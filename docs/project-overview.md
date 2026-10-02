@@ -106,33 +106,40 @@ The deployed frontend uses `npm run build:static` instead.
   continuations reorder together. Lowering the limit moves extra panes on;
   raising it never merges parts. Plain groups over the limit continue the same
   way, and a plain part left with one pane becomes an ordinary tab.
-- TailOS pins a **Home** area outside every group, for the owner helper and the
-  owner's own terminals. Placement:
+- TailOS pins a **Home** area outside every group. It is the owner helper's
+  control window and holds nothing else. Placement:
 
-  | Pane                                                                      | In Home?                                                                         |
-  | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-  | bound to the `owner_helper` agent                                         | always; it never leaves                                                          |
-  | bound to any other agent                                                  | never; adopting a Home shell as an agent moves it out                            |
-  | a terminal the owner opens (Start session, plain shell, Resume, bookmark) | always, even the first                                                           |
-  | restored                                                                  | its saved place (the hub role decides for a bound pane when the roster is known) |
-  | moved by the owner                                                        | the owner's choice                                                               |
+  | Pane                                                                      | In Home?                                                       |
+  | ------------------------------------------------------------------------- | -------------------------------------------------------------- |
+  | bound to the `owner_helper` agent                                         | always; it never leaves                                        |
+  | bound to any other agent                                                  | never; it joins its project group                              |
+  | a terminal the owner opens (Start session, plain shell, Resume, bookmark) | never; it opens as an ordinary tab                             |
+  | a launcher session the hub later reports as the helper                    | moves into Home when it is adopted                             |
+  | restored, bound, roster not yet known                                     | its saved place until the roster arrives, then by its hub role |
+
+  Workspaces saved by the earlier design, where the owner's shells shared Home,
+  migrate on the first restore: the shells leave Home together as one ordinary
+  group that keeps their arrangement (one shell becomes an ordinary tab) and the
+  helper stays. It happens once; afterwards they are ordinary terminals.
 
   Home is never counted by Panes per group, never splits into "(continued)" and
-  never reserves a project slot (the helper is not a project member). Home panes
-  tile and swap among themselves; a Home shell dragged onto a tab or pane joins
-  that group, and onto the tab bar gets its own tab; ↗ on its header, or Terminal
-  groups → "Move out of Home", does the same. A plain tab or pane dropped on
-  Home, or "⌂ Move to Home", joins Home. Agent panes are refused, the helper
-  never leaves, and the Home tab itself does not drag.
+  never reserves a project slot (the helper is not a project member). Nothing
+  can be dragged or moved into Home and the helper cannot be dragged or moved
+  out; the Home tab itself does not drag. When two projects each have a helper,
+  both tile in Home and can swap or be placed beside each other there.
 
-- Home shows beside the active group when the terminal area is at least 900 px
-  wide (resizable divider, default 40%, 20–80%); focusing a Home pane keeps the
-  last group beside it. Below 900 px only the focused region shows. While the
-  launcher shows, it fills the area. The pinned Home tab stays at the start of the
-  tab strip at every width: it mirrors Home's focused pane (select, session
-  actions, × closes that pane) and, when Home is empty, reads "⌂ Home" and opens
-  the launcher. Home's panes, order, focus and width persist in the encrypted
-  workspace. Server mode has no Home area.
+- Home shows alone, at the full width of the terminal area, at every window
+  width: focusing the Home tab shows only the helper, and focusing a tab or
+  group shows only that group. Home is never beside a group, so agent groups,
+  roster changes, reconnects and refreshes do not move or resize it. The pinned
+  Home tab stays at the start of the tab strip and is named from the hub role
+  and the project, "Owner helper - ‹project›" ("Owner helper" until the project
+  name is known), never from the tmux session name. The helper's pane header
+  shows the same name and, while the helper is focused, so does the browser
+  title: "Owner helper - ‹project› · Tailterm", after any pending-activity
+  prefix. With no helper bound there is no Home tab and the title is the usual
+  one. Home's panes, order and focus persist in the encrypted workspace. Server
+  mode has no Home area.
 - Closing or hiding a browser pane is distinct from terminating a remote session.
   Closing the page disconnects SSH but leaves ordinary remote tmux sessions alive.
 - Closing a task explicitly terminates its owned agent sessions. Guest sessions

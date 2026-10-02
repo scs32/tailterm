@@ -55,9 +55,14 @@ export function hasNewText(before, after) {
     return oldIndex > index;
   });
 }
-export function activityTitle(tabs) {
+// focus names the focused window when it has a name of its own (the owner
+// helper); it leads the title, after any pending activity.
+export function activityTitle(tabs, focus = "") {
   const pending = tabs.filter((t) => !t.disposed && t.activity);
-  if (!pending.length) return "Tailterm · Your servers, one workspace";
+  if (!pending.length)
+    return focus
+      ? `${focus} · Tailterm`
+      : "Tailterm · Your servers, one workspace";
   const priority = [
     "Needs attention",
     "Bell",
@@ -67,7 +72,7 @@ export function activityTitle(tabs) {
   const first = [...pending].sort(
     (a, b) => priority.indexOf(a.activity) - priority.indexOf(b.activity),
   )[0];
-  return `(${pending.length}) ${first.activity} · Tailterm`;
+  return `(${pending.length}) ${first.activity} · ${focus ? focus + " · " : ""}Tailterm`;
 }
 
 export function connectionNeedsAttention(tab, waitingForNetwork = false) {

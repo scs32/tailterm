@@ -32,19 +32,20 @@ window.fixture={groups,prefs,add,close,activate,
 const order=(params.get('order')||'').split(',').filter(Boolean);
 for(const id of order)add(id);
 </script></body></html>`;
-// Home: the owner helper and owner shells pinned outside the groups, with a
-// Home tab, a project of ten agents at limit 8 and a plain tab. The workspace
-// is saved to this context's storage and restored on reload.
+// Home: the owner helper alone, pinned outside the groups, with a Home tab, a
+// project of ten agents at limit 8, two owner shells and a plain tab. The
+// workspace is saved to this context's storage and restored on reload; a
+// restored pane is placed by homePlacement, as the app does.
 const homeHtml = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><section class="terminal-shell" style="margin:20px"><div class="terminal-tabs"><div class="tab-strip"><div id="home-tab" class="tab home-tab"></div><div id="tabs" style="white-space:nowrap"></div></div></div><div id="terminal-body" style="height:700px;position:relative"></div></section><dialog id="dialog"></dialog></div><script type="module">
 import {setupPaneGroups} from '/client/pane-groups.js';
 import {leaves} from '/client/pane-layout.js';
-import {taskMemberIds} from '/client/tasks.js';
+import {taskMemberIds,homePlacement} from '/client/tasks.js';
 import {workspaceSnapshot,normalizeWorkspace} from '/client/workspace-state.js';
 const TASK='tsk_3333333333333333',HELPER='agt_00000000000000aa',agentId=n=>'agt_'+String(n).padStart(16,'0');
 const server={id:'srv',host:'fixture',port:22,username:'test'};
 const tabs=[],prefs={paneGroupLimit:8};let active=null;
 const dialogEl=document.querySelector('#dialog');
-function strip(){const home=groups.homeEntry(),el=document.querySelector('#home-tab');el.classList.toggle('active',!!home&&home.ids.includes(active));el.innerHTML=home?'<button data-tab="'+home.tab.id+'"><span class="home-mark">⌂</span><span class="tab-name">'+home.tab.id+'</span></button>':'<button data-home-empty><span class="home-mark">⌂</span><span class="tab-name">Home</span></button>';document.querySelector('#tabs').innerHTML=groups.entries().map(({tab,group})=>'<div class="tab" style="display:inline-block;width:150px"><button data-tab="'+tab.id+'">'+groups.partName(group)+'</button></div>').join('')}
+function strip(){const home=groups.homeEntry(),el=document.querySelector('#home-tab');el.classList.toggle('active',!!home&&home.ids.includes(active));el.hidden=!home;el.innerHTML=home?'<button data-tab="'+home.tab.id+'"><span class="home-mark">⌂</span><span class="tab-name">'+home.tab.id+'</span></button>':'';document.querySelector('#tabs').innerHTML=groups.entries().map(({tab,group})=>'<div class="tab" style="display:inline-block;width:150px"><button data-tab="'+tab.id+'">'+groups.partName(group)+'</button></div>').join('')}
 function save(){localStorage.setItem('home-fixture',JSON.stringify(workspaceSnapshot(tabs,groups.model.groups,active,null,[TASK],[],groups.model.projectLayoutSnapshot(),groups.model.home)))}
 function activate(id){active=id;groups.render();strip();save()}
 const groups=setupPaneGroups({getTabs:()=>tabs,getActive:()=>active,activate,close(){},dialog(title,body){dialogEl.innerHTML='<h2>'+title+'</h2>'+body;if(!dialogEl.open)dialogEl.showModal()},closeDialog(){dialogEl.close()},preferences:()=>prefs,label:t=>t.id,groupName:g=>g.taskId?'Project':leaves(g.tree).join(' + '),changed:()=>{strip();save()}});
@@ -53,8 +54,8 @@ const roster=[{id:HELPER,role:'owner_helper',status:'running'},...Array.from({le
 groups.model.setTaskMembers(TASK,taskMemberIds({status:'open'},roster));
 groups.model.setTaskOrchestrator(TASK,'p1');
 const saved=normalizeWorkspace(JSON.parse(localStorage.getItem('home-fixture')||'null'));
-if(saved){const homeIds=new Set(saved.home?leaves(saved.home.tree):[]);for(const t of saved.tabs)add(t.id,t.task?.agentId,homeIds.has(t.id));groups.model.loadProjectLayouts(saved.projectLayouts);groups.model.groups=saved.groups;groups.model.home=saved.home?structuredClone(saved.home):null;groups.sync();activate(saved.active)}
-else{add('helper',HELPER,true);for(let n=1;n<=10;n++)add('p'+n,agentId(n));add('s1',null,true);add('s2',null,true);add('plain1');groups.sync();activate('p1')}
+if(saved){const homeIds=new Set(saved.home?leaves(saved.home.tree):[]);for(const t of saved.tabs)add(t.id,t.task?.agentId,homePlacement({binding:t.task,role:t.task?(t.task.agentId===HELPER?'owner_helper':''):undefined,saved:homeIds.has(t.id)}));groups.model.loadProjectLayouts(saved.projectLayouts);groups.model.groups=saved.groups;groups.model.home=saved.home?structuredClone(saved.home):null;groups.sync();activate(saved.active)}
+else{add('helper',HELPER,true);for(let n=1;n<=10;n++)add('p'+n,agentId(n));add('s1');add('s2');add('plain1');groups.sync();activate('p1')}
 window.fixture={groups,activate,
   state:()=>JSON.stringify({groups:groups.model.groups.map(g=>({tree:leaves(g.tree),taskId:g.taskId,part:g.part})),home:groups.model.home}),
   home:()=>groups.model.home&&{ids:leaves(groups.model.home.tree),active:groups.model.home.active,ratio:groups.model.home.ratio},
@@ -122,80 +123,120 @@ async function homeArea(browser, origin, name) {
         assert.ok(!overlap, `panes ${i} and ${j} overlap`);
       }
   };
-  // a6: Home sits left of every group, outside the cap and continued parts.
+  const state = () => run(() => fixture.state());
+  // Home is outside the cap and continued parts, and holds only the helper:
+  // the owner's shells are ordinary tabs.
   assert.deepEqual(await run(() => fixture.parts()), [8, 2]);
   assert.deepEqual(await run(() => fixture.names()), [
     "Project",
     "Project (continued)",
+    "s1",
+    "s2",
     "plain1",
   ]);
+  assert.deepEqual(await run(() => fixture.home().ids), ["helper"]);
   const stripOrder = await page
     .locator(".tab-strip > *")
     .evaluateAll((nodes) => nodes.map((n) => n.id));
   assert.deepEqual(stripOrder, ["home-tab", "tabs"], "Home tab first");
-  const homeBoxes = await boxes(".pane-header[data-home]");
-  assert.deepEqual(
-    homeBoxes.map((b) => b.id),
-    ["helper", "s1", "s2"],
-  );
-  const groupBoxes = await boxes(".pane-header:not([data-home])");
-  assert.equal(groupBoxes.length, 8);
-  const homeRight = Math.max(...homeBoxes.map((b) => b.x + b.w));
-  assert.ok(
-    groupBoxes.every((b) => b.x >= homeRight),
-    "all Home headers sit left of every group header",
-  );
-  assert.equal(await page.locator(".home-divider").count(), 1);
-  await assertBounds();
+  // A focused group shows alone: Home is never beside it.
+  const groupAlone = async (count) => {
+    assert.equal(await page.locator(".pane-header[data-home]").count(), 0);
+    assert.equal(
+      await page.locator(".pane-header:not([data-home])").count(),
+      count,
+    );
+    assert.equal(await page.locator(".home-divider").count(), 0);
+    assert.ok(await homeTab.isVisible(), "the Home tab stays in the strip");
+    assert.equal(await homeTab.getAttribute("class"), "tab home-tab");
+  };
+  // Home focused: the helper alone at the full width of the terminal area.
+  const helperAlone = async () => {
+    await run(() => fixture.activate("helper"));
+    const home = await boxes(".pane-header[data-home]");
+    assert.deepEqual(
+      home.map((b) => b.id),
+      ["helper"],
+    );
+    assert.equal(
+      await page.locator(".pane-header:not([data-home])").count(),
+      0,
+    );
+    assert.equal(await page.locator(".home-divider").count(), 0);
+    const body = await page.locator("#terminal-body").boundingBox();
+    assert.ok(
+      Math.abs(home[0].w - body.width) <= 1 &&
+        Math.abs(home[0].x - body.x) <= 1,
+      `the helper fills the terminal width (${home[0].w} of ${body.width})`,
+    );
+    assert.equal(await homeTab.getAttribute("class"), "tab home-tab active");
+    assert.equal(
+      await homeTab.locator("[data-tab]").getAttribute("data-tab"),
+      "helper",
+    );
+    assert.equal(await header("helper").locator("[data-detach]").count(), 0);
+    await assertBounds();
+    return home[0];
+  };
+  await groupAlone(8);
+  const wide = await helperAlone();
   await page.screenshot({ path: `.build/home-pane-${name}.png` });
   await run(() => fixture.activate("p9"));
-  assert.deepEqual(await boxes(".pane-header[data-home]"), homeBoxes);
-  assert.equal(await page.locator(".pane-header:not([data-home])").count(), 2);
-  await run(() => fixture.activate("s1"));
-  assert.deepEqual(await boxes(".pane-header[data-home]"), homeBoxes);
-  assert.deepEqual(
-    (await boxes(".pane-header:not([data-home])")).map((b) => b.id).sort(),
-    ["p10", "p9"],
-    "a focused Home pane keeps the last group beside it",
-  );
-  assert.equal(await homeTab.getAttribute("class"), "tab home-tab active");
-  assert.equal(
-    await homeTab.locator("[data-tab]").getAttribute("data-tab"),
-    "s1",
-  );
-  await assertBounds();
-  // Narrow: only the focused region shows.
+  await groupAlone(2);
+  assert.deepEqual(await helperAlone(), wide, "back from a group, unmoved");
+  await run(() => fixture.activate("plain1"));
+  await groupAlone(1);
+  assert.deepEqual(await helperAlone(), wide);
+  // Narrow: the same rule, with no breakpoint.
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForFunction(
-    () => !document.querySelector(".pane-header:not([data-home])"),
+    (w) =>
+      document.querySelector(".pane-header[data-home]").getBoundingClientRect()
+        .width < w,
+    wide.w,
   );
-  assert.equal(await page.locator(".pane-header[data-home]").count(), 3);
-  assert.equal(await page.locator(".home-divider").count(), 0);
+  const narrow = await helperAlone();
   await run(() => fixture.activate("p1"));
-  assert.equal(await page.locator(".pane-header[data-home]").count(), 0);
-  assert.equal(await page.locator(".pane-header:not([data-home])").count(), 8);
-  assert.ok(await homeTab.isVisible());
+  await groupAlone(8);
+  assert.deepEqual(await helperAlone(), narrow);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.waitForFunction(
-    () => document.querySelectorAll(".pane-header[data-home]").length === 3,
+    (w) =>
+      document.querySelector(".pane-header[data-home]").getBoundingClientRect()
+        .width === w,
+    wide.w,
   );
-  // a7: refused drags change nothing.
+  assert.deepEqual(await helperAlone(), wide, "back to the wide size");
+  // Refused drags change nothing: the helper never leaves and nothing enters.
   const refused = async (from, to, what) => {
-    const before = await run(() => fixture.state());
+    const before = await state();
     await pointerDrag(page, from, to);
-    assert.equal(await run(() => fixture.state()), before, what);
+    assert.equal(await state(), before, what);
   };
+  const tabNamed = (text) =>
+    page.locator("#tabs .tab", { hasText: new RegExp(`^${text}$`) });
   await refused(label("helper"), projectTab, "helper onto a project tab");
-  await refused(label("helper"), label("p2"), "helper onto a group pane");
-  await refused(label("p3"), label("s1"), "agent onto a Home pane");
-  await refused(label("p3"), homeTab, "agent onto the Home tab");
+  await refused(label("helper"), tabNamed("plain1"), "helper onto a plain tab");
+  await refused(
+    tabNamed("plain1"),
+    label("helper"),
+    "plain tab onto the helper",
+  );
+  await refused(tabNamed("s1"), label("helper"), "owner shell onto the helper");
+  await refused(projectTab, label("helper"), "project onto the helper");
+  await refused(tabNamed("plain1"), homeTab, "plain tab onto the Home tab");
   await refused(
     homeTab.locator("button"),
     projectTab,
     "the Home tab never drags",
   );
+  await run(() => fixture.activate("p1"));
+  await refused(label("p3"), homeTab, "agent onto the Home tab");
+  await run(() => fixture.activate("s2"));
+  await refused(label("s2"), homeTab, "owner shell pane onto the Home tab");
   // The helper cannot be dropped on the tab bar either.
-  const before = await run(() => fixture.state());
+  await run(() => fixture.activate("helper"));
+  const before = await state();
   const helperBox = await label("helper").boundingBox();
   await page.mouse.move(helperBox.x + 30, helperBox.y + helperBox.height / 2);
   await page.mouse.down();
@@ -210,76 +251,98 @@ async function homeArea(browser, origin, name) {
     },
   );
   await page.mouse.up();
-  assert.equal(
-    await run(() => fixture.state()),
-    before,
-    "helper onto the tab bar",
-  );
-  // Allowed: a Home shell joins a plain tab's group.
-  await pointerDrag(
-    page,
-    label("s2"),
-    page.locator("#tabs .tab", { hasText: /^plain1$/ }),
-  );
-  assert.equal(await run(() => fixture.inHome("s2")), false);
+  assert.equal(await state(), before, "helper onto the tab bar");
+  // The owner's shells group like any other terminal.
+  await pointerDrag(page, tabNamed("s2"), tabNamed("plain1"));
   assert.deepEqual((await run(() => fixture.group("plain1"))).sort(), [
     "plain1",
     "s2",
   ]);
-  // ↗ gives a Home shell its own tab; its tab dropped on Home rejoins Home.
-  await run(() => fixture.activate("s1"));
-  await header("s1").getByRole("button", { name: "Move out of Home" }).click();
-  assert.deepEqual(await run(() => fixture.group("s1")), ["s1"]);
-  assert.equal(
-    await header("helper")
-      .getByRole("button", { name: "Move out of Home" })
-      .count(),
-    0,
-    "the helper has no way out",
-  );
-  await pointerDrag(
-    page,
-    page.locator("#tabs .tab", { hasText: /^s1$/ }),
-    homeTab,
-  );
-  assert.equal(await run(() => fixture.inHome("s1")), true);
-  // A plain pane dropped on a Home pane joins Home.
-  await run(() => fixture.activate("s2"));
-  await pointerDrag(page, label("s2"), label("s1"));
-  assert.deepEqual(await run(() => fixture.home().ids), ["helper", "s1", "s2"]);
-  // a8: Home persists across a reload, with ten agents in 8 + 2.
-  await run(() => fixture.activate("helper"));
-  await page.locator(".home-divider").focus();
-  await page.keyboard.press("ArrowLeft");
-  await page.keyboard.press("ArrowLeft");
+  assert.deepEqual(await run(() => fixture.home().ids), ["helper"]);
+  // Home persists across a reload, in the same place, with ten agents in 8 + 2.
+  assert.deepEqual(await helperAlone(), wide);
   const home = await run(() => fixture.home());
-  assert.ok(Math.abs(home.ratio - 0.36) < 1e-9, String(home.ratio));
   const parts = await run(() => fixture.parts());
-  const groupsBefore = await run(() =>
-    fixture.groups.model.groups.map((g) => ({
-      taskId: g.taskId,
-      part: g.part,
-    })),
-  );
+  const saved = await state();
   await page.reload();
   await page.waitForFunction(() => !!window.fixture);
   assert.deepEqual(await run(() => fixture.home()), home);
   assert.deepEqual(await run(() => fixture.parts()), parts);
   assert.deepEqual(parts, [8, 2]);
+  assert.equal(await state(), saved, "groups and Home restored");
   assert.deepEqual(
-    await run(() =>
-      fixture.groups.model.groups.map((g) => ({
-        taskId: g.taskId,
-        part: g.part,
-      })),
-    ),
-    groupsBefore,
+    await boxes(".pane-header[data-home]"),
+    [wide],
+    "the helper is in the same place after a reload",
   );
-  assert.equal(await page.locator(".pane-header[data-home]").count(), 3);
+  assert.deepEqual(await helperAlone(), wide);
+  // A workspace saved by the earlier design, with the owner's shells in Home
+  // beside the helper: on restore they leave together as one ordinary group.
+  await run(() => {
+    const snapshot = JSON.parse(localStorage.getItem("home-fixture"));
+    const shells = ["s1", "s2"];
+    const strip = (tree) =>
+      tree.tab
+        ? shells.includes(tree.tab)
+          ? null
+          : tree
+        : ((a, b) => (a && b ? { ...tree, a, b } : a || b))(
+            strip(tree.a),
+            strip(tree.b),
+          );
+    snapshot.groups = snapshot.groups
+      .map((g) => ({ ...g, tree: strip(g.tree) }))
+      .filter((g) => g.tree);
+    snapshot.home = {
+      tree: {
+        id: "legacy-1",
+        axis: "y",
+        ratio: 1 / 3,
+        a: { tab: "helper" },
+        b: {
+          id: "legacy-2",
+          axis: "y",
+          ratio: 0.5,
+          a: { tab: "s1" },
+          b: { tab: "s2" },
+        },
+      },
+      active: "s1",
+      ratio: 0.36,
+    };
+    snapshot.active = "s1";
+    localStorage.setItem("home-fixture", JSON.stringify(snapshot));
+  });
+  await page.reload();
+  await page.waitForFunction(() => !!window.fixture);
+  assert.deepEqual(await run(() => fixture.home()), {
+    ids: ["helper"],
+    active: "helper",
+    ratio: 0.36,
+  });
+  assert.equal(await run(() => fixture.inHome("s1")), false);
+  assert.deepEqual(await run(() => fixture.group("s1")), ["s1", "s2"]);
+  assert.deepEqual(await run(() => fixture.group("plain1")), ["plain1"]);
+  assert.ok((await run(() => fixture.names())).includes("s1 + s2"));
+  assert.deepEqual(await run(() => fixture.parts()), [8, 2]);
+  assert.deepEqual(
+    (await boxes(".pane-header:not([data-home])")).map((b) => b.id),
+    ["s1", "s2"],
+    "the migrated shells show as their own group",
+  );
+  await groupAlone(2);
+  const migrated = await state();
+  await run(() => fixture.groups.sync());
+  assert.equal(await state(), migrated, "a second sync changes nothing");
+  assert.deepEqual(await helperAlone(), wide, "the helper did not move");
+  await run(() => fixture.activate("s1"));
+  await page.reload();
+  await page.waitForFunction(() => !!window.fixture);
+  assert.equal(await state(), migrated, "the migration is saved, not repeated");
   await assertBounds();
   assert.deepEqual(errors, []);
   console.log(
-    `${name}: Home area layout, cap exclusion, narrow regions, drag refusals and moves, and reload persistence passed`,
+    `${name}: helper-only Home at full width wide and narrow, cap exclusion, drag refusals, reload persistence and migration of shells saved in Home passed`,
   );
   await context.close();
 }

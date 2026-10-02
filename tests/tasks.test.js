@@ -15,6 +15,7 @@ import {
   taskBinding,
   taskMemberIds,
   homePlacement,
+  helperLabel,
   attachOptions,
   helperReattach,
   reattachOptions,
@@ -319,7 +320,7 @@ test("taskBinding keeps the helper role only, and homeAgent reads it", () => {
   assert.equal(homeAgent(undefined), false);
 });
 
-test("homePlacement: helper and new owner terminals in home, agents never", () => {
+test("homePlacement: only the owner helper is in home", () => {
   const helper = taskBinding(TASK, helperFixture);
   const plain = taskBinding(TASK, agent(5));
   const rows = [
@@ -338,34 +339,46 @@ test("homePlacement: helper and new owner terminals in home, agents never", () =
       false,
     ],
     [
-      "adopted home shell becomes an agent",
-      { binding: plain, role: "", explicit: true },
-      false,
-    ],
-    [
       "bound pane, roster unknown, saved in home",
       { binding: plain, saved: true },
       true,
     ],
-    ["new owner terminal, home empty", {}, true],
-    ["new owner terminal", undefined, true],
-    ["restored owner terminal in home", { saved: true }, true],
+    [
+      "bound pane, roster unknown, saved as a tab",
+      { binding: plain, saved: false },
+      false,
+    ],
+    ["new owner terminal", {}, false],
+    ["new owner terminal, no input", undefined, false],
+    ["owner terminal an older workspace saved in home", { saved: true }, false],
     ["restored owner terminal as a tab", { saved: false }, false],
     [
-      "owner moves a shell out of home",
-      { saved: true, explicit: false },
+      "an unbound terminal cannot claim the role",
+      { role: "owner_helper", saved: true },
       false,
     ],
-    ["owner moves a shell into home", { saved: false, explicit: true }, true],
-    [
-      "agent cannot be moved into home",
-      { binding: plain, explicit: true },
-      false,
-    ],
-    ["helper cannot be moved out", { binding: helper, explicit: false }, true],
   ];
   for (const [name, input, expected] of rows)
     assert.equal(homePlacement(input), expected, name);
+});
+
+test("helperLabel names the helper window from the hub role", () => {
+  const helper = taskBinding(TASK, helperFixture);
+  assert.equal(
+    helperLabel(helper, "Fixture project"),
+    "Owner helper - Fixture project",
+  );
+  assert.equal(helperLabel(helper), "Owner helper", "project name unknown");
+  assert.equal(helperLabel(helper, ""), "Owner helper");
+  assert.equal(helperLabel(taskBinding(TASK, agent(5)), "Fixture project"), "");
+  assert.equal(helperLabel(undefined, "Fixture project"), "");
+  assert.ok(
+    !helperLabel(
+      { ...helper, agentName: "Generic" },
+      "Fixture project",
+    ).includes("Generic"),
+    "never the session or agent name",
+  );
 });
 
 test("reconcileTask opens and adopts the helper like any agent", () => {

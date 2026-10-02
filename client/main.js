@@ -22,6 +22,7 @@ import {
   bindingOf,
   homeAgent,
   homePlacement,
+  helperLabel,
   attachOptions,
   helperReattach,
   reattachOptions,
@@ -501,7 +502,7 @@ function mount() {
     dialog,
     closeDialog,
     preferences: () => appearance,
-    label: (t) => tabName(t, true),
+    label: (t) => helperName(t) || tabName(t, true),
     groupName,
     changed: scheduleWorkspaceSave,
   });
@@ -683,8 +684,8 @@ function mount() {
           })
           .catch(() => {}),
       bookmark: (t) => {
-        // Adoption binds a live tab: the helper moves into home, any other
-        // agent out of it. A helper attach built without ignore-size is
+        // Adoption binds a live tab: the helper moves into home; any other
+        // agent stays out of it. A helper attach built without ignore-size is
         // replaced by an attach that ignores size, connected or not.
         if (staticMode && t.task) {
           t.home = homePlacement({
@@ -1091,7 +1092,7 @@ function renderSidebar() {
   );
 }
 function renderTabs() {
-  document.title = activityTitle(tabs);
+  document.title = activityTitle(tabs, helperName(currentTab()));
   for (const t of tabs) t.history?.sync();
   document.body.classList.toggle("terminal-open", visibleTabs().length > 0);
   if (!$("#tabs")) return;
@@ -1240,34 +1241,37 @@ function renderTabs() {
   if (t?.retryMessage)
     $("#terminal-status").textContent += " · " + t.retryMessage;
 }
-// The pinned Home tab mirrors home's focused pane, so tab actions (select,
-// session menu, close) work on home panes; empty, it opens the launcher.
+// A Home pane is the owner helper's: its name comes from the hub role and the
+// project, never the tmux session.
+function helperName(t) {
+  return t?.home
+    ? helperLabel(
+        { ...t.task, role: "owner_helper" },
+        taskHub?.name(t.task?.taskId),
+      )
+    : "";
+}
+// The pinned Home tab is the owner helper's window: it mirrors home's focused
+// pane, so tab actions (select, session menu, close) work on it. With no
+// helper there is no Home tab.
 function renderHomeTab(el) {
   const entry = paneGroups?.homeEntry();
   const focused = !!entry && entry.ids.includes(active);
   const t = entry && (focused ? currentTab() : entry.tab);
   el.classList.toggle("active", focused);
+  el.hidden = !t;
   if (!t) {
     el.dataset.tabColor = el.dataset.tabFill = "default";
     el.classList.remove("has-new-output");
-    el.innerHTML =
-      '<button data-home-empty role="tab" aria-selected="false" title="Home\nThe owner helper and the terminals you open land here. Click to open a terminal."><span class="home-mark" aria-hidden="true">⌂</span><span class="tab-copy"><span class="tab-name">Home</span></span></button>';
-    el.querySelector("[data-home-empty]").onclick = () => $("#new-tab").click();
+    el.replaceChildren();
     return;
   }
   const decoration = normalizeTabDecoration(t.decoration);
   const activities = entry.ids
     .map((id) => tabs.find((tab) => tab.id === id)?.activity)
     .filter(Boolean);
-  const names = entry.ids.map((id) =>
-    tabName(
-      tabs.find((tab) => tab.id === id),
-      true,
-    ),
-  );
-  const label = tabName(t, true);
-  // The focused pane's own tab details, then the Home summary.
-  const title = `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nHome · ${entry.ids.length} pane${entry.ids.length === 1 ? "" : "s"}: ${names.join(", ")}\nHome stays pinned beside your groups. × closes the focused pane.${activities.length ? "\n" + [...new Set(activities)].join(", ") : ""}`;
+  const label = helperName(t) || tabName(t, true);
+  const title = `${label}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nThe owner helper stays in Home, alone and at full width. × closes it.${activities.length ? "\n" + [...new Set(activities)].join(", ") : ""}`;
   el.dataset.tabColor = decoration.color;
   el.dataset.tabFill = decoration.fill;
   el.style.setProperty(
@@ -1321,18 +1325,9 @@ function groupDialog() {
   const inHome = paneGroups.inHome(t.id);
   const ids = inHome ? [] : paneGroups.members(t.id);
   const others = paneGroups.entries().filter((g) => !g.ids.includes(t.id));
-  const homeAction = paneGroups.canLeaveHome(t.id)
-    ? '<button data-home-move="out">↗ Move out of Home</button>'
-    : staticMode && paneGroups.canHome(t.id)
-      ? '<button data-home-move="in">⌂ Move to Home</button>'
-      : "";
   dialog(
     "Terminal groups",
     `<p>Choose terminals to group, or drag one tab onto another.</p>${
-      homeAction
-        ? `<h3>Home</h3><div class="group-choices">${homeAction}</div>`
-        : ""
-    }${
       ids.length > 1
         ? `<h3>This group · ${ids.length} panes</h3><div class="group-choices">${ids
             .map((id) => {
@@ -1348,14 +1343,6 @@ function groupDialog() {
       (b.onclick = () => {
         $("#dialog").close();
         paneGroups.detach(b.dataset.separate);
-      }),
-  );
-  $$("[data-home-move]").forEach(
-    (b) =>
-      (b.onclick = () => {
-        $("#dialog").close();
-        if (b.dataset.homeMove === "in") paneGroups.toHome(t.id);
-        else paneGroups.fromHome(t.id);
       }),
   );
   $$("[data-merge]").forEach(
@@ -1955,7 +1942,7 @@ async function connect(
       status: "Connecting",
       send: null,
     };
-    // TailOS only: the helper and new owner terminals land in home.
+    // TailOS only: the owner helper's pane lands in home; nothing else does.
     t.home =
       staticMode &&
       homePlacement({

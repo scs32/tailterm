@@ -775,19 +775,22 @@ test("closing a project unbinds every part", async () => {
   assert.ok(model.groups.every((g) => !g.taskId && !g.part && !g.guests));
 });
 
-// The home area: the owner helper's pane and the owner's shells, outside every
-// group, never counted by the cap. Fixture ids only.
+// The home area: only the owner helper's pane, outside every group, never
+// counted by the cap. Fixture ids only.
 const HOME_TASK = "tsk_2222222222222222";
+const OTHER_TASK = "tsk_3333333333333333";
 const homeAgentId = (n) => `agt_${String(n).padStart(16, "0")}`;
 const HELPER = "agt_00000000000000aa";
-const homeFixture = (agents, { limit = 8, shells = ["s1", "s2"] } = {}) => {
+const OTHER_HELPER = "agt_00000000000000bb";
+// shells are the owner's plain terminals; home is a saved home area to restore.
+const homeFixture = (agents, { limit = 8, shells = [], home } = {}) => {
   const model = new PaneGroups();
   model.limit = limit;
   const panes = new Map();
   for (let n = 1; n <= agents; n++)
     panes.set(`p${n}`, { taskId: HOME_TASK, agentId: homeAgentId(n) });
   panes.set("helper", { taskId: HOME_TASK, agentId: HELPER, home: true });
-  for (const id of shells) panes.set(id, { home: true });
+  for (const id of shells) panes.set(id, {});
   const taskOf = (id) => panes.get(id)?.taskId,
     agentOf = (id) => panes.get(id)?.agentId,
     homeOf = (id) => !!panes.get(id)?.home;
@@ -803,49 +806,54 @@ const homeFixture = (agents, { limit = 8, shells = ["s1", "s2"] } = {}) => {
     model.sync([...panes.keys()], taskOf, agentOf, homeOf);
     model.isolateTasks(taskOf, agentOf);
   };
+  if (home) model.home = structuredClone(home);
   sync();
   const parts = () =>
     model.series(model.taskGroup(HOME_TASK)).map((g) => leaves(g.tree).length);
-  return { model, panes, sync, parts, roster };
+  // As saved: a JSON round-trip, so an undefined key is not a difference.
+  const state = () =>
+    JSON.parse(JSON.stringify({ groups: model.groups, home: model.home }));
+  return { model, panes, sync, parts, state, roster };
 };
+// What an older workspace saved: the helper above the owner's shells.
+const legacyHome = (...shells) => ({
+  tree: shells.reduce(
+    (tree, id, i) => ({
+      id: `h${i}`,
+      axis: "y",
+      ratio: 1 - 1 / (i + 2),
+      a: tree,
+      b: { tab: id },
+    }),
+    { tab: "helper" },
+  ),
+  active: shells.at(-1),
+  ratio: 0.33,
+});
 
-test("the cap and continued groups ignore home panes", () => {
+test("the cap and continued groups ignore the home pane", () => {
   const eight = homeFixture(8);
   assert.deepEqual(eight.parts(), [8], "one part, no (continued)");
   assert.equal(eight.model.groups.length, 1);
-  assert.deepEqual(leaves(eight.model.home.tree).sort(), [
-    "helper",
-    "s1",
-    "s2",
-  ]);
-  assert.ok(
-    eight.model.groups.every(
-      (g) => !leaves(g.tree).some((id) => ["helper", "s1", "s2"].includes(id)),
-    ),
-  );
+  assert.deepEqual(leaves(eight.model.home.tree), ["helper"]);
+  assert.equal(eight.model.group("helper"), undefined);
   const nine = homeFixture(9);
   assert.deepEqual(nine.parts(), [8, 1]);
-  assert.deepEqual(leaves(nine.model.home.tree).sort(), ["helper", "s1", "s2"]);
+  assert.deepEqual(leaves(nine.model.home.tree), ["helper"]);
   for (const { model } of [eight, nine]) {
     const snapshot = JSON.stringify(model.projectLayoutSnapshot());
     assert.ok(!snapshot.includes(HELPER), "the helper never enters a template");
     assert.ok(!snapshot.includes('"helper"'));
   }
-  // Repeated syncs are stable and home keeps its order.
+  // Repeated syncs are stable.
   nine.sync();
-  const before = structuredClone({
-    groups: nine.model.groups,
-    home: nine.model.home,
-  });
+  const before = nine.state();
   nine.sync();
-  assert.deepEqual(
-    { groups: nine.model.groups, home: nine.model.home },
-    before,
-  );
+  assert.deepEqual(nine.state(), before);
 });
 
 test("an absent helper leaves eight agents in one part at limit 8", () => {
-  const { model, panes, sync, parts } = homeFixture(8, { shells: [] });
+  const { model, panes, sync, parts } = homeFixture(8);
   panes.delete("helper");
   sync();
   assert.deepEqual(parts(), [8]);
@@ -856,71 +864,157 @@ test("an absent helper leaves eight agents in one part at limit 8", () => {
   assert.ok(!keys.includes(HELPER));
 });
 
-test("group operations refuse home panes and leave the model unchanged", () => {
-  const { model, panes, sync } = homeFixture(3);
-  panes.set("plain", {});
+test("a new plain terminal never enters home", () => {
+  const { model, panes, sync } = homeFixture(2);
+  panes.set("s1", {});
   sync();
-  const state = () =>
-    structuredClone({ groups: model.groups, home: model.home });
+  assert.deepEqual(leaves(model.home.tree), ["helper"]);
+  assert.deepEqual(leaves(model.group("s1").tree), ["s1"]);
+});
+
+test("shells saved in home migrate to one ordinary group, once", () => {
+  const { model, panes, sync, state, parts } = homeFixture(3, {
+    shells: ["s1", "s2"],
+    home: legacyHome("s1", "s2"),
+  });
+  assert.deepEqual(leaves(model.home.tree), ["helper"]);
+  assert.deepEqual(model.home, {
+    tree: { tab: "helper" },
+    active: "helper",
+    ratio: 0.33,
+  });
+  const group = model.group("s1");
+  assert.equal(group, model.group("s2"), "one group for both shells");
+  assert.deepEqual(leaves(group.tree), ["s1", "s2"], "their old order");
+  assert.equal(group.tree.axis, "y", "their old arrangement");
+  assert.equal(group.active, "s2");
+  assert.equal(group.taskId, undefined, "an ordinary group, not a project's");
+  assert.equal(group.guests, undefined);
+  assert.deepEqual(parts(), [3], "the project group is untouched");
+  // A second sync changes nothing.
+  const before = state();
+  sync();
+  assert.deepEqual(state(), before);
+  // Once out, the shells are ordinary: separating one stays separated.
+  assert.equal(model.detach("s1"), true);
+  sync();
+  assert.notEqual(model.group("s1"), model.group("s2"));
+  assert.deepEqual(leaves(model.home.tree), ["helper"]);
+  panes.delete("helper");
+  sync();
+  assert.equal(model.home, null);
+});
+
+test("home migration: one shell, a closed shell and a non-helper agent", () => {
+  // One shell becomes an ordinary tab.
+  const one = homeFixture(1, { shells: ["s1"], home: legacyHome("s1") });
+  assert.deepEqual(one.model.group("s1").tree, { tab: "s1" });
+  assert.deepEqual(leaves(one.model.home.tree), ["helper"]);
+  // A saved shell that did not come back is dropped, not regrouped.
+  const gone = homeFixture(1, {
+    shells: ["s2"],
+    home: legacyHome("s1", "s2"),
+  });
+  assert.equal(gone.model.group("s1"), undefined);
+  assert.deepEqual(gone.model.group("s2").tree, { tab: "s2" });
+  // No helper pane: the shells still leave and home is empty.
+  const alone = homeFixture(0, {
+    shells: ["s1", "s2"],
+    home: legacyHome("s1", "s2"),
+  });
+  alone.panes.delete("helper");
+  alone.model.home = legacyHome("s1", "s2");
+  alone.model.groups = [];
+  alone.sync();
+  assert.equal(alone.model.home, null);
+  assert.deepEqual(leaves(alone.model.group("s1").tree), ["s1", "s2"]);
+  // An agent pane the roster says is not the helper joins its project, not
+  // the shells' group.
+  const agent = homeFixture(2, {
+    shells: ["s1"],
+    home: {
+      tree: {
+        id: "h0",
+        axis: "y",
+        ratio: 0.5,
+        a: { tab: "helper" },
+        b: {
+          id: "h1",
+          axis: "y",
+          ratio: 0.5,
+          a: { tab: "p1" },
+          b: { tab: "s1" },
+        },
+      },
+      active: "p1",
+      ratio: 0.4,
+    },
+  });
+  assert.deepEqual(leaves(agent.model.home.tree), ["helper"]);
+  assert.deepEqual(agent.model.group("s1").tree, { tab: "s1" });
+  assert.equal(agent.model.group("p1").taskId, HOME_TASK);
+  assert.equal(agent.model.group("p1"), agent.model.group("p2"));
+});
+
+test("group operations refuse home panes and leave the model unchanged", () => {
+  const { model, panes, sync, state } = homeFixture(3, { shells: ["plain"] });
+  // A second project's helper: home tiles one helper per project.
+  panes.set("helper2", {
+    taskId: OTHER_TASK,
+    agentId: OTHER_HELPER,
+    home: true,
+  });
+  sync();
+  assert.deepEqual(leaves(model.home.tree), ["helper", "helper2"]);
   const before = state();
   const checks = [
-    () => model.canMerge("s1", "p1"),
-    () => model.canMerge("p1", "s1", false),
-    () => model.canFit("s1", "plain"),
-    () => model.merge("s1", "plain"),
-    () => model.merge("plain", "s1", { whole: false }),
+    () => model.canMerge("helper", "p1"),
+    () => model.canMerge("p1", "helper", false),
+    () => model.canMerge("plain", "helper"),
+    () => model.canFit("helper", "plain"),
+    () => model.merge("helper", "plain"),
+    () => model.merge("plain", "helper", { whole: false }),
     () => model.merge("helper", "p1", { whole: false }),
-    () => model.send("s1", "plain"),
+    () => model.send("helper", "plain"),
     () => model.send("p1", "helper"),
-    () => model.makeRoom("s1", "p2"),
-    () => model.makeRoom("plain", "s1"),
-    () => model.place("s1", "p1", "right"),
-    () => model.place("p1", "s2", "above"),
-    () => model.swap("s1", "s2"),
+    () => model.makeRoom("helper", "p2"),
+    () => model.makeRoom("plain", "helper"),
+    () => model.place("helper", "p1", "right"),
+    () => model.place("p1", "helper2", "above"),
+    () => model.place("plain", "helper", "right"),
+    () => model.swap("helper", "helper2"),
     () => model.swap("helper", "p1"),
-    () => model.reorder("s1", "plain"),
+    () => model.reorder("helper", "plain"),
     () => model.reorder("plain", "helper", true),
-    () => model.detach("s1"),
     () => model.detach("helper"),
-    () => model.canDetach("s2"),
+    () => model.canDetach("helper2"),
+    () => model.homeSwap("helper", "plain"),
+    () => model.homeSwap("plain", "helper"),
+    () => model.homePlace("plain", "helper", "left"),
+    () => model.homePlace("helper", "p1", "left"),
   ];
   checks.forEach((check, i) => assert.equal(check(), false, `check ${i}`));
   assert.deepEqual(state(), before);
-  assert.equal(model.group("s1"), undefined);
-  // Only unbound terminals may enter; the helper never leaves.
-  assert.equal(model.canHome("p1"), false, "agent pane");
-  assert.equal(model.toHome("p1"), false);
-  assert.equal(model.leaveHome("helper"), false);
-  assert.deepEqual(state(), before);
-  assert.equal(model.canHome("plain"), true);
-  // leaveHome then re-entry round-trips a plain shell.
-  assert.equal(model.leaveHome("s1"), true);
-  assert.equal(model.inHome("s1"), false);
-  assert.deepEqual(leaves(model.group("s1").tree), ["s1"]);
-  assert.equal(model.toHome("s1", "s2", "above"), true);
-  assert.equal(model.inHome("s1"), true);
-  assert.equal(model.group("s1"), undefined);
-  assert.equal(model.home.active, "s1");
-  assert.deepEqual(leaves(model.home.tree), ["helper", "s1", "s2"]);
-  // Moves inside home.
-  assert.equal(model.homeSwap("s1", "helper"), true);
-  assert.deepEqual(leaves(model.home.tree), ["s1", "helper", "s2"]);
-  assert.equal(model.homePlace("s2", "s1", "left"), true);
-  assert.deepEqual(leaves(model.home.tree), ["s2", "s1", "helper"]);
-  assert.equal(model.homePlace("s2", "p1", "left"), false);
-  // Moving the last pane out of a plain group removes that group.
-  assert.equal(model.toHome("plain"), true);
-  assert.equal(model.group("plain"), undefined);
-  assert.equal(leaves(model.home.tree).at(-1), "plain");
-  model.rememberActive("helper");
-  assert.equal(model.home.active, "helper");
+  assert.equal(model.group("helper"), undefined);
+  // Nothing moves a pane into or out of home.
+  for (const name of ["canHome", "toHome", "leaveHome"])
+    assert.equal(model[name], undefined, name);
+  assert.equal(model.inHome("plain"), false);
+  // Helpers rearrange among themselves.
+  assert.equal(model.homeSwap("helper2", "helper"), true);
+  assert.deepEqual(leaves(model.home.tree), ["helper2", "helper"]);
+  assert.equal(model.homePlace("helper", "helper2", "left"), true);
+  assert.deepEqual(leaves(model.home.tree), ["helper", "helper2"]);
+  assert.equal(model.home.tree.axis, "x");
+  model.rememberActive("helper2");
+  assert.equal(model.home.active, "helper2");
+  assert.deepEqual(state().groups, before.groups, "the groups never changed");
 });
 
 test("home persists across a workspace round-trip", () => {
-  const { model, panes, sync } = homeFixture(10);
+  const { model, panes, sync } = homeFixture(10, { shells: ["s1", "s2"] });
   model.home.ratio = 0.33;
-  model.homeSwap("s2", "helper");
-  model.rememberActive("s1");
+  model.rememberActive("helper");
   const server = {
     id: "srv",
     host: "synthetic.invalid",
@@ -954,7 +1048,12 @@ test("home persists across a workspace round-trip", () => {
     ),
   );
   assert.deepEqual(saved.home, model.home);
-  const restored = homeFixture(10);
+  assert.deepEqual(saved.home, {
+    tree: { tab: "helper" },
+    active: "helper",
+    ratio: 0.33,
+  });
+  const restored = homeFixture(10, { shells: ["s1", "s2"] });
   restored.model.loadProjectLayouts(saved.projectLayouts);
   restored.model.groups = saved.groups;
   restored.model.home = saved.home;

@@ -152,24 +152,24 @@ export const taskMemberIds = (task, agents) =>
     ? []
     : agents.filter((a) => openAgent(a) && !homeAgent(a)).map((a) => a.id);
 
-// Whether a pane belongs in the home area.
-//   binding:  the pane's task binding, if any
-//   role:     the hub role when the roster is known ("" for an ordinary
-//             agent); undefined when unknown, which keeps the saved membership
-//   saved:    restored membership
-//   explicit: the owner's own move of an unbound terminal
-// A new unbound terminal the owner opens always lands in home.
-export function homePlacement({
-  binding,
-  role = binding?.role,
-  saved,
-  explicit,
-} = {}) {
-  if (binding) return role === undefined ? !!saved : role === "owner_helper";
-  if (explicit !== undefined) return !!explicit;
-  if (saved !== undefined) return !!saved;
-  return true;
+// Whether a pane belongs in the home area: only the owner helper's pane does.
+//   binding: the pane's task binding, if any
+//   role:    the hub role when the roster is known ("" for an ordinary
+//            agent); undefined when unknown, which keeps the saved membership
+//   saved:   restored membership
+// A terminal the owner opens is never in home, whatever was saved.
+export function homePlacement({ binding, role = binding?.role, saved } = {}) {
+  if (!binding) return false;
+  return role === undefined ? !!saved : role === "owner_helper";
 }
+
+// The helper window's name, from the hub role rather than the tmux session.
+export const helperLabel = (binding, projectName) =>
+  binding?.role === "owner_helper"
+    ? projectName
+      ? `Owner helper - ${projectName}`
+      : "Owner helper"
+    : "";
 
 // Every task-bound attach ignores size, so it never resizes other clients.
 export const attachOptions = (binding) => ({ ignoreSize: !!binding });

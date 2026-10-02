@@ -4,7 +4,8 @@ import { assertTerminalBounds } from "./terminal-bounds.mjs";
 // Pane image upload (fa356b7) and the tab session menu with its decoration
 // (f9be48d) are static-mode controls. Server mode must not show them; every
 // other layout, drag, keyboard and close check runs in both modes.
-// TailOS (static mode) opens every owner terminal in the pinned Home area.
+// TailOS (static mode) pins Home for the owner helper only: every terminal the
+// owner opens is an ordinary tab, and with no helper there is no Home tab.
 async function groupsDialog(page) {
   await page.locator("#commands").click();
   await page.locator("#command-query").fill("Manage terminal groups");
@@ -17,10 +18,6 @@ const homeIds = (page) =>
   page
     .locator(".pane-header[data-home]")
     .evaluateAll((nodes) => nodes.map((n) => n.dataset.pane));
-async function focusHome(page) {
-  await page.locator(".tab-strip > .home-tab [data-tab]").click();
-  await page.locator(".tab-strip > .home-tab.active").waitFor();
-}
 async function openShell(page) {
   const before = await page.locator(".terminal-instance").count();
   await page.locator("#new-tab").click();
@@ -34,145 +31,195 @@ async function openShell(page) {
     before,
   );
 }
-// Gives every Home shell its own tab through the Terminal groups dialog, the
-// focused one last so it stays focused. Returns the ids in Home order.
+// No terminal the owner opens is in Home, so there is nothing to move; kept for
+// the suites that call it before their per-tab checks.
 export async function homeShellsToTabs(page) {
-  const homeTab = page.locator(".tab-strip > .home-tab");
-  if (!(await homeTab.locator("[data-close]").count())) return [];
-  const focused = await page
-    .locator(".tab.active [data-tab]")
-    .getAttribute("data-tab")
-    .catch(() => null);
-  await focusHome(page);
-  const homed = await homeIds(page);
-  const order = [
-    ...homed.filter((id) => id !== focused),
-    ...homed.filter((id) => id === focused),
-  ];
-  for (const id of order) {
-    if (!(await page.locator(`.pane-header[data-pane="${id}"]`).isVisible()))
-      await focusHome(page);
-    await page.locator(`.pane-header[data-pane="${id}"] .pane-label`).click();
-    await groupsDialog(page);
-    await page.locator('[data-home-move="out"]').click();
-    await page.locator(`#tabs [data-tab="${id}"]`).waitFor();
-  }
-  return homed;
+  assert.deepEqual(
+    await page
+      .locator(".pane-header[data-home]")
+      .evaluateAll((nodes) =>
+        nodes
+          .map((n) => n.dataset.pane)
+          .filter((id) => document.querySelector(`#tabs [data-tab="${id}"]`)),
+      ),
+    [],
+  );
+  return [];
 }
-// Home shells leave through the Terminal groups dialog, so the per-tab checks
-// below run on ordinary tabs; they return to Home afterwards.
-async function leaveHome(page) {
+// Static mode with no owner helper: launcher shells are ordinary tabs, nothing
+// is in Home, the Home tab is hidden and nothing offers a move into Home.
+async function checkNoHome(page) {
   const homeTab = page.locator(".tab-strip > .home-tab");
-  if (!(await homeTab.count())) return [];
-  await focusHome(page);
-  const before = await homeIds(page);
-  assert.ok(before.length >= 3, "the launcher shells opened in Home");
-  for (const id of before)
-    assert.equal(
-      await page.locator(`#tabs [data-tab="${id}"]`).count(),
-      0,
-      "a Home shell has no tab of its own",
-    );
-  const homed = await homeShellsToTabs(page);
-  // An empty Home renders only its tab: no region, divider or close control.
-  assert.equal(await page.locator(".pane-header[data-home]").count(), 0);
+  assert.equal(await homeTab.count(), 1, "TailOS keeps the Home tab element");
+  assert.ok(
+    (await page.locator("#tabs [data-tab]").count()) >= 3,
+    "the launcher shells opened as tabs",
+  );
+  assert.deepEqual(await homeIds(page), [], "no shell is in Home");
   assert.equal(await page.locator(".home-divider").count(), 0);
-  assert.equal(await homeTab.locator("[data-close]").count(), 0);
-  assert.equal(await homeTab.locator(".tab-name").innerText(), "Home");
-  await checkHomeTab(page);
-  return homed;
-}
-// The Home tab: outside the scrolling strip, at every width and while the
-// launcher shows, aligned with the tabs and the + control. Selection is fill.
-async function checkHomeTab(page) {
-  const homeTab = page.locator(".tab-strip > .home-tab");
-  const original = page.viewportSize();
   assert.equal(await page.locator("#tabs .home-tab").count(), 0);
+  assert.equal(
+    await page.title(),
+    "Tailterm · Your servers, one workspace",
+    "the default title without a helper",
+  );
+  const original = page.viewportSize();
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: original.height });
-    assert.ok(await homeTab.isVisible(), `Home tab visible at ${width}px`);
-    const home = await homeTab.boundingBox(),
-      plus = await page.locator("#new-tab").boundingBox(),
+    assert.ok(
+      await homeTab.isHidden(),
+      `no Home tab without a helper at ${width}px`,
+    );
+    const plus = await page.locator("#new-tab").boundingBox(),
       tab = await page.locator("#tabs .tab").first().boundingBox();
-    for (const [name, box] of [
-      ["+", plus],
-      ["tab", tab],
-    ])
-      assert.ok(
-        Math.abs(home.y - box.y) < 1 && Math.abs(home.height - box.height) < 1,
-        `Home tab matches the ${name} frame at ${width}px`,
-      );
+    assert.ok(
+      Math.abs(tab.y - plus.y) < 1 && Math.abs(tab.height - plus.height) < 1,
+      `tabs match the + frame at ${width}px`,
+    );
   }
   await page.setViewportSize(original);
-  const activeTab = page.locator("#tabs .tab.active");
-  const fill = await activeTab.evaluate(
-    (el) => getComputedStyle(el).backgroundColor,
-  );
-  const idle = await homeTab.evaluate(
-    (el) => getComputedStyle(el).backgroundColor,
-  );
-  assert.notEqual(fill, idle, "an idle Home tab is not filled");
-  const focused = await activeTab
-    .locator("[data-tab]")
+  const focused = await page
+    .locator("#tabs .tab.active [data-tab]")
     .getAttribute("data-tab");
   await page.locator("#new-tab").click();
   await page.locator("#empty-terminal").waitFor({ state: "visible" });
+  assert.ok(await homeTab.isHidden(), "no Home tab while the launcher shows");
+  await page.locator(`#tabs [data-tab="${focused}"]`).click();
+  await groupsDialog(page);
+  await page.locator("#dialog [data-merge]").first().waitFor();
+  assert.equal(
+    await page.locator("[data-home-move]").count(),
+    0,
+    "Terminal groups offers no move into or out of Home",
+  );
+  assert.equal(
+    await page.locator("#dialog").getByText("Home", { exact: true }).count(),
+    0,
+  );
+  await page.keyboard.press("Escape");
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+}
+// A new launcher shell is one more ordinary tab, never a Home pane.
+async function checkShellOpensAsTab(page) {
+  const tabCount = () => page.locator("#tabs .tab").count();
+  const before = await tabCount();
+  await openShell(page);
+  assert.equal(await tabCount(), before + 1, "a new shell gets its own tab");
+  assert.deepEqual(await homeIds(page), []);
+  assert.ok(await page.locator(".tab-strip > .home-tab").isHidden());
+  const opened = await page
+    .locator("#tabs .tab.active [data-tab]")
+    .getAttribute("data-tab");
+  await page
+    .locator(`.pane-header[data-pane="${opened}"]`)
+    .getByRole("button", { name: "Close pane", exact: true })
+    .click();
+  await page.waitForFunction(
+    (count) => document.querySelectorAll("#tabs .tab").length === count,
+    before,
+  );
+}
+
+const sameBox = (a, b) =>
+  ["x", "y", "width", "height"].every((key) => Math.abs(a[key] - b[key]) < 1);
+// The owner helper's window, for a suite with a hub fixture and a bound
+// owner_helper pane `id`. Focuses Home and checks that it is named from the
+// hub role and the project (never the tmux session), in the Home tab and the
+// browser title, and that the helper is alone at the full terminal width.
+// Returns the helper header's box within the terminal area; pass an earlier one
+// as `same` to assert the window kept its place and size. `plain` is an ordinary tab that Home refuses.
+export async function checkHelperWindow(
+  page,
+  { id, project, session, same, plain, step = "helper window" },
+) {
+  const name = `Owner helper - ${project}`;
+  const homeTab = page.locator(".tab-strip > .home-tab");
+  await homeTab.locator(`[data-tab="${id}"]`).click();
+  await page.locator(".tab-strip > .home-tab.active").waitFor();
+  assert.equal(await homeTab.locator(".tab-name").textContent(), name, step);
+  assert.equal(
+    await homeTab.locator(".home-mark").getAttribute("aria-label"),
+    `Home: ${name}`,
+    step,
+  );
+  if (session)
+    assert.ok(
+      !(await homeTab.locator("[data-tab]").textContent()).includes(session),
+      `${step}: the Home tab does not show the tmux session name`,
+    );
+  await page.waitForFunction((text) => document.title.includes(text), name);
+  assert.equal(
+    await page.locator(`#tabs [data-tab="${id}"]`).count(),
+    0,
+    `${step}: the helper has no ordinary tab`,
+  );
+  assert.deepEqual(await homeIds(page), [id], `${step}: the helper alone`);
+  assert.equal(
+    await page.locator(".pane-header:not([data-home])").count(),
+    0,
+    `${step}: no group shows beside Home`,
+  );
+  assert.equal(await page.locator(".home-divider").count(), 0, step);
+  const header = page.locator(`.pane-header[data-home][data-pane="${id}"]`);
+  assert.equal(await header.locator("[data-detach]").count(), 0, step);
   assert.ok(
-    await homeTab.isVisible(),
-    "Home tab stays while the launcher shows",
+    (await header.locator(".pane-label").textContent()).startsWith(name),
+    `${step}: the pane header names the helper`,
+  );
+  // The box is relative to the terminal area: at narrow widths the shell
+  // around it can scroll sideways by a pixel, which is not Home moving.
+  const box = await header.evaluate((el) => {
+    const body = document.querySelector("#terminal-body");
+    const r = el.getBoundingClientRect(),
+      b = body.getBoundingClientRect();
+    return {
+      x: r.x - b.x,
+      y: r.y - b.y,
+      width: r.width,
+      height: r.height,
+      body: body.clientWidth,
+    };
+  });
+  assert.ok(
+    Math.abs(box.x) <= 1 && Math.abs(box.width - box.body) <= 1,
+    `${step}: the helper fills the terminal width (${box.width} of ${box.body})`,
+  );
+  if (same)
+    assert.ok(
+      sameBox(box, same),
+      `${step}: the helper kept its place and size (${JSON.stringify(box)} was ${JSON.stringify(same)})`,
+    );
+  if (plain) {
+    const tab = page.locator(`#tabs .tab:has([data-tab="${plain}"])`);
+    for (const target of [homeTab, header]) {
+      await tab.dragTo(target);
+      await homeTab.locator(`[data-tab="${id}"]`).click();
+      await header.waitFor();
+      assert.deepEqual(await homeIds(page), [id], `${step}: drop refused`);
+      assert.equal(
+        await page.locator(`#tabs [data-tab="${plain}"]`).count(),
+        1,
+        `${step}: the plain tab stays a tab`,
+      );
+    }
+  }
+  return box;
+}
+// Focusing a group shows the group alone: Home never sits beside it.
+export async function checkGroupAlone(page, tabId) {
+  await page.locator(`#tabs [data-tab="${tabId}"]`).click();
+  await page.locator(`.pane-header[data-pane="${tabId}"]`).waitFor();
+  assert.deepEqual(await homeIds(page), [], "a focused group hides Home");
+  assert.equal(await page.locator(".home-divider").count(), 0);
+  assert.ok(
+    await page.locator(".tab-strip > .home-tab").isVisible(),
+    "the Home tab stays in the strip",
   );
   assert.equal(await page.locator(".tab-strip > .home-tab.active").count(), 0);
-  await page.locator(`#tabs [data-tab="${focused}"]`).click();
-  return fill;
-}
-async function returnHome(page, homed) {
-  if (!homed.length) return;
-  const tabCount = () => page.locator("#tabs .tab").count();
-  // With Home empty, a new launcher shell lands in Home, as does a second.
-  const fill = await page
-    .locator("#tabs .tab.active")
-    .evaluate((el) => getComputedStyle(el).backgroundColor);
-  const homeTab = page.locator(".tab-strip > .home-tab.active");
-  for (const expected of [1, 2]) {
-    const before = await tabCount();
-    await openShell(page);
-    assert.equal(await tabCount(), before, "no tab is added for a Home shell");
-    await homeTab.waitFor();
-    const ids = await homeIds(page);
-    assert.equal(ids.length, expected);
-    // The Home tab mirrors Home's focused pane.
-    const focused = ids.at(-1);
-    assert.equal(
-      await homeTab.locator("[data-tab]").getAttribute("data-tab"),
-      focused,
-    );
-    const label = (
-      await page
-        .locator(`.pane-header[data-pane="${focused}"] .pane-label`)
-        .innerText()
-    ).split(" · ")[0];
-    assert.equal(await homeTab.locator(".tab-name").innerText(), label);
-    assert.equal(
-      await homeTab.locator(".home-mark").getAttribute("aria-label"),
-      `Home: ${label}`,
-    );
-    assert.equal(
-      await homeTab.evaluate((el) => getComputedStyle(el).backgroundColor),
-      fill,
-      "an active Home tab uses the same fill as an active tab",
-    );
-  }
-  for (const id of homed) {
-    const tab = page.locator(`#tabs [data-tab="${id}"]`);
-    if (!(await tab.count())) continue;
-    await tab.click();
-    await groupsDialog(page);
-    await page.locator('[data-home-move="in"]').click();
-    await page
-      .locator(`#tabs [data-tab="${id}"]`)
-      .waitFor({ state: "detached" });
-  }
-  await focusHome(page);
+  assert.ok(
+    !(await page.title()).includes("Owner helper"),
+    "the title names the helper only while it is focused",
+  );
 }
 
 export async function exercisePaneGroups(
@@ -186,7 +233,7 @@ export async function exercisePaneGroups(
       0,
       "server mode has no Home area",
     );
-  const homed = staticControls ? await leaveHome(page) : [];
+  if (staticControls) await checkNoHome(page);
   const originalCount = await page.locator("#tabs .tab").count();
   const ids = await page
     .locator("#tabs [data-tab]")
@@ -721,5 +768,5 @@ export async function exercisePaneGroups(
     for (const id of ids.slice(0, 2))
       assert.equal(await tab(id).getAttribute("data-tab-color"), "default");
   }
-  await returnHome(page, homed);
+  if (staticControls) await checkShellOpensAsTab(page);
 }

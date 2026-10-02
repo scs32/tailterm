@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { openVault } from "../client/vault-crypto.js";
+import { checkGroupAlone, checkHelperWindow } from "./pane-groups-browser.mjs";
 
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
 // configuration, task creation with a spawned agent, mirroring of agents the
@@ -236,9 +237,10 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     "original tab reactivated",
   );
 
-  // The owner helper's pane lives in Home (wi_d6327b69ba901602). The owner
-  // resumes a session from the launcher before the hub reports it as the
-  // helper: adoption moves that same tab into Home and replaces its plain
+  // Only the owner helper's pane lives in Home (wi_d6327b69ba901602,
+  // wi_33e3858e611cdd0b). The owner resumes a session from the launcher, as an
+  // ordinary tab, before the hub reports it as the helper: adoption moves
+  // that same tab into Home and replaces its plain
   // attach with an ignore-size attach-session, whether the first attach has
   // connected or is still connecting. Size-log entries are recorded only for
   // attach-session commands (never new-session); each carries its flag.
@@ -255,11 +257,11 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     const id = await page
       .locator(".tab.active [data-tab]")
       .getAttribute("data-tab");
-    await homePane(id).waitFor();
+    await page.locator(`#tabs [data-tab="${id}"]`).waitFor();
     assert.equal(
-      await page.locator(`#tabs [data-tab="${id}"]`).count(),
+      await homePane(id).count(),
       0,
-      `${name} opened in Home, not as a tab`,
+      `${name} opened as a tab, not in Home`,
     );
     assert.deepEqual(
       attaches(name).map((e) => e.ignoreSize),
@@ -299,6 +301,69 @@ export async function exerciseTasks(page, hub, origin, ssh) {
       ),
     "helper connected in Home with the same tab",
   );
+  // The helper window: named from the hub role and project, alone at the full
+  // terminal width, and in the same place after a reconnect, a roster join and
+  // close, and a visit to the project group, wide and narrow.
+  const viewport = page.viewportSize();
+  const plainId = await page
+    .locator("#tabs .tab:not(.task-tab) [data-tab]")
+    .first()
+    .getAttribute("data-tab");
+  const helperWindow = (step, same, extra) =>
+    checkHelperWindow(page, {
+      id: helperTab,
+      project: "home-adopt",
+      session: "helper-fx",
+      same,
+      step,
+      ...extra,
+    });
+  const terminals = () => page.locator(".terminal-instance").count();
+  for (const width of [1440, 800]) {
+    await page.setViewportSize({ width, height: viewport.height });
+    const at = (step) => `${step} at ${width}px`;
+    const box = await helperWindow(at("adopted"), undefined, {
+      plain: plainId,
+    });
+    const before = attaches("helper-fx").length;
+    await page.locator("#reconnect").click();
+    await waitFor(
+      async () =>
+        attaches("helper-fx").length > before &&
+        (await homePane(helperTab).count()) === 1 &&
+        (await homePane(helperTab).locator(".pane-label").innerText()).endsWith(
+          "Connected",
+        ),
+      at("helper reconnected"),
+    );
+    assert.equal(attaches("helper-fx").at(-1).ignoreSize, true);
+    await helperWindow(at("after a reconnect"), box);
+    const panes = await terminals();
+    const joiner = hub.api.addAgent(adopter.id, { name: `joiner-${width}` });
+    ssh.sessions.add(joiner.name);
+    hub.api.event(adopter.id, "started", joiner.id);
+    await waitFor(
+      async () => (await terminals()) === panes + 1,
+      at("joined agent pane"),
+    );
+    await helperWindow(at("after a roster join"), box);
+    hub.api.event(adopter.id, "closed", joiner.id);
+    await waitFor(
+      async () => (await terminals()) === panes,
+      at("closed agent pane"),
+    );
+    ssh.sessions.delete(joiner.name);
+    await helperWindow(at("after a roster close"), box);
+    await checkGroupAlone(
+      page,
+      await page
+        .locator("#tabs .tab.task-tab [data-tab]")
+        .getAttribute("data-tab"),
+    );
+    await helperWindow(at("after visiting the project group"), box);
+  }
+  await page.setViewportSize(viewport);
+  await helperWindow("original width");
   // The same, while the launcher attach is still connecting.
   ssh.hold("helper-hold");
   ssh.sessions.add("helper-hold");
@@ -312,9 +377,11 @@ export async function exerciseTasks(page, hub, origin, ssh) {
   const heldTab = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
-  await homePane(heldTab).waitFor();
+  const heldPane = page.locator(`.pane-header[data-pane="${heldTab}"]`);
+  await heldPane.waitFor();
+  assert.equal(await homePane(heldTab).count(), 0, "a tab until adopted");
   assert.match(
-    await homePane(heldTab).locator(".pane-label").innerText(),
+    await heldPane.locator(".pane-label").innerText(),
     /Connecting$/,
   );
   const held = hub.api.addAgent(adopter.id, {
@@ -337,15 +404,18 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     "held helper connected in Home",
   );
   assert.equal(attaches("helper-hold").at(-1).ignoreSize, true);
-  // An ordinary agent adopted the same way leaves Home for its project group,
-  // and its attach is unchanged.
+  // An ordinary agent adopted the same way joins its project group, never
+  // Home, and its attach is unchanged.
   const plainTab = await resume("plain-fx");
   const plain = hub.api.addAgent(adopter.id, { name: "plain-fx" });
   hub.api.event(adopter.id, "started", plain.id);
   await waitFor(
-    async () => (await homePane(plainTab).count()) === 0,
-    "adopted agent left Home",
+    async () =>
+      (await page.locator(`#tabs [data-tab="${plainTab}"]`).count()) === 0 ||
+      (await page.locator("#tabs .tab.task-tab.active").count()) === 1,
+    "adopted agent joined its project group",
   );
+  assert.equal(await homePane(plainTab).count(), 0, "never in Home");
   await page.locator("#tabs .tab.task-tab button[role=tab]").click();
   await page
     .locator(`.pane-header:not([data-home])[data-pane="${plainTab}"]`)
@@ -422,7 +492,7 @@ export async function exerciseTaskRestore(page, hub, ssh) {
       .click();
   };
   // Every tab and the tmux session of each of its panes, read from the UI.
-  // Home panes show beside every group, so they are read once, as Home.
+  // Home shows alone, never beside a group, so it is read once, as Home.
   async function inventory() {
     await page.locator(".mode-switch [data-mode=terminals]").click();
     const out = [];
@@ -540,6 +610,36 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     );
   }, "bound project panes");
 
+  // The live project's owner helper: its window must come back named, alone
+  // and in the same place after every restore and after a browser refresh.
+  const helperAgent = hub.api.addAgent(L.task.id, {
+    name: "owner-helper-rs",
+    session: "helper-rs",
+    role: "owner_helper",
+  });
+  ssh.sessions.add("helper-rs");
+  hub.api.event(L.task.id, "started", helperAgent.id);
+  await waitFor(async () => {
+    const tabs = await inventory();
+    return tabs
+      .find((t) => t.home)
+      ?.panes.some(
+        (p) => p.session === "helper-rs" && p.status === "Connected",
+      );
+  }, "helper pane in Home");
+  const helperId = await page
+    .locator(".tab-strip > .home-tab [data-tab]")
+    .getAttribute("data-tab");
+  const helperWindow = (step, same) =>
+    checkHelperWindow(page, {
+      id: helperId,
+      project: "restore-live",
+      session: "helper-rs",
+      same,
+      step,
+    });
+  const helperBox = await helperWindow("before the restores");
+
   // Each pane saves its project binding in its session bookmark once tmux
   // verifies the session.
   await waitFor(async () => {
@@ -596,6 +696,7 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     assert.ok(!tabs.some((t) => t.name === name), `${name} has no tab`);
   const panes = allPanes(tabs);
   assert.equal(new Set(panes).size, panes.length, "no agent has two panes");
+  await helperWindow("after the first restore", helperBox);
 
   // Cycle 2: the hub closes l1 while its restored pane is connecting.
   ssh.hold("l1");
@@ -623,6 +724,7 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     tabs = await inventory();
     return sessionsOf(tabs, "restore-live")?.join() === "l2";
   }, "l1 pane removed");
+  await helperWindow("after the second restore", helperBox);
   // Saving resumed: a tab opened now is restored at the next login.
   ssh.sessions.add("marker");
   await page.locator("#new-tab").click();
@@ -652,6 +754,21 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   assert.ok(cycle3.includes("marker"), "marker tab restored");
   for (const name of ["p1", "p2", "l1", "l3", "n2"])
     assert.ok(!cycle3.includes(name), `${name} is not attached in cycle 3`);
+  await helperWindow("after the third restore", helperBox);
+
+  // A browser refresh restores the same way.
+  await page.reload();
+  await page.locator("#lockscreen").waitFor();
+  await unlock();
+  await waitFor(restored, "restore after a refresh", 90000);
+  await waitFor(
+    async () =>
+      (await page
+        .locator(`.tab-strip > .home-tab [data-tab="${helperId}"]`)
+        .count()) === 1,
+    "helper restored after a refresh",
+  );
+  await helperWindow("after a browser refresh", helperBox);
 
   // Bookmarks of closed and finished agents lose their project binding.
   await page.locator("#backup-vault").click();
@@ -671,24 +788,16 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   // Leave the hub and tabs as the later checks expect them.
   for (const { task } of [L, N, X]) hub.api.closeTask(task.id);
   await waitFor(
-    async () => (await page.locator("#tabs .tab.task-tab").count()) === 0,
-    "restore projects closed",
+    async () =>
+      (await page.locator("#tabs .tab.task-tab").count()) === 0 &&
+      (await page.locator(".tab-strip > .home-tab [data-tab]").count()) === 0,
+    "restore projects and the helper closed",
   );
+  ssh.sessions.delete("helper-rs");
   const marker = page.locator("#tabs .tab", {
     has: page.locator(".tab-name", { hasText: /^marker$/ }),
   });
   if (await marker.count()) await marker.locator("[data-close]").click();
-  // In TailOS the marker opened in Home.
-  const homeMarker = page.locator(".pane-header[data-home]", {
-    has: page.locator(".pane-label", { hasText: / · marker · / }),
-  });
-  if (await page.locator(".tab-strip > .home-tab [data-tab]").count()) {
-    await page.locator(".tab-strip > .home-tab [data-tab]").click();
-    if (await homeMarker.count())
-      await homeMarker
-        .getByRole("button", { name: "Close pane", exact: true })
-        .click();
-  }
   for (const name of ["l3", "n2"]) ssh.gone.delete(name);
   console.log(
     `Task restore passed: stuck restore finished ${finishedIn} ms after the hub closed a connecting pane, no flash, paused/closed projects dropped, live projects bound, finished sessions checked, bookmarks unbound.`,

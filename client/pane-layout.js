@@ -174,14 +174,16 @@ const appendTab = (tree, id) =>
 const appendBelow = (tree, id) =>
   split("y", tree, { tab: id }, 1 - 1 / (leaves(tree).length + 1));
 
-// The home area's default share of the body width.
+// Home's width share in saved workspaces. Home now shows alone at full width,
+// so the value is only normalized and kept.
 export const HOME_RATIO = 0.4;
 export const clampHomeRatio = (value) =>
   Number.isFinite(value) ? Math.min(0.8, Math.max(0.2, value)) : HOME_RATIO;
 
 export class PaneGroups {
   groups = [];
-  // The pinned home area: {tree, active, ratio}, or null when empty. Its panes
+  // The pinned home area, for the owner helper only: {tree, active, ratio}, or
+  // null when empty. ratio is kept for saved workspaces and unused. Its panes
   // are never in groups, so every group operation refuses them.
   home = null;
   boundTabs = new Set();
@@ -268,6 +270,15 @@ export class PaneGroups {
   ) {
     this.boundTabs = new Set(ids.filter((id) => agentOf(id)));
     const homeIds = ids.filter((id) => homeOf(id));
+    // Home holds only the owner helper. A plain terminal an older workspace
+    // saved there moves out once, with the others, into one ordinary group
+    // that keeps their arrangement.
+    const was = this.home;
+    const evicted = was
+      ? leaves(was.tree).filter(
+          (id) => ids.includes(id) && !homeIds.includes(id) && !agentOf(id),
+        )
+      : [];
     this.#syncHome(homeIds);
     ids = ids.filter((id) => !homeIds.includes(id));
     this.tabOrder = [...ids];
@@ -293,6 +304,12 @@ export class PaneGroups {
       this.#leaveSeries(next, leaves(g.tree).length);
       return [next];
     });
+    const moved = evicted.filter((id) => !this.group(id));
+    if (moved.length)
+      this.groups.push({
+        tree: prune(was.tree, new Set(moved)),
+        active: moved.includes(was.active) ? was.active : moved[0],
+      });
     for (const id of ids)
       if (!this.group(id)) {
         const group = { tree: { tab: id }, active: id };
@@ -621,54 +638,6 @@ export class PaneGroups {
 
   inHome(tab) {
     return !!this.home && leaves(this.home.tree).includes(tab);
-  }
-  // Only an unbound terminal may move into home; agent panes never do.
-  canHome(tab) {
-    return !!this.group(tab) && !this.boundTabs.has(tab);
-  }
-  // Moves a plain terminal from its group into home: next to target when a
-  // placement is given, otherwise at the bottom.
-  toHome(tab, target, placement) {
-    if (!this.canHome(tab)) return false;
-    const group = this.group(tab),
-      count = leaves(group.tree).length;
-    if (group.guests) group.guests = group.guests.filter((id) => id !== tab);
-    this.#remove(group, tab);
-    if (group.tree) {
-      if (group.tree.tab) delete group.decoration;
-      this.#leaveSeries(group, count);
-    }
-    this.#normalizeSeries();
-    if (group.taskId && this.groups.includes(group)) this.#capture(group);
-    if (!this.home)
-      this.home = { tree: { tab }, active: tab, ratio: HOME_RATIO };
-    else if (
-      this.inHome(target) &&
-      ["right", "left", "above", "below"].includes(placement)
-    )
-      this.home.tree = replace(
-        this.home.tree,
-        target,
-        this.#placed(tab, target, placement),
-      );
-    else this.home.tree = appendBelow(this.home.tree, tab);
-    this.home.active = tab;
-    return true;
-  }
-  // A plain home terminal becomes its own tab; the helper never leaves.
-  leaveHome(tab) {
-    if (!this.inHome(tab) || this.boundTabs.has(tab)) return false;
-    const tree = prune(
-      this.home.tree,
-      new Set(leaves(this.home.tree).filter((id) => id !== tab)),
-    );
-    if (!tree) this.home = null;
-    else {
-      this.home.tree = tree;
-      if (this.home.active === tab) this.home.active = leaves(tree)[0];
-    }
-    this.groups.push({ tree: { tab }, active: tab });
-    return true;
   }
   homeSwap(source, target) {
     if (source === target || !this.inHome(source) || !this.inHome(target))
