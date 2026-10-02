@@ -264,7 +264,6 @@ test("Planned delivery verifies alongside review and verifies exactly what merge
   assert.match(verifier, /verify-matrix\.mjs targeted CONTEXT_JSON/);
   assert.match(verifier, /never imported and never gates acceptance/);
   assert.match(verifier, /stop its run with SIGINT/);
-  assert.match(verifier, /one matrix run per host at a time/);
   assert.match(verifier, /pick checks yourself; the runner selects them/);
   assert.match(handler, /Freeze each plan's base at the current local tasks-hub tip/);
   assert.match(handler, /Never import a targeted-receipt\.json/);
@@ -407,4 +406,19 @@ test("lead and verifier run the validated hub operations without a handler turn"
     assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, `${member.name} is ${member.prompt.length} characters`);
   const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
   assert.ok(bundle.includes("Import the receipt yourself: tt verification receipt"), "generated plan.mjs lacks the verifier's import");
+});
+
+// wi_8c5f65b4d6038b43 / order #20747: runs start at once and wait in the
+// host lock's ordered waitlist; nobody waits for an idle host by hand.
+test("verifier and small lead start the matrix at once and wait in the host waitlist", () => {
+  const verifier = exampleTeam("planned").members.find((m) => m.name === "verifier").prompt,
+    lead = exampleTeam("small").members.find((m) => m.name === "lead").prompt;
+  const tail =
+    "; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host.";
+  assert.ok(verifier.includes("Start each run at once" + tail));
+  assert.ok(lead.includes("node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once" + tail));
+  for (const prompt of [verifier, lead]) assert.doesNotMatch(prompt, /one matrix run per host/);
+  const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
+  assert.equal(bundle.split(tail).length - 1, 2);
+  assert.ok(!bundle.includes("one matrix run per host"));
 });

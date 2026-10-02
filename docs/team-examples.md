@@ -1156,6 +1156,8 @@ recorded exact focused verification before lead acceptance.
 Verification no longer waits for review to finish
 ([fast verification](objective-verification.md#parallel-scheduling-and-targeted-runs),
 wi_82ed4c6924930bad). Only one matrix run is active on a host at a time.
+Each run is started at once and waits its turn in the host lock's ordered
+waitlist; nobody waits for an idle host by hand.
 
 1. The builder freezes candidate C1. The lead sends the REVIEW. At the same
    time the handler freezes the full plan on the current tasks-hub tip, and the
@@ -1198,7 +1200,7 @@ Use a fresh clean detached worktree at the exact SHA. Run node scripts/verify-ma
 
 Import the receipt yourself: tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, where N is the frozen plan's generation. The hub checks it against the plan, saves immutable native evidence and notifies lead, reviewer and handler; if it refuses, send lead the named reason. Never import a targeted-receipt.json. AIV bindings remain explicitly unsubmitted; do not call external services. Report concrete failures to lead, linked with --work-item ID --work-item-revision N --work-order-message SEQ; never claim item completion. A later commit, matrix or scope change requires a new plan and run.
 
-For a fix candidate, lead may REQUEST a targeted run: node scripts/verify-matrix.mjs targeted CONTEXT_JSON EXTERNAL_LOG_DIRECTORY, where the context names baseCommit (the previous candidate) and commit (the fix). It runs only the checks the fix's paths select and writes targeted-receipt.json. Report it to lead as iteration evidence; it is never imported and never gates acceptance. The runner runs independent checks in parallel, so run one matrix run per host at a time and no ad hoc tests beside it. When lead withdraws a superseded candidate's REQUEST, stop its run with SIGINT (Ctrl-C); an interrupted run writes no receipt.
+For a fix candidate, lead may REQUEST a targeted run: node scripts/verify-matrix.mjs targeted CONTEXT_JSON EXTERNAL_LOG_DIRECTORY, where the context names baseCommit (the previous candidate) and commit (the fix). It runs only the checks the fix's paths select and writes targeted-receipt.json. Report it to lead as iteration evidence; it is never imported and never gates acceptance. Start each run at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. When lead withdraws a superseded candidate's REQUEST, stop its run with SIGINT (Ctrl-C); an interrupted run writes no receipt.
 
 ## Project roles
 
