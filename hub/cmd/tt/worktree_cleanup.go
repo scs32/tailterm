@@ -90,6 +90,9 @@ type worktreeDecision struct {
 	Manifest string `json:"manifest,omitempty"`
 	// recorded marks a decision whose receipt this call wrote.
 	recorded bool
+	// strayRoot is set on a checkout kept for lying outside the artifacts
+	// root: the root in use, or "none".
+	strayRoot string
 }
 
 type worktreeEvidence struct {
@@ -753,6 +756,9 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			d.Kind = kindArtifactCheckout
 		}
 		reason, detail := classifyWorktree(ctx, common, main, w, admin, in, inUse, linked, cited, cleared, art)
+		if strayReason, strayDetail, root := strayCheckout(w, in, art); strayReason != "" && reason == strayReason && detail == strayDetail {
+			d.strayRoot = root
+		}
 		if reason == keepMissing && !blockerChecked {
 			blockerChecked = true
 			if blocker, err = pruneBlocker(ctx, common, worktrees); err != nil {
@@ -807,7 +813,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			}
 		}
 	}
-	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, cited, cleared, art, now)...)
+	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, art, now)...)
 	if in.Apply {
 		for i := range decisions {
 			recorded, err := recordWorktreeDecision(in.Receipt, decisions[i], now)
@@ -887,6 +893,8 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 			return reason, detail
 		}
 		eligible = detail
+	} else if reason, detail, _ := strayCheckout(w, in, art); reason != "" {
+		return reason, detail
 	}
 	// Every linked worktree inside it counts, selected or not, unless it
 	// goes first in this pass or is already gone.
@@ -977,10 +985,17 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 var artifactItemIDPattern = regexp.MustCompile(`^wi_[0-9a-f]{16}$`)
 
 // artifactsRootFor names the artifacts tree of the repository whose main
-// checkout is main: TAILTERM_ARTIFACTS, else the sibling <main>-artifacts.
-// Tests replace it.
+// checkout is main: TAILTERM_ARTIFACTS, else the sibling <main>-artifacts. A
+// TAILTERM_ARTIFACTS that is not absolute names no tree: it says so once and
+// returns "", so no verifier checkout is examined. Tests replace it.
 var artifactsRootFor = func(main string) string {
 	if dir := os.Getenv("TAILTERM_ARTIFACTS"); dir != "" {
+		if !filepath.IsAbs(dir) {
+			artifactsRootWarning.Do(func() {
+				fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACTS=%q is not an absolute path; verifier checkouts are left alone\n", dir)
+			})
+			return ""
+		}
 		return dir
 	}
 	if main == "" {
@@ -1171,6 +1186,37 @@ func (a *artifactPass) checkoutItem(w gitWorktree) string {
 		return ""
 	}
 	return item
+}
+
+// strayCheckout reports a detached worktree below a folder named for an item
+// that is not a verifier checkout of the artifacts root in use, as happens
+// when that root is wrong or unset. It returns the keep reason and detail and
+// the root in use ("none" without one), or "" for any other worktree. Such a
+// checkout is never judged under the ordinary rules: it is kept as
+// item-active while an item it is filed under runs and as retention otherwise.
+func strayCheckout(w gitWorktree, in worktreeCleanupInputs, art *artifactPass) (string, string, string) {
+	if in.Items == nil || !w.Detached || art.checkoutItem(w) != "" {
+		return "", "", ""
+	}
+	root := "none"
+	if art != nil {
+		root = art.root
+	}
+	filed := false
+	for dir := filepath.Dir(w.Path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		item := filepath.Base(dir)
+		if !artifactItemIDPattern.MatchString(item) {
+			continue
+		}
+		filed = true
+		if st, ok := in.Items[item]; ok && st.State == artifactItemRunning {
+			return keepItemActive, st.Detail, root
+		}
+	}
+	if !filed {
+		return "", "", ""
+	}
+	return keepRetention, "outside the artifacts root " + root + "; check --artifacts or TAILTERM_ARTIFACTS", root
 }
 
 // gate returns the keep reason while the item holds its checkouts, or "" with
@@ -1592,27 +1638,31 @@ func sessionTempCandidates(in worktreeCleanupInputs, main string, linked []strin
 	return out
 }
 
-// sessionTempIdle is the time since the folder or one of its direct children
-// last changed.
+// sessionTempIdle is the time since anything in the folder, at any depth,
+// last changed. A folder that cannot be read through counts as changed now.
 func sessionTempIdle(folder string, now time.Time) time.Duration {
 	newest := time.Time{}
-	if info, err := os.Lstat(folder); err == nil {
-		newest = info.ModTime()
-	}
-	children, _ := os.ReadDir(folder)
-	for _, d := range children {
-		if info, err := d.Info(); err == nil && info.ModTime().After(newest) {
+	err := filepath.WalkDir(folder, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(newest) {
 			newest = info.ModTime()
 		}
-	}
-	if newest.IsZero() {
+		return nil
+	})
+	if err != nil || newest.IsZero() {
 		return 0
 	}
 	return now.Sub(newest)
 }
 
 // classifySessionTemp returns the first keep reason for a temp folder, or "".
-func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) (string, string) {
+func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) (string, string) {
 	key := filepath.Base(t.Folder)
 	// The key is lossy: directories that differ only in punctuation share a
 	// folder, so an equal key counts as in use.
@@ -1622,6 +1672,11 @@ func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCan
 		}
 		if claudeScratchKey(p) == key {
 			return keepInUse, "a session directory in use has this key: " + p
+		}
+		// Sessions key their folder by their start directory, which may be
+		// the worktree root above the path in use.
+		if root := linkedRoot(p, linked); root != "" && claudeScratchKey(root) == key {
+			return keepInUse, "a session started in " + root + " has a directory in use: " + p
 		}
 		if pathWithin(p, t.Folder) {
 			return keepInUse, "in use at " + p
@@ -1689,7 +1744,7 @@ func removeSessionTemp(root, folder string) error {
 // cleanupSessionTemp decides each candidate temp folder and, when applying,
 // removes the removable ones. It runs after the worktree pass, so worktrees
 // that pass removed from a scratchpad no longer hold their folder.
-func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTempCandidate, inUse []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) []worktreeDecision {
+func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) []worktreeDecision {
 	if len(temp) == 0 {
 		return nil
 	}
@@ -1697,7 +1752,7 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 	decisions := make([]worktreeDecision, 0, len(temp))
 	for _, t := range temp {
 		d := worktreeDecision{Path: t.Folder, Kind: kindSessionTemp}
-		reason, detail := classifySessionTemp(in, main, t, inUse, cited, cleared, art, now)
+		reason, detail := classifySessionTemp(in, main, t, inUse, linked, cited, cleared, art, now)
 		if reason != "" {
 			d.Action, d.Reason, d.Detail = "kept", reason, detail
 			decisions = append(decisions, d)
@@ -1925,12 +1980,21 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	jsonOut := fs.Bool("json", false, "print JSON")
 	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
 	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old")
-	artifacts := fs.String("artifacts", "", "artifacts root (default: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)")
+	artifacts := fs.String("artifacts", "", "artifacts root, an absolute path (default: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || *hub == "" || *minIdle < 0 || *acceptedAfter < 0 {
 		return errors.New("usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]")
+	}
+	// A relative artifacts root would name no tree and turn the item rules
+	// off, so it is refused before anything is read. The flag overrides the
+	// variable.
+	if *artifacts != "" && !filepath.IsAbs(*artifacts) {
+		return fmt.Errorf("--artifacts must be an absolute path, not %q", *artifacts)
+	}
+	if dir := os.Getenv("TAILTERM_ARTIFACTS"); *artifacts == "" && dir != "" && !filepath.IsAbs(dir) {
+		return fmt.Errorf("TAILTERM_ARTIFACTS must be an absolute path, not %q; fix it or pass --artifacts", dir)
 	}
 	repo := *cwd
 	if repo == "" {
@@ -2032,12 +2096,20 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	if report.Worktrees == nil {
 		report.Worktrees = []worktreeDecision{}
 	}
+	strays, strayRoot := 0, ""
 	for _, d := range decisions {
 		report.Totals.Actions[d.Action]++
 		if d.Action == "kept" {
 			report.Totals.Kept[d.Reason]++
 		}
 		report.Totals.Bytes += d.Bytes
+		if d.strayRoot != "" {
+			strays, strayRoot = strays+1, d.strayRoot
+		}
+	}
+	if strays > 0 {
+		noun := map[bool]string{true: "checkout is", false: "checkouts are"}[strays == 1]
+		fmt.Fprintf(os.Stderr, "tt: %d detached %s under an item folder but outside the artifacts root %s; kept. Check --artifacts or TAILTERM_ARTIFACTS\n", strays, noun, strayRoot)
 	}
 	if *jsonOut {
 		printJSON(report)

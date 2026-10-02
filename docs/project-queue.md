@@ -1256,6 +1256,13 @@ as a check; it deletes.
 - The artifacts root is `<main checkout>-artifacts`, the sibling of the
   repository's main worktree. `TAILTERM_ARTIFACTS` overrides it, and on the
   sweep `--artifacts DIR` overrides both.
+- A wrong root never frees a checkout. `--artifacts` and `TAILTERM_ARTIFACTS`
+  must be absolute: the sweep refuses a relative one before it reads the hub,
+  and closeout prints one line to stderr and leaves the artifacts tree alone.
+  A detached checkout under a folder named for an item but outside the root in
+  use is kept, as `item-active` while its item runs and as `retention`
+  otherwise, and the sweep warns on stderr with the count and the root it
+  used.
 - An item's checkouts go once the item is released, or once its acceptance is
   N old. Released means its newest finished queue entry has a release job in
   state `released`, a published release, or an owner integration. Accepted
@@ -1321,10 +1328,14 @@ when all of these hold:
   linked worktree is treated as shared too.
 - No directory in use has the same key (`in-use`). In use means the cwd or
   worktree of a queued, launching, running or unreleased failed entry, or the
-  cwd of an agent that is not closed. The key is lossy, so two directories
-  that differ only in punctuation share a folder and protect each other.
-- Sweep only: the folder and its direct children are older than `--min-idle`
-  (`recent`). This covers a session that is not on the roster.
+  cwd of an agent that is not closed, and the linked worktree that contains
+  such a path: a session started at a worktree's root is protected while any
+  directory below that root is in use. Closeout and the sweep apply the same
+  rule. The key is lossy, so two directories that differ only in punctuation
+  share a folder and protect each other.
+- Sweep only: nothing anywhere below the folder, at any depth, changed within
+  `--min-idle` (`recent`). A folder the sweep cannot read through counts as
+  changed. This covers a session that is not on the roster.
 - No receipt text names it (`evidence`): queue evidence, tracked docs, and the
   receipt and plan files of the items it belongs to.
 - No Git repository or kept worktree remains inside it (`nested`). Scratchpad
@@ -1344,8 +1355,9 @@ directories reports `0 B`.
 Keep reasons, in the order checked for a verifier checkout: `locked`,
 `missing`, `in-use`, `item-active` (an entry of the item is queued, launching,
 running or failed and not released, or an agent bound to the item is not
-closed), `retention` (accepted less than N ago, or the item has no queue
-record: unknown is never treated as released), `nested`, `recent` (sweep
+closed), `retention` (accepted less than N ago, the item has no queue
+record: unknown is never treated as released, or the checkout is outside the
+artifacts root in use), `nested`, `recent` (sweep
 only), `evidence`, `operation`, `dirty`, and `remove-failed`. `unpushed`
 applies only to ordinary worktrees and branch checkouts.
 
