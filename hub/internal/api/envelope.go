@@ -166,6 +166,38 @@ var (
 	severityValues = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
 )
 
+// MaxReviewFindingTitleLen is the work item title limit ValidTaskName applies:
+// the hub files each review finding as a held item under the finding's title.
+const MaxReviewFindingTitleLen = 120
+
+// ReviewFindingTitleProblems names every finding whose title could not become
+// a work item title. A title is refused exactly when ValidTaskName refuses it,
+// so tt send and the hub agree.
+func ReviewFindingTitleProblems(r *ReviewMetadata) []Problem {
+	var out []Problem
+	for i, f := range r.Findings {
+		if ValidTaskName(f.Title) {
+			continue
+		}
+		id := f.ID
+		if id == "" {
+			id = strconv.Itoa(i)
+		}
+		rule := fmt.Sprintf("; a title is 1 to %d characters", MaxReviewFindingTitleLen)
+		reason := "must not contain control characters" + rule
+		switch n := utf8.RuneCountInString(f.Title); {
+		case n == 0:
+			reason = "must not be empty" + rule
+		case n > MaxReviewFindingTitleLen:
+			reason = fmt.Sprintf("must be at most %d characters, has %d", MaxReviewFindingTitleLen, n)
+		case strings.TrimSpace(f.Title) != f.Title:
+			reason = "must not start or end with a space" + rule
+		}
+		out = append(out, Problem{Field: "review.findings[" + id + "].title", Reason: reason})
+	}
+	return out
+}
+
 // ValidateEnvelope is pure and deterministic. It returns every problem found,
 // in a stable order; nil means the envelope is valid.
 func ValidateEnvelope(e Envelope) []Problem {
@@ -178,6 +210,7 @@ func ValidateEnvelope(e Envelope) []Problem {
 		if r.Mode == "general" && e.Kind != "review" && e.Kind != "result" || r.Mode == "focused" && e.Kind != "request" && e.Kind != "result" || (r.Mode == "disposition" || r.Mode == "reconcile") && e.Kind != "notice" {
 			out = append(out, Problem{Field: "review.mode", Reason: "does not match message kind"})
 		}
+		out = append(out, ReviewFindingTitleProblems(r)...)
 	}
 	add := func(field, format string, args ...any) {
 		out = append(out, Problem{Field: field, Reason: fmt.Sprintf(format, args...)})

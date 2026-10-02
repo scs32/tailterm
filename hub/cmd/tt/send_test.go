@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -252,5 +253,102 @@ func TestReviewConvergenceSendMetadataFile(t *testing.T) {
 	}
 	if err = cmdSend(e, []string{"--kind", "notice", "--subject", "Invalid review fixture transition", "--text", "Invalid", "--review-file", path}); err == nil || !strings.Contains(err.Error(), "review.mode") {
 		t.Fatal(err)
+	}
+}
+
+// A finding title the hub would refuse when filing the follow-up is refused
+// before any request, naming the finding and the limit.
+func TestSendRefusesBadReviewFindingTitleLocally(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("hub contacted: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+	e := env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"}
+	candidate := strings.Repeat("a", 40)
+	for name, tc := range map[string]struct{ title, want string }{
+		"over limit":   {strings.Repeat("t", 121), "review.findings[f3].title: must be at most 120 characters, has 121"},
+		"multibyte":    {strings.Repeat("é", 121), "review.findings[f3].title: must be at most 120 characters, has 121"},
+		"empty":        {"", "review.findings[f3].title: must not be empty; a title is 1 to 120 characters"},
+		"space padded": {" Padded title", "review.findings[f3].title: must not start or end with a space; a title is 1 to 120 characters"},
+		"control":      {"Tab\tin title", "review.findings[f3].title: must not contain control characters; a title is 1 to 120 characters"},
+	} {
+		review := api.ReviewMetadata{Mode: "general", Candidate: candidate, Findings: []api.ReviewFinding{{ID: "f2", Title: "A fine title"}, {ID: "f3", Title: tc.title}}}
+		reviewPath := filepath.Join(t.TempDir(), "review.json")
+		raw, _ := json.Marshal(review)
+		if err := os.WriteFile(reviewPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		envelope := api.Envelope{Kind: "result", Subject: "Review fixture passes its checks", Review: &review, Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}}, Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "fixture", Outcome: "pass"}}}
+		envelopePath := filepath.Join(t.TempDir(), "msg.json")
+		raw, _ = json.Marshal(envelope)
+		if err := os.WriteFile(envelopePath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for form, args := range map[string][]string{
+			"review-file": {"--kind", "result", "--subject", "Review fixture passes its checks", "--outcome", "done", "--status", "a1=pass", "--evidence", "e1: fixture -> pass", "--review-file", reviewPath},
+			"file":        {"--file", envelopePath},
+		} {
+			err := cmdSend(e, args)
+			var exit *exitError
+			if !errors.As(err, &exit) || exit.code != 2 {
+				t.Fatalf("%s via --%s: want exit 2, got %v", name, form, err)
+			}
+			if !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "findings[f2]") {
+				t.Fatalf("%s via --%s: error %q", name, form, err)
+			}
+		}
+	}
+}
+
+// A 120-character finding title is at the limit: the review result posts and
+// the hub files the follow-up under that title.
+func TestSendPostsReviewFindingTitleAtLimit(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	ctx := context.Background()
+	reviewer, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "reviewer", Host: "host", Session: "reviewer", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Finding title limit fixture", RequestID: "item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: 1, Relationship: "primary"}}
+	assign := api.Envelope{Kind: "assign", Subject: "Implement exact title fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "passes"}}}
+	order, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &assign, WorkItems: links, RequestID: "assign"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := strings.Repeat("a", 40)
+	request := api.Envelope{Kind: "review", Subject: "Review exact title fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: map[string]string{"a1": "passes"}}}
+	review, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &request, WorkItems: links, To: reviewer.ID, RequestID: "review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	title := strings.Repeat("é", 120)
+	raw, _ := json.Marshal(api.ReviewMetadata{Mode: "general", Candidate: candidate, Findings: []api.ReviewFinding{{ID: "f1", Title: title, File: "fixture.go", Line: 1}}})
+	path := filepath.Join(t.TempDir(), "review.json")
+	if err = os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.agent, e.agentName, e.runID = reviewer.ID, reviewer.Name, reviewer.RunID
+	out, err := captureCLIOutput(t, func() error {
+		return cmdSend(e, []string{"--kind", "result", "--subject", "Title fixture review passes checks", "--outcome", "done", "--status", "a1=pass",
+			"--evidence", "e1: fixture -> pass", "--review-file", path, "--reply-to", fmt.Sprint(review.Seq),
+			"--work-item", item.ID, "--work-item-revision", "1", "--work-order-message", fmt.Sprint(order.Seq), "--request-id", "result"})
+	})
+	if err != nil || !strings.HasPrefix(out, "posted #") {
+		t.Fatalf("at-limit title: %q %v", out, err)
+	}
+	items, err := c.ListWorkItems(ctx, task.ID, "", "", 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filed := false
+	for _, it := range items.Items {
+		filed = filed || it.Title == title
+	}
+	if !filed {
+		t.Fatalf("follow-up not filed under the at-limit title: %+v", items.Items)
 	}
 }
