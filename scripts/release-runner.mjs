@@ -21,6 +21,32 @@ const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const REASON = /^[A-Za-z0-9 ,.:;()_\/-]{1,160}$/;
 export function releaseError(reason) { const error = new Error(reason); error.releaseReason = reason; return error; }
 export function failureReason(error) { const r = error?.releaseReason; return typeof r === "string" && REASON.test(r) ? r : "unclassified"; }
+// A conflicting path is named only when it matches this subset of REASON's
+// characters; any other path is counted and its text dropped.
+const CONFLICT_PATH = /^[A-Za-z0-9_.\/-]{1,120}$/, CONFLICT_PATHS = 50;
+// What the private journal keeps of a failure beside the reason. Nothing is
+// copied unless validated here: the tag only when failureReason accepts it
+// (a rejected tag leaves its length and why, never its text), conflict paths
+// only when they match CONFLICT_PATH, and for an untagged error its class
+// name and code. message, stack, cause and child output are never read.
+export function failureDetail(error) {
+  const detail = {}, tag = error?.releaseReason, count = n => Number.isSafeInteger(n) && n >= 0;
+  if (typeof tag === "string") {
+    if (REASON.test(tag)) detail.text = tag;
+    else { detail.tagRejected = tag.length > 160 && /^[A-Za-z0-9 ,.:;()_\/-]+$/.test(tag) ? "length" : "characters"; detail.tagLength = tag.length; }
+  } else {
+    if (typeof error?.name === "string" && /^[A-Za-z]{1,40}$/.test(error.name)) detail.name = error.name;
+    if (typeof error?.code === "string" && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code)) detail.code = error.code;
+  }
+  const conflict = error?.conflict;
+  if (conflict && typeof conflict === "object") {
+    const listed = Array.isArray(conflict.paths) ? conflict.paths : [], valid = listed.filter(p => typeof p === "string" && CONFLICT_PATH.test(p)), dropped = listed.length - valid.length;
+    detail.paths = valid.slice(0, CONFLICT_PATHS);
+    if (count(conflict.count)) detail.pathCount = conflict.count;
+    if (count(conflict.rejected) || dropped) detail.pathsRejected = (count(conflict.rejected) ? conflict.rejected : 0) + dropped;
+  }
+  return detail;
+}
 function childReason(argv, error) {
   const base = p => String(p).split("/").pop(), program = /\.(py|mjs)$/.test(argv[1] || "") ? base(argv[1]) : base(argv[0]);
   const name = /^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program";
@@ -138,23 +164,35 @@ export function matrixHeldNotice(job, held) {
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 export function integrateCandidate(cwd, job, branch="tasks-hub") {
-  if (branch !== "tasks-hub" || !sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit !== job.commit) throw new Error("Release binding mismatch");
-  if (git(cwd,"status","--porcelain")) throw new Error("Dirty deployment checkout");
+  if (branch !== "tasks-hub" || !sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit !== job.commit) throw releaseError("Release binding mismatch");
+  if (git(cwd,"status","--porcelain")) throw releaseError("Dirty deployment checkout");
   const expected = git(cwd,"rev-parse",`refs/heads/${branch}`);
-  if (!sha(expected) || git(cwd,"rev-parse",`${job.commit}^{commit}`)!==job.commit || git(cwd,"rev-parse",`${job.baseCommit}^{commit}`)!==job.baseCommit) throw new Error("Unknown commit identity");
-  try { git(cwd,"merge-base","--is-ancestor",job.baseCommit,job.commit); } catch { throw new Error("Unknown candidate base"); }
+  // rev-parse itself fails for a commit this repository does not have.
+  let known;
+  try { known = sha(expected) && git(cwd,"rev-parse",`${job.commit}^{commit}`)===job.commit && git(cwd,"rev-parse",`${job.baseCommit}^{commit}`)===job.baseCommit; } catch { known = false; }
+  if (!known) throw releaseError("Unknown commit identity");
+  try { git(cwd,"merge-base","--is-ancestor",job.baseCommit,job.commit); } catch { throw releaseError("Unknown candidate base"); }
   git(cwd,"checkout","--detach",expected);
   try {
     try {git(cwd,"merge-base","--is-ancestor",expected,job.commit);git(cwd,"checkout","--detach",job.commit);}
     catch {
       const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
-      if (!commits.length || commits.some(c => git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2)) throw new Error("Nonlinear candidate series");
+      if (!commits.length || commits.some(c => git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2)) throw releaseError("Nonlinear candidate series");
       git(cwd,"cherry-pick",...commits);
     }
-  } catch {
+  } catch (error) {
+    // The unmerged paths are read before the abort discards them, untrimmed
+    // and without git's stderr, and reduced here to valid paths and counts.
+    let unmerged=[];
+    try {unmerged=[...new Set(execFileSync("git",["diff","--name-only","--diff-filter=U","-z"],{cwd,encoding:"utf8",stdio:["ignore","pipe","ignore"]}).split("\0").filter(Boolean))].sort();} catch {}
+    const valid=unmerged.filter(p=>CONFLICT_PATH.test(p)),conflict={paths:valid.slice(0,CONFLICT_PATHS),count:unmerged.length,rejected:unmerged.length-valid.length};
     try {git(cwd,"cherry-pick","--abort");} catch {}
     git(cwd,"checkout","--detach",expected);
-    throw new Error("Candidate integration refused");
+    if (typeof error?.releaseReason==="string") throw error;
+    if (!conflict.count) throw releaseError("Candidate integration refused");
+    // All the paths or only their count, never a partial list.
+    const named="integration-conflict: "+conflict.paths.join(", "),listed=conflict.rejected===0 && conflict.count<=CONFLICT_PATHS && REASON.test(named);
+    const refused=releaseError(listed?named:`integration-conflict: ${conflict.count} path${conflict.count===1?"":"s"}`);refused.conflict=conflict;throw refused;
   }
   const integrated=git(cwd,"rev-parse","HEAD");
   return {expected,integrated,changed:diffPaths(cwd,expected,integrated)};
@@ -166,14 +204,14 @@ export function tasksHubCheckedOut(cwd) {
   return git(cwd,"worktree","list","--porcelain").split("\n").includes("branch refs/heads/tasks-hub");
 }
 export function publishIntegration(cwd, integrated, expected) {
-  if (!sha(integrated)||!sha(expected)||git(cwd,"rev-parse","HEAD")!==integrated||git(cwd,"status","--porcelain")) throw new Error("Integrated checkout changed");
-  if (tasksHubCheckedOut(cwd)) throw new Error("tasks-hub is checked out in a worktree");
-  try {git(cwd,"update-ref","refs/heads/tasks-hub",integrated,expected);}catch{throw new Error("Release ref race");}
+  if (!sha(integrated)||!sha(expected)||git(cwd,"rev-parse","HEAD")!==integrated||git(cwd,"status","--porcelain")) throw releaseError("Integrated checkout changed");
+  if (tasksHubCheckedOut(cwd)) throw releaseError("tasks-hub is checked out in a worktree");
+  try {git(cwd,"update-ref","refs/heads/tasks-hub",integrated,expected);}catch{throw releaseError("Release ref race");}
 }
 // D1: after a rollback, tasks-hub gets a commit whose tree is the pre-release
 // tree, so the next release does not ship the rolled-back change again.
 export function revertCommit(cwd, job, integrated, expected) {
-  if (!sha(integrated)||!sha(expected)) throw new Error("Revert binding required");
+  if (!sha(integrated)||!sha(expected)) throw releaseError("Revert binding required");
   const message=`Revert release ${job.id} (rolled back)\n\nRestores the tree of ${expected} after the live rollback of ${integrated}.\n\nRelease-Job: ${job.id}\n${job.itemId?`Work-Item: ${job.itemId}\n`:""}`;
   return execFileSync("git",["commit-tree",git(cwd,"rev-parse",`${expected}^{tree}`),"-p",integrated,"-F","-"],{cwd,input:message,encoding:"utf8",stdio:["pipe","pipe","pipe"]}).trim();
 }
@@ -196,11 +234,11 @@ export function pushRelease(cwd, commit, remote="origin") {
 // stamp its parent's revision). Go artifacts are therefore built in a
 // temporary shared clone detached at the exact commit, removed afterwards.
 export function withBuildCheckout(cwd, commit, build) {
-  if (!sha(commit)) throw new Error("Exact build commit required");
+  if (!sha(commit)) throw releaseError("Exact build commit required");
   const dir=mkdtempSync(join(tmpdir(),"tailterm-release-build-")),src=join(dir,"src");
   try {
     git(dir,"clone","--quiet","--shared","--no-checkout",resolve(cwd),src);git(src,"checkout","--quiet","--detach",commit);
-    if(git(src,"rev-parse","HEAD")!==commit||git(src,"status","--porcelain"))throw new Error("Build checkout mismatch");
+    if(git(src,"rev-parse","HEAD")!==commit||git(src,"status","--porcelain"))throw releaseError("Build checkout mismatch");
     return build(src);
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
@@ -227,9 +265,9 @@ const hostLockPath=(cwd,job)=>join(tmpdir(),"tailterm-release-locks",digest(cwd+
 export async function runRelease(config, adapter) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
-  if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw new Error("Claimed verified job required");
+  if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw releaseError("Claimed verified job required");
   const lock=hostLockPath(cwd,job);mkdirSync(dirname(lock),{recursive:true,mode:0o700});
-  let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw new Error("Release host locked; inspect prior execution");}
+  let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw releaseError("Release host locked; inspect prior execution");}
   writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
   let state={version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,phase:"prepared",effects:[]};
   if(existsSync(journalPath)){
@@ -241,7 +279,7 @@ export async function runRelease(config, adapter) {
     else {
       closeSync(fd);rmSync(lock);
       if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete") return prior.receipt;
-      throw new Error("Ambiguous journal requires handler reconciliation");
+      throw releaseError("Ambiguous journal requires handler reconciliation");
     }
   }
   const checkpoint=()=>save(journalPath,state);let step=null;
@@ -264,7 +302,10 @@ export async function runRelease(config, adapter) {
     // set aside, nothing here touches the checkout, starts a run or refuses.
     if(state.phase==="prepared" && adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return {jobId:job.id,outcome:"waiting_matrix"};
     checkpoint();await fence();
-    const integration=["waiting_matrix","waiting_inputs"].includes(state.phase)?{expected:state.expected,integrated:state.integrated}:integrateCandidate(cwd,job);state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
+    let integration;
+    if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
+    else{step={step:"integrate"};integration=integrateCandidate(cwd,job);step=null;}
+    state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(integration.integrated!==job.commit){
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
@@ -323,7 +364,10 @@ export async function runRelease(config, adapter) {
     return await pushAndFinish(receipt);
   } catch (error) {
     // The first failed target step is kept; a resumed run never rewrites it.
-    if(step && !state.failure){state.failure={...step,reason:failureReason(error)};checkpoint();}
+    if(step && !state.failure){state.failure={...step,reason:failureReason(error)};state.failureDetail??=failureDetail(error);checkpoint();}
+    // The first failure's validated detail is kept even when no step was set;
+    // a journal that cannot be written here is left to the checkpoints below.
+    if(!state.failureDetail){state.failureDetail=failureDetail(error);try{checkpoint();}catch{}}
     if(state.phase==="pushing")return {jobId:job.id,outcome:"pushing"};
     if(state.phase==="finishing" || state.phase==="receipt_pending"){
       state.phase="receipt_pending";checkpoint();return {jobId:job.id,outcome:"receipt_pending"};
@@ -331,7 +375,7 @@ export async function runRelease(config, adapter) {
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
     if(!state.published && state.effects.length===0){
-      state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw new Error("Release refused before publication");
+      state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
     }
     let blocked=state.effects.length===0;
     // Newest effect first, except that a paired hub is restored before its
@@ -369,10 +413,10 @@ export async function runRelease(config, adapter) {
       // Retryable like the success receipt: a lost response resumes this
       // exact receipt and generation, with no second rollback or escalation.
       state.finishGeneration=adapter.job?.generation??job.generation;state.phase="receipt_pending";checkpoint();
-      try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw new Error("Release failed; final receipt pending retry");}
+      try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw releaseError("Release failed; final receipt pending retry");}
       state.phase="blocked";checkpoint();
     }else{await adapter.block(job.id);}
-    throw new Error("Release failed; inspect saved journal");
+    throw releaseError("Release failed; inspect saved journal");
   } finally {closeSync(fd);rmSync(lock);}
 }
 
@@ -386,7 +430,7 @@ export class HostAdapter {
     // What the last poll saw: a wait on the host list, or a held run.
     this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
-    if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw new Error("Invalid host operation argv");
+    if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout});}
     catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
   }
@@ -397,7 +441,7 @@ export class HostAdapter {
   async fence(){try{this.native("check");return true;}catch{return false;}}
   // The project handler by the project rule (hub operation "handler"): a
   // finished entry holds no item lease, so role addressing is refused there.
-  handler(){const h=JSON.parse(this.command([this.config.tt||"tt","deployment","handler"]));if(!/^agt_[a-f0-9]+$/.test(h?.id||""))throw new Error("Project database handler required");return h.id;}
+  handler(){const h=JSON.parse(this.command([this.config.tt||"tt","deployment","handler"]));if(!/^agt_[a-f0-9]+$/.test(h?.id||""))throw releaseError("Project database handler required");return h.id;}
   async requestBug({commit,outcome}){
     const id=`${this.job.id}-rollback-bug`;
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","File a bug for a release that was rolled back","--ask",`Release job ${this.job.id} was rolled back after publication. File a bug linked to item ${this.job.itemId} so the change is fixed before it ships again. The tasks-hub revert ${commit||"was not created"} is ${outcome}; the private host journal has the rest.`,"--request-id",id,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`,...(commit?["--ref",`revert-commit=${commit}`]:[])]);
@@ -412,7 +456,7 @@ export class HostAdapter {
     // One directory per integrated commit and requeue attempt: a handler
     // requeue (a new reconciliation) never reuses an earlier attempt's host
     // wait or receipt, while a runner resumed within an attempt does.
-    if(!sha(job.integratedCommit))throw new Error("Exact integrated commit required");
+    if(!sha(job.integratedCommit))throw releaseError("Exact integrated commit required");
     const dir=join(this.config.journalDirectory,job.id+"-integrated-verification",`${job.integratedCommit}-r${job.reconciliations?.length||0}`);mkdirSync(dir,{recursive:true,mode:0o700});
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
     this.matrixWait=null;this.matrixHeld=null;
@@ -462,7 +506,7 @@ export class HostAdapter {
     // A failed intent save starts nothing and takes the ordinary refusal path.
     this.saveRun(dir,run);
     let pid;
-    try{pid=this.startMatrixRun(["node","scripts/verify-matrix.mjs","run",planPath,dir,"--priority",priority,"--item",NAME(job.itemId??this.job.itemId),"--host-wait-minutes",String(minutes)],dir);if(!Number.isSafeInteger(pid)||pid<=0)throw new Error("No matrix run pid");}
+    try{pid=this.startMatrixRun(["node","scripts/verify-matrix.mjs","run",planPath,dir,"--priority",priority,"--item",NAME(job.itemId??this.job.itemId),"--host-wait-minutes",String(minutes)],dir);if(!Number.isSafeInteger(pid)||pid<=0)throw releaseError("No matrix run pid");}
     catch{
       // Nothing was started, so this attempt is over.
       try{this.saveRun(dir,{...run,state:"ended",reason:"spawn-failed",refusal:"Integrated matrix run could not start"});}catch{}
@@ -479,7 +523,7 @@ export class HostAdapter {
     try{
       const child=spawn(argv[0],argv.slice(1),{cwd:this.config.cwd,detached:true,stdio:["ignore",out,err]});
       child.on("error",()=>{});
-      if(!Number.isSafeInteger(child.pid))throw new Error("Matrix run not started");
+      if(!Number.isSafeInteger(child.pid))throw releaseError("Matrix run not started");
       child.unref();this.matrixChildren.set(dir,child);return child.pid;
     }finally{closeSync(out);closeSync(err);}
   }
@@ -596,9 +640,9 @@ export class HostAdapter {
   }
   jobInputs(commit){
     const path=join(this.config.journalDirectory,this.job.id+"-inputs.json"),raw=readFileSync(path,"utf8");
-    if(fileDigest(path)!==this.job.inputsDigest || this.job.inputsCommit!==commit)throw new Error("Handler input digest binding required");
+    if(fileDigest(path)!==this.job.inputsDigest || this.job.inputsCommit!==commit)throw releaseError("Handler input digest binding required");
     const input=JSON.parse(raw);
-    if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw new Error("Exact job input binding required");
+    if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw releaseError("Exact job input binding required");
     // Two TrueNAS plans made before either deploy would each pin the other's
     // pre-release mount, so hub and bridge together must share one plan.
     const {hub,bridge}=input.targets||{};
@@ -611,9 +655,9 @@ export class HostAdapter {
     artifact.rollbackPath=path;artifact.priorArtifactSHA256=fileDigest(path);artifact.rollbackCaptured=true;
   }
   async prepare(target,commit){
-    if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw new Error("Candidate build checkout mismatch");
-    const t=this.config.targets[target];if(!t)throw new Error("Target host config required");
-    const input=this.jobInputs(commit),perJob=input.targets?.[target];if(!perJob)throw new Error("Exact job target input required");
+    if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw releaseError("Candidate build checkout mismatch");
+    const t=this.config.targets[target];if(!t)throw releaseError("Target host config required");
+    const input=this.jobInputs(commit),perJob=input.targets?.[target];if(!perJob)throw releaseError("Exact job target input required");
     const planTargets=PAIR.includes(target)?perJob.planTargets||[target]:undefined,paired=same(planTargets,PAIR);
     const release=this.job.id+"-"+commit.slice(0,12)+"-"+(paired?"truenas":target);
     if(perJob.release!==release)throw releaseError("Unique job release identity required");
@@ -626,7 +670,7 @@ export class HostAdapter {
       if(diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
       this.command(["npm","run","build:static"]);this.command(["npm","run","verify:release"]);
       const manifest=JSON.parse(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
-      if(manifest.commit!==commit)throw new Error("Static commit mismatch");
+      if(manifest.commit!==commit)throw releaseError("Static commit mismatch");
       artifact.artifactSHA256=digest(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
     }else{
       const filename={hub:"tailterm-hub-linux-amd64",bridge:"tailterm-discord-linux-amd64",mini:"tt-"+this.job.id}[target];
@@ -638,14 +682,14 @@ export class HostAdapter {
       artifact.artifactPath=output;artifact.artifactSHA256=fileDigest(output);if(target==="mini")artifact.version=commit;
     }
     if(artifact.schemaChanged){
-      if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw new Error("Fresh job backup identity required");
+      if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw releaseError("Fresh job backup identity required");
       artifact.migrationBinary=join(this.config.journalDirectory,this.job.id+"-migration");
       withBuildCheckout(this.config.cwd,commit,src=>this.command(["env","CGO_ENABLED=0",`GOOS=${process.platform}`,`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(src,"hub")));
       this.requireStamp(artifact.migrationBinary,commit);
       artifact.migrationBinarySHA256=fileDigest(artifact.migrationBinary);
     }
     if(["hub","bridge"].includes(target)){
-      if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.job.id))throw new Error("Fresh job backup identity required");
+      if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.job.id))throw releaseError("Fresh job backup identity required");
       const plan=JSON.parse(readFileSync(perJob.planPath,"utf8"));
       if(plan.deployment.releaseName!==release || plan.backupDestination!==perJob.backup || fileDigest(perJob.preflightReceipt)!==perJob.preflightReceiptSHA256)throw releaseError("Exact job preflight binding required");
       // Every target the plan changes mounts this release; a partner pinned
@@ -658,17 +702,17 @@ export class HostAdapter {
   // The live probe identifies a release by this stamp, so an artifact
   // without it is refused here, before any deploy.
   requireStamp(path,commit){
-    let info;try{info=buildInfo({run:argv=>({status:0,stdout:this.command(argv)})},path);}catch{throw new Error("Go artifact has no build revision");}
-    if(info.commit!==commit || info.integrity!==true)throw new Error("Go artifact revision does not match the integrated commit");
+    let info;try{info=buildInfo({run:argv=>({status:0,stdout:this.command(argv)})},path);}catch{throw releaseError("Go artifact has no build revision");}
+    if(info.commit!==commit || info.integrity!==true)throw releaseError("Go artifact revision does not match the integrated commit");
   }
   async rehearse(a){
-    if(!a.backupCopy || !a.migrationBinary)throw new Error("Handler backup-copy import required");
-    if(fileDigest(a.backupCopy)!==a.backupSHA256)throw new Error("Imported backup hash mismatch");
+    if(!a.backupCopy || !a.migrationBinary)throw releaseError("Handler backup-copy import required");
+    if(fileDigest(a.backupCopy)!==a.backupSHA256)throw releaseError("Imported backup hash mismatch");
     // The migrated copy is removed when the rehearsal ends, pass or fail. The
     // marker beside it, not the copy, refuses a second attempt; it is saved
     // before the copy exists and holds no path, output or error text.
     const copy=a.backupCopy+".rehearsal-"+this.job.id,marker=copy+".json";
-    if(existsSync(marker))throw new Error("Rehearsal already attempted; inspect prior attempt");
+    if(existsSync(marker))throw releaseError("Rehearsal already attempted; inspect prior attempt");
     const record={version:1,jobId:this.job.id,backupSHA256:a.backupSHA256,startedAt:new Date(this.now()).toISOString(),outcome:"started"};
     save(marker,record);
     const clear=()=>{let gone=true;for(const suffix of COPY_FILES){try{rmSync(copy+suffix,{force:true});}catch{gone=false;}}return gone;};
@@ -676,7 +720,7 @@ export class HostAdapter {
     try{
       // A copy an earlier run left behind is replaced, sidecars included.
       clear();copyFileSync(a.backupCopy,copy);
-      if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw new Error("Candidate migration binary changed");
+      if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw releaseError("Candidate migration binary changed");
       this.command([a.migrationBinary,"--migrate-only",copy]);outcome="passed";
     }finally{
       // Cleanup never changes the rehearsal's result; a copy left here is
@@ -696,18 +740,18 @@ export class HostAdapter {
       for(const p of planTargets.filter(t=>t!==target)){const other=this.artifacts.get(p);if(!other || other.planPath!==a.planPath || other.release!==a.release || !other.artifactPath || fileDigest(other.artifactPath)!==other.artifactSHA256)throw releaseError("Paired artifact changed");}
       this.command(["python3","scripts/deploy-truenas-hub.py",a.release,"--plan",a.planPath,"--preflight-receipt",a.preflightReceipt,"--preflight-receipt-sha256",a.preflightReceiptSHA256,"--update"]);
     }else if(target==="mini"){
-      if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256 || fileDigest(a.installPath)!==a.priorArtifactSHA256)throw new Error("Exact prior-live Mini rollback required");
+      if(!a.rollbackCaptured || fileDigest(a.rollbackPath)!==a.priorArtifactSHA256 || fileDigest(a.installPath)!==a.priorArtifactSHA256)throw releaseError("Exact prior-live Mini rollback required");
       // The live probe counts relay errors only after this deploy.
       const log=this.config.targets?.mini?.relayLog;if(log)save(join(this.config.journalDirectory,"mini-relay-offset.json"),{jobId:this.job.id,offset:existsSync(log)?statSync(log).size:0});
       // tt host setup installs the binary with its own rollback copy, updates
       // the hooks, restarts the relay and runs doctor (docs/host-setup.md).
       this.command(a.hostSetup||[a.artifactPath,"host","setup","--from",a.artifactPath]);
-      if(fileDigest(a.installPath)!==a.artifactSHA256)throw new Error("Mini install does not match the pinned artifact");
+      if(fileDigest(a.installPath)!==a.artifactSHA256)throw releaseError("Mini install does not match the pinned artifact");
     }else{
       const output=this.command(["npx","wrangler","pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",a.commit,"--commit-dirty=false"]);
       // Output is kept out of messages/receipts; a host probe supplies the
       // immutable deployment ID only after independently resolving it.
-      const match=output.match(/https:\/\/([a-f0-9]{8})\.tailos\.pages\.dev/);if(!match)throw new Error("TailOS deployment identity unconfirmed");a.deployment=match[0];
+      const match=output.match(/https:\/\/([a-f0-9]{8})\.tailos\.pages\.dev/);if(!match)throw releaseError("TailOS deployment identity unconfirmed");a.deployment=match[0];
     }
   }
   async check(target){
@@ -781,7 +825,7 @@ export class HostAdapter {
     const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");
     if(details.outcome==="refused"){
       const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
-      return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}. Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+      return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}.${reason.startsWith("integration-conflict")?" Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.":""} Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
     }
     if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`]);
     return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}${waits}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
@@ -858,8 +902,8 @@ export function reconcileReceipts(config,jobs){
 const COPY_FILES=["","-wal","-shm","-journal"],BACKUP_NAMES=["truenas","hub","bridge"],TERMINAL=["released","rolled_back","refused","superseded"];
 export function retentionPolicy(config){
   const retention=config?.retention??{};
-  if(typeof retention!=="object" || Array.isArray(retention))throw new Error("Invalid journal retention");
-  const value=(key,fallback)=>{const v=retention[key]===undefined?fallback:retention[key];if(!Number.isSafeInteger(v) || v<0)throw new Error("Invalid journal retention "+key);return v;};
+  if(typeof retention!=="object" || Array.isArray(retention))throw releaseError("Invalid journal retention");
+  const value=(key,fallback)=>{const v=retention[key]===undefined?fallback:retention[key];if(!Number.isSafeInteger(v) || v<0)throw releaseError("Invalid journal retention "+key);return v;};
   return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296)};
 }
 // Removes only the exact backup and rehearsal copy names of jobs in the
@@ -906,11 +950,11 @@ export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
 // cwd, journal and host references stay those the daemon started with.
 export function readBaselines(configPath){
   const b=JSON.parse(readFileSync(configPath,"utf8")).baselines,targets=["hub","bridge","mini","tailos"];
-  if(!targets.every(t=>sha(b?.[t])))throw new Error("Four last-successful baselines required");
+  if(!targets.every(t=>sha(b?.[t])))throw releaseError("Four last-successful baselines required");
   return Object.fromEntries(targets.map(t=>[t,b[t]]));
 }
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
-  if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw new Error("Explicit private activation config required");
+  if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw releaseError("Explicit private activation config required");
   tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
   retentionPolicy(config);
   // One fence-wait notice per holder, waiting job and reason per process; the
@@ -980,7 +1024,7 @@ if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) 
 }else if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   const index=process.argv.indexOf("--config");
   try{
-    if(index<0)throw new Error("Private config required");
+    if(index<0)throw releaseError("Private config required");
     const config=JSON.parse(readFileSync(process.argv[index+1],"utf8"));
     const controller=new AbortController();process.on("SIGTERM",()=>controller.abort());process.on("SIGINT",()=>controller.abort());
     await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1]});

@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -19,7 +19,7 @@ function change(f,file,text){writeFileSync(join(f.cwd,file),text);git(f.cwd,"add
 function job(f,commit){return {id:"rel_fixture",state:"claimed",commit,baseCommit:f.base,verificationDigest:"a".repeat(64),plan:{commit}};}
 test("fast forward pins exact candidate and ref CAS refuses a race",()=>{const f=fixture();const commit=change(f,"client/a.js","a");const out=integrateCandidate(f.cwd,job(f,commit));assert.equal(out.integrated,commit);git(f.cwd,"update-ref","refs/heads/tasks-hub",commit,f.base);assert.throws(()=>publishIntegration(f.cwd,commit,f.base),/race/);});
 test("full divergent series is cherry picked and conflict leaves ref unchanged",()=>{const f=fixture();change(f,"client/a.js","a");const commit=change(f,"client/b.js","b");git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");const prior=git(f.cwd,"rev-parse","HEAD");const out=integrateCandidate(f.cwd,job(f,commit));assert.notEqual(out.integrated,commit);assert.equal(readFileSync(join(f.cwd,"client/b.js"),"utf8"),"b");assert.equal(git(f.cwd,"rev-parse","tasks-hub"),prior);
-const g=fixture();const conflicting=change(g,"client/base.js","candidate");git(g.cwd,"checkout","tasks-hub");change(g,"client/base.js","release");assert.throws(()=>integrateCandidate(g.cwd,job(g,conflicting)),/refused/);assert.equal(git(g.cwd,"status","--porcelain"),"");});
+const g=fixture();const conflicting=change(g,"client/base.js","candidate");git(g.cwd,"checkout","tasks-hub");change(g,"client/base.js","release");assert.throws(()=>integrateCandidate(g.cwd,job(g,conflicting)),/integration-conflict/);assert.equal(git(g.cwd,"status","--porcelain"),"");});
 test("mismatched verified SHA is refused",()=>{const f=fixture();const commit=change(f,"client/a.js","a");const j=job(f,commit);j.plan.commit=f.base;assert.throws(()=>integrateCandidate(f.cwd,j),/binding/);});
 test("target selection handles rename/delete and rejects unknown paths",()=>{assert.deepEqual(targetsForPaths(["hub/internal/api/releases.go"]),["hub","bridge","mini"]);assert.deepEqual(targetsForPaths(["docs/release.md"]),[]);assert.throws(()=>targetsForPaths(["unknown.xyz"]),/Unknown/);const f=fixture();const commit=change(f,"client/a.js","a");git(f.cwd,"mv","client/base.js","client/moved.js");git(f.cwd,"commit","-m","rename");assert.deepEqual(selectReleaseTargets(f.cwd,Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,f.base])),git(f.cwd,"rev-parse","HEAD")),["tailos"]);});
 function fake(){const calls=[];return {calls,fence:async()=>true,verifyIntegrated:async()=>true,merged:async()=>calls.push("merged"),prepare:async t=>({release:"fixture-release",artifactSHA256:"b".repeat(64)}),deploy:async t=>calls.push("deploy:"+t),check:async()=>true,rollback:async t=>{calls.push("rollback:"+t);return true;},finish:async r=>calls.push("finish"),escalate:async()=>calls.push("escalate"),requestBug:async()=>{calls.push("bug");return "rel_fixture-rollback-bug";},block:async()=>calls.push("block"),refuse:async()=>calls.push("refuse")};}
@@ -1349,4 +1349,142 @@ test("T4 a probe's capture is reduced to the fixed, redacted shape before it rea
  const unavailable={app:"unavailable",logs:[{service:"hub",unavailable:"log read failed"},{service:"discord-bridge",unavailable:"invalid container id"}]};
  const u=readyAdapter("hub",{live:{...READY_DOWN,capture:unavailable}});assert.equal(await u.check("hub"),"readiness");assert.deepEqual(u.probeWait("hub","live").capture,unavailable);
  const s=readyAdapter("hub",{live:{...READY_DOWN,capture:SECRET}});assert.equal(await s.check("hub"),"readiness");assert.deepEqual(s.probeWait("hub","live"),{waitedMs:240000,polls:49,capture:{app:"unavailable",logs:[]}});
+});
+
+// Tagged refusals (g1-g5, g7). A candidate and tasks-hub that write the same
+// files differently, so the cherry-pick leaves each of them unmerged.
+const TOKEN="SYNTHETIC_PRIVATE_TOKEN",NEXT_ACTION="Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.";
+function conflictFixture(files=["client/base.js"]){
+ const f=fixture(),write=text=>{for(const p of files){mkdirSync(dirname(join(f.cwd,p)),{recursive:true});writeFileSync(join(f.cwd,p),text+p);}git(f.cwd,"add",".");git(f.cwd,"commit","-m",text);return git(f.cwd,"rev-parse","HEAD");};
+ const commit=write("candidate ");git(f.cwd,"checkout","tasks-hub");const prior=write("release ");return {f,j:job(f,commit),prior};
+}
+async function journalOf(f,j,arrange=()=>{},expected=/refused/){
+ const a=fake(),c=config(f,j);let escalation;a.escalate=async d=>{escalation=d;a.calls.push("escalate");};arrange(a,c);
+ await assert.rejects(runRelease(c,a),expected);const raw=readFileSync(c.journalPath,"utf8");return {a,c,raw,journal:JSON.parse(raw),escalation};
+}
+const checkoutState=cwd=>({status:git(cwd,"status","--porcelain"),head:git(cwd,"rev-parse","HEAD"),ref:git(cwd,"rev-parse","refs/heads/tasks-hub")});
+function refusesUnchanged(cwd,j,tag){
+ const before=checkoutState(cwd);assert.throws(()=>integrateCandidate(cwd,j),e=>failureReason(e)===tag,tag);assert.deepEqual(checkoutState(cwd),before,tag);return before;
+}
+test("g4 a candidate that conflicts with tasks-hub is refused at step integrate with a reason naming the paths",async()=>{
+ const {f,j,prior}=conflictFixture(),reason="integration-conflict: client/base.js",r=await journalOf(f,j);
+ assert.deepEqual(r.a.calls,["refuse","escalate"]);assert.equal(r.journal.phase,"refused");
+ assert.deepEqual(r.journal.failure,{step:"integrate",reason});assert.equal(r.journal.refusalReason,reason);
+ assert.deepEqual(r.journal.failureDetail,{text:reason,paths:["client/base.js"],pathCount:1,pathsRejected:0});
+ assert.deepEqual(r.escalation,{jobId:"rel_fixture",outcome:"refused",reason});assert.ok(!r.raw.includes("unclassified"));
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),prior);assert.equal(git(f.cwd,"status","--porcelain"),"");
+});
+test("g4 paths are named only when every one is valid and the reason fits, else they are counted",async()=>{
+ const secret=`client/token=${TOKEN}.js`,a=conflictFixture(["client/base.js",secret]),ra=await journalOf(a.f,a.j);
+ assert.equal(ra.journal.refusalReason,"integration-conflict: 2 paths");assert.deepEqual(ra.journal.failure,{step:"integrate",reason:"integration-conflict: 2 paths"});
+ assert.deepEqual(ra.journal.failureDetail,{text:"integration-conflict: 2 paths",paths:["client/base.js"],pathCount:2,pathsRejected:1});
+ for(const text of [ra.raw,JSON.stringify(ra.escalation)]){assert.ok(!text.includes(TOKEN));assert.ok(!text.includes("token="));}
+ assert.equal(git(a.f.cwd,"status","--porcelain"),"");
+ // The first and last sorted names carry a space that a trimmed read would lose.
+ const b=conflictFixture([" lead.js","client/base.js","zz-trail.js "]),rb=await journalOf(b.f,b.j);
+ assert.deepEqual(rb.journal.failureDetail,{text:"integration-conflict: 3 paths",paths:["client/base.js"],pathCount:3,pathsRejected:2});assert.ok(!rb.raw.includes("lead.js"));assert.ok(!rb.raw.includes("zz-trail"));
+ const long=["a","b","c"].map(x=>"client/"+x.repeat(93)+".js"),c=conflictFixture(long),rc=await journalOf(c.f,c.j);
+ assert.deepEqual(rc.journal.failureDetail,{text:"integration-conflict: 3 paths",paths:long,pathCount:3,pathsRejected:0});assert.equal(rc.escalation.reason,"integration-conflict: 3 paths");
+ const over="client/"+"d".repeat(111)+".js",d=conflictFixture([...long,over]),rd=await journalOf(d.f,d.j);assert.equal(over.length,121);
+ assert.deepEqual(rd.journal.failureDetail,{text:"integration-conflict: 4 paths",paths:long,pathCount:4,pathsRejected:1});assert.ok(!rd.raw.includes(over));
+ const one=conflictFixture([secret]),ro=await journalOf(one.f,one.j);assert.equal(ro.journal.refusalReason,"integration-conflict: 1 path");assert.deepEqual(ro.journal.failureDetail.paths,[]);
+ // The journal's own validation: at most 50 paths, and only valid strings.
+ const many=Array.from({length:60},(_,i)=>`client/f${i}.js`),capped=failureDetail(Object.assign(releaseError("integration-conflict: 60 paths"),{conflict:{paths:many,count:60,rejected:0}}));
+ assert.equal(capped.paths.length,50);assert.equal(capped.pathCount,60);assert.equal(capped.pathsRejected,0);
+ const mixed=failureDetail(Object.assign(releaseError("integration-conflict: 4 paths"),{conflict:{paths:["client/a.js",7,null,`token=${TOKEN}`,"x".repeat(121)],count:-1,rejected:"many"}}));
+ assert.deepEqual(mixed,{text:"integration-conflict: 4 paths",paths:["client/a.js"],pathsRejected:4});
+});
+test("g4 the refusal notice for a conflict names the reason and the next action, and no other refusal changes",async()=>{
+ const calls=[],notice=new HostAdapter({cwd:tmpdir(),journalDirectory:tmpdir()},{id:"rel_fixture"});notice.command=argv=>{calls.push(argv);return "";};
+ const text=()=>calls.at(-1)[calls.at(-1).indexOf("--text")+1];
+ await notice.escalate({jobId:"rel_fixture",outcome:"refused",reason:"integration-conflict: client/base.js"});
+ assert.equal(text(),`Release rel_fixture was refused before publication; nothing was published or deployed. Reason: integration-conflict: client/base.js. ${NEXT_ACTION} Handler reconciliation required.`);
+ assert.equal(calls[0][calls[0].indexOf("--subject")+1],"Release refused before publication");assert.equal(calls[0][calls[0].indexOf("--request-id")+1],"rel_fixture-release-failure");
+ await notice.escalate({jobId:"rel_fixture",outcome:"refused",reason:"integration-conflict: 2 paths"});assert.ok(text().includes("Reason: integration-conflict: 2 paths. "+NEXT_ACTION));
+ await notice.escalate({jobId:"rel_fixture",outcome:"refused",reason:"Missing matrix prerequisites: .build/test.wasm"});
+ assert.equal(text(),"Release rel_fixture was refused before publication; nothing was published or deployed. Reason: Missing matrix prerequisites: .build/test.wasm. Handler reconciliation required.");
+ await notice.escalate({jobId:"rel_fixture",outcome:"refused",reason:`integration-conflict: token=${TOKEN}`});assert.ok(text().includes("Reason: unclassified. Handler"));assert.ok(!text().includes("Next:"));
+});
+test("g3 every integrateCandidate refusal has its own tag and leaves the checkout as it found it",()=>{
+ const m=fixture(),mj=job(m,change(m,"client/a.js","a"));mj.plan.commit=m.base;refusesUnchanged(m.cwd,mj,"Release binding mismatch");
+ // A dirty checkout is the caller's: nothing is reset, stashed or cleaned.
+ const d=fixture(),dj=job(d,change(d,"client/a.js","a"));writeFileSync(join(d.cwd,"client/base.js"),"caller edit");writeFileSync(join(d.cwd,"client/untracked.txt"),"caller file");
+ const dirty=refusesUnchanged(d.cwd,dj,"Dirty deployment checkout");assert.notEqual(dirty.status,"");
+ assert.equal(readFileSync(join(d.cwd,"client/base.js"),"utf8"),"caller edit");assert.equal(readFileSync(join(d.cwd,"client/untracked.txt"),"utf8"),"caller file");
+ const u=fixture(),missing="d".repeat(40);change(u,"client/a.js","a");refusesUnchanged(u.cwd,{...job(u,missing),plan:{commit:missing}},"Unknown commit identity");
+ const b=fixture(),bc=change(b,"client/a.js","a");git(b.cwd,"checkout","tasks-hub");const later=change(b,"client/c.js","c");
+ refusesUnchanged(b.cwd,{...job(b,bc),baseCommit:later},"Unknown candidate base");
+ // A merge commit in the series, with tasks-hub moved so it cannot fast-forward.
+ const n=fixture();change(n,"client/a.js","a");git(n.cwd,"checkout","-b","side",n.base);change(n,"client/s.js","s");git(n.cwd,"checkout","candidate");git(n.cwd,"merge","--no-ff","-m","merge","side");
+ const merged=git(n.cwd,"rev-parse","HEAD");git(n.cwd,"checkout","tasks-hub");change(n,"client/c.js","c");
+ assert.equal(refusesUnchanged(n.cwd,job(n,merged),"Nonlinear candidate series").status,"");
+ // The candidate's change is already on tasks-hub: an empty pick, no conflict.
+ // tasks-hub moves first, so its copy of the change is never the same commit.
+ const e=fixture(),ec=change(e,"client/a.js","a");git(e.cwd,"checkout","tasks-hub");change(e,"client/c.js","c");change(e,"client/a.js","a");
+ assert.equal(refusesUnchanged(e.cwd,job(e,ec),"Candidate integration refused").status,"");
+});
+test("g3 the pre-step runner refusals are tagged and leave the journal alone",async()=>{
+ const tagged=tag=>e=>failureReason(e)===tag;
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let entered,release;
+ const ready=new Promise(r=>entered=r),gate=new Promise(r=>release=r);a.deploy=async()=>{entered();await gate;};
+ const first=runRelease(c,a);await ready;const other=config(f,j);
+ await assert.rejects(runRelease(other,fake()),tagged("Release host locked; inspect prior execution"));assert.ok(!existsSync(other.journalPath));release();await first;
+ const g=fixture(),k=job(g,change(g,"client/a.js","a")),b=fake(),d=config(g,k);b.check=async()=>"identity";await assert.rejects(runRelease(d,b),tagged("Release failed; inspect saved journal"));
+ const before=readFileSync(d.journalPath,"utf8");await assert.rejects(runRelease(d,b),tagged("Ambiguous journal requires handler reconciliation"));assert.equal(readFileSync(d.journalPath,"utf8"),before);
+ const h=fixture(),unclaimed=config(h,{...job(h,change(h,"client/a.js","a")),state:"verified"});
+ await assert.rejects(runRelease(unclaimed,fake()),tagged("Claimed verified job required"));assert.ok(!existsSync(unclaimed.journalPath));
+});
+test("g2 the four named adapter refusals carry their tag and a prepare refusal journals it",async()=>{
+ const tagged=tag=>e=>failureReason(e)===tag && failureDetail(e).text===tag;
+ const {f,commit,home,config:hostConfig}=hostFixture(),adapter=new HostAdapter(hostConfig,{...job(f,commit),id:"rel_tags"});
+ await assert.rejects(adapter.prepare("mini","e".repeat(40)),tagged("Candidate build checkout mismatch"));
+ importInputs(adapter,commit,{});await assert.rejects(adapter.prepare("mini",commit),tagged("Exact job target input required"));
+ hostConfig.targets.hub={};const release="rel_tags-"+commit.slice(0,12)+"-hub";adapter.command=argv=>{if(argv[1]==="version")return stamped(commit);if(argv.includes("build"))writeFileSync(argv[argv.indexOf("-o")+1],"binary");return "";};
+ importInputs(adapter,commit,{hub:{release,backupJobId:"rel_previous",backup:join(home,"rel_previous-backup")}});
+ await assert.rejects(adapter.prepare("hub",commit),tagged("Fresh job backup identity required"));
+ adapter.command=()=>"no url";await assert.rejects(adapter.deploy("tailos",{commit}),tagged("TailOS deployment identity unconfirmed"));
+ // Through the runner: the real adapter's prepare has no input for the target.
+ const g=fixture(),j=job(g,change(g,"client/a.js","a")),r=await journalOf(g,j,(a,c)=>{
+  const host=new HostAdapter({cwd:g.cwd,journalDirectory:dirname(c.journalPath),baselines:c.baselines,targets:{tailos:{}}},{...j});importInputs(host,j.commit,{});a.prepare=(t,commit)=>host.prepare(t,commit);
+ },/Release failed/);
+ assert.deepEqual(r.journal.failure,{step:"prepare",target:"tailos",reason:"Exact job target input required"});assert.deepEqual(r.journal.failureDetail,{text:"Exact job target input required"});
+ assert.deepEqual(Object.keys(r.journal.receipt).sort(),["commit","jobId","outcome","revert","targets","verificationDigest","version"]);
+});
+test("g7 the journal keeps a failure's validated text and nothing that was not validated",async()=>{
+ const start=()=>{const f=fixture();return [f,job(f,change(f,"client/a.js","a"))];},absent=(text,...words)=>{for(const w of words)assert.ok(!text.includes(w),w);};
+ // An untagged error: only its class name, whatever it carries.
+ const ra=await journalOf(...start(),a=>{a.deploy=async()=>{throw Object.assign(new Error(TOKEN,{cause:new Error(TOKEN)}),{stderr:TOKEN,stdout:TOKEN,output:[TOKEN]});};},/Release failed/);
+ assert.deepEqual(ra.journal.failureDetail,{name:"Error"});assert.deepEqual(ra.journal.failure,{step:"deploy",target:"tailos",reason:"unclassified"});absent(ra.raw,TOKEN);
+ const coded=failureDetail(Object.assign(new TypeError(TOKEN),{code:"ENOENT"}));assert.deepEqual(coded,{name:"TypeError",code:"ENOENT"});
+ assert.deepEqual(failureDetail(Object.assign(new Error("x"),{name:`token=${TOKEN}`,code:`token=${TOKEN}`})),{});assert.deepEqual(failureDetail(undefined),{});
+ // A token-shaped tag is rejected: its length and why, never its text.
+ const shaped=`token="${TOKEN}"`,rb=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(shaped);};},/Release failed/);
+ assert.deepEqual(rb.journal.failure,{step:"prepare",target:"tailos",reason:"unclassified"});assert.deepEqual(rb.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});absent(rb.raw,TOKEN,"token=");
+ const before=await journalOf(...start(),a=>{a.fence=async()=>{throw releaseError(shaped);};});
+ assert.equal(before.journal.refusalReason,"unclassified");assert.equal(before.journal.failure,undefined);assert.deepEqual(before.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});
+ absent(before.raw+JSON.stringify(before.escalation),TOKEN,"token=");
+ const long="SYNTHETICPRIVATETOKEN".repeat(10),rc=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(long);};},/Release failed/);
+ assert.deepEqual(rc.journal.failureDetail,{tagRejected:"length",tagLength:210});absent(rc.raw,"SYNTHETICPRIVATETOKEN");
+ // An attempt record's refusal is read back from disk, so it is validated too.
+ const d=fixture(),dj=job(d,change(d,"client/a.js","a"));git(d.cwd,"checkout","tasks-hub");change(d,"client/c.js","c");
+ const rd=await journalOf(d,dj,(a,c)=>{
+  const host=new HostAdapter({cwd:d.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>argv[2]==="list"?"[]":"";
+  a.verifyIntegrated=x=>{const dir=attemptDir(dirname(c.journalPath),x.integratedCommit,0);mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"ended",refusal:shaped}));return host.verifyIntegrated(x);};
+ });
+ assert.equal(rd.journal.refusalReason,"unclassified");assert.deepEqual(rd.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});absent(rd.raw+JSON.stringify(rd.escalation),TOKEN,"token=");
+ // A valid tag is kept as exactly the reason.
+ const valid=releaseError("Paired plan members disagree");assert.deepEqual(failureDetail(valid),{text:failureReason(valid)});
+ const dir=mkdtempSync(join(tmpdir(),"release-detail-")),script=join(dir,"fake-deploy.mjs");
+ writeFileSync(script,`process.stderr.write("${TOKEN}");console.log(JSON.stringify({classification:"remote-operation-failed",stage:"bridge-binary-upload",message:"${TOKEN}"}));process.exit(2);`);
+ let thrown;try{new HostAdapter({cwd:dir,journalDirectory:dir},{id:"rel_fixture"}).command([process.execPath,script]);}catch(error){thrown=error;}
+ assert.deepEqual(failureDetail(thrown),{text:"fake-deploy.mjs exit 2: remote-operation-failed at bridge-binary-upload"});
+ // A tagged failure after publication with no step still names its cause.
+ const rg=await journalOf(...start(),a=>{a.merged=async()=>{throw releaseError("Paired plan members disagree");};},/Release failed/);
+ assert.equal(rg.journal.failure,undefined);assert.deepEqual(rg.journal.failureDetail,{text:"Paired plan members disagree"});assert.equal(rg.journal.published,true);
+});
+test("g1 the runner throws no untagged fixed error",()=>{
+ const source=readFileSync(RUNNER,"utf8");assert.ok(!source.includes("throw new Error("));assert.equal(source.split("new Error(").length-1,2,"releaseError and the command wrapper");
+ for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
+  assert.ok(source.includes(`releaseError("${tag}")`),tag);assert.equal(failureReason(releaseError(tag)),tag);
+ }
 });
