@@ -27,6 +27,8 @@ records how every agent post measures up, and produces the data for the
 phase-1 exit criterion: **at least 90% of agent posts are valid envelopes over
 one week of real traffic**. Phase 2 (obligations, timers, Claude wake-up,
 Discord) builds on the envelope and the checks table introduced here.
+When those broker wakes are leased, the hub takes the oldest due obligation
+first by parsed time, with ties broken by message sequence.
 
 ## Scope
 

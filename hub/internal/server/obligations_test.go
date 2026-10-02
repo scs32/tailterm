@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -308,6 +312,71 @@ func TestWakeJobLeasing(t *testing.T) {
 	f.post(t, api.PostMessageRequest{AgentID: f.builder.ID, To: f.lead.ID, ReplyTo: later.Seq, Envelope: &api.Envelope{Kind: "decline", To: "lead", Subject: "Declining the rebase for now", Body: api.EnvelopeBody{Reason: "window closed"}}})
 	if err := f.c.st.ReportWakeJob(f.ctx, f.task.ID, retaken.ID, api.WakeJobReport{LeaseToken: retaken.LeaseToken, Status: "failed", Detail: "codex exited"}, later10); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// wi_5b3037cd65b55373: the oldest due wake is leased first, by time and not by
+// the text of its stamp, and wakes due together go in message order. due_at is
+// RFC3339Nano, which trims trailing zeros, so text order can differ from time
+// order. The stamps are written through a second connection because the
+// store's own is not exported.
+func TestOldestDueWakeIsLeasedFirst(t *testing.T) {
+	for _, tc := range []struct{ name, first, second string }{
+		{"identical stamps", "2026-10-01T19:00:05.5Z", "2026-10-01T19:00:05.5Z"},
+		{"trimmed fraction", "2026-10-01T19:00:05.5Z", "2026-10-01T19:00:05.50001Z"},
+		{"whole second", "2026-10-01T19:00:05Z", "2026-10-01T19:00:05.3Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "hub.sqlite")
+			st, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			c := &client{t: t, st: st, who: api.Caller{Node: "devbox", User: "stephen@example.com"}}
+			c.srv = httptest.NewServer(New(st, func(*http.Request) (api.Caller, error) { return c.who, nil }))
+			t.Cleanup(c.srv.Close)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { raw.Close() })
+			var task api.Task
+			if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "Obligations", Orchestrator: "lead"}, &task); code != 201 {
+				t.Fatalf("create task: %d", code)
+			}
+			f := oblFixture{c: c, task: task, lead: c.agent(task, "lead"), builder: c.agent(task, "builder"), ctx: context.Background()}
+			first := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: assignFrom(f.lead, "builder")})
+			second := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, To: f.builder.ID, Envelope: &api.Envelope{Kind: "question", To: "builder", Subject: "Which status code should we use", Body: api.EnvelopeBody{Question: "422?"}}})
+			// Swap the two wakes so the earlier message owns the later row;
+			// insertion order must not be what decides a tie.
+			if _, err := raw.Exec(`UPDATE wake_jobs SET obligation_id=(SELECT o.id FROM obligations o WHERE o.task_id=?1 AND o.message_seq=?2+?3-(SELECT message_seq FROM obligations WHERE id=wake_jobs.obligation_id)) WHERE task_id=?1`, task.ID, first.Seq, second.Seq); err != nil {
+				t.Fatal(err)
+			}
+			for seq, due := range map[int64]string{first.Seq: tc.first, second.Seq: tc.second} {
+				res, err := raw.Exec(`UPDATE wake_jobs SET due_at=? WHERE obligation_id=(SELECT id FROM obligations WHERE task_id=? AND message_seq=?)`, due, task.ID, seq)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, _ := res.RowsAffected(); n != 1 {
+					t.Fatalf("message #%d has %d wakes", seq, n)
+				}
+			}
+			// The hub's own SQLite driver must compare the two stamps the
+			// way the lease does: never later by time, whatever the text says.
+			var textLater, timeLater bool
+			if err := raw.QueryRow(`SELECT ?>?, julianday(?)>julianday(?)`, tc.first, tc.second, tc.first, tc.second).Scan(&textLater, &timeLater); err != nil {
+				t.Fatal(err)
+			}
+			if timeLater || textLater != (tc.first > tc.second) {
+				t.Fatalf("driver compares %s and %s: text later %v, time later %v", tc.first, tc.second, textLater, timeLater)
+			}
+			f.heartbeat(t, f.builder)
+			job, err := st.LeaseWakeJob(f.ctx, task.ID, f.builder.ID, f.builder.RunID, time.Now().UTC().Add(time.Second))
+			if err != nil || job == nil || job.MessageSeq != first.Seq {
+				t.Fatalf("lease: %v %+v, want message #%d", err, job, first.Seq)
+			}
+		})
 	}
 }
 
