@@ -987,12 +987,13 @@ var artifactItemIDPattern = regexp.MustCompile(`^wi_[0-9a-f]{16}$`)
 // artifactsRootFor names the artifacts tree of the repository whose main
 // checkout is main: TAILTERM_ARTIFACTS, else the sibling <main>-artifacts. A
 // TAILTERM_ARTIFACTS that is not absolute names no tree: it says so once and
-// returns "", so no verifier checkout is examined. Tests replace it.
+// returns "", so no verifier checkout is examined and session temp is kept.
+// Tests replace it.
 var artifactsRootFor = func(main string) string {
 	if dir := os.Getenv("TAILTERM_ARTIFACTS"); dir != "" {
 		if !filepath.IsAbs(dir) {
 			artifactsRootWarning.Do(func() {
-				fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACTS=%q is not an absolute path; verifier checkouts are left alone\n", dir)
+				fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACTS=%q is not an absolute path; verifier checkouts and session temp are left alone\n", dir)
 			})
 			return ""
 		}
@@ -1141,7 +1142,10 @@ func artifactItemStates(entries []api.TeamQueueEntry, agents []api.Agent) map[st
 // artifactPass holds one cleanup pass's artifact rules. A nil pass means the
 // rules are off and every worktree is an ordinary one.
 type artifactPass struct {
-	root          string
+	root string
+	// custom marks a root that is not the default <main>-artifacts: it came
+	// from --artifacts or TAILTERM_ARTIFACTS and may be mistaken.
+	custom        bool
 	items         map[string]artifactItemState
 	acceptedAfter time.Duration
 	now           time.Time
@@ -1161,7 +1165,7 @@ func newArtifactPass(in worktreeCleanupInputs, main string, linked []string) *ar
 	if root == "" || !filepath.IsAbs(root) {
 		return nil
 	}
-	a := &artifactPass{root: canonicalPath(root), items: in.Items, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
+	a := &artifactPass{root: canonicalPath(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
 	if a.acceptedAfter <= 0 {
 		a.acceptedAfter = defaultArtifactAcceptedAfter
 	}
@@ -1217,6 +1221,34 @@ func strayCheckout(w gitWorktree, in worktreeCleanupInputs, art *artifactPass) (
 		return "", "", ""
 	}
 	return keepRetention, "outside the artifacts root " + root + "; check --artifacts or TAILTERM_ARTIFACTS", root
+}
+
+// unreadable says why the receipt and plan files of items cannot be read for
+// citations, or "": there is no artifacts root, or the root is not the
+// default and is not a directory or holds no folder for one of the items.
+// Session temp is kept then, since a folder those files cite cannot be told
+// from an uncited one. The default root is trusted: an item with no folder
+// there has no receipt or plan file to cite anything.
+func (a *artifactPass) unreadable(items []string) string {
+	const check = "; check --artifacts or TAILTERM_ARTIFACTS"
+	if a == nil {
+		return "no artifacts root, so receipt citations cannot be read" + check
+	}
+	if !a.custom {
+		return ""
+	}
+	if info, err := os.Stat(a.root); err != nil || !info.IsDir() {
+		return "artifacts root " + a.root + " is not the default and is not a directory, so receipt citations cannot be read" + check
+	}
+	for _, item := range items {
+		if !artifactItemIDPattern.MatchString(item) {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(a.root, item)); err != nil || !info.IsDir() {
+			return "artifacts root " + a.root + " is not the default and has no folder for " + item + ", so its receipt citations cannot be read" + check
+		}
+	}
+	return ""
 }
 
 // gate returns the keep reason while the item holds its checkouts, or "" with
@@ -1689,6 +1721,11 @@ func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCan
 	}
 	if file := cited[t.Folder]; file != "" {
 		return keepEvidence, "cited by " + file
+	}
+	// Without its items' receipt and plan files a folder they cite would
+	// look uncited, so an unusable artifacts root keeps every folder.
+	if why := art.unreadable(t.Items); why != "" {
+		return keepRetention, why
 	}
 	evidence := append([]worktreeEvidence(nil), in.Evidence...)
 	for _, item := range t.Items {

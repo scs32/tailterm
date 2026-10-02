@@ -2263,6 +2263,47 @@ func TestWorktreeCleanupSessionTempRecentBelowTopLevel(t *testing.T) {
 	}
 }
 
+// closeoutTick runs one runner tick over a finished, released entry of item
+// with the given cwd, beside a running entry of runningItem in a paused
+// project, and returns the entry and the tick's stderr.
+func closeoutTick(t *testing.T, r cleanupRepo, item, cwd, runningItem string) (api.TeamQueueEntry, string) {
+	t.Helper()
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea0f"
+	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
+	finished := api.TeamQueueEntry{ID: "tqe_t15_finished", TaskID: task, ItemID: item, State: "finished", Host: host, Cwd: cwd, Repository: r.common, Position: 1,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd, Commit: head, AcceptedAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)},
+		Release:    &api.ReleaseJob{State: "released"}}
+	runningCwd := r.queuePath("queue-9999bbb4")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", runningCwd, "tasks-hub")
+	running := api.TeamQueueEntry{ID: "tqe_t15_other", TaskID: task, ItemID: runningItem, State: "running", Host: host, Cwd: runningCwd, Position: 2}
+	hub := &cleanupHub{
+		byHost:  api.TeamQueueList{Entries: []api.TeamQueueEntry{running}},
+		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{finished, running}}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen, PauseState: api.ProjectPausePaused}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every caller uses this entry; each gets its own first look.
+	closeoutWorktreeChecks.Delete(finished.ID)
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	runner := teamRunner{worktrees: closeoutWorktrees}
+	err = runner.tick(context.Background(), env{hub: server.URL}, c, host)
+	restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, writes := hub.snapshot(); len(writes) != 0 {
+		t.Fatalf("closeout wrote to the hub: %v", writes)
+	}
+	return finished, stderr.String()
+}
+
 // T15: a wrong artifacts root never frees a verifier checkout. The sweep
 // keeps the checkouts outside the root it used and warns, and refuses a
 // relative root before it reads the hub; closeout leaves the artifacts tree
@@ -2349,49 +2390,8 @@ func TestWorktreeCleanupWrongArtifactsRootKeepsRunningItem(t *testing.T) {
 		}
 	})
 
-	// closeout runs one runner tick over a finished, released entry of item
-	// with the given cwd, beside a running entry of runningItem in a paused
-	// project, and returns the tick's stderr.
-	closeout := func(t *testing.T, r cleanupRepo, item, cwd, runningItem string) (api.TeamQueueEntry, string) {
-		t.Helper()
-		const host = "fixture"
-		const task = "tsk_c1ea0c1ea0c1ea0f"
-		head := cleanupGit(t, r.main, "rev-parse", "HEAD")
-		finished := api.TeamQueueEntry{ID: "tqe_t15_finished", TaskID: task, ItemID: item, State: "finished", Host: host, Cwd: cwd, Repository: r.common, Position: 1,
-			Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd, Commit: head, AcceptedAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)},
-			Release:    &api.ReleaseJob{State: "released"}}
-		runningCwd := r.queuePath("queue-9999bbb4")
-		cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", runningCwd, "tasks-hub")
-		running := api.TeamQueueEntry{ID: "tqe_t15_other", TaskID: task, ItemID: runningItem, State: "running", Host: host, Cwd: runningCwd, Position: 2}
-		hub := &cleanupHub{
-			byHost:  api.TeamQueueList{Entries: []api.TeamQueueEntry{running}},
-			queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{finished, running}}},
-			details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen, PauseState: api.ProjectPausePaused}}},
-		}
-		server := httptest.NewServer(hub)
-		defer server.Close()
-		c, err := api.NewClient(server.URL, 5*time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Both sub-cases use this entry; each gets its own first look.
-		closeoutWorktreeChecks.Delete(finished.ID)
-		var stderr strings.Builder
-		restore := captureStderr(t, &stderr)
-		runner := teamRunner{worktrees: closeoutWorktrees}
-		err = runner.tick(context.Background(), env{hub: server.URL}, c, host)
-		restore()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, writes := hub.snapshot(); len(writes) != 0 {
-			t.Fatalf("closeout wrote to the hub: %v", writes)
-		}
-		return finished, stderr.String()
-	}
-
 	// e. A relative TAILTERM_ARTIFACTS: closeout says so once and leaves the
-	// artifacts tree alone; the closed team's session temp still goes.
+	// artifacts tree alone, and the closed team's session temp with it.
 	t.Run("closeout relative root", func(t *testing.T) {
 		r := newCleanupRepo(t)
 		r.ignoreBuildOutput(t)
@@ -2401,14 +2401,17 @@ func TestWorktreeCleanupWrongArtifactsRootKeepsRunningItem(t *testing.T) {
 		writeFixtureFile(t, filepath.Join(temp, "5e55-session", "scratchpad", "notes.md"), "scratch\n")
 		t.Setenv("TAILTERM_ARTIFACTS", "relative/dir")
 		artifactsRootWarning = sync.Once{}
-		_, stderr := closeout(t, r, artifactItemA, cwd, artifactItemB)
+		_, stderr := closeoutTick(t, r, artifactItemA, cwd, artifactItemB)
 		requireExists(t, filepath.Join(checkout, "dist", "app.js"), true)
 		requireExists(t, checkout+".removed.json", false)
-		requireExists(t, temp, false)
+		requireExists(t, filepath.Join(temp, "5e55-session", "scratchpad", "notes.md"), true)
+		if rec, ok := receiptFor(readCleanupReceipts(t), temp); !ok || rec.Action != "kept" || rec.Reason != keepRetention || !strings.Contains(rec.Detail, "no artifacts root") {
+			t.Fatalf("closeout receipt for %s: %+v %v", temp, rec, ok)
+		}
 		if _, ok := receiptFor(readCleanupReceipts(t), checkout); ok {
 			t.Fatal("closeout examined a verifier checkout with no artifacts root")
 		}
-		if strings.Count(stderr, "TAILTERM_ARTIFACTS") != 1 || !strings.Contains(stderr, `TAILTERM_ARTIFACTS="relative/dir" is not an absolute path`) {
+		if strings.Count(stderr, "TAILTERM_ARTIFACTS=") != 1 || !strings.Contains(stderr, `TAILTERM_ARTIFACTS="relative/dir" is not an absolute path`) {
 			t.Fatalf("relative root warning %q", stderr)
 		}
 	})
@@ -2420,12 +2423,141 @@ func TestWorktreeCleanupWrongArtifactsRootKeepsRunningItem(t *testing.T) {
 		r.ignoreBuildOutput(t)
 		checkout := r.verifierCheckout(t, artifactItemC, "verifier-abc1234")
 		t.Setenv("TAILTERM_ARTIFACTS", filepath.Join(r.root, "elsewhere"))
-		finished, _ := closeout(t, r, artifactItemC, checkout, artifactItemC)
+		finished, _ := closeoutTick(t, r, artifactItemC, checkout, artifactItemC)
 		requireExists(t, filepath.Join(checkout, "dist", "app.js"), true)
 		requireExists(t, checkout+".removed.json", false)
 		rec, ok := receiptFor(readCleanupReceipts(t), checkout)
 		if !ok || rec.Source != "closeout" || rec.EntryID != finished.ID || rec.Action != "kept" || rec.Reason != keepItemActive || !strings.Contains(rec.Detail, "tqe_t15_other is running") {
 			t.Fatalf("closeout receipt for %s: %+v %v", checkout, rec, ok)
 		}
+	})
+}
+
+// T16: session temp is removed only when its items' receipt and plan files
+// can be read for citations. With no artifacts root, or one that is not the
+// default and is not a directory or has no folder for the item, every folder
+// is kept, in the pass, the sweep command and at closeout. The default root
+// is trusted: an item with no folder there has no receipt to cite.
+func TestWorktreeCleanupSessionTempKeptWithUnusableArtifactsRoot(t *testing.T) {
+	// fixture has a gone cwd of item A whose temp folder only A's receipt
+	// cites, and one of item B, which has no artifact folder and no citation.
+	fixture := func(t *testing.T, r cleanupRepo) (cited, plain string, cwds []sessionTempCwd) {
+		t.Helper()
+		session := func(name, item string) string {
+			cwd := r.queuePath(name)
+			folder := filepath.Join(r.tempRoot(), claudeScratchKey(cwd))
+			writeFixtureFile(t, filepath.Join(folder, "5e55-session", "scratchpad", "notes.md"), "scratch\n")
+			cwds = append(cwds, sessionTempCwd{Path: cwd, ItemID: item})
+			return folder
+		}
+		cited, plain = session("queue-7777aaa1", artifactItemA), session("queue-7777aaa2", artifactItemB)
+		writeFixtureFile(t, filepath.Join(r.artifacts(), artifactItemA, "receipt.json"), `{"report":"`+cited+`/5e55-session/scratchpad/notes.md"}`)
+		return cited, plain, cwds
+	}
+	const check = "check --artifacts or TAILTERM_ARTIFACTS"
+	t.Run("pass", func(t *testing.T) {
+		r := newCleanupRepo(t)
+		cited, plain, cwds := fixture(t, r)
+		in := worktreeCleanupInputs{TempRoot: r.tempRoot(), TempCwds: cwds}
+		// The default root: the receipt is read, and item B's missing folder
+		// means there is nothing to cite its temp folder.
+		got := r.artifactSweep(t, in)
+		if d := requireDecision(t, got, cited, "kept", keepEvidence); !strings.Contains(d.Detail, "receipt.json") {
+			t.Fatalf("default root decision %+v", d)
+		}
+		requireDecision(t, got, plain, "would-remove", "")
+		// A wrong root that does not exist, and one that exists.
+		missing, other := filepath.Join(r.root, "elsewhere"), filepath.Join(r.root, "other-artifacts")
+		if err := os.MkdirAll(filepath.Join(other, artifactItemC), 0755); err != nil {
+			t.Fatal(err)
+		}
+		for root, why := range map[string]string{missing: "is not a directory", other: "has no folder for " + artifactItemA} {
+			for _, apply := range []bool{false, true} {
+				in.Artifacts, in.Apply = root, apply
+				got := r.artifactSweep(t, in)
+				d := requireDecision(t, got, cited, "kept", keepRetention)
+				if d.Kind != kindSessionTemp || !strings.Contains(d.Detail, root) || !strings.Contains(d.Detail, "not the default") || !strings.Contains(d.Detail, why) || !strings.Contains(d.Detail, check) {
+					t.Fatalf("root %s apply=%v: decision %+v", root, apply, d)
+				}
+				requireDecision(t, got, plain, "kept", keepRetention)
+				for _, p := range []string{cited, plain} {
+					requireExists(t, filepath.Join(p, "5e55-session", "scratchpad", "notes.md"), true)
+				}
+			}
+		}
+		// Back on the default root, applying removes only the uncited folder.
+		in.Artifacts, in.Apply = "", true
+		got = r.artifactSweep(t, in)
+		requireDecision(t, got, cited, "kept", keepEvidence)
+		requireDecision(t, got, plain, "removed", "")
+		requireExists(t, plain, false)
+		requireExists(t, cited, true)
+	})
+	t.Run("sweep command", func(t *testing.T) {
+		r := newCleanupRepo(t)
+		cited, plain, cwds := fixture(t, r)
+		host := spawn.Host()
+		const task = "tsk_c1ea0c1ea0c1ea1a"
+		var entries []api.TeamQueueEntry
+		for i, c := range cwds {
+			q := releasedArtifactEntry(c.ItemID)
+			q.ID, q.TaskID, q.Host, q.Cwd, q.Position = "tqe_t16_"+strconv.Itoa(i), task, host, c.Path, int64(i+1)
+			entries = append(entries, q)
+		}
+		hub := &cleanupHub{
+			tasks:   []api.Task{{ID: task, Status: api.TaskOpen}},
+			details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}},
+			queues:  map[string]api.TeamQueueList{task: {Entries: entries}},
+		}
+		server := httptest.NewServer(hub)
+		defer server.Close()
+		wrong := filepath.Join(r.root, "elsewhere")
+		out, err := captureSweepStdout(t, func() error {
+			return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, []string{"--cwd", r.main, "--min-idle", "0s", "--artifacts", wrong})
+		})
+		if err != nil || strings.Contains(out, "would-remove /") {
+			t.Fatalf("sweep with a wrong root: %v\n%s", err, out)
+		}
+		for _, p := range []string{cited, plain} {
+			if !strings.Contains(out, "kept retention "+p+": artifacts root "+wrong+" is not the default and is not a directory") {
+				t.Fatalf("sweep output lacks the kept row for %s:\n%s", p, out)
+			}
+		}
+		out, err = captureSweepStdout(t, func() error {
+			return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, []string{"--cwd", r.main, "--min-idle", "0s"})
+		})
+		if err != nil || !strings.Contains(out, "kept evidence "+cited) || !strings.Contains(out, "would-remove "+plain+" (session temp; ") {
+			t.Fatalf("sweep with the default root: %v\n%s", err, out)
+		}
+	})
+	for name, root := range map[string]string{"closeout wrong root": "elsewhere", "closeout relative root": ""} {
+		t.Run(name, func(t *testing.T) {
+			r := newCleanupRepo(t)
+			cited, _, cwds := fixture(t, r)
+			want := "no artifacts root"
+			if root == "" {
+				t.Setenv("TAILTERM_ARTIFACTS", "relative/dir")
+				artifactsRootWarning = sync.Once{}
+			} else {
+				t.Setenv("TAILTERM_ARTIFACTS", filepath.Join(r.root, root))
+				want = "artifacts root " + filepath.Join(r.root, root) + " is not the default and is not a directory"
+			}
+			finished, stderr := closeoutTick(t, r, artifactItemA, cwds[0].Path, artifactItemC)
+			requireExists(t, filepath.Join(cited, "5e55-session", "scratchpad", "notes.md"), true)
+			rec, ok := receiptFor(readCleanupReceipts(t), cited)
+			if !ok || rec.Source != "closeout" || rec.EntryID != finished.ID || rec.Kind != kindSessionTemp || rec.Action != "kept" || rec.Reason != keepRetention || !strings.Contains(rec.Detail, want) || !strings.Contains(rec.Detail, check) {
+				t.Fatalf("closeout receipt for %s: %+v %v", cited, rec, ok)
+			}
+			if !strings.Contains(stderr, "kept retention "+cited) {
+				t.Fatalf("stderr lacks the kept line: %q", stderr)
+			}
+		})
+	}
+	// The default root with no folder for the item: closeout still removes.
+	t.Run("closeout default root", func(t *testing.T) {
+		r := newCleanupRepo(t)
+		_, plain, cwds := fixture(t, r)
+		closeoutTick(t, r, artifactItemB, cwds[1].Path, artifactItemC)
+		requireExists(t, plain, false)
 	})
 }

@@ -1258,7 +1258,8 @@ as a check; it deletes.
   sweep `--artifacts DIR` overrides both.
 - A wrong root never frees a checkout. `--artifacts` and `TAILTERM_ARTIFACTS`
   must be absolute: the sweep refuses a relative one before it reads the hub,
-  and closeout prints one line to stderr and leaves the artifacts tree alone.
+  and closeout prints one line to stderr and leaves the artifacts tree and
+  every session temp folder alone.
   A detached checkout under a folder named for an item but outside the root in
   use is kept, as `item-active` while its item runs and as `retention`
   otherwise, and the sweep warns on stderr with the count and the root it
@@ -1336,6 +1337,13 @@ when all of these hold:
 - Sweep only: nothing anywhere below the folder, at any depth, changed within
   `--min-idle` (`recent`). A folder the sweep cannot read through counts as
   changed. This covers a session that is not on the roster.
+- Its items' receipt and plan files can be read (`retention` otherwise). With
+  no artifacts root (a relative or unset one), or a root that is not the
+  default `<main checkout>-artifacts` and is not a directory or has no folder
+  for one of its items, every session temp folder is kept, at closeout and in
+  the sweep, and the reason names the root. The default root is trusted: an
+  item with no folder there has no receipt or plan file, so nothing can cite
+  the folder.
 - No receipt text names it (`evidence`): queue evidence, tracked docs, and the
   receipt and plan files of the items it belongs to.
 - No Git repository or kept worktree remains inside it (`nested`). Scratchpad
