@@ -568,7 +568,12 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	defer tx.Rollback()
 	hash := verificationDigest(req)
 	var prior, raw string
-	err = tx.QueryRowContext(ctx, `SELECT payload_hash,record_json FROM release_action_receipts WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior, &raw)
+	// A check is a read of the fence, never a replay: the runner repeats one
+	// request ID while the generation stands, and each must be judged live.
+	err = sql.ErrNoRows
+	if req.Operation != "check" {
+		err = tx.QueryRowContext(ctx, `SELECT payload_hash,record_json FROM release_action_receipts WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior, &raw)
+	}
 	if err == nil {
 		if hash != prior {
 			return zero, releaseConflict("retry changed")
@@ -779,6 +784,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if j.State != "claimed" && j.State != "merged" {
 					return zero, releaseConflict("execution fence unavailable")
 				}
+				// Nothing changed, so nothing is written: the generation that
+				// handler imports bind to moves only on a substantive change.
+				return j, nil
 			case "merged":
 				if j.State != "claimed" || !validGitCommit(req.IntegratedCommit) {
 					return zero, releaseConflict("claimed integrated commit required")

@@ -2155,3 +2155,95 @@ func TestReleaseJobsMigrationAllowsSeveralJobsPerEntry(t *testing.T) {
 		t.Fatal("the fence allowed a second holder", err)
 	}
 }
+
+// fenceCheck is the runner's check: one request ID per job and generation,
+// repeated on every step and poll while the generation stands.
+func fenceCheck(j api.ReleaseJob, d api.Agent, generation int64) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: fmt.Sprintf("%s-check-%d", j.ID, generation), Operation: "check", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: generation}
+}
+
+// The handler reads the job after the claim and imports a minute later; the
+// runner's fence checks in between change nothing and must not cost it the
+// generation it bound to.
+func TestReleaseCheckKeepsGenerationForHandlerImport(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	approved := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	for i := range 3 {
+		checked, err := s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, j.Generation))
+		if err != nil || checked.Generation != j.Generation || checked.State != "claimed" {
+			t.Fatal("check", i, checked.Generation, checked.State, err)
+		}
+	}
+	saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+	if err != nil || saved.Generation != j.Generation {
+		t.Fatal("checks moved the generation", saved.Generation, err)
+	}
+	var receipts int
+	if err = s.db.QueryRow(`SELECT count(*) FROM release_action_receipts WHERE task_id=? AND request_id=?`, task.ID, fenceCheck(j, d, j.Generation).RequestID).Scan(&receipts); err != nil || receipts != 0 {
+		t.Fatal("check stored a receipt", receipts, err)
+	}
+	imported, err := s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "import-after-checks", approved))
+	if err != nil || imported.Generation != j.Generation+1 || imported.IntegratedVerification == nil {
+		t.Fatal("import after checks", imported.Generation, err)
+	}
+	// The import is a substantive change: a second import still bound to the
+	// earlier read, and the runner's check at that generation, both refuse.
+	if _, err = s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "import-stale", approved)); !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "generation changed") {
+		t.Fatal("stale import", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, j.Generation)); !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "generation changed") {
+		t.Fatal("stale check", err)
+	}
+	if checked, err := s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, imported.Generation)); err != nil || checked.Generation != imported.Generation {
+		t.Fatal("check after import", checked.Generation, err)
+	}
+	// Another run: the same request ID that just passed is judged again, for
+	// the replaced run and for a run that never held the claim.
+	s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID)
+	rotated, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: d.ID, ExpectedRunID: d.RunID, Name: d.Name, Role: d.Role, Host: d.Host, Session: d.Session}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(time.Now()), rotated.ID)
+	if _, err = s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, imported.Generation)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("replaced run kept the fence", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, fenceCheck(j, rotated, imported.Generation)); !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "fence belongs to another exact run") {
+		t.Fatal("another run passed the fence", err)
+	}
+	if saved, err = releaseLoad(ctx, s.db, task.ID, j.ID); err != nil || saved.Generation != imported.Generation {
+		t.Fatal("refused checks moved the generation", saved.Generation, err)
+	}
+}
+
+// A check that passed is not a receipt to replay: once the handler sets the
+// job aside, the same request ID and generation no longer hold the fence.
+func TestReleaseCheckAfterSetAsideIsRefused(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	if _, err := s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, j.Generation)); err != nil {
+		t.Fatal(err)
+	}
+	// Set-aside needs a later verified job waiting on the fence.
+	if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "waiting-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "waiting item", "waiting")}); err != nil {
+		t.Fatal(err)
+	}
+	evidence := setAsideEvidence(t, s, task, h, j)
+	aside, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+	if err != nil || aside.State != "verified" || aside.Generation != j.Generation+1 {
+		t.Fatal(aside.State, aside.Generation, err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, j.Generation)); !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "generation changed") {
+		t.Fatal("repeated check after set-aside", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, fenceCheck(j, d, aside.Generation)); !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "fence belongs to another exact run") {
+		t.Fatal("check after set-aside", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, j.ID); err != nil || saved.Generation != aside.Generation || saved.State != "verified" {
+		t.Fatal("refused checks changed the job", saved.Generation, saved.State, err)
+	}
+}
