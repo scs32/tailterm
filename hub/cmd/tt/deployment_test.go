@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -234,6 +236,153 @@ func TestSupersedeAndHandReleaseGuardBeforeHub(t *testing.T) {
 	sup := posts[2].Supersession
 	if posts[2].Operation != "supersede" || sup == nil || sup.HandReleaseID != "hrl_0123456789abcdef" || sup.ReleasedCommit != c["picked"] {
 		t.Fatalf("supersede request %+v", posts[2])
+	}
+}
+
+// a1-a4: a hand release with a tailos target is recorded only with a retained
+// rollback copy that matches the live release.json; --dist verifies a build
+// and retains it as the runner does. Other targets need neither flag. The
+// journal directory is a temp directory and release.json is served locally.
+func TestHandReleaseRequiresRetainedTailOSCopy(t *testing.T) {
+	dir, c := coverageFixture(t)
+	task, released := "tsk_0123456789abcdef", c["picked"]
+	jobs := []api.ReleaseJob{{ID: "rel_picked", BaseCommit: c["base"], Commit: c["c2"], State: "refused", Generation: 3}}
+	assets := map[string]string{"index.html": "<html>home</html>", "assets/app.js": "console.log(1)"}
+	manifest := func(commit string, files map[string]string) []byte {
+		m := map[string]any{"schema": 1, "commit": commit, "files": map[string]any{}}
+		for name, text := range files {
+			sum := sha256.Sum256([]byte(text))
+			m["files"].(map[string]any)[name] = map[string]any{"size": len(text), "sha256": hex.EncodeToString(sum[:])}
+		}
+		b, _ := json.Marshal(m)
+		return b
+	}
+	liveCommit := released
+	var posts []api.ReleaseRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/release.json":
+			_, _ = w.Write(manifest(liveCommit, assets))
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases"):
+			_ = json.NewEncoder(w).Encode(jobs)
+		default:
+			var req api.ReleaseRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			posts = append(posts, req)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.HandRelease{ID: "hrl_0123456789abcdef"})
+		}
+	}))
+	defer server.Close()
+	journal := filepath.Join(t.TempDir(), "journal")
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(t.TempDir(), "deploy.json")
+	doc, _ := json.Marshal(map[string]any{"version": 1, "journalDirectory": journal, "targets": map[string]any{"tailos": map[string]any{"url": server.URL + "/release.json"}}})
+	if err := os.WriteFile(config, doc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := func(files map[string]string) string {
+		root := t.TempDir()
+		for name, text := range files {
+			path := filepath.Join(root, filepath.FromSlash(name))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	with := func(extra map[string]string) map[string]string {
+		files := map[string]string{"release.json": string(manifest(released, assets))}
+		for name, text := range assets {
+			files[name] = text
+		}
+		for name, text := range extra {
+			files[name] = text
+		}
+		return files
+	}
+	owner := env{hub: server.URL, task: task}
+	record := func(target string, extra ...string) error {
+		args := append([]string{"hand-release", "--intervention", "7", "--released-commit", released, "--release", "20261002-hand", "--target", target, "--job", "rel_picked", "--repo", dir, "--request-id", "hand-tailos"}, extra...)
+		_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(owner, args) })
+		return err
+	}
+	retained := filepath.Join(journal, "tailos-dist-"+released)
+	refused := func(label string, err error, want string) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if strings.Contains(err.Error(), journal) {
+			t.Fatalf("%s names the private journal path: %v", label, err)
+		}
+		if entries, _ := os.ReadDir(journal); len(entries) != 0 || len(posts) != 0 {
+			t.Fatalf("%s retained %d entries or recorded %+v", label, len(entries), posts)
+		}
+	}
+	refused("no config", record("tailos"), "--deploy-config")
+	refused("missing directory", record("tailos", "--deploy-config", config), "--dist PATH")
+	refused("different file", record("tailos", "--deploy-config", config, "--dist", build(with(map[string]string{"assets/app.js": "console.log(2)"}))), "different: assets/app.js")
+	refused("extra file", record("tailos", "--deploy-config", config, "--dist", build(with(map[string]string{"extra.txt": "x"}))), "extra: extra.txt")
+	short := with(nil)
+	delete(short, "index.html")
+	refused("missing file", record("tailos", "--deploy-config", config, "--dist", build(short)), "missing: index.html")
+	refused("other build's release.json", record("tailos", "--deploy-config", config, "--dist", build(with(map[string]string{"release.json": string(manifest(c["base"], assets))}))), "does not name the released commit")
+	liveCommit = c["base"]
+	refused("live commit differs", record("tailos", "--deploy-config", config, "--dist", build(with(nil))), "TailOS serves "+c["base"])
+	liveCommit = released
+	refused("dist without tailos", record("hub", "--dist", build(with(nil))), "--target tailos")
+
+	// A matching build is retained (0700, no .tmp left) and then recorded.
+	if err := record("tailos", "--deploy-config", config, "--dist", build(with(nil))); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(retained)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("retained copy %v %v", info, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(retained, "assets", "app.js")); err != nil || string(b) != assets["assets/app.js"] {
+		t.Fatalf("retained file %q %v", b, err)
+	}
+	if entries, _ := os.ReadDir(journal); len(entries) != 1 {
+		t.Fatalf("journal entries %v", entries)
+	}
+	if len(posts) != 1 || posts[0].Operation != "hand_release" || posts[0].HandRelease == nil || posts[0].HandRelease.ReleasedCommit != released || !reflect.DeepEqual(posts[0].HandRelease.Targets, []string{"tailos"}) {
+		t.Fatalf("hand release request %+v", posts)
+	}
+	// The valid retained copy now satisfies the guard without --dist, and is
+	// kept when --dist is passed again.
+	before := info.ModTime()
+	if err := record("tailos", "--deploy-config", config); err != nil {
+		t.Fatal(err)
+	}
+	if err := record("tailos", "--deploy-config", config, "--dist", build(with(nil))); err != nil {
+		t.Fatal(err)
+	}
+	if info, err = os.Stat(retained); err != nil || !info.ModTime().Equal(before) || len(posts) != 3 {
+		t.Fatalf("existing copy not kept: %v %v posts=%d", info, err, len(posts))
+	}
+	// A retained copy that no longer matches is refused, with or without --dist.
+	if err := os.WriteFile(filepath.Join(retained, "index.html"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, extra := range [][]string{{"--deploy-config", config}, {"--deploy-config", config, "--dist", build(with(nil))}} {
+		if err := record("tailos", extra...); err == nil || !strings.Contains(err.Error(), "different: index.html") || !strings.Contains(err.Error(), "--dist PATH") {
+			t.Fatal("stale retained copy", err)
+		}
+	}
+	// Other targets are unchanged: no config, no dist, no journal write.
+	if err := record("hub"); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(journal); len(posts) != 4 || !reflect.DeepEqual(posts[3].HandRelease.Targets, []string{"hub"}) || len(entries) != 1 {
+		t.Fatalf("non-tailos hand release %+v", posts)
 	}
 }
 

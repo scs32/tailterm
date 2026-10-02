@@ -3,13 +3,18 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -256,7 +261,8 @@ func provisionPrerequisites(checkout, source string) error {
 
 // cmdHandRelease records the owner's hand release, or lists the records.
 // Recording proves every covered job in a local checkout first; the hub
-// refuses a request that carries an agent identity.
+// refuses a request that carries an agent identity. A tailos target is recorded
+// only with a verified retained rollback copy (retainedTailOSCopy).
 func cmdHandRelease(e env, args []string) error {
 	fs := flag.NewFlagSet("deployment "+args[0], flag.ContinueOnError)
 	intervention := fs.Int64("intervention", 0, "owner release intervention message sequence")
@@ -264,6 +270,8 @@ func cmdHandRelease(e env, args []string) error {
 	releaseName := fs.String("release", "", "release name, such as the hand release's release ID")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release")
 	key := fs.String("request-id", "", "stable retry identity")
+	deployConfig := fs.String("deploy-config", "", "the deployer's private config; required with a tailos target")
+	dist := fs.String("dist", "", "built dist-static of the released commit, to verify and retain as the TailOS rollback copy")
 	var targets, jobIDs stringListFlag
 	fs.Var(&targets, "target", "target the hand release shipped: hub, bridge, mini or tailos (repeatable)")
 	fs.Var(&jobIDs, "job", "release job whose accepted commit the hand release carries (repeatable)")
@@ -286,6 +294,13 @@ func cmdHandRelease(e env, args []string) error {
 	if *key == "" || len(jobIDs) == 0 {
 		return errors.New("hand-release needs --request-id and at least one --job")
 	}
+	tailos := false
+	for _, t := range targets {
+		tailos = tailos || t == "tailos"
+	}
+	if !tailos && *dist != "" {
+		return errors.New("--dist applies only to a hand release with --target tailos")
+	}
 	jobs, err := c.Releases(ctx, e.task)
 	if err != nil {
 		return err
@@ -301,6 +316,11 @@ func cmdHandRelease(e env, args []string) error {
 		}
 		commits = append(commits, j.Commit)
 	}
+	if tailos {
+		if err = retainedTailOSCopy(*deployConfig, *released, *dist); err != nil {
+			return err
+		}
+	}
 	record := &api.HandRelease{InterventionSeq: *intervention, ReleasedCommit: *released, Release: *releaseName, Targets: targets, Commits: commits}
 	out, err := c.RecordHandRelease(ctx, e.task, api.ReleaseRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, HandRelease: record})
 	if err == nil {
@@ -310,6 +330,230 @@ func cmdHandRelease(e env, args []string) error {
 		err = fmt.Errorf("%w; this shell carries an agent identity: record the hand release as the owner from a shell without it, e.g. env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...", err)
 	}
 	return err
+}
+
+// tailosReleaseURL is the default of scripts/release-probe.mjs (tailosURL).
+const tailosReleaseURL = "https://tailos.tailarr.com/release.json"
+
+// retainedTailOSCopy lets a TailOS hand release be recorded only when
+// journalDirectory/tailos-dist-COMMIT holds the build TailOS serves: the next
+// job's rollback redeploys that directory (scripts/release-inputs.mjs), and
+// only the runner's retain step otherwise writes it. With dist it verifies
+// that build and retains it as the runner does: copy to .tmp, 0700, rename.
+// Errors name the config's keys, never its values.
+func retainedTailOSCopy(configPath, released, dist string) error {
+	if !fullCommit(released) {
+		return errors.New("a tailos hand release needs --released-commit as a full 40-character commit")
+	}
+	if configPath == "" {
+		return errors.New("a tailos hand release needs --deploy-config PRIVATE_PATH: its journalDirectory must hold the retained rollback copy tailos-dist-" + released)
+	}
+	var config struct {
+		JournalDirectory string `json:"journalDirectory"`
+		Targets          struct {
+			TailOS struct {
+				URL string `json:"url"`
+			} `json:"tailos"`
+		} `json:"targets"`
+	}
+	if b, err := os.ReadFile(configPath); err != nil {
+		return errors.New("deploy config not readable: check the --deploy-config path")
+	} else if json.Unmarshal(b, &config) != nil || config.JournalDirectory == "" {
+		return errors.New("deploy config needs a journalDirectory")
+	}
+	url := config.Targets.TailOS.URL
+	if url == "" {
+		url = tailosReleaseURL
+	}
+	live, err := liveTailOSFiles(url, released)
+	if err != nil {
+		return err
+	}
+	retained := filepath.Join(config.JournalDirectory, "tailos-dist-"+released)
+	const name = "journalDirectory/tailos-dist-"
+	if dist != "" {
+		if err = matchesTailOSRelease(dist, released, live); err != nil {
+			return fmt.Errorf("--dist does not match the live TailOS release.json: %w; nothing was retained or recorded", err)
+		}
+	}
+	switch _, statErr := os.Lstat(retained); {
+	case statErr == nil:
+		// An existing copy is kept, as in the runner, but only a valid one.
+		if err = matchesTailOSRelease(retained, released, live); err != nil {
+			return fmt.Errorf("the retained TailOS rollback copy %s%s does not match the live release.json: %w; remove it, build that commit's dist-static and rerun with --dist PATH", name, released, err)
+		}
+		return nil
+	case !errors.Is(statErr, os.ErrNotExist):
+		return fmt.Errorf("the retained TailOS rollback copy %s%s cannot be read", name, released)
+	case dist == "":
+		return fmt.Errorf("no retained TailOS rollback copy %s%s: the next release could not roll TailOS back; build that commit's dist-static and rerun with --dist PATH", name, released)
+	}
+	tmp := retained + ".tmp"
+	if err = os.RemoveAll(tmp); err == nil {
+		err = copyTree(dist, tmp)
+	}
+	if err == nil {
+		err = os.Chmod(tmp, 0o700)
+	}
+	if err == nil {
+		// The copy, not the source, is what a rollback deploys.
+		err = matchesTailOSRelease(tmp, released, live)
+	}
+	if err == nil {
+		err = os.Rename(tmp, retained)
+	}
+	if err != nil {
+		_ = os.RemoveAll(tmp)
+		return fmt.Errorf("retaining --dist as %s%s failed: %w; nothing was recorded", name, released, err)
+	}
+	return nil
+}
+
+type tailosFile struct {
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// liveTailOSFiles reads the live release.json once and returns its file map;
+// the release must name the hand-released commit.
+func liveTailOSFiles(url, released string) (map[string]tailosFile, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, errors.New("deploy config targets.tailos.url is not a valid URL")
+	}
+	req.Header.Set("Cache-Control", "no-store")
+	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, errors.New("the live TailOS release.json could not be read")
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+	var manifest struct {
+		Commit string                `json:"commit"`
+		Files  map[string]tailosFile `json:"files"`
+	}
+	if err != nil || res.StatusCode != http.StatusOK || json.Unmarshal(body, &manifest) != nil || !fullCommit(manifest.Commit) || len(manifest.Files) == 0 {
+		return nil, errors.New("the live TailOS release.json could not be read")
+	}
+	if manifest.Commit != released {
+		return nil, fmt.Errorf("TailOS serves %s, not the hand-released commit %s", manifest.Commit, released)
+	}
+	return manifest.Files, nil
+}
+
+// matchesTailOSRelease compares a build directory with the live file map as
+// scripts/release-manifest.mjs inventories it: every regular file but the
+// top-level release.json, by size and sha256, none missing and none extra.
+// The directory's own release.json must name the commit, because the rollback
+// probe reads it after a redeploy.
+func matchesTailOSRelease(dir, released string, live map[string]tailosFile) error {
+	found := map[string]tailosFile{}
+	var walk func(prefix string) error
+	walk = func(prefix string) error {
+		entries, err := os.ReadDir(filepath.Join(dir, filepath.FromSlash(prefix)))
+		if err != nil {
+			return errors.New("the directory cannot be read")
+		}
+		for _, entry := range entries {
+			name := prefix + entry.Name()
+			if entry.IsDir() {
+				if err = walk(name + "/"); err != nil {
+					return err
+				}
+				continue
+			}
+			if !entry.Type().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", name)
+			}
+			b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(name)))
+			if err != nil {
+				return fmt.Errorf("%s cannot be read", name)
+			}
+			if name == "release.json" {
+				var own struct {
+					Commit string `json:"commit"`
+				}
+				if json.Unmarshal(b, &own) != nil || own.Commit != released {
+					return errors.New("its release.json does not name the released commit")
+				}
+				continue
+			}
+			sum := sha256.Sum256(b)
+			found[name] = tailosFile{Size: int64(len(b)), SHA256: hex.EncodeToString(sum[:])}
+		}
+		return nil
+	}
+	if err := walk(""); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "release.json")); err != nil {
+		return errors.New("it has no release.json")
+	}
+	var missing, extra, differ []string
+	for name, want := range live {
+		if got, ok := found[name]; !ok {
+			missing = append(missing, name)
+		} else if got != want {
+			differ = append(differ, name)
+		}
+	}
+	for name := range found {
+		if _, ok := live[name]; !ok {
+			extra = append(extra, name)
+		}
+	}
+	if len(missing)+len(extra)+len(differ) == 0 {
+		return nil
+	}
+	parts := []string{}
+	for _, group := range []struct {
+		label string
+		names []string
+	}{{"missing", missing}, {"extra", extra}, {"different", differ}} {
+		if len(group.names) == 0 {
+			continue
+		}
+		sort.Strings(group.names)
+		more := ""
+		if len(group.names) > 3 {
+			more = fmt.Sprintf(" and %d more", len(group.names)-3)
+			group.names = group.names[:3]
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s%s", group.label, strings.Join(group.names, ", "), more))
+	}
+	return errors.New(strings.Join(parts, "; "))
+}
+
+// copyTree copies a directory of regular files, as the runner's cpSync does
+// for dist-static.
+func copyTree(from, to string) error {
+	if err := os.MkdirAll(to, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		src, dst := filepath.Join(from, entry.Name()), filepath.Join(to, entry.Name())
+		if entry.IsDir() {
+			if err = copyTree(src, dst); err != nil {
+				return err
+			}
+			continue
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", entry.Name())
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		if err = os.WriteFile(dst, b, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func findReleaseJob(jobs []api.ReleaseJob, id string) (api.ReleaseJob, error) {

@@ -428,8 +428,42 @@ Run it as the owner from a shell without an agent identity: the CLI sends
 `TAILTERM_AGENT`/`TAILTERM_RUN` when they are set and the hub then refuses (409),
 so from an agent or owner-helper session use
 `env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...`.
-`tt deployment hand-releases` lists the records. The handler, with its own agent
-identity, then supersedes each covered job:
+`tt deployment hand-releases` lists the records.
+
+**A TailOS hand release needs the retained rollback copy.** With `--target
+tailos` the command also takes `--deploy-config PRIVATE_PATH` (required) and
+`--dist PATH`, and records nothing unless
+`journalDirectory/tailos-dist-RELEASED_COMMIT` is a valid copy of what TailOS
+serves. Only the runner's retain step otherwise writes that directory, and the
+next job's inputs mark TailOS rollback unsafe without it. The command reads the
+live `release.json` once (`targets.tailos.url` in the config, default
+`https://tailos.tailarr.com/release.json`), which must name the released commit,
+and compares a directory with its file map: every file by size and sha256, none
+missing and none extra, `release.json` itself excluded; the directory's own
+`release.json` must name the released commit.
+
+- Without `--dist`, the retained directory must already exist and match;
+  otherwise the command refuses and names `--dist PATH`.
+- With `--dist PATH`, it verifies PATH the same way and retains it as the runner
+  does (copy to `.tmp`, mode 0700, rename). A mismatch retains and records
+  nothing. An existing valid directory is kept; an existing one that does not
+  match is refused: remove it and rerun with `--dist`.
+
+To build the copy, check out the released commit in a clean worktree and build it
+as the runner does (`npm ci`, then `npm run build:static`, which writes
+`dist-static` with its `release.json`; the wasm and `.build` inputs the build
+needs come from the main checkout), then pass `--dist WORKTREE/dist-static`:
+
+```
+tt deployment hand-release --intervention SEQ --released-commit SHA \
+  --release NAME --target tailos --job REL --repo CHECKOUT --request-id KEY \
+  --deploy-config PRIVATE_PATH --dist WORKTREE/dist-static
+```
+
+Other targets take neither flag and behave as before; `--dist` without a tailos
+target is refused.
+
+The handler, with its own agent identity, then supersedes each covered job:
 
 ```
 tt deployment supersede --job ID --generation N --hand-release HRL \
@@ -746,7 +780,9 @@ It makes no backup and touches no token, database or Tailscale state, and refuse
 a missing or mismatched binary or an unrecognized live definition before any
 mutation. After a verified TailOS deploy the runner keeps `dist-static` as
 `journalDirectory/tailos-dist-COMMIT` (0700); the next job's TailOS rollback
-redeploys that directory with Wrangler. `prepare(tailos)` runs `npm ci` first when
+redeploys that directory with Wrangler. A hand release of TailOS
+retains the same directory through `tt deployment hand-release --dist` (see
+"Superseding jobs released by hand"). `prepare(tailos)` runs `npm ci` first when
 `package-lock.json` changed since the TailOS baseline.
 
 ### Private host configuration (keys only)
@@ -942,7 +978,9 @@ the job, so live code and `tasks-hub` agree again.
 **Hand release while the agent is provisioned.** Retire the deployer (pause
 above) and release by hand. Before resuming the deployer, record the owner
 `release` intervention, then the hand release record with every target it
-shipped and every job it carries (`tt deployment hand-release`, above), then
+shipped and every job it carries (`tt deployment hand-release`, above; a TailOS
+hand release is recorded only with its retained rollback copy, so pass
+`--deploy-config` and, unless the copy already exists, `--dist`), then
 order the handler to supersede each of those jobs citing the record. The
 baselines then advance by themselves: the deployer and the handler's input
 builder overlay each superseded job's released commit on the targets its record
