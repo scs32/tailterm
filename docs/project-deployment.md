@@ -789,7 +789,9 @@ release job"), the project handler, on the Mini in the dedicated checkout:
    `before-ID-TARGET.sqlite` and the other target's live mount retained. For
    each plan it runs `truenas_release_preflight.py --plan --receipt-output` once
    to create the backup, pins the receipt hash and copies the backup locally when
-   the store schema changed. Each hub/bridge manifest entry records its
+   the store schema changed. `tests/truenas-release-preflight.test.js` builds its
+   fixtures with the process's group, so its results do not depend on the temp
+   directory's group. Each hub/bridge manifest entry records its
    `planTargets` and names `--rollback-to` and rollback probe commands for that
    target's own probed live release. Mini and TailOS get their rollback probe and retained-dist program.
    The manifest `journalDirectory/ID-inputs.json` is written once, mode 0600.

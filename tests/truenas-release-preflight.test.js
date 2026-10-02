@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  chownSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -26,7 +27,11 @@ const pythonExecutable = spawnSync(
 ).stdout.trim();
 
 function workspace(name) {
-  return realpathSync(mkdtempSync(join(tmpdir(), `tailterm-${name}-`)));
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), `tailterm-${name}-`)));
+  // New files take their directory's group on macOS, so give the workspace the
+  // process's group instead of the one inherited from the temp directory.
+  chownSync(directory, process.getuid(), process.getgid());
+  return directory;
 }
 
 function createDatabase(path) {
