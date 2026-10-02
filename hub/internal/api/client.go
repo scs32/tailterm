@@ -38,8 +38,11 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string { return fmt.Sprintf("hub: %d %s", e.Status, e.Msg) }
 
+// defaultMaxResponseBytes bounds a hub response read through do.
+const defaultMaxResponseBytes = 32 << 20
+
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	return c.doLimited(ctx, method, path, body, out, 4<<20)
+	return c.doLimited(ctx, method, path, body, out, defaultMaxResponseBytes)
 }
 
 func (c *Client) doLimited(ctx context.Context, method, path string, body, out any, maxResponse int64) error {
@@ -82,9 +85,15 @@ func (c *Client) doLimitedJSON(ctx context.Context, method, path string, body, o
 		return err
 	}
 	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponse))
+	// Read one byte past the cap so an oversized body is reported instead of
+	// being parsed as truncated JSON.
+	data, err := io.ReadAll(io.LimitReader(res.Body, maxResponse+1))
 	if err != nil {
 		return err
+	}
+	overCap := int64(len(data)) > maxResponse
+	if overCap {
+		data = data[:maxResponse]
 	}
 	if res.StatusCode >= 400 {
 		if res.StatusCode == http.StatusConflict {
@@ -99,6 +108,9 @@ func (c *Client) doLimitedJSON(ctx context.Context, method, path string, body, o
 			e.Error = strings.TrimSpace(string(data))
 		}
 		return &HTTPError{Status: res.StatusCode, Msg: e.Error, Code: e.Code, Problems: e.Problems}
+	}
+	if overCap {
+		return fmt.Errorf("hub response exceeds %d bytes", maxResponse)
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
