@@ -56,6 +56,9 @@ type claudeWakeIntent struct {
 	RetryAt     time.Time `json:"retryAt,omitempty"`
 	ExhaustedAt time.Time `json:"exhaustedAt,omitempty"`
 	LastRetry   string    `json:"lastRetry,omitempty"`
+	// Safe records why the checks let this wake type: the turn state and how
+	// much of the transcript was read to reach it.
+	Safe string `json:"safe,omitempty"`
 }
 
 type claudeWakeSnapshot struct {
@@ -70,6 +73,10 @@ type claudeWakeSnapshot struct {
 	Cursor    activityCursor
 	// UnknownTypes lists transcript record types the idle check ignored.
 	UnknownTypes []string
+	// Safe says why the transcript allows input (see claudeWakeIntent.Safe).
+	Safe string
+	// ReadBytes is how much of the transcript this check read.
+	ReadBytes int64
 }
 
 type claudeWakeOps struct {
@@ -77,6 +84,9 @@ type claudeWakeOps struct {
 	send    func(context.Context, string, string, bool) error
 	sleep   func(time.Duration)
 	now     func() time.Time
+	// escalate reports a wake skipped past claudeWakeSkipBound. Nil disables
+	// the report; the skip is still tracked.
+	escalate func(context.Context, runtimeBinding, claudeWakeSkip) error
 }
 
 var errClaudeWakeUnsafe = errors.New("Claude is not safely idle")
@@ -305,52 +315,126 @@ func claudeClip(value string, limit int) string {
 	return value[:cut] + "…"
 }
 
-// claudeTranscriptSnapshot reads the whole transcript and decides idleness
-// from turn state: a completed turn, no pending tool call and no freshly
-// queued input. A record type the parser does not know is logged once and
-// otherwise ignored, so the pane check decides; other parse errors still
-// refuse unless a later completed turn supersedes them.
+// claudeTranscriptReadMax bounds the bytes one idle check reads. A check that
+// reaches it refuses with its own reason and keeps its place, so the next
+// check continues from there. A variable so a test can lower it.
+var claudeTranscriptReadMax int64 = 256 << 20
+
+// claudeTranscriptState is the idle check's place in one run's transcript.
+type claudeTranscriptState struct {
+	cursor        activityCursor
+	strictUnknown bool
+	unknownReason string
+	unknownTypes  []string
+	records       int
+}
+
+// claudeTranscriptCache keeps that place per run for the life of this relay
+// process, so a check reads only the records appended since the last one. It
+// is keyed by run and transcript path and is never written to disk: a
+// restarted relay reads from zero.
+// Until bug wi_85b4b3b61a6d8655 every check started from zero and stopped
+// after 128 passes of 256 records, so a transcript longer than 32768 records
+// was "transcript incomplete" forever and its session was never woken.
+var claudeTranscriptCache struct {
+	sync.Mutex
+	runs map[string]*claudeTranscriptState
+}
+
+const claudeTranscriptCacheCap = 64
+
+// claudeTranscriptSnapshot reads the transcript to its end and decides
+// idleness from turn state: a completed turn, no pending tool call and no
+// freshly queued input. The first check of a run reads the whole file; later
+// checks continue from the cached place, and a replaced or shortened file
+// starts again from zero. A record type the parser does not know is logged
+// once and otherwise ignored, so the pane check decides; other parse errors
+// still refuse unless a later completed turn supersedes them.
 func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapshot, error) {
+	return claudeTranscriptSnapshotContext(context.Background(), b, now)
+}
+
+// claudeTranscriptSnapshotContext also stops between passes when ctx ends.
+// The place is kept, so the next check continues.
+func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now time.Time) (claudeWakeSnapshot, error) {
 	path, err := activityTranscript(b)
 	if err != nil || path == "" {
 		return claudeWakeSnapshot{}, errors.New("Claude transcript unavailable")
 	}
-	var cursor activityCursor
-	strictUnknown := false
-	unknownReason := ""
-	var unknownTypes []string
-	for i := 0; i < 128; i++ {
-		if err := readActivityAppend(path, &cursor, func(line []byte, cursor *activityCursor) error {
+	claudeTranscriptCache.Lock()
+	defer claudeTranscriptCache.Unlock()
+	key := b.Run + "\x00" + path
+	st := claudeTranscriptCache.runs[key]
+	// The same test readActivityAppend uses to start over, applied first so
+	// the state kept beside the cursor starts over with it.
+	if info, statErr := os.Stat(path); st == nil || statErr != nil || st.cursor.Path != path || st.cursor.FileID != fileIdentity(info) || info.Size() < st.cursor.Offset {
+		st = &claudeTranscriptState{}
+		if claudeTranscriptCache.runs == nil || len(claudeTranscriptCache.runs) >= claudeTranscriptCacheCap {
+			claudeTranscriptCache.runs = map[string]*claudeTranscriptState{}
+		}
+		claudeTranscriptCache.runs[key] = st
+	}
+	cursor := &st.cursor
+	start, overBound, interrupted := cursor.Offset, false, false
+	for {
+		before, file := cursor.Offset, cursor.FileID
+		if err := readActivityAppend(path, cursor, func(line []byte, cursor *activityCursor) error {
+			st.records++
 			err := parseClaudeActivity(line, cursor)
 			var unknown unknownClaudeRecordError
 			if errors.As(err, &unknown) {
 				kind := claudeClip(unknown.Type, 64)
-				if !slices.Contains(unknownTypes, kind) {
-					unknownTypes = append(unknownTypes, kind)
+				if !slices.Contains(st.unknownTypes, kind) {
+					st.unknownTypes = append(st.unknownTypes, kind)
 					logClaudeRecordOnce("type/"+kind, "[tt relay] %s %s Claude transcript record type %q not recognized; idle from turn state and pane check; sample=%s\n", now.UTC().Format(time.RFC3339), b.Agent, kind, claudeRecordSample(line))
 				}
 				return nil
 			}
 			if err != nil {
-				strictUnknown = true
-				if unknownReason == "" {
-					unknownReason = err.Error()
+				st.strictUnknown = true
+				if st.unknownReason == "" {
+					st.unknownReason = err.Error()
 				}
 			} else if cursor.TurnComplete && claudeCompletedRecord(line) {
 				// A later fully completed turn supersedes an older malformed
 				// record. Malformed data after that boundary still blocks input.
-				strictUnknown, unknownReason = false, ""
+				st.strictUnknown, st.unknownReason = false, ""
 			}
 			return err
 		}); err != nil {
+			delete(claudeTranscriptCache.runs, key)
 			return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript unavailable: %w", err)
+		}
+		if before > 0 && (cursor.FileID != file || cursor.Offset < before) {
+			// The reader started over: the file was replaced or shortened
+			// after the test above. The state beside the cursor is for the
+			// old file, so drop it all and start over on the next check.
+			delete(claudeTranscriptCache.runs, key)
+			return claudeWakeSnapshot{}, errors.New("Claude transcript unavailable: transcript replaced during the check")
 		}
 		if cursor.Ready {
 			break
 		}
+		// A pass that reads nothing new has reached a partial final record.
+		if cursor.Offset == before {
+			break
+		}
+		if cursor.Offset-start >= claudeTranscriptReadMax {
+			overBound = true
+			break
+		}
+		if ctx.Err() != nil {
+			interrupted = true
+			break
+		}
 	}
+	strictUnknown, unknownReason := st.strictUnknown, st.unknownReason
 	reason := ""
 	switch {
+	case interrupted:
+		reason = "transcript read interrupted; continues on the next check"
+	case overBound:
+		reason = fmt.Sprintf("transcript read reached the %d MiB bound for one check; continues on the next", claudeTranscriptReadMax>>20)
 	case !cursor.Ready:
 		reason = "transcript incomplete"
 	case !cursor.SeenTurn:
@@ -360,7 +444,7 @@ func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapsh
 	case len(cursor.Pending) != 0:
 		ids := slices.Sorted(maps.Keys(cursor.Pending))
 		reason = "tool call pending: " + cursor.Pending[ids[0]].Name
-	case claudeQueueFresh(cursor, now):
+	case claudeQueueFresh(*cursor, now):
 		reason = fmt.Sprintf("queued input pending (%d)", cursor.ClaudeQueued)
 	case strictUnknown:
 		reason = unknownReason
@@ -373,7 +457,11 @@ func claudeTranscriptSnapshot(b runtimeBinding, now time.Time) (claudeWakeSnapsh
 	if cursor.ClaudeQueued > 0 {
 		logClaudeRecordOnce("queue-operation/stale", "[tt relay] %s %s Claude transcript has %d queued input older than %s after a completed turn; idle from turn state and pane check\n", now.UTC().Format(time.RFC3339), b.Agent, cursor.ClaudeQueued, claudeQueueStaleAfter)
 	}
-	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: cursor, UnknownTypes: unknownTypes}, nil
+	safe := fmt.Sprintf("turn complete, no pending tool call, no fresh queued input; transcript read to its end (%d records, %d bytes)", st.records, cursor.Offset)
+	// The caller gets a copy that shares nothing the next check will change.
+	snapshot := *cursor
+	snapshot.Pending, snapshot.ClaudeUsage, snapshot.Completed = maps.Clone(cursor.Pending), maps.Clone(cursor.ClaudeUsage), slices.Clone(cursor.Completed)
+	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: snapshot, UnknownTypes: slices.Clone(st.unknownTypes), Safe: safe, ReadBytes: cursor.Offset - start}, nil
 }
 
 // claudeCompletedRecord reports a record that ends a turn, including an
@@ -452,7 +540,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
-	transcript, err := claudeTranscriptSnapshot(b, time.Now())
+	transcript, err := claudeTranscriptSnapshotContext(ctx, b, time.Now())
 	if err != nil {
 		return claudeWakeSnapshot{}, err
 	}
@@ -759,7 +847,133 @@ func claudeWakeSaveReason(intent *claudeWakeIntent, reason string) {
 	intent.LastRetry = claudeClip(strings.Join(strings.Fields(reason), " "), 200)
 }
 
+// claudeWakeSkip is one episode of unsafe skips with the same reason: private
+// host state beside the wake intent, scoped to a run.
+type claudeWakeSkip struct {
+	Run         string    `json:"run"`
+	Reason      string    `json:"reason"`
+	Since       time.Time `json:"since"`
+	LastAt      time.Time `json:"lastAt"`
+	EscalatedAt time.Time `json:"escalatedAt,omitempty"`
+	// TriedAt is the last report attempt, successful or not.
+	TriedAt time.Time `json:"triedAt,omitempty"`
+}
+
+const (
+	// claudeWakeSkipBound is how long a wake may be skipped as unsafe for one
+	// unchanged reason before the relay reports it, once.
+	claudeWakeSkipBound = 10 * time.Minute
+	// claudeWakeSkipGap ends an episode: the relay attempts a wake only while
+	// input is unread, at most five minutes apart (its rate window), so a
+	// longer silence means the agent read its inbox in between.
+	claudeWakeSkipGap = 6 * time.Minute
+	// claudeWakeEscalateRetry spaces attempts to report after a failed one.
+	claudeWakeEscalateRetry = time.Minute
+)
+
+func claudeWakeSkipPath(b runtimeBinding) string {
+	return filepath.Join(relayDir(), bindingKey(b)+"-"+b.Run+".claude-wake-skip.json")
+}
+
+// claudeWakeWith attempts one wake and tracks how long it has been skipped.
 func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps) error {
+	err := claudeWakeAttempt(ctx, b, prompt, ops)
+	if b.Runtime == "claude" && validBinding(b) {
+		claudeWakeTrackSkip(ctx, b, ops, err)
+	}
+	return err
+}
+
+// claudeWakeTrackSkip keeps the current skip episode and escalates it once
+// when it has lasted claudeWakeSkipBound. Only unsafe skips count: a busy
+// turn, a pending tool, a dialog, an unreadable transcript. A confirmed wake
+// ends the episode; an unconfirmed one has its own retry and stuck reporting
+// and leaves the episode as it is. A changed reason starts a new episode, so
+// an agent that moves between tools is working, not reported. A failed report
+// is tried again at most once a minute, under the same request identity.
+func claudeWakeTrackSkip(ctx context.Context, b runtimeBinding, ops claudeWakeOps, wakeErr error) {
+	path := claudeWakeSkipPath(b)
+	if wakeErr == nil {
+		_ = os.Remove(path)
+		return
+	}
+	if !errors.Is(wakeErr, errClaudeWakeUnsafe) {
+		return
+	}
+	now := ops.now().UTC()
+	reason := claudeClip(strings.Join(strings.Fields(strings.TrimPrefix(wakeErr.Error(), errClaudeWakeUnsafe.Error()+": ")), " "), 200)
+	var skip claudeWakeSkip
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &skip)
+	}
+	if skip.Run != b.Run || skip.Reason != reason || skip.Since.IsZero() || now.Sub(skip.LastAt) > claudeWakeSkipGap {
+		skip = claudeWakeSkip{Run: b.Run, Reason: reason, Since: now}
+	}
+	skip.LastAt = now
+	if skip.EscalatedAt.IsZero() && now.Sub(skip.Since) >= claudeWakeSkipBound && ops.escalate != nil && (skip.TriedAt.IsZero() || now.Sub(skip.TriedAt) >= claudeWakeEscalateRetry) {
+		skip.TriedAt = now
+		if err := ops.escalate(ctx, b, skip); err != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip escalation failed: %v\n", now.Format(time.RFC3339), b.Agent, err)
+		} else {
+			skip.EscalatedAt = now
+			fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skipped since %s, escalated once: %s\n", now.Format(time.RFC3339), b.Agent, skip.Since.Format(time.RFC3339), skip.Reason)
+		}
+	}
+	if err := writePrivateJSON(path, skip); err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip record not saved: %v\n", now.Format(time.RFC3339), b.Agent, err)
+	}
+}
+
+// nativeClaudeEscalate posts one notice naming the session and the reason.
+// It uses the relay's configured hub token and shared request budget. The
+// notice goes to the project's database handler; when the skipped agent is
+// that handler, or none is live, to the owner helper; otherwise to the Board
+// with no recipient. The request identity is the run and the episode start,
+// so a retry or a restarted relay cannot post it twice.
+func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWakeSkip) error {
+	e := env{hub: b.Hub}
+	e.loadConfig()
+	c, err := e.client(3 * time.Second)
+	if err != nil {
+		return err
+	}
+	attachRelayBudget(c, activeRelayBudget)
+	agents, err := c.ListAgents(ctx, b.Task)
+	if err != nil {
+		return err
+	}
+	to := claudeEscalationRecipient(agents, b.Agent)
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: "The relay cannot wake a Claude agent that has unread input",
+		Refs: map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session},
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("The relay has skipped every wake to agent %s (run %s, tmux session %s) since %s, always for the same reason: %s. Its unread input is not reaching it. Check the session, or wake it by hand. The relay sends this once for this reason and keeps trying.",
+			b.Agent, b.Run, b.Session, skip.Since.Format(time.RFC3339), skip.Reason)}}
+	key := fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(b.Run, "run_"), skip.Since.Unix())
+	_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: key})
+	return err
+}
+
+// claudeEscalationRecipient picks who hears that agent skipped cannot be
+// woken: the newest live database handler, else the newest live owner helper,
+// never the skipped agent itself. The zero Agent means the Board.
+func claudeEscalationRecipient(agents []api.Agent, skipped string) api.Agent {
+	for _, role := range []string{api.AgentRoleDatabaseHandler, api.AgentRoleOwnerHelper} {
+		var found api.Agent
+		for _, a := range agents {
+			if a.Role != role || a.ID == skipped || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
+				continue
+			}
+			if found.ID == "" || a.CreatedAt.After(found.CreatedAt) {
+				found = a
+			}
+		}
+		if found.ID != "" {
+			return found
+		}
+	}
+	return api.Agent{}
+}
+
+func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps) error {
 	if b.Runtime != "claude" || !validBinding(b) || prompt == "" || strings.ContainsAny(prompt, "\r\n") {
 		return errors.New("invalid Claude wake binding or prompt")
 	}
@@ -934,6 +1148,10 @@ func claudeWakeType(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	intent.Phase, intent.At = "uncertain", now
 	intent.TextAt, intent.EnterAt, intent.ConfirmedAt = time.Time{}, time.Time{}, time.Time{}
 	intent.RetryAt = now.Add(claudeWakeBackoffAfter(intent.Attempts))
+	intent.Safe = ""
+	if first.Safe != "" {
+		intent.Safe = claudeClip(first.Safe+"; pane input empty", 240)
+	}
 	if err := writePrivateJSON(path, intent); err != nil {
 		return err
 	}
@@ -989,5 +1207,5 @@ func claudeWakeAwait(ctx context.Context, ops claudeWakeOps, path string, intent
 }
 
 func claudeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
-	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, sleep: time.Sleep, now: time.Now})
+	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, sleep: time.Sleep, now: time.Now, escalate: nativeClaudeEscalate})
 }

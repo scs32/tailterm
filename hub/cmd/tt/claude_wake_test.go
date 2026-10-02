@@ -1633,3 +1633,541 @@ func TestClaudeWakeAPIErrorTurnDelivers(t *testing.T) {
 		t.Fatalf("busy turn wake: sent=%q err=%v", sent, err)
 	}
 }
+
+// transcriptWakeOps drives claudeWakeWith over the real transcript check with
+// a fake pane: Enter appends the typed prompt as the new user record.
+func transcriptWakeOps(t *testing.T, transcript string, now *time.Time, sent *[]string) claudeWakeOps {
+	t.Helper()
+	typed := ""
+	return claudeWakeOps{
+		inspect: func(_ context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+			snap, err := claudeTranscriptSnapshot(b, *now)
+			if err != nil {
+				return claudeWakeSnapshot{}, err
+			}
+			snap.Pane, snap.SessionID, snap.Created, snap.PanePID = "%1", "$1", "100", 1001
+			snap.Screen = "❯ " + expected + "\n"
+			if expected == "" {
+				snap.Screen = "Answer\n❯ \n? for shortcuts\n"
+			}
+			return snap, nil
+		},
+		send: func(_ context.Context, _, value string, literal bool) error {
+			if literal {
+				*sent, typed = append(*sent, "text:"+value), value
+				return nil
+			}
+			*sent = append(*sent, "Enter")
+			line, _ := json.Marshal(map[string]any{"type": "user", "timestamp": now.UTC().Format(time.RFC3339Nano), "message": map[string]any{"role": "user", "content": typed}})
+			appendClaudeRecords(t, transcript, string(line))
+			return nil
+		},
+		sleep: func(d time.Duration) { *now = now.Add(d) },
+		now:   func() time.Time { return *now },
+	}
+}
+
+// Bug wi_85b4b3b61a6d8655, a1: a transcript longer than the old 32768-record
+// read cap, ending in a completed turn, is woken exactly once and the intent
+// records why that was safe. The owner helper's transcript passed 32768
+// records at 16:49:06Z on 2026-10-01 and was skipped from then on.
+func TestClaudeWakeLongTranscriptWokenOnce(t *testing.T) {
+	now := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	b, transcript := claudeTranscriptFixture(t, "queue-idle")
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	// Bookkeeping records Claude Code writes after a turn, as in the incident.
+	filler := strings.Repeat(`{"type":"mode","mode":"default","sessionId":"11111111-1111-4111-8111-111111111111"}`+"\n", 33000)
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(filler); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	snap, err := claudeTranscriptSnapshot(b, now)
+	if err != nil || !claudeWakeIdle(snap, now) {
+		t.Fatalf("long transcript refused: %v", err)
+	}
+	info, _ := os.Stat(transcript)
+	if snap.Offset != info.Size() || !strings.Contains(snap.Safe, "transcript read to its end (33") || !strings.Contains(snap.Safe, fmt.Sprintf("%d bytes", info.Size())) {
+		t.Fatalf("snapshot offset=%d size=%d safe=%q", snap.Offset, info.Size(), snap.Safe)
+	}
+	var sent []string
+	prompt := "Tailterm messages #19684. Run tt inbox --unread --mark-read."
+	for pass := 0; pass < 3; pass++ {
+		if err := claudeWakeWith(context.Background(), b, prompt, transcriptWakeOps(t, transcript, &now, &sent)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		now = now.Add(15 * time.Second)
+	}
+	if len(sent) != 2 || sent[0] != "text:"+prompt || sent[1] != "Enter" {
+		t.Fatalf("long transcript not woken exactly once: %q", sent)
+	}
+	var saved claudeWakeIntent
+	data, _ := os.ReadFile(claudeWakePath(b))
+	if json.Unmarshal(data, &saved) != nil || saved.Phase != "confirmed" || !strings.HasPrefix(saved.Safe, "turn complete, no pending tool call, no fresh queued input; transcript read to its end (33") || !strings.HasSuffix(saved.Safe, "; pane input empty") {
+		t.Fatalf("intent does not record why the wake was safe: %s", data)
+	}
+	if _, err := os.Stat(claudeWakeSkipPath(b)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed wake left a skip record: %v", err)
+	}
+}
+
+// a1: the read is bounded by bytes, with its own reason, and a partial final
+// record still refuses as incomplete.
+func TestClaudeTranscriptReadBound(t *testing.T) {
+	now := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	t.Run("a check stops at the bound and the next continues", func(t *testing.T) {
+		b, transcript := claudeTranscriptFixture(t, "queue-idle")
+		old := claudeTranscriptReadMax
+		claudeTranscriptReadMax = 1 << 20
+		t.Cleanup(func() { claudeTranscriptReadMax = old })
+		appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", (3<<19)/33), "\n"))
+		var sent []string
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		prompt := "Tailterm messages #1. Run tt inbox --unread --mark-read."
+		err := claudeWakeWith(context.Background(), b, prompt, transcriptWakeOps(t, transcript, &now, &sent))
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.HasSuffix(err.Error(), ": transcript read reached the 1 MiB bound for one check; continues on the next") || len(sent) != 0 {
+			t.Fatalf("first check: sent=%q err=%v", sent, err)
+		}
+		info, _ := os.Stat(transcript)
+		snap, err := claudeTranscriptSnapshot(b, now)
+		if err != nil || snap.Offset != info.Size() || snap.ReadBytes <= 0 || snap.ReadBytes >= info.Size()-(1<<20)+(64<<10) {
+			t.Fatalf("second check did not continue from the first: read=%d size=%d err=%v", snap.ReadBytes, info.Size(), err)
+		}
+	})
+	t.Run("partial final record", func(t *testing.T) {
+		b, transcript := claudeTranscriptFixture(t, "queue-idle")
+		f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(`{"type":"user","message":{"content":"half a rec`); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		if _, err := claudeTranscriptSnapshot(b, now); err == nil || !strings.HasSuffix(err.Error(), ": transcript incomplete") {
+			t.Fatalf("partial record: %v", err)
+		}
+	})
+}
+
+// The idle check keeps its place per run: a later check reads only what was
+// appended, and turn state, pending tool calls and queued input stay correct
+// across checks. A replaced transcript starts again from zero.
+func TestClaudeTranscriptCachedCursor(t *testing.T) {
+	now := time.Date(2026, 10, 1, 16, 50, 0, 0, time.UTC)
+	b, transcript := claudeTranscriptFixture(t, "queue-idle")
+	size := func() int64 {
+		info, err := os.Stat(transcript)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Size()
+	}
+	check := func(step, wantSuffix string, wantRead int64) claudeWakeSnapshot {
+		t.Helper()
+		snap, err := claudeTranscriptSnapshot(b, now)
+		switch {
+		case wantSuffix == "" && err != nil:
+			t.Fatalf("%s: refused: %v", step, err)
+		case wantSuffix != "" && (err == nil || !strings.HasSuffix(err.Error(), ": "+wantSuffix)):
+			t.Fatalf("%s: want %q, got %v", step, wantSuffix, err)
+		case err == nil && (snap.ReadBytes != wantRead || snap.Offset != size()):
+			t.Fatalf("%s: read %d bytes to offset %d, want %d to %d", step, snap.ReadBytes, snap.Offset, wantRead, size())
+		}
+		return snap
+	}
+	whole := size()
+	check("first check reads the whole file", "", whole)
+	check("unchanged file reads nothing", "", 0)
+
+	appendClaudeRecords(t, transcript, claudeBgLaunch)
+	check("tool call starts a turn", "turn in progress", 0)
+	appendClaudeRecords(t, transcript, claudeBgEndTurn)
+	check("tool call kept across checks", "tool call pending: Bash", 0)
+	before := size()
+	appendClaudeRecords(t, transcript, claudeBgLaunchResult)
+	if snap := check("tool result and turn end", "", size()-before); len(snap.Cursor.Pending) != 0 {
+		t.Fatalf("pending after result: %v", snap.Cursor.Pending)
+	}
+
+	appendClaudeRecords(t, transcript, strings.Replace(claudeBgEnqueue, "2026-10-01T16:41:00.000Z", "2026-10-01T16:49:55.000Z", 1))
+	check("queued input across checks", "queued input pending (1)", 0)
+	before = size()
+	appendClaudeRecords(t, transcript, claudeBgDequeue, claudeBgNotification)
+	check("notification turn", "turn in progress", 0)
+	appendClaudeRecords(t, transcript, claudeBgEndTurn, claudeBgTurnDuration)
+	if snap := check("notification turn ended", "", size()-before-int64(len(claudeBgDequeue)+len(claudeBgNotification)+2)); snap.Cursor.ClaudeQueued != 0 {
+		t.Fatalf("queued count %d", snap.Cursor.ClaudeQueued)
+	}
+
+	// A record written in two parts refuses until its newline arrives.
+	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	half := len(claudeBgTaskStatus) / 2
+	if _, err := f.WriteString(claudeBgTaskStatus[:half]); err != nil {
+		t.Fatal(err)
+	}
+	check("partial final record", "transcript incomplete", 0)
+	check("partial final record again", "transcript incomplete", 0)
+	if _, err := f.WriteString(claudeBgTaskStatus[half:] + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	check("record completed", "", int64(len(claudeBgTaskStatus)-half+1))
+
+	// A malformed record after the last completed turn refuses on every
+	// check until a later completed turn supersedes it.
+	appendClaudeRecords(t, transcript, `{"type":"user","message":`)
+	_, malformed := claudeTranscriptSnapshot(b, now)
+	_, again := claudeTranscriptSnapshot(b, now)
+	if malformed == nil || again == nil || malformed.Error() != again.Error() || strings.Contains(malformed.Error(), "turn in progress") {
+		t.Fatalf("malformed record not carried across checks: %v / %v", malformed, again)
+	}
+	before = size()
+	appendClaudeRecords(t, transcript, claudeBgNotification, claudeBgEndTurn, claudeBgTurnDuration)
+	check("completed turn after a malformed record", "", size()-before)
+
+	// A restarted relay has no cache: it reads from zero to the same state.
+	records := check("before restart", "", 0).Safe
+	claudeTranscriptCache.Lock()
+	claudeTranscriptCache.runs = nil
+	claudeTranscriptCache.Unlock()
+	if snap := check("after restart", "", size()); snap.Safe != records {
+		t.Fatalf("restart read %q, cached read %q", snap.Safe, records)
+	}
+
+	// An ended context stops a long read between passes and keeps its place.
+	appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", 600), "\n"))
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := claudeTranscriptSnapshotContext(ended, b, now); err == nil || !strings.HasSuffix(err.Error(), ": transcript read interrupted; continues on the next check") {
+		t.Fatalf("ended context: %v", err)
+	}
+	check("continues after the interruption", "", 344*33)
+
+	// The caller's copy does not alias the cached state.
+	snap := check("copy", "", 0)
+	snap.Cursor.Pending["toolu_alias"] = pendingActivityCall{Name: "Bash"}
+	snap.Cursor.ClaudeUsage["msg_alias"] = api.TokenTotals{Total: 1}
+	check("after mutating the copy", "", 0)
+
+	// A different file at the same path, longer than the old one, is read
+	// from zero: it ends mid-turn although the old file ended idle.
+	data, err := os.ReadFile(filepath.Join("testdata", "claude-transcript", "queue-busy.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", int(size())/33+1) + string(data)
+	swap := transcript + ".new"
+	if err := os.WriteFile(swap, []byte(padded), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(swap, transcript); err != nil {
+		t.Fatal(err)
+	}
+	check("replaced by a longer file", "turn in progress", 0)
+	appendClaudeRecords(t, transcript, claudeBgEndTurn, claudeBgTurnDuration)
+	check("replaced file completes", "", int64(len(claudeBgEndTurn)+len(claudeBgTurnDuration)+2))
+
+	// A shorter file at the same path is a different transcript.
+	if int64(len(data)) >= size() {
+		t.Fatalf("queue-busy fixture unusable: %d bytes, %v", len(data), err)
+	}
+	if err := os.WriteFile(transcript, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	check("replaced transcript", "turn in progress", 0)
+}
+
+// Record shapes Claude Code 2.1.x writes around a tracked background task,
+// taken from the owner helper transcript with content removed: the launch, the
+// queued <task-notification> prompt, and the bookkeeping after a turn.
+const (
+	claudeBgLaunch       = `{"type":"assistant","timestamp":"2026-10-01T16:40:00.000Z","message":{"id":"msg_bg0001","role":"assistant","content":[{"type":"tool_use","id":"toolu_bg0001","name":"Bash","input":{"command":"fixture watcher","run_in_background":true}}],"stop_reason":"tool_use"}}`
+	claudeBgLaunchResult = `{"type":"user","timestamp":"2026-10-01T16:40:00.200Z","toolUseResult":{"backgroundTaskId":"bg_fixture"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg0001","content":"Command running in background with ID: bg_fixture"}]}}`
+	claudeBgEndTurn      = `{"type":"assistant","timestamp":"2026-10-01T16:40:01.000Z","message":{"id":"msg_bg0002","role":"assistant","content":[{"type":"text","text":"Fixture answer."}],"stop_reason":"end_turn"}}`
+	claudeBgTurnDuration = `{"type":"system","timestamp":"2026-10-01T16:40:01.100Z","subtype":"turn_duration","durationMs":1100}`
+	claudeBgEnqueue      = `{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-01T16:41:00.000Z","content":"fixture"}`
+	claudeBgDequeue      = `{"type":"queue-operation","operation":"dequeue","timestamp":"2026-10-01T16:41:00.010Z"}`
+	claudeBgNotification = `{"type":"user","timestamp":"2026-10-01T16:41:00.020Z","origin":{"kind":"task-notification"},"isSidechain":false,"message":{"role":"user","content":"<task-notification>\n<task-id>bg_fixture</task-id>\n<status>running</status>\n</task-notification>"}}`
+	claudeBgTaskStatus   = `{"type":"attachment","timestamp":"2026-10-01T16:41:02.000Z","attachment":{"type":"task_status","taskId":"bg_fixture","status":"running"}}`
+	claudeBgFrameLink    = `{"type":"frame-link","timestamp":"2026-10-01T16:41:02.100Z"}`
+	claudeBgStopHook     = `{"type":"system","timestamp":"2026-10-01T16:41:01.050Z","subtype":"stop_hook_summary","hookCount":1}`
+)
+
+// a1/a3: background-task records after a completed turn do not block a wake;
+// a notification turn still in progress does.
+func TestClaudeWakeBackgroundTaskRecords(t *testing.T) {
+	prompt := "Tailterm messages #19700. Run tt inbox --unread --mark-read."
+	running := []string{claudeBgLaunch, claudeBgLaunchResult, claudeBgEndTurn, claudeBgStopHook, claudeBgTurnDuration, claudeBgTaskStatus, claudeBgFrameLink}
+	notified := append(slices.Clone(running), claudeBgEnqueue, claudeBgDequeue, claudeBgNotification, claudeBgEndTurn, claudeBgStopHook, claudeBgTurnDuration,
+		`{"type":"last-prompt"}`, `{"type":"ai-title"}`, `{"type":"mode"}`, `{"type":"atis-latch"}`, claudeBgFrameLink, claudeBgTaskStatus)
+	for name, extra := range map[string][]string{"task running after a completed turn": running, "after a task notification turn": notified} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Date(2026, 10, 1, 16, 50, 0, 0, time.UTC)
+			b, transcript := claudeTranscriptFixture(t, "queue-idle", extra...)
+			t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+			var sent []string
+			for pass := 0; pass < 3; pass++ {
+				if err := claudeWakeWith(context.Background(), b, prompt, transcriptWakeOps(t, transcript, &now, &sent)); err != nil {
+					t.Fatalf("pass %d: %v", pass, err)
+				}
+				now = now.Add(15 * time.Second)
+			}
+			if len(sent) != 2 || sent[0] != "text:"+prompt || sent[1] != "Enter" {
+				t.Fatalf("not woken exactly once: %q", sent)
+			}
+		})
+	}
+	t.Run("notification turn in progress", func(t *testing.T) {
+		now := time.Date(2026, 10, 1, 16, 50, 0, 0, time.UTC)
+		b, transcript := claudeTranscriptFixture(t, "queue-idle", append(slices.Clone(running), claudeBgEnqueue, claudeBgDequeue, claudeBgNotification)...)
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		var sent []string
+		err := claudeWakeWith(context.Background(), b, prompt, transcriptWakeOps(t, transcript, &now, &sent))
+		if !errors.Is(err, errClaudeWakeUnsafe) || !strings.HasSuffix(err.Error(), ": turn in progress") || len(sent) != 0 {
+			t.Fatalf("busy notification turn: sent=%q err=%v", sent, err)
+		}
+	})
+}
+
+// a2/a3: a truly busy session stays skipped, and a skip that keeps one reason
+// past the bound escalates exactly once, naming the session and the reason.
+func TestClaudeWakeSkipEscalatesOnce(t *testing.T) {
+	prompt := "Tailterm messages #19684. Run tt inbox --unread --mark-read."
+	type call struct {
+		b    runtimeBinding
+		skip claudeWakeSkip
+	}
+	tries := 0
+	setup := func(t *testing.T) (runtimeBinding, *time.Time, *[]string, *[]call, *error, func() error) {
+		tries = 0
+		now := time.Date(2026, 10, 1, 16, 50, 0, 0, time.UTC)
+		b, transcript := claudeTranscriptFixture(t, "queue-busy")
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		var sent []string
+		var calls []call
+		var fail error
+		attempt := func() error {
+			ops := transcriptWakeOps(t, transcript, &now, &sent)
+			ops.escalate = func(_ context.Context, b runtimeBinding, skip claudeWakeSkip) error {
+				tries++
+				if fail != nil {
+					return fail
+				}
+				calls = append(calls, call{b, skip})
+				return nil
+			}
+			return claudeWakeWith(context.Background(), b, prompt, ops)
+		}
+		return b, &now, &sent, &calls, &fail, attempt
+	}
+	t.Run("busy past the bound", func(t *testing.T) {
+		b, now, sent, calls, _, attempt := setup(t)
+		start := *now
+		for now.Sub(start) < 40*time.Minute {
+			if err := attempt(); !errors.Is(err, errClaudeWakeUnsafe) || !strings.HasSuffix(err.Error(), ": turn in progress") {
+				t.Fatalf("busy session not skipped: %v", err)
+			}
+			if now.Sub(start) < claudeWakeSkipBound && len(*calls) != 0 {
+				t.Fatalf("escalated after %s, before the bound", now.Sub(start))
+			}
+			*now = now.Add(15 * time.Second)
+		}
+		if len(*sent) != 0 {
+			t.Fatalf("busy session received input: %q", *sent)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("escalations = %d, want exactly 1", len(*calls))
+		}
+		got := (*calls)[0]
+		if got.b.Agent != b.Agent || got.b.Session != b.Session || got.b.Run != b.Run || !got.skip.Since.Equal(start) || got.skip.Reason != "Claude transcript busy, incomplete, or unknown: turn in progress" {
+			t.Fatalf("escalation %+v", got)
+		}
+	})
+	t.Run("failed report is retried, then sent once", func(t *testing.T) {
+		_, now, _, calls, fail, attempt := setup(t)
+		*fail = errors.New("hub: 403 identity unavailable: invalid hub token")
+		for i := 0; i < 60; i++ { // 15 minutes of skips, 5 past the bound
+			_ = attempt()
+			*now = now.Add(15 * time.Second)
+		}
+		// 20 skips fall past the bound; a failed report is tried once a minute.
+		if tries != 5 {
+			t.Fatalf("failed report tried %d times in five minutes, want 5", tries)
+		}
+		*fail = nil
+		for i := 0; i < 20; i++ {
+			_ = attempt()
+			*now = now.Add(15 * time.Second)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("escalations after a failed report = %d, want 1", len(*calls))
+		}
+	})
+	t.Run("a changed reason or a quiet gap starts a new episode", func(t *testing.T) {
+		b, now, _, calls, _, attempt := setup(t)
+		for i := 0; i < 36; i++ { // 9 minutes
+			_ = attempt()
+			*now = now.Add(15 * time.Second)
+		}
+		// The agent read its inbox; the relay had nothing to wake it for.
+		*now = now.Add(claudeWakeSkipGap + time.Second)
+		gapStart := *now
+		for i := 0; i < 36; i++ {
+			_ = attempt()
+			*now = now.Add(15 * time.Second)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("two short episodes escalated: %+v", *calls)
+		}
+		var skip claudeWakeSkip
+		data, _ := os.ReadFile(claudeWakeSkipPath(b))
+		if json.Unmarshal(data, &skip) != nil || !skip.Since.Equal(gapStart) {
+			t.Fatalf("episode did not restart after the gap: %s", data)
+		}
+		claudeWakeTrackSkip(context.Background(), b, claudeWakeOps{now: func() time.Time { return *now }}, fmt.Errorf("%w: Claude pane has a permission or selection prompt", errClaudeWakeUnsafe))
+		data, _ = os.ReadFile(claudeWakeSkipPath(b))
+		if json.Unmarshal(data, &skip) != nil || !skip.Since.Equal(*now) || skip.Reason != "Claude pane has a permission or selection prompt" {
+			t.Fatalf("episode did not restart on a new reason: %s", data)
+		}
+		// An unconfirmed wake is not an unsafe skip and leaves the episode alone.
+		*now = now.Add(time.Minute)
+		claudeWakeTrackSkip(context.Background(), b, claudeWakeOps{now: func() time.Time { return *now }}, errors.New("Claude new user turn did not confirm within five seconds"))
+		after, _ := os.ReadFile(claudeWakeSkipPath(b))
+		if string(after) != string(data) {
+			t.Fatalf("unconfirmed wake changed the skip record: %s", after)
+		}
+	})
+}
+
+// a2: against an isolated hub that requires its token, as production does,
+// the escalation is exactly one notice to the database handler. When the
+// skipped agent is that handler it goes to the owner helper, and with neither
+// to the Board. A wrong token fails and posts nothing.
+func TestClaudeWakeSkipEscalationNotice(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "p", Orchestrator: "lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database", Host: "h", Session: "database", Runtime: "claude", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "builder", Host: "h", Session: "builder", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("t", 40)
+	identity, err := server.TokenIdentity(token, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, identity))
+	t.Cleanup(srv.Close)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	config := func(token string) {
+		t.Helper()
+		data, _ := json.Marshal(map[string]string{"url": srv.URL, "token": token})
+		if err := os.MkdirAll(filepath.Join(home, ".config", "tailterm"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".config", "tailterm", "hub.json"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Token = token
+	notices := func() []api.Message {
+		t.Helper()
+		all, err := c.ListMessages(ctx, task.ID, 0, "", 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []api.Message
+		for _, m := range all {
+			if m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	binding := func(a api.Agent) runtimeBinding {
+		b := testClaudeBinding()
+		b.Hub, b.Task, b.Agent, b.Session = srv.URL, task.ID, a.ID, a.Session
+		return b
+	}
+	since := time.Date(2026, 10, 1, 16, 50, 0, 0, time.UTC)
+	skip := claudeWakeSkip{Run: testClaudeBinding().Run, Reason: "Claude transcript busy, incomplete, or unknown: turn in progress", Since: since}
+
+	config(strings.Repeat("x", 40))
+	if err := nativeClaudeEscalate(ctx, binding(worker), skip); err == nil || !strings.Contains(err.Error(), "403") || len(notices()) != 0 {
+		t.Fatalf("wrong token: err=%v notices=%d", err, len(notices()))
+	}
+	config(token)
+	for i := 0; i < 2; i++ { // the second stands in for a retry or a restarted relay
+		if err := nativeClaudeEscalate(ctx, binding(worker), skip); err != nil {
+			t.Fatalf("escalation %d: %v", i, err)
+		}
+	}
+	got := notices()
+	if len(got) != 1 || got[0].To != handler.ID || got[0].Envelope.To != handler.Name {
+		t.Fatalf("want exactly one notice to the handler, got %d: %+v", len(got), got)
+	}
+	for _, want := range []string{worker.ID, skip.Run, worker.Session, skip.Reason, "2026-10-01T16:50:00Z"} {
+		if !strings.Contains(got[0].Text, want) {
+			t.Fatalf("notice lacks %q: %s", want, got[0].Text)
+		}
+	}
+
+	// The handler itself is the agent that cannot be woken.
+	skip.Since = since.Add(time.Hour)
+	if err := nativeClaudeEscalate(ctx, binding(handler), skip); err != nil {
+		t.Fatal(err)
+	}
+	if got = notices(); len(got) != 2 || got[1].To != "" || got[1].Envelope.To != "" || !strings.Contains(got[1].Text, handler.ID) {
+		t.Fatalf("handler skip with no owner helper should reach the Board: %+v", got)
+	}
+}
+
+// a2: the recipient is the newest live handler, else the newest live owner
+// helper, never the skipped agent, else the Board.
+func TestClaudeEscalationRecipient(t *testing.T) {
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	agents := []api.Agent{
+		{ID: "agt_old", Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentClosed, CreatedAt: at},
+		{ID: "agt_h1", Name: "db-handler-s1", Role: api.AgentRoleDatabaseHandler, Status: "done", CreatedAt: at.Add(time.Hour)},
+		{ID: "agt_h2", Name: "db-handler-s2", Role: api.AgentRoleDatabaseHandler, Status: "running", CreatedAt: at.Add(2 * time.Hour)},
+		{ID: "agt_helper", Name: "owner-helper", Role: api.AgentRoleOwnerHelper, Status: "running", CreatedAt: at},
+		{ID: "agt_retired", Name: "old-helper", Role: api.AgentRoleOwnerHelper, Status: api.AgentRetired, CreatedAt: at.Add(3 * time.Hour)},
+		{ID: "agt_worker", Name: "builder", Status: "running", CreatedAt: at},
+	}
+	for skipped, want := range map[string]string{"agt_worker": "agt_h2", "agt_helper": "agt_h2", "agt_h2": "agt_h1"} {
+		if got := claudeEscalationRecipient(agents, skipped); got.ID != want {
+			t.Fatalf("skipped %s: recipient %q, want %q", skipped, got.ID, want)
+		}
+	}
+	only := []api.Agent{agents[0], agents[2], agents[3], agents[4], agents[5]}
+	if got := claudeEscalationRecipient(only, "agt_h2"); got.ID != "agt_helper" {
+		t.Fatalf("handler skipped: recipient %q, want the owner helper", got.ID)
+	}
+	if got := claudeEscalationRecipient([]api.Agent{agents[0], agents[2], agents[4], agents[5]}, "agt_h2"); got.ID != "" {
+		t.Fatalf("no one else live: recipient %q, want the Board", got.ID)
+	}
+}
