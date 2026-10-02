@@ -43,6 +43,8 @@ type rotationCLI struct {
 	briefings []string
 	dueCalls  atomic.Int32
 	actions   atomic.Int32
+	// auth is the owner's authorization passed to rotate; zero for an ordinary rotation.
+	auth rotationAuthorization
 }
 
 func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
@@ -164,7 +166,7 @@ func (f *rotationCLI) rotate(t *testing.T) (api.HandlerRotation, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return rotateHandler(ctx, f.deps, f.e, f.c, f.task.ID, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner, f.spec)
+	return rotateHandler(ctx, f.deps, f.e, f.c, f.task.ID, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner, f.spec, f.auth)
 }
 
 func (f *rotationCLI) request(t *testing.T, to, subject string) api.Message {
@@ -236,7 +238,7 @@ func (f *rotationCLI) assertRotated(t *testing.T, r api.HandlerRotation, moved i
 		t.Fatal(err)
 	}
 	if successor.Role != api.AgentRoleDatabaseHandler || successor.ID == f.old.ID || successor.RunID == f.old.RunID || !runIDPattern.MatchString(successor.RunID) ||
-		successor.Host != f.old.Host || successor.Runtime != f.old.Runtime || successor.Cwd != f.old.Cwd || successor.Name != "db-handler-r2" {
+		successor.Host != f.old.Host || successor.Runtime != f.spec.runtime() || successor.Cwd != f.old.Cwd || successor.Name != "db-handler-r2" {
 		t.Fatalf("successor: %+v", successor)
 	}
 	detail, err := f.c.GetTask(ctx, f.task.ID)
@@ -909,4 +911,212 @@ func TestHandlerRotationWithoutArmPolicyIgnoresSpecModel(t *testing.T) {
 		t.Fatalf("rotation without an arm policy: %v", err)
 	}
 	f.assertRotated(t, r, 0)
+}
+
+// Owner-authorized change of the primary's runtime, model or arm
+// (wi_f250a91c85367e6f, order #20511): the old primary is a Codex run in arm O
+// under an enabled arm policy, and the saved spec launches Claude in arm S.
+func crossRuntimeCLI(t *testing.T) *rotationCLI {
+	t.Helper()
+	f := newRotationCLI(t, "")
+	digest := handlerTemplateDigest("handler assignment")
+	db := f.db(t)
+	if _, err := db.Exec(`UPDATE agents SET runtime='codex' WHERE id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.old.Runtime = "codex"
+	if _, err := db.Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
+		f.task.ID, f.old.ID, f.old.RunID, digest, "gpt-6.1-sol", "high", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.SetHandlerArmPolicy(context.Background(), f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Enabled: true, Fallback: true, Seed: "K", TemplateDigest: digest, Arms: []api.HandlerArm{
+		{ID: "S", Runtime: "claude", Model: "claude-sonnet-5-5", Reasoning: "high", Weight: 1}, {ID: "O", Runtime: "codex", Model: "gpt-6.1-sol", Reasoning: "high", Weight: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if f.spec, err = newHandlerSpec(f.c.Base, f.task.ID, []string{"--run", "sleep 300", "--runtime", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--cwd", f.dir, "--prompt", "handler assignment"}); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+var crossRuntimeAuthorization = rotationAuthorization{by: "owner", reason: "Owner decision: move the primary handler from Codex to Sonnet"}
+
+func (f *rotationCLI) assertAuthorized(t *testing.T, r api.HandlerRotation) {
+	t.Helper()
+	want := api.HandlerRotationAuthorization{AuthorizedBy: crossRuntimeAuthorization.by, Reason: crossRuntimeAuthorization.reason, OldRuntime: "codex", SuccessorRuntime: "claude"}
+	if r.Authorization == nil || *r.Authorization != want {
+		t.Fatalf("authorization on the rotation: %+v", r.Authorization)
+	}
+}
+
+func TestHandlerRotationAuthorizedRuntimeChangeEndToEnd(t *testing.T) {
+	f := crossRuntimeCLI(t)
+	ctx := context.Background()
+	f.request(t, "role:"+api.RoleDatabaseHandler, "Record the first cross-runtime fixture item")
+	f.request(t, f.old.Name, "Record the second cross-runtime fixture item")
+	before, err := f.c.HandlerArmPolicy(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.auth = crossRuntimeAuthorization
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One successor, the unchanged handoff, the old session's cleanup receipt
+	// and no journal left.
+	successor := f.assertRotated(t, r, 2)
+	if n := f.executions(t, 2); f.spawns != 1 || n != 2 {
+		t.Fatalf("spawns=%d executions=%d", f.spawns, n)
+	}
+	if successor.Runtime != "claude" || f.old.Runtime != "codex" {
+		t.Fatalf("runtimes: old %q successor %q", f.old.Runtime, successor.Runtime)
+	}
+	args := strings.Join(f.spawnArgs[0], " ")
+	for _, want := range []string{"--runtime claude", "--model claude-sonnet-5-5", "--reasoning high", "--cwd " + f.dir, "--agent-id " + successor.ID, "--name db-handler-r2", "--handler-successor"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("successor launch args %q miss %q", args, want)
+		}
+	}
+	f.assertAuthorized(t, r)
+	got, err := f.c.GetHandlerRotation(ctx, f.task.ID, r.ID)
+	if err != nil || got.State != api.HandlerRotationCommitted || got.Handoff == nil || len(got.Handoff.Reissued) != 2 {
+		t.Fatalf("rotation get: %+v %v", got, err)
+	}
+	f.assertAuthorized(t, got)
+	// The arm policy is untouched; the new primary's run is in arm S.
+	after, err := f.c.HandlerArmPolicy(ctx, f.task.ID)
+	if err != nil || after.Policy.Revision != before.Policy.Revision || !after.Policy.Enabled || len(after.Policy.Arms) != 2 ||
+		after.Policy.UpdatedAt == nil || before.Policy.UpdatedAt == nil || !after.Policy.UpdatedAt.Equal(*before.Policy.UpdatedAt) {
+		t.Fatalf("arm policy changed: before %+v after %+v %v", before.Policy, after.Policy, err)
+	}
+	arm := ""
+	for _, h := range after.Handlers {
+		if h.AgentID == successor.ID {
+			arm = h.Arm
+		}
+	}
+	if arm != "S" {
+		t.Fatalf("successor arm %q, want S: %+v", arm, after.Handlers)
+	}
+	// The record is readable in the CLI text.
+	line := "Authorized by owner: Owner decision: move the primary handler from Codex to Sonnet (runtime codex -> claude)"
+	if out, err := captureStdout(t, func() error { return cmdHandlerRotation(f.e, []string{"get", r.ID, "--task", f.task.ID}) }); err != nil || !strings.Contains(out, line+"\n") {
+		t.Fatalf("tt handler rotation get: %v\n%s", err, out)
+	}
+	if out, err := captureStdout(t, func() error { return cmdHandlerRotation(f.e, []string{"list", "--task", f.task.ID}) }); err != nil || !strings.Contains(out, `authorized-by="owner"`) {
+		t.Fatalf("tt handler rotation list: %v\n%s", err, out)
+	}
+	var data string
+	if err := f.db(t).QueryRow(`SELECT data FROM events WHERE task_id=? AND text='Handler rotation committed'`, f.task.ID).Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"authorizedBy":"owner"`, `"oldRuntime":"codex"`, `"successorRuntime":"claude"`} {
+		if !strings.Contains(data, want) {
+			t.Fatalf("committed event misses %s: %s", want, data)
+		}
+	}
+}
+
+func TestHandlerRotationRuntimeChangeWithoutAuthorizationRefusedBeforeSpawn(t *testing.T) {
+	f := crossRuntimeCLI(t)
+	f.request(t, f.old.Name, "Record the refused fixture item")
+	untouched := func(what string) {
+		t.Helper()
+		if f.spawns != 0 || f.actions.Load() != 0 {
+			t.Fatalf("%s spawned %d and sent %d rotation writes", what, f.spawns, f.actions.Load())
+		}
+		if _, err := os.Stat(handlerRotationJournalPath(f.c.Base, f.task.ID)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s left a journal: %v", what, err)
+		}
+		if open, total := f.handlers(t); open != 1 || total != 1 {
+			t.Fatalf("%s: handlers open=%d total=%d", what, open, total)
+		}
+	}
+	_, err := f.rotate(t)
+	if err == nil || !strings.Contains(err.Error(), "differs from handler") || !strings.Contains(err.Error(), "--authorized-by") {
+		t.Fatalf("unauthorized runtime change: %v", err)
+	}
+	untouched("an unauthorized runtime change")
+	// An authorization never covers another directory.
+	elsewhere, err := newHandlerSpec(f.c.Base, f.task.ID, []string{"--run", "sleep 300", "--runtime", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--cwd", t.TempDir(), "--prompt", "handler assignment"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.spec, f.auth = elsewhere, crossRuntimeAuthorization
+	if _, err = f.rotate(t); err == nil || !strings.Contains(err.Error(), "differs from handler") || strings.Contains(err.Error(), "--authorized-by") {
+		t.Fatalf("authorized change of directory: %v", err)
+	}
+	untouched("an authorized change of directory")
+}
+
+func TestHandlerRotationAuthorizationSurvivesResume(t *testing.T) {
+	f := crossRuntimeCLI(t)
+	f.request(t, f.old.Name, "Record the resumed fixture item")
+	stop, stopped := errors.New("simulated crash"), false
+	f.deps.after = func(phase string) error {
+		if phase == rotationPhasePrepared && !stopped {
+			stopped = true
+			return stop
+		}
+		return nil
+	}
+	f.auth = crossRuntimeAuthorization
+	if _, err := f.rotate(t); !errors.Is(err, stop) {
+		t.Fatalf("expected the simulated crash, got %v", err)
+	}
+	j, err := loadRotationJournal(f.c.Base, f.task.ID)
+	if err != nil || j == nil || j.Phase != rotationPhasePrepared || j.AuthorizedBy != crossRuntimeAuthorization.by || j.AuthorizationReason != crossRuntimeAuthorization.reason {
+		t.Fatalf("journal: %+v %v", j, err)
+	}
+	// The rerun passes no authorization, as the runner's resume does.
+	f.auth = rotationAuthorization{}
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.assertRotated(t, r, 1)
+	f.assertAuthorized(t, r)
+	if n := f.executions(t, 2); f.spawns != 1 || n != 2 {
+		t.Fatalf("spawns=%d executions=%d, want one successor", f.spawns, n)
+	}
+	rotations, err := f.c.ListHandlerRotations(context.Background(), f.task.ID)
+	if err != nil || len(rotations) != 1 {
+		t.Fatalf("rotations: %+v %v", rotations, err)
+	}
+}
+
+func TestHandlerRotateAuthorizationFlags(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	owner := env{hub: srv.URL}
+	task := api.NewID("tsk")
+	spawnFlags := []string{"--", "--run", "claude", "--cwd", t.TempDir(), "--prompt", "handler assignment"}
+	for name, own := range map[string][]string{
+		"name only":    {"--authorized-by", "owner"},
+		"reason only":  {"--authorization-reason", "move to Sonnet"},
+		"blank name":   {"--authorized-by", "  ", "--authorization-reason", "move to Sonnet"},
+		"blank reason": {"--authorized-by", "owner", "--authorization-reason", " "},
+		"with abort":   {"--abort", "--authorized-by", "owner", "--authorization-reason", "move to Sonnet"},
+	} {
+		args := append(append([]string{"--task", task}, own...), spawnFlags...)
+		if err := cmdHandlerRotate(owner, args); err == nil || !strings.Contains(err.Error(), "usage: tt handler rotate") || !strings.Contains(err.Error(), "--authorized-by NAME --authorization-reason TEXT") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if err := cmdHandlerRotate(owner, []string{"--task", task, "--authorized-by", "owner", "--authorization-reason", strings.Repeat("r", 1001)}); err == nil || !strings.Contains(err.Error(), "at most 1000") {
+		t.Fatalf("long reason: %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("a usage error sent %d request(s)", n)
+	}
+	if _, err := os.Stat(handlerSpecPath(srv.URL, task)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a usage error saved the launch spec: %v", err)
+	}
 }

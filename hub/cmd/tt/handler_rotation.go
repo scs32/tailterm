@@ -143,7 +143,20 @@ type handlerRotationJournal struct {
 	SuccessorName    string `json:"successorName"`
 	Reason           string `json:"reason"`
 	Trigger          string `json:"trigger"`
+	// An owner-authorized change of runtime, model or arm; a resume replays it.
+	AuthorizedBy        string `json:"authorizedBy,omitempty"`
+	AuthorizationReason string `json:"authorizationReason,omitempty"`
 }
+
+// rotationAuthorization is the owner's authorization for a rotation that may
+// change the primary's runtime, model or arm: who authorized it and why.
+type rotationAuthorization struct {
+	by, reason string
+}
+
+func (a rotationAuthorization) set() bool { return a.by != "" }
+
+const rotationAuthorizationHint = "an owner-authorized change of runtime, model or arm needs tt handler rotate --authorized-by NAME --authorization-reason TEXT"
 
 const (
 	rotationPhasePreparing = "preparing"
@@ -225,8 +238,10 @@ func newRotationKey(prefix string) string {
 
 // rotateHandler starts a rotation, or resumes the one this host's journal
 // records. The phases are preparing, prepared, spawned and committed; the
-// journal is removed once the old session's cleanup receipt is written.
-func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec) (api.HandlerRotation, error) {
+// journal is removed once the old session's cleanup receipt is written. An
+// authorization lets a new rotation change the runtime, model or arm; a
+// resumed rotation uses the one in its journal.
+func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	hub := strings.TrimRight(c.Base, "/")
 	path := handlerRotationJournalPath(hub, task)
@@ -270,18 +285,26 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 		if old.Host != d.host() {
 			return zero, fmt.Errorf("handler %s runs on %s; rotate it from that host", old.Name, old.Host)
 		}
-		if spec.runtime() != old.Runtime || spec.value("cwd") != old.Cwd {
-			return zero, fmt.Errorf("the saved launch spec (runtime %q, cwd %q) differs from handler %s (runtime %q, cwd %q); save matching settings with tt handler spec", spec.runtime(), spec.value("cwd"), old.Name, old.Runtime, old.Cwd)
+		// The directory always matches; the runtime, model and arm may change
+		// only with the owner's authorization.
+		if spec.value("cwd") != old.Cwd || (spec.runtime() != old.Runtime && !auth.set()) {
+			hint := ""
+			if spec.value("cwd") == old.Cwd {
+				hint = "; " + rotationAuthorizationHint
+			}
+			return zero, fmt.Errorf("the saved launch spec (runtime %q, cwd %q) differs from handler %s (runtime %q, cwd %q); save matching settings with tt handler spec%s", spec.runtime(), spec.value("cwd"), old.Name, old.Runtime, old.Cwd, hint)
 		}
-		if err := checkRotationArm(ctx, c, task, old, spec); err != nil {
-			return zero, err
+		if !auth.set() {
+			if err := checkRotationArm(ctx, c, task, old, spec); err != nil {
+				return zero, err
+			}
 		}
 		if reason == "" {
 			reason = api.HandlerRotationReasonManual
 		}
 		j = &handlerRotationJournal{Version: 1, Hub: hub, Task: task, PrepareRequestID: newRotationKey("rotation-prepare"), HandlerRevision: detail.Task.HandlerRevision,
 			OldAgentID: old.ID, OldRunID: old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(old.Name, detail.Task.HandlerRevision),
-			Reason: reason, Trigger: trigger}
+			Reason: reason, Trigger: trigger, AuthorizedBy: auth.by, AuthorizationReason: auth.reason}
 		if err = save(rotationPhasePreparing); err != nil {
 			return zero, err
 		}
@@ -289,7 +312,7 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 	if j.Phase == rotationPhasePreparing {
 		r, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: j.PrepareRequestID,
 			ExpectedHandlerRevision: j.HandlerRevision, OldAgentID: j.OldAgentID, OldRunID: j.OldRunID, SuccessorAgentID: j.SuccessorAgentID,
-			SuccessorName: j.SuccessorName, Reason: j.Reason, Trigger: j.Trigger})
+			SuccessorName: j.SuccessorName, Reason: j.Reason, Trigger: j.Trigger, AuthorizedBy: j.AuthorizedBy, AuthorizationReason: j.AuthorizationReason})
 		if _, refused := rotationRefusal(err); refused {
 			// A refused prepare changed nothing; the next attempt starts fresh.
 			if removeErr := os.Remove(path); removeErr != nil {
@@ -491,12 +514,25 @@ func cmdHandlerRotate(e env, args []string) error {
 	fs := flag.NewFlagSet("handler rotate", flag.ContinueOnError)
 	task := fs.String("task", "", "project ID (required)")
 	abort := fs.Bool("abort", false, "abort the project's prepared rotation")
+	authorizedBy := fs.String("authorized-by", "", "who authorized a change of the primary's runtime, model or arm (with --authorization-reason)")
+	authorizationReason := fs.String("authorization-reason", "", "why the change is authorized (with --authorized-by)")
 	jsonOut := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(own); err != nil {
 		return err
 	}
+	usage := errors.New("usage: tt handler rotate --task ID [--abort] [--authorized-by NAME --authorization-reason TEXT] [-- tt spawn launch flags]")
 	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
-		return errors.New("usage: tt handler rotate --task ID [--abort] [-- tt spawn launch flags]")
+		return usage
+	}
+	auth := rotationAuthorization{by: strings.TrimSpace(*authorizedBy), reason: strings.TrimSpace(*authorizationReason)}
+	if (auth.by == "") != (auth.reason == "") {
+		return fmt.Errorf("--authorized-by and --authorization-reason go together; %w", usage)
+	}
+	if auth.set() && *abort {
+		return fmt.Errorf("--abort takes no authorization; %w", usage)
+	}
+	if !api.ValidText(auth.by, 200) || !api.ValidText(auth.reason, 1000) {
+		return errors.New("--authorized-by takes at most 200 bytes and --authorization-reason at most 1000, without control characters")
 	}
 	if err := requireOwnerSession(e, "tt handler rotate"); err != nil {
 		return err
@@ -528,7 +564,7 @@ func cmdHandlerRotate(e env, args []string) error {
 		if spec == nil {
 			return errors.New("no handler launch spec is saved on this host; pass the handler's tt spawn launch flags after --, for example tt handler rotate --task ID -- --run codex --cwd DIR --prompt TEXT")
 		}
-		r, err = rotateHandler(ctx, deps, e, c, *task, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner, *spec)
+		r, err = rotateHandler(ctx, deps, e, c, *task, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner, *spec, auth)
 	}
 	if err != nil {
 		return err
@@ -546,7 +582,24 @@ func cmdHandlerRotate(e env, args []string) error {
 		moved = r.Receipt.Reissued
 	}
 	fmt.Printf("Rotated handler %s to %s (%s); %d open obligation(s) moved; old session cleanup confirmed.\n", r.OldName, r.SuccessorName, r.ID, moved)
+	if line := rotationAuthorizationLine(r); line != "" {
+		fmt.Println(line)
+	}
 	return nil
+}
+
+// rotationAuthorizationLine is the record of an owner-authorized change, or
+// "" for an ordinary rotation.
+func rotationAuthorizationLine(r api.HandlerRotation) string {
+	a := r.Authorization
+	if a == nil {
+		return ""
+	}
+	line := fmt.Sprintf("Authorized by %s: %s", a.AuthorizedBy, a.Reason)
+	if a.OldRuntime != "" || a.SuccessorRuntime != "" {
+		line += fmt.Sprintf(" (runtime %s -> %s)", a.OldRuntime, a.SuccessorRuntime)
+	}
+	return line
 }
 
 func cmdHandlerRotation(e env, args []string) error {
@@ -584,7 +637,11 @@ func cmdHandlerRotation(e env, args []string) error {
 			return nil
 		}
 		for _, r := range rotations {
-			fmt.Printf("%s  %-9s  %s -> %s  reason=%s trigger=%s\n", r.ID, r.State, r.OldName, r.SuccessorName, r.Reason, r.Trigger)
+			authorized := ""
+			if r.Authorization != nil {
+				authorized = fmt.Sprintf(" authorized-by=%q", r.Authorization.AuthorizedBy)
+			}
+			fmt.Printf("%s  %-9s  %s -> %s  reason=%s trigger=%s%s\n", r.ID, r.State, r.OldName, r.SuccessorName, r.Reason, r.Trigger, authorized)
 		}
 		return nil
 	}
@@ -597,6 +654,9 @@ func cmdHandlerRotation(e env, args []string) error {
 		return nil
 	}
 	fmt.Printf("Rotation %s: %s, %s (%s) -> %s (%s), reason %s, trigger %s\n", r.ID, r.State, r.OldName, r.OldAgentID, r.SuccessorName, r.SuccessorAgentID, r.Reason, r.Trigger)
+	if line := rotationAuthorizationLine(r); line != "" {
+		fmt.Println(line)
+	}
 	if h := r.Handoff; h != nil {
 		fmt.Printf("Moved obligations: %d\n", len(h.Reissued))
 		for _, p := range h.Reissued {
@@ -811,7 +871,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				errs = append(errs, fmt.Errorf("handler rotation %s: the launch spec was removed during a rotation", d.TaskID))
 				continue
 			}
-			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec); err != nil && !rotationBusy(err) {
+			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			continue
@@ -832,7 +892,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 		if !d.Idle {
 			continue
 		}
-		if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec); err != nil && !rotationBusy(err) {
+		if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) {
 			errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 		}
 	}

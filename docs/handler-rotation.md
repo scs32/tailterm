@@ -89,6 +89,10 @@ tt handler spec --task TASK            # show the saved spec
 tt handler rotate --task TASK [-- <launch flags>]
 tt handler rotate --task TASK --abort  # abort a prepared rotation
 
+# Move the primary to another runtime, model or arm (see below).
+tt handler rotate --task TASK --authorized-by NAME --authorization-reason "..." \
+  -- --run claude --runtime claude --model M --reasoning R --cwd /path --prompt "..."
+
 tt handler rotation list --task TASK
 tt handler rotation get ROTATION --task TASK   # handoff snapshot and receipt
 
@@ -100,11 +104,58 @@ tt handler policy set --task TASK --revision N [--enabled=BOOL] [--max-items N] 
 A launch spec accepts only `--run`, `--cwd`, `--prompt`, `--runtime`, `--model`,
 `--reasoning`, `--permission-mode`, `--approval-mode`, `--sandbox-mode` and
 `--allowed-tools-json`. It is stored at mode 0600 under the relay state directory
-and keyed by hub and project. Its runtime and directory must match the old
-handler's.
+and keyed by hub and project. Its directory must match the old handler's. Its
+runtime must match too, unless the rotation is an
+[owner-authorized change](#changing-the-primarys-runtime-or-model).
 
 Run `tt handler rotate` on the old handler's host. That host must stop the old
-session, and the successor must run on the same host, runtime and directory.
+session, and the successor must run on the same host and directory, and on the
+same runtime unless the change is authorized.
+
+## Changing the primary's runtime or model
+
+An ordinary rotation keeps the primary on its runtime and, under a
+[handler arm policy](handler-ab.md), inside its arm. Use an authorized change
+when the owner decides to move the primary to another runtime, model or arm, for
+example from Codex to Claude (`wi_f250a91c85367e6f`, order #20511):
+
+```sh
+tt handler rotate --task TASK \
+  --authorized-by "owner" --authorization-reason "Owner decision #N: Sonnet-only handlers" \
+  -- --run claude --runtime claude --model claude-sonnet-5-5 --reasoning high \
+     --cwd /path --prompt "..."
+```
+
+- `--authorized-by` says who authorized the change (at most 200 bytes) and
+  `--authorization-reason` says why (at most 1000 bytes). Give both or neither;
+  one alone, or either with `--abort`, is a usage error before any hub request.
+  The hub refuses an authorization from the runner or with a blank field (400).
+- It is the same rotation: prepare, launch, wait, commit and cleanup, with the
+  same idle checks, journal resume, obligation re-issue, handoff snapshot,
+  directed NOTICE and close of the old handler. Only two checks are lifted: the
+  runtime match and `arm_changed`.
+- The host and directory must still match the old handler's. An authorization
+  never covers another directory or host.
+- The arm policy is not changed. If the new run matches an arm, it is in that arm
+  from then on and later ordinary rotations keep it there.
+- The flags after `--` are saved as the host's launch spec before the checks
+  run, so later runner rotations launch the new runtime. A refused attempt
+  leaves that spec saved too: a runner rotation that comes due is then refused
+  for the runtime mismatch and spawns nothing, until you retry with the
+  authorization or save the old spec again with `tt handler spec`.
+- Without the two flags nothing changes: a spec with another runtime is refused
+  before any spawn, and the hub refuses the commit (`successor_unavailable`,
+  `arm_changed`).
+
+The authorization is saved on the rotation at prepare, so a rerun or a runner
+resume needs no flags; the journal carries them. `tt handler rotation get` prints
+`Authorized by NAME: REASON (runtime OLD -> NEW)`, `tt handler rotation list`
+appends `authorized-by="NAME"`, and the JSON record has `authorization`
+(`authorizedBy`, `reason`, `oldRuntime`, `successorRuntime`; the runtimes are
+saved at commit). The `Handler rotation prepared` and `Handler rotation
+committed` events carry `authorizedBy` and `authorizationReason`, the committed
+event also carries `oldRuntime` and `successorRuntime`, and the handoff NOTICE
+names who authorized the change and why.
 
 ## How a rotation runs
 
@@ -124,7 +175,8 @@ routine keeps a journal of its phases next to the spec: `preparing`, `prepared`,
    online. If it does not, the rotation stays prepared.
 4. **Commit.** In one hub transaction, the hub:
    - re-checks that the old handler is idle
-   - verifies the successor is online on the same host, runtime and directory
+   - verifies the successor is online on the same host and directory, and on
+     the same runtime and arm unless the rotation carries an authorization
    - re-issues every open obligation the old handler holds (by role or by name)
      to the successor, keeping `via_role` and item links; each old one closes as
      `superseded`
@@ -157,9 +209,9 @@ The rotation row, successor and obligations stay as they were.
 | `not_primary` | The named run is not the current primary handler. |
 | `handler_changed` | The handler revision or the old run changed since the caller read it. |
 | `name_taken` | The successor name is wrong or already used by an open agent. |
-| `successor_unavailable` | At commit, the successor is not a registered, online handler on the old handler's host, runtime and directory. |
+| `successor_unavailable` | At commit, the successor is not a registered, online handler on the old handler's host, runtime and directory. An [authorized change](#changing-the-primarys-runtime-or-model) may differ in runtime only. |
 | `agent_caller` | The request carries an agent identity. |
-| `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy nothing changes. |
+| `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy, or for a run in no arm, a model change is accepted. An [authorized change](#changing-the-primarys-runtime-or-model) skips this check and does not write the policy. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
 409, and the rotation stays prepared until a later attempt finds it idle.
@@ -259,7 +311,9 @@ writing anything. Reusing it with different input is refused.
 
 The new columns (`tasks.primary_handler_id`, `tasks.handler_revision`) and
 tables (`handler_rotation_policy`, `handler_rotations`,
-`handler_rotation_requests`, `handler_runs`) stay in place. An older hub binary
+`handler_rotation_requests`, `handler_runs`) stay in place, as do the
+`handler_rotations` columns `authorized_by`, `authorization_reason`,
+`old_runtime` and `successor_runtime`, which default to empty. An older hub binary
 ignores them and returns to the legacy primary rules. A handler closed by a
 rotation stays closed. An older CLI does not forward the old name, so address the
 successor by its new name. Host specs and journals under the relay state

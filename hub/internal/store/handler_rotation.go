@@ -38,6 +38,18 @@ CREATE TABLE IF NOT EXISTS handler_runs (
  task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT PRIMARY KEY, template_digest TEXT NOT NULL, created_at TEXT NOT NULL);`); err != nil {
 		return err
 	}
+	// An owner-authorized change of runtime, model or arm (wi_f250a91c85367e6f).
+	for _, column := range []string{"authorized_by", "authorization_reason", "old_runtime", "successor_runtime"} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('handler_rotations') WHERE name=?`, column).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE handler_rotations ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
 	if existed == 0 {
 		// Owner decision #14233: rotation is on by default for new projects; the
 		// owner turns it on for projects that existed before this migration.
@@ -199,14 +211,19 @@ func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest, model
 	return err
 }
 
-const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at`
+const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at,authorized_by,authorization_reason,old_runtime,successor_runtime`
 
 func scanHandlerRotation(row interface{ Scan(...any) error }) (api.HandlerRotation, error) {
 	var r api.HandlerRotation
 	var handoff, receipt, created, updated string
+	var auth api.HandlerRotationAuthorization
 	if err := row.Scan(&r.ID, &r.TaskID, &r.RequestID, &r.State, &r.Reason, &r.Trigger, &r.HandlerRevision, &r.OldAgentID, &r.OldRunID, &r.OldName,
-		&r.SuccessorAgentID, &r.SuccessorName, &r.SuccessorRunID, &handoff, &receipt, &created, &updated); err != nil {
+		&r.SuccessorAgentID, &r.SuccessorName, &r.SuccessorRunID, &handoff, &receipt, &created, &updated,
+		&auth.AuthorizedBy, &auth.Reason, &auth.OldRuntime, &auth.SuccessorRuntime); err != nil {
 		return r, err
+	}
+	if auth.AuthorizedBy != "" {
+		r.Authorization = &auth
 	}
 	r.CreatedAt, r.UpdatedAt = parseTS(created), parseTS(updated)
 	if handoff != "" {
@@ -417,6 +434,13 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		!api.ValidID(req.OldAgentID, "agt") || !validRunID(req.OldRunID) || !api.ValidID(req.SuccessorAgentID, "agt") || !api.ValidName(req.SuccessorName) || req.ExpectedHandlerRevision < 1 {
 		return zero, api.ErrInvalid
 	}
+	// An authorization names who allowed a change of runtime, model or arm and
+	// why: both fields or neither, and never from the runner.
+	authorized := req.AuthorizedBy != "" || req.AuthorizationReason != ""
+	if authorized && (req.Trigger != api.HandlerRotationTriggerOwner || strings.TrimSpace(req.AuthorizedBy) == "" || strings.TrimSpace(req.AuthorizationReason) == "" ||
+		!api.ValidText(req.AuthorizedBy, 200) || !api.ValidText(req.AuthorizationReason, 1000)) {
+		return zero, api.ErrInvalid
+	}
 	if t.PauseState != api.ProjectPauseActive {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedPaused, Detail: "the project is paused"}
 	}
@@ -456,13 +480,18 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 	r := api.HandlerRotation{ID: api.NewID("hrot"), TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationPrepared, Reason: req.Reason, Trigger: req.Trigger,
 		HandlerRevision: t.HandlerRevision, OldAgentID: old.ID, OldRunID: old.RunID, OldName: old.Name, SuccessorAgentID: req.SuccessorAgentID,
 		SuccessorName: req.SuccessorName, CreatedAt: now, UpdatedAt: now}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
-		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now)); err != nil {
+	payload := map[string]any{"handlerRotationId": r.ID, "state": r.State, "reason": r.Reason,
+		"trigger": r.Trigger, "oldAgentId": r.OldAgentID, "oldRunId": r.OldRunID, "successorAgentId": r.SuccessorAgentID, "successorName": r.SuccessorName}
+	if authorized {
+		r.Authorization = &api.HandlerRotationAuthorization{AuthorizedBy: req.AuthorizedBy, Reason: req.AuthorizationReason}
+		payload["authorizedBy"], payload["authorizationReason"] = req.AuthorizedBy, req.AuthorizationReason
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at,authorized_by,authorization_reason)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
+		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now), req.AuthorizedBy, req.AuthorizationReason); err != nil {
 		return zero, err
 	}
-	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", old.ID, "Handler rotation prepared", map[string]any{"handlerRotationId": r.ID, "state": r.State, "reason": r.Reason,
-		"trigger": r.Trigger, "oldAgentId": r.OldAgentID, "oldRunId": r.OldRunID, "successorAgentId": r.SuccessorAgentID, "successorName": r.SuccessorName}, by); err != nil {
+	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", old.ID, "Handler rotation prepared", payload, by); err != nil {
 		return zero, err
 	}
 	return r, nil
@@ -504,14 +533,19 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}
+	// Only the authorization saved at prepare lets the runtime, model or arm
+	// change; host and directory always match.
+	authorized := r.Authorization != nil
 	if err != nil || successor.Role != api.AgentRoleDatabaseHandler || successor.Name != r.SuccessorName || !successor.Online ||
-		successor.Status == api.AgentRetired || successor.Host != old.Host || successor.Runtime != old.Runtime || successor.Cwd != old.Cwd {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessor, Detail: "the successor must be a registered, online database handler on the old handler's host, runtime and directory"}
+		successor.Status == api.AgentRetired || successor.Host != old.Host || successor.Cwd != old.Cwd || (successor.Runtime != old.Runtime && !authorized) {
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessor, Detail: "the successor must be a registered, online database handler on the old handler's host, runtime and directory; only an owner-authorized change (tt handler rotate --authorized-by NAME --authorization-reason TEXT) may change the runtime"}
 	}
-	if refusal, err := handlerRotationArmRefusal(ctx, tx, old, successor); err != nil {
-		return zero, err
-	} else if refusal != nil {
-		return zero, refusal
+	if !authorized {
+		if refusal, err := handlerRotationArmRefusal(ctx, tx, old, successor); err != nil {
+			return zero, err
+		} else if refusal != nil {
+			return zero, refusal
+		}
 	}
 	handoff, err := s.snapshotHandlerHandoff(ctx, tx, t, old, busy)
 	if err != nil {
@@ -559,6 +593,9 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	}
 	text := fmt.Sprintf("You are now this project's primary Database handler, replacing %s (%s / %s) by handler rotation %s. %d open obligation(s) moved to you. Run tt handler rotation get %s for the durable handoff: moved obligations, pending scope confirmations, requests and allocation intents the old handler authored, claimed Queue entries and legacy required deliveries. Continue from that record; do not repeat work it shows as done.",
 		old.Name, old.ID, old.RunID, r.ID, len(handoff.Reissued), r.ID)
+	if authorized {
+		text += fmt.Sprintf(" This change from runtime %s to %s was authorized by %s: %s", old.Runtime, successor.Runtime, r.Authorization.AuthorizedBy, r.Authorization.Reason)
+	}
 	if err = s.postBrokerNotice(ctx, tx, t, successor, successor.Name, "Handler rotation handoff to "+successor.Name, "Handler rotation handoff", text, map[string]string{"handlerRotation": r.ID}); err != nil {
 		return zero, err
 	}
@@ -578,13 +615,18 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 		ClosedAgentID: old.ID, ClosedRunID: old.RunID, NoticeSeq: noticeSeq, Reissued: len(handoff.Reissued), CommittedAt: now}
 	handoffJSON, _ := json.Marshal(handoff)
 	receiptJSON, _ := json.Marshal(r.Receipt)
-	if _, err = tx.ExecContext(ctx, `UPDATE handler_rotations SET state=?,successor_run_id=?,handoff_json=?,receipt_json=?,updated_at=? WHERE id=? AND state='prepared'`,
-		r.State, r.SuccessorRunID, string(handoffJSON), string(receiptJSON), ts(now), r.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE handler_rotations SET state=?,successor_run_id=?,handoff_json=?,receipt_json=?,updated_at=?,old_runtime=?,successor_runtime=? WHERE id=? AND state='prepared'`,
+		r.State, r.SuccessorRunID, string(handoffJSON), string(receiptJSON), ts(now), old.Runtime, successor.Runtime, r.ID); err != nil {
 		return zero, err
 	}
-	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", successor.ID, "Handler rotation committed", map[string]any{"handlerRotationId": r.ID, "state": r.State,
+	payload := map[string]any{"handlerRotationId": r.ID, "state": r.State,
 		"oldAgentId": old.ID, "oldRunId": old.RunID, "successorAgentId": successor.ID, "successorRunId": successor.RunID, "handlerRevision": t.HandlerRevision,
-		"reissued": len(handoff.Reissued), "noticeSeq": noticeSeq}, by); err != nil {
+		"reissued": len(handoff.Reissued), "noticeSeq": noticeSeq, "oldRuntime": old.Runtime, "successorRuntime": successor.Runtime}
+	if authorized {
+		r.Authorization.OldRuntime, r.Authorization.SuccessorRuntime = old.Runtime, successor.Runtime
+		payload["authorizedBy"], payload["authorizationReason"] = r.Authorization.AuthorizedBy, r.Authorization.Reason
+	}
+	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", successor.ID, "Handler rotation committed", payload, by); err != nil {
 		return zero, err
 	}
 	return r, nil

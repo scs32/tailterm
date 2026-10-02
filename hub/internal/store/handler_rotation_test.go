@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -658,5 +660,362 @@ func TestHandlerRotationTemplateDigestRecordedPerRun(t *testing.T) {
 	}
 	if _, err = f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "worker-digest", Host: "mini", Session: "w", TemplateDigest: digest}, f.by); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("a non-handler template digest: %v", err)
+	}
+}
+
+// Owner-authorized change of the primary's runtime, model or arm
+// (wi_f250a91c85367e6f, order #20511).
+
+// asRun gives the old primary an arm's runtime and recorded model.
+func (f *rotationFixture) asRun(t *testing.T, arm api.HandlerArm) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE agents SET runtime=? WHERE id=?`, arm.Runtime, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.old.Runtime = arm.Runtime
+	if _, err := f.s.db.Exec(`INSERT OR REPLACE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`,
+		f.task.ID, f.old.ID, f.old.RunID, digestP, arm.Model, arm.Reasoning, ts(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// armPolicy saves an enabled S (Claude) and O (Codex) arm policy.
+func (f *rotationFixture) armPolicy(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.SetHandlerArmPolicy(context.Background(), f.task.ID, api.HandlerArmPolicyRequest{RequestID: "arms", Enabled: true, Fallback: true, Seed: "K",
+		TemplateDigest: digestP, Arms: []api.HandlerArm{armS, armO}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *rotationFixture) armPolicyRow(t *testing.T) string {
+	t.Helper()
+	var row string
+	if err := f.s.db.QueryRow(`SELECT enabled||'|'||seed||'|'||fallback||'|'||limit_hold_minutes||'|'||template_digest||'|'||arms_json||'|'||revision||'|'||updated_at FROM handler_arm_policy WHERE task_id=?`, f.task.ID).Scan(&row); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func (f *rotationFixture) prepareAs(key, trigger, authorizedBy, reason string) (api.HandlerRotation, error) {
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: key,
+		ExpectedHandlerRevision: 1, OldAgentID: f.old.ID, OldRunID: f.old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.old.Name, 1),
+		Reason: api.HandlerRotationReasonManual, Trigger: trigger, AuthorizedBy: authorizedBy, AuthorizationReason: reason}, f.by)
+}
+
+// successor registers the prepared successor online on the old handler's
+// host and directory, as tt spawn records its runtime, model and reasoning.
+func (f *rotationFixture) successor(t *testing.T, r api.HandlerRotation, arm api.HandlerArm) api.Agent {
+	t.Helper()
+	ctx := context.Background()
+	a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Role: api.AgentRoleDatabaseHandler, Name: r.SuccessorName, Host: "mini",
+		Session: "successor-" + r.ID, Runtime: arm.Runtime, Cwd: f.old.Cwd, TemplateDigest: digestP, HandlerModel: arm.Model, HandlerReasoning: arm.Reasoning}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = f.s.GetAgent(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// assertNothingMoved checks a refused commit: the old handler stays the open
+// primary at revision 1 and every obligation is as it was.
+func (f *rotationFixture) assertNothingMoved(t *testing.T, before []rotationObligation) {
+	t.Helper()
+	ctx := context.Background()
+	task, err := f.s.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := f.s.GetAgent(ctx, f.old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.PrimaryHandlerID != "" || task.HandlerRevision != 1 || old.Status == api.AgentClosed || old.SuccessorID != "" || !reflect.DeepEqual(before, openObligations(t, f.s, f.task.ID)) {
+		t.Fatalf("a refused commit moved something: primary %q revision %d old %+v", task.PrimaryHandlerID, task.HandlerRevision, old)
+	}
+}
+
+func TestHandlerRotationAuthorizedRuntimeChange(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	s := f.s
+	f.asRun(t, armO)
+	f.armPolicy(t)
+	policy := f.armPolicyRow(t)
+	authored := f.send(t, f.old, api.EnvelopeKindRequest, f.worker.ID, "Please confirm the cross-runtime handoff", false)
+	held := []api.Message{
+		f.send(t, f.worker, api.EnvelopeKindRequest, "role:"+api.RoleDatabaseHandler, "Record the role-addressed fixture item", true),
+		f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Record the name-addressed fixture item", false),
+	}
+	before := openObligations(t, s, f.task.ID)
+	const who, why = "owner", "Owner decision: move the primary handler from Codex to Sonnet"
+	r, err := f.prepareAs("prepare", api.HandlerRotationTriggerOwner, who, why)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := r.Authorization; a == nil || a.AuthorizedBy != who || a.Reason != why || a.OldRuntime != "" || a.SuccessorRuntime != "" {
+		t.Fatalf("prepared authorization: %+v", r.Authorization)
+	}
+	var prepared map[string]any
+	var data string
+	if err = s.db.QueryRow(`SELECT data FROM events WHERE task_id=? AND text='Handler rotation prepared'`, f.task.ID).Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal([]byte(data), &prepared); err != nil || prepared["authorizedBy"] != who || prepared["authorizationReason"] != why {
+		t.Fatalf("prepared event: %s %v", data, err)
+	}
+	successor := f.successor(t, r, armS)
+	if successor.Runtime != "claude" || f.old.Runtime != "codex" {
+		t.Fatalf("fixture runtimes: old %q successor %q", f.old.Runtime, successor.Runtime)
+	}
+	committed, err := f.commit(r, "commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.State != api.HandlerRotationCommitted || committed.Receipt == nil || committed.Handoff == nil || committed.Receipt.PrimaryHandlerID != successor.ID || committed.Receipt.ClosedAgentID != f.old.ID {
+		t.Fatalf("committed: %+v", committed)
+	}
+	// Every open obligation moved once, to a new message seq.
+	h := committed.Handoff
+	if len(h.Reissued) != len(held) || len(h.AuthoredOpen) != 1 || h.AuthoredOpen[0].MessageSeq != authored.Seq || h.PendingScopeConfirmations == nil ||
+		h.AllocationIntents == nil || h.QueueClaims == nil || h.RequiredDeliveries == nil || len(h.LiveLeases) != 0 {
+		t.Fatalf("handoff: %+v", h)
+	}
+	after := map[string]rotationObligation{}
+	for _, o := range openObligations(t, s, f.task.ID) {
+		after[o.id] = o
+	}
+	for i, pair := range h.Reissued {
+		moved := after[pair.NewObligationID]
+		if pair.OldMessageSeq != held[i].Seq || pair.NewMessageSeq <= held[len(held)-1].Seq || moved.seq != pair.NewMessageSeq || moved.agent != successor.ID || moved.state == api.ObligationClosed {
+			t.Fatalf("obligation #%d must move to the successor with a new seq: %+v -> %+v", held[i].Seq, pair, moved)
+		}
+		if old := after[pair.OldObligationID]; old.state != api.ObligationClosed || old.outcome != api.OutcomeSuperseded {
+			t.Fatalf("old obligation not superseded: %+v", old)
+		}
+	}
+	for _, o := range before {
+		if o.agent == f.old.ID && after[o.id].outcome != api.OutcomeSuperseded {
+			t.Fatalf("obligation %s stayed with the old handler: %+v", o.id, after[o.id])
+		}
+	}
+	// The successor is primary, the old handler is closed.
+	task, _ := s.GetTask(ctx, f.task.ID)
+	oldNow, _ := s.GetAgent(ctx, f.old.ID)
+	if task.PrimaryHandlerID != successor.ID || task.HandlerRevision != 2 || oldNow.Status != api.AgentClosed || oldNow.SuccessorID != successor.ID {
+		t.Fatalf("primary %q revision %d old %+v", task.PrimaryHandlerID, task.HandlerRevision, oldNow)
+	}
+	// One directed handoff NOTICE names the rotation and who authorized it.
+	var notice string
+	if err = s.db.QueryRow(`SELECT text FROM messages WHERE task_id=? AND seq=? AND to_agent=? AND envelope LIKE '%"handlerRotation":"`+r.ID+`"%'`, f.task.ID, committed.Receipt.NoticeSeq, successor.ID).Scan(&notice); err != nil {
+		t.Fatalf("handoff notice: %v", err)
+	}
+	for _, want := range []string{r.ID, "from runtime codex to claude", "authorized by " + who + ": " + why} {
+		if !strings.Contains(notice, want) {
+			t.Fatalf("handoff notice misses %q:\n%s", want, notice)
+		}
+	}
+	// The record and the committed event carry the authorization and runtimes.
+	want := api.HandlerRotationAuthorization{AuthorizedBy: who, Reason: why, OldRuntime: "codex", SuccessorRuntime: "claude"}
+	readback, err := s.GetHandlerRotation(ctx, f.task.ID, r.ID)
+	if err != nil || committed.Authorization == nil || *committed.Authorization != want || readback.Authorization == nil || *readback.Authorization != want {
+		t.Fatalf("authorization on the record: committed %+v readback %+v %v", committed.Authorization, readback.Authorization, err)
+	}
+	var event map[string]any
+	if err = s.db.QueryRow(`SELECT data FROM events WHERE task_id=? AND text='Handler rotation committed'`, f.task.ID).Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal([]byte(data), &event); err != nil || event["authorizedBy"] != who || event["authorizationReason"] != why || event["oldRuntime"] != "codex" || event["successorRuntime"] != "claude" {
+		t.Fatalf("committed event: %s %v", data, err)
+	}
+	// The arm policy is not written.
+	if now := f.armPolicyRow(t); now != policy {
+		t.Fatalf("arm policy changed:\n%s\n%s", policy, now)
+	}
+	// A keyed replay returns the same record and writes nothing.
+	messages := countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+	replay, err := f.commit(r, "commit")
+	if err != nil || !reflect.DeepEqual(replay.Receipt, committed.Receipt) || replay.Authorization == nil || *replay.Authorization != want || countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID) != messages {
+		t.Fatalf("replay: %+v %v", replay, err)
+	}
+}
+
+func TestHandlerRotationRuntimeChangeNeedsAuthorization(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T, old api.HandlerArm) (*rotationFixture, []rotationObligation) {
+		f := newRotationFixture(t)
+		f.asRun(t, old)
+		f.armPolicy(t)
+		f.send(t, f.worker, api.EnvelopeKindRequest, "role:"+api.RoleDatabaseHandler, "Record the role-addressed fixture item", true)
+		f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Record the name-addressed fixture item", false)
+		return f, openObligations(t, f.s, f.task.ID)
+	}
+	t.Run("a runtime change is refused", func(t *testing.T) {
+		f, before := setup(t, armO)
+		policy := f.armPolicyRow(t)
+		r, err := f.prepareAs("prepare", api.HandlerRotationTriggerOwner, "", "")
+		if err != nil || r.Authorization != nil {
+			t.Fatalf("prepare: %+v %v", r, err)
+		}
+		f.successor(t, r, armS)
+		if _, err = f.commit(r, "commit"); refusalCode(err) != api.HandlerRotationRefusedSuccessor || !strings.Contains(err.Error(), "--authorized-by") {
+			t.Fatalf("unauthorized runtime change: %v", err)
+		}
+		f.assertNothingMoved(t, before)
+		if got, err := f.s.GetHandlerRotation(ctx, f.task.ID, r.ID); err != nil || got.State != api.HandlerRotationPrepared || got.Authorization != nil || f.armPolicyRow(t) != policy {
+			t.Fatalf("refused rotation: %+v %v", got, err)
+		}
+	})
+	t.Run("an arm change on the same runtime is refused", func(t *testing.T) {
+		f, before := setup(t, armS)
+		r, err := f.prepareAs("prepare", api.HandlerRotationTriggerOwner, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.successor(t, r, api.HandlerArm{Runtime: "claude", Model: "claude-opus-5-5", Reasoning: "high"})
+		if _, err = f.commit(r, "commit"); refusalCode(err) != api.HandlerRotationRefusedArmChanged {
+			t.Fatalf("unauthorized arm change: %v", err)
+		}
+		f.assertNothingMoved(t, before)
+	})
+	t.Run("half or runner authorization is invalid", func(t *testing.T) {
+		f, before := setup(t, armO)
+		for name, c := range map[string]struct{ trigger, by, reason string }{
+			"no reason":    {api.HandlerRotationTriggerOwner, "owner", ""},
+			"no name":      {api.HandlerRotationTriggerOwner, "", "move to Sonnet"},
+			"blank name":   {api.HandlerRotationTriggerOwner, "  ", "move to Sonnet"},
+			"blank reason": {api.HandlerRotationTriggerOwner, "owner", " \t"},
+			"long name":    {api.HandlerRotationTriggerOwner, strings.Repeat("n", 201), "move to Sonnet"},
+			"long reason":  {api.HandlerRotationTriggerOwner, "owner", strings.Repeat("r", 1001)},
+			"control char": {api.HandlerRotationTriggerOwner, "owner", "move\x00"},
+			"runner":       {api.HandlerRotationTriggerRunner, "owner", "move to Sonnet"},
+		} {
+			if _, err := f.prepareAs("prepare-"+name, c.trigger, c.by, c.reason); !errors.Is(err, api.ErrInvalid) {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM handler_rotations WHERE task_id=?`, f.task.ID); n != 0 {
+			t.Fatalf("invalid authorization wrote %d rotation row(s)", n)
+		}
+		f.assertNothingMoved(t, before)
+	})
+}
+
+func TestHandlerRotationModelChangeWithoutArmPolicy(t *testing.T) {
+	ctx := context.Background()
+	opus := api.HandlerArm{Runtime: "claude", Model: "claude-opus-5-5", Reasoning: "max"}
+	rotate := func(t *testing.T, f *rotationFixture, key string, to api.HandlerArm) (api.HandlerRotation, api.Agent, error) {
+		t.Helper()
+		r, err := f.prepareAs("prepare-"+key, api.HandlerRotationTriggerOwner, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := f.successor(t, r, to)
+		committed, err := f.commit(r, "commit-"+key)
+		if err == nil && (committed.State != api.HandlerRotationCommitted || committed.Authorization != nil) {
+			t.Fatalf("committed: %+v", committed)
+		}
+		return r, a, err
+	}
+	primary := func(t *testing.T, f *rotationFixture) string {
+		t.Helper()
+		task, err := f.s.GetTask(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task.PrimaryHandlerID
+	}
+	t.Run("no policy", func(t *testing.T) {
+		f := newRotationFixture(t)
+		f.asRun(t, armS)
+		if _, a, err := rotate(t, f, "no-policy", opus); err != nil || primary(t, f) != a.ID {
+			t.Fatalf("a model change without an arm policy: %v", err)
+		}
+	})
+	t.Run("primary in no arm", func(t *testing.T) {
+		f := newRotationFixture(t)
+		f.asRun(t, api.HandlerArm{Runtime: "claude", Model: "claude-haiku-4-5", Reasoning: "high"})
+		f.armPolicy(t)
+		if _, a, err := rotate(t, f, "no-arm", opus); err != nil || primary(t, f) != a.ID {
+			t.Fatalf("a model change for a primary in no arm: %v", err)
+		}
+	})
+	t.Run("arm handler stays in its arm", func(t *testing.T) {
+		f := newRotationFixture(t)
+		f.asRun(t, armS)
+		f.armPolicy(t)
+		before := openObligations(t, f.s, f.task.ID)
+		r, a, err := rotate(t, f, "other-model", opus)
+		if refusalCode(err) != api.HandlerRotationRefusedArmChanged {
+			t.Fatalf("another model for an arm handler: %v", err)
+		}
+		f.assertNothingMoved(t, before)
+		if _, err = f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort", RotationID: r.ID}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.s.CloseAgent(ctx, a.ID, f.by); err != nil && !errors.Is(err, api.ErrClosed) {
+			t.Fatal(err)
+		}
+		if _, a, err = rotate(t, f, "same-arm", armS); err != nil || primary(t, f) != a.ID {
+			t.Fatalf("a same-arm rotation: %v", err)
+		}
+	})
+}
+
+// A hub that predates the authorization columns gains them on open; its old
+// rotations read back with no authorization.
+func TestHandlerRotationAuthorizationColumnsMigrate(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	r, err := f.prepareAs("prepare", api.HandlerRotationTriggerOwner, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+	if _, err = f.commit(r, "commit"); err != nil {
+		t.Fatal(err)
+	}
+	columns := func(s *Store) int {
+		return countRows(t, s, `SELECT count(*) FROM pragma_table_info('handler_rotations') WHERE name IN ('authorized_by','authorization_reason','old_runtime','successor_runtime')`)
+	}
+	for _, column := range []string{"authorized_by", "authorization_reason", "old_runtime", "successor_runtime"} {
+		if _, err = f.s.db.Exec(`ALTER TABLE handler_rotations DROP COLUMN ` + column); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := columns(f.s); n != 0 {
+		t.Fatalf("old schema still has %d authorization column(s)", n)
+	}
+	f.s.Close()
+	reopened, err := Open(f.path)
+	if err != nil {
+		t.Fatalf("an old database must open: %v", err)
+	}
+	defer reopened.Close()
+	if n := columns(reopened); n != 4 {
+		t.Fatalf("migration added %d of 4 columns", n)
+	}
+	old, err := reopened.GetHandlerRotation(ctx, f.task.ID, r.ID)
+	if err != nil || old.State != api.HandlerRotationCommitted || old.Authorization != nil || old.Receipt == nil {
+		t.Fatalf("old rotation readback: %+v %v", old, err)
+	}
+	list, err := reopened.ListHandlerRotations(ctx, f.task.ID)
+	if err != nil || len(list) != 1 || list[0].Authorization != nil {
+		t.Fatalf("old rotation list: %+v %v", list, err)
+	}
+	// Opening again changes nothing.
+	reopened.Close()
+	again, err := Open(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if n := columns(again); n != 4 {
+		t.Fatalf("second open left %d columns", n)
 	}
 }

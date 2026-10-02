@@ -913,7 +913,8 @@ func (s *Store) HandlerWriteRefusals(ctx context.Context, task string) ([]api.Ha
 // handlerRotationArmRefusal keeps rotation inside an arm: when the project
 // has a saved arm policy and the old run belongs to one of its arms, the
 // successor must belong to the same arm. Without a policy, or for a run of
-// no arm, rotation is unchanged.
+// no arm, rotation is unchanged. An owner-authorized change skips this check
+// (commitHandlerRotation) and never writes the arm policy.
 func handlerRotationArmRefusal(ctx context.Context, tx *sql.Tx, old, successor api.Agent) (*api.HandlerRotationRefusal, error) {
 	p, err := loadHandlerArmPolicy(ctx, tx, old.TaskID)
 	if err != nil || p.Revision == 0 {

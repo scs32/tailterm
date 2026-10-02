@@ -104,6 +104,10 @@ type HandlerRotationRequest struct {
 	SuccessorName           string `json:"successorName,omitempty"`
 	Reason                  string `json:"reason,omitempty"`
 	Trigger                 string `json:"trigger,omitempty"`
+	// An owner-authorized change of the primary's runtime, model or arm: who
+	// authorized it and why. Both or neither; owner trigger only.
+	AuthorizedBy        string `json:"authorizedBy,omitempty"`
+	AuthorizationReason string `json:"authorizationReason,omitempty"`
 	// commit and abort
 	RotationID   string `json:"rotationId,omitempty"`
 	ActorAgentID string `json:"actorAgentId,omitempty"`
@@ -125,8 +129,20 @@ type HandlerRotation struct {
 	SuccessorRunID   string                  `json:"successorRunId,omitempty"`
 	Handoff          *HandlerRotationHandoff `json:"handoff,omitempty"`
 	Receipt          *HandlerRotationReceipt `json:"receipt,omitempty"`
-	CreatedAt        time.Time               `json:"createdAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
+	// Authorization is set only for an owner-authorized change.
+	Authorization *HandlerRotationAuthorization `json:"authorization,omitempty"`
+	CreatedAt     time.Time                     `json:"createdAt"`
+	UpdatedAt     time.Time                     `json:"updatedAt"`
+}
+
+// HandlerRotationAuthorization records who authorized a rotation that may
+// change the primary's runtime, model or arm, and why. The runtimes are saved
+// at commit.
+type HandlerRotationAuthorization struct {
+	AuthorizedBy     string `json:"authorizedBy"`
+	Reason           string `json:"reason"`
+	OldRuntime       string `json:"oldRuntime,omitempty"`
+	SuccessorRuntime string `json:"successorRuntime,omitempty"`
 }
 
 // HandlerRotationHandoff is the durable snapshot the successor reads with
