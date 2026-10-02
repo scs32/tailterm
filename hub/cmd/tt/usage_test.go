@@ -74,8 +74,14 @@ func TestUsageTextReadable(t *testing.T) {
 	build := api.UsageSummary{State: "measured", Requests: 52, AllocatedTurns: "103/2",
 		Tokens:         map[string]string{"input": "174400", "cached": "6710000", "cacheWrite": "0", "output": "12100"},
 		AverageContext: &average, CachedShare: &share, PricedSubtotal: map[string]string{"USD": "1234/100", "EUR": "7/2"}}
-	report := api.UsageReport{Version: 1, ProjectID: "tsk_1111111111111111", PriceRevision: 3, Items: []api.UsageItemReport{{TaskID: "tsk_1111111111111111", ItemID: "wi_1111111111111111", Title: "Synthetic item", Summary: build,
-		Phases: []api.UsageGroup{{Key: "build", Label: "build", Summary: build}}, Roles: []api.UsageGroup{{Key: "builder", Label: "builder", Summary: api.UsageSummary{State: "unavailable", AllocatedTurns: "0", Tokens: map[string]string{}}}}}},
+	handoffs := api.UsageSummary{State: "measured", Requests: 3, AllocatedTurns: "3", Tokens: map[string]string{"input": "2500", "output": "400"}}
+	// The item has a builder hand-offs phase row and measured time, so the
+	// text must carry readable tokens and the time lines together.
+	spent := &api.UsageTime{WallMs: "600000", ModelMs: "300000", ToolMs: "150000", WaitingMs: "150000", UnmeasuredMs: "0", PollMs: "0",
+		Timeline: api.UsageTimeline{ModelMs: "300000", ToolsOnlyMs: "150000", IdleMs: "150000", UnmeasuredMs: "0"},
+		Phases:   []api.UsageTimeSplit{{Key: "build", ModelMs: "240000", ToolMs: "150000", WaitingMs: "0"}, {Key: "hand-offs", ModelMs: "60000", ToolMs: "0", WaitingMs: "150000"}}}
+	report := api.UsageReport{Version: 1, TimeVersion: 1, ProjectID: "tsk_1111111111111111", PriceRevision: 3, Items: []api.UsageItemReport{{TaskID: "tsk_1111111111111111", ItemID: "wi_1111111111111111", Title: "Synthetic item", Summary: build, Time: spent,
+		Phases: []api.UsageGroup{{Key: "build", Label: "build", Summary: build}, {Key: "hand-offs", Label: "hand-offs", Summary: handoffs}}, Roles: []api.UsageGroup{{Key: "builder", Label: "builder", Summary: api.UsageSummary{State: "unavailable", AllocatedTurns: "0", Tokens: map[string]string{}}}}}},
 		Overhead: api.UsageItemReport{Title: "Project overhead", Summary: api.UsageSummary{State: "measured", Requests: 1, AllocatedTurns: "1", Tokens: map[string]string{"input": "950"}, CostComplete: true, PricedSubtotal: map[string]string{"USD": "1/8"}}}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { json.NewEncoder(w).Encode(report) }))
 	defer srv.Close()
@@ -103,6 +109,25 @@ func TestUsageTextReadable(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("text output lacks %q:\n%s", want, text)
 		}
+	}
+	// Tokens and time together, in the order tt usage prints them.
+	at := 0
+	for _, want := range []string{
+		"Synthetic item: measured · requests 52 · allocated 51.5 · tokens 6.90M (",
+		"  time: wall 10m0s · model 50.0% · tool 25.0% · waiting 25.0% · polls 0 · ",
+		"  timeline: some model working 50.0% · only tools running 25.0% · nobody active 25.0%\n",
+		"  time phase build: model 4m0s · tool 2m30s · waiting 0s\n",
+		"  time phase hand-offs: model 1m0s · tool 0s · waiting 2m30s\n",
+		"  build: measured · requests 52 · allocated 51.5 · tokens 6.90M (",
+		"  hand-offs: measured · requests 3 · allocated 3 · tokens 2.9k (input 2.5k, cached unavailable, cache write unavailable, output 400, reasoning unavailable) · average context unavailable\n",
+		"Project overhead: measured · requests 1 · ",
+		"  time: not measured\n",
+	} {
+		i := strings.Index(text[at:], want)
+		if i < 0 {
+			t.Fatalf("text output lacks %q after byte %d:\n%s", want, at, text)
+		}
+		at += i + len(want)
 	}
 	if strings.Contains(text, "map[") || regexp.MustCompile(`[0-9]/[0-9]`).MatchString(text) {
 		t.Errorf("text output still prints a raw map or rational:\n%s", text)
