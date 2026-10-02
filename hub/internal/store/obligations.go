@@ -156,6 +156,17 @@ func (s *Store) createObligations(ctx context.Context, tx *sql.Tx, m api.Message
 	if needs == "" {
 		return nil
 	}
+	// The deployment agent is an automated runner that never reads its inbox
+	// or acknowledges, so an obligation on it could only go overdue, escalate
+	// to the owner and count toward the project stall. A message addressed to
+	// it is stored and shown as sent but obliges no one (wi_1040ca9662cb4689).
+	var role string
+	if err := tx.QueryRowContext(ctx, `SELECT role FROM agents WHERE id=?`, req.To).Scan(&role); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if role == api.AgentRoleDeployment {
+		return nil
+	}
 	// Broker phase 3: a BLOCK that is not a reply obliges only the project
 	// lead (who can unblock); sent to anyone else it is news, not work. This
 	// stops "wait for X" BLOCKs to workers from escalating to the owner.
@@ -731,6 +742,11 @@ func (s *Store) ReassignObligation(ctx context.Context, taskID, obligationID str
 	target, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND task_id=?`, req.ToAgentID, taskID))
 	if err != nil || target.Status == api.AgentClosed {
 		return api.Message{}, api.ErrInvalid
+	}
+	// A message to the deployment agent creates no obligation, so moving work
+	// there would close it with nothing in its place.
+	if target.Role == api.AgentRoleDeployment {
+		return api.Message{}, fmt.Errorf("%w: the deployment agent cannot hold an obligation; move it to an agent that can answer", api.ErrConflict)
 	}
 	if req.ActorAgentID != "" {
 		item, err := scopedLeadItem(ctx, tx, taskID, req.ActorAgentID, req.ActorRunID)

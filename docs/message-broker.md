@@ -140,6 +140,27 @@ hub wraps them as `kind: human` with the text as the body.
 A human's directed message always creates an obligation. That is what makes a
 human nudge from Discord impossible to lose.
 
+**A message addressed to the deployment agent creates no obligation.** This is
+the one exception to the table and to the rule above: whatever its kind, and
+whether an agent or a person sent it, a message whose recipient holds the
+`deployment_agent` role creates no obligation and no wake job. The deployer is
+an automated runner (`scripts/release-runner.mjs`) that never reads its inbox,
+acknowledges or answers, so an obligation on it could only go overdue. Before
+this rule a handler's BLOCK to the deployer escalated to the owner after the
+acknowledgement deadline and was later counted as the project's only overdue
+work in the stall check, and someone had to answer for the deployer by hand.
+Now nothing is owed, so nothing can go overdue, reach the lead or owner, or
+count toward a project stall.
+
+The message itself is stored and shown on the board exactly as sent, addressed
+to the deployer, so the database handler and the owner helper can read it and
+act on it. It is information for them, not work for the runner: a sender who
+needs something done should address the handler or the lead, who can answer.
+For the same reason an open obligation cannot be reassigned to the deployment
+agent; `tt reassign` refuses with a conflict and the obligation stays with its
+holder. Obligations created for the deployer before this rule are not
+rewritten; the owner cancels any that are still open.
+
 ## Obligations and the broker state machine
 
 One obligation per (message, recipient). States:
