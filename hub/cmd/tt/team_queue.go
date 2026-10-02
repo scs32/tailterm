@@ -221,11 +221,7 @@ func cmdTeamQueue(e env, args []string) error {
 			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm), queueAttemptText(q))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			for _, member := range q.Activities {
-				state := "unknown"
-				if member.Activity != nil {
-					state = member.Activity.State
-				}
-				fmt.Printf("  %s activity=%s\n", member.Name, state)
+				fmt.Printf("  %s %s\n", member.Name, queueMemberActivity(member.Activity))
 			}
 			if q.OwnerIntegration != nil {
 				fmt.Printf("  Owner-integrated at %s: commit=%s changed=%s; slot, lease and ownership released, team closes when the item is terminal\n", q.OwnerIntegration.At, q.OwnerIntegration.Commit, strings.Join(q.OwnerIntegration.ChangedFiles, ","))

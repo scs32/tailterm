@@ -1888,11 +1888,18 @@ func TestActivityCLIShowsProviderBlocked(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/agents") {
 			_ = json.NewEncoder(w).Encode(api.AgentList{Agents: []api.Agent{{ID: "agt_0123456789abcdef", TaskID: task, Name: "reviewer", Session: "fake", Host: "mini", Status: api.AgentRunning, Activity: blocked}}})
+		} else if strings.HasSuffix(r.URL.Path, "/team-queue") {
+			_ = json.NewEncoder(w).Encode(api.TeamQueueList{ConcurrencyLimit: 1, Entries: []api.TeamQueueEntry{{ID: "tqe_0123456789abcdef", TaskID: task, ItemID: "wi_0123456789abcdef", State: "running",
+				Activities: []api.TeamAgentActivity{{Name: "reviewer", Activity: blocked}, {Name: "builder", Activity: &api.AgentActivity{State: "working"}}, {Name: "planner"}}}}})
 		} else {
 			http.NotFound(w, r)
 		}
 	}))
 	defer hub.Close()
+	queue, err := captureRelayOutput(t, false, func() error { return cmdTeamQueue(env{hub: hub.URL, task: task}, []string{"list"}) })
+	if err != nil || !strings.Contains(queue, "  reviewer activity=provider_blocked provider=anthropic class=usage_limit\n") || !strings.Contains(queue, "  builder activity=working\n") || !strings.Contains(queue, "  planner activity=unknown\n") {
+		t.Fatalf("queue output %q %v", queue, err)
+	}
 	agents, err := captureRelayOutput(t, false, func() error { return cmdAgents(env{hub: hub.URL, task: task}, nil) })
 	if err != nil || !strings.Contains(agents, "activity=provider_blocked") || !strings.Contains(agents, "  provider-blocked provider=anthropic model=claude-fable-5-1 class=usage_limit status=429 since=2026-09-26T18:53:10Z\n") {
 		t.Fatalf("agents output %q %v", agents, err)
