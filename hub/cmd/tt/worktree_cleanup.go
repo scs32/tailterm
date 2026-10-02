@@ -1000,6 +1000,10 @@ var claudeTempRoot = func() string {
 	return canonicalPath(filepath.Join(base, fmt.Sprintf("claude-%d", os.Getuid())))
 }
 
+// artifactsRootWarning limits the relative TAILTERM_ARTIFACTS notice to one
+// line per process. Tests reset it.
+var artifactsRootWarning sync.Once
+
 var artifactAcceptedAfterWarning sync.Once
 
 // artifactAcceptedAfter is closeout's acceptance age, from
