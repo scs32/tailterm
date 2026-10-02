@@ -798,3 +798,21 @@ func TestHelperRegisterSecondProjectSameSession(t *testing.T) {
 		t.Fatalf("tags after the closed helper: %v", tags)
 	}
 }
+
+// The second-project check reads only this session's tags, so an unrelated
+// session that tmux cannot list as JSON never fails a register.
+func TestHelperRegisterIgnoresUnrelatedSessionName(t *testing.T) {
+	f := newHelperFixture(t)
+	f.tmux(t, "new-session", "-d", "-s", `a"b`, "sleep 300")
+	if _, err := localSessions(context.Background()); err == nil {
+		t.Fatal(`fixture: a session named a"b no longer breaks the session listing`)
+	}
+	first := f.mustRegister(t)
+	again := f.mustRegister(t)
+	if again.Agent.ID != first.Agent.ID || again.Registration.Mode != api.OwnerHelperReplaced {
+		t.Fatalf("re-register %+v", again.Registration)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != f.task.ID || tags["TAILTERM_RUN"] != again.Agent.RunID {
+		t.Fatalf("tags %v", tags)
+	}
+}

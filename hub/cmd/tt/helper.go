@@ -175,31 +175,35 @@ func clearHelperTags(ctx context.Context, sessionID, created, agent string) erro
 // or registered again elsewhere no longer uses the session; a lookup that
 // fails any other way counts as live.
 func otherProjectHelper(ctx context.Context, c *api.Client, sessionID, hub, task string) (ownedSession, bool, error) {
-	sessions, err := localSessions(ctx)
+	// Only this session is read: an unrelated session never fails a register.
+	fields := []string{spawn.EnvHub, spawn.EnvTask, spawn.EnvAgent, "TAILTERM_RUN", "TAILTERM_ROLE"}
+	for i, f := range fields {
+		fields[i] = `"#{q/e:` + f + `}"`
+	}
+	raw, err := startupTmux(ctx, "display-message", "-p", "-t", sessionID, "-F", "["+strings.Join(fields, ",")+"]")
 	if err != nil {
 		return ownedSession{}, false, fmt.Errorf("read this tmux session's tags: %w", err)
 	}
-	for _, s := range sessions {
-		if s.ID != sessionID {
-			continue
-		}
-		if s.Role != api.AgentRoleOwnerHelper || (s.Hub == hub && s.Task == task) {
-			return ownedSession{}, false, nil
-		}
-		if s.Hub != hub || !api.ValidID(s.Task, "tsk") || !api.ValidID(s.Agent, "agt") {
-			return s, true, nil // not this hub's to look up
-		}
-		a, err := c.GetAgent(ctx, s.Task, s.Agent)
-		var httpErr *api.HTTPError
-		if errors.As(err, &httpErr) && httpErr.Status == 404 {
-			return ownedSession{}, false, nil
-		}
-		if err != nil {
-			return s, true, nil
-		}
-		return s, a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.RunID == s.Run, nil
+	var f []string
+	if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &f) != nil || len(f) != 5 {
+		return ownedSession{}, false, errors.New("cannot read this tmux session's tags")
 	}
-	return ownedSession{}, false, nil
+	s := ownedSession{ID: sessionID, Hub: f[0], Task: f[1], Agent: f[2], Run: f[3], Role: f[4]}
+	if s.Role != api.AgentRoleOwnerHelper || (s.Hub == hub && s.Task == task) {
+		return ownedSession{}, false, nil
+	}
+	if s.Hub != hub || !api.ValidID(s.Task, "tsk") || !api.ValidID(s.Agent, "agt") {
+		return s, true, nil // not this hub's to look up
+	}
+	a, err := c.GetAgent(ctx, s.Task, s.Agent)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 404 {
+		return ownedSession{}, false, nil
+	}
+	if err != nil {
+		return s, true, nil
+	}
+	return s, a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.RunID == s.Run, nil
 }
 
 func helperRequestHash(req api.RegisterOwnerHelperRequest) string {
