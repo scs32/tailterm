@@ -326,6 +326,9 @@ function runnerFixture(t, source) {
   writeFileSync(join(cwd, "docs/a.md"), "a\n");
   writeFileSync(join(cwd, "check.mjs"), source);
   writeFileSync(join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node check.mjs" } }));
+  writeFileSync(join(cwd, ".gitignore"), "node_modules/\n");
+  mkdirSync(join(cwd, "node_modules"));
+  writeFileSync(join(cwd, "node_modules/.package-lock.json"), "{}");
   git("init", "-q");
   git("config", "user.name", "Fixture");
   git("config", "user.email", "fixture@example.invalid");

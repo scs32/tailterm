@@ -6,7 +6,7 @@ import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
 import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
-import {planRunTimeout} from "../scripts/verify-matrix.mjs";
+import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
@@ -634,9 +634,11 @@ test("p1 a missing matrix prerequisite refuses the release by name before any ma
  assert.deepEqual(missingPrerequisites(f.cwd),[".build/test.wasm"]);
 });
 test("p1 the prerequisite list matches the one verify-matrix.mjs checks",()=>{
- const source=readFileSync(new URL("../scripts/verify-matrix.mjs",import.meta.url),"utf8"),at=source.indexOf('"Missing prerequisite: "');
- const start=source.lastIndexOf("for (const p of [",at),end=source.indexOf("])",start);assert.ok(at>0&&start>0&&end<at);
- assert.deepEqual([...source.slice(start,end).matchAll(/"([^"]+)"/g)].map(m=>m[1]),MATRIX_PREREQUISITES);
+ const cwd=join(tmpdir(),"prerequisite-list-fixture"),reads=[];
+ const checks=[{id:"npm-unit",argv:["npm","test"]},{id:"fixture-browser",argv:["node","fixture.mjs"],environment:{TEST_BROWSER:"both"}}];
+ const prerequisites=readPrerequisites(checks,cwd,file=>{reads.push(file);return Buffer.from("fixture");});
+ assert.deepEqual(prerequisites.map(p=>p.path),MATRIX_PREREQUISITES);
+ assert.deepEqual(reads,MATRIX_PREREQUISITES.map(p=>join(cwd,p)));
 });
 function provisionFixture(){
  const cwd=mkdtempSync(join(tmpdir(),"provision-checkout-")),from=mkdtempSync(join(tmpdir(),"provision-source-"));
