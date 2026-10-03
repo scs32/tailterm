@@ -92,7 +92,7 @@ test("CLI embedded planner and TailOS resolve identical complete member fields",
 
 // wi_ade4aa60c5d9b55e: a feature adds a plan reviewer on another model; the
 // planner stays on Claude Opus.
-test("a feature launch adds a GPT-6 Astra plan reviewer beside the Opus planner", () => {
+test("a feature launch adds a GPT-6 Astra plan reviewer beside the Sol planner", () => {
   const fields = Object.fromEntries(
     uiPlan(context).map(({ fields }) => [fields.name, fields]),
   );
@@ -104,7 +104,7 @@ test("a feature launch adds a GPT-6 Astra plan reviewer beside the Opus planner"
   const planner = fields["planner-22222222"];
   assert.deepEqual(
     [planner.runtime, planner.model],
-    ["claude", "claude-opus-5-5"],
+    ["codex", "gpt-6.1-sol"],
   );
 });
 

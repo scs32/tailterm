@@ -145,7 +145,7 @@ func TestTeamLaunchDryRunPrintsFullPlanAndChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Planned delivery (feature: plan review) for ", "lead-", "planner-", "builder-", "reviewer-", "claude-opus-5-5", "reasoning=high", "promptBytes=",
+	for _, want := range []string{"Planned delivery (feature: plan review) for ", "lead-", "planner-", "builder-", "reviewer-", "gpt-6.1-sol", "reasoning=high", "promptBytes=",
 		"plan-reviewer-" + f.item.ID[len(f.item.ID)-8:] + " runtime=codex model=gpt-6-astra reasoning=high "} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry plan lacks %q: %s", want, out)

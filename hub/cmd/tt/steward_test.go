@@ -259,7 +259,7 @@ func TestStewardTemplateFromEmbeddedBundle(t *testing.T) {
 	if err = json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("template JSON %q: %v", out, err)
 	}
-	if got.Role != api.AgentRoleBacklogSteward || got.Runtime != "claude" || got.Model != "claude-opus-5-5" || got.Reasoning != "high" || got.Name != "backlog-steward" {
+	if got.Role != api.AgentRoleBacklogSteward || got.Runtime != "codex" || got.Model != "gpt-6.1-sol" || got.Reasoning != "high" || got.Name != "backlog-steward" {
 		t.Fatalf("template fields: %+v", got.stewardTemplate)
 	}
 	if !strings.Contains(got.Prompt, "run tt ack SEQ before you start") || got.Digest != stewardTemplateDigest(got.Model, got.Reasoning, got.Prompt) {
