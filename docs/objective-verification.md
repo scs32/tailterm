@@ -719,6 +719,10 @@ inventory #21888 / final plan #22508 covers 58 entrypoints and 76 modules.
 
 - Each real runner invocation creates a fresh disposable HOME, TMPDIR, GOPATH,
   GOMODCACHE and GOCACHE, plus a private TMUX_TMPDIR directory beneath its home.
+  The home uses a fresh directory beneath canonical `/tmp` so long inherited
+  evidence paths do not exceed the host's Unix socket path bound. The synthetic
+  cancellation case forces a long outer TMPDIR, retains failed-check/cleanup
+  logs in TAP, and checks actual peer survival and tmux server teardown.
   Credential stripping, pre-admission prerequisite checks, post-admission held
   hashes, process-group recording, cleanup and no-receipt-on-failure are retained.
 - `task-form-browser.mjs` uses one short PID/random socket name per invocation

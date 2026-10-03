@@ -9,6 +9,7 @@ import {
   existsSync,
   statSync,
   symlinkSync,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -1047,8 +1048,38 @@ test("group tracking, release and exit recovery address only the exact holder an
   const recovered = await acquireHostLock(request(path, two)); assert.equal(allHeld(path).length, 1); assert.equal(recovered.record.overlap, 0);
   assert(events(path).includes("stale-recovered")); await recovered.release();
 });
+test("a confirmed-dead output lease can be retried while live or group-owning duplicates remain protected", async t => {
+  for (const group of [false, true]) {
+    const path = lockFile(t), output = tempDir(t), peerOutput = tempDir(t);
+    const dead = await heldByChild(t, path, { group, request: { ...two, output, recordDirectory: output } });
+    const peer = await acquireHostLock(request(path, { ...two, output: peerOutput, recordDirectory: peerOutput }));
+    try {
+      const peerBefore = structuredClone(allHeld(path).find(h => h.id === peer.id));
+      dead.child.kill("SIGKILL"); await exited(dead.child); assert(pidGone(dead.pid));
+      if (group) {
+        assert(!groupGone(dead.group));
+        const before = readFileSync(path, "utf8"), sidecar = readFileSync(join(output, "host-lock.json"), "utf8");
+        await assert.rejects(acquireHostLock(request(path, { ...two, output, recordDirectory: output })), /already in use/);
+        assert.equal(readFileSync(path, "utf8"), before); assert.equal(readFileSync(join(output, "host-lock.json"), "utf8"), sidecar);
+        kill(-dead.group); await until(() => groupGone(dead.group), "dead holder group gone");
+      }
+      const retry = await acquireHostLock(request(path, { ...two, output, recordDirectory: output }));
+      try {
+        assert.equal(retry.record.overlap, 0); assert.equal(retry.record.recovered.holder, dead.id);
+        assert.equal(allHeld(path).length, 2); assert.deepEqual(allHeld(path).find(h => h.id === peer.id), peerBefore);
+        assert(events(path).includes("stale-recovered"));
+        const before = readFileSync(path, "utf8"), sidecar = readFileSync(join(output, "host-lock.json"), "utf8");
+        await assert.rejects(acquireHostLock(request(path, { ...two, output, recordDirectory: output })), /already in use/);
+        assert.equal(readFileSync(path, "utf8"), before); assert.equal(readFileSync(join(output, "host-lock.json"), "utf8"), sidecar);
+      } finally { await retry.release(); }
+    } finally { await peer.release(); }
+  }
+});
 
 test("two real runPlan invocations have private homes, tmux namespaces and ports; cancelling one preserves its peer", async t => {
+  const inheritedTmp = process.env.TMPDIR, longTmp = join(tempDir(t), "private-" + "x".repeat(120));
+  mkdirSync(longTmp); process.env.TMPDIR = longTmp;
+  t.after(() => { if (inheritedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = inheritedTmp; });
   const path = lockFile(t), markers = [join(tempDir(t), "a.json"), join(tempDir(t), "b.json")], done = join(tempDir(t), "done");
   const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process';
     const tmux=spawnSync('tmux',['-L','two-run','new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
@@ -1059,15 +1090,26 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   const a = runnerFixture(t, source(markers[0], false)), b = runnerFixture(t, source(markers[1], true));
   const outs = [tempDir(t), tempDir(t)], abort = new AbortController();
   const first = runPlan(a.plan, a.cwd, outs[0], { minFreeBytes: 0, abortSignal: abort.signal, hostLock: { path, ...two, pollMs: 20 } });
-  const rejected = assert.rejects(first, /Verification interrupted by cancel-peer/);
   const second = runPlan(b.plan, b.cwd, outs[1], { minFreeBytes: 0, hostLock: { path, ...two, pollMs: 20 } });
+  const outcomes = [];
+  [first, second].forEach((promise, i) => promise.then(receipt => { outcomes[i] = { receipt }; }, error => { outcomes[i] = { error }; }));
+  let failure;
   try {
-  await until(()=>markers.every(existsSync), "both real checks started", 30000);
+  await until(() => {
+    const early = outcomes.find(Boolean);
+    if (early?.error) throw early.error;
+    if (early) throw new Error("Fixture completed before cancellation; retained check logs follow");
+    return markers.every(existsSync);
+  }, "both real checks started", 30000);
   const [ea, eb] = markers.map(f=>JSON.parse(readFileSync(f,"utf8")));
   assert.equal(allHeld(path).length, 2); assert.notEqual(ea.port, eb.port);
   for (const key of ["HOME", "TMPDIR", "TMUX_TMPDIR", "GOPATH", "GOMODCACHE", "GOCACHE"])assert.notEqual(ea[key],eb[key],key);
-  for(const e of [ea,eb])assert(existsSync(join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,"two-run")), "private actual tmux socket");
-  abort.abort("cancel-peer"); await rejected;
+  for(const e of [ea,eb]) {
+    const socket = join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,"two-run");
+    assert(Buffer.byteLength(socket) < 104, "private namespace fits the host Unix socket bound despite long inherited TMPDIR");
+    assert(existsSync(socket), "private actual tmux socket");
+  }
+  abort.abort("cancel-peer"); await assert.rejects(first, /Verification interrupted by cancel-peer/);
   await until(()=>pidGone(ea.tmuxPid), "cancelled fixture tmux cleaned");assert(!pidGone(eb.tmuxPid));
   assert(!existsSync(ea.HOME)); assert(existsSync(eb.HOME)); assert(!pidGone(eb.pid));
   assert.equal(allHeld(path).length, 1); assert.equal(allHeld(path)[0].output, canonicalResource(outs[1]));
@@ -1077,7 +1119,18 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   assert(existsSync(join(outs[1],"receipt.json"))); assert(!existsSync(eb.HOME));assert.deepEqual(allHeld(path),[]);
   await until(()=>pidGone(eb.tmuxPid), "completed fixture tmux cleaned");
   for (const out of outs)assert.equal(JSON.parse(readFileSync(join(out,"host-lock.json"),"utf8")).overlap,0);
-  } finally { abort.abort("cleanup"); writeFileSync(done,"done"); await Promise.allSettled([first, second, rejected]); }
+  } catch (error) { failure = error; throw error; }
+  finally {
+    abort.abort("cleanup"); writeFileSync(done,"done");
+    const cleanup = await Promise.allSettled([first, second]);
+    if (failure) for (const [i, out] of outs.entries()) {
+      const files = {};
+      try { for (const file of readdirSync(out)) if (/\.(log|json)$/.test(file)) files[file] = readFileSync(join(out, file), "utf8"); }
+      catch (error) { files.readError = error.message; }
+      console.error(JSON.stringify({ fixture: i, output: out, cleanup: cleanup[i].status,
+        cleanupError: cleanup[i].reason?.message, files }));
+    }
+  }
 });
 
 test("a third real child remains waiting until one of two real holder children releases", async t => {

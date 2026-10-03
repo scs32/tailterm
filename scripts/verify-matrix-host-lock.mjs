@@ -579,38 +579,40 @@ export async function acquireHostLock(options = {}) {
     shownAt = 0,
     busyAt = 0;
   const step = (state, first) => {
+    // Confirm ownership once under the mutex before checking resource roots.
+    // A dead pid with a surviving group still owns its lease and its output.
+    const deadHolders = [], live = [];
+    for (const holder of holdersOf(state)) {
+      if (pidGone(holder.pid) && !liveGroups(holder).length) deadHolders.push(holder);
+      else live.push(holder);
+    }
+    const dead = state.waiters.filter(w => w.id !== entry.id && pidGone(w.pid));
+    const waiters = state.waiters.filter(w => !dead.includes(w));
     if (first) {
-      if (!holdersOf(state).length && !state.waiters.length) {
+      if (!live.length && !waiters.length) {
         state.version = 2; state.holderLimit = limit; state.holders = []; delete state.holder;
       }
       if (state.version === 2 && state.holderLimit !== limit)
         throw new HostLockError("capacity-mismatch", `Host holder limit is frozen at ${state.holderLimit} until holders and waiters drain`);
       const resources = [entry.output, entry.recordDirectory].filter(Boolean);
-      if ([...holdersOf(state), ...state.waiters].some(e =>
+      if ([...live, ...waiters].some(e =>
         [e.output, e.recordDirectory].filter(Boolean).some(path => resources.includes(canonicalResource(path)))))
         throw new HostLockError("duplicate-output", "Host lock output/record directory is already in use");
       entry.seq = ++state.requestSeq;
       entry.grantSeqAtRequest = state.grantSeq;
-      state.waiters.push({ ...entry });
+      waiters.push({ ...entry });
       journal(paths, "request", entry, { seq: entry.seq, priority, prioritySource, kind });
     }
-    const dead = state.waiters.filter((w) => w.id !== entry.id && pidGone(w.pid));
     for (const waiter of dead) journal(paths, "waiter-dropped", waiter, { by: entry.id });
-    state.waiters = ordered(state.waiters.filter((w) => !dead.includes(w)));
+    state.waiters = ordered(waiters);
+    setHolders(state, live);
+    for (const holder of deadHolders)
+      journal(paths, "stale-recovered", entry, { reason: "pid-gone", holder: holder.id, holderPid: holder.pid, holderItem: holder.item, holderAgent: holder.agent });
     const mine = state.waiters.findIndex((w) => w.id === entry.id);
     if (mine < 0) throw new HostLockError("lost-request", `Host lock request ${entry.id} is no longer in ${paths.file}`);
     const position = mine + 1, length = state.waiters.length;
     if (first) Object.assign(record, { seq: entry.seq, queuePosition: position, queueLength: length });
-    let overlap = null, recovered = null;
-    const live = [];
-    for (const holder of holdersOf(state)) {
-      const groups = liveGroups(holder), holderGone = pidGone(holder.pid);
-      if (holderGone && !groups.length) {
-        recovered = holder;
-        journal(paths, "stale-recovered", entry, { reason: "pid-gone", holder: holder.id, holderPid: holder.pid, holderItem: holder.item, holderAgent: holder.agent });
-      } else live.push(holder);
-    }
-    setHolders(state, live);
+    let overlap = null, recovered = deadHolders.at(-1) || null;
     const capacity = state.version === 1 ? 1 : state.holderLimit;
     if (mine === 0 && live.length >= capacity) {
       const overdue = live.find(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);

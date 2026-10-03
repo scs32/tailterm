@@ -1259,7 +1259,10 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
   } = options;
   requireFreeSpace(minFreeBytes, getAvailableBytes);
   const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
-  const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
+  // Unix socket paths are bounded (104 bytes on this host). Inherited TMPDIR
+  // may be an arbitrarily deep evidence directory; keep the fresh private
+  // home short so its own tmux namespace remains usable there as well.
+  const home = mkdtempSync(join(realpathSync("/tmp"), "tailterm-verifier-"));
   const receiptPath = join(output, receiptName);
   let receiptWritten = false;
   try {
