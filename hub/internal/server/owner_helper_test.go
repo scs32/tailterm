@@ -27,7 +27,7 @@ func TestOwnerHelperRegisterAndDelegateHTTP(t *testing.T) {
 		t.Fatalf("reused request id %d", code)
 	}
 	for name, bad := range map[string]api.RegisterOwnerHelperRequest{
-		"runtime": {Host: "h", Session: "owner", Runtime: "codex", RequestID: "bad-runtime"},
+		"runtime": {Host: "h", Session: "owner", Runtime: "unsupported", RequestID: "bad-runtime"},
 		"session": {Host: "h", Session: "no spaces", Runtime: "claude", RequestID: "bad-session"},
 	} {
 		if code, _ := h.do(ownerToken, "POST", base+"/owner-helper", bad, nil); code != http.StatusBadRequest {

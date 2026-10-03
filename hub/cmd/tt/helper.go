@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,7 +20,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
-// The owner helper (docs/owner-helper.md): the owner's own Claude Code
+// The owner helper (docs/owner-helper.md): the owner's own Claude Code or Codex
 // session, registered as the project's owner_helper agent.
 
 const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--take-session] [--json]\n" +
@@ -42,8 +43,11 @@ type ownerHelperFile struct {
 	SessionID      string `json:"sessionId,omitempty"`
 	SessionCreated string `json:"sessionCreated,omitempty"`
 	Thread         string `json:"thread,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
 	PendingRequest string `json:"pendingRequestId,omitempty"`
 	PendingHash    string `json:"pendingHash,omitempty"`
+	RequestID      string `json:"requestId,omitempty"`
+	RequestHash    string `json:"requestHash,omitempty"`
 }
 
 func ownerHelperPath(hub, task string) string {
@@ -82,7 +86,7 @@ func cmdHelper(e env, args []string) error {
 	return errors.New(helperUsage)
 }
 
-// helperSession is the tmux session the owner's Claude Code pane runs in.
+// helperSession is the tmux session the owner's runtime pane runs in.
 type helperSession struct {
 	ID, Created, Name string
 	Panes             int
@@ -206,9 +210,12 @@ func otherProjectHelper(ctx context.Context, c *api.Client, sessionID, hub, task
 	return s, a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.RunID == s.Run, nil
 }
 
-func helperRequestHash(req api.RegisterOwnerHelperRequest) string {
+func helperRequestHash(req api.RegisterOwnerHelperRequest, thread string) string {
 	req.RequestID = ""
-	data, _ := json.Marshal(req)
+	data, _ := json.Marshal(struct {
+		Request api.RegisterOwnerHelperRequest
+		Thread  string
+	}{req, thread})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
@@ -228,6 +235,43 @@ func claudeTranscriptExists(thread string) bool {
 	}
 	paths, err := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", thread+".jsonl"))
 	return err == nil && len(paths) > 0
+}
+
+// helperRuntimeIdentity refuses mixed provider identities before any state write.
+func helperRuntimeIdentity() (runtime, thread, codex, codexHome string, err error) {
+	codexThread := os.Getenv("CODEX_THREAD_ID")
+	claudeThread := os.Getenv("CLAUDE_CODE_SESSION_ID")
+	if codexThread != "" {
+		if claudeThread != "" || os.Getenv("CLAUDECODE") != "" {
+			return "", "", "", "", errors.New("ambiguous Claude/Codex session identity; use the owner's dedicated runtime session")
+		}
+		if !threadIDPattern.MatchString(codexThread) {
+			return "", "", "", "", errors.New("CODEX_THREAD_ID must be an exact Codex thread UUID")
+		}
+		codex, err = exec.LookPath("codex")
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("resolve Codex executable: %w", err)
+		}
+		codex, err = filepath.Abs(codex)
+		if err != nil {
+			return "", "", "", "", err
+		}
+		codexHome = os.Getenv("CODEX_HOME")
+		if codexHome != "" {
+			codexHome, err = filepath.Abs(codexHome)
+			if err != nil {
+				return "", "", "", "", err
+			}
+		}
+		return "codex", codexThread, codex, codexHome, nil
+	}
+	if os.Getenv("CLAUDECODE") == "" || !threadIDPattern.MatchString(claudeThread) {
+		return "", "", "", "", errors.New("run tt helper register from the owner's Claude Code session or Codex session (CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID is not set)")
+	}
+	if !claudeTranscriptExists(claudeThread) {
+		return "", "", "", "", fmt.Errorf("no Claude transcript for session %s under ~/.claude/projects", claudeThread)
+	}
+	return "claude", claudeThread, "", "", nil
 }
 
 func helperRegister(e env, args []string) error {
@@ -254,15 +298,12 @@ func helperRegister(e env, args []string) error {
 	if e.agent != "" {
 		a, err := c.GetAgent(ctx, *task, e.agent)
 		if err != nil || a.Role != api.AgentRoleOwnerHelper {
-			return errors.New("tt helper register runs in the owner's own Claude Code session, not an agent session")
+			return errors.New("tt helper register runs in the owner's own Claude Code or Codex session, not an agent session")
 		}
 	}
-	thread := os.Getenv("CLAUDE_CODE_SESSION_ID")
-	if os.Getenv("CLAUDECODE") == "" || !threadIDPattern.MatchString(thread) {
-		return errors.New("run tt helper register from the owner's Claude Code session (CLAUDE_CODE_SESSION_ID is not set)")
-	}
-	if !claudeTranscriptExists(thread) {
-		return fmt.Errorf("no Claude transcript for session %s under ~/.claude/projects", thread)
+	runtime, thread, codex, codexHome, err := helperRuntimeIdentity()
+	if err != nil {
+		return err
 	}
 	session, inTmux, err := currentHelperSession(ctx)
 	if err != nil {
@@ -290,7 +331,7 @@ func helperRegister(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	req := api.RegisterOwnerHelperRequest{Name: *name, Host: spawn.Host(), Session: "terminal", Runtime: "claude", Cwd: cwd}
+	req := api.RegisterOwnerHelperRequest{Name: *name, Host: spawn.Host(), Session: "terminal", Runtime: runtime, Cwd: cwd}
 	if inTmux {
 		req.Session = session.Name
 	}
@@ -298,28 +339,28 @@ func helperRegister(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	hash := helperRequestHash(req)
-	pending := false
+	hash := helperRequestHash(req, thread)
 	switch {
 	case *requestID != "":
+		if state.PendingRequest == *requestID && state.PendingHash != hash || state.RequestID == *requestID && state.RequestHash != hash {
+			return errors.New("registration retry key belongs to another runtime/thread; use a new key")
+		}
 		req.RequestID = *requestID
 	case state.PendingRequest != "" && state.PendingHash == hash:
 		// The last attempt's outcome is unknown: replay it.
-		req.RequestID, pending = state.PendingRequest, true
+		req.RequestID = state.PendingRequest
 	default:
 		if req.RequestID, err = newHelperRequestID(); err != nil {
 			return err
 		}
-		state.PendingRequest, state.PendingHash, pending = req.RequestID, hash, true
-		if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
-			return err
-		}
+	}
+	state.PendingRequest, state.PendingHash = req.RequestID, hash
+	if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
+		return err
 	}
 	clearPending := func() {
-		if pending {
-			state.PendingRequest, state.PendingHash = "", ""
-			_ = writePrivateJSON(ownerHelperPath(e.hub, *task), state)
-		}
+		state.PendingRequest, state.PendingHash = "", ""
+		_ = writePrivateJSON(ownerHelperPath(e.hub, *task), state)
 	}
 	out, err := c.RegisterOwnerHelper(ctx, *task, req)
 	if err != nil {
@@ -331,7 +372,7 @@ func helperRegister(e env, args []string) error {
 	}
 	// Verify before any local write, so a stale replay never tags a session.
 	a := out.Agent
-	if a == nil || out.Registration == nil || a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited || out.Registration.RunID != a.RunID {
+	if a == nil || out.Registration == nil || a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited || out.Registration.RunID != a.RunID || a.Runtime != runtime || out.Registration.Runtime != runtime {
 		clearPending()
 		return errors.New("the hub did not return a live owner helper run; register again")
 	}
@@ -339,11 +380,11 @@ func helperRegister(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if current.RunID != a.RunID || current.Role != api.AgentRoleOwnerHelper || current.Status == api.AgentClosed || current.Status == api.AgentExited {
+	if current.Runtime != runtime || current.RunID != a.RunID || current.Role != api.AgentRoleOwnerHelper || current.Status == api.AgentClosed || current.Status == api.AgentExited {
 		clearPending()
 		return errors.New("the registered run is no longer the helper's current run; register again")
 	}
-	b := runtimeBinding{Hub: e.hub, Task: *task, Agent: a.ID, Run: a.RunID, Thread: thread, Runtime: "claude", Role: api.AgentRoleOwnerHelper, Session: req.Session, Cwd: cwd, CreatedAt: time.Now().UTC()}
+	b := runtimeBinding{Hub: e.hub, Task: *task, Agent: a.ID, Run: a.RunID, Thread: thread, Runtime: runtime, Codex: codex, CodexHome: codexHome, Role: api.AgentRoleOwnerHelper, Session: req.Session, Cwd: cwd, CreatedAt: time.Now().UTC()}
 	if inTmux {
 		if err := tagHelperSession(ctx, session.ID, b); err != nil {
 			return fmt.Errorf("tag this tmux session: %w", err)
@@ -364,7 +405,7 @@ func helperRegister(e env, args []string) error {
 	} else {
 		_ = os.Remove(filepath.Join(relayDir(), bindingKey(b)+".binding.json"))
 	}
-	state = ownerHelperFile{Hub: e.hub, Task: *task, Agent: a.ID, Name: a.Name, Run: a.RunID, Registration: out.Registration.ID, Session: req.Session, Thread: thread}
+	state = ownerHelperFile{Hub: e.hub, Task: *task, Agent: a.ID, Name: a.Name, Run: a.RunID, Registration: out.Registration.ID, Session: req.Session, Thread: thread, Runtime: runtime, RequestID: req.RequestID, RequestHash: hash}
 	if inTmux {
 		state.SessionID, state.SessionCreated = session.ID, session.Created
 	}
@@ -427,6 +468,18 @@ func verifiedHelper(e env, task string) (env, api.Agent, error) {
 		return env{}, api.Agent{}, fmt.Errorf("the owner helper is %s; run tt helper register", a.Status)
 	case a.RunID != state.Run:
 		return env{}, api.Agent{}, errors.New("the owner helper was registered again elsewhere; run tt helper register here to take it back")
+	}
+	// Host state is shared across sessions. A replaced caller must never adopt
+	// the successor identity just because its host file now names that run.
+	if e.agent != "" && (e.agent != state.Agent || e.runID != state.Run) {
+		return env{}, api.Agent{}, errors.New("this caller is not the registered helper run; register again")
+	}
+	codexThread, claudeThread := os.Getenv("CODEX_THREAD_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")
+	if codexThread != "" && claudeThread != "" ||
+		codexThread != "" && (a.Runtime != "codex" || codexThread != state.Thread) ||
+		claudeThread != "" && (a.Runtime != "claude" || claudeThread != state.Thread) ||
+		state.Runtime != "" && state.Runtime != a.Runtime {
+		return env{}, api.Agent{}, errors.New("this session is not the registered helper thread/runtime; register again")
 	}
 	helper := e
 	helper.task, helper.agent, helper.agentName, helper.runID, helper.session = task, a.ID, a.Name, a.RunID, a.Session

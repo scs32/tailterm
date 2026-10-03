@@ -1074,3 +1074,48 @@ func TestRelayWakesBoundAgentForUnlinkedDirected(t *testing.T) {
 		t.Fatalf("relay did not wake the bound agent for #%d: prompts=%q progress=%+v", directed.Seq, prompts, p)
 	}
 }
+
+func TestRelayCodexOwnerHelperWakeRoutes(t *testing.T) {
+	for _, role := range []string{api.AgentRoleOwnerHelper, ""} {
+		t.Run("role-"+role, func(t *testing.T) {
+			h := &needsInputHub{t: t, agent: api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Runtime: "codex", Role: role, Status: api.AgentDone, Online: true, Unread: 1}}
+			h.messages = []api.Message{{Seq: 41, To: h.agent.ID, From: api.Sender{Node: "workspace", User: "owner"}, Text: "owner input"}}
+			h.jobs = []api.WakeJob{{ID: "wake_0123456789abcdef", LeaseToken: "lease", MessageSeq: 42, AgentID: h.agent.ID, RunID: h.agent.RunID, Prompt: "Tailterm broker: #42 request. Run tt obligations."}}
+			hub := httptest.NewServer(h)
+			defer hub.Close()
+			c, _ := api.NewClient(hub.URL, time.Second)
+			b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: h.agent.ID, Run: h.agent.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "codex", Role: role, Codex: "/synthetic/codex"}
+			var prompts []string
+			queue := func(_ context.Context, got runtimeBinding, prompt string) error {
+				if got != b {
+					t.Fatal("queue binding changed")
+				}
+				prompts = append(prompts, prompt)
+				return nil
+			}
+			if err := relayOne(context.Background(), b, &relayProgress{}, c, time.Now(), queue); err != nil {
+				t.Fatal(err)
+			}
+			if handled, err := relayWakeJob(context.Background(), b, &relayProgress{}, c, time.Now(), queue); err != nil || !handled {
+				t.Fatalf("broker handled=%v err=%v", handled, err)
+			}
+			if len(prompts) != 2 {
+				t.Fatalf("prompts=%v", prompts)
+			}
+			for _, prompt := range prompts {
+				if role == api.AgentRoleOwnerHelper && (!strings.Contains(prompt, "tt helper inbox --task "+b.Task) || strings.Contains(prompt, "tt obligations") || strings.Contains(prompt, "tt inbox --unread")) {
+					t.Fatalf("helper prompt %q", prompt)
+				}
+				if role == "" && strings.Contains(prompt, "tt helper inbox") {
+					t.Fatalf("ordinary Codex changed %q", prompt)
+				}
+			}
+			if role == "" && prompts[1] != "Tailterm broker: #42 request. Run tt obligations." {
+				t.Fatalf("ordinary broker prompt changed %q", prompts[1])
+			}
+			if len(h.reports) != 1 || h.reports[0].Status != "accepted" {
+				t.Fatalf("broker reports %+v", h.reports)
+			}
+		})
+	}
+}

@@ -14,12 +14,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/bridge"
+	"github.com/scs32/tailterm/hub/internal/discord"
+	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 // helperFixture is a temporary hub, a private tmux server with one owner
@@ -42,6 +47,13 @@ func newHelperFixture(t *testing.T) helperFixture {
 	}
 	e, c, task, lead := cliWorkItemFixture(t)
 	home := t.TempDir()
+	t.Setenv("TAILTERM_TOKEN", "")
+	t.Setenv("TAILTERM_HUB", "")
+	t.Setenv("TAILTERM_TASK", "")
+	t.Setenv("TAILTERM_AGENT", "")
+	t.Setenv("TAILTERM_RUN", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HOME", home)
 	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
 	sock := "tt-helper-" + strings.TrimPrefix(api.NewID("agt"), "agt_")
@@ -317,6 +329,17 @@ func TestHelperRegisterAfterExit(t *testing.T) {
 
 func TestHelperRegisterUncertainRetry(t *testing.T) {
 	f := newHelperFixture(t)
+	exerciseHelperUncertainRetry(t, f)
+}
+
+func TestHelperCodexUncertainRetry(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	exerciseHelperUncertainRetry(t, f)
+}
+
+func exerciseHelperUncertainRetry(t *testing.T, f helperFixture) {
+	t.Helper()
 	ctx := context.Background()
 	upstream, err := url.Parse(f.owner.hub)
 	if err != nil {
@@ -814,5 +837,519 @@ func TestHelperRegisterIgnoresUnrelatedSessionName(t *testing.T) {
 	}
 	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != f.task.ID || tags["TAILTERM_RUN"] != again.Agent.RunID {
 		t.Fatalf("tags %v", tags)
+	}
+}
+
+// A genuine Codex thread supplies no Claude identity.
+func TestHelperCodexRegister(t *testing.T) {
+	f := newHelperFixture(t)
+	t.Setenv("CLAUDECODE", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", f.thread)
+	t.Setenv("CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex"))
+	if err := os.WriteFile(filepath.Join(f.bin, "codex"), []byte("#!/bin/sh\necho 'Queued message'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", f.bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	a := *f.mustRegister(t).Agent
+	b, ok := readBinding(t, f.owner.hub, a.ID)
+	if a.Runtime != "codex" || !ok || b.Runtime != "codex" || b.Thread != f.thread || b.Run != a.RunID || b.Role != api.AgentRoleOwnerHelper || b.Codex != filepath.Join(f.bin, "codex") || b.CodexHome != os.Getenv("CODEX_HOME") || !validBinding(b) {
+		t.Fatalf("genuine Codex registration: agent=%+v binding=%+v", a, b)
+	}
+}
+
+func helperTestRuntime(t *testing.T, f helperFixture, runtime, thread string) {
+	t.Helper()
+	t.Setenv("CODEX_THREAD_ID", "")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CLAUDECODE", "")
+	if runtime == "codex" {
+		t.Setenv("CODEX_THREAD_ID", thread)
+		t.Setenv("CODEX_HOME", filepath.Join(os.Getenv("HOME"), ".codex"))
+		if err := os.WriteFile(filepath.Join(f.bin, "codex"), []byte("#!/bin/sh\necho 'Queued message'\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", f.bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	} else {
+		t.Setenv("CLAUDECODE", "1")
+		t.Setenv("CLAUDE_CODE_SESSION_ID", thread)
+		writeHelperTranscript(t, os.Getenv("HOME"), thread)
+	}
+}
+
+func TestHelperCodexIdentityRefusalsAndBind(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	a := *f.mustRegister(t).Agent
+	e := env{hub: f.owner.hub, task: f.task.ID, agent: a.ID, runID: a.RunID}
+	original, _ := readBinding(t, e.hub, e.agent)
+	for _, command := range []string{"status", "inbox"} {
+		autoBindRuntime(e, command)
+	}
+	if err := bindRuntime(e, f.thread); err != nil {
+		t.Fatal(err)
+	}
+	kept, _ := readBinding(t, e.hub, e.agent)
+	if kept != original {
+		t.Fatalf("binding overwritten: %+v -> %+v", original, kept)
+	}
+	for _, field := range []string{"hub", "agent", "session"} {
+		foreignBinding := original
+		switch field {
+		case "hub":
+			foreignBinding.Hub = "http://foreign.invalid"
+		case "agent":
+			foreignBinding.Agent = api.NewID("agt")
+		case "session":
+			foreignBinding.Session = "other"
+		}
+		path := filepath.Join(relayDir(), bindingKey(original)+".binding.json")
+		if err := writePrivateJSON(path, foreignBinding); err != nil {
+			t.Fatal(err)
+		}
+		if err := bindRuntime(e, f.thread); err == nil {
+			t.Fatalf("foreign %s binding accepted", field)
+		}
+		if err := writePrivateJSON(path, original); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foreign := "00000000-0000-4000-8000-00000000dead"
+	if err := bindRuntime(e, foreign); err == nil {
+		t.Fatal("helper rebound to foreign thread")
+	}
+	t.Setenv("CODEX_THREAD_ID", foreign)
+	autoBindRuntime(e, "status")
+	if kept, _ := readBinding(t, e.hub, e.agent); kept != original {
+		t.Fatal("auto-bind changed registered thread")
+	}
+	for _, command := range []string{"env", "inbox", "reply"} {
+		args := []string{command, "--task", f.task.ID}
+		if command == "reply" {
+			args = append(args, "1", "--text", "stale")
+		}
+		if _, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, args) }); err == nil {
+			t.Fatalf("foreign thread %s accepted", command)
+		}
+	}
+	t.Setenv("CODEX_THREAD_ID", "bad")
+	if _, err := f.register(t, f.owner); err == nil {
+		t.Fatal("invalid thread accepted")
+	}
+	t.Setenv("CODEX_THREAD_ID", f.thread)
+	t.Setenv("CLAUDECODE", "1")
+	if _, err := f.register(t, f.owner); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("mixed identity: %v", err)
+	}
+	t.Setenv("CLAUDECODE", "")
+	t.Setenv("PATH", t.TempDir()) // no fallback to the host's real Codex
+	if _, err := f.register(t, f.owner); err == nil || !strings.Contains(err.Error(), "executable") {
+		t.Fatalf("missing Codex: %v", err)
+	}
+	if current, _ := f.c.GetAgent(context.Background(), f.task.ID, a.ID); current.RunID != a.RunID {
+		t.Fatal("refusal changed run")
+	}
+}
+
+func TestHelperRuntimeHandback(t *testing.T) {
+	for _, sequence := range [][]string{{"claude", "codex", "claude"}, {"codex", "claude", "codex"}} {
+		t.Run(strings.Join(sequence, "-"), func(t *testing.T) {
+			f := newHelperFixture(t)
+			ctx := context.Background()
+			var previous api.Agent
+			var previousBinding runtimeBinding
+			for i, runtime := range sequence {
+				thread := fmt.Sprintf("00000000-0000-4000-8000-%012x", i+1)
+				helperTestRuntime(t, f, runtime, thread)
+				a := *f.mustRegister(t).Agent
+				b, _ := readBinding(t, f.owner.hub, a.ID)
+				if b.Runtime != runtime || b.Thread != thread || b.Run != a.RunID {
+					t.Fatalf("handback binding %+v", b)
+				}
+				if i > 0 && (previous.ID != a.ID || previous.RunID == a.RunID) {
+					t.Fatal("handback did not replace same helper run")
+				}
+				if i > 0 {
+					helperTestRuntime(t, f, previousBinding.Runtime, previousBinding.Thread)
+					if _, err := captureCLIOutput(t, func() error {
+						return cmdHelper(f.owner, []string{"reply", "--task", f.task.ID, "1", "--text", "old thread"})
+					}); err == nil {
+						t.Fatal("actual stale owner thread adopted same-host replacement")
+					}
+					helperTestRuntime(t, f, runtime, thread)
+					stale := env{hub: f.owner.hub, task: f.task.ID, agent: previous.ID, runID: previous.RunID}
+					if _, err := captureCLIOutput(t, func() error {
+						return cmdHelper(stale, []string{"reply", "--task", f.task.ID, "1", "--text", "old run"})
+					}); err == nil {
+						t.Fatal("actual stale helper CLI adopted replacement")
+					}
+					if previousBinding.Runtime == "codex" {
+						if err := bindRuntime(stale, previousBinding.Thread); err == nil {
+							t.Fatal("stale bind accepted")
+						}
+					}
+					if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: previous.ID, RunID: previous.RunID, Kind: api.EventHeartbeat}); err == nil {
+						t.Fatal("stale heartbeat accepted")
+					}
+				}
+				probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+				if err := relayHelperHeartbeat(ctx, b, &relayProgress{}, f.c, time.Now(), probe); err != nil {
+					t.Fatal(err)
+				}
+				m, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Text: "handoff wake"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				calls := 0
+				queue := func(_ context.Context, got runtimeBinding, prompt string) error {
+					calls++
+					if got.Run != a.RunID || got.Thread != thread || !strings.Contains(prompt, "tt helper inbox --task "+f.task.ID) {
+						t.Fatalf("wake %+v %q", got, prompt)
+					}
+					return nil
+				}
+				if i > 0 {
+					if err := relayOne(ctx, previousBinding, &relayProgress{}, f.c, time.Now(), queue); err != nil {
+						t.Fatal(err)
+					}
+					if calls != 0 {
+						t.Fatal("stale binding woke")
+					}
+				}
+				if err := relayOne(ctx, b, &relayProgress{}, f.c, time.Now(), queue); err != nil || calls != 1 {
+					t.Fatalf("current wake calls=%d err=%v", calls, err)
+				}
+				if _, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"inbox", "--task", f.task.ID}) }); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := captureCLIOutput(t, func() error {
+					return cmdHelper(f.owner, []string{"reply", "--task", f.task.ID, fmt.Sprint(m.Seq), "--text", "new run answer"})
+				}); err != nil {
+					t.Fatal(err)
+				}
+				agents, err := f.c.ListAgents(ctx, f.task.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				helpers := 0
+				for _, got := range agents {
+					if got.Role == api.AgentRoleOwnerHelper && got.Status != api.AgentClosed && got.Status != api.AgentExited {
+						helpers++
+					}
+				}
+				if helpers != 1 {
+					t.Fatalf("active helpers=%d", helpers)
+				}
+				previous, previousBinding = a, b
+			}
+		})
+	}
+}
+
+func TestHelperCodexRetryThreadIdentity(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	out, err := f.register(t, f.owner, "--request-id", "exact-thread-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := readBinding(t, f.owner.hub, out.Agent.ID)
+	t.Setenv("CODEX_THREAD_ID", "00000000-0000-4000-8000-00000000dead")
+	if _, err := f.register(t, f.owner, "--request-id", "exact-thread-key"); err == nil {
+		t.Fatal("explicit key moved registered thread")
+	}
+	if after, _ := readBinding(t, f.owner.hub, out.Agent.ID); after != before {
+		t.Fatal("retry changed binding")
+	}
+	t.Setenv("CODEX_THREAD_ID", f.thread)
+	replay, err := f.register(t, f.owner, "--request-id", "exact-thread-key")
+	if err != nil || !replay.Replay || replay.Agent.RunID != out.Agent.RunID {
+		t.Fatalf("same-thread replay %+v %v", replay, err)
+	}
+}
+
+// Actual registration, Bridge.Run/Dispatch, real relay/native queue and helper
+// CLI reply against a temporary hub/state and fake Discord REST, never live data.
+func TestHelperCodexDiscordRoundTrip(t *testing.T) {
+	for _, route := range []string{"dm", "thread"} {
+		t.Run(route, func(t *testing.T) {
+			f := newHelperFixture(t)
+			ctx := context.Background()
+			st, err := store.Open(filepath.Join(t.TempDir(), "discord-hub.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			ownerToken := "owner-test-0123456789abcdef0123456789"
+			bridgeToken := "bridge-test-0123456789abcdef01234567"
+			identity, err := server.TokenIdentities(map[string]api.Caller{ownerToken: {Node: "workspace", User: "owner"}, bridgeToken: {Node: api.BridgeNode, User: "owner"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hub := httptest.NewServer(server.New(st, identity))
+			defer hub.Close()
+			c, err := api.NewClient(hub.URL, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Token = ownerToken
+			task, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: "Codex Discord fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.owner = env{hub: hub.URL, task: task.ID, token: ownerToken}
+			f.c = c
+			f.task = task
+			helperTestRuntime(t, f, "codex", f.thread)
+			queueLog := filepath.Join(t.TempDir(), "queue-argv")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + spawn.ShellQuote(queueLog) + "\nprintf 'Queued message\\n'\n"
+			if err := os.WriteFile(filepath.Join(f.bin, "codex"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			a := *f.mustRegister(t).Agent
+			b, _ := readBinding(t, hub.URL, a.ID)
+			if _, err := c.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: a.ID, RunID: a.RunID}); err != nil {
+				t.Fatal(err)
+			}
+			state, err := bridge.OpenState(filepath.Join(t.TempDir(), "bridge.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			if err := state.SetChannel(ctx, task.ID, "project", 0); err != nil {
+				t.Fatal(err)
+			}
+			const ownerID = "709500000000000001"
+			inbound := discord.Message{ID: "709500000000000099", ChannelID: "709500000000000004", Content: "synthetic owner question", Author: discord.User{ID: ownerID}}
+			replyChannel := "709500000000000004"
+			if route == "thread" {
+				inbound.ChannelID = "709500000000000003"
+				inbound.GuildID = "guild"
+				replyChannel = inbound.ID
+			}
+			type sentMessage struct{ channel, content string }
+			var mu sync.Mutex
+			var sent []sentMessage
+			var next atomic.Int64
+			fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/users/@me":
+					json.NewEncoder(w).Encode(discord.User{ID: "bot", Bot: true})
+				case r.URL.Path == "/users/@me/channels":
+					json.NewEncoder(w).Encode(discord.Channel{ID: "709500000000000004", Type: discord.ChannelDM})
+				case strings.HasSuffix(r.URL.Path, "/commands"):
+					w.Write([]byte(`[]`))
+				case strings.HasSuffix(r.URL.Path, "/threads"):
+					json.NewEncoder(w).Encode(discord.Channel{ID: inbound.ID, Type: discord.ChannelPublicThread, ParentID: "709500000000000003"})
+				case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/messages"):
+					w.Write([]byte(`[]`))
+				case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages"):
+					var msg discord.MessageSend
+					json.NewDecoder(r.Body).Decode(&msg)
+					channel := strings.Split(r.URL.Path, "/")[2]
+					mu.Lock()
+					sent = append(sent, sentMessage{channel, msg.Content})
+					mu.Unlock()
+					json.NewEncoder(w).Encode(discord.Message{ID: fmt.Sprint(709500000000001000 + next.Add(1)), ChannelID: channel, Content: msg.Content, Author: discord.User{ID: "bot", Bot: true}})
+				case strings.Contains(r.URL.Path, "/reactions/"):
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == "PATCH":
+					w.Write([]byte(`{"id":"card"}`))
+				default:
+					w.Write([]byte(`[]`))
+				}
+			}))
+			defer fake.Close()
+			bridgeClient, _ := api.NewClient(hub.URL, time.Second)
+			bridgeClient.Token = bridgeToken
+			br, err := bridge.New(bridge.Config{Hub: bridgeClient, Discord: &discord.Client{Base: fake.URL, Token: "synthetic", HTTP: fake.Client()}, AppID: "app", GuildID: "guild", Owners: []string{ownerID}, HelperTask: task.ID, HelperChannel: "709500000000000003", State: state, MirrorInterval: 20 * time.Millisecond, SyncInterval: time.Hour, DigestInterval: time.Hour, CardInterval: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- br.Run(runCtx) }()
+			var stopOnce sync.Once
+			stop := func() {
+				stopOnce.Do(func() {
+					cancel()
+					select {
+					case err := <-done:
+						if err != context.Canceled {
+							t.Errorf("bridge shutdown: %v", err)
+						}
+					case <-time.After(5 * time.Second):
+						t.Error("bridge loops did not join")
+					}
+				})
+			}
+			defer stop()
+
+			wait := func(what string, condition func() bool) {
+				t.Helper()
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					if condition() {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				t.Fatal("timed out: " + what)
+			}
+			wait("bridge startup", func() bool { dm, _ := state.Get(ctx, "helper:dm:"+ownerID); return dm == "709500000000000004" })
+			raw, _ := json.Marshal(inbound)
+			br.Dispatch(discord.Dispatch{Type: "MESSAGE_CREATE", Data: raw})
+			var source api.Message
+			wait("Discord input", func() bool {
+				msgs, _ := c.ListMessages(ctx, task.ID, 0, a.ID, 100)
+				for _, m := range msgs {
+					if m.Source != nil && m.Source.ID == inbound.ID {
+						source = m
+						return true
+					}
+				}
+				return false
+			})
+			if source.To != a.ID || source.Source.Kind != api.SourceDiscord || source.Source.UserID != ownerID || source.From.Node != api.BridgeNode {
+				t.Fatalf("Discord source %+v", source)
+			}
+			// Native inbox path leaves the read cursor with the helper.
+			if err := relayOne(ctx, b, &relayProgress{}, c, time.Now(), nativeQueue); err != nil {
+				t.Fatal(err)
+			}
+			argv, err := os.ReadFile(queueLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(string(argv), "queue\n--thread\n"+f.thread+"\n--message\n") || !strings.Contains(string(argv), "tt helper inbox --task "+task.ID) {
+				t.Fatalf("native queue argv %q", argv)
+			}
+			if current, _ := c.GetAgent(ctx, task.ID, a.ID); current.ReadUpTo >= source.Seq {
+				t.Fatal("relay marked owner message read")
+			}
+			inbox, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"inbox", "--task", task.ID}) })
+			if err != nil || !strings.Contains(inbox, inbound.Content) {
+				t.Fatalf("helper inbox %q %v", inbox, err)
+			}
+			answer := "synthetic Codex answer"
+			reply := func() error {
+				_, err := captureCLIOutput(t, func() error {
+					return cmdHelper(f.owner, []string{"reply", "--task", task.ID, fmt.Sprint(source.Seq), "--text", answer})
+				})
+				return err
+			}
+			if err := reply(); err != nil {
+				t.Fatal(err)
+			}
+			wait("Discord answer", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, m := range sent {
+					if m.channel == replyChannel && strings.Contains(m.content, answer) {
+						return true
+					}
+				}
+				return false
+			})
+			if err := reply(); err != nil {
+				t.Fatal(err)
+			} // identical CLI retry posts once
+			br.Dispatch(discord.Dispatch{Type: "MESSAGE_CREATE", Data: raw}) // Gateway redelivery is idempotent
+			// Stop and join loops before final route/count and provenance inspection.
+			time.Sleep(100 * time.Millisecond)
+			stop()
+			mu.Lock()
+			answers := 0
+			for _, m := range sent {
+				if m.channel != "project" && strings.Contains(m.content, answer) {
+					answers++
+					if m.channel != replyChannel {
+						t.Fatalf("wrong reply route %q", m.channel)
+					}
+				}
+			}
+			mu.Unlock()
+			if answers != 1 {
+				t.Fatalf("Discord answers=%d", answers)
+			}
+			msgs, err := c.ListMessages(ctx, task.ID, source.Seq, "", 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies := 0
+			for _, m := range msgs {
+				if m.Text == answer {
+					replies++
+					if m.From.AgentID != a.ID || m.ReplyTo != source.Seq {
+						t.Fatalf("reply provenance %+v", m)
+					}
+				}
+			}
+			if replies != 1 {
+				t.Fatalf("hub replies=%d", replies)
+			}
+		})
+	}
+}
+
+func TestHelperCodexPendingRetryCannotMoveThread(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	upstream, _ := url.Parse(f.owner.hub)
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	var drop atomic.Bool
+	drop.Store(true)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/owner-helper") && drop.Swap(false) {
+			body, _ := io.ReadAll(r.Body)
+			resp, err := http.Post(f.owner.hub+r.URL.Path, "application/json", bytes.NewReader(body))
+			if err == nil {
+				resp.Body.Close()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer front.Close()
+	e := env{hub: front.URL, task: f.task.ID}
+	if _, err := f.register(t, e); err == nil {
+		t.Fatal("lost reply reported success")
+	}
+	pending, err := loadOwnerHelperFile(front.URL, f.task.ID)
+	if err != nil || pending.PendingRequest == "" {
+		t.Fatalf("pending %+v %v", pending, err)
+	}
+	t.Setenv("CODEX_THREAD_ID", "00000000-0000-4000-8000-00000000dead")
+	if _, err := f.register(t, e, "--request-id", pending.PendingRequest); err == nil {
+		t.Fatal("pending explicit retry moved thread")
+	}
+	next, err := f.register(t, e)
+	if err != nil || next.Replay || next.Registration.RequestID == pending.PendingRequest {
+		t.Fatalf("new thread reused pending registration %+v %v", next, err)
+	}
+	b, _ := readBinding(t, front.URL, next.Agent.ID)
+	if b.Thread != os.Getenv("CODEX_THREAD_ID") || b.Run != next.Agent.RunID {
+		t.Fatalf("new thread binding %+v", b)
+	}
+}
+
+func TestHelperCodexOutsideTmux(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	a := *f.mustRegister(t).Agent
+	t.Setenv("TMUX", "")
+	text, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"register", "--task", f.task.ID}) })
+	if err != nil || !strings.Contains(text, "registered without wake") {
+		t.Fatalf("outside tmux %q %v", text, err)
+	}
+	if _, ok := readBinding(t, f.owner.hub, a.ID); ok {
+		t.Fatal("outside tmux kept wake binding")
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != "" {
+		t.Fatalf("old session tags %v", tags)
+	}
+	if state, err := loadOwnerHelperFile(f.owner.hub, f.task.ID); err != nil || state.Runtime != "codex" || state.Thread != f.thread {
+		t.Fatalf("outside tmux state %+v %v", state, err)
 	}
 }

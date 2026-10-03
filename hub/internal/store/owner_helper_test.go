@@ -72,7 +72,7 @@ func TestOwnerHelperRegister(t *testing.T) {
 		t.Fatalf("events %+v", events)
 	}
 	for _, bad := range []api.RegisterOwnerHelperRequest{
-		{Host: "h", Session: "owner", Runtime: "codex", RequestID: "bad-runtime"},
+		{Host: "h", Session: "owner", Runtime: "unsupported", RequestID: "bad-runtime"},
 		{Host: "h", Session: "bad name", Runtime: "claude", RequestID: "bad-session"},
 		{Session: "owner", Runtime: "claude", RequestID: "bad-host"},
 		{Host: "h", Session: "owner", Runtime: "claude", Cwd: "relative", RequestID: "bad-cwd"},

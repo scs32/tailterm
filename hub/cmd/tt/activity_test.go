@@ -1914,3 +1914,47 @@ func TestActivityCLIShowsProviderBlocked(t *testing.T) {
 		t.Fatalf("queue member nil %q", got)
 	}
 }
+
+func TestOwnerHelperCodexDiscoveryHeartbeatAndOffline(t *testing.T) {
+	f := newHelperFixture(t)
+	helperTestRuntime(t, f, "codex", f.thread)
+	processDir := t.TempDir()
+	if err := os.Symlink("/bin/sleep", filepath.Join(processDir, "codex")); err != nil {
+		t.Fatal(err)
+	}
+	f.tmux(t, "new-session", "-d", "-s", "codex-owner", filepath.Join(processDir, "codex")+" 300")
+	t.Setenv("TMUX_PANE", f.tmux(t, "display-message", "-p", "-t", "codex-owner:", "#{pane_id}"))
+	a := *f.mustRegister(t).Agent
+	b, _ := readBinding(t, f.owner.hub, a.ID)
+	receipt, err := nativeRuntimeDiscovery(context.Background(), b, a)
+	if err != nil || receipt.Run != a.RunID || receipt.Session != "codex-owner" || receipt.PID <= 0 {
+		t.Fatalf("Codex discovery %+v %v", receipt, err)
+	}
+	probe := func(got runtimeBinding, agent api.Agent) (bool, bool, error) {
+		_, err := nativeRuntimeDiscovery(context.Background(), got, agent)
+		return err == nil, err == nil, err
+	}
+	now := time.Now()
+	var p relayProgress
+	if err := relayHelperHeartbeat(context.Background(), b, &p, f.c, now, probe); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.c.GetAgent(context.Background(), f.task.ID, a.ID)
+	if err != nil || !current.Online {
+		t.Fatalf("helper heartbeat %+v %v", current, err)
+	}
+	previous := current.LastSeenAt
+	f.tmux(t, "kill-session", "-t", "codex-owner")
+	if err := relayHelperHeartbeat(context.Background(), b, &p, f.c, now.Add(31*time.Second), probe); err != nil {
+		t.Fatal(err)
+	}
+	current, err = f.c.GetAgent(context.Background(), f.task.ID, a.ID)
+	if err != nil || !current.LastSeenAt.Equal(previous) {
+		t.Fatalf("missing Codex process heartbeated %+v %v", current, err)
+	}
+	var cursor activityCursor
+	got := activityState(&cursor, a, 1, false, false, nil, now.Add(2*time.Minute), activityDefaults())
+	if got.State != "unknown" || got.Reason != "owner session offline" {
+		t.Fatalf("Codex helper absence %+v", got)
+	}
+}

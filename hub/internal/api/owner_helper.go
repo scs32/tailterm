@@ -1,8 +1,8 @@
 package api
 
-// The owner helper (docs/owner-helper.md): the owner's own Claude Code
+// The owner helper (docs/owner-helper.md): the owner's own Claude Code or Codex
 // session, registered as a project agent so it can be a delegation-window
-// delegate and be woken like other Claude agents. It is never leased, counted
+// delegate and be woken through its exact runtime binding. It is never leased, counted
 // as a team member or handler, or closed with an item team.
 
 import (
@@ -68,8 +68,8 @@ func ValidateRegisterOwnerHelper(req *RegisterOwnerHelperRequest) error {
 		return fmt.Errorf("%w: invalid session name", ErrInvalid)
 	case req.Host == "" || !ValidText(req.Host, 253):
 		return fmt.Errorf("%w: host is required", ErrInvalid)
-	case req.Runtime != "claude":
-		return fmt.Errorf("%w: the owner helper runtime is claude", ErrInvalid)
+	case req.Runtime != "claude" && req.Runtime != "codex":
+		return fmt.Errorf("%w: the owner helper runtime must be claude or codex", ErrInvalid)
 	case !ValidText(req.Cwd, 1024) || (req.Cwd != "" && !filepath.IsAbs(req.Cwd)):
 		return fmt.Errorf("%w: cwd must be an absolute path", ErrInvalid)
 	}

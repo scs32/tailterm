@@ -6,13 +6,14 @@ at `e9504a7`, after owner delegation windows (`ee47773`).
 
 ## What it is
 
-The owner's own Claude Code session (the owner's out-of-band helper) can join a
+The owner's own Claude Code or Codex session (the owner's out-of-band helper) can join a
 project as that project's one **owner helper**: an agent with role
 `owner_helper`. Being an agent lets it:
 
 - be a [delegation window](owner-delegation-windows.md) delegate, and answer the
   owner's routed requests with a rationale;
-- be woken by the host relay with the same safe Claude wake as other Claude agents.
+- be woken by the host relay through native `codex queue --thread` for Codex,
+  or the existing safe transcript/pane wake for Claude Code.
 
 It is not a team member. It is never leased to a queue entry, never counted as a
 team member or database handler, and never closed with an item team. The
@@ -28,7 +29,7 @@ owner session relays them. See [Project roles](project-roles.md).
 
 ## Register
 
-Run this in the owner's Claude Code session, in a dedicated one-pane tmux session:
+Run this in the owner's Claude Code or Codex session, in a dedicated one-pane tmux session:
 
 ```sh
 tt helper register --task tsk_...            # default agent name: owner-helper
@@ -37,8 +38,11 @@ tt helper register --task tsk_... --name N   # another name (first registration 
 
 It checks, before writing anything:
 
-- it runs inside Claude Code (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`), and the
-  session's transcript `~/.claude/projects/*/<session id>.jsonl` exists;
+- Claude Code supplies `CLAUDECODE` and its real `CLAUDE_CODE_SESSION_ID`, with
+  the transcript `~/.claude/projects/*/<session id>.jsonl` present; or Codex
+  supplies its real `CODEX_THREAD_ID`, with no Claude identity variables. Mixed
+  identities are refused. Codex registration resolves the installed `codex`
+  executable and optional `CODEX_HOME` to absolute paths before writing state;
 - it is not an agent session, unless that session carries this project's helper
   identity (a pane of the helper's own tmux session);
 - the tmux session name is a valid agent session name (rename it if not);
@@ -74,8 +78,10 @@ Then, on this host, `tt helper register`:
 3. unsets those tags on the previous helper session when it registered from another
    tmux session, only if that exact session (ID and creation time) still names this
    helper;
-4. writes the relay's wake binding, whose thread is the **real** Claude session ID
-   (not the derived ID spawned agents use), with role `owner_helper`;
+4. writes the relay's wake binding, whose thread is the **real** runtime session/thread ID
+   (not a derived or spoofed Claude ID), with runtime `claude` or `codex` and
+   role `owner_helper`. Codex bind/auto-bind preserves this registration-owned
+   binding and refuses a foreign thread or stale run;
 5. writes a private helper file (`<relay state>/<hub hash>-<task>.owner-helper.json`,
    0600, no token).
 
@@ -84,8 +90,10 @@ _registered without wake_: the relay cannot wake that session and it shows offli
 
 **Retries.** Without `--request-id`, each registration gets a new request ID. It is
 saved before the call; if the outcome is unknown (timeout, lost reply), running the
-command again replays that same ID, so the hub returns the original result instead
-of registering twice. A definite refusal or a verified result clears it. So a
+command again from the same runtime/thread replays that same ID, so the hub
+returns the original result instead of registering twice. Pending retries include
+the exact runtime/thread; an explicit key cannot move the saved registration to
+another thread. A definite refusal or a verified result clears it. So a
 deliberate registration after a confirmed one is always a new action: after a close,
 a fresh agent; after an exit, a new run; while live, a replaced run. An explicit
 `--request-id` keeps plain replay semantics.
@@ -94,9 +102,34 @@ a fresh agent; after an exit, a new run; while live, a replaced run. An explicit
 ID, and the old binding's transcript no longer moves. The wake then fails closed
 (transcript unavailable) until you register again.
 
+## Hand off between Claude Code and Codex
+
+Feature `wi_f771e8367facf50f`, order #22120, builder assignment #22213 adds
+both-runtime support. Deployment requires a separately ordered coordinated hub,
+Mini `tt`, and relay update; source changes alone do not update a running relay.
+
+1. Open the destination runtime in its own dedicated one-pane tmux session.
+   Use the real runtime-provided identity: `CODEX_THREAD_ID` for Codex or
+   `CLAUDE_CODE_SESSION_ID`/`CLAUDECODE` for Claude. Do not copy the old runtime's
+   variables or manufacture a Claude identity for Codex.
+2. In that destination session, run `tt helper register --task tsk_...` with
+   a fresh request key (or omit `--request-id`). Registration replaces the same
+   open helper's run and keeps one active helper. Tags on the previous local
+   session are cleared only after exact ownership verification.
+3. Run `tt helper inbox --task tsk_...` in the destination session. The relay
+   follows its newly registered exact thread/run; the previous run cannot wake,
+   heartbeat or reply by adopting the host's newer helper file.
+4. To hand back, repeat these steps in the other runtime. Re-register after a
+   Codex restart/new thread as well as after a Claude restart or `/clear`.
+
+Codex uses its registered executable and `CODEX_HOME` for native queue delivery.
+Both inbox and broker wakes name `tt helper inbox --task T`. Outside tmux either
+runtime still registers without automatic wake and shows offline. Existing
+retirement, exact pane/process, cleanup and one-project-per-session rules apply.
+
 ## Acting as the helper
 
-Claude Code's Bash environment does not persist, and the owner's session stays the
+The runtime's shell environment may not persist, and the owner's session stays the
 owner for ordinary `tt` commands. To act as the helper for one command:
 
 ```sh
@@ -108,7 +141,8 @@ tt helper inbox --task tsk_...     # the helper's unread messages, marked read
 TAILTERM_RUN=… TAILTERM_AGENT_NAME=…` after checking that the hub's helper is live
 and its current run is the one registered on this host. It never prints the token;
 the owner's own configuration supplies it. Both commands refuse when the helper was
-registered again elsewhere, closed or exited.
+registered again elsewhere, closed or exited, or when a caller supplies a
+stale run or a different runtime/thread.
 
 ## Talking from Discord
 
@@ -172,10 +206,12 @@ at the next adoption or reload).
 The relay must run on the owner's host (`tt relay`). For the helper it:
 
 - heartbeats at most every 30 seconds, only while the exact tmux pane, its session
-  tags and one Claude process under that pane all verify. With the session gone
+  tags and one process of the registered runtime under that pane all verify. With the session gone
   there is no heartbeat, the helper is offline within 90 seconds, and the relay's
   usual _agent offline_ skip applies;
-- wakes it only when that tmux session has **exactly one pane** (otherwise the wake
+- uses native queue delivery to the registered exact Codex thread, with the
+  helper inbox command in both inbox and broker prompts;
+- for Claude, wakes it only when that tmux session has **exactly one pane** (otherwise the wake
   is refused as _ambiguous owned runtime pane_ and nothing is typed), with
   `Tailterm messages N. Run tt helper inbox --task T.` or
   `Tailterm obligations N. Run tt helper inbox --task T. Wake J.`;
@@ -281,5 +317,8 @@ node --test tests/owner-helper.test.js
 ```
 
 All tests use temporary hubs and databases, private tmux sockets (`TT_TMUX_SOCKET`),
-a temporary `HOME` with a synthetic Claude transcript, and a fake `claude` process
-(a symlink to `sleep`). None touches the live hub or the owner's session.
+a temporary `HOME` with synthetic transcripts and fake runtime processes.
+Codex fixtures also use exported `Bridge.Run`/`Dispatch`, temporary bridge state,
+fake Discord REST and native queue argv to verify DM/thread replies and retries.
+Both runtime handback sequences exercise stale CLI/run/thread refusals. None
+touches the live hub or the owner's session.
