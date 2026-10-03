@@ -206,6 +206,9 @@ function fixture(t) {
     join(cwd, "package.json"),
     JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }),
   );
+  writeFileSync(join(cwd, ".gitignore"), "node_modules/\n");
+  mkdirSync(join(cwd, "node_modules"));
+  writeFileSync(join(cwd, "node_modules/.package-lock.json"), "{}");
   git("add", ".");
   git("commit", "-qm", "fixture");
   const base = git("rev-parse", "HEAD");
@@ -313,7 +316,7 @@ test("free-space reserve rejects before run and before retry without filling dis
     () =>
       runPlan(plan, f.cwd, output, {
         minFreeBytes: 10,
-        getAvailableBytes: () => (++probes < 3 ? 10 : 9),
+        getAvailableBytes: () => (++probes < 4 ? 10 : 9),
       }),
     /Insufficient free space/,
   );
@@ -322,7 +325,9 @@ test("free-space reserve rejects before run and before retry without filling dis
     "x",
     "only the first attempt ran",
   );
-  assert.equal(probes, 3);
+  assert.equal(probes, 4);
+  assert.equal(readHostState(hostLockFile()).holder, null, "retry refusal releases its lease");
+  assert(!existsSync(join(output, "receipt.json")), "no receipt after refused retry");
   const receipt = await runPlan(plan, f.cwd, output, {
     minFreeBytes: 0,
     getAvailableBytes: () => 10,
@@ -759,6 +764,7 @@ test("attached or wrong SHA cannot execute checks", async (t) => {
 
 test("browser run refuses missing prerequisite assets before commands execute", async (t) => {
   const f = fixture(t);
+  rmSync(join(f.cwd, "node_modules"), { recursive: true });
   writeFileSync(join(f.cwd, "tests/fixture.mjs"), "// browser.launch(");
   writeFileSync(
     join(f.cwd, "verification/matrix.json"),
@@ -788,7 +794,7 @@ test("test binary build failure starts no matrix check", async (t) => {
   writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\n");
   mkdirSync(join(f.cwd, "wasm"));
   writeFileSync(join(f.cwd, "wasm/tailserve.wasm"), "fixture");
-  mkdirSync(join(f.cwd, "node_modules"));
+  mkdirSync(join(f.cwd, "node_modules"), { recursive: true });
   writeFileSync(join(f.cwd, "node_modules/.package-lock.json"), "{}");
   mkdirSync(join(f.cwd, ".build"));
   for (const name of ["test.wasm", "speech-fixture.wav", "go-modules.txt"])
@@ -1377,7 +1383,7 @@ function browserFixture(t, suites) {
   writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\n");
   mkdirSync(join(f.cwd, "wasm"));
   writeFileSync(join(f.cwd, "wasm/tailserve.wasm"), "fixture");
-  mkdirSync(join(f.cwd, "node_modules"));
+  mkdirSync(join(f.cwd, "node_modules"), { recursive: true });
   writeFileSync(join(f.cwd, "node_modules/.package-lock.json"), "{}");
   mkdirSync(join(f.cwd, ".build"));
   for (const name of ["test.wasm", "speech-fixture.wav", "go-modules.txt"])
@@ -1784,6 +1790,246 @@ function plannedFixture(t, source) {
 }
 const holdHost = (item) =>
   acquireHostLock({ item, agent: "holder", runTimeoutMs: 60000, pollMs: 20 });
+
+// wi_789dc79d7eff49bc / order21693: refusal must precede host admission.
+const prerequisitePaths = [
+  "node_modules/.package-lock.json", "wasm/tailserve.wasm", ".build/test.wasm",
+  ".build/speech-fixture.wav", ".build/go-modules.txt",
+];
+function preflightFixture(t, browser = false) {
+  const f = browser
+    ? browserFixture(t, { "fixture-browser.mjs": "console.log('browser ran');" })
+    : fixture(t);
+  // All prerequisites are ignored, just as on real detached worktrees. Their
+  // removal must exercise the input gate rather than clean-candidate rejection.
+  if (browser) {
+    writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\nwasm/tailserve.wasm\n");
+    f.git("rm", "--cached", "wasm/tailserve.wasm");
+    f.git("add", ".gitignore");
+    f.git("commit", "-qm", "ignore generated wasm");
+  }
+  const baseCommit = f.git("rev-parse", "HEAD");
+  const prefix = browser ? "client/" : "docs/";
+  const commit = commitChange(f, prefix + "preflight.txt", "fix\n", "preflight candidate");
+  const context = { baseCommit, commit };
+  return { ...f, context, plan: makePlan({ ...context, owned: [prefix] }, f.cwd) };
+}
+const preflightRun = (mode, f, output, options) => mode === "run"
+  ? runPlan(f.plan, f.cwd, output, options)
+  : runTargeted(f.context, f.cwd, output, options);
+
+test("preflight refuses missing or unreadable selected inputs and invalid space in both run modes before acquisition", async (t) => {
+  const homeRoot = tempDir(t, "verification-preflight-homes-");
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = homeRoot;
+  t.after(() => {
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+  });
+  for (const browser of [false, true]) {
+    const f = preflightFixture(t, browser);
+    for (const mode of ["run", "targeted"]) {
+      let acquisitions = 0, homes = 0;
+      const options = {
+        getAvailableBytes: () => 2147483648,
+        acquireHostLock: () => { acquisitions++; throw new Error("unexpected acquisition"); },
+        removeHome: (home) => { homes++; removeVerifierHome(home); },
+      };
+      const refuse = async (overrides, expected) => {
+        const output = tempDir(t, "verification-preflight-logs-");
+        const directoriesBefore = readdirSync(homeRoot);
+        await assert.rejects(preflightRun(mode, f, output, { ...options, ...overrides }), expected);
+        assert.equal(acquisitions, 0, "no host acquisition call");
+        assert.deepEqual(readdirSync(output), [], "no commands, sidecars or receipts");
+        assert.equal(homes, 0, "no verifier home cleanup needed");
+        assert.deepEqual(readdirSync(homeRoot), directoriesBefore, "no verifier home allocated");
+      };
+      for (const path of browser ? prerequisitePaths : prerequisitePaths.slice(0, 1)) {
+        const bytes = readFileSync(join(f.cwd, path));
+        rmSync(join(f.cwd, path));
+        try {
+          await refuse({}, new RegExp("Missing prerequisite: " + path.replace(/[.*]/g, "\\$&")));
+        } finally {
+          writeFileSync(join(f.cwd, path), bytes);
+        }
+        await refuse({ readPrerequisiteFile: (file) => {
+          if (file === join(f.cwd, path)) throw Object.assign(new Error("synthetic access denied"), { code: "EACCES" });
+          return readFileSync(file);
+        } }, /Unreadable prerequisite: .*synthetic access denied/);
+      }
+      for (const reserve of [-1, NaN, null, Infinity, 1.5])
+        await refuse({ minFreeBytes: reserve }, /Invalid --min-free-bytes reserve/);
+      await refuse({ minFreeBytes: 10, getAvailableBytes: () => 9 }, /Insufficient free space/);
+      for (const free of [-1, NaN, Infinity, undefined, 1.5])
+        await refuse({ getAvailableBytes: () => free }, /Unable to determine free space/);
+      await refuse({ getAvailableBytes: () => { throw new Error("synthetic statfs failure"); } }, /Unable to determine free space.*synthetic statfs failure/);
+    }
+  }
+});
+
+test("preflight derives unique npm and browser inputs while Go-only admission reads neither", async (t) => {
+  const f = preflightFixture(t, true);
+  const read = [];
+  const reader = (file) => { read.push(file); return readFileSync(file); };
+  const npm = [{ id: "npm-unit", argv: ["npm", "test"] }];
+  const browser = [
+    ...npm, { id: "test-browser", argv: ["node", "test.mjs"] },
+    { id: "other", argv: ["node", "other.mjs"], environment: { TEST_BROWSER: "both" } },
+  ];
+  assert.deepEqual(matrixRunner.readPrerequisites(npm, f.cwd, reader).map((p) => p.path), prerequisitePaths.slice(0, 1));
+  assert.deepEqual(read.splice(0), [join(f.cwd, prerequisitePaths[0])]);
+  const prerequisites = matrixRunner.readPrerequisites(browser, f.cwd, reader);
+  assert.deepEqual(prerequisites.map((p) => p.path), prerequisitePaths);
+  assert.deepEqual(read.splice(0), prerequisitePaths.map((path) => join(f.cwd, path)));
+  for (const entry of prerequisites)
+    assert.equal(entry.sha256, digest(readFileSync(join(f.cwd, entry.path), "utf8")));
+  assert.deepEqual(matrixRunner.readPrerequisites([{ id: "go-test", argv: ["go", "test"], cwd: "hub" }], f.cwd, reader), []);
+  assert.deepEqual(read, []);
+
+  for (const browser of [false, true]) {
+    const prepared = browser ? f : preflightFixture(t);
+    for (const mode of ["run", "targeted"]) {
+      await assert.rejects(preflightRun(mode, prepared, tempDir(t, "verification-input-preflight-"), {
+        getAvailableBytes: () => 2147483648,
+        readPrerequisiteFile: reader,
+        acquireHostLock: () => { throw new Error("selected inputs passed preflight"); },
+      }), /selected inputs passed preflight/);
+      assert.deepEqual(read.splice(0), (browser ? prerequisitePaths : prerequisitePaths.slice(0, 1)).map((path) => join(prepared.cwd, path)));
+    }
+  }
+
+  mkdirSync(join(f.cwd, "hub"));
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.24.0\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "Go fixture setup");
+  const baseCommit = f.git("rev-parse", "HEAD");
+  const commit = commitChange(f, "hub/pkg/a.go", "package pkg\n", "Go-only fix");
+  const go = { ...f, context: { baseCommit, commit } };
+  go.plan = makePlan({ ...go.context, owned: ["hub/"] }, f.cwd);
+  rmSync(join(f.cwd, "node_modules"), { recursive: true });
+  rmSync(join(f.cwd, "wasm/tailserve.wasm"));
+  rmSync(join(f.cwd, ".build"), { recursive: true });
+  for (const mode of ["run", "targeted"]) {
+    let admissions = 0;
+    await assert.rejects(preflightRun(mode, go, tempDir(t, "verification-go-preflight-"), {
+      getAvailableBytes: () => 2147483648,
+      readPrerequisiteFile: () => assert.fail("Go-only has no npm or browser inputs"),
+      acquireHostLock: () => { admissions++; throw new Error("prepared Go plan reached admission"); },
+    }), /prepared Go plan reached admission/);
+    assert.equal(admissions, 1);
+  }
+});
+
+test("preflight rechecks inputs and space after admission and hashes the held bytes", async (t) => {
+  for (const [mode, browser] of [["run", false], ["run", true], ["targeted", false], ["targeted", true]]) {
+    for (const change of ["delete", "unreadable", "space", "content"]) {
+      const f = preflightFixture(t, browser);
+      const output = tempDir(t, "verification-held-preflight-");
+      const changedPath = prerequisitePaths[browser ? 2 : 0];
+      const path = join(f.cwd, changedPath);
+      let admitted = false, released = false, homes = 0;
+      const options = {
+        minFreeBytes: 10,
+        getAvailableBytes: () => admitted && change === "space" ? 9 : 10,
+        readPrerequisiteFile: (file) => {
+          if (admitted && change === "unreadable")
+            throw Object.assign(new Error("became unreadable"), { code: "EACCES" });
+          return readFileSync(file);
+        },
+        acquireHostLock: async (args) => {
+          const lease = await acquireHostLock(args);
+          admitted = true;
+          if (change === "delete") rmSync(path);
+          if (change === "content") writeFileSync(path, "new held bytes");
+          return { ...lease, release: async (summary) => {
+            await lease.release(summary);
+            released = true;
+          } };
+        },
+        removeHome: (home) => { homes++; removeVerifierHome(home); },
+      };
+      if (change === "content") {
+        const receipt = await preflightRun(mode, f, output, options);
+        assert.deepEqual(receipt.prerequisites.map((p) => p.path), browser ? prerequisitePaths : prerequisitePaths.slice(0, 1));
+        assert.equal(receipt.prerequisites.find((p) => p.path === changedPath).sha256, digest("new held bytes"));
+        assert(receipt.checks.every((c) => c.exitCode === 0));
+        assert.equal(homes, 1);
+      } else {
+        await assert.rejects(preflightRun(mode, f, output, options),
+          change === "space" ? /Insufficient free space/ : change === "delete" ? /Missing prerequisite/ : /Unreadable prerequisite/);
+        assert.equal(homes, 0, "held refusal allocates no home");
+        assert.deepEqual(readdirSync(output).sort(), ["host-lock.json", "host-lock.log"], "no command or receipt");
+      }
+      assert(admitted && released, "lease released after held recheck");
+      assert.equal(readHostState(hostLockFile()).holder, null);
+      assert.deepEqual(readHostState(hostLockFile()).waiters, []);
+    }
+  }
+});
+
+test("preflight CLI missing npm dependencies never joins or disturbs a private holder", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('must not run');");
+  rmSync(join(f.cwd, "node_modules"), { recursive: true, force: true });
+  const holder = await holdHost("wi_preflight_holder");
+  try {
+    const state = readFileSync(hostLockFile(), "utf8");
+    const journal = readJournal(hostLockFile());
+    const output = tempDir(t, "verification-preflight-cli-");
+    const result = spawnSync(process.execPath, [matrixScript, "run", planFile, output], {
+      cwd: f.cwd, env: { ...process.env }, encoding: "utf8", timeout: 1500,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Missing prerequisite: node_modules\/\.package-lock\.json/);
+    assert.deepEqual(readdirSync(output), [], "no host record, command log or receipt");
+    assert.equal(readFileSync(hostLockFile(), "utf8"), state, "holder and waitlist unchanged");
+    assert.deepEqual(readJournal(hostLockFile()), journal, "no request or grant");
+  } finally {
+    await holder.release();
+  }
+});
+
+test("preflight CLI rejects every missing browser asset, unreadable inputs and low space without joining in both modes", async (t) => {
+  const f = preflightFixture(t, true);
+  const inputs = tempDir(t, "verification-preflight-cli-inputs-");
+  const homeRoot = tempDir(t, "verification-preflight-cli-homes-");
+  const holder = await holdHost("wi_browser_preflight_holder");
+  try {
+    for (const mode of ["run", "targeted"]) {
+      const input = join(inputs, mode + ".json");
+      writeFileSync(input, JSON.stringify(mode === "run" ? f.plan : f.context));
+      const refuse = (flags, expected) => {
+        const state = readFileSync(hostLockFile(), "utf8");
+        const journal = readJournal(hostLockFile());
+        const output = tempDir(t, "verification-preflight-cli-logs-");
+        const result = spawnSync(process.execPath, [matrixScript, mode, input, output, "--priority", "normal", ...flags], {
+          cwd: f.cwd, env: { ...process.env, TMPDIR: homeRoot }, encoding: "utf8", timeout: 10000,
+        });
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, expected);
+        assert.deepEqual(readdirSync(output), [], "no record, command log or receipt");
+        assert.deepEqual(readdirSync(homeRoot), [], "no verifier home");
+        assert.equal(readFileSync(hostLockFile(), "utf8"), state, "existing holder undisturbed");
+        assert.deepEqual(readJournal(hostLockFile()), journal, "no request or grant");
+      };
+      for (const path of prerequisitePaths) {
+        const file = join(f.cwd, path), bytes = readFileSync(file);
+        rmSync(file);
+        try {
+          refuse([], new RegExp("Missing prerequisite: " + path.replace(/[.*]/g, "\\$&")));
+          mkdirSync(file);
+          refuse([], /Unreadable prerequisite:/);
+        } finally {
+          rmSync(file, { recursive: true, force: true });
+          writeFileSync(file, bytes);
+        }
+      }
+      refuse(["--min-free-bytes", "9007199254740991"], /Insufficient free space/);
+      refuse(["--min-free-bytes", "NaN"], /--min-free-bytes requires a nonnegative integer/);
+    }
+  } finally {
+    await holder.release();
+  }
+});
 
 test("V1 an uncontended run records the twelve host keys in its receipt, matching the sidecar, inside the receipt schema", async (t) => {
   assert(hostLockFile().startsWith(tmpdir() + "/") || hostLockFile().startsWith("/private" + tmpdir() + "/"));

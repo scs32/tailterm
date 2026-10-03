@@ -645,13 +645,50 @@ export function availableBytes(path = tmpdir()) {
 export function requireFreeSpace(reserve, getAvailableBytes = availableBytes) {
   if (!Number.isSafeInteger(reserve) || reserve < 0)
     throw new Error("Invalid --min-free-bytes reserve");
-  const free = getAvailableBytes();
+  let free;
+  try {
+    free = getAvailableBytes();
+  } catch (error) {
+    throw new Error("Unable to determine free space for verifier home: " + error.message, { cause: error });
+  }
   if (!Number.isSafeInteger(free) || free < 0)
     throw new Error("Unable to determine free space for verifier home");
   if (free < reserve)
     throw new Error(
       `Insufficient free space for verifier home: ${free} bytes available, ${reserve} bytes required`,
     );
+}
+
+const isBrowserCheck = (check) =>
+  check.id.includes("browser") || check.environment?.TEST_BROWSER;
+
+// Readability is checked by reading the bytes, not just testing existence.
+// Call again after admission: these hashes must describe the held run's inputs.
+export function readPrerequisites(checks, cwd, read = readFileSync) {
+  const browser = checks.some(isBrowserCheck);
+  const paths = new Set();
+  if (browser || checks.some((check) => check.argv[0] === "npm"))
+    paths.add("node_modules/.package-lock.json");
+  if (browser)
+    for (const path of [
+      "wasm/tailserve.wasm",
+      ".build/test.wasm",
+      ".build/speech-fixture.wav",
+      ".build/go-modules.txt",
+    ]) paths.add(path);
+  return [...paths].map((path) => {
+    let bytes;
+    try {
+      bytes = read(join(cwd, path));
+    } catch (error) {
+      throw new Error(
+        (error.code === "ENOENT" ? "Missing prerequisite: " : "Unreadable prerequisite: ") +
+          path + (error.code === "ENOENT" ? "" : ": " + error.message),
+        { cause: error },
+      );
+    }
+    return { path, sha256: createHash("sha256").update(bytes).digest("hex") };
+  });
 }
 
 // Go makes module-cache directories read-only. Only walk the exact home this
@@ -1138,7 +1175,7 @@ export async function runPlan(plan, cwd, output, options = {}) {
 // concurrency decisions can compare like with like.
 export function checkSet(checks) {
   const go = checks.some(isGoCheck),
-    browser = checks.some((c) => c.id.includes("browser") || c.environment?.TEST_BROWSER);
+    browser = checks.some(isBrowserCheck);
   if (checks.length && checks.every(isGoCheck)) return "go-only";
   return go && browser ? "full" : browser ? "browser" : "unit";
 }
@@ -1161,8 +1198,11 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   if (!isAbsolute(output) || relative(cwd, output).split("/")[0] !== "..")
     throw new Error("Logs/receipt must be outside worktree");
   mkdirSync(output, { recursive: true });
+  const { minFreeBytes = DEFAULT_MIN_FREE_BYTES } = options;
+  requireFreeSpace(minFreeBytes, options.getAvailableBytes);
+  readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   const hostLock = options.hostLock || {};
-  const lease = await acquireHostLock({
+  const lease = await (options.acquireHostLock || acquireHostLock)({
     runTimeoutMs: planRunTimeout(plan),
     ...hostLock,
     kind: plan.targeted ? "targeted" : "run",
@@ -1217,6 +1257,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     onGroup,
   } = options;
   requireFreeSpace(minFreeBytes, getAvailableBytes);
+  const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   const home = mkdtempSync(join(tmpdir(), "tailterm-verifier-"));
   const receiptPath = join(output, receiptName);
   let receiptWritten = false;
@@ -1236,26 +1277,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       VERIFICATION_JOBS: String(jobs),
     };
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
-    const prerequisites = [];
-    if (
-      plan.checks.some(
-        (c) => c.id.includes("browser") || c.environment.TEST_BROWSER,
-      )
-    ) {
-      for (const p of [
-        "node_modules/.package-lock.json",
-        "wasm/tailserve.wasm",
-        ".build/test.wasm",
-        ".build/speech-fixture.wav",
-        ".build/go-modules.txt",
-      ]) {
-        const f = join(cwd, p);
-        if (!existsSync(f)) throw new Error("Missing prerequisite: " + p);
-        prerequisites.push({
-          path: p,
-          sha256: createHash("sha256").update(readFileSync(f)).digest("hex"),
-        });
-      }
+    if (plan.checks.some(isBrowserCheck)) {
       environment.PLAYWRIGHT_BROWSERS_PATH =
         process.env.PLAYWRIGHT_BROWSERS_PATH ||
         join(process.env.HOME, "Library/Caches/ms-playwright");
