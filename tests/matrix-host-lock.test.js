@@ -1052,7 +1052,9 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   const path = lockFile(t), markers = [join(tempDir(t), "a.json"), join(tempDir(t), "b.json")], done = join(tempDir(t), "done");
   const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process';
     const tmux=spawnSync('tmux',['-L','two-run','new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
-    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
+    const tmuxPid=Number(spawnSync('tmux',['-L','two-run','display-message','-p','#{pid}'],{encoding:'utf8'}).stdout.trim());
+    process.once('SIGTERM',()=>{spawnSync('tmux',['-L','two-run','kill-server']);process.exit(0);});
+    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,tmuxPid,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
     setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L','two-run','kill-server']);server.close(()=>process.exit(0));}},30);`;
   const a = runnerFixture(t, source(markers[0], false)), b = runnerFixture(t, source(markers[1], true));
   const outs = [tempDir(t), tempDir(t)], abort = new AbortController();
@@ -1066,12 +1068,14 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   for (const key of ["HOME", "TMPDIR", "TMUX_TMPDIR", "GOPATH", "GOMODCACHE", "GOCACHE"])assert.notEqual(ea[key],eb[key],key);
   for(const e of [ea,eb])assert(existsSync(join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,"two-run")), "private actual tmux socket");
   abort.abort("cancel-peer"); await rejected;
+  await until(()=>pidGone(ea.tmuxPid), "cancelled fixture tmux cleaned");assert(!pidGone(eb.tmuxPid));
   assert(!existsSync(ea.HOME)); assert(existsSync(eb.HOME)); assert(!pidGone(eb.pid));
   assert.equal(allHeld(path).length, 1); assert.equal(allHeld(path)[0].output, canonicalResource(outs[1]));
   const {createConnection}=await import('node:net');
   const socket=createConnection({host:'127.0.0.1',port:eb.port}); const message=await once(socket,'data');assert.equal(message[0].toString(),'peer alive');socket.destroy();
   assert(!existsSync(join(outs[0],"receipt.json"))); writeFileSync(done,"done"); await second;
   assert(existsSync(join(outs[1],"receipt.json"))); assert(!existsSync(eb.HOME));assert.deepEqual(allHeld(path),[]);
+  await until(()=>pidGone(eb.tmuxPid), "completed fixture tmux cleaned");
   for (const out of outs)assert.equal(JSON.parse(readFileSync(join(out,"host-lock.json"),"utf8")).overlap,0);
   } finally { abort.abort("cleanup"); writeFileSync(done,"done"); await Promise.allSettled([first, second, rejected]); }
 });
