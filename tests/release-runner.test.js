@@ -14,6 +14,37 @@ import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.m
 process.env.TAILTERM_MATRIX_HOST_LOCK=join(mkdtempSync(join(tmpdir(),"release-matrix-lock-")),"host.json");
 delete process.env.TAILTERM_MATRIX_PRIORITY;delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 const git=(cwd,...args)=>execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+function bufferTT(t,body){
+ const cwd=mkdtempSync(join(tmpdir(),"release-buffer-")),tt=join(cwd,"tt"),log=join(cwd,"calls"),configPath=join(cwd,"config.json");
+ t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ writeFileSync(tt,"#!"+process.execPath+"\n"+`const fs=require('fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},args.join(' ')+'\\n');if(args.join(' ')!=='deployment list')process.exit(99);`+body);chmodSync(tt,0o755);
+ writeFileSync(configPath,JSON.stringify({version:1,enabled:true,cwd,journalDirectory:cwd,tt,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(x=>[x,"a".repeat(40)]))}));
+ const poll=()=>spawnSync(process.execPath,[RUNNER,"--config",configPath,"--once"],{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30000});
+ return {cwd,tt,log,poll};
+}
+test("buf1 a valid fake tt deployment list above eight MiB parses and polls",t=>{
+ const f=bufferTT(t,`fs.writeSync(1,JSON.stringify([{id:'rel_fixture',state:'refused',padding:'x'.repeat(9*1024*1024)}]));`);
+ const adapter=new HostAdapter({cwd:f.cwd,tt:f.tt},{}),raw=adapter.command([f.tt,"deployment","list"]);
+ assert.ok(Buffer.byteLength(raw)>8*1024*1024);const jobs=JSON.parse(raw);
+ assert.equal(jobs.length,1);assert.equal(jobs[0].padding.length,9*1024*1024);assert.equal(jobs[0].id,"rel_fixture");
+ const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");assert.equal(poll.stderr,"");
+ assert.equal(readFileSync(f.log,"utf8"),"deployment list\ndeployment list\n");
+});
+test("buf2 real fake tt command overflow names ENOBUFS without payloads or claims",t=>{
+ const f=bufferTT(t,`fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');const chunk=Buffer.alloc(1024*1024,120);for(let i=0;i<257;i++)fs.writeSync(2,chunk);`);
+ const adapter=new HostAdapter({cwd:f.cwd},{});
+ assert.throws(()=>adapter.command([f.tt,"deployment","list"]),e=>e.message==="Host operation failed" && failureReason(e)==="tt ENOBUFS (command buffer overflow)");
+ const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");const diagnostic=poll.stderr;
+ assert.match(diagnostic,/Deployment poll held.*ENOBUFS.*command buffer overflow/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
+ assert.equal(readFileSync(f.log,"utf8"),"deployment list\ndeployment list\n");
+});
+test("buf3 fake tt errors and invalid JSON keep bounded non-secret poll diagnostics",t=>{
+ for(const body of [`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');process.exit(2);`,`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');`]){
+  const f=bufferTT(t,body),poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");
+  const diagnostic=poll.stderr;assert.match(diagnostic,/Deployment poll held/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
+  assert.match(diagnostic,body.includes("process.exit")?/tt exit 2/:/unclassified/);assert.equal(readFileSync(f.log,"utf8"),"deployment list\n");
+ }
+});
 function fixture(){const cwd=mkdtempSync(join(tmpdir(),"release-git-")),origin=mkdtempSync(join(tmpdir(),"release-origin-"));git(origin,"init","--bare","-b","tasks-hub");git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"client"));writeFileSync(join(cwd,"client/base.js"),"base");git(cwd,"add",".");git(cwd,"commit","-m","base");const base=git(cwd,"rev-parse","HEAD");git(cwd,"remote","add","origin",origin);git(cwd,"push","--quiet","origin","tasks-hub");git(cwd,"checkout","-b","candidate");return {cwd,base,origin};}
 function change(f,file,text){writeFileSync(join(f.cwd,file),text);git(f.cwd,"add",".");git(f.cwd,"commit","-m","candidate");return git(f.cwd,"rev-parse","HEAD");}
 function job(f,commit){return {id:"rel_fixture",state:"claimed",commit,baseCommit:f.base,verificationDigest:"a".repeat(64),plan:{commit}};}

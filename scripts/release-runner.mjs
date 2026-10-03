@@ -50,6 +50,7 @@ export function failureDetail(error) {
 function childReason(argv, error) {
   const base = p => String(p).split("/").pop(), program = /\.(py|mjs)$/.test(argv[1] || "") ? base(argv[1]) : base(argv[0]);
   const name = /^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program";
+  if(error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")return `${name} ENOBUFS (command buffer overflow)`;
   const how = error.code === "ETIMEDOUT" ? "timeout" : /^SIG[A-Z0-9]{1,12}$/.test(error.signal || "") ? `signal ${error.signal}` : Number.isInteger(error.status) ? `exit ${error.status}` : "not started";
   let fields = "";
   try {
@@ -431,7 +432,7 @@ export class HostAdapter {
     this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
-    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:8*1024*1024,timeout});}
+    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout});}
     catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
   }
   native(operation,extra=[],expectedGeneration=this.job.generation){
@@ -1010,7 +1011,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       matrixNotify(reader,adapter.job||current,adapter);
       break;
     }
-    } catch {process.stderr.write("Deployment poll held; inspect native input or recovery evidence.\n");}
+    } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);}
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));
   }
