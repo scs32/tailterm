@@ -131,7 +131,7 @@ export async function exerciseServerFilters(page) {
     paneCount,
     "Refresh restores hidden members of the group",
   );
-  await page.screenshot({ path: "/tmp/tailterm-server-filters.png" });
+  await page.screenshot({ path: `.build/server-filters-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
   console.log(
     "Server filters passed: union, empty selection, focus, mixed groups, terminal identity, refresh persistence.",
   );

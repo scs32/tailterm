@@ -288,7 +288,7 @@ export async function exercisePaneGroups(
     .locator(".terminal-instance:not([hidden])")
     .boundingBox();
   assert.equal(singleTerminal.y, singleHeader.y + singleHeader.height);
-  await page.screenshot({ path: "/tmp/tailterm-single-pane.png" });
+  await page.screenshot({ path: `.build/pane-groups-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
   await checkUploadButton(ids[0]);
   await page.mouse.move(0, 0);
   const inactive = tab(ids[1]);

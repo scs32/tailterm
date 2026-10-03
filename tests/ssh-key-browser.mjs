@@ -53,9 +53,9 @@ export async function exerciseGeneratedKey(page) {
       .locator("#dialog")
       .evaluate((el) => el.scrollWidth <= el.clientWidth),
   );
-  await page.screenshot({ path: "/tmp/tailterm-ssh-keys-mobile.png" });
+  await page.screenshot({ path: `.build/ssh-key-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}-mobile.png` });
   await page.setViewportSize(size);
-  await page.screenshot({ path: "/tmp/tailterm-ssh-keys.png" });
+  await page.screenshot({ path: `.build/ssh-key-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}-full.png` });
   console.log(
     "Key generation, public-key copy, denied clipboard fallback and mobile layout passed.",
   );

@@ -41,7 +41,8 @@ import {
 import * as matrixRunner from "../scripts/verify-matrix.mjs";
 import {
   acquireHostLock,
-  readHostState,
+  readHostState as rawReadHostState,
+  holdersOf,
   readJournal,
   resolveRunPriority,
   lookupItemPriority,
@@ -50,6 +51,13 @@ import {
 // in a private directory and never the host's own lock file.
 const hostLockDirectory = mkdtempSync(join(tmpdir(), "matrix-host-lock-"));
 process.env.TAILTERM_MATRIX_HOST_LOCK = join(hostLockDirectory, "host.json");
+process.env.TAILTERM_MATRIX_MAX_HOLDERS = "1";
+const readHostState = (...args) => {
+  const state = rawReadHostState(...args);
+  const held = holdersOf(state);
+  assert(held.length <= 1, "legacy capacity-one fixture has at most one holder");
+  return state ? { ...state, holder: held[0] || null } : state;
+};
 delete process.env.TAILTERM_MATRIX_PRIORITY;
 // A stand-in tt comes first on PATH, so an item priority lookup made by any
 // run in this file never reaches a hub. FAKE_TT_PRIORITY is the priority it

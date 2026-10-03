@@ -1210,6 +1210,7 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
     agent: process.env.TAILTERM_AGENT_NAME || plan.verifierAgentId || "unknown",
     commit: plan.commit,
     output,
+    worktree: realpathSync(cwd),
     recordDirectory: output,
     signal: options.abortSignal,
   });
@@ -1267,6 +1268,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       PATH: installCodexStub(home, output) + ":" + process.env.PATH,
       HOME: home,
       TMPDIR: home,
+      TMUX_TMPDIR: join(home, "tmux"),
       GOPATH: join(home, "go"),
       GOMODCACHE: join(home, "go", "pkg", "mod"),
       GOCACHE: join(home, "go-build"),
@@ -1276,6 +1278,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       GOTOOLCHAIN: "auto",
       VERIFICATION_JOBS: String(jobs),
     };
+    mkdirSync(environment.TMUX_TMPDIR, { recursive: true, mode: 0o700 });
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
     if (plan.checks.some(isBrowserCheck)) {
       environment.PLAYWRIGHT_BROWSERS_PATH =

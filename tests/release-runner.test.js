@@ -5,13 +5,20 @@ import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
 import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
-import {acquireHostLock,readHostState,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
+import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
 // No test here may fall back to the host's own verification lock file.
 process.env.TAILTERM_MATRIX_HOST_LOCK=join(mkdtempSync(join(tmpdir(),"release-matrix-lock-")),"host.json");
+process.env.TAILTERM_MATRIX_MAX_HOLDERS = "1";
+const readHostState = (...args) => {
+  const state = rawReadHostState(...args);
+  const held = holdersOf(state);
+  assert(held.length <= 1, "legacy capacity-one fixture has at most one holder");
+  return state ? { ...state, holder: held[0] || null } : state;
+};
 delete process.env.TAILTERM_MATRIX_PRIORITY;delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 const git=(cwd,...args)=>execFileSync("git",args,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 function bufferTT(t,body){
@@ -685,7 +692,7 @@ import {spawn} from 'node:child_process';
 import {acquireHostLock} from ${JSON.stringify(LOCK_MODULE)};
 const o=JSON.parse(process.argv[2]);
 if(o.resist)process.on('SIGTERM',()=>{});
-const lease=await acquireHostLock({path:o.path,priority:o.priority,prioritySource:'flag',item:o.item,agent:'deployer',output:o.dir,recordDirectory:o.dir,runTimeoutMs:600000,pollMs:20});
+const lease=await acquireHostLock({path:o.path,priority:o.priority,prioritySource:'flag',item:o.item,agent:'deployer',output:o.dir,recordDirectory:o.dir,runTimeoutMs:600000,pollMs:20,environment:{TAILTERM_MATRIX_MAX_HOLDERS:o.limit||'1'}});
 let group=null;
 if(o.group){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await new Promise(r=>c.on('spawn',r));c.unref();group=c.pid;lease.addGroup(group);}
 if(o.mode==='receipt'){fs.writeFileSync(o.dir+'/receipt.json',JSON.stringify({environment:{},checks:[{exitCode:0}]}));await lease.release();process.exit(0);}
@@ -699,7 +706,7 @@ function idle(t){const c=spawn(process.execPath,["-e","setInterval(()=>{},1000)"
 function lockHost(t,child={}){
  const h=matrixHost(),script=join(h.home,"run-child.mjs");writeFileSync(script,RUN_CHILD);
  h.path=join(mkdtempSync(join(tmpdir(),"runner-host-lock-")),"host.json");h.children=[];h.signals=[];h.dir=attemptDir(h.home,h.integrated.integratedCommit,0);
- delete h.adapter.processStartTime;h.adapter.hostState=()=>readHostState(h.path);
+ delete h.adapter.processStartTime;h.adapter.hostState=()=>rawReadHostState(h.path);
  h.adapter.signalProcess=(target,name)=>{h.signals.push([target,name]);process.kill(target,name);};
  h.adapter.startMatrixRun=(argv,dir)=>{
   const flag=name=>argv[argv.indexOf(name)+1];
@@ -767,7 +774,7 @@ test("a3 behind a live holder and an earlier normal waiter, the deployer's run a
  assert.equal(await h.adapter.verifyIntegrated({...h.integrated,itemId:"wi_deployed"}),false);
  await until(()=>readHostState(h.path).waiters.length===2,"the deployer's run to join the list");
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
- assert.deepEqual(h.adapter.matrixWait,{attempt:h.integrated.integratedCommit+"-r0",position:1,length:2,priority:"high",change:1,holder:{id:holder.id,item:"wi_holder",agent:"verifier",pid:process.pid}});
+ assert.deepEqual(h.adapter.matrixWait,{attempt:h.integrated.integratedCommit+"-r0",position:1,length:2,priority:"high",change:1,holders:[{id:holder.id,item:"wi_holder",agent:"verifier",pid:process.pid}]});
  assert.deepEqual(readHostState(h.path).waiters.map(w=>[w.item,w.priority]),[["wi_deployed","high"],["wi_earlier","normal"]]);
  assert.equal(h.sends().length,0);assert.equal(h.starts(),1);
  await holder.release();
@@ -946,7 +953,7 @@ test("a10 (iii) a stale lock entry matching a reused pid is never signalled, and
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"Thu Jan  1 00:00:00 2026");
  // The pid now belongs to an unrelated live process; the lock file still names it for this directory.
  delete h.adapter.processStartTime;assert.notEqual(h.adapter.processStartTime(other.pid),"Thu Jan  1 00:00:00 2026");
- assert(updateHostState(h.path,state=>{state.holder=holderEntry(other.pid,h.dir);}).done);
+ assert(updateHostState(h.path,state=>{state.holders=[holderEntry(other.pid,h.dir)];}).done);
  clock=h.deadline()+3600000;
  for(let poll=0;poll<3;poll++){clock+=MATRIX_STOP_GRACE_MS;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);}
  assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);
@@ -961,7 +968,7 @@ test("a10 (iv) after a takeover while a recorded check group survives, the group
  process.kill(pid,"SIGKILL");await ended(h.children[0]);
  const requestIds=new Set();
  for(const takeover of [false,true,true]){
-  if(takeover)assert(updateHostState(h.path,state=>{state.holder=otherHolder();}).done);
+  if(takeover)assert(updateHostState(h.path,state=>{state.holders=[otherHolder()];}).done);
   assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"held, never refused");
   assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[group],reason:"a check group of the matrix run is still alive"});
   const notice=matrixHeldNotice({id:"rel_fixture"},h.adapter.matrixHeld);requestIds.add(notice.requestId);assert.ok(notice.text.includes(`check groups still alive: ${group};`));
@@ -977,7 +984,7 @@ test("a10 (v) a killed run with no release record whose holder entry was replace
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid}=await h.marker();
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
  process.kill(pid,"SIGKILL");await ended(h.children[0]);
- assert(updateHostState(h.path,state=>{state.holder=otherHolder();}).done);
+ assert(updateHostState(h.path,state=>{state.holders=[otherHolder()];}).done);
  for(let poll=0;poll<3;poll++)assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
  assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[],reason:"check group state cannot be shown"});
  assert.equal(h.run().snapshot,undefined);assert.equal(h.run().state,"started");assert.deepEqual(h.signals,[]);
@@ -1052,9 +1059,9 @@ test("a10 a11 the fence notice never advises set-aside while the job's matrix ru
 });
 test("a10 the snapshot of a gone run's lock entry is read after its pid was seen gone",async t=>{
  const h=lockHost(t),group=idle(t),pid=exitedPid();h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return pid;};h.adapter.processStartTime=()=>null;
- assert(updateHostState(h.path,state=>{state.holder=holderEntry(pid,h.dir);}).done);
+ assert(updateHostState(h.path,state=>{state.holders=[holderEntry(pid,h.dir)];}).done);
  // The run records a check group between the poll's first read of the lock file and the pid check.
- h.adapter.pidGone=target=>{assert.equal(target,pid);assert(updateHostState(h.path,state=>{state.holder.groups=[group.pid];}).done);return true;};
+ h.adapter.pidGone=target=>{assert.equal(target,pid);assert(updateHostState(h.path,state=>{state.holders[0].groups=[group.pid];}).done);return true;};
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false,"held: the group recorded last is seen");
  assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[group.pid],reason:"a check group of the matrix run is still alive"});
@@ -1520,4 +1527,40 @@ test("g1 the runner throws no untagged fixed error",()=>{
  for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
   assert.ok(source.includes(`releaseError("${tag}")`),tag);assert.equal(failureReason(releaseError(tag)),tag);
  }
+});
+
+test("v2 restarted consumer adopts its own second holder, records only its groups and never launches a peer", async t => {
+ const h=lockHost(t,{limit:"2",group:true});
+ const peer=await acquireHostLock({path:h.path,item:"wi_peer",agent:"peer",runTimeoutMs:60000,pollMs:20,environment:{TAILTERM_MATRIX_MAX_HOLDERS:"2"}});
+ try {
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);const {pid,group}=await h.marker();
+  t.after(()=>{try{process.kill(-group,"SIGKILL");}catch{}});
+  await until(()=>holdersOf(rawReadHostState(h.path)).length===2,"two consumer holders");
+  const saved=h.run();h.adapter.matrixChildren.clear();delete saved.pid;delete saved.processStartedAt;saved.state="starting";h.adapter.saveRun(h.dir,saved);
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().pid,pid);assert.equal(h.starts(),1);
+  assert.deepEqual(h.run().groups,[group]);assert.equal(h.adapter.matrixHeld,null);assert.equal(h.signals.length,0);
+  assert.equal(holdersOf(rawReadHostState(h.path))[0].id,peer.id);
+  const own=holdersOf(rawReadHostState(h.path))[1];
+  h.adapter.hostState=()=>({version:2,holderLimit:2,holders:[{...own,id:"other-lease",pid:process.pid},own],waiters:[]});
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixHeld.reason,"host lock identity ambiguous");
+  assert.equal(h.starts(),1);assert.deepEqual(h.signals,[]);
+ } finally {await peer.release();for(const child of h.children){try{process.kill(-child.pid,"SIGKILL");}catch{}}}
+});
+test("v2 holder-set notices preserve resend identity, report both holders and change when the actual set changes", () => {
+ const job={id:"rel_0123456789abcdef"},attempt="c".repeat(40)+"-r0";
+ const a={id:"a",item:"wi_a",agent:"a",pid:123},b={id:"b",item:"wi_b",agent:"b",pid:456};
+ const wait={attempt,position:1,length:1,priority:"normal",change:1,holders:[a,b]};
+ const first=matrixWaitNotice(job,wait);assert.match(first.text,/wi_a\/a\/pid 123; wi_b\/b\/pid 456/);
+ assert.equal(matrixWaitNotice(job,{...wait,holders:[b,a]}).requestId,first.requestId);
+ assert.notEqual(matrixWaitNotice(job,{...wait,holders:[a]}).requestId,first.requestId);
+ assert(first.requestId.length<=128);
+});
+test("v2 consumer holds if identity becomes ambiguous during its after-exit group snapshot", () => {
+ const dir=mkdtempSync(join(tmpdir(),"release-after-exit-")),adapter=new HostAdapter({cwd:dir,journalDirectory:dir},{id:"rel_fixture"});
+ const run={state:"started",pid:12345,launchedAt:Date.now(),groups:[]};let reads=0;
+ adapter.matrixEntry=()=>++reads===1?{role:"holder",entry:{id:"own",pid:run.pid,groups:[]}}:{ambiguous:true};
+ adapter.matrixSidecar=()=>null;adapter.pidGone=()=>true;adapter.signalProcess=()=>assert.fail("ambiguous identity must never be signalled");
+ assert.equal(adapter.resolveMatrixRun(dir,run),"held");assert.equal(reads,2);
+ assert.equal(adapter.matrixHeld.reason,"host lock identity ambiguous");assert.equal(run.snapshot,undefined);
+ rmSync(dir,{recursive:true,force:true});
 });

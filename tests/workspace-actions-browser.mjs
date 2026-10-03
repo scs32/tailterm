@@ -127,7 +127,7 @@ export async function exerciseWorkspaceActions(page, stream) {
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   );
-  await page.screenshot({ path: "/tmp/tailterm-mobile-controls.png" });
+  await page.screenshot({ path: `.build/workspace-actions-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.locator(`[data-tab="${original}"]`).click();
   const selectedTab = page.locator(".tab.active [data-tab]");

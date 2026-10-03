@@ -322,11 +322,12 @@ the final plan, so the verified commit is exactly what merges.
 
 Features `wi_6b4af2fb034ec36e`, order #18569 (phase 1) and
 `wi_c5cb667695c3614c`, order #19197 (phase 2: the deployer, the queue list and
-the holder cap). One host runs one verification at a time. Every
+the holder cap), extended by `wi_af52350b616dd0e4@4`, order #21517,
+ASSIGN #22512. One host admits two verification holders by default. Every
 `verify-matrix.mjs run` and `targeted`, the deployer's integrated run, and every
 supplemental run started through the `exec` wrapper below, takes one host lock
-before it starts and releases it when it ends. A run that finds the lock held
-joins an ordered waitlist. Nobody checks `ps` or waits for a quiet period any
+before it starts and releases its own lease when it ends. A run that finds
+all slots occupied or its canonical worktree in use joins an ordered waitlist. Nobody checks `ps` or waits for a quiet period any
 more: the lock file is the only thing a waiting run reads.
 
 **Order.** Urgent first, then high, then everything else, and first come first
@@ -336,10 +337,12 @@ that holds the lock is never interrupted for a more urgent one.
 
 **Priority.** `--priority urgent|high|normal` on `run`, `targeted` and `exec`.
 Without the flag, `TAILTERM_MATRIX_PRIORITY` with the same values. Without
-either, `normal` (owner answer #18706). Any other value is refused before the
+either, `run` and `targeted` look up the item priority (low maps to normal),
+falling back to normal with a warning; `exec` defaults to normal. Invalid
+overrides are refused before the
 run joins the list. Priority is self-declared and is not a plan field; the lock
 file, journal, sidecar and receipt record it with its source (`flag`,
-`environment` or `default`). Use the priority of the work item being verified.
+`environment`, `item` or `default`). Use the priority of the work item being verified.
 
 **Files.** The lock and waitlist are one file,
 `~/.local/state/tailterm-matrix/host.json`. Set `TAILTERM_MATRIX_HOST_LOCK` to
@@ -348,36 +351,52 @@ files 0600. Beside it are `host.journal.jsonl` (append-only history),
 `host.json.lock` (a short-lived mutex for updates) and
 `host.json.lock.reclaim` (a guard used while recovering a dead owner's mutex).
 
+`TAILTERM_MATRIX_MAX_HOLDERS` is a decimal integer from 1 through 16;
+unset or empty means 2. Invalid configuration refuses before enqueue or sidecar
+creation. A v2 cohort freezes `holderLimit` while any holder or waiter remains;
+a different limit refuses without joining. A drained cohort can change capacity.
+
 ```json
 {
-  "version": 1,
+  "version": 2,
   "host": "Stephens-Mini",
-  "updatedAt": "2026-10-01T10:00:00.000Z",
+  "updatedAt": "2026-10-03T23:00:00.000Z",
   "requestSeq": 41,
   "grantSeq": 37,
-  "holder": {
-    "id": "…", "seq": 38, "pid": 4242, "kind": "run",
-    "item": "wi_…", "agent": "verifier-…",
+  "holderLimit": 2,
+  "holders": [{
+    "id": "lease-a", "seq": 38, "pid": 4242, "kind": "run",
+    "item": "wi_example", "agent": "verifier",
     "priority": "high", "prioritySource": "flag",
-    "requestedAt": "…", "startedAt": "…", "runTimeoutMs": 7200000,
-    "groups": [4250, 4263], "commit": "…", "output": "/abs/logs"
-  },
-  "waiters": [
-    { "id": "…", "seq": 40, "pid": 4300, "kind": "targeted", "item": "…",
-      "agent": "…", "priority": "normal", "prioritySource": "default",
-      "requestedAt": "…", "grantSeqAtRequest": 37, "overtakenBy": 1,
-      "runTimeoutMs": 2400000, "commit": "…", "output": "…" }
-  ]
+    "requestedAt": "2026-10-03T22:59:00.000Z",
+    "startedAt": "2026-10-03T23:00:00.000Z", "runTimeoutMs": 7200000,
+    "groups": [4250], "commit": "exact-sha",
+    "worktree": "/abs/worktree-a", "output": "/abs/logs-a"
+  }],
+  "waiters": []
 }
 ```
 
-`holder` is `null` when the host is free. `waiters` is stored in the order the
-runs will be granted, so a waiter's position is its index plus one. `kind` is
-`run`, `targeted` or `exec`. `groups` lists the process groups of the holder's
-checks that are running now. `item` is the plan's `itemId`, else `--item ID`,
-else `unknown`; `agent` is `TAILTERM_AGENT_NAME`, else the plan's
-`verifierAgentId`, else `unknown`. Updates land by rename, so the file can be
-read at any time without taking anything.
+`holders` is empty when free; v2 has no singleton `holder` alias. Readers must
+inspect all holders. The lease ID, PID and canonical output identify the run.
+`waiters` is stored in priority/FIFO grant order. `kind` is `run`, `targeted`
+or `exec`; each holder's `groups` tracks only its own check process groups.
+Updates land by atomic rename under the existing mutex.
+
+Occupied v1 files retain their original one-holder protocol until both holder
+and waiters drain, then migrate atomically without resetting sequence counters.
+Old clients refuse v2 rather than treating it as free. Malformed or unknown
+state remains unchanged and fails closed. During a rollout, let old cohorts
+drain and use compatible readers before admitting v2 clients; never delete a
+live lock to force capacity changes.
+
+**Worktree and output isolation.** The runner records canonical real worktree
+and output paths, resolving existing symlink ancestors even for new output
+leaves. Only one holder may use a worktree. A blocked head is never skipped to
+fill a spare slot with a later waiter. Duplicate output/record roots are refused
+before writing sidecars. `exec` uses its canonical current directory. Separate
+worktrees are required for concurrent build/browser runs, as they write local
+`.build`, generated binaries and previews.
 
 **Reading the waitlist.**
 
@@ -402,8 +421,9 @@ exits 75. SIGINT or SIGTERM while waiting also leaves the list, with the usual
 exit 130 or 143.
 
 **When the lock moves on.** A waiter is granted the lock when it is first in
-the list and either there is no holder, or the holder's process and every
-check group it recorded are gone. The second case is journaled as
+the list, a slot is free and no holder uses its canonical worktree. A dead
+holder frees only its own slot when its process and every recorded check group
+are gone. The second case is journaled as
 `stale-recovered` with reason `pid-gone`. A killed runner whose checks are
 still running therefore keeps the lock until they end.
 
@@ -435,7 +455,8 @@ written, the lock is released and `run-timeout-abort` is journaled. A
 preparatory test-binary build blocks the runner, so the stop happens when that
 build returns.
 
-One exception allows two runs at once. If a holder is still alive 120 seconds
+Normal two-holder admission records overlap=0. Exceptional overdue takeover
+can exceed the physical concurrency limit: If a holder is still alive 120 seconds
 after its run timeout, the first waiter takes the lock anyway. This is printed
 as a warning, journaled as `overlap` with the process and groups that were
 still alive, and recorded in the new run's sidecar and receipt
@@ -510,7 +531,7 @@ list. The runner starts it detached with `--priority`, `--item` and
 release job's if the hub carries one, else the private config key
 `matrixPriority`, else `high`; its wait bound is `matrixHostWaitMs` (default 2
 hours); its holder bound is the clamped value above. While it waits, the
-deployer posts a notice with its position, the list length and the holder each
+deployer posts a notice with its position, the list length and the holder set each
 time one of them changes. If it must stop its own run it signals only that run,
 never a check group, and holds the job when it cannot confirm the run stopped.
 [Project deployment](project-deployment.md), "Integrated-commit verification",
@@ -687,3 +708,42 @@ approval and a handler-saved plan. Its successful exit means gate eligibility,
 not that every raw check passed. Independent execution and handler import/readback
 remain required before acceptance. This successor introduces no AIV submission,
 baseline test repairs, live data changes or deployment.
+
+## Concurrent resource inventory and evidence
+
+Feature `wi_af52350b616dd0e4@4`, order #21517 / ASSIGN #22512 preserves the
+approved matrix digest `f57266be7f09c6f8b78443cf88c8fe3fd00ec07f01d3f84b9e8f1e0c4cf182c6`
+(owner #16614). Its scope selects all eligible local browser entrypoints and
+imports; deployed-browser and deployed-reset remain excluded. The source
+inventory #21888 / final plan #22508 covers 58 entrypoints and 76 modules.
+
+- Each real runner invocation creates a fresh disposable HOME, TMPDIR, GOPATH,
+  GOMODCACHE and GOCACHE, plus a private TMUX_TMPDIR directory beneath its home.
+  Credential stripping, pre-admission prerequisite checks, post-admission held
+  hashes, process-group recording, cleanup and no-receipt-on-failure are retained.
+- `task-form-browser.mjs` uses one short PID/random socket name per invocation
+  for all four launch/assertion/teardown references. Identically named sockets
+  used by other fixtures live in separate TMUX_TMPDIR namespaces. Cleanup stays
+  inside the owning home/socket/group; no peer is signalled by lock recovery.
+- Browser listeners use the released per-run ephemeral ports. Matrix
+  `requiredPorts` are occupancy checks, not reservations. Canonical worktree
+  exclusion also protects each worktree's build and fixture files.
+- Eleven absolute `/tmp` screenshot destinations in nine approved browser files
+  now use worktree-local `.build` suite/entrypoint/engine paths. All captures and
+  assertions remain. Existing relative screenshots are separated by worktree;
+  upload `/tmp/fixture uploads/...` entries are in-memory SFTP fixture keys.
+- The release consumer reads every v1/v2 holder, adopts only a unique matching
+  output/lease/PID, and holds on ambiguity. Persisted process-start-instance
+  proof still controls signalling, after-PID-gone snapshots still fence surviving
+  groups, and holder-set notice keys remain stable across restart/order changes.
+
+Builder focused tests exercise real A/B/C processes, both slot-release orders,
+priority/FIFO, capacity configuration/cohort mismatch, v1 migration/old-reader
+rejection, corrupt state, canonical aliases, per-ID group/release/recovery,
+second-holder consumer adoption and ambiguity. Two real synthetic runPlan runs
+use distinct fixture worktrees, actual ephemeral listeners and private tmux
+servers; A cancellation must leave B's socket, process, home and receipt intact.
+These checks do not replace the distinct verifier's full eligible native matrix
+or the two-worktree/both-engine PNG decoding and peer-preservation probe in the
+saved plan. Keep runtime a1-a3 acceptance pending until that evidence, independent
+review, lead acceptance and handler-saved completion are retained.

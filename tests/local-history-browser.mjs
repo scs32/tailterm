@@ -85,7 +85,7 @@ export async function exerciseLocalHistory(page, getInput) {
   await page.keyboard.type("do not send this");
   await page.keyboard.press("Enter");
   assert.equal(getInput(), before, "History typing never reaches SSH");
-  await page.screenshot({ path: "/tmp/tailterm-power-scroll.png" });
+  await page.screenshot({ path: `.build/local-history-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
   await toggle.click();
   assert.equal(await page.locator(".local-history").count(), 0);
   assert.equal(await toggle.getAttribute("aria-pressed"), "false");

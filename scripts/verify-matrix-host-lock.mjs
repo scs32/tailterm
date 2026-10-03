@@ -13,8 +13,9 @@ import {
   unlinkSync,
   renameSync,
   rmSync,
+  realpathSync,
 } from "node:fs";
-import { join, dirname, isAbsolute, resolve } from "node:path";
+import { join, dirname, isAbsolute, resolve, basename } from "node:path";
 import { homedir, hostname, loadavg, availableParallelism } from "node:os";
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
@@ -156,6 +157,31 @@ export function holderCapMs(environment = process.env) {
   if (raw === undefined || raw === "") return DEFAULT_HOLDER_CAP_MS;
   return minutesFlag("TAILTERM_MATRIX_HOLDER_CAP_MINUTES", raw, 1440);
 }
+export function holderLimit(environment = process.env) {
+  const raw = environment.TAILTERM_MATRIX_MAX_HOLDERS;
+  if (raw === undefined || raw === "") return 2;
+  if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 16)
+    throw new Error("TAILTERM_MATRIX_MAX_HOLDERS must be a decimal integer from 1 to 16");
+  return Number(raw);
+}
+// Resolve existing symlink ancestors even when the output leaf is not yet made.
+export function canonicalResource(path) {
+  let parent = resolve(path), suffix = [];
+  for (;;) {
+    try { return join(realpathSync(parent), ...suffix); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const next = dirname(parent);
+      if (next === parent) throw error;
+      suffix.unshift(basename(parent)); parent = next;
+    }
+  }
+}
+export const holdersOf = (state) => state?.version === 2 ? state.holders : state?.holder ? [state.holder] : [];
+const setHolders = (state, holders) => {
+  if (state.version === 1) state.holder = holders[0] || null;
+  else state.holders = holders;
+};
 const rank = (priority) =>
   priority === "urgent" ? 0 : priority === "high" ? 1 : 2;
 
@@ -318,14 +344,31 @@ function parseState(raw) {
     return "not JSON";
   }
   if (!state || typeof state !== "object" || Array.isArray(state)) return "not an object";
-  if (state.version !== 1) return "unknown version";
+  if (![1, 2].includes(state.version)) return "unknown version";
   if (
     !Number.isSafeInteger(state.requestSeq) ||
     !Number.isSafeInteger(state.grantSeq) ||
     !Array.isArray(state.waiters) ||
-    !(state.holder === null || (typeof state.holder === "object" && !Array.isArray(state.holder)))
+    !(state.version === 1 ? state.holder === null || (state.holder && typeof state.holder === "object" && !Array.isArray(state.holder)) : Array.isArray(state.holders) && Number.isSafeInteger(state.holderLimit) && state.holderLimit >= 1 && state.holderLimit <= 16 && !Object.hasOwn(state, "holder"))
   )
     return "missing fields";
+  if (state.requestSeq < 0 || state.grantSeq < 0) return "invalid counters";
+  if (state.version === 2) {
+    const entries = [...state.holders, ...state.waiters];
+    if (state.holders.length > state.holderLimit || new Set(entries.map(e => e?.id)).size !== entries.length)
+      return "invalid or duplicate entries";
+    if (entries.some(e => !e || typeof e.id !== "string" || !e.id || !Number.isSafeInteger(e.pid) || e.pid <= 0 ||
+      !Number.isSafeInteger(e.seq) || e.seq <= 0 || !Number.isFinite(Date.parse(e.requestedAt)) ||
+      !["run", "targeted", "exec"].includes(e.kind) || typeof e.item !== "string" || typeof e.agent !== "string" ||
+      (e.output !== undefined && (typeof e.output !== "string" || !isAbsolute(e.output))) ||
+      (e.recordDirectory !== undefined && (typeof e.recordDirectory !== "string" || !isAbsolute(e.recordDirectory))) ||
+      (e.worktree !== undefined && (typeof e.worktree !== "string" || !isAbsolute(e.worktree))) ||
+      !PRIORITIES.includes(e.priority) || !Number.isSafeInteger(e.runTimeoutMs) || e.runTimeoutMs <= 0 ||
+      (e.groups !== undefined && (!Array.isArray(e.groups) || e.groups.some(g => !Number.isSafeInteger(g) || g <= 1)))))
+      return "invalid entry";
+    if (state.holders.some(e => !Number.isFinite(Date.parse(e.startedAt)))) return "invalid holder timestamp";
+    if (state.waiters.some(e => !Number.isSafeInteger(e.grantSeqAtRequest) || e.grantSeqAtRequest < 0 || !Number.isSafeInteger(e.overtakenBy) || e.overtakenBy < 0)) return "invalid waiter counters";
+  }
   return state;
 }
 // A missing file is a free host; anything unreadable or unknown fails closed.
@@ -335,7 +378,7 @@ function readState(paths, entry) {
     raw = readFileSync(paths.file, "utf8");
   } catch (error) {
     if (error.code === "ENOENT")
-      return { version: 1, host: hostname(), updatedAt: "", requestSeq: 0, grantSeq: 0, holder: null, waiters: [] };
+      return { version: 2, host: hostname(), updatedAt: "", requestSeq: 0, grantSeq: 0, holderLimit: holderLimit(), holders: [], waiters: [] };
     throw corrupt(paths, entry, error.code || "unreadable");
   }
   const state = parseState(raw);
@@ -419,8 +462,8 @@ function hookExit() {
           paths,
           entry,
           (state) => {
-            if (state.holder?.id === id) {
-              state.holder = null;
+            if (holdersOf(state).some(h => h.id === id)) {
+              setHolders(state, holdersOf(state).filter(h => h.id !== id));
               journal(paths, "release", entry, { fallback: true });
             } else if (state.waiters.some((w) => w.id === id)) {
               state.waiters = state.waiters.filter((w) => w.id !== id);
@@ -466,6 +509,7 @@ export async function acquireHostLock(options = {}) {
   const runTimeoutMs = Math.min(requestedRunTimeoutMs, holderCapMs(options.environment ?? process.env));
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs <= 0)
     throw new Error("Invalid host wait bound");
+  const limit = holderLimit(options.environment ?? process.env);
   const paths = lockPaths(options.path ?? lockPath());
   const requestedMs = now();
   const entry = {
@@ -482,7 +526,9 @@ export async function acquireHostLock(options = {}) {
     overtakenBy: 0,
     runTimeoutMs,
     ...(options.commit ? { commit: options.commit } : {}),
-    ...(options.output ? { output: options.output } : {}),
+    ...(options.output || recordDirectory ? { output: canonicalResource(options.output || recordDirectory) } : {}),
+    ...(recordDirectory ? { recordDirectory: canonicalResource(recordDirectory) } : {}),
+    ...(options.worktree ? { worktree: canonicalResource(options.worktree) } : {}),
   };
   const record = {
     version: 1,
@@ -511,25 +557,38 @@ export async function acquireHostLock(options = {}) {
     loadSamples: [],
     ...(options.extra || {}),
   };
-  if (recordDirectory) mkdirSync(recordDirectory, { recursive: true });
+
   const say = (line) => {
     print(line);
-    if (recordDirectory)
+    if (recordDirectory && entry.seq > 0) {
+      mkdirSync(recordDirectory, { recursive: true });
       appendFileSync(join(recordDirectory, "host-lock.log"), new Date().toISOString() + " " + line + "\n", { mode: 0o600 });
+    }
   };
   const saveRecord = () => {
-    if (recordDirectory)
+    if (recordDirectory && entry.seq > 0) {
+      mkdirSync(recordDirectory, { recursive: true });
       writeFileSync(join(recordDirectory, "host-lock.json"), JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
+    }
   };
 
-  // Grants the lock to entry when it is first and nothing of the previous
-  // holder is alive, or that holder is past its run timeout plus grace.
+  // Grants the head into a free, resource-compatible slot. Dead leases and
+  // exceptional overdue takeovers are recovered independently by exact ID.
   // Returns true when granted. No run is ever signalled from here.
   let shown = "",
     shownAt = 0,
     busyAt = 0;
   const step = (state, first) => {
     if (first) {
+      if (!holdersOf(state).length && !state.waiters.length) {
+        state.version = 2; state.holderLimit = limit; state.holders = []; delete state.holder;
+      }
+      if (state.version === 2 && state.holderLimit !== limit)
+        throw new HostLockError("capacity-mismatch", `Host holder limit is frozen at ${state.holderLimit} until holders and waiters drain`);
+      const resources = [entry.output, entry.recordDirectory].filter(Boolean);
+      if ([...holdersOf(state), ...state.waiters].some(e =>
+        [e.output, e.recordDirectory].filter(Boolean).some(path => resources.includes(canonicalResource(path)))))
+        throw new HostLockError("duplicate-output", "Host lock output/record directory is already in use");
       entry.seq = ++state.requestSeq;
       entry.grantSeqAtRequest = state.grantSeq;
       state.waiters.push({ ...entry });
@@ -539,29 +598,34 @@ export async function acquireHostLock(options = {}) {
     for (const waiter of dead) journal(paths, "waiter-dropped", waiter, { by: entry.id });
     state.waiters = ordered(state.waiters.filter((w) => !dead.includes(w)));
     const mine = state.waiters.findIndex((w) => w.id === entry.id);
-    if (mine < 0)
-      throw new HostLockError("lost-request", `Host lock request ${entry.id} is no longer in ${paths.file}`);
-    const position = mine + 1,
-      length = state.waiters.length,
-      holder = state.holder;
+    if (mine < 0) throw new HostLockError("lost-request", `Host lock request ${entry.id} is no longer in ${paths.file}`);
+    const position = mine + 1, length = state.waiters.length;
     if (first) Object.assign(record, { seq: entry.seq, queuePosition: position, queueLength: length });
-    let line = `matrix host: waiting ${position} of ${length}, holder none`,
-      overlap = null,
-      recovered = null;
-    if (holder) {
-      const holderGone = pidGone(holder.pid),
-        groups = liveGroups(holder);
-      const overdue = now() > Date.parse(holder.startedAt) + holder.runTimeoutMs + graceMs;
-      if (holderGone && !groups.length) recovered = holder;
-      else if (overdue)
-        overlap = { reason: "run-timeout", holder: holder.id, item: holder.item, agent: holder.agent, pid: holderGone ? null : holder.pid, groups };
-      line =
-        `matrix host: waiting ${position} of ${length}, holder ${describe(holder)}` +
-        (holderGone && groups.length ? ` gone, check group ${groups.join(",")} still running` : "");
+    let overlap = null, recovered = null;
+    const live = [];
+    for (const holder of holdersOf(state)) {
+      const groups = liveGroups(holder), holderGone = pidGone(holder.pid);
+      if (holderGone && !groups.length) {
+        recovered = holder;
+        journal(paths, "stale-recovered", entry, { reason: "pid-gone", holder: holder.id, holderPid: holder.pid, holderItem: holder.item, holderAgent: holder.agent });
+      } else live.push(holder);
     }
-    if (mine === 0 && (!holder || recovered || overlap)) {
-      if (recovered)
-        journal(paths, "stale-recovered", entry, { reason: "pid-gone", holder: recovered.id, holderPid: recovered.pid, holderItem: recovered.item, holderAgent: recovered.agent });
+    setHolders(state, live);
+    const capacity = state.version === 1 ? 1 : state.holderLimit;
+    if (mine === 0 && live.length >= capacity) {
+      const overdue = live.find(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);
+      if (overdue) {
+        overlap = { reason: "run-timeout", holder: overdue.id, item: overdue.item, agent: overdue.agent, pid: pidGone(overdue.pid) ? null : overdue.pid, groups: liveGroups(overdue) };
+      }
+    }
+    const remaining = overlap ? live.filter(h => h.id !== overlap.holder) : live;
+    const resourceBlocked = entry.worktree && remaining.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
+    const holder = live[0] || null;
+    let line = `matrix host: waiting ${position} of ${length}, holder ${holder ? describe(holder) : "none"}`;
+    if (holder && pidGone(holder.pid) && liveGroups(holder).length) line += ` gone, check group ${liveGroups(holder).join(",")} still running`;
+    if (live.length > 1) line += `; holders ${live.map(describe).join("; ")}`;
+    if (resourceBlocked) line += "; worktree in use";
+    if (mine === 0 && remaining.length < capacity && !resourceBlocked) {
       if (overlap) journal(paths, "overlap", entry, overlap);
       const queued = state.waiters.shift();
       for (const waiter of state.waiters) if (waiter.seq < queued.seq) waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
@@ -576,10 +640,10 @@ export async function acquireHostLock(options = {}) {
         ...(overlap ? { overlapDetails: overlap } : {}),
         ...(recovered ? { recovered: { reason: "pid-gone", holder: recovered.id, pid: recovered.pid } } : {}),
       });
-      if (first && !holder) Object.assign(record, { queuePosition: 0, queueLength: 0 });
+      if (first && !live.length) Object.assign(record, { queuePosition: 0, queueLength: 0 });
       state.grantSeq += 1;
       const { grantSeqAtRequest, overtakenBy, ...held } = queued;
-      state.holder = { ...held, startedAt: record.acquiredAt, groups: [] };
+      setHolders(state, [...remaining, { ...held, startedAt: record.acquiredAt, groups: [] }]);
       journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap });
       return { granted: true, overlap };
     }
@@ -605,9 +669,6 @@ export async function acquireHostLock(options = {}) {
     journal(paths, event, entry, { waitMs: record.waitMs, removed, ...extra });
     saveRecord();
   };
-
-  if (runTimeoutMs < requestedRunTimeoutMs)
-    say(`matrix host: run timeout ${requestedRunTimeoutMs} ms clamped to the holder cap of ${runTimeoutMs} ms`);
   hookExit();
   let first = true,
     last = null;
@@ -624,7 +685,10 @@ export async function acquireHostLock(options = {}) {
       throw error;
     }
     if (result.done) {
-      if (first) active.set(entry.id, { paths, entry });
+      if (first) {
+        active.set(entry.id, { paths, entry });
+        if (runTimeoutMs < requestedRunTimeoutMs) say(`matrix host: run timeout ${requestedRunTimeoutMs} ms clamped to the holder cap of ${runTimeoutMs} ms`);
+      }
       first = false;
       if (result.value.granted) {
         if (result.value.overlap)
@@ -690,8 +754,9 @@ export async function acquireHostLock(options = {}) {
     dirty = false,
     warned = false;
   const writeGroups = (state) => {
-    if (state.holder?.id !== entry.id) return false;
-    state.holder.groups = [...groups];
+    const mine = holdersOf(state).find(h => h.id === entry.id);
+    if (!mine) return false;
+    mine.groups = [...groups];
   };
   const flush = async () => {
     while (dirty && !released) {
@@ -745,8 +810,8 @@ export async function acquireHostLock(options = {}) {
         paths,
         entry,
         (state) => {
-          if (state.holder?.id !== entry.id) return false;
-          state.holder = null;
+          if (!holdersOf(state).some(h => h.id === entry.id)) return false;
+          setHolders(state, holdersOf(state).filter(h => h.id !== entry.id));
           held = true;
         },
         { withinMs: busyAbortMs },
@@ -811,6 +876,7 @@ export async function execWithHostLock(argv, options = {}) {
   try {
     lease = await acquireHostLock({
       ...options,
+      worktree: options.worktree || process.cwd(),
       kind: "exec",
       signal: interrupted.signal,
       extra: { checkSet: "supplemental", argv },
@@ -871,10 +937,10 @@ export function statusText(file = lockPath()) {
   const state = readHostState(file);
   const lines = ["matrix host lock: " + file];
   const tags = (e) => `${e.kind}, ${e.priority}/${e.prioritySource}`;
-  if (!state?.holder) lines.push("holder: none");
-  else {
-    const h = state.holder,
-      live = liveGroups(h);
+  const holders = holdersOf(state);
+  if (!holders.length) lines.push("holder: none");
+  for (const h of holders) {
+    const live = liveGroups(h);
     lines.push(
       `holder: ${describe(h)}${pidGone(h.pid) ? " gone" : ""} (${tags(h)}), started ${h.startedAt}, ` +
         `run timeout ${h.runTimeoutMs} ms, check groups ${(h.groups || []).join(",") || "none"} (alive: ${live.join(",") || "none"})`,

@@ -103,5 +103,5 @@ export async function exerciseWorkspaceContinuity(
     await page.locator("#terminal-status").innerText(),
     /renamed-static-launcher/,
   );
-  await page.screenshot({ path: "/tmp/tailterm-restored-workspace.png" });
+  await page.screenshot({ path: `.build/workspace-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
 }

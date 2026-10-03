@@ -8,6 +8,7 @@ import {
   rmSync,
   existsSync,
   statSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -19,7 +20,8 @@ import {
   execWithHostLock,
   lockPath,
   lockPaths,
-  readHostState,
+  readHostState as rawReadHostState,
+  holdersOf,
   readJournal,
   resolvePriority,
   statusText,
@@ -31,6 +33,8 @@ import {
   DEFAULT_HOST_WAIT_MS,
   RUN_TIMEOUT_GRACE_MS,
   holderCapMs,
+  holderLimit,
+  canonicalResource,
   updateHostState,
 } from "../scripts/verify-matrix-host-lock.mjs";
 import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
@@ -38,6 +42,13 @@ import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scri
 // No test here may fall back to the host's own lock file.
 const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
 process.env.TAILTERM_MATRIX_HOST_LOCK = join(isolated, "host.json");
+process.env.TAILTERM_MATRIX_MAX_HOLDERS = "1";
+const readHostState = (...args) => {
+  const state = rawReadHostState(...args);
+  const held = holdersOf(state);
+  assert(held.length <= 1, "legacy capacity-one fixture has at most one holder");
+  return state ? { ...state, holder: held[0] || null } : state;
+};
 delete process.env.TAILTERM_MATRIX_PRIORITY;
 delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
@@ -58,6 +69,7 @@ const request = (path, extra = {}) => ({
   item: "wi_test",
   agent: "tester",
   ...extra,
+  environment: { TAILTERM_MATRIX_MAX_HOLDERS: "1", ...extra.environment },
 });
 async function until(condition, what, ms = 15000) {
   const deadline = Date.now() + ms;
@@ -68,7 +80,7 @@ async function until(condition, what, ms = 15000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
-const waitersOf = (path) => readHostState(path)?.waiters || [];
+const waitersOf = (path) => rawReadHostState(path)?.waiters || [];
 const events = (path) => readJournal(path).map((line) => line.event);
 const RECOVERY = ["stale-recovered", "overlap", "waiter-dropped", "mutex-recovered", "guard-stale", "corrupt-file"];
 function exitedPid() {
@@ -101,6 +113,7 @@ if (o.mode === 'hold') {
     group = child.pid;
     lease.addGroup(group);
   }
+  process.on('SIGUSR1', async () => { await lease.release(); process.exit(0); });
   fs.writeFileSync(o.marker, JSON.stringify({ pid: process.pid, id: lease.id, group }));
   if (o.after === 'exit') process.exit(0);
   if (o.after === 'throw') throw new Error('fixture failure while holding');
@@ -144,7 +157,7 @@ async function heldByChild(t, path, { request: extra, ...options } = {}) {
   await until(() => existsSync(marker), "the child to hold the lock");
   const info = JSON.parse(readFileSync(marker, "utf8"));
   if (info.group) t.after(() => kill(-info.group));
-  if (info.group) await until(() => readHostState(path)?.holder?.groups?.includes(info.group), "the group to be on file");
+  if (info.group) await until(() => holdersOf(rawReadHostState(path)).some(h => h.id === info.id && h.groups?.includes(info.group)), "the group to be on file");
   return { child, ...info };
 }
 const exited = (child) => (child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, "close"));
@@ -161,7 +174,7 @@ test("a1 a11 the lock path is the documented home path unless the override names
   assert(!existsSync(join(home, ".local")), "status creates nothing");
 });
 
-test("a1 the lock file is version 1 JSON with the holder, its groups and the waitlist, and status prints the same", async (t) => {
+test("a1 the lock file is version 2 JSON with the holder, its groups and the waitlist, and status prints the same", async (t) => {
   const path = lockFile(t),
     record = tempDir(t);
   const run = execWithHostLock([process.execPath, "-e", "setTimeout(()=>{},600)"], {
@@ -176,8 +189,9 @@ test("a1 the lock file is version 1 JSON with the holder, its groups and the wai
   }, "the exec holder and its group");
   const waiting = acquireHostLock(request(path, { item: "wi_waiter" }));
   await until(() => waitersOf(path).length === 1, "the waiter");
-  const now = JSON.parse(readFileSync(path, "utf8"));
-  assert.equal(now.version, 1);
+  const now = readHostState(path);
+  assert.equal(now.version, 2);
+  assert.equal(now.holderLimit, 1);
   assert.equal(now.holder.kind, "exec");
   assert.equal(now.holder.item, "wi_exec");
   assert.equal(now.holder.priority, "high");
@@ -192,7 +206,7 @@ test("a1 the lock file is version 1 JSON with the holder, its groups and the wai
   assert.match(text, /\n {2}1 of 1: wi_waiter\/tester\/pid \d+ \(run, normal\/default\)/);
   const json = JSON.parse(execFileSync(process.execPath, [moduleFile, "status", "--json"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" }));
   assert.equal(json.path, path);
-  assert.equal(json.state.holder.id, now.holder.id);
+  assert.equal(json.state.holders[0].id, now.holder.id);
   assert.equal(await run, 0);
   await (await waiting).release();
   assert.equal(readHostState(path).holder, null);
@@ -898,7 +912,7 @@ test("a9 (iii) a waiter under a smaller cap never shortens the deadline a living
   for (const [name, recorded] of Object.entries(cases)) {
     const path = lockFile(t);
     const holder = await acquireHostLock(request(path, { item: "wi_holder", runTimeoutMs: 60000 }));
-    assert(updateHostState(path, (state) => void (state.holder.runTimeoutMs = recorded)).done);
+    assert(updateHostState(path, (state) => void (state.holders[0].runTimeoutMs = recorded)).done);
     const started = Date.parse(readHostState(path).holder.startedAt);
     // First the waiter's clock is far past its own one-minute cap, yet inside
     // the holder's recorded deadline plus grace.
@@ -926,4 +940,155 @@ test("a9 (iii) a waiter under a smaller cap never shortens the deadline a living
     await lease.release();
     await holder.release();
   }
+});
+
+// wi_af52350b616dd0e4 / order21517 / ASSIGN22512: real default-two cohorts.
+const two = { environment: { TAILTERM_MATRIX_MAX_HOLDERS: undefined }, maxWaitMs: 5000 };
+const allHeld = path => holdersOf(rawReadHostState(path));
+async function releaseChild(held) { held.child.kill("SIGUSR1"); await exited(held.child); }
+test("two holders run concurrently; either freed slot grants priority then FIFO with a third waiting", async t => {
+  for (const slot of [0, 1]) {
+    const path = lockFile(t);
+    const cohort = slot === 0 ? two : { ...two, environment: { TAILTERM_MATRIX_MAX_HOLDERS: "" } };
+    const peers = [await heldByChild(t, path, { request: { ...cohort, item: "A" } }), await heldByChild(t, path, { request: { ...cohort, item: "B" } })];
+    assert.equal(rawReadHostState(path).version, 2); assert.equal(rawReadHostState(path).holderLimit, 2);
+    assert.equal(allHeld(path).length, 2);
+    const requests = [], order = [];
+    for (const [item, priority] of [["normal", "normal"], ["high-first", "high"], ["urgent", "urgent"], ["high-second", "high"]]) {
+      requests.push(acquireHostLock(request(path, { ...two, item, priority })).then(async lease => {
+        order.push(item); assert(allHeld(path).some(h => h.id === lease.id)); assert.equal(allHeld(path).length, 2);
+        assert.equal(lease.record.overlap, 0); await lease.release();
+      }));
+      await until(() => waitersOf(path).some(w => w.item === item), item);
+    }
+    assert.deepEqual(order, []); assert.equal(waitersOf(path).length, 4);
+    await releaseChild(peers[slot]); await Promise.all(requests);
+    assert.deepEqual(order, ["urgent", "high-first", "high-second", "normal"]);
+    assert.deepEqual(allHeld(path).map(h => h.id), [peers[1-slot].id]);
+    await releaseChild(peers[1-slot]); assert.deepEqual(allHeld(path), []);
+    assert.equal(events(path).filter(e => e === "acquire").length, 6);
+    assert(!events(path).includes("overlap"));
+  }
+});
+test("holder configuration is strict, defaults to two, and capacity freezes until the cohort drains", async t => {
+  assert.equal(holderLimit({}), 2); assert.equal(holderLimit({ TAILTERM_MATRIX_MAX_HOLDERS: "" }), 2);
+  for (const value of ["0", "-1", "2.1", " 2", "2 ", "x", "17", "02"])
+    assert.throws(() => holderLimit({ TAILTERM_MATRIX_MAX_HOLDERS: value }), /decimal integer/);
+  const path = lockFile(t), lease = await acquireHostLock(request(path, two));
+  const before = readFileSync(path, "utf8"), seq = rawReadHostState(path).requestSeq;
+  await assert.rejects(acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_MAX_HOLDERS: "3" } })), /frozen at 2/);
+  assert.equal(readFileSync(path, "utf8"), before); assert.equal(rawReadHostState(path).requestSeq, seq);
+  const record = join(tempDir(t), "invalid-sidecar");
+  await assert.rejects(acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_MAX_HOLDERS: "0" }, recordDirectory: record })), /decimal integer/);
+  assert(!existsSync(record)); await lease.release();
+  const leases = [];
+  for (let i = 0; i < 3; i++) leases.push(await acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_MAX_HOLDERS: "3" } })));
+  assert.equal(allHeld(path).length, 3); for (const l of leases) await l.release();
+});
+test("an occupied v1 cohort drains at capacity one then migrates without losing counters", async t => {
+  const path = lockFile(t), owner = await acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_MAX_HOLDERS: "1" } }));
+  const state = rawReadHostState(path), original = allHeld(path)[0];
+  writeFileSync(path, JSON.stringify({ ...state, version: 1, holder: original, holders: undefined, holderLimit: undefined }));
+  const queued = acquireHostLock(request(path, two)); await until(() => waitersOf(path).length === 1, "v1 waiter");
+  assert.equal(rawReadHostState(path).version, 1); await owner.release(); const next = await queued;
+  assert.equal(rawReadHostState(path).version, 1); assert.equal(allHeld(path).length, 1); await next.release();
+  const migrated = await acquireHostLock(request(path, two));
+  assert.equal(rawReadHostState(path).version, 2); assert.equal(rawReadHostState(path).requestSeq, 3); assert.equal(rawReadHostState(path).grantSeq, 3);
+  await migrated.release();
+  // The original parser's v1-only gate refuses these bytes, never interpreting a free singleton.
+  const old = execFileSync("git", ["show", "235f87402cfca765cf0051b6421e767592f3be63:scripts/verify-matrix-host-lock.mjs"], { encoding: "utf8" });
+  const oldFile = join(tempDir(t), "old-lock.mjs"); writeFileSync(oldFile, old);
+  const before = readFileSync(path, "utf8");
+  const attempt = spawnSync(process.execPath, [canonicalResource(oldFile), "status", "--json"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" });
+  assert.equal(attempt.status, EXIT_LOCK_UNUSABLE); assert.match(attempt.stderr, /unknown version/); assert.equal(readFileSync(path, "utf8"), before);
+});
+test("unknown or malformed v2 state is refused byte-for-byte", async t => {
+  const path = lockFile(t);
+  for (const value of [{ version: 9 }, { version: 2, holderLimit: 0, holders: [], waiters: [], requestSeq: 0, grantSeq: 0 },
+    { version: 2, holderLimit: 2, holders: [{ id: "x", pid: 0 }], waiters: [], requestSeq: 0, grantSeq: 0 }]) {
+    const raw = JSON.stringify(value); writeFileSync(path, raw);
+    await assert.rejects(acquireHostLock(request(path, two)), /unusable/); assert.equal(readFileSync(path, "utf8"), raw);
+  }
+});
+test("canonical worktree head cannot be bypassed and duplicate output aliases refuse before sidecars", async t => {
+  const path = lockFile(t), root = tempDir(t), alias = join(tempDir(t), "alias"); symlinkSync(root, alias);
+  assert.equal(canonicalResource(join(alias, "new")), join(canonicalResource(root), "new"));
+  const output = join(root, "records"), sidecars = join(root, "sidecars"), owner = await acquireHostLock(request(path, { ...two, worktree: root, output, recordDirectory: sidecars }));
+  const queued = acquireHostLock(request(path, { ...two, worktree: alias, item: "head" }));
+  await until(() => waitersOf(path).length === 1, "blocked head");
+  const later = acquireHostLock(request(path, { ...two, worktree: tempDir(t), item: "later" }));
+  await until(() => waitersOf(path).length === 2, "later waiter");
+  assert.equal(allHeld(path).length, 1, "head not skipped despite spare capacity");
+  const before = readFileSync(path, "utf8");
+  await assert.rejects(acquireHostLock(request(path, { ...two, output: join(alias, "records"), recordDirectory: join(alias, "records") })), /already in use/);
+  assert.equal(readFileSync(path, "utf8"), before); assert(!existsSync(output), "no rejected sidecar directory");
+  const peerRecord = readFileSync(join(sidecars, "host-lock.json"), "utf8"), otherOutput = join(root, "other-output");
+  await assert.rejects(acquireHostLock(request(path, { ...two, output: otherOutput, recordDirectory: join(alias, "sidecars") })), /already in use/);
+  assert.equal(readFileSync(path, "utf8"), before); assert(!existsSync(otherOutput));
+  assert.equal(readFileSync(join(sidecars, "host-lock.json"), "utf8"), peerRecord);
+  const mutex = lockPaths(path).mutex;
+  writeFileSync(mutex, JSON.stringify({ pid: process.pid, token: "busy-fixture" }));
+  try {
+    await assert.rejects(acquireHostLock(request(path, { ...two, output: otherOutput, recordDirectory: sidecars, maxWaitMs: 60 })), /wait expired/);
+    assert.equal(readFileSync(join(sidecars, "host-lock.json"), "utf8"), peerRecord);
+    assert.equal(readFileSync(path, "utf8"), before);
+  } finally { rmSync(mutex, { force: true }); }
+  await owner.release(); const head = await queued, tail = await later;
+  assert.equal(allHeld(path).length, 2); await head.release(); await tail.release();
+});
+test("group tracking, release and exit recovery address only the exact holder and leave its live peer", async t => {
+  const path = lockFile(t), first = await heldByChild(t, path, { group: true, request: two }), second = await heldByChild(t, path, { group: true, request: two });
+  assert.equal(allHeld(path).length, 2); assert(allHeld(path).every(h => h.groups.length === 1));
+  const secondBefore = structuredClone(allHeld(path).find(h => h.id === second.id));
+  await releaseChild(first); assert.deepEqual(allHeld(path), [secondBefore]); assert(!groupGone(second.group));
+  const own = await acquireHostLock(request(path, two)); own.addGroup(first.group); own.removeGroup(first.group); await own.release();
+  assert.deepEqual(allHeld(path), [secondBefore]);
+  second.child.kill("SIGKILL"); await exited(second.child); kill(-second.group); await until(() => groupGone(second.group), "second group gone");
+  const recovered = await acquireHostLock(request(path, two)); assert.equal(allHeld(path).length, 1); assert.equal(recovered.record.overlap, 0);
+  assert(events(path).includes("stale-recovered")); await recovered.release();
+});
+
+test("two real runPlan invocations have private homes, tmux namespaces and ports; cancelling one preserves its peer", async t => {
+  const path = lockFile(t), markers = [join(tempDir(t), "a.json"), join(tempDir(t), "b.json")], done = join(tempDir(t), "done");
+  const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process';
+    const tmux=spawnSync('tmux',['-L','two-run','new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
+    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
+    setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L','two-run','kill-server']);server.close(()=>process.exit(0));}},30);`;
+  const a = runnerFixture(t, source(markers[0], false)), b = runnerFixture(t, source(markers[1], true));
+  const outs = [tempDir(t), tempDir(t)], abort = new AbortController();
+  const first = runPlan(a.plan, a.cwd, outs[0], { minFreeBytes: 0, abortSignal: abort.signal, hostLock: { path, ...two, pollMs: 20 } });
+  const rejected = assert.rejects(first, /Verification interrupted by cancel-peer/);
+  const second = runPlan(b.plan, b.cwd, outs[1], { minFreeBytes: 0, hostLock: { path, ...two, pollMs: 20 } });
+  try {
+  await until(()=>markers.every(existsSync), "both real checks started", 30000);
+  const [ea, eb] = markers.map(f=>JSON.parse(readFileSync(f,"utf8")));
+  assert.equal(allHeld(path).length, 2); assert.notEqual(ea.port, eb.port);
+  for (const key of ["HOME", "TMPDIR", "TMUX_TMPDIR", "GOPATH", "GOMODCACHE", "GOCACHE"])assert.notEqual(ea[key],eb[key],key);
+  for(const e of [ea,eb])assert(existsSync(join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,"two-run")), "private actual tmux socket");
+  abort.abort("cancel-peer"); await rejected;
+  assert(!existsSync(ea.HOME)); assert(existsSync(eb.HOME)); assert(!pidGone(eb.pid));
+  assert.equal(allHeld(path).length, 1); assert.equal(allHeld(path)[0].output, canonicalResource(outs[1]));
+  const {createConnection}=await import('node:net');
+  const socket=createConnection({host:'127.0.0.1',port:eb.port}); const message=await once(socket,'data');assert.equal(message[0].toString(),'peer alive');socket.destroy();
+  assert(!existsSync(join(outs[0],"receipt.json"))); writeFileSync(done,"done"); await second;
+  assert(existsSync(join(outs[1],"receipt.json"))); assert(!existsSync(eb.HOME));assert.deepEqual(allHeld(path),[]);
+  for (const out of outs)assert.equal(JSON.parse(readFileSync(join(out,"host-lock.json"),"utf8")).overlap,0);
+  } finally { abort.abort("cleanup"); writeFileSync(done,"done"); await Promise.allSettled([first, second, rejected]); }
+});
+
+test("a third real child remains waiting until one of two real holder children releases", async t => {
+ const path=lockFile(t),a=await heldByChild(t,path,{request:two}),b=await heldByChild(t,path,{request:two});
+ const marker=join(tempDir(t),"third"),child=startChild(t,childScript(t),{mode:"hold",marker,request:request(path,{...two,item:"C"})});
+ await until(()=>waitersOf(path).some(w=>w.item==="C"),"third child queued");assert(!existsSync(marker));assert.equal(allHeld(path).length,2);
+ await releaseChild(b);await until(()=>existsSync(marker),"third child granted");const c=JSON.parse(readFileSync(marker,"utf8"));
+ assert.deepEqual(new Set(allHeld(path).map(h=>h.id)),new Set([a.id,c.id]));
+ assert.equal(readJournal(path).filter(e=>e.event==="acquire").at(-1).overlap,0);
+ await releaseChild({child});await releaseChild(a);assert.deepEqual(allHeld(path),[]);
+});
+test("overdue takeover in a two-holder cohort records exceptional overlap and leaves the other peer intact", async t => {
+ const path=lockFile(t),a=await heldByChild(t,path,{group:true,request:{...two,runTimeoutMs:300}}),b=await heldByChild(t,path,{group:true,request:two});
+ const peer=structuredClone(allHeld(path).find(h=>h.id===b.id));
+ const next=await acquireHostLock(request(path,{...two,graceMs:20}));
+ assert.equal(next.record.overlap,1);assert.equal(next.record.overlapDetails.holder,a.id);assert(!pidGone(a.pid));assert(!groupGone(a.group));
+ assert.deepEqual(allHeld(path).find(h=>h.id===b.id),peer);assert(!groupGone(b.group));await next.release();await releaseChild(a);await releaseChild(b);
 });

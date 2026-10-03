@@ -43,7 +43,7 @@ export async function exerciseImageUpload(page, files, getInput, control) {
   );
   await page.waitForTimeout(100);
   assert.ok(getInput().includes("'/tmp/fixture uploads/drop-test.png'"));
-  await page.screenshot({ path: "/tmp/tailterm-upload-preview.png" });
+  await page.screenshot({ path: `.build/upload-${process.argv[1].split('/').at(-1).replace(/\.mjs$/, '')}-${process.env.TEST_BROWSER || 'chromium'}.png` });
   await page.locator("#upload-cancel").click();
   // Clipboard images use the review flow, and hiding it does not stop transfer.
   control.delay = 100;

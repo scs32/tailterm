@@ -1,6 +1,7 @@
 // Focused Chromium/WebKit checks against a real, isolated Go hub database.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -25,8 +26,9 @@ if (ttBinary !== path.join(state, "tt")) await symlink(ttBinary, path.join(state
 // run alive like the catalog's sleep command without reaching a real CLI.
 await writeFile(path.join(state, "codex"), "#!/bin/sh\nexec sleep 300\n");
 await chmod(path.join(state, "codex"), 0o755);
-// Stop sessions a crashed earlier run left on this socket, as teardown does.
-await exec("tmux", ["-L", "tailterm-form-check", "kill-server"]).catch(
+const tmuxSocket = `tf-${process.pid}-${randomUUID().slice(0, 8)}`;
+// Setup and teardown operate only on this invocation's private socket.
+await exec("tmux", ["-L", tmuxSocket, "kill-server"]).catch(
   () => {},
 );
 const reserve = createServer();
@@ -238,7 +240,7 @@ const server = createServer(async (req, res) => {
             ...fixtureEnv,
             PATH: state + path.delimiter + process.env.PATH,
             TAILTERM_HUB: `http://127.0.0.1:${port}`,
-            TT_TMUX_SOCKET: "tailterm-form-check",
+            TT_TMUX_SOCKET: tmuxSocket,
             TAILTERM_RELAY_STATE: path.join(state, "relay"),
           },
           timeout: 20000,
@@ -1749,7 +1751,7 @@ s.commit()
       for (const agent of closedDetail.agents) {
         const exists = await exec("tmux", [
           "-L",
-          "tailterm-form-check",
+          tmuxSocket,
           "has-session",
           "-t",
           "=" + agent.session,
@@ -1930,7 +1932,7 @@ s.commit()
     }
   }
 } finally {
-  await exec("tmux", ["-L", "tailterm-form-check", "kill-server"]).catch(
+  await exec("tmux", ["-L", tmuxSocket, "kill-server"]).catch(
     () => {},
   );
   backend.kill("SIGTERM");

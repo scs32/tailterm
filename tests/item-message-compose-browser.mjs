@@ -416,7 +416,7 @@ try {
         await page.setViewportSize({ width: 390, height: 740 });
         await page.locator("#notice").evaluate((el) => (el.textContent = ""));
         await page.screenshot({
-          path: `/tmp/item-message-correction-${name}-${kind}-narrow.png`,
+          path: `.build/item-message-correction-${name}-${kind}-narrow.png`,
         });
         assert.equal(
           await page.evaluate(
@@ -919,7 +919,7 @@ try {
       await page.setViewportSize({ width: 390, height: 740 });
       await page.locator("#notice").evaluate((el) => (el.textContent = ""));
       await page.screenshot({
-        path: `/tmp/item-message-correction-${name}-narrow.png`,
+        path: `.build/item-message-correction-${name}-narrow.png`,
       });
       assert.equal(
         await page.evaluate(

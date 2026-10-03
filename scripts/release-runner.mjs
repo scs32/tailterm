@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
-import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
+import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
 
@@ -150,11 +150,13 @@ const MATRIX_CHILDREN = new Map();
 // same place is not.
 export function matrixWaitNotice(job, wait) {
   if (!job?.id || !wait || !ATTEMPT.test(wait.attempt || "") || !Number.isSafeInteger(wait.position) || !Number.isSafeInteger(wait.length)) return null;
-  const h = wait.holder, pid = Number.isSafeInteger(h?.pid) ? h.pid : "unknown", again = Number.isSafeInteger(wait.change) && wait.change > 1 ? `-n${wait.change}` : "";
-  const id = holder => `${job.id}-matrix-wait-${wait.attempt}-p${wait.position}-of${wait.length}-${holder}${again}`, full = id(h ? NAME(h.id) : "none");
-  // The hub accepts at most 128 characters; a shortened holder id keeps the place distinct.
-  return {requestId: full.length <= 128 ? full : id(NAME(h?.id).slice(0, 8)), subject: "A release job is waiting for the verification host",
-    text: `Release ${job.id} waits for the verification host at position ${wait.position} of ${wait.length} at priority ${NAME(wait.priority)} ${h ? `behind ${NAME(h.item)}/${NAME(h.agent)}/pid ${pid}` : "with no holder"}`};
+  const holders = wait.holders || (wait.holder ? [wait.holder] : []);
+  const names = holders.map(h => NAME(h.id)).sort();
+  const identity = names.length > 1 ? createHash("sha256").update(JSON.stringify(names)).digest("hex").slice(0, 24) : names[0] || "none";
+  const again = Number.isSafeInteger(wait.change) && wait.change > 1 ? `-n${wait.change}` : "";
+  const id = h => `${job.id}-matrix-wait-${wait.attempt}-p${wait.position}-of${wait.length}-${h}${again}`, full = id(identity);
+  return {requestId: full.length <= 128 ? full : id(identity.slice(0, 8)), subject: "A release job is waiting for the verification host",
+    text: `Release ${job.id} waits for the verification host at position ${wait.position} of ${wait.length} at priority ${NAME(wait.priority)} ${holders.length ? "behind " + holders.map(h => `${NAME(h.item)}/${NAME(h.agent)}/pid ${Number.isSafeInteger(h.pid) ? h.pid : "unknown"}`).join("; ") : "with no holder"}`};
 }
 export function matrixHeldNotice(job, held) {
   if (!job?.id || !held || !(ATTEMPT.test(held.attempt || "") || held.attempt === ALL_ATTEMPTS)) return null;
@@ -540,13 +542,21 @@ export class HostAdapter {
   hostState(){return readHostState(lockPath());}
   // The run's entry in the host lock file, found by its output directory:
   // null when it has none, undefined when the file cannot be read.
-  matrixEntry(dir){
+  matrixEntry(dir,run){
     let state;try{state=this.hostState();}catch{return undefined;}
     if(!state)return null;
-    const output=resolve(dir);
-    if(state.holder?.output===output)return {state,role:"holder",entry:state.holder};
-    const index=state.waiters.findIndex(w=>w?.output===output);
-    return index<0?null:{state,role:"waiter",index,entry:state.waiters[index]};
+    try {
+      const output=canonicalResource(dir), matches=[];
+      for(const entry of holdersOf(state)) if(entry.output && canonicalResource(entry.output)===output) matches.push({state,role:"holder",entry});
+      state.waiters.forEach((entry,index)=>{if(entry.output && canonicalResource(entry.output)===output)matches.push({state,role:"waiter",index,entry});});
+      if(matches.length>1)return {ambiguous:true};
+      const match=matches[0];
+      if(!match)return null;
+      let leaseId=run?.leaseId;
+      try {leaseId ||= JSON.parse(readFileSync(join(dir,"host-lock.json"),"utf8")).id;} catch {}
+      if((leaseId && match.entry.id!==leaseId) || (run?.pid && match.entry.pid!==run.pid))return null;
+      return match;
+    } catch {return undefined;}
   }
   // The outcome the run itself recorded on leaving the list (released,
   // wait-expired, withdrawn, or a failure while waiting); null until then.
@@ -562,7 +572,7 @@ export class HostAdapter {
   // signalled. Held means the run could not be confirmed stopped; the job
   // then keeps the fence until it can.
   resolveMatrixRun(dir,run,stop=false){
-    const now=this.now(),child=this.matrixChildren.get(dir),found=this.matrixEntry(dir),sidecar=this.matrixSidecar(dir);
+    const now=this.now(),child=this.matrixChildren.get(dir),found=this.matrixEntry(dir,run),sidecar=this.matrixSidecar(dir);
     const persist=()=>{try{this.saveRun(dir,run);return true;}catch{return false;}};
     const alive=()=>[...new Set([...(run.snapshot?.groups||[]),...(run.groups||[])])].filter(g=>!this.groupGone(g));
     const held=reason=>{persist();this.matrixHeld={attempt:basename(dir),pid:run.pid??null,groups:run.state==="started"?alive():[],reason};return "held";};
@@ -570,6 +580,8 @@ export class HostAdapter {
     // A run that was not stopped and left a receipt ended normally, whatever
     // the record knew of it; the receipt's eligibility is checked at import.
     const ending=()=>run.stopRequestedAt?end("stopped","Integrated matrix run exceeded its bound"):existsSync(join(dir,"receipt.json"))?end("receipt"):sidecar==="wait-expired"?end("wait-expired","Verification host wait expired"):end("no-receipt","Integrated matrix run ended without a receipt");
+    if(found?.ambiguous)return held("host lock identity ambiguous");
+    if(found?.entry)run.leaseId ||= found.entry.id;
     if(run.state==="unreadable"){this.matrixHeld={attempt:basename(dir),pid:null,groups:[],reason:"attempt record unreadable"};return "held";}
     if(run.state==="starting"){
       // An unconfirmed launch: adopt the run from this process's child or
@@ -590,11 +602,11 @@ export class HostAdapter {
     const exited=child?child.exitCode!==null||child.signalCode!==null:this.pidGone(run.pid);
     if(!exited){
       if(!stop && now<run.launchedAt+run.hostWaitMs+run.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS){
-        const h=mine?.state.holder;
+        const holders=mine ? holdersOf(mine.state) : [];
         if(mine?.role==="waiter"){
-          const place=`${mine.index+1}/${mine.state.waiters.length}/${h?.id??""}`;
+          const place=`${mine.index+1}/${mine.state.waiters.length}/${holders.map(h=>h.id).sort().join(",")}`;
           if(run.waitPlace!==place){run.waitPlace=place;run.waitChange=(run.waitChange||0)+1;}
-          this.matrixWait={attempt:basename(dir),position:mine.index+1,length:mine.state.waiters.length,priority:run.priority,change:run.waitChange,holder:h?{id:h.id,item:h.item,agent:h.agent,pid:h.pid}:null};
+          this.matrixWait={attempt:basename(dir),position:mine.index+1,length:mine.state.waiters.length,priority:run.priority,change:run.waitChange,holders:holders.map(h=>({id:h.id,item:h.item,agent:h.agent,pid:h.pid}))};
         }
         persist();return "waiting";
       }
@@ -614,7 +626,9 @@ export class HostAdapter {
       // from its lock entry as read after it was gone, which it can no longer
       // change: the entry is read again here, after the pid was seen gone.
       // Another waiter may have replaced that entry first.
-      const after=this.matrixEntry(dir),last=after && after.entry.pid===run.pid?after:null;
+      const after=this.matrixEntry(dir,run);
+      if(after?.ambiguous)return held("host lock identity ambiguous");
+      const last=after?.entry?.pid===run.pid?after:null;
       if(last)run.snapshot={at:now,role:last.role,groups:(last.entry.groups||[]).filter(Number.isSafeInteger)};
       if(!run.snapshot)return held(after===undefined?"host lock file unreadable":"check group state cannot be shown");
       if(alive().length)return held("a check group of the matrix run is still alive");

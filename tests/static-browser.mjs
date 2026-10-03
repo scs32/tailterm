@@ -720,7 +720,7 @@ try {
   await page.locator("#rename-session-error").waitFor({ state: "visible" });
   assert.ok(sessions.has("named-static"));
   await page.locator("#rename-session-name").fill("renamed-static");
-  await page.screenshot({ path: "/tmp/tailterm-session-rename.png" });
+  await page.screenshot({ path: `.build/static-session-rename-${engine}.png` });
   await page.locator("#rename-session-submit").click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
   assert.ok(sessions.has("renamed-static"));
