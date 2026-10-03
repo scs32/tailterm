@@ -340,7 +340,21 @@ func helperRegister(e env, args []string) error {
 		return err
 	}
 	hash := helperRequestHash(req, thread)
+	// Before thread-aware hashes, Claude stored only the request shape. A
+	// matching key can recover its receipt, but is not proof of its thread.
+	legacyReq := req
+	legacyReq.RequestID = ""
+	legacyBytes, _ := json.Marshal(legacyReq)
+	legacySum := sha256.Sum256(legacyBytes)
+	legacyPending := runtime == "claude" && state.PendingRequest != "" &&
+		state.PendingHash == hex.EncodeToString(legacySum[:]) &&
+		(*requestID == "" || *requestID == state.PendingRequest)
+	if legacyPending && (state.Runtime != "" && state.Runtime != runtime || state.Thread != "" && state.Thread != thread) {
+		return errors.New("legacy registration retry belongs to another saved runtime/thread; use a new key")
+	}
 	switch {
+	case legacyPending:
+		req.RequestID = state.PendingRequest
 	case *requestID != "":
 		if state.PendingRequest == *requestID && state.PendingHash != hash || state.RequestID == *requestID && state.RequestHash != hash {
 			return errors.New("registration retry key belongs to another runtime/thread; use a new key")
@@ -354,11 +368,16 @@ func helperRegister(e env, args []string) error {
 			return err
 		}
 	}
-	state.PendingRequest, state.PendingHash = req.RequestID, hash
-	if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
-		return err
+	if !legacyPending {
+		state.PendingRequest, state.PendingHash = req.RequestID, hash
+		if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
+			return err
+		}
 	}
 	clearPending := func() {
+		if legacyPending {
+			return // retain the original recovery evidence
+		}
 		state.PendingRequest, state.PendingHash = "", ""
 		_ = writePrivateJSON(ownerHelperPath(e.hub, *task), state)
 	}
@@ -383,6 +402,22 @@ func helperRegister(e env, args []string) error {
 	if current.Runtime != runtime || current.RunID != a.RunID || current.Role != api.AgentRoleOwnerHelper || current.Status == api.AgentClosed || current.Status == api.AgentExited {
 		clearPending()
 		return errors.New("the registered run is no longer the helper's current run; register again")
+	}
+	if legacyPending && (state.Thread == "" || state.Agent != a.ID || state.Run != a.RunID) {
+		// An older saved helper thread can belong to the previous run, not this
+		// uncertain registration. Never promote it into evidence for a new run.
+		detail := "legacy registration receipt recovered; not ready: original thread evidence is missing. Run tt helper register with a new explicit --request-id from the intended runtime session to register deliberately"
+		if *asJSON {
+			printJSON(struct {
+				api.OwnerActionResult
+				Ready        bool   `json:"ready"`
+				RecoveryOnly bool   `json:"recoveryOnly"`
+				Detail       string `json:"detail"`
+			}{OwnerActionResult: out, Ready: false, RecoveryOnly: true, Detail: detail})
+		} else {
+			fmt.Printf("recovered receipt %s for helper %s, run %s\n%s\n", out.Registration.ID, a.ID, a.RunID, detail)
+		}
+		return nil
 	}
 	b := runtimeBinding{Hub: e.hub, Task: *task, Agent: a.ID, Run: a.RunID, Thread: thread, Runtime: runtime, Codex: codex, CodexHome: codexHome, Role: api.AgentRoleOwnerHelper, Session: req.Session, Cwd: cwd, CreatedAt: time.Now().UTC()}
 	if inTmux {

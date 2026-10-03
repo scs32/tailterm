@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1351,5 +1353,155 @@ func TestHelperCodexOutsideTmux(t *testing.T) {
 	}
 	if state, err := loadOwnerHelperFile(f.owner.hub, f.task.ID); err != nil || state.Runtime != "codex" || state.Thread != f.thread {
 		t.Fatalf("outside tmux state %+v %v", state, err)
+	}
+}
+
+// A previous CLI saved only the request hash before the hub committed a reply
+// that never reached it. Upgrading must not silently register a second run.
+func TestHelperLegacyClaudePendingReplay(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		for _, identity := range []string{"unknown", "exact", "foreign-thread", "foreign-runtime", "previous-run"} {
+			t.Run(fmt.Sprintf("explicit-%v/%s", explicit, identity), func(t *testing.T) {
+				f := newHelperFixture(t)
+				upstream, _ := url.Parse(f.owner.hub)
+				proxy := httputil.NewSingleHostReverseProxy(upstream)
+				var drop atomic.Bool
+				drop.Store(true)
+				type firstAttempt struct {
+					req    api.RegisterOwnerHelperRequest
+					result api.OwnerActionResult
+				}
+				first := make(chan firstAttempt, 1)
+				front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/owner-helper") && drop.Swap(false) {
+						body, _ := io.ReadAll(r.Body)
+						var attempt firstAttempt
+						json.Unmarshal(body, &attempt.req)
+						resp, err := http.Post(f.owner.hub+r.URL.Path, "application/json", bytes.NewReader(body))
+						if err == nil {
+							json.NewDecoder(resp.Body).Decode(&attempt.result)
+							resp.Body.Close()
+						}
+						first <- attempt
+						panic(http.ErrAbortHandler)
+					}
+					proxy.ServeHTTP(w, r)
+				}))
+				defer front.Close()
+				e := env{hub: front.URL, task: f.task.ID}
+				if _, err := f.register(t, e); err == nil {
+					t.Fatal("lost reply reported success")
+				}
+				attempt := <-first
+				committed := attempt.result
+				state, err := loadOwnerHelperFile(front.URL, f.task.ID)
+				if err != nil || state.PendingRequest == "" || committed.Agent == nil {
+					t.Fatalf("pending %+v committed %+v %v", state, committed, err)
+				}
+				// Exact pre-upgrade wire/state shape: request-only hash, no pending thread.
+				attempt.req.RequestID = ""
+				raw, _ := json.Marshal(attempt.req)
+				sum := sha256.Sum256(raw)
+				state.PendingHash = hex.EncodeToString(sum[:])
+				switch identity {
+				case "exact", "foreign-thread", "foreign-runtime", "previous-run":
+					state.Agent = committed.Agent.ID
+					state.Run = committed.Agent.RunID
+					state.Thread = f.thread
+					if identity == "foreign-thread" {
+						state.Thread = "00000000-0000-4000-8000-00000000dead"
+					}
+					if identity == "previous-run" {
+						state.Run = api.NewID("run")
+					}
+					if identity == "foreign-runtime" {
+						state.Runtime = "codex"
+					}
+				}
+				if err := writePrivateJSON(ownerHelperPath(front.URL, f.task.ID), state); err != nil {
+					t.Fatal(err)
+				}
+				var oldBinding runtimeBinding
+				if identity == "previous-run" {
+					oldBinding = runtimeBinding{Hub: front.URL, Task: f.task.ID, Agent: state.Agent, Run: state.Run, Thread: state.Thread, Runtime: "claude", Role: api.AgentRoleOwnerHelper, Session: "owner"}
+					if err := writeRelayBinding(oldBinding); err != nil {
+						t.Fatal(err)
+					}
+				}
+				args := []string{"register", "--task", f.task.ID, "--json"}
+				if explicit {
+					args = append(args, "--request-id", state.PendingRequest)
+				}
+				text, err := captureCLIOutput(t, func() error { return cmdHelper(e, args) })
+				if identity == "foreign-thread" || identity == "foreign-runtime" {
+					if err == nil || !strings.Contains(err.Error(), "another saved runtime/thread") {
+						t.Fatalf("foreign legacy caller %q %v", text, err)
+					}
+					if current, _ := f.c.GetAgent(context.Background(), f.task.ID, committed.Agent.ID); current.RunID != committed.Agent.RunID {
+						t.Fatal("foreign legacy caller changed run")
+					}
+					if after, _ := loadOwnerHelperFile(front.URL, f.task.ID); after != state {
+						t.Fatal("foreign legacy caller changed saved evidence")
+					}
+					return
+				}
+				var replay struct {
+					api.OwnerActionResult
+					Ready        bool
+					RecoveryOnly bool
+					Detail       string
+				}
+				if jsonErr := json.Unmarshal([]byte(text), &replay); jsonErr != nil {
+					t.Fatalf("output %q %v", text, jsonErr)
+				}
+				if err != nil || !replay.Replay || replay.Agent.RunID != committed.Agent.RunID || replay.Registration.RequestID != state.PendingRequest {
+					t.Fatalf("legacy replay %+v %v", replay, err)
+				}
+				if identity == "exact" {
+					binding, ok := readBinding(t, front.URL, committed.Agent.ID)
+					if replay.RecoveryOnly || !ok || binding.Thread != f.thread || binding.Run != committed.Agent.RunID || binding.Runtime != "claude" {
+						t.Fatalf("exact legacy replay %+v binding %+v", replay, binding)
+					}
+					again, err := f.register(t, e, "--request-id", state.PendingRequest)
+					if err != nil || !again.Replay || again.Agent.RunID != committed.Agent.RunID {
+						t.Fatalf("exact legacy explicit replay %+v %v", again, err)
+					}
+					return
+				}
+				if replay.Ready || !replay.RecoveryOnly || !strings.Contains(replay.Detail, "not ready") || !strings.Contains(replay.Detail, "new explicit --request-id") {
+					t.Fatalf("unknown thread reported ready %+v", replay)
+				}
+				if binding, ok := readBinding(t, front.URL, committed.Agent.ID); identity == "previous-run" {
+					if !ok || binding != oldBinding {
+						t.Fatal("receipt recovery changed previous run binding")
+					}
+				} else if ok {
+					t.Fatal("unknown legacy thread installed wake binding")
+				}
+				if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != "" {
+					t.Fatalf("unknown legacy thread tagged session %v", tags)
+				}
+				if after, _ := loadOwnerHelperFile(front.URL, f.task.ID); after != state {
+					t.Fatal("legacy recovery erased pending evidence")
+				}
+				humanText, err := captureCLIOutput(t, func() error { return cmdHelper(e, []string{"register", "--task", f.task.ID}) })
+				if err != nil || !strings.Contains(humanText, "not ready") || !strings.Contains(humanText, "new explicit --request-id") {
+					t.Fatalf("partial human output %q %v", humanText, err)
+				}
+				// Repeating recovery is still the same receipt, never a fresh run.
+				again, err := f.register(t, e)
+				if err != nil || !again.Replay || again.Agent.RunID != committed.Agent.RunID {
+					t.Fatalf("repeated recovery %+v %v", again, err)
+				}
+				fresh, err := f.register(t, e, "--request-id", "deliberate-fresh-thread")
+				if err != nil || fresh.Replay || fresh.Agent.RunID == committed.Agent.RunID {
+					t.Fatalf("explicit deliberate registration %+v %v", fresh, err)
+				}
+				binding, ok := readBinding(t, front.URL, fresh.Agent.ID)
+				if !ok || binding.Thread != f.thread || binding.Run != fresh.Agent.RunID {
+					t.Fatalf("deliberate thread binding %+v", binding)
+				}
+			})
+		}
 	}
 }
