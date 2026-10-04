@@ -47,43 +47,83 @@ const SETTLED = new Set(["released", "rolled_back", "refused", "superseded"]);
 // Read both views to terminal metadata before exposing any jobs to a caller.
 // The same ledger token covers both traversals; a changed ledger holds the poll.
 export function readReleaseSummaries(read) {
-  const jobs = [], ids = new Set(), cursors = new Set();
-  let snapshot = "";
+  const jobs = [], ids = new Set(), rows = new Set(), cursors = new Set();
+  let task;
+  let snapshot = "", head;
   for (const view of ["active", "settled"]) {
     let after = "", previous = 0;
     for (;;) {
       const argv = ["deployment", "list", "--view", view, "--limit", "200", ...(after ? ["--after", after] : []), ...(snapshot ? ["--snapshot", snapshot] : [])];
       const result = JSON.parse(read(argv)), p = result?.page;
       if (result?.version !== 1 || !Array.isArray(result.jobs) || !p || p.view !== view || !Number.isSafeInteger(p.limit) || p.limit < 1 || p.limit > 200 || result.jobs.length > p.limit || !/^[a-f0-9]{64}$/.test(p.snapshot || "") || (snapshot && snapshot !== p.snapshot) || typeof p.nextAfter !== "string") throw new Error("Invalid release page");
+      if (!snapshot) head = result.jobs;
       snapshot = p.snapshot;
       for (const j of result.jobs) {
-        if (j?.summary !== true || typeof j.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(j.id) || !Number.isSafeInteger(j.rowId) || j.rowId <= previous || ids.has(j.id) || typeof j.state !== "string" || SETTLED.has(j.state) !== (view === "settled")) throw new Error("Invalid release summary");
-        ids.add(j.id); previous = j.rowId; jobs.push(j);
+        if (j?.summary !== true || typeof j.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(j.id) || !Number.isSafeInteger(j.rowId) || j.rowId <= previous || ids.has(j.id) || rows.has(j.rowId) || typeof j.state !== "string" || SETTLED.has(j.state) !== (view === "settled")) throw new Error("Invalid release summary");
+        if (j.taskId !== undefined) { if (task !== undefined && j.taskId !== task) throw new Error("Release page task changed"); task = j.taskId; }
+        ids.add(j.id); rows.add(j.rowId); previous = j.rowId; jobs.push(j);
       }
       if (!p.nextAfter) break;
       if (!result.jobs.length || cursors.has(p.nextAfter)) throw new Error("Repeating release cursor");
       cursors.add(p.nextAfter); after = p.nextAfter;
     }
   }
+  for (const job of jobs) { Object.defineProperty(job, "releaseSnapshot", {value:snapshot}); Object.defineProperty(job, "releaseHead", {value:head}); }
+  Object.defineProperty(jobs, "releaseSnapshot", {value:snapshot});
+  Object.defineProperty(jobs, "releaseHead", {value:head});
   return jobs.sort((a,b) => a.rowId-b.rowId);
 }
-export function readReleaseDetail(read, summary) {
+// Compare every compact identity/pin and the projected receipt, including
+// omitted optional fields. A valid full detail may carry additional evidence.
+export function releaseProjection(job) {
+  const keys = ["id", "taskId", "entryId", "itemId", "itemRevision", "scopeRevision", "orderMessageSeq", "baseCommit", "commit", "verificationDigest", "state", "generation", "agentId", "runId", "pauseGeneration", "integratedCommit", "inputsCommit", "inputsDigest", "published", "settledAt"];
+  const out = Object.fromEntries(keys.filter(k => job[k] !== undefined).map(k => [k, job[k]]));
+  if (job.receipt) out.receipt = { outcome: job.receipt.outcome, commit: job.receipt.commit, targets: job.receipt.targets?.map(t => ({target:t.target, outcome:t.outcome})) };
+  if (job.supersession) out.supersession = { releasedCommit:job.supersession.releasedCommit, targets:job.supersession.targets };
+  return out;
+}
+export function readReleaseDetail(read, summary, {bookend = true} = {}) {
   const job = JSON.parse(read(["deployment", "get", "--job", summary.id]));
-  if (!job || job.summary === true || job.id !== summary.id || job.state !== summary.state || job.generation !== summary.generation || (summary.taskId && job.taskId !== summary.taskId)) throw new Error("Release detail changed or invalid");
+  if (!job || Array.isArray(job) || job.summary === true || JSON.stringify(releaseProjection(job)) !== JSON.stringify(releaseProjection(summary))) throw new Error("Release detail changed or invalid");
+  if (bookend && summary.releaseSnapshot) bookendReleaseLedger(read, summary.releaseSnapshot, summary.releaseHead);
   return job;
+}
+export function bookendReleaseLedger(read, snapshot, head) {
+  const p = JSON.parse(read(["deployment", "list", "--view", "active", "--limit", "200", "--snapshot", snapshot]));
+  if (p?.version !== 1 || !Array.isArray(p.jobs) || !p.page || p.page.view !== "active" || p.page.limit !== 200 || p.page.snapshot !== snapshot || typeof p.page.nextAfter !== "string" || p.jobs.length > 200 || (!p.jobs.length && p.page.nextAfter)) throw new Error("Release ledger changed during detail read");
+  let row = 0; const ids = new Set();
+  for (const j of p.jobs) {
+    if (j?.summary !== true || typeof j.id !== "string" || !Number.isSafeInteger(j.rowId) || j.rowId <= row || ids.has(j.id) || typeof j.state !== "string" || SETTLED.has(j.state)) throw new Error("Invalid release bookend summary");
+    row = j.rowId; ids.add(j.id);
+  }
+  if (head && JSON.stringify(p.jobs) !== JSON.stringify(head)) throw new Error("Release bookend projection changed");
+}
+// The underlying baseline reader orders Date milliseconds, then array order.
+// Supply exact RFC3339 nanosecond order first so fractional times within the
+// same millisecond remain correct. Equal times preserve ledger row order.
+export function deploymentBaselines(configured, jobs) {
+  const time = j => {
+    if (!j.settledAt) return null;
+    const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$/.exec(j.settledAt);
+    const ms = m ? Date.parse(m[1]+m[3]) : NaN;
+    if (!Number.isFinite(ms)) throw new Error("Invalid release settledAt");
+    return BigInt(ms)*1000000n + BigInt((m[2] || "").padEnd(9,"0"));
+  };
+  const ordered = jobs.map((job,index)=>({job,index,at:time(job)})).sort((a,b)=> a.at === b.at ? a.index-b.index : a.at === null ? -1 : b.at === null ? 1 : a.at < b.at ? -1 : 1).map(x=>x.job);
+  return releaseBaselines(configured, ordered);
 }
 
 export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   if (config.version !== 1 || !config.cwd || !config.journalDirectory || !/^rel_[a-f0-9]+$/.test(jobId || "")) throw new Error("Private activation config and job ID required");
   const jobs = readReleaseSummaries(deps.tt), summary = jobs.find(j => j.id === jobId);
   if (!summary) throw new Error("Only a claimed job waiting for inputs gets a manifest");
-  const job = readReleaseDetail(deps.tt, summary);
+  const job = readReleaseDetail(deps.tt, summary, {bookend:!dryRun});
   if (job?.state !== "claimed") throw new Error("Only a claimed job waiting for inputs gets a manifest");
   // Fast-forward releases have no imported integrated commit.
   const commit = job.integratedCommit || job.commit;
-  if (!sha(commit) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest || "")) throw new Error("Exact job binding required");
+  if (!Number.isSafeInteger(job.generation) || job.generation < 1 || !sha(commit) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest || "")) throw new Error("Exact job binding required");
   deps.git(["cat-file", "-e", `${commit}^{commit}`]);
-  const baselines = releaseBaselines(config.baselines, jobs), selected = selectReleaseTargets(config.cwd, baselines, commit);
+  const baselines = deploymentBaselines(config.baselines, jobs), selected = selectReleaseTargets(config.cwd, baselines, commit);
   const schema = schemaChanged(config.cwd, baselines.hub, commit);
   const dir = config.journalDirectory, manifestPath = join(dir, `${job.id}-inputs.json`);
   const command = [config.tt || "tt", "deployment", "inputs", "--job", job.id, "--generation", String(job.generation), "--commit", commit, "--file", manifestPath, "--request-id", `${job.id}-inputs-${commit.slice(0, 12)}`];
@@ -95,6 +135,7 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   const planTargets = t => pair.length === 2 ? pair : [t], planName = t => pair.length === 2 ? "truenas" : t;
   const releaseOf = t => `${job.id}-${commit.slice(0, 12)}-${BINARY[t] ? planName(t) : t}`;
   const plannedTrueNAS = t => { const name = planName(t); return { backupJobId: job.id, backup: `${BASE}/backups/before-${job.id}-${name}.sqlite`, planPath: join(dir, `${job.id}-${name}-plan.json`), preflightReceipt: join(dir, `${job.id}-${name}-preflight.json`), ...(schema ? { backupCopy: join(dir, `${job.id}-${name}-backup.sqlite`) } : {}), planTargets: planTargets(t) }; };
+  if (!dryRun) bookendReleaseLedger(deps.tt, jobs.releaseSnapshot, jobs.releaseHead);
   if (dryRun) {
     const targets = Object.fromEntries(selected.map(t => [t, { release: releaseOf(t), ...(BINARY[t] ? plannedTrueNAS(t) : {}) }]));
     return { dryRun: true, ...binding, generation: job.generation, schemaChanged: schema, targets, manifest: manifestPath, command };

@@ -1,10 +1,11 @@
 import test from "node:test";
+import {createServer} from "node:http";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync} from "node:fs";
+import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync,realpathSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
-import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -48,7 +49,7 @@ test("buf1 a valid fake tt deployment list above eight MiB parses and polls",t=>
  assert.ok(Buffer.byteLength(raw)>8*1024*1024);const jobs=JSON.parse(raw);
  assert.equal(jobs.version,1);assert.equal(jobs.jobs.length,1);assert.equal(jobs.jobs[0].padding.length,9*1024*1024);
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");assert.equal(poll.stderr,"");
- assert.equal(readFileSync(f.log,"utf8"),"deployment list --view settled\ndeployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\n");
+ assert.equal(readFileSync(f.log,"utf8"),"deployment list --view settled\ndeployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
 });
 test("buf2 real fake tt command overflow names ENOBUFS without payloads or claims",t=>{
  const f=bufferTT(t,`fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');const chunk=Buffer.alloc(1024*1024,120);for(let i=0;i<257;i++)fs.writeSync(2,chunk);`);
@@ -154,9 +155,9 @@ test("host Mini deploy that fails in host setup rolls back to the prior digest",
  assert.deepEqual(argvs.slice(0,2),[[bare.artifact,"host","setup","--from",bare.artifact],[bare.install,"host","setup","--rollback"]]);assert.equal(readFileSync(bare.install,"utf8"),"old CLI");
 });
 test("host receipt adapter writes its receipt beneath the provisioned journal directory",async()=>{
- const cwd=mkdtempSync(join(tmpdir(),"receipt-adapter-")),adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture",generation:5});let args;
- adapter.command=argv=>{args=argv;return JSON.stringify({id:"rel_fixture",generation:6,state:"released"});};
- const receipt={version:1,jobId:"rel_fixture",outcome:"released"};await adapter.finish(receipt,5);
+ const cwd=mkdtempSync(join(tmpdir(),"receipt-adapter-")),adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture",state:"merged",generation:5});let args;
+ adapter.command=argv=>{args=argv;return JSON.stringify({...adapter.job,generation:6,state:"released",receipt});};
+ const receipt={version:1,jobId:"rel_fixture",outcome:"released",targets:[]};await adapter.finish(receipt,5);
  assert.deepEqual(JSON.parse(readFileSync(join(cwd,"rel_fixture-receipt.json"),"utf8")),receipt);assert.ok(args.includes("rel_fixture-finish-5"));
 });
 
@@ -409,7 +410,7 @@ test("a7 publish and revert refuse while any worktree has tasks-hub checked out"
 });
 test("a4 host handler requests go to the project handler the hub resolves, never a fixed name",async()=>{
  const cwd=mkdtempSync(join(tmpdir(),"handler-adapter-")),calls=[];const adapter=new HostAdapter({cwd,journalDirectory:cwd,tt:"tt"},{id:"rel_fixture",commit:"a".repeat(40),itemId:"wi_fixture",itemRevision:2,orderMessageSeq:15262,generation:3});
- adapter.command=argv=>{calls.push(argv);if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123456789abcdef",name:"db-handler-sol61"});if(argv[2]==="get")return JSON.stringify({id:"rel_fixture"});return "";};
+ adapter.command=argv=>{calls.push(argv);if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123456789abcdef",name:"db-handler-sol61"});if(argv[2]==="get")return JSON.stringify({...adapter.job,state:"claimed"});return "";};
  assert.equal(await adapter.verifyInputs("b".repeat(40)),false);assert.equal(await adapter.requestBug({commit:"c".repeat(40),outcome:"committed"}),"rel_fixture-rollback-bug");
  const sends=calls.filter(a=>a[1]==="send");assert.equal(sends.length,2);for(const s of sends){assert.equal(s[s.indexOf("--to")+1],"agt_0123456789abcdef");assert.equal(s[s.indexOf("--work-item")+1],"wi_fixture");}
  assert.equal(sends[1][sends[1].indexOf("--request-id")+1],"rel_fixture-rollback-bug");assert.equal(sends[1][sends[1].indexOf("--work-order-message")+1],"15262");
@@ -433,7 +434,7 @@ test("a10 a superseded job is never selected, claimed or treated as a fence",asy
  assert.equal(runnableJob([superseded],"agent","run"),null);assert.equal(runnableJob([superseded,next],"agent","run"),next);
  const cwd=mkdtempSync(join(tmpdir(),"release-superseded-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");
  writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply([${JSON.stringify(superseded)}],a)));else process.exit(2);`);chmodSync(fakeTT,0o755);
- await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\n");
+ await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
 });
 test("b1 a recorded hand release advances the next poll's baselines with no config edit",async()=>{
  const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});const tt=change(f,"hub/cmd/tt/main.go","cli"),commit=change(f,"client/a.js","a");
@@ -442,7 +443,7 @@ test("b1 a recorded hand release advances the next poll's baselines with no conf
  writeFileSync(configPath,JSON.stringify({version:1,enabled:true,cwd:f.cwd,journalDirectory:home,tt:fakeTT,baselines:all(f.base)}));
  const superseded={id:"rel_hand",state:"superseded",settledAt:"2026-09-30T12:00:00.5Z",supersession:{releasedCommit:tt,release:"20260930-hand",handReleaseId:"hrl_0123456789abcdef",targets:["mini"]}};
  const verified={id:"rel_next",state:"verified",generation:1,commit};
- writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([superseded,verified])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2})}));else process.exit(2);`);chmodSync(fakeTT,0o755);
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([superseded,verified])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN})}));else process.exit(2);`);chmodSync(fakeTT,0o755);
  const seen=[];const release=async c=>{seen.push(c.baselines);};
  const config=JSON.parse(readFileSync(configPath,"utf8"));const before=readFileSync(configPath,"utf8");
  await serveDeployment(config,{once:true,configPath,release});
@@ -482,7 +483,7 @@ test("b1 an edited config baseline changes the next poll's target selection with
  const home=mkdtempSync(join(tmpdir(),"release-baselines-")),configPath=join(home,"deploy.json"),fakeTT=join(home,"tt");
  const write=b=>writeFileSync(configPath,JSON.stringify({version:1,enabled:true,cwd:f.cwd,journalDirectory:home,tt:fakeTT,baselines:b}));
  const verified={id:"rel_next",state:"verified",generation:1,commit};
- writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply([${JSON.stringify(verified)}],a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2})}));else process.exit(2);`);chmodSync(fakeTT,0o755);
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply([${JSON.stringify(verified)}],a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN})}));else process.exit(2);`);chmodSync(fakeTT,0o755);
  const all=b=>Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,b]));const selections=[];
  const release=async c=>{selections.push(selectReleaseTargets(f.cwd,c.baselines,commit));};
  write(all(f.base));const config=JSON.parse(readFileSync(configPath,"utf8"));
@@ -569,7 +570,7 @@ test("a7 the journal names the failed step, target and a bounded non-secret reas
  await assert.rejects(runRelease(c,a));const raw=readFileSync(c.journalPath,"utf8");assert.deepEqual(JSON.parse(raw).failure,{step:"deploy",target:"tailos",reason:"unclassified"});assert.ok(!raw.includes("SYNTHETIC_PRIVATE_TOKEN"));
  const g=fixture(),k=job(g,change(g,"client/a.js","a")),b=fake(),d=config(g,k);b.check=async()=>"identity";
  await assert.rejects(runRelease(d,b));assert.deepEqual(JSON.parse(readFileSync(d.journalPath,"utf8")).failure,{step:"live-check",target:"tailos",reason:"live verification failed"});
- const h=fixture(),m=job(h,change(h,"client/a.js","a")),e=fake(),n=config(h,m);let fences=0;e.fence=async()=>++fences<3;
+ const h=fixture(),m=job(h,change(h,"client/a.js","a")),e=fake(),n=config(h,m);let fences=0;e.fence=async()=>++fences<4;
  await assert.rejects(runRelease(n,e));assert.deepEqual(JSON.parse(readFileSync(n.journalPath,"utf8")).failure,{step:"prepare",target:"tailos",reason:"release fence lost"});
  const dir=mkdtempSync(join(tmpdir(),"release-reason-")),script=join(dir,"fake-deploy.mjs");
  writeFileSync(script,`process.stderr.write("SYNTHETIC_PRIVATE_TOKEN");console.log("progress");console.log(JSON.stringify({status:"failed",classification:"remote-operation-failed",stage:"bridge-binary-upload",message:"SYNTHETIC_PRIVATE_TOKEN",remoteDetail:"SYNTHETIC_PRIVATE_TOKEN /mnt/x"}));process.exit(2);`);
@@ -627,7 +628,7 @@ function matrixHost({plan=workedPlan,receipt={environment:{},checks:[{exitCode:0
  const calls=[];adapter.processStartTime=()=>null;
  adapter.startMatrixRun=(argv,dir)=>{calls.push({argv,dir});writeFileSync(join(dir,"receipt.json"),JSON.stringify(receipt));return exitedPid();};
  adapter.command=(argv,cwd,options)=>{calls.push({argv,timeout:options?.timeout??600000});
-  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify(jobs.find(j=>j.id==="rel_fixture")||{id:"rel_fixture"});
+  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify({...adapter.job,state:"claimed",generation:adapter.job.generation??1,...(jobs.find(j=>j.id==="rel_fixture")||{})});
   if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(plan));return "";}
   return "";};
@@ -640,7 +641,7 @@ test("p1 a missing matrix prerequisite refuses the release by name before any ma
  const f=fixture(),j=job(f,change(f,"client/a.js","a"));git(f.cwd,"checkout","tasks-hub");change(f,"client/c.js","c");
  ignorePrerequisites(f.cwd);placePrerequisites(f.cwd,[".build/test.wasm"]);
  const c=config(f,j),a=fake(),argvs=[];let escalation;
- const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>{argvs.push(argv);return argv[2]==="get"?JSON.stringify({id:"rel_fixture"}):"";};
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>{argvs.push(argv);return argv[2]==="get"?JSON.stringify({...host.job,state:"claimed",generation:host.job.generation??1}):"";};
  a.verifyIntegrated=x=>host.verifyIntegrated(x);a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
  await assert.rejects(runRelease(c,a),/refused/);
  assert.deepEqual(a.calls,["refuse","escalate"]);assert.ok(!argvs.some(x=>x.includes("scripts/verify-matrix.mjs")),"no matrix argv");
@@ -808,7 +809,7 @@ test("a3 behind a live holder and an earlier normal waiter, the deployer's run a
 test("a4 one wait notice per change of position, list length or holder, none on an unchanged poll, and one more when an earlier place returns",async t=>{
  const cwd=mkdtempSync(join(tmpdir(),"release-wait-notice-")),log=join(cwd,"log"),fakeTT=join(cwd,"tt"),commit="c".repeat(40),attempt=commit+"-r0";
  const verified={id:"rel_0123456789abcdef",state:"verified",generation:1,commit:"a".repeat(40)};
- writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([verified])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2})}));else if(a[0]==='send')require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');else process.exit(2);`);chmodSync(fakeTT,0o755);
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([verified])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified,state:"claimed",generation:2,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN})}));else if(a[0]==='send')require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');else process.exit(2);`);chmodSync(fakeTT,0o755);
  const A={id:"11111111-1111-4111-8111-111111111111",item:"wi_holder",agent:"verifier-1",pid:4242},B={id:"22222222-2222-4222-8222-222222222222",item:"wi_next",agent:"verifier-2",pid:4343};
  const at=(position,length,holder,change)=>({attempt,position,length,priority:"high",change,holder});
  const heldRun={attempt,pid:777,groups:[888,999],reason:"a check group of the matrix run is still alive"};
@@ -1053,7 +1054,7 @@ test("a10 a11 the fence notice never advises set-aside while the job's matrix ru
  const daemon=(records,held)=>{
   const cwd=mkdtempSync(join(tmpdir(),"release-fence-matrix-")),log=join(cwd,"log"),fakeTT=join(cwd,"tt");
   const a={id:"rel_a",state:"verified",generation:1,commit:"a".repeat(40)},b={id:"rel_b",state:"verified",generation:1,commit:"b".repeat(40)};
-  writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([a,b])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...a,state:"claimed",generation:2,agentId:"agt_d",runId:"run_d"})}));else if(a[0]==='send')require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');else process.exit(2);`);chmodSync(fakeTT,0o755);
+  writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([a,b])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...a,state:"claimed",generation:2,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN})}));else if(a[0]==='send')require('fs').appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');else process.exit(2);`);chmodSync(fakeTT,0o755);
   records.forEach((record,n)=>{const dir=join(cwd,"rel_a-integrated-verification",`${commit}-r${n}`);mkdirSync(dir,{recursive:true});if(record!==null)writeFileSync(join(dir,record==="set-aside"?"run.json.set-aside":"run.json"),typeof record==="string"?record:JSON.stringify(record));});
   const release=async(c,adapter)=>{adapter.matrixHeld=held?{attempt:commit+"-r0",pid:777,groups:[888],reason:"a check group of the matrix run is still alive"}:null;return {jobId:"rel_a",outcome:"waiting_matrix"};};
   return serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT},{once:true,release}).then(()=>({cwd,texts:readFileSync(log,"utf8").trim().split("\n").map(l=>JSON.parse(l)).map(x=>x[x.indexOf("--text")+1])}));
@@ -1213,7 +1214,7 @@ test("R6 an invalid TailOS switch window stops the daemon before any command",as
  writeFileSync(fakeTT,`#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\necho '{"version":1,"jobs":[],"page":{"view":"'$4'","limit":200,"snapshot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nextAfter":""}}'\n`);chmodSync(fakeTT,0o755);
  for(const bad of [-1,300001,"90000",1.5])await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:bad}}},{once:true}),/switch window/);
  assert.equal(existsSync(log),false);
- await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:120000}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\n");
+ await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:120000}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
 });
 const MATRIX_A='{"matrix":"approved"}\n',MATRIX_B='{"matrix":"changed"}\n';
 const uncoveredReason=`Matrix digest changed ${hash(MATRIX_A).slice(0,8)} to ${hash(MATRIX_B).slice(0,8)}; no owner approval covers it`;
@@ -1265,7 +1266,7 @@ function matrixChangeRelease(approvals){
  const host=new HostAdapter({cwd:f.cwd,journalDirectory:home},{id:"rel_fixture",agentId:"agt_fixture",runId:"run_fixture",generation:1});host.processStartTime=()=>null;
  host.startMatrixRun=(argv,dir)=>{argvs.push(argv);writeFileSync(join(dir,"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));return exitedPid();};
  host.command=argv=>{argvs.push(argv);
-  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify({id:"rel_fixture",state:"claimed",matrixApprovals:approvals});
+  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify({...host.job,state:"claimed",matrixApprovals:approvals});
   if(argv[1]==="deployment"&&argv[2]==="handler")return JSON.stringify({id:"agt_0123abcd"});
   if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){writeFileSync(argv[4],JSON.stringify(workedPlan));return "";}
   return "";};
@@ -1335,7 +1336,7 @@ test("T1 a hub or bridge probe that waited and is still not ready fails the live
  writeFileSync(fakeTT,`#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\necho '{"version":1,"jobs":[],"page":{"view":"'$4'","limit":200,"snapshot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nextAfter":""}}'\n`);chmodSync(fakeTT,0o755);
  for(const target of ["hub","bridge"])for(const bad of [-1,300001,"240000",1.5])await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{[target]:{host:"truenas",readyWindowMs:bad}}},{once:true}),/readiness window/);
  assert.equal(existsSync(log),false);
- await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{hub:{host:"truenas",readyWindowMs:120000},bridge:{host:"truenas"}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\n");
+ await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{hub:{host:"truenas",readyWindowMs:120000},bridge:{host:"truenas"}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
 });
 test("T2 a rollback that comes up late is restored, and a failed rollback still records what the probe saw",async()=>{
  for(const target of ["hub","bridge"]){
@@ -1513,7 +1514,7 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
  // A token-shaped tag is rejected: its length and why, never its text.
  const shaped=`token="${TOKEN}"`,rb=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(shaped);};},/Release failed/);
  assert.deepEqual(rb.journal.failure,{step:"prepare",target:"tailos",reason:"unclassified"});assert.deepEqual(rb.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});absent(rb.raw,TOKEN,"token=");
- const before=await journalOf(...start(),a=>{a.fence=async()=>{throw releaseError(shaped);};});
+ const before=await journalOf(...start(),a=>{let checks=0;a.fence=async()=>{if(!checks++)return true;throw releaseError(shaped);};});
  assert.equal(before.journal.refusalReason,"unclassified");assert.equal(before.journal.failure,undefined);assert.deepEqual(before.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});
  absent(before.raw+JSON.stringify(before.escalation),TOKEN,"token=");
  const long="SYNTHETICPRIVATETOKEN".repeat(10),rc=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(long);};},/Release failed/);
@@ -1521,7 +1522,7 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
  // An attempt record's refusal is read back from disk, so it is validated too.
  const d=fixture(),dj=job(d,change(d,"client/a.js","a"));git(d.cwd,"checkout","tasks-hub");change(d,"client/c.js","c");
  const rd=await journalOf(d,dj,(a,c)=>{
-  const host=new HostAdapter({cwd:d.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>argv[2]==="get"?JSON.stringify({id:"rel_fixture"}):"";
+  const host=new HostAdapter({cwd:d.cwd,journalDirectory:dirname(c.journalPath)},{id:"rel_fixture"});host.command=argv=>argv[2]==="get"?JSON.stringify({...host.job,state:"claimed",generation:host.job.generation??1}):"";
   a.verifyIntegrated=x=>{const dir=attemptDir(dirname(c.journalPath),x.integratedCommit,0);mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"ended",refusal:shaped}));return host.verifyIntegrated(x);};
  });
  assert.equal(rd.journal.refusalReason,"unclassified");assert.deepEqual(rd.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});absent(rd.raw+JSON.stringify(rd.escalation),TOKEN,"token=");
@@ -1591,10 +1592,10 @@ test("bounded poll refuses incomplete history before claims, receipt writes or p
 test("lost finish uses exactly one full detail and holds mismatched artifact pins",async t=>{
  const cwd=mkdtempSync(join(tmpdir(),"release-paged-receipt-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
  const log=join(cwd,"calls"),tt=join(cwd,"tt"),journal=join(cwd,"rel_done.json");
- const receipt={version:1,jobId:"rel_done",outcome:"released",commit:"c".repeat(40),verificationDigest:"d".repeat(64),targets:[{target:"hub",outcome:"released",artifactSHA256:"e".repeat(64),backup:"exact-backup",backupSHA256:"f".repeat(64)}]};
- const pending={jobId:"rel_done",phase:"receipt_pending",receipt};
+ const receipt={version:1,jobId:"rel_done",outcome:"released",commit:"c".repeat(40),verificationDigest:"d".repeat(64),targets:[{target:"hub",outcome:"released",release:"exact",artifactSHA256:"e".repeat(64),backup:"exact-backup",backupSHA256:"f".repeat(64)}]};
+ const pending={jobId:"rel_done",commit:receipt.commit,finishGeneration:3,phase:"receipt_pending",receipt};
  const poll=async changed=>{
-  const detail={id:"rel_done",state:"released",generation:4,receipt:structuredClone(receipt)};
+  const detail={id:"rel_done",state:"released",generation:4,commit:receipt.commit,integratedCommit:receipt.commit,verificationDigest:receipt.verificationDigest,receipt:structuredClone(receipt)};
   if(changed)detail.receipt.targets[0].artifactSHA256="0".repeat(64);
   writeFileSync(tt,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([detail])},a)));else process.exit(99);`);chmodSync(tt,0o755);
   writeFileSync(journal,JSON.stringify(pending));await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt},{once:true});
@@ -1610,10 +1611,125 @@ test("fake CLI traverses more than two hundred active jobs and five history page
  const cwd=mkdtempSync(join(tmpdir(),"release-many-pages-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
  const tt=join(cwd,"tt"),log=join(cwd,"calls"),targets=["hub","bridge","mini","tailos"],baseline="b".repeat(40);
  const jobs=[...Array.from({length:205},(_,i)=>({id:`rel_active_${i}`,state:"verified",generation:1,commit:"c".repeat(40)})),...Array.from({length:805},(_,i)=>({id:`rel_settled_${i}`,state:"released",generation:2,receipt:{outcome:"released",commit:baseline,targets:targets.map(target=>({target,outcome:"released",artifactSHA256:"d".repeat(64)}))}}))];
- writeFileSync(tt,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2),jobs=${JSON.stringify(jobs)};fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(jobs,a)));else if(a[1]==='claim')console.log(JSON.stringify({...jobs[0],state:'claimed',generation:2}));else process.exit(99);`);chmodSync(tt,0o755);
- let releases=0;await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt,baselines:Object.fromEntries(targets.map(t=>[t,"a".repeat(40)]))},{once:true,release:async config=>{releases++;assert.equal(config.job.id,jobs[0].id);assert.deepEqual(config.baselines,Object.fromEntries(targets.map(t=>[t,baseline])));return {outcome:"released"};}});
+ const settled=(i,state,at,receipt,supersession)=>Object.assign(jobs[205+i],{state,settledAt:at,receipt,supersession});
+ const shipped=(commit,targets)=>({outcome:"released",commit,targets:targets.map(target=>({target,outcome:"released"}))});
+ settled(799,"rolled_back","2026-10-04T10:00:00.000000099Z",{outcome:"rolled_back",commit:"f".repeat(40),targets:targets.map(target=>({target,outcome:"rolled_back"}))});
+ settled(800,"released","2026-10-04T10:00:00.000000009Z",shipped("c".repeat(40),["hub"]));
+ settled(801,"released","2026-10-04T10:00:00.000000001Z",shipped(baseline,["hub"]));
+ settled(802,"superseded","2026-10-04T10:00:00.000000009Z",undefined,{releasedCommit:"d".repeat(40),targets:["hub","mini"]});
+ settled(803,"released","2026-10-04T10:00:00.000000009Z",shipped("e".repeat(40),["bridge","tailos"]));
+ settled(804,"refused","2026-10-04T10:00:00.000000099Z",undefined);
+ const expected={hub:"d".repeat(40),bridge:"e".repeat(40),mini:"d".repeat(40),tailos:"e".repeat(40)};
+ writeFileSync(tt,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2),jobs=${JSON.stringify(jobs)};fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(jobs,a)));else if(a[1]==='claim')console.log(JSON.stringify({...jobs[0],state:'claimed',generation:2,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN}));else process.exit(99);`);chmodSync(tt,0o755);
+ let releases=0;await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt,baselines:Object.fromEntries(targets.map(t=>[t,"a".repeat(40)]))},{once:true,release:async config=>{releases++;assert.equal(config.job.id,jobs[0].id);assert.deepEqual(config.baselines,expected);return {outcome:"released"};}});
  assert.equal(releases,1);const calls=readFileSync(log,"utf8").trim().split("\n");
- assert.equal(calls.filter(x=>x.includes("--view active")).length,2);assert.equal(calls.filter(x=>x.includes("--view settled")).length,5);
+ assert.equal(calls.filter(x=>x.includes("--view active")).length,4);assert.equal(calls.filter(x=>x.includes("--view settled")).length,5);
  assert.equal(calls.filter(x=>x.startsWith("deployment get")).length,1);assert.equal(calls.filter(x=>x.startsWith("deployment claim")).length,1);
  assert.ok(calls.slice(0,7).every(x=>x.startsWith("deployment list ")));assert.equal(calls[7],"deployment get --job rel_active_0");
+});
+
+test("dedicated dispatcher rewrites only deployment reads and refuses recursion", t => {
+ const dir=mkdtempSync(join(tmpdir(),"release-dispatch-"));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+ const binary=join(dir,"stable-tt");writeFileSync(binary,"#!/bin/sh\nexit 0\n");chmodSync(binary,0o755);
+ for(const argv of [["deployment","list"],["deployment","list","--view","settled","--limit","200"],["deployment","get","--job","rel_fixture"],["deployment","finish","--file","literal;$(echo no)"],["send","--text","literal;$(echo no)"]]) {
+  let called;const code=dispatchCompatibility(binary,argv,{run:(path,args,options)=>{called={path,args,options};return {status:7};}});
+  assert.equal(code,7);assert.deepEqual(called.args,compatibilityArgv(argv));assert.equal(called.path,realpathSync(binary));assert.equal(called.options.stdio,"inherit");
+ }
+ assert.deepEqual(compatibilityArgv(["deployment","finish","--job","x"]),["deployment","finish","--job","x"]);
+ assert.throws(()=>dispatchCompatibility(RUNNER,["deployment","list"]));
+ assert.throws(()=>dispatchCompatibility(process.execPath,["deployment","list"]),/Recursive/);
+ assert.throws(()=>dispatchCompatibility("tt",["deployment","list"]),/Absolute/);
+ assert.throws(()=>compatibilityArgv(["deployment","list","line\nbreak"]),/Invalid/);
+});
+
+test("native response faults never replace the exact execution job or touch release files", async t => {
+ const f=fixture(),commit=change(f,"client/a.js","a"),home=mkdtempSync(join(tmpdir(),"release-native-pins-"));
+ t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const prior={...job(f,commit),taskId:"tsk_fixture",entryId:"tqe_fixture",itemId:"wi_fixture",itemRevision:5,scopeRevision:5,orderMessageSeq:23666,repository:f.cwd,generation:2,agentId:"agt_fixture",runId:"run_fixture",pauseGeneration:0,integratedCommit:commit,inputsCommit:commit,inputsDigest:"b".repeat(64)};
+ const faultKeys=["id","taskId","entryId","itemId","itemRevision","scopeRevision","orderMessageSeq","repository","baseCommit","commit","verificationDigest","pauseGeneration","generation","agentId","runId","integratedCommit","inputsCommit","inputsDigest","state","summary"];
+ for(const key of faultKeys) {
+  const bad={...prior,[key]:typeof prior[key]==="number"?prior[key]+1:key==="summary"?true:"other"};
+  const host=new HostAdapter({cwd:f.cwd,journalDirectory:home},prior);host.command=()=>JSON.stringify(bad);
+  assert.equal(await host.fence(),false,key);assert.equal(host.job,prior,key);
+  const before=git(f.cwd,"rev-parse","tasks-hub");
+  await assert.rejects(runRelease({...config(f,prior),journalPath:join(home,"journal.json")},host),/fence lost/);
+  assert.deepEqual(readdirSync(home),[],key);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),before,key);
+ }
+ assert.equal(validateNativeRelease(prior,{...prior},"check",2).generation,2);
+ const receipt={version:1,jobId:prior.id,commit,verificationDigest:prior.verificationDigest,outcome:"released",targets:[{target:"hub",outcome:"released",release:"exact",artifactSHA256:"c".repeat(64),backup:"retained",backupSHA256:"d".repeat(64),preflightReceiptSHA256:"e".repeat(64)}]};
+ assert.throws(()=>validateNativeRelease({...prior,state:"merged"},{...prior,state:"released",generation:3,receipt:{outcome:"released",commit,targets:[]}},"finish",2,[],receipt),/receipt/);
+ assert.equal(validateNativeRelease({...prior,state:"merged"},{...prior,state:"released",generation:3,receipt},"finish",2,[],receipt).receipt,receipt);
+});
+
+test("detail projection and snapshot faults hold inputs before probes, plans, backups or manifests", async t => {
+ const {buildInputs,readReleaseSummaries,deploymentBaselines}=await import("../scripts/release-inputs.mjs");
+ const f=fixture(),commit=change(f,"client/a.js","a"),home=mkdtempSync(join(tmpdir(),"release-input-fault-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const task="tsk_fixture",j={...job(f,commit),id:"rel_0123abcd",taskId:task,generation:2,agentId:"agt_fixture",runId:"run_fixture",pauseGeneration:0,integratedCommit:commit};
+ const config={version:1,cwd:f.cwd,journalDirectory:home,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,f.base]))};
+ for(const fault of ["taskId","agentId","runId","pauseGeneration","commit","baseCommit","verificationDigest","integratedCommit","inputsCommit","inputsDigest","generation","bookend","compact"]) {
+  const calls=[];let detail=false;
+  const read=argv=>{
+   calls.push(argv);if(argv[1]==="get") {detail=true;return JSON.stringify(fault==="compact"?{...j,summary:true}:{...j,...(!["bookend","compact"].includes(fault)?{[fault]:typeof j[fault]==="number"?j[fault]+1:"changed"}:{})});}
+   const page=releaseReply([j],argv);if(fault==="bookend" && detail)page.page.snapshot="b".repeat(64);return JSON.stringify(page);
+  };
+  const deps={tt:read,git:argv=>git(f.cwd,...argv),probe:()=>assert.fail("probe"),preflight:()=>assert.fail("backup"),copyBackup:()=>assert.fail("copy")};
+  await assert.rejects(buildInputs(config,j.id,{deps}),/detail|ledger/i,fault);assert.deepEqual(readdirSync(home),[]);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+ }
+ // Exact fractional (nanosecond) ordering and equal-time ledger ties.
+ const targets=["hub","bridge","mini","tailos"],released=(id,commit,at)=>({id,state:"released",settledAt:at,receipt:{outcome:"released",commit,targets:targets.map(target=>({target,outcome:"released"}))}});
+ const rows=[released("late","c".repeat(40),"2026-10-04T10:00:00.000000009Z"),released("early","b".repeat(40),"2026-10-04T10:00:00.000000001Z")];
+ assert.deepEqual(deploymentBaselines(config.baselines,rows),Object.fromEntries(targets.map(t=>[t,"c".repeat(40)])));
+ rows.push(released("tie","d".repeat(40),"2026-10-04T10:00:00.000000009Z"));
+ assert.deepEqual(deploymentBaselines(config.baselines,rows),Object.fromEntries(targets.map(t=>[t,"d".repeat(40)])));
+ const mixed=[j,{...j,id:"rel_2",taskId:"tsk_other"}];assert.throws(()=>readReleaseSummaries(a=>JSON.stringify(releaseReply(mixed,a))),/task changed/);
+});
+
+test("immutable flat and paged consumers cross both APIs with a stable binary through Mini rollback", {timeout:180000}, async t => {
+ const root=dirname(dirname(RUNNER)),dir=mkdtempSync(join(tmpdir(),"release-wire-crossing-")),historical=join(dir,"ab9"),stable=join(dir,"compat-tt"),installed=join(dir,"installed-tt");
+ mkdirSync(historical);t.after(()=>rmSync(dir,{recursive:true,force:true}));
+ const archive=execFileSync("git",["archive","ab9c4382d5f585c5d69f1d150d524d5670790b32","hub","scripts","verification","package.json","tests/test-binaries.mjs"],{cwd:root,maxBuffer:64*1024*1024});
+ execFileSync("tar",["-xf","-","-C",historical],{input:archive});
+ execFileSync("go",["build","-o",stable,"./cmd/tt"],{cwd:join(root,"hub"),timeout:90000,stdio:"pipe"});
+ const old=join(dir,"old-tt");execFileSync("go",["build","-o",old,"./cmd/tt"],{cwd:join(historical,"hub"),timeout:90000,stdio:"pipe"});
+ const shim=join(dir,"shim.mjs");writeFileSync(shim,"#!"+process.execPath+"\nimport {dispatchCompatibility} from "+JSON.stringify("file://"+RUNNER)+";process.exitCode=dispatchCompatibility("+JSON.stringify(stable)+",process.argv.slice(2));\n");chmodSync(shim,0o755);
+ const f=fixture(),commit=change(f,"client/a.js","a"),task="tsk_0123456789abcdef",jobID="rel_0123456789abcdef";
+ let mode="legacy",failure=0;const methods=[];
+ const jobs=[{id:jobID,taskId:task,state:"claimed",generation:2,commit,baseCommit:f.base,verificationDigest:"d".repeat(64),plan:{commit},agentId:"agt_other",runId:"run_other",pauseGeneration:0},
+ {id:"rel_1111111111111111",taskId:task,state:"superseded",generation:2,plan:{commit:f.base},settledAt:"2026-10-04T10:00:00.000000001Z",supersession:{releasedCommit:f.base,targets:["hub","bridge","mini","tailos"]}}];
+ const server=createServer((req,res)=>{
+  methods.push(req.method+" "+new URL(req.url,"http://fixture").pathname);
+  if(req.method!=="GET" || req.headers.authorization!=="Bearer synthetic-fixture" || failure){res.writeHead(failure||403);res.end("{}");return;}
+  const q=new URL(req.url,"http://fixture").searchParams;
+  if(mode==="legacy"){res.end(JSON.stringify(jobs));return;}
+  const token=hash(JSON.stringify(jobs));
+  if(q.get("snapshot") && q.get("snapshot")!==token){res.writeHead(409);res.end("{}");return;}
+  if(q.get("job")){res.end(JSON.stringify(jobs.find(j=>j.id===q.get("job"))));return;}
+  const argv=["deployment","list",...Array.from(q).flatMap(([k,v])=>["--"+k,v])],p=releaseReply(jobs,argv);p.page.snapshot=token;res.end(JSON.stringify(p));
+ });
+ await new Promise(r=>server.listen(0,"127.0.0.1",r));t.after(()=>new Promise(r=>server.close(r)));
+ const environment={...process.env,HOME:dir,TAILTERM_HUB:`http://127.0.0.1:${server.address().port}`,TAILTERM_TASK:task,TAILTERM_TOKEN:"synthetic-fixture",TAILTERM_AGENT:"",TAILTERM_RUN:"",TAILTERM_AGENT_NAME:"",CODEX_THREAD_ID:"",TAILTERM_CODEX_THREAD:"",TT_TMUX_SOCKET:"compat-isolated-"+process.pid};
+ const run=(binary,argv)=>new Promise(resolve=>execFile(binary,argv,{cwd:f.cwd,env:environment,timeout:30000,maxBuffer:32*1024*1024},(err,stdout,stderr)=>resolve({err,stdout,stderr})));
+ // Same stable reader handles hub-first, Mini-first, then both reverse orders.
+ for(const [api,mini] of [["legacy",old],["modern",old],["modern",stable],["legacy",stable],["legacy",old],["modern",stable],["modern",old],["legacy",old]]){
+  mode=api;copyFileSync(mini,installed);
+  const flat=await run(shim,["deployment","list"]);assert.equal(flat.err,null,flat.stderr);const full=JSON.parse(flat.stdout);assert.equal(full[0].plan.commit,commit);assert.equal(full.length,2);
+  const paged=await run(shim,["deployment","list","--view","active","--limit","200"]);assert.equal(paged.err,null,paged.stderr);assert.equal(JSON.parse(paged.stdout).jobs[0].summary,true);
+  const detail=await run(shim,["deployment","get","--job",jobID]);assert.equal(detail.err,null,detail.stderr);assert.equal(JSON.parse(detail.stdout).verificationDigest,jobs[0].verificationDigest);
+ }
+ // Immutable incompatible pairs fail, and produce no partial output.
+ mode="modern";let bad=await run(old,["deployment","list"]);assert(bad.err);assert.equal(bad.stdout,"");
+ mode="legacy";bad=await run(stable,["deployment","list"]);assert(bad.err);assert.equal(bad.stdout,"");
+ // Execute the actual immutable flat and current paged input preparers.
+ const configPath=join(dir,"config.json");writeFileSync(configPath,JSON.stringify({version:1,enabled:true,cwd:f.cwd,journalDirectory:dir,tt:shim,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,f.base]))}));
+ for(const api of ["legacy","modern"]){mode=api;for(const source of [historical,root]){
+  const result=await run(process.execPath,[realpathSync(join(source,"scripts/release-inputs.mjs")),"--config",configPath,"--job",jobID,"--dry-run"]);
+  assert.equal(result.err,null,result.stderr);const planned=JSON.parse(result.stdout);assert.equal(planned.commit,commit);assert.deepEqual(Object.keys(planned.targets),["tailos"]);
+  // The immutable old daemon consumes flat output; the new one consumes
+  // paged output. This other run holds the fence and neither may act on it.
+  const poll=await run(process.execPath,[realpathSync(join(source,"scripts/release-runner.mjs")),"--config",configPath,"--once"]);
+  assert.equal(poll.err,null,poll.stderr);assert.equal(poll.stderr,"");assert.equal(poll.stdout,"");
+ }}
+ const original=readFileSync(configPath,"utf8");failure=401;bad=await run(shim,["deployment","list"]);assert(bad.err);assert.equal(bad.stdout,"");assert.equal(readFileSync(configPath,"utf8"),original);
+ assert(methods.every(m=>m.startsWith("GET ")),"compatibility reads cannot post or claim");
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);assert(!existsSync(join(dir,jobID+"-inputs.json")));
 });

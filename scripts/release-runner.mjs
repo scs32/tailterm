@@ -1,8 +1,8 @@
-import { readReleaseSummaries, readReleaseDetail } from "./release-inputs.mjs";
+import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
@@ -270,16 +270,22 @@ export async function runRelease(config, adapter) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
   if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw releaseError("Claimed verified job required");
+  // A lost finish response must retry the original key/generation. The hub
+  // may already be terminal, so a fresh execution check cannot gate that retry.
+  let pending;
+  if(existsSync(journalPath))pending=JSON.parse(readFileSync(journalPath,"utf8"));
+  const finishOnly=pending && ["receipt_pending","finishing"].includes(pending.phase) && pending.jobId===job.id && pending.commit===job.commit && pending.agentId===job.agentId && pending.runId===job.runId && pending.receipt?.version===1 && pending.receipt.jobId===job.id && pending.receipt.commit===pending.integrated && pending.receipt.verificationDigest===job.verificationDigest && Array.isArray(pending.receipt.targets);
+  if(!finishOnly && await adapter.fence(job)!==true)throw releaseError("release fence lost");
   const lock=hostLockPath(cwd,job);mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw releaseError("Release host locked; inspect prior execution");}
   writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
-  let state={version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,phase:"prepared",effects:[]};
+  let state={version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,taskId:job.taskId,pauseGeneration:job.pauseGeneration,phase:"prepared",effects:[]};
   if(existsSync(journalPath)){
     const prior=JSON.parse(readFileSync(journalPath,"utf8")),recovery=job.reconciliations?.at(-1);
     const recovered=recovery?.disposition==="requeue" && recovery.noActiveExecution===true && recovery.noPublication===true && recovery.journalState==="no_effects" && recovery.jobId===job.id && recovery.journalDigest===fileDigest(journalPath) && recovery.agentId===prior.agentId && recovery.runId===prior.runId && prior.effects.length===0 && prior.published!==true && prior.jobId===job.id && prior.commit===job.commit;
     if(recovered){renameSync(journalPath,journalPath+".reconciled-"+recovery.journalDigest);}
     else
-    if(prior.jobId===job.id && prior.commit===job.commit && (["waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
+    if(prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && (["waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
     else {
       closeSync(fd);rmSync(lock);
       if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete") return prior.receipt;
@@ -427,6 +433,43 @@ export async function runRelease(config, adapter) {
 // The private activation config names existing host credential stores and
 // handler-produced preflight files. Probe/rollback programs are pinned host
 // programs, never commands received from Board text.
+export function compatibilityArgv(argv) {
+  if (!Array.isArray(argv) || argv.some(a=>typeof a!=="string" || /[\0\r\n]/.test(a))) throw releaseError("Invalid compatibility argv");
+  const out = [...argv];
+  if (out[0] === "deployment" && ["list", "get"].includes(out[1])) out[1] = "compat-" + out[1];
+  return out;
+}
+export function dispatchCompatibility(binary, argv, {run = spawnSync} = {}) {
+  if (!isAbsolute(binary || "")) throw releaseError("Absolute pinned compatibility binary required");
+  const path = realpathSync(binary), stat = statSync(path);
+  if (!stat.isFile() || !(stat.mode & 0o111) || path === realpathSync(fileURLToPath(import.meta.url)) || path === realpathSync(process.execPath)) throw releaseError("Recursive compatibility executable refused");
+  const result = run(path, compatibilityArgv(argv), {stdio:"inherit"});
+  if (result.error || result.signal || !Number.isInteger(result.status)) throw releaseError("Compatibility executable failed");
+  return result.status;
+}
+// A successful native action is still untrusted until its full record matches
+// the exact job/run and operation. Never replace the execution fence with a
+// compact receipt, wrong identity, stale generation or unrelated input pins.
+export function validateNativeRelease(prior, next, operation, expectedGeneration, extra = [], receipt) {
+  const immutable = ["id", "taskId", "entryId", "itemId", "itemRevision", "scopeRevision", "orderMessageSeq", "repository", "baseCommit", "commit", "verificationDigest", "pauseGeneration"];
+  const samePin = k => next?.[k] === prior[k];
+  const flag = n => extra[extra.indexOf(n)+1];
+  const expectedState = {claim:"claimed", check:prior.state, merged:"merged", finish:receipt?.outcome, block:"blocked", refuse:"refused"}[operation];
+  const advance = operation === "check" ? 0 : 1;
+  const allowed = {claim:["verified"],check:["claimed","merged"],merged:["claimed"],finish:["merged"],block:["claimed","merged"],refuse:["claimed"]};
+  if (!allowed[operation]?.includes(prior.state)) throw releaseError("Invalid native release transition");
+  if (!next || Array.isArray(next) || next.summary === true || !immutable.every(samePin) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || next.generation !== expectedGeneration + advance || !expectedState || next.state !== expectedState) throw releaseError("Invalid native release response");
+  const agent = operation === "claim" ? process.env.TAILTERM_AGENT : prior.agentId, run = operation === "claim" ? process.env.TAILTERM_RUN : prior.runId;
+  if (next.agentId !== agent || next.runId !== run) throw releaseError("Native release run binding mismatch");
+  for (const k of ["inputsCommit", "inputsDigest"]) if (!samePin(k)) throw releaseError("Native release input binding mismatch");
+  const integrated = operation === "merged" ? flag("--commit") : prior.integratedCommit;
+  if (next.integratedCommit !== integrated || (operation === "merged" && !sha(integrated))) throw releaseError("Native integrated commit mismatch");
+  if (operation === "finish") {
+    if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || digest(next.receipt) !== digest(receipt)) throw releaseError("Native full receipt mismatch");
+  } else if (!same(prior.receipt, next.receipt)) throw releaseError("Native receipt changed unexpectedly");
+  return next;
+}
+
 export class HostAdapter {
   constructor(config,job){this.config=config;this.job=job;this.artifacts=new Map();this.serial=0;this.now=()=>Date.now();
     // The TailOS poller's fetch and clock; tests replace them.
@@ -440,12 +483,18 @@ export class HostAdapter {
   }
   detail(id){
     const job=JSON.parse(this.command([this.config.tt||"tt","deployment","get","--job",id]));
-    if(job?.id!==id || job.summary===true || (this.job.taskId && job.taskId!==this.job.taskId))throw releaseError("Exact release detail required");
+    const immutable=["id","taskId","entryId","itemId","itemRevision","scopeRevision","orderMessageSeq","repository","baseCommit","commit","verificationDigest","agentId","runId","pauseGeneration"];
+    if(job?.id!==id || job.summary===true || (this.job.id && (!immutable.every(k=>job[k]===this.job[k]) || !Number.isSafeInteger(job.generation) || job.generation<this.job.generation || !["claimed","merged"].includes(job.state))))throw releaseError("Exact release detail required");
+    if(this.job.integratedCommit && job.integratedCommit!==this.job.integratedCommit)throw releaseError("Exact integrated release detail required");
+    if(this.job.inputsDigest && (job.inputsCommit!==this.job.inputsCommit || job.inputsDigest!==this.job.inputsDigest))throw releaseError("Exact input release detail required");
     return job;
   }
   native(operation,extra=[],expectedGeneration=this.job.generation){
+    if(!Number.isSafeInteger(expectedGeneration) || expectedGeneration<1)throw releaseError("Exact native release generation required");
     const args=[this.config.tt||"tt","deployment",operation,"--job",this.job.id,"--generation",String(expectedGeneration),"--request-id",`${this.job.id}-${operation}-${expectedGeneration}`,...extra];
-    this.job=JSON.parse(this.command(args));return this.job;
+    const next=JSON.parse(this.command(args));
+    const receipt=operation==="finish"?JSON.parse(readFileSync(extra[extra.indexOf("--file")+1],"utf8")):undefined;
+    this.job=validateNativeRelease(this.job,next,operation,expectedGeneration,extra,receipt);return this.job;
   }
   async fence(){try{this.native("check");return true;}catch{return false;}}
   // The project handler by the project rule (hub operation "handler"): a
@@ -909,6 +958,13 @@ export function reconcileHostLocks(config,jobs){
     if(record.jobId===job.id && record.agentId===r.agentId && record.runId===r.runId)rmSync(lock);
   }
 }
+function fullReleaseReceipt(receipt, job) {
+  const targets=new Set();
+  return receipt?.version===1 && receipt.jobId===job.id && sha(receipt.commit) && /^[a-f0-9]{64}$/.test(receipt.verificationDigest||"") && Array.isArray(receipt.targets) && ["released","rolled_back","blocked"].includes(receipt.outcome) && receipt.targets.every(t=>{
+    if (!t || !["hub","bridge","mini","tailos"].includes(t.target) || targets.has(t.target) || !/^[a-f0-9]{64}$/.test(t.artifactSHA256||"") || typeof t.release!=="string" || !t.release || !["released","failed","rolled_back"].includes(t.outcome)) return false;
+    targets.add(t.target);return true;
+  });
+}
 export function reconcileReceipts(config,jobs){
   const updates=[];
   for(const job of jobs){
@@ -916,7 +972,7 @@ export function reconcileReceipts(config,jobs){
     const path=join(config.journalDirectory,job.id+".json");if(!existsSync(path))continue;
     const journal=JSON.parse(readFileSync(path,"utf8"));
     if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id){
-      if(digest(journal.receipt)!==digest(job.receipt))throw releaseError("Saved release receipt does not match pending journal");
+      if(!fullReleaseReceipt(job.receipt,job) || journal.commit!==job.commit || journal.agentId!==job.agentId || journal.runId!==job.runId || (journal.taskId!==undefined && journal.taskId!==job.taskId) || (journal.pauseGeneration!==undefined && journal.pauseGeneration!==job.pauseGeneration) || job.receipt.commit!==(job.integratedCommit||job.commit) || job.receipt.verificationDigest!==job.verificationDigest || job.generation!==journal.finishGeneration+1 || digest(journal.receipt)!==digest(job.receipt))throw releaseError("Saved release receipt does not match pending journal");
       journal.phase="complete";updates.push([path,journal]);
     }
   }
@@ -1011,7 +1067,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const read=argv=>reader.command([config.tt||"tt",...argv]);
     const jobs=readReleaseSummaries(read);
     // Validate complete baseline history before any recovery write, pruning or claim.
-    const baselines=releaseBaselines(configured,jobs);
+    const baselines=deploymentBaselines(configured,jobs);
     // Fetch every locally relevant recovery record and the selected/held job
     // before any write, deletion or claim. A failed detail read holds the poll.
     const selected=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
@@ -1025,6 +1081,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         details.set(summary.id,readReleaseDetail(read,summary));
       }
     }
+    bookendReleaseLedger(read,jobs.releaseSnapshot,jobs.releaseHead);
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
@@ -1059,7 +1116,12 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     await new Promise(r=>setTimeout(r,30000));
   }
 }
-if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv.includes("--provision-prerequisites")){
+if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv[2]==="--compat-cli"){
+  try {
+    if(process.argv[3]!=="--tt" || !process.argv[4] || process.argv[5]!=="--")throw releaseError("Compatibility dispatcher needs pinned binary and argv separator");
+    process.exitCode=dispatchCompatibility(process.argv[4],process.argv.slice(6));
+  } catch {process.stderr.write("Deployment compatibility dispatch refused.\n");process.exitCode=1;}
+}else if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv.includes("--provision-prerequisites")){
   // tt deployment setup runs this in the deployer's checkout. Only the tagged
   // reason is printed on failure.
   const index=process.argv.indexOf("--from");

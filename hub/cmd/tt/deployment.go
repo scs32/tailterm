@@ -24,7 +24,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
@@ -82,6 +82,51 @@ func cmdDeployment(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(20 * time.Second)
 	defer cancel()
+	if args[0] == "compat-list" {
+		// Bare compatibility output is the historical FULL array. An explicit
+		// paging flag opts into the strict envelope used by current consumers.
+		paged := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "view" || f.Name == "limit" || f.Name == "after" || f.Name == "snapshot" {
+				paged = true
+			}
+		})
+		if *job != "" {
+			return errors.New("compat-list does not accept --job")
+		}
+		if paged {
+			out, err := c.CompatibilityReleasesPage(ctx, e.task, api.ReleaseListOptions{View: *view, Limit: *limit, After: *after, Snapshot: *snapshot})
+			if err == nil {
+				printJSON(out)
+			}
+			return err
+		}
+		out, err := c.CompatibilityReleases(ctx, e.task)
+		if err == nil {
+			printJSON(out)
+		}
+		return err
+	}
+	if args[0] == "compat-get" {
+		if *job == "" {
+			return errors.New("compat-get needs --job")
+		}
+		// Native detail+snapshot is unsupported; never silently discard it.
+		paging := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "view" || f.Name == "limit" || f.Name == "after" || f.Name == "snapshot" {
+				paging = true
+			}
+		})
+		if paging {
+			return errors.New("compat-get does not accept paging or snapshot flags")
+		}
+		out, err := c.CompatibilityRelease(ctx, e.task, *job)
+		if err == nil {
+			printJSON(out)
+		}
+		return err
+	}
 	if args[0] == "list" {
 		out, err := c.ReleasesPage(ctx, e.task, api.ReleaseListOptions{View: *view, Limit: *limit, After: *after, Snapshot: *snapshot})
 		if err == nil {

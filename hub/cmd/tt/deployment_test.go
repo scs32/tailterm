@@ -565,3 +565,42 @@ func TestDeploymentBoundedListAndExactGet(t *testing.T) {
 		t.Fatal(output, err, paths)
 	}
 }
+
+func TestDeploymentDedicatedCompatibilityCLILeavesOrdinaryReadsStrict(t *testing.T) {
+	task, id := "tsk_0123456789abcdef", "rel_0123456789abcdef"
+	job := api.ReleaseJob{ID: id, TaskID: task, State: "claimed", Generation: 2, Commit: strings.Repeat("c", 40), Plan: api.VerificationPlan{Commit: "full-plan"}, Receipt: &api.ReleaseReceipt{Version: 1, JobID: id, Targets: []api.ReleaseTargetReceipt{{Target: "hub", Backup: "retained-full-backup"}}}}
+	status := 200
+	posts := 0
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			posts++
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode([]api.ReleaseJob{job})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, token: "fixture"}
+	out, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"compat-list"}) })
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(out), "[") || !strings.Contains(out, "retained-full-backup") {
+		t.Fatal(out, err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"compat-list", "--view", "active", "--limit", "200"}) })
+	if err != nil || !strings.Contains(out, `"summary": true`) || !strings.Contains(out, `"version": 1`) {
+		t.Fatal(out, err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"compat-get", "--job", id}) })
+	if err != nil || !strings.Contains(out, "full-plan") || !strings.Contains(out, "retained-full-backup") {
+		t.Fatal(out, err)
+	}
+	for _, args := range [][]string{{"list"}, {"get", "--job", id}, {"compat-get", "--job", id, "--snapshot", strings.Repeat("a", 64)}, {"compat-list", "--limit", "201"}, {"compat-list", "--after", "wrong"}} {
+		out, err = captureCLIOutput(t, func() error { return cmdDeployment(e, args) })
+		if err == nil || out != "" {
+			t.Fatal(args, out, err)
+		}
+	}
+	status = 401
+	out, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"compat-list"}) })
+	if err == nil || out != "" || posts != 0 {
+		t.Fatal(out, err, posts)
+	}
+}

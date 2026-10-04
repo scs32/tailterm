@@ -1,12 +1,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 )
 
 const AgentRoleDeployment = "deployment_agent"
@@ -113,17 +121,6 @@ type ReleasePageInfo struct {
 }
 
 func (c *Client) ReleasesPage(ctx context.Context, task string, opts ReleaseListOptions) (ReleasePage, error) {
-	var out ReleasePage
-	var wire struct {
-		Version int              `json:"version"`
-		Jobs    []ReleaseSummary `json:"jobs"`
-		Page    *struct {
-			View      string  `json:"view"`
-			Limit     int     `json:"limit"`
-			Snapshot  string  `json:"snapshot"`
-			NextAfter *string `json:"nextAfter"`
-		} `json:"page"`
-	}
 	q := url.Values{}
 	if opts.View != "" {
 		q.Set("view", opts.View)
@@ -137,7 +134,26 @@ func (c *Client) ReleasesPage(ctx context.Context, task string, opts ReleaseList
 	if opts.Snapshot != "" {
 		q.Set("snapshot", opts.Snapshot)
 	}
-	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases?"+q.Encode(), nil, &wire)
+	var raw json.RawMessage
+	if err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases?"+q.Encode(), nil, &raw); err != nil {
+		return ReleasePage{}, err
+	}
+	return decodeReleasePage(raw, task, opts)
+}
+
+func decodeReleasePage(raw json.RawMessage, task string, opts ReleaseListOptions) (ReleasePage, error) {
+	var out ReleasePage
+	var wire struct {
+		Version int              `json:"version"`
+		Jobs    []ReleaseSummary `json:"jobs"`
+		Page    *struct {
+			View      string  `json:"view"`
+			Limit     int     `json:"limit"`
+			Snapshot  string  `json:"snapshot"`
+			NextAfter *string `json:"nextAfter"`
+		} `json:"page"`
+	}
+	err := json.Unmarshal(raw, &wire)
 	if err != nil {
 		return out, err
 	}
@@ -426,4 +442,305 @@ func (c *Client) Releases(ctx context.Context, task string) ([]ReleaseJob, error
 		seen[page.Page.NextAfter] = true
 		opts.After, opts.Snapshot = page.Page.NextAfter, page.Page.Snapshot
 	}
+}
+
+// Deployment compatibility is deliberately separate from the ordinary strict
+// page/detail protocol. It negotiates only a successful, validated JSON shape;
+// transport, authentication, size and version failures are never retried as legacy.
+type compatibilityReleaseCursor struct {
+	Version  int    `json:"version"`
+	Task     string `json:"task"`
+	View     string `json:"view"`
+	Snapshot string `json:"snapshot"`
+	Row      int64  `json:"row"`
+}
+
+func releaseSettled(state string) bool {
+	return state == "released" || state == "rolled_back" || state == "refused" || state == "superseded"
+}
+
+// Project full details onto exactly the native compact contract. Comparing
+// this projection detects changes to every pin, not just state/generation.
+func compatibilitySummary(j ReleaseJob, row int64) ReleaseSummary {
+	s := ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
+	if j.Receipt != nil {
+		s.Receipt = &ReleaseSummaryReceipt{Outcome: j.Receipt.Outcome, Commit: j.Receipt.Commit, Targets: []ReleaseSummaryTarget{}}
+		for _, t := range j.Receipt.Targets {
+			s.Receipt.Targets = append(s.Receipt.Targets, ReleaseSummaryTarget{Target: t.Target, Outcome: t.Outcome})
+		}
+	}
+	if j.Supersession != nil {
+		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
+	}
+	return s
+}
+
+func compatibilityLegacy(raw json.RawMessage, task string) ([]ReleaseJob, string, error) {
+	var records []json.RawMessage
+	if err := json.Unmarshal(raw, &records); err != nil || records == nil {
+		return nil, "", fmt.Errorf("invalid legacy release ledger")
+	}
+	jobs := make([]ReleaseJob, 0, len(records))
+	seen := map[string]bool{}
+	for _, record := range records {
+		j, err := decodeCompatibilityDetail(record, task, "")
+		if err != nil || seen[j.ID] {
+			return nil, "", fmt.Errorf("invalid legacy release detail")
+		}
+		seen[j.ID] = true
+		jobs = append(jobs, j)
+	}
+	// Include unknown fields as well: dropping heavy evidence from the digest
+	// would let a receipt/verification change escape the continuation bookend.
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(append([]byte("deployment-compat-v1\x00"+task+"\x00"), compact.Bytes()...))
+	return jobs, hex.EncodeToString(sum[:]), nil
+}
+
+func (c *Client) compatibilityPage(ctx context.Context, task string, opts ReleaseListOptions) (ReleasePage, []ReleaseJob, error) {
+	if opts.View == "" {
+		opts.View = "active"
+	}
+	if opts.Limit == 0 {
+		opts.Limit = 50
+	}
+	zero := ReleasePage{}
+	if (opts.View != "active" && opts.View != "settled") || opts.Limit < 1 || opts.Limit > 200 || len(opts.After) > 1024 || (opts.After != "" && opts.Snapshot == "") {
+		return zero, nil, fmt.Errorf("invalid compatibility list options")
+	}
+	if opts.Snapshot != "" {
+		b, e := hex.DecodeString(opts.Snapshot)
+		if e != nil || len(b) != 32 {
+			return zero, nil, fmt.Errorf("invalid release snapshot")
+		}
+	}
+	q := url.Values{"view": {opts.View}, "limit": {strconv.Itoa(opts.Limit)}}
+	if opts.After != "" {
+		q.Set("after", opts.After)
+	}
+	if opts.Snapshot != "" {
+		q.Set("snapshot", opts.Snapshot)
+	}
+	var raw json.RawMessage
+	if err := c.compatibilityRead(ctx, "/v1/tasks/"+url.PathEscape(task)+"/releases?"+q.Encode(), &raw); err != nil {
+		return zero, nil, err
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return zero, nil, fmt.Errorf("empty release response")
+	}
+	if raw[0] != '[' {
+		page, err := decodeReleasePage(raw, task, opts)
+		if err == nil {
+			for _, j := range page.Jobs {
+				if !compatibilityReleaseID(j.ID) || j.Generation < 1 {
+					err = fmt.Errorf("invalid compatibility release summary")
+					break
+				}
+			}
+		}
+		if err != nil {
+			return zero, nil, err
+		}
+		return page, nil, nil
+	}
+	jobs, token, err := compatibilityLegacy(raw, task)
+	if err != nil {
+		return zero, nil, err
+	}
+	if opts.Snapshot != "" && opts.Snapshot != token {
+		return zero, nil, fmt.Errorf("legacy release ledger changed")
+	}
+	var cursor compatibilityReleaseCursor
+	if opts.After != "" {
+		b, err := base64.RawURLEncoding.DecodeString(opts.After)
+		if err != nil || json.Unmarshal(b, &cursor) != nil || cursor.Version != 1 || cursor.Task != task || cursor.View != opts.View || cursor.Snapshot != token || cursor.Row < 1 || cursor.Row > int64(len(jobs)) {
+			return zero, nil, fmt.Errorf("invalid compatibility cursor")
+		}
+		if releaseSettled(jobs[cursor.Row-1].State) != (opts.View == "settled") {
+			return zero, nil, fmt.Errorf("invalid compatibility cursor view")
+		}
+	}
+	page := ReleasePage{Version: 1, Jobs: []ReleaseSummary{}, Page: ReleasePageInfo{View: opts.View, Limit: opts.Limit, Snapshot: token}}
+	for i, j := range jobs {
+		row := int64(i + 1)
+		if row <= cursor.Row || releaseSettled(j.State) != (opts.View == "settled") {
+			continue
+		}
+		if len(page.Jobs) == opts.Limit {
+			b, _ := json.Marshal(compatibilityReleaseCursor{1, task, opts.View, token, page.Jobs[len(page.Jobs)-1].RowID})
+			page.Page.NextAfter = base64.RawURLEncoding.EncodeToString(b)
+			break
+		}
+		page.Jobs = append(page.Jobs, compatibilitySummary(j, row))
+	}
+	return page, jobs, nil
+}
+
+func (c *Client) CompatibilityReleasesPage(ctx context.Context, task string, opts ReleaseListOptions) (ReleasePage, error) {
+	page, _, err := c.compatibilityPage(ctx, task, opts)
+	return page, err
+}
+
+// Traverse both views under one token, then hydrate full detail before exposing
+// any flat output. The final same-token bookend also catches detail-time races.
+func (c *Client) compatibilityLedger(ctx context.Context, task, onlyID string) ([]ReleaseJob, error) {
+	summaries := []ReleaseSummary{}
+	seenIDs := map[string]bool{}
+	rows := map[int64]bool{}
+	cursors := map[string]bool{}
+	token := ""
+	var legacy []ReleaseJob
+	for _, view := range []string{"active", "settled"} {
+		opts := ReleaseListOptions{View: view, Limit: 200, Snapshot: token}
+		previous := int64(0)
+		for {
+			page, full, err := c.compatibilityPage(ctx, task, opts)
+			if err != nil {
+				return nil, err
+			}
+			if token == "" {
+				token = page.Page.Snapshot
+				legacy = full
+			}
+			if (legacy != nil) != (full != nil) {
+				return nil, fmt.Errorf("release protocol changed during read")
+			}
+			for _, s := range page.Jobs {
+				if s.RowID <= previous || seenIDs[s.ID] || rows[s.RowID] {
+					return nil, fmt.Errorf("invalid release continuation")
+				}
+				previous = s.RowID
+				seenIDs[s.ID] = true
+				rows[s.RowID] = true
+				summaries = append(summaries, s)
+			}
+			if page.Page.NextAfter == "" {
+				break
+			}
+			if cursors[page.Page.NextAfter] {
+				return nil, fmt.Errorf("repeating release cursor")
+			}
+			cursors[page.Page.NextAfter] = true
+			opts.After = page.Page.NextAfter
+			opts.Snapshot = token
+		}
+	}
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].RowID < summaries[j].RowID })
+	out := make([]ReleaseJob, 0, len(summaries))
+	legacyByID := map[string]ReleaseJob{}
+	for _, j := range legacy {
+		legacyByID[j.ID] = j
+	}
+	for _, s := range summaries {
+		if onlyID != "" && s.ID != onlyID {
+			continue
+		}
+		var j ReleaseJob
+		if legacy != nil {
+			j = legacyByID[s.ID]
+		} else {
+			var err error
+			j, err = c.compatibilityDetail(ctx, task, s.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !reflect.DeepEqual(compatibilitySummary(j, s.RowID), s) {
+			return nil, fmt.Errorf("release detail changed or compact")
+		}
+		out = append(out, j)
+	}
+	// Revalidate both protocol and token after hydration; zero partial output.
+	_, full, err := c.compatibilityPage(ctx, task, ReleaseListOptions{View: "active", Limit: 200, Snapshot: token})
+	if err != nil {
+		return nil, err
+	}
+	if (legacy != nil) != (full != nil) {
+		return nil, fmt.Errorf("release protocol changed during bookend")
+	}
+	return out, nil
+}
+func (c *Client) CompatibilityReleases(ctx context.Context, task string) ([]ReleaseJob, error) {
+	return c.compatibilityLedger(ctx, task, "")
+}
+func (c *Client) CompatibilityRelease(ctx context.Context, task, id string) (ReleaseJob, error) {
+	if id == "" {
+		return ReleaseJob{}, fmt.Errorf("exact release ID required")
+	}
+	jobs, err := c.compatibilityLedger(ctx, task, id)
+	if err != nil {
+		return ReleaseJob{}, err
+	}
+	if len(jobs) != 1 {
+		return ReleaseJob{}, fmt.Errorf("release job not found")
+	}
+	return jobs[0], nil
+}
+
+// No successful-shape negotiation on redirects, partial bodies or HTTP errors.
+func (c *Client) compatibilityRead(ctx context.Context, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.Base+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	client := *c.HTTP
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, defaultMaxResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > defaultMaxResponseBytes {
+		return fmt.Errorf("hub response exceeds %d bytes", defaultMaxResponseBytes)
+	}
+	if response.StatusCode != http.StatusOK {
+		return &HTTPError{Status: response.StatusCode, Msg: "deployment compatibility read refused"}
+	}
+	return json.Unmarshal(data, out)
+}
+func compatibilityReleaseID(id string) bool {
+	if len(id) != 20 || !strings.HasPrefix(id, "rel_") || strings.ToLower(id) != id {
+		return false
+	}
+	_, err := hex.DecodeString(id[4:])
+	return err == nil
+}
+
+func decodeCompatibilityDetail(raw json.RawMessage, task, id string) (ReleaseJob, error) {
+	var fields map[string]json.RawMessage
+	var wire struct {
+		ReleaseJob
+		Summary bool `json:"summary"`
+	}
+	if json.Unmarshal(raw, &fields) != nil || fields == nil || json.Unmarshal(raw, &wire) != nil || wire.Summary || !compatibilityReleaseID(wire.ID) || (id != "" && wire.ID != id) || wire.TaskID != task || wire.State == "" || wire.Generation < 1 {
+		return ReleaseJob{}, fmt.Errorf("invalid full release detail")
+	}
+	// An unmarked compact object is also invalid: full records always contain
+	// the approved plan, and full receipts carry their native schema version.
+	var plan map[string]json.RawMessage
+	if json.Unmarshal(fields["plan"], &plan) != nil || plan == nil {
+		return ReleaseJob{}, fmt.Errorf("compact release detail")
+	}
+	if wire.Receipt != nil && (wire.Receipt.Version != 1 || wire.Receipt.JobID != wire.ID || wire.Receipt.Targets == nil) {
+		return ReleaseJob{}, fmt.Errorf("compact or invalid release receipt")
+	}
+	return wire.ReleaseJob, nil
+}
+func (c *Client) compatibilityDetail(ctx context.Context, task, id string) (ReleaseJob, error) {
+	var raw json.RawMessage
+	if err := c.compatibilityRead(ctx, "/v1/tasks/"+url.PathEscape(task)+"/releases?job="+url.QueryEscape(id), &raw); err != nil {
+		return ReleaseJob{}, err
+	}
+	return decodeCompatibilityDetail(raw, task, id)
 }
