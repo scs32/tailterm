@@ -5,8 +5,21 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildInputs } from "../scripts/release-inputs.mjs";
+import { releaseBaselines } from "../scripts/release-targets.mjs";
+import { buildInputs, readReleaseSummaries, readReleaseDetail } from "../scripts/release-inputs.mjs";
 
+function releaseReply(jobs,argv) {
+ const flag=n=>{const i=argv.indexOf(n);return i<0?undefined:argv[i+1];};
+ if(argv[1]==="get")return jobs.find(j=>j.id===flag("--job"))||{id:flag("--job")};
+ const view=flag("--view")||"active",terminal=["released","rolled_back","refused","superseded"],limit=+(flag("--limit")||50),after=+(flag("--after")||0);
+ const all=jobs.map((j,i)=>{
+  const {plan,integratedPlan,integratedVerification,integratedCoverage,integratedMatrix,reconciliations,retryOf,matrixApprovals,repository,...summary}=j;
+  if(j.receipt)summary.receipt={commit:j.receipt.commit,outcome:j.receipt.outcome,targets:j.receipt.targets.map(t=>({target:t.target,outcome:t.outcome}))};
+  if(j.supersession)summary.supersession={releasedCommit:j.supersession.releasedCommit,targets:j.supersession.targets};
+  return {...summary,summary:true,rowId:i+1};
+ }).filter(j=>terminal.includes(j.state)===(view==="settled")&&j.rowId>after);
+ const rows=all.slice(0,limit);return {version:1,jobs:rows,page:{view,limit,snapshot:"a".repeat(64),nextAfter:all.length>limit?String(rows.at(-1).rowId):""}};
+}
 const BASE = "/mnt/deepfreeze/tailterm-hub", SECRET = "SYNTHETIC_PRIVATE_TOKEN";
 const hash = b => createHash("sha256").update(b).digest("hex");
 const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8" }).trim();
@@ -31,7 +44,7 @@ function setup(file, { state = "claimed", released = [] } = {}) {
   const calls = [];
   const deps = {
     configPath: join(home, "deploy.json"),
-    tt: argv => { calls.push(["tt", ...argv]); return JSON.stringify([job, ...released]); },
+    tt: argv => { calls.push(["tt", ...argv]); return JSON.stringify(releaseReply([job, ...released],argv)); },
     git: argv => git(r.cwd, ...argv),
     probe: async argv => { calls.push(["probe", ...argv]); return LIVE[argv[1]]; },
     preflight: (plan, receipt) => { calls.push(["preflight", plan]); const p = JSON.parse(readFileSync(plan, "utf8")); writeFileSync(receipt, JSON.stringify({ status: "success", backupDestination: p.backupDestination, sha256: hash("backup-" + p.requestId), secret: SECRET })); },
@@ -106,7 +119,7 @@ test("TailOS rolls back to the retained dist of the live commit", async () => {
 test("released receipts move baselines, so nothing selected gives an empty manifest", async () => {
   const f = setup("client/app.js");
   const released = { id: "rel_done", state: "released", receipt: { outcome: "released", commit: f.commit, targets: [{ target: "tailos", outcome: "released" }] } };
-  f.deps.tt = () => JSON.stringify([f.job, released]);
+  f.deps.tt = argv => JSON.stringify(releaseReply([f.job, released],argv));
   const out = await buildInputs(f.config, f.job.id, { deps: f.deps });
   assert.deepEqual(out.targets, []); assert.deepEqual(JSON.parse(readFileSync(out.manifest, "utf8")).targets, {});
   assert.ok(!f.calls.some(c => c[0] === "probe"));
@@ -119,7 +132,7 @@ test("dry run prints the planned bindings with no host call or write", async () 
   assert.deepEqual(Object.keys(out.targets), ["hub", "bridge", "mini"]);
   const shared = { release: `rel_0123abcd-${sha12}-truenas`, backupJobId: "rel_0123abcd", backup: `${BASE}/backups/before-rel_0123abcd-truenas.sqlite`, planPath: join(f.home, "rel_0123abcd-truenas-plan.json"), preflightReceipt: join(f.home, "rel_0123abcd-truenas-preflight.json"), planTargets: ["hub", "bridge"] };
   assert.deepEqual(out.targets.hub, shared); assert.deepEqual(out.targets.bridge, shared);
-  assert.deepEqual(f.calls.map(c => c[0]), ["tt"]); assert.deepEqual(readdirSync(f.home), ["plan-template.json"]);
+  assert.deepEqual(f.calls.map(c => c[0]), ["tt","tt","tt"]); assert.deepEqual(readdirSync(f.home), ["plan-template.json"]);
 });
 
 test("inputs are refused for an unclaimed job, a changed backup copy, or an integrated commit that is not local", async () => {
@@ -136,4 +149,57 @@ test("the inputs command reports its own refusal without host output", () => {
   writeFileSync(cfg, JSON.stringify({ version: 1, cwd: home, journalDirectory: home, tt: join(home, "missing-tt") }));
   const r = spawnSync(process.execPath, ["scripts/release-inputs.mjs", "--config", cfg, "--job", "rel_abc"], { encoding: "utf8" });
   assert.equal(r.status, 1); assert.equal(r.stdout, ""); assert.equal(r.stderr, "release inputs refused: a host command failed\n");
+});
+
+
+test("complete paged history preserves all four baselines and full claimed detail",async()=>{
+ const f=setup("client/app.js"),targets=["hub","bridge","mini","tailos"],history=[];
+ for(let i=0;i<810;i++)history.push({id:`rel_hist_${i}`,state:"released",generation:1,receipt:{outcome:"released",commit:f.r.base,targets:targets.map(target=>({target,outcome:"released",artifactSHA256:"b".repeat(64)}))}});
+ history[201]={...history[201],settledAt:"2026-10-03T00:00:00.099Z",receipt:{outcome:"released",commit:f.commit,targets:targets.map(target=>({target,outcome:"released"}))}};
+ history[402]={...history[402],settledAt:"2026-10-03T00:00:00.1Z",state:"superseded",receipt:null,supersession:{releasedCommit:f.commit,targets:["hub","mini"]}};
+ history[603]={...history[603],settledAt:"2026-10-03T00:00:00.100Z",state:"superseded",receipt:null,supersession:{releasedCommit:f.commit,targets:["bridge","tailos"]}};
+ history[809]={...history[809],state:"rolled_back",settledAt:"2026-10-04T00:00:00Z",receipt:{outcome:"rolled_back",commit:f.r.base,targets:[{target:"hub",outcome:"rolled_back"}]}};
+ history.push({id:"rel_refused",state:"refused",generation:1},{id:"rel_legacy_superseded",state:"superseded",generation:1,supersession:{releasedCommit:f.r.base}});
+ const full=[history[0],f.job,...history.slice(1)],calls=[];
+ const read=argv=>{calls.push(argv);return JSON.stringify(releaseReply(full,argv));};
+ const summaries=readReleaseSummaries(read);
+ assert.deepEqual(releaseBaselines(f.config.baselines,summaries),releaseBaselines(f.config.baselines,full));
+ assert.deepEqual(releaseBaselines(f.config.baselines,summaries),Object.fromEntries(targets.map(t=>[t,f.commit])));
+ assert.ok(calls.filter(x=>x.includes("settled")).length>=5);
+ assert.equal(summaries.find(j=>j.id===f.job.id).plan,undefined);
+ f.job.plan={commit:f.commit,checks:[{id:"full-detail"}]};f.deps.tt=read;
+ const out=await buildInputs(f.config,f.job.id,{deps:f.deps,dryRun:true});assert.deepEqual(out.targets,{});
+ assert.equal(calls.filter(x=>x[1]==="get").length,1);assert.deepEqual(readdirSync(f.home),["plan-template.json"]);
+});
+
+test("invalid or incomplete history refuses inputs before host writes",async()=>{
+ for(const kind of ["legacy","version","view","token","repeat","duplicate","order","empty-continuation"]){
+  const f=setup("client/app.js"),reads=[];
+  f.deps.tt=argv=>{
+   reads.push(argv);const page=releaseReply([f.job],argv);
+   if(argv.includes("settled")){
+    if(kind==="legacy")return "[]";
+    if(kind==="version")page.version=2;
+    if(kind==="view")page.page.view="active";
+    if(kind==="token")page.page.snapshot="b".repeat(64);
+    if(["duplicate","order"].includes(kind))page.jobs=[{...f.job,summary:true,rowId:1,state:"released"}];
+    if(kind==="repeat"){page.jobs=[{id:"rel_hist",state:"released",summary:true,rowId:2}];page.page.nextAfter="same";}
+    if(kind==="empty-continuation")page.page.nextAfter="more";
+   }
+   return JSON.stringify(page);
+  };
+  await assert.rejects(buildInputs(f.config,f.job.id,{deps:f.deps}),/release/i);
+  assert.ok(!reads.some(a=>a[1]==="get"));assert.ok(!f.calls.some(a=>["probe","preflight","copy"].includes(a[0])));
+  assert.deepEqual(readdirSync(f.home),["plan-template.json"]);
+ }
+});
+
+
+test("changed or summary-only detail holds the input builder",async()=>{
+ for(const patch of [{summary:true},{id:"rel_other"},{state:"released"},{generation:9}]){
+  const f=setup("client/app.js"),read=f.deps.tt;
+  f.deps.tt=argv=>argv[1]==="get"?JSON.stringify({...f.job,...patch}):read(argv);
+  await assert.rejects(buildInputs(f.config,f.job.id,{deps:f.deps}),/detail changed or invalid/);
+  assert.ok(!f.calls.some(a=>["probe","preflight","copy"].includes(a[0])));assert.deepEqual(readdirSync(f.home),["plan-template.json"]);
+ }
 });

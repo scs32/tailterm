@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,6 +135,134 @@ func (s *Store) Releases(ctx context.Context, task string) ([]api.ReleaseJob, er
 				out[i].MatrixApprovals = approvals
 			}
 		}
+	}
+	return out, nil
+}
+
+// Release reads full evidence without expanding the list response.
+func (s *Store) Release(ctx context.Context, task, id string) (api.ReleaseJob, error) {
+	j, err := releaseLoad(ctx, s.db, task, id)
+	if err == nil && j.State == "claimed" {
+		j.MatrixApprovals, err = releaseMatrixApprovals(ctx, s.db, task)
+	}
+	return j, err
+}
+
+type releaseCursor struct {
+	Task     string `json:"task"`
+	View     string `json:"view"`
+	Snapshot string `json:"snapshot"`
+	RowID    int64  `json:"rowId"`
+}
+
+func releaseSummary(j api.ReleaseJob, row int64) api.ReleaseSummary {
+	out := api.ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
+	if j.Receipt != nil {
+		out.Receipt = &api.ReleaseSummaryReceipt{Outcome: j.Receipt.Outcome, Commit: j.Receipt.Commit, Targets: []api.ReleaseSummaryTarget{}}
+		for _, t := range j.Receipt.Targets {
+			out.Receipt.Targets = append(out.Receipt.Targets, api.ReleaseSummaryTarget{Target: t.Target, Outcome: t.Outcome})
+		}
+	}
+	if j.Supersession != nil {
+		out.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
+	}
+	return out
+}
+
+// ReleasesPage observes metadata and one bounded record page in the same transaction.
+// Any ledger change invalidates continuation, including settlement of an old row.
+func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseListOptions) (api.ReleasePage, error) {
+	out := api.ReleasePage{Version: 1, Jobs: []api.ReleaseSummary{}}
+	if opts.View == "" {
+		opts.View = "active"
+	}
+	if opts.Limit == 0 {
+		opts.Limit = 50
+	}
+	if !api.ValidID(task, "tsk") || (opts.View != "active" && opts.View != "settled") || opts.Limit < 1 || opts.Limit > 200 || len(opts.After) > 1024 {
+		return out, api.ErrInvalid
+	}
+	var cursor releaseCursor
+	if opts.After != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(opts.After)
+		if err != nil || json.Unmarshal(raw, &cursor) != nil || cursor.Task != task || cursor.View != opts.View || cursor.RowID <= 0 || opts.Snapshot == "" || cursor.Snapshot != opts.Snapshot {
+			return out, api.ErrInvalid
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT rowid,id,generation,state FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
+	if err != nil {
+		return out, err
+	}
+	hash := sha256.New()
+	fmt.Fprintln(hash, task)
+	for rows.Next() {
+		var row, gen int64
+		var id, state string
+		if err = rows.Scan(&row, &id, &gen, &state); err != nil {
+			rows.Close()
+			return out, err
+		}
+		fmt.Fprintf(hash, "%d:%s:%d:%s\n", row, id, gen, state)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	snapshot := fmt.Sprintf("%x", hash.Sum(nil))
+	if opts.Snapshot != "" && opts.Snapshot != snapshot {
+		return out, releaseConflict("stale list snapshot")
+	}
+	predicate := `state NOT IN ('released','rolled_back','refused','superseded')`
+	if opts.View == "settled" {
+		predicate = `state IN ('released','rolled_back','refused','superseded')`
+	}
+	if opts.After != "" {
+		var id string
+		if err = tx.QueryRowContext(ctx, `SELECT id FROM release_jobs WHERE task_id=? AND rowid=? AND `+predicate, task, cursor.RowID).Scan(&id); err != nil {
+			return out, api.ErrInvalid
+		}
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT rowid,record_json FROM release_jobs WHERE task_id=? AND `+predicate+` AND rowid>? ORDER BY rowid LIMIT ?`, task, cursor.RowID, opts.Limit+1)
+	if err != nil {
+		return out, err
+	}
+	more := false
+	for rows.Next() {
+		var row int64
+		var raw string
+		if err = rows.Scan(&row, &raw); err != nil {
+			rows.Close()
+			return out, err
+		}
+		if len(out.Jobs) == opts.Limit {
+			more = true
+			break
+		}
+		var j api.ReleaseJob
+		if err = json.Unmarshal([]byte(raw), &j); err != nil {
+			rows.Close()
+			return out, err
+		}
+		out.Jobs = append(out.Jobs, releaseSummary(j, row))
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	out.Page = api.ReleasePageInfo{View: opts.View, Limit: opts.Limit, Snapshot: snapshot}
+	if more {
+		raw, _ := json.Marshal(releaseCursor{Task: task, View: opts.View, Snapshot: snapshot, RowID: out.Jobs[len(out.Jobs)-1].RowID})
+		out.Page.NextAfter = base64.RawURLEncoding.EncodeToString(raw)
+	}
+	if err = tx.Commit(); err != nil {
+		return out, err
 	}
 	return out, nil
 }

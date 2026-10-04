@@ -431,6 +431,11 @@ func TestReleaseImportBindsOwnerApprovedMatrixChange(t *testing.T) {
 		t.Fatalf("approvals %+v %v", jobs, err)
 	}
 
+	detail, detailErr := s.Release(ctx, task.ID, j.ID)
+	if detailErr != nil || !slices.Equal(detail.MatrixApprovals, wantApprovals) {
+		t.Fatal("detail approval hint", detailErr, detail.MatrixApprovals)
+	}
+
 	req := matrixImport(j, h, d, "matrix-import", matrixB, covering, integrated)
 	imported, err := s.ReleaseAction(ctx, task.ID, req)
 	if err != nil {
@@ -2245,5 +2250,141 @@ func TestReleaseCheckAfterSetAsideIsRefused(t *testing.T) {
 	}
 	if saved, err := releaseLoad(ctx, s.db, task.ID, j.ID); err != nil || saved.Generation != aside.Generation || saved.State != "verified" {
 		t.Fatal("refused checks changed the job", saved.Generation, saved.State, err)
+	}
+}
+
+// Real isolated SQLite ledger: history size cannot expand default responses,
+// and every mutation anywhere in the ledger invalidates a continuation.
+func TestReleasesBoundedPagesAndExactDetail(t *testing.T) {
+	s, task, _, _, _ := releaseFixture(t)
+	ctx := context.Background()
+	var saved, savedActive api.ReleaseJob
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1031; i++ {
+		state := "released"
+		if i >= 810 {
+			state = "verified"
+		}
+		j := api.ReleaseJob{ID: fmt.Sprintf("rel_%016x", i+1), TaskID: task.ID, EntryID: api.NewID("tqe"), ItemID: api.NewID("wi"), State: state, Generation: 1, Commit: candidateB, BaseCommit: candidateA, Repository: strings.Repeat("heavy", 4096), Plan: api.VerificationPlan{Commit: candidateB}, SettledAt: "2026-10-03T00:00:00.1Z", Receipt: &api.ReleaseReceipt{Version: 1, Commit: candidateB, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "hub", Outcome: "released", Backup: strings.Repeat("heavy", 4096)}}}, RetryOf: &api.ReleaseRetry{Reason: "preserved"}, Reconciliations: []api.ReleaseReconciliation{{StopReason: "preserved"}}}
+		raw, _ := json.Marshal(j)
+		if _, err = tx.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			saved = j
+		}
+		if i == 810 {
+			savedActive = j
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{})
+	raw, _ := json.Marshal(page)
+	if err != nil || len(page.Jobs) != 50 || len(raw) >= 128<<10 || page.Page.NextAfter == "" {
+		t.Fatal(err, len(page.Jobs), len(raw))
+	}
+	if strings.Contains(string(raw), "heavy") || strings.Contains(string(raw), `"plan"`) || strings.Contains(string(raw), "reconciliations") {
+		t.Fatal("heavy fields leaked")
+	}
+	t.Logf("default: 810 settled heavy records, %d active summaries, %d bytes", len(page.Jobs), len(raw))
+	token := page.Page.Snapshot
+	for _, view := range []string{"active", "settled"} {
+		after := ""
+		ids := map[string]bool{}
+		previous := int64(0)
+		pages := 0
+		for {
+			p, e := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{View: view, Limit: 200, After: after, Snapshot: token})
+			if e != nil {
+				t.Fatal(e)
+			}
+			b, _ := json.Marshal(p)
+			t.Logf("%s page%d: %d summaries, %d bytes", view, pages+1, len(p.Jobs), len(b))
+			if len(b) >= 512<<10 || len(p.Jobs) > 200 {
+				t.Fatal("unbounded", len(b))
+			}
+			pages++
+			for _, j := range p.Jobs {
+				if ids[j.ID] || j.RowID <= previous {
+					t.Fatal("duplicate/order", j.ID)
+				}
+				ids[j.ID] = true
+				previous = j.RowID
+			}
+			if p.Page.NextAfter == "" {
+				break
+			}
+			if p.Page.NextAfter == after {
+				t.Fatal("repeating cursor")
+			}
+			after = p.Page.NextAfter
+		}
+		want := 810
+		if view == "active" {
+			want = 221
+		}
+		if len(ids) != want || (view == "settled" && pages < 3) {
+			t.Fatal(view, len(ids), pages)
+		}
+	}
+	detail, err := s.Release(ctx, task.ID, saved.ID)
+	a, _ := json.Marshal(detail)
+	b, _ := json.Marshal(saved)
+	if err != nil || string(a) != string(b) {
+		t.Fatal("detail changed", err)
+	}
+
+	activeDetail, activeErr := s.Release(ctx, task.ID, savedActive.ID)
+	a, _ = json.Marshal(activeDetail)
+	b, _ = json.Marshal(savedActive)
+	if activeErr != nil || string(a) != string(b) {
+		t.Fatal("active detail changed", activeErr)
+	}
+	// Task and view binding, malformed tokens, and limits fail closed.
+	for _, opts := range []api.ReleaseListOptions{{Limit: 201}, {Limit: -1}, {View: "all"}, {After: "bad", Snapshot: token}, {View: "settled", After: page.Page.NextAfter, Snapshot: token}} {
+		if _, e := s.ReleasesPage(ctx, task.ID, opts); e == nil {
+			t.Fatal("accepted invalid options", opts)
+		}
+	}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "other"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReleasesPage(ctx, other.ID, api.ReleaseListOptions{After: page.Page.NextAfter, Snapshot: token}); err == nil {
+		t.Fatal("cross-task cursor")
+	}
+
+	// A row behind the active continuation settles concurrently, without changing
+	// the total row count: continuation must not silently omit it from history.
+	if _, err = s.db.Exec(`UPDATE release_jobs SET state='released',generation=generation+1 WHERE task_id=? AND id=?`, task.ID, savedActive.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{After: page.Page.NextAfter, Snapshot: token}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("concurrent old-row settlement", err)
+	}
+	// An old row settles or a set-aside moves rowid: both change the token.
+	if _, err = s.db.Exec(`UPDATE release_jobs SET generation=generation+1 WHERE task_id=? AND id=?`, task.ID, saved.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{After: page.Page.NextAfter, Snapshot: token}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale continuation", err)
+	}
+	if _, err = s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{View: "settled", Snapshot: token}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("cross-view stale snapshot", err)
+	}
+	fresh, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`UPDATE release_jobs SET rowid=rowid+2000 WHERE task_id=? AND id=?`, task.ID, saved.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{After: fresh.Page.NextAfter, Snapshot: fresh.Page.Snapshot}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("set-aside move stale", err)
 	}
 }

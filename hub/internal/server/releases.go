@@ -3,13 +3,43 @@ package server
 import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"net/http"
+	"strconv"
 )
 
 func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.caller(w, r); !ok {
 		return
 	}
-	out, err := s.store.Releases(r.Context(), r.PathValue("id"))
+	q := r.URL.Query()
+	if id := q.Get("job"); id != "" {
+		if len(q) != 1 || len(q["job"]) != 1 {
+			fail(w, api.ErrInvalid)
+			return
+		}
+		out, err := s.store.Release(r.Context(), r.PathValue("id"), id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	for key, values := range q {
+		if (key != "view" && key != "limit" && key != "after" && key != "snapshot") || len(values) != 1 || values[0] == "" {
+			fail(w, api.ErrInvalid)
+			return
+		}
+	}
+	opts := api.ReleaseListOptions{View: q.Get("view"), After: q.Get("after"), Snapshot: q.Get("snapshot")}
+	if q.Has("limit") {
+		var err error
+		opts.Limit, err = strconv.Atoi(q.Get("limit"))
+		if err != nil || opts.Limit <= 0 {
+			fail(w, api.ErrInvalid)
+			return
+		}
+	}
+	out, err := s.store.ReleasesPage(r.Context(), r.PathValue("id"), opts)
 	if err != nil {
 		fail(w, err)
 		return

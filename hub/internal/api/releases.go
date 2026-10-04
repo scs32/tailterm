@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/url"
+	"strconv"
 )
 
 const AgentRoleDeployment = "deployment_agent"
@@ -44,10 +48,137 @@ type ReleaseJob struct {
 	// SettledAt orders released and superseded jobs for target baselines:
 	// the hub time of the final receipt, or the hand release's record time.
 	SettledAt string `json:"settledAt,omitempty"`
-	// MatrixApprovals is derived when jobs are listed and never saved: the
+	// MatrixApprovals is derived on exact detail reads and never saved: the
 	// project's owner matrix approvals, for a claimed job only. It is a hint
 	// for the runner; the verification import proves the one it cites.
 	MatrixApprovals []ReleaseMatrixApproval `json:"matrixApprovals,omitempty"`
+}
+
+// ReleaseSummary is an explicit projection; heavy evidence is available only by ID.
+type ReleaseSummary struct {
+	Summary            bool                        `json:"summary"`
+	RowID              int64                       `json:"rowId"`
+	ID                 string                      `json:"id"`
+	TaskID             string                      `json:"taskId"`
+	EntryID            string                      `json:"entryId"`
+	ItemID             string                      `json:"itemId"`
+	ItemRevision       int64                       `json:"itemRevision"`
+	ScopeRevision      int64                       `json:"scopeRevision"`
+	OrderMessageSeq    int64                       `json:"orderMessageSeq"`
+	BaseCommit         string                      `json:"baseCommit"`
+	Commit             string                      `json:"commit"`
+	VerificationDigest string                      `json:"verificationDigest"`
+	State              string                      `json:"state"`
+	Generation         int64                       `json:"generation"`
+	AgentID            string                      `json:"agentId,omitempty"`
+	RunID              string                      `json:"runId,omitempty"`
+	PauseGeneration    int64                       `json:"pauseGeneration"`
+	IntegratedCommit   string                      `json:"integratedCommit,omitempty"`
+	InputsCommit       string                      `json:"inputsCommit,omitempty"`
+	InputsDigest       string                      `json:"inputsDigest,omitempty"`
+	Published          bool                        `json:"published,omitempty"`
+	SettledAt          string                      `json:"settledAt,omitempty"`
+	Receipt            *ReleaseSummaryReceipt      `json:"receipt,omitempty"`
+	Supersession       *ReleaseSummarySupersession `json:"supersession,omitempty"`
+}
+type ReleaseSummaryReceipt struct {
+	Outcome string                 `json:"outcome"`
+	Commit  string                 `json:"commit"`
+	Targets []ReleaseSummaryTarget `json:"targets"`
+}
+type ReleaseSummaryTarget struct {
+	Target  string `json:"target"`
+	Outcome string `json:"outcome"`
+}
+type ReleaseSummarySupersession struct {
+	ReleasedCommit string   `json:"releasedCommit"`
+	Targets        []string `json:"targets"`
+}
+type ReleaseListOptions struct {
+	View     string
+	Limit    int
+	After    string
+	Snapshot string
+}
+type ReleasePage struct {
+	Version int              `json:"version"`
+	Jobs    []ReleaseSummary `json:"jobs"`
+	Page    ReleasePageInfo  `json:"page"`
+}
+type ReleasePageInfo struct {
+	View      string `json:"view"`
+	Limit     int    `json:"limit"`
+	Snapshot  string `json:"snapshot"`
+	NextAfter string `json:"nextAfter"`
+}
+
+func (c *Client) ReleasesPage(ctx context.Context, task string, opts ReleaseListOptions) (ReleasePage, error) {
+	var out ReleasePage
+	var wire struct {
+		Version int              `json:"version"`
+		Jobs    []ReleaseSummary `json:"jobs"`
+		Page    *struct {
+			View      string  `json:"view"`
+			Limit     int     `json:"limit"`
+			Snapshot  string  `json:"snapshot"`
+			NextAfter *string `json:"nextAfter"`
+		} `json:"page"`
+	}
+	q := url.Values{}
+	if opts.View != "" {
+		q.Set("view", opts.View)
+	}
+	if opts.Limit != 0 {
+		q.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.After != "" {
+		q.Set("after", opts.After)
+	}
+	if opts.Snapshot != "" {
+		q.Set("snapshot", opts.Snapshot)
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases?"+q.Encode(), nil, &wire)
+	if err != nil {
+		return out, err
+	}
+	if wire.Page == nil || wire.Page.NextAfter == nil {
+		return out, fmt.Errorf("invalid release page metadata")
+	}
+	out = ReleasePage{Version: wire.Version, Jobs: wire.Jobs, Page: ReleasePageInfo{View: wire.Page.View, Limit: wire.Page.Limit, Snapshot: wire.Page.Snapshot, NextAfter: *wire.Page.NextAfter}}
+	view := opts.View
+	if view == "" {
+		view = "active"
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	token, tokenErr := hex.DecodeString(out.Page.Snapshot)
+	if err == nil && (out.Version != 1 || out.Jobs == nil || out.Page.View != view || out.Page.Limit != limit || out.Page.Limit < 1 || out.Page.Limit > 200 || len(out.Jobs) > out.Page.Limit || tokenErr != nil || len(token) != 32 || (len(out.Jobs) == 0 && out.Page.NextAfter != "") || (opts.After != "" && out.Page.NextAfter == opts.After) || (opts.Snapshot != "" && out.Page.Snapshot != opts.Snapshot)) {
+		err = fmt.Errorf("invalid release page")
+	}
+	previous := int64(0)
+	seen := map[string]bool{}
+	for _, j := range out.Jobs {
+		settled := j.State == "released" || j.State == "rolled_back" || j.State == "refused" || j.State == "superseded"
+		if !j.Summary || j.ID == "" || j.TaskID != task || j.RowID <= previous || seen[j.ID] || j.State == "" || settled != (view == "settled") {
+			err = fmt.Errorf("invalid release summary")
+		}
+		previous = j.RowID
+		seen[j.ID] = true
+	}
+	return out, err
+}
+func (c *Client) Release(ctx context.Context, task, id string) (ReleaseJob, error) {
+	var wire struct {
+		ReleaseJob
+		Summary bool `json:"summary"`
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases?job="+url.QueryEscape(id), nil, &wire)
+	if err == nil && (wire.Summary || wire.ID != id || wire.TaskID != task) {
+		err = fmt.Errorf("invalid release detail")
+	}
+	return wire.ReleaseJob, err
 }
 
 // ReleaseMatrixChange records an integrated verification bound to a matrix
@@ -253,8 +384,46 @@ func (c *Client) HandReleases(ctx context.Context, task string) ([]HandRelease, 
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", ReleaseRequest{Operation: "hand_releases"}, &out)
 	return out, err
 }
+
+// Releases is a compatibility reader for historical API fixtures. Production
+// listing paths use strict ReleasesPage and exact Release instead.
 func (c *Client) Releases(ctx context.Context, task string) ([]ReleaseJob, error) {
 	out := []ReleaseJob{}
-	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases", nil, &out)
-	return out, err
+	opts := ReleaseListOptions{}
+	seen := map[string]bool{}
+	for {
+		q := url.Values{}
+		if opts.After != "" {
+			q.Set("after", opts.After)
+			q.Set("snapshot", opts.Snapshot)
+		}
+		var raw json.RawMessage
+		if err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/releases?"+q.Encode(), nil, &raw); err != nil {
+			return nil, err
+		}
+		if len(raw) > 0 && raw[0] == '[' && opts.After == "" {
+			err := json.Unmarshal(raw, &out)
+			return out, err
+		}
+		var page struct {
+			Version int             `json:"version"`
+			Jobs    []ReleaseJob    `json:"jobs"`
+			Page    ReleasePageInfo `json:"page"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, err
+		}
+		if page.Version != 1 || page.Jobs == nil || page.Page.View != "active" || len(page.Page.Snapshot) != 64 || (opts.Snapshot != "" && opts.Snapshot != page.Page.Snapshot) {
+			return nil, fmt.Errorf("invalid release page")
+		}
+		out = append(out, page.Jobs...)
+		if page.Page.NextAfter == "" {
+			return out, nil
+		}
+		if seen[page.Page.NextAfter] {
+			return nil, fmt.Errorf("repeating release cursor")
+		}
+		seen[page.Page.NextAfter] = true
+		opts.After, opts.Snapshot = page.Page.NextAfter, page.Page.Snapshot
+	}
 }

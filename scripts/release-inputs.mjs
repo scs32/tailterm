@@ -43,9 +43,41 @@ export function hostDeps(config, configPath) {
   };
 }
 
+const SETTLED = new Set(["released", "rolled_back", "refused", "superseded"]);
+// Read both views to terminal metadata before exposing any jobs to a caller.
+// The same ledger token covers both traversals; a changed ledger holds the poll.
+export function readReleaseSummaries(read) {
+  const jobs = [], ids = new Set(), cursors = new Set();
+  let snapshot = "";
+  for (const view of ["active", "settled"]) {
+    let after = "", previous = 0;
+    for (;;) {
+      const argv = ["deployment", "list", "--view", view, "--limit", "200", ...(after ? ["--after", after] : []), ...(snapshot ? ["--snapshot", snapshot] : [])];
+      const result = JSON.parse(read(argv)), p = result?.page;
+      if (result?.version !== 1 || !Array.isArray(result.jobs) || !p || p.view !== view || !Number.isSafeInteger(p.limit) || p.limit < 1 || p.limit > 200 || result.jobs.length > p.limit || !/^[a-f0-9]{64}$/.test(p.snapshot || "") || (snapshot && snapshot !== p.snapshot) || typeof p.nextAfter !== "string") throw new Error("Invalid release page");
+      snapshot = p.snapshot;
+      for (const j of result.jobs) {
+        if (j?.summary !== true || typeof j.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(j.id) || !Number.isSafeInteger(j.rowId) || j.rowId <= previous || ids.has(j.id) || typeof j.state !== "string" || SETTLED.has(j.state) !== (view === "settled")) throw new Error("Invalid release summary");
+        ids.add(j.id); previous = j.rowId; jobs.push(j);
+      }
+      if (!p.nextAfter) break;
+      if (!result.jobs.length || cursors.has(p.nextAfter)) throw new Error("Repeating release cursor");
+      cursors.add(p.nextAfter); after = p.nextAfter;
+    }
+  }
+  return jobs.sort((a,b) => a.rowId-b.rowId);
+}
+export function readReleaseDetail(read, summary) {
+  const job = JSON.parse(read(["deployment", "get", "--job", summary.id]));
+  if (!job || job.summary === true || job.id !== summary.id || job.state !== summary.state || job.generation !== summary.generation || (summary.taskId && job.taskId !== summary.taskId)) throw new Error("Release detail changed or invalid");
+  return job;
+}
+
 export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   if (config.version !== 1 || !config.cwd || !config.journalDirectory || !/^rel_[a-f0-9]+$/.test(jobId || "")) throw new Error("Private activation config and job ID required");
-  const jobs = JSON.parse(deps.tt(["deployment", "list"])), job = jobs.find(j => j.id === jobId);
+  const jobs = readReleaseSummaries(deps.tt), summary = jobs.find(j => j.id === jobId);
+  if (!summary) throw new Error("Only a claimed job waiting for inputs gets a manifest");
+  const job = readReleaseDetail(deps.tt, summary);
   if (job?.state !== "claimed") throw new Error("Only a claimed job waiting for inputs gets a manifest");
   // Fast-forward releases have no imported integrated commit.
   const commit = job.integratedCommit || job.commit;

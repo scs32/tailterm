@@ -168,7 +168,12 @@ func TestSupersedeAndHandReleaseGuardBeforeHub(t *testing.T) {
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases") {
-			_ = json.NewEncoder(w).Encode(jobs)
+			if r.URL.Query().Get("job") != jobs[0].ID {
+				t.Error("expected exact detail read", r.URL.String())
+			}
+			detail := jobs[0]
+			detail.TaskID = task
+			_ = json.NewEncoder(w).Encode(detail)
 			return
 		}
 		var req api.ReleaseRequest
@@ -265,7 +270,12 @@ func TestHandReleaseRequiresRetainedTailOSCopy(t *testing.T) {
 		case r.URL.Path == "/release.json":
 			_, _ = w.Write(manifest(liveCommit, assets))
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases"):
-			_ = json.NewEncoder(w).Encode(jobs)
+			if r.URL.Query().Get("job") != jobs[0].ID {
+				t.Error("expected exact detail read", r.URL.String())
+			}
+			detail := jobs[0]
+			detail.TaskID = task
+			_ = json.NewEncoder(w).Encode(detail)
 		default:
 			var req api.ReleaseRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
@@ -523,5 +533,35 @@ func TestDeploymentProvisioningReturnsTheRunnerReason(t *testing.T) {
 	err := provisionPrerequisites(checkout, "/bad")
 	if err == nil || err.Error() != "deployment prerequisites: Missing matrix prerequisites: .build/test.wasm" {
 		t.Fatal(err)
+	}
+}
+
+func TestDeploymentBoundedListAndExactGet(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	id := "rel_0123456789abcdef"
+	var paths []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("job") != "" {
+			json.NewEncoder(w).Encode(api.ReleaseJob{ID: id, TaskID: task, Plan: api.VerificationPlan{Commit: "full"}})
+			return
+		}
+		json.NewEncoder(w).Encode(api.ReleasePage{Version: 1, Jobs: []api.ReleaseSummary{}, Page: api.ReleasePageInfo{View: r.URL.Query().Get("view"), Limit: 200, Snapshot: strings.Repeat("a", 64)}})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, token: "fixture"}
+	output, err := captureCLIOutput(t, func() error {
+		return cmdDeployment(e, []string{"list", "--view", "settled", "--limit", "200", "--after", "cursor", "--snapshot", strings.Repeat("a", 64)})
+	})
+	if err != nil || !strings.Contains(output, `"version": 1`) {
+		t.Fatal(output, err)
+	}
+	if !strings.Contains(paths[0], "after=cursor") || !strings.Contains(paths[0], "view=settled") || !strings.Contains(paths[0], "limit=200") {
+		t.Fatal(paths)
+	}
+	output, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"get", "--job", id}) })
+	if err != nil || !strings.Contains(output, `"commit": "full"`) || !strings.Contains(paths[1], "job="+id) {
+		t.Fatal(output, err, paths)
 	}
 }

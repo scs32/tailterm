@@ -24,7 +24,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
@@ -47,6 +47,10 @@ func cmdDeployment(e env, args []string) error {
 		return deploymentSetup(e, args[1:])
 	}
 	fs := flag.NewFlagSet("deployment "+args[0], flag.ContinueOnError)
+	view := fs.String("view", "active", "active or settled release summaries")
+	limit := fs.Int("limit", 50, "release page size (1-200)")
+	after := fs.String("after", "", "opaque release continuation cursor")
+	snapshot := fs.String("snapshot", "", "release ledger snapshot token")
 	entry := fs.String("entry", "", "accepted queue entry (handler enqueue, retry)")
 	job := fs.String("job", "", "saved release job")
 	key := fs.String("request-id", "", "stable retry identity")
@@ -79,7 +83,17 @@ func cmdDeployment(e env, args []string) error {
 	ctx, cancel := ctxTimeout(20 * time.Second)
 	defer cancel()
 	if args[0] == "list" {
-		out, err := c.Releases(ctx, e.task)
+		out, err := c.ReleasesPage(ctx, e.task, api.ReleaseListOptions{View: *view, Limit: *limit, After: *after, Snapshot: *snapshot})
+		if err == nil {
+			printJSON(out)
+		}
+		return err
+	}
+	if args[0] == "get" {
+		if *job == "" {
+			return errors.New("get needs --job")
+		}
+		out, err := c.Release(ctx, e.task, *job)
 		if err == nil {
 			printJSON(out)
 		}
@@ -98,16 +112,12 @@ func cmdDeployment(e env, args []string) error {
 	}
 	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit, Retry: retry}
 	if args[0] == "supersede" {
-		jobs, err := c.Releases(ctx, e.task)
+		j, err := c.Release(ctx, e.task, *job)
 		if err != nil {
 			return err
 		}
 		if *handRelease == "" {
 			return errors.New("supersede needs --hand-release naming a recorded hand release")
-		}
-		j, err := findReleaseJob(jobs, *job)
-		if err != nil {
-			return err
 		}
 		if err = supersedeCoverage(*repo, j, *released); err != nil {
 			return err
@@ -301,13 +311,9 @@ func cmdHandRelease(e env, args []string) error {
 	if !tailos && *dist != "" {
 		return errors.New("--dist applies only to a hand release with --target tailos")
 	}
-	jobs, err := c.Releases(ctx, e.task)
-	if err != nil {
-		return err
-	}
 	commits := []string{}
 	for _, id := range jobIDs {
-		j, err := findReleaseJob(jobs, id)
+		j, err := c.Release(ctx, e.task, id)
 		if err != nil {
 			return err
 		}

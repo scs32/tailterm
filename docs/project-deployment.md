@@ -134,11 +134,56 @@ Unsafe downgrade or failed rollback retains a blocked fence and emits one
 escalation attempt. A failed release retains target outcomes and rollback results
 in its write-once final receipt; it is never displayed as released.
 
-`tt deployment list` and the read-only Delivery panel show release job, exact
-verification/integrated commit links, targets and truthful stages. Completion of
+`tt deployment list` shows bounded identity and stage summaries; `tt deployment
+get --job ID` and the read-only Delivery panel provide exact verification and
+integrated commit links, targets and full receipt evidence. Completion of
 this implementation still requires two review rounds, distinct full-matrix
 verification with owner approval, and handler-saved acceptance. Host activation,
 credential provisioning and any live release remain separately ordered work.
+
+## Bounded release listing and exact detail
+
+`tt deployment list` reads one bounded page of **active summaries** by default.
+Terminal states (`released`, `rolled_back`, `refused`, `superseded`) belong to
+explicit settled history; `blocked` remains active. The HTTP endpoint is
+`GET /v1/tasks/{id}/releases`. Its response is
+`{version:1,jobs:[...],page:{view,limit,snapshot,nextAfter}}`. The default limit
+is 50; `--limit` / `?limit=` accepts 1–200. Summaries identify their job,
+row order (`rowId`), exact commits, state, generation, claim/run, input pins,
+publication and settlement time. Compact terminal receipt and supersession
+fields retain commit/target/outcome baseline evidence. Plans, verification
+records, reconciliations, retries, paths and full receipts require detail.
+
+- `tt deployment list --view active --limit 200` reads active work.
+- `tt deployment list --view settled --limit 200` starts settled history.
+- Continue with the returned `--after CURSOR --snapshot TOKEN` until
+  `page.nextAfter` is empty. A nonempty cursor is not completion.
+- `tt deployment get --job ID` (HTTP `?job=ID`) returns the full saved record,
+  including claimed-job matrix approval hints. It is read-only and takes no
+  mutation request key.
+
+A token covers metadata for the complete task ledger, shared across both views.
+Each page observes its token and bounded rows in one SQLite transaction. Any
+job insertion, generation change, old-row settlement or set-aside row move
+invalidates continuation; stale tokens fail with a conflict. Cursors bind the
+task and view. Malformed options, wrong-view/task cursors and unsupported legacy
+array responses fail closed on production readers. Restart a read traversal
+from its first page after a conflict; never treat a partial history as complete.
+
+The runner and input builder traverse both views under one token before claims,
+manifest writes, reconciliation or retention. They reject duplicate jobs,
+nonmonotonic row order, repeated cursors and incomplete/changed pages, then
+restore ledger order before calculating the four target baselines. Fractional
+and equal settlement times and legacy fallback order retain their existing
+meaning. They fetch exact detail for execution, approval/input checks and locally
+relevant receipt/lock recovery. Lost-finish recovery compares the **full** receipt,
+including artifact and backup pins; compact summaries cannot complete a journal.
+Retention considers complete history, preserving its existing count/budget and
+write-before-delete receipts. A failed poll preserves the prior files and fence.
+
+The historical `api.Client.Releases` compatibility reader remains for existing
+API transport fixtures. Production CLI, runner and input paths use strict page
+and exact-detail readers; they do not fall back to that compatibility method.
 
 ## Activation (wi_d7010deecb20211f)
 
@@ -346,9 +391,9 @@ and the job's own approval does not cover it.
   plan rule in [objective verification](objective-verification.md)). The
   approval of another digest, the job's included, never carries over, and
   nothing is inferred.
-- **Hint, then proof.** `tt deployment list` gives each `claimed` job
+- **Hint, then proof.** `tt deployment get --job ID` gives a `claimed` job
   `matrixApprovals` (`digest`, `messageSeq`; the newest message per digest),
-  derived on each read and never saved. The runner takes the seq from there.
+  derived on each detail read and never saved. The runner takes the seq from there.
   The handler's import does not trust it: for a changed digest the hub re-reads
   the cited message and applies the same rule.
 - **No covering approval.** The runner refuses the job before any matrix run,
@@ -914,8 +959,8 @@ and, once the agent is provisioned, a hand release record
 (`tt deployment hand-releases`) and a job the handler superseded citing it.
 `tt deployment list` shows which.
 
-**Pause.** Only between releases: confirm `tt deployment list` has no `claimed`
-or `merged` job, then `tt retire DEPLOYER`; every release action is refused while
+**Pause.** Only between releases: exhaust all active `tt deployment list` pages
+under one snapshot and confirm none has a `claimed` or `merged` job, then `tt retire DEPLOYER`; every release action is refused while
 it is retired. Resume with `tt resume DEPLOYER`. Do not retire during a release:
 its next fence fails, the fenced rollback cannot run, and the job is left blocked
 with a pending receipt for reconciliation. `tt project-pause pause` closes the

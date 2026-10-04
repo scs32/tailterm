@@ -1,3 +1,4 @@
+import { readReleaseSummaries, readReleaseDetail } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -437,6 +438,11 @@ export class HostAdapter {
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout});}
     catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
   }
+  detail(id){
+    const job=JSON.parse(this.command([this.config.tt||"tt","deployment","get","--job",id]));
+    if(job?.id!==id || job.summary===true || (this.job.taskId && job.taskId!==this.job.taskId))throw releaseError("Exact release detail required");
+    return job;
+  }
   native(operation,extra=[],expectedGeneration=this.job.generation){
     const args=[this.config.tt||"tt","deployment",operation,"--job",this.job.id,"--generation",String(expectedGeneration),"--request-id",`${this.job.id}-${operation}-${expectedGeneration}`,...extra];
     this.job=JSON.parse(this.command(args));return this.job;
@@ -454,7 +460,7 @@ export class HostAdapter {
   async verifyIntegrated(job){
     // Independent release verification is imported by the handler. It is not
     // satisfied by deployer self-certification or a candidate-SHA receipt.
-    const current=JSON.parse(this.command([this.config.tt||"tt","deployment","list"])).find(j=>j.id===job.id);
+    const current=this.detail(job.id);
     if(current?.integratedCommit===job.integratedCommit && current.integratedVerification?.commit===job.integratedCommit){this.job=current;return true;}
     // One directory per integrated commit and requeue attempt: a handler
     // requeue (a new reconciliation) never reuses an earlier attempt's host
@@ -649,7 +655,7 @@ export class HostAdapter {
     return settled;
   }
   async verifyInputs(commit){
-    const current=JSON.parse(this.command([this.config.tt||"tt","deployment","list"])).find(j=>j.id===this.job.id);
+    const current=this.detail(this.job.id);
     if(current?.inputsCommit===commit && /^[a-f0-9]{64}$/.test(current.inputsDigest||"")){this.job=current;this.jobInputs(commit);return true;}
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,this.job.id+"-inputs.json")} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);return false;
   }
@@ -904,12 +910,17 @@ export function reconcileHostLocks(config,jobs){
   }
 }
 export function reconcileReceipts(config,jobs){
+  const updates=[];
   for(const job of jobs){
     if(!job.receipt)continue;
     const path=join(config.journalDirectory,job.id+".json");if(!existsSync(path))continue;
     const journal=JSON.parse(readFileSync(path,"utf8"));
-    if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id && digest(journal.receipt)===digest(job.receipt)){journal.phase="complete";save(path,journal);}
+    if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id){
+      if(digest(journal.receipt)!==digest(job.receipt))throw releaseError("Saved release receipt does not match pending journal");
+      journal.phase="complete";updates.push([path,journal]);
+    }
   }
+  for(const [path,journal] of updates)save(path,journal);
 }
 // Journal retention. The imported backup copy is read only by its job's
 // rehearsal (the authoritative backup stays on TrueNAS), so the journal keeps
@@ -997,15 +1008,33 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // An unreadable or invalid edit holds the whole poll, before any claim.
     const configured=configPath?readBaselines(configPath):config.baselines;
     const reader=new HostAdapter(config,{});
-    const jobs=JSON.parse(reader.command([config.tt||"tt","deployment","list"]));
-    reconcileReceipts(config,jobs);reconcileHostLocks(config,jobs);
+    const read=argv=>reader.command([config.tt||"tt",...argv]);
+    const jobs=readReleaseSummaries(read);
+    // Validate complete baseline history before any recovery write, pruning or claim.
+    const baselines=releaseBaselines(configured,jobs);
+    // Fetch every locally relevant recovery record and the selected/held job
+    // before any write, deletion or claim. A failed detail read holds the poll.
+    const selected=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
+    const details=new Map();
+    const lock=hostLockPath(config.cwd,jobs[0]||{});
+    const lockedJob=existsSync(lock)?JSON.parse(readFileSync(lock,"utf8")).jobId:null;
+    for(const summary of jobs){
+      const path=join(config.journalDirectory,summary.id+".json");
+      const pending=existsSync(path) && ["finishing","receipt_pending"].includes(JSON.parse(readFileSync(path,"utf8")).phase);
+      if(summary.id===selected?.id || ["claimed","merged","blocked"].includes(summary.state) || pending || summary.id===lockedJob){
+        details.set(summary.id,readReleaseDetail(read,summary));
+      }
+    }
+    const recovery=[...details.values()];
+    reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
     const skipped=new Set();
     for (;;) {
-      const job=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
+      const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
+      const job=summary?(details.get(summary.id)||readReleaseDetail(read,summary)):null;
       if(!job){
         const holder=jobs.find(j=>["claimed","merged","blocked"].includes(j.state));
-        if(holder)notify(reader,jobs,holder,holder.state);
+        if(holder)notify(reader,jobs,details.get(holder.id),holder.state);
         break;
       }
       // Archived only while unclaimed, so a later crash of the new claim
@@ -1017,7 +1046,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       const adapter=new HostAdapter(config,job);
       try{if(job.state==="verified")adapter.native("claim");}
       catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
-      const current=adapter.job,baselines=releaseBaselines(configured,jobs);adapter.baselines=baselines;
+      const current=adapter.job;adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
       let result;
       try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}

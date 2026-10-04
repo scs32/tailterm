@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/store"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -20,9 +22,12 @@ func TestReleaseHTTPHandlerBoundaryAndEmptyRead(t *testing.T) {
 	c := newClient(t)
 	task := c.task("release-http")
 	path := "/v1/tasks/" + task.ID + "/releases"
-	var jobs []api.ReleaseJob
-	if code := c.do("GET", path, nil, &jobs); code != 200 || len(jobs) != 0 {
-		t.Fatal(code, jobs)
+	var page struct {
+		Version int              `json:"version"`
+		Jobs    []api.ReleaseJob `json:"jobs"`
+	}
+	if code := c.do("GET", path, nil, &page); code != 200 || page.Version != 1 || len(page.Jobs) != 0 {
+		t.Fatal(code, page)
 	}
 	req := api.ReleaseRequest{RequestID: "fixture", Operation: "enqueue", AgentID: api.NewID("agt"), RunID: api.NewID("run"), EntryID: api.NewID("tqe")}
 	if code := c.do("POST", path+"/actions", req, nil); code != 409 {
@@ -195,15 +200,88 @@ func TestReleaseHTTPRetry(t *testing.T) {
 	if code := c.do("POST", actions, noReason, nil); code != 400 {
 		t.Fatal("retry without a retry record", code)
 	}
-	var jobs []api.ReleaseJob
-	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases", nil, &jobs); code != 200 || len(jobs) != 1 {
-		t.Fatal("refused retries added a job", code, jobs)
+	var page api.ReleasePage
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases?view=settled", nil, &page); code != 200 || len(page.Jobs) != 1 {
+		t.Fatal("refused retries added a job", code, page)
 	}
 	var second api.ReleaseJob
 	if code := c.do("POST", actions, retry("retry", h), &second); code != 201 || second.ID == first.ID || second.State != "verified" || second.Generation != 1 || second.Commit != first.Commit || second.RetryOf == nil || second.RetryOf.JobID != first.ID || second.RetryOf.Attempt != 2 || second.RetryOf.AgentID != h.ID {
 		t.Fatalf("handler retry %d %+v", code, second)
 	}
-	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases", nil, &jobs); code != 200 || len(jobs) != 2 || jobs[0].ID != first.ID || jobs[0].State != "refused" || jobs[1].ID != second.ID {
-		t.Fatal("history", code, jobs)
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases?view=settled", nil, &page); code != 200 || len(page.Jobs) != 1 || page.Jobs[0].ID != first.ID || page.Jobs[0].State != "refused" {
+		t.Fatal("history", code, page)
+	}
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases", nil, &page); code != 200 || len(page.Jobs) != 1 || page.Jobs[0].ID != second.ID {
+		t.Fatal("active retry summary", code, page)
+	}
+	var detail api.ReleaseJob
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/releases?job="+second.ID, nil, &detail); code != 200 || detail.RetryOf == nil || detail.RetryOf.JobID != first.ID {
+		t.Fatal("exact retry detail", code, detail)
+	}
+}
+
+func TestReleasesHTTPBoundsOptionsAndFullDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := &client{t: t, st: st, who: api.Caller{Node: "fixture", User: "owner"}}
+	c.srv = httptest.NewServer(New(st, func(*http.Request) (api.Caller, error) { return c.who, nil }))
+	defer c.srv.Close()
+	task := c.task("bounded-http")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1010; i++ {
+		state := "released"
+		if i >= 805 {
+			state = "verified"
+		}
+		if i == 805 {
+			state = "blocked"
+		}
+		j := api.ReleaseJob{ID: fmt.Sprintf("rel_%016x", i+1), TaskID: task.ID, EntryID: api.NewID("tqe"), State: state, Generation: 1, Repository: strings.Repeat("fixture", 4096), Plan: api.VerificationPlan{Commit: strings.Repeat("a", 40)}}
+		raw, _ := json.Marshal(j)
+		if _, err = tx.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	base := "/v1/tasks/" + task.ID + "/releases"
+	res, err := http.Get(c.srv.URL + base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page api.ReleasePage
+	if json.Unmarshal(raw, &page) != nil || res.StatusCode != 200 || len(page.Jobs) != 50 || len(raw) >= 128<<10 || page.Jobs[0].State != "blocked" {
+		t.Fatal("default page", res.StatusCode, len(raw), page)
+	}
+	t.Logf("HTTP default: 805 heavy settled + 205 active; 50 summaries, %d bytes", len(raw))
+	for _, query := range []string{"?limit=201", "?limit=0", "?limit=-1", "?limit=x", "?view=all", "?view=", "?unknown=1", "?after=bad", "?job=rel_missing&limit=1", "?job=rel_missing&job=rel_missing"} {
+		if code := c.do("GET", base+query, nil, nil); code != 400 {
+			t.Fatal("invalid options", query, code)
+		}
+	}
+	var detail api.ReleaseJob
+	if code := c.do("GET", base+"?job=rel_0000000000000001", nil, &detail); code != 200 || len(detail.Repository) != 7*4096 || detail.Plan.Commit != strings.Repeat("a", 40) {
+		t.Fatal("full terminal detail", code)
+	}
+	if code := c.do("GET", base+"?job=rel_0000000000000326", nil, &detail); code != 200 || detail.State != "blocked" || detail.Plan.Commit != strings.Repeat("a", 40) {
+		t.Fatal("full active detail", code, detail.State)
 	}
 }
