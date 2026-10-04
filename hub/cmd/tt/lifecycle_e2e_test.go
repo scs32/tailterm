@@ -728,40 +728,47 @@ func (l *lifecycleRun) releaseJob(t *testing.T) {
 	jobs := func() []api.ReleaseJob {
 		t.Helper()
 		var summaries []api.ReleaseSummary
-		var after, snapshot string
-		var lastRow int64
+		var snapshot string
 		seen, seenJobs := map[string]bool{}, map[string]bool{}
-		for {
-			args := []string{"list"}
-			if after != "" {
-				args = append(args, "--after", after, "--snapshot", snapshot)
-			}
-			out, err := lifecycleCLI(t, func() error { return cmdDeployment(l.handlerE, args) })
-			if err != nil {
-				t.Fatalf("tt deployment list: %v\n%s", err, out)
-			}
-			var page api.ReleasePage
-			if err = json.Unmarshal([]byte(out), &page); err != nil {
-				t.Fatalf("tt deployment list output: %v\n%s", err, out)
-			}
-			if page.Version != 1 || page.Page.View != "active" || page.Page.Limit < 1 || page.Page.Limit > 200 || len(page.Jobs) > page.Page.Limit || page.Page.Snapshot == "" || (snapshot != "" && page.Page.Snapshot != snapshot) || (page.Page.NextAfter != "" && len(page.Jobs) == 0) {
-				t.Fatalf("tt deployment list returned an invalid page: %+v", page)
-			}
-			for _, summary := range page.Jobs {
-				if !summary.Summary || summary.ID == "" || seenJobs[summary.ID] || summary.RowID <= lastRow {
-					t.Fatalf("tt deployment list returned an invalid summary: %+v", summary)
+		for _, view := range []string{"active", "settled"} {
+			var after string
+			var lastRow int64
+			for {
+				args := []string{"list", "--view", view}
+				if after != "" {
+					args = append(args, "--after", after)
 				}
-				seenJobs[summary.ID], lastRow = true, summary.RowID
-				summaries = append(summaries, summary)
+				if snapshot != "" {
+					args = append(args, "--snapshot", snapshot)
+				}
+				out, err := lifecycleCLI(t, func() error { return cmdDeployment(l.handlerE, args) })
+				if err != nil {
+					t.Fatalf("tt deployment list: %v\n%s", err, out)
+				}
+				var page api.ReleasePage
+				if err = json.Unmarshal([]byte(out), &page); err != nil {
+					t.Fatalf("tt deployment list output: %v\n%s", err, out)
+				}
+				if page.Version != 1 || page.Page.View != view || page.Page.Limit < 1 || page.Page.Limit > 200 || len(page.Jobs) > page.Page.Limit || page.Page.Snapshot == "" || (snapshot != "" && page.Page.Snapshot != snapshot) || (page.Page.NextAfter != "" && len(page.Jobs) == 0) {
+					t.Fatalf("tt deployment list returned an invalid page: %+v", page)
+				}
+				snapshot = page.Page.Snapshot
+				for _, summary := range page.Jobs {
+					if !summary.Summary || summary.ID == "" || seenJobs[summary.ID] || summary.RowID <= lastRow {
+						t.Fatalf("tt deployment list returned an invalid summary: %+v", summary)
+					}
+					seenJobs[summary.ID], lastRow = true, summary.RowID
+					summaries = append(summaries, summary)
+				}
+				if page.Page.NextAfter == "" {
+					break
+				}
+				if seen[page.Page.NextAfter] {
+					t.Fatalf("tt deployment list repeated cursor: %s", page.Page.NextAfter)
+				}
+				seen[page.Page.NextAfter] = true
+				after = page.Page.NextAfter
 			}
-			if page.Page.NextAfter == "" {
-				break
-			}
-			if seen[page.Page.NextAfter] {
-				t.Fatalf("tt deployment list repeated cursor: %s", page.Page.NextAfter)
-			}
-			seen[page.Page.NextAfter] = true
-			after, snapshot = page.Page.NextAfter, page.Page.Snapshot
 		}
 		var list []api.ReleaseJob
 		for _, summary := range summaries {
@@ -775,7 +782,7 @@ func (l *lifecycleRun) releaseJob(t *testing.T) {
 			if err = json.Unmarshal([]byte(out), &job); err != nil {
 				t.Fatalf("tt deployment get output: %v\n%s", err, out)
 			}
-			if job.ID != summary.ID || job.Generation != summary.Generation || job.State != summary.State {
+			if job.ID != summary.ID || job.TaskID != summary.TaskID || job.EntryID != summary.EntryID || job.ItemID != summary.ItemID || job.Generation != summary.Generation || job.State != summary.State {
 				t.Fatalf("tt deployment get differs from listed summary: %+v versus %+v", job, summary)
 			}
 			list = append(list, job)
