@@ -1081,12 +1081,13 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   mkdirSync(longTmp); process.env.TMPDIR = longTmp;
   t.after(() => { if (inheritedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = inheritedTmp; });
   const path = lockFile(t), markers = [join(tempDir(t), "a.json"), join(tempDir(t), "b.json")], done = join(tempDir(t), "done");
-  const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process';
-    const tmux=spawnSync('tmux',['-L','two-run','new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
-    const tmuxPid=Number(spawnSync('tmux',['-L','two-run','display-message','-p','#{pid}'],{encoding:'utf8'}).stdout.trim());
-    process.once('SIGTERM',()=>{spawnSync('tmux',['-L','two-run','kill-server']);process.exit(0);});
-    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,tmuxPid,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
-    setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L','two-run','kill-server']);server.close(()=>process.exit(0));}},30);`;
+  const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process'; import {randomUUID} from 'node:crypto';
+    const tmuxSocket='tailterm-menu-test-'+randomUUID();
+    const tmux=spawnSync('tmux',['-L',tmuxSocket,'new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
+    const tmuxPid=Number(spawnSync('tmux',['-L',tmuxSocket,'display-message','-p','#{pid}'],{encoding:'utf8'}).stdout.trim());
+    process.once('SIGTERM',()=>{spawnSync('tmux',['-L',tmuxSocket,'kill-server']);process.exit(0);});
+    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,tmuxPid,tmuxSocket,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
+    setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L',tmuxSocket,'kill-server']);server.close(()=>process.exit(0));}},30);`;
   const a = runnerFixture(t, source(markers[0], false)), b = runnerFixture(t, source(markers[1], true));
   const outs = [tempDir(t), tempDir(t)], abort = new AbortController();
   const first = runPlan(a.plan, a.cwd, outs[0], { minFreeBytes: 0, abortSignal: abort.signal, hostLock: { path, ...two, pollMs: 20 } });
@@ -1105,9 +1106,15 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   assert.equal(allHeld(path).length, 2); assert.notEqual(ea.port, eb.port);
   for (const key of ["HOME", "TMPDIR", "TMUX_TMPDIR", "GOPATH", "GOMODCACHE", "GOCACHE"])assert.notEqual(ea[key],eb[key],key);
   for(const e of [ea,eb]) {
-    const socket = join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,"two-run");
+    const socket = join(e.TMUX_TMPDIR,`tmux-${process.getuid()}`,e.tmuxSocket);
+    assert.equal(Buffer.byteLength(e.tmuxSocket), 55, "unchanged longest participating menu socket name");
     assert(Buffer.byteLength(socket) < 104, "private namespace fits the host Unix socket bound despite long inherited TMPDIR");
+    const maximumSocket = join(e.TMUX_TMPDIR, "tmux-4294967295", e.tmuxSocket);
+    assert(Buffer.byteLength(maximumSocket) <= 103, "full unsigned32 UID and longest name fit with NUL reserved");
+    assert.equal(statSync(e.HOME).mode & 0o777, 0o700);
+    assert.equal(statSync(e.TMUX_TMPDIR).mode & 0o777, 0o700);
     assert(existsSync(socket), "private actual tmux socket");
+    console.log(JSON.stringify({ socketBudget: { socket, actualBytes: Buffer.byteLength(socket), maximumBytes: Buffer.byteLength(maximumSocket) } }));
   }
   abort.abort("cancel-peer"); await assert.rejects(first, /Verification interrupted by cancel-peer/);
   await until(()=>pidGone(ea.tmuxPid), "cancelled fixture tmux cleaned");assert(!pidGone(eb.tmuxPid));
@@ -1148,4 +1155,31 @@ test("overdue takeover in a two-holder cohort records exceptional overlap and le
  const next=await acquireHostLock(request(path,{...two,graceMs:20}));
  assert.equal(next.record.overlap,1);assert.equal(next.record.overlapDetails.holder,a.id);assert(!pidGone(a.pid));assert(!groupGone(a.group));
  assert.deepEqual(allHeld(path).find(h=>h.id===b.id),peer);assert(!groupGone(b.group));await next.release();await releaseChild(a);await releaseChild(b);
+});
+
+
+test("a complete socket budget rejection removes its allocated home before launching checks", async t => {
+  const marker = join(tempDir(t), "check-started");
+  const fixture = runnerFixture(t, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'started');`);
+  const output = tempDir(t), path = lockFile(t);
+  const parent = join(tempDir(t), "private-" + "x".repeat(120));
+  mkdirSync(parent);
+  let home, groups = 0;
+  await assert.rejects(runPlan(fixture.plan, fixture.cwd, output, {
+    minFreeBytes: 0,
+    hostLock: { path, ...two, pollMs: 20 },
+    createHome: () => { home = mkdtempSync(join(parent, "tv-")); return home; },
+    onGroup: () => { groups++; },
+  }), /Private verifier tmux socket budget exceeds 103 bytes/);
+  assert(home, "real private home allocated before refusal");
+  assert(!existsSync(home), "real allocated home cleanup after refusal");
+  assert(!existsSync(marker), "no check launched");
+  assert.equal(groups, 0, "no process group launched");
+  assert(!existsSync(join(output, "receipt.json")), "no acceptance receipt");
+  assert(!existsSync(join(output, "cleanup-error.json")), "cleanup succeeded");
+  assert.deepEqual(allHeld(path), [], "own lease released after refusal");
+  const lock = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+  assert.equal(lock.outcome, "released");
+  assert.equal(lock.overlap, 0);
+  console.log(JSON.stringify({ socketBudgetRejection: { home, homeRemoved: !existsSync(home), groups, noCheck: !existsSync(marker), noReceipt: !existsSync(join(output, "receipt.json")) } }));
 });

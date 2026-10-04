@@ -1254,19 +1254,27 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     abortSignal,
     removeHome = removeVerifierHome,
     stopHomeProcesses = stopVerifierHomeProcesses,
+    createHome = () => mkdtempSync(join(realpathSync("/tmp"), "tv-")),
     jobs = defaultJobs(),
     onGroup,
   } = options;
   requireFreeSpace(minFreeBytes, getAvailableBytes);
   const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
-  // Unix socket paths are bounded (104 bytes on this host). Inherited TMPDIR
-  // may be an arbitrarily deep evidence directory; keep the fresh private
-  // home short so its own tmux namespace remains usable there as well.
-  const home = mkdtempSync(join(realpathSync("/tmp"), "tailterm-verifier-"));
+  // Keep the unique private home independent of arbitrarily deep inherited
+  // TMPDIR. createHome is injectable like the cleanup hooks for failure tests.
+  const home = createHome();
   const receiptPath = join(output, receiptName);
   let receiptWritten = false;
   try {
     mkdirSync(output, { recursive: true });
+    // macOS sun_path has 104 bytes including NUL. Budget the complete canonical
+    // path for the longest participating name (menu prefix19 + UUID36), plus
+    // the maximum unsigned32 UID. Never fall back to another run's namespace.
+    const longestSocket = join(realpathSync(home), "tmux", "tmux-4294967295",
+      "tailterm-menu-test-" + "0".repeat(36));
+    const socketBytes = Buffer.byteLength(longestSocket);
+    if (socketBytes > 103)
+      throw new Error(`Private verifier tmux socket budget exceeds 103 bytes: ${socketBytes}`);
     const environment = {
       PATH: installCodexStub(home, output) + ":" + process.env.PATH,
       HOME: home,

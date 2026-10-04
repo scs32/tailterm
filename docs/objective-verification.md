@@ -715,19 +715,37 @@ Feature `wi_af52350b616dd0e4@4`, order #21517 / ASSIGN #22512 preserves the
 approved matrix digest `f57266be7f09c6f8b78443cf88c8fe3fd00ec07f01d3f84b9e8f1e0c4cf182c6`
 (owner #16614). Its scope selects all eligible local browser entrypoints and
 imports; deployed-browser and deployed-reset remain excluded. The source
-inventory #21888 / final plan #22508 covers 58 entrypoints and 76 modules.
+inventory #21888 / final plan #22508 was refreshed for candidate `b9853e8`
+by diagnosis #22770: 58 entrypoints and 79 modules, plus the npm unit suites
+and their subprocess helpers. Correction order #22775 / saved #22788 covers
+only this document, the runner and the host-lock test.
 
 - Each real runner invocation creates a fresh disposable HOME, TMPDIR, GOPATH,
   GOMODCACHE and GOCACHE, plus a private TMUX_TMPDIR directory beneath its home.
-  The home uses a fresh directory beneath canonical `/tmp` so long inherited
-  evidence paths do not exceed the host's Unix socket path bound. The synthetic
-  cancellation case forces a long outer TMPDIR, retains failed-check/cleanup
-  logs in TAP, and checks actual peer survival and tmux server teardown.
+  The home uses unique `tv-` plus six mkdtemp bytes beneath canonical `/tmp`
+  (`/private/tmp` on the Mini). Its private `tmux` directory is mode 0700.
+  macOS `sun_path[104]` leaves a conservative 103 payload bytes after NUL.
+  The complete path is `TMUX_TMPDIR/tmux-<UID>/<socket-name>`: a 27-byte
+  canonical namespace, 10 decimal UID bytes and the longest 55-byte menu name
+  give 99 bytes; the current UID501 path uses 92. A cleanup-protected guard
+  rejects an oversized canonical path before any checks or groups launch.
+  The synthetic cancellation case forces a long outer TMPDIR and uses the
+  unchanged menu socket expression, retains failed-check/cleanup logs in TAP,
+  and checks actual peer survival and tmux server teardown. A separate real
+  allocated-home rejection proves cleanup, lease release and no receipt.
   Credential stripping, pre-admission prerequisite checks, post-admission held
   hashes, process-group recording, cleanup and no-receipt-on-failure are retained.
-- `task-form-browser.mjs` uses one short PID/random socket name per invocation
-  for all four launch/assertion/teardown references. Identically named sockets
-  used by other fixtures live in separate TMUX_TMPDIR namespaces. Cleanup stays
+- `tmux-menu-browser.mjs` uses `tailterm-menu-test-` (19 bytes) plus a
+  36-byte UUID for all real `-L` calls; this is the longest participating name.
+  `task-form-browser.mjs` uses `tf-`, up to 10 decimal positive PID bytes,
+  a separator and eight UUID bytes (maximum 22) for all four references.
+  `board-decisions-browser.mjs` configures a 29-byte never-started name for
+  its ask fixture; it does not intend a tmux launch. The npm unit attachment
+  fixture overrides the runner namespace with its own `/tmp/tt-XXXXXX` and
+  uses implicit `default` (7) and `-L viewer` (6). Shared shell fixtures use
+  fake tmux executables; `capture-pane -S -5000` is a line option, not a socket
+  path. No participating real global `-S` socket is selected. Identically named
+  sockets used by other fixtures live in separate TMUX_TMPDIR namespaces. Cleanup stays
   inside the owning home/socket/group; no peer is signalled by lock recovery.
 - Browser listeners use the released per-run ephemeral ports. Matrix
   `requiredPorts` are occupancy checks, not reservations. Canonical worktree
@@ -749,5 +767,15 @@ use distinct fixture worktrees, actual ephemeral listeners and private tmux
 servers; A cancellation must leave B's socket, process, home and receipt intact.
 These checks do not replace the distinct verifier's full eligible native matrix
 or the two-worktree/both-engine PNG decoding and peer-preservation probe in the
-saved plan. Keep runtime a1-a3 acceptance pending until that evidence, independent
+saved plan. Its browser/static SSH commands are synthetic; item composition
+uses an isolated hub without real tmux. Its separate private `OUT/home-XXXXXX`
+homes do not use the runner's allocator. The prepared short OUT would fit a
+hypothetical default name, but its 116-byte worst-case menu path is not safe
+and the menu suite is not selected there; refresh the budget if stages change.
+Standalone `tests/real-tmux.py` and Go tmux test suites are outside this native
+selection. The prior seven-byte synthetic name missed the real menu's 48-byte
+length difference; retained native menu failures establish that recurrence.
+The original earlier focused failure attribution remains unknown, and permanent
+prevention remains open until independently verified and saved.
+Keep runtime a1-a3 acceptance pending until that evidence, independent
 review, lead acceptance and handler-saved completion are retained.
