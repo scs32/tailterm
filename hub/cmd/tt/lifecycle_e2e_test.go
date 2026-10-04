@@ -727,13 +727,58 @@ func (l *lifecycleRun) releaseJob(t *testing.T) {
 	t.Helper()
 	jobs := func() []api.ReleaseJob {
 		t.Helper()
-		out, err := lifecycleCLI(t, func() error { return cmdDeployment(l.handlerE, []string{"list"}) })
-		if err != nil {
-			t.Fatalf("tt deployment list: %v\n%s", err, out)
+		var summaries []api.ReleaseSummary
+		var after, snapshot string
+		var lastRow int64
+		seen, seenJobs := map[string]bool{}, map[string]bool{}
+		for {
+			args := []string{"list"}
+			if after != "" {
+				args = append(args, "--after", after, "--snapshot", snapshot)
+			}
+			out, err := lifecycleCLI(t, func() error { return cmdDeployment(l.handlerE, args) })
+			if err != nil {
+				t.Fatalf("tt deployment list: %v\n%s", err, out)
+			}
+			var page api.ReleasePage
+			if err = json.Unmarshal([]byte(out), &page); err != nil {
+				t.Fatalf("tt deployment list output: %v\n%s", err, out)
+			}
+			if page.Version != 1 || page.Page.View != "active" || page.Page.Limit < 1 || page.Page.Limit > 200 || len(page.Jobs) > page.Page.Limit || page.Page.Snapshot == "" || (snapshot != "" && page.Page.Snapshot != snapshot) || (page.Page.NextAfter != "" && len(page.Jobs) == 0) {
+				t.Fatalf("tt deployment list returned an invalid page: %+v", page)
+			}
+			for _, summary := range page.Jobs {
+				if !summary.Summary || summary.ID == "" || seenJobs[summary.ID] || summary.RowID <= lastRow {
+					t.Fatalf("tt deployment list returned an invalid summary: %+v", summary)
+				}
+				seenJobs[summary.ID], lastRow = true, summary.RowID
+				summaries = append(summaries, summary)
+			}
+			if page.Page.NextAfter == "" {
+				break
+			}
+			if seen[page.Page.NextAfter] {
+				t.Fatalf("tt deployment list repeated cursor: %s", page.Page.NextAfter)
+			}
+			seen[page.Page.NextAfter] = true
+			after, snapshot = page.Page.NextAfter, page.Page.Snapshot
 		}
 		var list []api.ReleaseJob
-		if err = json.Unmarshal([]byte(out), &list); err != nil {
-			t.Fatalf("tt deployment list output: %v\n%s", err, out)
+		for _, summary := range summaries {
+			out, err := lifecycleCLI(t, func() error {
+				return cmdDeployment(l.handlerE, []string{"get", "--job", summary.ID})
+			})
+			if err != nil {
+				t.Fatalf("tt deployment get: %v\n%s", err, out)
+			}
+			var job api.ReleaseJob
+			if err = json.Unmarshal([]byte(out), &job); err != nil {
+				t.Fatalf("tt deployment get output: %v\n%s", err, out)
+			}
+			if job.ID != summary.ID || job.Generation != summary.Generation || job.State != summary.State {
+				t.Fatalf("tt deployment get differs from listed summary: %+v versus %+v", job, summary)
+			}
+			list = append(list, job)
 		}
 		return list
 	}
