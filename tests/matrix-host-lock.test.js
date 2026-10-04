@@ -1169,7 +1169,10 @@ test("a complete socket budget rejection removes its allocated home before launc
     minFreeBytes: 0,
     hostLock: { path, ...two, pollMs: 20 },
     createHome: () => { home = mkdtempSync(join(parent, "tv-")); return home; },
-    onGroup: () => { groups++; },
+    acquireHostLock: async options => {
+      const lease = await acquireHostLock(options);
+      return { ...lease, addGroup: pgid => { groups++; return lease.addGroup(pgid); } };
+    },
   }), /Private verifier tmux socket budget exceeds 103 bytes/);
   assert(home, "real private home allocated before refusal");
   assert(!existsSync(home), "real allocated home cleanup after refusal");
