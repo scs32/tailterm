@@ -179,23 +179,39 @@ so it can never satisfy the verification plan's owner approval binding.
 
 ## Where the helper's pane opens
 
-In TailOS the helper's pane always opens in the pinned **Home** area, beside the
-agent groups and outside them (see [project overview](project-overview.md)). It
+In TailOS the helper's pane always opens in the pinned **Home** area, outside the
+agent groups (see [project overview](project-overview.md)). It
 is identified by its hub role, `owner_helper`, never by name. Home is not counted
 by Panes per group, and the helper is not a project member, so it never takes a
 project slot or creates a "(continued)" group. It cannot be dragged out of Home.
 
-The pane attaches with `attach-session -f ignore-size` (tmux 3.2+; older tmux
-attaches plainly), so it never resizes the owner's own terminal on that session.
-A reconnect keeps the binding and the flag. If the owner opened the helper's
-session from the launcher before the hub reported it, adoption moves that tab
-into Home and replaces its plain attach with an ignore-size attach, whether it is
-still connecting or connected; the tab id and place are kept, and it never runs
-`new-session`.
+On each helper attach, TailOS verifies the exact tmux session ID and creation
+time plus its task, agent, run and `owner_helper` tags, resolves the selected
+window's stable ID, and sets only that window to `window-size latest`. It refuses
+the policy if the identity differs or the window is linked to another session.
+It does not change global window sizing or the ordinary-agent sizing controller.
 
-Caveat: ignore-size only defers to other attached clients. A lone ignore-size
-client can still size a `window-size latest` window, so with the owner's terminal
-detached the window may follow the TailOS pane until the owner attaches again.
+The pane then attaches with `attach-session -f ignore-size` on tmux 3.2+.
+When TailOS is the only attached client, the helper window follows that pane's
+PTY dimensions. When the owner's normal terminal is attached too, tmux excludes
+TailOS from sizing and uses the owner's terminal dimensions. Owner attach/detach
+transitions reconcile natively, without a browser command or client-count poll.
+A historical manual 200×50 window is corrected on attach, including when the
+owner is present; its resulting dimensions come from the owner, not TailOS.
+Program rows exclude tmux's status rows: a 137×24 client with one status row
+produces a 137×23 program window. The helper's native policy has no 80×24 floor.
+
+Reconnect reapplies the guarded policy and keeps the binding and size flag. If
+the launcher opened the helper before the hub reported it, adoption moves that
+tab into Home and replaces its plain attach with the guarded helper attach,
+whether still connecting or connected. It keeps the tab ID and attaches to the
+existing session without creating one. A changed server endpoint blocks helper
+replacement until the original profile is restored. Hidden replacements keep
+the previous PTY dimensions; visible panes send their fitted dimensions.
+
+The private-socket regression executes these transitions on tmux 3.7b. Older
+than tmux 3.2, the existing compatibility fallback attaches plainly; owner
+precedence through `ignore-size` is unavailable and is not guaranteed there.
 
 A workspace saved before Home kept the helper inside its project group; the login
 restore moves it into Home once the hub roster is read (if the hub is unreachable,

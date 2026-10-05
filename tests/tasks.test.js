@@ -18,12 +18,13 @@ import {
   helperLabel,
   attachOptions,
   helperReattach,
+  helperAttachKey,
   reattachOptions,
 } from "../client/tasks.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
-import { tmuxCommand } from "../shared/tmux-command.js";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { tmuxCommand, shellQuote } from "../shared/tmux-command.js";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 const servers = [
   {
@@ -288,6 +289,7 @@ test("sessionCheckNeeded covers finished agents only", () => {
 // A synthetic owner helper: never the live owner session.
 const helperFixture = agent(90, {
   name: "owner-helper-fx",
+  runId: "run_0000000000000090",
   session: "helper-fx",
   role: "owner_helper",
 });
@@ -451,8 +453,13 @@ test("helperReattach and reattachOptions force an ignore-size attach", () => {
       true,
       status,
     );
-  assert.equal(helperReattach(tab({ attachIgnoresSize: true })), false);
-  assert.equal(helperReattach(tab({ attachIgnoresSize: undefined })), false);
+  assert.equal(
+    helperReattach(
+      tab({ attachIgnoresSize: true, attachHelperKey: helperAttachKey(task) }),
+    ),
+    false,
+  );
+  assert.equal(helperReattach(tab({ attachIgnoresSize: undefined })), true);
   assert.equal(
     helperReattach(tab({ attachIgnoresSize: false, tmux: false })),
     false,
@@ -465,6 +472,24 @@ test("helperReattach and reattachOptions force an ignore-size attach", () => {
     "an ordinary agent is not reattached",
   );
   assert.equal(helperReattach(null), false);
+  assert.equal(
+    helperReattach(tab({ attachIgnoresSize: true })),
+    true,
+    "legacy ignore-size helper adoption still needs the latest policy",
+  );
+  assert.equal(
+    helperReattach(
+      tab({
+        attachIgnoresSize: true,
+        attachHelperKey: helperAttachKey({
+          ...task,
+          runId: "run_0000000000000091",
+        }),
+      }),
+    ),
+    true,
+    "a different run's emitted command cannot suppress the current policy",
+  );
   const original = tab({ status: "Connecting", attachIgnoresSize: false });
   const options = reattachOptions(original);
   assert.equal(options.replace, original);
@@ -472,7 +497,18 @@ test("helperReattach and reattachOptions force an ignore-size attach", () => {
   assert.equal(options.task, task);
   assert.equal(options.target, target);
   assert.equal(options.home, true);
-  assert.deepEqual(attachOptions(task), { ignoreSize: true });
+  assert.deepEqual(attachOptions(task), {
+    ignoreSize: true,
+    helperBinding: {
+      taskId: task.taskId,
+      agentId: task.agentId,
+      runId: task.runId,
+      role: "owner_helper",
+    },
+  });
+  assert.deepEqual(attachOptions({ ...task, runId: undefined }), {
+    ignoreSize: true,
+  });
   assert.deepEqual(attachOptions(undefined), { ignoreSize: false });
   const command = tmuxCommand(
     original.session,
@@ -498,82 +534,186 @@ test("helperReattach and reattachOptions force an ignore-size attach", () => {
   assert.doesNotMatch(plainCommand, /ignore-size/);
 });
 
-// Real tmux on private sockets: the helper's attach never resizes the owner's
-// terminal. Both servers live under a private TMUX_TMPDIR.
-test("the helper attach does not change the session's window size", (t) => {
-  let version = "";
-  try {
-    version = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
-  } catch {
-    t.skip("tmux is not installed");
-    return;
-  }
-  const [major, minor] = (version.match(/(\d+)\.(\d+)/) || [])
-    .slice(1)
-    .map(Number);
-  if (!(major > 3 || (major === 3 && minor >= 2))) {
-    t.skip(`tmux 3.2+ is required for ignore-size (found ${version})`);
-    return;
-  }
-  // Unix socket paths are limited (104 bytes on macOS), so the private
-  // sockets live in a short 0700 directory, not under a possibly long TMPDIR.
-  const dir = mkdtempSync("/tmp/tt-");
-  const env = { ...process.env, TMUX_TMPDIR: dir };
-  delete env.TMUX;
-  delete env.TMUX_PANE;
-  const target = (...args) =>
-    execFileSync("tmux", ["-f", "/dev/null", ...args], {
-      env,
-      encoding: "utf8",
-    }).trim();
-  const viewer = (...args) =>
-    execFileSync("tmux", ["-L", "viewer", "-f", "/dev/null", ...args], {
-      env,
-      encoding: "utf8",
-    }).trim();
-  const size = () =>
-    target(
-      "display-message",
-      "-p",
-      "-t",
-      "helper-fx:",
-      "#{window_width}x#{window_height}",
-    );
-  const waitClient = (want) => {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      if (
-        target(
-          "list-clients",
-          "-F",
-          "#{client_width}x#{client_height} #{session_name}",
-        ).includes(want)
-      )
-        return execFileSync("sleep", ["0.2"]);
-      execFileSync("sleep", ["0.05"]);
-    }
-    assert.fail(`no ${want} client attached`);
-  };
+// Real PTYs and generated attach commands on TWO private sockets. No inherited
+// session/configuration/credential state participates in the sizing policy.
+test("helper latest policy follows lone TailOS and defers to the owner across transitions", (t) => {
+  const version = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
+  assert.match(
+    version,
+    /^tmux (?:3\.[2-9]|[4-9]\.)/,
+    "tmux 3.2+ required; this check must execute",
+  );
+  const dir = mkdtempSync("/tmp/tt-help-");
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) =>
+        !key.startsWith("TAILTERM_") && !["TMUX", "TMUX_PANE"].includes(key),
+    ),
+  );
+  const binary = dir + "/tmux";
+  const tmuxPath = execFileSync("/bin/sh", ["-c", "command -v tmux"], {
+    env,
+    encoding: "utf8",
+  }).trim();
+  writeFileSync(
+    binary,
+    `#!/bin/sh\nexec '${tmuxPath}' -S '${dir}/target' -f /dev/null "$@"\n`,
+    { mode: 0o700 },
+  );
+  const run = (socket, ...args) =>
+    execFileSync(
+      tmuxPath,
+      ["-S", dir + "/" + socket, "-f", "/dev/null", ...args],
+      { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+  const target = (...args) => run("target", ...args);
+  const viewer = (...args) => run("viewer", ...args);
   t.after(() => {
-    for (const run of [target, viewer])
+    for (const socket of ["target", "viewer"])
       try {
-        run("kill-server");
+        run(socket, "kill-server");
       } catch {}
     rmSync(dir, { recursive: true, force: true });
   });
+  const binding = attachOptions(taskBinding(TASK, helperFixture));
+  const tag = binding.helperBinding;
   target(
     "new-session",
     "-d",
     "-s",
-    helperFixture.session,
+    "helper-fx",
+    "-n",
+    "control",
     "-x",
     "200",
     "-y",
     "50",
+    ...Object.entries({
+      TAILTERM_TASK: tag.taskId,
+      TAILTERM_AGENT: tag.agentId,
+      TAILTERM_RUN: tag.runId,
+      TAILTERM_ROLE: tag.role,
+    }).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     "sleep 120",
   );
-  target("set-option", "-w", "-t", "helper-fx:", "window-size", "latest");
-  // The owner's own terminal: a normal 120x40 client.
+  const [id, created, windowId] = target(
+    "display-message",
+    "-p",
+    "-t",
+    "helper-fx:",
+    "#{session_id}|#{session_created}|#{window_id}",
+  ).split("|");
+  const identity = { id, created };
+  const window = id + ":" + windowId;
+  const dimensions = () =>
+    target(
+      "display-message",
+      "-p",
+      "-t",
+      window,
+      "#{window_width}x#{window_height}",
+    );
+  const wait = (predicate, label) => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      execFileSync("sleep", ["0.05"]);
+    }
+    assert.fail(
+      `${label}: window ${dimensions()}, clients ${target("list-clients", "-F", "#{client_width}x#{client_height}|#{client_flags}")}`,
+    );
+  };
+  const expectClient = (cols, rows) =>
+    wait(
+      () =>
+        target("list-clients", "-F", "#{client_width}x#{client_height}")
+          .split("\n")
+          .includes(`${cols}x${rows}`),
+      "PTY resize delivered",
+    );
+  const record = (label) =>
+    t.diagnostic(
+      `${label}: ${target("display-message", "-p", "-t", window, "#{session_id}|#{session_created}|#{window_id}|#{window-size}|#{window_width}x#{window_height}|pane=#{pane_width}x#{pane_height}|status=#{status}")}; clients ${target("list-clients", "-F", "#{client_width}x#{client_height}|#{client_flags}")}`,
+    );
+  const expect = (size, label) => {
+    wait(() => dimensions() === size, label);
+    record(label);
+  };
+  const manual = () => {
+    target("set-option", "-w", "-t", window, "window-size", "manual");
+    target("resize-window", "-t", window, "-x", "200", "-y", "50");
+  };
+  const attach = (name, cols, rows, options = binding, exact = identity) => {
+    const command = tmuxCommand("helper-fx", binary, true, exact, "", options);
+    viewer(
+      "new-session",
+      "-d",
+      "-s",
+      name,
+      "-x",
+      String(cols),
+      "-y",
+      String(rows),
+      "env -u TMUX " + command,
+    );
+    wait(
+      () =>
+        target(
+          "list-clients",
+          "-F",
+          "#{client_width}x#{client_height}",
+        ).includes(`${cols}x${rows}`),
+      `${name} attached`,
+    );
+  };
+  // Sentinels include a non-target helper window, unrelated session and global policy.
+  target("new-window", "-d", "-t", id, "-n", "sentinel", "sleep 120");
+  target(
+    "new-session",
+    "-d",
+    "-s",
+    "unrelated",
+    "-x",
+    "180",
+    "-y",
+    "45",
+    "sleep 120",
+  );
+  target("set-option", "-w", "-t", id + ":sentinel", "window-size", "manual");
+  target("set-option", "-w", "-t", "unrelated:", "window-size", "manual");
+  const sentinels = () => [
+    target(
+      "list-windows",
+      "-t",
+      id,
+      "-F",
+      "#{window_id}|#{window-size}|#{window_width}x#{window_height}",
+    )
+      .split("\n")
+      .filter((line) => !line.startsWith(windowId + "|")),
+    target(
+      "display-message",
+      "-p",
+      "-t",
+      "unrelated:",
+      "#{window-size}|#{window_width}x#{window_height}",
+    ),
+    target("show-option", "-gw", "window-size"),
+  ];
+  const before = sentinels();
+  manual();
+  attach("baseline", 137, 24, { ignoreSize: true });
+  expect("200x50", "baseline: manual size clips lone ignore-size client");
+  viewer("kill-session", "-t", "baseline");
+  attach("tile", 137, 24);
+  expect("137x23", "M1 first helper attach");
+  assert.equal(
+    target("show-option", "-wv", "-t", window, "window-size"),
+    "latest",
+  );
+  viewer("resize-window", "-t", "tile:", "-x", "145", "-y", "30");
+  expectClient(145, 30);
+  expect("145x29", "M1 visible PTY resize");
   viewer(
     "new-session",
     "-d",
@@ -583,53 +723,124 @@ test("the helper attach does not change the session's window size", (t) => {
     "120",
     "-y",
     "40",
-    "env -u TMUX tmux attach-session -t '=helper-fx'",
+    "env -u TMUX " + binary + " attach-session -t " + shellQuote(id),
   );
-  waitClient("120x40 helper-fx");
-  assert.equal(size(), "120x39", "the owner's client sizes the window");
-  const helperAttach = tmuxCommand(
-    helperFixture.session,
-    "",
-    true,
-    undefined,
-    "",
-    attachOptions(taskBinding(TASK, helperFixture)),
-  );
-  assert.match(helperAttach, /ignore-size/);
-  viewer(
-    "new-session",
-    "-d",
-    "-s",
-    "tile",
-    "-x",
-    "16",
-    "-y",
-    "2",
-    "env -u TMUX " + helperAttach,
-  );
-  waitClient("16x2 helper-fx");
-  assert.equal(size(), "120x39", "the home pane attach left the window alone");
-  // Control: the same tile without the flag does resize the window.
+  expect("120x39", "M5 TailOS first then owner");
+  viewer("resize-window", "-t", "tile:", "-x", "137", "-y", "24");
+  expectClient(137, 24);
+  expect("120x39", "M4 TailOS resize cannot impose owner dimensions");
   viewer("kill-session", "-t", "tile");
-  const plainAttach = tmuxCommand(
-    helperFixture.session,
-    "",
-    true,
-    undefined,
-    "",
-    attachOptions(undefined),
-  );
+  manual();
+  attach("tile", 137, 24);
+  expect("120x39", "M4 owner first plus historical manual size on reconnect");
+  viewer("kill-session", "-t", "owner");
+  expect("137x23", "M5 owner detach without a browser command");
   viewer(
     "new-session",
     "-d",
     "-s",
-    "plain",
+    "owner",
     "-x",
-    "16",
+    "120",
     "-y",
-    "2",
-    "env -u TMUX " + plainAttach,
+    "40",
+    "env -u TMUX " + binary + " attach-session -t " + shellQuote(id),
   );
-  waitClient("16x2 helper-fx");
-  assert.notEqual(size(), "120x39", "the control attach must change the size");
+  expect("120x39", "M5 owner reattach takes precedence again");
+  viewer("kill-session", "-t", "tile");
+  attach("tile", 137, 24);
+  expect("120x39", "M5 TailOS reconnect while owner remains");
+  viewer("kill-session", "-t", "owner");
+  expect("137x23", "M5 owner detach after reconnect");
+  viewer("kill-session", "-t", "tile");
+  manual();
+  attach("tile", 110, 21);
+  expect("110x20", "M3 smaller reconnect clears historical manual size");
+  target("set-option", "-t", id, "status", "off");
+  expect("110x21", "M6 no status row");
+  target("set-option", "-t", id, "status", "2");
+  expect("110x19", "M6 two status rows");
+  target("set-option", "-t", id, "status", "on");
+  expect("110x20", "M6 one status row");
+  // Adoption: ordinary launcher first, followed by generated helper reattach.
+  viewer("kill-session", "-t", "tile");
+  manual();
+  attach("launcher", 137, 24, { ignoreSize: false });
+  expect("200x50", "M2 plain launcher preserves historical manual size");
+  viewer("kill-session", "-t", "launcher");
+  attach("adopted", 137, 24, binding, undefined);
+  expect("137x23", "M2 adopted exact-name helper policy");
+  viewer("kill-session", "-t", "adopted");
+  target("rename-session", "-t", id, "renamed-helper");
+  attach("renamed", 130, 28);
+  expect("130x27", "renamed exact session attach");
+  viewer("kill-session", "-t", "renamed");
+  // Negative commands must exit before attach AND before the latest mutation.
+  const refuse = (options, exact, label) => {
+    manual();
+    const command = tmuxCommand("helper-fx", binary, true, exact, "", options);
+    const result = spawnSync("/bin/sh", ["-c", command], {
+      env,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+    assert.equal(dimensions(), "200x50", label);
+    assert.equal(
+      target("show-option", "-wv", "-t", window, "window-size"),
+      "manual",
+      label,
+    );
+    assert.deepEqual(sentinels(), before, label);
+  };
+  for (const key of ["taskId", "agentId", "runId"]) {
+    refuse(
+      {
+        ...binding,
+        helperBinding: { ...tag, [key]: tag[key].slice(0, -1) + "1" },
+      },
+      identity,
+      `wrong ${key}`,
+    );
+  }
+  target("set-environment", "-t", id, "TAILTERM_ROLE", "ordinary");
+  refuse(binding, identity, "remote role mismatch");
+  target("set-environment", "-t", id, "TAILTERM_ROLE", "owner_helper");
+  refuse(
+    binding,
+    { ...identity, created: String(Number(created) - 1) },
+    "stale creation time",
+  );
+  refuse(binding, { ...identity, id: "$99999" }, "absent session");
+  target("link-window", "-d", "-s", window, "-t", "unrelated:");
+  // Linked-window guard: record the linked manual state, not the new unrelated link.
+  manual();
+  const linkedBefore = target(
+    "list-windows",
+    "-t",
+    "unrelated",
+    "-F",
+    "#{window_id}|#{window-size}|#{window_width}x#{window_height}",
+  );
+  const result = spawnSync(
+    "/bin/sh",
+    ["-c", tmuxCommand("helper-fx", binary, true, identity, "", binding)],
+    { env, encoding: "utf8", timeout: 5000 },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /linked/);
+  assert.equal(dimensions(), "200x50");
+  assert.equal(
+    target(
+      "list-windows",
+      "-t",
+      "unrelated",
+      "-F",
+      "#{window_id}|#{window-size}|#{window_width}x#{window_height}",
+    ),
+    linkedBefore,
+  );
+  t.diagnostic(
+    `${version}; isolated sockets ${dir}/target and ${dir}/viewer; all identity and linked-window negatives refused`,
+  );
 });

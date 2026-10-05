@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
@@ -390,6 +396,116 @@ test("agent tiles attach with ignore-size on tmux 3.2+ only; other attaches neve
       assert.equal(result.status, 0, result.stderr);
       assert.doesNotMatch(result.stdout, /ignore-size/);
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("helper policy is identity guarded, exact-window targeted and shell quoted", () => {
+  const dir = mkdtempSync("/tmp/tt-helper-command-");
+  const binary = dir + "/tmux ' fixture";
+  const binding = {
+    taskId: "tsk_0000000000000001",
+    agentId: "agt_0000000000000001",
+    runId: "run_0000000000000001",
+    role: "owner_helper",
+  };
+  const options = { ignoreSize: true, helperBinding: binding };
+  try {
+    writeFileSync(
+      binary,
+      `#!/bin/sh
+case "$1" in
+-V) printf 'tmux %s\\n' "$FAKE_TMUX_VERSION" ;;
+list-sessions) printf 'helper|$4\\n' ;;
+display-message) case "$*" in *window_id*) printf '@12|1234\\n' ;; *) printf '$4|1234\\n' ;; esac ;;
+if-shell) printf '%s\\n' "$@" > "${dir}/guard"; printf '%s\\n' "$FAKE_HELPER_POLICY" ;;
+*) printf '%s\\n' "$@" ;;
+esac
+`,
+      { mode: 0o700 },
+    );
+    const command = tmuxCommand(
+      "helper",
+      binary,
+      true,
+      { id: "$4", created: "1234" },
+      "",
+      options,
+    );
+    for (const version of ["3.7b", "3.1c"]) {
+      const result = spawnSync("/bin/sh", ["-c", command], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FAKE_TMUX_VERSION: version,
+          FAKE_HELPER_POLICY: "helper-ready",
+        },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(
+        result.stdout,
+        /attach-session\n(?:-f\nignore-size\n)?-t\n\$4:@12\n/,
+      );
+      assert.equal(result.stdout.includes("ignore-size"), version === "3.7b");
+      const guard = readFileSync(dir + "/guard", "utf8");
+      assert.match(guard, /if-shell\n-F\n-t\n\$4:@12\n/);
+      assert.match(guard, /session_created},1234/);
+      for (const tag of [
+        "TAILTERM_TASK",
+        "TAILTERM_AGENT",
+        "TAILTERM_RUN",
+        "TAILTERM_ROLE",
+        "window_linked",
+        "window_id",
+      ])
+        assert.ok(guard.includes(tag), tag);
+      assert.match(guard, /set-option -w -t '\$4:@12' window-size latest/);
+      assert.doesNotMatch(guard, /resize-window|-g /);
+    }
+    const refused = spawnSync("/bin/sh", ["-c", command], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        FAKE_TMUX_VERSION: "3.7b",
+        FAKE_HELPER_POLICY: "helper-refused",
+      },
+    });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /Helper sizing refused/);
+    assert.doesNotMatch(refused.stdout, /attach-session/);
+    for (const malformed of [
+      { ...binding, role: "ordinary" },
+      { ...binding, runId: "" },
+      { ...binding, taskId: "bad'$(false)" },
+      { ...binding, agentId: "bad" },
+    ])
+      assert.throws(
+        () =>
+          tmuxCommand("helper", binary, true, undefined, "", {
+            ignoreSize: true,
+            helperBinding: malformed,
+          }),
+        /identity/,
+      );
+    assert.throws(
+      () => tmuxCommand("helper", binary, false, undefined, "", options),
+      /existing-session/,
+    );
+    assert.throws(
+      () =>
+        tmuxCommand("helper", binary, true, undefined, "", {
+          ...options,
+          ignoreSize: false,
+        }),
+      /ignore-size/,
+    );
+    for (const plain of [
+      tmuxCommand("helper"),
+      tmuxCommand("helper", "", true),
+      tmuxCommand("agent", "", true, undefined, "", { ignoreSize: true }),
+    ])
+      assert.doesNotMatch(plain, /helper-ready|window-size latest/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

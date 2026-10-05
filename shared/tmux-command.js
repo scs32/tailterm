@@ -49,10 +49,17 @@ export function tmuxCommand(
   resumeOnly = false,
   target,
   cwd = "",
-  { ignoreSize = false } = {},
+  { ignoreSize = false, helperBinding } = {},
 ) {
   validateSession(name);
   validateStartDirectory(cwd);
+  if (helperBinding && (!resumeOnly || !ignoreSize))
+    throw new Error(
+      "Helper sizing requires an ignore-size existing-session attach.",
+    );
+  const helperPolicy = helperBinding
+    ? helperWindowPolicy(helperBinding, target)
+    : "";
   const start = cwd && !resumeOnly ? " -c " + shellQuote(cwd) : "";
   // PTY size never implicitly controls an agent window. Foreground focus uses
   // the separately guarded sizing command; manual sizing protects hidden tiles.
@@ -69,9 +76,41 @@ export function tmuxCommand(
             ? exactTarget(target)
             : exactSession(name)
           : "") +
+        helperPolicy +
         // Browser terminals always support UTF-8, even when SSH has no locale.
-        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? "attach-session " + attachFlags + '-t "$tailterm_tmux_target"' : "new-session -A -s " + shellQuote(name) + start} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
+        `"$tailterm_tmux_bin" -u $tailterm_tmux_features ${resumeOnly ? "attach-session " + attachFlags + '-t "$tailterm_tmux_target' + (helperPolicy ? ":$tailterm_tmux_window" : "") + '"' : "new-session -A -s " + shellQuote(name) + start} \\; if-shell -F '#{==:#{set-clipboard},off}' 'set-option -s set-clipboard external' \\; set-option mouse on; tailterm_tmux_status=$?; if [ "$tailterm_tmux_status" -ne 0 ]; then printf 'tmux failed with exit status %s; see its error above.\\n' "$tailterm_tmux_status" >&2; fi; exit "$tailterm_tmux_status"`,
     )
+  );
+}
+// Helpers use native client precedence, not the ordinary-agent manual-size
+// controller. Resolve the selected window once, then guard and mutate it in a
+// synchronous tmux queue. A window linked to another session is unsupported.
+function helperWindowPolicy(binding, target) {
+  if (
+    binding?.role !== "owner_helper" ||
+    !/^tsk_[0-9a-f]{16}$/.test(binding.taskId || "") ||
+    !/^agt_[0-9a-f]{16}$/.test(binding.agentId || "") ||
+    !/^run_[0-9a-f]{16}$/.test(binding.runId || "")
+  )
+    throw new Error("Invalid helper sizing identity.");
+  const eq = (field, value) => `#{==:#{${field}},${value}}`;
+  const identity = [
+    eq("session_id", "$tailterm_tmux_target"),
+    eq("session_created", "$tailterm_tmux_created"),
+    eq("window_id", "$tailterm_tmux_window"),
+    eq("TAILTERM_TASK", binding.taskId),
+    eq("TAILTERM_AGENT", binding.agentId),
+    eq("TAILTERM_RUN", binding.runId),
+    eq("TAILTERM_ROLE", "owner_helper"),
+    eq("window_linked", 0),
+  ].reduce((a, b) => `#{&&:${a},${b}}`);
+  return (
+    `tailterm_tmux_window_identity=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{window_id}|#{session_created}') || exit 1; ` +
+    `tailterm_tmux_window=\${tailterm_tmux_window_identity%%|*}; ` +
+    `tailterm_tmux_created=${target ? shellQuote(String(target.created)) : '"${tailterm_tmux_window_identity#*|}"'}; ` +
+    `case "$tailterm_tmux_window" in @*[!0-9]*|@|'') printf 'Invalid helper window identity.\\n' >&2; exit 1 ;; @*) ;; *) exit 1 ;; esac; ` +
+    `tailterm_helper_policy=$("$tailterm_tmux_bin" if-shell -F -t "$tailterm_tmux_target:$tailterm_tmux_window" "${identity}" "set-option -w -t '$tailterm_tmux_target:$tailterm_tmux_window' window-size latest ; display-message -p helper-ready" 'display-message -p helper-refused') || exit 1; ` +
+    `if [ "$tailterm_helper_policy" != helper-ready ]; then printf 'Helper sizing refused: session identity changed or window is linked to another session.\\n' >&2; exit 1; fi; `
   );
 }
 function attachFlagsFeature() {

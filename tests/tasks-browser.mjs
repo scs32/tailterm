@@ -330,6 +330,17 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     ssh.sizeLog.filter((e) => e.session === name && e.kind === "open");
   const homePane = (id) =>
     page.locator(`.pane-header[data-home][data-pane="${id}"]`);
+  const fittedHelperPTY = async (name, label) => {
+    await waitFor(async () => {
+      const [cols, rows] = (await page.locator("#dimensions").innerText())
+        .split("×")
+        .map((n) => Number(n.trim()));
+      const latest = ssh.sizeLog.filter((e) => e.session === name).at(-1);
+      return (
+        latest?.cols === cols && latest?.rows === rows && cols > 16 && rows > 2
+      );
+    }, label + " real visible PTY dimensions");
+  };
   const resume = async (name) => {
     ssh.sessions.add(name);
     await page.locator("#new-tab").click();
@@ -419,7 +430,13 @@ export async function exerciseTasks(page, hub, origin, ssh) {
       at("helper reconnected"),
     );
     assert.equal(attaches("helper-fx").at(-1).ignoreSize, true);
+    assert.equal(
+      attaches("helper-fx").length,
+      before + 1,
+      "one attach per reconnect",
+    );
     await helperWindow(at("after a reconnect"), box);
+    await fittedHelperPTY("helper-fx", at("reconnected"));
     const panes = await terminals();
     const joiner = hub.api.addAgent(adopter.id, { name: `joiner-${width}` });
     ssh.sessions.add(joiner.name);
@@ -486,6 +503,37 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     "held helper connected in Home",
   );
   assert.equal(attaches("helper-hold").at(-1).ignoreSize, true);
+  assert.equal(
+    attaches("helper-hold").length,
+    2,
+    "held adoption replaces exactly once",
+  );
+  // A helper first discovered through the roster starts with the policy; the
+  // subsequent exact-session verification must not cause another replacement.
+  const direct = hub.api.addAgent(adopter.id, {
+    name: "owner-helper-direct",
+    session: "helper-direct",
+    role: "owner_helper",
+  });
+  ssh.sessions.add("helper-direct");
+  hub.api.event(adopter.id, "started", direct.id);
+  await waitFor(
+    async () =>
+      attaches("helper-direct").length === 1 &&
+      (
+        await page
+          .locator(".pane-header[data-home] .pane-label")
+          .allInnerTexts()
+      ).some((text) => text.endsWith("Connected")),
+    "direct helper first attach",
+  );
+  assert.equal(attaches("helper-direct").at(-1).ignoreSize, true);
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.equal(
+    attaches("helper-direct").length,
+    1,
+    "verified helper does not loop on policy adoption",
+  );
   // An ordinary agent adopted the same way joins its project group, never
   // Home, and its attach is unchanged.
   const plainTab = await resume("plain-fx");
@@ -522,7 +570,13 @@ export async function exerciseTasks(page, hub, origin, ssh) {
       (await page.locator(".pane-header[data-home]").count()) === 0,
     "adoption project closed",
   );
-  for (const name of ["helper-fx", "helper-hold", "plain-fx", "anchor"])
+  for (const name of [
+    "helper-fx",
+    "helper-hold",
+    "helper-direct",
+    "plain-fx",
+    "anchor",
+  ])
     ssh.sessions.delete(name);
   await page.locator("#tabs .tab button[role=tab]").nth(originalIndex).click();
   console.log(

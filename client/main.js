@@ -25,6 +25,7 @@ import {
   helperLabel,
   attachOptions,
   helperReattach,
+  helperAttachKey,
   reattachOptions,
 } from "./tasks.js";
 import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
@@ -1048,13 +1049,10 @@ function reattachBoundAgent(t) {
     t.target;
   if (!helper && !ordinary) return;
   const current = data.servers.find((s) => s.id === t.server.id);
-  if (
-    ordinary &&
-    (!current || endpointKey(current) !== endpointKey(t.server))
-  ) {
+  if (!current || endpointKey(current) !== endpointKey(t.server)) {
     if (!t.reattachSizeBlocked)
       notice(
-        "Agent pane stays attached to its original endpoint; restore its server profile before reattaching.",
+        `${helper ? "Helper" : "Agent"} pane stays attached to its original endpoint; restore its server profile before reattaching.`,
       );
     t.reattachSizeBlocked = true;
     return;
@@ -1882,6 +1880,7 @@ function appearanceDialog() {
 function attachFlags(t, resumeOnly) {
   const options = attachOptions(t.task);
   t.attachIgnoresSize = options.ignoreSize && !!resumeOnly;
+  t.attachHelperKey = resumeOnly ? helperAttachKey(t.task) : "";
   return options;
 }
 function tmuxCommand(name, path, resumeOnly = false, cwd = "", options = {}) {
@@ -1898,6 +1897,13 @@ async function connect(
   options = {},
 ) {
   if (!server) throw new Error("Add and select a server first.");
+  if (
+    options.replace?.task?.role === "owner_helper" &&
+    endpointKey(server) !== endpointKey(options.replace.server)
+  )
+    throw new Error(
+      "Helper pane stays on its original endpoint. Restore its server profile before reattaching.",
+    );
   if (!restoring && !options.replace && serverFilter !== null)
     serverFilter.add(server.id);
   if (tmux) session = resolveSessionName(session);
@@ -1933,6 +1939,9 @@ async function connect(
     const replacementIndex = options.replace
       ? tabs.indexOf(options.replace)
       : -1;
+    const previousPTY = options.replace?.term
+      ? { cols: options.replace.term.cols, rows: options.replace.term.rows }
+      : null;
     if (options.replace) {
       if (options.replace.disposed) return;
       disposeTab(options.replace, true);
@@ -2063,7 +2072,14 @@ async function connect(
     // A hidden tile has no real size. Open its PTY at the agent default and
     // send the real tile size the first time it is shown.
     if (el.hidden || (staticMode && t.task && !visibleAgentViewport(viewport)))
-      term.resize(HIDDEN_TILE_COLS, HIDDEN_TILE_ROWS);
+      term.resize(
+        homeAgent(t.task)
+          ? previousPTY?.cols || HIDDEN_TILE_COLS
+          : HIDDEN_TILE_COLS,
+        homeAgent(t.task)
+          ? previousPTY?.rows || HIDDEN_TILE_ROWS
+          : HIDDEN_TILE_ROWS,
+      );
     else fit.fit();
     term.onTitleChange((title) => {
       t.title = title.slice(0, 200);

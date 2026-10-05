@@ -172,14 +172,36 @@ export const helperLabel = (binding, projectName) =>
     : "";
 
 // Every task-bound attach ignores size, so it never resizes other clients.
-export const attachOptions = (binding) => ({ ignoreSize: !!binding });
+export const attachOptions = (binding) => ({
+  ignoreSize: !!binding,
+  ...(binding?.role === "owner_helper" &&
+  /^tsk_[0-9a-f]{16}$/.test(binding.taskId || "") &&
+  /^agt_[0-9a-f]{16}$/.test(binding.agentId || "") &&
+  /^run_[0-9a-f]{16}$/.test(binding.runId || "")
+    ? {
+        helperBinding: {
+          taskId: binding.taskId,
+          agentId: binding.agentId,
+          runId: binding.runId,
+          role: "owner_helper",
+        },
+      }
+    : {}),
+});
+// This records the command's binding, not a claim of remote policy success.
+export const helperAttachKey = (binding) => {
+  const helper = attachOptions(binding).helperBinding;
+  return helper ? `${helper.taskId}/${helper.agentId}/${helper.runId}` : "";
+};
 
-// A helper pane whose attach was built without ignore-size (an adopted
-// launcher session) must reattach, whether it is connecting or connected.
+// A helper adopted from a plain or legacy ignore-size attach needs the native
+// policy for its current identity, whether it is connecting or connected.
 export const helperReattach = (tab) =>
   tab?.task?.role === "owner_helper" &&
   !!tab.tmux &&
-  tab.attachIgnoresSize === false;
+  (tab.attachIgnoresSize === false ||
+    (!!helperAttachKey(tab.task) &&
+      tab.attachHelperKey !== helperAttachKey(tab.task)));
 
 // The replace path keeps the tab id, binding and home membership and always
 // attaches to the existing session, never creating one.
