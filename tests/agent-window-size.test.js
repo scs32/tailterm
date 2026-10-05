@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { spawnSync } from "node:child_process";
+import { agentWindowSizeCommand } from "../shared/tmux-command.js";
 import { setupAgentWindowFixture } from "./agent-window-size-fixture.js";
 import { endpointKey } from "../client/workspace-state.js";
 import { helperReattach, homeAgent, reattachOptions } from "../client/tasks.js";
@@ -324,6 +325,239 @@ test("private tmux controllers reject obsolete claims delayed past hide, dispose
         B.dispose();
         await A.settled();
         await B.settled();
+      }
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("exact revision inspection across two tagged targets and unrelated default preserves refocus reconnect and grow", async () => {
+  const f = setupAgentWindowFixture();
+  const controllers = [];
+  try {
+    const fixtures = ["target-X", "target-Y"].map((name, i) => {
+      const binding = {
+        ...valid().binding,
+        agentId: "agt_000000000000000" + (i + 1),
+      };
+      f.tmux(
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-n",
+        "agent",
+        "-e",
+        "TAILTERM_TASK=" + binding.taskId,
+        "-e",
+        "TAILTERM_AGENT=" + binding.agentId,
+        "-e",
+        "TAILTERM_RUN=" + binding.runId,
+        "sleep 60",
+      );
+      const [id, created] = f
+        .tmux(
+          "display-message",
+          "-p",
+          "-t",
+          name,
+          "#{session_id}|#{session_created}",
+        )
+        .split("|");
+      return { ...valid(), binding, target: { id, created }, path: f.wrapper };
+    });
+    f.tmux("new-session", "-d", "-s", "unrelated-default", "sleep 60");
+    const unrelated = () =>
+      f.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        "unrelated-default",
+        "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+      );
+    const before = unrelated();
+    const run = (command) => {
+      const r = spawnSync("/bin/sh", ["-c", command], {
+        env: f.env,
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, r.stderr);
+      return r.stdout.trim();
+    };
+    for (const [i, s] of fixtures.entries()) {
+      let seq = 0;
+      const token = () =>
+        "target_viewer_00000000000" + i + String(++seq).padStart(4, "0");
+      const state = () =>
+        f.tmux(
+          "display-message",
+          "-p",
+          "-t",
+          s.target.id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}|#{@tailterm_size_revision}",
+        );
+      const c = createAgentWindowSizer({
+        snapshot: () => s,
+        token,
+        execute: async (command) => run(command),
+      });
+      controllers.push(c);
+      c.refresh({ focus: true });
+      await c.settled();
+      const revision = f.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        s.target.id + ":agent",
+        "#{@tailterm_size_revision}",
+      );
+      assert.ok(revision);
+      assert.equal(
+        run(
+          agentWindowSizeCommand(
+            { ...s, token: revision, action: "inspect" },
+            f.wrapper,
+          ),
+        ),
+        "ready:" + revision,
+      );
+      c.refresh({ focus: true });
+      await c.settled();
+      assert.match(state(), /^120x34\|target_viewer_/);
+      assert.ok(
+        !state().includes(revision),
+        "same-size focus accepts a new exact-target token",
+      );
+      s.cols = 240;
+      s.rows = 60;
+      c.refresh();
+      await c.settled();
+      assert.match(state(), /^240x59\|target_viewer_/);
+      s.connected = false;
+      c.refresh();
+      await c.settled();
+      const oldRevision = f.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        s.target.id + ":agent",
+        "#{@tailterm_size_revision}",
+      );
+      s.connection++;
+      s.connected = true;
+      c.refresh({ focus: true });
+      await c.settled();
+      assert.match(state(), /^240x59\|target_viewer_/);
+      assert.ok(!state().includes(oldRevision));
+      s.cols = 120;
+      s.rows = 35;
+      c.refresh();
+      await c.settled();
+      assert.match(state(), /^120x34\|target_viewer_/);
+      assert.equal(unrelated(), before, "unrelated default window untouched");
+    }
+  } finally {
+    for (const c of controllers) {
+      c.dispose();
+      await c.settled();
+    }
+    await f.cleanup();
+  }
+});
+
+test("characterize unresolved no-viewer hidden and disposed delivery mutation for a2 and a5", async (t) => {
+  const f = setupAgentWindowFixture();
+  try {
+    for (const [i, transition] of ["hide", "dispose"].entries()) {
+      const binding = valid().binding;
+      f.tmux(
+        "new-session",
+        "-d",
+        "-s",
+        "residual-" + i,
+        "-n",
+        "agent",
+        "-e",
+        "TAILTERM_TASK=" + binding.taskId,
+        "-e",
+        "TAILTERM_AGENT=" + binding.agentId,
+        "-e",
+        "TAILTERM_RUN=" + binding.runId,
+        "sleep 60",
+      );
+      const [id, created] = f
+        .tmux(
+          "display-message",
+          "-p",
+          "-t",
+          "residual-" + i,
+          "#{session_id}|#{session_created}",
+        )
+        .split("|");
+      f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
+      f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
+      const s = { ...valid(), target: { id, created }, path: f.wrapper };
+      const state = () =>
+        f.tmux(
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        );
+      let release,
+        arrived,
+        held = false;
+      const gate = new Promise((r) => (release = r)),
+        arrival = new Promise((r) => (arrived = r));
+      const c = createAgentWindowSizer({
+        snapshot: () => s,
+        token: () => "residual_viewer_000000000" + i,
+        execute: async (command) => {
+          if (!held && command.includes("resize-window")) {
+            held = true;
+            arrived();
+            await gate;
+          }
+          const r = spawnSync("/bin/sh", ["-c", command], {
+            env: f.env,
+            encoding: "utf8",
+          });
+          assert.equal(r.status, 0, r.stderr);
+          return r.stdout;
+        },
+      });
+      try {
+        const before = state();
+        assert.equal(before, "200x50|");
+        c.refresh({ focus: true });
+        await arrival;
+        if (transition === "dispose") c.dispose();
+        else {
+          s.visible = false;
+          s.foreground = false;
+          c.refresh();
+        }
+        release();
+        await c.settled();
+        assert.equal(
+          state(),
+          "120x34|",
+          "characterization confirms unmet safety criterion, not an acceptance pass",
+        );
+        t.diagnostic(
+          "f1 " +
+            transition +
+            ": a2/a5 FAIL, delayed no-viewer mutation " +
+            before +
+            " -> " +
+            state(),
+        );
+      } finally {
+        release();
+        c.dispose();
+        await c.settled();
       }
     }
   } finally {

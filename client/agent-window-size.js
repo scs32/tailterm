@@ -39,7 +39,9 @@ export function eligibleAgentViewport(s) {
 
 // A focus transition creates a fresh token even at identical dimensions. Resize
 // only updates an existing claim. One command in flight coalesces layout bursts;
-// a stale callback never revives a disconnected/hidden/rebound pane.
+// a stale callback does not enqueue a new claim for an ineligible pane. An
+// already-submitted claim can still execute without a newer host revision; that
+// unresolved transport limit is tracked against the hidden/obsolete safety checks.
 export function createAgentWindowSizer({
   snapshot,
   execute,

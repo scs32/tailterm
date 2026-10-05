@@ -39,3 +39,10 @@ release still require the viewer token. A focus claim that loses a competing
 compare-and-swap retries once only while its exact focus and lifecycle remain
 current; hidden/disposed/reconnected callbacks never retry. Resize never reclaims
 a superseded token.
+
+Known acceptance blocker for the visible-pane candidate: an already-submitted
+focus claim can still resize its window after its pane hides or is disposed when
+no newer viewer has advanced the host revision. The subsequent release removes
+its authority but does not undo the resize. The isolated no-competitor regression
+records this as failed a2/a5 safety, not an accepted exception; release remains
+blocked until a cancellation/invalidation design is verified.

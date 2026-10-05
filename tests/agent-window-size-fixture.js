@@ -243,6 +243,24 @@ export async function exerciseAgentWindowSizing({
     "manual",
   );
   f.tmux("set-option", "-t", agent.session, "default-size", "200x50");
+  f.tmux(
+    "new-session",
+    "-d",
+    "-s",
+    "unrelated-default",
+    "-n",
+    "unrelated",
+    "sleep 600",
+  );
+  const unrelatedSize = () =>
+    f.tmux(
+      "display-message",
+      "-p",
+      "-t",
+      "unrelated-default",
+      "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+    );
+  const unrelatedBefore = unrelatedSize();
   const [id, created] = f
     .tmux(
       "display-message",
@@ -758,6 +776,11 @@ export async function exerciseAgentWindowSizing({
   assert.equal(size(), prior);
   console.log(
     `${engine} agent-sizing a5: exact session/run/helper guards, rename/reused name, command failure pass`,
+  );
+  assert.equal(
+    unrelatedSize(),
+    unrelatedBefore,
+    "unrelated default window never resized or claimed",
   );
   await A.close();
   for (const c of f.contexts) await c.close();

@@ -174,7 +174,7 @@ export function agentWindowSizeCommand(
   ]);
   let mutate;
   if (action === "inspect") {
-    mutate = "display-message -p 'ready:#{@tailterm_size_revision}'";
+    mutate = `display-message -p -t ${window} 'ready:#{@tailterm_size_revision}'`;
   } else if (action === "release") {
     mutate = `set-option -wu -t ${window} @tailterm_size_viewer ; display-message -p released`;
   } else {
