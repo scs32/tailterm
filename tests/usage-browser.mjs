@@ -108,8 +108,35 @@ try {
             " errors=" +
             JSON.stringify(errors),
         );
+      // Hold the initial read across real Projects reloads. Repaint must keep
+      // that request and deliver its result to the newest usage mount.
+      await page.evaluate(() => {
+        window.delay = true;
+      });
       await page.locator("[data-usage-disclosure] > summary").click();
+      await page.waitForFunction(() => window.pending.length === 1);
+      for (let i = 0; i < 5; i++) await page.evaluate(() => window.reload());
+      assert.deepEqual(
+        await page.evaluate(() => ({
+          calls: window.calls.length,
+          pending: window.pending.length,
+        })),
+        { calls: 1, pending: 1 },
+        "same-project reloads must retain the initial usage request",
+      );
+      assert.match(
+        await page.locator(".project-usage [role=status]").innerText(),
+        /Loading usage/,
+      );
+      await page.evaluate(() => {
+        window.delay = false;
+        window.pending.shift()();
+      });
       await page.locator("[data-usage-item]").first().waitFor();
+      assert.doesNotMatch(
+        await page.locator(".project-usage [role=status]").innerText(),
+        /Loading usage/,
+      );
       const usageStyle = await page.evaluate(() => {
         const items = document.querySelector(".usage-items");
         const item = document.querySelector(".usage-item");
@@ -290,9 +317,41 @@ try {
       await page.evaluate(() => {
         window.offline = false;
         window.delay = true;
+        window.fixture.report.items[1].title = "Stale explicit refresh";
       });
       await page.locator("[data-usage-refresh]").click();
       await page.waitForFunction(() => window.pending.length === 1);
+      await page.evaluate(() => {
+        window.fixture.report.items[1].title = "Latest explicit refresh";
+      });
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(() => window.pending.length === 2);
+      const refreshCalls = await page.evaluate(() => window.calls.length);
+      for (let i = 0; i < 3; i++) await page.evaluate(() => window.reload());
+      assert.equal(
+        await page.evaluate(() => window.calls.length),
+        refreshCalls,
+      );
+      await page.evaluate(() => window.pending[1]());
+      await page.waitForFunction(() =>
+        document
+          .querySelector(".usage-items")
+          .textContent.includes("Latest explicit refresh"),
+      );
+      await page.evaluate(() => window.pending[0]());
+      assert.doesNotMatch(
+        await page.locator(".usage-items").innerText(),
+        /Stale explicit refresh/,
+      );
+      await page.evaluate(() => {
+        window.pending = [];
+        window.fixture.report.items[1].title = "Stale open project";
+      });
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(() => window.pending.length === 1);
+      await page.evaluate(() => {
+        window.fixture.report.items[1].title = "Closed project usage";
+      });
       await page.locator(".tasks-closed > summary").click();
       await page.locator('[data-task-select="tsk_2222222222222222"]').click();
       await page.locator("[data-usage-disclosure] > summary").click();
@@ -303,6 +362,14 @@ try {
       assert.match(
         await page.locator(".tasks-detail h2").innerText(),
         /Closed synthetic/,
+      );
+      assert.match(
+        await page.locator(".usage-items").innerText(),
+        /Closed project usage/,
+      );
+      assert.doesNotMatch(
+        await page.locator(".usage-items").innerText(),
+        /Stale open project/,
       );
       await page.evaluate(() => {
         window.delay = false;

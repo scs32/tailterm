@@ -17,6 +17,7 @@ export function createUsageView({ client, notice = () => {} }) {
   let root = null,
     project = "",
     epoch = 0,
+    loadingEpoch = null,
     mountedClient = null;
   const states = new Map();
   const state = () => {
@@ -37,16 +38,18 @@ export function createUsageView({ client, notice = () => {} }) {
   const offline = () =>
     String(client()?.cacheStatus?.().label || "").includes("offline");
   function mount(node, id) {
-    if (mountedClient !== client()) {
+    const c = client();
+    if (mountedClient !== c || project !== id) epoch++;
+    if (mountedClient !== c) {
       states.clear();
-      mountedClient = client();
+      mountedClient = c;
     }
     root = node;
     project = id;
-    epoch++;
     if (!node) return;
     render();
-    if (state().open && !state().report) void load();
+    // A Projects repaint replaces the mount, not its in-flight usage read.
+    if (state().open && !state().report && loadingEpoch !== epoch) void load();
   }
   function render() {
     if (!root) return;
@@ -155,6 +158,7 @@ export function createUsageView({ client, notice = () => {} }) {
       id = project,
       c = client(),
       token = ++epoch;
+    loadingEpoch = token;
     s.error = "Loading usage…";
     render();
     try {
@@ -174,6 +178,8 @@ export function createUsageView({ client, notice = () => {} }) {
         ? "Usage unsupported by this hub"
         : e.message || "Usage unavailable";
       render();
+    } finally {
+      if (loadingEpoch === token) loadingEpoch = null;
     }
   }
   async function editPrices() {
