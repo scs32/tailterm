@@ -40,8 +40,9 @@ export function eligibleAgentViewport(s) {
 // A focus transition creates a fresh token even at identical dimensions. Resize
 // only updates an existing claim. One command in flight coalesces layout bursts;
 // a stale callback does not enqueue a new claim for an ineligible pane. An
-// already-submitted claim can still execute without a newer host revision; that
-// unresolved transport limit is tracked against the hidden/obsolete safety checks.
+// already-submitted eligible claim may execute after hide/dispose (owner #24371);
+// it keeps the usable minimum and conditionally releases authority. Cancellation
+// remains tracked separately as residual wi_1b1a86c6be5b6bcc.
 export function createAgentWindowSizer({
   snapshot,
   execute,

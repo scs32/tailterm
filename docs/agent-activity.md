@@ -40,9 +40,11 @@ compare-and-swap retries once only while its exact focus and lifecycle remain
 current; hidden/disposed/reconnected callbacks never retry. Resize never reclaims
 a superseded token.
 
-Known acceptance blocker for the visible-pane candidate: an already-submitted
-focus claim can still resize its window after its pane hides or is disposed when
-no newer viewer has advanced the host revision. The subsequent release removes
-its authority but does not undo the resize. The isolated no-competitor regression
-records this as failed a2/a5 safety, not an accepted exception; release remains
-blocked until a cancellation/invalidation design is verified.
+Owner decision #24371, saved by handler #24387 at revision/scope 5, permits
+only a previously submitted eligible claim to arrive after its pane hides or is
+disposed. It remains at least 80x24 and releases authority; hidden, blurred or
+closed panes cannot initiate new claims or mutations. Newer-viewer, conditional
+revision and exact-identity protection are unchanged. The transport does not
+prove cancellation. Original a2/a5 failures remain recorded against scope 4, and
+residual bug `wi_1b1a86c6be5b6bcc` remains open and held. Candidate acceptance still
+requires focused b3 review and full native verification against scope 5.

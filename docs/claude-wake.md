@@ -69,9 +69,13 @@ Bug `wi_9e5d8194ed093cd4`, owner order #24075, implementation #24163,
 replaces the fixed-viewer expectation of `wi_b6b79229c8fec99d` only for an
 explicit foreground, visible, focused ordinary agent pane. Spawn still starts
 at 200x50 with manual sizing, and every agent attach keeps `ignore-size`.
-Hidden, collapsed, minimized, background, Board and disconnected panes cannot
-claim or update program size. A tiny visible pane crops a program window of at
-least 80 columns and 24 usable rows. The existing tmux status rows are deducted
+Hidden, collapsed, minimized, background, Board and closed panes cannot initiate
+new claims or program-size updates. Owner decision #24371 (saved revision/scope 5,
+handler #24387) permits only an eligible claim already submitted before
+hide/dispose to arrive afterward; it keeps the 80x24 floor and releases authority.
+This is not transport cancellation; residual `wi_1b1a86c6be5b6bcc` remains held.
+Newer-viewer and exact-identity guards still apply. A tiny visible pane crops a
+program window of at least 80 columns and 24 usable rows. The existing tmux status rows are deducted
 from the visible viewport before clamping; status configuration is untouched.
 
 The latest focus claim accepted by the host wins across browser viewers. An

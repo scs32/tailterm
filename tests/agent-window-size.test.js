@@ -466,10 +466,17 @@ test("exact revision inspection across two tagged targets and unrelated default 
   }
 });
 
-test("characterize unresolved no-viewer hidden and disposed delivery mutation for a2 and a5", async (t) => {
+test("recorded in-flight exception keeps minimum, releases authority and initiates no hidden work", async (t) => {
   const f = setupAgentWindowFixture();
   try {
-    for (const [i, transition] of ["hide", "dispose"].entries()) {
+    for (const [i, scenario] of [
+      { transition: "hide", cols: 120, rows: 35 },
+      { transition: "dispose", cols: 120, rows: 35 },
+      { transition: "hide", cols: 16, rows: 2 },
+      { transition: "dispose", cols: 16, rows: 2 },
+    ].entries()) {
+      const { transition, cols, rows } = scenario;
+      const commands = [];
       const binding = valid().binding;
       f.tmux(
         "new-session",
@@ -497,7 +504,13 @@ test("characterize unresolved no-viewer hidden and disposed delivery mutation fo
         .split("|");
       f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
       f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
-      const s = { ...valid(), target: { id, created }, path: f.wrapper };
+      const s = {
+        ...valid(),
+        cols,
+        rows,
+        target: { id, created },
+        path: f.wrapper,
+      };
       const state = () =>
         f.tmux(
           "display-message",
@@ -515,6 +528,7 @@ test("characterize unresolved no-viewer hidden and disposed delivery mutation fo
         snapshot: () => s,
         token: () => "residual_viewer_000000000" + i,
         execute: async (command) => {
+          commands.push(command);
           if (!held && command.includes("resize-window")) {
             held = true;
             arrived();
@@ -543,16 +557,32 @@ test("characterize unresolved no-viewer hidden and disposed delivery mutation fo
         await c.settled();
         assert.equal(
           state(),
-          "120x34|",
-          "characterization confirms unmet safety criterion, not an acceptance pass",
+          `${Math.max(80, cols)}x${Math.max(24, rows - 1)}|`,
+          "already submitted eligible claim keeps floor and releases authority",
+        );
+        const deliveredCount = commands.length;
+        s.visible = false;
+        s.foreground = false;
+        s.cols = 240;
+        s.rows = 60;
+        c.refresh();
+        c.refresh({ focus: true });
+        await c.settled();
+        assert.equal(
+          commands.length,
+          deliveredCount,
+          "no new hidden/disposed query, claim, mutation or retry",
         );
         t.diagnostic(
-          "f1 " +
+          "scope5 owner24371: " +
             transition +
-            ": a2/a5 FAIL, delayed no-viewer mutation " +
-            before +
+            " submitted " +
+            cols +
+            "x" +
+            rows +
             " -> " +
-            state(),
+            state() +
+            "; no further hidden work",
         );
       } finally {
         release();
