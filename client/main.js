@@ -1047,17 +1047,25 @@ function reattachBoundAgent(t) {
     t.tmuxVerified &&
     t.target;
   if (!helper && !ordinary) return;
+  const current = data.servers.find((s) => s.id === t.server.id);
+  if (
+    ordinary &&
+    (!current || endpointKey(current) !== endpointKey(t.server))
+  ) {
+    if (!t.reattachSizeBlocked)
+      notice(
+        "Agent pane stays attached to its original endpoint; restore its server profile before reattaching.",
+      );
+    t.reattachSizeBlocked = true;
+    return;
+  }
+  t.reattachSizeBlocked = false;
   t.reattachingSize = true;
-  void connect(
-    data.servers.find((s) => s.id === t.server.id) || t.server,
-    true,
-    t.session,
-    {
-      ...reattachOptions(t),
-      home: !!t.home,
-      quiet: active !== t.id,
-    },
-  ).catch((e) => {
+  void connect(current || t.server, true, t.session, {
+    ...reattachOptions(t),
+    home: !!t.home,
+    quiet: active !== t.id,
+  }).catch((e) => {
     t.reattachingSize = false;
     notice(
       `Could not reattach ${helper ? "the helper" : "agent pane"}: ${e.message}`,

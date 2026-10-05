@@ -195,6 +195,12 @@ const ssh = new ssh2.Server(
         });
         const exec = (accept, reject, info) => {
           const accepted = accept();
+          if (info.command.includes("ready:#{@tailterm_size_revision}")) {
+            accepted.write("ready:\n");
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
           if (info.command.includes("@tailterm_size_viewer")) {
             const agentId = info.command.match(
               /TAILTERM_AGENT\},(agt_[0-9a-f]{16})\}/,

@@ -102,7 +102,18 @@ finally:
 sys.exit(p.returncode if p.returncode>=0 else 0)
 `,
   );
+  let claimGate;
   return {
+    holdNextClaim() {
+      let arrived;
+      const gate = {
+        arrived: new Promise((r) => (arrived = r)),
+        mark: () => arrived(),
+        release: () => gate.deliver?.(),
+      };
+      claimGate = gate;
+      return gate;
+    },
     dir,
     wrapper,
     env,
@@ -113,51 +124,64 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
       if (!info.command.includes(wrapper)) return false;
       const channel = accept();
       commands.push({ command: info.command, pty });
-      const child = pty
-        ? spawn(
-            "python3",
-            [
-              dir + "/pty-bridge.py",
-              info.command,
-              String(pty.rows),
-              String(pty.cols),
-              wrapper,
-            ],
-            { env: { ...env, TERM: "xterm-256color" } },
-          )
-        : spawn("/bin/sh", ["-c", info.command], { env });
-      processes.add(child);
-      child.stdout.on("data", (d) => channel.writable && channel.write(d));
-      child.stderr.on("data", (d) => {
-        console.error("Private sizing SSH stderr:", d.toString());
-        if (channel.stderr.writable) channel.stderr.write(d);
-      });
-      if (pty) {
-        const control = (message) => {
-          if (child.stdin.writable)
-            child.stdin.write(JSON.stringify(message) + "\n");
-        };
-        channel.on("data", (d) => control({ data: d.toString("base64") }));
-        session.on("window-change", (accept, reject, size) =>
-          control({ rows: size.rows, cols: size.cols }),
-        );
-      }
-      channel.on("close", () => {
-        child.stdin.end();
-        if (!pty) child.kill();
-      });
-      child.on("close", (code) => {
-        processes.delete(child);
-        if (channel.writable) {
-          channel.exit(code || 0);
-          channel.end();
+      const deliver = () => {
+        const child = pty
+          ? spawn(
+              "python3",
+              [
+                dir + "/pty-bridge.py",
+                info.command,
+                String(pty.rows),
+                String(pty.cols),
+                wrapper,
+              ],
+              { env: { ...env, TERM: "xterm-256color" } },
+            )
+          : spawn("/bin/sh", ["-c", info.command], { env });
+        processes.add(child);
+        child.stdout.on("data", (d) => channel.writable && channel.write(d));
+        child.stderr.on("data", (d) => {
+          console.error("Private sizing SSH stderr:", d.toString());
+          if (channel.stderr.writable) channel.stderr.write(d);
+        });
+        if (pty) {
+          const control = (message) => {
+            if (child.stdin.writable)
+              child.stdin.write(JSON.stringify(message) + "\n");
+          };
+          channel.on("data", (d) => control({ data: d.toString("base64") }));
+          session.on("window-change", (accept, reject, size) =>
+            control({ rows: size.rows, cols: size.cols }),
+          );
         }
-      });
-      child.on("error", (e) => {
-        channel.stderr.write(e.message);
-        channel.exit(1);
-        channel.end();
-      });
+        channel.on("close", () => {
+          child.stdin.end();
+          if (!pty) child.kill();
+        });
+        child.on("close", (code) => {
+          processes.delete(child);
+          if (channel.writable) {
+            channel.exit(code || 0);
+            channel.end();
+          }
+        });
+        child.on("error", (e) => {
+          channel.stderr.write(e.message);
+          channel.exit(1);
+          channel.end();
+        });
+      };
+      if (
+        claimGate &&
+        !pty &&
+        info.command.includes("@tailterm_size_revision") &&
+        info.command.includes("resize-window")
+      ) {
+        const gate = claimGate;
+        claimGate = null;
+        gate.deliver = deliver;
+        gate.mark();
+      } else deliver();
       return true;
     },
     async cleanup() {
@@ -564,7 +588,22 @@ export async function exerciseAgentWindowSizing({
       [
         "-c",
         agentWindowSizeCommand(
-          { target, binding, action, token, cols: 120, rows: 35, ...changes },
+          {
+            target,
+            binding,
+            action,
+            token,
+            cols: 120,
+            rows: 35,
+            expectedRevision: f.tmux(
+              "display-message",
+              "-p",
+              "-t",
+              id + ":agent",
+              "#{@tailterm_size_revision}",
+            ),
+            ...changes,
+          },
           f.wrapper,
         ),
       ],
@@ -577,8 +616,32 @@ export async function exerciseAgentWindowSizing({
     assert.equal(invoke(action, aToken), "superseded");
     assert.equal(size(), "240x59");
   }
+  const delayed = f.holdNextClaim();
+  await A.bringToFront();
+  await A.locator(".terminal-instance:not([hidden])").click();
+  await delayed.arrived;
+  await A.locator("[data-mode=board]").click();
+  await B.bringToFront();
+  await B.locator(".terminal-instance:not([hidden])").click();
+  await wait(
+    () => owner() && owner() !== bToken && size() === "240x59",
+    "B accepts newer focus while A claim is delayed",
+  );
+  const newerB = owner();
+  delayed.release();
+  await pause(300);
+  assert.equal(
+    size(),
+    "240x59",
+    "main integration obsolete A claim cannot change B size",
+  );
+  assert.equal(
+    owner(),
+    newerB,
+    "main integration obsolete A claim cannot release B authority",
+  );
   await B.locator("[data-mode=board]").click();
-  await A.locator("[data-mode=board]").evaluate((el) => el.click());
+  // A is already in Board from the delayed-claim transition.
   await wait(() => owner() === "", "all hidden release authority");
   assert.equal(
     size(),
@@ -660,6 +723,7 @@ export async function exerciseAgentWindowSizing({
           target: { id: "$99999", created },
           binding,
           action: "claim",
+          expectedRevision: "",
           token: "fixture_0000000000000001",
           cols: 80,
           rows: 24,
@@ -680,6 +744,7 @@ export async function exerciseAgentWindowSizing({
           target,
           binding,
           action: "claim",
+          expectedRevision: "",
           token: "fixture_0000000000000001",
           cols: 80,
           rows: 24,

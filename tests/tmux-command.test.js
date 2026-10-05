@@ -73,11 +73,28 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       cols: 120,
       rows: 35,
       action: "claim",
+      expectedRevision: "",
     };
     const invoke = (changes = {}) =>
       spawnSync(
         "/bin/sh",
-        ["-c", agentWindowSizeCommand({ ...params, ...changes }, binary)],
+        [
+          "-c",
+          agentWindowSizeCommand(
+            {
+              ...params,
+              expectedRevision: run(
+                "display-message",
+                "-p",
+                "-t",
+                id + ":agent",
+                "#{@tailterm_size_revision}",
+              ),
+              ...changes,
+            },
+            binary,
+          ),
+        ],
         { env, encoding: "utf8" },
       );
     const size = () =>
@@ -130,6 +147,13 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
     assert.equal(invoke().stdout.trim(), "refused");
     assert.equal(size(), before);
     run("set-environment", "-u", "-t", id, "TAILTERM_ROLE");
+    const revision = run(
+      "display-message",
+      "-p",
+      "-t",
+      id + ":agent",
+      "#{@tailterm_size_revision}",
+    );
     const contenders = Array.from({ length: 8 }, (_, i) => ({
       token: `concurrent_${String(i).padStart(16, "0")}`,
       cols: 130 + i,
@@ -141,7 +165,13 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
           new Promise((resolve, reject) => {
             const p = spawn(
               "/bin/sh",
-              ["-c", agentWindowSizeCommand({ ...params, ...c }, binary)],
+              [
+                "-c",
+                agentWindowSizeCommand(
+                  { ...params, expectedRevision: revision, ...c },
+                  binary,
+                ),
+              ],
               { env },
             );
             let output = "",
@@ -152,7 +182,7 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
             p.on("close", (code) => {
               try {
                 assert.equal(code, 0, stderr);
-                assert.equal(output.trim(), "sized");
+                assert.ok(["sized", "superseded"].includes(output.trim()));
                 resolve();
               } catch (e) {
                 reject(e);

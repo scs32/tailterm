@@ -96,8 +96,56 @@ export function createAgentWindowSizer({
         wasEligible = true;
         if (!claim && !failed) {
           seenFocus = focusVersion;
-          claim = { ...s, key, token: token(), cols: s.cols, rows: s.rows };
-          await command(claim, "claim");
+          const next = {
+            ...s,
+            key,
+            token: token(),
+            cols: s.cols,
+            rows: s.rows,
+          };
+          // Read the host revision before sending a conditional claim. A newer
+          // viewer advances it even if it later releases (no empty-token ABA).
+          // Recheck lifecycle after the read, before any mutating command.
+          const version = focusVersion;
+          try {
+            // A competing in-flight claim may win this compare-and-swap.
+            // Retry once only while this exact focus/lifecycle remains current;
+            // hidden or superseded lifecycle callbacks never retry a mutation.
+            for (let attempt = 0; attempt < 2; attempt++) {
+              const fresh = () => {
+                const current = snapshot();
+                return (
+                  !disposed &&
+                  eligibleAgentViewport(current) &&
+                  identity(current) === key &&
+                  focusVersion === version
+                );
+              };
+              if (!fresh()) break;
+              const response = (
+                await execute(
+                  agentWindowSizeCommand(
+                    { ...next, action: "inspect" },
+                    next.path,
+                  ),
+                )
+              ).trim();
+              if (!/^ready:([a-zA-Z0-9_-]{16,64})?$/.test(response))
+                throw new Error("Agent pane sizing was refused by the host.");
+              if (!fresh()) break;
+              const current = snapshot();
+              claim = {
+                ...next,
+                cols: current.cols,
+                rows: current.rows,
+                expectedRevision: response.slice(6),
+              };
+              if ((await command(claim, "claim")) !== "superseded") break;
+            }
+          } catch (e) {
+            failed = true;
+            error(e);
+          }
           pending = true;
         } else if (claim && (claim.cols !== s.cols || claim.rows !== s.rows)) {
           claim.cols = s.cols;
@@ -118,6 +166,7 @@ export function createAgentWindowSizer({
       if (!["sized", "released", "superseded"].includes(response))
         throw new Error("Agent pane sizing was refused by the host.");
       // Keep a superseded token locally: resize must not reclaim authority.
+      return response;
     } catch (e) {
       failed = true;
       error(e);

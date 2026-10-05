@@ -30,3 +30,12 @@ An agent's activity also carries `matrixWait` while the agent has a live verific
 A reported matrix wait stops counting 4 hours 30 minutes after its `since` (the lock's wait limit is 240 minutes and its holder limit 122 minutes; `since` restarts when the run gets the host). On the host it ends sooner: the relay drops the field on its next 15-second check once the run exits or leaves the lock file, and the idle time then starts from that report. The bound matters only when the relay itself has stopped reporting. An open owner decision has no such bound; the broker's owner escalation covers it. Limitations: a run whose lock entry names no agent (`agent: unknown`) and a wait kept outside the lock (a shell loop that watches processes) are not seen; a reused pid can keep a dead entry counted until the lock removes it or the bound passes; and a waiting team is named by its member's `matrixWait` in the agent and queue JSON, not by a notice.
 
 Synthetic checks are `go test ./cmd/tt -run 'TestActivity|TestMatrixWait'`, `go test ./internal/store -run 'TestActivity|TestProviderBlock|TestQueueStall'`, `go test ./internal/broker -run TestBrokerProviderBlockSweep`, `node tests/activity-browser.mjs`, `go vet ./...`, `go test ./...`, and `npm test`. Browser checks use disposable Chromium and WebKit contexts; default Go checks use synthetic transcripts, fake process/tmux probes and isolated SQLite/HTTP fixtures. The opt-in Claude wake check reads only its own disposable session transcript on a private tmux socket and local test hub. No check touches the live hub, relay, a working agent's transcript or the host's live matrix lock file.
+
+Viewer sizing focus claims read the exact window's retained sizing revision, then
+recheck the pane lifecycle before submitting a conditional claim. A newer accepted
+claim changes that revision; release preserves it. Delayed obsolete claims cannot
+overwrite a newer viewer or exploit a released, empty authority token. Resize and
+release still require the viewer token. A focus claim that loses a competing
+compare-and-swap retries once only while its exact focus and lifecycle remain
+current; hidden/disposed/reconnected callbacks never retry. Resize never reclaims
+a superseded token.

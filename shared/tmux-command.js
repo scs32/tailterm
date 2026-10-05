@@ -130,7 +130,7 @@ export function tmuxHistoryCommand(target, path = "") {
 // drains that command queue without yielding: identity/token check and mutation
 // cannot interleave with another viewer's claim. No shell lock or input injection.
 export function agentWindowSizeCommand(
-  { target, binding, token, action, cols, rows },
+  { target, binding, token, action, cols, rows, expectedRevision },
   path = "",
 ) {
   validateTarget(target);
@@ -140,11 +140,18 @@ export function agentWindowSizeCommand(
     !/^run_[0-9a-f]{16}$/.test(binding?.runId || "") ||
     binding?.role === "owner_helper" ||
     !/^[a-zA-Z0-9_-]{16,64}$/.test(token || "") ||
-    !["claim", "resize", "release"].includes(action)
+    !["inspect", "claim", "resize", "release"].includes(action)
   )
     throw new Error("Invalid agent sizing identity or action.");
   if (
-    action !== "release" &&
+    action === "claim" &&
+    (typeof expectedRevision !== "string" ||
+      (expectedRevision !== "" &&
+        !/^[a-zA-Z0-9_-]{16,64}$/.test(expectedRevision)))
+  )
+    throw new Error("Invalid agent sizing revision.");
+  if (
+    !["inspect", "release"].includes(action) &&
     (![cols, rows].every(Number.isSafeInteger) ||
       cols < 1 ||
       rows < 1 ||
@@ -166,13 +173,15 @@ export function agentWindowSizeCommand(
     eq("window_panes", 1),
   ]);
   let mutate;
-  if (action === "release") {
+  if (action === "inspect") {
+    mutate = "display-message -p 'ready:#{@tailterm_size_revision}'";
+  } else if (action === "release") {
     mutate = `set-option -wu -t ${window} @tailterm_size_viewer ; display-message -p released`;
   } else {
     const size = (statusRows) =>
       `set-option -w -t ${window} window-size manual ; resize-window -t ${window} -x ${Math.max(80, cols)} -y ${Math.max(24, rows - statusRows)} ; ` +
       (action === "claim"
-        ? `set-option -w -t ${window} @tailterm_size_viewer ${shellQuote(token)} ; `
+        ? `set-option -w -t ${window} @tailterm_size_revision ${shellQuote(token)} ; set-option -w -t ${window} @tailterm_size_viewer ${shellQuote(token)} ; `
         : "") +
       "display-message -p sized";
     // tmux's status occupies client rows outside the window. Keep at least 24
@@ -191,7 +200,9 @@ export function agentWindowSizeCommand(
       )
       .join(" ; ");
   }
-  if (action !== "claim")
+  if (action === "claim")
+    mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_revision", expectedRevision))} ${shellQuote(mutate)} 'display-message -p superseded'`;
+  if (["resize", "release"].includes(action))
     mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_viewer", token))} ${shellQuote(mutate)} 'display-message -p superseded'`;
   return (
     "/bin/sh -c " +
