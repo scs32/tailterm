@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,92 @@ func syntheticUsageTurn(id string) api.UsageTurn {
 func usageBatch(a api.Agent, key string, turns ...api.UsageTurn) api.UsageBatch {
 	return api.UsageBatch{Version: 1, RequestID: key, RunID: a.RunID, Session: "synthetic-session", StartedAt: time.Date(2026, 9, 27, 9, 0, 0, 0, time.UTC), Coverage: "synthetic complete", Turns: turns}
 }
+
+func TestUsageReportTurnsQueryUsesProjectIndex(t *testing.T) {
+	s, task, _, _, _ := usageFixture(t)
+	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+usageReportTurnsQuery, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	indexed := false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(detail)
+		indexed = indexed || (strings.Contains(detail, "SEARCH usage_turns USING INDEX") && strings.Contains(detail, "(task_id=?)"))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed {
+		t.Fatal("usage report does not use an indexed task lookup")
+	}
+}
+
+func TestUsageReportReadsOnlyProjectTurns(t *testing.T) {
+	s, task, a, _, messages := usageFixture(t)
+	ctx := context.Background()
+	shared := syntheticUsageTurn("shared")
+	for _, message := range messages {
+		shared.Handled = append(shared.Handled, api.UsageEvidence{TaskID: task.ID, Seq: message.Seq, Operation: "ack", At: shared.At})
+	}
+	if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "project-turns", shared, syntheticUsageTurn("overhead"))); err != nil {
+		t.Fatal(err)
+	}
+	want, err := s.Usage(ctx, task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want.Summary.Requests != 2 || want.Summary.Tokens["input"] != "42" || want.Overhead.Summary.Tokens["input"] != "21" {
+		t.Fatalf("project totals: %+v", want)
+	}
+	for _, item := range want.Items {
+		if item.Summary.Requests != 1 || item.Summary.Tokens["input"] != "21/2" {
+			t.Fatalf("shared item totals: %+v", item)
+		}
+	}
+	if len(want.Coverage) != 1 || want.Coverage[0].AgentID != a.ID || want.Coverage[0].RunID != a.RunID || want.Coverage[0].State != "synthetic complete" {
+		t.Fatalf("project coverage: %+v", want.Coverage)
+	}
+	by := api.Caller{Node: "fixture", User: "owner"}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Unrelated synthetic project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherAgent, err := s.AddAgent(ctx, other.ID, api.AddAgentRequest{Name: "other", AgentID: api.NewID("agt"), Runtime: "codex", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "other-synthetic"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReportUsage(ctx, other.ID, otherAgent.ID, usageBatch(otherAgent, "other-project-turn", syntheticUsageTurn("other"))); err != nil {
+		t.Fatal(err)
+	}
+	otherReport, err := s.Usage(ctx, other.ID, api.UsageQuery{})
+	if err != nil || otherReport.Summary.Requests != 1 || otherReport.Summary.Tokens["input"] != "21" || len(otherReport.Coverage) != 1 || otherReport.Coverage[0].AgentID != otherAgent.ID {
+		t.Fatalf("other project report: %+v, %v", otherReport, err)
+	}
+	check := func() {
+		t.Helper()
+		got, err := s.Usage(ctx, task.ID, api.UsageQuery{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("unrelated project changed report: got %+v, want %+v", got, want)
+		}
+	}
+	check()
+	// Poison only the unrelated project's isolated ledger row. Success proves
+	// the report excludes that row before decoding, rather than filtering shares.
+	if _, err := s.db.ExecContext(ctx, `UPDATE usage_turns SET projection='invalid JSON' WHERE task_id=?`, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	check()
+}
+
 func TestUsageSharedConservationOverheadReceiptsAndClosure(t *testing.T) {
 	s, task, a, items, messages := usageFixture(t)
 	ctx := context.Background()

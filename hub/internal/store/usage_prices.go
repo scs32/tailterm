@@ -270,6 +270,9 @@ func (a *usageItemAccumulator) finish() api.UsageItemReport {
 func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.UsageReport, error) {
 	return s.usageReport(ctx, task, q, newUsagePhaseCache())
 }
+
+const usageReportTurnsQuery = `SELECT projection FROM usage_turns WHERE task_id=? ORDER BY task_id,agent_id,run_id,request_id`
+
 func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, cache *usagePhaseCache) (api.UsageReport, error) {
 	out := api.UsageReport{Version: api.UsageVersion, ProjectID: task, Items: []api.UsageItemReport{}}
 	if !api.ValidID(task, "tsk") || (q.Item != "" && !api.ValidID(q.Item, "wi")) || (!q.From.IsZero() && !q.To.IsZero() && !q.From.Before(q.To)) {
@@ -332,7 +335,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 	if err != nil {
 		return out, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT projection FROM usage_turns ORDER BY task_id,agent_id,run_id,request_id`)
+	rows, err = tx.QueryContext(ctx, usageReportTurnsQuery, task)
 	if err != nil {
 		return out, err
 	}
