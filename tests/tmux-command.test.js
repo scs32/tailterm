@@ -3,15 +3,223 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   tmuxCommand,
   tmuxListCommand,
   validateTmuxPath,
   tmuxRenameCommand,
+  agentWindowSizeCommand,
+  shellQuote,
 } from "../shared/tmux-command.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
+
+test("real private tmux sizing serializes claims and rejects stale viewers and identities", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-size-"));
+  const binary = path.join(dir, "tmux");
+  writeFileSync(
+    binary,
+    `#!/bin/sh\nexec tmux -f /dev/null -S ${shellQuote(dir + "/socket")} "$@"\n`,
+    { mode: 0o700 },
+  );
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k]) => !k.startsWith("TAILTERM_") && k !== "TMUX",
+    ),
+  );
+  const run = (...args) => {
+    const r = spawnSync(binary, args, { env, encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  const binding = {
+    taskId: "tsk_0000000000000001",
+    agentId: "agt_0000000000000001",
+    runId: "run_0000000000000001",
+  };
+  try {
+    run(
+      "new-session",
+      "-d",
+      "-s",
+      "sizing",
+      "-n",
+      "agent",
+      "-x",
+      "200",
+      "-y",
+      "50",
+      "-e",
+      "TAILTERM_TASK=" + binding.taskId,
+      "-e",
+      "TAILTERM_AGENT=" + binding.agentId,
+      "-e",
+      "TAILTERM_RUN=" + binding.runId,
+      "sleep 60",
+    );
+    const [id, created] = run(
+      "display-message",
+      "-p",
+      "-t",
+      "sizing",
+      "#{session_id}|#{session_created}",
+    ).split("|");
+    const target = { id, created };
+    const params = {
+      target,
+      binding,
+      token: "viewer_0000000000000001",
+      cols: 120,
+      rows: 35,
+      action: "claim",
+    };
+    const invoke = (changes = {}) =>
+      spawnSync(
+        "/bin/sh",
+        ["-c", agentWindowSizeCommand({ ...params, ...changes }, binary)],
+        { env, encoding: "utf8" },
+      );
+    const size = () =>
+      run(
+        "display-message",
+        "-p",
+        "-t",
+        id + ":agent",
+        "#{pane_width}x#{pane_height}",
+      );
+    const globals = run("show-options", "-g") + run("show-options", "-gw");
+    assert.equal(invoke().stdout.trim(), "sized");
+    assert.equal(size(), "120x34");
+    assert.equal(
+      invoke({
+        token: "viewer_0000000000000002",
+        cols: 240,
+        rows: 60,
+      }).stdout.trim(),
+      "sized",
+    );
+    for (const action of ["resize", "release"]) {
+      assert.equal(invoke({ action }).stdout.trim(), "superseded");
+      assert.equal(size(), "240x59");
+    }
+    assert.equal(
+      invoke().stdout.trim(),
+      "sized",
+      "same-size refocus takes authority",
+    );
+    for (const status of ["off", "on", "2", "5"]) {
+      run("set-option", "-t", id, "status", status);
+      assert.equal(invoke({ cols: 16, rows: 2 }).stdout.trim(), "sized");
+      assert.equal(size(), "80x24");
+      assert.equal(invoke().stdout.trim(), "sized");
+      assert.equal(
+        size(),
+        "120x" + (35 - ({ off: 0, on: 1 }[status] ?? +status)),
+      );
+    }
+    const before = size();
+    for (const changes of [
+      { target: { id, created: "0" } },
+      { binding: { ...binding, runId: "run_0000000000000002" } },
+    ]) {
+      assert.equal(invoke(changes).stdout.trim(), "refused");
+      assert.equal(size(), before);
+    }
+    run("set-environment", "-t", id, "TAILTERM_ROLE", "owner_helper");
+    assert.equal(invoke().stdout.trim(), "refused");
+    assert.equal(size(), before);
+    run("set-environment", "-u", "-t", id, "TAILTERM_ROLE");
+    const contenders = Array.from({ length: 8 }, (_, i) => ({
+      token: `concurrent_${String(i).padStart(16, "0")}`,
+      cols: 130 + i,
+      rows: 45 + i,
+    }));
+    await Promise.all(
+      contenders.map(
+        (c) =>
+          new Promise((resolve, reject) => {
+            const p = spawn(
+              "/bin/sh",
+              ["-c", agentWindowSizeCommand({ ...params, ...c }, binary)],
+              { env },
+            );
+            let output = "",
+              stderr = "";
+            p.stdout.on("data", (d) => (output += d));
+            p.stderr.on("data", (d) => (stderr += d));
+            p.on("error", reject);
+            p.on("close", (code) => {
+              try {
+                assert.equal(code, 0, stderr);
+                assert.equal(output.trim(), "sized");
+                resolve();
+              } catch (e) {
+                reject(e);
+              }
+            });
+          }),
+      ),
+    );
+    const winner = run(
+      "show-option",
+      "-w",
+      "-v",
+      "-t",
+      id + ":agent",
+      "@tailterm_size_viewer",
+    );
+    const expected = contenders.find((c) => c.token === winner);
+    assert.ok(expected);
+    assert.equal(
+      size(),
+      `${expected.cols}x${expected.rows - 5}`,
+      "concurrent claim size and token belong to one viewer",
+    );
+    run("rename-session", "-t", id, "renamed");
+    assert.equal(
+      invoke().stdout.trim(),
+      "sized",
+      "exact identity survives rename",
+    );
+    run("new-session", "-d", "-s", "sizing", "sleep 60");
+    assert.equal(invoke({ cols: 240 }).stdout.trim(), "sized");
+    assert.equal(
+      run("display-message", "-p", "-t", "sizing", "#{pane_width}"),
+      "80",
+      "reused name is untouched",
+    );
+    run("split-window", "-d", "-t", id + ":agent", "sleep 60");
+    assert.equal(
+      invoke().stdout.trim(),
+      "refused",
+      "never sizes an arbitrary split pane",
+    );
+    assert.equal(
+      run("show-options", "-g") + run("show-options", "-gw"),
+      globals,
+    );
+    assert.throws(
+      () => agentWindowSizeCommand({ ...params, cols: NaN }),
+      /viewport/,
+    );
+    assert.throws(
+      () => agentWindowSizeCommand({ ...params, token: "'unsafe" }),
+      /identity/,
+    );
+    assert.throws(
+      () =>
+        agentWindowSizeCommand({
+          ...params,
+          binding: { ...binding, role: "owner_helper" },
+        }),
+      /identity/,
+    );
+  } finally {
+    spawnSync(binary, ["kill-server"], { env });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("tmux launch resolves SSH PATH and preserves real tmux failures", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-tmux-"));
@@ -118,7 +326,7 @@ test("agent tiles attach with ignore-size on tmux 3.2+ only; other attaches neve
     // attach arguments one per line.
     writeFileSync(
       path.join(dir, "tmux"),
-      '#!/bin/sh\ncase "$1" in -V) printf \'tmux %s\\n\' "$FAKE_TMUX_VERSION"; exit 0 ;; list-sessions) printf \'work|$4\\n\'; exit 0 ;; esac\nprintf \'%s\\n\' "$@"\n',
+      "#!/bin/sh\ncase \"$1\" in -V) printf 'tmux %s\\n' \"$FAKE_TMUX_VERSION\"; exit 0 ;; list-sessions) printf 'work|$4\\n'; exit 0 ;; esac\nprintf '%s\\n' \"$@\"\n",
       { mode: 0o700 },
     );
     const run = (cmd, version) =>

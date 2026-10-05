@@ -31,6 +31,7 @@ import { createInactivityLock, IDLE_MINUTES } from "./inactivity.js";
 import { createAppearancePreview } from "./appearance-preview.js";
 import { normalizeTabDecoration, showTabDecoration } from "./tab-decoration.js";
 let appearancePreview;
+let browserFocused = document.hasFocus();
 let dialogSequence = 0;
 import { setupTerminalLinks } from "./terminal-links.js";
 import { confirmDialog } from "./confirm-dialog.js";
@@ -45,6 +46,10 @@ import {
   connectionNeedsAttention,
 } from "./activity.js";
 import { tmuxHistoryCommand } from "../shared/tmux-command.js";
+import {
+  createAgentWindowSizer,
+  visibleAgentViewport,
+} from "./agent-window-size.js";
 import { showCommandPalette } from "./command-palette.js";
 import { setupMobileTerminal } from "./mobile-terminal.js";
 import { showForgetDevice } from "./forget-device.js";
@@ -685,22 +690,13 @@ function mount() {
           .catch(() => {}),
       bookmark: (t) => {
         // Adoption binds a live tab: the helper moves into home; any other
-        // agent stays out of it. A helper attach built without ignore-size is
-        // replaced by an attach that ignores size, connected or not.
+        // agent stays out of it. Adopted attaches must ignore implicit PTY sizing.
         if (staticMode && t.task) {
           t.home = homePlacement({
             binding: t.task,
             role: t.task.role || "",
           });
-          if (helperReattach(t))
-            void connect(
-              data.servers.find((s) => s.id === t.server.id) || t.server,
-              true,
-              t.session,
-              { ...reattachOptions(t), quiet: active !== t.id },
-            ).catch((e) =>
-              notice("Could not reattach the helper: " + e.message),
-            );
+          reattachBoundAgent(t);
         }
         return api("/sessions", "POST", {
           serverId: t.server.id,
@@ -825,6 +821,7 @@ function mount() {
       header: $("main > header"),
       main: $("main"),
       onChange: (mode, view) => {
+        refreshAgentSizes();
         boardView.hide();
         tasksView.hide();
         bugsView.hide();
@@ -1035,6 +1032,37 @@ function render() {
   renderClipboard();
   scheduleWorkspaceSave();
   renderBackupStatus();
+  refreshAgentSizes();
+}
+function refreshAgentSizes() {
+  for (const t of tabs) t.agentSizer?.refresh();
+}
+function reattachBoundAgent(t) {
+  if (!staticMode || !t.task || t.disposed || t.reattachingSize) return;
+  const helper = helperReattach(t);
+  const ordinary =
+    t.tmux &&
+    !homeAgent(t.task) &&
+    t.attachIgnoresSize === false &&
+    t.tmuxVerified &&
+    t.target;
+  if (!helper && !ordinary) return;
+  t.reattachingSize = true;
+  void connect(
+    data.servers.find((s) => s.id === t.server.id) || t.server,
+    true,
+    t.session,
+    {
+      ...reattachOptions(t),
+      home: !!t.home,
+      quiet: active !== t.id,
+    },
+  ).catch((e) => {
+    t.reattachingSize = false;
+    notice(
+      `Could not reattach ${helper ? "the helper" : "agent pane"}: ${e.message}`,
+    );
+  });
 }
 function tabVisible(t) {
   return serverFilter === null || serverFilter.has(t.server.id);
@@ -1384,6 +1412,7 @@ function activate(id) {
   if (previous)
     previous.activitySnapshot = activitySnapshot(previous.term, previous.tmux);
   active = id;
+  refreshAgentSizes();
   if (!restoring) paneGroups?.model.rememberActive?.(id);
   const t = currentTab();
   if (t) {
@@ -1399,11 +1428,14 @@ function activate(id) {
       tabs.filter((t) => !t.el.hidden).forEach((t) => t.fit.fit());
       if (t.history?.isOpen()) t.history.focus();
       else t.term.focus();
+      t.agentSizer?.refresh({ focus: true });
     });
 }
 function disposeTab(t, replacing = false) {
   reconnects.cancel(t.id);
   t.disposed = true;
+  t.agentSizer?.dispose();
+  t.sizeVisibilityObserver?.disconnect();
   t.settleInitial?.();
   clearTimeout(t.activityTimer);
   t.history?.clear();
@@ -1653,11 +1685,15 @@ function renderLauncher() {
   );
 }
 async function verifyTmux(t) {
+  const generation = t.generation;
+  const live = () =>
+    !t.disposed && t.status === "Connected" && t.generation === generation;
   for (let attempt = 0; attempt < 3; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 400));
-    if (t.disposed || t.status !== "Connected") return;
+    if (!live()) return;
     try {
       const result = await refreshRemote(t.server, t);
+      if (!live()) return;
       const remote = result.sessions.find((s) =>
         t.target ? sameTarget(s.target, t.target) : s.name === t.session,
       );
@@ -1665,8 +1701,10 @@ async function verifyTmux(t) {
       t.session = remote.name;
       t.target = remote.target;
       scheduleWorkspaceSave();
-      if (t.disposed) return;
+      if (!live()) return;
       t.tmuxVerified = true;
+      reattachBoundAgent(t);
+      t.agentSizer?.refresh();
       const updated = await api("/sessions", "POST", {
         serverId: t.server.id,
         name: t.session,
@@ -1679,7 +1717,7 @@ async function verifyTmux(t) {
       return;
     } catch {}
   }
-  if (!t.disposed) {
+  if (live()) {
     t.tmuxVerified = false;
     render();
     notice(
@@ -1959,17 +1997,65 @@ async function connect(
     t.settleInitial = initialDone;
     if (replacementIndex >= 0) tabs.splice(replacementIndex, 0, t);
     else tabs.push(t);
+    if (staticMode && tmux)
+      t.agentSizer = createAgentWindowSizer({
+        snapshot: () => ({
+          staticMode,
+          connected:
+            t.status === "Connected" &&
+            endpointKey(t.server) ===
+              endpointKey(data.servers.find((s) => s.id === t.server.id) || {}),
+          tmux: t.tmux,
+          verified: t.tmuxVerified,
+          ignoreSize: t.attachIgnoresSize,
+          binding: t.task,
+          home: t.home,
+          disposed: t.disposed,
+          locked: locking,
+          mode: modes?.get() || "terminals",
+          active: active === t.id,
+          foreground:
+            browserFocused &&
+            document.visibilityState === "visible" &&
+            document.hasFocus(),
+          visible: visibleAgentViewport(viewport),
+          cols: term.cols,
+          rows: term.rows,
+          target: t.target,
+          path: t.server.tmuxPath,
+          connection: t.generation,
+        }),
+        execute: (command) =>
+          browserTransport.browserCommand(ipn, t.server, peers, command),
+        error: (e) => notice(`Could not size agent pane: ${e.message}`),
+      });
+    if (t.agentSizer) {
+      el.addEventListener("pointerdown", () =>
+        t.agentSizer.refresh({ focus: true }),
+      );
+      t.sizeVisibilityObserver = new MutationObserver(() =>
+        t.agentSizer.refresh(),
+      );
+      for (let ancestor = viewport; ancestor; ancestor = ancestor.parentElement)
+        t.sizeVisibilityObserver.observe(ancestor, {
+          attributes: true,
+          attributeFilter: ["hidden", "style", "class"],
+        });
+    }
     t.observer = new ResizeObserver(() => {
-      if (!t.el.hidden && !t.disposed) fit.fit();
+      if (!t.disposed && visibleAgentViewport(viewport)) fit.fit();
+      t.agentSizer?.refresh();
     });
     t.observer.observe(el);
+    t.observer.observe(viewport);
     t.renderer = createRenderer(term, viewport, {
       enabled: () => appearance.gpuRendering,
     });
     if (!options.quiet) activate(t.id);
     // A hidden tile has no real size. Open its PTY at the agent default and
     // send the real tile size the first time it is shown.
-    if (el.hidden) term.resize(HIDDEN_TILE_COLS, HIDDEN_TILE_ROWS);
+    if (el.hidden || (staticMode && t.task && !visibleAgentViewport(viewport)))
+      term.resize(HIDDEN_TILE_COLS, HIDDEN_TILE_ROWS);
     else fit.fit();
     term.onTitleChange((title) => {
       t.title = title.slice(0, 200);
@@ -2039,7 +2125,12 @@ async function connect(
     });
     term.onResize(({ rows, cols }) => {
       t.activitySnapshot = activitySnapshot(term, tmux);
-      if (!t.el.hidden) t.resize?.(rows, cols);
+      if (
+        !t.el.hidden &&
+        (!staticMode || !t.task || visibleAgentViewport(viewport))
+      )
+        t.resize?.(rows, cols);
+      t.agentSizer?.refresh();
       if (active === t.id) $("#dimensions").textContent = `${cols} × ${rows}`;
     });
     setupTerminalInput(t, {
@@ -2053,6 +2144,7 @@ async function connect(
     const update = (status) => {
       if (t.disposed) return;
       t.status = status;
+      t.agentSizer?.refresh();
       refreshConnectionAttention(t);
       renderTabs();
       renderSidebar();
@@ -2091,6 +2183,8 @@ async function connect(
       t.restart = (interactive = true) => {
         if (t.disposed || locking) return;
         const generation = (t.generation = (t.generation || 0) + 1);
+        t.tmuxVerified = false;
+        t.agentSizer?.refresh();
         t.connection?.close();
         t.send = null;
         t.retryMessage = interactive ? "" : "Reconnecting...";
@@ -3088,13 +3182,21 @@ function openCommands() {
   showCommandPalette({ dialog, close: closeDialog, commands });
 }
 
-function browserAttentionChanged() {
+function browserAttentionChanged(event) {
+  if (event.type === "blur") browserFocused = false;
+  if (event.type === "focus") browserFocused = true;
+  refreshAgentSizes();
   const t = currentTab();
   if (!t) return;
   t.activitySnapshot = activitySnapshot(t.term, t.tmux);
-  if (document.visibilityState === "visible" && document.hasFocus()) {
+  if (
+    browserFocused &&
+    document.visibilityState === "visible" &&
+    document.hasFocus()
+  ) {
     t.activity = "";
     renderTabs();
+    t.agentSizer?.refresh({ focus: true });
   }
 }
 window.addEventListener("blur", browserAttentionChanged);

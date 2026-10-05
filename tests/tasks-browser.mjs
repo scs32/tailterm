@@ -186,7 +186,9 @@ export async function exerciseTasks(page, hub, origin, ssh) {
   );
   const ordinaryPanes = await panes();
   const sizes = () => ssh.sizeLog.filter((e) => e.session === "sizer");
+  const claims = () => ssh.sizingLog.filter((e) => e.session === "sizer");
   const sizer = hub.api.addAgent(task.id, { name: "sizer", session: "sizer" });
+  ssh.sessions.add(sizer.session);
   hub.api.event(task.id, "started", sizer.id);
   await waitFor(async () => sizes().length > 0, "hidden sizer attach");
   await new Promise((r) => setTimeout(r, 1000));
@@ -196,6 +198,11 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     "hidden agent tile opens at 200x50 with ignore-size and never resizes",
   );
   assert.equal(await panes(), ordinaryPanes, "the sizer pane stays hidden");
+  assert.equal(
+    claims().length,
+    0,
+    "hidden attach never claims agent size authority",
+  );
   await page.locator("#tabs .task-tab button[role=tab]").click();
   await waitFor(async () => (await panes()) === 4, "sizer pane shown");
   await waitFor(async () => sizes().length > 1, "shown sizer resize");
@@ -210,8 +217,83 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     "shown tile sends exactly one resize with its real size",
   );
   assert.ok(cols < 200 && rows < 50, "the tile is smaller than the default");
+  await waitFor(
+    () => claims().some((e) => e.command.includes("resize-window")),
+    "focused sizer host sizing claim",
+  );
   hub.api.event(task.id, "closed", sizer.id);
   await waitFor(async () => (await panes()) === 3, "sizer pane closed");
+
+  // Lead clarification #24225: an adopted ordinary launcher needs an exact
+  // ignore-size reattach before sizing, and must remain outside Home.
+  for (const fail of [false, true]) {
+    const name = fail ? "adopted-failure" : "adopted-ordinary";
+    ssh.sessions.add(name);
+    await page.locator("#new-tab").click();
+    await page.locator("#launcher-name").fill(name);
+    await page.locator("#start-session").click();
+    await waitFor(async () => {
+      const status = await page.locator("#terminal-status").textContent();
+      return (
+        status.includes(name) &&
+        status.includes("Connected") &&
+        !status.includes("unverified")
+      );
+    }, "unbound ordinary pane verified");
+    const tabId = await page
+      .locator("#tabs .tab.active [data-tab]")
+      .getAttribute("data-tab");
+    if (fail) ssh.gone.add(name);
+    const adopted = hub.api.addAgent(task.id, { name, session: name });
+    hub.api.event(task.id, "started", adopted.id);
+    await waitFor(
+      () => ssh.attachLog.includes(name),
+      "adopted ordinary reattach",
+    );
+    assert.ok(
+      ssh.sizeLog.some(
+        (e) => e.session === name && e.kind === "open" && e.ignoreSize,
+      ),
+      "ordinary replacement uses ignore-size",
+    );
+    if (fail) {
+      await waitFor(
+        async () =>
+          (await page.locator(`[data-pane="${tabId}"]`).textContent()).includes(
+            "Error",
+          ),
+        "failed reattach is visible",
+      );
+      assert.equal(
+        ssh.sizingLog.filter((e) => e.session === name).length,
+        0,
+        "failed replacement never claims size",
+      );
+    } else {
+      await page.locator(`[data-pane="${tabId}"] .pane-label`).click();
+      await waitFor(
+        () =>
+          ssh.sizingLog.some(
+            (e) => e.session === name && e.command.includes("resize-window"),
+          ),
+        "adopted ordinary focus sizes",
+      );
+      assert.equal(
+        await page.locator(`[data-pane="${tabId}"][data-home]`).count(),
+        0,
+        "ordinary agent retains its tab identity outside Home",
+      );
+      assert.ok(
+        ssh.sizingLog
+          .find((e) => e.session === name)
+          .command.includes(adopted.runId),
+        "replacement preserves the exact run binding",
+      );
+    }
+    hub.api.event(task.id, "closed", adopted.id);
+    await waitFor(async () => (await panes()) === 3, "adopted pane closed");
+    ssh.gone.delete(name);
+  }
 
   // Closing an agent removes its pane; closing the task removes the rest.
   hub.api.event(task.id, "closed", tester.id);

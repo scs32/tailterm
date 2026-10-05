@@ -44,6 +44,14 @@ func TestRelayReconcileRestoresShrunkAgentWindowOnly(t *testing.T) {
 	run(owned("big-agent", "agt_0000000000000002", "run_0000000000000002")...)
 	run("set-option", "-w", "-t", "big-agent:", "window-size", "manual")
 	run("resize-window", "-t", "big-agent:", "-x", "220", "-y", "60")
+	// Explicit foreground TailOS sizing below the spawn default remains manual
+	// and usable. Reconcile must not fight it, even after authority is released.
+	run(owned("visible-agent", "agt_0000000000000003", "run_0000000000000003")...)
+	run("set-option", "-w", "-t", "visible-agent:", "window-size", "manual")
+	run("resize-window", "-t", "visible-agent:", "-x", "120", "-y", "35")
+	run(owned("tiny-visible-agent", "agt_0000000000000004", "run_0000000000000004")...)
+	run("set-option", "-w", "-t", "tiny-visible-agent:", "window-size", "manual")
+	run("resize-window", "-t", "tiny-visible-agent:", "-x", "80", "-y", "24")
 	// A human session behind the same kind of viewer.
 	run("new-session", "-d", "-s", "human", "-x", "200", "-y", "50", "sleep 60")
 	attachViewer(t, run, sock, "old-agent")
@@ -78,6 +86,12 @@ func TestRelayReconcileRestoresShrunkAgentWindowOnly(t *testing.T) {
 	if got := size("big-agent"); got != "220x60 manual" {
 		t.Fatalf("deliberate manual size changed: %q", got)
 	}
+	if got := size("visible-agent"); got != "120x35 manual" {
+		t.Fatalf("visible pane size changed: %q", got)
+	}
+	if got := size("tiny-visible-agent"); got != "80x24 manual" {
+		t.Fatalf("tiny visible pane minimum changed: %q", got)
+	}
 	if got := size("human"); got != "16x1 latest" {
 		t.Fatalf("human session touched: %q", got)
 	}
@@ -90,6 +104,12 @@ func TestRelayReconcileRestoresShrunkAgentWindowOnly(t *testing.T) {
 	writes = nil
 	if changed, err := reconcileAgentWindowSizes(ctx, counting, logf); err != nil || changed != 0 || len(writes) != 0 {
 		t.Fatalf("second pass changed=%d err=%v writes=%v", changed, err, writes)
+	}
+	if got := size("visible-agent"); got != "120x35 manual" {
+		t.Fatalf("second pass overwrote visible pane: %q", got)
+	}
+	if got := size("tiny-visible-agent"); got != "80x24 manual" {
+		t.Fatalf("second pass overwrote minimum: %q", got)
 	}
 }
 

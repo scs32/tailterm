@@ -47,7 +47,7 @@ the bookkeeping path cannot edit item fields.
 
 ## Agent window size
 
-Agent tmux sessions keep a fixed 200x50 window whatever attaches to them (bug `wi_b6b79229c8fec99d`, order #14836). `tt spawn` sets the session's `default-size` and its window's `window-size manual` in the same tmux command that creates it. The relay restores that policy on older Tailterm sessions. TailOS also attaches agent tiles with `-f ignore-size` and never sizes a hidden tile, but the manual window size is what protects agents. Global tmux options are not required or changed. Details are in [claude-wake.md](claude-wake.md).
+Agent tmux sessions start at a manual 200x50 window (bug `wi_b6b79229c8fec99d`, order #14836). `tt spawn` sets the session's `default-size` and its window's `window-size manual` in the same tmux command that creates it. The relay restores that policy on older Tailterm sessions. TailOS also attaches agent tiles with `-f ignore-size` and never sizes a hidden tile, while an eligible foreground focused ordinary agent pane may explicitly size the manual window with a minimum of 80x24 usable program dimensions (bug `wi_9e5d8194ed093cd4`, owner order #24075, implementation #24163). Most recently host-accepted focus wins; hidden/background panes cannot claim, and stale resize/release tokens cannot override a newer viewer. Owner helpers and human shells are excluded. Global tmux options are not required or changed. Details are in [claude-wake.md](claude-wake.md).
 
 What a launch host needs (tmux, `tt`, runtimes and logins, hooks, the relay) is
 listed in [host-requirements.md](host-requirements.md); `tt doctor --role agent`

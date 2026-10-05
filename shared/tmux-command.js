@@ -54,9 +54,10 @@ export function tmuxCommand(
   validateSession(name);
   validateStartDirectory(cwd);
   const start = cwd && !resumeOnly ? " -c " + shellQuote(cwd) : "";
-  // An agent tile never overrides other clients' size (tmux 3.2+ ignore-size).
-  // The agent window's fixed manual size (tt spawn) is what protects it.
-  const attachFlags = ignoreSize && resumeOnly ? "$tailterm_tmux_attach_flags " : "";
+  // PTY size never implicitly controls an agent window. Foreground focus uses
+  // the separately guarded sizing command; manual sizing protects hidden tiles.
+  const attachFlags =
+    ignoreSize && resumeOnly ? "$tailterm_tmux_attach_flags " : "";
   return (
     "/bin/sh -c " +
     shellQuote(
@@ -121,6 +122,82 @@ export function tmuxHistoryCommand(target, path = "") {
       resolver(path) +
         exactTarget(target) +
         `tailterm_history_pane=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{pane_id}') || exit; exec "$tailterm_tmux_bin" capture-pane -p -e -J -S -5000 -t "$tailterm_history_pane"`,
+    )
+  );
+}
+
+// Each if-shell -F branch contains only synchronous tmux commands. The server
+// drains that command queue without yielding: identity/token check and mutation
+// cannot interleave with another viewer's claim. No shell lock or input injection.
+export function agentWindowSizeCommand(
+  { target, binding, token, action, cols, rows },
+  path = "",
+) {
+  validateTarget(target);
+  if (
+    !/^tsk_[0-9a-f]{16}$/.test(binding?.taskId || "") ||
+    !/^agt_[0-9a-f]{16}$/.test(binding?.agentId || "") ||
+    !/^run_[0-9a-f]{16}$/.test(binding?.runId || "") ||
+    binding?.role === "owner_helper" ||
+    !/^[a-zA-Z0-9_-]{16,64}$/.test(token || "") ||
+    !["claim", "resize", "release"].includes(action)
+  )
+    throw new Error("Invalid agent sizing identity or action.");
+  if (
+    action !== "release" &&
+    (![cols, rows].every(Number.isSafeInteger) ||
+      cols < 1 ||
+      rows < 1 ||
+      cols > 10000 ||
+      rows > 10000)
+  )
+    throw new Error("Invalid agent viewport size.");
+  const window = shellQuote(target.id + ":agent");
+  const eq = (field, value) => `#{==:#{${field}},${value}}`;
+  const all = (conditions) => conditions.reduce((a, b) => `#{&&:${a},${b}}`);
+  const identity = all([
+    eq("session_id", target.id),
+    eq("session_created", target.created),
+    eq("TAILTERM_TASK", binding.taskId),
+    eq("TAILTERM_AGENT", binding.agentId),
+    eq("TAILTERM_RUN", binding.runId),
+    "#{!=:#{TAILTERM_ROLE},owner_helper}",
+    eq("window_name", "agent"),
+    eq("window_panes", 1),
+  ]);
+  let mutate;
+  if (action === "release") {
+    mutate = `set-option -wu -t ${window} @tailterm_size_viewer ; display-message -p released`;
+  } else {
+    const size = (statusRows) =>
+      `set-option -w -t ${window} window-size manual ; resize-window -t ${window} -x ${Math.max(80, cols)} -y ${Math.max(24, rows - statusRows)} ; ` +
+      (action === "claim"
+        ? `set-option -w -t ${window} @tailterm_size_viewer ${shellQuote(token)} ; `
+        : "") +
+      "display-message -p sized";
+    // tmux's status occupies client rows outside the window. Keep at least 24
+    // usable program rows, including when the viewport itself is tiny.
+    mutate = [
+      ["off", 0],
+      ["on", 1],
+      ["2", 2],
+      ["3", 3],
+      ["4", 4],
+      ["5", 5],
+    ]
+      .map(
+        ([value, height]) =>
+          `if-shell -F -t ${window} ${shellQuote(eq("status", value))} ${shellQuote(size(height))}`,
+      )
+      .join(" ; ");
+  }
+  if (action !== "claim")
+    mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_viewer", token))} ${shellQuote(mutate)} 'display-message -p superseded'`;
+  return (
+    "/bin/sh -c " +
+    shellQuote(
+      resolver(path) +
+        `exec "$tailterm_tmux_bin" if-shell -F -t ${window} ${shellQuote(identity)} ${shellQuote(mutate)} 'display-message -p refused'`,
     )
   );
 }

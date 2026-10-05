@@ -42,6 +42,11 @@ const fixtureHub = createFixtureHub();
 import { exerciseImageUpload } from "./upload-browser.mjs";
 import { finishRestoration } from "./restore-browser.mjs";
 import { exerciseWorkspaceContinuity } from "./workspace-browser.mjs";
+import {
+  setupAgentWindowFixture,
+  exerciseAgentWindowSizing,
+} from "./agent-window-size-fixture.js";
+let agentSizeFixture;
 const hostKey = generateKeyPairSync("rsa", {
   modulusLength: 2048,
   privateKeyEncoding: { type: "pkcs1", format: "pem" },
@@ -78,6 +83,7 @@ const sshControl = {
   attachLog: [],
   // PTY sizes requested by attaches and later window changes, per session.
   sizeLog: [],
+  sizingLog: [],
   gone: new Set(),
   holding: new Set(),
   held: new Map(),
@@ -166,6 +172,7 @@ const ssh = new ssh2.Server(
         };
         session.on("shell", (accept) => terminal(accept()));
         session.on("exec", (accept, reject, info) => {
+          if (agentSizeFixture.handleExec(session, accept, info, pty)) return;
           const name = attachedSession(info.command);
           if (!name) return exec(accept, reject, info);
           sshControl.attachLog.push(name);
@@ -188,6 +195,21 @@ const ssh = new ssh2.Server(
         });
         const exec = (accept, reject, info) => {
           const accepted = accept();
+          if (info.command.includes("@tailterm_size_viewer")) {
+            const agentId = info.command.match(
+              /TAILTERM_AGENT\},(agt_[0-9a-f]{16})\}/,
+            )?.[1];
+            const name = fixtureHub.api
+              .agents()
+              .find((a) => a.id === agentId)?.session;
+            sshControl.sizingLog.push({ session: name, command: info.command });
+            accepted.write(
+              info.command.includes("released") ? "released\n" : "sized\n",
+            );
+            accepted.exit(0);
+            accepted.end();
+            return;
+          }
           if (info.command === "hostname -s") {
             accepted.write("production\n");
             accepted.exit(0);
@@ -369,6 +391,7 @@ const wait = async (fn) => {
   throw new Error("Condition timed out.");
 };
 try {
+  agentSizeFixture = setupAgentWindowFixture();
   browser = await selectedBrowser.launch({
     args: [
       "--use-fake-device-for-media-stream",
@@ -520,6 +543,15 @@ try {
       .textContent.includes("Connected"),
   );
   await wait(() => discoveries > 0);
+  await exerciseAgentWindowSizing({
+    fixture: agentSizeFixture,
+    browser,
+    page,
+    hub: fixtureHub,
+    origin,
+    engine,
+  });
+  await page.bringToFront();
   assert.ok(
     await page
       .locator(".terminal-instance:not([hidden])")
@@ -1044,6 +1076,7 @@ try {
     throw error;
   }
 } finally {
+  await agentSizeFixture?.cleanup();
   await browser?.close();
   for (const ws of sockets) ws.terminate();
   wss.close();

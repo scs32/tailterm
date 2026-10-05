@@ -8,7 +8,7 @@ Updated for bug `wi_7757e967b69a5ba6` revision 1, order #14126 and assignment #1
 
 Updated for bug `wi_614f0e656fcc0c35` revision 1, order #14254 and assignment #14311: queued input, and unrecognized transcript records.
 
-Updated for bug `wi_b6b79229c8fec99d` revision 1, order #14836 and assignment #14887: a bounded retry replaces "never retypes", agent windows keep a fixed size, and an unconfirmed wake reports `stuck`.
+Updated for bug `wi_b6b79229c8fec99d` revision 1, order #14836 and assignment #14887: a bounded retry replaces "never retypes", agent windows start at a safe manual size, and an unconfirmed wake reports `stuck`.
 
 Updated for bug `wi_132c8895adfe0886` revision 1, order #15557 and assignment #15583: a turn that an API error ended counts as complete.
 
@@ -43,7 +43,7 @@ A clear is refused, and the wake skipped as unsafe, when Claude is busy, the pan
 
 A wake that was typed but not submitted is undelivered. Only the exact new user record confirms a wake: text left in the input, with or without stray replies beside it, never does, and every such outcome is reported as `did not confirm` or as an unsafe skip, never as confirmed. It then follows the bounded retries above and ends `exhausted` if the pane never submits, with the `stuck` report below.
 
-Agent windows keep a fixed size. `tt spawn` creates each agent session at 200x50 and, in the same tmux command, sets that session's `default-size 200x50` and its window's `window-size manual`, so no viewer can attach in between. Global tmux options are never changed, and the policy comes back with every new session after a tmux server restart. Every 15 seconds, before any wake, the relay reconciles Tailterm-owned sessions created before this change. A window that is not `manual`, or is below 80x24, gets the same options plus `resize-window 200x50`, with one log line: `[tt relay] <time> <session> window resized WxH -> 200x50 (window-size was X)`. A manual window at or above 80x24 is left alone, and human sessions are never touched. TailOS attaches agent tiles with `attach-session -f ignore-size` on tmux 3.2 and newer, so a tiny tile never overrides another client. That flag is not a guarantee on its own: on tmux 3.7b, an ignore-size client that was the server's only client still sized a `window-size latest` window to 16x1. The fixed manual size is the control that protects agents (`TestIgnoreSizeAttachSemantics`). A hidden tile opens its PTY at 200x50 and sends its real size only once it is shown.
+Agent windows start at a safe manual size. `tt spawn` creates each agent session at 200x50 and, in the same tmux command, sets that session's `default-size 200x50` and its window's `window-size manual`, so no viewer can attach in between. Global tmux options are never changed, and the policy comes back with every new session after a tmux server restart. Every 15 seconds, before any wake, the relay reconciles Tailterm-owned sessions created before this change. A window that is not `manual`, or is below 80x24, gets the same options plus `resize-window 200x50`, with one log line: `[tt relay] <time> <session> window resized WxH -> 200x50 (window-size was X)`. A manual window at or above 80x24 is left alone, and human sessions are never touched. TailOS attaches agent tiles with `attach-session -f ignore-size` on tmux 3.2 and newer, so a tiny tile never overrides another client. That flag is not a guarantee on its own: on tmux 3.7b, an ignore-size client that was the server's only client still sized a `window-size latest` window to 16x1. The manual policy and minimum size are the controls that protect agents (`TestIgnoreSizeAttachSemantics`). A hidden tile opens its PTY at 200x50 and sends its real size only once it is shown.
 
 The idle check reads the transcript to its end, whatever the record count. The relay process keeps its place per run and transcript path, in memory only (file identity, offset, turn state, pending tool calls, queued-input count, malformed-record state), so the first check of a run reads the whole file and each later check reads only the records appended since. A replaced or shortened file, or a restarted relay, starts again from zero. One check reads at most 256 MiB (`claudeTranscriptReadMax`); a check that reaches the bound, or whose relay tick context ends, refuses, keeps its place, and the next check continues from there. Callers get a copy that shares nothing with the kept state: the pending-call and usage maps, the completed list and the provider block (`ProviderBlock`, a pointer the next check updates in place when the same provider failure repeats) are all copied, so changing a snapshot does not change the kept state and a later check does not change an earlier snapshot. Until 2026-10-01 every check started from zero and stopped after 128 passes of 256 records. A transcript longer than 32768 records therefore never counted as fully read, and every wake to its session was skipped as `transcript incomplete`, with no bound and no report. The owner helper's transcript wrote its 32768th record at 16:49:06Z on 2026-10-01 and the session went unwoken from 09:50 PDT for about two hours, missing owner messages (bug `wi_85b4b3b61a6d8655`, order #20576). The intake blamed tracked background tasks. They only made the transcript long: a running background task writes nothing that holds a turn open. Its launch gets an immediate tool result, its `<task-notification>` arrives as an ordinary queued prompt that starts and ends a normal turn, and the `task_status`, `mode`, `last-prompt` and similar records after a turn do not change turn state. `transcript incomplete` now means only that the final record is partly written; the check waits for its newline and never parses half a record. A wake intent records why typing was safe in `safe`, for example `turn complete, no pending tool call, no fresh queued input; transcript read to its end (36411 records, 61908496 bytes); pane input empty`. Measured on that 61.9 MB, 36411-record transcript on the Mac mini: 1.1 s for the first check, 3 to 4 ms for a later one.
 
@@ -62,3 +62,33 @@ The focused Go suite uses synthetic Claude transcripts, isolated hub fixtures an
 Two more opt-in live checks use the same isolation. They run Claude under `tt wrap` from the checkout, with that `tt` on the session's PATH, so the session is online the way a spawned agent is. `TestClaudeWakeLiveNeedsInput` has the session ask a decision with `tt ask`, run `tt event needs_input` and end its turn. It then answers the decision and requires a confirmed wake through the real broker and inbox passes. `TestClaudeWakeLivePromptSuggestion` enables suggestions for that process only (`--settings '{"promptSuggestionEnabled":true}'`; the owner's user settings are not changed). It requires wakes to confirm while a suggestion shows, and real typed text to refuse with a logged skip. `TestClaudeWakeLiveScrollbackDialogWords` has a session quote the dialog words in an answer and requires a message to wake it; a second session, run with `--permission-mode default` for that process only, shows a real Bash permission prompt and must refuse with one logged skip naming the dialog, with the prompt untouched and the command not run. `TT_LIVE_CLAUDE_CWD` picks another trusted folder.
 
 The idle footer allowlist accepts bypass mode (`⏵⏵ …`) and `? for shortcuts`. In default permission mode Claude Code 2.1.284 draws `⏸ manual mode on · ? for shortcuts`, which the allowlist refuses, so an agent in that mode is not woken.
+
+### Focused TailOS pane sizing
+
+Bug `wi_9e5d8194ed093cd4`, owner order #24075, implementation #24163,
+replaces the fixed-viewer expectation of `wi_b6b79229c8fec99d` only for an
+explicit foreground, visible, focused ordinary agent pane. Spawn still starts
+at 200x50 with manual sizing, and every agent attach keeps `ignore-size`.
+Hidden, collapsed, minimized, background, Board and disconnected panes cannot
+claim or update program size. A tiny visible pane crops a program window of at
+least 80 columns and 24 usable rows. The existing tmux status rows are deducted
+from the visible viewport before clamping; status configuration is untouched.
+
+The latest focus claim accepted by the host wins across browser viewers. An
+ordinary resize never claims authority. Same-size refocus and verified reconnect
+claim again. Synchronous tmux format guards check session ID/creation, task, agent,
+run, non-helper role and the single-pane `agent` window together with a window-local
+viewer token. A stale viewer's resize or release cannot change a newer viewer's
+size. Renaming retains identity; a reused session name cannot redirect a command.
+Hiding or disconnecting conditionally releases authority and retains the last
+safe dimensions. Command failures are shown in the browser; they do not trigger
+an automatic reclaim loop. The relay already leaves manual windows at or above
+the minimum alone, including a safe size smaller than the 200x50 default.
+The owner helper and ordinary human shells remain excluded. An ordinary launcher
+pane later adopted as an agent first reattaches with `ignore-size`, preserving its
+exact target, tab and run binding outside Home (lead clarification #24225). A
+failed replacement stays ineligible and shows the SSH failure.
+
+Acceptance uses a private tmux socket and a PTY/SIGWINCH program through fixture
+SSH in both engines of `tests/static-browser.mjs`, plus controller, command, spawn
+and relay regressions. No live owner/agent sessions are test fixtures.
