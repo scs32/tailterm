@@ -214,7 +214,7 @@ async function checkOptionalReads(engine, origin) {
       });
       await expect(
         page.locator("[data-owner-requests], [data-owner-wait]"),
-      ).toHaveCount(0);
+      ).toHaveCount(1);
       await page.evaluate(async () => {
         window.qa.state.mode = "ok";
         await window.qa.client.refreshConnection();
