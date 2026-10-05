@@ -168,19 +168,24 @@ func ownerRequestParts(m api.Message) []string {
 		return chunk(m.Text, embedBudget)
 	}
 	parts := chunk(strings.TrimSuffix(m.Text, "\nExpected answer:\n"+answer), embedBudget)
+	// Invisible word joiners keep leading/trailing answer whitespace away from
+	// embed edges, where Discord would trim it. Reserve one rune at each edge.
+	const boundary = "\u2060"
 	var part strings.Builder
+	part.WriteString(boundary)
 	part.WriteString("\nExpected answer:\n")
-	n := part.Len()
+	n := utf8.RuneCountInString(part.String())
 	for _, r := range answer {
 		escape := strings.ContainsRune("\\`*_{}[]()#+-.!|>~<", r)
 		size := 1
 		if escape {
 			size++
 		}
-		if n+size > embedBudget {
-			parts = append(parts, part.String())
+		if n+size > embedBudget-1 {
+			parts = append(parts, part.String()+boundary)
 			part.Reset()
-			n = 0
+			part.WriteString(boundary)
+			n = 1
 		}
 		if escape {
 			part.WriteByte('\\')
@@ -189,7 +194,7 @@ func ownerRequestParts(m api.Message) []string {
 		n += size
 	}
 	// Do not trim whitespace or split an escape pair at an embed boundary.
-	return append(parts, part.String())
+	return append(parts, part.String()+boundary)
 }
 
 // renderEscalation pings only the owners and offers the unstall controls.

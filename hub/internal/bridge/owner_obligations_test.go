@@ -32,7 +32,7 @@ func TestOwnerCardFullTextApproveAndRetry(t *testing.T) {
 			continue
 		}
 		for _, e := range x.Embeds {
-			rendered.WriteString(e.Description)
+			rendered.WriteString(ownerAnswerDisplayText(e.Description))
 		}
 		for _, row := range x.Components {
 			for _, b := range row.Components {

@@ -325,7 +325,7 @@ func TestOwnerExpectedAnswerIsLiteral(t *testing.T) {
 	buttons := 0
 	for _, line := range h.lines() {
 		for _, embed := range line.Embeds {
-			rendered.WriteString(embed.Description)
+			rendered.WriteString(ownerAnswerDisplayText(embed.Description))
 		}
 		for _, row := range line.Components {
 			for _, button := range row.Components {
@@ -367,6 +367,9 @@ func TestOwnerExpectedAnswerParts(t *testing.T) {
 		{"split escape pairs", "Please approve", strings.Repeat("*", 1739) + strings.Repeat("\\", 260) + "\n", strings.Repeat("\\*", 1739) + strings.Repeat("\\\\", 260) + "\n"},
 		{"multiline markdown", "Please approve", "# heading\n> quote\n- list\n1. item\n||spoiler|| [link](url) ~strike~\n\t矩阵🙂  \n", "\\# heading\n\\> quote\n\\- list\n1\\. item\n\\|\\|spoiler\\|\\| \\[link\\]\\(url\\) \\~strike\\~\n\t矩阵🙂  \n"},
 		{"no expected answer", "Please answer", "", ""},
+		{"trailing whitespace", "Please approve", " *yes* \n\t", " \\*yes\\* \n\t"},
+		{"leading continuation whitespace", "Please approve", strings.Repeat("*", 1740) + " \n\tY", strings.Repeat("\\*", 1740) + " \n\tY"},
+		{"literal boundary characters", "Please approve", "\u2060 *yes*\u2060 \n", "\u2060 \\*yes\\*\u2060 \n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -391,8 +394,15 @@ func TestOwnerExpectedAnswerParts(t *testing.T) {
 					t.Fatalf("part %d has wrong marker: %q", i, p.Marker)
 				}
 				if i > 0 {
+					if !strings.HasPrefix(e.Description, "\u2060") || !strings.HasSuffix(e.Description, "\u2060") {
+						t.Fatalf("part %d leaves answer whitespace at an embed edge", i)
+					}
+					if tc.name == "leading continuation whitespace" && i == 2 && !strings.HasPrefix(e.Description, "\u2060 \n\t") {
+						t.Fatal("fixture did not exercise leading continuation whitespace")
+					}
 					// Each answer embed ends on a complete escaped token.
-					tail := len(e.Description) - len(strings.TrimRight(e.Description, "\\"))
+					body := ownerAnswerDisplayText(e.Description)
+					tail := len(body) - len(strings.TrimRight(body, "\\"))
 					if tail%2 != 0 {
 						t.Fatalf("part %d ends with a split escape: %q", i, e.Description)
 					}
@@ -401,7 +411,7 @@ func TestOwnerExpectedAnswerParts(t *testing.T) {
 				if (len(p.Message.Components) > 0) != wantButton {
 					t.Fatalf("part %d approval button presence incorrect", i)
 				}
-				rendered.WriteString(e.Description)
+				rendered.WriteString(ownerAnswerDisplayText(e.Description))
 			}
 			want := m.Text
 			if tc.answer != "" {
@@ -418,6 +428,17 @@ func TestOwnerExpectedAnswerParts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Discord trims embed-edge whitespace. Apply that behavior before removing only
+// the two invisible presentation boundaries, preserving every answer byte inside.
+func ownerAnswerDisplayText(description string) string {
+	description = strings.TrimSpace(description)
+	const boundary = "\u2060"
+	if strings.HasPrefix(description, boundary) && strings.HasSuffix(description, boundary) && len(description) >= 2*len(boundary) {
+		return description[len(boundary) : len(description)-len(boundary)]
+	}
+	return description
 }
 
 // d7: notices change only the status card; card edits are coalesced.
