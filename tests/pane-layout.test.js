@@ -618,6 +618,118 @@ const sorted = (...ids) => ids.sort();
 const range = (from, to) =>
   sorted(...Array.from({ length: to - from + 1 }, (_, i) => `p${from + i}`));
 
+test("automatic agent continuations stack two or three workers before opening another column", () => {
+  for (const limit of [4, 8]) {
+    for (const rows of [2, 3, 4]) {
+      const { model, parts } = project(limit + rows, { limit });
+      const continuation = model.series(model.taskGroup("task"))[1];
+      const panes = tileLayout(continuation.tree, 1200, 800).panes;
+      const xs = [...new Set(panes.map((p) => p.x))];
+      assert.equal(
+        xs.length,
+        rows < 4 ? 1 : 2,
+        `cap ${limit}, ${rows} workers`,
+      );
+      assert.ok(xs.every((x) => panes.filter((p) => p.x === x).length >= 2));
+      assert.deepEqual(parts(), [
+        range(1, limit),
+        range(limit + 1, limit + rows),
+      ]);
+      assert.equal(
+        new Set(model.groups.flatMap((g) => leaves(g.tree))).size,
+        limit + rows,
+      );
+    }
+  }
+});
+
+test("saved auto continuations migrate and reconnect while manual and guest shapes stay", async () => {
+  const { continuationTree } = await import("../client/pane-cap.js");
+  const taskId = "tsk_1111111111111111";
+  for (const limit of [4, 8]) {
+    for (const rows of [2, 3, 4]) {
+      const { model, ids } = project(limit + rows, { limit, taskId });
+      const agentOf = (id) => homeAgentId(Number(id.slice(1)));
+      const roster = ids.map(agentOf);
+      model.setTaskMembers(taskId, roster);
+      model.sync(ids, () => taskId, agentOf);
+      model.isolateTasks(() => taskId, agentOf);
+      const convert = (tree) =>
+        tree.tab
+          ? { agentId: agentOf(tree.tab) }
+          : { ...tree, a: convert(tree.a), b: convert(tree.b) };
+      const oldTree = convert(continuationTree(ids.slice(limit)));
+      oldTree.ratio = 0.61;
+      const saved = model.projectLayoutSnapshot();
+      saved[0].continued = [oldTree];
+      saved[0].activeAgentId = roster.at(-1);
+      const restore = (taskLayout) => {
+        const restored = new PaneGroups();
+        restored.limit = limit;
+        restored.loadProjectLayouts(
+          JSON.parse(JSON.stringify([{ ...saved[0], taskLayout }])),
+        );
+        restored.setTaskMembers(taskId, roster);
+        const tabs = [];
+        const newAgentOf = (id) =>
+          id.startsWith("new-") ? homeAgentId(Number(id.slice(4))) : undefined;
+        for (const id of [...ids].reverse()) {
+          tabs.push(`new-${id.slice(1)}`);
+          restored.sync(tabs, () => taskId, newAgentOf);
+          restored.setTaskOrchestrator(taskId, "new-1");
+          restored.isolateTasks(() => taskId, newAgentOf);
+        }
+        return { restored, tabs, newAgentOf };
+      };
+      const { restored, tabs, newAgentOf } = restore("auto");
+      const continuation = restored.series(restored.taskGroup(taskId))[1];
+      const panes = tileLayout(continuation.tree, 1200, 800).panes;
+      assert.equal(new Set(panes.map((p) => p.x)).size, rows < 4 ? 1 : 2);
+      assert.deepEqual(
+        leaves(continuation.tree).sort(),
+        ids
+          .slice(limit)
+          .map((id) => `new-${id.slice(1)}`)
+          .sort(),
+      );
+      assert.equal(continuation.active, `new-${limit + rows}`);
+      if (rows === 4)
+        assert.deepEqual(
+          restored.projectLayoutSnapshot()[0].continued[0],
+          oldTree,
+        );
+      else assert.equal(continuation.tree.axis, "y");
+      const before = structuredClone(restored.projectLayoutSnapshot());
+      restored.sync(tabs, () => taskId, newAgentOf);
+      restored.isolateTasks(() => taskId, newAgentOf);
+      assert.deepEqual(restored.projectLayoutSnapshot(), before);
+      assert.deepEqual(
+        restore("manual").restored.projectLayoutSnapshot()[0].continued[0],
+        oldTree,
+      );
+      // A guest joining a small continuation makes it manual and retains its shape.
+      const taskOf = (id) => (id === "shell" ? undefined : taskId);
+      restored.sync([...tabs, "shell"], taskOf, (id) =>
+        id === "shell" ? undefined : newAgentOf(id),
+      );
+      restored.isolateTasks(taskOf, newAgentOf);
+      assert.equal(
+        restored.merge("shell", `new-${limit + 1}`, { whole: false }),
+        rows < limit,
+      );
+      if (rows < limit) {
+        const guestTree = structuredClone(restored.group("shell").tree);
+        restored.sync([...tabs, "shell"], taskOf, (id) =>
+          id === "shell" ? undefined : newAgentOf(id),
+        );
+        restored.isolateTasks(taskOf, newAgentOf);
+        assert.deepEqual(restored.group("shell").tree, guestTree);
+        assert.deepEqual(restored.group("shell").guests, ["shell"]);
+      }
+    }
+  }
+});
+
 test("pane cap rules: limits, suffixes, cascade, arrival and series reorder", async () => {
   const cap = await import("../client/pane-cap.js");
   assert.equal(cap.normalizePaneLimit(undefined), 8);
@@ -638,6 +750,11 @@ test("pane cap rules: limits, suffixes, cascade, arrival and series reorder", as
   assert.equal(cap.arrivalPart([7, 8], 8, 1), 0);
   assert.equal(cap.arrivalPart([8, 8], 8), -1);
   assert.deepEqual(leaves(cap.continuationTree(["a"])), ["a"]);
+  assert.equal(
+    cap.continuationTree(["a", "b"]).axis,
+    "x",
+    "ordinary continuations retain their two-column rule",
+  );
   const tree = cap.continuationTree(["a", "b", "c", "d", "e"]);
   assert.equal(tree.axis, "x");
   assert.deepEqual(leaves(tree.a), ["a", "c", "e"]);

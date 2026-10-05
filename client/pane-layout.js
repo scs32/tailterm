@@ -70,25 +70,23 @@ const legacyTaskTree = (tree) =>
     tree.ratio === 0.5 &&
     legacyTaskTree(tree.a) &&
     legacyTaskTree(tree.b));
-function taskTree(ids) {
+function taskWorkerTree(ids) {
   const column = (tabs) =>
     tabs.length === 1
       ? { tab: tabs[0] }
       : split("y", { tab: tabs[0] }, column(tabs.slice(1)), 1 / tabs.length);
+  // Fill a worker column at least two high before opening a second one.
+  return ids.length < 4 ? column(ids) : continuationTree(ids);
+}
+function taskTree(ids) {
   if (ids.length === 1) return { tab: ids[0] };
   if (ids.length === 2) return split("x", { tab: ids[0] }, { tab: ids[1] });
   const workers = ids.slice(1);
-  // Fill a worker column at least two high before opening a second one.
-  if (workers.length < 4) return split("x", { tab: ids[0] }, column(workers));
   return split(
     "x",
     { tab: ids[0] },
-    split(
-      "x",
-      column(workers.filter((_, i) => i % 2 === 0)),
-      column(workers.filter((_, i) => i % 2 === 1)),
-    ),
-    1 / 3,
+    taskWorkerTree(workers),
+    workers.length < 4 ? 0.5 : 1 / 3,
   );
 }
 
@@ -159,7 +157,7 @@ const stableContinuation = (agentIds) => {
     tree.tab
       ? { agentId: tree.tab }
       : { ...tree, a: convert(tree.a), b: convert(tree.b) };
-  return convert(continuationTree(agentIds));
+  return convert(taskWorkerTree(agentIds));
 };
 // New panes share the width with the panes already there.
 const prependTabs = (tree, ids) =>
@@ -413,7 +411,7 @@ export class PaneGroups {
       if (!group.taskId || group.taskLayout !== "auto" || group.guests?.length)
         continue;
       const ids = this.#memberOrder(group);
-      const tree = group.part ? continuationTree(ids) : taskTree(ids);
+      const tree = group.part ? taskWorkerTree(ids) : taskTree(ids);
       // Stable membership preserves divider IDs/ratios and focused terminals.
       if (!sameShape(group.tree, tree)) group.tree = tree;
     }

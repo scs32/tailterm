@@ -101,6 +101,9 @@ The deployed frontend uses `npm run build:static` instead.
   is at least two panes high when the count permits, without empty panes.
   Saved automatic layouts adopt this rule; manual divider resizing, swaps and
   guest layouts are retained, and narrow screens still stack.
+  Agent continuation groups have no lead: two or three workers stack in one
+  full-width column, and four or more alternate across two balanced columns.
+  Ordinary continuation groups keep their existing arrangement.
 - A group holds at most eight panes (Appearance → Panes per group: 4–16).
   Further panes continue in an adjacent "‹group› (continued)", then
   "(continued 2)" group with the same project binding, hub mirror and restore.
