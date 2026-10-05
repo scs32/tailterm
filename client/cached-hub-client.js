@@ -23,7 +23,8 @@ export function createCachedHubClient({
     auditEpochs = new Map(),
     auditMemory = new Map(),
     auditSaveQueues = new Map();
-  const optionalFailures = new Map();
+  const optionalFailures = new Map(),
+    staleOptionalPaths = new Set();
   let optionalAuthenticationError = null;
   const optionalOwnerRead = (path) => {
     const url = new URL(path, client.base);
@@ -55,9 +56,11 @@ export function createCachedHubClient({
       : saved
         ? !online() || failed
           ? "Saved data · offline"
-          : pending.size
-            ? "Saved data · refreshing"
-            : "Saved data"
+          : staleOptionalPaths.size
+            ? "Saved data · stale"
+            : pending.size
+              ? "Saved data · refreshing"
+              : "Saved data"
         : cacheFailed
           ? "Local cache unavailable"
           : !online()
@@ -121,8 +124,9 @@ export function createCachedHubClient({
         throw optionalAuthenticationError;
     };
     const work = (async () => {
+      let old;
       try {
-        const old = await stored(path);
+        old = await stored(path);
         if (disposed) throw new Error("Workspace is locked.");
         const url = new URL(path, client.base);
         const previousMessages = old?.value.data?.messages;
@@ -170,6 +174,7 @@ export function createCachedHubClient({
         checkOptionalAuthentication();
         saved ||= retained;
         const recoveredOptional = optionalFailures.delete(path);
+        staleOptionalPaths.delete(path);
         failed = false;
         authenticationError = null;
         optionalAuthenticationError = null;
@@ -187,6 +192,7 @@ export function createCachedHubClient({
           if (optionalOwnerRead(path)) optionalAuthenticationError = error;
           await cache.clear(await scope).catch(() => {});
           saved = false;
+          staleOptionalPaths.clear();
         } else if (error.status === 404 || error.status === 410) {
           await cache
             .put(await scope, path, {
@@ -194,7 +200,9 @@ export function createCachedHubClient({
             })
             .catch(() => {});
           dirty.delete(path);
+          staleOptionalPaths.delete(path);
         } else if (!optionalOwnerRead(path)) failed = true;
+        else if (old && !old.value.error) staleOptionalPaths.add(path);
         // An unsupported/transient optional read must not flip ordinary cached
         // views offline or trigger an endless read -> failure -> reload loop.
         if (optionalOwnerRead(path) && ![401, 403].includes(error.status)) {
@@ -221,12 +229,16 @@ export function createCachedHubClient({
     if (authenticationError) throw authenticationError;
     if (
       optionalFailures.has(path) &&
+      (!entry || entry.value.error) &&
       now() - (checked.get(path) || 0) < refreshMs
     )
       throw optionalFailures.get(path);
     if (
       entry &&
       (!dirty.has(path) ||
+        // A transient optional failure leaves presentation data usable while
+        // its bounded background retry runs, including after invalidation.
+        staleOptionalPaths.has(path) ||
         (failed && now() - (checked.get(path) || 0) < refreshMs))
     ) {
       saved = true;

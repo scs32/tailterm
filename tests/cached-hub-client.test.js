@@ -28,8 +28,13 @@ function fixture() {
       return { status, text: async () => JSON.stringify(body) };
     },
   });
-  const make = (client = live) =>
-    createCachedHubClient({ client, cache: cache(), online: () => connected });
+  const make = (client = live, options = {}) =>
+    createCachedHubClient({
+      client,
+      cache: cache(),
+      online: () => connected,
+      ...options,
+    });
   return {
     live,
     cache,
@@ -49,6 +54,152 @@ function fixture() {
     },
   };
 }
+
+for (const dirty of [false, true]) {
+  test(`warm owner requests stay stale through bounded retries${dirty ? " after invalidation" : ""}`, async () => {
+    let clock = 0;
+    const f = fixture();
+    const view = f.make(f.live, { now: () => clock, refreshMs: 1000 });
+    const original = [{ id: "saved-request" }];
+    try {
+      f.response({ obligations: original });
+      assert.deepEqual(await view.listOwnerObligations("one"), original);
+      if (dirty) view.invalidate();
+      f.status(503);
+      f.response({ error: "Synthetic transient failure" });
+      await view.refreshConnection();
+      assert.equal(f.requests.length, 2);
+
+      for (clock of [0, 1, 999]) {
+        assert.deepEqual(await view.listOwnerObligations("one"), original);
+        assert.equal(view.cacheStatus().label, "Saved data · stale");
+        assert.equal(
+          f.requests.length,
+          2,
+          "retry interval suppresses requests",
+        );
+      }
+
+      clock = 1000;
+      let release;
+      f.hold(new Promise((resolve) => (release = resolve)));
+      assert.deepEqual(await view.listOwnerObligations("one"), original);
+      const retry = view.refreshConnection();
+      assert.equal(view.cacheStatus().label, "Saved data · stale");
+      release({ error: "Repeated transient failure" });
+      await retry;
+      assert.equal(
+        f.requests.length,
+        3,
+        "the concurrent retry is deduplicated",
+      );
+      clock = 1999;
+      assert.deepEqual(await view.listOwnerObligations("one"), original);
+      assert.equal(view.cacheStatus().label, "Saved data · stale");
+      assert.equal(f.requests.length, 3);
+
+      clock = 2000;
+      f.status(200);
+      f.hold(new Promise((resolve) => (release = resolve)));
+      assert.deepEqual(await view.listOwnerObligations("one"), original);
+      const recovery = view.refreshConnection();
+      assert.equal(view.cacheStatus().label, "Saved data · stale");
+      release({ obligations: [{ id: "recovered-request" }] });
+      await recovery;
+      assert.equal(f.requests.length, 4);
+      assert.deepEqual(await view.listOwnerObligations("one"), [
+        { id: "recovered-request" },
+      ]);
+      assert.equal(view.cacheStatus().label, "Saved data");
+    } finally {
+      view.dispose();
+    }
+  });
+}
+
+test("cold optional failures remain errors and do not label ordinary data stale", async () => {
+  let clock = 0;
+  const f = fixture();
+  const view = f.make(f.live, { now: () => clock, refreshMs: 1000 });
+  try {
+    await view.listTasks();
+    f.status(503);
+    f.response({ error: "Cold optional failure" });
+    await assert.rejects(view.listOwnerObligations("one"), /Cold optional/);
+    clock = 999;
+    await assert.rejects(view.listOwnerObligations("one"), /Cold optional/);
+    assert.equal(f.requests.length, 2);
+    assert.equal(view.cacheStatus().label, "Saved data");
+    clock = 1000;
+    await assert.rejects(view.listOwnerObligations("one"), /Cold optional/);
+    assert.equal(f.requests.length, 3);
+  } finally {
+    view.dispose();
+  }
+});
+
+for (const status of [401, 403, 404, 410]) {
+  test(`warm optional ${status} rejects saved data rather than serving it stale`, async () => {
+    const f = fixture();
+    const view = f.make();
+    try {
+      f.response({ obligations: [{ id: "saved-request" }] });
+      await view.listOwnerObligations("one");
+      f.status(status);
+      f.response({ error: `Synthetic ${status}` });
+      await view.refreshConnection();
+      await assert.rejects(view.listOwnerObligations("one"), {
+        status,
+      });
+      assert.equal(f.requests.length, 2);
+      if ([401, 403].includes(status))
+        assert.equal(view.cacheStatus().label, "Hub sign-in required");
+      else assert.doesNotMatch(view.cacheStatus().label, /stale|offline/);
+    } finally {
+      view.dispose();
+    }
+  });
+}
+
+test("ordinary success preserves optional stale status and unchanged recovery notifies", async () => {
+  let clock = 0;
+  const f = fixture();
+  const view = f.make(
+    {
+      ...f.live,
+      subscribe: () => ({ stop() {}, cursor: 0 }),
+    },
+    { now: () => clock, refreshMs: 1000 },
+  );
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const original = { obligations: [{ id: "saved-request" }] };
+  try {
+    f.response(original);
+    await view.listOwnerObligations("one");
+    await settle();
+    let notifications = 0;
+    view.subscribe("", () => notifications++);
+    f.status(503);
+    f.response({ error: "Transient optional failure" });
+    await view.refreshConnection();
+    await settle();
+    assert.equal(notifications, 1, "stale transition notifies once");
+    f.status(200);
+    f.response({ tasks: [{ id: "ordinary" }] });
+    await view.listTasks();
+    assert.equal(view.cacheStatus().label, "Saved data · stale");
+    await settle();
+    const beforeRecovery = notifications;
+    clock = 1000;
+    f.response(original);
+    await view.listOwnerObligations("one");
+    await settle();
+    assert.equal(view.cacheStatus().label, "Saved data");
+    assert.equal(notifications, beforeRecovery + 1);
+  } finally {
+    view.dispose();
+  }
+});
 
 test("saved views return before a slow refresh and update when it finishes", async () => {
   const f = fixture(),
