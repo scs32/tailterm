@@ -781,6 +781,10 @@ func renderHelperReply(name string, c conversation, msg api.Message) []OutboxRow
 			body = env.Body.Answer
 		case api.EnvelopeKindNotice:
 			body = env.Body.Text
+		case api.EnvelopeKindResult:
+			if env.Refs["helperReply"] == "final" {
+				body = env.Body.Text
+			}
 		}
 	}
 	parts := chunk(redactSecrets(body), partBudget)

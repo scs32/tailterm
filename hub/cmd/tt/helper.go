@@ -670,6 +670,13 @@ func helperReply(e env, args []string) error {
 			req.Envelope = &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Progress on the owner message", Body: api.EnvelopeBody{Text: *text}}
 		} else if o.SourceKind == "human" || o.Needs == api.ObligationNeedsAnswer || o.SourceKind == api.EnvelopeKindBlock {
 			req.Envelope = &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "Answer to the owner message", Body: api.EnvelopeBody{Answer: *text}}
+		} else if o.Needs == api.ObligationNeedsOutcome {
+			req.Envelope = &api.Envelope{
+				Kind: api.EnvelopeKindResult, Subject: "Final reply to the owner message",
+				Refs:     map[string]string{"helperReply": "final"},
+				Body:     api.EnvelopeBody{Outcome: "done", Text: *text, Status: map[string]string{"reply": "pass"}},
+				Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "The final helper reply is recorded in this message."}},
+			}
 		}
 		if req.Envelope != nil {
 			req.Text = "" // the hub renders the typed Board text

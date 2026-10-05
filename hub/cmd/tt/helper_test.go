@@ -745,6 +745,72 @@ func TestHelperReplyWithoutObligation(t *testing.T) {
 	}
 }
 
+func helperOwnerWorkEnvelope(kind, to string) api.Envelope {
+	e := api.Envelope{Kind: kind, To: to, Subject: "Complete the synthetic owner request"}
+	switch kind {
+	case api.EnvelopeKindRequest:
+		e.Body.Ask = "Please finish this synthetic request."
+	case api.EnvelopeKindAssign:
+		e.Body.Objective = "Finish this synthetic assignment."
+		e.Body.Owns = []string{"synthetic fixture"}
+		e.Body.Acceptance = map[string]string{"a1": "Reply with the result."}
+	case api.EnvelopeKindReview:
+		e.Body.Candidate = "synthetic candidate"
+		e.Body.Scope = "Review this synthetic request."
+		e.Body.Acceptance = map[string]string{"a1": "Reply with the review."}
+	}
+	return e
+}
+
+func TestHelperReplyTypedOwnerWork(t *testing.T) {
+	for _, kind := range []string{api.EnvelopeKindRequest, api.EnvelopeKindAssign, api.EnvelopeKindReview} {
+		t.Run(kind, func(t *testing.T) {
+			f := newHelperFixture(t)
+			ctx := context.Background()
+			a := *f.mustRegister(t).Agent
+			e := helperOwnerWorkEnvelope(kind, a.Name)
+			asked, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Envelope: &e})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := "**Synthetic result**\n\n- first\n- second\n\n```sh\necho synthetic\n```"
+			reply := func(interim bool) (string, error) {
+				args := []string{"reply", "--task", f.task.ID, fmt.Sprint(asked.Seq), "--text", text}
+				if interim {
+					args = append(args, "--interim")
+				}
+				return captureCLIOutput(t, func() error { return cmdHelper(f.owner, args) })
+			}
+			interim, err := reply(true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			obligations, err := f.c.ListObligations(ctx, f.task.ID, a.ID, a.RunID, false, false)
+			if err != nil || len(obligations) != 1 || obligations[0].State != api.ObligationWorking || obligations[0].LastProgressAt == nil || obligations[0].Outcome != "" {
+				t.Fatalf("typed owner interim = %+v %v", obligations, err)
+			}
+			final, err := reply(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again, err := reply(false); err != nil || again != final {
+				t.Fatalf("typed final retry = %q %v", again, err)
+			}
+			if again, err := reply(true); err != nil || again != interim {
+				t.Fatalf("typed interim retry = %q %v", again, err)
+			}
+			msgs, err := f.c.ListMessages(ctx, f.task.ID, asked.Seq, "", 10)
+			if err != nil || len(msgs) != 2 || msgs[0].Envelope == nil || msgs[0].Envelope.Kind != api.EnvelopeKindNotice || msgs[0].Envelope.Body.Text != text || msgs[1].Envelope == nil || msgs[1].Envelope.Kind != api.EnvelopeKindResult || msgs[1].Envelope.Body.Text != text {
+				t.Fatalf("typed owner reply messages = %+v %v", msgs, err)
+			}
+			obligations, err = f.c.ListObligations(ctx, f.task.ID, a.ID, a.RunID, false, false)
+			if err != nil || len(obligations) != 1 || obligations[0].State != api.ObligationClosed || obligations[0].Outcome != api.OutcomeResult || obligations[0].OutcomeSeq != msgs[1].Seq {
+				t.Fatalf("typed owner final = %+v %v", obligations, err)
+			}
+		})
+	}
+}
+
 // wi_2de2c1273e34473a a10, f0: tt helper reply posts as the verified helper
 // with replyTo (SEQ before or after the flags), answering one of two
 // pending messages is accepted, and an unverified helper is refused.
@@ -1192,7 +1258,7 @@ func TestHelperCodexRetryThreadIdentity(t *testing.T) {
 // Actual registration, Bridge.Run/Dispatch, real relay/native queue and helper
 // CLI reply against a temporary hub/state and fake Discord REST, never live data.
 func TestHelperCodexDiscordRoundTrip(t *testing.T) {
-	for _, route := range []string{"dm", "thread"} {
+	for _, route := range []string{"dm", "thread", "dm-request", "thread-request"} {
 		t.Run(route, func(t *testing.T) {
 			f := newHelperFixture(t)
 			ctx := context.Background()
@@ -1243,7 +1309,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 			const ownerID = "709500000000000001"
 			inbound := discord.Message{ID: "709500000000000099", ChannelID: "709500000000000004", Content: "synthetic owner question", Author: discord.User{ID: ownerID}}
 			replyChannel := "709500000000000004"
-			if route == "thread" {
+			if strings.HasPrefix(route, "thread") {
 				inbound.ChannelID = "709500000000000003"
 				inbound.GuildID = "guild"
 				replyChannel = inbound.ID
@@ -1282,7 +1348,37 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 				}
 			}))
 			defer fake.Close()
-			bridgeClient, _ := api.NewClient(hub.URL, time.Second)
+			bridgeURL := hub.URL
+			finalKind, finalOutcome := api.EnvelopeKindAnswer, api.OutcomeAnswered
+			if strings.HasSuffix(route, "request") {
+				finalKind, finalOutcome = api.EnvelopeKindResult, api.OutcomeResult
+				// Inject a typed owner request at the bridge's HTTP boundary so
+				// the actual helper CLI and Discord reply route exercise b1.
+				target, _ := url.Parse(hub.URL)
+				proxy := httputil.NewSingleHostReverseProxy(target)
+				ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages") {
+						var req api.PostMessageRequest
+						if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+							http.Error(w, err.Error(), http.StatusBadRequest)
+							return
+						}
+						r.Body.Close()
+						if req.Source != nil && req.Source.ID == inbound.ID {
+							e := helperOwnerWorkEnvelope(api.EnvelopeKindRequest, a.Name)
+							e.Body.Ask = inbound.Content
+							req.Envelope, req.Text = &e, ""
+						}
+						raw, _ := json.Marshal(req)
+						r.Body = io.NopCloser(bytes.NewReader(raw))
+						r.ContentLength = int64(len(raw))
+					}
+					proxy.ServeHTTP(w, r)
+				}))
+				defer ingress.Close()
+				bridgeURL = ingress.URL
+			}
+			bridgeClient, _ := api.NewClient(bridgeURL, time.Second)
 			bridgeClient.Token = bridgeToken
 			br, err := bridge.New(bridge.Config{Hub: bridgeClient, Discord: &discord.Client{Base: fake.URL, Token: "synthetic", HTTP: fake.Client()}, AppID: "app", GuildID: "guild", Owners: []string{ownerID}, HelperTask: task.ID, HelperChannel: "709500000000000003", State: state, MirrorInterval: 20 * time.Millisecond, SyncInterval: time.Hour, DigestInterval: time.Hour, CardInterval: time.Hour})
 			if err != nil {
@@ -1391,7 +1487,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				for _, m := range sent {
-					if m.channel == replyChannel && strings.Contains(m.content, " · ANSWER · ") && strings.Contains(m.content, answer) {
+					if m.channel == replyChannel && strings.Contains(m.content, " · "+strings.ToUpper(finalKind)+" · ") && strings.Contains(m.content, answer) {
 						return true
 					}
 				}
@@ -1404,7 +1500,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 			answered := false
 			for _, o := range obligations {
 				if o.MessageSeq == source.Seq {
-					answered = o.State == api.ObligationClosed && o.Outcome == api.OutcomeAnswered && o.OutcomeSeq != 0
+					answered = o.State == api.ObligationClosed && o.Outcome == finalOutcome && o.OutcomeSeq != 0
 				}
 			}
 			if !answered {
@@ -1437,7 +1533,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 			}
 			replies := 0
 			for _, m := range msgs {
-				if m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindAnswer && m.Envelope.Body.Answer == answer {
+				if m.Envelope != nil && m.Envelope.Kind == finalKind && (m.Envelope.Body.Answer == answer || m.Envelope.Body.Text == answer) {
 					replies++
 					if m.From.AgentID != a.ID || m.ReplyTo != source.Seq {
 						t.Fatalf("reply provenance %+v", m)
