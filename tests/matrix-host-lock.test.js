@@ -35,6 +35,7 @@ import {
   RUN_TIMEOUT_GRACE_MS,
   holderCapMs,
   holderLimit,
+  overtakeLimit,
   canonicalResource,
   updateHostState,
 } from "../scripts/verify-matrix-host-lock.mjs";
@@ -52,6 +53,7 @@ const readHostState = (...args) => {
 };
 delete process.env.TAILTERM_MATRIX_PRIORITY;
 delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
+delete process.env.TAILTERM_MATRIX_OVERTAKE_LIMIT;
 process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
 
 const moduleFile = fileURLToPath(new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url));
@@ -250,6 +252,126 @@ test("L1 behind a holder, requests are granted urgent, then high, then normal, F
     ["urgent", 1, 3, 0, 0],
     ["high-2", 3, 4, 2, 0],
   ]);
+});
+
+// wi_5fbd2fe86826fc33 / order23970 / ASSIGN23978: bounded non-urgent overtakes.
+test("steady high arrivals cannot overtake a normal waiter beyond its configured limit", async t => {
+  for (const capacity of [1, 2]) for (const limit of [2, 1, 3]) {
+    const path = lockFile(t), abort = new AbortController();
+    const environment = { TAILTERM_MATRIX_MAX_HOLDERS: String(capacity),
+      ...(limit === 2 ? {} : { TAILTERM_MATRIX_OVERTAKE_LIMIT: String(limit) }) };
+    let holder = await acquireHostLock(request(path, { environment }));
+    const peer = capacity === 2 ? await acquireHostLock(request(path, { environment, item: "peer" })) : null;
+    const normal = acquireHostLock(request(path, { environment, item: "normal", signal: abort.signal }));
+    const runs = [normal];
+    // Attach a handler even if a regression makes cleanup withdraw the waiter.
+    normal.catch(() => {});
+    try {
+      await until(() => waitersOf(path).some(w => w.item === "normal"), "normal queued");
+      for (let i = 0; i < limit; i++) {
+        const high = acquireHostLock(request(path, { environment, item: "high-" + i, priority: "high", signal: abort.signal }));
+        high.catch(() => {}); runs.push(high);
+        await until(() => waitersOf(path).some(w => w.item === "high-" + i), "high queued");
+        await holder.release(); holder = await high;
+        assert.equal(waitersOf(path).find(w => w.item === "normal").overtakenBy, i + 1);
+      }
+      const protectedState = waitersOf(path).find(w => w.item === "normal");
+      assert.equal(protectedState.nonUrgentOvertakes, limit);
+      assert.equal(protectedState.overtakeLimit, limit);
+      assert(statusText(path).includes(`non-urgent overtakes ${limit}/${limit}; protected from later non-urgent overtaking (urgent exempt)`));
+      const urgent = acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_MAX_HOLDERS: String(capacity) }, item: "urgent", priority: "urgent", signal: abort.signal }));
+      urgent.catch(() => {}); runs.push(urgent);
+      await until(() => waitersOf(path).some(w => w.item === "urgent"), "urgent queued");
+      const late = acquireHostLock(request(path, { environment, item: "late-high", priority: "high", signal: abort.signal }));
+      late.catch(() => {}); runs.push(late);
+      await until(() => waitersOf(path).some(w => w.item === "late-high"), "late high queued");
+      assert.deepEqual(waitersOf(path).map(w => w.item), ["urgent", "normal", "late-high"], "only urgent passes the protected normal");
+      await holder.release(); holder = await urgent;
+      const protectedAfterUrgent = waitersOf(path).find(w => w.item === "normal");
+      assert.equal(protectedAfterUrgent.nonUrgentOvertakes, limit, "urgent does not consume fairness budget");
+      assert.equal(protectedAfterUrgent.overtakenBy, limit + 1, "total still counts urgent");
+      assert.deepEqual(waitersOf(path).map(w => w.item), ["normal", "late-high"]);
+      const text = execFileSync(process.execPath, [moduleFile, "status"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" });
+      assert.match(text, /protected from later non-urgent overtaking \(urgent exempt\)/);
+      await holder.release(); holder = await normal;
+      assert.equal(holder.record.overtakenBy, limit + 1);
+      assert.equal(holder.record.nonUrgentOvertakes, limit);
+      await holder.release(); holder = await late;
+    } finally {
+      abort.abort("fixture cleanup"); await holder.release(); await peer?.release();
+      await Promise.allSettled(runs);
+    }
+  }
+});
+
+test("fairness configuration is strict and rejected before creating lock or sidecars", async t => {
+  assert.equal(overtakeLimit({}), 2);
+  assert.equal(overtakeLimit({ TAILTERM_MATRIX_OVERTAKE_LIMIT: "" }), 2);
+  assert.equal(overtakeLimit({ TAILTERM_MATRIX_OVERTAKE_LIMIT: "1" }), 1);
+  assert.equal(overtakeLimit({ TAILTERM_MATRIX_OVERTAKE_LIMIT: "1000" }), 1000);
+  for (const raw of ["0", "-1", "1.5", "2x", " 2", "02", "1001"]) {
+    const path = lockFile(t), record = join(tempDir(t), "record");
+    await assert.rejects(acquireHostLock(request(path, { environment: { TAILTERM_MATRIX_OVERTAKE_LIMIT: raw }, recordDirectory: record })), /decimal integer from 1 to 1000/);
+    assert(!existsSync(path)); assert(!existsSync(record));
+  }
+});
+
+test("a younger protected waiter preserves older same-priority FIFO across mixed budgets", async t => {
+  const path = lockFile(t), abort = new AbortController(), runs = [];
+  let holder = await acquireHostLock(request(path));
+  const queue = async (item, priority, limit) => {
+    const run = acquireHostLock(request(path, { item, priority, signal: abort.signal,
+      environment: { TAILTERM_MATRIX_OVERTAKE_LIMIT: String(limit) } }));
+    run.catch(() => {}); runs.push(run);
+    await until(() => waitersOf(path).some(w => w.item === item), item + " queued");
+    return { run };
+  };
+  try {
+    const older = await queue("older", "normal", 3), younger = await queue("younger", "normal", 1);
+    const first = await queue("first-high", "high", 2);
+    await holder.release(); holder = await first.run;
+    const late = await queue("late-high", "high", 2);
+    assert.deepEqual(waitersOf(path).map(w => w.item), ["older", "younger", "late-high"]);
+    for (const queued of [older, younger, late]) { await holder.release(); holder = await queued.run; }
+  } finally { abort.abort("fixture cleanup"); await holder.release(); await Promise.allSettled(runs); }
+});
+
+test("legacy waiter counters retain protection and malformed fairness fields fail closed", async t => {
+  for (const version of [1, 2]) {
+    const path = lockFile(t), abort = new AbortController(), runs = [];
+    let holder = await acquireHostLock(request(path));
+    const normal = acquireHostLock(request(path, { item: "legacy-normal", signal: abort.signal }));
+    normal.catch(() => {}); runs.push(normal);
+    try {
+      await until(() => waitersOf(path).length === 1, "legacy normal queued");
+      updateHostState(path, state => {
+        const w = state.waiters[0];
+        delete w.nonUrgentOvertakes; delete w.overtakeLimit; w.overtakenBy = 2;
+        if (version === 1) {
+          state.version = 1; state.holder = state.holders[0];
+          delete state.holders; delete state.holderLimit;
+        }
+      });
+      const late = acquireHostLock(request(path, { item: "late-high", priority: "high", signal: abort.signal }));
+      late.catch(() => {}); runs.push(late);
+      await until(() => waitersOf(path).length === 2, "legacy late high queued");
+      assert.deepEqual(waitersOf(path).map(w => w.item), ["legacy-normal", "late-high"]);
+      assert(statusText(path).includes("non-urgent overtakes 2/2; protected"));
+      await holder.release(); holder = await normal;
+      assert.equal(holder.record.nonUrgentOvertakes, 2);
+      await holder.release(); holder = await late;
+    } finally { abort.abort("fixture cleanup"); await holder.release(); await Promise.allSettled(runs); }
+  }
+  const path = lockFile(t), holder = await acquireHostLock(request(path));
+  const original = readFileSync(path, "utf8"); await holder.release();
+  for (const fields of [{ overtakeLimit: 0 }, { overtakeLimit: 1001 }, { overtakeLimit: "2" },
+    { nonUrgentOvertakes: -1 }, { nonUrgentOvertakes: 0.5 }]) {
+    const state = JSON.parse(original); Object.assign(state.holders[0], fields);
+    const raw = JSON.stringify(state); writeFileSync(path, raw);
+    assert.throws(() => rawReadHostState(path), /invalid fairness counters/);
+    await assert.rejects(acquireHostLock(request(path)), /invalid fairness counters/);
+    assert.equal(readFileSync(path, "utf8"), raw);
+  }
 });
 
 test("L2 same-priority requests with one identical timestamp are granted in arrival order", async (t) => {

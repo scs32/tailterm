@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 export const PRIORITIES = ["urgent", "high", "normal"];
 export const DEFAULT_HOST_WAIT_MS = 240 * 60000;
 export const DEFAULT_POLL_MS = 2000;
+export const DEFAULT_OVERTAKE_LIMIT = 2;
 // No holder keeps the host longer than this, whatever its plan asks for
 // (wi_c5cb667695c3614c). A plan's serial sum is far above what parallel lanes
 // take, so the cap is what bounds a hung run.
@@ -164,6 +165,24 @@ export function holderLimit(environment = process.env) {
     throw new Error("TAILTERM_MATRIX_MAX_HOLDERS must be a decimal integer from 1 to 16");
   return Number(raw);
 }
+// Each request freezes its own fairness budget so all polling processes use
+// the same rule even if their environments differ. Urgent grants neither use
+// this budget nor obey its protection (wi_5fbd2fe86826fc33, order #23970).
+export function overtakeLimit(environment = process.env) {
+  const raw = environment.TAILTERM_MATRIX_OVERTAKE_LIMIT;
+  if (raw === undefined || raw === "") return DEFAULT_OVERTAKE_LIMIT;
+  if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 1000)
+    throw new Error("TAILTERM_MATRIX_OVERTAKE_LIMIT must be a decimal integer from 1 to 1000");
+  return Number(raw);
+}
+// Old waiters have only a total counter; conservatively count those historical
+// overtakes toward protection rather than resetting an already waiting run.
+const fairnessCount = waiter => waiter.nonUrgentOvertakes ?? waiter.overtakenBy ?? 0;
+const fairnessLimit = waiter => waiter.overtakeLimit ?? DEFAULT_OVERTAKE_LIMIT;
+const protectedWaiter = waiter => waiter.priority !== "urgent" && fairnessCount(waiter) >= fairnessLimit(waiter);
+const protectionText = waiter => `non-urgent overtakes ${fairnessCount(waiter)}/${fairnessLimit(waiter)}` +
+  (protectedWaiter(waiter) ? "; protected from later non-urgent overtaking (urgent exempt)" : "");
+
 // Resolve existing symlink ancestors even when the output leaf is not yet made.
 export function canonicalResource(path) {
   let parent = resolve(path), suffix = [];
@@ -366,6 +385,10 @@ function parseState(raw) {
       !PRIORITIES.includes(e.priority) || !Number.isSafeInteger(e.runTimeoutMs) || e.runTimeoutMs <= 0 ||
       (e.groups !== undefined && (!Array.isArray(e.groups) || e.groups.some(g => !Number.isSafeInteger(g) || g <= 1)))))
       return "invalid entry";
+    if (entries.some(e =>
+      (e.overtakeLimit !== undefined && (!Number.isSafeInteger(e.overtakeLimit) || e.overtakeLimit < 1 || e.overtakeLimit > 1000)) ||
+      (e.nonUrgentOvertakes !== undefined && (!Number.isSafeInteger(e.nonUrgentOvertakes) || e.nonUrgentOvertakes < 0))))
+      return "invalid fairness counters";
     if (state.holders.some(e => !Number.isFinite(Date.parse(e.startedAt)))) return "invalid holder timestamp";
     if (state.waiters.some(e => !Number.isSafeInteger(e.grantSeqAtRequest) || e.grantSeqAtRequest < 0 || !Number.isSafeInteger(e.overtakenBy) || e.overtakenBy < 0)) return "invalid waiter counters";
   }
@@ -444,8 +467,23 @@ function updateSync(paths, entry, change, withinMs) {
   }
 }
 
-const ordered = (waiters) =>
-  waiters.sort((a, b) => rank(a.priority) - rank(b.priority) || a.seq - b.seq);
+const ordered = (waiters) => {
+  const remaining = [...waiters].sort((a, b) => a.seq - b.seq), result = [];
+  while (remaining.length) {
+    // A protected arrival is a barrier to later non-urgent arrivals. Choose
+    // priority/FIFO only from the prefix ending at the oldest such barrier;
+    // urgent remains eligible everywhere. A pairwise priority/protection sort
+    // would be non-transitive when an older unprotected normal precedes it.
+    const barrier = remaining.findIndex(protectedWaiter);
+    let best = 0;
+    for (let i = 1; i < remaining.length; i++) {
+      if (barrier >= 0 && i > barrier && remaining[i].priority !== "urgent") continue;
+      if (rank(remaining[i].priority) < rank(remaining[best].priority)) best = i;
+    }
+    result.push(...remaining.splice(best, 1));
+  }
+  return result;
+};
 const describe = (entry) => `${entry.item}/${entry.agent}/pid ${entry.pid}`;
 const liveGroups = (holder) => (holder.groups || []).filter((pgid) => !groupGone(pgid));
 
@@ -481,7 +519,7 @@ function hookExit() {
 // path, priority, prioritySource, kind (run|targeted|exec), item, agent,
 // commit, output (logged in the file), recordDirectory (host-lock.log and the
 // host-lock.json sidecar), runTimeoutMs, maxWaitMs, pollMs, graceMs, signal,
-// print, now, extra (copied into the sidecar), environment (the holder cap).
+// print, now, extra (copied into the sidecar), environment (holder/fairness limits).
 // The requester clamps its own run timeout to the holder cap, so the deadline
 // it records in the file is the one it stops itself at. A waiter never
 // shortens the deadline another holder recorded.
@@ -510,6 +548,7 @@ export async function acquireHostLock(options = {}) {
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs <= 0)
     throw new Error("Invalid host wait bound");
   const limit = holderLimit(options.environment ?? process.env);
+  const overtakeBudget = overtakeLimit(options.environment ?? process.env);
   const paths = lockPaths(options.path ?? lockPath());
   const requestedMs = now();
   const entry = {
@@ -524,6 +563,8 @@ export async function acquireHostLock(options = {}) {
     requestedAt: iso(requestedMs),
     grantSeqAtRequest: 0,
     overtakenBy: 0,
+    nonUrgentOvertakes: 0,
+    overtakeLimit: overtakeBudget,
     runTimeoutMs,
     ...(options.commit ? { commit: options.commit } : {}),
     ...(options.output || recordDirectory ? { output: canonicalResource(options.output || recordDirectory) } : {}),
@@ -550,6 +591,8 @@ export async function acquireHostLock(options = {}) {
     queueLength: 0,
     grantsBeforeStart: 0,
     overtakenBy: 0,
+    nonUrgentOvertakes: 0,
+    overtakeLimit: overtakeBudget,
     overlap: 0,
     runTimeoutMs,
     requestedRunTimeoutMs,
@@ -627,10 +670,18 @@ export async function acquireHostLock(options = {}) {
     if (holder && pidGone(holder.pid) && liveGroups(holder).length) line += ` gone, check group ${liveGroups(holder).join(",")} still running`;
     if (live.length > 1) line += `; holders ${live.map(describe).join("; ")}`;
     if (resourceBlocked) line += "; worktree in use";
+    if (protectedWaiter(state.waiters[mine])) line += "; " + protectionText(state.waiters[mine]);
     if (mine === 0 && remaining.length < capacity && !resourceBlocked) {
       if (overlap) journal(paths, "overlap", entry, overlap);
       const queued = state.waiters.shift();
-      for (const waiter of state.waiters) if (waiter.seq < queued.seq) waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
+      for (const waiter of state.waiters) if (waiter.seq < queued.seq) {
+        const count = fairnessCount(waiter);
+        waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
+        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" ? 0 : 1);
+      }
+      // Persist the new grant order immediately, including between polls when
+      // another slot is free and the next grant could happen at once.
+      state.waiters = ordered(state.waiters);
       const acquiredMs = now();
       Object.assign(record, {
         acquiredAt: iso(acquiredMs),
@@ -638,6 +689,8 @@ export async function acquireHostLock(options = {}) {
         waitMs: Math.max(0, acquiredMs - requestedMs),
         grantsBeforeStart: state.grantSeq - queued.grantSeqAtRequest,
         overtakenBy: queued.overtakenBy || 0,
+        nonUrgentOvertakes: fairnessCount(queued),
+        overtakeLimit: fairnessLimit(queued),
         overlap: overlap ? 1 : 0,
         ...(overlap ? { overlapDetails: overlap } : {}),
         ...(recovered ? { recovered: { reason: "pid-gone", holder: recovered.id, pid: recovered.pid } } : {}),
@@ -951,7 +1004,7 @@ export function statusText(file = lockPath()) {
   const waiters = state?.waiters || [];
   lines.push(waiters.length ? "waiters:" : "waiters: none");
   waiters.forEach((w, i) =>
-    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}`),
+    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}; ${protectionText(w)}`),
   );
   return lines.join("\n");
 }
@@ -959,7 +1012,8 @@ export function statusText(file = lockPath()) {
 const USAGE =
   "Usage: node scripts/verify-matrix-host-lock.mjs status [--json]\n" +
   "       node scripts/verify-matrix-host-lock.mjs exec --item ID --timeout-minutes N --record /abs/dir\n" +
-  "            [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] -- COMMAND [ARGS...]";
+  "            [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] -- COMMAND [ARGS...]\n" +
+  "Fairness: TAILTERM_MATRIX_OVERTAKE_LIMIT=1..1000 (default 2); urgent grants are exempt.";
 export function minutesFlag(name, value, max) {
   if (!/^[1-9][0-9]{0,3}$/.test(value || "") || Number(value) > max)
     throw new Error(`${name} requires a whole number of minutes from 1 to ${max}`);
