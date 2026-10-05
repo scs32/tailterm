@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -303,6 +304,119 @@ func TestMirrorInOrderWithParts(t *testing.T) {
 	}
 	if bad := h.fake.sentWithoutAllowedMentions(); len(bad) > 0 {
 		t.Fatalf("sends without an empty allowed_mentions parse list: %v", bad)
+	}
+}
+
+func TestOwnerExpectedAnswerIsLiteral(t *testing.T) {
+	h := newHarness(t)
+	item, err := h.st.CreateWorkItem(h.ctx, h.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Literal answer fixture", RequestID: "literal-answer-item"}, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact := " *yes* _OK_ `sha` \\done\n```ansi\n**approve**\n``` \n"
+	want := " \\*yes\\* \\_OK\\_ \\`sha\\` \\\\done\n\\`\\`\\`ansi\n\\*\\*approve\\*\\*\n\\`\\`\\` \n"
+	m := h.post(api.PostMessageRequest{
+		AgentID: h.builder.ID, RunID: h.builder.RunID, RequestID: "literal-answer-request",
+		Envelope:  &api.Envelope{Kind: "request", To: "owner", Subject: "Approve the literal answer fixture", ExpectedAnswer: exact, Body: api.EnvelopeBody{Ask: "Please approve"}},
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: h.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+	})
+	h.cycle()
+	var rendered strings.Builder
+	buttons := 0
+	for _, line := range h.lines() {
+		for _, embed := range line.Embeds {
+			rendered.WriteString(embed.Description)
+		}
+		for _, row := range line.Components {
+			for _, button := range row.Components {
+				if button.Label == "Approve" {
+					buttons++
+					if button.CustomID != fmt.Sprintf("approve-owner:%d", m.Seq) {
+						t.Fatalf("unexpected approval identity: %s", button.CustomID)
+					}
+				}
+			}
+		}
+	}
+	if !strings.HasSuffix(rendered.String(), "\nExpected answer:\n"+want) || buttons != 1 {
+		t.Fatalf("literal answer or approval control lost: %q, buttons %d", rendered.String(), buttons)
+	}
+	h.interact(discord.Interaction{ID: "910000000000000101", Type: discord.InteractionComponent, Data: discord.InteractionData{CustomID: fmt.Sprintf("approve-owner:%d", m.Seq)}})
+	answers := 0
+	for _, saved := range h.boardMessages() {
+		if saved.Seq == m.Seq && (saved.Text != m.Text || saved.Envelope.ExpectedAnswer != exact) {
+			t.Fatal("rendering changed the stored request")
+		}
+		if saved.ReplyTo == m.Seq {
+			answers++
+			if saved.Envelope.Body.Answer != exact {
+				t.Fatalf("approval changed stored answer bytes: %q", saved.Envelope.Body.Answer)
+			}
+		}
+	}
+	if answers != 1 {
+		t.Fatalf("got %d approvals, want one", answers)
+	}
+}
+
+func TestOwnerExpectedAnswerParts(t *testing.T) {
+	tests := []struct {
+		name, ask, answer, escaped string
+	}{
+		{"unfinished ask fence", "```go", "*approve*", "\\*approve\\*"},
+		{"split escape pairs", "Please approve", strings.Repeat("*", 1739) + strings.Repeat("\\", 260) + "\n", strings.Repeat("\\*", 1739) + strings.Repeat("\\\\", 260) + "\n"},
+		{"multiline markdown", "Please approve", "# heading\n> quote\n- list\n1. item\n||spoiler|| [link](url) ~strike~\n\t矩阵🙂  \n", "\\# heading\n\\> quote\n\\- list\n1\\. item\n\\|\\|spoiler\\|\\| \\[link\\]\\(url\\) \\~strike\\~\n\t矩阵🙂  \n"},
+		{"no expected answer", "Please answer", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := &api.Envelope{Kind: "request", To: "owner", Subject: "Approve the answer fixture", ExpectedAnswer: tc.answer, Body: api.EnvelopeBody{Ask: tc.ask}}
+			m := api.Message{TaskID: "tsk_fixture", Seq: 42, From: api.Sender{AgentID: "agt_fixture"}, Envelope: env, Text: api.RenderText(*env)}
+			b := &Bridge{cfg: Config{TailOSURL: "https://tailos.example"}}
+			rows := b.renderMessage(api.Task{}, nil, m)
+			var rendered strings.Builder
+			for i, row := range rows {
+				var p outboxPayload
+				if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
+					t.Fatal(err)
+				}
+				if len(p.Message.Embeds) != 1 {
+					t.Fatalf("part %d has %d embeds", i, len(p.Message.Embeds))
+				}
+				e := p.Message.Embeds[0]
+				if utf8.RuneCountInString(e.Description) > embedBudget || e.URL != "https://tailos.example/" || e.Color != kindColors["request"] {
+					t.Fatalf("part %d lost embed limits or metadata: %+v", i, e)
+				}
+				if p.Marker != marker(m.Seq, i+1, len(rows), "owner-request") {
+					t.Fatalf("part %d has wrong marker: %q", i, p.Marker)
+				}
+				if i > 0 {
+					// Each answer embed ends on a complete escaped token.
+					tail := len(e.Description) - len(strings.TrimRight(e.Description, "\\"))
+					if tail%2 != 0 {
+						t.Fatalf("part %d ends with a split escape: %q", i, e.Description)
+					}
+				}
+				wantButton := tc.answer != "" && i == len(rows)-1
+				if (len(p.Message.Components) > 0) != wantButton {
+					t.Fatalf("part %d approval button presence incorrect", i)
+				}
+				rendered.WriteString(e.Description)
+			}
+			want := m.Text
+			if tc.answer != "" {
+				want = strings.TrimSuffix(m.Text, tc.answer) + tc.escaped
+				if len(rows) < 2 {
+					t.Fatal("answer inherited request markdown context")
+				}
+			}
+			if tc.name == "split escape pairs" && len(rows) < 3 {
+				t.Fatal("long escaped answer did not exercise multipart rendering")
+			}
+			if rendered.String() != want || m.Envelope.ExpectedAnswer != tc.answer {
+				t.Fatalf("rendered answer differs or stored bytes changed: got %q, want %q", rendered.String(), want)
+			}
+		})
 	}
 }
 

@@ -117,7 +117,7 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 		}
 	}
 	if env != nil && env.Kind == api.EnvelopeKindRequest && m.From.AgentID != "" && (env.To == "owner" || (env.To == "" && m.To == "")) {
-		parts := chunk(m.Text, embedBudget)
+		parts := ownerRequestParts(m)
 		rows := []OutboxRow{}
 		for i, text := range parts {
 			mk := marker(m.Seq, i+1, len(parts), "owner-request")
@@ -157,6 +157,39 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 		rows = append(rows, row("msg", kindLine, i+1, outboxPayload{Message: discord.MessageSend{Content: content}, Marker: mk}))
 	}
 	return rows
+}
+
+// Keep the exact answer in separate embeds so request markdown (including an
+// unfinished code fence) cannot change its presentation. Escape only the display
+// copy; approval continues to use the stored envelope's original bytes.
+func ownerRequestParts(m api.Message) []string {
+	answer := m.Envelope.ExpectedAnswer
+	if answer == "" {
+		return chunk(m.Text, embedBudget)
+	}
+	parts := chunk(strings.TrimSuffix(m.Text, "\nExpected answer:\n"+answer), embedBudget)
+	var part strings.Builder
+	part.WriteString("\nExpected answer:\n")
+	n := part.Len()
+	for _, r := range answer {
+		escape := strings.ContainsRune("\\`*_{}[]()#+-.!|>~<", r)
+		size := 1
+		if escape {
+			size++
+		}
+		if n+size > embedBudget {
+			parts = append(parts, part.String())
+			part.Reset()
+			n = 0
+		}
+		if escape {
+			part.WriteByte('\\')
+		}
+		part.WriteRune(r)
+		n += size
+	}
+	// Do not trim whitespace or split an escape pair at an embed boundary.
+	return append(parts, part.String())
 }
 
 // renderEscalation pings only the owners and offers the unstall controls.
