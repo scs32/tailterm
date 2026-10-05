@@ -228,7 +228,7 @@ test("ordinary session guests survive task reconciliation and can leave without 
   assert.deepEqual(m.taskGroup("review").guests, []);
 });
 
-test("task agents grow into two worker columns while the orchestrator stays full-height", () => {
+test("task agents stack workers before growing into two balanced columns", () => {
   const model = new PaneGroups();
   const ids = [
     "lead",
@@ -238,6 +238,7 @@ test("task agents grow into two worker columns while the orchestrator stays full
     "fifth",
     "sixth",
     "seventh",
+    "eighth",
   ];
   for (let count = 1; count <= ids.length; count++) {
     model.sync(ids.slice(0, count), () => "task");
@@ -249,12 +250,25 @@ test("task agents grow into two worker columns while the orchestrator stays full
     assert.equal(byId.lead.x, 0);
     assert.equal(byId.lead.y, 0);
     assert.equal(byId.lead.height, 800);
-    assert.equal(new Set(panes.map((pane) => pane.x)).size, Math.min(count, 3));
-    if (count >= 4) {
-      assert.equal(byId.second.x, byId.fourth.x);
-      assert.ok(byId.fourth.y > byId.second.y);
+    const columns = [...new Set(panes.map((pane) => pane.x))];
+    assert.equal(columns.length, count === 1 ? 1 : count < 5 ? 2 : 3);
+    if (count >= 3) {
+      const heights = columns
+        .slice(1)
+        .map((x) => panes.filter((pane) => pane.x === x).length);
+      assert.ok(heights.every((rows) => rows >= 2));
+      assert.ok(Math.max(...heights) - Math.min(...heights) <= 1);
+    }
+    if (count === 3 || count === 4) {
+      assert.equal(group.tree.ratio, 0.5);
+      assert.equal(byId.second.x, byId.third.x);
+      assert.ok(byId.third.y > byId.second.y);
+      if (count === 4) assert.ok(byId.fourth.y > byId.third.y);
     }
     if (count >= 5) {
+      assert.equal(group.tree.ratio, 1 / 3);
+      assert.equal(byId.second.x, byId.fourth.x);
+      assert.ok(byId.fourth.y > byId.second.y);
       assert.equal(byId.third.x, byId.fifth.x);
       assert.ok(byId.fifth.y > byId.third.y);
     }
@@ -266,6 +280,116 @@ test("task agents grow into two worker columns while the orchestrator stays full
       saved,
       "repeated sync preserves divider IDs and focus",
     );
+  }
+});
+
+test("saved automatic worker columns migrate by shape and reconnect by agent identity", () => {
+  const taskId = "tsk_1111111111111111";
+  for (const count of [3, 4, 5]) {
+    const agents = Array.from({ length: count }, (_, i) => homeAgentId(i + 1));
+    const column = (ids) =>
+      ids.length === 1
+        ? { agentId: ids[0] }
+        : {
+            id: `column-${ids[0]}`,
+            axis: "y",
+            ratio: 1 / ids.length,
+            a: { agentId: ids[0] },
+            b: column(ids.slice(1)),
+          };
+    const oldTree = {
+      id: "old-root",
+      axis: "x",
+      ratio: 0.37,
+      a: { agentId: agents[0] },
+      b: {
+        id: "old-workers",
+        axis: "x",
+        ratio: 0.62,
+        a: column(agents.slice(1).filter((_, i) => i % 2 === 0)),
+        b: column(agents.slice(1).filter((_, i) => i % 2 === 1)),
+      },
+    };
+    const saved = [
+      { taskId, taskLayout: "auto", tree: oldTree, activeAgentId: agents[2] },
+    ];
+    const restored = new PaneGroups();
+    restored.loadProjectLayouts(JSON.parse(JSON.stringify(saved)));
+    restored.setTaskMembers(taskId, agents);
+    const tabs = [];
+    const taskOf = () => taskId;
+    const agentOf = (id) => agents[Number(id.slice(4))];
+    for (const i of [...agents.keys()].reverse()) {
+      tabs.push(`new-${i}`);
+      restored.sync(tabs, taskOf, agentOf);
+      restored.setTaskOrchestrator(taskId, "new-0");
+      restored.isolateTasks(taskOf, agentOf);
+    }
+    const group = restored.taskGroup(taskId);
+    const { panes } = tileLayout(group.tree, 1200, 800);
+    const workers = panes.filter((p) => p.id !== "new-0");
+    assert.equal(new Set(workers.map((p) => p.x)).size, count < 5 ? 1 : 2);
+    assert.equal(group.active, "new-2");
+    if (count === 5) {
+      assert.deepEqual(
+        restored.projectLayoutSnapshot(),
+        saved,
+        "matching auto shape keeps divider IDs and ratios",
+      );
+    } else {
+      assert.equal(group.tree.ratio, 0.5);
+      assert.equal(group.tree.b.axis, "y");
+    }
+    const before = structuredClone(restored.projectLayoutSnapshot());
+    restored.sync(tabs, taskOf, agentOf);
+    restored.isolateTasks(taskOf, agentOf);
+    assert.deepEqual(restored.projectLayoutSnapshot(), before);
+    // A manually retained old arrangement is never migrated.
+    const manual = new PaneGroups();
+    manual.loadProjectLayouts([{ ...saved[0], taskLayout: "manual" }]);
+    manual.setTaskMembers(taskId, agents);
+    manual.sync(tabs, taskOf, agentOf);
+    manual.setTaskOrchestrator(taskId, "new-0");
+    manual.isolateTasks(taskOf, agentOf);
+    assert.deepEqual(manual.projectLayoutSnapshot()[0].tree, oldTree);
+  }
+});
+
+test("stacked small teams keep manual resizing, swaps, guests and narrow layouts", () => {
+  for (const count of [3, 4, 5]) {
+    const model = new PaneGroups();
+    const ids = Array.from({ length: count }, (_, i) => `p${i}`);
+    const taskOf = (id) => (ids.includes(id) ? "task" : undefined);
+    model.sync([...ids, "shell"], taskOf);
+    model.setTaskOrchestrator("task", "p0");
+    model.isolateTasks(taskOf);
+    const group = model.taskGroup("task");
+    for (const [width, height] of [
+      [360, 700],
+      [800, 1200],
+    ]) {
+      const layout = tileLayout(group.tree, width, height);
+      assert.equal(layout.dividers[0].axis, "y");
+      if (width < 540) {
+        assert.ok(layout.dividers.every((d) => d.axis === "y"));
+        assert.ok(layout.panes.every((p) => p.x === 0 && p.width === width));
+      }
+      assert.ok(layout.panes.every((p) => p.width >= 180 && p.height >= 120));
+    }
+    model.customize("p0");
+    group.tree.ratio = 0.42;
+    group.tree.b.ratio = 0.63;
+    model.swap("p1", "p2");
+    const before = structuredClone(group.tree);
+    model.sync([...ids, "shell"], taskOf);
+    model.isolateTasks(taskOf);
+    assert.deepEqual(model.taskGroup("task").tree, before);
+    assert.equal(model.merge("shell", "p1", { whole: false }), true);
+    const guestTree = structuredClone(model.taskGroup("task").tree);
+    model.sync([...ids, "shell"], taskOf);
+    model.isolateTasks(taskOf);
+    assert.deepEqual(model.taskGroup("task").tree, guestTree);
+    assert.deepEqual(model.taskGroup("task").guests, ["shell"]);
   }
 });
 

@@ -78,6 +78,8 @@ function taskTree(ids) {
   if (ids.length === 1) return { tab: ids[0] };
   if (ids.length === 2) return split("x", { tab: ids[0] }, { tab: ids[1] });
   const workers = ids.slice(1);
+  // Fill a worker column at least two high before opening a second one.
+  if (workers.length < 4) return split("x", { tab: ids[0] }, column(workers));
   return split(
     "x",
     { tab: ids[0] },
@@ -1028,9 +1030,13 @@ export class PaneGroups {
           ordered.unshift(...ordered.splice(ordered.indexOf(anchor), 1));
         const next =
           i === 0 ? stableTaskTree(ordered) : stableContinuation(ordered);
+        // An old auto template can have the same leaf order but a different
+        // column shape. Keep ratios/IDs only when the shape also matches.
         const same = (a, b) =>
-          a.length === b.length && a.every((key, j) => key === b[j]);
-        return same(stableKeys(tree), stableKeys(next)) ? tree : next;
+          a.agentId || a.tabId || b.agentId || b.tabId
+            ? stableKey(a) === stableKey(b)
+            : a.axis === b.axis && same(a.a, b.a) && same(a.b, b.b);
+        return same(tree, next) ? tree : next;
       });
     }
     layout.tree = trees[0] || null;

@@ -94,9 +94,13 @@ The deployed frontend uses `npm run build:static` instead.
 - Task groups cannot merge into another task or ordinary group. An ordinary
   session can join a task group visually as a guest without becoming an agent.
 - Default task layouts keep the orchestrator full-height on the left and add
-  workers across two columns on the right, stacking the fourth/fifth agents
-  beneath the second/third. Later workers extend those columns. Manual divider
-  resizing, swaps and guest layouts are retained; narrow screens still stack.
+  workers in stacked columns on the right. One worker stays beside the lead;
+  two or three workers share one column, with equal lead/worker column widths.
+  Four or more workers alternate across two balanced columns, with the lead
+  and both worker columns each taking a third of the width. Every worker column
+  is at least two panes high when the count permits, without empty panes.
+  Saved automatic layouts adopt this rule; manual divider resizing, swaps and
+  guest layouts are retained, and narrow screens still stack.
 - A group holds at most eight panes (Appearance → Panes per group: 4–16).
   Further panes continue in an adjacent "‹group› (continued)", then
   "(continued 2)" group with the same project binding, hub mirror and restore.
