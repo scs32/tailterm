@@ -26,7 +26,7 @@ import (
 const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--take-session] [--json]\n" +
 	"       tt helper env --task T\n" +
 	"       tt helper inbox --task T\n" +
-	"       tt helper reply --task T SEQ --text TEXT [--request-id K]"
+	"       tt helper reply --task T SEQ --text TEXT [--interim] [--request-id K]"
 
 // ownerHelperFile is private host state for one project's helper: the exact
 // registered identity and tmux session, and a pending request ID that makes a
@@ -597,7 +597,7 @@ func helperMessageLine(m api.Message, names map[string]string, task string) stri
 		return line
 	}
 	line, _, _ = strings.Cut(line, "\n  Reply on the shared board:")
-	return line + fmt.Sprintf("\n  From the owner on Discord. Answer with tt helper reply --task %s %d --text \"your reply\" (it goes back to their DM or thread), or tt ack %d. Until you reply or ack, the hub holds your other posts.", task, m.Seq, m.Seq)
+	return line + fmt.Sprintf("\n  From the owner on Discord. Answer with tt helper reply --task %s %d --text \"your reply\" (it goes back to their DM or thread and closes the obligation; no second typed answer is needed). Add --interim for a progress reply that keeps the obligation open, or tt ack %d to acknowledge without replying. Until you reply or ack, the hub holds your other posts.", task, m.Seq, m.Seq)
 }
 
 // helperReplyRequestID names one exact reply, so a rerun after a timeout
@@ -614,7 +614,8 @@ func helperReply(e env, args []string) error {
 	fs := flag.NewFlagSet("helper reply", flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")
 	text := fs.String("text", "", "the reply")
-	requestID := fs.String("request-id", "", "stable retry identity (default: derived from the project, SEQ and text, so running the same reply again posts once)")
+	interim := fs.Bool("interim", false, "record progress and keep the obligation open instead of answering it")
+	requestID := fs.String("request-id", "", "stable retry identity (default: derived from the project, SEQ, text and interim mode, so running the same reply again posts once)")
 	// SEQ may come before or after the flags.
 	var positional []string
 	for {
@@ -649,8 +650,33 @@ func helperReply(e env, args []string) error {
 	defer cancel()
 	if *requestID == "" {
 		*requestID = helperReplyRequestID(helper.task, seq, *text)
+		if *interim {
+			*requestID += "-interim"
+		}
 	}
-	m, err := c.PostMessage(ctx, helper.task, api.PostMessageRequest{AgentID: helper.agent, RunID: helper.runID, ReplyTo: seq, Text: *text, RequestID: *requestID})
+	req := api.PostMessageRequest{AgentID: helper.agent, RunID: helper.runID, ReplyTo: seq, Text: *text, RequestID: *requestID}
+	// Include closed obligations: an identical retry must retain its envelope
+	// after the first post has settled the obligation. Without an obligation,
+	// preserve the existing plain reply and its display text.
+	obligations, err := c.ListObligationsFrom(ctx, helper.task, helper.agent, seq, seq)
+	if err != nil {
+		return err
+	}
+	for _, o := range obligations {
+		if o.MessageSeq != seq || o.Needs == api.ObligationNeedsDelivery {
+			continue
+		}
+		if *interim {
+			req.Envelope = &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Progress on the owner message", Body: api.EnvelopeBody{Text: *text}}
+		} else if o.SourceKind == "human" || o.Needs == api.ObligationNeedsAnswer || o.SourceKind == api.EnvelopeKindBlock {
+			req.Envelope = &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "Answer to the owner message", Body: api.EnvelopeBody{Answer: *text}}
+		}
+		if req.Envelope != nil {
+			req.Text = "" // the hub renders the typed Board text
+		}
+		break
+	}
+	m, err := c.PostMessage(ctx, helper.task, req)
 	if err != nil {
 		return err
 	}

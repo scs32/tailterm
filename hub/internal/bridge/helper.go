@@ -774,6 +774,14 @@ func renderHelperReply(name string, c conversation, msg api.Message) []OutboxRow
 	if env := msg.Envelope; env != nil {
 		header += fmt.Sprintf(" · %s · %s", strings.ToUpper(env.Kind), clean(redactSecrets(env.Subject)))
 		body = typedBody(msg.Text)
+		// Helper answers and progress retain their original Markdown. The
+		// normalized Board display text flattens envelope field line breaks.
+		switch env.Kind {
+		case api.EnvelopeKindAnswer:
+			body = env.Body.Answer
+		case api.EnvelopeKindNotice:
+			body = env.Body.Text
+		}
 	}
 	parts := chunk(redactSecrets(body), partBudget)
 	rows := make([]OutboxRow, 0, len(parts))

@@ -626,6 +626,125 @@ func TestOwnerHelperTeamCountAndOfflineLabel(t *testing.T) {
 	}
 }
 
+// wi_66b40c00f6e5eb03, order #24191 amended by #24238: final replies
+// settle the owner obligation; interim replies keep it open with progress.
+func TestHelperReplyClosesOwnerObligation(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	a := *f.mustRegister(t).Agent
+	asked, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Text: "Please answer this owner question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := "**Answer**\n\n- first\n- second\n\n```sh\necho synthetic\n```"
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdHelper(f.owner, []string{"reply", "--task", f.task.ID, fmt.Sprint(asked.Seq), "--text", answer})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	obligations, err := f.c.ListObligations(ctx, f.task.ID, a.ID, a.RunID, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range obligations {
+		if o.MessageSeq == asked.Seq {
+			if o.State != api.ObligationClosed || o.Outcome != api.OutcomeAnswered || o.OutcomeSeq == 0 {
+				t.Fatalf("final helper reply left owner obligation unsettled: %+v", o)
+			}
+			return
+		}
+	}
+	t.Fatal("owner obligation missing")
+}
+
+func TestHelperReplyInterimRecordsProgress(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	a := *f.mustRegister(t).Agent
+	asked, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Text: "Please investigate this owner question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := "Working on it\n\n- first step finished"
+	reply := func(interim bool) (string, error) {
+		args := []string{"reply", "--task", f.task.ID, fmt.Sprint(asked.Seq), "--text", text}
+		if interim {
+			args = append(args, "--interim")
+		}
+		return captureCLIOutput(t, func() error { return cmdHelper(f.owner, args) })
+	}
+	first, err := reply(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := reply(true); err != nil || again != first {
+		t.Fatalf("interim retry = %q %v, want %q", again, err, first)
+	}
+	obligations, err := f.c.ListObligations(ctx, f.task.ID, a.ID, a.RunID, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, o := range obligations {
+		if o.MessageSeq == asked.Seq {
+			found = true
+			if o.State != api.ObligationWorking || o.LastProgressAt == nil || o.Outcome != "" || o.ClosedAt != nil {
+				t.Fatalf("interim reply did not record open progress: %+v", o)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("owner obligation missing")
+	}
+	// The same text can be a final answer: interim and final use distinct
+	// retry identities. Replaying the earlier interim cannot reopen it.
+	if final, err := reply(false); err != nil || final == first {
+		t.Fatalf("final reply = %q %v, interim = %q", final, err, first)
+	}
+	if again, err := reply(true); err != nil || again != first {
+		t.Fatalf("interim retry after final = %q %v", again, err)
+	}
+	msgs, err := f.c.ListMessages(ctx, f.task.ID, asked.Seq, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].Envelope == nil || msgs[0].Envelope.Kind != api.EnvelopeKindNotice || msgs[0].Envelope.Body.Text != text || msgs[1].Envelope == nil || msgs[1].Envelope.Kind != api.EnvelopeKindAnswer || msgs[1].Envelope.Body.Answer != text {
+		t.Fatalf("interim/final messages = %+v", msgs)
+	}
+	obligations, err = f.c.ListObligations(ctx, f.task.ID, a.ID, a.RunID, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range obligations {
+		if o.MessageSeq == asked.Seq && (o.State != api.ObligationClosed || o.Outcome != api.OutcomeAnswered || o.OutcomeSeq != msgs[1].Seq) {
+			t.Fatalf("interim retry reopened the final answer: %+v", o)
+		}
+	}
+}
+
+func TestHelperReplyWithoutObligation(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	a := *f.mustRegister(t).Agent
+	asked, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "A board message without an obligation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := "**Reply**\n\n- first\n- second"
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdHelper(f.owner, []string{"reply", "--task", f.task.ID, fmt.Sprint(asked.Seq), "--text", answer})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := f.c.ListMessages(ctx, f.task.ID, asked.Seq, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Text != answer || msgs[0].Envelope != nil || msgs[0].ReplyTo != asked.Seq || msgs[0].From.AgentID != a.ID {
+		t.Fatalf("no-obligation reply changed: %+v", msgs)
+	}
+}
+
 // wi_2de2c1273e34473a a10, f0: tt helper reply posts as the verified helper
 // with replyTo (SEQ before or after the flags), answering one of two
 // pending messages is accepted, and an unverified helper is refused.
@@ -666,7 +785,7 @@ func TestHelperReply(t *testing.T) {
 		replyTo int64
 	}{{"answer to the second", asked[1].Seq}, {"answer to the first", asked[0].Seq}} {
 		m := msgs[i]
-		if m.From.AgentID != a.ID || m.ReplyTo != want.replyTo || m.Text != want.text {
+		if m.From.AgentID != a.ID || m.ReplyTo != want.replyTo || m.Envelope == nil || m.Envelope.Kind != api.EnvelopeKindAnswer || m.Envelope.Body.Answer != want.text {
 			t.Fatalf("reply %d = %+v, want from %s replying to %d", i, m, a.ID, want.replyTo)
 		}
 	}
@@ -702,7 +821,7 @@ func TestHelperInboxDiscordHint(t *testing.T) {
 	names := map[string]string{}
 	discordMsg := api.Message{Seq: 42, From: api.Sender{Node: api.BridgeNode, User: "owner"}, Text: "what's stuck?", Source: &api.MessageSource{Kind: api.SourceDiscord, ID: "1", UserID: "2"}}
 	line := helperMessageLine(discordMsg, names, "tsk_0123456789abcdef")
-	if !strings.Contains(line, `tt helper reply --task tsk_0123456789abcdef 42 --text "your reply"`) || !strings.Contains(line, "tt ack 42") || strings.Contains(line, "Reply on the shared board") {
+	if !strings.Contains(line, `tt helper reply --task tsk_0123456789abcdef 42 --text "your reply"`) || !strings.Contains(line, "tt ack 42") || strings.Contains(line, "Reply on the shared board") || !strings.Contains(line, "--interim") || !strings.Contains(line, "keeps the obligation open") || !strings.Contains(line, "no second typed answer is needed") {
 		t.Fatalf("Discord hint = %q", line)
 	}
 	if !strings.HasPrefix(line, strings.SplitN(formatMessage(discordMsg, names), "\n", 2)[0]) {
@@ -1234,27 +1353,64 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 			if err != nil || !strings.Contains(inbox, inbound.Content) {
 				t.Fatalf("helper inbox %q %v", inbox, err)
 			}
-			answer := "synthetic Codex answer"
-			reply := func() error {
+			answer := "**Synthetic Codex answer**\n\n- first\n- second\n\n```sh\necho synthetic\n```"
+			reply := func(interim bool) error {
 				_, err := captureCLIOutput(t, func() error {
-					return cmdHelper(f.owner, []string{"reply", "--task", task.ID, fmt.Sprint(source.Seq), "--text", answer})
+					args := []string{"reply", "--task", task.ID, fmt.Sprint(source.Seq), "--text", answer}
+					if interim {
+						args = append(args, "--interim")
+					}
+					return cmdHelper(f.owner, args)
 				})
 				return err
 			}
-			if err := reply(); err != nil {
+			if err := reply(true); err != nil {
+				t.Fatal(err)
+			}
+			wait("Discord interim progress", func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, m := range sent {
+					if m.channel == replyChannel && strings.Contains(m.content, " · NOTICE · ") && strings.Contains(m.content, answer) {
+						return true
+					}
+				}
+				return false
+			})
+			progress, err := c.ListObligations(ctx, task.ID, a.ID, a.RunID, false, false)
+			if err != nil || len(progress) != 1 || progress[0].State != api.ObligationWorking || progress[0].LastProgressAt == nil || progress[0].ClosedAt != nil {
+				t.Fatalf("Discord interim progress = %+v %v", progress, err)
+			}
+			if err := reply(true); err != nil {
+				t.Fatal(err)
+			}
+			if err := reply(false); err != nil {
 				t.Fatal(err)
 			}
 			wait("Discord answer", func() bool {
 				mu.Lock()
 				defer mu.Unlock()
 				for _, m := range sent {
-					if m.channel == replyChannel && strings.Contains(m.content, answer) {
+					if m.channel == replyChannel && strings.Contains(m.content, " · ANSWER · ") && strings.Contains(m.content, answer) {
 						return true
 					}
 				}
 				return false
 			})
-			if err := reply(); err != nil {
+			obligations, err := c.ListObligations(ctx, task.ID, a.ID, a.RunID, false, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			answered := false
+			for _, o := range obligations {
+				if o.MessageSeq == source.Seq {
+					answered = o.State == api.ObligationClosed && o.Outcome == api.OutcomeAnswered && o.OutcomeSeq != 0
+				}
+			}
+			if !answered {
+				t.Fatalf("Discord reply did not close the owner obligation: %+v", obligations)
+			}
+			if err := reply(false); err != nil {
 				t.Fatal(err)
 			} // identical CLI retry posts once
 			br.Dispatch(discord.Dispatch{Type: "MESSAGE_CREATE", Data: raw}) // Gateway redelivery is idempotent
@@ -1272,7 +1428,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 				}
 			}
 			mu.Unlock()
-			if answers != 1 {
+			if answers != 2 { // one interim plus one final, despite both retries
 				t.Fatalf("Discord answers=%d", answers)
 			}
 			msgs, err := c.ListMessages(ctx, task.ID, source.Seq, "", 100)
@@ -1281,7 +1437,7 @@ func TestHelperCodexDiscordRoundTrip(t *testing.T) {
 			}
 			replies := 0
 			for _, m := range msgs {
-				if m.Text == answer {
+				if m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindAnswer && m.Envelope.Body.Answer == answer {
 					replies++
 					if m.From.AgentID != a.ID || m.ReplyTo != source.Seq {
 						t.Fatalf("reply provenance %+v", m)
