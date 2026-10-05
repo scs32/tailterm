@@ -46,12 +46,12 @@ and the comparison plan below includes human interventions and regressions.
 sequential change, and **Feature delivery** only when UI and API work can be
 partitioned. These recommendations are design judgments, not measured rankings.
 
-Template seats default to GPT-6.1 Sol (`gpt-6.1-sol`, app `codex`; owner decision October 3, 2026, replacing Claude Opus 5.5;
+Template seats default to Claude Opus 5.5 (`claude-opus-5-5`, app `claude`;
 owner decision, September 28, 2026). There are three exceptions. The **Planned
 delivery** database handler uses Claude Sonnet 5.5 (`claude-sonnet-5-5`, app
 `claude`), an owner trial against the Opus handler (September 29, 2026). The
 **Planned delivery** plan reviewer uses GPT-6 Astra (`gpt-6-astra`, app `codex`),
-so a feature's plan is checked on another model than the Sol planner. The four
+so a feature's plan is checked on another model than the Opus planner. The four
 **Coordinated swarm** workers use GPT-6 Luna (`gpt-6-luna`, app `codex`) for
 focused, high-volume assignments. GPT-6 Luna needs `codex-cli` 0.156.1 or later
 on the launching host.
@@ -146,7 +146,7 @@ rate limits and deduplication. This does not extend automatic wake support to
 other runtimes. Prompts discourage acknowledgement loops, redundant findings and
 taking over assignments addressed to someone else.
 
-The **Coordinated swarm** example starts with one GPT-6.1 Sol orchestrator
+The **Coordinated swarm** example starts with one Claude Opus 5.5 orchestrator
 and four GPT-6 Luna workers. Templates support up to 32 members, so one orchestrator plus ten
 workers can be saved, but this is an experiment to measure, not a claimed optimum.
 The active-agent cap and Max new agents allowance remain separate. A larger
@@ -185,15 +185,15 @@ A lead, a planner, a plan reviewer for features, one writer, a database handler,
 
 **Swarm:** off. **Main orchestrator:** lead.
 
-The lead uses GPT-6.1 Sol (`gpt-6.1-sol`, app `codex`, effort `medium`). Planner, builder, verifier and reviewer use GPT-6.1 Sol (effort `high`). The database handler uses Claude Sonnet 5.5 (`claude-sonnet-5-5`, effort `high`), an owner trial against the Opus handler (September 29, 2026).
+The lead uses Claude Opus 5.5 (`claude-opus-5-5`, effort `medium`). Planner, builder, verifier and reviewer use Claude Opus 5.5 (effort `high`). The database handler uses Claude Sonnet 5.5 (`claude-sonnet-5-5`, effort `high`), an owner trial against the Opus handler (September 29, 2026).
 
-Features get a plan and a plan review; bugs get a plan only (owner rule, September 28, 2026; `wi_ade4aa60c5d9b55e`). The plan reviewer uses GPT-6 Astra (`gpt-6-astra`, app `codex`, effort `high`), so the plan is checked by a separate session on another model than the Sol planner. The shared launch plan reads the item kind from the exact item revision in the launch context: a feature team launches six members (lead, planner, plan-reviewer, builder, verifier, reviewer), and a bug team launches five, without the plan reviewer. A launch whose context has no item kind is refused. The database seat is never launched; the project's existing handler serves both shapes. For a feature, the lead sends the planner's plan to the plan reviewer in a REQUEST before any builder ASSIGN. The plan reviewer answers each REQUEST with one RESULT whose outcome is `done` (a RESULT outcome is `done` or `partial`, never `pass`); its text gives the verdict: pass, or numbered blockers p1…pN (missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step), each with its reason. The planner gets one revision round, the lead may send one focused-check REQUEST for those blocker IDs (answered by its own RESULT), and then the lead decides; there is no plan-review loop. Plan and plan review use REQUEST, never ASSIGN or REVIEW, because an ASSIGN freezes the acceptance criteria and plan review is not a code-review round. For a bug, the lead assigns the builder from the plan directly. A TailOS team saved before this rule has no plan-reviewer seat and launches five members for either kind; re-add Planned delivery from the example to get the new seat.
+Features get a plan and a plan review; bugs get a plan only (owner rule, September 28, 2026; `wi_ade4aa60c5d9b55e`). The plan reviewer uses GPT-6 Astra (`gpt-6-astra`, app `codex`, effort `high`), so the plan is checked by a separate session on another model than the Opus planner. The shared launch plan reads the item kind from the exact item revision in the launch context: a feature team launches six members (lead, planner, plan-reviewer, builder, verifier, reviewer), and a bug team launches five, without the plan reviewer. A launch whose context has no item kind is refused. The database seat is never launched; the project's existing handler serves both shapes. For a feature, the lead sends the planner's plan to the plan reviewer in a REQUEST before any builder ASSIGN. The plan reviewer answers each REQUEST with one RESULT whose outcome is `done` (a RESULT outcome is `done` or `partial`, never `pass`); its text gives the verdict: pass, or numbered blockers p1…pN (missing acceptance coverage, wrong file ownership, unsafe step or unverifiable step), each with its reason. The planner gets one revision round, the lead may send one focused-check REQUEST for those blocker IDs (answered by its own RESULT), and then the lead decides; there is no plan-review loop. Plan and plan review use REQUEST, never ASSIGN or REVIEW, because an ASSIGN freezes the acceptance criteria and plan review is not a code-review round. For a bug, the lead assigns the builder from the plan directly. A TailOS team saved before this rule has no plan-reviewer seat and launches five members for either kind; re-add Planned delivery from the example to get the new seat.
 
 The reviewer is independent because it is a separate session with its own context that did not write the change, not because of its model; it may run the same model as the builder. The relay wakes an idle Claude session only after verifying its exact owned pane and empty prompt. All members post with `tt send` (the [typed message format](message-broker.md#typed-message-envelope)); the hub records adoption in shadow mode and accepts free text until phase 4.
 
 ### lead — Delivery lead and orchestrator
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `medium`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -226,7 +226,7 @@ If a teammate leaves directed work without a reply for 30 minutes, send that tea
 
 ### planner — Planning and acceptance criteria
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -286,7 +286,7 @@ The planner gets one revision round. Lead may then REQUEST one focused check of 
 
 ### builder — Implementation
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -346,7 +346,7 @@ Reply with one RESULT per request. The subject says what was saved in plain Engl
 
 ### reviewer — Independent code review
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -389,7 +389,7 @@ One capable agent for a bounded change, without coordination overhead.
 
 ### builder — Implementation and verification
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -427,7 +427,7 @@ A single writer plus an independent reviewer. A practical default for most codin
 
 ### builder — Implementation lead
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -451,7 +451,7 @@ Before finishing, read the inbox, confirm the reviewed artifact matches your fin
 
 ### reviewer — Independent correctness review
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -487,7 +487,7 @@ A lead, two implementation lanes, and independent acceptance testing.
 
 ### lead — Architecture and delivery orchestration
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -511,7 +511,7 @@ Close with qa's evidence and any unresolved findings. Do not announce completion
 
 ### ui — Client implementation
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -535,7 +535,7 @@ Exercise keyboard and pointer interactions, relevant viewport sizes, and the bro
 
 ### api — Service and data implementation
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -559,7 +559,7 @@ Verify the happy path and the most important failure or concurrency case through
 
 ### qa — Independent acceptance testing
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -595,7 +595,7 @@ Two independent lines of diagnosis, with one agent responsible for the fix.
 
 ### fixer — Diagnosis orchestration
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -619,7 +619,7 @@ Send the precise patch and claimed mechanism to both teammates. Have reproducer 
 
 ### reproducer — Failure reproduction
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -643,7 +643,7 @@ After the patch, rerun the original scenario and a nearby negative case, includi
 
 ### analyst — Causal analysis and repair implementation
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -679,7 +679,7 @@ A design audit, a single UI writer, and browser/accessibility verification.
 
 ### designer — Interaction and visual audit
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -703,7 +703,7 @@ Review the rendered result after implementation, including a narrow viewport. Di
 
 ### implementer — UI implementation lead
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -727,7 +727,7 @@ Send verifier exact scenarios and the artifact to test, then correct reproducibl
 
 ### verifier — Browser and accessibility checks
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -763,7 +763,7 @@ A threat model and two independent, evidence-focused review lanes.
 
 ### lead — Threat model and triage
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -787,7 +787,7 @@ Keep investigation within the authorized system and use isolated, non-destructiv
 
 ### identity — Identity and state review
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -811,7 +811,7 @@ Send lead each confirmed finding with exact location, attacker preconditions, ob
 
 ### surfaces — Input and output boundary review
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -847,7 +847,7 @@ A change plan, one operator, and independent readiness/rollback checks.
 
 ### lead — Change planning and coordination
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -871,7 +871,7 @@ Coordinate the operator and verifier through the change, keeping the owner infor
 
 ### operator — Deployment and migration operator
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -895,7 +895,7 @@ Send verifier the deployed artifact, endpoints, expected behavior and relevant b
 
 ### verifier — Readiness and recovery verification
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -931,7 +931,7 @@ Separated evidence collection, counterarguments and a final decision brief.
 
 ### lead — Decision framing and synthesis
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -955,7 +955,7 @@ Ask critic to challenge the provisional conclusion before finalizing it. Resolve
 
 ### researcher — Primary-source evidence
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -979,7 +979,7 @@ Send lead the strongest evidence early and flag gaps that could change the resul
 
 ### critic — Counterarguments and source checking
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT
@@ -1015,7 +1015,7 @@ An Astra orchestrator and four Luna workers sharing one broadcast conversation.
 
 ### orchestrator — Main orchestrator
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Machine: Main machine. Directory: optional.
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Machine: Main machine. Directory: optional.
 
 ```text
 WORKING AGREEMENT

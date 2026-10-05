@@ -479,7 +479,7 @@ to new briefings; they do not rewrite running threads or saved launch plans.
 Owner rule (September 28, 2026; `wi_ade4aa60c5d9b55e`): features get a plan and
 a plan review; bugs get a plan only. The Planned delivery template has a
 `plan-reviewer` seat on GPT-6 Astra (`gpt-6-astra`, app `codex`, reasoning
-`high`), a separate session on another model than the GPT-6.1 Sol planner. The
+`high`), a separate session on another model than the Claude Opus planner. The
 shared launch plan used by TailOS **Add team**, `tt team launch` and the queue
 runner reads the item kind from the exact item revision in the prepared context.
 A feature team launches six members with the plan reviewer; a bug team launches
@@ -533,7 +533,7 @@ Planned are in [project-queue.md](project-queue.md#small-change-lane).
 
 The builder and reviewer prompts are the Planned delivery prompts in
 [team-examples.md](team-examples.md), byte for byte. The lead runs on
-`gpt-6.1-sol` (app `codex`) with reasoning `high`; its role is `Small-change lead and verifier`, and its
+`claude-opus-5-5` with reasoning `high`; its role is `Small-change lead and verifier`, and its
 prompt is:
 
 ```text

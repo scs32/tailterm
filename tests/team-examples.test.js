@@ -33,12 +33,12 @@ test("lead and worker prompts teach withdrawal of superseded requests", () => {
   }
 });
 
-test("fresh planned delivery uses a GPT-6.1 Sol lead without reviewer polling", () => {
+test("fresh planned delivery uses a Claude lead without reviewer polling", () => {
   const team = exampleTeam("planned");
   const lead = team.members.find((member) => member.name === "lead");
   const reviewer = team.members.find((member) => member.name === "reviewer");
-  assert.equal(lead.runtime, "codex");
-  assert.equal(lead.model, "gpt-6.1-sol");
+  assert.equal(lead.runtime, "claude");
+  assert.equal(lead.model, "claude-opus-5-5");
   assert.doesNotMatch(reviewer.prompt, /inbox --unread --mark-read --wait|relay cannot wake/i);
   assert.match(reviewer.prompt, /relay can wake your idle Claude session/);
 });
@@ -231,13 +231,13 @@ test("Planned delivery runs the database handler on Sonnet 5.5 and the plan revi
     planned.members.map((m) => [m.name, [m.runtime, m.model, m.reasoning]]),
   );
   assert.deepEqual(seats, {
-    lead: ["codex", "gpt-6.1-sol", "medium"],
-    planner: ["codex", "gpt-6.1-sol", "high"],
+    lead: ["claude", "claude-opus-5-5", "medium"],
+    planner: ["claude", "claude-opus-5-5", "high"],
     "plan-reviewer": ["codex", "gpt-6-astra", "high"],
-    builder: ["codex", "gpt-6.1-sol", "high"],
+    builder: ["claude", "claude-opus-5-5", "high"],
     database: ["claude", "claude-sonnet-5-5", "high"],
-    verifier: ["codex", "gpt-6.1-sol", "high"],
-    reviewer: ["codex", "gpt-6.1-sol", "high"],
+    verifier: ["claude", "claude-opus-5-5", "high"],
+    reviewer: ["claude", "claude-opus-5-5", "high"],
   });
   assert.doesNotMatch(JSON.stringify(planned), /different model family/i);
   const reviewer = planned.members.find((m) => m.name === "reviewer");
@@ -332,7 +332,7 @@ test("queue-only small change reuses Planned seats and stays out of the gallery"
       name,
     );
   const lead = small.members[0];
-  assert.deepEqual([lead.runtime, lead.model, lead.reasoning], ["codex", "gpt-6.1-sol", "high"]);
+  assert.deepEqual([lead.runtime, lead.model, lead.reasoning], ["claude", "claude-opus-5-5", "high"]);
   assert.match(lead.prompt, /Post with tt send/);
   assert.match(lead.prompt, /run tt ack SEQ before you start/);
   assert.match(lead.prompt, /inventory useful long-lived services/);
