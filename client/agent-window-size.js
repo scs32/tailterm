@@ -47,9 +47,10 @@ export function eligibleAgentViewport(s) {
 // claim last set while visible is sent again, then the claim is released.
 // A claim or resize whose reply is lost may have landed and is treated as if it
 // had. A retired claim is kept until the host answers its undo and release: one
-// immediate retry, then error() and another attempt when the pane's state next
-// changes. Every command is conditional on the token, so none of this can
-// overwrite a newer viewer.
+// immediate retry, then error() and another round when the pane's state next
+// changes, three rounds at most. A refusal is an answer: the identity the
+// command was conditional on is gone. Every command is conditional on the
+// token, so none of this can overwrite a newer viewer.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -64,6 +65,7 @@ export function createAgentWindowSizer({
     running = false,
     disposed = false;
   let focusVersion = 0,
+    focusAsked = 0,
     seenFocus = -1,
     wasEligible = false,
     failed = false;
@@ -77,6 +79,7 @@ export function createAgentWindowSizer({
     if (disposed) return;
     if (focus) {
       focusVersion++;
+      focusAsked++;
       failed = false;
     }
     pending = true;
@@ -104,12 +107,14 @@ export function createAgentWindowSizer({
         }
         // Unconfirmed teardowns wait for a focus or lifecycle change, so layout
         // bursts over a dead link do not repeat them.
-        const mark = JSON.stringify([eligible, key, focusVersion, disposed]);
+        const mark = JSON.stringify([eligible, key, focusAsked, disposed]);
         if (owed.length && owedMark !== mark) {
           owedMark = mark;
           const waiting = owed;
           owed = [];
-          for (const c of waiting) if (!(await teardown(c))) owed.push(c);
+          for (const c of waiting)
+            if (!(await teardown(c)) && (c.rounds = (c.rounds || 0) + 1) < 3)
+              owed.push(c);
           pending = true; // recompute after the await; never reuse this snapshot
           continue;
         }
@@ -209,29 +214,36 @@ export function createAgentWindowSizer({
   // Undo what landed after the pane went stale, then drop authority. False
   // while the host has not answered a step; the claim is then kept.
   async function teardown(c) {
-    if (c.undo === "restore") return confirmed({ ...c, ...c.prior }, "restore");
+    if (c.undo === "restore")
+      return !!(await confirmed({ ...c, ...c.prior }, "restore"));
     if (c.undo === "resize") {
       // The same token sends the size it last set while visible, so a newer
       // viewer still wins.
-      if (!(await confirmed({ ...c, ...c.sized }, "resize"))) return false;
+      const undone = await confirmed({ ...c, ...c.sized }, "resize");
+      if (!undone || undone === "refused") return !!undone;
       c.undo = null;
     }
-    return confirmed(c, "release");
+    return !!(await confirmed(c, "release"));
   }
   // One immediate retry; only the last failure is reported. It does not stop
   // the visible pane from claiming again.
   async function confirmed(c, action) {
-    return !!(
-      (await command(c, action, () => {})) || (await command(c, action, error))
+    return (
+      (await command(c, action, () => {}, true)) ||
+      (await command(c, action, error, true))
     );
   }
-  async function command(c, action, report = fail) {
+  async function command(c, action, report = fail, final = false) {
     try {
       const response = (
         await execute(agentWindowSizeCommand({ ...c, action }, c.path))
       ).trim();
-      if (!["sized", "released", "restored", "superseded"].includes(response))
-        throw new Error("Agent pane sizing was refused by the host.");
+      const refused = new Error("Agent pane sizing was refused by the host.");
+      if (final && response === "refused") error(refused);
+      else if (
+        !["sized", "released", "restored", "superseded"].includes(response)
+      )
+        throw refused;
       // Keep a superseded token locally: resize must not reclaim authority.
       return response;
     } catch (e) {

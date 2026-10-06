@@ -1184,18 +1184,18 @@ test("a lost corrective resize is retried at once, then reported and kept for th
       shown.s.visible = shown.s.foreground = true;
       await shown.focus();
       assert.deepEqual(shown.errors, ["transport lost", "transport lost"]);
-      assert.equal(
-        shown.sent.length,
-        11,
-        "two lost passes, inspect, claim, then the old undo and release",
-      );
+      assert.equal(shown.sent.length, 9, "two lost rounds, inspect, claim");
       assert.notEqual(shown.token, first);
-      assert.match(shown.sent[9], /-x 120 -y 34 .*sized/);
-      for (const old of shown.sent.slice(9))
-        assert.ok(old.includes(first), "the old token is superseded");
       assert.equal(shown.state(), "240x59|" + shown.token);
       await shown.focus();
-      assert.equal(shown.sent.length, 14, "release, inspect, claim");
+      assert.equal(
+        shown.sent.length,
+        14,
+        "the old undo and release, then release, inspect, claim",
+      );
+      assert.match(shown.sent[9], /-x 120 -y 34 .*sized/);
+      for (const old of shown.sent.slice(9, 11))
+        assert.ok(old.includes(first), "the old token is superseded");
       assert.equal(shown.state(), "240x59|" + shown.token);
       t.diagnostic(`kept claim, pane shown again -> ${shown.state()}`);
     } finally {
@@ -1203,5 +1203,81 @@ test("a lost corrective resize is retried at once, then reported and kept for th
     }
   } finally {
     await f.cleanup();
+  }
+});
+
+test("a teardown the host refuses or never answers is dropped after a bounded number of rounds", async () => {
+  for (const mode of ["refuses", "never answers"]) {
+    // Hidden pane whose host is gone: focus changes must not repeat forever.
+    let s = valid(),
+      sequence = 0,
+      dead = false;
+    const commands = [],
+      errors = [];
+    const c = createAgentWindowSizer({
+      snapshot: () => s,
+      token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
+      error: (e) => errors.push(e.message),
+      execute: async (command) => {
+        commands.push(command);
+        if (command.includes("ready:")) return "ready::200x50";
+        if (!/resize-window|restored/.test(command) && !dead) return "released";
+        if (!dead || command.includes("@tailterm_size_revision},"))
+          return "sized";
+        if (mode === "refuses") return "refused";
+        throw Error("transport lost");
+      },
+    });
+    c.refresh({ focus: true });
+    await c.settled();
+    assert.equal(commands.length, 2, mode);
+    dead = true;
+    s.visible = false;
+    c.refresh();
+    await c.settled();
+    for (let i = 0; i < 3; i++) {
+      c.refresh({ focus: true });
+      await c.settled();
+    }
+    // One refusal is final; a silent host gets three rounds of two attempts.
+    assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
+    assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
+    for (let i = 0; i < 20; i++) {
+      c.refresh({ focus: true });
+      await c.settled();
+    }
+    assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
+    assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
+
+    // Ten identity changes, each leaving a claim on a target that is gone.
+    s = { ...valid(), connection: 2 };
+    c.refresh({ focus: true });
+    await c.settled();
+    for (let i = 3; i < 13; i++) {
+      s = { ...s, connection: i };
+      const before = commands.length;
+      c.refresh();
+      await c.settled();
+      assert.ok(
+        commands.length - before <= 3 * 2 + 2,
+        mode + ": at most three kept claims are retried per change",
+      );
+    }
+    s.visible = false;
+    for (let i = 0; i < 4; i++) {
+      c.refresh({ focus: true });
+      await c.settled();
+    }
+    const count = commands.length,
+      reported = errors.length;
+    for (let i = 0; i < 20; i++) {
+      c.refresh({ focus: true });
+      await c.settled();
+    }
+    assert.equal(commands.length, count, mode + ": nothing is owed any more");
+    assert.equal(errors.length, reported, mode);
+    c.dispose();
+    await c.settled();
+    assert.equal(commands.length, count, mode);
   }
 });
