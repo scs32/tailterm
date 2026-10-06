@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { probe, hostDeps, waitForTailOSCommit } from "../scripts/release-probe.mjs";
 import { readyWindow, waitForTrueNASReady, sanitizeCapture, TRUENAS_READY_WINDOW_MS } from "../scripts/release-probe.mjs";
@@ -278,8 +279,9 @@ test("H7 every hub and bridge probe command has a run timeout and the worst case
 });
 
 // The real command with fake ssh, go and tt executables first on PATH: no
-// production host is contacted. The poll interval is the real 5 s, so the two
-// waiting runs go side by side.
+// production host is contacted. The command runs on a preloaded clock that
+// only its own sleeps advance, so the poll counts and waits are exact however
+// slowly a poll or a process starts.
 test("H6 the probe command waits for a late hub, captures a hub that never comes up and prints nothing for an unreadable config", async () => {
   const dir = mkdtempSync(join(tmpdir(), "probe-ready-cli-")), bin = join(dir, "bin"), node = "#!" + process.execPath + "\n";
   mkdirSync(bin);
@@ -288,9 +290,11 @@ test("H6 the probe command waits for a late hub, captures a hub that never comes
   exe("go", `console.log("x: go1.25\\n\\tbuild\\tvcs.revision=${commit}\\n\\tbuild\\tvcs.modified=false");`);
   // Fails PROBE_TT_FAILS times, counting its calls in PROBE_TT_COUNT, then succeeds.
   exe("tt", `const fs=require("fs"),f=process.env.PROBE_TT_COUNT,n=Number(fs.existsSync(f)?fs.readFileSync(f,"utf8"):0)+1;fs.writeFileSync(f,String(n));console.error("${SECRET}");process.exit(n>Number(process.env.PROBE_TT_FAILS)?0:1);`);
+  const clock = join(dir, "clock.mjs");
+  writeFileSync(clock, "let t = Date.now(); Date.now = () => t; globalThis.setTimeout = (fn, ms = 0, ...args) => { t += ms; return setImmediate(fn, ...args); };\n");
   const run = (name, windowMs, fails) => new Promise((done, fail) => {
     const cfg = join(dir, name + ".json"); writeFileSync(cfg, JSON.stringify({ tt: join(bin, "tt"), targets: { hub: { host: "truenas", readyWindowMs: windowMs } }, secret: SECRET }));
-    const child = spawn(process.execPath, ["scripts/release-probe.mjs", "live", "hub", "--config", cfg], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PATH: bin + ":" + process.env.PATH, PROBE_TT_COUNT: join(dir, name + ".count"), PROBE_TT_FAILS: String(fails) } });
+    const child = spawn(process.execPath, ["--import", pathToFileURL(clock).href, "scripts/release-probe.mjs", "live", "hub", "--config", cfg], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PATH: bin + ":" + process.env.PATH, PROBE_TT_COUNT: join(dir, name + ".count"), PROBE_TT_FAILS: String(fails) } });
     let stdout = "", stderr = ""; child.stdout.on("data", d => { stdout += d; }); child.stderr.on("data", d => { stderr += d; });
     child.on("error", fail); child.on("close", status => done({ status, stdout, stderr }));
   });
@@ -298,11 +302,10 @@ test("H6 the probe command waits for a late hub, captures a hub that never comes
   for (const r of [late, never]) { assert.equal(r.status, 0); assert.equal(r.stderr, ""); assert.equal(r.stdout.trim().split("\n").length, 1); assert.ok(!r.stdout.includes("SYNTHETIC")); }
   const up3 = JSON.parse(late.stdout);
   assert.equal(up3.hubResponds, true); assert.equal(up3.containersRunning, true); assert.equal(up3.commit, commit); assert.equal(up3.polls, 3);
-  // Two real 5 s sleeps plus three polls: just over 10 s here. The upper bound
-  // leaves room for slow process starts on a busy host.
-  assert.ok(up3.waitedMs >= 10000 && up3.waitedMs < 20000, `waitedMs ${up3.waitedMs}`); assert.ok(!("capture" in up3));
+  // Two 5 s sleeps between three polls.
+  assert.equal(up3.waitedMs, 10000); assert.ok(!("capture" in up3));
   const down = JSON.parse(never.stdout);
-  assert.equal(down.hubResponds, false); assert.equal(down.containersRunning, true); assert.equal(down.polls, 2); assert.ok(down.waitedMs >= 1000);
+  assert.equal(down.hubResponds, false); assert.equal(down.containersRunning, true); assert.equal(down.polls, 2); assert.equal(down.waitedMs, 1000);
   assert.deepEqual(down.capture, { app: { state: "RUNNING", containers: [{ service: "hub", state: "running", id: "1".repeat(12) }, { service: "discord-bridge", state: "running", id: "2".repeat(12) }] }, logs: [{ service: "hub", unavailable: "log read failed" }, { service: "discord-bridge", unavailable: "log read failed" }] });
   writeFileSync(join(dir, "broken.json"), "{ not json " + SECRET);
   for (const cfg of [join(dir, "missing.json"), join(dir, "broken.json")]) {
