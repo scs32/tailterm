@@ -267,20 +267,49 @@ async function writeCustom(page, seq, text) {
   await customChoice(page, seq).check();
   await custom(page, seq).fill(text);
 }
+// A Board render replaces the whole panel. locator.evaluate resolves its element
+// and evaluates it in separate round trips, so a render in between leaves it on
+// the detached one (wi_1b62e79fc4488c03). These read the rendered element in one
+// in-page step; an action that depends on such a read is polled together with it.
+const historyOpen = (page, seq) => page.evaluate(seq => {
+  const history = seq === undefined ? document.querySelector(".decision-history")
+    : document.querySelector(`[data-decision-request="${seq}"]`)?.closest("details");
+  return history ? history.open : null;
+}, seq);
+const optionState = (page, seq, id) => page.evaluate(([seq, id]) => {
+  const el = document.querySelector(`[data-decision-request="${seq}"] [data-decision-option="${id}"]`);
+  return el && { checkable: el.matches('input[type="radio"],input[type="checkbox"]'),
+    chosen: el.checked === true || el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-pressed") === "true" };
+}, [seq, id]);
 async function visibleAnswer(page, seq, text) {
   await expect(answerView(page, seq)).toContainText(text);
-  const history = card(page, seq).locator("xpath=ancestor::details[1]");
-  if (await history.count() && !(await history.evaluate(el => el.open)))
-    await history.locator("summary").click();
-  await expect(answerView(page, seq)).toBeVisible();
+  await expect(async () => {
+    if ((await historyOpen(page, seq)) === false)
+      await card(page, seq).locator("xpath=ancestor::details[1]").locator("summary").click({ timeout: 2000 });
+    await expect(answerView(page, seq)).toBeVisible({ timeout: 2000 });
+  }).toPass({ timeout: 7000 });
 }
 async function choose(page, seq, id) {
   const control = option(page, seq, id);
-  if (await control.evaluate(el => el.matches('input[type="radio"],input[type="checkbox"]'))) await control.check();
-  else await control.click();
+  let state;
+  await expect.poll(async () => (state = await optionState(page, seq, id))).toBeTruthy();
+  if (!state.checkable) { await control.click(); return; }
+  // check() compares the state before and after its click on one resolved
+  // element; confirm the choice on the rendered one instead.
+  await expect(async () => {
+    await control.check({ timeout: 2000 });
+    assert.equal((await optionState(page, seq, id))?.chosen, true, `option ${id} must be chosen on the rendered card`);
+  }).toPass({ timeout: 7000 });
 }
 async function selected(page, seq, id) {
-  await expect.poll(() => option(page, seq, id).evaluate(el => el.checked === true || el.getAttribute("aria-checked") === "true" || el.getAttribute("aria-pressed") === "true")).toBe(true);
+  await expect.poll(async () => (await optionState(page, seq, id))?.chosen).toBe(true);
+}
+// fill() selects the field and inserts the text in separate steps.
+async function fillDraft(field, text) {
+  await expect(async () => {
+    await field.fill(text, { timeout: 2000 });
+    await expect(field).toHaveValue(text, { timeout: 2000 });
+  }).toPass({ timeout: 7000 });
 }
 async function snapshotReads(p) { return { decisions: await records(p), messages: await messages(p) }; }
 function answerAttempts(p, seq) {
@@ -446,22 +475,25 @@ try {
     });
     await check(`${name}: offline failure retains selection/draft through refresh and navigation without replay`, async () => {
       const q = questions.offline, text = "Wait for the synthetic network to return.";
-      const history = page.locator(".decision-history"), panel = page.locator("#board-decisions");
-      if (!(await history.evaluate(el => el.open))) await history.locator("summary").click();
+      await expect(async () => {
+        if (!(await historyOpen(page))) await page.locator(".decision-history summary").click({ timeout: 2000 });
+        assert.equal(await historyOpen(page), true, "answered history must be open before the reload");
+      }).toPass({ timeout: 7000 });
       await page.locator("#board-text").focus();
-      // Keep the value from the read that passed: a second locator read can land on
-      // a panel detached by a background render and see 0 (wi_a9a69169f732121d).
+      // Keep the value from the read that passed: a second read can follow a
+      // background render (wi_a9a69169f732121d).
       let scroll = 0;
-      await expect.poll(async () => (scroll = await panel.evaluate(el => {
+      await expect.poll(async () => (scroll = await page.evaluate(() => {
+        const el = document.querySelector("#board-decisions");
         el.scrollTop = Math.min(180, el.scrollHeight - el.clientHeight); return el.scrollTop;
       }))).toBeGreaterThan(0);
       assert.ok(scroll > 0, "fixture must exercise a scrollable decision panel");
       await page.evaluate(() => qa.board.reload());
-      await expect.poll(() => history.evaluate(el => el.open)).toBe(true);
-      await expect.poll(() => panel.evaluate(el => el.scrollTop)).toBe(scroll);
+      await expect.poll(() => historyOpen(page)).toBe(true);
+      await expect.poll(() => page.evaluate(() => document.querySelector("#board-decisions")?.scrollTop)).toBe(scroll);
       await page.evaluate(id => qa.show(id), other.task.id);
       await page.evaluate(id => qa.show(id), p.task.id);
-      await choose(page, q.seq, "defer"); await explanation(page, q.seq).fill(text);
+      await choose(page, q.seq, "defer"); await fillDraft(explanation(page, q.seq), text);
       await page.evaluate(() => qa.online(false));
       await expect(page.locator(".hub-sync-status")).toContainText(/offline/i);
       if (await submit(page, q.seq).isEnabled()) {
