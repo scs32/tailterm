@@ -13,7 +13,7 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
 | Primary database handler | `database_handler` | one primary per project | persistent; [rotated](handler-rotation.md) | all work-item records: filing, work orders, scope confirmation, completion and acceptance records; readiness passes |
 | Lane database handlers | `database_handler` (auxiliary) | as many as parallel lanes | persistent; leased to one queue entry at a time | the records of the one item leased to their exact run |
 | Deployment agent | `deployment_agent` | one per project | persistent | consuming release jobs after project activation |
-| Item team | ordinary agents bound to the item | one team per item | fresh identities per item; closed with `tt close --team` | planning, implementation, review and verification of one bug or feature |
+| Item team | ordinary agents bound to the item | one team per item | fresh identities per item; closed with `tt close --team`, or with `--reason` [while the item stays open](#closing-a-team-while-its-item-stays-open) | planning, implementation, review and verification of one bug or feature |
 
 ## Boundaries
 
@@ -43,6 +43,39 @@ roles (September 29), and the backlog steward (`wi_5b4b94dbc9a11e8b`, order
   Planned delivery template), plus a plan reviewer on another model for a
   feature. A bug team has no plan reviewer. Each session serves exactly one item; a new item
   gets fresh identities. See [Team examples](team-examples.md).
+
+## Closing a team while its item stays open
+
+`tt close --team` closes the team of a done or dismissed item. A team whose
+item is still open closes only with a reason (`wi_3c3ebbbeeaa2fd4f`):
+
+    tt close --team --reason findings-only
+    tt close --team --reason owner-hold
+
+- **`findings-only`**: a diagnosis or investigation order that ends with
+  findings and no commit. The item stays open for a separate fix order.
+- **`owner-hold`**: the owner pauses the work, and the team should not keep its
+  queue slot while it waits.
+
+The item's exact lead runs it, or the owner with `--task` and, when several
+teams share the project, `--item`. The checks are those of an ordinary team
+close: the exact lead, run and revision, an open and active project, the
+current member snapshot and no open team obligations. Without a reason the
+close is refused as before, and a reason on a done or dismissed item is
+refused too.
+
+The close does not change the item: its status and revision stay as they were.
+It records the same close receipt, with the reason, and the same per-member
+cleanup receipts. The team's queue entry ends as `failed` with
+`Team closed with the item open: REASON`, never `finished`, and no owner
+escalation is posted. It is then released like any failed entry, which frees
+its slot, handler lease and owned paths: the runner does it in a parallel
+queue once cleanup receipts exist, and in a serial queue the owner runs
+`tt team queue release --entry tqe_ID`.
+
+A later order on the same item is `tt team queue requeue --entry tqe_ID`. It
+adds a new entry, attempt 2, and launches a fresh team with new identities;
+the closed entry stays as history.
 
 ## Questions
 

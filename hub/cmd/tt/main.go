@@ -1500,14 +1500,18 @@ func cmdClose(e env, args []string) error {
 	fs := flag.NewFlagSet("close", flag.ExitOnError)
 	task := fs.String("task", e.task, "task id")
 	jsonOut := fs.Bool("json", false, "JSON result")
-	team := fs.Bool("team", false, "close the terminal item's team and lead")
+	team := fs.Bool("team", false, "close the item's team and lead; the item must be done or dismissed unless --reason is given")
 	item := fs.String("item", "", "exact item to close when several teams share a project")
+	reason := fs.String("reason", "", "with --team, close a team whose item stays open: owner-hold or findings-only")
 	_ = fs.Parse(args)
 	if *team {
 		if fs.NArg() != 0 || *task == "" || (e.agent == "" && !flagPresent(args, "task")) {
-			return errors.New("usage: tt close --team [--task ID] (owner must supply --task)")
+			return errors.New("usage: tt close --team [--task ID] [--reason owner-hold|findings-only] (owner must supply --task)")
 		}
-		return cmdCloseTeam(e, *task, *item, *jsonOut)
+		return cmdCloseTeam(e, *task, *item, *reason, *jsonOut)
+	}
+	if flagPresent(args, "reason") {
+		return errors.New("--reason applies only to tt close --team")
 	}
 	ref := e.agent
 	if fs.NArg() > 0 {

@@ -23,7 +23,8 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	var zero api.TeamCloseResult
 	if !api.ValidID(taskID, "tsk") || !validRequestID(req.RequestID) || !api.ValidID(req.LeadAgentID, "agt") || !validRunID(req.LeadRunID) ||
 		!api.ValidID(req.ItemID, "wi") || req.ItemRevision < 1 || req.LeadRevision < 0 || len(req.Members) == 0 || len(req.Members) > 500 ||
-		(req.ActorAgentID == "") != (req.ActorRunID == "") || (req.ActorAgentID != "" && (!api.ValidID(req.ActorAgentID, "agt") || !validRunID(req.ActorRunID))) {
+		(req.ActorAgentID == "") != (req.ActorRunID == "") || (req.ActorAgentID != "" && (!api.ValidID(req.ActorAgentID, "agt") || !validRunID(req.ActorRunID))) ||
+		(req.Reason != "" && !api.ValidTeamCloseReason(req.Reason)) {
 		return zero, api.ErrInvalid
 	}
 	encoded, err := json.Marshal(req)
@@ -64,8 +65,14 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	if err != nil {
 		return zero, err
 	}
-	if item.Revision < req.ItemRevision || (item.Status != "done" && item.Status != "dismissed") {
+	terminal := item.Status == "done" || item.Status == "dismissed"
+	// A reason closes the team of an open item and nothing else, so a receipt's
+	// reason always means the item stayed open.
+	if item.Revision < req.ItemRevision || (!terminal && req.Reason == "") {
 		return zero, fmt.Errorf("%w: item is not terminal at the selected revision", api.ErrConflict)
+	}
+	if terminal && req.Reason != "" {
+		return zero, fmt.Errorf("%w: item is terminal; close its team without a reason", api.ErrConflict)
 	}
 	agents, err := s.ListAgents(ctx, taskID)
 	if err != nil {
@@ -124,7 +131,7 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 			return zero, &api.TeamCloseWaitError{Code: "team-close-obligations", Text: "open team obligations: " + strings.Join(open, "; ")}
 		}
 	}
-	result := api.TeamCloseResult{TaskID: taskID, ItemID: item.ID, LeadAgentID: lead.ID}
+	result := api.TeamCloseResult{TaskID: taskID, ItemID: item.ID, LeadAgentID: lead.ID, Reason: req.Reason}
 	for _, m := range actual {
 		if m.AgentID != lead.ID {
 			result.Members = append(result.Members, m)
@@ -188,6 +195,11 @@ func (s *Store) CloseItemTeam(ctx context.Context, taskID string, req api.TeamCl
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,?,?,?,?,?)`, taskID, "task_updated", "", task.Name, "", by.Node, by.User, now); err != nil {
 		return zero, err
+	}
+	if req.Reason != "" {
+		if err := failQueueEntryForOpenClose(ctx, tx, taskID, req.ItemID, req.Reason, now); err != nil {
+			return zero, err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO team_close_receipts(task_id,request_id,payload_hash,result_json,created_at) VALUES (?,?,?,?,?)`, taskID, req.RequestID, hash, string(resultJSON), now); err != nil {
 		return zero, err

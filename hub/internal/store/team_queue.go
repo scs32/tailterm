@@ -391,6 +391,17 @@ func liveItemRuns(ctx context.Context, q queryRower, task, item string) (int, er
 	return live, err
 }
 
+// failQueueEntryForOpenClose ends the running entry of an item whose team was
+// closed with the item open. The entry fails with the close reason and keeps
+// its reservation, so the ordinary release frees it once cleanup receipts
+// exist and a requeue starts the later order's team. Nothing went wrong, so
+// no owner escalation is posted. A team without a queue entry matches no row.
+func failQueueEntryForOpenClose(ctx context.Context, tx *sql.Tx, task, item, reason, now string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE team_queue_entries SET state='failed',failure=?,revision=revision+1,updated_at=? WHERE task_id=? AND item_id=? AND state='running' AND released_at=''`,
+		"Team closed with the item open: "+reason, now, task, item)
+	return err
+}
+
 func validTeamQueueID(id string) bool {
 	if !strings.HasPrefix(id, "tqe_") || len(id) != 20 {
 		return false

@@ -103,7 +103,15 @@ func closeTeamSnapshotWithLead(task api.Task, agents []api.Agent, actorAgent, ac
 	return req, nil
 }
 
-func cmdCloseTeam(e env, taskID, itemID string, jsonOut bool) error {
+// teamCloseReasonUsage names the reasons that close a team whose item is open.
+const teamCloseReasonUsage = "usage: tt close --team --reason " + api.TeamCloseReasonOwnerHold + "|" + api.TeamCloseReasonFindingsOnly
+
+// cmdCloseTeam closes an item team. An empty reason closes the team of a done
+// or dismissed item; a reason closes one whose item stays open.
+func cmdCloseTeam(e env, taskID, itemID, reason string, jsonOut bool) error {
+	if reason != "" && !api.ValidTeamCloseReason(reason) {
+		return errors.New(teamCloseReasonUsage)
+	}
 	if !api.ValidID(taskID, "tsk") || (e.agent != "" && e.task != taskID) {
 		return errors.New("invalid or mismatched team close project")
 	}
@@ -151,11 +159,15 @@ func cmdCloseTeam(e env, taskID, itemID string, jsonOut bool) error {
 		if req.ActorAgentID != e.agent || req.ActorRunID != e.runID {
 			return errors.New("saved team close retry belongs to a different exact actor run")
 		}
+		if req.Reason != reason {
+			return errors.New("saved team close retry has a different reason")
+		}
 	} else {
 		req, err = closeTeamSnapshotForItem(detail.Task, detail.Agents, e.agent, e.runID, itemID)
 		if err != nil {
 			return err
 		}
+		req.Reason = reason
 		if err := writePrivateJSON(pending, req); err != nil {
 			return fmt.Errorf("save team close retry: %w", err)
 		}
@@ -192,7 +204,12 @@ func cmdCloseTeam(e env, taskID, itemID string, jsonOut bool) error {
 	if jsonOut {
 		printJSON(result)
 	} else {
-		fmt.Printf("Recorded team close for %s; project remains open.\n", result.ItemID)
+		if result.Reason != "" {
+			fmt.Printf("Recorded team close for %s (%s); the item stays open.\n", result.ItemID, result.Reason)
+			fmt.Println("Its queue entry failed with that reason: a serial queue needs tt team queue release, and a later order is tt team queue requeue.")
+		} else {
+			fmt.Printf("Recorded team close for %s; project remains open.\n", result.ItemID)
+		}
 		if len(remote) != 0 {
 			fmt.Printf("Remote cleanup pending: %s\n", strings.Join(remote, ", "))
 		}

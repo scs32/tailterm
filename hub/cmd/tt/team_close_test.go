@@ -262,3 +262,116 @@ func TestTeamCloseCleansLocalWorkerBeforeLead(t *testing.T) {
 		}
 	}
 }
+
+// a7: tt close --team --reason closes the team of an open item through a real
+// fixture hub. Without a reason the refusal is unchanged, and a reason outside
+// the supported two is refused before anything is sent.
+func TestTeamCloseReasonClosesOpenItemTeam(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	hub := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
+	var closes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-close") {
+			closes.Add(1)
+		}
+		hub.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	c, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: "Open close", Orchestrator: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Diagnosis fixture", RequestID: "fixture-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Bounded diagnosis order", RequestID: "fixture-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlerAgent, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Session: "db-handler", Role: api.AgentRoleDatabaseHandler, Runtime: "generic", Host: "fixture", Cwd: "/fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmCLIFixtureOrder(t, c, task.ID, item.ID, order.Seq, handlerAgent)
+	add := func(name string) api.Agent {
+		a, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, Host: "remote-fixture", Session: name, Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, WorkOrderMessage: api.MessageReference{TaskID: task.ID, Seq: order.Seq}, ContextBundle: teamCloseCLIContext(t, item, order)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	lead, worker := add("lead"), add("worker")
+	e := env{hub: srv.URL}
+	unchanged := func(step string) {
+		t.Helper()
+		detail, err := c.GetTask(ctx, task.ID)
+		if err != nil || detail.Task.Orchestrator != "lead" {
+			t.Fatalf("%s changed the project: %+v %v", step, detail.Task, err)
+		}
+		for _, id := range []string{lead.ID, worker.ID} {
+			if a, err := c.GetAgent(ctx, task.ID, id); err != nil || a.Status == api.AgentClosed {
+				t.Fatalf("%s closed %s: %v", step, a.Name, err)
+			}
+		}
+	}
+
+	if err := cmdClose(e, []string{"--team", "--task", task.ID, "--reason", "bogus"}); err == nil || err.Error() != "usage: tt close --team --reason owner-hold|findings-only" {
+		t.Fatalf("unknown reason: %v", err)
+	}
+	if closes.Load() != 0 {
+		t.Fatalf("an unknown reason sent %d team close requests", closes.Load())
+	}
+	unchanged("an unknown reason")
+	if err := cmdClose(e, []string{"--reason", "findings-only", lead.ID}); err == nil || !strings.Contains(err.Error(), "--reason") || closes.Load() != 0 {
+		t.Fatalf("reason without --team: %v after %d requests", err, closes.Load())
+	}
+	unchanged("a reason without --team")
+
+	// Without a reason the hub refuses as it always has.
+	if err := cmdClose(e, []string{"--team", "--task", task.ID}); err == nil || !strings.Contains(err.Error(), "item is not terminal at the selected revision") {
+		t.Fatalf("open item without a reason: %v", err)
+	}
+	if closes.Load() != 1 {
+		t.Fatalf("team close requests after the refusal: %d", closes.Load())
+	}
+	unchanged("a close without a reason")
+
+	out, err := captureCLIOutput(t, func() error {
+		return cmdClose(e, []string{"--team", "--task", task.ID, "--reason", "findings-only"})
+	})
+	if err != nil {
+		t.Fatalf("close with a reason: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Recorded team close for "+item.ID+" (findings-only); the item stays open.") || !strings.Contains(out, "tt team queue release") || !strings.Contains(out, "tt team queue requeue") {
+		t.Fatalf("output %q", out)
+	}
+	detail, err := c.GetTask(ctx, task.ID)
+	if err != nil || detail.Task.Status != api.TaskOpen || detail.Task.Orchestrator != "" {
+		t.Fatalf("task %+v %v", detail.Task, err)
+	}
+	for _, id := range []string{lead.ID, worker.ID} {
+		if a, err := c.GetAgent(ctx, task.ID, id); err != nil || a.Status != api.AgentClosed {
+			t.Fatalf("member %+v %v", a, err)
+		}
+	}
+	after, err := c.GetWorkItem(ctx, task.ID, item.ID)
+	if err != nil || after.Status != "open" || after.Revision != item.Revision {
+		t.Fatalf("item %+v %v", after, err)
+	}
+	receipt, err := c.GetTeamCloseReceipt(ctx, task.ID, "team-close-"+task.ID+"-"+lead.RunID)
+	if err != nil || receipt.Reason != "findings-only" || receipt.LeadAgentID != lead.ID {
+		t.Fatalf("receipt %+v %v", receipt, err)
+	}
+}

@@ -10,6 +10,20 @@ type TeamCloseMember struct {
 	Status  string `json:"status"`
 }
 
+// A team close with a reason ends a team whose item stays open: an owner hold,
+// or a diagnosis order that produced findings and no commit. A close without
+// a reason requires a done or dismissed item.
+const (
+	TeamCloseReasonOwnerHold    = "owner-hold"
+	TeamCloseReasonFindingsOnly = "findings-only"
+)
+
+// ValidTeamCloseReason reports whether reason permits closing a team whose
+// item is open.
+func ValidTeamCloseReason(reason string) bool {
+	return reason == TeamCloseReasonOwnerHold || reason == TeamCloseReasonFindingsOnly
+}
+
 type TeamCloseRequest struct {
 	RequestID    string            `json:"requestId"`
 	ActorAgentID string            `json:"actorAgentId,omitempty"`
@@ -20,6 +34,9 @@ type TeamCloseRequest struct {
 	ItemID       string            `json:"itemId"`
 	ItemRevision int64             `json:"itemRevision"`
 	Members      []TeamCloseMember `json:"members"`
+	// Reason is empty for a terminal item's close, so existing requests keep
+	// their payload hash.
+	Reason string `json:"reason,omitempty"`
 }
 
 type TeamCloseResult struct {
@@ -27,4 +44,5 @@ type TeamCloseResult struct {
 	ItemID      string            `json:"itemId"`
 	LeadAgentID string            `json:"leadAgentId"`
 	Members     []TeamCloseMember `json:"members"`
+	Reason      string            `json:"reason,omitempty"`
 }
