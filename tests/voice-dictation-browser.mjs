@@ -10,16 +10,17 @@ export async function mockSpeechWorker(context) {
 }
 export async function exerciseVoiceDictation(page, getInput) {
   await page.evaluate(() => {
-    const original = navigator.mediaDevices.getUserMedia.bind(
-      navigator.mediaDevices,
-    );
+    // Patch the prototype: WebKit can collect and recreate the
+    // navigator.mediaDevices wrapper, which drops an own-property override.
+    const devices = Object.getPrototypeOf(navigator.mediaDevices);
+    const original = devices.getUserMedia;
     window.__speechTracks = [];
     window.__speechRequests = 0;
-    navigator.mediaDevices.getUserMedia = async (...args) => {
+    devices.getUserMedia = async function (...args) {
       window.__speechRequests++;
       if (window.__denySpeech)
         throw new DOMException("Denied", "NotAllowedError");
-      const stream = await original(...args);
+      const stream = await original.apply(this, args);
       window.__speechTracks.push(...stream.getTracks());
       return stream;
     };
