@@ -486,7 +486,11 @@ restart aimed at and which digest it came from. When it then finds itself
 `current` it posts "Deployer now runs the published scripts".
 
 **Refuse reasons and recovery.** A refusal is decided again at every poll, so
-one whose cause is removed clears by itself; the last two below do not.
+one whose cause is removed clears by itself, with three exceptions.
+`loaded-unreadable` never clears in the same process, because the loaded
+digest is read only once, as the process starts. `exec-failed` and
+`restart-did-not-refresh` hold for as long as the published digest stays the
+same.
 
 | Reason                    | Meaning                                                                                                                   | Operator action                                                                                     |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -509,7 +513,9 @@ directory, mode 0600: `agentId`, `runId`, `pid`, `startedAt`, `checkedAt`,
 `current` (the published `commit`, `digest` and `files`; null when unreadable),
 `changed` (the watched files that differ) and `restartedFrom` after a restart.
 It is rewritten only when something other than `checkedAt` changes, so
-`checkedAt` is when the current state was first seen.
+`checkedAt` is when the current state was first seen. Each release job's
+journal also records, in `code`, the `loaded` and `current` digests of the
+runner that last ran it.
 
 The Board gets one notice per state, loaded digest and published digest. Only
 12-character prefixes of the digests and the commit, names from the watched
