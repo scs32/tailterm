@@ -575,6 +575,21 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
       } catch {}
     rmSync(dir, { recursive: true, force: true });
   });
+  // A server exits with its last session, and the next new-session can reach
+  // the dying socket ("server exited unexpectedly"). Keep both alive instead.
+  for (const socket of ["target", "viewer"])
+    run(socket, "start-server", ";", "set-option", "-g", "exit-empty", "off");
+  // tmux stops expanding a format after 100 ms and leaves the rest empty, still
+  // exiting 0, so a loaded host can cut a reading short. Read until complete.
+  const whole = (shape, ...args) => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const value = target(...args);
+      if (value.split("\n").every((line) => shape.test(line))) return value;
+      assert.ok(Date.now() < deadline, `incomplete tmux reading: ${value}`);
+      execFileSync("sleep", ["0.05"]);
+    }
+  };
   const binding = attachOptions(taskBinding(TASK, helperFixture));
   const tag = binding.helperBinding;
   target(
@@ -596,7 +611,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
     }).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     "sleep 120",
   );
-  const [id, created, windowId] = target(
+  const [id, created, windowId] = whole(
+    /^\$\d+\|\d+\|@\d+$/,
     "display-message",
     "-p",
     "-t",
@@ -606,7 +622,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
   const identity = { id, created };
   const window = id + ":" + windowId;
   const dimensions = () =>
-    target(
+    whole(
+      /^\d+x\d+$/,
       "display-message",
       "-p",
       "-t",
@@ -682,7 +699,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
   target("set-option", "-w", "-t", id + ":sentinel", "window-size", "manual");
   target("set-option", "-w", "-t", "unrelated:", "window-size", "manual");
   const sentinels = () => [
-    target(
+    whole(
+      /^@\d+\|[a-z]+\|\d+x\d+$/,
       "list-windows",
       "-t",
       id,
@@ -691,7 +709,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
     )
       .split("\n")
       .filter((line) => !line.startsWith(windowId + "|")),
-    target(
+    whole(
+      /^[a-z]+\|\d+x\d+$/,
       "display-message",
       "-p",
       "-t",
@@ -815,7 +834,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
   target("link-window", "-d", "-s", window, "-t", "unrelated:");
   // Linked-window guard: record the linked manual state, not the new unrelated link.
   manual();
-  const linkedBefore = target(
+  const linkedBefore = whole(
+    /^@\d+\|[a-z]+\|\d+x\d+$/,
     "list-windows",
     "-t",
     "unrelated",
@@ -831,7 +851,8 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
   assert.match(result.stderr, /linked/);
   assert.equal(dimensions(), "200x50");
   assert.equal(
-    target(
+    whole(
+      /^@\d+\|[a-z]+\|\d+x\d+$/,
       "list-windows",
       "-t",
       "unrelated",
