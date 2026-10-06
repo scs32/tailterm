@@ -23,14 +23,30 @@ import (
 // TestMain drops TAILTERM_* variables inherited from the shell, so the suite
 // behaves the same when a Tailterm-launched agent runs it (a reviewer's
 // TAILTERM_REASONING would otherwise leak into spawn defaults).
+//
+// It also raises minCommandTimeout to testCommandTimeout for the whole
+// package, after saving the value the binary ships with. A test that needs
+// the shipped deadlines sets minCommandTimeout back for its own duration.
 func TestMain(m *testing.M) {
 	for _, kv := range os.Environ() {
 		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "TAILTERM_") {
 			os.Unsetenv(name)
 		}
 	}
+	productionMinCommandTimeout = minCommandTimeout
+	minCommandTimeout = testCommandTimeout
 	os.Exit(m.Run())
 }
+
+// testCommandTimeout is the floor the package's tests put under the CLI's
+// fixed command deadlines. Under full-matrix load one loopback request to a
+// trivial test hub has outlasted the 10 s a command asks for
+// (wi_5e804f501074629f, wi_a19eb9be318f557e).
+const testCommandTimeout = 60 * time.Second
+
+// productionMinCommandTimeout is minCommandTimeout as the binary ships it,
+// read by TestMain before the package floor replaces it.
+var productionMinCommandTimeout time.Duration
 
 func TestInboxWaitFindsDirectedMessageBehindSelfSentPage(t *testing.T) {
 	h := newInboxHub(t)

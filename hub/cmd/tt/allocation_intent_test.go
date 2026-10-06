@@ -107,9 +107,14 @@ func raiseCommandTimeout(t *testing.T) {
 }
 
 func TestCommandTimeoutFloor(t *testing.T) {
-	if minCommandTimeout != 0 {
-		t.Fatalf("default minCommandTimeout = %v, want 0", minCommandTimeout)
+	if productionMinCommandTimeout != 0 {
+		t.Fatalf("default minCommandTimeout = %v, want 0", productionMinCommandTimeout)
 	}
+	// TestMain raised the floor for the package; check the shipped deadlines
+	// without it.
+	previous := minCommandTimeout
+	minCommandTimeout = productionMinCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
 	check := func(requested, want time.Duration) {
 		t.Helper()
 		c, err := env{hub: "http://127.0.0.1:1"}.client(requested)
