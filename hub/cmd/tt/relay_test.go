@@ -1119,3 +1119,225 @@ func TestRelayCodexOwnerHelperWakeRoutes(t *testing.T) {
 		})
 	}
 }
+
+// rotationLoopFixture runs the relay loop against a local hub with one bound
+// agent, away from the live hub, relay state, config and tmux socket. It
+// counts the team queue polls and the bound agent's wake-pass reads.
+type rotationLoopFixture struct {
+	queuePolls, agentReads atomic.Int32
+}
+
+func newRotationLoopFixture(t *testing.T, handler, steward func(context.Context) error, pause func() bool) *rotationLoopFixture {
+	t.Helper()
+	f := &rotationLoopFixture{}
+	stateDir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", stateDir)
+	t.Setenv("TT_TMUX_SOCKET", "relay-rotation-test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	for _, name := range []string{"TAILTERM_TOKEN", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN"} {
+		t.Setenv(name, "")
+	}
+	b := runtimeBinding{Task: "tsk_0000000000000001", Agent: "agt_0000000000000001", Run: "run_0000000000000001", Thread: "00000000-0000-4000-8000-000000000001", Codex: filepath.Join(stateDir, "fake-codex")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/team-queues":
+			f.queuePolls.Add(1)
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+		case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/agents/"):
+			f.agentReads.Add(1)
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: true, Unread: 0})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	b.Hub = server.URL
+	t.Setenv("TAILTERM_HUB", server.URL)
+	if err := writePrivateJSON(filepath.Join(stateDir, bindingKey(b)+".binding.json"), b); err != nil {
+		t.Fatal(err)
+	}
+	oldHandler, oldSteward, oldPause := relayHandlerRotation, relayStewardRotation, relayLoopPause
+	t.Cleanup(func() { relayHandlerRotation, relayStewardRotation, relayLoopPause = oldHandler, oldSteward, oldPause })
+	relayHandlerRotation, relayStewardRotation, relayLoopPause = handler, steward, pause
+	return f
+}
+
+func TestRelayLoopWakesWhileRotationTickBlocks(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	var mu sync.Mutex
+	var order []string
+	var enteredAt time.Time
+	record := func(name string) {
+		mu.Lock()
+		order = append(order, name)
+		mu.Unlock()
+	}
+	// The handler tick holds its whole two-minute budget unless released.
+	handler := func(ctx context.Context) error {
+		record("handler")
+		mu.Lock()
+		first := enteredAt.IsZero()
+		if first {
+			enteredAt = time.Now()
+		}
+		mu.Unlock()
+		if !first {
+			return nil
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+	steward := func(context.Context) error { record("steward"); return nil }
+	var f *rotationLoopFixture
+	var passes int
+	var readsWhenBlocked, readsAfter int32
+	var wakeDelay time.Duration
+	pause := func() bool {
+		passes++
+		switch passes {
+		case 1:
+			// The pass started during the first loop pass; the tick now blocks.
+			select {
+			case <-entered:
+			case <-time.After(15 * time.Second):
+				t.Error("rotation tick never started")
+				return false
+			}
+			readsWhenBlocked = f.agentReads.Load()
+			return true
+		case 2, 3:
+			return true
+		}
+		// Three more full passes ran while the tick was still blocked.
+		mu.Lock()
+		wakeDelay = time.Since(enteredAt)
+		mu.Unlock()
+		readsAfter = f.agentReads.Load()
+		mu.Lock()
+		if got := strings.Join(order, ","); got != "handler" {
+			t.Errorf("ticks while the handler tick blocks = %q, want one handler tick", got)
+		}
+		mu.Unlock()
+		unblock()
+		return false
+	}
+	f = newRotationLoopFixture(t, handler, steward, pause)
+	if err := cmdRelay(nil); err != nil {
+		t.Fatal(err)
+	}
+	if readsAfter <= readsWhenBlocked {
+		t.Fatalf("no wake pass read the agent while rotation blocked: %d then %d", readsWhenBlocked, readsAfter)
+	}
+	if wakeDelay > 15*time.Second {
+		t.Fatalf("wake passes took %s behind a blocked rotation tick, want at most 15s", wakeDelay)
+	}
+	if got := strings.Join(order, ","); got != "handler,steward" {
+		t.Fatalf("rotation ticks = %q, want handler then steward once", got)
+	}
+}
+
+func TestRelayLoopHoldsQueueAndRotationAfterRotationRateLimit(t *testing.T) {
+	var handlerCalls, stewardCalls atomic.Int32
+	handler := func(context.Context) error {
+		handlerCalls.Add(1)
+		return &api.HTTPError{Status: http.StatusTooManyRequests, Msg: "synthetic 429"}
+	}
+	steward := func(context.Context) error { stewardCalls.Add(1); return nil }
+	var passes int
+	pause := func() bool {
+		passes++
+		time.Sleep(50 * time.Millisecond)
+		return passes < 12
+	}
+	f := newRotationLoopFixture(t, handler, steward, pause)
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Twelve passes fit well inside the first six-second spacing.
+	if handlerCalls.Load() != 1 || stewardCalls.Load() != 0 {
+		t.Fatalf("handler ticks = %d, steward ticks = %d, want 1 and 0", handlerCalls.Load(), stewardCalls.Load())
+	}
+	if got := f.queuePolls.Load(); got < 1 || got > 3 {
+		t.Fatalf("team queue polls over %d passes = %d, want them held off after the 429", passes, got)
+	}
+	if got := strings.Count(stderr, "[tt relay] handler rotation: "); got != 1 || !strings.Contains(stderr, "synthetic 429") {
+		t.Fatalf("handler rotation log entries = %d: %s", got, stderr)
+	}
+}
+
+func TestRelayRotationPassObservesBackoffLikeInlineTicks(t *testing.T) {
+	rateLimited := &api.HTTPError{Status: http.StatusTooManyRequests, Msg: "synthetic 429"}
+	var handlerErr, stewardErr error
+	var calls []string
+	oldHandler, oldSteward := relayHandlerRotation, relayStewardRotation
+	t.Cleanup(func() { relayHandlerRotation, relayStewardRotation = oldHandler, oldSteward })
+	relayHandlerRotation = func(context.Context) error { calls = append(calls, "handler"); return handlerErr }
+	relayStewardRotation = func(context.Context) error { calls = append(calls, "steward"); return stewardErr }
+	var backoff teamQueuePollBackoff
+	var rotation relayRotationPass
+	// run mirrors the loop: a pass starts only when the backoff is ready.
+	run := func() (string, string) {
+		t.Helper()
+		calls = nil
+		stderr, _ := captureRelayOutput(t, true, func() error {
+			if backoff.ready(time.Now()) {
+				rotation.start()
+			}
+			rotation.collect(&backoff, true)
+			return nil
+		})
+		return strings.Join(calls, ","), stderr
+	}
+	elapse := func() { backoff.next = time.Now().Add(-time.Second) }
+
+	handlerErr = rateLimited
+	if got, stderr := run(); got != "handler" || backoff.delay != 6*time.Second || backoff.ready(time.Now()) || !strings.Contains(stderr, "[tt relay] handler rotation: ") {
+		t.Fatalf("handler 429: ticks=%q backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	if got, _ := run(); got != "" {
+		t.Fatalf("rotation ran inside the backoff: %q", got)
+	}
+	elapse()
+	if got, _ := run(); got != "handler" || backoff.delay != 12*time.Second || backoff.ready(time.Now()) {
+		t.Fatalf("second handler 429: ticks=%q backoff=%+v", got, backoff)
+	}
+	backoff.delay = time.Minute
+	elapse()
+	if _, _ = run(); backoff.delay != time.Minute {
+		t.Fatalf("backoff passed its one-minute cap: %+v", backoff)
+	}
+	elapse()
+	handlerErr, stewardErr = errors.New("handler boom"), errors.New("steward boom")
+	if got, stderr := run(); got != "handler,steward" || backoff.delay != time.Minute || !backoff.ready(time.Now()) ||
+		!strings.Contains(stderr, "[tt relay] handler rotation: handler boom\n") || !strings.Contains(stderr, "[tt relay] steward rotation: steward boom\n") {
+		t.Fatalf("other errors: ticks=%q backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	handlerErr, stewardErr = nil, nil
+	if got, stderr := run(); got != "handler,steward" || backoff.delay != 0 || !backoff.ready(time.Now()) || stderr != "" {
+		t.Fatalf("success did not clear the backoff: ticks=%q backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	stewardErr = rateLimited
+	if got, stderr := run(); got != "handler,steward" || backoff.delay != 6*time.Second || backoff.ready(time.Now()) || !strings.Contains(stderr, "[tt relay] steward rotation: ") {
+		t.Fatalf("steward 429: ticks=%q backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	// A clean pass must not clear spacing that a 429 set while it ran.
+	handlerErr, stewardErr = nil, nil
+	rotation.start()
+	rotation.collect(&backoff, true)
+	if backoff.delay != 6*time.Second || backoff.ready(time.Now()) {
+		t.Fatalf("a clean pass cleared a live backoff: %+v", backoff)
+	}
+}

@@ -703,8 +703,7 @@ type teamQueuePollBackoff struct {
 func (b *teamQueuePollBackoff) ready(now time.Time) bool { return !now.Before(b.next) }
 
 func (b *teamQueuePollBackoff) observe(now time.Time, err error) {
-	var response *api.HTTPError
-	if errors.As(err, &response) && response.Status == http.StatusTooManyRequests {
+	if rateLimited(err) {
 		if b.delay == 0 {
 			b.delay = 6 * time.Second
 		} else {
@@ -713,6 +712,90 @@ func (b *teamQueuePollBackoff) observe(now time.Time, err error) {
 		b.next = now.Add(b.delay)
 	} else if err == nil {
 		b.delay, b.next = 0, time.Time{}
+	}
+}
+
+func rateLimited(err error) bool {
+	var response *api.HTTPError
+	return errors.As(err, &response) && response.Status == http.StatusTooManyRequests
+}
+
+// Test seams: the two rotation ticks, and the wait between passes, which
+// ends the loop when it returns false.
+var (
+	relayHandlerRotation = relayHandlerRotationTick
+	relayStewardRotation = relayStewardRotationTick
+	relayLoopPause       = func() bool { time.Sleep(3 * time.Second); return true }
+)
+
+type relayRotationResult struct {
+	handlerErr, stewardErr error
+	handlerAt, stewardAt   time.Time
+	stewardRan             bool
+}
+
+// relayRotationPass runs the handler and steward rotation ticks off the wake
+// path. A rotation launches a session and moves a lease, so it keeps its
+// two-minute budget, but a slow one no longer delays wakes. Only the relay
+// loop calls these methods and touches the shared backoff; the pass hands
+// its errors back for the loop to observe.
+type relayRotationPass struct {
+	done chan relayRotationResult // nil while no pass is in flight
+}
+
+func (r *relayRotationPass) start() {
+	if r.done != nil {
+		return
+	}
+	done := make(chan relayRotationResult, 1)
+	r.done = done
+	handler, steward := relayHandlerRotation, relayStewardRotation
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		var result relayRotationResult
+		result.handlerErr = handler(ctx)
+		result.handlerAt = time.Now()
+		// A rate-limited handler tick holds off the steward tick, as the
+		// shared backoff does.
+		if !rateLimited(result.handlerErr) {
+			result.stewardRan = true
+			result.stewardErr = steward(ctx)
+			result.stewardAt = time.Now()
+		}
+		done <- result
+	}()
+}
+
+// collect observes a finished pass; with wait it blocks for one in flight.
+func (r *relayRotationPass) collect(backoff *teamQueuePollBackoff, wait bool) {
+	if r.done == nil {
+		return
+	}
+	var result relayRotationResult
+	if wait {
+		result = <-r.done
+	} else {
+		select {
+		case result = <-r.done:
+		default:
+			return
+		}
+	}
+	r.done = nil
+	observeRotation(backoff, "handler", result.handlerAt, result.handlerErr)
+	if result.stewardRan {
+		observeRotation(backoff, "steward", result.stewardAt, result.stewardErr)
+	}
+}
+
+func observeRotation(backoff *teamQueuePollBackoff, name string, at time.Time, err error) {
+	// A clean tick must not clear spacing that a later 429 set while it ran.
+	if err != nil || backoff.ready(at) {
+		backoff.observe(at, err)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] %s rotation: %v\n", name, err)
 	}
 }
 
@@ -739,6 +822,7 @@ func cmdRelay(args []string) error {
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
 	var queueBackoff teamQueuePollBackoff
+	var rotation relayRotationPass
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastWindowSize time.Time
 	var claudeRetryCursor int
@@ -746,6 +830,7 @@ func cmdRelay(args []string) error {
 		if !*status {
 			relayCleanup()
 			inspectStartupPrompts()
+			rotation.collect(&queueBackoff, false)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if queueBackoff.ready(time.Now()) {
 				queueErr := relayTeamQueueTick(ctx)
@@ -754,22 +839,15 @@ func cmdRelay(args []string) error {
 					fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", queueErr)
 				}
 			}
-			// Handler rotation shares the queue's request budget and backoff.
-			if queueBackoff.ready(time.Now()) {
-				rotationErr := relayHandlerRotationTick(ctx)
-				queueBackoff.observe(time.Now(), rotationErr)
-				if rotationErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] handler rotation: %v\n", rotationErr)
-				}
-			}
-			if queueBackoff.ready(time.Now()) {
-				stewardErr := relayStewardRotationTick(ctx)
-				queueBackoff.observe(time.Now(), stewardErr)
-				if stewardErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] steward rotation: %v\n", stewardErr)
-				}
-			}
 			cancel()
+			// Handler and steward rotation share the queue's request budget and
+			// backoff, but run off the wake path; one pass is in flight at most.
+			if queueBackoff.ready(time.Now()) {
+				rotation.start()
+			}
+			if *once {
+				rotation.collect(&queueBackoff, true)
+			}
 			if time.Since(lastClaudeRetry) >= 15*time.Second {
 				lastClaudeRetry = time.Now()
 				retryCtx, stopRetry := context.WithTimeout(context.Background(), 3*time.Second)
@@ -918,6 +996,9 @@ func cmdRelay(args []string) error {
 		if *once || *status {
 			return nil
 		}
-		time.Sleep(3 * time.Second)
+		if !relayLoopPause() {
+			rotation.collect(&queueBackoff, true)
+			return nil
+		}
 	}
 }
