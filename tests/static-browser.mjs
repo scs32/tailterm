@@ -938,11 +938,19 @@ try {
   await page.waitForFunction(() =>
     document.querySelector("#terminal-status").textContent.includes("Error"),
   );
-  assert.ok(
-    (
-      await page.locator(".terminal-instance:not([hidden])").innerText()
-    ).includes("closed the connection during SSH sign-in"),
-  );
+  // The status can turn Error before WebKit has rendered the terminal text.
+  await page
+    .waitForFunction(() =>
+      document
+        .querySelector(".terminal-instance:not([hidden])")
+        ?.innerText.includes("closed the connection during SSH sign-in"),
+    )
+    .catch((error) => {
+      throw new Error(
+        "The visible terminal never showed the SSH sign-in EOF explanation",
+        { cause: error },
+      );
+    });
   assert.equal(
     await page.locator(".login-prompt").count(),
     0,
