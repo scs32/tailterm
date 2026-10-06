@@ -509,9 +509,8 @@ func (l *lifecycleRun) dispositionBeforeVerification(t *testing.T) {
 	notice := func(e env, subject, file string) (int64, error) {
 		return l.send(t, e, "--kind", "notice", "--subject", subject, "--text", "Candidate "+l.c2, "--review-file", file)
 	}
-	if _, err := notice(lead, "Accept the fixed candidate as it stands", accept); err == nil {
-		t.Fatal("an ordinary accept was recorded with a2 failed and verification pending")
-	}
+	_, err := notice(lead, "Accept the fixed candidate as it stands", accept)
+	l.refused(t, "an ordinary accept with a2 failed and verification pending", "passing receipt for current scope and exact accepted candidate required", err)
 	if _, err := notice(lead, "Record the lead disposition for the candidate", l.file(t, "disposition.json", l.disposition(l.opts.disposition, l.c2))); err != nil {
 		t.Fatalf("%s disposition before verification: %v", l.opts.disposition, err)
 	}
@@ -519,7 +518,7 @@ func (l *lifecycleRun) dispositionBeforeVerification(t *testing.T) {
 	if state.Disposition == nil || state.Disposition.Kind != l.opts.disposition || state.Disposition.Candidate != l.c2 || state.Disposition.AgentID != l.agents["lead"].ID {
 		t.Fatalf("%s disposition is not recorded for C2: %+v", l.opts.disposition, state.Disposition)
 	}
-	_, err := notice(lead, "Accept the fixed candidate after the disposition", accept)
+	_, err = notice(lead, "Accept the fixed candidate after the disposition", accept)
 	l.refused(t, "an ordinary accept after the disposition", "disposition already recorded", err)
 	ownerAccept := l.file(t, "owner-accept.json", l.disposition("owner-accept", l.c2))
 	_, err = notice(lead, "Accept the candidate in the name of the owner", ownerAccept)
