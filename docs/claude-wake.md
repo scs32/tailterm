@@ -99,13 +99,13 @@ and relay regressions. No live owner/agent sessions are test fixtures.
 
 ## Tool-call ledger
 
-Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendment #25980 and answers #25999 and #26032, builder assignment #26043. This source change is a candidate.
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. This source change is a candidate.
 
 Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
 
 ### Hooks
 
-`tt hooks claude` prints, and `tt host setup` installs into the user-level Claude `settings.json`, three more events: `PreToolUse`, `PostToolUse` and `PostToolUseFailure`. Each runs `tt hook tool` in a group with no matcher, so every tool is seen. Host setup keeps the user's own entries for these events, for example a `PreToolUse` group with a `Bash` matcher, and moves a `tt hook tool` entry out of a matcher group.
+`tt hooks claude` prints, and `tt host setup` installs into the user-level Claude `settings.json`, three more events: `PreToolUse`, `PostToolUse` and `PostToolUseFailure`. Each runs `tt hook tool` in a group with no matcher, so every tool is seen, and each entry carries `"timeout": 5`: Claude Code abandons the hook after 5 seconds if it ever hangs (see "What Claude Code does when the hook misbehaves"). Host setup adds the timeout to a `tt hook tool` entry installed without it, or with another value. The four older hooks are written exactly as before, with no timeout. Host setup keeps the user's own entries for these events, for example a `PreToolUse` group with a `Bash` matcher, and moves a `tt hook tool` entry out of a matcher group.
 
 `tt hook tool` can never deny, delay, rewrite or fail a tool call:
 
@@ -210,8 +210,13 @@ Observed on 2026-10-06 with Claude Code 2.1.291 in `claude -p`, with a made-up a
 | --- | --- |
 | Exits 1 with text on stderr (the pre-feature `tt hook tool`) on all three events | Both tool calls ran and returned their normal results. The model saw no hook message. |
 | Exits 2 on PreToolUse with text on stderr | The tool call was blocked and the model was shown the stderr text. `tt hook tool` cannot do this: its handler returns nothing and `tt` exits 1 for any error. |
-| Does not return (a PreToolUse hook that sleeps 100 seconds) | Claude Code waited the full 100 seconds, then ran the tool call normally. No shorter timeout applied, so a hook that hangs holds each tool call for as long as it hangs. The limit at which Claude Code gives up was not observed. |
+| Does not return, entry has no `timeout` (a PreToolUse hook that sleeps 100 seconds) | Claude Code waited the full 100 seconds, then ran the tool call normally. The limit at which Claude Code gives up by itself was not observed. |
+| Does not return, entry has `"timeout": 5` as installed (the same hook on all three events) | Claude Code abandoned the PreToolUse hook and ran the tool call 4.9 seconds after the hook started. The call returned its normal result. The PostToolUse hook was abandoned after 5 seconds in the same way. Neither hook process was left running, and the model saw no hook message. |
 
-So the only harm a broken `tt hook tool` can do is delay, and only by hanging. The handler's own work cannot hang past 150 ms. What remains is the time before the handler starts: process start and the config read named above. The installed entries carry no `timeout`; adding one is possible follow-up work.
+So a broken `tt hook tool` cannot deny or rewrite a call, and the only harm it can do is delay, by hanging. The handler's own work cannot hang past 150 ms. What remains is the time before the handler starts: process start and the config read named above. If that ever hangs, the 5 second timeout applies: a tool call is held at most 5 seconds before it runs and at most 5 seconds after, the call still proceeds, and that call gets no row or an incomplete one.
+
+Why 5 seconds: the hook normally takes 6 to 12 ms and at most about 360 ms on the first run after an install, so 5 seconds never fires on a working hook, including on a loaded host, while a hang costs seconds and not minutes. A smaller value was not tested.
+
+The same timeout was not given to the four older hooks, and it is not shown to be safe for them. `tt hook session-start`, `prompt`, `stop` and `notification` each make hub requests with client timeouts of 2 and 5 seconds, several in a row, so a slow hub can take them past 5 seconds while they are working correctly. Cutting off `tt hook stop` would also drop its decision to hold a turn open on unacknowledged work. A timeout for them needs its own measurement and is follow-up work.
 
 Replacing the `tt` binary while hooks run, measured with the candidate binary outside Claude Code: host setup installs by rename, so a call in flight keeps the binary it started with and exits 0, and the next call runs the new file. Across 300 consecutive calls with the binary replaced twice, every call exited 0 with no output and wrote its row. The first call after each replacement took 216 and 228 ms, against a median of 7 ms: macOS checks a new binary file on its first run. So the 200 ms bound is passed once after each install. This was not tried inside a Claude Code session.

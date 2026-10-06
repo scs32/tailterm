@@ -530,22 +530,35 @@ func TestHostSetupMergesHooks(t *testing.T) {
 
 // The tool-call ledger events: each gets one unmatched tt hook tool group
 // beside the user's own matched PreToolUse entry, a tt entry a matcher would
-// restrict is moved out of it, and a second run changes nothing.
+// restrict is moved out of it, every tool entry carries the timeout (one
+// installed without it, or with another, is upgraded in place), the four
+// older hooks get no timeout, and a second run changes nothing.
 func TestHostSetupInstallsToolHooks(t *testing.T) {
 	s := newHostSandbox(t, "home")
 	s.holdRelayLock()
 	s.write(s.p.claudeSettings, `{"hooks":{
 		"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"guard.sh"},{"type":"command","command":"/old/tt hook tool"}]}],
-		"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"tt hook tool"}]}]
+		"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"tt hook tool"}]}],
+		"PostToolUseFailure":[{"note":"mine","hooks":[{"type":"command","command":"`+adapters.HookCommand(s.p.install, "tool")+`","async":false},{"type":"command","command":"after.sh","timeout":60}]}],
+		"Stop":[{"hooks":[{"type":"command","command":"`+adapters.HookCommand(s.p.install, "stop")+`"}]}]
 	}}`, 0o600)
 	out := s.mustRun("--from", s.artifact("tt-v1"))
 	s.requireCanonicalHooks()
-	tool := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool")}}}
+	tool := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool"), "timeout": json.Number("5")}}}
+	plain := func(name string) []any {
+		return []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, name)}}}}
+	}
 	hooks := decodeJSONFile(t, s.p.claudeSettings)["hooks"].(map[string]any)
 	for event, want := range map[string][]any{
-		"PreToolUse":         {map[string]any{"matcher": "Bash", "hooks": []any{map[string]any{"type": "command", "command": "guard.sh"}}}, tool},
-		"PostToolUse":        {tool},
-		"PostToolUseFailure": {tool},
+		"PreToolUse":  {map[string]any{"matcher": "Bash", "hooks": []any{map[string]any{"type": "command", "command": "guard.sh"}}}, tool},
+		"PostToolUse": {tool},
+		"PostToolUseFailure": {map[string]any{"note": "mine", "hooks": []any{
+			map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool"), "async": false, "timeout": json.Number("5")},
+			map[string]any{"type": "command", "command": "after.sh", "timeout": json.Number("60")}}}},
+		"SessionStart":     plain("session-start"),
+		"UserPromptSubmit": plain("prompt"),
+		"Stop":             plain("stop"),
+		"Notification":     plain("notification"),
 	} {
 		if got := hooks[event]; !reflect.DeepEqual(got, want) {
 			t.Errorf("%s after setup:\n got %v\nwant %v", event, got, want)

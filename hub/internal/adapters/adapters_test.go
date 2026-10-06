@@ -40,6 +40,31 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 			t.Errorf("%s group is not a bare hooks list: %s", ev, raw.Hooks[ev][0])
 		}
 	}
+	// Only the tool entries carry a timeout; the four older entries are
+	// written exactly as before.
+	for ev, group := range raw.Hooks {
+		want := `[{"command":"/usr/local/bin/tt hook tool","timeout":5,"type":"command"}]`
+		switch ev {
+		case "SessionStart":
+			want = `[{"command":"/usr/local/bin/tt hook session-start","type":"command"}]`
+		case "UserPromptSubmit":
+			want = `[{"command":"/usr/local/bin/tt hook prompt","type":"command"}]`
+		case "Stop":
+			want = `[{"command":"/usr/local/bin/tt hook stop","type":"command"}]`
+		case "Notification":
+			want = `[{"command":"/usr/local/bin/tt hook notification","type":"command"}]`
+		}
+		var entries any
+		if err := json.Unmarshal(group[0]["hooks"], &entries); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := json.Marshal(entries); string(got) != want {
+			t.Errorf("%s entries = %s; want %s", ev, got, want)
+		}
+	}
+	if ToolHookTimeoutSeconds != 5 || HookTimeoutSeconds("tool") != 5 || HookTimeoutSeconds("stop") != 0 {
+		t.Errorf("timeouts: tool %d, stop %d", HookTimeoutSeconds("tool"), HookTimeoutSeconds("stop"))
+	}
 	if !strings.Contains(CodexConfig("tt"), `notify = ["tt", "hook", "codex"]`) {
 		t.Error("codex config wrong")
 	}

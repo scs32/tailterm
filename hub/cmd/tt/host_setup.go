@@ -688,7 +688,8 @@ func isTTHook(command, name string) bool {
 // mergeTTHooks brings each managed event to exactly one tt entry, in a group
 // with no matcher, and no other tt entry. Everything else in the document is
 // kept. With keepExisting an unrestricted tt entry is left as written;
-// otherwise its command becomes the canonical one for tt.
+// otherwise its command becomes the canonical one for tt, and its timeout
+// the one that hook carries (adapters.HookTimeoutSeconds), if it has one.
 func mergeTTHooks(doc map[string]any, events []hookEvent, tt string, keepExisting bool) (bool, error) {
 	if err := checkHookShape(doc, events); err != nil {
 		return false, err
@@ -700,6 +701,7 @@ func mergeTTHooks(doc map[string]any, events []hookEvent, tt string, keepExistin
 	changed := false
 	for _, ev := range events {
 		canonical := adapters.HookCommand(tt, ev.name)
+		timeout := adapters.HookTimeoutSeconds(ev.name)
 		groups, _ := hooks[ev.event].([]any)
 		kept := false
 		out := make([]any, 0, len(groups)+1)
@@ -723,6 +725,10 @@ func mergeTTHooks(doc map[string]any, events []hookEvent, tt string, keepExistin
 						hook["command"] = canonical
 						changed = true
 					}
+					if timeout > 0 && !keepExisting && fmt.Sprint(hook["timeout"]) != fmt.Sprint(timeout) {
+						hook["timeout"] = timeout
+						changed = true
+					}
 					remaining = append(remaining, hook)
 				default: // a duplicate, or one a matcher would not always fire
 					changed = true
@@ -737,7 +743,7 @@ func mergeTTHooks(doc map[string]any, events []hookEvent, tt string, keepExistin
 			out = append(out, group)
 		}
 		if !kept {
-			out = append(out, map[string]any{"hooks": []any{map[string]any{"type": "command", "command": canonical}}})
+			out = append(out, map[string]any{"hooks": []any{adapters.HookEntry(tt, ev.name)}})
 			changed = true
 		}
 		hooks[ev.event] = out

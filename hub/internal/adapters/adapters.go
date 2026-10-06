@@ -74,12 +74,35 @@ func ParseHookCommand(cmd string) (exe, name string, ok bool) {
 	return word.String(), rest[1], true
 }
 
+// ToolHookTimeoutSeconds is the timeout Claude Code is given for tt hook
+// tool. The hook returns within 200 ms; if it ever hangs, Claude Code
+// abandons it after this long and the tool call proceeds.
+const ToolHookTimeoutSeconds = 5
+
+// HookTimeoutSeconds is the timeout a tt hook's settings entry carries, or
+// zero for an entry written without one.
+func HookTimeoutSeconds(name string) int {
+	if name == "tool" {
+		return ToolHookTimeoutSeconds
+	}
+	return 0
+}
+
+// HookEntry is the settings entry that runs tt hook <name>.
+func HookEntry(tt, name string) map[string]any {
+	entry := map[string]any{"type": "command", "command": HookCommand(tt, name)}
+	if seconds := HookTimeoutSeconds(name); seconds > 0 {
+		entry["timeout"] = seconds
+	}
+	return entry
+}
+
 // ClaudeHooks returns a Claude Code settings.json fragment wiring tt hooks.
 // The three tool events run the observe-only tool-call ledger (tt hook tool)
 // with no matcher, so every tool call is seen.
 func ClaudeHooks(tt string) string {
 	hook := func(name string) map[string]any {
-		return map[string]any{"hooks": []map[string]any{{"type": "command", "command": HookCommand(tt, name)}}}
+		return map[string]any{"hooks": []map[string]any{HookEntry(tt, name)}}
 	}
 	settings := map[string]any{"hooks": map[string]any{
 		"SessionStart":       []map[string]any{hook("session-start")},
