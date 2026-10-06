@@ -107,8 +107,10 @@ The deployed frontend uses `npm run build:static` instead.
 - A group holds at most eight panes (Appearance → Panes per group: 4–16).
   Further panes continue in an adjacent "‹group› (continued)", then
   "(continued 2)" group with the same project binding, hub mirror and restore.
-  A closed pane frees its slot; the next pane fills the earliest part with room,
-  the orchestrator stays in the first part and empty parts disappear. Dropping
+  A closed pane frees its slot. An arriving pane returns to its recorded part
+  if that part has room, otherwise it fills the earliest part with room, and
+  otherwise it starts a new part; existing panes never move. The orchestrator
+  stays in the first part and empty parts disappear. Dropping
   onto a full group offers Send to the continuation or Make room; a group and its
   continuations reorder together. Lowering the limit moves extra panes on;
   raising it never merges parts. Plain groups over the limit continue the same
