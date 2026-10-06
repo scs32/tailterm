@@ -721,6 +721,12 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	// under its name would settle an owner request the owner never answered.
 	if r.Header.Get(RelayAuthorHeader) != "" {
 		notice := req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindNotice && req.ReplyTo == 0
+		// The store turns the envelope's refs.repliesTo into ReplyTo, so that
+		// form of a reply is refused here too.
+		if notice {
+			_, replies := req.Envelope.Refs["repliesTo"]
+			notice = !replies
+		}
 		if !notice || c.Node == api.BridgeNode || req.AgentID != "" || req.RunID != "" || req.Source != nil {
 			writeError(w, http.StatusBadRequest, "a relay-authored message is a notice that replies to nothing and carries no agent, run or source")
 			return

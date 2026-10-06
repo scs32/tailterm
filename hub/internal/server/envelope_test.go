@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -254,5 +257,84 @@ func TestTypedMessageReachesBoundRecipient(t *testing.T) {
 	// the item (wi_a31c079e98518efc, #11759).
 	if !seen[linked.Seq] || !seen[unlinked.Seq] {
 		t.Fatalf("bound inbox: linked %v (want true), unlinked %v (want true)", seen[linked.Seq], seen[unlinked.Seq])
+	}
+}
+
+// A relay-marked post is a notice that replies to nothing, whichever form the
+// reply takes: the envelope's refs.repliesTo becomes ReplyTo once the store
+// normalizes the post (wi_a304acd70b6369cd).
+func TestRelayMarkedNoticeRepliesToNothing(t *testing.T) {
+	c := newClient(t)
+	task := c.task("relay notice")
+	path := "/v1/tasks/" + task.ID + "/messages"
+	var asked api.Message
+	if code := c.do("POST", path, api.PostMessageRequest{Text: "please look at the relay"}, &asked); code != 201 {
+		t.Fatalf("owner post: %d", code)
+	}
+	notice := func(refs map[string]string) *api.Envelope {
+		return &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A relay notice", Refs: refs, Body: api.EnvelopeBody{Text: "text"}}
+	}
+	marked := func(body api.PostMessageRequest, out any) int {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest("POST", c.srv.URL+path, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(RelayAuthorHeader, "1")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		_ = json.NewDecoder(res.Body).Decode(out)
+		return res.StatusCode
+	}
+	count := func() int {
+		t.Helper()
+		var list api.MessageList
+		if code := c.do("GET", path+"?after=0", nil, &list); code != 200 {
+			t.Fatalf("list: %d", code)
+		}
+		return len(list.Messages)
+	}
+
+	before := count()
+	seq := strconv.FormatInt(asked.Seq, 10)
+	for name, req := range map[string]api.PostMessageRequest{
+		"a plain reply":                   {Envelope: notice(nil), ReplyTo: asked.Seq},
+		"an envelope reply":               {Envelope: notice(map[string]string{"repliesTo": seq})},
+		"an envelope reply with a hash":   {Envelope: notice(map[string]string{"repliesTo": "#" + seq})},
+		"an invalid envelope reply":       {Envelope: notice(map[string]string{"repliesTo": "none"})},
+		"both forms of the same reply":    {Envelope: notice(map[string]string{"repliesTo": seq}), ReplyTo: asked.Seq},
+		"an envelope reply and other ref": {Envelope: notice(map[string]string{"repliesTo": seq, "commit": "abc1234"})},
+	} {
+		var rejected api.ErrorResponse
+		if code := marked(req, &rejected); code != http.StatusBadRequest || !strings.Contains(rejected.Error, "relay-authored message is a notice that replies to nothing") {
+			t.Fatalf("marked post with %s: status %d response %+v, want the relay 400", name, code, rejected)
+		}
+	}
+	if after := count(); after != before {
+		t.Fatalf("a rejected marked post stored a message: %d -> %d", before, after)
+	}
+
+	// The marker still works on a notice that replies to nothing, other refs
+	// included, and an unmarked envelope reply is still the owner's.
+	var relayed api.Message
+	if code := marked(api.PostMessageRequest{Envelope: notice(map[string]string{"commit": "abc1234"})}, &relayed); code != 201 {
+		t.Fatalf("marked plain notice: %d", code)
+	}
+	if relayed.From != (api.Sender{Node: RelayNode, User: RelayUser}) || relayed.ReplyTo != 0 {
+		t.Fatalf("marked plain notice author %+v replyTo %d, want the relay replying to nothing", relayed.From, relayed.ReplyTo)
+	}
+	var reply api.Message
+	if code := c.do("POST", path, api.PostMessageRequest{Envelope: notice(map[string]string{"repliesTo": seq})}, &reply); code != 201 {
+		t.Fatalf("unmarked envelope reply: %d", code)
+	}
+	if reply.From != (api.Sender{Node: c.who.Node, User: c.who.User}) || reply.ReplyTo != asked.Seq {
+		t.Fatalf("unmarked envelope reply author %+v replyTo %d, want the owner replying to %d", reply.From, reply.ReplyTo, asked.Seq)
 	}
 }
