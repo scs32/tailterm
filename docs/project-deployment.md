@@ -237,8 +237,8 @@ handler. Three things make that run succeed or fail for a named reason
   `node_modules/.package-lock.json`, `wasm/tailserve.wasm`, `.build/test.wasm`,
   `.build/speech-fixture.wav` and `.build/go-modules.txt`; the deployer needs
   them as much as a verifier does. `tt deployment setup --cwd CHECKOUT
-  --prerequisites-from SOURCE ...` runs `node scripts/release-runner.mjs
-  --provision-prerequisites --from SOURCE` in the checkout before any spawn:
+--prerequisites-from SOURCE ...` runs `node scripts/release-runner.mjs
+--provision-prerequisites --from SOURCE` in the checkout before any spawn:
   `npm ci` when the install marker is missing, then each other missing file
   copied from `SOURCE` (the owner's root checkout,
   `/Users/stephenspeicher/projects/tailterm`), never overwriting an existing
@@ -258,17 +258,20 @@ handler. Three things make that run succeed or fail for a named reason
   `maxAttempts`, plus 30 minutes for test-binary builds, clamped to the holder
   cap (`TAILTERM_MATRIX_HOLDER_CAP_MINUTES`, default 120 minutes; see
   [objective verification](objective-verification.md), "Host lock and
-  waitlist"). The worked example, go-race 1800000 and npm-unit 120000 at 3
-  attempts, sums to 7560000 ms and is bounded at 7200000. The run stops itself
-  at that bound; the per-check timers inside the matrix remain the real limit.
-  Every other host command keeps the 600-second limit. A check limit that is
-  missing or above 1800000 refuses.
+  waitlist"). The worked example uses the limits in `verification/matrix.json`:
+  go-race 3000000 and npm-unit 480000 at 3 attempts are 10440000 ms, plus
+  1800000 for builds is 12240000 ms, which the 120-minute holder cap clamps to
+  a bound of 7200000 ms. The run stops itself at that bound; the per-check
+  timers inside the matrix remain the real limit. Every other host command
+  keeps the 600-second limit. The per-check ceiling is `MAX_CHECK_TIMEOUT_MS`,
+  3600000 ms (`scripts/verify-matrix.mjs`; the runner imports the same
+  constant): a check limit that is missing or above it refuses.
 - **The shared order.** The run is a member of the verification host's ordered
   waitlist, exactly like a verifier's run: urgent first, then high, then
   normal, first come first served within a priority. The runner counts no
   processes and never waits for a quiet host. It starts the run detached as
   `node scripts/verify-matrix.mjs run PLAN DIR --priority P --item ITEM
-  --host-wait-minutes N`, and that run takes its turn on the list.
+--host-wait-minutes N`, and that run takes its turn on the list.
   - `P` is the job's `priority` if the hub ever carries one, else the private
     config key `matrixPriority`, else `high`. Any value other than `urgent`,
     `high` or `normal` refuses the job as `Invalid matrix priority` before a
@@ -278,13 +281,13 @@ handler. Three things make that run succeed or fail for a named reason
     `Verification host wait expired`.
   - While the run waits, the deployer posts one notice per change of its place:
     "A release job is waiting for the verification host", with `Release JOB
-    waits for the verification host at position P of N at priority X behind
-    ITEM/AGENT/pid PID` (or `with no holder`). The request id is
+waits for the verification host at position P of N at priority X behind
+ITEM/AGENT/pid PID` (or `with no holder`). The request id is
     `JOB-matrix-wait-COMMIT-rN-pP-ofN-HOLDERID`, so an unchanged poll posts
     nothing. `run.json` counts the places the run has had; from the second
     place on the id ends in `-nK`, so a return to an earlier place is posted
     again while a restarted runner's resend is not. `tt team queue list` and `node scripts/verify-matrix-host-lock.mjs
-    status` show the same place.
+status` show the same place.
 
 The context, plan, receipt, logs and the attempt record live in
 `journalDirectory/ID-integrated-verification/COMMIT-rN`, keyed by the integrated
@@ -295,11 +298,11 @@ run instead of reusing an earlier attempt's receipt. The run's output is in
 **The attempt record.** `run.json` in that directory says what the runner knows
 about the attempt's one run. A run is never started twice in one directory.
 
-| `state` | Meaning |
-|---|---|
-| `starting` | Saved before the run is spawned, with `launchedAt`, `priority`, `hostWaitMs` and `boundMs`. If this save fails nothing is started. |
-| `started` | The run exists: `pid`, `processStartedAt` (its process start time, or null when it could not be read), `groups`, every check group the runner has seen it record in the lock file, and `waitPlace` with `waitChange`, its last place on the waitlist and how many places it has had. |
-| `ended` | Final, with `reason` (`receipt`, `stopped`, `wait-expired`, `no-receipt` or `spawn-failed`) and, for a refusal, its name. |
+| `state`    | Meaning                                                                                                                                                                                                                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `starting` | Saved before the run is spawned, with `launchedAt`, `priority`, `hostWaitMs` and `boundMs`. If this save fails nothing is started.                                                                                                                                                   |
+| `started`  | The run exists: `pid`, `processStartedAt` (its process start time, or null when it could not be read), `groups`, every check group the runner has seen it record in the lock file, and `waitPlace` with `waitChange`, its last place on the waitlist and how many places it has had. |
+| `ended`    | Final, with `reason` (`receipt`, `stopped`, `wait-expired`, `no-receipt` or `spawn-failed`) and, for a refusal, its name.                                                                                                                                                            |
 
 The journal is saved as `waiting_matrix` before the run is started, and every
 poll returns at once, so the host release lock is not held while the run waits
@@ -327,7 +330,7 @@ an earlier attempt's run still alive. It takes one step per poll:
    `host-lock.json` records that it left the list, or its lock entry, read
    after the pid was gone, shows no check group still alive (nor any group in
    `run.json`). Only then is the job refused, as `Integrated matrix run
-   exceeded its bound`.
+exceeded its bound`.
 
 **Held.** When a run cannot be confirmed stopped, the job is held, not
 refused: it stays `waiting_matrix` with the project fence, the deployer keeps
@@ -348,7 +351,7 @@ reasons:
 - `check group state cannot be shown`: the run is gone without a release record
   and another waiter replaced its lock entry before the runner read it.
 - `host lock file unreadable`, `attempt record unreadable`, and `attempt
-  records unreadable` when a requeued job's attempt directories cannot be
+records unreadable` when a requeued job's attempt directories cannot be
   listed (request id `JOB-matrix-held-attempts`).
 
 A held job resumes by itself once the evidence is complete (the group ends, the
@@ -402,7 +405,7 @@ and the job's own approval does not cover it.
   with `Matrix digest changed OLD8 to NEW8; no owner approval covers it` (the
   first eight hex digits of each) instead of `verify-matrix.mjs exit 1`. An
   import citing no covering approval is refused as `matrix digest changed OLD8
-  -> NEW8; no approval`. A refused job is terminal: after the owner approves the
+-> NEW8; no approval`. A refused job is terminal: after the owner approves the
   new digest, the handler retries the entry (Retrying a refused release, below)
   or the owner releases it by hand. The runner does not wait for an approval or
   ask for one.
@@ -438,6 +441,107 @@ for other scope metadata), `unknown field "NAME"` (`unknown-field`, the name
 bounded to 64 bytes), `wrong type for field "NAME"` (`wrong-type`), `malformed
 JSON` (`malformed-json`) or `trailing data after the JSON object`
 (`trailing-data`).
+
+### The runner's own code (wi_2be015df9af54c5c)
+
+A release can change the scripts the deployer itself runs. One process loads
+them once, so after such a release the running deployer is older than what it
+just published. It checks this itself, once per poll and before any claim.
+
+**What is compared.** The watched set is `RUNNER_CODE_FILES`, six files under
+`scripts/`: `release-inputs.mjs`, `release-probe.mjs`, `release-runner.mjs`,
+`release-targets.mjs`, `verify-matrix-host-lock.mjs` and `verify-matrix.mjs`. A
+code digest is the sha256 of their `name:sha256` lines. The loaded digest is
+read once as the process starts, from the files beside the running module. The
+published digest is read at every poll from the blobs of the commit that
+`refs/heads/tasks-hub` names in the deployer's checkout, never from the working
+tree. The deployer treats that local ref as published: it does not fetch it
+while idle, so a `tasks-hub` that moved only on origin is not seen until the
+local ref moves. A change to any other file does not count.
+
+**States.** Each poll decides one of four:
+
+- `current`: the digests are equal. Nothing new; it claims as usual.
+- `draining`: the code is stale and the deployer is not idle. It claims no new
+  release and changes nothing else. A release it already owns runs to its end:
+  an active release is never interrupted.
+- `restart`: the code is stale and the deployer is idle. It re-execs onto the
+  published scripts (below).
+- `refused`: it cannot compare or cannot restart. It claims no release, with
+  one of the reasons below, and keeps polling.
+
+Idle means all three: no job of the project is `claimed`, `merged` or
+`blocked`, this process has no matrix run, and no host release lock exists. In
+every state but `current` a `verified` job stays unclaimed and its journal is
+not archived.
+
+**Restart.** A deployer that was told to stop does not restart. Otherwise it
+first prepares the checkout: `git status --porcelain` must be empty (ignored
+build outputs do not count), `HEAD` is moved to the published commit with `git
+checkout --detach` when it differs, and the six files on disk must then have
+the published digest. It records and announces the restart, then replaces its
+own process image with the same Node executable and arguments. The pid, agent
+and run stay the same. The new image is told which published digest the
+restart aimed at and which digest it came from. When it then finds itself
+`current` it posts "Deployer now runs the published scripts".
+
+**Refuse reasons and recovery.** A refusal is decided again at every poll, so
+one whose cause is removed clears by itself; the last two below do not.
+
+| Reason                    | Meaning                                                                                                                   | Operator action                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `loaded-unreadable`       | The scripts beside the running module could not be read when the process started.                                         | Restore the checkout's `scripts/`, then re-provision.                                               |
+| `published-unreadable`    | `refs/heads/tasks-hub` does not resolve to a commit in the checkout, or one of the six blobs is missing from it.          | Repair the local ref or the missing objects; the next poll compares again.                          |
+| `checkout-dirty`          | `git status --porcelain` is not empty, so the checkout was not moved.                                                     | Inspect the checkout and remove or preserve what is there; the next poll retries.                   |
+| `checkout-failed`         | `git status`, `git rev-parse` or the detached checkout failed.                                                            | Repair the worktree; the next poll retries.                                                         |
+| `disk-mismatch`           | After the checkout the six files are unreadable or are not the published bytes.                                           | Restore the files to the published commit; the next poll retries.                                   |
+| `exec-failed`             | Replacing the process image failed. This process does not try again for the same published digest.                        | Re-provision.                                                                                       |
+| `restart-did-not-refresh` | The process was already restarted for this published digest and is still stale: the restart did not change what it loads. | Re-provision, and check that the deployer's command starts the runner from the configured checkout. |
+
+Re-provision means the action every refusal notice names: run `tt deployment
+setup` for the deployer with its current run as predecessor (the provisioning
+order at the top of this document). No release is active in a refusal that
+followed a restart attempt, because only an idle deployer attempts one.
+
+**Where it shows.** The private record is `runner-code.json` in the journal
+directory, mode 0600: `agentId`, `runId`, `pid`, `startedAt`, `checkedAt`,
+`state`, `reason` when refused, `loaded` (`digest` and per-file `files`),
+`current` (the published `commit`, `digest` and `files`; null when unreadable),
+`changed` (the watched files that differ) and `restartedFrom` after a restart.
+It is rewritten only when something other than `checkedAt` changes, so
+`checkedAt` is when the current state was first seen.
+
+The Board gets one notice per state, loaded digest and published digest. Only
+12-character prefixes of the digests and the commit, names from the watched
+set and the fixed reason tokens reach its text:
+
+- "Deployer code is out of date; it restarts itself after the current release"
+  (`draining`).
+- "Deployer is restarting itself onto the published scripts" (`restart`). If no
+  "Deployer now runs the published scripts" notice follows, the deployer did
+  not come back: re-provision.
+- "Deployer is not claiming releases: its scripts are out of date", or for the
+  two unreadable reasons "Deployer is not claiming releases: it cannot compare
+  its scripts with the published ones" (`refused`, with `Reason: TOKEN`).
+  `published-unreadable` is posted only when it withholds a claim.
+
+The request id is `runner-code-RUN-LOADED-CURRENT-STATE`, with `-REASON` for a
+refusal and no time, so a restarted process resends the same notice and an
+unchanged poll posts nothing. The deployer's terminal prints one line for each
+of `draining`, `restart` and `refused`.
+
+**Failed CLI calls.** When a call of the configured `tt` fails, the journal
+directory keeps the evidence in `cli-failures.json`, mode 0600: for each
+failure `at`, `jobId`, `agentId`, `runId`, the exact `argv`, `cwd`, `exitCode`,
+`signal`, `errorCode`, the last 16384 bytes of `stderr`, `stderrBytes`,
+`stderrTruncated`, `count` and `lastAt`. The newest 20 distinct failures are
+kept; a repeat raises `count` and `lastAt` only. `argv` can hold Board text and
+private paths, so none of it leaves the file. The Board gets "A deployer CLI
+call failed" with `Deployer CLI call failed: REASON (release JOB). The exact
+argv, exit code and stderr are kept in cli-failures.json in the private journal
+directory of the deployer.`, once per job and reason for a process. That notice
+goes through the CLI that just failed, so it is best effort; the private record
+and the terminal line remain.
 
 ### Handler requests and gating
 
@@ -541,12 +645,12 @@ job:
 
 Anything else is refused with a reason that names the job:
 
-| Job | Refusal |
-|---|---|
-| `claimed`, `merged` or `blocked` (including a set-aside job claimed again) | `job ID is STATE; reconcile it first` |
-| `verified` with a requeue reconciliation or bound inputs | `verified job ID has deployer history (DETAIL)` |
-| `refused` with effects that are not restored | `job ID has release effects that are not restored (DETAIL)`, where DETAIL names the first target still released or whose rollback is blocked |
-| `released` or `superseded` | `job ID is already STATE` |
+| Job                                                                        | Refusal                                                                                                                                      |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claimed`, `merged` or `blocked` (including a set-aside job claimed again) | `job ID is STATE; reconcile it first`                                                                                                        |
+| `verified` with a requeue reconciliation or bound inputs                   | `verified job ID has deployer history (DETAIL)`                                                                                              |
+| `refused` with effects that are not restored                               | `job ID has release effects that are not restored (DETAIL)`, where DETAIL names the first target still released or whose rollback is blocked |
+| `released` or `superseded`                                                 | `job ID is already STATE`                                                                                                                    |
 
 The hub also refuses unless the cited record exists in the project (`recorded
 hand release required`), its released commit equals `--released-commit`, its
@@ -606,7 +710,7 @@ refusal:
 3. Nothing of the job is still live, by the same rule as supersede (above): no
    receipt and never published, or rolled back, or refused by a reconcile that
    records the restoration. Otherwise `job ID has release effects that are not
-   restored (DETAIL); roll back, reconcile, or supersede with a hand release`.
+restored (DETAIL); roll back, reconcile, or supersede with a hand release`.
    There is no automatic retry of a job with effects. While such a job is still
    held (`merged` or `blocked`), roll its targets back by hand and reconcile it
    with the restoration recorded; it is then retryable. A job already refused
@@ -620,7 +724,7 @@ refusal:
    and the item revision, commit, base commit and verification are the ones the
    refused job had. Otherwise `candidate changed since ID`.
 6. The project pause generation is the one the job had. Otherwise `project
-   generation changed since ID`: after a project pause the entry needs the
+generation changed since ID`: after a project pause the entry needs the
    owner's decision, not a retry.
 
 **What it creates.** A new job with a new ID for the same entry, item and
@@ -728,7 +832,7 @@ a restart's resend returns the original.
   release and hash equal the expected prior values; database writes are preserved
   when the state mount is unchanged and the hub responds. `rollback hub|bridge`
   adds `waitedMs` and `polls`, and `capture` when it ends not ready. `rollback
-  tailos` adds `lastCommit` (the last 40-hex commit read, or null) and `waitedMs`.
+tailos` adds `lastCommit` (the last 40-hex commit read, or null) and `waitedMs`.
 
 **TailOS switch window.** After `wrangler pages deploy`, Cloudflare's custom
 domain keeps serving the previous deployment for a few seconds, so one read
@@ -856,6 +960,12 @@ matrixHostWaitMs optional: how long the integrated run waits for the verificatio
 Credentials stay in the existing Mini stores (SSH keys, git helper, Wrangler,
 tt token) and are referenced, never copied into this file.
 
+On 2026-10-05 the `tt` key of the deployer's private config was changed from
+the stopgap wrapper put in place on 10-02 and 10-04 to the installed `tt`. The
+wrapper ran an older private CLI, and newly released runner code calling that
+old CLI failed in the publish step. Keep `tt` pointed at the installed `tt`,
+which a Mini release updates together with the scripts.
+
 ### Handler inputs procedure (d2)
 
 When the deployer asks for inputs (subject "Import immutable inputs for this
@@ -879,7 +989,7 @@ release job"), the project handler, on the Mini in the dedicated checkout:
    target's own probed live release. Mini and TailOS get their rollback probe and retained-dist program.
    The manifest `journalDirectory/ID-inputs.json` is written once, mode 0600.
 3. Run the printed `tt deployment inputs --job ID --generation N --commit SHA
-   --file PATH --request-id KEY` and reply to the deployer's request with the
+--file PATH --request-id KEY` and reply to the deployer's request with the
    saved result. The deployer resumes on its next pass.
 
 A refused run prints only its own reason. A manifest that already exists is
@@ -975,6 +1085,12 @@ journal or lock by hand. The inspection's "no active execution" covers the
 integrated matrix run as well: read `run.json` in each attempt directory of the
 job and confirm the pid it names is gone (above, "Requeue").
 
+**Stale deployer code.** A notice "Deployer is not claiming releases: ..."
+means the deployer runs scripts older than the published ones and could not
+restart itself. Read its `Reason:` and `runner-code.json`, then follow "The
+runner's own code" above. The other code notices need no action unless a
+restart is not followed by "Deployer now runs the published scripts".
+
 **Held matrix run.** A notice "A release job is held until its matrix run is
 confirmed stopped" means the deployer will not refuse or move on by itself.
 Follow "Held" under integrated-commit verification: confirm nothing of that
@@ -991,10 +1107,11 @@ aside; wait for the run, or follow **Held matrix run** below. A locked claim
 goes through **Reconcile** instead. The deployer claims the waiting job at its next poll.
 
 **Manual rollback, per target.**
+
 - hub or bridge: `python3 scripts/deploy-truenas-hub.py --rollback-to PRIOR_RELEASE
-  --target hub|bridge --expect-sha256 PRIOR_SHA`, then `node
-  scripts/release-probe.mjs rollback TARGET --expect-release PRIOR_RELEASE
-  --expect-sha PRIOR_SHA --config PRIVATE`. The prior release and hash are in the
+--target hub|bridge --expect-sha256 PRIOR_SHA`, then `node
+scripts/release-probe.mjs rollback TARGET --expect-release PRIOR_RELEASE
+--expect-sha PRIOR_SHA --config PRIVATE`. The prior release and hash are in the
   job's manifest (`rollbackProgram`) or a previous receipt. After a paired
   release roll back both, hub first (the bridge probe needs a responding hub),
   each to its own prior release.
@@ -1004,13 +1121,13 @@ goes through **Reconcile** instead. The deployer claims the waiting job at its n
   atomically (copy to `tt.rollback`, then rename) and restart the relay with the
   configured command. The runner's rollback does the same.
 - TailOS: `npx wrangler pages deploy journalDirectory/tailos-dist-PRIOR
-  --project-name tailos --branch main --commit-hash PRIOR --commit-dirty=false`,
+--project-name tailos --branch main --commit-hash PRIOR --commit-dirty=false`,
   then `node scripts/release-probe.mjs rollback tailos --expect-commit PRIOR
-  --config PRIVATE`. The probe polls for up to the switch window (above; the
+--config PRIVATE`. The probe polls for up to the switch window (above; the
   default 90 s without `--config`) before it reports `restored: false`.
 - tasks-hub: if the D1 revert failed, commit the revert by hand in the dedicated
   checkout and move the ref with `git update-ref refs/heads/tasks-hub REVERT
-  INTEGRATED` (never force).
+INTEGRATED` (never force).
 
 **A blocked receipt with a committed revert.** When a rollback could not run or
 did not restore a target (for example the fence was lost), the receipt outcome is
@@ -1039,7 +1156,7 @@ before the record exists, the deployer selects against the old baselines and
 redeploys the hand-released targets; and a record made after a newer deployer
 receipt settles later, so its older commit would win that target's baseline.
 
-*Fallback: a config baseline edit.* Only for a hand release that no job carries,
+_Fallback: a config baseline edit._ Only for a hand release that no job carries,
 or whose job cannot be superseded (requeued after a claim, or refused with
 effects that are not restored): for each target
 released by hand, run `node scripts/release-probe.mjs live TARGET --config
@@ -1061,4 +1178,3 @@ out, the deployer refuses to publish. To update the main checkout later,
 build and deploy from the detached `HEAD`, then `git update-ref
 refs/heads/tasks-hub NEW OLD` and `git push origin NEW:refs/heads/tasks-hub`,
 without checking the branch out.
-
