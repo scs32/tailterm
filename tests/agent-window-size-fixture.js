@@ -110,6 +110,22 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
         arrived: new Promise((r) => (arrived = r)),
         mark: () => arrived(),
         release: () => gate.deliver?.(),
+        // The held command's reply once it has run, and the same viewer's
+        // release that follows it (a sizer drops a claim it may not keep).
+        reply: () => (gate.held?.exited ? gate.held.output.trim() : undefined),
+        released: () => {
+          const token =
+            /@tailterm_size_viewer[^a-zA-Z0-9_-]+([a-zA-Z0-9_-]{16,64})/.exec(
+              gate.held?.command || "",
+            )?.[1];
+          return commands.some(
+            (c) =>
+              c.exited &&
+              !c.pty &&
+              c.command.includes(token) &&
+              c.command.includes("display-message -p released"),
+          );
+        },
       };
       claimGate = gate;
       return gate;
@@ -123,7 +139,8 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
     handleExec(session, accept, info, pty) {
       if (!info.command.includes(wrapper)) return false;
       const channel = accept();
-      commands.push({ command: info.command, pty });
+      const entry = { command: info.command, pty, output: "" };
+      commands.push(entry);
       const deliver = () => {
         const child = pty
           ? spawn(
@@ -139,7 +156,10 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
             )
           : spawn("/bin/sh", ["-c", info.command], { env });
         processes.add(child);
-        child.stdout.on("data", (d) => channel.writable && channel.write(d));
+        child.stdout.on("data", (d) => {
+          if (!pty) entry.output += d;
+          if (channel.writable) channel.write(d);
+        });
         child.stderr.on("data", (d) => {
           console.error("Private sizing SSH stderr:", d.toString());
           if (channel.stderr.writable) channel.stderr.write(d);
@@ -159,6 +179,7 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
           if (!pty) child.kill();
         });
         child.on("close", (code) => {
+          entry.exited = true;
           processes.delete(child);
           if (channel.writable) {
             channel.exit(code || 0);
@@ -179,6 +200,7 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
       ) {
         const gate = claimGate;
         claimGate = null;
+        gate.held = entry;
         gate.deliver = deliver;
         gate.mark();
       } else deliver();
@@ -641,13 +663,24 @@ export async function exerciseAgentWindowSizing({
   await A.locator("[data-mode=board]").click();
   await B.bringToFront();
   await B.locator(".terminal-instance:not([hidden])").click();
-  await wait(
-    () => owner() && owner() !== bToken && size() === "240x59",
-    "B accepts newer focus while A claim is delayed",
-  );
-  const newerB = owner();
+  // B drops its old claim before it claims again, so the token is briefly
+  // empty: read it once per poll and keep that same read as B's new token.
+  let newerB;
+  await wait(() => {
+    newerB = owner();
+    return newerB && newerB !== bToken && size() === "240x59";
+  }, "B accepts newer focus while A claim is delayed");
   delayed.release();
-  await pause(300);
+  await wait(
+    () => delayed.reply() !== undefined,
+    "delayed A claim reaches the host",
+  );
+  assert.equal(
+    delayed.reply(),
+    "superseded",
+    "main integration obsolete A claim is refused",
+  );
+  await wait(() => delayed.released(), "A releases its refused claim");
   assert.equal(
     size(),
     "240x59",
