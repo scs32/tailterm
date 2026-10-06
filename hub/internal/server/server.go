@@ -717,10 +717,12 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	// A host relay posts with the owner's token. Its own notices carry the
 	// marker and are recorded as the relay's, so they never read as the
-	// owner's. The relay speaks for no agent.
+	// owner's. The relay speaks for no agent and answers nothing: a reply
+	// under its name would settle an owner request the owner never answered.
 	if r.Header.Get(RelayAuthorHeader) != "" {
-		if c.Node == api.BridgeNode || req.AgentID != "" || req.RunID != "" || req.Source != nil {
-			writeError(w, http.StatusBadRequest, "a relay-authored message carries no agent, run or source")
+		notice := req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindNotice && req.ReplyTo == 0
+		if !notice || c.Node == api.BridgeNode || req.AgentID != "" || req.RunID != "" || req.Source != nil {
+			writeError(w, http.StatusBadRequest, "a relay-authored message is a notice that replies to nothing and carries no agent, run or source")
 			return
 		}
 		c = api.Caller{Node: RelayNode, User: RelayUser}

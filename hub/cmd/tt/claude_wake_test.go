@@ -2171,8 +2171,17 @@ func TestClaudeWakeSkipEscalationNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := marked.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "as an agent", AgentID: worker.ID}); err == nil || !strings.Contains(err.Error(), "400") {
-		t.Fatalf("marked post with an agent identity: err=%v, want 400", err)
+	note := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A relay notice", Body: api.EnvelopeBody{Text: "text"}}
+	answer := api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "A relay answer", Body: api.EnvelopeBody{Answer: "yes"}}
+	for name, req := range map[string]api.PostMessageRequest{
+		"an agent identity": {Envelope: &note, Text: api.RenderText(note), AgentID: worker.ID},
+		"a reply":           {Envelope: &note, Text: api.RenderText(note), ReplyTo: plain.Seq},
+		"a non-notice":      {Envelope: &answer, Text: api.RenderText(answer)},
+		"no envelope":       {Text: "plain text"},
+	} {
+		if _, err := marked.PostMessage(ctx, task.ID, req); err == nil || !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "relay-authored") {
+			t.Fatalf("marked post with %s: err=%v, want 400", name, err)
+		}
 	}
 	if after, err := c.ListMessages(ctx, task.ID, 0, "", 200); err != nil || len(after) != len(before) {
 		t.Fatalf("rejected marked post stored a message: %d -> %d err=%v", len(before), len(after), err)
@@ -2187,23 +2196,38 @@ func TestClaudeWakeSkipEscalationNotice(t *testing.T) {
 		t.Fatalf("handler skip with no owner helper should reach the Board: %+v", got)
 	}
 
-	// The marked client still draws on the relay's request budget: with one
-	// request left, listing agents spends it and the post waits past the deadline.
+	// Under an active relay budget with room, the marker survives the budget
+	// wrapper: the notice is still the relay's.
 	domain, err := canonicalLimiterDomain(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	budget, prior := new(relayRateBudget), activeRelayBudget
 	now := time.Now().UTC()
-	if err := budget.configure(&api.TeamHostPolicy{LimiterDomain: domain, Version: 1, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), MaxRequestsPerMinute: 4, MaxBurst: 4, HeadroomPercent: 50}, now); err != nil {
+	policy := api.TeamHostPolicy{LimiterDomain: domain, Version: 1, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), MaxRequestsPerMinute: 120, MaxBurst: 40, HeadroomPercent: 50}
+	if err := budget.configure(&policy, now); err != nil {
 		t.Fatal(err)
 	}
 	activeRelayBudget = budget
 	t.Cleanup(func() { activeRelayBudget = prior })
+	skip.Since = since.Add(2 * time.Hour)
+	if err := nativeClaudeEscalate(ctx, binding(worker), skip); err != nil {
+		t.Fatal(err)
+	}
+	if got = notices(); len(got) != 3 || got[2].From != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+		t.Fatalf("budgeted notice author: %+v", got)
+	}
+
+	// The budget is really charged: with one request left, listing agents
+	// spends it and the post waits past the deadline.
+	policy.Version, policy.MaxRequestsPerMinute, policy.MaxBurst = 2, 4, 4
+	if err := budget.configure(&policy, now); err != nil {
+		t.Fatal(err)
+	}
 	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
-	skip.Since = since.Add(2 * time.Hour)
-	if err := nativeClaudeEscalate(short, binding(worker), skip); !errors.Is(err, context.DeadlineExceeded) || len(notices()) != 2 {
+	skip.Since = since.Add(3 * time.Hour)
+	if err := nativeClaudeEscalate(short, binding(worker), skip); !errors.Is(err, context.DeadlineExceeded) || len(notices()) != 3 {
 		t.Fatalf("escalation bypassed the relay budget: err=%v notices=%d", err, len(notices()))
 	}
 }
