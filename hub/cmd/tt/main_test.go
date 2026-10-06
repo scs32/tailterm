@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,6 +30,70 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(m.Run())
+}
+
+func TestInboxWaitFindsDirectedMessageBehindSelfSentPage(t *testing.T) {
+	h := newInboxHub(t)
+	e, _, link, order := h.bind(t, "wait-bound")
+	old := inboxPollInterval
+	inboxPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { inboxPollInterval = old })
+
+	own := h.post(t, api.PostMessageRequest{Text: "self progress", RequestID: "wait-self", AgentID: e.agent, RunID: e.runID, WorkItems: link, WorkOrderMessage: order}, 51)
+	if n, err := unreadCount(h.c, e.task, e.agent); err != nil || n != 0 {
+		t.Fatalf("self-sent unread count = %d, %v; want 0", n, err)
+	}
+	directed := h.post(t, api.PostMessageRequest{Text: "directed wake", AgentID: h.lead.ID, To: e.agent}, 1)[0]
+	if n, err := unreadCount(h.c, e.task, e.agent); err != nil || n != 1 {
+		t.Errorf("unread count behind 51 self-sent messages = %d, %v; want 1", n, err)
+	}
+	start := time.Now()
+	out, err := captureCLIOutput(t, func() error {
+		return cmdInbox(e, []string{"--unread", "--wait", "2s", "--mark-read", "--json"})
+	})
+	elapsed := time.Since(start)
+	var messages []api.Message
+	if err != nil || json.Unmarshal([]byte(out), &messages) != nil || len(messages) != 1 || messages[0].Seq != directed.Seq {
+		t.Fatalf("wait JSON = %q, %v; want only directed message #%d", out, err, directed.Seq)
+	}
+	if elapsed >= time.Second {
+		t.Errorf("wait took %v despite an unread directed message; want under 1s", elapsed)
+	}
+	a, err := h.c.GetAgent(context.Background(), e.task, e.agent)
+	if err != nil || a.ReadUpTo != own[49].Seq || a.Unread != 1 {
+		t.Fatalf("first page cursor/count = %+v, %v; want cursor %d and unread 1", a, err, own[49].Seq)
+	}
+	out, err = captureCLIOutput(t, func() error {
+		return cmdInbox(e, []string{"--unread", "--wait", "2s", "--mark-read", "--json"})
+	})
+	if err != nil || json.Unmarshal([]byte(out), &messages) != nil || len(messages) != 1 || messages[0].Seq != directed.Seq {
+		t.Fatalf("tail JSON = %q, %v; want the directed message again", out, err)
+	}
+	a, err = h.c.GetAgent(context.Background(), e.task, e.agent)
+	if err != nil || a.ReadUpTo != directed.Seq || a.Unread != 0 {
+		t.Fatalf("drained cursor/count = %+v, %v; want cursor %d and unread 0", a, err, directed.Seq)
+	}
+}
+
+func TestInboxWaitPropagatesUnreadCountError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tasks/task/agents/agent" {
+			t.Errorf("unexpected request after failed unread count: %s", r.URL.Path)
+		}
+		http.Error(w, "unread count unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := unreadCount(c, "task", "agent"); n != 0 || err == nil || !strings.Contains(err.Error(), "503") || !strings.Contains(err.Error(), "unread count unavailable") {
+		t.Fatalf("unread count error = %d, %v", n, err)
+	}
+	err = cmdInbox(env{hub: srv.URL, task: "task", agent: "agent"}, []string{"--unread", "--wait", "2s"})
+	if err == nil || !strings.Contains(err.Error(), "503") || !strings.Contains(err.Error(), "unread count unavailable") {
+		t.Fatalf("wait error = %v", err)
+	}
 }
 
 // closeHub is an isolated SQLite hub behind httptest with a private tmux

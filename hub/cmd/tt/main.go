@@ -785,21 +785,11 @@ var inboxPollInterval = 5 * time.Second
 func unreadCount(c *api.Client, task, agent string) (int, error) {
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	after, err := readCursor(ctx, c, task, agent)
+	a, err := c.GetAgent(ctx, task, agent)
 	if err != nil {
 		return 0, err
 	}
-	msgs, err := c.ListMessages(ctx, task, after, agent, 50)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, m := range msgs {
-		if m.From.AgentID != agent {
-			n++
-		}
-	}
-	return n, nil
+	return a.Unread, nil
 }
 
 func readCursor(ctx context.Context, c *api.Client, task, agent string) (int64, error) {
