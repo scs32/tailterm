@@ -140,7 +140,7 @@ export function agentWindowSizeCommand(
     !/^run_[0-9a-f]{16}$/.test(binding?.runId || "") ||
     binding?.role === "owner_helper" ||
     !/^[a-zA-Z0-9_-]{16,64}$/.test(token || "") ||
-    !["inspect", "claim", "resize", "release"].includes(action)
+    !["inspect", "claim", "resize", "release", "restore"].includes(action)
   )
     throw new Error("Invalid agent sizing identity or action.");
   if (
@@ -174,9 +174,13 @@ export function agentWindowSizeCommand(
   ]);
   let mutate;
   if (action === "inspect") {
-    mutate = `display-message -p -t ${window} 'ready:#{@tailterm_size_revision}'`;
+    // The reported size lets a claim that lands after its pane hid be undone.
+    mutate = `display-message -p -t ${window} 'ready:#{@tailterm_size_revision}:#{window_width}x#{window_height}'`;
   } else if (action === "release") {
     mutate = `set-option -wu -t ${window} @tailterm_size_viewer ; display-message -p released`;
+  } else if (action === "restore") {
+    // cols and rows are the window size inspect reported, not a viewport.
+    mutate = `set-option -w -t ${window} window-size manual ; resize-window -t ${window} -x ${Math.max(80, cols)} -y ${Math.max(24, rows)} ; set-option -wu -t ${window} @tailterm_size_viewer ; display-message -p restored`;
   } else {
     const size = (statusRows) =>
       `set-option -w -t ${window} window-size manual ; resize-window -t ${window} -x ${Math.max(80, cols)} -y ${Math.max(24, rows - statusRows)} ; ` +
@@ -202,7 +206,7 @@ export function agentWindowSizeCommand(
   }
   if (action === "claim")
     mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_revision", expectedRevision))} ${shellQuote(mutate)} 'display-message -p superseded'`;
-  if (["resize", "release"].includes(action))
+  if (["resize", "release", "restore"].includes(action))
     mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_viewer", token))} ${shellQuote(mutate)} 'display-message -p superseded'`;
   return (
     "/bin/sh -c " +

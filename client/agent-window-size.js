@@ -39,10 +39,10 @@ export function eligibleAgentViewport(s) {
 
 // A focus transition creates a fresh token even at identical dimensions. Resize
 // only updates an existing claim. One command in flight coalesces layout bursts;
-// a stale callback does not enqueue a new claim for an ineligible pane. An
-// already-submitted eligible claim may execute after hide/dispose (owner #24371);
-// it keeps the usable minimum and conditionally releases authority. Cancellation
-// remains tracked separately as residual wi_1b1a86c6be5b6bcc.
+// a stale callback does not enqueue a new claim for an ineligible pane. A claim
+// already in transport cannot be cancelled: if it sizes the window after its
+// pane hid, closed or changed identity, one restore puts back the size read
+// before the claim and drops authority, unless a newer viewer has claimed.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -133,7 +133,11 @@ export function createAgentWindowSizer({
                   ),
                 )
               ).trim();
-              if (!/^ready:([a-zA-Z0-9_-]{16,64})?$/.test(response))
+              const ready =
+                /^ready:([a-zA-Z0-9_-]{16,64})?(?::(\d+)x(\d+))?$/.exec(
+                  response,
+                );
+              if (!ready)
                 throw new Error("Agent pane sizing was refused by the host.");
               if (!fresh()) break;
               const current = snapshot();
@@ -141,9 +145,26 @@ export function createAgentWindowSizer({
                 ...next,
                 cols: current.cols,
                 rows: current.rows,
-                expectedRevision: response.slice(6),
+                expectedRevision: ready[1] || "",
               };
-              if ((await command(claim, "claim")) !== "superseded") break;
+              const outcome = await command(claim, "claim");
+              if (outcome === "superseded") continue;
+              const after = snapshot();
+              if (
+                outcome === "sized" &&
+                ready[2] &&
+                (disposed ||
+                  !eligibleAgentViewport(after) ||
+                  identity(after) !== key)
+              ) {
+                const stale = claim;
+                claim = null;
+                await command(
+                  { ...stale, cols: +ready[2], rows: +ready[3] },
+                  "restore",
+                );
+              }
+              break;
             }
           } catch (e) {
             failed = true;
@@ -166,7 +187,7 @@ export function createAgentWindowSizer({
       const response = (
         await execute(agentWindowSizeCommand({ ...c, action }, c.path))
       ).trim();
-      if (!["sized", "released", "superseded"].includes(response))
+      if (!["sized", "released", "restored", "superseded"].includes(response))
         throw new Error("Agent pane sizing was refused by the host.");
       // Keep a superseded token locally: resize must not reclaim authority.
       return response;

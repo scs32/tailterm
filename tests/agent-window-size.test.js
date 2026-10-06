@@ -420,7 +420,7 @@ test("exact revision inspection across two tagged targets and unrelated default 
             f.wrapper,
           ),
         ),
-        "ready:" + revision,
+        "ready:" + revision + ":120x34",
       );
       c.refresh({ focus: true });
       await c.settled();
@@ -466,7 +466,7 @@ test("exact revision inspection across two tagged targets and unrelated default 
   }
 });
 
-test("recorded in-flight exception keeps minimum, releases authority and initiates no hidden work", async (t) => {
+test("a claim delivered after hide or dispose is restored to the prior size with no viewer and no further hidden work", async (t) => {
   const f = setupAgentWindowFixture();
   try {
     for (const [i, scenario] of [
@@ -519,6 +519,14 @@ test("recorded in-flight exception keeps minimum, releases authority and initiat
           id + ":agent",
           "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
         );
+      const revision = () =>
+        f.tmux(
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{@tailterm_size_revision}",
+        );
       let release,
         arrived,
         held = false;
@@ -557,8 +565,19 @@ test("recorded in-flight exception keeps minimum, releases authority and initiat
         await c.settled();
         assert.equal(
           state(),
-          `${Math.max(80, cols)}x${Math.max(24, rows - 1)}|`,
-          "already submitted eligible claim keeps floor and releases authority",
+          before,
+          "delivered obsolete claim is undone and holds no authority",
+        );
+        assert.equal(commands.length, 3, "inspect, claim and one restore");
+        assert.match(
+          commands[1],
+          new RegExp(`-x ${Math.max(80, cols)} -y ${Math.max(24, rows - 1)} `),
+        );
+        assert.match(commands[2], /-x 200 -y 50 .*restored/);
+        assert.equal(
+          revision(),
+          "residual_viewer_000000000" + i,
+          "restore keeps the advanced revision",
         );
         const deliveredCount = commands.length;
         s.visible = false;
@@ -574,7 +593,7 @@ test("recorded in-flight exception keeps minimum, releases authority and initiat
           "no new hidden/disposed query, claim, mutation or retry",
         );
         t.diagnostic(
-          "scope5 owner24371: " +
+          "delayed claim restored: " +
             transition +
             " submitted " +
             cols +
@@ -590,6 +609,150 @@ test("recorded in-flight exception keeps minimum, releases authority and initiat
         await c.settled();
       }
     }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("restore yields to a newer viewer and a visible pane never restores", async () => {
+  const f = setupAgentWindowFixture();
+  try {
+    const binding = valid().binding;
+    f.tmux(
+      "new-session",
+      "-d",
+      "-s",
+      "restore-race",
+      "-n",
+      "agent",
+      "-e",
+      "TAILTERM_TASK=" + binding.taskId,
+      "-e",
+      "TAILTERM_AGENT=" + binding.agentId,
+      "-e",
+      "TAILTERM_RUN=" + binding.runId,
+      "sleep 60",
+    );
+    const [id, created] = f
+      .tmux(
+        "display-message",
+        "-p",
+        "-t",
+        "restore-race",
+        "#{session_id}|#{session_created}",
+      )
+      .split("|");
+    f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
+    f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
+    const run = (command) => {
+      const r = spawnSync("/bin/sh", ["-c", command], {
+        env: f.env,
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, r.stderr);
+      return r.stdout;
+    };
+    const state = () =>
+      f.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        id + ":agent",
+        "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+      );
+    const a = { ...valid(), target: { id, created }, path: f.wrapper };
+    const b = { ...a, cols: 240, rows: 60 };
+    const sent = [];
+    let release, arrived;
+    const gate = new Promise((r) => (release = r)),
+      arrival = new Promise((r) => (arrived = r));
+    const A = createAgentWindowSizer({
+      snapshot: () => a,
+      token: () => "restore_A_0000000000000001",
+      execute: async (command) => {
+        sent.push(command);
+        if (command.includes("resize-window") && sent.length === 2)
+          a.visible = false; // hidden while the claim is in transport
+        if (command.includes("restored")) {
+          arrived();
+          await gate;
+        }
+        return run(command);
+      },
+    });
+    const seen = [];
+    const B = createAgentWindowSizer({
+      snapshot: () => b,
+      token: () => "restore_B_0000000000000001",
+      execute: async (command) => {
+        seen.push(command);
+        return run(command);
+      },
+    });
+    try {
+      A.refresh({ focus: true });
+      await arrival;
+      assert.equal(state(), "120x34|restore_A_0000000000000001");
+      B.refresh({ focus: true });
+      await B.settled();
+      const winner = state();
+      assert.equal(winner, "240x59|restore_B_0000000000000001");
+      release();
+      await A.settled();
+      assert.equal(state(), winner, "superseded restore changes nothing");
+      assert.equal(sent.length, 3, "no command follows the restore");
+      b.cols = 250;
+      B.refresh();
+      B.refresh({ focus: true });
+      await B.settled();
+      assert.match(state(), /^250x59\|restore_B_/);
+      assert.ok(
+        seen.every((command) => !command.includes("restored")),
+        "visible eligible pane resizes and refocuses without restoring",
+      );
+    } finally {
+      release();
+      A.dispose();
+      B.dispose();
+      await A.settled();
+      await B.settled();
+    }
+    const s = { ...valid(), target: { id, created } };
+    const restore = agentWindowSizeCommand({
+      ...s,
+      token: "restore_A_0000000000000001",
+      action: "restore",
+      cols: 16,
+      rows: 2,
+    });
+    assert.match(restore, /-x 80 -y 24 /);
+    for (const guard of [
+      "TAILTERM_TASK",
+      "TAILTERM_AGENT",
+      "TAILTERM_RUN",
+      "session_created",
+      "window_panes",
+      "@tailterm_size_viewer",
+    ])
+      assert.ok(restore.includes(guard), guard);
+    assert.ok(!restore.includes("@tailterm_size_revision"));
+    for (const bad of [
+      { cols: 0 },
+      { rows: 10001 },
+      { cols: "200" },
+      { token: "short" },
+      { binding: { ...s.binding, role: "owner_helper" } },
+    ])
+      assert.throws(() =>
+        agentWindowSizeCommand({
+          ...s,
+          token: "restore_A_0000000000000001",
+          action: "restore",
+          cols: 200,
+          rows: 50,
+          ...bad,
+        }),
+      );
   } finally {
     await f.cleanup();
   }
