@@ -57,6 +57,10 @@ function holdNextMessage() {
 // until its whole timeout, so wait for a connected, enabled option, select
 // through a freshly resolved locator with a short action timeout, and report
 // the option's state if it never becomes selectable.
+// A later re-render paints the select from the draft, so a selection holds
+// only when the select and the saved draft both carry it. Each retry is
+// logged with the state it observed and the held value is asserted after the
+// last attempt, so a reverted classification cannot pass unnoticed.
 async function selectAuditKind(page, value) {
   const optionState = () =>
     page.evaluate((expected) => {
@@ -68,6 +72,9 @@ async function selectAuditKind(page, value) {
         selectPresent: !!select,
         selectDisabled: select?.disabled ?? null,
         selectValue: select?.value ?? null,
+        savedAuditKind:
+          qa.drafts().find((x) => x.id === `draft:${qa.board.selected()}`)
+            ?.values?.auditKind ?? null,
         optionPresent: !!option,
         optionDisabled: option?.disabled ?? null,
         disabledAncestor: !!option?.closest(
@@ -88,13 +95,18 @@ async function selectAuditKind(page, value) {
       !option.closest("fieldset[disabled], optgroup[disabled]")
     );
   };
+  const held = (expected) =>
+    document.querySelector("#board-audit-kind")?.value === expected &&
+    qa.drafts().find((x) => x.id === `draft:${qa.board.selected()}`)?.values
+      ?.auditKind === expected;
   const unselectable = async (reason, cause) =>
     new Error(
       `Audit kind ${JSON.stringify(value)} ${reason}: ${JSON.stringify(await optionState())}`,
       { cause },
     );
+  const attempts = 3;
   let failure;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await page.waitForFunction(selectable, value, { timeout: 10000 });
     } catch (error) {
@@ -109,19 +121,24 @@ async function selectAuditKind(page, value) {
         { timeout: 2000 },
       );
       await select.selectOption(value, { force: true, timeout: 2000 });
-      await page.waitForFunction(
-        (expected) =>
-          document.querySelector("#board-audit-kind")?.value === expected,
-        value,
-        { timeout: 2000 },
-      );
-      return;
+      await page.waitForFunction(held, value, { timeout: 2000 });
+      break;
     } catch (error) {
       if (error.name !== "TimeoutError") throw error;
       failure = error;
+      console.log(
+        `selectAuditKind ${JSON.stringify(value)} attempt ${attempt} of ${attempts} did not hold (${error.message.split("\n")[0]}): ${JSON.stringify(await optionState())}`,
+      );
+      if (attempt === attempts)
+        throw await unselectable("could not be selected", failure);
     }
   }
-  throw await unselectable("could not be selected", failure);
+  const final = await optionState();
+  assert.deepEqual(
+    { selectValue: final.selectValue, savedAuditKind: final.savedAuditKind },
+    { selectValue: value, savedAuditKind: value },
+    `Audit kind ${JSON.stringify(value)} was reverted after selection: ${JSON.stringify(final)}`,
+  );
 }
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
