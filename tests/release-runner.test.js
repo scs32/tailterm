@@ -2534,6 +2534,36 @@ end(undefined);
 // queued behind it and a diverged tasks-hub: recorded from that runner.
 const SINGLE_JOB_TRACE=["list --view active","list --view settled","get --job rel_b1","list --view active","list --view active","claim --job rel_b1 --generation 1","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","merged --job rel_b1 --generation 2","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","finish --job rel_b1 --generation 3"];
 const traceOf=log=>log.filter(l=>l.startsWith("deployment ")).map(l=>l.split(" ").slice(1).filter((w,i,all)=>!["--limit","--snapshot","--request-id","--commit","--file"].includes(w)&&!["--limit","--snapshot","--request-id","--commit","--file"].includes(all[i-1])).join(" "));
+test("batch13b a failed or interrupted batch receipt write stays pending and every later poll retries it",async()=>{
+ // A directory where the receipt's temporary file goes makes the write fail.
+ const blocked=(b,home)=>{const p=join(home,batchId("rel_b1",2,b.tip)+"-receipt.json.tmp");mkdirSync(p);return p;};
+ const settled=(b,sent,journal)=>({...b.lead,state:sent.outcome,generation:journal.finishGeneration+1,integratedCommit:sent.commit,published:true,receipt:sent});
+ for(const check of [undefined,async()=>"identity"]){
+  // The hub saved the finish, then the write failed: the lead journal is not marked finished.
+  const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);if(check)a.check=check;const obstacle=blocked(b,c.home);
+  let result;try{result=await runRelease(c,a);}catch(error){result=error;}
+  const sent=a.receipts[0];let journal=batchJournal(c);const id=journal.batch.id,path=join(c.home,id+"-receipt.json");
+  assert.equal(a.receipts.length,1);assert.equal(sent.outcome,check?"rolled_back":"released");
+  if(check)assert.match(result.message,/batch receipt pending retry/);else assert.deepEqual(result,{jobId:"rel_b1",outcome:"receipt_pending"});
+  assert.equal(journal.phase,"receipt_pending");assert.ok(!existsSync(path));assert.ok(!existsSync(join(c.home,"rel_b2.json")));
+  // The next poll's reconciliation fails the same way and leaves it pending: nothing is lost.
+  assert.throws(()=>reconcileReceipts({journalDirectory:c.home},[settled(b,sent,journal)]));
+  assert.equal(batchJournal(c).phase,"receipt_pending");assert.ok(!existsSync(path));
+  // Once the write can succeed, the same poll step writes everything and only then finishes the journal.
+  rmSync(obstacle,{recursive:true});const calls=a.calls.length;
+  reconcileReceipts({journalDirectory:c.home},[settled(b,sent,journal)]);
+  assert.equal(batchJournal(c).phase,"complete");assert.equal(JSON.parse(readFileSync(path,"utf8")).outcome,sent.outcome);
+  assert.equal(existsSync(join(c.home,"rel_b2.json")),!check);assert.equal(existsSync(join(c.home,"rel_b3.json")),!check);assert.equal(a.calls.length,calls,"no deploy, rollback or finish is repeated");
+ }
+ // The runner's own retry of the pending finish: a failed write keeps it pending, the next retry completes.
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3),obstacle=blocked(b,c.home);
+ assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"receipt_pending"});
+ assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"receipt_pending"});assert.equal(batchJournal(c).phase,"receipt_pending");
+ rmSync(obstacle,{recursive:true});const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.equal(batchJournal(c).phase,"complete");assert.ok(existsSync(join(c.home,batchJournal(c).batch.id+"-receipt.json")));assert.ok(existsSync(join(c.home,"rel_b2.json")));
+ assert.equal(a.calls.filter(n=>n.startsWith("deploy:")).length,1);assert.equal(a.calls.filter(n=>n==="finish").length,3,"the finish is replayed with the same receipt and generation");
+ assert.deepEqual(a.receipts[1],a.receipts[0]);assert.deepEqual(a.receipts[2],a.receipts[0]);
+});
 test("batch14 daemon traces with batching absent and at 1 against an older hub",async()=>{
  const traces=[];
  for(const releaseBatch of [undefined,{maxJobs:1},{}]){

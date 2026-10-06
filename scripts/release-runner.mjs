@@ -510,9 +510,11 @@ export async function runRelease(config, adapter) {
   if(config.code)state.code={loaded:config.code.loaded??null,current:config.code.current??null};
   const checkpoint=()=>save(journalPath,state);let step=null;
   const fence=async()=>{if(await adapter.fence(job)!==true)throw releaseError("release fence lost");};
-  // Best effort after the hub has the final receipt: a failed write here
-  // must never reach the rollback path below.
-  const materialize=()=>{if(state.batchReceipt){try{materializeBatch(dirname(journalPath),state);}catch{}}};
+  // The batch receipt and member journals, written once the hub has the
+  // final receipt and before the journal leaves its pending phase: a failed
+  // write, or a stop here, leaves a pending journal that every later poll
+  // retries (the finish replays; reconcileReceipts writes again).
+  const materialize=()=>{if(state.batchReceipt)materializeBatch(dirname(journalPath),state);};
   // Batch calls to the hub. Each is journaled with the lead generation it is
   // sent at before it is sent, and its request id is built from that saved
   // generation, so a call whose response was lost is sent again unchanged and
@@ -638,11 +640,11 @@ export async function runRelease(config, adapter) {
     state.receipt=receipt;state.phase="pushing";checkpoint();
     receipt.push={remote:"origin",commit:receipt.commit,outcome:pushRelease(cwd,receipt.commit)?"pushed":"failed"};checkpoint();
     if(receipt.push.outcome==="failed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed"});}catch{}}
-    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);state.phase="complete";checkpoint();materialize();return receipt;
+    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);materialize();state.phase="complete";checkpoint();return receipt;
   };
   try {
     if(state.phase==="receipt_pending" || state.phase==="finishing"){
-      await adapter.finish(state.receipt,state.finishGeneration);state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();materialize();return state.receipt;
+      await adapter.finish(state.receipt,state.finishGeneration);materialize();state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
     }
     if(state.phase==="pushing")return await pushAndFinish(state.receipt);
     // A job with no resumable journal (a requeue) first settles the matrix
@@ -778,7 +780,8 @@ export async function runRelease(config, adapter) {
       // exact receipt and generation, with no second rollback or escalation.
       state.finishGeneration=adapter.job?.generation??job.generation;state.phase="receipt_pending";checkpoint();
       try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw releaseError("Release failed; final receipt pending retry");}
-      state.phase="blocked";checkpoint();materialize();
+      try{materialize();}catch{throw releaseError("Release failed; batch receipt pending retry");}
+      state.phase="blocked";checkpoint();
     }else{await adapter.block(job.id);}
     throw releaseError("Release failed; inspect saved journal");
   } finally {closeSync(fd);rmSync(lock);}
@@ -1454,7 +1457,9 @@ export function reconcileReceipts(config,jobs){
       journal.phase="complete";updates.push([path,journal]);
     }
   }
-  for(const [path,journal] of updates){save(path,journal);if(journal.batchReceipt){try{materializeBatch(config.journalDirectory,journal);}catch{}}}
+  // A batch's receipt and member journals first: a failed write holds the
+  // poll with the journal still pending, so the next poll writes again.
+  for(const [path,journal] of updates){if(journal.batchReceipt)materializeBatch(config.journalDirectory,journal);save(path,journal);}
 }
 // Journal retention. The imported backup copy is read only by its job's
 // rehearsal (the authoritative backup stays on TrueNAS), so the journal keeps

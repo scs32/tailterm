@@ -837,6 +837,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
+			// A settled lead still holds its batch's members: superseding
+			// it would leave no job the freeing reconcile could name.
+			if batch != nil {
+				return zero, releaseConflict("job " + j.ID + " leads release batch " + batch.ID + " (" + batch.State + "); reconcile it with refuse and restoration evidence first")
+			}
 			if reason := releaseSupersedable(j); reason != "" {
 				return zero, releaseConflict(reason)
 			}

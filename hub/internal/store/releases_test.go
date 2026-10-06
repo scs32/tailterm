@@ -3184,6 +3184,16 @@ func TestReleaseBatchPublishedMembersStayHeld(t *testing.T) {
 		if _, err = f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("refuse"), Operation: "refuse", AgentID: f.d.ID, RunID: f.d.RunID, JobID: next.ID, ExpectedGeneration: next.Generation}); err != nil {
 			t.Fatal(err)
 		}
+		// A hand release cannot supersede the lead while it holds the batch:
+		// that would leave the members held with no job to reconcile.
+		hand := recordHandRelease(t, f.s, f.task, f.key("hand"), candidateB, []string{candidateA, candidateB})
+		supersede := api.ReleaseRequest{RequestID: f.key("supersede"), Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: hand.ReleasedCommit, HandReleaseID: hand.ID}}
+		if _, err = f.s.ReleaseAction(context.Background(), f.task.ID, supersede); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "leads release batch") || !strings.Contains(err.Error(), "(held)") {
+			t.Fatal("lead of a held batch superseded", err)
+		}
+		if got := f.load(t, f.lead.ID); got.State != "rolled_back" || got.Generation != f.lead.Generation || got.Supersession != nil {
+			t.Fatalf("refused supersede changed the lead: %s", got.State)
+		}
 		if _, err = f.reconcile(t, func(r *api.ReleaseReconciliation) { restored(r); r.JournalState = "no_effects" }); !errors.Is(err, api.ErrConflict) {
 			t.Fatal("held batch freed without a restored journal", err)
 		}
@@ -3196,6 +3206,11 @@ func TestReleaseBatchPublishedMembersStayHeld(t *testing.T) {
 			t.Fatalf("%+v %v", lead, err)
 		}
 		free(f, rows)
+		// Freed, the same supersede is accepted: the refusal was the batch's.
+		supersede.RequestID, supersede.ExpectedGeneration = f.key("supersede"), lead.Generation
+		if done, serr := f.s.ReleaseAction(context.Background(), f.task.ID, supersede); serr != nil || done.State != "superseded" {
+			t.Fatal("supersede after the batch was freed", serr)
+		}
 	}
 }
 
