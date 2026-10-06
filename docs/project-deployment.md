@@ -427,13 +427,22 @@ binds it), Go checks keep `VERIFICATION_BASE_COMMIT` at that base, every
 approved check is still kept, and the team's own verification before release
 is unchanged.
 
-- **Fallback.** The rule applies only when the tip is a commit the checkout
-  can read, the approved base is its ancestor and it is an ancestor of the
-  integrated commit, and every job's approved plan lists its `changed` and
-  `owned` paths (for a batch, every joined member's record included).
-  Otherwise the plan selects from the diff between the job's base and the
-  integrated commit, as it did before this rule. A fallback is never a
-  refusal.
+- **Which tip is honoured.** Only a commit that all of these hold for: the
+  checkout can read it; the approved base is its ancestor; it is an ancestor
+  of the integrated commit; and the published branch in that checkout,
+  `refs/heads/tasks-hub`, already holds it. The last condition is the safety
+  rule: the runner integrates onto that branch's tip and moves the branch only
+  after the integrated run is imported, so the tip it names is always
+  published, while a candidate can never name itself or any other unpublished
+  commit to drop the checks for its own changed paths. The latest tip any
+  context or record can name is the published one, and the diff from there
+  holds the whole candidate.
+- **Fallback.** With any of those conditions unmet, the published branch
+  unreadable, a job's approved plan missing its `changed` or `owned` paths
+  (for a batch, any joined member's record included), or a selection path that
+  is malformed or that the matrix has no rule for, the plan selects from the
+  diff between the job's base and the integrated commit, as it did before this
+  rule. A fallback is never a refusal.
 - **Where the rule is recorded.** In the attempt directory
   (`JOB-integrated-verification/COMMIT-rN/`): `context.json` carries
   `selectionBaseCommit` (the tip) and `selectionPaths` when the runner named a
@@ -441,16 +450,18 @@ is unchanged.
   (`integration-tip` or `job-base`), `baseCommit`, and either
   `selectionBaseCommit` and `selectionPaths` or the fallback `reason`
   (`invalid-selection-base`, `invalid-selection-paths`,
-  `unreadable-selection-base`, `selection-base-off-line`). The plan command
+  `unreadable-selection-base`, `selection-base-off-line`,
+  `unreadable-published-ref`, `selection-base-unpublished`). The plan command
   prints the same on stderr. `plan.json` itself gains no field, because the
   hub binds the receipt to the digest of the plan fields it knows.
 - **The record's role in the run.** `verify-matrix.mjs run` re-derives the
   plan before any check starts and refuses a difference. It reads the
   selection from `plan.preserved.json` beside the plan file and applies the
-  same tip conditions. With that record missing, unreadable, malformed or
-  naming a tip that fails the conditions, it re-derives from the job's base,
-  so a plan narrowed by the tip rule is refused as `Altered or omitted
-  required checks`, never run on trust. Keep the record with its plan; do not
+  same tip conditions, the published branch included. With that record
+  missing, unreadable, malformed or naming a tip that fails the conditions, it
+  re-derives from the job's base, so a narrowed plan is refused as `Altered or
+  omitted required checks`, never run on trust. An edited record therefore
+  cannot narrow a run below the published tip's diff. Keep the record with its plan; do not
   edit or delete it in a live attempt directory.
 
 The handler's import (`verification` release operation) binds the integrated

@@ -381,8 +381,12 @@ export function keepAcceptedChecks(
 // hands over the tasks-hub tip its candidate was integrated onto
 // (selectionBaseCommit) and the candidates' own changed and owned paths
 // (selectionPaths). The tip rule applies only to a readable tip on the line
-// from the bound base to the commit; anything else, a git failure included,
-// selects from the bound base as before and never throws.
+// from the bound base to the commit that the published branch already holds:
+// the runner integrates onto that branch's tip, and a candidate can then never
+// name itself or any other unpublished commit to narrow its own selection.
+// Anything else, a git failure included, selects from the bound base as
+// before and never throws.
+const PUBLISHED_REF = "refs/heads/tasks-hub";
 function selectionRule(context, cwd) {
   const jobBase = (reason) => ({
     rule: "job-base",
@@ -394,7 +398,17 @@ function selectionRule(context, cwd) {
   if (tip === undefined) return jobBase("no-selection-base");
   if (typeof tip !== "string" || !/^[a-f0-9]{40}$/.test(tip))
     return jobBase("invalid-selection-base");
-  if (!Array.isArray(paths) || paths.some((p) => typeof p !== "string"))
+  if (
+    !Array.isArray(paths) ||
+    paths.some(
+      (p) =>
+        typeof p !== "string" ||
+        !p ||
+        isAbsolute(p) ||
+        p.split("/").includes("..") ||
+        /[\0\n]/.test(p),
+    )
+  )
     return jobBase("invalid-selection-paths");
   const ok = (...args) =>
     spawnSync("git", args, { cwd, encoding: "utf8" }).status === 0;
@@ -405,6 +419,10 @@ function selectionRule(context, cwd) {
     !ok("merge-base", "--is-ancestor", context.baseCommit, tip)
   )
     return jobBase("selection-base-off-line");
+  if (!ok("rev-parse", "--verify", "--quiet", `${PUBLISHED_REF}^{commit}`))
+    return jobBase("unreadable-published-ref");
+  if (!ok("merge-base", "--is-ancestor", tip, PUBLISHED_REF))
+    return jobBase("selection-base-unpublished");
   return {
     rule: "integration-tip",
     baseCommit: context.baseCommit,
@@ -433,9 +451,14 @@ export function planWithPreservation(context, cwd) {
     );
   assertInventory(matrix, cwd);
   assertFastForward(cwd, context.baseCommit, context.commit);
-  const selection = selectionRule(context, cwd);
-  let changed;
+  const packages = candidateGoPackages(cwd, context.commit);
+  let selection = selectionRule(context, cwd),
+    changed,
+    checks;
   if (selection.rule === "integration-tip") {
+    // A tip diff that cannot be read, or a selection path the matrix has no
+    // rule for, falls back like any other unusable selection input.
+    let reason = "unreadable-selection-base";
     try {
       changed = [
         ...new Set([
@@ -443,19 +466,16 @@ export function planWithPreservation(context, cwd) {
           ...context.selectionPaths,
         ]),
       ].sort();
+      reason = "invalid-selection-paths";
+      checks = selectChecks(matrix, context.owned, changed, packages);
     } catch {
-      delete selection.selectionBaseCommit;
-      selection.rule = "job-base";
-      selection.reason = "unreadable-selection-base";
+      selection = { rule: "job-base", baseCommit: context.baseCommit, reason };
     }
   }
-  changed ??= diffPaths(cwd, context.baseCommit, context.commit);
-  let checks = selectChecks(
-    matrix,
-    context.owned,
-    changed,
-    candidateGoPackages(cwd, context.commit),
-  );
+  if (selection.rule === "job-base") {
+    changed = diffPaths(cwd, context.baseCommit, context.commit);
+    checks = selectChecks(matrix, context.owned, changed, packages);
+  }
   for (const check of checks)
     if (check.argv[0] === "go")
       check.environment.VERIFICATION_BASE_COMMIT = context.baseCommit;

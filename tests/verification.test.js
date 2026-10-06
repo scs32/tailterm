@@ -2853,6 +2853,8 @@ function tipFixture(
   );
   f.git("checkout", "-q", "--detach", f.base);
   const tipCommit = commit(tip, "another release");
+  // The published branch the release runner integrates onto.
+  f.git("update-ref", "refs/heads/tasks-hub", tipCommit);
   f.git("cherry-pick", candidate);
   const integrated = f.git("rev-parse", "HEAD");
   // What the release runner saves as the plan context.
@@ -2960,12 +2962,83 @@ test("a3 an unknown, malformed or off-line selection base selects from the job's
     [{ selectionPaths: undefined }, "invalid-selection-paths"],
     [{ selectionPaths: "docs/x.md" }, "invalid-selection-paths"],
     [{ selectionPaths: [7] }, "invalid-selection-paths"],
+    // A malformed path, or one the matrix has no rule for, falls back too.
+    [{ selectionPaths: ["../outside.md"] }, "invalid-selection-paths"],
+    [{ selectionPaths: ["/etc/hosts"] }, "invalid-selection-paths"],
+    [{ selectionPaths: [""] }, "invalid-selection-paths"],
+    [{ selectionPaths: ["docs/x.md\nhub/y.go"] }, "invalid-selection-paths"],
+    [{ selectionPaths: ["unknown/path.txt"] }, "invalid-selection-paths"],
+    // A commit the published branch does not hold: the integrated commit itself.
+    [{ selectionBaseCommit: f.integrated }, "selection-base-unpublished"],
   ];
-  for (const [change, reason] of cases) {
+  const fallsBack = ([change, reason]) => {
     const { plan, selection } = matrixRunner.planWithPreservation({ ...f.context, ...change }, f.cwd);
     assert.deepEqual(plan, before, reason);
     assert.deepEqual(selection, { rule: "job-base", baseCommit: f.base, reason }, reason);
-  }
+  };
+  cases.forEach(fallsBack);
+  // The true tip, while the published branch is behind it or cannot be read.
+  f.git("update-ref", "refs/heads/tasks-hub", f.base);
+  fallsBack([{}, "selection-base-unpublished"]);
+  f.git("update-ref", "-d", "refs/heads/tasks-hub");
+  fallsBack([{}, "unreadable-published-ref"]);
+  f.git("update-ref", "refs/heads/tasks-hub", f.tip);
+  assert.equal(matrixRunner.planWithPreservation(f.context, f.cwd).selection.rule, "integration-tip");
+});
+
+test("b1 a candidate cannot narrow its own selection by naming itself or an unpublished commit as the tip", async (t) => {
+  // The reviewer's trigger: a docs and Go change whose context, or whose
+  // forged plan record, names the candidate itself with no selection paths.
+  const f = tipFixture(
+    t,
+    { "docs/x.md": "the job's change\n", "hub/internal/api/api.go": "package api\n\nvar Job = 1\n" },
+    { "docs/other.md": "another release\n" },
+  );
+  // A team context: the candidate on its base, owning only the docs path.
+  f.git("checkout", "-q", "--detach", f.candidate);
+  const { checks, checksDigest, changed, ...team } = { ...f.accepted, owned: ["docs/x.md"] };
+  const honest = makePlan(team, f.cwd);
+  assert.deepEqual(checkIds(honest), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  const named = matrixRunner.planWithPreservation(
+    { ...team, selectionBaseCommit: f.candidate, selectionPaths: [] },
+    f.cwd,
+  );
+  assert.deepEqual(named.plan, honest);
+  assert.deepEqual(named.selection, {
+    rule: "job-base",
+    baseCommit: f.base,
+    reason: "selection-base-unpublished",
+  });
+  assert.deepEqual(
+    makePlan({ ...team, selectionBaseCommit: f.base, selectionPaths: [] }, f.cwd),
+    honest,
+  );
+  // The narrowed plan such a context produced before this rule: docs only.
+  const kept = honest.checks.filter((c) => c.id === "npm-unit");
+  const narrowed = { ...honest, changed: [], checks: kept, checksDigest: digest(kept) };
+  const run = (options) =>
+    runPlan(narrowed, f.cwd, tempDir(t, "verification-logs-"), { jobs: 1, ...options });
+  await assert.rejects(run({}), /Altered or omitted required checks/);
+  for (const selectionBaseCommit of [f.candidate, f.base])
+    await assert.rejects(
+      run({ selection: { selectionBaseCommit, selectionPaths: [] } }),
+      /Altered or omitted required checks/,
+      selectionBaseCommit,
+    );
+  // The same on the integrated commit: the latest tip a record can name is
+  // the published one, whose diff holds the whole change.
+  f.git("checkout", "-q", "--detach", f.integrated);
+  const integrated = makePlan(f.context, f.cwd);
+  assert.deepEqual(checkIds(integrated), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  assert.deepEqual(
+    makePlan({ ...f.context, selectionBaseCommit: f.integrated, selectionPaths: [] }, f.cwd),
+    makePlan(withoutSelection(f.context), f.cwd),
+  );
+  assert.deepEqual(
+    makePlan({ ...f.context, selectionPaths: [] }, f.cwd).checks,
+    integrated.checks,
+    "the published tip with no paths still selects the candidate's own change",
+  );
 });
 
 test("plan mode records the selection and run mode re-derives a tip-selected plan only with that record", async (t) => {
@@ -3019,9 +3092,14 @@ test("plan mode records the selection and run mode re-derives a tip-selected pla
       /Altered or omitted required checks/,
       forged,
     );
-  // A tip past the job's own change is on the line, but the job's paths are
-  // still selected; dropping them from the record is refused too.
-  await run({ selection: { ...selection, selectionBaseCommit: f.integrated } });
+  // A record naming the integrated commit itself as the tip is refused: it is
+  // on the line but not on the published branch, so the plan is re-derived
+  // from the job's base. (This record was accepted before the published
+  // branch condition; accepting it let a commit name itself as its tip.)
+  await assert.rejects(
+    run({ selection: { ...selection, selectionBaseCommit: f.integrated } }),
+    /Altered or omitted required checks/,
+  );
   // The run command reads the record beside its plan file, with no argument.
   const root = tempDir(t, "verification-cli-root-");
   const cli = () =>
