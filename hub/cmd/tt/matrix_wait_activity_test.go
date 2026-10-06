@@ -55,6 +55,12 @@ func matrixLockJSON(host string, holder string, waiters ...string) string {
 	return `{"version":1,"host":"` + host + `","holder":` + holder + `,"waiters":[` + strings.Join(waiters, ",") + `]}`
 }
 
+// matrixLockV2JSON is a version 2 lock as the script writes it: a list of
+// holders under a holder limit and no single holder.
+func matrixLockV2JSON(host string, holders []string, waiters ...string) string {
+	return `{"version":2,"host":"` + host + `","requestSeq":9,"grantSeq":4,"holderLimit":2,"holders":[` + strings.Join(holders, ",") + `],"waiters":[` + strings.Join(waiters, ",") + `]}`
+}
+
 func matrixEntry(pid, item, agent, at string) string {
 	return `{"pid":` + pid + `,"kind":"matrix","item":"` + item + `","agent":"` + agent + `","priority":"normal","requestedAt":"` + at + `","startedAt":"` + at + `","commit":"abc1234","outputDir":"/private/output"}`
 }
@@ -86,16 +92,47 @@ func TestMatrixWaitFor(t *testing.T) {
 		t.Fatalf("unbound agent: %+v", w)
 	}
 
+	// Version 2: any of several holders is running, not only the first, and a
+	// waiter keeps its place in the ordered list.
+	write(matrixLockV2JSON("test-mini", []string{other, mine}, other))
+	if w := matrixWaitFor(lead, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}) || !w.Valid() {
+		t.Fatalf("version 2 second holder: %+v", w)
+	}
+	write(matrixLockV2JSON("test-mini", []string{mine, other}))
+	if w := matrixWaitFor(lead, now); w == nil || w.Role != api.MatrixWaitRunning || w.Position != 0 || w.Length != 0 {
+		t.Fatalf("version 2 first holder: %+v", w)
+	}
+	write(matrixLockV2JSON("Test-Mini.local", []string{other, other}, other, other, mine))
+	if w := matrixWaitFor(lead, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 3, Length: 3, Since: since}) || !w.Valid() {
+		t.Fatalf("version 2 waiter: %+v", w)
+	}
+	// Holding wins over a later place in the waitlist.
+	write(matrixLockV2JSON("test-mini", []string{other, mine}, mine))
+	if w := matrixWaitFor(lead, now); w == nil || w.Role != api.MatrixWaitRunning {
+		t.Fatalf("version 2 holder that also waits: %+v", w)
+	}
+
 	for name, content := range map[string]string{
-		"dead pid":         matrixLockJSON("test-mini", "", matrixEntry("44", matrixTestItem, "lead-a", requested)),
-		"another agent":    matrixLockJSON("test-mini", other, other),
-		"another item":     matrixLockJSON("test-mini", "", matrixEntry("22", "wi_fedcba9876543210", "lead-a", requested)),
-		"another host":     matrixLockJSON("other-mini", mine, mine),
-		"no host":          matrixLockJSON("", mine, mine),
-		"not JSON":         "{broken",
-		"wrong version":    strings.Replace(matrixLockJSON("test-mini", mine, mine), `"version":1`, `"version":2`, 1),
-		"unparsable time":  matrixLockJSON("test-mini", "", matrixEntry("22", matrixTestItem, "lead-a", "soon")),
-		"too many waiters": matrixLockJSON("test-mini", "", strings.Split(strings.Repeat(other+"\x00", 1000)+mine, "\x00")...),
+		"dead pid":       matrixLockJSON("test-mini", "", matrixEntry("44", matrixTestItem, "lead-a", requested)),
+		"another agent":  matrixLockJSON("test-mini", other, other),
+		"another item":   matrixLockJSON("test-mini", "", matrixEntry("22", "wi_fedcba9876543210", "lead-a", requested)),
+		"another host":   matrixLockJSON("other-mini", mine, mine),
+		"no host":        matrixLockJSON("", mine, mine),
+		"not JSON":       "{broken",
+		"wrong version":  strings.Replace(matrixLockJSON("test-mini", mine, mine), `"version":1`, `"version":3`, 1),
+		"version 3 list": strings.Replace(matrixLockV2JSON("test-mini", []string{mine}, mine), `"version":2`, `"version":3`, 1),
+		"no version":     strings.Replace(matrixLockJSON("test-mini", mine, mine), `"version":1,`, ``, 1),
+		// Each version reads only its own holder field.
+		"version 2 single holder": strings.Replace(matrixLockJSON("test-mini", mine), `"version":1`, `"version":2`, 1),
+		"version 1 holder list":   strings.Replace(matrixLockV2JSON("test-mini", []string{mine}), `"version":2`, `"version":1`, 1),
+		"version 2 dead holder":   matrixLockV2JSON("test-mini", []string{other, matrixEntry("44", matrixTestItem, "lead-a", requested)}),
+		"version 2 another agent": matrixLockV2JSON("test-mini", []string{other, other}, other),
+		"version 2 another item":  matrixLockV2JSON("test-mini", []string{matrixEntry("22", "wi_fedcba9876543210", "lead-a", requested)}),
+		"version 2 another host":  matrixLockV2JSON("other-mini", []string{mine}, mine),
+		"version 2 no host":       matrixLockV2JSON("", []string{mine}, mine),
+		"version 2 too many":      matrixLockV2JSON("test-mini", nil, strings.Split(strings.Repeat(other+"\x00", 1000)+mine, "\x00")...),
+		"unparsable time":         matrixLockJSON("test-mini", "", matrixEntry("22", matrixTestItem, "lead-a", "soon")),
+		"too many waiters":        matrixLockJSON("test-mini", "", strings.Split(strings.Repeat(other+"\x00", 1000)+mine, "\x00")...),
 	} {
 		write(content)
 		if w := matrixWaitFor(lead, now); w != nil {
@@ -149,6 +186,51 @@ func TestMatrixWaitFor(t *testing.T) {
 	// The real pid probe, on this process and on pids that name none.
 	if !nativeMatrixWaitPIDAlive(os.Getpid()) || nativeMatrixWaitPIDAlive(0) || nativeMatrixWaitPIDAlive(-1) {
 		t.Fatal("pid probe")
+	}
+}
+
+// The one parse both readers share: holders and ordered waiters for either
+// version, and the reason for a file it refuses.
+func TestParseMatrixLock(t *testing.T) {
+	at := "2026-10-02T11:40:00.000Z"
+	a, b, c := matrixEntry("11", matrixTestItem, "lead-a", at), matrixEntry("22", matrixTestItem, "lead-b", at), matrixEntry("33", matrixTestItem, "lead-c", at)
+	agents := func(entries []matrixLockEntry) string {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Agent)
+		}
+		return strings.Join(names, ",")
+	}
+	for name, tc := range map[string]struct {
+		content          string
+		version          int
+		holders, waiters string
+	}{
+		"version 1 holder":      {matrixLockJSON("Test-Mini", a, b, c), 1, "lead-a", "lead-b,lead-c"},
+		"version 1 free":        {matrixLockJSON("Test-Mini", "", c, b), 1, "", "lead-c,lead-b"},
+		"version 2 two holders": {matrixLockV2JSON("Test-Mini", []string{b, a}, c), 2, "lead-b,lead-a", "lead-c"},
+		"version 2 free":        {matrixLockV2JSON("Test-Mini", nil), 2, "", ""},
+	} {
+		lock, reason := parseMatrixLock([]byte(tc.content))
+		if lock == nil || reason != "" || lock.Version != tc.version || lock.Host != "Test-Mini" || agents(lock.Holders) != tc.holders || agents(lock.Waiters) != tc.waiters {
+			t.Fatalf("%s: %+v %q", name, lock, reason)
+		}
+	}
+	lock, _ := parseMatrixLock([]byte(matrixLockV2JSON("test-mini", []string{a})))
+	if h := lock.Holders[0]; h != (matrixLockEntry{PID: 11, Kind: "matrix", Item: matrixTestItem, Agent: "lead-a", Priority: "normal", RequestedAt: at, StartedAt: at}) {
+		t.Fatalf("entry fields: %+v", h)
+	}
+	for content, want := range map[string]string{
+		"{broken":                 "not JSON",
+		`[]`:                      "not JSON",
+		`{"version":"2"}`:         "not JSON",
+		`{}`:                      "unknown version",
+		`{"version":0}`:           "unknown version",
+		`{"version":3,"host":""}`: "unknown version",
+	} {
+		if lock, reason := parseMatrixLock([]byte(content)); lock != nil || reason != want {
+			t.Fatalf("%s: %+v %q, want %q", content, lock, reason, want)
+		}
 	}
 }
 
@@ -257,5 +339,16 @@ func TestMatrixWaitActivityTick(t *testing.T) {
 	tick(64*time.Second, matrixLockJSON("test-mini", mine), 3)
 	if w := reports[2].MatrixWait; w == nil || !w.Valid() || w.Role != api.MatrixWaitRunning {
 		t.Fatalf("holder report: %+v", w)
+	}
+	// A version 2 lock reports the same way: the second of two holders is the
+	// same running wait, a waiter is a new report, and leaving clears it.
+	tick(80*time.Second, matrixLockV2JSON("test-mini", []string{other, mine}, other), 3)
+	tick(96*time.Second, matrixLockV2JSON("test-mini", []string{other, other}, other, mine), 4)
+	if w := reports[3].MatrixWait; w == nil || !w.Valid() || w.Role != api.MatrixWaitWaiting || w.Position != 2 || w.Length != 2 {
+		t.Fatalf("version 2 waiter report: %+v", w)
+	}
+	tick(112*time.Second, matrixLockV2JSON("test-mini", []string{other, other}), 5)
+	if last := reports[4]; last.MatrixWait != nil {
+		t.Fatalf("report after the version 2 entry left: %+v", last)
 	}
 }

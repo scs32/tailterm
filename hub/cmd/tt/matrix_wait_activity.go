@@ -16,17 +16,50 @@ import (
 // reads it: who holds the verification host and who waits, in order.
 type matrixLockEntry struct {
 	PID         int    `json:"pid"`
+	Kind        string `json:"kind"`
 	Item        string `json:"item"`
 	Agent       string `json:"agent"`
+	Priority    string `json:"priority"`
 	RequestedAt string `json:"requestedAt"`
 	StartedAt   string `json:"startedAt"`
 }
 
+// matrixLockFile is either lock version in one shape: version 1 keeps a
+// single holder and version 2 a list, both read here as Holders.
 type matrixLockFile struct {
-	Version int               `json:"version"`
-	Host    string            `json:"host"`
-	Holder  *matrixLockEntry  `json:"holder"`
-	Waiters []matrixLockEntry `json:"waiters"`
+	Version int
+	Host    string
+	Holders []matrixLockEntry
+	Waiters []matrixLockEntry
+}
+
+// parseMatrixLock is the one parse of the lock file's bytes, for the relay and
+// the queue view: the holders and the ordered waiters of a version 1 or 2
+// file, as holdersOf in the script. Otherwise it returns nil and the reason,
+// "not JSON" or "unknown version". It does not check the host.
+func parseMatrixLock(raw []byte) (*matrixLockFile, string) {
+	var file struct {
+		Version int               `json:"version"`
+		Host    string            `json:"host"`
+		Holder  *matrixLockEntry  `json:"holder"`
+		Holders []matrixLockEntry `json:"holders"`
+		Waiters []matrixLockEntry `json:"waiters"`
+	}
+	if json.Unmarshal(raw, &file) != nil {
+		return nil, "not JSON"
+	}
+	lock := &matrixLockFile{Version: file.Version, Host: file.Host, Waiters: file.Waiters}
+	switch file.Version {
+	case 1:
+		if file.Holder != nil {
+			lock.Holders = []matrixLockEntry{*file.Holder}
+		}
+	case 2:
+		lock.Holders = file.Holders
+	default:
+		return nil, "unknown version"
+	}
+	return lock, ""
 }
 
 // Tests replace these, so none reads the host's live lock file or signals a
@@ -53,7 +86,8 @@ func matrixWaitHost(host string) string {
 }
 
 // readMatrixLock returns this host's lock file, or nil when it is absent,
-// unreadable, malformed, of another version or written by another host.
+// unreadable, malformed, of a version other than 1 or 2, or written by
+// another host.
 func readMatrixLock() *matrixLockFile {
 	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
 	if path == "" {
@@ -66,21 +100,21 @@ func readMatrixLock() *matrixLockFile {
 	if err != nil {
 		return nil
 	}
-	var lock matrixLockFile
-	if json.Unmarshal(raw, &lock) != nil || lock.Version != 1 {
+	lock, _ := parseMatrixLock(raw)
+	if lock == nil {
 		return nil
 	}
 	local, err := matrixWaitHostname()
 	if err != nil || matrixWaitHost(lock.Host) == "" || matrixWaitHost(lock.Host) != matrixWaitHost(local) {
 		return nil
 	}
-	return &lock
+	return lock
 }
 
 // matrixWaitFor is the agent's live verification run in this host's matrix
-// lock: holding the host, else its first place in the waitlist, else nil. An
-// entry is the agent's when it names the agent, its process is alive and its
-// item, when both are known, is the agent's bound item.
+// lock: one of the host's holders, else its first place in the waitlist, else
+// nil. An entry is the agent's when it names the agent, its process is alive
+// and its item, when both are known, is the agent's bound item.
 func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 	if a.Name == "" {
 		return nil
@@ -106,8 +140,8 @@ func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 		}
 		return &api.MatrixWait{Item: item, Since: since.UTC()}
 	}
-	if h := lock.Holder; h != nil {
-		if w := match(*h, h.StartedAt); w != nil {
+	for _, h := range lock.Holders {
+		if w := match(h, h.StartedAt); w != nil {
 			w.Role = api.MatrixWaitRunning
 			return w
 		}
