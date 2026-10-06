@@ -33,9 +33,9 @@ backend.stderr.on("data", (chunk) => { childStderr = (childStderr + chunk.toStri
 const childClosed = once(backend, "close").catch(() => []);
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside><button id="profile-sync"><span class="nav-label">Profile sync</span></button></aside><main><header>Profile check</header><div id="status"></div></main></div><dialog id="dialog"></dialog></div><script type="module">
 import * as vault from '/client/local-vault.js';import {createProfileSync} from '/client/profile-sync.js';import {confirmDialog} from '/client/confirm-dialog.js';
-let online=false, sync, requests=0, unavailable=false;
-const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(unavailable)throw new Error("Host temporarily unavailable");return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
-window.qa={vault,unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
+let online=false, sync, requests=0, unavailable=false, gate=null, release=null, held=0;
+const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(gate){held++;await gate}if(unavailable)throw new Error("Host temporarily unavailable");return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
+window.qa={vault,async holdSync(){gate=new Promise(r=>release=r);while(!held){void sync.connected();await new Promise(r=>setTimeout(r,10))}},releaseOffline(){online=false;gate=null;held=0;release()},unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
 </script></body></html>`;
 let vite;
 let origin;
@@ -259,12 +259,36 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
       );
       phase = "disconnect";
       await b.evaluate(() => qa.show());
-      await b.locator("#profile-disconnect").click();
+      // A sync tick can be in flight at any click: one is scheduled 800 ms after
+      // B's offline rename, another runs every 15 s. Disconnect is then refused
+      // and the finishing tick replaces the refusal with its own status, so
+      // record every status. Hold one tick in flight to make the refusal
+      // certain, then release it with B offline, where no tick can start, and
+      // click again once that tick has reported.
+      const refusal = "Profile sync is already running. Try again shortly.";
+      await b.evaluate(() => {
+        const status = document.querySelector("#profile-sync-status");
+        window.statuses = [];
+        new MutationObserver(() =>
+          window.statuses.push(status.textContent),
+        ).observe(status, { childList: true });
+      });
       try {
+        await b.evaluate(() => qa.holdSync());
+        await b.locator("#profile-disconnect").click();
+        await b.waitForFunction((r) => window.statuses.includes(r), refusal);
+        assert.ok(
+          await b.evaluate(() => qa.data().profile.hub),
+          "disconnect must be refused while sync is running",
+        );
+        await b.evaluate(() => qa.releaseOffline());
+        await b.waitForFunction((r) => window.statuses.at(-1) !== r, refusal);
+        await b.locator("#profile-disconnect").click();
         await b.waitForFunction(() => !qa.data().profile.hub);
       } catch (error) {
         const observed = await b.evaluate(() => ({
           status: document.querySelector("#profile-sync-status")?.textContent,
+          statuses: window.statuses,
           hub: !!qa.data().profile.hub,
           autoRestore: qa.data().profile.autoRestore,
           revision: qa.data().profile.revision,
