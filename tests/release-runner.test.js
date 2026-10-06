@@ -2599,3 +2599,120 @@ test("batch15 a size of 3 with five eligible jobs batches three and leaves two w
  assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,"refs/heads/tasks-hub").split("\n"),["client/a.js","client/b.js","client/c.js"]);
  assert.ok(existsSync(join(h.home,"rel_b2.json"))&&existsSync(join(h.home,"rel_b3.json")));assert.deepEqual([...readBatchSolo(h.home)],[]);
 });
+// Integrated check selection (wi_e30d4baf0243a036): the plan selects from the
+// tasks-hub tip the candidates were integrated onto, not from the job's base.
+const MATRIX_SCRIPT=new URL("../scripts/verify-matrix.mjs",import.meta.url).pathname;
+// tasks-hub moves through another release after the jobs were accepted.
+const moveTip=(m,path="hub/internal/store/store.go",text="package store\n\nvar Released = 1\n")=>{
+ git(m.f.cwd,"checkout","--quiet","tasks-hub");writeFileSync(join(m.f.cwd,path),text);git(m.f.cwd,"add",".");git(m.f.cwd,"commit","-qm","another release");
+ const tip=git(m.f.cwd,"rev-parse","HEAD");m.settle();return tip;
+};
+// What the host adapter does with the job the runner hands it: the saved
+// context, and the plan and record the real plan command writes from it.
+async function hostPlan(m,handed){
+ const home=mkdtempSync(join(tmpdir(),"release-selection-host-"));
+ const {integratedCommit,selection,batchCovers,...record}=handed;
+ const host=new HostAdapter({cwd:m.f.cwd,journalDirectory:home},{...record});const started=[];let stderr="";
+ host.processStartTime=()=>null;host.startMatrixRun=(argv,dir)=>{started.push(argv);return exitedPid();};
+ host.command=argv=>{
+  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify(record);
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){const r=spawnSync(process.execPath,[MATRIX_SCRIPT,"plan",argv[3],argv[4]],{cwd:m.f.cwd,encoding:"utf8"});stderr=r.stderr;if(r.status!==0)throw new Error(r.stderr);}
+  return "";
+ };
+ assert.equal(await host.verifyIntegrated(handed),false);
+ const dir=join(home,handed.id+"-integrated-verification",handed.integratedCommit+"-r0"),read=n=>JSON.parse(readFileSync(join(dir,n),"utf8"));
+ return {context:read("context.json"),plan:read("plan.json"),record:read("plan.preserved.json"),started,stderr};
+}
+const checkIds=plan=>plan.checks.map(c=>c.id);
+// A second docs job from the base, where docs/ does not exist yet.
+const acceptDocs=(m,n,path,text)=>{m.settle();mkdirSync(join(m.f.cwd,"docs"),{recursive:true});return m.accept(n,path,text);};
+test("select1 a docs-only job on a base older than the tip selects the docs checks only",async()=>{
+ const m=matrixRepo(),docs=m.accept(1,"docs/a.md","a\n");ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ const tip=moveTip(m);assert.notEqual(tip,m.base);assert.equal(docs.baseCommit,m.base);assert.deepEqual(checkIds(docs.plan),["npm-unit"]);
+ const a=matrixFake(docs),c=batchConfig({f:m.f,lead:docs,members:[]},1);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");assert.ok(!a.calls.some(x=>x.startsWith("batch-")));
+ assert.equal(a.verifies.length,1);const handed=a.verifies[0];
+ assert.equal(handed.integratedCommit,r.commit);assert.notEqual(r.commit,docs.commit);
+ assert.deepEqual(handed.selection,{base:tip,paths:["docs/a.md"]});assert.equal(batchJournal(c).expected,tip);
+ assert.deepEqual(handed.plan,docs.plan,"the job's approved plan is handed over unchanged");
+ const h=await hostPlan(m,handed);
+ // The context names the tip beside the job's bound base; the plan keeps the base and gains no field.
+ assert.equal(h.context.selectionBaseCommit,tip);assert.deepEqual(h.context.selectionPaths,["docs/a.md"]);assert.equal(h.context.baseCommit,m.base);assert.equal(h.context.commit,r.commit);
+ assert.deepEqual(checkIds(h.plan),["npm-unit"]);assert.deepEqual(h.plan.checks,docs.plan.checks);assert.deepEqual(h.plan.changed,["docs/a.md"]);
+ assert.equal(h.plan.baseCommit,m.base);assert.equal(h.plan.commit,r.commit);assert.deepEqual(Object.keys(h.plan).sort(),Object.keys(docs.plan).sort());
+ assert.deepEqual(h.record.selection,{rule:"integration-tip",baseCommit:m.base,selectionBaseCommit:tip,selectionPaths:["docs/a.md"]});
+ assert.match(h.stderr,new RegExp(`^Selected checks from the integration tip ${tip}\n`));
+ // The run command is unchanged: plan path and attempt directory, no selection argument.
+ assert.equal(h.started.length,1);assert.deepEqual(h.started[0].slice(0,3),["node","scripts/verify-matrix.mjs","run"]);assert.deepEqual(h.started[0].filter(x=>x.startsWith("--")),["--priority","--item","--host-wait-minutes"]);
+ // Selected from the job's base, the same integrated commit runs the hub checks of the release the tip moved through.
+ const before=integratedPlan(m,docs,r.commit);
+ assert.deepEqual(checkIds(before),["go-race","go-test","go-vet","npm-unit"]);assert.deepEqual(before.changed,["docs/a.md","hub/internal/store/store.go"]);
+});
+test("select2 a Go job on the same moved tip still selects Go",async()=>{
+ const m=matrixRepo(),code=m.accept(1,"hub/internal/api/api.go","package api\n\nvar Code = 1\n");ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ const tip=moveTip(m,"docs/released.md","released\n");
+ const a=matrixFake(code),c=batchConfig({f:m.f,lead:code,members:[]},1);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+ const handed=a.verifies[0];assert.deepEqual(handed.selection,{base:tip,paths:["hub/internal/api/api.go"]});
+ const h=await hostPlan(m,handed);
+ assert.deepEqual(checkIds(h.plan),["go-race","go-test","go-vet"]);assert.deepEqual(h.plan.checks,code.plan.checks);assert.deepEqual(race(h.plan).slice(-1),["./internal/api"]);
+ assert.deepEqual(checkIds(integratedPlan(m,code,r.commit)),["go-race","go-test","go-vet","npm-unit"]);
+});
+test("select3 a two-job docs batch on a base older than the tip selects the docs checks only",async()=>{
+ const m=matrixRepo(),lead=m.accept(1,"docs/a.md","a\n"),member=acceptDocs(m,2,"docs/b.md","b\n");ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ const tip=moveTip(m);assert.equal(lead.baseCommit,m.base);assert.equal(member.baseCommit,m.base);assert.equal(batchMismatch(lead,member),"");
+ const a=matrixFake(lead),c=batchConfig({f:m.f,lead,members:[member]},2);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls.filter(x=>x==="verify"||x.startsWith("batch-")),["batch-open","batch-add:tqe_m1","batch-add:tqe_m2","verify"]);
+ const journal=batchJournal(c);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_m1","rel_m2"]);assert.equal(journal.batch.base,tip);
+ assert.equal(a.verifies.length,1);const handed=a.verifies[0];
+ assert.equal(handed.integratedCommit,r.commit);assert.deepEqual(handed.selection,{base:tip,paths:["docs/a.md","docs/b.md"]});
+ assert.deepEqual(git(m.f.cwd,"diff","--name-only",tip,r.commit).split("\n"),["docs/a.md","docs/b.md"]);
+ const h=await hostPlan(m,handed);
+ assert.equal(h.context.selectionBaseCommit,tip);assert.deepEqual(h.context.selectionPaths,["docs/a.md","docs/b.md"]);assert.equal(h.context.baseCommit,m.base);
+ assert.deepEqual(checkIds(h.plan),["npm-unit"]);assert.deepEqual(h.plan.changed,["docs/a.md","docs/b.md"]);assert.equal(h.plan.baseCommit,m.base);
+ assert.equal(batchPlanCovers(h.plan,handed.batchCovers),null);assert.equal(batchPlanCovers(h.plan,covers(lead,member)),null);assert.equal(h.started.length,1);
+ assert.deepEqual(checkIds(integratedPlan(m,handed,r.commit)),["go-race","go-test","go-vet","npm-unit"]);
+});
+test("select4 a batch member's owned paths outside its diff stay selected and covered",async()=>{
+ const m=matrixRepo(),lead=m.accept(1,"hub/internal/store/store.go","package store\n\nvar Lead = 1\n"),member=m.accept(2,"hub/internal/api/api.go","package api\n\nvar Member = 1\n");
+ // The member also owns a package its commit does not change, so its accepted go-race names it.
+ member.plan=planWithPreservation({operationKey:"fixture-2",repository:"fixture",baseCommit:m.base,commit:member.commit,owned:["hub/cmd/tt/main.go","hub/internal/api/api.go"],verifierAgentId:"agt_verifier",verifierRunId:"run_verifier",approvedMatrixDigest:m.approved,matrixApprovalMessageSeq:9},m.f.cwd).plan;
+ assert.deepEqual(member.plan.changed,["hub/internal/api/api.go"]);assert.deepEqual(race(member.plan).slice(-2),["./cmd/tt","./internal/api"]);
+ ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);const tip=moveTip(m,"docs/released.md","released\n");
+ const a=matrixFake(lead),c=batchConfig({f:m.f,lead,members:[member]},2);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");assert.equal(a.verifies.length,1);
+ const handed=a.verifies[0];
+ assert.deepEqual(handed.selection,{base:tip,paths:["hub/cmd/tt/main.go","hub/internal/api/api.go","hub/internal/store/store.go"]});
+ const h=await hostPlan(m,handed);
+ assert.deepEqual(checkIds(h.plan),["go-race","go-test","go-vet"]);assert.deepEqual(race(h.plan).slice(-3),["./cmd/tt","./internal/api","./internal/store"]);
+ assert.deepEqual(h.plan.changed,["hub/cmd/tt/main.go","hub/internal/api/api.go","hub/internal/store/store.go"]);
+ assert.equal(batchPlanCovers(h.plan,handed.batchCovers),null);assert.equal(batchPlanCovers(h.plan,covers(lead,member)),null);assert.equal(h.started.length,1);
+});
+test("select5 a job or batch whose changed paths cannot be read hands no selection and selects from the job's base",async()=>{
+ const m=matrixRepo(),docs=m.accept(1,"docs/a.md","a\n"),member=acceptDocs(m,2,"docs/b.md","b\n");ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ moveTip(m);
+ for(const plan of [{...docs.plan,changed:undefined},{...docs.plan,changed:"docs/a.md"},{...docs.plan,owned:undefined}]){
+  git(m.f.cwd,"checkout","--quiet","--detach","tasks-hub");const before=git(m.f.cwd,"rev-parse","refs/heads/tasks-hub");
+  const job={...docs,plan},a=matrixFake(job),c=batchConfig({f:m.f,lead:job,members:[]},1);
+  const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+  const handed=a.verifies[0];assert.ok(!("selection" in handed));
+  if(plan.owned){
+   const h=await hostPlan(m,handed);
+   assert.ok(!("selectionBaseCommit" in h.context)&&!("selectionPaths" in h.context));assert.equal(h.context.baseCommit,m.base);
+   assert.deepEqual(checkIds(h.plan),["go-race","go-test","go-vet","npm-unit"]);assert.equal(h.record.selection,undefined);assert.doesNotMatch(h.stderr,/Selected checks from/);
+  }
+  // The next case integrates the same job again from the tip as it was.
+  git(m.f.cwd,"checkout","--quiet","--detach",before);git(m.f.cwd,"update-ref","refs/heads/tasks-hub",before);
+ }
+ // A batch with a member whose plan names no changed paths, or whose record is gone, falls back whole.
+ for(const members of [[{...member,plan:{...member.plan,changed:undefined}}],null]){
+  const before=git(m.f.cwd,"rev-parse","refs/heads/tasks-hub");
+  const a=matrixFake(docs),c=batchConfig({f:m.f,lead:docs,members:members||[member]},2);
+  if(!members){const add=a.batch;a.batch=async(...x)=>{const out=await add(...x);if(x[0]==="batch-add"&&x[1].entryId==="tqe_m2")c.batch.candidates=[];return out;};}
+  const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+  assert.deepEqual(batchJournal(c).batch.jobs.map(j=>j.jobId),["rel_m1","rel_m2"]);
+  const handed=a.verifies[0];assert.ok(!("selection" in handed),members?"unreadable member plan":"missing member record");
+  git(m.f.cwd,"checkout","--quiet","--detach",before);git(m.f.cwd,"update-ref","refs/heads/tasks-hub",before);
+ }
+});

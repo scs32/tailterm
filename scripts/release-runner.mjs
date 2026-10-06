@@ -579,13 +579,23 @@ export async function runRelease(config, adapter) {
     if(git(cwd,"status","--porcelain"))throw releaseError("Dirty deployment checkout");
     return integration;
   };
+  // What the integrated plan selects its checks from: the tasks-hub tip the
+  // candidates were integrated onto, plus every candidate's own changed and
+  // owned paths. Without a known tip, or with a plan whose paths cannot be
+  // read, nothing is passed and the plan selects from the job's base.
+  const selection=plans=>{
+    if(!sha(state.expected) || plans.some(p=>!Array.isArray(p?.changed) || !Array.isArray(p.owned)))return {};
+    return {selection:{base:state.expected,paths:[...new Set(plans.flatMap(p=>[...p.changed,...p.owned]))].sort()}};
+  };
   // The lead with the plan one matrix run must keep for the whole batch, and
   // each job's approved checks for the proof made before that run starts.
   const batchJob=()=>{
     const checks=job.plan?.checks?.map(c=>c.id==="go-race" && state.batch.goRace?state.batch.goRace:c);
-    if(!checks)return {...job,integratedCommit:state.integrated};
-    const plans=state.batch.jobs.slice(1).map(j=>config.batch?.candidates?.find(c=>c.id===j.jobId)).filter(Boolean);
-    return {...job,integratedCommit:state.integrated,plan:{...job.plan,checks,checksDigest:digest(checks)},
+    const members=state.batch.jobs.slice(1).map(j=>config.batch?.candidates?.find(c=>c.id===j.jobId));
+    const selected=selection([job.plan,...members.map(m=>m?.plan)]);
+    if(!checks)return {...job,integratedCommit:state.integrated,...selected};
+    const plans=members.filter(Boolean);
+    return {...job,integratedCommit:state.integrated,...selected,plan:{...job.plan,checks,checksDigest:digest(checks)},
       batchCovers:[{jobId:job.id,checks:job.plan.checks,matrixDigest:job.plan.matrixDigest},{jobId:state.batch.id,checks},...plans.map(p=>({jobId:p.id,checks:p.plan?.checks,matrixDigest:p.plan?.matrixDigest}))]};
   };
   // Fallback to per-job releases, before anything is published: the batch is
@@ -666,7 +676,7 @@ export async function runRelease(config, adapter) {
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
       state.phase="waiting_matrix";checkpoint();
-      await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
+      await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated,...selection([job.plan])})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
       state.phase="integrated";checkpoint();
     }
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
@@ -930,7 +940,9 @@ export class HostAdapter {
     const wait=this.config.matrixHostWaitMs??MATRIX_HOST_WAIT_MS;
     if(!Number.isSafeInteger(wait)||wait<=0)throw releaseError("Invalid matrix host wait");
     const minutes=Math.min(1440,Math.max(1,Math.floor(wait/60000)));
-    save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
+    // Checks are selected from the tip the candidate was integrated onto,
+    // when the runner named one; baseCommit stays the job's bound base.
+    save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId,...(job.selection?{selectionBaseCommit:job.selection.base,selectionPaths:job.selection.paths}:{})});
     this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
     const plan=JSON.parse(readFileSync(planPath,"utf8"));
     // A batch's one run must cover every job's approved checks, as the hub

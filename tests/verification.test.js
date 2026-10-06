@@ -2828,3 +2828,235 @@ test("after an approved matrix change the rebuilt checks stand and go-race still
   assert.deepEqual(receipt.checks[0].argv, ["go", "test", "-race", "-timeout=30m", "./..."]);
   assert.deepEqual(receipt.checks.map((c) => c.exitCode), [0, 0, 0]);
 });
+
+// The release runner's case: the job's base is older than the tasks-hub tip,
+// which moved through other releases, and the job is picked onto that tip.
+// job and tip map each changed path to its new content.
+function tipFixture(
+  t,
+  job = { "docs/x.md": "the job's change\n" },
+  tip = { "hub/internal/store/store.go": "package store\n\nvar Tip = 1\n" },
+) {
+  const f = integratedFixture(t);
+  mkdirSync(join(f.cwd, "docs"), { recursive: true });
+  const commit = (files, message) => {
+    for (const [path, text] of Object.entries(files)) writeFileSync(join(f.cwd, path), text);
+    f.git("add", ".");
+    f.git("commit", "-qm", message);
+    return f.git("rev-parse", "HEAD");
+  };
+  f.git("checkout", "-q", "--detach", f.base);
+  const candidate = commit(job, "the job");
+  const accepted = makePlan(
+    { ...f.context, commit: candidate, owned: Object.keys(job).sort() },
+    f.cwd,
+  );
+  f.git("checkout", "-q", "--detach", f.base);
+  const tipCommit = commit(tip, "another release");
+  f.git("cherry-pick", candidate);
+  const integrated = f.git("rev-parse", "HEAD");
+  // What the release runner saves as the plan context.
+  const context = {
+    ...accepted,
+    commit: integrated,
+    selectionBaseCommit: tipCommit,
+    selectionPaths: [...new Set([...accepted.changed, ...accepted.owned])].sort(),
+  };
+  return { ...f, candidate, accepted, tip: tipCommit, integrated, context };
+}
+const checkIds = (plan) => plan.checks.map((c) => c.id);
+const withoutSelection = ({ selectionBaseCommit, selectionPaths, ...context }) => context;
+
+test("a1 a docs-only job picked onto a tip that moved through a hub change selects the docs checks only", (t) => {
+  const f = tipFixture(t);
+  assert.notEqual(f.tip, f.base);
+  assert.deepEqual(checkIds(f.accepted), ["npm-unit"]);
+  const { plan, preserved, selection } = matrixRunner.planWithPreservation(f.context, f.cwd);
+  assert.deepEqual(checkIds(plan), ["npm-unit"]);
+  assert.deepEqual(plan.checks, f.accepted.checks);
+  assert.deepEqual(plan.changed, ["docs/x.md"]);
+  assert.deepEqual(preserved.kept, ["npm-unit"]);
+  assert.deepEqual(preserved.added, []);
+  assert.deepEqual(selection, {
+    rule: "integration-tip",
+    baseCommit: f.base,
+    selectionBaseCommit: f.tip,
+  });
+  // The bound base does not move and the plan gains no field: the hub binds
+  // a receipt to the plan fields it knows.
+  assert.equal(plan.baseCommit, f.base);
+  assert.equal(plan.commit, f.integrated);
+  assert.deepEqual(Object.keys(plan).sort(), Object.keys(f.accepted).sort());
+  // Selected from the job's base, the same commit also runs the hub checks
+  // of the release the tip moved through.
+  const before = matrixRunner.planWithPreservation(withoutSelection(f.context), f.cwd);
+  assert.deepEqual(checkIds(before.plan), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  assert.deepEqual(before.plan.changed, ["docs/x.md", "hub/internal/store/store.go"]);
+  assert.deepEqual(before.selection, {
+    rule: "job-base",
+    baseCommit: f.base,
+    reason: "no-selection-base",
+  });
+});
+
+test("a Go job picked onto a moved tip still selects Go, for its own package", (t) => {
+  const f = tipFixture(
+    t,
+    { "hub/internal/api/api.go": "package api\n\nvar Job = 1\n" },
+    {
+      "hub/internal/store/store.go": "package store\n\nvar Tip = 1\n",
+      "docs/other.md": "another release\n",
+    },
+  );
+  const { plan, selection } = matrixRunner.planWithPreservation(f.context, f.cwd);
+  assert.equal(selection.rule, "integration-tip");
+  assert.deepEqual(checkIds(plan), ["go-race", "go-test", "go-vet"]);
+  assert.deepEqual(raceArgv(plan), ["go", "test", "-race", "./internal/api"]);
+  assert.deepEqual(plan.checks, f.accepted.checks);
+  for (const check of plan.checks)
+    assert.equal(check.environment.VERIFICATION_BASE_COMMIT, f.base);
+  const before = makePlan(withoutSelection(f.context), f.cwd);
+  assert.deepEqual(checkIds(before), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  assert.deepEqual(raceArgv(before), ["go", "test", "-race", "./internal/api", "./internal/store"]);
+});
+
+test("a path the tip already holds stays selected through the job's own paths", (t) => {
+  // The tip made the job's hub change already, so the pick leaves only the
+  // docs path in the tip-to-integrated diff.
+  const api = "package api\n\nvar Same = 1\n";
+  const f = tipFixture(
+    t,
+    { "docs/x.md": "the job's change\n", "hub/internal/api/api.go": api },
+    { "hub/internal/api/api.go": api },
+  );
+  assert.deepEqual(matrixRunner.diffPaths(f.cwd, f.tip, f.integrated), ["docs/x.md"]);
+  const { plan, selection } = matrixRunner.planWithPreservation(f.context, f.cwd);
+  assert.equal(selection.rule, "integration-tip");
+  assert.deepEqual(plan.changed, ["docs/x.md", "hub/internal/api/api.go"]);
+  assert.deepEqual(plan.checks, f.accepted.checks);
+  // Without the job's own paths the accepted Go checks are not selected and
+  // the plan is refused rather than narrowed.
+  assert.throws(
+    () => makePlan({ ...f.context, selectionPaths: [], owned: ["docs/x.md"] }, f.cwd),
+    /Accepted check is not selected for this commit: go-race/,
+  );
+});
+
+test("a3 an unknown, malformed or off-line selection base selects from the job's base as before", (t) => {
+  const f = tipFixture(t);
+  const before = makePlan(withoutSelection(f.context), f.cwd);
+  assert.deepEqual(checkIds(before), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  const side = f.git("commit-tree", "-m", "unrelated", f.git("rev-parse", f.base + "^{tree}"));
+  const cases = [
+    [{ selectionBaseCommit: "d".repeat(40) }, "unreadable-selection-base"],
+    [{ selectionBaseCommit: "tasks-hub" }, "invalid-selection-base"],
+    [{ selectionBaseCommit: f.tip.slice(0, 12) }, "invalid-selection-base"],
+    [{ selectionBaseCommit: 7 }, "invalid-selection-base"],
+    [{ selectionBaseCommit: null }, "invalid-selection-base"],
+    // Real commits off the line from the bound base to the integrated commit.
+    [{ selectionBaseCommit: f.candidate }, "selection-base-off-line"],
+    [{ selectionBaseCommit: side }, "selection-base-off-line"],
+    [{ selectionBaseCommit: f.git("rev-parse", f.base + "^") }, "selection-base-off-line"],
+    [{ selectionPaths: undefined }, "invalid-selection-paths"],
+    [{ selectionPaths: "docs/x.md" }, "invalid-selection-paths"],
+    [{ selectionPaths: [7] }, "invalid-selection-paths"],
+  ];
+  for (const [change, reason] of cases) {
+    const { plan, selection } = matrixRunner.planWithPreservation({ ...f.context, ...change }, f.cwd);
+    assert.deepEqual(plan, before, reason);
+    assert.deepEqual(selection, { rule: "job-base", baseCommit: f.base, reason }, reason);
+  }
+});
+
+test("plan mode records the selection and run mode re-derives a tip-selected plan only with that record", async (t) => {
+  const f = tipFixture(t);
+  const directory = tempDir(t, "verification-plan-");
+  const contextFile = join(directory, "context.json"),
+    planFile = join(directory, "plan.json"),
+    recordFile = matrixRunner.preservationPath(planFile);
+  const planMode = (input) => {
+    writeFileSync(contextFile, JSON.stringify(input));
+    const result = spawnSync(
+      process.execPath,
+      [new URL("../scripts/verify-matrix.mjs", import.meta.url).pathname, "plan", contextFile, planFile],
+      { cwd: f.cwd, encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return result.stderr;
+  };
+  assert.equal(
+    planMode(f.context),
+    `Selected checks from the integration tip ${f.tip}\nKept 1 accepted checks (accepted checksDigest ${f.accepted.checksDigest})\n`,
+  );
+  const plan = JSON.parse(readFileSync(planFile, "utf8"));
+  assert.deepEqual(checkIds(plan), ["npm-unit"]);
+  assert.deepEqual(Object.keys(plan).sort(), Object.keys(f.accepted).sort());
+  const record = JSON.parse(readFileSync(recordFile, "utf8"));
+  assert.deepEqual(record.selection, {
+    rule: "integration-tip",
+    baseCommit: f.base,
+    selectionBaseCommit: f.tip,
+    selectionPaths: ["docs/x.md"],
+  });
+  assert.deepEqual(record.kept, ["npm-unit"]);
+  const selection = matrixRunner.recordedSelection(planFile);
+  assert.deepEqual(selection, {
+    selectionBaseCommit: f.tip,
+    selectionPaths: ["docs/x.md"],
+  });
+  const run = (options) =>
+    runPlan(plan, f.cwd, tempDir(t, "verification-logs-"), { jobs: 1, ...options });
+  const receipt = await run({ selection });
+  assert.equal(receipt.planDigest, digest(plan));
+  assert.equal(receipt.baseCommit, f.base);
+  assert.deepEqual(receipt.checks.map((c) => c.id), ["npm-unit"]);
+  // Without the record, or with a tip off the line, the plan is re-derived
+  // from the job's base and the narrower plan is refused.
+  await assert.rejects(run({}), /Altered or omitted required checks/);
+  for (const forged of [f.candidate, "d".repeat(40), "tasks-hub"])
+    await assert.rejects(
+      run({ selection: { ...selection, selectionBaseCommit: forged } }),
+      /Altered or omitted required checks/,
+      forged,
+    );
+  // A tip past the job's own change is on the line, but the job's paths are
+  // still selected; dropping them from the record is refused too.
+  await run({ selection: { ...selection, selectionBaseCommit: f.integrated } });
+  // The run command reads the record beside its plan file, with no argument.
+  const root = tempDir(t, "verification-cli-root-");
+  const cli = () =>
+    spawnSync(
+      process.execPath,
+      [
+        new URL("../scripts/verify-matrix.mjs", import.meta.url).pathname,
+        "run", planFile, tempDir(t, "verification-cli-logs-"), "--min-free-bytes", "0",
+      ],
+      { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, encoding: "utf8" },
+    );
+  const ran = cli();
+  assert.equal(ran.status, 0, ran.stderr);
+  rmSync(recordFile);
+  assert.equal(matrixRunner.recordedSelection(planFile), undefined);
+  const refused = cli();
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /Altered or omitted required checks/);
+  writeFileSync(recordFile, "{");
+  assert.equal(matrixRunner.recordedSelection(planFile), undefined);
+  writeFileSync(recordFile, JSON.stringify({ version: 1, selection: { rule: "integration-tip", selectionBaseCommit: f.tip } }));
+  assert.equal(matrixRunner.recordedSelection(planFile), undefined);
+  // A base the rule refused is recorded with its reason and names no tip.
+  assert.equal(
+    planMode({ ...f.context, selectionBaseCommit: "d".repeat(40) }),
+    `Selected checks from the job base ${f.base} (unreadable-selection-base)\nKept 1 accepted checks (accepted checksDigest ${f.accepted.checksDigest})\n`,
+  );
+  assert.deepEqual(JSON.parse(readFileSync(recordFile, "utf8")).selection, {
+    rule: "job-base",
+    baseCommit: f.base,
+    reason: "unreadable-selection-base",
+  });
+  assert.equal(matrixRunner.recordedSelection(planFile), undefined);
+  // With no accepted checks the record holds the selection alone.
+  const { checks, checksDigest, ...plain } = f.context;
+  assert.equal(planMode(plain), `Selected checks from the integration tip ${f.tip}\n`);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(recordFile, "utf8"))), ["version", "selection"]);
+});

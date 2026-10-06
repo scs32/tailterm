@@ -414,12 +414,52 @@ and the job's own approval does not cover it.
   job's approved `plan` is never rewritten. A requeue or set-aside clears
   `integratedMatrix` with the rest of the integrated verification.
 
+**Which paths the integrated run selects its checks from.** The runner
+integrates a candidate onto the current tasks-hub tip, and the integrated plan
+selects checks from the diff between that tip and the integrated commit, plus
+each job's own approved changed and owned paths. The tip was verified by the
+release that published it, so releases that landed after the job's base no
+longer add their paths: a docs-only job on an old base runs the docs checks, not
+the whole matrix. A batch uses its combined diff, the tip to the batch's
+integrated commit, plus every joined job's changed and owned paths. Nothing
+else moves: the plan's `baseCommit` stays the job's approved base (the hub
+binds it), Go checks keep `VERIFICATION_BASE_COMMIT` at that base, every
+approved check is still kept, and the team's own verification before release
+is unchanged.
+
+- **Fallback.** The rule applies only when the tip is a commit the checkout
+  can read, the approved base is its ancestor and it is an ancestor of the
+  integrated commit, and every job's approved plan lists its `changed` and
+  `owned` paths (for a batch, every joined member's record included).
+  Otherwise the plan selects from the diff between the job's base and the
+  integrated commit, as it did before this rule. A fallback is never a
+  refusal.
+- **Where the rule is recorded.** In the attempt directory
+  (`JOB-integrated-verification/COMMIT-rN/`): `context.json` carries
+  `selectionBaseCommit` (the tip) and `selectionPaths` when the runner named a
+  tip; `plan.preserved.json` carries `selection` with `rule`
+  (`integration-tip` or `job-base`), `baseCommit`, and either
+  `selectionBaseCommit` and `selectionPaths` or the fallback `reason`
+  (`invalid-selection-base`, `invalid-selection-paths`,
+  `unreadable-selection-base`, `selection-base-off-line`). The plan command
+  prints the same on stderr. `plan.json` itself gains no field, because the
+  hub binds the receipt to the digest of the plan fields it knows.
+- **The record's role in the run.** `verify-matrix.mjs run` re-derives the
+  plan before any check starts and refuses a difference. It reads the
+  selection from `plan.preserved.json` beside the plan file and applies the
+  same tip conditions. With that record missing, unreadable, malformed or
+  naming a tip that fails the conditions, it re-derives from the job's base,
+  so a plan narrowed by the tip rule is refused as `Altered or omitted
+  required checks`, never run on trust. Keep the record with its plan; do not
+  edit or delete it in a live attempt directory.
+
 The handler's import (`verification` release operation) binds the integrated
 plan to the approved one and requires every approved check in it. Every check
-must match exactly except `go-race`: the runner builds the integrated plan with
-only the commit changed, so `verify-matrix.mjs` derives go-race packages from
-every path changed since the approved base, which includes the tasks-hub
-commits a cherry-pick lands on. An approved `go-race` is covered by an
+must match exactly except `go-race`: `verify-matrix.mjs` derives go-race
+packages from the paths the integrated plan selects from (above), which under
+the fallback rule are every path changed since the approved base, including
+the tasks-hub commits a cherry-pick lands on. An approved `go-race` is covered
+by an
 integrated one with the same id, cwd, environment and flags (every argv element
 before the first `./` package) whose packages are a superset of the approved
 list, or `./...`. Each approved check covered that way is recorded on the job

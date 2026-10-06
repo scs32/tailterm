@@ -377,9 +377,44 @@ export function keepAcceptedChecks(
     },
   };
 }
+// Which diff an integrated plan selects its checks from. The release runner
+// hands over the tasks-hub tip its candidate was integrated onto
+// (selectionBaseCommit) and the candidates' own changed and owned paths
+// (selectionPaths). The tip rule applies only to a readable tip on the line
+// from the bound base to the commit; anything else, a git failure included,
+// selects from the bound base as before and never throws.
+function selectionRule(context, cwd) {
+  const jobBase = (reason) => ({
+    rule: "job-base",
+    baseCommit: context.baseCommit,
+    reason,
+  });
+  const tip = context.selectionBaseCommit,
+    paths = context.selectionPaths;
+  if (tip === undefined) return jobBase("no-selection-base");
+  if (typeof tip !== "string" || !/^[a-f0-9]{40}$/.test(tip))
+    return jobBase("invalid-selection-base");
+  if (!Array.isArray(paths) || paths.some((p) => typeof p !== "string"))
+    return jobBase("invalid-selection-paths");
+  const ok = (...args) =>
+    spawnSync("git", args, { cwd, encoding: "utf8" }).status === 0;
+  if (!ok("rev-parse", "--verify", "--quiet", `${tip}^{commit}`))
+    return jobBase("unreadable-selection-base");
+  if (
+    !ok("merge-base", "--is-ancestor", tip, context.commit) ||
+    !ok("merge-base", "--is-ancestor", context.baseCommit, tip)
+  )
+    return jobBase("selection-base-off-line");
+  return {
+    rule: "integration-tip",
+    baseCommit: context.baseCommit,
+    selectionBaseCommit: tip,
+  };
+}
 // The plan, and for a context that carries accepted checks the record of what
 // was kept. The record stays outside the plan: the hub binds a receipt to the
-// digest of the plan fields it knows, so a plan carries no others.
+// digest of the plan fields it knows, so a plan carries no others. selection
+// names the rule the checks were selected by, also outside the plan.
 export function planWithPreservation(context, cwd) {
   if (
     !/^[a-f0-9]{40}$/.test(context.commit) ||
@@ -398,7 +433,23 @@ export function planWithPreservation(context, cwd) {
     );
   assertInventory(matrix, cwd);
   assertFastForward(cwd, context.baseCommit, context.commit);
-  const changed = diffPaths(cwd, context.baseCommit, context.commit);
+  const selection = selectionRule(context, cwd);
+  let changed;
+  if (selection.rule === "integration-tip") {
+    try {
+      changed = [
+        ...new Set([
+          ...diffPaths(cwd, selection.selectionBaseCommit, context.commit),
+          ...context.selectionPaths,
+        ]),
+      ].sort();
+    } catch {
+      delete selection.selectionBaseCommit;
+      selection.rule = "job-base";
+      selection.reason = "unreadable-selection-base";
+    }
+  }
+  changed ??= diffPaths(cwd, context.baseCommit, context.commit);
   let checks = selectChecks(
     matrix,
     context.owned,
@@ -423,7 +474,13 @@ export function planWithPreservation(context, cwd) {
     ));
     if (matrixChanged) preserved.acceptedMatrixDigest = context.matrixDigest;
   }
-  const { maxAttempts, knownFailures, ...inputContext } = context;
+  const {
+    maxAttempts,
+    knownFailures,
+    selectionBaseCommit,
+    selectionPaths,
+    ...inputContext
+  } = context;
   const plan = {
     ...inputContext,
     version: 1,
@@ -437,7 +494,7 @@ export function planWithPreservation(context, cwd) {
     if (matrixChanged) preserved.matrixDigest = plan.matrixDigest;
     preserved.checksDigest = plan.checksDigest;
   }
-  return { plan, preserved };
+  return { plan, preserved, selection };
 }
 export function makePlan(context, cwd) {
   return planWithPreservation(context, cwd).plan;
@@ -445,6 +502,29 @@ export function makePlan(context, cwd) {
 // Where plan mode writes the record of kept accepted checks for a plan file.
 export function preservationPath(planPath) {
   return planPath.replace(/\.json$/, "") + ".preserved.json";
+}
+// The selection inputs a plan's record names, for run mode to re-derive the
+// plan by the rule it was built with. A missing, unreadable or malformed
+// record, or one that names no integration tip, gives none: the plan is then
+// re-derived from its bound base.
+export function recordedSelection(planPath) {
+  try {
+    const { selection } = JSON.parse(
+      readFileSync(preservationPath(planPath), "utf8"),
+    );
+    if (
+      selection?.rule !== "integration-tip" ||
+      typeof selection.selectionBaseCommit !== "string" ||
+      !Array.isArray(selection.selectionPaths)
+    )
+      return undefined;
+    return {
+      selectionBaseCommit: selection.selectionBaseCommit,
+      selectionPaths: selection.selectionPaths,
+    };
+  } catch {
+    return undefined;
+  }
 }
 export function checkClean(cwd, commit) {
   if (git(cwd, "rev-parse", "HEAD") !== commit)
@@ -1127,9 +1207,15 @@ export async function runPlan(plan, cwd, output, options = {}) {
   // The plan's own checks are read as accepted checks, so a plan that kept an
   // accepted go-race re-derives to itself. A check edited any other way is
   // refused by that rule, and one dropped or narrowed by the comparison below.
+  // The selection inputs are not plan fields; options.selection carries the
+  // ones its record names, and the same rule decides whether they apply.
+  const { selectionBaseCommit, selectionPaths } = options.selection || {};
   let expected;
   try {
-    expected = makePlan(plan, cwd);
+    expected = makePlan(
+      options.selection ? { ...plan, selectionBaseCommit, selectionPaths } : plan,
+      cwd,
+    );
   } catch (error) {
     if (!error.acceptedChecks) throw error;
     throw new Error("Altered or omitted required checks: " + error.message);
@@ -1472,14 +1558,36 @@ if (
     const [mode, file, output, ...flags] = process.argv.slice(2),
       input = JSON.parse(readFileSync(file, "utf8"));
     if (mode === "plan") {
-      const { plan, preserved } = planWithPreservation(input, process.cwd());
+      const { plan, preserved, selection } = planWithPreservation(
+        input,
+        process.cwd(),
+      );
       writeFileSync(output, JSON.stringify(plan, null, 2) + "\n");
       rmSync(preservationPath(output), { force: true });
-      if (preserved) {
+      // Only a context that named a selection base reports its rule.
+      const stated = input.selectionBaseCommit !== undefined;
+      if (stated)
+        console.error(
+          selection.rule === "integration-tip"
+            ? `Selected checks from the integration tip ${selection.selectionBaseCommit}`
+            : `Selected checks from the job base ${selection.baseCommit} (${selection.reason})`,
+        );
+      // Run mode re-derives the plan from this record's selection inputs.
+      const record = stated
+        ? {
+            ...(preserved || { version: 1 }),
+            selection:
+              selection.rule === "integration-tip"
+                ? { ...selection, selectionPaths: input.selectionPaths }
+                : selection,
+          }
+        : preserved;
+      if (record)
         writeFileSync(
           preservationPath(output),
-          JSON.stringify(preserved, null, 2) + "\n",
+          JSON.stringify(record, null, 2) + "\n",
         );
+      if (preserved) {
         console.error(
           `Kept ${preserved.kept.length + preserved.widened.length} accepted checks (accepted checksDigest ${preserved.acceptedChecksDigest})` +
             (preserved.rebuilt.length
@@ -1524,11 +1632,13 @@ if (
             );
         } else throw new Error("Unknown verifier run option: " + flags[i]);
       }
+      const selection = mode === "run" ? recordedSelection(file) : undefined;
       const r = await (mode === "run" ? runPlan : runTargeted)(
         input,
         process.cwd(),
         resolve(output),
         {
+          ...(selection ? { selection } : {}),
           keepHome,
           minFreeBytes,
           jobs,
