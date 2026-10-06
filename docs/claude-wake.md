@@ -115,7 +115,7 @@ Every tool call in a Tailterm Claude agent session leaves one private local row:
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
 - Outside a Tailterm agent session (no `TAILTERM_AGENT`, `TAILTERM_TASK` or hub) it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
 
-Assumptions behind the 200 ms, not changed by this feature: before any hook runs, `tt` sets `PATH` and reads the small local file `~/.config/tailterm/hub.json` with no deadline, as every `tt` command and the four existing hooks do. A home directory on a stalled filesystem would hold all of them. The first run of a newly installed `tt` binary on macOS can take longer once (358 ms was measured for a freshly built binary, then 6 to 8 ms, and about 160 ms with stdin held open).
+Assumptions behind the 200 ms, not changed by this feature: before any hook runs, `tt` sets `PATH` and reads the small local file `~/.config/tailterm/hub.json` with no deadline, as every `tt` command and the four existing hooks do. A home directory on a stalled filesystem would hold all of them. One exception was measured: the first run of a new `tt` binary file on macOS takes 216 to 358 ms, once after each install, because the system checks a new binary on its first run. Later runs took 6 to 12 ms, and about 160 ms with stdin held open.
 
 When the 150 ms runs out, that invocation writes nothing more. A pre cut off leaves nothing. A post cut off before it claims its pending entry leaves the entry, which later becomes an `unknown` row; a post cut off between claiming the entry and appending the row loses that row.
 
@@ -168,10 +168,50 @@ A pre hook writes a pending file of at most 512 bytes with the start time, sessi
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.
 
-### Activation and rollback
+### Activation
 
-- The hooks reach the Mini when a release's Mini target runs `tt host setup --from ARTIFACT`, which installs the new `tt` and merges the three events into `~/.claude/settings.json`. Nothing is active before that step. Any other host gets them only when host setup is run there.
-- That file is the user-level settings, so from then every Claude Code session started on the host runs `tt hook tool` on every tool call, the owner's own sessions included. Only sessions with a Tailterm agent identity write rows.
-- Sessions already running when the file changes are affected too. Observed on 2026-10-06 with Claude Code 2.1.291 in `claude -p`, using a project-level `.claude/settings.json`: the hooks were added while the session's first tool call was running, and that call's PostToolUse and every later call ran the hook and wrote rows, with no restart. The first row of such a session has no pre, so its duration comes from Claude Code alone. An interactive session and the user-level file were not tried; assume they behave the same. So expect running Tailterm Claude sessions on a host to start writing rows at the moment host setup merges the hooks. Host setup installs the new `tt` before it merges them.
-- `tt host setup --rollback` restores the previous `tt` and does not touch hooks, so the three entries stay. The previous `tt` has no `tool` hook: in a Tailterm agent session it prints `tt: unknown hook "tool"` to stderr and exits 1 on every tool call, which Claude Code is documented to treat as a non-blocking hook error (not checked here). Outside an agent session it still exits 0 silently. To stop that after a rollback, delete the `tt hook tool` groups under `PreToolUse`, `PostToolUse` and `PostToolUseFailure` in `~/.claude/settings.json`; the next host setup puts them back.
+- The hooks reach the Mini when a release's Mini target runs `tt host setup --from ARTIFACT`. Host setup first renames the new `tt` into place, then merges the three events into `~/.claude/settings.json`. Nothing is active before that step. Any other host gets them only when host setup is run there.
+- That file is the user-level settings, so every Claude Code session on the host runs `tt hook tool` on every tool call, the owner's own sessions included. Only sessions with a Tailterm agent identity write rows.
+- Running sessions are ledgered from install; no restart is needed. Observed on 2026-10-06 with Claude Code 2.1.291 in `claude -p`, using a project-level `.claude/settings.json`: hooks added while a session's first tool call was running ran for that call's PostToolUse and for every later call. Hooks removed while a session ran stopped running for its later calls. The first row of a session ledgered mid-call has no pre, so its duration comes from Claude Code alone. An interactive session and the user-level file were not tried; expect the same.
 - `tt doctor` still checks only the four earlier hooks.
+
+### Rollback
+
+`tt host setup --rollback` restores the previous `tt` and restarts the relay. It does not touch hooks: in a sandbox home the settings file was byte-identical before and after it, and `TestHostSetupRollback` asserts the same. A `tt` from before this feature has no `tool` hook. Checked with that binary: in a Tailterm agent session `tt hook tool` prints `tt: unknown hook "tool"` to stderr and exits 1; outside one it exits 0 silently. Claude Code treats that exit 1 as a non-blocking error (see below), so tool calls keep working, but nothing is recorded and each call runs a failing hook.
+
+To roll back cleanly, remove the hooks first and then roll the binary back:
+
+```sh
+f="$HOME/.claude/settings.json"
+cp -p "$f" "$f.before-tool-hook-removal"
+/usr/bin/jq '
+  def ledger: ["PreToolUse", "PostToolUse", "PostToolUseFailure"];
+  if (.hooks | type) == "object" then
+    .hooks |= with_entries(
+      if (.key as $k | ledger | index($k)) and (.value | type) == "array" then
+        .value |= (map(if (.hooks | type) == "array"
+                       then .hooks |= map(select(((.command? // "") | tostring | test("(^|/)tt.? +hook +tool *$")) | not))
+                       else . end)
+                   | map(select((.hooks | type) != "array" or (.hooks | length) > 0)))
+      else . end)
+    | .hooks |= with_entries(select((.key as $k | ledger | index($k) | not) or (.value | length) > 0))
+  else . end' "$f.before-tool-hook-removal" > "$f.tmp" && cat "$f.tmp" > "$f" && rm "$f.tmp"
+grep -q 'hook tool' "$f" || echo "tool hooks removed"
+tt host setup --rollback
+```
+
+The filter removes only hook entries whose command is a `tt` binary followed by `hook tool`, then the groups and events that leaves empty. Run against the sandbox settings host setup had written, it removed the three groups, kept the user's own `PreToolUse` group with its `Bash` matcher, the four other tt hooks, every other key and a 20-digit number unchanged, and a second run changed nothing. `cat` into the file keeps its mode and a symlink. Running sessions stop running the hook once the file changes (observed as above). Any later `tt host setup` from a version with the ledger adds the hooks again, so the rolled-back `tt` must be the one used for further setup until the release is retried. To remove the hooks without rolling back, run the same commands without the last line. The ledger files stay; delete `~/.local/state/tailterm/tool-ledger` to remove them.
+
+### What Claude Code does when the hook misbehaves
+
+Observed on 2026-10-06 with Claude Code 2.1.291 in `claude -p`, with a made-up agent identity, an unreachable hub and the hook under test in a temporary project's settings:
+
+| Hook behaviour | What the session did |
+| --- | --- |
+| Exits 1 with text on stderr (the pre-feature `tt hook tool`) on all three events | Both tool calls ran and returned their normal results. The model saw no hook message. |
+| Exits 2 on PreToolUse with text on stderr | The tool call was blocked and the model was shown the stderr text. `tt hook tool` cannot do this: its handler returns nothing and `tt` exits 1 for any error. |
+| Does not return (a PreToolUse hook that sleeps 100 seconds) | Claude Code waited the full 100 seconds, then ran the tool call normally. No shorter timeout applied, so a hook that hangs holds each tool call for as long as it hangs. The limit at which Claude Code gives up was not observed. |
+
+So the only harm a broken `tt hook tool` can do is delay, and only by hanging. The handler's own work cannot hang past 150 ms. What remains is the time before the handler starts: process start and the config read named above. The installed entries carry no `timeout`; adding one is possible follow-up work.
+
+Replacing the `tt` binary while hooks run, measured with the candidate binary outside Claude Code: host setup installs by rename, so a call in flight keeps the binary it started with and exits 0, and the next call runs the new file. Across 300 consecutive calls with the binary replaced twice, every call exited 0 with no output and wrote its row. The first call after each replacement took 216 and 228 ms, against a median of 7 ms: macOS checks a new binary file on its first run. So the 200 ms bound is passed once after each install. This was not tried inside a Claude Code session.
