@@ -2148,6 +2148,35 @@ func TestClaudeWakeSkipEscalationNotice(t *testing.T) {
 			t.Fatalf("notice lacks %q: %s", want, got[0].Text)
 		}
 	}
+	// The relay posts with the owner's token, yet the notice is the relay's.
+	if relayAuthorHeader != server.RelayAuthorHeader {
+		t.Fatalf("relay marker header %q differs from the server's %q", relayAuthorHeader, server.RelayAuthorHeader)
+	}
+	if from := got[0].From; from != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) || from.User == by.User {
+		t.Fatalf("notice author = %+v, want the relay with no agent", from)
+	}
+	// An unmarked agentless post with the same token is still the owner's.
+	plain, err := c.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "owner note"})
+	if err != nil || plain.From != (api.Sender{Node: by.Node, User: by.User}) {
+		t.Fatalf("unmarked post author = %+v err=%v, want the owner", plain.From, err)
+	}
+	// The relay speaks for no agent: a marked post naming one stores nothing.
+	marked, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked.Token = token
+	marked.HTTP.Transport = relayAuthorTransport{}
+	before, err := c.ListMessages(ctx, task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := marked.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "as an agent", AgentID: worker.ID}); err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("marked post with an agent identity: err=%v, want 400", err)
+	}
+	if after, err := c.ListMessages(ctx, task.ID, 0, "", 200); err != nil || len(after) != len(before) {
+		t.Fatalf("rejected marked post stored a message: %d -> %d err=%v", len(before), len(after), err)
+	}
 
 	// The handler itself is the agent that cannot be woken.
 	skip.Since = since.Add(time.Hour)
@@ -2156,6 +2185,26 @@ func TestClaudeWakeSkipEscalationNotice(t *testing.T) {
 	}
 	if got = notices(); len(got) != 2 || got[1].To != "" || got[1].Envelope.To != "" || !strings.Contains(got[1].Text, handler.ID) {
 		t.Fatalf("handler skip with no owner helper should reach the Board: %+v", got)
+	}
+
+	// The marked client still draws on the relay's request budget: with one
+	// request left, listing agents spends it and the post waits past the deadline.
+	domain, err := canonicalLimiterDomain(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget, prior := new(relayRateBudget), activeRelayBudget
+	now := time.Now().UTC()
+	if err := budget.configure(&api.TeamHostPolicy{LimiterDomain: domain, Version: 1, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), MaxRequestsPerMinute: 4, MaxBurst: 4, HeadroomPercent: 50}, now); err != nil {
+		t.Fatal(err)
+	}
+	activeRelayBudget = budget
+	t.Cleanup(func() { activeRelayBudget = prior })
+	short, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	skip.Since = since.Add(2 * time.Hour)
+	if err := nativeClaudeEscalate(short, binding(worker), skip); !errors.Is(err, context.DeadlineExceeded) || len(notices()) != 2 {
+		t.Fatalf("escalation bypassed the relay budget: err=%v notices=%d", err, len(notices()))
 	}
 }
 

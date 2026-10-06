@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1028,8 +1029,26 @@ func claudeWakeTrackSkip(ctx context.Context, b runtimeBinding, ops claudeWakeOp
 	}
 }
 
+// relayAuthorHeader is the server's RelayAuthorHeader: the hub records a post
+// that carries it as the relay's, not as the owner whose token the relay uses.
+const relayAuthorHeader = "X-Tailterm-Relay-Author"
+
+// relayAuthorTransport marks every request of one client as the relay's own.
+type relayAuthorTransport struct{ base http.RoundTripper }
+
+func (t relayAuthorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	req = req.Clone(req.Context())
+	req.Header.Set(relayAuthorHeader, "1")
+	return base.RoundTrip(req)
+}
+
 // nativeClaudeEscalate posts one notice naming the session and the reason.
-// It uses the relay's configured hub token and shared request budget. The
+// It uses the relay's configured hub token and shared request budget, and
+// marks the post so the hub records the relay, not the owner, as author. The
 // notice goes to the project's database handler; when the skipped agent is
 // that handler, or none is live, to the owner helper; otherwise to the Board
 // with no recipient. The request identity is the run and the episode start,
@@ -1041,6 +1060,7 @@ func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWake
 	if err != nil {
 		return err
 	}
+	c.HTTP.Transport = relayAuthorTransport{base: c.HTTP.Transport}
 	attachRelayBudget(c, activeRelayBudget)
 	agents, err := c.ListAgents(ctx, b.Task)
 	if err != nil {

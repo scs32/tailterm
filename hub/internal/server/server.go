@@ -688,6 +688,14 @@ func (s *Server) closeAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, a)
 }
 
+// RelayAuthorHeader marks a message the host relay itself wrote. RelayNode and
+// RelayUser are the author the hub records for it, in place of the token's.
+const (
+	RelayAuthorHeader = "X-Tailterm-Relay-Author"
+	RelayNode         = "host-relay"
+	RelayUser         = "relay"
+)
+
 func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.writer(w, r)
 	if !ok {
@@ -706,6 +714,16 @@ func (s *Server) postMessage(w http.ResponseWriter, r *http.Request) {
 	if (req.Source != nil) != (c.Node == api.BridgeNode) || (c.Node == api.BridgeNode && (req.AgentID != "" || req.RunID != "")) {
 		writeError(w, http.StatusBadRequest, "a message source is required from the bridge and allowed only from the bridge")
 		return
+	}
+	// A host relay posts with the owner's token. Its own notices carry the
+	// marker and are recorded as the relay's, so they never read as the
+	// owner's. The relay speaks for no agent.
+	if r.Header.Get(RelayAuthorHeader) != "" {
+		if c.Node == api.BridgeNode || req.AgentID != "" || req.RunID != "" || req.Source != nil {
+			writeError(w, http.StatusBadRequest, "a relay-authored message carries no agent, run or source")
+			return
+		}
+		c = api.Caller{Node: RelayNode, User: RelayUser}
 	}
 	m, err := s.store.PostMessage(r.Context(), id, req, c)
 	if err != nil {
