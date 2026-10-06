@@ -1494,7 +1494,7 @@ dialog:modal {
   box-sizing: border-box;
   position: relative;
 }
-.tab-strip > .home-tab button:is([data-tab], [data-home-empty]) {
+.tab-strip > .home-tab button[data-tab] {
   flex: 1;
   min-width: 0;
   height: 100%;
@@ -6058,27 +6058,4 @@ body:is(
 }
 .delegated-tag {
   color: var(--ink);
-}
-
-/* The divider between home and the group beside it. */
-.home-divider {
-  position: absolute;
-  pointer-events: auto;
-  touch-action: none;
-  cursor: col-resize;
-  background: var(--terminal-bg);
-}
-.home-divider::after {
-  content: "";
-  position: absolute;
-  inset: 0 3px;
-  background: color-mix(in srgb, var(--muted) 30%, transparent);
-}
-.home-divider:hover::after,
-.home-divider:focus-visible::after {
-  background: var(--accent);
-}
-.home-divider:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
 }

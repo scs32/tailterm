@@ -46,7 +46,8 @@ export async function exerciseWorkspaceControls(page) {
         mobile ? { width: 390, height: 650 } : original,
       );
       const plus = await page.locator("#new-tab").boundingBox();
-      // The first tab in the strip: the pinned Home tab in TailOS.
+      // The first visible tab in the strip: the pinned Home tab only when a
+      // helper is bound.
       const tab = await page
         .locator(".tab-strip .tab:visible")
         .first()
