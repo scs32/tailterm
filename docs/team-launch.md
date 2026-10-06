@@ -367,8 +367,26 @@ and closeout also logs new outcomes to the relay's stderr as
 **One-time sweep.** For worktrees that predate closeout cleanup:
 
 ```sh
-tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--cwd DIR]
+tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]
 ```
+
+- `--apply` removes the `would-remove` worktrees and session temp folders and
+  prunes missing ones; without it the sweep is a dry run.
+- `--json` prints the result as JSON instead of lines.
+- `--min-idle` (default 24h) keeps worktrees whose Git state changed more
+  recently, and session temp folders changed more recently.
+- `--accepted-after` (default 24h) removes an accepted, unreleased item's
+  verifier checkouts once its acceptance is this old.
+- `--artifacts` names the artifacts root, an absolute path that defaults to
+  `TAILTERM_ARTIFACTS`, else `<main checkout>-artifacts`.
+- `--cwd` names any worktree of the repository, in place of the current
+  directory.
+- `--hub` names the hub URL to read, in place of the configured hub.
+
+A negative duration is a usage error, and a relative artifacts root is refused
+before the hub is read. `docs/project-queue.md` ("Team queue artifact and
+session temp retention") has the rules for verifier checkouts and session temp
+folders.
 
 Run it from any worktree of the repository (or pass `--cwd`). It first reads
 every project's roster and team queue from the hub and exits non-zero, having
@@ -430,13 +448,13 @@ blocking entry, the supported fix command and since when it has held (a
 durable time from saved records, so a hub restart does not reset it), and its
 reason starts with `Stalled:`. Causes:
 
-| Cause | Blocker |
-|---|---|
-| `failed-entry` | a failed entry that still holds its slot; in a parallel project only while its item still has live runs (with none, the runner releases it) |
-| `nothing-running` | a launching or running entry with no live item-bound run for the 5-minute grace |
-| `idle-entry` | a running entry whose live members are all idle, silent-finished or done, with no open work held or sent by them, for 30 minutes |
-| `no-handler` | no online, non-retired database handler exists |
-| `serial-halted` | a failed entry halts a serial queue |
+| Cause             | Blocker                                                                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `failed-entry`    | a failed entry that still holds its slot; in a parallel project only while its item still has live runs (with none, the runner releases it) |
+| `nothing-running` | a launching or running entry with no live item-bound run for the 5-minute grace                                                             |
+| `idle-entry`      | a running entry whose live members are all idle, silent-finished or done, with no open work held or sent by them, for 30 minutes            |
+| `no-handler`      | no online, non-retired database handler exists                                                                                              |
+| `serial-halted`   | a failed entry halts a serial queue                                                                                                         |
 
 A stall also covers slots or handler leases that are full only because stall
 blockers hold them. Waiting on a working team (an ownership overlap, full slots
