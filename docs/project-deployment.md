@@ -101,8 +101,10 @@ PRIVATE_INSPECTION --request-id KEY`. The typed inspection binds the held job,
 prior exact agent/run and pause generation, incident bug and hashed incident/
 journal evidence, last action and stop timestamps, expected next action, cause,
 contributing conditions/unresolved questions, and an accountable prevention
-item/order/criterion. The prevention order must have a current handler-confirmed
-scope. Preserve immediate recovery separately from permanent prevention; keep
+item/order/criterion. The prevention order may have been handler-confirmed at an
+earlier item revision if the narrative scope has not changed since, including
+when the prevention item has since been saved as done; dismissed items do not qualify.
+Preserve immediate recovery separately from permanent prevention; keep
 prevention work open until verified and handler-accepted. Retirement is not exit.
 A claimed run must be exited/closed or have completed exact-run rotation; host
 inspection must additionally prove no active execution, known journal state and

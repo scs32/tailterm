@@ -1324,6 +1324,73 @@ func setAsideEvidence(t *testing.T, s *Store, task api.Task, h api.Agent, j api.
 	return r
 }
 
+func TestReleaseRecoveryPreventionScopeAfterSave(t *testing.T) {
+	for _, operation := range []string{"set-aside", "reconcile"} {
+		for _, state := range []string{"done", "changed scope", "dismissed"} {
+			t.Run(operation+"/"+state, func(t *testing.T) {
+				s, task, h, d, entry := releaseFixture(t)
+				ctx := context.Background()
+				j := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+				evidence := recoveryEvidence(t, s, task, h, j)
+				if operation == "set-aside" {
+					if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "later-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "waiting fix", "later")}); err != nil {
+						t.Fatal(err)
+					}
+					evidence.Disposition = "set_aside"
+				} else if _, err := s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+					t.Fatal(err)
+				}
+				item, err := s.GetWorkItem(ctx, task.ID, evidence.PreventionItemID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				confirmation, err := s.GetWorkOrderScopeConfirmation(ctx, task.ID, item.ID, 1, evidence.PreventionOrderMessage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				update := api.UpdateWorkItemRequest{Revision: item.Revision}
+				if state == "changed scope" {
+					description := item.Description + "; expanded prevention scope"
+					update.Description = &description
+				} else {
+					update.Status = &state
+					if state == "done" {
+						seedPassingVerification(t, s, item, candidateB)
+					}
+				}
+				updated, err := s.UpdateWorkItem(ctx, task.ID, item.ID, update, api.Caller{Node: "fixture", User: "owner"})
+				if err != nil || updated.Revision != 2 {
+					t.Fatal("prevention save", updated.Revision, err)
+				}
+				if (updated.ScopeRevision != confirmation.ScopeRevision) != (state == "changed scope") {
+					t.Fatal("unexpected narrative scope", updated.ScopeRevision)
+				}
+				out, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "recover", Operation: operation, AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+				if state == "done" {
+					if err != nil || out.State != "verified" || out.Generation != j.Generation+1 || len(out.Reconciliations) != 1 {
+						t.Fatal("finished prevention refused", out.State, err)
+					}
+				} else {
+					if !errors.Is(err, api.ErrConflict) || (state == "changed scope" && !strings.Contains(err.Error(), "scope confirmation is stale")) {
+						t.Fatal("expected prevention refusal", err)
+					}
+					saved, loadErr := releaseLoad(ctx, s.db, task.ID, j.ID)
+					if loadErr != nil || saved.State != j.State || saved.Generation != j.Generation || len(saved.Reconciliations) != 0 {
+						t.Fatal("refusal changed the job", saved.State, loadErr)
+					}
+				}
+				retained, err := s.GetWorkOrderScopeConfirmation(ctx, task.ID, item.ID, 1, evidence.PreventionOrderMessage)
+				if err != nil || verificationDigest(retained) != verificationDigest(confirmation) {
+					t.Fatal("original confirmation changed", err)
+				}
+				if _, err := s.GetWorkOrderScopeConfirmation(ctx, task.ID, item.ID, 2, evidence.PreventionOrderMessage); !errors.Is(err, api.ErrNotFound) {
+					t.Fatal("recovery created a new confirmation", err)
+				}
+			})
+		}
+	}
+}
+
 // A claimed job whose integrated import is refused would wait forever; the
 // fix for that refusal, queued behind it, claims once the handler sets the
 // stuck job aside, and the stuck job is claimed afresh after the fix ships.

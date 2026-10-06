@@ -1180,7 +1180,24 @@ func releaseIncident(ctx context.Context, tx *sql.Tx, task string, r *api.Releas
 	if err != nil {
 		return err
 	}
-	return requireConfirmedTeamOrder(ctx, tx, task, prevention.ID, prevention.Revision, r.PreventionOrderMessage)
+	if prevention.Status == "dismissed" {
+		return releaseConflict("dismissed prevention item cannot support release recovery")
+	}
+	// A status or other non-scope save can advance the item revision after
+	// its order was confirmed, including when prevention finishes. Read the
+	// latest confirmation without changing the immutable admission record.
+	var scope int64
+	err = tx.QueryRowContext(ctx, `SELECT scope_revision FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND order_seq=? AND item_revision<=? ORDER BY item_revision DESC LIMIT 1`, task, prevention.ID, r.PreventionOrderMessage, prevention.Revision).Scan(&scope)
+	if errors.Is(err, sql.ErrNoRows) {
+		return workItemConflict("scope is not confirmed for this exact item revision and order; ask the database handler to complete intake and confirm the owner-filed scope before queueing or launching")
+	}
+	if err != nil {
+		return err
+	}
+	if scope != prevention.ScopeRevision {
+		return workItemConflict("scope confirmation is stale; ask the database handler to confirm the current item revision")
+	}
+	return nil
 }
 
 // setAsideRelease frees the fence held by a claimed job that has no effects,
