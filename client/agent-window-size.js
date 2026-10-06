@@ -42,7 +42,9 @@ export function eligibleAgentViewport(s) {
 // a stale callback does not enqueue a new claim for an ineligible pane. A claim
 // already in transport cannot be cancelled: if it sizes the window after its
 // pane hid, closed or changed identity, one restore puts back the size read
-// before the claim and drops authority, unless a newer viewer has claimed.
+// before the claim and drops authority, unless a newer viewer has claimed. A
+// resize in transport likewise: if it lands after its pane hid, the size this
+// claim last set while visible is sent again, then the claim is released.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -59,6 +61,11 @@ export function createAgentWindowSizer({
     wasEligible = false,
     failed = false;
   const identity = (s) => JSON.stringify([s.target, s.binding, s.connection]);
+  // True once the pane a command was sent for hid, closed or changed identity.
+  const stale = (key) => {
+    const s = snapshot();
+    return disposed || !eligibleAgentViewport(s) || identity(s) !== key;
+  };
   function refresh({ focus = false } = {}) {
     if (disposed) return;
     if (focus) {
@@ -149,18 +156,13 @@ export function createAgentWindowSizer({
               };
               const outcome = await command(claim, "claim");
               if (outcome === "superseded") continue;
-              const after = snapshot();
-              if (
-                outcome === "sized" &&
-                ready[2] &&
-                (disposed ||
-                  !eligibleAgentViewport(after) ||
-                  identity(after) !== key)
-              ) {
-                const stale = claim;
+              if (outcome === "sized" && !stale(key))
+                claim.sized = { cols: claim.cols, rows: claim.rows };
+              else if (outcome === "sized" && ready[2]) {
+                const obsolete = claim;
                 claim = null;
                 await command(
-                  { ...stale, cols: +ready[2], rows: +ready[3] },
+                  { ...obsolete, cols: +ready[2], rows: +ready[3] },
                   "restore",
                 );
               }
@@ -174,7 +176,17 @@ export function createAgentWindowSizer({
         } else if (claim && (claim.cols !== s.cols || claim.rows !== s.rows)) {
           claim.cols = s.cols;
           claim.rows = s.rows;
-          await command(claim, "resize");
+          const outcome = await command(claim, "resize");
+          if (outcome === "sized") {
+            if (!stale(key))
+              claim.sized = { cols: claim.cols, rows: claim.rows };
+            else if (claim.sized) {
+              // The same token sends the size it last set while visible, so
+              // a newer viewer still wins; the next pass releases the claim.
+              Object.assign(claim, claim.sized);
+              await command(claim, "resize");
+            }
+          }
           pending = true;
         }
       }

@@ -757,3 +757,160 @@ test("restore yields to a newer viewer and a visible pane never restores", async
     await f.cleanup();
   }
 });
+
+test("a resize delivered after hide, dispose or reconnect is put back to the last visible size and never overwrites a newer viewer", async (t) => {
+  const f = setupAgentWindowFixture();
+  try {
+    const binding = valid().binding;
+    const run = (command) => {
+      const r = spawnSync("/bin/sh", ["-c", command], {
+        env: f.env,
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, r.stderr);
+      return r.stdout;
+    };
+    for (const [i, scenario] of [
+      { transition: "hide" },
+      { transition: "dispose" },
+      { transition: "reconnect" },
+      { transition: "hide", newer: "before delivery" },
+      { transition: "hide", newer: "after delivery" },
+    ].entries()) {
+      const { transition, newer } = scenario;
+      f.tmux(
+        "new-session",
+        "-d",
+        "-s",
+        "late-resize-" + i,
+        "-n",
+        "agent",
+        "-e",
+        "TAILTERM_TASK=" + binding.taskId,
+        "-e",
+        "TAILTERM_AGENT=" + binding.agentId,
+        "-e",
+        "TAILTERM_RUN=" + binding.runId,
+        "sleep 60",
+      );
+      const [id, created] = f
+        .tmux(
+          "display-message",
+          "-p",
+          "-t",
+          "late-resize-" + i,
+          "#{session_id}|#{session_created}",
+        )
+        .split("|");
+      const state = () =>
+        f.tmux(
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        );
+      const a = { ...valid(), target: { id, created }, path: f.wrapper };
+      const b = { ...a, cols: 200, rows: 51 };
+      const sent = [];
+      let release, arrived;
+      const gate = new Promise((r) => (release = r)),
+        arrival = new Promise((r) => (arrived = r));
+      // Hold the resize itself, or the command that follows its delivery.
+      const heldAt = newer === "after delivery" ? 4 : 3;
+      const A = createAgentWindowSizer({
+        snapshot: () => a,
+        token: () => "late_resize_A_00000000000" + i,
+        execute: async (command) => {
+          sent.push(command);
+          if (newer === "after delivery" && sent.length === 3) hide();
+          if (sent.length === heldAt) {
+            arrived();
+            await gate;
+          }
+          return run(command);
+        },
+      });
+      const B = createAgentWindowSizer({
+        snapshot: () => b,
+        token: () => "late_resize_B_00000000000" + i,
+        execute: async (command) => run(command),
+      });
+      function hide() {
+        a.foreground = false;
+        if (transition === "hide") a.visible = false;
+        if (transition === "dispose") A.dispose();
+        if (transition === "reconnect") {
+          a.connection++;
+          a.connected = false;
+        }
+        A.refresh();
+      }
+      try {
+        A.refresh({ focus: true });
+        await A.settled();
+        assert.equal(state(), "120x34|late_resize_A_00000000000" + i);
+        a.cols = 240;
+        a.rows = 60;
+        A.refresh();
+        await arrival;
+        if (newer === "after delivery")
+          // The pane hid in transport and the resize landed; a newer viewer
+          // now claims before A's next command is delivered.
+          assert.equal(state(), "240x59|late_resize_A_00000000000" + i);
+        else {
+          assert.match(sent[2], /-x 240 -y 59 .*sized/);
+          assert.equal(
+            state(),
+            "120x34|late_resize_A_00000000000" + i,
+            "the resize is still held in transport",
+          );
+          hide();
+        }
+        let expected = "120x34|";
+        if (newer) {
+          B.refresh({ focus: true });
+          await B.settled();
+          expected = "200x50|late_resize_B_00000000000" + i;
+          assert.equal(state(), expected);
+        }
+        release();
+        await A.settled();
+        assert.equal(
+          state(),
+          expected,
+          transition +
+            (newer ? ", newer viewer " + newer : "") +
+            ": the delayed size does not stand",
+        );
+        assert.doesNotMatch(state(), /^240x59/);
+        if (!newer) {
+          assert.equal(sent.length, 5, "inspect, claim, resize, undo, release");
+          assert.match(sent[3], /-x 120 -y 34 .*sized/);
+          assert.match(sent[4], /released/);
+        }
+        const count = sent.length;
+        a.cols = 250;
+        A.refresh();
+        await A.settled();
+        assert.equal(sent.length, count, "no further hidden work");
+        assert.equal(state(), expected);
+        t.diagnostic(
+          "delayed resize: " +
+            transition +
+            (newer ? ", newer viewer " + newer : "") +
+            " -> " +
+            state(),
+        );
+      } finally {
+        release();
+        A.dispose();
+        B.dispose();
+        await A.settled();
+        await B.settled();
+      }
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
