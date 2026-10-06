@@ -3,12 +3,19 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"modernc.org/sqlite"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -129,8 +136,8 @@ func TestObligationWakePromptNamesFullTextCommand(t *testing.T) {
 	}
 }
 
-// inboxScale is the wi_e1b6ca74b7e58414 fixture: 500 agents, 450 of them
-// closed, 480 bound across 60 work items, and 20,000 messages.
+// inboxScale is the wi_e1b6ca74b7e58414 fixture: 600 agents, 570 of them
+// closed, 580 bound across 60 work items, and 20,000 messages.
 type inboxScale struct {
 	agents []string
 	// boundOpen and unboundOpen are open agents that have read nothing, the
@@ -146,8 +153,8 @@ type inboxScale struct {
 }
 
 const (
-	inboxScaleAgents   = 500
-	inboxScaleBound    = 480
+	inboxScaleAgents   = 600
+	inboxScaleBound    = 580
 	inboxScaleMessages = 20000
 )
 
@@ -178,7 +185,7 @@ func seedInboxScale(t *testing.T, db *sql.DB, taskID string, items []api.WorkIte
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	f := inboxScale{unread: map[string]int{}}
-	open := func(i int) bool { return i%10 == 0 }
+	open := func(i int) bool { return i%20 == 0 }
 	itemOf := func(i int) int {
 		if i >= inboxScaleBound {
 			return -1
@@ -192,7 +199,7 @@ func seedInboxScale(t *testing.T, db *sql.DB, taskID string, items []api.WorkIte
 		if open(i) {
 			status = api.AgentRunning
 		}
-		exec(addAgent, id, taskID, fmt.Sprintf("scale-%d", i), "fixture", fmt.Sprintf("scale-%d", i), "codex", status, now, now, fmt.Sprintf("run_%016x", i+1))
+		exec(addAgent, id, taskID, fmt.Sprintf("scale-%d", i), "fixture", fmt.Sprintf("scale-%d", i), "codex", status, ts(parseTS(now).Add(time.Duration(i)*time.Millisecond)), now, fmt.Sprintf("run_%016x", i+1))
 		f.agents = append(f.agents, id)
 	}
 	f.boundOpen, f.unboundOpen, f.closedBound = f.agents[0], f.agents[inboxScaleBound], f.agents[1]
@@ -256,6 +263,41 @@ func seedInboxScale(t *testing.T, db *sql.DB, taskID string, items []api.WorkIte
 			exec(addCursor, taskID, id, f.recent)
 		}
 	}
+	// Non-empty metadata on open and closed agents, plus stale-run rows that
+	// must be ignored. Use isolated SQL fixtures, never live task data.
+	addActivity := prepare(`INSERT INTO agent_activity VALUES(?,?,?,?,?,?,?)`)
+	for i, id := range f.agents {
+		run := fmt.Sprintf("run_%016x", i+1)
+		if i%3 == 0 || i == 1 {
+			payload, err := json.Marshal(api.AgentActivity{State: "working", ObservedAt: parseTS(now), PendingTool: "fixture", Tokens: api.TokenTotals{Input: int64(i + 1)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(addActivity, taskID, id, run, "working", now, string(payload), fmt.Sprintf("activity-%d", i))
+		}
+		exec(addActivity, taskID, id, "run_old", "idle", now, "invalid stale payload", fmt.Sprintf("old-activity-%d", i))
+	}
+	exec(prepare(`UPDATE agents SET cwd='/fixture',title='scale title',last_seen_at=?,blocked_reason='tool',blocked_text='fixture blocker',cleanup_done=1,cleanup_error='fixture receipt' WHERE id=?`), now, f.closedBound)
+	exec(prepare(`UPDATE agent_work_item_bindings SET replaces_agent_id=?,team_role='extra',context_through_message_seq=7 WHERE agent_id=?`), f.agents[2], f.closedBound)
+	exec(prepare(`INSERT INTO read_cursors VALUES(?,?,?)`), taskID, f.agents[3], 12)
+	lead := prepare(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,?,?)`)
+	for i, state := range []string{"running", "launching", "closed", "running"} {
+		run := fmt.Sprintf("run_%016x", i+1)
+		if i == 3 {
+			run = "run_old"
+		}
+		exec(lead, taskID, items[i].ID, f.agents[i], run, i+2, state)
+	}
+	// More than one lead row must retain QueryRow's first revision.
+	exec(lead, taskID, items[4].ID, f.boundOpen, "run_0000000000000001", 17, "running")
+	exec(prepare(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,replaces_agent_id,team_role,context_digest,context_json,created_at)
+SELECT agent_id,'run_old',item_task_id,item_id,99,work_order_task_id,work_order_message_seq,context_through_message_seq,replaces_agent_id,team_role,context_digest,context_json,created_at
+FROM agent_work_item_bindings WHERE agent_id=?`), f.boundOpen)
+
+	exec(prepare(`UPDATE agents SET role='database_handler' WHERE id=?`), f.closedBound)
+	exec(prepare(`INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at)
+VALUES('rotation_fixture',?,'fixture','fixture','committed','fixture','fixture',1,?,?,'closed handler',?,'successor',?,?)`), taskID, f.closedBound, "run_0000000000000002", f.agents[2], now, now)
+
 	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -291,9 +333,88 @@ func bestOf(t *testing.T, fn func()) time.Duration {
 	return best
 }
 
+// Count the actual database/sql driver calls, including QueryRowContext.
+// No production counter or mock query path is involved.
+var inboxScaleDriverSerial atomic.Int64
+
+type inboxScaleDriver struct {
+	driver.Driver
+	queries *atomic.Int64
+}
+
+type inboxScaleConn struct {
+	driver.Conn
+	queries *atomic.Int64
+}
+
+func (d inboxScaleDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.Driver.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return inboxScaleConn{conn, d.queries}, nil
+}
+
+func (c inboxScaleConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+}
+
+func (c inboxScaleConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	c.queries.Add(1)
+	return c.Conn.(driver.QueryerContext).QueryContext(ctx, q, args)
+}
+
+func (c inboxScaleConn) ExecContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, q, args)
+}
+
+// Preserve the pre-fix ListAgents loader as the full-field parity oracle.
+func perAgentRoster(t *testing.T, s *Store, task string) []api.Agent {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := s.db.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? ORDER BY created_at`, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := []api.Agent{}
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	for i := range out {
+		a := &out[i]
+		for _, load := range []func(context.Context, *api.Agent) error{s.loadActivity, s.loadAgentWorkItem, s.loadSuccessor} {
+			if err := load(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+		}
+		err := s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, task, a.ID, a.RunID).Scan(&a.ItemLeadRevision)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		a.ItemLead = err == nil
+		if a.ReadUpTo, err = s.ReadCursor(ctx, task, a.ID); err != nil {
+			t.Fatal(err)
+		}
+		if a.Status != api.AgentClosed && a.Status != api.AgentExited {
+			if a.Unread, err = s.Unread(ctx, task, a.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return out
+}
+
 // wi_e1b6ca74b7e58414: the inbox of a bound agent is read through the two
 // indexes rather than a scan of the task's messages, and the roster counts
-// unread only for agents that can still read, so both stay fast at 500 agents
+// unread only for agents that can still read, so both stay fast at 600 agents
 // and 20,000 messages (213fd7e took 25 s for the roster at 473 agents).
 func TestInboxScale(t *testing.T) {
 	ctx := context.Background()
@@ -318,6 +439,22 @@ func TestInboxScale(t *testing.T) {
 	}
 	f := seedInboxScale(t, s.db, task.ID, items)
 
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Other roster task"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty, err := s.ListAgents(ctx, other.ID); err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("empty roster = %+v, %v", empty, err)
+	}
+	otherAgent, err := s.AddAgent(ctx, other.ID, api.AddAgentRequest{Name: "other", Host: "fixture", Session: "other"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A malformed current snapshot on another task must never be loaded.
+	if _, err := s.db.Exec(`INSERT INTO agent_activity VALUES(?,?,?,'idle',?,'invalid other-task payload','other-activity')`, other.ID, otherAgent.ID, otherAgent.RunID, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+
 	// The index is declared in the schema, so Open creates it on a new
 	// database and on an existing one that lacks it.
 	hasIndex := func(when string) {
@@ -338,6 +475,17 @@ func TestInboxScale(t *testing.T) {
 		t.Fatal(err)
 	}
 	hasIndex("an existing")
+
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var queries atomic.Int64
+	countDriver := fmt.Sprintf("inbox-scale-%d", inboxScaleDriverSerial.Add(1))
+	sql.Register(countDriver, inboxScaleDriver{Driver: &sqlite.Driver{}, queries: &queries})
+	if s.db, err = sql.Open(countDriver, path); err != nil {
+		t.Fatal(err)
+	}
+	s.db.SetMaxOpenConns(1)
 
 	// Correctness on the fixture.
 	for _, id := range []string{f.boundOpen, f.unboundOpen} {
@@ -416,6 +564,26 @@ func TestInboxScale(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	queries.Store(0)
+	want := perAgentRoster(t, s, task.ID)
+	baselineQueries := queries.Swap(0)
+	listAgents()
+	rosterQueries := queries.Swap(0)
+	if len(roster) != len(want) {
+		t.Fatalf("roster length = %d, want %d", len(roster), len(want))
+	}
+	if !reflect.DeepEqual(roster, want) {
+		for i := range roster {
+			if !reflect.DeepEqual(roster[i], want[i]) {
+				t.Errorf("roster field mismatch at %d: got %+v, want %+v", i, roster[i], want[i])
+			}
+		}
+	}
+	t.Logf("SQL queries: per-agent loader %d, ListAgents %d", baselineQueries, rosterQueries)
+	if rosterQueries > 40 {
+		t.Errorf("ListAgents issued %d SQL queries, want at most 40", rosterQueries)
+	}
+
 	rosterTime := bestOf(t, listAgents)
 	if len(roster) != inboxScaleAgents {
 		t.Fatalf("roster has %d agents, want %d", len(roster), inboxScaleAgents)
@@ -434,8 +602,8 @@ func TestInboxScale(t *testing.T) {
 			}
 		}
 	}
-	if closed != 450 {
-		t.Errorf("roster has %d closed agents, want 450", closed)
+	if closed != 570 {
+		t.Errorf("roster has %d closed agents, want 570", closed)
 	}
 	closedAgent, err := s.GetAgent(ctx, f.closedBound)
 	if err != nil || closedAgent.Unread != f.unread[f.closedBound] || closedAgent.Unread == 0 {
@@ -464,13 +632,13 @@ func TestInboxScale(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	t.Logf("500 agents, 20,000 messages: ListAgents %v, unread inbox %v", rosterTime, inboxTime)
+	t.Logf("600 agents (30 open), 20,000 messages: ListAgents %v, unread inbox %v", rosterTime, inboxTime)
 	if testing.Short() || raceBuilt() {
 		t.Log("wall-clock bounds are not checked in short or race runs")
 		return
 	}
-	if rosterTime > time.Second {
-		t.Errorf("ListAgents took %v, want under 1 s", rosterTime)
+	if rosterTime >= 100*time.Millisecond {
+		t.Errorf("ListAgents took %v, want under 100 ms", rosterTime)
 	}
 	if inboxTime > time.Second {
 		t.Errorf("unread inbox took %v, want under 1 s", inboxTime)

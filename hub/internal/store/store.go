@@ -976,7 +976,14 @@ func (s *Store) GetAgent(ctx context.Context, id string) (api.Agent, error) {
 }
 
 func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? ORDER BY created_at`, taskID)
+	// A single read snapshot keeps task membership and run identity coherent
+	// while agents are admitted or replaced between the set queries.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? ORDER BY created_at`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -992,34 +999,114 @@ func (s *Store) ListAgents(ctx context.Context, taskID string) ([]api.Agent, err
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// Finish the base scan before querying again: the store has one connection.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return out, tx.Commit()
+	}
+	byID := make(map[string]*api.Agent, len(out))
 	for i := range out {
-		if err = s.loadActivity(ctx, &out[i]); err != nil {
-			return nil, err
+		byID[out[i].ID] = &out[i]
+	}
+	// Every metadata query selects the task's agents and, where applicable,
+	// only their current run. Historical runs and other tasks cannot leak in.
+	load := func(query string, scan func(*sql.Rows) error) error {
+		rows, err := tx.QueryContext(ctx, query, taskID)
+		if err != nil {
+			return err
 		}
-		if err = s.loadAgentWorkItem(ctx, &out[i]); err != nil {
-			return nil, err
+		defer rows.Close()
+		for rows.Next() {
+			if err := scan(rows); err != nil {
+				return err
+			}
 		}
-		if err = s.loadSuccessor(ctx, &out[i]); err != nil {
-			return nil, err
+		return rows.Err()
+	}
+	if err = load(`SELECT x.agent_id,x.payload FROM agents a
+JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id WHERE a.task_id=?`, func(rows *sql.Rows) error {
+		var id, payload string
+		if err := rows.Scan(&id, &payload); err != nil {
+			return err
 		}
-		err = s.db.QueryRowContext(ctx, `SELECT revision FROM item_team_leads WHERE task_id=? AND agent_id=? AND run_id=? AND state<>'closed'`, taskID, out[i].ID, out[i].RunID).Scan(&out[i].ItemLeadRevision)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
+		var activity api.AgentActivity
+		if err := json.Unmarshal([]byte(payload), &activity); err != nil {
+			return fmt.Errorf("activity snapshot: %w", err)
 		}
-		out[i].ItemLead = err == nil
-		if out[i].ReadUpTo, err = s.ReadCursor(ctx, taskID, out[i].ID); err != nil {
-			return nil, err
+		byID[id].Activity = &activity
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err = load(`SELECT `+agentWorkItemBindingCols+` FROM agent_work_item_bindings
+WHERE (agent_id,run_id) IN (SELECT id,run_id FROM agents WHERE task_id=?)`, func(rows *sql.Rows) error {
+		binding, err := scanAgentWorkItemBinding(rows)
+		if err == nil {
+			byID[binding.AgentID].WorkItem = binding
 		}
-		// A closed or exited agent no longer reads, so the roster does not
-		// count for it; GetAgent still returns its exact count.
-		if out[i].Status == api.AgentClosed || out[i].Status == api.AgentExited {
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	if err = load(`SELECT r.old_agent_id,r.successor_agent_id FROM agents a
+JOIN handler_rotations r ON r.old_agent_id=a.id AND r.state='committed'
+WHERE a.task_id=? AND a.role='database_handler'`, func(rows *sql.Rows) error {
+		var id, successor string
+		if err := rows.Scan(&id, &successor); err != nil {
+			return err
+		}
+		if a := byID[id]; a.SuccessorID == "" {
+			a.SuccessorID = successor
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err = load(`SELECT l.agent_id,l.revision FROM agents a
+JOIN item_team_leads l ON l.task_id=a.task_id AND l.agent_id=a.id AND l.run_id=a.run_id
+WHERE a.task_id=? AND l.state<>'closed'`, func(rows *sql.Rows) error {
+		var id string
+		var revision int64
+		if err := rows.Scan(&id, &revision); err != nil {
+			return err
+		}
+		a := byID[id]
+		// Match QueryRow's first row if one agent leads multiple items.
+		if !a.ItemLead {
+			a.ItemLead, a.ItemLeadRevision = true, revision
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if err = load(`SELECT agent_id,up_to FROM read_cursors WHERE task_id=?`, func(rows *sql.Rows) error {
+		var id string
+		var cursor int64
+		if err := rows.Scan(&id, &cursor); err != nil {
+			return err
+		}
+		if a := byID[id]; a != nil {
+			a.ReadUpTo = cursor
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		a := &out[i]
+		// Preserve the roster's zero unread count for closed/exited agents.
+		// GetAgent still returns their exact count.
+		if a.Status == api.AgentClosed || a.Status == api.AgentExited {
 			continue
 		}
-		if out[i].Unread, err = s.Unread(ctx, taskID, out[i].ID); err != nil {
+		query, args := inboxUnreadQuery(taskID, a.ID, a.ReadUpTo, a.WorkItem)
+		if err := tx.QueryRowContext(ctx, query, args...).Scan(&a.Unread); err != nil {
 			return nil, err
 		}
 	}
-	return out, nil
+	return out, tx.Commit()
 }
 
 func (s *Store) UpdateAgent(ctx context.Context, id string, req api.UpdateAgentRequest, by api.Caller) (api.Agent, error) {

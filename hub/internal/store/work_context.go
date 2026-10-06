@@ -448,11 +448,12 @@ ON CONFLICT(task_id,agent_id) DO UPDATE SET up_to=MAX(up_to,excluded.up_to)`, ag
 	return binding, err
 }
 
-func loadAgentWorkItemBinding(q queryRower, ctx context.Context, agentID, runID string) (*api.AgentWorkItemBinding, error) {
+const agentWorkItemBindingCols = `agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,COALESCE(replaces_agent_id,''),team_role,context_digest,created_at`
+
+func scanAgentWorkItemBinding(row interface{ Scan(...any) error }) (*api.AgentWorkItemBinding, error) {
 	var binding api.AgentWorkItemBinding
 	var created string
-	err := q.QueryRowContext(ctx, `SELECT agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,COALESCE(replaces_agent_id,''),team_role,context_digest,created_at
-FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, agentID, runID).Scan(
+	err := row.Scan(
 		&binding.AgentID, &binding.RunID, &binding.ItemTaskID, &binding.ItemID, &binding.ItemRevision,
 		&binding.WorkOrderMessage.TaskID, &binding.WorkOrderMessage.Seq, &binding.ContextThroughMessageSeq,
 		&binding.ReplacesAgentID, &binding.TeamRole, &binding.ContextDigest, &created,
@@ -465,6 +466,11 @@ FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, agentID, runID).Sc
 	}
 	binding.CreatedAt = parseTS(created)
 	return &binding, nil
+}
+
+func loadAgentWorkItemBinding(q queryRower, ctx context.Context, agentID, runID string) (*api.AgentWorkItemBinding, error) {
+	return scanAgentWorkItemBinding(q.QueryRowContext(ctx, `SELECT `+agentWorkItemBindingCols+`
+FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, agentID, runID))
 }
 
 func (s *Store) loadAgentWorkItem(ctx context.Context, agent *api.Agent) error {
