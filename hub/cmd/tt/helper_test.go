@@ -1843,6 +1843,15 @@ func TestHelperRegisterInheritedOtherProjectIdentity(t *testing.T) {
 		unchanged(what)
 	}
 
+	// This project's own helper re-registers even when the pane's inherited
+	// project is another one.
+	again, err := f.register(t, env{hub: f.owner.hub, task: second.ID, agent: a.ID, runID: a.RunID})
+	if err != nil || again.Agent.ID != a.ID || again.Registration.Mode != api.OwnerHelperReplaced || again.Registration.PreviousRunID != a.RunID {
+		t.Fatalf("own helper with another inherited project: %+v %v", again, err)
+	}
+	a = *again.Agent
+	inherited.runID = a.RunID
+
 	// The explicit flag moves the session, with the warning naming the cost.
 	warning, err := registerSecond(inherited, "--take-session")
 	helpers := secondHelpers()
