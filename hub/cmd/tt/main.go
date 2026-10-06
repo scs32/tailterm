@@ -123,11 +123,17 @@ func readEnv() env {
 	return e
 }
 
+// minCommandTimeout is a floor under every command deadline built by
+// env.client and ctxTimeout. It is zero outside tests, which leaves each
+// requested duration unchanged; a test raises it so a loaded host cannot
+// expire a fixed deadline before the hub answers.
+var minCommandTimeout time.Duration
+
 func (e env) client(timeout time.Duration) (*api.Client, error) {
 	if e.hub == "" {
 		return nil, errors.New("TAILTERM_HUB is not set")
 	}
-	c, err := api.NewClient(e.hub, timeout)
+	c, err := api.NewClient(e.hub, max(timeout, minCommandTimeout))
 	if c != nil {
 		c.Token = e.token
 	}
@@ -284,7 +290,7 @@ func main() {
 }
 
 func ctxTimeout(d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d)
+	return context.WithTimeout(context.Background(), max(d, minCommandTimeout))
 }
 
 func printJSON(v any) {

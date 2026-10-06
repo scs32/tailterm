@@ -90,8 +90,53 @@ type exactRunFixture struct {
 	reportInvalidated *atomic.Bool
 }
 
+// exactRunCommandTimeout is the floor these tests put under the CLI's fixed
+// command deadlines. Each case builds its own hub, and under full-matrix load
+// one loopback read has outlasted the 10 s the commands ask for
+// (wi_5e804f501074629f).
+const exactRunCommandTimeout = 60 * time.Second
+
+// raiseCommandTimeout sets minCommandTimeout for the rest of the test and
+// restores the previous value afterwards. Tests using it must not run in
+// parallel.
+func raiseCommandTimeout(t *testing.T) {
+	t.Helper()
+	previous := minCommandTimeout
+	minCommandTimeout = exactRunCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
+}
+
+func TestCommandTimeoutFloor(t *testing.T) {
+	if minCommandTimeout != 0 {
+		t.Fatalf("default minCommandTimeout = %v, want 0", minCommandTimeout)
+	}
+	check := func(requested, want time.Duration) {
+		t.Helper()
+		c, err := env{hub: "http://127.0.0.1:1"}.client(requested)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.HTTP.Timeout != want {
+			t.Fatalf("client timeout for %v = %v, want %v", requested, c.HTTP.Timeout, want)
+		}
+		start := time.Now()
+		ctx, cancel := ctxTimeout(requested)
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if got := deadline.Sub(start); !ok || got < want || got > want+time.Second {
+			t.Fatalf("context deadline for %v is %v away (set %v), want %v", requested, got, ok, want)
+		}
+	}
+	check(10*time.Second, 10*time.Second)
+	check(2*time.Minute, 2*time.Minute)
+	raiseCommandTimeout(t)
+	check(10*time.Second, exactRunCommandTimeout)
+	check(2*time.Minute, 2*time.Minute)
+}
+
 func newExactRunFixture(t *testing.T) *exactRunFixture {
 	t.Helper()
+	raiseCommandTimeout(t)
 	f := &exactRunFixture{tmuxLog: exactRunTmux(t), loseAgentReply: new(atomic.Bool), reportInvalidated: new(atomic.Bool), agentID: api.NewID("agt"), runID: api.NewID("run")}
 	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
 	if err != nil {
@@ -131,7 +176,7 @@ func newExactRunFixture(t *testing.T) *exactRunFixture {
 		handler.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	if f.c, err = api.NewClient(srv.URL, 5*time.Second); err != nil {
+	if f.c, err = api.NewClient(srv.URL, exactRunCommandTimeout); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -350,6 +395,7 @@ func TestAgentSessionExactRunSpawnRejectsWithoutExactIntent(t *testing.T) {
 // A hub that returns a matching intent but admits a different run must not
 // reach tmux, and the admitted agent is closed.
 func TestAgentSessionExactRunSpawnClosesOnAdmittedRunMismatch(t *testing.T) {
+	raiseCommandTimeout(t)
 	log := exactRunTmux(t)
 	taskID, itemID := api.NewID("tsk"), api.NewID("wi")
 	handlerID, launcherID, launcherRun := api.NewID("agt"), api.NewID("agt"), api.NewID("run")
