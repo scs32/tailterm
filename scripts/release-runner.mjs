@@ -48,9 +48,14 @@ export function failureDetail(error) {
   }
   return detail;
 }
-function childReason(argv, error) {
+// For the configured CLI only (cli), the reason also names the subcommand:
+// its first one or two argv words when they are plain lowercase words. No
+// flag, value or path of the call is ever part of it.
+const CLI_WORD = /^[a-z][a-z-]{0,23}$/;
+function childReason(argv, error, cli) {
   const base = p => String(p).split("/").pop(), program = /\.(py|mjs)$/.test(argv[1] || "") ? base(argv[1]) : base(argv[0]);
-  const name = /^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program";
+  const word = i => argv[0] === cli && CLI_WORD.test(argv[i] || "") ? " " + argv[i] : "";
+  const name = (/^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program") + word(1) + (word(1) ? word(2) : "");
   if(error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")return `${name} ENOBUFS (command buffer overflow)`;
   const how = error.code === "ETIMEDOUT" ? "timeout" : /^SIG[A-Z0-9]{1,12}$/.test(error.signal || "") ? `signal ${error.signal}` : Number.isInteger(error.status) ? `exit ${error.status}` : "not started";
   let fields = "";
@@ -60,6 +65,43 @@ function childReason(argv, error) {
     if (classification) fields = `: ${classification}${stage ? ` at ${stage}` : ""}`;
   } catch {}
   return `${name} ${how}${fields}`;
+}
+// What the private journal directory keeps of a failed call of the configured
+// CLI, in cli-failures.json (0600): the exact argv, working directory, exit
+// code, signal and the end of stderr. argv can hold Board text and private
+// paths, so none of it leaves this file; the Board and the job journal get
+// only childReason's text. The newest CLI_FAILURES distinct failures are kept;
+// a repeat of a kept one only raises its count and lastAt, so a failing poll
+// cannot grow the file. A record that cannot be written is dropped.
+const CLI_FAILURES = 20, CLI_STDERR_BYTES = 16384;
+function recordCliFailure(config, job, argv, cwd, error, reason, now) {
+  const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
+  let tail = Buffer.from(text.slice(-CLI_STDERR_BYTES));
+  if (tail.length > CLI_STDERR_BYTES) tail = tail.subarray(tail.length - CLI_STDERR_BYTES);
+  const bytes = Buffer.byteLength(text), at = new Date(now).toISOString();
+  const entry = {at, jobId: job?.id || null, agentId: process.env.TAILTERM_AGENT || null, runId: process.env.TAILTERM_RUN || null, argv: [...argv], cwd: cwd ?? null,
+    exitCode: Number.isInteger(error.status) ? error.status : null, signal: typeof error.signal === "string" ? error.signal : null, errorCode: typeof error.code === "string" ? error.code : null,
+    stderr: tail.toString("utf8"), stderrBytes: bytes, stderrTruncated: bytes > tail.length, count: 1, lastAt: at};
+  try {
+    const path = join(config.journalDirectory, "cli-failures.json"), argvText = JSON.stringify(entry.argv);
+    let failures = [];
+    try { const prior = JSON.parse(readFileSync(path, "utf8")); if (Array.isArray(prior?.failures)) failures = prior.failures; } catch {}
+    const kept = failures.find(f => ["jobId", "runId", "cwd", "exitCode", "signal", "errorCode", "stderr", "stderrBytes"].every(k => f?.[k] === entry[k]) && JSON.stringify(f.argv) === argvText);
+    if (kept) { kept.count = (Number.isSafeInteger(kept.count) ? kept.count : 1) + 1; kept.lastAt = at; entry.at = kept.at; }
+    else failures.push(entry);
+    save(path, {version: 1, failures: failures.slice(-CLI_FAILURES)});
+  } catch {}
+  return {reason, jobId: entry.jobId, at: entry.at};
+}
+// The Board notice for a recorded CLI failure: the safe reason and the job,
+// nothing else of the call. key is one per job and reason for a process; the
+// request id also carries when the kept failure was first seen, so a later
+// recurrence is a new notice while a restart's resend is not.
+export function cliFailureNotice(failure, run) {
+  const reason = REASON.test(failure?.reason || "") ? failure.reason : "unclassified", job = /^rel_[A-Za-z0-9]{1,40}$/.test(failure?.jobId || "") ? failure.jobId : null;
+  const id = createHash("sha256").update(JSON.stringify([failure?.at ?? null, job, reason])).digest("hex").slice(0, 16);
+  return {key: `cli-failure ${job} ${reason}`, requestId: `cli-failure-${NAME(run)}-${id}`, jobId: job, subject: "A deployer CLI call failed",
+    text: `Deployer CLI call failed: ${reason}${job ? ` (release ${job})` : ""}. The exact argv, exit code and stderr are kept in cli-failures.json in the private journal directory of the deployer.`};
 }
 // The files verify-matrix.mjs requires before a browser check runs, in its
 // order (a drift test pins the list). All are gitignored, so provisioning
@@ -292,6 +334,8 @@ export async function runRelease(config, adapter) {
       throw releaseError("Ambiguous journal requires handler reconciliation");
     }
   }
+  // The runner code that last ran this job; never part of a resume decision.
+  if(config.code)state.code={loaded:config.code.loaded??null,current:config.code.current??null};
   const checkpoint=()=>save(journalPath,state);let step=null;
   const fence=async()=>{if(await adapter.fence(job)!==true)throw releaseError("release fence lost");};
   // Every selected target is live-verified before this runs, so nothing here
@@ -385,7 +429,10 @@ export async function runRelease(config, adapter) {
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
     if(!state.published && state.effects.length===0){
-      state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();await adapter.refuse();state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
+      state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();
+      // refusalReason stays the cause; a refuse call that itself fails is named beside it.
+      try{await adapter.refuse();}catch(refuseError){state.refuseFailure=failureReason(refuseError);checkpoint();throw refuseError;}
+      state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
     }
     let blocked=state.effects.length===0;
     // Newest effect first, except that a paired hub is restored before its
@@ -475,11 +522,17 @@ export class HostAdapter {
     // The TailOS poller's fetch and clock; tests replace them.
     this.probeDeps={fetchJSON:hostDeps.fetchJSON,sleep:hostDeps.sleep,now:hostDeps.now};this.probeWaits=new Map();
     // What the last poll saw: a wait on the host list, or a held run.
-    this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;}
+    this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;
+    // Failed calls of the configured CLI this adapter recorded privately.
+    this.cliFailures=[];}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout});}
-    catch(error){const failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error);throw failed;}
+    catch(error){
+      const cli=this.config.tt||"tt",failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli);
+      if(argv[0]===cli && this.config.journalDirectory){try{this.cliFailures.push(recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now()));}catch{}}
+      throw failed;
+    }
   }
   detail(id){
     const job=JSON.parse(this.command([this.config.tt||"tt","deployment","get","--job",id]));
@@ -902,6 +955,100 @@ export class HostAdapter {
   }
 }
 
+// The runner's own code: the six scripts one process loads once, as static
+// imports, by file name under scripts/. A drift test pins the list to their
+// "./" imports. A code digest is the sha256 of the "name:sha256" lines.
+export const RUNNER_CODE_FILES=["release-inputs.mjs","release-probe.mjs","release-runner.mjs","release-targets.mjs","verify-matrix-host-lock.mjs","verify-matrix.mjs"];
+const HEX64=/^[a-f0-9]{64}$/,bytesDigest=bytes=>createHash("sha256").update(bytes).digest("hex");
+export const codeDigest=files=>bytesDigest(RUNNER_CODE_FILES.map(n=>`${n}:${files[n]}`).join("\n"));
+export function diskCode(directory){
+  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(readFileSync(join(directory,n)))]));
+  return {files,digest:codeDigest(files)};
+}
+// Read once as this process starts: the bytes beside this module, which are
+// the ones it imported. null when they cannot be read; the gate then refuses.
+export const LOADED_CODE=(()=>{try{return diskCode(dirname(fileURLToPath(import.meta.url)));}catch{return null;}})();
+// The same six scripts as published: the blobs of refs/heads/tasks-hub, never
+// the working tree, which holds an unpublished candidate after a refusal.
+export function publishedCode(cwd){
+  const commit=git(cwd,"rev-parse","--verify","refs/heads/tasks-hub^{commit}");
+  if(!sha(commit))throw releaseError("published-unreadable");
+  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(execFileSync("git",["cat-file","blob",`${commit}:scripts/${n}`],{cwd,stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024}))]));
+  return {commit,files,digest:codeDigest(files)};
+}
+const validCode=c=>HEX64.test(c?.digest||"") && RUNNER_CODE_FILES.every(n=>HEX64.test(c.files?.[n]||""));
+// What a poll may do about its own code. current: claim as usual. draining:
+// stale while a release, matrix run or host release lock is active; claim
+// nothing new. restart: stale and idle; re-exec onto the published scripts.
+// refused: claim nothing until a person re-provisions the deployer. marker is
+// the published digest a re-exec was last aimed at: stale again at that same
+// digest means the re-exec did not change what this process loads.
+export const CODE_REASONS=["loaded-unreadable","published-unreadable","restart-did-not-refresh","checkout-dirty","checkout-failed","disk-mismatch","exec-failed"];
+export function codeDecision({loaded,published,idle,marker}){
+  if(!validCode(loaded))return {state:"refused",reason:"loaded-unreadable"};
+  if(!validCode(published) || !sha(published.commit))return {state:"refused",reason:"published-unreadable"};
+  if(loaded.digest===published.digest)return {state:"current"};
+  if(idle!==true)return {state:"draining"};
+  if(marker===published.digest)return {state:"refused",reason:"restart-did-not-refresh"};
+  return {state:"restart"};
+}
+// Brings the idle checkout to the published commit before a re-exec, under
+// integrateCandidate's cleanliness rule (ignored build outputs do not count),
+// and proves the six files on disk are the published bytes.
+export function prepareCode(cwd,published){
+  let dirty;try{dirty=git(cwd,"status","--porcelain");}catch{throw releaseError("checkout-failed");}
+  if(dirty)throw releaseError("checkout-dirty");
+  try{if(git(cwd,"rev-parse","HEAD")!==published.commit)git(cwd,"checkout","--detach",published.commit);}catch{throw releaseError("checkout-failed");}
+  let disk;try{disk=diskCode(join(cwd,"scripts"));}catch{throw releaseError("disk-mismatch");}
+  if(disk.digest!==published.digest)throw releaseError("disk-mismatch");
+}
+// The gate serveDeployment consults before every claim; only the daemon entry
+// builds it, and tests replace its parts. exec replaces this process image
+// (same pid, parent, agent and run) and returns only in tests. noticed and
+// said hold what this process already posted and printed.
+export function runnerCodeGate(over={}){
+  const from=process.env.TAILTERM_RUNNER_REEXEC_FROM;
+  return {loaded:LOADED_CODE,marker:process.env.TAILTERM_RUNNER_REEXEC||null,restartedFrom:HEX64.test(from||"")?from:null,
+    published:publishedCode,prepare:prepareCode,now:()=>Date.now(),execve:(file,argv,env)=>process.execve(file,argv,env),
+    async exec(published){
+      // Whatever this process printed reaches a piped terminal before it is replaced.
+      await new Promise(done=>{setTimeout(done,1000).unref();process.stderr.write("",()=>done());});
+      this.execve(process.execPath,[process.execPath,...process.execArgv,...process.argv.slice(1)],{...process.env,TAILTERM_RUNNER_REEXEC:published.digest,TAILTERM_RUNNER_REEXEC_FROM:this.loaded.digest});
+    },
+    noticed:new Set(),said:new Set(),...over};
+}
+// JOURNAL/runner-code.json (0600): the code this process loaded and the
+// published code it was last compared with. Rewritten only when something
+// other than checkedAt changes, so checkedAt is when this state was first seen.
+export function codeRecord(config,code,decision,published){
+  const iso=ms=>new Date(ms).toISOString(),loaded=validCode(code.loaded)?{digest:code.loaded.digest,files:code.loaded.files}:null;
+  const current=validCode(published)&&sha(published.commit)?{commit:published.commit,digest:published.digest,files:published.files}:null;
+  code.startedAt??=iso(code.now());
+  const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),
+    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&code.marker===loaded.digest?{restartedFrom:code.restartedFrom}:{})};
+  const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null});
+  let prior=null;try{prior=JSON.parse(readFileSync(path,"utf8"));}catch{}
+  if(prior && unchecked(prior)===unchecked(record))return prior;
+  save(path,record);return record;
+}
+// Board notices about the runner's code. Only 12-hex prefixes, names from
+// RUNNER_CODE_FILES and fixed reason tokens reach the text. The request id
+// has no time in it, so a restarted process resends the same notice.
+const RESTART_ACTION="Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).";
+const short=v=>HEX64.test(v||"")||sha(v)?v.slice(0,12):"none";
+export function codeNotice(record,kind=record?.state){
+  if(!["draining","restart","restarted","refused"].includes(kind))return null;
+  const run=NAME(record.runId),loaded=short(record.loaded?.digest),current=short(record.current?.digest),reason=CODE_REASONS.includes(record.reason)?record.reason:"unclassified";
+  const changed=(Array.isArray(record.changed)?record.changed:[]).filter(n=>RUNNER_CODE_FILES.includes(n)).join(", ")||"none";
+  const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
+  const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:""}`;
+  if(kind==="draining")return {requestId,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
+  if(kind==="restart")return {requestId,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
+  if(kind==="restarted")return {requestId,subject:"Deployer now runs the published scripts",text:`Deployer run ${run} restarted itself from scripts ${short(record.restartedFrom)} and now runs ${loaded}, the scripts of published tasks-hub ${short(record.current?.commit)}.`};
+  return {requestId,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
+    text:`${seen} It could not restart itself and claims no release. Reason: ${reason}. ${RESTART_ACTION}`};
+}
+const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n"};
 export function runnableJob(jobs,agent,run,skipped=new Set()){
   const owned=jobs.find(j=>["claimed","merged"].includes(j.state) && j.agentId===agent && j.runId===run);
   if(owned)return owned;
@@ -1035,7 +1182,7 @@ export function readBaselines(configPath){
   if(!targets.every(t=>sha(b?.[t])))throw releaseError("Four last-successful baselines required");
   return Object.fromEntries(targets.map(t=>[t,b[t]]));
 }
-export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease}={}) {
+export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease,code}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw releaseError("Explicit private activation config required");
   tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
   retentionPolicy(config);
@@ -1059,11 +1206,31 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       catch{process.stderr.write("Matrix host notice not posted; the next poll retries.\n");}
     }
   };
+  // One notice and one terminal line per code state, loaded and published
+  // digest for this process; a failed post is retried by the next poll.
+  const codeNotify=(reader,record,kind=record.state)=>{
+    const notice=codeNotice(record,kind);if(!notice)return;
+    if(CODE_LINES[kind] && !code.said.has(notice.requestId)){code.said.add(notice.requestId);process.stderr.write(CODE_LINES[kind]);}
+    if(code.noticed.has(notice.requestId))return;
+    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId]);code.noticed.add(notice.requestId);}
+    catch{process.stderr.write("Runner code notice not posted; the next poll retries.\n");}
+  };
+  // One notice per job and safe reason for the CLI failures a held poll or a
+  // held release recorded. It goes through the CLI that just failed, so it is
+  // best effort: the private record and the terminal line remain.
+  const cliNotify=(reader,failures)=>{
+    for(const failure of [...failures]){
+      const notice=cliFailureNotice(failure,process.env.TAILTERM_RUN);
+      if(posted.has(notice.key))continue;
+      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[])]);posted.add(notice.key);}catch{}
+    }
+  };
   while(!signal?.aborted){
+    let reader=null;
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
     const configured=configPath?readBaselines(configPath):config.baselines;
-    const reader=new HostAdapter(config,{});
+    reader=new HostAdapter(config,{});
     const read=argv=>reader.command([config.tt||"tt",...argv]);
     const jobs=readReleaseSummaries(read);
     // Validate complete baseline history before any recovery write, pruning or claim.
@@ -1085,6 +1252,33 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
+    // The runner's own code, once per poll and before any claim. Idle is the
+    // only place it restarts: no claimed, merged or blocked job, no matrix run
+    // of this process and no host release lock. Whatever is decided, a stale
+    // runner claims nothing below; a job it already owns is still run.
+    let codeNow=null;
+    if(code){
+      let published=null;try{published=code.published(config.cwd);}catch{}
+      const idle=!jobs.some(j=>["claimed","merged","blocked"].includes(j.state)) && MATRIX_CHILDREN.size===0 && !existsSync(lock);
+      let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker});
+      // A re-exec that failed in this process is not tried again for the same
+      // published code, so its refusal is not rewritten on every poll.
+      if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
+      if(decision.state==="restart"){
+        try{code.prepare(config.cwd,published);}
+        catch(error){const reason=failureReason(error);decision={state:"refused",reason:CODE_REASONS.includes(reason)?reason:"checkout-failed"};}
+      }
+      if(decision.state==="restart"){
+        // Recorded and announced first: a successful exec never returns.
+        codeNotify(reader,codeRecord(config,code,decision,published));
+        try{await code.exec(published);}catch{code.execFailed=published.digest;decision={state:"refused",reason:"exec-failed"};}
+      }
+      codeNow=codeRecord(config,code,decision,published);
+      // An unreadable published ref is announced only when it withholds a
+      // claim (below), so a poll with nothing to claim stays silent.
+      if(codeNow.state==="current"){if(codeNow.restartedFrom)codeNotify(reader,codeNow,"restarted");}
+      else if(codeNow.reason!=="published-unreadable")codeNotify(reader,codeNow);
+    }
     const skipped=new Set();
     for (;;) {
       const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
@@ -1094,6 +1288,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         if(holder)notify(reader,jobs,details.get(holder.id),holder.state);
         break;
       }
+      // Stale code never archives a journal or claims.
+      if(codeNow && codeNow.state!=="current" && job.state==="verified"){codeNotify(reader,codeNow);break;}
       // Archived only while unclaimed, so a later crash of the new claim
       // leaves its own journal alone.
       if(job.state==="verified"){
@@ -1106,12 +1302,13 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       const current=adapter.job;adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
       let result;
-      try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json")},adapter);}catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");}
+      try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json"),...(codeNow?{code:{loaded:codeNow.loaded?.digest??null,current:codeNow.current?.digest??null}}:{})},adapter);}
+      catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");cliNotify(reader,[...reader.cliFailures,...adapter.cliFailures]);}
       if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,jobs,adapter.job||current,result.outcome);
       matrixNotify(reader,adapter.job||current,adapter);
       break;
     }
-    } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);}
+    } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);if(reader)cliNotify(reader,reader.cliFailures);}
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));
   }
@@ -1133,6 +1330,6 @@ if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) 
     if(index<0)throw releaseError("Private config required");
     const config=JSON.parse(readFileSync(process.argv[index+1],"utf8"));
     const controller=new AbortController();process.on("SIGTERM",()=>controller.abort());process.on("SIGINT",()=>controller.abort());
-    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1]});
+    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1],code:runnerCodeGate()});
   }catch{process.stderr.write("Deployment blocked; inspect private host journal and handler release gate.\n");process.exitCode=1;}
 }

@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -57,13 +57,16 @@ test("buf2 real fake tt command overflow names ENOBUFS without payloads or claim
  assert.throws(()=>adapter.command([f.tt,"deployment","list"]),e=>e.message==="Host operation failed" && failureReason(e)==="tt ENOBUFS (command buffer overflow)");
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");const diagnostic=poll.stderr;
  assert.match(diagnostic,/Deployment poll held.*ENOBUFS.*command buffer overflow/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
- assert.equal(readFileSync(f.log,"utf8"),"deployment list\ndeployment list --view active --limit 200\n");
+ const calls=readFileSync(f.log,"utf8").split("\n");assert.deepEqual(calls.slice(0,2),["deployment list","deployment list --view active --limit 200"]);
+ assert.match(calls[2],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list ENOBUFS \(command buffer overflow\)\. /);assert.ok(!calls[2].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(3),[""]);
 });
 test("buf3 fake tt errors and invalid JSON keep bounded non-secret poll diagnostics",t=>{
  for(const body of [`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');process.exit(2);`,`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');`]){
   const f=bufferTT(t,body),poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");
   const diagnostic=poll.stderr;assert.match(diagnostic,/Deployment poll held/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
-  assert.match(diagnostic,body.includes("process.exit")?/tt exit 2/:/unclassified/);assert.equal(readFileSync(f.log,"utf8"),"deployment list --view active --limit 200\n");
+  assert.match(diagnostic,body.includes("process.exit")?/tt deployment list exit 2/:/unclassified/);const calls=readFileSync(f.log,"utf8").split("\n");assert.equal(calls[0],"deployment list --view active --limit 200");
+  if(body.includes("process.exit")){assert.match(calls[1],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list exit 2\. /);assert.ok(!calls[1].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(2),[""]);}
+  else assert.deepEqual(calls.slice(1),[""]);
  }
 });
 function fixture(){const cwd=mkdtempSync(join(tmpdir(),"release-git-")),origin=mkdtempSync(join(tmpdir(),"release-origin-"));git(origin,"init","--bare","-b","tasks-hub");git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"client"));writeFileSync(join(cwd,"client/base.js"),"base");git(cwd,"add",".");git(cwd,"commit","-m","base");const base=git(cwd,"rev-parse","HEAD");git(cwd,"remote","add","origin",origin);git(cwd,"push","--quiet","origin","tasks-hub");git(cwd,"checkout","-b","candidate");return {cwd,base,origin};}
@@ -1734,4 +1737,243 @@ test("immutable flat and paged consumers cross both APIs with a stable binary th
  const original=readFileSync(configPath,"utf8");failure=401;bad=await run(shim,["deployment","list"]);assert(bad.err);assert.equal(bad.stdout,"");assert.equal(readFileSync(configPath,"utf8"),original);
  assert(methods.every(m=>m.startsWith("GET ")),"compatibility reads cannot post or claim");
  assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);assert(!existsSync(join(dir,jobID+"-inputs.json")));
+});
+
+// Runner code gate (wi_2be015df9af54c5c). A fixture repository whose scripts/
+// holds six small stand-ins: commit a, then commit b changing the runner.
+const CODE_AGENT="agt_c0defixture",CODE_RUN="run_c0defixture",SAFE_TEXT=/^[A-Za-z0-9 ,.:;()_\/-]+$/;
+function codeRepo(t,real=false){
+ // The real path: the daemon entry compares its argv with the module's own URL.
+ const cwd=realpathSync(mkdtempSync(join(tmpdir(),"release-code-")));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"scripts"));
+ for(const n of RUNNER_CODE_FILES){if(real)copyFileSync(new URL("../scripts/"+n,import.meta.url),join(cwd,"scripts",n));else writeFileSync(join(cwd,"scripts",n),`// ${n} a\n`);}
+ if(real){mkdirSync(join(cwd,"tests"));copyFileSync(new URL("./test-binaries.mjs",import.meta.url),join(cwd,"tests/test-binaries.mjs"));}
+ git(cwd,"add",".");git(cwd,"commit","-m","a");const a=git(cwd,"rev-parse","HEAD"),codeA=publishedCode(cwd);
+ writeFileSync(join(cwd,"scripts/release-runner.mjs"),readFileSync(join(cwd,"scripts/release-runner.mjs"),"utf8")+"// b\n");git(cwd,"add",".");git(cwd,"commit","-m","b");
+ const b=git(cwd,"rev-parse","HEAD"),codeB=publishedCode(cwd);
+ // at(head,published): detached at head with tasks-hub at published.
+ const at=(head,published)=>{git(cwd,"checkout","--quiet","--detach",head);git(cwd,"update-ref","refs/heads/tasks-hub",published);};
+ return {cwd,a,b,codeA,codeB,at,head:()=>git(cwd,"rev-parse","HEAD")};
+}
+// A fake tt that reads its job list from a file on every call, logs each argv
+// as a JSON line, accepts claim, check and send, and fails anything else.
+function codeHost(t,cwd,extra=""){
+ const home=mkdtempSync(join(tmpdir(),"release-code-home-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const tt=join(home,"tt"),log=join(home,"calls.jsonl"),jobsPath=join(home,"jobs.json");
+ writeFileSync(tt,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs'),cp=require('child_process');const a=process.argv.slice(2),jobs=JSON.parse(fs.readFileSync(${JSON.stringify(jobsPath)},'utf8'));
+let head='';try{head=cp.execFileSync('git',['rev-parse','HEAD'],{cwd:${JSON.stringify(cwd)},encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();}catch{}
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({argv:a,ppid:process.ppid,run:process.env.TAILTERM_RUN||null,agent:process.env.TAILTERM_AGENT||null,head})+'\\n');
+const flag=n=>a[a.indexOf(n)+1],job=jobs.find(j=>j.id===flag('--job'));${extra}
+if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(jobs,a)));
+else if(a[1]==='claim')console.log(JSON.stringify({...job,state:'claimed',generation:+flag('--generation')+1,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN}));
+else if(a[1]==='check')console.log(JSON.stringify({...job,state:'claimed',generation:+flag('--generation'),agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN}));
+else if(a[0]!=='send')process.exit(2);`);chmodSync(tt,0o755);
+ const config={version:1,enabled:true,cwd,journalDirectory:home,tt,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(x=>[x,"a".repeat(40)]))};
+ const setJobs=jobs=>writeFileSync(jobsPath,JSON.stringify(jobs));setJobs([]);
+ const calls=()=>existsSync(log)?readFileSync(log,"utf8").trim().split("\n").filter(Boolean).map(l=>JSON.parse(l)):[];
+ const sends=()=>calls().filter(c=>c.argv[0]==="send").map(c=>({subject:c.argv[c.argv.indexOf("--subject")+1],text:c.argv[c.argv.indexOf("--text")+1],requestId:c.argv[c.argv.indexOf("--request-id")+1]}));
+ const claims=()=>calls().filter(c=>c.argv[1]==="claim");
+ const record=()=>JSON.parse(readFileSync(join(home,"runner-code.json"),"utf8"));
+ // One poll in this process under a fixed agent and run; returns its stderr.
+ const poll=async(code,release=async()=>{})=>{
+  const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="";
+  process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+  try{await serveDeployment(config,{once:true,release,...(code?{code}:{})});}
+  finally{process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+  return err;
+ };
+ return {home,tt,config,setJobs,calls,sends,claims,record,poll};
+}
+const verifiedJob=(id="rel_code")=>({id,state:"verified",generation:1,commit:"c".repeat(40)});
+// The gate with a spy in place of the process replacement.
+function codeGate(loaded,over={}){const execs=[];return {execs,gate:runnerCodeGate({loaded,marker:null,restartedFrom:null,now:()=>Date.parse("2026-10-06T06:00:00Z"),execve:(...args)=>{execs.push(args);},...over})};}
+const codeSends=h=>h.sends().filter(s=>s.requestId.startsWith("runner-code-"));
+
+test("code a1 unchanged code does not restart: the job is claimed, nothing is re-executed and no code notice is sent",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeB),released=[];h.setJobs([verifiedJob()]);
+ const err=await h.poll(gate,async c=>{released.push(c);});
+ assert.equal(h.claims().length,1);assert.equal(execs.length,0);assert.deepEqual(codeSends(h),[]);assert.equal(err,"");
+ assert.equal(h.record().state,"current");assert.deepEqual(released.map(c=>[c.job.id,c.code]),[["rel_code",{loaded:r.codeB.digest,current:r.codeB.digest}]]);
+});
+test("code a2 changed code cannot claim: two polls claim and set aside nothing, and the re-exec keeps argv, agent and run",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd);r.at(r.a,r.b);
+ const job={...verifiedJob(),reconciliations:[{disposition:"set_aside",agentId:"agt_old",runId:"run_old"}]},journal=join(h.home,job.id+".json");
+ writeFileSync(journal,JSON.stringify({jobId:job.id,commit:job.commit,agentId:"agt_old",runId:"run_old",effects:[]}));h.setJobs([job]);
+ const seen=[],{gate,execs}=codeGate(r.codeA,{execve:(...args)=>{execs.push(args);seen.push({record:h.record(),head:r.head(),claims:h.claims().length});}});
+ const released=[];await h.poll(gate,async c=>{released.push(c);});await h.poll(gate,async c=>{released.push(c);});
+ assert.equal(h.claims().length,0);assert.deepEqual(released,[]);assert.ok(existsSync(journal));assert.deepEqual(readdirSync(h.home).filter(n=>n.includes("set-aside")),[]);
+ assert.equal(execs.length,2);const [file,argv,env]=execs[0];
+ assert.equal(file,process.execPath);assert.deepEqual(argv,[process.execPath,...process.execArgv,...process.argv.slice(1)]);
+ assert.equal(env.TAILTERM_AGENT,CODE_AGENT);assert.equal(env.TAILTERM_RUN,CODE_RUN);assert.equal(env.TAILTERM_RUNNER_REEXEC,r.codeB.digest);assert.equal(env.TAILTERM_RUNNER_REEXEC_FROM,r.codeA.digest);
+ // The record was saved, and the checkout moved to the published commit, before the re-exec.
+ assert.equal(seen[0].record.state,"restart");assert.equal(seen[0].record.loaded.digest,r.codeA.digest);assert.equal(seen[0].record.current.digest,r.codeB.digest);assert.equal(seen[0].head,r.b);assert.equal(seen[0].claims,0);
+ assert.equal(r.head(),r.b);assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer is restarting itself onto the published scripts"]);
+});
+test("code a3 active jobs drain: an owned job, a live matrix run and a blocked job each stop the restart, which then happens once before any claim",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);
+ // (i) this run's own claimed job is still run.
+ const own={id:"rel_own",state:"claimed",generation:2,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN},released=[];
+ h.setJobs([own,verifiedJob("rel_next")]);await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.deepEqual(released,["rel_own"]);assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.record().state,"draining");assert.equal(h.claims().length,0);
+ // (ii) a matrix run this process started.
+ const children=new HostAdapter({},{}).matrixChildren,key="code-a3-fixture";children.set(key,{});t.after(()=>children.delete(key));
+ h.setJobs([verifiedJob("rel_next")]);await h.poll(gate,async c=>{released.push(c.job.id);});children.delete(key);
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.record().state,"draining");assert.equal(h.claims().length,0);
+ // (iii) a blocked job holds the fence.
+ h.setJobs([{id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40)},verifiedJob("rel_next")]);await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.record().state,"draining");assert.equal(h.claims().length,0);assert.deepEqual(released,["rel_own"]);
+ assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer code is out of date; it restarts itself after the current release"]);
+ // (iv) free: one re-exec, and no claim before or after it.
+ h.setJobs([verifiedJob("rel_next")]);let claimsAtExec=null;gate.execve=(...args)=>{execs.push(args);claimsAtExec=h.claims().length;};await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.equal(execs.length,1);assert.equal(claimsAtExec,0);assert.equal(h.claims().length,0);assert.equal(r.head(),r.b);assert.equal(h.record().state,"restart");assert.deepEqual(released,["rel_own"]);
+});
+test("code a4 a runner that cannot restart refuses with one actionable notice and no claim",async t=>{
+ const refusal=async(reason,arrange,expected)=>{
+  const r=codeRepo(t);let cwd=r.cwd;if(reason==="published-unreadable"){cwd=mkdtempSync(join(tmpdir(),"release-code-plain-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));}
+  const h=codeHost(t,cwd);r.at(r.a,r.b);h.setJobs([verifiedJob()]);const {gate,execs}=codeGate(r.codeA,arrange(r)||{});
+  const err=await h.poll(gate)+await h.poll(gate);
+  assert.equal(h.claims().length,0,reason);assert.equal(h.record().state,"refused",reason);assert.equal(h.record().reason,reason);
+  const refused=codeSends(h).filter(s=>s.requestId.endsWith("-refused-"+reason));
+  assert.equal(refused.length,1,reason);assert.match(refused[0].text,new RegExp("Reason: "+reason+"\\. Action: run tt deployment setup for the deployer with its current run as predecessor"));
+  assert.deepEqual(codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-")),expected.notices,reason);
+  assert.deepEqual(err.split("\n").filter(Boolean),expected.lines,reason);
+  return {r,h,execs};
+ };
+ const refusedLine="Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.",restartLine="Deployer restarting itself onto the published scripts.";
+ // The restart is announced before the exec that then fails, so this case alone has two notices and two lines; the exec is tried once.
+ const failed=await refusal("exec-failed",()=>{let n=0;return {execve:()=>{n++;throw new Error("SYNTHETIC exec failure "+n);}};},{notices:["restart","refused-exec-failed"],lines:[restartLine,refusedLine]});
+ assert.equal(failed.r.head(),failed.r.b);
+ const dirty=await refusal("checkout-dirty",r=>{writeFileSync(join(r.cwd,"untracked.txt"),"x");},{notices:["refused-checkout-dirty"],lines:[refusedLine]});
+ assert.equal(dirty.r.head(),dirty.r.a);assert.equal(dirty.execs.length,0);
+ const looped=await refusal("restart-did-not-refresh",r=>({marker:r.codeB.digest}),{notices:["refused-restart-did-not-refresh"],lines:[refusedLine]});
+ assert.equal(looped.r.head(),looped.r.a);assert.equal(looped.execs.length,0);
+ const plain=await refusal("published-unreadable",()=>{},{notices:["refused-published-unreadable"],lines:[refusedLine]});assert.equal(plain.execs.length,0);
+ // Ignored build outputs are not a dirty checkout.
+ const r=codeRepo(t);r.at(r.a,r.b);writeFileSync(join(r.cwd,".git/info/exclude"),"node_modules/\n");mkdirSync(join(r.cwd,"node_modules"));writeFileSync(join(r.cwd,"node_modules/x"),"x");prepareCode(r.cwd,r.codeB);assert.equal(r.head(),r.b);
+ // With an unreadable published ref and nothing to claim, the poll stays silent.
+ const empty=mkdtempSync(join(tmpdir(),"release-code-plain-"));t.after(()=>rmSync(empty,{recursive:true,force:true}));
+ const quiet=codeHost(t,empty);assert.equal(await quiet.poll(codeGate(r.codeA).gate),"");assert.deepEqual(quiet.sends(),[]);assert.equal(quiet.record().reason,"published-unreadable");
+});
+test("code a5 the published ref, not the working tree, is what counts as current",async t=>{
+ // The checkout sits on an unpublished commit that changes a watched script; tasks-hub is what was loaded.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.b,r.a);h.setJobs([verifiedJob()]);
+ assert.notEqual(diskCode(join(r.cwd,"scripts")).digest,r.codeA.digest);
+ assert.equal(await h.poll(gate),"");assert.equal(h.claims().length,1);assert.equal(execs.length,0);assert.equal(r.head(),r.b);assert.equal(h.record().state,"current");
+ // The disk still holds what was loaded, but tasks-hub moved a watched script.
+ const s=codeRepo(t),g=codeHost(t,s.cwd);s.at(s.a,s.b);g.setJobs([verifiedJob()]);assert.equal(diskCode(join(s.cwd,"scripts")).digest,s.codeA.digest);
+ const stale=codeGate(s.codeA,{prepare:()=>{throw releaseError("checkout-dirty");}});await g.poll(stale.gate);
+ assert.equal(g.claims().length,0);assert.equal(stale.execs.length,0);assert.equal(g.record().state,"refused");assert.deepEqual(g.record().changed,["release-runner.mjs"]);
+});
+test("code a6 the private record names loaded and current code, is 0600 and is not rewritten by an identical poll; the job journal names both digests",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd);r.at(r.a,r.b);let now=Date.parse("2026-10-06T06:00:00Z");
+ const own={id:"rel_own",state:"claimed",generation:2,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN};h.setJobs([own]);
+ const {gate}=codeGate(r.codeA,{now:()=>now});await h.poll(gate);
+ const path=join(h.home,"runner-code.json"),first=statSync(path),record=h.record();
+ assert.equal(first.mode&0o777,0o600);
+ assert.deepEqual(record,{version:1,agentId:CODE_AGENT,runId:CODE_RUN,pid:process.pid,startedAt:"2026-10-06T06:00:00.000Z",checkedAt:"2026-10-06T06:00:00.000Z",state:"draining",
+  loaded:{digest:r.codeA.digest,files:r.codeA.files},current:{commit:r.b,digest:r.codeB.digest,files:r.codeB.files},changed:["release-runner.mjs"]});
+ assert.equal(record.loaded.digest,codeDigest(record.loaded.files));assert.notEqual(record.loaded.digest,record.current.digest);
+ now+=30000;await h.poll(gate);assert.equal(statSync(path).ino,first.ino);assert.deepEqual(h.record(),record);
+ // A changed state is a new record; reason and restartedFrom appear only when they apply.
+ h.setJobs([]);await h.poll(codeGate(r.codeA,{now:()=>now,marker:r.codeB.digest}).gate);
+ assert.deepEqual(Object.keys(h.record()),["version","agentId","runId","pid","startedAt","checkedAt","state","reason","loaded","current","changed"]);assert.equal(h.record().checkedAt,"2026-10-06T06:00:30.000Z");
+ const after=codeRecord(h.config,{loaded:r.codeB,marker:r.codeB.digest,restartedFrom:r.codeA.digest,now:()=>now},{state:"current"},r.codeB);
+ assert.equal(after.restartedFrom,r.codeA.digest);assert.deepEqual(after.changed,[]);assert.equal(h.record().restartedFrom,r.codeA.digest);
+ // runRelease keeps the digests in the job journal.
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),c={...config(f,j),code:{loaded:r.codeA.digest,current:r.codeB.digest}};
+ assert.equal((await runRelease(c,fake())).outcome,"released");assert.deepEqual(JSON.parse(readFileSync(c.journalPath,"utf8")).code,{loaded:r.codeA.digest,current:r.codeB.digest});
+});
+test("code a7 every code notice is safe text with 12-hex digests and only watched file names, under a request id a resend repeats",t=>{
+ const r=codeRepo(t),home=mkdtempSync(join(tmpdir(),"release-code-notice-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const saved=process.env.TAILTERM_RUN;process.env.TAILTERM_RUN=CODE_RUN;t.after(()=>{if(saved===undefined)delete process.env.TAILTERM_RUN;else process.env.TAILTERM_RUN=saved;});
+ const build=(decision,over={})=>codeRecord({journalDirectory:home},{loaded:r.codeA,marker:null,restartedFrom:null,now:()=>0,...over},decision,r.codeB);
+ const l=r.codeA.digest.slice(0,12),c=r.codeB.digest.slice(0,12),ids=new Set();
+ const cases=[[build({state:"draining"}),"draining"],[build({state:"restart"}),"restart"],...CODE_REASONS.map(reason=>[build({state:"refused",reason}),"refused"]),
+  [codeRecord({journalDirectory:home},{loaded:r.codeB,marker:r.codeB.digest,restartedFrom:r.codeA.digest,now:()=>0},{state:"current"},r.codeB),"restarted"]];
+ for(const [record,kind] of cases){
+  const notice=codeNotice(record,kind);
+  assert.match(notice.text,SAFE_TEXT);assert.match(notice.subject,SAFE_TEXT);assert.ok(notice.subject.length<=120);assert.ok(Buffer.byteLength(notice.text)<1000);assert.match(notice.requestId,/^[A-Za-z0-9_-]{1,128}$/);
+  assert.ok(notice.text.includes(kind==="restarted"?c:l));assert.ok(notice.text.includes(c));assert.ok(notice.text.includes(r.b.slice(0,12)));
+  assert.ok(!/[a-f0-9]{13}/.test(notice.text),"no digest longer than its 12-hex prefix");
+  for(const name of notice.text.match(/[A-Za-z0-9_.\/-]+\.mjs/g)||[])assert.ok(RUNNER_CODE_FILES.includes(name),name);
+  if(kind!=="restarted")assert.ok(notice.text.includes("Changed: release-runner.mjs."));
+  if(kind==="refused")assert.ok(notice.text.includes(`Reason: ${record.reason}.`));
+  // The same state from a restarted process is the same request.
+  assert.deepEqual(codeNotice(JSON.parse(JSON.stringify({...record,pid:1,startedAt:"x",checkedAt:"y"})),kind),notice);assert.ok(!ids.has(notice.requestId));ids.add(notice.requestId);
+ }
+ // Unlisted names, reasons and run ids never reach the text.
+ const hostile=codeNotice({state:"refused",reason:"x'; rm -rf /",runId:"run with spaces'",loaded:{digest:"SECRET"},current:{commit:"../../etc/passwd",digest:r.codeB.digest},changed:["../../etc/passwd","release-runner.mjs","evil.mjs"]});
+ assert.match(hostile.text,SAFE_TEXT);assert.ok(!/passwd|evil|rm -rf|SECRET|spaces/.test(hostile.text+hostile.requestId));assert.ok(hostile.text.includes("Reason: unclassified."));assert.ok(hostile.text.includes("Changed: release-runner.mjs."));
+ assert.equal(codeNotice({state:"current"}),null);
+ // The decision itself, with a fixed clock and digests only.
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeA,idle:false}),{state:"current"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:false}),{state:"draining"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:null}),{state:"restart"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:r.codeB.digest}),{state:"refused",reason:"restart-did-not-refresh"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:null,idle:true}),{state:"refused",reason:"published-unreadable"});
+ assert.deepEqual(codeDecision({loaded:null,published:r.codeB,idle:true}),{state:"refused",reason:"loaded-unreadable"});
+});
+test("code a8 a real re-exec keeps the process, agent and run, and claims once only after the checkout moved",async t=>{
+ const r=codeRepo(t,true),h=codeHost(t,r.cwd);r.at(r.a,r.b);h.setJobs([verifiedJob()]);
+ const configPath=join(h.home,"config.json");writeFileSync(configPath,JSON.stringify(h.config));
+ const env={...process.env,TAILTERM_AGENT:CODE_AGENT,TAILTERM_RUN:CODE_RUN};delete env.TAILTERM_RUNNER_REEXEC;delete env.TAILTERM_RUNNER_REEXEC_FROM;
+ const run=spawnSync(process.execPath,[join(r.cwd,"scripts/release-runner.mjs"),"--config",configPath,"--once"],{cwd:r.cwd,env,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:60000});
+ assert.equal(run.status,0,run.stderr);assert.equal(run.stdout,"");assert.match(run.stderr,/^Deployer restarting itself onto the published scripts\.\n/);
+ const calls=h.calls(),claims=h.claims();
+ assert.equal(claims.length,1);assert.equal(claims[0].head,r.b);assert.equal(calls[0].head,r.a);
+ // One process throughout: every call has the pid the first list call saw, and the same agent and run.
+ assert.equal(claims[0].ppid,calls[0].ppid);assert.ok(calls.every(c=>c.ppid===calls[0].ppid && c.run===CODE_RUN && c.agent===CODE_AGENT));
+ const before=calls.slice(0,calls.indexOf(claims[0]));assert.ok(before.some(c=>c.head===r.a) && before.some(c=>c.head===r.b));
+ const record=h.record();
+ assert.equal(record.state,"current");assert.equal(record.loaded.digest,record.current.digest);assert.equal(record.current.commit,r.b);assert.equal(record.restartedFrom,r.codeA.digest);assert.equal(record.pid,calls[0].ppid);assert.equal(record.runId,CODE_RUN);
+ assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer is restarting itself onto the published scripts","Deployer now runs the published scripts"]);assert.equal(r.head(),r.b);
+});
+test("code a9 a failed CLI call keeps its exact argv, exit code and stderr privately, and only the subcommand and exit code elsewhere",async t=>{
+ const marker="SYNTHETIC_PRIVATE_STDERR",cwd=mkdtempSync(join(tmpdir(),"release-cli-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const h=codeHost(t,cwd,`if(a[1]==='refuse'){fs.writeSync(2,${JSON.stringify(marker+" refuse failed\n")});process.exit(3);}`);h.setJobs([{...verifiedJob("rel_cli"),verificationDigest:"a".repeat(64)}]);
+ const journal=join(h.home,"rel_cli.json"),failures=()=>JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8"));
+ // No base commit: integration refuses before publication, then the refuse call itself fails.
+ const err=await h.poll(null,runRelease);assert.equal(err,"Release held; inspect handler fence and private journal.\n");
+ const state=JSON.parse(readFileSync(journal,"utf8"));
+ assert.equal(state.phase,"refusing");assert.equal(state.refusalReason,"Release binding mismatch");assert.equal(state.refuseFailure,"tt deployment refuse exit 3");assert.deepEqual(state.effects,[]);
+ assert.equal(statSync(join(h.home,"cli-failures.json")).mode&0o777,0o600);
+ let kept=failures();assert.equal(kept.version,1);assert.equal(kept.failures.length,1);const entry=kept.failures[0];
+ assert.deepEqual(entry.argv,[h.tt,"deployment","refuse","--job","rel_cli","--generation","2","--request-id","rel_cli-refuse-2"]);
+ assert.equal(entry.exitCode,3);assert.equal(entry.signal,null);assert.equal(entry.stderr,marker+" refuse failed\n");assert.equal(entry.stderrBytes,Buffer.byteLength(entry.stderr));assert.equal(entry.stderrTruncated,false);
+ assert.equal(entry.jobId,"rel_cli");assert.equal(entry.agentId,CODE_AGENT);assert.equal(entry.runId,CODE_RUN);assert.equal(entry.cwd,cwd);assert.equal(entry.count,1);
+ // Three identical failures are one entry counted three times, under one request id.
+ rmSync(journal);await h.poll(null,runRelease);rmSync(journal);await h.poll(null,runRelease);
+ kept=failures();assert.equal(kept.failures.length,1);assert.equal(kept.failures[0].count,3);assert.equal(kept.failures[0].at,entry.at);
+ const sent=h.sends();assert.equal(sent.length,3);assert.equal(new Set(sent.map(s=>s.requestId)).size,1);
+ for(const c of h.calls())for(const text of c.argv)assert.ok(!text.includes(marker));
+ for(const s of sent){assert.ok(s.text.includes("tt deployment refuse exit 3"));assert.match(s.text,SAFE_TEXT);assert.equal(s.subject,"A deployer CLI call failed");}
+ assert.deepEqual(cliFailureNotice({reason:"tt deployment refuse exit 3",jobId:"rel_cli",at:entry.at},CODE_RUN).requestId,sent[0].requestId);
+ // Where the CLI call is itself the cause, the poll's reason names its subcommand.
+ const adapter=new HostAdapter({cwd,tt:h.tt,journalDirectory:h.home},{id:"rel_cli"});
+ assert.throws(()=>adapter.command([h.tt,"deployment","refuse","--job","rel_cli"]),reasonIs("tt deployment refuse exit 3"));
+ assert.throws(()=>adapter.command([h.tt,"deployment","--job","rel_cli"]),reasonIs("tt deployment exit 2"));
+ assert.throws(()=>adapter.command([h.tt,"Deployment","refuse"]),reasonIs("tt exit 3"));
+ // A long stderr keeps its last 16384 bytes.
+ const big=codeHost(t,cwd,`fs.writeSync(2,'HEAD_OF_STDERR'+'x'.repeat(300*1024-14-5)+'TAIL.');process.exit(4);`),loud=new HostAdapter({cwd,tt:big.tt,journalDirectory:big.home},{});
+ assert.throws(()=>loud.command([big.tt,"deployment","handler"]),reasonIs("tt deployment handler exit 4"));
+ const long=JSON.parse(readFileSync(join(big.home,"cli-failures.json"),"utf8")).failures[0];
+ assert.equal(Buffer.byteLength(long.stderr),16384);assert.equal(long.stderrBytes,300*1024);assert.equal(long.stderrTruncated,true);assert.ok(long.stderr.endsWith("TAIL."));assert.ok(!long.stderr.includes("HEAD_OF_STDERR"));
+ assert.deepEqual(loud.cliFailures.map(f=>f.reason),["tt deployment handler exit 4"]);
+ // Another program, or no journal directory, records nothing; at most twenty distinct failures are kept.
+ const before=readFileSync(join(big.home,"cli-failures.json"),"utf8");
+ assert.throws(()=>loud.command([process.execPath,"-e","process.stderr.write('other');process.exit(5)"]),reasonIs("node exit 5"));assert.equal(readFileSync(join(big.home,"cli-failures.json"),"utf8"),before);
+ const bare=mkdtempSync(join(tmpdir(),"release-cli-bare-"));t.after(()=>rmSync(bare,{recursive:true,force:true}));
+ assert.throws(()=>new HostAdapter({cwd:bare,tt:big.tt},{}).command([big.tt,"deployment","handler"]),reasonIs("tt deployment handler exit 4"));assert.deepEqual(readdirSync(bare),[]);
+ for(let i=0;i<25;i++)assert.throws(()=>loud.command([big.tt,"deployment","get","--job","rel_"+i]),reasonIs("tt deployment get exit 4"));
+ const capped=JSON.parse(readFileSync(join(big.home,"cli-failures.json"),"utf8")).failures;assert.equal(capped.length,20);assert.equal(capped.at(-1).argv.at(-1),"rel_24");
+});
+test("code a10 every relative import of the watched scripts is itself watched, and this process recorded its own code",()=>{
+ assert.equal(RUNNER_CODE_FILES.length,6);assert.deepEqual([...RUNNER_CODE_FILES].sort(),RUNNER_CODE_FILES);
+ const directory=dirname(RUNNER);
+ for(const name of RUNNER_CODE_FILES){
+  const source=readFileSync(join(directory,name),"utf8"),imports=[...source.matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.\/[^"']+)["']/g)].map(m=>m[1].slice(2));
+  for(const imported of imports)assert.ok(RUNNER_CODE_FILES.includes(imported),`${name} imports ./${imported}`);
+ }
+ assert.deepEqual(LOADED_CODE,diskCode(directory));assert.equal(LOADED_CODE.digest,codeDigest(LOADED_CODE.files));
+ assert.ok(readFileSync(RUNNER,"utf8").includes("code:runnerCodeGate()"),"only the daemon entry builds the real gate");
 });
