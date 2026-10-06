@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -349,6 +350,62 @@ func TestLeadCopyWakesOnce(t *testing.T) {
 	}
 	if _, w := f.owed(t, f.lead); w != 1 {
 		t.Fatalf("lead has %d wake jobs, want 1", w)
+	}
+}
+
+// A wake that is due, or a lease that has expired, is found by time even when
+// its stamp text sorts after the lease time: RFC3339Nano trims trailing zeros.
+func TestLeaseWakeJobComparesTimeNotStampText(t *testing.T) {
+	for _, shape := range []struct {
+		name          string
+		stamp, leased time.Duration
+	}{
+		{"fraction .12Z against .123Z", 120 * time.Millisecond, 123 * time.Millisecond},
+		{"whole second 05Z against 05.3Z", 0, 300 * time.Millisecond},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			f := newLeadCopyFixture(t)
+			f.online(t, f.lead)
+			if _, err := f.s.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{Kind: api.EventDone, AgentID: f.lead.ID, RunID: f.lead.RunID}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			f.exchange(t, api.EnvelopeKindResult, true)
+			f.exchange(t, api.EnvelopeKindResult, true)
+			base := f.s.now().UTC().Truncate(time.Second)
+			stamp, now := ts(base.Add(shape.stamp)), base.Add(shape.leased)
+			if stamp <= ts(now) {
+				t.Fatalf("stamp %s must sort after lease time %s as text", stamp, ts(now))
+			}
+			set := func(query string, args ...any) {
+				t.Helper()
+				res, err := f.s.db.ExecContext(f.ctx, query, args...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					t.Fatalf("no wake job changed by %s", query)
+				}
+			}
+			set(`UPDATE wake_jobs SET due_at=? WHERE agent_id=? AND state=?`, stamp, f.lead.ID, wakePending)
+			if _, w := f.owed(t, f.lead); w != 2 {
+				t.Fatalf("lead has %d wake jobs, want 2", w)
+			}
+			job, err := f.s.LeaseWakeJob(f.ctx, f.task.ID, f.lead.ID, f.lead.RunID, now)
+			if err != nil || job == nil {
+				t.Fatalf("due wake job not leased: %+v %v", job, err)
+			}
+			// The other due wake is deferred behind the leased one.
+			var deferred int
+			if err := f.s.db.QueryRowContext(f.ctx, `SELECT count(*) FROM wake_jobs WHERE agent_id=? AND state=? AND due_at=? AND detail=?`,
+				f.lead.ID, wakePending, ts(now.Add(wakeLease)), "deferred behind "+job.ID).Scan(&deferred); err != nil || deferred != 1 {
+				t.Fatalf("deferred wake jobs: %d %v, want 1", deferred, err)
+			}
+			set(`UPDATE wake_jobs SET lease_expires_at=? WHERE id=?`, stamp, job.ID)
+			again, err := f.s.LeaseWakeJob(f.ctx, f.task.ID, f.lead.ID, f.lead.RunID, now)
+			if err != nil || again == nil || again.ID != job.ID || again.LeaseToken == job.LeaseToken {
+				t.Fatalf("expired lease not re-leased: %+v %v", again, err)
+			}
+		})
 	}
 }
 

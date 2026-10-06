@@ -886,7 +886,7 @@ func (s *Store) LeaseWakeJob(ctx context.Context, taskID, agentID, runID string,
 		return nil, err
 	}
 	var due int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wake_jobs WHERE task_id=? AND agent_id=? AND ((state=? AND due_at<=?) OR (state=? AND lease_expires_at<?))`,
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wake_jobs WHERE task_id=? AND agent_id=? AND ((state=? AND julianday(due_at)<=julianday(?)) OR (state=? AND julianday(lease_expires_at)<julianday(?)))`,
 		taskID, agentID, wakePending, ts(now), wakeLeased, ts(now)).Scan(&due); err != nil {
 		return nil, err
 	}
@@ -926,11 +926,12 @@ func (s *Store) LeaseWakeJob(ctx context.Context, taskID, agentID, runID string,
 	}
 	var job api.WakeJob
 	var leasedBefore string
-	// Oldest first by time, not by stamp text: RFC3339Nano trims trailing
-	// zeros, so text order can differ from time order. julianday compares to
-	// the millisecond; wakes due within one go in message order.
+	// Due, expired and oldest first by time, not by stamp text: RFC3339Nano
+	// trims trailing zeros, so text order can differ from time order.
+	// julianday compares to the millisecond; wakes due within one go in
+	// message order. A leased job always carries its expiry.
 	err = tx.QueryRowContext(ctx, `SELECT w.id,w.obligation_id,o.message_seq,w.state FROM wake_jobs w JOIN obligations o ON o.id=w.obligation_id
-WHERE w.task_id=? AND w.agent_id=? AND ((w.state=? AND w.due_at<=?) OR (w.state=? AND w.lease_expires_at<?)) ORDER BY julianday(w.due_at),o.message_seq LIMIT 1`,
+WHERE w.task_id=? AND w.agent_id=? AND ((w.state=? AND julianday(w.due_at)<=julianday(?)) OR (w.state=? AND julianday(w.lease_expires_at)<julianday(?))) ORDER BY julianday(w.due_at),o.message_seq LIMIT 1`,
 		taskID, agentID, wakePending, t, wakeLeased, t).Scan(&job.ID, &job.ObligationID, &job.MessageSeq, &leasedBefore)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -957,7 +958,7 @@ WHERE w.task_id=? AND w.agent_id=? AND ((w.state=? AND w.due_at<=?) OR (w.state=
 	}
 	// Other due wakes wait behind this one; they are retired only when it is
 	// accepted, so a lost or failed wake leaves them to run.
-	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET due_at=?,detail=? WHERE agent_id=? AND task_id=? AND state=? AND due_at<=? AND id<>?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET due_at=?,detail=? WHERE agent_id=? AND task_id=? AND state=? AND julianday(due_at)<=julianday(?) AND id<>?`,
 		expires, "deferred behind "+job.ID, agentID, taskID, wakePending, t, job.ID); err != nil {
 		return nil, err
 	}
