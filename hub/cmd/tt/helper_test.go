@@ -1757,3 +1757,99 @@ func TestHelperLegacyClaudePendingReplay(t *testing.T) {
 		}
 	}
 }
+
+// A pane that inherited another project's helper identity is not an agent
+// session: it reaches the one-project-per-tmux-session check, so the refusal
+// names the flag that moves the session. A real agent session stays refused.
+func TestHelperRegisterInheritedOtherProjectIdentity(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	a := *f.mustRegister(t).Agent
+	second, err := f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "Second project", Orchestrator: "lead"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inherited := env{hub: f.owner.hub, task: f.task.ID, agent: a.ID, runID: a.RunID}
+	registerSecond := func(e env, args ...string) (string, error) {
+		t.Helper()
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+		_, runErr := captureCLIOutput(t, func() error {
+			return cmdHelper(e, append([]string{"register", "--task", second.ID}, args...))
+		})
+		_ = w.Close()
+		os.Stderr = old
+		warning, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(warning), runErr
+	}
+	secondHelpers := func() []api.Agent {
+		t.Helper()
+		agents, err := f.c.ListAgents(ctx, second.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var helpers []api.Agent
+		for _, agent := range agents {
+			if agent.Role == api.AgentRoleOwnerHelper {
+				helpers = append(helpers, agent)
+			}
+		}
+		return helpers
+	}
+	tagsBefore := f.tags(t, "owner")
+	stateBefore, _ := os.ReadFile(ownerHelperPath(f.owner.hub, f.task.ID))
+	unchanged := func(what string) {
+		t.Helper()
+		if helpers := secondHelpers(); len(helpers) != 0 {
+			t.Fatalf("%s: refused registration reached the hub: %+v", what, helpers)
+		}
+		if _, err := os.Stat(ownerHelperPath(f.owner.hub, second.ID)); !os.IsNotExist(err) {
+			t.Fatalf("%s: refused registration wrote helper state: %v", what, err)
+		}
+		if tags := f.tags(t, "owner"); fmt.Sprint(tags) != fmt.Sprint(tagsBefore) {
+			t.Fatalf("%s: tags %v, want %v", what, tags, tagsBefore)
+		}
+		if state, _ := os.ReadFile(ownerHelperPath(f.owner.hub, f.task.ID)); !bytes.Equal(state, stateBefore) {
+			t.Fatalf("%s: first project's helper file changed: %s", what, state)
+		}
+		if current, _ := f.c.GetAgent(ctx, f.task.ID, a.ID); current.RunID != a.RunID {
+			t.Fatalf("%s: first project's helper changed", what)
+		}
+	}
+
+	// The inherited helper identity gets the session refusal, not the agent one.
+	_, err = registerSecond(inherited)
+	if err == nil || strings.Contains(err.Error(), "not an agent session") || !strings.Contains(err.Error(), "one project per tmux session") || !strings.Contains(err.Error(), f.task.ID) || !strings.Contains(err.Error(), "--take-session") {
+		t.Fatalf("inherited helper identity of another project: %v", err)
+	}
+	unchanged("inherited helper identity")
+
+	// A real agent session, and an identity that is not shown to be an owner
+	// helper, are refused as agent sessions even with the flag.
+	for what, e := range map[string]env{
+		"agent session":             {hub: f.owner.hub, task: f.task.ID, agent: f.lead.ID, runID: f.lead.RunID},
+		"agent session, no project": {hub: f.owner.hub, agent: f.lead.ID, runID: f.lead.RunID},
+		"helper of no such project": {hub: f.owner.hub, task: second.ID, agent: a.ID, runID: a.RunID},
+		"unknown agent":             {hub: f.owner.hub, task: f.task.ID, agent: api.NewID("agt")},
+	} {
+		if _, err := registerSecond(e, "--take-session"); err == nil || !strings.Contains(err.Error(), "not an agent session") {
+			t.Fatalf("%s: %v", what, err)
+		}
+		unchanged(what)
+	}
+
+	// The explicit flag moves the session, with the warning naming the cost.
+	warning, err := registerSecond(inherited, "--take-session")
+	helpers := secondHelpers()
+	if err != nil || len(helpers) != 1 || !strings.Contains(warning, f.task.ID) || !strings.Contains(warning, "wake-ups stop") {
+		t.Fatalf("take-session: %v %+v %q", err, helpers, warning)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != second.ID || tags["TAILTERM_AGENT"] != helpers[0].ID {
+		t.Fatalf("tags after take-session: %v", tags)
+	}
+}

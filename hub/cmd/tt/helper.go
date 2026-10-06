@@ -293,10 +293,15 @@ func helperRegister(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(15 * time.Second)
 	defer cancel()
-	// An agent session may not register, except a pane that inherited this
-	// project's helper identity.
+	// An agent session may not register, except a pane that inherited an
+	// owner helper's identity. The identity is looked up in its own project:
+	// another project's helper goes on to the session check below.
 	if e.agent != "" {
-		a, err := c.GetAgent(ctx, *task, e.agent)
+		home := e.task
+		if !api.ValidID(home, "tsk") {
+			home = *task
+		}
+		a, err := c.GetAgent(ctx, home, e.agent)
 		if err != nil || a.Role != api.AgentRoleOwnerHelper {
 			return errors.New("tt helper register runs in the owner's own Claude Code or Codex session, not an agent session")
 		}
