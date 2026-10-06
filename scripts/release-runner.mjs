@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
-import { digest, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS } from "./verify-matrix.mjs";
+import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
@@ -226,22 +226,189 @@ export function integrateCandidate(cwd, job, branch="tasks-hub") {
       if (!commits.length || commits.some(c => git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2)) throw releaseError("Nonlinear candidate series");
       git(cwd,"cherry-pick",...commits);
     }
-  } catch (error) {
-    // The unmerged paths are read before the abort discards them, untrimmed
-    // and without git's stderr, and reduced here to valid paths and counts.
-    let unmerged=[];
-    try {unmerged=[...new Set(execFileSync("git",["diff","--name-only","--diff-filter=U","-z"],{cwd,encoding:"utf8",stdio:["ignore","pipe","ignore"]}).split("\0").filter(Boolean))].sort();} catch {}
-    const valid=unmerged.filter(p=>CONFLICT_PATH.test(p)),conflict={paths:valid.slice(0,CONFLICT_PATHS),count:unmerged.length,rejected:unmerged.length-valid.length};
-    try {git(cwd,"cherry-pick","--abort");} catch {}
-    git(cwd,"checkout","--detach",expected);
-    if (typeof error?.releaseReason==="string") throw error;
-    if (!conflict.count) throw releaseError("Candidate integration refused");
-    // All the paths or only their count, never a partial list.
-    const named="integration-conflict: "+conflict.paths.join(", "),listed=conflict.rejected===0 && conflict.count<=CONFLICT_PATHS && REASON.test(named);
-    const refused=releaseError(listed?named:`integration-conflict: ${conflict.count} path${conflict.count===1?"":"s"}`);refused.conflict=conflict;throw refused;
-  }
+  } catch (error) {abortIntegration(cwd,expected,error);}
   const integrated=git(cwd,"rev-parse","HEAD");
   return {expected,integrated,changed:diffPaths(cwd,expected,integrated)};
+}
+// Ends a failed checkout or cherry-pick back on the commit it started from
+// and throws the refusal.
+function abortIntegration(cwd,expected,error) {
+  // The unmerged paths are read before the abort discards them, untrimmed
+  // and without git's stderr, and reduced here to valid paths and counts.
+  let unmerged=[];
+  try {unmerged=[...new Set(execFileSync("git",["diff","--name-only","--diff-filter=U","-z"],{cwd,encoding:"utf8",stdio:["ignore","pipe","ignore"]}).split("\0").filter(Boolean))].sort();} catch {}
+  const valid=unmerged.filter(p=>CONFLICT_PATH.test(p)),conflict={paths:valid.slice(0,CONFLICT_PATHS),count:unmerged.length,rejected:unmerged.length-valid.length};
+  try {git(cwd,"cherry-pick","--abort");} catch {}
+  git(cwd,"checkout","--detach",expected);
+  if (typeof error?.releaseReason==="string") throw error;
+  if (!conflict.count) throw releaseError("Candidate integration refused");
+  // All the paths or only their count, never a partial list.
+  const named="integration-conflict: "+conflict.paths.join(", "),listed=conflict.rejected===0 && conflict.count<=CONFLICT_PATHS && REASON.test(named);
+  const refused=releaseError(listed?named:`integration-conflict: ${conflict.count} path${conflict.count===1?"":"s"}`);refused.conflict=conflict;throw refused;
+}
+// Release batching. With releaseBatch.maxJobs above 1 in the private config,
+// the deployer integrates the verified jobs queued behind the one it claimed
+// (the lead) that cherry-pick cleanly, in queue order, into one candidate,
+// and runs one matrix, one import and one deploy for them. Only the lead is
+// claimed; the hub settles the other jobs with the lead's released finish.
+// Absent or 1, none of this runs.
+export const BATCH_MAX_JOBS=8,BATCH_IMPORT_WAIT_MS=1800000;
+export function releaseBatchPolicy(config){
+  const batch=config?.releaseBatch;
+  if(batch===undefined)return {max:1,importWaitMs:BATCH_IMPORT_WAIT_MS};
+  if(!batch || typeof batch!=="object" || Array.isArray(batch))throw releaseError("Invalid release batch size");
+  const max=batch.maxJobs===undefined?1:batch.maxJobs,importWaitMs=batch.importWaitMs===undefined?BATCH_IMPORT_WAIT_MS:batch.importWaitMs;
+  if(!Number.isSafeInteger(max) || max<1 || max>BATCH_MAX_JOBS)throw releaseError("Invalid release batch size");
+  if(!Number.isSafeInteger(importWaitMs) || importWaitMs<=0)throw releaseError("Invalid release batch import wait");
+  return {max,importWaitMs};
+}
+// The hub computes the same id (releaseBatchID in hub/internal/store/releases.go);
+// one shared test vector pins both. generation is the lead's before batch-open.
+export const batchId=(leadJobId,generation,baseCommit)=>"bat_"+createHash("sha256").update(`${leadJobId}\n${generation}\n${baseCommit}`).digest("hex").slice(0,16);
+// The summaries that may join the lead's batch, in queue order: verified,
+// unclaimed, queued after the lead in the same project generation, from the
+// lead's base commit (one matrix run covers a job only from that base), and
+// not marked to release alone.
+export function batchCandidates(jobs,lead,solo=new Set()){
+  const at=jobs.find(j=>j.id===lead?.id)?.rowId;
+  if(!Number.isSafeInteger(at) || solo.has(lead.id))return [];
+  return jobs.filter(j=>j.state==="verified" && !j.agentId && Number.isSafeInteger(j.rowId) && j.rowId>at && j.pauseGeneration===lead.pauseGeneration && sha(j.baseCommit) && j.baseCommit===lead.baseCommit && !solo.has(j.id)).sort((a,b)=>a.rowId-b.rowId);
+}
+const racePackages=argv=>{const first=Array.isArray(argv)?argv.findIndex(a=>typeof a==="string" && a.startsWith("./")):-1;return first<1 || argv.slice(first).some(a=>typeof a!=="string" || !a.startsWith("./"))?null:{flags:argv.slice(0,first),packages:argv.slice(first)};};
+// extra's checks carried on base's list, or null when they cannot be: every
+// check must equal the listed check of its id, except go-race, which may
+// differ in packages only. The merged go-race tests the union, or ./... alone.
+function mergeAcceptedChecks(base,extra){
+  if(!Array.isArray(base) || !Array.isArray(extra))return null;
+  let out=base;
+  for(const check of extra){
+    const at=out.findIndex(c=>c.id===check?.id);
+    if(at<0)return null;
+    if(canonical(out[at])===canonical(check))continue;
+    const have=racePackages(out[at].argv),want=check.id==="go-race" && racePackages(check.argv);
+    if(!have || !want || !same(have.flags,want.flags) || canonical({...out[at],argv:[]})!==canonical({...check,argv:[]}))return null;
+    const packages=[have,want].some(p=>p.packages.includes("./..."))?["./..."]:[...new Set([...have.packages,...want.packages])].sort();
+    out=out.with(at,{...out[at],argv:[...have.flags,...packages]});
+  }
+  return out;
+}
+// The accepted checks one matrix run must keep for the lead and the members
+// that can share it; a member whose checks differ in any other way is dropped.
+export function batchAcceptedChecks(lead,members){
+  let checks=lead.plan.checks;const joined=[],dropped=[];
+  for(const member of members){
+    const merged=mergeAcceptedChecks(checks,member.plan?.checks);
+    if(merged){checks=merged;joined.push(member.id);}else dropped.push({jobId:member.id,reason:"batch-plan-mismatch"});
+  }
+  return {checks,checksDigest:digest(checks),joined,dropped};
+}
+// Why a job's full record cannot join the lead's batch, or "". The hub checks
+// the same at batch-add.
+export function batchMismatch(lead,job){
+  if(job?.state!=="verified" || job.agentId || job.pauseGeneration!==lead.pauseGeneration || job.repository!==lead.repository || job.baseCommit!==lead.baseCommit)return "batch-ineligible";
+  if(job.plan?.matrixDigest!==lead.plan?.matrixDigest || job.plan?.matrixApprovalMessageSeq!==lead.plan?.matrixApprovalMessageSeq)return "batch-other-matrix";
+  if(lead.plan?.checks===undefined && job.plan?.checks===undefined)return "";
+  return mergeAcceptedChecks(lead.plan?.checks,job.plan?.checks)?"":"batch-plan-mismatch";
+}
+// The hub's coverage rule, checked before the matrix runs: every approved
+// check of every job is in the plan by digest, by the go-race package
+// superset, or, when the plan's matrix is not the job's, by the check of the
+// same id (a go-race still testing every approved package). Returns the first
+// uncovered {jobId, checkId}, or null.
+export function batchPlanCovers(plan,jobs){
+  const race=(want,have,policy)=>{
+    if(want.id!=="go-race" || have.id!==want.id)return false;
+    const w=racePackages(want.argv),h=racePackages(have.argv);
+    if(!w || !h || (policy && (have.cwd!==want.cwd || canonical(have.environment)!==canonical(want.environment) || !same(w.flags,h.flags))))return false;
+    return h.packages.includes("./...") || w.packages.every(p=>h.packages.includes(p));
+  };
+  const checks=Array.isArray(plan?.checks)?plan.checks:[];
+  for(const job of jobs){
+    const changed=job.matrixDigest!==undefined && job.matrixDigest!==plan?.matrixDigest;
+    for(const want of job.checks||[]){
+      if(!checks.some(have=>canonical(have)===canonical(want) || race(want,have,true) || (changed && have.id===want.id && (want.id!=="go-race" || race(want,have,false)))))return {jobId:job.jobId,checkId:want.id};
+    }
+  }
+  return null;
+}
+// One member's commits cherry-picked onto head; a failure leaves the checkout
+// on head and throws the refusal integrateCandidate would.
+function pickCandidate(cwd,job,head){
+  if(!sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit!==job.commit)throw releaseError("Release binding mismatch");
+  let known;
+  try{known=git(cwd,"rev-parse",`${job.commit}^{commit}`)===job.commit && git(cwd,"rev-parse",`${job.baseCommit}^{commit}`)===job.baseCommit;}catch{known=false;}
+  if(!known)throw releaseError("Unknown commit identity");
+  try{git(cwd,"merge-base","--is-ancestor",job.baseCommit,job.commit);}catch{throw releaseError("Unknown candidate base");}
+  try{
+    const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
+    if(!commits.length || commits.some(c=>git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2))throw releaseError("Nonlinear candidate series");
+    git(cwd,"cherry-pick",...commits);
+  }catch(error){abortIntegration(cwd,head,error);}
+  return git(cwd,"rev-parse","HEAD");
+}
+// Integrates the lead as integrateCandidate does, then each candidate in turn
+// until the batch holds max jobs. A candidate that does not pick cleanly, or
+// that the hub refuses, drops out with the checkout back on the last job that
+// joined. hooks.integrated(first) follows the lead's integration; hooks.open
+// (base) declares the batch before the first member, returning its id or
+// false, and hooks.add(job, from, to) declares each job's range, the lead's
+// first. A hook that throws (an unconfirmed hub call) is passed on with the
+// checkout untouched. Returns today's integration, the jobs dropped, and
+// batch only when a member joined.
+export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
+  const first=integrateCandidate(cwd,lead),jobs=[],dropped=[];
+  await hooks.integrated?.(first);
+  const range=(job,from,to)=>({jobId:job.id,entryId:job.entryId,generation:job.generation,commit:job.commit,verificationDigest:job.verificationDigest,from,to});
+  let head=first.integrated,id=null,closed=false;
+  for(const member of candidates){
+    if(closed || Math.max(jobs.length,1)>=max)break;
+    let to;
+    try{to=pickCandidate(cwd,member,head);}
+    catch(error){dropped.push({jobId:member.id,reason:failureReason(error)});continue;}
+    if(!id){
+      id=await hooks.open(first.expected);
+      if(id && await hooks.add(lead,first.expected,first.integrated)===true)jobs.push(range(lead,first.expected,first.integrated));
+      else closed=true;
+    }
+    if(closed || await hooks.add(member,head,to)!==true){
+      git(cwd,"checkout","--detach",head);dropped.push({jobId:member.id,reason:closed?"batch-open-refused":"batch-add-refused"});continue;
+    }
+    jobs.push(range(member,head,to));head=to;
+  }
+  return {expected:first.expected,integrated:head,changed:diffPaths(cwd,first.expected,head),dropped,...(jobs.length>1?{batch:{id,base:first.expected,jobs,dropped}}:{})};
+}
+// The batch's own receipt and, for a released batch, one finished journal per
+// member, written from the lead journal's saved intent and final receipt.
+// The same bytes on every call, each through a temporary file and a rename,
+// so any finish, retry or reconciliation path may repeat it.
+export function materializeBatch(journalDirectory,journal){
+  const intent=journal?.batchReceipt,final=journal?.receipt;
+  if(!intent || !/^bat_[a-f0-9]{16}$/.test(intent.batchId||"") || !Array.isArray(intent.jobs) || !final || !["released","rolled_back","blocked"].includes(final.outcome))return null;
+  const receipt={...intent,commit:final.commit,outcome:final.outcome,targets:final.targets,...(final.push?{push:final.push}:{}),...(final.revert?{revert:final.revert}:{})};
+  save(join(journalDirectory,intent.batchId+"-receipt.json"),receipt);
+  if(final.outcome==="released")for(const member of intent.jobs.slice(1)){
+    if(typeof member?.jobId!=="string" || !/^[A-Za-z0-9_-]+$/.test(member.jobId))continue;
+    const path=join(journalDirectory,member.jobId+".json");
+    // A journal of an earlier claim of this job is kept beside the new one.
+    try{if(JSON.parse(readFileSync(path,"utf8"))?.batch?.id!==intent.batchId)renameSync(path,`${path}.before-${intent.batchId}`);}catch{}
+    save(path,{version:1,jobId:member.jobId,commit:member.commit,...(journal.taskId?{taskId:journal.taskId}:{}),phase:"complete",effects:[],batch:{id:intent.batchId,leadJobId:intent.leadJobId,from:member.from,to:member.to,integrated:intent.integrated},
+      receipt:{version:1,jobId:member.jobId,commit:final.commit,verificationDigest:member.verificationDigest,targets:final.targets,outcome:"released",...(final.push?{push:final.push}:{})}});
+  }
+  return receipt;
+}
+// Jobs that left a failed batch release alone and never join another:
+// JOURNAL/batch-solo.json. A missing file is empty; an unreadable one throws,
+// so nothing is batched on doubt.
+const batchSoloPath=dir=>join(dir,"batch-solo.json");
+export function readBatchSolo(journalDirectory){
+  if(!existsSync(batchSoloPath(journalDirectory)))return new Set();
+  let jobs;try{jobs=JSON.parse(readFileSync(batchSoloPath(journalDirectory),"utf8"))?.jobs;}catch{}
+  if(!Array.isArray(jobs) || jobs.some(j=>typeof j!=="string"))throw releaseError("Invalid batch solo file");
+  return new Set(jobs);
+}
+export function addBatchSolo(journalDirectory,jobIds){
+  const jobs=readBatchSolo(journalDirectory);for(const id of jobIds)jobs.add(id);
+  save(batchSoloPath(journalDirectory),{version:1,jobs:[...jobs]});
 }
 // Moving tasks-hub under a worktree that has it checked out leaves that
 // working tree showing the release reversed, so every ref mutation refuses
@@ -327,10 +494,15 @@ export async function runRelease(config, adapter) {
     const recovered=recovery?.disposition==="requeue" && recovery.noActiveExecution===true && recovery.noPublication===true && recovery.journalState==="no_effects" && recovery.jobId===job.id && recovery.journalDigest===fileDigest(journalPath) && recovery.agentId===prior.agentId && recovery.runId===prior.runId && prior.effects.length===0 && prior.published!==true && prior.jobId===job.id && prior.commit===job.commit;
     if(recovered){renameSync(journalPath,journalPath+".reconciled-"+recovery.journalDigest);}
     else
+    // A run stopped while declaring a batch: nothing is published or deployed
+    // and the checkout may be anywhere, so the resume below first replays
+    // the unconfirmed hub call and only then moves the checkout.
+    if(prior.phase==="batching" && prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && prior.taskId===job.taskId && prior.pauseGeneration===job.pauseGeneration && Array.isArray(prior.effects) && !prior.effects.length && prior.published!==true && sha(prior.expected) && sha(prior.batchLead)) {state=prior;}
+    else
     if(prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && (["waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
     else {
       closeSync(fd);rmSync(lock);
-      if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete") return prior.receipt;
+      if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete"){try{materializeBatch(dirname(journalPath),prior);}catch{}return prior.receipt;}
       throw releaseError("Ambiguous journal requires handler reconciliation");
     }
   }
@@ -338,17 +510,139 @@ export async function runRelease(config, adapter) {
   if(config.code)state.code={loaded:config.code.loaded??null,current:config.code.current??null};
   const checkpoint=()=>save(journalPath,state);let step=null;
   const fence=async()=>{if(await adapter.fence(job)!==true)throw releaseError("release fence lost");};
+  // Best effort after the hub has the final receipt: a failed write here
+  // must never reach the rollback path below.
+  const materialize=()=>{if(state.batchReceipt){try{materializeBatch(dirname(journalPath),state);}catch{}}};
+  // Batch calls to the hub. Each is journaled with the lead generation it is
+  // sent at before it is sent, and its request id is built from that saved
+  // generation, so a call whose response was lost is sent again unchanged and
+  // the hub replays it. A call that still fails was refused if the lead's
+  // generation has not moved; otherwise its result is unknown and the run
+  // returns waiting_batch with the checkout untouched, for the next poll.
+  const batchOp=async(op,fields={})=>{
+    state.batchOps??=[];
+    const generation=adapter.job?.generation??job.generation,requestId=`${job.id}-${op}-${generation}`;
+    let record=state.batchOps.find(o=>o.status==="sending" && o.op===op) || (op==="batch-drop"?state.batchOps.find(o=>o.requestId===requestId && o.status==="refused"):undefined);
+    if(!record){record={op,...fields,generation,requestId};state.batchOps.push(record);}
+    record.status="sending";checkpoint();
+    return settleBatchOp(record);
+  };
+  const settleBatchOp=async record=>{
+    for(let attempt=0;attempt<2;attempt++){
+      try{await adapter.batch(record.op,{entryId:record.entryId,commit:record.commit},record.generation);record.status="done";checkpoint();return true;}catch{}
+    }
+    let generation;try{generation=await adapter.generation();}catch{}
+    if(generation!==record.generation)throw Object.assign(releaseError("Release batch call unconfirmed"),{batchWait:true});
+    record.status="refused";checkpoint();return false;
+  };
+  // What a settled batch-open or batch-add means for the journal's batch.
+  const applyBatchOp=(record,ok)=>{
+    if(record.applied)return;
+    if(ok && record.op==="batch-open")state.batch={id:batchId(job.id,record.generation,record.commit),base:record.commit,jobs:[]};
+    if(ok && record.op==="batch-add" && state.batch){state.batch.jobs.push({...record.member,from:record.from,to:record.commit});if(record.goRace)state.batch.goRace=record.goRace;}
+    record.applied=true;checkpoint();
+  };
+  const declare=async(op,fields)=>{const ok=await batchOp(op,fields),record=state.batchOps.findLast(o=>o.op===op);applyBatchOp(record,ok);return ok;};
+  const batchDropped=()=>state.batchOps?.some(o=>o.op==="batch-drop" && o.status==="done")===true;
+  // A batch no member joined is dropped at the hub and the lead goes alone.
+  const closeBatch=async()=>{
+    if(state.batch && state.batch.jobs.length<2){if(!batchDropped())await batchOp("batch-drop");state.batch=null;checkpoint();}
+    return {expected:state.expected,integrated:state.batch?state.batch.jobs.at(-1).to:state.batchLead};
+  };
+  const mergedGoRace=member=>{
+    const lead=job.plan?.checks,race=lead?.map(c=>c.id==="go-race" && state.batch?.goRace?state.batch.goRace:c);
+    return mergeAcceptedChecks(race,member.plan?.checks)?.find(c=>c.id==="go-race");
+  };
+  const openBatch=async()=>{
+    const members=config.batch.candidates.filter(c=>{const reason=batchMismatch(job,c);if(reason)(state.batchDropped??=[]).push({jobId:c.id,reason});return !reason;});
+    const result=await integrateBatch(cwd,job,members,config.batch.max,{
+      integrated:first=>{state.expected=first.expected;state.integrated=first.integrated;state.batchLead=first.integrated;state.phase="batching";checkpoint();},
+      open:async base=>await declare("batch-open",{commit:base})?state.batch.id:false,
+      add:(member,from,to)=>{const goRace=member.id===job.id?undefined:mergedGoRace(member);return declare("batch-add",{entryId:member.entryId,commit:to,from,...(goRace?{goRace}:{}),member:{jobId:member.id,entryId:member.entryId,generation:member.generation,commit:member.commit,verificationDigest:member.verificationDigest}});},
+    });
+    if(result.dropped.length)(state.batchDropped??=[]).push(...result.dropped);
+    return closeBatch();
+  };
+  // Resuming a stopped declaration: the unconfirmed call is replayed before
+  // any checkout, the batch closes with the jobs that joined, and only then
+  // is the checkout put on its tip.
+  const resumeBatch=async()=>{
+    const pending=state.batchOps?.find(o=>o.status==="sending");
+    if(pending && !await settleBatchOp(pending) && pending.op==="batch-add" && pending.member?.jobId!==job.id)(state.batchDropped??=[]).push({jobId:pending.member.jobId,reason:"batch-add-refused"});
+    for(const record of state.batchOps||[])if(record.op!=="batch-drop")applyBatchOp(record,record.status==="done");
+    if(batchDropped())state.batch=null;
+    const integration=await closeBatch();
+    try{git(cwd,"cherry-pick","--abort");}catch{}
+    git(cwd,"checkout","--detach",integration.integrated);
+    if(git(cwd,"status","--porcelain"))throw releaseError("Dirty deployment checkout");
+    return integration;
+  };
+  // The lead with the plan one matrix run must keep for the whole batch, and
+  // each job's approved checks for the proof made before that run starts.
+  const batchJob=()=>{
+    const checks=job.plan?.checks?.map(c=>c.id==="go-race" && state.batch.goRace?state.batch.goRace:c);
+    if(!checks)return {...job,integratedCommit:state.integrated};
+    const plans=state.batch.jobs.slice(1).map(j=>config.batch?.candidates?.find(c=>c.id===j.jobId)).filter(Boolean);
+    return {...job,integratedCommit:state.integrated,plan:{...job.plan,checks,checksDigest:digest(checks)},
+      batchCovers:[{jobId:job.id,checks:job.plan.checks,matrixDigest:job.plan.matrixDigest},{jobId:state.batch.id,checks},...plans.map(p=>({jobId:p.id,checks:p.plan?.checks,matrixDigest:p.plan?.matrixDigest}))]};
+  };
+  // Fallback to per-job releases, before anything is published: the batch is
+  // dropped at the hub, its members are marked to release alone, and the
+  // lead goes on alone in this claim. False when the hub refuses the drop;
+  // "waiting" while the batch's own matrix run is not confirmed over, since
+  // the checkout must not move under it.
+  const fallback=async(reason,detail)=>{
+    state.batchFallback={batchId:state.batch.id,reason,...(detail && detail!==reason?{detail}:{}),members:state.batch.jobs.slice(1).map(j=>j.jobId),status:"dropping"};checkpoint();
+    return finishFallback();
+  };
+  const finishFallback=async()=>{
+    if(adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return "waiting";
+    if(!batchDropped() && !await batchOp("batch-drop")){state.batchFallback.status="refused";checkpoint();return false;}
+    await config.batch?.onFallback?.(state.batchFallback.members,state.batchFallback.batchId);
+    // Resumable from here as a declaration that closed with no member.
+    state.batch=null;delete state.batchReceipt;state.batchFallback.status="done";state.phase="batching";checkpoint();
+    git(cwd,"checkout","--detach",state.batchLead);
+    state.integrated=state.batchLead;state.phase="integrated";checkpoint();
+    return true;
+  };
+  // One matrix run and one import for the batch. Returns a waiting outcome,
+  // or null once the batch is verified or has fallen back to the lead alone.
+  const verifyBatch=async()=>{
+    const waiting={jobId:job.id,outcome:"waiting_matrix"};
+    // Saved first: every waiting return below resumes from this phase.
+    state.phase="waiting_matrix";checkpoint();
+    if(state.batchFallback?.status==="dropping"){const fell=await finishFallback();if(fell)return fell===true?null:waiting;}
+    const clock=config.now||(()=>Date.now()),wait=config.batch?.importWaitMs??BATCH_IMPORT_WAIT_MS;
+    for(let pass=0;;pass++){
+      state.phase="waiting_matrix";checkpoint();await fence();
+      let verified,failure;
+      try{verified=await adapter.verifyIntegrated(batchJob());}catch(error){failure=error;}
+      if(verified===true){state.phase="integrated";checkpoint();return null;}
+      if(failure){
+        const reason=failureReason(failure);
+        const fell=await fallback(reason==="batch-plan-uncovered"?reason:"batch-matrix-failed",reason);
+        if(fell)return fell===true?null:waiting;
+        throw failure;
+      }
+      if(adapter.matrixImportRequested && state.batchImportRequestedAt===undefined){state.batchImportRequestedAt=clock();checkpoint();}
+      if(pass || state.batchImportRequestedAt===undefined || clock()-state.batchImportRequestedAt<wait)return waiting;
+      const fell=await fallback("batch-import-timeout");
+      if(fell)return fell===true?null:waiting;
+      // The drop was refused: the import may just have been saved, so the
+      // batch stands and is read once more.
+    }
+  };
   // Every selected target is live-verified before this runs, so nothing here
   // rolls back: a failed push is escalated once and the release stands.
   const pushAndFinish=async receipt=>{
     state.receipt=receipt;state.phase="pushing";checkpoint();
     receipt.push={remote:"origin",commit:receipt.commit,outcome:pushRelease(cwd,receipt.commit)?"pushed":"failed"};checkpoint();
     if(receipt.push.outcome==="failed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed"});}catch{}}
-    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);state.phase="complete";checkpoint();return receipt;
+    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);state.phase="complete";checkpoint();materialize();return receipt;
   };
   try {
     if(state.phase==="receipt_pending" || state.phase==="finishing"){
-      await adapter.finish(state.receipt,state.finishGeneration);state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
+      await adapter.finish(state.receipt,state.finishGeneration);state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();materialize();return state.receipt;
     }
     if(state.phase==="pushing")return await pushAndFinish(state.receipt);
     // A job with no resumable journal (a requeue) first settles the matrix
@@ -358,9 +652,15 @@ export async function runRelease(config, adapter) {
     checkpoint();await fence();
     let integration;
     if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
+    else if(state.phase==="batching")integration=await resumeBatch();
+    else if(config.batch?.max>1 && config.batch.candidates?.length){step={step:"integrate"};integration=await openBatch();step=null;}
     else{step={step:"integrate"};integration=integrateCandidate(cwd,job);step=null;}
     state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
-    if(integration.integrated!==job.commit){
+    if(state.batch){
+      const waiting=await verifyBatch();if(waiting)return waiting;
+      integration={expected:state.expected,integrated:state.integrated};
+    }
+    if(!state.batch && integration.integrated!==job.commit){
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
       state.phase="waiting_matrix";checkpoint();
@@ -372,7 +672,10 @@ export async function runRelease(config, adapter) {
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const selected=selectReleaseTargets(cwd,baselines,integration.integrated);
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
-    state.receipt=receipt;checkpoint();
+    state.receipt=receipt;
+    // The batch receipt's intent is saved with the lead's, before any deploy.
+    if(state.batch)state.batchReceipt={version:1,batchId:state.batch.id,leadJobId:job.id,base:state.batch.base,integrated:integration.integrated,jobs:state.batch.jobs,dropped:state.batchDropped||[]};
+    checkpoint();
     // Targets sharing one TrueNAS plan (hub and bridge together) deploy as a
     // group: both effects are journaled before the single deploy, so any
     // failure rolls both back to the prior pair.
@@ -417,6 +720,8 @@ export async function runRelease(config, adapter) {
     step=null;
     return await pushAndFinish(receipt);
   } catch (error) {
+    // An unconfirmed batch call: nothing here may touch the checkout or the job.
+    if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
     if(step && !state.failure){state.failure={...step,reason:failureReason(error)};state.failureDetail??=failureDetail(error);checkpoint();}
     // The first failure's validated detail is kept even when no step was set;
@@ -450,6 +755,8 @@ export async function runRelease(config, adapter) {
       checkpoint();
     }
     state.phase="blocked";state.outcome=blocked?"blocked":"rolled_back";checkpoint();
+    // A batch that failed after publication: its members release alone.
+    if(state.batch && !state.batchSolo){state.batchSolo=true;checkpoint();try{await config.batch?.onFallback?.(state.batch.jobs.slice(1).map(j=>j.jobId),state.batch.id);}catch{}}
     if(state.published && !state.revert){
       state.revert={outcome:"failed"};checkpoint();
       try{state.revert.commit=revertCommit(cwd,job,state.integrated,state.expected);checkpoint();if(moveReleaseRef(cwd,state.revert.commit,state.integrated))state.revert.outcome="committed";}catch{}
@@ -471,7 +778,7 @@ export async function runRelease(config, adapter) {
       // exact receipt and generation, with no second rollback or escalation.
       state.finishGeneration=adapter.job?.generation??job.generation;state.phase="receipt_pending";checkpoint();
       try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw releaseError("Release failed; final receipt pending retry");}
-      state.phase="blocked";checkpoint();
+      state.phase="blocked";checkpoint();materialize();
     }else{await adapter.block(job.id);}
     throw releaseError("Release failed; inspect saved journal");
   } finally {closeSync(fd);rmSync(lock);}
@@ -501,15 +808,17 @@ export function validateNativeRelease(prior, next, operation, expectedGeneration
   const immutable = ["id", "taskId", "entryId", "itemId", "itemRevision", "scopeRevision", "orderMessageSeq", "repository", "baseCommit", "commit", "verificationDigest", "pauseGeneration"];
   const samePin = k => next?.[k] === prior[k];
   const flag = n => extra[extra.indexOf(n)+1];
-  const expectedState = {claim:"claimed", check:prior.state, merged:"merged", finish:receipt?.outcome, block:"blocked", refuse:"refused"}[operation];
+  const expectedState = {claim:"claimed", check:prior.state, merged:"merged", finish:receipt?.outcome, block:"blocked", refuse:"refused", "batch-open":"claimed", "batch-add":"claimed", "batch-drop":"claimed"}[operation];
   const advance = operation === "check" ? 0 : 1;
-  const allowed = {claim:["verified"],check:["claimed","merged"],merged:["claimed"],finish:["merged"],block:["claimed","merged"],refuse:["claimed"]};
+  const allowed = {claim:["verified"],check:["claimed","merged"],merged:["claimed"],finish:["merged"],block:["claimed","merged"],refuse:["claimed"],"batch-open":["claimed"],"batch-add":["claimed"],"batch-drop":["claimed"]};
   if (!allowed[operation]?.includes(prior.state)) throw releaseError("Invalid native release transition");
   if (!next || Array.isArray(next) || next.summary === true || !immutable.every(samePin) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || next.generation !== expectedGeneration + advance || !expectedState || next.state !== expectedState) throw releaseError("Invalid native release response");
   const agent = operation === "claim" ? process.env.TAILTERM_AGENT : prior.agentId, run = operation === "claim" ? process.env.TAILTERM_RUN : prior.runId;
   if (next.agentId !== agent || next.runId !== run) throw releaseError("Native release run binding mismatch");
   for (const k of ["inputsCommit", "inputsDigest"]) if (!samePin(k)) throw releaseError("Native release input binding mismatch");
-  const integrated = operation === "merged" ? flag("--commit") : prior.integratedCommit;
+  // A batch-add's --commit is the job's range end, never the lead's integrated
+  // commit; batch-drop is the one place a cleared integrated commit is expected.
+  const integrated = operation === "merged" ? flag("--commit") : operation === "batch-drop" ? undefined : prior.integratedCommit;
   if (next.integratedCommit !== integrated || (operation === "merged" && !sha(integrated))) throw releaseError("Native integrated commit mismatch");
   if (operation === "finish") {
     if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || digest(next.receipt) !== digest(receipt)) throw releaseError("Native full receipt mismatch");
@@ -559,6 +868,13 @@ export class HostAdapter {
     return id;
   }
   async merged(commit){this.native("merged",["--commit",commit]);}
+  // batch-open, batch-add and batch-drop on the claimed lead, at the lead
+  // generation the runner journaled before sending.
+  async batch(operation,{entryId,commit}={},generation){
+    if(!["batch-open","batch-add","batch-drop"].includes(operation))throw releaseError("Invalid release batch operation");
+    this.native(operation,[...(entryId?["--entry",entryId]:[]),...(commit?["--commit",commit]:[])],generation);return true;
+  }
+  async generation(){return this.detail(this.job.id).generation;}
   async verifyIntegrated(job){
     // Independent release verification is imported by the handler. It is not
     // satisfied by deployer self-certification or a candidate-SHA receipt.
@@ -582,6 +898,7 @@ export class HostAdapter {
     // The receipt is read only once its run is gone, and imported only when eligible.
     if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
+    this.matrixImportRequested=true;
     return false;
   }
   // The integrated checkout's matrix file can differ from the one the job was
@@ -612,7 +929,11 @@ export class HostAdapter {
     const minutes=Math.min(1440,Math.max(1,Math.floor(wait/60000)));
     save(contextPath,{...job.plan,...matrix,commit:job.integratedCommit,verifierAgentId:this.job.agentId,verifierRunId:this.job.runId});
     this.command(["node","scripts/verify-matrix.mjs","plan",contextPath,planPath]);
-    const boundMs=matrixRunTimeout(JSON.parse(readFileSync(planPath,"utf8")));
+    const plan=JSON.parse(readFileSync(planPath,"utf8"));
+    // A batch's one run must cover every job's approved checks, as the hub
+    // will require of its import; proven here, before any matrix run.
+    if(job.batchCovers && batchPlanCovers(plan,job.batchCovers))throw releaseError("batch-plan-uncovered");
+    const boundMs=matrixRunTimeout(plan);
     const run={version:1,state:"starting",launchedAt:this.now(),priority,hostWaitMs:minutes*60000,boundMs};
     // A failed intent save starts nothing and takes the ordinary refusal path.
     this.saveRun(dir,run);
@@ -1133,7 +1454,7 @@ export function reconcileReceipts(config,jobs){
       journal.phase="complete";updates.push([path,journal]);
     }
   }
-  for(const [path,journal] of updates)save(path,journal);
+  for(const [path,journal] of updates){save(path,journal);if(journal.batchReceipt){try{materializeBatch(config.journalDirectory,journal);}catch{}}}
 }
 // Journal retention. The imported backup copy is read only by its job's
 // rehearsal (the authoritative backup stays on TrueNAS), so the journal keeps
@@ -1196,6 +1517,21 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw releaseError("Explicit private activation config required");
   tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
   retentionPolicy(config);
+  // Read once, at daemon start. At 1 (or absent) nothing below reads a
+  // candidate, the solo file or passes a batch key: today's release.
+  const batchPolicy=releaseBatchPolicy(config);
+  // The batch key for a claimed lead: the candidates' full records while its
+  // batch may still be declared or verified, else none.
+  const batchFor=(read,jobs,current)=>{
+    const batch={max:batchPolicy.max,importWaitMs:batchPolicy.importWaitMs,candidates:[],onFallback:ids=>addBatchSolo(config.journalDirectory,ids)};
+    let journal=null;try{journal=JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8"));}catch{}
+    if(current.state!=="claimed" || current.integratedVerification || (journal && journal.phase!=="batching" && !journal.batch))return batch;
+    let solo;try{solo=readBatchSolo(config.journalDirectory);}catch{process.stderr.write("Batch solo file unreadable; releasing one job at a time.\n");return batch;}
+    for(const summary of batchCandidates(jobs,current,solo).slice(0,2*(batchPolicy.max-1))){
+      try{const detail=readReleaseDetail(read,summary,{bookend:false});if(!batchMismatch(current,detail))batch.candidates.push(detail);}catch{}
+    }
+    return batch;
+  };
   // One fence-wait notice per holder, waiting job and reason per process; the
   // hub returns the original for a restart's identical resend.
   const posted=new Set();
@@ -1315,10 +1651,14 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
       const current=adapter.job;adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
+      const batch=batchPolicy.max>1?batchFor(read,jobs,current):null;
       let result;
-      try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json"),...(codeNow?{code:{loaded:codeNow.loaded?.digest??null,current:codeNow.current?.digest??null}}:{})},adapter);}
+      try{result=await release({...activation,baselines,job:current,journalPath:join(config.journalDirectory,current.id+".json"),...(batch?{batch}:{}),...(codeNow?{code:{loaded:codeNow.loaded?.digest??null,current:codeNow.current?.digest??null}}:{})},adapter);}
       catch{process.stderr.write("Release held; inspect handler fence and private journal.\n");cliNotify(reader,[...reader.cliFailures,...adapter.cliFailures]);}
-      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,jobs,adapter.job||current,result.outcome);
+      // A batch's own members are not waiting behind its lead.
+      let waiting=jobs;
+      if(batch){try{const members=new Set(JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8")).batch?.jobs?.map(j=>j.jobId));waiting=jobs.filter(j=>!members.has(j.id));}catch{}}
+      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,waiting,adapter.job||current,result.outcome);
       matrixNotify(reader,adapter.job||current,adapter);
       break;
     }

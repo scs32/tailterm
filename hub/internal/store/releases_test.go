@@ -2455,3 +2455,829 @@ func TestReleasesBoundedPagesAndExactDetail(t *testing.T) {
 		t.Fatal("set-aside move stale", err)
 	}
 }
+
+// batchFixture is a claimed lead job with later verified jobs queued behind
+// it, all from one base under one matrix approval.
+type batchFixture struct {
+	s       *Store
+	task    api.Task
+	h, d    api.Agent
+	lead    api.ReleaseJob
+	members []api.ReleaseJob
+	keys    int
+}
+
+var batchBase = strings.Repeat("0", 40)
+
+// batchTo is the integrated tip after the batch's i-th job; the last job of
+// a declared batch ends on candidateA, the commit integratedImport verifies.
+func batchTo(i int) string { return strings.Repeat(fmt.Sprint(i), 40) }
+
+func newBatchFixture(t *testing.T, members int) *batchFixture {
+	t.Helper()
+	s, task, h, d, entry := releaseFixture(t)
+	f := &batchFixture{s: s, task: task, h: h, d: d}
+	ctx := context.Background()
+	enqueue := func(entry string) api.ReleaseJob {
+		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: f.key("enqueue"), Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+	f.lead = enqueue(entry)
+	for i := range members {
+		f.members = append(f.members, enqueue(releaseEntry(t, s, task, fmt.Sprintf("batch member %d", i+1), fmt.Sprintf("member-%d", i+1))))
+	}
+	if _, err := f.deployer("claim", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+func (f *batchFixture) key(op string) string {
+	f.keys++
+	return fmt.Sprintf("batch-%s-%d", op, f.keys)
+}
+
+// deployer runs one operation of the deployer's exact run on the lead.
+func (f *batchFixture) deployer(op, entry, commit string) (api.ReleaseJob, error) {
+	j, err := f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key(op), Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, EntryID: entry, IntegratedCommit: commit})
+	if err == nil {
+		f.lead = j
+	}
+	return j, err
+}
+
+// declare opens the batch and adds the lead and every member in queue order.
+func (f *batchFixture) declare(t *testing.T) ReleaseBatch {
+	t.Helper()
+	if _, err := f.deployer("batch-open", "", batchBase); err != nil {
+		t.Fatal(err)
+	}
+	jobs := append([]api.ReleaseJob{f.lead}, f.members...)
+	for i, j := range jobs {
+		to := batchTo(i + 1)
+		if i == len(jobs)-1 {
+			to = candidateA
+		}
+		if _, err := f.deployer("batch-add", j.EntryID, to); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	return f.batch(t, f.lead.ID)
+}
+func (f *batchFixture) batch(t *testing.T, job string) ReleaseBatch {
+	t.Helper()
+	b, err := f.s.ReleaseBatchOf(context.Background(), f.task.ID, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// verify imports the one integrated verification, as the handler does.
+func (f *batchFixture) verify(checks []api.VerificationCheck) error {
+	if checks == nil {
+		checks = f.lead.Plan.Checks
+	}
+	j, err := f.s.ReleaseAction(context.Background(), f.task.ID, integratedImport(f.lead, f.h, f.d, f.key("import"), checks))
+	if err == nil {
+		f.lead = j
+	}
+	return err
+}
+
+// publish imports the verification and records the lead as merged.
+func (f *batchFixture) publish(t *testing.T) {
+	t.Helper()
+	if err := f.verify(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deployer("merged", "", candidateA); err != nil {
+		t.Fatal(err)
+	}
+}
+func (f *batchFixture) finish(outcome string, revert *api.ReleaseRevert) (api.ReleaseJob, error) {
+	target := api.ReleaseTargetReceipt{Target: "tailos", Release: "fixture-batch", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}
+	switch outcome {
+	case "rolled_back":
+		target.Outcome, target.Rollback = "rolled_back", "restored"
+	case "blocked":
+		target.Outcome = "failed"
+	}
+	receipt := &api.ReleaseReceipt{Version: 1, JobID: f.lead.ID, Commit: candidateA, VerificationDigest: f.lead.VerificationDigest, Outcome: outcome, Targets: []api.ReleaseTargetReceipt{target}, Revert: revert}
+	if outcome == "released" {
+		receipt.Push = &api.ReleasePush{Remote: "origin", Commit: candidateA, Outcome: "pushed"}
+	}
+	j, err := f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("finish"), Operation: "finish", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, Receipt: receipt})
+	if err == nil {
+		f.lead = j
+	}
+	return j, err
+}
+func (f *batchFixture) load(t *testing.T, id string) api.ReleaseJob {
+	t.Helper()
+	j, err := releaseLoad(context.Background(), f.s.db, f.task.ID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+func (f *batchFixture) rows(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM release_batch_jobs WHERE task_id=?`, f.task.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// claim is the deployer's claim of any job, lead or not.
+func (f *batchFixture) claim(j api.ReleaseJob) (api.ReleaseJob, error) {
+	return f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("claim"), Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+}
+
+// memberHeld requires that no operation reaches the member while its batch
+// holds it, and that the member's row is what it was.
+func (f *batchFixture) memberHeld(t *testing.T, m api.ReleaseJob, row string) {
+	t.Helper()
+	ctx := context.Background()
+	evidence := api.ReleaseReconciliation{JobID: m.ID, Disposition: "set_aside"}
+	for _, req := range []api.ReleaseRequest{
+		{Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID},
+		{Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: "hrl_fixture"}},
+		{Operation: "set-aside", AgentID: f.h.ID, RunID: f.h.RunID, Reconciliation: &evidence},
+		{Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, Reconciliation: &evidence},
+	} {
+		req.RequestID, req.JobID, req.ExpectedGeneration = f.key("member-"+req.Operation), m.ID, m.Generation
+		if _, err := f.s.ReleaseAction(ctx, f.task.ID, req); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is in release batch") {
+			t.Fatalf("%s reached batch member %s: %v", req.Operation, m.ID, err)
+		}
+	}
+	if got := releaseRow(t, f.s, f.task, m.ID); got != row {
+		t.Fatalf("batch member %s changed:\n%s\n%s", m.ID, row, got)
+	}
+}
+
+// exitDeployer marks the deployer's run exited, as a reconcile requires;
+// resumeDeployer brings the same run back for later deployer operations.
+func (f *batchFixture) exitDeployer(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, f.d.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+func (f *batchFixture) resumeDeployer(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(time.Now()), f.d.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+func (f *batchFixture) reconcile(t *testing.T, change func(*api.ReleaseReconciliation)) (api.ReleaseJob, error) {
+	t.Helper()
+	evidence := recoveryEvidence(t, f.s, f.task, f.h, f.lead)
+	change(&evidence)
+	j, err := f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("reconcile"), Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, Reconciliation: &evidence})
+	if err == nil {
+		f.lead = j
+	}
+	return j, err
+}
+
+// rewriteJob is a test-only rewrite of a saved job snapshot.
+func rewriteJob(t *testing.T, s *Store, j api.ReleaseJob, change func(*api.ReleaseJob)) api.ReleaseJob {
+	t.Helper()
+	change(&j)
+	raw, _ := json.Marshal(j)
+	if _, err := s.db.Exec(`UPDATE release_jobs SET record_json=? WHERE task_id=? AND id=?`, string(raw), j.TaskID, j.ID); err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+// One integrated verification, imported once on the lead, releases every job
+// of the batch; each keeps its own receipt and its own commit range.
+func TestReleaseBatchOneVerificationSettlesEveryJob(t *testing.T) {
+	f := newBatchFixture(t, 2)
+	declared := f.declare(t)
+	if declared.ID != releaseBatchID(f.lead.ID, declared.LeadGeneration, batchBase) || declared.State != "open" || declared.IntegratedCommit != candidateA || len(declared.Jobs) != 3 {
+		t.Fatalf("declared %+v", declared)
+	}
+	f.publish(t)
+	if b := f.batch(t, f.lead.ID); b.State != "published" || !b.Published {
+		t.Fatalf("published %+v", b)
+	}
+	lead, err := f.finish("released", nil)
+	if err != nil || lead.State != "released" {
+		t.Fatal(lead.State, err)
+	}
+	want := verificationDigest(lead.IntegratedVerification)
+	from := batchBase
+	for i, id := range []string{f.lead.ID, f.members[0].ID, f.members[1].ID} {
+		j := f.load(t, id)
+		if j.State != "released" || !j.Published || j.IntegratedCommit != candidateA || j.IntegratedVerification == nil || verificationDigest(j.IntegratedVerification) != want || j.SettledAt != lead.SettledAt || j.AgentID != f.d.ID || j.RunID != f.d.RunID {
+			t.Fatalf("job %d %+v", i, j)
+		}
+		if j.Receipt == nil || j.Receipt.JobID != id || j.Receipt.VerificationDigest != j.VerificationDigest || j.Receipt.Commit != candidateA || j.Receipt.Outcome != "released" || len(j.Receipt.Targets) != 1 || j.Receipt.Targets[0].Outcome != "released" || j.Receipt.Push == nil || j.Receipt.Push.Commit != candidateA {
+			t.Fatalf("job %d receipt %+v", i, j.Receipt)
+		}
+		b := f.batch(t, id)
+		if b.ID != declared.ID || b.State != "released" || b.SettledAt == "" || b.LeadJobID != f.lead.ID || b.BaseCommit != batchBase || b.IntegratedCommit != candidateA {
+			t.Fatalf("batch of job %d %+v", i, b)
+		}
+		row := b.Jobs[i]
+		if row.JobID != id || row.Seq != int64(i+1) || row.FromCommit != from || row.ToCommit == from || row.EntryID != j.EntryID {
+			t.Fatalf("range of job %d %+v", i, row)
+		}
+		from = row.ToCommit
+	}
+	if from != candidateA {
+		t.Fatal("ranges do not end on the integrated commit", from)
+	}
+	if f.members[0].VerificationDigest == f.members[1].VerificationDigest || f.members[0].VerificationDigest == f.lead.VerificationDigest {
+		t.Fatal("fixture jobs share a verification digest")
+	}
+	if _, err = f.s.ReleaseBatchOf(context.Background(), f.task.ID, "rel_absent"); !errors.Is(err, api.ErrNotFound) {
+		t.Fatal("batch of an unknown job", err)
+	}
+
+	// An import that omits one member's approved check is refused by name.
+	f = newBatchFixture(t, 2)
+	extra := append(slices.Clone(f.members[1].Plan.Checks), api.VerificationCheck{ID: "member-only", Argv: []string{"fixture", "member"}, Cwd: ".", Environment: map[string]string{}})
+	approveChecks(t, f.s, f.members[1], extra)
+	f.declare(t)
+	before := f.lead.Generation
+	if err = f.verify(nil); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release batch job "+f.members[1].ID+": integrated matrix omitted approved check member-only") {
+		t.Fatal("uncovered member", err)
+	}
+	if saved := f.load(t, f.lead.ID); saved.Generation != before || saved.IntegratedVerification != nil || saved.IntegratedPlan != nil {
+		t.Fatal("refused import changed the lead", saved.Generation)
+	}
+	if err = f.verify(extra); err != nil {
+		t.Fatal("covering import", err)
+	}
+	// An import of another commit than the batch's is refused.
+	f = newBatchFixture(t, 1)
+	f.declare(t)
+	other := integratedImport(f.lead, f.h, f.d, "batch-other-commit", f.lead.Plan.Checks)
+	other.Plan.Commit, other.IntegratedCommit = candidateB, candidateB
+	receipt := passingVerification(*other.Plan)
+	other.Verification = &receipt
+	if _, err = f.s.ReleaseAction(context.Background(), f.task.ID, other); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "requires the verification of its integrated commit") {
+		t.Fatal("other commit", err)
+	}
+}
+
+// A docs-only member needs every package and a code member needs its own:
+// only the merged plan covers both, and each job records its own coverage.
+func TestReleaseBatchHeterogeneousPlansNeedTheMergedPlan(t *testing.T) {
+	f := newBatchFixture(t, 2)
+	leadChecks := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	docs := goRaceMatrix(goRace(raceFlags, "./..."))
+	code := goRaceMatrix(goRace(raceFlags, "./internal/store"))
+	f.lead = approveChecks(t, f.s, f.lead, leadChecks)
+	approveChecks(t, f.s, f.members[0], docs)
+	approveChecks(t, f.s, f.members[1], code)
+	f.declare(t)
+	if err := f.verify(leadChecks); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release batch job "+f.members[0].ID+": integrated matrix omitted approved check go-race") {
+		t.Fatal("lead plan alone", err)
+	}
+	if err := f.verify(goRaceMatrix(goRace(raceFlags, "./cmd/tt", "./internal/store"))); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.members[0].ID) {
+		t.Fatal("package union without ./...", err)
+	}
+	if err := f.verify(docs); err != nil {
+		t.Fatal("merged plan", err)
+	}
+	if _, err := f.deployer("merged", "", candidateA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.finish("released", nil); err != nil {
+		t.Fatal(err)
+	}
+	superset := func(approved []api.VerificationCheck) []api.ReleaseCheckCoverage {
+		return []api.ReleaseCheckCoverage{{CheckID: "go-race", ApprovedDigest: verificationDigest(approved[71]), IntegratedDigest: verificationDigest(docs[71]), Relation: "superset"}}
+	}
+	if got := f.load(t, f.lead.ID).IntegratedCoverage; !slices.Equal(got, superset(leadChecks)) {
+		t.Fatalf("lead coverage %+v", got)
+	}
+	if got := f.load(t, f.members[0].ID); got.State != "released" || got.IntegratedCoverage != nil {
+		t.Fatalf("docs member %s %+v", got.State, got.IntegratedCoverage)
+	}
+	if got := f.load(t, f.members[1].ID); got.State != "released" || !slices.Equal(got.IntegratedCoverage, superset(code)) {
+		t.Fatalf("code member %s %+v", got.State, got.IntegratedCoverage)
+	}
+}
+
+// Until the lead's finish a member is the row it was when it joined, no
+// operation reaches it, and the lead alone holds the project fence.
+func TestReleaseBatchMembersAdvanceOnlyAtFinish(t *testing.T) {
+	f := newBatchFixture(t, 3)
+	outside := f.members[2]
+	f.members = f.members[:2]
+	rows := []string{releaseRow(t, f.s, f.task, f.members[0].ID), releaseRow(t, f.s, f.task, f.members[1].ID)}
+	held := func(stage string) {
+		t.Helper()
+		for i, m := range f.members {
+			f.memberHeld(t, m, rows[i])
+		}
+		if _, err := f.claim(outside); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "project already fenced") {
+			t.Fatal(stage, "the fence allowed a second claim", err)
+		}
+	}
+	f.declare(t)
+	held("declared")
+	if err := f.verify(nil); err != nil {
+		t.Fatal(err)
+	}
+	held("verified")
+	if _, err := f.deployer("merged", "", candidateA); err != nil {
+		t.Fatal(err)
+	}
+	held("merged")
+	lead, err := f.finish("released", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range f.members {
+		got := f.load(t, m.ID)
+		if got.State != "released" || got.Generation != m.Generation+1 || got.SettledAt != lead.SettledAt || got.SettledAt == "" {
+			t.Fatalf("member %d %s generation %d settled %q", i, got.State, got.Generation, got.SettledAt)
+		}
+		if _, err = f.claim(got); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("released member claimed", err)
+		}
+	}
+	if got := f.load(t, outside.ID); got.State != "verified" || got.Generation != outside.Generation {
+		t.Fatal("job outside the batch changed", got.State)
+	}
+	if claimed, err := f.claim(outside); err != nil || claimed.State != "claimed" {
+		t.Fatal("next job after the batch", err)
+	}
+}
+
+// A dropped batch and a rolled-back batch whose revert is committed leave
+// every member the verified row it was, free for its own release.
+func TestReleaseBatchDropAndRollbackLeaveMembersVerified(t *testing.T) {
+	ctx := context.Background()
+	untouched := func(f *batchFixture, rows []string) {
+		t.Helper()
+		for i, m := range f.members {
+			if got := releaseRow(t, f.s, f.task, m.ID); got != rows[i] {
+				t.Fatalf("member %d changed:\n%s\n%s", i, rows[i], got)
+			}
+		}
+	}
+	start := func(n int) (*batchFixture, []string) {
+		t.Helper()
+		f := newBatchFixture(t, n)
+		var rows []string
+		for _, m := range f.members {
+			rows = append(rows, releaseRow(t, f.s, f.task, m.ID))
+		}
+		return f, rows
+	}
+
+	// batch-drop: dissolved, the lead clean and able to verify alone.
+	f, rows := start(2)
+	f.declare(t)
+	dropped, err := f.deployer("batch-drop", "", "")
+	if err != nil || dropped.State != "claimed" || dropped.IntegratedCommit != "" || dropped.IntegratedPlan != nil || dropped.IntegratedCoverage != nil || dropped.IntegratedMatrix != nil || dropped.IntegratedVerification != nil {
+		t.Fatalf("drop %+v %v", dropped, err)
+	}
+	if b := f.batch(t, f.members[0].ID); b.State != "dissolved" || b.SettledAt == "" || len(b.Jobs) != 3 {
+		t.Fatalf("dropped batch %+v", b)
+	}
+	untouched(f, rows)
+	if _, err = f.deployer("batch-drop", "", ""); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second drop", err)
+	}
+	if err = f.verify(nil); err != nil {
+		t.Fatal("lead alone after the drop", err)
+	}
+	if _, err = f.deployer("merged", "", candidateA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.finish("released", nil); err != nil {
+		t.Fatal(err)
+	}
+	untouched(f, rows)
+	if claimed, cerr := f.claim(f.members[0]); cerr != nil || claimed.State != "claimed" {
+		t.Fatal("member after a dropped batch", cerr)
+	}
+
+	// A drop is refused once the import is saved: the batch continues.
+	f, rows = start(1)
+	f.declare(t)
+	if err = f.verify(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-drop", "", ""); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "integrated verification is saved") {
+		t.Fatal("drop after import", err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "open" {
+		t.Fatal(b.State)
+	}
+
+	// Rolled back with the tasks-hub revert committed: members are free.
+	f, rows = start(2)
+	f.declare(t)
+	f.publish(t)
+	lead, err := f.finish("rolled_back", &api.ReleaseRevert{Outcome: "committed", Commit: candidateB})
+	if err != nil || lead.State != "rolled_back" {
+		t.Fatal(lead.State, err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "rolled_back" || b.SettledAt == "" {
+		t.Fatalf("rolled back batch %+v", b)
+	}
+	untouched(f, rows)
+	if claimed, cerr := f.claim(f.members[0]); cerr != nil || claimed.State != "claimed" {
+		t.Fatal("member after a rolled-back batch", cerr)
+	}
+
+	// The lead leaving the fence unpublished dissolves the batch.
+	f, rows = start(1)
+	f.declare(t)
+	if _, err = f.deployer("refuse", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "dissolved" {
+		t.Fatal("refuse", b.State)
+	}
+	untouched(f, rows)
+	f, rows = start(1)
+	f.declare(t)
+	evidence := setAsideEvidence(t, f.s, f.task, f.h, f.lead)
+	if _, err = f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "batch-set-aside", Operation: "set-aside", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, Reconciliation: &evidence}); err != nil {
+		t.Fatal(err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "dissolved" {
+		t.Fatal("set-aside", b.State)
+	}
+	untouched(f, rows)
+	if claimed, cerr := f.claim(f.members[0]); cerr != nil || claimed.State != "claimed" {
+		t.Fatal("member after the lead was set aside", cerr)
+	}
+
+	// Blocked before publication holds the members until the handler's
+	// inspected requeue, which dissolves the batch.
+	f, rows = start(1)
+	f.declare(t)
+	if _, err = f.deployer("block", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "held" || b.Published {
+		t.Fatalf("blocked batch %+v", b)
+	}
+	f.memberHeld(t, f.members[0], rows[0])
+	f.exitDeployer(t)
+	if _, err = f.reconcile(t, func(*api.ReleaseReconciliation) {}); err != nil {
+		t.Fatal("requeue", err)
+	}
+	if b := f.batch(t, f.lead.ID); b.State != "dissolved" {
+		t.Fatal("requeue", b.State)
+	}
+	untouched(f, rows)
+}
+
+// The batch id is the runner's formula (the same literal is asserted in
+// tests/release-runner.test.js), and a repeated batch request replays.
+func TestReleaseBatchIdAndReplay(t *testing.T) {
+	if got := releaseBatchID("rel_0123456789abcdef", 2, strings.Repeat("a", 40)); got != "bat_093efed8fd1877b6" {
+		t.Fatal(got)
+	}
+	f := newBatchFixture(t, 1)
+	ctx := context.Background()
+	open := api.ReleaseRequest{RequestID: "replay-open", Operation: "batch-open", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, IntegratedCommit: batchBase}
+	opened, err := f.s.ReleaseAction(ctx, f.task.ID, open)
+	if err != nil || opened.Generation != f.lead.Generation+1 || opened.State != "claimed" {
+		t.Fatal(opened.Generation, err)
+	}
+	b := f.batch(t, f.lead.ID)
+	if b.ID != releaseBatchID(f.lead.ID, f.lead.Generation, batchBase) || b.LeadGeneration != f.lead.Generation || len(b.Jobs) != 0 {
+		t.Fatalf("opened %+v", b)
+	}
+	if again, err := f.s.ReleaseAction(ctx, f.task.ID, open); err != nil || again.Generation != opened.Generation {
+		t.Fatal("open replay", err)
+	}
+	add := api.ReleaseRequest{RequestID: "replay-add", Operation: "batch-add", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.lead.ID, ExpectedGeneration: opened.Generation, EntryID: f.lead.EntryID, IntegratedCommit: batchTo(1)}
+	added, err := f.s.ReleaseAction(ctx, f.task.ID, add)
+	if err != nil || added.Generation != opened.Generation+1 {
+		t.Fatal(added.Generation, err)
+	}
+	again, err := f.s.ReleaseAction(ctx, f.task.ID, add)
+	if err != nil || again.Generation != added.Generation || f.rows(t) != 1 {
+		t.Fatal("add replay", again.Generation, f.rows(t), err)
+	}
+	changed := add
+	changed.IntegratedCommit = batchTo(2)
+	if _, err = f.s.ReleaseAction(ctx, f.task.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") || f.rows(t) != 1 {
+		t.Fatal("changed add", err)
+	}
+	if got := f.batch(t, f.lead.ID); got.IntegratedCommit != batchTo(1) || got.Jobs[0].FromCommit != batchBase || got.Jobs[0].Generation != opened.Generation {
+		t.Fatalf("after replay %+v", got)
+	}
+}
+
+// Every refused batch-add leaves no row.
+func TestReleaseBatchAddRefusals(t *testing.T) {
+	ctx := context.Background()
+	f := newBatchFixture(t, 9)
+	refuse := func(name, want string, entry, commit string, rows int) {
+		t.Helper()
+		before := f.lead.Generation
+		_, err := f.deployer("batch-add", entry, commit)
+		if err == nil || (want == "" && !errors.Is(err, api.ErrInvalid)) || (want != "" && (!errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), want))) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if f.rows(t) != rows || f.load(t, f.lead.ID).Generation != before {
+			t.Fatalf("%s left a row or moved the lead: %d rows", name, f.rows(t))
+		}
+	}
+	refuse("before open", "open release batch required", f.lead.EntryID, batchTo(1), 0)
+	if _, err := f.deployer("batch-open", "", "not-a-commit"); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("open without a base", err)
+	}
+	if _, err := f.deployer("batch-open", "", batchBase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deployer("batch-open", "", batchBase); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is still open") {
+		t.Fatal("second open", err)
+	}
+	refuse("member before the lead", "starts with its lead job", f.members[0].EntryID, batchTo(1), 0)
+	refuse("no commit", "", f.lead.EntryID, "", 0)
+	refuse("lead adds nothing", "adds no commit", f.lead.EntryID, batchBase, 0)
+	if _, err := f.deployer("batch-add", f.lead.EntryID, batchTo(1)); err != nil {
+		t.Fatal(err)
+	}
+	refuse("lead twice", "already in release batch", f.lead.EntryID, batchTo(2), 1)
+	refuse("unknown entry", "entry has no release job", api.NewID("tqe"), batchTo(2), 1)
+	refuse("no entry", "", "", batchTo(2), 1)
+
+	m := f.members
+	restore := func(j api.ReleaseJob) { rewriteJob(t, f.s, j, func(*api.ReleaseJob) {}) }
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.AgentID, j.RunID = f.d.ID, f.d.RunID })
+	refuse("claimed member", "is not an unclaimed verified job", m[0].EntryID, batchTo(2), 1)
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.State = "refused" })
+	refuse("settled member", "is not an unclaimed verified job", m[0].EntryID, batchTo(2), 1)
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.BaseCommit = candidateB })
+	refuse("other base", "has another base commit than the lead", m[0].EntryID, batchTo(2), 1)
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.Plan.MatrixDigest = strings.Repeat("e", 64) })
+	refuse("other matrix", "has another matrix approval than the lead", m[0].EntryID, batchTo(2), 1)
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.Plan.MatrixApprovalMessageSeq = 77 })
+	refuse("other approval", "has another matrix approval than the lead", m[0].EntryID, batchTo(2), 1)
+	rewriteJob(t, f.s, m[0], func(j *api.ReleaseJob) { j.PauseGeneration++ })
+	refuse("other project generation", "project generation changed for job", m[0].EntryID, batchTo(2), 1)
+	restore(m[0])
+	// The accepted candidate changed after enqueue.
+	if _, err := f.s.db.Exec(`UPDATE work_items SET status='open' WHERE id=?`, m[0].ItemID); err != nil {
+		t.Fatal(err)
+	}
+	refuse("changed candidate", "exact accepted SHA and current verification required", m[0].EntryID, batchTo(2), 1)
+	if _, err := f.s.db.Exec(`UPDATE work_items SET status='done' WHERE id=?`, m[0].ItemID); err != nil {
+		t.Fatal(err)
+	}
+	// Another run of the deployer, and the handler, cannot extend the batch.
+	for name, who := range map[string][2]string{"wrong run": {f.d.ID, api.NewID("run")}, "handler": {f.h.ID, f.h.RunID}} {
+		if _, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: f.key("wrong"), Operation: "batch-add", AgentID: who[0], RunID: who[1], JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, EntryID: m[0].EntryID, IntegratedCommit: batchTo(2)}); !errors.Is(err, api.ErrConflict) || f.rows(t) != 1 {
+			t.Fatal(name, err)
+		}
+	}
+	if _, err := f.deployer("batch-add", m[1].EntryID, batchTo(2)); err != nil {
+		t.Fatal(err)
+	}
+	refuse("earlier queue position", "in queue order", m[0].EntryID, batchTo(3), 2)
+	// Eight jobs, then no ninth.
+	for i := 2; i < 8; i++ {
+		if _, err := f.deployer("batch-add", m[i].EntryID, batchTo(i+1)); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	refuse("ninth job", "already has 8 jobs", m[8].EntryID, strings.Repeat("9", 40), 8)
+
+	// Nothing joins after the integrated verification is saved.
+	f = newBatchFixture(t, 2)
+	late := f.members[1]
+	f.members = f.members[:1]
+	f.declare(t)
+	if err := f.verify(nil); err != nil {
+		t.Fatal(err)
+	}
+	refuse("add after verification", "fixed once its integrated verification is saved", late.EntryID, candidateB, 2)
+	if _, err := f.deployer("batch-open", "", batchBase); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("open after verification", err)
+	}
+	// An unclaimed job cannot lead a batch.
+	if _, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "unclaimed-open", Operation: "batch-open", AgentID: f.d.ID, RunID: f.d.RunID, JobID: late.ID, ExpectedGeneration: late.Generation, IntegratedCommit: batchBase}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("unclaimed lead", err)
+	}
+}
+
+// Once the lead is merged, tasks-hub carries every member: they stay held
+// until the whole batch settles or an exact inspection records it restored.
+func TestReleaseBatchPublishedMembersStayHeld(t *testing.T) {
+	start := func() (*batchFixture, api.ReleaseJob, []string) {
+		t.Helper()
+		f := newBatchFixture(t, 3)
+		outside := f.members[2]
+		f.members = f.members[:2]
+		rows := []string{releaseRow(t, f.s, f.task, f.members[0].ID), releaseRow(t, f.s, f.task, f.members[1].ID)}
+		f.declare(t)
+		f.publish(t)
+		return f, outside, rows
+	}
+	held := func(f *batchFixture, rows []string, state string) {
+		t.Helper()
+		for i, m := range f.members {
+			f.memberHeld(t, m, rows[i])
+		}
+		if b := f.batch(t, f.lead.ID); b.State != state || !b.Published {
+			t.Fatalf("batch %+v, want %s", b, state)
+		}
+	}
+	fenced := func(f *batchFixture, outside api.ReleaseJob) {
+		t.Helper()
+		if _, err := f.claim(outside); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "project already fenced") {
+			t.Fatal("the fence allowed a second claim", err)
+		}
+	}
+	free := func(f *batchFixture, rows []string) {
+		t.Helper()
+		if b := f.batch(t, f.lead.ID); b.State != "rolled_back" || b.SettledAt == "" {
+			t.Fatalf("batch %+v", b)
+		}
+		for i, m := range f.members {
+			if got := releaseRow(t, f.s, f.task, m.ID); got != rows[i] {
+				t.Fatalf("member %d changed", i)
+			}
+		}
+		f.resumeDeployer(t)
+		if claimed, err := f.claim(f.members[0]); err != nil || claimed.State != "claimed" {
+			t.Fatal("member after restoration", err)
+		}
+	}
+	restored := func(r *api.ReleaseReconciliation) {
+		r.Disposition, r.NoPublication, r.JournalState = "refuse", false, "restored"
+	}
+
+	// Merged, then the run stops: only exact restoration evidence frees them.
+	f, outside, rows := start()
+	held(f, rows, "published")
+	fenced(f, outside)
+	f.exitDeployer(t)
+	if _, err := f.reconcile(t, func(r *api.ReleaseReconciliation) { restored(r); r.RefResolved = false }); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reconcile without a resolved ref", err)
+	}
+	if _, err := f.reconcile(t, func(r *api.ReleaseReconciliation) { restored(r); r.JournalState = "unknown" }); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reconcile without an inspected journal", err)
+	}
+	if _, err := f.reconcile(t, func(*api.ReleaseReconciliation) {}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is published; requeue cannot free its members") {
+		t.Fatal("requeue of a published batch", err)
+	}
+	held(f, rows, "published")
+	if lead, err := f.reconcile(t, restored); err != nil || lead.State != "refused" {
+		t.Fatal(lead.State, err)
+	}
+	free(f, rows)
+
+	// Finished blocked: held with the fence, until the same evidence.
+	f, outside, rows = start()
+	if lead, err := f.finish("blocked", nil); err != nil || lead.State != "blocked" {
+		t.Fatal(lead.State, err)
+	}
+	held(f, rows, "held")
+	fenced(f, outside)
+	f.exitDeployer(t)
+	if _, err := f.reconcile(t, func(r *api.ReleaseReconciliation) { restored(r); r.NoActiveExecution = false }); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("reconcile with a live execution", err)
+	}
+	held(f, rows, "held")
+	if _, err := f.reconcile(t, restored); err != nil {
+		t.Fatal(err)
+	}
+	free(f, rows)
+
+	// The deployer's own block after publication holds them too.
+	f, outside, rows = start()
+	if _, err := f.deployer("block", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	held(f, rows, "held")
+	fenced(f, outside)
+
+	// Rolled back live, but the tasks-hub revert failed: the lead is settled
+	// and the fence is free, yet tasks-hub still carries the members.
+	for _, revert := range []*api.ReleaseRevert{{Outcome: "failed"}, nil} {
+		f, outside, rows = start()
+		lead, err := f.finish("rolled_back", revert)
+		if err != nil || lead.State != "rolled_back" {
+			t.Fatal(lead.State, err)
+		}
+		held(f, rows, "held")
+		next, err := f.claim(outside)
+		if err != nil {
+			t.Fatal("job outside the batch", err)
+		}
+		// No new batch while one is held.
+		if _, err = f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("open"), Operation: "batch-open", AgentID: f.d.ID, RunID: f.d.RunID, JobID: next.ID, ExpectedGeneration: next.Generation, IntegratedCommit: batchBase}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is still open, published or held") {
+			t.Fatal("batch opened beside a held one", err)
+		}
+		if _, err = f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: f.key("refuse"), Operation: "refuse", AgentID: f.d.ID, RunID: f.d.RunID, JobID: next.ID, ExpectedGeneration: next.Generation}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.reconcile(t, func(r *api.ReleaseReconciliation) { restored(r); r.JournalState = "no_effects" }); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("held batch freed without a restored journal", err)
+		}
+		if _, err = f.reconcile(t, func(*api.ReleaseReconciliation) {}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("held batch freed by a requeue", err)
+		}
+		held(f, rows, "held")
+		lead, err = f.reconcile(t, restored)
+		if err != nil || lead.State != "rolled_back" || lead.Receipt == nil || len(lead.Reconciliations) != 1 || lead.Reconciliations[0].JournalState != "restored" {
+			t.Fatalf("%+v %v", lead, err)
+		}
+		free(f, rows)
+	}
+}
+
+// The batch tables are created beside an existing ledger, survive a second
+// open unchanged, and keep their rows as history.
+func TestReleaseBatchTablesSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "batch ledger"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A ledger from before batches has neither table.
+	if _, err = s.db.Exec(`DROP TABLE release_batch_jobs; DROP TABLE release_batches`); err != nil {
+		t.Fatal(err)
+	}
+	shape := func(s *Store) string {
+		t.Helper()
+		var out []string
+		rows, err := s.db.Query(`SELECT type||' '||name||' '||coalesce(sql,'') FROM sqlite_master WHERE tbl_name IN ('release_batches','release_batch_jobs') ORDER BY name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var line string
+			if err = rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, line)
+		}
+		return strings.Join(out, "\n")
+	}
+	if shape(s) != "" {
+		t.Fatal(shape(s))
+	}
+	reopen := func() {
+		t.Helper()
+		if err = s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reopen()
+	created := shape(s)
+	for _, want := range []string{"table release_batches", "table release_batch_jobs", "index release_batch_active", "trigger release_batch_no_delete", "trigger release_batch_job_no_update", "trigger release_batch_job_no_delete"} {
+		if !strings.Contains(created, want) {
+			t.Fatal("missing", want, created)
+		}
+	}
+	id := releaseBatchID("rel_fixture", 2, batchBase)
+	if _, err = s.db.Exec(`INSERT INTO release_batches(task_id,batch_id,lead_job_id,lead_generation,base_commit,state,created_at) VALUES(?,?,?,?,?,'open',?)`, task.ID, id, "rel_fixture", 2, batchBase, ts(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO release_batch_jobs VALUES(?,?,1,'rel_fixture','tqe_fixture',3,?,?)`, task.ID, id, batchBase, candidateA); err != nil {
+		t.Fatal(err)
+	}
+	reopen()
+	defer s.Close()
+	if shape(s) != created {
+		t.Fatal("a second open changed the batch tables")
+	}
+	b, err := s.ReleaseBatchOf(ctx, task.ID, "rel_fixture")
+	if err != nil || b.ID != id || b.State != "open" || len(b.Jobs) != 1 || b.Jobs[0].ToCommit != candidateA || b.Jobs[0].Generation != 3 {
+		t.Fatalf("%+v %v", b, err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO release_batches(task_id,batch_id,lead_job_id,lead_generation,base_commit,state,created_at) VALUES(?,?,?,?,?,'held',?)`, task.ID, "bat_second", "rel_other", 1, batchBase, ts(time.Now())); err == nil || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatal("two active batches in one project", err)
+	}
+	if _, err = s.db.Exec(`DELETE FROM release_batches WHERE batch_id=?`, id); err == nil || !strings.Contains(err.Error(), "release batch history") {
+		t.Fatal("batch deleted", err)
+	}
+	if _, err = s.db.Exec(`UPDATE release_batch_jobs SET to_commit=? WHERE batch_id=?`, candidateB, id); err == nil || !strings.Contains(err.Error(), "immutable release batch job") {
+		t.Fatal("batch job rewritten", err)
+	}
+	if _, err = s.db.Exec(`DELETE FROM release_batch_jobs WHERE batch_id=?`, id); err == nil || !strings.Contains(err.Error(), "immutable release batch job") {
+		t.Fatal("batch job deleted", err)
+	}
+}

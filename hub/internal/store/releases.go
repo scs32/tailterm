@@ -31,7 +31,20 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  released_commit TEXT NOT NULL,record_json TEXT NOT NULL,
  PRIMARY KEY(task_id,id),UNIQUE(task_id,intervention_seq));
  CREATE TRIGGER IF NOT EXISTS release_hand_release_no_update BEFORE UPDATE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;
- CREATE TRIGGER IF NOT EXISTS release_hand_release_no_delete BEFORE DELETE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;`
+ CREATE TRIGGER IF NOT EXISTS release_hand_release_no_delete BEFORE DELETE ON release_hand_releases BEGIN SELECT RAISE(ABORT,'immutable hand release'); END;
+ CREATE TABLE IF NOT EXISTS release_batches (
+ task_id TEXT NOT NULL REFERENCES tasks(id),batch_id TEXT NOT NULL,lead_job_id TEXT NOT NULL,lead_generation INTEGER NOT NULL,
+ base_commit TEXT NOT NULL,integrated_commit TEXT NOT NULL DEFAULT '',state TEXT NOT NULL,published INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL,settled_at TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(task_id,batch_id));
+ CREATE UNIQUE INDEX IF NOT EXISTS release_batch_active ON release_batches(task_id) WHERE state IN ('open','published','held');
+ CREATE TABLE IF NOT EXISTS release_batch_jobs (
+ task_id TEXT NOT NULL,batch_id TEXT NOT NULL,seq INTEGER NOT NULL,job_id TEXT NOT NULL,entry_id TEXT NOT NULL,
+ job_generation INTEGER NOT NULL,from_commit TEXT NOT NULL,to_commit TEXT NOT NULL,
+ PRIMARY KEY(task_id,batch_id,job_id),UNIQUE(task_id,batch_id,seq));
+ CREATE TRIGGER IF NOT EXISTS release_batch_no_delete BEFORE DELETE ON release_batches BEGIN SELECT RAISE(ABORT,'release batch history'); END;
+ CREATE TRIGGER IF NOT EXISTS release_batch_job_no_update BEFORE UPDATE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;
+ CREATE TRIGGER IF NOT EXISTS release_batch_job_no_delete BEFORE DELETE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -726,6 +739,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		return zero, err
 	}
 	var j api.ReleaseJob
+	// batchState, when set, is the active batch's new state; settled holds
+	// the members a released lead settles in this transaction.
+	var batch *ReleaseBatch
+	var batchState string
+	var settled []api.ReleaseJob
 	if req.Operation == "enqueue" {
 		if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 			return zero, err
@@ -755,6 +773,14 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		if err != nil {
 			return zero, err
 		}
+		// The project's one active batch, when this job is its lead or one of
+		// its members. A member is written only by its lead's settlement.
+		if batch, err = activeReleaseBatch(ctx, tx, task, j.ID); err != nil {
+			return zero, err
+		}
+		if batch != nil && batch.LeadJobID != j.ID {
+			return zero, releaseConflict("job " + j.ID + " is in release batch " + batch.ID + " held by " + batch.LeadJobID)
+		}
 		if j.Generation != req.ExpectedGeneration {
 			return zero, releaseConflict("generation changed")
 		}
@@ -762,8 +788,28 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
-			if err = reconcileRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
-				return zero, err
+			if batch != nil && batch.State == "held" && j.State == "rolled_back" {
+				// The lead settled rolled back while tasks-hub still carried
+				// the batch: its members wait for this inspection record.
+				if err = restoreHeldBatch(ctx, tx, task, &j, req.Reconciliation); err != nil {
+					return zero, err
+				}
+				batchState = "rolled_back"
+			} else {
+				if batch != nil && batch.Published && req.Reconciliation != nil && req.Reconciliation.Disposition == "requeue" {
+					return zero, releaseConflict("release batch " + batch.ID + " is published; requeue cannot free its members, reconcile with refuse and restoration evidence")
+				}
+				if err = reconcileRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
+					return zero, err
+				}
+				// Every accepted reconcile resolved the release ref and
+				// inspected the journal as restored or without effects.
+				if batch != nil {
+					batchState = "dissolved"
+					if batch.Published {
+						batchState = "rolled_back"
+					}
+				}
 			}
 		} else if req.Operation == "set-aside" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
@@ -771,6 +817,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 			if err = setAsideRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
 				return zero, err
+			}
+			if batch != nil {
+				batchState = "dissolved"
 			}
 		} else if req.Operation == "inputs" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
@@ -839,30 +888,24 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = releaseDeployer(ctx, tx, task, j.AgentID, j.RunID); err != nil {
 				return zero, err
 			}
-			var coverage []api.ReleaseCheckCoverage
-			for _, required := range j.Plan.Checks {
-				want := verificationDigest(required)
-				found := false
-				var wider, rebuilt *api.VerificationCheck
-				for i, check := range p.Checks {
-					if verificationDigest(check) == want {
-						found = true
-					} else if wider == nil && goRaceCovers(required, check) {
-						wider = &p.Checks[i]
-					} else if matrixChanged && rebuilt == nil && matrixChangeCovers(required, check) {
-						rebuilt = &p.Checks[i]
-					}
+			// One import settles a whole batch: it must be of the batch's
+			// commit and cover every member's approved checks too.
+			var members []api.ReleaseJob
+			if batch != nil {
+				if batch.State != "open" || len(batch.Jobs) == 0 || req.IntegratedCommit != batch.IntegratedCommit {
+					return zero, releaseConflict("release batch " + batch.ID + " requires the verification of its integrated commit")
 				}
-				if !found && wider != nil {
-					found = true
-					coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*wider), Relation: "superset"})
+				if members, err = releaseBatchMembers(ctx, tx, task, batch); err != nil {
+					return zero, err
 				}
-				if !found && rebuilt != nil {
-					found = true
-					coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*rebuilt), Relation: "matrix_changed"})
-				}
-				if !found {
-					return zero, releaseConflict("integrated matrix omitted approved check " + required.ID)
+			}
+			coverage, missing := releaseCoverage(j.Plan.Checks, p.Checks, matrixChanged)
+			if missing != "" {
+				return zero, releaseConflict("integrated matrix omitted approved check " + missing)
+			}
+			for _, m := range members {
+				if _, missing = releaseCoverage(m.Plan.Checks, p.Checks, matrixChanged); missing != "" {
+					return zero, releaseConflict("release batch job " + m.ID + ": integrated matrix omitted approved check " + missing)
 				}
 			}
 			if err = verificationEligible(p, *req.Verification); err != nil {
@@ -876,6 +919,15 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 			if _, err = validateVerificationKnownFailures(ctx, tx, p, self, req.Verification); err != nil {
 				return zero, err
+			}
+			for _, m := range members {
+				var item api.WorkItem
+				if item, err = getWorkItem(tx, ctx, m.TaskID, m.ItemID); err != nil {
+					return zero, err
+				}
+				if _, err = validateVerificationKnownFailures(ctx, tx, p, item, req.Verification); err != nil {
+					return zero, fmt.Errorf("%w (release batch job %s)", err, m.ID)
+				}
 			}
 			j.IntegratedCommit = req.IntegratedCommit
 			j.IntegratedVerification = req.Verification
@@ -924,6 +976,12 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if req.IntegratedCommit != j.Commit && (j.IntegratedVerification == nil || j.IntegratedCommit != req.IntegratedCommit) {
 					return zero, releaseConflict("changed integrated SHA requires handler imported matrix receipt")
 				}
+				if batch != nil {
+					if batch.State != "open" || req.IntegratedCommit != batch.IntegratedCommit || (len(batch.Jobs) > 1 && j.IntegratedVerification == nil) {
+						return zero, releaseConflict("release batch " + batch.ID + " publishes only its verified integrated commit")
+					}
+					batchState = "published"
+				}
 				j.IntegratedCommit = req.IntegratedCommit
 				j.Published = true
 				j.State = "merged"
@@ -963,16 +1021,42 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				j.Receipt = r
 				j.State = r.Outcome
 				j.SettledAt = ts(s.now())
+				if batch != nil {
+					// Members advance only here, with the lead, each with its
+					// own receipt. A rollback frees them once tasks-hub no
+					// longer carries the batch; anything else holds them.
+					switch {
+					case r.Outcome == "released":
+						if settled, err = settleReleaseBatch(ctx, tx, task, batch, j); err != nil {
+							return zero, err
+						}
+						batchState = "released"
+					case r.Outcome == "rolled_back" && r.Revert != nil && r.Revert.Outcome == "committed":
+						batchState = "rolled_back"
+					default:
+						batchState = "held"
+					}
+				}
 			case "refuse":
 				if j.State != "claimed" || j.Receipt != nil {
 					return zero, releaseConflict("only an unpublished claim may refuse")
 				}
 				j.State = "refused"
+				if batch != nil {
+					batchState = "dissolved"
+				}
 			case "block":
 				if j.State != "claimed" && j.State != "merged" {
 					return zero, releaseConflict("owned execution required")
 				}
 				j.State = "blocked"
+				if batch != nil {
+					batchState = "held"
+				}
+			case "batch-open", "batch-add", "batch-drop":
+				if batchState, err = releaseBatchAction(ctx, tx, task, req, &j, batch, generation, s.now()); err != nil {
+					return zero, err
+				}
 			default:
 				return zero, api.ErrInvalid
 			}
@@ -990,6 +1074,24 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	}
 	if err != nil {
 		return zero, releaseConflict("project already fenced or ledger conflict")
+	}
+	for _, m := range settled {
+		mb, merr := json.Marshal(m)
+		if merr != nil {
+			return zero, merr
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, m.State, m.Generation, string(mb), task, m.ID); err != nil {
+			return zero, err
+		}
+	}
+	if batch != nil && batchState != "" && batchState != batch.State {
+		settledAt, published := "", batch.Published || batchState == "published"
+		if batchState != "published" && batchState != "held" {
+			settledAt = ts(s.now())
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE release_batches SET state=?,published=?,settled_at=? WHERE task_id=? AND batch_id=?`, batchState, published, settledAt, task, batch.ID); err != nil {
+			return zero, err
+		}
 	}
 	if req.Operation == "set-aside" {
 		// Behind every queued job: the runner and Releases follow rowid order.
@@ -1234,6 +1336,322 @@ func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Releas
 	j.InputsCommit = ""
 	j.InputsDigest = ""
 	j.PauseGeneration = generation
+	j.Reconciliations = append(j.Reconciliations, *r)
+	return nil
+}
+
+// releaseCoverage checks that the integrated checks cover every approved one:
+// by digest, by a go-race package superset, or, under an owner-approved
+// matrix change, by the rebuilt check of the same ID. It returns the coverage
+// that is not digest-equal, or the first approved check left uncovered.
+func releaseCoverage(approved, integrated []api.VerificationCheck, matrixChanged bool) (coverage []api.ReleaseCheckCoverage, missing string) {
+	for _, required := range approved {
+		want := verificationDigest(required)
+		found := false
+		var wider, rebuilt *api.VerificationCheck
+		for i, check := range integrated {
+			if verificationDigest(check) == want {
+				found = true
+			} else if wider == nil && goRaceCovers(required, check) {
+				wider = &integrated[i]
+			} else if matrixChanged && rebuilt == nil && matrixChangeCovers(required, check) {
+				rebuilt = &integrated[i]
+			}
+		}
+		if !found && wider != nil {
+			found = true
+			coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*wider), Relation: "superset"})
+		}
+		if !found && rebuilt != nil {
+			found = true
+			coverage = append(coverage, api.ReleaseCheckCoverage{CheckID: required.ID, ApprovedDigest: want, IntegratedDigest: verificationDigest(*rebuilt), Relation: "matrix_changed"})
+		}
+		if !found {
+			return nil, required.ID
+		}
+	}
+	return coverage, ""
+}
+
+// A release batch is several verified jobs the deployer integrated into one
+// candidate, to verify, publish and deploy once. Only its lead job is claimed
+// and holds the project fence; the other jobs stay verified and unwritten
+// until the lead's released finish settles them all in one transaction.
+// States: open (declared, unpublished), published (the lead is merged),
+// released, held (published or blocked with the outcome not restored),
+// rolled_back and dissolved (ended unpublished). Rows are history: none is
+// deleted, and a job's row in a batch never changes.
+const releaseBatchMaxJobs = 8
+
+// ReleaseBatchJob is one job of a batch, in integration order. Its change is
+// the commits after FromCommit up to ToCommit on the integrated history.
+type ReleaseBatchJob struct {
+	Seq        int64  `json:"seq"`
+	JobID      string `json:"jobId"`
+	EntryID    string `json:"entryId"`
+	Generation int64  `json:"generation"`
+	FromCommit string `json:"fromCommit"`
+	ToCommit   string `json:"toCommit"`
+}
+
+// ReleaseBatch is the store's batch record. The server does not expose it yet.
+type ReleaseBatch struct {
+	ID               string            `json:"id"`
+	TaskID           string            `json:"taskId"`
+	LeadJobID        string            `json:"leadJobId"`
+	LeadGeneration   int64             `json:"leadGeneration"`
+	BaseCommit       string            `json:"baseCommit"`
+	IntegratedCommit string            `json:"integratedCommit,omitempty"`
+	State            string            `json:"state"`
+	Published        bool              `json:"published,omitempty"`
+	CreatedAt        string            `json:"createdAt"`
+	SettledAt        string            `json:"settledAt,omitempty"`
+	Jobs             []ReleaseBatchJob `json:"jobs"`
+}
+
+// releaseBatchID is computed the same way by the runner (batchId in
+// scripts/release-runner.mjs); one shared test vector pins both.
+func releaseBatchID(leadJobID string, leadGeneration int64, baseCommit string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%d\n%s", leadJobID, leadGeneration, baseCommit)))
+	return fmt.Sprintf("bat_%x", sum[:8])
+}
+
+const releaseBatchCols = `batch_id,lead_job_id,lead_generation,base_commit,integrated_commit,state,published,created_at,settled_at`
+
+func scanReleaseBatch(ctx context.Context, q queryRower, task string, row *sql.Row) (*ReleaseBatch, error) {
+	b := ReleaseBatch{TaskID: task, Jobs: []ReleaseBatchJob{}}
+	err := row.Scan(&b.ID, &b.LeadJobID, &b.LeadGeneration, &b.BaseCommit, &b.IntegratedCommit, &b.State, &b.Published, &b.CreatedAt, &b.SettledAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT seq,job_id,entry_id,job_generation,from_commit,to_commit FROM release_batch_jobs WHERE task_id=? AND batch_id=? ORDER BY seq`, task, b.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var j ReleaseBatchJob
+		if err = rows.Scan(&j.Seq, &j.JobID, &j.EntryID, &j.Generation, &j.FromCommit, &j.ToCommit); err != nil {
+			return nil, err
+		}
+		b.Jobs = append(b.Jobs, j)
+	}
+	return &b, rows.Err()
+}
+
+// activeReleaseBatch returns the project's open, published or held batch when
+// job is its lead or one of its jobs, else nil.
+func activeReleaseBatch(ctx context.Context, q queryRower, task, job string) (*ReleaseBatch, error) {
+	b, err := scanReleaseBatch(ctx, q, task, q.QueryRowContext(ctx, `SELECT `+releaseBatchCols+` FROM release_batches WHERE task_id=? AND state IN ('open','published','held')`, task))
+	if err != nil || b == nil {
+		return nil, err
+	}
+	if b.LeadJobID == job || slices.ContainsFunc(b.Jobs, func(j ReleaseBatchJob) bool { return j.JobID == job }) {
+		return b, nil
+	}
+	return nil, nil
+}
+
+// ReleaseBatchOf returns the latest batch that names the job, with every
+// job's commit range, or api.ErrNotFound.
+func (s *Store) ReleaseBatchOf(ctx context.Context, task, job string) (ReleaseBatch, error) {
+	b, err := scanReleaseBatch(ctx, s.db, task, s.db.QueryRowContext(ctx, `SELECT `+releaseBatchCols+` FROM release_batches WHERE task_id=? AND (lead_job_id=? OR batch_id IN (SELECT batch_id FROM release_batch_jobs WHERE task_id=? AND job_id=?)) ORDER BY rowid DESC LIMIT 1`, task, job, task, job))
+	if err != nil {
+		return ReleaseBatch{}, err
+	}
+	if b == nil {
+		return ReleaseBatch{}, api.ErrNotFound
+	}
+	return *b, nil
+}
+
+// releaseBatchMembers loads the batch's jobs other than its lead. Each must
+// still be the unclaimed verified record it was when it joined.
+func releaseBatchMembers(ctx context.Context, tx *sql.Tx, task string, b *ReleaseBatch) ([]api.ReleaseJob, error) {
+	var out []api.ReleaseJob
+	for _, row := range b.Jobs {
+		if row.JobID == b.LeadJobID {
+			continue
+		}
+		m, err := releaseLoad(ctx, tx, task, row.JobID)
+		if err != nil {
+			return nil, err
+		}
+		if m.State != "verified" || m.Generation != row.Generation || m.AgentID != "" {
+			return nil, releaseConflict("release batch " + b.ID + " job " + m.ID + " changed since it joined")
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// releaseBatchAction declares, extends or drops the batch of a claimed lead
+// for its exact deployer run. The caller has checked the run, the heartbeat
+// and the pause generation; it bumps the lead's generation and saves the
+// action receipt, so a repeated request replays. It returns the batch's new
+// state when that changes.
+func releaseBatchAction(ctx context.Context, tx *sql.Tx, task string, req api.ReleaseRequest, j *api.ReleaseJob, b *ReleaseBatch, generation int64, now time.Time) (string, error) {
+	if j.State != "claimed" || j.Published || j.Receipt != nil || j.InputsDigest != "" {
+		return "", releaseConflict("release batch requires a claimed lead with no inputs or effects")
+	}
+	if j.IntegratedVerification != nil {
+		return "", releaseConflict("release batch is fixed once its integrated verification is saved")
+	}
+	switch req.Operation {
+	case "batch-open":
+		if !validGitCommit(req.IntegratedCommit) || req.EntryID != "" {
+			return "", api.ErrInvalid
+		}
+		var active string
+		err := tx.QueryRowContext(ctx, `SELECT batch_id FROM release_batches WHERE task_id=? AND state IN ('open','published','held')`, task).Scan(&active)
+		if err == nil {
+			return "", releaseConflict("release batch " + active + " is still open, published or held")
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO release_batches(task_id,batch_id,lead_job_id,lead_generation,base_commit,state,created_at) VALUES(?,?,?,?,?,'open',?)`, task, releaseBatchID(j.ID, req.ExpectedGeneration, req.IntegratedCommit), j.ID, req.ExpectedGeneration, req.IntegratedCommit, ts(now))
+		return "", err
+	case "batch-drop":
+		if b == nil || b.State != "open" || req.EntryID != "" || req.IntegratedCommit != "" {
+			return "", releaseConflict("open release batch required")
+		}
+		// What a requeue clears; none is set before an import, which the
+		// check above refuses.
+		j.IntegratedCommit = ""
+		j.IntegratedPlan = nil
+		j.IntegratedCoverage = nil
+		j.IntegratedMatrix = nil
+		j.IntegratedVerification = nil
+		return "dissolved", nil
+	}
+	if b == nil || b.State != "open" {
+		return "", releaseConflict("open release batch required")
+	}
+	if !validGitCommit(req.IntegratedCommit) || req.EntryID == "" || len(req.EntryID) > 64 {
+		return "", api.ErrInvalid
+	}
+	if len(b.Jobs) >= releaseBatchMaxJobs {
+		return "", releaseConflict(fmt.Sprintf("release batch %s already has %d jobs", b.ID, releaseBatchMaxJobs))
+	}
+	var id string
+	var rowid int64
+	err := tx.QueryRowContext(ctx, `SELECT id,rowid FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task, req.EntryID).Scan(&id, &rowid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", releaseConflict("entry has no release job")
+	}
+	if err != nil {
+		return "", err
+	}
+	from, member := b.BaseCommit, *j
+	if len(b.Jobs) == 0 {
+		// The lead's own range comes first.
+		if id != j.ID {
+			return "", releaseConflict("release batch " + b.ID + " starts with its lead job " + j.ID)
+		}
+	} else {
+		last := b.Jobs[len(b.Jobs)-1]
+		from = last.ToCommit
+		if slices.ContainsFunc(b.Jobs, func(row ReleaseBatchJob) bool { return row.JobID == id }) {
+			return "", releaseConflict("job " + id + " is already in release batch " + b.ID)
+		}
+		var previous int64
+		if err = tx.QueryRowContext(ctx, `SELECT rowid FROM release_jobs WHERE task_id=? AND id=?`, task, last.JobID).Scan(&previous); err != nil {
+			return "", err
+		}
+		if rowid <= previous {
+			return "", releaseConflict("job " + id + " is not after job " + last.JobID + " in queue order")
+		}
+		if member, err = releaseLoad(ctx, tx, task, id); err != nil {
+			return "", err
+		}
+		if member.State != "verified" || member.AgentID != "" || member.IntegratedCommit != "" || member.InputsDigest != "" || member.Published || member.Receipt != nil {
+			return "", releaseConflict("job " + id + " is not an unclaimed verified job")
+		}
+		if member.PauseGeneration != generation {
+			return "", releaseConflict("project generation changed for job " + id)
+		}
+		// One matrix run covers a job only from the lead's base under the
+		// lead's approved matrix.
+		if member.Repository != j.Repository || member.BaseCommit != j.BaseCommit {
+			return "", releaseConflict("job " + id + " has another base commit than the lead")
+		}
+		if member.Plan.MatrixDigest != j.Plan.MatrixDigest || member.Plan.MatrixApprovalMessageSeq != j.Plan.MatrixApprovalMessageSeq {
+			return "", releaseConflict("job " + id + " has another matrix approval than the lead")
+		}
+		e, p, r, cerr := releaseCandidate(ctx, tx, task, member.EntryID)
+		if cerr != nil {
+			return "", cerr
+		}
+		if e.Acceptance.ItemRevision != member.ItemRevision || p.Commit != member.Commit || verificationDigest(r) != member.VerificationDigest {
+			return "", releaseConflict("candidate changed since enqueue for job " + id)
+		}
+	}
+	if req.IntegratedCommit == from {
+		return "", releaseConflict("job " + id + " adds no commit to release batch " + b.ID)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_batch_jobs(task_id,batch_id,seq,job_id,entry_id,job_generation,from_commit,to_commit) VALUES(?,?,?,?,?,?,?,?)`, task, b.ID, len(b.Jobs)+1, id, req.EntryID, member.Generation, from, req.IntegratedCommit); err != nil {
+		return "", err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE release_batches SET integrated_commit=? WHERE task_id=? AND batch_id=?`, req.IntegratedCommit, task, b.ID)
+	return "", err
+}
+
+// settleReleaseBatch builds the released record of every member from the
+// lead's settlement: the one integrated verification, the member's own
+// coverage of it, and the member's own receipt (its job ID and verification
+// digest, the batch's commit, targets and push).
+func settleReleaseBatch(ctx context.Context, tx *sql.Tx, task string, b *ReleaseBatch, lead api.ReleaseJob) ([]api.ReleaseJob, error) {
+	if b.State != "published" || lead.IntegratedCommit != b.IntegratedCommit || lead.Receipt == nil {
+		return nil, releaseConflict("release batch " + b.ID + " is not published at the lead's commit")
+	}
+	members, err := releaseBatchMembers(ctx, tx, task, b)
+	if err != nil {
+		return nil, err
+	}
+	for i := range members {
+		m := &members[i]
+		if lead.IntegratedPlan == nil || lead.IntegratedVerification == nil {
+			return nil, releaseConflict("release batch " + b.ID + " has no integrated verification")
+		}
+		coverage, missing := releaseCoverage(m.Plan.Checks, lead.IntegratedPlan.Checks, lead.IntegratedMatrix != nil)
+		if missing != "" {
+			return nil, releaseConflict("release batch job " + m.ID + ": integrated matrix omitted approved check " + missing)
+		}
+		receipt := api.ReleaseReceipt{Version: 1, JobID: m.ID, Commit: lead.IntegratedCommit, VerificationDigest: m.VerificationDigest, Targets: slices.Clone(lead.Receipt.Targets), Outcome: "released"}
+		if lead.Receipt.Push != nil {
+			push := *lead.Receipt.Push
+			receipt.Push = &push
+		}
+		m.State = "released"
+		m.Generation++
+		m.AgentID = lead.AgentID
+		m.RunID = lead.RunID
+		m.IntegratedCommit = lead.IntegratedCommit
+		m.IntegratedPlan = lead.IntegratedPlan
+		m.IntegratedCoverage = coverage
+		m.IntegratedMatrix = lead.IntegratedMatrix
+		m.IntegratedVerification = lead.IntegratedVerification
+		m.Published = true
+		m.Receipt = &receipt
+		m.SettledAt = lead.SettledAt
+	}
+	return members, nil
+}
+
+// restoreHeldBatch frees the members of a held batch whose lead already
+// settled rolled back: the handler's record that tasks-hub no longer carries
+// the batch. The lead keeps its state and receipt and gains the record.
+func restoreHeldBatch(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, r *api.ReleaseReconciliation) error {
+	if r == nil || r.JobID != j.ID || r.AgentID != j.AgentID || r.RunID != j.RunID || r.PauseGeneration != j.PauseGeneration || !validContextDigest(r.IncidentDigest) || !validContextDigest(r.JournalDigest) || !r.NoActiveExecution || !r.RefResolved || r.JournalState != "restored" || r.Disposition != "refuse" {
+		return releaseConflict("exact inspected recovery evidence required")
+	}
+	if err := releaseIncident(ctx, tx, task, r); err != nil {
+		return err
+	}
 	j.Reconciliations = append(j.Reconciliations, *r)
 	return nil
 }

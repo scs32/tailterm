@@ -2044,3 +2044,528 @@ test("code b1 a stop signal during the restart poll means no re-exec and no clai
  const u=codeRepo(t),k=codeHost(t,u.cwd),idle=new AbortController();u.at(u.a,u.b);const third=codeGate(u.codeA);
  await k.poll(third.gate,undefined,{once:true,signal:idle.signal});assert.equal(third.execs.length,1);
 });
+
+// Release batching (wi_50e80d45647b342a slice one).
+import {integrateBatch,batchCandidates,batchAcceptedChecks,batchMismatch,batchPlanCovers,batchId,releaseBatchPolicy,materializeBatch,readBatchSolo,addBatchSolo,reconcileReceipts,BATCH_IMPORT_WAIT_MS} from "../scripts/release-runner.mjs";
+import {planWithPreservation,digest as matrixDigest} from "../scripts/verify-matrix.mjs";
+// One job per file, each a single commit on the published base; the first is
+// the claimed lead. tasks-hub then moves, so every job is cherry-picked.
+function batchJobs(files,{moved="client/hub.js"}={}){
+ const f=fixture();
+ const jobs=files.map(([file,text],i)=>{
+  git(f.cwd,"checkout","--quiet","--detach",f.base);const commit=change(f,file,text);
+  return {id:`rel_b${i+1}`,taskId:"tsk_fixture",entryId:`tqe_b${i+1}`,itemId:`wi_b${i+1}`,itemRevision:1,scopeRevision:1,orderMessageSeq:7,repository:"fixture",baseCommit:f.base,commit,verificationDigest:String(i+1).repeat(64),state:i?"verified":"claimed",generation:i?1:2,pauseGeneration:1,plan:{commit},...(i?{}:{agentId:"agt_fixture",runId:"run_fixture"})};
+ });
+ git(f.cwd,"checkout","--quiet","tasks-hub");if(moved)change(f,moved,"release");git(f.cwd,"checkout","--quiet","--detach","tasks-hub");
+ return {f,lead:jobs[0],members:jobs.slice(1),tip:git(f.cwd,"rev-parse","refs/heads/tasks-hub")};
+}
+// A fake adapter that also takes the batch calls, as the hub would: each
+// accepted call moves the lead's generation.
+function batchFake(lead,{refuse=()=>false}={}){
+ const a=fake();a.job={...lead};a.ops=[];a.refused=[];a.receipts=[];a.verifies=[];
+ a.batch=async(op,fields,generation)=>{
+  const name=op+(fields.entryId?":"+fields.entryId:"");
+  if(refuse(op,fields)){a.refused.push(name);throw new Error("refused");}
+  assert.equal(generation,a.job.generation,"batch call at the journaled generation");
+  a.ops.push({op,...fields,generation});a.calls.push(name);a.job={...a.job,generation:a.job.generation+1};return true;
+ };
+ a.generation=async()=>a.job.generation;
+ a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);return true;};
+ a.finish=async r=>{a.receipts.push(structuredClone(r));a.calls.push("finish");};
+ return a;
+}
+function batchConfig(b,max,over={}){
+ const home=mkdtempSync(join(tmpdir(),"release-batch-")),solo=[];
+ return {cwd:b.f.cwd,job:b.lead,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,b.f.base])),journalPath:join(home,b.lead.id+".json"),testPolicy:{startupMs:0,failures:1,intervalMs:0,relayCleanMs:0},home,solo,
+  batch:{max,importWaitMs:BATCH_IMPORT_WAIT_MS,candidates:b.members,onFallback:ids=>{solo.push(...ids);addBatchSolo(home,ids);},...over}};
+}
+const batchJournal=c=>JSON.parse(readFileSync(c.journalPath,"utf8"));
+const batchFiles=home=>readdirSync(home).filter(n=>n.startsWith("bat_")||n==="batch-solo.json");
+const three=()=>batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"]]);
+const clean=cwd=>assert.equal(git(cwd,"status","--porcelain"),"");
+test("batch1 a clean batch of three integrates once, verifies once and deploys once",async()=>{
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","merged","deploy:tailos","finish"]);
+ const journal=batchJournal(c),batch=journal.batch,integrated=git(b.f.cwd,"rev-parse","refs/heads/tasks-hub");
+ assert.equal(batch.id,batchId("rel_b1",2,b.tip));assert.match(batch.id,/^bat_[a-f0-9]{16}$/);assert.equal(batch.base,b.tip);assert.equal(journal.expected,b.tip);
+ assert.deepEqual(batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);
+ let from=b.tip;
+ for(const [i,range] of batch.jobs.entries()){
+  assert.equal(range.from,from);assert.deepEqual(git(b.f.cwd,"diff","--name-only",range.from,range.to).split("\n"),[`client/${"abc"[i]}.js`]);
+  assert.equal(range.entryId,`tqe_b${i+1}`);assert.equal(range.verificationDigest,String(i+1).repeat(64));from=range.to;
+ }
+ assert.equal(from,integrated);assert.equal(r.commit,integrated);assert.equal(journal.integrated,integrated);
+ assert.deepEqual(a.ops.map(o=>[o.op,o.entryId,o.commit,o.generation]),[["batch-open",undefined,b.tip,2],["batch-add","tqe_b1",batch.jobs[0].to,3],["batch-add","tqe_b2",batch.jobs[1].to,4],["batch-add","tqe_b3",integrated,5]]);
+ assert.equal(a.verifies.length,1);assert.equal(a.verifies[0].integratedCommit,integrated);
+ assert.deepEqual(journal.batchOps.map(o=>[o.op,o.status,o.requestId]),[["batch-open","done","rel_b1-batch-open-2"],["batch-add","done","rel_b1-batch-add-3"],["batch-add","done","rel_b1-batch-add-4"],["batch-add","done","rel_b1-batch-add-5"]]);
+ // a11: the batch has its own receipt, every member a journal naming the
+ // batch, and the hub receipt the lead sent is the lead's own.
+ const receipt=JSON.parse(readFileSync(join(c.home,batch.id+"-receipt.json"),"utf8"));
+ assert.equal(receipt.batchId,batch.id);assert.equal(receipt.leadJobId,"rel_b1");assert.equal(receipt.outcome,"released");assert.equal(receipt.base,b.tip);assert.equal(receipt.integrated,integrated);assert.equal(receipt.commit,integrated);
+ assert.deepEqual(receipt.jobs,batch.jobs);assert.deepEqual(receipt.targets.map(t=>[t.target,t.outcome]),[["tailos","released"]]);assert.deepEqual(receipt.dropped,[]);
+ for(const [i,id] of ["rel_b2","rel_b3"].entries()){
+  const member=JSON.parse(readFileSync(join(c.home,id+".json"),"utf8"));
+  assert.equal(member.phase,"complete");assert.deepEqual(member.batch,{id:batch.id,leadJobId:"rel_b1",from:batch.jobs[i+1].from,to:batch.jobs[i+1].to,integrated});
+  assert.equal(member.receipt.jobId,id);assert.equal(member.receipt.verificationDigest,String(i+2).repeat(64));assert.equal(member.receipt.commit,integrated);assert.equal(member.commit,b.members[i].commit);
+ }
+ assert.equal(a.receipts.length,1);assert.equal(a.receipts[0].jobId,"rel_b1");assert.equal(a.receipts[0].verificationDigest,"1".repeat(64));assert.equal(a.receipts[0].batchId,undefined);
+ assert.equal(journal.batchReceipt.batchId,batch.id);assert.deepEqual(c.solo,[]);clean(b.f.cwd);
+ // A repeated run returns the saved receipt and repeats nothing.
+ const calls=a.calls.length;assert.deepEqual(await runRelease(c,a),r);assert.equal(a.calls.length,calls);
+});
+test("batch2 a conflicting job drops out and waits",async()=>{
+ const b=batchJobs([["client/a.js","a"],["client/base.js","candidate"],["client/c.js","c"]],{moved:"client/base.js"}),a=batchFake(b.lead),c=batchConfig(b,3);
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b3","verify","merged","deploy:tailos","finish"]);assert.deepEqual(a.refused,[]);
+ const journal=batchJournal(c);
+ assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);
+ assert.deepEqual(journal.batchDropped,[{jobId:"rel_b2",reason:"integration-conflict: client/base.js"}]);
+ assert.equal(journal.batch.jobs[1].from,journal.batch.jobs[0].to);
+ clean(b.f.cwd);assert.equal(git(b.f.cwd,"rev-parse","HEAD"),r.commit);
+ assert.ok(!existsSync(join(c.home,"rel_b2.json")),"no journal for the dropped job");assert.ok(existsSync(join(c.home,"rel_b3.json")));
+ assert.equal(git(b.f.cwd,"show",r.commit+":client/base.js"),"release");
+ assert.deepEqual(JSON.parse(readFileSync(join(c.home,journal.batch.id+"-receipt.json"),"utf8")).dropped,journal.batchDropped);
+ assert.deepEqual(c.solo,[],"a dropped job is not marked to release alone");
+});
+test("batch3 a failing matrix falls back to per-job releases",async()=>{
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);
+ a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(a.verifies.length===1)throw releaseError("Integrated matrix receipt is not eligible");return true;};
+ const refs=[];const publish=a.merged;a.merged=async commit=>{refs.push(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"));return publish(commit);};
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","batch-drop","verify","merged","deploy:tailos","finish"]);
+ assert.ok(!a.calls.includes("refuse"));
+ const journal=batchJournal(c),batchTip=a.verifies[0].integratedCommit,alone=a.verifies[1].integratedCommit;
+ assert.notEqual(batchTip,alone);assert.equal(r.commit,alone);assert.equal(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),alone);
+ assert.deepEqual(refs,[alone]);assert.throws(()=>git(b.f.cwd,"merge-base","--is-ancestor",batchTip,"refs/heads/tasks-hub"),"tasks-hub never carried the batch commit");
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,alone).split("\n"),["client/a.js"]);
+ assert.equal(journal.batch,null);assert.equal(journal.batchReceipt,undefined);
+ assert.deepEqual(journal.batchFallback,{batchId:batchId("rel_b1",2,b.tip),reason:"batch-matrix-failed",detail:"Integrated matrix receipt is not eligible",members:["rel_b2","rel_b3"],status:"done"});
+ assert.deepEqual(c.solo,["rel_b2","rel_b3"]);assert.deepEqual([...readBatchSolo(c.home)],["rel_b2","rel_b3"]);
+ assert.deepEqual(batchFiles(c.home),["batch-solo.json"],"no batch receipt for a batch that never published");assert.ok(!existsSync(join(c.home,"rel_b2.json")));
+ // Each member is then released alone: it leads no batch and joins none.
+ const summaries=[b.lead,...b.members].map((j,i)=>({...j,summary:true,rowId:i+1}));
+ for(const [i,member] of b.members.entries()){
+  const lead={...member,state:"claimed",generation:2,agentId:"agt_fixture",runId:"run_fixture"};
+  assert.deepEqual(batchCandidates(summaries,lead,readBatchSolo(c.home)),[]);
+  const a2=batchFake(lead),c2=batchConfig({f:b.f,lead,members:[]},3);
+  const r2=await runRelease(c2,a2);
+  assert.equal(r2.outcome,"released");assert.deepEqual(a2.calls,["verify","merged","deploy:tailos","finish"]);assert.equal(batchJournal(c2).batch,undefined);
+  assert.equal(git(b.f.cwd,"show",r2.commit+`:client/${"bc"[i]}.js`),"bc"[i]);
+ }
+});
+test("batch3b a fallback waits until the batch's own matrix run is confirmed over",async()=>{
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);let settled=true;const asked=[];
+ a.settleMatrixRuns=async()=>{asked.push(settled);return settled;};
+ a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(a.verifies.length===1)throw releaseError("Host operation failed");return true;};
+ const first=await runRelease(c,a);assert.equal(first.outcome,"released");assert.deepEqual(asked,[true,true]);
+ // Not over: nothing is dropped and the checkout stays on the batch.
+ const b2=three(),a2=batchFake(b2.lead),c2=batchConfig(b2,3);let over=true;
+ a2.settleMatrixRuns=async()=>over;
+ a2.verifyIntegrated=async j=>{a2.calls.push("verify");a2.verifies.push(j);if(a2.verifies.length===1){over=false;throw releaseError("Host operation failed");}return true;};
+ assert.deepEqual(await runRelease(c2,a2),{jobId:"rel_b1",outcome:"waiting_matrix"});
+ let journal=batchJournal(c2);const batchTip=journal.batch.jobs.at(-1).to;
+ assert.equal(journal.batchFallback.status,"dropping");assert.ok(!a2.calls.includes("batch-drop"));assert.equal(git(b2.f.cwd,"rev-parse","HEAD"),batchTip);assert.deepEqual(c2.solo,[]);
+ assert.deepEqual(await runRelease(c2,a2),{jobId:"rel_b1",outcome:"waiting_matrix"});assert.ok(!a2.calls.includes("batch-drop"));
+ over=true;const r=await runRelease(c2,a2);
+ assert.equal(r.outcome,"released");assert.deepEqual(a2.calls.slice(-5),["batch-drop","verify","merged","deploy:tailos","finish"]);assert.deepEqual(c2.solo,["rel_b2","rel_b3"]);
+ journal=batchJournal(c2);assert.equal(journal.batchFallback.status,"done");assert.equal(journal.batchFallback.reason,"batch-matrix-failed");assert.equal(journal.batchFallback.detail,"Host operation failed");
+ assert.deepEqual(git(b2.f.cwd,"diff","--name-only",b2.tip,r.commit).split("\n"),["client/a.js"]);
+});
+test("batch4 a rollback restores the whole batch",async()=>{
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);a.check=async()=>"identity";
+ await assert.rejects(runRelease(c,a),/failed/);
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","merged","deploy:tailos","rollback:tailos","escalate","bug","finish"]);
+ const journal=batchJournal(c),revert=git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),integrated=journal.batch.jobs.at(-1).to;
+ assert.equal(git(b.f.cwd,"rev-parse",revert+"^"),integrated);assert.equal(git(b.f.cwd,"rev-parse",revert+"^{tree}"),git(b.f.cwd,"rev-parse",b.tip+"^{tree}"));
+ for(const file of ["a","b","c"])assert.equal(git(b.f.cwd,"ls-tree","--name-only",revert,`client/${file}.js`),"");
+ assert.equal(a.receipts.length,1);assert.equal(a.receipts[0].outcome,"rolled_back");assert.equal(a.receipts[0].jobId,"rel_b1");assert.deepEqual(a.receipts[0].revert,{commit:revert,outcome:"committed",bugRequestId:"rel_fixture-rollback-bug"});
+ const receipt=JSON.parse(readFileSync(join(c.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.equal(receipt.outcome,"rolled_back");assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.deepEqual(receipt.revert,a.receipts[0].revert);assert.deepEqual(receipt.targets.map(t=>[t.target,t.outcome,t.rollback]),[["tailos","rolled_back","restored"]]);
+ assert.ok(!existsSync(join(c.home,"rel_b2.json")));assert.ok(!existsSync(join(c.home,"rel_b3.json")));
+ assert.deepEqual(c.solo,["rel_b2","rel_b3"]);assert.deepEqual([...readBatchSolo(c.home)],["rel_b2","rel_b3"]);
+ assert.equal(a.calls.filter(x=>x==="rollback:tailos").length,1);
+});
+test("batch5 an absent setting or a size of 1 is today's release",async()=>{
+ for(const batch of [undefined,{max:1,candidates:"members"},{max:1,candidates:[]},{max:3,candidates:[]}]){
+  const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"]],{moved:null}),a=batchFake(b.lead),c=batchConfig(b,3);
+  delete a.verifyIntegrated;a.verifyIntegrated=async()=>true;
+  if(batch)c.batch={...c.batch,...batch,candidates:batch.candidates==="members"?b.members:batch.candidates};else delete c.batch;
+  const r=await runRelease(c,a);
+  assert.equal(r.outcome,"released");assert.deepEqual(a.calls,["merged","deploy:tailos","finish"]);assert.deepEqual(a.refused,[]);
+  const journal=batchJournal(c);
+  for(const key of ["batch","batchOps","batchLead","batchReceipt","batchDropped","batchFallback"])assert.ok(!(key in journal),key);
+  assert.equal(r.commit,b.lead.commit);assert.deepEqual(batchFiles(c.home),[]);assert.deepEqual(readdirSync(c.home),["rel_b1.json"]);
+ }
+ assert.deepEqual(releaseBatchPolicy({}),{max:1,importWaitMs:BATCH_IMPORT_WAIT_MS});assert.deepEqual(releaseBatchPolicy({releaseBatch:{}}),{max:1,importWaitMs:BATCH_IMPORT_WAIT_MS});
+ assert.deepEqual(releaseBatchPolicy({releaseBatch:{maxJobs:1}}),{max:1,importWaitMs:BATCH_IMPORT_WAIT_MS});assert.deepEqual(releaseBatchPolicy({releaseBatch:{maxJobs:8,importWaitMs:60000}}),{max:8,importWaitMs:60000});
+ for(const maxJobs of [0,1.5,"3",9,-1,null,true]){
+  assert.throws(()=>releaseBatchPolicy({releaseBatch:{maxJobs}}),/Invalid release batch size/,String(maxJobs));
+  // The daemon stops before any command.
+  const cwd=mkdtempSync(join(tmpdir(),"release-batch-size-")),log=join(cwd,"calls"),tt=join(cwd,"tt");
+  writeFileSync(tt,"#!"+process.execPath+`\nrequire('fs').appendFileSync(${JSON.stringify(log)},'call\\n');process.exit(2);`);chmodSync(tt,0o755);
+  await assert.rejects(serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt,releaseBatch:{maxJobs}},{once:true}),/Invalid release batch size/);
+  assert.ok(!existsSync(log));
+ }
+ for(const releaseBatch of [null,3,[3],"3"])assert.throws(()=>releaseBatchPolicy({releaseBatch}),/Invalid release batch size/);
+ for(const importWaitMs of [0,-5,1.5,"60000"])assert.throws(()=>releaseBatchPolicy({releaseBatch:{maxJobs:3,importWaitMs}}),/Invalid release batch import wait/);
+});
+test("batch6 batch id vector",()=>{
+ // The same literal is asserted by TestReleaseBatchIdAndReplay in hub/internal/store.
+ assert.equal(batchId("rel_0123456789abcdef",2,"a".repeat(40)),"bat_093efed8fd1877b6");
+});
+test("batch7 a hub without batch operations releases the lead alone",async()=>{
+ const b=three(),a=batchFake(b.lead,{refuse:()=>true}),c=batchConfig(b,3);
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.deepEqual(a.calls,["verify","merged","deploy:tailos","finish"]);
+ assert.deepEqual(a.refused,["batch-open","batch-open","batch-drop","batch-drop"].slice(0,2),"one open, sent twice, and nothing else");
+ const journal=batchJournal(c);
+ assert.equal(journal.batch,undefined);assert.deepEqual(journal.batchOps.map(o=>[o.op,o.status]),[["batch-open","refused"]]);
+ assert.deepEqual(journal.batchDropped,[{jobId:"rel_b2",reason:"batch-open-refused"}]);
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,r.commit).split("\n"),["client/a.js"]);assert.equal(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.commit);
+ assert.deepEqual(batchFiles(c.home),[]);assert.deepEqual(c.solo,[]);assert.ok(!existsSync(join(c.home,"rel_b2.json")));clean(b.f.cwd);
+});
+// A repository with an approved matrix and Go packages, for real plans.
+function matrixRepo(){
+ const f=fixture();
+ for(const p of ["tests","verification","hub/cmd/tt/testdata","hub/internal/store","hub/internal/api","docs"])mkdirSync(join(f.cwd,p),{recursive:true});
+ git(f.cwd,"checkout","--quiet","tasks-hub");
+ writeFileSync(join(f.cwd,"verification/matrix.json"),JSON.stringify({maxAttempts:3,knownFailures:[],version:1,browserSuites:[],excludedBrowserSuites:[],rules:[{prefixes:["hub/"],groups:["go"]},{prefixes:["docs/"],groups:["unit"]}]}));
+ writeFileSync(join(f.cwd,"hub/go.mod"),"module fixture\n\ngo 1.24.0\n");writeFileSync(join(f.cwd,"hub/cmd/tt/main.go"),"package main\n\nfunc main() {}\n");
+ writeFileSync(join(f.cwd,"hub/cmd/tt/testdata/README.md"),"old\n");writeFileSync(join(f.cwd,"hub/internal/store/store.go"),"package store\n");writeFileSync(join(f.cwd,"hub/internal/api/api.go"),"package api\n");
+ writeFileSync(join(f.cwd,"tests/keep.txt"),"x");writeFileSync(join(f.cwd,"package.json"),JSON.stringify({scripts:{test:'node -e "process.exit(0)"'}}));
+ git(f.cwd,"add",".");git(f.cwd,"commit","-qm","packages");const base=git(f.cwd,"rev-parse","HEAD");
+ const approved=matrixDigest(readFileSync(join(f.cwd,"verification/matrix.json"),"utf8"));
+ // An accepted job: one commit on base changing one path, with its real plan.
+ const accept=(n,path,text,over={})=>{
+  git(f.cwd,"checkout","--quiet","--detach",over.base||base);writeFileSync(join(f.cwd,path),text);git(f.cwd,"add",".");git(f.cwd,"commit","-qm","job "+n);const commit=git(f.cwd,"rev-parse","HEAD");
+  const {plan}=planWithPreservation({operationKey:"fixture-"+n,repository:"fixture",baseCommit:over.base||base,commit,owned:[path],verifierAgentId:"agt_verifier",verifierRunId:"run_verifier",approvedMatrixDigest:approved,matrixApprovalMessageSeq:9},f.cwd);
+  return {id:`rel_m${n}`,taskId:"tsk_fixture",entryId:`tqe_m${n}`,itemId:`wi_m${n}`,itemRevision:1,scopeRevision:1,orderMessageSeq:7,repository:"fixture",baseCommit:over.base||base,commit,verificationDigest:String(n).repeat(64),state:n===1?"claimed":"verified",generation:n===1?2:1,pauseGeneration:1,plan,...(n===1?{agentId:"agt_fixture",runId:"run_fixture"}:{})};
+ };
+ const settle=()=>git(f.cwd,"checkout","--quiet","--detach","tasks-hub");
+ return {f:{...f,base},base,approved,accept,settle};
+}
+const race=plan=>plan.checks.find(c=>c.id==="go-race").argv;
+// The integrated plan as launchMatrixRun asks for it: the job's plan with the
+// integrated commit and the deployer as verifier.
+const integratedPlan=(m,job,commit)=>planWithPreservation({...job.plan,commit,verifierAgentId:"agt_fixture",verifierRunId:"run_fixture"},m.f.cwd).plan;
+const covers=(...jobs)=>jobs.map(j=>({jobId:j.id,checks:j.plan.checks,matrixDigest:j.plan.matrixDigest}));
+// A hub change selects the paired hub and bridge, which need pinned inputs.
+const matrixFake=lead=>{const a=batchFake(lead);a.prepare=async t=>["hub","bridge"].includes(t)?{...PAIRED}:{release:"fixture-release",artifactSHA256:"b".repeat(64)};return a;};
+test("batch8 a docs-only member keeps ./... in the batch plan",async()=>{
+ const m=matrixRepo(),lead=m.accept(1,"hub/internal/store/store.go","package store\n\nvar Lead = 1\n"),docs=m.accept(2,"hub/cmd/tt/testdata/README.md","new\n"),code=m.accept(3,"hub/internal/api/api.go","package api\n\nvar Code = 1\n");m.settle();
+ assert.deepEqual(race(lead.plan).slice(-1),["./internal/store"]);assert.deepEqual(race(docs.plan).slice(-1),["./..."]);assert.deepEqual(race(code.plan).slice(-1),["./internal/api"]);
+ for(const member of [docs,code])assert.equal(batchMismatch(lead,member),"");
+ const merged=batchAcceptedChecks(lead,[docs,code]);
+ assert.deepEqual(merged.joined,["rel_m2","rel_m3"]);assert.deepEqual(merged.dropped,[]);assert.deepEqual(merged.checks.find(c=>c.id==="go-race").argv.slice(-1),["./..."]);assert.equal(merged.checksDigest,matrixDigest(merged.checks));
+ assert.deepEqual(batchAcceptedChecks(lead,[code]).checks.find(c=>c.id==="go-race").argv.slice(-2),["./internal/api","./internal/store"]);
+ // Through runRelease: the job handed to the matrix carries the merged plan.
+ const b={f:m.f,lead,members:[docs,code]},a=matrixFake(lead),c=batchConfig(b,3);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+ const handed=a.verifies[0];
+ assert.deepEqual(race(handed.plan).slice(-1),["./..."]);assert.equal(handed.plan.checksDigest,matrixDigest(handed.plan.checks));assert.equal(handed.plan.commit,lead.commit);
+ assert.deepEqual(handed.batchCovers.map(x=>x.jobId),["rel_m1",batchJournal(c).batch.id,"rel_m2","rel_m3"]);
+ // The real plan from that context covers every job; from the lead's own plan it does not.
+ const plan=integratedPlan(m,handed,r.commit);
+ assert.deepEqual(race(plan).slice(-1),["./..."]);assert.equal(batchPlanCovers(plan,handed.batchCovers),null);assert.equal(batchPlanCovers(plan,covers(lead,docs,code)),null);
+ const leadOnly=integratedPlan(m,lead,r.commit);
+ assert.ok(!race(leadOnly).includes("./..."));assert.deepEqual(batchPlanCovers(leadOnly,covers(lead,docs,code)),{jobId:"rel_m2",checkId:"go-race"});assert.equal(batchPlanCovers(leadOnly,covers(lead,code)),null,"the integrated diff already names the code member's package");
+ // A check that differs in anything but go-race packages cannot share the run.
+ const other=structuredClone(code);other.plan.checks.find(c=>c.id==="go-vet").argv.push("-x");
+ assert.equal(batchMismatch(lead,other),"batch-plan-mismatch");assert.deepEqual(batchAcceptedChecks(lead,[other,docs]).dropped,[{jobId:"rel_m3",reason:"batch-plan-mismatch"}]);
+ const flags=structuredClone(code);flags.plan.checks.find(c=>c.id==="go-race").argv.splice(2,0,"-count=1");assert.equal(batchMismatch(lead,flags),"batch-plan-mismatch");
+ const extra=structuredClone(code);extra.plan.checks.push({id:"npm-unit",argv:["npm","test"],cwd:".",environment:{}});assert.equal(batchMismatch(lead,extra),"batch-plan-mismatch");
+});
+test("batch9 a job with another base is not tried and releases alone",async()=>{
+ const m=matrixRepo(),lead=m.accept(1,"hub/internal/store/store.go","package store\n\nvar Lead = 1\n");
+ git(m.f.cwd,"checkout","--quiet","tasks-hub");writeFileSync(join(m.f.cwd,"docs/later.md"),"later\n");git(m.f.cwd,"add",".");git(m.f.cwd,"commit","-qm","later tip");const later=git(m.f.cwd,"rev-parse","HEAD");
+ const moved=m.accept(2,"hub/internal/api/api.go","package api\n\nvar Moved = 1\n",{base:later}),same=m.accept(3,"hub/cmd/tt/main.go","package main\n\nfunc main() { _ = 1 }\n");m.settle();
+ const summaries=[lead,moved,same].map((j,i)=>({...j,summary:true,rowId:i+1}));
+ assert.deepEqual(batchCandidates(summaries,lead).map(j=>j.id),["rel_m3"]);assert.equal(batchMismatch(lead,moved),"batch-ineligible");
+ assert.equal(batchMismatch(lead,{...same,plan:{...same.plan,matrixApprovalMessageSeq:10}}),"batch-other-matrix");assert.equal(batchMismatch(lead,{...same,plan:{...same.plan,matrixDigest:"e".repeat(64)}}),"batch-other-matrix");
+ for(const change of [{state:"claimed"},{agentId:"agt_other"},{pauseGeneration:2},{rowId:0}])assert.deepEqual(batchCandidates(summaries.map(j=>j.id==="rel_m3"?{...j,...change}:j),lead),[],JSON.stringify(change));
+ assert.deepEqual(batchCandidates(summaries,lead,new Set(["rel_m3"])),[]);assert.deepEqual(batchCandidates(summaries,lead,new Set(["rel_m1"])),[],"a job marked to release alone leads no batch");
+ // Even handed to the runner, the other-base job is never picked or declared.
+ const a=matrixFake(lead),c=batchConfig({f:m.f,lead,members:[moved]},3);
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.deepEqual(a.calls,["verify","merged","deploy:hub","deploy:mini","finish"]);assert.deepEqual(a.refused,[]);
+ assert.deepEqual(batchJournal(c).batchDropped,[{jobId:"rel_m2",reason:"batch-ineligible"}]);assert.equal(batchJournal(c).batch,undefined);
+ assert.deepEqual(git(m.f.cwd,"diff","--name-only",later,r.commit).split("\n"),["hub/internal/store/store.go"]);
+ // It then releases alone, in its turn.
+ const next={...moved,state:"claimed",generation:2,agentId:"agt_fixture",runId:"run_fixture"},a2=matrixFake(next),c2=batchConfig({f:m.f,lead:next,members:[]},3);
+ const r2=await runRelease(c2,a2);assert.equal(r2.outcome,"released");assert.ok(!a2.calls.some(x=>x.startsWith("batch-")));
+});
+test("batch10 an uncovered plan falls back before any matrix run",async()=>{
+ // The host adapter proves coverage after the plan is written and before the run starts.
+ const m=matrixRepo(),lead=m.accept(1,"hub/internal/store/store.go","package store\n\nvar Lead = 1\n"),docs=m.accept(2,"hub/cmd/tt/testdata/README.md","new\n");m.settle();
+ const home=mkdtempSync(join(tmpdir(),"release-batch-host-"));ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ const picked=await integrateBatch(m.f.cwd,lead,[docs],3,{open:async()=>"bat_0000000000000000",add:async()=>true});
+ assert.deepEqual(picked.batch.jobs.map(j=>j.jobId),["rel_m1","rel_m2"]);
+ const host=new HostAdapter({cwd:m.f.cwd,journalDirectory:home},{...lead});const started=[];let planned=0;
+ host.processStartTime=()=>null;host.startMatrixRun=(argv,dir)=>{started.push(dir);return exitedPid();};
+ host.command=argv=>{
+  if(argv[1]==="deployment"&&argv[2]==="get")return JSON.stringify(lead);
+  if(argv[1]==="scripts/verify-matrix.mjs"&&argv[2]==="plan"){planned++;writeFileSync(argv[4],JSON.stringify(planWithPreservation(JSON.parse(readFileSync(argv[3],"utf8")),m.f.cwd).plan));}
+  return "";
+ };
+ const leadOnly={...lead,integratedCommit:picked.integrated,batchCovers:covers(lead,docs)};
+ await assert.rejects(host.verifyIntegrated(leadOnly),e=>failureReason(e)==="batch-plan-uncovered");
+ assert.equal(planned,1);assert.deepEqual(started,[]);assert.ok(!existsSync(join(home,"rel_m1-integrated-verification",picked.integrated+"-r0","run.json")),"no run was recorded");
+ // With the merged plan the same proof passes and the run starts.
+ const merged=batchAcceptedChecks(lead,[docs]);
+ assert.equal(await host.verifyIntegrated({...leadOnly,plan:{...lead.plan,checks:merged.checks,checksDigest:merged.checksDigest}}),false);
+ // The first directory holds the refused plan; a new attempt directory is not
+ // needed because no run was recorded there.
+ assert.equal(started.length,1);
+ // Without batchCovers nothing is checked: a single release is untouched.
+ git(m.f.cwd,"checkout","--quiet","--detach","tasks-hub");
+ // Through runRelease: the fallback is recorded by name and the lead goes on alone.
+ const b={f:m.f,lead,members:[docs]},a=matrixFake(lead),c=batchConfig(b,3);
+ a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(j.batchCovers)throw releaseError("batch-plan-uncovered");return true;};
+ const r=await runRelease(c,a);
+ // The lead alone is a fast-forward of tasks-hub here, so it needs no second matrix.
+ assert.equal(r.outcome,"released");assert.deepEqual(a.calls,["batch-open","batch-add:tqe_m1","batch-add:tqe_m2","verify","batch-drop","merged","deploy:hub","deploy:mini","finish"]);assert.equal(r.commit,lead.commit);
+ assert.equal(batchJournal(c).batchFallback.reason,"batch-plan-uncovered");assert.equal(batchJournal(c).batchFallback.detail,undefined);assert.deepEqual(c.solo,["rel_m2"]);
+ assert.equal(a.verifies.length,1);assert.deepEqual(git(m.f.cwd,"diff","--name-only","refs/heads/tasks-hub~1","refs/heads/tasks-hub").split("\n"),["hub/internal/store/store.go"]);
+});
+test("batch11 an import not saved in time falls back, and continues if it was saved",async()=>{
+ // Not saved: after the wait the batch is dropped and the lead goes on alone.
+ const b=three();let clock=1000;const a=batchFake(b.lead),c={...batchConfig(b,3,{importWaitMs:60000}),now:()=>clock};
+ let saved=false;a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(!j.batchCovers&&!state().batch)return true;a.matrixImportRequested=true;return saved;};
+ const state=()=>batchJournal(c);
+ assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"waiting_matrix"});
+ assert.equal(state().batchImportRequestedAt,1000);assert.equal(state().phase,"waiting_matrix");
+ clock+=59999;assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"waiting_matrix"});assert.ok(!a.calls.includes("batch-drop"));assert.equal(state().batchImportRequestedAt,1000,"the first request time is kept");
+ clock+=1;const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.deepEqual(a.calls.slice(-5),["batch-drop","verify","merged","deploy:tailos","finish"]);
+ assert.deepEqual(state().batchFallback,{batchId:batchId("rel_b1",2,b.tip),reason:"batch-import-timeout",members:["rel_b2","rel_b3"],status:"done"});assert.deepEqual(c.solo,["rel_b2","rel_b3"]);
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,r.commit).split("\n"),["client/a.js"]);
+ // Saved just as the wait ran out: the hub refuses the drop and the batch continues.
+ const b2=three();clock=1000;const a2=batchFake(b2.lead,{refuse:op=>op==="batch-drop"}),c2={...batchConfig(b2,3,{importWaitMs:60000}),now:()=>clock};
+ let polls=0;a2.verifyIntegrated=async j=>{a2.calls.push("verify");a2.matrixImportRequested=true;return ++polls>2;};
+ assert.equal((await runRelease(c2,a2)).outcome,"waiting_matrix");clock+=60000;
+ const r2=await runRelease(c2,a2);
+ assert.equal(r2.outcome,"released");assert.deepEqual(a2.refused,["batch-drop","batch-drop"]);assert.ok(!a2.calls.includes("batch-drop"));
+ const j2=batchJournal(c2);
+ assert.equal(j2.batchFallback.status,"refused");assert.deepEqual(j2.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(r2.commit,j2.batch.jobs.at(-1).to);assert.deepEqual(c2.solo,[]);
+ assert.equal(JSON.parse(readFileSync(join(c2.home,j2.batch.id+"-receipt.json"),"utf8")).outcome,"released");
+ // Still not saved after a refused drop: the batch waits, with one drop record.
+ const b3=three();clock=1000;const a3=batchFake(b3.lead,{refuse:op=>op==="batch-drop"}),c3={...batchConfig(b3,3,{importWaitMs:60000}),now:()=>clock};
+ a3.verifyIntegrated=async()=>{a3.matrixImportRequested=true;return false;};
+ await runRelease(c3,a3);clock+=60000;
+ for(let i=0;i<3;i++)assert.equal((await runRelease(c3,a3)).outcome,"waiting_matrix");
+ assert.equal(batchJournal(c3).batchOps.filter(o=>o.op==="batch-drop").length,1);assert.ok(batchJournal(c3).batch);
+});
+// A hub in a file: a fake tt that keeps the lead's record, replays a saved
+// request id, and can refuse a call or lose its response after saving it.
+function batchHub(b,{refuse=[],lose={}}={}){
+ const home=mkdtempSync(join(tmpdir(),"release-batch-hub-")),statePath=join(home,"hub.json"),tt=join(home,"tt");
+ writeFileSync(statePath,JSON.stringify({job:b.lead,saved:{},executed:{},refuse,lose,log:[]}));
+ writeFileSync(tt,"#!"+process.execPath+`
+const fs=require('fs'),cp=require('child_process');const a=process.argv.slice(2),S=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8'));
+const flag=n=>{const i=a.indexOf(n);return i<0?undefined:a[i+1];};
+let head='';try{head=cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();}catch{}
+S.log.push({argv:a.join(' '),head});
+const end=(value,code)=>{fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(S));if(value===undefined)process.exit(code||2);console.log(JSON.stringify(value));process.exit(0);};
+if(a[0]!=='deployment')end({});
+if(a[1]==='get')end(S.job);
+if(a[1]==='check')end(+flag('--generation')===S.job.generation?S.job:undefined);
+if(a[1].startsWith('batch-')){
+ const id=flag('--request-id'),name=a[1]+(flag('--entry')?':'+flag('--entry'):'');
+ if(!S.saved[id]){
+  if(S.refuse.includes(name)||+flag('--generation')!==S.job.generation)end(undefined);
+  S.job={...S.job,generation:S.job.generation+1};S.saved[id]=S.job;S.executed[name]=(S.executed[name]||0)+1;
+ }
+ if(S.lose[name]>0){S.lose[name]--;end(undefined,3);}
+ end(S.saved[id]);
+}
+end(undefined);
+`);chmodSync(tt,0o755);
+ const read=()=>JSON.parse(readFileSync(statePath,"utf8"));
+ // A host adapter whose batch calls, fence and detail go through that tt.
+ const adapter=()=>{
+  const host=new HostAdapter({cwd:b.f.cwd,journalDirectory:home,tt},read().job),stub=fake();host.calls=stub.calls;
+  for(const key of ["merged","prepare","deploy","check","rollback","finish","escalate","requestBug","block","refuse"])host[key]=stub[key];
+  host.verifyIntegrated=async()=>{stub.calls.push("verify");return true;};host.verifyInputs=async()=>true;host.settleMatrixRuns=async()=>true;host.retain=async()=>{};
+  return host;
+ };
+ const cfg=(max=3)=>({cwd:b.f.cwd,job:read().job,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,b.f.base])),journalPath:join(home,b.lead.id+".json"),testPolicy:{startupMs:0,failures:1,intervalMs:0,relayCleanMs:0},batch:{max,importWaitMs:BATCH_IMPORT_WAIT_MS,candidates:b.members,onFallback:()=>{}}});
+ const batchCalls=()=>read().log.filter(l=>/^deployment batch-/.test(l.argv));
+ return {home,read,adapter,cfg,batchCalls,journal:()=>JSON.parse(readFileSync(join(home,b.lead.id+".json"),"utf8"))};
+}
+test("batch12 lost batch responses replay before any checkout",async()=>{
+ // Saved by the hub, response lost once: sent again unchanged and counted once.
+ let b=three(),h=batchHub(b,{lose:{"batch-add:tqe_b2":1}}),a=h.adapter();
+ let r=await runRelease(h.cfg(),a);
+ assert.equal(r.outcome,"released");assert.deepEqual(h.journal().batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);
+ let adds=h.batchCalls().filter(l=>l.argv.includes("--entry tqe_b2"));
+ assert.equal(adds.length,2);assert.equal(adds[0].argv,adds[1].argv);assert.match(adds[0].argv,/--generation 4 --request-id rel_b1-batch-add-4 --entry tqe_b2 --commit [a-f0-9]{40}$/);
+ assert.equal(h.read().executed["batch-add:tqe_b2"],1);assert.equal(h.read().job.generation,6);assert.deepEqual(a.calls,["verify","merged","deploy:tailos","finish"]);
+ // Lost twice: the result is unknown, so the run waits with the checkout where it was.
+ b=three();h=batchHub(b,{lose:{"batch-add:tqe_b2":2}});a=h.adapter();
+ assert.deepEqual(await runRelease(h.cfg(),a),{jobId:"rel_b1",outcome:"waiting_batch"});
+ let journal=h.journal();const pending=journal.batchOps.at(-1),head=git(b.f.cwd,"rev-parse","HEAD");
+ assert.equal(journal.phase,"batching");assert.deepEqual([pending.op,pending.status,pending.entryId,pending.generation],["batch-add","sending","tqe_b2",4]);assert.equal(head,pending.commit,"the checkout still holds the picked member");
+ assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1"]);assert.deepEqual(a.calls,[]);assert.equal(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),b.tip);
+ assert.ok(!existsSync(join(tmpdir(),"tailterm-release-locks","none")));
+ // The next poll replays that call first, from the same checkout, then finishes with the jobs that joined.
+ const before=h.read().log.length;a=h.adapter();r=await runRelease(h.cfg(),a);
+ assert.equal(r.outcome,"released");
+ const after=h.read().log.slice(before),replay=after.find(l=>/^deployment batch-/.test(l.argv));
+ assert.equal(replay.argv,h.batchCalls().filter(l=>l.argv.includes("--entry tqe_b2"))[0].argv);assert.equal(replay.head,head,"replayed before any checkout");
+ assert.equal(h.read().executed["batch-add:tqe_b2"],1);
+ journal=h.journal();assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);assert.equal(r.commit,pending.commit);assert.equal(journal.batch.jobs[1].to,pending.commit);
+ assert.ok(!h.batchCalls().some(l=>l.argv.includes("tqe_b3")),"a resumed declaration closes with the jobs that joined");
+ assert.deepEqual(a.calls,["verify","merged","deploy:tailos","finish"]);clean(b.f.cwd);
+ // Every member refused: the open batch has no member, so it is dropped and the lead goes alone.
+ b=three();h=batchHub(b,{refuse:["batch-add:tqe_b2","batch-add:tqe_b3"]});a=h.adapter();
+ r=await runRelease(h.cfg(),a);
+ assert.equal(r.outcome,"released");
+ assert.deepEqual(h.batchCalls().map(l=>l.argv.split(" ")[1]+(/--entry (\S+)/.exec(l.argv)?.[1]?":"+/--entry (\S+)/.exec(l.argv)[1]:"")),["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b2","batch-add:tqe_b3","batch-add:tqe_b3","batch-drop"]);
+ journal=h.journal();assert.equal(journal.batch,null);assert.deepEqual(journal.batchDropped,[{jobId:"rel_b2",reason:"batch-add-refused"},{jobId:"rel_b3",reason:"batch-add-refused"}]);
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,r.commit).split("\n"),["client/a.js"]);assert.equal(journal.batchReceipt,undefined);
+ // An older hub answers every batch call as invalid: one open, then the lead alone.
+ b=three();h=batchHub(b,{refuse:["batch-open"]});a=h.adapter();
+ r=await runRelease(h.cfg(),a);assert.equal(r.outcome,"released");assert.deepEqual(h.batchCalls().map(l=>l.argv.split(" ")[1]),["batch-open","batch-open"]);assert.equal(h.read().job.generation,2);
+ // validateNativeRelease: the three calls keep the claim and move one generation;
+ // only batch-drop may come back without the integrated commit.
+ const prior={...b.lead,integratedCommit:"c".repeat(40)},next=over=>({...prior,generation:3,...over});
+ for(const op of ["batch-open","batch-add","batch-drop"]){
+  const after=over=>{const n=next(over);if(op==="batch-drop")delete n.integratedCommit;return n;};
+  assert.equal(validateNativeRelease(prior,after(),op,2).generation,3);
+  assert.throws(()=>validateNativeRelease({...prior,state:"merged"},after(),op,2),/Invalid native release transition/);
+  assert.throws(()=>validateNativeRelease(prior,after({generation:2}),op,2),/Invalid native release response/);
+  assert.throws(()=>validateNativeRelease(prior,after({state:"verified"}),op,2),/Invalid native release response/);
+  assert.throws(()=>validateNativeRelease(prior,after({runId:"run_other"}),op,2),/run binding mismatch/);
+  assert.throws(()=>validateNativeRelease(prior,after({inputsDigest:"d".repeat(64)}),op,2),/input binding mismatch/);
+  assert.throws(()=>validateNativeRelease(prior,after({receipt:{version:1}}),op,2),/receipt changed/);
+ }
+ const cleared=next();delete cleared.integratedCommit;
+ assert.equal(validateNativeRelease(prior,cleared,"batch-drop",2),cleared);assert.throws(()=>validateNativeRelease(prior,next(),"batch-drop",2),/integrated commit mismatch/);
+ for(const op of ["batch-open","batch-add"]){
+  assert.throws(()=>validateNativeRelease(prior,cleared,op,2,["--commit","e".repeat(40)]),/integrated commit mismatch/);
+  assert.ok(validateNativeRelease(prior,next(),op,2,["--commit","e".repeat(40)]),"a batch call's --commit is not the lead's integrated commit");
+ }
+});
+test("batch13 a crash after hub settlement materializes the receipts without redeploying",async()=>{
+ // The hub saved the finish; the runner stopped before it learned so.
+ const stopped=async(check)=>{
+  const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);let sent;if(check)a.check=check;
+  a.finish=async r=>{sent=structuredClone(r);a.calls.push("finish");throw new Error("connection lost");};
+  let result;try{result=await runRelease(c,a);}catch(error){result=error;}
+  return {b,a,c,sent,result};
+ };
+ const settled=(x,journal)=>({...x.b.lead,state:x.sent.outcome,generation:journal.finishGeneration+1,integratedCommit:x.sent.commit,published:true,receipt:x.sent});
+ let x=await stopped();
+ assert.deepEqual(x.result,{jobId:"rel_b1",outcome:"receipt_pending"});
+ let journal=batchJournal(x.c);const id=journal.batch.id,path=join(x.c.home,id+"-receipt.json");
+ assert.equal(journal.phase,"receipt_pending");assert.equal(journal.batchReceipt.batchId,id);assert.deepEqual(batchFiles(x.c.home),[],"nothing is written before the hub's settlement is known");assert.ok(!existsSync(join(x.c.home,"rel_b2.json")));
+ // A half-written batch receipt and a stale temporary file are replaced.
+ writeFileSync(path,'{"batchId":"');writeFileSync(path+".tmp","partial");writeFileSync(join(x.c.home,"rel_b2.json"),'{"jobId":"rel_b2","phase":"refused"}');
+ const calls=x.a.calls.length;
+ reconcileReceipts({journalDirectory:x.c.home},[settled(x,journal)]);
+ assert.equal(batchJournal(x.c).phase,"complete");assert.equal(x.a.calls.length,calls,"no prepare, deploy or second finish");
+ const receipt=JSON.parse(readFileSync(path,"utf8"));
+ assert.equal(receipt.outcome,"released");assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.deepEqual(receipt.push,x.sent.push);
+ for(const member of ["rel_b2","rel_b3"]){const m=JSON.parse(readFileSync(join(x.c.home,member+".json"),"utf8"));assert.equal(m.batch.id,id);assert.equal(m.phase,"complete");assert.equal(m.receipt.jobId,member);}
+ assert.equal(JSON.parse(readFileSync(join(x.c.home,`rel_b2.json.before-${id}`),"utf8")).phase,"refused","an earlier journal of the member is kept");
+ // The same bytes on every repeat, from any path.
+ const bytes=()=>[id+"-receipt.json","rel_b2.json","rel_b3.json"].map(n=>readFileSync(join(x.c.home,n),"utf8"));const first=bytes();
+ materializeBatch(x.c.home,batchJournal(x.c));assert.deepEqual(bytes(),first);
+ assert.deepEqual(await runRelease(x.c,x.a),x.sent);assert.deepEqual(bytes(),first);assert.equal(x.a.calls.length,calls);
+ // The runner's own retry of a pending finish writes them too.
+ x=await stopped();journal=batchJournal(x.c);x.a.finish=async()=>{x.a.calls.push("finish-retry");};
+ assert.deepEqual(await runRelease(x.c,x.a),x.sent);
+ assert.deepEqual(x.a.calls.slice(-2),["finish","finish-retry"]);assert.equal(x.a.calls.filter(n=>n.startsWith("deploy:")).length,1);
+ assert.deepEqual(batchFiles(x.c.home),[journal.batch.id+"-receipt.json"]);assert.ok(existsSync(join(x.c.home,"rel_b3.json")));
+ // Rolled back: the batch receipt only, never a member journal.
+ x=await stopped(async()=>"identity");
+ assert.match(x.result.message,/final receipt pending retry/);journal=batchJournal(x.c);assert.equal(journal.phase,"receipt_pending");assert.equal(x.sent.outcome,"rolled_back");
+ const rollbacks=x.a.calls.filter(n=>n==="rollback:tailos").length;
+ reconcileReceipts({journalDirectory:x.c.home},[settled(x,journal)]);
+ const rolled=JSON.parse(readFileSync(join(x.c.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.equal(rolled.outcome,"rolled_back");assert.deepEqual(rolled.revert,x.sent.revert);assert.ok(!existsSync(join(x.c.home,"rel_b2.json")));assert.ok(!existsSync(join(x.c.home,"rel_b3.json")));
+ assert.equal(x.a.calls.filter(n=>n==="rollback:tailos").length,rollbacks);
+ // Nothing is written from a journal without a batch, or without a final outcome.
+ assert.equal(materializeBatch(x.c.home,{receipt:x.sent}),null);assert.equal(materializeBatch(x.c.home,{batchReceipt:journal.batchReceipt,receipt:{...x.sent,outcome:"pending"}}),null);
+});
+// A hub for the daemon: the ledger, claims, fence checks, merged and finish,
+// and the batch calls unless it is an older hub.
+function daemonHub(b,{batchSupported=true,releaseBatch}={}){
+ const home=mkdtempSync(join(tmpdir(),"release-batch-daemon-")),statePath=join(home,"hub.json"),tt=join(home,"tt"),configPath=join(home,"deploy.json");
+ const jobs=[{...b.lead,state:"verified",generation:1,agentId:undefined,runId:undefined},...b.members];
+ writeFileSync(statePath,JSON.stringify({jobs,log:[],batch:[]}));
+ writeFileSync(tt,"#!"+process.execPath+"\n"+releaseReplySource+`
+const fs=require('fs');const a=process.argv.slice(2),S=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8'));
+const flag=n=>{const i=a.indexOf(n);return i<0?undefined:a[i+1];};
+S.log.push(a.join(' '));
+const end=value=>{fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(S));if(value===undefined)process.exit(2);console.log(JSON.stringify(value));process.exit(0);};
+if(a[0]!=='deployment')end({});
+if(a[1]==='handler')end({id:'agt_0123abcd'});
+if(['list','get'].includes(a[1]))end(releaseReply(S.jobs,a));
+const at=S.jobs.findIndex(j=>j.id===flag('--job')),job=S.jobs[at];
+if(!job||(a[1]!=='check'&&+flag('--generation')!==job.generation))end(undefined);
+const save=next=>{S.jobs[at]=next;end(next);};
+if(a[1]==='check')end(+flag('--generation')===job.generation?job:undefined);
+if(a[1]==='claim')save({...job,state:'claimed',generation:job.generation+1,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN});
+if(a[1]==='merged')save({...job,state:'merged',generation:job.generation+1,integratedCommit:flag('--commit'),published:true});
+if(a[1]==='finish'){const receipt=JSON.parse(fs.readFileSync(flag('--file'),'utf8'));save({...job,state:receipt.outcome,generation:job.generation+1,receipt,settledAt:'2026-10-06T16:00:00Z'});}
+if(a[1].startsWith('batch-')&&${JSON.stringify(batchSupported)}){S.batch.push(a[1]+(flag('--entry')?':'+flag('--entry'):''));save({...job,generation:job.generation+1});}
+end(undefined);
+`);chmodSync(tt,0o755);
+ const config={version:1,enabled:true,cwd:b.f.cwd,journalDirectory:home,tt,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,b.f.base])),testPolicy:{startupMs:0,failures:1,intervalMs:0,relayCleanMs:0},...(releaseBatch===undefined?{}:{releaseBatch})};
+ writeFileSync(configPath,JSON.stringify(config));
+ const read=()=>JSON.parse(readFileSync(statePath,"utf8"));
+ // The real runRelease over the daemon's own adapter: only the host work
+ // (matrix, inputs, artifacts, probes) is stubbed.
+ const seen=[];
+ const release=(c,adapter)=>{
+  seen.push(c);const stub=fake();
+  for(const key of ["prepare","deploy","check","rollback","escalate","requestBug"])adapter[key]=stub[key];
+  adapter.verifyIntegrated=async()=>true;adapter.verifyInputs=async()=>true;adapter.settleMatrixRuns=async()=>true;adapter.retain=async()=>{};
+  return runRelease({...c,testPolicy:config.testPolicy},adapter);
+ };
+ return {home,config,configPath,read,release,seen,poll:()=>serveDeployment(config,{once:true,configPath,release})};
+}
+// What the published runner (aff59de) sends for one verified job, three more
+// queued behind it and a diverged tasks-hub: recorded from that runner.
+const SINGLE_JOB_TRACE=["list --view active","list --view settled","get --job rel_b1","list --view active","list --view active","claim --job rel_b1 --generation 1","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","merged --job rel_b1 --generation 2","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","finish --job rel_b1 --generation 3"];
+const traceOf=log=>log.filter(l=>l.startsWith("deployment ")).map(l=>l.split(" ").slice(1).filter((w,i,all)=>!["--limit","--snapshot","--request-id","--commit","--file"].includes(w)&&!["--limit","--snapshot","--request-id","--commit","--file"].includes(all[i-1])).join(" "));
+test("batch14 daemon traces with batching absent and at 1 against an older hub",async()=>{
+ const traces=[];
+ for(const releaseBatch of [undefined,{maxJobs:1},{}]){
+  const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"]]),h=daemonHub(b,{batchSupported:false,releaseBatch});
+  await h.poll();
+  const state=h.read();
+  assert.equal(state.jobs[0].state,"released");assert.deepEqual(state.jobs.slice(1).map(j=>[j.state,j.generation]),[["verified",1],["verified",1],["verified",1]]);
+  assert.deepEqual(traceOf(state.log),SINGLE_JOB_TRACE);assert.ok(!state.log.some(l=>l.startsWith("deployment batch-")));assert.equal(state.log.filter(l=>l.startsWith("deployment get")).length,1,"no extra detail read");
+  assert.equal(h.seen.length,1);assert.ok(!("batch" in h.seen[0]),"no batch key reaches runRelease");
+  assert.deepEqual(readdirSync(h.home).filter(n=>n.startsWith("bat_")||n.startsWith("batch-")||/^rel_b[234]/.test(n)),[]);assert.ok(!("batch" in JSON.parse(readFileSync(join(h.home,"rel_b1.json"),"utf8"))));
+  traces.push(state.log.map(l=>l.replace(/[a-f0-9]{40}/g,"SHA").replace(h.home,"HOME")));
+ }
+ assert.deepEqual(traces[1],traces[0],"a size of 1 sends exactly what an absent setting sends");assert.deepEqual(traces[2],traces[0]);
+ // Enabled against the same older hub: one refused open, then the lead alone.
+ const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"]]),h=daemonHub(b,{batchSupported:false,releaseBatch:{maxJobs:3}});
+ await h.poll();
+ assert.equal(h.read().jobs[0].state,"released");assert.deepEqual(h.read().jobs.slice(1).map(j=>j.state),["verified","verified","verified"]);
+ assert.equal(h.read().log.filter(l=>l.startsWith("deployment batch-open")).length,2);assert.equal(h.read().log.filter(l=>l.startsWith("deployment batch-")).length,2);
+});
+test("batch15 a size of 3 with five eligible jobs batches three and leaves two waiting",async()=>{
+ const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"],["client/e.js","e"],["client/f.js","f"]]),h=daemonHub(b,{releaseBatch:{maxJobs:3}});
+ await h.poll();
+ const state=h.read(),journal=JSON.parse(readFileSync(join(h.home,"rel_b1.json"),"utf8"));
+ assert.deepEqual(state.batch,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3"]);
+ assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(state.jobs[0].state,"released");assert.equal(state.jobs[0].receipt.jobId,"rel_b1");
+ assert.equal(h.seen[0].batch.max,3);assert.deepEqual(h.seen[0].batch.candidates.map(j=>j.id),["rel_b2","rel_b3","rel_b4","rel_b5"],"twice the open places are read, in queue order");
+ assert.deepEqual(state.log.filter(l=>l.startsWith("deployment get")).map(l=>l.split(" ")[3]),["rel_b1","rel_b2","rel_b3","rel_b4","rel_b5"]);
+ // The two that did not fit were never declared and wait as they were.
+ assert.deepEqual(state.jobs.slice(3).map(j=>[j.id,j.state,j.generation]),[["rel_b4","verified",1],["rel_b5","verified",1],["rel_b6","verified",1]]);
+ for(const id of ["rel_b4","rel_b5","rel_b6"])assert.ok(!existsSync(join(h.home,id+".json")));
+ const receipt=JSON.parse(readFileSync(join(h.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(receipt.outcome,"released");
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,"refs/heads/tasks-hub").split("\n"),["client/a.js","client/b.js","client/c.js"]);
+ assert.ok(existsSync(join(h.home,"rel_b2.json"))&&existsSync(join(h.home,"rel_b3.json")));assert.deepEqual([...readBatchSolo(h.home)],[]);
+});
