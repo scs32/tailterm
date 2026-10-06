@@ -3,7 +3,7 @@ import {createServer} from "node:http";
 import assert from "node:assert/strict";
 import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync,realpathSync} from "node:fs";
 import {tmpdir} from "node:os";
-import {join,dirname} from "node:path";
+import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
 import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
@@ -1740,16 +1740,16 @@ test("immutable flat and paged consumers cross both APIs with a stable binary th
 });
 
 // Runner code gate (wi_2be015df9af54c5c). A fixture repository whose scripts/
-// holds six small stand-ins: commit a, then commit b changing the runner.
+// and tests/ hold small stand-ins for the watched files: commit a, then
+// commit b changing one of them (the runner unless another is named).
 const CODE_AGENT="agt_c0defixture",CODE_RUN="run_c0defixture",SAFE_TEXT=/^[A-Za-z0-9 ,.:;()_\/-]+$/;
-function codeRepo(t,real=false){
+function codeRepo(t,real=false,changed="release-runner.mjs"){
  // The real path: the daemon entry compares its argv with the module's own URL.
  const cwd=realpathSync(mkdtempSync(join(tmpdir(),"release-code-")));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
- git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"scripts"));
+ git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"scripts"));mkdirSync(join(cwd,"tests"));
  for(const n of RUNNER_CODE_FILES){if(real)copyFileSync(new URL("../scripts/"+n,import.meta.url),join(cwd,"scripts",n));else writeFileSync(join(cwd,"scripts",n),`// ${n} a\n`);}
- if(real){mkdirSync(join(cwd,"tests"));copyFileSync(new URL("./test-binaries.mjs",import.meta.url),join(cwd,"tests/test-binaries.mjs"));}
  git(cwd,"add",".");git(cwd,"commit","-m","a");const a=git(cwd,"rev-parse","HEAD"),codeA=publishedCode(cwd);
- writeFileSync(join(cwd,"scripts/release-runner.mjs"),readFileSync(join(cwd,"scripts/release-runner.mjs"),"utf8")+"// b\n");git(cwd,"add",".");git(cwd,"commit","-m","b");
+ writeFileSync(join(cwd,"scripts",changed),readFileSync(join(cwd,"scripts",changed),"utf8")+"// b\n");git(cwd,"add",".");git(cwd,"commit","-m","b");
  const b=git(cwd,"rev-parse","HEAD"),codeB=publishedCode(cwd);
  // at(head,published): detached at head with tasks-hub at published.
  const at=(head,published)=>{git(cwd,"checkout","--quiet","--detach",head);git(cwd,"update-ref","refs/heads/tasks-hub",published);};
@@ -1967,15 +1967,66 @@ test("code a9 a failed CLI call keeps its exact argv, exit code and stderr priva
  for(let i=0;i<25;i++)assert.throws(()=>loud.command([big.tt,"deployment","get","--job","rel_"+i]),reasonIs("tt deployment get exit 4"));
  const capped=JSON.parse(readFileSync(join(big.home,"cli-failures.json"),"utf8")).failures;assert.equal(capped.length,20);assert.equal(capped.at(-1).argv.at(-1),"rel_24");
 });
-test("code a10 every relative import of the watched scripts is itself watched, and this process recorded its own code",()=>{
- assert.equal(RUNNER_CODE_FILES.length,6);assert.deepEqual([...RUNNER_CODE_FILES].sort(),RUNNER_CODE_FILES);
- const directory=dirname(RUNNER);
- for(const name of RUNNER_CODE_FILES){
-  const source=readFileSync(join(directory,name),"utf8"),imports=[...source.matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.\/[^"']+)["']/g)].map(m=>m[1].slice(2));
-  for(const imported of imports)assert.ok(RUNNER_CODE_FILES.includes(imported),`${name} imports ./${imported}`);
+// Every "./" or "../" import of the watched files that is not itself watched,
+// as "importer imports path" with paths from the repository root.
+function unwatchedImports(watched,directory=dirname(RUNNER)){
+ const root=dirname(directory),paths=new Set(watched.map(n=>resolve(directory,n))),found=[];
+ for(const file of paths){
+  const specifiers=[...readFileSync(file,"utf8").matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.\.?\/[^"']+)["']/g)].map(m=>m[1]);
+  for(const specifier of specifiers){const imported=resolve(dirname(file),specifier);if(!paths.has(imported))found.push(`${file.slice(root.length+1)} imports ${imported.slice(root.length+1)}`);}
  }
+ return found;
+}
+test("code a10 every relative import of the watched files is itself watched, and this process recorded its own code",()=>{
+ const directory=dirname(RUNNER);
+ assert.deepEqual(unwatchedImports(RUNNER_CODE_FILES),[]);
+ assert.equal(RUNNER_CODE_FILES.length,7);assert.deepEqual([...RUNNER_CODE_FILES].sort(),RUNNER_CODE_FILES);
+ // The guard sees an import that leaves scripts/: without its entry the matrix's import is reported.
+ assert.deepEqual(unwatchedImports(RUNNER_CODE_FILES.filter(n=>n!=="../tests/test-binaries.mjs")),["scripts/verify-matrix.mjs imports tests/test-binaries.mjs"]);
+ assert.deepEqual(unwatchedImports(RUNNER_CODE_FILES.filter(n=>n!=="release-probe.mjs")),["scripts/release-inputs.mjs imports scripts/release-probe.mjs","scripts/release-runner.mjs imports scripts/release-probe.mjs"]);
  assert.deepEqual(LOADED_CODE,diskCode(directory));assert.equal(LOADED_CODE.digest,codeDigest(LOADED_CODE.files));
+ assert.match(LOADED_CODE.files["../tests/test-binaries.mjs"],/^[a-f0-9]{64}$/);
  assert.ok(readFileSync(RUNNER,"utf8").includes("code:runnerCodeGate()"),"only the daemon entry builds the real gate");
+});
+test("code a11 a change to the test binaries module alone is stale code: it drains while a release is active and restarts once idle",async t=>{
+ const name="../tests/test-binaries.mjs",r=codeRepo(t,false,name),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);
+ // Only that file differs between the two commits, and both readers of the code see it.
+ assert.deepEqual(git(r.cwd,"diff","--name-only",r.a,r.b).split("\n"),["tests/test-binaries.mjs"]);
+ assert.deepEqual(RUNNER_CODE_FILES.filter(n=>r.codeA.files[n]!==r.codeB.files[n]),[name]);assert.notEqual(r.codeA.digest,r.codeB.digest);
+ assert.deepEqual(diskCode(join(r.cwd,"scripts")),{files:r.codeA.files,digest:r.codeA.digest});
+ const others=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,"0".repeat(64)]));assert.notEqual(codeDigest(others),codeDigest({...others,[name]:"1".repeat(64)}));
+ // An active release: its own job still runs, nothing new is claimed and nothing is re-executed.
+ const own={id:"rel_own",state:"claimed",generation:2,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN},released=[];
+ h.setJobs([own,verifiedJob("rel_next")]);await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.deepEqual(released,["rel_own"]);assert.equal(execs.length,0);assert.equal(h.claims().length,0);assert.equal(r.head(),r.a);
+ assert.equal(h.record().state,"draining");assert.deepEqual(h.record().changed,[name]);
+ assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer code is out of date; it restarts itself after the current release"]);
+ assert.ok(codeSends(h)[0].text.includes(`Changed: ${name}.`));assert.match(codeSends(h)[0].text,SAFE_TEXT);
+ // Idle: one re-exec aimed at the published code, from the published checkout, and still no claim.
+ h.setJobs([verifiedJob("rel_next")]);await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.equal(execs.length,1);assert.equal(execs[0][2].TAILTERM_RUNNER_REEXEC,r.codeB.digest);assert.equal(execs[0][2].TAILTERM_RUNNER_REEXEC_FROM,r.codeA.digest);
+ assert.equal(h.claims().length,0);assert.deepEqual(released,["rel_own"]);assert.equal(r.head(),r.b);assert.equal(h.record().state,"restart");assert.deepEqual(h.record().changed,[name]);
+ assert.equal(readFileSync(join(r.cwd,"tests/test-binaries.mjs"),"utf8"),`// ${name} a\n// b\n`);
+ assert.ok(codeSends(h).at(-1).text.includes(`Changed: ${name}.`));
+});
+test("code a12 a restart begun by a runner that watched only the scripts is still announced, and its marker decides nothing else",async t=>{
+ const name="../tests/test-binaries.mjs",r=codeRepo(t,false,name),scripts=RUNNER_CODE_FILES.filter(n=>n!==name);assert.equal(scripts.length,6);
+ // What the earlier runner computed: the sha256 of the six scripts' "name:sha256" lines.
+ const earlier=code=>createHash("sha256").update(scripts.map(n=>`${n}:${code.files[n]}`).join("\n")).digest("hex"),from="f".repeat(64);
+ assert.notEqual(earlier(r.codeB),r.codeB.digest);
+ // Restarted onto b with that marker: current, one job claimed, and the restarted notice is sent once.
+ const h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeB,{marker:earlier(r.codeB),restartedFrom:from});h.setJobs([verifiedJob()]);
+ await h.poll(gate);await h.poll(gate);
+ assert.equal(h.record().state,"current");assert.equal(h.record().restartedFrom,from);assert.equal(execs.length,0);assert.equal(h.claims().length,2);
+ assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer now runs the published scripts"]);assert.ok(codeSends(h)[0].text.includes(`from scripts ${from.slice(0,12)} and now runs ${r.codeB.digest.slice(0,12)}`));
+ // Any other marker announces nothing.
+ const home=mkdtempSync(join(tmpdir(),"release-code-marker-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const record=marker=>codeRecord({journalDirectory:home},{loaded:r.codeB,marker,restartedFrom:from,now:()=>0},{state:"current"},r.codeB);
+ assert.equal(record("e".repeat(64)).restartedFrom,undefined);assert.equal(record(null).restartedFrom,undefined);assert.equal(record(r.codeB.digest).restartedFrom,from);
+ // The decision compares the marker with the published digest only: the six-script value never refuses or allows a restart.
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:earlier(r.codeB)}),{state:"restart"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:r.codeB.digest}),{state:"refused",reason:"restart-did-not-refresh"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:false,marker:earlier(r.codeB)}),{state:"draining"});
 });
 test("code b1 a stop signal during the restart poll means no re-exec and no claim, and the runner ends",{timeout:20000},async t=>{
  // The signal arrives during the poll's synchronous work and is handled at the next turn of the event loop.

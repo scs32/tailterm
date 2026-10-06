@@ -955,10 +955,11 @@ export class HostAdapter {
   }
 }
 
-// The runner's own code: the six scripts one process loads once, as static
-// imports, by file name under scripts/. A drift test pins the list to their
-// "./" imports. A code digest is the sha256 of the "name:sha256" lines.
-export const RUNNER_CODE_FILES=["release-inputs.mjs","release-probe.mjs","release-runner.mjs","release-targets.mjs","verify-matrix-host-lock.mjs","verify-matrix.mjs"];
+// The runner's own code: the modules one process loads once, as static
+// imports, each named by its path from scripts/ (the matrix imports one from
+// tests/). A drift test pins the list to their "./" and "../" imports. A code
+// digest is the sha256 of the "name:sha256" lines.
+export const RUNNER_CODE_FILES=["../tests/test-binaries.mjs","release-inputs.mjs","release-probe.mjs","release-runner.mjs","release-targets.mjs","verify-matrix-host-lock.mjs","verify-matrix.mjs"];
 const HEX64=/^[a-f0-9]{64}$/,bytesDigest=bytes=>createHash("sha256").update(bytes).digest("hex");
 export const codeDigest=files=>bytesDigest(RUNNER_CODE_FILES.map(n=>`${n}:${files[n]}`).join("\n"));
 export function diskCode(directory){
@@ -968,14 +969,18 @@ export function diskCode(directory){
 // Read once as this process starts: the bytes beside this module, which are
 // the ones it imported. null when they cannot be read; the gate then refuses.
 export const LOADED_CODE=(()=>{try{return diskCode(dirname(fileURLToPath(import.meta.url)));}catch{return null;}})();
-// The same six scripts as published: the blobs of refs/heads/tasks-hub, never
+// The same files as published: the blobs of refs/heads/tasks-hub, never
 // the working tree, which holds an unpublished candidate after a refusal.
 export function publishedCode(cwd){
   const commit=git(cwd,"rev-parse","--verify","refs/heads/tasks-hub^{commit}");
   if(!sha(commit))throw releaseError("published-unreadable");
-  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(execFileSync("git",["cat-file","blob",`${commit}:scripts/${n}`],{cwd,stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024}))]));
+  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(execFileSync("git",["cat-file","blob",`${commit}:${join("scripts",n)}`],{cwd,stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024}))]));
   return {commit,files,digest:codeDigest(files)};
 }
+// The digest as computed before tests/test-binaries.mjs was watched: the
+// scripts alone. A runner of that code aims its re-exec marker at this value,
+// so codeRecord accepts it, only to say that the restart arrived.
+const scriptsDigest=files=>bytesDigest(RUNNER_CODE_FILES.filter(n=>!n.startsWith("../")).map(n=>`${n}:${files[n]}`).join("\n"));
 const validCode=c=>HEX64.test(c?.digest||"") && RUNNER_CODE_FILES.every(n=>HEX64.test(c.files?.[n]||""));
 // What a poll may do about its own code. current: claim as usual. draining:
 // stale while a release, matrix run or host release lock is active; claim
@@ -994,7 +999,7 @@ export function codeDecision({loaded,published,idle,marker}){
 }
 // Brings the idle checkout to the published commit before a re-exec, under
 // integrateCandidate's cleanliness rule (ignored build outputs do not count),
-// and proves the six files on disk are the published bytes.
+// and proves the watched files on disk are the published bytes.
 export function prepareCode(cwd,published){
   let dirty;try{dirty=git(cwd,"status","--porcelain");}catch{throw releaseError("checkout-failed");}
   if(dirty)throw releaseError("checkout-dirty");
@@ -1030,7 +1035,7 @@ export function codeRecord(config,code,decision,published){
   const current=validCode(published)&&sha(published.commit)?{commit:published.commit,digest:published.digest,files:published.files}:null;
   code.startedAt??=iso(code.now());
   const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),
-    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&code.marker===loaded.digest?{restartedFrom:code.restartedFrom}:{})};
+    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{})};
   const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null});
   let prior=null;try{prior=JSON.parse(readFileSync(path,"utf8"));}catch{}
   if(prior && unchecked(prior)===unchecked(record))return prior;
