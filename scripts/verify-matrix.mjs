@@ -89,6 +89,7 @@ export function assertFastForward(cwd, base, commit) {
         (ancestry.error?.message || ancestry.stderr.trim()),
     );
 }
+export const MAX_CHECK_TIMEOUT_MS = 3600000;
 export function selectChecks(
   matrix,
   owned,
@@ -124,7 +125,7 @@ export function selectChecks(
   const add = (id, argv, cwd = ".", environment = {}) => {
     const timeout =
       matrix.checkTimeoutMs?.[id] ?? matrix.defaultTimeoutMs ?? 600000;
-    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
+    if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_CHECK_TIMEOUT_MS)
       throw new Error("Invalid matrix check timeout: " + id);
     checks.push({
       id,
@@ -488,7 +489,7 @@ export function occupiedPorts(check) {
 // ends, so the host lock holder can record what is still running.
 export async function runCheck(check, cwd, environment, abortSignal, onGroup) {
   const timeout = Number(check.environment.VERIFICATION_TIMEOUT_MS);
-  if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 1800000)
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_CHECK_TIMEOUT_MS)
     throw new Error("Invalid approved check timeout");
   if (process.platform === "win32")
     throw new Error("POSIX process groups required for verification");

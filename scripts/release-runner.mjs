@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
-import { digest, diffPaths, receiptEligible } from "./verify-matrix.mjs";
+import { digest, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
@@ -104,7 +104,7 @@ export function matrixRunTimeout(plan) {
   if (!Number.isSafeInteger(attempts) || attempts < 1) throw releaseError("Invalid matrix attempt limit");
   return Math.min(holderCapMs(), plan.checks.reduce((total, check) => {
     const raw = check?.environment?.VERIFICATION_TIMEOUT_MS, ms = Number(raw);
-    if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(ms) || ms > 1800000) throw releaseError("Invalid matrix check timeout");
+    if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(ms) || ms > MAX_CHECK_TIMEOUT_MS) throw releaseError("Invalid matrix check timeout");
     return total + ms * attempts;
   }, MATRIX_BUILD_ALLOWANCE_MS));
 }

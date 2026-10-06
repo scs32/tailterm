@@ -740,7 +740,9 @@ test("a8 a10 the deployer's run bound is the serial sum under the holder cap, th
  assert.equal(matrixRunTimeout({checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}),2400000,"a plan under the cap keeps its serial sum; without maxAttempts each check runs once");
  process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES="30";
  try{assert.equal(matrixRunTimeout(workedPlan),1800000,"the cap is configurable");}finally{delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;}
- for(const bad of [{...workedPlan,checks:[]},{checks:[{environment:{}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"1800001"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"0"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:1800000}}]},{maxAttempts:0,checks:workedPlan.checks}])
+ assert.equal(matrixRunTimeout({checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600000"}}]}),5400000,"the one-hour check ceiling is admitted");
+ assert.equal(matrixRunTimeout({maxAttempts:3,checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3000000"}},{environment:{VERIFICATION_TIMEOUT_MS:"240000"}}]}),7200000,"the prescribed limits still clamp to the unchanged holder cap");
+ for(const bad of [{...workedPlan,checks:[]},{checks:[{environment:{}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600001"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"0"}}]},{checks:[{environment:{VERIFICATION_TIMEOUT_MS:1800000}}]},{maxAttempts:0,checks:workedPlan.checks}])
   assert.throws(()=>matrixRunTimeout(bad),e=>/^(Matrix plan has no checks|Invalid matrix check timeout|Invalid matrix attempt limit)$/.test(failureReason(e)));
  // The run passes planRunTimeout to the host lock, which records the clamped value.
  for(const plan of [workedPlan,{checks:[{environment:{VERIFICATION_TIMEOUT_MS:"600000"}}]}]){
@@ -751,7 +753,7 @@ test("a8 a10 the deployer's run bound is the serial sum under the holder cap, th
  assert.deepEqual(h.matrix().map(c=>[c.argv[2],c.timeout]),[["plan",600000],["run",undefined]],"the run is started, not waited on, so it has no command timeout");
  assert.equal(h.run().boundMs,7200000);assert.equal(h.sends().length,0);
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.sends().length,1);assert.equal(h.run().reason,"receipt");
- const bad=matrixHost({plan:{maxAttempts:3,checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600000"}}]}});
+ const bad=matrixHost({plan:{maxAttempts:3,checks:[{environment:{VERIFICATION_TIMEOUT_MS:"3600001"}}]}});
  await assert.rejects(bad.adapter.verifyIntegrated(bad.integrated),reasonIs("Invalid matrix check timeout"));assert.deepEqual(bad.matrix().map(c=>c.argv[2]),["plan"]);
  assert.ok(!existsSync(join(attemptDir(bad.home,bad.integrated.integratedCommit,0),"run.json")));
  const failing=matrixHost({receipt:{environment:{},checks:[{exitCode:1}]}});

@@ -162,7 +162,7 @@ test("ownership union diff selects all engines, migration and touched race packa
     "go",
     "test",
     "-race",
-    "-timeout=25m",
+    "-timeout=29m",
     "./internal/store",
   ]);
   for (const suite of matrix.browserSuites)
@@ -877,7 +877,7 @@ test("removed Go package is excluded from candidate race targets", () => {
     "go",
     "test",
     "-race",
-    "-timeout=25m",
+    "-timeout=29m",
     "./...",
   ]);
 });
@@ -943,7 +943,7 @@ test("approved matrix records default, per-check timeout and required fixed port
   );
   assert.equal(
     checks.find((c) => c.id === "npm-unit").environment.VERIFICATION_TIMEOUT_MS,
-    "120000",
+    "240000",
   );
   assert.equal(
     checks.find((c) => c.id === "tests/browser.mjs:chromium").environment
@@ -973,6 +973,46 @@ test("approved matrix records default, per-check timeout and required fixed port
       ),
     /timeout/,
   );
+});
+
+test("matrix selection admits one-hour check timeouts and refuses higher or invalid values", () => {
+  for (const timeout of [3000000, 3600000]) {
+    for (const limits of [
+      { defaultTimeoutMs: timeout, checkTimeoutMs: {} },
+      { checkTimeoutMs: { "npm-unit": timeout } },
+    ]) {
+      const checks = selectChecks({ ...matrix, ...limits }, ["docs/readme.md"], []);
+      assert.equal(checks[0].environment.VERIFICATION_TIMEOUT_MS, String(timeout));
+    }
+  }
+  for (const timeout of [3600001, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "3600000"]) {
+    for (const limits of [
+      { defaultTimeoutMs: timeout, checkTimeoutMs: {} },
+      { checkTimeoutMs: { "npm-unit": timeout } },
+    ])
+      assert.throws(
+        () => selectChecks({ ...matrix, ...limits }, ["docs/readme.md"], []),
+        /Invalid matrix check timeout: npm-unit/,
+      );
+  }
+});
+
+test("check execution admits a one-hour timer and rejects higher or invalid timers before launch", async () => {
+  const check = (timeout) => ({
+    id: "timeout-boundary",
+    argv: [process.execPath, "-e", 'console.log("boundary child ran")'],
+    cwd: ".",
+    environment: { VERIFICATION_TIMEOUT_MS: String(timeout) },
+  });
+  const result = await runCheck(check(3600000), process.cwd(), { PATH: process.env.PATH });
+  assert.equal(result.status, 0);
+  assert.equal(result.failureReason, "");
+  assert.equal(result.stdout.trim(), "boundary child ran");
+  for (const timeout of [3600001, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "invalid"])
+    await assert.rejects(
+      runCheck(check(timeout), process.cwd(), { PATH: process.env.PATH }),
+      /Invalid approved check timeout/,
+    );
 });
 
 test("occupied required port reports its PID and never starts or kills a listener", async (t) => {
@@ -1728,13 +1768,13 @@ test("non-Go check process groups run at the lower priority and Go checks do not
 // Owner decision #15114: the approved matrix carries go test's package
 // timeout for go-test and go-race only.
 test("approved goTestFlags reach only go-test and go-race, and only as a timeout", () => {
-  assert.deepEqual(matrix.goTestFlags, ["-timeout=25m"]);
+  assert.deepEqual(matrix.goTestFlags, ["-timeout=29m"]);
   const checks = selectChecks(matrix, ["hub/internal/store/migrate.go"], []);
   const argv = (id) => checks.find((c) => c.id === id).argv;
-  assert.deepEqual(argv("go-test"), ["go", "test", "-timeout=25m", "./..."]);
-  assert.deepEqual(argv("go-race"), ["go", "test", "-race", "-timeout=25m", "./internal/store"]);
+  assert.deepEqual(argv("go-test"), ["go", "test", "-timeout=29m", "./..."]);
+  assert.deepEqual(argv("go-race"), ["go", "test", "-race", "-timeout=29m", "./internal/store"]);
   assert.deepEqual(argv("go-vet"), ["go", "vet", "./..."]);
-  assert(!argv("migration-rehearsal").includes("-timeout=25m"));
+  assert(!argv("migration-rehearsal").includes("-timeout=29m"));
   const { goTestFlags, ...legacy } = matrix;
   assert.deepEqual(
     selectChecks(legacy, ["hub/cmd/tt/main.go"], []).find((c) => c.id === "go-test").argv,
@@ -2572,7 +2612,7 @@ test("an accepted check that differs any other way, or is not selected, refuses 
     checks.find((c) => c.id === "go-vet").argv = ["true"];
   }, /^Error: Accepted check differs from the selected one: go-vet$/);
   refused((checks) => {
-    checks.find((c) => c.id === "go-race").argv.splice(3, 0, "-timeout=25m");
+    checks.find((c) => c.id === "go-race").argv.splice(3, 0, "-timeout=29m");
   }, /^Error: Accepted check differs from the selected one: go-race$/);
   refused((checks) => {
     checks.find((c) => c.id === "go-race").environment.VERIFICATION_TIMEOUT_MS = "1";
