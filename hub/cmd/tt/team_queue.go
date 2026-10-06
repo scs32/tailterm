@@ -848,22 +848,12 @@ func queueReleaseRequest(ctx context.Context, c *api.Client, hub, task string, q
 // The verification host's lock and waitlist: the JSON file
 // scripts/verify-matrix-host-lock.mjs keeps on the machine that runs the
 // matrix (docs/objective-verification.md, "Host lock and waitlist"). The list
-// reads it without the file's mutex; updates land by rename.
-type matrixHostEntry struct {
-	PID         int64  `json:"pid"`
-	Kind        string `json:"kind"`
-	Item        string `json:"item"`
-	Agent       string `json:"agent"`
-	Priority    string `json:"priority"`
-	RequestedAt string `json:"requestedAt"`
-}
+// reads it without the file's mutex; updates land by rename. These are the
+// queue view's names for the shared lock types (matrix_wait_activity.go): a
+// version 1 holder or the version 2 holders, and the ordered waiters.
+type matrixHostEntry = matrixLockEntry
 
-type matrixWaitlist struct {
-	Version int               `json:"version"`
-	Host    string            `json:"host"`
-	Holder  *matrixHostEntry  `json:"holder"`
-	Waiters []matrixHostEntry `json:"waiters"`
-}
+type matrixWaitlist = matrixLockFile
 
 var matrixLocalHost = os.Hostname
 
@@ -910,18 +900,15 @@ func readMatrixWaitlist() (*matrixWaitlist, string) {
 	if err != nil {
 		return unusable("unreadable")
 	}
-	var list matrixWaitlist
-	if json.Unmarshal(raw, &list) != nil {
-		return unusable("not JSON")
-	}
-	if list.Version != 1 {
-		return unusable("unknown version")
+	list, reason := parseMatrixLock(raw)
+	if list == nil {
+		return unusable(reason)
 	}
 	local, _ := matrixLocalHost()
 	if matrixHostLabel(list.Host) != matrixHostLabel(local) {
 		return nil, fmt.Sprintf("matrix host: lock file %s belongs to host %s; waitlist not shown", path, matrixName(list.Host))
 	}
-	return &list, ""
+	return list, ""
 }
 
 // waitLines is one line per run of the entry's item that waits for the
@@ -931,8 +918,12 @@ func (m *matrixWaitlist) waitLines(q api.TeamQueueEntry) []string {
 		return nil
 	}
 	holder := "none"
-	if h := m.Holder; h != nil {
-		holder = fmt.Sprintf("%s/%s/pid %d", matrixName(h.Item), matrixName(h.Agent), h.PID)
+	if len(m.Holders) > 0 {
+		names := make([]string, len(m.Holders))
+		for i, h := range m.Holders {
+			names[i] = fmt.Sprintf("%s/%s/pid %d", matrixName(h.Item), matrixName(h.Agent), h.PID)
+		}
+		holder = strings.Join(names, ",")
 	}
 	var lines []string
 	for i, w := range m.Waiters {

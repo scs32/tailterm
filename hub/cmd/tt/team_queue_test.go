@@ -1155,6 +1155,42 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 		t.Fatalf("no waiter must add nothing:\n%s", out)
 	}
 
+	// q1, q2 (wi_dacc0b35ff1cec85): a version 2 lock names every holder, in
+	// the file's order, on each waiting entry's line.
+	writeV2 := func(holders []map[string]any, waiters ...map[string]any) {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{"version": 2, "host": "Stephens-Mini.local", "requestSeq": 9, "grantSeq": 3, "holders": holders, "waiters": waiters})
+		if err != nil || os.WriteFile(path, raw, 0o600) != nil {
+			t.Fatal("write lock file")
+		}
+	}
+	second := map[string]any{"id": "h2", "pid": 778, "kind": "targeted", "item": "wi_second", "agent": "verifier-4", "priority": "normal", "startedAt": "2026-10-01T14:01:00.000Z", "groups": []int{}}
+	writeV2([]map[string]any{holder, second}, waiter("wi_someone_else", "urgent", "run", "verifier-2"), waiter(waitingItem.ID, "high", "run", "deployer"), waiter(waitingItem.ID, "normal", "targeted", "verifier-9"))
+	out = list()
+	holders := "holder=wi_holder/verifier-1/pid 777,wi_second/verifier-4/pid 778"
+	wantV2 := []string{
+		"  waiting-for-matrix position=2 of 3 " + holders + " priority=high kind=run agent=deployer since=2026-10-01T14:05:00.000Z",
+		"  waiting-for-matrix position=3 of 3 " + holders + " priority=normal kind=targeted agent=verifier-9 since=2026-10-01T14:05:00.000Z",
+	}
+	if got := lines(out); len(got) != 2 || got[0] != wantV2[0] || got[1] != wantV2[1] {
+		t.Fatalf("version 2 lines %q, want %q:\n%s", got, wantV2, out)
+	}
+	if at := strings.Index(out, wantV2[0]+"\n"+wantV2[1]+"\n"); at < strings.Index(out, waitingItem.ID) || at > strings.Index(out, remote.ID) {
+		t.Fatalf("the version 2 lines must follow their entry:\n%s", out)
+	}
+	if got := listJSON(); got != plainJSON {
+		t.Fatalf("--json must be unchanged for version 2:\n%s", got)
+	}
+	// Version 2 with no holder is a free host, and with no waiter adds nothing.
+	writeV2([]map[string]any{}, waiter(waitingItem.ID, "high", "run", "deployer"))
+	if got := lines(list()); len(got) != 1 || !strings.Contains(got[0], "position=1 of 1 holder=none priority=high kind=run agent=deployer") {
+		t.Fatalf("version 2 free host lines %q", got)
+	}
+	writeV2([]map[string]any{holder, second})
+	if out := list(); out != plain {
+		t.Fatalf("version 2 with no waiter must add nothing:\n%s", out)
+	}
+
 	// a7: each no-waitlist case is one named line, exit 0, entries intact.
 	oneLine := func(what, want string) {
 		t.Helper()
@@ -1171,7 +1207,7 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 	}
 	write("TrueNAS.local", 1, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
 	oneLine("other host", "matrix host: lock file "+path+" belongs to host TrueNAS.local; waitlist not shown")
-	write("Stephens-Mini.local", 2, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
+	write("Stephens-Mini.local", 3, holder, waiter(waitingItem.ID, "high", "run", "deployer"))
 	oneLine("unknown version", "matrix host: lock file "+path+" unusable (unknown version); waitlist not shown")
 	if os.WriteFile(path, []byte("{not json"), 0o600) != nil {
 		t.Fatal("write")
