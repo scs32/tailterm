@@ -20,6 +20,26 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 			t.Errorf("%s hook missing or wrong: %+v", ev, v.Hooks[ev])
 		}
 	}
+	// The tool-call ledger: one unmatched group per tool event, so every
+	// tool call runs tt hook tool.
+	var raw struct {
+		Hooks map[string][]map[string]json.RawMessage
+	}
+	if err := json.Unmarshal([]byte(ClaudeHooks("/usr/local/bin/tt")), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Hooks) != 7 {
+		t.Errorf("fragment wires %d events; want 7", len(raw.Hooks))
+	}
+	for _, ev := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"} {
+		if len(v.Hooks[ev]) != 1 || len(v.Hooks[ev][0].Hooks) != 1 || v.Hooks[ev][0].Hooks[0].Type != "command" || v.Hooks[ev][0].Hooks[0].Command != "/usr/local/bin/tt hook tool" {
+			t.Errorf("%s hook missing or wrong: %+v", ev, v.Hooks[ev])
+			continue
+		}
+		if _, restricted := raw.Hooks[ev][0]["matcher"]; restricted || len(raw.Hooks[ev][0]) != 1 {
+			t.Errorf("%s group is not a bare hooks list: %s", ev, raw.Hooks[ev][0])
+		}
+	}
 	if !strings.Contains(CodexConfig("tt"), `notify = ["tt", "hook", "codex"]`) {
 		t.Error("codex config wrong")
 	}

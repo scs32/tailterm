@@ -528,6 +528,44 @@ func TestHostSetupMergesHooks(t *testing.T) {
 	}
 }
 
+// The tool-call ledger events: each gets one unmatched tt hook tool group
+// beside the user's own matched PreToolUse entry, a tt entry a matcher would
+// restrict is moved out of it, and a second run changes nothing.
+func TestHostSetupInstallsToolHooks(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	s.write(s.p.claudeSettings, `{"hooks":{
+		"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"guard.sh"},{"type":"command","command":"/old/tt hook tool"}]}],
+		"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"tt hook tool"}]}]
+	}}`, 0o600)
+	out := s.mustRun("--from", s.artifact("tt-v1"))
+	s.requireCanonicalHooks()
+	tool := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool")}}}
+	hooks := decodeJSONFile(t, s.p.claudeSettings)["hooks"].(map[string]any)
+	for event, want := range map[string][]any{
+		"PreToolUse":         {map[string]any{"matcher": "Bash", "hooks": []any{map[string]any{"type": "command", "command": "guard.sh"}}}, tool},
+		"PostToolUse":        {tool},
+		"PostToolUseFailure": {tool},
+	} {
+		if got := hooks[event]; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s after setup:\n got %v\nwant %v", event, got, want)
+		}
+	}
+	if len(hooks) != len(claudeHookEvents) {
+		t.Errorf("settings wire %d events; want %d", len(hooks), len(claudeHookEvents))
+	}
+	if !strings.Contains(out, "updated    claude-hooks") {
+		t.Fatalf("tool hooks not reported as updated:\n%s", out)
+	}
+	before := s.tree()
+	if out := s.mustRun("--from", s.artifact("tt-v1")); !strings.Contains(out, "current    claude-hooks") {
+		t.Fatalf("a second run did not report the hooks current:\n%s", out)
+	}
+	if after := s.tree(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("a second run changed files:\nbefore %v\nafter  %v", before, after)
+	}
+}
+
 func TestHostSetupHookStaleEntries(t *testing.T) {
 	s := newHostSandbox(t, "home")
 	s.holdRelayLock()

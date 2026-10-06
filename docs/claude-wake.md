@@ -96,3 +96,82 @@ failed replacement stays ineligible and shows the SSH failure.
 Acceptance uses a private tmux socket and a PTY/SIGWINCH program through fixture
 SSH in both engines of `tests/static-browser.mjs`, plus controller, command, spawn
 and relay regressions. No live owner/agent sessions are test fixtures.
+
+## Tool-call ledger
+
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendment #25980 and answers #25999 and #26032, builder assignment #26043. This source change is a candidate.
+
+Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
+
+### Hooks
+
+`tt hooks claude` prints, and `tt host setup` installs into the user-level Claude `settings.json`, three more events: `PreToolUse`, `PostToolUse` and `PostToolUseFailure`. Each runs `tt hook tool` in a group with no matcher, so every tool is seen. Host setup keeps the user's own entries for these events, for example a `PreToolUse` group with a `Bash` matcher, and moves a `tt hook tool` entry out of a matcher group.
+
+`tt hook tool` can never deny, delay, rewrite or fail a tool call:
+
+- It writes nothing to stdout or stderr, so Claude Code has no decision to read.
+- It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
+- It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
+- The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
+- Outside a Tailterm agent session (no `TAILTERM_AGENT`, `TAILTERM_TASK` or hub) it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
+
+Assumptions behind the 200 ms, not changed by this feature: before any hook runs, `tt` sets `PATH` and reads the small local file `~/.config/tailterm/hub.json` with no deadline, as every `tt` command and the four existing hooks do. A home directory on a stalled filesystem would hold all of them. The first run of a newly installed `tt` binary on macOS can take longer once (358 ms was measured for a freshly built binary, then 6 to 8 ms, and about 160 ms with stdin held open).
+
+When the 150 ms runs out, that invocation writes nothing more. A pre cut off leaves nothing. A post cut off before it claims its pending entry leaves the entry, which later becomes an `unknown` row; a post cut off between claiming the entry and appending the row loses that row.
+
+### Where the rows are
+
+`~/.local/state/tailterm/tool-ledger/<agent id>/`, beside the relay state:
+
+- `ledger.jsonl`: the rows, one JSON object per line.
+- `ledger.jsonl.1`: the previous file after a rotation. Nothing older is kept.
+- `ledger.lock`: the lock for appends and rotation.
+- `pending/`: one small file per call that has started and not finished.
+
+Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `tool-ledger` directory; tests use it.
+
+### Row fields
+
+| Field | Meaning |
+| --- | --- |
+| `v` | 1 |
+| `time` | UTC RFC 3339 time the row was written |
+| `task`, `agent`, `run` | `TAILTERM_TASK`, `TAILTERM_AGENT` and `TAILTERM_RUN` of the session |
+| `session` | Claude Code `session_id` |
+| `tool` | `tool_name`, cut to 128 bytes |
+| `toolUseId` | `tool_use_id`, cut to 128 bytes |
+| `argsDigest` | lower-case hex SHA-256 of `tool_input` after it is decoded and encoded again by Go's `encoding/json` (object keys sorted, numbers kept as written); empty when there is no `tool_input` |
+| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use) |
+| `durationMs`, `durationSource` | `duration_ms` from Claude Code (`claude`), else the time since the call's pre hook (`measured`), else absent |
+| `oversize` | `true` only when the input passed the 8 MiB cap |
+
+Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
+
+Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table.
+
+### Pairing and bounds
+
+A pre hook writes a pending file of at most 512 bytes with the start time, session, tool-use id, tool name and digest. The post or failure hook removes it and writes the row; the process whose remove succeeds owns the entry. A call with a tool-use id is paired by session and id. A call without one gets its own file in a per-session queue, and a post claims the session's oldest entry with the same tool and digest, so identical overlapping calls pair in start order. A post with no pending entry still writes its row from its own input.
+
+- Input: at most 8 MiB of stdin is read. A larger input, malformed JSON or an event other than the three gives one `unreadable` row with the identity fields and `time` only, and no pending file is created or claimed. So a call whose post is above 8 MiB shows as one `unreadable` row then and one `unknown` row later.
+- Pending: before a pre creates its file, entries older than 24 hours and the oldest entries beyond 255 are each written as an `unknown` row and removed, at most 32 per invocation. After any pre there are at most 256 pending files per agent. Pres racing in parallel can pass that by the number racing; the next pre brings it back.
+- Ledger: every append takes `flock` on `ledger.lock`, retrying every 2 ms for at most 50 ms. Under the lock the size is read again, and a `ledger.jsonl` of 4 MiB or more is renamed over `ledger.jsonl.1` before the row is appended in one write. If the lock is not obtained the row is appended without rotating. One agent therefore holds about 8 MiB at most.
+
+### Known limits
+
+- A denied or abandoned call has a pre and no post. It appears as `unknown` only when a later pre evicts it.
+- The digest is unsalted. It hides content, but a short guessable argument such as `ls` can be confirmed by hashing a guess.
+- A reader must tolerate a torn last line if a hook is killed during its write.
+- Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
+- The owner helper's session has an agent identity, so its calls are recorded, with an empty `run`.
+- Hub upload, deny or rewrite rules and budget caps are not part of this version.
+
+The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. They were not confirmed by a live run: the isolated check needs a private `CLAUDE_CONFIG_DIR`, and Claude Code is not signed in under one (`Not logged in`).
+
+### Activation and rollback
+
+- The hooks reach the Mini when a release's Mini target runs `tt host setup --from ARTIFACT`, which installs the new `tt` and merges the three events into `~/.claude/settings.json`. Nothing is active before that step. Any other host gets them only when host setup is run there.
+- That file is the user-level settings, so from then every Claude Code session started on the host runs `tt hook tool` on every tool call, the owner's own sessions included. Only sessions with a Tailterm agent identity write rows.
+- Sessions already running when the file changes: the order says they are not changed. Whether Claude Code 2.1.291 applies hooks added to `settings.json` under a running session was not observed, for the sign-in reason above. Treat it as unknown until it is checked.
+- `tt host setup --rollback` restores the previous `tt` and does not touch hooks, so the three entries stay. The previous `tt` has no `tool` hook: in a Tailterm agent session it prints `tt: unknown hook "tool"` to stderr and exits 1 on every tool call, which Claude Code is documented to treat as a non-blocking hook error (not checked here). Outside an agent session it still exits 0 silently. To stop that after a rollback, delete the `tt hook tool` groups under `PreToolUse`, `PostToolUse` and `PostToolUseFailure` in `~/.claude/settings.json`; the next host setup puts them back.
+- `tt doctor` still checks only the four earlier hooks.

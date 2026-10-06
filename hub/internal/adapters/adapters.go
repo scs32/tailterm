@@ -75,15 +75,20 @@ func ParseHookCommand(cmd string) (exe, name string, ok bool) {
 }
 
 // ClaudeHooks returns a Claude Code settings.json fragment wiring tt hooks.
+// The three tool events run the observe-only tool-call ledger (tt hook tool)
+// with no matcher, so every tool call is seen.
 func ClaudeHooks(tt string) string {
 	hook := func(name string) map[string]any {
 		return map[string]any{"hooks": []map[string]any{{"type": "command", "command": HookCommand(tt, name)}}}
 	}
 	settings := map[string]any{"hooks": map[string]any{
-		"SessionStart":     []map[string]any{hook("session-start")},
-		"UserPromptSubmit": []map[string]any{hook("prompt")},
-		"Stop":             []map[string]any{hook("stop")},
-		"Notification":     []map[string]any{hook("notification")},
+		"SessionStart":       []map[string]any{hook("session-start")},
+		"UserPromptSubmit":   []map[string]any{hook("prompt")},
+		"Stop":               []map[string]any{hook("stop")},
+		"Notification":       []map[string]any{hook("notification")},
+		"PreToolUse":         []map[string]any{hook("tool")},
+		"PostToolUse":        []map[string]any{hook("tool")},
+		"PostToolUseFailure": []map[string]any{hook("tool")},
 	}}
 	b, _ := json.MarshalIndent(settings, "", "  ")
 	return string(b) + "\n"

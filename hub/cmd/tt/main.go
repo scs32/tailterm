@@ -1721,6 +1721,11 @@ func cmdHook(e env, args []string) error {
 	if e.agent == "" || e.task == "" || e.hub == "" {
 		return nil
 	}
+	// A registered handler reads stdin itself, under its own deadline.
+	if h := hookHandlers[args[0]]; h != nil {
+		h(e, args)
+		return nil
+	}
 	var input map[string]any
 	if args[0] == "codex" && len(args) > 1 {
 		input = spawn.ReadJSON([]byte(args[1]))
