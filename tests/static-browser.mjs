@@ -1027,6 +1027,58 @@ try {
   assert.equal(await page.locator("html").getAttribute("data-theme"), "tokyo");
   await finishRestoration(page);
   console.log("Backup and lock/unlock restoration passed.");
+  // Lock saves the workspace as it was when pressed. A change made after that
+  // is dropped: the reload after the vault locks must not write to it. Hold
+  // the vault's encryption so Lock's own save stays pending while a second
+  // filter changes.
+  const savedFilter = page
+    .locator(".server-item")
+    .filter({ hasText: "Home lab" });
+  const lateFilter = page
+    .locator(".server-item")
+    .filter({ hasText: "Archive" });
+  await page.evaluate(() => {
+    const encrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    globalThis.__heldSaves = 0;
+    globalThis.__saveGate = new Promise((release) => {
+      globalThis.__releaseSaves = release;
+    });
+    crypto.subtle.encrypt = async (...args) => {
+      globalThis.__heldSaves++;
+      await globalThis.__saveGate;
+      return encrypt(...args);
+    };
+  });
+  await savedFilter.click();
+  await page.locator("#lock").click();
+  await page.waitForFunction(() => globalThis.__heldSaves > 0);
+  await lateFilter.click();
+  assert.equal(await lateFilter.getAttribute("aria-pressed"), "true");
+  await page.evaluate(() => globalThis.__releaseSaves());
+  await page.locator("#lockscreen").waitFor();
+  await page.locator("#password").fill("static browser vault passphrase");
+  await page.locator("#unlock-button").click();
+  await page.locator("#workspace").waitFor();
+  await finishRestoration(page);
+  assert.deepEqual(
+    errors,
+    [],
+    "Locking with a late change raises no page error",
+  );
+  assert.equal(
+    await savedFilter.getAttribute("aria-pressed"),
+    "true",
+    "A filter changed before Lock was pressed is restored",
+  );
+  assert.equal(
+    await lateFilter.getAttribute("aria-pressed"),
+    "false",
+    "A filter changed after Lock was pressed is not saved",
+  );
+  await page.locator("#all-servers").click();
+  console.log(
+    "Lock saves the workspace as pressed and drops later changes without a page error.",
+  );
   assert.equal(await page.locator("[data-launch-server]").count(), 6);
   await exerciseServerFilters(page);
   await page.setViewportSize({ width: 390, height: 844 });

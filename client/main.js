@@ -2835,6 +2835,9 @@ async function lock() {
   } catch (e) {
     notice("Could not save the latest layout: " + e.message);
   }
+  // The workspace is saved as it was when Lock was pressed. Later changes
+  // are teardown: the reload must not write them to the locked vault.
+  workspaceReady = false;
   clearInterval(heartbeat);
   await persistQueue;
   await api("/lock", "POST", {});
@@ -2884,7 +2887,7 @@ window.addEventListener("keydown", (e) => {
   }
 });
 window.addEventListener("beforeunload", () => {
-  void flushWorkspace();
+  void flushWorkspace().catch(() => {});
 });
 window.addEventListener("pagehide", () => {
   credentialCache.clear();
