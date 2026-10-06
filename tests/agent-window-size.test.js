@@ -914,3 +914,294 @@ test("a resize delivered after hide, dispose or reconnect is put back to the las
     await f.cleanup();
   }
 });
+
+// One private tmux window at 200x50 and a sizer whose numbered commands can be
+// held or lost: "request" never reaches the host, "reply" lands and then fails.
+function lossySizer(f, name) {
+  const binding = valid().binding;
+  f.tmux(
+    "new-session",
+    "-d",
+    "-s",
+    name,
+    "-n",
+    "agent",
+    "-e",
+    "TAILTERM_TASK=" + binding.taskId,
+    "-e",
+    "TAILTERM_AGENT=" + binding.agentId,
+    "-e",
+    "TAILTERM_RUN=" + binding.runId,
+    "sleep 60",
+  );
+  const [id, created] = f
+    .tmux(
+      "display-message",
+      "-p",
+      "-t",
+      name,
+      "#{session_id}|#{session_created}",
+    )
+    .split("|");
+  f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
+  f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
+  const run = (command) => {
+    const r = spawnSync("/bin/sh", ["-c", command], {
+      env: f.env,
+      encoding: "utf8",
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  const s = { ...valid(), target: { id, created }, path: f.wrapper };
+  const sent = [],
+    errors = [],
+    hooks = {};
+  const tokens = [];
+  const sizer = createAgentWindowSizer({
+    snapshot: () => s,
+    token: () =>
+      tokens[
+        tokens.push(
+          (name.replace(/-/g, "_") + "_A_000000000000").slice(0, 30) +
+            String(tokens.length).padStart(2, "0"),
+        ) - 1
+      ],
+    error: (e) => errors.push(e.message),
+    execute: async (command) => {
+      sent.push(command);
+      const hook = hooks[sent.length] || {};
+      await hook.before?.();
+      if (hook.lose === "request") throw Error("transport lost");
+      const out = run(command);
+      if (hook.lose === "reply") throw Error("transport lost");
+      return out;
+    },
+  });
+  return {
+    s,
+    sent,
+    errors,
+    hooks,
+    sizer,
+    get token() {
+      return tokens.at(-1);
+    },
+    run,
+    state: () =>
+      f.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        id + ":agent",
+        "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+      ),
+    hide() {
+      s.visible = false;
+      s.foreground = false;
+      sizer.refresh();
+    },
+    async resize(cols, rows) {
+      s.cols = cols;
+      s.rows = rows;
+      sizer.refresh();
+      await sizer.settled();
+    },
+    async focus() {
+      sizer.refresh({ focus: true });
+      await sizer.settled();
+    },
+    async end() {
+      sizer.dispose();
+      await sizer.settled();
+    },
+  };
+}
+
+test("a restore that is lost, or that follows a lost claim reply, still puts the prior size back and never overwrites a newer viewer", async (t) => {
+  const f = setupAgentWindowFixture();
+  try {
+    for (const transition of ["hide", "dispose"]) {
+      const x = lossySizer(f, "lost-restore-" + transition);
+      try {
+        x.hooks[2] = {
+          before: () => (transition === "hide" ? x.hide() : x.sizer.dispose()),
+        };
+        x.hooks[3] = { lose: "request" };
+        await x.focus();
+        assert.equal(x.state(), "200x50|", transition);
+        assert.equal(x.sent.length, 4, "inspect, claim, lost restore, restore");
+        assert.match(x.sent[3], /-x 200 -y 50 .*restored/);
+        assert.deepEqual(x.errors, [], "a retry that succeeds reports nothing");
+        await x.resize(250, 60);
+        assert.equal(x.sent.length, 4, "no further hidden work");
+        t.diagnostic(`lost restore: ${transition} -> ${x.state()}`);
+      } finally {
+        await x.end();
+      }
+    }
+    const reply = lossySizer(f, "lost-claim-reply");
+    try {
+      reply.hooks[2] = { before: () => reply.hide(), lose: "reply" };
+      await reply.focus();
+      assert.equal(reply.state(), "200x50|");
+      assert.equal(reply.sent.length, 3, "inspect, claim, restore");
+      assert.match(reply.sent[2], /-x 200 -y 50 .*restored/);
+      assert.equal(reply.errors.length, 1);
+      t.diagnostic(`claim reply lost after hide -> ${reply.state()}`);
+    } finally {
+      await reply.end();
+    }
+    const a = lossySizer(f, "lost-restore-newer");
+    const b = { ...a.s, cols: 240, rows: 60 };
+    const B = createAgentWindowSizer({
+      snapshot: () => b,
+      token: () => "lost_restore_newer_B_00000000001",
+      execute: async (command) => a.run(command),
+    });
+    try {
+      a.hooks[2] = { before: () => a.hide() };
+      a.hooks[3] = { lose: "request" };
+      a.hooks[4] = {
+        before: async () => {
+          B.refresh({ focus: true });
+          await B.settled();
+        },
+      };
+      await a.focus();
+      assert.equal(a.state(), "240x59|lost_restore_newer_B_00000000001");
+      assert.equal(a.sent.length, 4, "the superseded retry ends the restore");
+      await a.focus();
+      assert.equal(a.sent.length, 4);
+      assert.equal(a.state(), "240x59|lost_restore_newer_B_00000000001");
+    } finally {
+      B.dispose();
+      await B.settled();
+      await a.end();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a claim or visible resize whose reply is lost is the size put back after a later resize lands past hide", async (t) => {
+  const f = setupAgentWindowFixture();
+  try {
+    const claim = lossySizer(f, "lost-visible-claim");
+    try {
+      claim.hooks[2] = { lose: "reply" };
+      await claim.focus();
+      assert.equal(claim.state(), "120x34|" + claim.token);
+      assert.equal(claim.sent.length, 2, "a visible pane is not restored");
+      claim.hooks[3] = { before: () => claim.hide() };
+      await claim.resize(240, 60);
+      assert.equal(claim.state(), "120x34|");
+      assert.equal(
+        claim.sent.length,
+        5,
+        "inspect, claim, resize, undo, release",
+      );
+      assert.match(claim.sent[2], /-x 240 -y 59 .*sized/);
+      assert.match(claim.sent[3], /-x 120 -y 34 .*sized/);
+      assert.match(claim.sent[4], /released/);
+      t.diagnostic(`claim reply lost while visible -> ${claim.state()}`);
+    } finally {
+      await claim.end();
+    }
+    const resize = lossySizer(f, "lost-visible-resize");
+    try {
+      await resize.focus();
+      resize.hooks[3] = { lose: "reply" };
+      await resize.resize(200, 51);
+      assert.equal(resize.state(), "200x50|" + resize.token);
+      assert.equal(resize.sent.length, 3, "a visible pane is not restored");
+      resize.hooks[4] = { before: () => resize.hide() };
+      await resize.resize(240, 60);
+      assert.equal(resize.state(), "200x50|");
+      assert.match(resize.sent[3], /-x 240 -y 59 .*sized/);
+      assert.match(resize.sent[4], /-x 200 -y 50 .*sized/);
+      assert.match(resize.sent[5], /released/);
+      assert.equal(resize.sent.length, 6);
+      t.diagnostic(`resize reply lost while visible -> ${resize.state()}`);
+    } finally {
+      await resize.end();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a lost corrective resize is retried at once, then reported and kept for the next focus or lifecycle change", async (t) => {
+  const f = setupAgentWindowFixture();
+  try {
+    const once = lossySizer(f, "lost-undo-once");
+    try {
+      await once.focus();
+      once.hooks[3] = { before: () => once.hide() };
+      once.hooks[4] = { lose: "request" };
+      await once.resize(240, 60);
+      assert.equal(once.state(), "120x34|");
+      assert.equal(once.sent.length, 6, "resize, lost undo, undo, release");
+      assert.match(once.sent[4], /-x 120 -y 34 .*sized/);
+      assert.match(once.sent[5], /released/);
+      assert.deepEqual(once.errors, []);
+      t.diagnostic(`corrective resize lost once -> ${once.state()}`);
+    } finally {
+      await once.end();
+    }
+    const twice = lossySizer(f, "lost-undo-twice");
+    try {
+      await twice.focus();
+      twice.hooks[3] = { before: () => twice.hide() };
+      twice.hooks[4] = twice.hooks[5] = { lose: "request" };
+      await twice.resize(240, 60); // settled() resolves with the undo unsent
+      assert.deepEqual(twice.errors, ["transport lost"]);
+      assert.equal(twice.sent.length, 5, "one retry, then no loop");
+      assert.equal(twice.state(), "240x59|" + twice.token);
+      await twice.resize(250, 60);
+      assert.equal(twice.sent.length, 5, "layout alone does not retry");
+      await twice.focus();
+      assert.equal(twice.state(), "120x34|");
+      assert.equal(twice.sent.length, 7, "the kept claim is undone, released");
+      assert.match(twice.sent[5], /-x 120 -y 34 .*sized/);
+      assert.match(twice.sent[6], /released/);
+      await twice.focus();
+      assert.equal(twice.sent.length, 7, "no further hidden work");
+      t.diagnostic(
+        `corrective resize lost twice, next focus -> ${twice.state()}`,
+      );
+    } finally {
+      await twice.end();
+    }
+    // A kept claim neither blocks nor later undoes the pane's own next claim.
+    const shown = lossySizer(f, "lost-undo-shown");
+    try {
+      await shown.focus();
+      const first = shown.token;
+      shown.hooks[3] = { before: () => shown.hide() };
+      for (const n of [4, 5, 6, 7]) shown.hooks[n] = { lose: "request" };
+      await shown.resize(240, 60);
+      shown.s.visible = shown.s.foreground = true;
+      await shown.focus();
+      assert.deepEqual(shown.errors, ["transport lost", "transport lost"]);
+      assert.equal(
+        shown.sent.length,
+        11,
+        "two lost passes, inspect, claim, then the old undo and release",
+      );
+      assert.notEqual(shown.token, first);
+      assert.match(shown.sent[9], /-x 120 -y 34 .*sized/);
+      for (const old of shown.sent.slice(9))
+        assert.ok(old.includes(first), "the old token is superseded");
+      assert.equal(shown.state(), "240x59|" + shown.token);
+      await shown.focus();
+      assert.equal(shown.sent.length, 14, "release, inspect, claim");
+      assert.equal(shown.state(), "240x59|" + shown.token);
+      t.diagnostic(`kept claim, pane shown again -> ${shown.state()}`);
+    } finally {
+      await shown.end();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});

@@ -45,6 +45,11 @@ export function eligibleAgentViewport(s) {
 // before the claim and drops authority, unless a newer viewer has claimed. A
 // resize in transport likewise: if it lands after its pane hid, the size this
 // claim last set while visible is sent again, then the claim is released.
+// A claim or resize whose reply is lost may have landed and is treated as if it
+// had. A retired claim is kept until the host answers its undo and release: one
+// immediate retry, then error() and another attempt when the pane's state next
+// changes. Every command is conditional on the token, so none of this can
+// overwrite a newer viewer.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -53,6 +58,8 @@ export function createAgentWindowSizer({
   schedule = queueMicrotask,
 }) {
   let claim = null,
+    owed = [],
+    owedMark = null,
     pending = false,
     running = false,
     disposed = false;
@@ -86,11 +93,23 @@ export function createAgentWindowSizer({
         const key = identity(s);
         if (
           claim &&
-          (!eligible || claim.key !== key || seenFocus !== focusVersion)
+          (claim.undo ||
+            !eligible ||
+            claim.key !== key ||
+            seenFocus !== focusVersion)
         ) {
-          const previous = claim;
+          owed.push(claim);
           claim = null;
-          await command(previous, "release");
+          owedMark = null;
+        }
+        // Unconfirmed teardowns wait for a focus or lifecycle change, so layout
+        // bursts over a dead link do not repeat them.
+        const mark = JSON.stringify([eligible, key, focusVersion, disposed]);
+        if (owed.length && owedMark !== mark) {
+          owedMark = mark;
+          const waiting = owed;
+          owed = [];
+          for (const c of waiting) if (!(await teardown(c))) owed.push(c);
           pending = true; // recompute after the await; never reuse this snapshot
           continue;
         }
@@ -153,19 +172,14 @@ export function createAgentWindowSizer({
                 cols: current.cols,
                 rows: current.rows,
                 expectedRevision: ready[1] || "",
+                prior: ready[2] && { cols: +ready[2], rows: +ready[3] },
               };
               const outcome = await command(claim, "claim");
               if (outcome === "superseded") continue;
-              if (outcome === "sized" && !stale(key))
+              // A lost reply (no outcome) may be a claim that landed.
+              if (!stale(key))
                 claim.sized = { cols: claim.cols, rows: claim.rows };
-              else if (outcome === "sized" && ready[2]) {
-                const obsolete = claim;
-                claim = null;
-                await command(
-                  { ...obsolete, cols: +ready[2], rows: +ready[3] },
-                  "restore",
-                );
-              }
+              else if (claim.prior) claim.undo = "restore";
               break;
             }
           } catch (e) {
@@ -177,15 +191,13 @@ export function createAgentWindowSizer({
           claim.cols = s.cols;
           claim.rows = s.rows;
           const outcome = await command(claim, "resize");
-          if (outcome === "sized") {
+          // A lost reply (no outcome) may be a resize that landed.
+          if (outcome !== "superseded") {
             if (!stale(key))
               claim.sized = { cols: claim.cols, rows: claim.rows };
-            else if (claim.sized) {
-              // The same token sends the size it last set while visible, so
-              // a newer viewer still wins; the next pass releases the claim.
-              Object.assign(claim, claim.sized);
-              await command(claim, "resize");
-            }
+            // The next pass retires the claim and puts the visible size back.
+            else if (claim.sized) claim.undo = "resize";
+            else if (claim.prior) claim.undo = "restore";
           }
           pending = true;
         }
@@ -194,7 +206,26 @@ export function createAgentWindowSizer({
       running = false;
     }
   }
-  async function command(c, action) {
+  // Undo what landed after the pane went stale, then drop authority. False
+  // while the host has not answered a step; the claim is then kept.
+  async function teardown(c) {
+    if (c.undo === "restore") return confirmed({ ...c, ...c.prior }, "restore");
+    if (c.undo === "resize") {
+      // The same token sends the size it last set while visible, so a newer
+      // viewer still wins.
+      if (!(await confirmed({ ...c, ...c.sized }, "resize"))) return false;
+      c.undo = null;
+    }
+    return confirmed(c, "release");
+  }
+  // One immediate retry; only the last failure is reported. It does not stop
+  // the visible pane from claiming again.
+  async function confirmed(c, action) {
+    return !!(
+      (await command(c, action, () => {})) || (await command(c, action, error))
+    );
+  }
+  async function command(c, action, report = fail) {
     try {
       const response = (
         await execute(agentWindowSizeCommand({ ...c, action }, c.path))
@@ -204,10 +235,13 @@ export function createAgentWindowSizer({
       // Keep a superseded token locally: resize must not reclaim authority.
       return response;
     } catch (e) {
-      failed = true;
-      error(e);
+      report(e);
       // Retain the token so a later hide can release an uncertain claim.
     }
+  }
+  function fail(e) {
+    failed = true;
+    error(e);
   }
   return {
     refresh,
