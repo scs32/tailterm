@@ -130,9 +130,11 @@ the run. A dialog that differs, such as a permission dialog for another
 command, posts again.
 
 The item's lead gets the same notice only when the agent belongs to an item
-team, is not `done`, and has at least one open obligation that needs more than
-delivery (an assign, request, review, question or block it has not closed).
-The owner is always told. The lead's own prompt goes to the owner only.
+team and has at least one open obligation that needs more than delivery (an
+assign, request, review, question or block it has not closed). The agent's
+status is not consulted, so a `done` agent woken for new work still notifies
+its lead. The owner is always told. The lead's own prompt goes to the owner
+only.
 
 Limits:
 

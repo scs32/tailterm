@@ -223,7 +223,9 @@ func TestRuntimePromptEscalation(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT count(*) FROM runtime_prompt_escalations WHERE agent_id=?`, member.ID).Scan(&rows); err != nil || rows != 4 {
 		t.Fatalf("escalation rows %d %v", rows, err)
 	}
-	// A done member still has its open request; only the owner is told.
+	// A done member still has its open request, so the lead is told too:
+	// status changes only when the agent posts an event, and a done agent
+	// woken for new work stays done until it does.
 	if _, err := s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: member.ID, RunID: member.RunID, Kind: api.EventDone}, by); err != nil {
 		t.Fatal(err)
 	}
@@ -234,20 +236,23 @@ func TestRuntimePromptEscalation(t *testing.T) {
 	afterDone := *permission
 	afterDone.Fingerprint = "33333333333333333333333333333333"
 	send("done-member", "runtime_prompt", &afterDone)
-	expect("done member", 5, 4)
-	// A running member that owes nothing: a notice obliges only delivery.
-	idle := add("member-two")
-	if _, err := s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: idle.ID, RunID: idle.RunID, Kind: api.EventRunning}, by); err != nil {
-		t.Fatal(err)
+	expect("done member with open work", 5, 5)
+	// A member that owes nothing, done or running: a notice obliges only
+	// delivery, so only the owner is told.
+	for i, kind := range []string{api.EventDone, api.EventRunning} {
+		idle := add("idle-" + kind)
+		if _, err := s.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: idle.ID, RunID: idle.RunID, Kind: kind}, by); err != nil {
+			t.Fatal(err)
+		}
+		ask(idle, api.EnvelopeKindNotice, api.EnvelopeBody{Text: "Wait for your assignment"})
+		if _, err := s.ReportActivity(ctx, task.ID, idle.ID, api.ActivityReport{RequestID: "no-obligation-" + kind, RunID: idle.RunID, Activity: api.AgentActivity{State: "runtime_prompt", ObservedAt: now, Prompt: permission}}); err != nil {
+			t.Fatal(err)
+		}
+		expect(kind+" member with no open work obligation", 6+i, 5)
 	}
-	ask(idle, api.EnvelopeKindNotice, api.EnvelopeBody{Text: "Wait for your assignment"})
-	if _, err := s.ReportActivity(ctx, task.ID, idle.ID, api.ActivityReport{RequestID: "no-obligation", RunID: idle.RunID, Activity: api.AgentActivity{State: "runtime_prompt", ObservedAt: now, Prompt: permission}}); err != nil {
-		t.Fatal(err)
-	}
-	expect("member with no open work obligation", 6, 4)
 	// The lead's own prompt reaches only the owner.
 	if _, err := s.ReportActivity(ctx, task.ID, lead.ID, api.ActivityReport{RequestID: "lead-prompt", RunID: lead.RunID, Activity: api.AgentActivity{State: "runtime_prompt", ObservedAt: now, Prompt: permission}}); err != nil {
 		t.Fatal(err)
 	}
-	expect("lead prompt", 7, 4)
+	expect("lead prompt", 8, 5)
 }

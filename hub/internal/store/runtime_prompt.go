@@ -117,7 +117,7 @@ func (s *Store) SetRuntimePromptPolicy(ctx context.Context, task string, req api
 
 // postRuntimePromptEscalation tells the owner that an agent is waiting on a
 // runtime prompt a person must answer, and the item lead too when that agent
-// is not done and has an open work obligation. It posts once per agent run
+// has an open work obligation, whatever its status. It posts once per agent run
 // and prompt fingerprint: repeats, replays, prompt flaps and relay restarts
 // find the existing row and post nothing.
 func (s *Store) postRuntimePromptEscalation(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
@@ -148,12 +148,9 @@ func (s *Store) postRuntimePromptEscalation(ctx context.Context, tx *sql.Tx, tas
 	if err != nil {
 		return err
 	}
-	name, status := agent, ""
-	if a, loadErr := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agent)); loadErr == nil {
-		status = a.Status
-		if a.Name != "" {
-			name = a.Name
-		}
+	name := agent
+	if a, loadErr := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agent)); loadErr == nil && a.Name != "" {
+		name = a.Name
 	}
 	refs := map[string]string{"agent": agent, "run": run, "activity": activity.State, "promptKind": p.Kind}
 	if item != "" {
@@ -168,9 +165,10 @@ func (s *Store) postRuntimePromptEscalation(ctx context.Context, tx *sql.Tx, tas
 	if err := s.postBrokerNotice(ctx, tx, project, api.Agent{}, "", subject, subject, text, refs); err != nil {
 		return err
 	}
-	// A lead can do nothing about a prompt on an agent that is done or owes
-	// no work, so that notice would only cost it a turn.
-	if leadID != "" && leadID != agent && status != api.AgentDone {
+	// A lead can do nothing about a prompt on an agent that owes no work, so
+	// that notice would only cost it a turn. Open work decides, not status: a
+	// done agent woken for new work stays done until it posts an event.
+	if leadID != "" && leadID != agent {
 		var owed int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE task_id=? AND agent_id=? AND recipient_kind=? AND needs<>? AND state<>?`,
 			task, agent, api.ObligationRecipientAgent, api.ObligationNeedsDelivery, api.ObligationClosed).Scan(&owed); err != nil {
