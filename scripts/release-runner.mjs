@@ -1004,15 +1004,20 @@ export function prepareCode(cwd,published){
 }
 // The gate serveDeployment consults before every claim; only the daemon entry
 // builds it, and tests replace its parts. exec replaces this process image
-// (same pid, parent, agent and run) and returns only in tests. noticed and
-// said hold what this process already posted and printed.
+// (same pid, parent, agent and run) and returns only in tests, or when a stop
+// signal arrived first: the new image would not know it was told to stop.
+// noticed and said hold what this process already posted and printed.
+const stopSignalTurn=()=>new Promise(done=>setImmediate(()=>setImmediate(done)));
 export function runnerCodeGate(over={}){
   const from=process.env.TAILTERM_RUNNER_REEXEC_FROM;
   return {loaded:LOADED_CODE,marker:process.env.TAILTERM_RUNNER_REEXEC||null,restartedFrom:HEX64.test(from||"")?from:null,
     published:publishedCode,prepare:prepareCode,now:()=>Date.now(),execve:(file,argv,env)=>process.execve(file,argv,env),
-    async exec(published){
+    async exec(published,signal){
       // Whatever this process printed reaches a piped terminal before it is replaced.
       await new Promise(done=>{setTimeout(done,1000).unref();process.stderr.write("",()=>done());});
+      // A signal that arrived during this poll's synchronous work is handled
+      // only once the event loop turns, so it is given that turn.
+      await stopSignalTurn();if(signal?.aborted)return;
       this.execve(process.execPath,[process.execPath,...process.execArgv,...process.argv.slice(1)],{...process.env,TAILTERM_RUNNER_REEXEC:published.digest,TAILTERM_RUNNER_REEXEC_FROM:this.loaded.digest});
     },
     noticed:new Set(),said:new Set(),...over};
@@ -1264,6 +1269,9 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       // A re-exec that failed in this process is not tried again for the same
       // published code, so its refusal is not rewritten on every poll.
       if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
+      // A runner told to stop does not restart: nothing below moves the
+      // checkout, replaces the process or claims once the signal is set.
+      if(decision.state==="restart"){await stopSignalTurn();if(signal?.aborted)return;}
       if(decision.state==="restart"){
         try{code.prepare(config.cwd,published);}
         catch(error){const reason=failureReason(error);decision={state:"refused",reason:CODE_REASONS.includes(reason)?reason:"checkout-failed"};}
@@ -1271,7 +1279,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       if(decision.state==="restart"){
         // Recorded and announced first: a successful exec never returns.
         codeNotify(reader,codeRecord(config,code,decision,published));
-        try{await code.exec(published);}catch{code.execFailed=published.digest;decision={state:"refused",reason:"exec-failed"};}
+        try{await code.exec(published,signal);}catch{code.execFailed=published.digest;decision={state:"refused",reason:"exec-failed"};}
+        if(signal?.aborted)return;
       }
       codeNow=codeRecord(config,code,decision,published);
       // An unreadable published ref is announced only when it withholds a

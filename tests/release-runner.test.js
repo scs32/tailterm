@@ -1775,10 +1775,10 @@ else if(a[0]!=='send')process.exit(2);`);chmodSync(tt,0o755);
  const claims=()=>calls().filter(c=>c.argv[1]==="claim");
  const record=()=>JSON.parse(readFileSync(join(home,"runner-code.json"),"utf8"));
  // One poll in this process under a fixed agent and run; returns its stderr.
- const poll=async(code,release=async()=>{})=>{
+ const poll=async(code,release=async()=>{},options={once:true})=>{
   const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="";
   process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
-  try{await serveDeployment(config,{once:true,release,...(code?{code}:{})});}
+  try{await serveDeployment(config,{...options,release,...(code?{code}:{})});}
   finally{process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
   return err;
  };
@@ -1976,4 +1976,20 @@ test("code a10 every relative import of the watched scripts is itself watched, a
  }
  assert.deepEqual(LOADED_CODE,diskCode(directory));assert.equal(LOADED_CODE.digest,codeDigest(LOADED_CODE.files));
  assert.ok(readFileSync(RUNNER,"utf8").includes("code:runnerCodeGate()"),"only the daemon entry builds the real gate");
+});
+test("code b1 a stop signal during the restart poll means no re-exec and no claim, and the runner ends",{timeout:20000},async t=>{
+ // The signal arrives during the poll's synchronous work and is handled at the next turn of the event loop.
+ // (i) before the checkout is touched: nothing moves.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),early=new AbortController();r.at(r.a,r.b);h.setJobs([verifiedJob()]);
+ const first=codeGate(r.codeA,{published:cwd=>{setImmediate(()=>early.abort());return publishedCode(cwd);}});
+ assert.equal(await h.poll(first.gate,undefined,{signal:early.signal}),"");
+ assert.equal(first.execs.length,0);assert.equal(h.claims().length,0);assert.equal(r.head(),r.a);assert.deepEqual(h.sends(),[]);
+ // (ii) during the wait inside exec, after the restart was announced: the process is not replaced, and the loop is left without another poll.
+ const s=codeRepo(t),g=codeHost(t,s.cwd),late=new AbortController();s.at(s.a,s.b);g.setJobs([verifiedJob()]);
+ const second=codeGate(s.codeA),exec=second.gate.exec;second.gate.exec=function(...args){setImmediate(()=>late.abort());return exec.apply(this,args);};
+ await g.poll(second.gate,undefined,{signal:late.signal});
+ assert.equal(second.execs.length,0);assert.equal(g.claims().length,0);assert.equal(g.calls().filter(c=>c.argv[1]==="list"&&!c.argv.includes("--snapshot")).length,1);
+ // Without a signal the same gate does re-exec.
+ const u=codeRepo(t),k=codeHost(t,u.cwd),idle=new AbortController();u.at(u.a,u.b);const third=codeGate(u.codeA);
+ await k.poll(third.gate,undefined,{once:true,signal:idle.signal});assert.equal(third.execs.length,1);
 });
