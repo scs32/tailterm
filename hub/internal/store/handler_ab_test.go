@@ -1977,3 +1977,214 @@ func TestHandlerNeedOfflineBelowLimitKeepsProvisioning(t *testing.T) {
 		t.Fatalf("provision below the limit: %+v %v", reserved.HandlerNeed, err)
 	}
 }
+
+// Ceiling on automatic provisions that never register (wi_3550b9785342e780,
+// order #27845).
+
+// runProvisionPeriods acts as the runner for an entry over ten-minute
+// periods: each period it lists the entry and offers a matching spec only
+// when the need asks for one, and the offered handler never registers. It
+// returns the agents it offered.
+func (f *provisionFixture) runProvisionPeriods(t *testing.T, id string, periods int) []string {
+	t.Helper()
+	var offered []string
+	for i := 0; i < periods; i++ {
+		q := listedEntry(t, f.s, f.task.ID, id)
+		if q.HandlerNeed != nil && q.HandlerNeed.Provision {
+			agentID := api.NewID("agt")
+			if _, err := f.provision(q, runnerKey(q), agentID, armS, digestP); err != nil {
+				t.Fatalf("period %d provision: %v", i+1, err)
+			}
+			offered = append(offered, agentID)
+		}
+		f.clock = f.clock.Add(handlerProvisionAbandonAfter)
+		observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	}
+	return offered
+}
+
+// a1, a2, a3: a handler that never registers is reserved three times for an
+// entry and no more. The third reservation counts as soon as it expires,
+// before anything saves it; the entry then says a person must look, and
+// repeated listings and requests change nothing.
+func TestHandlerProvisionStopsAfterThreeNeverRegisteredAttempts(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	id := f.entries[3].ID
+	offered := f.runProvisionPeriods(t, id, 6)
+	if len(offered) != 3 || f.notices(t, provisionNotice) != 3 || f.allRows(t) != 3 {
+		t.Fatalf("after six periods: %d reservations, %d notices, %d rows; want 3 of each", len(offered), f.notices(t, provisionNotice), f.allRows(t))
+	}
+	// The third reservation expired but nothing has saved that yet.
+	if f.rows(t, "abandoned") != 2 || f.rows(t, "reserved") != 1 {
+		t.Fatalf("abandoned %d reserved %d", f.rows(t, "abandoned"), f.rows(t, "reserved"))
+	}
+	stopped := listedEntry(t, f.s, f.task.ID, id)
+	n := stopped.HandlerNeed
+	if n == nil || n.Provision || n.Refused || n.AgentID != "" || n.Fix != "" || n.Attempt != 4 || n.Handlers != 3 || n.Leased != 3 {
+		t.Fatalf("need at the ceiling %+v", n)
+	}
+	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last " + offered[2] +
+		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. The entry leases a handler of arm S as soon as one is free"
+	if stopped.BlockReason != want {
+		t.Fatalf("reason at the ceiling:\n got %s\nwant %s", stopped.BlockReason, want)
+	}
+	// A request at the ceiling is refused whatever its identity, and leaves
+	// no row and no notice; the listing is the same afterwards, hours later.
+	for i := 0; i < 3; i++ {
+		_, err := f.provision(stopped, fmt.Sprintf("at-ceiling-%d", i), api.NewID("agt"), armS, digestP)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "no handler is added: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry") {
+			t.Fatalf("provision at the ceiling: %v", err)
+		}
+		if _, err := f.provision(stopped, runnerKey(stopped), api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("runner identity at the ceiling: %v", err)
+		}
+		f.clock = f.clock.Add(time.Hour)
+		observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+		again := listedEntry(t, f.s, f.task.ID, id)
+		if again.BlockReason != want || !reflect.DeepEqual(again.HandlerNeed, n) {
+			t.Fatalf("listing %d drifted: %+v %q", i, again.HandlerNeed, again.BlockReason)
+		}
+	}
+	if f.allRows(t) != 3 || f.rows(t, "abandoned") != 2 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("at the ceiling: rows %d abandoned %d notices %d", f.allRows(t), f.rows(t, "abandoned"), f.notices(t, provisionNotice))
+	}
+	// An earlier attempt's identity still replays its stored answer.
+	first := api.TeamQueueEntry{ID: id, Revision: stopped.Revision, HandlerNeed: &api.TeamQueueHandlerNeed{Attempt: 1}}
+	if replay, err := f.provision(stopped, runnerKey(first), offered[0], armS, digestP); err != nil || replay.HandlerNeed.AgentID != offered[0] || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("replay of the first attempt: %+v %v rows %d", replay.HandlerNeed, err, f.allRows(t))
+	}
+
+	// The ceiling is the entry's own: another waiting entry still gets its
+	// three attempts, and the first of them saves the expired reservation.
+	other := f.entries[4].ID
+	theirs := f.runProvisionPeriods(t, other, 1)
+	if len(theirs) != 1 || f.rows(t, "abandoned") != 3 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 4 {
+		t.Fatalf("other entry: offered %d abandoned %d reserved %d notices %d", len(theirs), f.rows(t, "abandoned"), f.rows(t, "reserved"), f.notices(t, provisionNotice))
+	}
+	// Saved as abandoned, the three count the same as before.
+	if saved := listedEntry(t, f.s, f.task.ID, id); saved.BlockReason != want || !reflect.DeepEqual(saved.HandlerNeed, n) {
+		t.Fatalf("after the third was saved: %+v %q", saved.HandlerNeed, saved.BlockReason)
+	}
+	theirs = append(theirs, f.runProvisionPeriods(t, other, 5)...)
+	if len(theirs) != 3 || f.allRows(t) != 6 || f.notices(t, provisionNotice) != 6 {
+		t.Fatalf("other entry after six periods: offered %d rows %d notices %d", len(theirs), f.allRows(t), f.notices(t, provisionNotice))
+	}
+	if got := listedEntry(t, f.s, f.task.ID, other); got.HandlerNeed == nil || got.HandlerNeed.Provision || !strings.Contains(got.BlockReason, "3 automatic attempts for this entry reserved a handler on mini that never came online") || !strings.Contains(got.BlockReason, "(last "+theirs[2]+")") {
+		t.Fatalf("other entry at its ceiling: %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+	if saved := listedEntry(t, f.s, f.task.ID, id); saved.BlockReason != want {
+		t.Fatalf("first entry after the other's attempts: %q", saved.BlockReason)
+	}
+}
+
+// a3: the ceiling leaves the other provisioning rules alone. Below it a
+// pending reservation still holds and a spec that differs is still refused
+// and corrected; at it the switch still reads off, and a reserved handler
+// that registers after all is leased, as one that registers in time is.
+func TestHandlerProvisionCeilingKeepsOtherRules(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	ctx := context.Background()
+	id := f.entries[3].ID
+	offered := f.runProvisionPeriods(t, id, 2)
+	if len(offered) != 2 {
+		t.Fatalf("offered %d", len(offered))
+	}
+	// Two abandoned: the third attempt is still asked for, a differing spec
+	// is refused without counting, and the corrected spec reserves.
+	q := listedEntry(t, f.s, f.task.ID, id)
+	if !q.HandlerNeed.Provision || q.HandlerNeed.Attempt != 3 {
+		t.Fatalf("third attempt need %+v", q.HandlerNeed)
+	}
+	if _, err := f.provision(q, runnerKey(q), api.NewID("agt"), armS, digestQ); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "the saved launch spec on mini") {
+		t.Fatalf("differing spec: %v", err)
+	}
+	refused := listedEntry(t, f.s, f.task.ID, id)
+	if !refused.HandlerNeed.Refused || refused.HandlerNeed.Attempt != 3 || f.rows(t, "refused") != 1 || f.notices(t, provisionNotice) != 2 {
+		t.Fatalf("refused need %+v", refused.HandlerNeed)
+	}
+	third := api.NewID("agt")
+	if _, err := f.provision(refused, runnerKey(refused), third, armS, digestP); err != nil {
+		t.Fatalf("corrected spec: %v", err)
+	}
+	pending := listedEntry(t, f.s, f.task.ID, id)
+	if pending.HandlerNeed.Provision || pending.HandlerNeed.AgentID != third || !strings.HasSuffix(pending.BlockReason, "the runner is adding one") || f.rows(t, "refused") != 0 {
+		t.Fatalf("pending third attempt %+v %q", pending.HandlerNeed, pending.BlockReason)
+	}
+	if _, err := f.provision(pending, "while-pending", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("provision while pending: %v", err)
+	}
+	f.clock = f.clock.Add(handlerProvisionAbandonAfter)
+	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	stopped := listedEntry(t, f.s, f.task.ID, id)
+	if stopped.HandlerNeed.Provision || !strings.Contains(stopped.BlockReason, "3 automatic attempts for this entry reserved a handler on mini that never came online") {
+		t.Fatalf("at the ceiling %+v %q", stopped.HandlerNeed, stopped.BlockReason)
+	}
+	// Off is still the switch's own reason and fix.
+	f.setProvision(t, api.HandlerProvisionOff)
+	onFix := "tt team queue provision --task " + f.task.ID + " --auto on"
+	if off := listedEntry(t, f.s, f.task.ID, id); off.HandlerNeed.Provision || off.HandlerNeed.Fix != onFix || !strings.HasSuffix(off.BlockReason, "automatic provisioning is off. Fix: "+onFix) {
+		t.Fatalf("switched off at the ceiling %+v %q", off.HandlerNeed, off.BlockReason)
+	}
+	f.setProvision(t, api.HandlerProvisionOn)
+	// The third handler registers late and online: the claim leases it.
+	added, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "handler-late", Role: api.AgentRoleDatabaseHandler, AgentID: third, Host: "mini", Session: "handler-late",
+		Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.online(t, added)
+	claimed, err := claimEntry(f.s, f.task, stopped)
+	if err != nil || claimed.HandlerID != third {
+		t.Fatalf("claim after a late registration %+v %v", claimed, err)
+	}
+	if f.rows(t, "registered") != 1 || f.rows(t, "abandoned") != 2 || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("after the late registration: registered %d abandoned %d rows %d", f.rows(t, "registered"), f.rows(t, "abandoned"), f.allRows(t))
+	}
+}
+
+// b1: the runner's spawn records the handler's agent before its session
+// starts. A launch that then exits at once, or is closed, leaves an agent row
+// the limit does not count, so its reservation counts toward the ceiling like
+// one whose agent never appeared.
+func TestHandlerProvisionCeilingCountsExitedAndClosedLaunches(t *testing.T) {
+	for _, kind := range []string{api.EventExited, api.EventClosed} {
+		t.Run(kind, func(t *testing.T) {
+			f := newProvisionFixture(t, 4, 3, 3)
+			ctx := context.Background()
+			id := f.entries[3].ID
+			var offered []string
+			for i := 0; i < 6; i++ {
+				q := listedEntry(t, f.s, f.task.ID, id)
+				if q.HandlerNeed != nil && q.HandlerNeed.Provision {
+					agentID := api.NewID("agt")
+					if _, err := f.provision(q, runnerKey(q), agentID, armS, digestP); err != nil {
+						t.Fatalf("period %d provision: %v", i+1, err)
+					}
+					offered = append(offered, agentID)
+					a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: fmt.Sprintf("handler-gone-%d", i), Role: api.AgentRoleDatabaseHandler, AgentID: agentID, Host: "mini", Session: fmt.Sprintf("handler-gone-%d", i),
+						Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: kind}, f.by); err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.clock = f.clock.Add(handlerProvisionAbandonAfter)
+				observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+			}
+			if len(offered) != 3 || f.notices(t, provisionNotice) != 3 || f.allRows(t) != 3 {
+				t.Fatalf("after six periods: %d reservations, %d notices, %d rows; want 3 of each", len(offered), f.notices(t, provisionNotice), f.allRows(t))
+			}
+			got := listedEntry(t, f.s, f.task.ID, id)
+			n := got.HandlerNeed
+			if n == nil || n.Provision || n.Handlers != 3 || n.Leased != 3 ||
+				!strings.Contains(got.BlockReason, "cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last "+offered[2]+") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini") {
+				t.Fatalf("need at the ceiling %+v %q", n, got.BlockReason)
+			}
+			if _, err := f.provision(got, "at-ceiling", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
+				t.Fatalf("provision at the ceiling: %v rows %d", err, f.allRows(t))
+			}
+		})
+	}
+}

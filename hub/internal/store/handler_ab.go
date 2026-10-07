@@ -1640,6 +1640,12 @@ const noFreeHandlerReason = "No free database handler"
 // register online before its reservation stops holding the next one.
 const handlerProvisionAbandonAfter = 10 * time.Minute
 
+// handlerProvisionMaxNeverRegistered is how many reservations for one queue
+// entry may expire with no handler coming online before the hub stops adding
+// one for it. Three ride out a transient launch failure; a launch that fails
+// every time needs a person, not a notice every ten minutes.
+const handlerProvisionMaxNeverRegistered = 3
+
 const handlerProvisionNoticeSubject = "Automatic handler provision"
 
 // queueHandlerProvision reads the project's automatic handler provisioning
@@ -1717,6 +1723,25 @@ func settleHandlerProvisions(ctx context.Context, tx *sql.Tx, task string, now t
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE handler_provisions SET state=?,updated_at=? WHERE id=? AND state='reserved'`, state, ts(now), r.id)
 	return err
+}
+
+// neverRegisteredProvisions counts an entry's reservations that expired with
+// no handler coming online, and returns the latest one's agent and host. The
+// reserved row with the given ID counts once it is abandoned although not
+// saved as such. The runner's spawn records the agent before its session
+// starts, so a launch that exits at once or is closed leaves an agent row:
+// that reservation counts too. Only a reservation whose agent is an open
+// handler is left out, because the limit already counts that handler (offline
+// it stops further provisions by itself, online it is leased).
+func neverRegisteredProvisions(ctx context.Context, q queryRower, entryID, expiredID string) (count int, agentID, host string, err error) {
+	err = q.QueryRowContext(ctx, `SELECT count(*) OVER (),p.agent_id,p.host FROM handler_provisions p
+ WHERE p.entry_id=? AND (p.state='abandoned' OR (p.state='reserved' AND p.id=?))
+ AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id=p.agent_id AND a.role=? AND a.status NOT IN (?,?,?))
+ ORDER BY p.created_at DESC,p.rowid DESC LIMIT 1`, entryID, expiredID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, api.AgentRetired).Scan(&count, &agentID, &host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", "", nil
+	}
+	return count, agentID, host, err
 }
 
 // clearHandlerProvisionRefusal drops an entry's standing spec refusal, as
@@ -1867,6 +1892,14 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		return nil, "", err
 	}
 	seats := queueTeamSeats(kind, e.Template)
+	expiredID := ""
+	if c.over != nil {
+		expiredID = c.over.id
+	}
+	unregistered, lastAgent, lastHost, err := neverRegisteredProvisions(ctx, q, e.ID, expiredID)
+	if err != nil {
+		return nil, "", err
+	}
 	switch {
 	case !c.autoOn:
 		n.Fix = fmt.Sprintf("tt team queue provision --task %s --auto on", e.TaskID)
@@ -1876,6 +1909,17 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 			n.AgentID = c.pending.agentID
 		}
 		n.Reason = counts + "; the runner is adding one"
+	case unregistered >= handlerProvisionMaxNeverRegistered:
+		// A launch that fails the same way every time is not retried for
+		// ever. The hub runs and resets nothing: the entry waits for a
+		// handler like any other, and says what a person should look at.
+		wanted := "a handler"
+		if n.Arm != "" {
+			wanted = "a handler of arm " + n.Arm
+		}
+		on := provisionText(lastHost)
+		n.Reason = fmt.Sprintf("%s; cannot add one: %d automatic attempts for this entry reserved a handler on %s that never came online (last %s) and the ceiling is %d, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on %s: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. The entry leases %s as soon as one is free",
+			counts, unregistered, on, lastAgent, handlerProvisionMaxNeverRegistered, on, wanted)
 	case c.capOpen+c.capSeats+seats+1 > c.maxAgents:
 		// The new handler and the waiting team must both fit, so a provision
 		// is never what pushes the team over the cap.
