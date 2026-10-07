@@ -1498,13 +1498,29 @@ test("M7 a hold journals one memory-hold and the sidecar records it, with the tw
 // SIGTERM, which lets a run stop its check, remove its home and release, then
 // SIGKILL for whatever is left.
 const RUN_COMMAND_STOP_MS = 20000, RUN_COMMAND_KILL_MS = 10000;
-const processTable = () => execFileSync("ps", ["-Aww", "-o", "pid=,ppid=,pgid=,args="], { encoding: "utf8" }).split("\n")
+// Agent sessions carry command lines of tens of kilobytes each, so the listing
+// can pass the default one-megabyte output limit on a busy host.
+const processTable = () => execFileSync("ps", ["-Aww", "-o", "pid=,ppid=,pgid=,args="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n")
   .map(line => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line)).filter(Boolean).map(([, pid, ppid, pgid, args]) => ({ pid: +pid, ppid: +ppid, pgid: +pgid, args }));
-async function stopRunCommand({ output, lock }) {
+async function stopRunCommand({ output, lock, child, text, listing = processTable }) {
   if (!output) return { pids: [], forced: [], ms: 0 };
-  const began = Date.now(), table = processTable();
+  const began = Date.now(), groups = existsSync(lock) ? allHeld(lock).flatMap(h => h.groups || []) : [];
+  let table;
+  try {
+    table = listing();
+  } catch (error) {
+    // Without a listing, what the command itself made known is still stopped:
+    // the command while it runs, the run it said it detached, and the groups on file.
+    const known = [child?.exitCode === null && child.signalCode === null ? child.pid : 0, Number(/detached as pid (\d+);/.exec(text?.() || "")?.[1])].filter(pid => !pidGone(pid));
+    const left = () => known.some(pid => !pidGone(pid)) || groups.some(group => !groupGone(group));
+    for (const pid of known) kill(pid, "SIGTERM");
+    for (const end = Date.now() + RUN_COMMAND_STOP_MS; left() && Date.now() < end; ) await new Promise(resolve => setTimeout(resolve, 20));
+    for (const pid of known) kill(pid);
+    for (const group of groups) kill(-group);
+    throw new Error("the process listing failed, so only the run command's known processes were stopped: " + error.message, { cause: error });
+  }
   const runners = table.filter(p => p.args.includes("verify-matrix.mjs") && p.args.includes(output)).map(p => p.pid);
-  const found = new Set([...runners, ...(existsSync(lock) ? allHeld(lock).flatMap(h => h.groups || []) : [])]);
+  const found = new Set([...runners, ...groups]);
   for (let grew = true; grew; ) {
     grew = false;
     for (const p of table) if (!found.has(p.pid) && (found.has(p.ppid) || found.has(p.pgid))) { found.add(p.pid); grew = true; }
@@ -1595,7 +1611,7 @@ test("M8 a waiting release run sorts first and takes the single slot, fairness c
   assert(!existsSync(refused.lock), "refused before joining the list");
 });
 test("M8 stopping a started run command, as a failed test's teardown does, ends the command, its run and the check and leaves no holder or home", async t => {
-  for (const marker of [undefined, "1"]) {
+  for (const [marker, listing] of [[undefined], ["1"], [undefined, () => { throw new Error("no listing"); }]]) {
     const mark = join(tempDir(t), "check.json");
     const run = runCommand(t, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(mark + ".part")},JSON.stringify({pid:process.pid,home:process.env.HOME}));fs.renameSync(${JSON.stringify(mark + ".part")},${JSON.stringify(mark)});setInterval(()=>{},1000);`, marker);
     await until(() => existsSync(mark) || run.child.exitCode !== null, "the run command's check to start");
@@ -1606,13 +1622,15 @@ test("M8 stopping a started run command, as a failed test's teardown does, ends 
     assert.equal(holder.pid === run.child.pid, marker === "1", run.text());
     if (marker === undefined) assert.match(run.text(), new RegExp(`detached as pid ${holder.pid};`));
     assert(existsSync(check.home), "the run's private home exists while it runs");
+    // A failed listing is reported, and still stops what the command made known.
+    if (listing) await assert.rejects(stopRunCommand({ ...run, listing }), /the process listing failed.*no listing/);
     const stopped = await stopRunCommand(run);
-    for (const pid of [run.child.pid, holder.pid, check.pid]) { assert(stopped.pids.includes(pid), `pid ${pid} was found`); assert(pidGone(pid), `pid ${pid} is gone`); }
+    for (const pid of [run.child.pid, holder.pid, check.pid]) { assert(listing || stopped.pids.includes(pid), `pid ${pid} was found`); assert(pidGone(pid), `pid ${pid} is gone`); }
     for (const group of holder.groups) assert(groupGone(group), `group ${group} is gone`);
     assert(stopped.ms < 60000, `stopped in ${stopped.ms} ms`);
     assert.deepEqual([allHeld(run.lock), waitersOf(run.lock)], [[], []], "no holder or waiter is left");
     assert(!existsSync(check.home), "the run removed its private home");
-    console.log(JSON.stringify({ runCommandStop: { marker: marker ?? null, command: run.child.pid, run: holder.pid, check: check.pid, groups: holder.groups, home: check.home, ...stopped } }));
+    console.log(JSON.stringify({ runCommandStop: { marker: marker ?? null, listing: listing ? "failed" : "read", command: run.child.pid, run: holder.pid, check: check.pid, groups: holder.groups, home: check.home, ...stopped } }));
   }
 });
 test("M9 the limit defaults to 70, accepts 1 to 99 and off, and a bad value refuses before any file is written", async t => {
