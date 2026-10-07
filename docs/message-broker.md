@@ -435,8 +435,10 @@ independently verified. REVIEW repeats those exact IDs. Each general RESULT must
 mark them `pending-verification`; it is distinct from pass and partial. The
 handler-imported eligible receipt for the exact candidate, scope and assignment
 judges those IDs, including on items without mandatory enrollment. All other
-criteria still need reviewer pass, and partial or failed verdicts still block.
-Existing completed verdicts remain frozen with their owner-accept route.
+criteria still need reviewer pass. A failed verdict blocks until its blocker is
+verified by ID. A round-two `partial` with no blocker blocks until a focused
+check settles it (see below). Completed verdicts stay frozen: settlement is a
+separate record, and the owner-accept route remains.
 A review RESULT replies to that request, includes every criterion in Status and
 structured `review` metadata. `tt send --review-file metadata.json` supports the
 same metadata; `--file` can contain it directly. Example:
@@ -481,12 +483,64 @@ verifiers are eligible. The RESULT repeats the metadata, reports exactly
 (`git diff --quiet <reviewed> <rebased> -> exit 0`) or series equivalence
 (`git range-diff <old base>..<reviewed> <new base>..<rebased>` with every pair
 `=`). The hub checks the form of the proof; the verifier attests the git fact.
+The equivalence path is only for identical trees or an equivalent series.
+
+A lead-named fix after a converged review also has no blocker to name, for
+example a test-only correction found by the verification matrix. Its tree
+differs, so it is not an equivalence. The lead sends the focused REQUEST with
+no `blockerIds`, `treeDiffers:true`, the fixed commit as `candidate`, and a
+`fix` that names the diff and contains the full round-two candidate:
+
+```json
+{"mode":"focused","candidate":"cccccccccccccccccccccccccccccccccccccccc",
+ "treeDiffers":true,
+ "fix":"Test-only fix after bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb: accept TEST_BROWSER=both in tests/terminal-replies-browser.mjs"}
+```
+
+The same refusals apply as for an equivalence: the round-two candidate must be
+converged and no blocker may be unresolved on the fixed commit. `treeDiffers`
+with `blockerIds` is refused; an unresolved blocker is always verified by ID.
+The verifier confirms read-only that the delta is exactly the named diff. The
+RESULT repeats the metadata, reports exactly `delta=pass` or `delta=fail`, and
+includes a `command` evidence entry naming both full commits
+(`git diff --stat <reviewed> <fixed>`). A `treeDiffers` record refuses an
+`equivalence` status and an equivalence record refuses `delta`. The ledger keeps
+`treeDiffers:true` on the record.
+
+A criterion that round two left `partial` with no blocker, typically because
+the full matrix had not yet run, is settled by naming it in `criterionIds`:
+
+```json
+{"mode":"focused","candidate":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "criterionIds":["a4"],
+ "fix":"Receipt generation 3 passed the full store package and race for a4"}
+```
+
+Each ID must be a distinct frozen criterion that is not verification-owned, is
+`partial` in round two, has no unresolved blocker or finding, and is not also a
+named blocker ID. `criterionIds` may stand alone on the round-two candidate, or
+ride on a request that names `blockerIds`, an equivalence or `treeDiffers`, so
+a partial plus a rebase or fix is one request. The RESULT repeats the metadata
+and reports pass/fail for each criterion ID in Status, beside any blocker IDs
+and the `equivalence` or `delta` key. The round's own verdict stays `partial`;
+the focused record is the settlement and stores the `receiptGeneration` that
+settled it. A held criterion part added after round two uses the same request:
+`treeDiffers` for the commit that adds it, plus its ID in `criterionIds` when
+round two left it `partial`.
+
+Exact receipt rule for both routes: a request with `criterionIds`, a RESULT that
+passes them, and any accept that relies on a passed `treeDiffers` or
+`criterionIds` record need the handler-imported eligible passing receipt for
+the current scope and that exact commit. This holds also on items without
+enrollment or verification-owned criteria. A receipt for another commit, or a
+newer plan with no receipt yet, refuses the step.
 
 A lead NOTICE records `mode:"disposition"`, exact `candidate` and `disposition`
 of `accept`, `owner-decision` or `follow-ups`. Completion and team acceptance
 require recorded acceptance, passing criteria and resolved blockers. A changed
 candidate requires passing exact focused verification as the latest focused
-record: of its named blockers, or of its equivalence to the reviewed candidate.
+record: of its named blockers, of its equivalence to the reviewed candidate, or
+of its lead-named delta (`treeDiffers`). A third general review stays refused.
 Where independent verification is required, the passing receipt must also be for
 that exact changed commit; a receipt for the pre-rebase commit does not count.
 Receipt replay precedes all enforcement; refusals roll back the message,

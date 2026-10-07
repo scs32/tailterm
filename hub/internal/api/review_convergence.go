@@ -3,6 +3,9 @@ package api
 // ReviewMetadata is an explicit transition attached to a typed Board message.
 // General reviews use REVIEW/RESULT; focused verification uses REQUEST/RESULT;
 // the lead records a disposition on a NOTICE. Unstructured history is unknown.
+// On a focused check, CriterionIDs names round-two partial criteria that the
+// passing receipt settles, and TreeDiffers marks a lead-named fix: no blocker
+// ID and a tree that is not identical to the reviewed candidate.
 type ReviewMetadata struct {
 	LegacyReviewers    []LegacyReviewerBinding `json:"legacyReviewers,omitempty"`
 	LegacyRequests     []int64                 `json:"legacyRequests,omitempty"`
@@ -11,6 +14,8 @@ type ReviewMetadata struct {
 	Blockers           []ReviewFinding         `json:"blockers,omitempty"`
 	Findings           []ReviewFinding         `json:"findings,omitempty"`
 	BlockerIDs         []string                `json:"blockerIds,omitempty"`
+	CriterionIDs       []string                `json:"criterionIds,omitempty"`
+	TreeDiffers        bool                    `json:"treeDiffers,omitempty"`
 	Fix                string                  `json:"fix,omitempty"`
 	VerificationItemID string                  `json:"verificationItemId,omitempty"`
 	Disposition        string                  `json:"disposition,omitempty"`
@@ -71,6 +76,8 @@ type ReviewFollowUp struct {
 	MessageSeq int64         `json:"messageSeq"`
 }
 
+// FocusedReview's ReceiptGeneration is the passing receipt for the exact
+// candidate that settled CriterionIDs.
 type FocusedReview struct {
 	ScopeResolvedIDs   []string `json:"scopeResolvedIds,omitempty"`
 	ActiveRequestSeq   int64    `json:"activeRequestSeq,omitempty"`
@@ -79,6 +86,9 @@ type FocusedReview struct {
 	Candidate          string   `json:"candidate"`
 	Fix                string   `json:"fix"`
 	BlockerIDs         []string `json:"blockerIds"`
+	CriterionIDs       []string `json:"criterionIds,omitempty"`
+	TreeDiffers        bool     `json:"treeDiffers,omitempty"`
+	ReceiptGeneration  int64    `json:"receiptGeneration,omitempty"`
 	ReviewerID         string   `json:"reviewerId"`
 	ReviewerRun        string   `json:"reviewerRun"`
 	VerificationItemID string   `json:"verificationItemId,omitempty"`

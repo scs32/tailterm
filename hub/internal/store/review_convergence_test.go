@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1836,5 +1837,586 @@ func TestReviewConvergenceVerificationFoundFix(t *testing.T) {
 	}
 	if err = reviewCompletion(f.ctx, tx, f.item, candidateC); err != nil {
 		t.Fatal("team acceptance of the fixed commit", err)
+	}
+}
+
+func (f *convergenceFixture) focusedRequest(meta api.ReviewMetadata) (api.Message, error) {
+	return f.post(focusedRequestEnv(meta), f.reviewer.ID, 0, f.lead)
+}
+func (f *convergenceFixture) focusedResult(reply int64, meta api.ReviewMetadata, status map[string]string, evidence map[string]api.Evidence) error {
+	_, err := f.post(focusedResultEnv(meta, status, evidence), "", reply, f.reviewer)
+	return err
+}
+
+// focusedCheck stores the request and its verdict, and fails on any refusal.
+func (f *convergenceFixture) focusedCheck(t *testing.T, meta api.ReviewMetadata, status map[string]string, evidence map[string]api.Evidence) {
+	t.Helper()
+	request, err := f.focusedRequest(meta)
+	if err != nil {
+		t.Fatal("focused request", err)
+	}
+	if err = f.focusedResult(request.Seq, meta, status, evidence); err != nil {
+		t.Fatal("focused result", err)
+	}
+}
+
+// seedPlanWithoutReceipt replaces the current plan with a newer one that has
+// no receipt yet, as a rerun of the matrix does.
+func seedPlanWithoutReceipt(t *testing.T, f *convergenceFixture) {
+	t.Helper()
+	records, err := verificationRecords(f.ctx, f.s.db, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := currentVerification(records)
+	if p == nil {
+		t.Fatal("no plan to replace")
+	}
+	b, _ := json.Marshal(api.VerificationRecord{Generation: int64(len(records)) + 1, Kind: "plan", Plan: p})
+	if _, err = f.s.db.Exec(`INSERT INTO verification_records VALUES(?,?,?,?,?,?,?)`, f.task.ID, f.item.ID, len(records)+1, "plan", api.NewID("req"), "synthetic-fixture", string(b)); err != nil {
+		t.Fatal(err)
+	}
+}
+func receiptRefused(t *testing.T, name string, err error) {
+	t.Helper()
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "passing receipt") {
+		t.Fatal(name, err)
+	}
+}
+
+func TestReviewConvergenceSettlementRefusals(t *testing.T) {
+	t.Run("request", func(t *testing.T) {
+		criteria := map[string]string{"a1": "code", "a2": "full package", "a3": "retries", "a4": "matrix"}
+		f := newConvergenceFixtureWithCriteria(t, criteria, []string{"a4"})
+		status := map[string]string{"a1": "pass", "a2": "partial", "a3": "fail", "a4": "pending-verification"}
+		b := api.ReviewFinding{ID: "b1", Criterion: "a3", Title: "Retry failure", File: "fixture.go", Line: 7}
+		f.generalRound(t, candidateA, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		f.generalRound(t, candidateB, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		settle := func(candidate string, ids ...string) error {
+			_, err := f.focusedRequest(api.ReviewMetadata{Candidate: candidate, Fix: "Receipt settles the partial", CriterionIDs: ids})
+			return err
+		}
+		receiptRefused(t, "no receipt", settle(candidateB, "a2"))
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		receiptRefused(t, "receipt for another commit", settle(candidateB, "a2"))
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		for name, ids := range map[string][]string{
+			"unknown criterion":    {"a9"},
+			"verification-owned":   {"a4"},
+			"passed in round two":  {"a1"},
+			"failed in round two":  {"a3"},
+			"duplicated":           {"a2", "a2"},
+			"one valid, one wrong": {"a2", "a1"},
+		} {
+			if err := settle(candidateB, ids...); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterionIds must name distinct round-two partial criteria") {
+				t.Fatal(name, err)
+			}
+		}
+		if _, err := f.post(focusedRequestEnv(api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the partial", CriterionIDs: []string{"a2"}}), f.reviewer.ID, 0, f.reviewer); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("non-lead settlement request", err)
+		}
+		if st := f.state(t); len(st.Focused) != 0 || len(st.Rounds) != 2 {
+			t.Fatal("refused request was stored", st)
+		}
+		f.thirdReviewRefused(t, candidateB)
+	})
+	t.Run("criterion tied to an outstanding blocker", func(t *testing.T) {
+		// Messages cannot produce a partial criterion with an open blocker: a
+		// blocker's criterion must carry a failed verdict. The ledger is edited
+		// directly to prove the request-time guard on its own.
+		f := newConvergenceFixture(t)
+		f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		st := f.state(t)
+		st.Rounds[1].Blockers = []api.ReviewFinding{{ID: "b1", Criterion: "a2", Title: "Retry failure", File: "fixture.go", Line: 7}}
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = saveReviewState(f.ctx, tx, f.task.ID, st); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.focusedRequest(api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the partial", CriterionIDs: []string{"a2"}})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has an unresolved blocker") {
+			t.Fatal("settled a criterion with an open blocker", err)
+		}
+		if len(f.state(t).Focused) != 0 {
+			t.Fatal("refused request was stored", f.state(t))
+		}
+	})
+	t.Run("result", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		other, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "other", Host: "fixture", Session: "other"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta := api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the partial", CriterionIDs: []string{"a2"}}
+		request, err := f.focusedRequest(meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pass := map[string]string{"a2": "pass"}
+		stale := f.reviewer
+		stale.RunID = "run_dddddddddddddddd"
+		for name, from := range map[string]api.Agent{"another agent": other, "stale reviewer run": stale} {
+			if _, err = f.post(focusedResultEnv(meta, pass, receiptProof(candidateB)), "", request.Seq, from); !errors.Is(err, api.ErrConflict) {
+				t.Fatal(name, err)
+			}
+		}
+		for name, bad := range map[string]api.Envelope{
+			"unknown verdict":      focusedResultEnv(meta, map[string]string{"a2": "partial"}, receiptProof(candidateB)),
+			"another criterion":    focusedResultEnv(meta, map[string]string{"a1": "pass"}, receiptProof(candidateB)),
+			"extra status key":     focusedResultEnv(meta, map[string]string{"a2": "pass", "a1": "pass"}, receiptProof(candidateB)),
+			"equivalence key":      focusedResultEnv(meta, map[string]string{"a2": "pass", "equivalence": "pass"}, rebaseProof(candidateA, candidateB)),
+			"criterion list drops": focusedResultEnv(api.ReviewMetadata{Candidate: candidateB, Fix: meta.Fix}, pass, receiptProof(candidateB)),
+			"new finding":          focusedResultEnv(api.ReviewMetadata{Candidate: candidateB, Fix: meta.Fix, CriterionIDs: []string{"a2"}, Findings: []api.ReviewFinding{{ID: "f1", Title: "Later", File: "fixture.go", Line: 1}}}, pass, receiptProof(candidateB)),
+		} {
+			if _, err = f.post(bad, "", request.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+				t.Fatal(name, err)
+			}
+		}
+		if st := f.state(t); len(st.Focused) != 1 || st.Focused[0].ResultSeq != 0 {
+			t.Fatal("refused result was stored", st)
+		}
+		if err = f.focusedResult(request.Seq, meta, map[string]string{"a2": "fail"}, receiptProof(candidateB)); err != nil {
+			t.Fatal("failed settlement must be recordable", err)
+		}
+		if st := f.state(t); st.Focused[0].Passed || st.Focused[0].ReceiptGeneration != 0 {
+			t.Fatal("failed settlement recorded as settled", st)
+		}
+		if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has not passed") {
+			t.Fatal("accepted after a failed settlement", err)
+		}
+		// A settlement on B covers B only, and the latest verdict on B decides.
+		f.focusedCheck(t, meta, pass, receiptProof(candidateB))
+		if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("settlement of B accepted C", err)
+		}
+		f.focusedCheck(t, meta, map[string]string{"a2": "fail"}, receiptProof(candidateB))
+		if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("an earlier pass outlived a later fail", err)
+		}
+		f.focusedCheck(t, meta, pass, receiptProof(candidateB))
+		f.thirdReviewRefused(t, candidateB)
+		if err = f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+			t.Fatal(err)
+		}
+		if st := f.state(t); len(st.Rounds) != 2 || len(st.Focused) != 4 || st.Rounds[1].Verdicts["a2"] != "partial" {
+			t.Fatal("history", st)
+		}
+	})
+}
+
+// The exact receipt gates both new routes on an item with no enrollment and
+// no verification-owned criterion, where an ordinary accept needs none.
+func TestReviewConvergenceNewRoutesAlwaysNeedExactReceipt(t *testing.T) {
+	unenrolled := func(t *testing.T, f *convergenceFixture) {
+		t.Helper()
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if required, err := verificationRequired(f.ctx, tx, f.task.ID, f.item.ID); err != nil || required {
+			t.Fatal("expected an unenrolled fixture", required, err)
+		}
+	}
+	completion := func(f *convergenceFixture, candidate string) error {
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		return reviewCompletion(f.ctx, tx, f.item, candidate)
+	}
+	t.Run("lead-named fix", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		unenrolled(t, f)
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		// The request needs no receipt yet: the fix may precede the matrix rerun.
+		f.focusedCheck(t, api.ReviewMetadata{Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true}, map[string]string{"delta": "pass"}, deltaProof(candidateB, candidateC))
+		receiptRefused(t, "no receipt", f.acceptCandidate(candidateC, api.Agent{}))
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		receiptRefused(t, "receipt for the pre-fix commit", f.acceptCandidate(candidateC, api.Agent{}))
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		seedPlanWithoutReceipt(t, f)
+		receiptRefused(t, "newer plan without a receipt", f.acceptCandidate(candidateC, api.Agent{}))
+		if f.state(t).Disposition != nil {
+			t.Fatal("refused acceptance wrote a disposition")
+		}
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+			t.Fatal("exact receipt and delta refused", err)
+		}
+		if err := completion(f, candidateC); err != nil {
+			t.Fatal("completion with the exact receipt", err)
+		}
+		// Completion re-checks the receipt after the accept was saved.
+		seedPlanWithoutReceipt(t, f)
+		receiptRefused(t, "completion after the receipt was replaced", completion(f, candidateC))
+	})
+	t.Run("settled partial", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		unenrolled(t, f)
+		f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+		meta := api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the partial", CriterionIDs: []string{"a2"}}
+		_, err := f.focusedRequest(meta)
+		receiptRefused(t, "request with no receipt", err)
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		request, err := f.focusedRequest(meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedPlanWithoutReceipt(t, f)
+		pass := map[string]string{"a2": "pass"}
+		receiptRefused(t, "pass after the receipt was replaced", f.focusedResult(request.Seq, meta, pass, receiptProof(candidateB)))
+		if st := f.state(t); st.Focused[0].ResultSeq != 0 {
+			t.Fatal("refused result was stored", st)
+		}
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		if err = f.focusedResult(request.Seq, meta, pass, receiptProof(candidateB)); err != nil {
+			t.Fatal(err)
+		}
+		seedPlanWithoutReceipt(t, f)
+		receiptRefused(t, "accept with a newer plan and no receipt", f.acceptCandidate(candidateB, api.Agent{}))
+		seedPassingVerification(t, f.s, f.item, candidateA)
+		receiptRefused(t, "accept with a receipt for another commit", f.acceptCandidate(candidateB, api.Agent{}))
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		if err = f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+			t.Fatal("exact receipt and settlement refused", err)
+		}
+		if err = completion(f, candidateB); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ordinary accept is unchanged", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		if err := f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+			t.Fatal("an unenrolled clean review needed a receipt", err)
+		}
+	})
+}
+
+func TestReviewConvergenceNewRoutesCannotBypassBlocker(t *testing.T) {
+	named := func(t *testing.T, f *convergenceFixture, candidate, id string) {
+		t.Helper()
+		f.focusedCheck(t, api.ReviewMetadata{Candidate: candidate, Fix: "Restore durable retry receipt", BlockerIDs: []string{id}}, map[string]string{id: "pass"}, receiptProof(candidate))
+	}
+	t.Run("failed criterion with a blocker", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+		status := map[string]string{"a1": "fail", "a2": "partial"}
+		f.generalRound(t, candidateA, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		f.generalRound(t, candidateB, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		for name, tc := range map[string]struct {
+			meta   api.ReviewMetadata
+			reason string
+		}{
+			"lead-named fix over the blocker":       {api.ReviewMetadata{Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true}, "treeDiffers verification needs a converged review"},
+			"lead-named fix settling the partial":   {api.ReviewMetadata{Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true, CriterionIDs: []string{"a2"}}, "treeDiffers verification needs a converged review"},
+			"settle the blocker's criterion":        {api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the criterion", CriterionIDs: []string{"a1"}}, "criterionIds must name distinct round-two partial criteria"},
+			"lead-named fix with blocker IDs":       {api.ReviewMetadata{Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true, BlockerIDs: []string{"b1"}}, "treeDiffers verification names no blocker IDs"},
+			"lead-named fix on the reviewed commit": {api.ReviewMetadata{Candidate: candidateB, Fix: deltaFix(candidateB), TreeDiffers: true, BlockerIDs: []string{"b1"}}, "treeDiffers verification names no blocker IDs"},
+		} {
+			if _, err := f.focusedRequest(tc.meta); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatal(name, err)
+			}
+		}
+		if len(f.state(t).Focused) != 0 {
+			t.Fatal("refused request was stored", f.state(t))
+		}
+		// Settling the partial does not clear the blocker.
+		f.focusedCheck(t, api.ReviewMetadata{Candidate: candidateB, Fix: "Receipt settles the partial", CriterionIDs: []string{"a2"}}, map[string]string{"a2": "pass"}, receiptProof(candidateB))
+		if err := f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accepted with an unresolved blocker", err)
+		}
+		f.thirdReviewRefused(t, candidateB)
+		named(t, f, candidateB, "b1")
+		if err := f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+			t.Fatal("blocker verified by ID and partial settled", err)
+		}
+	})
+	t.Run("blocker and partial in one request", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+		status := map[string]string{"a1": "fail", "a2": "partial"}
+		f.generalRound(t, candidateA, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		f.generalRound(t, candidateB, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		meta := api.ReviewMetadata{Candidate: candidateC, Fix: "Restore durable retry receipt", BlockerIDs: []string{"b1"}, CriterionIDs: []string{"a2"}}
+		request, err := f.focusedRequest(meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = f.focusedResult(request.Seq, meta, map[string]string{"b1": "pass"}, receiptProof(candidateC)); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("result skipped the criterion", err)
+		}
+		if err = f.focusedResult(request.Seq, meta, map[string]string{"b1": "fail", "a2": "pass"}, receiptProof(candidateC)); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accepted with a failed blocker verdict", err)
+		}
+		f.focusedCheck(t, meta, map[string]string{"b1": "pass", "a2": "pass"}, receiptProof(candidateC))
+		if err = f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("criterion ID equal to a blocker ID", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "a2", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+		status := map[string]string{"a1": "fail", "a2": "partial"}
+		f.generalRound(t, candidateA, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		f.generalRound(t, candidateB, status, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seedPassingVerification(t, f.s, f.item, candidateB)
+		_, err := f.focusedRequest(api.ReviewMetadata{Candidate: candidateB, Fix: "Restore durable retry receipt", BlockerIDs: []string{"a2"}, CriterionIDs: []string{"a2"}})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is also a named blocker ID") {
+			t.Fatal("ambiguous status key", err)
+		}
+	})
+	t.Run("blocker verified on the reviewed commit only", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		b := api.ReviewFinding{ID: "b1", Regression: true, Baseline: candidateC, Candidate: candidateA, Title: "Regression", File: "fixture.go", Line: 1}
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		b.Candidate = candidateB
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+		seedPassingVerification(t, f.s, f.item, candidateD)
+		named(t, f, candidateB, "b1")
+		_, err := f.focusedRequest(api.ReviewMetadata{Candidate: candidateD, Fix: deltaFix(candidateB), TreeDiffers: true})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "unresolved blockers on rebased candidate") {
+			t.Fatal("lead-named fix over a blocker open on the fixed commit", err)
+		}
+		if err = f.acceptCandidate(candidateD, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accept", err)
+		}
+		named(t, f, candidateD, "b1")
+		if err = f.acceptCandidate(candidateD, api.Agent{}); err != nil {
+			t.Fatal("named-blocker path on the fixed commit", err)
+		}
+	})
+}
+
+func TestReviewConvergenceEquivalenceAndDeltaStayDistinct(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	for name, meta := range map[string]api.ReviewMetadata{
+		"candidate is the reviewed one": {Candidate: candidateB, Fix: deltaFix(candidateB), TreeDiffers: true},
+		"fix lacks the reviewed commit": {Candidate: candidateC, Fix: "Test-only fix", TreeDiffers: true},
+		"fix names a short commit":      {Candidate: candidateC, Fix: deltaFix(candidateB[:12]), TreeDiffers: true},
+		"fix names round one":           {Candidate: candidateC, Fix: deltaFix(candidateA), TreeDiffers: true},
+		"candidate is not a commit":     {Candidate: "cccccc", Fix: deltaFix(candidateB), TreeDiffers: true},
+		"settles a passed criterion":    {Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true, CriterionIDs: []string{"a2"}},
+	} {
+		if _, err := f.focusedRequest(meta); !errors.Is(err, api.ErrConflict) {
+			t.Fatal(name, err)
+		}
+	}
+	if len(f.state(t).Focused) != 0 {
+		t.Fatal("refused request was stored", f.state(t))
+	}
+	pass := func(key string) map[string]string { return map[string]string{key: "pass"} }
+	refused := func(reply int64, cases map[string]api.Envelope) {
+		t.Helper()
+		for name, bad := range cases {
+			if _, err := f.post(bad, "", reply, f.reviewer); !errors.Is(err, api.ErrConflict) {
+				t.Fatal(name, err)
+			}
+		}
+	}
+	// An equivalence record never takes a delta verdict or the new fields.
+	equivalence := api.ReviewMetadata{Candidate: candidateC, Fix: rebaseFix(candidateB)}
+	request, err := f.focusedRequest(equivalence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := json.Marshal(f.state(t).Focused[0]); strings.Contains(string(raw), "treeDiffers") || strings.Contains(string(raw), "criterionIds") || strings.Contains(string(raw), "receiptGeneration") {
+		t.Fatal("equivalence record gained new fields", string(raw))
+	}
+	refused(request.Seq, map[string]api.Envelope{
+		"delta status":            focusedResultEnv(equivalence, pass("delta"), rebaseProof(candidateB, candidateC)),
+		"delta beside the proof":  focusedResultEnv(equivalence, map[string]string{"equivalence": "pass", "delta": "pass"}, rebaseProof(candidateB, candidateC)),
+		"result says treeDiffers": focusedResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: equivalence.Fix, TreeDiffers: true}, pass("delta"), rebaseProof(candidateB, candidateC)),
+		"treeDiffers equivalence": focusedResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: equivalence.Fix, TreeDiffers: true}, pass("equivalence"), rebaseProof(candidateB, candidateC)),
+		"result adds a criterion": focusedResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: equivalence.Fix, CriterionIDs: []string{"a2"}}, map[string]string{"equivalence": "pass", "a2": "pass"}, rebaseProof(candidateB, candidateC)),
+	})
+	if err = f.focusedResult(request.Seq, equivalence, pass("equivalence"), rebaseProof(candidateB, candidateC)); err != nil {
+		t.Fatal(err)
+	}
+	// A treeDiffers record never takes an equivalence verdict.
+	delta := api.ReviewMetadata{Candidate: candidateD, Fix: deltaFix(candidateB), TreeDiffers: true}
+	request, err = f.focusedRequest(delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := func(value string) map[string]api.Evidence {
+		return map[string]api.Evidence{"e1": {Type: "command", Value: value}}
+	}
+	refused(request.Seq, map[string]api.Envelope{
+		"equivalence status":      focusedResultEnv(delta, pass("equivalence"), deltaProof(candidateB, candidateD)),
+		"both keys":               focusedResultEnv(delta, map[string]string{"equivalence": "pass", "delta": "pass"}, deltaProof(candidateB, candidateD)),
+		"criterion status":        focusedResultEnv(delta, pass("a1"), deltaProof(candidateB, candidateD)),
+		"unknown verdict":         focusedResultEnv(delta, map[string]string{"delta": "partial"}, deltaProof(candidateB, candidateD)),
+		"result drops the flag":   focusedResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: delta.Fix}, pass("delta"), deltaProof(candidateB, candidateD)),
+		"flag dropped, old key":   focusedResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: delta.Fix}, pass("equivalence"), deltaProof(candidateB, candidateD)),
+		"different candidate":     focusedResultEnv(api.ReviewMetadata{Candidate: candidateC, Fix: delta.Fix, TreeDiffers: true}, pass("delta"), deltaProof(candidateB, candidateC)),
+		"record evidence only":    focusedResultEnv(delta, pass("delta"), map[string]api.Evidence{"e1": {Type: "record", Value: "diff of " + candidateB + " and " + candidateD}}),
+		"only the fixed commit":   focusedResultEnv(delta, pass("delta"), command("git show --stat "+candidateD)),
+		"only the reviewed":       focusedResultEnv(delta, pass("delta"), command("git show --stat "+candidateB)),
+		"short commits":           focusedResultEnv(delta, pass("delta"), command("git diff --stat "+candidateB[:12]+" "+candidateD[:12])),
+		"new blocker in verdict":  focusedResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: delta.Fix, TreeDiffers: true, Blockers: []api.ReviewFinding{{ID: "b1", Criterion: "a1", Title: "Changed", File: "fixture.go", Line: 1}}}, pass("delta"), deltaProof(candidateB, candidateD)),
+		"result names a blocker":  focusedResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: delta.Fix, TreeDiffers: true, BlockerIDs: []string{"b1"}}, pass("b1"), deltaProof(candidateB, candidateD)),
+		"result adds a criterion": focusedResultEnv(api.ReviewMetadata{Candidate: candidateD, Fix: delta.Fix, TreeDiffers: true, CriterionIDs: []string{"a2"}}, map[string]string{"delta": "pass", "a2": "pass"}, deltaProof(candidateB, candidateD)),
+	})
+	if st := f.state(t); len(st.Focused) != 2 || st.Focused[1].ResultSeq != 0 || !st.Focused[1].TreeDiffers {
+		t.Fatal("refused result was stored", st)
+	}
+	// A failed delta is recordable and never accepted; the verdict is not replaced.
+	if err = f.focusedResult(request.Seq, delta, map[string]string{"delta": "fail"}, deltaProof(candidateB, candidateD)); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.focusedResult(request.Seq, delta, pass("delta"), deltaProof(candidateB, candidateD)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("verdict replaced", err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateD)
+	for _, c := range []string{candidateC, candidateD} {
+		if err = f.acceptCandidate(c, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("accepted after a later failed delta", c, err)
+		}
+	}
+	f.thirdReviewRefused(t, candidateD)
+	if st := f.state(t); len(st.Rounds) != 2 || len(st.Focused) != 2 || st.Focused[1].Passed {
+		t.Fatal("history", st)
+	}
+}
+
+// One request carries the changed candidate and the round-two partial: a held
+// criterion part added after review, or a rebase with a partial to settle.
+func TestReviewConvergenceChangedCandidateSettlesPartialInOneRequest(t *testing.T) {
+	for name, tc := range map[string]struct {
+		meta  api.ReviewMetadata
+		key   string
+		proof map[string]api.Evidence
+	}{
+		"lead-named fix": {api.ReviewMetadata{Candidate: candidateC, Fix: deltaFix(candidateB), TreeDiffers: true, CriterionIDs: []string{"a2"}}, "delta", deltaProof(candidateB, candidateC)},
+		"equivalence":    {api.ReviewMetadata{Candidate: candidateC, Fix: rebaseFix(candidateB), CriterionIDs: []string{"a2"}}, "equivalence", rebaseProof(candidateB, candidateC)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+			f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+			bare := tc.meta
+			bare.CriterionIDs = nil
+			if _, err := f.focusedRequest(bare); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "needs a converged review") {
+				t.Fatal("changed candidate over an unsettled partial", err)
+			}
+			_, err := f.focusedRequest(tc.meta)
+			receiptRefused(t, "request with no receipt on the changed commit", err)
+			seedPassingVerification(t, f.s, f.item, candidateC)
+			request, err := f.focusedRequest(tc.meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := f.state(t)
+			if len(st.Focused) != 1 || st.Focused[0].TreeDiffers != tc.meta.TreeDiffers || len(st.Focused[0].CriterionIDs) != 1 || st.Focused[0].CriterionIDs[0] != "a2" || len(st.Focused[0].BlockerIDs) != 0 || st.Focused[0].BlockerIDs == nil {
+				t.Fatal("stored request", st)
+			}
+			for label, status := range map[string]map[string]string{
+				"proof only":     {tc.key: "pass"},
+				"criterion only": {"a2": "pass"},
+				"extra key":      {tc.key: "pass", "a2": "pass", "a1": "pass"},
+			} {
+				if err = f.focusedResult(request.Seq, tc.meta, status, tc.proof); !errors.Is(err, api.ErrConflict) {
+					t.Fatal(label, err)
+				}
+			}
+			if err = f.focusedResult(request.Seq, tc.meta, map[string]string{tc.key: "fail", "a2": "pass"}, tc.proof); err != nil {
+				t.Fatal(err)
+			}
+			if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("accepted with a failed proof", err)
+			}
+			f.focusedCheck(t, tc.meta, map[string]string{tc.key: "pass", "a2": "pass"}, tc.proof)
+			f.thirdReviewRefused(t, candidateC)
+			if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("settlement on the changed commit accepted the reviewed one", err)
+			}
+			if err = f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+				t.Fatal(err)
+			}
+			st = f.state(t)
+			if len(st.Rounds) != 2 || st.Rounds[1].Verdicts["a2"] != "partial" || len(st.Focused) != 2 || st.Focused[1].ReceiptGeneration <= 0 || st.Disposition.Candidate != candidateC {
+				t.Fatal("accepted state", st)
+			}
+		})
+	}
+}
+
+// The documented focused examples are valid on the wire as tt send reads them.
+func TestReviewConvergenceDocumentedFocusedExamples(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "message-broker.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, section, found := strings.Cut(string(raw), "\n## Review convergence\n")
+	if !found {
+		t.Fatal("Review convergence section missing")
+	}
+	var settles, differs, equivalence int
+	for i, block := range strings.Split(section, "```json\n") {
+		if i == 0 {
+			continue
+		}
+		example, _, _ := strings.Cut(block, "```")
+		var meta api.ReviewMetadata
+		dec := json.NewDecoder(strings.NewReader(example))
+		dec.DisallowUnknownFields()
+		if err = dec.Decode(&meta); err != nil {
+			t.Fatal("example does not decode", err, example)
+		}
+		if meta.Mode != "focused" {
+			continue
+		}
+		if !validGitCommit(meta.Candidate) || strings.TrimSpace(meta.Fix) == "" {
+			t.Fatal("focused example lacks candidate or fix", example)
+		}
+		if problems := api.ValidateEnvelope(focusedRequestEnv(meta)); len(problems) != 0 {
+			t.Fatal("request envelope invalid", problems, example)
+		}
+		status := map[string]string{}
+		switch {
+		case meta.TreeDiffers:
+			differs++
+			status["delta"] = "pass"
+		case len(meta.CriterionIDs) > 0:
+			settles++
+		default:
+			equivalence++
+			status["equivalence"] = "pass"
+		}
+		for _, id := range meta.CriterionIDs {
+			status[id] = "pass"
+		}
+		if meta.Candidate != candidateB && !strings.Contains(meta.Fix, candidateB) {
+			t.Fatal("changed-candidate example does not name the reviewed commit", example)
+		}
+		if problems := api.ValidateEnvelope(focusedResultEnv(meta, status, deltaProof(candidateB, meta.Candidate))); len(problems) != 0 {
+			t.Fatal("result envelope invalid", problems, example)
+		}
+	}
+	if settles != 1 || differs != 1 || equivalence != 1 {
+		t.Fatal("expected one settlement, one treeDiffers and one equivalence example", settles, differs, equivalence)
 	}
 }

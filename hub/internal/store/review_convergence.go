@@ -238,6 +238,13 @@ func outstanding(state api.ReviewConvergence) map[string]api.ReviewFinding {
 	return out
 }
 func reviewReady(state api.ReviewConvergence, scope int64, candidate string) error {
+	return reviewReadySettling(state, scope, candidate, nil)
+}
+
+// reviewReadySettling also treats the named round-two partial criteria as
+// settled. A focused request uses it to ask whether its own passing result
+// would leave the reviewed candidate converged.
+func reviewReadySettling(state api.ReviewConvergence, scope int64, candidate string, settling []string) error {
 	if state.History == "unknown" {
 		if len(state.Scopes) > 0 {
 			return reviewConflict("legacy review history is unknown; do not infer a fresh lifetime count")
@@ -284,12 +291,33 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 			}
 		}
 	}
+	// A focused record settles a partial in this projection only; the round's
+	// own verdict is never rewritten. The latest verdict on the candidate decides.
+	settled := map[string]bool{}
+	for _, f := range state.Focused {
+		if f.ResultSeq != 0 && f.Candidate == candidate {
+			for _, id := range f.CriterionIDs {
+				settled[id] = f.Passed
+			}
+		}
+	}
+	for _, id := range settling {
+		settled[id] = true
+	}
+	for id, passed := range settled {
+		if passed && verdicts[id] == "partial" {
+			verdicts[id] = "pass"
+		}
+	}
 	for key := range sc.Criteria {
 		if verificationOwned(sc.VerificationCriteria, key) {
 			if verdicts[key] != "pending-verification" {
 				return reviewConflict("verification-owned criterion " + key + " was not pending")
 			}
 			continue
+		}
+		if verdicts[key] == "partial" {
+			return reviewConflict("criterion " + key + " has not passed; a partial with no blocker is settled by focused verification naming it in criterionIds")
 		}
 		if verdicts[key] != "pass" {
 			return reviewConflict("criterion " + key + " has not passed")
@@ -299,15 +327,71 @@ func reviewReady(state api.ReviewConvergence, scope int64, candidate string) err
 		return reviewConflict("unresolved blockers on accepted candidate")
 	}
 	if candidate != last.Candidate {
+		changed := reviewConflict("changed candidate needs exact focused verification: of its blockerIds, of an identical-tree rebase, or of a lead-named fix with treeDiffers")
 		if len(state.Focused) == 0 {
-			return reviewConflict("changed candidate needs exact focused verification")
+			return changed
 		}
 		f := state.Focused[len(state.Focused)-1]
 		if !f.Passed || f.Candidate != candidate {
-			return reviewConflict("changed candidate needs exact focused verification")
+			return changed
 		}
 	}
 	return nil
+}
+
+// receiptGated reports whether accepting the candidate relies on a settled
+// partial or a lead-named fix. Those routes always need the exact receipt.
+func receiptGated(state api.ReviewConvergence, candidate string) bool {
+	for _, f := range state.Focused {
+		if f.Passed && f.Candidate == candidate && (f.TreeDiffers || len(f.CriterionIDs) > 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// exactReceipt returns the generation of the passing receipt for the exact
+// candidate. Unlike verificationReady it also applies to an item that is not
+// enrolled and has no verification-owned criterion.
+func exactReceipt(ctx context.Context, tx *sql.Tx, item api.WorkItem, candidate string) (int64, error) {
+	missing := reviewConflict("passing receipt for the current scope and exact candidate " + candidate + " required")
+	done, err := checkVerificationCompletion(ctx, tx, item, candidate)
+	if errors.Is(err, api.ErrConflict) {
+		return 0, fmt.Errorf("%w (%s)", missing, strings.TrimPrefix(err.Error(), api.ErrConflict.Error()+": "))
+	}
+	if err != nil {
+		return 0, err
+	}
+	if done != nil {
+		return done.ReceiptGeneration, nil
+	}
+	records, err := verificationRecords(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return 0, err
+	}
+	p, r := currentVerification(records)
+	if p == nil || r == nil || p.ScopeRevision != item.ScopeRevision || candidate == "" || p.Commit != candidate {
+		return 0, missing
+	}
+	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return 0, err
+	}
+	if sc := scopeFor(&state, item.ScopeRevision); sc == nil || sc.AssignmentSeq != p.AssignmentSeq {
+		return 0, verificationConflict("assignment changed")
+	}
+	for _, round := range state.Rounds {
+		if round.ReviewerID == r.VerifierAgentID {
+			return 0, verificationConflict("reviewer cannot verify")
+		}
+	}
+	if err = verificationEligible(*p, *r); err != nil {
+		return 0, err
+	}
+	if _, err = validateVerificationKnownFailures(ctx, tx, *p, item, r); err != nil {
+		return 0, err
+	}
+	return currentReceiptGeneration(records), nil
 }
 func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candidate string) error {
 	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
@@ -336,7 +420,13 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
 	if state.Disposition.Kind == "owner-accept" {
 		return nil // the owner explicitly accepted this exact candidate
 	}
-	return reviewReady(state, item.ScopeRevision, state.Disposition.Candidate)
+	if err = reviewReady(state, item.ScopeRevision, state.Disposition.Candidate); err != nil {
+		return err
+	}
+	if receiptGated(state, state.Disposition.Candidate) {
+		_, err = exactReceipt(ctx, tx, item, state.Disposition.Candidate)
+	}
+	return err
 }
 
 // applyReviewConvergence runs after immutable receipt replay and message insertion,
@@ -525,6 +615,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if err = reviewReady(state, item.ScopeRevision, meta.Candidate); err != nil {
 				return err
 			}
+			if receiptGated(state, meta.Candidate) {
+				if _, err = exactReceipt(ctx, tx, item, meta.Candidate); err != nil {
+					return err
+				}
+			}
 		} else if !validGitCommit(meta.Candidate) {
 			return reviewConflict("exact disposition candidate required")
 		}
@@ -543,11 +638,18 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if !validGitCommit(meta.Candidate) || strings.TrimSpace(meta.Fix) == "" {
 			return reviewConflict("focused verification needs exact fix and candidate")
 		}
-		// No blocker IDs: a rebase equivalence verification of the round-two
-		// candidate. The hub checks identity and shape; the verifier attests the
-		// git fact.
+		// No blocker IDs on a changed candidate: a rebase equivalence verification
+		// of the round-two candidate, or with treeDiffers a lead-named fix whose
+		// exact delta the verifier confirms. The hub checks identity and shape; the
+		// verifier attests the git fact. criterionIds may ride on any focused
+		// request, or stand alone on the reviewed candidate, to settle round-two
+		// partials by the passing receipt for the exact candidate.
 		rebase := len(meta.BlockerIDs) == 0
 		reviewed := state.Rounds[1].Candidate
+		route := "rebase verification"
+		if meta.TreeDiffers {
+			route = "treeDiffers verification"
+		}
 		if e.Kind == "request" {
 			if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
 				return err
@@ -580,15 +682,35 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				return reviewConflict("verifier must be original exact reviewer or bound to linked verification item")
 			}
 			open := outstandingOnCandidate(state, meta.Candidate)
-			if rebase {
+			settling := map[string]bool{}
+			for _, id := range meta.CriterionIDs {
+				if settling[id] || sc.Criteria[id] == "" || verificationOwned(sc.VerificationCriteria, id) || state.Rounds[1].Verdicts[id] != "partial" {
+					return reviewConflict("criterionIds must name distinct round-two partial criteria that are not verification-owned")
+				}
+				for _, b := range open {
+					if b.Criterion == id {
+						return reviewConflict("criterion " + id + " has an unresolved blocker; name its blocker ID instead")
+					}
+				}
+				for _, blocker := range meta.BlockerIDs {
+					if blocker == id {
+						return reviewConflict("criterion ID " + id + " is also a named blocker ID")
+					}
+				}
+				settling[id] = true
+			}
+			if meta.TreeDiffers && !rebase {
+				return reviewConflict("treeDiffers verification names no blocker IDs; verify unresolved blockers by ID")
+			}
+			if rebase && (meta.Candidate != reviewed || meta.TreeDiffers || len(meta.CriterionIDs) == 0) {
 				if meta.Candidate == reviewed {
-					return reviewConflict("rebase verification needs a candidate other than the reviewed one")
+					return reviewConflict(route + " needs a candidate other than the reviewed one")
 				}
 				if !strings.Contains(meta.Fix, reviewed) {
-					return reviewConflict("rebase verification fix must name the exact reviewed candidate")
+					return reviewConflict(route + " fix must name the exact reviewed candidate")
 				}
-				if err = reviewReady(state, item.ScopeRevision, reviewed); err != nil {
-					return reviewConflict("rebase verification needs a converged review; name unresolved blocker IDs instead")
+				if err = reviewReadySettling(state, item.ScopeRevision, reviewed, meta.CriterionIDs); err != nil {
+					return reviewConflict(route + " needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds")
 				}
 				if len(open) != 0 {
 					return reviewConflict("unresolved blockers on rebased candidate; name them for focused verification")
@@ -601,6 +723,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				}
 				seen[id] = true
 			}
+			if len(meta.CriterionIDs) > 0 {
+				if _, err = exactReceipt(ctx, tx, item, meta.Candidate); err != nil {
+					return err
+				}
+			}
 			if len(state.Focused) > 0 && state.Focused[len(state.Focused)-1].ResultSeq == 0 {
 				return reviewConflict("focused verification pending")
 			}
@@ -608,7 +735,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if rebase {
 				ids = []string{} // stored as [], never null
 			}
-			state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: m.Seq, Candidate: meta.Candidate, Fix: meta.Fix, BlockerIDs: ids, ReviewerID: target.ID, ReviewerRun: target.RunID, VerificationItemID: meta.VerificationItemID})
+			var criteria []string
+			if len(meta.CriterionIDs) > 0 {
+				criteria = meta.CriterionIDs
+			}
+			state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: m.Seq, Candidate: meta.Candidate, Fix: meta.Fix, BlockerIDs: ids, CriterionIDs: criteria, TreeDiffers: meta.TreeDiffers, ReviewerID: target.ID, ReviewerRun: target.RunID, VerificationItemID: meta.VerificationItemID})
 			state.Disposition = nil
 		} else if e.Kind == "result" {
 			found := false
@@ -621,32 +752,57 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				if f.ResultSeq != 0 || f.ReviewerID != req.AgentID || f.ReviewerRun != req.RunID || f.Candidate != meta.Candidate || f.Fix != meta.Fix || (len(f.BlockerIDs)+len(meta.BlockerIDs) != 0 && !reflect.DeepEqual(f.BlockerIDs, meta.BlockerIDs)) || f.VerificationItemID != meta.VerificationItemID {
 					return reviewConflict("focused result identity, fix or candidate mismatch")
 				}
-				if len(f.BlockerIDs) == 0 {
-					verdict := e.Body.Status["equivalence"]
-					if len(meta.Blockers) > 0 || len(meta.Findings) > 0 || len(e.Body.Status) != 1 || (verdict != "pass" && verdict != "fail") {
-						return reviewConflict("rebase result reports exactly equivalence pass or fail")
+				if f.TreeDiffers != meta.TreeDiffers || (len(f.CriterionIDs)+len(meta.CriterionIDs) != 0 && !reflect.DeepEqual(f.CriterionIDs, meta.CriterionIDs)) {
+					return reviewConflict("focused result criterionIds or treeDiffers mismatch")
+				}
+				// Status holds exactly: each blocker ID, each criterion ID, and for a
+				// changed candidate with no blocker either equivalence (identical
+				// tree) or delta (treeDiffers). The two are never interchangeable.
+				keys := append(append([]string{}, f.BlockerIDs...), f.CriterionIDs...)
+				proof := ""
+				if len(f.BlockerIDs) == 0 && f.Candidate != reviewed {
+					proof = "equivalence"
+					if f.TreeDiffers {
+						proof = "delta"
 					}
+					keys = append(keys, proof)
+				}
+				shape := "focused result verifies exactly the named fixes with evidence; Status reports pass or fail for exactly " + strings.Join(keys, ", ")
+				if proof == "equivalence" && len(f.CriterionIDs) == 0 {
+					shape = "rebase result reports exactly equivalence pass or fail"
+				}
+				if len(meta.Blockers) > 0 || len(meta.Findings) > 0 || len(e.Evidence) == 0 || len(e.Body.Status) != len(keys) {
+					return reviewConflict(shape)
+				}
+				passed := true
+				for _, key := range keys {
+					if e.Body.Status[key] != "pass" && e.Body.Status[key] != "fail" {
+						return reviewConflict(shape)
+					}
+					passed = passed && e.Body.Status[key] == "pass"
+				}
+				if proof != "" {
 					proven := false
 					for _, ev := range e.Evidence {
 						proven = proven || (ev.Type == "command" && strings.Contains(ev.Value, reviewed) && strings.Contains(ev.Value, f.Candidate))
 					}
 					if !proven {
+						if proof == "delta" {
+							return reviewConflict("delta result needs command evidence naming the reviewed and changed candidates")
+						}
 						return reviewConflict("rebase result needs command evidence naming the reviewed and rebased candidates")
 					}
-					f.Passed = verdict == "pass"
-					f.ResultSeq = m.Seq
-					continue
 				}
-				if len(meta.Blockers) > 0 || len(meta.Findings) > 0 || len(e.Evidence) == 0 || len(e.Body.Status) != len(f.BlockerIDs) {
-					return reviewConflict("focused result verifies exactly the named fixes with evidence")
+				settles := len(f.CriterionIDs) > 0
+				for _, id := range f.CriterionIDs {
+					settles = settles && e.Body.Status[id] == "pass"
 				}
-				f.Passed = true
-				for _, id := range f.BlockerIDs {
-					if e.Body.Status[id] != "pass" && e.Body.Status[id] != "fail" {
-						return reviewConflict("focused verdict must name each blocker")
+				if settles {
+					if f.ReceiptGeneration, err = exactReceipt(ctx, tx, item, f.Candidate); err != nil {
+						return err
 					}
-					f.Passed = f.Passed && e.Body.Status[id] == "pass"
 				}
+				f.Passed = passed
 				f.ResultSeq = m.Seq
 			}
 			if !found {
