@@ -3382,3 +3382,441 @@ func TestReleaseBatchTablesSurviveReopen(t *testing.T) {
 		t.Fatal("batch job deleted", err)
 	}
 }
+
+// holdFixture is a project with n verified release jobs in queue order, each
+// for its own item.
+func holdFixture(t *testing.T, n int) (*Store, api.Task, api.Agent, api.Agent, []api.ReleaseJob) {
+	t.Helper()
+	s, task, h, d, entry := releaseFixture(t)
+	jobs := make([]api.ReleaseJob, 0, n)
+	for i := range n {
+		if i > 0 {
+			entry = releaseEntry(t, s, task, fmt.Sprintf("held line item %d", i+1), fmt.Sprintf("held-line-%d", i+1))
+		}
+		j, err := s.ReleaseAction(context.Background(), task.ID, api.ReleaseRequest{RequestID: fmt.Sprintf("enqueue-%d", i+1), Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs = append(jobs, j)
+	}
+	return s, task, h, d, jobs
+}
+
+func holdRequest(key string, h api.Agent, j api.ReleaseJob, reason string, items ...string) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: "hold", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Hold: &api.ReleaseHold{Reason: reason, UntilItems: items}}
+}
+
+func unholdRequest(key string, h api.Agent, j api.ReleaseJob, reason string) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: "unhold", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Hold: &api.ReleaseHold{Reason: reason}}
+}
+
+func claimRequest(key string, d api.Agent, j api.ReleaseJob) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+}
+
+// releaseThrough takes a verified job through claim, merged and a released
+// finish as the deployer.
+func releaseThrough(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	var err error
+	if j, err = s.ReleaseAction(ctx, task.ID, claimRequest(j.ID+"-claim", d, j)); err != nil {
+		t.Fatal(err)
+	}
+	if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: j.ID + "-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+		t.Fatal(err)
+	}
+	finish := api.ReleaseRequest{RequestID: j.ID + "-finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+	if j, err = s.ReleaseAction(ctx, task.ID, finish); err != nil || j.State != "released" {
+		t.Fatal(j.State, err)
+	}
+	return j
+}
+
+// wi_0c5c5add2242991b a1: the handler holds a verified job; the deployer's
+// claim of it is refused and its claim of the next verified job succeeds.
+func TestReleaseHoldKeepsVerifiedJobFromClaim(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 2)
+	ctx := context.Background()
+	a, b := jobs[0], jobs[1]
+	before := time.Now().Add(-time.Second)
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, a, "Safety fixes must release first", b.ItemID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.State != "held" || held.Generation != a.Generation+1 || held.AgentID != "" || held.RunID != "" {
+		t.Fatalf("held job %+v", held)
+	}
+	hold := held.Hold
+	if hold == nil || hold.Reason != "Safety fixes must release first" || !slices.Equal(hold.UntilItems, []string{b.ItemID}) || hold.AgentID != h.ID || hold.RunID != h.RunID {
+		t.Fatalf("hold %+v", hold)
+	}
+	if at, perr := time.Parse(time.RFC3339Nano, hold.HeldAt); perr != nil || at.Before(before) {
+		t.Fatal("heldAt", hold.HeldAt, perr)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, a.ID); err != nil || saved.State != "held" || saved.Hold == nil || saved.Hold.Reason != hold.Reason {
+		t.Fatal("saved", saved.State, err)
+	}
+	_, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-held", d, held))
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") || !strings.Contains(err.Error(), "owner hold (Safety fixes must release first)") {
+		t.Fatal("claim of a held job", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, a.ID); err != nil || saved.State != "held" || saved.Generation != held.Generation || saved.AgentID != "" {
+		t.Fatal("refused claim changed the held job", saved.State, err)
+	}
+	next, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-next", d, b))
+	if err != nil || next.State != "claimed" || next.AgentID != d.ID || next.RunID != d.RunID {
+		t.Fatal("the next verified job was not claimed", next.State, err)
+	}
+}
+
+// a2: unhold returns the job to verified in its original queue position and
+// the history keeps both transitions.
+func TestReleaseUnholdMakesJobClaimable(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 2)
+	ctx := context.Background()
+	a, b := jobs[0], jobs[1]
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, a, "Owner wants to read the change first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, unholdRequest("unhold-verified", h, b, "nothing to release")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not on hold") {
+		t.Fatal("unhold of a verified job", err)
+	}
+	free, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold", h, held, "Owner go at message 100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if free.State != "verified" || free.Hold != nil || free.Generation != held.Generation+1 || free.AgentID != "" {
+		t.Fatalf("unheld job %+v", free)
+	}
+	history := free.HoldHistory
+	if len(history) != 2 {
+		t.Fatalf("history %+v", history)
+	}
+	if e := history[0]; e.Action != "hold" || e.Cause != "" || e.Reason != "Owner wants to read the change first" || e.AgentID != h.ID || e.RunID != h.RunID || e.Generation != held.Generation || e.At == "" {
+		t.Fatalf("hold event %+v", e)
+	}
+	if e := history[1]; e.Action != "release" || e.Cause != "handler" || e.Reason != "Owner go at message 100" || e.AgentID != h.ID || e.RunID != h.RunID || e.Generation != free.Generation || e.At == "" || e.TriggerJobID != "" {
+		t.Fatalf("release event %+v", e)
+	}
+	line, err := s.Releases(ctx, task.ID)
+	if err != nil || len(line) != 2 || line[0].ID != a.ID || line[1].ID != b.ID || line[0].State != "verified" {
+		t.Fatal("queue order", line, err)
+	}
+	claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim", d, free))
+	if err != nil || claimed.State != "claimed" || claimed.RunID != d.RunID || len(claimed.HoldHistory) != 2 {
+		t.Fatal("unheld job was not claimable", claimed.State, err)
+	}
+}
+
+// a3: a hold applies only before a claim; a claimed or terminal job is left
+// exactly as it was and the refusal points to set-aside.
+func TestReleaseHoldRefusesClaimedAndTerminalJobs(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 3)
+	ctx := context.Background()
+	refuse := func(name string, j api.ReleaseJob) {
+		t.Helper()
+		row := releaseRow(t, s, task, j.ID)
+		_, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold-"+name, h, j, "Hold it"))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment set-aside") || !strings.Contains(err.Error(), j.State) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if releaseRow(t, s, task, j.ID) != row {
+			t.Fatalf("%s: refused hold changed the job", name)
+		}
+	}
+	a, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-a", d, jobs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refuse("claimed", a)
+	if a, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "refuse-a", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: a.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	refuse("refused", a)
+	refuse("released", releaseThrough(t, s, task, d, jobs[1]))
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+	c, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede-c", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: jobs[2].ID, ExpectedGeneration: jobs[2].Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refuse("superseded", c)
+}
+
+// a4: hold and unhold are the handler's, at the exact generation, and replay
+// by request ID.
+func TestReleaseHoldRequiresHandlerAndGeneration(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 1)
+	ctx := context.Background()
+	a := jobs[0]
+	row := releaseRow(t, s, task, a.ID)
+	if _, err := s.ReleaseAction(ctx, task.ID, holdRequest("by-deployer", d, a, "Hold it")); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("deployer held a job", err)
+	}
+	stale := holdRequest("stale", h, a, "Hold it")
+	stale.ExpectedGeneration++
+	if _, err := s.ReleaseAction(ctx, task.ID, stale); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "generation changed") {
+		t.Fatal("stale generation", err)
+	}
+	if releaseRow(t, s, task, a.ID) != row {
+		t.Fatal("refused hold changed the job")
+	}
+	req := holdRequest("hold", h, a, "Hold it")
+	held, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.ReleaseAction(ctx, task.ID, req); err != nil || again.Generation != held.Generation || again.State != "held" || len(again.HoldHistory) != 1 {
+		t.Fatal("replay", again.Generation, err)
+	}
+	changed := holdRequest("hold", h, a, "Another reason")
+	if _, err = s.ReleaseAction(ctx, task.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed hold replayed", err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, holdRequest("hold-again", h, held, "Hold it twice")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "already on hold (Hold it)") {
+		t.Fatal("second hold", err)
+	}
+	row = releaseRow(t, s, task, a.ID)
+	if _, err = s.ReleaseAction(ctx, task.ID, unholdRequest("unhold-by-deployer", d, held, "Go")); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("deployer released a hold", err)
+	}
+	stale = unholdRequest("unhold-stale", h, held, "Go")
+	stale.ExpectedGeneration--
+	if _, err = s.ReleaseAction(ctx, task.ID, stale); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "generation changed") {
+		t.Fatal("stale unhold", err)
+	}
+	for name, bad := range map[string]*api.ReleaseHold{"no record": nil, "no reason": {}, "two lines": {Reason: "Go\nnow"}, "items": {Reason: "Go", UntilItems: []string{a.ItemID}}} {
+		r := unholdRequest("unhold-bad-"+strings.ReplaceAll(name, " ", "-"), h, held, "")
+		r.Hold = bad
+		if _, err = s.ReleaseAction(ctx, task.ID, r); !errors.Is(err, api.ErrInvalid) {
+			t.Fatal("unhold", name, err)
+		}
+	}
+	if releaseRow(t, s, task, a.ID) != row {
+		t.Fatal("refused unhold changed the job")
+	}
+	free := unholdRequest("unhold", h, held, "Go")
+	done, err := s.ReleaseAction(ctx, task.ID, free)
+	if err != nil || done.State != "verified" {
+		t.Fatal(done.State, err)
+	}
+	if again, err := s.ReleaseAction(ctx, task.ID, free); err != nil || again.Generation != done.Generation || again.State != "verified" {
+		t.Fatal("unhold replay", again.Generation, err)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, unholdRequest("unhold", h, held, "Go later")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed unhold replayed", err)
+	}
+}
+
+// a4: the reason and the named items are checked before anything is saved.
+func TestReleaseHoldValidation(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 3)
+	ctx := context.Background()
+	a, b, c := jobs[0], jobs[1], jobs[2]
+	row := releaseRow(t, s, task, a.ID)
+	many := make([]string, 17)
+	for i := range many {
+		many[i] = api.NewID("wi")
+	}
+	keys := 0
+	refuse := func(name string, want error, text string, hold *api.ReleaseHold) {
+		t.Helper()
+		keys++
+		req := holdRequest(fmt.Sprintf("bad-%d", keys), h, a, "")
+		req.Hold = hold
+		_, err := s.ReleaseAction(ctx, task.ID, req)
+		if !errors.Is(err, want) || !strings.Contains(err.Error(), text) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if releaseRow(t, s, task, a.ID) != row {
+			t.Fatalf("%s: refused hold changed the job", name)
+		}
+	}
+	refuse("no record", api.ErrInvalid, "", nil)
+	refuse("no reason", api.ErrInvalid, "", &api.ReleaseHold{})
+	refuse("two line reason", api.ErrInvalid, "", &api.ReleaseHold{Reason: "Hold\nit"})
+	refuse("long reason", api.ErrInvalid, "", &api.ReleaseHold{Reason: strings.Repeat("r", 513)})
+	refuse("malformed item", api.ErrInvalid, "", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{"item-one"}})
+	refuse("duplicate item", api.ErrInvalid, "", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{b.ItemID, b.ItemID}})
+	refuse("seventeen items", api.ErrInvalid, "", &api.ReleaseHold{Reason: "Hold it", UntilItems: many})
+	refuse("own item", api.ErrConflict, "its own item", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{a.ItemID}})
+	unknown := api.NewID("wi")
+	refuse("unknown item", api.ErrConflict, "named item "+unknown+" is not a work item of this project", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{b.ItemID, unknown}})
+	other := secondTask(t, s)
+	foreign, err := s.CreateWorkItem(ctx, other.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "another project's item", RequestID: "foreign"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refuse("another project's item", api.ErrConflict, "is not a work item of this project", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{foreign.ID}})
+	releaseThrough(t, s, task, d, b)
+	refuse("condition already met", api.ErrConflict, "the named items are already released", &api.ReleaseHold{Reason: "Hold it", UntilItems: []string{b.ItemID}})
+	// One of two named items released is a condition still open.
+	if held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold-open", h, a, "Hold it", b.ItemID, c.ItemID)); err != nil || held.State != "held" {
+		t.Fatal(held.State, err)
+	}
+	// A requeue may leave the host release lock with the job.
+	locked := rewriteJob(t, s, c, func(j *api.ReleaseJob) {
+		j.Reconciliations = append(j.Reconciliations, api.ReleaseReconciliation{Disposition: "requeue", LockDigest: strings.Repeat("e", 64)})
+	})
+	if _, err = s.ReleaseAction(ctx, task.ID, holdRequest("hold-locked", h, locked, "Hold it")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "host release lock") {
+		t.Fatal("hold on a requeued job with a host lock", err)
+	}
+}
+
+// a5: a held job is outside the release line: no batch takes it, set-aside
+// does not count it as waiting, and reconcile and supersede wait for unhold.
+func TestReleaseHeldJobIsOutsideTheLine(t *testing.T) {
+	ctx := context.Background()
+	f := newBatchFixture(t, 1)
+	held, err := f.s.ReleaseAction(ctx, f.task.ID, holdRequest("hold", f.h, f.members[0], "Wait for the owner"))
+	if err != nil || held.State != "held" {
+		t.Fatal(held.State, err)
+	}
+	row := releaseRow(t, f.s, f.task, held.ID)
+	// The lead is claimed with no effects, and the only job behind it is held.
+	evidence := setAsideEvidence(t, f.s, f.task, f.h, f.lead)
+	aside := api.ReleaseRequest{RequestID: "set-aside", Operation: "set-aside", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.lead.ID, ExpectedGeneration: f.lead.Generation, Reconciliation: &evidence}
+	if _, err = f.s.ReleaseAction(ctx, f.task.ID, aside); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "no later verified job is waiting") {
+		t.Fatal("set-aside counted a held job as waiting", err)
+	}
+	if _, err = f.deployer("batch-open", "", batchBase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", f.lead.EntryID, batchTo(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", held.EntryID, candidateA); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not an unclaimed verified job") {
+		t.Fatal("a held job joined a batch", err)
+	}
+	if b := f.batch(t, f.lead.ID); len(b.Jobs) != 1 {
+		t.Fatalf("batch %+v", b.Jobs)
+	}
+	recovery := recoveryEvidence(t, f.s, f.task, f.h, held)
+	reconcile := api.ReleaseRequest{RequestID: "reconcile-held", Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, JobID: held.ID, ExpectedGeneration: held.Generation, Reconciliation: &recovery}
+	if _, err = f.s.ReleaseAction(ctx, f.task.ID, reconcile); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") {
+		t.Fatal("held job reconciled", err)
+	}
+	hand := recordHandRelease(t, f.s, f.task, "hand", candidateB, []string{candidateB})
+	supersede := func(key string, j api.ReleaseJob) (api.ReleaseJob, error) {
+		return f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	}
+	if _, err = supersede("supersede-held", held); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") {
+		t.Fatal("held job superseded", err)
+	}
+	if releaseRow(t, f.s, f.task, held.ID) != row {
+		t.Fatal("a refused operation changed the held job")
+	}
+	free, err := f.s.ReleaseAction(ctx, f.task.ID, unholdRequest("unhold", f.h, held, "Owner go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done, err := supersede("supersede", free); err != nil || done.State != "superseded" || len(done.HoldHistory) != 2 {
+		t.Fatal("unheld job was not supersedable", done.State, err)
+	}
+}
+
+// a6: the active page shows the held job with its hold; the settled page
+// carries none.
+func TestReleasesPageShowsHold(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 3)
+	ctx := context.Background()
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, jobs[0], "Owner hold until the fix ships", jobs[2].ItemID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := releaseThrough(t, s, task, d, jobs[1])
+	active, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{})
+	if err != nil || len(active.Jobs) != 2 {
+		t.Fatal(active.Jobs, err)
+	}
+	first := active.Jobs[0]
+	if first.ID != held.ID || first.State != "held" || first.Generation != held.Generation || first.Hold == nil || first.Hold.Reason != "Owner hold until the fix ships" || !slices.Equal(first.Hold.UntilItems, []string{jobs[2].ItemID}) || first.Hold.AgentID != h.ID || first.Hold.HeldAt == "" {
+		t.Fatalf("held summary %+v %+v", first, first.Hold)
+	}
+	if second := active.Jobs[1]; second.ID != jobs[2].ID || second.State != "verified" || second.Hold != nil {
+		t.Fatalf("verified summary %+v", second)
+	}
+	settled, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{View: "settled"})
+	if err != nil || len(settled.Jobs) != 1 || settled.Jobs[0].ID != released.ID || settled.Jobs[0].Hold != nil {
+		t.Fatal(settled.Jobs, err)
+	}
+	// The wire form the CLI and the runner read.
+	raw, _ := json.Marshal(first)
+	var wire map[string]json.RawMessage
+	if json.Unmarshal(raw, &wire) != nil || !strings.Contains(string(wire["hold"]), `"reason":"Owner hold until the fix ships"`) || string(wire["state"]) != `"held"` {
+		t.Fatal(string(raw))
+	}
+}
+
+// a7: a hold that names items lifts itself when the last of them is released
+// or superseded; a hold with no items is lifted only by unhold.
+func TestReleaseHoldLiftsWhenNamedItemsRelease(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 6)
+	ctx := context.Background()
+	a, b, c, plain, e, f := jobs[0], jobs[1], jobs[2], jobs[3], jobs[4], jobs[5]
+	hold := func(key string, j api.ReleaseJob, items ...string) api.ReleaseJob {
+		t.Helper()
+		held, err := s.ReleaseAction(ctx, task.ID, holdRequest(key, h, j, "Wait for the safety fixes", items...))
+		if err != nil || held.State != "held" {
+			t.Fatal(key, held.State, err)
+		}
+		return held
+	}
+	load := func(j api.ReleaseJob) api.ReleaseJob {
+		t.Helper()
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saved
+	}
+	a = hold("hold-a", a, b.ItemID, c.ItemID)
+	plain = hold("hold-plain", plain)
+	e = hold("hold-e", e, b.ItemID, f.ItemID)
+	rows := map[string]string{a.ID: releaseRow(t, s, task, a.ID), plain.ID: releaseRow(t, s, task, plain.ID), e.ID: releaseRow(t, s, task, e.ID), f.ID: releaseRow(t, s, task, f.ID)}
+	unchanged := func(when string, ids ...string) {
+		t.Helper()
+		for _, id := range ids {
+			if releaseRow(t, s, task, id) != rows[id] {
+				t.Fatalf("%s: job %s was rewritten", when, id)
+			}
+		}
+	}
+	// The first named item releases: both conditions are still open.
+	releaseThrough(t, s, task, d, b)
+	unchanged("after the first item", a.ID, plain.ID, e.ID, f.ID)
+	// The second: a lifts, with the settling job as its trigger.
+	released := releaseThrough(t, s, task, d, c)
+	unchanged("after the second item", plain.ID, e.ID, f.ID)
+	lifted := load(a)
+	if lifted.State != "verified" || lifted.Hold != nil || lifted.Generation != a.Generation+1 || len(lifted.HoldHistory) != 2 {
+		t.Fatalf("lifted job %+v", lifted)
+	}
+	if ev := lifted.HoldHistory[1]; ev.Action != "release" || ev.Cause != "items_released" || ev.TriggerJobID != released.ID || ev.AgentID != "" || ev.Generation != lifted.Generation || ev.At == "" || !slices.Equal(ev.UntilItems, []string{b.ItemID, c.ItemID}) {
+		t.Fatalf("lift event %+v", ev)
+	}
+	// A hand release that supersedes the last named item's job lifts too.
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+	gone, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede-f", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: f.ID, ExpectedGeneration: f.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	if err != nil || gone.State != "superseded" {
+		t.Fatal(gone.State, err)
+	}
+	unchanged("after the supersession", plain.ID)
+	lifted = load(e)
+	if lifted.State != "verified" || lifted.Hold != nil || len(lifted.HoldHistory) != 2 || lifted.HoldHistory[1].Cause != "items_released" || lifted.HoldHistory[1].TriggerJobID != f.ID {
+		t.Fatalf("job lifted by a supersession %+v", lifted)
+	}
+	// Queue order is the original one, and the lifted job is claimable.
+	line, err := s.Releases(ctx, task.ID)
+	if err != nil || len(line) != 6 || line[0].ID != a.ID || line[3].ID != plain.ID || line[4].ID != e.ID {
+		t.Fatal("queue order", err)
+	}
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-lifted", d, load(a))); err != nil || claimed.State != "claimed" {
+		t.Fatal("lifted job was not claimable", claimed.State, err)
+	}
+	if still := load(plain); still.State != "held" || still.Hold == nil || len(still.HoldHistory) != 1 {
+		t.Fatalf("a hold with no items lifted by itself: %+v", still)
+	}
+}

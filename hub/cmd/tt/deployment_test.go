@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"net/http"
 	"net/http/httptest"
@@ -602,5 +603,220 @@ func TestDeploymentDedicatedCompatibilityCLILeavesOrdinaryReadsStrict(t *testing
 	out, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"compat-list"}) })
 	if err == nil || out != "" || posts != 0 {
 		t.Fatal(out, err, posts)
+	}
+}
+
+// holdHub is a hub that saves release actions, serves the job's item and
+// records board posts; failPost makes the board refuse.
+type holdHub struct {
+	task     string
+	job      api.ReleaseJob
+	requests []string
+	actions  []api.ReleaseRequest
+	posts    []api.PostMessageRequest
+	failPost bool
+}
+
+func newHoldHub(t *testing.T) (*holdHub, env) {
+	t.Helper()
+	h := &holdHub{task: "tsk_0123456789abcdef", job: api.ReleaseJob{ID: "rel_0123456789abcdef", ItemID: "wi_0123456789abcdef", ItemRevision: 2, OrderMessageSeq: 41, Commit: strings.Repeat("c", 40)}}
+	h.job.TaskID = h.task
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.requests = append(h.requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/work-items/"+h.job.ItemID):
+			// The item moved on after the job's accepted revision.
+			_ = json.NewEncoder(w).Encode(api.WorkItem{ID: h.job.ItemID, TaskID: h.task, Revision: 5})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/releases/actions"):
+			var req api.ReleaseRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			h.actions = append(h.actions, req)
+			out := h.job
+			out.Generation = req.ExpectedGeneration + 1
+			out.State = "verified"
+			if req.Operation == "hold" {
+				out.State = "held"
+				out.Hold = &api.ReleaseHold{Reason: req.Hold.Reason, UntilItems: req.Hold.UntilItems, AgentID: req.AgentID, RunID: req.RunID, HeldAt: "2026-10-07T09:00:00Z"}
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(out)
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages"):
+			var req api.PostMessageRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			h.posts = append(h.posts, req)
+			if h.failPost {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "conflict: board unavailable"})
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(api.Message{Seq: 77})
+		default:
+			t.Error("unexpected request", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(hub.Close)
+	return h, env{hub: hub.URL, task: h.task, agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+}
+
+// wi_0c5c5add2242991b a8: hold sends the typed request, then posts one typed
+// notice; bad input never reaches the hub.
+func TestDeploymentHoldSendsRequestThenNotice(t *testing.T) {
+	h, e := newHoldHub(t)
+	hold := func(args ...string) (string, error) {
+		return captureRelayOutput(t, false, func() error { return cmdDeployment(e, append([]string{"hold"}, args...)) })
+	}
+	base := []string{"--job", h.job.ID, "--generation", "1", "--request-id", "hold-1"}
+	with := func(extra ...string) []string { return append(append([]string{}, base...), extra...) }
+	many := make([]string, 17)
+	for i := range many {
+		many[i] = fmt.Sprintf("wi_%016x", i+1)
+	}
+	for name, c := range map[string]struct {
+		args []string
+		want string
+	}{
+		"no reason":       {base, "--reason"},
+		"blank reason":    {with("--reason", "  "), "--reason"},
+		"two line reason": {with("--reason", "wait\nreally"), "--reason"},
+		"long reason":     {with("--reason", strings.Repeat("r", 513)), "--reason"},
+		"no job":          {[]string{"--generation", "1", "--request-id", "hold-1", "--reason", "wait"}, "--job"},
+		"malformed item":  {with("--reason", "wait", "--until-items", "wi_0123456789abcdee,item-two"), "work item IDs"},
+		"empty item":      {with("--reason", "wait", "--until-items", "wi_0123456789abcdee,"), "work item IDs"},
+		"repeated item":   {with("--reason", "wait", "--until-items", "wi_0123456789abcdee,wi_0123456789abcdee"), "twice"},
+		"too many items":  {with("--reason", "wait", "--until-items", strings.Join(many, ",")), "at most 16"},
+	} {
+		if _, err := hold(c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(h.requests) != 0 {
+		t.Fatalf("refused holds reached the hub: %v", h.requests)
+	}
+	if _, err := hold("--job", h.job.ID, "--generation", "1", "--reason", "wait"); err == nil || !strings.Contains(err.Error(), "request-id") || len(h.actions) != 0 || len(h.posts) != 0 {
+		t.Fatal("hold without a request id", err, h.requests)
+	}
+	h.requests = nil
+	out, err := hold(with("--reason", "Safety fixes must release first.", "--until-items", "wi_0123456789abcdee, wi_0123456789abcdef")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.actions) != 1 || len(h.posts) != 1 || h.requests[0] != "POST /v1/tasks/"+h.task+"/releases/actions" || !strings.HasSuffix(h.requests[len(h.requests)-1], "/messages") {
+		t.Fatalf("requests %v", h.requests)
+	}
+	got := h.actions[0]
+	if got.Operation != "hold" || got.RequestID != "hold-1" || got.AgentID != e.agent || got.RunID != e.runID || got.JobID != h.job.ID || got.ExpectedGeneration != 1 || got.Hold == nil || got.Hold.Reason != "Safety fixes must release first." || len(got.Hold.UntilItems) != 2 || got.Hold.UntilItems[0] != "wi_0123456789abcdee" || got.Hold.UntilItems[1] != "wi_0123456789abcdef" || got.Hold.AgentID != "" || got.Retry != nil {
+		t.Fatalf("hold request %+v %+v", got, got.Hold)
+	}
+	var printed api.ReleaseJob
+	if json.Unmarshal([]byte(out), &printed) != nil || printed.State != "held" || printed.Hold == nil {
+		t.Fatal("output", out)
+	}
+	post := h.posts[0]
+	if post.Envelope == nil || post.Envelope.Kind != api.EnvelopeKindNotice || post.Envelope.Subject != "A release job is on hold" || post.Envelope.To != "" || post.To != "" || post.Text != api.RenderText(*post.Envelope) {
+		t.Fatalf("notice %+v", post)
+	}
+	if problems := api.ValidateEnvelope(*post.Envelope); len(problems) != 0 {
+		t.Fatal(problems)
+	}
+	if post.Envelope.Refs["release-job"] != h.job.ID || post.Envelope.Refs["item"] != h.job.ItemID || post.RequestID != h.job.ID+"-hold-g2" || post.AgentID != e.agent || post.RunID != e.runID {
+		t.Fatalf("notice identity %+v %v", post, post.Envelope.Refs)
+	}
+	text := post.Envelope.Body.Text
+	for _, want := range []string{h.job.ID, h.job.ItemID, "cccccccccccc)", "Reason: Safety fixes must release first. Held by " + e.agent, "wi_0123456789abcdee, wi_0123456789abcdef", "will not claim it", "tt deployment unhold"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice text lacks %q: %s", want, text)
+		}
+	}
+	if len(post.WorkItems) != 1 || post.WorkItems[0] != (api.MessageWorkItem{ItemTaskID: h.task, ItemID: h.job.ItemID, ItemRevision: 5, Relationship: "primary"}) || post.WorkOrderMessage == nil || *post.WorkOrderMessage != (api.MessageReference{TaskID: h.task, Seq: 41}) {
+		t.Fatalf("notice links %+v %+v", post.WorkItems, post.WorkOrderMessage)
+	}
+	// A hold with no items says how it ends.
+	if _, err = hold("--job", h.job.ID, "--generation", "3", "--request-id", "hold-2", "--reason", "Owner reads it first"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(h.posts); n != 2 || h.actions[1].Hold.UntilItems != nil || !strings.Contains(h.posts[1].Envelope.Body.Text, "stays on hold until tt deployment unhold") || h.posts[1].RequestID != h.job.ID+"-hold-g4" {
+		t.Fatalf("plain hold %+v", h.posts)
+	}
+	if err := cmdDeployment(e, nil); err == nil || !strings.Contains(err.Error(), "|set-aside|hold|unhold|refuse|") {
+		t.Fatal("usage does not list hold and unhold", err)
+	}
+	// Other operations carry no hold record and post nothing.
+	if _, err := captureRelayOutput(t, false, func() error {
+		return cmdDeployment(e, []string{"claim", "--job", h.job.ID, "--generation", "1", "--request-id", "claim-1"})
+	}); err != nil || len(h.actions) != 3 || h.actions[2].Operation != "claim" || h.actions[2].Hold != nil || len(h.posts) != 2 {
+		t.Fatalf("claim %+v %v", h.actions, err)
+	}
+}
+
+// a8: a hold whose notice cannot be posted stands, and the command says so
+// with the notice to post.
+func TestDeploymentHoldReportsSavedHoldWhenNoticeFails(t *testing.T) {
+	h, e := newHoldHub(t)
+	h.failPost = true
+	out, err := captureRelayOutput(t, false, func() error {
+		return cmdDeployment(e, []string{"hold", "--job", h.job.ID, "--generation", "1", "--request-id", "hold-1", "--reason", "Owner reads it first"})
+	})
+	if err == nil || len(h.actions) != 1 || len(h.posts) != 1 {
+		t.Fatal("failed post was not reported", err, h.requests)
+	}
+	for _, want := range []string{"job " + h.job.ID + " is on hold at generation 2", "board notice was not posted", "board unavailable", "linked to item " + h.job.ItemID, "NOTICE: A release job is on hold", "Reason: Owner reads it first."} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error lacks %q: %v", want, err)
+		}
+	}
+	if !strings.Contains(out, `"state": "held"`) && !strings.Contains(out, `"state":"held"`) {
+		t.Fatal("the saved job was not printed", out)
+	}
+}
+
+// a8: unhold sends the typed request, then posts one typed notice.
+func TestDeploymentUnholdSendsRequestThenNotice(t *testing.T) {
+	h, e := newHoldHub(t)
+	unhold := func(args ...string) (string, error) {
+		return captureRelayOutput(t, false, func() error { return cmdDeployment(e, append([]string{"unhold"}, args...)) })
+	}
+	base := []string{"--job", h.job.ID, "--generation", "2", "--request-id", "unhold-1"}
+	for name, c := range map[string]struct {
+		args []string
+		want string
+	}{
+		"no reason": {base, "--reason"},
+		"no job":    {[]string{"--generation", "2", "--request-id", "unhold-1", "--reason", "go"}, "--job"},
+		"items":     {append(append([]string{}, base...), "--reason", "go", "--until-items", "wi_0123456789abcdee"), "does not accept --until-items"},
+	} {
+		if _, err := unhold(c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(h.requests) != 0 {
+		t.Fatalf("refused unholds reached the hub: %v", h.requests)
+	}
+	out, err := unhold(append(append([]string{}, base...), "--reason", "Owner go for the release")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.actions) != 1 || len(h.posts) != 1 {
+		t.Fatalf("requests %v", h.requests)
+	}
+	got := h.actions[0]
+	if got.Operation != "unhold" || got.RequestID != "unhold-1" || got.AgentID != e.agent || got.RunID != e.runID || got.JobID != h.job.ID || got.ExpectedGeneration != 2 || got.Hold == nil || got.Hold.Reason != "Owner go for the release" || got.Hold.UntilItems != nil {
+		t.Fatalf("unhold request %+v %+v", got, got.Hold)
+	}
+	if !strings.Contains(out, "verified") {
+		t.Fatal("output", out)
+	}
+	post := h.posts[0]
+	if post.Envelope == nil || post.Envelope.Kind != api.EnvelopeKindNotice || post.Envelope.Subject != "A release job hold was released" || post.Text != api.RenderText(*post.Envelope) || len(api.ValidateEnvelope(*post.Envelope)) != 0 {
+		t.Fatalf("notice %+v", post)
+	}
+	if post.Envelope.Refs["release-job"] != h.job.ID || post.RequestID != h.job.ID+"-unhold-g3" || !strings.Contains(post.Envelope.Body.Text, "Reason: Owner go for the release") || !strings.Contains(post.Envelope.Body.Text, "original queue position") || len(post.WorkItems) != 1 || post.WorkItems[0].ItemRevision != 5 {
+		t.Fatalf("notice %+v %v", post, post.Envelope.Refs)
+	}
+	h.failPost = true
+	if _, err = unhold("--job", h.job.ID, "--generation", "4", "--request-id", "unhold-2", "--reason", "Owner go again"); err == nil || !strings.Contains(err.Error(), "is released from its hold at generation 5") || !strings.Contains(err.Error(), "NOTICE: A release job hold was released") {
+		t.Fatal("failed unhold notice", err)
 	}
 }

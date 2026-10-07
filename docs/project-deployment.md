@@ -922,6 +922,79 @@ that run stops, and its request id ends in `-locked`. Any other holder keeps the
 handler reconciliation. Its request id is `HOLDER-fence-wait-WAITING-REASON`, so
 a restart's resend returns the original.
 
+### Holding a verified job (owner hold)
+
+The deployer is an automated runner (`scripts/release-runner.mjs`). It reads the
+release ledger and nothing else: a notice, request or block addressed to it on
+the board is not read, so a message cannot keep a job from releasing. An owner
+decision that a verified job must wait is saved on the job itself, where the
+hub enforces it. Both commands are handler-only:
+
+```
+tt deployment hold   --job ID --generation N --reason TEXT [--until-items wi_a,wi_b] --request-id KEY
+tt deployment unhold --job ID --generation N --reason TEXT --request-id KEY
+```
+
+`hold` moves a `verified` job that no deployer has claimed to state `held` and
+saves its `hold`: the reason, the release condition (`untilItems`), the handler
+agent and run, and the time. While the job is `held`:
+
+- A claim of it is refused (`job ID is on an owner hold (REASON)`), and so is
+  adding it to a batch. The runner picks only `verified` jobs, so it passes over
+  the held job and claims the next verified one; the release line does not stop.
+- It keeps its place in the queue. It does not count as a waiting job: the
+  deployer posts no fence-wait notice for it, and it does not make a claimed job
+  ahead of it eligible for set-aside.
+- `reconcile` and `supersede` are refused until the hold is released.
+- `tt deployment list` shows it in the active view with state `held` and its
+  `hold`; `tt deployment get` also shows `holdHistory`.
+
+`unhold` returns the job to `verified` in the same queue position, so it is
+claimed in its original order. The hub also lifts a hold by itself when it
+names items: once every item in `untilItems` has a release job that is
+`released` or `superseded`, the request that settled the last one returns the
+held job to `verified`. A hold with no items ends only with `unhold`.
+
+Every transition is appended to the job's `holdHistory` and never rewritten: a
+`hold` event, then a `release` event whose `cause` is `handler` (an unhold, with
+the handler's agent, run and reason) or `items_released` (with `triggerJobId`,
+the job whose release met the condition). Each carries the job generation after
+the event and the hub time.
+
+Rules the hub checks:
+
+- The reason is one line of at most 512 characters. `--until-items` names at
+  most 16 existing work items of the project, none twice and not the job's own
+  item. A condition that is already met is refused.
+- Only a `verified`, unclaimed job can be held. A claimed job with no effects is
+  set aside first and then held; the refusal says so. A job whose latest
+  reconcile record carries a host lock digest (a requeue) cannot be held: the
+  runner frees that lock only while the job is `verified`, and the hub cannot
+  see the host.
+- Both commands need the job's exact generation and replay by request ID.
+
+After the hub saves either command, the CLI posts one board notice linked to
+the job's item ("A release job is on hold" or "A release job hold was
+released"). If that post fails the hold or release still stands; the command
+prints the notice text to post by hand. A hold the hub lifts by itself writes
+the history and the list but posts no notice. A hold saved between the runner's
+list read and its claim makes that one claim fail: the runner posts its usual
+"the hub refused its claim" notice once and goes on to the next job.
+
+Which of the three to use:
+
+| | Applies to | Effect | Ends when |
+|---|---|---|---|
+| Owner hold (`hold`) | a `verified`, unclaimed job | state `held`; never claimed or batched; queue position kept | `unhold`, or its named items release |
+| Set-aside (`set-aside`) | a `claimed` job with no effects while a later verified job waits | back to `verified` behind every queued job; claimed again when its turn comes | it is not a hold: nothing stops the next claim |
+| Refuse (`refuse`, or `reconcile` with `refuse`) | a claimed job that must not release as it is | terminal state `refused` | never; a new job needs `tt deployment retry` |
+
+"Held" is also used for three other things, none of which is an owner hold: a
+release batch in state `held` (published or blocked, outcome not restored), the
+runner's notice for a job it skips because the hub refused its claim or its
+set-aside journal is held, and reconcile's "job is not held" for a job that is
+already terminal.
+
 ### Probes and rollback programs
 
 `scripts/release-probe.mjs` prints only the fields the runner reads:

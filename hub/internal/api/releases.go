@@ -56,6 +56,10 @@ type ReleaseJob struct {
 	// SettledAt orders released and superseded jobs for target baselines:
 	// the hub time of the final receipt, or the hand release's record time.
 	SettledAt string `json:"settledAt,omitempty"`
+	// Hold is set only while the job is in state held (an owner hold);
+	// HoldHistory keeps every hold and release of the job and is never rewritten.
+	Hold        *ReleaseHold       `json:"hold,omitempty"`
+	HoldHistory []ReleaseHoldEvent `json:"holdHistory,omitempty"`
 	// MatrixApprovals is derived on exact detail reads and never saved: the
 	// project's owner matrix approvals, for a claimed job only. It is a hint
 	// for the runner; the verification import proves the one it cites.
@@ -88,6 +92,7 @@ type ReleaseSummary struct {
 	SettledAt          string                      `json:"settledAt,omitempty"`
 	Receipt            *ReleaseSummaryReceipt      `json:"receipt,omitempty"`
 	Supersession       *ReleaseSummarySupersession `json:"supersession,omitempty"`
+	Hold               *ReleaseHold                `json:"hold,omitempty"`
 }
 type ReleaseSummaryReceipt struct {
 	Outcome string                 `json:"outcome"`
@@ -265,6 +270,36 @@ type ReleaseRetry struct {
 	CreatedAt  string                  `json:"createdAt,omitempty"`
 }
 
+// ReleaseHold is an owner hold on a verified job, saved by the database
+// handler (operations hold and unhold). The job is in state held while it
+// stands: no deployer can claim it or take it into a batch, and it keeps its
+// place in the queue. A request supplies Reason and UntilItems; the hub fills
+// the rest. UntilItems is the release condition: the hub lifts the hold once
+// every named item has a released or superseded job. Empty means until unhold.
+type ReleaseHold struct {
+	Reason     string   `json:"reason"`
+	UntilItems []string `json:"untilItems,omitempty"`
+	AgentID    string   `json:"agentId,omitempty"`
+	RunID      string   `json:"runId,omitempty"`
+	HeldAt     string   `json:"heldAt,omitempty"`
+}
+
+// ReleaseHoldEvent is one hold or release in a job's hold history. Cause is
+// set on a release: "handler" for an unhold, "items_released" when the hub
+// lifted the hold because TriggerJobID settled the last named item.
+// Generation is the job's generation after the event.
+type ReleaseHoldEvent struct {
+	Action       string   `json:"action"`
+	Cause        string   `json:"cause,omitempty"`
+	Reason       string   `json:"reason"`
+	UntilItems   []string `json:"untilItems,omitempty"`
+	AgentID      string   `json:"agentId,omitempty"`
+	RunID        string   `json:"runId,omitempty"`
+	TriggerJobID string   `json:"triggerJobId,omitempty"`
+	Generation   int64    `json:"generation"`
+	At           string   `json:"at"`
+}
+
 // HandRelease is the owner's immutable record of a release made by hand. It
 // cites an owner release intervention and names the released tasks-hub
 // commit, the targets it shipped and the accepted job commits it carries.
@@ -370,6 +405,7 @@ type ReleaseRequest struct {
 	Supersession       *ReleaseSupersession   `json:"supersession,omitempty"`
 	HandRelease        *HandRelease           `json:"handRelease,omitempty"`
 	Retry              *ReleaseRetry          `json:"retry,omitempty"`
+	Hold               *ReleaseHold           `json:"hold,omitempty"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {

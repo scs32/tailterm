@@ -179,6 +179,10 @@ func releaseSummary(j api.ReleaseJob, row int64) api.ReleaseSummary {
 	if j.Supersession != nil {
 		out.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
+	if j.Hold != nil {
+		hold := *j.Hold
+		out.Hold = &hold
+	}
 	return out
 }
 
@@ -788,6 +792,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
 			}
+			if j.State == "held" {
+				return zero, releaseConflict("job " + j.ID + " is on an owner hold; release the hold first with tt deployment unhold")
+			}
 			if batch != nil && batch.State == "held" && j.State == "rolled_back" {
 				// The lead settled rolled back while tasks-hub still carried
 				// the batch: its members wait for this inspection record.
@@ -821,6 +828,18 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if batch != nil {
 				batchState = "dissolved"
 			}
+		} else if req.Operation == "hold" || req.Operation == "unhold" {
+			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+				return zero, err
+			}
+			if req.Operation == "hold" {
+				err = holdRelease(ctx, tx, task, &j, req, s.now())
+			} else {
+				err = unholdRelease(&j, req, s.now())
+			}
+			if err != nil {
+				return zero, err
+			}
 		} else if req.Operation == "inputs" {
 			if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 				return zero, err
@@ -841,6 +860,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			// it would leave no job the freeing reconcile could name.
 			if batch != nil {
 				return zero, releaseConflict("job " + j.ID + " leads release batch " + batch.ID + " (" + batch.State + "); reconcile it with refuse and restoration evidence first")
+			}
+			if j.State == "held" {
+				return zero, releaseConflict("job " + j.ID + " is on an owner hold; release the hold first with tt deployment unhold")
 			}
 			if reason := releaseSupersedable(j); reason != "" {
 				return zero, releaseConflict(reason)
@@ -954,6 +976,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 			switch req.Operation {
 			case "claim":
+				if j.State == "held" && j.Hold != nil {
+					return zero, releaseConflict("job " + j.ID + " is on an owner hold (" + j.Hold.Reason + "); the handler releases it with tt deployment unhold")
+				}
 				if j.State != "verified" {
 					return zero, releaseConflict("job cannot be taken over")
 				}
@@ -1086,6 +1111,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			return zero, merr
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, m.State, m.Generation, string(mb), task, m.ID); err != nil {
+			return zero, err
+		}
+	}
+	if (req.Operation == "finish" && j.State == "released") || req.Operation == "supersede" {
+		if err = liftReleaseHolds(ctx, tx, task, j.ID, s.now()); err != nil {
 			return zero, err
 		}
 	}
@@ -1342,6 +1372,160 @@ func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Releas
 	j.InputsDigest = ""
 	j.PauseGeneration = generation
 	j.Reconciliations = append(j.Reconciliations, *r)
+	return nil
+}
+
+// holdRelease puts an owner hold on a verified job no deployer holds: the job
+// moves to state held, where claim and batch-add refuse it and the deployer
+// takes the next verified job. It keeps its place in the queue. A claimed job
+// is not held here: one with no effects is set aside first.
+func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, req api.ReleaseRequest, now time.Time) error {
+	switch j.State {
+	case "verified":
+		if j.AgentID != "" {
+			return releaseConflict("job " + j.ID + " is claimed by " + j.AgentID + "; a hold applies only to a verified job no deployer holds. A claimed job with no effects is freed with tt deployment set-aside, then held")
+		}
+	case "held":
+		reason := ""
+		if j.Hold != nil {
+			reason = " (" + j.Hold.Reason + ")"
+		}
+		return releaseConflict("job " + j.ID + " is already on hold" + reason)
+	case "claimed", "merged", "blocked":
+		return releaseConflict("job " + j.ID + " is " + j.State + "; a hold applies only to a verified job no deployer holds. A claimed job with no effects is freed with tt deployment set-aside, then held")
+	default:
+		return releaseConflict("job " + j.ID + " is already " + j.State + "; a hold applies only before a claim (a claimed job with no effects uses tt deployment set-aside)")
+	}
+	// A requeue may leave the host release lock with this job. The runner
+	// frees it only for a verified, refused or superseded job, and the hub
+	// cannot see whether it has, so the record alone decides.
+	if n := len(j.Reconciliations); n > 0 && j.Reconciliations[n-1].LockDigest != "" {
+		return releaseConflict("job " + j.ID + " was requeued with a host release lock, which the deployer frees only while the job is verified; it cannot be held")
+	}
+	h := req.Hold
+	if h == nil || !releaseText(h.Reason) || len(h.UntilItems) > 16 {
+		return api.ErrInvalid
+	}
+	seen := map[string]bool{}
+	for _, id := range h.UntilItems {
+		if !api.ValidID(id, "wi") || seen[id] {
+			return api.ErrInvalid
+		}
+		seen[id] = true
+		if id == j.ItemID {
+			return releaseConflict("job " + j.ID + " releases item " + id + " itself; a hold cannot wait for its own item")
+		}
+		if _, err := getWorkItem(tx, ctx, task, id); err != nil {
+			if errors.Is(err, api.ErrNotFound) {
+				return releaseConflict("named item " + id + " is not a work item of this project")
+			}
+			return err
+		}
+	}
+	if len(h.UntilItems) > 0 {
+		met, err := releaseItemsSettled(ctx, tx, task, h.UntilItems)
+		if err != nil {
+			return err
+		}
+		if met {
+			return releaseConflict("the named items are already released")
+		}
+	}
+	at := ts(now)
+	j.State = "held"
+	j.Hold = &api.ReleaseHold{Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), AgentID: req.AgentID, RunID: req.RunID, HeldAt: at}
+	j.HoldHistory = append(j.HoldHistory, api.ReleaseHoldEvent{Action: "hold", Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), AgentID: req.AgentID, RunID: req.RunID, Generation: j.Generation + 1, At: at})
+	return nil
+}
+
+// unholdRelease is the handler's release of an owner hold: the job is
+// verified again in its original queue position.
+func unholdRelease(j *api.ReleaseJob, req api.ReleaseRequest, now time.Time) error {
+	if j.State != "held" {
+		return releaseConflict("job " + j.ID + " is not on hold")
+	}
+	if req.Hold == nil || !releaseText(req.Hold.Reason) || len(req.Hold.UntilItems) > 0 {
+		return api.ErrInvalid
+	}
+	liftReleaseHold(j, api.ReleaseHoldEvent{Action: "release", Cause: "handler", Reason: req.Hold.Reason, AgentID: req.AgentID, RunID: req.RunID, At: ts(now)})
+	return nil
+}
+
+// liftReleaseHold returns a held job to verified and appends the release
+// event at the generation the caller is about to save.
+func liftReleaseHold(j *api.ReleaseJob, event api.ReleaseHoldEvent) {
+	if j.Hold != nil {
+		event.UntilItems = slices.Clone(j.Hold.UntilItems)
+	}
+	event.Generation = j.Generation + 1
+	j.State = "verified"
+	j.Hold = nil
+	j.HoldHistory = append(j.HoldHistory, event)
+}
+
+// releaseItemsSettled reports whether every item has a released or
+// superseded release job in the project.
+func releaseItemsSettled(ctx context.Context, q queryRower, task string, items []string) (bool, error) {
+	for _, id := range items {
+		var n int
+		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM release_jobs WHERE task_id=? AND state IN ('released','superseded') AND json_extract(record_json,'$.itemId')=?`, task, id).Scan(&n); err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// liftReleaseHolds runs after a job settled released or superseded: every
+// held job whose named items are now all released or superseded returns to
+// verified, with the settling job recorded as the trigger. A hold with no
+// named items is lifted only by unhold.
+func liftReleaseHolds(ctx context.Context, tx *sql.Tx, task, trigger string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? AND state='held' ORDER BY rowid`, task)
+	if err != nil {
+		return err
+	}
+	var held []api.ReleaseJob
+	for rows.Next() {
+		var raw string
+		var j api.ReleaseJob
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &j)
+		}
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if j.Hold != nil && len(j.Hold.UntilItems) > 0 {
+			held = append(held, j)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for i := range held {
+		j := &held[i]
+		met, err := releaseItemsSettled(ctx, tx, task, j.Hold.UntilItems)
+		if err != nil {
+			return err
+		}
+		if !met {
+			continue
+		}
+		liftReleaseHold(j, api.ReleaseHoldEvent{Action: "release", Cause: "items_released", Reason: "every named item is released", TriggerJobID: trigger, At: ts(now)})
+		j.Generation++
+		b, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, j.State, j.Generation, string(b), task, j.ID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

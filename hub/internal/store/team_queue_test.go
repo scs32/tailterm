@@ -2698,3 +2698,27 @@ func TestQueueLimitDecreaseSkipsHostAdmissionGates(t *testing.T) {
 		gated(t, s, task.ID, 3, "host session or polling budget exhausted")
 	})
 }
+
+// wi_0c5c5add2242991b a12: a release job on an owner hold is still in the
+// deployment path, so the owner's integration record is refused until the
+// hold ends in a finished job.
+func TestOwnerIntegratedRefusedWhileReleaseJobHeld(t *testing.T) {
+	f := newChoresQueue(t, 1, 1, 0)
+	a := f.run(t, f.add(t, 0, "src"))
+	commit := strings.Repeat("b", 40)
+	if _, err := f.s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, f.task.ID, "rel_held", a.ID, "held", 2, "{}"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.integrated(a, "held-job", commit); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release job rel_held is held; the deployment path owns this candidate") {
+		t.Fatalf("owner integration with a held release job: %v", err)
+	}
+	if got := listedEntry(t, f.s, f.task.ID, a.ID); got.OwnerIntegration != nil || got.ReleasedAt != "" || got.Revision != a.Revision {
+		t.Fatalf("refused integration changed the entry: %+v", got)
+	}
+	if _, err := f.s.db.Exec(`UPDATE release_jobs SET state='superseded' WHERE id='rel_held'`); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := f.integrated(a, "after-hold", commit); err != nil || released.OwnerIntegration == nil {
+		t.Fatalf("owner integration after the job finished: %v", err)
+	}
+}

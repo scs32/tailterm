@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +25,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|refuse|supersede|retry|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|hold|unhold|refuse|supersede|retry|hand-release|hand-releases")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
@@ -62,7 +63,8 @@ func cmdDeployment(e env, args []string) error {
 	releaseName := fs.String("release", "", "optional release name; must equal the hand release record's (supersede)")
 	handRelease := fs.String("hand-release", "", "recorded hand release ID from tt deployment hand-release (supersede)")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
-	reason := fs.String("reason", "", "why a new job is expected to pass (retry)")
+	reason := fs.String("reason", "", "why a new job is expected to pass (retry), or why the job is held or its hold released (hold, unhold)")
+	untilItems := fs.String("until-items", "", "comma-separated work items whose release lifts the hold (hold)")
 	var restored stringListFlag
 	fs.Var(&restored, "restored", "TARGET=RELEASE the refused job's target runs again; one per target in its receipt (retry, repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -73,6 +75,14 @@ func cmdDeployment(e env, args []string) error {
 		// Checked before any hub call, like supersede's coverage.
 		var err error
 		if retry, err = deploymentRetry(*entry, *job, *reason, restored); err != nil {
+			return err
+		}
+	}
+	var hold *api.ReleaseHold
+	if args[0] == "hold" || args[0] == "unhold" {
+		// Checked before any hub call, like retry's record.
+		var err error
+		if hold, err = deploymentHold(args[0], *job, *reason, *untilItems); err != nil {
 			return err
 		}
 	}
@@ -155,7 +165,7 @@ func cmdDeployment(e env, args []string) error {
 	if *key == "" || e.agent == "" || e.runID == "" {
 		return errors.New("exact agent/run and request-id required")
 	}
-	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit, Retry: retry}
+	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit, Retry: retry, Hold: hold}
 	if args[0] == "supersede" {
 		j, err := c.Release(ctx, e.task, *job)
 		if err != nil {
@@ -217,6 +227,95 @@ func cmdDeployment(e env, args []string) error {
 	if err == nil {
 		printJSON(out)
 	}
+	if err == nil && hold != nil {
+		// The deployer reads no board messages: the hub enforces the hold, and
+		// this notice only tells the team.
+		notice := holdNotice(args[0], out, hold.Reason)
+		if postErr := postHoldNotice(ctx, c, e, args[0], out, notice); postErr != nil {
+			saved := "is on hold"
+			if args[0] == "unhold" {
+				saved = "is released from its hold"
+			}
+			return fmt.Errorf("job %s %s at generation %d, but its board notice was not posted: %v; post this notice linked to item %s:\n%s", out.ID, saved, out.Generation, postErr, out.ItemID, api.RenderText(notice))
+		}
+	}
+	return err
+}
+
+// deploymentHold builds the handler's hold or unhold record: a one-line
+// reason, and for a hold the items whose release lifts it. The hub checks
+// that the items exist and are not yet all released.
+func deploymentHold(operation, job, reason, untilItems string) (*api.ReleaseHold, error) {
+	if job == "" {
+		return nil, fmt.Errorf("%s needs --job naming the release job", operation)
+	}
+	if strings.TrimSpace(reason) == "" || len(reason) > 512 || strings.ContainsAny(reason, "\x00\n\r") {
+		return nil, fmt.Errorf("%s needs --reason: one line, at most 512 characters", operation)
+	}
+	out := &api.ReleaseHold{Reason: reason}
+	if untilItems == "" {
+		return out, nil
+	}
+	if operation == "unhold" {
+		return nil, errors.New("unhold does not accept --until-items: it releases the hold now")
+	}
+	seen := map[string]bool{}
+	for _, id := range strings.Split(untilItems, ",") {
+		id = strings.TrimSpace(id)
+		if !api.ValidID(id, "wi") {
+			return nil, fmt.Errorf("hold --until-items needs comma-separated work item IDs, got %q", id)
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("hold --until-items names item %s twice", id)
+		}
+		seen[id] = true
+		out.UntilItems = append(out.UntilItems, id)
+	}
+	if len(out.UntilItems) > 16 {
+		return nil, errors.New("hold --until-items accepts at most 16 items")
+	}
+	return out, nil
+}
+
+// holdNotice is the board notice for a saved hold or unhold of job j.
+func holdNotice(operation string, j api.ReleaseJob, reason string) api.Envelope {
+	commit := j.Commit
+	if len(commit) > 12 {
+		commit = commit[:12]
+	}
+	what := fmt.Sprintf("Release job %s (item %s, commit %s)", j.ID, j.ItemID, commit)
+	refs := map[string]string{"release-job": j.ID, "item": j.ItemID}
+	if operation == "unhold" {
+		return api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A release job hold was released", Refs: refs,
+			Body: api.EnvelopeBody{Text: fmt.Sprintf("%s is verified again in its original queue position; the deployer can claim it. Reason: %s", what, reason)}}
+	}
+	condition := "It stays on hold until tt deployment unhold."
+	holder := ""
+	if j.Hold != nil {
+		if len(j.Hold.UntilItems) > 0 {
+			condition = "The hub lifts the hold when every one of these items is released: " + strings.Join(j.Hold.UntilItems, ", ") + "; tt deployment unhold releases it earlier."
+		}
+		if j.Hold.AgentID != "" {
+			holder = " Held by " + j.Hold.AgentID + "."
+		}
+	}
+	return api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A release job is on hold", Refs: refs,
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("%s is on an owner hold: the deployer will not claim it and goes on to the next verified job. Reason: %s.%s %s", what, strings.TrimRight(reason, "."), holder, condition)}}
+}
+
+// postHoldNotice posts the notice once per saved transition, linked to the
+// job's item at its current revision and to the item's work order.
+func postHoldNotice(ctx context.Context, c *api.Client, e env, operation string, j api.ReleaseJob, notice api.Envelope) error {
+	item, err := c.GetWorkItem(ctx, e.task, j.ItemID)
+	if err != nil {
+		return err
+	}
+	post := api.PostMessageRequest{Envelope: &notice, Text: api.RenderText(notice), AgentID: e.agent, RunID: e.runID, RequestID: fmt.Sprintf("%s-%s-g%d", j.ID, operation, j.Generation),
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: e.task, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}
+	if j.OrderMessageSeq > 0 {
+		post.WorkOrderMessage = &api.MessageReference{TaskID: e.task, Seq: j.OrderMessageSeq}
+	}
+	_, err = c.PostMessage(ctx, e.task, post)
 	return err
 }
 
