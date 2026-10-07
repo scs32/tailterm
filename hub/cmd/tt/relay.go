@@ -284,19 +284,39 @@ func runActivitySafely(tick func() error) (err error) {
 // agent author. Its own posts never wake it, and hub-authored broker notices
 // are delivered by broker wake jobs, never by waking the whole roster as if
 // they were human announcements. deployers names the deployment agents whose
-// recipient-less notices also wake this agent (deployerNoticeAuthors); it is
-// nil for every agent but the primary database handler and the owner helper.
+// recipient-less notices also wake this agent (deployerNoticeAuthors) unless
+// the notice is tagged routine (wakingNotice); it is nil for every agent but
+// the primary database handler and the owner helper.
 func wakeEligible(m api.Message, agent string, deployers map[string]bool) bool {
 	if m.From.Node == api.BrokerNode || m.From.AgentID == agent {
 		return false
 	}
-	return m.Broadcast || m.To == agent || (m.To == "" && (m.From.AgentID == "" || (deployers[m.From.AgentID] && recipientlessNotice(m))))
+	return m.Broadcast || m.To == agent || (m.To == "" && (m.From.AgentID == "" || (deployers[m.From.AgentID] && wakingNotice(m))))
 }
 
 // recipientlessNotice reports a typed NOTICE an agent posted with no
-// recipient, the form of the deployer's refused, failed and waiting notices.
+// recipient, the form of every notice the deployer does not direct.
 func recipientlessNotice(m api.Message) bool {
 	return m.To == "" && !m.Broadcast && m.From.AgentID != "" && m.From.Node != api.BrokerNode && m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice
+}
+
+// noticeWakeRef is the ref the deployer sets on each recipient-less notice
+// (scripts/release-runner.mjs WAKE), and noticeWakeRoutine its value on a
+// notice nobody has to act on: a fence or host wait for a normal handler
+// step, a restart, a transient CLI failure.
+const (
+	noticeWakeRef     = "wake"
+	noticeWakeRoutine = "routine"
+)
+
+// wakingNotice reports a recipient-less notice that wakes the primary
+// database handler and the owner helper when a deployer posted it
+// (wi_991125f66a787459). Only the exact routine tag keeps it from waking: a
+// notice with no tag, as an older runner posts it, or with any other value
+// wakes. The tag is read nowhere else, so it never stops or starts the wake
+// of a directed, broadcast, owner or other agent's message.
+func wakingNotice(m api.Message) bool {
+	return recipientlessNotice(m) && m.Envelope.Refs[noticeWakeRef] != noticeWakeRoutine
 }
 
 // relayAuthorRoles remembers each agent's role for the relay process, so the
@@ -390,11 +410,12 @@ func (r *primaryHandlers) primary(ctx context.Context, c *api.Client, b runtimeB
 }
 
 // deployerNoticeAuthors returns the deployment agents among the authors of
-// this page's recipient-less notices, for the bindings of the project's
-// primary database handler and of the owner helper only
-// (wi_3670e153328df185): a refused, failed or waiting release is announced
+// this page's recipient-less notices that are not tagged routine, for the
+// bindings of the project's primary database handler and of the owner helper
+// only (wi_3670e153328df185): a refused, failed or held release is announced
 // with no recipient, and in a project that is not a swarm that reaches their
-// inbox without waking them. A project holds many live handlers, one per
+// inbox without waking them. A routine notice wakes nobody, so it causes no
+// read here either. A project holds many live handlers, one per
 // running item, so only the explicit primary is woken; with no primary set no
 // handler is, because the legacy choice (the newest open handler that is not
 // a prepared successor) cannot be made from the relay's reads. The caller has
@@ -409,7 +430,7 @@ func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding,
 	var deployers map[string]bool
 	checked := map[string]bool{}
 	for _, m := range msgs {
-		if !recipientlessNotice(m) || m.From.AgentID == b.Agent || checked[m.From.AgentID] {
+		if !wakingNotice(m) || m.From.AgentID == b.Agent || checked[m.From.AgentID] {
 			continue
 		}
 		if a.Role == api.AgentRoleDatabaseHandler && len(checked) == 0 {

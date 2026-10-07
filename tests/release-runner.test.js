@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,heldRestartJob,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,heldRestartJob,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,WAKE} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -2116,7 +2116,7 @@ async function heldRun(t,h,polls,release){
  const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
  const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
  try{
-  const serving=serveDeployment(h.config,{signal:controller.signal,release:async c=>{await release(c);polled++;}});
+  const serving=serveDeployment(h.config,{signal:controller.signal,release:async(c,adapter)=>{const out=await release(c,adapter);polled++;return out;}});
   for(let n=1;n<=polls;n++){while(polled<n)await settle();await settle();if(n===polls)controller.abort();t.mock.timers.tick(30000);}
   await serving;
  }finally{t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
@@ -2167,7 +2167,7 @@ test("held r1 r2 a held set-aside journal is never claimed; a recipient that can
  assert.deepEqual(sent.map(s=>[s.to,s.requestId]),[[HELD_HELPER,id+"-helper"],[null,id+"-board"],[HELD_HANDLER,id+"-handler"],[HELD_HELPER,id+"-helper"]]);
  for(const n of sent){
   assert.equal(n.kind,"notice");assert.equal(n.subject,"A release job is skipped because its set-aside journal is held");
-  assert.deepEqual(n.refs,["release-job=rel_aside","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
+  assert.deepEqual(n.refs,["release-job=rel_aside","item="+HELD_ITEM,"commit="+"c".repeat(40),...(n.to?[]:["wake=attention"])]);
   assert.ok(n.text.includes("Reason: the journal is unreadable, shows effects or is not of exactly the set-aside claim."));assert.match(n.text,SAFE_TEXT);
  }
  for(const word of h.calls().flatMap(c=>c.argv))assert.ok(!word.includes(h.home));
@@ -3219,4 +3219,111 @@ test("g2 g3 through the host adapter: the stuck check and refuse of the incident
  const d={...config(g,lost.job),journalPath:join(m.home,"rel_fixture.json")};
  await assert.rejects(runRelease(d,lost),/release fence lost/);
  assert.deepEqual(m.calls(),["deployment check 2","deployment get"]);assert.equal(lost.job.generation,2);assert.ok(!existsSync(d.journalPath));assert.equal(git(g.cwd,"rev-parse","tasks-hub"),g.base);
+});
+
+// Wake class (wi_991125f66a787459). Every notice the runner posts with no
+// recipient carries one wake ref; the relay wakes nobody for wake=routine.
+const wakeRefs=argv=>argv.filter((w,i)=>argv[i-1]==="--ref" && w.startsWith("wake="));
+const noticeArgv=h=>h.calls().map(c=>c.argv).filter(a=>a[0]==="send" && a[a.indexOf("--kind")+1]==="notice");
+const argvField=(a,n)=>a[a.indexOf(n)+1];
+const WAKE_ATTEMPT="c".repeat(40)+"-r0",WAKE_WAIT={attempt:WAKE_ATTEMPT,position:1,length:2,priority:"high",holders:[{id:"h1",item:"wi_a",agent:"a",pid:1}],change:1},WAKE_HELD={attempt:WAKE_ATTEMPT,pid:1,groups:[],reason:"fixture"};
+test("wake a1 each recipient-less notice has its class at the builder and exactly one wake ref in the argv its sender passes",async t=>{
+ const R=WAKE.routine,A=WAKE.attention;assert.deepEqual(WAKE,{routine:"routine",attention:"attention"});
+ // rows[n]: the class of plan row n, what its builder returned, and each argv its sender passed.
+ const rows=new Map(),row=(n,cls,built,argvs)=>rows.set(n,{cls,built,argvs});
+ const plain=()=>{const cwd=mkdtempSync(join(tmpdir(),"release-wake-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));return cwd;};
+ const bySubject=(h,subject)=>noticeArgv(h).filter(a=>argvField(a,"--subject")===subject);
+ // Row 1: a failed detail read holds the poll, which then reports the CLI failure.
+ {const h=codeHost(t,plain(),`if(a[1]==='get')process.exit(4);`);h.setJobs([verifiedJob()]);await h.poll(null);
+  row(1,R,[cliFailureNotice({reason:"tt deployment get exit 4",jobId:"rel_code",at:"2026-10-07T00:00:00.000Z"},CODE_RUN).wake],bySubject(h,"A deployer CLI call failed"));}
+ // Rows 2, 3 and 12: a claimed job waits for its matrix import, then for its inputs, with a later job behind it.
+ {const h=codeHost(t,plain());h.setJobs([verifiedJob("rel_a"),verifiedJob("rel_b")]);
+  for(const outcome of ["waiting_matrix","waiting_inputs"])await h.poll(null,async(c,adapter)=>{adapter.matrixWait=WAKE_WAIT;adapter.matrixHeld=WAKE_HELD;return {outcome};});
+  row(2,R,[matrixWaitNotice({id:"rel_a"},WAKE_WAIT).wake],bySubject(h,"A release job is waiting for the verification host"));
+  row(3,A,[matrixHeldNotice({id:"rel_a"},WAKE_HELD).wake,matrixHeldNotice({id:"rel_a"},{...WAKE_HELD,attempt:"attempts"}).wake],bySubject(h,"A release job is held until its matrix run is confirmed stopped"));
+  const fence=bySubject(h,"A release job is waiting behind a held project fence");
+  assert.deepEqual(fence.map(a=>argvField(a,"--request-id")),["rel_a-fence-wait-rel_b-waiting_matrix","rel_a-fence-wait-rel_b-waiting_inputs"]);
+  const jobs=[{id:"rel_a",state:"claimed"},{id:"rel_b",state:"verified"}],built=[];
+  for(const reason of ["waiting_matrix","waiting_inputs"])for(const holder of [jobs[0],{...jobs[0],inputsDigest:"a".repeat(64)}])for(const locked of [false,true])for(const run of [false,true])built.push(fenceWaitNotice(jobs,holder,reason,locked,run).wake);
+  assert.equal(built.length,16);row(12,R,built,fence);}
+ // Row 13: a blocked or merged job, or one another run claimed, holds the fence.
+ {const argvs=[],built=[];
+  for(const state of ["blocked","merged","claimed"]){
+   const h=codeHost(t,plain()),holder={id:"rel_hold",state,generation:3,commit:"d".repeat(40),agentId:"agt_other",runId:"run_other"};h.setJobs([holder,verifiedJob("rel_next")]);await h.poll(null);
+   const sent=bySubject(h,"A release job is waiting behind a held project fence");assert.equal(sent.length,1,state);assert.match(argvField(sent[0],"--request-id"),new RegExp("^rel_hold-fence-wait-rel_next-"+state));argvs.push(...sent);
+   for(const locked of [false,true])for(const run of [false,true])built.push(fenceWaitNotice([holder,verifiedJob("rel_next")],holder,state,locked,run).wake);
+  }
+  row(13,A,built,argvs);}
+ // Rows 4, 5 and 6: the host adapter's three escalations build and send in one step.
+ {const cwd=plain(),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
+  await adapter.escalate({outcome:"refused",reason:"integration-conflict: 1 path"});await adapter.escalate({outcome:"refused"});await adapter.escalate({push:"failed"});await adapter.escalate({});await adapter.escalate({revert:"failed",rollbackBlocked:true});
+  const of=subject=>calls.filter(a=>argvField(a,"--subject")===subject);
+  row(4,A,[],of("Release refused before publication"));row(5,A,[],of("Release is live but the tasks-hub push failed"));row(6,A,[],of("Release failed and requires recovery"));
+  assert.deepEqual([4,5,6].map(n=>rows.get(n).argvs.length),[2,1,2]);}
+ // Row 7: stale code behind a blocked job drains.
+ {const r=codeRepo(t),h=codeHost(t,r.cwd),{gate}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([{id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40)},verifiedJob("rel_next")]);await h.poll(gate);
+  row(7,R,[codeNotice(h.record(),"draining").wake],bySubject(h,DRAINING_SUBJECT));}
+ // Row 8: the only owned job is held, so the stale runner restarts with it.
+ {const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),{gate}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([own,verifiedJob("rel_next")]);heldJournal(h,own);await h.poll(gate);
+  assert.equal(h.record().heldJob,"rel_held");row(8,R,[codeNotice(h.record(),"restart").wake],bySubject(h,HELD_SUBJECT));}
+ // Rows 9 and 11: an idle stale runner announces its restart; the re-exec then fails and it refuses.
+ {const r=codeRepo(t),h=codeHost(t,r.cwd),{gate}=codeGate(r.codeA,{execve:()=>{throw new Error("no exec");}});r.at(r.a,r.b);h.setJobs([verifiedJob()]);await h.poll(gate);
+  assert.equal(h.record().state,"refused");assert.equal(h.record().reason,"exec-failed");
+  row(9,R,[codeNotice({...h.record(),state:"restart"},"restart").wake],bySubject(h,"Deployer is restarting itself onto the published scripts"));
+  row(11,A,[...CODE_REASONS,"anything else"].map(reason=>codeNotice({...h.record(),reason},"refused").wake),noticeArgv(h).filter(a=>argvField(a,"--subject").startsWith("Deployer is not claiming releases: ")));}
+ // Row 10: the restarted runner reports the scripts it now runs.
+ {const r=codeRepo(t),h=codeHost(t,r.cwd),{gate}=codeGate(r.codeB,{marker:r.codeB.digest,restartedFrom:"f".repeat(64)});await h.poll(gate);
+  row(10,R,[codeNotice(h.record(),"restarted").wake],bySubject(h,"Deployer now runs the published scripts"));}
+ // Row 14: only the Board copy of the held claim notice has a class; the directed copies have none.
+ {const refuse=`if(a[1]==='claim'&&flag('--job')==='rel_held'){fs.writeSync(2,'tt: hub: 409 conflict: release: job cannot be taken over\\n');process.exit(1);}`;
+  const board=codeHost(t,plain(),refuse+`if(a[0]==='agents'){console.log('[]');process.exit(0);}`),directed=codeHost(t,plain(),refuse+heldRoster);
+  for(const h of [board,directed]){h.setJobs([{...verifiedJob("rel_held"),itemId:HELD_ITEM},verifiedJob("rel_next")]);await h.poll(null);}
+  const copies=noticeArgv(directed);assert.deepEqual(copies.map(a=>argvField(a,"--to")),[HELD_HANDLER,HELD_HELPER]);for(const a of copies){assert.ok(a.includes("--to"));assert.deepEqual(wakeRefs(a),[]);}
+  const sent=noticeArgv(board);assert.equal(sent.length,1);assert.ok(!sent[0].includes("--to"));assert.match(argvField(sent[0],"--request-id"),/-board$/);
+  row(14,A,["claim","journal"].map(kind=>heldClaimNotice({id:"rel_held"},kind,"x",CODE_RUN).wake),sent);}
+ assert.deepEqual([...rows.keys()].sort((a,b)=>a-b),Array.from({length:14},(_,i)=>i+1));
+ const classes={};
+ for(const [n,{cls,built,argvs}] of rows){
+  classes[n]=cls;assert.ok([4,5,6].includes(n)||built.length>0,`row ${n} has a builder`);assert.ok(argvs.length>0,`row ${n} was sent`);
+  for(const wake of built)assert.equal(wake,cls,`row ${n} at its builder`);
+  for(const argv of argvs){assert.ok(!argv.includes("--to"),`row ${n} has no recipient`);assert.deepEqual(wakeRefs(argv),[`wake=${cls}`],`row ${n} argv`);}
+ }
+ assert.deepEqual(classes,{1:R,2:R,3:A,4:A,5:A,6:A,7:R,8:R,9:R,10:R,11:A,12:R,13:A,14:A});
+});
+// The notice sends of a runner source that pass no wake ref, as 1-based line
+// numbers, and how many notice sends it has. The held claim send carries the
+// ref on its Board copy only, which wake a1 pins on the argv.
+function untaggedNoticeSends(source){
+ const sends=source.split("\n").map((text,i)=>({line:i+1,text})).filter(l=>/"--kind",\s*"notice"/.test(l.text));
+ return {count:sends.length,untagged:sends.filter(l=>!/\.\.\.(?:wakeRef\((?:notice\.wake|WAKE\.(?:routine|attention))\)|\(to\?\[\]:wakeRef\(notice\.wake\)\))\]\)/.test(l.text)).map(l=>l.line)};
+}
+test("wake a2 every notice send in the runner passes a wake ref, and a send without one is found",()=>{
+ const source=readFileSync(RUNNER,"utf8"),found=untaggedNoticeSends(source);
+ assert.equal(found.count,8,"three escalations, fence wait, matrix host, runner code, CLI failure and held claim");assert.deepEqual(found.untagged,[]);
+ // No notice is sent in a form the line check cannot see.
+ assert.equal(source.split('"notice"').length-1,found.count);assert.ok(!/"--kind",\s*[^"\s]/.test(source),"every kind is a literal");
+ // The check bites: one ref removed from a scratch copy, for each send in turn.
+ const lines=source.split("\n"),sends=lines.map((text,i)=>i).filter(i=>/"--kind",\s*"notice"/.test(lines[i]));
+ for(const i of sends){
+  const scratch=[...lines];scratch[i]=scratch[i].replace(/,\.\.\.(?:wakeRef\([A-Za-z.]+\)|\(to\?\[\]:wakeRef\(notice\.wake\)\))\]\)/,"])");assert.notEqual(scratch[i],lines[i]);
+  assert.deepEqual(untaggedNoticeSends(scratch.join("\n")),{count:8,untagged:[i+1]});
+ }
+ assert.deepEqual(untaggedNoticeSends('x.command([tt,"send","--kind","notice","--subject",s]);'),{count:1,untagged:[1]});
+});
+test("wake a11 a refused send of a tagged notice leaves the poll running, is journaled, is not marked posted and is sent again by the next poll",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-wake-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ // The hub refuses the fence-wait notice as it does a request id reused with other data, until the file exists.
+ const h=codeHost(t,cwd,`if(a[0]==='send'&&flag('--request-id').includes('-fence-wait-')&&!fs.existsSync(__dirname+'/accept')){fs.writeSync(2,'tt: hub: 409 conflict: request id reused with different data\\n');process.exit(1);}`);
+ h.setJobs([verifiedJob("rel_a"),verifiedJob("rel_b")]);let polls=0;
+ const err=await heldRun(t,h,4,async(c,adapter)=>{if(++polls===3)writeFileSync(join(h.home,"accept"),"");adapter.matrixWait=WAKE_WAIT;return {outcome:"waiting_matrix"};});
+ assert.equal(polls,4,"the run of four polls ended without throwing");assert.equal(err,"Fence wait notice not posted; the next poll retries.\n".repeat(2));
+ // Each poll goes on after the refused send: the matrix notice of the first, and a claim in every one.
+ const calls=h.calls().map(c=>c.argv),steps=calls.filter(a=>a[1]==="claim"||a[0]==="send").map(a=>a[1]==="claim"?"claim":argvField(a,"--request-id").includes("-fence-wait-")?"fence":"matrix");
+ assert.deepEqual(steps,["claim","fence","matrix","claim","fence","claim","fence","claim"]);
+ const fence=noticeArgv(h).filter(a=>argvField(a,"--request-id").includes("-fence-wait-"));assert.equal(fence.length,3);
+ for(const a of fence){assert.equal(argvField(a,"--request-id"),"rel_a-fence-wait-rel_b-waiting_matrix");assert.deepEqual(wakeRefs(a),["wake=routine"]);assert.deepEqual(a,fence[0]);}
+ assert.deepEqual(noticeArgv(h).map(a=>argvField(a,"--subject")).filter(s=>s!=="A release job is waiting behind a held project fence"),["A release job is waiting for the verification host"]);
+ // One private record of the refused call, counted twice.
+ const kept=JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8")).failures;assert.equal(kept.length,1);
+ assert.deepEqual(kept[0].argv,[h.tt,...fence[0]]);assert.equal(kept[0].exitCode,1);assert.equal(kept[0].count,2);assert.match(kept[0].stderr,/request id reused with different data/);
 });

@@ -605,6 +605,54 @@ directory of the deployer.`, once per job and reason for a process. That notice
 goes through the CLI that just failed, so it is best effort; the private record
 and the terminal line remain.
 
+### Which notices wake (wi_991125f66a787459)
+
+Every notice the deployer posts with no recipient carries one ref, `wake`,
+with the value `routine` or `attention`. The Board shows it in `Refs:`. A
+notice with no recipient is in every agent's inbox. The inbox relay wakes two
+agents for one from the deployer: the project's primary database handler and
+the owner helper, each once per notice. It wakes neither for `wake=routine`;
+that notice stays unread until they next read their inbox.
+
+| Notice | Ref |
+|---|---|
+| A release job is waiting behind a held project fence, when the holder waits for the handler to import integrated verification or to bind inputs | `wake=routine` |
+| A release job is waiting for the verification host | `wake=routine` |
+| Deployer code is out of date; it restarts itself after the current release | `wake=routine` |
+| Deployer is restarting itself onto the published scripts, with or without a held job | `wake=routine` |
+| Deployer now runs the published scripts | `wake=routine` |
+| A deployer CLI call failed | `wake=routine` |
+| A release job is waiting behind a held project fence, when the holder is blocked, merged or claimed by another deployer run | `wake=attention` |
+| A release job is held until its matrix run is confirmed stopped | `wake=attention` |
+| Release refused before publication | `wake=attention` |
+| Release is live but the tasks-hub push failed | `wake=attention` |
+| Release failed and requires recovery | `wake=attention` |
+| Deployer is not claiming releases: ..., for every reason | `wake=attention` |
+| A release job is skipped because ..., the Board copy sent when a recipient was not reached | `wake=attention` |
+
+- A routine notice repeats what the handler already has or needs no action. For
+  the two routine fence waits the handler holds the deployer's directed request
+  for that step (Handler requests and gating, below).
+- Only the exact value `routine` is quiet. A notice with no `wake` ref, as a
+  runner older than this change posts it, or with any other value wakes as an
+  `attention` notice does.
+- The ref is read only on a typed notice a deployment agent posted with no
+  recipient. It does not stop or start the wake of a directed message, a
+  broadcast, an owner post or another agent's notice. The directed copies of
+  the held claim notice carry no `wake` ref; a directed message wakes its
+  recipient.
+- A restart is routine whether or not "Deployer now runs the published scripts"
+  follows, so a deployer that does not come back after its restart notice wakes
+  no one. A restart the deployer cannot make is "Deployer is not claiming
+  releases: ..." and wakes.
+- Request ids do not include the class. A notice an older runner posted
+  untagged and a newer runner resends under the same request id is refused by
+  the hub as a reused id with other data: the original stays on the Board, the
+  deployer retries once per poll while the condition lasts (for a fence wait,
+  a host wait or a code notice it prints "... not posted; the next poll
+  retries." each time), and `cli-failures.json` keeps one counted record. This can only happen for a wait or hold that is still active across
+  the restart onto the tagging runner.
+
 ### Handler requests and gating
 
 - **Project handler (f5).** `tt deployment handler` (hub release operation
@@ -920,7 +968,9 @@ Otherwise, if the host release lock names that claim's run (or cannot be read),
 it says the job keeps the fence and needs reconcile with the lock digest after
 that run stops, and its request id ends in `-locked`. Any other holder keeps the fence until
 handler reconciliation. Its request id is `HOLDER-fence-wait-WAITING-REASON`, so
-a restart's resend returns the original.
+a restart's resend returns the original. The notice is `wake=routine` while the
+holder waits for the handler's import or inputs, and `wake=attention` for a
+blocked, merged or otherwise claimed holder (Which notices wake, above).
 
 ### Holding a verified job (owner hold)
 
@@ -1378,8 +1428,11 @@ job and confirm the pid it names is gone (above, "Requeue").
 **Stale deployer code.** A notice "Deployer is not claiming releases: ..."
 means the deployer runs scripts older than the published ones and could not
 restart itself. Read its `Reason:` and `runner-code.json`, then follow "The
-runner's own code" above. The other code notices need no action unless a
-restart is not followed by "Deployer now runs the published scripts".
+runner's own code" above. It is the one code notice that wakes the primary
+database handler and the owner helper. The other code notices are
+`wake=routine` and wake no one (Which notices wake, above); they need no action
+unless a restart is not followed by "Deployer now runs the published scripts",
+which nothing reports by itself.
 
 **Held claim.** A notice "A release job is skipped because the hub refused its
 claim" or "A release job is skipped because its set-aside journal is held"
@@ -1410,8 +1463,10 @@ published or deployed, and it holds no project fence.
   claim notice not delivered to every recipient; the next poll retries.`,
   posts the same notice once per job per run on the Board with no recipient,
   and tries that recipient again at every poll. A Board notice is in every
-  agent's inbox but wakes no one, so read it as "someone was not reached". No
-  failure here changes the skip.
+  agent's inbox. This one is `wake=attention`, so it wakes the primary database
+  handler and the owner helper when they are live (Which notices wake, above),
+  and no other agent; read it as "someone was not reached". No failure here
+  changes the skip.
 - Request ids are `JOB-claim-held-RUN-HASH-handler`, `-helper` and `-board`.
   `HASH` is eight hex characters of the case and the reason. A restart under
   the same run with the same reason resends the same ids, and the hub answers

@@ -1881,3 +1881,405 @@ func TestRelayDeployerNoticeRoleReadFailureRetries(t *testing.T) {
 		t.Fatalf("recovered task list read: err=%v wakes=%d progress=%+v", err, wakes, p)
 	}
 }
+
+// taggedNotice is a recipient-less deployer notice with the runner's wake ref
+// (wi_991125f66a787459); an empty wake is the untagged notice of an older
+// runner.
+func taggedNotice(seq int64, from, subject, wake string) api.Message {
+	m := deployerNotice(seq, from)
+	m.Text = "NOTICE: " + subject
+	m.Envelope.Subject = subject
+	m.Envelope.Refs = map[string]string{"release-job": "rel_00000000000000d1"}
+	if wake != "" {
+		m.Envelope.Refs["wake"] = wake
+	}
+	return m
+}
+
+// noticeRecipients are the two agents a deployer notice can wake.
+var noticeRecipients = []string{noticeHandler, noticeHelper}
+
+// A notice the runner tags routine wakes neither the primary handler nor the
+// owner helper. The cursor moves past it, and it causes no read of its
+// author's role or of the task list.
+func TestRelayDeployerNoticeRoutineWakesNobody(t *testing.T) {
+	for _, agent := range noticeRecipients {
+		for _, runtime := range []string{"codex", "claude"} {
+			t.Run(agent+"-"+runtime, func(t *testing.T) {
+				h, c, binding := newNoticeHub(t)
+				h.messages = []api.Message{taggedNotice(31, noticeDeployer, "A release job is waiting behind a held project fence", "routine")}
+				b := binding(agent)
+				if runtime == "claude" {
+					b.Runtime, b.Codex, b.Session = "claude", "", "fixture"
+				}
+				never := func(context.Context, runtimeBinding, string) error {
+					t.Fatal("a routine deployer notice queued a wake")
+					return nil
+				}
+				p := relayProgress{}
+				now := time.Now()
+				if err := relayOne(context.Background(), b, &p, c, now, never); err != nil {
+					t.Fatal(err)
+				}
+				h.mu.Lock()
+				calls := strings.Join(h.calls, ", ")
+				h.mu.Unlock()
+				base := "GET /v1/tasks/" + noticeTask
+				if want := base + "/pause, " + base + "/agents/" + agent + ", " + base + "/messages"; calls != want {
+					t.Fatalf("hub requests for a routine notice: %s", calls)
+				}
+				if p.Through != 31 || p.Wakes != 0 || !p.LastAttempt.IsZero() || p.Skip != nil {
+					t.Fatalf("progress after a routine notice: %+v", p)
+				}
+				// Later passes, a reloaded progress record and a second routine
+				// notice change nothing.
+				raw, _ := json.Marshal(p)
+				p = relayProgress{}
+				_ = json.Unmarshal(raw, &p)
+				h.mu.Lock()
+				h.messages = append(h.messages, taggedNotice(32, noticeDeployer, "A release job is waiting for the verification host", "routine"))
+				h.mu.Unlock()
+				for i := 1; i < 4; i++ {
+					if err := relayOne(context.Background(), b, &p, c, now.Add(time.Duration(i)*time.Minute), never); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tasks, author := h.reads("tasks", false), h.reads(noticeDeployer, false); tasks != 0 || author != 0 || p.Through != 32 {
+					t.Fatalf("routine notices read the task list %d times and the deployer %d times: %+v", tasks, author, p)
+				}
+			})
+		}
+	}
+}
+
+// Only the exact routine tag is quiet. An attention notice, an untagged one
+// (an older runner) and one with any other value wake both recipients once.
+func TestRelayDeployerNoticeAttentionUntaggedAndUnknownWake(t *testing.T) {
+	for _, wake := range []string{"attention", "", "urgent", "Routine", "routine ", "ROUTINE", "routine,attention"} {
+		for _, agent := range noticeRecipients {
+			t.Run(fmt.Sprintf("%q-%s", wake, agent), func(t *testing.T) {
+				h, c, binding := newNoticeHub(t)
+				m := taggedNotice(31, noticeDeployer, "Release failed and requires recovery", wake)
+				if _, tagged := m.Envelope.Refs["wake"]; tagged != (wake != "") {
+					t.Fatalf("fixture refs: %v", m.Envelope.Refs)
+				}
+				h.messages = []api.Message{m}
+				p := relayProgress{}
+				wakes := 0
+				queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+				now := time.Now()
+				for i := 0; i < 3; i++ {
+					if err := relayOne(context.Background(), binding(agent), &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if wakes != 1 || p.Through != 31 || h.reads(noticeDeployer, false) != 1 {
+					t.Fatalf("wakes=%d author reads=%d progress=%+v", wakes, h.reads(noticeDeployer, false), p)
+				}
+			})
+		}
+	}
+	// A notice with no refs at all, and one whose other refs say routine.
+	bare := deployerNotice(31, noticeDeployer)
+	other := taggedNotice(31, noticeDeployer, "Release refused before publication", "")
+	other.Envelope.Refs["release-job"] = "routine"
+	other.Envelope.Refs["Wake"] = "routine"
+	for name, m := range map[string]api.Message{"no refs": bare, "other refs": other} {
+		if !wakingNotice(m) || !wakeEligible(m, noticeHelper, map[string]bool{noticeDeployer: true}) {
+			t.Fatalf("%s: the notice does not wake", name)
+		}
+	}
+}
+
+// The wake ref is kept by the real store and served by the hub API, and the
+// relay reads it there: a routine notice wakes nobody, an attention notice
+// posted after it wakes the primary handler and the owner helper once.
+func TestRelayDeployerNoticeWakeRefThroughStore(t *testing.T) {
+	relayAuthorRoles.reset()
+	relayPrimaryHandlers.reset()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Deployer wake class", Orchestrator: "lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(name, role string) api.Agent {
+		t.Helper()
+		a, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "host", Session: name, Runtime: "codex", Role: role}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	deployer, primary := add("deployer", api.AgentRoleDeployment), add("database", api.AgentRoleDatabaseHandler)
+	registered, err := st.RegisterOwnerHelper(ctx, task.ID, api.RegisterOwnerHelperRequest{Host: "host", Session: "owner", Runtime: "codex", RequestID: "wake-helper"}, by)
+	if err != nil || registered.Agent == nil {
+		t.Fatalf("register helper: %+v %v", registered, err)
+	}
+	helper := *registered.Agent
+	for _, a := range []api.Agent{primary, helper} {
+		if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: a.ID, RunID: a.RunID}, by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, primary.ID, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	post := func(requestID, subject, wake string) api.Message {
+		t.Helper()
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: deployer.ID, RunID: deployer.RunID, RequestID: requestID,
+			Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: map[string]string{"release-job": "rel_00000000000000d1", "wake": wake}, Body: api.EnvelopeBody{Text: subject + "."}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.To != "" || m.Broadcast {
+			t.Fatalf("fixture notice has a recipient: %+v", m)
+		}
+		return m
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := func(m api.Message, agent, wake string) {
+		t.Helper()
+		page, err := c.ListMessages(ctx, task.ID, m.Seq-1, agent, 200)
+		if err != nil || len(page) != 1 || page[0].Seq != m.Seq || page[0].Envelope == nil || page[0].Envelope.Refs["wake"] != wake {
+			t.Fatalf("the hub did not serve notice #%d with wake=%s: %+v %v", m.Seq, wake, page, err)
+		}
+	}
+	type recipient struct {
+		b       runtimeBinding
+		p       relayProgress
+		prompts []string
+	}
+	recipients := map[string]*recipient{}
+	for _, a := range []api.Agent{primary, helper} {
+		recipients[a.Name] = &recipient{b: runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: a.ID, Run: a.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "codex", Role: a.Role, Codex: "/synthetic/codex"}}
+	}
+	recipients[primary.Name].b.Role = ""
+	now := time.Now()
+	pass := func(at time.Time) {
+		t.Helper()
+		for _, r := range recipients {
+			queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+				r.prompts = append(r.prompts, prompt)
+				return nil
+			}
+			if err := relayOne(ctx, r.b, &r.p, c, at, queue); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	routine := post("wake-routine", "A release job is waiting behind a held project fence", "routine")
+	for name, r := range recipients {
+		served(routine, r.b.Agent, "routine")
+		if a, err := c.GetAgent(ctx, task.ID, r.b.Agent); err != nil || a.Unread != 1 || !a.Online {
+			t.Fatalf("the routine notice is not unread for live %s: %+v %v", name, a, err)
+		}
+	}
+	pass(now)
+	pass(now.Add(time.Minute))
+	for name, r := range recipients {
+		if len(r.prompts) != 0 || r.p.Through != routine.Seq {
+			t.Fatalf("%s after the routine notice: prompts=%q progress=%+v", name, r.prompts, r.p)
+		}
+	}
+	attention := post("wake-attention", "Release failed and requires recovery", "attention")
+	for _, r := range recipients {
+		served(attention, r.b.Agent, "attention")
+	}
+	pass(now.Add(2 * time.Minute))
+	pass(now.Add(3 * time.Minute))
+	for name, r := range recipients {
+		if len(r.prompts) != 1 || r.p.Through != attention.Seq || !strings.Contains(r.prompts[0], fmt.Sprintf("through message #%d", attention.Seq)) {
+			t.Fatalf("%s was not woken once for attention notice #%d: prompts=%q progress=%+v", name, attention.Seq, r.prompts, r.p)
+		}
+	}
+}
+
+// An attention notice wakes each recipient exactly once across repeated
+// passes and a reloaded progress record, and on a page that also holds
+// routine notices the one wake names the attention notice only.
+func TestRelayDeployerNoticeAttentionWakesOnceAndMixedPage(t *testing.T) {
+	for _, agent := range noticeRecipients {
+		t.Run("once-"+agent, func(t *testing.T) {
+			h, c, binding := newNoticeHub(t)
+			h.messages = []api.Message{taggedNotice(31, noticeDeployer, "Release refused before publication", "attention")}
+			p := relayProgress{}
+			wakes := 0
+			queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+			now := time.Now()
+			for i := 0; i < 8; i++ {
+				if i == 3 {
+					raw, _ := json.Marshal(p)
+					p = relayProgress{}
+					if err := json.Unmarshal(raw, &p); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := relayOne(context.Background(), binding(agent), &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+					t.Fatal(err)
+				}
+				if wakes != 1 || p.Through != 31 {
+					t.Fatalf("pass %d: wakes=%d progress=%+v", i, wakes, p)
+				}
+			}
+		})
+		t.Run("mixed-"+agent, func(t *testing.T) {
+			h, c, binding := newNoticeHub(t)
+			h.messages = []api.Message{
+				taggedNotice(31, noticeDeployer, "A release job is waiting behind a held project fence", "routine"),
+				taggedNotice(32, noticeDeployer, "Release failed and requires recovery", "attention"),
+				taggedNotice(33, noticeDeployer, "A deployer CLI call failed", "routine"),
+			}
+			b := binding(agent)
+			b.Runtime, b.Codex, b.Session = "claude", "", "fixture"
+			p := relayProgress{}
+			var prompts []string
+			queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+				prompts = append(prompts, prompt)
+				return nil
+			}
+			now := time.Now()
+			for i := 0; i < 3; i++ {
+				if err := relayOne(context.Background(), b, &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(prompts) != 1 || p.Through != 33 || !strings.HasPrefix(prompts[0], "Tailterm messages #32. ") || strings.Contains(prompts[0], "#31") || strings.Contains(prompts[0], "#33") {
+				t.Fatalf("mixed page: prompts=%q progress=%+v", prompts, p)
+			}
+			if h.reads(noticeDeployer, false) != 1 {
+				t.Fatalf("the deployer's role was read %d times", h.reads(noticeDeployer, false))
+			}
+		})
+	}
+}
+
+// The routine tag is read only on a deployer's recipient-less notice. On a
+// message directed to the agent, a broadcast or an owner post it stops no
+// wake, and an attention notice still wakes no handler but the primary.
+func TestRelayDeployerNoticeRoutineTagStopsNoOtherWake(t *testing.T) {
+	directed := func(to string) api.Message {
+		m := taggedNotice(31, noticeDeployer, "A release job is skipped because the hub refused its claim", "routine")
+		m.To = to
+		return m
+	}
+	broadcast := taggedNotice(31, noticeDeployer, "A release job is waiting behind a held project fence", "routine")
+	broadcast.Broadcast = true
+	owner := taggedNotice(31, "", "A release job is waiting behind a held project fence", "routine")
+	if owner.From.AgentID != "" || owner.Envelope.Refs["wake"] != "routine" {
+		t.Fatalf("fixture owner post: %+v", owner)
+	}
+	for _, tc := range []struct {
+		name, agent string
+		m           api.Message
+		wake        bool
+	}{
+		{"directed to the handler", noticeHandler, directed(noticeHandler), true},
+		{"directed to the helper", noticeHelper, directed(noticeHelper), true},
+		{"directed to a worker", noticeWorker, directed(noticeWorker), true},
+		{"broadcast to the handler", noticeHandler, broadcast, true},
+		{"broadcast to the helper", noticeHelper, broadcast, true},
+		{"broadcast to a worker", noticeWorker, broadcast, true},
+		{"owner post to the handler", noticeHandler, owner, true},
+		{"owner post to the helper", noticeHelper, owner, true},
+		{"owner post to a worker", noticeWorker, owner, true},
+		{"routine worker notice to the helper", noticeHelper, taggedNotice(31, noticeWorker, "Status", "routine"), false},
+		{"attention worker notice to the helper", noticeHelper, taggedNotice(31, noticeWorker, "Status", "attention"), false},
+		{"attention notice to another handler", noticeHandlerB, taggedNotice(31, noticeDeployer, "Release failed and requires recovery", "attention"), false},
+		{"attention notice to a worker", noticeWorker, taggedNotice(31, noticeDeployer, "Release failed and requires recovery", "attention"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, c, binding := newNoticeHub(t)
+			h.messages = []api.Message{tc.m}
+			p := relayProgress{}
+			wakes := 0
+			queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+			now := time.Now()
+			for i := 0; i < 3; i++ {
+				if err := relayOne(context.Background(), binding(tc.agent), &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if want := map[bool]int{true: 1}[tc.wake]; wakes != want || p.Through != 31 {
+				t.Fatalf("wakes=%d want %d progress=%+v", wakes, want, p)
+			}
+			// A deployer's role is never read for a routine notice, nor by a
+			// handler that is not the primary.
+			if tc.m.From.AgentID == noticeDeployer && h.reads(noticeDeployer, false) != 0 {
+				t.Fatalf("the deployer's role was read %d times", h.reads(noticeDeployer, false))
+			}
+		})
+	}
+}
+
+// One clean release as the deployer announces it: three fence waits for
+// normal handler steps, a wait for the verification host, and the restart
+// onto the released scripts with its "now runs" report. Tagged as the runner
+// now tags them (tests/release-runner.test.js wake a1), none wakes the primary
+// handler or the owner helper. The same notices untagged, as before, woke each
+// of them for every one.
+func TestRelayDeployerNoticeCleanReleaseWakesNobody(t *testing.T) {
+	subjects := []string{
+		"A release job is waiting behind a held project fence",
+		"A release job is waiting for the verification host",
+		"A release job is waiting behind a held project fence",
+		"A release job is waiting behind a held project fence",
+		"Deployer is restarting itself onto the published scripts",
+		"Deployer now runs the published scripts",
+	}
+	replay := func(t *testing.T, wake string) map[string]int {
+		t.Helper()
+		h, c, binding := newNoticeHub(t)
+		woken := map[string]int{}
+		queue := func(_ context.Context, b runtimeBinding, _ string) error {
+			woken[b.Agent]++
+			return nil
+		}
+		progress := map[string]*relayProgress{noticeHandler: {}, noticeHelper: {}}
+		now := time.Now()
+		// Each notice arrives, and the relay passes over both bindings before
+		// the next one does.
+		for i, subject := range subjects {
+			h.mu.Lock()
+			h.messages = append(h.messages, taggedNotice(int64(31+i), noticeDeployer, subject, wake))
+			h.mu.Unlock()
+			for _, agent := range noticeRecipients {
+				if err := relayOne(context.Background(), binding(agent), progress[agent], c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for agent, p := range progress {
+			if p.Through != int64(30+len(subjects)) {
+				t.Fatalf("%s did not pass the last notice: %+v", agent, p)
+			}
+		}
+		if wake == "routine" && (h.reads(noticeDeployer, false) != 0 || h.reads("tasks", false) != 0) {
+			t.Fatalf("a clean release read the deployer %d times and the task list %d times", h.reads(noticeDeployer, false), h.reads("tasks", false))
+		}
+		return woken
+	}
+	if woken := replay(t, "routine"); len(woken) != 0 {
+		t.Fatalf("a clean release woke %v", woken)
+	}
+	before := replay(t, "")
+	if before[noticeHandler] != len(subjects) || before[noticeHelper] != len(subjects) || len(before) != 2 {
+		t.Fatalf("the same release untagged woke %v, want %d each", before, len(subjects))
+	}
+}

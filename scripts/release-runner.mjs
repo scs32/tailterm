@@ -98,6 +98,13 @@ function recordCliFailure(config, job, argv, cwd, error, reason, now) {
   } catch {}
   return {reason, jobId: entry.jobId, at: entry.at};
 }
+// The wake class of a notice posted with no recipient, sent as its wake ref.
+// The inbox relay wakes the primary database handler and the owner helper for
+// such a notice unless the ref is exactly routine (a notice the Board keeps
+// and nobody has to act on); attention is a refused, failed, held or
+// recovery-needed release. A directed notice carries no class.
+export const WAKE = {routine: "routine", attention: "attention"};
+const wakeRef = wake => ["--ref", `wake=${wake}`];
 // The Board notice for a recorded CLI failure: the safe reason and the job,
 // nothing else of the call. key is one per job and reason for a process; the
 // request id also carries when the kept failure was first seen, so a later
@@ -105,7 +112,7 @@ function recordCliFailure(config, job, argv, cwd, error, reason, now) {
 export function cliFailureNotice(failure, run) {
   const reason = REASON.test(failure?.reason || "") ? failure.reason : "unclassified", job = /^rel_[A-Za-z0-9]{1,40}$/.test(failure?.jobId || "") ? failure.jobId : null;
   const id = createHash("sha256").update(JSON.stringify([failure?.at ?? null, job, reason])).digest("hex").slice(0, 16);
-  return {key: `cli-failure ${job} ${reason}`, requestId: `cli-failure-${NAME(run)}-${id}`, jobId: job, subject: "A deployer CLI call failed",
+  return {key: `cli-failure ${job} ${reason}`, requestId: `cli-failure-${NAME(run)}-${id}`, jobId: job, wake: WAKE.routine, subject: "A deployer CLI call failed",
     text: `Deployer CLI call failed: ${reason}${job ? ` (release ${job})` : ""}. The exact argv, exit code and stderr are kept in cli-failures.json in the private journal directory of the deployer.`};
 }
 // What the Board may repeat of a refused CLI call's stderr: its last line,
@@ -132,7 +139,7 @@ export function heldClaimNotice(job, kind, reason, run) {
   const item = /^wi_[a-f0-9]{1,40}$/.test(job.itemId || "") ? job.itemId : null, commit = /^[a-f0-9]{40}$/.test(job.commit || "") ? job.commit : null;
   const why = REASON.test(reason || "") ? reason : "unclassified", journal = kind === "journal";
   const id = createHash("sha256").update(JSON.stringify([journal ? "journal" : "claim", why])).digest("hex").slice(0, 8);
-  return {key: `claim-held ${job.id}`, requestId: `${job.id}-claim-held-${NAME(run)}-${id}`, jobId: job.id, item, commit,
+  return {key: `claim-held ${job.id}`, requestId: `${job.id}-claim-held-${NAME(run)}-${id}`, jobId: job.id, item, commit, wake: WAKE.attention,
     subject: journal ? "A release job is skipped because its set-aside journal is held" : "A release job is skipped because the hub refused its claim",
     text: `Release ${job.id} (item ${item || "unknown"}, commit ${commit ? commit.slice(0, 12) : "unknown"}) is verified but not claimed: ${journal ? "the journal of its set-aside claim is held" : "the hub refused the claim"}. Reason: ${why}. Nothing was integrated, published or deployed. The deployer skips this job at every poll and goes on to later jobs; this notice is sent once per job per deployer run to the database handler and to the owner helper. Database handler: reconcile the job (Held claim in docs/project-deployment.md). Owner helper: for information.`};
 }
@@ -231,13 +238,13 @@ export function matrixWaitNotice(job, wait) {
   const identity = names.length > 1 ? createHash("sha256").update(JSON.stringify(names)).digest("hex").slice(0, 24) : names[0] || "none";
   const again = Number.isSafeInteger(wait.change) && wait.change > 1 ? `-n${wait.change}` : "";
   const id = h => `${job.id}-matrix-wait-${wait.attempt}-p${wait.position}-of${wait.length}-${h}${again}`, full = id(identity);
-  return {requestId: full.length <= 128 ? full : id(identity.slice(0, 8)), subject: "A release job is waiting for the verification host",
+  return {requestId: full.length <= 128 ? full : id(identity.slice(0, 8)), wake: WAKE.routine, subject: "A release job is waiting for the verification host",
     text: `Release ${job.id} waits for the verification host at position ${wait.position} of ${wait.length} at priority ${NAME(wait.priority)} ${holders.length ? "behind " + holders.map(h => `${NAME(h.item)}/${NAME(h.agent)}/pid ${Number.isSafeInteger(h.pid) ? h.pid : "unknown"}`).join("; ") : "with no holder"}`};
 }
 export function matrixHeldNotice(job, held) {
   if (!job?.id || !held || !(ATTEMPT.test(held.attempt || "") || held.attempt === ALL_ATTEMPTS)) return null;
   const groups = (held.groups || []).filter(Number.isSafeInteger);
-  return {requestId: `${job.id}-matrix-held-${held.attempt}`, subject: "A release job is held until its matrix run is confirmed stopped",
+  return {requestId: `${job.id}-matrix-held-${held.attempt}`, wake: WAKE.attention, subject: "A release job is held until its matrix run is confirmed stopped",
     text: `Release ${job.id} is held: its matrix run could not be confirmed stopped (pid ${Number.isSafeInteger(held.pid) ? held.pid : "unknown"}; check groups still alive: ${groups.join(",") || "none"}; ${REASON.test(held.reason || "") ? held.reason : "unclassified"}). It keeps the project release fence and no other job integrates. Confirm nothing of that run is alive, then follow the held matrix run step in docs/project-deployment.md.`};
 }
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
@@ -1456,10 +1463,10 @@ export class HostAdapter {
     const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");
     if(details.outcome==="refused"){
       const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
-      return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}.${reason.startsWith("integration-conflict")?" Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.":""} Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+      return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}.${reason.startsWith("integration-conflict")?" Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.":""} Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
     }
-    if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`]);
-    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}${waits}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`]);
+    if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
+    return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}${waits}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
   }
 }
 
@@ -1588,12 +1595,12 @@ export function codeNotice(record,kind=record?.state){
   const changed=(Array.isArray(record.changed)?record.changed:[]).filter(n=>RUNNER_CODE_FILES.includes(n)).join(", ")||"none";
   const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
   const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:""}`;
-  if(kind==="draining")return {requestId,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
+  if(kind==="draining")return {requestId,wake:WAKE.routine,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
   // A restart with a held job is its own notice and names the job.
-  if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
-  if(kind==="restart")return {requestId,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
-  if(kind==="restarted")return {requestId,subject:"Deployer now runs the published scripts",text:`Deployer run ${run} restarted itself from scripts ${short(record.restartedFrom)} and now runs ${loaded}, the scripts of published tasks-hub ${short(record.current?.commit)}.`};
-  return {requestId,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
+  if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
+  if(kind==="restart")return {requestId,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
+  if(kind==="restarted")return {requestId,wake:WAKE.routine,subject:"Deployer now runs the published scripts",text:`Deployer run ${run} restarted itself from scripts ${short(record.restartedFrom)} and now runs ${loaded}, the scripts of published tasks-hub ${short(record.current?.commit)}.`};
+  return {requestId,wake:WAKE.attention,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
     text:`${seen} It could not restart itself and claims no release. Reason: ${reason}. ${RESTART_ACTION}`};
 }
 const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n"};
@@ -1626,13 +1633,16 @@ const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integr
 // waiting, running or held): that run may be using the checkout, and the host
 // release lock is not held while it runs. Unless the caller says otherwise, a
 // job waiting for its matrix is taken to have such a run. The request id
-// omits generations, which every fence check bumps.
+// omits generations, which every fence check bumps. A holder waiting for the
+// handler's own step (the matrix import or the inputs binding) is routine,
+// since the handler already holds the directed request for it; a blocked or
+// merged holder, or one another deployer run claimed, needs attention.
 export function fenceWaitNotice(jobs,holder,reason,locked=false,matrixRun=reason==="waiting_matrix"){
   const waiting=jobs.find(j=>j.id!==holder?.id && j.state==="verified");
   if(!holder || !waiting || !FENCE_REASONS[reason])return null;
   const noEffects=holder.state==="claimed" && holder.published!==true && !holder.receipt && !holder.inputsDigest;
   const advice=!noEffects?"It keeps the fence until handler reconciliation.":matrixRun?"It keeps the fence: its integrated matrix run has not ended and may be using the checkout, so it is not set aside until the run.json of each of its attempts says ended.":locked?"It keeps the fence: the host release lock names its run, so the handler reconciles it with the lock digest after that run stops.":"It has no release effects; the handler can move it aside with tt deployment set-aside so the waiting job claims the fence.";
-  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}${noEffects&&matrixRun?"-matrix":noEffects&&locked?"-locked":""}`,waitingJobId:waiting.id,subject:"A release job is waiting behind a held project fence",
+  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}${noEffects&&matrixRun?"-matrix":noEffects&&locked?"-locked":""}`,waitingJobId:waiting.id,wake:["waiting_matrix","waiting_inputs"].includes(reason)?WAKE.routine:WAKE.attention,subject:"A release job is waiting behind a held project fence",
     text:`Release ${holder.id} holds the project release fence and ${FENCE_REASONS[reason]}; release ${waiting.id} is queued behind it. ${advice}`};
 }
 // Whether the host release lock names this job's exact claim. An unreadable
@@ -1768,7 +1778,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     let matrixRun=true;try{matrixRun=matrixRunUnsettled(config.journalDirectory,holder);}catch{}
     const notice=fenceWaitNotice(jobs,holder,reason,locked,matrixRun);
     if(!notice || posted.has(notice.requestId))return;
-    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`]);posted.add(notice.requestId);}
+    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
     catch{process.stderr.write("Fence wait notice not posted; the next poll retries.\n");}
   };
   // One notice per place on the verification host's waitlist (position, list
@@ -1776,7 +1786,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   const matrixNotify=(reader,job,adapter)=>{
     for(const notice of [matrixWaitNotice(job,adapter.matrixWait),matrixHeldNotice(job,adapter.matrixHeld)]){
       if(!notice || posted.has(notice.requestId))continue;
-      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${job.id}`]);posted.add(notice.requestId);}
+      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${job.id}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
       catch{process.stderr.write("Matrix host notice not posted; the next poll retries.\n");}
     }
   };
@@ -1786,7 +1796,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const notice=codeNotice(record,kind);if(!notice)return;
     if(CODE_LINES[kind] && !code.said.has(notice.requestId)){code.said.add(notice.requestId);process.stderr.write(CODE_LINES[kind]);}
     if(code.noticed.has(notice.requestId))return;
-    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId]);code.noticed.add(notice.requestId);}
+    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...wakeRef(notice.wake)]);code.noticed.add(notice.requestId);}
     catch{process.stderr.write("Runner code notice not posted; the next poll retries.\n");}
   };
   // One notice per job and safe reason for the CLI failures a held poll or a
@@ -1796,20 +1806,21 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     for(const failure of [...failures]){
       const notice=cliFailureNotice(failure,process.env.TAILTERM_RUN);
       if(posted.has(notice.key))continue;
-      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[])]);posted.add(notice.key);}catch{}
+      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[]),...wakeRef(notice.wake)]);posted.add(notice.key);}catch{}
     }
   };
   // A skipped job (a refused claim or a held set-aside journal) is told once
   // per process to each of the project database handler and the live owner
   // helper, directed so both are woken. While a recipient cannot be resolved
   // or its post fails, one Board notice without a recipient stands in and that
-  // recipient is tried again at the next poll. Nothing here changes the skip.
+  // recipient is tried again at the next poll. Only that Board copy carries
+  // the wake class. Nothing here changes the skip.
   const HELD_TO={handler:reader=>reader.handler(),helper:reader=>{
     const live=JSON.parse(reader.command([config.tt||"tt","agents","--json"])).filter(a=>a?.role==="owner_helper" && !["closed","exited"].includes(a.status));
     if(live.length!==1 || !/^agt_[a-f0-9]+$/.test(live[0].id||""))throw releaseError("One live owner helper required");return live[0].id;}};
   const heldNotify=(reader,job,kind,reason)=>{
     const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);if(!notice)return;
-    const send=(suffix,to)=>reader.command([config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[])]);
+    const send=(suffix,to)=>reader.command([config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[]),...(to?[]:wakeRef(notice.wake))]);
     let missed=false;
     for(const [name,resolve] of Object.entries(HELD_TO)){
       if(posted.has(`${notice.key} ${name}`))continue;
