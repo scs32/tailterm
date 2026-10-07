@@ -2,6 +2,58 @@ import assert from "node:assert/strict";
 import { finishRestoration } from "./restore-browser.mjs";
 import { homeShellsToTabs } from "./pane-groups-browser.mjs";
 
+// What decides which terminals show, for the message of a failed count: the
+// pressed filters, the tabs, and each visible terminal with the pane over it.
+const filterState = (page) =>
+  page.evaluate(() => {
+    const text = (n) => n?.textContent.replace(/\s+/g, " ").trim() ?? "";
+    const headers = [...document.querySelectorAll(".pane-header")];
+    const paneOver = (terminal) => {
+      const box = terminal.getBoundingClientRect();
+      const header = headers.find((h) => {
+        const b = h.getBoundingClientRect();
+        return (
+          Math.abs(b.left - box.left) < 8 && Math.abs(b.bottom - box.top) < 8
+        );
+      });
+      return header
+        ? `pane ${header.dataset.pane} "${text(header.querySelector(".pane-label"))}"`
+        : "no pane header over it";
+    };
+    return {
+      filters: [...document.querySelectorAll("#all-servers, .server-item")]
+        .filter((n) => n.getAttribute("aria-pressed") === "true")
+        .map((n) => text(n.querySelector("strong") || n)),
+      tabs: [...document.querySelectorAll("#tabs .tab")].map(
+        (n) =>
+          `${n.querySelector("[data-tab]")?.dataset.tab}${n.classList.contains("active") ? " (active)" : ""} "${text(n.querySelector("[data-tab]"))}"`,
+      ),
+      visible: [...document.querySelectorAll(".terminal-instance")].flatMap(
+        (n, i) =>
+          n.hidden
+            ? []
+            : [
+                `terminal ${i}${n.classList.contains("focused-pane") ? " (focused)" : ""}: ${paneOver(n)}`,
+              ],
+      ),
+      status: text(document.querySelector("#terminal-status")),
+    };
+  });
+// A filter click decides which terminals show. Wait for the count instead of
+// reading it once, and say what is showing when it never arrives.
+async function visibleTerminals(page, expected, timeout = 10000) {
+  const count = () => page.locator(".terminal-instance:not([hidden])").count();
+  const deadline = Date.now() + timeout;
+  while ((await count()) !== expected && Date.now() < deadline)
+    await page.waitForTimeout(50);
+  const seen = await count();
+  assert.equal(
+    seen,
+    expected,
+    `${seen} visible terminal instances, expected ${expected}, after ${timeout} ms: ${JSON.stringify(await filterState(page))}`,
+  );
+}
+
 export async function exerciseServerFilters(page) {
   await page.locator("#all-servers").click();
   const production = page
@@ -17,10 +69,29 @@ export async function exerciseServerFilters(page) {
     .locator("[data-tab]")
     .getAttribute("data-tab");
   await page.locator("#new-tab").click();
-  await page
+  // The launcher redraws its server cards when a background session check
+  // ends, and a click split by that redraw reaches no card. Click until
+  // Development is the chosen card, or the shell opens on Production.
+  const card = page
     .locator("[data-launch-server]")
-    .filter({ hasText: "Development" })
-    .click();
+    .filter({ hasText: "Development" });
+  const chosen = Date.now() + 10000;
+  for (let tries = 1; ; tries++) {
+    await card.click();
+    if ((await card.getAttribute("aria-pressed")) === "true") break;
+    assert.ok(
+      tries < 5 && Date.now() < chosen,
+      `Development is chosen in the launcher after ${tries} clicks: ${JSON.stringify(
+        await page.evaluate(() => ({
+          cards: [...document.querySelectorAll("[data-launch-server]")].map(
+            (n) =>
+              `${n.querySelector("strong")?.textContent ?? n.dataset.launchServer}${n.getAttribute("aria-pressed") === "true" ? " (chosen)" : ""}`,
+          ),
+          note: document.querySelector("#launcher-note")?.textContent,
+        })),
+      )}`,
+    );
+  }
   await page.locator("#launcher-shell").click();
   const deadline = Date.now() + 30000;
   while (
@@ -44,6 +115,11 @@ export async function exerciseServerFilters(page) {
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
   const tab = (id) => page.locator(`#tabs .tab:has([data-tab="${id}"])`);
+  assert.match(
+    await tab(dev).innerText(),
+    /Development/,
+    "The new shell is a Development tab",
+  );
   await tab(dev).dragTo(tab(original));
   const paneCount = await page.locator(".pane-header").count();
   assert.ok(paneCount >= 2, "Mixed-server group created");
@@ -59,10 +135,7 @@ export async function exerciseServerFilters(page) {
   assert.equal(await production.getAttribute("aria-pressed"), "true");
   assert.equal(await development.getAttribute("aria-pressed"), "false");
   assert.doesNotMatch(await page.locator("#tabs").innerText(), /Development/);
-  assert.equal(
-    await page.locator(".terminal-instance:not([hidden])").count(),
-    paneCount - 1,
-  );
+  await visibleTerminals(page, paneCount - 1);
   const focused = await page
     .locator(".tab.active [data-tab]")
     .getAttribute("data-tab");
@@ -72,25 +145,16 @@ export async function exerciseServerFilters(page) {
     focused,
     "Adding a filter preserves active session",
   );
-  assert.equal(
-    await page.locator(".terminal-instance:not([hidden])").count(),
-    paneCount,
-  );
+  await visibleTerminals(page, paneCount);
   await production.click();
   assert.equal(
     await page.locator(".tab.active [data-tab]").getAttribute("data-tab"),
     dev,
   );
-  assert.equal(
-    await page.locator(".terminal-instance:not([hidden])").count(),
-    1,
-  );
+  await visibleTerminals(page, 1);
   await development.click();
   assert.equal(await page.locator("#tabs .tab").count(), 0);
-  assert.equal(
-    await page.locator(".terminal-instance:not([hidden])").count(),
-    0,
-  );
+  await visibleTerminals(page, 0);
   assert.match(
     await page.locator("#server-filter-empty").innerText(),
     /No servers selected/,
