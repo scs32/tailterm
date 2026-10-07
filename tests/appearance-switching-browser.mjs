@@ -54,10 +54,18 @@ try {
             )) {
             const button = page.locator(`[data-${attr}-choice="${id}"]`);
             await button.scrollIntoViewIfNeeded();
+            // The typeface cards use bundled web fonts with font-display:
+            // swap. A card measured in its fallback font is 2 px shorter than
+            // once its font arrives, so read only after every font the page
+            // asked for has loaded and that layout has been painted.
             const metrics = () =>
-              page
-                .locator("#dialog")
-                .evaluate((d) => ({
+              page.locator("#dialog").evaluate(async (d) => {
+                do {
+                  await document.fonts.ready;
+                  for (let frame = 0; frame < 2; frame++)
+                    await new Promise(requestAnimationFrame);
+                } while (document.fonts.status !== "loaded");
+                return {
                   scroll: d.scrollTop,
                   width: d.clientWidth,
                   scrollWidth: d.scrollWidth,
@@ -69,7 +77,8 @@ try {
                     .getBoundingClientRect().height,
                   card: d.querySelector(".font-grid").getBoundingClientRect()
                     .height,
-                }));
+                };
+              });
             const before = await metrics();
             await button.click();
             await page.waitForTimeout(200);
