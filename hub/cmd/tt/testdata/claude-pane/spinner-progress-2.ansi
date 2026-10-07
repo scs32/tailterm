@@ -1,0 +1,30 @@
+
+  A third strand is [1mprotocol extension[0m. The inherited protocol has real deficiencies. The keyboard
+  encoding cannot distinguish many key combinations: Control-I and Tab are the
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mDo not use any tools. Think at great length, privately, about eight different proofs that there [39m
+  [38;5;231mare infinitely many primes and check each one in detail. Then answer with only the word done.[39m
+
+[38;5;231m[49m⏺[39m done
+
+[38;5;246m✻[39m [38;5;246mBaked for 10s · done 11:52 PM · 1 shell still running[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mFirst run the bash command: sleep 32. Then think hard and at length about three proofs of the [39m
+  [38;5;231minfinitude of primes, then write a 900-word essay about them. Use no other tools.[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m⏺[39m Foreground [38;5;153msleep[39m is blocked in this harness, so I'm running the same command in the background and
+  will write the essay once it exits.
+
+[38;5;246m [39m Running [1m1[0m shell command…
+[38;5;246m  ⎿  $ sleep 32[39m
+
+[38;5;174m✶[39m [38;5;174mSchlepping… [38;5;246m(5s · ↓[39m [38;5;246m339 tokens · thought for 2s)[39m
+[38;5;246m  ⎿  Tip: Did you know you can drag and drop image files into your terminal?[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m · [38;5;44m1 shell[38;5;246m · esc to interrupt · ← for agents · ↓ to manage[39m

@@ -16,3 +16,17 @@ Sanitized transcript excerpts for `claude_transcript_test.go` (bug `wi_614f0e656
 | `queue-remove-noreason` | agent session in another project, lines 726-734, 2026-08-27 04:57:50-04:57:56Z | 2.1.243 | A completed turn, then an enqueue and a `remove` without `reason` (older Claude Code format). | idle |
 
 Tests copy a fixture into a temporary `HOME` and may append synthetic records: a dequeue, a user prompt, an `end_turn`, an unknown record type, or a malformed line.
+
+## Interrupted turns
+
+Sanitized excerpts for `claude_stall_test.go` and the interrupt record in `claudeTurnEnd` (bug `wi_03ce50892a559767` revision 10, order #27407, assignment #27506, manifest step H1, criteria h4-h7 and h12).
+
+- Captured on 2026-10-07 on Stephens-Mini from one disposable Claude Code 2.1.292 session on a private tmux socket (`tmux -L ttfix-03ce -f /dev/null`, 100x30, `env -i` with only HOME, PATH, USER, LANG and TERM=xterm-256color, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0`, `claude --session-id <new uuid>`). Escape was sent with `tmux send-keys Escape`. No agent session was involved and user settings were not changed.
+- Sanitized by the same rules as above: prompts, answers, thinking and tool input and output replaced with fixture text, ids renumbered with their links kept, `cwd`, `gitBranch`, `requestId` and metadata fields dropped. Kept as recorded: `isAbortedMidStream`, the `interruptedMessageId` link, and the text of the interrupt record itself, `[Request interrupted by user]`, which is Claude Code's own fixed string and not user content. The same grep finds nothing.
+
+| Fixture | Source lines | Shape | Idle check |
+| --- | --- | --- | --- |
+| `interrupt-after-tool` | 71-84, 06:52:57-06:54:31Z | A completed turn, then a prompt, a Bash `tool_use` and its result, and five seconds into the thinking that followed, Escape: one `user` record whose content is a list with the single text part `[Request interrupted by user]`. No `turn_duration` follows. This is the shape of a stalled turn after a tool result. Tests drop the last record to get the open, quiet turn and append it again as Claude Code's answer to Escape. | idle, reason `turn interrupted` |
+| `interrupt-streaming` | 23-43, 06:49:21-06:50:53Z | A prompt, a completed thinking block, then Escape after 66 seconds of streamed text: the partial text block is written with `isAbortedMidStream`, then the interrupt record. | idle, reason `turn interrupted` |
+| `interrupt-no-record` | 4-22, 06:48:43Z | A prompt, then Escape 17 seconds into the first thinking, before any assistant record. Claude Code wrote nothing for the interrupt and put the prompt back in the input box. | turn in progress |
+

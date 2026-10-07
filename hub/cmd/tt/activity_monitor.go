@@ -424,6 +424,10 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if state.State != "runtime_prompt" && state.State != "provider_blocked" && probeErr == nil && tmuxAlive && processAlive {
 		if reason := activityStuckReason(ctx, b, a, state.State, now, activityDefaults()); reason != "" {
 			state.State, state.Reason = "stuck", reason
+		} else if reason := claudeStallStuckReason(b, &c, now); observed && reason != "" {
+			// A recorded stalled turn (claude_stall.go): open, nothing pending
+			// and nothing written since the stall began.
+			state.State, state.Reason = "stuck", reason
 		}
 	}
 	if state.State == "stuck" && c.StuckUnsupported {

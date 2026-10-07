@@ -941,7 +941,12 @@ func cmdRelay(args []string) error {
 					queued, brokerErr := false, error(nil)
 					queue := nativeQueue
 					if b.Runtime == "claude" {
-						queue = claudeQueue
+						// A stalled turn is detected, and on a host set to
+						// interrupt it is interrupted, before delivery, so the
+						// wake it held back is typed in this same pass. The
+						// wrapper notes that wake in the stall record.
+						claudeStallPass(ctx, b, nativeClaudeStallOps(c))
+						queue = claudeStallWake(claudeQueue, time.Now)
 					}
 					queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, queue)
 					if brokerErr != nil {

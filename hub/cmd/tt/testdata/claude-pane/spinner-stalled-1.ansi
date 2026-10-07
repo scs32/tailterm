@@ -1,0 +1,30 @@
+  the open set that must surround 1 is a progression 1 + (p₁p₂⋯pₖ)ℤ. Its members are exactly the
+  numbers that leave remainder 1 on division by the product of all the primes. That is Euclid's N in
+  different clothing.
+
+  [1mWhat the three share[0m
+
+  All three proofs rest on the same fact: every integer above 1 has a prime factor. They differ in
+  what they build around it. Euclid builds a single number. Euler builds an identity that carries
+  the entire multiplicative structure of the integers. Furstenberg builds a space in which a
+  finiteness assumption collides with the size of open sets.
+
+  They also differ in what they give back. Euclid's proof gives a method for finding a new prime.
+  Euler's gives a measure of how many primes there are. Furstenberg's gives no new information about
+  primes at all, but it shows that the language of topology can express a purely arithmetic fact.
+  Proofs of this theorem are still being published, largely for that reason.
+
+[38;5;246m✻[39m [38;5;246mCrunched for 25s · done 11:53 PM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mRun the bash command: true. After it returns, think privately and at great length about ten [39m
+  [38;5;231mproofs of the infinitude of primes, then write a 2000-word essay. Use no other tools.[39m
+
+[38;5;246m[49m [39m Running the no-op true command
+[38;5;246m  ⎿  $ true[39m
+
+[38;5;174m✻[39m [38;5;174mMarin[38;5;216mati[38;5;174mng… [38;5;246m(16m 2s · ↓[39m [38;5;246m75 tokens · thinking with high effort)[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [39m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents[39m

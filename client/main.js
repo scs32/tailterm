@@ -35,6 +35,7 @@ let appearancePreview;
 let browserFocused = document.hasFocus();
 let dialogSequence = 0;
 import { setupTerminalLinks } from "./terminal-links.js";
+import { attachTerminalReplies } from "./terminal-replies.js";
 import { confirmDialog } from "./confirm-dialog.js";
 import { setupVoiceDictation } from "./voice-dictation.js";
 let voiceDictation;
@@ -1445,6 +1446,7 @@ function disposeTab(t, replacing = false) {
   t.settleInitial?.();
   clearTimeout(t.activityTimer);
   t.history?.clear();
+  t.replies?.dispose();
   t.close?.();
   t.observer.disconnect();
   t.renderer?.dispose();
@@ -2085,7 +2087,9 @@ async function connect(
       t.title = title.slice(0, 200);
       if (active === t.id) renderContext();
     });
-    term.onData((d) => t.send?.(d));
+    // Replies xterm writes for an earlier connection, or for a tmux attach's
+    // device-attribute question, are never sent (terminal-replies.js).
+    t.replies = attachTerminalReplies(term, t, { tmux: !!tmux });
     const markActivity = (label) => {
       if (
         t.disposed ||
@@ -2200,6 +2204,7 @@ async function connect(
       if (t.disposed) return;
       t.transport = "ssh";
       t.send = null;
+      t.replies.restart();
       update("Connecting");
       openStandardSSH(t, ready, error, update);
     };
@@ -2211,6 +2216,7 @@ async function connect(
         t.agentSizer?.refresh();
         t.connection?.close();
         t.send = null;
+        t.replies.restart();
         t.retryMessage = interactive ? "" : "Reconnecting...";
         update("Connecting");
         const live = () => !t.disposed && generation === t.generation;

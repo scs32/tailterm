@@ -132,7 +132,19 @@ type activityThresholds struct {
 	// ProviderRepeat is how many failed turns in a row make a rate-limited or
 	// server-error provider failure a block. Values below 2 mean 2.
 	ProviderRepeat int
+	// Stalled is how long an open Claude turn with no pending tool call may go
+	// without a transcript record or a worktree change before it is a stalled
+	// turn (claude_stall.go). Zero means the default.
+	Stalled time.Duration
 }
+
+// Bounds and default of TAILTERM_ACTIVITY_STALLED_SECONDS. The floor keeps the
+// rule above the hung-tool default and well above a long thinking block.
+const (
+	activityStalledDefault = 900
+	activityStalledMin     = 300
+	activityStalledMax     = 86400
+)
 
 func activityDefaults() activityThresholds {
 	seconds := func(name string, fallback int) time.Duration {
@@ -150,7 +162,11 @@ func activityDefaults() activityThresholds {
 	if err != nil || repeat < 2 || repeat > 20 {
 		repeat = 2
 	}
-	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180), repeat}
+	stalled, err := strconv.Atoi(os.Getenv("TAILTERM_ACTIVITY_STALLED_SECONDS"))
+	if err != nil || stalled < activityStalledMin || stalled > activityStalledMax {
+		stalled = activityStalledDefault
+	}
+	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180), repeat, time.Duration(stalled) * time.Second}
 }
 
 func activityTranscript(b runtimeBinding) (string, error) {
@@ -546,13 +562,38 @@ func (e unknownClaudeRecordError) Error() string {
 
 var claudeAPIErrorCode = regexp.MustCompile(`^[a-z_]{1,40}$`)
 
+// claudeInterruptReason is the turn-end reason of an interrupted turn.
+const claudeInterruptReason = "turn interrupted"
+
+// claudeInterruptRecord reports the record Claude Code writes when Escape
+// interrupts a turn: a user record whose content is a list holding one text
+// part, "[Request interrupted by user]" or "[Request interrupted by user for
+// tool use]". Claude Code 2.1.292 writes it when the turn is interrupted while
+// thinking after a tool result or while a response streams, and writes no
+// turn_duration after it (testdata/claude-transcript, interrupt-*). A prompt a
+// person types is recorded as a string, never as this list, so a typed prompt
+// with the same words still starts a turn.
+func claudeInterruptRecord(content json.RawMessage) bool {
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &parts) != nil || len(parts) != 1 || parts[0].Type != "text" {
+		return false
+	}
+	return parts[0].Text == "[Request interrupted by user]" || parts[0].Text == "[Request interrupted by user for tool use]"
+}
+
 // claudeTurnEnd reports whether a Claude transcript record ends a turn, and
 // the reason for an unusual end. A turn ends at assistant end_turn, a result
-// record, a system turn_duration record, or the synthetic assistant record
+// record, a system turn_duration record, the synthetic assistant record
 // Claude Code writes when an API error ends the response (isApiErrorMessage,
-// stop_reason stop_sequence). Before bug wi_132c8895adfe0886 the last two
-// left the turn "in progress" and every wake was skipped. The reason carries
-// only a fixed phrase and a short error code, never transcript text.
+// stop_reason stop_sequence), or the user record it writes when the turn is
+// interrupted (claudeInterruptRecord). Before bug wi_132c8895adfe0886 the
+// turn_duration and API-error records left the turn "in progress" and every
+// wake was skipped; before bug wi_03ce50892a559767 the interrupt record did,
+// because it read as a new prompt. The reason carries only a fixed phrase and
+// a short error code, never transcript text.
 func claudeTurnEnd(line []byte) (ended bool, reason string) {
 	var rec struct {
 		Type       string `json:"type"`
@@ -560,7 +601,8 @@ func claudeTurnEnd(line []byte) (ended bool, reason string) {
 		IsAPIError bool   `json:"isApiErrorMessage"`
 		Error      string `json:"error"`
 		Message    struct {
-			StopReason string `json:"stop_reason"`
+			StopReason string          `json:"stop_reason"`
+			Content    json.RawMessage `json:"content"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(line, &rec) != nil {
@@ -576,6 +618,10 @@ func claudeTurnEnd(line []byte) (ended bool, reason string) {
 			return true, reason
 		}
 		return rec.Message.StopReason == "end_turn", ""
+	case "user":
+		if claudeInterruptRecord(rec.Message.Content) {
+			return true, claudeInterruptReason
+		}
 	case "result":
 		return true, ""
 	case "system":
@@ -669,6 +715,13 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 			}
 		}
 	case "user":
+		// An interrupt ends the turn. Nothing runs after it, so a tool call
+		// still pending is dropped, as at turn_duration.
+		if ended {
+			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, true, endReason
+			clear(c.Pending)
+			break
+		}
 		// A real user prompt starts a new turn. Tool results are also encoded as
 		// user records, but they continue the assistant's existing turn.
 		if claudeUserText(line) != "" {

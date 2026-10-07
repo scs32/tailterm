@@ -21,6 +21,7 @@
     "test:links": "node tests/terminal-links-browser.mjs",
     "test:context-menu": "node tests/terminal-context-menu-browser.mjs",
     "test:tmux-menu": "node tests/tmux-menu-browser.mjs",
+    "test:terminal-replies": "node tests/terminal-replies-browser.mjs",
     "build:hub": "npm run check:team-plan && cd hub && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../.build/ttbin/ ./cmd/...",
     "test:hub": "cd hub && go vet ./... && go test ./...",
     "container:up": "./scripts/container-dev.sh up",
