@@ -805,6 +805,57 @@ the change and `tasks-hub` still carries it, the runner's cherry-pick is empty
 and the new job is refused before publication; revert the change on `tasks-hub`
 first, or supersede the job with a hand release instead.
 
+### A generation that advances under a claim (wi_395d07d432a93bc7)
+
+Every native call names the job generation the runner last saw. Another
+writer can advance it while the runner still holds the claim: the handler's
+import of integrated verification or of inputs does. The hub then answers the
+runner's next call with 409 `release: generation changed`. That alone is not a
+lost fence.
+
+**Adopted.** When the fence check (`tt deployment check`) gets that answer, the
+runner reads the job once more (`tt deployment get`, with the exact-detail
+checks). It adopts the new generation and sends the check once more when all of
+these hold:
+
+- the job is still `claimed` by this exact agent and run;
+- its pause generation, immutable pins, integrated commit and input pins are
+  unchanged, and its generation is later than the one the runner held;
+- nothing is published and the journal has no effect.
+
+The release then goes on as if the check had passed. A refuse call
+(`tt deployment refuse`) that gets the same answer is treated the same way: one
+re-read, then one more refuse at the new generation.
+
+**A lost fence.** Anything else is a lost fence, as before: a claim that now
+names another agent or run, a job that is no longer claimed, a changed pin, a
+failed re-read, any other check error, a second `generation changed` after the
+one re-read, and any generation change once the release is published or an
+effect is journaled. The runner never re-reads twice for one call, and it never
+continues or refuses for another agent or run.
+
+**A refusal left unfinished.** A refuse call that still fails leaves the journal
+in phase `refusing` with `refuseFailure` beside `refusalReason`, nothing
+published and no effects. The next poll of the same claim resumes it: the job is
+read at the hub's generation, the refuse is sent again, and the job ends
+`refused` with the original reason. A `refusing` journal of another run, with an
+effect, with `published` set or with no `refuseFailure` is not resumed; it still
+needs handler reconciliation.
+
+What an operator sees:
+
+| Case                                             | Terminal                                                  | Journal                                                                                                       | Board                                                                                                    |
+| ------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Adopted, release continues                       | nothing                                                   | `generationAdoptions` counts the adoptions; the phases go on as usual                                         | nothing; the rejected call is kept in `cli-failures.json` and is named only if the release is later held |
+| Lost fence at the poll's first check             | `Release held; inspect handler fence and private journal` | unchanged                                                                                                     | "A deployer CLI call failed"                                                                             |
+| Lost fence later, nothing published              | the same line                                             | `refusalReason: release fence lost`; `refused`, or `refusing` with `refuseFailure` when the refuse failed too | "Release refused before publication" once refused, and "A deployer CLI call failed"                      |
+| Refuse retried in the same run                   | the same line, for the refusal itself                     | `refused` and `generationAdoptions`                                                                           | "Release refused before publication" with the original reason                                            |
+| Refusal resumed by a later poll                  | the same line at each poll until it completes             | `refused`; `refuseRecovered` holds the earlier `refuseFailure`                                                | "Release refused before publication" with the original reason                                            |
+| Generation change after publication or an effect | the same line                                             | the existing revert, rollback and `blocked` records                                                           | the existing rollback notices                                                                            |
+
+A refused job is terminal; the handler retries its entry (Retrying a refused
+release, above).
+
 ### Setting aside a job that holds the fence
 
 A claimed job that cannot progress (for example its integrated import was

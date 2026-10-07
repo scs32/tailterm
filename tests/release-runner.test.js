@@ -2829,3 +2829,136 @@ test("select5 a job or batch whose changed paths cannot be read hands no selecti
   git(m.f.cwd,"checkout","--quiet","--detach",before);git(m.f.cwd,"update-ref","refs/heads/tasks-hub",before);
  }
 });
+
+// A generation the hub advanced under the claim (wi_395d07d432a93bc7, g1-g4).
+// stale() is the error the adapter throws for the hub's "generation changed".
+const stale=()=>Object.assign(new Error("Host operation failed"),{generationChanged:true});
+function claimed(f,commit){return {...job(f,commit),agentId:"agt_fixture",runId:"run_fixture"};}
+// fence answers "generation-changed" on the listed calls (1-based), else true.
+function advancing(staleCalls,reread=true){
+ const a=fake();a.fences=0;a.rereads=0;
+ a.fence=async()=>staleCalls.includes(++a.fences)?"generation-changed":true;
+ a.adoptGeneration=async()=>{a.rereads++;return reread;};
+ return a;
+}
+const journalAt=c=>JSON.parse(readFileSync(c.journalPath,"utf8"));
+test("g1 a generation advanced between claim and fence is adopted once and the release publishes",async()=>{
+ const f=fixture(),commit=change(f,"client/a.js","a"),a=advancing([2]),c=config(f,claimed(f,commit));
+ const receipt=await runRelease(c,a);
+ assert.equal(receipt.outcome,"released");assert.deepEqual(a.calls,["merged","deploy:tailos","finish"]);assert.ok(!a.calls.includes("refuse"));
+ assert.equal(a.rereads,1);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),commit);
+ const journal=journalAt(c);assert.equal(journal.phase,"complete");assert.equal(journal.generationAdoptions,1);assert.equal(journal.refusalReason,undefined);
+});
+test("g1 a claim that is no longer this run's is a lost fence with no effects, and other check failures are not re-read",async()=>{
+ const f=fixture(),commit=change(f,"client/a.js","a"),a=advancing([2],false),c=config(f,claimed(f,commit));
+ a.refuse=async()=>{a.calls.push("refuse");throw stale();};
+ await assert.rejects(runRelease(c,a));
+ assert.deepEqual(a.calls,["refuse"],"one refuse call, which the hub answers for the claim it has");assert.equal(a.rereads,2,"one re-read for the check and one for the refuse");
+ const journal=journalAt(c);assert.equal(journal.phase,"refusing");assert.equal(journal.refusalReason,"release fence lost");assert.deepEqual(journal.effects,[]);assert.notEqual(journal.published,true);assert.equal(journal.generationAdoptions,undefined);
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+ const g=fixture(),b=fake(),d=config(g,claimed(g,change(g,"client/a.js","a")));b.rereads=0;b.fence=async()=>false;b.adoptGeneration=async()=>{b.rereads++;return true;};
+ await assert.rejects(runRelease(d,b),/release fence lost/);assert.equal(b.rereads,0);assert.deepEqual(b.calls,[]);assert.ok(!existsSync(d.journalPath));
+});
+test("g1 no loop: a check still answered generation changed after the one re-read is a lost fence",async()=>{
+ const f=fixture(),a=advancing([1,2,3,4,5,6]),c=config(f,claimed(f,change(f,"client/a.js","a")));
+ await assert.rejects(runRelease(c,a),/release fence lost/);
+ assert.equal(a.fences,2);assert.equal(a.rereads,1);assert.deepEqual(a.calls,[]);assert.ok(!existsSync(c.journalPath));assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+});
+// A job refused at integrate: its plan names another commit.
+function refusable(f){const j=claimed(f,change(f,"client/a.js","a"));j.plan.commit=f.base;return j;}
+test("g2 a refuse answered generation changed is sent once more at the re-read generation",async()=>{
+ const f=fixture(),a=advancing([]),c=config(f,refusable(f));let refuses=0,escalation;
+ a.refuse=async()=>{a.calls.push("refuse");if(++refuses===1)throw stale();};a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(c,a),/Release refused before publication/);
+ assert.deepEqual(a.calls,["refuse","refuse","escalate"]);assert.equal(a.rereads,1);assert.deepEqual(escalation,{jobId:"rel_fixture",outcome:"refused",reason:"Release binding mismatch"});
+ const journal=journalAt(c);assert.equal(journal.phase,"refused");assert.equal(journal.refuseFailure,undefined);assert.equal(journal.generationAdoptions,1);assert.equal(journal.refusalReason,"Release binding mismatch");
+});
+test("g2 a journal left refusing by a failed refuse is resumed by the next poll and completes the refusal",async()=>{
+ const f=fixture(),a=advancing([]),j=refusable(f),c=config(f,j);
+ a.refuse=async()=>{a.calls.push("refuse");throw stale();};
+ await assert.rejects(runRelease(c,a));
+ assert.deepEqual(a.calls,["refuse","refuse"],"no loop: one retry");assert.equal(a.rereads,1);
+ const stuck=journalAt(c);assert.equal(stuck.phase,"refusing");assert.equal(stuck.refuseFailure,"unclassified");assert.equal(stuck.refusalReason,"Release binding mismatch");
+ // The next poll: the same claim, read again at the hub's generation.
+ const head=git(f.cwd,"rev-parse","HEAD"),b=advancing([]);let escalation;b.escalate=async d=>{escalation=d;b.calls.push("escalate");};
+ b.verifyIntegrated=async()=>{throw new Error("a resumed refusal starts no matrix run");};
+ await assert.rejects(runRelease(c,b),/Release refused before publication/);
+ assert.deepEqual(b.calls,["refuse","escalate"]);assert.equal(b.fences,1,"only the entry check");assert.deepEqual(escalation,{jobId:"rel_fixture",outcome:"refused",reason:"Release binding mismatch"});
+ const done=journalAt(c);assert.equal(done.phase,"refused");assert.equal(done.refuseFailure,undefined);assert.equal(done.refuseRecovered,"unclassified");assert.equal(done.refusalReason,"Release binding mismatch");
+ assert.equal(git(f.cwd,"rev-parse","HEAD"),head);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+ // A refuse that fails again leaves it refusing for the poll after.
+ writeFileSync(c.journalPath,JSON.stringify(stuck));const again=advancing([]);again.refuse=async()=>{again.calls.push("refuse");throw new Error("hub unreachable");};
+ await assert.rejects(runRelease(c,again),/hub unreachable/);assert.deepEqual(again.calls,["refuse"]);assert.equal(again.rereads,0);assert.equal(journalAt(c).phase,"refusing");
+});
+test("g3 a refusing journal of another run, with effects, published or with no failed refuse is never resumed",async()=>{
+ const f=fixture(),j=refusable(f),c=config(f,j);
+ const stuck={version:1,jobId:j.id,commit:j.commit,agentId:j.agentId,runId:j.runId,phase:"refusing",refusalReason:"release fence lost",refuseFailure:"tt deployment refuse exit 1",effects:[]};
+ for(const [name,change] of [["another run",{runId:"run_other"}],["another agent",{agentId:"agt_other"}],["an effect",{effects:[{target:"tailos",release:"r",state:"attempting"}]}],["published",{published:true}],["no failed refuse",{refuseFailure:undefined}],["another pause generation",{pauseGeneration:7}]]){
+  writeFileSync(c.journalPath,JSON.stringify({...stuck,...change}));const a=advancing([]);
+  await assert.rejects(runRelease(c,a),/Ambiguous journal requires handler reconciliation/,name);assert.deepEqual(a.calls,[],name);assert.equal(a.rereads,0,name);
+  assert.deepEqual(journalAt(c),JSON.parse(JSON.stringify({...stuck,...change})),name+": journal untouched");
+ }
+ // A resumed refusal whose entry check finds the claim gone refuses nothing.
+ writeFileSync(c.journalPath,JSON.stringify(stuck));const lost=advancing([1],false);
+ await assert.rejects(runRelease(c,lost),/release fence lost/);assert.deepEqual(lost.calls,[]);assert.equal(journalAt(c).phase,"refusing");
+});
+test("g3 once the release is published or an effect is journaled a generation change is never adopted",async()=>{
+ // Fence calls of a fast-forward release: entry, start, publish, prepare, deploy.
+ for(const [at,published,effects] of [[4,true,0],[5,true,1]]){
+  const f=fixture(),a=advancing([at]),c=config(f,claimed(f,change(f,"client/a.js","a")));
+  await assert.rejects(runRelease(c,a));
+  assert.equal(a.rereads,0,`fence call ${at}`);assert.ok(!a.calls.includes("refuse"));
+  const journal=journalAt(c);assert.equal(journal.published,published);assert.equal(journal.effects.length,effects);assert.equal(journal.generationAdoptions,undefined);assert.equal(journal.phase,"blocked");
+ }
+});
+// The host adapter against a CLI that answers like the hub: check and refuse
+// succeed only at the job's generation, and a stale one gets the 409 text.
+// advanceOn: the first call of that operation finds the generation moved on.
+function nativeFixture(hubJob,{conflict="conflict: release: generation changed",advanceOn=""}={}){
+ const home=mkdtempSync(join(tmpdir(),"release-generation-")),tt=join(home,"tt"),log=join(home,"calls"),state=join(home,"job.json");
+ writeFileSync(state,JSON.stringify(hubJob));
+ writeFileSync(tt,"#!"+process.execPath+`
+const fs=require('fs'),a=process.argv.slice(2),flag=n=>a.includes(n)?a[a.indexOf(n)+1]:'',job=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8'));
+fs.appendFileSync(${JSON.stringify(log)},a.slice(0,2).join(' ')+' '+flag('--generation')+'\\n');
+if(a[1]===${JSON.stringify(advanceOn)} && !fs.existsSync(${JSON.stringify(state)}+'.advanced')){fs.writeFileSync(${JSON.stringify(state)}+'.advanced','');job.generation++;fs.writeFileSync(${JSON.stringify(state)},JSON.stringify(job));}
+if(a[1]==='get'){console.log(JSON.stringify(job));process.exit(0);}
+if(+flag('--generation')!==job.generation){process.stderr.write('tt: hub: 409 '+${JSON.stringify(conflict)}+'\\n');process.exit(1);}
+if(a[1]==='refuse'){job.state='refused';job.generation++;}
+console.log(JSON.stringify(job));`);chmodSync(tt,0o755);
+ return {home,config:{cwd:home,journalDirectory:home,tt},calls:()=>readFileSync(log,"utf8").trim().split("\n").map(l=>l.trim()),set:j=>writeFileSync(state,JSON.stringify(j))};
+}
+const hubJob=(generation,more={})=>({id:"rel_fixture",taskId:"tsk_fixture",entryId:"qe_fixture",itemId:"wi_fixture",itemRevision:1,scopeRevision:1,orderMessageSeq:7,repository:"fixture",baseCommit:"a".repeat(40),commit:"b".repeat(40),verificationDigest:"c".repeat(64),pauseGeneration:1,state:"claimed",generation,agentId:"agt_fixture",runId:"run_fixture",...more});
+test("g1 the host adapter names the hub's generation changed, re-reads once and adopts only its own exact claim",async()=>{
+ const n=nativeFixture(hubJob(3,{integratedVerification:{commit:"b".repeat(40)}})),adapter=new HostAdapter(n.config,hubJob(2));
+ assert.equal(await adapter.fence(),"generation-changed");assert.equal(adapter.job.generation,2,"a failed check adopts nothing");
+ assert.equal(await adapter.adoptGeneration(),true);assert.equal(adapter.job.generation,3);assert.equal(await adapter.fence(),true);
+ assert.deepEqual(n.calls(),["deployment check 2","deployment get","deployment check 3"]);
+ assert.equal(await adapter.adoptGeneration(),false,"a generation that did not advance is not adopted");
+ // Another run, another agent, another pause generation, a changed pin or a job no longer claimed: never adopted.
+ for(const [name,other] of [["run",{runId:"run_other"}],["agent",{agentId:"agt_other"}],["pause",{pauseGeneration:2}],["commit",{commit:"d".repeat(40)}],["verified again",{state:"verified",agentId:undefined,runId:undefined}],["refused",{state:"refused"}],["merged",{state:"merged"}]]){
+  const m=nativeFixture(hubJob(3,other)),stale=new HostAdapter(m.config,hubJob(2));
+  assert.equal(await stale.fence(),"generation-changed",name);assert.equal(await stale.adoptGeneration(),false,name);assert.equal(stale.job.generation,2,name);assert.equal(stale.job.runId,"run_fixture",name);
+ }
+ // Any other check failure, another conflict included, is a plain lost fence.
+ const p=nativeFixture(hubJob(3),{conflict:"conflict: release: project generation changed"});assert.equal(await new HostAdapter(p.config,hubJob(2)).fence(),false);
+ const q=nativeFixture(hubJob(3),{conflict:"conflict: release: job rel_fixture is claimed by another run"});assert.equal(await new HostAdapter(q.config,hubJob(2)).fence(),false);
+});
+test("g2 g3 through the host adapter: the stuck check and refuse of the incident end in a refusal at the re-read generation, and never for another run",async()=>{
+ const f=fixture(),commit=change(f,"client/a.js","a"),mine={baseCommit:f.base,commit,plan:{commit:f.base}};
+ // The handler's import moved the job from 2 to 3 while this run still held 2.
+ const n=nativeFixture(hubJob(3,mine)),adapter=new HostAdapter({...n.config,cwd:f.cwd},hubJob(2,mine));let escalation;adapter.escalate=async d=>{escalation=d;};
+ const c={...config(f,adapter.job),journalPath:join(n.home,"rel_fixture.json")};
+ await assert.rejects(runRelease(c,adapter),/Release refused before publication/);
+ assert.deepEqual(n.calls(),["deployment check 2","deployment get","deployment check 3","deployment check 3","deployment refuse 3"]);
+ assert.equal(adapter.job.state,"refused");assert.equal(escalation.reason,"Release binding mismatch");assert.equal(journalAt(c).generationAdoptions,1);
+ // The advance lands between the last check and the refuse: one re-read, one more refuse.
+ const h=fixture(),late={baseCommit:h.base,commit:change(h,"client/a.js","a"),plan:{commit:h.base}},r=nativeFixture(hubJob(2,late),{advanceOn:"refuse"}),retried=new HostAdapter({...r.config,cwd:h.cwd},hubJob(2,late));retried.escalate=async()=>{};
+ const e={...config(h,retried.job),journalPath:join(r.home,"rel_fixture.json")};
+ await assert.rejects(runRelease(e,retried),/Release refused before publication/);
+ assert.deepEqual(r.calls(),["deployment check 2","deployment check 2","deployment refuse 2","deployment get","deployment refuse 3"]);assert.equal(retried.job.state,"refused");assert.equal(journalAt(e).phase,"refused");
+ // The same advance, but the claim went to another run: no adoption, and the refuse stays at the stale generation, which the hub rejects.
+ const g=fixture(),other={baseCommit:g.base,commit:change(g,"client/a.js","a")},m=nativeFixture(hubJob(3,{...other,runId:"run_other"})),lost=new HostAdapter({...m.config,cwd:g.cwd},hubJob(2,other));
+ const d={...config(g,lost.job),journalPath:join(m.home,"rel_fixture.json")};
+ await assert.rejects(runRelease(d,lost),/release fence lost/);
+ assert.deepEqual(m.calls(),["deployment check 2","deployment get"]);assert.equal(lost.job.generation,2);assert.ok(!existsSync(d.journalPath));assert.equal(git(g.cwd,"rev-parse","tasks-hub"),g.base);
+});

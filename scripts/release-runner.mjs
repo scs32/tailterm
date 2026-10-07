@@ -74,6 +74,11 @@ function childReason(argv, error, cli) {
 // a repeat of a kept one only raises its count and lastAt, so a failing poll
 // cannot grow the file. A record that cannot be written is dropped.
 const CLI_FAILURES = 20, CLI_STDERR_BYTES = 16384;
+// The hub's 409 for a native release call sent at a generation the job has
+// left (releaseConflict "generation changed"), as the CLI prints it. Only this
+// yes or no is taken from the child's stderr; none of its text is kept.
+const GENERATION_CHANGED = /\bhub: 409 [^\n]*\brelease: generation changed\s*$/;
+const generationChanged = error => GENERATION_CHANGED.test((typeof error?.stderr === "string" ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : "").slice(-CLI_STDERR_BYTES));
 function recordCliFailure(config, job, argv, cwd, error, reason, now) {
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
   let tail = Buffer.from(text.slice(-CLI_STDERR_BYTES));
@@ -512,7 +517,23 @@ export async function runRelease(config, adapter) {
   let pending;
   if(existsSync(journalPath))pending=JSON.parse(readFileSync(journalPath,"utf8"));
   const finishOnly=pending && ["receipt_pending","finishing"].includes(pending.phase) && pending.jobId===job.id && pending.commit===job.commit && pending.agentId===job.agentId && pending.runId===job.runId && pending.receipt?.version===1 && pending.receipt.jobId===job.id && pending.receipt.commit===pending.integrated && pending.receipt.verificationDigest===job.verificationDigest && Array.isArray(pending.receipt.targets);
-  if(!finishOnly && await adapter.fence(job)!==true)throw releaseError("release fence lost");
+  // A hub write by someone else (the handler's import of integrated
+  // verification or inputs) advances the job's generation under this claim.
+  // When the fence check or the refuse call fails only for that, the job is
+  // re-read once: still this exact claim, the new generation is adopted and
+  // the call is sent once more; otherwise the fence is lost as before. Never
+  // once the release is published or any effect is journaled.
+  let adopted=0;
+  const adopt=async journal=>{
+    if(journal?.published===true || journal?.effects?.length || typeof adapter.adoptGeneration!=="function" || await adapter.adoptGeneration()!==true)return false;
+    adopted++;return true;
+  };
+  const held=async journal=>{
+    let fenced=await adapter.fence(job);
+    if(fenced==="generation-changed" && await adopt(journal))fenced=await adapter.fence(job);
+    return fenced===true;
+  };
+  if(!finishOnly && !await held(pending))throw releaseError("release fence lost");
   const lock=hostLockPath(cwd,job);mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw releaseError("Release host locked; inspect prior execution");}
   writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
@@ -528,6 +549,10 @@ export async function runRelease(config, adapter) {
     if(prior.phase==="batching" && prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && prior.taskId===job.taskId && prior.pauseGeneration===job.pauseGeneration && Array.isArray(prior.effects) && !prior.effects.length && prior.published!==true && sha(prior.expected) && sha(prior.batchLead)) {state=prior;}
     else
     if(prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && (["waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
+    else
+    // A refusal whose refuse call failed, with nothing published and no
+    // effects: this exact claim completes it below instead of holding the job.
+    if(prior.phase==="refusing" && prior.refuseFailure!==undefined && prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && Array.isArray(prior.effects) && !prior.effects.length && prior.published!==true) {state=prior;}
     else {
       closeSync(fd);rmSync(lock);
       if(prior.jobId===job.id && prior.commit===job.commit && prior.phase==="complete"){try{materializeBatch(dirname(journalPath),prior);}catch{}return prior.receipt;}
@@ -537,7 +562,24 @@ export async function runRelease(config, adapter) {
   // The runner code that last ran this job; never part of a resume decision.
   if(config.code)state.code={loaded:config.code.loaded??null,current:config.code.current??null};
   const checkpoint=()=>save(journalPath,state);let step=null;
-  const fence=async()=>{if(await adapter.fence(job)!==true)throw releaseError("release fence lost");};
+  // How often this job went on at a generation the hub advanced under it.
+  const noteAdopted=()=>{if(adopted){state.generationAdoptions=(state.generationAdoptions||0)+adopted;adopted=0;}};
+  noteAdopted();
+  const fence=async()=>{const ok=await held(state);noteAdopted();if(!ok)throw releaseError("release fence lost");};
+  // The refusal of an unpublished job with no effects. A refuse call the hub
+  // answers with "generation changed" is sent once more at the re-read
+  // generation. A failed call leaves the journal in refusing with
+  // refuseFailure beside the cause, and the next poll resumes here.
+  let refusing=false;
+  const refuseUnpublished=async()=>{
+    refusing=true;
+    try{
+      try{await adapter.refuse();}
+      catch(error){if(error?.generationChanged!==true || !await adopt(state))throw error;noteAdopted();await adapter.refuse();}
+    }catch(refuseError){noteAdopted();state.refuseFailure=failureReason(refuseError);checkpoint();throw refuseError;}
+    if(state.refuseFailure!==undefined){state.refuseRecovered=state.refuseFailure;delete state.refuseFailure;}
+    state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
+  };
   // The batch receipt and member journals, written once the hub has the
   // final receipt and before the journal leaves its pending phase: a failed
   // write, or a stop here, leaves a pending journal that every later poll
@@ -685,6 +727,7 @@ export async function runRelease(config, adapter) {
       await adapter.finish(state.receipt,state.finishGeneration);materialize();state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
     }
     if(state.phase==="pushing")return await pushAndFinish(state.receipt);
+    if(state.phase==="refusing")await refuseUnpublished();
     // A job with no resumable journal (a requeue) first settles the matrix
     // runs of its earlier attempts: until each is confirmed stopped, ended or
     // set aside, nothing here touches the checkout, starts a run or refuses.
@@ -760,6 +803,8 @@ export async function runRelease(config, adapter) {
     step=null;
     return await pushAndFinish(receipt);
   } catch (error) {
+    // A resumed refusal that failed or finished above is not refused again.
+    if(refusing)throw error;
     // An unconfirmed batch call: nothing here may touch the checkout or the job.
     if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
@@ -776,8 +821,7 @@ export async function runRelease(config, adapter) {
     if(!state.published && state.effects.length===0){
       state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();
       // refusalReason stays the cause; a refuse call that itself fails is named beside it.
-      try{await adapter.refuse();}catch(refuseError){state.refuseFailure=failureReason(refuseError);checkpoint();throw refuseError;}
-      state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
+      await refuseUnpublished();
     }
     let blocked=state.effects.length===0;
     // Newest effect first, except that a paired hub is restored before its
@@ -881,6 +925,7 @@ export class HostAdapter {
     catch(error){
       const cli=this.config.tt||"tt",failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli);
       if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
+      if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
       if(argv[0]===cli && this.config.journalDirectory){try{this.cliFailures.push(recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now()));}catch{}}
       throw failed;
     }
@@ -900,7 +945,21 @@ export class HostAdapter {
     const receipt=operation==="finish"?JSON.parse(readFileSync(extra[extra.indexOf("--file")+1],"utf8")):undefined;
     this.job=validateNativeRelease(this.job,next,operation,expectedGeneration,extra,receipt);return this.job;
   }
-  async fence(){try{this.native("check");return true;}catch{return false;}}
+  // "generation-changed" when the hub refused the check only because the job's
+  // generation moved; runRelease then decides whether to re-read (adoptGeneration).
+  async fence(){try{this.native("check");return true;}catch(error){return error?.generationChanged===true?"generation-changed":false;}}
+  // One re-read after a "generation changed" answer. detail() refuses a job
+  // that is no longer this exact claim (agent and run), whose pause generation,
+  // immutable pins, integrated commit or input pins differ, or that left
+  // claimed/merged. Only a still claimed job at a later generation is adopted;
+  // anything else, or a failed read, is a lost fence.
+  async adoptGeneration(){
+    try{
+      const current=this.detail(this.job.id);
+      if(!this.job.agentId || !this.job.runId || current.state!=="claimed" || current.generation<=this.job.generation)return false;
+      this.job=current;return true;
+    }catch{return false;}
+  }
   // The project handler by the project rule (hub operation "handler"): a
   // finished entry holds no item lease, so role addressing is refused there.
   handler(){const h=JSON.parse(this.command([this.config.tt||"tt","deployment","handler"]));if(!/^agt_[a-f0-9]+$/.test(h?.id||""))throw releaseError("Project database handler required");return h.id;}
