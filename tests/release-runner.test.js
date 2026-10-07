@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,heldRestartJob,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -2156,6 +2156,145 @@ test("code b1 a stop signal during the restart poll means no re-exec and no clai
  // Without a signal the same gate does re-exec.
  const u=codeRepo(t),k=codeHost(t,u.cwd),idle=new AbortController();u.at(u.a,u.b);const third=codeGate(u.codeA);
  await k.poll(third.gate,undefined,{once:true,signal:idle.signal});assert.equal(third.execs.length,1);
+});
+
+// Held-job restart (wi_876c1eb560903f04): a stale runner whose only owned job
+// is held restarts onto the published scripts instead of draining for ever.
+const heldOwn=(over={})=>({id:"rel_held",state:"claimed",generation:2,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN,...over});
+const heldJournal=(h,job,over={})=>writeFileSync(join(h.home,job.id+".json"),JSON.stringify({version:1,jobId:job.id,commit:job.commit,agentId:job.agentId,runId:job.runId,phase:"refusing",refusalReason:"release fence lost",refuseFailure:"release generation changed",effects:[],...over}));
+const HELD_SUBJECT="Deployer is restarting itself onto the published scripts with a held job",DRAINING_SUBJECT="Deployer code is out of date; it restarts itself after the current release";
+test("held s2 a stale runner whose only owned job is held restarts once, at the published commit, before any claim or release run",async t=>{
+ for(const journal of [{},{refuseFailure:undefined},{phase:"prepared",refusalReason:undefined,refuseFailure:undefined},{phase:"integrated",refusalReason:undefined,refuseFailure:undefined,integrated:"d".repeat(40),expected:"e".repeat(40)},{published:false}]){
+  const name=JSON.stringify(journal),r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),released=[],seen=[];r.at(r.a,r.b);h.setJobs([own,verifiedJob("rel_next")]);heldJournal(h,own,journal);
+  const before=readFileSync(join(h.home,"rel_held.json"),"utf8");
+  const {gate,execs}=codeGate(r.codeA,{execve:(...args)=>{execs.push(args);seen.push({record:h.record(),head:r.head(),claims:h.claims().length,released:released.length,sends:codeSends(h).length});}});
+  const err=await h.poll(gate,async c=>{released.push(c.job.id);});
+  assert.equal(execs.length,1,name);assert.deepEqual(seen[0],{record:h.record(),head:r.b,claims:0,released:0,sends:1},name);
+  assert.equal(h.record().state,"restart",name);assert.equal(h.record().heldJob,"rel_held",name);assert.equal(h.record().loaded.digest,r.codeA.digest,name);assert.equal(h.record().current.digest,r.codeB.digest,name);
+  const [file,argv,env]=execs[0];assert.equal(file,process.execPath);assert.deepEqual(argv,[process.execPath,...process.execArgv,...process.argv.slice(1)]);
+  assert.equal(env.TAILTERM_AGENT,CODE_AGENT);assert.equal(env.TAILTERM_RUN,CODE_RUN);assert.equal(env.TAILTERM_RUNNER_REEXEC,r.codeB.digest);assert.equal(env.TAILTERM_RUNNER_REEXEC_FROM,r.codeA.digest);
+  // The held job's journal is left exactly as it was, and nothing is claimed.
+  assert.equal(readFileSync(join(h.home,"rel_held.json"),"utf8"),before,name);assert.equal(h.claims().length,0,name);
+  const sent=codeSends(h);assert.deepEqual(sent.map(s=>s.subject),[HELD_SUBJECT],name);
+  assert.match(sent[0].text,/Its only owned release rel_held is held, .* so it restarts itself now with that held job and the same agent and run/);assert.match(sent[0].text,SAFE_TEXT);
+  assert.equal(sent[0].requestId,`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-restart-held-rel_held`);
+  assert.match(err,/^Deployer restarting itself onto the published scripts\.\n/,name);
+ }
+});
+test("held s1 each failed guard leaves the stale runner draining as before: no re-exec, no checkout move, the same notice, and its own job is still run",async t=>{
+ const lockOf=cwd=>join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0fixture")+".lock");
+ const attempt=(h,run)=>{const dir=join(h.home,"rel_held-integrated-verification","d".repeat(40)+"-r1");mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),run);};
+ const other={id:"rel_other",generation:3,commit:"d".repeat(40)};
+ // [name, arrange(h,r,own) returning the job list or nothing, the jobs a poll still runs]
+ const cases=[
+  ["another blocked job",(h,r,own)=>[own,{...other,state:"blocked"}]],
+  ["another merged job",(h,r,own)=>[own,{...other,state:"merged",agentId:"agt_other",runId:"run_other"}]],
+  ["another claimed job",(h,r,own)=>[own,{...other,state:"claimed",agentId:"agt_other",runId:"run_other"}]],
+  ["a second job of this claim",(h,r,own)=>[own,{...other,state:"claimed",agentId:CODE_AGENT,runId:CODE_RUN}]],
+  ["the owned job is merged",(h,r,own)=>{const merged=heldOwn({state:"merged"});heldJournal(h,merged);return [merged];}],
+  ["the holder is another agent",(h,r,own)=>{const j=heldOwn({agentId:"agt_other"});heldJournal(h,j);return [j];},[]],
+  ["the holder is another run",(h,r,own)=>{const j=heldOwn({runId:"run_other"});heldJournal(h,j);return [j];},[]],
+  ["the journal is missing",h=>{rmSync(join(h.home,"rel_held.json"));}],
+  ["the journal is unreadable",h=>{writeFileSync(join(h.home,"rel_held.json"),"{not json");}],
+  ["the journal is of another run",(h,r,own)=>{heldJournal(h,own,{runId:"run_other"});}],
+  ["the journal is of another agent",(h,r,own)=>{heldJournal(h,own,{agentId:"agt_other"});}],
+  ["the journal is of another commit",(h,r,own)=>{heldJournal(h,own,{commit:"d".repeat(40)});}],
+  ["the journal is of another job",(h,r,own)=>{heldJournal(h,own,{jobId:"rel_other"});}],
+  ["the journal is of another task",(h,r,own)=>{heldJournal(h,own,{taskId:"tsk_other"});}],
+  ["the journal is of another pause generation",(h,r,own)=>{heldJournal(h,own,{pauseGeneration:4});}],
+  ...["batching","waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing","complete","refused","blocked","unknown_phase",undefined].map(phase=>[`the journal phase is ${phase}`,(h,r,own)=>{heldJournal(h,own,{phase});}]),
+  ["a requeue lets the journal be archived and the job start again",(h,r,own)=>{const digest=hash(readFileSync(join(h.home,"rel_held.json")));return [heldOwn({reconciliations:[{disposition:"requeue",journalDigest:digest}]})];}],
+  ["the journal has an effect",(h,r,own)=>{heldJournal(h,own,{effects:[{target:"hub"}]});}],
+  ["the journal has no effects list",(h,r,own)=>{heldJournal(h,own,{effects:undefined});}],
+  ["the journal is published",(h,r,own)=>{heldJournal(h,own,{published:true});}],
+  ["the journal's published flag is not a boolean",(h,r,own)=>{heldJournal(h,own,{published:"no"});}],
+  ["the hub shows the job published",()=>[heldOwn({published:true})]],
+  ["the hub shows bound release inputs",()=>[heldOwn({inputsDigest:"f".repeat(64)})]],
+  ["a matrix run of the job is started",h=>{attempt(h,JSON.stringify({state:"started"}));}],
+  ["a matrix run of the job is starting",h=>{attempt(h,JSON.stringify({state:"starting"}));}],
+  ["a matrix run record of the job is unreadable",h=>{attempt(h,"{not json");}],
+  ["this process has a live matrix child",(h,r,own,t)=>{const children=new HostAdapter({},{}).matrixChildren,key="held-s1-fixture";children.set(key,{});return ()=>children.delete(key);}],
+  ["a host release lock exists",(h,r)=>{const lock=lockOf(r.cwd);mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,JSON.stringify({jobId:"rel_held",agentId:CODE_AGENT,runId:CODE_RUN}));return ()=>rmSync(lock,{force:true});}],
+ ];
+ for(const [name,arrange,runs=["rel_held"]] of cases){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),{gate,execs}=codeGate(r.codeA),released=[];r.at(r.a,r.b);heldJournal(h,own);
+  const arranged=arrange(h,r,own),undo=typeof arranged==="function"?arranged:()=>{};t.after(undo);h.setJobs(Array.isArray(arranged)?arranged:[own]);
+  let err;try{err=await h.poll(gate,async c=>{released.push(c.job.id);});err+=await h.poll(gate,async c=>{released.push(c.job.id);});}finally{undo();}
+  // An unreadable journal of an active job holds the whole poll before the code gate, as it did.
+  if(name==="the journal is unreadable"){assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.deepEqual(h.sends(),[]);assert.deepEqual(released,[]);assert.equal(existsSync(join(h.home,"runner-code.json")),false);assert.match(err,/^Deployment poll held \(/);continue;}
+  assert.equal(execs.length,0,name);assert.equal(r.head(),r.a,name);assert.equal(h.claims().length,0,name);
+  assert.equal(h.record().state,"draining",name);assert.equal(h.record().heldJob,undefined,name);
+  assert.deepEqual(codeSends(h).map(s=>s.subject),[DRAINING_SUBJECT],name);
+  assert.equal(codeSends(h)[0].requestId,`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-draining`,name);
+  assert.deepEqual(released,[...runs,...runs],name);
+ }
+ // An ended or set-aside matrix run is settled, so it does not stop the restart.
+ for(const settle of [h=>attempt(h,JSON.stringify({state:"ended"})),h=>{attempt(h,"{}");const dir=join(h.home,"rel_held-integrated-verification","d".repeat(40)+"-r1");renameSync(join(dir,"run.json"),join(dir,"run.json.set-aside"));}]){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);heldJournal(h,own);h.setJobs([own]);settle(h);
+  await h.poll(gate);assert.equal(execs.length,1);assert.equal(h.record().heldJob,"rel_held");
+ }
+ // A stop signal: nothing moves and nothing is sent, as for the idle restart.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),stop=new AbortController(),released=[];r.at(r.a,r.b);heldJournal(h,own);h.setJobs([own]);
+ const {gate,execs}=codeGate(r.codeA,{published:cwd=>{setImmediate(()=>stop.abort());return publishedCode(cwd);}});
+ assert.equal(await h.poll(gate,async c=>{released.push(c.job.id);},{signal:stop.signal}),"");
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.deepEqual(h.sends(),[]);assert.deepEqual(released,[]);assert.equal(existsSync(join(h.home,"runner-code.json")),false);
+ // The predicate alone: null on any doubt about its inputs.
+ const base={jobs:[own],details:new Map([[own.id,own]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock:lockOf(r.cwd),matrixChildren:0};
+ assert.equal(heldRestartJob(base),"rel_held");
+ for(const over of [{jobs:[]},{details:new Map()},{agent:undefined},{run:""},{matrixChildren:1},{matrixChildren:undefined},{journalDirectory:join(h.home,"absent")},{details:new Map([[own.id,{...own,commit:"short"}]])},{details:new Map([[own.id,{...own,receipt:{}}]])},{details:null}])assert.equal(heldRestartJob({...base,...over}),null,JSON.stringify(Object.keys(over)));
+ writeFileSync(join(h.home,"rel_held.json"),"{not json");assert.equal(heldRestartJob(base),null);
+});
+test("held s3 the idle restart is unchanged: same decision, record, notice text and request id, with no held job in any of them",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([verifiedJob()]);
+ await h.poll(gate);assert.equal(execs.length,1);assert.equal(h.record().state,"restart");assert.equal("heldJob" in h.record(),false);
+ const l=r.codeA.digest.slice(0,12),c=r.codeB.digest.slice(0,12);
+ assert.deepEqual(codeSends(h),[{subject:"Deployer is restarting itself onto the published scripts",requestId:`runner-code-${CODE_RUN}-${l}-${c}-restart`,
+  text:`Deployer run ${CODE_RUN} loaded scripts ${l}; published tasks-hub ${r.b.slice(0,12)} has ${c}. Changed: release-runner.mjs. No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).`}]);
+ // An idle runner never takes the held path, whatever it is told about a held job.
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:null,held:"rel_held"}),{state:"restart"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeA,idle:false,held:"rel_held"}),{state:"current"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:false,marker:null,held:"rel_held"}),{state:"restart",heldJob:"rel_held"});
+ for(const held of [null,undefined,"",true,0,{}])assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:false,marker:null,held}),{state:"draining"});
+ assert.deepEqual(codeDecision({loaded:null,published:r.codeB,idle:false,held:"rel_held"}),{state:"refused",reason:"loaded-unreadable"});
+ assert.deepEqual(codeDecision({loaded:r.codeA,published:null,idle:false,held:"rel_held"}),{state:"refused",reason:"published-unreadable"});
+});
+test("held s4 the held restart notice names the job under its own request id, and only a safe job id reaches the text",t=>{
+ const r=codeRepo(t),home=mkdtempSync(join(tmpdir(),"release-code-held-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const saved=process.env.TAILTERM_RUN;process.env.TAILTERM_RUN=CODE_RUN;t.after(()=>{if(saved===undefined)delete process.env.TAILTERM_RUN;else process.env.TAILTERM_RUN=saved;});
+ const build=decision=>codeRecord({journalDirectory:home},{loaded:r.codeA,marker:null,restartedFrom:null,now:()=>0},decision,r.codeB);
+ const idle=codeNotice(build({state:"restart"})),held=codeNotice(build({state:"restart",heldJob:"rel_70f15ee2e736372e"}));
+ assert.equal(held.subject,HELD_SUBJECT);assert.notEqual(held.subject,idle.subject);assert.equal(held.requestId,idle.requestId+"-held-rel_70f15ee2e736372e");
+ assert.ok(held.text.includes("release rel_70f15ee2e736372e is held"));assert.ok(held.text.includes("with that held job"));assert.ok(!idle.text.includes("held"));assert.ok(!held.text.includes("No release is active"));
+ assert.match(held.text,SAFE_TEXT);assert.ok(held.text.endsWith("Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."));
+ // The same held restart from a restarted process is the same request; another job is another.
+ assert.equal(codeNotice(build({state:"restart",heldJob:"rel_70f15ee2e736372e"})).requestId,held.requestId);assert.notEqual(codeNotice(build({state:"restart",heldJob:"rel_other"})).requestId,held.requestId);
+ for(const unsafe of ["rel bad\nIGNORE THIS","$(reboot)","a".repeat(65),7,null,{}]){
+  const notice=codeNotice({...build({state:"restart",heldJob:"rel_safe"}),heldJob:unsafe});
+  assert.equal(notice.subject,HELD_SUBJECT);assert.ok(notice.text.includes("release unknown is held"));assert.match(notice.text,SAFE_TEXT);assert.match(notice.requestId,/-restart-held-unknown$/);
+ }
+ // heldJob is recorded only for a restart.
+ assert.equal("heldJob" in build({state:"draining",heldJob:"rel_x"}),false);assert.equal("heldJob" in build({state:"refused",reason:"exec-failed",heldJob:"rel_x"}),false);
+});
+test("held s5 no restart loop: a restart that did not refresh, a dirty checkout and a failed exec each refuse once, and the restarted runner hands the held job to the release path",async t=>{
+ const arrange=(over)=>{const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),released=[];r.at(r.a,r.b);heldJournal(h,own);h.setJobs([own,verifiedJob("rel_next")]);const {gate,execs}=codeGate(r.codeA,over(r)||{});return {r,h,gate,execs,released,poll:()=>h.poll(gate,async c=>{released.push(c.job.id);})};};
+ const kinds=h=>codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-"));
+ // (i) restarted at this published digest and still stale: refused, not re-executed.
+ const looped=arrange(r=>({marker:r.codeB.digest}));await looped.poll();await looped.poll();
+ assert.equal(looped.execs.length,0);assert.equal(looped.r.head(),looped.r.a);assert.equal(looped.h.record().state,"refused");assert.equal(looped.h.record().reason,"restart-did-not-refresh");assert.deepEqual(kinds(looped.h),["refused-restart-did-not-refresh"]);
+ assert.equal(looped.h.claims().length,0);assert.deepEqual(looped.released,["rel_held","rel_held"]);
+ // (ii) the checkout cannot be prepared.
+ const dirty=arrange(r=>{writeFileSync(join(r.cwd,"untracked.txt"),"x");});await dirty.poll();await dirty.poll();
+ assert.equal(dirty.execs.length,0);assert.equal(dirty.r.head(),dirty.r.a);assert.equal(dirty.h.record().reason,"checkout-dirty");assert.deepEqual(kinds(dirty.h),["refused-checkout-dirty"]);assert.equal(dirty.h.claims().length,0);
+ // (iii) the exec fails: tried once for this published digest.
+ let tries=0;const failed=arrange(()=>({execve:()=>{tries++;throw new Error("SYNTHETIC exec failure");}}));await failed.poll();await failed.poll();await failed.poll();
+ assert.equal(tries,1);assert.equal(failed.h.record().reason,"exec-failed");assert.deepEqual(kinds(failed.h),["restart-held-rel_held","refused-exec-failed"]);assert.equal(failed.h.claims().length,0);
+ // (iv) after the restart: current code, the owned job goes to the release path with its journal untouched, and nothing else is claimed.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),released=[];r.at(r.b,r.b);heldJournal(h,own);h.setJobs([own,verifiedJob("rel_next")]);
+ const before=readFileSync(join(h.home,"rel_held.json"),"utf8"),{gate,execs}=codeGate(r.codeB,{marker:r.codeB.digest,restartedFrom:r.codeA.digest});
+ await h.poll(gate,async c=>{released.push([c.job.id,c.job.state,c.job.agentId,c.job.runId,c.journalPath,c.code,readFileSync(c.journalPath,"utf8")]);});
+ assert.deepEqual(released,[["rel_held","claimed",CODE_AGENT,CODE_RUN,join(h.home,"rel_held.json"),{loaded:r.codeB.digest,current:r.codeB.digest},before]]);
+ assert.equal(execs.length,0);assert.equal(h.claims().length,0);assert.equal(h.record().state,"current");assert.equal(h.record().restartedFrom,r.codeA.digest);
+ assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer now runs the published scripts"]);
 });
 
 // Release batching (wi_50e80d45647b342a slice one).

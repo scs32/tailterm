@@ -1412,15 +1412,43 @@ const validCode=c=>HEX64.test(c?.digest||"") && RUNNER_CODE_FILES.every(n=>HEX64
 // nothing new. restart: stale and idle; re-exec onto the published scripts.
 // refused: claim nothing until a person re-provisions the deployer. marker is
 // the published digest a re-exec was last aimed at: stale again at that same
-// digest means the re-exec did not change what this process loads.
+// digest means the re-exec did not change what this process loads. held is
+// the id of the runner's sole owned job when that job is held (heldRestartJob):
+// a stale runner that is not idle restarts with it, and heldJob names it.
 export const CODE_REASONS=["loaded-unreadable","published-unreadable","restart-did-not-refresh","checkout-dirty","checkout-failed","disk-mismatch","exec-failed"];
-export function codeDecision({loaded,published,idle,marker}){
+export function codeDecision({loaded,published,idle,marker,held}){
   if(!validCode(loaded))return {state:"refused",reason:"loaded-unreadable"};
   if(!validCode(published) || !sha(published.commit))return {state:"refused",reason:"published-unreadable"};
   if(loaded.digest===published.digest)return {state:"current"};
-  if(idle!==true)return {state:"draining"};
+  const heldJob=idle!==true && typeof held==="string" && held?held:null;
+  if(idle!==true && !heldJob)return {state:"draining"};
   if(marker===published.digest)return {state:"refused",reason:"restart-did-not-refresh"};
-  return {state:"restart"};
+  return {state:"restart",...(heldJob?{heldJob}:{})};
+}
+// A journal phase that makes no progress when its claim is run again: a
+// refusal that is not finished, or one runRelease rejects as ambiguous.
+const HELD_PHASES=["prepared","integrated","refusing"];
+// The one job a stale runner may restart with, or null. The ledger's only
+// claimed, merged or blocked job is claimed by this agent and run; the hub
+// shows nothing published, no receipt and no inputs binding; its journal is
+// readable, of exactly this claim, in a held phase, with no effects and not
+// published, and is not one a requeue lets runRelease archive and start again;
+// no matrix run of the job is unsettled, this process has no matrix child and
+// no host release lock exists. Null on any doubt.
+export function heldRestartJob({jobs,details,agent,run,journalDirectory,lock,matrixChildren}){
+  try{
+    const active=jobs.filter(j=>["claimed","merged","blocked"].includes(j.state));
+    if(active.length!==1 || !agent || !run)return null;
+    const job=details.get(active[0].id);
+    if(!job || job.id!==active[0].id || active[0].state!=="claimed" || job.state!=="claimed" || job.agentId!==agent || job.runId!==run || !sha(job.commit))return null;
+    if(job.published===true || job.receipt || job.inputsDigest)return null;
+    if(matrixChildren!==0 || existsSync(lock) || matrixRunUnsettled(journalDirectory,job))return null;
+    const path=join(journalDirectory,job.id+".json"),prior=JSON.parse(readFileSync(path,"utf8")),recovery=job.reconciliations?.at(-1);
+    if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==agent || prior.runId!==run || (prior.taskId!==undefined && prior.taskId!==job.taskId) || (prior.pauseGeneration!==undefined && prior.pauseGeneration!==job.pauseGeneration))return null;
+    if(!HELD_PHASES.includes(prior.phase) || !Array.isArray(prior.effects) || prior.effects.length || prior.published!==undefined && prior.published!==false)return null;
+    if(recovery?.disposition==="requeue" && recovery.journalDigest===fileDigest(path))return null;
+    return job.id;
+  }catch{return null;}
 }
 // Brings the idle checkout to the published commit before a re-exec, under
 // integrateCandidate's cleanliness rule (ignored build outputs do not count),
@@ -1459,7 +1487,7 @@ export function codeRecord(config,code,decision,published){
   const iso=ms=>new Date(ms).toISOString(),loaded=validCode(code.loaded)?{digest:code.loaded.digest,files:code.loaded.files}:null;
   const current=validCode(published)&&sha(published.commit)?{commit:published.commit,digest:published.digest,files:published.files}:null;
   code.startedAt??=iso(code.now());
-  const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),
+  const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),...(decision.state==="restart"&&decision.heldJob?{heldJob:decision.heldJob}:{}),
     loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{})};
   const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null});
   let prior=null;try{prior=JSON.parse(readFileSync(path,"utf8"));}catch{}
@@ -1478,6 +1506,8 @@ export function codeNotice(record,kind=record?.state){
   const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
   const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:""}`;
   if(kind==="draining")return {requestId,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
+  // A restart with a held job is its own notice and names the job.
+  if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
   if(kind==="restart")return {requestId,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
   if(kind==="restarted")return {requestId,subject:"Deployer now runs the published scripts",text:`Deployer run ${run} restarted itself from scripts ${short(record.restartedFrom)} and now runs ${loaded}, the scripts of published tasks-hub ${short(record.current?.commit)}.`};
   return {requestId,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
@@ -1725,15 +1755,18 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
-    // The runner's own code, once per poll and before any claim. Idle is the
-    // only place it restarts: no claimed, merged or blocked job, no matrix run
-    // of this process and no host release lock. Whatever is decided, a stale
-    // runner claims nothing below; a job it already owns is still run.
+    // The runner's own code, once per poll and before any claim. It restarts
+    // when idle: no claimed, merged or blocked job, no matrix run of this
+    // process and no host release lock. It also restarts when its only owned
+    // job is held (heldRestartJob), so a fix for a stuck job can be loaded.
+    // Whatever is decided, a stale runner claims nothing below; a job it
+    // already owns is otherwise still run.
     let codeNow=null;
     if(code){
       let published=null;try{published=code.published(config.cwd);}catch{}
       const idle=!jobs.some(j=>["claimed","merged","blocked"].includes(j.state)) && MATRIX_CHILDREN.size===0 && !existsSync(lock);
-      let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker});
+      const held=idle?null:heldRestartJob({jobs,details,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,journalDirectory:config.journalDirectory,lock,matrixChildren:MATRIX_CHILDREN.size});
+      let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker,held});
       // A re-exec that failed in this process is not tried again for the same
       // published code, so its refusal is not rewritten on every poll.
       if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
