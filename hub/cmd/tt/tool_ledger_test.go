@@ -25,11 +25,16 @@ import (
 const toolLedgerBound = 200 * time.Millisecond // l1: the whole hook
 
 // toolLedgerSandbox points the ledger at a temp directory and returns a
-// synthetic identity. No test here needs a hub.
+// synthetic identity. No test here needs a hub. The relay state is a temp
+// directory too and the runtime thread variables are empty, so a run inside
+// a real helper session never reads that session's helper file.
 func toolLedgerSandbox(t *testing.T) (env, string) {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "tool-ledger")
 	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(t.TempDir(), "relay"))
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
 	return env{hub: "http://127.0.0.1:9", task: "tsk_ledger", agent: "agt_ledger", runID: "run_ledger"}, root
 }
 
@@ -763,5 +768,380 @@ func TestToolArgsDigest(t *testing.T) {
 	sort.Strings(got)
 	if got[0] != "" || got[1] != "" || got[2] == got[3] || got[2] == "" {
 		t.Fatalf("digests = %q", got)
+	}
+}
+
+// The owner helper's session (bug wi_b3e8ecd5a2ee01b3): no Tailterm identity
+// in the environment, a helper file on the host, and the runtime's own
+// thread variable.
+
+const (
+	helperLedgerHub    = "http://127.0.0.1:9"
+	helperLedgerTask   = "tsk_00000000000000a1"
+	helperLedgerAgent  = "agt_00000000000000a1"
+	helperLedgerRun    = "run_helper_a1"
+	helperLedgerThread = "11111111-1111-4111-8111-111111111111"
+)
+
+// helperLedgerSandbox gives a host with no Tailterm identity and no hub
+// configuration: an empty home, temp relay state and ledger root, and every
+// identity variable empty. It returns the ledger root and the relay directory.
+func helperLedgerSandbox(t *testing.T) (root, relay string) {
+	t.Helper()
+	dir := t.TempDir()
+	root, relay = filepath.Join(dir, "tool-ledger"), filepath.Join(dir, "relay")
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+	t.Setenv("TAILTERM_RELAY_STATE", relay)
+	for _, name := range []string{"TAILTERM_AGENT", "TAILTERM_TASK", "TAILTERM_RUN", "TAILTERM_HUB", "TAILTERM_TOKEN", "TAILTERM_AGENT_NAME", "TAILTERM_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+		t.Setenv(name, "")
+	}
+	if err := os.MkdirAll(relay, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return root, relay
+}
+
+func helperLedgerFile() ownerHelperFile {
+	return ownerHelperFile{Hub: helperLedgerHub, Task: helperLedgerTask, Agent: helperLedgerAgent, Name: "owner-helper", Run: helperLedgerRun, Thread: helperLedgerThread, Runtime: "claude"}
+}
+
+// writeHelperLedgerFile stores f where tt helper register would.
+func writeHelperLedgerFile(t *testing.T, f ownerHelperFile) {
+	t.Helper()
+	if err := writePrivateJSON(ownerHelperPath(f.Hub, f.Task), f); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// helperLedgerEnv is the environment tt reads in the sandbox. It fails the
+// test unless that environment carries no agent, task or run.
+func helperLedgerEnv(t *testing.T) env {
+	t.Helper()
+	e := readEnv()
+	if e.agent != "" || e.task != "" || e.runID != "" {
+		t.Fatalf("the sandbox environment has an identity: agent %q, task %q, run %q", e.agent, e.task, e.runID)
+	}
+	return e
+}
+
+func rowKeys(row map[string]any) string {
+	keys := make([]string, 0, len(row))
+	for k := range row {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// a1: with no agent, task or run in the environment, the helper's calls are
+// written under the helper file's agent, task and run, in the same row
+// format as any agent's, and the file's hub is never contacted.
+func TestToolLedgerHelperSession(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			defer conn.Close() // accepted and never answered
+		}
+	}()
+	for runtime, variable := range map[string]string{"claude": "CLAUDE_CODE_SESSION_ID", "codex": "CODEX_THREAD_ID"} {
+		t.Run(runtime, func(t *testing.T) {
+			root, _ := helperLedgerSandbox(t)
+			file := helperLedgerFile()
+			file.Hub, file.Runtime = "http://"+ln.Addr().String(), runtime
+			// Private registration fields the ledger has no use for.
+			file.Registration, file.RequestID, file.RequestHash, file.Session, file.SessionID = "ohr_private", "request-private", "hash-private", "Codex_Orchestrator", "$7"
+			writeHelperLedgerFile(t, file)
+			t.Setenv(variable, file.Thread)
+			e := helperLedgerEnv(t)
+			call := map[string]any{"session_id": file.Thread, "tool_use_id": "u1", "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}, "duration_ms": 7}
+			toolHook(t, e, "PreToolUse", call)
+			toolHook(t, e, "PostToolUse", call)
+			rows := toolLedgerRows(t, root, file.Agent)
+			if len(rows) != 1 {
+				t.Fatalf("helper rows = %v", rows)
+			}
+			digest, _ := rows[0]["argsDigest"].(string)
+			want := map[string]any{"v": float64(1), "time": rows[0]["time"], "task": file.Task, "agent": file.Agent, "run": file.Run, "session": file.Thread, "tool": "Bash", "toolUseId": "u1", "argsDigest": digest, "outcome": "ok", "durationMs": float64(7), "durationSource": "claude"}
+			if fmt.Sprint(rows[0]) != fmt.Sprint(want) || !toolDigestRE.MatchString(digest) {
+				t.Fatalf("row = %v\nwant  %v", rows[0], want)
+			}
+			if left := toolPendingFiles(t, root, file.Agent); len(left) != 0 {
+				t.Fatalf("pending entries left after the post: %v", left)
+			}
+			// The same call under an environment identity has the same keys.
+			agent := env{hub: file.Hub, task: "tsk_ledger", agent: "agt_ledger", runID: "run_ledger"}
+			toolHook(t, agent, "PreToolUse", call)
+			toolHook(t, agent, "PostToolUse", call)
+			if other := toolLedgerRows(t, root, agent.agent); len(other) != 1 || rowKeys(other[0]) != rowKeys(rows[0]) {
+				t.Fatalf("agent rows = %v; want one row with the helper row's keys %s", other, rowKeys(rows[0]))
+			}
+			if entries, err := os.ReadDir(root); err != nil || len(entries) != 2 {
+				t.Fatalf("ledger root = %v, %v; want the helper and the agent", entries, err)
+			}
+		})
+	}
+	if n := connections.Load(); n != 0 {
+		t.Fatalf("the hook opened %d hub connection(s)", n)
+	}
+}
+
+// a2: without exactly one helper file for this runtime session the hook
+// returns nil, prints nothing, leaves stdin unread and writes nothing.
+func TestToolLedgerHelperNoMatch(t *testing.T) {
+	const otherThread = "22222222-2222-4222-8222-222222222222"
+	claude := func(t *testing.T) { t.Setenv("CLAUDE_CODE_SESSION_ID", helperLedgerThread) }
+	missing := func(change func(*ownerHelperFile)) func(*testing.T, string) {
+		return func(t *testing.T, _ string) {
+			file := helperLedgerFile()
+			change(&file)
+			writeHelperLedgerFile(t, file)
+			claude(t)
+		}
+	}
+	// misnamed stores a complete, matching helper file under a name its own
+	// hub and task do not give it.
+	misnamed := func(t *testing.T, relay, name string) {
+		data, err := json.Marshal(helperLedgerFile())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(relay, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		claude(t)
+	}
+	cases := map[string]func(t *testing.T, relay string){
+		"no helper file": func(t *testing.T, _ string) { claude(t) },
+		"no thread variable": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+		},
+		"thread differs": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			t.Setenv("CLAUDE_CODE_SESSION_ID", otherThread)
+		},
+		"runtime differs":       missing(func(f *ownerHelperFile) { f.Runtime = "codex" }),
+		"runtime in other case": missing(func(f *ownerHelperFile) { f.Runtime = "Claude" }),
+		"both thread variables set": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			claude(t)
+			t.Setenv("CODEX_THREAD_ID", helperLedgerThread)
+		},
+		"malformed thread variable": func(t *testing.T, _ string) {
+			file := helperLedgerFile()
+			file.Thread = "not-a-thread"
+			writeHelperLedgerFile(t, file)
+			t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+		},
+		"file missing agent":   missing(func(f *ownerHelperFile) { f.Agent = "" }),
+		"file missing run":     missing(func(f *ownerHelperFile) { f.Run = "" }),
+		"file missing thread":  missing(func(f *ownerHelperFile) { f.Thread = "" }),
+		"file missing runtime": missing(func(f *ownerHelperFile) { f.Runtime = "" }),
+		"unsafe agent id":      missing(func(f *ownerHelperFile) { f.Agent = "../agt_00000000000000a1" }),
+		"invalid task id": func(t *testing.T, relay string) {
+			file := helperLedgerFile()
+			file.Task = "tsk_ledger"
+			writeHelperLedgerFile(t, file)
+			claude(t)
+		},
+		"malformed JSON": func(t *testing.T, _ string) {
+			if err := os.WriteFile(ownerHelperPath(helperLedgerHub, helperLedgerTask), []byte(`{"hub":"`+helperLedgerHub+`","thread":"`+helperLedgerThread+`"`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			claude(t)
+		},
+		"oversized file": missing(func(f *ownerHelperFile) { f.Name = strings.Repeat("n", ownerHelperFileBytes) }),
+		"file under another hub's name": func(t *testing.T, relay string) {
+			misnamed(t, relay, filepath.Base(ownerHelperPath("http://other.example:1", helperLedgerTask)))
+		},
+		"file under another task's name": func(t *testing.T, relay string) {
+			misnamed(t, relay, filepath.Base(ownerHelperPath(helperLedgerHub, "tsk_00000000000000b2")))
+		},
+		"copied file": func(t *testing.T, relay string) { misnamed(t, relay, "copy.owner-helper.json") },
+		"TAILTERM_TASK names another project": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			claude(t)
+			t.Setenv("TAILTERM_TASK", "tsk_00000000000000b2")
+		},
+		"TAILTERM_RUN names another run": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			claude(t)
+			t.Setenv("TAILTERM_RUN", "run_replaced")
+		},
+		"two files carry the same thread": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			second := helperLedgerFile()
+			second.Task, second.Agent, second.Run = "tsk_00000000000000b2", "agt_00000000000000b2", "run_helper_b2"
+			writeHelperLedgerFile(t, second)
+			claude(t)
+		},
+		"more helper files than one lookup reads": func(t *testing.T, _ string) {
+			writeHelperLedgerFile(t, helperLedgerFile())
+			for i := 0; i < ownerHelperCandidates; i++ {
+				other := helperLedgerFile()
+				other.Task, other.Agent, other.Thread = fmt.Sprintf("tsk_%016x", 0xc0+i), fmt.Sprintf("agt_%016x", 0xc0+i), fmt.Sprintf("33333333-3333-4333-8333-%012x", i)
+				writeHelperLedgerFile(t, other)
+			}
+			claude(t)
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			root, relay := helperLedgerSandbox(t)
+			setup(t, relay)
+			e := readEnv()
+			if e.agent != "" {
+				t.Fatalf("the sandbox environment has an agent: %q", e.agent)
+			}
+			for _, event := range []string{"PreToolUse", "PostToolUse"} {
+				payload := toolPayload(event, map[string]any{"session_id": helperLedgerThread, "tool_use_id": "u1", "tool_name": "Bash"})
+				r, w, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = w.WriteString(payload)
+				w.Close()
+				run := runToolHook(t, e, "tool", "", r)
+				left, _ := io.ReadAll(r)
+				r.Close()
+				if run.err != nil || run.out != "" || string(left) != payload {
+					t.Errorf("%s = %v, output %q, %d of %d stdin bytes left", event, run.err, run.out, len(left), len(payload))
+				}
+			}
+			requireEmptyRoot(t, root)
+		})
+	}
+}
+
+// a5: with a helper for each of two projects on the host, only the one
+// registered from this thread is written.
+func TestToolLedgerHelperTwoProjects(t *testing.T) {
+	root, _ := helperLedgerSandbox(t)
+	first := helperLedgerFile()
+	second := helperLedgerFile()
+	second.Task, second.Agent, second.Run, second.Thread = "tsk_00000000000000b2", "agt_00000000000000b2", "run_helper_b2", "22222222-2222-4222-8222-222222222222"
+	writeHelperLedgerFile(t, first)
+	writeHelperLedgerFile(t, second)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", second.Thread)
+	e := helperLedgerEnv(t)
+	call := map[string]any{"session_id": second.Thread, "tool_use_id": "u1", "tool_name": "Read"}
+	toolHook(t, e, "PreToolUse", call)
+	toolHook(t, e, "PostToolUse", call)
+	rows := toolLedgerRows(t, root, second.Agent)
+	if len(rows) != 1 || rows[0]["agent"] != second.Agent || rows[0]["task"] != second.Task || rows[0]["run"] != second.Run || rows[0]["outcome"] != "ok" {
+		t.Fatalf("rows for the matching helper = %v", rows)
+	}
+	if entries, err := os.ReadDir(root); err != nil || len(entries) != 1 || entries[0].Name() != second.Agent {
+		t.Fatalf("ledger root = %v, %v; want only %s", entries, err, second.Agent)
+	}
+}
+
+// a6: the lookup stays inside the hook's bound in a relay directory far
+// larger than a busy host's. A timing miss is retried twice, since a stalled
+// test host is not the property; every attempt must still write its row.
+func TestToolLedgerHelperWithinBound(t *testing.T) {
+	root, relay := helperLedgerSandbox(t)
+	for i := 0; i < 10000; i++ {
+		name := fmt.Sprintf("%064x-agt_%016x.binding.json", i, i)
+		if err := os.WriteFile(filepath.Join(relay, name), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := helperLedgerFile()
+	other := helperLedgerFile()
+	other.Task, other.Agent, other.Run, other.Thread = "tsk_00000000000000b2", "agt_00000000000000b2", "run_helper_b2", "22222222-2222-4222-8222-222222222222"
+	writeHelperLedgerFile(t, file)
+	writeHelperLedgerFile(t, other)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+	e := helperLedgerEnv(t)
+	var slowest time.Duration
+	for attempt := 1; attempt <= 3; attempt++ {
+		slowest = 0
+		call := map[string]any{"session_id": file.Thread, "tool_use_id": fmt.Sprintf("u%d", attempt), "tool_name": "Bash"}
+		for _, event := range []string{"PreToolUse", "PostToolUse"} {
+			r := runToolHook(t, e, "tool", toolPayload(event, call), nil)
+			if r.err != nil || r.out != "" {
+				t.Fatalf("%s = %v, output %q", event, r.err, r.out)
+			}
+			slowest = max(slowest, r.elapsed)
+		}
+		if slowest < toolLedgerBound {
+			if rows := toolLedgerRows(t, root, file.Agent); len(rows) == 0 || rows[len(rows)-1]["toolUseId"] != call["tool_use_id"] || rows[len(rows)-1]["outcome"] != "ok" {
+				t.Fatalf("rows after an in-bound call = %v", rows)
+			}
+			return
+		}
+	}
+	t.Fatalf("slowest hook took %v in each of three attempts; want under %v", slowest, toolLedgerBound)
+}
+
+// a3: a helper row holds the row fields and nothing else: no token, no
+// tool input and none of the helper file's registration fields.
+func TestToolLedgerHelperStoresNoSecrets(t *testing.T) {
+	root, _ := helperLedgerSandbox(t)
+	markers := []string{"MARK-TOKEN", "MARK-INPUT", "MARK-REQUEST-ID", "MARK-REQUEST-HASH", "MARK-REGISTRATION"}
+	file := helperLedgerFile()
+	file.RequestID, file.RequestHash, file.Registration = markers[2], markers[3], markers[4]
+	writeHelperLedgerFile(t, file)
+	t.Setenv("TAILTERM_TOKEN", markers[0])
+	t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+	e := helperLedgerEnv(t)
+	if e.token != markers[0] {
+		t.Fatalf("the test token did not reach the environment: %q", e.token)
+	}
+	fields := func(id string) map[string]any {
+		return map[string]any{"session_id": file.Thread, "tool_use_id": id, "tool_name": "Bash", "duration_ms": 3,
+			"tool_input": map[string]any{"command": "echo MARK-INPUT", "env": map[string]any{"TOKEN": "MARK-INPUT"}}}
+	}
+	toolHook(t, e, "PreToolUse", fields("u1"))
+	toolHook(t, e, "PostToolUse", fields("u1"))
+	toolHook(t, e, "PreToolUse", fields("u2"))
+	toolHook(t, e, "PostToolUseFailure", fields("u2"))
+	toolHook(t, e, "PreToolUse", fields("u3")) // stays pending
+	if r := runToolHook(t, e, "tool", `{"tool_input":"MARK-INPUT"`, nil); r.err != nil || r.out != "" {
+		t.Fatalf("malformed input = %v, output %q", r.err, r.out)
+	}
+	files := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files++
+		for _, marker := range markers {
+			if bytes.Contains(data, []byte(marker)) || strings.Contains(path, marker) {
+				t.Errorf("%s holds %s", path, marker)
+			}
+		}
+		return nil
+	})
+	if err != nil || files != 3 { // ledger, lock, one pending
+		t.Fatalf("read %d files, %v", files, err)
+	}
+	rows := toolLedgerRows(t, root, file.Agent)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %v", rows)
+	}
+	const complete = "agent,argsDigest,durationMs,durationSource,outcome,run,session,task,time,tool,toolUseId,v"
+	for i, want := range []string{complete, complete, "agent,argsDigest,outcome,run,session,task,time,tool,toolUseId,v"} {
+		if rowKeys(rows[i]) != want {
+			t.Errorf("row %d keys = %s; want %s", i, rowKeys(rows[i]), want)
+		}
+		if rows[i]["agent"] != file.Agent || rows[i]["task"] != file.Task || rows[i]["run"] != file.Run {
+			t.Errorf("row %d identity = %v %v %v", i, rows[i]["agent"], rows[i]["task"], rows[i]["run"])
+		}
 	}
 }

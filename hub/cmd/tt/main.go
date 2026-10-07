@@ -1717,17 +1717,20 @@ func cmdHooks(args []string) error {
 }
 
 // cmdHook handles runtime callbacks. It must be quick and must never fail the
-// runtime: hub errors are swallowed, and without an agent identity it is a no-op.
+// runtime: hub errors are swallowed, and without an agent identity it is a
+// no-op. A registered handler decides for itself what it does without one.
 func cmdHook(e env, args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: tt hook <session-start|prompt|stop|notification|codex>")
 	}
-	if e.agent == "" || e.task == "" || e.hub == "" {
-		return nil
-	}
-	// A registered handler reads stdin itself, under its own deadline.
+	// A registered handler reads stdin itself, under its own deadline, and
+	// runs before the identity check: the tool ledger resolves the owner
+	// helper's identity offline when the environment has none.
 	if h := hookHandlers[args[0]]; h != nil {
 		h(e, args)
+		return nil
+	}
+	if e.agent == "" || e.task == "" || e.hub == "" {
 		return nil
 	}
 	var input map[string]any

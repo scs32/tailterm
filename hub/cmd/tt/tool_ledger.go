@@ -21,6 +21,10 @@ import (
 // each tool call leaves one private local row. The hook never writes to
 // stdout or stderr, never talks to the hub, and cannot make tt exit non-zero,
 // so it cannot deny, delay or rewrite a call. See docs/claude-wake.md.
+//
+// The owner helper's session has no agent identity in its environment. Its
+// calls are ledgered under the helper registered from that exact runtime
+// session, read from the host helper file (bug wi_b3e8ecd5a2ee01b3).
 
 // hookHandlers holds the tt hook names that cmdHook hands over before it
 // reads stdin. A handler has no return value, so it cannot fail the runtime.
@@ -130,13 +134,19 @@ func toolLedgerAgentOK(agent string) bool {
 // included, happens in a goroutine the handler waits on for at most the
 // deadline. When the handler returns, cmdHook returns nil and the process
 // exits 0, which ends a goroutine still blocked on stdin or the disk.
+//
+// The identity is the environment's agent, task and run. With no agent in
+// the environment it is the owner helper registered from this runtime
+// session, resolved from the host helper files inside the same goroutine
+// and deadline; without exactly one such helper stdin and the disk are left
+// alone.
 func toolLedgerHook(e env, _ []string) {
 	root := toolLedgerRoot()
-	if root == "" || !toolLedgerAgentOK(e.agent) {
+	if root == "" || e.agent != "" && (e.task == "" || e.hub == "" || !toolLedgerAgentOK(e.agent)) {
 		return
 	}
 	l := toolLedger{
-		dir: filepath.Join(root, e.agent), task: toolLedgerCut(e.task), agent: e.agent, run: toolLedgerCut(e.runID), started: time.Now(), deadline: toolLedgerDeadline,
+		started: time.Now(), deadline: toolLedgerDeadline,
 		maxInput: toolLedgerMaxInput, maxBytes: toolLedgerMaxBytes, maxPending: toolLedgerMaxPending,
 		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
 	}
@@ -145,6 +155,18 @@ func toolLedgerHook(e env, _ []string) {
 	go func() {
 		defer close(done)
 		defer func() { _ = recover() }()
+		if e.agent == "" {
+			helper, ok := offlineOwnerHelper()
+			// A partial environment identity must agree with the file.
+			if !ok || e.task != "" && e.task != helper.Task || e.runID != "" && e.runID != helper.Run {
+				return
+			}
+			e.task, e.agent, e.runID = helper.Task, helper.Agent, helper.Run
+			if time.Since(l.started) >= l.deadline {
+				return // the handler has already returned; leave stdin alone
+			}
+		}
+		l.dir, l.task, l.agent, l.run = filepath.Join(root, e.agent), toolLedgerCut(e.task), e.agent, toolLedgerCut(e.runID)
 		l.record(in)
 	}()
 	timer := time.NewTimer(l.deadline)

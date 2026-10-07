@@ -99,9 +99,9 @@ and relay regressions. No live owner/agent sessions are test fixtures.
 
 ## Tool-call ledger
 
-Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. This source change is a candidate.
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. This source change is a candidate.
 
-Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
+Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The owner helper's Claude session is covered too (see "Owner helper session"). The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
 
 ### Hooks
 
@@ -113,7 +113,8 @@ Every tool call in a Tailterm Claude agent session leaves one private local row:
 - It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
 - It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
-- Outside a Tailterm agent session (no `TAILTERM_AGENT`, `TAILTERM_TASK` or hub) it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
+- With `TAILTERM_AGENT` set, the session is an agent's and nothing below changes it. If `TAILTERM_TASK` or the hub is then missing, it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
+- With no `TAILTERM_AGENT`, it looks for the owner helper registered from this exact session (see "Owner helper session"). When neither `CLAUDE_CODE_SESSION_ID` nor `CODEX_THREAD_ID` is set, or both are, it returns before touching any file. Otherwise it lists the relay state directory and reads the helper files there. Unless exactly one matches, it returns before reading stdin and writes nothing.
 
 Assumptions behind the 200 ms, not changed by this feature: before any hook runs, `tt` sets `PATH` and reads the small local file `~/.config/tailterm/hub.json` with no deadline, as every `tt` command and the four existing hooks do. A home directory on a stalled filesystem would hold all of them. One exception was measured: the first run of a new `tt` binary file on macOS takes 216 to 358 ms, once after each install, because the system checks a new binary on its first run. Later runs took 6 to 12 ms, and about 160 ms with stdin held open.
 
@@ -136,7 +137,7 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 | --- | --- |
 | `v` | 1 |
 | `time` | UTC RFC 3339 time the row was written |
-| `task`, `agent`, `run` | `TAILTERM_TASK`, `TAILTERM_AGENT` and `TAILTERM_RUN` of the session |
+| `task`, `agent`, `run` | `TAILTERM_TASK`, `TAILTERM_AGENT` and `TAILTERM_RUN` of the session; for the owner helper session, `task`, `agent` and `run` from its helper file |
 | `session` | Claude Code `session_id` |
 | `tool` | `tool_name`, cut to 128 bytes |
 | `toolUseId` | `tool_use_id`, cut to 128 bytes |
@@ -147,7 +148,33 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 
 Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
 
-Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table.
+Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table. From a helper file only `task`, `agent` and `run` reach a row; its registration and request fields do not.
+
+### Owner helper session
+
+The owner helper is the owner's own Claude Code session (`docs/owner-helper.md`). Its process environment has no `TAILTERM_AGENT`, `TAILTERM_TASK` or `TAILTERM_RUN`: it takes its identity per command from `tt helper env`. Until this change `tt hook tool` returned at once in that session and none of its calls were recorded (bug `wi_b3e8ecd5a2ee01b3`).
+
+With no agent in the environment, the hook now resolves the helper from this host's files only:
+
+- The session is named by `CLAUDE_CODE_SESSION_ID` (runtime `claude`) or `CODEX_THREAD_ID` (runtime `codex`). Exactly one must be set, and it must be a thread UUID.
+- The hook lists the relay state directory (`~/.local/state/tailterm/relay`, or `TAILTERM_RELAY_STATE`) for names ending `.owner-helper.json`, the files `tt helper register` writes, one per hub and project.
+- A file matches when its `runtime` and `thread` equal the session's exactly, its `agent` and `task` are well-formed ids, its `run` is not empty, and its file name is the one its own `hub` and `task` give it. A copied or renamed file is not believed.
+- Exactly one matching file gives the identity: rows are written to `tool-ledger/<agent>/` with that file's `agent`, `task` and `run`, in the same format and under the same limits as any agent's rows.
+- No match writes nothing. Two or more matches (one thread registered as the helper of two projects) are ambiguous and write nothing. A file that is not JSON, is larger than 64 KiB, or lacks any of those fields is not a match. If `TAILTERM_TASK` or `TAILTERM_RUN` happens to be set without an agent, the file must carry the same value.
+
+The hook never asks the hub, never reads tmux session tags and never guesses: the hub and task are not inputs, and nothing is taken from a partial environment identity. The lookup runs inside the same 150 ms wait, before stdin is read. It reads directory names without a stat per entry, and reads at most 16 helper files; a directory with more helper files than that writes nothing. A test runs it with 10,000 unrelated files in the directory inside the 200 ms bound.
+
+The lookup depends on Claude Code giving a hook process the session's own id. Observed on 2026-10-06 with Claude Code 2.1.292: a `claude -p` run in a temporary project, with `PreToolUse` and `PostToolUse` hooks in its `.claude/settings.json` and no `CLAUDE_CODE_SESSION_ID` or Tailterm identity in the parent environment, ran one Bash `true`. In both hook processes `CLAUDE_CODE_SESSION_ID` was set and equal to the payload's `session_id`. An interactive session was not tried. Codex has no tool hook, so a Codex helper session is not ledgered; the `codex` rule exists so the two runtimes are matched the same way.
+
+To check that a helper session is covered, in that session:
+
+```sh
+tt helper env --task <project id>    # prints TAILTERM_AGENT=<helper agent id> and TAILTERM_RUN
+ls ~/.local/state/tailterm/tool-ledger/<helper agent id>/
+tail -n 1 ~/.local/state/tailterm/tool-ledger/<helper agent id>/ledger.jsonl
+```
+
+The last row's `agent`, `task` and `run` name the helper and its `session` is the session's id. No directory after the session has made a tool call means one of: the helper was not registered from this session (run `tt helper register`), it was registered again from another session, the host's `tt` is older than this change, or the tool hooks are not installed (`tt host setup`).
 
 ### Pairing and bounds
 
@@ -163,7 +190,8 @@ A pre hook writes a pending file of at most 512 bytes with the start time, sessi
 - The digest is unsalted. It hides content, but a short guessable argument such as `ls` can be confirmed by hashing a guess.
 - A reader must tolerate a torn last line if a hook is killed during its write.
 - Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
-- The owner helper's session has an agent identity, so its calls are recorded, with an empty `run`.
+- A helper closed on the hub is still ledgered while this host's helper file names the session's thread. Telling would need a hub request, which the hook never makes. The rows are for calls that session really made, under the agent and run the file names. Registering the helper again from another session ends it.
+- Every Claude Code session on the host that is not a Tailterm agent now lists the relay state directory once per tool hook, to learn that it is not the helper.
 - Hub upload, deny or rewrite rules and budget caps are not part of this version.
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.

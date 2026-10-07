@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,22 +52,118 @@ type ownerHelperFile struct {
 }
 
 func ownerHelperPath(hub, task string) string {
-	return filepath.Join(relayDir(), fmt.Sprintf("%x-%s.owner-helper.json", sha256.Sum256([]byte(hub)), task))
+	return filepath.Join(relayDir(), fmt.Sprintf("%x-%s%s", sha256.Sum256([]byte(hub)), task, ownerHelperSuffix))
+}
+
+// Bounds on reading helper files. offlineOwnerHelper runs inside the tool
+// hook's deadline, so it gives up past the candidate count.
+const (
+	ownerHelperFileBytes  = 64 << 10 // largest helper file read
+	ownerHelperCandidates = 16       // most helper files one offline lookup reads
+	ownerHelperSuffix     = ".owner-helper.json"
+)
+
+var errOwnerHelperFileInvalid = errors.New("owner helper file is not valid JSON or is too large")
+
+// readOwnerHelperFile decodes the helper file at path over f, reading at most
+// ownerHelperFileBytes. A file that is larger or not JSON gives
+// errOwnerHelperFileInvalid; any other error is the read's own.
+func readOwnerHelperFile(path string, f *ownerHelperFile) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, ownerHelperFileBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > ownerHelperFileBytes || json.Unmarshal(data, f) != nil {
+		return errOwnerHelperFileInvalid
+	}
+	return nil
 }
 
 func loadOwnerHelperFile(hub, task string) (ownerHelperFile, error) {
 	f := ownerHelperFile{Hub: hub, Task: task}
-	data, err := os.ReadFile(ownerHelperPath(hub, task))
+	err := readOwnerHelperFile(ownerHelperPath(hub, task), &f)
 	if errors.Is(err, os.ErrNotExist) {
 		return f, nil
 	}
-	if err != nil {
-		return f, err
+	if err != nil && !errors.Is(err, errOwnerHelperFileInvalid) {
+		return ownerHelperFile{Hub: hub, Task: task}, err
 	}
-	if err := json.Unmarshal(data, &f); err != nil || f.Hub != hub || f.Task != task {
+	if err != nil || f.Hub != hub || f.Task != task {
 		return ownerHelperFile{Hub: hub, Task: task}, errors.New("owner helper state is unreadable; remove " + ownerHelperPath(hub, task) + " and register again")
 	}
 	return f, nil
+}
+
+// sessionHelperThread is the runtime and thread this process's runtime
+// session names: CLAUDE_CODE_SESSION_ID for claude, CODEX_THREAD_ID for
+// codex. ok is false when neither is set or both are.
+func sessionHelperThread() (runtime, thread string, ok bool) {
+	codexThread, claudeThread := os.Getenv("CODEX_THREAD_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")
+	switch {
+	case codexThread != "" && claudeThread == "":
+		return "codex", codexThread, true
+	case claudeThread != "" && codexThread == "":
+		return "claude", claudeThread, true
+	}
+	return "", "", false
+}
+
+// offlineOwnerHelper is the helper registered on this host from this exact
+// runtime session, found without the hub: the one helper file in the relay
+// directory whose runtime and thread are this session's. It trusts a file
+// only under the name its own hub and task give it, and returns false for no
+// match, for more than one, and past the read bounds. The hub is not asked,
+// so a helper closed there still matches until it is registered again.
+func offlineOwnerHelper() (ownerHelperFile, bool) {
+	runtime, thread, ok := sessionHelperThread()
+	if !ok || !threadIDPattern.MatchString(thread) {
+		return ownerHelperFile{}, false
+	}
+	dir := relayDir()
+	d, err := os.Open(dir)
+	if err != nil {
+		return ownerHelperFile{}, false
+	}
+	defer d.Close()
+	var candidates []string
+	for {
+		names, err := d.Readdirnames(4096) // names only: no stat per entry
+		for _, name := range names {
+			if !strings.HasSuffix(name, ownerHelperSuffix) {
+				continue
+			}
+			if len(candidates) == ownerHelperCandidates {
+				return ownerHelperFile{}, false
+			}
+			candidates = append(candidates, name)
+		}
+		if err != nil {
+			if err != io.EOF {
+				return ownerHelperFile{}, false
+			}
+			break
+		}
+	}
+	var found ownerHelperFile
+	matches := 0
+	for _, name := range candidates {
+		var f ownerHelperFile
+		if readOwnerHelperFile(filepath.Join(dir, name), &f) != nil {
+			continue
+		}
+		if name != filepath.Base(ownerHelperPath(f.Hub, f.Task)) || f.Runtime != runtime || f.Thread != thread ||
+			!api.ValidID(f.Agent, "agt") || !toolLedgerAgentOK(f.Agent) || !api.ValidID(f.Task, "tsk") || f.Run == "" {
+			continue
+		}
+		found = f
+		matches++
+	}
+	return found, matches == 1
 }
 
 func cmdHelper(e env, args []string) error {
@@ -521,10 +618,9 @@ func verifiedHelper(e env, task string) (env, api.Agent, error) {
 	if e.agent != "" && (e.agent != state.Agent || e.runID != state.Run) {
 		return env{}, api.Agent{}, errors.New("this caller is not the registered helper run; register again")
 	}
-	codexThread, claudeThread := os.Getenv("CODEX_THREAD_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")
-	if codexThread != "" && claudeThread != "" ||
-		codexThread != "" && (a.Runtime != "codex" || codexThread != state.Thread) ||
-		claudeThread != "" && (a.Runtime != "claude" || claudeThread != state.Thread) ||
+	runtime, thread, single := sessionHelperThread()
+	both := !single && os.Getenv("CODEX_THREAD_ID") != ""
+	if both || single && (a.Runtime != runtime || thread != state.Thread) ||
 		state.Runtime != "" && state.Runtime != a.Runtime {
 		return env{}, api.Agent{}, errors.New("this session is not the registered helper thread/runtime; register again")
 	}
