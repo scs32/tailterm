@@ -820,7 +820,7 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 		t.Fatal("queue handler briefing still asks for hand scoping")
 	}
 	const before = "4556752233b1d6c05364c7b689d2485781534d3411a2493738e467619a70d0bf" // c6a8ec1
-	const current = "6c6a04d9ad079693a01253aad7f9bb0ce1e6738f95e0a329b59e3283d20a93d9"
+	const current = "6b3b35c98a12cfae03a3c640a54df752f026e0789721341237bd0594c9ffce11"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}
