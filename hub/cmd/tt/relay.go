@@ -1007,6 +1007,7 @@ func cmdRelay(args []string) error {
 	}
 	var queueBackoff teamQueuePollBackoff
 	var rotation relayRotationPass
+	var sweep relaySweepPass
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastWindowSize time.Time
 	var claudeRetryCursor int
@@ -1031,6 +1032,12 @@ func cmdRelay(args []string) error {
 			}
 			if *once {
 				rotation.collect(&queueBackoff, true)
+			}
+			// The scheduled worktree sweep runs off the wake path too, and
+			// never under --once: a sweep can outlast a single pass.
+			sweep.collect()
+			if !*once && queueBackoff.ready(time.Now()) {
+				sweep.start()
 			}
 			if time.Since(lastClaudeRetry) >= 15*time.Second {
 				lastClaudeRetry = time.Now()

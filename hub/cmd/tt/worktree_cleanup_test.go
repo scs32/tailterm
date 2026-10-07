@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,6 +61,7 @@ func resetCleanupProcessState(t *testing.T) {
 	t.Helper()
 	reset := func() {
 		closeoutWorktreeChecks.Clear()
+		keptWorktreeReceipts.Clear()
 		artifactAcceptedAfterWarning = sync.Once{}
 	}
 	reset()
@@ -77,6 +80,9 @@ func newCleanupRepo(t *testing.T) cleanupRepo {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The matrix lock is a fake file too: a sweep takes its mutex, and the
+	// host's real one is never read or linked.
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", filepath.Join(root, "matrix", "host.json"))
 	// Session temp is a fake tree too; the host's real one is never read.
 	realTempRoot := claudeTempRoot
 	claudeTempRoot = func() string { return filepath.Join(root, "tmp", "claude-501") }
@@ -2016,7 +2022,10 @@ func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"removed " + releasedCheckout + " (artifact checkout; ", "removed " + releasedTemp + " (session temp; ", "removed " + acceptedTemp, "totals: removed=3 kept=3"} {
+	for _, want := range []string{"removed " + releasedCheckout + " (artifact checkout; ", "removed " + releasedTemp + " (session temp; ", "removed " + acceptedTemp,
+		// The accepted item is finished, so its kept checkout's node_modules is
+		// judged for the cache trim: it has no install marker and is kept.
+		"kept unproven " + filepath.Join(acceptedCheckout, "node_modules") + ": no npm install marker", "totals: removed=3 kept=4"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("apply output lacks %q:\n%s", want, text)
 		}
@@ -2575,4 +2584,925 @@ func TestWorktreeCleanupSessionTempKeptWithUnusableArtifactsRoot(t *testing.T) {
 		closeoutTick(t, r, artifactItemB, cwds[1].Path, artifactItemC)
 		requireExists(t, plain, false)
 	})
+}
+
+// Cache trim, tombstones and the scheduled pass.
+
+const (
+	trimHost     = "fixture-host"
+	trimItemAcc  = "wi_00000000000000a1"
+	trimItemRel  = "wi_00000000000000a2"
+	trimItemCwd  = "wi_00000000000000a3"
+	trimItemFar  = "wi_00000000000000a4"
+	trimItemOut  = "wi_00000000000000a5"
+	trimItemFail = "wi_00000000000000b1"
+	trimItemLive = "wi_00000000000000b2"
+	trimItemGone = "wi_00000000000000b3"
+	trimItemRedo = "wi_00000000000000b4"
+	trimItemBusy = "wi_00000000000000b5"
+)
+
+// installModules makes checkout's node_modules look like an npm install: the
+// marker npm writes, and a package.
+func installModules(t *testing.T, checkout string) string {
+	t.Helper()
+	cache := filepath.Join(checkout, "node_modules")
+	writeFixtureFile(t, filepath.Join(cache, ".package-lock.json"), `{"name":"fixture","lockfileVersion":3}`+"\n")
+	writeFixtureFile(t, filepath.Join(cache, "left-pad", "index.js"), "module.exports = 1\n")
+	return cache
+}
+
+// treeContents is every entry below root with its mode and bytes (a link's
+// target for a symlink), so a tree can be shown byte-identical.
+func treeContents(t *testing.T, root string) string {
+	t.Helper()
+	var lines []string
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		line := p + " " + info.Mode().String()
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, _ := os.Readlink(p)
+			line += " -> " + target
+		case info.Mode().IsRegular():
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			line += " " + strconv.Quote(string(data))
+		}
+		lines = append(lines, line)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// trimFixture is a repository with ignored build output, a fake home holding
+// sentinel shared caches, and a clock two days ahead so every tree is idle.
+type trimFixture struct {
+	cleanupRepo
+	home string
+	now  time.Time
+}
+
+func newTrimFixture(t *testing.T) trimFixture {
+	t.Helper()
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	return trimFixture{cleanupRepo: r, home: isolatedHome(t, r.root), now: time.Now().Add(48 * time.Hour)}
+}
+
+// accepted is a finished entry of item on this host, accepted two hours
+// before the fixture's clock: its verifier checkouts are kept for retention.
+func (f trimFixture) accepted(item string) api.TeamQueueEntry {
+	q := acceptedArtifactEntry(item, f.now.Add(-2*time.Hour))
+	q.Host, q.TaskID = trimHost, "tsk_c1ea0c1ea0c1ea10"
+	return q
+}
+
+// pass runs the sweep's own pass over the fixture.
+func (f trimFixture) pass(t *testing.T, state sweepHubState, apply bool) map[string]worktreeDecision {
+	t.Helper()
+	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: f.now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]worktreeDecision{}
+	for _, d := range decisions {
+		if _, twice := out[d.Path]; twice {
+			t.Fatalf("two decisions for %s: %+v", d.Path, decisions)
+		}
+		out[d.Path] = d
+	}
+	return out
+}
+
+func requireNoTombstones(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, dir := range dirs {
+		left, _ := filepath.Glob(filepath.Join(dir, tombstonePrefix+"*"))
+		if len(left) != 0 {
+			t.Fatalf("tombstones left in %s: %v", dir, left)
+		}
+	}
+	if intents, err := loadDetachIntents(); err != nil || len(intents) != 0 {
+		t.Fatalf("intents left: %+v %v", intents, err)
+	}
+}
+
+// t12 (a2): one fixture swept by the manual command and by the schedule
+// gives the same decisions and the same cleanup receipts apart from the time.
+func TestWorktreeCleanupManualAndScheduledSweepsAgree(t *testing.T) {
+	f := newSweepFixture(t)
+	r := f.r
+	f.host = spawn.Host()
+	at := f.now
+	oldNow := sweepNow
+	sweepNow = func() time.Time { return at }
+	t.Cleanup(func() { sweepNow = oldNow })
+
+	stale := f.stale(t, "queue-a2a20001")
+	dirty := f.stale(t, "queue-a2a20002")
+	writeFixtureFile(t, filepath.Join(dirty, "draft.txt"), "draft\n")
+	unpushed := r.branchWorktree(t, r.queuePath("queue-a2a20003"), "feat/parity-unpushed")
+	missing := f.stale(t, "queue-a2a20004")
+	if err := os.RemoveAll(missing); err != nil {
+		t.Fatal(err)
+	}
+	releasedCheckout := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
+	acceptedCheckout := r.verifierCheckout(t, artifactItemB, "verifier-abc1234")
+	cache := installModules(t, acceptedCheckout)
+	runningCheckout := r.verifierCheckout(t, artifactItemC, "verifier-abc1234")
+	tempCwd := r.queuePath("queue-a2a20005")
+	temp := filepath.Join(r.tempRoot(), claudeScratchKey(tempCwd))
+	writeFixtureFile(t, filepath.Join(temp, "session", "scratchpad", "note.txt"), "scratch\n")
+	released := releasedArtifactEntry(artifactItemA)
+	released.TaskID, released.Host, released.Cwd, released.Repository = sweepTask, f.host, tempCwd, r.main
+	accepted := acceptedArtifactEntry(artifactItemB, at.Add(-2*time.Hour))
+	accepted.TaskID, accepted.Host = sweepTask, f.host
+	running := api.TeamQueueEntry{ID: "tqe_parity_running", TaskID: sweepTask, ItemID: artifactItemC, State: "running", Host: f.host, Cwd: r.queuePath("queue-a2a20006"), Position: 2}
+	f.setEntries(released, accepted, running)
+
+	snapshot := t.TempDir()
+	copyTree := func(from, to string) {
+		t.Helper()
+		if out, err := exec.Command("cp", "-a", from+"/.", to).CombinedOutput(); err != nil {
+			t.Fatalf("copy %s: %v: %s", from, err, out)
+		}
+	}
+	copyTree(r.root, snapshot)
+	type result struct {
+		decisions string
+		receipts  []worktreeCleanupReceipt
+	}
+	collect := func(decisions []worktreeDecision) result {
+		t.Helper()
+		data, err := json.MarshalIndent(decisions, "", " ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipts := readCleanupReceipts(t)
+		for i := range receipts {
+			if receipts[i].At != at.UTC().Format(time.RFC3339Nano) {
+				t.Fatalf("receipt time %s, want the pass's %s", receipts[i].At, at.UTC().Format(time.RFC3339Nano))
+			}
+			receipts[i].At = ""
+		}
+		return result{string(data), receipts}
+	}
+	check := func(who string) {
+		t.Helper()
+		for _, p := range []string{stale, releasedCheckout, temp, cache} {
+			requireExists(t, p, false)
+		}
+		for _, p := range []string{dirty, unpushed, acceptedCheckout, runningCheckout, releasedCheckout + ".removed.json", filepath.Join(acceptedCheckout, "dist", "app.js")} {
+			requireExists(t, p, true)
+		}
+		if list := cleanupGit(t, r.main, "worktree", "list", "--porcelain"); strings.Contains(list, missing) {
+			t.Fatalf("%s did not prune %s", who, missing)
+		}
+	}
+
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(env{hub: f.hubURL}, []string{"--cwd", r.main, "--min-idle", "6h", "--apply", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("manual sweep: %v\n%s", err, out)
+	}
+	var report worktreeSweepReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	check("the manual sweep")
+	manual := collect(report.Worktrees)
+	if report.Totals.Actions["removed"] != 3 || report.Totals.Actions["trimmed"] != 1 || report.Totals.Actions["pruned"] != 1 || len(manual.receipts) != len(report.Worktrees) {
+		t.Fatalf("manual totals %+v with %d receipts", report.Totals, len(manual.receipts))
+	}
+
+	// Back to the same fixture, with nothing remembered from the first run.
+	entries, err := os.ReadDir(r.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(r.root, e.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copyTree(snapshot, r.root)
+	for _, name := range []string{"worktree-cleanup.jsonl", "worktree-sweep-state.json"} {
+		if err := os.Remove(filepath.Join(relayDir(), name)); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	keptWorktreeReceipts.Clear()
+	for _, p := range []string{stale, releasedCheckout, temp, cache} {
+		requireExists(t, p, true)
+	}
+
+	if !f.attempt() || f.sweeps != 1 {
+		t.Fatalf("scheduled sweep: %d sweeps, %+v", f.sweeps, lastSweepLine(t))
+	}
+	check("the scheduled sweep")
+	scheduled := collect(f.last)
+	if manual.decisions != scheduled.decisions {
+		t.Fatalf("decisions differ.\nmanual:\n%s\nscheduled:\n%s", manual.decisions, scheduled.decisions)
+	}
+	if !reflect.DeepEqual(manual.receipts, scheduled.receipts) {
+		t.Fatalf("receipts differ.\nmanual:    %+v\nscheduled: %+v", manual.receipts, scheduled.receipts)
+	}
+	line := lastSweepLine(t)
+	if line.Outcome != "swept" || line.TreesRemoved != 2 || line.FoldersRemoved != 1 || line.CachesTrimmed != 1 || line.Pruned != 1 || line.Kept[keepDirty] != 1 || line.Kept[keepUnpushed] != 1 || line.Kept[keepRetention] != 1 || line.Kept[keepItemActive] != 1 {
+		t.Fatalf("scheduled line %+v", line)
+	}
+	var freed int64
+	for _, d := range report.Worktrees {
+		freed += d.Bytes
+	}
+	if line.BytesFreed != freed || freed != report.Totals.Bytes {
+		t.Fatalf("bytes freed %d, manual %d, totals %d", line.BytesFreed, freed, report.Totals.Bytes)
+	}
+}
+
+// t13 (a5): finished is positive evidence with an item-wide veto.
+func TestWorktreeCleanupCacheTrimFinishedItems(t *testing.T) {
+	f := newTrimFixture(t)
+	checkout := func(item string) string {
+		path := f.verifierCheckout(t, item, "verifier-abc1234")
+		installModules(t, path)
+		return path
+	}
+	acc := checkout(trimItemAcc)
+	rel := checkout(trimItemRel)
+	writeFixtureFile(t, filepath.Join(rel, "notes.txt"), "kept dirty\n")
+	failed, live, gone, redo, busy := checkout(trimItemFail), checkout(trimItemLive), checkout(trimItemGone), checkout(trimItemRedo), checkout(trimItemBusy)
+	branch := func(name, branch string) string {
+		path := f.branchWorktree(t, f.queuePath(name), branch)
+		installModules(t, path)
+		return path
+	}
+	cwd := branch("queue-a5a50001", "feat/trim-cwd")
+	far := branch("queue-a5a50002", "feat/trim-other-host")
+	nobody := branch("queue-a5a50003", "feat/trim-unattributed")
+	outside := f.branchWorktree(t, filepath.Join(f.root, "elsewhere", "queue-a5a50004"), "feat/trim-outside")
+	installModules(t, outside)
+
+	after := func(q api.TeamQueueEntry, state string) api.TeamQueueEntry {
+		next := api.TeamQueueEntry{ID: q.ID + "_next", TaskID: q.TaskID, ItemID: q.ItemID, Host: q.Host, State: state, Position: q.Position + 1}
+		return next
+	}
+	released := releasedArtifactEntry(trimItemRel)
+	released.Host = trimHost
+	withCwd := func(item, path, host string) api.TeamQueueEntry {
+		q := f.accepted(item)
+		q.Host, q.Cwd = host, path
+		q.Acceptance.Worktree = path
+		return q
+	}
+	failedReleased := after(f.accepted(trimItemFail), "failed")
+	failedReleased.ReleasedAt = "2026-10-01T10:00:00Z"
+	entries := []api.TeamQueueEntry{
+		f.accepted(trimItemAcc), released,
+		withCwd(trimItemCwd, cwd, trimHost), withCwd(trimItemFar, far, "another-host"), withCwd(trimItemOut, outside, trimHost),
+		f.accepted(trimItemFail), failedReleased,
+		f.accepted(trimItemLive), after(f.accepted(trimItemLive), "failed"),
+		f.accepted(trimItemGone), after(f.accepted(trimItemGone), "abandoned"),
+		f.accepted(trimItemRedo), after(f.accepted(trimItemRedo), "queued"),
+		f.accepted(trimItemBusy),
+	}
+	agents := []api.Agent{{ID: "agt_00000000000000b5", Name: "late-reviewer", Host: "another-host", Status: api.AgentRunning, WorkItem: &api.AgentWorkItemBinding{ItemID: trimItemBusy}}}
+	set := finishedTrimSet(trimHost, entries, agents)
+	wantItems := map[string]bool{trimItemAcc: true, trimItemRel: true, trimItemCwd: true, trimItemFar: true, trimItemOut: true}
+	wantPaths := map[string]string{cwd: trimItemCwd, outside: trimItemOut}
+	if !reflect.DeepEqual(set.Items, wantItems) || !reflect.DeepEqual(set.Paths, wantPaths) {
+		t.Fatalf("finished set %+v\nwant items %v, paths %v", set, wantItems, wantPaths)
+	}
+	// A closed agent does not veto, and an item whose only entry is active has none finished.
+	closed := finishedTrimSet(trimHost, []api.TeamQueueEntry{f.accepted(trimItemBusy)}, []api.Agent{{Status: api.AgentClosed, WorkItem: &api.AgentWorkItemBinding{ItemID: trimItemBusy}}})
+	if !closed.Items[trimItemBusy] || len(finishedTrimSet(trimHost, []api.TeamQueueEntry{{ItemID: trimItemRedo, State: "running", Position: 1}}, nil).Items) != 0 {
+		t.Fatalf("closed agent or active entry: %+v", closed)
+	}
+
+	state := sweepHubState{entries: entries, agents: agents}
+	trimmed := []string{acc, rel, cwd}
+	untouched := []string{failed, live, gone, redo, busy, far, nobody, outside}
+	before := fixtureTree(t, f.root)
+	dry := f.pass(t, state, false)
+	for _, p := range trimmed {
+		if d := requireDecision(t, dry, filepath.Join(p, "node_modules"), "would-trim", ""); d.Kind != kindCache || d.Bytes <= 0 {
+			t.Fatalf("dry decision %+v", d)
+		}
+	}
+	if fixtureTree(t, f.root) != before {
+		t.Fatal("the dry run changed the fixture")
+	}
+	got := f.pass(t, state, true)
+	for _, p := range trimmed {
+		d := requireDecision(t, got, filepath.Join(p, "node_modules"), "trimmed", "")
+		if d.Kind != kindCache || d.Bytes <= 0 {
+			t.Fatalf("trim decision %+v", d)
+		}
+		requireExists(t, filepath.Join(p, "node_modules"), false)
+		requireExists(t, filepath.Join(p, "app.txt"), true)
+		requireNoTombstones(t, p)
+	}
+	requireExists(t, filepath.Join(rel, "notes.txt"), true)
+	requireExists(t, filepath.Join(acc, "dist", "app.js"), true)
+	for _, p := range untouched {
+		if d, ok := got[filepath.Join(p, "node_modules")]; ok {
+			t.Fatalf("a cache decision for an unfinished or unattributed checkout: %+v", d)
+		}
+		requireExists(t, filepath.Join(p, "node_modules", "left-pad", "index.js"), true)
+		requireExists(t, filepath.Join(p, "node_modules", ".package-lock.json"), true)
+	}
+	// The checkouts' own decisions are the keep rules', unchanged.
+	requireDecision(t, got, acc, "kept", keepRetention)
+	requireDecision(t, got, rel, "kept", keepDirty)
+	requireDecision(t, got, cwd, "kept", keepUnpushed)
+	requireDecision(t, got, live, "kept", keepItemActive)
+	requireDecision(t, got, busy, "kept", keepItemActive)
+	var caches int
+	for _, receipt := range readCleanupReceipts(t) {
+		if receipt.Kind == kindCache {
+			caches++
+			if receipt.Action != "trimmed" || receipt.Bytes <= 0 || receipt.Source != "sweep" {
+				t.Fatalf("cache receipt %+v", receipt)
+			}
+		}
+	}
+	if caches != len(trimmed) {
+		t.Fatalf("%d cache receipts for %d trims", caches, len(trimmed))
+	}
+	// Closeout, which sets no trim, never trims.
+	again := installModules(t, acc)
+	decisions, err := cleanupWorktrees(context.Background(), worktreeCleanupInputs{Repo: f.main, Now: f.now, Apply: true, Items: artifactItemStates(entries, agents), Receipt: worktreeCleanupReceipt{Source: "closeout"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range decisions {
+		if d.Kind == kindCache {
+			t.Fatalf("closeout made a cache decision: %+v", d)
+		}
+	}
+	requireExists(t, again, true)
+}
+
+// t14 (a5): the trim touches only node_modules, only in an idle, unlocked
+// checkout nobody uses, and only when the directory is provably the cache.
+func TestWorktreeCleanupCacheTrimScope(t *testing.T) {
+	f := newTrimFixture(t)
+	checkout := func(name string) (string, string) {
+		path := f.verifierCheckout(t, trimItemAcc, name)
+		return path, installModules(t, path)
+	}
+	plain, plainCache := checkout("verifier-plain")
+	writeFixtureFile(t, filepath.Join(plain, "home", "go-build", "trim.txt"), "1759000000\n")
+	writeFixtureFile(t, filepath.Join(plain, "home", "go-build", "aa", "aa11-a"), "object\n")
+	writeFixtureFile(t, filepath.Join(plain, "home", "go", "pkg", "mod", "cache", "download", "sumdb"), "sum\n")
+	writeFixtureFile(t, filepath.Join(plain, ".build", "go", "pkg", "mod", "x"), "wasm cache\n")
+	recent, recentCache := checkout("verifier-recent")
+	stale, staleCache := checkout("verifier-recent-cache")
+	used, usedCache := checkout("verifier-used")
+	locked, lockedCache := checkout("verifier-locked")
+	cleanupGit(t, f.main, "worktree", "lock", locked)
+	tracked, trackedCache := checkout("verifier-tracked")
+	cleanupGit(t, tracked, "add", "-f", "node_modules/left-pad/index.js")
+	cleanupGit(t, tracked, "commit", "-q", "-m", "track a module")
+	cited, citedCache := checkout("verifier-cited")
+	writeFixtureFile(t, filepath.Join(f.artifacts(), trimItemAcc, "verifier-cited-logs", "receipt.json"), `{"module":"`+filepath.Join(cited, "node_modules", "left-pad", "index.js")+`"}`+"\n")
+	unmarked := f.verifierCheckout(t, trimItemAcc, "verifier-unmarked")
+	unmarkedCache := filepath.Join(unmarked, "node_modules")
+	nested, nestedCache := checkout("verifier-nested")
+	cleanupGit(t, nestedCache, "init", "-q", "left-pad")
+	// Every checkout is two days idle by the fixture's clock except these.
+	soon := f.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(worktreeAdminDir(recent), "HEAD"), soon, soon); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(staleCache, soon, soon); err != nil {
+		t.Fatal(err)
+	}
+	state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}, agents: []api.Agent{{ID: "agt_00000000000000c1", Name: "someone", Host: trimHost, Status: api.AgentRunning, Cwd: filepath.Join(used, "hub")}}}
+	before := fixtureTree(t, f.root)
+	dry := f.pass(t, state, false)
+	requireDecision(t, dry, plainCache, "would-trim", "")
+	if fixtureTree(t, f.root) != before {
+		t.Fatal("the dry run changed the fixture")
+	}
+	got := f.pass(t, state, true)
+	requireDecision(t, got, plainCache, "trimmed", "")
+	requireExists(t, plainCache, false)
+	// Nothing but node_modules goes, a Go cache under a home directory least of all.
+	for _, p := range []string{"home/go-build/trim.txt", "home/go-build/aa/aa11-a", "home/go/pkg/mod/cache/download/sumdb", ".build/go/pkg/mod/x", "dist/app.js", "app.txt"} {
+		requireExists(t, filepath.Join(plain, p), true)
+	}
+	// Retention is reported first for a verifier checkout and hides that it
+	// is recent, so the trim checks the idle rule itself.
+	requireDecision(t, got, recent, "kept", keepRetention)
+	requireDecision(t, got, used, "kept", keepInUse)
+	requireDecision(t, got, locked, "kept", keepLocked)
+	for _, cache := range []string{usedCache, lockedCache} {
+		if d, ok := got[cache]; ok {
+			t.Fatalf("a cache decision in an in-use or locked checkout: %+v", d)
+		}
+	}
+	for cache, want := range map[string][2]string{
+		recentCache:   {keepRecent, "Git state changed 1h0m0s ago"},
+		staleCache:    {keepRecent, "node_modules changed 1h0m0s ago"},
+		trackedCache:  {keepUnproven, "tracked files"},
+		citedCache:    {keepEvidence, "receipt.json"},
+		unmarkedCache: {keepUnproven, "no npm install marker"},
+		nestedCache:   {keepNested, "contains Git repository"},
+	} {
+		if d := requireDecision(t, got, cache, "kept", want[0]); d.Kind != kindCache || !strings.Contains(d.Detail, want[1]) {
+			t.Fatalf("%s: %+v, want detail with %q", cache, d, want[1])
+		}
+	}
+	for _, cache := range []string{recentCache, staleCache, usedCache, lockedCache, trackedCache, citedCache, unmarkedCache, nestedCache} {
+		requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+	}
+	requireNoTombstones(t, plain, stale, nested)
+}
+
+// sharedCaches is the fake home's shared caches, byte for byte.
+func (f trimFixture) sharedCaches(t *testing.T) string {
+	t.Helper()
+	return treeContents(t, f.home)
+}
+
+// t15 (a6): the never-touch proof. The sentinel shared caches are
+// byte-identical after an applying sweep in every case.
+func TestWorktreeCleanupCacheTrimNeverTouchesSharedCaches(t *testing.T) {
+	// trap is a shared cache laid out so that a followed link would find a
+	// node_modules to delete in it.
+	setup := func(t *testing.T) (trimFixture, string, string, sweepHubState, string) {
+		f := newTrimFixture(t)
+		checkout := f.verifierCheckout(t, trimItemAcc, "verifier-abc1234")
+		trap := filepath.Join(f.home, "go", "trap")
+		installModules(t, filepath.Join(trap, "verifier-abc1234"))
+		state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}
+		return f, checkout, trap, state, f.sharedCaches(t)
+	}
+	t.Run("node_modules is a symlink to a shared cache", func(t *testing.T) {
+		f, checkout, _, state, shared := setup(t)
+		cache := filepath.Join(checkout, "node_modules")
+		if err := os.RemoveAll(cache); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(f.home, ".npm"), cache); err != nil {
+			t.Fatal(err)
+		}
+		got := f.pass(t, state, true)
+		if d := requireDecision(t, got, cache, "kept", keepUnproven); !strings.Contains(d.Detail, "not a real directory") {
+			t.Fatalf("decision %+v", d)
+		}
+		if target, err := os.Readlink(cache); err != nil || target != filepath.Join(f.home, ".npm") {
+			t.Fatalf("the link was not left in place: %q %v", target, err)
+		}
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+	})
+	t.Run("a symlink inside node_modules points to a shared cache", func(t *testing.T) {
+		f, checkout, _, state, shared := setup(t)
+		cache := installModules(t, checkout)
+		for name, target := range map[string]string{"go-build": filepath.Join(f.home, "Library", "Caches", "go-build"), "mod": filepath.Join(f.home, "go", "pkg"), ".bin/npm-cache": filepath.Join(f.home, ".npm")} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(cache, name)), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(cache, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := f.pass(t, state, true)
+		requireDecision(t, got, cache, "trimmed", "")
+		requireExists(t, cache, false)
+		requireNoTombstones(t, checkout)
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+	})
+	swap := func(t *testing.T, replace func(f trimFixture, checkout, trap string)) {
+		f, checkout, trap, state, shared := setup(t)
+		cache := installModules(t, checkout)
+		moved := ""
+		trimBeforeDelete = func(path string) {
+			if path != cache {
+				t.Errorf("trim of %s", path)
+			}
+			replace(f, checkout, trap)
+			moved = "done"
+		}
+		t.Cleanup(func() { trimBeforeDelete = nil })
+		got := f.pass(t, state, true)
+		trimBeforeDelete = nil
+		if moved == "" {
+			t.Fatal("the swap never ran")
+		}
+		// The pinned directory was trimmed wherever it went; what took its
+		// place was not followed.
+		requireDecision(t, got, cache, "trimmed", "")
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+		requireExists(t, filepath.Join(checkout, "node_modules", "left-pad", "index.js"), true)
+	}
+	t.Run("the checkout is swapped for a symlink to a shared cache before the delete", func(t *testing.T) {
+		swap(t, func(f trimFixture, checkout, trap string) {
+			if err := os.Rename(checkout, checkout+".moved"); err != nil {
+				t.Error(err)
+			}
+			if err := os.Symlink(filepath.Join(trap, "verifier-abc1234"), checkout); err != nil {
+				t.Error(err)
+			}
+		})
+	})
+	t.Run("the checkout is swapped for another directory before the delete", func(t *testing.T) {
+		swap(t, func(f trimFixture, checkout, trap string) {
+			if err := os.Rename(checkout, checkout+".moved"); err != nil {
+				t.Error(err)
+			}
+			installModules(t, checkout)
+		})
+	})
+	t.Run("an ancestor is swapped for a symlink to a shared cache before the delete", func(t *testing.T) {
+		swap(t, func(f trimFixture, checkout, trap string) {
+			item := filepath.Dir(checkout)
+			if err := os.Rename(item, item+".moved"); err != nil {
+				t.Error(err)
+			}
+			if err := os.Symlink(trap, item); err != nil {
+				t.Error(err)
+			}
+		})
+	})
+	t.Run("a checkout swapped before it is pinned is kept", func(t *testing.T) {
+		for _, kind := range []string{"symlink", "directory"} {
+			f, checkout, trap, _, shared := setup(t)
+			installModules(t, checkout)
+			admin := worktreeAdminDir(checkout)
+			classified, err := os.Lstat(checkout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(checkout, checkout+".moved"); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "symlink" {
+				if err := os.Symlink(filepath.Join(trap, "verifier-abc1234"), checkout); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				installModules(t, checkout)
+				writeFixtureFile(t, filepath.Join(checkout, ".git"), "gitdir: "+admin+"\n")
+			}
+			reason, detail := trimCheckoutCache(worktreeCleanupInputs{Now: f.now}, gitWorktree{Path: checkout}, admin, classified, f.artifacts(), nil)
+			if reason != keepMoved || !strings.Contains(detail, "replaced") {
+				t.Fatalf("%s: %q %q", kind, reason, detail)
+			}
+			if f.sharedCaches(t) != shared {
+				t.Fatalf("%s: a shared cache changed", kind)
+			}
+			requireExists(t, filepath.Join(checkout, "node_modules", "left-pad", "index.js"), true)
+			requireExists(t, filepath.Join(checkout+".moved", "node_modules", "left-pad", "index.js"), true)
+			requireNoTombstones(t, checkout+".moved")
+		}
+	})
+	t.Run("a never-touch path inside the harness roots is kept", func(t *testing.T) {
+		f, checkout, _, state, shared := setup(t)
+		cache := installModules(t, checkout)
+		for name, value := range map[string]string{"GOMODCACHE": cache, "GOCACHE": filepath.Join(checkout, ".build", "go-build"), "GOPATH": f.root, "npm_config_cache": filepath.Join(cache, "left-pad")} {
+			t.Run(name, func(t *testing.T) {
+				t.Setenv(name, value)
+				for _, apply := range []bool{false, true} {
+					got := f.pass(t, state, apply)
+					if d := requireDecision(t, got, cache, "kept", keepProtected); !strings.Contains(d.Detail, "never-touch path "+value) {
+						t.Fatalf("decision %+v", d)
+					}
+				}
+				requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+			})
+		}
+		// The apply-time check stands on its own: the same file under another name.
+		alias := filepath.Join(f.root, "alias-cache")
+		if err := os.Symlink(cache, alias); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GOMODCACHE", alias)
+		classified, err := os.Lstat(checkout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reason, _ := trimCheckoutCache(worktreeCleanupInputs{Now: f.now}, gitWorktree{Path: checkout}, worktreeAdminDir(checkout), classified, f.artifacts(), nil); reason != keepProtected {
+			t.Fatalf("aliased never-touch path: %q", reason)
+		}
+		requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+	})
+}
+
+// t15 (a6, R1): what an interrupted pass left is finished only when the
+// recorded parent is provably the same directory; anything else deletes
+// nothing, and a tombstone with no intent is never deleted by name.
+func TestWorktreeCleanupTombstoneRecoveryFailsClosed(t *testing.T) {
+	setup := func(t *testing.T) (trimFixture, string, string, sweepHubState, string) {
+		f := newTrimFixture(t)
+		checkout := f.verifierCheckout(t, trimItemAcc, "verifier-abc1234")
+		installModules(t, checkout)
+		state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}
+		return f, checkout, filepath.Join(checkout, "node_modules"), state, f.sharedCaches(t)
+	}
+	crash := func(t *testing.T, f trimFixture, state sweepHubState, stage string) detachIntent {
+		t.Helper()
+		detachCrashAt = func(at string) bool { return at == stage }
+		t.Cleanup(func() { detachCrashAt = nil })
+		f.pass(t, state, true)
+		detachCrashAt = nil
+		intents, err := loadDetachIntents()
+		if err != nil || len(intents) != 1 || intents[0].Kind != kindCache || intents[0].Source != "node_modules" || !validTombstone(intents[0].Tombstone) {
+			t.Fatalf("intents after a crash at %s: %+v %v", stage, intents, err)
+		}
+		return intents[0]
+	}
+	recovered := func(t *testing.T, got map[string]worktreeDecision, cache string) worktreeDecision {
+		t.Helper()
+		d, ok := got[cache]
+		if !ok {
+			t.Fatalf("no decision for %s: %+v", cache, got)
+		}
+		return d
+	}
+	t.Run("crash after the intent and before the rename", func(t *testing.T) {
+		f, checkout, cache, state, shared := setup(t)
+		intent := crash(t, f, state, "intent")
+		requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+		requireExists(t, filepath.Join(checkout, intent.Tombstone), false)
+		// The next pass drops the intent, deleting nothing for it.
+		decisions := recoverDetachIntents(worktreeCleanupInputs{}, f.main, &artifactPass{root: f.artifacts()})
+		if len(decisions) != 1 || decisions[0].Action != "kept" || decisions[0].Path != cache || !strings.Contains(decisions[0].Detail, "was never detached") {
+			t.Fatalf("recovery %+v", decisions)
+		}
+		requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+		requireNoTombstones(t, checkout)
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+		// And a whole pass afterwards trims normally.
+		requireDecision(t, f.pass(t, state, true), cache, "trimmed", "")
+		requireExists(t, cache, false)
+	})
+	t.Run("crash after the rename and before the delete", func(t *testing.T) {
+		f, checkout, cache, state, shared := setup(t)
+		intent := crash(t, f, state, "renamed")
+		requireExists(t, cache, false)
+		requireExists(t, filepath.Join(checkout, intent.Tombstone, "left-pad", "index.js"), true)
+		if intent.Parent != checkout || intent.Root != f.artifacts() || intent.Inode == 0 {
+			t.Fatalf("intent %+v", intent)
+		}
+		// A stray tombstone with no intent is not the pass's to delete.
+		stray := filepath.Join(checkout, tombstonePrefix+"stray")
+		writeFixtureFile(t, filepath.Join(stray, "keep.txt"), "no intent names this\n")
+		got := f.pass(t, state, true)
+		d := recovered(t, got, cache)
+		if d.Action != "trimmed" || d.Kind != kindCache || !strings.Contains(d.Detail, "finished an interrupted sweep") {
+			t.Fatalf("recovery %+v", d)
+		}
+		requireExists(t, filepath.Join(checkout, intent.Tombstone), false)
+		requireExists(t, filepath.Join(stray, "keep.txt"), true)
+		if intents, _ := loadDetachIntents(); len(intents) != 0 {
+			t.Fatalf("intents left %+v", intents)
+		}
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+	})
+	replaced := func(t *testing.T, name, cause string, replace func(f trimFixture, checkout string, intent detachIntent)) {
+		t.Run(name, func(t *testing.T) {
+			f, checkout, cache, state, _ := setup(t)
+			// The trap holds a directory with the tombstone's own name.
+			intent := crash(t, f, state, "renamed")
+			trap := filepath.Join(f.home, "go", "trap")
+			writeFixtureFile(t, filepath.Join(trap, intent.Tombstone, "shared.txt"), "shared cache\n")
+			replace(f, checkout, intent)
+			shared := f.sharedCaches(t)
+			before := fixtureTree(t, f.root)
+			decisions := recoverDetachIntents(worktreeCleanupInputs{}, f.main, &artifactPass{root: f.artifacts()})
+			if len(decisions) != 1 || decisions[0].Action != "kept" || decisions[0].Path != cache || !strings.Contains(decisions[0].Detail, cause) || !strings.Contains(decisions[0].Detail, "nothing deleted") {
+				t.Fatalf("recovery %+v, want cause %q", decisions, cause)
+			}
+			if f.sharedCaches(t) != shared {
+				t.Fatal("a shared cache changed")
+			}
+			if fixtureTree(t, f.root) != before {
+				t.Fatal("recovery deleted something")
+			}
+			if intents, _ := loadDetachIntents(); len(intents) != 0 {
+				t.Fatalf("the intent was not dropped: %+v", intents)
+			}
+			// One kept decision: the next pass has nothing left to say about it.
+			if again := recoverDetachIntents(worktreeCleanupInputs{}, f.main, &artifactPass{root: f.artifacts()}); len(again) != 0 {
+				t.Fatalf("a second recovery decision: %+v", again)
+			}
+		})
+	}
+	replaced(t, "the parent is replaced by another directory", "not the directory the intent recorded", func(f trimFixture, checkout string, intent detachIntent) {
+		if err := os.Rename(checkout, checkout+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, filepath.Join(checkout, intent.Tombstone, "other.txt"), "another directory's own\n")
+	})
+	replaced(t, "the parent is replaced by a symlink to a shared cache", "not the directory the intent recorded", func(f trimFixture, checkout string, intent detachIntent) {
+		if err := os.Rename(checkout, checkout+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(f.home, "go", "trap"), checkout); err != nil {
+			t.Fatal(err)
+		}
+	})
+	replaced(t, "the tombstone is replaced by a symlink", "not a real directory", func(f trimFixture, checkout string, intent detachIntent) {
+		tombstone := filepath.Join(checkout, intent.Tombstone)
+		if err := os.Rename(tombstone, tombstone+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(f.home, "go", "trap", intent.Tombstone), tombstone); err != nil {
+			t.Fatal(err)
+		}
+	})
+	replaced(t, "the parent is gone", "cannot be opened", func(f trimFixture, checkout string, intent detachIntent) {
+		if err := os.Rename(checkout, checkout+".moved"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("an intent that is malformed or under another root deletes nothing", func(t *testing.T) {
+		f, checkout, _, state, shared := setup(t)
+		intent := crash(t, f, state, "renamed")
+		tombstone := filepath.Join(checkout, intent.Tombstone)
+		for name, change := range map[string]func(*detachIntent){
+			"a tombstone without the prefix": func(i *detachIntent) { i.Tombstone = "node_modules" },
+			"a tombstone with a path":        func(i *detachIntent) { i.Tombstone = tombstonePrefix + "x/../../app.txt" },
+			"a parent outside its root":      func(i *detachIntent) { i.Root = filepath.Join(f.artifacts(), "wi_ffffffffffffffff") },
+			"an unknown kind":                func(i *detachIntent) { i.Kind = "worktree" },
+			"a session temp kind in a tree":  func(i *detachIntent) { i.Kind = kindSessionTemp },
+		} {
+			bad := intent
+			change(&bad)
+			if cause, retry := finishDetach(bad); cause == "" || retry {
+				t.Fatalf("%s: finished (%q, %v)", name, cause, retry)
+			}
+			requireExists(t, filepath.Join(tombstone, "left-pad", "index.js"), true)
+		}
+		// A pass over other roots leaves the intent for the pass that owns it.
+		if decisions := recoverDetachIntents(worktreeCleanupInputs{}, filepath.Join(f.root, "another-repo"), nil); len(decisions) != 0 {
+			t.Fatalf("another repository's pass decided %+v", decisions)
+		}
+		if intents, _ := loadDetachIntents(); len(intents) != 1 {
+			t.Fatalf("intents %+v", intents)
+		}
+		if f.sharedCaches(t) != shared {
+			t.Fatal("a shared cache changed")
+		}
+	})
+	t.Run("nothing is renamed when the intent cannot be saved", func(t *testing.T) {
+		f, checkout, cache, state, _ := setup(t)
+		if err := os.MkdirAll(filepath.Join(sweepStatePath(), "blocked"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		got := f.pass(t, state, true)
+		if d := requireDecision(t, got, cache, "kept", keepFailed); !strings.Contains(d.Detail, "nothing renamed") {
+			t.Fatalf("decision %+v", d)
+		}
+		requireExists(t, filepath.Join(cache, "left-pad", "index.js"), true)
+		if left, _ := filepath.Glob(filepath.Join(checkout, tombstonePrefix+"*")); len(left) != 0 {
+			t.Fatalf("tombstones %v", left)
+		}
+	})
+}
+
+// The sweep removes a session temp folder through a tombstone in the pinned
+// temp root, read-only directories included, and finishes an interrupted one.
+func TestWorktreeCleanupSessionTempTombstone(t *testing.T) {
+	f := newTrimFixture(t)
+	cwd := f.queuePath("queue-a6a60001")
+	folder := filepath.Join(f.tempRoot(), claudeScratchKey(cwd))
+	fill := func() {
+		writeFixtureFile(t, filepath.Join(folder, "session", "scratchpad", "mod", "pkg", "file.go"), "package pkg\n")
+		if err := os.Chmod(filepath.Join(folder, "session", "scratchpad", "mod", "pkg"), 0555); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(folder, "session", "scratchpad", "mod"), 0555); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fill()
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(f.tempRoot()) })
+	stray := filepath.Join(f.tempRoot(), tombstonePrefix+"stray")
+	writeFixtureFile(t, filepath.Join(stray, "keep.txt"), "no intent names this\n")
+	released := releasedArtifactEntry(trimItemRel)
+	released.Host, released.Cwd = trimHost, cwd
+	state := sweepHubState{entries: []api.TeamQueueEntry{released}}
+	shared := f.sharedCaches(t)
+	if d := requireDecision(t, f.pass(t, state, true), folder, "removed", ""); d.Kind != kindSessionTemp || d.Bytes <= 0 {
+		t.Fatalf("decision %+v", d)
+	}
+	requireExists(t, folder, false)
+	requireExists(t, filepath.Join(stray, "keep.txt"), true)
+	if intents, _ := loadDetachIntents(); len(intents) != 0 {
+		t.Fatalf("intents %+v", intents)
+	}
+	// Interrupted after the rename: the next pass deletes the tombstone.
+	fill()
+	detachCrashAt = func(at string) bool { return at == "renamed" }
+	t.Cleanup(func() { detachCrashAt = nil })
+	f.pass(t, state, true)
+	detachCrashAt = nil
+	intents, _ := loadDetachIntents()
+	if len(intents) != 1 || intents[0].Kind != kindSessionTemp || intents[0].Parent != f.tempRoot() || intents[0].Root != f.tempRoot() {
+		t.Fatalf("intents %+v", intents)
+	}
+	tombstone := filepath.Join(f.tempRoot(), intents[0].Tombstone)
+	requireExists(t, folder, false)
+	requireExists(t, filepath.Join(tombstone, "session", "scratchpad", "mod", "pkg", "file.go"), true)
+	got := f.pass(t, state, true)
+	if d := requireDecision(t, got, folder, "removed", ""); d.Kind != kindSessionTemp || !strings.Contains(d.Detail, "finished an interrupted sweep") {
+		t.Fatalf("recovery %+v", d)
+	}
+	requireExists(t, tombstone, false)
+	requireExists(t, filepath.Join(stray, "keep.txt"), true)
+	if f.sharedCaches(t) != shared {
+		t.Fatal("a shared cache changed")
+	}
+	if intents, _ := loadDetachIntents(); len(intents) != 0 {
+		t.Fatalf("intents %+v", intents)
+	}
+}
+
+// t16: closeout steps aside quietly while a sweep holds the cleanup lock, and
+// still returns every other error.
+func TestWorktreeCleanupCloseoutSkipsQuietlyWhileASweepHoldsTheLock(t *testing.T) {
+	r := newCleanupRepo(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea16"
+	cwd := r.queuePath("queue-a1a60001")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", cwd, "tasks-hub")
+	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
+	finished := api.TeamQueueEntry{ID: "tqe_t16_finished", TaskID: task, ItemID: artifactItemA, State: "finished", Host: host, Cwd: cwd, Repository: r.common, Position: 1,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd, Commit: head, AcceptedAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)},
+		Release:    &api.ReleaseJob{State: "released"}}
+	hub := &cleanupHub{details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}}}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := api.TeamQueueList{Entries: []api.TeamQueueEntry{finished}}
+	closeout := func() (string, error) {
+		closeoutWorktreeChecks.Delete(finished.ID)
+		var stderr strings.Builder
+		restore := captureStderr(t, &stderr)
+		err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, list, finished)
+		restore()
+		return stderr.String(), err
+	}
+	lock, err := worktreeCleanupLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktreeCleanupLock(); !errors.Is(err, errWorktreeCleanupActive) || !strings.Contains(err.Error(), "worktree cleanup is active on this host") {
+		t.Fatalf("second lock: %v", err)
+	}
+	if said, err := closeout(); err != nil || said != "" {
+		t.Fatalf("closeout under a held lock: %v, said %q", err, said)
+	}
+	requireExists(t, cwd, true)
+	if receipts := readCleanupReceipts(t); len(receipts) != 0 {
+		t.Fatalf("receipts %+v", receipts)
+	}
+	unlockQueueLaunch(lock)
+	// Another error is still returned: here the project cannot be read.
+	hub.mu.Lock()
+	hub.details = map[string]api.TaskDetail{}
+	hub.mu.Unlock()
+	if _, err := closeout(); err == nil {
+		t.Fatal("a hub failure was swallowed")
+	}
+	requireExists(t, cwd, true)
+	hub.mu.Lock()
+	hub.details = map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}}
+	hub.mu.Unlock()
+	if said, err := closeout(); err != nil || !strings.Contains(said, "removed "+cwd) {
+		t.Fatalf("closeout with the lock free: %v, said %q", err, said)
+	}
+	requireExists(t, cwd, false)
 }

@@ -46,12 +46,19 @@ const (
 	// released nor accepted long enough.
 	keepItemActive = "item-active"
 	keepRetention  = "retention"
+	// Cache trim only: the directory is not provably a regenerable cache the
+	// harness may delete, or it touches a path on the never-touch list.
+	keepUnproven  = "unproven"
+	keepProtected = "protected"
 )
 
 // Decision and receipt kinds; an ordinary worktree has none.
 const (
 	kindArtifactCheckout = "artifact-checkout"
 	kindSessionTemp      = "session-temp"
+	// A regenerable cache inside a kept checkout; its actions are
+	// would-trim and trimmed.
+	kindCache = "cache"
 )
 
 // defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
@@ -84,8 +91,8 @@ type worktreeDecision struct {
 	Reason string `json:"reason"`
 	Detail string `json:"detail"`
 	Bytes  int64  `json:"bytes"`
-	// Kind is "artifact-checkout" or "session-temp"; an ordinary worktree
-	// has none.
+	// Kind is "artifact-checkout", "session-temp" or "cache"; an ordinary
+	// worktree has none.
 	Kind     string `json:"kind,omitempty"`
 	Manifest string `json:"manifest,omitempty"`
 	// recorded marks a decision whose receipt this call wrote.
@@ -134,6 +141,88 @@ type worktreeCleanupInputs struct {
 	// TempRoot is the Claude session temp root; "" skips session temp.
 	TempRoot string
 	TempCwds []sessionTempCwd
+	// Exclusive, when set, runs each removal's final re-check and its
+	// removal or detach while no matrix run can register: it calls act with
+	// the paths matrix runs hold at that moment. It returns a keep reason
+	// when it refuses, and then act has not run; with no reason, its second
+	// value is a note for the receipt, such as a removal that outran the
+	// hold limit. Nil runs the removal directly, as closeout does.
+	Exclusive func(act func(live []string)) (string, string)
+	// Trim turns on the cache trim for the finished checkouts it names
+	// (sweep only); nil trims nothing.
+	Trim *cacheTrimSet
+	// Tombstones makes an applying pass detach session temp folders by a
+	// rename before deleting them, and finish or drop what an interrupted
+	// pass left behind (sweep only).
+	Tombstones bool
+}
+
+// exclusive runs act under in.Exclusive, or directly without one. inUse is
+// the in-use rule for what act removes: a path a matrix run registered since
+// classification keeps it, and act does not run. It returns the keep reason
+// and its detail, or "" and the exclusion's note about a removal that ran.
+func (in worktreeCleanupInputs) exclusive(inUse func(p string) string, act func()) (string, string) {
+	if in.Exclusive == nil {
+		act()
+		return "", ""
+	}
+	reason, detail := "", ""
+	held, note := in.Exclusive(func(live []string) {
+		for _, p := range live {
+			if detail = inUse(p); detail != "" {
+				reason, detail = keepInUse, detail+", registered by a matrix run since classification"
+				return
+			}
+		}
+		if exclusiveAfterCheck != nil {
+			exclusiveAfterCheck()
+		}
+		act()
+	})
+	if held != "" {
+		return held, note
+	}
+	if reason != "" {
+		return reason, detail
+	}
+	return "", note
+}
+
+// worktreeInUseAt says how a path in use keeps the worktree at path, or "".
+func worktreeInUseAt(path, p string, linked []string) string {
+	// A path in use keeps the worktree holding it, and the worktrees
+	// nested in it when it is itself inside a linked worktree.
+	if pathWithin(p, path) || (pathWithin(path, p) && linkedRoot(p, linked) != "") {
+		return "in use at " + p
+	}
+	// Sessions key scratchpads by their start directory, which may be
+	// the worktree root above the path in use.
+	for _, cwd := range []string{p, linkedRoot(p, linked)} {
+		if cwd != "" && underClaudeScratch(path, cwd) {
+			return "in a scratchpad of a session in " + cwd
+		}
+	}
+	return ""
+}
+
+// sessionTempInUseAt says how a path in use keeps the session temp folder,
+// or "".
+func sessionTempInUseAt(folder, p string, linked []string) string {
+	key := filepath.Base(folder)
+	// The key is lossy: directories that differ only in punctuation share a
+	// folder, so an equal key counts as in use.
+	if claudeScratchKey(p) == key {
+		return "a session directory in use has this key: " + p
+	}
+	// Sessions key their folder by their start directory, which may be
+	// the worktree root above the path in use.
+	if root := linkedRoot(p, linked); root != "" && claudeScratchKey(root) == key {
+		return "a session started in " + root + " has a directory in use: " + p
+	}
+	if pathWithin(p, folder) {
+		return "in use at " + p
+	}
+	return ""
 }
 
 type worktreeCleanupReceipt struct {
@@ -148,8 +237,8 @@ type worktreeCleanupReceipt struct {
 	Action  string `json:"action"`
 	Reason  string `json:"reason,omitempty"`
 	Detail  string `json:"detail,omitempty"`
-	// Kind, Bytes and Manifest are set for artifact checkouts and session
-	// temp folders.
+	// Kind, Bytes and Manifest are set for artifact checkouts, session temp
+	// folders and caches.
 	Kind     string `json:"kind,omitempty"`
 	Bytes    int64  `json:"bytes,omitempty"`
 	Manifest string `json:"manifest,omitempty"`
@@ -186,6 +275,10 @@ var keptWorktreeReceipts sync.Map
 // closeoutWorktreeChecks remembers when closeout last examined each entry.
 var closeoutWorktreeChecks sync.Map
 
+// errWorktreeCleanupActive is the cleanup lock held by another closeout or
+// sweep on this host.
+var errWorktreeCleanupActive = errors.New("worktree cleanup is active on this host")
+
 func worktreeCleanupLock() (*os.File, error) {
 	if err := os.MkdirAll(relayDir(), 0700); err != nil {
 		return nil, err
@@ -196,7 +289,10 @@ func worktreeCleanupLock() (*os.File, error) {
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("worktree cleanup is active on this host: %w", err)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w: %w", errWorktreeCleanupActive, err)
+		}
+		return nil, fmt.Errorf("worktree cleanup lock: %w", err)
 	}
 	return file, nil
 }
@@ -782,20 +878,27 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 				d.Bytes = worktreeBytes(w.Path, linkedSet)
 			}
 			d.Action, d.Detail = "would-remove", detail
-			switch {
-			case !in.Apply:
-			case item != "":
-				// A verifier checkout leaves a manifest beside its receipts.
-				if reason, why, manifest, bytes := removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.items[item], in.Receipt, now); reason != "" {
+			if in.Apply {
+				var reason, why, manifest string
+				bytes := d.Bytes
+				held, heldWhy := in.exclusive(func(p string) string { return worktreeInUseAt(w.Path, p, linked) }, func() {
+					if item != "" {
+						// A verifier checkout leaves a manifest beside its receipts.
+						reason, why, manifest, bytes = removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.items[item], in.Receipt, now)
+						return
+					}
+					reason, why = removeWorktree(ctx, common, w, admin, cleared)
+				})
+				if held != "" {
+					reason, why = held, heldWhy
+				}
+				if reason != "" {
 					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
 				} else {
 					d.Action, d.Manifest, d.Bytes = "removed", manifest, bytes
-				}
-			default:
-				if reason, why := removeWorktree(ctx, common, w, admin, cleared); reason != "" {
-					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
-				} else {
-					d.Action = "removed"
+					if heldWhy != "" {
+						d.Detail = strings.TrimPrefix(d.Detail+"; "+heldWhy, "; ")
+					}
 				}
 			}
 		}
@@ -813,6 +916,10 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			}
 		}
 	}
+	if in.Apply && in.Tombstones {
+		decisions = append(decisions, recoverDetachIntents(in, main, art)...)
+	}
+	decisions = append(decisions, trimCaches(ctx, in, common, main, candidates, decisions, linked, art, now)...)
 	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, art, now)...)
 	if in.Apply {
 		for i := range decisions {
@@ -870,17 +977,8 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 		return keepFailed, "worktree has no readable .git link"
 	}
 	for _, p := range inUse {
-		// A path in use keeps the worktree holding it, and the worktrees
-		// nested in it when it is itself inside a linked worktree.
-		if pathWithin(p, w.Path) || (pathWithin(w.Path, p) && linkedRoot(p, linked) != "") {
-			return keepInUse, "in use at " + p
-		}
-		// Sessions key scratchpads by their start directory, which may be
-		// the worktree root above the path in use.
-		for _, cwd := range []string{p, linkedRoot(p, linked)} {
-			if cwd != "" && underClaudeScratch(w.Path, cwd) {
-				return keepInUse, "in a scratchpad of a session in " + cwd
-			}
+		if detail := worktreeInUseAt(w.Path, p, linked); detail != "" {
+			return keepInUse, detail
 		}
 	}
 	// A verifier checkout under the artifacts tree waits for its item: it
@@ -1695,23 +1793,12 @@ func sessionTempIdle(folder string, now time.Time) time.Duration {
 
 // classifySessionTemp returns the first keep reason for a temp folder, or "".
 func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) (string, string) {
-	key := filepath.Base(t.Folder)
-	// The key is lossy: directories that differ only in punctuation share a
-	// folder, so an equal key counts as in use.
 	for _, p := range append(append([]string(nil), inUse...), in.InUse...) {
 		if p == "" {
 			continue
 		}
-		if claudeScratchKey(p) == key {
-			return keepInUse, "a session directory in use has this key: " + p
-		}
-		// Sessions key their folder by their start directory, which may be
-		// the worktree root above the path in use.
-		if root := linkedRoot(p, linked); root != "" && claudeScratchKey(root) == key {
-			return keepInUse, "a session started in " + root + " has a directory in use: " + p
-		}
-		if pathWithin(p, t.Folder) {
-			return keepInUse, "in use at " + p
+		if detail := sessionTempInUseAt(t.Folder, p, linked); detail != "" {
+			return keepInUse, detail
 		}
 	}
 	if in.MinIdle > 0 {
@@ -1797,8 +1884,14 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 		}
 		d.Action, d.Detail, d.Bytes = "would-remove", "sessions started in "+t.Cwd, worktreeBytes(t.Folder, nil)
 		if in.Apply {
-			if err := removeSessionTemp(root, t.Folder); err != nil {
-				d.Action, d.Reason, d.Detail, d.Bytes = "kept", keepFailed, err.Error(), 0
+			reason, why := "", ""
+			if in.Tombstones {
+				reason, why = detachSessionTemp(in, root, t.Folder, linked)
+			} else if err := removeSessionTemp(root, t.Folder); err != nil {
+				reason, why = keepFailed, err.Error()
+			}
+			if reason != "" {
+				d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
 			} else {
 				d.Action = "removed"
 			}
@@ -1936,6 +2029,11 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		}
 	}
 	lock, err := worktreeCleanupLock()
+	if errors.Is(err, errWorktreeCleanupActive) {
+		// A sweep holds the host; this entry is looked at again after
+		// closeoutWorktreeInterval.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -2005,24 +2103,148 @@ type worktreeSweepReport struct {
 	Totals    worktreeSweepTotals `json:"totals"`
 }
 
+// sweepHubState is every queue entry and agent the hub knows: the sweep's
+// protection inputs, read before any worktree is touched.
+type sweepHubState struct {
+	entries []api.TeamQueueEntry
+	agents  []api.Agent
+}
+
+// readSweepHub reads every project's agents and every page of its queue.
+func readSweepHub(ctx context.Context, c *api.Client) (sweepHubState, error) {
+	var state sweepHubState
+	tasks, err := c.ListTasks(ctx)
+	if err != nil {
+		return state, fmt.Errorf("sweep needs the hub: %w", err)
+	}
+	for _, task := range tasks {
+		detail, err := c.GetTask(ctx, task.ID)
+		if err != nil {
+			return state, fmt.Errorf("sweep needs the hub: project %s: %w", task.ID, err)
+		}
+		state.agents = append(state.agents, detail.Agents...)
+		// The listing pages its history; an item's state needs every page.
+		for after, pages := int64(0), 0; ; pages++ {
+			queue, err := c.ListTeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Limit: api.MaxLimit, After: after})
+			if err != nil {
+				return state, fmt.Errorf("sweep needs the hub: project %s queue: %w", task.ID, err)
+			}
+			if after == 0 {
+				state.entries = append(state.entries, queue.Entries...)
+			} else {
+				// A later page repeats the active entries; keep its history.
+				for _, q := range queue.Entries {
+					if !activeQueueEntry(q) {
+						state.entries = append(state.entries, q)
+					}
+				}
+			}
+			if queue.History == nil || queue.History.NextAfter == 0 || queue.History.NextAfter == after {
+				break
+			}
+			if pages >= 1000 {
+				return state, fmt.Errorf("sweep needs the hub: project %s queue history does not end", task.ID)
+			}
+			after = queue.History.NextAfter
+		}
+	}
+	return state, nil
+}
+
+// sweepOptions is one sweep of one repository.
+type sweepOptions struct {
+	Repo  string
+	Apply bool
+	// MinIdle and AcceptedAfter are the cleanup inputs of the same name.
+	MinIdle       time.Duration
+	AcceptedAfter time.Duration
+	Artifacts     string
+	Now           time.Time
+	// Matrix is the host's validated matrix lock: its entries' paths are in
+	// use, and an applying sweep deletes under its mutex.
+	Matrix *matrixExclusion
+}
+
+// runWorktreeSweep is the one sweep pass, for the command and the schedule:
+// the same protection inputs, keep rules, receipts and cache trim. The caller
+// holds the cleanup lock when applying.
+func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o sweepOptions) ([]worktreeDecision, error) {
+	inUse, evidence := worktreeProtection(host, state.entries, state.agents)
+	// Session temp folders are named for the directories this host's teams
+	// worked in: their entries' worktrees and their item-bound agents' cwds.
+	var tempCwds []sessionTempCwd
+	for _, q := range state.entries {
+		if q.Host != host {
+			continue
+		}
+		paths := []string{q.Cwd}
+		if q.Acceptance != nil {
+			paths = append(paths, q.Acceptance.Worktree)
+		}
+		if q.Integration != nil {
+			paths = append(paths, q.Integration.Worktree)
+		}
+		for _, p := range paths {
+			if p != "" {
+				tempCwds = append(tempCwds, sessionTempCwd{Path: p, ItemID: q.ItemID})
+			}
+		}
+	}
+	for _, a := range state.agents {
+		if a.Host == host && a.WorkItem != nil && a.Cwd != "" {
+			tempCwds = append(tempCwds, sessionTempCwd{Path: a.Cwd, ItemID: a.WorkItem.ItemID})
+		}
+	}
+	in := worktreeCleanupInputs{
+		Repo: o.Repo, InUse: inUse, Evidence: evidence, MinIdle: o.MinIdle, Now: o.Now,
+		Apply: o.Apply, MeasureBytes: true, Receipt: worktreeCleanupReceipt{Source: "sweep"},
+		Items: artifactItemStates(state.entries, state.agents), Artifacts: o.Artifacts, AcceptedAfter: o.AcceptedAfter,
+		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
+		Trim: finishedTrimSet(host, state.entries, state.agents), Tombstones: o.Apply,
+	}
+	if o.Matrix != nil {
+		// A matrix run keeps the checkout, output and record folders it holds.
+		in.InUse = append(in.InUse, o.Matrix.paths()...)
+		if o.Apply {
+			in.Exclusive = o.Matrix.run
+		}
+	}
+	return cleanupWorktrees(ctx, in)
+}
+
+// sweepNow is the command's clock; tests replace it.
+var sweepNow = time.Now
+
+const sweepUsage = "usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL] | --journal [--limit 20] [--json]"
+
 // cmdTeamQueueSweepWorktrees applies the closeout rules to every existing
 // linked worktree of the repository, verifier checkouts under the artifacts
 // tree included, and to the session temp folders of this host's teams. It is
 // a dry run unless --apply is set, and reads the hub before touching anything.
+// With --journal it prints the scheduled sweep's journal instead, from the
+// local file only.
 func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	fs := flag.NewFlagSet("team queue sweep-worktrees", flag.ContinueOnError)
 	hub := fs.String("hub", e.hub, "hub URL")
 	cwd := fs.String("cwd", "", "any worktree of the repository (default: current directory)")
-	apply := fs.Bool("apply", false, "remove the would-remove worktrees and session temp folders and prune missing ones")
+	apply := fs.Bool("apply", false, "remove the would-remove worktrees and session temp folders, trim the would-trim caches and prune missing worktrees")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
 	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old")
 	artifacts := fs.String("artifacts", "", "artifacts root, an absolute path (default: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)")
+	journal := fs.Bool("journal", false, "print this host's scheduled sweep journal, newest last")
+	limit := fs.Int("limit", 20, "with --journal: how many lines to print")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *journal {
+		if fs.NArg() != 0 || *apply || *limit < 1 {
+			return errors.New(sweepUsage)
+		}
+		return printSweepJournal(*limit, *jsonOut)
+	}
 	if fs.NArg() != 0 || *hub == "" || *minIdle < 0 || *acceptedAfter < 0 {
-		return errors.New("usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]")
+		return errors.New(sweepUsage)
 	}
 	// A relative artifacts root would name no tree and turn the item rules
 	// off, so it is refused before anything is read. The flag overrides the
@@ -2049,69 +2271,14 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	defer cancel()
 	host := spawn.Host()
 	// Every protection input is read before any worktree is touched; a hub
-	// failure stops the sweep.
-	tasks, err := c.ListTasks(ctx)
+	// failure or an untrustworthy matrix lock file stops the sweep.
+	state, err := readSweepHub(ctx, c)
 	if err != nil {
-		return fmt.Errorf("sweep needs the hub: %w", err)
+		return err
 	}
-	var entries []api.TeamQueueEntry
-	var agents []api.Agent
-	for _, task := range tasks {
-		detail, err := c.GetTask(ctx, task.ID)
-		if err != nil {
-			return fmt.Errorf("sweep needs the hub: project %s: %w", task.ID, err)
-		}
-		agents = append(agents, detail.Agents...)
-		// The listing pages its history; an item's state needs every page.
-		for after, pages := int64(0), 0; ; pages++ {
-			queue, err := c.ListTeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Limit: api.MaxLimit, After: after})
-			if err != nil {
-				return fmt.Errorf("sweep needs the hub: project %s queue: %w", task.ID, err)
-			}
-			if after == 0 {
-				entries = append(entries, queue.Entries...)
-			} else {
-				// A later page repeats the active entries; keep its history.
-				for _, q := range queue.Entries {
-					if !activeQueueEntry(q) {
-						entries = append(entries, q)
-					}
-				}
-			}
-			if queue.History == nil || queue.History.NextAfter == 0 || queue.History.NextAfter == after {
-				break
-			}
-			if pages >= 1000 {
-				return fmt.Errorf("sweep needs the hub: project %s queue history does not end", task.ID)
-			}
-			after = queue.History.NextAfter
-		}
-	}
-	inUse, evidence := worktreeProtection(host, entries, agents)
-	// Session temp folders are named for the directories this host's teams
-	// worked in: their entries' worktrees and their item-bound agents' cwds.
-	var tempCwds []sessionTempCwd
-	for _, q := range entries {
-		if q.Host != host {
-			continue
-		}
-		paths := []string{q.Cwd}
-		if q.Acceptance != nil {
-			paths = append(paths, q.Acceptance.Worktree)
-		}
-		if q.Integration != nil {
-			paths = append(paths, q.Integration.Worktree)
-		}
-		for _, p := range paths {
-			if p != "" {
-				tempCwds = append(tempCwds, sessionTempCwd{Path: p, ItemID: q.ItemID})
-			}
-		}
-	}
-	for _, a := range agents {
-		if a.Host == host && a.WorkItem != nil && a.Cwd != "" {
-			tempCwds = append(tempCwds, sessionTempCwd{Path: a.Cwd, ItemID: a.WorkItem.ItemID})
-		}
+	matrix, why := loadMatrixExclusion()
+	if matrix == nil {
+		return fmt.Errorf("sweep cannot trust the matrix lock file (%s); nothing was examined", why)
 	}
 	if *apply {
 		lock, err := worktreeCleanupLock()
@@ -2120,12 +2287,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		}
 		defer unlockQueueLaunch(lock)
 	}
-	decisions, err := cleanupWorktrees(ctx, worktreeCleanupInputs{
-		Repo: repo, InUse: inUse, Evidence: evidence, MinIdle: *minIdle, Now: time.Now(),
-		Apply: *apply, MeasureBytes: true, Receipt: worktreeCleanupReceipt{Source: "sweep"},
-		Items: artifactItemStates(entries, agents), Artifacts: *artifacts, AcceptedAfter: acceptedAfterInput(*acceptedAfter),
-		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
-	})
+	decisions, err := runWorktreeSweep(ctx, state, host, sweepOptions{Repo: repo, Apply: *apply, MinIdle: *minIdle, AcceptedAfter: acceptedAfterInput(*acceptedAfter), Artifacts: *artifacts, Now: sweepNow(), Matrix: matrix})
 	if decisions == nil && err != nil {
 		return err
 	}
@@ -2156,7 +2318,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		switch d.Action {
 		case "kept":
 			fmt.Printf("kept %s %s: %s\n", d.Reason, d.Path, d.Detail)
-		case "removed", "would-remove":
+		case "removed", "would-remove", "trimmed", "would-trim":
 			if d.Kind != "" {
 				fmt.Printf("%s %s (%s; %s)\n", d.Action, d.Path, worktreeLabel(d), humanBytes(d.Bytes))
 				continue
@@ -2167,7 +2329,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		}
 	}
 	var parts []string
-	for _, action := range []string{"removed", "would-remove", "pruned", "would-prune", "kept"} {
+	for _, action := range []string{"removed", "would-remove", "trimmed", "would-trim", "pruned", "would-prune", "kept"} {
 		if n := report.Totals.Actions[action]; n > 0 {
 			parts = append(parts, fmt.Sprintf("%s=%d", action, n))
 		}
@@ -2179,7 +2341,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	sort.Strings(reasons)
 	fmt.Printf("totals: %s; kept by reason: %s; %s %s\n", strings.Join(parts, " "), strings.Join(reasons, " "), map[bool]string{true: "removed", false: "reclaimable"}[*apply], humanBytes(report.Totals.Bytes))
 	if !*apply {
-		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees and session temp folders")
+		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees and session temp folders and trim the would-trim caches")
 	}
 	return err
 }
@@ -2190,6 +2352,8 @@ func worktreeLabel(d worktreeDecision) string {
 		return "artifact checkout; " + d.Detail
 	case kindSessionTemp:
 		return "session temp"
+	case kindCache:
+		return "cache; " + d.Detail
 	}
 	label := "detached " + shortSHA(d.Head)
 	if d.Branch != "" {
@@ -2212,4 +2376,588 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// Cache trim and tombstones.
+//
+// The sweep trims one regenerable cache, node_modules, out of a checkout it
+// keeps, when the checkout belongs to a finished item. A trim, and the sweep's
+// removal of a session temp folder, never deletes by pathname: the parent
+// directory is opened as a pinned root, the entry is renamed to a tombstone
+// beside it, and the tombstone is deleted through that root. The intent is
+// saved before the rename, so a pass that died in between is finished or
+// dropped by the next one, and nothing is ever deleted by name alone.
+
+// tombstonePrefix starts every tombstone name; the rest is random.
+const tombstonePrefix = ".tt-sweep-trash-"
+
+// trimCacheName is the whole trim allowlist, and trimCacheMarker is the file
+// npm writes inside it on every install.
+const (
+	trimCacheName   = "node_modules"
+	trimCacheMarker = ".package-lock.json"
+)
+
+// trimKeptReasons are the keep reasons under which a checkout may still be
+// trimmed; the lock, operation and idle rules are checked again directly,
+// since the first reason reported can hide a later one.
+var trimKeptReasons = map[string]bool{keepRetention: true, keepEvidence: true, keepDirty: true, keepUnpushed: true, keepNested: true}
+
+// Test seams. trimBeforeDelete runs after every check and immediately before
+// the rename; detachCrashAt returning true abandons the detach at that stage
+// ("intent" or "renamed"), as a crash would.
+var (
+	trimBeforeDelete func(path string)
+	detachCrashAt    func(stage string) bool
+)
+
+// cacheTrimSet names what may be trimmed: the finished items, and this
+// host's recorded checkouts of those items by canonical path.
+type cacheTrimSet struct {
+	Items map[string]bool
+	Paths map[string]string
+}
+
+// finishedTrimSet derives the trim set from every queue entry and agent, on
+// any host. An item is finished when its newest entry by position, of any
+// state, is finished and accepted or released, none of its entries is active
+// and no agent bound to it is other than closed. It does not change
+// artifactItemStates or any keep rule.
+func finishedTrimSet(host string, entries []api.TeamQueueEntry, agents []api.Agent) *cacheTrimSet {
+	type newest struct {
+		position int64
+		ok       bool
+	}
+	state := map[string]*newest{}
+	vetoed := map[string]bool{}
+	for _, q := range entries {
+		if q.ItemID == "" {
+			continue
+		}
+		if activeQueueEntry(q) {
+			vetoed[q.ItemID] = true
+		}
+		ok := q.State == "finished" && (releasedQueueEntry(q) || q.Acceptance != nil)
+		switch cur := state[q.ItemID]; {
+		case cur == nil || q.Position > cur.position:
+			state[q.ItemID] = &newest{position: q.Position, ok: ok}
+		case q.Position == cur.position:
+			cur.ok = cur.ok && ok
+		}
+	}
+	for _, a := range agents {
+		if a.WorkItem != nil && a.WorkItem.ItemID != "" && a.Status != api.AgentClosed {
+			vetoed[a.WorkItem.ItemID] = true
+		}
+	}
+	set := &cacheTrimSet{Items: map[string]bool{}, Paths: map[string]string{}}
+	for item, n := range state {
+		if n.ok && !vetoed[item] {
+			set.Items[item] = true
+		}
+	}
+	for _, q := range entries {
+		if q.Host != host || q.State != "finished" || q.Acceptance == nil || !set.Items[q.ItemID] {
+			continue
+		}
+		paths := []string{q.Cwd, q.Acceptance.Worktree}
+		if q.Integration != nil {
+			paths = append(paths, q.Integration.Worktree)
+		}
+		for _, p := range paths {
+			if p != "" && filepath.IsAbs(p) {
+				set.Paths[canonicalPath(p)] = q.ItemID
+			}
+		}
+	}
+	return set
+}
+
+// neverTouchPaths are the shared user caches no cleanup may delete, lie in or
+// contain: the standing owner rule is that they are never cleared.
+func neverTouchPaths() []string {
+	var out []string
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+		out = append(out, filepath.Join(home, "Library", "Caches"), filepath.Join(home, "go"), filepath.Join(home, ".npm"))
+	}
+	for _, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "npm_config_cache"} {
+		for _, p := range filepath.SplitList(os.Getenv(name)) {
+			if filepath.IsAbs(p) {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// neverTouch names the never-touch path that path lies in or contains, or
+// that is the same file as one of infos; "" when there is none.
+func neverTouch(path string, infos ...os.FileInfo) string {
+	path = canonicalPath(path)
+	for _, deny := range neverTouchPaths() {
+		real := canonicalPath(deny)
+		if pathWithin(path, real) || pathWithin(real, path) {
+			return deny
+		}
+		st, err := os.Stat(deny)
+		if err != nil {
+			continue
+		}
+		for _, info := range infos {
+			if info != nil && os.SameFile(st, info) {
+				return deny
+			}
+		}
+	}
+	return ""
+}
+
+// trimCaches decides the cache of each kept, finished checkout and, when
+// applying, trims it. candidates and decisions are the worktree pass's, in
+// the same order. A checkout with no cache, or one that is not attributable
+// to a finished item, gets no decision.
+func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main string, candidates []gitWorktree, decisions []worktreeDecision, linked []string, art *artifactPass, now time.Time) []worktreeDecision {
+	if in.Trim == nil {
+		return nil
+	}
+	var roots []string
+	if main != "" {
+		roots = append(roots, filepath.Join(main, ".build", "worktrees"))
+	}
+	if art != nil {
+		roots = append(roots, art.root)
+	}
+	var out []worktreeDecision
+	for i, w := range candidates {
+		if i >= len(decisions) || decisions[i].Path != w.Path || decisions[i].Action != "kept" || !trimKeptReasons[decisions[i].Reason] {
+			continue
+		}
+		item := art.checkoutItem(w)
+		if item != "" {
+			if !in.Trim.Items[item] {
+				continue
+			}
+		} else if item = in.Trim.Paths[w.Path]; item == "" {
+			continue
+		}
+		allowed := ""
+		for _, root := range roots {
+			if w.Path != root && pathWithin(w.Path, root) {
+				allowed = root
+			}
+		}
+		cache := filepath.Join(w.Path, trimCacheName)
+		cacheInfo, err := os.Lstat(cache)
+		if allowed == "" || err != nil {
+			continue
+		}
+		d := worktreeDecision{Path: cache, Branch: strings.TrimPrefix(w.Branch, "refs/heads/"), Head: w.Head, Kind: kindCache}
+		admin := worktreeAdminDir(w.Path)
+		checkout, reason, detail := classifyCache(ctx, in, common, main, w, admin, item, cacheInfo, art, now)
+		switch {
+		case reason != "":
+			d.Action, d.Reason, d.Detail = "kept", reason, detail
+		default:
+			if in.MeasureBytes {
+				d.Bytes = worktreeBytes(cache, nil)
+			}
+			d.Action, d.Detail = "would-trim", "regenerable cache in a finished checkout of "+item
+			if in.Apply {
+				if reason, detail := trimCheckoutCache(in, w, admin, checkout, allowed, linked); reason != "" {
+					d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, detail, 0
+				} else {
+					d.Action = "trimmed"
+				}
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// classifyCache returns the checkout's identity and the first reason its
+// cache is kept, or "" when the cache may be trimmed.
+func classifyCache(ctx context.Context, in worktreeCleanupInputs, common, main string, w gitWorktree, admin, item string, cacheInfo os.FileInfo, art *artifactPass, now time.Time) (os.FileInfo, string, string) {
+	cache := filepath.Join(w.Path, trimCacheName)
+	checkout, err := os.Lstat(w.Path)
+	if err != nil || !checkout.IsDir() {
+		return nil, keepMoved, "the checkout is not a real directory"
+	}
+	if !cacheInfo.IsDir() {
+		return nil, keepUnproven, trimCacheName + " is not a real directory; left in place"
+	}
+	if admin == "" {
+		return nil, keepFailed, "worktree has no readable .git link"
+	}
+	if _, err := os.Lstat(filepath.Join(admin, "locked")); w.Locked || err == nil {
+		return nil, keepLocked, "git worktree is locked"
+	}
+	if op := worktreeOperation(admin); op != "" {
+		return nil, keepOperation, op + " in progress"
+	}
+	if in.MinIdle > 0 {
+		if idle := worktreeIdle(admin, now); idle < in.MinIdle {
+			return nil, keepRecent, fmt.Sprintf("Git state changed %s ago", idle.Round(time.Minute))
+		}
+		if age := now.Sub(cacheInfo.ModTime()); age < in.MinIdle {
+			return nil, keepRecent, fmt.Sprintf("%s changed %s ago", trimCacheName, age.Round(time.Minute))
+		}
+	}
+	if marker, err := os.Lstat(filepath.Join(cache, trimCacheMarker)); err != nil || !marker.Mode().IsRegular() {
+		return nil, keepUnproven, "no npm install marker " + filepath.Join(trimCacheName, trimCacheMarker)
+	}
+	tracked, err := worktreeGit(ctx, w.Path, "ls-files", "-z", "--", trimCacheName)
+	if err != nil {
+		return nil, keepFailed, err.Error()
+	}
+	if tracked != "" {
+		return nil, keepUnproven, trimCacheName + " holds tracked files"
+	}
+	if _, err := worktreeGit(ctx, w.Path, "check-ignore", "-q", trimCacheName); err != nil {
+		if gitExitCode(err) == 1 {
+			return nil, keepUnproven, trimCacheName + " is not ignored by Git"
+		}
+		return nil, keepFailed, err.Error()
+	}
+	nested, err := nestedRepository(cache, nil)
+	if err != nil {
+		return nil, keepFailed, "scan for nested repositories: " + err.Error()
+	}
+	if nested != "" {
+		return nil, keepNested, "contains Git repository " + nested
+	}
+	docs, err := docsCitations(ctx, common, main, []string{cache}, nil)
+	if err != nil {
+		return nil, keepFailed, "evidence lookup: " + err.Error()
+	}
+	if file := docs[cache]; file != "" {
+		return nil, keepEvidence, "cited by " + file
+	}
+	evidence := append([]worktreeEvidence(nil), in.Evidence...)
+	texts, fault := art.itemTexts(item)
+	if fault != "" {
+		return nil, keepFailed, "receipt scan: " + fault
+	}
+	for _, ev := range append(evidence, texts...) {
+		for _, pattern := range worktreeEvidencePatterns(cache, main) {
+			if strings.Contains(ev.Text, pattern) {
+				return nil, keepEvidence, "cited by " + ev.Source
+			}
+		}
+	}
+	for _, target := range []struct {
+		path string
+		info os.FileInfo
+	}{{w.Path, checkout}, {cache, cacheInfo}} {
+		if deny := neverTouch(target.path, target.info); deny != "" {
+			return nil, keepProtected, target.path + " touches the never-touch path " + deny
+		}
+	}
+	return checkout, "", ""
+}
+
+// trimCheckoutCache is the only route to a trim. It pins the checkout as a
+// root, proves the pinned directory is the one that was classified, and from
+// then on resolves no pathname again: the rename and the delete are confined
+// to that root, so a checkout or ancestor swapped meanwhile is never followed.
+func trimCheckoutCache(in worktreeCleanupInputs, w gitWorktree, admin string, checkout os.FileInfo, allowed string, linked []string) (string, string) {
+	root, err := os.OpenRoot(w.Path)
+	if err != nil {
+		return keepMoved, "the checkout cannot be opened: " + err.Error()
+	}
+	defer root.Close()
+	pinned, err := root.Stat(".")
+	if err != nil || !os.SameFile(checkout, pinned) {
+		return keepMoved, "the checkout was replaced since it was classified"
+	}
+	link, err := root.ReadFile(".git")
+	dir, ok := strings.CutPrefix(strings.TrimSpace(string(link)), "gitdir: ")
+	if err != nil || !ok || filepath.Clean(dir) != admin {
+		return keepMoved, "the checkout's .git link no longer names " + admin
+	}
+	check := func() (os.FileInfo, string, string) {
+		cache, err := root.Lstat(trimCacheName)
+		if err != nil || !cache.IsDir() {
+			return nil, keepUnproven, trimCacheName + " is not a real directory; left in place"
+		}
+		if marker, err := root.Lstat(filepath.Join(trimCacheName, trimCacheMarker)); err != nil || !marker.Mode().IsRegular() {
+			return nil, keepUnproven, "no npm install marker " + filepath.Join(trimCacheName, trimCacheMarker)
+		}
+		return cache, "", ""
+	}
+	cache, reason, detail := check()
+	if reason != "" {
+		return reason, detail
+	}
+	for _, target := range []struct {
+		path string
+		info os.FileInfo
+	}{{w.Path, pinned}, {filepath.Join(w.Path, trimCacheName), cache}} {
+		if deny := neverTouch(target.path, target.info); deny != "" {
+			return keepProtected, target.path + " touches the never-touch path " + deny
+		}
+	}
+	inUse := func(p string) string { return worktreeInUseAt(w.Path, p, linked) }
+	return detachAndDelete(in, root, pinned, w.Path, allowed, trimCacheName, kindCache, inUse, func() (string, string) {
+		if _, err := os.Lstat(filepath.Join(admin, "locked")); err == nil {
+			return keepLocked, "locked since classification"
+		}
+		if op := worktreeOperation(admin); op != "" {
+			return keepOperation, op + " in progress"
+		}
+		_, reason, detail := check()
+		return reason, detail
+	})
+}
+
+// detachIntent is what a pass saves before it renames name to a tombstone in
+// a pinned parent: enough for a later pass to prove it is deleting the same
+// tombstone in the same directory, and nothing else.
+type detachIntent struct {
+	At string `json:"at"`
+	// Kind is the decision kind: cache or session-temp.
+	Kind string `json:"kind"`
+	// Parent is the pinned directory's canonical path and Root the worktrees,
+	// artifacts or session temp root it was recorded under.
+	Parent string `json:"parent"`
+	Root   string `json:"root"`
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+	Source string `json:"source"`
+	// Tombstone is the generated name: the reserved prefix and a random
+	// suffix.
+	Tombstone string `json:"tombstone"`
+}
+
+// directoryIdentity is the device and inode of an opened or stat'ed file.
+func directoryIdentity(info os.FileInfo) (uint64, uint64, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return uint64(st.Dev), uint64(st.Ino), true
+}
+
+func validTombstone(name string) bool {
+	suffix, ok := strings.CutPrefix(name, tombstonePrefix)
+	return ok && suffix != "" && !strings.ContainsAny(name, "/\\")
+}
+
+// rootMakeWritable adds owner rwx to the directories under name that lack
+// it, through the root, so a read-only module cache in a session temp folder
+// can be deleted. It never leaves the root.
+func rootMakeWritable(root *os.Root, name string) {
+	_ = fs.WalkDir(root.FS(), name, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.Mode().Perm()&0700 != 0700 {
+			_ = root.Chmod(p, info.Mode().Perm()|0700)
+		}
+		return nil
+	})
+}
+
+// detachAndDelete removes name from the pinned parent: it saves the intent,
+// re-checks and renames name to a tombstone under the exclusion, then deletes
+// the tombstone through the root and clears the intent. Nothing is renamed
+// when the intent cannot be saved. It returns a keep reason, or "".
+func detachAndDelete(in worktreeCleanupInputs, root *os.Root, parent os.FileInfo, parentPath, allowed, name, kind string, inUse func(p string) string, recheck func() (string, string)) (string, string) {
+	device, inode, ok := directoryIdentity(parent)
+	if !ok {
+		return keepFailed, "the directory's identity cannot be read"
+	}
+	suffix, err := randomHex(8)
+	if err != nil {
+		return keepFailed, err.Error()
+	}
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	intent := detachIntent{At: now.UTC().Format(time.RFC3339Nano), Kind: kind, Parent: parentPath, Root: allowed, Device: device, Inode: inode, Source: name, Tombstone: tombstonePrefix + suffix}
+	if err := saveDetachIntent(intent); err != nil {
+		return keepFailed, "intent not saved, nothing renamed: " + err.Error()
+	}
+	if detachCrashAt != nil && detachCrashAt("intent") {
+		return keepFailed, "interrupted after the intent"
+	}
+	var reason, why string
+	held, heldWhy := in.exclusive(inUse, func() {
+		if reason, why = recheck(); reason != "" {
+			return
+		}
+		if trimBeforeDelete != nil {
+			trimBeforeDelete(filepath.Join(parentPath, name))
+		}
+		if err := root.Rename(name, intent.Tombstone); err != nil {
+			reason, why = keepFailed, err.Error()
+		}
+	})
+	if held != "" {
+		reason, why = held, heldWhy
+	}
+	if reason != "" {
+		if err := clearDetachIntent(intent.Tombstone); err != nil {
+			why += "; intent not cleared: " + err.Error()
+		}
+		return reason, why
+	}
+	if detachCrashAt != nil && detachCrashAt("renamed") {
+		return keepFailed, "interrupted after the rename"
+	}
+	if kind == kindSessionTemp {
+		rootMakeWritable(root, intent.Tombstone)
+	}
+	if err := root.RemoveAll(intent.Tombstone); err != nil {
+		// The intent stays, so the next pass finishes the delete.
+		return keepFailed, "detached as " + intent.Tombstone + " but not deleted: " + err.Error()
+	}
+	if err := clearDetachIntent(intent.Tombstone); err != nil {
+		return keepFailed, "deleted, but the intent was not cleared: " + err.Error()
+	}
+	return "", ""
+}
+
+// detachSessionTemp is the sweep's removal of one folder directly under the
+// temp root: the checks of removeSessionTemp, then a detach through the
+// pinned root.
+func detachSessionTemp(in worktreeCleanupInputs, root, folder string, linked []string) (string, string) {
+	info, err := os.Lstat(folder)
+	if err != nil {
+		return keepFailed, err.Error()
+	}
+	real, err := filepath.EvalSymlinks(folder)
+	if err != nil {
+		return keepFailed, err.Error()
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || !info.IsDir() || real != folder || filepath.Dir(folder) != root || folder == root {
+		return keepFailed, "not a directory directly under " + root
+	}
+	pinnedRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return keepFailed, err.Error()
+	}
+	defer pinnedRoot.Close()
+	pinned, err := pinnedRoot.Stat(".")
+	if err != nil || !os.SameFile(rootInfo, pinned) {
+		return keepMoved, "the temp root was replaced"
+	}
+	name := filepath.Base(folder)
+	check := func() (os.FileInfo, string, string) {
+		entry, err := pinnedRoot.Lstat(name)
+		if err != nil || !entry.IsDir() {
+			return nil, keepMoved, "not a real directory directly under " + root
+		}
+		return entry, "", ""
+	}
+	entry, reason, detail := check()
+	if reason != "" {
+		return reason, detail
+	}
+	if deny := neverTouch(folder, pinned, entry); deny != "" {
+		return keepProtected, folder + " touches the never-touch path " + deny
+	}
+	inUse := func(p string) string { return sessionTempInUseAt(folder, p, linked) }
+	return detachAndDelete(in, pinnedRoot, pinned, root, root, name, kindSessionTemp, inUse, func() (string, string) {
+		_, reason, detail := check()
+		return reason, detail
+	})
+}
+
+// recoverDetachIntents settles what an interrupted pass left under this
+// pass's roots. A tombstone is deleted only when the recorded parent is still
+// the same directory under the root it was recorded under, and the tombstone
+// is a real directory with the reserved prefix; anything else deletes
+// nothing, drops the intent and is recorded as kept with the cause.
+func recoverDetachIntents(in worktreeCleanupInputs, main string, art *artifactPass) []worktreeDecision {
+	roots := map[string]bool{}
+	if main != "" {
+		roots[filepath.Join(main, ".build", "worktrees")] = true
+	}
+	if art != nil {
+		roots[art.root] = true
+	}
+	if in.TempRoot != "" {
+		roots[canonicalPath(in.TempRoot)] = true
+	}
+	intents, err := loadDetachIntents()
+	if err != nil {
+		return nil
+	}
+	var out []worktreeDecision
+	for _, intent := range intents {
+		if !roots[intent.Root] {
+			continue
+		}
+		d := worktreeDecision{Path: filepath.Join(intent.Parent, intent.Source), Kind: intent.Kind}
+		cause, retry := finishDetach(intent)
+		switch {
+		case cause == "":
+			d.Action, d.Detail = "removed", "finished an interrupted sweep: deleted "+intent.Tombstone
+			if intent.Kind == kindCache {
+				d.Action = "trimmed"
+			}
+		case retry:
+			d.Action, d.Reason, d.Detail = "kept", keepFailed, cause
+		default:
+			d.Action, d.Reason, d.Detail = "kept", keepMoved, "interrupted sweep left "+intent.Tombstone+"; nothing deleted: "+cause
+		}
+		if !retry {
+			if err := clearDetachIntent(intent.Tombstone); err != nil {
+				d.Detail += "; intent not cleared: " + err.Error()
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// finishDetach deletes the intent's tombstone when every check holds. It
+// returns the cause when it deleted nothing, and whether the intent should be
+// kept for another try (the delete itself failed).
+func finishDetach(intent detachIntent) (string, bool) {
+	if !validTombstone(intent.Tombstone) || intent.Source == "" || strings.ContainsAny(intent.Source, "/\\") || !filepath.IsAbs(intent.Parent) || !filepath.IsAbs(intent.Root) {
+		return "the intent is malformed", false
+	}
+	if intent.Kind != kindCache && intent.Kind != kindSessionTemp {
+		return "the intent has an unknown kind", false
+	}
+	root, err := os.OpenRoot(intent.Parent)
+	if err != nil {
+		return "the parent directory cannot be opened: " + err.Error(), false
+	}
+	defer root.Close()
+	pinned, err := root.Stat(".")
+	if err != nil {
+		return "the parent directory cannot be read: " + err.Error(), false
+	}
+	if device, inode, ok := directoryIdentity(pinned); !ok || device != intent.Device || inode != intent.Inode {
+		return "the parent is not the directory the intent recorded", false
+	}
+	parent := canonicalPath(intent.Parent)
+	if parent != intent.Parent || !pathWithin(parent, intent.Root) || (parent == intent.Root) != (intent.Kind == kindSessionTemp) {
+		return "the parent no longer lies under " + intent.Root, false
+	}
+	tombstone, err := root.Lstat(intent.Tombstone)
+	if err != nil {
+		if _, sourceErr := root.Lstat(intent.Source); sourceErr == nil {
+			return intent.Source + " was never detached", false
+		}
+		return "the tombstone is gone", false
+	}
+	if !tombstone.IsDir() {
+		return "the tombstone is not a real directory", false
+	}
+	if deny := neverTouch(filepath.Join(parent, intent.Tombstone), pinned, tombstone); deny != "" {
+		return "it touches the never-touch path " + deny, false
+	}
+	if intent.Kind == kindSessionTemp {
+		rootMakeWritable(root, intent.Tombstone)
+	}
+	if err := root.RemoveAll(intent.Tombstone); err != nil {
+		return "detached as " + intent.Tombstone + " but not deleted: " + err.Error(), true
+	}
+	return "", false
 }

@@ -295,8 +295,8 @@ or release the source.
 
 A finished team's Git worktrees, and the caches inside them such as the Go
 module cache under `.build/go`, are removed on the launch host once the
-accepted work is safe elsewhere. Team closeout and the one-time sweep use the
-same rules. A worktree is removed only when no keep reason applies; the first
+accepted work is safe elsewhere. Team closeout and the sweep, run by hand or
+by the relay on a schedule, use the same rules. A worktree is removed only when no keep reason applies; the first
 matching reason is reported:
 
 - `locked`: `git worktree lock` is set.
@@ -340,7 +340,8 @@ A change found by the re-check keeps the worktree with that reason (or
 `moved` for a new HEAD). A failed removal is kept as `remove-failed` and the
 directory permissions are restored. Branches are never deleted: an accepted
 branch and commit still resolve after their worktree is gone. Closeout and sweep share a host lock in
-the relay state directory.
+the relay state directory. While a sweep holds it, closeout skips its look
+without a message and returns to the entry within 15 minutes.
 
 **Closeout timing.** On each tick the runner looks at the project's finished
 entries on its host that have a saved acceptance. If none of the entry's cwd,
@@ -360,19 +361,24 @@ failed entries and anything left over go to the sweep.
 `worktree-cleanup.jsonl` in the relay state directory
 (`~/.local/state/tailterm/relay`, or `TAILTERM_RELAY_STATE`):
 `{at, source, taskId, entryId, itemId, path, branch, head, action, reason,
-detail}` with `source` `closeout` or `sweep` and `action` `removed`, `kept` or
-`pruned`. A kept outcome is written once per path, reason and HEAD per process,
+detail}` with `source` `closeout` or `sweep` (also for a scheduled run) and
+`action` `removed`, `trimmed`, `kept` or `pruned`. A kept outcome is written once per path, reason and HEAD per process,
 and closeout also logs new outcomes to the relay's stderr as
 `[tt relay] worktree cleanup <entry>: ...`.
 
-**One-time sweep.** For worktrees that predate closeout cleanup:
+**Sweep.** For worktrees closeout does not reach:
 
 ```sh
 tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]
+tt team queue sweep-worktrees --journal [--limit 20] [--json]
 ```
 
-- `--apply` removes the `would-remove` worktrees and session temp folders and
-  prunes missing ones; without it the sweep is a dry run.
+- `--apply` removes the `would-remove` worktrees and session temp folders,
+  trims the `would-trim` caches and prunes missing worktrees; without it the
+  sweep is a dry run.
+- `--journal` prints the scheduled sweep's journal instead (see "Scheduled
+  sweep"). It reads only this host's file, and cannot be combined with
+  `--apply`.
 - `--json` prints the result as JSON instead of lines.
 - `--min-idle` (default 24h) keeps worktrees whose Git state changed more
   recently, and session temp folders changed more recently.
@@ -400,6 +406,100 @@ and `pruned` lines with totals. `--json` prints
 `{"worktrees":[{"path","branch","head","action","reason","detail","bytes"}],
 "totals":{"actions":{},"kept":{},"bytes":0}}`. Review the dry run's kept and
 would-remove lists, especially `.build/releases/*`, before applying.
+
+The sweep also honours the host's verification matrix lock
+(`~/.local/state/tailterm-matrix/host.json`, or `TAILTERM_MATRIX_HOST_LOCK`).
+The worktree, output folder and record folder of every run that holds or waits
+for the host are in use, so a tree holding one is kept `in-use`. A lock file
+that cannot be read, is not JSON, fails the structural check the matrix script
+itself applies, lacks an absolute `worktree` on an entry, or was written by
+another host stops the sweep before it examines anything. When applying, each
+removal makes its final check and deletes while holding the lock's own mutex
+(`host.json.lock`), so a matrix run cannot register on a path between the
+check and the removal:
+
+- If the mutex stays busy for 2 seconds the path is kept `in-use` ("matrix
+  lock busy"). The sweep never reclaims a mutex and never writes `host.json`.
+- A path a run registered since classification is kept `in-use`. A lock file
+  that turns unusable keeps the path and ends the pass.
+- No hold reaches 20 seconds: a matrix run that cannot update the lock file
+  for 30 seconds aborts itself. A cache or session temp folder is only renamed
+  under the mutex, which takes milliseconds. A whole worktree removal that is
+  still running after 18 seconds releases the mutex and finishes outside it;
+  its receipt detail says it outran the hold limit.
+- The sweep waits 250 ms between holds so a waiting matrix process gets in.
+
+**Scheduled sweep.** On every host, the relay runs the same pass with apply
+for each repository that the host's queue entries name, with the same keep
+rules, receipts and cache trim as the command. It is not run by `tt relay
+--once` or `--status`. Settings are in `~/.config/tailterm/relay.json`, read
+at each check, so a change needs no relay restart:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `worktreeSweep` | `"on"` | `"off"` is the owner's switch: nothing is swept. |
+| `worktreeSweepInterval` | `"1h"` | Time between swept runs, a Go duration; at least `5m`. |
+| `worktreeSweepMinIdle` | `"6h"` | The sweep's `--min-idle`, a Go duration above zero. |
+| `worktreeSweepLowSpaceGiB` | `8` | Free space, in GiB, below which the owner helper is told. |
+
+A missing file means the defaults. A file that exists but cannot be read, is
+over 64 KiB or is not a JSON object, or a `worktreeSweep` value other than
+`"on"` or `"off"`, skips the run: the switch could not be read. A bad
+interval, min-idle or threshold uses its default and says so once on the
+relay's stderr. The accepted-after wait is closeout's
+(`TAILTERM_ARTIFACT_ACCEPTED_AFTER`, default 24 hours).
+
+A run is due one interval after the last swept run. A skipped or failed
+attempt is tried again 5 minutes later. The whole run is skipped, with the
+reason in the journal, when:
+
+- `off`: the switch is off. This is journalled once, when the switch is first
+  seen off, not at every check.
+- `settings`: `relay.json` cannot be trusted, as above.
+- `cleanup-active`: another sweep or a closeout holds the cleanup lock.
+- `matrix-lock`: the matrix lock file cannot be trusted, as above.
+- `hub`: a roster or queue read failed, so the protections are unknown.
+
+A matrix run does not skip the run: it keeps what it holds, and other trees go.
+
+*Journal.* Each attempt appends exactly one line to `worktree-sweep.jsonl` in
+the relay state directory (mode 0600), read with `tt team queue sweep-worktrees
+--journal [--limit 20] [--json]`, newest last:
+
+```json
+{"at":"…","source":"schedule","outcome":"swept","reason":"","repositories":1,
+ "treesRemoved":3,"foldersRemoved":2,"cachesTrimmed":4,"pruned":0,
+ "bytesFreed":123,"freeBytesAfter":456,"kept":{"unpushed":7},
+ "minIdle":"6h0m0s","durationMs":8123,"exclusionExceeded":0,
+ "lowSpace":false,"noticeSeq":0,"noticePending":""}
+```
+
+`outcome` is `swept`, `skipped` or `failed`, with the cause in `reason` and
+`detail`. `treesRemoved` counts worktrees and verifier checkouts and
+`foldersRemoved` session temp folders. `at` is the `at` of that run's lines in
+`worktree-cleanup.jsonl`. `freeBytesAfter` is the least free space over each
+repository's main checkout and artifacts root after the run, or `-1` when it
+could not be read. `exclusionExceeded` counts removals that outran the matrix
+hold limit. `noticesDropped` appears when a full pending list dropped a notice.
+
+*Low-space notice.* A run posts nothing while space is fine. An episode
+begins at the first swept run that ends below the threshold and ends at the
+first swept run at or above it; skipped and failed runs do neither. When an
+episode begins, the relay sends one NOTICE to the newest live owner helper on
+the hub, in that helper's project, or to the Board of the project of this
+host's newest queue entry when there is none. It names the free space, what
+the run freed, and the five largest kept trees with their keep reason. The
+notice is saved in `worktree-sweep-state.json` before it is posted and
+replayed unchanged, with the same project, recipient, text and request
+identity (`worktree-sweep-low-<host>-<episode start>`), at every later swept
+run until the hub returns a post receipt for that identity. The journal shows
+the request identity in `noticePending` until then and the message number in
+`noticeSeq` once. Each episode has its own notice; at most 8 wait at a time,
+and the oldest is dropped, and journalled, when a ninth would join.
+
+The first scheduled run on a host deletes whatever a manual
+`--min-idle 6h --apply` would. Run the manual dry run with `--min-idle 6h`
+first, then read `--journal` after the run.
 
 ## Queue chores the product handles
 

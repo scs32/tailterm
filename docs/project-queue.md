@@ -1422,11 +1422,22 @@ Closeout and `tt team queue sweep-worktrees` (described in
 `docs/team-launch.md`) also retire two things a finished team leaves outside
 its worktree: the verifier's clean checkouts under the artifacts tree, and
 Claude Code's per-directory session temp folders. Receipts, logs and plan
-files are never removed.
+files are never removed. The sweep, and only the sweep, also trims one
+regenerable cache out of the checkouts it keeps (see "Cache trim").
 
 ```sh
 tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR]
+tt team queue sweep-worktrees --journal [--limit 20] [--json]
 ```
+
+The relay runs the same pass with apply on a schedule on each host: hourly
+with `--min-idle 6h` by default, set or switched off in
+`~/.config/tailterm/relay.json` (`worktreeSweep`, `worktreeSweepInterval`,
+`worktreeSweepMinIdle`, `worktreeSweepLowSpaceGiB`). Each attempt writes one
+line to `worktree-sweep.jsonl`, which `--journal` prints, and the owner helper
+gets one notice per low-space episode. `docs/team-launch.md` ("Scheduled
+sweep") has the settings, the skip reasons, the matrix lock rules, the journal
+fields and the notice rule.
 
 Without `--apply` it is a dry run that writes nothing: no manifest, no
 receipt, no ref. It lists each verifier checkout and session temp folder with
@@ -1537,16 +1548,103 @@ when all of these hold:
 - No Git repository or kept worktree remains inside it (`nested`). Scratchpad
   worktrees removed earlier in the same pass do not count.
 
+When the sweep applies, it removes a folder in two steps: it renames the
+folder to a tombstone beside it in the temp root, then deletes the tombstone
+(see "Cache trim" for the tombstone rules). Closeout deletes the folder
+directly, as before.
+
+### Cache trim
+
+The sweep trims a regenerable cache out of a checkout it keeps, so a checkout
+held for its receipts or its branch stops holding hundreds of megabytes of
+installed packages. The dry run reports it as `would-trim`, `--apply` and the
+scheduled sweep as `trimmed`. Closeout never trims.
+
+**Allowlist.** Exactly one path: `<checkout>/node_modules`. Nothing else is
+trimmed anywhere: no Go build or module cache, no `home` directory a
+verification run made, no `.build`, no `dist`.
+
+**Never touched.** The sweep never deletes, and never deletes inside, the
+shared user caches: `~/Library/Caches` (so `~/Library/Caches/go-build`),
+`~/go` (so `~/go/pkg`), `~/.npm`, or the relay's own `GOCACHE`, `GOMODCACHE`,
+`GOPATH` and `npm_config_cache`. Clearing the shared Go caches is a standing
+owner rule: never. Nothing outside the worktrees root
+(`<main checkout>/.build/worktrees`), the artifacts root and the session temp
+root is ever a candidate. A checkout or cache that lies in, contains or is the
+same file as one of those paths is kept `protected`.
+
+**Finished.** A checkout qualifies only when all of these hold:
+
+- It is a verifier checkout of the item, or the `cwd`, accepted worktree or
+  integration worktree recorded on a `finished` queue entry of the item with a
+  saved acceptance on this host; and it lies in the worktrees root or the
+  artifacts root.
+- The item's newest queue entry on any host, by position and of any state, is
+  `finished` and is accepted or released. A newer failed entry, released or
+  not, an abandoned entry, or a newer queued, launching or running retry
+  disqualifies the item.
+- No entry of the item is active, and no agent bound to it on any host is
+  other than closed.
+- The pass keeps the checkout as `retention`, `evidence`, `dirty`, `unpushed`
+  or `nested`. A removable checkout is removed whole instead. A checkout kept
+  as `in-use`, `locked`, `recent`, `item-active` or for an operation in
+  progress is left alone, and the lock, operation and `--min-idle` rules are
+  checked again directly, because the first reason reported can hide a later
+  one.
+
+**The cache itself.** `node_modules` is trimmed only when it is a real
+directory, holds npm's install marker `node_modules/.package-lock.json`, is
+ignored by Git with no tracked file inside, holds no `.git` entry, was last
+changed more than `--min-idle` ago, and no receipt text names a path in it
+(queue evidence, tracked `docs/` files, and the item's receipt and plan
+files). Otherwise it is kept, with the cause in the detail: `unproven` (a
+symlink, no marker, tracked or not ignored), `nested`, `recent`, `evidence`,
+`locked`, `operation`, `protected`, `moved` or `remove-failed`. A
+`node_modules` that is itself a symlink is kept and the link left in place.
+
+**How it is deleted.** One function is the only route to a trim, and it never
+deletes by pathname:
+
+1. The checkout is opened as a pinned directory. It must be the same file
+   that was classified, and its `.git` link must still name the same worktree;
+   a checkout or parent folder swapped meanwhile is kept `moved`.
+2. The intent is written and synced to `worktree-sweep-state.json` in the
+   relay state directory: the checkout's path, its device and inode, the root
+   it lies under, and a generated tombstone name (`.tt-sweep-trash-` and a
+   random suffix). If that write fails, nothing is renamed.
+3. Under the matrix lock's mutex (see `docs/team-launch.md`), `node_modules`
+   is renamed to the tombstone inside the pinned directory.
+4. The tombstone is deleted through the pinned directory, and the intent is
+   cleared. A symlink inside the cache is unlinked with it; its target is not
+   followed. Read-only directories are not made writable: a delete that fails
+   is `remove-failed`, and the next pass tries again.
+
+A pass that died between steps is settled by the next applying sweep of the
+same roots, before it trims anything. It deletes the tombstone only when the
+recorded directory is still the same file under the root it was recorded
+under, and the tombstone carries the reserved prefix and is a real directory.
+Anything else (the directory gone or replaced, the tombstone missing or a
+symlink, `node_modules` never renamed) deletes nothing, drops the intent, and
+is recorded once as kept `moved` with the cause. A tombstone with no intent is
+never deleted by name.
+
+A manual session that is not on the roster can lose `node_modules` in a
+finished checkout it works in; `npm ci` restores it, and `--min-idle` and the
+matrix lock protect a checkout in use.
+
 ### Receipts and report
 
-Both kinds are recorded in `worktree-cleanup.jsonl` with the ordinary worktree
-receipts, one line per decision, and kept outcomes once. Their lines add
-`kind` (`artifact-checkout` or `session-temp`), `bytes`, and for a removed
-checkout `manifest`. `--json` rows add the same `kind`; existing keys and
-totals keep their meaning. The text report prints
-`would-remove PATH (artifact checkout; item wi_x released; 1.7 GiB)` and
-`would-remove PATH (session temp; 78.0 MiB)`. A folder that holds only empty
-directories reports `0 B`.
+All three kinds are recorded in `worktree-cleanup.jsonl` with the ordinary
+worktree receipts, one line per decision, and kept outcomes once. Their lines
+add `kind` (`artifact-checkout`, `session-temp` or `cache`), `bytes`, and for a
+removed checkout `manifest`. A cache's `path` is the `node_modules` directory
+and its action `trimmed`. `--json` rows add the same `kind`; existing keys and
+totals keep their meaning, and `totals.actions` gains `would-trim` or
+`trimmed`. The text report prints
+`would-remove PATH (artifact checkout; item wi_x released; 1.7 GiB)`,
+`would-remove PATH (session temp; 78.0 MiB)` and
+`would-trim PATH (cache; regenerable cache in a finished checkout of wi_x; 412.0 MiB)`.
+A folder that holds only empty directories reports `0 B`.
 
 Keep reasons, in the order checked for a verifier checkout: `locked`,
 `missing`, `in-use`, `item-active` (an entry of the item is queued, launching,
@@ -1573,3 +1671,6 @@ applies only to ordinary worktrees and branch checkouts.
   checkouts are kept as `retention`.
 - The main checkout's session temp folder, artifact folders not named for an
   item, and build output that is not inside a checkout are out of scope.
+- The cache trim does not reach Go build or module caches in a verification
+  run's private home, `.build/go`, or any cache under a folder not named for
+  an item: nothing on disk proves the harness made them.
