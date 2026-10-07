@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -753,5 +754,108 @@ func TestBrokerProviderBlockSweep(t *testing.T) {
 				t.Fatalf("second tick: %v notices=%d", err, owner())
 			}
 		})
+	}
+}
+
+// a10 (wi_d8ff05d1989ff279): the tick runs the deployer liveness sweep. The
+// project has a silent deployer and a verified release job; the store's own
+// tests cover the rule, this one that Tick reaches it.
+func TestBrokerTickRunsDeployerLivenessSweep(t *testing.T) {
+	f := newFixture(t)
+	add := func(name, role string) api.Agent {
+		t.Helper()
+		a, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Role: role, Host: "h", Session: name, Runtime: "codex"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	handler, deployer, helper := add("db-handler", api.AgentRoleDatabaseHandler), add("deployer", api.AgentRoleDeployment), add("owner-helper", "")
+	// The wrapper's heartbeat, as tt wrap posts it.
+	if _, err := f.st.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: deployer.ID, RunID: deployer.RunID, Kind: api.EventHeartbeat}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	// A verified job and the owner helper's role have no short public path
+	// from this package; the rows go into this test's own database file.
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE agents SET role=? WHERE id=?`, []any{api.AgentRoleOwnerHelper, helper.ID}},
+		{`INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'verified',1,'{}')`, []any{f.task.ID, api.NewID("rel"), api.NewID("tqe")}},
+	} {
+		if _, err := db.Exec(stmt.query, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := &Broker{Store: f.st}
+	tick := func(at time.Time) (silent int) {
+		t.Helper()
+		steps, err := b.Tick(f.ctx, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range steps {
+			if s.Action == "deployer-silent" {
+				if s.TaskID != f.task.ID || s.MessageSeq == 0 {
+					t.Fatalf("step %+v", s)
+				}
+				silent++
+			}
+		}
+		return silent
+	}
+	copies := func() (toHandler, toHelper int) {
+		t.Helper()
+		msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			if m.From.Node != api.BrokerNode || m.Envelope == nil || m.Envelope.Subject != "Deployer has gone silent while release jobs wait" {
+				continue
+			}
+			switch m.To {
+			case handler.ID:
+				toHandler++
+			case helper.ID:
+				toHelper++
+			default:
+				t.Fatalf("liveness notice to %q", m.To)
+			}
+		}
+		return
+	}
+	start := time.Now().UTC()
+	// The first tick is the sweep's first sight of the job: it must stand
+	// for the bound before it counts as waiting.
+	if n := tick(start); n != 0 {
+		t.Fatalf("first sight: %d steps", n)
+	}
+	if n := tick(start.Add(9 * time.Minute)); n != 0 {
+		t.Fatalf("inside the bound: %d steps", n)
+	}
+	past := start.Add(11 * time.Minute)
+	if n := tick(past); n != 2 {
+		t.Fatalf("past the bound: %d deployer-silent steps, want 2", n)
+	}
+	if h, o := copies(); h != 1 || o != 1 {
+		t.Fatalf("copies: handler %d, owner helper %d", h, o)
+	}
+	if n := tick(past); n != 0 {
+		t.Fatalf("second tick: %d steps", n)
+	}
+	if n := tick(past.Add(30 * time.Minute)); n != 0 {
+		t.Fatalf("later tick: %d steps", n)
+	}
+	if h, o := copies(); h != 1 || o != 1 {
+		t.Fatalf("copies after later ticks: handler %d, owner helper %d", h, o)
 	}
 }

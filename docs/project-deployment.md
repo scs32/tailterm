@@ -642,9 +642,9 @@ that notice stays unread until they next read their inbox.
   the held claim notice carry no `wake` ref; a directed message wakes its
   recipient.
 - A restart is routine whether or not "Deployer now runs the published scripts"
-  follows, so a deployer that does not come back after its restart notice wakes
-  no one. A restart the deployer cannot make is "Deployer is not claiming
-  releases: ..." and wakes.
+  follows. A deployer that does not come back after its restart notice is
+  reported by the hub instead (A silent deployer, below). A restart the
+  deployer cannot make is "Deployer is not claiming releases: ..." and wakes.
 - Request ids do not include the class. A notice an older runner posted
   untagged and a newer runner resends under the same request id is refused by
   the hub as a reused id with other data: the original stays on the Board, the
@@ -652,6 +652,85 @@ that notice stays unread until they next read their inbox.
   a host wait or a code notice it prints "... not posted; the next poll
   retries." each time), and `cli-failures.json` keeps one counted record. This can only happen for a wait or hold that is still active across
   the restart onto the tagging runner.
+
+### A silent deployer (wi_d8ff05d1989ff279)
+
+The hub itself notices a deployer that has died or that restarted and did not
+come back while a release job waits. The check is part of the hub's 30 second
+scheduling tick. It reads only saved rows: the deployer's heartbeat, its
+messages and the release jobs. It reads no inbox and no unread position, and it
+runs for every open project that is not paused.
+
+**Rule.** With N the bound (10 minutes unless set, below), the hub posts when
+both hold:
+
+- **A job waits.** At least one release job has stood in `verified`, or in
+  `claimed`, for N without changing state. A job that moves from `verified` to
+  `claimed` starts its N again. `held`, `merged` and `blocked` jobs never count,
+  so an owner hold alone is never reported. The hub times a job from the first
+  tick that sees it in its state, so the notice is never early and at most one
+  tick late. After a hub start onto this code, or after a project resumes from
+  a pause, every standing job starts its N afresh.
+- **The deployer is not alive.** Either of:
+  - *Silent.* Nothing was heard from it for N: no heartbeat from its `tt wrap`
+    wrapper and no message from its current run. This covers a dead wrapper, a
+    dead host and an exited deployer.
+  - *Restart not completed.* Its current run posted "Deployer is restarting
+    itself onto the published scripts" (with or without a held job) N or more
+    ago and has posted neither "Deployer now runs the published scripts" nor
+    "Deployer is not claiming releases: ..." since. The wrapper keeps its
+    heartbeat through such a restart, so the heartbeat does not hide it.
+
+The deployer is the project's newest deployment agent that is neither retired
+nor closed. Retiring or closing it is deliberate and is not reported. A deployer
+on a long verification run keeps its heartbeat and is not reported, however
+long its claimed job stands.
+
+**Notice.** One directed notice per recipient: the primary database handler,
+unless it is retired, and the owner helper. A directed notice wakes its
+recipient once. The subject is "Deployer has gone silent while release jobs
+wait" or "Deployer announced a restart and did not come back", with refs
+`activity=deployer_liveness`, `reason=silent` or `reason=restart`,
+`deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
+run and status, its last heartbeat, its last message (number, time and
+subject), how many jobs are `verified` and `claimed`, the oldest of them, the
+bound and the recovery.
+
+**Once per episode.** An episode opens with the first notice and each
+recipient gets one copy in it, however long the silence lasts. A recipient
+that was absent when it opened (no handler, a retired handler, no open owner
+helper) gets its copy at the first tick that finds it present while the
+episode is open and a job still waits; the other recipient is not sent a
+second one. A handler rotation inside an episode does not send a second
+handler copy. The episode ends, and the check re-arms, at the first tick that
+finds the deployer alive: a fresh heartbeat or message for a silent deployer,
+"Deployer now runs the published scripts" for a restart. A new deployer run
+also ends it.
+
+**Recovery.** The hub detects and wakes only. It never restarts, signals,
+replaces or messages the deployer, and it changes no release job. Whoever is
+woken checks the deployer's host and terminal, then runs `tt deployment setup`
+for the deployer with its current run as predecessor (the start of this
+document; the run is in the notice's `run` ref).
+
+**Setting.** `TAILTERM_DEPLOYER_LIVENESS_MINUTES` in the hub's environment
+sets N, a whole number of minutes from 1 to 1440. Any other value, or none,
+gives 10. One N is used for the silence, the restart and the job.
+
+**Hub clock.** If the hub's clock jumps forward, or the hub was down for
+longer than N, a deployer that did not heartbeat in the meantime looks silent
+once its jobs have stood for N again; that is one notice per project.
+
+**Claim freshness.** Separately, the hub refuses a claim, and the deployer's
+other fenced calls, when the deployer's heartbeat is more than 90 seconds old
+("deployment heartbeat stale"). Both rules read the hub's own clock.
+
+#### Not detected
+
+A runner that hangs while its wrapper still heartbeats, and that announced no restart, is not detected.
+The hub has no signal that separates it from a long verification run: both
+show a fresh heartbeat and a job that stands still. Look at the release line
+when a job has stood longer than its matrix should take.
 
 ### Handler requests and gating
 
@@ -1430,9 +1509,19 @@ means the deployer runs scripts older than the published ones and could not
 restart itself. Read its `Reason:` and `runner-code.json`, then follow "The
 runner's own code" above. It is the one code notice that wakes the primary
 database handler and the owner helper. The other code notices are
-`wake=routine` and wake no one (Which notices wake, above); they need no action
-unless a restart is not followed by "Deployer now runs the published scripts",
-which nothing reports by itself.
+`wake=routine` and wake no one (Which notices wake, above); they need no
+action. A restart that is not followed by "Deployer now runs the published
+scripts" is reported by the hub (next).
+
+**Silent deployer.** A notice "Deployer has gone silent while release jobs
+wait" or "Deployer announced a restart and did not come back" comes from the
+hub, not the deployer: a release job has waited for the bound while the
+deployer was not heard from, or after a restart it did not finish (A silent
+deployer, above). Nothing was restarted. Check the deployer's host and
+terminal, then run `tt deployment setup` for the deployer with the run named
+in the notice as predecessor. There is one notice per recipient until the
+deployer is seen alive again. A runner that hangs while its wrapper still
+heartbeats, with no restart announced, sends no such notice.
 
 **Held claim.** A notice "A release job is skipped because the hub refused its
 claim" or "A release job is skipped because its set-aside journal is held"

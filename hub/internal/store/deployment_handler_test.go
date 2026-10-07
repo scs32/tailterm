@@ -105,6 +105,10 @@ func TestAckGateExemptsDeploymentAgent(t *testing.T) {
 	}
 	direct(d, "to-deployer")
 	s.now = func() time.Time { return start.Add(api.ObligationAckGrace + time.Minute) }
+	// Claim freshness reads the store clock: the deployer heartbeats at it.
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(s.now()), d.ID); err != nil {
+		t.Fatal(err)
+	}
 	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +146,10 @@ func TestAckGateExemptsDeployerFinishAndRefuse(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.now = func() time.Time { return start.Add(api.ObligationAckGrace + time.Minute) }
+		// Claim freshness reads the store clock: the deployer heartbeats at it.
+		if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(s.now()), d.ID); err != nil {
+			t.Fatal(err)
+		}
 		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
 		if err != nil {
 			t.Fatal(err)

@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"maps"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,7 +46,13 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  PRIMARY KEY(task_id,batch_id,job_id),UNIQUE(task_id,batch_id,seq));
  CREATE TRIGGER IF NOT EXISTS release_batch_no_delete BEFORE DELETE ON release_batches BEGIN SELECT RAISE(ABORT,'release batch history'); END;
  CREATE TRIGGER IF NOT EXISTS release_batch_job_no_update BEFORE UPDATE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;
- CREATE TRIGGER IF NOT EXISTS release_batch_job_no_delete BEFORE DELETE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;`
+ CREATE TRIGGER IF NOT EXISTS release_batch_job_no_delete BEFORE DELETE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;
+ CREATE TABLE IF NOT EXISTS release_liveness_jobs (
+ task_id TEXT NOT NULL,job_id TEXT NOT NULL,state TEXT NOT NULL,since TEXT NOT NULL,
+ PRIMARY KEY(task_id,job_id));
+ CREATE TABLE IF NOT EXISTS release_deployer_liveness (
+ task_id TEXT NOT NULL PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,state TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',
+ opened_at TEXT NOT NULL DEFAULT '',handler_seq INTEGER NOT NULL DEFAULT 0,helper_seq INTEGER NOT NULL DEFAULT 0);`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -476,13 +484,16 @@ func handReleaseLoad(ctx context.Context, q queryRower, task, id string) (api.Ha
 	}
 	return h, err
 }
-func releaseDeployer(ctx context.Context, q queryRower, task, agent, run string) error {
+
+// releaseDeployer requires the exact deployment run with a heartbeat no older
+// than 90 s at now, the store clock of the caller.
+func releaseDeployer(ctx context.Context, q queryRower, task, agent, run string, now time.Time) error {
 	var role, status, current, seen string
 	if err := q.QueryRowContext(ctx, `SELECT role,status,run_id,last_seen_at FROM agents WHERE task_id=? AND id=?`, task, agent).Scan(&role, &status, &current, &seen); err != nil || role != api.AgentRoleDeployment || current != run || run == "" || seen == "" || (status != api.AgentRunning && status != api.AgentDone) {
 		return releaseConflict("available exact deployment run required")
 	}
 	when, err := time.Parse(time.RFC3339Nano, seen)
-	if err != nil || time.Since(when) > 90*time.Second {
+	if err != nil || now.Sub(when) > 90*time.Second {
 		return releaseConflict("deployment heartbeat stale")
 	}
 	return nil
@@ -912,7 +923,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if matrixChanged && !releaseMatrixApproval(ctx, tx, task, p.MatrixApprovalMessageSeq, p.MatrixDigest) {
 				return zero, releaseConflict(fmt.Sprintf("matrix digest changed %.8s -> %.8s; no approval", j.Plan.MatrixDigest, p.MatrixDigest))
 			}
-			if err = releaseDeployer(ctx, tx, task, j.AgentID, j.RunID); err != nil {
+			if err = releaseDeployer(ctx, tx, task, j.AgentID, j.RunID, s.now()); err != nil {
 				return zero, err
 			}
 			// One import settles a whole batch: it must be of the batch's
@@ -965,7 +976,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				j.IntegratedMatrix = &api.ReleaseMatrixChange{ApprovedDigest: j.Plan.MatrixDigest, IntegratedDigest: p.MatrixDigest, ApprovalMessageSeq: p.MatrixApprovalMessageSeq}
 			}
 		} else {
-			if err = releaseDeployer(ctx, tx, task, req.AgentID, req.RunID); err != nil {
+			if err = releaseDeployer(ctx, tx, task, req.AgentID, req.RunID, s.now()); err != nil {
 				return zero, err
 			}
 			if j.PauseGeneration != generation {
@@ -1843,4 +1854,319 @@ func restoreHeldBatch(ctx context.Context, tx *sql.Tx, task string, j *api.Relea
 	}
 	j.Reconciliations = append(j.Reconciliations, *r)
 	return nil
+}
+
+// Deployer liveness (wi_d8ff05d1989ff279, docs/project-deployment.md "A silent
+// deployer"). The runner posts these subjects itself (scripts/release-runner.mjs
+// codeNotice); TestDeployerLivenessRunnerSubjects keeps them in step.
+const (
+	deployerRestartSubject     = "Deployer is restarting itself onto the published scripts"
+	deployerRestartedSubject   = "Deployer now runs the published scripts"
+	deployerNotClaimingSubject = "Deployer is not claiming releases"
+
+	deployerSilentNoticeSubject  = "Deployer has gone silent while release jobs wait"
+	deployerRestartNoticeSubject = "Deployer announced a restart and did not come back"
+
+	deployerAlive   = "alive"
+	deployerSilent  = "silent"
+	deployerRestart = "restart"
+
+	deployerLivenessArmed = "armed"
+	deployerLivenessOpen  = "open"
+)
+
+// deployerLivenessBound is how long a deployer may be unheard, a restart
+// unfinished and a release job standing before the notice is posted.
+func deployerLivenessBound() time.Duration {
+	v, err := strconv.Atoi(os.Getenv("TAILTERM_DEPLOYER_LIVENESS_MINUTES"))
+	if err != nil || v < 1 || v > 1440 {
+		v = 10
+	}
+	return time.Duration(v) * time.Minute
+}
+
+// deployerLiveness judges a deployer at now: silent when it was last heard
+// from (heartbeat or message) a bound or more ago, restart when it announced
+// a restart a bound or more ago and has not reported back (restartAt is zero
+// with no such restart), otherwise alive. A runner that hangs while its
+// wrapper still heartbeats, and that announced no restart, is alive here: the
+// hub cannot tell it from a long verification run.
+func deployerLiveness(now, lastHeard, restartAt time.Time, bound time.Duration) string {
+	switch {
+	case now.Sub(lastHeard) >= bound:
+		return deployerSilent
+	case !restartAt.IsZero() && now.Sub(restartAt) >= bound:
+		return deployerRestart
+	}
+	return deployerAlive
+}
+
+// DeployerNotice is one liveness notice a sweep posted.
+type DeployerNotice struct {
+	TaskID     string
+	MessageSeq int64
+}
+
+// DeployerLivenessSweep posts, once per episode and recipient, a directed
+// notice to the primary database handler and the owner helper of every open,
+// active project whose deployer is silent or stuck in a restart while a
+// release job has stood in verified or claimed for the bound. It reads only
+// durable rows and never restarts, signals or changes the deployer or a job.
+func (s *Store) DeployerLivenessSweep(ctx context.Context, now time.Time) ([]DeployerNotice, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT a.task_id FROM agents a JOIN tasks t ON t.id=a.task_id WHERE a.role=? AND t.status=? AND t.pause_state='active' ORDER BY a.task_id`, api.AgentRoleDeployment, api.TaskOpen)
+	if err != nil {
+		return nil, err
+	}
+	var tasks []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tasks = append(tasks, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	var posted []DeployerNotice
+	var firstErr error
+	bound := deployerLivenessBound()
+	for _, task := range tasks {
+		seqs, err := s.sweepDeployerLiveness(ctx, task, now, bound)
+		for _, seq := range seqs {
+			posted = append(posted, DeployerNotice{TaskID: task, MessageSeq: seq})
+		}
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("deployer liveness sweep %s: %w", task, err)
+		}
+		if len(seqs) > 0 {
+			s.notify(task)
+		}
+	}
+	return posted, firstErr
+}
+
+func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now time.Time, bound time.Duration) ([]int64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive {
+		return nil, nil
+	}
+	// A retired or closed deployer is deliberate; a successor is the newest.
+	var d struct{ id, name, status, run, seen, event string }
+	err = tx.QueryRowContext(ctx, `SELECT id,name,status,run_id,last_seen_at,last_event_at FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) ORDER BY created_at DESC,id DESC LIMIT 1`,
+		taskID, api.AgentRoleDeployment, api.AgentClosed, api.AgentRetired).Scan(&d.id, &d.name, &d.status, &d.run, &d.seen, &d.event)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// A job waits once it has stood in verified, or in claimed, for the bound.
+	// Jobs carry no state-change time, so the sweep keeps its first sight of
+	// each state: never earlier than the change, so the notice is never early.
+	seen := map[string][2]string{}
+	rows, err := tx.QueryContext(ctx, `SELECT job_id,state,since FROM release_liveness_jobs WHERE task_id=?`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, state, since string
+		if err := rows.Scan(&id, &state, &since); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		seen[id] = [2]string{state, since}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	type standing struct{ id, state string }
+	var jobs []standing
+	if rows, err = tx.QueryContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND state IN ('verified','claimed') ORDER BY rowid`, taskID); err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var j standing
+		if err := rows.Scan(&j.id, &j.state); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	waiting := false
+	counts := map[string]int{}
+	for _, j := range jobs {
+		counts[j.state]++
+		since := now
+		if row, ok := seen[j.id]; ok && row[0] == j.state {
+			since = parseTS(row[1])
+		} else if _, err := tx.ExecContext(ctx, `INSERT INTO release_liveness_jobs(task_id,job_id,state,since) VALUES(?,?,?,?) ON CONFLICT(task_id,job_id) DO UPDATE SET state=excluded.state,since=excluded.since`, taskID, j.id, j.state, ts(now)); err != nil {
+			return nil, err
+		}
+		delete(seen, j.id)
+		if now.Sub(since) >= bound {
+			waiting = true
+		}
+	}
+	for id := range seen {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM release_liveness_jobs WHERE task_id=? AND job_id=?`, taskID, id); err != nil {
+			return nil, err
+		}
+	}
+
+	var ep struct {
+		exists                    bool
+		agent, run, state, reason string
+		handlerSeq, helperSeq     int64
+		openedAt                  string
+	}
+	err = tx.QueryRowContext(ctx, `SELECT agent_id,run_id,state,reason,opened_at,handler_seq,helper_seq FROM release_deployer_liveness WHERE task_id=?`, taskID).Scan(&ep.agent, &ep.run, &ep.state, &ep.reason, &ep.openedAt, &ep.handlerSeq, &ep.helperSeq)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	ep.exists = err == nil
+	// With no job standing and no open episode nothing can change.
+	if len(jobs) == 0 && ep.state != deployerLivenessOpen {
+		return nil, tx.Commit()
+	}
+
+	// Last heard: the wrapper heartbeat or the newest message of this run.
+	var last struct {
+		seq           int64
+		at, subject   string
+		lastHeard     time.Time
+		restartAt     time.Time
+		restartNotice int64
+	}
+	err = tx.QueryRowContext(ctx, `SELECT seq,created_at,CASE WHEN json_valid(envelope) THEN coalesce(json_extract(envelope,'$.subject'),'') ELSE '' END FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? ORDER BY seq DESC LIMIT 1`, taskID, d.id, d.run).Scan(&last.seq, &last.at, &last.subject)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	last.lastHeard = parseTS(d.seen)
+	if at := parseTS(last.at); at.After(last.lastHeard) {
+		last.lastHeard = at
+	}
+	if last.lastHeard.IsZero() {
+		last.lastHeard = parseTS(d.event)
+	}
+	// A restart is pending while its notice is the newest of the run's
+	// restart, "now runs" and "not claiming" notices: a refused restart is a
+	// live deployer and already wakes.
+	var codeSubject, codeAt string
+	var codeSeq int64
+	const subject = `CASE WHEN json_valid(envelope) THEN coalesce(json_extract(envelope,'$.subject'),'') ELSE '' END`
+	err = tx.QueryRowContext(ctx, `SELECT seq,created_at,`+subject+` FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? AND envelope<>''
+ AND (`+subject+`=? OR substr(`+subject+`,1,?)=? OR substr(`+subject+`,1,?)=?) ORDER BY seq DESC LIMIT 1`,
+		taskID, d.id, d.run, deployerRestartedSubject, len(deployerRestartSubject), deployerRestartSubject, len(deployerNotClaimingSubject), deployerNotClaimingSubject).Scan(&codeSeq, &codeAt, &codeSubject)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if strings.HasPrefix(codeSubject, deployerRestartSubject) {
+		last.restartAt, last.restartNotice = parseTS(codeAt), codeSeq
+	}
+	verdict := deployerLiveness(now, last.lastHeard, last.restartAt, bound)
+
+	save := func() error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO release_deployer_liveness(task_id,agent_id,run_id,state,reason,opened_at,handler_seq,helper_seq) VALUES(?,?,?,?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET agent_id=excluded.agent_id,run_id=excluded.run_id,state=excluded.state,reason=excluded.reason,opened_at=excluded.opened_at,handler_seq=excluded.handler_seq,helper_seq=excluded.helper_seq`,
+			taskID, d.id, d.run, ep.state, ep.reason, ep.openedAt, ep.handlerSeq, ep.helperSeq)
+		return err
+	}
+	if verdict == deployerAlive || (ep.exists && (ep.agent != d.id || ep.run != d.run)) {
+		// Seen alive, or another deployer run: the episode ends and re-arms.
+		if ep.exists && (ep.state != deployerLivenessArmed || ep.agent != d.id || ep.run != d.run) {
+			ep.state, ep.reason, ep.openedAt, ep.handlerSeq, ep.helperSeq = deployerLivenessArmed, "", "", 0, 0
+			if err := save(); err != nil {
+				return nil, err
+			}
+		}
+		return nil, tx.Commit()
+	}
+	if !waiting {
+		return nil, tx.Commit()
+	}
+	changed := ep.state != deployerLivenessOpen
+	if changed {
+		ep.state, ep.reason, ep.openedAt, ep.handlerSeq, ep.helperSeq = deployerLivenessOpen, verdict, ts(now), 0, 0
+	}
+
+	// One copy per recipient slot per episode. A recipient absent now gets
+	// its copy at the first later sweep that finds it, while a job waits.
+	handler, err := primaryHandler(ctx, tx, task)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && handler.Status == api.AgentRetired) {
+		handler, err = api.Agent{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	helper, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?,?) ORDER BY created_at DESC,id DESC LIMIT 1`, taskID, api.AgentRoleOwnerHelper, api.AgentClosed, api.AgentExited, api.AgentRetired))
+	if errors.Is(err, sql.ErrNoRows) {
+		helper, err = api.Agent{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	noticeSubject := deployerSilentNoticeSubject
+	lead := fmt.Sprintf("Deployer %s (agent %s, run %s, status %s) has not been heard from for %s or more while release jobs wait.", d.name, d.id, d.run, d.status, bound)
+	if ep.reason == deployerRestart {
+		noticeSubject = deployerRestartNoticeSubject
+		lead = fmt.Sprintf("Deployer %s (agent %s, run %s, status %s) announced a restart %s or more ago and has not reported that it runs the published scripts, while release jobs wait.", d.name, d.id, d.run, d.status, bound)
+		if last.restartNotice != 0 {
+			lead += fmt.Sprintf(" Restart notice: #%d.", last.restartNotice)
+		}
+	}
+	heartbeat, lastNotice := "none", "none"
+	if d.seen != "" {
+		heartbeat = d.seen
+	}
+	if last.seq != 0 {
+		if last.subject == "" {
+			last.subject = "untyped message"
+		}
+		lastNotice = fmt.Sprintf("#%d at %s, %q", last.seq, last.at, last.subject)
+	}
+	text := fmt.Sprintf("%s Last heartbeat: %s. Last notice: %s. Waiting: %d verified and %d claimed release jobs; oldest %s. Bound: %d minutes. "+
+		"Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md). Nothing was restarted or signalled.",
+		lead, heartbeat, lastNotice, counts["verified"], counts["claimed"], jobs[0].id, int(bound/time.Minute))
+	refs := map[string]string{"activity": "deployer_liveness", "reason": ep.reason, "deployer": d.id, "run": d.run}
+	var posted []int64
+	for _, slot := range []struct {
+		to  api.Agent
+		seq *int64
+	}{{handler, &ep.handlerSeq}, {helper, &ep.helperSeq}} {
+		if *slot.seq != 0 || slot.to.ID == "" {
+			continue
+		}
+		if err := s.postBrokerNotice(ctx, tx, task, slot.to, "", noticeSubject, noticeSubject, text, refs); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=? AND to_agent=?`, taskID, slot.to.ID).Scan(slot.seq); err != nil {
+			return nil, err
+		}
+		posted = append(posted, *slot.seq)
+	}
+	if changed || len(posted) > 0 {
+		if err := save(); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return posted, nil
 }

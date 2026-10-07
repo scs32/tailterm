@@ -27,7 +27,7 @@ type Step struct {
 	ObligationID string
 	MessageSeq   int64
 	WindowID     string // delegation-expired only
-	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired
+	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent
 }
 
 func wakesDue(o store.BrokerObligation, now time.Time) int {
@@ -57,6 +57,16 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 	// Owner notices for provider-blocked agents wait out a grace period so a
 	// runtime-wide outage is one notice; paused projects are swept too.
 	if _, err := b.Store.ProviderBlockSweep(ctx, now); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// A deployer that has gone silent, or that announced a restart and did
+	// not come back, while a release job waits: one notice per recipient and
+	// episode. It detects and wakes only.
+	silent, err := b.Store.DeployerLivenessSweep(ctx, now)
+	for _, n := range silent {
+		steps = append(steps, Step{TaskID: n.TaskID, MessageSeq: n.MessageSeq, Action: "deployer-silent"})
+	}
+	if err != nil && firstErr == nil {
 		firstErr = err
 	}
 	open, err := b.Store.BrokerOpenObligations(ctx)
@@ -181,6 +191,8 @@ func (b *Broker) Start(ctx context.Context) <-chan struct{} {
 				for _, s := range steps {
 					if s.Action == "delegation-expired" {
 						b.Log("broker: %s %s", s.Action, s.WindowID)
+					} else if s.Action == "deployer-silent" {
+						b.Log("broker: %s %s message %d", s.Action, s.TaskID, s.MessageSeq)
 					} else if s.Action != "wake" {
 						b.Log("broker: %s %s message %d", s.Action, s.ObligationID, s.MessageSeq)
 					}

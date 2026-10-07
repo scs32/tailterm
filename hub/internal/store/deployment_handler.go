@@ -23,7 +23,7 @@ func (s *Store) ReleaseHandler(ctx context.Context, task, agent, run string) (ap
 		return api.Agent{}, err
 	}
 	defer tx.Rollback()
-	if err = releaseDeployer(ctx, tx, task, agent, run); err != nil {
+	if err = releaseDeployer(ctx, tx, task, agent, run, s.now()); err != nil {
 		return api.Agent{}, err
 	}
 	var primary string

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -3819,4 +3820,671 @@ func TestReleaseHoldLiftsWhenNamedItemsRelease(t *testing.T) {
 	if still := load(plain); still.State != "held" || still.Hold == nil || len(still.HoldHistory) != 1 {
 		t.Fatalf("a hold with no items lifted by itself: %+v", still)
 	}
+}
+
+// a1: the 90 s claim freshness follows the store clock, not the wall clock.
+func TestReleaseDeployerFreshnessUsesStoreClock(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	// Two days ahead of the wall clock: time.Since would call this heartbeat
+	// fresh at any offset below, and a wall-clock heartbeat stale.
+	beat := time.Now().UTC().Add(48 * time.Hour)
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(beat), d.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { return beat }
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := api.ReleaseRequest{RequestID: "stale", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+	s.now = func() time.Time { return beat.Add(91 * time.Second) }
+	if _, err = s.ReleaseAction(ctx, task.ID, claim); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "deployment heartbeat stale") {
+		t.Fatalf("91 s after the heartbeat on the store clock: %v", err)
+	}
+	if _, err = s.ReleaseHandler(ctx, task.ID, d.ID, d.RunID); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "deployment heartbeat stale") {
+		t.Fatalf("handler lookup 91 s after the heartbeat: %v", err)
+	}
+	s.now = func() time.Time { return beat.Add(89 * time.Second) }
+	claim.RequestID = "fresh"
+	if j, err = s.ReleaseAction(ctx, task.ID, claim); err != nil || j.State != "claimed" {
+		t.Fatalf("89 s after the heartbeat on the store clock: %v %s", err, j.State)
+	}
+	if _, err = s.ReleaseHandler(ctx, task.ID, d.ID, d.RunID); err != nil {
+		t.Fatalf("handler lookup 89 s after the heartbeat: %v", err)
+	}
+}
+
+// livenessFixture is a release fixture with an owner helper and an injected
+// store clock; the deployer's heartbeat starts at that clock.
+type livenessFixture struct {
+	t         *testing.T
+	s         *Store
+	task      api.Task
+	h, d, own api.Agent
+	entry     string
+	clock     time.Time
+	ctx       context.Context
+	keys      int
+}
+
+func newLivenessFixture(t *testing.T) *livenessFixture {
+	t.Helper()
+	s, task, h, d, entry := releaseFixture(t)
+	f := &livenessFixture{t: t, s: s, task: task, h: h, d: d, entry: entry, clock: time.Now().UTC().Truncate(time.Second), ctx: context.Background()}
+	s.now = func() time.Time { return f.clock }
+	own, err := s.AddAgent(f.ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "owner-helper", Host: "fixture", Session: "owner-helper"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.own = own
+	f.exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleOwnerHelper, own.ID)
+	f.beat()
+	return f
+}
+
+func (f *livenessFixture) exec(query string, args ...any) {
+	f.t.Helper()
+	if _, err := f.s.db.Exec(query, args...); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *livenessFixture) key(op string) string {
+	f.keys++
+	return fmt.Sprintf("%s-%d", op, f.keys)
+}
+
+// beat records a deployer heartbeat at the fixture clock.
+func (f *livenessFixture) beat() {
+	f.t.Helper()
+	f.exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(f.clock), f.d.ID)
+}
+
+func (f *livenessFixture) advance(d time.Duration) { f.clock = f.clock.Add(d) }
+
+func (f *livenessFixture) enqueue() api.ReleaseJob {
+	f.t.Helper()
+	j, err := f.s.ReleaseAction(f.ctx, f.task.ID, api.ReleaseRequest{RequestID: f.key("enqueue"), Operation: "enqueue", AgentID: f.h.ID, RunID: f.h.RunID, EntryID: f.entry})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return j
+}
+
+// act is a deployer action on a job; the heartbeat must be fresh.
+func (f *livenessFixture) act(j api.ReleaseJob, op string) api.ReleaseJob {
+	f.t.Helper()
+	j, err := f.s.ReleaseAction(f.ctx, f.task.ID, api.ReleaseRequest{RequestID: f.key(op), Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit})
+	if err != nil {
+		f.t.Fatal(op, err)
+	}
+	return j
+}
+
+// say posts a notice as the deployer's current run, as the runner does.
+func (f *livenessFixture) say(subject string) api.Message {
+	f.t.Helper()
+	m, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.d.ID, RunID: f.d.RunID, RequestID: f.key("say"), Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: map[string]string{"wake": "routine"}, Body: api.EnvelopeBody{Text: "runner notice"}}}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return m
+}
+
+// sweep runs one liveness sweep at the fixture clock and returns how many
+// notices it posted.
+func (f *livenessFixture) sweep() int {
+	f.t.Helper()
+	posted, err := f.s.DeployerLivenessSweep(f.ctx, f.clock)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return len(posted)
+}
+
+// copies are the liveness notices addressed to one agent.
+func (f *livenessFixture) copies(to api.Agent) []api.Envelope {
+	f.t.Helper()
+	rows, err := f.s.db.Query(`SELECT envelope FROM messages WHERE task_id=? AND to_agent=? AND from_node=? AND json_extract(envelope,'$.refs.activity')='deployer_liveness' ORDER BY seq`, f.task.ID, to.ID, api.BrokerNode)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []api.Envelope
+	for rows.Next() {
+		var raw string
+		var e api.Envelope
+		if err := rows.Scan(&raw); err != nil {
+			f.t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(raw), &e); err != nil {
+			f.t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// want checks the copies each recipient holds and that nothing else in the
+// project carries a liveness notice.
+func (f *livenessFixture) want(at string, handler, helper int) {
+	f.t.Helper()
+	if h, o := len(f.copies(f.h)), len(f.copies(f.own)); h != handler || o != helper {
+		f.t.Fatalf("%s: handler copies %d (want %d), owner helper copies %d (want %d)", at, h, handler, o, helper)
+	}
+	if n := countRows(f.t, f.s, `SELECT count(*) FROM messages WHERE task_id=? AND json_extract(envelope,'$.refs.activity')='deployer_liveness'`, f.task.ID); n != handler+helper {
+		f.t.Fatalf("%s: %d liveness notices in the project, want %d", at, n, handler+helper)
+	}
+}
+
+const livenessN = 10 * time.Minute
+
+// standing enqueues a job and lets the sweep see it stand for the bound plus
+// a minute, keeping the deployer's heartbeat fresh when alive is set.
+func (f *livenessFixture) standing(alive bool) api.ReleaseJob {
+	f.t.Helper()
+	j := f.enqueue()
+	if n := f.sweep(); n != 0 {
+		f.t.Fatalf("first sight posted %d", n)
+	}
+	f.advance(livenessN + time.Minute)
+	if alive {
+		f.beat()
+	}
+	return j
+}
+
+// a2: a silent deployer with a waiting job posts one notice per recipient.
+func TestDeployerLivenessSilentPostsOnePerRecipient(t *testing.T) {
+	for _, state := range []string{"verified", "claimed"} {
+		t.Run(state, func(t *testing.T) {
+			f := newLivenessFixture(t)
+			heartbeat := ts(f.clock)
+			j := f.enqueue()
+			if state == "claimed" {
+				j = f.act(j, "claim")
+			}
+			lastNotice := f.say("A release job is waiting for the verification host")
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("first sight posted %d", n)
+			}
+			f.advance(livenessN + time.Minute)
+			if n := f.sweep(); n != 2 {
+				t.Fatalf("posted %d, want 2", n)
+			}
+			f.want("silent", 1, 1)
+			for _, to := range []api.Agent{f.h, f.own} {
+				e := f.copies(to)[0]
+				if e.Kind != api.EnvelopeKindNotice || e.To != to.Name || e.Subject != "Deployer has gone silent while release jobs wait" {
+					t.Fatalf("%s copy: %+v", to.Name, e)
+				}
+				if e.Refs["reason"] != "silent" || e.Refs["deployer"] != f.d.ID || e.Refs["run"] != f.d.RunID {
+					t.Fatalf("%s refs: %v", to.Name, e.Refs)
+				}
+				for _, part := range []string{f.d.Name, f.d.ID, f.d.RunID, "Last heartbeat: " + heartbeat, fmt.Sprintf("Last notice: #%d", lastNotice.Seq), "A release job is waiting for the verification host", "oldest " + j.ID, "Bound: 10 minutes",
+					"Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).", "Nothing was restarted or signalled."} {
+					if !strings.Contains(e.Body.Text, part) {
+						t.Fatalf("%s text lacks %q: %s", to.Name, part, e.Body.Text)
+					}
+				}
+				counts := map[string]string{"verified": "Waiting: 1 verified and 0 claimed", "claimed": "Waiting: 0 verified and 1 claimed"}[state]
+				if !strings.Contains(e.Body.Text, counts) {
+					t.Fatalf("%s text lacks %q: %s", to.Name, counts, e.Body.Text)
+				}
+				if n := countRows(t, f.s, `SELECT count(*) FROM wake_jobs WHERE task_id=? AND agent_id=?`, f.task.ID, to.ID); n != 1 {
+					t.Fatalf("%s wake jobs %d, want 1", to.Name, n)
+				}
+			}
+		})
+	}
+}
+
+// a3: a restart announced and not completed is reported though the wrapper
+// still heartbeats; a completed or refused restart is not.
+func TestDeployerLivenessRestartNotCompleted(t *testing.T) {
+	for _, subject := range []string{"Deployer is restarting itself onto the published scripts", "Deployer is restarting itself onto the published scripts with a held job"} {
+		t.Run(subject, func(t *testing.T) {
+			f := newLivenessFixture(t)
+			restart := f.say(subject)
+			f.standing(true)
+			if n := f.sweep(); n != 2 {
+				t.Fatalf("posted %d, want 2", n)
+			}
+			f.want("restart", 1, 1)
+			for _, to := range []api.Agent{f.h, f.own} {
+				e := f.copies(to)[0]
+				if e.Subject != "Deployer announced a restart and did not come back" || e.Refs["reason"] != "restart" || !strings.Contains(e.Body.Text, fmt.Sprintf("Restart notice: #%d.", restart.Seq)) || !strings.Contains(e.Body.Text, "Last heartbeat: "+ts(f.clock)) {
+					t.Fatalf("%s copy: %+v", to.Name, e)
+				}
+			}
+		})
+	}
+	for _, later := range []string{"Deployer now runs the published scripts", "Deployer is not claiming releases: its scripts are out of date"} {
+		t.Run(later, func(t *testing.T) {
+			f := newLivenessFixture(t)
+			f.say("Deployer is restarting itself onto the published scripts")
+			f.advance(time.Minute)
+			f.say(later)
+			f.standing(true)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("posted %d, want 0", n)
+			}
+			f.want("answered restart", 0, 0)
+		})
+	}
+}
+
+// a4: one notice per episode; it re-arms only once the deployer is seen alive.
+func TestDeployerLivenessOnePerEpisodeAndRearm(t *testing.T) {
+	state := func(f *livenessFixture) (st string) {
+		t.Helper()
+		if err := f.s.db.QueryRow(`SELECT state FROM release_deployer_liveness WHERE task_id=?`, f.task.ID).Scan(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	t.Run("silent", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("posted %d, want 2", n)
+		}
+		for i := 0; i < 4; i++ {
+			f.advance(livenessN)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("repeat sweep %d posted %d", i, n)
+			}
+		}
+		f.want("same episode", 1, 1)
+		if state(f) != "open" {
+			t.Fatal(state(f))
+		}
+		f.beat()
+		if n := f.sweep(); n != 0 || state(f) != "armed" {
+			t.Fatalf("alive sweep posted %d, state %s", n, state(f))
+		}
+		f.advance(livenessN - time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("below the bound after re-arm posted %d", n)
+		}
+		f.advance(2 * time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("second silence posted %d, want 2", n)
+		}
+		f.want("second episode", 2, 2)
+	})
+	t.Run("successor run", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("posted %d, want 2", n)
+		}
+		// tt deployment setup rotates the same agent onto a new run.
+		f.exec(`UPDATE agents SET run_id=?,last_seen_at=? WHERE id=?`, api.NewID("run"), ts(f.clock), f.d.ID)
+		if n := f.sweep(); n != 0 || state(f) != "armed" {
+			t.Fatalf("successor run: posted %d, state %s", n, state(f))
+		}
+		f.advance(livenessN + time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("silent successor run posted %d, want 2", n)
+		}
+		f.want("successor episode", 2, 2)
+	})
+	t.Run("restart", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.say("Deployer is restarting itself onto the published scripts")
+		f.standing(true)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("posted %d, want 2", n)
+		}
+		// A fresh heartbeat alone does not end a restart episode.
+		f.advance(livenessN)
+		f.beat()
+		if n := f.sweep(); n != 0 || state(f) != "open" {
+			t.Fatalf("heartbeat only: posted %d, state %s", n, state(f))
+		}
+		f.say("Deployer now runs the published scripts")
+		if n := f.sweep(); n != 0 || state(f) != "armed" {
+			t.Fatalf("now runs: posted %d, state %s", n, state(f))
+		}
+		f.say("Deployer is restarting itself onto the published scripts")
+		f.advance(livenessN + time.Minute)
+		f.beat()
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("second restart posted %d, want 2", n)
+		}
+		f.want("second episode", 2, 2)
+	})
+}
+
+// a5: nothing is posted when no job waits, when only an owner hold or a
+// merged or blocked job stands, in a paused project, for a retired or closed
+// deployer, or below the bound.
+func TestDeployerLivenessQuietCases(t *testing.T) {
+	quiet := func(t *testing.T, f *livenessFixture) {
+		t.Helper()
+		for i := 0; i < 3; i++ {
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("sweep %d posted %d", i, n)
+			}
+			f.advance(livenessN)
+		}
+		f.want("quiet", 0, 0)
+	}
+	t.Run("no job", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.advance(2 * livenessN)
+		quiet(t, f)
+	})
+	t.Run("only held jobs", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		j := f.enqueue()
+		if _, err := f.s.ReleaseAction(f.ctx, f.task.ID, api.ReleaseRequest{RequestID: "hold", Operation: "hold", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Hold: &api.ReleaseHold{Reason: "owner hold"}}); err != nil {
+			t.Fatal(err)
+		}
+		f.advance(2 * livenessN)
+		quiet(t, f)
+	})
+	for _, last := range []string{"merged", "block"} {
+		t.Run("only "+last+" jobs", func(t *testing.T) {
+			f := newLivenessFixture(t)
+			j := f.act(f.enqueue(), "claim")
+			j = f.act(j, "merged")
+			if last == "block" {
+				if j = f.act(j, "block"); j.State != "blocked" {
+					t.Fatal(j.State)
+				}
+			}
+			f.advance(2 * livenessN)
+			quiet(t, f)
+		})
+	}
+	t.Run("project paused", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		f.exec(`UPDATE tasks SET pause_state='paused' WHERE id=?`, f.task.ID)
+		quiet(t, f)
+	})
+	for _, status := range []string{api.AgentRetired, api.AgentClosed} {
+		t.Run("deployer "+status, func(t *testing.T) {
+			f := newLivenessFixture(t)
+			f.standing(false)
+			f.exec(`UPDATE agents SET status=? WHERE id=?`, status, f.d.ID)
+			quiet(t, f)
+		})
+	}
+	// One deployment agent row per project may be other than closed
+	// (agents_deployment_agent), so a predecessor beside a successor row is
+	// closed, and a retired one is the "deployer retired" case above.
+	t.Run("closed predecessor with a live successor", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentClosed, f.d.ID)
+		f.advance(time.Second) // the successor is the newer row
+		next, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer-2", Host: "fixture", Session: "deployer-2", Role: api.AgentRoleDeployment}, api.Caller{Node: "fixture", User: "owner"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			f.exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(f.clock), next.ID)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("sweep %d posted %d", i, n)
+			}
+			f.advance(livenessN)
+		}
+		f.want("successor alive", 0, 0)
+	})
+	t.Run("stale by less than the bound", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.enqueue()
+		f.sweep()
+		f.advance(livenessN + time.Minute) // the job has stood for the bound
+		f.beat()
+		f.advance(livenessN - time.Second)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("posted %d", n)
+		}
+		f.want("below the bound", 0, 0)
+	})
+}
+
+// a6: a healthy deployer on a long verification run keeps its heartbeat and
+// is not reported however long its claimed job stands.
+func TestDeployerLivenessLongVerificationIsQuiet(t *testing.T) {
+	f := newLivenessFixture(t)
+	f.act(f.enqueue(), "claim")
+	for elapsed := time.Duration(0); elapsed <= 3*livenessN; elapsed += time.Minute {
+		f.beat()
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("posted %d after %s", n, elapsed)
+		}
+		f.advance(time.Minute)
+	}
+	f.want("long verification", 0, 0)
+}
+
+// a7: TAILTERM_DEPLOYER_LIVENESS_MINUTES moves the bound; an invalid value is 10.
+func TestDeployerLivenessBoundSetting(t *testing.T) {
+	for _, invalid := range []string{"", "abc", "0", "-3", "1441", "2.5"} {
+		t.Setenv("TAILTERM_DEPLOYER_LIVENESS_MINUTES", invalid)
+		if got := deployerLivenessBound(); got != 10*time.Minute {
+			t.Fatalf("%q gave %s", invalid, got)
+		}
+	}
+	t.Setenv("TAILTERM_DEPLOYER_LIVENESS_MINUTES", "abc")
+	f := newLivenessFixture(t)
+	f.enqueue()
+	f.sweep()
+	f.advance(3 * time.Minute)
+	if n := f.sweep(); n != 0 {
+		t.Fatalf("invalid setting, 3 minutes: posted %d", n)
+	}
+	t.Setenv("TAILTERM_DEPLOYER_LIVENESS_MINUTES", "2")
+	if got := deployerLivenessBound(); got != 2*time.Minute {
+		t.Fatal(got)
+	}
+	g := newLivenessFixture(t)
+	g.enqueue()
+	g.sweep()
+	g.advance(time.Minute)
+	if n := g.sweep(); n != 0 {
+		t.Fatalf("bound 2, 1 minute: posted %d", n)
+	}
+	g.advance(time.Minute)
+	if n := g.sweep(); n != 2 {
+		t.Fatalf("bound 2, 2 minutes: posted %d, want 2", n)
+	}
+	if e := g.copies(g.h)[0]; !strings.Contains(e.Body.Text, "Bound: 2 minutes") {
+		t.Fatal(e.Body.Text)
+	}
+}
+
+// a8: the sweep detects and wakes only: the deployer and every release job
+// are unchanged by a sweep that posts.
+func TestDeployerLivenessChangesNothingElse(t *testing.T) {
+	f := newLivenessFixture(t)
+	f.act(f.enqueue(), "claim")
+	f.entry = releaseEntry(t, f.s, f.task, "second release item", "item-2")
+	f.enqueue()
+	f.sweep()
+	f.advance(livenessN + time.Minute)
+	snapshot := func() string {
+		t.Helper()
+		var out []string
+		for _, query := range []string{`SELECT ` + agentCols + ` FROM agents WHERE role='deployment_agent' ORDER BY id`, `SELECT rowid,task_id,id,entry_id,state,generation,record_json FROM release_jobs ORDER BY rowid`,
+			`SELECT task_id,batch_id,state FROM release_batches ORDER BY batch_id`} {
+			rows, err := f.s.db.Query(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cols, _ := rows.Columns()
+			for rows.Next() {
+				vals := make([]any, len(cols))
+				for i := range vals {
+					vals[i] = new(any)
+				}
+				if err := rows.Scan(vals...); err != nil {
+					t.Fatal(err)
+				}
+				for _, v := range vals {
+					out = append(out, fmt.Sprint(*v.(*any)))
+				}
+			}
+			rows.Close()
+		}
+		return strings.Join(out, "\x00")
+	}
+	before := snapshot()
+	if n := f.sweep(); n != 2 {
+		t.Fatalf("posted %d, want 2", n)
+	}
+	if after := snapshot(); after != before {
+		t.Fatalf("sweep changed the deployer or a release job:\nbefore %q\nafter  %q", before, after)
+	}
+	var status, run, seen string
+	if err := f.s.db.QueryRow(`SELECT status,run_id,last_seen_at FROM agents WHERE id=?`, f.d.ID).Scan(&status, &run, &seen); err != nil || status != api.AgentRunning || run != f.d.RunID || seen == "" {
+		t.Fatal(status, run, seen, err)
+	}
+}
+
+// a9: the runner subjects the rule reads are the ones the runner posts, so a
+// reworded runner notice fails here rather than silencing the rule.
+func TestDeployerLivenessRunnerSubjects(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "release-runner.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := string(raw)
+	for _, literal := range []string{
+		`subject:"` + deployerRestartSubject + `"`,
+		`subject:"` + deployerRestartSubject + ` with a held job"`,
+		`subject:"` + deployerRestartedSubject + `"`,
+		`"` + deployerNotClaimingSubject + `: it cannot compare its scripts with the published ones"`,
+		`"` + deployerNotClaimingSubject + `: its scripts are out of date"`,
+	} {
+		if !strings.Contains(runner, literal) {
+			t.Fatalf("scripts/release-runner.mjs no longer contains %s", literal)
+		}
+	}
+}
+
+// a12: a job counts as waiting only after it has stood in its state for the
+// bound, as the sweep saw it.
+func TestDeployerLivenessJobMustStandForBound(t *testing.T) {
+	t.Run("verified", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.advance(2 * livenessN) // deployer silent for twice the bound
+		f.enqueue()
+		f.sweep()
+		f.advance(livenessN - time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("job seen for the bound minus a minute: posted %d", n)
+		}
+		f.advance(2 * time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("job seen for the bound plus a minute: posted %d, want 2", n)
+		}
+		f.want("stood", 1, 1)
+	})
+	t.Run("verified then claimed", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		j := f.enqueue()
+		f.sweep()
+		f.advance(3 * livenessN) // long in verified, deployer alive
+		f.beat()
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("alive deployer: posted %d", n)
+		}
+		f.act(j, "claim") // the deployer's last sign of life
+		f.advance(livenessN - time.Minute)
+		if n := f.sweep(); n != 0 { // first sight of claimed
+			t.Fatalf("first sight of claimed: posted %d", n)
+		}
+		f.advance(time.Minute) // silent for the bound, claimed seen a minute ago
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("claimed for a minute: posted %d", n)
+		}
+		f.want("claimed for a minute", 0, 0)
+		f.advance(livenessN - 2*time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("claimed for the bound minus a minute: posted %d", n)
+		}
+		f.advance(time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("claimed for the bound: posted %d, want 2", n)
+		}
+		f.want("claimed for the bound", 1, 1)
+	})
+}
+
+// a13: each recipient gets exactly one copy per episode; one absent when the
+// episode opens gets its copy when it returns, and a retired handler none.
+func TestDeployerLivenessLateRecipientGetsOneCopy(t *testing.T) {
+	status := func(f *livenessFixture, a api.Agent, st string) {
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, st, a.ID)
+	}
+	t.Run("handler retired", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		status(f, f.h, api.AgentRetired)
+		if n := f.sweep(); n != 1 {
+			t.Fatalf("posted %d, want 1", n)
+		}
+		f.want("handler retired", 0, 1)
+		f.advance(time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("still retired: posted %d", n)
+		}
+		status(f, f.h, api.AgentRunning)
+		if n := f.sweep(); n != 1 {
+			t.Fatalf("handler resumed: posted %d, want 1", n)
+		}
+		f.want("handler resumed", 1, 1)
+		for i := 0; i < 3; i++ {
+			f.advance(livenessN)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("later sweep %d posted %d", i, n)
+			}
+		}
+		f.want("later sweeps", 1, 1)
+	})
+	t.Run("neither present then both", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.standing(false)
+		status(f, f.h, api.AgentRetired)
+		status(f, f.own, api.AgentExited)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("no recipient: posted %d", n)
+		}
+		f.want("no recipient", 0, 0)
+		status(f, f.h, api.AgentRunning)
+		status(f, f.own, api.AgentRunning)
+		f.advance(time.Minute)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("both back: posted %d, want 2", n)
+		}
+		f.advance(time.Minute)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("after both copies: posted %d", n)
+		}
+		f.want("both back", 1, 1)
+	})
+}
+
+// a14 records a limit; it does not close it. A runner that hangs while its
+// tt wrap wrapper still heartbeats, and that announced no restart, is not
+// detected: the hub has no signal that separates it from a long verification
+// run (docs/project-deployment.md, "Not detected").
+func TestDeployerLivenessHungRunnerIsNotDetected(t *testing.T) {
+	f := newLivenessFixture(t)
+	f.enqueue() // verified and never claimed: the runner is hung
+	for elapsed := time.Duration(0); elapsed <= 3*livenessN; elapsed += time.Minute {
+		f.beat() // the wrapper lives
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("posted %d after %s", n, elapsed)
+		}
+		f.advance(time.Minute)
+	}
+	f.want("hung runner, live wrapper", 0, 0)
 }
