@@ -292,6 +292,7 @@
     "01-static-release-verify": 120000
   },
   "goTestFlags": ["-timeout=45m"],
+  "goRaceShards": { "./internal/store": 4 },
   "maxAttempts": 3,
   "knownFailures": []
 }

@@ -466,6 +466,92 @@ func TestReleaseImportBindsOwnerApprovedMatrixChange(t *testing.T) {
 	}
 }
 
+// shardedRace is the go-race of a matrix with goRaceShards: the matrix
+// runner's own command with the shard count in its prefix, then only packages
+// (wi_d6b6387726c1f846). The coverage rule reads it like the go test form.
+func shardedRace(k int, packages ...string) api.VerificationCheck {
+	race := goRace(nil, packages...)
+	race.Argv = append([]string{"node", "../scripts/verify-matrix.mjs", "go-race", "-timeout=45m", fmt.Sprintf("-shards=./internal/store=%d", k)}, packages...)
+	return race
+}
+
+// Under one matrix a sharded go-race is covered by a sharded go-race with the
+// same prefix and a package superset. Another shard count is another prefix.
+func TestReleaseImportCoversShardedGoRaceBySuperset(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	approved := goRaceMatrix(shardedRace(4, "./internal/api"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	refuse := func(name string, checks []api.VerificationCheck) {
+		t.Helper()
+		_, err := s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "shard-"+name, checks))
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "integrated matrix omitted approved check go-race") {
+			t.Fatalf("%s: %v", name, err)
+		}
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil || saved.Generation != j.Generation || saved.IntegratedPlan != nil || saved.IntegratedCoverage != nil {
+			t.Fatal(name, "changed the job", saved.Generation, saved.IntegratedCoverage, err)
+		}
+	}
+	refuse("other-k", goRaceMatrix(shardedRace(5, widerPackages...)))
+	refuse("missing-package", goRaceMatrix(shardedRace(4, "./cmd/tt", "./internal/store")))
+	refuse("go-test-form", goRaceMatrix(goRace([]string{"-race", "-timeout=45m"}, widerPackages...)))
+	refuse("flag-after", goRaceMatrix(shardedRace(4, append(slices.Clone(widerPackages), "-shards=./internal/api=2")...)))
+	// An approved store-only go-race and an approved "./..." follow the same rule.
+	j = approveChecks(t, s, j, goRaceMatrix(shardedRace(4, "./internal/store")))
+	refuse("store-missing", goRaceMatrix(shardedRace(4, "./internal/api")))
+	j = approveChecks(t, s, j, goRaceMatrix(shardedRace(4, "./...")))
+	refuse("all-vs-list", goRaceMatrix(shardedRace(4, widerPackages...)))
+	j = approveChecks(t, s, j, approved)
+
+	integrated := goRaceMatrix(shardedRace(4, widerPackages...))
+	imported, err := s.ReleaseAction(ctx, task.ID, integratedImport(j, h, d, "shard-import", integrated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []api.ReleaseCheckCoverage{{CheckID: "go-race", ApprovedDigest: verificationDigest(approved[71]), IntegratedDigest: verificationDigest(integrated[71]), Relation: "superset"}}
+	if !slices.Equal(imported.IntegratedCoverage, want) || imported.IntegratedMatrix != nil || imported.Generation != j.Generation+1 {
+		t.Fatalf("coverage %+v matrix %+v", imported.IntegratedCoverage, imported.IntegratedMatrix)
+	}
+}
+
+// A go-race approved in the go test form, before the matrix gained shards, is
+// covered by a sharded one only as an owner-approved matrix change, and only
+// while every approved package is still tested.
+func TestReleaseImportCoversGoTestRaceByShardsOnlyAsMatrixChange(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	approved := goRaceMatrix(goRace([]string{"-race", "-timeout=45m"}, "./internal/api", "./internal/store"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	integrated := goRaceMatrix(shardedRace(4, widerPackages...))
+	refuse := func(name, want string, req api.ReleaseRequest) {
+		t.Helper()
+		_, err := s.ReleaseAction(ctx, task.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil || saved.Generation != j.Generation || saved.IntegratedPlan != nil || saved.IntegratedMatrix != nil || saved.IntegratedCoverage != nil {
+			t.Fatal(name, "changed the job", saved.Generation, saved.IntegratedMatrix, err)
+		}
+	}
+	const omitted = "integrated matrix omitted approved check go-race"
+	refuse("same-matrix", omitted, integratedImport(j, h, d, "shards-same-matrix", integrated))
+	refuse("no-approval", "release: matrix digest changed aaaaaaaa -> bbbbbbbb; no approval", matrixImport(j, h, d, "shards-no-approval", matrixB, 0, integrated))
+	covering := ownerApproval(t, s, task, "verification-matrix-approval:"+matrixB)
+	refuse("store-dropped", omitted, matrixImport(j, h, d, "shards-narrow", matrixB, covering, goRaceMatrix(shardedRace(4, "./cmd/tt", "./internal/api"))))
+
+	imported, err := s.ReleaseAction(ctx, task.ID, matrixImport(j, h, d, "shards-import", matrixB, covering, integrated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMatrix := api.ReleaseMatrixChange{ApprovedDigest: matrixA, IntegratedDigest: matrixB, ApprovalMessageSeq: covering}
+	wantCoverage := []api.ReleaseCheckCoverage{{CheckID: "go-race", ApprovedDigest: verificationDigest(approved[71]), IntegratedDigest: verificationDigest(integrated[71]), Relation: "matrix_changed"}}
+	if imported.IntegratedMatrix == nil || *imported.IntegratedMatrix != wantMatrix || !slices.Equal(imported.IntegratedCoverage, wantCoverage) || imported.Generation != j.Generation+1 {
+		t.Fatalf("matrix %+v coverage %+v", imported.IntegratedMatrix, imported.IntegratedCoverage)
+	}
+}
+
 // A requeued or set-aside job starts its integrated verification from
 // scratch, the recorded matrix change included.
 func TestReleaseRequeueAndSetAsideClearIntegratedMatrix(t *testing.T) {

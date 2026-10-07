@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { prepareTestBinary, sourceIdentity, fileHash } from "./test-binaries.mjs";
 import { createServer } from "node:net";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   selectChecks,
@@ -175,10 +176,11 @@ test("ownership union diff selects all engines, migration and touched race packa
   assert(checks.some((c) => c.id === "go-vet"));
   assert(checks.some((c) => c.id === "migration-rehearsal"));
   assert.deepEqual(checks.find((c) => c.id === "go-race").argv, [
-    "go",
-    "test",
-    "-race",
+    "node",
+    "../scripts/verify-matrix.mjs",
+    "go-race",
     "-timeout=45m",
+    "-shards=./internal/store=4",
     "./internal/store",
   ]);
   for (const suite of matrix.browserSuites)
@@ -890,10 +892,11 @@ test("removed Go package is excluded from candidate race targets", () => {
     new Set(),
   );
   assert.deepEqual(checks.find((c) => c.id === "go-race").argv, [
-    "go",
-    "test",
-    "-race",
+    "node",
+    "../scripts/verify-matrix.mjs",
+    "go-race",
     "-timeout=45m",
+    "-shards=./internal/store=4",
     "./...",
   ]);
 });
@@ -1788,7 +1791,10 @@ test("approved goTestFlags reach only go-test and go-race, and only as a timeout
   const checks = selectChecks(matrix, ["hub/internal/store/migrate.go"], []);
   const argv = (id) => checks.find((c) => c.id === id).argv;
   assert.deepEqual(argv("go-test"), ["go", "test", "-timeout=45m", "./..."]);
-  assert.deepEqual(argv("go-race"), ["go", "test", "-race", "-timeout=45m", "./internal/store"]);
+  assert.deepEqual(argv("go-race"), [
+    "node", "../scripts/verify-matrix.mjs", "go-race", "-timeout=45m",
+    "-shards=./internal/store=4", "./internal/store",
+  ]);
   assert.deepEqual(argv("go-vet"), ["go", "vet", "./..."]);
   assert(!argv("migration-rehearsal").includes("-timeout=45m"));
   const { goTestFlags, ...legacy } = matrix;
@@ -3541,4 +3547,667 @@ test("detached a10 an output directory inside the worktree is refused before any
   assert.notEqual(await linked.closed, 0, linked.text);
   assert(!linked.text.includes("matrix run:"), linked.text);
   assert(!existsSync(join(f.cwd, "logs", "runner.log")) && !existsSync(join(f.cwd, "logs", "runner.json")));
+});
+
+// wi_d6b6387726c1f846: the store race suite runs as K shards inside the one
+// go-race check. A test's shard is the first 8 hex digits of the SHA-256 of
+// its name modulo K, and the last shard is a catch-all that skips the others.
+const {
+  goRaceShardOf,
+  goRaceTestNames,
+  goRacePartition,
+  assertGoRacePartition,
+  goRaceShardSelectors,
+  goRaceRunCounts,
+  assertRanExactlyOnce,
+  goRaceShardSpec,
+  checkWeight,
+} = matrixRunner;
+const shardPrefix = (k = 4, pkg = "./internal/store") => [
+  "node", "../scripts/verify-matrix.mjs", "go-race", "-timeout=45m", `-shards=${pkg}=${k}`,
+];
+const shardedCheck = (k, ...packages) => ({
+  id: "go-race",
+  argv: [...shardPrefix(k), ...packages],
+  cwd: "hub",
+  environment: {},
+});
+
+test("a test's shard is pinned to its name and does not move when other tests come or go", () => {
+  // printf TestAlpha | shasum -a 256 starts 3993fc05, TestGamma 0592ea06.
+  assert.equal(goRaceShardOf("TestAlpha", 4), 0x3993fc05 % 4);
+  assert.equal(goRaceShardOf("TestGamma", 4), 0x0592ea06 % 4);
+  const pinned = {
+    TestAlpha: 1, TestBeta: 3, TestGamma: 2, TestDelta: 1, TestEpsilon: 2,
+    FuzzSeed: 1, ExampleHello: 2, TestInboxScale: 1, TestUsageTimeWaitCauses: 2,
+  };
+  for (const [name, shard] of Object.entries(pinned))
+    assert.equal(goRaceShardOf(name, 4), shard, name);
+  const names = Object.keys(pinned);
+  const { parts, digest: partitionDigest } = goRacePartition(names, 4);
+  assert.deepEqual(parts, [
+    [],
+    ["FuzzSeed", "TestAlpha", "TestDelta", "TestInboxScale"],
+    ["ExampleHello", "TestEpsilon", "TestGamma", "TestUsageTimeWaitCauses"],
+    ["TestBeta"],
+  ]);
+  assert.equal(
+    partitionDigest,
+    createHash("sha256").update(JSON.stringify(parts)).digest("hex"),
+    "the digest is the SHA-256 of the canonical JSON of the K sorted lists",
+  );
+  assert.deepEqual(goRacePartition([...names].reverse(), 4), { parts, digest: partitionDigest });
+  const shardsOf = (list) =>
+    Object.fromEntries(goRacePartition(list, 4).parts.flatMap((part, i) => part.map((name) => [name, i])));
+  const grown = shardsOf([...names, "TestAdded", "TestAlsoAdded", "ExampleNew"]),
+    shrunk = shardsOf(names.filter((name) => name !== "TestAlpha" && name !== "TestBeta"));
+  for (const [name, shard] of Object.entries(pinned)) {
+    assert.equal(grown[name], shard, name + " moved when tests were added");
+    if (name in shrunk) assert.equal(shrunk[name], shard, name + " moved when tests were removed");
+  }
+  assert.equal(Object.keys(shrunk).length, names.length - 2);
+  assert.throws(() => goRacePartition(["TestAlpha", "TestBeta", "TestAlpha"], 4), /^Error: Duplicate Go test name: TestAlpha$/);
+  for (const k of [1, 9, 2.5, "4"])
+    assert.throws(() => goRacePartition(names, k), /shard count must be an integer from 2 to 8/);
+});
+
+test("shard selectors list every shard but the catch-all, which skips the others", () => {
+  const { parts } = goRacePartition(["TestAlpha", "TestBeta", "TestGamma", "TestDelta"], 4);
+  assert.deepEqual(goRaceShardSelectors(parts), [
+    null,
+    ["-run", "^(TestAlpha|TestDelta)$"],
+    ["-run", "^(TestGamma)$"],
+    ["-skip", "^(TestAlpha|TestDelta|TestGamma)$"],
+  ]);
+  // No name outside the catch-all: it still starts, with nothing to skip.
+  assert.deepEqual(goRaceShardSelectors([[], ["TestBeta"]]), [null, []]);
+  assertGoRacePartition(["TestAlpha", "TestBeta", "TestGamma", "TestDelta"], parts);
+  const refused = (names, lists, pattern) =>
+    assert.throws(() => assertGoRacePartition(names, lists), pattern);
+  refused(["TestA", "TestB"], [["TestA"], []], /^Error: go-race shards do not hold every test exactly once: missing: TestB$/);
+  refused(["TestA", "TestB"], [["TestA"], ["TestA", "TestB"]], /more than once: TestA$/);
+  refused(["TestA"], [["TestA"], ["TestC"]], /unlisted: TestC$/);
+  refused(["TestA", "TestA"], [["TestA"], []], /the test list repeats a name$/);
+});
+
+test("the source rule names every top-level Test, Fuzz and Example function except TestMain", () => {
+  const names = goRaceTestNames([
+    'package store\n\nfunc TestOne(t *testing.T) {}\nfunc TestMain(m *testing.M) {}\nfunc Test(t *testing.T) {}\n' +
+      "func Testlower(t *testing.T) {}\nfunc (s *suite) TestMethod(t *testing.T) {}\n\tfunc TestIndented(t *testing.T) {}\n" +
+      "func helperTest() {}\nfunc Test_underscore(t *testing.T) {}\nfunc Test2(t *testing.T) {}\n",
+    "func FuzzThree(f *testing.F) {}\nfunc ExampleFour() {}\nfunc Example() {}\nfunc Example_suffix() {}\nfunc Examples() {}\nfunc BenchmarkFive(b *testing.B) {}\nfunc TestOne(t *testing.T) {}\n",
+  ]);
+  assert.deepEqual(names, [
+    "TestOne", "Test", "Test_underscore", "Test2",
+    "FuzzThree", "ExampleFour", "Example", "Example_suffix", "TestOne",
+  ]);
+});
+
+test("run counts read top-level run events only, and exactly-once names what is wrong", () => {
+  const event = (Action, Test) => JSON.stringify({ Action, Package: "fixture/store", ...(Test ? { Test } : {}) });
+  const counts = goRaceRunCounts([
+    event("start"), event("run", "TestA"), event("output", "TestA"), event("run", "TestA/sub"),
+    event("pause", "TestA"), event("cont", "TestA"), event("pass", "TestA"),
+    event("run", "FuzzB"), event("run", "FuzzB/seed#0"), event("run", "ExampleC"),
+    "not json", event("pass"),
+  ]);
+  assert.deepEqual([...counts], [["TestA", 1], ["FuzzB", 1], ["ExampleC", 1]]);
+  assertRanExactlyOnce(["TestA", "FuzzB", "ExampleC"], counts);
+  assert.throws(
+    () => assertRanExactlyOnce(["TestA", "TestMissing"], goRaceRunCounts([event("run", "TestA"), event("run", "TestA"), event("run", "TestExtra")])),
+    /^Error: go-race shards did not run every test exactly once: missing: TestMissing; more than once: TestA; unlisted: TestExtra$/,
+  );
+});
+
+test("with approved shards every go-race argv has one prefix, and without the key the argv is unchanged", () => {
+  assert.deepEqual(matrix.goRaceShards, { "./internal/store": 4 });
+  const race = (m, owned) => selectChecks(m, owned, []).find((c) => c.id === "go-race").argv;
+  const lists = {
+    "hub/internal/store/migrate.go": ["./internal/store"],
+    "hub/internal/api/releases.go": ["./internal/api"],
+    "hub/go.mod": ["./..."],
+  };
+  for (const [owned, packages] of Object.entries(lists)) {
+    const argv = race(matrix, [owned]);
+    assert.deepEqual(argv.slice(0, 5), shardPrefix(), owned);
+    assert.deepEqual(argv.slice(5), packages, owned);
+  }
+  assert.deepEqual(
+    race(matrix, ["hub/internal/api/releases.go", "hub/internal/store/migrate.go"]),
+    [...shardPrefix(), "./internal/api", "./internal/store"],
+  );
+  // The key changes go-race only.
+  const { goRaceShards, ...legacy } = matrix;
+  const others = (m) => selectChecks(m, ["hub/internal/store/migrate.go", "client/app.js"], []).filter((c) => c.id !== "go-race");
+  assert.deepEqual(others(matrix), others(legacy));
+  assert.deepEqual(race(legacy, ["hub/internal/store/migrate.go"]), ["go", "test", "-race", "-timeout=45m", "./internal/store"]);
+  assert.deepEqual(race(legacy, ["hub/internal/api/releases.go"]), ["go", "test", "-race", "-timeout=45m", "./internal/api"]);
+  assert.deepEqual(race(legacy, ["hub/go.mod"]), ["go", "test", "-race", "-timeout=45m", "./..."]);
+  for (const shards of [
+    null, [], "./internal/store=4", {}, { "./internal/store": 4, "./internal/api": 2 },
+    { "./internal/store": 1 }, { "./internal/store": 9 }, { "./internal/store": "4" }, { "./internal/store": 2.5 },
+    { "./...": 4 }, { "internal/store": 4 }, { "./internal/../store": 4 }, { "./internal//store": 4 },
+    { "./internal/store -run=X": 4 }, { "./": 4 },
+  ])
+    assert.throws(
+      () => selectChecks({ ...matrix, goRaceShards: shards }, ["hub/cmd/tt/main.go"], []),
+      /^Error: Invalid matrix goRaceShards$/,
+      JSON.stringify(shards),
+    );
+});
+
+test("a go-race that will shard holds slots for K race processes, capped at the job count", () => {
+  assert.equal(matrixRunner.GO_RACE_PROCESS_BYTES, 1024 ** 3);
+  assert.equal(matrixRunner.JOB_SLOT_BYTES, 3 * 1024 ** 3);
+  assert.equal(defaultJobs(10, 16 * 1024 ** 3), 5);
+  assert.deepEqual(goRaceShardSpec(shardedCheck(4, "./internal/store")), { package: "./internal/store", k: 4 });
+  assert.deepEqual(goRaceShardSpec(shardedCheck(4, "./...")), { package: "./internal/store", k: 4 });
+  assert.equal(goRaceShardSpec(shardedCheck(4, "./internal/api")), null, "this list will not shard");
+  assert.equal(goRaceShardSpec({ ...shardedCheck(4, "./internal/store"), id: "go-test" }), null);
+  assert.equal(checkWeight(shardedCheck(4, "./internal/store"), 5), 2);
+  assert.equal(checkWeight(shardedCheck(4, "./..."), 5), 2);
+  assert.equal(checkWeight(shardedCheck(6, "./internal/store"), 5), 2);
+  assert.equal(checkWeight(shardedCheck(7, "./internal/store"), 5), 3);
+  assert.equal(checkWeight(shardedCheck(8, "./internal/api", "./internal/store"), 5), 3);
+  assert.equal(checkWeight(shardedCheck(4, "./internal/api"), 5), 2, "a go-race that will not shard keeps weight 2");
+  assert.equal(checkWeight(goFixture("go-race", ["go", "test", "-race", "-timeout=45m", "./internal/store"]), 5), 2);
+  assert.equal(checkWeight(shardedCheck(7, "./internal/store"), 2), 2, "capped at the job count");
+  assert.equal(checkWeight(shardedCheck(4, "./internal/store"), 1), 1);
+  assert.equal(checkWeight(goFixture("go-test", ["go", "test", "./..."]), 5), 1);
+  // The sharded check is still a Go check: it holds the Go lane.
+  assert(executionLocks(shardedCheck(4, "./internal/store")).includes("go"));
+});
+
+test("an accepted go test race is rebuilt as shards only under a changed matrix, and sharded lists union", () => {
+  const environment = { VERIFICATION_TIMEOUT_MS: "3000000" };
+  const old = { ...goFixture("go-race", ["go", "test", "-race", "-timeout=45m", "./cmd/tt"]), environment };
+  const sharded = (...packages) => ({ ...shardedCheck(4, ...packages), environment });
+  assert.throws(
+    () => matrixRunner.keepAcceptedChecks([sharded("./internal/store")], [old]),
+    /^Error: Accepted check differs from the selected one: go-race$/,
+  );
+  const rebuilt = matrixRunner.keepAcceptedChecks([sharded("./internal/store")], [old], undefined, { matrixChanged: true });
+  assert.deepEqual(rebuilt.checks[0].argv, [...shardPrefix(), "./cmd/tt", "./internal/store"]);
+  assert.deepEqual(rebuilt.preserved.rebuilt, ["go-race"]);
+  const widened = matrixRunner.keepAcceptedChecks([sharded("./internal/store")], [sharded("./internal/api")]);
+  assert.deepEqual(widened.checks[0].argv, [...shardPrefix(), "./internal/api", "./internal/store"]);
+  assert.deepEqual(widened.preserved.widened, ["go-race"]);
+  assert.deepEqual(
+    matrixRunner.keepAcceptedChecks([sharded("./internal/store")], [sharded("./...")]).checks[0].argv,
+    [...shardPrefix(), "./..."],
+  );
+  // Another shard count is another prefix: refused under one matrix.
+  assert.throws(
+    () => matrixRunner.keepAcceptedChecks([sharded("./internal/store")], [{ ...shardedCheck(5, "./internal/store"), environment }]),
+    /^Error: Accepted check differs from the selected one: go-race$/,
+  );
+});
+
+function shardPlanFixture(t) {
+  const f = fixture(t);
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({
+      maxAttempts: 3,
+      knownFailures: [],
+      version: 1,
+      browserSuites: [],
+      excludedBrowserSuites: [],
+      rules: [
+        { prefixes: ["hub/"], groups: ["go"] },
+        { prefixes: ["docs/"], groups: ["unit"] },
+      ],
+      goTestFlags: ["-timeout=5m"],
+      goRaceShards: { "./internal/store": 2 },
+    }),
+  );
+  const files = {
+    "hub/go.mod": "module fixture\n\ngo 1.24.0\n",
+    "hub/internal/api/api.go": "package api\n",
+    "hub/internal/store/store.go": "package store\n",
+    "hub/internal/store/a_test.go":
+      'package store\n\nimport "testing"\n\nfunc TestMain(m *testing.M) { m.Run() }\nfunc TestOne(t *testing.T) {}\nfunc TestTwo(t *testing.T) {}\nfunc FuzzThree(f *testing.F) {}\n',
+    "hub/internal/store/b_test.go":
+      'package store\n\nimport "testing"\n\nfunc ExampleFour() {}\nfunc Test(t *testing.T) {}\nfunc helperTest() {}\nfunc Testlower() {}\n',
+    // Another package's tests are not the shard package's.
+    "hub/internal/store/sub/sub_test.go": 'package sub\n\nimport "testing"\n\nfunc TestSub(t *testing.T) {}\n',
+    "hub/internal/store/notes_test.txt": "func TestNotGo(t *testing.T) {}\n",
+  };
+  for (const path of Object.keys(files)) commitChange(f, path, files[path], "add " + path);
+  const base = f.git("rev-parse", "HEAD");
+  const context = (commit, owned) => ({
+    operationKey: "fixture",
+    repository: "fixture",
+    baseCommit: base,
+    commit,
+    owned,
+    verifierAgentId: "fixture",
+    verifierRunId: "fixture",
+    approvedMatrixDigest: digest(readFileSync(join(f.cwd, "verification/matrix.json"), "utf8")),
+    matrixApprovalMessageSeq: 1,
+  });
+  return { ...f, base, context, names: ["TestOne", "TestTwo", "FuzzThree", "ExampleFour", "Test"] };
+}
+
+test("plan creation partitions the shard package's tests at the commit and prints K, the count and the digest", (t) => {
+  const f = shardPlanFixture(t);
+  const store = commitChange(f, "hub/internal/store/store.go", "package store\n\nvar Changed = 1\n", "store change");
+  const context = f.context(store, ["hub/internal/store/store.go"]);
+  const { plan, goRaceShards } = matrixRunner.planWithPreservation(context, f.cwd);
+  const race = plan.checks.find((c) => c.id === "go-race");
+  assert.deepEqual(race.argv, [
+    "node", "../scripts/verify-matrix.mjs", "go-race", "-timeout=5m", "-shards=./internal/store=2", "./internal/store",
+  ]);
+  assert.equal(race.environment.VERIFICATION_BASE_COMMIT, f.base);
+  for (const check of plan.checks)
+    assert.equal(check.environment.VERIFICATION_BASE_COMMIT, check.cwd === "hub" ? f.base : undefined, check.id);
+  assert.equal(
+    makeTargetedPlan({ baseCommit: f.base, commit: store }, f.cwd).checks.find((c) => c.id === "go-race").environment.VERIFICATION_BASE_COMMIT,
+    f.base,
+  );
+  // The partition: disjoint lists whose union is the source list, each name
+  // in the shard its hash gives.
+  const { parts, digest: partitionDigest } = goRacePartition(f.names, 2);
+  assert.deepEqual(parts.flat().sort(), [...f.names].sort());
+  assert.equal(new Set(parts.flat()).size, f.names.length);
+  parts.forEach((part, i) => part.forEach((name) => assert.equal(goRaceShardOf(name, 2), i)));
+  assert.equal(partitionDigest, createHash("sha256").update(JSON.stringify(parts)).digest("hex"));
+  const line = `go-race shards: ./internal/store K=2 tests=5 partition sha256:${partitionDigest}`;
+  assert.match(line, /^go-race shards: \.\/internal\/store K=2 tests=5 partition sha256:[a-f0-9]{64}$/);
+  assert.deepEqual(goRaceShards, { package: "./internal/store", k: 2, tests: 5, digest: partitionDigest, line });
+  assert.equal("goRaceShards" in plan, false, "the plan itself carries no partition");
+
+  const directory = tempDir(t, "verification-shard-plan-");
+  const planMode = (input) => {
+    writeFileSync(join(directory, "context.json"), JSON.stringify(input));
+    return spawnSync(
+      process.execPath,
+      [matrixScript, "plan", join(directory, "context.json"), join(directory, "plan.json")],
+      { cwd: f.cwd, encoding: "utf8" },
+    );
+  };
+  let result = planMode(context);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, line + "\n");
+  assert.deepEqual(JSON.parse(readFileSync(join(directory, "plan.json"), "utf8")), plan);
+
+  // A go-race that will not shard prints nothing; ./... does.
+  const api = commitChange(f, "hub/internal/api/api.go", "package api\n\nvar Changed = 1\n", "api change");
+  result = planMode({ ...f.context(api, ["hub/internal/api/api.go"]), baseCommit: store });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  const every = commitChange(f, "hub/go.mod", "module fixture\n\ngo 1.24.0\n\n// changed\n", "module change");
+  result = planMode({ ...f.context(every, ["hub/go.mod"]), baseCommit: api });
+  assert.deepEqual(raceArgv(JSON.parse(readFileSync(join(directory, "plan.json"), "utf8"))).slice(-1), ["./..."]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, line + "\n");
+
+  // Plan creation fails when the partition does not hold every test exactly
+  // once: a dropped name, a name in two shards, and a real duplicate.
+  const tampered = (change) => (names, k) => {
+    const made = goRacePartition(names, k);
+    change(made.parts);
+    return made;
+  };
+  assert.throws(
+    () => matrixRunner.planWithPreservation(context, f.cwd, {
+      partition: tampered((lists) => lists.forEach((list, i) => (lists[i] = list.filter((name) => name !== "TestTwo")))),
+    }),
+    /^Error: go-race shards do not hold every test exactly once: missing: TestTwo$/,
+  );
+  assert.throws(
+    () => matrixRunner.planWithPreservation(context, f.cwd, {
+      partition: tampered((lists) => lists[1 - goRaceShardOf("TestTwo", 2)].push("TestTwo")),
+    }),
+    /^Error: go-race shards do not hold every test exactly once: more than once: TestTwo$/,
+  );
+  const duplicate = commitChange(f, "hub/internal/store/c_test.go", 'package store\n\nimport "testing"\n\nfunc TestOne(t *testing.T) {}\n', "duplicate test");
+  result = planMode(f.context(duplicate, ["hub/internal/store/c_test.go"]));
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "Duplicate Go test name: TestOne\n");
+});
+
+// A real Go module run through the go-race command. Every fixture test appends
+// "package name pid nanoseconds run" to FIXTURE_LOG, and a go wrapper on PATH
+// records each go command line before running it.
+const fixtureGoTests = {
+  "go.mod": "module fixture\n\ngo 1.24.0\n",
+  "internal/fixturelog/log.go": `package fixturelog
+
+import (
+	"fmt"
+	"os"
+	"time"
+)
+
+func Record(pkg, name string) {
+	f, err := os.OpenFile(os.Getenv("FIXTURE_LOG"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	// Reading the run's number keeps go test from reusing a cached result.
+	fmt.Fprintf(f, "%s %s %d %d %s\\n", pkg, name, os.Getpid(), time.Now().UnixNano(), os.Getenv("FIXTURE_RUN"))
+	time.Sleep(20 * time.Millisecond)
+}
+`,
+  "store/store.go": 'package store\n\nfunc Hello() string { return "hello" }\n',
+  "store/store_test.go": `package store
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"fixture/internal/fixturelog"
+)
+
+func TestAlpha(t *testing.T) {
+	fixturelog.Record("store", "TestAlpha")
+	if os.Getenv("FIXTURE_SLEEP") != "" {
+		time.Sleep(time.Minute)
+	}
+}
+func TestBeta(t *testing.T) {
+	fixturelog.Record("store", "TestBeta")
+	t.Run("one", func(t *testing.T) {})
+	t.Run("two", func(t *testing.T) {})
+}
+func TestGamma(t *testing.T) { fixturelog.Record("store", "TestGamma") }
+func TestDelta(t *testing.T) {
+	fixturelog.Record("store", "TestDelta")
+	if os.Getenv("FIXTURE_FAIL") == "store" {
+		t.Fatal("fixture failure")
+	}
+}
+func TestEpsilon(t *testing.T) { fixturelog.Record("store", "TestEpsilon") }
+func FuzzSeed(f *testing.F) {
+	fixturelog.Record("store", "FuzzSeed")
+	f.Add("seed")
+	f.Fuzz(func(t *testing.T, s string) {})
+}
+func ExampleHello() {
+	fixturelog.Record("store", "ExampleHello")
+	fmt.Println(Hello())
+	// Output: hello
+}
+`,
+  "other/other.go": "package other\n",
+  "other/other_test.go": `package other
+
+import (
+	"os"
+	"testing"
+
+	"fixture/internal/fixturelog"
+)
+
+func TestOther(t *testing.T) {
+	fixturelog.Record("other", "TestOther")
+	if os.Getenv("FIXTURE_FAIL") == "other" {
+		t.Fatal("fixture failure")
+	}
+}
+`,
+  "third/third.go": "package third\n",
+  "third/third_test.go": `package third
+
+import (
+	"testing"
+
+	"fixture/internal/fixturelog"
+)
+
+func TestThird(t *testing.T) { fixturelog.Record("third", "TestThird") }
+`,
+};
+const fixtureStoreTests = ["TestAlpha", "TestBeta", "TestGamma", "TestDelta", "TestEpsilon", "FuzzSeed", "ExampleHello"];
+function goRaceFixture(t) {
+  const cwd = tempDir(t, "verification-go-race-"),
+    tools = tempDir(t, "verification-go-race-tools-");
+  for (const [path, content] of Object.entries(fixtureGoTests)) {
+    mkdirSync(join(cwd, path, ".."), { recursive: true });
+    writeFileSync(join(cwd, path), content);
+  }
+  const realGo = execFileSync("sh", ["-c", "command -v go"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    join(tools, "go"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FIXTURE_GO_ARGV"\nexec '${realGo}' "$@"\n`,
+    { mode: 0o755 },
+  );
+  const log = join(tools, "tests.log"),
+    commands = join(tools, "go-argv.log");
+  const environment = (extra = {}) => ({
+    ...process.env,
+    PATH: tools + ":" + process.env.PATH,
+    FIXTURE_LOG: log,
+    FIXTURE_GO_ARGV: commands,
+    VERIFICATION_JOBS: "5",
+    ...extra,
+  });
+  const lines = (path) => (existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean) : []);
+  const entries = () =>
+    lines(log).map((line) => {
+      const [pkg, name, pid, at] = line.split(" ");
+      return { pkg, name, pid, at: BigInt(at) };
+    });
+  let runs = 0;
+  const run = (args, extra = {}) => {
+    extra = { FIXTURE_RUN: `${process.pid}-${++runs}`, ...extra };
+    rmSync(log, { force: true });
+    rmSync(commands, { force: true });
+    const result = spawnSync(process.execPath, [matrixScript, "go-race", ...args], {
+      cwd,
+      env: environment(extra),
+      encoding: "utf8",
+      timeout: 240000,
+    });
+    return { ...result, commands: lines(commands), entries: entries() };
+  };
+  return { cwd, run, environment, entries, log };
+}
+const bigMax = (values) => values.reduce((a, b) => (a > b ? a : b)),
+  bigMin = (values) => values.reduce((a, b) => (a < b ? a : b));
+// The fixture's partition for K=2, from the hash rule.
+const fixtureShards = [0, 1].map((shard) => fixtureStoreTests.filter((name) => goRaceShardOf(name, 2) === shard).sort());
+const fixtureShardCommands = [
+  `test -race -json -count=1 -timeout=5m -run ^(${fixtureShards[0].join("|")})$ ./store`,
+  `test -race -json -count=1 -timeout=5m -skip ^(${fixtureShards[0].join("|")})$ ./store`,
+];
+
+test("go-race command runs the other packages first and then every test of the shard package exactly once", { timeout: 600000 }, (t) => {
+  const f = goRaceFixture(t);
+  assert.deepEqual(fixtureShards, [
+    ["ExampleHello", "TestEpsilon", "TestGamma"],
+    ["FuzzSeed", "TestAlpha", "TestBeta", "TestDelta"],
+  ]);
+  const digestLine = `partition sha256:${goRacePartition(fixtureStoreTests, 2).digest}`;
+  const otherThenShards = (result, others) => {
+    const store = result.entries.filter((e) => e.pkg === "store"),
+      rest = result.entries.filter((e) => e.pkg !== "store");
+    assert.deepEqual(rest.map((e) => e.pkg).sort(), others, "each other package ran once");
+    assert.deepEqual(store.map((e) => e.name).sort(), [...fixtureStoreTests].sort(), "each store test ran once");
+    assert(bigMax(rest.map((e) => e.at)) < bigMin(store.map((e) => e.at)), "the other packages ended before any shard test started");
+    const pids = [...new Set(store.map((e) => e.pid))];
+    assert.equal(pids.length, 2, "the shard package ran as two shard processes");
+    for (const pid of pids)
+      assert(
+        fixtureShards.some((names) => canonicalNames(store.filter((e) => e.pid === pid)) === names.join()),
+        "each process ran exactly one shard's tests",
+      );
+    return pids.map((pid) => store.filter((e) => e.pid === pid).map((e) => e.at));
+  };
+  const canonicalNames = (list) => list.map((e) => e.name).sort().join();
+
+  // Every package: ./... is expanded, the shard package taken out.
+  let result = f.run(["-timeout=5m", "-shards=./store=2", "./..."]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.commands.slice(0, 3), [
+    "list -f {{.Dir}} ./...",
+    "test -race -timeout=5m ./internal/fixturelog ./other ./third",
+    "test -race -list . ./store",
+  ]);
+  assert.deepEqual(result.commands.slice(3).sort(), [...fixtureShardCommands].sort());
+  otherThenShards(result, ["other", "third"]);
+  const out = result.stdout;
+  const at = (text) => {
+    assert(out.includes(text), text + "\n" + out);
+    return out.indexOf(text);
+  };
+  assert.match(out, /^go-race other packages: 3 packages, [0-9.]+ s, exit 0$/m);
+  assert(at("go-race other packages:") < at(`go-race shards: ./store K=2 tests=7 ${digestLine}\n`));
+  assert(at(`tests=7 ${digestLine}\n`) < at("go-race shard 1/2:"));
+  assert(at("go-race shard 1/2:") < at("go-race shard 2/2:"));
+  assert.match(out, /^go-race shard 1\/2: 3 tests, [0-9.]+ s, exit 0$/m);
+  assert.match(out, /^go-race shard 2\/2: 4 tests, [0-9.]+ s, exit 0$/m);
+  assert(
+    out.endsWith(`go-race shards: ./store K=2 tests=7 ran-once=7 ${digestLine} peak-shard-processes=2\n`),
+    out,
+  );
+  // The log keeps every RUN line: each top-level name once, in its shard's
+  // part of the output, and the subtests.
+  for (const name of fixtureStoreTests) {
+    assert.equal(out.split(`=== RUN   ${name}\n`).length, 2, name);
+    const shard = fixtureShards[0].includes(name) ? 1 : 2;
+    assert.equal(at(`=== RUN   ${name}\n`) < at(`go-race shard ${shard}/2:`), true, name);
+    if (shard === 2) assert(at(`=== RUN   ${name}\n`) > at("go-race shard 1/2:"), name);
+  }
+  assert(out.includes("=== RUN   TestBeta/one\n") && out.includes("=== RUN   FuzzSeed/seed#0\n"), out);
+  assert(out.includes("ok  \tfixture/other") && out.includes("ok  \tfixture/third"));
+
+  // A mixed list on a one-job host: the other package first, then the shards
+  // in turn.
+  result = f.run(["-timeout=5m", "-shards=./store=2", "./store", "./other"], { VERIFICATION_JOBS: "1" });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.commands, [
+    "test -race -timeout=5m ./other",
+    "test -race -list . ./store",
+    ...fixtureShardCommands,
+  ]);
+  const [first, second] = otherThenShards(result, ["other"]);
+  assert(bigMax(first) < bigMin(second) || bigMax(second) < bigMin(first), "with one job the shards do not overlap");
+  assert.match(result.stdout, /^go-race other packages: 1 packages, [0-9.]+ s, exit 0$/m);
+  assert(result.stdout.endsWith(`tests=7 ran-once=7 ${digestLine} peak-shard-processes=1\n`), result.stdout);
+
+  // The shard package alone: no other-package phase.
+  result = f.run(["-timeout=5m", "-shards=./store=2", "./store"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.commands.slice(0, 1), ["test -race -list . ./store"]);
+  assert.equal(result.commands.length, 3);
+  assert(!result.stdout.includes("go-race other packages"));
+  assert(result.stdout.endsWith(`tests=7 ran-once=7 ${digestLine} peak-shard-processes=2\n`), result.stdout);
+
+  // A list without the shard package, and a command without the flag, are one
+  // plain go test -race.
+  result = f.run(["-timeout=5m", "-shards=./store=2", "./other", "./third"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.commands, ["test -race -timeout=5m ./other ./third"]);
+  assert(!result.stdout.includes("go-race"), result.stdout);
+  result = f.run(["./other"]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.commands, ["test -race ./other"]);
+
+  // Anything but the two flags and packages is a usage error; nothing runs.
+  for (const args of [
+    [], ["-timeout=5m"], ["-count=2", "./store"], ["-run=TestAlpha", "./store"], ["-shards=./store=9", "./store"],
+    ["-shards=./store=1", "./store"], ["-shards=./...=2", "./..."], ["-shards=./store=2", "-shards=./other=2", "./store"],
+    ["-timeout=5s", "./store"], ["./store", "-run=TestAlpha"], ["-shards=./store=2", "store"],
+  ]) {
+    result = f.run(args);
+    assert.equal(result.status, 2, args.join(" "));
+    assert.match(result.stderr, /^Usage: node \.\.\/scripts\/verify-matrix\.mjs go-race /);
+    assert.deepEqual(result.commands, []);
+  }
+});
+
+test("go-race command fails closed: a failing package, a failing shard, and a test list that disagrees with the source", { timeout: 600000 }, (t) => {
+  const f = goRaceFixture(t);
+  // A failing other package: no shard starts.
+  let result = f.run(["-timeout=5m", "-shards=./store=2", "./..."], { FIXTURE_FAIL: "other" });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /^go-race other packages: 3 packages, [0-9.]+ s, exit 1$/m);
+  assert(!result.stdout.includes("go-race shard"), result.stdout);
+  assert.deepEqual(result.commands, [
+    "list -f {{.Dir}} ./...",
+    "test -race -timeout=5m ./internal/fixturelog ./other ./third",
+  ]);
+  assert.deepEqual(result.entries.filter((e) => e.pkg === "store"), []);
+
+  // A failing test fails its shard and the command; the count still holds.
+  result = f.run(["-timeout=5m", "-shards=./store=2", "./store"], { FIXTURE_FAIL: "store" });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /^--- FAIL: TestDelta /m);
+  assert.match(result.stdout, /^go-race shard 1\/2: 3 tests, [0-9.]+ s, exit 0$/m);
+  assert.match(result.stdout, /^go-race shard 2\/2: 4 tests, [0-9.]+ s, exit 1$/m);
+  assert.match(result.stdout, /tests=7 ran-once=7 partition sha256:[a-f0-9]{64} peak-shard-processes=2\n$/);
+
+  // A test in the source that go test -list does not list stops the run
+  // before any shard: the catch-all must not hide a disagreement.
+  const disagrees = (file, content, pattern) => {
+    writeFileSync(join(f.cwd, "store", file), content);
+    try {
+      result = f.run(["-timeout=5m", "-shards=./store=2", "./store"]);
+    } finally {
+      rmSync(join(f.cwd, "store", file));
+    }
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stderr, pattern);
+    assert.deepEqual(result.commands, ["test -race -list . ./store"]);
+    assert.deepEqual(result.entries, []);
+    assert(!result.stdout.includes("go-race shard"), result.stdout);
+  };
+  disagrees(
+    "hidden_test.go",
+    '//go:build never\n\npackage store\n\nimport "testing"\n\nfunc TestHidden(t *testing.T) {}\n',
+    /^go-race: the test source of \.\/store and go test -list disagree; only in the source: TestHidden$/m,
+  );
+  // Go compiles an Example without an output comment but never runs it.
+  disagrees(
+    "silent_test.go",
+    "package store\n\nfunc Example_silent() {}\n",
+    /^go-race: the test source of \.\/store and go test -list disagree; only in the source: Example_silent$/m,
+  );
+  // A package that does not build fails at the list.
+  writeFileSync(join(f.cwd, "store", "broken_test.go"), "package store\n\nfunc TestBroken(t *testing.T) { undefined() }\n");
+  result = f.run(["-timeout=5m", "-shards=./store=2", "./store"]);
+  rmSync(join(f.cwd, "store", "broken_test.go"));
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(result.commands, ["test -race -list . ./store"]);
+  assert(!result.stdout.includes("go-race shard"), result.stdout);
+});
+
+test("go-race command stopped through its process group leaves no shard process behind", { timeout: 600000 }, async (t) => {
+  const f = goRaceFixture(t);
+  rmSync(f.log, { force: true });
+  const child = spawn(process.execPath, [matrixScript, "go-race", "-timeout=5m", "-shards=./store=2", "./store"], {
+    cwd: f.cwd,
+    env: f.environment({ FIXTURE_SLEEP: "1" }),
+    detached: true,
+    stdio: "ignore",
+  });
+  const groupAlive = () => {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      throw error;
+    }
+  };
+  t.after(() => {
+    if (groupAlive()) process.kill(-child.pid, "SIGKILL");
+  });
+  const exited = once(child, "exit");
+  const deadline = Date.now() + 240000;
+  while (!f.entries().some((e) => e.name === "TestAlpha")) {
+    assert(child.exitCode === null && Date.now() < deadline, "the sleeping shard test never started");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  // What the matrix runner does to a check at its timeout.
+  process.kill(-child.pid, "SIGTERM");
+  const [code, signal] = await exited;
+  assert.equal(signal ?? code, 143);
+  for (let i = 0; i < 100 && groupAlive(); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(groupAlive(), false, "a process of the check's group survived");
 });
