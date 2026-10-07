@@ -15,7 +15,7 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(ClaudeHooks("/usr/local/bin/tt")), &v); err != nil {
 		t.Fatal(err)
 	}
-	for _, ev := range []string{"SessionStart", "UserPromptSubmit", "Stop", "Notification"} {
+	for _, ev := range []string{"UserPromptSubmit", "Stop", "Notification"} {
 		if len(v.Hooks[ev]) != 1 || !strings.HasPrefix(v.Hooks[ev][0].Hooks[0].Command, "/usr/local/bin/tt hook ") {
 			t.Errorf("%s hook missing or wrong: %+v", ev, v.Hooks[ev])
 		}
@@ -28,8 +28,8 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(ClaudeHooks("/usr/local/bin/tt")), &raw); err != nil {
 		t.Fatal(err)
 	}
-	if len(raw.Hooks) != 7 {
-		t.Errorf("fragment wires %d events; want 7", len(raw.Hooks))
+	if len(raw.Hooks) != 9 {
+		t.Errorf("fragment wires %d events; want 9", len(raw.Hooks))
 	}
 	for _, ev := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"} {
 		if len(v.Hooks[ev]) != 1 || len(v.Hooks[ev][0].Hooks) != 1 || v.Hooks[ev][0].Hooks[0].Type != "command" || v.Hooks[ev][0].Hooks[0].Command != "/usr/local/bin/tt hook tool" {
@@ -40,13 +40,18 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 			t.Errorf("%s group is not a bare hooks list: %s", ev, raw.Hooks[ev][0])
 		}
 	}
-	// Only the tool entries carry a timeout; the four older entries are
-	// written exactly as before.
+	// Only the tool and handoff entries carry a timeout; the four older
+	// entries are written exactly as before. On SessionStart the handoff hook
+	// is a second group, so its timeout is not on tt hook session-start.
+	handoff := `[{"command":"/usr/local/bin/tt hook handoff","timeout":5,"type":"command"}]`
 	for ev, group := range raw.Hooks {
 		want := `[{"command":"/usr/local/bin/tt hook tool","timeout":5,"type":"command"}]`
+		groups := 1
 		switch ev {
 		case "SessionStart":
-			want = `[{"command":"/usr/local/bin/tt hook session-start","type":"command"}]`
+			want, groups = `[{"command":"/usr/local/bin/tt hook session-start","type":"command"}]`, 2
+		case "PreCompact", "SessionEnd":
+			want = handoff
 		case "UserPromptSubmit":
 			want = `[{"command":"/usr/local/bin/tt hook prompt","type":"command"}]`
 		case "Stop":
@@ -54,16 +59,28 @@ func TestClaudeHooksIsValidJSON(t *testing.T) {
 		case "Notification":
 			want = `[{"command":"/usr/local/bin/tt hook notification","type":"command"}]`
 		}
-		var entries any
-		if err := json.Unmarshal(group[0]["hooks"], &entries); err != nil {
-			t.Fatal(err)
+		if len(group) != groups {
+			t.Errorf("%s has %d groups; want %d", ev, len(group), groups)
+			continue
 		}
-		if got, _ := json.Marshal(entries); string(got) != want {
-			t.Errorf("%s entries = %s; want %s", ev, got, want)
+		for i, want := range []string{want, handoff}[:groups] {
+			var entries any
+			if err := json.Unmarshal(group[i]["hooks"], &entries); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := json.Marshal(entries); string(got) != want {
+				t.Errorf("%s group %d entries = %s; want %s", ev, i, got, want)
+			}
+			if _, restricted := group[i]["matcher"]; restricted || len(group[i]) != 1 {
+				t.Errorf("%s group %d is not a bare hooks list: %s", ev, i, group[i])
+			}
 		}
 	}
 	if ToolHookTimeoutSeconds != 5 || HookTimeoutSeconds("tool") != 5 || HookTimeoutSeconds("stop") != 0 {
 		t.Errorf("timeouts: tool %d, stop %d", HookTimeoutSeconds("tool"), HookTimeoutSeconds("stop"))
+	}
+	if HandoffHookTimeoutSeconds != 5 || HookTimeoutSeconds("handoff") != 5 || HookTimeoutSeconds("session-start") != 0 {
+		t.Errorf("timeouts: handoff %d, session-start %d", HookTimeoutSeconds("handoff"), HookTimeoutSeconds("session-start"))
 	}
 	if !strings.Contains(CodexConfig("tt"), `notify = ["tt", "hook", "codex"]`) {
 		t.Error("codex config wrong")

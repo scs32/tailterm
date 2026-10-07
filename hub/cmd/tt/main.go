@@ -39,6 +39,7 @@ Commands
   projects                     list projects on the hub (tasks is an alias)
   project-pause <get|pause|handoff|resume>  explicit project team lifecycle
   helper register|env|inbox --task ID  the owner's Claude Code session as the project's owner helper
+  handoff show|write|note      the owner helper's host-local session handoff record (docs/session-handoff.md)
   handler <rotate|rotation|policy|spec|arms|ab-report>  rotate, arm and compare database handlers (owner)
   steward <template|setup|summary|rotate|rotation|policy>  the project's backlog steward (setup, rotate: owner)
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
@@ -278,6 +279,8 @@ func main() {
 		err = cmdHost(args)
 	case "hook":
 		err = cmdHook(e, args)
+	case "handoff":
+		err = cmdHandoff(e, args)
 	case "new-task", "new-project":
 		err = cmdNewTask(e, args)
 	default:

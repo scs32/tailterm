@@ -545,6 +545,7 @@ func TestHostSetupInstallsToolHooks(t *testing.T) {
 	out := s.mustRun("--from", s.artifact("tt-v1"))
 	s.requireCanonicalHooks()
 	tool := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool"), "timeout": json.Number("5")}}}
+	handoff := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "handoff"), "timeout": json.Number("5")}}}
 	plain := func(name string) []any {
 		return []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, name)}}}}
 	}
@@ -555,7 +556,9 @@ func TestHostSetupInstallsToolHooks(t *testing.T) {
 		"PostToolUseFailure": {map[string]any{"note": "mine", "hooks": []any{
 			map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "tool"), "async": false, "timeout": json.Number("5")},
 			map[string]any{"type": "command", "command": "after.sh", "timeout": json.Number("60")}}}},
-		"SessionStart":     plain("session-start"),
+		"SessionStart":     append(plain("session-start"), handoff),
+		"PreCompact":       {handoff},
+		"SessionEnd":       {handoff},
 		"UserPromptSubmit": plain("prompt"),
 		"Stop":             plain("stop"),
 		"Notification":     plain("notification"),
@@ -564,8 +567,9 @@ func TestHostSetupInstallsToolHooks(t *testing.T) {
 			t.Errorf("%s after setup:\n got %v\nwant %v", event, got, want)
 		}
 	}
-	if len(hooks) != len(claudeHookEvents) {
-		t.Errorf("settings wire %d events; want %d", len(hooks), len(claudeHookEvents))
+	// SessionStart carries two tt hooks, so the events are one fewer.
+	if len(hooks) != len(claudeHookEvents)-1 {
+		t.Errorf("settings wire %d events; want %d", len(hooks), len(claudeHookEvents)-1)
 	}
 	if !strings.Contains(out, "updated    claude-hooks") {
 		t.Fatalf("tool hooks not reported as updated:\n%s", out)
@@ -946,6 +950,78 @@ func TestHostSetupServiceFailures(t *testing.T) {
 			t.Fatalf("output:\n%s", out)
 		}
 	})
+}
+
+// a12 of the session handoff: setup adds tt hook handoff to SessionStart,
+// PreCompact and SessionEnd with the timeout; tt hook session-start stays on
+// SessionStart with none; the user's own entries on those events are kept; a
+// handoff entry installed without the timeout, under a matcher or twice is
+// brought to one unmatched entry; a second run changes nothing; handoff.json
+// is never created; and a rollback leaves the settings file as it was.
+func TestHostSetupInstallsHandoffHooks(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	t.Setenv("TAILTERM_HANDOFF_CONFIG", "")
+	t.Setenv("TAILTERM_HANDOFF_DIR", "")
+	s.write(s.p.claudeSettings, `{"hooks":{
+		"SessionStart":[{"hooks":[{"type":"command","command":"mine-start.sh"}]},{"matcher":"startup","hooks":[{"type":"command","command":"tt hook handoff"}]}],
+		"PreCompact":[{"matcher":"manual","hooks":[{"type":"command","command":"mine-compact.sh","timeout":30}]},{"hooks":[{"type":"command","command":"/old/tt hook handoff"}]},{"hooks":[{"type":"command","command":"/old/tt hook handoff","timeout":60}]}],
+		"SessionEnd":[{"hooks":[{"type":"command","command":"mine-end.sh"}]}]
+	}}`, 0o600)
+	v1, v2 := s.artifact("tt-v1"), s.artifact("tt-v2")
+	s.mustRun("--from", v1)
+	s.requireCanonicalHooks()
+	entry := func(name string, timeout bool) map[string]any {
+		e := map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, name)}
+		if timeout {
+			e["timeout"] = json.Number("5")
+		}
+		return e
+	}
+	hooks := decodeJSONFile(t, s.p.claudeSettings)["hooks"].(map[string]any)
+	for event, want := range map[string][]any{
+		"SessionStart": {
+			map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "mine-start.sh"}}},
+			map[string]any{"hooks": []any{entry("session-start", false)}},
+			map[string]any{"hooks": []any{entry("handoff", true)}}},
+		"PreCompact": {
+			map[string]any{"matcher": "manual", "hooks": []any{map[string]any{"type": "command", "command": "mine-compact.sh", "timeout": json.Number("30")}}},
+			map[string]any{"hooks": []any{entry("handoff", true)}}},
+		"SessionEnd": {
+			map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "mine-end.sh"}}},
+			map[string]any{"hooks": []any{entry("handoff", true)}}},
+	} {
+		if got := hooks[event]; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s after setup:\n got %v\nwant %v", event, got, want)
+		}
+	}
+	// The timeout is on the handoff entry only: no session-start entry has one.
+	for _, g := range hooks["SessionStart"].([]any) {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			hook := h.(map[string]any)
+			if _, timed := hook["timeout"]; timed != strings.HasSuffix(hook["command"].(string), " hook handoff") {
+				t.Errorf("SessionStart entry has the wrong timeout: %v", hook)
+			}
+		}
+	}
+	before := s.tree()
+	s.mustRun("--from", v1)
+	if after := s.tree(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("a second run changed files:\nbefore %v\nafter  %v", before, after)
+	}
+	s.mustRun("--from", v2)
+	settings := s.hash(s.p.claudeSettings)
+	if out := s.mustRun("--rollback"); s.hash(s.p.claudeSettings) != settings || !strings.Contains(out, "host rollback: ok") {
+		t.Fatalf("rollback changed the settings file:\n%s", out)
+	}
+	for path := range s.tree() {
+		if strings.Contains(path, "handoff") {
+			t.Errorf("host setup created %s", path)
+		}
+	}
+	if exists(filepath.Join(s.home, ".config", "tailterm", "handoff.json")) || exists(filepath.Join(s.home, ".local", "state", "tailterm", "handoff")) {
+		t.Error("host setup created the handoff setting or state")
+	}
 }
 
 func TestHostSetupRollback(t *testing.T) {

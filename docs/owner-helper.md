@@ -102,6 +102,12 @@ a fresh agent; after an exit, a new run; while live, a replaced run. An explicit
 ID, and the old binding's transcript no longer moves. The wake then fails closed
 (transcript unavailable) until you register again.
 
+**What the session was holding** (its scheduled wakes, standing instructions and
+orders in flight) can be kept in a host-local record that a new session is told
+about at start: see [session-handoff.md](session-handoff.md). It is off until the
+host turns it on, and in this version it registers nothing and restores nothing:
+the new session still runs `tt helper register` and re-creates its wakes by hand.
+
 ## Hand off between Claude Code and Codex
 
 Feature `wi_f771e8367facf50f`, order #22120, builder assignment #22213 adds
@@ -121,6 +127,11 @@ Mini `tt`, and relay update; source changes alone do not update a running relay.
    heartbeat or reply by adopting the host's newer helper file.
 4. To hand back, repeat these steps in the other runtime. Re-register after a
    Codex restart/new thread as well as after a Claude restart or `/clear`.
+
+With the session handoff record switched on ([session-handoff.md](session-handoff.md)),
+run `tt handoff write --task tsk_... --out PATH` in the outgoing session before
+step 1, and `tt handoff show --task tsk_...` in the destination after step 2. The
+record is not proof of registration; step 2 is.
 
 Codex uses its registered executable and `CODEX_HOME` for native queue delivery.
 Both inbox and broker wakes name `tt helper inbox --task T`. Outside tmux either

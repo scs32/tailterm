@@ -147,12 +147,12 @@ func requireEmptyRoot(t *testing.T, root string) {
 	}
 }
 
-// a13: only tool goes through the registry; the four existing hooks, codex
-// and unknown names take the code that was there before.
-func TestHookRegistryHoldsOnlyTool(t *testing.T) {
+// a13: only tool and handoff go through the registry; the four existing
+// hooks, codex and unknown names take the code that was there before.
+func TestHookRegistryHoldsToolAndHandoff(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
-	if len(hookHandlers) != 1 || hookHandlers["tool"] == nil {
-		t.Fatalf("registry = %v; want only tool", hookHandlers)
+	if len(hookHandlers) != 2 || hookHandlers["tool"] == nil || hookHandlers["handoff"] == nil {
+		t.Fatalf("registry = %v; want exactly tool and handoff", hookHandlers)
 	}
 	if r := runToolHook(t, e, "nope", "{}", nil); r.err == nil || r.err.Error() != `unknown hook "nope"` {
 		t.Fatalf("unknown hook = %v", r.err)

@@ -111,6 +111,16 @@ Known limits:
 - A runtime that is not installed is skipped. The hooks do nothing outside a
   Tailterm agent session.
 
+Claude Code also gets the tool-call ledger's `tt hook tool` on the three tool
+events ([claude-wake.md](claude-wake.md)) and the session handoff's
+`tt hook handoff` on `SessionStart`, `PreCompact` and `SessionEnd`
+([session-handoff.md](session-handoff.md)), each with `"timeout": 5`. On
+`SessionStart` the handoff hook is a second entry beside `tt hook session-start`,
+which keeps no timeout. The handoff hook does nothing until the host's
+`~/.config/tailterm/handoff.json` turns it on; host setup never creates or
+changes that file. `tt host setup --rollback` does not touch hooks:
+session-handoff.md has the commands that remove the handoff entries.
+
 ## Relay service: agent or daemon
 
 On macOS the relay runs under launchd, label `com.tailterm.inbox-relay`, with

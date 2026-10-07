@@ -79,11 +79,19 @@ func ParseHookCommand(cmd string) (exe, name string, ok bool) {
 // abandons it after this long and the tool call proceeds.
 const ToolHookTimeoutSeconds = 5
 
+// HandoffHookTimeoutSeconds is the timeout Claude Code is given for tt hook
+// handoff. The hook returns within 500 ms; if it ever hangs, Claude Code
+// abandons it after this long and the start, compaction or exit proceeds.
+const HandoffHookTimeoutSeconds = 5
+
 // HookTimeoutSeconds is the timeout a tt hook's settings entry carries, or
 // zero for an entry written without one.
 func HookTimeoutSeconds(name string) int {
-	if name == "tool" {
+	switch name {
+	case "tool":
 		return ToolHookTimeoutSeconds
+	case "handoff":
+		return HandoffHookTimeoutSeconds
 	}
 	return 0
 }
@@ -99,13 +107,18 @@ func HookEntry(tt, name string) map[string]any {
 
 // ClaudeHooks returns a Claude Code settings.json fragment wiring tt hooks.
 // The three tool events run the observe-only tool-call ledger (tt hook tool)
-// with no matcher, so every tool call is seen.
+// with no matcher, so every tool call is seen. SessionStart, PreCompact and
+// SessionEnd run the session handoff hook (tt hook handoff), which does
+// nothing unless the host setting turns it on; on SessionStart it is its own
+// entry, so its timeout never lands on tt hook session-start.
 func ClaudeHooks(tt string) string {
 	hook := func(name string) map[string]any {
 		return map[string]any{"hooks": []map[string]any{HookEntry(tt, name)}}
 	}
 	settings := map[string]any{"hooks": map[string]any{
-		"SessionStart":       []map[string]any{hook("session-start")},
+		"SessionStart":       []map[string]any{hook("session-start"), hook("handoff")},
+		"PreCompact":         []map[string]any{hook("handoff")},
+		"SessionEnd":         []map[string]any{hook("handoff")},
 		"UserPromptSubmit":   []map[string]any{hook("prompt")},
 		"Stop":               []map[string]any{hook("stop")},
 		"Notification":       []map[string]any{hook("notification")},
