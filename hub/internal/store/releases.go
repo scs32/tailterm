@@ -52,7 +52,8 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  PRIMARY KEY(task_id,job_id));
  CREATE TABLE IF NOT EXISTS release_deployer_liveness (
  task_id TEXT NOT NULL PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,state TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',
- opened_at TEXT NOT NULL DEFAULT '',handler_seq INTEGER NOT NULL DEFAULT 0,helper_seq INTEGER NOT NULL DEFAULT 0);`
+ opened_at TEXT NOT NULL DEFAULT '',handler_seq INTEGER NOT NULL DEFAULT 0,helper_seq INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS release_liveness_sweeps (task_id TEXT NOT NULL PRIMARY KEY,swept_at TEXT NOT NULL);`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -1901,6 +1902,15 @@ func deployerLiveness(now, lastHeard, restartAt time.Time, bound time.Duration) 
 	return deployerAlive
 }
 
+// deployerLivenessSweepGap is how long a project may go without a sweep of
+// its standing jobs before their first sights are dropped: two minutes, four
+// broker ticks, and never more than the bound. While the hub is down or the
+// project paused it records no heartbeat either, so a job timed across such
+// a gap would report a healthy deployer at the first tick after it.
+func deployerLivenessSweepGap(bound time.Duration) time.Duration {
+	return min(2*time.Minute, bound)
+}
+
 // DeployerNotice is one liveness notice a sweep posted.
 type DeployerNotice struct {
 	TaskID     string
@@ -1992,6 +2002,21 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	// A gap in the sweeps of this project (the hub was down, the project
+	// paused, or it had no deployer) drops the first sights: every standing
+	// job starts its bound afresh, so the first sweep after a gap cannot post.
+	if len(seen) > 0 {
+		var swept string
+		if err := tx.QueryRowContext(ctx, `SELECT swept_at FROM release_liveness_sweeps WHERE task_id=?`, taskID).Scan(&swept); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if swept == "" || now.Sub(parseTS(swept)) >= deployerLivenessSweepGap(bound) {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM release_liveness_jobs WHERE task_id=?`, taskID); err != nil {
+				return nil, err
+			}
+			clear(seen)
+		}
+	}
 	type standing struct{ id, state string }
 	var jobs []standing
 	if rows, err = tx.QueryContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND state IN ('verified','claimed') ORDER BY rowid`, taskID); err != nil {
@@ -2025,6 +2050,11 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	}
 	for id := range seen {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM release_liveness_jobs WHERE task_id=? AND job_id=?`, taskID, id); err != nil {
+			return nil, err
+		}
+	}
+	if len(jobs) > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO release_liveness_sweeps(task_id,swept_at) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET swept_at=excluded.swept_at`, taskID, ts(now)); err != nil {
 			return nil, err
 		}
 	}

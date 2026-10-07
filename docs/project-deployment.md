@@ -669,8 +669,12 @@ both hold:
   `claimed` starts its N again. `held`, `merged` and `blocked` jobs never count,
   so an owner hold alone is never reported. The hub times a job from the first
   tick that sees it in its state, so the notice is never early and at most one
-  tick late. After a hub start onto this code, or after a project resumes from
-  a pause, every standing job starts its N afresh.
+  tick late. The timing does not carry across a gap in the checks: when a
+  project has gone unchecked for two minutes or more (for N or more when N is
+  under two minutes) because the hub was down, the project was paused or it
+  had no deployer, every standing job starts its N afresh at the next tick. No
+  heartbeat is recorded in such a gap either, so the first tick after it never
+  posts. A shorter gap keeps the timing.
 - **The deployer is not alive.** Either of:
   - *Silent.* Nothing was heard from it for N: no heartbeat from its `tt wrap`
     wrapper and no message from its current run. This covers a dead wrapper, a
@@ -717,9 +721,11 @@ document; the run is in the notice's `run` ref).
 sets N, a whole number of minutes from 1 to 1440. Any other value, or none,
 gives 10. One N is used for the silence, the restart and the job.
 
-**Hub clock.** If the hub's clock jumps forward, or the hub was down for
-longer than N, a deployer that did not heartbeat in the meantime looks silent
-once its jobs have stood for N again; that is one notice per project.
+**Hub outage and clock.** After the hub was down, or its clock jumped forward,
+for two minutes or more, a deployer is reported only if it is still not heard
+from once its jobs have stood for N again; a deployer that heartbeats again in
+that time is not reported. A gap shorter than that keeps the job timing, and
+is too short by itself to make a deployer silent.
 
 **Claim freshness.** Separately, the hub refuses a claim, and the deployer's
 other fenced calls, when the deployer's heartbeat is more than 90 seconds old

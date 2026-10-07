@@ -835,14 +835,15 @@ func TestBrokerTickRunsDeployerLivenessSweep(t *testing.T) {
 	}
 	start := time.Now().UTC()
 	// The first tick is the sweep's first sight of the job: it must stand
-	// for the bound before it counts as waiting.
-	if n := tick(start); n != 0 {
-		t.Fatalf("first sight: %d steps", n)
+	// for the bound, seen by a tick every 30 s as the hub runs them, before
+	// it counts as waiting.
+	at := start
+	for ; at.Before(start.Add(10 * time.Minute)); at = at.Add(30 * time.Second) {
+		if n := tick(at); n != 0 {
+			t.Fatalf("inside the bound, after %s: %d steps", at.Sub(start), n)
+		}
 	}
-	if n := tick(start.Add(9 * time.Minute)); n != 0 {
-		t.Fatalf("inside the bound: %d steps", n)
-	}
-	past := start.Add(11 * time.Minute)
+	past := at
 	if n := tick(past); n != 2 {
 		t.Fatalf("past the bound: %d deployer-silent steps, want 2", n)
 	}
@@ -852,8 +853,10 @@ func TestBrokerTickRunsDeployerLivenessSweep(t *testing.T) {
 	if n := tick(past); n != 0 {
 		t.Fatalf("second tick: %d steps", n)
 	}
-	if n := tick(past.Add(30 * time.Minute)); n != 0 {
-		t.Fatalf("later tick: %d steps", n)
+	for at = past; at.Before(past.Add(30 * time.Minute)); at = at.Add(30 * time.Second) {
+		if n := tick(at); n != 0 {
+			t.Fatalf("later tick: %d steps", n)
+		}
 	}
 	if h, o := copies(); h != 1 || o != 1 {
 		t.Fatalf("copies after later ticks: handler %d, owner helper %d", h, o)
