@@ -82,18 +82,28 @@ func newHandlerFixture(t *testing.T) *handlerFixture {
 func (f *handlerFixture) launch() (api.Agent, error) {
 	return ensureHandler(context.Background(), f.c, f.task, f.req, f.opts)
 }
+
+// handlerLaunchWait bounds how long executions waits for the fake tt to append
+// its byte. tmux starts that process after the launch has returned, so on a
+// loaded host the marker can trail the launch by seconds.
+const handlerLaunchWait = 30 * time.Second
+
+// executions waits until the fake tt has run exactly n times. It returns as
+// soon as the marker holds n bytes and fails at once when it holds more, so a
+// replayed launch is never waited out.
 func (f *handlerFixture) executions(t *testing.T, n int) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.Now().Add(handlerLaunchWait)
+	for {
 		data, _ := os.ReadFile(f.marker)
 		if len(data) == n {
 			return
 		}
+		if len(data) > n || !time.Now().Before(deadline) {
+			t.Fatalf("expected %d launches, got %q", n, data)
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	data, _ := os.ReadFile(f.marker)
-	t.Fatalf("expected %d launches, got %q", n, data)
 }
 func handlerTestTmux(t *testing.T, args ...string) {
 	t.Helper()
