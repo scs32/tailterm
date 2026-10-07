@@ -603,8 +603,9 @@ reasoning and prompt template digest equal the wanted ones exactly, and the
 handler and the waiting team both fit under the project agent cap (`open +
 reserved + team seats + 1 <= cap`). The hub then posts one Board notice,
 `Automatic handler provision`; it is not an owner intervention. A reserved
-handler that is not online after 10 minutes is abandoned and may be reserved
-again. Handlers are never closed by this rule.
+handler that is not online after 10 minutes is abandoned, and the runner's
+next pass reserves and starts a new one, with a new notice. Handlers are never
+closed by this rule.
 
 **Reasons.** The waiting entry's JSON carries `handlerNeed` (`provision`,
 `arm`, `handlers`, `leased`, `reason`, `fix`). Its reason starts with `Waiting
@@ -616,13 +617,17 @@ handler`, and continues, for example after `: 3 of 3 leased, limit 4`:
 - `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29.
   Fix: tt team queue limit --task TSK --limit 3`
 - `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING
-  digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: tt handler
-  spec --task TSK -- --run R --runtime R --model M --reasoning E --prompt
-  "$(cat PROMPT_FILE)" (PROMPT_FILE holds the handler prompt with that
-  template digest; keep the saved spec's other flags), or: tt team queue limit
-  --task TSK --limit 3`
+  digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix:
+  PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task TSK -- --run 'SAVED
+  RUN' --cwd 'SAVED CWD' --runtime R --model M --reasoning E --prompt
+  "$PROMPT" (PROMPT_FILE holds the handler prompt with that template digest),
+  or: tt team queue limit --task TSK --limit 3`. The command repeats the saved
+  spec's other launch flags and is safe to paste: it saves nothing if
+  `PROMPT_FILE` cannot be read.
 - the same with `the saved launch spec on HOST is missing` when the host has
-  no saved spec.
+  no saved spec, or when the saved spec starts another runtime; the command
+  then has no `--run` (so `tt handler spec` refuses it) and the note says `add
+  --run with the R launch command and the host's other launch flags`.
 
 The reason stays the plain wait, and nothing is added, when the limit already
 has its handlers, or when the project's first handler recorded no model or

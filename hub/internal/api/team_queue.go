@@ -366,6 +366,10 @@ type TeamQueueRequest struct {
 	HandlerSpecModel     string `json:"handlerSpecModel,omitempty"`
 	HandlerSpecReasoning string `json:"handlerSpecReasoning,omitempty"`
 	HandlerSpecDigest    string `json:"handlerSpecDigest,omitempty"`
+	// HandlerSpecArgs is the saved spec's other launch flags as flag, value
+	// pairs (never the prompt), so a refusal can print a complete command
+	// that saves the corrected spec.
+	HandlerSpecArgs []string `json:"handlerSpecArgs,omitempty"`
 	// Caller is the authenticated caller, set by the hub's HTTP layer and
 	// never read from the wire. A rebind records it as the approver.
 	Caller Caller `json:"-"`

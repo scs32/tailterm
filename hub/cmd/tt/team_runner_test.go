@@ -1616,6 +1616,9 @@ type provisionRunnerFixture struct {
 	waiting api.TeamQueueEntry
 	spawns  []api.AddAgentRequest
 	runner  teamRunner
+	// lost makes the substituted launch return without registering, as when
+	// the handler's session dies before it reaches the hub.
+	lost bool
 }
 
 // newProvisionRunnerFixture is a parallel project with limit 2 whose one
@@ -1673,6 +1676,9 @@ func newProvisionRunnerFixture(t *testing.T, specArgs ...string) *provisionRunne
 	ensurePersistent = func(ctx context.Context, c *api.Client, task string, req api.AddAgentRequest, _ spawn.Options) (api.Agent, error) {
 		// Stand in for the launch: register the handler and report it online.
 		p.spawns = append(p.spawns, req)
+		if p.lost {
+			return api.Agent{ID: req.AgentID, TaskID: task, Name: req.Name}, nil
+		}
 		req.Session = "fixture-" + req.Name
 		a, err := c.AddAgent(ctx, task, req)
 		if err != nil {
@@ -1788,7 +1794,8 @@ func TestTeamRunnerDoesNotProvisionWhenRefused(t *testing.T) {
 		}
 		got := p.listed(t)
 		if len(p.spawns) != 0 || got.HandlerNeed == nil || got.HandlerNeed.Provision || !got.HandlerNeed.Refused ||
-			!strings.Contains(got.BlockReason, "the saved launch spec on "+p.host+" is claude/claude-opus-5-5/high") || !strings.Contains(got.BlockReason, "tt handler spec --task "+p.task.ID+" -- ") {
+			!strings.Contains(got.BlockReason, "the saved launch spec on "+p.host+" is claude/claude-opus-5-5/high") ||
+			!strings.Contains(got.BlockReason, `Fix: PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task `+p.task.ID+` -- --run 'claude' --runtime claude --model claude-sonnet-5-5 --reasoning high --prompt "$PROMPT" (`) {
 			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
 		}
 		// The owner saves the matching spec; the next pass adds the handler.
@@ -1803,6 +1810,19 @@ func TestTeamRunnerDoesNotProvisionWhenRefused(t *testing.T) {
 			t.Fatalf("after the corrected spec: %v, spawns %d", err, len(p.spawns))
 		}
 	})
+	// f4: a run command given by path yields a runtime no arm can have. The
+	// hub refuses it as a spec that differs instead of rejecting the request.
+	t.Run("spec runtime is a path", func(t *testing.T) {
+		p := newProvisionRunnerFixture(t, "--run", "/opt/bin/claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt)
+		if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil {
+			t.Fatal(err)
+		}
+		got := p.listed(t)
+		if len(p.spawns) != 0 || got.HandlerNeed == nil || !got.HandlerNeed.Refused || !strings.Contains(got.BlockReason, "the saved launch spec on "+p.host+" is /opt/bin/claude/claude-sonnet-5-5/high") ||
+			strings.Contains(got.BlockReason, "--run '") || !strings.Contains(got.BlockReason, "add --run with the claude launch command") {
+			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
+		}
+	})
 	t.Run("no spec", func(t *testing.T) {
 		p := newProvisionRunnerFixture(t)
 		if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil {
@@ -1813,4 +1833,87 @@ func TestTeamRunnerDoesNotProvisionWhenRefused(t *testing.T) {
 			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
 		}
 	})
+}
+
+// a8 (review b1): a started handler that never registers is abandoned after
+// ten minutes and the runner, with its own retry identity, reserves and
+// starts a new one.
+func TestTeamRunnerRetriesAbandonedHandlerProvision(t *testing.T) {
+	p := newProvisionRunnerFixture(t, "--run", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt)
+	p.lost = true
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", p.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows := func(state string) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM handler_provisions WHERE task_id=? AND state=?`, p.task.ID, state).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	notices := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND envelope<>'' AND json_extract(envelope,'$.subject')='Automatic handler provision'`, p.task.ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// While the reservation is pending, further passes start nothing.
+	for pass := 0; pass < 3; pass++ {
+		if err := p.runner.tick(ctx, p.e, p.c, p.host); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := handlerProvisionAgentID(p.c.Base, p.task.ID, fmt.Sprintf("queue-provision-%s-%d-1", p.waiting.ID, p.waiting.Revision))
+	if len(p.spawns) != 1 || p.spawns[0].AgentID != first || rows("reserved") != 1 || notices() != 1 {
+		t.Fatalf("pending: spawns %d reserved %d notices %d", len(p.spawns), rows("reserved"), notices())
+	}
+	if got := p.listed(t); got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Attempt != 1 || got.HandlerNeed.AgentID != first {
+		t.Fatalf("pending need %+v", got.HandlerNeed)
+	}
+	// Ten minutes pass without the handler registering.
+	if _, err := db.Exec(`UPDATE handler_provisions SET created_at=? WHERE task_id=? AND state='reserved'`, time.Now().UTC().Add(-11*time.Minute).Format(time.RFC3339Nano), p.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.listed(t); got.HandlerNeed == nil || !got.HandlerNeed.Provision || got.HandlerNeed.Attempt != 2 {
+		t.Fatalf("expired need %+v", got.HandlerNeed)
+	}
+	if err := p.runner.tick(ctx, p.e, p.c, p.host); err != nil {
+		t.Fatal(err)
+	}
+	second := handlerProvisionAgentID(p.c.Base, p.task.ID, fmt.Sprintf("queue-provision-%s-%d-2", p.waiting.ID, p.waiting.Revision))
+	if len(p.spawns) != 2 || p.spawns[1].AgentID != second || second == first {
+		t.Fatalf("retry spawns %d, second agent %s (first %s)", len(p.spawns), second, first)
+	}
+	if rows("abandoned") != 1 || rows("reserved") != 1 || notices() != 2 {
+		t.Fatalf("after retry: abandoned %d reserved %d notices %d", rows("abandoned"), rows("reserved"), notices())
+	}
+	var abandoned, reserved string
+	if err := db.QueryRow(`SELECT agent_id FROM handler_provisions WHERE task_id=? AND state='abandoned'`, p.task.ID).Scan(&abandoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT agent_id FROM handler_provisions WHERE task_id=? AND state='reserved'`, p.task.ID).Scan(&reserved); err != nil {
+		t.Fatal(err)
+	}
+	if abandoned != first || reserved != second {
+		t.Fatalf("abandoned %s reserved %s", abandoned, reserved)
+	}
+	// The second handler registers; the entry stops waiting and leases it.
+	p.lost = false
+	agent, err := p.c.AddAgent(ctx, p.task.ID, func() api.AddAgentRequest { r := p.spawns[1]; r.Session = "fixture-second"; return r }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.c.PostEvent(ctx, p.task.ID, api.PostEventRequest{AgentID: agent.ID, RunID: agent.RunID, Kind: api.EventRunning}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := p.c.TeamQueueAction(ctx, p.task.ID, api.TeamQueueRequest{RequestID: "retry-claim", Operation: "claim", EntryID: p.waiting.ID, ExpectedRevision: p.waiting.Revision, Host: p.host})
+	if err != nil || claimed.HandlerID != second || rows("registered") != 1 || len(p.spawns) != 2 {
+		t.Fatalf("claim after retry %+v %v registered %d", claimed, err, rows("registered"))
+	}
 }

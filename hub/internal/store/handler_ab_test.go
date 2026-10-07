@@ -1269,10 +1269,17 @@ func newProvisionFixture(t *testing.T, limit, sHandlers, leased int) *provisionF
 	return f
 }
 
-// provision offers a saved spec for an entry, as the runner does.
-func (f *provisionFixture) provision(q api.TeamQueueEntry, key, agentID string, spec api.HandlerArm, digest string) (api.TeamQueueEntry, error) {
+// provision offers a saved spec for an entry, as the runner does; args are
+// the spec's other launch flags.
+func (f *provisionFixture) provision(q api.TeamQueueEntry, key, agentID string, spec api.HandlerArm, digest string, args ...string) (api.TeamQueueEntry, error) {
 	return f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "provision_handler", EntryID: q.ID, ExpectedRevision: q.Revision,
-		Host: "mini", HandlerAgentID: agentID, HandlerSpecRuntime: spec.Runtime, HandlerSpecModel: spec.Model, HandlerSpecReasoning: spec.Reasoning, HandlerSpecDigest: digest})
+		Host: "mini", HandlerAgentID: agentID, HandlerSpecRuntime: spec.Runtime, HandlerSpecModel: spec.Model, HandlerSpecReasoning: spec.Reasoning, HandlerSpecDigest: digest, HandlerSpecArgs: args})
+}
+
+// runnerKey is the runner's retry identity for an entry's listed attempt
+// (cmd/tt/team_runner.go provisionHandler).
+func runnerKey(q api.TeamQueueEntry) string {
+	return fmt.Sprintf("queue-provision-%s-%d-%d", q.ID, q.Revision, q.HandlerNeed.Attempt)
 }
 
 func (f *provisionFixture) rows(t *testing.T, state string) int {
@@ -1397,30 +1404,40 @@ func TestHandlerProvisionReservesOnceAndReplays(t *testing.T) {
 }
 
 // a5, a6: the saved spec must equal the wanted runtime, model, reasoning and
-// template digest; any one difference, or no spec at all, is refused.
+// template digest; any one difference, or no spec at all, is refused with a
+// command that is safe to paste.
 func TestHandlerProvisionRequiresExactSpec(t *testing.T) {
 	differ := func(change func(*api.HandlerArm)) api.HandlerArm {
 		spec := armS
 		change(&spec)
 		return spec
 	}
+	saved := []string{"--run", "claude --verbose", "--cwd", "/srv/it's here", "--permission-mode", "workspace-auto"}
+	const keeps = ` --run 'claude --verbose' --cwd '/srv/it'\''s here' --permission-mode 'workspace-auto'`
+	const addRun = "; add --run with the claude launch command and the host's other launch flags, tt refuses the spec without --run)"
 	cases := []struct {
 		name    string
 		spec    api.HandlerArm
 		digest  string
+		args    []string
 		current string
+		keeps   string
 	}{
-		{"runtime", differ(func(a *api.HandlerArm) { a.Runtime = "codex" }), digestP, "codex/claude-sonnet-5-5/high digest " + digestP},
-		{"model", differ(func(a *api.HandlerArm) { a.Model = "claude-opus-5-5" }), digestP, "claude/claude-opus-5-5/high digest " + digestP},
-		{"reasoning", differ(func(a *api.HandlerArm) { a.Reasoning = "medium" }), digestP, "claude/claude-sonnet-5-5/medium digest " + digestP},
-		{"digest", armS, digestQ, "claude/claude-sonnet-5-5/high digest " + digestQ},
-		{"missing", api.HandlerArm{}, "", "the saved launch spec on mini is missing"},
+		// Another runtime's run command is never carried into the command.
+		{"runtime", differ(func(a *api.HandlerArm) { a.Runtime = "codex" }), digestP, []string{"--run", "codex"}, "codex/claude-sonnet-5-5/high digest " + digestP, ""},
+		{"model", differ(func(a *api.HandlerArm) { a.Model = "claude-opus-5-5" }), digestP, saved, "claude/claude-opus-5-5/high digest " + digestP, keeps},
+		{"reasoning", differ(func(a *api.HandlerArm) { a.Reasoning = "medium" }), digestP, saved, "claude/claude-sonnet-5-5/medium digest " + digestP, keeps},
+		{"digest", armS, digestQ, saved, "claude/claude-sonnet-5-5/high digest " + digestQ, keeps},
+		{"missing", api.HandlerArm{}, "", nil, "the saved launch spec on mini is missing", ""},
+		// f4: values no handler could have are a spec that differs, not a
+		// malformed request; control characters never reach the reason.
+		{"malformed", differ(func(a *api.HandlerArm) { a.Runtime = "/opt/bin/claude\x1b[2J" }), "not-a-digest", []string{"--run", "/opt/bin/claude"}, "/opt/bin/claude [2J/claude-sonnet-5-5/high digest not-a-digest", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newProvisionFixture(t, 4, 3, 3)
-			q := f.entries[3]
-			_, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), tc.spec, tc.digest)
+			q := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+			_, err := f.provision(q, runnerKey(q), api.NewID("agt"), tc.spec, tc.digest, tc.args...)
 			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "cannot add one: the saved launch spec on mini") {
 				t.Fatalf("mismatched spec: %v", err)
 			}
@@ -1428,23 +1445,45 @@ func TestHandlerProvisionRequiresExactSpec(t *testing.T) {
 				t.Fatalf("rows %d refused %d notices %d", f.allRows(t), f.rows(t, "refused"), f.notices(t, provisionNotice))
 			}
 			got := listedEntry(t, f.s, f.task.ID, q.ID)
-			specFix := "tt handler spec --task " + f.task.ID + ` -- --run claude --runtime claude --model claude-sonnet-5-5 --reasoning high --prompt "$(cat PROMPT_FILE)"`
+			specFix := `PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task ` + f.task.ID + " --" + tc.keeps + ` --runtime claude --model claude-sonnet-5-5 --reasoning high --prompt "$PROMPT"`
 			n := got.HandlerNeed
-			if n == nil || n.Provision || !n.Refused || n.Fix != specFix {
-				t.Fatalf("refused need %+v", n)
+			if n == nil || n.Provision || !n.Refused || n.Fix != specFix || n.Attempt != 1 {
+				t.Fatalf("refused need %+v\nwant fix %s", n, specFix)
 			}
-			for _, want := range []string{"3 of 3 leased, limit 4; cannot add one", tc.current, "arm S needs claude/claude-sonnet-5-5/high digest " + digestP, "Fix: " + specFix,
-				"or: tt team queue limit --task " + f.task.ID + " --limit 3"} {
+			wants := []string{"3 of 3 leased, limit 4; cannot add one", tc.current, "arm S needs claude/claude-sonnet-5-5/high digest " + digestP, "Fix: " + specFix + " (PROMPT_FILE holds the handler prompt with that template digest",
+				"or: tt team queue limit --task " + f.task.ID + " --limit 3"}
+			if tc.keeps == "" {
+				wants = append(wants, addRun)
+			}
+			for _, want := range wants {
 				if !strings.Contains(got.BlockReason, want) {
 					t.Fatalf("reason lacks %q: %s", want, got.BlockReason)
 				}
 			}
-			// The same spec again keeps the one row; a corrected spec clears
-			// it and reserves.
-			if _, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), tc.spec, tc.digest); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 1 {
+			if strings.ContainsAny(got.BlockReason, "\x1b\n") || (tc.keeps == "" && strings.Contains(got.BlockReason, "--run '")) {
+				t.Fatalf("unsafe reason or command: %q", got.BlockReason)
+			}
+			// f2: the same spec offered again writes nothing: the standing
+			// row is the same row, untouched.
+			var id, updated string
+			row := func() (string, string) {
+				var a, b string
+				if err := f.s.db.QueryRow(`SELECT id,updated_at FROM handler_provisions WHERE entry_id=? AND state='refused'`, q.ID).Scan(&a, &b); err != nil {
+					t.Fatal(err)
+				}
+				return a, b
+			}
+			id, updated = row()
+			f.clock = f.clock.Add(time.Minute)
+			observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+			if _, err := f.provision(got, runnerKey(got), api.NewID("agt"), tc.spec, tc.digest, tc.args...); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 1 {
 				t.Fatalf("repeat refusal: %v, rows %d", err, f.allRows(t))
 			}
-			if _, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), armS, digestP); err != nil {
+			if again, at := row(); again != id || at != updated {
+				t.Fatalf("an unchanged refusal rewrote the row: %s %s, was %s %s", again, at, id, updated)
+			}
+			// A corrected spec clears the refusal and reserves.
+			if _, err := f.provision(got, runnerKey(got), api.NewID("agt"), armS, digestP, saved...); err != nil {
 				t.Fatalf("corrected spec: %v", err)
 			}
 			if f.rows(t, "refused") != 0 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 1 {
@@ -1497,35 +1536,79 @@ func TestHandlerProvisionIsBounded(t *testing.T) {
 }
 
 // a8: a reservation whose handler never registers stops holding after ten
-// minutes, and the next one is a new attempt.
+// minutes. The listing then already names the next attempt, so the runner's
+// own retry identity changes and its next request reserves a new handler.
 func TestHandlerProvisionAbandonsUnregisteredReservation(t *testing.T) {
 	f := newProvisionFixture(t, 4, 3, 3)
-	q := f.entries[3]
-	if _, err := f.provision(q, "attempt-1", api.NewID("agt"), armS, digestP); err != nil {
+	q := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+	first := api.NewID("agt")
+	firstKey := runnerKey(q)
+	if _, err := f.provision(q, firstKey, first, armS, digestP); err != nil {
 		t.Fatal(err)
 	}
 	f.clock = f.clock.Add(handlerProvisionAbandonAfter - time.Second)
 	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
-	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.HandlerNeed.Provision {
-		t.Fatalf("still pending: %+v", got.HandlerNeed)
+	pending := listedEntry(t, f.s, f.task.ID, q.ID)
+	if pending.HandlerNeed.Provision || pending.HandlerNeed.Attempt != 1 || pending.HandlerNeed.AgentID != first || runnerKey(pending) != firstKey {
+		t.Fatalf("still pending: %+v", pending.HandlerNeed)
 	}
-	if _, err := f.provision(q, "early", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+	if _, err := f.provision(q, "another-key", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("provision while pending: %v", err)
 	}
 	f.clock = f.clock.Add(time.Second)
-	got := listedEntry(t, f.s, f.task.ID, q.ID)
-	if !got.HandlerNeed.Provision || got.HandlerNeed.Attempt != 1 {
-		t.Fatalf("after ten minutes: %+v", got.HandlerNeed)
+	// Nothing has saved the outcome yet; the listing alone moves the attempt.
+	expired := listedEntry(t, f.s, f.task.ID, q.ID)
+	if !expired.HandlerNeed.Provision || expired.HandlerNeed.Attempt != 2 || expired.HandlerNeed.AgentID != "" || runnerKey(expired) == firstKey || f.rows(t, "reserved") != 1 {
+		t.Fatalf("after ten minutes: %+v", expired.HandlerNeed)
 	}
-	next := api.NewID("agt")
-	if _, err := f.provision(q, "attempt-2", next, armS, digestP); err != nil {
-		t.Fatalf("new reservation: %v", err)
+	second := api.NewID("agt")
+	reserved, err := f.provision(expired, runnerKey(expired), second, armS, digestP)
+	if err != nil || reserved.HandlerNeed.AgentID != second {
+		t.Fatalf("new reservation: %+v %v", reserved.HandlerNeed, err)
 	}
-	if f.rows(t, "abandoned") != 1 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 2 {
-		t.Fatalf("abandoned %d reserved %d", f.rows(t, "abandoned"), f.rows(t, "reserved"))
+	if f.rows(t, "abandoned") != 1 || f.rows(t, "reserved") != 1 || f.allRows(t) != 2 || f.notices(t, provisionNotice) != 2 {
+		t.Fatalf("abandoned %d reserved %d notices %d", f.rows(t, "abandoned"), f.rows(t, "reserved"), f.notices(t, provisionNotice))
 	}
-	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.HandlerNeed.Attempt != 2 || got.HandlerNeed.AgentID != next {
+	var agent string
+	if err := f.s.db.QueryRow(`SELECT agent_id FROM handler_provisions WHERE task_id=? AND state='abandoned'`, f.task.ID).Scan(&agent); err != nil || agent != first {
+		t.Fatalf("abandoned agent %q %v", agent, err)
+	}
+	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.HandlerNeed.Provision || got.HandlerNeed.Attempt != 2 || got.HandlerNeed.AgentID != second {
 		t.Fatalf("second attempt need %+v", got.HandlerNeed)
+	}
+	// The first attempt's identity replays its stored answer and adds nothing.
+	if _, err := f.provision(q, firstKey, first, armS, digestP); err != nil || f.allRows(t) != 2 || f.notices(t, provisionNotice) != 2 {
+		t.Fatalf("stale replay: %v rows %d", err, f.allRows(t))
+	}
+}
+
+// a7, a8: a reserved handler that registered but never came online is
+// abandoned too, yet it is an open handler, so it counts toward the limit and
+// no further one is reserved on top of it.
+func TestHandlerProvisionAbandonedRegisteredHandlerStillCounts(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	q := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+	first := api.NewID("agt")
+	if _, err := f.provision(q, runnerKey(q), first, armS, digestP); err != nil {
+		t.Fatal(err)
+	}
+	added, err := f.s.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{Name: "handler-stuck", Role: api.AgentRoleDatabaseHandler, AgentID: first, Host: "mini", Session: "handler-stuck",
+		Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.offline(t, added)
+	f.clock = f.clock.Add(handlerProvisionAbandonAfter)
+	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	got := listedEntry(t, f.s, f.task.ID, q.ID)
+	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Handlers != 4 || got.BlockReason != "Waiting for a free handler of arm S" {
+		t.Fatalf("stuck handler need %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+	if _, err := f.provision(got, "after-stuck", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("provision on top of a stuck handler: %v", err)
+	}
+	if f.allRows(t) != 1 || f.notices(t, provisionNotice) != 1 {
+		t.Fatalf("rows %d notices %d", f.allRows(t), f.notices(t, provisionNotice))
 	}
 }
 

@@ -177,11 +177,19 @@ from the team queue, not an owner intervention. The runner then starts the
 handler through the ordinary `tt spawn --role database_handler` path with the
 spec's flags and the reserved agent ID; the next pass claims as usual. The row
 becomes `registered` when that agent is an online handler and `abandoned` if
-it is not after 10 minutes, after which a new reservation (attempt 2, a new
-agent ID) is allowed. A retry with the same request ID replays the same row
-and posts nothing. The runner makes one provision attempt per project and
-pass. This work never closes a handler: surplus handlers stay until the owner
-closes them.
+it is not after 10 minutes. The runner's request ID is
+`queue-provision-ENTRY-REVISION-ATTEMPT` and the handler agent ID is derived
+from it, so a retry with the same ID replays the same row and posts nothing.
+Once the ten minutes have passed the listing reports the next `attempt` even
+before anything has saved the outcome, so the runner's next request has a new
+ID: it saves the old row as `abandoned`, reserves a new handler (a new agent
+ID) and posts a new notice. This repeats every ten minutes while the handler
+keeps failing to come online. A handler registers with the hub before its
+session starts, so an abandoned attempt either never registered, and nothing
+of it runs, or it is an open handler that counts toward `handlers`, and no
+further one is reserved once the limit is reached. The runner makes one
+provision attempt per project and pass. This work never closes a handler:
+surplus handlers stay until the owner closes them.
 
 **Reasons.** The entry's reason starts with `Waiting for a free handler of arm
 S` (or `No free database handler` without a policy) and, when the limit has
@@ -192,21 +200,36 @@ room for another handler, continues with the counts and one of:
 | Being added, or one is pending | `; the runner is adding one` |
 | Switch off | `; automatic provisioning is off. Fix: tt team queue provision --task TSK --auto on` |
 | Agent cap | `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29. Fix: tt team queue limit --task TSK --limit 3` (with `+ R reserved` after the open count when seats are reserved) |
-| Spec differs | `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: tt handler spec --task TSK -- --run R --runtime R --model M --reasoning E --prompt "$(cat PROMPT_FILE)" (PROMPT_FILE holds the handler prompt with that template digest; keep the saved spec's other flags), or: tt team queue limit --task TSK --limit 3` |
-| No spec saved | as above, with `the saved launch spec on HOST is missing` |
+| Spec differs | `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task TSK -- --run 'SAVED RUN' --cwd 'SAVED CWD' --runtime R --model M --reasoning E --prompt "$PROMPT" (PROMPT_FILE holds the handler prompt with that template digest), or: tt team queue limit --task TSK --limit 3` |
+| Spec is for another runtime, or no spec saved | the same, with `the saved launch spec on HOST is missing` when none is saved, a command without `--run`, and the note `(…; add --run with the R launch command and the host's other launch flags, tt refuses the spec without --run)` |
 
 `TSK` is the real project ID and the numbers are the real counts. The limit
 command always names the current number of matching handlers, so it is an
 exact alternative: the queue then admits only as many teams as it has
-handlers. The hub stores only the prompt's digest, so `PROMPT_FILE` is the one
-placeholder. Without a policy the spec reasons say `the handlers in use needs`
-instead of `arm S needs`. When the limit already has its handlers (they are
+handlers.
+
+The spec command is safe to paste as written. `tt handler spec` replaces the
+whole saved spec, so the runner sends the saved spec's other launch flags
+(`--run`, `--cwd`, the permission, approval, sandbox and allowed-tools flags;
+never the prompt) and the command repeats them, shell-quoted, with the wanted
+runtime, model and reasoning. The hub stores only the prompt's digest, so
+`PROMPT_FILE` is the one placeholder; the command reads it first and stops
+before saving anything if it cannot. When the saved run command starts
+another runtime, or no spec is saved, the hub does not guess a run command:
+the command has no `--run`, which `tt handler spec` refuses, and the note says
+to add it. A saved value no handler could have, such as a runtime taken from
+a run command given by path, is refused the same way with the value shown;
+control characters are removed and long values cut. Without a policy the spec
+reasons say `the handlers in use needs` instead of `arm S needs`. When the limit already has its handlers (they are
 busy or offline), the reason stays the plain wait and nothing is added.
 
 A refused spec is stored as one `refused` row per entry and is the entry's
 standing reason. The runner keeps offering its spec each pass, so saving a
 matching spec is noticed; the row is removed then, and when the entry leases a
-handler. A cap, switch or limit refusal answers 409 and stores nothing.
+handler. Offering the same spec again answers 409 and writes nothing: the row
+is rewritten, and the project's listeners notified, only when the offered spec
+or the wanted settings changed. A cap, switch or limit refusal answers 409 and
+stores nothing.
 
 **Switch.** Automatic handler provisioning is a project setting, default
 **on**, stored as `team_queue_settings.handler_provision` (a project with no

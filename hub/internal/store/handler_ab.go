@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS handler_provisions (
  id TEXT PRIMARY KEY, task_id TEXT NOT NULL, entry_id TEXT NOT NULL, arm TEXT NOT NULL DEFAULT '', agent_id TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL CHECK(state IN ('reserved','registered','abandoned','refused')), reason TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
  host TEXT NOT NULL DEFAULT '', spec_runtime TEXT NOT NULL DEFAULT '', spec_model TEXT NOT NULL DEFAULT '', spec_reasoning TEXT NOT NULL DEFAULT '',
- spec_digest TEXT NOT NULL DEFAULT '', notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+ spec_digest TEXT NOT NULL DEFAULT '', fix TEXT NOT NULL DEFAULT '', notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS handler_provisions_entry ON handler_provisions(task_id,entry_id);
 CREATE UNIQUE INDEX IF NOT EXISTS handler_provisions_pending ON handler_provisions(task_id) WHERE state='reserved';
 CREATE UNIQUE INDEX IF NOT EXISTS handler_provisions_refused ON handler_provisions(entry_id) WHERE state='refused';`)
@@ -1660,14 +1660,14 @@ func handlerProvisionState(on bool) string {
 type handlerProvisionRow struct {
 	id, entryID, arm, agentID, state, reason, host    string
 	specRuntime, specModel, specReasoning, specDigest string
-	createdAt                                         string
+	fix, createdAt                                    string
 }
 
-const handlerProvisionCols = `id,entry_id,arm,agent_id,state,reason,host,spec_runtime,spec_model,spec_reasoning,spec_digest,created_at`
+const handlerProvisionCols = `id,entry_id,arm,agent_id,state,reason,host,spec_runtime,spec_model,spec_reasoning,spec_digest,fix,created_at`
 
 func scanHandlerProvision(row interface{ Scan(...any) error }) (handlerProvisionRow, error) {
 	var r handlerProvisionRow
-	err := row.Scan(&r.id, &r.entryID, &r.arm, &r.agentID, &r.state, &r.reason, &r.host, &r.specRuntime, &r.specModel, &r.specReasoning, &r.specDigest, &r.createdAt)
+	err := row.Scan(&r.id, &r.entryID, &r.arm, &r.agentID, &r.state, &r.reason, &r.host, &r.specRuntime, &r.specModel, &r.specReasoning, &r.specDigest, &r.fix, &r.createdAt)
 	return r, err
 }
 
@@ -1730,14 +1730,17 @@ func clearHandlerProvisionRefusal(ctx context.Context, tx *sql.Tx, entryID strin
 // provision shares: the open handlers, the cap counts and the pending
 // reservation are read once.
 type handlerNeedContext struct {
-	policy             api.HandlerArmPolicy
-	active             []api.TeamQueueEntry
-	limit, maxAgents   int
-	autoOn             bool
-	now                time.Time
-	handlers           []api.HandlerArmHandler
-	capOpen, capSeats  int
-	pending            *handlerProvisionRow
+	policy            api.HandlerArmPolicy
+	active            []api.TeamQueueEntry
+	limit, maxAgents  int
+	autoOn            bool
+	now               time.Time
+	handlers          []api.HandlerArmHandler
+	capOpen, capSeats int
+	pending           *handlerProvisionRow
+	// over is a reserved row that has become registered or abandoned but is
+	// not saved as such yet; it already counts as a finished attempt.
+	over               *handlerProvisionRow
 	leasedByActive     map[string]bool
 	effectiveLimit     int
 	effectiveLimitText string
@@ -1767,6 +1770,8 @@ func loadHandlerNeedContext(ctx context.Context, q queryRower, p api.HandlerArmP
 	}
 	if state == "reserved" {
 		c.pending = pending
+	} else {
+		c.over = pending
 	}
 	for _, e := range active {
 		if e.HandlerID != "" {
@@ -1825,6 +1830,12 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM handler_provisions WHERE entry_id=? AND state IN ('registered','abandoned')`, e.ID).Scan(&attempts); err != nil {
 		return nil, "", err
 	}
+	if c.over != nil && c.over.entryID == e.ID {
+		// The listing judges an expired reservation without saving it, so the
+		// runner's next retry identity is already the next attempt; that
+		// request then saves the outcome and reserves anew.
+		attempts++
+	}
 	n.Attempt = attempts + 1
 	kind, err := queueItemKind(ctx, q, e.TaskID, e.ItemID)
 	if err != nil {
@@ -1861,36 +1872,86 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		}
 		if err == nil {
 			n.Provision, n.Refused = false, true
-			n.Fix = handlerSpecFix(e.TaskID, *n)
+			n.Fix = refused.fix
 			n.Reason = counts + "; " + refused.reason + ", or: " + lower
 		}
 	}
 	return n, ": " + n.Reason, nil
 }
 
+// provisionText makes a runner-supplied value safe to show in a reason: one
+// line, no control characters, bounded.
+func provisionText(v string) string {
+	v = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, v)
+	if len(v) > 200 {
+		v = v[:200] + "..."
+	}
+	return v
+}
+
 func handlerSpecText(runtime, model, reasoning, digest string) string {
 	if runtime == "" && model == "" && reasoning == "" && digest == "" {
 		return "missing"
 	}
-	return fmt.Sprintf("%s/%s/%s digest %s", or(runtime, "-"), or(model, "-"), or(reasoning, "-"), or(digest, "-"))
+	return fmt.Sprintf("%s/%s/%s digest %s", or(provisionText(runtime), "-"), or(provisionText(model), "-"), or(provisionText(reasoning), "-"), or(provisionText(digest), "-"))
 }
+
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// handlerSpecKeptFlags are the launch flags a refusal's command carries over
+// from the saved spec; the wanted runtime, model and reasoning and the prompt
+// replace the saved ones.
+var handlerSpecKeptFlags = map[string]bool{"--run": true, "--cwd": true, "--permission-mode": true, "--approval-mode": true, "--sandbox-mode": true, "--allowed-tools-json": true}
 
 // handlerSpecFix is the command that saves a launch spec with the wanted
-// settings. The hub holds only the prompt's digest, so the prompt file is
-// the one placeholder.
-func handlerSpecFix(task string, n api.TeamQueueHandlerNeed) string {
-	return fmt.Sprintf(`tt handler spec --task %s -- --run %s --runtime %s --model %s --reasoning %s --prompt "$(cat PROMPT_FILE)"`, task, n.Runtime, n.Runtime, n.Model, n.Reasoning)
+// settings, and a note on what it leaves to the owner. tt handler spec
+// replaces the whole spec, so the saved spec's other flags are repeated. The
+// hub holds only the prompt's digest: PROMPT_FILE is the one placeholder, and
+// the command stops before saving anything if that file cannot be read. When
+// the saved run command is unknown or starts another runtime, --run is left
+// out, and tt handler spec refuses the command until it is added.
+func handlerSpecFix(task string, n api.TeamQueueHandlerNeed, req api.TeamQueueRequest) (string, string) {
+	kept, hasRun := "", false
+	if req.HandlerSpecRuntime == n.Runtime && len(req.HandlerSpecArgs)%2 == 0 && len(req.HandlerSpecArgs) <= 2*len(handlerSpecKeptFlags) {
+		for i := 0; i+1 < len(req.HandlerSpecArgs); i += 2 {
+			flag, value := req.HandlerSpecArgs[i], req.HandlerSpecArgs[i+1]
+			if !handlerSpecKeptFlags[flag] || len(value) > 4096 || strings.ContainsAny(value, "\r\n\x00") {
+				kept, hasRun = "", false
+				break
+			}
+			kept += " " + flag + " " + shellQuote(value)
+			hasRun = hasRun || flag == "--run"
+		}
+	}
+	if !hasRun {
+		kept = ""
+	}
+	fix := fmt.Sprintf(`PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task %s --%s --runtime %s --model %s --reasoning %s --prompt "$PROMPT"`, task, kept, n.Runtime, n.Model, n.Reasoning)
+	note := "PROMPT_FILE holds the handler prompt with that template digest"
+	if !hasRun {
+		note += "; add --run with the " + n.Runtime + " launch command and the host's other launch flags, tt refuses the spec without --run"
+	}
+	return fix, note
 }
 
-// handlerSpecRefusal is the stored reason of a spec that does not match.
-func handlerSpecRefusal(task, host string, req api.TeamQueueRequest, n api.TeamQueueHandlerNeed) string {
+// handlerSpecRefusal is the stored reason and fix of a spec that does not
+// match.
+func handlerSpecRefusal(task, host string, req api.TeamQueueRequest, n api.TeamQueueHandlerNeed) (string, string) {
 	wanted := "the handlers in use"
 	if n.Arm != "" {
 		wanted = "arm " + n.Arm
 	}
-	return fmt.Sprintf("cannot add one: the saved launch spec on %s is %s, %s needs %s. Fix: %s (PROMPT_FILE holds the handler prompt with that template digest; keep the saved spec's other flags)",
-		host, handlerSpecText(req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest), wanted,
-		handlerSpecText(n.Runtime, n.Model, n.Reasoning, n.TemplateDigest), handlerSpecFix(task, n))
+	fix, note := handlerSpecFix(task, n, req)
+	return fmt.Sprintf("cannot add one: the saved launch spec on %s is %s, %s needs %s. Fix: %s (%s)",
+		provisionText(host), handlerSpecText(req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest), wanted,
+		handlerSpecText(n.Runtime, n.Model, n.Reasoning, n.TemplateDigest), fix, note), fix
 }
 
 // provisionHandler is the provision_handler queue operation: it recomputes
@@ -1901,9 +1962,10 @@ func handlerSpecRefusal(task, host string, req api.TeamQueueRequest, n api.TeamQ
 // caller commits it and returns the second result as the 409.
 func (s *Store) provisionHandler(ctx context.Context, tx *sql.Tx, t api.Task, req api.TeamQueueRequest) (api.TeamQueueEntry, error, error) {
 	var zero api.TeamQueueEntry
-	if !api.ValidID(req.HandlerAgentID, "agt") || req.Host == "" || req.EntryID == "" ||
-		!validArmField(req.HandlerSpecRuntime) || !validArmField(req.HandlerSpecModel) || !validArmField(req.HandlerSpecReasoning) ||
-		(req.HandlerSpecDigest != "" && !validContextDigest(req.HandlerSpecDigest)) {
+	// The spec values are whatever the host has saved. A value no handler
+	// could have is not a malformed request: it is a spec that does not match,
+	// and the entry's reason must say so.
+	if !api.ValidID(req.HandlerAgentID, "agt") || req.Host == "" || req.EntryID == "" {
 		return zero, nil, api.ErrInvalid
 	}
 	now := s.now()
@@ -1998,17 +2060,30 @@ func (s *Store) provisionHandler(ctx context.Context, tx *sql.Tx, t api.Task, re
 		return zero, nil, fmt.Errorf("%w: no handler is added: %s", api.ErrConflict, need.Reason)
 	}
 	stamp := ts(now)
-	if err := clearHandlerProvisionRefusal(ctx, tx, e.ID); err != nil {
-		return zero, nil, err
-	}
 	if req.HandlerSpecRuntime != need.Runtime || req.HandlerSpecModel != need.Model || req.HandlerSpecReasoning != need.Reasoning || req.HandlerSpecDigest != need.TemplateDigest {
-		reason := handlerSpecRefusal(t.ID, req.Host, req, *need)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO handler_provisions(id,task_id,entry_id,arm,agent_id,state,reason,request_id,host,spec_runtime,spec_model,spec_reasoning,spec_digest,created_at,updated_at)
- VALUES(?,?,?,?,'','refused',?,?,?,?,?,?,?,?,?)`, api.NewID("hpv"), t.ID, e.ID, need.Arm, reason, req.RequestID, req.Host,
-			req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest, stamp, stamp); err != nil {
+		reason, fix := handlerSpecRefusal(t.ID, req.Host, req, *need)
+		refusal := fmt.Errorf("%w: no handler is added: %s", api.ErrConflict, reason)
+		standing, err := scanHandlerProvision(tx.QueryRowContext(ctx, `SELECT `+handlerProvisionCols+` FROM handler_provisions WHERE entry_id=? AND state='refused'`, e.ID))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return zero, nil, err
 		}
-		return zero, fmt.Errorf("%w: no handler is added: %s", api.ErrConflict, reason), nil
+		if err == nil && standing.reason == reason && standing.fix == fix {
+			// The same spec offered again: the standing row already says
+			// this, so nothing is written and nobody is notified.
+			return zero, nil, refusal
+		}
+		if err := clearHandlerProvisionRefusal(ctx, tx, e.ID); err != nil {
+			return zero, nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO handler_provisions(id,task_id,entry_id,arm,agent_id,state,reason,request_id,host,spec_runtime,spec_model,spec_reasoning,spec_digest,fix,created_at,updated_at)
+ VALUES(?,?,?,?,'','refused',?,?,?,?,?,?,?,?,?,?)`, api.NewID("hpv"), t.ID, e.ID, need.Arm, reason, req.RequestID, provisionText(req.Host),
+			provisionText(req.HandlerSpecRuntime), provisionText(req.HandlerSpecModel), provisionText(req.HandlerSpecReasoning), provisionText(req.HandlerSpecDigest), fix, stamp, stamp); err != nil {
+			return zero, nil, err
+		}
+		return zero, refusal, nil
+	}
+	if err := clearHandlerProvisionRefusal(ctx, tx, e.ID); err != nil {
+		return zero, nil, err
 	}
 	var taken int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE id=?`, req.HandlerAgentID).Scan(&taken); err != nil {

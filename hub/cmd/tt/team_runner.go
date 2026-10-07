@@ -514,6 +514,15 @@ func (r teamRunner) provisionOne(ctx context.Context, e env, c *api.Client, q ap
 	if spec != nil {
 		req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning = spec.runtime(), spec.value("model"), spec.value("reasoning")
 		req.HandlerSpecDigest = handlerTemplateDigest(spec.value("prompt"))
+		// The other launch flags let a refusal print a complete command; the
+		// prompt and the three compared settings are not repeated.
+		for i := 0; i+1 < len(spec.Args); i += 2 {
+			switch spec.Args[i] {
+			case "--prompt", "--runtime", "--model", "--reasoning":
+			default:
+				req.HandlerSpecArgs = append(req.HandlerSpecArgs, spec.Args[i], spec.Args[i+1])
+			}
+		}
 	}
 	if _, err := c.TeamQueueAction(ctx, q.TaskID, req); err != nil {
 		var response *api.HTTPError
