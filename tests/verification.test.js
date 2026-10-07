@@ -1723,12 +1723,13 @@ test("concurrent checks keep plan-ordered receipts and record the job count", as
   assert(fast.startedAt < slow.endedAt && slow.startedAt < fast.endedAt);
   assert(receipt.checks.every((c) => c.status === "pass"));
 });
-// Pids of the processes whose command line carries token, read in one listing.
+// Pids of the live processes whose command line carries token, read in one
+// listing. A zombie awaiting its parent is not running and is left out.
 const tokenProcesses = (token) =>
-  spawnSync("ps", ["-axww", "-o", "pid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+  spawnSync("ps", ["-axww", "-o", "pid=,state=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
     .stdout.split("\n")
-    .map((line) => line.match(/^\s*(\d+)\s+(.*)$/))
-    .filter((match) => match && match[2].includes(token))
+    .map((line) => line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/))
+    .filter((match) => match && !match[2].startsWith("Z") && match[3].includes(token))
     .map((match) => Number(match[1]));
 // Starts two concurrent check groups through the CLI, interrupts the run once
 // both published a pid file and checks what it left. Every process of the run
@@ -1861,8 +1862,15 @@ test("a check group that never publishes its pid file is still stopped when the 
   );
   assert(run.runner.exitCode !== null || run.runner.signalCode !== null, "the runner exited");
   assert.equal(run.started.length, 4);
-  assert.deepEqual(run.started.filter(alive), [], "a started check group process is still running");
-  assert.deepEqual(tokenProcesses(run.token), []);
+  // Judged by the run's token and process state, as the cleanup is: a bare
+  // pid probe also answers for a zombie or for a stranger that took the pid.
+  const left = tokenProcesses(run.token);
+  assert.deepEqual(
+    run.started.filter((pid) => left.includes(pid)),
+    [],
+    "a started check group process is still running",
+  );
+  assert.deepEqual(left, []);
 });
 function commitChange(f, path, content, message) {
   mkdirSync(join(f.cwd, path, ".."), { recursive: true });
