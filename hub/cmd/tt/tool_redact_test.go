@@ -174,7 +174,7 @@ type redactProbe struct {
 	transcripts map[string]bool
 }
 
-// TestSecretRedactionSandboxProbe: run with TT_LIVE_CLAUDE=1. It starts six
+// TestSecretRedactionSandboxProbe: run with TT_LIVE_CLAUDE=1. It starts eight
 // disposable Claude sessions with an environment built from nothing and
 // reports, per check, what the model received and which local files hold the
 // generated value. The transcript and local-copy findings are records for the
@@ -248,8 +248,43 @@ func TestSecretRedactionSandboxProbe(t *testing.T) {
 	}
 	t.Logf("check 6 (cut-off JSON): original output used=%v, placeholder in tool result=%v", strings.Contains(run.toolResult, value), strings.Contains(run.toolResult, redactProbeHolder))
 
+	// Checks 7 and 8: the same two modes for a file read through the Read tool.
+	const readPrompt = "Read the file value.txt in the current directory with the Read tool, once, and use no other tool. Then reply with the file's content copied exactly, character for character, and nothing else."
+	value = p.newValue()
+	before = len(p.rows())
+	run = p.turn("redact", "Read", readPrompt)
+	if strings.Contains(run.toolResult, value) || strings.Contains(run.reply, value) {
+		t.Errorf("check 7: the generated value reached the model after a rewrite of Read output (tool result %v, reply %v)", strings.Contains(run.toolResult, value), strings.Contains(run.reply, value))
+	}
+	t.Logf("check 7 (redact, Read tool): value in tool result=%v, in reply=%v; placeholder in tool result=%v, in reply=%v; hook rows=%s", strings.Contains(run.toolResult, value), strings.Contains(run.reply, value), strings.Contains(run.toolResult, redactProbeHolder), strings.Contains(run.reply, redactProbeHolder), redactProbeRowSummary(p.rows()[before:]))
+	p.findings("check 7", run, value)
+
+	value = p.newValue()
+	before = len(p.rows())
+	run = p.turn("report", "Read", readPrompt)
+	counted = -1
+	for _, row := range p.rows()[before:] {
+		if row["event"] == "PostToolUse" && row["tool"] == "Read" {
+			counted = int(row["count"].(float64))
+		}
+	}
+	if !strings.Contains(run.toolResult, value) || counted != 1 {
+		t.Errorf("check 8: report mode on Read: value in tool result=%v, hook counted %d", strings.Contains(run.toolResult, value), counted)
+	}
+	t.Logf("check 8 (report, Read tool): output unchanged=%v, hook counted=%d", strings.Contains(run.toolResult, value), counted)
+	p.findings("check 8", run, value)
+
 	p.sandboxOnly()
 	p.noValueInWorkingTree()
+}
+
+// redactProbeRowSummary names each hook row's event, tool and response keys.
+func redactProbeRowSummary(rows []map[string]any) string {
+	var parts []string
+	for _, row := range rows {
+		parts = append(parts, fmt.Sprintf("%v/%v count=%v keys=%v", row["event"], row["tool"], row["count"], row["responseKeys"]))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func newRedactProbe(t *testing.T) *redactProbe {
@@ -367,13 +402,18 @@ func (p *redactProbe) rows() []map[string]any {
 // session runs one disposable `claude -p` turn that runs one Bash command.
 func (p *redactProbe) session(mode, command string) redactProbeRun {
 	p.t.Helper()
+	return p.turn(mode, "Bash", "Run exactly this one Bash command, once, and use no other tool: "+command+"\nIt may exit non-zero; do not retry it. Then reply with the command's output copied exactly, character for character, and nothing else.")
+}
+
+// turn runs one disposable `claude -p` turn that is allowed one tool.
+func (p *redactProbe) turn(mode, tool, prompt string) redactProbeRun {
+	p.t.Helper()
 	if err := os.WriteFile(p.setting, []byte(mode), 0600); err != nil {
 		p.t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	prompt := "Run exactly this one Bash command, once, and use no other tool: " + command + "\nIt may exit non-zero; do not retry it. Then reply with the command's output copied exactly, character for character, and nothing else."
-	cmd := exec.CommandContext(ctx, p.claude, "-p", prompt, "--output-format", "stream-json", "--verbose", "--allowedTools", "Bash", "--model", "haiku")
+	cmd := exec.CommandContext(ctx, p.claude, "-p", prompt, "--output-format", "stream-json", "--verbose", "--allowedTools", tool, "--model", "haiku")
 	cmd.Dir, cmd.Env = p.project, p.env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
