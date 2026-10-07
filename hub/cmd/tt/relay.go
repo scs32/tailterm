@@ -285,7 +285,7 @@ func runActivitySafely(tick func() error) (err error) {
 // are delivered by broker wake jobs, never by waking the whole roster as if
 // they were human announcements. deployers names the deployment agents whose
 // recipient-less notices also wake this agent (deployerNoticeAuthors); it is
-// nil for every agent but the database handler and the owner helper.
+// nil for every agent but the primary database handler and the owner helper.
 func wakeEligible(m api.Message, agent string, deployers map[string]bool) bool {
 	if m.From.Node == api.BrokerNode || m.From.AgentID == agent {
 		return false
@@ -339,15 +339,70 @@ func (r *authorRoles) role(ctx context.Context, c *api.Client, b runtimeBinding,
 	return a.Role, nil
 }
 
+// relayPrimaryHandlers remembers each project's primary database handler for
+// a minute: long enough that polls do not repeat the read, short enough that
+// a committed handler rotation moves the deployer notice wake to the new one.
+var relayPrimaryHandlers = &primaryHandlers{}
+
+type primaryHandlers struct {
+	mu   sync.Mutex
+	seen map[string]primaryHandler
+}
+
+type primaryHandler struct {
+	agent string
+	at    time.Time
+}
+
+func (r *primaryHandlers) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = nil
+}
+
+// primary returns the project's explicit primary handler, or "" when none is
+// set. The task list carries it without the project's roster.
+func (r *primaryHandlers) primary(ctx context.Context, c *api.Client, b runtimeBinding, now time.Time) (string, error) {
+	key := b.Hub + "\x00" + b.Task
+	r.mu.Lock()
+	got, ok := r.seen[key]
+	r.mu.Unlock()
+	if ok && now.Sub(got.at) < time.Minute && !now.Before(got.at) {
+		return got.agent, nil
+	}
+	tasks, err := c.ListTasks(ctx)
+	if err != nil {
+		return "", err
+	}
+	got = primaryHandler{at: now}
+	for _, t := range tasks {
+		if t.ID == b.Task {
+			got.agent = t.PrimaryHandlerID
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen == nil {
+		r.seen = map[string]primaryHandler{}
+	}
+	r.seen[key] = got
+	return got.agent, nil
+}
+
 // deployerNoticeAuthors returns the deployment agents among the authors of
-// this page's recipient-less notices, for the database handler's and the
-// owner helper's bindings only (wi_3670e153328df185): a refused, failed or
-// waiting release is announced with no recipient, and in a project that is
-// not a swarm that reaches their inbox without waking them. The caller has
-// already found this binding live. The one added hub request is a cached read
-// of an author's role; a failed read is returned, so the page is read again
-// rather than passed over.
-func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, msgs []api.Message) (map[string]bool, error) {
+// this page's recipient-less notices, for the bindings of the project's
+// primary database handler and of the owner helper only
+// (wi_3670e153328df185): a refused, failed or waiting release is announced
+// with no recipient, and in a project that is not a swarm that reaches their
+// inbox without waking them. A project holds many live handlers, one per
+// running item, so only the explicit primary is woken; with no primary set no
+// handler is, because the legacy choice (the newest open handler that is not
+// a prepared successor) cannot be made from the relay's reads. The caller has
+// already found this binding live. The added hub requests are cached reads of
+// the primary handler and of an author's role, made only when the page holds
+// such a notice; a failed read is returned, so the page is read again rather
+// than passed over.
+func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, msgs []api.Message, now time.Time) (map[string]bool, error) {
 	if a.Role != api.AgentRoleDatabaseHandler && a.Role != api.AgentRoleOwnerHelper {
 		return nil, nil
 	}
@@ -356,6 +411,12 @@ func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding,
 	for _, m := range msgs {
 		if !recipientlessNotice(m) || m.From.AgentID == b.Agent || checked[m.From.AgentID] {
 			continue
+		}
+		if a.Role == api.AgentRoleDatabaseHandler && len(checked) == 0 {
+			primary, err := relayPrimaryHandlers.primary(ctx, c, b, now)
+			if err != nil || primary != b.Agent {
+				return nil, err
+			}
 		}
 		checked[m.From.AgentID] = true
 		role, err := relayAuthorRoles.role(ctx, c, b, m.From.AgentID)
@@ -742,7 +803,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 			}
 		}
 	}
-	deployers, err := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs)
+	deployers, err := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs, now)
 	if err != nil {
 		return err
 	}
