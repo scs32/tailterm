@@ -137,6 +137,20 @@ delegation window routes it to the delegate, whose answer reaches the steward as
 a directed message. A window whose delegate is the steward never routes the
 steward's own decision.
 
+**Lane.** Every queue proposal names the team template (owner decision #19235,
+`wi_2430de4c12e43df4`). A bug whose fix fits at most three owned paths,
+including the doc that describes the changed behaviour, is proposed with
+template `small`. A bug is proposed for Planned delivery only with one named
+reason, given to `tt team queue add` as `--planned-reason`:
+
+- `paths`: the fix needs more than three owned paths;
+- `schema`: a schema or migration change;
+- `risk:TEXT`: a cross-cutting risk the steward names.
+
+Features stay Planned and need no reason. `tt team queue add` applies the same
+default when `--template` is omitted; see
+[project-queue.md](project-queue.md#small-change-lane).
+
 The steward applies nothing itself. After an answer it sends a REQUEST citing
 the decision:
 

@@ -1304,3 +1304,333 @@ func TestTeamQueueCLIHandlerProvisionSwitchAndLimitWarning(t *testing.T) {
 		t.Fatalf("bound session: %v", err)
 	}
 }
+
+// wi_2430de4c12e43df4: the lane tt team queue add picks from the item kind,
+// the submitted path count, --serial, --template and --planned-reason.
+func TestQueueAddTemplate(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		kind               string
+		owned              int
+		serial             bool
+		explicit, reason   string
+		template, recorded string
+		why, refusal       string
+	}{
+		{name: "bug with one path", kind: "bug", owned: 1, template: "small", why: "bug owning 1 path (default)"},
+		{name: "bug with three paths", kind: "bug", owned: 3, template: "small", why: "bug owning 3 paths (default)"},
+		{name: "bug with four paths", kind: "bug", owned: 4, template: "planned", recorded: "paths", why: "bug owning 4 paths, more than three (default)"},
+		{name: "serial bug", kind: "bug", serial: true, template: "planned", recorded: "unscoped", why: "cannot admit"},
+		{name: "unscoped bug", kind: "bug", template: "planned", recorded: "unscoped", why: "cannot admit"},
+		{name: "feature", kind: "feature", owned: 2, template: "planned", why: "a feature stays on Planned delivery (default)"},
+		{name: "explicit small bug", kind: "bug", owned: 2, explicit: "small", template: "small", why: "--template small"},
+		{name: "explicit small is left to the hub", kind: "feature", owned: 9, explicit: "small", template: "small", why: "--template small"},
+		{name: "explicit planned feature", kind: "feature", owned: 1, explicit: "planned", template: "planned", why: "--template planned"},
+		{name: "explicit planned small bug without a reason", kind: "bug", owned: 2, explicit: "planned", refusal: "--planned-reason schema"},
+		{name: "explicit planned small bug with paths", kind: "bug", owned: 3, explicit: "planned", reason: "paths", refusal: "--planned-reason risk:TEXT"},
+		{name: "explicit planned small bug with schema", kind: "bug", owned: 2, explicit: "planned", reason: "schema", template: "planned", recorded: "schema", why: "--template planned"},
+		{name: "explicit planned small bug with a risk", kind: "bug", owned: 2, explicit: "planned", reason: "risk: shared relay limiter ", template: "planned", recorded: "risk:shared relay limiter", why: "--template planned"},
+		{name: "explicit planned wide bug", kind: "bug", owned: 5, explicit: "planned", template: "planned", recorded: "paths", why: "--template planned"},
+		{name: "explicit planned wide bug with schema", kind: "bug", owned: 5, explicit: "planned", reason: "schema", template: "planned", recorded: "schema", why: "--template planned"},
+		{name: "explicit planned serial bug", kind: "bug", serial: true, explicit: "planned", template: "planned", recorded: "unscoped", why: "--template planned"},
+		{name: "paths on a serial bug", kind: "bug", serial: true, explicit: "planned", reason: "paths", refusal: "this entry declares none"},
+		{name: "default wide bug with a named risk", kind: "bug", owned: 4, reason: "risk:x", template: "planned", recorded: "risk:x", why: "more than three (default)"},
+		{name: "reason on a default small bug", kind: "bug", owned: 2, reason: "schema", refusal: "add --template planned"},
+		{name: "reason with explicit small", kind: "bug", owned: 2, explicit: "small", reason: "schema", refusal: "add --template planned"},
+		{name: "reason on a feature", kind: "feature", owned: 2, reason: "schema", refusal: "a feature is always Planned"},
+		{name: "unknown reason", kind: "bug", owned: 4, reason: "big", refusal: "paths, schema or risk:TEXT"},
+		{name: "empty risk", kind: "bug", owned: 2, explicit: "planned", reason: "risk: ", refusal: "paths, schema or risk:TEXT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template, why, recorded, err := queueAddTemplate(tc.kind, tc.owned, tc.serial, tc.explicit, tc.reason)
+			if tc.refusal != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.refusal) || template != "" || recorded != "" {
+					t.Fatalf("got %q %q %q %v, want refusal %q", template, why, recorded, err, tc.refusal)
+				}
+				return
+			}
+			if err != nil || template != tc.template || recorded != tc.recorded || !strings.Contains(why, tc.why) {
+				t.Fatalf("got %q %q %q %v, want %q %q %q", template, why, recorded, err, tc.template, tc.why, tc.recorded)
+			}
+		})
+	}
+}
+
+// laneFixtureItem files one more item of a kind with its own confirmed order;
+// owns, when given, is the ownership the handler recorded at intake.
+func laneFixtureItem(t *testing.T, f teamFixture, kind, key string, owns ...string) (api.WorkItem, int64) {
+	t.Helper()
+	ctx := context.Background()
+	item, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: kind, Title: key, RequestID: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: key + " bounded order", RequestID: key + "-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: key + "-scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true, Ownership: owns}); err != nil {
+		t.Fatal(err)
+	}
+	return item, order.Seq
+}
+
+// laneAdd runs tt team queue add for an item in repo and returns its stdout
+// and stderr.
+func laneAdd(t *testing.T, e env, item api.WorkItem, order int64, repo string, extra ...string) (string, string, error) {
+	t.Helper()
+	args := append([]string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--cwd", repo}, extra...)
+	oldErr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	out, runErr := captureCLIOutput(t, func() error { return cmdTeamQueue(e, args) })
+	_ = w.Close()
+	os.Stderr = oldErr
+	stderr, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return out, string(stderr), runErr
+}
+
+func laneEntry(t *testing.T, f teamFixture, item string) api.TeamQueueEntry {
+	t.Helper()
+	list, err := f.c.ListTeamQueue(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []api.TeamQueueEntry
+	for _, q := range list.Entries {
+		if q.ItemID == item {
+			found = append(found, q)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("item %s has %d queue entries: %+v", item, len(found), list.Entries)
+	}
+	return found[0]
+}
+
+// laneNotices returns the lane notices linked to an item.
+func laneNotices(t *testing.T, f teamFixture, item string) []api.Message {
+	t.Helper()
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notices []api.Message
+	for _, m := range messages {
+		if m.Envelope == nil || m.Envelope.Kind != api.EnvelopeKindNotice || m.Envelope.Refs["entry"] == "" {
+			continue
+		}
+		for _, link := range m.WorkItems {
+			if link.ItemID == item {
+				notices = append(notices, m)
+			}
+		}
+	}
+	return notices
+}
+
+// a1, a3, a7 and the intake case: a bug owning at most three paths defaults
+// to the small-change lane, a feature to Planned delivery, neither leaves a
+// notice, and --json keeps stdout to the entry alone.
+func TestTeamQueueCLIDefaultLaneSmallBugAndFeature(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	out, _, err := laneAdd(t, f.e, f.item, f.order, repo, "--owns", "hub/a.go", "--owns", "hub/a_test.go", "--owns", "docs/a.md")
+	if err != nil || !strings.Contains(out, "template small: bug owning 3 paths (default)\n") || strings.Contains(out, "reason=") {
+		t.Fatalf("three-path bug %q %v", out, err)
+	}
+	if q := laneEntry(t, f, f.item.ID); q.Template != "small" || len(q.Ownership) != 3 {
+		t.Fatalf("three-path bug entry %+v", q)
+	}
+
+	intake, intakeOrder := laneFixtureItem(t, f, "bug", "intake-bug", "client/x.js", "tests/x.test.js")
+	out, _, err = laneAdd(t, f.e, intake, intakeOrder, repo)
+	if err != nil || !strings.Contains(out, "owns client/x.js,tests/x.test.js (from the scope confirmation)\n") || !strings.Contains(out, "template small: bug owning 2 paths (default)\n") {
+		t.Fatalf("intake bug %q %v", out, err)
+	}
+	if q := laneEntry(t, f, intake.ID); q.Template != "small" {
+		t.Fatalf("intake bug entry %+v", q)
+	}
+
+	feature, featureOrder := laneFixtureItem(t, f, "feature", "lane-feature")
+	out, _, err = laneAdd(t, f.e, feature, featureOrder, repo, "--owns", "scripts/one.mjs")
+	if err != nil || !strings.Contains(out, "template planned: a feature stays on Planned delivery (default)\n") || strings.Contains(out, "reason=") {
+		t.Fatalf("feature %q %v", out, err)
+	}
+	if q := laneEntry(t, f, feature.ID); q.Template != "planned" {
+		t.Fatalf("feature entry %+v", q)
+	}
+
+	jsonBug, jsonOrder := laneFixtureItem(t, f, "bug", "json-bug")
+	out, stderr, err := laneAdd(t, f.e, jsonBug, jsonOrder, repo, "--json", "--owns", "web/a.js", "--owns", "web/b.js", "--owns", "web/c.js")
+	var saved api.TeamQueueEntry
+	if err != nil || json.Unmarshal([]byte(out), &saved) != nil || saved.ItemID != jsonBug.ID || saved.Template != "small" {
+		t.Fatalf("json add stdout %q %v", out, err)
+	}
+	if strings.Contains(out, "template small:") || stderr != "template small: bug owning 3 paths (default)\n" {
+		t.Fatalf("json add stdout %q stderr %q", out, stderr)
+	}
+
+	for _, item := range []string{f.item.ID, intake.ID, feature.ID, jsonBug.ID} {
+		if notices := laneNotices(t, f, item); len(notices) != 0 {
+			t.Fatalf("%s has lane notices %+v", item, notices)
+		}
+	}
+}
+
+// a2, a5: a bug the small-change lane cannot admit falls back to Planned
+// delivery with the reason printed and recorded in one linked notice.
+func TestTeamQueueCLIDefaultLanePlannedBugRecordsReason(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	out, _, err := laneAdd(t, f.e, f.item, f.order, repo, "--owns", "hub/a.go", "--owns", "hub/a_test.go", "--owns", "docs/a.md", "--owns", "client/a.js")
+	if err != nil || !strings.Contains(out, "template planned: bug owning 4 paths, more than three (default) reason=paths\n") {
+		t.Fatalf("four-path bug %q %v", out, err)
+	}
+	wide := laneEntry(t, f, f.item.ID)
+	serialBug, serialOrder := laneFixtureItem(t, f, "bug", "serial-bug")
+	out, _, err = laneAdd(t, f.e, serialBug, serialOrder, repo, "--serial")
+	if err != nil || !strings.Contains(out, "template planned: bug with no owned paths, which the small-change lane cannot admit (default) reason=unscoped\n") {
+		t.Fatalf("serial bug %q %v", out, err)
+	}
+	serial := laneEntry(t, f, serialBug.ID)
+	for _, want := range []struct {
+		entry  api.TeamQueueEntry
+		item   api.WorkItem
+		order  int64
+		reason string
+	}{{wide, f.item, f.order, "reason=paths (more than three owned paths)"}, {serial, serialBug, serialOrder, "reason=unscoped (no owned paths"}} {
+		if want.entry.Template != "planned" {
+			t.Fatalf("entry %+v is not planned", want.entry)
+		}
+		notices := laneNotices(t, f, want.item.ID)
+		if len(notices) != 1 {
+			t.Fatalf("%s has %d lane notices: %+v", want.item.ID, len(notices), notices)
+		}
+		n := notices[0]
+		if len(n.WorkItems) != 1 || n.WorkItems[0].ItemRevision != want.item.Revision || n.WorkItems[0].Relationship != "primary" || n.WorkOrderMessage == nil || n.WorkOrderMessage.Seq != want.order {
+			t.Fatalf("notice links %+v order %+v", n.WorkItems, n.WorkOrderMessage)
+		}
+		if n.Envelope.Refs["entry"] != want.entry.ID || !strings.Contains(n.Text, want.entry.ID) || !strings.Contains(n.Text, "template planned") || !strings.Contains(n.Text, want.reason) {
+			t.Fatalf("notice %q refs %v", n.Text, n.Envelope.Refs)
+		}
+	}
+}
+
+// a4: an explicit --template always wins, but Planned delivery for a bug the
+// small-change lane would take needs a named reason, refused before any
+// entry or worktree exists; --template small still meets the hub's refusals.
+func TestTeamQueueCLIDefaultLaneExplicitTemplate(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	worktree := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(f.item.ID, "wi_")[:8])
+	for _, refused := range [][]string{
+		{"--template", "planned"},
+		{"--template", "planned", "--planned-reason", "paths"},
+		{"--template", "planned", "--planned-reason", "risk:"},
+		{"--planned-reason", "schema"},
+	} {
+		args := append([]string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "hub/a.go", "--owns", "docs/a.md"}, refused...)
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, args) }); err == nil || !strings.Contains(err.Error(), "--planned-reason") {
+			t.Fatalf("%v: %v", refused, err)
+		}
+		if list, err := f.c.ListTeamQueue(context.Background(), f.task.ID); err != nil || len(list.Entries) != 0 {
+			t.Fatalf("%v queued %+v %v", refused, list, err)
+		}
+		if _, err := os.Lstat(worktree); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%v left worktree %s: %v", refused, worktree, err)
+		}
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"requeue", "--entry", "tqe_0000000000000000", "--planned-reason", "schema"})
+	}); err == nil || !strings.Contains(err.Error(), "--planned-reason applies only to tt team queue add") {
+		t.Fatalf("requeue with a reason: %v", err)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "hub/a.go", "--owns", "docs/a.md", "--template", "planned", "--planned-reason", "risk:touches every relay binding"})
+	})
+	if err != nil || !strings.Contains(out, "template planned: --template planned reason=risk:touches every relay binding\n") {
+		t.Fatalf("planned with a risk %q %v", out, err)
+	}
+	q := laneEntry(t, f, f.item.ID)
+	notices := laneNotices(t, f, f.item.ID)
+	if q.Template != "planned" || len(notices) != 1 || !strings.Contains(notices[0].Text, "a cross-cutting risk: touches every relay binding") || notices[0].Envelope.Refs["entry"] != q.ID {
+		t.Fatalf("entry %+v notices %+v", q, notices)
+	}
+
+	schema, schemaOrder := laneFixtureItem(t, f, "bug", "schema-bug")
+	out, _, err = laneAdd(t, f.e, schema, schemaOrder, repo, "--owns", "hub/store.go", "--template", "planned", "--planned-reason", "schema")
+	if err != nil || !strings.Contains(out, "template planned: --template planned reason=schema\n") {
+		t.Fatalf("planned with schema %q %v", out, err)
+	}
+	if q, notices := laneEntry(t, f, schema.ID), laneNotices(t, f, schema.ID); q.Template != "planned" || len(notices) != 1 || !strings.Contains(notices[0].Text, "reason=schema (a schema or migration change)") {
+		t.Fatalf("schema entry %+v notices %+v", q, notices)
+	}
+
+	// --template small is sent as given; the hub alone admits or refuses.
+	feature, featureOrder := laneFixtureItem(t, f, "feature", "small-feature")
+	if _, _, err := laneAdd(t, f.e, feature, featureOrder, repo, "--owns", "web/one.js", "--template", "small"); err == nil || !strings.Contains(err.Error(), "the small-change lane admits only bugs") {
+		t.Fatalf("small feature: %v", err)
+	}
+	wide, wideOrder := laneFixtureItem(t, f, "bug", "wide-small-bug")
+	if _, _, err := laneAdd(t, f.e, wide, wideOrder, repo, "--owns", "w/1", "--owns", "w/2", "--owns", "w/3", "--owns", "w/4", "--template", "small"); err == nil || !strings.Contains(err.Error(), "the small-change lane owns at most 3 paths") {
+		t.Fatalf("wide small bug: %v", err)
+	}
+	small, smallOrder := laneFixtureItem(t, f, "bug", "explicit-small-bug")
+	out, _, err = laneAdd(t, f.e, small, smallOrder, repo, "--owns", "s/1", "--template", "small")
+	if err != nil || !strings.Contains(out, "template small: --template small\n") || laneEntry(t, f, small.ID).Template != "small" {
+		t.Fatalf("explicit small bug %q %v", out, err)
+	}
+	for _, item := range []string{feature.ID, wide.ID, small.ID} {
+		if notices := laneNotices(t, f, item); len(notices) != 0 {
+			t.Fatalf("%s has lane notices %+v", item, notices)
+		}
+	}
+}
+
+// a6: when the hub refuses the notice the entry stays queued and add fails
+// naming the entry and the exact notice to post.
+func TestTeamQueueCLIDefaultLaneNoticeFailureKeepsEntry(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	target, err := url.Parse(f.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages") {
+			http.Error(w, `{"error":"board unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	broken := f.e
+	broken.hub = proxy.URL
+	_, _, err = laneAdd(t, broken, f.item, f.order, repo, "--owns", "a", "--owns", "b", "--owns", "c", "--owns", "d")
+	q := laneEntry(t, f, f.item.ID)
+	if q.Template != "planned" || q.State != "queued" {
+		t.Fatalf("entry after a refused notice %+v", q)
+	}
+	if err == nil {
+		t.Fatal("add succeeded without its reason record")
+	}
+	for _, want := range []string{"entry " + q.ID + " was added", "its Planned reason was not recorded", "NOTICE: A bug was queued on Planned delivery with a recorded reason", "Queue entry " + q.ID + " puts bug " + f.item.ID + " on template planned", "reason=paths (more than three owned paths)", fmt.Sprintf("order #%d", f.order)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error lacks %q:\n%v", want, err)
+		}
+	}
+	if notices := laneNotices(t, f, f.item.ID); len(notices) != 0 {
+		t.Fatalf("refused notice was stored: %+v", notices)
+	}
+}

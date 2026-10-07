@@ -875,13 +875,63 @@ Feature `wi_f8d48780626165cc` (order #16786) adds a queue-only team template,
 `small`, for small mechanical bug fixes. A Planned bug team is five sessions
 (lead, planner, builder, verifier, reviewer); the small-change team is three.
 
-**Who chooses it.** The owner or the owner helper, explicitly, with
+**Who chooses it.** `tt team queue add` picks it by default for a small bug
+(next paragraph), and the owner or the owner helper can name it with
 `tt team queue add --item wi_ID --order SEQ --template small --owns PATH...`.
-Nothing selects it automatically, and TailOS **Add team** and
-`tt team launch` do not offer it: `tt team launch --template small` fails with
-`the small-change lane is queue-only: use tt team queue add --template small`.
-The default template stays `planned`. `tt team queue list` shows
-`template=planned` or `template=small` on each entry.
+TailOS **Add team** and `tt team launch` do not offer it: `tt team launch
+--template small` fails with `the small-change lane is queue-only: use tt team
+queue add --template small`. `tt team queue list` shows `template=planned` or
+`template=small` on each entry.
+
+**Default lane.** Owner decision #19235 (`wi_2430de4c12e43df4`): a bug whose
+fix fits at most three owned paths, including the doc that describes the
+changed behaviour, is ordered on the small-change lane. When `--template` is
+omitted, `tt team queue add` reads the item kind and counts the entry's owned
+paths as submitted (`--owns`, or the handler's scope confirmation), then prints
+its choice and why before it creates a worktree or writes to the hub:
+
+| Item and entry | Lane | Printed line |
+| --- | --- | --- |
+| bug owning one to three paths | `small` | `template small: bug owning 3 paths (default)` |
+| bug owning more than three paths | `planned` | `template planned: bug owning 4 paths, more than three (default) reason=paths` |
+| bug with `--serial` or no ownership | `planned` | `template planned: bug with no owned paths, which the small-change lane cannot admit (default) reason=unscoped` |
+| feature | `planned` | `template planned: a feature stays on Planned delivery (default)` |
+
+The second and third rows are the fallback: the hub's eligibility rules below
+are unchanged, so a default the small-change lane cannot admit goes to Planned
+delivery with the reason shown. Count the doc when scoping a bug: a file, its
+test and the doc that describes the behaviour are three paths, and a fix that
+needs a fourth is Planned.
+
+An explicit `--template` always wins. `--template small` is sent as given and
+the hub admits or refuses it. Planned delivery for a bug needs a stated reason,
+one of three exceptions, passed as `--planned-reason`:
+
+- `paths`: more than three owned paths (the default reason when that is so);
+- `schema`: a schema or migration change;
+- `risk:TEXT`: a cross-cutting risk, named in TEXT.
+
+`--template planned` on a bug owning at most three paths is refused without
+`--planned-reason schema` or `--planned-reason risk:TEXT`, before any entry or
+worktree exists. `--planned-reason` is refused for a feature, for an entry that
+ends up `small`, and on every subcommand but `add`. `tt team queue requeue`
+keeps its own rule: it copies the failed entry's template unless `--template`
+is given.
+
+**Reason record.** The queue entry has no reason field, and `tt team queue
+list` does not show the reason. For every bug that `add` queues on Planned
+delivery it posts one typed NOTICE after the hub confirms the entry, linked to
+the item at its current revision and to the order message, naming the entry,
+the template and the reason (`reason=paths (more than three owned paths)`).
+Small entries and features get no notice. If that post fails, the entry stays
+queued and `add` exits non-zero with the entry ID and the exact notice text to
+post by hand. With `--json`, stdout is only the entry JSON and the `template
+...` line goes to stderr.
+
+The steward's proposals follow the same rule
+([backlog-steward.md](backlog-steward.md#proposals)). The database handler's
+queue proposal guidance does not state it yet; that is a filed follow-up
+(`wi_2b66e2a634afa39d`).
 
 **Eligibility, enforced by the hub.** Queue add refuses `small` with a 409
 naming the rule unless:
@@ -932,8 +982,10 @@ launch freezes, its three members are what count.
 choice or a plan, the lead asks the owner to requeue. A still-queued small
 entry is removed with `tt team queue remove --entry ENTRY`; a launched team
 first ends through its ordinary disposition and closeout, because queue add
-refuses an item with a live team. Then `tt team queue add --item wi_ID --order
-SEQ` without `--template` queues a Planned delivery team. A new or revised
+refuses an item with a live team. Then queue it as Planned with its reason:
+`tt team queue add --item wi_ID --order SEQ --template planned
+--planned-reason schema` (or `risk:TEXT`); a bug that now owns more than three
+paths goes Planned by default with `reason=paths`. A new or revised
 order goes through the usual scope confirmation first. An item whose small
 entry failed and was released keeps its entry as history: retry it as Planned
 with `tt team queue requeue --entry ENTRY --template planned [--owns PATH...]`

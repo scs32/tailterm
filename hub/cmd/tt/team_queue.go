@@ -128,7 +128,8 @@ func cmdTeamQueue(e env, args []string) error {
 	hub := fs.String("hub", e.hub, "hub URL")
 	item := fs.String("item", "", "work item ID")
 	order := fs.Int64("order", 0, "recorded work-order message sequence")
-	template := fs.String("template", "planned", "team template: planned, or small for an eligible small bug")
+	template := fs.String("template", "", "team template: planned or small; add picks small for a bug owning at most three paths")
+	plannedReason := fs.String("planned-reason", "", "add: why a bug is queued on Planned delivery: paths, schema or risk:TEXT")
 	entry := fs.String("entry", "", "queue entry ID")
 	leadAgent := fs.String("lead-agent", "", "exact replacement item team member ID")
 	worktree := fs.String("worktree", "", "accepted builder worktree root")
@@ -163,6 +164,9 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	if fs.NArg() != 0 || !api.ValidID(*task, "tsk") || *hub == "" {
 		return errors.New("team queue requires a project and hub")
+	}
+	if sub != "add" && *plannedReason != "" {
+		return errors.New("--planned-reason applies only to tt team queue add")
 	}
 	e.task, e.hub = *task, *hub
 	c, err := e.client(20 * time.Second)
@@ -259,6 +263,9 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
 	createdWorktree := ""
+	// laneNotice is the reason record of a bug that add queues on Planned
+	// delivery; it is posted once the hub confirms the entry.
+	var laneNotice *queueLaneNotice
 	switch sub {
 	case "policy":
 		if *policyVersion < 1 || *policyExpires == "" || *policySessions < 1 || *policyPolling < 1 || *policyBindings < 1 || *policyRate < 1 || *policyBurst < 1 || *policyHeadroom < 1 || *policyHeadroom >= 100 || *minFreeDisk < 0 {
@@ -294,8 +301,8 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		req.Operation, req.HandlerProvision = "set_handler_provision", *auto
 	case "add":
-		if !api.ValidID(*item, "wi") || *order < 1 || (*template != "planned" && *template != "small") || (*newWorktree && (*noNewWorktree || *cwd != "")) {
-			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]")
+		if !api.ValidID(*item, "wi") || *order < 1 || (*template != "" && *template != "planned" && *template != "small") || (*newWorktree && (*noNewWorktree || *cwd != "")) {
+			return errors.New(queueAddUsage)
 		}
 		if *serial && len(ownership) > 0 {
 			return errors.New("--serial declares no ownership; pass either --owns or --serial")
@@ -305,10 +312,14 @@ func cmdTeamQueue(e env, args []string) error {
 			return listErr
 		}
 		parallel := queueParallel(list.ConcurrencyLimit)
+		current, itemErr := c.GetWorkItem(ctx, *task, *item)
+		if itemErr != nil {
+			return itemErr
+		}
 		if len(ownership) == 0 && !*serial {
 			// Ownership comes from the handler's intake record for the
 			// item's current revision and this order.
-			intake, intakeErr := intakeOwnership(ctx, c, *task, *item, *order)
+			intake, intakeErr := intakeOwnership(ctx, c, *task, current, *order)
 			if intakeErr != nil {
 				return intakeErr
 			}
@@ -320,6 +331,26 @@ func cmdTeamQueue(e env, args []string) error {
 		if parallel && len(ownership) == 0 && !*serial {
 			return errors.New("a parallel queue entry needs ownership: pass --owns PATH, ask the database handler to record it with tt work-items scope confirm --owns PATH, or mark the entry --serial to run it alone")
 		}
+		// The lane is settled, and a refusal returned, before any worktree
+		// or hub write. The hub alone decides whether Small admits the entry.
+		lane, why, recorded, laneErr := queueAddTemplate(current.Kind, len(ownership), *serial, *template, *plannedReason)
+		if laneErr != nil {
+			return laneErr
+		}
+		if recorded != "" {
+			laneNotice = &queueLaneNotice{item: current, order: *order, template: lane, reason: recorded}
+			// Refuse a reason the board would not store before the entry exists.
+			if problems := api.ValidateEnvelope(laneNotice.envelope("tqe_0000000000000000")); problems != nil {
+				return fmt.Errorf("--planned-reason cannot be recorded: %w", problemsError(problems))
+			}
+			why += " reason=" + recorded
+		}
+		// With --json stdout holds only the entry.
+		laneOut := os.Stdout
+		if *jsonOut {
+			laneOut = os.Stderr
+		}
+		fmt.Fprintf(laneOut, "template %s: %s\n", lane, why)
 		if *cwd == "" && !*noNewWorktree && !*newWorktree {
 			// A parallel project gives each entry its own worktree by default.
 			*newWorktree = parallel
@@ -366,7 +397,7 @@ func cmdTeamQueue(e env, args []string) error {
 		if scopeErr != nil {
 			return scopeErr
 		}
-		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd, req.Repository, req.Ownership, req.Serial = *item, *order, *template, spawn.Host(), *cwd, repository, ownership, *serial
+		req.ItemID, req.OrderMessageSeq, req.Template, req.Host, req.Cwd, req.Repository, req.Ownership, req.Serial = *item, *order, lane, spawn.Host(), *cwd, repository, ownership, *serial
 		if repository != "" {
 			req.BaseCommit, err = queueGitCommit(*cwd)
 			if err != nil {
@@ -726,6 +757,16 @@ func cmdTeamQueue(e env, args []string) error {
 		return errors.New("the hub did not save the new worktree; update the hub before moving entries")
 	}
 	createdWorktree = "" // The saved entry now names it.
+	if laneNotice != nil {
+		env := laneNotice.envelope(result.ID)
+		post := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: "queue-lane-" + result.ID,
+			WorkItems:        []api.MessageWorkItem{{ItemTaskID: *task, ItemID: laneNotice.item.ID, ItemRevision: laneNotice.item.Revision, Relationship: "primary"}},
+			WorkOrderMessage: &api.MessageReference{TaskID: *task, Seq: laneNotice.order}}
+		if _, postErr := c.PostMessage(ctx, *task, post); postErr != nil {
+			// The entry stays queued; only its reason record is missing.
+			return fmt.Errorf("entry %s was added at %d for %s, but its Planned reason was not recorded: %v; post this notice linked to the item and order #%d:\n%s", result.ID, result.Position, result.ItemID, postErr, laneNotice.order, api.RenderText(env))
+		}
+	}
 	if *jsonOut {
 		printJSON(result)
 	} else {
@@ -766,14 +807,100 @@ func ownerIntegratedChanges(ctx context.Context, repository, base, commit string
 	return queueChangedFiles(ctx, repository, base, commit)
 }
 
+const queueAddUsage = "usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--planned-reason paths|schema|risk:TEXT] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]"
+
+// queueSmallMaxOwned mirrors the hub's small-change admission cap; the hub
+// still decides admission.
+const queueSmallMaxOwned = 3
+
+// queueAddTemplate picks the lane tt team queue add sends. An explicit
+// --template always wins. Without one, a bug owning one to three paths goes to
+// the small-change lane and everything else to Planned delivery. recorded is
+// the reason a bug goes Planned (paths, unscoped, schema or risk:TEXT) and is
+// empty for a small entry and for any other kind. owned counts the paths as
+// submitted.
+func queueAddTemplate(kind string, owned int, serial bool, explicit, reason string) (template, why, recorded string, err error) {
+	risk, isRisk := strings.CutPrefix(reason, "risk:")
+	risk = strings.TrimSpace(risk)
+	if reason != "" && reason != "paths" && reason != "schema" && (!isRisk || risk == "") {
+		return "", "", "", errors.New("--planned-reason is paths, schema or risk:TEXT (name the cross-cutting risk)")
+	}
+	if isRisk {
+		reason = "risk:" + risk
+	}
+	bug := kind == "bug"
+	small := bug && !serial && owned >= 1 && owned <= queueSmallMaxOwned
+	if explicit == "small" || (explicit == "" && small) {
+		if reason != "" {
+			return "", "", "", errors.New("--planned-reason records why a bug is queued on Planned delivery; add --template planned to queue this bug there")
+		}
+		if explicit == "small" {
+			return "small", "--template small", "", nil
+		}
+		return "small", fmt.Sprintf("bug owning %s (default)", queuePathCount(owned)), "", nil
+	}
+	if !bug {
+		if reason != "" {
+			return "", "", "", fmt.Errorf("--planned-reason records why a bug is queued on Planned delivery; a %s is always Planned", kind)
+		}
+		if explicit == "planned" {
+			return "planned", "--template planned", "", nil
+		}
+		return "planned", fmt.Sprintf("a %s stays on Planned delivery (default)", kind), "", nil
+	}
+	// A bug on Planned delivery always records one reason.
+	fallback, shape := "paths", fmt.Sprintf("bug owning %s, more than three", queuePathCount(owned))
+	if serial || owned == 0 {
+		fallback, shape = "unscoped", "bug with no owned paths, which the small-change lane cannot admit"
+	}
+	switch {
+	case small && (reason == "" || reason == "paths"):
+		return "", "", "", fmt.Errorf("a bug owning %s belongs on the small-change lane; --template planned needs --planned-reason schema (a schema or migration change) or --planned-reason risk:TEXT (a cross-cutting risk you name)", queuePathCount(owned))
+	case reason == "paths" && fallback != "paths":
+		return "", "", "", errors.New("--planned-reason paths is for a bug owning more than three paths; this entry declares none")
+	case reason == "":
+		reason = fallback
+	}
+	if explicit == "planned" {
+		return "planned", "--template planned", reason, nil
+	}
+	return "planned", shape + " (default)", reason, nil
+}
+
+func queuePathCount(n int) string {
+	if n == 1 {
+		return "1 path"
+	}
+	return fmt.Sprintf("%d paths", n)
+}
+
+// queueLaneNotice is the durable record of why add queued a bug on Planned
+// delivery. The queue entry has no field for it.
+type queueLaneNotice struct {
+	item     api.WorkItem
+	order    int64
+	template string
+	reason   string
+}
+
+func (n queueLaneNotice) envelope(entry string) api.Envelope {
+	meaning := map[string]string{
+		"paths":    "more than three owned paths",
+		"unscoped": "no owned paths, which the small-change lane cannot admit",
+		"schema":   "a schema or migration change",
+	}[n.reason]
+	if risk, ok := strings.CutPrefix(n.reason, "risk:"); ok {
+		meaning = "a cross-cutting risk: " + risk
+	}
+	return api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A bug was queued on Planned delivery with a recorded reason",
+		Refs: map[string]string{"entry": entry, "item": n.item.ID, "order": strconv.FormatInt(n.order, 10)},
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("Queue entry %s puts bug %s on template %s instead of the small-change lane. reason=%s (%s).", entry, n.item.ID, n.template, n.reason, meaning)}}
+}
+
 // intakeOwnership reads the ownership the database handler recorded at scope
 // confirmation for the item's current revision and the order. None is nil.
-func intakeOwnership(ctx context.Context, c *api.Client, task, item string, order int64) ([]string, error) {
-	current, err := c.GetWorkItem(ctx, task, item)
-	if err != nil {
-		return nil, err
-	}
-	confirmation, err := c.GetWorkOrderScopeConfirmation(ctx, task, item, current.Revision, order)
+func intakeOwnership(ctx context.Context, c *api.Client, task string, current api.WorkItem, order int64) ([]string, error) {
+	confirmation, err := c.GetWorkOrderScopeConfirmation(ctx, task, current.ID, current.Revision, order)
 	var response *api.HTTPError
 	if errors.As(err, &response) && response.Status == 404 {
 		return nil, nil

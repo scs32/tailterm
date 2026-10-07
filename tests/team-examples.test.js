@@ -422,3 +422,17 @@ test("verifier and small lead start the matrix at once and wait in the host wait
   assert.equal(bundle.split(tail).length - 1, 2);
   assert.ok(!bundle.includes("one matrix run per host"));
 });
+
+// wi_2430de4c12e43df4 (owner decision #19235): the steward proposes the
+// small-change lane for small bugs and names one of three reasons for Planned.
+test("the steward proposes the small lane for small bugs and names a reason for Planned", () => {
+  const steward = PROJECT_ROLE_TEMPLATES.backlog_steward.prompt;
+  const rule =
+    "Lane: every queue proposal names the team template. Propose template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned.";
+  assert.ok(steward.includes(rule), "steward prompt lacks the lane rule");
+  for (const reason of [/more than three owned paths \(paths\)/, /a schema or migration change \(schema\)/, /a cross-cutting risk you name \(risk:TEXT\)/])
+    assert.match(steward, reason);
+  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
+  const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
+  assert.equal(bundle.split(rule).length - 1, 1, "generated plan.mjs lacks the steward lane rule");
+});

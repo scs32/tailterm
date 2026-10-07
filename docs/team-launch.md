@@ -58,7 +58,8 @@ checks a machine against it read-only.
 On the launch host, the owner can save a sequence of recorded item orders:
 
 ```sh
-tt team queue add --task tsk_... --item wi_... --order 123 --template planned
+tt team queue add --task tsk_... --item wi_... --order 123 --owns client   # lane by default: small for a bug owning at most three paths, else planned
+tt team queue add --task tsk_... --item wi_... --order 123 --template planned --planned-reason schema   # a small bug on Planned delivery needs its reason
 tt team queue add --task tsk_... --item wi_... --order 124 --cwd /absolute/worktree --owns client --owns hub/internal/store
 tt team queue add --task tsk_... --item wi_... --order 125 --new-worktree --owns docs/team-launch.md
 tt team queue add --task tsk_... --item wi_... --order 126   # ownership from the handler's scope confirmation
@@ -548,6 +549,19 @@ verifier, the Planned delivery builder and the Planned delivery reviewer. Only
 small` is refused as queue-only, and TailOS **Add team** does not list it.
 Eligibility, the three-path cap, the records it saves and how to requeue it as
 Planned are in [project-queue.md](project-queue.md#small-change-lane).
+
+`tt team queue add` without `--template` defaults to this lane for a bug whose
+fix fits at most three owned paths, counting the doc that describes the changed
+behaviour, and prints `template small: ...`. Everything else defaults to
+Planned delivery: features always, and a bug only for one of three exceptions,
+recorded as `--planned-reason`: more than three owned paths (`paths`), a schema
+or migration change (`schema`), or a cross-cutting risk you name
+(`risk:TEXT`). An explicit `--template` always wins, but `--template planned`
+on a small bug is refused without `schema` or `risk:TEXT`. The reason is
+printed and posted as one linked notice; `tt team queue list` does not show it.
+The steward proposes lanes by the same rule; the database handler's guidance is
+a filed follow-up (`wi_2b66e2a634afa39d`). Details are in
+[project-queue.md](project-queue.md#small-change-lane).
 
 The builder and reviewer prompts are the Planned delivery prompts in
 [team-examples.md](team-examples.md), byte for byte. The lead runs on
