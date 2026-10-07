@@ -12,9 +12,9 @@ session, the database handlers, the deployment agent and item teams.
 ## Provisioning
 
 The steward is the `backlog_steward` role, one per project. Its template is
-`PROJECT_ROLE_TEMPLATES.backlog_steward` in `client/team-examples.js`: GPT-6.1
-Sol (`gpt-6.1-sol`, app `codex`) at `high` reasoning, because the work is research
-and judgment (owner decision October 3, 2026; it ran Claude Opus 5.5 before). The exact prompt is in [Team examples](team-examples.md#project-roles).
+`PROJECT_ROLE_TEMPLATES.backlog_steward` in `client/team-examples.js`: Claude
+Opus 5.5 (`claude-opus-5-5`, app `claude`) at `high` reasoning, because the work is research
+and judgment. The exact prompt is in [Team examples](team-examples.md#project-roles).
 The CLI reads the template through the embedded plan bundle
 (`hub/internal/teamplan/plan.mjs`, action `project-role`).
 
@@ -25,8 +25,8 @@ tt steward template [--json]
 tt steward setup --task tsk_ID --cwd /path/to/repo [--name backlog-steward] [--permission-mode MODE]
 ```
 
-`setup` runs `tt spawn --role backlog_steward --agent-id agt_… --run codex
---model gpt-6.1-sol --reasoning high --prompt <template>` with the project's
+`setup` runs `tt spawn --role backlog_steward --agent-id agt_… --run claude
+--model claude-opus-5-5 --reasoning high --prompt <template>` with the project's
 current lifecycle generation. `tt spawn --role backlog_steward` also works
 directly. Both are owner commands and refuse inside an agent session. The hub
 admits a steward like the other persistent roles: a stable agent ID, no parent,

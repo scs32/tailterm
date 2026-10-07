@@ -39,9 +39,9 @@ Post with tt send, which checks the message before it reaches the board. Example
 // GPT-6 Astra (high) after the Opus planner; bugs get a plan only, so the
 // shared launch plan drops the plan-reviewer seat for a bug.
 // Owner amendment 2026-10-05 (#24442): restore team roles to Claude;
-// the steward stays on GPT-6.1 Sol and the database handler stays on Sonnet.
-const sol61 = "gpt-6.1-sol",
-  opus = "claude-opus-5-5",
+// the database handler stays on Sonnet. The steward returned to Claude Opus
+// 5.5 (high) on 2026-10-06 (wi_4e85f423a1078a52).
+const opus = "claude-opus-5-5",
   sonnet = "claude-sonnet-5-5",
   astra = "gpt-6-astra",
   luna = "gpt-6-luna";
@@ -589,8 +589,8 @@ const PROJECT_ROLE_TEMPLATES = {
     name: "backlog-steward",
     title: "Backlog steward",
     role: "backlog_steward",
-    runtime: "codex",
-    model: sol61,
+    runtime: "claude",
+    model: opus,
     reasoning: "high",
     prompt:
       stewardAgreement +

@@ -8,10 +8,10 @@ import { MODEL_OPTIONS } from "../client/model-picker.js";
 // Backlog steward template (wi_5b4b94dbc9a11e8b, a4).
 const steward = PROJECT_ROLE_TEMPLATES.backlog_steward;
 
-test("the backlog steward template runs GPT-6.1 Sol at high reasoning", () => {
+test("the backlog steward template runs Claude Opus 5.5 at high reasoning", () => {
   assert.equal(steward.role, "backlog_steward");
-  assert.equal(steward.runtime, "codex");
-  assert.equal(steward.model, "gpt-6.1-sol");
+  assert.equal(steward.runtime, "claude");
+  assert.equal(steward.model, "claude-opus-5-5");
   assert.equal(steward.reasoning, "high");
   assert.equal(steward.name, "backlog-steward");
   assert.equal(steward.title, "Backlog steward");

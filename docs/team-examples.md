@@ -1212,11 +1212,11 @@ the hub.
 
 ### backlog-steward — Backlog steward
 
-App: `codex`. Model: `gpt-6.1-sol`. Reasoning: `high`. Role:
+App: `claude`. Model: `claude-opus-5-5`. Reasoning: `high`. Role:
 `backlog_steward`, one per project. The owner provisions it with
 `tt steward setup --task ID --cwd DIR`, which launches this prompt through
 `tt spawn --role backlog_steward`. The steward researches and judges rather than
-executing assignments, so it runs GPT-6.1 Sol at high effort. See
+executing assignments, so it runs Claude Opus 5.5 at high effort. See
 [Backlog steward](backlog-steward.md).
 
 ```text

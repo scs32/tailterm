@@ -259,7 +259,7 @@ func TestStewardTemplateFromEmbeddedBundle(t *testing.T) {
 	if err = json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("template JSON %q: %v", out, err)
 	}
-	if got.Role != api.AgentRoleBacklogSteward || got.Runtime != "codex" || got.Model != "gpt-6.1-sol" || got.Reasoning != "high" || got.Name != "backlog-steward" {
+	if got.Role != api.AgentRoleBacklogSteward || got.Runtime != "claude" || got.Model != "claude-opus-5-5" || got.Reasoning != "high" || got.Name != "backlog-steward" {
 		t.Fatalf("template fields: %+v", got.stewardTemplate)
 	}
 	if !strings.Contains(got.Prompt, "run tt ack SEQ before you start") || got.Digest != stewardTemplateDigest(got.Model, got.Reasoning, got.Prompt) {
@@ -829,6 +829,41 @@ func TestStewardRotationOwnerRotationEndToEnd(t *testing.T) {
 	}
 	if open, _ = f.c.ListObligations(ctx, f.task.ID, successor.ID, "", true, false); len(open) != 4 {
 		t.Fatalf("successor obligations after new intake: %d", len(open))
+	}
+}
+
+// A steward running on Claude rotates onto the real embedded template
+// (wi_4e85f423a1078a52, a4): the hub refuses a successor on another runtime.
+func TestStewardRotationOntoEmbeddedTemplateKeepsClaudeRuntime(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node unavailable")
+	}
+	f := newStewardCLI(t)
+	ctx := context.Background()
+	cleanups := 0
+	d := f.rotationDeps(t, false, &cleanups)
+	steward, _ := f.rotationSetup(t, true)
+	if steward.Runtime != "claude" {
+		t.Fatalf("fixture steward runtime: %q", steward.Runtime)
+	}
+	d.template = loadStewardTemplate
+	tmpl, err := loadStewardTemplate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.rotate(t, d)
+	if err != nil {
+		t.Fatalf("rotation onto the embedded %s template: %v", tmpl.Runtime, err)
+	}
+	if r.State != api.StewardRotationCommitted || cleanups != 1 {
+		t.Fatalf("rotation: %+v cleanups=%d", r, cleanups)
+	}
+	successor, err := f.c.GetAgent(ctx, f.task.ID, r.SuccessorAgentID)
+	if err != nil || successor.Status == api.AgentClosed || successor.Runtime != "claude" || successor.Runtime != tmpl.Runtime {
+		t.Fatalf("successor: %+v %v", successor, err)
+	}
+	if open, _ := f.stewards(t); open != 1 {
+		t.Fatalf("open stewards after rotation: %d", open)
 	}
 }
 
