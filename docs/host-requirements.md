@@ -161,6 +161,7 @@ Client, plus:
 | wrangler | on PATH, or in npm's npx cache `~/.npm/_npx/*/node_modules/wrangler` (highest version; its `engines.node` must admit the installed Node) | `npx wrangler --version` (downloads it) | same | `wrangler` |
 | wrangler credential | `CLOUDFLARE_API_TOKEN` set, or the OAuth file with an `oauth_token` that is unexpired or has a `refresh_token` | `npx wrangler login` | same | `wrangler credential` |
 | SSH route | `Host truenas` with `HostName` in `~/.ssh/config` (the `truenas-ssh` route in `scripts/deploy-truenas-hub.py`) | edit `~/.ssh/config` | same | `ssh route truenas` |
+| Container runtime | apple/container: `container` on PATH (or the deployer config's optional `rehearsal.runtime` path) with its service running (`container system status` exits 0), and the image `gcr.io/distroless/static-debian12:nonroot` pulled or pullable. Checked at 1.1.0 (`scripts/release-runner.mjs` `rehearse`) | `brew install container`, then `container system start` | none supported yet: a Linux release host cannot release a schema change | none |
 | Deployer config | `--deploy-config PATH`: readable JSON, not group/other readable, `version` 1, `enabled` true, non-empty `cwd` and `journalDirectory`, and 40-character `baselines.hub`, `bridge`, `mini`, `tailos` (`scripts/release-runner.mjs` `serveDeployment` and `readBaselines`) | provided by the owner | same | `deploy config`, `deploy config private`, `deploy config <field>` |
 
 Notes:
@@ -177,6 +178,15 @@ Notes:
   `!negation`. `Match` blocks are never evaluated: with an alias present they
   make the line `warn` ("Match rules not evaluated"); confirm with `ssh -G
   truenas` yourself.
+- The container runtime runs the migration rehearsal of a release whose store
+  schema changed, under the production hub container's constraints
+  ([project deployment](project-deployment.md), "Migration rehearsal
+  container"). Without it, or with its service stopped, such a release is
+  refused before any deploy step (`Rehearsal container runtime unavailable` or
+  `Rehearsal container runtime not running`); the runner never falls back to
+  running the migration on the host. Releases with no schema change do not use
+  it. Doctor does not check it yet. The service runs under the deployer's
+  user; confirm it after a reboot with `container system status`.
 - Without `--deploy-config`, the role prints one `missing` deploy config line.
   The field lines name the field only, never a value.
 - The deployer also keeps its own checkout with the four test fixtures

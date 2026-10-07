@@ -54,8 +54,10 @@ TailOS. Unknown paths refuse release. Each configured target has pinned artifact
 and retained rollback artifacts before activation. Hub/bridge consume
 handler-created online backups and externally saved receipt pins; the deployer
 never manufactures a backup pin from its input. Schema changes require
-`tailterm-hub --migrate-only BACKUP_COPY`; this path opens only the supplied copy
-and starts no listener, broker, relay or Tailscale node. A release that selects
+`tailterm-hub --migrate-only BACKUP_COPY`, run in a container under the
+production hub constraints (see "Migration rehearsal container"); this path
+opens only the supplied copy and starts no listener, broker, relay or Tailscale
+node. A release that selects
 both hub and bridge deploys them from ONE TrueNAS plan (`deployment.targets
 ["hub","bridge"]`, one release directory `ID-SHA12-truenas`, one backup and
 preflight): two plans made before either deploy would each pin the other's
@@ -85,9 +87,11 @@ include this job ID and name `backupJobId`; their plan binds the exact derived
 release and backup destination. Module outputs are built from the exact clean
 integrated checkout. Schema changes are detected conservatively from the
 last-successful hub baseline through the integrated diff. Rehearsal builds a
-native host hub binary from that integrated commit, verifies its hash, and
-migrates a fresh copy of the handler-imported hash-verified backup. A configured
-old migration binary or static schema flag cannot replace those inputs.
+Linux hub binary from that integrated commit (`GOOS=linux`, the release host's
+own architecture), verifies its hash, and migrates a fresh copy of the
+handler-imported hash-verified backup inside a container. The binary never runs
+on the release host itself. A configured old migration binary or static schema
+flag cannot replace those inputs.
 
 Mini preparation captures the currently installed binary into an exclusive
 job-specific rollback file and pins its SHA before the install effect. Install
@@ -1026,7 +1030,8 @@ has already exited may return no log lines.
 
 A probe failure prints nothing and exits 1. When a target step fails, the
 journal's `failure` field keeps the first one as `{step, target, reason}`: step
-is `prepare`, `rehearse`, `deploy` or `live-check`. The reason is at most 160
+is `prepare`, `rehearse`, `deploy` or `live-check`. A failed rehearsal container
+run adds `rehearsal` (see "Migration rehearsal container"). The reason is at most 160
 characters and is only a fixed message the runner or adapter tagged (for example
 `live verification failed` or `release fence lost`) or, for a host program, its
 name, exit status and the `classification`/`stage` of its last JSON line (for
@@ -1104,6 +1109,101 @@ release job"), the project handler, on the Mini in the dedicated checkout:
 A refused run prints only its own reason. A manifest that already exists is
 never rewritten; a changed job needs handler reconciliation.
 
+### Migration rehearsal container (wi_78521ba68a8ad197)
+
+A release whose store schema changed rehearses the candidate migration on a copy
+of the imported backup before any deploy step, in a container built from the
+production hub service. The migration binary is never run on the release host:
+a host run passed a migration that then failed in the read-only production
+container (no writable temporary directory, 2026-09-30).
+
+**Requirement.** The release host needs apple/container: `container` on PATH
+(or the path in the private config's optional `rehearsal.runtime`) with its
+service running (`container system status` exits 0). No setting selects a host
+run or skips the rehearsal. See [host requirements](host-requirements.md).
+
+**Constraints.** The runner asks the integrated checkout's own
+`scripts/deploy-truenas-hub.py` for the hub service that `hub_compose` builds
+from this job's plan and release (after `_deployment_plan` validates the plan),
+and maps it:
+
+| Composed field | Container argument |
+|---|---|
+| `image` | the image, exactly as composed |
+| `user` (`950:950`) | `--user 950:950` |
+| `read_only: true` | `--read-only` |
+| `cap_drop: ["ALL"]` | `--cap-drop ALL` |
+| `mem_limit` (`512m`) | `--memory 512M` |
+| `cpus` (`1.0`) | `--cpus 1` (rounded up to a whole CPU) |
+| `environment` | one `-e NAME=VALUE` for every entry, `SQLITE_TMPDIR=/state` included |
+| `entrypoint` | `--entrypoint /opt/tailterm-hub`, with the candidate binary mounted there read-only |
+| the `/state` volume | the job's private rehearsal state directory, holding the copy as `hub.sqlite` |
+
+The run is `container run --rm --progress none --name tt-rehearsal-ID ...
+IMAGE --migrate-only /state/hub.sqlite`. Only those two mounts exist. The
+composed token and key volumes are not mounted, so no production path or secret
+is an argument; their environment variables name files that are absent, which
+`--migrate-only` never opens. The rehearsal never contacts TrueNAS, the live
+database or the production container.
+
+A service the runner does not fully understand is refused, never run with less:
+an unknown field (for example a `tmpfs`), `read_only` not true, a `cap_drop`
+other than `["ALL"]`, a missing `no-new-privileges`, a missing or unreadable
+`image`, `user`, `mem_limit`, `cpus`, `environment` or `entrypoint`, no `/state`
+volume, or a second writable volume. A change to `hub_compose` of that kind must
+change the runner's mapping in the same release.
+
+**Refusals.** All of these stop the release at step `rehearse`, before any
+deploy step:
+
+| Reason | Meaning | Marker saved |
+|---|---|---|
+| `Rehearsal container runtime unavailable` | the runtime could not be started (not installed, not on PATH) | no |
+| `Rehearsal container runtime not running` | `container system status` exited non-zero | no |
+| `Rehearsal compose unsupported` | the composed hub service is not one the mapping above accepts | no |
+| `python3 exit N` | the candidate's plan validation or compose function failed | no |
+| `Rehearsal container exit N` | the migration failed in the container (`exit 137` is the out-of-memory kill) | yes |
+| `Rehearsal container signal NAME`, `timeout`, `not started` | the run was killed, exceeded ten minutes, or could not start | yes |
+
+A refusal with no marker can be retried by the same job once the host is fixed.
+A failed container run cannot: its marker refuses a second attempt, as before.
+
+**What the journal keeps.** A failed container run adds to the private job
+journal's `failure`:
+
+```
+rehearsal: {runtime, image, exit: "exit N" | "signal NAME" | "timeout" | "not started", lines: [...]}
+```
+
+`lines` is at most the last 40 output lines (stderr first), each redacted by
+the same rules as a probe capture (composed environment values, labelled
+credentials and long opaque runs become `[redacted]`) and cut to 300 characters.
+A record of any other shape is dropped. It reaches no message, notice or hub
+receipt; the marker still holds no output.
+
+**Known differences from production.**
+
+1. Architecture: the rehearsal binary is built for the release host's
+   architecture (linux/arm64 on the Mini); production runs the linux/amd64
+   artifact of the same commit. A fault that depends on the filesystem, user,
+   memory or environment is caught; an amd64-only fault is not.
+2. `no-new-privileges` has no apple/container flag and is not enforced.
+3. Memory and CPU are the size of a small virtual machine, not a cgroup limit:
+   the guest kernel shares the 512 MiB, so the rehearsal is somewhat stricter
+   than production, and the guest may see two CPUs. There is no override; a
+   migration killed here (`exit 137`) is refused and needs an owner decision.
+4. Working directory: the run sets `--workdir /`, because apple/container will
+   not start uid 950 in the image's own working directory (`/home/nonroot`,
+   another user's private directory). Both are unwritable to the hub.
+5. The image is used by tag, so it may resolve to a different digest than the
+   one on TrueNAS, and a host without it pulls it on the first rehearsal.
+
+**Leftover container.** `--rm` removes the container when the run ends. After
+a timeout, a signal or a failed start the runner also removes it by name, best
+effort. A runner killed mid-rehearsal can leave `tt-rehearsal-ID` behind
+(`container ls -a`); the `started` marker refuses that job, and the container is
+removed by hand with `container delete -f tt-rehearsal-ID`.
+
 ### Journal retention (wi_e83171b4c215f626)
 
 **Where backups live.** The authoritative pre-release backup is on TrueNAS at
@@ -1114,11 +1214,13 @@ run also copies it to the Mini as `journalDirectory/ID-NAME-backup.sqlite`. That
 local copy is read only by its own job's migration rehearsal; no rollback reads
 it.
 
-**Rehearsal copy.** The rehearsal migrates
-`ID-NAME-backup.sqlite.rehearsal-ID`, a copy of the local copy, and removes it
-and its SQLite sidecars (`-wal`, `-shm`, `-journal`) when the rehearsal ends,
-pass or fail. A failed cleanup never changes the rehearsal's result. Before
-copying it saves the marker `ID-NAME-backup.sqlite.rehearsal-ID.json` (0600):
+**Rehearsal copy.** The rehearsal migrates `hub.sqlite` in the state directory
+`ID-NAME-backup.sqlite.rehearsal-ID.state/` (0700), a copy of the local copy
+mounted into the container as `/state`, and removes the whole directory (the
+copy, its SQLite sidecars `-wal`, `-shm`, `-journal` and any temporary file)
+when the rehearsal ends, pass or fail. A failed cleanup never changes the
+rehearsal's result. Before copying it saves the marker
+`ID-NAME-backup.sqlite.rehearsal-ID.json` (0600):
 
 ```
 {version: 1, jobId, backupSHA256, startedAt, outcome: "started"}
@@ -1128,18 +1230,23 @@ copying it saves the marker `ID-NAME-backup.sqlite.rehearsal-ID.json` (0600):
 The marker holds no path, output or error text. A job whose marker exists is
 never rehearsed again ("Rehearsal already attempted; inspect prior attempt"),
 whatever the outcome, including `started` left by a run stopped mid-rehearsal.
-A rehearsal copy with no marker does not refuse; it is replaced.
+A state directory with no marker does not refuse; it is replaced.
 
 **Retention rule.** At every poll, after reconciliation and before any claim,
 the daemon sweeps the journal directory. It considers only jobs in
 `tt deployment list` and only the exact names `ID-truenas-backup.sqlite`,
 `ID-hub-backup.sqlite`, `ID-bridge-backup.sqlite` and their rehearsal copies,
-as regular files directly in `journalDirectory`:
+as regular files directly in `journalDirectory` or directly in a job's
+rehearsal state directory:
 
 1. A job that is `verified`, `claimed`, `merged` or `blocked`, or in any state
    the runner does not know as terminal, keeps everything, whatever the policy.
 2. A terminal job (`released`, `rolled_back`, `refused`, `superseded`) loses any
-   leftover rehearsal copy and sidecars (reason `terminal`). A refused job is
+   leftover rehearsal state directory: every regular file directly in it, then
+   the directory once it is empty (reason `terminal`, one record per file). A
+   link or directory inside it is neither followed nor removed, and then the
+   state directory stays. A flat `ID-NAME-backup.sqlite.rehearsal-ID` copy and
+   sidecars left by an earlier runner are removed the same way. A refused job is
    terminal for that job ID even when the handler retries its entry: the retry
    is a new job with its own journal files.
 3. A terminal job that is not `released` loses its backup copy (reason
@@ -1165,7 +1272,8 @@ synced to `journalDirectory/retention.jsonl` (0600):
 {version: 1, at, jobId, file, kind: "backup" | "rehearsal", bytes, reason: "terminal" | "not-released" | "count" | "budget"}
 ```
 
-`file` is the name inside the journal directory. A sweep with nothing to remove
+`file` is the name inside the journal directory; a file of a rehearsal state
+directory is `DIRECTORY/NAME`. A sweep with nothing to remove
 writes nothing. A sweep that fails (for example the record cannot be written)
 removes nothing further, prints "Journal retention sweep failed; remaining
 backup copies kept." and the poll continues. The first poll after this change

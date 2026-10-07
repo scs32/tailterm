@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
+import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, rmdirSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
@@ -808,7 +808,7 @@ export async function runRelease(config, adapter) {
     // An unconfirmed batch call: nothing here may touch the checkout or the job.
     if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
-    if(step && !state.failure){state.failure={...step,reason:failureReason(error)};state.failureDetail??=failureDetail(error);checkpoint();}
+    if(step && !state.failure){const rehearsal=failureRehearsal(error);state.failure={...step,reason:failureReason(error),...(rehearsal?{rehearsal}:{})};state.failureDetail??=failureDetail(error);checkpoint();}
     // The first failure's validated detail is kept even when no step was set;
     // a journal that cannot be written here is left to the checkpoints below.
     if(!state.failureDetail){state.failureDetail=failureDetail(error);try{checkpoint();}catch{}}
@@ -909,6 +909,55 @@ export function validateNativeRelease(prior, next, operation, expectedGeneration
     if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || digest(next.receipt) !== digest(receipt)) throw releaseError("Native full receipt mismatch");
   } else if (!same(prior.receipt, next.receipt)) throw releaseError("Native receipt changed unexpectedly");
   return next;
+}
+
+// The migration rehearsal container (wi_78521ba68a8ad197). The candidate's own
+// hub_compose (scripts/deploy-truenas-hub.py) describes the production hub
+// service; each constraint becomes a container argument, and a service this
+// table does not fully understand is refused, never run with less. Only the
+// candidate binary and the private state directory are mounted: every other
+// composed volume (tokens, keys) stays out, so no production path is an
+// argument. no-new-privileges has no flag in apple/container; restart and
+// ports do not apply to a run that starts no listener. The working directory
+// is set to / because apple/container refuses to start uid 950 in the image's
+// own (/home/nonroot, another user's 0700 directory); both are unwritable.
+const REHEARSAL_DB="hub.sqlite",REHEARSAL_LINES=40,REHEARSAL_LINE_LENGTH=300;
+const REHEARSAL_KEYS=["image","user","restart","entrypoint","read_only","cap_drop","security_opt","ports","environment","volumes","mem_limit","cpus"];
+const REHEARSAL_HOW=/^(exit \d{1,3}|signal SIG[A-Z0-9]{1,12}|timeout|not started)$/,REHEARSAL_NAME=/^[A-Za-z0-9._\/:@-]{1,160}$/;
+const REHEARSAL_COMPOSE="import json,sys,importlib.util as u;sys.path.insert(0,'scripts');s=u.spec_from_file_location('deploy_truenas_hub','scripts/deploy-truenas-hub.py');m=u.module_from_spec(s);s.loader.exec_module(m);d=m._deployment_plan(json.load(open(sys.argv[1])),sys.argv[2]);print(json.dumps(m.hub_compose(d,d['binaryDestination'])['services']['hub']))";
+export function rehearsalArgv(service,{runtime,name,binary,stateDir}){
+  const s=service,plain=v=>typeof v==="string" && v.length>0 && !/[\0\r\n]/.test(v);
+  if(!s || typeof s!=="object" || Array.isArray(s) || Object.keys(s).some(k=>!REHEARSAL_KEYS.includes(k)))throw releaseError("Rehearsal compose unsupported");
+  const memory=/^([1-9]\d{0,6})m$/.exec(typeof s.mem_limit==="string"?s.mem_limit:""),cpus=["string","number"].includes(typeof s.cpus) && /^\d+(\.\d+)?$/.test(String(s.cpus))?Math.ceil(Number(s.cpus)):0;
+  const env=s.environment && typeof s.environment==="object" && !Array.isArray(s.environment)?Object.entries(s.environment):null;
+  const entry=Array.isArray(s.entrypoint) && s.entrypoint.length===1 && /^\/[A-Za-z0-9._\/-]+$/.test(s.entrypoint[0])?s.entrypoint[0]:null;
+  const volumes=Array.isArray(s.volumes) && s.volumes.every(plain)?s.volumes:null;
+  // Besides the binary and /state, production mounts only read-only files; a
+  // second writable mount would be storage the rehearsal does not provide.
+  const mounted=volumes && entry && volumes.filter(v=>v.endsWith(`:${entry}:ro`)).length===1 && volumes.filter(v=>v.endsWith(":/state")).length===1 && volumes.every(v=>v.endsWith(":ro") || v.endsWith(":/state"));
+  if(!plain(s.image) || !/^[A-Za-z0-9][A-Za-z0-9._\/:@-]*$/.test(s.image) || !/^\d+:\d+$/.test(typeof s.user==="string"?s.user:"") || s.read_only!==true || !same(s.cap_drop,["ALL"]) || !same(s.security_opt,["no-new-privileges:true"])
+    || !memory || !(cpus>=1) || !env || env.some(([k,v])=>!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || typeof v!=="string" || /[\0\r\n]/.test(v)) || !entry || !mounted
+    || ![runtime,name,binary,stateDir].every(plain))throw releaseError("Rehearsal compose unsupported");
+  return [runtime,"run","--rm","--progress","none","--name",name,"--read-only","--user",s.user,"--cap-drop","ALL","--memory",memory[1]+"M","--cpus",String(cpus),"--workdir","/",
+    ...env.sort(([a],[b])=>a<b?-1:a>b?1:0).flatMap(([k,v])=>["-e",`${k}=${v}`]),"-v",`${binary}:${entry}:ro`,"-v",`${stateDir}:/state`,"--entrypoint",entry,s.image,"--migrate-only","/state/"+REHEARSAL_DB];
+}
+// How a rehearsal run ended, in childReason's vocabulary (exit 137 is the
+// out-of-memory kill), with its last output lines redacted and bounded.
+function rehearsalFailure(run,runtime,service){
+  const how=run?.error?.code==="ETIMEDOUT"?"timeout":/^SIG[A-Z0-9]{1,12}$/.test(run?.signal||"")?`signal ${run.signal}`:Number.isInteger(run?.status) && run.status>=0 && run.status<1000?`exit ${run.status}`:"not started";
+  const tail=(text,n)=>n>0?String(text||"").split(/\r?\n/).filter(l=>l.trim()).slice(-n):[];
+  const stderr=tail(run?.stderr,REHEARSAL_LINES),lines=[...stderr,...tail(run?.stdout,REHEARSAL_LINES-stderr.length)];
+  const error=releaseError("Rehearsal container "+how);
+  error.rehearsal={runtime,image:service.image,exit:how,lines:sanitizeCapture({logs:[{service:"hub",lines}]},Object.values(service.environment)).logs[0].lines};
+  return error;
+}
+// The only shape of a failed rehearsal the private journal keeps; anything
+// else on the error is dropped whole.
+export function failureRehearsal(error){
+  const r=error?.rehearsal;
+  if(!r || typeof r!=="object" || ![r.runtime,r.image].every(v=>typeof v==="string" && REHEARSAL_NAME.test(v)) || typeof r.exit!=="string" || !REHEARSAL_HOW.test(r.exit)
+    || !Array.isArray(r.lines) || r.lines.length>REHEARSAL_LINES || r.lines.some(l=>typeof l!=="string" || l.length>REHEARSAL_LINE_LENGTH))return null;
+  return {runtime:r.runtime,image:r.image,exit:r.exit,lines:[...r.lines]};
 }
 
 export class HostAdapter {
@@ -1232,7 +1281,9 @@ export class HostAdapter {
     if(artifact.schemaChanged){
       if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw releaseError("Fresh job backup identity required");
       artifact.migrationBinary=join(this.config.journalDirectory,this.job.id+"-migration");
-      withBuildCheckout(this.config.cwd,commit,src=>this.command(["env","CGO_ENABLED=0",`GOOS=${process.platform}`,`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(src,"hub")));
+      // Built for Linux at the release host's own architecture: it only ever
+      // runs inside the rehearsal container, never on the host.
+      withBuildCheckout(this.config.cwd,commit,src=>this.command(["env","CGO_ENABLED=0","GOOS=linux",`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`,"go","build","-trimpath","-o",artifact.migrationBinary,"./cmd/tailterm-hub"],join(src,"hub")));
       this.requireStamp(artifact.migrationBinary,commit);
       artifact.migrationBinarySHA256=fileDigest(artifact.migrationBinary);
     }
@@ -1253,26 +1304,58 @@ export class HostAdapter {
     let info;try{info=buildInfo({run:argv=>({status:0,stdout:this.command(argv)})},path);}catch{throw releaseError("Go artifact has no build revision");}
     if(info.commit!==commit || info.integrity!==true)throw releaseError("Go artifact revision does not match the integrated commit");
   }
+  // Runs the container CLI and keeps its output. It never throws: the caller
+  // reads status, signal and error. Tests replace it.
+  container(argv,{timeout=600000}={}){
+    const r=spawnSync(argv[0],argv.slice(1),{cwd:this.config.cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:64*1024*1024,timeout});
+    return {status:r.status,signal:r.signal,error:r.error,stdout:r.stdout||"",stderr:r.stderr||""};
+  }
+  // The production hub service as the integrated checkout composes it for
+  // this job's plan and release.
+  rehearsalSpec(a){
+    if(typeof a.planPath!=="string" || typeof a.release!=="string")throw releaseError("Rehearsal plan required");
+    let service;try{service=JSON.parse(this.command(["python3","-c",REHEARSAL_COMPOSE,a.planPath,a.release]));}catch(error){if(error?.releaseReason)throw error;throw releaseError("Rehearsal compose unsupported");}
+    return service;
+  }
+  // The candidate migration runs only in a container under the production
+  // hub constraints. Nothing here runs the migration binary on the host: with
+  // no usable runtime the release is refused.
   async rehearse(a){
     if(!a.backupCopy || !a.migrationBinary)throw releaseError("Handler backup-copy import required");
     if(fileDigest(a.backupCopy)!==a.backupSHA256)throw releaseError("Imported backup hash mismatch");
-    // The migrated copy is removed when the rehearsal ends, pass or fail. The
-    // marker beside it, not the copy, refuses a second attempt; it is saved
-    // before the copy exists and holds no path, output or error text.
-    const copy=a.backupCopy+".rehearsal-"+this.job.id,marker=copy+".json";
+    // The migrated copy is hub.sqlite in a private state directory mounted as
+    // /state; the directory is removed when the rehearsal ends, pass or fail.
+    // The marker beside it, not the copy, refuses a second attempt; it is
+    // saved before the copy exists and holds no path, output or error text.
+    const base=a.backupCopy+".rehearsal-"+this.job.id,stateDir=base+".state",marker=base+".json";
     if(existsSync(marker))throw releaseError("Rehearsal already attempted; inspect prior attempt");
+    // Runtime and compose refusals come before the marker, so the same job
+    // can be rehearsed once the host is fixed.
+    const runtime=this.config.rehearsal?.runtime??"container";
+    if(typeof runtime!=="string" || !REHEARSAL_NAME.test(runtime))throw releaseError("Invalid rehearsal runtime");
+    const up=this.container([runtime,"system","status"],{timeout:30000});
+    if(up?.error)throw releaseError("Rehearsal container runtime unavailable");
+    if(up?.status!==0)throw releaseError("Rehearsal container runtime not running");
+    const service=this.rehearsalSpec(a),name="tt-rehearsal-"+this.job.id,argv=rehearsalArgv(service,{runtime,name,binary:a.migrationBinary,stateDir});
     const record={version:1,jobId:this.job.id,backupSHA256:a.backupSHA256,startedAt:new Date(this.now()).toISOString(),outcome:"started"};
     save(marker,record);
-    const clear=()=>{let gone=true;for(const suffix of COPY_FILES){try{rmSync(copy+suffix,{force:true});}catch{gone=false;}}return gone;};
+    const clear=()=>{try{rmSync(stateDir,{recursive:true,force:true});return !existsSync(stateDir);}catch{return false;}};
     let outcome="failed";
     try{
-      // A copy an earlier run left behind is replaced, sidecars included.
-      clear();copyFileSync(a.backupCopy,copy);
+      // A directory an earlier run left behind is replaced, sidecars included.
+      clear();mkdirSync(stateDir,{mode:0o700});copyFileSync(a.backupCopy,join(stateDir,REHEARSAL_DB));
       if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw releaseError("Candidate migration binary changed");
-      this.command([a.migrationBinary,"--migrate-only",copy]);outcome="passed";
+      const run=this.container(argv);
+      if(run?.status!==0 || run.signal || run.error){
+        // A run that did not end by itself may have left its container; the
+        // removal is best effort and never changes the result.
+        if(!Number.isInteger(run?.status)){try{this.container([runtime,"delete","-f",name],{timeout:30000});}catch{}}
+        throw rehearsalFailure(run,runtime,service);
+      }
+      outcome="passed";
     }finally{
-      // Cleanup never changes the rehearsal's result; a copy left here is
-      // removed by the retention sweep once the job is terminal.
+      // Cleanup never changes the rehearsal's result; a directory left here
+      // is removed by the retention sweep once the job is terminal.
       const copyRemoved=clear();
       try{save(marker,{...record,outcome,endedAt:new Date(this.now()).toISOString(),copyRemoved});}catch{}
     }
@@ -1603,11 +1686,14 @@ export function retentionPolicy(config){
   return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296)};
 }
 // Removes only the exact backup and rehearsal copy names of jobs in the
-// deployment list, each a regular file directly in the journal directory. A
-// job in any state not known to be terminal keeps everything; a terminal job
-// loses its leftover rehearsal copy, and its backup copy unless it is one of
-// the newest released jobs within the size budget. Every removal is appended
-// to retention.jsonl before the file goes. Returns the records written.
+// deployment list, each a regular file directly in the journal directory or
+// directly in the job's rehearsal state directory. A job in any state not
+// known to be terminal keeps everything; a terminal job loses its leftover
+// rehearsal copy, and its backup copy unless it is one of the newest released
+// jobs within the size budget. In a state directory only regular files go,
+// then the directory once empty; a link is never followed or removed. Every
+// removal is appended to retention.jsonl before the file goes. Returns the
+// records written.
 export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
   const policy=retentionPolicy(config),dir=config.journalDirectory,records=[];
   const size=file=>{try{const s=lstatSync(join(dir,file));return s.isFile()?s.size:null;}catch{return null;}};
@@ -1624,6 +1710,12 @@ export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
     const held=()=>backups.reduce((sum,file)=>sum+(size(file)??0),0);
     if(!TERMINAL.includes(job.state)){total+=held();return;}
     for(const file of backups)for(const suffix of COPY_FILES)remove(job.id,`${file}.rehearsal-${job.id}${suffix}`,"rehearsal","terminal");
+    for(const file of backups){
+      const state=`${file}.rehearsal-${job.id}.state`;let names;
+      try{if(!lstatSync(join(dir,state)).isDirectory())continue;names=readdirSync(join(dir,state)).sort();}catch{continue;}
+      for(const name of names)remove(job.id,`${state}/${name}`,"rehearsal","terminal");
+      try{rmdirSync(join(dir,state));}catch{}
+    }
     if(job.state!=="released"){for(const file of backups)remove(job.id,file,"backup","not-released");return;}
     // settledAt is RFC3339Nano with trimmed zeros, so it is compared as time;
     // a job without a usable one is the oldest, in list order.
