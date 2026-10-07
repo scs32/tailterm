@@ -752,6 +752,75 @@ func TestAllocationIntentCreateLostResponseRetryReplaysIdentically(t *testing.T)
 	}
 }
 
+// wi_5bd7ba47f56fab7f: one Start rule for a team queue entry. The fixture
+// scenario is the single string this test and tests/team-examples.test.js
+// compare against, so the handler texts and the team texts cannot drift. The
+// separate Start rule outside the queue stays in both texts.
+func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
+	var scenarios []struct {
+		Name   string
+		Worker []string
+	}
+	data, err := os.ReadFile("../../../tests/handler-allocation-cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(data, &scenarios); err != nil {
+		t.Fatal(err)
+	}
+	var rule, accept string
+	for _, scenario := range scenarios {
+		if scenario.Name == "queue-team-start-evidence" && len(scenario.Worker) == 2 {
+			rule, accept = scenario.Worker[0], scenario.Worker[1]
+		}
+	}
+	if rule == "" || rule != queueTeamStartRule || accept != queueTeamStartHandlerRule {
+		t.Fatalf("fixture and Go constants differ: %q %q", rule, accept)
+	}
+	if n := strings.Count(primaryHandlerGuidance, rule+" "+accept); n != 1 {
+		t.Fatalf("handler role text states the rule %d times", n)
+	}
+	task := api.Task{Name: "Project", Orchestrator: "lead"}
+	primaryRoster := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}}
+	auxiliaryRoster := append(append([]api.Agent{}, primaryRoster...), api.Agent{Name: "handler-aux", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning})
+	primary := agentTaskBriefing(task, "handler", api.AgentRoleDatabaseHandler, "", primaryRoster)
+	auxiliary := agentTaskBriefing(task, "handler-aux", api.AgentRoleDatabaseHandler, "", auxiliaryRoster)
+	builder := agentTaskBriefing(task, "builder", "", "", primaryRoster)
+	if !strings.Contains(auxiliary, "owner-provisioned auxiliary Database handler") || strings.Contains(primary, "owner-provisioned auxiliary Database handler") {
+		t.Fatal("test rosters no longer select the primary and auxiliary handler briefings")
+	}
+	for _, check := range []struct {
+		name, briefing, clause string
+		want                   int
+	}{
+		{"primary handler", primary, rule + " " + accept, 2},
+		{"auxiliary handler", auxiliary, rule, 1},
+		{"auxiliary handler", auxiliary, accept, 1},
+		{"builder", builder, rule, 1},
+		{"builder", builder, accept, 1},
+	} {
+		if n := strings.Count(check.briefing, check.clause); n != check.want {
+			t.Fatalf("%s briefing states %q %d times, want %d", check.name, check.clause, n, check.want)
+		}
+	}
+	for _, check := range []struct{ name, briefing, clause string }{
+		{"builder", builder, "A deliberate Queue Pull records selection but remains separate from the bounded work order and exact Start evidence."},
+		{"builder", builder, "separate Start evidence before implementation. " + rule},
+		{"primary handler", primary, "separate exact Start evidence with item/revision/agent/run/context digest"},
+	} {
+		if !strings.Contains(check.briefing, check.clause) {
+			t.Fatalf("%s briefing lost the separate Start rule %q", check.name, check.clause)
+		}
+	}
+	plan, err := os.ReadFile("../../internal/teamplan/plan.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plan), rule) {
+		t.Fatal("team plan bundle does not carry the queue team Start rule")
+	}
+}
+
 // wi_26c0698de7d3eef2 review finding f1: the standing briefing names the one
 // narrow exception for an item lead and the plan's verifier, and keeps the
 // handler rule and the no-bypass rule around it. A handler's own briefing

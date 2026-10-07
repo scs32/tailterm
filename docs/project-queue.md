@@ -969,7 +969,9 @@ rebased on tasks-hub. The lead prompt is in [team-launch.md](team-launch.md).
 already exist: queue freeze, attempt, started and running with the exact
 agent, run and context digest (the Start evidence), the typed ASSIGN with frozen
 criteria and scope, typed REVIEW and RESULT rounds and the typed disposition.
-The lead sends the handler no Start, plan or assignment gate REQUESTs. The
+The lead sends the handler no Start, plan or assignment gate REQUESTs, with one
+exception: after a scope amendment it sends one Start REQUEST at the new
+revision (see [Queue team Start evidence](#queue-team-start-evidence)). The
 verification plan freeze, the receipt import and the done save with queue
 acceptance are validated hub operations the lead calls itself; see
 [Validated team operations](#validated-team-operations).
@@ -1128,6 +1130,53 @@ the build's acceptance.
   the database handler to save it on the follow-up item. No threshold is set:
   the result is the two numbers and the owner judges them.
 
+## Queue team Start evidence
+
+Bug `wi_5bd7ba47f56fab7f` (order #28219). Team briefings said that queue
+admission is the Start, while the work-audit text every agent and handler
+receives asked for a separate Start. Two items were marked deviant for following
+their own briefing. There is now one rule, stated in the same words in the
+work-audit text, the handler role text and the Planned lead, Small lead and
+builder briefings:
+
+> Queue team: admission is Start evidence for the admitted revision; after a scope amendment, lead sends one Start REQUEST at the new revision before any builder ASSIGN on that scope.
+
+For handlers, the work-audit text and the handler role text add:
+
+> A handler accepts that admission and asks a queue team for no other Start.
+
+What it means:
+
+- **Admission is the Start.** Admitting a team queue entry records the queue
+  freeze, the attempt, and started and running with the exact agent, run and
+  context digest. That is the Start evidence for the item revision the team was
+  admitted at. The lead sends no Start REQUEST for it, and a handler does not
+  ask for one.
+- **Scope amendment.** An item revision saved after admission that changes the
+  owned paths, the criteria or the scope. A revision that changes none of these,
+  such as a priority change or a note saved as a receipt, needs no Start.
+- **Order after an amendment.** The handler saves the amendment, confirms scope
+  and rebinds the entry ([Rebind after an amendment](#rebind-after-an-amendment)).
+  A message can be linked at the new revision only after that rebind. The lead
+  then sends one typed Start REQUEST linked at the new revision. The builder
+  ASSIGN on the new scope follows it, and the builder begins only on that
+  ASSIGN.
+- **Precedence is by Board sequence.** The Start REQUEST must precede the
+  builder ASSIGN. The lead does not wait for the handler's reply before
+  assigning. The handler answers the REQUEST with a RESULT, as it does for any
+  live-team gate.
+- **Outside a team queue entry nothing changes.** A separate exact Start is
+  still required before implementation.
+
+The sentence is `queueTeamStartRule` in `hub/cmd/tt/coordination.go` and
+`queueStartRule` in `client/team-examples.js`. Both are compared with the
+`queue-team-start-evidence` scenario in `tests/handler-allocation-cases.json`,
+by `TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts` and by
+`tests/team-examples.test.js`, so a change in one language fails a test.
+
+A running agent keeps the briefing it was launched with. The rule reaches a
+handler when it is next replaced.
+
 ## Team queue amendments and retries
 
 Bug `wi_4f66c2a118639128` (order #17395). A queue entry freezes the item
@@ -1175,6 +1224,9 @@ The handler's sequence after an owner-approved amendment:
 3. `tt team queue rebind --entry tqe_ID --source SEQ`.
 4. Carry on at the new revision: bookkeeping, new admissions, allocation
    intents, acceptance, team close and finish all use it.
+5. If the amendment changed scope, expect the lead's one Start REQUEST at the
+   new revision and answer it with a RESULT; see
+   [Queue team Start evidence](#queue-team-start-evidence).
 
 Until step 3, the entry is not failed. A queued entry stays queued, is skipped
 when the hub picks the queue head (so later entries still launch), and lists

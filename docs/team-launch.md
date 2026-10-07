@@ -548,7 +548,10 @@ verifier, the Planned delivery builder and the Planned delivery reviewer. Only
 `tt team queue add --template small` admits it; `tt team launch --template
 small` is refused as queue-only, and TailOS **Add team** does not list it.
 Eligibility, the three-path cap, the records it saves and how to requeue it as
-Planned are in [project-queue.md](project-queue.md#small-change-lane).
+Planned are in [project-queue.md](project-queue.md#small-change-lane). What
+counts as its Start, and the one Start REQUEST the lead sends after a scope
+amendment, are in
+[Queue team Start evidence](project-queue.md#queue-team-start-evidence).
 
 `tt team queue add` without `--template` defaults to this lane for a bug whose
 fix fits at most three owned paths, counting the doc that describes the changed
@@ -588,7 +591,7 @@ You are the main orchestrator of a small-change team and its distinct verifier. 
 
 There is no planner. Read the item, its work order and this queue entry's owned paths, then send builder one ASSIGN with the objective, owned files taken only from the entry's owned paths, observable criteria a1…aN, and --verification-criterion aN for the full-matrix criterion (repeat it on REVIEW). If the fix needs more files or a design choice, never widen: ask the owner with tt ask to requeue the item as Planned delivery.
 
-Records come from operations: queue admission is the Start evidence, and typed ASSIGN, REVIEW, RESULT and disposition messages record scope and review. Send no Start, plan or assignment gate REQUESTs; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, with no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and tells reviewer and handler when the receipt is imported. Ask the handler only when the hub refuses, quoting its reason.
+Queue team: admission is Start evidence for the admitted revision; after a scope amendment, lead sends one Start REQUEST at the new revision before any builder ASSIGN on that scope. Send no Start, plan or assignment gate REQUESTs otherwise; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, with no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and tells reviewer and handler when the receipt is imported. Ask the handler only when the hub refuses, quoting its reason.
 
 When builder sends a RESULT with a frozen commit, check each criterion, send reviewer a REVIEW naming that commit, the scope and the criteria, and at once freeze the verification plan on the current tasks-hub tip. Verify it yourself: a fresh clean detached worktree at the exact SHA, node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. Never import a targeted-receipt.json.
 

@@ -185,5 +185,17 @@
       "For exited/offline workers, report the actual dependency and arrange authorized supported exact-run launch/recovery handling without changing item identity or retrying unchanged resume failures",
       "Do not busy-poll"
     ]
+  },
+  {
+    "name": "queue-team-start-evidence",
+    "situation": "A queue team is admitted at revision N; the owner then amends the item's scope to revision M.",
+    "handler": [],
+    "lead": [
+      "Queue team: admission is Start evidence for the admitted revision; after a scope amendment, lead sends one Start REQUEST at the new revision before any builder ASSIGN on that scope."
+    ],
+    "worker": [
+      "Queue team: admission is Start evidence for the admitted revision; after a scope amendment, lead sends one Start REQUEST at the new revision before any builder ASSIGN on that scope.",
+      "A handler accepts that admission and asks a queue team for no other Start."
+    ]
   }
 ]

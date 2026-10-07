@@ -350,6 +350,37 @@ test("documented small-change lead prompt exactly matches the template", () => {
       assert.ok(documentation.includes(member.prompt), "missing exact small/lead prompt");
 });
 
+// wi_5bd7ba47f56fab7f: one Start rule for a team queue entry. The fixture
+// scenario is the single string this test and the Go test
+// TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts compare against.
+test("queue teams, handlers and docs state one Start rule", () => {
+  const read = (file) => readFileSync(new URL(file, import.meta.url), "utf8");
+  const count = (text, clause) => text.split(clause).length - 1;
+  const scenario = JSON.parse(read("./handler-allocation-cases.json")).find(
+    (candidate) => candidate.name === "queue-team-start-evidence",
+  );
+  const [rule, accept] = scenario.worker;
+  assert.equal(scenario.lead[0], rule);
+
+  for (const id of ["planned", "small"])
+    for (const member of exampleTeam(id).members)
+      assert.equal(
+        count(member.prompt, rule),
+        ["lead", "builder"].includes(member.name) ? 1 : 0,
+        `${id}/${member.name}`,
+      );
+
+  const go = read("../hub/cmd/tt/coordination.go");
+  assert.equal(count(go, rule), 1);
+  assert.equal(count(go, accept), 1);
+  const queueDoc = read("../docs/project-queue.md");
+  assert.equal(count(queueDoc, rule), 1);
+  assert.equal(count(queueDoc, accept), 1);
+  assert.equal(count(queueDoc, "\n## Queue team Start evidence\n"), 1);
+  for (const file of ["../docs/team-launch.md", "../docs/team-examples.md"])
+    assert.ok(read(file).includes("project-queue.md#queue-team-start-evidence"), file);
+});
+
 // wi_26c0698de7d3eef2: the plan freeze, the receipt import and the done save
 // with queue acceptance are validated hub operations the lead and the
 // verifier call themselves; the handler keeps intake, scope confirmation,
@@ -378,7 +409,7 @@ test("lead and verifier run the validated hub operations without a handler turn"
   assert.match(verifier, /Import the receipt yourself: tt verification receipt --item ID --file receipt\.json --request-id KEY --generation N/);
   assert.match(verifier, /notifies lead, reviewer and handler/);
   assert.match(verifier, /Never import a targeted-receipt\.json/);
-  assert.match(builder, /Queue admission is your Start evidence: begin on lead's ASSIGN/);
+  assert.match(builder, /Begin only on lead's ASSIGN, which after an amendment follows that Start REQUEST/);
 
   // No lead, builder or verifier prompt asks the handler for a Start, plan,
   // assignment, freeze, import or done-save turn.
