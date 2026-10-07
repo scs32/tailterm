@@ -51,8 +51,23 @@ func writeFixtureFile(t *testing.T, path, content string) {
 	}
 }
 
+// resetCleanupProcessState clears what closeout remembers for the life of the
+// process, now and when the test ends: which entries it examined recently and
+// that it already warned about a bad TAILTERM_ARTIFACT_ACCEPTED_AFTER. Without
+// it a repeat run (go test -count) starts where the last one stopped.
+func resetCleanupProcessState(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		closeoutWorktreeChecks.Clear()
+		artifactAcceptedAfterWarning = sync.Once{}
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
 func newCleanupRepo(t *testing.T) cleanupRepo {
 	t.Helper()
+	resetCleanupProcessState(t)
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
