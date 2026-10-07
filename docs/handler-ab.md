@@ -118,10 +118,129 @@ and reason, skipped arms, handler agent and run, the run's and the policy's
 digests, and the lease time. Finishing the entry stamps `finishedAt`.
 
 `tt team queue list` prints `arm=S drawn=S fallback=no|busy`, and the entry
-JSON carries `handlerArm`. Under a policy a queued entry's reason is `Waiting
-for a free handler of arm S` or `Every handler arm is at a provider limit`. In
+JSON carries `handlerArm`. Under a policy a queued entry's reason starts with
+`Waiting for a free handler of arm S` (continued as "Automatic provisioning"
+describes) or is `Every handler arm is at a provider limit`. In
 TailOS the Delivery row reads `Handler NAME · lease N · arm S`, plus
 `(fallback from O)`.
+
+## Automatic provisioning
+
+Bug `wi_01b6d3afed81167c`, work order #27052. The queue limit admits teams,
+but each team needs its own handler lease. Before this change nothing added a
+handler when the limit had room and every handler was leased: on 2026-10-01
+the limit was 4 with three handlers, an urgent entry waited for "a free handler
+of arm S", and the owner helper started a fourth handler by hand.
+
+**Rule.** When a queued entry is admissible except for a free database handler,
+the runner on the entry's host adds one handler from that host's saved launch
+spec (`tt handler spec`), if the hub allows it. Otherwise the entry's reason
+names what is missing and the exact command that fixes it.
+
+**Handler need.** Such an entry carries `handlerNeed` in the listing JSON:
+`arm` (the drawn arm; empty without an enabled policy), the wanted `runtime`,
+`model`, `reasoning` and `templateDigest`, `handlers` (the project's open,
+non-retired handlers with that runtime, model and reasoning), `leased` (how
+many of them active entries hold), `provision`, `reason`, `fix`, and the
+bookkeeping fields `refused`, `attempt` and `agentId`. Under an enabled policy
+the wanted settings are the drawn arm's and the policy's template digest.
+Without one they are the recorded settings of the project's first open
+handler; if that handler recorded no model or template at spawn, the entry has
+no `handlerNeed`, keeps the reason `No free database handler`, and nothing is
+added. A project with no handler at all is not covered here
+(`wi_42be87739d7bbfc9`).
+
+**Conditions.** `provision` is true only when all of these hold:
+
+- automatic handler provisioning is on for the project (see the switch below);
+- the queue has a free slot and the drawn arm is not at a provider limit;
+- `handlers` is below the queue limit (with `--limit none`: below the active
+  teams plus one), so handlers of the wanted settings never exceed the limit;
+- the new handler and the waiting team both fit under the project agent cap:
+  `open + reserved + team seats + 1 <= cap`, with the counts of
+  [project-queue.md](project-queue.md), "Project agent cap". A provision is
+  therefore never what pushes the team over the cap;
+- no other provision of the project is pending;
+- the host's saved spec was not refused for this entry.
+
+**Exact match.** The runner sends the hub its saved spec's runtime, model,
+reasoning and the template digest of its `--prompt`, with a preallocated
+handler agent ID (queue operation `provision_handler`). The hub recomputes the
+need in one transaction and decides the match itself: all four values must
+equal the wanted ones. A single saved spec can therefore add handlers of one
+arm only; for any other arm it is refused, never adapted.
+
+**Reservation and notice.** On a match the hub stores one `reserved` row in
+`handler_provisions` and posts one Board notice with the subject `Automatic
+handler provision`, naming the entry, arm and handler agent. It is a notice
+from the team queue, not an owner intervention. The runner then starts the
+handler through the ordinary `tt spawn --role database_handler` path with the
+spec's flags and the reserved agent ID; the next pass claims as usual. The row
+becomes `registered` when that agent is an online handler and `abandoned` if
+it is not after 10 minutes, after which a new reservation (attempt 2, a new
+agent ID) is allowed. A retry with the same request ID replays the same row
+and posts nothing. The runner makes one provision attempt per project and
+pass. This work never closes a handler: surplus handlers stay until the owner
+closes them.
+
+**Reasons.** The entry's reason starts with `Waiting for a free handler of arm
+S` (or `No free database handler` without a policy) and, when the limit has
+room for another handler, continues with the counts and one of:
+
+| Case | Reason after `…: 3 of 3 leased, limit 4` |
+| --- | --- |
+| Being added, or one is pending | `; the runner is adding one` |
+| Switch off | `; automatic provisioning is off. Fix: tt team queue provision --task TSK --auto on` |
+| Agent cap | `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29. Fix: tt team queue limit --task TSK --limit 3` (with `+ R reserved` after the open count when seats are reserved) |
+| Spec differs | `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: tt handler spec --task TSK -- --run R --runtime R --model M --reasoning E --prompt "$(cat PROMPT_FILE)" (PROMPT_FILE holds the handler prompt with that template digest; keep the saved spec's other flags), or: tt team queue limit --task TSK --limit 3` |
+| No spec saved | as above, with `the saved launch spec on HOST is missing` |
+
+`TSK` is the real project ID and the numbers are the real counts. The limit
+command always names the current number of matching handlers, so it is an
+exact alternative: the queue then admits only as many teams as it has
+handlers. The hub stores only the prompt's digest, so `PROMPT_FILE` is the one
+placeholder. Without a policy the spec reasons say `the handlers in use needs`
+instead of `arm S needs`. When the limit already has its handlers (they are
+busy or offline), the reason stays the plain wait and nothing is added.
+
+A refused spec is stored as one `refused` row per entry and is the entry's
+standing reason. The runner keeps offering its spec each pass, so saving a
+matching spec is noticed; the row is removed then, and when the entry leases a
+handler. A cap, switch or limit refusal answers 409 and stores nothing.
+
+**Switch.** Automatic handler provisioning is a project setting, default
+**on**, stored as `team_queue_settings.handler_provision` (a project with no
+settings row reads on):
+
+```sh
+tt team queue provision --task T --auto off
+tt team queue provision --task T --auto on
+```
+
+It is an owner-side change with the same authorisation as `tt team queue
+limit`. `tt team queue list` prints `handler provisioning=on|off` and the
+listing JSON carries `handlerProvision`. Off stops reservations at once; a
+handler that was already started stays.
+
+**Raising the limit warns.** The filed choice was "warn or provision up to the
+limit"; this change warns. `tt team queue limit` still saves a raised limit
+that exceeds the available handlers (online, not retired, not in a prepared
+rotation) and prints `warning: limit 4 exceeds 3 available database handlers;
+the runner adds one per waiting team while the agent cap allows`, or, with the
+switch off, `…; automatic provisioning is off, so teams will wait. Fix: tt
+team queue provision --task TSK --auto on`. The JSON result carries it as
+`warning`. A change to `--limit none` has no number to compare, so it always
+reads `no fixed limit with 3 available database handlers; …`. Lowering or
+keeping the limit prints no warning. Handlers are added one at a time, only
+when a team actually waits.
+
+**Release note.** The default is on, so after release the runner starts a
+handler the first time a team waits with room under the limit and the cap,
+provided the host's saved spec matches. To keep the old behaviour run `tt team
+queue provision --task T --auto off`.
+
+**Compatibility.** An older `tt` ignores `handlerNeed` and waits as before. A
+newer `tt` against an older hub sees no `handlerNeed` and adds nothing.
 
 ## Rotation within an arm
 

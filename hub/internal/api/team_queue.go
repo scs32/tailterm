@@ -76,6 +76,14 @@ type TeamQueueEntry struct {
 	// arm policy (docs/handler-ab.md).
 	HandlerArm *TeamQueueHandlerArm `json:"handlerArm,omitempty"`
 
+	// HandlerNeed explains a queued entry that waits only for a database
+	// handler: what it needs and whether the runner may add one
+	// (docs/handler-ab.md, "Automatic provisioning"). It is computed on read.
+	HandlerNeed *TeamQueueHandlerNeed `json:"handlerNeed,omitempty"`
+	// Warning is advice a saved settings change returns, such as a raised
+	// limit that exceeds the available database handlers.
+	Warning string `json:"warning,omitempty"`
+
 	// Summary marks a trimmed history entry in a listing: it carries no
 	// launch, close or activities and bounded reviews, verification and
 	// release. GET .../team-queue/{entry} returns it in full.
@@ -148,6 +156,37 @@ func (s TeamQueueStall) NoticeRequestID(entryID string) string {
 	return fmt.Sprintf("queue-stall-%s-%s-%d", subject, s.Cause, s.BlockerRevision)
 }
 
+// TeamQueueHandlerNeed is the database handler a queued entry waits for.
+// Handlers counts the project's open handlers with the wanted settings and
+// Leased how many of them active entries hold. Provision is true when the
+// runner may add one from its saved launch spec; otherwise Reason says why
+// not and Fix is the exact command.
+type TeamQueueHandlerNeed struct {
+	Arm            string `json:"arm,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Reasoning      string `json:"reasoning,omitempty"`
+	TemplateDigest string `json:"templateDigest,omitempty"`
+	Handlers       int    `json:"handlers"`
+	Leased         int    `json:"leased"`
+	Provision      bool   `json:"provision"`
+	// Refused marks a standing refusal of this host's saved launch spec. The
+	// runner keeps offering its spec, so a corrected one is noticed.
+	Refused bool `json:"refused,omitempty"`
+	// Attempt numbers the entry's provisions from 1; the runner's retry
+	// identity includes it, so an abandoned reservation is not replayed.
+	Attempt int    `json:"attempt,omitempty"`
+	AgentID string `json:"agentId,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Fix     string `json:"fix,omitempty"`
+}
+
+// Automatic handler provisioning switch values.
+const (
+	HandlerProvisionOn  = "on"
+	HandlerProvisionOff = "off"
+)
+
 // Stall causes.
 const (
 	StallFailedEntry    = "failed-entry"
@@ -169,6 +208,9 @@ type TeamQueueList struct {
 	ConcurrencyLimit int              `json:"concurrencyLimit"`
 	HostPolicy       *TeamHostPolicy  `json:"hostPolicy,omitempty"`
 	HostUsage        *TeamHostUsage   `json:"hostUsage,omitempty"`
+	// HandlerProvision is the project's automatic handler provisioning
+	// switch, "on" or "off"; an older hub leaves it empty.
+	HandlerProvision string `json:"handlerProvision,omitempty"`
 	// History describes the page of history entries that follows the
 	// active entries; it is absent for view=active and item listings.
 	History *TeamQueueHistoryPage `json:"history,omitempty"`
@@ -315,6 +357,15 @@ type TeamQueueRequest struct {
 	// be the item's current one. SourceMessageSeq is the amendment's message.
 	ItemRevision     int64 `json:"itemRevision,omitempty"`
 	SourceMessageSeq int64 `json:"sourceMessageSeq,omitempty"`
+	// HandlerProvision is set_handler_provision's switch value, "on" or "off".
+	HandlerProvision string `json:"handlerProvision,omitempty"`
+	// The runner's saved handler launch spec for provision_handler: runtime,
+	// model, reasoning and the prompt's template digest, all empty when the
+	// host has no saved spec. HandlerAgentID is the preallocated handler.
+	HandlerSpecRuntime   string `json:"handlerSpecRuntime,omitempty"`
+	HandlerSpecModel     string `json:"handlerSpecModel,omitempty"`
+	HandlerSpecReasoning string `json:"handlerSpecReasoning,omitempty"`
+	HandlerSpecDigest    string `json:"handlerSpecDigest,omitempty"`
 	// Caller is the authenticated caller, set by the hub's HTTP layer and
 	// never read from the wire. A rebind records it as the approver.
 	Caller Caller `json:"-"`

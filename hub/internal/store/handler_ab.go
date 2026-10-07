@@ -59,7 +59,15 @@ CREATE INDEX IF NOT EXISTS handler_write_refusals_item ON handler_write_refusals
 CREATE TRIGGER IF NOT EXISTS handler_write_refusals_no_update BEFORE UPDATE ON handler_write_refusals
 BEGIN SELECT RAISE(ABORT,'handler write refusals are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS handler_write_refusals_no_delete BEFORE DELETE ON handler_write_refusals
-BEGIN SELECT RAISE(ABORT,'handler write refusals are immutable'); END;`)
+BEGIN SELECT RAISE(ABORT,'handler write refusals are immutable'); END;
+CREATE TABLE IF NOT EXISTS handler_provisions (
+ id TEXT PRIMARY KEY, task_id TEXT NOT NULL, entry_id TEXT NOT NULL, arm TEXT NOT NULL DEFAULT '', agent_id TEXT NOT NULL DEFAULT '',
+ state TEXT NOT NULL CHECK(state IN ('reserved','registered','abandoned','refused')), reason TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
+ host TEXT NOT NULL DEFAULT '', spec_runtime TEXT NOT NULL DEFAULT '', spec_model TEXT NOT NULL DEFAULT '', spec_reasoning TEXT NOT NULL DEFAULT '',
+ spec_digest TEXT NOT NULL DEFAULT '', notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS handler_provisions_entry ON handler_provisions(task_id,entry_id);
+CREATE UNIQUE INDEX IF NOT EXISTS handler_provisions_pending ON handler_provisions(task_id) WHERE state='reserved';
+CREATE UNIQUE INDEX IF NOT EXISTS handler_provisions_refused ON handler_provisions(entry_id) WHERE state='refused';`)
 	return err
 }
 
@@ -527,32 +535,59 @@ func attachHandlerArm(ctx context.Context, q queryRower, e *api.TeamQueueEntry) 
 
 // explainArmWaits replaces the generic free-handler reason on queued entries
 // with the arm the entry waits for, reading the same episode predicate as
-// the draw.
-func explainArmWaits(ctx context.Context, q queryRower, list *api.TeamQueueList, active []api.TeamQueueEntry, now time.Time) error {
+// the draw. An entry that waits only for a handler also gets its HandlerNeed
+// and, when one could be added, a reason with the counts and the fix.
+func explainArmWaits(ctx context.Context, q queryRower, list *api.TeamQueueList, active []api.TeamQueueEntry, maxAgents int, now time.Time) error {
 	if len(list.Entries) == 0 {
 		return nil
 	}
-	p, err := loadHandlerArmPolicy(ctx, q, list.Entries[0].TaskID)
-	if err != nil || !p.Enabled {
+	task := list.Entries[0].TaskID
+	p, err := loadHandlerArmPolicy(ctx, q, task)
+	if err != nil {
 		return err
 	}
+	var nc *handlerNeedContext
 	for i := range list.Entries {
 		e := &list.Entries[i]
-		if e.State != "queued" || len(e.BlockedBy) > 0 || (e.BlockReason != "" && e.BlockReason != "No free database handler") {
+		if e.State != "queued" || len(e.BlockedBy) > 0 || (e.BlockReason != "" && e.BlockReason != noFreeHandlerReason) {
 			continue
 		}
-		d, err := decideHandlerArm(ctx, q, p, e.ID, active, now)
+		drawn := ""
+		if p.Enabled {
+			d, err := decideHandlerArm(ctx, q, p, e.ID, active, now)
+			if err != nil {
+				return err
+			}
+			switch {
+			case d.wait == armAllLimitedMessage:
+				e.BlockReason = "Every handler arm is at a provider limit"
+				continue
+			case d.wait != "":
+				e.BlockReason = "Waiting for a free handler of arm " + d.drawn
+				drawn = d.drawn
+			default:
+				if e.BlockReason == noFreeHandlerReason {
+					e.BlockReason = ""
+				}
+				continue
+			}
+		} else if e.BlockReason != noFreeHandlerReason {
+			continue
+		}
+		if nc == nil {
+			if nc, err = loadHandlerNeedContext(ctx, q, p, active, list.ConcurrencyLimit, maxAgents, now); err != nil {
+				return err
+			}
+		}
+		need, tail, err := nc.need(ctx, q, *e, drawn, false)
 		if err != nil {
 			return err
 		}
-		switch {
-		case d.wait == armAllLimitedMessage:
-			e.BlockReason = "Every handler arm is at a provider limit"
-		case d.wait != "":
-			e.BlockReason = "Waiting for a free handler of arm " + d.drawn
-		case e.BlockReason == "No free database handler":
-			e.BlockReason = ""
+		if need == nil {
+			continue
 		}
+		e.HandlerNeed = need
+		e.BlockReason += tail
 	}
 	return nil
 }
@@ -1589,4 +1624,445 @@ func handlerABComparisons(arms []api.HandlerABArm, items []api.HandlerABItem) []
 		}
 	}
 	return out
+}
+
+// Automatic handler provisioning (docs/handler-ab.md, "Automatic
+// provisioning"). A queued entry that is admissible except for a free
+// database handler gets a HandlerNeed. When the project's switch is on, the
+// queue limit has room for another handler of the wanted settings and the
+// handler plus the waiting team fit under the project agent cap, the runner
+// reserves one with provision_handler and starts it from its saved launch
+// spec. The store decides the exact match of that spec itself.
+
+const noFreeHandlerReason = "No free database handler"
+
+// handlerProvisionAbandonAfter is how long a reserved handler may take to
+// register online before its reservation stops holding the next one.
+const handlerProvisionAbandonAfter = 10 * time.Minute
+
+const handlerProvisionNoticeSubject = "Automatic handler provision"
+
+// queueHandlerProvision reads the project's automatic handler provisioning
+// switch. A project with no settings row reads on.
+func queueHandlerProvision(ctx context.Context, q queryRower, task string) (bool, error) {
+	var on bool
+	err := q.QueryRowContext(ctx, `SELECT COALESCE((SELECT handler_provision FROM team_queue_settings WHERE task_id=?),1)`, task).Scan(&on)
+	return on, err
+}
+
+func handlerProvisionState(on bool) string {
+	if on {
+		return api.HandlerProvisionOn
+	}
+	return api.HandlerProvisionOff
+}
+
+type handlerProvisionRow struct {
+	id, entryID, arm, agentID, state, reason, host    string
+	specRuntime, specModel, specReasoning, specDigest string
+	createdAt                                         string
+}
+
+const handlerProvisionCols = `id,entry_id,arm,agent_id,state,reason,host,spec_runtime,spec_model,spec_reasoning,spec_digest,created_at`
+
+func scanHandlerProvision(row interface{ Scan(...any) error }) (handlerProvisionRow, error) {
+	var r handlerProvisionRow
+	err := row.Scan(&r.id, &r.entryID, &r.arm, &r.agentID, &r.state, &r.reason, &r.host, &r.specRuntime, &r.specModel, &r.specReasoning, &r.specDigest, &r.createdAt)
+	return r, err
+}
+
+// handlerRegistered reports whether a reserved handler agent has registered
+// and is an online, usable database handler.
+func handlerRegistered(ctx context.Context, q queryRower, agentID string) (bool, error) {
+	a, err := scanAgent(q.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agentID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return a.Role == api.AgentRoleDatabaseHandler && a.Online && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.Status != api.AgentRetired, nil
+}
+
+// reservedHandlerProvision reads the project's reserved row, if any, and what
+// it has become: "registered", "abandoned" or still "reserved". It writes
+// nothing; settleHandlerProvisions saves the same judgement.
+func reservedHandlerProvision(ctx context.Context, q queryRower, task string, now time.Time) (*handlerProvisionRow, string, error) {
+	r, err := scanHandlerProvision(q.QueryRowContext(ctx, `SELECT `+handlerProvisionCols+` FROM handler_provisions WHERE task_id=? AND state='reserved'`, task))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	registered, err := handlerRegistered(ctx, q, r.agentID)
+	if err != nil {
+		return nil, "", err
+	}
+	switch {
+	case registered:
+		return &r, "registered", nil
+	case !now.Before(parseTS(r.createdAt).Add(handlerProvisionAbandonAfter)):
+		return &r, "abandoned", nil
+	}
+	return &r, "reserved", nil
+}
+
+// settleHandlerProvisions saves a reserved row's outcome: registered once its
+// handler is online, abandoned after ten minutes otherwise.
+func settleHandlerProvisions(ctx context.Context, tx *sql.Tx, task string, now time.Time) error {
+	r, state, err := reservedHandlerProvision(ctx, tx, task, now)
+	if err != nil || r == nil || state == "reserved" {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE handler_provisions SET state=?,updated_at=? WHERE id=? AND state='reserved'`, state, ts(now), r.id)
+	return err
+}
+
+// clearHandlerProvisionRefusal drops an entry's standing spec refusal, as
+// when the entry leases a handler after all.
+func clearHandlerProvisionRefusal(ctx context.Context, tx *sql.Tx, entryID string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM handler_provisions WHERE entry_id=? AND state='refused'`, entryID)
+	return err
+}
+
+// handlerNeedContext is what every handler need of one listing or one
+// provision shares: the open handlers, the cap counts and the pending
+// reservation are read once.
+type handlerNeedContext struct {
+	policy             api.HandlerArmPolicy
+	active             []api.TeamQueueEntry
+	limit, maxAgents   int
+	autoOn             bool
+	now                time.Time
+	handlers           []api.HandlerArmHandler
+	capOpen, capSeats  int
+	pending            *handlerProvisionRow
+	leasedByActive     map[string]bool
+	effectiveLimit     int
+	effectiveLimitText string
+}
+
+func loadHandlerNeedContext(ctx context.Context, q queryRower, p api.HandlerArmPolicy, active []api.TeamQueueEntry, limit, maxAgents int, now time.Time) (*handlerNeedContext, error) {
+	c := &handlerNeedContext{policy: p, active: active, limit: limit, maxAgents: maxAgents, now: now, leasedByActive: map[string]bool{}}
+	var err error
+	if c.autoOn, err = queueHandlerProvision(ctx, q, p.TaskID); err != nil {
+		return nil, err
+	}
+	all, err := armHandlers(ctx, q, p)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range all {
+		if h.Status != api.AgentRetired {
+			c.handlers = append(c.handlers, h)
+		}
+	}
+	if c.capOpen, c.capSeats, err = projectAgentCapUsage(ctx, q, p.TaskID); err != nil {
+		return nil, err
+	}
+	pending, state, err := reservedHandlerProvision(ctx, q, p.TaskID, now)
+	if err != nil {
+		return nil, err
+	}
+	if state == "reserved" {
+		c.pending = pending
+	}
+	for _, e := range active {
+		if e.HandlerID != "" {
+			c.leasedByActive[e.HandlerID] = true
+		}
+	}
+	// With no fixed cap the queue wants one handler per active team and one
+	// for the team that waits.
+	c.effectiveLimit, c.effectiveLimitText = limit, fmt.Sprint(limit)
+	if limit == 0 {
+		c.effectiveLimit, c.effectiveLimitText = len(active)+1, "none"
+	}
+	return c, nil
+}
+
+// need computes the handler need of a queued entry whose only block is the
+// handler. drawn is its arm under an enabled policy, else empty: the wanted
+// settings are then the first open handler's recorded ones, and a project
+// whose first handler recorded no template has no need to state (it keeps the
+// legacy reason). The second result is the text to append to the entry's
+// wait reason. ignoreRefusal leaves a standing spec refusal out, for the
+// provision that re-examines the spec. It writes nothing.
+func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQueueEntry, drawn string, ignoreRefusal bool) (*api.TeamQueueHandlerNeed, string, error) {
+	n := &api.TeamQueueHandlerNeed{Arm: drawn}
+	if drawn != "" {
+		for _, arm := range c.policy.Arms {
+			if arm.ID == drawn {
+				n.Runtime, n.Model, n.Reasoning, n.TemplateDigest = arm.Runtime, arm.Model, arm.Reasoning, c.policy.TemplateDigest
+			}
+		}
+	} else {
+		if len(c.handlers) == 0 || c.handlers[0].Model == "" || c.handlers[0].TemplateDigest == "" {
+			return nil, "", nil
+		}
+		first := c.handlers[0]
+		n.Runtime, n.Model, n.Reasoning, n.TemplateDigest = first.Runtime, first.Model, first.Reasoning, first.TemplateDigest
+	}
+	for _, h := range c.handlers {
+		if h.Runtime != n.Runtime || h.Model != n.Model || h.Reasoning != n.Reasoning {
+			continue
+		}
+		n.Handlers++
+		if c.leasedByActive[h.AgentID] {
+			n.Leased++
+		}
+	}
+	if n.Handlers >= c.effectiveLimit {
+		// The limit already has its handlers; they are busy or offline, and
+		// another one would not be within the limit.
+		n.Reason = fmt.Sprintf("%d of %d leased, limit %s; the limit already has its handlers", n.Leased, n.Handlers, c.effectiveLimitText)
+		return n, "", nil
+	}
+	counts := fmt.Sprintf("%d of %d leased, limit %s", n.Leased, n.Handlers, c.effectiveLimitText)
+	lower := fmt.Sprintf("tt team queue limit --task %s --limit %d", e.TaskID, n.Handlers)
+	var attempts int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM handler_provisions WHERE entry_id=? AND state IN ('registered','abandoned')`, e.ID).Scan(&attempts); err != nil {
+		return nil, "", err
+	}
+	n.Attempt = attempts + 1
+	kind, err := queueItemKind(ctx, q, e.TaskID, e.ItemID)
+	if err != nil {
+		return nil, "", err
+	}
+	seats := queueTeamSeats(kind, e.Template)
+	switch {
+	case !c.autoOn:
+		n.Fix = fmt.Sprintf("tt team queue provision --task %s --auto on", e.TaskID)
+		n.Reason = counts + "; automatic provisioning is off. Fix: " + n.Fix
+	case c.pending != nil:
+		if c.pending.entryID == e.ID {
+			n.AgentID = c.pending.agentID
+		}
+		n.Reason = counts + "; the runner is adding one"
+	case c.capOpen+c.capSeats+seats+1 > c.maxAgents:
+		// The new handler and the waiting team must both fit, so a provision
+		// is never what pushes the team over the cap.
+		reserved := ""
+		if c.capSeats > 0 {
+			reserved = fmt.Sprintf(" + %d reserved", c.capSeats)
+		}
+		n.Fix = lower
+		n.Reason = fmt.Sprintf("%s; cannot add one: %s%d open%s + %d seats + 1 handler > %d. Fix: %s", counts, projectAgentCapPrefix, c.capOpen, reserved, seats, c.maxAgents, n.Fix)
+	default:
+		n.Provision = true
+		n.Reason = counts + "; the runner is adding one"
+		if ignoreRefusal {
+			break
+		}
+		refused, err := scanHandlerProvision(q.QueryRowContext(ctx, `SELECT `+handlerProvisionCols+` FROM handler_provisions WHERE entry_id=? AND state='refused'`, e.ID))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, "", err
+		}
+		if err == nil {
+			n.Provision, n.Refused = false, true
+			n.Fix = handlerSpecFix(e.TaskID, *n)
+			n.Reason = counts + "; " + refused.reason + ", or: " + lower
+		}
+	}
+	return n, ": " + n.Reason, nil
+}
+
+func handlerSpecText(runtime, model, reasoning, digest string) string {
+	if runtime == "" && model == "" && reasoning == "" && digest == "" {
+		return "missing"
+	}
+	return fmt.Sprintf("%s/%s/%s digest %s", or(runtime, "-"), or(model, "-"), or(reasoning, "-"), or(digest, "-"))
+}
+
+// handlerSpecFix is the command that saves a launch spec with the wanted
+// settings. The hub holds only the prompt's digest, so the prompt file is
+// the one placeholder.
+func handlerSpecFix(task string, n api.TeamQueueHandlerNeed) string {
+	return fmt.Sprintf(`tt handler spec --task %s -- --run %s --runtime %s --model %s --reasoning %s --prompt "$(cat PROMPT_FILE)"`, task, n.Runtime, n.Runtime, n.Model, n.Reasoning)
+}
+
+// handlerSpecRefusal is the stored reason of a spec that does not match.
+func handlerSpecRefusal(task, host string, req api.TeamQueueRequest, n api.TeamQueueHandlerNeed) string {
+	wanted := "the handlers in use"
+	if n.Arm != "" {
+		wanted = "arm " + n.Arm
+	}
+	return fmt.Sprintf("cannot add one: the saved launch spec on %s is %s, %s needs %s. Fix: %s (PROMPT_FILE holds the handler prompt with that template digest; keep the saved spec's other flags)",
+		host, handlerSpecText(req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest), wanted,
+		handlerSpecText(n.Runtime, n.Model, n.Reasoning, n.TemplateDigest), handlerSpecFix(task, n))
+}
+
+// provisionHandler is the provision_handler queue operation: it recomputes
+// the entry's handler need and, when one may be added and the runner's saved
+// spec matches the wanted runtime, model, reasoning and template digest
+// exactly, reserves the preallocated handler and posts one Board notice. A
+// spec that differs or is missing stores one refused row for the entry; the
+// caller commits it and returns the second result as the 409.
+func (s *Store) provisionHandler(ctx context.Context, tx *sql.Tx, t api.Task, req api.TeamQueueRequest) (api.TeamQueueEntry, error, error) {
+	var zero api.TeamQueueEntry
+	if !api.ValidID(req.HandlerAgentID, "agt") || req.Host == "" || req.EntryID == "" ||
+		!validArmField(req.HandlerSpecRuntime) || !validArmField(req.HandlerSpecModel) || !validArmField(req.HandlerSpecReasoning) ||
+		(req.HandlerSpecDigest != "" && !validContextDigest(req.HandlerSpecDigest)) {
+		return zero, nil, api.ErrInvalid
+	}
+	now := s.now()
+	e, err := scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id=?`, t.ID, req.EntryID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return zero, nil, api.ErrNotFound
+	}
+	if err != nil {
+		return zero, nil, err
+	}
+	if e.State != "queued" || (req.ExpectedRevision != 0 && req.ExpectedRevision != e.Revision) {
+		return zero, nil, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
+	}
+	if t.PauseState != api.ProjectPauseActive {
+		return zero, nil, fmt.Errorf("%w: project is not launchable", api.ErrConflict)
+	}
+	if err := settleHandlerProvisions(ctx, tx, t.ID, now); err != nil {
+		return zero, nil, err
+	}
+	limit, err := queueConcurrencyLimit(ctx, tx, t.ID)
+	if err != nil {
+		return zero, nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND `+queueHoldsSQL+` ORDER BY position`, t.ID)
+	if err != nil {
+		return zero, nil, err
+	}
+	var active []api.TeamQueueEntry
+	for rows.Next() {
+		a, scanErr := scanTeamQueue(rows)
+		if scanErr != nil {
+			rows.Close()
+			return zero, nil, scanErr
+		}
+		active = append(active, a)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return zero, nil, err
+	}
+	// The entry must be admissible except for the handler, in the claim's
+	// order: slots, host admission, then nothing active in its way.
+	if queueSlotsFull(limit, len(active)) {
+		return zero, nil, fmt.Errorf("%w: all team slots are reserved", api.ErrConflict)
+	}
+	if queueParallel(limit) {
+		if err := checkTeamHostAdmission(ctx, tx, e.Host, now); err != nil {
+			return zero, nil, err
+		}
+	}
+	for _, a := range active {
+		if e.Cwd == a.Cwd || queueEntryConflicts(e, a) {
+			return zero, nil, fmt.Errorf("%w: the entry waits for an active team, not for a handler", api.ErrConflict)
+		}
+	}
+	p, err := loadHandlerArmPolicy(ctx, tx, t.ID)
+	if err != nil {
+		return zero, nil, err
+	}
+	drawn := ""
+	if p.Enabled {
+		d, err := decideHandlerArm(ctx, tx, p, e.ID, active, now)
+		if err != nil {
+			return zero, nil, err
+		}
+		if d.wait == "" || d.wait == armAllLimitedMessage {
+			return zero, nil, fmt.Errorf("%w: the entry does not wait for a handler that can be added", api.ErrConflict)
+		}
+		drawn = d.drawn
+	} else {
+		free, err := freeQueueHandler(ctx, tx, t.ID, active)
+		if err != nil {
+			return zero, nil, err
+		}
+		if free.ID != "" {
+			return zero, nil, fmt.Errorf("%w: the entry does not wait for a handler that can be added", api.ErrConflict)
+		}
+	}
+	nc, err := loadHandlerNeedContext(ctx, tx, p, active, limit, s.MaxAgents, now)
+	if err != nil {
+		return zero, nil, err
+	}
+	need, _, err := nc.need(ctx, tx, e, drawn, true)
+	if err != nil {
+		return zero, nil, err
+	}
+	if need == nil {
+		return zero, nil, fmt.Errorf("%w: the project's handlers recorded no launch template, so none can be added automatically", api.ErrConflict)
+	}
+	if !need.Provision {
+		return zero, nil, fmt.Errorf("%w: no handler is added: %s", api.ErrConflict, need.Reason)
+	}
+	stamp := ts(now)
+	if err := clearHandlerProvisionRefusal(ctx, tx, e.ID); err != nil {
+		return zero, nil, err
+	}
+	if req.HandlerSpecRuntime != need.Runtime || req.HandlerSpecModel != need.Model || req.HandlerSpecReasoning != need.Reasoning || req.HandlerSpecDigest != need.TemplateDigest {
+		reason := handlerSpecRefusal(t.ID, req.Host, req, *need)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO handler_provisions(id,task_id,entry_id,arm,agent_id,state,reason,request_id,host,spec_runtime,spec_model,spec_reasoning,spec_digest,created_at,updated_at)
+ VALUES(?,?,?,?,'','refused',?,?,?,?,?,?,?,?,?)`, api.NewID("hpv"), t.ID, e.ID, need.Arm, reason, req.RequestID, req.Host,
+			req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest, stamp, stamp); err != nil {
+			return zero, nil, err
+		}
+		return zero, fmt.Errorf("%w: no handler is added: %s", api.ErrConflict, reason), nil
+	}
+	var taken int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE id=?`, req.HandlerAgentID).Scan(&taken); err != nil {
+		return zero, nil, err
+	}
+	if taken != 0 {
+		return zero, nil, fmt.Errorf("%w: the preallocated handler agent already exists", api.ErrConflict)
+	}
+	armText, refs := "", map[string]string{"entry": e.ID, "agent": req.HandlerAgentID, "item": e.ItemID}
+	if need.Arm != "" {
+		armText, refs["arm"] = " of arm "+need.Arm, need.Arm
+	}
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: handlerProvisionNoticeSubject, Refs: refs, Body: api.EnvelopeBody{Text: fmt.Sprintf(
+		"The team queue is adding one database handler%s (%s, %s/%s/%s) on %s for waiting entry %s: %d of %d handlers are leased and the queue limit is %s. This is an automatic provision, not an owner intervention. Turn it off with: tt team queue provision --task %s --auto off",
+		armText, req.HandlerAgentID, need.Runtime, need.Model, need.Reasoning, req.Host, e.ID, need.Leased, need.Handlers, nc.effectiveLimitText, t.ID)}}
+	m, err := s.insertMessage(ctx, tx, t, api.PostMessageRequest{Envelope: &env}, api.Agent{}, api.Caller{Node: "team_queue", User: "runner"}, false, false)
+	if err != nil {
+		return zero, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO handler_provisions(id,task_id,entry_id,arm,agent_id,state,request_id,host,spec_runtime,spec_model,spec_reasoning,spec_digest,notice_seq,created_at,updated_at)
+ VALUES(?,?,?,?,?,'reserved',?,?,?,?,?,?,?,?,?)`, api.NewID("hpv"), t.ID, e.ID, need.Arm, req.HandlerAgentID, req.RequestID, req.Host,
+		req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning, req.HandlerSpecDigest, m.Seq, stamp, stamp); err != nil {
+		return zero, nil, err
+	}
+	need.AgentID = req.HandlerAgentID
+	e.HandlerNeed = need
+	return e, nil, nil
+}
+
+// handlerLimitWarning is set_limit's advice after a raise: the limit admits
+// more teams than there are available database handlers.
+func handlerLimitWarning(ctx context.Context, q queryRower, task string, limit int) (string, error) {
+	free, err := freeQueueHandlers(ctx, q, task, nil)
+	if err != nil {
+		return "", err
+	}
+	available := len(free)
+	if limit > 0 && limit <= available {
+		return "", nil
+	}
+	noun := "handlers"
+	if available == 1 {
+		noun = "handler"
+	}
+	text := fmt.Sprintf("limit %d exceeds %d available database %s", limit, available, noun)
+	if limit == 0 {
+		text = fmt.Sprintf("no fixed limit with %d available database %s", available, noun)
+	}
+	on, err := queueHandlerProvision(ctx, q, task)
+	if err != nil {
+		return "", err
+	}
+	if on {
+		return text + "; the runner adds one per waiting team while the agent cap allows", nil
+	}
+	return fmt.Sprintf("%s; automatic provisioning is off, so teams will wait. Fix: tt team queue provision --task %s --auto on", text, task), nil
 }

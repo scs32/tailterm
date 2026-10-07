@@ -1258,3 +1258,49 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 		t.Fatalf("sanitized line %q", got)
 	}
 }
+
+// wi_01b6d3afed81167c a9, a10 (CLI): the provisioning switch is set and
+// listed, and a limit raised above the available handlers prints a warning.
+func TestTeamQueueCLIHandlerProvisionSwitchAndLimitWarning(t *testing.T) {
+	f := newTeamFixture(t, true)
+	repo, _ := queueGitRepo(t)
+	const adds = "warning: limit 2 exceeds 1 available database handler; the runner adds one per waiting team while the agent cap allows"
+	if out := parallelCLIProject(t, f, "2"); !strings.Contains(out, "concurrency limit=2") || !strings.Contains(out, adds) {
+		t.Fatalf("raised limit output %q", out)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "1"}) }); err != nil || strings.Contains(out, "warning") {
+		t.Fatalf("lowered limit %q %v", out, err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--cwd", repo, "--owns", "client"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(out, "handler provisioning=on\n") {
+		t.Fatalf("default list %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"provision", "--auto", "off"}) }); err != nil || out != "handler provisioning=off\n" {
+		t.Fatalf("provision off %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(out, "handler provisioning=off\n") {
+		t.Fatalf("off list %q %v", out, err)
+	}
+	off := "warning: limit 2 exceeds 1 available database handler; automatic provisioning is off, so teams will wait. Fix: tt team queue provision --task " + f.task.ID + " --auto on"
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "2"}) }); err != nil || !strings.Contains(out, off) {
+		t.Fatalf("raised limit while off %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"provision", "--auto", "on"}) }); err != nil || out != "handler provisioning=on\n" {
+		t.Fatalf("provision on %q %v", out, err)
+	}
+	for _, bad := range [][]string{{"provision"}, {"provision", "--auto", "maybe"}} {
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, bad) }); err == nil || !strings.Contains(err.Error(), "usage: tt team queue provision --auto on|off") {
+			t.Fatalf("%v: %v", bad, err)
+		}
+	}
+	// Like the limit, the switch is an owner-side change.
+	bound := f.e
+	bound.agent = f.handler.ID
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(bound, []string{"provision", "--auto", "off"}) }); err == nil || !strings.Contains(err.Error(), "owner-side team queue changes require an unbound CLI session") {
+		t.Fatalf("bound session: %v", err)
+	}
+}

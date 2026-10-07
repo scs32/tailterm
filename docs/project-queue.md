@@ -588,6 +588,60 @@ of arm S` or `Every handler arm is at a provider limit`, and the claim returns a
 ordinary wait. With no policy, or a disabled one, entries lease the first free
 handler as before.
 
+## Handlers and the limit
+
+Bug `wi_01b6d3afed81167c`, work order #27052; the full description is
+[handler-ab.md](handler-ab.md), "Automatic provisioning".
+
+**Rule.** The limit admits teams, and every team needs its own database
+handler. When a queued entry is admissible except for a free handler, the
+runner on its host adds one handler from the host's saved launch spec. The
+hub allows it only when automatic handler provisioning is on, the matching
+handlers are below the limit (with `--limit none`: below the active teams
+plus one), no other provision is pending, the saved spec's runtime, model,
+reasoning and prompt template digest equal the wanted ones exactly, and the
+handler and the waiting team both fit under the project agent cap (`open +
+reserved + team seats + 1 <= cap`). The hub then posts one Board notice,
+`Automatic handler provision`; it is not an owner intervention. A reserved
+handler that is not online after 10 minutes is abandoned and may be reserved
+again. Handlers are never closed by this rule.
+
+**Reasons.** The waiting entry's JSON carries `handlerNeed` (`provision`,
+`arm`, `handlers`, `leased`, `reason`, `fix`). Its reason starts with `Waiting
+for a free handler of arm S` under an arm policy, else `No free database
+handler`, and continues, for example after `: 3 of 3 leased, limit 4`:
+
+- `; the runner is adding one`
+- `; automatic provisioning is off. Fix: tt team queue provision --task TSK --auto on`
+- `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29.
+  Fix: tt team queue limit --task TSK --limit 3`
+- `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING
+  digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: tt handler
+  spec --task TSK -- --run R --runtime R --model M --reasoning E --prompt
+  "$(cat PROMPT_FILE)" (PROMPT_FILE holds the handler prompt with that
+  template digest; keep the saved spec's other flags), or: tt team queue limit
+  --task TSK --limit 3`
+- the same with `the saved launch spec on HOST is missing` when the host has
+  no saved spec.
+
+The reason stays the plain wait, and nothing is added, when the limit already
+has its handlers, or when the project's first handler recorded no model or
+template at spawn.
+
+**Switch.** Automatic handler provisioning is on by default and stored per
+project in `team_queue_settings.handler_provision`. `tt team queue provision
+--task T --auto off` turns it off and `--auto on` back on; `tt team queue
+list` prints `handler provisioning=on|off`. Because the default is on, a
+released runner starts a handler the first time a team waits with room under
+the limit and the cap.
+
+**Raising the limit warns.** Of "warn or provision up to the limit" this
+change warns: `tt team queue limit` saves the raised limit and prints
+`warning: limit 4 exceeds 3 available database handlers; the runner adds one
+per waiting team while the agent cap allows`, or with the switch off `…;
+automatic provisioning is off, so teams will wait. Fix: tt team queue
+provision --task TSK --auto on`.
+
 ## Team queue shared checkouts
 
 Two teams never edit one working tree, so a queued entry whose `cwd` equals an

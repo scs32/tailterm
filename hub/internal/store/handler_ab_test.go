@@ -1215,3 +1215,419 @@ func TestHandlerArmLimitProviderBlockedSignal(t *testing.T) {
 		t.Fatalf("codex block opened %d episodes", n)
 	}
 }
+
+// Automatic handler provisioning (wi_01b6d3afed81167c, order #27052). Every
+// test uses an isolated SQLite hub and synthetic agents; no handler is started.
+
+type provisionFixture struct {
+	*armFixture
+	entries []api.TeamQueueEntry
+	sArms   []api.Agent
+}
+
+var armSHeavy = api.HandlerArm{ID: "S", Runtime: armS.Runtime, Model: armS.Model, Reasoning: armS.Reasoning, Weight: 1000}
+
+// newProvisionFixture is the reported gap: a parallel queue with the given
+// limit, sHandlers online arm-S handlers, and five scoped entries that all
+// draw arm S. The first leased entries are claimed, one handler each.
+func newProvisionFixture(t *testing.T, limit, sHandlers, leased int) *provisionFixture {
+	t.Helper()
+	f := &provisionFixture{armFixture: newArmFixture(t, 3)}
+	f.sArms = []api.Agent{f.hS}
+	for i := 1; i < sHandlers; i++ {
+		f.sArms = append(f.sArms, f.handler(t, fmt.Sprintf("handler-s%d", i+1), armS, digestP))
+	}
+	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	setQueueLimit(t, f.s, f.task.ID, limit)
+	for i := range f.items {
+		f.entries = append(f.entries, addScopedEntry(t, f.s, f.task, f.items[i], f.orders[i], fmt.Sprintf("src/%d", i)))
+	}
+	seed := ""
+	for i := 0; i < 1000 && seed == ""; i++ {
+		seed = fmt.Sprintf("seed-%d", i)
+		for _, q := range f.entries {
+			if arm, _ := handlerArmDraw(seed, q.ID, []api.HandlerArm{armSHeavy, armO}); arm != "S" {
+				seed = ""
+				break
+			}
+		}
+	}
+	if seed == "" {
+		t.Fatal("no seed draws arm S for every entry")
+	}
+	if _, err := f.s.SetHandlerArmPolicy(context.Background(), f.task.ID, api.HandlerArmPolicyRequest{RequestID: "provision-policy", Enabled: true, Seed: seed,
+		TemplateDigest: digestP, Arms: []api.HandlerArm{armSHeavy, armO}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < leased; i++ {
+		q, err := claimEntry(f.s, f.task, f.entries[i])
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		f.entries[i] = q
+	}
+	return f
+}
+
+// provision offers a saved spec for an entry, as the runner does.
+func (f *provisionFixture) provision(q api.TeamQueueEntry, key, agentID string, spec api.HandlerArm, digest string) (api.TeamQueueEntry, error) {
+	return f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "provision_handler", EntryID: q.ID, ExpectedRevision: q.Revision,
+		Host: "mini", HandlerAgentID: agentID, HandlerSpecRuntime: spec.Runtime, HandlerSpecModel: spec.Model, HandlerSpecReasoning: spec.Reasoning, HandlerSpecDigest: digest})
+}
+
+func (f *provisionFixture) rows(t *testing.T, state string) int {
+	t.Helper()
+	return countRows(t, f.s, `SELECT count(*) FROM handler_provisions WHERE task_id=? AND state=?`, f.task.ID, state)
+}
+
+func (f *provisionFixture) allRows(t *testing.T) int {
+	t.Helper()
+	return countRows(t, f.s, `SELECT count(*) FROM handler_provisions WHERE task_id=?`, f.task.ID)
+}
+
+func (f *provisionFixture) setProvision(t *testing.T, value string) {
+	t.Helper()
+	if _, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_handler_provision", HandlerProvision: value}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const provisionNotice = "Automatic handler provision"
+
+// a1, a2: limit 4, three arm-S handlers leased, the fourth entry queued.
+func TestHandlerProvisionNeedListsWaitingEntry(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	list, err := f.s.ListTeamQueue(context.Background(), f.task.ID)
+	if err != nil || list.HandlerProvision != api.HandlerProvisionOn {
+		t.Fatalf("list %q %v", list.HandlerProvision, err)
+	}
+	got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+	n := got.HandlerNeed
+	if n == nil || !n.Provision || n.Arm != "S" || n.Handlers != 3 || n.Leased != 3 || n.Attempt != 1 || !strings.Contains(n.Reason, "3 of 3 leased, limit 4") {
+		t.Fatalf("handler need %+v", n)
+	}
+	if n.Runtime != armS.Runtime || n.Model != armS.Model || n.Reasoning != armS.Reasoning || n.TemplateDigest != digestP {
+		t.Fatalf("wanted settings %+v", n)
+	}
+	if got.BlockReason != "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; the runner is adding one" {
+		t.Fatalf("reason %q", got.BlockReason)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("listing wrote a provision")
+	}
+}
+
+// a3: the handler and the waiting team do not both fit under the agent cap.
+func TestHandlerProvisionStopsAtAgentCap(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	open, reserved, err := projectAgentCapUsage(context.Background(), f.s.db, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The feature team's six seats fit exactly; one more agent does not.
+	f.s.MaxAgents = open + reserved + featureTeamSlots
+	got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+	limitFix := "tt team queue limit --task " + f.task.ID + " --limit 3"
+	n := got.HandlerNeed
+	if n == nil || n.Provision || n.Fix != limitFix || !strings.Contains(got.BlockReason, "cannot add one: project agent cap: ") ||
+		!strings.Contains(got.BlockReason, fmt.Sprintf("+ %d seats + 1 handler > %d", featureTeamSlots, f.s.MaxAgents)) || !strings.HasSuffix(got.BlockReason, "Fix: "+limitFix) {
+		t.Fatalf("cap need %+v reason %q", n, got.BlockReason)
+	}
+	_, err = f.provision(got, "cap", api.NewID("agt"), armS, digestP)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "project agent cap: ") {
+		t.Fatalf("provision at cap: %v", err)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("cap refusal left a row or notice")
+	}
+	f.s.MaxAgents++
+	if got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID); !got.HandlerNeed.Provision {
+		t.Fatalf("one more seat: %+v", got.HandlerNeed)
+	}
+}
+
+// a4: a matching spec reserves once, posts one notice that is not an owner
+// intervention, and replays; the registered handler is then leased.
+func TestHandlerProvisionReservesOnceAndReplays(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	ctx := context.Background()
+	q := f.entries[3]
+	interventions := countRows(t, f.s, `SELECT count(*) FROM owner_interventions WHERE task_id=?`, f.task.ID)
+	agentID := api.NewID("agt")
+	first, err := f.provision(q, "provision-1", agentID, armS, digestP)
+	if err != nil || first.ID != q.ID || first.State != "queued" || first.HandlerNeed == nil || first.HandlerNeed.AgentID != agentID || !first.HandlerNeed.Provision {
+		t.Fatalf("provision %+v %v", first.HandlerNeed, err)
+	}
+	replay, err := f.provision(q, "provision-1", agentID, armS, digestP)
+	if err != nil || !reflect.DeepEqual(replay.HandlerNeed, first.HandlerNeed) {
+		t.Fatalf("replay %+v %v", replay.HandlerNeed, err)
+	}
+	if f.rows(t, "reserved") != 1 || f.allRows(t) != 1 || f.notices(t, provisionNotice) != 1 {
+		t.Fatalf("rows %d notices %d", f.allRows(t), f.notices(t, provisionNotice))
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM owner_interventions WHERE task_id=?`, f.task.ID); n != interventions {
+		t.Fatalf("owner interventions %d, were %d", n, interventions)
+	}
+	var text, node string
+	if err := f.s.db.QueryRow(`SELECT json_extract(envelope,'$.body.text'),from_node FROM messages WHERE task_id=? AND envelope<>'' AND json_extract(envelope,'$.subject')=?`, f.task.ID, provisionNotice).Scan(&text, &node); err != nil {
+		t.Fatal(err)
+	}
+	if node != "team_queue" || !strings.Contains(text, agentID) || !strings.Contains(text, q.ID) || !strings.Contains(text, "arm S") || !strings.Contains(text, "not an owner intervention") {
+		t.Fatalf("notice from %q: %s", node, text)
+	}
+	// While the handler starts, the entry says one is being added.
+	waiting := listedEntry(t, f.s, f.task.ID, q.ID)
+	if waiting.HandlerNeed.Provision || waiting.HandlerNeed.AgentID != agentID || !strings.HasSuffix(waiting.BlockReason, "the runner is adding one") {
+		t.Fatalf("pending need %+v %q", waiting.HandlerNeed, waiting.BlockReason)
+	}
+	// The reserved handler registers online; the claim leases it.
+	added, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "handler-auto", Role: api.AgentRoleDatabaseHandler, AgentID: agentID, Host: "mini", Session: "handler-auto",
+		Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.online(t, added)
+	claimed, err := claimEntry(f.s, f.task, q)
+	if err != nil || claimed.HandlerID != agentID || claimed.HandlerArm == nil || claimed.HandlerArm.Arm != "S" {
+		t.Fatalf("claim after provision %+v %v", claimed, err)
+	}
+	if f.rows(t, "registered") != 1 || f.allRows(t) != 1 {
+		t.Fatalf("registered rows %d of %d", f.rows(t, "registered"), f.allRows(t))
+	}
+}
+
+// a5, a6: the saved spec must equal the wanted runtime, model, reasoning and
+// template digest; any one difference, or no spec at all, is refused.
+func TestHandlerProvisionRequiresExactSpec(t *testing.T) {
+	differ := func(change func(*api.HandlerArm)) api.HandlerArm {
+		spec := armS
+		change(&spec)
+		return spec
+	}
+	cases := []struct {
+		name    string
+		spec    api.HandlerArm
+		digest  string
+		current string
+	}{
+		{"runtime", differ(func(a *api.HandlerArm) { a.Runtime = "codex" }), digestP, "codex/claude-sonnet-5-5/high digest " + digestP},
+		{"model", differ(func(a *api.HandlerArm) { a.Model = "claude-opus-5-5" }), digestP, "claude/claude-opus-5-5/high digest " + digestP},
+		{"reasoning", differ(func(a *api.HandlerArm) { a.Reasoning = "medium" }), digestP, "claude/claude-sonnet-5-5/medium digest " + digestP},
+		{"digest", armS, digestQ, "claude/claude-sonnet-5-5/high digest " + digestQ},
+		{"missing", api.HandlerArm{}, "", "the saved launch spec on mini is missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newProvisionFixture(t, 4, 3, 3)
+			q := f.entries[3]
+			_, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), tc.spec, tc.digest)
+			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "cannot add one: the saved launch spec on mini") {
+				t.Fatalf("mismatched spec: %v", err)
+			}
+			if f.rows(t, "refused") != 1 || f.allRows(t) != 1 || f.notices(t, provisionNotice) != 0 {
+				t.Fatalf("rows %d refused %d notices %d", f.allRows(t), f.rows(t, "refused"), f.notices(t, provisionNotice))
+			}
+			got := listedEntry(t, f.s, f.task.ID, q.ID)
+			specFix := "tt handler spec --task " + f.task.ID + ` -- --run claude --runtime claude --model claude-sonnet-5-5 --reasoning high --prompt "$(cat PROMPT_FILE)"`
+			n := got.HandlerNeed
+			if n == nil || n.Provision || !n.Refused || n.Fix != specFix {
+				t.Fatalf("refused need %+v", n)
+			}
+			for _, want := range []string{"3 of 3 leased, limit 4; cannot add one", tc.current, "arm S needs claude/claude-sonnet-5-5/high digest " + digestP, "Fix: " + specFix,
+				"or: tt team queue limit --task " + f.task.ID + " --limit 3"} {
+				if !strings.Contains(got.BlockReason, want) {
+					t.Fatalf("reason lacks %q: %s", want, got.BlockReason)
+				}
+			}
+			// The same spec again keeps the one row; a corrected spec clears
+			// it and reserves.
+			if _, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), tc.spec, tc.digest); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 1 {
+				t.Fatalf("repeat refusal: %v, rows %d", err, f.allRows(t))
+			}
+			if _, err := f.provision(q, "refused-"+tc.name, api.NewID("agt"), armS, digestP); err != nil {
+				t.Fatalf("corrected spec: %v", err)
+			}
+			if f.rows(t, "refused") != 0 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 1 {
+				t.Fatalf("after correction: refused %d reserved %d", f.rows(t, "refused"), f.rows(t, "reserved"))
+			}
+		})
+	}
+}
+
+// a7: one provision at a time, and never more handlers than the limit.
+func TestHandlerProvisionIsBounded(t *testing.T) {
+	f := newProvisionFixture(t, 0, 3, 3)
+	agentID := api.NewID("agt")
+	if _, err := f.provision(f.entries[3], "first", agentID, armS, digestP); err != nil {
+		t.Fatal(err)
+	}
+	// A second waiting entry reserves nothing while one is pending.
+	second := listedEntry(t, f.s, f.task.ID, f.entries[4].ID)
+	if second.HandlerNeed == nil || second.HandlerNeed.Provision || second.HandlerNeed.AgentID != "" {
+		t.Fatalf("second need %+v", second.HandlerNeed)
+	}
+	if _, err := f.provision(second, "second", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("second provision: %v", err)
+	}
+	if f.allRows(t) != 1 || f.notices(t, provisionNotice) != 1 {
+		t.Fatalf("rows %d notices %d", f.allRows(t), f.notices(t, provisionNotice))
+	}
+
+	// With the limit's handlers all present, none is added even though one
+	// is offline and the entry waits: the reason stays the plain arm wait.
+	g := newProvisionFixture(t, 3, 3, 2)
+	leased := map[string]bool{g.entries[0].HandlerID: true, g.entries[1].HandlerID: true}
+	for _, a := range g.sArms {
+		if !leased[a.ID] {
+			g.offline(t, a)
+		}
+	}
+	held := listedEntry(t, g.s, g.task.ID, g.entries[2].ID)
+	if held.HandlerNeed == nil || held.HandlerNeed.Provision || held.HandlerNeed.Handlers != 3 || held.HandlerNeed.Leased != 2 || held.BlockReason != "Waiting for a free handler of arm S" {
+		t.Fatalf("at-limit need %+v %q", held.HandlerNeed, held.BlockReason)
+	}
+	if _, err := g.provision(held, "at-limit", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || g.allRows(t) != 0 {
+		t.Fatalf("at-limit provision: %v rows %d", err, g.allRows(t))
+	}
+	// Raising the limit by one admits exactly one more handler.
+	setQueueLimit(t, g.s, g.task.ID, 4)
+	if got := listedEntry(t, g.s, g.task.ID, g.entries[2].ID); !got.HandlerNeed.Provision || !strings.Contains(got.BlockReason, "2 of 3 leased, limit 4") {
+		t.Fatalf("raised limit need %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+}
+
+// a8: a reservation whose handler never registers stops holding after ten
+// minutes, and the next one is a new attempt.
+func TestHandlerProvisionAbandonsUnregisteredReservation(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	q := f.entries[3]
+	if _, err := f.provision(q, "attempt-1", api.NewID("agt"), armS, digestP); err != nil {
+		t.Fatal(err)
+	}
+	f.clock = f.clock.Add(handlerProvisionAbandonAfter - time.Second)
+	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.HandlerNeed.Provision {
+		t.Fatalf("still pending: %+v", got.HandlerNeed)
+	}
+	if _, err := f.provision(q, "early", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("provision while pending: %v", err)
+	}
+	f.clock = f.clock.Add(time.Second)
+	got := listedEntry(t, f.s, f.task.ID, q.ID)
+	if !got.HandlerNeed.Provision || got.HandlerNeed.Attempt != 1 {
+		t.Fatalf("after ten minutes: %+v", got.HandlerNeed)
+	}
+	next := api.NewID("agt")
+	if _, err := f.provision(q, "attempt-2", next, armS, digestP); err != nil {
+		t.Fatalf("new reservation: %v", err)
+	}
+	if f.rows(t, "abandoned") != 1 || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 2 {
+		t.Fatalf("abandoned %d reserved %d", f.rows(t, "abandoned"), f.rows(t, "reserved"))
+	}
+	if got := listedEntry(t, f.s, f.task.ID, q.ID); got.HandlerNeed.Attempt != 2 || got.HandlerNeed.AgentID != next {
+		t.Fatalf("second attempt need %+v", got.HandlerNeed)
+	}
+}
+
+// a9: the switch defaults on; off stops provisioning and names the command.
+func TestHandlerProvisionSwitch(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	ctx := context.Background()
+	q := f.entries[3]
+	if on, err := queueHandlerProvision(ctx, f.s.db, "tsk_0000000000000000"); err != nil || !on {
+		t.Fatalf("project without settings reads %v %v", on, err)
+	}
+	f.setProvision(t, api.HandlerProvisionOff)
+	list, err := f.s.ListTeamQueue(ctx, f.task.ID)
+	if err != nil || list.HandlerProvision != api.HandlerProvisionOff || list.ConcurrencyLimit != 4 {
+		t.Fatalf("off list %q limit %d %v", list.HandlerProvision, list.ConcurrencyLimit, err)
+	}
+	onFix := "tt team queue provision --task " + f.task.ID + " --auto on"
+	got := listedEntry(t, f.s, f.task.ID, q.ID)
+	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Fix != onFix ||
+		got.BlockReason != "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; automatic provisioning is off. Fix: "+onFix {
+		t.Fatalf("off need %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+	if _, err := f.provision(q, "off", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), onFix) || f.allRows(t) != 0 {
+		t.Fatalf("provision while off: %v", err)
+	}
+	if _, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "bad-switch", Operation: "set_handler_provision", HandlerProvision: "maybe"}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("invalid switch value: %v", err)
+	}
+	f.setProvision(t, api.HandlerProvisionOn)
+	got = listedEntry(t, f.s, f.task.ID, q.ID)
+	if !got.HandlerNeed.Provision || got.BlockReason != "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; the runner is adding one" {
+		t.Fatalf("on again %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+}
+
+// a10: raising the limit above the available handlers warns and still saves.
+func TestHandlerProvisionLimitRaiseWarns(t *testing.T) {
+	f := newProvisionFixture(t, 3, 3, 0)
+	ctx := context.Background()
+	// Only the three arm-S handlers stay available.
+	for _, name := range []string{"database", "handler-o"} {
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='retired' WHERE task_id=? AND name=?`, f.task.ID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limit := func(n int) api.TeamQueueEntry {
+		t.Helper()
+		e, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_limit", Host: "mini", ConcurrencyLimit: n})
+		if err != nil {
+			t.Fatalf("limit %d: %v", n, err)
+		}
+		return e
+	}
+	raised := limit(4)
+	if raised.Warning != "limit 4 exceeds 3 available database handlers; the runner adds one per waiting team while the agent cap allows" {
+		t.Fatalf("warning %q", raised.Warning)
+	}
+	if list, err := f.s.ListTeamQueue(ctx, f.task.ID); err != nil || list.ConcurrencyLimit != 4 {
+		t.Fatalf("limit not saved: %d %v", list.ConcurrencyLimit, err)
+	}
+	if lowered := limit(3); lowered.Warning != "" {
+		t.Fatalf("lowering warned %q", lowered.Warning)
+	}
+	f.handler(t, "handler-s4", armS, digestP)
+	if enough := limit(4); enough.Warning != "" {
+		t.Fatalf("four handlers warned %q", enough.Warning)
+	}
+	f.setProvision(t, api.HandlerProvisionOff)
+	if off := limit(5); off.Warning != "limit 5 exceeds 4 available database handlers; automatic provisioning is off, so teams will wait. Fix: tt team queue provision --task "+f.task.ID+" --auto on" {
+		t.Fatalf("off warning %q", off.Warning)
+	}
+}
+
+// Without an arm policy the wanted settings are the first handler's recorded
+// ones; a handler that recorded no template keeps the legacy reason.
+func TestHandlerProvisionWithoutPolicy(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 0)
+	ctx := context.Background()
+	if _, err := f.s.SetHandlerArmPolicy(ctx, f.task.ID, api.HandlerArmPolicyRequest{RequestID: "disable", ExpectedRevision: 1, Enabled: false, Seed: "off", Arms: []api.HandlerArm{armSHeavy, armO}}); err != nil {
+		t.Fatal(err)
+	}
+	// Only the arm-S handlers remain, so the first open handler is recorded.
+	for _, name := range []string{"database", "handler-o"} {
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='closed' WHERE task_id=? AND name=?`, f.task.ID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := claimEntry(f.s, f.task, f.entries[i]); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+	}
+	q := f.entries[3]
+	got := listedEntry(t, f.s, f.task.ID, q.ID)
+	n := got.HandlerNeed
+	if n == nil || !n.Provision || n.Arm != "" || n.Model != armS.Model || n.TemplateDigest != digestP || got.BlockReason != "No free database handler: 3 of 3 leased, limit 4; the runner is adding one" {
+		t.Fatalf("no-policy need %+v %q", n, got.BlockReason)
+	}
+	if _, err := f.provision(q, "plain-refused", api.NewID("agt"), armO, digestP); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "the handlers in use needs claude/claude-sonnet-5-5/high") {
+		t.Fatalf("mismatch without policy: %v", err)
+	}
+	if _, err := f.provision(q, "plain", api.NewID("agt"), armS, digestP); err != nil || f.rows(t, "reserved") != 1 || f.rows(t, "refused") != 0 {
+		t.Fatalf("provision without policy: %v", err)
+	}
+}

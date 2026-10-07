@@ -29,7 +29,7 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|scope|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|scope|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -156,6 +156,7 @@ func cmdTeamQueue(e env, args []string) error {
 	policyRate := fs.Int("requests-per-minute", 0, "host relay request-rate budget")
 	policyBurst := fs.Int("burst", 0, "host relay burst budget")
 	policyHeadroom := fs.Int("headroom-percent", 0, "reserved host limiter headroom percent")
+	auto := fs.String("auto", "", "provision: automatic handler provisioning, on or off")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -201,6 +202,10 @@ func cmdTeamQueue(e env, args []string) error {
 			return nil
 		}
 		fmt.Printf("concurrency limit=%s\n", queueLimitText(list.ConcurrencyLimit))
+		if list.HandlerProvision != "" {
+			// An older hub does not report the switch.
+			fmt.Printf("handler provisioning=%s\n", list.HandlerProvision)
+		}
 		matrix, matrixNotice := readMatrixWaitlist()
 		if matrixNotice != "" {
 			fmt.Println(matrixNotice)
@@ -283,6 +288,11 @@ func cmdTeamQueue(e env, args []string) error {
 				}
 			}
 		}
+	case "provision":
+		if *auto != api.HandlerProvisionOn && *auto != api.HandlerProvisionOff {
+			return errors.New("usage: tt team queue provision --auto on|off (automatic handler provisioning; default on)")
+		}
+		req.Operation, req.HandlerProvision = "set_handler_provision", *auto
 	case "add":
 		if !api.ValidID(*item, "wi") || *order < 1 || (*template != "planned" && *template != "small") || (*newWorktree && (*noNewWorktree || *cwd != "")) {
 			return errors.New("usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]")
@@ -721,6 +731,11 @@ func cmdTeamQueue(e env, args []string) error {
 	} else {
 		if sub == "limit" {
 			fmt.Printf("concurrency limit=%s\n", queueLimitText(int(result.Revision)))
+			if result.Warning != "" {
+				fmt.Printf("warning: %s\n", result.Warning)
+			}
+		} else if sub == "provision" {
+			fmt.Printf("handler provisioning=%s\n", *auto)
 		} else if sub == "rebind" {
 			fmt.Printf("rebind %s %s%s (%s)\n", result.ID, result.ItemID, queueAttemptText(result), result.State)
 		} else if sub == "requeue" {

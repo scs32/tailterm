@@ -1603,3 +1603,214 @@ func TestTeamRunnerRegistrationCapHoldsLaunch(t *testing.T) {
 		t.Fatalf("spawn attempts %v registered %v", attempts, registered)
 	}
 }
+
+// Automatic handler provisioning (wi_01b6d3afed81167c, order #27052). The
+// fixture's hub, relay directory and tmux socket are temporary, and the
+// persistent launch seam is substituted, so no handler is started.
+
+const provisionTestPrompt = "fixture handler prompt"
+
+type provisionRunnerFixture struct {
+	teamFixture
+	host    string
+	waiting api.TeamQueueEntry
+	spawns  []api.AddAgentRequest
+	runner  teamRunner
+}
+
+// newProvisionRunnerFixture is a parallel project with limit 2 whose one
+// recorded handler is leased by a running team on another host, a second
+// entry that waits only for a handler, and the given saved launch spec.
+func newProvisionRunnerFixture(t *testing.T, specArgs ...string) *provisionRunnerFixture {
+	t.Helper()
+	p := &provisionRunnerFixture{teamFixture: newTeamFixture(t, true), host: spawn.Host()}
+	f := p.teamFixture
+	ctx := context.Background()
+	handler, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler-recorded", Role: api.AgentRoleDatabaseHandler, Host: p.host, Session: "fixture-handler",
+		Runtime: "claude", TemplateDigest: handlerTemplateDigest(provisionTestPrompt), HandlerModel: "claude-sonnet-5-5", HandlerReasoning: "high"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}); err != nil {
+		t.Fatal(err)
+	}
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "2")
+	second, secondOrder := queueFixtureItem(t, f, "provision-second")
+	add := func(key string, item api.WorkItem, order int64, owns string) api.TeamQueueEntry {
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item.ID, OrderMessageSeq: order, Host: p.host, Cwd: t.TempDir(), Repository: repo, BaseCommit: head, Ownership: []string{owns}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	busy := add("provision-busy", f.item, f.order, "client")
+	p.waiting = add("provision-waiting", second, secondOrder, "hub")
+	// A running team on another host holds the only handler; this host's
+	// runner leaves that entry alone. The fixture's own handler recorded no
+	// launch template, so it is closed: the recorded one is the project's.
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE agents SET status='closed' WHERE id=?`, f.handler.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE team_queue_entries SET state='running',host='elsewhere',handler_id=?,handler_run_id=?,handler_lease_generation=1 WHERE id=?`, handler.ID, handler.RunID, busy.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(specArgs) > 0 {
+		spec, err := newHandlerSpec(f.c.Base, f.task.ID, specArgs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := saveHandlerSpec(spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prior := ensurePersistent
+	ensurePersistent = func(ctx context.Context, c *api.Client, task string, req api.AddAgentRequest, _ spawn.Options) (api.Agent, error) {
+		// Stand in for the launch: register the handler and report it online.
+		p.spawns = append(p.spawns, req)
+		req.Session = "fixture-" + req.Name
+		a, err := c.AddAgent(ctx, task, req)
+		if err != nil {
+			return a, err
+		}
+		_, err = c.PostEvent(ctx, task, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventRunning})
+		return a, err
+	}
+	t.Cleanup(func() { ensurePersistent = prior })
+	p.runner = teamRunner{
+		plan: func(context.Context, map[string]any, *teamLaunchResolved) error {
+			return errors.New("no team launch in this test")
+		},
+		spawn: cmdSpawn,
+		owned: func(context.Context, env, api.Agent) error { return nil },
+	}
+	return p
+}
+
+func (p *provisionRunnerFixture) listed(t *testing.T) api.TeamQueueEntry {
+	t.Helper()
+	q, err := p.c.GetTeamQueueEntry(context.Background(), p.task.ID, p.waiting.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := p.c.ListTeamQueuePage(context.Background(), p.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list.Entries {
+		if e.ID == q.ID {
+			return e
+		}
+	}
+	t.Fatalf("entry %s not listed", q.ID)
+	return q
+}
+
+// a11: the runner reserves one handler for the waiting entry and starts it
+// once from the saved spec; the claim then leases it.
+func TestTeamRunnerProvisionsHandlerFromSavedSpec(t *testing.T) {
+	p := newProvisionRunnerFixture(t, "--run", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt)
+	ctx := context.Background()
+	before := p.listed(t)
+	if before.HandlerNeed == nil || !before.HandlerNeed.Provision || before.BlockReason != "No free database handler: 1 of 1 leased, limit 2; the runner is adding one" {
+		t.Fatalf("waiting entry %+v %q", before.HandlerNeed, before.BlockReason)
+	}
+	if err := p.runner.tick(ctx, p.e, p.c, p.host); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.spawns) != 1 {
+		t.Fatalf("spawn calls %d, want 1", len(p.spawns))
+	}
+	wantID := handlerProvisionAgentID(p.c.Base, p.task.ID, fmt.Sprintf("queue-provision-%s-%d-1", p.waiting.ID, p.waiting.Revision))
+	got := p.spawns[0]
+	if got.AgentID != wantID || got.Role != api.AgentRoleDatabaseHandler || got.Runtime != "claude" || got.HandlerModel != "claude-sonnet-5-5" || got.HandlerReasoning != "high" ||
+		got.TemplateDigest != handlerTemplateDigest(provisionTestPrompt) || got.Name != "db-handler-auto-"+wantID[len(wantID)-6:] || got.ParentAgentID != "" {
+		t.Fatalf("spawned handler %+v, want agent %s", got, wantID)
+	}
+	notices := 0
+	messages, err := p.c.ListMessages(ctx, p.task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == "Automatic handler provision" {
+			notices++
+			if m.Envelope.Refs["agent"] != wantID || m.Envelope.Refs["entry"] != p.waiting.ID || m.Intervention != nil {
+				t.Fatalf("notice %+v", m)
+			}
+		}
+	}
+	if notices != 1 {
+		t.Fatalf("provision notices %d", notices)
+	}
+	// The registered handler is free, so the entry no longer waits and a
+	// further pass adds nothing.
+	p.runner.provisionHandler(ctx, p.e, p.c, api.TeamQueueList{Entries: []api.TeamQueueEntry{before}}, p.host)
+	if len(p.spawns) != 1 {
+		t.Fatalf("spawn calls after a replayed pass %d", len(p.spawns))
+	}
+	if after := p.listed(t); after.HandlerNeed != nil || after.BlockReason != "" {
+		t.Fatalf("after registration %+v %q", after.HandlerNeed, after.BlockReason)
+	}
+	claimed, err := p.c.TeamQueueAction(ctx, p.task.ID, api.TeamQueueRequest{RequestID: "provision-claim", Operation: "claim", EntryID: p.waiting.ID, ExpectedRevision: p.waiting.Revision, Host: p.host})
+	if err != nil || claimed.State != "launching" || claimed.HandlerID != wantID {
+		t.Fatalf("claim after provision %+v %v", claimed, err)
+	}
+}
+
+// a11: nothing is started when the hub says no handler may be added: the
+// switch is off, the saved spec differs, or no spec is saved.
+func TestTeamRunnerDoesNotProvisionWhenRefused(t *testing.T) {
+	t.Run("switch off", func(t *testing.T) {
+		p := newProvisionRunnerFixture(t, "--run", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt)
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(p.e, []string{"provision", "--auto", "off"}) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil {
+			t.Fatal(err)
+		}
+		got := p.listed(t)
+		if len(p.spawns) != 0 || got.HandlerNeed == nil || got.HandlerNeed.Provision || !strings.HasSuffix(got.BlockReason, "Fix: tt team queue provision --task "+p.task.ID+" --auto on") {
+			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
+		}
+	})
+	t.Run("spec differs", func(t *testing.T) {
+		p := newProvisionRunnerFixture(t, "--run", "claude", "--model", "claude-opus-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt)
+		for pass := 0; pass < 2; pass++ {
+			if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := p.listed(t)
+		if len(p.spawns) != 0 || got.HandlerNeed == nil || got.HandlerNeed.Provision || !got.HandlerNeed.Refused ||
+			!strings.Contains(got.BlockReason, "the saved launch spec on "+p.host+" is claude/claude-opus-5-5/high") || !strings.Contains(got.BlockReason, "tt handler spec --task "+p.task.ID+" -- ") {
+			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
+		}
+		// The owner saves the matching spec; the next pass adds the handler.
+		spec, err := newHandlerSpec(p.c.Base, p.task.ID, []string{"--run", "claude", "--model", "claude-sonnet-5-5", "--reasoning", "high", "--prompt", provisionTestPrompt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := saveHandlerSpec(spec); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil || len(p.spawns) != 1 {
+			t.Fatalf("after the corrected spec: %v, spawns %d", err, len(p.spawns))
+		}
+	})
+	t.Run("no spec", func(t *testing.T) {
+		p := newProvisionRunnerFixture(t)
+		if err := p.runner.tick(context.Background(), p.e, p.c, p.host); err != nil {
+			t.Fatal(err)
+		}
+		got := p.listed(t)
+		if len(p.spawns) != 0 || got.HandlerNeed == nil || !got.HandlerNeed.Refused || !strings.Contains(got.BlockReason, "the saved launch spec on "+p.host+" is missing") {
+			t.Fatalf("spawns %d need %+v %q", len(p.spawns), got.HandlerNeed, got.BlockReason)
+		}
+	})
+}

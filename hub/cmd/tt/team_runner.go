@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -374,6 +375,11 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				}
 			}
 		}
+		if !parallel || (hostBudgetErr == nil && list.HostPolicy != nil) {
+			// A new handler is new load, so an unsafe host observation holds
+			// it like any parallel launch.
+			r.provisionHandler(ctx, e, c, queue, host)
+		}
 		r.noticeStalls(ctx, c, queue, host)
 	}
 	if r.roundRobin {
@@ -440,6 +446,93 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 		return r.finish(ctx, e, c, q, host)
 	}
 	return nil
+}
+
+// provisionedHandlers remembers, per process, the handler provisions whose
+// spawn call returned without error, so a reservation that is still waiting
+// for its handler to register is not spawned again on every tick. After a
+// relay restart one replay reaches the handler launch journal, which resumes
+// the same agent instead of starting another.
+var provisionedHandlers sync.Map
+
+// handlerProvisionAgentID derives the preallocated handler identity from the
+// provision's retry identity, so a replay offers the same agent.
+func handlerProvisionAgentID(hub, task, requestID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(hub, "/") + "\x00" + task + "\x00" + requestID))
+	return "agt_" + hex.EncodeToString(sum[:8])
+}
+
+// provisionHandler adds one database handler for the first queued entry of
+// this host that waits only for a handler the hub says may be added
+// (docs/handler-ab.md, "Automatic provisioning"). It offers the host's saved
+// launch spec to the hub, which decides the exact match and reserves the
+// handler; only then is the handler started, through the same spawn path as
+// tt spawn. One attempt per project and pass; an error is logged and the
+// pass continues.
+func (r teamRunner) provisionHandler(ctx context.Context, e env, c *api.Client, queue api.TeamQueueList, host string) {
+	if r.spawn == nil {
+		return
+	}
+	hub := strings.TrimRight(c.Base, "/")
+	for _, q := range queue.Entries {
+		n := q.HandlerNeed
+		if q.Host != host || q.State != "queued" || n == nil {
+			continue
+		}
+		requestID := fmt.Sprintf("queue-provision-%s-%d-%d", q.ID, q.Revision, n.Attempt)
+		key := hub + "\x00" + requestID
+		_, spawned := provisionedHandlers.Load(key)
+		// A standing refusal is offered again so a corrected spec is seen; a
+		// reservation of this entry is replayed until its spawn succeeded.
+		if spawned || (!n.Provision && !n.Refused && n.AgentID == "") {
+			continue
+		}
+		started, err := r.provisionOne(ctx, e, c, q, hub, host, requestID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] handler provision %s: %v\n", q.ID, err)
+		}
+		if started {
+			provisionedHandlers.Store(key, true)
+		}
+		return
+	}
+}
+
+// provisionOne reports whether the reserved handler's launch returned
+// without error. A 409 is the hub's refusal: nothing is started and the
+// entry's listed reason says why.
+func (r teamRunner) provisionOne(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, hub, host, requestID string) (bool, error) {
+	spec, specErr := loadHandlerSpec(hub, q.TaskID)
+	if specErr != nil {
+		// An unreadable spec is offered as a missing one, so the entry's
+		// reason names the host and the command that saves it again.
+		fmt.Fprintf(os.Stderr, "[tt relay] handler provision %s: %v\n", q.ID, specErr)
+		spec = nil
+	}
+	agentID := handlerProvisionAgentID(hub, q.TaskID, requestID)
+	req := api.TeamQueueRequest{RequestID: requestID, Operation: "provision_handler", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, HandlerAgentID: agentID}
+	if spec != nil {
+		req.HandlerSpecRuntime, req.HandlerSpecModel, req.HandlerSpecReasoning = spec.runtime(), spec.value("model"), spec.value("reasoning")
+		req.HandlerSpecDigest = handlerTemplateDigest(spec.value("prompt"))
+	}
+	if _, err := c.TeamQueueAction(ctx, q.TaskID, req); err != nil {
+		var response *api.HTTPError
+		if errors.As(err, &response) && response.Status == 409 {
+			return false, nil
+		}
+		return false, err
+	}
+	if spec == nil {
+		return false, errors.New("the hub reserved a handler without a saved launch spec")
+	}
+	args := append(append([]string(nil), spec.Args...), "--role", api.AgentRoleDatabaseHandler, "--agent-id", agentID,
+		"--name", "db-handler-auto-"+agentID[len(agentID)-6:], "--task", q.TaskID, "--hub", hub)
+	launch := e
+	launch.hub, launch.task, launch.agent, launch.agentName, launch.runID = hub, q.TaskID, "", "", ""
+	if err := r.spawn(launch, args); err != nil {
+		return false, fmt.Errorf("start reserved handler %s: %w", agentID, err)
+	}
+	return true, nil
 }
 
 // narrow shrinks an accepted running entry's ownership to the files its

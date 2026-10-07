@@ -269,6 +269,17 @@ func migrateTeamQueue(db *sql.DB) error {
 			}
 		}
 	}
+	// Automatic handler provisioning is on unless the owner turns it off
+	// (docs/handler-ab.md, "Automatic provisioning").
+	var provisionColumn int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_settings') WHERE name='handler_provision'`).Scan(&provisionColumn); err != nil {
+		return err
+	}
+	if provisionColumn == 0 {
+		if _, err := tx.Exec(`ALTER TABLE team_queue_settings ADD COLUMN handler_provision INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return err
+		}
+	}
 	var entryPK int
 	rows, err := tx.Query(`PRAGMA table_info('team_launch_reservations')`)
 	if err != nil {
@@ -575,6 +586,11 @@ func (s *Store) ListTeamQueue(ctx context.Context, task string) (api.TeamQueueLi
 	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
 		return out, err
 	}
+	provision, err := queueHandlerProvision(ctx, s.db, task)
+	if err != nil {
+		return out, err
+	}
+	out.HandlerProvision = handlerProvisionState(provision)
 	if out.Entries, err = s.teamQueueRows(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? ORDER BY position`, task); err != nil {
 		return api.TeamQueueList{}, err
 	}
@@ -784,7 +800,7 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			holding = append(holding, entry)
 		}
 	}
-	if err := explainArmWaits(ctx, reader, out, holding, s.now()); err != nil {
+	if err := explainArmWaits(ctx, reader, out, holding, s.MaxAgents, s.now()); err != nil {
 		return err
 	}
 	if err := s.explainQueueStalls(ctx, reader, capacityTx, out); err != nil {
@@ -901,6 +917,11 @@ func (s *Store) TeamQueuePage(ctx context.Context, task string, opts api.TeamQue
 	if out.ConcurrencyLimit, err = queueConcurrencyLimit(ctx, s.db, task); err != nil {
 		return out, err
 	}
+	provision, err := queueHandlerProvision(ctx, s.db, task)
+	if err != nil {
+		return out, err
+	}
+	out.HandlerProvision = handlerProvisionState(provision)
 	var attempts []api.TeamQueueEntry
 	if opts.Item != "" {
 		// Every attempt of the item, newest first, each in full.
@@ -1311,6 +1332,35 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, State: "settings", Revision: int64(req.ConcurrencyLimit)}
+		if (req.ConcurrencyLimit == 0 && current != 0) || (current > 0 && req.ConcurrencyLimit > current) {
+			// The limit is saved either way; the warning says what the extra
+			// teams will wait for (docs/project-queue.md, "Handlers and the limit").
+			if e.Warning, err = handlerLimitWarning(ctx, tx, task, req.ConcurrencyLimit); err != nil {
+				return zero, err
+			}
+		}
+	case "set_handler_provision":
+		if req.HandlerProvision != api.HandlerProvisionOn && req.HandlerProvision != api.HandlerProvisionOff {
+			return zero, api.ErrInvalid
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_settings(task_id,handler_provision) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET handler_provision=excluded.handler_provision`, task, req.HandlerProvision == api.HandlerProvisionOn); err != nil {
+			return zero, err
+		}
+		e = api.TeamQueueEntry{TaskID: task, State: "settings"}
+	case "provision_handler":
+		var refusal error
+		if e, refusal, err = s.provisionHandler(ctx, tx, t, req); err != nil {
+			return zero, err
+		}
+		if refusal != nil {
+			// The refused row is the entry's standing reason, so it is kept
+			// although the request fails.
+			if err := tx.Commit(); err != nil {
+				return zero, err
+			}
+			s.notify(task)
+			return zero, refusal
+		}
 	case "manual_release":
 		if !api.ValidID(req.ItemID, "wi") || req.OrderMessageSeq < 1 || req.ReservationToken != fmt.Sprintf("manual-%s-%s-%d", task, req.ItemID, req.OrderMessageSeq) || t.Orchestrator != "" || t.CleanupPending != 0 {
 			return zero, api.ErrConflict
@@ -1857,6 +1907,12 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 					return zero, err
 				}
 				e.HandlerArm = armLease
+			}
+			if err := settleHandlerProvisions(ctx, tx, task, s.now()); err != nil {
+				return zero, err
+			}
+			if err := clearHandlerProvisionRefusal(ctx, tx, e.ID); err != nil {
+				return zero, err
 			}
 		case "freeze":
 			if e.State != "launching" || len(e.LaunchJSON) != 0 || !json.Valid(req.LaunchJSON) || len(req.LaunchJSON) == 0 {
