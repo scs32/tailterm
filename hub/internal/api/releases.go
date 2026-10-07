@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -618,12 +619,46 @@ func (c *Client) compatibilityPage(ctx context.Context, task string, opts Releas
 
 func (c *Client) CompatibilityReleasesPage(ctx context.Context, task string, opts ReleaseListOptions) (ReleasePage, error) {
 	page, _, err := c.compatibilityPage(ctx, task, opts)
+	// A caller paging with its own snapshot sees the plain refusal, as before.
+	var stale *staleReleaseSnapshotError
+	if errors.As(err, &stale) {
+		err = stale.HTTPError
+	}
 	return page, err
+}
+
+// staleReleaseSnapshotError marks the hub's 409 "stale list snapshot": the
+// ledger changed after the token was issued. It reads as its HTTPError.
+type staleReleaseSnapshotError struct{ *HTTPError }
+
+func (e *staleReleaseSnapshotError) Unwrap() error { return e.HTTPError }
+
+// compatibilityLedgerAttempts bounds whole-ledger reads under ledger churn.
+const compatibilityLedgerAttempts = 3
+
+// A stale snapshot means only that a job changed between two requests of one
+// read, which is routine while releases move. Each attempt starts again from a
+// first page with no token and shares nothing with the attempt before it, so
+// the result is always one snapshot. No other failure is retried.
+func (c *Client) compatibilityLedger(ctx context.Context, task, onlyID string) ([]ReleaseJob, error) {
+	for attempt := 1; ; attempt++ {
+		out, err := c.compatibilityLedgerOnce(ctx, task, onlyID)
+		var stale *staleReleaseSnapshotError
+		if !errors.As(err, &stale) {
+			return out, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if attempt == compatibilityLedgerAttempts {
+			return nil, fmt.Errorf("release list kept changing: stale list snapshot on each of %d attempts: %w", attempt, err)
+		}
+	}
 }
 
 // Traverse both views under one token, then hydrate full detail before exposing
 // any flat output. The final same-token bookend also catches detail-time races.
-func (c *Client) compatibilityLedger(ctx context.Context, task, onlyID string) ([]ReleaseJob, error) {
+func (c *Client) compatibilityLedgerOnce(ctx context.Context, task, onlyID string) ([]ReleaseJob, error) {
 	summaries := []ReleaseSummary{}
 	seenIDs := map[string]bool{}
 	rows := map[int64]bool{}
@@ -741,7 +776,12 @@ func (c *Client) compatibilityRead(ctx context.Context, path string, out any) er
 		return fmt.Errorf("hub response exceeds %d bytes", defaultMaxResponseBytes)
 	}
 	if response.StatusCode != http.StatusOK {
-		return &HTTPError{Status: response.StatusCode, Msg: "deployment compatibility read refused"}
+		refused := &HTTPError{Status: response.StatusCode, Msg: "deployment compatibility read refused"}
+		var body ErrorResponse
+		if response.StatusCode == http.StatusConflict && json.Unmarshal(data, &body) == nil && strings.HasSuffix(body.Error, "release: stale list snapshot") {
+			return &staleReleaseSnapshotError{refused}
+		}
+		return refused
 	}
 	return json.Unmarshal(data, out)
 }
