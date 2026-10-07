@@ -53,7 +53,11 @@ try {
 }
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
-const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><main id="projects"></main><script type="module">
+// The scroll variant differs only in layout and transport: the real rules that
+// make the Projects detail and rail scroll are scoped to #mode-view, the rail
+// lists enough projects to overflow, and subscribe keeps its callback so the
+// test can deliver a hub message the way production does.
+const fixturePage = (scroll) => `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body${scroll ? ' data-mode="tasks"' : ""}>${scroll ? '<main id="mode-view" style="height:600px"></main>' : '<main id="projects"></main>'}<script type="module">
 import {createTasksView} from '/client/tasks-view.js';
 const open={id:'tsk_1111111111111111',name:'Open synthetic',status:'open',goal:'Fixture only',createdAt:'2026-09-27T00:00:00Z',pauseState:'active',lifecycleGeneration:0};
 const closed={...open,id:'tsk_2222222222222222',name:'Closed synthetic',status:'closed'};
@@ -64,9 +68,12 @@ const time={wallMs:'3600000',from:'2026-01-01T10:00:00Z',to:'2026-01-01T11:00:00
 const waitingOnly={...time,wallMs:'600000',modelMs:'0',toolMs:'0',waitingMs:'600000',phases:[split('waiting only',0,0,600000)],roles:[],timeline:{modelMs:'0',toolsOnlyMs:'0',idleMs:'600000',unmeasuredMs:'0'},waits:[],polls:0,pollMs:'0'};
 const report={version:1,timeVersion:1,projectId:open.id,priceRevision:0,summary:summary(4,3),items:[{...item('wi_1111111111111111','Low',1),time:waitingOnly},{...item('wi_2222222222222222','High',2),time},item('wi_3333333333333333','Not measured',null,0),item('wi_4444444444444444','<b>Unknown model</b>',10,1,false)],overhead:item('','Project overhead',null)};
 let prices={revision:0,rows:[]};window.calls=[];window.pending=[];window.delay=false;window.offline=false;window.oldHub=false;
-const client={listTasks:async()=>[open,closed],getTask:async id=>({task:id===open.id?open:closed,agents:[]}),listTeamDelivery:async()=>({entries:[],concurrencyLimit:1}),listOwnerObligations:async()=>[],capabilities:async()=>({}),subscribe:()=>({stop(){}}),cacheStatus:()=>({label:window.offline?'Saved data · offline':''}),getUsage:async(id,filters)=>{window.calls.push({id,filters});if(window.oldHub){const error=new Error('missing');error.status=404;throw error;}const data=structuredClone({...report,projectId:id});if(window.delay)return await new Promise(resolve=>window.pending.push(()=>resolve(data)));return data;},getUsagePrices:async()=>structuredClone(prices),setUsagePrices:async(id,body)=>{if(body.expectedRevision!==prices.revision){const e=new Error('conflict');e.status=409;throw e;}prices={revision:prices.revision+1,rows:body.rows};return structuredClone(prices);}};
-window.fixture={client,report,prices:()=>prices};
-const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>false,groupOf:()=>null},getTabs:()=>[],activate:()=>{},notice:()=>{},confirm:async()=>true,openBoard:()=>{},openWorkItems:()=>{},configure:()=>{}});view.mount(document.querySelector('#projects'));window.ready=view.show();window.reload=()=>view.reload();
+const scroll=${scroll ? "true" : "false"};
+const fillers=scroll?Array.from({length:40},(_,i)=>({...open,id:'tsk_'+String(i+10).padStart(16,'0'),name:'Filler '+i})):[];
+const team=scroll?Array.from({length:12},(_,i)=>({id:'agt_'+String(i+10).padStart(16,'0'),name:'member-'+i,status:'running',host:'fixture',session:'s'+i,activity:{},createdAt:'2026-09-27T00:00:00Z'})):[];
+const client={listTasks:async()=>[...fillers,open,closed],getTask:async id=>({task:id===open.id?open:id===closed.id?closed:fillers.find(t=>t.id===id),agents:id===open.id?team:[]}),listTeamDelivery:async()=>({entries:[],concurrencyLimit:1}),listOwnerObligations:async()=>[],capabilities:async()=>({}),subscribe:(_id,cb)=>{window.push=cb;return{stop(){}}},cacheStatus:()=>({label:window.offline?'Saved data · offline':''}),getUsage:async(id,filters)=>{window.calls.push({id,filters});if(window.oldHub){const error=new Error('missing');error.status=404;throw error;}const data=structuredClone({...report,projectId:id});if(window.delay)return await new Promise(resolve=>window.pending.push(()=>resolve(data)));return data;},getUsagePrices:async()=>structuredClone(prices),setUsagePrices:async(id,body)=>{if(body.expectedRevision!==prices.revision){const e=new Error('conflict');e.status=409;throw e;}prices={revision:prices.revision+1,rows:body.rows};return structuredClone(prices);}};
+window.fixture={client,report,open,prices:()=>prices};
+const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>false,groupOf:()=>null},getTabs:()=>[],activate:()=>{},notice:()=>{},confirm:async()=>true,openBoard:()=>{},openWorkItems:()=>{},configure:()=>{}});view.mount(document.querySelector(scroll?'#mode-view':'#projects'));window.ready=view.show();window.reload=()=>view.reload();
 </script></body></html>`;
 const vite = await createServer({
   configFile: false,
@@ -76,9 +83,9 @@ const vite = await createServer({
     {
       name: "usage-fixture",
       configureServer(s) {
-        s.middlewares.use("/usage-test", (_req, res) => {
+        s.middlewares.use("/usage-test", (req, res) => {
           res.setHeader("Content-Type", "text/html");
-          res.end(html);
+          res.end(fixturePage(/[?&]scroll=1/.test(req.url || "")));
         });
       },
     },
@@ -86,8 +93,175 @@ const vite = await createServer({
 });
 await vite.listen();
 const origin = "http://127.0.0.1:" + vite.httpServer.address().port;
+// A refresh of the Projects view must leave every scrolled container where the
+// user left it. Its own pages keep the fake clock away from the checks above.
+async function scrollSection(browser, name) {
+  const context = await browser.newContext({
+    viewport: { width: 1200, height: 900 },
+  });
+  await context.route("**/*", (r) =>
+    new URL(r.request().url()).origin === origin ? r.continue() : r.abort(),
+  );
+  const errors = [];
+  const start = Date.parse("2026-09-27T12:00:00Z");
+  // The Projects clock is created in show(), so the fake clock is installed
+  // before the page loads; paused, only the test moves time.
+  const openPage = async () => {
+    const page = await context.newPage();
+    page.on("pageerror", (e) => errors.push(e.message));
+    await page.clock.install({ time: start });
+    await page.goto(origin + "/usage-test?scroll=1");
+    await page.clock.pauseAt(start + 1000);
+    await page.evaluate(() => window.ready);
+    await page.locator("[data-usage-disclosure]").waitFor();
+    return page;
+  };
+  const positions = (page) =>
+    page.evaluate(() => ({
+      detail: document.querySelector(".tasks-detail").scrollTop,
+      rail: document.querySelector(".board-rail").scrollTop,
+    }));
+  // Every refresh the page can receive: the 30 s clock, a hub message through
+  // the subscription, and a direct reload. Each settles its queued repaints.
+  const refreshes = {
+    "the 30 s clock tick": (page) => page.clock.fastForward(30001),
+    "a pushed hub message": (page) => page.evaluate(() => window.push({})),
+    "a reload": (page) => page.evaluate(() => window.reload()),
+  };
+  const settle = async (page) => {
+    await page.clock.runFor(5);
+    await page.evaluate(() => 0);
+  };
+  const near = (actual, expected, what) =>
+    assert.ok(
+      Math.abs(actual.detail - expected.detail) <= 1 &&
+        Math.abs(actual.rail - expected.rail) <= 1,
+      `${name}: ${what}: scrollTop ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`,
+    );
+
+  const page = await openPage();
+  await page.locator("[data-usage-disclosure] > summary").click();
+  const item = page.locator("[data-usage-item]").first();
+  await item.waitFor();
+  await item.locator(":scope > summary").click();
+  await item.locator("[data-usage-group]").first().locator(":scope > summary").click();
+  const scroller = await page.evaluate(() => {
+    const detail = document.querySelector(".tasks-detail");
+    const rail = document.querySelector(".board-rail");
+    return {
+      detailOverflow: getComputedStyle(detail).overflowY,
+      detailRoom: detail.scrollHeight - detail.clientHeight,
+      railOverflow: getComputedStyle(rail).overflowY,
+      railRoom: rail.scrollHeight - rail.clientHeight,
+      page: document.scrollingElement.scrollHeight - window.innerHeight,
+    };
+  });
+  assert.equal(scroller.detailOverflow, "auto", JSON.stringify(scroller));
+  assert.equal(scroller.railOverflow, "auto", JSON.stringify(scroller));
+  assert.ok(scroller.detailRoom > 200, JSON.stringify(scroller));
+  assert.ok(scroller.railRoom > 200, JSON.stringify(scroller));
+  assert.ok(scroller.page <= 0, JSON.stringify(scroller));
+  // Bring the Usage summary to the top of the detail section.
+  await page.evaluate(() => {
+    const detail = document.querySelector(".tasks-detail");
+    const usage = document.querySelector("[data-usage-disclosure]");
+    detail.scrollTop +=
+      usage.getBoundingClientRect().top - detail.getBoundingClientRect().top;
+    document.querySelector(".board-rail").scrollTop = 150;
+  });
+  const scrolled = await positions(page);
+  assert.ok(scrolled.detail > 0 && scrolled.rail > 0, JSON.stringify(scrolled));
+  for (const [what, refresh] of Object.entries(refreshes)) {
+    const goal = "Goal changed before " + what;
+    await page.evaluate((text) => {
+      window.fixture.open.goal = text;
+      document.querySelector(".tasks-detail").dataset.stale = "1";
+    }, goal);
+    await refresh(page);
+    await settle(page);
+    const after = await page.evaluate(() => ({
+      rebuilt: !document.querySelector(".tasks-detail").dataset.stale,
+      head: document.querySelector(".tasks-detail .board-head").textContent,
+      usage: document.querySelector("[data-usage-disclosure]").open,
+      item: document.querySelector("[data-usage-item]").open,
+      group: document.querySelector("[data-usage-item] [data-usage-group]").open,
+    }));
+    assert.equal(after.rebuilt, true, `${name}: no rebuild after ${what}`);
+    near(await positions(page), scrolled, "after " + what);
+    assert.ok(after.head.includes(goal), `${name}: stale after ${what}: ${after.head}`);
+    assert.deepEqual(
+      { usage: after.usage, item: after.item, group: after.group },
+      { usage: true, item: true, group: true },
+      `${name}: disclosures after ${what}`,
+    );
+  }
+  // A refresh during a wheel gesture over the detail section waits for the
+  // gesture to go idle, so the element under the gesture is not replaced.
+  const held = await page.evaluate(async () => {
+    const detail = document.querySelector(".tasks-detail");
+    window.heldDetail = detail;
+    window.fixture.open.goal = "Goal changed during a wheel gesture";
+    detail
+      .querySelector("[data-usage-disclosure]")
+      .dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 40 }));
+    detail.scrollTop += 40;
+    await window.reload();
+    return {
+      connected: detail.isConnected,
+      head: detail.querySelector(".board-head").textContent,
+      detail: detail.scrollTop,
+      rail: document.querySelector(".board-rail").scrollTop,
+    };
+  });
+  await page.clock.runFor(100);
+  assert.equal(
+    await page.evaluate(() => window.heldDetail.isConnected),
+    true,
+    `${name}: the detail section was replaced during a wheel gesture`,
+  );
+  assert.equal(held.connected, true);
+  assert.doesNotMatch(held.head, /during a wheel gesture/);
+  await page.clock.runFor(200);
+  await settle(page);
+  assert.deepEqual(
+    await page.evaluate(() => ({
+      connected: window.heldDetail.isConnected,
+      shown: document
+        .querySelector(".tasks-detail .board-head")
+        .textContent.includes("Goal changed during a wheel gesture"),
+    })),
+    { connected: false, shown: true },
+    `${name}: the held refresh was not shown once the gesture went idle`,
+  );
+  near(await positions(page), held, "after the held refresh");
+  await page.close();
+
+  // A page that was never scrolled stays at the top.
+  const top = await openPage();
+  for (const [what, refresh] of Object.entries(refreshes)) {
+    await refresh(top);
+    await settle(top);
+    assert.deepEqual(
+      await positions(top),
+      { detail: 0, rail: 0 },
+      `${name}: an unscrolled page moved after ${what}`,
+    );
+  }
+  assert.deepEqual(errors, []);
+  await context.close();
+  console.log(
+    name +
+      ": Projects scroll kept across clock, hub message and reload; disclosures, fresh content, wheel hold and top-of-page checks pass",
+  );
+}
 try {
-  for (const engine of [chromium, webkit]) {
+  // USAGE_ENGINE=chromium|webkit runs one engine; the default runs both.
+  const engines = [chromium, webkit].filter(
+    (engine) =>
+      !process.env.USAGE_ENGINE || process.env.USAGE_ENGINE === engine.name(),
+  );
+  assert.ok(engines.length, "USAGE_ENGINE must be chromium or webkit");
+  for (const engine of engines) {
     const browser = await engine.launch();
     try {
       const context = await browser.newContext({
@@ -458,6 +632,7 @@ try {
         engine.name() +
           ": Usage project integration, cost order, time, waits, editor, stale/offline/closed/focus/narrow checks pass",
       );
+      await scrollSection(browser, engine.name());
     } finally {
       await browser.close();
     }

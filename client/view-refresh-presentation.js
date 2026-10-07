@@ -3,6 +3,8 @@ const INTERACTIVE_POINTER_TARGET =
 const TEXT_ENTRY_TARGET =
   'textarea, input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]), [contenteditable="true"]';
 const TEXT_INTERACTION_IDLE_MS = 120;
+const SCROLL_CONTAINER = "[data-view-scroll]";
+const SCROLL_GESTURE_IDLE_MS = 150;
 
 export const shouldReleaseViewPointer = (activePointer, event) =>
   activePointer !== null &&
@@ -21,6 +23,9 @@ export const disclosureStateKey = (context, name) =>
 // finish against the DOM that started them. This boundary coalesces repaints
 // while a native select/popover or pointer gesture is active and remembers the
 // manual state of explicitly keyed disclosures across ordinary refreshes.
+// Containers a view marks with data-view-scroll keep their scroll offsets
+// across one repaint, and a wheel or touch scroll over one holds the repaint
+// until the gesture is idle. Unmarked views are left exactly as they were.
 export function createViewRefreshPresentation({ render }) {
   let root = null;
   let pointer = null;
@@ -31,11 +36,13 @@ export function createViewRefreshPresentation({ render }) {
   let textEntry = null;
   let composingTextEntry = null;
   let textEntryTimer = null;
+  let scrollGestureTimer = null;
   let queued = false;
   let scheduled = false;
   let renderedContext = "";
   let focusKey = "";
   const disclosure = new Map();
+  const scrollOffsets = new Map();
 
   function openPopover() {
     try {
@@ -54,6 +61,7 @@ export function createViewRefreshPresentation({ render }) {
       Boolean(nativeSelect?.isConnected) ||
       textEntry !== null ||
       composingTextEntry !== null ||
+      scrollGestureTimer !== null ||
       Boolean(openPopover())
     );
   }
@@ -77,6 +85,51 @@ export function createViewRefreshPresentation({ render }) {
     textEntry = target;
     clearTimeout(textEntryTimer);
     textEntryTimer = setTimeout(releaseTextEntry, TEXT_INTERACTION_IDLE_MS);
+  }
+
+  function releaseScrollGesture() {
+    scrollGestureTimer = null;
+    scheduleFlush();
+  }
+
+  function clearScrollGesture() {
+    clearTimeout(scrollGestureTimer);
+    scrollGestureTimer = null;
+  }
+
+  // Only the user's own wheel and touch events extend the hold, so hub
+  // traffic cannot starve a refresh.
+  function onScrollGesture(event) {
+    if (!event.target?.closest?.(SCROLL_CONTAINER)) return;
+    clearTimeout(scrollGestureTimer);
+    scrollGestureTimer = setTimeout(
+      releaseScrollGesture,
+      SCROLL_GESTURE_IDLE_MS,
+    );
+  }
+
+  function captureScroll() {
+    scrollOffsets.clear();
+    root?.querySelectorAll?.(SCROLL_CONTAINER).forEach((node) => {
+      if (!node.scrollTop && !node.scrollLeft) return;
+      scrollOffsets.set(
+        disclosureStateKey(renderedContext, node.dataset.viewScroll),
+        { top: node.scrollTop, left: node.scrollLeft },
+      );
+    });
+  }
+
+  function restoreScroll() {
+    if (!scrollOffsets.size) return;
+    root?.querySelectorAll?.(SCROLL_CONTAINER).forEach((node) => {
+      const saved = scrollOffsets.get(
+        disclosureStateKey(renderedContext, node.dataset.viewScroll),
+      );
+      if (!saved) return;
+      node.scrollTop = saved.top;
+      node.scrollLeft = saved.left;
+    });
+    scrollOffsets.clear();
   }
 
   function captureDisclosure() {
@@ -236,7 +289,11 @@ export function createViewRefreshPresentation({ render }) {
     root?.removeEventListener?.("input", onInput);
     root?.removeEventListener?.("compositionstart", onCompositionStart);
     root?.removeEventListener?.("compositionend", onCompositionEnd);
+    root?.removeEventListener?.("wheel", onScrollGesture);
+    root?.removeEventListener?.("touchmove", onScrollGesture);
     clearTextEntry();
+    clearScrollGesture();
+    scrollOffsets.clear();
     root = container;
     root?.addEventListener?.("pointerdown", onPointerDown);
     root?.addEventListener?.("keydown", onKeyDown);
@@ -246,6 +303,8 @@ export function createViewRefreshPresentation({ render }) {
     root?.addEventListener?.("input", onInput);
     root?.addEventListener?.("compositionstart", onCompositionStart);
     root?.addEventListener?.("compositionend", onCompositionEnd);
+    root?.addEventListener?.("wheel", onScrollGesture, { passive: true });
+    root?.addEventListener?.("touchmove", onScrollGesture, { passive: true });
   }
 
   function beforeRender(context) {
@@ -254,6 +313,7 @@ export function createViewRefreshPresentation({ render }) {
       return false;
     }
     captureDisclosure();
+    captureScroll();
     const active = globalThis.document?.activeElement;
     focusKey =
       root?.contains?.(active) && active?.dataset?.viewControl
@@ -275,6 +335,9 @@ export function createViewRefreshPresentation({ render }) {
         if (disclosure.has(key)) node.open = disclosure.get(key);
         node.ontoggle = () => disclosure.set(key, node.open);
       });
+    // Reopened disclosures give the content its height first; the focus
+    // restore below does not scroll.
+    restoreScroll();
     if (focusKey) {
       const key = focusKey.replaceAll('"', '\\"');
       root
@@ -309,6 +372,8 @@ export function createViewRefreshPresentation({ render }) {
     nativeSelect = null;
     nativeSelectWatch++;
     clearTextEntry();
+    clearScrollGesture();
+    scrollOffsets.clear();
     queued = false;
     scheduled = false;
     focusKey = "";
