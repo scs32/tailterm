@@ -53,6 +53,11 @@ var (
 	// handoffAccessHook sees every path this file opens, lists, creates or
 	// renames. Tests use it to fail on a path outside their temporary root.
 	handoffAccessHook func(path string)
+	// handoffWorker is closed when the latest hook call's worker goroutine
+	// has finished. The handler returns at its deadline whether or not the
+	// worker has; a test waits here before it changes anything above, so
+	// that an abandoned worker is never still reading it.
+	handoffWorker <-chan struct{}
 )
 
 const (
@@ -994,6 +999,7 @@ func handoffHook(e env, _ []string) {
 	}
 	run := handoffHookRun{started: time.Now(), deadline: handoffDeadline, in: os.Stdin, out: os.Stdout}
 	done := make(chan struct{})
+	handoffWorker = done
 	go func() {
 		defer close(done)
 		defer func() { _ = recover() }()

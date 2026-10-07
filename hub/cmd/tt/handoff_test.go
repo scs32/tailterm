@@ -109,6 +109,28 @@ type handoffBox struct {
 	now     time.Time
 	mu      sync.Mutex
 	outside []string
+	release []func() // what lets a worker the hook abandoned finish, such as closing its stdin
+}
+
+// settle waits for the worker goroutine of the last hook call to finish. The
+// hook returns at its deadline and may leave its worker running; the worker
+// reads the package's test seams, so nothing may restore them, and no other
+// hook may run, until it is done. The wait is on the worker's own completion
+// signal, not on a sleep.
+func (b *handoffBox) settle() {
+	b.t.Helper()
+	for _, release := range b.release {
+		release()
+	}
+	b.release = nil
+	if handoffWorker == nil {
+		return
+	}
+	select {
+	case <-handoffWorker:
+	case <-time.After(30 * time.Second):
+		b.t.Fatal("the hook's worker goroutine did not finish")
+	}
 }
 
 func newHandoffBox(t *testing.T) *handoffBox {
@@ -262,7 +284,17 @@ func init() {
 
 func (b *handoffBox) hook(event, session string, fields map[string]any) toolHookRun {
 	b.t.Helper()
-	return runToolHook(b.t, b.e, "handoff", handoffPayload(event, session, fields), nil)
+	return b.hookRaw(handoffPayload(event, session, fields), nil)
+}
+
+// hookRaw runs the hook on a payload or a stdin file, then waits for its
+// worker, so that every hook call in these tests has fully ended before the
+// test goes on.
+func (b *handoffBox) hookRaw(payload string, stdin *os.File) toolHookRun {
+	b.t.Helper()
+	r := runToolHook(b.t, b.e, "handoff", payload, stdin)
+	b.settle()
+	return r
 }
 
 // quiet runs a hook that must succeed and print nothing.
@@ -454,6 +486,7 @@ func TestHandoffHookBound(t *testing.T) {
 				b.t.Fatal(err)
 			}
 			b.t.Cleanup(func() { w.Close(); r.Close() })
+			b.release = append(b.release, func() { w.Close() }) // after the hook has returned
 			_, _ = w.WriteString(payload[:len(payload)/2])
 			return r
 		},
@@ -514,7 +547,7 @@ func TestHandoffHookBound(t *testing.T) {
 							session = handoffOtherID
 						}
 						payload := handoffPayload(ev.event, session, ev.extra)
-						last = runToolHook(t, b.e, "handoff", payload, arrange(b, payload))
+						last = b.hookRaw(payload, arrange(b, payload))
 						if last.err != nil {
 							t.Fatalf("hook = %v", last.err)
 						}
@@ -526,7 +559,6 @@ func TestHandoffHookBound(t *testing.T) {
 							if last.out != "" {
 								t.Fatalf("printed %q for a session it could not identify", last.out)
 							}
-							time.Sleep(handoffDeadline) // let the abandoned goroutine finish before the box goes
 						}
 					})
 					if last.elapsed <= handoffBound {
@@ -676,7 +708,11 @@ func TestHandoffHookLate(t *testing.T) {
 			if r.err != nil || r.out != want || r.elapsed > handoffBound {
 				t.Fatalf("late hook = %+v; want %q", r, want)
 			}
-			time.Sleep(300 * time.Millisecond)
+			// hook has waited for the worker: it ran on past the deadline, saw
+			// that it was late, and wrote nothing.
+			if !slept.Load() {
+				t.Fatal("the stall was not reached")
+			}
 			if data := b.bytes("record.json"); data != nil {
 				t.Fatalf("a late hook wrote the record: %s", data)
 			}
@@ -844,7 +880,7 @@ func TestHandoffHookSilentOnCompactAndEnd(t *testing.T) {
 				if payload != nil {
 					text = payload(ev.event, ev.extra)
 				}
-				if r := runToolHook(t, b.e, "handoff", text, nil); r.err != nil || r.out != "" || r.elapsed > handoffBound {
+				if r := b.hookRaw(text, nil); r.err != nil || r.out != "" || r.elapsed > handoffBound {
 					t.Fatalf("%s = %v, output %q, %s; want nil, silent, inside the bound", ev.event, r.err, r.out, r.elapsed)
 				}
 			}
@@ -868,7 +904,7 @@ func TestHandoffHookIgnoresAgentsAndStrangers(t *testing.T) {
 			}
 			_, _ = w.WriteString(handoffPayload(ev.event, b.helper.Thread, ev.extra))
 			w.Close()
-			if run := runToolHook(t, b.e, "handoff", "", r); run.err != nil || run.out != "" || run.elapsed > handoffBound {
+			if run := b.hookRaw("", r); run.err != nil || run.out != "" || run.elapsed > handoffBound {
 				t.Fatalf("agent %s = %+v", ev.event, run)
 			}
 			var left bytes.Buffer
