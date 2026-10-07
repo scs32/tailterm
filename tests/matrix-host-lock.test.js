@@ -1490,6 +1490,52 @@ test("M7 a hold journals one memory-hold and the sidecar records it, with the tw
   gauge.reading = 30; const next = await twice; assert.equal(journaled(path, "memory-hold").length, 2);
   await again.release(); await next.release();
 });
+// wi_b5c33753fe4ae9fb / order 27946 / ASSIGN 27967: without the release marker
+// the run command starts its run detached and only follows it, so killing the
+// command leaves the run and its check behind when a test fails. A started
+// command is therefore stopped whole: every matrix runner naming its output
+// directory, their descendants and any group still on its lock file get
+// SIGTERM, which lets a run stop its check, remove its home and release, then
+// SIGKILL for whatever is left.
+const RUN_COMMAND_STOP_MS = 20000, RUN_COMMAND_KILL_MS = 10000;
+const processTable = () => execFileSync("ps", ["-Aww", "-o", "pid=,ppid=,pgid=,args="], { encoding: "utf8" }).split("\n")
+  .map(line => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line)).filter(Boolean).map(([, pid, ppid, pgid, args]) => ({ pid: +pid, ppid: +ppid, pgid: +pgid, args }));
+async function stopRunCommand({ output, lock }) {
+  if (!output) return { pids: [], forced: [], ms: 0 };
+  const began = Date.now(), table = processTable();
+  const runners = table.filter(p => p.args.includes("verify-matrix.mjs") && p.args.includes(output)).map(p => p.pid);
+  const found = new Set([...runners, ...(existsSync(lock) ? allHeld(lock).flatMap(h => h.groups || []) : [])]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const p of table) if (!found.has(p.pid) && (found.has(p.ppid) || found.has(p.pgid))) { found.add(p.pid); grew = true; }
+  }
+  const pids = table.filter(p => found.has(p.pid)).map(p => p.pid), alive = () => pids.filter(pid => !pidGone(pid));
+  const gone = async ms => { for (const end = Date.now() + ms; alive().length && Date.now() < end; ) await new Promise(resolve => setTimeout(resolve, 20)); return alive(); };
+  for (const pid of runners) kill(pid, "SIGTERM");
+  const forced = await gone(RUN_COMMAND_STOP_MS);
+  for (const pid of forced) kill(pid);
+  const left = await gone(RUN_COMMAND_KILL_MS);
+  assert.deepEqual(left, [], "the run command's processes are stopped");
+  return { pids, forced, ms: Date.now() - began };
+}
+// The real run command against a private lock file. Its stop is registered
+// before its directories, so it runs first and the run can still clean up.
+// The command carries no agent identity: a run stopped while it still waits
+// would otherwise report its withdrawal to the live task.
+function runCommand(t, source, marker) {
+  const run = {};
+  t.after(async () => {
+    const stopped = await stopRunCommand(run);
+    if (stopped.pids.length) console.log(JSON.stringify({ runCommandStopped: stopped }));
+  });
+  const fixture = runnerFixture(t, source), lock = lockFile(t), planFile = join(tempDir(t), "plan.json"), output = tempDir(t, "matrix-host-lock-logs-");
+  writeFileSync(planFile, JSON.stringify(fixture.plan));
+  Object.assign(run, { output, lock });
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../scripts/verify-matrix.mjs", import.meta.url)), "run", planFile, output, "--priority", "normal", "--min-free-bytes", "0"],
+    { cwd: fixture.cwd, env: { ...process.env, TAILTERM_AGENT: undefined, TAILTERM_AGENT_NAME: undefined, TAILTERM_TASK: undefined, TAILTERM_MATRIX_HOST_LOCK: lock, TAILTERM_MATRIX_MAX_HOLDERS: "2", ...(marker === undefined ? {} : { TAILTERM_MATRIX_RELEASE: marker }) }, stdio: ["ignore", "pipe", "pipe"] });
+  let said = ""; child.stdout.on("data", d => (said += d)); child.stderr.on("data", d => (said += d));
+  return Object.assign(run, { child, text: () => said });
+}
 test("M8 a waiting release run sorts first and takes the single slot, fairness counts unchanged, and run mode passes the marker", async t => {
   const path = lockFile(t), gauge = meter(90), order = [];
   const joins = (item, extra) => asks(path, gauge, { item, ...extra }).then(lease => (order.push(item), lease));
@@ -1535,15 +1581,7 @@ test("M8 a waiting release run sorts first and takes the single slot, fairness c
   await until(() => allHeld(runPath).length === 1, "the marked run to hold");
   assert.deepEqual([allHeld(runPath)[0].kind, allHeld(runPath)[0].release], ["run", true]);
   writeFileSync(done, ""); await running; rmSync(done);
-  const viaCommand = async (marker) => {
-    const fixture = runnerFixture(t, source), lock = lockFile(t), planFile = join(tempDir(t), "plan.json"), output = tempDir(t, "matrix-host-lock-logs-");
-    writeFileSync(planFile, JSON.stringify(fixture.plan));
-    const child = spawn(process.execPath, [fileURLToPath(new URL("../scripts/verify-matrix.mjs", import.meta.url)), "run", planFile, output, "--priority", "normal", "--min-free-bytes", "0"],
-      { cwd: fixture.cwd, env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: lock, TAILTERM_MATRIX_MAX_HOLDERS: "2", ...(marker === undefined ? {} : { TAILTERM_MATRIX_RELEASE: marker }) }, stdio: ["ignore", "pipe", "pipe"] });
-    let said = ""; child.stdout.on("data", d => (said += d)); child.stderr.on("data", d => (said += d));
-    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
-    return { child, lock, text: () => said };
-  };
+  const viaCommand = (marker) => runCommand(t, source, marker);
   const marked = await viaCommand("1");
   await until(() => allHeld(marked.lock).length === 1 || marked.child.exitCode !== null, "the run command to hold");
   assert.equal(allHeld(marked.lock)[0]?.release, true, marked.text());
@@ -1555,6 +1593,27 @@ test("M8 a waiting release run sorts first and takes the single slot, fairness c
   const refused = await viaCommand("yes"); await exited(refused.child);
   assert.notEqual(refused.child.exitCode, 0); assert.match(refused.text(), /TAILTERM_MATRIX_RELEASE must be 1 or unset/);
   assert(!existsSync(refused.lock), "refused before joining the list");
+});
+test("M8 stopping a started run command, as a failed test's teardown does, ends the command, its run and the check and leaves no holder or home", async t => {
+  for (const marker of [undefined, "1"]) {
+    const mark = join(tempDir(t), "check.json");
+    const run = runCommand(t, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(mark + ".part")},JSON.stringify({pid:process.pid,home:process.env.HOME}));fs.renameSync(${JSON.stringify(mark + ".part")},${JSON.stringify(mark)});setInterval(()=>{},1000);`, marker);
+    await until(() => existsSync(mark) || run.child.exitCode !== null, "the run command's check to start");
+    assert(existsSync(mark), run.text());
+    const check = JSON.parse(readFileSync(mark, "utf8"));
+    const [holder] = await until(() => { const held = allHeld(run.lock); return held[0]?.groups?.length ? held : null; }, "the check's group to be on file");
+    // Unmarked, the command only follows the run it detached; marked, it is the run.
+    assert.equal(holder.pid === run.child.pid, marker === "1", run.text());
+    if (marker === undefined) assert.match(run.text(), new RegExp(`detached as pid ${holder.pid};`));
+    assert(existsSync(check.home), "the run's private home exists while it runs");
+    const stopped = await stopRunCommand(run);
+    for (const pid of [run.child.pid, holder.pid, check.pid]) { assert(stopped.pids.includes(pid), `pid ${pid} was found`); assert(pidGone(pid), `pid ${pid} is gone`); }
+    for (const group of holder.groups) assert(groupGone(group), `group ${group} is gone`);
+    assert(stopped.ms < 60000, `stopped in ${stopped.ms} ms`);
+    assert.deepEqual([allHeld(run.lock), waitersOf(run.lock)], [[], []], "no holder or waiter is left");
+    assert(!existsSync(check.home), "the run removed its private home");
+    console.log(JSON.stringify({ runCommandStop: { marker: marker ?? null, command: run.child.pid, run: holder.pid, check: check.pid, groups: holder.groups, home: check.home, ...stopped } }));
+  }
 });
 test("M9 the limit defaults to 70, accepts 1 to 99 and off, and a bad value refuses before any file is written", async t => {
   assert.equal(DEFAULT_MEMORY_PRESSURE_MAX, 70);
