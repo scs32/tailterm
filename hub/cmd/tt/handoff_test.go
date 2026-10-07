@@ -2455,25 +2455,28 @@ func (r *handoffLiveRun) exit() time.Duration {
 	return r.wait("the claude process to exit", 60*time.Second, func() bool { return len(handoffLiveExit.FindAllString(r.screen(), -1)) >= r.exits })
 }
 
-// dirty asks the model whether it was shown a hook error, and reports what
-// the pane shows of the hook when it says so. It does not stop the check: the
-// other runs are still worth measuring.
+// dirty asks the model whether it was shown a hook error. It only reports:
+// which runs may say yes is the caller's rule.
 func (r *handoffLiveRun) dirty() bool {
-	t := r.l.t
-	t.Helper()
-	answer := r.ask("Reply with one word only: DIRTY if your context contains any hook error, any hook timeout message, or any line with a seven-digit number; otherwise CLEAN.",
+	r.l.t.Helper()
+	answer := r.ask("Reply with one word only: DIRTY if your context contains any hook error, hook failure or hook cancellation message; otherwise CLEAN.",
 		regexp.MustCompile(`⏺ (CLEAN|DIRTY)\b`))
-	if strings.HasSuffix(answer, "CLEAN") {
-		return false
-	}
-	var lines []string
-	for _, line := range strings.Split(r.screen(), "\n") {
-		if line = strings.TrimSpace(line); strings.Contains(line, "failed") || strings.Contains(line, "cancelled") || strings.Contains(line, "error") || strings.Contains(line, r.failMark) {
-			lines = append(lines, strings.ReplaceAll(line, r.dir, "<run>"))
+	return !strings.HasSuffix(answer, "CLEAN")
+}
+
+// hookLines is what the pane shows of failed hooks: the text after each
+// "failed:", with the pane's line wrapping and spacing removed.
+func (r *handoffLiveRun) hookLines() []string {
+	var out []string
+	parts := strings.Split(strings.Join(strings.Fields(r.screen()), ""), "]failed:")
+	for i, part := range parts[1:] {
+		event := parts[i][strings.LastIndex(parts[i], "'")+1:]
+		if end := strings.IndexAny(part, "❯⏺✻─"); end >= 0 {
+			part = part[:end]
 		}
+		out = append(out, event+" failed:"+part)
 	}
-	t.Errorf("%s: the model reports a hook error in its context. The pane shows: %q", r.name, lines)
-	return true
+	return out
 }
 
 const handoffLiveOK = "Reply with OK only."
@@ -2583,16 +2586,24 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 	w.ask("Repeat the first line of the Tailterm session handoff note in your context, exactly, and nothing else. If there is none, reply NONE.",
 		regexp.MustCompile(`⏺ Tailterm session handoff\. Owner helper live-helper \(`+w.helper.Agent+`\)`))
 	t.Log("start: the note reached the model")
+	if w.dirty() {
+		t.Errorf("working run: the model reports a hook error after the start:\n%s", w.screen())
+	}
 
 	w.typeLine("/compact")
 	compactStart := time.Now()
-	w.capture(2, "PreCompact", "manual", "registered")
+	_, hookTook := w.capture(2, "PreCompact", "manual", "registered") // /compact to the end of its PreCompact hook
 	afterCompact, _ := w.capture(3, "SessionStart", "compact", "registered")
 	compactTook := time.Since(compactStart)
 	t.Logf("compact: PreCompact trigger manual, then SessionStart source compact; session id changed: %v", afterCompact.Session != w.thread)
 	w.ask("Repeat the second line of the Tailterm session handoff note in your context, exactly, and nothing else. If there is none, reply NONE.",
 		regexp.MustCompile(`⏺ The host file names this session as the owner helper\.`))
 	t.Log("compact: the note reached the model again")
+	// A working hook shows the model no hook error, on start or on compaction.
+	if lines := w.hookLines(); w.dirty() || len(lines) != 0 {
+		t.Errorf("working run: a working hook left a hook error after the compaction: %q\n%s", lines, w.screen())
+	}
+	t.Log("working hook: the model reported no hook error after the start or after the compaction")
 
 	w.wait("an idle prompt", 60*time.Second, w.ready)
 	w.typeLine("/clear")
@@ -2615,8 +2626,8 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 	w.exit()
 	w.capture(8, "SessionEnd", "", "candidate")
 	w.isolated(map[string]int{"SessionStart": 4, "PreCompact": 1, "SessionEnd": 3})
-	t.Logf("working run: prompt ready %s after launch, first reply %s after launch; compaction to its SessionStart %s; exit %s",
-		startTook.Round(100*time.Millisecond), replyTook.Round(100*time.Millisecond), compactTook.Round(100*time.Millisecond), exitTook.Round(100*time.Millisecond))
+	t.Logf("working run: prompt ready %s after launch, first reply %s after launch; /compact to the end of its PreCompact hook %s, to its SessionStart %s; exit %s",
+		startTook.Round(100*time.Millisecond), replyTook.Round(100*time.Millisecond), hookTook.Round(100*time.Millisecond), compactTook.Round(100*time.Millisecond), exitTook.Round(100*time.Millisecond))
 
 	// One hung or failing entry at a time. The other two entries work.
 	type abnormal struct{ name, event, mode string }
@@ -2638,6 +2649,7 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 		r.ask(handoffLiveOK, handoffLiveOKReply)
 		reply := time.Since(from)
 		measured, baseline, what := took, startTook, "prompt ready"
+		var compactFrom time.Time
 		captured := 0
 		if a.event != "SessionStart" {
 			captured++
@@ -2645,20 +2657,29 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 		}
 		if a.event == "PreCompact" {
 			r.typeLine("/compact")
-			from := time.Now()
+			compactFrom = time.Now()
 			captured++
 			r.capture(captured, "SessionStart", "compact", "registered")
-			measured, baseline, what = time.Since(from), compactTook, "compaction to its SessionStart"
+			measured, baseline, what = time.Since(compactFrom), compactTook, "compaction to its SessionStart"
 			ran["PreCompact"], ran["SessionStart"] = 1, 2
 		}
 		// The session carries on after the hung or failed entry. Whether the
 		// model was shown anything of it is asked while the session lives;
 		// for SessionEnd there is no later turn to ask in.
+		//
+		// A hung entry may leave at most the one line Claude Code itself
+		// prints when it cancels it, and nothing else. On Claude Code 2.1.293
+		// that line appears for PreCompact only. What a failing entry leaves
+		// is recorded, not judged: tt hook handoff never exits non-zero.
 		shown := "the session was over, so there was no turn to show it in"
 		if a.event != "SessionEnd" {
-			shown = "the model reported no hook error"
-			if r.dirty() {
-				shown = "THE MODEL REPORTED A HOOK ERROR IN ITS CONTEXT"
+			lines, dirty := r.hookLines(), r.dirty()
+			shown = fmt.Sprintf("the pane shows of the entry: %q; asked, the model reported a hook error: %v", lines, dirty)
+			if a.mode == handoffLiveHang {
+				cancelled := len(lines) == 1 && lines[0] == a.event+" failed:Hookcancelled"
+				if len(lines) > 1 || len(lines) == 1 && !cancelled || dirty && !cancelled {
+					t.Errorf("%s: a hung %s entry left more than the one line Claude Code prints when it cancels a hook: %q, model reported a hook error: %v\n%s", a.name, a.event, lines, dirty, r.screen())
+				}
 			}
 			if left := r.left(); left != "" {
 				t.Errorf("%s: a hook process is still running after the cut-off:\n%s", a.name, left)
@@ -2670,10 +2691,6 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 		} else {
 			captured++
 			r.capture(captured, "SessionEnd", "", "registered")
-		}
-		extra := measured - baseline
-		if a.mode == handoffLiveHang && extra > budget {
-			t.Errorf("%s: a hung %s held the session %s longer than the working run; the budget is %s", a.name, a.event, extra.Round(100*time.Millisecond), budget)
 		}
 		// The first reply is a model call, so its time varies by more than the
 		// hook does. It is recorded, and fails only when it is far out.
@@ -2688,7 +2705,7 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 		// one how long after its start Claude Code gave it up: the entry
 		// logs its start in whole seconds, the debug output dates the end.
 		var said []string
-		cutoff := "not measured"
+		cutoff, compaction := "not measured", ""
 		script := map[string]string{handoffLiveHang: "hung.sh", handoffLiveFail: "failing.sh"}[a.mode]
 		for i := 1; i <= r.debugs; i++ {
 			for _, line := range strings.Split(r.read(fmt.Sprintf("debug-%d.log", i)), "\n") {
@@ -2706,12 +2723,24 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 				if err != nil {
 					continue
 				}
+				if a.event == "PreCompact" {
+					// The summary a compaction writes takes 15 to 25 seconds and
+					// varies by more than the cut-off, so the whole compaction
+					// cannot show what the hook cost. What the hook holds is
+					// the time from /compact to the end of the hook.
+					compaction = fmt.Sprintf("; the whole compaction took %s against %s", measured.Round(100*time.Millisecond), baseline.Round(100*time.Millisecond))
+					measured, baseline, what = ended.Sub(compactFrom), hookTook, "/compact to the end of its PreCompact hook"
+				}
 				held := ended.Sub(time.Unix(began, 0))
 				cutoff = held.Round(100*time.Millisecond).String() + " after it started"
 				if held < 4*time.Second || held > budget {
 					t.Errorf("%s: Claude Code gave the hung %s entry up %s after it started; want about 5 s and at most %s", a.name, a.event, held.Round(100*time.Millisecond), budget)
 				}
 			}
+		}
+		extra := measured - baseline
+		if a.mode == handoffLiveHang && extra > budget {
+			t.Errorf("%s: a hung %s held the session %s longer than the working run; the budget is %s", a.name, a.event, extra.Round(100*time.Millisecond), budget)
 		}
 		if a.mode == handoffLiveHang && cutoff == "not measured" {
 			t.Errorf("%s: Claude Code's debug output does not say when it gave the hung %s entry up: %q", a.name, a.event, said)
@@ -2720,9 +2749,9 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 			t.Errorf("%s: the %s entry did not run", a.name, a.mode)
 		}
 		r.isolated(ran)
-		t.Logf("%s: %s entry %s; %s took %s against %s in the working run (extra %s); first reply %s after launch against %s; Claude Code's debug output says of the entry: %q, cut off %s; the session continued; %s; no process left",
+		t.Logf("%s: %s entry %s; %s took %s against %s in the working run (extra %s)%s; first reply %s after launch against %s; Claude Code's debug output says of the entry: %q, cut off %s; the session continued; %s; no process left",
 			a.name, a.event, map[string]string{handoffLiveHang: "hung for 100 s with timeout 5", handoffLiveFail: "exited 1 with text on stderr"}[a.mode],
-			what, measured.Round(100*time.Millisecond), baseline.Round(100*time.Millisecond), extra.Round(100*time.Millisecond),
+			what, measured.Round(100*time.Millisecond), baseline.Round(100*time.Millisecond), extra.Round(100*time.Millisecond), compaction,
 			reply.Round(100*time.Millisecond), replyTook.Round(100*time.Millisecond), said, cutoff, shown)
 	}
 }

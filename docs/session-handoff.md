@@ -55,7 +55,7 @@ Two separate bounds apply.
 
 **Claude Code's outside cut-off: 5 seconds.** The handler cannot bound what happens before it runs: process start, and the `PATH` and `hub.json` read every `tt` command does first. The settings entry carries `"timeout": 5` for that. The live check below shows Claude Code honours it on all three events: it gave a hung entry up 4.9 to 5.2 seconds after it started.
 
-So a working hook holds a session for at most 500 ms, and a hung one for at most about 5 seconds per event. One thing a hung hook does leave behind: on `PreCompact`, Claude Code shows the model a line saying the hook was cancelled (see the live check's result).
+So a working hook holds a session for at most 500 ms, and a hung one for at most about 5 seconds per event. One thing a hung hook does leave behind: on `PreCompact`, Claude Code 2.1.293 shows the model one line saying the hook was cancelled. That is a known limit; see the live check's result.
 
 It also cannot decide anything:
 
@@ -262,9 +262,11 @@ The run directories are created under the repository's ignored `.build` director
 
 Hung entries are tested one event at a time, because a compaction runs `PreCompact` and then `SessionStart`, and a clear runs `SessionEnd` and then `SessionStart`: hanging all three would stack two cut-offs. In each of runs H1 to H3 exactly one entry sleeps 100 seconds with `"timeout": 5` and the other two work. Runs F1 to F3 do the same with an entry that exits 1 with text on stderr. Each run's time for that step is compared with the same step in the working run; the budget is 7 seconds more. A hung entry also logs its own start, and the check times from there to the line in Claude Code's debug output that gives it up.
 
+What the model is shown is checked two ways: the pane is read for failed-hook lines, and the model is asked whether its context holds a hook error. A working hook must leave neither. A hung entry may leave at most the one line Claude Code prints when it cancels a hook.
+
 ### Result
 
-Run on 2026-10-07 on the Mini with Claude Code **2.1.293**, on the stage A candidate, twice in full with the same outcome (and once more as far as run H2). The figures are from the last run (started 20:05:20Z). **The check fails on one point, the first under "What failed" below.** Everything else it requires was observed.
+Run on 2026-10-07 on the Mini with Claude Code **2.1.293**, on the stage A candidate. **It passes**, under criterion a16 as the owner helper amended it in #28733: a working hook shows the model no hook error, and a hung hook shows at most the one line Claude Code itself prints when it cancels it. The figures are from the run started at 20:23:15Z. Four earlier full runs the same day observed the same behaviour; see "History of this result".
 
 **Isolation, all eight runs.** Every path the hook opened was under its run directory (94 in the working run, 10 or 34 in the others). The wrapper logs showed exactly the expected entries and counts. Claude Code's debug output named no hook command but the run's own, and no `UserPromptSubmit`, tool, `Stop` or `Notification` hook, so no user-level hook ran: `--setting-sources project` keeps them out. The real settings file's hash was unchanged, and the real handoff directory did not exist before or after.
 
@@ -280,26 +282,27 @@ Run on 2026-10-07 on the Mini with Claude Code **2.1.293**, on the stage A candi
 | `/exit` | `SessionEnd`, `reason` `prompt_input_exit` | | |
 | `claude --resume` | `SessionStart`, `source` `resume` | unchanged | |
 
-**Hung entries, one at a time.** In each run one entry slept 100 seconds with `"timeout": 5`. The cut-off is the time from the entry's own start to the line in Claude Code's debug output that gives it up.
+**A working hook shows no hook error.** Asked after the start and again after the compaction, the model reported none, and the pane showed no failed hook.
 
-| Run | Hung event | Cut off after | What the session did | Against the working run |
-| --- | --- | --- | --- | --- |
-| H1 | `SessionStart` | 4.9 s (`timed out after 5000ms`) | The prompt was ready at once; the first reply waited for the cut-off | prompt ready 0.7 s against 0.7 s; first reply 7.1 s after launch against 2.5 s |
-| H2 | `PreCompact` | 5.2 s (`cancelled`) | The compaction completed | 22.8 s against 25.8 s: the summary itself takes about 20 s and varies by more than the 5 s, so the cut-off is the measure here |
-| H3 | `SessionEnd` | 4.9 s (`cancelled`) | The process exited | exit 5.5 s against 0.3 s, 5.2 s more |
+**Hung entries, one at a time.** In each run one entry slept 100 seconds with `"timeout": 5`. The cut-off is the time from the entry's own start, which it logs in whole seconds, to the line in Claude Code's debug output that gives it up.
 
-All within the 7-second budget. After each run no hook process was left. In H1 the model, asked, reported no hook error in its context.
+| Run | Hung event | Cut off after | What the session did | Against the working run | What the model was shown |
+| --- | --- | --- | --- | --- | --- |
+| H1 | `SessionStart` | 5.3 s (`timed out after 5000ms`) | The prompt was ready at once; the first reply waited for the cut-off | prompt ready 0.5 s against 0.7 s; first reply 7.1 s after launch against 2.7 s | Nothing; it reported no hook error |
+| H2 | `PreCompact` | 5.5 s (`cancelled`) | The compaction completed | `/compact` to the end of the hook 5.0 s against 0.1 s, 4.9 s more | One line, `PreCompact [command] failed: Hook cancelled`; it reported a hook error |
+| H3 | `SessionEnd` | 5.7 s (`cancelled`) | The process exited | exit 5.6 s against 0.3 s, 5.2 s more | The session was over |
 
-**Failing entries (exit 1, text on stderr), one at a time.** F1 `SessionStart`, F2 `PreCompact`, F3 `SessionEnd`: the session started, compacted and exited as in the working run (prompt ready 0.7 s; exit 0.8 s against 0.3 s). In F1 the model reported no hook error.
+All within the 7-second budget. After each run no hook process was left. For H2 the time is taken to the end of the hook and not to the end of the compaction: the summary a compaction writes took 13 to 26 seconds across these runs, which varies by more than the cut-off (26.1 s in H2 against 20.0 s in the working run).
 
-**What failed.** The criterion asks that the model is shown no hook error in any run. For `PreCompact` it is shown one:
+**Failing entries (exit 1, text on stderr), one at a time.** F1 `SessionStart`, F2 `PreCompact`, F3 `SessionEnd`: the session started, compacted and exited as in the working run (prompt ready 0.6 s; exit 0.8 s against 0.3 s). In F1 the model reported no hook error. In F2 it was shown `PreCompact [command] failed:` followed by the entry's stderr text. This is recorded and not judged: `tt hook handoff` never exits non-zero and never writes to stderr.
 
-- Claude Code prints the `PreCompact` hook's outcome under `/compact`, and that output is part of what the model then sees. For a working hook the line is `PreCompact [command] completed successfully`. In H2 it was `PreCompact [command] failed: Hook cancelled`, and in F2 `PreCompact [command] failed:` followed by the entry's stderr text. Asked, the model reported a hook error in both.
-- This is how Claude Code 2.1.293 reports any `PreCompact` command hook on a manual compaction. Nothing in `tt hook handoff` can change it. The compaction still completed and the session carried on in both runs.
-- What it means in use: `tt hook handoff` never exits non-zero and never writes to stderr, so the F2 case does not arise from it. The H2 case arises only if the hook process hangs past 5 seconds, and then the model sees one line saying a `PreCompact` hook was cancelled. On every manual compaction the model sees one line saying the hook completed.
+**Known limit with Claude Code 2.1.293: the `PreCompact` line.** Claude Code prints the outcome of a `PreCompact` command hook under `/compact`, and that output is part of what the model then sees. Nothing in `tt hook handoff` can change it.
+
+- If the hook process hangs past 5 seconds, Claude Code cancels it, the compaction completes, and the model sees one line: `PreCompact [command] failed: Hook cancelled`. The check allows exactly that line and fails on anything more.
+- For a working hook Claude Code prints `PreCompact [command] completed successfully` in the same place. The model does not report that as an error.
 - Not observed: an automatic compaction, where there is no `/compact` output.
 
-Whether that one line is acceptable is the owner's decision; the check keeps failing on it until the criterion or Claude Code changes.
+**History of this result.** The criterion first read "the model is shown no hook error" in every run. Two full runs at 20:02Z and 20:05Z failed it on H2 for the line above, and the owner helper amended the criterion (#28733). A run at 20:20Z under the amended check failed on a different point, a timing that compared the whole compaction (25.5 s against 16.4 s) with the 7-second budget; that measure was replaced with the time to the end of the hook, as in the table. The run at 20:23Z is the first under the final check.
 
 **Other things learned.**
 
@@ -316,7 +319,7 @@ Whether that one line is acceptable is the owner's decision; the check keeps fai
 - **A second Claude session in the helper's tmux session** is shown the note as a candidate successor. The note says it is not registered.
 - **A wake's line in the note includes its schedule only when the line fits in 120 bytes.** `tt handoff show` always prints it.
 - **Decisions stay current until closed.** A list of 50 recorded decisions refuses a new one until one is closed.
-- **Claude Code reports the `PreCompact` hook under `/compact`**, where the model sees it: "completed successfully" normally, "failed: Hook cancelled" if the hook hung. See the live check's result.
+- **Claude Code 2.1.293 reports the `PreCompact` hook under `/compact`**, where the model sees it: "completed successfully" normally, and the one line "failed: Hook cancelled" if the hook process hung past 5 seconds. The compaction completes either way. See the live check's result.
 - **`tt doctor` does not check the new hook.**
 - **Claude Code only.** Codex runs no capture hook. A Codex helper can use the commands.
 - **One host.** The record is not uploaded or copied. Another host has its own.
