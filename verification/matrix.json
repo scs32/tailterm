@@ -200,6 +200,10 @@
       "mode": "selected"
     },
     {
+      "file": "tests/terminal-replies-browser.mjs",
+      "mode": "both"
+    },
+    {
       "file": "tests/tmux-menu-browser.mjs",
       "mode": "both"
     },
