@@ -36,11 +36,12 @@ import { rmSync } from "node:fs";
 import assert from "node:assert/strict";
 
 const engines = { chromium, webkit };
-const selected = process.env.TEST_BROWSER
-  ? [process.env.TEST_BROWSER]
-  : ["chromium", "webkit"];
-for (const name of selected)
-  if (!engines[name]) throw new Error("Unknown TEST_BROWSER");
+// Unset or "both" runs both engines, as the verification matrix runs a
+// mode "both" entry; "chromium" or "webkit" runs that one alone.
+const requested = process.env.TEST_BROWSER || "both";
+if (requested !== "both" && !Object.hasOwn(engines, requested))
+  throw new Error("Unknown TEST_BROWSER");
+const selected = requested === "both" ? ["chromium", "webkit"] : [requested];
 
 const socket = "tailterm-replies-test-" + randomUUID();
 const tmuxEnv = { ...process.env, TERM: "xterm-256color" };
