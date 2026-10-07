@@ -2454,3 +2454,77 @@ func TestHandlerRotationDueListExitedCandidate(t *testing.T) {
 		}
 	}
 }
+
+// Review b1: an idle exited primary beside a dead, busy acting handler does
+// not hide that handler. The due list names the acting handler and the
+// parent's rotation replaces it; the exited primary is untouched.
+func TestHandlerRotationIdleExitedPrimaryLeavesActingHandlerToParentPath(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		name := "legacy oldest handler"
+		if explicit {
+			name = "explicit primary"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			ctx := context.Background()
+			s := f.s
+			p, err := s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "db-handler-first", Host: f.old.Host, Session: "tt-handler-first", Runtime: f.old.Runtime, Cwd: f.old.Cwd}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if explicit {
+				_, err = s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, p.ID, f.task.ID)
+			} else {
+				_, err = s.db.Exec(`UPDATE agents SET created_at=? WHERE id=?`, ts(f.clock.Add(-24*time.Hour)), p.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			idle := api.AgentActivity{State: "idle", ObservedAt: f.clock, LastEventAt: f.clock}
+			if _, err = s.ReportActivity(ctx, f.task.ID, p.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: p.RunID, Activity: idle}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: p.ID, RunID: p.RunID, Kind: api.EventExited, Text: "Process exited (1)"}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			task, _ := s.GetTask(ctx, f.task.ID)
+			if exited, ok, err := exitedPrimaryHandler(ctx, s.db, task); err != nil || !ok || exited.ID != p.ID {
+				t.Fatalf("the exited primary is %+v %t %v", exited, ok, err)
+			}
+			f.advance(11 * time.Minute)
+			// The due list names the acting handler as the dead candidate.
+			list, err := s.HandlerRotationsDue(ctx, "mini", "")
+			if err != nil || len(list.Entries) != 1 || list.Entries[0].Agent.ID != f.old.ID || !list.Entries[0].DeadCandidate || !list.Entries[0].SilenceMet {
+				t.Fatalf("due list: %+v %v", list.Entries, err)
+			}
+			// Prepare agrees: the acting handler rotates by the parent path.
+			r, err := f.prepareDead(t, "acting-prepare", nil)
+			if err != nil || r.OldAgentID != f.old.ID || r.Exit != nil {
+				t.Fatalf("prepare for the acting handler: %+v %v", r, err)
+			}
+			successor := f.succeed(t, r)
+			f.advance(30 * time.Second)
+			if r, err = f.commitDead(r, "acting-commit", f.evidence()); err != nil || r.State != api.HandlerRotationCommitted || r.Receipt.LeasesMoved != 2 {
+				t.Fatalf("commit for the acting handler: %+v %v", r, err)
+			}
+			task, _ = s.GetTask(ctx, f.task.ID)
+			old, _ := s.GetAgent(ctx, f.old.ID)
+			first, _ := s.GetAgent(ctx, p.ID)
+			if task.PrimaryHandlerID != successor.ID || old.Status != api.AgentClosed || first.Status != api.AgentExited || first.RunID != p.RunID {
+				t.Fatalf("primary %s acting %s exited primary %s", task.PrimaryHandlerID, old.Status, first.Status)
+			}
+		})
+	}
+	// Named by the request, an idle exited primary is still refused as not
+	// busy, and a busy one is the primary for prepare as it is for the due list.
+	f := newDeadPrimaryFixture(t)
+	exit := f.exit(t, 1)
+	f.advance(11 * time.Minute)
+	other := api.NewID("agt")
+	if _, err := f.prepareDead(t, "another-handler", func(req *api.HandlerRotationRequest) { req.OldAgentID = other }); refusalCode(err) != api.HandlerRotationRefusedNotPrimary {
+		t.Fatalf("a request naming another handler beside a busy exited primary: %v", err)
+	}
+	if r, err := f.prepareExited(t, "busy-exited", f.idleEvidence(exit)); err != nil || r.OldAgentID != f.old.ID || r.Exit == nil {
+		t.Fatalf("busy exited primary: %+v %v", r, err)
+	}
+}

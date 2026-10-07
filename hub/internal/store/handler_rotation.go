@@ -1066,11 +1066,23 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		return zero, err
 	}
 	if dead {
-		// Only this rotation sees a primary whose wrapper reported exited.
+		// Only this rotation sees a primary whose wrapper reported exited, and
+		// only when the request names it or it is busy, as in the due list.
+		// An idle exited primary leaves the acting handler above in place.
 		if exited, ok, err := exitedPrimaryHandler(ctx, tx, t); err != nil {
 			return zero, err
 		} else if ok {
-			old = exited
+			use := exited.ID == req.OldAgentID && exited.RunID == req.OldRunID
+			if !use {
+				held, err := loadHandlerBusy(ctx, tx, t.ID, exited)
+				if err != nil {
+					return zero, err
+				}
+				use = !held.idle()
+			}
+			if use {
+				old = exited
+			}
 		}
 	}
 	if old.ID != req.OldAgentID || old.RunID != req.OldRunID {

@@ -402,6 +402,10 @@ otherwise the oldest handler that is not closed and not a prepared successor,
 when its status is `exited`. Every other rotation, and `tt handler rotate` by
 hand, still skips an exited handler.
 
+A `dead_primary` prepare uses the exited handler only when the request names
+it or it is busy, the same condition as the due list. An idle exited primary
+beside another open handler leaves that handler to the rules above.
+
 **The exit report (hub).** The agent's newest `started`, `heartbeat` or
 `exited` event must be an `exited` event whose text is exactly the wrapper's
 `Process exited (N)`. The hub saves its status, time and event on the rotation
@@ -615,6 +619,14 @@ directory are inert without the new CLI.
   owner when the wrapper's exit event was pruned or posted by hand, when the
   host's receipt records no exit, or when anything runs under the pane's
   leftover shell. The strict pane rule is not yet proven on a live host.
+- The pane rule cannot tell the wrapper's login shell from a runtime that
+  replaced it. A runtime started again with `exec` in the leftover shell takes
+  the shell's place, and while it has no child process the pane looks like an
+  idle shell. The hub refuses that run's events, so after the silence such a
+  live handler could be replaced. Follow-up filed.
+- An obligation the broker closed is re-issued at commit, ten or more minutes
+  later. A sender who re-sent the request in between reaches the successor
+  twice. Follow-up filed.
 - An exit report that was lost while the wrapper survived is recovered by
   neither rule: the hub never marks the handler exited, and its session is
   present, so the probe answers alive.
