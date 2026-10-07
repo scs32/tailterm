@@ -232,7 +232,9 @@ those handlers is offline (the hub has not heard from it for 90 seconds).
 | Every handler is online (busy, or held by an open rotation) | `Waiting for a free handler of arm S`, unchanged; the counts are in the entry's handler need only |
 | One is offline | `Waiting for a free handler of arm S: 1 of 2 leased, limit 2; the limit already has its handlers, and NAME is offline. The hub does not restart a handler; an operator can retire NAME so that it stops counting and one can be added. Fix: tt retire --task TSK NAME` |
 | The offline one is the primary | the same up to `…restart a handler;`, then ` an operator can rotate NAME, the primary, to a successor. Fix: tt handler rotate --task TSK` |
-| Several are offline | `…, and NAME1 and NAME2 are offline. …` (`NAME1, NAME2 and NAME3` for more), in lease order; the recovery and the fix are for the first that is not the primary |
+| The offline primary cannot be rotated now | the same up to `…restart a handler;`, then ` NAME is the primary, and its rotation (tt handler rotate --task TSK) is refused until this clears: DETAIL.` with no `Fix:`; DETAIL is the refusal `tt handler rotate` would give, such as `the handler run holds 1 live team lease(s), first ENTRY` |
+| The offline one is the project's last available handler (and not the primary) | the same up to `…restart a handler;`, then ` an operator can add another handler; NAME is the project's last available one and cannot be retired until then. Fix: set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project TSK` |
+| Several are offline | `…, and NAME1 and NAME2 are offline. …` (`NAME1, NAME2 and NAME3` for more), in lease order; the recovery and the fix are for one of them: a handler no active team leases before a leased one, and the primary last |
 
 A busy handler frees itself, so that wait needs no action. An offline one does
 not come back by itself, and until an operator acts the entry waits. The hub
@@ -248,7 +250,22 @@ here, and the listing writes nothing. The operator's recovery is:
 - **`tt handler rotate --task TSK`** for the primary. The hub refuses to
   retire or close the primary; rotation, run on the old handler's host, moves
   the role to a successor and closes the old handler, which then no longer
-  counts (see `docs/handler-rotation.md`).
+  counts (see `docs/handler-rotation.md`). Rotation is refused while the
+  primary's run holds a live team lease, has a pending tool call, or is
+  recorded as working, hung on a tool or looping. The hub makes that same
+  check here: when it would refuse, the reason gives the refusal and no fix,
+  because no command the hub accepts frees the place yet. The lease clears
+  when its team finishes or the owner releases its failed entry.
+
+- **Another handler first** when the offline one is the project's last
+  available handler (no other handler is open and not retired). The hub
+  refuses to retire or close that one, so the retire is never stated. The fix
+  is the one of the queue's no-handler stall: set up a database handler
+  (Projects → Set up database handler) or resume a retired one with
+  `tt resume NAME`. The waiting entry leases that handler on the next pass,
+  and the offline one can be retired afterwards. With no limit set this
+  project is stalled and the entry's reason is the stall's own text; the
+  handler need then carries the same fix.
 
 With several offline handlers the next listing names the remaining ones once
 the first is dealt with. An offline handler below the limit changes nothing:

@@ -1776,13 +1776,27 @@ func TestHandlerNeedNamesOfflineHandlerAtLimit(t *testing.T) {
 		!strings.HasSuffix(got.BlockReason, "an operator can rotate "+idle.Name+", the primary, to a successor. Fix: "+rotate) {
 		t.Fatalf("offline primary need %+v reason %q", got.HandlerNeed, got.BlockReason)
 	}
+	// tt handler rotate refuses a primary recorded as working, so no fix is
+	// given: the reason says what the rotation waits for.
+	if _, err := f.s.db.Exec(`INSERT INTO agent_activity(task_id,agent_id,run_id,state,observed_at,payload,request_id) VALUES(?,?,?,'working',?,'{}','offline-primary')`,
+		f.task.ID, idle.ID, idle.RunID, ts(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	if got.HandlerNeed.Fix != "" || got.HandlerNeed.Provision || strings.Contains(got.BlockReason, "Fix: ") ||
+		!strings.HasSuffix(got.BlockReason, idle.Name+" is offline. The hub does not restart a handler; "+idle.Name+" is the primary, and its rotation ("+rotate+") is refused until this clears: the handler run's activity is working.") {
+		t.Fatalf("working primary need %+v reason %q", got.HandlerNeed, got.BlockReason)
+	}
+	if _, err := f.s.db.Exec(`DELETE FROM agent_activity WHERE agent_id=?`, idle.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id='' WHERE id=?`, f.task.ID); err != nil {
 		t.Fatal(err)
 	}
 	// A name the flag parser would misread is given as the agent ID.
-	c := &handlerNeedContext{}
-	if fix, _ := c.offlineHandlerFix("tsk_x", api.HandlerArmHandler{AgentID: "agt_x", Name: "-odd"}); fix != "tt retire --task tsk_x agt_x" {
-		t.Fatalf("odd name fix %q", fix)
+	c := &handlerNeedContext{handlers: make([]api.HandlerArmHandler, 2)}
+	if _, fix, err := c.offlineHandlerFix(context.Background(), f.s.db, "tsk_x", api.HandlerArmHandler{AgentID: "agt_x", Name: "-odd"}); err != nil || fix != "tt retire --task tsk_x agt_x" {
+		t.Fatalf("odd name fix %q %v", fix, err)
 	}
 
 	// The stated recovery, run by the operator: the retired handler stops
@@ -1800,7 +1814,8 @@ func TestHandlerNeedNamesOfflineHandlerAtLimit(t *testing.T) {
 	}
 }
 
-// h1: every offline handler is named in lease order; the fix is the first's.
+// h1: every offline handler is named in lease order. The fix is for the
+// easiest one: a handler no team leases, then a leased one, the primary last.
 func TestHandlerNeedNamesEveryOfflineHandlerAtLimit(t *testing.T) {
 	f, idle := offlineLimitFixture(t)
 	var leased api.Agent
@@ -1817,20 +1832,107 @@ func TestHandlerNeedNamesEveryOfflineHandlerAtLimit(t *testing.T) {
 	if !strings.Contains(got.BlockReason, "the limit already has its handlers, and "+a+" and "+b+" are offline. ") {
 		a, b = b, a
 	}
-	if !strings.Contains(got.BlockReason, "the limit already has its handlers, and "+a+" and "+b+" are offline. ") || got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+a ||
-		!strings.Contains(got.BlockReason, "an operator can retire "+a+" so that") {
+	if !strings.Contains(got.BlockReason, "the limit already has its handlers, and "+a+" and "+b+" are offline. ") || got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+idle.Name ||
+		!strings.Contains(got.BlockReason, "an operator can retire "+idle.Name+" so that") {
 		t.Fatalf("two offline: %+v reason %q", got.HandlerNeed, got.BlockReason)
 	}
-	// With the first one the primary, the lighter retire of the other is the fix.
-	primary, other := f.sArms[0], f.sArms[1]
-	if primary.Name != a {
-		primary, other = other, primary
-	}
-	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, primary.ID, f.task.ID); err != nil {
+	// With the unleased one the primary, the retire of the leased one is the fix.
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, idle.ID, f.task.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID); got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+other.Name {
-		t.Fatalf("offline primary first: %+v", got.HandlerNeed)
+	if got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID); got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+leased.Name {
+		t.Fatalf("offline primary and a leased handler: %+v", got.HandlerNeed)
+	}
+}
+
+// h1: a primary that holds a live team lease cannot be rotated, so the reason
+// gives the refusal of tt handler rotate and no fix.
+func TestHandlerNeedLeasedOfflinePrimaryHasNoRotateFix(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	var leased api.Agent
+	for _, h := range f.sArms {
+		if h.ID == f.entries[0].HandlerID {
+			leased = h
+		}
+	}
+	// The free handler is online but held by an open rotation.
+	now := ts(time.Now())
+	if _, err := f.s.db.Exec(`INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at) VALUES('hrot_fixture',?,'rotate','hash','prepared','fixture','owner',1,?,?,?,'agt_successor','successor',?,?)`,
+		f.task.ID, idle.ID, idle.RunID, idle.Name, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, leased.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.offline(t, leased)
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	want := leased.Name + " is offline. The hub does not restart a handler; " + leased.Name + " is the primary, and its rotation (tt handler rotate --task " + f.task.ID +
+		") is refused until this clears: the handler run holds 1 live team lease(s), first " + f.entries[0].ID + "."
+	if n := got.HandlerNeed; n == nil || n.Fix != "" || n.Provision || !strings.HasSuffix(got.BlockReason, want) {
+		t.Fatalf("leased primary need %+v reason %q", n, got.BlockReason)
+	}
+}
+
+// soleOfflineFixture is a project whose only open handler is offline, with one
+// queued entry.
+func soleOfflineFixture(t *testing.T, limit int) *provisionFixture {
+	t.Helper()
+	f := newProvisionFixture(t, limit, 1, 0)
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed' WHERE role=? AND id<>?`, api.AgentRoleDatabaseHandler, f.hS.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.offline(t, f.hS)
+	return f
+}
+
+// h1: the handler floor refuses to retire the project's last available
+// handler, so for it the reason states the recovery the floor allows, never
+// the retire. Run through the store, that recovery is accepted: the entry
+// leases the added handler, and only then may the offline one be retired.
+func TestHandlerNeedLastOfflineHandlerIsNotRetired(t *testing.T) {
+	f := soleOfflineFixture(t, 1)
+	add := "set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project " + f.task.ID
+	got := listedEntry(t, f.s, f.task.ID, f.entries[0].ID)
+	n := got.HandlerNeed
+	if n == nil || n.Provision || n.Handlers != 1 || n.Leased != 0 || n.Fix != add {
+		t.Fatalf("last handler need %+v", n)
+	}
+	want := armLimitWait + ": 0 of 1 leased, limit 1; the limit already has its handlers, and handler-s is offline. " +
+		"The hub does not restart a handler; an operator can add another handler; handler-s is the project's last available one and cannot be retired until then. Fix: " + add
+	if got.BlockReason != want || strings.Contains(got.BlockReason, "tt retire") {
+		t.Fatalf("last handler reason %q", got.BlockReason)
+	}
+	retired := api.AgentRetired
+	if _, err := f.s.UpdateAgent(context.Background(), f.hS.ID, api.UpdateAgentRequest{Status: &retired}, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "last available database handler") {
+		t.Fatalf("the floor let the last handler retire: %v", err)
+	}
+	// The stated recovery: another handler of the arm is set up.
+	added := f.handler(t, "handler-s-new", armS, digestP)
+	if got = listedEntry(t, f.s, f.task.ID, f.entries[0].ID); got.BlockReason != "" || got.HandlerNeed != nil {
+		t.Fatalf("after adding a handler: %q %+v", got.BlockReason, got.HandlerNeed)
+	}
+	claimed, err := claimEntry(f.s, f.task, got)
+	if err != nil || claimed.HandlerID != added.ID {
+		t.Fatalf("claim after adding a handler: %+v %v", claimed, err)
+	}
+	if _, err := f.s.UpdateAgent(context.Background(), f.hS.ID, api.UpdateAgentRequest{Status: &retired}, f.by); err != nil {
+		t.Fatalf("retire once another handler is available: %v", err)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("the recovery wrote a provision")
+	}
+}
+
+// h1: with no limit the same project is stalled, and the need's fix is the
+// stall's own, not a retire.
+func TestHandlerNeedLastOfflineHandlerMatchesStall(t *testing.T) {
+	f := soleOfflineFixture(t, 0)
+	got := listedEntry(t, f.s, f.task.ID, f.entries[0].ID)
+	if !strings.Contains(got.BlockReason, "the project has no available database handler. Fix: ") {
+		t.Fatalf("stall reason %q", got.BlockReason)
+	}
+	if n := got.HandlerNeed; n == nil || n.Provision || n.Fix == "" || strings.Contains(n.Fix+n.Reason, "tt retire") || !strings.HasSuffix(got.BlockReason, "Fix: "+n.Fix) {
+		t.Fatalf("stalled need %+v reason %q", n, got.BlockReason)
 	}
 }
 
