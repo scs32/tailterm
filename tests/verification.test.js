@@ -9,6 +9,7 @@ import {
   existsSync,
   readdirSync,
   chmodSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir, getPriority } from "node:os";
 import { join } from "node:path";
@@ -52,6 +53,12 @@ import {
 const hostLockDirectory = mkdtempSync(join(tmpdir(), "matrix-host-lock-"));
 process.env.TAILTERM_MATRIX_HOST_LOCK = join(hostLockDirectory, "host.json");
 process.env.TAILTERM_MATRIX_MAX_HOLDERS = "1";
+// CLI runs in this file stay one process, the run itself, unless a test starts
+// the detached launcher on purpose (launcherCLI). No run inherits an agent
+// identity, so none reports a withdrawal unless its test supplies one.
+process.env.TAILTERM_MATRIX_FOREGROUND = "1";
+for (const key of ["TAILTERM_MATRIX_RUN_CHILD", "TAILTERM_MATRIX_RELEASE", "TAILTERM_AGENT", "TAILTERM_AGENT_NAME", "TAILTERM_TASK"])
+  delete process.env[key];
 const readHostState = (...args) => {
   const state = rawReadHostState(...args);
   const held = holdersOf(state);
@@ -62,7 +69,9 @@ delete process.env.TAILTERM_MATRIX_PRIORITY;
 // A stand-in tt comes first on PATH, so an item priority lookup made by any
 // run in this file never reaches a hub. FAKE_TT_PRIORITY is the priority it
 // reports, FAKE_TT_MODE one of fail, garbage or hang, and it appends each
-// call's arguments to fakeTTCalls. With neither set it fails.
+// call's arguments to fakeTTCalls. With neither set it fails. For a withdrawal
+// report it prints FAKE_TT_CONTEXT for context (failing without one) and
+// accepts send.
 const fakeTTDirectory = mkdtempSync(join(tmpdir(), "matrix-fake-tt-"));
 const fakeTTCalls = join(fakeTTDirectory, "calls.jsonl");
 writeFileSync(
@@ -71,8 +80,14 @@ writeFileSync(
 const { appendFileSync } = require("node:fs");
 appendFileSync(${JSON.stringify(fakeTTCalls)}, JSON.stringify(process.argv.slice(2)) + "\\n");
 const mode = process.env.FAKE_TT_MODE, priority = process.env.FAKE_TT_PRIORITY;
+const command = process.argv[2], context = process.env.FAKE_TT_CONTEXT;
 if (mode === "hang") setInterval(() => {}, 1000);
 else if (mode === "garbage") console.log("not json");
+else if (mode !== "fail" && command === "context" && context) console.log(context);
+else if (mode !== "fail" && command === "context") {
+  console.error("no bound work item");
+  process.exit(1);
+} else if (mode !== "fail" && command === "send") console.log("posted #4242");
 else if (mode === "fail" || priority === undefined) {
   console.error("work item not found");
   process.exit(1);
@@ -83,6 +98,7 @@ else if (mode === "fail" || priority === undefined) {
 process.env.PATH = fakeTTDirectory + ":" + process.env.PATH;
 delete process.env.FAKE_TT_MODE;
 delete process.env.FAKE_TT_PRIORITY;
+delete process.env.FAKE_TT_CONTEXT;
 const fakeTTLookups = () =>
   existsSync(fakeTTCalls)
     ? readFileSync(fakeTTCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line))
@@ -3137,4 +3153,374 @@ test("plan mode records the selection and run mode re-derives a tip-selected pla
   const { checks, checksDigest, ...plain } = f.context;
   assert.equal(planMode(plain), `Selected checks from the integration tip ${f.tip}\n`);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(recordFile, "utf8"))), ["version", "selection"]);
+});
+
+// Detached matrix run (wi_912a9789357529d4, order #27051). a1-a10 of the plan.
+// The launcher is the CLI without the foreground opt-out: it starts the real
+// run detached and only follows its log. Every run it starts is stopped by pid
+// when its test ends.
+const runnerRecord = (output) => {
+  try {
+    return JSON.parse(readFileSync(join(output, "runner.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+};
+function launcherCLI(t, f, args, environment = {}, options = {}) {
+  const env = { ...process.env, TAILTERM_MATRIX_FOREGROUND: "", ...environment };
+  for (const key of ["TAILTERM_MATRIX_RUN_CHILD", "TAILTERM_MATRIX_RELEASE"])
+    if (!(key in environment)) delete env[key];
+  const child = spawn(process.execPath, [matrixScript, ...args], {
+    cwd: f.cwd,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: options.group === true,
+  });
+  child.text = "";
+  child.stdout.on("data", (data) => (child.text += data));
+  child.stderr.on("data", (data) => (child.text += data));
+  const closed = once(child, "close");
+  child.closed = closed.then(([code, signal]) => code ?? signal);
+  // The run is asked to stop first, so it stops its own checks and leaves the
+  // lock file, and is killed only if it does not.
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    const record = runnerRecord(args[2]);
+    if (!record || record.exitCode !== undefined || !Number.isInteger(record.pid) || !pidAlive(record.pid)) return;
+    try {
+      process.kill(record.pid, "SIGTERM");
+      for (let i = 0; i < 500 && pidAlive(record.pid); i++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      if (pidAlive(record.pid)) process.kill(record.pid, "SIGKILL");
+    } catch {}
+  });
+  return child;
+}
+// The queued run of a launcher: its waitlist entry once runner.json names it.
+const queuedRun = (output, what) =>
+  untilHost(() => {
+    const record = runnerRecord(output);
+    const waiter = record && readHostState(hostLockFile())?.waiters.find((w) => w.pid === record.pid);
+    return waiter && { record, waiter };
+  }, what + " to join the waitlist as the detached run");
+
+for (const [name, stop, expected] of [
+  ["SIGTERM to the launcher", (child) => child.kill("SIGTERM"), 143],
+  ["SIGKILL to the launcher's process group", (child) => process.kill(-child.pid, "SIGKILL"), "SIGKILL"],
+])
+  test(`detached a1 ${name} while the run is queued leaves the run its waitlist place and it runs after the release`, async (t) => {
+    const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+      output = tempDir(t, "verification-detached-logs-");
+    const holder = await holdHost("wi_a1_holder");
+    let released = false;
+    try {
+      const child = launcherCLI(t, f, ["run", planFile, output], {}, { group: true });
+      const { record, waiter } = await queuedRun(output, "the run");
+      assert.notEqual(waiter.pid, child.pid, "the launcher does not hold the place");
+      assert.equal(waiter.pid, record.pid);
+      await untilHost(() => child.text.includes("matrix host: waiting 1 of 1"), "the waiting line; saw " + child.text);
+      stop(child);
+      assert.equal(await child.closed, expected, child.text);
+      if (expected === 143)
+        assert.match(child.text, new RegExp(`stopped by SIGTERM; the run continues as pid ${record.pid}`));
+      // The place outlives the launcher.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const after = readHostState(hostLockFile()).waiters;
+      assert.deepEqual(after.map((w) => [w.id, w.seq, w.pid]), [[waiter.id, waiter.seq, record.pid]]);
+      assert(pidAlive(record.pid), "the run is still alive");
+      released = true;
+      await holder.release();
+      await untilHost(() => runnerRecord(output)?.exitCode !== undefined, "the run to finish");
+      assert.equal(runnerRecord(output).exitCode, 0, readFileSync(join(output, "runner.log"), "utf8"));
+      const e = JSON.parse(readFileSync(join(output, "receipt.json"), "utf8")).environment;
+      assert.equal(e.VERIFICATION_HOST_QUEUE_POSITION, "1");
+      assert.equal(JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8")).id, waiter.id);
+    } finally {
+      if (!released) await holder.release();
+    }
+  });
+
+test("detached a2 with nothing stopped the launcher shows the run's lines and exits with the run's code", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-detached-logs-");
+  const holder = await holdHost("wi_a2_holder");
+  const child = launcherCLI(t, f, ["run", planFile, output]);
+  const { record } = await queuedRun(output, "the run");
+  await untilHost(() => /matrix host: waiting 1 of 1, holder wi_a2_holder\/holder/.test(child.text), "the waiting line; saw " + child.text);
+  assert(!existsSync(join(output, "receipt.json")), "no check ran while waiting");
+  await holder.release();
+  assert.equal(await child.closed, 0, child.text);
+  assert.match(child.text, new RegExp(`^matrix run: detached as pid ${record.pid}; log \\S+runner\\.log; it keeps running if this command is stopped\\. Run the same command to re-attach; stop the run with: kill ${record.pid}\\n`));
+  assert.match(child.text, /matrix host: acquired after \d+ ms\n/);
+  assert(existsSync(join(output, "receipt.json")), "the receipt was written before the launcher returned");
+  assert.equal(readFileSync(join(output, "runner.log"), "utf8"), child.text.slice(child.text.indexOf("\n") + 1), "the launcher printed the whole log");
+  const ended = runnerRecord(output);
+  assert.deepEqual([ended.version, ended.pid, ended.exitCode, ended.log], [1, record.pid, 0, join(output, "runner.log")]);
+  assert(Date.parse(ended.endedAt) >= Date.parse(ended.startedAt));
+  assert.deepEqual(ended.argv, ["run", planFile, output]);
+  // A failed check is the run's exit code 1.
+  const failing = plannedFixture(t, "process.exit(1);"),
+    failedOutput = tempDir(t, "verification-detached-logs-");
+  const failed = launcherCLI(t, failing.f, ["run", failing.planFile, failedOutput]);
+  assert.equal(await failed.closed, 1, failed.text);
+  assert.equal(runnerRecord(failedOutput).exitCode, 1);
+});
+
+test("detached a2 a6 a wait that expires exits the launcher 75 and reports nothing", async (t) => {
+  rmSync(fakeTTCalls, { force: true });
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-detached-logs-");
+  const holder = await acquireHostLock({ item: "wi_a2_expiry_holder", agent: "holder", runTimeoutMs: 120000, pollMs: 20 });
+  try {
+    const child = launcherCLI(t, f, ["run", planFile, output, "--host-wait-minutes", "1"], agentIdentity);
+    assert.equal(await child.closed, 75, child.text);
+    assert.match(child.text, /Host lock wait expired after 60000 ms/);
+    assert.equal(runnerRecord(output).exitCode, 75);
+    assert.deepEqual(readHostState(hostLockFile()).waiters, []);
+    assert.deepEqual(fakeTTLookups(), [], "an expired wait is not a signal withdrawal");
+    assert(!existsSync(join(output, "withdrawal-report.json")));
+    assert(!existsSync(join(output, "receipt.json")));
+  } finally {
+    await holder.release();
+  }
+});
+
+test("detached a3 the same command again re-attaches to the queued run, and a dead recorded pid starts a fresh run", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-detached-logs-");
+  const journalBefore = readJournal(hostLockFile()).length;
+  const holder = await holdHost("wi_a3_holder");
+  let released = false;
+  try {
+    const first = launcherCLI(t, f, ["run", planFile, output]);
+    const { record, waiter } = await queuedRun(output, "the first run");
+    const second = launcherCLI(t, f, ["run", planFile, output]);
+    await untilHost(() => second.text.includes(`matrix run: re-attached to pid ${record.pid}\n`), "the re-attach line; saw " + second.text);
+    assert(!second.text.includes("detached as pid"), second.text);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => w.id), [waiter.id], "one waiter");
+    assert.equal(runnerRecord(output).pid, record.pid);
+    released = true;
+    await holder.release();
+    assert.deepEqual([await first.closed, await second.closed], [0, 0], first.text + second.text);
+    assert.match(second.text, /matrix host: acquired after \d+ ms\n/);
+    const requests = readJournal(hostLockFile()).slice(journalBefore).filter((entry) => entry.event === "request" && entry.kind !== "hold" && entry.agent !== "holder");
+    assert.deepEqual(requests.map((entry) => entry.id), [waiter.id], "one request");
+    assert(existsSync(join(output, "receipt.json")));
+  } finally {
+    if (!released) await holder.release();
+  }
+  // A record naming a pid that is gone is not followed.
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid,
+    fresh = tempDir(t, "verification-detached-logs-");
+  assert(!pidAlive(dead));
+  writeFileSync(join(fresh, "runner.json"), JSON.stringify({ version: 1, pid: dead, startedAt: new Date().toISOString(), argv: [], log: join(fresh, "runner.log") }));
+  const again = launcherCLI(t, f, ["run", planFile, fresh]);
+  assert.equal(await again.closed, 0, again.text);
+  assert(!again.text.includes("re-attached"), again.text);
+  const started = runnerRecord(fresh);
+  assert.notEqual(started.pid, dead);
+  assert.match(again.text, new RegExp(`^matrix run: detached as pid ${started.pid};`));
+  assert.equal(started.exitCode, 0);
+  assert(existsSync(join(fresh, "receipt.json")));
+});
+
+for (const [name, signal, code, target] of [
+  ["SIGTERM to the run's pid", "SIGTERM", 143, "run"],
+  ["SIGINT to the launcher", "SIGINT", 130, "launcher"],
+])
+  test(`detached a4 ${name} while it is queued withdraws the run with ${code} and no receipt`, async (t) => {
+    const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+      output = tempDir(t, "verification-detached-logs-");
+    const holder = await holdHost("wi_a4_holder");
+    try {
+      const child = launcherCLI(t, f, ["run", planFile, output]);
+      const { record, waiter } = await queuedRun(output, "the run");
+      if (target === "run") process.kill(record.pid, signal);
+      else child.kill(signal);
+      assert.equal(await child.closed, code, child.text);
+      assert.match(child.text, new RegExp(`Verification interrupted by ${signal} while waiting for the host lock`));
+      const state = readHostState(hostLockFile());
+      assert.deepEqual(state.waiters, [], "the waiter left the list");
+      assert.equal(state.holder.id, holder.id, "the holder was not disturbed");
+      const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+      assert.deepEqual([sidecar.id, sidecar.outcome, sidecar.acquiredAt], [waiter.id, "withdrawn", null]);
+      assert.equal(runnerRecord(output).exitCode, code);
+      assert(!pidAlive(record.pid));
+      assert(!existsSync(join(output, "receipt.json")), "no receipt");
+      assert(!existsSync(join(output, "withdrawal-report.json")), "no identity, no report");
+    } finally {
+      await holder.release();
+    }
+  });
+
+// The launcher's run once it holds the host.
+const holdingRun = (output, what) =>
+  untilHost(() => {
+    const record = runnerRecord(output);
+    return record && readHostState(hostLockFile())?.holder?.pid === record.pid && record;
+  }, what + " to hold the host");
+test("detached a5 SIGTERM to the launcher while the run holds the host stops only the launcher", async (t) => {
+  const { f, planFile } = plannedFixture(t, sleepingCheck(1500)),
+    output = tempDir(t, "verification-detached-logs-");
+  const child = launcherCLI(t, f, ["run", planFile, output]);
+  const record = await holdingRun(output, "the run");
+  child.kill("SIGTERM");
+  assert.equal(await child.closed, 143, child.text);
+  assert.match(child.text, new RegExp(`stopped by SIGTERM; the run continues as pid ${record.pid}`));
+  assert(pidAlive(record.pid), "the run is still alive");
+  assert.equal(readHostState(hostLockFile()).holder.pid, record.pid, "and still holds the host");
+  await untilHost(() => runnerRecord(output)?.exitCode !== undefined, "the run to finish");
+  assert.equal(runnerRecord(output).exitCode, 0, readFileSync(join(output, "runner.log"), "utf8"));
+  assert(existsSync(join(output, "receipt.json")));
+  assert.equal(readHostState(hostLockFile()).holder, null);
+});
+for (const [name, signal, code, target] of [
+  ["SIGINT to the launcher", "SIGINT", 130, "launcher"],
+  ["SIGTERM to the run's pid", "SIGTERM", 143, "run"],
+])
+  test(`detached a5 ${name} while the run holds the host stops the run with ${code} and no receipt`, async (t) => {
+    const started = join(tempDir(t, "verification-detached-check-"), "started");
+    const { f, planFile } = plannedFixture(t, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(started)},'');` + sleepingCheck(60000)),
+      output = tempDir(t, "verification-detached-logs-");
+    const child = launcherCLI(t, f, ["run", planFile, output]);
+    const record = await holdingRun(output, "the run");
+    await untilHost(() => existsSync(started), "the check to start");
+    if (target === "run") process.kill(record.pid, signal);
+    else child.kill(signal);
+    assert.equal(await child.closed, code, child.text);
+    assert.equal(runnerRecord(output).exitCode, code);
+    assert(!pidAlive(record.pid));
+    assert(!existsSync(join(output, "receipt.json")), "no receipt");
+    assert.equal(readHostState(hostLockFile()).holder, null, "the lock was released");
+    assert(!existsSync(join(output, "withdrawal-report.json")), "a run stopped while holding is not a queued withdrawal");
+  });
+
+const agentIdentity = {
+  TAILTERM_AGENT: "agt_fake_verifier",
+  TAILTERM_AGENT_NAME: "verifier-fake",
+  TAILTERM_TASK: "tsk_fake",
+};
+const fakeBinding = { itemId: "wi_fake_item", itemRevision: 7, workOrderMessage: { taskId: "tsk_fake", seq: 4321 } };
+test("detached a6 a run withdrawn by a signal while queued sends its lead a linked notice with the reason", async (t) => {
+  rmSync(fakeTTCalls, { force: true });
+  const { f, plan, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-detached-logs-");
+  const holder = await holdHost("wi_a6_holder");
+  try {
+    const child = launcherCLI(t, f, ["run", planFile, output], {
+      ...agentIdentity,
+      FAKE_TT_CONTEXT: JSON.stringify({ version: 1, binding: fakeBinding }),
+    });
+    const { record } = await queuedRun(output, "the run");
+    process.kill(record.pid, "SIGTERM");
+    assert.equal(await child.closed, 143, child.text);
+    const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+    const calls = fakeTTLookups();
+    assert.equal(calls.length, 2, JSON.stringify(calls));
+    assert.deepEqual(calls[0], ["context", "--json"]);
+    const text = `verifier-fake's matrix run for wi_fake_item at ${plan.commit.slice(0, 12)} was withdrawn by SIGTERM after waiting ${Math.round(sidecar.waitMs / 60000)} min, joined at position 1; no check ran and no receipt exists. Logs: ${output}. Start it again with the same command.`;
+    assert.deepEqual(calls[1], [
+      "send", "--kind", "notice", "--to", "role:lead",
+      "--subject", "A queued matrix run was withdrawn by a signal",
+      "--text", text,
+      "--work-item", "wi_fake_item", "--work-item-revision", "7", "--work-order-message", "4321",
+    ]);
+    assert.deepEqual(JSON.parse(readFileSync(join(output, "withdrawal-report.json"), "utf8")), {
+      version: 1, signal: "SIGTERM", waitMs: sidecar.waitMs, queuePosition: 1, reported: true, messageSeq: 4242,
+    });
+    assert.match(child.text, /matrix run: reported the withdrawal to the lead\n/);
+    assert.deepEqual(readHostState(hostLockFile()).waiters, []);
+  } finally {
+    await holder.release();
+  }
+});
+
+test("detached a7 when tt fails the withdrawn run still exits 143, has left the list, and records why nobody was told", async (t) => {
+  rmSync(fakeTTCalls, { force: true });
+  const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+    output = tempDir(t, "verification-detached-logs-");
+  const holder = await holdHost("wi_a7_holder");
+  try {
+    const child = launcherCLI(t, f, ["run", planFile, output], { ...agentIdentity, FAKE_TT_MODE: "fail" });
+    const { record } = await queuedRun(output, "the run");
+    process.kill(record.pid, "SIGTERM");
+    assert.equal(await child.closed, 143, child.text);
+    assert.equal(runnerRecord(output).exitCode, 143);
+    assert.deepEqual(readHostState(hostLockFile()).waiters, [], "the place is released");
+    const report = JSON.parse(readFileSync(join(output, "withdrawal-report.json"), "utf8"));
+    assert.deepEqual([report.reported, report.reason, report.signal], [false, "the notice failed: work item not found", "SIGTERM"]);
+    assert(!("messageSeq" in report));
+    assert(readFileSync(join(output, "runner.log"), "utf8").includes("matrix run: could not report the withdrawal to the lead: the notice failed: work item not found\n"));
+    // The unlinked notice was still tried once, after the failed context lookup.
+    const calls = fakeTTLookups();
+    assert.deepEqual(calls.map((call) => call[0]), ["context", "send"]);
+    assert(!calls[1].includes("--work-item"));
+    // No agent identity: tt is never called.
+    rmSync(fakeTTCalls, { force: true });
+    const plainOutput = tempDir(t, "verification-detached-logs-");
+    const plain = launcherCLI(t, f, ["run", planFile, plainOutput], { TAILTERM_AGENT: "agt_fake_verifier" });
+    const queued = await queuedRun(plainOutput, "the run without an identity");
+    process.kill(queued.record.pid, "SIGTERM");
+    assert.equal(await plain.closed, 143, plain.text);
+    assert.deepEqual(fakeTTLookups(), []);
+    assert(!existsSync(join(plainOutput, "withdrawal-report.json")));
+  } finally {
+    await holder.release();
+  }
+});
+
+for (const [name, environment] of [
+  ["the release marker", { TAILTERM_MATRIX_RELEASE: "1", ...agentIdentity }],
+  ["the foreground opt-out", { TAILTERM_MATRIX_FOREGROUND: "1" }],
+])
+  test(`detached a8 a7 with ${name} the command is the run itself: its pid waits, no runner files, no report`, async (t) => {
+    rmSync(fakeTTCalls, { force: true });
+    const { f, planFile } = plannedFixture(t, "console.log('ran');"),
+      output = tempDir(t, "verification-detached-logs-");
+    const holder = await holdHost("wi_a8_holder");
+    try {
+      const child = launcherCLI(t, f, ["run", planFile, output], environment);
+      const waiter = await untilHost(() => readHostState(hostLockFile()).waiters[0], "the waiter; saw " + child.text);
+      assert.equal(waiter.pid, child.pid, "the started pid holds the place");
+      assert(!child.text.includes("matrix run: detached"), child.text);
+      child.kill("SIGTERM");
+      assert.equal(await child.closed, 143, child.text);
+      assert.deepEqual(readHostState(hostLockFile()).waiters, []);
+      assert.deepEqual(readdirSync(output).sort(), ["host-lock.json", "host-lock.log"]);
+      assert.deepEqual(fakeTTLookups(), []);
+    } finally {
+      await holder.release();
+    }
+  });
+
+test("detached a10 an output directory inside the worktree is refused before anything is created", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');");
+  // The checkout's real path, as the command itself sees its directory.
+  const worktree = f.git("rev-parse", "--show-toplevel");
+  for (const output of [join(worktree, "logs"), "logs", "."]) {
+    const child = launcherCLI(t, f, ["run", planFile, output]);
+    assert.equal(await child.closed, 1, child.text);
+    assert.match(child.text, /^Logs\/receipt must be outside worktree$/m);
+    assert(!child.text.includes("matrix run:"), child.text);
+  }
+  assert(!existsSync(join(f.cwd, "logs")));
+  assert.equal(f.git("status", "--short"), "");
+  assert.deepEqual(readHostState(hostLockFile())?.waiters ?? [], []);
+  // A path that reaches the checkout through a symbolic link starts no
+  // launcher either: the command stays the run itself.
+  const link = join(tempDir(t, "verification-detached-link-"), "checkout");
+  symlinkSync(worktree, link);
+  const linked = launcherCLI(t, f, ["run", planFile, join(link, "logs")]);
+  assert.notEqual(await linked.closed, 0, linked.text);
+  assert(!linked.text.includes("matrix run:"), linked.text);
+  assert(!existsSync(join(f.cwd, "logs", "runner.log")) && !existsSync(join(f.cwd, "logs", "runner.json")));
 });

@@ -11,6 +11,10 @@ import {
   chmodSync,
   rmSync,
   realpathSync,
+  openSync,
+  closeSync,
+  readSync,
+  renameSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute, dirname, basename } from "node:path";
 import {
@@ -1563,22 +1567,288 @@ export async function runTargeted(context, cwd, output, options = {}) {
   );
 }
 
+// A run or targeted command starts the real run as a detached process before
+// it joins the host waitlist, and then only follows its log. The detached run
+// owns the waitlist place, so stopping the command that started it (a tool
+// call reaching its time limit) no longer withdraws the run
+// (wi_912a9789357529d4). The command stays one process when it is that
+// detached run (TAILTERM_MATRIX_RUN_CHILD=1), when it is the deployer's run,
+// whose pid the release runner tracks (TAILTERM_MATRIX_RELEASE set), when the
+// caller opts out (TAILTERM_MATRIX_FOREGROUND=1), or when the output directory
+// is not outside the worktree, which the run itself refuses.
+const RUNNER_FOLLOW_MS = 200;
+// How long each tt call of a withdrawal report may take.
+const WITHDRAWAL_REPORT_MS = 15000;
+// The launcher creates the output directory, so it only starts when that is
+// outside the worktree both as written (the run's own test) and through any
+// symbolic link on the way to it.
+function outsideWorktree(output) {
+  const outside = (cwd, path) => relative(cwd, path).split("/")[0] === "..";
+  if (!outside(process.cwd(), output)) return false;
+  let existing = output,
+    rest = "";
+  while (!existsSync(existing) && dirname(existing) !== existing) {
+    rest = join(basename(existing), rest);
+    existing = dirname(existing);
+  }
+  try {
+    return outside(realpathSync(process.cwd()), join(realpathSync(existing), rest));
+  } catch {
+    return false;
+  }
+}
+function launchesDetached(mode, file, output, environment = process.env) {
+  return (
+    (mode === "run" || mode === "targeted") &&
+    Boolean(file && output) &&
+    environment.TAILTERM_MATRIX_RUN_CHILD !== "1" &&
+    environment.TAILTERM_MATRIX_RELEASE === undefined &&
+    environment.TAILTERM_MATRIX_FOREGROUND !== "1" &&
+    outsideWorktree(resolve(output))
+  );
+}
+function readRunnerRecord(output) {
+  try {
+    return JSON.parse(readFileSync(join(output, "runner.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+function writeRunnerRecord(output, record) {
+  const path = join(output, "runner.json");
+  writeFileSync(path + "." + process.pid, JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
+  renameSync(path + "." + process.pid, path);
+}
+// Signal 0 probes without signalling; a pid we may not signal is alive.
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+// The recorded run is still the one to follow: no exit recorded, its pid is
+// alive, and that pid is a matrix runner rather than a reused number.
+function recordedRunAlive(record) {
+  if (!Number.isSafeInteger(record?.pid) || record.pid <= 0 || record.exitCode !== undefined)
+    return false;
+  if (!pidAlive(record.pid)) return false;
+  const ps = spawnSync("ps", ["-p", String(record.pid), "-o", "command="], { encoding: "utf8" });
+  return ps.status === 0 && ps.stdout.includes("verify-matrix.mjs");
+}
+// Starts the run detached, or re-attaches to the one the output directory
+// already records, follows its log, and resolves to the exit code.
+async function launchDetached(argv, output) {
+  mkdirSync(output, { recursive: true });
+  const logPath = join(output, "runner.log");
+  let offset = existsSync(logPath) ? statSync(logPath).size : 0;
+  let pid, child, ended;
+  const recorded = readRunnerRecord(output);
+  if (recordedRunAlive(recorded)) {
+    pid = recorded.pid;
+    console.log(`matrix run: re-attached to pid ${pid}`);
+  } else {
+    const log = openSync(logPath, "a", 0o600);
+    try {
+      child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: ["ignore", log, log],
+        env: { ...process.env, TAILTERM_MATRIX_RUN_CHILD: "1" },
+      });
+    } finally {
+      closeSync(log);
+    }
+    child.on("error", (error) => (ended ??= { error }));
+    child.on("exit", (code, signal) => (ended ??= { code, signal }));
+    if (!child.pid) {
+      await new Promise((resolve) => setImmediate(resolve));
+      throw new Error("Could not start the detached matrix run: " + (ended?.error?.message || "no pid"));
+    }
+    pid = child.pid;
+    writeRunnerRecord(output, {
+      version: 1,
+      pid,
+      startedAt: new Date().toISOString(),
+      argv,
+      log: logPath,
+    });
+    child.unref();
+    console.log(
+      `matrix run: detached as pid ${pid}; log ${logPath}; it keeps running if this command is stopped. ` +
+        `Run the same command to re-attach; stop the run with: kill ${pid}`,
+    );
+  }
+  const logFile = openSync(logPath, "r");
+  const buffer = Buffer.alloc(65536);
+  const drain = () => {
+    for (;;) {
+      const read = readSync(logFile, buffer, 0, buffer.length, offset);
+      if (!read) return;
+      offset += read;
+      process.stdout.write(buffer.subarray(0, read));
+    }
+  };
+  let stopped = "";
+  const handlers = {
+    // Only an interactive cancel stops the run; it then ends through its own
+    // interruption path and this command reports its exit code.
+    SIGINT: () => {
+      try {
+        process.kill(pid, "SIGINT");
+      } catch {}
+    },
+    SIGTERM: () => (stopped ||= "SIGTERM"),
+    SIGHUP: () => (stopped ||= "SIGHUP"),
+  };
+  for (const [signal, handler] of Object.entries(handlers)) process.on(signal, handler);
+  try {
+    for (;;) {
+      const over = child ? ended : !pidAlive(pid);
+      drain();
+      if (stopped) {
+        console.log(
+          `matrix run: this command was stopped by ${stopped}; the run continues as pid ${pid}, log ${logPath}`,
+        );
+        return stopped === "SIGHUP" ? 129 : 143;
+      }
+      if (over) break;
+      await new Promise((resolve) => setTimeout(resolve, RUNNER_FOLLOW_MS));
+    }
+  } finally {
+    closeSync(logFile);
+    for (const [signal, handler] of Object.entries(handlers)) process.off(signal, handler);
+  }
+  if (child && Number.isInteger(ended.code)) return ended.code;
+  const code = child ? undefined : readRunnerRecord(output)?.exitCode;
+  if (Number.isInteger(code) && readRunnerRecord(output)?.pid === pid) return code;
+  console.log(
+    `matrix run: pid ${pid} ended without recording an exit code` +
+      (ended?.signal ? ` (killed by ${ended.signal})` : ""),
+  );
+  return 1;
+}
+// The detached run records how it ended for a command that re-attached.
+function recordRunnerExit(output) {
+  process.on("exit", (code) => {
+    try {
+      // Only its own record: another run may have been started for the same
+      // directory, and the host lock refuses one of the two.
+      const record = readRunnerRecord(output);
+      if (record?.pid === process.pid)
+        writeRunnerRecord(output, { ...record, exitCode: code, endedAt: new Date().toISOString() });
+    } catch {}
+  });
+}
+function reportingTT(args, what) {
+  const result = spawnSync("tt", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: WITHDRAWAL_REPORT_MS,
+    killSignal: "SIGKILL",
+  });
+  if (result.error)
+    throw new Error(
+      result.error.code === "ETIMEDOUT"
+        ? `${what} timed out after ${WITHDRAWAL_REPORT_MS} ms`
+        : `${what} could not run: ${result.error.message}`,
+    );
+  if (result.status !== 0)
+    throw new Error(
+      `${what} failed: ` +
+        ((result.stderr || "").trim().split("\n").pop() ||
+          (result.signal ? "signal " + result.signal : "exit " + result.status)),
+    );
+  return result.stdout;
+}
+// A run withdrawn by a signal while it was queued tells its item lead why, so
+// the loss is not only in its own log directory. The deployer reports its own
+// runs and a person's shell has no agent identity: neither sends anything. The
+// place is already released when this runs, and a failed report is recorded
+// and never retried.
+function reportWithdrawal({ output, signal, item, commit }, environment = process.env) {
+  if (environment.TAILTERM_MATRIX_RELEASE !== undefined) return;
+  if (!environment.TAILTERM_AGENT || !environment.TAILTERM_TASK) return;
+  let sidecar = {};
+  try {
+    sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+  } catch {}
+  const report = {
+    version: 1,
+    signal,
+    waitMs: sidecar.waitMs ?? null,
+    queuePosition: sidecar.queuePosition ?? null,
+  };
+  let binding;
+  try {
+    binding = JSON.parse(reportingTT(["context", "--json"], "the context lookup"))?.binding;
+  } catch {}
+  const linked =
+    typeof binding?.itemId === "string" &&
+    Number.isSafeInteger(binding.itemRevision) &&
+    Number.isSafeInteger(binding.workOrderMessage?.seq);
+  const named = item || (linked ? binding.itemId : "") || sidecar.item;
+  const agent = environment.TAILTERM_AGENT_NAME || environment.TAILTERM_AGENT;
+  const text =
+    `${agent}'s matrix run` +
+    (named && named !== "unknown" ? ` for ${named}` : "") +
+    (commit ? ` at ${String(commit).slice(0, 12)}` : "") +
+    ` was withdrawn by ${signal}` +
+    (Number.isFinite(sidecar.waitMs) ? ` after waiting ${Math.round(sidecar.waitMs / 60000)} min` : "") +
+    (sidecar.queuePosition ? `, joined at position ${sidecar.queuePosition}` : "") +
+    `; no check ran and no receipt exists. Logs: ${output}. Start it again with the same command.`;
+  try {
+    const sent = reportingTT(
+      [
+        "send", "--kind", "notice", "--to", "role:lead",
+        "--subject", "A queued matrix run was withdrawn by a signal",
+        "--text", text,
+        ...(linked
+          ? [
+              "--work-item", binding.itemId,
+              "--work-item-revision", String(binding.itemRevision),
+              "--work-order-message", String(binding.workOrderMessage.seq),
+            ]
+          : []),
+      ],
+      "the notice",
+    );
+    const seq = /#(\d+)/.exec(sent);
+    Object.assign(report, { reported: true }, seq ? { messageSeq: Number(seq[1]) } : {});
+    console.log("matrix run: reported the withdrawal to the lead");
+  } catch (error) {
+    Object.assign(report, { reported: false, reason: error.message });
+    console.log("matrix run: could not report the withdrawal to the lead: " + error.message);
+  }
+  try {
+    writeFileSync(join(output, "withdrawal-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
+  } catch {}
+}
+
 if (
   process.argv[1] &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
+  const [mode, file, output, ...flags] = process.argv.slice(2);
+  const launches = launchesDetached(mode, file, output);
   const interruption = new AbortController();
   let interruptedBy = "";
-  for (const signal of ["SIGINT", "SIGTERM"])
-    process.on(signal, () => {
-      interruptedBy ||= signal;
-      interruption.abort(interruptedBy);
-      process.exitCode = signal === "SIGINT" ? 130 : 143;
-    });
+  if (!launches)
+    for (const signal of ["SIGINT", "SIGTERM"])
+      process.on(signal, () => {
+        interruptedBy ||= signal;
+        interruption.abort(interruptedBy);
+        process.exitCode = signal === "SIGINT" ? 130 : 143;
+      });
+  if (!launches && output && mode !== "plan" && process.env.TAILTERM_MATRIX_RUN_CHILD === "1")
+    recordRunnerExit(resolve(output));
+  let input, item;
   try {
-    const [mode, file, output, ...flags] = process.argv.slice(2),
-      input = JSON.parse(readFileSync(file, "utf8"));
-    if (mode === "plan") {
+    input = JSON.parse(readFileSync(file, "utf8"));
+    if (launches)
+      process.exitCode = await launchDetached(process.argv.slice(2), resolve(output));
+    else if (mode === "plan") {
       const { plan, preserved, selection } = planWithPreservation(
         input,
         process.cwd(),
@@ -1624,7 +1894,7 @@ if (
       let keepHome = false;
       let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
       let jobs = defaultJobs();
-      let priority, item;
+      let priority;
       let maxWaitMs = DEFAULT_HOST_WAIT_MS;
       for (let i = 0; i < flags.length; i++) {
         if (flags[i] === "--keep-home") keepHome = true;
@@ -1696,6 +1966,13 @@ if (
       );
   } catch (e) {
     console.error(e.message);
+    if (e.code === "withdrawn" && interruptedBy)
+      reportWithdrawal({
+        output: resolve(output),
+        signal: interruptedBy,
+        item: input?.itemId || item,
+        commit: input?.commit,
+      });
     process.exitCode =
       interruptedBy === "SIGINT" ? 130 : interruptedBy === "SIGTERM" ? 143 : (e.exitCode ?? 1);
   }
