@@ -1634,3 +1634,48 @@ func TestTeamQueueCLIDefaultLaneNoticeFailureKeepsEntry(t *testing.T) {
 		t.Fatalf("refused notice was stored: %+v", notices)
 	}
 }
+
+// a7 (review b1): with --json every line add prints itself, the intake owns
+// line, the worktree line and the lane line, goes to stderr, so stdout is
+// exactly the entry JSON.
+func TestTeamQueueCLIDefaultLaneJSONStdoutIsOnlyTheEntry(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	item, order := laneFixtureItem(t, f, "bug", "json-intake-bug", "client/x.js", "tests/x.test.js")
+	worktree := filepath.Join(repo, ".build", "worktrees", "queue-"+strings.TrimPrefix(item.ID, "wi_")[:8])
+	oldErr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	out, runErr := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--json"})
+	})
+	_ = w.Close()
+	os.Stderr = oldErr
+	stderr, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if runErr != nil || readErr != nil {
+		t.Fatalf("json add %v %v", runErr, readErr)
+	}
+	dec := json.NewDecoder(strings.NewReader(out))
+	var saved api.TeamQueueEntry
+	if err := dec.Decode(&saved); err != nil || saved.ItemID != item.ID || saved.Template != "small" {
+		t.Fatalf("stdout is not the entry: %q %v", out, err)
+	}
+	if realCwd, _ := filepath.EvalSymlinks(saved.Cwd); realCwd != worktree {
+		t.Fatalf("entry cwd %s, want the new worktree %s", saved.Cwd, worktree)
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		t.Fatalf("stdout holds more than one JSON value: %q", out)
+	}
+	for _, line := range []string{"owns client/x.js,tests/x.test.js (from the scope confirmation)\n", "worktree ", "template small: bug owning 2 paths (default)\n"} {
+		if strings.Contains(out, line) || !strings.Contains(string(stderr), line) {
+			t.Fatalf("%q belongs on stderr only\nstdout %q\nstderr %q", line, out, stderr)
+		}
+	}
+}

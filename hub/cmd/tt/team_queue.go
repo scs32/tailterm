@@ -316,6 +316,11 @@ func cmdTeamQueue(e env, args []string) error {
 		if itemErr != nil {
 			return itemErr
 		}
+		// With --json stdout holds only the entry; add's own lines go to stderr.
+		notes := os.Stdout
+		if *jsonOut {
+			notes = os.Stderr
+		}
 		if len(ownership) == 0 && !*serial {
 			// Ownership comes from the handler's intake record for the
 			// item's current revision and this order.
@@ -325,7 +330,7 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 			ownership = intake
 			if len(ownership) > 0 {
-				fmt.Printf("owns %s (from the scope confirmation)\n", strings.Join(ownership, ","))
+				fmt.Fprintf(notes, "owns %s (from the scope confirmation)\n", strings.Join(ownership, ","))
 			}
 		}
 		if parallel && len(ownership) == 0 && !*serial {
@@ -345,12 +350,7 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 			why += " reason=" + recorded
 		}
-		// With --json stdout holds only the entry.
-		laneOut := os.Stdout
-		if *jsonOut {
-			laneOut = os.Stderr
-		}
-		fmt.Fprintf(laneOut, "template %s: %s\n", lane, why)
+		fmt.Fprintf(notes, "template %s: %s\n", lane, why)
 		if *cwd == "" && !*noNewWorktree && !*newWorktree {
 			// A parallel project gives each entry its own worktree by default.
 			*newWorktree = parallel
@@ -377,7 +377,7 @@ func cmdTeamQueue(e env, args []string) error {
 					_ = exec.Command("git", "-C", checkout, "worktree", "remove", "--force", createdWorktree).Run()
 				}
 			}()
-			fmt.Printf("worktree %s\n", *cwd)
+			fmt.Fprintf(notes, "worktree %s\n", *cwd)
 		}
 		if *cwd == "" {
 			*cwd, err = os.Getwd()
