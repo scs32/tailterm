@@ -1744,6 +1744,9 @@ type handlerNeedContext struct {
 	leasedByActive     map[string]bool
 	effectiveLimit     int
 	effectiveLimitText string
+	// primaryID is the project's recorded primary handler, which the handler
+	// floor lets an operator rotate but not retire.
+	primaryID string
 }
 
 func loadHandlerNeedContext(ctx context.Context, q queryRower, p api.HandlerArmPolicy, active []api.TeamQueueEntry, limit, maxAgents int, now time.Time) (*handlerNeedContext, error) {
@@ -1762,6 +1765,9 @@ func loadHandlerNeedContext(ctx context.Context, q queryRower, p api.HandlerArmP
 		}
 	}
 	if c.capOpen, c.capSeats, err = projectAgentCapUsage(ctx, q, p.TaskID); err != nil {
+		return nil, err
+	}
+	if err = q.QueryRowContext(ctx, `SELECT primary_handler_id FROM tasks WHERE id=?`, p.TaskID).Scan(&c.primaryID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	pending, state, err := reservedHandlerProvision(ctx, q, p.TaskID, now)
@@ -1809,6 +1815,7 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		first := c.handlers[0]
 		n.Runtime, n.Model, n.Reasoning, n.TemplateDigest = first.Runtime, first.Model, first.Reasoning, first.TemplateDigest
 	}
+	var offline []api.HandlerArmHandler
 	for _, h := range c.handlers {
 		if h.Runtime != n.Runtime || h.Model != n.Model || h.Reasoning != n.Reasoning {
 			continue
@@ -1817,12 +1824,33 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		if c.leasedByActive[h.AgentID] {
 			n.Leased++
 		}
+		if !h.Online {
+			offline = append(offline, h)
+		}
 	}
 	if n.Handlers >= c.effectiveLimit {
-		// The limit already has its handlers; they are busy or offline, and
-		// another one would not be within the limit.
+		// The limit already has its handlers, and another one would not be
+		// within the limit. Busy ones free themselves: the reason stays the
+		// plain wait. An offline one does not come back by itself, so the
+		// reason names it and the command an operator runs; the hub runs
+		// nothing.
 		n.Reason = fmt.Sprintf("%d of %d leased, limit %s; the limit already has its handlers", n.Leased, n.Handlers, c.effectiveLimitText)
-		return n, "", nil
+		if len(offline) == 0 {
+			return n, "", nil
+		}
+		// Either command frees a place; the retire is the lighter one, so a
+		// handler that is not the primary comes first.
+		first := offline[0]
+		for _, h := range offline {
+			if h.AgentID != c.primaryID {
+				first = h
+				break
+			}
+		}
+		var recovery string
+		n.Fix, recovery = c.offlineHandlerFix(e.TaskID, first)
+		n.Reason += fmt.Sprintf(", and %s. The hub does not restart a handler; an operator can %s. Fix: %s", offlineHandlerNames(offline), recovery, n.Fix)
+		return n, ": " + n.Reason, nil
 	}
 	counts := fmt.Sprintf("%d of %d leased, limit %s", n.Leased, n.Handlers, c.effectiveLimitText)
 	lower := fmt.Sprintf("tt team queue limit --task %s --limit %d", e.TaskID, n.Handlers)
@@ -1877,6 +1905,36 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		}
 	}
 	return n, ": " + n.Reason, nil
+}
+
+// offlineHandlerFix is the command an operator runs for an offline handler
+// that holds a place in the limit, and what it does. A retired handler no
+// longer counts, so the need falls below the limit and the provisioning rules
+// apply. The handler floor refuses to retire the primary, which is rotated.
+func (c *handlerNeedContext) offlineHandlerFix(task string, h api.HandlerArmHandler) (fix, recovery string) {
+	if h.AgentID == c.primaryID {
+		return fmt.Sprintf("tt handler rotate --task %s", task), fmt.Sprintf("rotate %s, the primary, to a successor", provisionText(h.Name))
+	}
+	name := h.Name
+	if !api.ValidName(name) || strings.HasPrefix(name, "-") {
+		// tt retire also resolves an agent ID, which no shell or flag parser
+		// misreads.
+		name = h.AgentID
+	}
+	return fmt.Sprintf("tt retire --task %s %s", task, name), fmt.Sprintf("retire %s so that it stops counting and one can be added", provisionText(h.Name))
+}
+
+// offlineHandlerNames lists offline handlers in lease order: "a is offline",
+// "a and b are offline".
+func offlineHandlerNames(offline []api.HandlerArmHandler) string {
+	names := make([]string, len(offline))
+	for i, h := range offline {
+		names[i] = provisionText(h.Name)
+	}
+	if len(names) == 1 {
+		return names[0] + " is offline"
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1] + " are offline"
 }
 
 // provisionText makes a runner-supplied value safe to show in a reason: one

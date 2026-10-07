@@ -396,7 +396,10 @@ func TestHandlerArmLeaseWaitsFallsBackAndSkipsUnmatchedRuns(t *testing.T) {
 		t.Fatalf("busy arm left %d rows", n)
 	}
 	list, err := f.s.ListTeamQueue(ctx, f.task.ID)
-	if err != nil || list.Entries[0].BlockReason != "Waiting for a free handler of arm S" {
+	// The arm's only handler fills the limit of one and is offline, so the
+	// wait names it and the operator's fix (h1).
+	if err != nil || list.Entries[0].BlockReason != "Waiting for a free handler of arm S: 0 of 1 leased, limit 1; the limit already has its handlers, and handler-s is offline. "+
+		"The hub does not restart a handler; an operator can retire handler-s so that it stops counting and one can be added. Fix: tt retire --task "+f.task.ID+" handler-s" {
 		t.Fatalf("list reason %q %v", list.Entries[0].BlockReason, err)
 	}
 	f.policy(t, "fallback", 1, true, true, seed)
@@ -1513,7 +1516,8 @@ func TestHandlerProvisionIsBounded(t *testing.T) {
 	}
 
 	// With the limit's handlers all present, none is added even though one
-	// is offline and the entry waits: the reason stays the plain arm wait.
+	// is offline and the entry waits: the reason names the offline handler
+	// and the operator's fix (h1) instead of the plain arm wait.
 	g := newProvisionFixture(t, 3, 3, 2)
 	leased := map[string]bool{g.entries[0].HandlerID: true, g.entries[1].HandlerID: true}
 	for _, a := range g.sArms {
@@ -1522,7 +1526,9 @@ func TestHandlerProvisionIsBounded(t *testing.T) {
 		}
 	}
 	held := listedEntry(t, g.s, g.task.ID, g.entries[2].ID)
-	if held.HandlerNeed == nil || held.HandlerNeed.Provision || held.HandlerNeed.Handlers != 3 || held.HandlerNeed.Leased != 2 || held.BlockReason != "Waiting for a free handler of arm S" {
+	if held.HandlerNeed == nil || held.HandlerNeed.Provision || held.HandlerNeed.Handlers != 3 || held.HandlerNeed.Leased != 2 ||
+		!strings.HasPrefix(held.BlockReason, "Waiting for a free handler of arm S: 2 of 3 leased, limit 3; the limit already has its handlers, and ") ||
+		!strings.HasSuffix(held.BlockReason, " Fix: "+held.HandlerNeed.Fix) || !strings.HasPrefix(held.HandlerNeed.Fix, "tt retire --task "+g.task.ID+" handler-s") {
 		t.Fatalf("at-limit need %+v %q", held.HandlerNeed, held.BlockReason)
 	}
 	if _, err := g.provision(held, "at-limit", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || g.allRows(t) != 0 {
@@ -1584,7 +1590,8 @@ func TestHandlerProvisionAbandonsUnregisteredReservation(t *testing.T) {
 
 // a7, a8: a reserved handler that registered but never came online is
 // abandoned too, yet it is an open handler, so it counts toward the limit and
-// no further one is reserved on top of it.
+// no further one is reserved on top of it. Being offline at the limit, it is
+// named with the operator's fix (h1).
 func TestHandlerProvisionAbandonedRegisteredHandlerStillCounts(t *testing.T) {
 	f := newProvisionFixture(t, 4, 3, 3)
 	q := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
@@ -1601,7 +1608,10 @@ func TestHandlerProvisionAbandonedRegisteredHandlerStillCounts(t *testing.T) {
 	f.clock = f.clock.Add(handlerProvisionAbandonAfter)
 	observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
 	got := listedEntry(t, f.s, f.task.ID, q.ID)
-	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Handlers != 4 || got.BlockReason != "Waiting for a free handler of arm S" {
+	stuckFix := "tt retire --task " + f.task.ID + " handler-stuck"
+	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Handlers != 4 || got.HandlerNeed.Fix != stuckFix ||
+		!strings.HasPrefix(got.BlockReason, "Waiting for a free handler of arm S: 3 of 4 leased, limit 4; the limit already has its handlers, and handler-stuck is offline. ") ||
+		!strings.HasSuffix(got.BlockReason, "Fix: "+stuckFix) {
 		t.Fatalf("stuck handler need %+v %q", got.HandlerNeed, got.BlockReason)
 	}
 	if _, err := f.provision(got, "after-stuck", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
@@ -1712,5 +1722,156 @@ func TestHandlerProvisionWithoutPolicy(t *testing.T) {
 	}
 	if _, err := f.provision(q, "plain", api.NewID("agt"), armS, digestP); err != nil || f.rows(t, "reserved") != 1 || f.rows(t, "refused") != 0 {
 		t.Fatalf("provision without policy: %v", err)
+	}
+}
+
+// offlineLimitFixture is a parallel queue at its limit of two arm-S handlers:
+// one leased by the first entry, the other free. It returns the free one.
+func offlineLimitFixture(t *testing.T) (*provisionFixture, api.Agent) {
+	t.Helper()
+	f := newProvisionFixture(t, 2, 2, 1)
+	for _, h := range f.sArms {
+		if h.ID != f.entries[0].HandlerID {
+			return f, h
+		}
+	}
+	t.Fatal("no free arm-S handler")
+	return nil, api.Agent{}
+}
+
+const armLimitWait = "Waiting for a free handler of arm S"
+
+// h1: at the limit an offline handler is named with the command an operator
+// runs: retire for an ordinary handler, rotate for the primary. The hub writes
+// and starts nothing, and after the retire the provisioning rules apply.
+func TestHandlerNeedNamesOfflineHandlerAtLimit(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	f.offline(t, idle)
+	retire := "tt retire --task " + f.task.ID + " " + idle.Name
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	n := got.HandlerNeed
+	if n == nil || n.Provision || n.Refused || n.Handlers != 2 || n.Leased != 1 || n.Attempt != 0 || n.AgentID != "" || n.Fix != retire {
+		t.Fatalf("offline need %+v", n)
+	}
+	want := armLimitWait + ": 1 of 2 leased, limit 2; the limit already has its handlers, and " + idle.Name + " is offline. " +
+		"The hub does not restart a handler; an operator can retire " + idle.Name + " so that it stops counting and one can be added. Fix: " + retire
+	if got.BlockReason != want {
+		t.Fatalf("offline reason %q", got.BlockReason)
+	}
+	// The limit still refuses a provision; nothing is reserved or announced.
+	if _, err := f.provision(got, "offline-at-limit", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("provision at the limit: %v", err)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("the offline reason wrote a provision")
+	}
+
+	// The handler floor refuses to retire the primary, so it is rotated.
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, idle.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	rotate := "tt handler rotate --task " + f.task.ID
+	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	if got.HandlerNeed.Fix != rotate || got.HandlerNeed.Provision || !strings.Contains(got.BlockReason, idle.Name+" is offline. ") ||
+		!strings.HasSuffix(got.BlockReason, "an operator can rotate "+idle.Name+", the primary, to a successor. Fix: "+rotate) {
+		t.Fatalf("offline primary need %+v reason %q", got.HandlerNeed, got.BlockReason)
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id='' WHERE id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A name the flag parser would misread is given as the agent ID.
+	c := &handlerNeedContext{}
+	if fix, _ := c.offlineHandlerFix("tsk_x", api.HandlerArmHandler{AgentID: "agt_x", Name: "-odd"}); fix != "tt retire --task tsk_x agt_x" {
+		t.Fatalf("odd name fix %q", fix)
+	}
+
+	// The stated recovery, run by the operator: the retired handler stops
+	// counting and the entry is back under the provisioning rules.
+	retired := api.AgentRetired
+	if _, err := f.s.UpdateAgent(context.Background(), idle.ID, api.UpdateAgentRequest{Status: &retired}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	if n := got.HandlerNeed; n == nil || !n.Provision || n.Handlers != 1 || n.Attempt != 1 || got.BlockReason != armLimitWait+": 1 of 1 leased, limit 2; the runner is adding one" {
+		t.Fatalf("after retire %+v reason %q", n, got.BlockReason)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("listing wrote a provision")
+	}
+}
+
+// h1: every offline handler is named in lease order; the fix is the first's.
+func TestHandlerNeedNamesEveryOfflineHandlerAtLimit(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	var leased api.Agent
+	for _, h := range f.sArms {
+		if h.ID == f.entries[0].HandlerID {
+			leased = h
+		}
+	}
+	f.offline(t, idle)
+	f.offline(t, leased)
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	// The fixture's handlers share one creation time, so either may be first.
+	a, b := f.sArms[0].Name, f.sArms[1].Name
+	if !strings.Contains(got.BlockReason, "the limit already has its handlers, and "+a+" and "+b+" are offline. ") {
+		a, b = b, a
+	}
+	if !strings.Contains(got.BlockReason, "the limit already has its handlers, and "+a+" and "+b+" are offline. ") || got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+a ||
+		!strings.Contains(got.BlockReason, "an operator can retire "+a+" so that") {
+		t.Fatalf("two offline: %+v reason %q", got.HandlerNeed, got.BlockReason)
+	}
+	// With the first one the primary, the lighter retire of the other is the fix.
+	primary, other := f.sArms[0], f.sArms[1]
+	if primary.Name != a {
+		primary, other = other, primary
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, primary.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID); got.HandlerNeed.Fix != "tt retire --task "+f.task.ID+" "+other.Name {
+		t.Fatalf("offline primary first: %+v", got.HandlerNeed)
+	}
+}
+
+// h2: at the limit with every handler online (the free one is held by an open
+// rotation) the reason is the plain wait, as before.
+func TestHandlerNeedOnlineAtLimitKeepsPlainWait(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	now := ts(time.Now())
+	if _, err := f.s.db.Exec(`INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at) VALUES('hrot_fixture',?,'rotate','hash','prepared','fixture','owner',1,?,?,?,'agt_successor','successor',?,?)`,
+		f.task.ID, idle.ID, idle.RunID, idle.Name, now, now); err != nil {
+		t.Fatal(err)
+	}
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	n := got.HandlerNeed
+	if n == nil || n.Provision || n.Fix != "" || n.Handlers != 2 || n.Leased != 1 || n.Reason != "1 of 2 leased, limit 2; the limit already has its handlers" {
+		t.Fatalf("online need %+v", n)
+	}
+	if got.BlockReason != armLimitWait {
+		t.Fatalf("online reason %q", got.BlockReason)
+	}
+	if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+		t.Fatal("listing wrote a provision")
+	}
+}
+
+// h2: below the limit an offline handler changes nothing: the provisioning
+// reason, the counts and the reservation are the ones of an online project.
+func TestHandlerNeedOfflineBelowLimitKeepsProvisioning(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	f.offline(t, f.sArms[2])
+	got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+	n := got.HandlerNeed
+	if n == nil || !n.Provision || n.Fix != "" || n.Handlers != 3 || n.Leased != 3 || n.Attempt != 1 {
+		t.Fatalf("below the limit %+v", n)
+	}
+	if got.BlockReason != armLimitWait+": 3 of 3 leased, limit 4; the runner is adding one" {
+		t.Fatalf("below the limit reason %q", got.BlockReason)
+	}
+	agent := api.NewID("agt")
+	reserved, err := f.provision(got, runnerKey(got), agent, armS, digestP)
+	if err != nil || reserved.HandlerNeed == nil || reserved.HandlerNeed.AgentID != agent || f.rows(t, "reserved") != 1 || f.notices(t, provisionNotice) != 1 {
+		t.Fatalf("provision below the limit: %+v %v", reserved.HandlerNeed, err)
 	}
 }

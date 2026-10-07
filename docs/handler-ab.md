@@ -220,8 +220,39 @@ the command has no `--run`, which `tt handler spec` refuses, and the note says
 to add it. A saved value no handler could have, such as a runtime taken from
 a run command given by path, is refused the same way with the value shown;
 control characters are removed and long values cut. Without a policy the spec
-reasons say `the handlers in use needs` instead of `arm S needs`. When the limit already has its handlers (they are
-busy or offline), the reason stays the plain wait and nothing is added.
+reasons say `the handlers in use needs` instead of `arm S needs`.
+
+**At the limit.** When the limit already has its handlers of the wanted
+settings, nothing is added: another handler would not be within the limit, and
+a provision request answers 409. What the entry says depends on whether one of
+those handlers is offline (the hub has not heard from it for 90 seconds).
+
+| Case | Entry reason |
+| --- | --- |
+| Every handler is online (busy, or held by an open rotation) | `Waiting for a free handler of arm S`, unchanged; the counts are in the entry's handler need only |
+| One is offline | `Waiting for a free handler of arm S: 1 of 2 leased, limit 2; the limit already has its handlers, and NAME is offline. The hub does not restart a handler; an operator can retire NAME so that it stops counting and one can be added. Fix: tt retire --task TSK NAME` |
+| The offline one is the primary | the same up to `…restart a handler;`, then ` an operator can rotate NAME, the primary, to a successor. Fix: tt handler rotate --task TSK` |
+| Several are offline | `…, and NAME1 and NAME2 are offline. …` (`NAME1, NAME2 and NAME3` for more), in lease order; the recovery and the fix are for the first that is not the primary |
+
+A busy handler frees itself, so that wait needs no action. An offline one does
+not come back by itself, and until an operator acts the entry waits. The hub
+only states the command: it never starts, stops, retires or rotates a handler
+here, and the listing writes nothing. The operator's recovery is:
+
+- **`tt retire --task TSK NAME`** for a handler that is not the primary. A
+  retired handler no longer counts toward `handlers`, so the entry is below
+  the limit again and the rules above apply: with the switch on and room under
+  the agent cap the runner adds a replacement, otherwise the reason names that
+  fix. `tt resume NAME` undoes it if the handler comes back. For a name that
+  starts with `-` the command gives the agent ID instead.
+- **`tt handler rotate --task TSK`** for the primary. The hub refuses to
+  retire or close the primary; rotation, run on the old handler's host, moves
+  the role to a successor and closes the old handler, which then no longer
+  counts (see `docs/handler-rotation.md`).
+
+With several offline handlers the next listing names the remaining ones once
+the first is dealt with. An offline handler below the limit changes nothing:
+the entry keeps the provisioning reason above.
 
 A refused spec is stored as one `refused` row per entry and is the entry's
 standing reason. The runner keeps offering its spec each pass, so saving a
