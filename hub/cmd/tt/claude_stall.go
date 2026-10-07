@@ -109,7 +109,7 @@ type claudeStall struct {
 	Outcome string `json:"outcome,omitempty"`
 
 	// The notice is written once and sent unchanged, so a retry or a restarted
-	// relay replays the same request. EscalatedAt is the repeat notice.
+	// relay replays the same request. EscalatedAt is set with a repeat's notice.
 	Notice        string    `json:"notice,omitempty"`
 	NoticedAt     time.Time `json:"noticedAt,omitempty"`
 	NoticeTriedAt time.Time `json:"noticeTriedAt,omitempty"`
@@ -169,7 +169,10 @@ func loadClaudeStall(b runtimeBinding) claudeStall {
 // ~/.config/tailterm/relay.json, beside hub.json. It is read at each
 // detection, so a change needs no relay restart. A missing or unreadable
 // file, malformed JSON, a missing key or any value other than "interrupt"
-// means report: the relay then sends no key and types nothing.
+// means report: the relay then sends no key and types nothing. The key is
+// read by its exact name from a map: encoding/json would match a struct field
+// without regard to case, so "claudestallaction" would count, and would even
+// override the real key when both are present.
 func relayStallAction() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -179,10 +182,9 @@ func relayStallAction() string {
 	if err != nil || len(data) > 64<<10 {
 		return claudeStallReport
 	}
-	var config struct {
-		Action string `json:"claudeStallAction"`
-	}
-	if json.Unmarshal(data, &config) != nil || config.Action != claudeStallInterrupt {
+	var config map[string]json.RawMessage
+	var action string
+	if json.Unmarshal(data, &config) != nil || json.Unmarshal(config["claudeStallAction"], &action) != nil || action != claudeStallInterrupt {
 		return claudeStallReport
 	}
 	return claudeStallInterrupt
@@ -733,7 +735,7 @@ func claudeStallNoticeText(b runtimeBinding, s claudeStall) string {
 	}
 	switch {
 	case s.Count > 1:
-		text += "The relay sent no key and typed nothing: it never interrupts a run after its first stall. This is a repeat, so the agent needs a person. Later stalls of this run are recorded and shown as stuck but not reported again."
+		text += "The relay sent no key and typed nothing: it never interrupts a run after its first stall. This is a repeat, so the agent needs a person."
 	case !s.InterruptedAt.IsZero() && strings.HasPrefix(s.Outcome, "interrupt key failed"):
 		text += "The relay tried to interrupt the turn at " + s.InterruptedAt.Format(time.RFC3339) + " and the key could not be sent. It will not try again for this stall and typed nothing. The agent needs a person."
 	case !s.InterruptedAt.IsZero() && !s.EndedAt.IsZero():
@@ -753,11 +755,11 @@ func claudeStallNoticeText(b runtimeBinding, s claudeStall) string {
 	return text
 }
 
-// claudeStallNotify posts the notice of a run's first stall and of its second
-// (the repeat), each once. The text is frozen in the record before the first
-// attempt; a failed attempt is tried again at most once a minute.
+// claudeStallNotify posts one notice for every stall, once. A stall after the
+// run's first is marked as a repeat. The text is frozen in the record before
+// the first attempt; a failed attempt is tried again at most once a minute.
 func claudeStallNotify(ctx context.Context, b runtimeBinding, ops claudeStallOps, s *claudeStall, now time.Time) {
-	if ops.notify == nil || !s.NoticedAt.IsZero() || s.Count > 2 || (!s.NoticeTriedAt.IsZero() && now.Sub(s.NoticeTriedAt) < claudeStallNoticeRetry) {
+	if ops.notify == nil || !s.NoticedAt.IsZero() || (!s.NoticeTriedAt.IsZero() && now.Sub(s.NoticeTriedAt) < claudeStallNoticeRetry) {
 		return
 	}
 	if s.Notice == "" {

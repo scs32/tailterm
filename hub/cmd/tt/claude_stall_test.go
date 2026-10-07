@@ -601,8 +601,8 @@ func (f *stallFixture) stallAgain(t *testing.T) string {
 
 // h5 (s2): a second stall in the same run is never interrupted. It posts one
 // notice marked as a repeat; a failed post is retried under the same text, and
-// neither a retry nor a restarted relay posts it twice. A third stall is
-// recorded but not reported.
+// neither a retry nor a restarted relay posts it twice. A third stall posts
+// its own repeat notice, once, and is not interrupted either.
 func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 	f := newStallFixture(t)
 	f.setAction(`{"claudeStallAction":"interrupt"}`)
@@ -661,7 +661,8 @@ func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 	if len(restarted.notices) != 0 || len(restarted.keys) != keys || len(restarted.sent) != sent {
 		t.Fatalf("restarted relay acted again: notices=%d keys=%q sent=%q", len(restarted.notices), restarted.keys, restarted.sent)
 	}
-	// A third stall of the run: recorded and stuck, no key, no further notice.
+	// A third stall of the run: recorded and stuck, no key, and one notice of
+	// its own, under its own identity, marked as a repeat.
 	f.now = restarted.now
 	f.appendAssistant(f.now)
 	f.advance(20 * time.Second)
@@ -670,8 +671,28 @@ func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 	}
 	posted := len(f.notices)
 	f.stallAgain(t)
-	if s := f.record(); !s.active() || s.Count != 3 || len(f.notices) != posted || len(f.keys) != keys || len(f.sent) != sent {
-		t.Fatalf("third stall: %+v notices=%d keys=%q", s, len(f.notices), f.keys)
+	third := f.record()
+	if !third.active() || third.Count != 3 || !third.InterruptedAt.IsZero() || len(f.keys) != keys || len(f.sent) != sent {
+		t.Fatalf("third stall: %+v keys=%q", third, f.keys)
+	}
+	if len(f.notices) != posted+1 || third.NoticedAt.IsZero() || !third.EscalatedAt.Equal(third.NoticedAt) {
+		t.Fatalf("third stall posted %d notices, want one: %+v", len(f.notices)-posted, third)
+	}
+	last := f.notices[len(f.notices)-1]
+	for _, want := range []string{"This is stall 3 of the run.", "This is a repeat, so the agent needs a person."} {
+		if !strings.Contains(last.Notice, want) {
+			t.Fatalf("third stall notice lacks %q: %s", want, last.Notice)
+		}
+	}
+	if id := claudeStallRequestID(f.b, last); id == claudeStallRequestID(f.b, repeat) || id == claudeStallRequestID(f.b, f.notices[0]) {
+		t.Fatalf("the third stall reused an earlier request identity %s", id)
+	}
+	for i := 0; i < 5; i++ {
+		f.advance(70 * time.Second)
+		f.pass()
+	}
+	if len(f.notices) != posted+1 || len(f.keys) != keys || len(f.sent) != sent {
+		t.Fatalf("third stall reported again or touched the pane: notices=%d keys=%q", len(f.notices)-posted, f.keys)
 	}
 	c, _ := f.cursor(f.b)
 	if reason := claudeStallStuckReason(f.b, &c, f.now); !strings.HasPrefix(reason, "turn stalled: no output for ") {
@@ -875,17 +896,21 @@ func TestClaudeInterruptedTurnEnds(t *testing.T) {
 // receives no key and no text, with and without a wake waiting.
 func TestClaudeStallDefaultSendsNothing(t *testing.T) {
 	for name, content := range map[string]string{
-		"no file":        "",
-		"malformed":      `{"claudeStallAction":"interrupt"`,
-		"not an object":  `"interrupt"`,
-		"no key":         `{"other":true}`,
-		"empty value":    `{"claudeStallAction":""}`,
-		"report":         `{"claudeStallAction":"report"}`,
-		"unknown value":  `{"claudeStallAction":"cancel"}`,
-		"wrong case":     `{"claudeStallAction":"Interrupt"}`,
-		"padded":         `{"claudeStallAction":" interrupt "}`,
-		"wrong type":     `{"claudeStallAction":true}`,
-		"wrong key case": `{"claudestallaction_":"interrupt"}`,
+		"no file":                             "",
+		"malformed":                           `{"claudeStallAction":"interrupt"`,
+		"not an object":                       `"interrupt"`,
+		"no key":                              `{"other":true}`,
+		"empty value":                         `{"claudeStallAction":""}`,
+		"report":                              `{"claudeStallAction":"report"}`,
+		"unknown value":                       `{"claudeStallAction":"cancel"}`,
+		"wrong case":                          `{"claudeStallAction":"Interrupt"}`,
+		"padded":                              `{"claudeStallAction":" interrupt "}`,
+		"wrong type":                          `{"claudeStallAction":true}`,
+		"wrong key case":                      `{"claudestallaction":"interrupt"}`,
+		"upper key case":                      `{"CLAUDESTALLACTION":"interrupt"}`,
+		"lower-case duplicate after the key":  `{"claudeStallAction":"report","claudestallaction":"interrupt"}`,
+		"lower-case duplicate before the key": `{"claudestallaction":"interrupt","claudeStallAction":"report"}`,
+		"null value":                          `{"claudeStallAction":null}`,
 	} {
 		for _, unread := range []int{0, 2} {
 			t.Run(fmt.Sprintf("%s unread %d", name, unread), func(t *testing.T) {
@@ -927,6 +952,19 @@ func TestClaudeStallDefaultSendsNothing(t *testing.T) {
 					t.Fatalf("notice lacks the would-have action %q: %s", would, f.notices[0].Notice)
 				}
 			})
+		}
+	}
+	// The exact key decides, whatever other keys say.
+	f := newStallFixture(t)
+	for content, want := range map[string]string{
+		`{"claudeStallAction":"interrupt"}`:                              claudeStallInterrupt,
+		`{"claudeStallAction":"interrupt","claudestallaction":"report"}`: claudeStallInterrupt,
+		`{"claudestallaction":"report","claudeStallAction":"interrupt"}`: claudeStallInterrupt,
+		`{"hub":"x","claudeStallAction":"interrupt","n":[1,{"a":2}]}`:    claudeStallInterrupt,
+	} {
+		f.setAction(content)
+		if got := relayStallAction(); got != want {
+			t.Fatalf("setting %s read as %q, want %q", content, got, want)
 		}
 	}
 	// A setting file that cannot be read at all also means report.
@@ -1126,6 +1164,18 @@ func TestClaudeStallNotice(t *testing.T) {
 	}
 	if got = h.notices(t); len(got) != 4 || got[3].Envelope.Refs["repeat"] != "true" || got[3].Envelope.Refs["stall"] != "2" || !strings.Contains(got[3].Text, "This is a repeat, so the agent needs a person.") {
 		t.Fatalf("repeat notice: %+v", got)
+	}
+	// A third stall posts too, under its own identity, still marked.
+	third := stallRecord(b, claudeStallInterrupt, 3)
+	third.Since = s.Since.Add(4 * time.Hour)
+	third.Notice = claudeStallNoticeText(b, third)
+	for i := 0; i < 2; i++ {
+		if err := nativeClaudeStallNotify(ctx, b, third); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got = h.notices(t); len(got) != 5 || got[4].To != helper.ID || got[4].Envelope.Refs["repeat"] != "true" || got[4].Envelope.Refs["stall"] != "3" || !strings.Contains(got[4].Text, "This is stall 3 of the run.") || got[4].PostReceipt.RequestID == got[3].PostReceipt.RequestID {
+		t.Fatalf("third stall notice: %+v", got)
 	}
 	// The recipient rule, on its own.
 	old := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)

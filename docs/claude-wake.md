@@ -90,7 +90,7 @@ The relay runs the rule for each Claude binding in its loop, before delivery. It
 
 ### What every host does
 
-- **Record.** A private run-scoped file beside the wake intent, `…claude-stall.json`: `run`, `count` (stalls of this run), `since` (the last transcript record or worktree change), `detectedAt`, `mode`, `counter` or `unreadable`, `unread` and `wakeSeqs` (the input waiting at detection), `notInterrupted`, `interruptedAt`, `endedAt`, `rewakeAt`, `resumeAt`, `resumeConfirmedAt`, `outcome`, the frozen `notice` with `noticedAt`, `escalatedAt` (the repeat notice) and `clearedAt`.
+- **Record.** A private run-scoped file beside the wake intent, `…claude-stall.json`: `run`, `count` (stalls of this run), `since` (the last transcript record or worktree change), `detectedAt`, `mode`, `counter` or `unreadable`, `unread` and `wakeSeqs` (the input waiting at detection), `notInterrupted`, `interruptedAt`, `endedAt`, `rewakeAt`, `resumeAt`, `resumeConfirmedAt`, `outcome`, the frozen `notice` with `noticedAt`, `escalatedAt` (set with a repeat's notice) and `clearedAt`.
 - **Log.** One relay log line per change, for example `[tt relay] <time> <agent> Claude turn stalled since <time> (stall 1 of run <run>, mode report): no transcript record or worktree change for 17m, no tool call pending, token counter 75 unchanged from <time> to <time>`.
 - **Activity.** The agent reports `stuck` with `turn stalled: no output for 17m` for as long as the turn stays open with nothing pending and nothing written.
 - **Notice.** One typed NOTICE per stall, subject "A Claude agent's turn has stopped producing output". It names the agent, run and tmux session, the signals, the stall's number in the run, the host setting, and what the relay did or would have done. It goes to the live owner helper; with none, or when the stalled agent is the helper, to the Board with no recipient. It is never addressed to the stalled agent, the database handler or the owner. Its request identity is `claude-stall-<run without prefix>-<since, unix seconds>` and its text is saved in the record before the first attempt, so a second pass, a retry (at most once a minute after a failed post) and a restarted relay replay one request and post once. It is posted as the relay, like the wake-skip notice.
@@ -107,7 +107,7 @@ Interrupting is off unless the host says otherwise. The setting is one key in `~
 {"claudeStallAction": "interrupt"}
 ```
 
-`"report"`, a missing file, a file that cannot be read, malformed JSON, a missing key and any other value all mean report: the relay sends no key and types nothing. The relay service is started with only `PATH` in its environment, which is why this is a file; the owner or the owner helper edits it by hand, per host, and there is no `tt` command for it. The file is read at each detection, so a change needs no relay restart. The mode is saved in the stall's record at detection: a stall detected under `report` is never interrupted later, and switching affects the next stall only. Each log line and notice states the mode that applied.
+`"report"`, a missing file, a file that cannot be read, malformed JSON, a missing key and any other value all mean report: the relay sends no key and types nothing. The key must be spelled exactly `claudeStallAction`; a key in another case is not it. The relay service is started with only `PATH` in its environment, which is why this is a file; the owner or the owner helper edits it by hand, per host, and there is no `tt` command for it. The file is read at each detection, so a change needs no relay restart. The mode is saved in the stall's record at detection: a stall detected under `report` is never interrupted later, and switching affects the next stall only. Each log line and notice states the mode that applied.
 
 ### What a host set to interrupt does
 
@@ -121,7 +121,7 @@ Once per stall, and only for the first stall of a run:
 
 It does not interrupt, and types nothing, when the counter could not be compared, the pane or counter changed before the key, the transcript grew, the session is the owner helper's, or the stall is not the run's first. The record's `notInterrupted` and the notice say which.
 
-A second stall in the same run is never interrupted in either mode. Its notice says it is a repeat and that the agent needs a person. A third or later stall of that run is recorded and shown as `stuck` but not reported again.
+A second or later stall in the same run is never interrupted in either mode. Each still posts its own notice, under its own identity, saying it is a repeat and that the agent needs a person.
 
 ### Limits
 
