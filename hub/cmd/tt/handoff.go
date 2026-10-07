@@ -193,6 +193,10 @@ type handoffCapture struct {
 	Start   *handoffStamp `json:"start,omitempty"`
 	Compact *handoffStamp `json:"compact,omitempty"`
 	End     *handoffStamp `json:"end,omitempty"`
+	// Open is true from a session start until the next session end. The
+	// stamps are kept to the second, and a /clear stamps an end and a start
+	// in the same second, so their times cannot say which came last.
+	Open bool `json:"open,omitempty"`
 }
 
 // handoffSnapshot is what the hub said at AsOf. It is a dated copy for a
@@ -905,7 +909,10 @@ func handoffMatchThread(files []ownerHelperFile, runtime, thread string) (ownerH
 // handoffMatchTmux is the one helper file whose tmux session, by id and
 // creation time, is the session this process's pane is in. It asks tmux at
 // most once, and not at all when no helper file names a tmux session.
-func handoffMatchTmux(ctx context.Context, files []ownerHelperFile) (ownerHelperFile, bool) {
+//
+// start starts the query; nil means cmd.Start. The hook passes its own, so
+// that the handler knows the child and can kill it before it returns.
+func handoffMatchTmux(ctx context.Context, files []ownerHelperFile, start func(*exec.Cmd) error) (ownerHelperFile, bool) {
 	pane := os.Getenv("TMUX_PANE")
 	named := false
 	for _, f := range files {
@@ -919,10 +926,22 @@ func handoffMatchTmux(ctx context.Context, files []ownerHelperFile) (ownerHelper
 		args = append([]string{"-L", socket}, args...)
 	}
 	cmd := exec.CommandContext(ctx, "tmux", args...)
+	// Its own process group, so that one signal ends it and anything it
+	// started; and a pipe-free stdout, so that Wait never waits on a reader.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return handoffKillGroup(cmd.Process) }
 	cmd.WaitDelay = 20 * time.Millisecond
-	raw, err := cmd.Output()
+	var raw bytes.Buffer
+	cmd.Stdout = &raw
+	if start == nil {
+		start = (*exec.Cmd).Start
+	}
+	err := start(cmd)
+	if err == nil {
+		err = cmd.Wait()
+	}
 	var values []string
-	if err != nil || json.Unmarshal(bytes.TrimSpace(raw), &values) != nil || len(values) != 2 ||
+	if err != nil || json.Unmarshal(bytes.TrimSpace(raw.Bytes()), &values) != nil || len(values) != 2 ||
 		!sessionIDPattern.MatchString(values[0]) || !sessionTimePattern.MatchString(values[1]) {
 		return ownerHelperFile{}, false
 	}
@@ -935,6 +954,18 @@ func handoffMatchTmux(ctx context.Context, files []ownerHelperFile) (ownerHelper
 		}
 	}
 	return found, matches == 1
+}
+
+// handoffKillGroup kills a child started in its own process group, and the
+// group with it.
+func handoffKillGroup(p *os.Process) error {
+	// A child that has ended and been waited for is left alone: its number
+	// may belong to another process by now.
+	if p == nil || p.Signal(syscall.Signal(0)) != nil {
+		return nil
+	}
+	_ = syscall.Kill(-p.Pid, syscall.SIGKILL)
+	return p.Kill()
 }
 
 // ---- the hook ----
@@ -978,6 +1009,11 @@ func handoffHook(e env, _ []string) {
 			_, _ = io.WriteString(run.out, handoffLateLine)
 		}
 		run.closed = true
+		// No child outlives the hook. The context would kill the tmux query
+		// at this same moment, but from a goroutine the process exit can
+		// beat; the handler sends the signal itself before it returns, and
+		// under the lock no child can start after this.
+		_ = handoffKillGroup(run.child)
 		run.mu.Unlock()
 	}
 }
@@ -988,8 +1024,35 @@ type handoffHookRun struct {
 	in       io.Reader
 	out      io.Writer
 	mu       sync.Mutex
-	owes     bool // a matched SessionStart has not printed yet
-	closed   bool // the handler has returned; print nothing more
+	owes     bool        // a matched SessionStart has not printed yet
+	closed   bool        // the handler has returned; print nothing more, start nothing more
+	child    *os.Process // the tmux query, while it runs
+}
+
+// matchTmux asks tmux through startChild and forgets the child once the
+// query has ended.
+func (h *handoffHookRun) matchTmux(ctx context.Context, files []ownerHelperFile) (ownerHelperFile, bool) {
+	defer func() {
+		h.mu.Lock()
+		h.child = nil
+		h.mu.Unlock()
+	}()
+	return handoffMatchTmux(ctx, files, h.startChild)
+}
+
+// startChild starts the hook's one subprocess unless the handler has already
+// returned, and records it for the handler to kill.
+func (h *handoffHookRun) startChild(cmd *exec.Cmd) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return errors.New("the hook has returned")
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	h.child = cmd.Process
+	return nil
 }
 
 func (h *handoffHookRun) late() bool { return time.Since(h.started) >= h.deadline }
@@ -1028,7 +1091,7 @@ func (h *handoffHookRun) work() {
 	helper, match := ownerHelperFile{}, handoffAsRegistered
 	if found, ok := handoffMatchThread(files, "claude", thread); ok {
 		helper = found
-	} else if found, ok := handoffMatchTmux(ctx, files); ok {
+	} else if found, ok := h.matchTmux(ctx, files); ok {
 		helper, match = found, handoffAsCandidate
 	} else {
 		return
@@ -1081,10 +1144,15 @@ func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffS
 	}
 	// A start that follows a start with no end between them means the
 	// previous session was killed; a compaction continues the same session.
-	noEnd := event == "SessionStart" && stamp.Detail != "compact" && r.Capture.Start != nil &&
-		(r.Capture.End == nil || r.Capture.End.Time < r.Capture.Start.Time)
+	noEnd := event == "SessionStart" && stamp.Detail != "compact" && r.Capture.Open
 	r.refreshIdentity(helper)
 	*slot(&r.Capture) = &stamp
+	switch event {
+	case "SessionStart":
+		r.Capture.Open = true
+	case "SessionEnd":
+		r.Capture.Open = false
+	}
 	if unlock == nil || late() {
 		return r, noEnd, nil
 	}
@@ -1650,7 +1718,7 @@ func handoffShowAgent(e env, task string) (string, error) {
 	files, _ := handoffHelperFiles()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if helper, ok := handoffMatchTmux(ctx, files); ok {
+	if helper, ok := handoffMatchTmux(ctx, files, nil); ok {
 		return helper.Agent, nil
 	}
 	root := handoffRoot()

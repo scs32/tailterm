@@ -539,6 +539,118 @@ func TestHandoffHookBound(t *testing.T) {
 	}
 }
 
+// Round one blocker b1: no child process outlives the hook. The hook runs as
+// its own process here, as Claude Code runs it, because the fault was a race
+// between the process exiting and the kill of a tmux that does not answer.
+// Each fake tmux records its own process id and then sleeps; after the hook
+// has exited that process must be gone. Only those recorded ids are checked
+// and, at the end, killed.
+func TestHandoffHookLeavesNoChild(t *testing.T) {
+	b := newHandoffBox(t)
+	b.on()
+	b.register()
+	bin := filepath.Join(b.root, "bin")
+	pids := filepath.Join(b.root, "tmux-pids")
+	if err := os.MkdirAll(pids, 0700); err != nil {
+		t.Fatal(err)
+	}
+	tt := filepath.Join(bin, "tt")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("go", "build", "-o", tt, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build tt: %v\n%s", err, out)
+	}
+	// It starts a child of its own as well: the whole group must go.
+	script := "#!/bin/sh\necho $$ > " + spawnQuote(pids) + "/$$\nsleep 30 &\necho $! > " + spawnQuote(pids) + "/$!\nwait\n"
+	if err := os.WriteFile(filepath.Join(bin, "tmux"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	owned := func() []int {
+		var out []int
+		entries, _ := os.ReadDir(pids)
+		for _, entry := range entries {
+			if pid, err := strconv.Atoi(entry.Name()); err == nil {
+				out = append(out, pid)
+			}
+		}
+		return out
+	}
+	alive := func(pid int) bool {
+		// A process that was killed and not yet collected still answers
+		// signal 0; ps tells the two apart.
+		out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		state := strings.TrimSpace(string(out))
+		return err == nil && state != "" && !strings.HasPrefix(state, "Z")
+	}
+	t.Cleanup(func() {
+		for _, pid := range owned() {
+			if alive(pid) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	env := []string{"HOME=" + filepath.Join(b.root, "home"), "PATH=" + bin + ":/usr/bin:/bin", "TAILTERM_HUB=http://127.0.0.1:9",
+		"TAILTERM_HANDOFF_DIR=" + b.dir(), "TAILTERM_HANDOFF_CONFIG=" + b.config(), "TAILTERM_RELAY_STATE=" + filepath.Join(b.root, "relay"),
+		"TMUX=/tmp/handoff-test,1,0", "TMUX_PANE=%1", "CLAUDE_CODE_SESSION_ID=" + handoffOtherID}
+	const rounds, together = 12, 10 // 120 hook runs
+	var mu sync.Mutex
+	var slowest time.Duration
+	left := 0
+	for round := 0; round < rounds; round++ {
+		var wg sync.WaitGroup
+		for i := 0; i < together; i++ {
+			wg.Add(1)
+			go func(event struct {
+				event string
+				extra map[string]any
+			}) {
+				defer wg.Done()
+				cmd := exec.Command(tt, "hook", "handoff")
+				cmd.Env, cmd.Dir = env, b.root
+				cmd.Stdin = strings.NewReader(handoffPayload(event.event, handoffOtherID, event.extra))
+				start := time.Now()
+				out, err := cmd.CombinedOutput()
+				took := time.Since(start)
+				mu.Lock()
+				defer mu.Unlock()
+				slowest = max(slowest, took)
+				if err != nil || len(out) != 0 {
+					t.Errorf("hook with a tmux that does not answer = %v, output %q; want exit 0 and silence", err, out)
+				}
+			}(handoffEvents[i%len(handoffEvents)])
+		}
+		wg.Wait()
+		// The hook has exited. Its children were sent the signal before it
+		// did; give the kernel a moment to finish with them, no more. On a
+		// loaded host a fake tmux can be killed before it has recorded
+		// itself, so a round is not required to show all of them.
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for _, pid := range owned() {
+			for alive(pid) && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if alive(pid) {
+				left++
+				t.Errorf("round %d: process %d of a tmux that did not answer outlived the hook", round, pid)
+			}
+		}
+	}
+	// One that recorded itself late is caught here.
+	time.Sleep(300 * time.Millisecond)
+	for _, pid := range owned() {
+		if alive(pid) {
+			left++
+			t.Errorf("process %d of a tmux that did not answer is still running after every hook has exited", pid)
+		}
+	}
+	if n := len(owned()); n < rounds*together/2 {
+		t.Fatalf("only %d fake tmux processes recorded themselves in %d runs: the case did not reach tmux", n, rounds*together)
+	}
+	t.Logf("%d hook runs with a tmux that does not answer, %d at a time: %d processes started, %d left after the hook exited; slowest run %s", rounds*together, together, len(owned()), left, slowest.Round(time.Millisecond))
+	b.requireNoState()
+}
+
 // a2, a4: a hook that runs out of time on a matched SessionStart prints the
 // one fixed line; on PreCompact and SessionEnd it prints nothing.
 func TestHandoffHookLate(t *testing.T) {
@@ -1235,6 +1347,62 @@ func TestHandoffInjection(t *testing.T) {
 			t.Fatalf("a start after an end reports a missing end:\n%s", r.out)
 		}
 	})
+	// Round one blocker b2: /clear stamps the old session's end and the new
+	// session's start in the same second. If that new session is then
+	// killed, the next start must still say no end was recorded.
+	t.Run("a session killed after a clear leaves no end", func(t *testing.T) {
+		b := newHandoffBox(t)
+		b.on()
+		b.asHelper()
+		const noEnd = "No end was recorded for the previous session.\n"
+		says := func(source string) bool {
+			t.Helper()
+			r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": source})
+			if r.err != nil || r.out == "" {
+				t.Fatalf("start = %v, %q", r.err, r.out)
+			}
+			return strings.Contains(r.out, noEnd)
+		}
+		if says("startup") {
+			t.Fatal("the first start reports a missing end")
+		}
+		b.now = b.now.Add(time.Second)
+		// The clear: an end and a start with the same stamp.
+		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "clear"})
+		if says("clear") {
+			t.Fatal("the start after a clear reports a missing end")
+		}
+		if c := b.record().Capture; c.End.Time != c.Start.Time || !c.Open {
+			t.Fatalf("the clear did not stamp end and start in the same second, or the session is not open: %+v %+v open=%v", c.End, c.Start, c.Open)
+		}
+		b.now = b.now.Add(time.Second)
+		if !says("startup") { // the session after the clear was killed
+			t.Fatal("a start after a killed session that began with a clear does not report the missing end")
+		}
+		// An end and a start in the same second, then a proper end, then a
+		// start: nothing is missing.
+		b.now = b.now.Add(time.Second)
+		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "clear"})
+		if says("clear") {
+			t.Fatal("the start after a clear reports a missing end")
+		}
+		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "logout"}) // the same second again
+		if c := b.record().Capture; c.Open {
+			t.Fatalf("an end left the session open: %+v", c)
+		}
+		if says("startup") {
+			t.Fatal("a start after a proper end reports a missing end")
+		}
+		// A compaction and a resume inside a live session do not close it.
+		b.now = b.now.Add(time.Second)
+		b.quiet("PreCompact", b.helper.Thread, map[string]any{"trigger": "auto"})
+		if says("compact") {
+			t.Fatal("a compaction reports a missing end")
+		}
+		if !says("resume") {
+			t.Fatal("a resume with no end before it does not report the missing end")
+		}
+	})
 	t.Run("a record that cannot be read", func(t *testing.T) {
 		b := newHandoffBox(t)
 		b.on()
@@ -1278,7 +1446,7 @@ func TestHandoffInjection(t *testing.T) {
 				record.Snapshot = &handoffSnapshot{AsOf: handoffStamped(b.now), HelperStatus: api.AgentRetired, ObligationsOmitted: 999999, DecisionsOmitted: 999999, QueueOmitted: 999999,
 					Window:      &handoffWindow{ID: "dlw_0123456789abcdef", Scope: api.DelegationScopeDecisionsMergesDeploys, EndsAt: handoffStamped(b.now), State: api.DelegationExpired},
 					Obligations: []handoffObligation{}, Decisions: []handoffDecision{}, Queue: []handoffQueueRow{}}
-				record.Capture.Start = &handoffStamp{Time: handoffStamped(b.now.Add(-time.Hour)), Detail: "startup"} // and no end: the widest header
+				record.Capture.Start, record.Capture.Open = &handoffStamp{Time: handoffStamped(b.now.Add(-time.Hour)), Detail: "startup"}, true // and no end: the widest header
 				b.save(record)
 				saved := b.bytes("record.json")
 				r := b.hook("SessionStart", session, start)
@@ -1805,6 +1973,10 @@ func requireHandoffValues(t *testing.T, data []byte) {
 		case json.Number:
 			if !regexp.MustCompile(`^[0-9]{1,12}$`).MatchString(v.String()) {
 				t.Fatalf("stored number at %s is not a whole number of at most 12 digits: %s", path, v)
+			}
+		case bool:
+			if path != "capture.open" {
+				t.Fatalf("stored true or false at %s", path)
 			}
 		case nil:
 			if path != "snapshot.window" {

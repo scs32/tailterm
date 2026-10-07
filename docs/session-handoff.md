@@ -51,7 +51,7 @@ A session does not run the hook at all when it opts out of user settings or of h
 
 Two separate bounds apply.
 
-**The hook's own target: 500 ms.** The work, the stdin read included, runs in a goroutine the handler waits on for at most 400 ms. Its one possible subprocess, a single `tmux display-message`, runs under the same deadline and is killed with it. The hook makes no hub request and opens no connection. `TestHandoffHookBound` holds it to 500 ms with stdin held open, 10,000 unrelated files in the relay state, a `tmux` that never answers, an unwritable state directory and the record's lock held by another process.
+**The hook's own target: 500 ms.** The work, the stdin read included, runs in a goroutine the handler waits on for at most 400 ms. Its one possible subprocess, a single `tmux display-message`, runs in its own process group under the same deadline. If it has not answered when the handler's wait ends, the handler itself kills the group before it returns, so no child outlives the hook; `TestHandoffHookLeavesNoChild` runs the hook as a process 120 times against a `tmux` that never answers and finds none left. The hook makes no hub request and opens no connection. `TestHandoffHookBound` holds it to 500 ms with stdin held open, 10,000 unrelated files in the relay state, a `tmux` that never answers, an unwritable state directory and the record's lock held by another process.
 
 **Claude Code's outside cut-off: 5 seconds.** The handler cannot bound what happens before it runs: process start, and the `PATH` and `hub.json` read every `tt` command does first. The settings entry carries `"timeout": 5` for that. The live check below shows Claude Code honours it on all three events: it gave a hung entry up 4.9 to 5.2 seconds after it started.
 
@@ -95,7 +95,7 @@ What costs: the record alone does not say what an instruction is. The note and `
 
 **Identity**, copied from the host helper file (`docs/owner-helper.md`): hub, project, agent id and name, run, registration receipt id, runtime, runtime thread, tmux session name, id and creation time, and when it was copied. The helper file's request ids and hashes are not copied. It says what that file said at that time. It is not proof of a registration.
 
-**Capture**, written by the hook: for the last session start, the last compaction and the last session end, the time, the `source`, `trigger` or `reason`, and the Claude Code session id. An unknown `source`, `trigger` or `reason` is stored as `other`. From the hook's input only `hook_event_name`, `session_id`, `source`, `trigger` and `reason` are decoded; `cwd`, `transcript_path` and `custom_instructions` are not read into anything.
+**Capture**, written by the hook: for the last session start, the last compaction and the last session end, the time, the `source`, `trigger` or `reason`, and the Claude Code session id; and whether a session is open, which is true from a start until the next end. Times are kept to the second and a `/clear` stamps an end and a start in the same second, so it is that flag, not the times, that tells the next start an end is missing. An unknown `source`, `trigger` or `reason` is stored as `other`. From the hook's input only `hook_event_name`, `session_id`, `source`, `trigger` and `reason` are decoded; `cwd`, `transcript_path` and `custom_instructions` are not read into anything.
 
 **Hub snapshot**, written only by `tt handoff write`, with one as-of time:
 
@@ -302,7 +302,7 @@ All within the 7-second budget. After each run no hook process was left. For H2 
 - For a working hook Claude Code prints `PreCompact [command] completed successfully` in the same place. The model does not report that as an error.
 - Not observed: an automatic compaction, where there is no `/compact` output.
 
-**History of this result.** The criterion first read "the model is shown no hook error" in every run. Two full runs at 20:02Z and 20:05Z failed it on H2 for the line above, and the owner helper amended the criterion (#28733). A run at 20:20Z under the amended check failed on a different point, a timing that compared the whole compaction (25.5 s against 16.4 s) with the 7-second budget; that measure was replaced with the time to the end of the hook, as in the table. The run at 20:23Z is the first under the final check.
+**History of this result.** The criterion first read "the model is shown no hook error" in every run. Two full runs at 20:02Z and 20:05Z failed it on H2 for the line above, and the owner helper amended the criterion (#28733). A run at 20:20Z under the amended check failed on a different point, a timing that compared the whole compaction (25.5 s against 16.4 s) with the 7-second budget; that measure was replaced with the time to the end of the hook, as in the table. The run at 20:23Z is the first under the final check. After the round one review fixes (the handler kills its own `tmux` child, and the open-session flag), the check was run again at 20:31Z because the first changes the query that recognises a candidate successor after `/clear`: it passed with the same observations (cut-offs 5.3, 5.7 and 5.2 s).
 
 **Other things learned.**
 
