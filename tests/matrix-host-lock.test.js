@@ -73,6 +73,7 @@ process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
 
 const moduleFile = fileURLToPath(new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url));
 const moduleURL = new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url).href;
+const fixtureURL = new URL("./agent-window-size-fixture.js", import.meta.url).href;
 
 function tempDir(t, prefix = "matrix-host-lock-") {
   const directory = mkdtempSync(join(tmpdir(), prefix));
@@ -1218,10 +1219,11 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
   mkdirSync(longTmp); process.env.TMPDIR = longTmp;
   t.after(() => { if (inheritedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = inheritedTmp; });
   const path = lockFile(t), markers = [join(tempDir(t), "a.json"), join(tempDir(t), "b.json")], done = join(tempDir(t), "done");
-  const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process'; import {randomUUID} from 'node:crypto';
+  const source = (marker, finish) => `import fs from 'node:fs'; import net from 'node:net'; import {spawnSync} from 'node:child_process'; import {randomUUID} from 'node:crypto'; import {readTmuxFormat} from ${JSON.stringify(fixtureURL)};
     const tmuxSocket='tailterm-menu-test-'+randomUUID();
     const tmux=spawnSync('tmux',['-L',tmuxSocket,'new-session','-d','sleep 120'],{encoding:'utf8'}); if(tmux.status!==0)throw new Error(tmux.stderr);
-    const tmuxPid=Number(spawnSync('tmux',['-L',tmuxSocket,'display-message','-p','#{pid}'],{encoding:'utf8'}).stdout.trim());
+    const tmuxRead=(...args)=>{const r=spawnSync('tmux',['-L',tmuxSocket,...args],{encoding:'utf8'}); if(r.status!==0)throw new Error(r.stderr||String(r.error)); return r.stdout;};
+    const tmuxPid=Number(readTmuxFormat(tmuxRead,['display-message','-p','#{pid}'],{shape:/^\\d+$/}));
     process.once('SIGTERM',()=>{spawnSync('tmux',['-L',tmuxSocket,'kill-server']);process.exit(0);});
     const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,tmuxPid,tmuxSocket,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
     setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L',tmuxSocket,'kill-server']);server.close(()=>process.exit(0));}},30);`;

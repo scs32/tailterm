@@ -20,6 +20,7 @@ import {
   shellQuote,
 } from "../shared/tmux-command.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
+import { readTmuxFormat } from "./agent-window-size-fixture.js";
 
 test("real private tmux sizing serializes claims and rejects stale viewers and identities", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-size-"));
@@ -64,12 +65,16 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       "TAILTERM_RUN=" + binding.runId,
       "sleep 60",
     );
-    const [id, created] = run(
-      "display-message",
-      "-p",
-      "-t",
-      "sizing",
-      "#{session_id}|#{session_created}",
+    const [id, created] = readTmuxFormat(
+      run,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        "sizing",
+        "#{session_id}|#{session_created}",
+      ],
+      { shape: /^\$\d+\|\d+$/ },
     ).split("|");
     const target = { id, created };
     const params = {
@@ -89,13 +94,13 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
           agentWindowSizeCommand(
             {
               ...params,
-              expectedRevision: run(
+              expectedRevision: readTmuxFormat(run, [
                 "display-message",
                 "-p",
                 "-t",
                 id + ":agent",
                 "#{@tailterm_size_revision}",
-              ),
+              ]),
               ...changes,
             },
             binary,
@@ -104,12 +109,16 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
         { env, encoding: "utf8" },
       );
     const size = () =>
-      run(
-        "display-message",
-        "-p",
-        "-t",
-        id + ":agent",
-        "#{pane_width}x#{pane_height}",
+      readTmuxFormat(
+        run,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}",
+        ],
+        { shape: /^\d+x\d+$/ },
       );
     const globals = run("show-options", "-g") + run("show-options", "-gw");
     assert.equal(invoke().stdout.trim(), "sized");
@@ -153,13 +162,13 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
     assert.equal(invoke().stdout.trim(), "refused");
     assert.equal(size(), before);
     run("set-environment", "-u", "-t", id, "TAILTERM_ROLE");
-    const revision = run(
+    const revision = readTmuxFormat(run, [
       "display-message",
       "-p",
       "-t",
       id + ":agent",
       "#{@tailterm_size_revision}",
-    );
+    ]);
     const contenders = Array.from({ length: 8 }, (_, i) => ({
       token: `concurrent_${String(i).padStart(16, "0")}`,
       cols: 130 + i,
@@ -221,7 +230,11 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
     run("new-session", "-d", "-s", "sizing", "sleep 60");
     assert.equal(invoke({ cols: 240 }).stdout.trim(), "sized");
     assert.equal(
-      run("display-message", "-p", "-t", "sizing", "#{pane_width}"),
+      readTmuxFormat(
+        run,
+        ["display-message", "-p", "-t", "sizing", "#{pane_width}"],
+        { shape: /^\d+$/ },
+      ),
       "80",
       "reused name is untouched",
     );

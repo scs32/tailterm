@@ -18,6 +18,33 @@ async function wait(fn, label) {
   throw Error("Agent sizing fixture timed out: " + label);
 }
 
+// tmux stops expanding a format after 100 ms and leaves the rest empty, still
+// exiting 0. A literal placed last survives only when every field before it
+// expanded, so read until each line carries it (and matches shape, if given).
+export const TMUX_FORMAT_END = "|tt-format-end";
+export function readTmuxFormat(
+  run,
+  args,
+  { shape, timeoutMs = 5000, pauseMs = 50 } = {},
+) {
+  const format = args.at(-1),
+    deadline = Date.now() + timeoutMs;
+  for (let reads = 1; ; reads++) {
+    const value = String(run(...args.slice(0, -1), format + TMUX_FORMAT_END));
+    const lines = value.trim().split("\n");
+    if (value.trim() && lines.every((line) => line.endsWith(TMUX_FORMAT_END))) {
+      const whole = lines.map((line) => line.slice(0, -TMUX_FORMAT_END.length));
+      if (!shape || whole.every((line) => shape.test(line)))
+        return whole.join("\n");
+    }
+    const got = `${format} got ${JSON.stringify(value)}`;
+    if (Date.now() >= deadline)
+      throw Error(`incomplete tmux reading after ${reads} reads: ${got}`);
+    process.stderr.write(`tmux format re-read ${reads}: ${got}\n`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pauseMs);
+  }
+}
+
 export function setupAgentWindowFixture() {
   const dir = mkdtempSync(tmpdir() + "/tailterm-agent-sizing-");
   const wrapper = dir + "/private-tmux";
@@ -275,41 +302,51 @@ export async function exerciseAgentWindowSizing({
     "sleep 600",
   );
   const unrelatedSize = () =>
-    f.tmux(
-      "display-message",
-      "-p",
-      "-t",
-      "unrelated-default",
-      "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+    readTmuxFormat(
+      f.tmux,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        "unrelated-default",
+        "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+      ],
+      { shape: /^\d+x\d+\|[^|]*\|[^|]*$/ },
     );
   const unrelatedBefore = unrelatedSize();
-  const [id, created] = f
-    .tmux(
+  const [id, created] = readTmuxFormat(
+    f.tmux,
+    [
       "display-message",
       "-p",
       "-t",
       agent.session,
       "#{session_id}|#{session_created}",
-    )
-    .split("|");
+    ],
+    { shape: /^\$\d+\|\d+$/ },
+  ).split("|");
   const target = { id, created },
     binding = { taskId: task.id, agentId: agent.id, runId: agent.runId };
   const size = () =>
-    f.tmux(
-      "display-message",
-      "-p",
-      "-t",
-      id + ":agent",
-      "#{pane_width}x#{pane_height}",
+    readTmuxFormat(
+      f.tmux,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        id + ":agent",
+        "#{pane_width}x#{pane_height}",
+      ],
+      { shape: /^\d+x\d+$/ },
     );
   const owner = () =>
-    f.tmux(
+    readTmuxFormat(f.tmux, [
       "display-message",
       "-p",
       "-t",
       id + ":agent",
       "#{@tailterm_size_viewer}",
-    );
+    ]);
   const probe = () => {
     try {
       return JSON.parse(readFileSync(f.dir + "/probe.json", "utf8"));
@@ -635,13 +672,13 @@ export async function exerciseAgentWindowSizing({
             token,
             cols: 120,
             rows: 35,
-            expectedRevision: f.tmux(
+            expectedRevision: readTmuxFormat(f.tmux, [
               "display-message",
               "-p",
               "-t",
               id + ":agent",
               "#{@tailterm_size_revision}",
-            ),
+            ]),
             ...changes,
           },
           f.wrapper,
@@ -755,12 +792,16 @@ export async function exerciseAgentWindowSizing({
     "sized",
   );
   assert.equal(
-    f.tmux(
-      "display-message",
-      "-p",
-      "-t",
-      agent.session,
-      "#{pane_width}x#{pane_height}",
+    readTmuxFormat(
+      f.tmux,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        agent.session,
+        "#{pane_width}x#{pane_height}",
+      ],
+      { shape: /^\d+x\d+$/ },
     ),
     "90x30",
   );

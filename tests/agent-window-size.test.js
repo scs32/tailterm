@@ -4,7 +4,11 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { spawnSync } from "node:child_process";
 import { agentWindowSizeCommand } from "../shared/tmux-command.js";
-import { setupAgentWindowFixture } from "./agent-window-size-fixture.js";
+import {
+  readTmuxFormat,
+  setupAgentWindowFixture,
+  TMUX_FORMAT_END,
+} from "./agent-window-size-fixture.js";
 import { endpointKey } from "../client/workspace-state.js";
 import { helperReattach, homeAgent, reattachOptions } from "../client/tasks.js";
 import {
@@ -243,15 +247,17 @@ test("private tmux controllers reject obsolete claims delayed past hide, dispose
       "TAILTERM_RUN=" + binding.runId,
       "sleep 60",
     );
-    const [id, created] = f
-      .tmux(
+    const [id, created] = readTmuxFormat(
+      f.tmux,
+      [
         "display-message",
         "-p",
         "-t",
         "delayed",
         "#{session_id}|#{session_created}",
-      )
-      .split("|");
+      ],
+      { shape: /^\$\d+\|\d+$/ },
+    ).split("|");
     const run = (command) => {
       const r = spawnSync("/bin/sh", ["-c", command], {
         env: f.env,
@@ -261,12 +267,16 @@ test("private tmux controllers reject obsolete claims delayed past hide, dispose
       return r.stdout;
     };
     const state = () =>
-      f.tmux(
-        "display-message",
-        "-p",
-        "-t",
-        id + ":agent",
-        "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+      readTmuxFormat(
+        f.tmux,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        ],
+        { shape: /^\d+x\d+\|[^|]*$/ },
       );
     for (const [i, transition] of ["hide", "dispose", "reconnect"].entries()) {
       let release, arrived;
@@ -356,25 +366,31 @@ test("exact revision inspection across two tagged targets and unrelated default 
         "TAILTERM_RUN=" + binding.runId,
         "sleep 60",
       );
-      const [id, created] = f
-        .tmux(
+      const [id, created] = readTmuxFormat(
+        f.tmux,
+        [
           "display-message",
           "-p",
           "-t",
           name,
           "#{session_id}|#{session_created}",
-        )
-        .split("|");
+        ],
+        { shape: /^\$\d+\|\d+$/ },
+      ).split("|");
       return { ...valid(), binding, target: { id, created }, path: f.wrapper };
     });
     f.tmux("new-session", "-d", "-s", "unrelated-default", "sleep 60");
     const unrelated = () =>
-      f.tmux(
-        "display-message",
-        "-p",
-        "-t",
-        "unrelated-default",
-        "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+      readTmuxFormat(
+        f.tmux,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          "unrelated-default",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_revision}|#{@tailterm_size_viewer}",
+        ],
+        { shape: /^\d+x\d+\|[^|]*\|[^|]*$/ },
       );
     const before = unrelated();
     const run = (command) => {
@@ -390,12 +406,16 @@ test("exact revision inspection across two tagged targets and unrelated default 
       const token = () =>
         "target_viewer_00000000000" + i + String(++seq).padStart(4, "0");
       const state = () =>
-        f.tmux(
-          "display-message",
-          "-p",
-          "-t",
-          s.target.id + ":agent",
-          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}|#{@tailterm_size_revision}",
+        readTmuxFormat(
+          f.tmux,
+          [
+            "display-message",
+            "-p",
+            "-t",
+            s.target.id + ":agent",
+            "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}|#{@tailterm_size_revision}",
+          ],
+          { shape: /^\d+x\d+\|[^|]*\|[^|]*$/ },
         );
       const c = createAgentWindowSizer({
         snapshot: () => s,
@@ -405,13 +425,13 @@ test("exact revision inspection across two tagged targets and unrelated default 
       controllers.push(c);
       c.refresh({ focus: true });
       await c.settled();
-      const revision = f.tmux(
+      const revision = readTmuxFormat(f.tmux, [
         "display-message",
         "-p",
         "-t",
         s.target.id + ":agent",
         "#{@tailterm_size_revision}",
-      );
+      ]);
       assert.ok(revision);
       assert.equal(
         run(
@@ -437,13 +457,13 @@ test("exact revision inspection across two tagged targets and unrelated default 
       s.connected = false;
       c.refresh();
       await c.settled();
-      const oldRevision = f.tmux(
+      const oldRevision = readTmuxFormat(f.tmux, [
         "display-message",
         "-p",
         "-t",
         s.target.id + ":agent",
         "#{@tailterm_size_revision}",
-      );
+      ]);
       s.connection++;
       s.connected = true;
       c.refresh({ focus: true });
@@ -493,15 +513,17 @@ test("a claim delivered after hide or dispose is restored to the prior size with
         "TAILTERM_RUN=" + binding.runId,
         "sleep 60",
       );
-      const [id, created] = f
-        .tmux(
+      const [id, created] = readTmuxFormat(
+        f.tmux,
+        [
           "display-message",
           "-p",
           "-t",
           "residual-" + i,
           "#{session_id}|#{session_created}",
-        )
-        .split("|");
+        ],
+        { shape: /^\$\d+\|\d+$/ },
+      ).split("|");
       f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
       f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
       const s = {
@@ -512,21 +534,25 @@ test("a claim delivered after hide or dispose is restored to the prior size with
         path: f.wrapper,
       };
       const state = () =>
-        f.tmux(
-          "display-message",
-          "-p",
-          "-t",
-          id + ":agent",
-          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        readTmuxFormat(
+          f.tmux,
+          [
+            "display-message",
+            "-p",
+            "-t",
+            id + ":agent",
+            "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+          ],
+          { shape: /^\d+x\d+\|[^|]*$/ },
         );
       const revision = () =>
-        f.tmux(
+        readTmuxFormat(f.tmux, [
           "display-message",
           "-p",
           "-t",
           id + ":agent",
           "#{@tailterm_size_revision}",
-        );
+        ]);
       let release,
         arrived,
         held = false;
@@ -633,15 +659,17 @@ test("restore yields to a newer viewer and a visible pane never restores", async
       "TAILTERM_RUN=" + binding.runId,
       "sleep 60",
     );
-    const [id, created] = f
-      .tmux(
+    const [id, created] = readTmuxFormat(
+      f.tmux,
+      [
         "display-message",
         "-p",
         "-t",
         "restore-race",
         "#{session_id}|#{session_created}",
-      )
-      .split("|");
+      ],
+      { shape: /^\$\d+\|\d+$/ },
+    ).split("|");
     f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
     f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
     const run = (command) => {
@@ -653,12 +681,16 @@ test("restore yields to a newer viewer and a visible pane never restores", async
       return r.stdout;
     };
     const state = () =>
-      f.tmux(
-        "display-message",
-        "-p",
-        "-t",
-        id + ":agent",
-        "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+      readTmuxFormat(
+        f.tmux,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        ],
+        { shape: /^\d+x\d+\|[^|]*$/ },
       );
     const a = { ...valid(), target: { id, created }, path: f.wrapper };
     const b = { ...a, cols: 240, rows: 60 };
@@ -793,22 +825,28 @@ test("a resize delivered after hide, dispose or reconnect is put back to the las
         "TAILTERM_RUN=" + binding.runId,
         "sleep 60",
       );
-      const [id, created] = f
-        .tmux(
+      const [id, created] = readTmuxFormat(
+        f.tmux,
+        [
           "display-message",
           "-p",
           "-t",
           "late-resize-" + i,
           "#{session_id}|#{session_created}",
-        )
-        .split("|");
+        ],
+        { shape: /^\$\d+\|\d+$/ },
+      ).split("|");
       const state = () =>
-        f.tmux(
-          "display-message",
-          "-p",
-          "-t",
-          id + ":agent",
-          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        readTmuxFormat(
+          f.tmux,
+          [
+            "display-message",
+            "-p",
+            "-t",
+            id + ":agent",
+            "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+          ],
+          { shape: /^\d+x\d+\|[^|]*$/ },
         );
       const a = { ...valid(), target: { id, created }, path: f.wrapper };
       const b = { ...a, cols: 200, rows: 51 };
@@ -934,15 +972,11 @@ function lossySizer(f, name) {
     "TAILTERM_RUN=" + binding.runId,
     "sleep 60",
   );
-  const [id, created] = f
-    .tmux(
-      "display-message",
-      "-p",
-      "-t",
-      name,
-      "#{session_id}|#{session_created}",
-    )
-    .split("|");
+  const [id, created] = readTmuxFormat(
+    f.tmux,
+    ["display-message", "-p", "-t", name, "#{session_id}|#{session_created}"],
+    { shape: /^\$\d+\|\d+$/ },
+  ).split("|");
   f.tmux("set-option", "-w", "-t", id + ":agent", "window-size", "manual");
   f.tmux("resize-window", "-t", id + ":agent", "-x", "200", "-y", "50");
   const run = (command) => {
@@ -989,12 +1023,16 @@ function lossySizer(f, name) {
     },
     run,
     state: () =>
-      f.tmux(
-        "display-message",
-        "-p",
-        "-t",
-        id + ":agent",
-        "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+      readTmuxFormat(
+        f.tmux,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{pane_width}x#{pane_height}|#{@tailterm_size_viewer}",
+        ],
+        { shape: /^\d+x\d+\|[^|]*$/ },
       ),
     hide() {
       s.visible = false;
@@ -1280,4 +1318,89 @@ test("a teardown the host refuses or never answers is dropped after a bounded nu
     await c.settled();
     assert.equal(commands.length, count, mode);
   }
+});
+
+test("tmux format read returns a complete reading after a cut one", () => {
+  const formats = [],
+    values = ["240x", "240x59|viewer_1" + TMUX_FORMAT_END];
+  const run = (...args) => (formats.push(args.at(-1)), values.shift());
+  assert.equal(
+    readTmuxFormat(run, ["display-message", "-p", "#{a}x#{b}|#{c}"], {
+      pauseMs: 1,
+    }),
+    "240x59|viewer_1",
+  );
+  assert.deepEqual(formats, Array(2).fill("#{a}x#{b}|#{c}" + TMUX_FORMAT_END));
+});
+
+test("tmux format read keeps a legitimately empty field on the first read", () => {
+  let reads = 0;
+  const run = () => (reads++, "240x59|" + TMUX_FORMAT_END + "\n");
+  assert.equal(
+    readTmuxFormat(run, ["display-message", "-p", "#{a}|#{c}"], {
+      shape: /^\d+x\d+\|[^|]*$/,
+    }),
+    "240x59|",
+  );
+  assert.equal(reads, 1);
+  assert.equal(
+    readTmuxFormat(() => TMUX_FORMAT_END, ["-p", "#{c}"]),
+    "",
+  );
+});
+
+test("tmux format read re-reads a complete reading that fails its shape", () => {
+  const values = ["x59", "240x59", "1x2\n3x"].map((v) =>
+    v.replaceAll(/$/gm, TMUX_FORMAT_END),
+  );
+  const run = () => values.shift();
+  assert.equal(
+    readTmuxFormat(run, ["-p", "#{a}x#{b}"], {
+      shape: /^\d+x\d+$/,
+      pauseMs: 1,
+    }),
+    "240x59",
+  );
+  assert.throws(
+    () =>
+      readTmuxFormat(run, ["list-windows", "-F", "#{a}x#{b}"], {
+        shape: /^\d+x\d+$/,
+        timeoutMs: 0,
+      }),
+    /incomplete tmux reading after 1 reads/,
+  );
+});
+
+test("tmux format read throws loudly when every reading stays cut", () => {
+  let reads = 0;
+  const started = Date.now();
+  assert.throws(
+    () =>
+      readTmuxFormat(() => (reads++, "240x"), ["-p", "#{a}x#{b}"], {
+        timeoutMs: 60,
+        pauseMs: 5,
+      }),
+    (e) =>
+      /^incomplete tmux reading after \d+ reads: #\{a\}x#\{b\} got "240x"$/.test(
+        e.message,
+      ) && e.message.includes(`after ${reads} reads`),
+  );
+  assert.ok(reads > 1 && Date.now() - started < 2000, String(reads));
+  assert.throws(
+    () => readTmuxFormat(() => "", ["-p", "#{a}"], { timeoutMs: 0 }),
+    /incomplete tmux reading after 1 reads: #\{a\} got ""/,
+  );
+});
+
+test("tmux format read lets the runner's own error through", () => {
+  let reads = 0;
+  const run = () => {
+    reads++;
+    throw Error("no server running");
+  };
+  assert.throws(
+    () => readTmuxFormat(run, ["-p", "#{a}"]),
+    /^Error: no server running$/,
+  );
+  assert.equal(reads, 1);
 });
