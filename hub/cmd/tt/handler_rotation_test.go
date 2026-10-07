@@ -1517,6 +1517,8 @@ func TestHandlerDeathProbe(t *testing.T) {
 		listErr    error
 		pids       map[int]any // true: alive; error: check failed; absent: gone
 		socket     string
+		// noRosterSession probes an agent whose roster entry names no session.
+		noRosterSession bool
 	}
 	cases := []struct {
 		name   string
@@ -1536,6 +1538,8 @@ func TestHandlerDeathProbe(t *testing.T) {
 		{"receipt without a PID", func(s *setup) { s.receipt.PID = 0 }, handlerProbeUnknown},
 		{"receipt without a start identity", func(s *setup) { s.receipt.Started = "" }, handlerProbeUnknown},
 		{"socket mismatch", func(s *setup) { s.socket = "another-socket" }, handlerProbeUnknown},
+		{"no session name in the receipt or the roster", func(s *setup) { s.receipt.Session, s.noRosterSession = "", true }, handlerProbeUnknown},
+		{"session named by the roster only", func(s *setup) { s.receipt.Session = "" }, handlerProbeGone},
 		{"lister error", func(s *setup) { s.listErr = errors.New("cannot verify tmux session identities") }, handlerProbeUnknown},
 		{"session present by agent, another run", func(s *setup) {
 			s.sessions = []ownedSession{{ID: "$8", Created: "2", Name: "renamed", Hub: hub, Task: a.TaskID, Agent: a.ID, Run: "run_00000000000000cc"}}
@@ -1575,7 +1579,11 @@ func TestHandlerDeathProbe(t *testing.T) {
 				},
 				socket: func() string { return s.socket }, host: func() string { return "mini" }, now: func() time.Time { return observed },
 			}
-			state, detail, ev := p.probe(context.Background(), hub+"/", a)
+			probed := a
+			if s.noRosterSession {
+				probed.Session = ""
+			}
+			state, detail, ev := p.probe(context.Background(), hub+"/", probed)
 			if state != c.want || detail == "" || (ev != nil) != (c.want == handlerProbeGone) {
 				t.Fatalf("state %s (%s) evidence %+v, want %s", state, detail, ev, c.want)
 			}

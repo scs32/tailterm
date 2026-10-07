@@ -457,8 +457,8 @@ func deathUnconfirmed(format string, args ...any) *api.HandlerRotationRefusal {
 
 // deathEvidenceRefusal checks a host's death evidence against what the hub
 // itself knows: it must name the old handler's host and exact run, state both
-// the session and the process gone with a PID and start identity, and be
-// fresh by the hub's clock. The hub must also see no heartbeat from the run.
+// the session and the process gone, name that session, give a PID and start
+// identity, and be fresh by the hub's clock. The hub must also see no heartbeat from the run.
 func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, now time.Time) *api.HandlerRotationRefusal {
 	switch {
 	case ev == nil:
@@ -469,6 +469,8 @@ func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, now time.
 		return deathUnconfirmed("the evidence does not name the primary handler's exact agent and run")
 	case ev.SessionState != api.HandlerDeathStateGone || ev.ProcessState != api.HandlerDeathStateGone:
 		return deathUnconfirmed("the evidence must state the session and the process gone; it states session %q, process %q", ev.SessionState, ev.ProcessState)
+	case ev.SessionName == "":
+		return deathUnconfirmed("the evidence does not name the tmux session it found absent")
 	case ev.PID <= 0 || ev.ProcessStarted == "" || ev.PanePID < 0:
 		return deathUnconfirmed("the evidence has no runtime process ID and start identity")
 	case ev.ObservedAt.IsZero() || now.Sub(ev.ObservedAt) > api.HandlerDeathEvidenceMaxAge:

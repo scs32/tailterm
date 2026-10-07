@@ -70,9 +70,9 @@ const (
 	HandlerDeathStateGone = "gone"
 )
 
-// HandlerDeathEvidence is what the handler's own host observed: the recorded
-// tmux session is absent from a readable listing, and the runtime and pane
-// processes are absent by PID and start identity. Only "gone" is evidence; a
+// HandlerDeathEvidence is what the handler's own host observed: the named
+// tmux session is absent from a readable listing, and the runtime process is
+// absent by PID and start identity, as is the pane process when PanePID is set. Only "gone" is evidence; a
 // host that could not read a fact sends nothing.
 type HandlerDeathEvidence struct {
 	Host           string    `json:"host"`

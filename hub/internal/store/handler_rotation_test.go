@@ -1483,6 +1483,7 @@ func TestHandlerRotationUnknownHostStateNeverRotates(t *testing.T) {
 		"session-alive":     func(e *api.HandlerDeathEvidence) { e.SessionState = "alive" },
 		"process-unknown":   func(e *api.HandlerDeathEvidence) { e.ProcessState = "unknown" },
 		"process-empty":     func(e *api.HandlerDeathEvidence) { e.ProcessState = "" },
+		"no-session-name":   func(e *api.HandlerDeathEvidence) { e.SessionName = "" },
 		"no-pid":            func(e *api.HandlerDeathEvidence) { e.PID = 0 },
 		"no-start-identity": func(e *api.HandlerDeathEvidence) { e.ProcessStarted = "" },
 		"another-host":      func(e *api.HandlerDeathEvidence) { e.Host = "air" },
@@ -1580,7 +1581,9 @@ func TestHandlerRotationDeadPrimaryCommitNeedsFreshEvidence(t *testing.T) {
 	stale.ObservedAt = f.clock.Add(-3 * time.Minute)
 	alive := f.evidence()
 	alive.ProcessState = "alive"
-	for name, ev := range map[string]*api.HandlerDeathEvidence{"none": nil, "the-prepare-observation": first, "stale": stale, "alive": alive} {
+	unnamed := f.evidence()
+	unnamed.SessionName = ""
+	for name, ev := range map[string]*api.HandlerDeathEvidence{"none": nil, "the-prepare-observation": first, "stale": stale, "alive": alive, "no-session-name": unnamed} {
 		if _, err := f.commitDead(r, "commit-"+name, ev); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
 			t.Fatalf("commit with %s evidence: %v", name, err)
 		}

@@ -213,7 +213,7 @@ The rotation row, successor and obligations stay as they were.
 | `agent_caller` | The request carries an agent identity. |
 | `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy, or for a run in no arm, a model change is accepted. An [authorized change](#changing-the-primarys-runtime-or-model) skips this check and does not write the policy. |
 
-| `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. |
+| `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. |
 | `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
@@ -240,7 +240,8 @@ leases, so the refusals above never clear and every team waits. The host runner
 replaces such a handler automatically, and only when **both** hold:
 
 1. **Its own host confirms its process and session gone.** Not merely
-   unreachable: a state the host cannot read is not confirmation.
+   unreachable: a state the host cannot read is not confirmation. The host
+   confirms two facts, listed under [The host's probe](#the-hosts-probe).
 2. **The hub has recorded no activity from that exact run for the project's
    silence**, 10 minutes by default.
 
@@ -275,19 +276,26 @@ is met. The steps run in order and the first that decides wins:
 1. Read the wrapper's process receipt for the exact hub, agent and run.
    Missing, unreadable, naming another hub, project, agent or run, or with no
    PID or no start identity: **unknown**.
-2. The receipt's tmux socket differs from the runner's: **unknown**.
+2. The receipt's tmux socket differs from the runner's: **unknown**. Neither
+   the receipt nor the roster names the handler's tmux session: **unknown**,
+   because there is then nothing to look for in the listing.
 3. The tmux session listing cannot be read: **unknown**. Otherwise a session
    tagged with this agent (any run), or named as the receipt or the roster
    names the handler's session: **alive**.
 4. The runtime process by PID and start identity: a failed check is
    **unknown**, including a PID now used by another process; running is
-   **alive**. The same for the pane process when the receipt has one; a pane
-   PID with no start identity is **unknown**.
-5. Otherwise **gone**.
+   **alive**.
+5. Only when the receipt records a pane process: the same check for it, and a
+   pane PID with no start identity is **unknown**.
+6. Otherwise **gone**.
 
-So gone needs three facts read on the handler's own host: its recorded session
-is absent from a readable listing, its runtime process is absent, and its pane
-process is absent. The probe signals and stops nothing. Only gone produces
+So gone confirms two facts read on the handler's own host: its named session
+is absent from a readable listing, and its runtime process is absent by PID
+and start identity. The receipt the handler's wrapper saves records no pane
+process, so step 5 does not run for it and the pane is not a third fact: with
+the session absent, the pane that lived in it is not checked separately. Step
+5 applies only to a receipt that does record a pane process. The probe signals
+and stops nothing. Only gone produces
 evidence; alive and unknown send the hub nothing. An unreachable host sends
 nothing at all, because only that host's runner probes.
 
@@ -306,7 +314,7 @@ besides the guards every rotation has:
 | The trigger is `runner`, there is no owner authorization, and evidence is present. Evidence with any other reason is refused too. | 400 |
 | The replacement is on for the project. | `death_unconfirmed` |
 | The evidence names the old handler's recorded host and the primary's exact agent and run. | `death_unconfirmed` |
-| Both states are `gone`, with a PID and a start identity. | `death_unconfirmed` |
+| Both states are `gone`, with the session's name, a PID and a start identity. | `death_unconfirmed` |
 | The observation is at most 2 minutes old and at most 30 seconds ahead of the hub clock. | `death_unconfirmed` |
 | The hub itself has no heartbeat from the run within 90 seconds. | `death_unconfirmed` |
 | The run is busy: the runner's ordinary refusal applies. An idle offline primary takes the ordinary rotation. | `death_unconfirmed` |
@@ -502,9 +510,14 @@ directory are inert without the new CLI.
   no saved launch spec, lost the run's process receipt, or finds the PID in
   use by another process, the probe is unknown and the handler waits for the
   owner.
-- The probe checks the runtime and pane processes, not every descendant. An
+- The probe checks the handler's session and its runtime process, not the
+  pane process (the saved receipt records none) and not every descendant. An
   orphaned child that still writes counts as activity and delays or aborts the
   replacement.
+- A primary whose wrapper survived the runtime and reported `exited` is not
+  replaced by this rule. The hub no longer treats an exited agent as the
+  primary and refuses a rotation that names it (`not_primary` at prepare,
+  `handler_changed` at commit), so it keeps its leases until the owner acts.
 - A dead primary rotation whose successor cannot start stays prepared and is
   resumed from the journal, with no retry ceiling.
 - The hub does not reprovision a handler when the count reaches zero; that is

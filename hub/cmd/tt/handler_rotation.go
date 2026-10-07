@@ -217,10 +217,11 @@ const (
 
 type handlerDeathProbe func(ctx context.Context, hub string, a api.Agent) (state, detail string, evidence *api.HandlerDeathEvidence)
 
-// deathProbe confirms a handler gone from three facts read on its own host:
-// its recorded tmux session is absent from a readable listing, its runtime
-// process is absent by PID and start identity, and so is its pane process.
-// Any fact it cannot read is unknown, never gone. It signals nothing.
+// deathProbe confirms a handler gone from two facts read on its own host: its
+// recorded tmux session is absent from a readable listing, and its runtime
+// process is absent by PID and start identity. When the receipt also records
+// a pane process, that must be absent too. Any fact it cannot read is
+// unknown, never gone. It signals nothing.
 type deathProbe struct {
 	receipt  func(hub, agent, run string) (runtimeProcessReceipt, error)
 	sessions func(context.Context) ([]ownedSession, error)
@@ -260,6 +261,15 @@ func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string,
 	if receipt.Socket != p.socket() {
 		return handlerProbeUnknown, "the handler's tmux socket is not the one this runner reads", nil
 	}
+	// With no session name there is nothing to look for in the listing, so
+	// its absence cannot be confirmed.
+	session := receipt.Session
+	if session == "" {
+		session = a.Session
+	}
+	if session == "" {
+		return handlerProbeUnknown, "neither the process receipt nor the roster names the handler's tmux session", nil
+	}
 	sessions, err := p.sessions(ctx)
 	if err != nil {
 		return handlerProbeUnknown, "the tmux session listing is unreadable", nil
@@ -283,10 +293,6 @@ func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string,
 		} else if alive {
 			return handlerProbeAlive, fmt.Sprintf("pane process %d is running", receipt.PanePID), nil
 		}
-	}
-	session := receipt.Session
-	if session == "" {
-		session = a.Session
 	}
 	ev := &api.HandlerDeathEvidence{Host: p.host(), AgentID: a.ID, RunID: a.RunID, ObservedAt: p.now().UTC(), SessionName: session, SessionID: receipt.SessionID,
 		SessionCreated: receipt.SessionCreated, SessionState: api.HandlerDeathStateGone, PID: receipt.PID, PanePID: receipt.PanePID, ProcessStarted: receipt.Started,
