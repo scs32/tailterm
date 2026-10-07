@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,7 +46,10 @@ var lifecycleCriteria = []string{
 type lifecycleOptions struct {
 	name           string
 	planRepository string // "worktree" or "root"
-	disposition    string // "follow-ups" or "owner-decision"
+	// disposition is what the lead records before verification: "follow-ups"
+	// or "owner-decision". With "accept" the lead records nothing then and
+	// accepts ordinarily once verification has passed.
+	disposition string
 	// ownerSavesDone: the owner saves the item done and the handler then runs
 	// tt team queue accept. Otherwise the handler's done save carries the
 	// acceptance and the later queue accept changes nothing.
@@ -78,6 +82,7 @@ func TestDeliveryLifecycle(t *testing.T) {
 	for _, opts := range []lifecycleOptions{
 		{name: "base moved after queueing, plan names the worktree, receipt over 64 KiB, follow-ups before verification", planRepository: "worktree", disposition: "follow-ups"},
 		{name: "base moved after queueing, plan names the repository root, receipt over 64 KiB, owner-decision before verification", planRepository: "root", disposition: "owner-decision", ownerSavesDone: true},
+		{name: "base moved after queueing, plan names the worktree, receipt over 64 KiB, ordinary accept after verification", planRepository: "worktree", disposition: "accept"},
 	} {
 		t.Run(opts.name, func(t *testing.T) {
 			l := newLifecycleRun(t, opts)
@@ -501,7 +506,8 @@ func (l *lifecycleRun) fixAndReviewRoundTwo(t *testing.T, assign int64) {
 }
 
 // With a2 still failed the lead records its disposition while
-// verification is pending.
+// verification is pending. A lead that will accept ordinarily records none:
+// its accept is refused here and it waits for verification.
 func (l *lifecycleRun) dispositionBeforeVerification(t *testing.T) {
 	t.Helper()
 	lead := l.members["lead"]
@@ -511,6 +517,13 @@ func (l *lifecycleRun) dispositionBeforeVerification(t *testing.T) {
 	}
 	_, err := notice(lead, "Accept the fixed candidate as it stands", accept)
 	l.refused(t, "an ordinary accept with a2 failed and verification pending", "passing receipt for current scope and exact accepted candidate required", err)
+	if l.opts.disposition == "accept" {
+		if got := l.reviews(t).Disposition; got != nil {
+			t.Fatalf("a refused accept recorded a disposition: %+v", got)
+		}
+		l.step(t, "disposition: none recorded for C2 before verification, the ordinary accept waits")
+		return
+	}
 	if _, err := notice(lead, "Record the lead disposition for the candidate", l.file(t, "disposition.json", l.disposition(l.opts.disposition, l.c2))); err != nil {
 		t.Fatalf("%s disposition before verification: %v", l.opts.disposition, err)
 	}
@@ -642,15 +655,68 @@ func (l *lifecycleRun) fullSizeVerification(t *testing.T, assign int64) {
 	l.step(t, "verification receipt: %d checks, %d attempts each (%d attempts), %d bytes (over %d), plan names the %s", lifecycleMatrixChecks, lifecycleMaxAttempts, attempts, len(size), limit, l.opts.planRepository)
 }
 
-// The owner resolves the disposition for exactly C2, the completion
-// report is saved, and the item is saved done.
+// C2 is verified and a2 is still failed, so the failed criterion alone
+// refuses the lead's ordinary accept. The reviewer then passes n1, the
+// finding that holds a2 failed, in a focused verification of C2, and the same
+// accept is taken with the same receipt.
+func (l *lifecycleRun) ordinaryAccept(t *testing.T) {
+	t.Helper()
+	lead, reviewer := l.members["lead"], l.members["reviewer"]
+	accept := []string{"--kind", "notice", "--subject", "Accept the verified candidate", "--text", "Candidate " + l.c2, "--review-file", l.file(t, "accept.json", l.disposition("accept", l.c2))}
+	var before []api.VerificationRecord
+	l.read(t, &before, "tt verification history", func() error { return cmdVerification(l.handlerE, []string{"history", "--item", l.item.ID}) })
+	_, err := l.send(t, lead, accept...)
+	l.refused(t, "an ordinary accept of the verified candidate with a2 failed", "criterion a2 has not passed", err)
+	if got := l.reviews(t).Disposition; got != nil {
+		t.Fatalf("a refused accept recorded a disposition: %+v", got)
+	}
+	l.step(t, "ordinary accept: refused for failed a2 alone, C2 is verified")
+
+	focused := l.file(t, "focused-n1.json", api.ReviewMetadata{Mode: "focused", Candidate: l.c2, Fix: "the check for the edge case covers src/a.txt on " + l.c2, BlockerIDs: []string{"n1"}})
+	request := l.mustSend(t, lead, "--kind", "request", "--to", "reviewer-e2e", "--subject", "Verify the remaining gap on the fixed candidate", "--ask", "Verify finding n1 on the fixed candidate", "--review-file", focused)
+	l.ack(t, reviewer, request)
+	result := l.mustSend(t, reviewer, "--kind", "result", "--to", "lead-e2e", "--reply-to", fmt.Sprint(request), "--subject", "The remaining gap is closed", "--outcome", "done", "--status", "n1=pass", "--evidence", "e1: cat src/a.txt -> fixed", "--review-file", focused)
+	state := l.reviews(t)
+	if len(state.Focused) != 2 {
+		t.Fatalf("the focused verification of n1 is not persisted: %+v", state.Focused)
+	}
+	if got := state.Focused[1]; len(got.BlockerIDs) != 1 || got.BlockerIDs[0] != "n1" || got.Candidate != l.c2 || !got.Passed || got.ResultSeq != result {
+		t.Fatalf("focused verification does not pass n1 on C2 %s by result #%d: %+v", l.c2, result, got)
+	}
+	if got := state.Rounds[1].Verdicts["a2"]; got != "fail" {
+		t.Fatalf("the round-two verdict for a2 changed to %q", got)
+	}
+
+	seq, err := l.send(t, lead, accept...)
+	if err != nil {
+		t.Fatalf("an ordinary accept of the verified candidate after n1 passed: %v", err)
+	}
+	if got := l.reviews(t).Disposition; got == nil || got.Kind != "accept" || got.Candidate != l.c2 || got.AgentID != l.agents["lead"].ID || got.MessageSeq != seq {
+		t.Fatalf("accept is not the current disposition for C2 by notice #%d: %+v", seq, got)
+	}
+	var after []api.VerificationRecord
+	l.read(t, &after, "tt verification history", func() error { return cmdVerification(l.handlerE, []string{"history", "--item", l.item.ID}) })
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("the accept was not taken with the same verification: %d records before, %d after", len(before), len(after))
+	}
+	l.step(t, "ordinary accept: n1 passed on C2 by result #%d, accept recorded by notice #%d with the same receipt", result, seq)
+}
+
+// The owner resolves the disposition for exactly C2, or the lead accepts it
+// ordinarily; the completion report is saved, and the item is saved done.
 func (l *lifecycleRun) accept(t *testing.T) {
 	t.Helper()
-	if _, err := l.send(t, l.owner, "--kind", "notice", "--subject", "Owner accepts the verified candidate", "--text", "Candidate "+l.c2, "--review-file", l.file(t, "owner-accept.json", l.disposition("owner-accept", l.c2))); err != nil {
-		t.Fatalf("the owner's owner-accept of a verified candidate after a %s disposition: %v", l.opts.disposition, err)
-	}
-	if got := l.reviews(t).Disposition; got == nil || got.Kind != "owner-accept" || got.Candidate != l.c2 || got.AgentID != "" {
-		t.Fatalf("owner-accept is not the current disposition for C2: %+v", got)
+	accepted := "owner-accept"
+	if l.opts.disposition == "accept" {
+		accepted = "accept"
+		l.ordinaryAccept(t)
+	} else {
+		if _, err := l.send(t, l.owner, "--kind", "notice", "--subject", "Owner accepts the verified candidate", "--text", "Candidate "+l.c2, "--review-file", l.file(t, "owner-accept.json", l.disposition("owner-accept", l.c2))); err != nil {
+			t.Fatalf("the owner's owner-accept of a verified candidate after a %s disposition: %v", l.opts.disposition, err)
+		}
+		if got := l.reviews(t).Disposition; got == nil || got.Kind != "owner-accept" || got.Candidate != l.c2 || got.AgentID != "" {
+			t.Fatalf("owner-accept is not the current disposition for C2: %+v", got)
+		}
 	}
 	item := l.current(t)
 	reportFile := l.file(t, "report.json", api.PutNarrativeReportRequest{RequestID: l.key("report"), ScopeRevision: item.ScopeRevision,
@@ -684,10 +750,10 @@ func (l *lifecycleRun) accept(t *testing.T) {
 		if entry := l.queueEntry(t); entry.Acceptance != nil {
 			t.Fatalf("the owner's done save recorded queue acceptance: %+v", entry.Acceptance)
 		}
-		l.step(t, "acceptance: owner-accept for C2, completion report %s, item saved done by the owner", report.ReportID)
+		l.step(t, "acceptance: %s for C2, completion report %s, item saved done by the owner", accepted, report.ReportID)
 		return
 	}
-	l.step(t, "acceptance: owner-accept for C2, completion report %s, item saved done by the handler with the accepted worktree", report.ReportID)
+	l.step(t, "acceptance: %s for C2, completion report %s, item saved done by the handler with the accepted worktree", accepted, report.ReportID)
 }
 
 // Queue acceptance from the builder worktree binds the verified base
