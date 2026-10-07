@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -1980,6 +1980,77 @@ test("code a9 a failed CLI call keeps its exact argv, exit code and stderr priva
  assert.throws(()=>new HostAdapter({cwd:bare,tt:big.tt},{}).command([big.tt,"deployment","handler"]),reasonIs("tt deployment handler exit 4"));assert.deepEqual(readdirSync(bare),[]);
  for(let i=0;i<25;i++)assert.throws(()=>loud.command([big.tt,"deployment","get","--job","rel_"+i]),reasonIs("tt deployment get exit 4"));
  const capped=JSON.parse(readFileSync(join(big.home,"cli-failures.json"),"utf8")).failures;assert.equal(capped.length,20);assert.equal(capped.at(-1).argv.at(-1),"rel_24");
+});
+// Held claim notice (wi_03c526946b24ce35). One deployer run of several polls
+// over a fake hub whose stderr for a refused claim carries a synthetic secret
+// and the private journal path.
+const HELD_ITEM="wi_0123456789abcdef",HELD_SECRET="tth_SYNTHETICsecret0123456789abcdef";
+const sendOf=c=>{const a=c.argv,field=n=>a[a.indexOf(n)+1];return {to:a.includes("--to"),kind:field("--kind"),subject:field("--subject"),text:field("--text"),requestId:field("--request-id"),refs:a.filter((w,i)=>a[i-1]==="--ref")};};
+async function heldRun(t,h,polls,release){
+ // Each poll ends in one release call (the later job); the mocked 30 s wait is then ticked.
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="",polled=0;
+ process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
+ try{
+  const serving=serveDeployment(h.config,{signal:controller.signal,release:async c=>{await release(c);polled++;}});
+  for(let n=1;n<=polls;n++){while(polled<n)await settle();await settle();if(n===polls)controller.abort();t.mock.timers.tick(30000);}
+  await serving;
+ }finally{t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+ return err;
+}
+test("held r1 r2 r3 a refused claim sends exactly one notice with the hub's reason in a deployer run, the job stays skipped and nothing private leaves",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ // The hub refuses rel_held only; its stderr ends with the refusal, a token, a NAME=value pair and the journal path.
+ const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job')==='rel_held'){fs.writeSync(2,'debug line with '+${JSON.stringify(HELD_SECRET)}+'\\ntt: hub: 409 conflict: release: candidate changed since enqueue token '+${JSON.stringify(HELD_SECRET)}+' TAILTERM_TOKEN='+${JSON.stringify(HELD_SECRET)}+' '+__dirname+'/rel_held.json\\n');process.exit(1);}`);
+ const held={...verifiedJob("rel_held"),itemId:HELD_ITEM},next=verifiedJob("rel_next"),released=[];h.setJobs([held,next]);
+ const err=await heldRun(t,h,3,async c=>{released.push(c.job.id);});
+ // Skip unchanged: every poll tries the held job, prints the line, and goes on to the later job.
+ const claims=h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]);
+ assert.deepEqual(claims,["rel_held","rel_next","rel_held","rel_next","rel_held","rel_next"]);assert.deepEqual(released,["rel_next","rel_next","rel_next"]);
+ assert.equal(err,"Release claim held; handler reconciliation required.\n".repeat(3));
+ // Exactly one notice over three polls: board-wide, typed, naming job, item, commit and the reason.
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,1);const [n]=sent;
+ assert.equal(n.kind,"notice");assert.equal(n.to,false);assert.equal(n.subject,"A release job is skipped because the hub refused its claim");assert.equal(n.requestId,"rel_held-claim-held-"+CODE_RUN);
+ assert.deepEqual(n.refs,["release-job=rel_held","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
+ assert.ok(n.text.includes("Release rel_held (item "+HELD_ITEM+", commit "+"c".repeat(12)+")"));
+ assert.ok(n.text.includes("Reason: hub: 409 conflict: release: candidate changed since enqueue token (removed) (tt deployment claim exit 1)."));
+ assert.match(n.text,/Database handler: reconcile the job .*Owner helper: for information\.$/);assert.match(n.text,SAFE_TEXT);assert.ok(n.subject.length<=120&&!/rel_|wi_/.test(n.subject));
+ // Nothing private in any argv word of any call: not the secret, the variable or the journal directory.
+ for(const c of h.calls())for(const word of c.argv)for(const secret of [HELD_SECRET,"SYNTHETIC","TAILTERM_TOKEN",h.home,tmpdir()])assert.ok(!word.includes(secret),secret);
+ // The exact stderr stays in the private record only.
+ assert.ok(JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8")).failures[0].stderr.includes(HELD_SECRET));
+});
+test("held r1 r2 a held set-aside journal sends one notice per deployer run and is never claimed; a failed send keeps the skip and is retried",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ // The first send fails; later ones succeed.
+ const h=codeHost(t,cwd,`if(a[0]==='send'&&!fs.existsSync(__dirname+'/sent-once')){fs.writeFileSync(__dirname+'/sent-once','');process.exit(4);}`);
+ const held={...verifiedJob("rel_aside"),itemId:HELD_ITEM,reconciliations:[{disposition:"set_aside",agentId:"agt_old",runId:"run_old"}]},released=[];
+ // A journal of another run: not exactly the set-aside claim.
+ writeFileSync(join(h.home,"rel_aside.json"),JSON.stringify({jobId:"rel_aside",commit:held.commit,agentId:"agt_other",runId:"run_other",effects:[]}));
+ h.setJobs([held,verifiedJob("rel_next")]);
+ const err=await heldRun(t,h,3,async c=>{released.push(c.job.id);});
+ assert.deepEqual(h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),["rel_next","rel_next","rel_next"]);assert.deepEqual(released,["rel_next","rel_next","rel_next"]);
+ assert.ok(existsSync(join(h.home,"rel_aside.json")),"the held journal is left in place");
+ assert.equal(err,"Set-aside release journal held; handler reconciliation required.\nHeld claim notice not posted; the next poll retries.\n"+"Set-aside release journal held; handler reconciliation required.\n".repeat(2));
+ // The failed attempt and one delivered notice, same request id; the third poll sends nothing.
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,2);assert.deepEqual(sent[0],sent[1]);const n=sent[1];
+ assert.equal(n.subject,"A release job is skipped because its set-aside journal is held");assert.equal(n.requestId,"rel_aside-claim-held-"+CODE_RUN);
+ assert.deepEqual(n.refs,["release-job=rel_aside","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
+ assert.ok(n.text.includes("Reason: the journal is unreadable, shows effects or is not of exactly the set-aside claim."));assert.match(n.text,SAFE_TEXT);
+ for(const word of h.calls().flatMap(c=>c.argv))assert.ok(!word.includes(h.home));
+ // A new deployer run (a new process) sends its own notice, once.
+ await h.poll(null,async()=>{});assert.equal(h.calls().filter(c=>c.argv[0]==="send").length,3);
+});
+test("held r3 the notice keeps only plain words, small numbers and hub ids of the refusal, and only well-formed job fields",()=>{
+ assert.equal(refusalText("noise\ntt: hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first\n"),"hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first");
+ assert.equal(refusalText(Buffer.from("tt: open /Users/someone/.tailterm/journal/rel_x.json: permission denied")),"open (removed) permission denied");
+ assert.equal(refusalText("refused Bearer abc123DEF456 TOKEN=hunter2 ~/.config/tt ../x C:\\\\secret 1234567 $HOME `id`"),"refused Bearer (removed)");
+ for(const empty of [undefined,null,"","\n\n","/only/a/path","abc123 /p"])assert.equal(refusalText(empty),null);
+ const long=refusalText("word ".repeat(300));assert.ok(long.length<=120&&long.startsWith("word word"));
+ const n=heldClaimNotice({id:"rel_a",itemId:"wi_../../etc",commit:"not a commit"},"claim","bad\nreason "+HELD_SECRET+"!","run with spaces");
+ assert.ok(n.text.includes("(item unknown, commit unknown)"));assert.ok(n.text.includes("Reason: unclassified."));assert.equal(n.item,null);assert.equal(n.commit,null);assert.equal(n.requestId,"rel_a-claim-held-unknown");assert.match(n.text,SAFE_TEXT);
+ assert.equal(heldClaimNotice({id:"../rel"},"claim","x","r"),null);assert.equal(heldClaimNotice(null,"claim","x","r"),null);
 });
 // Every "./" or "../" import of the watched files that is not itself watched,
 // as "importer imports path" with paths from the repository root.

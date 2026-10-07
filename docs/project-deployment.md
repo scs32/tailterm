@@ -124,7 +124,8 @@ Conflict or ref race before publication is refused without a blocked project
 fence; post-publication failures still retain the existing rollback/recovery gates.
 The daemon skips an unclaimable verified job and continues to later jobs rather
 than exiting; it never skips a real claimed/merged/blocked project fence. It
-names such a fence in a notice when a later job waits behind it. Besides
+posts one notice for the skipped job (**Held claim**, below) and names a real
+fence in a notice when a later job waits behind it. Besides
 reconcile, a claimed fence is freed only by its own run's refusal before
 publication or by the handler's set-aside.
 
@@ -1147,6 +1148,46 @@ means the deployer runs scripts older than the published ones and could not
 restart itself. Read its `Reason:` and `runner-code.json`, then follow "The
 runner's own code" above. The other code notices need no action unless a
 restart is not followed by "Deployer now runs the published scripts".
+
+**Held claim.** A notice "A release job is skipped because the hub refused its
+claim" or "A release job is skipped because its set-aside journal is held"
+means a `verified` job is not being released and will not be until someone
+acts: the deployer skips it at every poll, prints `Release claim held; handler
+reconciliation required.` (or `Set-aside release journal held; ...`) in its own
+terminal and goes on to later jobs. Nothing of that job was integrated,
+published or deployed, and it holds no project fence.
+
+- The text names the job, its item, the first 12 characters of its commit and a
+  `Reason:`; the refs carry `release-job`, `item` and the full `commit`. For a
+  refused claim the reason is the last line the hub's refusal printed, followed
+  by the failed call in brackets, for example `hub: 409 conflict: release:
+  candidate changed since enqueue (tt deployment claim exit 1)`. Only plain
+  words, numbers of at most six digits and hub ids are repeated; every other
+  word (a path, a token, a `NAME=value` pair) reads `(removed)`. The exact
+  stderr stays in `cli-failures.json` (Failed CLI calls, above). For a held
+  journal the reason is fixed: the journal is unreadable, shows effects or is
+  not of exactly the set-aside claim.
+- It is a Board notice with no recipient, so it is in the inbox of every agent
+  of the project, the database handler and the owner helper included. It is
+  sent once per job per deployer run (request id `JOB-claim-held-RUN`): later
+  polls of the same run send nothing, even if the reason changes, and a
+  restart under the same run resends the same notice, which the hub answers
+  with the original. A post that fails is retried at the next poll and never
+  changes the skip.
+- **Who acts: the database handler.** Read the reason and `tt deployment get
+  --job JOB`, and record what is found before changing anything. `candidate
+  changed since enqueue` means the entry's accepted revision, commit or
+  verification no longer match the job, so the job cannot be claimed as it is.
+  `project generation changed` and the deployer-run refusals (`available exact
+  deployment run required`, `deployment heartbeat stale`) concern the project
+  or the deployer, not the job. A held journal goes through **Reconcile** with
+  the journal as inspected evidence; never delete or edit it by hand. The
+  deployer needs no restart: when the hub accepts the claim, or the journal no
+  longer holds, the next poll takes the job. A job that can never be claimed
+  stays `verified` and skipped until the handler closes it; if no recorded
+  step fits, the handler asks the owner.
+- **The owner helper is informed** and does not act on the job; it follows up
+  only when the notice stays unanswered.
 
 **Held matrix run.** A notice "A release job is held until its matrix run is
 confirmed stopped" means the deployer will not refuse or move on by itself.

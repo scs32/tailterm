@@ -103,6 +103,31 @@ export function cliFailureNotice(failure, run) {
   return {key: `cli-failure ${job} ${reason}`, requestId: `cli-failure-${NAME(run)}-${id}`, jobId: job, subject: "A deployer CLI call failed",
     text: `Deployer CLI call failed: ${reason}${job ? ` (release ${job})` : ""}. The exact argv, exit code and stderr are kept in cli-failures.json in the private journal directory of the deployer.`};
 }
+// What the Board may repeat of a refused CLI call's stderr: its last line,
+// word by word. A plain word, a small number or a hub id is kept; any other
+// word (a path, a token, a NAME=value pair) becomes "(removed)". null when
+// nothing readable is left.
+const SAFE_WORD = /^\(?(?:[A-Za-z][A-Za-z-]{0,23}|\d{1,6}|(?:rel|wi|tsk|agt|run)_[a-f0-9]{1,40})[),.:;]*$/;
+export function refusalText(stderr) {
+  const text = typeof stderr === "string" ? stderr : Buffer.isBuffer(stderr) ? stderr.toString("utf8") : "";
+  const line = (text.trim().split("\n").at(-1) || "").trim().replace(/^tt: /, "").slice(0, 1024);
+  const words = line.split(/\s+/).filter(Boolean).map(w => SAFE_WORD.test(w) ? w : "(removed)").filter((w, i, all) => w !== "(removed)" || all[i - 1] !== w);
+  while (words.length && words.join(" ").length > 120) words.pop();
+  return words.some(w => w !== "(removed)") ? words.join(" ") : null;
+}
+// The Board notice for a verified job the deployer skips: the hub refused its
+// claim, or its set-aside journal is held. Only the job, its item and commit
+// when they have the hub's shape, and a reason of REASON's characters. key is
+// one per job for a process; the request id carries the deployer run, so a
+// restart of that run resends the same notice.
+export function heldClaimNotice(job, kind, reason, run) {
+  if (!/^rel_[A-Za-z0-9]{1,40}$/.test(job?.id || "")) return null;
+  const item = /^wi_[a-f0-9]{1,40}$/.test(job.itemId || "") ? job.itemId : null, commit = /^[a-f0-9]{40}$/.test(job.commit || "") ? job.commit : null;
+  const why = REASON.test(reason || "") ? reason : "unclassified", journal = kind === "journal";
+  return {key: `claim-held ${job.id}`, requestId: `${job.id}-claim-held-${NAME(run)}`, jobId: job.id, item, commit,
+    subject: journal ? "A release job is skipped because its set-aside journal is held" : "A release job is skipped because the hub refused its claim",
+    text: `Release ${job.id} (item ${item || "unknown"}, commit ${commit ? commit.slice(0, 12) : "unknown"}) is verified but not claimed: ${journal ? "the journal of its set-aside claim is held" : "the hub refused the claim"}. Reason: ${why}. Nothing was integrated, published or deployed. The deployer skips this job at every poll and goes on to later jobs; this notice is sent once per job per deployer run. Database handler: reconcile the job (Held claim in docs/project-deployment.md). Owner helper: for information.`};
+}
 // The files verify-matrix.mjs requires before a browser check runs, in its
 // order (a drift test pins the list). All are gitignored, so provisioning
 // them never dirties the deployer's checkout.
@@ -852,6 +877,7 @@ export class HostAdapter {
     try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout});}
     catch(error){
       const cli=this.config.tt||"tt",failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli);
+      if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
       if(argv[0]===cli && this.config.journalDirectory){try{this.cliFailures.push(recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now()));}catch{}}
       throw failed;
     }
@@ -1589,6 +1615,14 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[])]);posted.add(notice.key);}catch{}
     }
   };
+  // One notice per skipped job for a process: a refused claim or a held
+  // set-aside journal. A failed post never changes the skip.
+  const heldNotify=(reader,job,kind,reason)=>{
+    const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);
+    if(!notice || posted.has(notice.key))return;
+    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[])]);posted.add(notice.key);}
+    catch{process.stderr.write("Held claim notice not posted; the next poll retries.\n");}
+  };
   while(!signal?.aborted){
     let reader=null;
     try {
@@ -1662,11 +1696,11 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       // leaves its own journal alone.
       if(job.state==="verified"){
         let journal;try{journal=setAsideJournal(join(config.journalDirectory,job.id+".json"),job);}catch{journal="held";}
-        if(journal==="held"){skipped.add(job.id);process.stderr.write("Set-aside release journal held; handler reconciliation required.\n");continue;}
+        if(journal==="held"){skipped.add(job.id);process.stderr.write("Set-aside release journal held; handler reconciliation required.\n");heldNotify(reader,job,"journal","the journal is unreadable, shows effects or is not of exactly the set-aside claim");continue;}
       }
       const adapter=new HostAdapter(config,job);
       try{if(job.state==="verified")adapter.native("claim");}
-      catch{skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");continue;}
+      catch(error){skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");const call=failureReason(error),said=error?.refusal?`${error.refusal} (${call})`:call;heldNotify(reader,job,"claim",said.length<=160?said:call);continue;}
       const current=adapter.job;adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
       const batch=batchPolicy.max>1?batchFor(read,jobs,current):null;
