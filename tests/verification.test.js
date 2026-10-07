@@ -10,13 +10,14 @@ import {
   readdirSync,
   chmodSync,
   symlinkSync,
+  realpathSync,
 } from "node:fs";
 import { tmpdir, getPriority } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { prepareTestBinary, sourceIdentity, fileHash } from "./test-binaries.mjs";
 import { createServer } from "node:net";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
   selectChecks,
@@ -155,10 +156,12 @@ test("profile startup failure emits child exit, stderr and phase diagnostics", a
   writeFileSync(manifest, JSON.stringify({ binaries: [{ target: "hub", historicalCommit: null,
     source: await sourceIdentity(root), path: binary, sha256: await fileHash(binary) }] }));
   const result = spawnSync(process.execPath, ["tests/profile-sync-browser.mjs"], {
-    cwd: root, encoding: "utf8", timeout: 10000,
+    cwd: root, encoding: "utf8", timeout: 120000,
     env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR,
       TAILTERM_TEST_BINARIES: manifest },
   });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /profile-sync failure diagnostics:/);
   assert.match(result.stderr, /"phase":"startup"/);
@@ -557,15 +560,23 @@ test("cleanup failure removes eligible receipt and reports retained home", async
   assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
 });
 // Processes a fixture check leaves behind record their pids outside the
-// verifier home, and t.after SIGKILLs every recorded pid, so a failing test
-// cannot leak the processes it exercises.
+// verifier home, and t.after SIGKILLs every recorded pid that still runs this
+// fixture's own child.cjs, so a failing test cannot leak the processes it
+// exercises. A recorded pid whose process already exited may by then belong
+// to a stranger, which the unique directory in the command line rules out.
 function fixturePids(t) {
   const directory = mkdtempSync(join(tmpdir(), "verification-pids-"));
+  const owns = (pid) =>
+    Number.isInteger(pid) &&
+    pid > 0 &&
+    (spawnSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout || "")
+      .includes(join(directory, "child.cjs"));
   t.after(() => {
     for (const name of readdirSync(directory)) {
       if (name.endsWith(".pid"))
         try {
-          process.kill(Number(readFileSync(join(directory, name), "utf8")), "SIGKILL");
+          const pid = Number(readFileSync(join(directory, name), "utf8"));
+          if (owns(pid)) process.kill(pid, "SIGKILL");
         } catch {}
       if (name.endsWith(".path"))
         rmSync(readFileSync(join(directory, name), "utf8"), { recursive: true, force: true });
@@ -600,11 +611,36 @@ const alive = (pid) => {
     return error.code !== "ESRCH";
   }
 };
+test("fixture pid cleanup stops its own child and spares a recorded pid it does not own", async (t) => {
+  // The decoy stands for a stranger that took a recorded pid after its owner
+  // exited. The test holds its handle, so nothing here is found by number.
+  const decoy = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+  t.after(() => decoy.kill("SIGKILL"));
+  await once(decoy, "spawn");
+  let child, childExit;
+  await t.test("a fixture holding one child and the decoy's pid", async (s) => {
+    const pids = fixturePids(s);
+    child = spawn(process.execPath, [join(pids, "child.cjs"), "own"], { stdio: "ignore" });
+    childExit = once(child, "exit");
+    for (const deadline = Date.now() + 10_000; !existsSync(join(pids, "own.pid")); ) {
+      assert(child.exitCode === null && Date.now() < deadline, "the fixture child never started");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(pidOf(pids, "own"), child.pid);
+    writeFileSync(join(pids, "decoy.pid"), String(decoy.pid));
+  });
+  const [, signal] = await childExit;
+  assert.equal(signal, "SIGKILL", "cleanup stopped the fixture's own child");
+  // A killed decoy is a zombie, or already reaped, by the time ps answers.
+  const state = spawnSync("ps", ["-o", "state=", "-p", String(decoy.pid)], { encoding: "utf8" }).stdout.trim();
+  assert(state && !state.startsWith("Z"), `cleanup signalled a pid it does not own (state ${state || "gone"})`);
+  assert(decoy.exitCode === null && decoy.signalCode === null);
+});
 test("codex stub shadows any real codex on the check PATH and logs each call", async (t) => {
   const f = fixture(t),
     plan = commandPlan(
       f,
-      `import {spawnSync} from 'node:child_process';const r=spawnSync('sh',['-c','command -v codex; codex app-server --listen unix:// --managed-daemon; echo status=$?'],{encoding:'utf8'});process.stdout.write(r.stdout);process.stderr.write(r.stderr);`,
+      `import {spawnSync} from 'node:child_process';const r=spawnSync('sh',['-c','command -v codex; codex --version; echo status=$?'],{encoding:'utf8'});process.stdout.write(r.stdout);process.stderr.write(r.stderr);`,
     );
   const output = tempDir(t, "verification-codex-stub-logs-");
   const receipt = await runPlan(plan, f.cwd, output);
@@ -619,7 +655,7 @@ test("codex stub shadows any real codex on the check PATH and logs each call", a
     .split("\n")
     .filter(Boolean);
   assert.equal(calls.length, 1);
-  assert.match(calls[0], /\tapp-server --listen unix:\/\/ --managed-daemon$/);
+  assert.match(calls[0], /\t--version$/);
   assert.deepEqual(matrixRunner.verifierHomeProcesses(home), []);
   assert(!existsSync(home));
 });
@@ -830,21 +866,148 @@ test("test binary build failure starts no matrix check", async (t) => {
     version: 1, browserSuites: [{ file: "tests/profile-sync-browser.mjs", mode: "both" }],
     excludedBrowserSuites: [], rules: [{ prefixes: ["docs/"], groups: ["browser"] }],
   }));
-  f.git("add", ".gitignore", "wasm", "tests", "verification");
+  // A real module whose hub command does not parse: go build itself fails, at
+  // package load, so nothing is compiled.
+  mkdirSync(join(f.cwd, "hub/cmd/tt"), { recursive: true });
+  mkdirSync(join(f.cwd, "hub/cmd/tailterm-hub"));
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.22\n");
+  writeFileSync(join(f.cwd, "hub/cmd/tt/main.go"), "package main\n\nfunc main() {}\n");
+  writeFileSync(join(f.cwd, "hub/cmd/tailterm-hub/main.go"), "package main\n\nfunc main() {\n");
+  f.git("add", ".gitignore", "wasm", "tests", "verification", "hub");
   f.git("commit", "-qm", "browser fixture");
   const commit = f.git("rev-parse", "HEAD");
   const plan = makePlan({ baseCommit: commit, commit, owned: ["docs/"] }, f.cwd);
   const output = tempDir(t, "verification-build-failure-");
   const previousTmpdir = process.env.TMPDIR;
   process.env.TMPDIR = homeParent;
+  // The runner's own way of making its home, recording the exact directory.
+  const home = { path: "", existed: false };
+  const createHome = () => {
+    home.path = mkdtempSync(join(realpathSync("/tmp"), "tv-"));
+    home.existed = existsSync(home.path);
+    return home.path;
+  };
+  t.after(() => home.path && rmSync(home.path, { recursive: true, force: true }));
   try {
-    await assert.rejects(() => runPlan(plan, f.cwd, output), /ENOENT.*hub|no such file.*hub/i);
+    await assert.rejects(
+      () => runPlan(plan, f.cwd, output, { createHome }),
+      /go build[^]*cmd\/tailterm-hub\/main\.go:\d+:\d+: syntax error/,
+    );
     assert.deepEqual(readdirSync(output).sort(), ["host-lock.json", "host-lock.log"]);
     assert.deepEqual(readdirSync(homeParent), [], "failed binary preparation removed its runner home");
+    assert.notEqual(home.path, "");
+    assert(home.existed, "the injected runner home was created");
+    assert(!existsSync(home.path), "failed binary preparation removed its exact runner home");
   } finally {
     if (previousTmpdir === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = previousTmpdir;
   }
+});
+test("a prepared test binary changed by a check leaves no receipt", { timeout: 120000 }, async (t) => {
+  // tests/test-binaries.mjs captures its build environment when imported, so
+  // this process cannot redirect go. The run happens in a child process whose
+  // PATH puts a stand-in go first before it imports the runner; no real build
+  // runs. The stand-in writes a small executable for build -o and logs each call.
+  const tools = tempDir(t, "verification-binary-mutation-"),
+    goCalls = join(tools, "go-calls.log"),
+    suiteRecord = join(tools, "suite.json"),
+    output = tempDir(t, "verification-binary-mutation-logs-");
+  writeFileSync(
+    join(tools, "go"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> '${goCalls}'\n[ "$1" = build ] || exit 1\nout=\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n[ -n "$out" ] || exit 1\nprintf '#!/bin/sh\\nexit 0\\n' > "$out" && chmod +x "$out"\n`,
+    { mode: 0o755 },
+  );
+  // The suite's name selects binary preparation. It records the home it ran
+  // in and appends a byte to the first prepared binary.
+  const f = browserFixture(t, {
+    "profile-sync-browser.mjs":
+      `import fs from 'node:fs';const m=JSON.parse(fs.readFileSync(process.env.TAILTERM_TEST_BINARIES,'utf8'));` +
+      `fs.writeFileSync(${JSON.stringify(suiteRecord)},JSON.stringify({home:process.env.HOME,binary:m.binaries[0].path}));` +
+      `fs.appendFileSync(m.binaries[0].path,'x');`,
+  });
+  mkdirSync(join(f.cwd, "hub"));
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.22\n");
+  // Planned on its own commit, so the hub tree selects no Go check.
+  const commit = commitChange(f, "hub/cmd/tt/main.go", "package main\n\nfunc main() {}\n", "hub tree");
+  const plan = makePlan({ baseCommit: commit, commit, owned: ["client/"] }, f.cwd);
+  assert(plan.checks.some((check) => check.id === "tests/profile-sync-browser.mjs"));
+  writeFileSync(join(tools, "plan.json"), JSON.stringify(plan));
+  // The runner's own way of making its home, recording the exact directory.
+  writeFileSync(
+    join(tools, "run.mjs"),
+    `import { mkdtempSync, existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+const [runner, planFile, cwd, output, suiteRecord] = process.argv.slice(2);
+const { runPlan } = await import(runner);
+const home = { path: "", existed: false };
+let error = "";
+try {
+  await runPlan(JSON.parse(readFileSync(planFile, "utf8")), cwd, output, {
+    minFreeBytes: 0,
+    jobs: 1,
+    createHome: () => {
+      home.path = mkdtempSync(join(realpathSync("/tmp"), "tv-"));
+      home.existed = existsSync(home.path);
+      return home.path;
+    },
+  });
+} catch (failure) {
+  error = failure.message;
+}
+console.log(JSON.stringify({
+  error,
+  home: home.path,
+  existed: home.existed,
+  exists: existsSync(home.path),
+  suite: existsSync(suiteRecord) ? JSON.parse(readFileSync(suiteRecord, "utf8")) : null,
+  output: readdirSync(output).sort(),
+}));
+`,
+  );
+  const child = spawn(
+    process.execPath,
+    [
+      join(tools, "run.mjs"),
+      new URL("../scripts/verify-matrix.mjs", import.meta.url).href,
+      join(tools, "plan.json"),
+      f.cwd,
+      output,
+      suiteRecord,
+    ],
+    {
+      cwd: f.cwd,
+      env: {
+        ...process.env,
+        PATH: tools + ":" + process.env.PATH,
+        TAILTERM_MATRIX_HOST_LOCK: join(tools, "host.json"),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+  let stdout = "",
+    stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, stderr);
+  const result = JSON.parse(stdout.trim().split("\n").at(-1));
+  t.after(() => result.home && rmSync(result.home, { recursive: true, force: true }));
+  assert.match(result.error, /Prepared test binary changed during verification/);
+  assert(result.error.endsWith(": " + result.suite.binary), result.error);
+  assert(!result.output.includes("receipt.json"), String(result.output));
+  assert(
+    result.output.includes(digest("tests/profile-sync-browser.mjs") + ".attempt-1.log"),
+    String(result.output),
+  );
+  assert.notEqual(result.home, "");
+  assert.equal(result.suite.home, result.home, "the suite ran in the injected runner home");
+  assert(result.existed, "the injected runner home was created");
+  assert(!result.exists, "the refused run removed its exact runner home");
+  assert.deepEqual(readFileSync(goCalls, "utf8").split("\n").filter(Boolean), [
+    `build -ldflags=-s -w -o ${join(output, "tailterm-hub-test")} ./cmd/tailterm-hub`,
+    `build -o ${join(output, "tailterm-tt-test")} ./cmd/tt`,
+  ]);
 });
 
 test("candidate matrix weakening cannot replace the independently approved digest", (t) => {
@@ -1293,6 +1456,54 @@ test("only knownFailures bytes change invalidates prior approval and plan", (t) 
       /known failure/,
     );
 });
+test("run refuses a plan whose retry policy was edited after planning, before any check starts", async (t) => {
+  const known = {
+    checkId: "npm-unit",
+    bugTaskId: "tsk_aaaaaaaaaaaaaaaa",
+    bugId: "wi_bbbbbbbbbbbbbbbb",
+  };
+  // The one check writes a marker outside the repository, so a check that
+  // started is seen even when the run is refused afterwards.
+  const planned = (knownFailures) => {
+    const f = fixture(t),
+      marker = join(tempDir(t, "verification-policy-marker-"), "ran");
+    if (knownFailures.length) {
+      const m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json")));
+      writeFileSync(
+        join(f.cwd, "verification/matrix.json"),
+        JSON.stringify({ ...m, knownFailures }),
+      );
+    }
+    const plan = commandPlan(
+      f,
+      `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'ran');`,
+    );
+    return { f, marker, plan };
+  };
+  const refused = async ({ f, marker }, edited) => {
+    const output = tempDir(t, "verification-policy-logs-");
+    await assert.rejects(
+      () => runPlan(edited, f.cwd, output),
+      /Altered or omitted required checks/,
+    );
+    assert(!existsSync(marker), "a check ran before the refusal");
+    assert.deepEqual(readdirSync(output), []);
+  };
+  const plain = planned([]);
+  assert.equal(plain.plan.maxAttempts, 3);
+  assert.equal(plain.plan.knownFailures, undefined);
+  await refused(plain, { ...plain.plan, knownFailures: [known] });
+  await refused(plain, { ...plain.plan, maxAttempts: 1 });
+  const { maxAttempts, ...withoutAttempts } = plain.plan;
+  await refused(plain, withoutAttempts);
+  const listed = planned([known]);
+  assert.deepEqual(listed.plan.knownFailures, [known]);
+  const { knownFailures, ...withoutKnown } = listed.plan;
+  await refused(listed, withoutKnown);
+  // The untouched plan still runs its check, so the marker is a live signal.
+  await runPlan(plain.plan, plain.f.cwd, tempDir(t, "verification-policy-logs-"));
+  assert(existsSync(plain.marker));
+});
 
 // wi_82ed4c6924930bad / order #13844: parallel scheduling, targeted fix runs
 // and fast-forward bases.
@@ -1512,23 +1723,54 @@ test("concurrent checks keep plan-ordered receipts and record the job count", as
   assert(fast.startedAt < slow.endedAt && slow.startedAt < fast.endedAt);
   assert(receipt.checks.every((c) => c.status === "pass"));
 });
-test("CLI SIGINT stops every concurrent check group, keeps partial logs and leaves no receipt", async (t) => {
-  const root = tempDir(t, "verification-concurrent-signal-");
+// Pids of the processes whose command line carries token, read in one listing.
+const tokenProcesses = (token) =>
+  spawnSync("ps", ["-axww", "-o", "pid=,command="], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
+    .stdout.split("\n")
+    .map((line) => line.match(/^\s*(\d+)\s+(.*)$/))
+    .filter((match) => match && match[2].includes(token))
+    .map((match) => Number(match[1]));
+// Starts two concurrent check groups through the CLI, interrupts the run once
+// both published a pid file and checks what it left. Every process of the run
+// carries its token, the base name of a fresh directory: the runner in its
+// plan path, each suite in its file name and each suite's TERM-ignoring child
+// as an argument. Cleanup signals the runner by its handle and otherwise only
+// processes that carry the token, so it stops check groups that never
+// published and never signals a pid merely read from a file. withhold names
+// suites that start but never publish; run receives the token, the runner and
+// each started suite's pids for the caller's own assertions.
+async function interruptedConcurrentRun(t, { withhold = [], publishWithinMs = 30_000 } = {}, run = {}) {
+  const root = tempDir(t, "verification-concurrent-signal-"),
+    token = root.split("/").at(-1),
+    names = ["one", "two"];
+  const waitFor = async (pending, deadline, [did, todo], runner) => {
+    while (pending().length) {
+      assert(
+        runner.exitCode === null && runner.signalCode === null,
+        `the runner exited before these check groups ${did}: ${pending()}`,
+      );
+      assert(Date.now() < deadline, `timed out waiting for these check groups to ${todo}: ${pending()}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
   // The runner writes an attempt log only when its check ends, so the pid file
-  // is the readiness event: each suite first puts its partial line in the
-  // runner's pipe with a synchronous write, then publishes the complete pid
-  // file by rename.
+  // is the readiness event: each suite first records that it started, then
+  // puts its partial line in the runner's pipe with a synchronous write, then
+  // publishes the complete pid file by rename.
+  const publish = (file) =>
+    `fs.writeFileSync(${JSON.stringify(join(root, file + ".tmp"))},JSON.stringify([process.pid,c.pid]));` +
+    `fs.renameSync(${JSON.stringify(join(root, file + ".tmp"))},${JSON.stringify(join(root, file))});`;
   const suite = (name) =>
     `import {spawn} from 'node:child_process';import fs from 'node:fs';` +
-    `const c=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{stdio:'ignore'});` +
+    `const c=spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)',${JSON.stringify(token)}],{stdio:'ignore'});` +
+    publish(name + ".started") +
     `fs.writeSync(1,'partial ${name}\\n');` +
-    `fs.writeFileSync(${JSON.stringify(join(root, name + ".tmp"))},JSON.stringify([process.pid,c.pid]));` +
-    `fs.renameSync(${JSON.stringify(join(root, name + ".tmp"))},${JSON.stringify(join(root, name))});` +
+    (withhold.includes(name) ? "" : publish(name)) +
     `setInterval(()=>{},1000);`;
-  const f = browserFixture(t, {
-    "one-browser.mjs": suite("one"),
-    "two-browser.mjs": suite("two"),
-  });
+  const f = browserFixture(
+    t,
+    Object.fromEntries(names.map((name) => [`${name}-${token}-browser.mjs`, suite(name)])),
+  );
   const plan = makePlan(
     { baseCommit: f.commit, commit: f.commit, owned: ["client/"] },
     f.cwd,
@@ -1542,25 +1784,29 @@ test("CLI SIGINT stops every concurrent check group, keeps partial logs and leav
     [script, "run", planFile, output, "--min-free-bytes", "0", "--jobs", "3"],
     { cwd: f.cwd, env: { ...process.env, TMPDIR: root }, stdio: "ignore" },
   );
+  const closed = once(runner, "close");
+  Object.assign(run, { token, runner, started: [] });
   const pids = [];
   try {
-    const waiting = () =>
-      ["one", "two"].filter((name) => !existsSync(join(root, name)));
-    for (const deadline = Date.now() + 30_000; waiting().length; ) {
-      assert(
-        runner.exitCode === null && runner.signalCode === null,
-        `the runner exited before these check groups published a pid file: ${waiting()}`,
-      );
-      assert(
-        Date.now() < deadline,
-        `timed out waiting for these check groups to publish a pid file: ${waiting()}`,
-      );
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    for (const name of ["one", "two"])
+    // Both suites are running before any publication deadline applies.
+    await waitFor(
+      () => names.filter((name) => !existsSync(join(root, name + ".started"))),
+      Date.now() + 30_000,
+      ["started", "start"],
+      runner,
+    );
+    for (const name of names)
+      run.started.push(...JSON.parse(readFileSync(join(root, name + ".started"), "utf8")));
+    await waitFor(
+      () => names.filter((name) => !existsSync(join(root, name))),
+      Date.now() + publishWithinMs,
+      ["published a pid file", "publish a pid file"],
+      runner,
+    );
+    for (const name of names)
       pids.push(...JSON.parse(readFileSync(join(root, name), "utf8")));
     runner.kill("SIGINT");
-    const [code] = await once(runner, "close");
+    const [code] = await closed;
     assert.equal(code, 130);
     const alive = (pid) => {
       try {
@@ -1574,21 +1820,49 @@ test("CLI SIGINT stops every concurrent check group, keeps partial logs and leav
       await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(pids.filter(alive), [], "every check group was stopped");
     assert(!existsSync(join(output, "receipt.json")));
-    for (const name of ["one", "two"]) {
+    for (const name of names) {
       const log = readFileSync(
-        join(output, digest(`tests/${name}-browser.mjs`) + ".attempt-1.log"),
+        join(output, digest(`tests/${name}-${token}-browser.mjs`) + ".attempt-1.log"),
         "utf8",
       );
       assert.match(log, new RegExp("partial " + name));
       assert.match(log, /failureReason: interrupted/);
     }
   } finally {
-    if (runner.exitCode === null && runner.signalCode === null) runner.kill("SIGKILL");
-    for (const pid of pids)
+    const running = () => runner.exitCode === null && runner.signalCode === null;
+    // The runner stops its own check groups on SIGINT; SIGKILL would orphan them.
+    if (running()) {
+      runner.kill("SIGINT");
+      await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 15_000))]);
+    }
+    if (running()) {
+      runner.kill("SIGKILL");
+      await closed;
+    }
+    let left = tokenProcesses(token);
+    for (const pid of left)
       try {
         process.kill(pid, "SIGKILL");
       } catch {}
+    for (const deadline = Date.now() + 5_000; left.length && Date.now() < deadline; ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      left = tokenProcesses(token);
+    }
+    assert.deepEqual(left, [], "a process of this run outlived its cleanup");
   }
+}
+test("CLI SIGINT stops every concurrent check group, keeps partial logs and leaves no receipt", (t) =>
+  interruptedConcurrentRun(t));
+test("a check group that never publishes its pid file is still stopped when the wait times out", async (t) => {
+  const run = {};
+  await assert.rejects(
+    () => interruptedConcurrentRun(t, { withhold: ["two"], publishWithinMs: 3_000 }, run),
+    /timed out waiting for these check groups to publish a pid file: two$/,
+  );
+  assert(run.runner.exitCode !== null || run.runner.signalCode !== null, "the runner exited");
+  assert.equal(run.started.length, 4);
+  assert.deepEqual(run.started.filter(alive), [], "a started check group process is still running");
+  assert.deepEqual(tokenProcesses(run.token), []);
 });
 function commitChange(f, path, content, message) {
   mkdirSync(join(f.cwd, path, ".."), { recursive: true });
@@ -4177,37 +4451,150 @@ test("go-race command fails closed: a failing package, a failing shard, and a te
   assert(!result.stdout.includes("go-race shard"), result.stdout);
 });
 
+// Every process with its group and state, and whether its environment carries
+// marker. Read the way the runner's home sweep reads environments, which hold
+// other processes' credentials: matched here and never kept.
+function markedProcesses(marker) {
+  const ps = (...args) => {
+    const result = spawnSync("ps", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+    if (result.status !== 0) throw new Error("ps failed: " + (result.error?.message || result.stderr));
+    return result.stdout.split("\n");
+  };
+  const row = (line) => /^\s*(\d+)\s+(\d+)\s+(\S+)(?:\s(.*))?$/.exec(line);
+  if (process.platform === "darwin")
+    return ps("-axww", "-E", "-o", "pid=,pgid=,state=,command=")
+      .map(row)
+      .filter(Boolean)
+      .map(([, pid, pgid, state, rest = ""]) => ({
+        pid: Number(pid),
+        pgid: Number(pgid),
+        state,
+        marked: rest.includes(marker),
+      }));
+  if (process.platform === "linux")
+    return ps("-ax", "-o", "pid=,pgid=,state=")
+      .map(row)
+      .filter(Boolean)
+      .map(([, pid, pgid, state]) => {
+        let marked = false;
+        try {
+          marked = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(marker);
+        } catch {}
+        return { pid: Number(pid), pgid: Number(pgid), state, marked };
+      });
+  throw new Error("Unsupported platform for the process group listing");
+}
+// The live processes of a detached child's group that this test started. A
+// bare group number says nothing about whose it is: once the group's last
+// process is reaped the number can name a stranger's group, and a group that
+// holds only zombies answers EPERM. So a member is ours only while it is in
+// the group, is not a zombie and inherited marker ("NAME=value") from the
+// child's environment. After alive() has once answered false the group is
+// over for good, and stop() signals nothing. stop() SIGKILLs each member by
+// its own pid, never a group.
+function ownedGroup(pgid, marker, { list = markedProcesses, kill = process.kill } = {}) {
+  let over = false;
+  const members = () =>
+    over
+      ? []
+      : list(marker)
+          .filter((p) => p.pgid === pgid && !p.state.startsWith("Z") && p.marked)
+          .map((p) => p.pid);
+  return {
+    members,
+    alive() {
+      if (!over && !members().length) over = true;
+      return !over;
+    },
+    stop() {
+      for (const pid of members())
+        try {
+          kill(pid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+    },
+  };
+}
+test("owned group probe answers only for marked live members and never signals a group", () => {
+  // A kernel over a process table: a group of zombies answers EPERM, as macOS does.
+  const kernel = (table) => {
+    const signals = [];
+    const kill = (pid, signal) => {
+      const targets = table.filter((p) => (pid < 0 ? p.pgid === -pid : p.pid === pid));
+      const refuse = (code) => {
+        throw Object.assign(new Error("kill " + code), { code });
+      };
+      if (!targets.length) refuse("ESRCH");
+      if (targets.every((p) => p.state.startsWith("Z"))) refuse("EPERM");
+      signals.push([pid, signal]);
+    };
+    return { table, signals, group: ownedGroup(500, "M=1", { list: () => table.map((p) => ({ ...p })), kill }) };
+  };
+  const mine = { pid: 501, pgid: 500, state: "S", marked: true },
+    stranger = { pid: 502, pgid: 500, state: "R", marked: false },
+    elsewhere = { pid: 503, pgid: 600, state: "S", marked: true };
+  // A marked live member: alive, and stopped by its own pid.
+  let k = kernel([mine, stranger, elsewhere]);
+  assert.equal(k.group.alive(), true);
+  assert.deepEqual(k.group.members(), [501]);
+  k.group.stop();
+  assert.deepEqual(k.signals, [[501, "SIGKILL"]]);
+  // A same-user stranger holding the group number, before any false answer.
+  k = kernel([stranger, elsewhere]);
+  k.group.stop();
+  assert.deepEqual(k.signals, []);
+  assert.equal(k.group.alive(), false);
+  k.group.stop();
+  assert.deepEqual(k.signals, []);
+  // Only a zombie left in the group: an answer, not EPERM.
+  k = kernel([{ ...mine, state: "Z" }]);
+  assert.equal(k.group.alive(), false);
+  k.group.stop();
+  assert.deepEqual(k.signals, []);
+  // After a false answer a marked process in the reused group is not ours.
+  k = kernel([]);
+  assert.equal(k.group.alive(), false);
+  k.table.push(mine);
+  assert.equal(k.group.alive(), false);
+  assert.deepEqual(k.group.members(), []);
+  k.group.stop();
+  assert.deepEqual(k.signals, []);
+  // A member that exits between the listing and the signal is not an error.
+  const racing = ownedGroup(500, "M=1", {
+    list: () => [{ ...mine }],
+    kill: () => {
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    },
+  });
+  racing.stop();
+});
 test("go-race command stopped through its process group leaves no shard process behind", { timeout: 600000 }, async (t) => {
   const f = goRaceFixture(t);
   rmSync(f.log, { force: true });
+  // Every descendant inherits the marker, as it does FIXTURE_RUN.
+  const marker = randomUUID();
   const child = spawn(process.execPath, [matrixScript, "go-race", "-timeout=5m", "-shards=./store=2", "./store"], {
     cwd: f.cwd,
-    env: f.environment({ FIXTURE_SLEEP: "1" }),
+    env: f.environment({ FIXTURE_SLEEP: "1", FIXTURE_GROUP_MARKER: marker }),
     detached: true,
     stdio: "ignore",
   });
-  const groupAlive = () => {
-    try {
-      process.kill(-child.pid, 0);
-      return true;
-    } catch (error) {
-      if (error.code === "ESRCH") return false;
-      throw error;
-    }
-  };
-  t.after(() => {
-    if (groupAlive()) process.kill(-child.pid, "SIGKILL");
-  });
+  const group = ownedGroup(child.pid, "FIXTURE_GROUP_MARKER=" + marker);
+  t.after(() => group.stop());
   const exited = once(child, "exit");
   const deadline = Date.now() + 240000;
   while (!f.entries().some((e) => e.name === "TestAlpha")) {
     assert(child.exitCode === null && Date.now() < deadline, "the sleeping shard test never started");
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  // The listing sees the running check, so a later empty answer means stopped.
+  const running = group.members();
+  assert(running.includes(child.pid) && running.length > 1, `the group listing misses the running check: ${running}`);
   // What the matrix runner does to a check at its timeout.
   process.kill(-child.pid, "SIGTERM");
   const [code, signal] = await exited;
   assert.equal(signal ?? code, 143);
-  for (let i = 0; i < 100 && groupAlive(); i++) await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(groupAlive(), false, "a process of the check's group survived");
+  for (let i = 0; i < 100 && group.alive(); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(group.alive(), false, "a process of the check's group survived");
 });
