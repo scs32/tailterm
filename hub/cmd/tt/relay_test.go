@@ -1341,3 +1341,388 @@ func TestRelayRotationPassObservesBackoffLikeInlineTicks(t *testing.T) {
 		t.Fatalf("a clean pass cleared a live backoff: %+v", backoff)
 	}
 }
+
+func deployerNotice(seq int64, from string) api.Message {
+	return api.Message{Seq: seq, From: api.Sender{AgentID: from, Node: "workspace", User: "owner"}, Text: "NOTICE: Release refused before publication",
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Release refused before publication", Body: api.EnvelopeBody{Text: "Release was refused before publication."}}}
+}
+
+// noticeHub is an isolated hub for the deployer notice wake: it serves each
+// agent by its ID and records every call, so a test can prove which hub reads
+// a binding caused and that the relay wrote nothing.
+type noticeHub struct {
+	t        *testing.T
+	mu       sync.Mutex
+	agents   map[string]api.Agent
+	messages []api.Message
+	calls    []string
+	fail     map[string]int // agent ID -> status for its reads
+}
+
+func (h *noticeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	h.calls = append(h.calls, r.Method+" "+r.URL.Path)
+	id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	switch {
+	case r.Method != http.MethodGet:
+		h.t.Errorf("the inbox wake must not write to the hub: %s %s", r.Method, r.URL)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	case strings.HasSuffix(r.URL.Path, "/pause"):
+		_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+	case strings.HasSuffix(r.URL.Path, "/obligations"):
+		_ = json.NewEncoder(w).Encode(api.ObligationList{})
+	case strings.HasSuffix(r.URL.Path, "/messages"):
+		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		var page []api.Message
+		for _, m := range h.messages {
+			if m.Seq > after {
+				page = append(page, m)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(api.MessageList{Messages: page})
+	case strings.Contains(r.URL.Path, "/agents/") && h.fail[id] != 0:
+		http.Error(w, "refused", h.fail[id])
+	case strings.Contains(r.URL.Path, "/agents/"):
+		a, ok := h.agents[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(a)
+	default:
+		h.t.Errorf("unexpected hub call %s %s", r.Method, r.URL)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}
+}
+
+// reads counts the recorded reads of one agent and, with reset, clears the record.
+func (h *noticeHub) reads(agent string, reset bool) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, call := range h.calls {
+		if strings.HasSuffix(call, "/agents/"+agent) {
+			n++
+		}
+	}
+	if reset {
+		h.calls = nil
+	}
+	return n
+}
+
+const (
+	noticeTask     = "tsk_00000000000000d1"
+	noticeDeployer = "agt_00000000000000d1"
+	noticeHandler  = "agt_00000000000000d2"
+	noticeHelper   = "agt_00000000000000d3"
+	noticeWorker   = "agt_00000000000000d4"
+	noticeSteward  = "agt_00000000000000d5"
+	noticeRun      = "run_00000000000000d1"
+)
+
+func newNoticeHub(t *testing.T) (*noticeHub, *api.Client, func(agent string) runtimeBinding) {
+	t.Helper()
+	h := &noticeHub{t: t, agents: map[string]api.Agent{}, fail: map[string]int{}}
+	for id, role := range map[string]string{noticeDeployer: api.AgentRoleDeployment, noticeHandler: api.AgentRoleDatabaseHandler,
+		noticeHelper: api.AgentRoleOwnerHelper, noticeWorker: "", noticeSteward: api.AgentRoleBacklogSteward} {
+		h.agents[id] = api.Agent{ID: id, RunID: noticeRun, Role: role, Runtime: "codex", Status: api.AgentDone, Online: true, Unread: 1}
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	c, _ := api.NewClient(srv.URL, time.Second)
+	return h, c, func(agent string) runtimeBinding {
+		b := runtimeBinding{Hub: srv.URL, Task: noticeTask, Agent: agent, Run: noticeRun, Thread: "00000000-0000-4000-8000-0000000000d1", Runtime: "codex", Codex: "/synthetic/codex"}
+		if agent == noticeHelper {
+			b.Role = api.AgentRoleOwnerHelper
+		}
+		return b
+	}
+}
+
+// A release the deployer refuses, fails or holds is announced with no
+// recipient. In a project that is not a swarm that reaches the database
+// handler's and the owner helper's inbox, and it must also wake them
+// (wi_3670e153328df185). This runs against a real hub store, so the inbox
+// page and the unread count are the hub's own.
+func TestRelayWakesHandlerAndHelperForDeployerNotice(t *testing.T) {
+	h := newInboxHub(t)
+	ctx := context.Background()
+	deployer, err := h.st.AddAgent(ctx, h.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer", Host: "host", Session: "deployer", Runtime: "claude", Role: api.AgentRoleDeployment}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := h.st.RegisterOwnerHelper(ctx, h.task.ID, api.RegisterOwnerHelperRequest{Host: "host", Session: "owner", Runtime: "codex", RequestID: "notice-helper"}, h.by)
+	if err != nil || registered.Agent == nil {
+		t.Fatalf("register helper: %+v %v", registered, err)
+	}
+	helper := *registered.Agent
+	for _, a := range []api.Agent{h.handler, helper} {
+		if _, err := h.st.PostEvent(ctx, h.task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: a.ID, RunID: a.RunID}, h.by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notice, err := h.st.PostMessage(ctx, h.task.ID, api.PostMessageRequest{AgentID: deployer.ID, RunID: deployer.RunID, RequestID: "notice-refused",
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Release refused before publication", Body: api.EnvelopeBody{Text: "Release was refused before publication; nothing was published."}}}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notice.To != "" || notice.Broadcast || notice.From.AgentID != deployer.ID {
+		t.Fatalf("fixture notice is not a recipient-less deployer notice: %+v", notice)
+	}
+	for _, tc := range []struct {
+		name, role string
+		agent      api.Agent
+	}{{"database handler", "", h.handler}, {"owner helper", api.AgentRoleOwnerHelper, helper}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if a, err := h.c.GetAgent(ctx, h.task.ID, tc.agent.ID); err != nil || a.Unread != 1 || !a.Online {
+				t.Fatalf("the notice is not unread for a live %s: %+v %v", tc.name, a, err)
+			}
+			b := runtimeBinding{Hub: h.e.hub, Task: h.task.ID, Agent: tc.agent.ID, Run: tc.agent.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "codex", Role: tc.role, Codex: "/synthetic/codex"}
+			p := relayProgress{}
+			var prompts []string
+			queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+				prompts = append(prompts, prompt)
+				return nil
+			}
+			now := time.Now()
+			if err := relayOne(ctx, b, &p, h.c, now, queue); err != nil {
+				t.Fatal(err)
+			}
+			if len(prompts) != 1 || p.Through != notice.Seq || !strings.Contains(prompts[0], fmt.Sprintf("through message #%d", notice.Seq)) {
+				t.Fatalf("the %s was not woken for deployer notice #%d: prompts=%q progress=%+v", tc.name, notice.Seq, prompts, p)
+			}
+			// The notice stays unread; a later poll must not wake for it again.
+			if err := relayOne(ctx, b, &p, h.c, now.Add(time.Minute), queue); err != nil || len(prompts) != 1 {
+				t.Fatalf("the %s was woken twice for one notice: %v %q", tc.name, err, prompts)
+			}
+		})
+	}
+}
+
+func TestRelayDeployerNoticeWakesOncePerRecipient(t *testing.T) {
+	for _, agent := range []string{noticeHandler, noticeHelper} {
+		for _, runtime := range []string{"codex", "claude"} {
+			t.Run(agent+"-"+runtime, func(t *testing.T) {
+				relayAuthorRoles.reset()
+				h, c, binding := newNoticeHub(t)
+				h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+				b := binding(agent)
+				if runtime == "claude" {
+					b.Runtime, b.Codex, b.Session = "claude", "", "fixture"
+				}
+				ctx := context.Background()
+				p := relayProgress{}
+				var prompts []string
+				queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+					prompts = append(prompts, prompt)
+					return nil
+				}
+				failed := func(context.Context, runtimeBinding, string) error { return errors.New("Codex queue failed: offline") }
+				now := time.Now()
+				// A failed queue is not a delivered wake: the cursor stays and the
+				// retry is the one wake.
+				if err := relayOne(ctx, b, &p, c, now, failed); err == nil || p.Through != 0 {
+					t.Fatalf("failed queue advanced the cursor: %v %+v", err, p)
+				}
+				if err := relayOne(ctx, b, &p, c, now.Add(time.Second), queue); err != nil || len(prompts) != 0 {
+					t.Fatalf("retry ignored the 15-second spacing: %v %q", err, prompts)
+				}
+				if err := relayOne(ctx, b, &p, c, now.Add(time.Minute), queue); err != nil || len(prompts) != 1 || p.Through != 31 {
+					t.Fatalf("retry did not wake once: %v %q %+v", err, prompts, p)
+				}
+				want := "through message #31"
+				if runtime == "claude" {
+					want = "Tailterm messages #31."
+				}
+				inbox := "tt inbox --unread --mark-read"
+				if agent == noticeHelper {
+					inbox = "tt helper inbox --task " + noticeTask
+				}
+				if !strings.Contains(prompts[0], want) || !strings.Contains(prompts[0], inbox) {
+					t.Fatalf("wake prompt %q", prompts[0])
+				}
+				// Repeated polls, a persisted and reloaded progress record, and the
+				// same page read again all leave it at one wake.
+				raw, _ := json.Marshal(p)
+				p = relayProgress{}
+				_ = json.Unmarshal(raw, &p)
+				for i := 2; i < 6; i++ {
+					if err := relayOne(ctx, b, &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if len(prompts) != 1 {
+					t.Fatalf("one notice woke %d times: %q", len(prompts), prompts)
+				}
+				// The author's role is read once for the relay process, however
+				// many polls and notices follow.
+				h.mu.Lock()
+				h.messages = append(h.messages, deployerNotice(32, noticeDeployer))
+				h.mu.Unlock()
+				if err := relayOne(ctx, b, &p, c, now.Add(10*time.Minute), queue); err != nil || len(prompts) != 2 || p.Through != 32 {
+					t.Fatalf("a second notice did not wake once: %v %q %+v", err, prompts, p)
+				}
+				if n := h.reads(noticeDeployer, false); n != 1 {
+					t.Fatalf("the deployer's role was read %d times", n)
+				}
+			})
+		}
+	}
+}
+
+// A binding that is not live gets no wake and causes no hub request beyond
+// the ones the relay already made for it.
+func TestRelayDeployerNoticeNeedsLiveBinding(t *testing.T) {
+	for name, change := range map[string]func(*api.Agent){
+		"superseded run": func(a *api.Agent) { a.RunID = "run_00000000000000ff" },
+		"offline":        func(a *api.Agent) { a.Online = false },
+		"closed":         func(a *api.Agent) { a.Status = api.AgentClosed },
+		"exited":         func(a *api.Agent) { a.Status = api.AgentExited },
+		"retired":        func(a *api.Agent) { a.Status = api.AgentRetired },
+	} {
+		for _, agent := range []string{noticeHandler, noticeHelper} {
+			t.Run(name+"-"+agent, func(t *testing.T) {
+				relayAuthorRoles.reset()
+				h, c, binding := newNoticeHub(t)
+				h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+				a := h.agents[agent]
+				change(&a)
+				h.agents[agent] = a
+				p := relayProgress{}
+				queue := func(context.Context, runtimeBinding, string) error {
+					t.Fatal("a binding that is not live was woken")
+					return nil
+				}
+				if err := relayOne(context.Background(), binding(agent), &p, c, time.Now(), queue); err != nil {
+					t.Fatal(err)
+				}
+				h.mu.Lock()
+				calls := strings.Join(h.calls, ", ")
+				h.mu.Unlock()
+				if want := "GET /v1/tasks/" + noticeTask + "/pause, GET /v1/tasks/" + noticeTask + "/agents/" + agent; calls != want {
+					t.Fatalf("hub requests for a binding that is not live: %s", calls)
+				}
+			})
+		}
+	}
+	// An agent with no binding is never passed to relayOne; the bindings of
+	// other agents must not cause a read of it or a wake for it.
+	relayAuthorRoles.reset()
+	h, c, binding := newNoticeHub(t)
+	h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+	woken := map[string]int{}
+	queue := func(_ context.Context, b runtimeBinding, _ string) error {
+		woken[b.Agent]++
+		return nil
+	}
+	if err := relayOne(context.Background(), binding(noticeHandler), &relayProgress{}, c, time.Now(), queue); err != nil {
+		t.Fatal(err)
+	}
+	if woken[noticeHandler] != 1 || len(woken) != 1 || h.reads(noticeHelper, false) != 0 {
+		t.Fatalf("the unbound owner helper was read or woken: %v", woken)
+	}
+}
+
+func TestRelayDeployerNoticeLeavesOtherWakesUnchanged(t *testing.T) {
+	result := deployerNotice(31, noticeDeployer)
+	result.Envelope = &api.Envelope{Kind: api.EnvelopeKindResult, Subject: "Release published"}
+	freeText := api.Message{Seq: 31, From: api.Sender{AgentID: noticeDeployer}, Text: "deployer free text"}
+	broker := deployerNotice(31, noticeDeployer)
+	broker.From = api.Sender{Node: api.BrokerNode, User: "broker"}
+	directedElsewhere := deployerNotice(31, noticeDeployer)
+	directedElsewhere.To = noticeWorker
+	directed := deployerNotice(31, noticeDeployer)
+	directed.To = noticeWorker
+	broadcast := deployerNotice(31, noticeWorker)
+	broadcast.Broadcast = true
+	for _, tc := range []struct {
+		name, agent string
+		m           api.Message
+		wake        bool
+		authorReads int // reads of the message's author
+	}{
+		{"deployer notice wakes the handler", noticeHandler, deployerNotice(31, noticeDeployer), true, 1},
+		{"deployer notice wakes the helper", noticeHelper, deployerNotice(31, noticeDeployer), true, 1},
+		{"worker notice does not wake the handler", noticeHandler, deployerNotice(31, noticeWorker), false, 1},
+		{"steward notice does not wake the helper", noticeHelper, deployerNotice(31, noticeSteward), false, 1},
+		{"handler notice does not wake the helper", noticeHelper, deployerNotice(31, noticeHandler), false, 1},
+		{"unknown author does not wake the handler", noticeHandler, deployerNotice(31, "agt_00000000000000ee"), false, 1},
+		{"deployer result does not wake the handler", noticeHandler, result, false, 0},
+		{"deployer free text does not wake the helper", noticeHelper, freeText, false, 0},
+		{"broker notice does not wake the handler", noticeHandler, broker, false, 0},
+		{"notice directed elsewhere does not wake the handler", noticeHandler, directedElsewhere, false, 0},
+		{"deployer notice does not wake a worker", noticeWorker, deployerNotice(31, noticeDeployer), false, 0},
+		{"deployer notice does not wake the steward", noticeSteward, deployerNotice(31, noticeDeployer), false, 0},
+		{"deployer notice does not wake the deployer", noticeDeployer, deployerNotice(31, noticeDeployer), false, 0},
+		{"directed still wakes a worker", noticeWorker, directed, true, 0},
+		{"broadcast still wakes the steward", noticeSteward, broadcast, true, 0},
+		{"authorless still wakes a worker", noticeWorker, api.Message{Seq: 31, From: api.Sender{Node: "workspace", User: "owner"}, Text: "owner note"}, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			relayAuthorRoles.reset()
+			h, c, binding := newNoticeHub(t)
+			h.messages = []api.Message{tc.m}
+			p := relayProgress{}
+			wakes := 0
+			queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+			now := time.Now()
+			for i := 0; i < 3; i++ {
+				if err := relayOne(context.Background(), binding(tc.agent), &p, c, now.Add(time.Duration(i)*time.Minute), queue); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if want := map[bool]int{true: 1}[tc.wake]; wakes != want || p.Through != 31 {
+				t.Fatalf("wakes=%d want %d progress=%+v", wakes, want, p)
+			}
+			author := tc.m.From.AgentID
+			reads := h.reads(author, false)
+			if author == tc.agent {
+				reads = 0 // its own reads, not an author lookup
+			}
+			if tc.authorReads == 0 && author != "" && author != tc.agent && reads != 0 || tc.authorReads == 1 && reads != 1 {
+				t.Fatalf("author %s was read %d times, want %d", author, reads, tc.authorReads)
+			}
+			// One rule for the wake, its diagnostics and the Claude prompt.
+			authors := map[string]bool{}
+			if tc.wake && tc.authorReads == 1 {
+				authors[author] = true
+			}
+			_, eligible := wakeThroughFor(h.messages, tc.agent, authors)
+			seqs := wakeSeqsFor(h.messages, tc.agent, authors)
+			prompt := claudeWakePromptFor(h.messages, tc.agent, authors)
+			if eligible != tc.wake || (len(seqs) == 1) != tc.wake || strings.Contains(prompt, "#31") != tc.wake {
+				t.Fatalf("rule disagrees: eligible=%v seqs=%v prompt=%q", eligible, seqs, prompt)
+			}
+			// Without the deployer set, the rule is what it was before.
+			_, before := wakeThrough(h.messages, tc.agent)
+			if want := tc.wake && tc.authorReads == 0; before != want {
+				t.Fatalf("existing rule changed: %v want %v", before, want)
+			}
+		})
+	}
+}
+
+// A failed role read holds the page instead of passing the notice over, and a
+// later poll delivers it.
+func TestRelayDeployerNoticeRoleReadFailureRetries(t *testing.T) {
+	relayAuthorRoles.reset()
+	h, c, binding := newNoticeHub(t)
+	h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+	h.fail[noticeDeployer] = http.StatusInternalServerError
+	p := relayProgress{}
+	wakes := 0
+	queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+	now := time.Now()
+	if err := relayOne(context.Background(), binding(noticeHandler), &p, c, now, queue); err == nil || wakes != 0 || p.Through != 0 {
+		t.Fatalf("failed role read: err=%v wakes=%d progress=%+v", err, wakes, p)
+	}
+	h.mu.Lock()
+	delete(h.fail, noticeDeployer)
+	h.mu.Unlock()
+	if err := relayOne(context.Background(), binding(noticeHandler), &p, c, now.Add(time.Minute), queue); err != nil || wakes != 1 || p.Through != 31 {
+		t.Fatalf("recovered role read: err=%v wakes=%d progress=%+v", err, wakes, p)
+	}
+}

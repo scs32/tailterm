@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -277,29 +278,122 @@ func runActivitySafely(tick func() error) (err error) {
 	}()
 	return tick()
 }
+
+// wakeEligible is the one rule for which inbox messages wake an agent: a
+// broadcast, a message addressed to it, or a message with no recipient and no
+// agent author. Its own posts never wake it, and hub-authored broker notices
+// are delivered by broker wake jobs, never by waking the whole roster as if
+// they were human announcements. deployers names the deployment agents whose
+// recipient-less notices also wake this agent (deployerNoticeAuthors); it is
+// nil for every agent but the database handler and the owner helper.
+func wakeEligible(m api.Message, agent string, deployers map[string]bool) bool {
+	if m.From.Node == api.BrokerNode || m.From.AgentID == agent {
+		return false
+	}
+	return m.Broadcast || m.To == agent || (m.To == "" && (m.From.AgentID == "" || (deployers[m.From.AgentID] && recipientlessNotice(m))))
+}
+
+// recipientlessNotice reports a typed NOTICE an agent posted with no
+// recipient, the form of the deployer's refused, failed and waiting notices.
+func recipientlessNotice(m api.Message) bool {
+	return m.To == "" && !m.Broadcast && m.From.AgentID != "" && m.From.Node != api.BrokerNode && m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice
+}
+
+// relayAuthorRoles remembers each agent's role for the relay process, so the
+// deployer notice wake reads an author once, not once per poll.
+var relayAuthorRoles = &authorRoles{}
+
+type authorRoles struct {
+	mu    sync.Mutex
+	roles map[string]string
+}
+
+func (r *authorRoles) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.roles = nil
+}
+
+func (r *authorRoles) role(ctx context.Context, c *api.Client, b runtimeBinding, agent string) (string, error) {
+	key := b.Hub + "\x00" + b.Task + "\x00" + agent
+	r.mu.Lock()
+	role, ok := r.roles[key]
+	r.mu.Unlock()
+	if ok {
+		return role, nil
+	}
+	a, err := c.GetAgent(ctx, b.Task, agent)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+		err = nil // no such agent: not a deployer
+	}
+	if err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.roles == nil || len(r.roles) >= 4096 {
+		r.roles = map[string]string{}
+	}
+	r.roles[key] = a.Role
+	return a.Role, nil
+}
+
+// deployerNoticeAuthors returns the deployment agents among the authors of
+// this page's recipient-less notices, for the database handler's and the
+// owner helper's bindings only (wi_3670e153328df185): a refused, failed or
+// waiting release is announced with no recipient, and in a project that is
+// not a swarm that reaches their inbox without waking them. The caller has
+// already found this binding live. The one added hub request is a cached read
+// of an author's role; a failed read is returned, so the page is read again
+// rather than passed over.
+func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, msgs []api.Message) (map[string]bool, error) {
+	if a.Role != api.AgentRoleDatabaseHandler && a.Role != api.AgentRoleOwnerHelper {
+		return nil, nil
+	}
+	var deployers map[string]bool
+	checked := map[string]bool{}
+	for _, m := range msgs {
+		if !recipientlessNotice(m) || m.From.AgentID == b.Agent || checked[m.From.AgentID] {
+			continue
+		}
+		checked[m.From.AgentID] = true
+		role, err := relayAuthorRoles.role(ctx, c, b, m.From.AgentID)
+		if err != nil {
+			return nil, err
+		}
+		if role == api.AgentRoleDeployment {
+			if deployers == nil {
+				deployers = map[string]bool{}
+			}
+			deployers[m.From.AgentID] = true
+		}
+	}
+	return deployers, nil
+}
+
 func wakeThrough(messages []api.Message, agent string) (through int64, eligible bool) {
+	return wakeThroughFor(messages, agent, nil)
+}
+
+func wakeThroughFor(messages []api.Message, agent string, deployers map[string]bool) (through int64, eligible bool) {
 	for _, m := range messages {
 		if m.Seq > through {
 			through = m.Seq
 		}
-		// Hub-authored broker notices are delivered by broker wake jobs, never by
-		// waking the whole roster as if they were human announcements.
-		if m.From.Node == api.BrokerNode {
-			continue
-		}
-		if m.From.AgentID != agent && (m.Broadcast || m.To == agent || (m.To == "" && m.From.AgentID == "")) {
+		if wakeEligible(m, agent, deployers) {
 			eligible = true
 		}
 	}
 	return
 }
 
-// wakeSeqs lists the sequences wakeThrough treats as wake-eligible (at most
-// eight, keeping the last), for skip diagnostics.
-func wakeSeqs(messages []api.Message, agent string) []int64 {
+// wakeSeqsFor lists the sequences wakeThroughFor treats as wake-eligible (at
+// most eight, keeping the last), for skip diagnostics.
+func wakeSeqsFor(messages []api.Message, agent string, deployers map[string]bool) []int64 {
 	var seqs []int64
 	for _, m := range messages {
-		if m.From.Node == api.BrokerNode || m.From.AgentID == agent || !(m.Broadcast || m.To == agent || (m.To == "" && m.From.AgentID == "")) {
+		if !wakeEligible(m, agent, deployers) {
 			continue
 		}
 		if len(seqs) == 8 {
@@ -319,10 +413,14 @@ func wakePrompt(b runtimeBinding, through int64) string {
 }
 
 func claudeWakePrompt(messages []api.Message, agent string) string {
+	return claudeWakePromptFor(messages, agent, nil)
+}
+
+func claudeWakePromptFor(messages []api.Message, agent string, deployers map[string]bool) string {
 	seqs := make([]string, 0, 5)
 	var last int64
 	for _, message := range messages {
-		if message.From.Node == api.BrokerNode || message.From.AgentID == agent || !(message.Broadcast || message.To == agent || (message.To == "" && message.From.AgentID == "")) {
+		if !wakeEligible(message, agent, deployers) {
 			continue
 		}
 		last = max(last, message.Seq)
@@ -644,7 +742,11 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 			}
 		}
 	}
-	_, eligible := wakeThrough(eligibleMsgs, b.Agent)
+	deployers, err := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs)
+	if err != nil {
+		return err
+	}
+	_, eligible := wakeThroughFor(eligibleMsgs, b.Agent, deployers)
 	if !eligible {
 		// Nothing is held back here. The page holds input already delivered,
 		// messages that broker wake jobs deliver, or messages that never wake
@@ -655,7 +757,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		p.Through = max(p.Through, through)
 		return nil
 	}
-	seqs := wakeSeqs(eligibleMsgs, b.Agent)
+	seqs := wakeSeqsFor(eligibleMsgs, b.Agent, deployers)
 	p.LastAttempt = now
 	p.Wakes++ // Bound attempts too, including ambiguous runtime failures.
 	active, err = relayProjectActive(ctx, c, b)
@@ -676,7 +778,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	}
 	prompt := wakePrompt(b, through)
 	if b.Runtime == "claude" {
-		prompt = claudeWakeFor(b, claudeWakePrompt(eligibleMsgs, b.Agent))
+		prompt = claudeWakeFor(b, claudeWakePromptFor(eligibleMsgs, b.Agent, deployers))
 	}
 	if err := queue(ctx, b, prompt); err != nil {
 		if b.Runtime == "claude" {
