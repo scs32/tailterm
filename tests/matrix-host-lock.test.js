@@ -122,6 +122,8 @@ import { spawn } from 'node:child_process';
 import { acquireHostLock, updateHostState } from ${JSON.stringify(moduleURL)};
 const o = JSON.parse(process.argv[2]);
 const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// A marker appears whole or not at all: the parent reads it as soon as it exists.
+const mark = (file, text) => { fs.writeFileSync(file + '.part', text); fs.renameSync(file + '.part', file); };
 if (o.mode === 'hold') {
   const lease = await acquireHostLock(o.request);
   let group = null;
@@ -133,7 +135,7 @@ if (o.mode === 'hold') {
     lease.addGroup(group);
   }
   process.on('SIGUSR1', async () => { await lease.release(); process.exit(0); });
-  fs.writeFileSync(o.marker, JSON.stringify({ pid: process.pid, id: lease.id, group }));
+  mark(o.marker, JSON.stringify({ pid: process.pid, id: lease.id, group }));
   if (o.after === 'exit') process.exit(0);
   if (o.after === 'throw') throw new Error('fixture failure while holding');
   setInterval(() => {}, 1000);
@@ -147,7 +149,7 @@ if (o.mode === 'hold') {
   }
 } else if (o.mode === 'pause') {
   const result = updateHostState(o.request.path, (state) => {
-    fs.writeFileSync(o.marker, String(process.pid));
+    mark(o.marker, String(process.pid));
     while (!fs.existsSync(o.go)) nap(10);
     state.requestSeq += 1000;
   });
@@ -634,23 +636,40 @@ test("L9 concurrent requests from several processes never hold together and none
 });
 
 test("L10 a waiter prints and logs its position and the holder, updates on change, and leaves at its wait bound", async (t) => {
+  // Registered before the temporary directories, so it runs before they are
+  // removed: a request still polling when an assertion fails is withdrawn and
+  // awaited here instead of rejecting after the test has ended.
+  const ended = new AbortController(),
+    requests = [];
+  const ask = (extra) => {
+    const asked = acquireHostLock(request(path, { signal: ended.signal, ...extra }));
+    requests.push(asked);
+    return asked;
+  };
+  t.after(async () => {
+    ended.abort("the end of the test");
+    for (const settled of await Promise.allSettled(requests)) await settled.value?.release();
+  });
   const path = lockFile(t),
     record = tempDir(t);
-  const holder = await acquireHostLock(request(path, { item: "wi_holder", agent: "verifier-a" }));
+  const holder = await ask({ item: "wi_holder", agent: "verifier-a" });
   const lines = [];
-  const first = acquireHostLock(request(path, { item: "wi_first", recordDirectory: record, print: (line) => lines.push(line) }));
+  // The file mutex can be busy for one poll under load. That line is printed
+  // too, and is not one of the waiting lines.
+  const waiting = () => lines.filter((line) => !line.startsWith("matrix host: lock file busy, mutex owner pid "));
+  const first = ask({ item: "wi_first", recordDirectory: record, print: (line) => lines.push(line) });
   const holderText = `holder wi_holder/verifier-a/pid ${process.pid}`;
-  await until(() => lines.length === 1, "the first waiting line");
-  assert.deepEqual(lines, [`matrix host: waiting 1 of 1, ${holderText}`]);
-  const urgent = acquireHostLock(request(path, { item: "wi_urgent", priority: "urgent", prioritySource: "flag" }));
-  await until(() => lines.length === 2, "the line after being overtaken");
-  assert.equal(lines[1], `matrix host: waiting 2 of 2, ${holderText}`);
+  await until(() => waiting().length === 1, "the first waiting line");
+  assert.deepEqual(waiting(), [`matrix host: waiting 1 of 1, ${holderText}`]);
+  const urgent = ask({ item: "wi_urgent", priority: "urgent", prioritySource: "flag" });
+  await until(() => waiting().length === 2, "the line after being overtaken");
+  assert.equal(waiting()[1], `matrix host: waiting 2 of 2, ${holderText}`);
 
   // A waiter whose process is gone is dropped by the others.
   const dead = startChild(t, childScript(t), { mode: "hold", marker: join(tempDir(t), "never"), request: request(path, { item: "wi_dead" }) });
   await until(() => waitersOf(path).some((w) => w.item === "wi_dead"), "the doomed waiter");
-  await until(() => lines.length === 3, "the line counting three waiters");
-  assert.equal(lines[2], `matrix host: waiting 2 of 3, ${holderText}`);
+  await until(() => waiting().length === 3, "the line counting three waiters");
+  assert.equal(waiting()[2], `matrix host: waiting 2 of 3, ${holderText}`);
   dead.kill("SIGKILL");
   await until(() => !waitersOf(path).some((w) => w.item === "wi_dead"), "the dead waiter to be dropped");
   const dropped = readJournal(path).find((line) => line.event === "waiter-dropped");
@@ -686,7 +705,10 @@ test("L10 a waiter prints and logs its position and the holder, updates on chang
   const lease = await first;
   assert.match(lines.at(-1), /^matrix host: acquired after \d+ ms$/);
   const logged = readFileSync(join(record, "host-lock.log"), "utf8").trim().split("\n");
-  assert.deepEqual(logged.map((line) => line.replace(/^\S+ /, "")), lines, "host-lock.log carries the same lines");
+  // Nothing is written for a request before it joins the list, so a busy line
+  // printed ahead of the first waiting line is the one line the log omits.
+  const sinceJoining = lines.slice(lines.indexOf(waiting()[0]));
+  assert.deepEqual(logged.map((line) => line.replace(/^\S+ /, "")), sinceJoining, "host-lock.log carries the same lines");
   for (const line of logged) assert.match(line, /^\d{4}-\d\d-\d\dT[\d:.]+Z matrix host: /);
   await lease.release();
 });
@@ -1225,7 +1247,7 @@ test("two real runPlan invocations have private homes, tmux namespaces and ports
     const tmuxRead=(...args)=>{const r=spawnSync('tmux',['-L',tmuxSocket,...args],{encoding:'utf8'}); if(r.status!==0)throw new Error(r.stderr||String(r.error)); return r.stdout;};
     const tmuxPid=Number(readTmuxFormat(tmuxRead,['display-message','-p','#{pid}'],{shape:/^\\d+$/}));
     process.once('SIGTERM',()=>{spawnSync('tmux',['-L',tmuxSocket,'kill-server']);process.exit(0);});
-    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,tmuxPid,tmuxSocket,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE})));
+    const server=net.createServer(s=>s.end('peer alive')); server.listen(0,'127.0.0.1',()=>{fs.writeFileSync(${JSON.stringify(marker + ".part")},JSON.stringify({pid:process.pid,tmuxPid,tmuxSocket,port:server.address().port,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR,TMUX_TMPDIR:process.env.TMUX_TMPDIR,GOPATH:process.env.GOPATH,GOMODCACHE:process.env.GOMODCACHE,GOCACHE:process.env.GOCACHE}));fs.renameSync(${JSON.stringify(marker + ".part")},${JSON.stringify(marker)});});
     setInterval(()=>{if(${finish} && fs.existsSync(${JSON.stringify(done)})){spawnSync('tmux',['-L',tmuxSocket,'kill-server']);server.close(()=>process.exit(0));}},30);`;
   const a = runnerFixture(t, source(markers[0], false)), b = runnerFixture(t, source(markers[1], true));
   const outs = [tempDir(t), tempDir(t)], abort = new AbortController();
@@ -1678,7 +1700,10 @@ test("M15 under a one-slot hold an in-time holder is never taken over, and one o
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");
   assert(!existsSync(probeMarker), "a test ran sysctl");
-  // The guard is live: the default reader finds the stub, not the host.
-  assert.equal(readMemoryPressure({ platform: "darwin" }), 50);
+  // The guard is live: the reader's own command and PATH find the stub, not
+  // the host. Only the probe's time bound is lengthened, so a shell that
+  // starts slowly under load is not mistaken for a failed guard.
+  const patient = (command, args, options) => spawnSync(command, args, { ...options, timeout: 60000 });
+  assert.equal(readMemoryPressure({ platform: "darwin", run: patient }), 50);
   assert(existsSync(probeMarker), "the stub records a probe");
 });
