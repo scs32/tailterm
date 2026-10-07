@@ -1640,12 +1640,18 @@ function recordedRunAlive(record) {
 // Starts the run detached, or re-attaches to the one the output directory
 // already records, follows its log, and resolves to the exit code.
 async function launchDetached(argv, output) {
+  const recorded = readRunnerRecord(output);
   mkdirSync(output, { recursive: true });
   const logPath = join(output, "runner.log");
   let offset = existsSync(logPath) ? statSync(logPath).size : 0;
   let pid, child, ended;
-  const recorded = readRunnerRecord(output);
   if (recordedRunAlive(recorded)) {
+    // Only the same command from the same directory follows that run; any
+    // other is refused as the host lock refuses a directory already in use.
+    if (recorded.cwd !== process.cwd() || JSON.stringify(recorded.argv) !== JSON.stringify(argv))
+      throw new Error(
+        `Host lock output/record directory is already in use by a different matrix run (pid ${recorded.pid})`,
+      );
     pid = recorded.pid;
     console.log(`matrix run: re-attached to pid ${pid}`);
   } else {
@@ -1672,6 +1678,7 @@ async function launchDetached(argv, output) {
       pid,
       startedAt: new Date().toISOString(),
       argv,
+      cwd: process.cwd(),
       log: logPath,
     });
     child.unref();

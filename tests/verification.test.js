@@ -3308,6 +3308,24 @@ test("detached a3 the same command again re-attaches to the queued run, and a de
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => w.id), [waiter.id], "one waiter");
     assert.equal(runnerRecord(output).pid, record.pid);
+    // A different command into the same directory is refused while the first
+    // run is queued: it neither follows that run nor starts its own. So is
+    // the same command from another checkout.
+    const other = plannedFixture(t, "process.exit(1);");
+    const logBefore = readFileSync(join(output, "runner.log"), "utf8");
+    for (const [checkout, args] of [
+      [other.f, ["run", other.planFile, output]],
+      [f, ["run", planFile, output, "--jobs", "1"]],
+      [other.f, ["run", planFile, output]],
+    ]) {
+      const refused = launcherCLI(t, checkout, args);
+      assert.equal(await refused.closed, 1, refused.text);
+      assert.equal(refused.text, `Host lock output/record directory is already in use by a different matrix run (pid ${record.pid})\n`);
+    }
+    assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => [w.id, w.pid]), [[waiter.id, record.pid]], "still one waiter, the first run");
+    assert.deepEqual(runnerRecord(output), record, "the first run's record is untouched");
+    assert.equal(readFileSync(join(output, "runner.log"), "utf8"), logBefore, "no second run wrote to the log");
+    assert.equal(record.cwd, f.git("rev-parse", "--show-toplevel"));
     released = true;
     await holder.release();
     assert.deepEqual([await first.closed, await second.closed], [0, 0], first.text + second.text);
