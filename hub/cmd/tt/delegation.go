@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +20,9 @@ import (
 const delegationUsage = "usage: tt owner delegation open --delegate NAME (--for 3h | --until RFC3339) [--scope decisions|decisions-merges-deploys] [--reason T] [--request-id K] [--json]\n" +
 	"       tt owner delegation close WINDOW_ID [--reason T] [--request-id K] [--json]\n" +
 	"       tt owner delegation list [--json]"
+
+// delegationNow is the clock --for is measured from; tests move it.
+var delegationNow = time.Now
 
 // derivedKey is a stable per-minute retry key, like the other owner commands.
 func derivedKey(prefix string, parts ...string) string {
@@ -78,7 +84,7 @@ func cmdOwnerDelegation(e env, args []string) error {
 		if (*forFlag == 0) == (*until == "") {
 			return errors.New("give exactly one of --for or --until")
 		}
-		ends := time.Now().Add(*forFlag)
+		ends := delegationNow().Add(*forFlag)
 		if *until != "" {
 			if ends, err = time.Parse(time.RFC3339, *until); err != nil {
 				return fmt.Errorf("--until must be RFC3339, such as 2026-09-30T18:00:00-07:00: %w", err)
@@ -91,8 +97,12 @@ func cmdOwnerDelegation(e env, args []string) error {
 		if *requestID == "" {
 			*requestID = derivedKey("owner-delegation-open", *delegate, forFlag.String(), *until, normalized, *reason)
 		}
-		out, err := c.OpenDelegationWindow(ctx, *task, api.OpenDelegationWindowRequest{Delegate: *delegate, EndsAt: ends.UTC().Truncate(time.Second), Scope: normalized, Reason: *reason,
-			Source: &api.DelegationSource{Kind: api.DelegationSourceTT}, RequestID: *requestID})
+		req := api.OpenDelegationWindowRequest{Delegate: *delegate, EndsAt: ends.UTC().Truncate(time.Second), Scope: normalized, Reason: *reason,
+			Source: &api.DelegationSource{Kind: api.DelegationSourceTT}, RequestID: *requestID}
+		out, err := c.OpenDelegationWindow(ctx, *task, req)
+		if *forFlag != 0 && requestIDReused(err) {
+			out, err = replayDelegationOpen(ctx, c, *task, req, *forFlag, err)
+		}
 		return printDelegationResult(out, err, *asJSON)
 	case "close":
 		if *requestID == "" {
@@ -102,6 +112,48 @@ func cmdOwnerDelegation(e env, args []string) error {
 		return printDelegationResult(out, err, *asJSON)
 	}
 	return errors.New(delegationUsage)
+}
+
+// delegationReplaySlack is how far a window's stored length may differ from
+// --for and still be the window an earlier call with the same request ID
+// opened. The hub stamps the start up to the 10 second request timeout after
+// the CLI read its clock, the end time loses up to a second to truncation,
+// and the rest allows for the two hosts' clocks differing.
+const delegationReplaySlack = 15 * time.Second
+
+// requestIDReused reports the hub's refusal of a request ID that is already
+// stored with a different payload.
+func requestIDReused(err error) bool {
+	var he *api.HTTPError
+	return errors.As(err, &he) && he.Status == http.StatusConflict && strings.Contains(he.Msg, "request ID was already used")
+}
+
+// replayDelegationOpen retries a refused --for open. A repeated call measures
+// --for from a later moment, so its end time differs from the one stored
+// under the request ID. This resends the request with the end time of each
+// window of the same length, scope and reason, newest first. The request ID
+// is already taken, so the hub can only replay the stored result or refuse
+// again: nothing new is opened, and a different delegate, scope, reason or
+// length still gets the hub's refusal.
+func replayDelegationOpen(ctx context.Context, c *api.Client, task string, req api.OpenDelegationWindowRequest, length time.Duration, refused error) (api.OwnerActionResult, error) {
+	list, err := c.ListDelegationWindows(ctx, task)
+	if err != nil {
+		return api.OwnerActionResult{}, refused
+	}
+	windows := list.Windows
+	sort.SliceStable(windows, func(i, j int) bool { return windows[i].CreatedAt.After(windows[j].CreatedAt) })
+	for _, w := range windows {
+		off := w.EndsAt.Sub(w.CreatedAt) - length
+		if w.Scope != req.Scope || w.Reason != req.Reason || off < -delegationReplaySlack || off > delegationReplaySlack || w.EndsAt.Equal(req.EndsAt) {
+			continue
+		}
+		req.EndsAt = w.EndsAt
+		out, err := c.OpenDelegationWindow(ctx, task, req)
+		if !requestIDReused(err) {
+			return out, err
+		}
+	}
+	return api.OwnerActionResult{}, refused
 }
 
 func printDelegationResult(out api.OwnerActionResult, err error, asJSON bool) error {

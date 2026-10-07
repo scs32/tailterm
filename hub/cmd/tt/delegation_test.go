@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -130,5 +131,89 @@ func TestOwnerDelegationCLI(t *testing.T) {
 	text, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "list"}) })
 	if err != nil || !strings.Contains(text, "closed") || !strings.Contains(text, "rationale: Tests passed and the window is quiet.") || !strings.Contains(text, "rationale: It is the recommendation and reversible.") {
 		t.Fatalf("list after close %q %v", text, err)
+	}
+}
+
+// moveDelegationClock pins the clock --for is measured from and returns a
+// function that advances it. The test must not run in parallel.
+func moveDelegationClock(t *testing.T) func(time.Duration) {
+	t.Helper()
+	now := time.Now()
+	old := delegationNow
+	delegationNow = func() time.Time { return now }
+	t.Cleanup(func() { delegationNow = old })
+	return func(d time.Duration) { now = now.Add(d) }
+}
+
+func TestOwnerDelegationOpenForReplaysAcrossSeconds(t *testing.T) {
+	e, _, _, _ := cliWorkItemFixture(t)
+	owner := env{hub: e.hub, task: e.task}
+	advance := moveDelegationClock(t)
+	run := func(args ...string) (string, error) {
+		return captureCLIOutput(t, func() error { return cmdOwner(owner, append([]string{"delegation", "open"}, args...)) })
+	}
+	open := []string{"--delegate", "lead", "--for", "2h", "--scope", "decisions-merges-deploys", "--reason", "at the dentist", "--request-id", "open-1"}
+	out, err := run(open...)
+	if err != nil || !strings.Contains(out, "open  → lead  decisions-merges-deploys") {
+		t.Fatalf("open %q %v", out, err)
+	}
+	for _, later := range []time.Duration{1500 * time.Millisecond, 3 * time.Second} {
+		advance(later)
+		again, err := run(open...)
+		if err != nil || again != out {
+			t.Fatalf("replay %s later %q %v", later, again, err)
+		}
+	}
+
+	// The same request ID with anything else is still refused.
+	with := func(flag, value string) []string {
+		args := append([]string{}, open...)
+		for i := range args {
+			if args[i] == flag {
+				args[i+1] = value
+			}
+		}
+		return args
+	}
+	for name, args := range map[string][]string{
+		"delegate":        with("--delegate", "database"),
+		"scope":           with("--scope", "decisions"),
+		"reason":          with("--reason", "at lunch"),
+		"shorter":         with("--for", "1h"),
+		"a minute longer": with("--for", "2h1m"),
+	} {
+		advance(time.Second)
+		if out, err := run(args...); err == nil || !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "request ID was already used") {
+			t.Fatalf("different %s: %q %v", name, out, err)
+		}
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "list"}) })
+	if err != nil || list != out {
+		t.Fatalf("windows after refusals %q, want only %q (%v)", list, out, err)
+	}
+}
+
+// An --until open sends the end time it was given, so the clock does not
+// matter: a repeat replays and a different end time is refused.
+func TestOwnerDelegationOpenUntilReplayUnchanged(t *testing.T) {
+	e, _, _, _ := cliWorkItemFixture(t)
+	owner := env{hub: e.hub, task: e.task}
+	advance := moveDelegationClock(t)
+	run := func(until time.Time) (string, error) {
+		return captureCLIOutput(t, func() error {
+			return cmdOwner(owner, []string{"delegation", "open", "--delegate", "lead", "--until", until.Format(time.RFC3339), "--request-id", "until-1"})
+		})
+	}
+	until := time.Now().Add(2 * time.Hour)
+	out, err := run(until)
+	if err != nil || !strings.Contains(out, "open  → lead  decisions") {
+		t.Fatalf("open %q %v", out, err)
+	}
+	advance(3 * time.Second)
+	if again, err := run(until); err != nil || again != out {
+		t.Fatalf("replay %q %v", again, err)
+	}
+	if out, err := run(until.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "request ID was already used") {
+		t.Fatalf("different end time: %q %v", out, err)
 	}
 }
