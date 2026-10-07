@@ -23,7 +23,7 @@ import {
 } from "../client/tasks.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
 import { tmuxCommand, shellQuote } from "../shared/tmux-command.js";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 const servers = [
@@ -575,6 +575,21 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
       } catch {}
     rmSync(dir, { recursive: true, force: true });
   });
+  // A killed test process never reaches the hook above, and exit-empty off
+  // below would keep both servers forever. This watcher outlives the process,
+  // then ends its servers and removes its directory within about a second.
+  spawn(
+    "/bin/sh",
+    [
+      "-c",
+      `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done
+for socket in target viewer; do
+  '${tmuxPath}' -S '${dir}'/$socket -f /dev/null kill-server 2>/dev/null
+done
+rm -rf '${dir}'`,
+    ],
+    { env, detached: true, stdio: "ignore" },
+  ).unref();
   // A server exits with its last session, and the next new-session can reach
   // the dying socket ("server exited unexpectedly"). Keep both alive instead.
   for (const socket of ["target", "viewer"])
