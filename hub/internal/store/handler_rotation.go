@@ -1,11 +1,14 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,6 +53,25 @@ CREATE TABLE IF NOT EXISTS handler_runs (
 			}
 		}
 	}
+	// A dead primary (wi_b863e669073858f4, owner order #28057): the silence
+	// applies to every project, existing and new, and the rotation keeps the
+	// host's evidence and the old run's last recorded activity.
+	for _, column := range []struct{ table, name, kind string }{
+		{"handler_rotation_policy", "dead_silence_minutes", fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", api.DefaultHandlerDeadSilenceMinutes)},
+		{"handler_rotations", "evidence_json", "TEXT NOT NULL DEFAULT ''"},
+		{"handler_rotations", "commit_evidence_json", "TEXT NOT NULL DEFAULT ''"},
+		{"handler_rotations", "last_activity_at", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('`+column.table+`') WHERE name=?`, column.name).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE " + column.table + " ADD COLUMN " + column.name + " " + column.kind); err != nil {
+				return err
+			}
+		}
+	}
 	if existed == 0 {
 		// Owner decision #14233: rotation is on by default for new projects; the
 		// owner turns it on for projects that existed before this migration.
@@ -63,14 +85,14 @@ CREATE TABLE IF NOT EXISTS handler_runs (
 
 func defaultHandlerRotationPolicy(task string) api.HandlerRotationPolicy {
 	return api.HandlerRotationPolicy{TaskID: task, Enabled: true, MaxItems: api.DefaultHandlerRotationMaxItems,
-		MaxTotalTokens: api.DefaultHandlerRotationMaxTotalTokens, OnTemplateChange: true}
+		MaxTotalTokens: api.DefaultHandlerRotationMaxTotalTokens, OnTemplateChange: true, DeadSilenceMinutes: api.DefaultHandlerDeadSilenceMinutes}
 }
 
 func loadHandlerRotationPolicy(ctx context.Context, q queryRower, task string) (api.HandlerRotationPolicy, error) {
 	p := defaultHandlerRotationPolicy(task)
 	var updated string
-	err := q.QueryRowContext(ctx, `SELECT enabled,max_items,max_total_tokens,on_template_change,revision,updated_at FROM handler_rotation_policy WHERE task_id=?`, task).
-		Scan(&p.Enabled, &p.MaxItems, &p.MaxTotalTokens, &p.OnTemplateChange, &p.Revision, &updated)
+	err := q.QueryRowContext(ctx, `SELECT enabled,max_items,max_total_tokens,on_template_change,revision,updated_at,dead_silence_minutes FROM handler_rotation_policy WHERE task_id=?`, task).
+		Scan(&p.Enabled, &p.MaxItems, &p.MaxTotalTokens, &p.OnTemplateChange, &p.Revision, &updated, &p.DeadSilenceMinutes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil
 	}
@@ -94,7 +116,8 @@ func (s *Store) SetHandlerRotationPolicy(ctx context.Context, task string, req a
 	if req.ActorAgentID != "" {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedAgentCaller, Detail: "the rotation policy is the owner's; agent sessions cannot change it"}
 	}
-	if req.ExpectedRevision < 0 || req.MaxItems < 0 || req.MaxTotalTokens < 0 {
+	if req.ExpectedRevision < 0 || req.MaxItems < 0 || req.MaxTotalTokens < 0 ||
+		(req.DeadSilenceMinutes != nil && (*req.DeadSilenceMinutes < 0 || *req.DeadSilenceMinutes > api.MaxHandlerDeadSilenceMinutes)) {
 		return zero, api.ErrInvalid
 	}
 	s.writeMu.Lock()
@@ -122,12 +145,18 @@ func (s *Store) SetHandlerRotationPolicy(ctx context.Context, task string, req a
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedStalePolicy, Detail: fmt.Sprintf("policy is at revision %d; reload before changing it", current.Revision)}
 	}
 	now := s.now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotation_policy(task_id,enabled,max_items,max_total_tokens,on_template_change,revision,updated_at) VALUES(?,?,?,?,?,?,?)
- ON CONFLICT(task_id) DO UPDATE SET enabled=excluded.enabled,max_items=excluded.max_items,max_total_tokens=excluded.max_total_tokens,on_template_change=excluded.on_template_change,revision=excluded.revision,updated_at=excluded.updated_at`,
-		task, req.Enabled, req.MaxItems, req.MaxTotalTokens, req.OnTemplateChange, current.Revision+1, ts(now)); err != nil {
+	// An omitted silence keeps the saved one, so a caller that does not know
+	// the field cannot turn the dead primary replacement off or on.
+	silence := current.DeadSilenceMinutes
+	if req.DeadSilenceMinutes != nil {
+		silence = *req.DeadSilenceMinutes
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotation_policy(task_id,enabled,max_items,max_total_tokens,on_template_change,revision,updated_at,dead_silence_minutes) VALUES(?,?,?,?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET enabled=excluded.enabled,max_items=excluded.max_items,max_total_tokens=excluded.max_total_tokens,on_template_change=excluded.on_template_change,revision=excluded.revision,updated_at=excluded.updated_at,dead_silence_minutes=excluded.dead_silence_minutes`,
+		task, req.Enabled, req.MaxItems, req.MaxTotalTokens, req.OnTemplateChange, current.Revision+1, ts(now), silence); err != nil {
 		return zero, err
 	}
-	out := api.HandlerRotationPolicy{TaskID: task, Enabled: req.Enabled, MaxItems: req.MaxItems, MaxTotalTokens: req.MaxTotalTokens, OnTemplateChange: req.OnTemplateChange, Revision: current.Revision + 1, UpdatedAt: &now}
+	out := api.HandlerRotationPolicy{TaskID: task, Enabled: req.Enabled, MaxItems: req.MaxItems, MaxTotalTokens: req.MaxTotalTokens, OnTemplateChange: req.OnTemplateChange, DeadSilenceMinutes: silence, Revision: current.Revision + 1, UpdatedAt: &now}
 	if _, err = s.insertEvent(ctx, tx, task, "task_updated", "", "Handler rotation policy saved", map[string]any{"handlerRotationPolicy": out}, api.Caller{Node: "workspace", User: "owner"}); err != nil {
 		return zero, err
 	}
@@ -211,16 +240,32 @@ func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest, model
 	return err
 }
 
-const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at,authorized_by,authorization_reason,old_runtime,successor_runtime`
+const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at,authorized_by,authorization_reason,old_runtime,successor_runtime,evidence_json,commit_evidence_json,last_activity_at`
 
 func scanHandlerRotation(row interface{ Scan(...any) error }) (api.HandlerRotation, error) {
 	var r api.HandlerRotation
-	var handoff, receipt, created, updated string
+	var handoff, receipt, created, updated, evidence, commitEvidence, lastActivity string
 	var auth api.HandlerRotationAuthorization
 	if err := row.Scan(&r.ID, &r.TaskID, &r.RequestID, &r.State, &r.Reason, &r.Trigger, &r.HandlerRevision, &r.OldAgentID, &r.OldRunID, &r.OldName,
 		&r.SuccessorAgentID, &r.SuccessorName, &r.SuccessorRunID, &handoff, &receipt, &created, &updated,
-		&auth.AuthorizedBy, &auth.Reason, &auth.OldRuntime, &auth.SuccessorRuntime); err != nil {
+		&auth.AuthorizedBy, &auth.Reason, &auth.OldRuntime, &auth.SuccessorRuntime, &evidence, &commitEvidence, &lastActivity); err != nil {
 		return r, err
+	}
+	for _, saved := range []struct {
+		raw string
+		to  **api.HandlerDeathEvidence
+	}{{evidence, &r.DeathEvidence}, {commitEvidence, &r.CommitDeathEvidence}} {
+		if saved.raw == "" {
+			continue
+		}
+		*saved.to = &api.HandlerDeathEvidence{}
+		if err := json.Unmarshal([]byte(saved.raw), *saved.to); err != nil {
+			return r, fmt.Errorf("handler rotation death evidence: %w", err)
+		}
+	}
+	if lastActivity != "" {
+		t := parseTS(lastActivity)
+		r.LastActivityAt = &t
 	}
 	if auth.AuthorizedBy != "" {
 		r.Authorization = &auth
@@ -353,6 +398,402 @@ func (b handlerBusy) idle() bool {
 	return b.refusal(api.HandlerRotationTriggerRunner) == nil
 }
 
+// handlerSeenWithin reports whether the hub, by its own clock, has a
+// heartbeat from the handler's current run within the online window.
+func handlerSeenWithin(a api.Agent, now time.Time) bool {
+	return !a.LastSeenAt.IsZero() && now.Sub(a.LastSeenAt) < api.HandlerOnlineWindow
+}
+
+// handlerLastActivity is the latest thing the hub recorded from the exact
+// run: its wrapper's heartbeat, its observed activity, a message it sent or a
+// work-item revision it saved. Events and broker reminders do not count,
+// because other actors write those about the handler. ok is false when the
+// run has none of the four: no record is not evidence of silence. Prepare,
+// commit, the due list and the queue reason all use it, so they agree.
+func handlerLastActivity(ctx context.Context, q queryRower, task string, a api.Agent) (time.Time, bool, error) {
+	var last time.Time
+	note := func(raw string) {
+		if t := parseTS(raw); t.After(last) {
+			last = t
+		}
+	}
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT last_seen_at FROM agents WHERE task_id=? AND id=? AND run_id=?`, task, a.ID, a.RunID).Scan(&raw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return last, false, err
+	}
+	note(raw)
+	raw = ""
+	err = q.QueryRowContext(ctx, `SELECT observed_at FROM agent_activity WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&raw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return last, false, err
+	}
+	note(raw)
+	raw = ""
+	err = q.QueryRowContext(ctx, `SELECT created_at FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? ORDER BY seq DESC LIMIT 1`, task, a.ID, a.RunID).Scan(&raw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return last, false, err
+	}
+	note(raw)
+	// Timestamps are not stored in a sortable form, so the newest revision is
+	// found here rather than in SQL.
+	rows, err := q.QueryContext(ctx, `SELECT updated_at FROM work_item_revisions WHERE item_task_id=? AND updated_agent=? AND updated_run_id=?`, task, a.ID, a.RunID)
+	if err != nil {
+		return last, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := rows.Scan(&raw); err != nil {
+			return last, false, err
+		}
+		note(raw)
+	}
+	return last, !last.IsZero(), rows.Err()
+}
+
+func deathUnconfirmed(format string, args ...any) *api.HandlerRotationRefusal {
+	return &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedDeathUnconfirmed, Detail: fmt.Sprintf(format, args...)}
+}
+
+// deathEvidenceRefusal checks a host's death evidence against what the hub
+// itself knows: it must name the old handler's host and exact run, state both
+// the session and the process gone with a PID and start identity, and be
+// fresh by the hub's clock. The hub must also see no heartbeat from the run.
+func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, now time.Time) *api.HandlerRotationRefusal {
+	switch {
+	case ev == nil:
+		return deathUnconfirmed("a dead primary rotation needs the host's death evidence")
+	case ev.Host == "" || ev.Host != old.Host:
+		return deathUnconfirmed("the evidence is from host %q, not the handler's host %q", ev.Host, old.Host)
+	case ev.AgentID != old.ID || ev.RunID != old.RunID:
+		return deathUnconfirmed("the evidence does not name the primary handler's exact agent and run")
+	case ev.SessionState != api.HandlerDeathStateGone || ev.ProcessState != api.HandlerDeathStateGone:
+		return deathUnconfirmed("the evidence must state the session and the process gone; it states session %q, process %q", ev.SessionState, ev.ProcessState)
+	case ev.PID <= 0 || ev.ProcessStarted == "" || ev.PanePID < 0:
+		return deathUnconfirmed("the evidence has no runtime process ID and start identity")
+	case ev.ObservedAt.IsZero() || now.Sub(ev.ObservedAt) > api.HandlerDeathEvidenceMaxAge:
+		return deathUnconfirmed("the evidence was observed more than %s ago", api.HandlerDeathEvidenceMaxAge)
+	case ev.ObservedAt.Sub(now) > api.HandlerDeathEvidenceMaxAhead:
+		return deathUnconfirmed("the evidence is dated more than %s ahead of the hub clock", api.HandlerDeathEvidenceMaxAhead)
+	case handlerSeenWithin(old, now):
+		return deathUnconfirmed("the hub had a heartbeat from the handler run within the last %s", api.HandlerOnlineWindow)
+	}
+	return nil
+}
+
+func validDeathEvidenceText(ev *api.HandlerDeathEvidence) bool {
+	for _, v := range []string{ev.Host, ev.AgentID, ev.RunID, ev.SessionName, ev.SessionID, ev.SessionCreated, ev.SessionState, ev.ProcessStarted, ev.ProcessState} {
+		if !api.ValidText(v, 253) || strings.ContainsAny(v, "\r\n\t") {
+			return false
+		}
+	}
+	return true
+}
+
+// deadPrimaryPrepareCheck is every hub-side condition of a dead primary
+// rotation besides the guards all rotations share. It returns the run's last
+// recorded activity, which commit requires unchanged.
+func deadPrimaryPrepareCheck(ctx context.Context, q queryRower, t api.Task, old api.Agent, busy handlerBusy, ev *api.HandlerDeathEvidence, now time.Time) (time.Time, error) {
+	var zero time.Time
+	policy, err := loadHandlerRotationPolicy(ctx, q, t.ID)
+	if err != nil {
+		return zero, err
+	}
+	if policy.DeadSilenceMinutes <= 0 {
+		return zero, deathUnconfirmed("automatic replacement of a dead primary is off for this project")
+	}
+	if refusal := deathEvidenceRefusal(ev, old, now); refusal != nil {
+		return zero, refusal
+	}
+	if busy.refusal(api.HandlerRotationTriggerRunner) == nil {
+		return zero, deathUnconfirmed("the handler is not busy; the ordinary rotation applies")
+	}
+	last, ok, err := handlerLastActivity(ctx, q, t.ID, old)
+	if err != nil {
+		return zero, err
+	}
+	if !ok {
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: "the hub has no recorded activity from the handler run, which is not evidence of silence"}
+	}
+	if silent := now.Sub(last); silent < time.Duration(policy.DeadSilenceMinutes)*time.Minute {
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: fmt.Sprintf("the handler run was last active %s ago; the policy needs %d minute(s) of silence", silent.Truncate(time.Second), policy.DeadSilenceMinutes)}
+	}
+	return last, nil
+}
+
+// deadPrimaryCommitCheck re-confirms a prepared dead primary rotation: a
+// second observation later than the first, still no heartbeat, and no activity
+// recorded since prepare. It returns the policy whose silence applied.
+func deadPrimaryCommitCheck(ctx context.Context, q queryRower, t api.Task, old api.Agent, r api.HandlerRotation, ev *api.HandlerDeathEvidence, now time.Time) (api.HandlerRotationPolicy, error) {
+	policy, err := loadHandlerRotationPolicy(ctx, q, t.ID)
+	if err != nil {
+		return policy, err
+	}
+	if policy.DeadSilenceMinutes <= 0 {
+		return policy, deathUnconfirmed("automatic replacement of a dead primary was turned off for this project")
+	}
+	if ev == nil {
+		return policy, deathUnconfirmed("the commit of a dead primary rotation needs a second observation from the host")
+	}
+	if refusal := deathEvidenceRefusal(ev, old, now); refusal != nil {
+		return policy, refusal
+	}
+	if r.DeathEvidence == nil || r.LastActivityAt == nil {
+		return policy, workItemConflict("handler rotation " + r.ID + " has no saved death evidence")
+	}
+	if !ev.ObservedAt.After(r.DeathEvidence.ObservedAt) {
+		return policy, deathUnconfirmed("the commit needs an observation later than the one saved at prepare")
+	}
+	last, ok, err := handlerLastActivity(ctx, q, t.ID, old)
+	if err != nil {
+		return policy, err
+	}
+	if !ok || last.After(*r.LastActivityAt) {
+		return policy, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: "the handler run recorded activity after the rotation was prepared"}
+	}
+	return policy, nil
+}
+
+// deadPrimaryOffHint is how the feature is turned off; the docs, the queue
+// reason and the notice quote it.
+func deadPrimaryOffHint(task string, revision int64) string {
+	return fmt.Sprintf("tt handler policy set --task %s --revision %d --dead-silence-minutes 0", task, revision)
+}
+
+// rewriteLaunchHandler replaces the handler identity inside an entry's frozen
+// launch plan, leaving every other byte as stored: the team runner refuses a
+// plan that names another handler than the entry's lease. A plan that names
+// no handler is returned unchanged; one that names a third handler, or that
+// cannot be read, is an error.
+func rewriteLaunchHandler(plan []byte, oldID, newID, newRunID string, newGeneration int64) ([]byte, bool, error) {
+	type span struct {
+		start, end int
+		found      bool
+	}
+	var id, run, generation span
+	var named string
+	dec := json.NewDecoder(bytes.NewReader(plan))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false, errors.New("the stored launch plan is not a JSON object")
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil, false, err
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, false, err
+		}
+		end := int(dec.InputOffset())
+		at := span{start: end - len(raw), end: end, found: true}
+		var target *span
+		switch key {
+		case "handlerId":
+			target = &id
+			if err := json.Unmarshal(raw, &named); err != nil {
+				return nil, false, err
+			}
+		case "handlerRunId":
+			target = &run
+		case "handlerLeaseGeneration":
+			target = &generation
+		default:
+			continue
+		}
+		if target.found {
+			return nil, false, fmt.Errorf("the stored launch plan repeats %s", key)
+		}
+		*target = at
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, false, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false, errors.New("the stored launch plan has trailing data")
+	}
+	if named == "" {
+		return plan, false, nil
+	}
+	if named != oldID {
+		return nil, false, fmt.Errorf("the stored launch plan names handler %s", named)
+	}
+	newIDJSON, _ := json.Marshal(newID)
+	newRunJSON, _ := json.Marshal(newRunID)
+	newGenerationJSON := []byte(fmt.Sprint(newGeneration))
+	// A field the plan omitted is added right after the handler ID.
+	idText := append([]byte(nil), newIDJSON...)
+	if !run.found {
+		idText = append(append(idText, `,"handlerRunId":`...), newRunJSON...)
+	}
+	if !generation.found {
+		idText = append(append(idText, `,"handlerLeaseGeneration":`...), newGenerationJSON...)
+	}
+	edits := []struct {
+		at   span
+		text []byte
+	}{{id, idText}}
+	if run.found {
+		edits = append(edits, struct {
+			at   span
+			text []byte
+		}{run, newRunJSON})
+	}
+	if generation.found {
+		edits = append(edits, struct {
+			at   span
+			text []byte
+		}{generation, newGenerationJSON})
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].at.start > edits[j].at.start })
+	out := append([]byte(nil), plan...)
+	for _, e := range edits {
+		out = append(out[:e.at.start], append(append([]byte(nil), e.text...), out[e.at.end:]...)...)
+	}
+	return out, true, nil
+}
+
+// moveDeadHandlerLeases hands every lease the dead run holds to the
+// successor, in queue order: the entry's handler, run and a new generation,
+// its frozen launch plan and its arm assignment. Leases are moved, never
+// released: a released lease would strand a running team with no handler. Any
+// entry that cannot be moved exactly fails the whole commit.
+func (s *Store) moveDeadHandlerLeases(ctx context.Context, tx *sql.Tx, t api.Task, old, successor api.Agent, leases []api.HandlerRotationLease, now time.Time) ([]api.HandlerRotationLease, error) {
+	moved := []api.HandlerRotationLease{}
+	for _, l := range leases {
+		var launch []byte
+		if err := tx.QueryRowContext(ctx, `SELECT launch_json FROM team_queue_entries WHERE id=? AND task_id=?`, l.EntryID, t.ID).Scan(&launch); err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(handler_lease_generation),0)+1 FROM team_queue_entries WHERE handler_id=?`, successor.ID).Scan(&l.NewLeaseGeneration); err != nil {
+			return nil, err
+		}
+		if len(launch) > 0 {
+			rewritten, changed, err := rewriteLaunchHandler(launch, old.ID, successor.ID, successor.RunID, l.NewLeaseGeneration)
+			if err != nil {
+				return nil, workItemConflict(fmt.Sprintf("team queue entry %s cannot be handed to the successor: %v", l.EntryID, err))
+			}
+			launch, l.LaunchPlanRewritten = rewritten, changed
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE team_queue_entries SET handler_id=?,handler_run_id=?,handler_lease_generation=?,launch_json=?,revision=revision+1,updated_at=?
+ WHERE id=? AND task_id=? AND handler_id=? AND handler_run_id=? AND handler_lease_generation=? AND `+queueHoldsSQL,
+			successor.ID, successor.RunID, l.NewLeaseGeneration, string(launch), ts(now), l.EntryID, t.ID, old.ID, old.RunID, l.LeaseGeneration)
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return nil, err
+		} else if n != 1 {
+			return nil, workItemConflict(fmt.Sprintf("team queue entry %s changed while its lease was being handed to the successor", l.EntryID))
+		}
+		if err := moveHandlerArmAssignment(ctx, tx, l.EntryID, old.ID, l.LeaseGeneration, successor, l.NewLeaseGeneration); err != nil {
+			return nil, err
+		}
+		moved = append(moved, l)
+	}
+	return moved, nil
+}
+
+const handlerRotationRecentWrites = 50
+
+// snapshotDeadInFlight reports what the dead run was doing. Nothing can be
+// recovered from a dead process, so its last state, its pending tool and the
+// work-item revisions it saved recently are listed for the successor to
+// compare with each moved request. The window starts at the oldest open
+// obligation it held, or 30 minutes before its last activity with none.
+func snapshotDeadInFlight(ctx context.Context, tx *sql.Tx, t api.Task, old api.Agent, busy handlerBusy, lastActivity time.Time, silence int64, open []api.Obligation) (*api.HandlerRotationInFlight, error) {
+	in := &api.HandlerRotationInFlight{ActivityState: busy.state, PendingTool: busy.pendingTool, LastActivityAt: lastActivity, SilenceMinutes: silence,
+		WritesSince: lastActivity.Add(-30 * time.Minute), RecentWrites: []api.HandlerRotationWrite{}}
+	for i, o := range open {
+		if i == 0 || o.CreatedAt.Before(in.WritesSince) {
+			in.WritesSince = o.CreatedAt
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT item_id,revision,updated_at,COALESCE(changed_fields,'') FROM work_item_revisions WHERE item_task_id=? AND updated_agent=? AND updated_run_id=?`, t.ID, old.ID, old.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var w api.HandlerRotationWrite
+		var updated, changed string
+		if err := rows.Scan(&w.ItemID, &w.Revision, &updated, &changed); err != nil {
+			return nil, err
+		}
+		if w.UpdatedAt = parseTS(updated); w.UpdatedAt.Before(in.WritesSince) {
+			continue
+		}
+		w.ChangedFields = []string{}
+		if changed != "" {
+			if err := json.Unmarshal([]byte(changed), &w.ChangedFields); err != nil {
+				return nil, fmt.Errorf("work item revision changed fields: %w", err)
+			}
+		}
+		in.RecentWrites = append(in.RecentWrites, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(in.RecentWrites, func(i, j int) bool {
+		a, b := in.RecentWrites[i], in.RecentWrites[j]
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			return a.UpdatedAt.After(b.UpdatedAt)
+		}
+		if a.ItemID != b.ItemID {
+			return a.ItemID < b.ItemID
+		}
+		return a.Revision > b.Revision
+	})
+	if n := len(in.RecentWrites); n > handlerRotationRecentWrites {
+		in.RecentWrites, in.WritesOmitted = in.RecentWrites[:handlerRotationRecentWrites], n-handlerRotationRecentWrites
+	}
+	return in, nil
+}
+
+const deadPrimaryNoticeSubject = "A dead primary database handler was replaced automatically"
+
+// deadPrimaryNoticeText is the one notice of a dead primary rotation: the dead
+// handler, the evidence, what was handed off, what the successor does next,
+// and how the owner turns the replacement off.
+func deadPrimaryNoticeText(t api.Task, r api.HandlerRotation, old, successor api.Agent, commit *api.HandlerDeathEvidence, h api.HandlerRotationHandoff, policyRevision int64) string {
+	ev, in := r.DeathEvidence, h.InFlight
+	stamp := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+	var b strings.Builder
+	fmt.Fprintf(&b, "Primary database handler %s (%s / %s) was dead while the hub still recorded it as busy, so the host runner replaced it with %s by handler rotation %s.", old.Name, old.ID, old.RunID, successor.Name, r.ID)
+	fmt.Fprintf(&b, " Evidence from host %s: tmux session %s is absent and runtime process %d (started %s) is absent", ev.Host, ev.SessionName, ev.PID, ev.ProcessStarted)
+	if ev.PanePID > 0 {
+		fmt.Fprintf(&b, ", as is pane process %d", ev.PanePID)
+	}
+	fmt.Fprintf(&b, "; observed %s and again %s.", stamp(ev.ObservedAt), stamp(commit.ObservedAt))
+	if ev.ExitedAt != nil {
+		fmt.Fprintf(&b, " Its wrapper recorded an exit at %s.", stamp(*ev.ExitedAt))
+	}
+	fmt.Fprintf(&b, " The hub's last recorded activity from that run was %s; the silence applied was %d minute(s).", stamp(in.LastActivityAt), in.SilenceMinutes)
+	fmt.Fprintf(&b, " Handed to %s: %d open obligation(s) and %d team lease(s)", successor.Name, len(h.Reissued), len(h.LiveLeases))
+	if len(h.LiveLeases) > 0 {
+		ids := make([]string, 0, 5)
+		for i, l := range h.LiveLeases {
+			if i == 5 {
+				break
+			}
+			ids = append(ids, l.EntryID)
+		}
+		b.WriteString(" (" + strings.Join(ids, ", "))
+		if more := len(h.LiveLeases) - len(ids); more > 0 {
+			fmt.Fprintf(&b, " and %d more", more)
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(". Reported, not recovered: last activity " + in.ActivityState)
+	if in.PendingTool != "" {
+		b.WriteString(", pending tool " + provisionText(in.PendingTool))
+	}
+	fmt.Fprintf(&b, ", %d recent work-item save(s) by the dead run, %d allocation intent(s) and %d claimed Queue entr(ies) it authored.", len(in.RecentWrites)+in.WritesOmitted, len(h.AllocationIntents), len(h.QueueClaims))
+	fmt.Fprintf(&b, " %s: run tt handler rotation get %s --task %s and compare each moved request with inFlight.recentWrites before repeating a save.", successor.Name, r.ID, t.ID)
+	fmt.Fprintf(&b, " This was automatic under owner order #28057. To turn it off for this project: %s", deadPrimaryOffHint(t.ID, policyRevision))
+	return b.String()
+}
+
 func handlerRotationReceipt(ctx context.Context, tx *sql.Tx, task, requestID, operation, hash string) (string, bool, error) {
 	var priorOperation, priorHash, rotation string
 	err := tx.QueryRowContext(ctx, `SELECT operation,payload_hash,rotation_id FROM handler_rotation_requests WHERE task_id=? AND request_id=?`, task, requestID).Scan(&priorOperation, &priorHash, &rotation)
@@ -376,7 +817,17 @@ func (s *Store) HandlerRotationAction(ctx context.Context, task string, req api.
 	if req.ActorAgentID != "" {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedAgentCaller, Detail: "handler rotation is an owner or host-runner action; agent sessions cannot rotate handlers"}
 	}
-	hash := requestHash(req)
+	if req.DeathEvidence != nil && !validDeathEvidenceText(req.DeathEvidence) {
+		return zero, api.ErrInvalid
+	}
+	// A commit is keyed by its rotation. Its second observation is not part
+	// of the key, so a retry of an unconfirmed commit with a newer observation
+	// replays the saved record.
+	keyed := req
+	if req.Operation == api.HandlerRotationCommit {
+		keyed.DeathEvidence = nil
+	}
+	hash := requestHash(keyed)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -426,8 +877,15 @@ func (s *Store) HandlerRotationAction(ctx context.Context, task string, req api.
 func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Task, req api.HandlerRotationRequest, by api.Caller) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	switch req.Reason {
-	case api.HandlerRotationReasonManual, api.HandlerRotationReasonItems, api.HandlerRotationReasonTokens, api.HandlerRotationReasonTemplate:
+	case api.HandlerRotationReasonManual, api.HandlerRotationReasonItems, api.HandlerRotationReasonTokens, api.HandlerRotationReasonTemplate, api.HandlerRotationReasonDeadPrimary:
 	default:
+		return zero, api.ErrInvalid
+	}
+	// Only the host runner replaces a dead primary, only with its host's
+	// evidence, and never with an owner authorization; evidence means nothing
+	// to any other rotation.
+	dead := req.Reason == api.HandlerRotationReasonDeadPrimary
+	if dead != (req.DeathEvidence != nil) || (dead && (req.Trigger != api.HandlerRotationTriggerRunner || req.AuthorizedBy != "" || req.AuthorizationReason != "")) {
 		return zero, api.ErrInvalid
 	}
 	if (req.Trigger != api.HandlerRotationTriggerOwner && req.Trigger != api.HandlerRotationTriggerRunner) || req.RotationID != "" ||
@@ -473,10 +931,18 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 	if err != nil {
 		return zero, err
 	}
-	if refusal := busy.refusal(req.Trigger); refusal != nil {
+	now := s.now()
+	var lastActivity time.Time
+	if dead {
+		// The one exception to h2, by owner order #28057: the busy refusal is
+		// lifted only when the host confirmed the death and the hub's own
+		// records show the run silent.
+		if lastActivity, err = deadPrimaryPrepareCheck(ctx, tx, t, old, busy, req.DeathEvidence, now); err != nil {
+			return zero, err
+		}
+	} else if refusal := busy.refusal(req.Trigger); refusal != nil {
 		return zero, refusal
 	}
-	now := s.now()
 	r := api.HandlerRotation{ID: api.NewID("hrot"), TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationPrepared, Reason: req.Reason, Trigger: req.Trigger,
 		HandlerRevision: t.HandlerRevision, OldAgentID: old.ID, OldRunID: old.RunID, OldName: old.Name, SuccessorAgentID: req.SuccessorAgentID,
 		SuccessorName: req.SuccessorName, CreatedAt: now, UpdatedAt: now}
@@ -486,9 +952,16 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		r.Authorization = &api.HandlerRotationAuthorization{AuthorizedBy: req.AuthorizedBy, Reason: req.AuthorizationReason}
 		payload["authorizedBy"], payload["authorizationReason"] = req.AuthorizedBy, req.AuthorizationReason
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at,authorized_by,authorization_reason)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
-		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now), req.AuthorizedBy, req.AuthorizationReason); err != nil {
+	evidenceJSON, lastActivityText := "", ""
+	if dead {
+		data, _ := json.Marshal(req.DeathEvidence)
+		evidenceJSON, lastActivityText = string(data), ts(lastActivity)
+		r.DeathEvidence, r.LastActivityAt = req.DeathEvidence, &lastActivity
+		payload["deathEvidence"], payload["lastActivityAt"] = req.DeathEvidence, lastActivityText
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at,authorized_by,authorization_reason,evidence_json,last_activity_at)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
+		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now), req.AuthorizedBy, req.AuthorizationReason, evidenceJSON, lastActivityText); err != nil {
 		return zero, err
 	}
 	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", old.ID, "Handler rotation prepared", payload, by); err != nil {
@@ -512,6 +985,10 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if r.State != api.HandlerRotationPrepared {
 		return zero, workItemConflict("handler rotation " + r.ID + " was aborted")
 	}
+	dead := r.Reason == api.HandlerRotationReasonDeadPrimary
+	if !dead && req.DeathEvidence != nil {
+		return zero, api.ErrInvalid
+	}
 	if t.PauseState != api.ProjectPauseActive {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedPaused, Detail: "the project is paused"}
 	}
@@ -526,7 +1003,15 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err != nil {
 		return zero, err
 	}
-	if refusal := busy.refusal(r.Trigger); refusal != nil {
+	var deadPolicy api.HandlerRotationPolicy
+	if dead {
+		// A second, later observation from the host, and nothing recorded from
+		// the run since prepare; otherwise the rotation stays prepared and the
+		// runner aborts it.
+		if deadPolicy, err = deadPrimaryCommitCheck(ctx, tx, t, old, r, req.DeathEvidence, s.now()); err != nil {
+			return zero, err
+		}
+	} else if refusal := busy.refusal(r.Trigger); refusal != nil {
 		return zero, refusal
 	}
 	successor, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, t.ID, r.SuccessorAgentID))
@@ -571,6 +1056,14 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err = rows.Err(); err != nil {
 		return zero, err
 	}
+	if dead {
+		if handoff.InFlight, err = snapshotDeadInFlight(ctx, tx, t, old, busy, *r.LastActivityAt, deadPolicy.DeadSilenceMinutes, open); err != nil {
+			return zero, err
+		}
+		if handoff.LiveLeases, err = s.moveDeadHandlerLeases(ctx, tx, t, old, successor, busy.leases, s.now()); err != nil {
+			return zero, err
+		}
+	}
 	for _, o := range open {
 		var viaRole string
 		if err = tx.QueryRowContext(ctx, `SELECT via_role FROM obligations WHERE id=?`, o.ID).Scan(&viaRole); err != nil {
@@ -596,12 +1089,36 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if authorized {
 		text += fmt.Sprintf(" This change from runtime %s to %s was authorized by %s: %s", old.Runtime, successor.Runtime, r.Authorization.AuthorizedBy, r.Authorization.Reason)
 	}
-	if err = s.postBrokerNotice(ctx, tx, t, successor, successor.Name, "Handler rotation handoff to "+successor.Name, "Handler rotation handoff", text, map[string]string{"handlerRotation": r.ID}); err != nil {
+	subject, fallback := "Handler rotation handoff to "+successor.Name, "Handler rotation handoff"
+	if dead {
+		// One notice, in place of the ordinary handoff: the successor's copy
+		// here and the owner helper's below carry the same text.
+		subject, fallback = deadPrimaryNoticeSubject, deadPrimaryNoticeSubject
+		text = deadPrimaryNoticeText(t, r, old, successor, req.DeathEvidence, handoff, deadPolicy.Revision)
+	}
+	if err = s.postBrokerNotice(ctx, tx, t, successor, successor.Name, subject, fallback, text, map[string]string{"handlerRotation": r.ID}); err != nil {
 		return zero, err
 	}
-	var noticeSeq int64
+	var noticeSeq, ownerNoticeSeq int64
 	if err = tx.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=? AND to_agent=?`, t.ID, successor.ID).Scan(&noticeSeq); err != nil {
 		return zero, err
+	}
+	if dead {
+		// The owner helper's copy; with no open owner helper it is board-wide.
+		helper, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, t.ID, api.AgentRoleOwnerHelper, api.AgentClosed, api.AgentExited))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return zero, err
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			helper = api.Agent{}
+		}
+		refs := map[string]string{"handlerRotation": r.ID, "escalation": "owner", "cause": "dead-primary-handler"}
+		if err = s.postBrokerNotice(ctx, tx, t, helper, successor.Name, subject, fallback, text, refs); err != nil {
+			return zero, err
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=?`, t.ID).Scan(&ownerNoticeSeq); err != nil {
+			return zero, err
+		}
 	}
 	now := s.now()
 	if _, err = tx.ExecContext(ctx, `UPDATE agents SET status=?,last_event_at=?,blocked_reason='',blocked_text='' WHERE id=?`, api.AgentClosed, ts(now), old.ID); err != nil {
@@ -613,15 +1130,24 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	r.State, r.SuccessorRunID, r.UpdatedAt, r.Handoff = api.HandlerRotationCommitted, successor.RunID, now, &handoff
 	r.Receipt = &api.HandlerRotationReceipt{RotationID: r.ID, RequestID: req.RequestID, HandlerRevision: t.HandlerRevision, PrimaryHandlerID: successor.ID,
 		ClosedAgentID: old.ID, ClosedRunID: old.RunID, NoticeSeq: noticeSeq, Reissued: len(handoff.Reissued), CommittedAt: now}
+	commitEvidenceJSON := ""
+	if dead {
+		data, _ := json.Marshal(req.DeathEvidence)
+		commitEvidenceJSON, r.CommitDeathEvidence = string(data), req.DeathEvidence
+		r.Receipt.LeasesMoved, r.Receipt.OwnerNoticeSeq = len(handoff.LiveLeases), ownerNoticeSeq
+	}
 	handoffJSON, _ := json.Marshal(handoff)
 	receiptJSON, _ := json.Marshal(r.Receipt)
-	if _, err = tx.ExecContext(ctx, `UPDATE handler_rotations SET state=?,successor_run_id=?,handoff_json=?,receipt_json=?,updated_at=?,old_runtime=?,successor_runtime=? WHERE id=? AND state='prepared'`,
-		r.State, r.SuccessorRunID, string(handoffJSON), string(receiptJSON), ts(now), old.Runtime, successor.Runtime, r.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE handler_rotations SET state=?,successor_run_id=?,handoff_json=?,receipt_json=?,updated_at=?,old_runtime=?,successor_runtime=?,commit_evidence_json=? WHERE id=? AND state='prepared'`,
+		r.State, r.SuccessorRunID, string(handoffJSON), string(receiptJSON), ts(now), old.Runtime, successor.Runtime, commitEvidenceJSON, r.ID); err != nil {
 		return zero, err
 	}
 	payload := map[string]any{"handlerRotationId": r.ID, "state": r.State,
 		"oldAgentId": old.ID, "oldRunId": old.RunID, "successorAgentId": successor.ID, "successorRunId": successor.RunID, "handlerRevision": t.HandlerRevision,
 		"reissued": len(handoff.Reissued), "noticeSeq": noticeSeq, "oldRuntime": old.Runtime, "successorRuntime": successor.Runtime}
+	if dead {
+		payload["reason"], payload["leasesMoved"], payload["ownerNoticeSeq"], payload["commitDeathEvidence"] = r.Reason, len(handoff.LiveLeases), ownerNoticeSeq, req.DeathEvidence
+	}
 	if authorized {
 		r.Authorization.OldRuntime, r.Authorization.SuccessorRuntime = old.Runtime, successor.Runtime
 		payload["authorizedBy"], payload["authorizationReason"] = r.Authorization.AuthorizedBy, r.Authorization.Reason
@@ -741,9 +1267,10 @@ func (s *Store) abortHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Task
 	return r, nil
 }
 
-// HandlerRotationsDue lists, for each open project whose policy is enabled
-// and whose primary handler runs on host, the counters the runner compares
-// with the policy. templateDigest is the runner's current handler template.
+// HandlerRotationsDue lists, for each open project whose primary handler runs
+// on host, the counters the runner compares with the policy: a project whose
+// limit policy is enabled, and any project whose primary is a dead candidate.
+// templateDigest is the runner's current handler template. templateDigest is the runner's current handler template.
 func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest string) (api.HandlerRotationDueList, error) {
 	out := api.HandlerRotationDueList{Entries: []api.HandlerRotationDue{}}
 	if host == "" || !api.ValidText(host, 253) || len(templateDigest) > 64 {
@@ -772,7 +1299,9 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if err != nil {
 			return out, err
 		}
-		if !policy.Enabled {
+		// Listed for its limits when the limit policy is enabled, and for a
+		// dead primary whenever that replacement is on; decided below.
+		if !policy.Enabled && policy.DeadSilenceMinutes <= 0 {
 			continue
 		}
 		primary, err := primaryHandler(ctx, s.db, t)
@@ -794,6 +1323,22 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 			return out, err
 		}
 		d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), busy.idle()
+		now := s.now()
+		d.Online = handlerSeenWithin(primary, now)
+		d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle
+		if !policy.Enabled && !d.DeadCandidate {
+			continue
+		}
+		if !d.Online {
+			last, ok, err := handlerLastActivity(ctx, s.db, t.ID, primary)
+			if err != nil {
+				return out, err
+			}
+			if ok {
+				d.LastActivityAt = &last
+				d.SilenceMet = d.DeadCandidate && now.Sub(last) >= time.Duration(policy.DeadSilenceMinutes)*time.Minute
+			}
+		}
 		if err = s.loadActivity(ctx, &d.Agent); err != nil {
 			return out, err
 		}
@@ -805,13 +1350,14 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 			return out, err
 		}
 		d.DigestMatches = templateDigest != "" && d.RecordedDigest == templateDigest
-		if policy.MaxItems > 0 && d.FinishedItems >= policy.MaxItems {
+		// The limits are due only under an enabled limit policy.
+		if policy.Enabled && policy.MaxItems > 0 && d.FinishedItems >= policy.MaxItems {
 			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonItems)
 		}
-		if policy.MaxTotalTokens > 0 && d.TotalTokens >= policy.MaxTotalTokens {
+		if policy.Enabled && policy.MaxTotalTokens > 0 && d.TotalTokens >= policy.MaxTotalTokens {
 			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTokens)
 		}
-		if policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
+		if policy.Enabled && policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
 			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTemplate)
 		}
 		if d.OpenRotation, err = openHandlerRotation(ctx, s.db, t.ID); err != nil {

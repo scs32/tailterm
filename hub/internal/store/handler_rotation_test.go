@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -1017,5 +1018,845 @@ func TestHandlerRotationAuthorizationColumnsMigrate(t *testing.T) {
 	defer again.Close()
 	if n := columns(again); n != 4 {
 		t.Fatalf("second open left %d columns", n)
+	}
+}
+
+// Dead primary rotation (wi_b863e669073858f4, owner order #28057). The store
+// clock and the host's evidence are injected; no process, tmux server or
+// handler is read, started, stopped or rotated.
+
+type deadPrimaryFixture struct {
+	*rotationFixture
+	clock    time.Time
+	running  api.TeamQueueEntry
+	frozen   api.TeamQueueEntry
+	plan     string
+	revision api.WorkItemRevision
+	helper   api.Agent
+	requests []api.Message
+}
+
+const deadPrimaryStarted = "Wed Oct  7 06:00:00 2026"
+
+// newDeadPrimaryFixture is a primary last recorded as working with a pending
+// tool, holding a running lease and a frozen-launch lease, with two open
+// requests and one work-item revision it saved. Its last recorded activity is
+// at the fixture clock; advance moves the clock on from there.
+func newDeadPrimaryFixture(t *testing.T) *deadPrimaryFixture {
+	t.Helper()
+	f := &deadPrimaryFixture{rotationFixture: newRotationFixture(t), clock: time.Now().UTC().Truncate(time.Millisecond)}
+	ctx := context.Background()
+	s := f.s
+	s.now = func() time.Time { return f.clock }
+	helper, err := s.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-host", Session: "owner", Runtime: "claude", Cwd: "/work/tailterm", RequestID: "dead-helper"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.helper, err = s.GetAgent(ctx, helper.Agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	for i, cwd := range []string{"/dead-running", "/dead-frozen"} {
+		q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "dead-add-" + cwd[1:], Operation: "add", ItemID: f.items[i].ID, OrderMessageSeq: f.orders[i].Seq, Host: "mini", Cwd: cwd})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			f.running = q
+		} else {
+			f.frozen = q
+		}
+	}
+	// The dead run's own writes: a work-item save and a message.
+	title := "Queued work, saved by the handler"
+	saved, _, err := s.CreateWorkItemUpdate(ctx, f.task.ID, f.items[1].ID, api.CreateWorkItemUpdate{ExpectedRevision: f.items[1].Revision, Title: &title, AgentID: f.old.ID, RunID: f.old.RunID, RequestID: "dead-save"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.revision = saved.Revision
+	f.send(t, f.old, api.EnvelopeKindNotice, f.worker.ID, "Fixture notice from the handler", false)
+	f.requests = []api.Message{
+		f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "First fixture request held by the handler", false),
+		f.send(t, f.worker, api.EnvelopeKindRequest, "role:database_handler", "Second fixture request held by role", false),
+	}
+	// A frozen plan with spacing and key order a re-marshal would not keep.
+	f.plan = `{"version":1, "hub":"http://fixture", "task":"` + f.task.ID + `","item":"` + f.items[1].ID + `", "revision":1,"order":` + jsonInt(f.orders[1].Seq) +
+		`, "handlerId":"` + f.old.ID + `" ,"handlerRunId": "` + f.old.RunID + `","handlerLeaseGeneration":5, "context":{"b":1,"a":[1, 2]},"members":[{"fields":{"agentId":"agt_0000000000000001","name":"lead-x","cwd":"/dead-frozen"},"state":"unstarted","runId":"run_0000000000000001"}]}`
+	if _, err = s.db.Exec(`UPDATE team_queue_entries SET state='running',handler_id=?,handler_run_id=?,handler_lease_generation=1 WHERE id=?`, f.old.ID, f.old.RunID, f.running.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`UPDATE team_queue_entries SET state='launching',handler_id=?,handler_run_id=?,handler_lease_generation=5,launch_json=? WHERE id=?`, f.old.ID, f.old.RunID, f.plan, f.frozen.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = withTx(s, func(tx *sql.Tx) error {
+		return insertHandlerArmAssignment(ctx, tx, f.task.ID, api.TeamQueueEntry{ID: f.running.ID, ItemID: f.items[0].ID},
+			api.TeamQueueHandlerArm{LeaseGeneration: 1, PolicyRevision: 3, Draw: "0a", DrawnArm: "S", Arm: "S", HandlerID: f.old.ID, HandlerRunID: f.old.RunID, HandlerDigest: "digest-as-leased", PolicyDigest: "policy", LeasedAt: ts(f.clock), SkippedLimited: []string{}})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.busy(t, "working", "Bash")
+	f.heartbeat(t)
+	if f.running, err = s.GetTeamQueueEntry(ctx, f.task.ID, f.running.ID); err != nil {
+		t.Fatal(err)
+	}
+	if f.frozen, err = s.GetTeamQueueEntry(ctx, f.task.ID, f.frozen.ID); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func jsonInt(v int64) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func withTx(s *Store, fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (f *deadPrimaryFixture) advance(d time.Duration) { f.clock = f.clock.Add(d) }
+
+// busy records the old run's activity as observed at the fixture clock.
+func (f *deadPrimaryFixture) busy(t *testing.T, state, tool string) {
+	t.Helper()
+	activity := api.AgentActivity{State: state, ObservedAt: f.clock, LastEventAt: f.clock, PendingTool: tool}
+	if tool != "" {
+		activity.PendingSince = f.clock
+	}
+	if _, err := f.s.ReportActivity(context.Background(), f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: activity}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// heartbeat is the old run's wrapper heartbeat at the fixture clock.
+func (f *deadPrimaryFixture) heartbeat(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(f.clock), f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// evidence is what a host that confirmed the death sends, observed now.
+func (f *deadPrimaryFixture) evidence() *api.HandlerDeathEvidence {
+	return &api.HandlerDeathEvidence{Host: f.old.Host, AgentID: f.old.ID, RunID: f.old.RunID, ObservedAt: f.clock, SessionName: "tt-handler-fixture", SessionID: "$7", SessionCreated: "1700000000",
+		SessionState: api.HandlerDeathStateGone, PID: 4242, PanePID: 4200, ProcessStarted: deadPrimaryStarted, ProcessState: api.HandlerDeathStateGone}
+}
+
+func (f *deadPrimaryFixture) prepareDead(t *testing.T, key string, change func(*api.HandlerRotationRequest)) (api.HandlerRotation, error) {
+	t.Helper()
+	task, err := f.s.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: key, ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: f.old.ID, OldRunID: f.old.RunID,
+		SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.old.Name, task.HandlerRevision), Reason: api.HandlerRotationReasonDeadPrimary,
+		Trigger: api.HandlerRotationTriggerRunner, DeathEvidence: f.evidence()}
+	if change != nil {
+		change(&req)
+	}
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, req, f.by)
+}
+
+func (f *deadPrimaryFixture) commitDead(r api.HandlerRotation, key string, ev *api.HandlerDeathEvidence) (api.HandlerRotation, error) {
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: key, RotationID: r.ID, DeathEvidence: ev}, f.by)
+}
+
+// succeed registers the prepared rotation's successor, online at the clock.
+func (f *deadPrimaryFixture) succeed(t *testing.T, r api.HandlerRotation) api.Agent {
+	t.Helper()
+	ctx := context.Background()
+	a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Role: api.AgentRoleDatabaseHandler, Name: r.SuccessorName, Host: f.old.Host, Session: "tt-handler-successor", Runtime: f.old.Runtime, Cwd: f.old.Cwd}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = f.s.GetAgent(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// deadState is everything a refused dead primary request must leave alone.
+type deadState struct {
+	rotations, agents, openOld, messages, handlerRevision int
+	primary, runningLease, frozenLease, plan, assignment  string
+}
+
+func (f *deadPrimaryFixture) state(t *testing.T) deadState {
+	t.Helper()
+	s := f.s
+	var d deadState
+	d.rotations = countRows(t, s, `SELECT count(*) FROM handler_rotations WHERE state<>'aborted'`)
+	d.agents = countRows(t, s, `SELECT count(*) FROM agents WHERE task_id=? AND status<>'closed'`, f.task.ID)
+	d.openOld = countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed'`, f.old.ID)
+	d.messages = countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+	d.handlerRevision = countRows(t, s, `SELECT handler_revision FROM tasks WHERE id=?`, f.task.ID)
+	lease := `SELECT handler_id||'/'||handler_run_id||'/'||handler_lease_generation||'/'||revision FROM team_queue_entries WHERE id=?`
+	for _, q := range []struct {
+		to    *string
+		query string
+		arg   string
+	}{{&d.primary, `SELECT primary_handler_id FROM tasks WHERE id=?`, f.task.ID}, {&d.runningLease, lease, f.running.ID}, {&d.frozenLease, lease, f.frozen.ID},
+		{&d.plan, `SELECT CAST(launch_json AS TEXT) FROM team_queue_entries WHERE id=?`, f.frozen.ID},
+		{&d.assignment, `SELECT handler_id||'/'||handler_run_id||'/'||lease_generation FROM handler_arm_assignments WHERE entry_id=?`, f.running.ID}} {
+		if err := s.db.QueryRow(q.query, q.arg).Scan(q.to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return d
+}
+
+func noticesTo(t *testing.T, s *Store, task, agent string) []api.Message {
+	t.Helper()
+	messages, err := s.ListMessages(context.Background(), task, 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == deadPrimaryNoticeSubject && m.To == agent {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// rotateDeadPrimary runs the whole accepted path: 11 minutes of silence,
+// prepare with evidence, a registered successor and a commit with a second,
+// later observation.
+func rotateDeadPrimary(t *testing.T) (*deadPrimaryFixture, api.HandlerRotation, api.Agent) {
+	t.Helper()
+	f := newDeadPrimaryFixture(t)
+	f.advance(11 * time.Minute)
+	r, err := f.prepareDead(t, "dead-prepare", nil)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	successor := f.succeed(t, r)
+	f.advance(30 * time.Second)
+	committed, err := f.commitDead(r, "rotation-commit-"+r.ID, f.evidence())
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return f, committed, successor
+}
+
+// T1: a dead, silent, busy primary is rotated through prepare and commit, and
+// everything it held is on the successor after the one commit.
+func TestHandlerRotationDeadSilentPrimaryRotates(t *testing.T) {
+	f, r, successor := rotateDeadPrimary(t)
+	ctx := context.Background()
+	s := f.s
+	if r.State != api.HandlerRotationCommitted || r.Reason != api.HandlerRotationReasonDeadPrimary || r.Trigger != api.HandlerRotationTriggerRunner ||
+		r.DeathEvidence == nil || r.CommitDeathEvidence == nil || !r.CommitDeathEvidence.ObservedAt.After(r.DeathEvidence.ObservedAt) || r.LastActivityAt == nil {
+		t.Fatalf("rotation record: %+v", r)
+	}
+	task, _ := s.GetTask(ctx, f.task.ID)
+	old, _ := s.GetAgent(ctx, f.old.ID)
+	if task.PrimaryHandlerID != successor.ID || task.HandlerRevision != 2 || old.Status != api.AgentClosed {
+		t.Fatalf("primary %s revision %d old %s", task.PrimaryHandlerID, task.HandlerRevision, old.Status)
+	}
+	// Leases: both entries name the successor's exact run with new generations.
+	running, _ := s.GetTeamQueueEntry(ctx, f.task.ID, f.running.ID)
+	frozen, _ := s.GetTeamQueueEntry(ctx, f.task.ID, f.frozen.ID)
+	for i, e := range []api.TeamQueueEntry{running, frozen} {
+		before := []api.TeamQueueEntry{f.running, f.frozen}[i]
+		if e.HandlerID != successor.ID || e.HandlerRunID != successor.RunID || e.HandlerLeaseGeneration != int64(i+1) || e.Revision != before.Revision+1 || e.State != before.State || e.ReleasedAt != "" {
+			t.Fatalf("lease %d not moved: %+v", i, e)
+		}
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM team_queue_entries WHERE handler_id=?`, f.old.ID); n != 0 {
+		t.Fatalf("leases left on the dead handler: %d", n)
+	}
+	// The stored launch plan names the successor and is otherwise byte-identical.
+	want := strings.Replace(f.plan, `"handlerId":"`+f.old.ID+`"`, `"handlerId":"`+successor.ID+`"`, 1)
+	want = strings.Replace(want, `"handlerRunId": "`+f.old.RunID+`"`, `"handlerRunId": "`+successor.RunID+`"`, 1)
+	want = strings.Replace(want, `"handlerLeaseGeneration":5,`, `"handlerLeaseGeneration":2,`, 1) // the successor's second lease
+	if string(frozen.LaunchJSON) != want || want == f.plan {
+		t.Fatalf("launch plan:\n got %s\nwant %s", frozen.LaunchJSON, want)
+	}
+	var plan struct {
+		HandlerID              string `json:"handlerId"`
+		HandlerRunID           string `json:"handlerRunId"`
+		HandlerLeaseGeneration int64  `json:"handlerLeaseGeneration"`
+	}
+	if err := json.Unmarshal(frozen.LaunchJSON, &plan); err != nil || plan.HandlerID != frozen.HandlerID || plan.HandlerRunID != frozen.HandlerRunID || plan.HandlerLeaseGeneration != frozen.HandlerLeaseGeneration {
+		t.Fatalf("launch plan does not match the entry: %+v %v", plan, err)
+	}
+	// The arm assignment follows the lease and keeps what was leased.
+	if running.HandlerArm == nil || running.HandlerArm.HandlerID != successor.ID || running.HandlerArm.HandlerRunID != successor.RunID || running.HandlerArm.LeaseGeneration != 1 ||
+		running.HandlerArm.HandlerDigest != "digest-as-leased" || running.HandlerArm.Draw != "0a" || running.HandlerArm.Arm != "S" {
+		t.Fatalf("arm assignment: %+v", running.HandlerArm)
+	}
+	// Obligations: each of the two requests reissued once to the successor.
+	h := r.Handoff
+	if h == nil || len(h.Reissued) != 2 || countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed'`, f.old.ID) != 0 {
+		t.Fatalf("handoff reissued: %+v", h)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed' AND source_kind='request'`, successor.ID); n != 2 {
+		t.Fatalf("requests on the successor: %d", n)
+	}
+	if len(h.LiveLeases) != 2 || h.LiveLeases[0].EntryID != f.running.ID || h.LiveLeases[0].LeaseGeneration != 1 || h.LiveLeases[0].NewLeaseGeneration != 1 || h.LiveLeases[0].LaunchPlanRewritten ||
+		h.LiveLeases[1].EntryID != f.frozen.ID || h.LiveLeases[1].LeaseGeneration != 5 || h.LiveLeases[1].NewLeaseGeneration != 2 || !h.LiveLeases[1].LaunchPlanRewritten {
+		t.Fatalf("handoff leases: %+v", h.LiveLeases)
+	}
+	// In flight: reported, not recovered.
+	in := h.InFlight
+	if in == nil || in.ActivityState != "working" || in.PendingTool != "Bash" || in.SilenceMinutes != 10 || !in.LastActivityAt.Equal(*r.LastActivityAt) || in.WritesOmitted != 0 ||
+		len(in.RecentWrites) != 1 || in.RecentWrites[0].ItemID != f.revision.ItemID || in.RecentWrites[0].Revision != f.revision.Revision || !reflect.DeepEqual(in.RecentWrites[0].ChangedFields, []string{"title"}) {
+		t.Fatalf("in flight: %+v", in)
+	}
+	// One notice each to the successor and the owner helper, with the same text.
+	toSuccessor, toHelper := noticesTo(t, s, f.task.ID, successor.ID), noticesTo(t, s, f.task.ID, f.helper.ID)
+	if len(toSuccessor) != 1 || len(toHelper) != 1 || toSuccessor[0].Seq != r.Receipt.NoticeSeq || toHelper[0].Seq != r.Receipt.OwnerNoticeSeq || r.Receipt.LeasesMoved != 2 || r.Receipt.Reissued != 2 {
+		t.Fatalf("notices: successor %d helper %d receipt %+v", len(toSuccessor), len(toHelper), r.Receipt)
+	}
+	text := toSuccessor[0].Envelope.Body.Text
+	if text != toHelper[0].Envelope.Body.Text || toSuccessor[0].Envelope.Refs["handlerRotation"] != r.ID || toHelper[0].Envelope.Refs["handlerRotation"] != r.ID {
+		t.Fatalf("the two copies differ:\n%s\n%s", text, toHelper[0].Envelope.Body.Text)
+	}
+	for _, part := range []string{
+		"Primary database handler " + f.old.Name + " (" + f.old.ID + " / " + f.old.RunID + ")",
+		"Evidence from host mini: tmux session tt-handler-fixture is absent and runtime process 4242 (started " + deadPrimaryStarted + ") is absent, as is pane process 4200",
+		"the silence applied was 10 minute(s)",
+		"2 open obligation(s) and 2 team lease(s) (" + f.running.ID + ", " + f.frozen.ID + ")",
+		"last activity working, pending tool Bash, 1 recent work-item save(s)",
+		"tt handler rotation get " + r.ID,
+		"owner order #28057",
+		"To turn it off for this project: tt handler policy set --task " + f.task.ID + " --revision 0 --dead-silence-minutes 0",
+	} {
+		if !strings.Contains(text, part) {
+			t.Fatalf("notice lacks %q:\n%s", part, text)
+		}
+	}
+	if len(text) > 2000 {
+		t.Fatalf("notice is %d bytes", len(text))
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=? AND to_agent=? AND text LIKE '%Handler rotation handoff%'`, f.task.ID, successor.ID); n != 0 {
+		t.Fatalf("the ordinary handoff notice was posted too: %d", n)
+	}
+	// A replayed commit, even with a newer observation, adds nothing.
+	messages := countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+	f.advance(20 * time.Second)
+	again, err := f.commitDead(r, "rotation-commit-"+r.ID, f.evidence())
+	if err != nil || again.State != api.HandlerRotationCommitted || again.Receipt.NoticeSeq != r.Receipt.NoticeSeq || !again.CommitDeathEvidence.ObservedAt.Equal(r.CommitDeathEvidence.ObservedAt) {
+		t.Fatalf("replayed commit: %+v %v", again, err)
+	}
+	if countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID) != messages || len(noticesTo(t, s, f.task.ID, successor.ID)) != 1 || len(noticesTo(t, s, f.task.ID, f.helper.ID)) != 1 {
+		t.Fatal("a replayed commit posted again")
+	}
+	// The record survives a read back.
+	read, err := s.GetHandlerRotation(ctx, f.task.ID, r.ID)
+	if err != nil || read.Handoff.InFlight == nil || read.DeathEvidence.PID != 4242 || read.CommitDeathEvidence == nil || len(read.Handoff.LiveLeases) != 2 {
+		t.Fatalf("read back: %+v %v", read, err)
+	}
+}
+
+// T1, no owner helper: the owner's copy of the notice is posted board-wide.
+func TestHandlerRotationDeadPrimaryNoticeIsBoardWideWithoutOwnerHelper(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed' WHERE id=?`, f.helper.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(11 * time.Minute)
+	r, err := f.prepareDead(t, "dead-prepare", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := f.succeed(t, r)
+	f.advance(time.Second)
+	if r, err = f.commitDead(r, "dead-commit", f.evidence()); err != nil {
+		t.Fatal(err)
+	}
+	if len(noticesTo(t, f.s, f.task.ID, successor.ID)) != 1 || len(noticesTo(t, f.s, f.task.ID, "")) != 1 || len(noticesTo(t, f.s, f.task.ID, f.helper.ID)) != 0 || r.Receipt.OwnerNoticeSeq == 0 {
+		t.Fatalf("notices without an owner helper: receipt %+v", r.Receipt)
+	}
+}
+
+// T2: a dead primary that was active within the silence waits. Any of the
+// run's own records counts, by the store clock.
+func TestHandlerRotationDeadButRecentlyActiveWaits(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	base := f.state(t)
+	f.advance(9 * time.Minute)
+	if _, err := f.prepareDead(t, "nine-minutes", nil); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+		t.Fatalf("9 minutes of silence: %v", err)
+	}
+	if f.state(t) != base {
+		t.Fatal("a refused prepare changed state")
+	}
+	// A message from the run at minute 8 keeps it not silent at minute 15.
+	if _, err := f.s.db.Exec(`UPDATE messages SET created_at=? WHERE task_id=? AND from_agent=? AND from_run_id=?`, ts(f.clock.Add(-time.Minute)), f.task.ID, f.old.ID, f.old.RunID); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(6 * time.Minute)
+	if _, err := f.prepareDead(t, "message-at-eight", nil); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+		t.Fatalf("a message 7 minutes ago: %v", err)
+	}
+	// So does a work-item revision the run saved.
+	if _, err := f.s.db.Exec(`UPDATE messages SET created_at=? WHERE task_id=? AND from_agent=?`, ts(f.clock.Add(-time.Hour)), f.task.ID, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE work_item_revisions SET updated_at=? WHERE updated_agent=? AND updated_run_id=?`, ts(f.clock.Add(-2*time.Minute)), f.old.ID, f.old.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.prepareDead(t, "revision-two-minutes-ago", nil); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+		t.Fatalf("a revision 2 minutes ago: %v", err)
+	}
+	if f.state(t) != base {
+		t.Fatal("a refused prepare changed state")
+	}
+	// A run with no recorded activity at all is not silent either.
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at='' WHERE id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DELETE FROM agent_activity WHERE agent_id=?`, `UPDATE messages SET from_run_id='' WHERE from_agent=?`, `UPDATE work_item_revisions SET updated_run_id='' WHERE updated_agent=?`} {
+		if _, err := f.s.db.Exec(q, f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.advance(time.Hour)
+	if _, err := f.prepareDead(t, "no-record", nil); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+		t.Fatalf("no recorded activity: %v", err)
+	}
+}
+
+// T3: an alive, busy primary is never rotated: without evidence the request
+// is invalid, with a recent heartbeat the death is unconfirmed, and the owner
+// trigger cannot carry evidence.
+func TestHandlerRotationAliveBusyPrimaryNeverRotates(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	base := f.state(t)
+	f.advance(11 * time.Minute)
+	if _, err := f.prepareDead(t, "no-evidence", func(r *api.HandlerRotationRequest) { r.DeathEvidence = nil }); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("dead_primary without evidence: %v", err)
+	}
+	for name, change := range map[string]func(*api.HandlerRotationRequest){
+		"owner-trigger":    func(r *api.HandlerRotationRequest) { r.Trigger = api.HandlerRotationTriggerOwner },
+		"owner-authorized": func(r *api.HandlerRotationRequest) { r.AuthorizedBy, r.AuthorizationReason = "owner", "fixture" },
+		"manual-reason":    func(r *api.HandlerRotationRequest) { r.Reason = api.HandlerRotationReasonManual },
+		"limit-reason":     func(r *api.HandlerRotationRequest) { r.Reason = api.HandlerRotationReasonTokens },
+		"control-chars":    func(r *api.HandlerRotationRequest) { r.DeathEvidence.SessionName = "bad\nname" },
+	} {
+		if _, err := f.prepareDead(t, "invalid-"+name, change); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	// The hub saw a heartbeat 30 seconds ago: whatever the host says, not dead.
+	f.advance(-30 * time.Second)
+	f.heartbeat(t)
+	f.advance(30 * time.Second)
+	if _, err := f.prepareDead(t, "heartbeat", nil); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+		t.Fatalf("heartbeat 30 seconds ago: %v", err)
+	}
+	// Without evidence the busy primary is refused exactly as before.
+	if _, err := f.prepare(t, "owner-busy", api.Agent{}, ""); refusalCode(err) != api.HandlerRotationRefusedLiveLease {
+		t.Fatalf("owner rotation of a leased primary: %v", err)
+	}
+	task, _ := f.s.GetTask(context.Background(), f.task.ID)
+	runner := api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: "runner-busy", ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: f.old.ID, OldRunID: f.old.RunID,
+		SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.old.Name, task.HandlerRevision), Reason: api.HandlerRotationReasonItems, Trigger: api.HandlerRotationTriggerRunner}
+	if _, err := f.s.HandlerRotationAction(context.Background(), f.task.ID, runner, f.by); refusalCode(err) != api.HandlerRotationRefusedLiveLease {
+		t.Fatalf("runner limit rotation of a leased primary: %v", err)
+	}
+	if f.state(t) != base {
+		t.Fatal("a refused request changed state")
+	}
+}
+
+// T4: an unknown or unreadable host state is never confirmation.
+func TestHandlerRotationUnknownHostStateNeverRotates(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	base := f.state(t)
+	f.advance(11 * time.Minute)
+	for name, change := range map[string]func(*api.HandlerDeathEvidence){
+		"session-unknown":   func(e *api.HandlerDeathEvidence) { e.SessionState = "unknown" },
+		"session-alive":     func(e *api.HandlerDeathEvidence) { e.SessionState = "alive" },
+		"process-unknown":   func(e *api.HandlerDeathEvidence) { e.ProcessState = "unknown" },
+		"process-empty":     func(e *api.HandlerDeathEvidence) { e.ProcessState = "" },
+		"no-pid":            func(e *api.HandlerDeathEvidence) { e.PID = 0 },
+		"no-start-identity": func(e *api.HandlerDeathEvidence) { e.ProcessStarted = "" },
+		"another-host":      func(e *api.HandlerDeathEvidence) { e.Host = "air" },
+		"no-host":           func(e *api.HandlerDeathEvidence) { e.Host = "" },
+		"another-run":       func(e *api.HandlerDeathEvidence) { e.RunID = "run_0000000000000009" },
+		"another-agent":     func(e *api.HandlerDeathEvidence) { e.AgentID = f.worker.ID },
+		"three-minutes-old": func(e *api.HandlerDeathEvidence) { e.ObservedAt = f.clock.Add(-3 * time.Minute) },
+		"one-minute-ahead":  func(e *api.HandlerDeathEvidence) { e.ObservedAt = f.clock.Add(time.Minute) },
+		"undated":           func(e *api.HandlerDeathEvidence) { e.ObservedAt = time.Time{} },
+	} {
+		_, err := f.prepareDead(t, "unknown-"+name, func(r *api.HandlerRotationRequest) { change(r.DeathEvidence) })
+		if refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if f.state(t) != base {
+			t.Fatalf("%s changed state", name)
+		}
+	}
+	// The same evidence, unchanged, is accepted: the cases above failed on
+	// the one field each changed.
+	if _, err := f.prepareDead(t, "valid", nil); err != nil {
+		t.Fatalf("valid evidence: %v", err)
+	}
+}
+
+// T5: activity recorded between prepare and commit refuses the commit and
+// moves nothing; the abort leaves the old handler primary with its leases.
+func TestHandlerRotationDeadPrimaryActivityBeforeCommitMovesNothing(t *testing.T) {
+	for _, activity := range []string{"heartbeat", "message", "activity"} {
+		t.Run(activity, func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			f.advance(11 * time.Minute)
+			r, err := f.prepareDead(t, "prepare", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			successor := f.succeed(t, r)
+			prepared := f.state(t)
+			f.advance(100 * time.Second)
+			want := api.HandlerRotationRefusedNotSilent
+			switch activity {
+			case "heartbeat":
+				// Seen within the online window as well, so the death is unconfirmed.
+				f.heartbeat(t)
+				want = api.HandlerRotationRefusedDeathUnconfirmed
+				prepared = f.state(t)
+			case "message":
+				if _, err := f.s.db.Exec(`INSERT INTO messages (task_id,from_agent,from_node,from_user,to_agent,text,created_at,reply_to,broadcast,from_run_id,envelope) VALUES (?,?,'fixture','owner','','late write',?,0,1,?,'')`,
+					f.task.ID, f.old.ID, ts(f.clock), f.old.RunID); err != nil {
+					t.Fatal(err)
+				}
+				prepared = f.state(t)
+			case "activity":
+				if _, err := f.s.db.Exec(`UPDATE agent_activity SET observed_at=? WHERE agent_id=?`, ts(f.clock), f.old.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.advance(10 * time.Second)
+			if _, err := f.commitDead(r, "commit", f.evidence()); refusalCode(err) != want {
+				t.Fatalf("commit after %s: %v", activity, err)
+			}
+			still, _ := f.s.GetHandlerRotation(context.Background(), f.task.ID, r.ID)
+			if f.state(t) != prepared || still.State != api.HandlerRotationPrepared || still.CommitDeathEvidence != nil ||
+				countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed'`, successor.ID) != 0 || len(noticesTo(t, f.s, f.task.ID, successor.ID)) != 0 {
+				t.Fatalf("a refused commit moved something: %+v", still)
+			}
+			aborted, err := f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort", RotationID: r.ID}, f.by)
+			if err != nil || aborted.State != api.HandlerRotationAborted {
+				t.Fatalf("abort: %+v %v", aborted, err)
+			}
+			after := f.state(t)
+			old, _ := f.s.GetAgent(context.Background(), f.old.ID)
+			gone, _ := f.s.GetAgent(context.Background(), successor.ID)
+			if after.runningLease != prepared.runningLease || after.frozenLease != prepared.frozenLease || after.plan != f.plan || after.assignment != prepared.assignment ||
+				after.openOld != 2 || after.handlerRevision != 1 || old.Status == api.AgentClosed || gone.Status != api.AgentClosed {
+				t.Fatalf("abort changed the old handler's holdings: %+v old %s successor %s", after, old.Status, gone.Status)
+			}
+		})
+	}
+}
+
+// T6: a commit needs a second, fresh observation.
+func TestHandlerRotationDeadPrimaryCommitNeedsFreshEvidence(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	f.advance(11 * time.Minute)
+	first := f.evidence()
+	r, err := f.prepareDead(t, "prepare", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.succeed(t, r)
+	prepared := f.state(t)
+	f.advance(30 * time.Second)
+	stale := f.evidence()
+	stale.ObservedAt = f.clock.Add(-3 * time.Minute)
+	alive := f.evidence()
+	alive.ProcessState = "alive"
+	for name, ev := range map[string]*api.HandlerDeathEvidence{"none": nil, "the-prepare-observation": first, "stale": stale, "alive": alive} {
+		if _, err := f.commitDead(r, "commit-"+name, ev); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+			t.Fatalf("commit with %s evidence: %v", name, err)
+		}
+		if f.state(t) != prepared {
+			t.Fatalf("commit with %s evidence changed state", name)
+		}
+	}
+	// Turned off after prepare: the commit is refused too.
+	policy, _ := f.s.HandlerRotationPolicy(context.Background(), f.task.ID)
+	off := int64(0)
+	if _, err := f.s.SetHandlerRotationPolicy(context.Background(), f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: policy.Enabled, DeadSilenceMinutes: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.commitDead(r, "commit-off", f.evidence()); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+		t.Fatalf("commit after the replacement was turned off: %v", err)
+	}
+	// Evidence is refused on a rotation that is not a dead primary one.
+	if _, err := f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort", RotationID: r.ID}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE task_id=?`, ts(f.clock), f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.busy(t, "idle", "")
+	ordinary, err := f.prepare(t, "ordinary", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.commitDead(ordinary, "ordinary-commit", f.evidence()); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("evidence on an ordinary commit: %v", err)
+	}
+}
+
+// T7: the silence is a policy field: default 10, 0 is off, 1 to 1440 sets it,
+// an omitted field keeps it, and it is measured by the store clock.
+func TestHandlerRotationDeadSilencePolicy(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	ctx := context.Background()
+	s := f.s
+	p, err := s.HandlerRotationPolicy(ctx, f.task.ID)
+	if err != nil || p.DeadSilenceMinutes != 10 || p.Revision != 0 {
+		t.Fatalf("default policy: %+v %v", p, err)
+	}
+	set := func(minutes *int64) (api.HandlerRotationPolicy, error) {
+		current, _ := s.HandlerRotationPolicy(ctx, f.task.ID)
+		return s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: current.Revision, Enabled: true, MaxItems: 10, DeadSilenceMinutes: minutes})
+	}
+	minutes := func(v int64) *int64 { return &v }
+	for _, bad := range []int64{-1, 1441} {
+		if _, err := set(minutes(bad)); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("silence %d: %v", bad, err)
+		}
+	}
+	// Off: even a dead, long-silent primary is not rotated.
+	if p, err = set(minutes(0)); err != nil || p.DeadSilenceMinutes != 0 {
+		t.Fatalf("off: %+v %v", p, err)
+	}
+	base := f.state(t)
+	f.advance(time.Hour)
+	if _, err := f.prepareDead(t, "off", nil); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+		t.Fatalf("prepare with the replacement off: %v", err)
+	}
+	if f.state(t) != base {
+		t.Fatal("a refused prepare changed state")
+	}
+	// An omitted field keeps the saved value, off included.
+	if p, err = set(nil); err != nil || p.DeadSilenceMinutes != 0 {
+		t.Fatalf("omitted keeps off: %+v %v", p, err)
+	}
+	if p, err = set(minutes(3)); err != nil || p.DeadSilenceMinutes != 3 {
+		t.Fatalf("three minutes: %+v %v", p, err)
+	}
+	if p, err = set(nil); err != nil || p.DeadSilenceMinutes != 3 {
+		t.Fatalf("omitted keeps three: %+v %v", p, err)
+	}
+	if read, _ := s.HandlerRotationPolicy(ctx, f.task.ID); read.DeadSilenceMinutes != 3 {
+		t.Fatalf("read back: %+v", read)
+	}
+	// The store clock decides: 2m59s is not silent, 4 minutes is.
+	f.heartbeat(t)
+	f.advance(3*time.Minute - time.Second)
+	if _, err := f.prepareDead(t, "under-three", nil); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+		t.Fatalf("2m59s of silence under a 3 minute policy: %v", err)
+	}
+	f.advance(time.Minute + time.Second)
+	r, err := f.prepareDead(t, "four-minutes", nil)
+	if err != nil {
+		t.Fatalf("4 minutes of silence under a 3 minute policy: %v", err)
+	}
+	f.succeed(t, r)
+	f.advance(time.Second)
+	if r, err = f.commitDead(r, "commit", f.evidence()); err != nil || r.Handoff.InFlight.SilenceMinutes != 3 {
+		t.Fatalf("commit: %+v %v", r, err)
+	}
+}
+
+// T7: a hub that had the policy table before this change gets the silence
+// with its default, and its rotations the three new columns.
+func TestHandlerRotationDeadSilenceColumnsMigrate(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	if _, err := f.s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{Enabled: true, MaxItems: 4}); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`ALTER TABLE handler_rotation_policy DROP COLUMN dead_silence_minutes`, `ALTER TABLE handler_rotations DROP COLUMN evidence_json`,
+		`ALTER TABLE handler_rotations DROP COLUMN commit_evidence_json`, `ALTER TABLE handler_rotations DROP COLUMN last_activity_at`} {
+		if _, err := f.s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ { // the migration is idempotent
+		if err := migrateHandlerRotation(f.s.db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := f.s.HandlerRotationPolicy(ctx, f.task.ID)
+	if err != nil || p.DeadSilenceMinutes != api.DefaultHandlerDeadSilenceMinutes || p.MaxItems != 4 || p.Revision != 1 {
+		t.Fatalf("migrated policy: %+v %v", p, err)
+	}
+	if r, err := f.prepare(t, "after-migration", api.Agent{}, ""); err != nil || r.DeathEvidence != nil || r.LastActivityAt != nil {
+		t.Fatalf("rotation after migration: %+v %v", r, err)
+	}
+}
+
+// T8: the due list says, by the store clock, whether the primary is online, a
+// dead candidate and silent long enough; a project whose limit policy is off
+// is listed only for the dead case.
+func TestHandlerRotationDueListDeadCandidate(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	ctx := context.Background()
+	s := f.s
+	due := func() []api.HandlerRotationDue {
+		t.Helper()
+		list, err := s.HandlerRotationsDue(ctx, "mini", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.Entries
+	}
+	// Online and busy: listed for its enabled limit policy, not a candidate.
+	d := due()
+	if len(d) != 1 || !d[0].Online || d[0].DeadCandidate || d[0].SilenceMet || d[0].LastActivityAt != nil || d[0].Idle || d[0].LiveLeases != 2 {
+		t.Fatalf("online busy: %+v", d)
+	}
+	// Offline and busy, not silent yet.
+	f.advance(5 * time.Minute)
+	last := f.clock.Add(-5 * time.Minute)
+	if d = due(); len(d) != 1 || d[0].Online || !d[0].DeadCandidate || d[0].SilenceMet || d[0].LastActivityAt == nil || !d[0].LastActivityAt.Equal(last) {
+		t.Fatalf("offline busy, 5 minutes: %+v", d)
+	}
+	// Offline, busy and silent for the policy's minutes.
+	f.advance(5 * time.Minute)
+	if d = due(); len(d) != 1 || d[0].Online || !d[0].DeadCandidate || !d[0].SilenceMet || !d[0].LastActivityAt.Equal(last) {
+		t.Fatalf("offline busy, 10 minutes: %+v", d)
+	}
+	// With the limit policy off the project is still listed for the dead case,
+	// and no limit is reported due.
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{Enabled: false, MaxItems: 1, MaxTotalTokens: 1, OnTemplateChange: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, ts(f.clock), f.running.ID); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 1 || !d[0].DeadCandidate || !d[0].SilenceMet || len(d[0].DueReasons) != 0 || d[0].FinishedItems != 1 || d[0].Policy.Enabled {
+		t.Fatalf("limit policy off, dead candidate: %+v", d)
+	}
+	// Dead rotation off as well: not listed at all.
+	off := int64(0)
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 1, Enabled: false, DeadSilenceMinutes: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 0 {
+		t.Fatalf("both off: %+v", d)
+	}
+	// Limit policy on, dead rotation off: listed, never a candidate.
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 2, Enabled: true, MaxItems: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 1 || d[0].DeadCandidate || d[0].SilenceMet || d[0].Online || !reflect.DeepEqual(d[0].DueReasons, []string{"items"}) {
+		t.Fatalf("dead rotation off: %+v", d)
+	}
+	// Offline and idle: the ordinary rotation applies, so not a candidate; with
+	// the limit policy off it is not listed.
+	ten := int64(10)
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 3, Enabled: false, DeadSilenceMinutes: &ten}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, ts(f.clock), f.frozen.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE agent_activity SET state='idle',payload='{}' WHERE agent_id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 0 {
+		t.Fatalf("offline idle with the limit policy off: %+v", d)
+	}
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 4, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 1 || d[0].Online || d[0].DeadCandidate || d[0].SilenceMet || !d[0].Idle || d[0].LastActivityAt == nil {
+		t.Fatalf("offline idle: %+v", d)
+	}
+}
+
+// T9: an offline primary that is not busy is not a dead primary rotation; the
+// ordinary rotation already accepts it.
+func TestHandlerRotationDeadPrimaryNotBusyIsRefused(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE task_id=?`, ts(f.clock), f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.busy(t, "idle", "")
+	f.advance(11 * time.Minute)
+	_, err := f.prepareDead(t, "idle", nil)
+	var refusal *api.HandlerRotationRefusal
+	if !errors.As(err, &refusal) || refusal.Code != api.HandlerRotationRefusedDeathUnconfirmed || refusal.Detail != "the handler is not busy; the ordinary rotation applies" {
+		t.Fatalf("not busy: %v", err)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_rotations`); n != 0 {
+		t.Fatalf("rotations: %d", n)
+	}
+	if _, err := f.prepare(t, "ordinary", api.Agent{}, ""); err != nil {
+		t.Fatalf("the ordinary rotation of an idle offline primary: %v", err)
+	}
+}
+
+// The launch plan rewrite replaces the three handler fields and nothing else,
+// and refuses a plan it cannot hand over exactly.
+func TestHandlerRotationLaunchPlanRewrite(t *testing.T) {
+	for _, c := range []struct{ name, plan, want string }{
+		{"all three", `{"a":1,"handlerId":"agt_old","handlerRunId":"run_old","handlerLeaseGeneration":7,"z":[{"handlerId":"agt_old"}]}`,
+			`{"a":1,"handlerId":"agt_new","handlerRunId":"run_new","handlerLeaseGeneration":3,"z":[{"handlerId":"agt_old"}]}`},
+		{"spacing and order kept", "{ \"handlerLeaseGeneration\" : 12 ,\n\t\"handlerRunId\":\"run_old\", \"x\":\"handlerId\",\"handlerId\" :  \"agt_old\" }",
+			"{ \"handlerLeaseGeneration\" : 3 ,\n\t\"handlerRunId\":\"run_new\", \"x\":\"handlerId\",\"handlerId\" :  \"agt_new\" }"},
+		{"omitted fields added", `{"handlerId":"agt_old","context":{}}`, `{"handlerId":"agt_new","handlerRunId":"run_new","handlerLeaseGeneration":3,"context":{}}`},
+	} {
+		got, changed, err := rewriteLaunchHandler([]byte(c.plan), "agt_old", "agt_new", "run_new", 3)
+		if err != nil || !changed || string(got) != c.want {
+			t.Fatalf("%s: %q %v %v", c.name, got, changed, err)
+		}
+	}
+	for _, plan := range []string{`{"handlerId":"","members":[]}`, `{"members":[]}`} {
+		got, changed, err := rewriteLaunchHandler([]byte(plan), "agt_old", "agt_new", "run_new", 3)
+		if err != nil || changed || string(got) != plan {
+			t.Fatalf("a plan naming no handler: %q %v %v", got, changed, err)
+		}
+	}
+	for name, plan := range map[string]string{"third handler": `{"handlerId":"agt_other"}`, "not json": `{"handlerId":`, "not an object": `["agt_old"]`,
+		"repeated": `{"handlerId":"agt_old","handlerId":"agt_old"}`, "trailing": `{"handlerId":"agt_old"} {}`, "wrong type": `{"handlerId":7}`} {
+		if _, _, err := rewriteLaunchHandler([]byte(plan), "agt_old", "agt_new", "run_new", 3); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+}
+
+// A lease whose stored plan names a third handler fails the whole commit:
+// nothing moves, and the rotation stays prepared.
+func TestHandlerRotationDeadPrimaryUnmovableLeaseFailsCommit(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	bad := strings.Replace(f.plan, f.old.ID, f.worker.ID, 1)
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET launch_json=? WHERE id=?`, bad, f.frozen.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(11 * time.Minute)
+	r, err := f.prepareDead(t, "prepare", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := f.succeed(t, r)
+	prepared := f.state(t)
+	f.advance(time.Second)
+	if _, err = f.commitDead(r, "commit", f.evidence()); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.frozen.ID) {
+		t.Fatalf("commit with an unmovable lease: %v", err)
+	}
+	still, _ := f.s.GetHandlerRotation(context.Background(), f.task.ID, r.ID)
+	if f.state(t) != prepared || still.State != api.HandlerRotationPrepared || countRows(t, f.s, `SELECT count(*) FROM team_queue_entries WHERE handler_id=?`, successor.ID) != 0 {
+		t.Fatal("a failed commit moved the first lease")
 	}
 }

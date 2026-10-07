@@ -494,6 +494,16 @@ func finishHandlerArmAssignment(ctx context.Context, tx *sql.Tx, e api.TeamQueue
 	return err
 }
 
+// moveHandlerArmAssignment follows a lease that a dead primary rotation hands
+// to the successor (docs/handler-rotation.md): the entry's assignment row
+// takes the successor and the new lease generation, and keeps its draw, arm
+// and digest as leased. An entry leased without an arm policy has no row.
+func moveHandlerArmAssignment(ctx context.Context, tx *sql.Tx, entryID, oldHandlerID string, oldGeneration int64, successor api.Agent, newGeneration int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE handler_arm_assignments SET handler_id=?,handler_run_id=?,lease_generation=? WHERE entry_id=? AND handler_id=? AND lease_generation=?`,
+		successor.ID, successor.RunID, newGeneration, entryID, oldHandlerID, oldGeneration)
+	return err
+}
+
 const handlerArmAssignmentCols = `entry_id,item_id,lease_generation,policy_revision,draw_hex,drawn_arm,arm,fallback,fallback_reason,skipped_json,handler_id,handler_run_id,handler_digest,policy_digest,leased_at,finished_at`
 
 type armAssignmentRow struct {
@@ -1989,7 +1999,14 @@ func (c *handlerNeedContext) offlineHandlerFix(ctx context.Context, q queryRower
 			return "", "", err
 		}
 		if refusal := busy.refusal(api.HandlerRotationTriggerOwner); refusal != nil {
-			return fmt.Sprintf("%s is the primary, and its rotation (%s) is refused until this clears: %s.", shown, rotate, provisionText(refusal.Detail)), "", nil
+			// No operator command clears a busy primary. The host runner
+			// replaces it once it is confirmed dead and silent (owner order
+			// #28057), so the reason says when, or that this is off.
+			auto, err := c.deadPrimaryText(ctx, q, task, h)
+			if err != nil {
+				return "", "", err
+			}
+			return fmt.Sprintf("%s is the primary, and its rotation (%s) is refused until this clears: %s. %s", shown, rotate, provisionText(refusal.Detail), auto), "", nil
 		}
 		return fmt.Sprintf("an operator can rotate %s, the primary, to a successor.", shown), rotate, nil
 	}
@@ -2004,6 +2021,37 @@ func (c *handlerNeedContext) offlineHandlerFix(ctx context.Context, q queryRower
 		name = h.AgentID
 	}
 	return fmt.Sprintf("an operator can retire %s so that it stops counting and one can be added.", shown), fmt.Sprintf("tt retire --task %s %s", task, name), nil
+}
+
+// deadPrimaryText says what the product does about an offline, busy primary:
+// the automatic replacement and how long the run has been silent, or that the
+// replacement is off and the command that turns it on.
+func (c *handlerNeedContext) deadPrimaryText(ctx context.Context, q queryRower, task string, h api.HandlerArmHandler) (string, error) {
+	policy, err := loadHandlerRotationPolicy(ctx, q, task)
+	if err != nil {
+		return "", err
+	}
+	if policy.DeadSilenceMinutes <= 0 {
+		return fmt.Sprintf("Automatic replacement of a dead primary is off (tt handler policy set --task %s --revision %d --dead-silence-minutes N).", task, policy.Revision), nil
+	}
+	var host string
+	if err := q.QueryRowContext(ctx, `SELECT host FROM agents WHERE task_id=? AND id=?`, task, h.AgentID).Scan(&host); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	silent := "no activity recorded from it yet"
+	last, ok, err := handlerLastActivity(ctx, q, task, api.Agent{ID: h.AgentID, RunID: h.RunID})
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		minutes := int64(c.now.Sub(last) / time.Minute)
+		if minutes < 0 {
+			minutes = 0
+		}
+		silent = fmt.Sprintf("silent %d so far", minutes)
+	}
+	return fmt.Sprintf("The host runner on %s replaces it automatically once its process and session are confirmed gone there and it has been silent for %d minutes (%s).",
+		provisionText(host), policy.DeadSilenceMinutes, silent), nil
 }
 
 // offlineHandlerNames lists offline handlers in lease order: "a is offline",

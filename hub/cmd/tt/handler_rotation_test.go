@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -752,28 +753,6 @@ func TestHandlerRotationRunnerQuietWhenTemplateCurrentAndResumesInterruptedRotat
 	}
 }
 
-func TestHandlerRotationRelayTickNeedsLocalHandlerSession(t *testing.T) {
-	f := newRotationCLI(t, "")
-	ctx := context.Background()
-	if runs, err := hostRunsHandler(ctx, f.c.Base); err != nil || !runs {
-		t.Fatalf("the fixture handler session: %v %v", runs, err)
-	}
-	if runs, err := hostRunsHandler(ctx, unreachableHub(t)); err != nil || runs {
-		t.Fatalf("another hub's handler: %v %v", runs, err)
-	}
-	if _, err := startupTmux(ctx, "kill-server"); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(spawn.EnvHub, f.c.Base)
-	before := f.dueCalls.Load()
-	if err := relayHandlerRotationTick(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if f.dueCalls.Load() != before {
-		t.Fatal("the relay asked the hub although no handler session runs here")
-	}
-}
-
 func TestHandlerRotationRunnerSpacesDueRequestsWhileEnabled(t *testing.T) {
 	f := newRotationCLI(t, handlerTemplateDigest("handler assignment"))
 	now := time.Now()
@@ -1118,5 +1097,586 @@ func TestHandlerRotateAuthorizationFlags(t *testing.T) {
 	}
 	if _, err := os.Stat(handlerSpecPath(srv.URL, task)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a usage error saved the launch spec: %v", err)
+	}
+}
+
+// Dead primary rotation on the host runner (wi_b863e669073858f4, owner order
+// #28057). The death probe is injected: these tests read no process and no
+// tmux listing to decide a death, and rotate only the fixture's fake handler.
+
+// deadProbe is a scripted death probe: one answer per call, the last repeated.
+type deadProbe struct {
+	f       *rotationCLI
+	answers []string
+	calls   int
+	agents  []api.Agent
+	// before runs ahead of answer n (from 0), for a change between probes.
+	before map[int]func()
+}
+
+func (p *deadProbe) probe(_ context.Context, hub string, a api.Agent) (string, string, *api.HandlerDeathEvidence) {
+	if fn := p.before[p.calls]; fn != nil {
+		fn()
+	}
+	answer := p.answers[min(p.calls, len(p.answers)-1)]
+	p.calls++
+	p.agents = append(p.agents, a)
+	if hub != p.f.c.Base || answer != handlerProbeGone {
+		return answer, "scripted " + answer, nil
+	}
+	return answer, "scripted gone", &api.HandlerDeathEvidence{Host: "fixture", AgentID: a.ID, RunID: a.RunID, ObservedAt: time.Now().UTC(), SessionName: a.Session,
+		SessionState: api.HandlerDeathStateGone, PID: 4242, ProcessStarted: "Wed Oct  7 06:00:00 2026", ProcessState: api.HandlerDeathStateGone}
+}
+
+// deadRotationCLI is a fixture whose old handler the hub last heard from
+// `silent` ago, recorded as working: offline and busy. Its template is
+// current and no limit is reached, so only the dead primary branch can act.
+func deadRotationCLI(t *testing.T, silent time.Duration, answers ...string) (*rotationCLI, *deadProbe) {
+	t.Helper()
+	f := newRotationCLI(t, handlerTemplateDigest("handler assignment"))
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	f.lastHeard(t, silent)
+	p := &deadProbe{f: f, answers: answers, before: map[int]func(){}}
+	f.deps.probe = p.probe
+	return f, p
+}
+
+// lastHeard sets everything the hub recorded from the old run to `ago`.
+func (f *rotationCLI) lastHeard(t *testing.T, ago time.Duration) {
+	t.Helper()
+	at := time.Now().UTC().Add(-ago).Format(time.RFC3339Nano)
+	db := f.db(t)
+	if _, err := db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, at, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE agent_activity SET state='working',observed_at=?,payload='{"state":"working"}' WHERE agent_id=? AND run_id=?`, at, f.old.ID, f.old.RunID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *rotationCLI) rotations(t *testing.T) []api.HandlerRotation {
+	t.Helper()
+	rotations, err := f.c.ListHandlerRotations(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rotations
+}
+
+func (f *rotationCLI) journalExists() bool {
+	_, err := os.Stat(handlerRotationJournalPath(f.c.Base, f.task.ID))
+	return err == nil
+}
+
+func (f *rotationCLI) subjects(t *testing.T, subject string) int {
+	t.Helper()
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == subject {
+			n++
+		}
+	}
+	return n
+}
+
+// T12: the probe says gone twice. The prepare carries the first evidence, one
+// successor is spawned, the commit carries a second, later observation, and
+// the journal is removed.
+func TestHandlerDeathRunnerRotatesWhenProbeSaysGone(t *testing.T) {
+	f, p := deadRotationCLI(t, 11*time.Minute, handlerProbeGone)
+	ctx := context.Background()
+	held := f.request(t, f.old.Name, "Fixture request held by the dead handler")
+	f.lastHeard(t, 11*time.Minute)
+	f.tick(t, f.runner())
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || p.calls != 2 || f.spawns != 1 || f.actions.Load() != 2 {
+		t.Fatalf("rotations=%d probes=%d spawns=%d actions=%d", len(rotations), p.calls, f.spawns, f.actions.Load())
+	}
+	r := rotations[0]
+	if r.State != api.HandlerRotationCommitted || r.Reason != api.HandlerRotationReasonDeadPrimary || r.Trigger != api.HandlerRotationTriggerRunner || r.DeathEvidence == nil ||
+		r.CommitDeathEvidence == nil || !r.CommitDeathEvidence.ObservedAt.After(r.DeathEvidence.ObservedAt) || r.DeathEvidence.AgentID != f.old.ID || r.DeathEvidence.RunID != f.old.RunID ||
+		r.Receipt == nil || r.Receipt.Reissued != 1 || r.Handoff == nil || r.Handoff.InFlight == nil || r.Handoff.InFlight.ActivityState != "working" || r.Handoff.Reissued[0].OldMessageSeq != held.Seq {
+		t.Fatalf("rotation: %+v", r)
+	}
+	// Both probes were asked about the old handler's exact run.
+	for _, a := range p.agents {
+		if a.ID != f.old.ID || a.RunID != f.old.RunID {
+			t.Fatalf("probed %s / %s", a.ID, a.RunID)
+		}
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != r.SuccessorAgentID || detail.Task.HandlerRevision != 2 {
+		t.Fatalf("primary: %+v %v", detail.Task, err)
+	}
+	if f.journalExists() {
+		t.Fatal("the journal was left behind")
+	}
+	if n := f.subjects(t, "A dead primary database handler was replaced automatically"); n != 2 {
+		t.Fatalf("dead primary notices: %d", n)
+	}
+	// Further ticks find nothing to do.
+	f.tick(t, f.runner())
+	if len(f.rotations(t)) != 1 || f.spawns != 1 || p.calls != 2 {
+		t.Fatalf("a later tick acted again: rotations=%d spawns=%d probes=%d", len(f.rotations(t)), f.spawns, p.calls)
+	}
+}
+
+// T13, T14: an alive or unknown probe sends the hub no rotation request and
+// spawns nothing, tick after tick.
+func TestHandlerDeathRunnerSendsNothingUnlessGone(t *testing.T) {
+	for _, answer := range []string{handlerProbeAlive, handlerProbeUnknown} {
+		t.Run(answer, func(t *testing.T) {
+			f, p := deadRotationCLI(t, 11*time.Minute, answer)
+			for i := 0; i < 3; i++ {
+				f.tick(t, f.runner())
+			}
+			if p.calls != 3 || f.actions.Load() != 0 || f.spawns != 0 || len(f.rotations(t)) != 0 || f.journalExists() {
+				t.Fatalf("probe %s: probes=%d actions=%d spawns=%d rotations=%d", answer, p.calls, f.actions.Load(), f.spawns, len(f.rotations(t)))
+			}
+			if open, total := f.handlers(t); open != 1 || total != 1 {
+				t.Fatalf("handlers: %d open of %d", open, total)
+			}
+		})
+	}
+	// A host with no probe confirms nothing either.
+	f, _ := deadRotationCLI(t, 11*time.Minute, handlerProbeGone)
+	f.deps.probe = nil
+	f.tick(t, f.runner())
+	if f.actions.Load() != 0 || f.spawns != 0 {
+		t.Fatalf("no probe: actions=%d spawns=%d", f.actions.Load(), f.spawns)
+	}
+}
+
+// T15: until the hub reports the silence met, the host is not probed at all.
+func TestHandlerDeathRunnerDoesNotProbeBeforeSilence(t *testing.T) {
+	f, p := deadRotationCLI(t, 5*time.Minute, handlerProbeGone)
+	list, err := f.c.HandlerRotationsDue(context.Background(), "fixture", "")
+	if err != nil || len(list.Entries) != 1 || !list.Entries[0].DeadCandidate || list.Entries[0].SilenceMet || list.Entries[0].Online {
+		t.Fatalf("due: %+v %v", list, err)
+	}
+	for i := 0; i < 3; i++ {
+		f.tick(t, f.runner())
+	}
+	if p.calls != 0 || f.actions.Load() != 0 || f.spawns != 0 {
+		t.Fatalf("5 minutes of silence: probes=%d actions=%d spawns=%d", p.calls, f.actions.Load(), f.spawns)
+	}
+	// An online handler, however busy, is never probed.
+	f.live(t, f.old)
+	f.activity(t, f.old, "working", "Bash", 0)
+	f.tick(t, f.runner())
+	if p.calls != 0 || f.actions.Load() != 0 {
+		t.Fatalf("online busy handler: probes=%d actions=%d", p.calls, f.actions.Load())
+	}
+}
+
+// T16: the second look decides. A second probe that is not gone, or a hub
+// that saw activity after prepare, aborts the rotation: the successor is
+// closed and cleaned up, the journal is removed, the old handler stays primary.
+func TestHandlerDeathRunnerAbortsWhenSecondProbeIsNotGone(t *testing.T) {
+	for _, second := range []string{handlerProbeAlive, handlerProbeUnknown, "hub-heartbeat"} {
+		t.Run(second, func(t *testing.T) {
+			answers := []string{handlerProbeGone, second}
+			if second == "hub-heartbeat" {
+				answers = []string{handlerProbeGone}
+			}
+			f, p := deadRotationCLI(t, 11*time.Minute, answers...)
+			if second == "hub-heartbeat" {
+				// The host still says gone, but the hub heard from the run.
+				p.before[1] = func() {
+					if _, err := f.db(t).Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), f.old.ID); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			err := f.runner().tick(ctx, f.e, f.c, "fixture")
+			if !errors.Is(err, errDeathNotConfirmed) {
+				t.Fatalf("tick: %v", err)
+			}
+			rotations := f.rotations(t)
+			wantActions := int32(2) // prepare, abort
+			if second == "hub-heartbeat" {
+				wantActions = 3 // prepare, refused commit, abort
+			}
+			if len(rotations) != 1 || rotations[0].State != api.HandlerRotationAborted || rotations[0].CommitDeathEvidence != nil || p.calls != 2 || f.spawns != 1 || f.actions.Load() != wantActions {
+				t.Fatalf("rotations=%+v probes=%d spawns=%d actions=%d", rotations, p.calls, f.spawns, f.actions.Load())
+			}
+			if f.journalExists() {
+				t.Fatal("the journal was left behind")
+			}
+			detail, err := f.c.GetTask(context.Background(), f.task.ID)
+			if err != nil || detail.Task.PrimaryHandlerID != "" || detail.Task.HandlerRevision != 1 {
+				t.Fatalf("task: %+v %v", detail.Task, err)
+			}
+			successor, err := f.c.GetAgent(context.Background(), f.task.ID, rotations[0].SuccessorAgentID)
+			old, _ := f.c.GetAgent(context.Background(), f.task.ID, f.old.ID)
+			if err != nil || successor.Status != api.AgentClosed || !successor.CleanupDone || old.Status == api.AgentClosed {
+				t.Fatalf("successor %+v old %s %v", successor, old.Status, err)
+			}
+			if open, total := f.handlers(t); open != 1 || total != 2 {
+				t.Fatalf("handlers: %d open of %d", open, total)
+			}
+			if n := f.subjects(t, "A dead primary database handler was replaced automatically"); n != 0 {
+				t.Fatalf("an aborted rotation posted %d notice(s)", n)
+			}
+		})
+	}
+}
+
+// relayTickDueCalls runs the relay's own rotation tick, with the fixture's
+// dependencies in place of the production ones, and counts its due requests.
+func relayTickDueCalls(t *testing.T, f *rotationCLI) int32 {
+	t.Helper()
+	saved, quiet := hostRotationRunner.deps, hostRotationRunner.quietTil
+	hostRotationRunner.deps, hostRotationRunner.quietTil = f.deps, time.Time{}
+	defer func() { hostRotationRunner.deps, hostRotationRunner.quietTil = saved, quiet }()
+	before := f.dueCalls.Load()
+	if err := relayHandlerRotationTick(context.Background()); err != nil {
+		t.Logf("relay tick: %v", err)
+	}
+	return f.dueCalls.Load() - before
+}
+
+// T17: a host whose handler session is gone still ticks while it keeps a
+// trace of a handler for this hub (a saved launch spec, a rotation journal or
+// a handler's session receipt), and makes no hub request with none of them.
+func TestHandlerDeathRelayTickRunsOnHandlerTrace(t *testing.T) {
+	f := newRotationCLI(t, handlerTemplateDigest("handler assignment"))
+	ctx := context.Background()
+	t.Setenv(spawn.EnvHub, f.c.Base)
+	if runs, err := hostRunsHandler(ctx, f.c.Base); err != nil || !runs {
+		t.Fatalf("the fixture handler session: %v %v", runs, err)
+	}
+	if runs, err := hostRunsHandler(ctx, unreachableHub(t)); err != nil || runs {
+		t.Fatalf("another hub's handler: %v %v", runs, err)
+	}
+	// The fixture's handler session is gone; its ownership receipt remains.
+	if _, err := startupTmux(ctx, "kill-server"); err != nil {
+		t.Fatal(err)
+	}
+	if runs, err := hostRunsHandler(ctx, f.c.Base); err != nil || runs {
+		t.Fatalf("after the session died: %v %v", runs, err)
+	}
+	receipts, err := filepath.Glob(filepath.Join(relayDir(), "*.session.json"))
+	if err != nil || len(receipts) == 0 || !hostHasHandlerTrace(f.c.Base) || hostHasHandlerTrace(unreachableHub(t)) {
+		t.Fatalf("handler session receipt: %v %v", receipts, err)
+	}
+	if n := relayTickDueCalls(t, f); n != 1 {
+		t.Fatalf("with a handler session receipt the tick made %d due requests", n)
+	}
+	// With no trace at all the tick asks the hub nothing.
+	var kept []byte
+	for _, path := range receipts {
+		if kept, err = os.ReadFile(path); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hostHasHandlerTrace(f.c.Base) {
+		t.Fatal("a trace remains")
+	}
+	if n := relayTickDueCalls(t, f); n != 0 {
+		t.Fatalf("with no trace the tick made %d due requests", n)
+	}
+	// A receipt of a session that is not a handler's is no trace.
+	var other ownedSession
+	if err = json.Unmarshal(kept, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Name, other.Role = "builder", ""
+	if err = writePrivateJSON(filepath.Join(relayDir(), "other.session.json"), other); err != nil {
+		t.Fatal(err)
+	}
+	if hostHasHandlerTrace(f.c.Base) || relayTickDueCalls(t, f) != 0 {
+		t.Fatal("a non-handler session receipt counted as a handler trace")
+	}
+	// A saved launch spec alone is a trace; one for another hub is not.
+	foreign := f.spec
+	foreign.Hub = unreachableHub(t)
+	if err = writePrivateJSON(handlerSpecPath(foreign.Hub, f.task.ID), foreign); err != nil {
+		t.Fatal(err)
+	}
+	if hostHasHandlerTrace(f.c.Base) {
+		t.Fatal("another hub's spec counted")
+	}
+	if err = saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	if n := relayTickDueCalls(t, f); n != 1 {
+		t.Fatalf("with a saved spec the tick made %d due requests", n)
+	}
+	if err = os.Remove(handlerSpecPath(f.c.Base, f.task.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if n := relayTickDueCalls(t, f); n != 0 {
+		t.Fatalf("after the spec was removed the tick made %d due requests", n)
+	}
+	// A rotation journal alone is a trace.
+	journal := handlerRotationJournal{Version: 1, Hub: f.c.Base, Task: "tsk_0000000000000000", Phase: rotationPhasePreparing}
+	if err = writePrivateJSON(handlerRotationJournalPath(f.c.Base, journal.Task), journal); err != nil {
+		t.Fatal(err)
+	}
+	if n := relayTickDueCalls(t, f); n != 1 {
+		t.Fatalf("with a rotation journal the tick made %d due requests", n)
+	}
+	if f.spawns != 0 || f.actions.Load() != 0 {
+		t.Fatalf("the relay tick rotated: spawns=%d actions=%d", f.spawns, f.actions.Load())
+	}
+}
+
+// T18: the hub now lists a project for a dead primary even with its limit
+// policy off, so the runner itself must not act on a limit there.
+func TestHandlerDeathRunnerIgnoresLimitsWhenPolicyDisabled(t *testing.T) {
+	// A hub answer that lists an idle handler with a limit due under a
+	// disabled limit policy: nothing is rotated.
+	f := newRotationCLI(t, "")
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	var posts atomic.Int32
+	listed := api.HandlerRotationDueList{Entries: []api.HandlerRotationDue{{TaskID: f.task.ID, HandlerRevision: 1, Agent: f.old, Idle: true, Online: true, ActivityState: "idle",
+		Policy:     api.HandlerRotationPolicy{TaskID: f.task.ID, Enabled: false, MaxItems: 1, OnTemplateChange: true, DeadSilenceMinutes: 10},
+		DueReasons: []string{api.HandlerRotationReasonItems}, FinishedItems: 5}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/handler-rotations/due") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(listed)
+			return
+		}
+		// Anything else is the start of a rotation.
+		posts.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+	fake, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := f.spec
+	spec.Hub = fake.Base
+	if err = saveHandlerSpec(spec); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err = f.runner().tick(ctx, env{hub: fake.Base}, fake, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 0 || f.spawns != 0 {
+		t.Fatalf("disabled limit policy: rotation requests=%d spawns=%d", posts.Load(), f.spawns)
+	}
+	// The same answer with the policy enabled does act, so the guard is what
+	// held it back.
+	listed.Entries[0].Policy.Enabled = true
+	_ = f.runner().tick(ctx, env{hub: fake.Base}, fake, "fixture")
+	if posts.Load() == 0 {
+		t.Fatal("the enabled control case made no request")
+	}
+	// Against the real hub: limits reached, limit policy off, and a dead
+	// candidate that is not silent yet. Nothing rotates for the limits.
+	f.finishedLeases(t, 2)
+	setRotationPolicy(t, f, api.HandlerRotationPolicyRequest{Enabled: false, MaxItems: 1, OnTemplateChange: true})
+	f.lastHeard(t, 5*time.Minute)
+	p := &deadProbe{f: f, answers: []string{handlerProbeGone}}
+	f.deps.probe = p.probe
+	list, err := f.c.HandlerRotationsDue(context.Background(), "fixture", "")
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Policy.Enabled || len(list.Entries[0].DueReasons) != 0 || !list.Entries[0].DeadCandidate {
+		t.Fatalf("due: %+v %v", list, err)
+	}
+	for i := 0; i < 3; i++ {
+		f.tick(t, f.runner())
+	}
+	if f.actions.Load() != 0 || f.spawns != 0 || p.calls != 0 {
+		t.Fatalf("limit policy off: actions=%d spawns=%d probes=%d", f.actions.Load(), f.spawns, p.calls)
+	}
+}
+
+// T19: the production probe, with the receipt reader, the session listing and
+// the PID check injected. Every unreadable fact is unknown; a present session
+// or process is alive; gone needs all three absent.
+func TestHandlerDeathProbe(t *testing.T) {
+	const hub = "http://hub.fixture"
+	a := api.Agent{ID: "agt_00000000000000aa", TaskID: "tsk_00000000000000aa", RunID: "run_00000000000000aa", Session: "tt-handler-aa", Name: "db-handler"}
+	exited := time.Date(2026, 10, 7, 13, 0, 0, 0, time.UTC)
+	base := runtimeProcessReceipt{Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID, Session: a.Session, Socket: "tt-socket", PID: 4242, Started: "start-4242", PanePID: 4200,
+		PaneStarted: "start-4200", SessionID: "$7", SessionCreated: "1700000000", ExitedAt: exited}
+	observed := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	type setup struct {
+		receipt    runtimeProcessReceipt
+		receiptErr error
+		sessions   []ownedSession
+		listErr    error
+		pids       map[int]any // true: alive; error: check failed; absent: gone
+		socket     string
+	}
+	cases := []struct {
+		name   string
+		change func(*setup)
+		want   string
+	}{
+		{"all absent", func(*setup) {}, handlerProbeGone},
+		{"no pane recorded", func(s *setup) { s.receipt.PanePID, s.receipt.PaneStarted = 0, "" }, handlerProbeGone},
+		{"other sessions only", func(s *setup) {
+			s.sessions = []ownedSession{{ID: "$9", Created: "1", Name: "tt-handler-bb", Hub: hub, Task: a.TaskID, Agent: "agt_00000000000000bb", Run: "run_00000000000000bb"}}
+		}, handlerProbeGone},
+		{"missing receipt", func(s *setup) { s.receiptErr = os.ErrNotExist }, handlerProbeUnknown},
+		{"receipt of another run", func(s *setup) { s.receipt.Run = "run_00000000000000bb" }, handlerProbeUnknown},
+		{"receipt of another hub", func(s *setup) { s.receipt.Hub = "http://other" }, handlerProbeUnknown},
+		{"receipt of another project", func(s *setup) { s.receipt.Task = "tsk_00000000000000bb" }, handlerProbeUnknown},
+		{"receipt of another agent", func(s *setup) { s.receipt.Agent = "agt_00000000000000bb" }, handlerProbeUnknown},
+		{"receipt without a PID", func(s *setup) { s.receipt.PID = 0 }, handlerProbeUnknown},
+		{"receipt without a start identity", func(s *setup) { s.receipt.Started = "" }, handlerProbeUnknown},
+		{"socket mismatch", func(s *setup) { s.socket = "another-socket" }, handlerProbeUnknown},
+		{"lister error", func(s *setup) { s.listErr = errors.New("cannot verify tmux session identities") }, handlerProbeUnknown},
+		{"session present by agent, another run", func(s *setup) {
+			s.sessions = []ownedSession{{ID: "$8", Created: "2", Name: "renamed", Hub: hub, Task: a.TaskID, Agent: a.ID, Run: "run_00000000000000cc"}}
+		}, handlerProbeAlive},
+		{"session present by name", func(s *setup) { s.sessions = []ownedSession{{ID: "$8", Created: "2", Name: a.Session}} }, handlerProbeAlive},
+		{"runtime PID alive", func(s *setup) { s.pids[4242] = true }, handlerProbeAlive},
+		{"pane PID alive", func(s *setup) { s.pids[4200] = true }, handlerProbeAlive},
+		{"runtime PID check error", func(s *setup) { s.pids[4242] = errors.New("runtime pid reused or creation identity changed") }, handlerProbeUnknown},
+		{"pane PID check error", func(s *setup) { s.pids[4200] = errors.New("operation not permitted") }, handlerProbeUnknown},
+		{"pane PID without identity", func(s *setup) { s.receipt.PaneStarted = "" }, handlerProbeUnknown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := setup{receipt: base, pids: map[int]any{}, socket: "tt-socket"}
+			c.change(&s)
+			var checked []int
+			p := deathProbe{
+				receipt: func(h, agent, run string) (runtimeProcessReceipt, error) {
+					if h != hub || agent != a.ID || run != a.RunID {
+						t.Fatalf("receipt asked for %s %s %s", h, agent, run)
+					}
+					return s.receipt, s.receiptErr
+				},
+				sessions: func(context.Context) ([]ownedSession, error) { return s.sessions, s.listErr },
+				pid: func(pid int, started string) (bool, error) {
+					checked = append(checked, pid)
+					if want := map[int]string{4242: "start-4242", 4200: "start-4200"}[pid]; started != want {
+						t.Fatalf("pid %d checked with identity %q", pid, started)
+					}
+					switch v := s.pids[pid].(type) {
+					case bool:
+						return v, nil
+					case error:
+						return false, v
+					}
+					return false, nil
+				},
+				socket: func() string { return s.socket }, host: func() string { return "mini" }, now: func() time.Time { return observed },
+			}
+			state, detail, ev := p.probe(context.Background(), hub+"/", a)
+			if state != c.want || detail == "" || (ev != nil) != (c.want == handlerProbeGone) {
+				t.Fatalf("state %s (%s) evidence %+v, want %s", state, detail, ev, c.want)
+			}
+			if c.want != handlerProbeGone {
+				return
+			}
+			want := api.HandlerDeathEvidence{Host: "mini", AgentID: a.ID, RunID: a.RunID, ObservedAt: observed, SessionName: a.Session, SessionID: "$7", SessionCreated: "1700000000",
+				SessionState: api.HandlerDeathStateGone, PID: 4242, PanePID: s.receipt.PanePID, ProcessStarted: "start-4242", ProcessState: api.HandlerDeathStateGone, ExitedAt: &exited}
+			if ev.ExitedAt == nil || !ev.ExitedAt.Equal(exited) {
+				t.Fatalf("exit record: %+v", ev.ExitedAt)
+			}
+			got := *ev
+			got.ExitedAt = want.ExitedAt
+			if got != want {
+				t.Fatalf("evidence %+v\n    want %+v", got, want)
+			}
+			if wantChecks := 1 + min(s.receipt.PanePID, 1); len(checked) != wantChecks {
+				t.Fatalf("PID checks: %v", checked)
+			}
+		})
+	}
+}
+
+// T20: a dead candidate on a host with no saved launch spec gets one owner
+// notice per run; the host does not probe and rotates nothing.
+func TestHandlerDeathRunnerWithoutSpecNotifiesOnce(t *testing.T) {
+	f, p := deadRotationCLI(t, 11*time.Minute, handlerProbeGone)
+	if err := os.Remove(handlerSpecPath(f.c.Base, f.task.ID)); err != nil {
+		t.Fatal(err)
+	}
+	const subject = "An offline busy primary handler cannot be replaced because this host has no saved launch spec"
+	r := f.runner()
+	for i := 0; i < 3; i++ {
+		f.tick(t, r)
+	}
+	f.tick(t, f.runner()) // a relay restart keeps the notice keyed to the run
+	if n := f.subjects(t, subject); n != 1 {
+		t.Fatalf("owner notices: %d", n)
+	}
+	if p.calls != 0 || f.actions.Load() != 0 || f.spawns != 0 {
+		t.Fatalf("no saved spec: probes=%d actions=%d spawns=%d", p.calls, f.actions.Load(), f.spawns)
+	}
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range messages {
+		if m.Envelope == nil || m.Envelope.Subject != subject {
+			continue
+		}
+		for _, part := range []string{f.old.Name + " (" + f.old.ID + " / " + f.old.RunID + ")", "silent for the 10 minute(s)", "tt handler spec --task " + f.task.ID,
+			"tt handler policy set --task " + f.task.ID + " --revision 0 --dead-silence-minutes 0"} {
+			if !strings.Contains(m.Envelope.Body.Text, part) {
+				t.Fatalf("notice lacks %q: %s", part, m.Envelope.Body.Text)
+			}
+		}
+	}
+	// With the spec saved the same candidate is probed and replaced.
+	if err = saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	f.tick(t, f.runner())
+	if rotations := f.rotations(t); len(rotations) != 1 || rotations[0].State != api.HandlerRotationCommitted || p.calls != 2 {
+		t.Fatalf("after the spec was saved: %+v probes=%d", rotations, p.calls)
+	}
+}
+
+// The policy command sets and prints the silence, and an omitted flag keeps it.
+func TestHandlerDeathSilencePolicyCommand(t *testing.T) {
+	f := newRotationCLI(t, "")
+	ctx := context.Background()
+	run := func(args ...string) error {
+		return cmdHandlerPolicy(f.e, append(args, "--task", f.task.ID))
+	}
+	if p, err := f.c.HandlerRotationPolicy(ctx, f.task.ID); err != nil || p.DeadSilenceMinutes != 10 {
+		t.Fatalf("default: %+v %v", p, err)
+	}
+	if err := run("set", "--revision", "0", "--dead-silence-minutes", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := f.c.HandlerRotationPolicy(ctx, f.task.ID); p.DeadSilenceMinutes != 0 || !p.Enabled || p.MaxItems != api.DefaultHandlerRotationMaxItems || p.Revision != 1 {
+		t.Fatalf("off: %+v", p)
+	}
+	if err := run("set", "--revision", "1", "--max-items", "4"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := f.c.HandlerRotationPolicy(ctx, f.task.ID); p.DeadSilenceMinutes != 0 || p.MaxItems != 4 {
+		t.Fatalf("an omitted flag changed the silence: %+v", p)
+	}
+	if err := run("set", "--revision", "2", "--dead-silence-minutes", "25"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := f.c.HandlerRotationPolicy(ctx, f.task.ID); p.DeadSilenceMinutes != 25 || p.MaxItems != 4 {
+		t.Fatalf("25 minutes: %+v", p)
+	}
+	for _, bad := range []string{"-1", "1441"} {
+		if err := run("set", "--revision", "3", "--dead-silence-minutes", bad); err == nil {
+			t.Fatalf("--dead-silence-minutes %s was accepted", bad)
+		}
+	}
+	if err := run("get"); err != nil {
+		t.Fatal(err)
 	}
 }

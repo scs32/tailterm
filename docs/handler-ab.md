@@ -232,7 +232,8 @@ those handlers is offline (the hub has not heard from it for 90 seconds).
 | Every handler is online (busy, or held by an open rotation) | `Waiting for a free handler of arm S`, unchanged; the counts are in the entry's handler need only |
 | One is offline | `Waiting for a free handler of arm S: 1 of 2 leased, limit 2; the limit already has its handlers, and NAME is offline. The hub does not restart a handler; an operator can retire NAME so that it stops counting and one can be added. Fix: tt retire --task TSK NAME` |
 | The offline one is the primary | the same up to `…restart a handler;`, then ` an operator can rotate NAME, the primary, to a successor. Fix: tt handler rotate --task TSK` |
-| The offline primary cannot be rotated now | the same up to `…restart a handler;`, then ` NAME is the primary, and its rotation (tt handler rotate --task TSK) is refused until this clears: DETAIL.` with no `Fix:`; DETAIL is the refusal `tt handler rotate` would give, such as `the handler run holds 1 live team lease(s), first ENTRY` |
+| The offline primary cannot be rotated now | the same up to `…restart a handler;`, then ` NAME is the primary, and its rotation (tt handler rotate --task TSK) is refused until this clears: DETAIL. The host runner on HOST replaces it automatically once its process and session are confirmed gone there and it has been silent for N minutes (silent M so far).` with no `Fix:`. DETAIL is the refusal `tt handler rotate` would give, such as `the handler run holds 1 live team lease(s), first ENTRY`; N is the project's silence and M the whole minutes since the run's last recorded activity. A run with no recorded activity ends `(no activity recorded from it yet).` instead |
+| The same, with the automatic replacement off | the same up to `…until this clears: DETAIL.`, then ` Automatic replacement of a dead primary is off (tt handler policy set --task TSK --revision R --dead-silence-minutes N).` with no `Fix:`; R is the policy's current revision |
 | The offline one is the project's last available handler (and not the primary) | the same up to `…restart a handler;`, then ` an operator can add another handler; NAME is the project's last available one and cannot be retired until then. Fix: set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project TSK` |
 | Several are offline | `…, and NAME1 and NAME2 are offline. …` (`NAME1, NAME2 and NAME3` for more), in lease order; the recovery and the fix are for one of them: a handler no active team leases before a leased one, and the primary last |
 
@@ -256,6 +257,18 @@ here, and the listing writes nothing. The operator's recovery is:
   check here: when it would refuse, the reason gives the refusal and no fix,
   because no command the hub accepts frees the place yet. The lease clears
   when its team finishes or the owner releases its failed entry.
+
+  A primary that died while busy never clears that refusal by itself. The
+  host runner replaces it: once the handler's own host confirms its process
+  and session gone and the hub has recorded nothing from the run for the
+  project's silence (10 minutes by default), the runner rotates it and its
+  leases move to the successor. See
+  [A dead primary](handler-rotation.md#a-dead-primary). The reason says so,
+  with the host, the minutes and how long the run has been silent. Turn that
+  replacement off for a project with
+  `tt handler policy set --task TSK --revision R --dead-silence-minutes 0`;
+  the reason then names the command that turns it on, and the entry waits for
+  the owner.
 
 - **Another handler first** when the offline one is the project's last
   available handler (no other handler is open and not retired). The hub
@@ -323,6 +336,12 @@ before spawning in the same case when the saved spec's `--model` or
 `--reasoning` differs from the old run's recorded values. Without a policy, or
 for a run of no arm, rotation is unchanged. An arm that does not rotate grows context; the
 report shows rotations and mean input tokens per request per arm.
+
+A [dead primary rotation](handler-rotation.md#a-dead-primary) moves the dead
+handler's live leases to the successor, which the check above keeps in the same
+arm. A moved lease keeps its arm assignment: the row takes the successor's
+agent, run and new lease generation, and keeps its draw, arm and handler digest
+as leased. The report then counts that item under the successor.
 
 ## Provider limits
 

@@ -98,7 +98,7 @@ tt handler rotation get ROTATION --task TASK   # handoff snapshot and receipt
 
 tt handler policy get --task TASK
 tt handler policy set --task TASK --revision N [--enabled=BOOL] [--max-items N] \
-  [--max-total-tokens N] [--on-template-change=BOOL]
+  [--max-total-tokens N] [--on-template-change=BOOL] [--dead-silence-minutes N]
 ```
 
 A launch spec accepts only `--run`, `--cwd`, `--prompt`, `--runtime`, `--model`,
@@ -213,8 +213,16 @@ The rotation row, successor and obligations stay as they were.
 | `agent_caller` | The request carries an agent identity. |
 | `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy, or for a run in no arm, a model change is accepted. An [authorized change](#changing-the-primarys-runtime-or-model) skips this check and does not write the policy. |
 
+| `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. |
+| `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
+
 Commit repeats the idle checks. A handler that became busy after prepare gets a
 409, and the rotation stays prepared until a later attempt finds it idle.
+
+These idle checks have one exception, by owner order #28057: a
+[dead primary](#a-dead-primary). No other rotation, and never
+`tt handler rotate` by hand, moves a handler that holds a live lease, has a
+pending tool or is recorded as working.
 
 "Finish an already-started atomic record" has no hub record. Its observable
 signal is the activity monitor's exact-run state and pending tool. Activity
@@ -222,6 +230,150 @@ snapshots are transitions, so a handler that just started a turn can look idle
 for up to the monitor's working window. The owner command treats an unobserved
 (`unknown`) run as idle. The runner requires an observed `idle` or
 `finished_silent` state.
+
+## A dead primary
+
+Bug `wi_b863e669073858f4`, owner order #28057.
+
+A primary that dies while the hub records it as busy keeps that state and its
+leases, so the refusals above never clear and every team waits. The host runner
+replaces such a handler automatically, and only when **both** hold:
+
+1. **Its own host confirms its process and session gone.** Not merely
+   unreachable: a state the host cannot read is not confirmation.
+2. **The hub has recorded no activity from that exact run for the project's
+   silence**, 10 minutes by default.
+
+A busy primary whose process is alive, or whose state cannot be confirmed, is
+never rotated automatically. `tt handler rotate` by hand is unchanged and is
+still refused for a busy primary: the exception exists only for the runner,
+with evidence.
+
+### Turning it off
+
+The silence is the policy field `deadSilenceMinutes`. It is 10 for every
+project, existing and new, and does not depend on `enabled`, which governs only
+the item, token and template limits.
+
+```sh
+tt handler policy get --task TASK                                  # prints dead-silence-minutes
+tt handler policy set --task TASK --revision N --dead-silence-minutes 0    # off
+tt handler policy set --task TASK --revision N --dead-silence-minutes 15   # 1 to 1440
+```
+
+`0` turns the automatic replacement off for the project: the runner no longer
+probes, and the hub refuses a dead primary prepare or commit
+(`death_unconfirmed`). A `policy set` without the flag keeps the saved value.
+With it off, a dead busy primary waits for the owner, as before this change.
+
+### The host's probe
+
+The runner on the handler's host probes only when the hub's due list says the
+primary is a dead candidate (not online, busy, replacement on) and the silence
+is met. The steps run in order and the first that decides wins:
+
+1. Read the wrapper's process receipt for the exact hub, agent and run.
+   Missing, unreadable, naming another hub, project, agent or run, or with no
+   PID or no start identity: **unknown**.
+2. The receipt's tmux socket differs from the runner's: **unknown**.
+3. The tmux session listing cannot be read: **unknown**. Otherwise a session
+   tagged with this agent (any run), or named as the receipt or the roster
+   names the handler's session: **alive**.
+4. The runtime process by PID and start identity: a failed check is
+   **unknown**, including a PID now used by another process; running is
+   **alive**. The same for the pane process when the receipt has one; a pane
+   PID with no start identity is **unknown**.
+5. Otherwise **gone**.
+
+So gone needs three facts read on the handler's own host: its recorded session
+is absent from a readable listing, its runtime process is absent, and its pane
+process is absent. The probe signals and stops nothing. Only gone produces
+evidence; alive and unknown send the hub nothing. An unreachable host sends
+nothing at all, because only that host's runner probes.
+
+A host with no saved launch spec cannot start a successor. It does not probe,
+and posts one board notice per handler run:
+`An offline busy primary handler cannot be replaced because this host has no saved launch spec`.
+
+### What the hub checks itself
+
+The runner sends a prepare with reason `dead_primary`, trigger `runner` and the
+evidence (`deathEvidence`). The hub accepts it only when all of these hold,
+besides the guards every rotation has:
+
+| Check | Refusal |
+| --- | --- |
+| The trigger is `runner`, there is no owner authorization, and evidence is present. Evidence with any other reason is refused too. | 400 |
+| The replacement is on for the project. | `death_unconfirmed` |
+| The evidence names the old handler's recorded host and the primary's exact agent and run. | `death_unconfirmed` |
+| Both states are `gone`, with a PID and a start identity. | `death_unconfirmed` |
+| The observation is at most 2 minutes old and at most 30 seconds ahead of the hub clock. | `death_unconfirmed` |
+| The hub itself has no heartbeat from the run within 90 seconds. | `death_unconfirmed` |
+| The run is busy: the runner's ordinary refusal applies. An idle offline primary takes the ordinary rotation. | `death_unconfirmed` |
+| The silence rule below. | `not_silent` |
+
+The evidence is a claim by a caller that may write rotations, the same trust
+as the runner trigger. The heartbeat and silence checks use only the hub's own
+records and clock, which that claim cannot change.
+
+**Silence.** The run's last recorded activity is the latest of: its wrapper's
+heartbeat (`agents.last_seen_at`), its observed activity
+(`agent_activity.observed_at`), the newest message it sent, and the newest
+work-item revision it saved. Events and broker reminders do not count, because
+other actors write those about the handler. A run with none of the four is not
+silent: no record is not evidence of silence. The hub's clock decides.
+
+### The second look before commit
+
+The successor takes up to two minutes to come online. Before the commit the
+runner probes again and sends that second observation. The commit needs it to
+be valid, fresh and later than the first, the hub still to see no heartbeat,
+the replacement still on, and **no activity recorded from the run since
+prepare**. If the second probe is not gone, or the hub refuses the commit with
+`death_unconfirmed` or `not_silent`, the runner aborts the rotation through the
+ordinary abort: the successor is closed and its session cleaned up, the old
+handler stays primary, and nothing has moved.
+
+### What is handed off
+
+The same two-phase, keyed rotation, journal and abort as any other. In the one
+commit transaction, in addition to what every commit does:
+
+- **Obligations** move as always: every open obligation the dead handler held
+  is re-issued to the successor.
+- **Leases** move. Every team queue entry the dead run holds (`launching`,
+  `running`, or `failed` and not released) takes the successor's agent, run
+  and a new lease generation, in queue order. Leases are never released: a
+  released lease would leave a running team with no handler. The handler
+  identity in an entry's frozen launch plan is rewritten to match, every other
+  byte kept, so the team runner's identity check still passes; a plan that
+  cannot be read or that names a third handler fails the whole commit and
+  nothing moves. The entry's [arm assignment](handler-ab.md#rotation-within-an-arm)
+  follows the lease. `handoff.liveLeases` lists each entry with its old and new
+  generation.
+- **In-flight work is reported, not recovered**, because nothing can be read
+  from a dead process. `handoff.inFlight` has the run's last activity state,
+  its pending tool, its last recorded activity, the silence applied, and
+  `recentWrites`: the work-item revisions that run saved since its oldest open
+  obligation was created (or in the 30 minutes before its last activity when it
+  held none), newest first, at most 50, with a count of any left out. The
+  successor compares each moved request with these before repeating a save.
+
+The old handler is then closed, so the hub's closed-agent checks apply to any
+late write from an orphaned child of the dead run.
+
+### The notice
+
+A committed dead primary rotation posts one notice,
+`A dead primary database handler was replaced automatically`, written in the
+commit transaction so a replay never repeats it. The same text goes once to the successor, in place of
+the ordinary handoff notice, and once to the project's owner helper; with no
+open owner helper that second copy is posted board-wide. It names the dead
+handler, the host's evidence and both observation times, the hub's last
+recorded activity and the silence applied, what was handed off and what is
+only reported, and the command that turns the replacement off. The receipt has
+`noticeSeq`, `ownerNoticeSeq` and `leasesMoved`, and `tt handler rotation get`
+prints the evidence, the moved leases and the in-flight section.
 
 ## Handoff contents
 
@@ -231,7 +383,9 @@ for up to the monitor's working window. The owner command treats an unobserved
   obligation and message on the successor, and the old state and role
 - **pendingScopeConfirmations**: queued team entries whose exact
   item/revision/order has no scope confirmation
-- **liveLeases**: always empty; commit refuses otherwise
+- **liveLeases**: empty, because commit refuses otherwise; a
+  [dead primary](#a-dead-primary) rotation lists the leases it moved
+- **inFlight**: a dead primary rotation only; see above
 - **authoredOpen**: open obligations on other agents for messages the old
   handler authored. Replies to those messages route to the successor.
 - **allocationIntents**: unconsumed allocation intents the old run authored
@@ -259,7 +413,9 @@ The record survives a hub restart.
 
 `handler_rotation_policy` holds `enabled`, `max_items`, `max_total_tokens`,
 `on_template_change` and a revision. A zero limit is off. Rotation fires on
-whichever limit is reached first.
+whichever limit is reached first. It also holds `dead_silence_minutes`, which
+is separate from the limits and from `enabled`; see
+[A dead primary](#a-dead-primary).
 
 Defaults (owner decision #14233, option A): 10 finished leased items, 300M total
 tokens, template change on. Rotation is enabled for projects created after this
@@ -279,7 +435,9 @@ policy set`. A stale revision is refused.
 
 The host relay runs one rotation tick per loop, after the team queue tick and
 under the same request budget and backoff. The tick asks the hub nothing unless
-a `tt-handler-*` session for that hub runs on the host. It then makes one
+a `tt-handler-*` session for that hub runs on the host, or the host keeps a
+trace of one: a saved launch spec, a rotation journal, or a handler's session
+receipt. A host whose handler died therefore keeps ticking. It then makes one
 `GET /v1/handler-rotations/due?host=H&templateDigest=D` request. The relay
 loops every 3 seconds, so the tick spaces these requests: at most one a minute
 while a listed policy is enabled, and an empty answer is cached for 5 minutes.
@@ -293,7 +451,11 @@ For each listed project:
   relay restart does not repeat it. No spawn. Without a spec the host does not
   know the handler's prompt, so it reports a template change only for a legacy
   run with no recorded digest.
-- Policy disabled: the project is not listed, so no rotation request is made.
+- A [dead candidate](#a-dead-primary) whose silence is met: probe this host
+  and, only on gone, rotate with reason `dead_primary`. It is handled before
+  the limits and never by them.
+- Policy disabled: the project is listed only while its primary is a dead
+  candidate, and the runner acts on no limit for it.
 
 ## API
 
@@ -302,7 +464,7 @@ For each listed project:
 | `GET/PUT /v1/tasks/{id}/handler-rotation/policy` | Read, or save with `expectedRevision` |
 | `POST /v1/tasks/{id}/handler-rotations` | `operation` `prepare`, `commit` or `abort`, keyed by `requestId` |
 | `GET /v1/tasks/{id}/handler-rotations[/{rid}]` | List, or read one |
-| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list |
+| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list, with `online`, `lastActivityAt`, `deadCandidate` and `silenceMet` per primary |
 
 Reusing a request ID with the same input returns the saved record without
 writing anything. Reusing it with different input is refused.
@@ -313,7 +475,10 @@ The new columns (`tasks.primary_handler_id`, `tasks.handler_revision`) and
 tables (`handler_rotation_policy`, `handler_rotations`,
 `handler_rotation_requests`, `handler_runs`) stay in place, as do the
 `handler_rotations` columns `authorized_by`, `authorization_reason`,
-`old_runtime` and `successor_runtime`, which default to empty. An older hub binary
+`old_runtime` and `successor_runtime`, which default to empty, and the dead
+primary columns: `handler_rotation_policy.dead_silence_minutes` (default 10) and
+`handler_rotations.evidence_json`, `commit_evidence_json` and
+`last_activity_at`. An older hub binary
 ignores them and returns to the legacy primary rules. A handler closed by a
 rotation stays closed. An older CLI does not forward the old name, so address the
 successor by its new name. Host specs and journals under the relay state
@@ -330,7 +495,18 @@ directory are inert without the new CLI.
 - The owner notice for a missing spec is posted board-wide. The hub has no
   directed owner NOTICE.
 - The handler floor learns of a crash only from an `exited` report. A handler
-  that dies without one still counts as available, and no notice is posted.
+  that dies without one still counts as available, and no notice is posted. A
+  primary that died busy is the exception: it is replaced as a
+  [dead primary](#a-dead-primary).
+- A dead primary is replaced only from its own host. If that host is down, has
+  no saved launch spec, lost the run's process receipt, or finds the PID in
+  use by another process, the probe is unknown and the handler waits for the
+  owner.
+- The probe checks the runtime and pane processes, not every descendant. An
+  orphaned child that still writes counts as activity and delays or aborts the
+  replacement.
+- A dead primary rotation whose successor cannot start stays prepared and is
+  resumed from the journal, with no retry ceiling.
 - The hub does not reprovision a handler when the count reaches zero; that is
   follow-up `wi_42be87739d7bbfc9`.
 - `tt close` still refuses a database handler that is not retired on the client

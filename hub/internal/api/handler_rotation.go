@@ -26,6 +26,10 @@ const (
 	HandlerRotationReasonItems    = "items"
 	HandlerRotationReasonTokens   = "tokens"
 	HandlerRotationReasonTemplate = "template"
+	// The host runner found the busy primary's process and session gone on its
+	// host, and the hub has recorded nothing from that run for the policy's
+	// silence (owner order #28057). Runner trigger only, with death evidence.
+	HandlerRotationReasonDeadPrimary = "dead_primary"
 
 	// The owner command may treat an unknown activity as idle; the runner
 	// requires an observed idle or finished_silent state.
@@ -43,11 +47,49 @@ const (
 	HandlerRotationRefusedAgentCaller  = "agent_caller"
 	HandlerRotationRefusedStalePolicy  = "stale_revision"
 	HandlerRotationRefusedStaleHandler = "handler_changed"
+	// A dead-primary rotation only: the evidence does not confirm the death,
+	// or the run has not been silent for the policy's minutes.
+	HandlerRotationRefusedDeathUnconfirmed = "death_unconfirmed"
+	HandlerRotationRefusedNotSilent        = "not_silent"
 
 	// Owner decision #14233, option A.
 	DefaultHandlerRotationMaxItems       int64 = 10
 	DefaultHandlerRotationMaxTotalTokens int64 = 300_000_000
+
+	// Owner order #28057: a dead, busy primary is replaced after this many
+	// minutes with no recorded activity. 0 turns the replacement off.
+	DefaultHandlerDeadSilenceMinutes int64 = 10
+	MaxHandlerDeadSilenceMinutes     int64 = 1440
+	// HandlerDeathEvidenceMaxAge bounds how old a host's observation may be
+	// when the hub reads it; HandlerDeathEvidenceMaxAhead bounds clock skew.
+	HandlerDeathEvidenceMaxAge   = 2 * time.Minute
+	HandlerDeathEvidenceMaxAhead = 30 * time.Second
+	// HandlerOnlineWindow is how recent a heartbeat makes a run online.
+	HandlerOnlineWindow = 90 * time.Second
+
+	HandlerDeathStateGone = "gone"
 )
+
+// HandlerDeathEvidence is what the handler's own host observed: the recorded
+// tmux session is absent from a readable listing, and the runtime and pane
+// processes are absent by PID and start identity. Only "gone" is evidence; a
+// host that could not read a fact sends nothing.
+type HandlerDeathEvidence struct {
+	Host           string    `json:"host"`
+	AgentID        string    `json:"agentId"`
+	RunID          string    `json:"runId"`
+	ObservedAt     time.Time `json:"observedAt"`
+	SessionName    string    `json:"sessionName"`
+	SessionID      string    `json:"sessionId,omitempty"`
+	SessionCreated string    `json:"sessionCreated,omitempty"`
+	SessionState   string    `json:"sessionState"`
+	PID            int       `json:"pid"`
+	PanePID        int       `json:"panePid,omitempty"`
+	ProcessStarted string    `json:"processStarted"`
+	ProcessState   string    `json:"processState"`
+	// ExitedAt is the wrapper's own exit record, when it wrote one.
+	ExitedAt *time.Time `json:"exitedAt,omitempty"`
+}
 
 var rotatedNameSuffix = regexp.MustCompile(`-r[0-9]+$`)
 
@@ -74,23 +116,30 @@ func (e *HandlerRotationRefusal) Unwrap() error { return ErrConflict }
 // primary handler. Revision 0 means the owner has not saved one: new projects
 // use the owner-decided defaults with rotation enabled.
 type HandlerRotationPolicy struct {
-	TaskID           string     `json:"taskId"`
-	Enabled          bool       `json:"enabled"`
-	MaxItems         int64      `json:"maxItems"`
-	MaxTotalTokens   int64      `json:"maxTotalTokens"`
-	OnTemplateChange bool       `json:"onTemplateChange"`
-	Revision         int64      `json:"revision"`
-	UpdatedAt        *time.Time `json:"updatedAt,omitempty"`
-}
-
-// A zero MaxItems or MaxTotalTokens turns that limit off.
-type HandlerRotationPolicyRequest struct {
-	ExpectedRevision int64  `json:"expectedRevision"`
+	TaskID           string `json:"taskId"`
 	Enabled          bool   `json:"enabled"`
 	MaxItems         int64  `json:"maxItems"`
 	MaxTotalTokens   int64  `json:"maxTotalTokens"`
 	OnTemplateChange bool   `json:"onTemplateChange"`
-	ActorAgentID     string `json:"actorAgentId,omitempty"`
+	Revision         int64  `json:"revision"`
+	// DeadSilenceMinutes is how long a dead, busy primary must have been
+	// silent before the runner replaces it; 0 is off. It does not depend on
+	// Enabled, which governs the item, token and template limits.
+	DeadSilenceMinutes int64      `json:"deadSilenceMinutes"`
+	UpdatedAt          *time.Time `json:"updatedAt,omitempty"`
+}
+
+// A zero MaxItems or MaxTotalTokens turns that limit off.
+type HandlerRotationPolicyRequest struct {
+	ExpectedRevision int64 `json:"expectedRevision"`
+	Enabled          bool  `json:"enabled"`
+	MaxItems         int64 `json:"maxItems"`
+	MaxTotalTokens   int64 `json:"maxTotalTokens"`
+	OnTemplateChange bool  `json:"onTemplateChange"`
+	// DeadSilenceMinutes: omitted keeps the saved value, 0 turns the dead
+	// primary replacement off, 1 to 1440 sets it.
+	DeadSilenceMinutes *int64 `json:"deadSilenceMinutes,omitempty"`
+	ActorAgentID       string `json:"actorAgentId,omitempty"`
 }
 
 type HandlerRotationRequest struct {
@@ -108,6 +157,9 @@ type HandlerRotationRequest struct {
 	// authorized it and why. Both or neither; owner trigger only.
 	AuthorizedBy        string `json:"authorizedBy,omitempty"`
 	AuthorizationReason string `json:"authorizationReason,omitempty"`
+	// DeathEvidence is required by a dead_primary prepare and by its commit,
+	// which needs a second, fresh observation; refused with any other reason.
+	DeathEvidence *HandlerDeathEvidence `json:"deathEvidence,omitempty"`
 	// commit and abort
 	RotationID   string `json:"rotationId,omitempty"`
 	ActorAgentID string `json:"actorAgentId,omitempty"`
@@ -131,8 +183,13 @@ type HandlerRotation struct {
 	Receipt          *HandlerRotationReceipt `json:"receipt,omitempty"`
 	// Authorization is set only for an owner-authorized change.
 	Authorization *HandlerRotationAuthorization `json:"authorization,omitempty"`
-	CreatedAt     time.Time                     `json:"createdAt"`
-	UpdatedAt     time.Time                     `json:"updatedAt"`
+	// A dead_primary rotation only: the host's evidence at prepare and at
+	// commit, and the old run's last recorded activity at prepare.
+	DeathEvidence       *HandlerDeathEvidence `json:"deathEvidence,omitempty"`
+	CommitDeathEvidence *HandlerDeathEvidence `json:"commitDeathEvidence,omitempty"`
+	LastActivityAt      *time.Time            `json:"lastActivityAt,omitempty"`
+	CreatedAt           time.Time             `json:"createdAt"`
+	UpdatedAt           time.Time             `json:"updatedAt"`
 }
 
 // HandlerRotationAuthorization records who authorized a rotation that may
@@ -146,8 +203,9 @@ type HandlerRotationAuthorization struct {
 }
 
 // HandlerRotationHandoff is the durable snapshot the successor reads with
-// tt handler rotation get. Only Reissued moved; the other lists are what the
-// successor inherits as context.
+// tt handler rotation get. Reissued moved, and so did LiveLeases in a
+// dead_primary rotation (any other rotation has none); the other lists are
+// what the successor inherits as context.
 type HandlerRotationHandoff struct {
 	Reissued                  []HandlerRotationReissue    `json:"reissued"`
 	PendingScopeConfirmations []HandlerRotationScope      `json:"pendingScopeConfirmations"`
@@ -156,6 +214,30 @@ type HandlerRotationHandoff struct {
 	AllocationIntents         []HandlerRotationIntent     `json:"allocationIntents"`
 	QueueClaims               []HandlerRotationQueueClaim `json:"queueClaims"`
 	RequiredDeliveries        []HandlerRotationDelivery   `json:"requiredDeliveries"`
+	// InFlight is set by a dead_primary rotation: what the dead run was doing,
+	// reported because nothing can be recovered from a dead process.
+	InFlight *HandlerRotationInFlight `json:"inFlight,omitempty"`
+}
+
+// HandlerRotationInFlight reports a dead run's last state and its recent
+// saves, so the successor can compare a moved request with them before
+// repeating a save.
+type HandlerRotationInFlight struct {
+	ActivityState  string                 `json:"activityState"`
+	PendingTool    string                 `json:"pendingTool,omitempty"`
+	LastActivityAt time.Time              `json:"lastActivityAt"`
+	SilenceMinutes int64                  `json:"silenceMinutes"`
+	WritesSince    time.Time              `json:"writesSince"`
+	RecentWrites   []HandlerRotationWrite `json:"recentWrites"`
+	// WritesOmitted counts older saves in the window beyond the 50 listed.
+	WritesOmitted int `json:"writesOmitted"`
+}
+
+type HandlerRotationWrite struct {
+	ItemID        string    `json:"itemId"`
+	Revision      int64     `json:"revision"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	ChangedFields []string  `json:"changedFields"`
 }
 
 type HandlerRotationReissue struct {
@@ -180,6 +262,9 @@ type HandlerRotationLease struct {
 	ItemID          string `json:"itemId"`
 	State           string `json:"state"`
 	LeaseGeneration int64  `json:"leaseGeneration"`
+	// Set when a dead_primary rotation moved the lease to the successor.
+	NewLeaseGeneration  int64 `json:"newLeaseGeneration,omitempty"`
+	LaunchPlanRewritten bool  `json:"launchPlanRewritten,omitempty"`
 }
 
 type HandlerRotationAuthored struct {
@@ -215,15 +300,19 @@ type HandlerRotationDelivery struct {
 }
 
 type HandlerRotationReceipt struct {
-	RotationID       string    `json:"rotationId"`
-	RequestID        string    `json:"requestId"`
-	HandlerRevision  int64     `json:"handlerRevision"`
-	PrimaryHandlerID string    `json:"primaryHandlerId"`
-	ClosedAgentID    string    `json:"closedAgentId"`
-	ClosedRunID      string    `json:"closedRunId"`
-	NoticeSeq        int64     `json:"noticeSeq"`
-	Reissued         int       `json:"reissued"`
-	CommittedAt      time.Time `json:"committedAt"`
+	RotationID       string `json:"rotationId"`
+	RequestID        string `json:"requestId"`
+	HandlerRevision  int64  `json:"handlerRevision"`
+	PrimaryHandlerID string `json:"primaryHandlerId"`
+	ClosedAgentID    string `json:"closedAgentId"`
+	ClosedRunID      string `json:"closedRunId"`
+	NoticeSeq        int64  `json:"noticeSeq"`
+	Reissued         int    `json:"reissued"`
+	// A dead_primary rotation only: leases moved, and the owner helper's copy
+	// of the notice.
+	LeasesMoved    int       `json:"leasesMoved,omitempty"`
+	OwnerNoticeSeq int64     `json:"ownerNoticeSeq,omitempty"`
+	CommittedAt    time.Time `json:"committedAt"`
 }
 
 // HandlerRotationDue is one project's primary handler on a host, with the
@@ -243,6 +332,14 @@ type HandlerRotationDue struct {
 	Idle            bool                  `json:"idle"`
 	DueReasons      []string              `json:"dueReasons"`
 	OpenRotation    *HandlerRotation      `json:"openRotation,omitempty"`
+	// Online is the hub's own view by its clock: a heartbeat within
+	// HandlerOnlineWindow. DeadCandidate: not online, busy for the runner, and
+	// the dead primary replacement is on. SilenceMet: no recorded activity for
+	// the policy's minutes. The runner probes its host only when both hold.
+	Online         bool       `json:"online"`
+	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
+	DeadCandidate  bool       `json:"deadCandidate"`
+	SilenceMet     bool       `json:"silenceMet"`
 }
 
 type HandlerRotationDueList struct {

@@ -1917,3 +1917,117 @@ func TestTeamRunnerRetriesAbandonedHandlerProvision(t *testing.T) {
 		t.Fatalf("claim after retry %+v %v registered %d", claimed, err, rows("registered"))
 	}
 }
+
+// T21 (wi_b863e669073858f4, a12): a dead primary rotation moves a launching
+// entry's lease and rewrites the handler identity in its stored launch plan.
+// The runner's own frozen-launch identity check must accept that entry and
+// carry on with the successor, and must still refuse a plan that names
+// another handler. The dead handler is a fixture row: nothing is probed,
+// stopped or started.
+func TestTeamRunnerFrozenLaunchFollowsDeadPrimaryHandoff(t *testing.T) {
+	for _, tampered := range []bool{false, true} {
+		name := "moved plan accepted"
+		if tampered {
+			name = "plan naming another handler refused"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, hub, q, runner, now, spawns := launchRetryFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "team-fixture", User: "owner"}
+			var handlerFlags []string
+			spawn := runner.spawn
+			runner.spawn = func(e env, args []string) error {
+				for i := 0; i+1 < len(args); i += 2 {
+					if args[i] == "--team-handler-id" {
+						handlerFlags = append(handlerFlags, args[i+1])
+					}
+				}
+				return spawn(e, args)
+			}
+			// The launch is frozen and then stops before any member starts.
+			hub.refuse("attempt", 503, "service unavailable")
+			_ = runner.tick(ctx, hub.e, hub.c, "fixture")
+			frozen, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || frozen.State != "launching" || len(frozen.LaunchJSON) == 0 || frozen.HandlerID != f.handler.ID || *spawns != 0 {
+				t.Fatalf("frozen launch: %+v %v spawns=%d", frozen, err, *spawns)
+			}
+			var before teamLaunchJournal
+			if err = json.Unmarshal(frozen.LaunchJSON, &before); err != nil || before.HandlerID != f.handler.ID || before.HandlerRunID != frozen.HandlerRunID {
+				t.Fatalf("frozen plan: %+v %v", before, err)
+			}
+			// The handler dies holding that lease: the hub last heard from it 11
+			// minutes ago and its host confirms it gone, twice.
+			db, err := sql.Open("sqlite", f.dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err = db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, time.Now().UTC().Add(-11*time.Minute).Format(time.RFC3339Nano), f.handler.ID); err != nil {
+				t.Fatal(err)
+			}
+			evidence := func() *api.HandlerDeathEvidence {
+				return &api.HandlerDeathEvidence{Host: "fixture", AgentID: f.handler.ID, RunID: frozen.HandlerRunID, ObservedAt: time.Now().UTC(), SessionName: "fixture-handler",
+					SessionState: api.HandlerDeathStateGone, PID: 4242, ProcessStarted: "Wed Oct  7 06:00:00 2026", ProcessState: api.HandlerDeathStateGone}
+			}
+			detail, err := hub.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := f.st.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: "dead-prepare", ExpectedHandlerRevision: detail.Task.HandlerRevision,
+				OldAgentID: f.handler.ID, OldRunID: frozen.HandlerRunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.handler.Name, detail.Task.HandlerRevision),
+				Reason: api.HandlerRotationReasonDeadPrimary, Trigger: api.HandlerRotationTriggerRunner, DeathEvidence: evidence()}, by)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			successor, err := hub.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Name: r.SuccessorName, Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "fixture-handler-r2", Runtime: "codex"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = hub.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: successor.ID, RunID: successor.RunID, Kind: api.EventRunning}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Millisecond) // the second observation is later than the first
+			if r, err = f.st.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + r.ID, RotationID: r.ID, DeathEvidence: evidence()}, by); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			moved, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			var after teamLaunchJournal
+			if err != nil || json.Unmarshal(moved.LaunchJSON, &after) != nil || moved.State != "launching" || moved.HandlerID != successor.ID || moved.HandlerRunID != successor.RunID ||
+				after.HandlerID != successor.ID || after.HandlerRunID != successor.RunID || after.HandlerLeaseGeneration != moved.HandlerLeaseGeneration ||
+				r.Receipt.LeasesMoved != 1 || !r.Handoff.LiveLeases[0].LaunchPlanRewritten {
+				t.Fatalf("moved entry %+v plan %+v receipt %+v %v", moved, after, r.Receipt, err)
+			}
+			// Only the handler identity changed in the plan.
+			after.HandlerID, after.HandlerRunID, after.HandlerLeaseGeneration = before.HandlerID, before.HandlerRunID, before.HandlerLeaseGeneration
+			if restored, _ := json.Marshal(after); string(restored) != string(frozen.LaunchJSON) {
+				t.Fatalf("the plan changed beyond the handler identity:\n%s\n%s", restored, frozen.LaunchJSON)
+			}
+			if tampered {
+				// A stored plan that names a handler other than the entry's lease.
+				other := strings.Replace(string(moved.LaunchJSON), successor.ID, f.handler.ID, 1)
+				if _, err = db.Exec(`UPDATE team_queue_entries SET launch_json=? WHERE id=?`, other, q.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hub.refuse("attempt", 0, "")
+			*now = now.Add(10 * time.Minute)
+			tickErr := runner.tick(ctx, hub.e, hub.c, "fixture")
+			got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tampered {
+				if got.State != "failed" || !strings.Contains(got.Failure, "frozen team identity conflicts with queue entry") || *spawns != 0 {
+					t.Fatalf("a plan naming another handler: state=%s failure=%q spawns=%d", got.State, got.Failure, *spawns)
+				}
+				return
+			}
+			if tickErr != nil || got.State != "running" || got.Failure != "" || *spawns != 1 || got.HandlerID != successor.ID {
+				t.Fatalf("launch after the handoff: state=%s failure=%q spawns=%d handler=%s %v", got.State, got.Failure, *spawns, got.HandlerID, tickErr)
+			}
+			if len(handlerFlags) != 1 || handlerFlags[0] != successor.ID {
+				t.Fatalf("members were briefed with handler %v, want the successor %s", handlerFlags, successor.ID)
+			}
+		})
+	}
+}

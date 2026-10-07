@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -1784,7 +1785,7 @@ func TestHandlerNeedNamesOfflineHandlerAtLimit(t *testing.T) {
 	}
 	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
 	if got.HandlerNeed.Fix != "" || got.HandlerNeed.Provision || strings.Contains(got.BlockReason, "Fix: ") ||
-		!strings.HasSuffix(got.BlockReason, idle.Name+" is offline. The hub does not restart a handler; "+idle.Name+" is the primary, and its rotation ("+rotate+") is refused until this clears: the handler run's activity is working.") {
+		!strings.Contains(got.BlockReason, idle.Name+" is offline. The hub does not restart a handler; "+idle.Name+" is the primary, and its rotation ("+rotate+") is refused until this clears: the handler run's activity is working. ") {
 		t.Fatalf("working primary need %+v reason %q", got.HandlerNeed, got.BlockReason)
 	}
 	if _, err := f.s.db.Exec(`DELETE FROM agent_activity WHERE agent_id=?`, idle.ID); err != nil {
@@ -1868,7 +1869,7 @@ func TestHandlerNeedLeasedOfflinePrimaryHasNoRotateFix(t *testing.T) {
 	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
 	want := leased.Name + " is offline. The hub does not restart a handler; " + leased.Name + " is the primary, and its rotation (tt handler rotate --task " + f.task.ID +
 		") is refused until this clears: the handler run holds 1 live team lease(s), first " + f.entries[0].ID + "."
-	if n := got.HandlerNeed; n == nil || n.Fix != "" || n.Provision || !strings.HasSuffix(got.BlockReason, want) {
+	if n := got.HandlerNeed; n == nil || n.Fix != "" || n.Provision || !strings.Contains(got.BlockReason, want+" ") {
 		t.Fatalf("leased primary need %+v reason %q", n, got.BlockReason)
 	}
 }
@@ -2186,5 +2187,106 @@ func TestHandlerProvisionCeilingCountsExitedAndClosedLaunches(t *testing.T) {
 				t.Fatalf("provision at the ceiling: %v rows %d", err, f.allRows(t))
 			}
 		})
+	}
+}
+
+// T10 (wi_b863e669073858f4): the queue reason for an offline, busy primary
+// names what the product does about it: the host runner's automatic
+// replacement, its host, the policy's minutes and the silence so far; or, with
+// that replacement off, the policy command. No operator command is the fix.
+func TestHandlerNeedOfflineBusyPrimaryNamesAutomaticReplacement(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	var leased api.Agent
+	for _, h := range f.sArms {
+		if h.ID == f.entries[0].HandlerID {
+			leased = h
+		}
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, leased.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The other handler is held by an open rotation, so the entry waits.
+	now := ts(time.Now())
+	if _, err := f.s.db.Exec(`INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at) VALUES('hrot_fixture',?,'rotate','hash','prepared','fixture','owner',1,?,?,?,'agt_successor','successor',?,?)`,
+		f.task.ID, idle.ID, idle.RunID, idle.Name, now, now); err != nil {
+		t.Fatal(err)
+	}
+	f.offline(t, leased)
+	// Its last recorded activity was 7 minutes ago by the store clock.
+	clock := f.s.now()
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(clock.Add(-7*time.Minute-20*time.Second)), leased.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.s.now = func() time.Time { return clock }
+	head := leased.Name + " is offline. The hub does not restart a handler; " + leased.Name + " is the primary, and its rotation (tt handler rotate --task " + f.task.ID +
+		") is refused until this clears: the handler run holds 1 live team lease(s), first " + f.entries[0].ID + ". "
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	want := head + "The host runner on " + leased.Host + " replaces it automatically once its process and session are confirmed gone there and it has been silent for 10 minutes (silent 7 so far)."
+	if n := got.HandlerNeed; n == nil || n.Fix != "" || n.Provision || !strings.HasSuffix(got.BlockReason, want) || strings.Contains(got.BlockReason, "Fix: ") {
+		t.Fatalf("offline busy primary need %+v\nreason %q\n  want %q", n, got.BlockReason, want)
+	}
+	// A run with no recorded activity says so rather than a number.
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at='' WHERE id=?`, leased.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DELETE FROM agent_activity WHERE agent_id=?`, `UPDATE messages SET from_run_id='' WHERE from_agent=?`, `UPDATE work_item_revisions SET updated_run_id='' WHERE updated_agent=?`} {
+		if _, err := f.s.db.Exec(q, leased.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	if !strings.HasSuffix(got.BlockReason, "it has been silent for 10 minutes (no activity recorded from it yet).") || got.HandlerNeed.Fix != "" {
+		t.Fatalf("no recorded activity: %q", got.BlockReason)
+	}
+	// With the replacement off the reason names the policy command.
+	off := int64(0)
+	if _, err := f.s.SetHandlerRotationPolicy(context.Background(), f.task.ID, api.HandlerRotationPolicyRequest{Enabled: true, DeadSilenceMinutes: &off}); err != nil {
+		t.Fatal(err)
+	}
+	got = listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	want = head + "Automatic replacement of a dead primary is off (tt handler policy set --task " + f.task.ID + " --revision 1 --dead-silence-minutes N)."
+	if n := got.HandlerNeed; n == nil || n.Fix != "" || !strings.HasSuffix(got.BlockReason, want) || strings.Contains(got.BlockReason, "Fix: ") {
+		t.Fatalf("replacement off: need %+v\nreason %q\n  want %q", n, got.BlockReason, want)
+	}
+}
+
+// T11 (wi_b863e669073858f4): after a dead primary rotation hands a lease to
+// the successor, the entry's arm assignment loads and finishes under the
+// successor, with the draw, arm and digest it was leased with.
+func TestHandlerArmAssignmentFollowsDeadPrimaryHandoff(t *testing.T) {
+	f, r, successor := rotateDeadPrimary(t)
+	ctx := context.Background()
+	if r.Receipt.LeasesMoved != 2 {
+		t.Fatalf("leases moved: %+v", r.Receipt)
+	}
+	entry, err := f.s.GetTeamQueueEntry(ctx, f.task.ID, f.running.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := api.TeamQueueEntry{ID: entry.ID, HandlerID: entry.HandlerID, HandlerLeaseGeneration: entry.HandlerLeaseGeneration}
+	if err = attachHandlerArm(ctx, f.s.db, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	a := loaded.HandlerArm
+	if a == nil || a.HandlerID != successor.ID || a.HandlerRunID != successor.RunID || a.LeaseGeneration != entry.HandlerLeaseGeneration || a.Arm != "S" || a.DrawnArm != "S" ||
+		a.Draw != "0a" || a.PolicyRevision != 3 || a.HandlerDigest != "digest-as-leased" || a.PolicyDigest != "policy" || a.FinishedAt != "" {
+		t.Fatalf("assignment under the successor: %+v", a)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_arm_assignments WHERE entry_id=?`, entry.ID); n != 1 {
+		t.Fatalf("assignment rows for the entry: %d", n)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_arm_assignments WHERE handler_id=?`, f.old.ID); n != 0 {
+		t.Fatalf("assignments left on the dead handler: %d", n)
+	}
+	finished := ts(f.clock)
+	if err = withTx(f.s, func(tx *sql.Tx) error { return finishHandlerArmAssignment(ctx, tx, entry, finished) }); err != nil {
+		t.Fatal(err)
+	}
+	if err = attachHandlerArm(ctx, f.s.db, &loaded); err != nil || loaded.HandlerArm.FinishedAt != finished {
+		t.Fatalf("finish under the successor: %+v %v", loaded.HandlerArm, err)
+	}
+	// An entry leased without an arm policy has no row, and moving it is not an error.
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_arm_assignments WHERE entry_id=?`, f.frozen.ID); n != 0 {
+		t.Fatalf("assignment rows for the unarmed entry: %d", n)
 	}
 }

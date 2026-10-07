@@ -146,6 +146,9 @@ type handlerRotationJournal struct {
 	// An owner-authorized change of runtime, model or arm; a resume replays it.
 	AuthorizedBy        string `json:"authorizedBy,omitempty"`
 	AuthorizationReason string `json:"authorizationReason,omitempty"`
+	// The host's evidence for a dead_primary rotation, as sent at prepare, so
+	// a replayed prepare carries the same payload.
+	DeathEvidence *api.HandlerDeathEvidence `json:"deathEvidence,omitempty"`
 }
 
 // rotationAuthorization is the owner's authorization for a rotation that may
@@ -193,11 +196,106 @@ type rotationDeps struct {
 	poll    time.Duration
 	// after runs once a phase is saved; tests use it to stop the routine.
 	after func(phase string) error
+	// probe reads, on this host only, whether a handler's process and session
+	// are gone. A nil probe confirms nothing.
+	probe handlerDeathProbe
 }
 
 func productionRotationDeps() rotationDeps {
 	runner := productionTeamRunner()
-	return rotationDeps{spawn: cmdSpawn, cleanup: runner.cleanup, host: spawn.Host, online: 2 * time.Minute, poll: 2 * time.Second}
+	return rotationDeps{spawn: cmdSpawn, cleanup: runner.cleanup, host: spawn.Host, online: 2 * time.Minute, poll: 2 * time.Second,
+		probe: productionDeathProbe().probe}
+}
+
+// A death probe answers gone, alive or unknown. Only gone carries evidence,
+// and only gone lets the runner ask the hub for a dead primary rotation.
+const (
+	handlerProbeGone    = "gone"
+	handlerProbeAlive   = "alive"
+	handlerProbeUnknown = "unknown"
+)
+
+type handlerDeathProbe func(ctx context.Context, hub string, a api.Agent) (state, detail string, evidence *api.HandlerDeathEvidence)
+
+// deathProbe confirms a handler gone from three facts read on its own host:
+// its recorded tmux session is absent from a readable listing, its runtime
+// process is absent by PID and start identity, and so is its pane process.
+// Any fact it cannot read is unknown, never gone. It signals nothing.
+type deathProbe struct {
+	receipt  func(hub, agent, run string) (runtimeProcessReceipt, error)
+	sessions func(context.Context) ([]ownedSession, error)
+	pid      runtimePIDProbe
+	socket   func() string
+	host     func() string
+	now      func() time.Time
+}
+
+func productionDeathProbe() deathProbe {
+	return deathProbe{
+		receipt: func(hub, agent, run string) (runtimeProcessReceipt, error) {
+			var r runtimeProcessReceipt
+			data, err := os.ReadFile(runtimeProcessPath(hub, agent, run))
+			if err != nil {
+				return r, err
+			}
+			return r, json.Unmarshal(data, &r)
+		},
+		sessions: localSessions, pid: nativeRuntimePIDProbe,
+		socket: func() string { return os.Getenv("TT_TMUX_SOCKET") }, host: spawn.Host, now: time.Now,
+	}
+}
+
+func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string, string, *api.HandlerDeathEvidence) {
+	hub = strings.TrimRight(hub, "/")
+	receipt, err := p.receipt(hub, a.ID, a.RunID)
+	if err != nil {
+		return handlerProbeUnknown, "the handler run's process receipt is unreadable on this host", nil
+	}
+	if strings.TrimRight(receipt.Hub, "/") != hub || receipt.Task != a.TaskID || receipt.Agent != a.ID || receipt.Run != a.RunID || a.RunID == "" {
+		return handlerProbeUnknown, "the process receipt names another hub, project, agent or run", nil
+	}
+	if receipt.PID < 1 || receipt.Started == "" {
+		return handlerProbeUnknown, "the process receipt has no runtime process ID and start identity", nil
+	}
+	if receipt.Socket != p.socket() {
+		return handlerProbeUnknown, "the handler's tmux socket is not the one this runner reads", nil
+	}
+	sessions, err := p.sessions(ctx)
+	if err != nil {
+		return handlerProbeUnknown, "the tmux session listing is unreadable", nil
+	}
+	for _, s := range sessions {
+		if s.Agent == a.ID || (receipt.Session != "" && s.Name == receipt.Session) || (a.Session != "" && s.Name == a.Session) {
+			return handlerProbeAlive, "tmux session " + s.Name + " is present", nil
+		}
+	}
+	if alive, err := p.pid(receipt.PID, receipt.Started); err != nil {
+		return handlerProbeUnknown, "the runtime process could not be checked: " + err.Error(), nil
+	} else if alive {
+		return handlerProbeAlive, fmt.Sprintf("runtime process %d is running", receipt.PID), nil
+	}
+	if receipt.PanePID > 0 {
+		if receipt.PaneStarted == "" {
+			return handlerProbeUnknown, "the pane process has no start identity", nil
+		}
+		if alive, err := p.pid(receipt.PanePID, receipt.PaneStarted); err != nil {
+			return handlerProbeUnknown, "the pane process could not be checked: " + err.Error(), nil
+		} else if alive {
+			return handlerProbeAlive, fmt.Sprintf("pane process %d is running", receipt.PanePID), nil
+		}
+	}
+	session := receipt.Session
+	if session == "" {
+		session = a.Session
+	}
+	ev := &api.HandlerDeathEvidence{Host: p.host(), AgentID: a.ID, RunID: a.RunID, ObservedAt: p.now().UTC(), SessionName: session, SessionID: receipt.SessionID,
+		SessionCreated: receipt.SessionCreated, SessionState: api.HandlerDeathStateGone, PID: receipt.PID, PanePID: receipt.PanePID, ProcessStarted: receipt.Started,
+		ProcessState: api.HandlerDeathStateGone}
+	if !receipt.ExitedAt.IsZero() {
+		exited := receipt.ExitedAt.UTC()
+		ev.ExitedAt = &exited
+	}
+	return handlerProbeGone, "the session and the runtime process are absent", ev
 }
 
 // rotationRefusal reports a hub refusal that changed nothing.
@@ -207,7 +305,8 @@ func rotationRefusal(err error) (string, bool) {
 		switch httpErr.Code {
 		case api.HandlerRotationRefusedLiveLease, api.HandlerRotationRefusedWorking, api.HandlerRotationRefusedPendingTool, api.HandlerRotationRefusedOpen,
 			api.HandlerRotationRefusedPaused, api.HandlerRotationRefusedNotPrimary, api.HandlerRotationRefusedSuccessor, api.HandlerRotationRefusedNameTaken,
-			api.HandlerRotationRefusedAgentCaller, api.HandlerRotationRefusedStaleHandler:
+			api.HandlerRotationRefusedAgentCaller, api.HandlerRotationRefusedStaleHandler,
+			api.HandlerRotationRefusedDeathUnconfirmed, api.HandlerRotationRefusedNotSilent:
 			return httpErr.Code, true
 		}
 	}
@@ -242,6 +341,20 @@ func newRotationKey(prefix string) string {
 // authorization lets a new rotation change the runtime, model or arm; a
 // resumed rotation uses the one in its journal.
 func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization) (api.HandlerRotation, error) {
+	return runHandlerRotation(ctx, d, e, c, task, reason, trigger, spec, auth, nil)
+}
+
+// deathUnconfirmedRefusal reports a hub refusal that says a dead primary is
+// not, or no longer, confirmed dead and silent.
+func deathUnconfirmedRefusal(err error) bool {
+	code, ok := rotationRefusal(err)
+	return ok && (code == api.HandlerRotationRefusedDeathUnconfirmed || code == api.HandlerRotationRefusedNotSilent)
+}
+
+// runHandlerRotation is rotateHandler with the host's death evidence, which
+// only the runner's dead primary branch passes for a new rotation. A resumed
+// rotation uses the evidence in its journal.
+func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization, evidence *api.HandlerDeathEvidence) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	hub := strings.TrimRight(c.Base, "/")
 	path := handlerRotationJournalPath(hub, task)
@@ -304,7 +417,7 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 		}
 		j = &handlerRotationJournal{Version: 1, Hub: hub, Task: task, PrepareRequestID: newRotationKey("rotation-prepare"), HandlerRevision: detail.Task.HandlerRevision,
 			OldAgentID: old.ID, OldRunID: old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(old.Name, detail.Task.HandlerRevision),
-			Reason: reason, Trigger: trigger, AuthorizedBy: auth.by, AuthorizationReason: auth.reason}
+			Reason: reason, Trigger: trigger, AuthorizedBy: auth.by, AuthorizationReason: auth.reason, DeathEvidence: evidence}
 		if err = save(rotationPhasePreparing); err != nil {
 			return zero, err
 		}
@@ -312,7 +425,8 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 	if j.Phase == rotationPhasePreparing {
 		r, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: j.PrepareRequestID,
 			ExpectedHandlerRevision: j.HandlerRevision, OldAgentID: j.OldAgentID, OldRunID: j.OldRunID, SuccessorAgentID: j.SuccessorAgentID,
-			SuccessorName: j.SuccessorName, Reason: j.Reason, Trigger: j.Trigger, AuthorizedBy: j.AuthorizedBy, AuthorizationReason: j.AuthorizationReason})
+			SuccessorName: j.SuccessorName, Reason: j.Reason, Trigger: j.Trigger, AuthorizedBy: j.AuthorizedBy, AuthorizationReason: j.AuthorizationReason,
+			DeathEvidence: j.DeathEvidence})
 		if _, refused := rotationRefusal(err); refused {
 			// A refused prepare changed nothing; the next attempt starts fresh.
 			if removeErr := os.Remove(path); removeErr != nil {
@@ -356,7 +470,32 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 			case <-time.After(d.poll):
 			}
 		}
-		if _, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + j.RotationID, RotationID: j.RotationID}); err != nil {
+		commit := api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + j.RotationID, RotationID: j.RotationID}
+		if j.Reason == api.HandlerRotationReasonDeadPrimary {
+			// The successor took time to start: look again before the commit,
+			// and leave the old handler primary on any doubt.
+			old, err := c.GetAgent(ctx, task, j.OldAgentID)
+			if err != nil {
+				return zero, err
+			}
+			state, detail := handlerProbeUnknown, "this host has no death probe"
+			if d.probe != nil && old.RunID == j.OldRunID {
+				state, detail, commit.DeathEvidence = d.probe(ctx, hub, old)
+			}
+			if state != handlerProbeGone || commit.DeathEvidence == nil {
+				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j.RotationID); abortErr != nil {
+					return zero, fmt.Errorf("the second death probe of %s says %s (%s); aborting the rotation failed and will retry: %w", old.Name, state, detail, abortErr)
+				}
+				return zero, fmt.Errorf("%w: the second probe of %s says %s (%s); the rotation was aborted and it stays primary", errDeathNotConfirmed, old.Name, state, detail)
+			}
+		}
+		if _, err := c.HandlerRotationAction(ctx, task, commit); err != nil {
+			if j.Reason == api.HandlerRotationReasonDeadPrimary && deathUnconfirmedRefusal(err) {
+				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j.RotationID); abortErr != nil {
+					return zero, fmt.Errorf("the hub refused the commit (%v); aborting the rotation failed and will retry: %w", err, abortErr)
+				}
+				return zero, fmt.Errorf("%w: %v; the rotation was aborted and the old handler stays primary", errDeathNotConfirmed, err)
+			}
 			return zero, err
 		}
 		if err = save(rotationPhaseCommitted); err != nil {
@@ -370,6 +509,26 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 		return zero, err
 	}
 	return c.GetHandlerRotation(ctx, task, j.RotationID)
+}
+
+// errDeathNotConfirmed marks a dead primary rotation the runner aborted
+// because the death was not confirmed a second time.
+var errDeathNotConfirmed = errors.New("dead primary not confirmed")
+
+// abortJournaledRotation aborts the prepared rotation this host's journal
+// names, cleans up its successor's session and removes the journal. The
+// caller holds the journal lock.
+func abortJournaledRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, path, rotationID string) error {
+	r, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "rotation-abort-" + rotationID, RotationID: rotationID})
+	if err != nil {
+		return err
+	}
+	if _, err = c.GetAgent(ctx, task, r.SuccessorAgentID); err == nil {
+		if err = d.cleanup(ctx, e, task, r.SuccessorAgentID); err != nil {
+			return fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
+		}
+	}
+	return os.Remove(path)
 }
 
 // abortHandlerRotation aborts the project's prepared rotation, closes and
@@ -683,13 +842,61 @@ func cmdHandlerRotation(e env, args []string) error {
 			fmt.Printf("  %s #%d %s item %s (%s)\n", v.ID, v.MessageSeq, v.Kind, v.ItemID, v.Phase)
 		}
 		fmt.Printf("Live leases: %d\n", len(h.LiveLeases))
+		for _, l := range h.LiveLeases {
+			if l.NewLeaseGeneration == 0 {
+				continue
+			}
+			plan := ""
+			if l.LaunchPlanRewritten {
+				plan = ", launch plan rewritten"
+			}
+			fmt.Printf("  %s item %s (%s) moved to the successor: lease generation %d -> %d%s\n", l.EntryID, l.ItemID, l.State, l.LeaseGeneration, l.NewLeaseGeneration, plan)
+		}
+		if in := h.InFlight; in != nil {
+			fmt.Printf("In flight when the old handler died (reported, not recovered): activity %s", in.ActivityState)
+			if in.PendingTool != "" {
+				fmt.Printf(", pending tool %s", in.PendingTool)
+			}
+			fmt.Printf(", last recorded activity %s, silence applied %d minute(s)\n", in.LastActivityAt.UTC().Format(time.RFC3339), in.SilenceMinutes)
+			fmt.Printf("Work-item saves by the dead run since %s: %d listed, %d older left out\n", in.WritesSince.UTC().Format(time.RFC3339), len(in.RecentWrites), in.WritesOmitted)
+			for _, w := range in.RecentWrites {
+				fmt.Printf("  %s r%d at %s (%s)\n", w.ItemID, w.Revision, w.UpdatedAt.UTC().Format(time.RFC3339), strings.Join(w.ChangedFields, ", "))
+			}
+		}
+	}
+	for _, line := range rotationDeathEvidenceLines(r) {
+		fmt.Println(line)
 	}
 	return nil
 }
 
+// rotationDeathEvidenceLines is the host evidence of a dead_primary rotation,
+// one line per observation; none for any other rotation.
+func rotationDeathEvidenceLines(r api.HandlerRotation) []string {
+	var lines []string
+	for _, v := range []struct {
+		label string
+		ev    *api.HandlerDeathEvidence
+	}{{"at prepare", r.DeathEvidence}, {"at commit", r.CommitDeathEvidence}} {
+		if v.ev == nil {
+			continue
+		}
+		line := fmt.Sprintf("Death evidence %s: host %s observed %s: tmux session %s %s, runtime process %d (started %s) %s", v.label, v.ev.Host, v.ev.ObservedAt.UTC().Format(time.RFC3339),
+			v.ev.SessionName, v.ev.SessionState, v.ev.PID, v.ev.ProcessStarted, v.ev.ProcessState)
+		if v.ev.PanePID > 0 {
+			line += fmt.Sprintf(", pane process %d gone", v.ev.PanePID)
+		}
+		if v.ev.ExitedAt != nil {
+			line += ", wrapper exit recorded " + v.ev.ExitedAt.UTC().Format(time.RFC3339)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
 func cmdHandlerPolicy(e env, args []string) error {
 	if len(args) == 0 || (args[0] != "get" && args[0] != "set") {
-		return errors.New("usage: tt handler policy get|set --task ID [--revision N --enabled=BOOL --max-items N --max-total-tokens N --on-template-change=BOOL] [--json]")
+		return errors.New("usage: tt handler policy get|set --task ID [--revision N --enabled=BOOL --max-items N --max-total-tokens N --on-template-change=BOOL --dead-silence-minutes N] [--json]")
 	}
 	operation := args[0]
 	fs := flag.NewFlagSet("handler policy", flag.ContinueOnError)
@@ -699,6 +906,7 @@ func cmdHandlerPolicy(e env, args []string) error {
 	maxItems := fs.Int64("max-items", 0, "finished leased items per handler run; 0 turns the limit off")
 	maxTokens := fs.Int64("max-total-tokens", 0, "total tokens per handler run; 0 turns the limit off")
 	onTemplate := fs.Bool("on-template-change", true, "rotate when the handler prompt template changes")
+	deadSilence := fs.Int64("dead-silence-minutes", api.DefaultHandlerDeadSilenceMinutes, "minutes of silence before a dead, busy primary is replaced automatically; 0 turns that off")
 	jsonOut := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -739,6 +947,13 @@ func cmdHandlerPolicy(e env, args []string) error {
 		if flagPresent(args, "on-template-change") {
 			req.OnTemplateChange = *onTemplate
 		}
+		// Omitted, the hub keeps the saved silence.
+		if flagPresent(args, "dead-silence-minutes") {
+			if *deadSilence < 0 || *deadSilence > api.MaxHandlerDeadSilenceMinutes {
+				return fmt.Errorf("--dead-silence-minutes takes 0 (off) to %d", api.MaxHandlerDeadSilenceMinutes)
+			}
+			req.DeadSilenceMinutes = deadSilence
+		}
 		if out, err = c.SetHandlerRotationPolicy(ctx, *task, req); err != nil {
 			return err
 		}
@@ -753,8 +968,8 @@ func cmdHandlerPolicy(e env, args []string) error {
 		}
 		return strconv.FormatInt(v, 10)
 	}
-	fmt.Printf("Handler rotation policy for %s (revision %d): enabled=%t max-items=%s max-total-tokens=%s on-template-change=%t\n",
-		out.TaskID, out.Revision, out.Enabled, limit(out.MaxItems), limit(out.MaxTotalTokens), out.OnTemplateChange)
+	fmt.Printf("Handler rotation policy for %s (revision %d): enabled=%t max-items=%s max-total-tokens=%s on-template-change=%t dead-silence-minutes=%s\n",
+		out.TaskID, out.Revision, out.Enabled, limit(out.MaxItems), limit(out.MaxTotalTokens), out.OnTemplateChange, limit(out.DeadSilenceMinutes))
 	return nil
 }
 
@@ -782,9 +997,12 @@ func relayHandlerRotationTick(ctx context.Context) error {
 	if e.hub == "" {
 		return nil
 	}
-	// Spend no hub request on a host that runs no database handler.
-	if runs, err := hostRunsHandler(ctx, e.hub); err != nil || !runs {
+	// Spend no hub request on a host that neither runs a database handler nor
+	// keeps a trace of one: a host whose handler died must keep ticking.
+	if runs, err := hostRunsHandler(ctx, e.hub); err != nil {
 		return err
+	} else if !runs && !hostHasHandlerTrace(e.hub) {
+		return nil
 	}
 	c, err := e.client(20 * time.Second)
 	if err != nil {
@@ -807,6 +1025,33 @@ func hostRunsHandler(ctx context.Context, hub string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// hostHasHandlerTrace reports whether this host has ever been set up to run a
+// database handler for hub: a saved launch spec, a rotation journal, or a
+// handler's session ownership receipt. It reads local files only.
+func hostHasHandlerTrace(hub string) bool {
+	hub = strings.TrimRight(hub, "/")
+	for _, pattern := range []string{"handler-spec-*.json", "handler-rotation-*.json"} {
+		paths, _ := filepath.Glob(filepath.Join(relayDir(), pattern))
+		for _, path := range paths {
+			var saved struct {
+				Hub string `json:"hub"`
+			}
+			if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &saved) == nil && saved.Hub != "" && strings.TrimRight(saved.Hub, "/") == hub {
+				return true
+			}
+		}
+	}
+	paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.session.json"))
+	for _, path := range paths {
+		var s ownedSession
+		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &s) == nil && s.valid() && strings.TrimRight(s.Hub, "/") == hub &&
+			(s.Role == api.AgentRoleDatabaseHandler || strings.HasPrefix(s.Name, "tt-handler-")) {
+			return true
+		}
+	}
+	return false
 }
 
 // rotationDueReasons decides what the runner acts on. Item and token limits
@@ -871,13 +1116,29 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				errs = append(errs, fmt.Errorf("handler rotation %s: the launch spec was removed during a rotation", d.TaskID))
 				continue
 			}
-			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) {
+			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			continue
 		}
 		if d.OpenRotation != nil {
 			continue // another host or process owns it
+		}
+		if d.DeadCandidate {
+			// A busy primary the hub no longer hears from. It is never idle, so
+			// no limit applies; it is replaced only when it has been silent
+			// long enough and this host confirms it gone.
+			if d.SilenceMet {
+				if err := r.replaceDeadPrimary(ctx, e, c, host, d, spec); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			continue
+		}
+		// The hub lists a project for a dead primary even with its limit
+		// policy off, so the limits need the policy checked here.
+		if !d.Policy.Enabled {
+			continue
 		}
 		reasons := rotationDueReasons(d, spec)
 		if len(reasons) == 0 {
@@ -897,6 +1158,43 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// replaceDeadPrimary probes this host and, only when the handler's session
+// and process are confirmed gone, asks the hub for a dead primary rotation.
+// alive or unknown sends the hub nothing.
+func (r *rotationRunner) replaceDeadPrimary(ctx context.Context, e env, c *api.Client, host string, d api.HandlerRotationDue, spec *handlerSpec) error {
+	if spec == nil {
+		return r.notifyDeadWithoutSpec(ctx, c, host, d)
+	}
+	if r.deps.probe == nil {
+		return nil
+	}
+	state, _, evidence := r.deps.probe(ctx, strings.TrimRight(c.Base, "/"), d.Agent)
+	if state != handlerProbeGone || evidence == nil {
+		return nil
+	}
+	if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonDeadPrimary, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, evidence); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
+		return fmt.Errorf("handler rotation %s: %w", d.TaskID, err)
+	}
+	return nil
+}
+
+// notifyDeadWithoutSpec posts one owner notice per exact run: without a
+// saved launch spec this host cannot start a successor, so it does not probe.
+func (r *rotationRunner) notifyDeadWithoutSpec(ctx context.Context, c *api.Client, host string, d api.HandlerRotationDue) error {
+	key := "handler-dead-no-spec-" + strings.TrimPrefix(d.Agent.ID, "agt_") + "-" + strings.TrimPrefix(d.Agent.RunID, "run_")
+	if r.notified[key] {
+		return nil
+	}
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "An offline busy primary handler cannot be replaced because this host has no saved launch spec",
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("Primary database handler %s (%s / %s) is offline, still recorded as busy, and has been silent for the %d minute(s) the project's policy needs. Host %s has no saved launch spec, so it did not check whether the handler is dead and replaced nothing. Save the handler's launch settings on that host with tt handler spec --task %s -- <tt spawn launch flags>; the runner then replaces the handler once its process and session are confirmed gone. To turn the automatic replacement off: tt handler policy set --task %s --revision %d --dead-silence-minutes 0.",
+			d.Agent.Name, d.Agent.ID, d.Agent.RunID, d.Policy.DeadSilenceMinutes, host, d.TaskID, d.TaskID, d.Policy.Revision)}}
+	if _, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key}); err != nil {
+		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+	}
+	r.notified[key] = true
+	return nil
 }
 
 // notifyMissingSpec posts one owner notice per due episode of an exact run.
