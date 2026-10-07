@@ -1167,13 +1167,24 @@ published or deployed, and it holds no project fence.
   stderr stays in `cli-failures.json` (Failed CLI calls, above). For a held
   journal the reason is fixed: the journal is unreadable, shows effects or is
   not of exactly the set-aside claim.
-- It is a Board notice with no recipient, so it is in the inbox of every agent
-  of the project, the database handler and the owner helper included. It is
-  sent once per job per deployer run (request id `JOB-claim-held-RUN`): later
-  polls of the same run send nothing, even if the reason changes, and a
-  restart under the same run resends the same notice, which the hub answers
-  with the original. A post that fails is retried at the next poll and never
-  changes the skip.
+- It is sent directed, so the recipient is woken, to two agents: the project
+  database handler (the one `tt deployment handler` names) and the owner helper
+  (the one agent of the roster, `tt agents --json`, whose role is
+  `owner_helper` and whose status is neither `closed` nor `exited`). Each gets
+  it once per job per deployer run; later polls of the same run send nothing
+  more, even if the reason changes.
+- **Fallback.** While a recipient cannot be resolved (no handler, or not
+  exactly one live owner helper) or its post fails, the deployer prints `Held
+  claim notice not delivered to every recipient; the next poll retries.`,
+  posts the same notice once per job per run on the Board with no recipient,
+  and tries that recipient again at every poll. A Board notice is in every
+  agent's inbox but wakes no one, so read it as "someone was not reached". No
+  failure here changes the skip.
+- Request ids are `JOB-claim-held-RUN-HASH-handler`, `-helper` and `-board`.
+  `HASH` is eight hex characters of the case and the reason. A restart under
+  the same run with the same reason resends the same ids, and the hub answers
+  with the originals, so nothing new is posted; with another reason the ids
+  differ and each recipient gets a new notice.
 - **Who acts: the database handler.** Read the reason and `tt deployment get
   --job JOB`, and record what is found before changing anything. `candidate
   changed since enqueue` means the entry's accepted revision, commit or

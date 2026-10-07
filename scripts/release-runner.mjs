@@ -118,15 +118,18 @@ export function refusalText(stderr) {
 // The Board notice for a verified job the deployer skips: the hub refused its
 // claim, or its set-aside journal is held. Only the job, its item and commit
 // when they have the hub's shape, and a reason of REASON's characters. key is
-// one per job for a process; the request id carries the deployer run, so a
-// restart of that run resends the same notice.
+// one per job for a process. The request id carries the deployer run and a
+// short hash of the case and reason: a restart of that run resends the same
+// notice, and one with another reason sends a new one. Each recipient's copy
+// adds its own suffix.
 export function heldClaimNotice(job, kind, reason, run) {
   if (!/^rel_[A-Za-z0-9]{1,40}$/.test(job?.id || "")) return null;
   const item = /^wi_[a-f0-9]{1,40}$/.test(job.itemId || "") ? job.itemId : null, commit = /^[a-f0-9]{40}$/.test(job.commit || "") ? job.commit : null;
   const why = REASON.test(reason || "") ? reason : "unclassified", journal = kind === "journal";
-  return {key: `claim-held ${job.id}`, requestId: `${job.id}-claim-held-${NAME(run)}`, jobId: job.id, item, commit,
+  const id = createHash("sha256").update(JSON.stringify([journal ? "journal" : "claim", why])).digest("hex").slice(0, 8);
+  return {key: `claim-held ${job.id}`, requestId: `${job.id}-claim-held-${NAME(run)}-${id}`, jobId: job.id, item, commit,
     subject: journal ? "A release job is skipped because its set-aside journal is held" : "A release job is skipped because the hub refused its claim",
-    text: `Release ${job.id} (item ${item || "unknown"}, commit ${commit ? commit.slice(0, 12) : "unknown"}) is verified but not claimed: ${journal ? "the journal of its set-aside claim is held" : "the hub refused the claim"}. Reason: ${why}. Nothing was integrated, published or deployed. The deployer skips this job at every poll and goes on to later jobs; this notice is sent once per job per deployer run. Database handler: reconcile the job (Held claim in docs/project-deployment.md). Owner helper: for information.`};
+    text: `Release ${job.id} (item ${item || "unknown"}, commit ${commit ? commit.slice(0, 12) : "unknown"}) is verified but not claimed: ${journal ? "the journal of its set-aside claim is held" : "the hub refused the claim"}. Reason: ${why}. Nothing was integrated, published or deployed. The deployer skips this job at every poll and goes on to later jobs; this notice is sent once per job per deployer run to the database handler and to the owner helper. Database handler: reconcile the job (Held claim in docs/project-deployment.md). Owner helper: for information.`};
 }
 // The files verify-matrix.mjs requires before a browser check runs, in its
 // order (a drift test pins the list). All are gitignored, so provisioning
@@ -1615,13 +1618,26 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[])]);posted.add(notice.key);}catch{}
     }
   };
-  // One notice per skipped job for a process: a refused claim or a held
-  // set-aside journal. A failed post never changes the skip.
+  // A skipped job (a refused claim or a held set-aside journal) is told once
+  // per process to each of the project database handler and the live owner
+  // helper, directed so both are woken. While a recipient cannot be resolved
+  // or its post fails, one Board notice without a recipient stands in and that
+  // recipient is tried again at the next poll. Nothing here changes the skip.
+  const HELD_TO={handler:reader=>reader.handler(),helper:reader=>{
+    const live=JSON.parse(reader.command([config.tt||"tt","agents","--json"])).filter(a=>a?.role==="owner_helper" && !["closed","exited"].includes(a.status));
+    if(live.length!==1 || !/^agt_[a-f0-9]+$/.test(live[0].id||""))throw releaseError("One live owner helper required");return live[0].id;}};
   const heldNotify=(reader,job,kind,reason)=>{
-    const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);
-    if(!notice || posted.has(notice.key))return;
-    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[])]);posted.add(notice.key);}
-    catch{process.stderr.write("Held claim notice not posted; the next poll retries.\n");}
+    const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);if(!notice)return;
+    const send=(suffix,to)=>reader.command([config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[])]);
+    let missed=false;
+    for(const [name,resolve] of Object.entries(HELD_TO)){
+      if(posted.has(`${notice.key} ${name}`))continue;
+      try{send(name,resolve(reader));posted.add(`${notice.key} ${name}`);}catch{missed=true;}
+    }
+    if(!missed)return;
+    process.stderr.write("Held claim notice not delivered to every recipient; the next poll retries.\n");
+    if(posted.has(`${notice.key} board`))return;
+    try{send("board");posted.add(`${notice.key} board`);}catch{}
   };
   while(!signal?.aborted){
     let reader=null;

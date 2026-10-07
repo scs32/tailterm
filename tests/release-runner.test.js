@@ -1985,7 +1985,11 @@ test("code a9 a failed CLI call keeps its exact argv, exit code and stderr priva
 // over a fake hub whose stderr for a refused claim carries a synthetic secret
 // and the private journal path.
 const HELD_ITEM="wi_0123456789abcdef",HELD_SECRET="tth_SYNTHETICsecret0123456789abcdef";
-const sendOf=c=>{const a=c.argv,field=n=>a[a.indexOf(n)+1];return {to:a.includes("--to"),kind:field("--kind"),subject:field("--subject"),text:field("--text"),requestId:field("--request-id"),refs:a.filter((w,i)=>a[i-1]==="--ref")};};
+const HELD_HANDLER="agt_0123abcd",HELD_HELPER="agt_feedbeef";
+// The fake hub's roster and handler: one live owner helper beside a closed earlier one.
+const heldRoster=`if(a[0]==='deployment'&&a[1]==='handler'){console.log(JSON.stringify({id:${JSON.stringify(HELD_HANDLER)}}));process.exit(0);}
+if(a[0]==='agents'){console.log(JSON.stringify([{id:'agt_0ld',role:'owner_helper',status:'closed'},{id:${JSON.stringify(HELD_HANDLER)},role:'database_handler',status:'done'},{id:'agt_b111de7',status:'running'},{id:${JSON.stringify(HELD_HELPER)},role:'owner_helper',status:'running'}]));process.exit(0);}`;
+const sendOf=c=>{const a=c.argv,field=n=>a[a.indexOf(n)+1];return {to:a.includes("--to")?field("--to"):null,kind:field("--kind"),subject:field("--subject"),text:field("--text"),requestId:field("--request-id"),refs:a.filter((w,i)=>a[i-1]==="--ref")};};
 async function heldRun(t,h,polls,release){
  // Each poll ends in one release call (the later job); the mocked 30 s wait is then ticked.
  const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="",polled=0;
@@ -2002,16 +2006,21 @@ async function heldRun(t,h,polls,release){
 test("held r1 r2 r3 a refused claim sends exactly one notice with the hub's reason in a deployer run, the job stays skipped and nothing private leaves",async t=>{
  const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
  // The hub refuses rel_held only; its stderr ends with the refusal, a token, a NAME=value pair and the journal path.
- const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job')==='rel_held'){fs.writeSync(2,'debug line with '+${JSON.stringify(HELD_SECRET)}+'\\ntt: hub: 409 conflict: release: candidate changed since enqueue token '+${JSON.stringify(HELD_SECRET)}+' TAILTERM_TOKEN='+${JSON.stringify(HELD_SECRET)}+' '+__dirname+'/rel_held.json\\n');process.exit(1);}`);
+ const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job')==='rel_held'){fs.writeSync(2,'debug line with '+${JSON.stringify(HELD_SECRET)}+'\\ntt: hub: 409 conflict: release: candidate changed since enqueue token '+${JSON.stringify(HELD_SECRET)}+' TAILTERM_TOKEN='+${JSON.stringify(HELD_SECRET)}+' '+__dirname+'/rel_held.json\\n');process.exit(1);}`+heldRoster);
  const held={...verifiedJob("rel_held"),itemId:HELD_ITEM},next=verifiedJob("rel_next"),released=[];h.setJobs([held,next]);
  const err=await heldRun(t,h,3,async c=>{released.push(c.job.id);});
  // Skip unchanged: every poll tries the held job, prints the line, and goes on to the later job.
  const claims=h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]);
  assert.deepEqual(claims,["rel_held","rel_next","rel_held","rel_next","rel_held","rel_next"]);assert.deepEqual(released,["rel_next","rel_next","rel_next"]);
  assert.equal(err,"Release claim held; handler reconciliation required.\n".repeat(3));
- // Exactly one notice over three polls: board-wide, typed, naming job, item, commit and the reason.
- const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,1);const [n]=sent;
- assert.equal(n.kind,"notice");assert.equal(n.to,false);assert.equal(n.subject,"A release job is skipped because the hub refused its claim");assert.equal(n.requestId,"rel_held-claim-held-"+CODE_RUN);
+ // Over three polls exactly one typed notice to each of the handler and the owner helper, and none to the Board.
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.deepEqual(sent.map(s=>s.to),[HELD_HANDLER,HELD_HELPER]);const [n,copy]=sent;
+ const id=heldClaimNotice(held,"claim","hub: 409 conflict: release: candidate changed since enqueue token (removed) (tt deployment claim exit 1)",CODE_RUN).requestId;
+ assert.match(id,new RegExp("^rel_held-claim-held-"+CODE_RUN+"-[a-f0-9]{8}$"));assert.equal(n.requestId,id+"-handler");assert.equal(copy.requestId,id+"-helper");
+ assert.deepEqual({...copy,to:null,requestId:null},{...n,to:null,requestId:null});
+ assert.equal(n.kind,"notice");assert.equal(n.subject,"A release job is skipped because the hub refused its claim");
+ // The roster and the handler are read at the first poll only.
+ assert.equal(h.calls().filter(c=>c.argv[0]==="agents").length,1);assert.equal(h.calls().filter(c=>c.argv[1]==="handler").length,1);
  assert.deepEqual(n.refs,["release-job=rel_held","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
  assert.ok(n.text.includes("Release rel_held (item "+HELD_ITEM+", commit "+"c".repeat(12)+")"));
  assert.ok(n.text.includes("Reason: hub: 409 conflict: release: candidate changed since enqueue token (removed) (tt deployment claim exit 1)."));
@@ -2021,26 +2030,42 @@ test("held r1 r2 r3 a refused claim sends exactly one notice with the hub's reas
  // The exact stderr stays in the private record only.
  assert.ok(JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8")).failures[0].stderr.includes(HELD_SECRET));
 });
-test("held r1 r2 a held set-aside journal sends one notice per deployer run and is never claimed; a failed send keeps the skip and is retried",async t=>{
+test("held r1 r2 a held set-aside journal is never claimed; a recipient that cannot be resolved or reached gets a Board notice and is retried",async t=>{
  const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
- // The first send fails; later ones succeed.
- const h=codeHost(t,cwd,`if(a[0]==='send'&&!fs.existsSync(__dirname+'/sent-once')){fs.writeFileSync(__dirname+'/sent-once','');process.exit(4);}`);
+ // At the first poll the handler lookup fails and the post to the owner helper fails; from the second both work.
+ const once=(name,code)=>`if(!fs.existsSync(__dirname+'/${name}')){fs.writeFileSync(__dirname+'/${name}','');process.exit(${code});}`;
+ const h=codeHost(t,cwd,`if(a[0]==='deployment'&&a[1]==='handler'){${once("handler-failed",2)}}if(a[0]==='send'&&a.includes(${JSON.stringify(HELD_HELPER)})){${once("helper-failed",4)}}`+heldRoster);
  const held={...verifiedJob("rel_aside"),itemId:HELD_ITEM,reconciliations:[{disposition:"set_aside",agentId:"agt_old",runId:"run_old"}]},released=[];
  // A journal of another run: not exactly the set-aside claim.
  writeFileSync(join(h.home,"rel_aside.json"),JSON.stringify({jobId:"rel_aside",commit:held.commit,agentId:"agt_other",runId:"run_other",effects:[]}));
  h.setJobs([held,verifiedJob("rel_next")]);
- const err=await heldRun(t,h,3,async c=>{released.push(c.job.id);});
- assert.deepEqual(h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),["rel_next","rel_next","rel_next"]);assert.deepEqual(released,["rel_next","rel_next","rel_next"]);
+ const err=await heldRun(t,h,4,async c=>{released.push(c.job.id);});
+ assert.deepEqual(h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),Array(4).fill("rel_next"));assert.deepEqual(released,Array(4).fill("rel_next"));
  assert.ok(existsSync(join(h.home,"rel_aside.json")),"the held journal is left in place");
- assert.equal(err,"Set-aside release journal held; handler reconciliation required.\nHeld claim notice not posted; the next poll retries.\n"+"Set-aside release journal held; handler reconciliation required.\n".repeat(2));
- // The failed attempt and one delivered notice, same request id; the third poll sends nothing.
- const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,2);assert.deepEqual(sent[0],sent[1]);const n=sent[1];
- assert.equal(n.subject,"A release job is skipped because its set-aside journal is held");assert.equal(n.requestId,"rel_aside-claim-held-"+CODE_RUN);
- assert.deepEqual(n.refs,["release-job=rel_aside","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
- assert.ok(n.text.includes("Reason: the journal is unreadable, shows effects or is not of exactly the set-aside claim."));assert.match(n.text,SAFE_TEXT);
+ assert.equal(err,"Set-aside release journal held; handler reconciliation required.\nHeld claim notice not delivered to every recipient; the next poll retries.\n"+"Set-aside release journal held; handler reconciliation required.\n".repeat(3));
+ // Poll one: the failed post to the helper, then the Board notice. Poll two: one to each. Polls three and four: nothing.
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf),id=heldClaimNotice(held,"journal","the journal is unreadable, shows effects or is not of exactly the set-aside claim",CODE_RUN).requestId;
+ assert.deepEqual(sent.map(s=>[s.to,s.requestId]),[[HELD_HELPER,id+"-helper"],[null,id+"-board"],[HELD_HANDLER,id+"-handler"],[HELD_HELPER,id+"-helper"]]);
+ for(const n of sent){
+  assert.equal(n.kind,"notice");assert.equal(n.subject,"A release job is skipped because its set-aside journal is held");
+  assert.deepEqual(n.refs,["release-job=rel_aside","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
+  assert.ok(n.text.includes("Reason: the journal is unreadable, shows effects or is not of exactly the set-aside claim."));assert.match(n.text,SAFE_TEXT);
+ }
  for(const word of h.calls().flatMap(c=>c.argv))assert.ok(!word.includes(h.home));
- // A new deployer run (a new process) sends its own notice, once.
- await h.poll(null,async()=>{});assert.equal(h.calls().filter(c=>c.argv[0]==="send").length,3);
+ // A new deployer process sends each recipient its notice once more, under the same request ids.
+ await h.poll(null,async()=>{});assert.deepEqual(h.calls().filter(c=>c.argv[0]==="send").map(sendOf).slice(4).map(s=>[s.to,s.requestId]),[[HELD_HANDLER,id+"-handler"],[HELD_HELPER,id+"-helper"]]);
+});
+test("held r1 r2 with no live owner helper and no handler the Board notice is sent once per deployer run",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ // Two live helpers are as unusable as none; the handler lookup fails.
+ const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job')==='rel_held'){fs.writeSync(2,'tt: hub: 409 conflict: release: job cannot be taken over\\n');process.exit(1);}
+if(a[0]==='agents'){console.log(JSON.stringify([{id:'agt_aa',role:'owner_helper',status:'running'},{id:'agt_bb',role:'owner_helper',status:'retired'}]));process.exit(0);}`);
+ h.setJobs([{...verifiedJob("rel_held"),itemId:HELD_ITEM},verifiedJob("rel_next")]);
+ const err=await heldRun(t,h,3,async()=>{});
+ assert.equal(err,"Release claim held; handler reconciliation required.\nHeld claim notice not delivered to every recipient; the next poll retries.\n".repeat(3));
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,1);assert.equal(sent[0].to,null);assert.match(sent[0].requestId,/-board$/);
+ assert.ok(sent[0].text.includes("Reason: hub: 409 conflict: release: job cannot be taken over (tt deployment claim exit 1)."));
+ assert.equal(h.claims().filter(c=>c.argv.includes("rel_next")).length,3);
 });
 test("held r3 the notice keeps only plain words, small numbers and hub ids of the refusal, and only well-formed job fields",()=>{
  assert.equal(refusalText("noise\ntt: hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first\n"),"hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first");
@@ -2049,7 +2074,10 @@ test("held r3 the notice keeps only plain words, small numbers and hub ids of th
  for(const empty of [undefined,null,"","\n\n","/only/a/path","abc123 /p"])assert.equal(refusalText(empty),null);
  const long=refusalText("word ".repeat(300));assert.ok(long.length<=120&&long.startsWith("word word"));
  const n=heldClaimNotice({id:"rel_a",itemId:"wi_../../etc",commit:"not a commit"},"claim","bad\nreason "+HELD_SECRET+"!","run with spaces");
- assert.ok(n.text.includes("(item unknown, commit unknown)"));assert.ok(n.text.includes("Reason: unclassified."));assert.equal(n.item,null);assert.equal(n.commit,null);assert.equal(n.requestId,"rel_a-claim-held-unknown");assert.match(n.text,SAFE_TEXT);
+ assert.ok(n.text.includes("(item unknown, commit unknown)"));assert.ok(n.text.includes("Reason: unclassified."));assert.equal(n.item,null);assert.equal(n.commit,null);assert.match(n.requestId,/^rel_a-claim-held-unknown-[a-f0-9]{8}$/);assert.match(n.text,SAFE_TEXT);
+ // The request id follows the case and the reason, nothing else.
+ const idOf=(kind,reason)=>heldClaimNotice({id:"rel_a"},kind,reason,"run_1").requestId;
+ assert.equal(idOf("claim","one reason"),idOf("claim","one reason"));assert.notEqual(idOf("claim","one reason"),idOf("claim","another reason"));assert.notEqual(idOf("claim","one reason"),idOf("journal","one reason"));
  assert.equal(heldClaimNotice({id:"../rel"},"claim","x","r"),null);assert.equal(heldClaimNotice(null,"claim","x","r"),null);
 });
 // Every "./" or "../" import of the watched files that is not itself watched,
