@@ -1701,3 +1701,140 @@ func TestReviewConvergenceRebaseLifecycle(t *testing.T) {
 		}
 	}
 }
+
+// Settlement and lead-named fix: focused records that let the lead accept
+// without the owner after two completed general rounds.
+func focusedMeta(t *testing.T, raw string) api.ReviewMetadata {
+	t.Helper()
+	var meta api.ReviewMetadata
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+func focusedRequestEnv(meta api.ReviewMetadata) api.Envelope {
+	meta.Mode = "focused"
+	return api.Envelope{Kind: "request", Subject: "Verify the named focused check", Review: &meta, Body: api.EnvelopeBody{Ask: "Verify exactly the named check"}}
+}
+func focusedResultEnv(meta api.ReviewMetadata, status map[string]string, evidence map[string]api.Evidence) api.Envelope {
+	meta.Mode = "focused"
+	return api.Envelope{Kind: "result", Subject: "Focused check verdict recorded", Review: &meta, Body: api.EnvelopeBody{Outcome: "done", Status: status}, Evidence: evidence}
+}
+func receiptProof(candidate string) map[string]api.Evidence {
+	return map[string]api.Evidence{"e1": {Type: "record", Value: "passing verification receipt for " + candidate}}
+}
+func deltaFix(reviewed string) string {
+	return "Test-only fix after " + reviewed + ": accept TEST_BROWSER=both in the new browser test"
+}
+func deltaProof(reviewed, changed string) map[string]api.Evidence {
+	return map[string]api.Evidence{"e1": {Type: "command", Value: "git diff --stat " + reviewed + " " + changed + " -> 1 file changed, the named test"}}
+}
+func (f *convergenceFixture) thirdReviewRefused(t *testing.T, candidate string) {
+	t.Helper()
+	_, err := f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: f.criteria, VerificationCriteria: f.verificationCriteria}}, f.reviewer.ID, 0, f.lead)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "third general review refused") {
+		t.Fatal("third general review", err)
+	}
+	if st := f.state(t); len(st.Rounds) != 2 {
+		t.Fatal("round count changed", st)
+	}
+}
+
+var partialConvergence = map[string]string{"a1": "pass", "a2": "partial"}
+
+// Case A (wi_0de79d818662efe9 c5): round two left a2 partial only because the
+// matrix had not run; the passing receipt for the exact candidate settles it.
+func TestReviewConvergencePartialSettledByReceipt(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	if err := f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has not passed") {
+		t.Fatal("accept with a round-two partial", err)
+	}
+	f.thirdReviewRefused(t, candidateB)
+	// New route: the lead names the partial criterion; the original reviewer settles it.
+	meta := focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"Full matrix receipt covers a2","criterionIds":["a2"]}`)
+	request, err := f.post(focusedRequestEnv(meta), f.reviewer.ID, 0, api.Agent{})
+	if err != nil {
+		t.Fatal("settlement request refused", err)
+	}
+	if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("accepted before the settling verdict", err)
+	}
+	if _, err = f.post(focusedResultEnv(meta, map[string]string{"a2": "pass"}, receiptProof(candidateB)), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal("settling result refused", err)
+	}
+	f.thirdReviewRefused(t, candidateB)
+	if err = f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+		t.Fatal("settled partial not accepted", err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || st.Rounds[1].Verdicts["a2"] != "partial" || len(st.Focused) != 1 || !st.Focused[0].Passed || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateB {
+		t.Fatal("accepted state", st)
+	}
+	raw, _ := json.Marshal(st.Focused[0])
+	var record struct {
+		CriterionIDs      []string `json:"criterionIds"`
+		BlockerIDs        []string `json:"blockerIds"`
+		ReceiptGeneration int64    `json:"receiptGeneration"`
+	}
+	if err = json.Unmarshal(raw, &record); err != nil {
+		t.Fatal(err)
+	}
+	if len(record.CriterionIDs) != 1 || record.CriterionIDs[0] != "a2" || record.ReceiptGeneration <= 0 || !strings.Contains(string(raw), `"blockerIds":[]`) {
+		t.Fatal("settling record", string(raw))
+	}
+}
+
+// Case B (wi_0de79d818662efe9 c4): verification found a test-only fix after a
+// clean final round, so the candidate changed and no blocker ID exists.
+func TestReviewConvergenceVerificationFoundFix(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	if err := f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "changed candidate needs exact focused verification") {
+		t.Fatal("accept of the changed candidate", err)
+	}
+	named := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+deltaFix(candidateB)+`","blockerIds":["b1"]}`)
+	if _, err := f.post(focusedRequestEnv(named), f.reviewer.ID, 0, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "must name distinct unresolved blocker IDs") {
+		t.Fatal("focused request naming a blocker that does not exist", err)
+	}
+	f.thirdReviewRefused(t, candidateC)
+	// New route: the lead names the fix; the original reviewer confirms the exact delta.
+	meta := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+deltaFix(candidateB)+`","treeDiffers":true}`)
+	request, err := f.post(focusedRequestEnv(meta), f.reviewer.ID, 0, api.Agent{})
+	if err != nil {
+		t.Fatal("lead-named fix request refused", err)
+	}
+	st := f.state(t)
+	if raw, _ := json.Marshal(st.Focused); len(st.Focused) != 1 || !strings.Contains(string(raw), `"treeDiffers":true`) || !strings.Contains(string(raw), `"blockerIds":[]`) {
+		t.Fatal("stored record does not say the tree differs", string(raw))
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("accepted before the delta verdict", err)
+	}
+	if _, err = f.post(focusedResultEnv(meta, map[string]string{"delta": "pass"}, deltaProof(candidateB, candidateC)), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal("delta result refused", err)
+	}
+	f.thirdReviewRefused(t, candidateC)
+	if err = f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal("lead-named fix not accepted", err)
+	}
+	st = f.state(t)
+	if len(st.Rounds) != 2 || len(st.Focused) != 1 || !st.Focused[0].Passed || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateC {
+		t.Fatal("accepted state", st)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateB); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("team acceptance of the pre-fix commit", err)
+	}
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateC); err != nil {
+		t.Fatal("team acceptance of the fixed commit", err)
+	}
+}
