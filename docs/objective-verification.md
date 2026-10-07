@@ -523,14 +523,27 @@ can exceed the physical concurrency limit: If a holder is still alive 120 second
 after its run timeout, the first waiter takes the lock anyway. This is printed
 as a warning, journaled as `overlap` with the process and groups that were
 still alive, and recorded in the new run's sidecar and receipt
-(`VERIFICATION_HOST_OVERLAP=1`). No run ever signals another run. Under a
-memory hold the same exception applies to the one admitted slot: a single
-holder past its run timeout plus grace is taken over as an overlap, and with
-two live holders nothing is taken over while the reading stays over the limit.
+(`VERIFICATION_HOST_OVERLAP=1`). No run ever signals another run.
+
+The first waiter takes over as many overdue holders as it needs to free one
+slot, or none (owner amendment #26938). With both slots held and no memory
+hold that is one holder, as before. Under a one-slot memory hold every overdue
+holder in the way is taken over: a single overdue holder, or both of two
+overdue holders, so hung runs cannot keep a waiter, the deployer in particular,
+out until its wait bound. A holder that is alive and inside its run timeout
+plus grace is never taken over: with one overdue and one in-time holder under
+a hold nothing is taken over, the in-time holder's entry is untouched and the
+waiter stays held for memory; when the reading falls it takes over the one
+overdue holder. Each holder taken over gets its own warning line and its own
+`overlap` journal event. In the sidecar `overlap` stays `1` and
+`overlapDetails` is the first holder taken over; `overlaps` lists all of them.
+After a double takeover three runs can be alive at once (two hung, one new) on
+a host that is already over the limit; that is the price of not waiting for
+hung runs.
 
 A waiter whose process is gone is dropped (`waiter-dropped`). The journal
 events are `request`, `acquire`, `release`, `withdrawn`, `wait-expired`,
-`run-timeout-abort`, `stale-recovered`, `overlap`, `waiter-dropped`,
+`run-timeout-abort`, `stale-recovered`, `overlap` (one per holder taken over), `waiter-dropped`,
 `mutex-recovered`, `guard-stale`, `corrupt-file`, `holder-update-failed`,
 `memory-hold` and `memory-unreadable`.
 Each line has the time, the request id, pid, item and agent. The journal is
@@ -655,10 +668,12 @@ which waiters honour. A waiter in a checkout older than memory-aware admission
 ignores the memory rule and the release order: as head it takes a free slot
 whatever the reading, it re-sorts the list without the release rule, and it
 writes no `heldReason` for itself. Under a memory hold
-the deployer waits for one whole holder, so a hung holder (120-minute cap plus
-grace) can outlast the deployer's default 2-hour wait bound and end that
-release attempt with exit 75; before, both slots had to hang. The wait bound
-and the overdue takeover are unchanged. Builders' ad hoc test runs take no lock
+the deployer waits for one whole holder. A hung holder is taken over at its
+run timeout plus grace, by default at most 122 minutes after it started, and
+the deployer's default wait bound is 2 hours from when it joined. So a holder
+that started less than about two minutes before the deployer joined and then
+runs or hangs for its whole cap, or one recorded under a larger cap, can still
+end that release attempt with exit 75. The wait bound is unchanged. Builders' ad hoc test runs take no lock
 and are not counted by the memory rule. A process or group id
 reused by an unrelated process makes a dead run look alive; that only delays
 the next run, up to the run timeout plus grace. There is a short window

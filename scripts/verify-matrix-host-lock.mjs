@@ -752,17 +752,19 @@ export async function acquireHostLock(options = {}) {
     const recovered = deadHolders.at(-1) || null;
     const capacity = state.version === 1 ? 1 : state.holderLimit;
     // What admitting up to `slots` holders gives this request as the head.
+    // It takes over as many overdue holders as it needs to free one slot, or
+    // none: a holder inside its run timeout plus grace is never taken over.
     const admit = (slots) => {
-      let overlap = null;
+      let overlaps = [];
       if (mine === 0 && live.length >= slots) {
-        const overdue = live.find(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);
-        if (overdue) {
-          overlap = { reason: "run-timeout", holder: overdue.id, item: overdue.item, agent: overdue.agent, pid: pidGone(overdue.pid) ? null : overdue.pid, groups: liveGroups(overdue) };
-        }
+        const overdue = live.filter(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);
+        const need = live.length - slots + 1;
+        if (overdue.length >= need)
+          overlaps = overdue.slice(0, need).map(h => ({ reason: "run-timeout", holder: h.id, item: h.item, agent: h.agent, pid: pidGone(h.pid) ? null : h.pid, groups: liveGroups(h) }));
       }
-      const remaining = overlap ? live.filter(h => h.id !== overlap.holder) : live;
+      const remaining = live.filter(h => !overlaps.some(o => o.holder === h.id));
       const resourceBlocked = entry.worktree && remaining.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
-      return { overlap, remaining, resourceBlocked, free: mine === 0 && remaining.length < slots && !resourceBlocked };
+      return { overlaps, remaining, resourceBlocked, free: mine === 0 && remaining.length < slots && !resourceBlocked };
     };
     let admission = admit(capacity), memoryHeld = false;
     // The reading decides only a grant the slot count allows beside a live
@@ -778,7 +780,7 @@ export async function acquireHostLock(options = {}) {
         memoryHeld = !admission.free;
       }
     }
-    const { overlap, remaining, resourceBlocked } = admission;
+    const { overlaps, remaining, resourceBlocked } = admission, overlap = overlaps[0] || null;
     if (memoryHeld && memoryHeldSince === null) {
       memoryHeldSince = now();
       journal(paths, "memory-hold", entry, { reading: taken.reading, max: pressureMax });
@@ -791,7 +793,7 @@ export async function acquireHostLock(options = {}) {
     if (resourceBlocked) line += "; worktree in use";
     if (protectedWaiter(state.waiters[mine])) line += "; " + protectionText(state.waiters[mine]);
     if (admission.free) {
-      if (overlap) journal(paths, "overlap", entry, overlap);
+      for (const each of overlaps) journal(paths, "overlap", entry, each);
       const queued = state.waiters.shift();
       for (const waiter of state.waiters) if (waiter.seq < queued.seq) {
         const count = fairnessCount(waiter);
@@ -812,7 +814,7 @@ export async function acquireHostLock(options = {}) {
         nonUrgentOvertakes: fairnessCount(queued),
         overtakeLimit: fairnessLimit(queued),
         overlap: overlap ? 1 : 0,
-        ...(overlap ? { overlapDetails: overlap } : {}),
+        ...(overlap ? { overlapDetails: overlap, overlaps } : {}),
         ...(recovered ? { recovered: { reason: "pid-gone", holder: recovered.id, pid: recovered.pid } } : {}),
       });
       if (first && !live.length) Object.assign(record, { queuePosition: 0, queueLength: 0 });
@@ -820,7 +822,7 @@ export async function acquireHostLock(options = {}) {
       const { grantSeqAtRequest, overtakenBy, heldReason, ...held } = queued;
       setHolders(state, [...remaining, { ...held, startedAt: record.acquiredAt, groups: [] }]);
       journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap, memoryHeldMs: record.memoryHeldMs });
-      return { granted: true, overlap };
+      return { granted: true, overlaps };
     }
     // A later waiter is held by whatever holds the head.
     const heldReason = mine === 0 ? (memoryHeld ? "memory" : "slots") : state.waiters[0].heldReason ?? "slots";
@@ -871,10 +873,10 @@ export async function acquireHostLock(options = {}) {
       }
       first = false;
       if (result.value.granted) {
-        if (result.value.overlap)
+        for (const overlap of result.value.overlaps)
           say(
-            `matrix host: WARNING overlap, lock taken after run timeout from ${result.value.overlap.item}/${result.value.overlap.agent}` +
-              ` (pid ${result.value.overlap.pid ?? "gone"}, check groups ${result.value.overlap.groups.join(",") || "none"} still alive)`,
+            `matrix host: WARNING overlap, lock taken after run timeout from ${overlap.item}/${overlap.agent}` +
+              ` (pid ${overlap.pid ?? "gone"}, check groups ${overlap.groups.join(",") || "none"} still alive)`,
           );
         say(`matrix host: acquired after ${record.waitMs} ms`);
         break;

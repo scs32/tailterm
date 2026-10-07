@@ -1617,6 +1617,62 @@ test("M13 under a memory hold a single holder past its run timeout plus grace is
   assert.equal(taken.record.overlap, 1); assert.deepEqual(items(allHeld(full)), ["peer", "third"]);
   await taken.release(); await peer.release(); await late.release();
 });
+// Owner amendment #26938 (m8), ASSIGN #26947. The waiter's injected clock makes
+// a living child holder overdue without waiting out its run timeout.
+const skewed = () => { const clock = { aheadMs: 0 }; clock.now = () => Date.now() + clock.aheadMs; return clock; };
+const DAY_MS = 24 * 3600000;
+test("M14 under a one-slot hold two overdue holders are both taken over and the release waiter is admitted", async t => {
+  const path = lockFile(t), gauge = meter(90), clock = skewed(), lines = [], record = join(tempDir(t), "record");
+  const a = await heldByChild(t, path, { group: true, request: { ...two, item: "hung-a" } }), b = await heldByChild(t, path, { group: true, request: { ...two, item: "hung-b" } });
+  const urgent = asks(path, gauge, { item: "urgent", priority: "urgent" }); await heldAs(path, "urgent", "slots");
+  const release = asks(path, gauge, { item: "release", release: true, now: clock.now, maxWaitMs: DAY_MS, recordDirectory: record, print: line => lines.push(line) });
+  await heldAs(path, "release", "slots");
+  assert.deepEqual(items(waitersOf(path)), ["release", "urgent"]); assert.deepEqual(allHeld(path).map(h => h.id), [a.id, b.id]);
+  assert.equal(gauge.calls, 0, "a full host in time takes no reading"); assert(!events(path).includes("overlap"));
+  clock.aheadMs = 60000 + RUN_TIMEOUT_GRACE_MS + 60000;
+  const lease = await release;
+  assert.deepEqual(allHeld(path).map(h => h.id), [lease.id], "the release run alone holds");
+  const overlaps = journaled(path, "overlap");
+  assert.deepEqual(overlaps.map(line => [line.id, line.holder, line.reason, line.item, line.pid, line.groups]),
+    [[lease.id, a.id, "run-timeout", "hung-a", a.pid, [a.group]], [lease.id, b.id, "run-timeout", "hung-b", b.pid, [b.group]]]);
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.overlap, 1); assert.equal(sidecar.overlapDetails.holder, a.id);
+  assert.deepEqual(sidecar.overlaps.map(o => o.holder), [a.id, b.id]); assert.deepEqual(sidecar.overlaps[0], sidecar.overlapDetails);
+  assert.equal(receiptKeys(lease.finish({ checkSet: "unit" })).VERIFICATION_HOST_OVERLAP, "1");
+  assert.equal(lines.filter(line => /WARNING overlap, lock taken after run timeout from hung-[ab]\/tester/.test(line)).length, 2, lines.join(" | "));
+  assert.equal(journaled(path, "memory-hold", lease.id).length, 0, "it was never refused for memory");
+  for (const hung of [a, b]) { assert(!pidGone(hung.pid), "no holder process was signalled"); assert(!groupGone(hung.group), "no check group was signalled"); }
+  await heldAs(path, "urgent", "memory"); assert.deepEqual(items(waitersOf(path)), ["urgent"]);
+  await lease.release(); await (await urgent).release(); await releaseChild(a); await releaseChild(b);
+  assert.deepEqual(allHeld(path), []);
+});
+test("M15 under a one-slot hold an in-time holder is never taken over, and one overdue holder is when the reading falls", async t => {
+  const path = lockFile(t), gauge = meter(90), clock = skewed(), record = join(tempDir(t), "record");
+  const late = await heldByChild(t, path, { group: true, request: { ...two, item: "late" } });
+  const timely = await heldByChild(t, path, { group: true, request: { ...two, item: "timely", runTimeoutMs: 3600000 } });
+  const waiting = asks(path, gauge, { item: "head", now: clock.now, maxWaitMs: DAY_MS, recordDirectory: record }); await heldAs(path, "head", "slots");
+  const before = JSON.stringify(allHeld(path)), peer = structuredClone(allHeld(path).find(h => h.id === timely.id));
+  clock.aheadMs = 60000 + RUN_TIMEOUT_GRACE_MS + 60000;
+  await heldAs(path, "head", "memory");
+  const seen = gauge.calls; await until(() => gauge.calls >= seen + 3, "three more readings over the limit");
+  assert.equal(JSON.stringify(allHeld(path)), before, "both holders are on file unchanged");
+  assert.deepEqual(items(waitersOf(path)), ["head"]); assert.equal(waitersOf(path)[0].heldReason, "memory"); assert(!events(path).includes("overlap"));
+  gauge.reading = DEFAULT_MEMORY_PRESSURE_MAX;
+  const lease = await waiting, overlaps = journaled(path, "overlap");
+  assert.deepEqual(overlaps.map(line => [line.id, line.holder]), [[lease.id, late.id]]);
+  assert.deepEqual(allHeld(path).map(h => h.id), [timely.id, lease.id]); assert.deepEqual(allHeld(path)[0], peer, "the in-time holder's entry is unchanged");
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.overlap, 1); assert.deepEqual(sidecar.overlaps, [sidecar.overlapDetails]); assert.equal(sidecar.overlapDetails.holder, late.id);
+  for (const held of [late, timely]) { assert(!pidGone(held.pid)); assert(!groupGone(held.group)); }
+  await lease.release(); await releaseChild(late); await releaseChild(timely);
+  // Both holders in time under a hold: nothing is taken over, whatever the wait.
+  const calm = lockFile(t), high = meter(99);
+  const x = await asks(calm, high, { ...two, item: "x" }), y = await asks(calm, high, { ...two, item: "y" });
+  const third = asks(calm, high, { item: "third", graceMs: 0 }); await heldAs(calm, "third", "slots");
+  assert.equal(high.calls, 0); assert(!events(calm).includes("overlap"));
+  await x.release(); await heldAs(calm, "third", "memory"); await y.release();
+  const last = await third; assert.equal(last.record.overlap, 0); assert(!Object.hasOwn(last.record, "overlaps")); await last.release();
+});
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");
   assert(!existsSync(probeMarker), "a test ran sysctl");
