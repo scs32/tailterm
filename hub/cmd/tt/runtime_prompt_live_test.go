@@ -262,6 +262,7 @@ func TestRuntimePromptLiveCodexMigration(t *testing.T) {
 	}
 	start := exec.Command("tmux", "-L", os.Getenv("TT_TMUX_SOCKET"), "-f", "/dev/null", "new-session", "-d", "-x", "100", "-y", "30", "-s", session, "-c", cwd, codex)
 	start.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "USER=" + os.Getenv("USER"), "LANG=en_US.UTF-8", "TERM=xterm-256color", "CODEX_HOME=" + codexHome,
+		"TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR"),
 		"TAILTERM_HUB=" + b.Hub, "TAILTERM_TASK=" + b.Task, "TAILTERM_AGENT=" + b.Agent, "TAILTERM_RUN=" + b.Run}
 	if out, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("private tmux start: %v %s", err, out)
