@@ -12,6 +12,45 @@ import (
 	"time"
 )
 
+// TestMain runs the package's tests with TMUX_TMPDIR pointing at a directory
+// only this test process owns, and removes it afterwards, on pass and on
+// failure. tmux leaves a socket file behind when its server stops, so every
+// private -L server a test started used to leave one in the shared per-user
+// directory (wi_3493188f14edd3e3). Nothing is removed by name or age, and the
+// shared directory and its default server are never touched.
+//
+// The directory sits directly under /tmp rather than os.TempDir(): a unix
+// socket path holds about 104 bytes, and the macOS per-user temporary
+// directory would use half of that before the socket name.
+//
+// The TestContextArgvFixture child exits from inside its test and starts no
+// tmux, so it gets no directory to leave behind.
+func TestMain(m *testing.M) {
+	if os.Getenv("TT_SYNTHETIC_CONTEXT_ARGV") == "1" {
+		os.Exit(m.Run())
+	}
+	dir, err := os.MkdirTemp("/tmp", "tt-tmux-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "private tmux directory:", err)
+		os.Exit(1)
+	}
+	os.Setenv("TMUX_TMPDIR", dir)
+	code := m.Run()
+	// Stop any server a test left running; it would be unreachable once its
+	// socket is gone.
+	sockets, _ := filepath.Glob(filepath.Join(dir, "tmux-*", "*"))
+	for _, socket := range sockets {
+		_ = exec.Command("tmux", "-S", socket, "kill-server").Run()
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "remove private tmux directory:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
 func TestProbeSessionDistinguishesAbsenceFromProbeFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fake-tmux")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' \"$TT_PROBE_MESSAGE\" >&2\nexit 1\n"), 0700); err != nil {

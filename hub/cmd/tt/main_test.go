@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,8 +36,53 @@ func TestMain(m *testing.M) {
 	}
 	productionMinCommandTimeout = minCommandTimeout
 	minCommandTimeout = testCommandTimeout
-	os.Exit(m.Run())
+	os.Exit(runWithOwnTmuxDir(m))
 }
+
+// runWithOwnTmuxDir runs the package's tests with TMUX_TMPDIR pointing at a
+// directory only this test process owns, and removes it afterwards, on pass
+// and on failure. tmux leaves a socket file behind when its server stops, so
+// every private -L server a test started used to leave one in the shared
+// per-user directory (wi_3493188f14edd3e3). Nothing is removed by name or
+// age, and the shared directory and its default server are never touched.
+//
+// The directory sits directly under /tmp rather than os.TempDir(): a unix
+// socket path holds about 104 bytes, and the macOS per-user temporary
+// directory would use half of that before the socket name.
+//
+// A child that is this test binary again keeps the directory it inherited.
+// Some such children exit without returning here: with a directory each, one
+// package run left eleven empty ones behind.
+func runWithOwnTmuxDir(m *testing.M) int {
+	if dir := os.Getenv(testTmuxDirEnv); dir != "" && dir == os.Getenv("TMUX_TMPDIR") {
+		return m.Run()
+	}
+	dir, err := os.MkdirTemp("/tmp", "tt-tmux-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "private tmux directory:", err)
+		return 1
+	}
+	os.Setenv("TMUX_TMPDIR", dir)
+	os.Setenv(testTmuxDirEnv, dir)
+	code := m.Run()
+	// Stop any server a test left running; it would be unreachable once its
+	// socket is gone.
+	sockets, _ := filepath.Glob(filepath.Join(dir, "tmux-*", "*"))
+	for _, socket := range sockets {
+		_ = exec.Command("tmux", "-S", socket, "kill-server").Run()
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "remove private tmux directory:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	return code
+}
+
+// testTmuxDirEnv names the TMUX_TMPDIR a parent test process owns, so a child
+// can tell an inherited directory from one the caller's shell set.
+const testTmuxDirEnv = "TT_TEST_TMUX_TMPDIR"
 
 // testCommandTimeout is the floor the package's tests put under the CLI's
 // fixed command deadlines. Under full-matrix load one loopback request to a
