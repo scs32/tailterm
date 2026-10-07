@@ -22,6 +22,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 export const PRIORITIES = ["urgent", "high", "normal"];
+// Why a waiter is still waiting, kept on its entry in the lock file.
+export const HELD_REASONS = ["slots", "memory"];
 export const DEFAULT_HOST_WAIT_MS = 240 * 60000;
 export const DEFAULT_POLL_MS = 2000;
 export const DEFAULT_OVERTAKE_LIMIT = 2;
@@ -164,6 +166,54 @@ export function holderLimit(environment = process.env) {
   if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 16)
     throw new Error("TAILTERM_MATRIX_MAX_HOLDERS must be a decimal integer from 1 to 16");
   return Number(raw);
+}
+// Memory-aware admission (wi_fc5776e011eaabe1, order #26885). While the host's
+// memory-pressure reading is over this limit the lock admits one holder
+// instead of holderLimit. TAILTERM_MATRIX_MEMORY_PRESSURE_MAX is a whole
+// number from 1 to 99, or "off" (returned as null); unset or empty means 70.
+export const DEFAULT_MEMORY_PRESSURE_MAX = 70;
+export function memoryPressureMax(environment = process.env) {
+  const raw = environment.TAILTERM_MATRIX_MEMORY_PRESSURE_MAX;
+  if (raw === undefined || raw === "") return DEFAULT_MEMORY_PRESSURE_MAX;
+  if (raw === "off") return null;
+  if (!/^[1-9][0-9]?$/.test(raw))
+    throw new Error('TAILTERM_MATRIX_MEMORY_PRESSURE_MAX must be a whole number from 1 to 99, or "off"');
+  return Number(raw);
+}
+// TAILTERM_MATRIX_RELEASE=1 marks the release deployer's integrated run, which
+// is granted ahead of every other waiter. Unset or empty means an ordinary run.
+export function releaseRun(environment = process.env) {
+  const raw = environment.TAILTERM_MATRIX_RELEASE;
+  if (raw === undefined || raw === "") return false;
+  if (raw !== "1") throw new Error("TAILTERM_MATRIX_RELEASE must be 1 or unset");
+  return true;
+}
+export const MEMORY_PROBE_MS = 1000;
+// The reading: the percentage of memory the kernel does not count as
+// available, 0 to 100, higher is worse (100 - kern.memorystatus_level). Throws
+// with the reason when the platform has no such reading or it cannot be read;
+// the caller then admits by slot count alone.
+export function readMemoryPressure({ platform = process.platform, run = spawnSync } = {}) {
+  if (platform !== "darwin") throw new Error(`no memory-pressure reading on ${platform}`);
+  const result = run("sysctl", ["-n", "kern.memorystatus_level"], {
+    env: { ...process.env, PATH: [process.env.PATH, "/usr/sbin"].filter(Boolean).join(":") },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: MEMORY_PROBE_MS,
+    killSignal: "SIGKILL",
+  });
+  if (result?.error)
+    throw new Error(
+      result.error.code === "ETIMEDOUT"
+        ? `sysctl timed out after ${MEMORY_PROBE_MS} ms`
+        : "sysctl could not run: " + result.error.message,
+    );
+  if (result?.status !== 0)
+    throw new Error("sysctl failed: " + (result?.signal ? "signal " + result.signal : "exit " + result?.status));
+  const text = String(result.stdout ?? "").trim();
+  if (!/^(0|[1-9][0-9]?|100)$/.test(text))
+    throw new Error("sysctl returned no percentage from 0 to 100");
+  return 100 - Number(text);
 }
 // Each request freezes its own fairness budget so all polling processes use
 // the same rule even if their environments differ. Urgent grants neither use
@@ -383,7 +433,9 @@ function parseState(raw) {
       (e.recordDirectory !== undefined && (typeof e.recordDirectory !== "string" || !isAbsolute(e.recordDirectory))) ||
       (e.worktree !== undefined && (typeof e.worktree !== "string" || !isAbsolute(e.worktree))) ||
       !PRIORITIES.includes(e.priority) || !Number.isSafeInteger(e.runTimeoutMs) || e.runTimeoutMs <= 0 ||
-      (e.groups !== undefined && (!Array.isArray(e.groups) || e.groups.some(g => !Number.isSafeInteger(g) || g <= 1)))))
+      (e.groups !== undefined && (!Array.isArray(e.groups) || e.groups.some(g => !Number.isSafeInteger(g) || g <= 1))) ||
+      (e.release !== undefined && typeof e.release !== "boolean") ||
+      (e.heldReason !== undefined && !HELD_REASONS.includes(e.heldReason))))
       return "invalid entry";
     if (entries.some(e =>
       (e.overtakeLimit !== undefined && (!Number.isSafeInteger(e.overtakeLimit) || e.overtakeLimit < 1 || e.overtakeLimit > 1000)) ||
@@ -468,7 +520,10 @@ function updateSync(paths, entry, change, withinMs) {
 }
 
 const ordered = (waiters) => {
-  const remaining = [...waiters].sort((a, b) => a.seq - b.seq), result = [];
+  // A waiting release run goes ahead of every other waiter, in arrival order;
+  // the rest keep the barrier/priority/FIFO order below.
+  const arrivals = [...waiters].sort((a, b) => a.seq - b.seq);
+  const result = arrivals.filter(w => w.release === true), remaining = arrivals.filter(w => w.release !== true);
   while (remaining.length) {
     // A protected arrival is a barrier to later non-urgent arrivals. Choose
     // priority/FIFO only from the prefix ending at the oldest such barrier;
@@ -519,7 +574,9 @@ function hookExit() {
 // path, priority, prioritySource, kind (run|targeted|exec), item, agent,
 // commit, output (logged in the file), recordDirectory (host-lock.log and the
 // host-lock.json sidecar), runTimeoutMs, maxWaitMs, pollMs, graceMs, signal,
-// print, now, extra (copied into the sidecar), environment (holder/fairness limits).
+// print, now, extra (copied into the sidecar), environment (holder, fairness
+// and memory-pressure limits), release (the deployer's run, granted first),
+// memoryPressure (a function returning the reading; tests inject one).
 // The requester clamps its own run timeout to the holder cap, so the deadline
 // it records in the file is the one it stops itself at. A waiter never
 // shortens the deadline another holder recorded.
@@ -537,6 +594,7 @@ export async function acquireHostLock(options = {}) {
     print = () => {},
     now = Date.now,
     recordDirectory,
+    memoryPressure = readMemoryPressure,
   } = options;
   const { priority, prioritySource } =
     options.priority && options.prioritySource
@@ -549,6 +607,8 @@ export async function acquireHostLock(options = {}) {
     throw new Error("Invalid host wait bound");
   const limit = holderLimit(options.environment ?? process.env);
   const overtakeBudget = overtakeLimit(options.environment ?? process.env);
+  const pressureMax = memoryPressureMax(options.environment ?? process.env);
+  const releaseMarked = options.release === true;
   const paths = lockPaths(options.path ?? lockPath());
   const requestedMs = now();
   const entry = {
@@ -566,6 +626,7 @@ export async function acquireHostLock(options = {}) {
     nonUrgentOvertakes: 0,
     overtakeLimit: overtakeBudget,
     runTimeoutMs,
+    ...(releaseMarked ? { release: true } : {}),
     ...(options.commit ? { commit: options.commit } : {}),
     ...(options.output || recordDirectory ? { output: canonicalResource(options.output || recordDirectory) } : {}),
     ...(recordDirectory ? { recordDirectory: canonicalResource(recordDirectory) } : {}),
@@ -598,6 +659,9 @@ export async function acquireHostLock(options = {}) {
     requestedRunTimeoutMs,
     cpuCount: availableParallelism(),
     loadSamples: [],
+    ...(releaseMarked ? { release: true } : {}),
+    memoryPressureMax: pressureMax ?? "off",
+    memoryHeldMs: 0,
     ...(options.extra || {}),
   };
 
@@ -618,10 +682,40 @@ export async function acquireHostLock(options = {}) {
   // Grants the head into a free, resource-compatible slot. Dead leases and
   // exceptional overdue takeovers are recovered independently by exact ID.
   // Returns true when granted. No run is ever signalled from here.
+  // The memory reading is never taken under the file mutex: step asks for one
+  // (needsReading) only when it decides the grant, the wait loop takes it and
+  // the next step consumes it.
   let shown = "",
     shownAt = 0,
-    busyAt = 0;
+    busyAt = 0,
+    pressure = null,
+    unreadableNoted = false,
+    memoryHeldSince = null;
+  const probe = () => {
+    let reading, reason;
+    try {
+      reading = memoryPressure();
+      if (!Number.isFinite(reading) || reading < 0 || reading > 100)
+        reason = "the reading was not a number from 0 to 100";
+    } catch (error) {
+      reason = String(error?.message || error);
+    }
+    if (reason === undefined) return (record.memoryReading = reading), { reading };
+    if (!unreadableNoted) {
+      unreadableNoted = true;
+      journal(paths, "memory-unreadable", entry, { reason });
+      say(`matrix host: memory pressure unreadable (${reason}), admitting by slot count`);
+    }
+    return { unreadable: reason };
+  };
+  const memoryHoldEnds = () => {
+    if (memoryHeldSince === null) return;
+    record.memoryHeldMs += Math.max(0, now() - memoryHeldSince);
+    memoryHeldSince = null;
+  };
   const step = (state, first) => {
+    const taken = pressure;
+    pressure = null;
     // Confirm ownership once under the mutex before checking resource roots.
     // A dead pid with a surviving group still owns its lease and its output.
     const deadHolders = [], live = [];
@@ -655,29 +749,55 @@ export async function acquireHostLock(options = {}) {
     if (mine < 0) throw new HostLockError("lost-request", `Host lock request ${entry.id} is no longer in ${paths.file}`);
     const position = mine + 1, length = state.waiters.length;
     if (first) Object.assign(record, { seq: entry.seq, queuePosition: position, queueLength: length });
-    let overlap = null, recovered = deadHolders.at(-1) || null;
+    const recovered = deadHolders.at(-1) || null;
     const capacity = state.version === 1 ? 1 : state.holderLimit;
-    if (mine === 0 && live.length >= capacity) {
-      const overdue = live.find(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);
-      if (overdue) {
-        overlap = { reason: "run-timeout", holder: overdue.id, item: overdue.item, agent: overdue.agent, pid: pidGone(overdue.pid) ? null : overdue.pid, groups: liveGroups(overdue) };
+    // What admitting up to `slots` holders gives this request as the head.
+    const admit = (slots) => {
+      let overlap = null;
+      if (mine === 0 && live.length >= slots) {
+        const overdue = live.find(h => now() > Date.parse(h.startedAt) + h.runTimeoutMs + graceMs);
+        if (overdue) {
+          overlap = { reason: "run-timeout", holder: overdue.id, item: overdue.item, agent: overdue.agent, pid: pidGone(overdue.pid) ? null : overdue.pid, groups: liveGroups(overdue) };
+        }
+      }
+      const remaining = overlap ? live.filter(h => h.id !== overlap.holder) : live;
+      const resourceBlocked = entry.worktree && remaining.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
+      return { overlap, remaining, resourceBlocked, free: mine === 0 && remaining.length < slots && !resourceBlocked };
+    };
+    let admission = admit(capacity), memoryHeld = false;
+    // The reading decides only a grant the slot count allows beside a live
+    // holder. With no holder the head is always admitted, and a full host, a
+    // later waiter and a one-slot cohort take no reading.
+    if (admission.free && live.length && capacity > 1 && pressureMax !== null) {
+      if (!taken) {
+        state.waiters[mine].heldReason ??= "slots";
+        return { granted: false, needsReading: true };
+      }
+      if (taken.reading > pressureMax) {
+        admission = admit(1);
+        memoryHeld = !admission.free;
       }
     }
-    const remaining = overlap ? live.filter(h => h.id !== overlap.holder) : live;
-    const resourceBlocked = entry.worktree && remaining.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
+    const { overlap, remaining, resourceBlocked } = admission;
+    if (memoryHeld && memoryHeldSince === null) {
+      memoryHeldSince = now();
+      journal(paths, "memory-hold", entry, { reading: taken.reading, max: pressureMax });
+    }
+    if (!memoryHeld) memoryHoldEnds();
     const holder = live[0] || null;
     let line = `matrix host: waiting ${position} of ${length}, holder ${holder ? describe(holder) : "none"}`;
     if (holder && pidGone(holder.pid) && liveGroups(holder).length) line += ` gone, check group ${liveGroups(holder).join(",")} still running`;
     if (live.length > 1) line += `; holders ${live.map(describe).join("; ")}`;
     if (resourceBlocked) line += "; worktree in use";
     if (protectedWaiter(state.waiters[mine])) line += "; " + protectionText(state.waiters[mine]);
-    if (mine === 0 && remaining.length < capacity && !resourceBlocked) {
+    if (admission.free) {
       if (overlap) journal(paths, "overlap", entry, overlap);
       const queued = state.waiters.shift();
       for (const waiter of state.waiters) if (waiter.seq < queued.seq) {
         const count = fairnessCount(waiter);
         waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
-        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" ? 0 : 1);
+        // A release grant, like an urgent one, spends nobody's fairness budget.
+        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" || queued.release === true ? 0 : 1);
       }
       // Persist the new grant order immediately, including between polls when
       // another slot is free and the next grant could happen at once.
@@ -697,11 +817,15 @@ export async function acquireHostLock(options = {}) {
       });
       if (first && !live.length) Object.assign(record, { queuePosition: 0, queueLength: 0 });
       state.grantSeq += 1;
-      const { grantSeqAtRequest, overtakenBy, ...held } = queued;
+      const { grantSeqAtRequest, overtakenBy, heldReason, ...held } = queued;
       setHolders(state, [...remaining, { ...held, startedAt: record.acquiredAt, groups: [] }]);
-      journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap });
+      journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap, memoryHeldMs: record.memoryHeldMs });
       return { granted: true, overlap };
     }
+    // A later waiter is held by whatever holds the head.
+    const heldReason = mine === 0 ? (memoryHeld ? "memory" : "slots") : state.waiters[0].heldReason ?? "slots";
+    state.waiters[mine].heldReason = heldReason;
+    if (heldReason === "memory") line += "; memory pressure over the limit, one holder admitted";
     return { granted: false, line, position, length, holder };
   };
   // Leaves the waitlist. If the file cannot be updated now, the entry stays
@@ -720,6 +844,7 @@ export async function acquireHostLock(options = {}) {
       ).done;
     } catch {}
     if (removed) active.delete(entry.id);
+    memoryHoldEnds();
     Object.assign(record, { outcome: event, releasedAt: iso(now()), waitMs: Math.max(0, now() - requestedMs) });
     journal(paths, event, entry, { waitMs: record.waitMs, removed, ...extra });
     saveRecord();
@@ -753,6 +878,10 @@ export async function acquireHostLock(options = {}) {
           );
         say(`matrix host: acquired after ${record.waitMs} ms`);
         break;
+      }
+      if (result.value.needsReading) {
+        pressure = probe();
+        continue;
       }
       last = result.value;
       if (last.line !== shown || Date.now() - shownAt >= REPEAT_LINE_MS) {
@@ -991,7 +1120,7 @@ export async function execWithHostLock(argv, options = {}) {
 export function statusText(file = lockPath()) {
   const state = readHostState(file);
   const lines = ["matrix host lock: " + file];
-  const tags = (e) => `${e.kind}, ${e.priority}/${e.prioritySource}`;
+  const tags = (e) => `${e.kind}, ${e.priority}/${e.prioritySource}${e.release === true ? ", release" : ""}`;
   const holders = holdersOf(state);
   if (!holders.length) lines.push("holder: none");
   for (const h of holders) {
@@ -1004,7 +1133,7 @@ export function statusText(file = lockPath()) {
   const waiters = state?.waiters || [];
   lines.push(waiters.length ? "waiters:" : "waiters: none");
   waiters.forEach((w, i) =>
-    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}; ${protectionText(w)}`),
+    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}; ${protectionText(w)}${w.heldReason ? "; held: " + w.heldReason : ""}`),
   );
   return lines.join("\n");
 }
@@ -1013,7 +1142,8 @@ const USAGE =
   "Usage: node scripts/verify-matrix-host-lock.mjs status [--json]\n" +
   "       node scripts/verify-matrix-host-lock.mjs exec --item ID --timeout-minutes N --record /abs/dir\n" +
   "            [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] -- COMMAND [ARGS...]\n" +
-  "Fairness: TAILTERM_MATRIX_OVERTAKE_LIMIT=1..1000 (default 2); urgent grants are exempt.";
+  "Fairness: TAILTERM_MATRIX_OVERTAKE_LIMIT=1..1000 (default 2); urgent grants are exempt.\n" +
+  "Memory: TAILTERM_MATRIX_MEMORY_PRESSURE_MAX=1..99 or off (default 70); over it one holder is admitted.";
 export function minutesFlag(name, value, max) {
   if (!/^[1-9][0-9]{0,3}$/.test(value || "") || Number(value) > max)
     throw new Error(`${name} requires a whole number of minutes from 1 to ${max}`);

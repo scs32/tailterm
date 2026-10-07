@@ -38,6 +38,12 @@ import {
   overtakeLimit,
   canonicalResource,
   updateHostState,
+  memoryPressureMax,
+  readMemoryPressure,
+  releaseRun,
+  receiptKeys,
+  DEFAULT_MEMORY_PRESSURE_MAX,
+  MEMORY_PROBE_MS,
 } from "../scripts/verify-matrix-host-lock.mjs";
 import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
 
@@ -54,6 +60,15 @@ const readHostState = (...args) => {
 delete process.env.TAILTERM_MATRIX_PRIORITY;
 delete process.env.TAILTERM_MATRIX_HOLDER_CAP_MINUTES;
 delete process.env.TAILTERM_MATRIX_OVERTAKE_LIMIT;
+// No test here may read the host's memory pressure either: the feature is off
+// unless a test injects a reading, and a sysctl stub placed first on PATH
+// records any probe that still gets through, child processes included (M12).
+process.env.TAILTERM_MATRIX_MEMORY_PRESSURE_MAX = "off";
+delete process.env.TAILTERM_MATRIX_RELEASE;
+const probeMarker = join(isolated, "sysctl-ran");
+mkdirSync(join(isolated, "bin"));
+writeFileSync(join(isolated, "bin", "sysctl"), `#!/bin/sh\n: >> '${probeMarker}'\necho 50\n`, { mode: 0o755 });
+process.env.PATH = join(isolated, "bin") + ":" + process.env.PATH;
 process.on("exit", () => rmSync(isolated, { recursive: true, force: true }));
 
 const moduleFile = fileURLToPath(new URL("../scripts/verify-matrix-host-lock.mjs", import.meta.url));
@@ -72,7 +87,7 @@ const request = (path, extra = {}) => ({
   item: "wi_test",
   agent: "tester",
   ...extra,
-  environment: { TAILTERM_MATRIX_MAX_HOLDERS: "1", ...extra.environment },
+  environment: { TAILTERM_MATRIX_MAX_HOLDERS: "1", TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "off", ...extra.environment },
 });
 async function until(condition, what, ms = 15000) {
   const deadline = Date.now() + ms;
@@ -1066,13 +1081,13 @@ test("a9 (iii) a waiter under a smaller cap never shortens the deadline a living
 });
 
 // wi_af52350b616dd0e4 / order21517 / ASSIGN22512: real default-two cohorts.
-const two = { environment: { TAILTERM_MATRIX_MAX_HOLDERS: undefined }, maxWaitMs: 5000 };
+const two = { environment: { TAILTERM_MATRIX_MAX_HOLDERS: undefined, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "off" }, maxWaitMs: 5000 };
 const allHeld = path => holdersOf(rawReadHostState(path));
 async function releaseChild(held) { held.child.kill("SIGUSR1"); await exited(held.child); }
 test("two holders run concurrently; either freed slot grants priority then FIFO with a third waiting", async t => {
   for (const slot of [0, 1]) {
     const path = lockFile(t);
-    const cohort = slot === 0 ? two : { ...two, environment: { TAILTERM_MATRIX_MAX_HOLDERS: "" } };
+    const cohort = slot === 0 ? two : { ...two, environment: { ...two.environment, TAILTERM_MATRIX_MAX_HOLDERS: "" } };
     const peers = [await heldByChild(t, path, { request: { ...cohort, item: "A" } }), await heldByChild(t, path, { request: { ...cohort, item: "B" } })];
     assert.equal(rawReadHostState(path).version, 2); assert.equal(rawReadHostState(path).holderLimit, 2);
     assert.equal(allHeld(path).length, 2);
@@ -1307,4 +1322,305 @@ test("a complete socket budget rejection removes its allocated home before launc
   assert.equal(lock.outcome, "released");
   assert.equal(lock.overlap, 0);
   console.log(JSON.stringify({ socketBudgetRejection: { home, homeRemoved: !existsSync(home), groups, noCheck: !existsSync(marker), noReceipt: !existsSync(join(output, "receipt.json")) } }));
+});
+
+// wi_fc5776e011eaabe1 / order 26885 / ASSIGN 26917: memory-aware admission.
+// Every reading is injected; two slots and the default limit of 70.
+const gated = { environment: { TAILTERM_MATRIX_MAX_HOLDERS: undefined, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "" }, maxWaitMs: 30000 };
+const items = entries => entries.map(e => e.item);
+function meter(reading) {
+  const gauge = { reading, calls: 0 };
+  gauge.memoryPressure = () => { gauge.calls++; if (gauge.reading instanceof Error) throw gauge.reading; return gauge.reading; };
+  return gauge;
+}
+const asks = (path, gauge, extra) => acquireHostLock(request(path, { ...gated, memoryPressure: gauge.memoryPressure, ...extra }));
+const heldAs = (path, item, reason) => until(() => waitersOf(path).some(w => w.item === item && w.heldReason === reason), `${item} held by ${reason}`);
+const journaled = (path, event, id) => readJournal(path).filter(line => line.event === event && (!id || line.id === id));
+
+test("M1 over the limit the head keeps its place behind one holder, and is admitted when the reading drops", async t => {
+  const path = lockFile(t), gauge = meter(71), granted = [];
+  const holder = await asks(path, gauge, { item: "holder" });
+  assert.equal(gauge.calls, 0);
+  const head = asks(path, gauge, { item: "head" }).then(lease => (granted.push("head"), lease));
+  await heldAs(path, "head", "memory");
+  const later = asks(path, gauge, { item: "later" }).then(lease => (granted.push("later"), lease));
+  await heldAs(path, "later", "memory");
+  const seen = gauge.calls;
+  await until(() => gauge.calls >= seen + 3, "three more readings over the limit");
+  assert.deepEqual(items(waitersOf(path)), ["head", "later"], "the head is still first");
+  assert.deepEqual(items(allHeld(path)), ["holder"]); assert.deepEqual(granted, []);
+  gauge.reading = 70;
+  const second = await head;
+  assert.deepEqual(items(allHeld(path)), ["holder", "head"], "two holders on file");
+  assert.equal(second.record.overlap, 0); assert.deepEqual(granted, ["head"]);
+  await heldAs(path, "later", "slots");
+  await holder.release(); await (await later).release(); await second.release();
+  assert.deepEqual(allHeld(path), []);
+});
+test("M2 while the reading stays over the head is admitted when the holder releases, and the next waiter still waits", async t => {
+  const path = lockFile(t), gauge = meter(95);
+  const holder = await asks(path, gauge, { item: "holder" });
+  const head = asks(path, gauge, { item: "head" }); await heldAs(path, "head", "memory");
+  const next = asks(path, gauge, { item: "next" }); await heldAs(path, "next", "memory");
+  await holder.release();
+  const lease = await head;
+  assert.deepEqual(items(allHeld(path)), ["head"]); assert.equal(lease.record.overlap, 0);
+  const seen = gauge.calls;
+  await until(() => gauge.calls >= seen + 3, "the next waiter's own readings");
+  assert.deepEqual(items(waitersOf(path)), ["next"]); assert.equal(waitersOf(path)[0].heldReason, "memory");
+  assert.deepEqual(items(allHeld(path)), ["head"], "one holder while the reading is over");
+  await lease.release(); await (await next).release();
+  assert(!events(path).includes("overlap"));
+});
+test("M3 with no holder a reading of 100 admits at once and is never taken", async t => {
+  const path = lockFile(t), gauge = meter(100);
+  const lease = await asks(path, gauge, { item: "alone" });
+  assert.equal(gauge.calls, 0); assert.deepEqual(events(path), ["request", "acquire"]);
+  assert.equal(lease.record.memoryHeldMs, 0); assert(!Object.hasOwn(lease.record, "memoryReading"));
+  await lease.release();
+  // A waiter left alone by its holder is admitted the same way.
+  const holder = await asks(path, gauge, { item: "holder" }), waiting = asks(path, gauge, { item: "waiter" });
+  await heldAs(path, "waiter", "memory"); await holder.release();
+  const next = await waiting; assert.deepEqual(items(allHeld(path)), ["waiter"]); await next.release();
+});
+test("M4 a reading at or below the limit admits the second holder as before", async t => {
+  for (const reading of [DEFAULT_MEMORY_PRESSURE_MAX, 12, 0]) {
+    const path = lockFile(t), gauge = meter(reading);
+    const first = await asks(path, gauge), second = await asks(path, gauge, { item: "second" });
+    assert.equal(allHeld(path).length, 2); assert.equal(second.record.overlap, 0);
+    assert.equal(gauge.calls, 1); assert.equal(second.record.memoryReading, reading); assert.equal(second.record.memoryHeldMs, 0);
+    assert.deepEqual(journaled(path, "memory-hold"), []);
+    await first.release(); await second.release();
+  }
+  // A lower configured limit moves the boundary.
+  const path = lockFile(t), gauge = meter(41), lower = { environment: { ...gated.environment, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "40" } };
+  const first = await asks(path, gauge, lower), waiting = asks(path, gauge, { ...lower, item: "second" });
+  await heldAs(path, "second", "memory"); gauge.reading = 40;
+  const second = await waiting; assert.equal(allHeld(path).length, 2);
+  await first.release(); await second.release();
+});
+test("M5 an unreadable or unsupported reading admits by slot count with one memory-unreadable journal line", async t => {
+  const unreadable = [() => null, () => NaN, () => 101, () => -1, () => "55", () => undefined, () => { throw new Error("probe broke"); }, () => readMemoryPressure({ platform: "linux" })];
+  for (const memoryPressure of unreadable) {
+    const path = lockFile(t), lines = [];
+    const first = await acquireHostLock(request(path, { ...gated, memoryPressure }));
+    const second = await acquireHostLock(request(path, { ...gated, memoryPressure, item: "second", print: line => lines.push(line) }));
+    assert.equal(allHeld(path).length, 2); assert.equal(second.record.overlap, 0);
+    assert.equal(journaled(path, "memory-unreadable").length, 1);
+    assert.equal(journaled(path, "memory-unreadable", second.id).length, 1);
+    assert.equal(typeof journaled(path, "memory-unreadable")[0].reason, "string");
+    assert.deepEqual(journaled(path, "memory-hold"), []);
+    assert.equal(lines.filter(line => /memory pressure unreadable \(.+\), admitting by slot count/.test(line)).length, 1, lines.join(" | "));
+    assert(!Object.hasOwn(second.record, "memoryReading"));
+    await first.release(); await second.release();
+  }
+  // With both slots still full by count, an unreadable reading admits nobody.
+  const path = lockFile(t), broken = meter(new Error("probe broke"));
+  const first = await asks(path, broken), second = await asks(path, broken, { item: "second" });
+  const third = asks(path, broken, { item: "third" }); await heldAs(path, "third", "slots");
+  assert.equal(allHeld(path).length, 2); assert.equal(broken.calls, 1);
+  await first.release(); const last = await third; assert.equal(allHeld(path).length, 2);
+  await second.release(); await last.release();
+});
+test("M6 waiters persist heldReason memory or slots, status shows it, and holders carry none", async t => {
+  const path = lockFile(t), gauge = meter(88), lines = [];
+  const holder = await asks(path, gauge, { item: "holder" });
+  const head = asks(path, gauge, { item: "head", print: line => lines.push(line) }); await heldAs(path, "head", "memory");
+  const behind = asks(path, gauge, { item: "behind" }); await heldAs(path, "behind", "memory");
+  assert.deepEqual(rawReadHostState(path).waiters.map(w => [w.item, w.heldReason]), [["head", "memory"], ["behind", "memory"]]);
+  const held = statusText(path).split("\n").filter(line => / of 2: /.test(line));
+  assert.equal(held.length, 2); for (const line of held) assert.match(line, /; held: memory$/);
+  assert(lines.some(line => /^matrix host: waiting 1 of \d, holder holder\/tester\/pid \d+; memory pressure over the limit, one holder admitted$/.test(line)), lines.join(" | "));
+  gauge.reading = 10;
+  const second = await head; await heldAs(path, "behind", "slots");
+  assert.equal(allHeld(path).length, 2);
+  for (const entry of allHeld(path)) assert(!Object.hasOwn(entry, "heldReason"), "holders carry no held reason");
+  assert.match(statusText(path), / 1 of 1: .*; held: slots$/m); assert.doesNotMatch(statusText(path), /held: memory/);
+  assert.equal(JSON.parse(execFileSync(process.execPath, [moduleFile, "status", "--json"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" })).state.waiters[0].heldReason, "slots");
+  await holder.release(); const third = await behind;
+  for (const entry of allHeld(path)) assert(!Object.hasOwn(entry, "heldReason"));
+  await second.release(); await third.release();
+});
+test("M7 a hold journals one memory-hold and the sidecar records it, with the twelve receipt keys unchanged", async t => {
+  const path = lockFile(t), gauge = meter(93), record = join(tempDir(t), "record");
+  const holder = await asks(path, gauge, { item: "holder" });
+  const waiting = asks(path, gauge, { item: "head", recordDirectory: record }); await heldAs(path, "head", "memory");
+  const seen = gauge.calls; await until(() => gauge.calls >= seen + 3, "a hold lasting several readings");
+  gauge.reading = 30;
+  const lease = await waiting, holds = journaled(path, "memory-hold");
+  assert.equal(holds.length, 1); assert.deepEqual([holds[0].id, holds[0].reading, holds[0].max], [lease.id, 93, 70]);
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.memoryPressureMax, 70); assert.equal(sidecar.memoryReading, 30);
+  assert(Number.isSafeInteger(sidecar.memoryHeldMs) && sidecar.memoryHeldMs > 0, String(sidecar.memoryHeldMs));
+  assert(sidecar.memoryHeldMs <= sidecar.waitMs);
+  assert.equal(journaled(path, "acquire", lease.id)[0].memoryHeldMs, sidecar.memoryHeldMs);
+  assert.match(readFileSync(join(record, "host-lock.log"), "utf8"), /memory pressure over the limit, one holder admitted/);
+  assert.deepEqual(Object.keys(receiptKeys(lease.finish({ checkSet: "unit" }))), [
+    "VERIFICATION_HOST_LOCK", "VERIFICATION_HOST_PRIORITY", "VERIFICATION_HOST_PRIORITY_SOURCE", "VERIFICATION_HOST_WAIT_MS",
+    "VERIFICATION_HOST_QUEUE_POSITION", "VERIFICATION_HOST_QUEUE_LENGTH", "VERIFICATION_HOST_GRANTS_BEFORE_START",
+    "VERIFICATION_HOST_OVERTAKEN_BY", "VERIFICATION_HOST_OVERLAP", "VERIFICATION_CHECK_SET", "VERIFICATION_RUN_DURATION_MS", "VERIFICATION_HOST_LOAD"]);
+  // A second hold by the same run is a second line.
+  await holder.release(); await lease.release();
+  const again = await asks(path, gauge, { item: "holder" }); gauge.reading = 93;
+  const twice = asks(path, gauge, { item: "twice" }); await heldAs(path, "twice", "memory");
+  gauge.reading = 30; const next = await twice; assert.equal(journaled(path, "memory-hold").length, 2);
+  await again.release(); await next.release();
+});
+test("M8 a waiting release run sorts first and takes the single slot, fairness counts unchanged, and run mode passes the marker", async t => {
+  const path = lockFile(t), gauge = meter(90), order = [];
+  const joins = (item, extra) => asks(path, gauge, { item, ...extra }).then(lease => (order.push(item), lease));
+  const holder = await asks(path, gauge, { item: "holder" });
+  const normal = joins("normal"); await until(() => waitersOf(path).length === 1, "normal");
+  assert(updateHostState(path, state => { state.waiters[0].nonUrgentOvertakes = 2; }).done);
+  const urgent = joins("urgent", { priority: "urgent" }); await until(() => waitersOf(path).length === 2, "urgent");
+  const team = joins("team", { priority: "high" }); await until(() => waitersOf(path).length === 3, "team");
+  assert.deepEqual(items(waitersOf(path)), ["urgent", "normal", "team"], "a protected normal bars the later high run");
+  const release = joins("release", { release: true }); await until(() => waitersOf(path).length === 4, "release");
+  assert.deepEqual(items(waitersOf(path)), ["release", "urgent", "normal", "team"]);
+  assert.equal(waitersOf(path)[0].release, true); assert(!Object.hasOwn(waitersOf(path)[1], "release"));
+  assert.match(statusText(path), / 1 of 4: release\/tester\/pid \d+ \(run, normal\/default, release\)/);
+  await heldAs(path, "release", "memory"); assert.deepEqual(order, []);
+  const before = waitersOf(path).slice(1).map(w => [w.item, w.nonUrgentOvertakes, w.overtakenBy]);
+  await holder.release();
+  const deployer = await release;
+  assert.deepEqual(order, ["release"]); assert.deepEqual(allHeld(path).map(h => [h.item, h.release]), [["release", true]]);
+  assert.deepEqual(items(waitersOf(path)), ["urgent", "normal", "team"]);
+  assert.deepEqual(waitersOf(path).map(w => [w.item, w.nonUrgentOvertakes, w.overtakenBy]), before.map(([item, fair, total]) => [item, fair, total + 1]),
+    "the release grant is counted, but spends nobody's fairness budget");
+  await heldAs(path, "urgent", "memory"); assert.deepEqual(order, ["release"], "the release run takes the one slot, the urgent run waits");
+  gauge.reading = 5; await deployer.release();
+  for (const waiting of [urgent, normal, team]) await (await waiting).release();
+  assert.deepEqual(order, ["release", "urgent", "normal", "team"]);
+  // Two release runs keep arrival order.
+  gauge.reading = 90;
+  const again = await asks(path, gauge, { item: "holder" });
+  const a = joins("release-a", { release: true }); await until(() => waitersOf(path).length === 1, "release-a");
+  const b = joins("release-b", { release: true, priority: "urgent" }); await until(() => waitersOf(path).length === 2, "release-b");
+  assert.deepEqual(items(waitersOf(path)), ["release-a", "release-b"]);
+  await again.release(); await (await a).release(); await (await b).release();
+
+  for (const value of [undefined, ""]) assert.equal(releaseRun({ TAILTERM_MATRIX_RELEASE: value }), false);
+  assert.equal(releaseRun({}), false); assert.equal(releaseRun({ TAILTERM_MATRIX_RELEASE: "1" }), true);
+  for (const value of ["0", "true", "yes", " 1", "1 ", "01", "2"]) assert.throws(() => releaseRun({ TAILTERM_MATRIX_RELEASE: value }), /TAILTERM_MATRIX_RELEASE must be 1 or unset/);
+
+  // runPlan hands the marker to the lock, and the run command sets it from the environment.
+  const done = join(tempDir(t), "done");
+  const source = `import fs from 'node:fs';const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(done)})){clearInterval(t);}},20);`;
+  const direct = runnerFixture(t, source), runPath = lockFile(t);
+  const running = runPlan(direct.plan, direct.cwd, tempDir(t, "matrix-host-lock-logs-"), { minFreeBytes: 0, hostLock: { path: runPath, pollMs: 20, release: true } });
+  await until(() => allHeld(runPath).length === 1, "the marked run to hold");
+  assert.deepEqual([allHeld(runPath)[0].kind, allHeld(runPath)[0].release], ["run", true]);
+  writeFileSync(done, ""); await running; rmSync(done);
+  const viaCommand = async (marker) => {
+    const fixture = runnerFixture(t, source), lock = lockFile(t), planFile = join(tempDir(t), "plan.json"), output = tempDir(t, "matrix-host-lock-logs-");
+    writeFileSync(planFile, JSON.stringify(fixture.plan));
+    const child = spawn(process.execPath, [fileURLToPath(new URL("../scripts/verify-matrix.mjs", import.meta.url)), "run", planFile, output, "--priority", "normal", "--min-free-bytes", "0"],
+      { cwd: fixture.cwd, env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: lock, TAILTERM_MATRIX_MAX_HOLDERS: "2", ...(marker === undefined ? {} : { TAILTERM_MATRIX_RELEASE: marker }) }, stdio: ["ignore", "pipe", "pipe"] });
+    let said = ""; child.stdout.on("data", d => (said += d)); child.stderr.on("data", d => (said += d));
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+    return { child, lock, text: () => said };
+  };
+  const marked = await viaCommand("1");
+  await until(() => allHeld(marked.lock).length === 1 || marked.child.exitCode !== null, "the run command to hold");
+  assert.equal(allHeld(marked.lock)[0]?.release, true, marked.text());
+  const plain = await viaCommand(undefined);
+  await until(() => allHeld(plain.lock).length === 1 || plain.child.exitCode !== null, "the unmarked run command to hold");
+  assert.equal(allHeld(plain.lock).length, 1, plain.text()); assert(!Object.hasOwn(allHeld(plain.lock)[0], "release"));
+  writeFileSync(done, ""); await exited(marked.child); await exited(plain.child);
+  assert.deepEqual([marked.child.exitCode, plain.child.exitCode], [0, 0], marked.text() + plain.text());
+  const refused = await viaCommand("yes"); await exited(refused.child);
+  assert.notEqual(refused.child.exitCode, 0); assert.match(refused.text(), /TAILTERM_MATRIX_RELEASE must be 1 or unset/);
+  assert(!existsSync(refused.lock), "refused before joining the list");
+});
+test("M9 the limit defaults to 70, accepts 1 to 99 and off, and a bad value refuses before any file is written", async t => {
+  assert.equal(DEFAULT_MEMORY_PRESSURE_MAX, 70);
+  assert.equal(memoryPressureMax({}), 70); assert.equal(memoryPressureMax({ TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "" }), 70);
+  for (const [raw, value] of [["1", 1], ["9", 9], ["70", 70], ["99", 99], ["off", null]])
+    assert.equal(memoryPressureMax({ TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: raw }), value);
+  for (const raw of ["0", "100", "7.5", "abc", "-1", " 70", "70 ", "070", "OFF", "on"]) {
+    assert.throws(() => memoryPressureMax({ TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: raw }), /whole number from 1 to 99, or "off"/);
+    const path = lockFile(t), record = join(tempDir(t), "record"), gauge = meter(10);
+    await assert.rejects(asks(path, gauge, { environment: { ...gated.environment, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: raw }, recordDirectory: record }), /whole number from 1 to 99, or "off"/);
+    assert(!existsSync(path)); assert(!existsSync(record)); assert.equal(gauge.calls, 0);
+  }
+  const path = lockFile(t), gauge = meter(100), off = { environment: { ...gated.environment, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "off" } };
+  const record = join(tempDir(t), "record");
+  const first = await asks(path, gauge, off), second = await asks(path, gauge, { ...off, item: "second", recordDirectory: record });
+  assert.equal(allHeld(path).length, 2); assert.equal(gauge.calls, 0);
+  assert.equal(JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8")).memoryPressureMax, "off");
+  await first.release(); await second.release();
+});
+test("M10 readMemoryPressure with an injected run gives 44 for 56 and is unreadable on failure", () => {
+  const calls = [];
+  assert.equal(readMemoryPressure({ platform: "darwin", run: (...args) => (calls.push(args), { status: 0, stdout: "56\n" }) }), 44);
+  assert.deepEqual(calls[0].slice(0, 2), ["sysctl", ["-n", "kern.memorystatus_level"]]);
+  assert.equal(calls[0][2].timeout, MEMORY_PROBE_MS); assert.equal(MEMORY_PROBE_MS, 1000);
+  assert.match(calls[0][2].env.PATH, /:\/usr\/sbin$/);
+  assert.equal(readMemoryPressure({ platform: "darwin", run: () => ({ status: 0, stdout: "0" }) }), 100);
+  assert.equal(readMemoryPressure({ platform: "darwin", run: () => ({ status: 0, stdout: "100\n" }) }), 0);
+  const timedOut = Object.assign(new Error("spawnSync sysctl ETIMEDOUT"), { code: "ETIMEDOUT" });
+  const missing = Object.assign(new Error("spawnSync sysctl ENOENT"), { code: "ENOENT" });
+  for (const [result, why] of [
+    [{ status: 1, stdout: "" }, /sysctl failed: exit 1/], [{ status: null, signal: "SIGKILL", stdout: "" }, /sysctl failed: signal SIGKILL/],
+    [{ error: timedOut, status: null }, /timed out after 1000 ms/], [{ error: missing, status: null }, /could not run/],
+    [{ status: 0, stdout: "abc\n" }, /no percentage/], [{ status: 0, stdout: "56.5\n" }, /no percentage/], [{ status: 0, stdout: "" }, /no percentage/],
+    [{ status: 0, stdout: "101\n" }, /no percentage/], [{ status: 0, stdout: "-1\n" }, /no percentage/], [{ status: 0 }, /no percentage/], [undefined, /sysctl failed/]])
+    assert.throws(() => readMemoryPressure({ platform: "darwin", run: () => result }), why);
+  for (const platform of ["linux", "win32", "freebsd"])
+    assert.throws(() => readMemoryPressure({ platform, run: () => assert.fail("no probe off darwin") }), /no memory-pressure reading on/);
+});
+test("M11 files without the new fields are accepted, bad field values refuse unchanged, and a v1 cohort takes no reading", async t => {
+  const stamp = new Date().toISOString();
+  const old = extra => ({ id: "old-holder", seq: 1, pid: process.pid, kind: "run", item: "old", agent: "tester", priority: "normal", prioritySource: "default",
+    requestedAt: stamp, startedAt: stamp, runTimeoutMs: 60000, groups: [], ...extra });
+  const file = holder => JSON.stringify({ version: 2, host: "h", updatedAt: stamp, requestSeq: 1, grantSeq: 1, holderLimit: 2, holders: [holder], waiters: [] });
+  const path = lockFile(t), gauge = meter(20);
+  writeFileSync(path, file(old()));
+  const lease = await asks(path, gauge, { item: "new" });
+  assert.deepEqual(items(allHeld(path)), ["old", "new"]); assert.equal(gauge.calls, 1);
+  await lease.release();
+  for (const bad of [{ heldReason: "other" }, { heldReason: null }, { release: "yes" }, { release: 1 }, { release: null }]) {
+    const raw = file(old(bad)); writeFileSync(path, raw);
+    await assert.rejects(asks(path, gauge), error => error.code === "corrupt-file" && error.exitCode === EXIT_LOCK_UNUSABLE && /invalid entry/.test(error.message));
+    assert.equal(readFileSync(path, "utf8"), raw);
+    assert.throws(() => rawReadHostState(path), error => error.exitCode === 78);
+  }
+  for (const good of [{ heldReason: "slots" }, { heldReason: "memory" }, { release: true }, { release: false }]) {
+    writeFileSync(path, file(old(good))); assert.equal(holdersOf(rawReadHostState(path)).length, 1);
+  }
+  rmSync(path);
+  const owner = await acquireHostLock(request(path)), state = rawReadHostState(path), high = meter(100);
+  writeFileSync(path, JSON.stringify({ ...state, version: 1, holder: allHeld(path)[0], holders: undefined, holderLimit: undefined }));
+  const queued = asks(path, high, { item: "queued" }); await heldAs(path, "queued", "slots");
+  assert.equal(rawReadHostState(path).version, 1);
+  await owner.release(); await (await queued).release(); assert.equal(high.calls, 0);
+});
+test("M13 under a memory hold a single holder past its run timeout plus grace is taken over as a recorded overlap", async t => {
+  const path = lockFile(t), gauge = meter(90), lines = [];
+  const overdue = await asks(path, gauge, { item: "overdue", runTimeoutMs: 200 });
+  const lease = await asks(path, gauge, { item: "next", graceMs: 200, print: line => lines.push(line) });
+  assert(Date.parse(lease.record.acquiredAt) >= Date.parse(overdue.record.acquiredAt) + 400 - 5, "not before the run timeout plus grace");
+  assert.equal(lease.record.overlap, 1); assert.equal(lease.record.overlapDetails.holder, overdue.id);
+  assert.deepEqual(items(allHeld(path)), ["next"]);
+  assert.equal(journaled(path, "overlap", lease.id).length, 1); assert.equal(journaled(path, "memory-hold", lease.id).length, 1);
+  assert(lease.record.memoryHeldMs > 0);
+  assert(lines.some(line => /WARNING overlap, lock taken after run timeout from overdue\/tester/.test(line)), lines.join(" | "));
+  await lease.release(); await overdue.release();
+  // Two live holders, one overdue: nothing is taken over while the reading is over.
+  const full = lockFile(t), low = meter(10);
+  const late = await asks(full, low, { item: "late", runTimeoutMs: 100 }), peer = await asks(full, low, { item: "peer" });
+  low.reading = 90;
+  const third = asks(full, low, { item: "third", graceMs: 100 }); await heldAs(full, "third", "memory");
+  const seen = low.calls; await until(() => low.calls >= seen + 3 && Date.now() > Date.parse(late.record.acquiredAt) + 300, "readings past the grace");
+  assert.deepEqual(items(allHeld(full)), ["late", "peer"]); assert(!events(full).includes("overlap"));
+  low.reading = 10; const taken = await third;
+  assert.equal(taken.record.overlap, 1); assert.deepEqual(items(allHeld(full)), ["peer", "third"]);
+  await taken.release(); await peer.release(); await late.release();
+});
+test("M12 no test in this file, child processes included, probed the host's memory", () => {
+  assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");
+  assert(!existsSync(probeMarker), "a test ran sysctl");
+  // The guard is live: the default reader finds the stub, not the host.
+  assert.equal(readMemoryPressure({ platform: "darwin" }), 50);
+  assert(existsSync(probeMarker), "the stub records a probe");
 });

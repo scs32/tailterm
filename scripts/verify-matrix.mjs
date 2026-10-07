@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
 import {
   acquireHostLock,
+  releaseRun,
   resolveRunPriority,
   receiptKeys,
   minutesFlag,
@@ -1665,6 +1666,8 @@ if (
           abortSignal: interruption.signal,
           hostLock: {
             ...resolveRunPriority(priority, input?.itemId || item),
+            // The deployer marks its integrated run; only run mode honours it.
+            ...(mode === "run" && releaseRun(process.env) ? { release: true } : {}),
             maxWaitMs,
             item,
             print: (line) => console.log(line),

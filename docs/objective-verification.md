@@ -330,7 +330,8 @@ before it starts and releases its own lease when it ends. A run that finds
 all slots occupied or its canonical worktree in use joins an ordered waitlist. Nobody checks `ps` or waits for a quiet period any
 more: the lock file is the only thing a waiting run reads.
 
-**Order.** Urgent first, then high, then everything else, and first come first
+**Order.** A waiting release run first (see "The deployer" below), then
+urgent, then high, then everything else, and first come first
 served within a priority. Arrival order is a sequence number assigned when the
 request joins, so two requests with the same timestamp keep their order. A run
 that holds the lock is never interrupted for a more urgent one.
@@ -356,6 +357,53 @@ unset or empty means 2. Invalid configuration refuses before enqueue or sidecar
 creation. A v2 cohort freezes `holderLimit` while any holder or waiter remains;
 a different limit refuses without joining. A drained cohort can change capacity.
 
+**Memory-aware admission.** Bug `wi_fc5776e011eaabe1`, order #26885,
+ASSIGN #26917. Slots alone let two runs start on a host that is already short
+of memory, and then every run slows down. So before the head waiter is granted
+a slot beside a running holder, it takes one memory-pressure reading for the
+host:
+
+- The reading is the percentage of memory the kernel does not count as
+  available, 0 to 100, higher is worse. On macOS it is
+  `100 - kern.memorystatus_level`, read with `sysctl -n kern.memorystatus_level`
+  (found through `PATH`, then `/usr/sbin`) with a one-second timeout. Swap use
+  is not the reading: swap stays allocated long after pressure falls.
+- `TAILTERM_MATRIX_MEMORY_PRESSURE_MAX` is the limit: a whole number from 1
+  through 99, or `off` to disable the rule. Unset or empty means 70, which holds
+  the second slot of a 16 GB host only while under 30 percent (about 4.8 GB) is
+  available. An invalid value refuses before the run joins the list or writes a
+  sidecar. Each run reads its own environment; nothing is frozen in the file.
+- While the reading is over the limit (strictly: a reading equal to the limit
+  admits), the host admits one holder instead of `holderLimit`. The head waiter
+  keeps its place, takes a fresh reading at every poll, and is granted when the
+  reading is at or below the limit or the holder ends. Later waiters stay behind
+  it; nobody is skipped.
+- With no holder the head is always admitted and no reading is taken, so a
+  high reading can never leave the host idle. A full host, a later waiter and
+  a one-slot (`TAILTERM_MATRIX_MAX_HOLDERS=1` or v1) cohort take no reading
+  either.
+- A reading that cannot be taken (the command is missing, fails, times out or
+  prints something else, or the platform is not macOS) falls back to the slot
+  count alone, as before this rule. The run prints `matrix host: memory pressure
+  unreadable (REASON), admitting by slot count` and journals `memory-unreadable`
+  once.
+- Running holders are never interrupted; the reading only decides new grants.
+  The limit set too low costs one run at a time; set too high it is the slot
+  count alone.
+
+Each waiter's entry carries `heldReason`, rewritten at every poll: `memory`
+when the head was refused a free slot by the reading, `slots` when no slot is
+free (or its worktree is in use), and for a later waiter whatever holds the
+head. Holders carry none. `status` appends `; held: memory` or `; held: slots`
+to each waiter line and `status --json` shows the field, so a sweep can tell a
+full host from a memory hold. A held head also says so in its waiting line.
+When a hold starts the journal gets `memory-hold` with the `reading` and the
+`max`; `acquire` gains `memoryHeldMs`. The sidecar `host-lock.json` gains
+`memoryPressureMax` (the limit, or `off`), `memoryHeldMs` and, when a reading
+was taken, the last one as `memoryReading`. The receipt keys do not change.
+The default of 70 is not calibrated against a measured incident; these records
+are the data for tuning it.
+
 ```json
 {
   "version": 2,
@@ -373,13 +421,26 @@ a different limit refuses without joining. A drained cohort can change capacity.
     "groups": [4250], "commit": "exact-sha",
     "worktree": "/abs/worktree-a", "output": "/abs/logs-a"
   }],
-  "waiters": []
+  "waiters": [{
+    "id": "lease-b", "seq": 41, "pid": 4300, "kind": "run",
+    "item": "wi_release", "agent": "deployer",
+    "priority": "high", "prioritySource": "flag", "release": true,
+    "requestedAt": "2026-10-03T23:00:30.000Z", "runTimeoutMs": 7200000,
+    "grantSeqAtRequest": 37, "overtakenBy": 0,
+    "nonUrgentOvertakes": 0, "overtakeLimit": 2,
+    "heldReason": "memory",
+    "worktree": "/abs/worktree-b", "output": "/abs/logs-b"
+  }]
 }
 ```
 
+`release` (only ever `true` on the deployer's run) and `heldReason` (`slots` or
+`memory`, waiters only) are optional: files and clients without them stay
+valid, and any other value fails closed like other malformed state.
+
 `holders` is empty when free; v2 has no singleton `holder` alias. Readers must
 inspect all holders. The lease ID, PID and canonical output identify the run.
-`waiters` is stored in priority/FIFO grant order. `kind` is `run`, `targeted`
+`waiters` is stored in grant order: release runs, then priority/FIFO. `kind` is `run`, `targeted`
 or `exec`; each holder's `groups` tracks only its own check process groups.
 Updates land by atomic rename under the existing mutex.
 
@@ -412,6 +473,7 @@ and at least once a minute:
 ```text
 matrix host: waiting 2 of 3, holder wi_…/verifier-…/pid 4242
 matrix host: waiting 1 of 1, holder wi_…/verifier-…/pid 4242 gone, check group 4250 still running
+matrix host: waiting 1 of 2, holder wi_…/verifier-…/pid 4242; memory pressure over the limit, one holder admitted
 matrix host: acquired after 184213 ms
 ```
 
@@ -421,7 +483,8 @@ exits 75. SIGINT or SIGTERM while waiting also leaves the list, with the usual
 exit 130 or 143.
 
 **When the lock moves on.** A waiter is granted the lock when it is first in
-the list, a slot is free and no holder uses its canonical worktree. A dead
+the list, a slot is free, no holder uses its canonical worktree and, beside a
+running holder, the memory reading is not over the limit. A dead
 holder frees only its own slot when its process and every recorded check group
 are gone. The second case is journaled as
 `stale-recovered` with reason `pid-gone`. A killed runner whose checks are
@@ -460,12 +523,16 @@ can exceed the physical concurrency limit: If a holder is still alive 120 second
 after its run timeout, the first waiter takes the lock anyway. This is printed
 as a warning, journaled as `overlap` with the process and groups that were
 still alive, and recorded in the new run's sidecar and receipt
-(`VERIFICATION_HOST_OVERLAP=1`). No run ever signals another run.
+(`VERIFICATION_HOST_OVERLAP=1`). No run ever signals another run. Under a
+memory hold the same exception applies to the one admitted slot: a single
+holder past its run timeout plus grace is taken over as an overlap, and with
+two live holders nothing is taken over while the reading stays over the limit.
 
 A waiter whose process is gone is dropped (`waiter-dropped`). The journal
 events are `request`, `acquire`, `release`, `withdrawn`, `wait-expired`,
 `run-timeout-abort`, `stale-recovered`, `overlap`, `waiter-dropped`,
-`mutex-recovered`, `guard-stale`, `corrupt-file` and `holder-update-failed`.
+`mutex-recovered`, `guard-stale`, `corrupt-file`, `holder-update-failed`,
+`memory-hold` and `memory-unreadable`.
 Each line has the time, the request id, pid, item and agent. The journal is
 not rotated yet.
 
@@ -530,7 +597,17 @@ list. The runner starts it detached with `--priority`, `--item` and
 `--host-wait-minutes`, counts no processes, and polls. Its priority is the
 release job's if the hub carries one, else the private config key
 `matrixPriority`, else `high`; its wait bound is `matrixHostWaitMs` (default 2
-hours); its holder bound is the clamped value above. While it waits, the
+hours); its holder bound is the clamped value above. The runner also sets
+`TAILTERM_MATRIX_RELEASE=1` in that run's environment (argv is unchanged).
+`verify-matrix.mjs run` then marks its lock entry `release: true`, and a
+waiting release run is ordered ahead of every other waiter, urgent and
+protected ones included, in arrival order among release runs; `status` tags it
+`release`. Its grant counts in older waiters' `overtakenBy` but, like an urgent
+grant, spends nobody's fairness budget. It is not exempt from the memory rule:
+under a memory hold it takes the one slot next, when the holder ends or the
+reading falls, so team runs cannot starve it. The variable must be `1`, unset or
+empty; anything else refuses before the run joins. `targeted` and `exec` ignore
+it, and it is for the deployer only. While it waits, the
 deployer posts a notice with its position, the list length and the holder set each
 time one of them changes. If it must stop its own run it signals only that run,
 never a check group, and holds the job when it cannot confirm the run stopped.
@@ -574,7 +651,15 @@ read it (`wi_772e88d71e5cd0e5`).
 
 **Limits.** A runner in a checkout older than phase 1 takes no lock until
 it is rebased, and one older than phase 2 records an unclamped run timeout,
-which waiters honour. Builders' ad hoc test runs take no lock. A process or group id
+which waiters honour. A waiter in a checkout older than memory-aware admission
+ignores the memory rule and the release order: as head it takes a free slot
+whatever the reading, it re-sorts the list without the release rule, and it
+writes no `heldReason` for itself. Under a memory hold
+the deployer waits for one whole holder, so a hung holder (120-minute cap plus
+grace) can outlast the deployer's default 2-hour wait bound and end that
+release attempt with exit 75; before, both slots had to hang. The wait bound
+and the overdue takeover are unchanged. Builders' ad hoc test runs take no lock
+and are not counted by the memory rule. A process or group id
 reused by an unrelated process makes a dead run look alive; that only delays
 the next run, up to the run timeout plus grace. There is a short window
 between a check starting and its group reaching the file, and the children of

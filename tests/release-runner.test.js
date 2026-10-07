@@ -27,6 +27,8 @@ const releaseReplySource = "const releaseReply="+releaseReply.toString()+";\n";
 // No test here may fall back to the host's own verification lock file.
 process.env.TAILTERM_MATRIX_HOST_LOCK=join(mkdtempSync(join(tmpdir(),"release-matrix-lock-")),"host.json");
 process.env.TAILTERM_MATRIX_MAX_HOLDERS = "1";
+// No test here reads the host's memory pressure (wi_fc5776e011eaabe1).
+process.env.TAILTERM_MATRIX_MEMORY_PRESSURE_MAX = "off";
 const readHostState = (...args) => {
   const state = rawReadHostState(...args);
   const held = holdersOf(state);
@@ -709,7 +711,7 @@ import {spawn} from 'node:child_process';
 import {acquireHostLock} from ${JSON.stringify(LOCK_MODULE)};
 const o=JSON.parse(process.argv[2]);
 if(o.resist)process.on('SIGTERM',()=>{});
-const lease=await acquireHostLock({path:o.path,priority:o.priority,prioritySource:'flag',item:o.item,agent:'deployer',output:o.dir,recordDirectory:o.dir,runTimeoutMs:600000,pollMs:20,environment:{TAILTERM_MATRIX_MAX_HOLDERS:o.limit||'1'}});
+const lease=await acquireHostLock({path:o.path,priority:o.priority,prioritySource:'flag',item:o.item,agent:'deployer',output:o.dir,recordDirectory:o.dir,runTimeoutMs:600000,pollMs:20,environment:{TAILTERM_MATRIX_MAX_HOLDERS:o.limit||'1',TAILTERM_MATRIX_MEMORY_PRESSURE_MAX:'off'}});
 let group=null;
 if(o.group){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await new Promise(r=>c.on('spawn',r));c.unref();group=c.pid;lease.addGroup(group);}
 if(o.mode==='receipt'){fs.writeFileSync(o.dir+'/receipt.json',JSON.stringify({environment:{},checks:[{exitCode:0}]}));await lease.release();process.exit(0);}
@@ -1023,6 +1025,18 @@ test("a10 the default launch is detached with its output on file, and this proce
  await ended(child);
  // It never joined the host list and left no record of its own: held, not refused.
  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixHeld.reason,"check group state cannot be shown");
+});
+test("a14 the integrated run is started with TAILTERM_MATRIX_RELEASE=1 in its environment and its argv unchanged",async t=>{
+ const h=matrixHost(),dir=attemptDir(h.home,h.integrated.integratedCommit,0);let given;h.adapter.hostState=()=>null;
+ delete h.adapter.startMatrixRun;const start=h.adapter.startMatrixRun.bind(h.adapter);
+ h.adapter.startMatrixRun=(argv,d)=>{given=argv;return start([process.execPath,"-e","console.log(JSON.stringify([process.env.TAILTERM_MATRIX_RELEASE,process.argv.slice(1)]));setInterval(()=>{},1000)",...argv.slice(1)],d);};
+ const inherited=process.env.TAILTERM_MATRIX_RELEASE;delete process.env.TAILTERM_MATRIX_RELEASE;t.after(()=>{if(inherited!==undefined)process.env.TAILTERM_MATRIX_RELEASE=inherited;});
+ assert.equal(await h.adapter.verifyIntegrated({...h.integrated,itemId:"wi_0123456789abcdef"}),false);
+ const child=h.adapter.matrixChildren.get(dir);t.after(()=>{try{process.kill(-child.pid,"SIGKILL");}catch{}});
+ assert.deepEqual(given,["node","scripts/verify-matrix.mjs","run",join(dir,"plan.json"),dir,"--priority","high","--item","wi_0123456789abcdef","--host-wait-minutes","120"],"no marker flag in argv");
+ await until(()=>readFileSync(join(dir,"run.out"),"utf8").includes("\n"),"the run's output on file");
+ assert.deepEqual(JSON.parse(readFileSync(join(dir,"run.out"),"utf8")),["1",given.slice(1)]);
+ assert.equal(process.env.TAILTERM_MATRIX_RELEASE,undefined,"the runner's own environment is not marked");
 });
 test("a4 the attempt record counts each place the run has had, so a returned place is a new notice and a restart's resend is not",async t=>{
  const h=lockHost(t),lock={path:h.path,agent:"verifier",runTimeoutMs:60000,pollMs:20};

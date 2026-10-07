@@ -968,7 +968,8 @@ export class HostAdapter {
   startMatrixRun(argv,dir){
     const out=openSync(join(dir,"run.out"),"a",0o600),err=openSync(join(dir,"run.err"),"a",0o600);
     try{
-      const child=spawn(argv[0],argv.slice(1),{cwd:this.config.cwd,detached:true,stdio:["ignore",out,err]});
+      // The marker puts this run ahead of team runs on the host waitlist.
+      const child=spawn(argv[0],argv.slice(1),{cwd:this.config.cwd,detached:true,stdio:["ignore",out,err],env:{...process.env,TAILTERM_MATRIX_RELEASE:"1"}});
       child.on("error",()=>{});
       if(!Number.isSafeInteger(child.pid))throw releaseError("Matrix run not started");
       child.unref();this.matrixChildren.set(dir,child);return child.pid;
