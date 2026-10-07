@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1861,5 +1862,595 @@ func TestHandlerRotationDeadPrimaryUnmovableLeaseFailsCommit(t *testing.T) {
 	still, _ := f.s.GetHandlerRotation(context.Background(), f.task.ID, r.ID)
 	if f.state(t) != prepared || still.State != api.HandlerRotationPrepared || countRows(t, f.s, `SELECT count(*) FROM team_queue_entries WHERE handler_id=?`, successor.ID) != 0 {
 		t.Fatal("a failed commit moved the first lease")
+	}
+}
+
+// Exited primary rotation (wi_1d987e7f296b6a2e, owner order #28426): the
+// runtime ended, its wrapper survived and reported exited. The wrapper's exit
+// event, the store clock, the broker's closure and the host's evidence are
+// injected; no process, tmux server or handler is read, started, stopped or
+// rotated.
+
+// exit posts the old run's exit report as tt wrap does, at the fixture clock.
+func (f *deadPrimaryFixture) exit(t *testing.T, code int) api.Event {
+	t.Helper()
+	e, err := f.s.PostEvent(context.Background(), f.task.ID, api.PostEventRequest{AgentID: f.old.ID, RunID: f.old.RunID, Kind: api.EventExited, Text: fmt.Sprintf("Process exited (%d)", code)}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, err := f.s.GetAgent(context.Background(), f.old.ID); err != nil || a.Status != api.AgentExited || a.RunID != f.old.RunID {
+		t.Fatalf("the exit report left the handler %+v %v", a, err)
+	}
+	return e
+}
+
+// idleEvidence is what a host sends for an exited handler whose session
+// remains: the runtime process gone, the receipt's exit, and a pane holding
+// only the wrapper and its idle shell.
+func (f *deadPrimaryFixture) idleEvidence(exit api.Event) *api.HandlerDeathEvidence {
+	ev := f.evidence()
+	at := exit.CreatedAt
+	ev.SessionState, ev.PanePID, ev.PaneRootPID, ev.ExitedAt = api.HandlerDeathStateIdleShell, 0, 4200, &at
+	return ev
+}
+
+func (f *deadPrimaryFixture) prepareExited(t *testing.T, key string, ev *api.HandlerDeathEvidence) (api.HandlerRotation, error) {
+	t.Helper()
+	return f.prepareDead(t, key, func(req *api.HandlerRotationRequest) { req.DeathEvidence = ev })
+}
+
+// brokerCloses is the broker's tick for an exited recipient: it closes the
+// handler's open obligation on the given message recipient_gone.
+func (f *deadPrimaryFixture) brokerCloses(t *testing.T, messageSeq int64) {
+	t.Helper()
+	open, err := f.s.BrokerOpenObligations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range open {
+		if o.AgentID == f.old.ID && o.MessageSeq == messageSeq {
+			if o.AgentStatus != api.AgentExited {
+				t.Fatalf("the broker sees the handler as %q", o.AgentStatus)
+			}
+			if err := f.s.BrokerCloseRecipientGone(context.Background(), o, f.clock); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+	}
+	t.Fatalf("no open obligation of the handler on message %d", messageSeq)
+}
+
+// a1, a7: an exited, silent, busy primary whose session still holds the idle
+// shell is prepared and committed; leases, the frozen plan, the obligations
+// the broker already closed and the one still open, and both notices are on
+// the successor after the one commit.
+func TestHandlerRotationExitedSilentPrimaryRotates(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	ctx := context.Background()
+	s := f.s
+	// A request the handler declined before it exited, and one the broker
+	// closed for a closed recipient: neither is handed over.
+	declined := f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Fixture request declined before the exit", false)
+	other := f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Fixture request closed for another reason", false)
+	early := f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Fixture request closed before the exit", false)
+	for _, c := range []struct {
+		seq             int64
+		outcome, reason string
+	}{{declined.Seq, api.OutcomeDeclined, "fixture decline"}, {other.Seq, api.OutcomeRecipientGone, "recipient agent is closed"}, {early.Seq, api.OutcomeRecipientGone, exitedRecipientGoneReason}} {
+		if _, err := s.db.Exec(`UPDATE obligations SET state='closed',outcome=?,reason=?,closed_at=?,changed_at=? WHERE message_seq=? AND agent_id=?`, c.outcome, c.reason, ts(f.clock), ts(f.clock), c.seq, f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.advance(time.Minute)
+	exit := f.exit(t, 3)
+	// The broker's next tick closes the first request; the second is still open.
+	f.advance(30 * time.Second)
+	f.brokerCloses(t, f.requests[0].Seq)
+	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed'`, f.old.ID); n != 1 {
+		t.Fatalf("open obligations on the exited handler after the broker tick: %d", n)
+	}
+	f.advance(11 * time.Minute)
+	r, err := f.prepareExited(t, "exit-prepare", f.idleEvidence(exit))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if r.Exit == nil || r.Exit.Code != 3 || !r.Exit.ReportedAt.Equal(exit.CreatedAt) || r.Exit.EventSeq != exit.Seq || r.DeathEvidence.SessionState != api.HandlerDeathStateIdleShell ||
+		r.LastActivityAt == nil || r.LastActivityAt.Before(exit.CreatedAt) {
+		t.Fatalf("prepared record: %+v exit %+v", r, r.Exit)
+	}
+	successor := f.succeed(t, r)
+	f.advance(30 * time.Second)
+	r, err = f.commitDead(r, "rotation-commit-"+r.ID, f.idleEvidence(exit))
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	task, _ := s.GetTask(ctx, f.task.ID)
+	old, _ := s.GetAgent(ctx, f.old.ID)
+	if r.State != api.HandlerRotationCommitted || task.PrimaryHandlerID != successor.ID || task.HandlerRevision != 2 || old.Status != api.AgentClosed {
+		t.Fatalf("state %s primary %s revision %d old %s", r.State, task.PrimaryHandlerID, task.HandlerRevision, old.Status)
+	}
+	// Leases and the frozen launch plan name the successor's exact run.
+	running, _ := s.GetTeamQueueEntry(ctx, f.task.ID, f.running.ID)
+	frozen, _ := s.GetTeamQueueEntry(ctx, f.task.ID, f.frozen.ID)
+	for i, e := range []api.TeamQueueEntry{running, frozen} {
+		if e.HandlerID != successor.ID || e.HandlerRunID != successor.RunID || e.HandlerLeaseGeneration != int64(i+1) {
+			t.Fatalf("lease %d not moved: %+v", i, e)
+		}
+	}
+	var plan struct {
+		HandlerID    string `json:"handlerId"`
+		HandlerRunID string `json:"handlerRunId"`
+	}
+	if err := json.Unmarshal(frozen.LaunchJSON, &plan); err != nil || plan.HandlerID != successor.ID || plan.HandlerRunID != successor.RunID || r.Receipt.LeasesMoved != 2 {
+		t.Fatalf("launch plan %+v %v receipt %+v", plan, err, r.Receipt)
+	}
+	if running.HandlerArm == nil || running.HandlerArm.HandlerID != successor.ID {
+		t.Fatalf("arm assignment: %+v", running.HandlerArm)
+	}
+	// Obligations: the one the broker closed after the exit and the one still
+	// open are each open on the successor exactly once.
+	if r.Handoff == nil || len(r.Handoff.Reissued) != 2 || r.Receipt.Reissued != 2 {
+		t.Fatalf("handoff reissued: %+v", r.Handoff)
+	}
+	for i, m := range f.requests {
+		var pairs []api.HandlerRotationReissue
+		for _, p := range r.Handoff.Reissued {
+			if p.OldMessageSeq == m.Seq {
+				pairs = append(pairs, p)
+			}
+		}
+		if len(pairs) != 1 || pairs[0].NewObligationID == "" || (i == 0) != (pairs[0].OldState == api.ObligationClosed) {
+			t.Fatalf("request #%d reissued: %+v", m.Seq, pairs)
+		}
+		if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed' AND message_seq=? AND id=?`, successor.ID, pairs[0].NewMessageSeq, pairs[0].NewObligationID); n != 1 {
+			t.Fatalf("request #%d is open on the successor %d times", m.Seq, n)
+		}
+		if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND message_seq=? AND state='closed' AND outcome=?`, f.old.ID, m.Seq, api.OutcomeSuperseded); n != 1 {
+			t.Fatalf("request #%d on the old handler is not superseded", m.Seq)
+		}
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed' AND source_kind='request'`, successor.ID); n != 2 {
+		t.Fatalf("requests on the successor: %d", n)
+	}
+	// What was closed for another reason, or before the exit, stays as it was.
+	for _, c := range []struct {
+		seq             int64
+		outcome, reason string
+	}{{declined.Seq, api.OutcomeDeclined, "fixture decline"}, {other.Seq, api.OutcomeRecipientGone, "recipient agent is closed"}, {early.Seq, api.OutcomeRecipientGone, exitedRecipientGoneReason}} {
+		if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE message_seq=? AND agent_id=? AND state='closed' AND outcome=? AND reason=?`, c.seq, f.old.ID, c.outcome, c.reason); n != 1 {
+			t.Fatalf("obligation on #%d did not stay closed %s (%s)", c.seq, c.outcome, c.reason)
+		}
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed'`, f.old.ID); n != 0 {
+		t.Fatalf("open obligations left on the exited handler: %d", n)
+	}
+	// One notice each, same text, naming the exit status and time.
+	toSuccessor, toHelper := noticesTo(t, s, f.task.ID, successor.ID), noticesTo(t, s, f.task.ID, f.helper.ID)
+	if len(toSuccessor) != 1 || len(toHelper) != 1 || toSuccessor[0].Seq != r.Receipt.NoticeSeq || toHelper[0].Seq != r.Receipt.OwnerNoticeSeq {
+		t.Fatalf("notices: successor %d helper %d receipt %+v", len(toSuccessor), len(toHelper), r.Receipt)
+	}
+	text := toSuccessor[0].Envelope.Body.Text
+	if text != toHelper[0].Envelope.Body.Text {
+		t.Fatalf("the two copies differ:\n%s\n%s", text, toHelper[0].Envelope.Body.Text)
+	}
+	for _, part := range []string{
+		"Primary database handler " + f.old.Name + " (" + f.old.ID + " / " + f.old.RunID + ")",
+		"Its runtime exited with status 3 at " + exit.CreatedAt.UTC().Format(time.RFC3339) + ", as reported by its wrapper.",
+		"Evidence from host mini: runtime process 4242 (started " + deadPrimaryStarted + ") is absent and tmux session tt-handler-fixture holds only the wrapper (process 4200) and its idle shell",
+		"2 open obligation(s) and 2 team lease(s) (" + f.running.ID + ", " + f.frozen.ID + ")",
+		"the silence applied was 10 minute(s)",
+		"tt handler rotation get " + r.ID,
+	} {
+		if !strings.Contains(text, part) {
+			t.Fatalf("notice lacks %q:\n%s", part, text)
+		}
+	}
+	if len(text) > 2000 {
+		t.Fatalf("notice is %d bytes", len(text))
+	}
+	// A replayed commit, even with a newer observation, writes nothing.
+	messages := countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+	obligations := countRows(t, s, `SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID)
+	events := countRows(t, s, `SELECT count(*) FROM events WHERE task_id=?`, f.task.ID)
+	f.advance(20 * time.Second)
+	again, err := f.commitDead(r, "rotation-commit-"+r.ID, f.idleEvidence(exit))
+	if err != nil || again.State != api.HandlerRotationCommitted || again.Receipt.NoticeSeq != r.Receipt.NoticeSeq || again.Exit == nil || again.Exit.EventSeq != exit.Seq {
+		t.Fatalf("replayed commit: %+v %v", again, err)
+	}
+	if countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID) != messages || countRows(t, s, `SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID) != obligations ||
+		countRows(t, s, `SELECT count(*) FROM events WHERE task_id=?`, f.task.ID) != events {
+		t.Fatal("a replayed commit wrote again")
+	}
+	read, err := s.GetHandlerRotation(ctx, f.task.ID, r.ID)
+	if err != nil || read.Exit == nil || read.Exit.Code != 3 || !read.Exit.ReportedAt.Equal(exit.CreatedAt) || read.CommitDeathEvidence == nil || read.CommitDeathEvidence.PaneRootPID != 4200 {
+		t.Fatalf("read back: %+v %v", read, err)
+	}
+}
+
+// a2: every missing condition refuses the prepare and leaves the primary,
+// its leases and its obligations as they were.
+func TestHandlerRotationExitedPrimaryRefusals(t *testing.T) {
+	cases := []struct {
+		name string
+		// before runs ahead of the exit report, after once the silence passed.
+		before, after func(*testing.T, *deadPrimaryFixture)
+		wait          time.Duration
+		evidence      func(*api.HandlerDeathEvidence, *deadPrimaryFixture)
+		want          string
+	}{
+		{name: "silence not met", wait: 9 * time.Minute, want: api.HandlerRotationRefusedNotSilent},
+		{name: "hub heartbeat within 90 s", after: func(t *testing.T, f *deadPrimaryFixture) {
+			if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(f.clock.Add(-30*time.Second)), f.old.ID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "stale evidence", evidence: func(ev *api.HandlerDeathEvidence, f *deadPrimaryFixture) {
+			ev.ObservedAt = f.clock.Add(-3 * time.Minute)
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "no exit in the host receipt", evidence: func(ev *api.HandlerDeathEvidence, _ *deadPrimaryFixture) { ev.ExitedAt = nil }, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "idle shell without the pane process", evidence: func(ev *api.HandlerDeathEvidence, _ *deadPrimaryFixture) { ev.PaneRootPID = 0 }, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "process not gone", evidence: func(ev *api.HandlerDeathEvidence, _ *deadPrimaryFixture) { ev.ProcessState = "alive" }, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "session alive", evidence: func(ev *api.HandlerDeathEvidence, _ *deadPrimaryFixture) { ev.SessionState = "alive" }, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "replacement off", after: func(t *testing.T, f *deadPrimaryFixture) {
+			off := int64(0)
+			if _, err := f.s.SetHandlerRotationPolicy(context.Background(), f.task.ID, api.HandlerRotationPolicyRequest{Enabled: true, DeadSilenceMinutes: &off}); err != nil {
+				t.Fatal(err)
+			}
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "handler not busy", before: func(t *testing.T, f *deadPrimaryFixture) {
+			if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE task_id=?`, ts(f.clock), f.task.ID); err != nil {
+				t.Fatal(err)
+			}
+			f.busy(t, "idle", "")
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "no wrapper exit event", after: func(t *testing.T, f *deadPrimaryFixture) {
+			if _, err := f.s.db.Exec(`DELETE FROM events WHERE agent_id=? AND kind=?`, f.old.ID, api.EventExited); err != nil {
+				t.Fatal(err)
+			}
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "exit posted by hand", after: func(t *testing.T, f *deadPrimaryFixture) {
+			if _, err := f.s.db.Exec(`UPDATE events SET text='' WHERE agent_id=? AND kind=?`, f.old.ID, api.EventExited); err != nil {
+				t.Fatal(err)
+			}
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+		{name: "exit text not the wrapper's", after: func(t *testing.T, f *deadPrimaryFixture) {
+			if _, err := f.s.db.Exec(`UPDATE events SET text='Process exited (0) by hand' WHERE agent_id=? AND kind=?`, f.old.ID, api.EventExited); err != nil {
+				t.Fatal(err)
+			}
+		}, want: api.HandlerRotationRefusedDeathUnconfirmed},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			if c.before != nil {
+				c.before(t, f)
+			}
+			exit := f.exit(t, 1)
+			wait := c.wait
+			if wait == 0 {
+				wait = 11 * time.Minute
+			}
+			f.advance(wait)
+			if c.after != nil {
+				c.after(t, f)
+			}
+			ev := f.idleEvidence(exit)
+			if c.evidence != nil {
+				c.evidence(ev, f)
+			}
+			base := f.state(t)
+			if _, err := f.prepareExited(t, "refused", ev); refusalCode(err) != c.want {
+				t.Fatalf("prepare: %v, want %s", err, c.want)
+			}
+			if f.state(t) != base {
+				t.Fatal("a refused prepare changed state")
+			}
+			if a, _ := f.s.GetAgent(context.Background(), f.old.ID); a.Status != api.AgentExited {
+				t.Fatalf("the handler is %s", a.Status)
+			}
+		})
+	}
+}
+
+// a3: an idle shell confirms nothing about a primary that is not exited, and
+// an exited primary whose session is gone needs no idle shell.
+func TestHandlerRotationIdleShellNeedsReportedExit(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	f.advance(11 * time.Minute)
+	base := f.state(t)
+	ev := f.idleEvidence(api.Event{CreatedAt: f.clock.Add(-11 * time.Minute)})
+	if _, err := f.prepareExited(t, "not-exited", ev); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed || !strings.Contains(err.Error(), `session "idle_shell"`) {
+		t.Fatalf("idle shell evidence for a handler that is not exited: %v", err)
+	}
+	if f.state(t) != base {
+		t.Fatal("a refused prepare changed state")
+	}
+	// The parent's evidence still prepares it.
+	if r, err := f.prepareDead(t, "gone", nil); err != nil || r.Exit != nil {
+		t.Fatalf("parent path: %+v %v", r, err)
+	}
+
+	g := newDeadPrimaryFixture(t)
+	exit := g.exit(t, 0)
+	g.advance(11 * time.Minute)
+	gone := g.evidence()
+	gone.ExitedAt = &exit.CreatedAt
+	if r, err := g.prepareExited(t, "exited-session-gone", gone); err != nil || r.Exit == nil || r.Exit.Code != 0 || r.DeathEvidence.SessionState != api.HandlerDeathStateGone {
+		t.Fatalf("exited primary with its session gone: %+v %v", r, err)
+	}
+}
+
+// a4: an exited primary that restarted, or whose run recorded anything after
+// prepare, is never rotated, and neither is one with a later wrapper event.
+func TestHandlerRotationExitedThenRestartedNeverRotates(t *testing.T) {
+	ctx := context.Background()
+	restart := func(t *testing.T, f *deadPrimaryFixture) api.Agent {
+		t.Helper()
+		a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: f.old.ID, Role: api.AgentRoleDatabaseHandler, Name: f.old.Name, Host: f.old.Host, Session: f.old.Session, Runtime: f.old.Runtime, Cwd: f.old.Cwd, ExpectedRunID: f.old.RunID}, f.by)
+		if err != nil || a.RunID == f.old.RunID || a.Status == api.AgentExited {
+			t.Fatalf("restart: %+v %v", a, err)
+		}
+		return a
+	}
+	t.Run("restart before prepare", func(t *testing.T) {
+		f := newDeadPrimaryFixture(t)
+		exit := f.exit(t, 1)
+		f.advance(11 * time.Minute)
+		restarted := restart(t, f)
+		if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: restarted.ID, RunID: restarted.RunID, Kind: api.EventStarted, Text: "Process started"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		base := f.state(t)
+		if _, err := f.prepareExited(t, "restarted", f.idleEvidence(exit)); refusalCode(err) != api.HandlerRotationRefusedNotPrimary {
+			t.Fatalf("prepare for the old run: %v", err)
+		}
+		// Even naming the new run, the old run's evidence confirms nothing.
+		if _, err := f.prepareDead(t, "restarted-new-run", func(req *api.HandlerRotationRequest) {
+			req.OldRunID, req.DeathEvidence = restarted.RunID, f.idleEvidence(exit)
+		}); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+			t.Fatalf("prepare for the new run with the old evidence: %v", err)
+		}
+		if f.state(t) != base {
+			t.Fatal("a refused prepare changed state")
+		}
+		list, err := f.s.HandlerRotationsDue(ctx, "mini", "")
+		if err != nil || len(list.Entries) != 1 || list.Entries[0].Agent.RunID != restarted.RunID || list.Entries[0].DeadCandidate || list.Entries[0].SilenceMet {
+			t.Fatalf("due list after a restart: %+v %v", list.Entries, err)
+		}
+	})
+	t.Run("restart between prepare and commit", func(t *testing.T) {
+		f := newDeadPrimaryFixture(t)
+		exit := f.exit(t, 1)
+		f.advance(11 * time.Minute)
+		r, err := f.prepareExited(t, "prepare", f.idleEvidence(exit))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.succeed(t, r)
+		restart(t, f)
+		prepared := f.state(t)
+		f.advance(time.Second)
+		if _, err = f.commitDead(r, "commit", f.idleEvidence(exit)); refusalCode(err) != api.HandlerRotationRefusedStaleHandler {
+			t.Fatalf("commit after a restart: %v", err)
+		}
+		if still, _ := f.s.GetHandlerRotation(ctx, f.task.ID, r.ID); f.state(t) != prepared || still.State != api.HandlerRotationPrepared {
+			t.Fatal("a refused commit moved something")
+		}
+	})
+	t.Run("activity between prepare and commit", func(t *testing.T) {
+		f := newDeadPrimaryFixture(t)
+		exit := f.exit(t, 1)
+		f.advance(11 * time.Minute)
+		r, err := f.prepareExited(t, "prepare", f.idleEvidence(exit))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.succeed(t, r)
+		f.advance(time.Second)
+		if _, err := f.s.db.Exec(`UPDATE messages SET created_at=? WHERE task_id=? AND from_agent=? AND from_run_id=?`, ts(f.clock), f.task.ID, f.old.ID, f.old.RunID); err != nil {
+			t.Fatal(err)
+		}
+		prepared := f.state(t)
+		f.advance(time.Second)
+		if _, err = f.commitDead(r, "commit", f.idleEvidence(exit)); refusalCode(err) != api.HandlerRotationRefusedNotSilent {
+			t.Fatalf("commit after activity: %v", err)
+		}
+		if still, _ := f.s.GetHandlerRotation(ctx, f.task.ID, r.ID); f.state(t) != prepared || still.State != api.HandlerRotationPrepared {
+			t.Fatal("a refused commit moved something")
+		}
+	})
+	// A rotation prepared without an exit report never replaces a handler
+	// that exited afterwards: only a saved exit report lifts that refusal.
+	t.Run("exit reported after a prepare without one", func(t *testing.T) {
+		f := newDeadPrimaryFixture(t)
+		f.advance(11 * time.Minute)
+		r, err := f.prepareDead(t, "prepare", nil)
+		if err != nil || r.Exit != nil {
+			t.Fatalf("prepare: %+v %v", r, err)
+		}
+		f.succeed(t, r)
+		exit := f.exit(t, 1)
+		prepared := f.state(t)
+		f.advance(time.Second)
+		for _, ev := range []*api.HandlerDeathEvidence{f.evidence(), f.idleEvidence(exit)} {
+			if _, err = f.commitDead(r, "commit", ev); refusalCode(err) != api.HandlerRotationRefusedStaleHandler {
+				t.Fatalf("commit after a late exit report: %v", err)
+			}
+		}
+		if still, _ := f.s.GetHandlerRotation(ctx, f.task.ID, r.ID); f.state(t) != prepared || still.State != api.HandlerRotationPrepared {
+			t.Fatal("a refused commit moved something")
+		}
+	})
+	// The hub records no event from an exited agent today, so a later row is
+	// injected: the guard holds if that ever changes.
+	for _, kind := range []string{api.EventStarted, api.EventHeartbeat} {
+		inject := func(t *testing.T, f *deadPrimaryFixture) {
+			t.Helper()
+			if _, err := f.s.db.Exec(`INSERT INTO events (task_id,kind,agent_id,text,data,by_node,by_user,created_at) VALUES (?,?,?,'','','workspace','owner',?)`, f.task.ID, kind, f.old.ID, ts(f.clock)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Run("later "+kind+" row before prepare", func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			exit := f.exit(t, 1)
+			f.advance(11 * time.Minute)
+			inject(t, f)
+			base := f.state(t)
+			if _, err := f.prepareExited(t, "prepare", f.idleEvidence(exit)); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+				t.Fatalf("prepare after a later %s row: %v", kind, err)
+			}
+			if f.state(t) != base {
+				t.Fatal("a refused prepare changed state")
+			}
+		})
+		t.Run("later "+kind+" row before commit", func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			exit := f.exit(t, 1)
+			f.advance(11 * time.Minute)
+			r, err := f.prepareExited(t, "prepare", f.idleEvidence(exit))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.succeed(t, r)
+			inject(t, f)
+			prepared := f.state(t)
+			f.advance(time.Second)
+			if _, err = f.commitDead(r, "commit", f.idleEvidence(exit)); refusalCode(err) != api.HandlerRotationRefusedDeathUnconfirmed {
+				t.Fatalf("commit after a later %s row: %v", kind, err)
+			}
+			if still, _ := f.s.GetHandlerRotation(ctx, f.task.ID, r.ID); f.state(t) != prepared || still.State != api.HandlerRotationPrepared {
+				t.Fatal("a refused commit moved something")
+			}
+		})
+	}
+}
+
+// a7: a commit of an exit rotation that fails part-way changes nothing: the
+// first lease, and the obligation the broker closed, stay as they were.
+func TestHandlerRotationExitedPrimaryCommitIsAtomic(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	bad := strings.Replace(f.plan, f.old.ID, f.worker.ID, 1)
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET launch_json=? WHERE id=?`, bad, f.frozen.ID); err != nil {
+		t.Fatal(err)
+	}
+	exit := f.exit(t, 2)
+	f.advance(30 * time.Second)
+	f.brokerCloses(t, f.requests[0].Seq)
+	f.advance(11 * time.Minute)
+	r, err := f.prepareExited(t, "prepare", f.idleEvidence(exit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := f.succeed(t, r)
+	prepared := f.state(t)
+	obligations := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID)
+	f.advance(time.Second)
+	if _, err = f.commitDead(r, "commit", f.idleEvidence(exit)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.frozen.ID) {
+		t.Fatalf("commit with an unmovable lease: %v", err)
+	}
+	still, _ := f.s.GetHandlerRotation(context.Background(), f.task.ID, r.ID)
+	old, _ := f.s.GetAgent(context.Background(), f.old.ID)
+	if f.state(t) != prepared || still.State != api.HandlerRotationPrepared || old.Status != api.AgentExited ||
+		countRows(t, f.s, `SELECT count(*) FROM team_queue_entries WHERE handler_id=?`, successor.ID) != 0 ||
+		countRows(t, f.s, `SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID) != obligations ||
+		countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND message_seq=? AND state='closed' AND outcome=? AND reason=?`, f.old.ID, f.requests[0].Seq, api.OutcomeRecipientGone, exitedRecipientGoneReason) != 1 ||
+		countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=?`, successor.ID) != 0 {
+		t.Fatal("a failed commit changed something")
+	}
+}
+
+// a8: a database from before the exit column gains it, and old rotations and
+// an exit rotation both read back.
+func TestHandlerRotationExitColumnMigrates(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	if _, err := f.s.db.Exec(`ALTER TABLE handler_rotations DROP COLUMN exit_json`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the migration is idempotent
+		if err := migrateHandlerRotation(f.s.db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM pragma_table_info('handler_rotations') WHERE name='exit_json'`); n != 1 {
+		t.Fatalf("exit_json columns after migrating: %d", n)
+	}
+	exit := f.exit(t, 137)
+	f.advance(11 * time.Minute)
+	r, err := f.prepareExited(t, "after-migration", f.idleEvidence(exit))
+	if err != nil || r.Exit == nil || r.Exit.Code != 137 {
+		t.Fatalf("exit rotation after migration: %+v %v", r, err)
+	}
+	read, err := f.s.GetHandlerRotation(context.Background(), f.task.ID, r.ID)
+	if err != nil || read.Exit == nil || read.Exit.Code != 137 || read.Exit.EventSeq != exit.Seq || !read.Exit.ReportedAt.Equal(exit.CreatedAt) {
+		t.Fatalf("read back: %+v %v", read.Exit, err)
+	}
+	list, err := f.s.ListHandlerRotations(context.Background(), f.task.ID)
+	if err != nil || len(list) != 1 || list[0].Exit == nil {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+}
+
+// a9: the due list marks an exited busy primary a dead candidate, with its
+// silence measured from the exit report by the store clock, and does not
+// list an exited idle one as one.
+func TestHandlerRotationDueListExitedCandidate(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	ctx := context.Background()
+	s := f.s
+	due := func() []api.HandlerRotationDue {
+		t.Helper()
+		list, err := s.HandlerRotationsDue(ctx, "mini", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.Entries
+	}
+	f.advance(2 * time.Minute)
+	exit := f.exit(t, 1)
+	// Just exited: the exit report was its last heartbeat, so not a candidate yet.
+	d := due()
+	if len(d) != 1 || d[0].Agent.ID != f.old.ID || d[0].Agent.Status != api.AgentExited || !d[0].Online || d[0].DeadCandidate || d[0].SilenceMet {
+		t.Fatalf("just exited: %+v", d)
+	}
+	f.advance(5 * time.Minute)
+	if d = due(); len(d) != 1 || d[0].Agent.Status != api.AgentExited || d[0].Online || !d[0].DeadCandidate || d[0].SilenceMet || d[0].Idle || d[0].LiveLeases != 2 ||
+		d[0].LastActivityAt == nil || !d[0].LastActivityAt.Equal(exit.CreatedAt) {
+		t.Fatalf("exited busy, 5 minutes: %+v", d)
+	}
+	f.advance(5 * time.Minute)
+	if d = due(); len(d) != 1 || !d[0].DeadCandidate || !d[0].SilenceMet || !d[0].LastActivityAt.Equal(exit.CreatedAt) {
+		t.Fatalf("exited busy, 10 minutes: %+v", d)
+	}
+	// With the limit policy off it is still listed for the dead case.
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 1 || !d[0].DeadCandidate || !d[0].SilenceMet || len(d[0].DueReasons) != 0 {
+		t.Fatalf("limit policy off: %+v", d)
+	}
+	// With the dead primary replacement off it is not a candidate, and an
+	// exited handler is not listed for any limit either.
+	off, ten := int64(0), int64(10)
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 1, Enabled: true, MaxItems: 1, DeadSilenceMinutes: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if d = due(); len(d) != 0 {
+		t.Fatalf("replacement off: %+v", d)
+	}
+	// Exited and idle: out of this rule's scope, so not listed as a candidate.
+	if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: 2, Enabled: true, MaxItems: 1, DeadSilenceMinutes: &ten}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE task_id=?`, ts(f.clock), f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE agent_activity SET state='idle',payload='{}' WHERE agent_id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range due() {
+		if e.DeadCandidate || e.Agent.ID == f.old.ID {
+			t.Fatalf("exited idle: %+v", e)
+		}
 	}
 }

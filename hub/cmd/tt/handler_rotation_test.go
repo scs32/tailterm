@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1686,5 +1687,397 @@ func TestHandlerDeathSilencePolicyCommand(t *testing.T) {
 	}
 	if err := run("get"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Exited primary rotation on the host (wi_1d987e7f296b6a2e, owner order
+// #28426). The probe's readers and the runner's probe, spawn and cleanup are
+// injected: these tests start no tmux server and no process, read no process
+// table, and use a temporary hub database.
+
+// a5: the probe of a handler whose wrapper reported exited. Its session is
+// still present, holding the wrapper and its login shell.
+func TestHandlerDeathProbeExited(t *testing.T) {
+	const hub = "http://hub.fixture"
+	a := api.Agent{ID: "agt_00000000000000aa", TaskID: "tsk_00000000000000aa", RunID: "run_00000000000000aa", Session: "tt-handler-aa", Name: "db-handler", Status: api.AgentExited}
+	exited := time.Date(2026, 10, 7, 13, 0, 0, 0, time.UTC)
+	observed := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	base := runtimeProcessReceipt{Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID, Session: a.Session, Socket: "tt-socket", PID: 4242, Started: "start-4242",
+		SessionID: "$7", SessionCreated: "1700000000", ExitedAt: exited}
+	own := ownedSession{ID: "$7", Created: "1700000000", Name: a.Session, Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID}
+	type setup struct {
+		agent      api.Agent
+		receipt    runtimeProcessReceipt
+		receiptErr error
+		sessions   []ownedSession
+		listErr    error
+		pids       map[int]any // true: alive; error: check failed; absent: gone
+		panes      []int
+		panesErr   error
+		// parents is the process table: pane 4200 is the wrapper, 4300 its shell.
+		parents    map[int]int
+		parentsErr error
+	}
+	cases := []struct {
+		name   string
+		change func(*setup)
+		want   string
+		// session is the evidence's session state when the answer is gone.
+		session string
+	}{
+		{"idle shell", func(*setup) {}, handlerProbeGone, api.HandlerDeathStateIdleShell},
+		{"receipt records no session identity", func(s *setup) { s.receipt.SessionID, s.receipt.SessionCreated = "", "" }, handlerProbeGone, api.HandlerDeathStateIdleShell},
+		{"session absent", func(s *setup) { s.sessions = nil }, handlerProbeGone, api.HandlerDeathStateGone},
+		{"process under the shell", func(s *setup) { s.parents[4400] = 4300 }, handlerProbeAlive, ""},
+		{"runtime PID running", func(s *setup) { s.pids[4242] = true }, handlerProbeAlive, ""},
+		{"runtime PID running, session absent", func(s *setup) { s.sessions, s.pids[4242] = nil, true }, handlerProbeAlive, ""},
+		{"unreadable receipt", func(s *setup) { s.receiptErr = os.ErrNotExist }, handlerProbeUnknown, ""},
+		{"receipt records no exit", func(s *setup) { s.receipt.ExitedAt = time.Time{} }, handlerProbeUnknown, ""},
+		{"receipt records no exit, session absent", func(s *setup) { s.receipt.ExitedAt, s.sessions = time.Time{}, nil }, handlerProbeUnknown, ""},
+		{"unreadable sessions", func(s *setup) { s.listErr = errors.New("cannot verify tmux session identities") }, handlerProbeUnknown, ""},
+		{"unreadable panes", func(s *setup) { s.panesErr = errors.New("tmux failed") }, handlerProbeUnknown, ""},
+		{"unreadable process table", func(s *setup) { s.parentsErr = errors.New("unreadable process table row") }, handlerProbeUnknown, ""},
+		{"PID check error", func(s *setup) { s.pids[4242] = errors.New("runtime pid reused or creation identity changed") }, handlerProbeUnknown, ""},
+		{"two panes", func(s *setup) { s.panes = []int{4200, 4201} }, handlerProbeUnknown, ""},
+		{"no pane", func(s *setup) { s.panes = nil }, handlerProbeUnknown, ""},
+		{"session of another run", func(s *setup) { s.sessions[0].Run = "run_00000000000000cc" }, handlerProbeUnknown, ""},
+		{"session of another project", func(s *setup) { s.sessions[0].Task = "tsk_00000000000000bb" }, handlerProbeUnknown, ""},
+		{"session of another hub", func(s *setup) { s.sessions[0].Hub = "http://other" }, handlerProbeUnknown, ""},
+		{"session with another tmux ID", func(s *setup) { s.sessions[0].ID = "$8" }, handlerProbeUnknown, ""},
+		{"session created at another time", func(s *setup) { s.sessions[0].Created = "1700000001" }, handlerProbeUnknown, ""},
+		{"session renamed", func(s *setup) { s.sessions[0].Name = "renamed" }, handlerProbeUnknown, ""},
+		{"untagged session with the handler's name", func(s *setup) { s.sessions = []ownedSession{{ID: "$7", Created: "1700000000", Name: a.Session}} }, handlerProbeUnknown, ""},
+		{"two sessions name the handler", func(s *setup) {
+			s.sessions = append(s.sessions, ownedSession{ID: "$9", Created: "2", Name: "copy", Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID})
+		}, handlerProbeUnknown, ""},
+		{"pane process not in the table", func(s *setup) { delete(s.parents, 4200) }, handlerProbeUnknown, ""},
+		{"wrapper without a shell", func(s *setup) { delete(s.parents, 4300) }, handlerProbeUnknown, ""},
+		{"wrapper with two children", func(s *setup) { s.parents[4301] = 4200 }, handlerProbeUnknown, ""},
+		// The roster status decides the branch: a handler that is not exited
+		// is alive whenever its session is present, whatever the pane holds.
+		{"not exited, session present", func(s *setup) { s.agent.Status = api.AgentRunning }, handlerProbeAlive, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := setup{agent: a, receipt: base, sessions: []ownedSession{own}, pids: map[int]any{}, panes: []int{4200}, parents: map[int]int{1: 0, 4200: 1, 4300: 4200, 9000: 1, 9001: 9000, 9002: 9001}}
+			c.change(&s)
+			readPanes, readTable := 0, 0
+			p := deathProbe{
+				receipt:  func(string, string, string) (runtimeProcessReceipt, error) { return s.receipt, s.receiptErr },
+				sessions: func(context.Context) ([]ownedSession, error) { return s.sessions, s.listErr },
+				pid: func(pid int, started string) (bool, error) {
+					if pid != 4242 || started != "start-4242" {
+						t.Fatalf("pid %d checked with identity %q", pid, started)
+					}
+					switch v := s.pids[pid].(type) {
+					case bool:
+						return v, nil
+					case error:
+						return false, v
+					}
+					return false, nil
+				},
+				panes: func(_ context.Context, id string) ([]int, error) {
+					readPanes++
+					if id != "$7" {
+						t.Fatalf("panes read for session %q", id)
+					}
+					return s.panes, s.panesErr
+				},
+				processes: func(context.Context) (map[int]int, error) { readTable++; return s.parents, s.parentsErr },
+				socket:    func() string { return "tt-socket" }, host: func() string { return "mini" }, now: func() time.Time { return observed },
+			}
+			state, detail, ev := p.probe(context.Background(), hub+"/", s.agent)
+			if state != c.want || detail == "" || (ev != nil) != (c.want == handlerProbeGone) {
+				t.Fatalf("state %s (%s) evidence %+v, want %s", state, detail, ev, c.want)
+			}
+			if s.agent.Status != api.AgentExited && (readPanes != 0 || readTable != 0) {
+				t.Fatal("a handler that is not exited had its pane read")
+			}
+			if c.want != handlerProbeGone {
+				return
+			}
+			want := api.HandlerDeathEvidence{Host: "mini", AgentID: a.ID, RunID: a.RunID, ObservedAt: observed, SessionName: a.Session, SessionID: "$7", SessionCreated: "1700000000",
+				SessionState: c.session, PID: 4242, ProcessStarted: "start-4242", ProcessState: api.HandlerDeathStateGone}
+			if c.session == api.HandlerDeathStateIdleShell {
+				want.PaneRootPID = 4200
+			}
+			if ev.ExitedAt == nil || !ev.ExitedAt.Equal(exited) {
+				t.Fatalf("exit record: %+v", ev.ExitedAt)
+			}
+			got := *ev
+			got.ExitedAt = nil
+			if got != want {
+				t.Fatalf("evidence %+v\n    want %+v", got, want)
+			}
+		})
+	}
+	// With no pane or process reader the host confirms nothing.
+	p := deathProbe{receipt: func(string, string, string) (runtimeProcessReceipt, error) { return base, nil },
+		sessions: func(context.Context) ([]ownedSession, error) { return []ownedSession{own}, nil }, pid: func(int, string) (bool, error) { return false, nil },
+		socket: func() string { return "tt-socket" }, host: func() string { return "mini" }, now: func() time.Time { return observed }}
+	if state, _, ev := p.probe(context.Background(), hub, a); state != handlerProbeUnknown || ev != nil {
+		t.Fatalf("no readers: %s %+v", state, ev)
+	}
+}
+
+// a5: the process table is read whole or not at all.
+func TestHandlerDeathProcessTableParse(t *testing.T) {
+	got, err := parseProcessParents("    1     0\n 4200     1\n 4300  4200\n")
+	if err != nil || len(got) != 3 || got[4300] != 4200 || got[1] != 0 {
+		t.Fatalf("table: %v %v", got, err)
+	}
+	for _, raw := range []string{"", "1 0\nzsh 1\n", "1 0\n4200\n", "1 0\n4200 1 extra\n", "1 0\n1 0\n", "0 0\n", "7 -1\n"} {
+		if got, err := parseProcessParents(raw); err == nil {
+			t.Fatalf("table %q read as %v", raw, got)
+		}
+	}
+}
+
+// exitedRunner is a hub with one busy primary whose wrapper reported exited
+// 11 minutes ago, and a runner whose probe, spawn and cleanup are scripted.
+type exitedRunner struct {
+	*rotationCLI
+	exit    api.Event
+	answers []string
+	probes  []api.Agent
+	// before runs ahead of probe n (from 0), for a change between probes.
+	before  map[int]func()
+	cleaned []string
+	held    api.Message
+}
+
+func newExitedRunner(t *testing.T, answers ...string) *exitedRunner {
+	t.Helper()
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	x := &exitedRunner{rotationCLI: &rotationCLI{dbPath: filepath.Join(t.TempDir(), "hub.sqlite")}, answers: answers, before: map[int]func(){}}
+	f := x.rotationCLI
+	var err error
+	if f.st, err = store.Open(f.dbPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.st.Close() })
+	handler := server.New(f.st, func(r *http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "owner"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/handler-rotations") {
+			f.actions.Add(1)
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	if f.c, err = api.NewClient(srv.URL, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	f.e = env{hub: f.c.Base}
+	ctx := context.Background()
+	if f.task, err = f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "isolated exited primary test"}); err != nil {
+		t.Fatal(err)
+	}
+	f.dir = t.TempDir()
+	if f.old, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "db-handler", Runtime: "generic", Host: "fixture",
+		Session: "tt-handler-exited-fixture", Cwd: f.dir, TemplateDigest: handlerTemplateDigest("handler assignment")}); err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, f.old)
+	if f.worker, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "generic"}); err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, f.worker)
+	x.held = f.request(t, f.old.Name, "Fixture request held by the exited handler")
+	f.activity(t, f.old, "working", "Bash", 0)
+	if x.exit, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: f.old.ID, RunID: f.old.RunID, Kind: api.EventExited, Text: "Process exited (1)"}); err != nil {
+		t.Fatal(err)
+	}
+	// The exit and everything else the hub recorded from the run was 11 minutes ago.
+	at := time.Now().UTC().Add(-11 * time.Minute)
+	x.exit.CreatedAt = at
+	db := f.db(t)
+	for _, q := range []struct {
+		query string
+		args  []any
+	}{{`UPDATE agents SET last_seen_at=? WHERE id=?`, []any{at.Format(time.RFC3339Nano), f.old.ID}},
+		{`UPDATE agent_activity SET observed_at=? WHERE agent_id=? AND run_id=?`, []any{at.Format(time.RFC3339Nano), f.old.ID, f.old.RunID}},
+		{`UPDATE events SET created_at=? WHERE seq=?`, []any{at.Format(time.RFC3339Nano), x.exit.Seq}}} {
+		if _, err := db.Exec(q.query, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The broker's tick after the exit closed the request the handler held.
+	open, err := f.st.BrokerOpenObligations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := 0
+	for _, o := range open {
+		if o.AgentID == f.old.ID {
+			if err := f.st.BrokerCloseRecipientGone(ctx, o, at.Add(30*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			closed++
+		}
+	}
+	if closed != 1 {
+		t.Fatalf("the broker closed %d obligation(s) of the exited handler", closed)
+	}
+	if f.spec, err = newHandlerSpec(f.c.Base, f.task.ID, []string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "handler assignment"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	f.deps = rotationDeps{host: func() string { return "fixture" }, online: 3 * time.Second, poll: 20 * time.Millisecond,
+		// spawn registers the successor as tt spawn would; it starts nothing.
+		spawn: func(_ env, args []string) error {
+			f.spawns++
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "--handler-successor" {
+					continue
+				}
+				flags[args[i]] = args[i+1]
+				i++
+			}
+			a, err := f.c.AddAgent(ctx, flags["--task"], api.AddAgentRequest{AgentID: flags["--agent-id"], Role: flags["--role"], Name: flags["--name"], Host: "fixture", Session: "tt-handler-successor-fixture",
+				Runtime: flags["--runtime"], Cwd: flags["--cwd"], TemplateDigest: handlerTemplateDigest(flags["--prompt"])})
+			if err != nil {
+				return err
+			}
+			_, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted})
+			return err
+		},
+		cleanup: func(_ context.Context, _ env, _, agent string) error {
+			x.cleaned = append(x.cleaned, agent)
+			return nil
+		},
+		probe: func(_ context.Context, hub string, a api.Agent) (string, string, *api.HandlerDeathEvidence) {
+			if fn := x.before[len(x.probes)]; fn != nil {
+				fn()
+			}
+			answer := x.answers[min(len(x.probes), len(x.answers)-1)]
+			x.probes = append(x.probes, a)
+			if hub != f.c.Base || answer != handlerProbeGone {
+				return answer, "scripted " + answer, nil
+			}
+			return answer, "scripted idle shell", &api.HandlerDeathEvidence{Host: "fixture", AgentID: a.ID, RunID: a.RunID, ObservedAt: time.Now().UTC(), SessionName: a.Session,
+				SessionState: api.HandlerDeathStateIdleShell, PID: 4242, ProcessStarted: "Wed Oct  7 06:00:00 2026", ProcessState: api.HandlerDeathStateGone, ExitedAt: &at, PaneRootPID: 4200}
+		}}
+	return x
+}
+
+// a6, a8: the runner replaces an exited dead candidate when its probe says
+// gone twice, cleans up the old session, and the rotation prints its exit.
+func TestHandlerDeathRunnerRotatesExitedPrimary(t *testing.T) {
+	x := newExitedRunner(t, handlerProbeGone)
+	f := x.rotationCLI
+	ctx := context.Background()
+	list, err := f.c.HandlerRotationsDue(ctx, "fixture", "")
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Agent.ID != f.old.ID || list.Entries[0].Agent.Status != api.AgentExited || !list.Entries[0].DeadCandidate || !list.Entries[0].SilenceMet {
+		t.Fatalf("due: %+v %v", list, err)
+	}
+	f.tick(t, f.runner())
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || len(x.probes) != 2 || f.spawns != 1 || f.actions.Load() != 2 {
+		t.Fatalf("rotations=%d probes=%d spawns=%d actions=%d", len(rotations), len(x.probes), f.spawns, f.actions.Load())
+	}
+	r := rotations[0]
+	if r.State != api.HandlerRotationCommitted || r.Reason != api.HandlerRotationReasonDeadPrimary || r.OldAgentID != f.old.ID || r.OldRunID != f.old.RunID || r.Exit == nil || r.Exit.Code != 1 ||
+		r.Exit.EventSeq != x.exit.Seq || r.DeathEvidence == nil || r.DeathEvidence.SessionState != api.HandlerDeathStateIdleShell || r.CommitDeathEvidence == nil ||
+		!r.CommitDeathEvidence.ObservedAt.After(r.DeathEvidence.ObservedAt) || r.Receipt == nil || r.Receipt.Reissued != 1 || r.Handoff.Reissued[0].OldMessageSeq != x.held.Seq {
+		t.Fatalf("rotation: %+v exit %+v", r, r.Exit)
+	}
+	for _, a := range x.probes {
+		if a.ID != f.old.ID || a.RunID != f.old.RunID || a.Status != api.AgentExited {
+			t.Fatalf("probed %s / %s (%s)", a.ID, a.RunID, a.Status)
+		}
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	old, _ := f.c.GetAgent(ctx, f.task.ID, f.old.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != r.SuccessorAgentID || detail.Task.HandlerRevision != 2 || old.Status != api.AgentClosed {
+		t.Fatalf("primary: %+v old %s %v", detail.Task, old.Status, err)
+	}
+	// The old session, with its leftover shell, is cleaned up as in every rotation.
+	if len(x.cleaned) != 1 || x.cleaned[0] != f.old.ID || f.journalExists() {
+		t.Fatalf("cleanup %v journal %t", x.cleaned, f.journalExists())
+	}
+	if n := f.subjects(t, "A dead primary database handler was replaced automatically"); n != 2 {
+		t.Fatalf("dead primary notices: %d", n)
+	}
+	out, err := captureStdout(t, func() error { return cmdHandlerRotation(f.e, []string{"get", r.ID, "--task", f.task.ID}) })
+	exitLine := fmt.Sprintf("Wrapper exit report: status 1, reported %s (event %d)\n", r.Exit.ReportedAt.UTC().Format(time.RFC3339), r.Exit.EventSeq)
+	if err != nil || !strings.Contains(out, exitLine) || strings.Count(out, "tmux session tt-handler-exited-fixture idle_shell, runtime process 4242") != 2 ||
+		strings.Count(out, ", pane holds only wrapper process 4200 and its idle shell, wrapper exit recorded ") != 2 {
+		t.Fatalf("rotation get: %v\n%s", err, out)
+	}
+	// Further ticks find nothing to do.
+	f.tick(t, f.runner())
+	if len(f.rotations(t)) != 1 || f.spawns != 1 || len(x.probes) != 2 {
+		t.Fatalf("a later tick acted again: rotations=%d spawns=%d probes=%d", len(f.rotations(t)), f.spawns, len(x.probes))
+	}
+}
+
+// a6: on any doubt the exited primary stays. An alive or unknown first probe
+// sends the hub nothing; a second probe that is not gone, or a restart before
+// it, aborts the prepared rotation.
+func TestHandlerDeathRunnerLeavesExitedPrimaryOnDoubt(t *testing.T) {
+	for _, answer := range []string{handlerProbeAlive, handlerProbeUnknown} {
+		t.Run("first probe "+answer, func(t *testing.T) {
+			x := newExitedRunner(t, answer)
+			f := x.rotationCLI
+			for i := 0; i < 3; i++ {
+				f.tick(t, f.runner())
+			}
+			old, err := f.c.GetAgent(context.Background(), f.task.ID, f.old.ID)
+			if len(x.probes) != 3 || f.actions.Load() != 0 || f.spawns != 0 || len(f.rotations(t)) != 0 || f.journalExists() || len(x.cleaned) != 0 || err != nil || old.Status != api.AgentExited {
+				t.Fatalf("probes=%d actions=%d spawns=%d rotations=%d cleaned=%v old=%s %v", len(x.probes), f.actions.Load(), f.spawns, len(f.rotations(t)), x.cleaned, old.Status, err)
+			}
+		})
+	}
+	for _, second := range []string{handlerProbeAlive, handlerProbeUnknown, "restarted"} {
+		t.Run("second probe "+second, func(t *testing.T) {
+			answers := []string{handlerProbeGone, second}
+			if second == "restarted" {
+				answers = []string{handlerProbeGone}
+			}
+			x := newExitedRunner(t, answers...)
+			f := x.rotationCLI
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			wantProbes := 2
+			if second == "restarted" {
+				// The exited handler is started again while the successor
+				// starts: its new run is never probed with the old one's facts.
+				wantProbes = 1
+				f.deps.after = func(phase string) error {
+					if phase != rotationPhaseSpawned {
+						return nil
+					}
+					_, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: f.old.ID, Role: api.AgentRoleDatabaseHandler, Name: f.old.Name, Runtime: f.old.Runtime, Host: f.old.Host,
+						Session: f.old.Session, Cwd: f.old.Cwd, ExpectedRunID: f.old.RunID})
+					return err
+				}
+			}
+			if err := f.runner().tick(ctx, f.e, f.c, "fixture"); !errors.Is(err, errDeathNotConfirmed) {
+				t.Fatalf("tick: %v", err)
+			}
+			rotations := f.rotations(t)
+			if len(rotations) != 1 || rotations[0].State != api.HandlerRotationAborted || rotations[0].CommitDeathEvidence != nil || rotations[0].Exit == nil || len(x.probes) != wantProbes ||
+				f.spawns != 1 || f.actions.Load() != 2 {
+				t.Fatalf("rotations=%+v probes=%d spawns=%d actions=%d", rotations, len(x.probes), f.spawns, f.actions.Load())
+			}
+			detail, err := f.c.GetTask(context.Background(), f.task.ID)
+			if err != nil || detail.Task.PrimaryHandlerID != "" || detail.Task.HandlerRevision != 1 || f.journalExists() {
+				t.Fatalf("task: %+v journal %t %v", detail.Task, f.journalExists(), err)
+			}
+			successor, err := f.c.GetAgent(context.Background(), f.task.ID, rotations[0].SuccessorAgentID)
+			old, _ := f.c.GetAgent(context.Background(), f.task.ID, f.old.ID)
+			if err != nil || successor.Status != api.AgentClosed || old.Status == api.AgentClosed || (second != "restarted") != (old.Status == api.AgentExited) ||
+				len(x.cleaned) != 1 || x.cleaned[0] != rotations[0].SuccessorAgentID {
+				t.Fatalf("successor %s old %s cleaned %v %v", successor.Status, old.Status, x.cleaned, err)
+			}
+			if n := f.subjects(t, "A dead primary database handler was replaced automatically"); n != 0 {
+				t.Fatalf("an aborted rotation posted %d notice(s)", n)
+			}
+		})
 	}
 }

@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +63,9 @@ CREATE TABLE IF NOT EXISTS handler_runs (
 		{"handler_rotations", "evidence_json", "TEXT NOT NULL DEFAULT ''"},
 		{"handler_rotations", "commit_evidence_json", "TEXT NOT NULL DEFAULT ''"},
 		{"handler_rotations", "last_activity_at", "TEXT NOT NULL DEFAULT ''"},
+		// An exited primary (wi_1d987e7f296b6a2e, owner order #28426): the
+		// wrapper's exit report the rotation was prepared on.
+		{"handler_rotations", "exit_json", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('`+column.table+`') WHERE name=?`, column.name).Scan(&n); err != nil {
@@ -182,6 +187,65 @@ func primaryHandler(ctx context.Context, q queryRower, task api.Task) (api.Agent
 		task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, task.ID))
 }
 
+// exitedPrimaryHandler is the project's primary with the exited exclusion
+// lifted: the explicit primary when it is not closed, otherwise the oldest
+// handler that is not closed and not a prepared successor. ok is true only
+// when that agent's wrapper reported exited. Only a dead_primary prepare and
+// the due list use it; every other rotation keeps primaryHandler.
+func exitedPrimaryHandler(ctx context.Context, q queryRower, task api.Task) (api.Agent, bool, error) {
+	var a api.Agent
+	err := sql.ErrNoRows
+	if task.PrimaryHandlerID != "" {
+		a, err = scanAgent(q.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND role=? AND status<>?`, task.ID, task.PrimaryHandlerID, api.AgentRoleDatabaseHandler, api.AgentClosed))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return a, false, err
+		}
+	}
+	if err != nil {
+		a, err = scanAgent(q.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status<>?
+ AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id LIMIT 1`,
+			task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, task.ID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.Agent{}, false, nil
+		}
+		if err != nil {
+			return a, false, err
+		}
+	}
+	return a, a.Status == api.AgentExited, nil
+}
+
+// wrapperExitText is the text tt wrap posts with its exited event.
+var wrapperExitText = regexp.MustCompile(`^Process exited \((-?[0-9]{1,9})\)$`)
+
+// wrapperExitReport is the exit an exited handler's own wrapper reported:
+// the agent's newest started, heartbeat or exited event must be an exited
+// event with the wrapper's text. A restart changes the run and the status, so
+// together with the caller's exact-run check the event belongs to this run.
+// A missing or pruned event, a later start or heartbeat, and an exit posted by
+// hand are all refused: none of them is the wrapper's report.
+func wrapperExitReport(ctx context.Context, q queryRower, task string, a api.Agent) (*api.HandlerRotationExit, error) {
+	var seq int64
+	var kind, text, created string
+	err := q.QueryRowContext(ctx, `SELECT seq,kind,text,created_at FROM events WHERE task_id=? AND agent_id=? AND kind IN (?,?,?) ORDER BY seq DESC LIMIT 1`,
+		task, a.ID, api.EventStarted, api.EventHeartbeat, api.EventExited).Scan(&seq, &kind, &text, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, deathUnconfirmed("the hub no longer has the exit event of the handler's wrapper")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if kind != api.EventExited {
+		return nil, deathUnconfirmed("the handler's newest wrapper event is %s, not its exit", kind)
+	}
+	m := wrapperExitText.FindStringSubmatch(text)
+	if m == nil {
+		return nil, deathUnconfirmed("the handler's exit event was not reported by its wrapper")
+	}
+	code, _ := strconv.Atoi(m[1])
+	return &api.HandlerRotationExit{Code: code, ReportedAt: parseTS(created), EventSeq: seq}, nil
+}
+
 // liveSuccessor follows committed rotations from a closed handler to the
 // open end of its chain. It returns "" when the agent was not rotated.
 func liveSuccessor(ctx context.Context, q queryRower, agentID string) (string, error) {
@@ -240,16 +304,22 @@ func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest, model
 	return err
 }
 
-const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at,authorized_by,authorization_reason,old_runtime,successor_runtime,evidence_json,commit_evidence_json,last_activity_at`
+const handlerRotationCols = `id,task_id,request_id,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,successor_run_id,handoff_json,receipt_json,created_at,updated_at,authorized_by,authorization_reason,old_runtime,successor_runtime,evidence_json,commit_evidence_json,last_activity_at,exit_json`
 
 func scanHandlerRotation(row interface{ Scan(...any) error }) (api.HandlerRotation, error) {
 	var r api.HandlerRotation
-	var handoff, receipt, created, updated, evidence, commitEvidence, lastActivity string
+	var handoff, receipt, created, updated, evidence, commitEvidence, lastActivity, exit string
 	var auth api.HandlerRotationAuthorization
 	if err := row.Scan(&r.ID, &r.TaskID, &r.RequestID, &r.State, &r.Reason, &r.Trigger, &r.HandlerRevision, &r.OldAgentID, &r.OldRunID, &r.OldName,
 		&r.SuccessorAgentID, &r.SuccessorName, &r.SuccessorRunID, &handoff, &receipt, &created, &updated,
-		&auth.AuthorizedBy, &auth.Reason, &auth.OldRuntime, &auth.SuccessorRuntime, &evidence, &commitEvidence, &lastActivity); err != nil {
+		&auth.AuthorizedBy, &auth.Reason, &auth.OldRuntime, &auth.SuccessorRuntime, &evidence, &commitEvidence, &lastActivity, &exit); err != nil {
 		return r, err
+	}
+	if exit != "" {
+		r.Exit = &api.HandlerRotationExit{}
+		if err := json.Unmarshal([]byte(exit), r.Exit); err != nil {
+			return r, fmt.Errorf("handler rotation exit: %w", err)
+		}
 	}
 	for _, saved := range []struct {
 		raw string
@@ -459,7 +529,11 @@ func deathUnconfirmed(format string, args ...any) *api.HandlerRotationRefusal {
 // itself knows: it must name the old handler's host and exact run, state both
 // the session and the process gone, name that session, give a PID and start
 // identity, and be fresh by the hub's clock. The hub must also see no heartbeat from the run.
-func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, now time.Time) *api.HandlerRotationRefusal {
+// exit is the wrapper's exit report of an exited primary, nil otherwise. Only
+// with it may the session be present as an idle shell, and then the host's
+// own receipt must record the exit and the evidence must name the pane's
+// process.
+func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, exit *api.HandlerRotationExit, now time.Time) *api.HandlerRotationRefusal {
 	switch {
 	case ev == nil:
 		return deathUnconfirmed("a dead primary rotation needs the host's death evidence")
@@ -467,11 +541,17 @@ func deathEvidenceRefusal(ev *api.HandlerDeathEvidence, old api.Agent, now time.
 		return deathUnconfirmed("the evidence is from host %q, not the handler's host %q", ev.Host, old.Host)
 	case ev.AgentID != old.ID || ev.RunID != old.RunID:
 		return deathUnconfirmed("the evidence does not name the primary handler's exact agent and run")
-	case ev.SessionState != api.HandlerDeathStateGone || ev.ProcessState != api.HandlerDeathStateGone:
+	case exit == nil && (ev.SessionState != api.HandlerDeathStateGone || ev.ProcessState != api.HandlerDeathStateGone):
 		return deathUnconfirmed("the evidence must state the session and the process gone; it states session %q, process %q", ev.SessionState, ev.ProcessState)
+	case exit != nil && (ev.ProcessState != api.HandlerDeathStateGone || (ev.SessionState != api.HandlerDeathStateGone && ev.SessionState != api.HandlerDeathStateIdleShell)):
+		return deathUnconfirmed("for a handler whose wrapper reported exited the evidence must state the process gone and the session gone or %s; it states session %q, process %q", api.HandlerDeathStateIdleShell, ev.SessionState, ev.ProcessState)
+	case exit != nil && ev.ExitedAt == nil:
+		return deathUnconfirmed("the host's process receipt records no exit, so the exit report is not confirmed on the handler's host")
+	case ev.SessionState == api.HandlerDeathStateIdleShell && ev.PaneRootPID <= 0:
+		return deathUnconfirmed("the evidence of an idle shell does not name the pane's process")
 	case ev.SessionName == "":
 		return deathUnconfirmed("the evidence does not name the tmux session it found absent")
-	case ev.PID <= 0 || ev.ProcessStarted == "" || ev.PanePID < 0:
+	case ev.PID <= 0 || ev.ProcessStarted == "" || ev.PanePID < 0 || ev.PaneRootPID < 0:
 		return deathUnconfirmed("the evidence has no runtime process ID and start identity")
 	case ev.ObservedAt.IsZero() || now.Sub(ev.ObservedAt) > api.HandlerDeathEvidenceMaxAge:
 		return deathUnconfirmed("the evidence was observed more than %s ago", api.HandlerDeathEvidenceMaxAge)
@@ -494,33 +574,52 @@ func validDeathEvidenceText(ev *api.HandlerDeathEvidence) bool {
 
 // deadPrimaryPrepareCheck is every hub-side condition of a dead primary
 // rotation besides the guards all rotations share. It returns the run's last
-// recorded activity, which commit requires unchanged.
-func deadPrimaryPrepareCheck(ctx context.Context, q queryRower, t api.Task, old api.Agent, busy handlerBusy, ev *api.HandlerDeathEvidence, now time.Time) (time.Time, error) {
+// recorded activity, which commit requires unchanged, and for a primary whose
+// wrapper reported exited the exit report, which commit requires unchanged
+// too.
+func deadPrimaryPrepareCheck(ctx context.Context, q queryRower, t api.Task, old api.Agent, busy handlerBusy, ev *api.HandlerDeathEvidence, now time.Time) (time.Time, *api.HandlerRotationExit, error) {
 	var zero time.Time
 	policy, err := loadHandlerRotationPolicy(ctx, q, t.ID)
 	if err != nil {
-		return zero, err
+		return zero, nil, err
 	}
 	if policy.DeadSilenceMinutes <= 0 {
-		return zero, deathUnconfirmed("automatic replacement of a dead primary is off for this project")
+		return zero, nil, deathUnconfirmed("automatic replacement of a dead primary is off for this project")
 	}
-	if refusal := deathEvidenceRefusal(ev, old, now); refusal != nil {
-		return zero, refusal
+	var exit *api.HandlerRotationExit
+	if old.Status == api.AgentExited {
+		if exit, err = wrapperExitReport(ctx, q, t.ID, old); err != nil {
+			return zero, nil, err
+		}
+	}
+	if refusal := deathEvidenceRefusal(ev, old, exit, now); refusal != nil {
+		return zero, nil, refusal
 	}
 	if busy.refusal(api.HandlerRotationTriggerRunner) == nil {
-		return zero, deathUnconfirmed("the handler is not busy; the ordinary rotation applies")
+		return zero, nil, deathUnconfirmed("the handler is not busy; the ordinary rotation applies")
 	}
-	last, ok, err := handlerLastActivity(ctx, q, t.ID, old)
+	last, ok, err := handlerSilentSince(ctx, q, t.ID, old, exit)
 	if err != nil {
-		return zero, err
+		return zero, nil, err
 	}
 	if !ok {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: "the hub has no recorded activity from the handler run, which is not evidence of silence"}
+		return zero, nil, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: "the hub has no recorded activity from the handler run, which is not evidence of silence"}
 	}
 	if silent := now.Sub(last); silent < time.Duration(policy.DeadSilenceMinutes)*time.Minute {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: fmt.Sprintf("the handler run was last active %s ago; the policy needs %d minute(s) of silence", silent.Truncate(time.Second), policy.DeadSilenceMinutes)}
+		return zero, nil, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: fmt.Sprintf("the handler run was last active %s ago; the policy needs %d minute(s) of silence", silent.Truncate(time.Second), policy.DeadSilenceMinutes)}
 	}
-	return last, nil
+	return last, exit, nil
+}
+
+// handlerSilentSince is handlerLastActivity, never earlier than the wrapper's
+// exit report when there is one: the silence of an exited run starts at its
+// exit or later.
+func handlerSilentSince(ctx context.Context, q queryRower, task string, a api.Agent, exit *api.HandlerRotationExit) (time.Time, bool, error) {
+	last, ok, err := handlerLastActivity(ctx, q, task, a)
+	if err == nil && exit != nil && exit.ReportedAt.After(last) {
+		last, ok = exit.ReportedAt, true
+	}
+	return last, ok, err
 }
 
 // deadPrimaryCommitCheck re-confirms a prepared dead primary rotation: a
@@ -537,7 +636,18 @@ func deadPrimaryCommitCheck(ctx context.Context, q queryRower, t api.Task, old a
 	if ev == nil {
 		return policy, deathUnconfirmed("the commit of a dead primary rotation needs a second observation from the host")
 	}
-	if refusal := deathEvidenceRefusal(ev, old, now); refusal != nil {
+	// An exit rotation needs the same exit report still to be the run's
+	// newest start, heartbeat or exit.
+	var exit *api.HandlerRotationExit
+	if r.Exit != nil {
+		if exit, err = wrapperExitReport(ctx, q, t.ID, old); err != nil {
+			return policy, err
+		}
+		if exit.EventSeq != r.Exit.EventSeq {
+			return policy, deathUnconfirmed("the handler's exit report is not the one saved at prepare")
+		}
+	}
+	if refusal := deathEvidenceRefusal(ev, old, exit, now); refusal != nil {
 		return policy, refusal
 	}
 	if r.DeathEvidence == nil || r.LastActivityAt == nil {
@@ -546,7 +656,7 @@ func deadPrimaryCommitCheck(ctx context.Context, q queryRower, t api.Task, old a
 	if !ev.ObservedAt.After(r.DeathEvidence.ObservedAt) {
 		return policy, deathUnconfirmed("the commit needs an observation later than the one saved at prepare")
 	}
-	last, ok, err := handlerLastActivity(ctx, q, t.ID, old)
+	last, ok, err := handlerSilentSince(ctx, q, t.ID, old, exit)
 	if err != nil {
 		return policy, err
 	}
@@ -554,6 +664,35 @@ func deadPrimaryCommitCheck(ctx context.Context, q queryRower, t api.Task, old a
 		return policy, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotSilent, Detail: "the handler run recorded activity after the rotation was prepared"}
 	}
 	return policy, nil
+}
+
+// exitedRecipientGoneReason is the reason the broker saves when it closes an
+// obligation whose recipient exited (BrokerCloseRecipientGone).
+const exitedRecipientGoneReason = "recipient agent is " + api.AgentExited
+
+// exitedHandlerClosedObligations lists the obligations of an exited handler
+// that the broker closed recipient_gone, for that reason, at or after the
+// wrapper's exit report. Nothing closed earlier or for any other reason is
+// listed. Reissuing one marks it superseded, so it is never listed twice.
+func exitedHandlerClosedObligations(ctx context.Context, tx *sql.Tx, task string, old api.Agent, exit api.HandlerRotationExit) ([]api.Obligation, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE task_id=? AND agent_id=? AND state=? AND outcome=? AND reason=? ORDER BY message_seq,id`,
+		task, old.ID, api.ObligationClosed, api.OutcomeRecipientGone, exitedRecipientGoneReason)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.Obligation
+	for rows.Next() {
+		o, err := scanObligation(rows)
+		if err != nil {
+			return nil, err
+		}
+		// Timestamps are not stored in a sortable form, so the bound is applied here.
+		if o.ClosedAt != nil && !o.ClosedAt.Before(exit.ReportedAt) {
+			out = append(out, o)
+		}
+	}
+	return out, rows.Err()
 }
 
 // deadPrimaryOffHint is how the feature is turned off; the docs, the queue
@@ -762,12 +901,22 @@ func deadPrimaryNoticeText(t api.Task, r api.HandlerRotation, old, successor api
 	stamp := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 	var b strings.Builder
 	fmt.Fprintf(&b, "Primary database handler %s (%s / %s) was dead while the hub still recorded it as busy, so the host runner replaced it with %s by handler rotation %s.", old.Name, old.ID, old.RunID, successor.Name, r.ID)
-	fmt.Fprintf(&b, " Evidence from host %s: tmux session %s is absent and runtime process %d (started %s) is absent", ev.Host, ev.SessionName, ev.PID, ev.ProcessStarted)
-	if ev.PanePID > 0 {
-		fmt.Fprintf(&b, ", as is pane process %d", ev.PanePID)
+	if r.Exit != nil {
+		// The exited case: the session may remain, holding the wrapper's shell.
+		session := "is absent"
+		if ev.SessionState == api.HandlerDeathStateIdleShell {
+			session = fmt.Sprintf("holds only the wrapper (process %d) and its idle shell", ev.PaneRootPID)
+		}
+		fmt.Fprintf(&b, " Its runtime exited with status %d at %s, as reported by its wrapper. Evidence from host %s: runtime process %d (started %s) is absent and tmux session %s %s",
+			r.Exit.Code, stamp(r.Exit.ReportedAt), ev.Host, ev.PID, ev.ProcessStarted, ev.SessionName, session)
+	} else {
+		fmt.Fprintf(&b, " Evidence from host %s: tmux session %s is absent and runtime process %d (started %s) is absent", ev.Host, ev.SessionName, ev.PID, ev.ProcessStarted)
+		if ev.PanePID > 0 {
+			fmt.Fprintf(&b, ", as is pane process %d", ev.PanePID)
+		}
 	}
 	fmt.Fprintf(&b, "; observed %s and again %s.", stamp(ev.ObservedAt), stamp(commit.ObservedAt))
-	if ev.ExitedAt != nil {
+	if ev.ExitedAt != nil && r.Exit == nil {
 		fmt.Fprintf(&b, " Its wrapper recorded an exit at %s.", stamp(*ev.ExitedAt))
 	}
 	fmt.Fprintf(&b, " The hub's last recorded activity from that run was %s; the silence applied was %d minute(s).", stamp(in.LastActivityAt), in.SilenceMinutes)
@@ -916,6 +1065,14 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}
+	if dead {
+		// Only this rotation sees a primary whose wrapper reported exited.
+		if exited, ok, err := exitedPrimaryHandler(ctx, tx, t); err != nil {
+			return zero, err
+		} else if ok {
+			old = exited
+		}
+	}
 	if old.ID != req.OldAgentID || old.RunID != req.OldRunID {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotPrimary, Detail: "the named run is not the project's current primary database handler"}
 	}
@@ -935,11 +1092,12 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 	}
 	now := s.now()
 	var lastActivity time.Time
+	var exit *api.HandlerRotationExit
 	if dead {
 		// The one exception to h2, by owner order #28057: the busy refusal is
 		// lifted only when the host confirmed the death and the hub's own
 		// records show the run silent.
-		if lastActivity, err = deadPrimaryPrepareCheck(ctx, tx, t, old, busy, req.DeathEvidence, now); err != nil {
+		if lastActivity, exit, err = deadPrimaryPrepareCheck(ctx, tx, t, old, busy, req.DeathEvidence, now); err != nil {
 			return zero, err
 		}
 	} else if refusal := busy.refusal(req.Trigger); refusal != nil {
@@ -954,16 +1112,20 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		r.Authorization = &api.HandlerRotationAuthorization{AuthorizedBy: req.AuthorizedBy, Reason: req.AuthorizationReason}
 		payload["authorizedBy"], payload["authorizationReason"] = req.AuthorizedBy, req.AuthorizationReason
 	}
-	evidenceJSON, lastActivityText := "", ""
+	evidenceJSON, lastActivityText, exitJSON := "", "", ""
 	if dead {
 		data, _ := json.Marshal(req.DeathEvidence)
 		evidenceJSON, lastActivityText = string(data), ts(lastActivity)
 		r.DeathEvidence, r.LastActivityAt = req.DeathEvidence, &lastActivity
 		payload["deathEvidence"], payload["lastActivityAt"] = req.DeathEvidence, lastActivityText
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at,authorized_by,authorization_reason,evidence_json,last_activity_at)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
-		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now), req.AuthorizedBy, req.AuthorizationReason, evidenceJSON, lastActivityText); err != nil {
+	if exit != nil {
+		data, _ := json.Marshal(exit)
+		exitJSON, r.Exit, payload["exit"] = string(data), exit, exit
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at,authorized_by,authorization_reason,evidence_json,last_activity_at,exit_json)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.TaskID, r.RequestID, requestHash(req), r.State, r.Reason, r.Trigger, r.HandlerRevision, r.OldAgentID, r.OldRunID, r.OldName,
+		r.SuccessorAgentID, r.SuccessorName, ts(now), ts(now), req.AuthorizedBy, req.AuthorizationReason, evidenceJSON, lastActivityText, exitJSON); err != nil {
 		return zero, err
 	}
 	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", old.ID, "Handler rotation prepared", payload, by); err != nil {
@@ -998,7 +1160,9 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err != nil {
 		return zero, err
 	}
-	if old.RunID != r.OldRunID || old.Status == api.AgentClosed || old.Status == api.AgentExited || t.HandlerRevision != r.HandlerRevision {
+	// Only a rotation prepared on a saved exit report may replace an exited
+	// handler, and it replaces nothing else: a restart changes the status.
+	if old.RunID != r.OldRunID || old.Status == api.AgentClosed || (old.Status == api.AgentExited) != (r.Exit != nil) || t.HandlerRevision != r.HandlerRevision {
 		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedStaleHandler, Detail: "the old handler run changed since prepare; abort this rotation"}
 	}
 	busy, err := loadHandlerBusy(ctx, tx, t.ID, old)
@@ -1057,6 +1221,16 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	rows.Close()
 	if err = rows.Err(); err != nil {
 		return zero, err
+	}
+	if r.Exit != nil {
+		// The broker closes an exited recipient's obligations within one tick,
+		// long before the silence is met, so those are handed over too.
+		closed, err := exitedHandlerClosedObligations(ctx, tx, t.ID, old, *r.Exit)
+		if err != nil {
+			return zero, err
+		}
+		open = append(open, closed...)
+		sort.SliceStable(open, func(i, j int) bool { return open[i].MessageSeq < open[j].MessageSeq })
 	}
 	if dead {
 		if handoff.InFlight, err = snapshotDeadInFlight(ctx, tx, t, old, busy, *r.LastActivityAt, deadPolicy.DeadSilenceMinutes, open); err != nil {
@@ -1272,14 +1446,15 @@ func (s *Store) abortHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Task
 // HandlerRotationsDue lists, for each open project whose primary handler runs
 // on host, the counters the runner compares with the policy: a project whose
 // limit policy is enabled, and any project whose primary is a dead candidate.
+// A busy primary whose wrapper reported exited is listed as the primary too.
 // templateDigest is the runner's current handler template. templateDigest is the runner's current handler template.
 func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest string) (api.HandlerRotationDueList, error) {
 	out := api.HandlerRotationDueList{Entries: []api.HandlerRotationDue{}}
 	if host == "" || !api.ValidText(host, 253) || len(templateDigest) > 64 {
 		return out, api.ErrInvalid
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE status=? AND pause_state=? AND EXISTS (SELECT 1 FROM agents a WHERE a.task_id=tasks.id AND a.role=? AND a.host=? AND a.status NOT IN (?,?)) ORDER BY created_at,id`,
-		api.TaskOpen, api.ProjectPauseActive, api.AgentRoleDatabaseHandler, host, api.AgentClosed, api.AgentExited)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE status=? AND pause_state=? AND EXISTS (SELECT 1 FROM agents a WHERE a.task_id=tasks.id AND a.role=? AND a.host=? AND a.status<>?) ORDER BY created_at,id`,
+		api.TaskOpen, api.ProjectPauseActive, api.AgentRoleDatabaseHandler, host, api.AgentClosed)
 	if err != nil {
 		return out, err
 	}
@@ -1306,22 +1481,37 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if !policy.Enabled && policy.DeadSilenceMinutes <= 0 {
 			continue
 		}
-		primary, err := primaryHandler(ctx, s.db, t)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
+		// A primary whose wrapper reported exited is listed only while it is
+		// busy and the dead primary replacement is on; otherwise the project
+		// is listed for its open primary as before.
+		primary, exited, err := exitedPrimaryHandler(ctx, s.db, t)
 		if err != nil {
 			return out, err
+		}
+		var busy handlerBusy
+		if exited {
+			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); err != nil {
+				return out, err
+			}
+			exited = policy.DeadSilenceMinutes > 0 && !busy.idle()
+		}
+		if !exited {
+			primary, err = primaryHandler(ctx, s.db, t)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return out, err
+			}
+			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); err != nil {
+				return out, err
+			}
 		}
 		if primary.Host != host {
 			continue
 		}
 		d := api.HandlerRotationDue{TaskID: t.ID, HandlerRevision: t.HandlerRevision, Agent: primary, Policy: policy, DueReasons: []string{}}
 		if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND handler_id=? AND handler_run_id=? AND state='finished'`, t.ID, primary.ID, primary.RunID).Scan(&d.FinishedItems); err != nil {
-			return out, err
-		}
-		busy, err := loadHandlerBusy(ctx, s.db, t.ID, primary)
-		if err != nil {
 			return out, err
 		}
 		d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), busy.idle()
@@ -1332,7 +1522,16 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 			continue
 		}
 		if !d.Online {
-			last, ok, err := handlerLastActivity(ctx, s.db, t.ID, primary)
+			// An exited run's silence starts at its wrapper's exit report; a
+			// report the hub cannot use leaves the decision to prepare.
+			var exit *api.HandlerRotationExit
+			if exited {
+				var refusal *api.HandlerRotationRefusal
+				if exit, err = wrapperExitReport(ctx, s.db, t.ID, primary); err != nil && !errors.As(err, &refusal) {
+					return out, err
+				}
+			}
+			last, ok, err := handlerSilentSince(ctx, s.db, t.ID, primary, exit)
 			if err != nil {
 				return out, err
 			}

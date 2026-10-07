@@ -68,12 +68,18 @@ const (
 	HandlerOnlineWindow = 90 * time.Second
 
 	HandlerDeathStateGone = "gone"
+	// HandlerDeathStateIdleShell is a session state only, and only for a
+	// primary whose wrapper reported exited (wi_1d987e7f296b6a2e, owner order
+	// #28426): the session is present and its one pane holds nothing but the
+	// wrapper and one childless shell.
+	HandlerDeathStateIdleShell = "idle_shell"
 )
 
 // HandlerDeathEvidence is what the handler's own host observed: the named
 // tmux session is absent from a readable listing, and the runtime process is
 // absent by PID and start identity, as is the pane process when PanePID is set. Only "gone" is evidence; a
-// host that could not read a fact sends nothing.
+// host that could not read a fact sends nothing. For a handler whose wrapper
+// reported exited the session may instead be "idle_shell", with PaneRootPID.
 type HandlerDeathEvidence struct {
 	Host           string    `json:"host"`
 	AgentID        string    `json:"agentId"`
@@ -89,6 +95,19 @@ type HandlerDeathEvidence struct {
 	ProcessState   string    `json:"processState"`
 	// ExitedAt is the wrapper's own exit record, when it wrote one.
 	ExitedAt *time.Time `json:"exitedAt,omitempty"`
+	// PaneRootPID is the pane's process as tmux listed it when SessionState is
+	// idle_shell: the surviving wrapper.
+	PaneRootPID int `json:"paneRootPid,omitempty"`
+}
+
+// HandlerRotationExit is the wrapper's exit report the hub found for an
+// exited primary at prepare: its exit status, when the hub recorded it and
+// the event that carries it. Commit needs the same event to still be the
+// run's newest start, heartbeat or exit.
+type HandlerRotationExit struct {
+	Code       int       `json:"code"`
+	ReportedAt time.Time `json:"reportedAt"`
+	EventSeq   int64     `json:"eventSeq"`
 }
 
 var rotatedNameSuffix = regexp.MustCompile(`-r[0-9]+$`)
@@ -188,8 +207,10 @@ type HandlerRotation struct {
 	DeathEvidence       *HandlerDeathEvidence `json:"deathEvidence,omitempty"`
 	CommitDeathEvidence *HandlerDeathEvidence `json:"commitDeathEvidence,omitempty"`
 	LastActivityAt      *time.Time            `json:"lastActivityAt,omitempty"`
-	CreatedAt           time.Time             `json:"createdAt"`
-	UpdatedAt           time.Time             `json:"updatedAt"`
+	// Exit is set when the replaced primary's wrapper had reported exited.
+	Exit      *HandlerRotationExit `json:"exit,omitempty"`
+	CreatedAt time.Time            `json:"createdAt"`
+	UpdatedAt time.Time            `json:"updatedAt"`
 }
 
 // HandlerRotationAuthorization records who authorized a rotation that may

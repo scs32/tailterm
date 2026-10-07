@@ -213,7 +213,7 @@ The rotation row, successor and obligations stay as they were.
 | `agent_caller` | The request carries an agent identity. |
 | `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy, or for a run in no arm, a model change is accepted. An [authorized change](#changing-the-primarys-runtime-or-model) skips this check and does not write the policy. |
 
-| `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. |
+| `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. For a [primary whose wrapper reported exited](#a-primary-whose-wrapper-reported-exited): the hub has no exit report from the wrapper as the run's newest start, heartbeat or exit, or that report changed since prepare; the evidence carries no exit from the host's receipt; or it states an `idle_shell` session without the pane's process. |
 | `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
@@ -383,6 +383,102 @@ only reported, and the command that turns the replacement off. The receipt has
 `noticeSeq`, `ownerNoticeSeq` and `leasesMoved`, and `tt handler rotation get`
 prints the evidence, the moved leases and the in-flight section.
 
+### A primary whose wrapper reported exited
+
+Bug `wi_1d987e7f296b6a2e`, owner order #28426.
+
+A runtime that crashes usually leaves its `tt wrap` wrapper alive. The wrapper
+posts `exited` with the text `Process exited (N)`, writes `exitedAt` to its
+process receipt, and leaves a login shell in the pane, so the tmux session
+stays. The rules above never fire for it, because the session is present. A
+busy primary in that state is replaced through the same prepare and commit,
+with these differences. Everything not listed here is unchanged: the silence,
+the 90 second heartbeat check, fresh evidence from the handler's own host and
+exact run, the second look, the single commit transaction and the off switch.
+
+**Which handler.** Only a `dead_primary` prepare and the due list see an
+exited handler as the primary: the explicit primary when it is not closed,
+otherwise the oldest handler that is not closed and not a prepared successor,
+when its status is `exited`. Every other rotation, and `tt handler rotate` by
+hand, still skips an exited handler.
+
+**The exit report (hub).** The agent's newest `started`, `heartbeat` or
+`exited` event must be an `exited` event whose text is exactly the wrapper's
+`Process exited (N)`. The hub saves its status, time and event on the rotation
+as `exit` (`code`, `reportedAt`, `eventSeq`). An event that is missing, was
+pruned (the hub keeps the newest 10,000 events per project), or was posted by
+hand with `tt event exited` is refused `death_unconfirmed`. The silence starts
+at the exit report or at any later activity of the run.
+
+**The evidence.** `processState` must be `gone`, the evidence must carry the
+receipt's `exitedAt`, and `sessionState` is either `gone` or `idle_shell` with
+`paneRootPid`, the pane's process. So the host's own receipt must record the
+exit as well: an `exited` event alone is never enough. For a primary that is
+not exited nothing changed: `idle_shell` is refused and both states must be
+`gone`.
+
+**The probe.** For a handler whose roster status is `exited`, steps 1 and 2
+above run first, then:
+
+1. The receipt records no exit: **unknown**.
+2. The session listing cannot be read: **unknown**.
+3. No session is tagged with this agent or named as the handler's session: the
+   remaining steps above apply, and gone states the session `gone`.
+4. Otherwise the runtime process by PID and start identity: a failed check is
+   **unknown**, running is **alive**.
+5. More than one such session, or one that is not tagged with this hub,
+   project, agent and exact run, that does not carry the handler's session
+   name, or whose tmux ID or creation time differs from what the receipt
+   records: **unknown**.
+6. The session's panes cannot be read, or it has no pane or more than one:
+   **unknown**.
+7. The process table (`ps`, process ID and parent ID only) cannot be read, has
+   a row that does not parse, or lacks the pane's process: **unknown**.
+8. The pane's process must have exactly one child, and that child none. A
+   process below that child is **alive**
+   (`process N runs under the pane's shell`). Any other shape is **unknown**.
+9. Otherwise **gone**, with `sessionState: idle_shell` and `paneRootPid`.
+
+Step 8 matches no executable name. Anything running under the leftover shell
+blocks the replacement, which covers a runtime someone started again by hand
+in that shell.
+
+**A restart cancels it.** Starting an exited handler again gives it a new run
+and a status other than `exited`. A prepare for the old run is then refused
+`not_primary`, a prepared rotation's commit is refused `handler_changed`, and
+the runner's second probe is not run for another run, so it aborts. Any
+activity recorded from the run after prepare refuses the commit `not_silent`.
+The commit also needs the same exit event still to be the run's newest start,
+heartbeat or exit. A rotation prepared without a saved exit never replaces a
+handler that exited afterwards (`handler_changed`).
+
+**What is handed off.** As above, plus one addition. The broker closes an
+exited recipient's open obligations as `recipient_gone` within one tick (30
+seconds), long before the silence is met. The commit therefore also re-issues
+to the successor the old handler's obligations closed `recipient_gone` with
+the reason `recipient agent is exited` at or after the exit report. An
+obligation closed earlier or for any other reason is not re-issued, and a
+re-issued one is marked superseded, so a replay re-issues nothing twice.
+After the commit the runner cleans up the old session, which ends the leftover
+shell, as in every rotation.
+
+**The notice.** Same subject and the same two copies. Its evidence sentence
+differs: it gives the exit status and time, says the runtime process is
+absent, and says the tmux session `is absent` or
+`holds only the wrapper (process P) and its idle shell`. It begins:
+
+`Its runtime exited with status N at TIME, as reported by its wrapper.`
+
+`tt handler rotation get` prints the saved exit report as:
+
+`Wrapper exit report: status N, reported TIME (event S)`
+
+**Not proven on a live host.** The strict pane rule is covered only by tests
+with injected process tables. A login shell that keeps a helper process
+running under it would make step 8 answer alive on every probe, and that
+handler would wait for the owner, as before this change. What a real exited
+handler pane on this project's host holds has not been observed yet.
+
 ## Handoff contents
 
 `tt handler rotation get` shows the snapshot saved at commit:
@@ -485,8 +581,9 @@ tables (`handler_rotation_policy`, `handler_rotations`,
 `handler_rotations` columns `authorized_by`, `authorization_reason`,
 `old_runtime` and `successor_runtime`, which default to empty, and the dead
 primary columns: `handler_rotation_policy.dead_silence_minutes` (default 10) and
-`handler_rotations.evidence_json`, `commit_evidence_json` and
-`last_activity_at`. An older hub binary
+`handler_rotations.evidence_json`, `commit_evidence_json`,
+`last_activity_at` and `exit_json` (the saved exit report, empty for any other
+rotation). An older hub binary
 ignores them and returns to the legacy primary rules. A handler closed by a
 rotation stays closed. An older CLI does not forward the old name, so address the
 successor by its new name. Host specs and journals under the relay state
@@ -514,10 +611,16 @@ directory are inert without the new CLI.
   pane process (the saved receipt records none) and not every descendant. An
   orphaned child that still writes counts as activity and delays or aborts the
   replacement.
-- A primary whose wrapper survived the runtime and reported `exited` is not
-  replaced by this rule. The hub no longer treats an exited agent as the
-  primary and refuses a rotation that names it (`not_primary` at prepare,
-  `handler_changed` at commit), so it keeps its leases until the owner acts.
+- An [exited primary](#a-primary-whose-wrapper-reported-exited) waits for the
+  owner when the wrapper's exit event was pruned or posted by hand, when the
+  host's receipt records no exit, or when anything runs under the pane's
+  leftover shell. The strict pane rule is not yet proven on a live host.
+- An exit report that was lost while the wrapper survived is recovered by
+  neither rule: the hub never marks the handler exited, and its session is
+  present, so the probe answers alive.
+- An exited primary that is not busy is not replaced by this rule; see the
+  handler floor and follow-up `wi_42be87739d7bbfc9`.
+- The queue's waiting reason for a project whose primary exited is unchanged.
 - A dead primary rotation whose successor cannot start stays prepared and is
   resumed from the journal, with no retry ceiling.
 - The hub does not reprovision a handler when the count reaches zero; that is

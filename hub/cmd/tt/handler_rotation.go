@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,13 +224,22 @@ type handlerDeathProbe func(ctx context.Context, hub string, a api.Agent) (state
 // process is absent by PID and start identity. When the receipt also records
 // a pane process, that must be absent too. Any fact it cannot read is
 // unknown, never gone. It signals nothing.
+//
+// A handler whose wrapper reported exited (wi_1d987e7f296b6a2e) keeps its
+// session, because the wrapper leaves a login shell in the pane. For that
+// roster status only, a present session is read further: see idleShell.
 type deathProbe struct {
 	receipt  func(hub, agent, run string) (runtimeProcessReceipt, error)
 	sessions func(context.Context) ([]ownedSession, error)
 	pid      runtimePIDProbe
-	socket   func() string
-	host     func() string
-	now      func() time.Time
+	// panes lists the pane process IDs of one session by its tmux ID, and
+	// processes maps every process ID on the host to its parent's. Only the
+	// exited case reads them; a nil reader confirms nothing.
+	panes     func(ctx context.Context, sessionID string) ([]int, error)
+	processes func(context.Context) (map[int]int, error)
+	socket    func() string
+	host      func() string
+	now       func() time.Time
 }
 
 func productionDeathProbe() deathProbe {
@@ -241,7 +252,7 @@ func productionDeathProbe() deathProbe {
 			}
 			return r, json.Unmarshal(data, &r)
 		},
-		sessions: localSessions, pid: nativeRuntimePIDProbe,
+		sessions: localSessions, pid: nativeRuntimePIDProbe, panes: sessionPanePIDs, processes: processParents,
 		socket: func() string { return os.Getenv("TT_TMUX_SOCKET") }, host: spawn.Host, now: time.Now,
 	}
 }
@@ -270,14 +281,27 @@ func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string,
 	if session == "" {
 		return handlerProbeUnknown, "neither the process receipt nor the roster names the handler's tmux session", nil
 	}
+	// An exit the wrapper posted must also be in its own receipt on this
+	// host; an exited status alone is never enough.
+	exited := a.Status == api.AgentExited
+	if exited && receipt.ExitedAt.IsZero() {
+		return handlerProbeUnknown, "the roster says the handler exited but its process receipt records no exit", nil
+	}
 	sessions, err := p.sessions(ctx)
 	if err != nil {
 		return handlerProbeUnknown, "the tmux session listing is unreadable", nil
 	}
+	var present []ownedSession
 	for _, s := range sessions {
 		if s.Agent == a.ID || (receipt.Session != "" && s.Name == receipt.Session) || (a.Session != "" && s.Name == a.Session) {
-			return handlerProbeAlive, "tmux session " + s.Name + " is present", nil
+			if !exited {
+				return handlerProbeAlive, "tmux session " + s.Name + " is present", nil
+			}
+			present = append(present, s)
 		}
+	}
+	if len(present) > 0 {
+		return p.idleShell(ctx, hub, a, receipt, session, present)
 	}
 	if alive, err := p.pid(receipt.PID, receipt.Started); err != nil {
 		return handlerProbeUnknown, "the runtime process could not be checked: " + err.Error(), nil
@@ -302,6 +326,129 @@ func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string,
 		ev.ExitedAt = &exited
 	}
 	return handlerProbeGone, "the session and the runtime process are absent", ev
+}
+
+// idleShell reads the session an exited handler left behind. It answers gone
+// only when the runtime process is absent, the one session is this exact
+// run's, it has one pane, and that pane's process has exactly one child with
+// no children of its own: the wrapper and its idle login shell. Anything
+// running under that shell answers alive, whatever its name, so a runtime
+// rerun by hand is never replaced. Every unreadable or unexpected fact is
+// unknown.
+func (p deathProbe) idleShell(ctx context.Context, hub string, a api.Agent, receipt runtimeProcessReceipt, session string, present []ownedSession) (string, string, *api.HandlerDeathEvidence) {
+	if alive, err := p.pid(receipt.PID, receipt.Started); err != nil {
+		return handlerProbeUnknown, "the runtime process could not be checked: " + err.Error(), nil
+	} else if alive {
+		return handlerProbeAlive, fmt.Sprintf("runtime process %d is running", receipt.PID), nil
+	}
+	if len(present) != 1 {
+		return handlerProbeUnknown, fmt.Sprintf("%d tmux sessions name the handler", len(present)), nil
+	}
+	s := present[0]
+	if !s.valid() || strings.TrimRight(s.Hub, "/") != hub || s.Task != a.TaskID || s.Agent != a.ID || s.Run != a.RunID || s.Name != session ||
+		(receipt.SessionID != "" && s.ID != receipt.SessionID) || (receipt.SessionCreated != "" && s.Created != receipt.SessionCreated) {
+		return handlerProbeUnknown, "tmux session " + s.Name + " is not identified as the exited run's own session", nil
+	}
+	if p.panes == nil || p.processes == nil {
+		return handlerProbeUnknown, "this host cannot read the session's pane and process table", nil
+	}
+	panes, err := p.panes(ctx, s.ID)
+	if err != nil {
+		return handlerProbeUnknown, "the session's panes are unreadable", nil
+	}
+	if len(panes) != 1 || panes[0] < 1 {
+		return handlerProbeUnknown, fmt.Sprintf("the session has %d panes, not one", len(panes)), nil
+	}
+	parents, err := p.processes(ctx)
+	if err != nil {
+		return handlerProbeUnknown, "the process table is unreadable", nil
+	}
+	if state, detail := idleShellTree(parents, panes[0]); state != handlerProbeGone {
+		return state, detail, nil
+	}
+	exitedAt := receipt.ExitedAt.UTC()
+	return handlerProbeGone, "the runtime process is absent and the session holds only the wrapper and its idle shell", &api.HandlerDeathEvidence{Host: p.host(), AgentID: a.ID, RunID: a.RunID,
+		ObservedAt: p.now().UTC(), SessionName: s.Name, SessionID: s.ID, SessionCreated: s.Created, SessionState: api.HandlerDeathStateIdleShell, PID: receipt.PID,
+		ProcessStarted: receipt.Started, ProcessState: api.HandlerDeathStateGone, ExitedAt: &exitedAt, PaneRootPID: panes[0]}
+}
+
+// idleShellTree checks the shape below a pane's process in a table of process
+// ID to parent ID: exactly one child, and that child childless. It matches no
+// executable name.
+func idleShellTree(parents map[int]int, root int) (string, string) {
+	if _, ok := parents[root]; !ok {
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d is not in the process table", root)
+	}
+	children := func(of int) []int {
+		var out []int
+		for pid, parent := range parents {
+			if parent == of && pid != of {
+				out = append(out, pid)
+			}
+		}
+		sort.Ints(out)
+		return out
+	}
+	shells := children(root)
+	if len(shells) != 1 {
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d has %d child processes, not one shell", root, len(shells))
+	}
+	if below := children(shells[0]); len(below) > 0 {
+		return handlerProbeAlive, fmt.Sprintf("process %d runs under the pane's shell", below[0])
+	}
+	return handlerProbeGone, ""
+}
+
+// sessionPanePIDs lists the pane process IDs of one tmux session, all windows.
+func sessionPanePIDs(ctx context.Context, sessionID string) ([]int, error) {
+	if !sessionIDPattern.MatchString(sessionID) {
+		return nil, errors.New("invalid tmux session ID")
+	}
+	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", sessionID, "-F", "#{pane_pid}")
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid < 1 {
+			return nil, errors.New("unreadable pane process ID")
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
+}
+
+const maxProcessTable = 65536
+
+// processParents reads every process ID and its parent's. One unparsable or
+// repeated row makes the whole table unreadable.
+func processParents(ctx context.Context) (map[int]int, error) {
+	raw, err := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseProcessParents(string(raw))
+}
+
+func parseProcessParents(raw string) (map[int]int, error) {
+	parents := map[int]int{}
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, errors.New("unreadable process table row")
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		parent, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil || pid < 1 || parent < 0 {
+			return nil, errors.New("unreadable process table row")
+		}
+		if _, repeated := parents[pid]; repeated || len(parents) >= maxProcessTable {
+			return nil, errors.New("the process table repeats a process or is too large")
+		}
+		parents[pid] = parent
+	}
+	return parents, nil
 }
 
 // rotationRefusal reports a hub refusal that changed nothing.
@@ -329,6 +476,20 @@ func rotationBusy(err error) bool {
 func currentPrimaryHandler(d api.TaskDetail) (api.Agent, bool) {
 	for _, a := range primaryHandlerFirst(d.Task, d.Agents) {
 		if a.Role == api.AgentRoleDatabaseHandler && a.Status != api.AgentClosed && a.Status != api.AgentExited {
+			return a, true
+		}
+	}
+	return api.Agent{}, false
+}
+
+// exitedHandlerNamed is the exited database handler the host's death evidence
+// names by agent and exact run, if the roster has one.
+func exitedHandlerNamed(d api.TaskDetail, evidence *api.HandlerDeathEvidence) (api.Agent, bool) {
+	if evidence == nil {
+		return api.Agent{}, false
+	}
+	for _, a := range d.Agents {
+		if a.Role == api.AgentRoleDatabaseHandler && a.Status == api.AgentExited && a.ID == evidence.AgentID && a.RunID == evidence.RunID && a.RunID != "" {
 			return a, true
 		}
 	}
@@ -398,6 +559,11 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			}
 		}
 		old, ok := currentPrimaryHandler(detail)
+		// Only a dead primary rotation may name a handler whose wrapper
+		// reported exited; the hub decides whether it is the primary.
+		if exited, found := exitedHandlerNamed(detail, evidence); found {
+			old, ok = exited, true
+		}
 		if !ok {
 			return zero, errors.New("the project has no open database handler to rotate")
 		}
@@ -880,6 +1046,9 @@ func cmdHandlerRotation(e env, args []string) error {
 // one line per observation; none for any other rotation.
 func rotationDeathEvidenceLines(r api.HandlerRotation) []string {
 	var lines []string
+	if r.Exit != nil {
+		lines = append(lines, fmt.Sprintf("Wrapper exit report: status %d, reported %s (event %d)", r.Exit.Code, r.Exit.ReportedAt.UTC().Format(time.RFC3339), r.Exit.EventSeq))
+	}
 	for _, v := range []struct {
 		label string
 		ev    *api.HandlerDeathEvidence
@@ -891,6 +1060,9 @@ func rotationDeathEvidenceLines(r api.HandlerRotation) []string {
 			v.ev.SessionName, v.ev.SessionState, v.ev.PID, v.ev.ProcessStarted, v.ev.ProcessState)
 		if v.ev.PanePID > 0 {
 			line += fmt.Sprintf(", pane process %d gone", v.ev.PanePID)
+		}
+		if v.ev.PaneRootPID > 0 {
+			line += fmt.Sprintf(", pane holds only wrapper process %d and its idle shell", v.ev.PaneRootPID)
 		}
 		if v.ev.ExitedAt != nil {
 			line += ", wrapper exit recorded " + v.ev.ExitedAt.UTC().Format(time.RFC3339)
