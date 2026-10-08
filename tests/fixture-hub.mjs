@@ -1,6 +1,8 @@
 // In-memory stand-in for tailterm-hub, mounted on the static test server at
 // /fixture-hub/v1/*. It mirrors the real API closely enough for the client:
-// tasks, agents, messages, lifecycle events, and long-polled feeds.
+// tasks, agents, messages, lifecycle events, and long-polled feeds. It also
+// offers navigateWithHubHeld, which a test wraps around every Lock or reload
+// of a page that talks to it.
 import { randomBytes } from "node:crypto";
 
 const id = (prefix) => `${prefix}_${randomBytes(8).toString("hex")}`;
@@ -162,7 +164,25 @@ export function createFixtureHub({
     requests: [],
   };
 
+  // Requests not answered yet, and the answers kept back while a page
+  // navigates (see navigateWithHubHeld below).
+  const unanswered = new Set();
+  let held = null;
+
   async function handle(req, res, url) {
+    const entry = { key: req.method + " " + req.url };
+    const end = res.end.bind(res);
+    unanswered.add(entry);
+    res.on("close", () => unanswered.delete(entry));
+    res.end = (...args) => {
+      const send = () => {
+        unanswered.delete(entry);
+        end(...args);
+      };
+      if (held) held.push(send);
+      else send();
+      return res;
+    };
     const path = url.pathname.replace(/^\/fixture-hub/, "");
     api.requests.push(req.method + " " + path + url.search);
     const json = (status, body) => {
@@ -310,7 +330,105 @@ export function createFixtureHub({
     });
   }
 
-  return { api, handle };
+  // A navigation must not cut off a hub response. The Go WASM HTTP client reads
+  // a response body as a stream and, when the read fails, cancels the stream
+  // without handling the promise that returns. A reload (Lock included) that
+  // lands between a response's headers and the end of its body therefore
+  // leaves an unhandled "Load failed" rejection, which WebKit reports as a page
+  // error. The fixture hub answers every long-poll whenever any event is posted,
+  // so such a response can be on the wire at any reload. WebKit cancels the old
+  // document's requests as the navigation starts, so the wait comes first: stop
+  // the fixture answering, wait until the browser has received every answer
+  // already sent, then navigate. Requests the fixture has not answered are
+  // cancelled before their headers, which the client handles.
+  const hubKey = (request) => {
+    const url = new URL(request.url());
+    return url.pathname.startsWith("/fixture-hub/")
+      ? request.method() + " " + url.pathname + url.search
+      : "";
+  };
+  const watched = new WeakSet();
+  const inFlight = new Set();
+  // The hold has to see every hub request a page makes, so a test hands over
+  // its browser context before opening the page.
+  function watchRequests(context) {
+    watched.add(context);
+    // Chromium reports neither an end nor a failure for a request that a
+    // navigation discards. So a frame's open requests are forgotten when it
+    // commits the document it asked for (framenavigated alone also fires for
+    // same-document navigations, which discard nothing), and a page's when it
+    // closes.
+    const documentRequests = new Map();
+    const forget = (gone) => {
+      for (const request of inFlight)
+        if (gone(request.frame())) inFlight.delete(request);
+    };
+    context.on("request", (request) => {
+      if (hubKey(request)) inFlight.add(request);
+      else if (request.isNavigationRequest())
+        documentRequests.set(request.frame(), request);
+    });
+    context.on("requestfinished", (request) => inFlight.delete(request));
+    context.on("requestfailed", (request) => {
+      inFlight.delete(request);
+      if (documentRequests.get(request.frame()) === request)
+        documentRequests.delete(request.frame());
+    });
+    context.on("page", (opened) => {
+      opened.on("framenavigated", (frame) => {
+        if (documentRequests.delete(frame)) forget((owner) => owner === frame);
+      });
+      opened.on("close", () => forget((owner) => owner.page() === opened));
+    });
+  }
+  // A request the browser still waits on that the fixture is not keeping has
+  // its answer, or the request itself, on the wire.
+  const onTheWire = () => {
+    const kept = [...unanswered].map((entry) => entry.key);
+    return [...inFlight].map(hubKey).filter((key) => {
+      const at = kept.indexOf(key);
+      if (at < 0) return true;
+      kept.splice(at, 1);
+      return false;
+    });
+  };
+  let holds = 0;
+  async function navigateWithHubHeld(page, navigate) {
+    if (!watched.has(page.context()))
+      throw new Error(
+        "navigateWithHubHeld needs watchRequests(context) before the page opens",
+      );
+    holds++;
+    held ||= [];
+    try {
+      const deadline = Date.now() + 15000;
+      while (onTheWire().length) {
+        if (Date.now() > deadline)
+          throw new Error(
+            "Hub responses still on the wire before navigation: " +
+              onTheWire().join(", "),
+          );
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const navigated = page.waitForEvent("framenavigated", {
+        predicate: (frame) => frame === page.mainFrame(),
+      });
+      navigated.catch(() => {}); // reported by the await below, or by navigate()
+      const result = await navigate();
+      await navigated;
+      return result;
+    } finally {
+      // The old document's requests are cancelled by now; an answer still
+      // kept for another page is sent.
+      if (!--holds) {
+        const kept = held;
+        held = null;
+        for (const send of kept) send();
+      }
+    }
+  }
+
+  return { api, handle, watchRequests, navigateWithHubHeld };
 }
 
 function parseDuration(value) {

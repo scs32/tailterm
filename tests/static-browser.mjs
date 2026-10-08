@@ -53,12 +53,24 @@ const hostKey = generateKeyPairSync("rsa", {
   publicKeyEncoding: { type: "spki", format: "pem" },
 }).privateKey;
 const keyPassphrase = "fixture-key-passphrase";
-const loginKey = ssh2.utils.generateKeyPairSync("ed25519", {
-  passphrase: keyPassphrase,
-  cipher: "aes256-cbc",
-}).private;
+// ssh2 now and then writes a key that its own parser rejects, so a key that
+// does not parse is generated again rather than failing the suite at startup.
+function generateLoginKey(attempts = 20) {
+  let parsed;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const key = ssh2.utils.generateKeyPairSync("ed25519", {
+      passphrase: keyPassphrase,
+      cipher: "aes256-cbc",
+    }).private;
+    parsed = ssh2.utils.parseKey(key, keyPassphrase);
+    if (!(parsed instanceof Error)) return { key, parsed };
+  }
+  throw new Error(
+    `No generated ed25519 login key parsed in ${attempts} attempts: ${parsed.message}`,
+  );
+}
+const { key: loginKey, parsed: parsedLogin } = generateLoginKey();
 let generatedLogin;
-const parsedLogin = ssh2.utils.parseKey(loginKey, keyPassphrase);
 assert.equal(typeof parsedLogin.getPublicSSH, "function");
 let input = "",
   stream,
@@ -347,30 +359,12 @@ const csp = readFileSync("deploy/_headers", "utf8")
   .find((line) => line.includes("Content-Security-Policy:"))
   .split("Content-Security-Policy:")[1]
   .trim();
-// Hub requests the fixture has not answered yet, and the answers it keeps back
-// while a page navigates (see hubHold below).
-const hubUnanswered = new Set();
-let hubHeld = null;
 const http = createServer(async (req, res) => {
   requests.push(req.url);
   try {
     const url = new URL(req.url, "http://localhost");
-    if (url.pathname.startsWith("/fixture-hub/")) {
-      const entry = { key: req.method + " " + req.url };
-      const end = res.end.bind(res);
-      hubUnanswered.add(entry);
-      res.on("close", () => hubUnanswered.delete(entry));
-      res.end = (...args) => {
-        const send = () => {
-          hubUnanswered.delete(entry);
-          end(...args);
-        };
-        if (hubHeld) hubHeld.push(send);
-        else send();
-        return res;
-      };
+    if (url.pathname.startsWith("/fixture-hub/"))
       return fixtureHub.handle(req, res, url);
-    }
     const name = url.pathname === "/" ? "/index.html" : url.pathname;
     const root = path.resolve("dist-static");
     const file = path.resolve(root, "." + name);
@@ -407,95 +401,6 @@ await once(http, "listening");
 const origin = `http://127.0.0.1:${http.address().port}`;
 let browser, debugPage;
 const browserLog = [];
-// A navigation must not cut off a hub response. The Go WASM HTTP client reads
-// a response body as a stream and, when the read fails, cancels the stream
-// without handling the promise that returns. A reload (Lock included) that
-// lands between a response's headers and the end of its body therefore
-// leaves an unhandled "Load failed" rejection, which WebKit reports as a page
-// error. The fixture hub answers every long-poll whenever any event is posted,
-// so such a response can be on the wire at any reload. WebKit cancels the old
-// document's requests as the navigation starts, so the wait comes first: stop
-// the fixture answering, wait until the browser has received every answer
-// already sent, then navigate. Requests the fixture has not answered are
-// cancelled before their headers, which the client handles.
-function hubHold(context) {
-  const hubKey = (request) => {
-    const url = new URL(request.url());
-    return url.pathname.startsWith("/fixture-hub/")
-      ? request.method() + " " + url.pathname + url.search
-      : "";
-  };
-  const inFlight = new Set();
-  // Chromium reports neither an end nor a failure for a request that a
-  // navigation discards. So a frame's open requests are forgotten when it
-  // commits the document it asked for (framenavigated alone also fires for
-  // same-document navigations, which discard nothing), and a page's when it
-  // closes.
-  const documentRequests = new Map();
-  const forget = (gone) => {
-    for (const request of inFlight)
-      if (gone(request.frame())) inFlight.delete(request);
-  };
-  context.on("request", (request) => {
-    if (hubKey(request)) inFlight.add(request);
-    else if (request.isNavigationRequest())
-      documentRequests.set(request.frame(), request);
-  });
-  context.on("requestfinished", (request) => inFlight.delete(request));
-  context.on("requestfailed", (request) => {
-    inFlight.delete(request);
-    if (documentRequests.get(request.frame()) === request)
-      documentRequests.delete(request.frame());
-  });
-  context.on("page", (opened) => {
-    opened.on("framenavigated", (frame) => {
-      if (documentRequests.delete(frame)) forget((owner) => owner === frame);
-    });
-    opened.on("close", () => forget((owner) => owner.page() === opened));
-  });
-  // A request the browser still waits on that the fixture is not keeping has
-  // its answer, or the request itself, on the wire.
-  const onTheWire = () => {
-    const kept = [...hubUnanswered].map((entry) => entry.key);
-    return [...inFlight].map(hubKey).filter((key) => {
-      const at = kept.indexOf(key);
-      if (at < 0) return true;
-      kept.splice(at, 1);
-      return false;
-    });
-  };
-  let holds = 0;
-  return async function navigateWithHubHeld(page, navigate) {
-    holds++;
-    hubHeld ||= [];
-    try {
-      const deadline = Date.now() + 15000;
-      while (onTheWire().length) {
-        if (Date.now() > deadline)
-          throw new Error(
-            "Hub responses still on the wire before navigation: " +
-              onTheWire().join(", "),
-          );
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      const navigated = page.waitForEvent("framenavigated", {
-        predicate: (frame) => frame === page.mainFrame(),
-      });
-      navigated.catch(() => {}); // reported by the await below, or by navigate()
-      const result = await navigate();
-      await navigated;
-      return result;
-    } finally {
-      // The old document's requests are cancelled by now; an answer still
-      // kept for another page is sent.
-      if (!--holds) {
-        const held = hubHeld;
-        hubHeld = null;
-        for (const send of held) send();
-      }
-    }
-  };
-}
 const wait = async (fn) => {
   for (let i = 0; i < 150; i++) {
     if (await fn()) return;
@@ -571,7 +476,10 @@ try {
     }),
   );
   await mockSpeechWorker(context);
-  const navigateWithHubHeld = hubHold(context);
+  // Every Lock and reload of the hub-configured page holds the hub first
+  // (see navigateWithHubHeld in fixture-hub.mjs).
+  fixtureHub.watchRequests(context);
+  const { navigateWithHubHeld } = fixtureHub;
   const page = await context.newPage();
   context.setDefaultTimeout(30000);
   debugPage = page;
@@ -954,34 +862,7 @@ try {
   if (process.env.TAILTERM_ACTIVITY_ONLY) throw new FocusedActivityComplete();
   await exerciseWorkspaceContinuity(page, context, () => terminalStarts);
   await exerciseTasks(page, fixtureHub, origin, sshControl);
-  // Some checks lock and reload from their own modules. Hand them a page
-  // that differs in two calls only: its Lock click and its reload hold the
-  // hub first. The hold has to precede the click because WebKit cancels
-  // the page's requests the moment the reload starts. Nothing is caught or
-  // filtered; every other call goes to the real page.
-  const heldLock = (locator) =>
-    new Proxy(locator, {
-      get: (target, key) =>
-        key === "click"
-          ? (...args) => navigateWithHubHeld(page, () => target.click(...args))
-          : typeof target[key] === "function"
-            ? target[key].bind(target)
-            : target[key],
-    });
-  const heldPage = new Proxy(page, {
-    get: (target, key) =>
-      key === "reload"
-        ? (...args) => navigateWithHubHeld(page, () => target.reload(...args))
-        : key === "locator"
-          ? (selector, ...rest) =>
-              selector === "#lock"
-                ? heldLock(target.locator(selector, ...rest))
-                : target.locator(selector, ...rest)
-          : typeof target[key] === "function"
-            ? target[key].bind(target)
-            : target[key],
-  });
-  await exerciseTaskRestore(heldPage, fixtureHub, sshControl);
+  await exerciseTaskRestore(page, fixtureHub, sshControl);
   assert.equal(
     await page.locator("[data-mode=files]").count(),
     0,
@@ -1219,6 +1100,35 @@ try {
     "Lock saves the workspace as pressed and drops later changes without a page error.",
   );
   assert.equal(await page.locator("[data-launch-server]").count(), 6);
+  // The server-filter and vault-reset checks reload and lock from their own
+  // modules, which do not take the hub's hold yet (a recorded follow-up).
+  // Until they do, hand them a page that differs in two calls only: its Lock
+  // click and its reload hold the hub first. The hold has to precede the
+  // click because WebKit cancels the page's requests the moment the reload
+  // starts. Nothing is caught or filtered; every other call goes to the real
+  // page.
+  const heldLock = (locator) =>
+    new Proxy(locator, {
+      get: (target, key) =>
+        key === "click"
+          ? (...args) => navigateWithHubHeld(page, () => target.click(...args))
+          : typeof target[key] === "function"
+            ? target[key].bind(target)
+            : target[key],
+    });
+  const heldPage = new Proxy(page, {
+    get: (target, key) =>
+      key === "reload"
+        ? (...args) => navigateWithHubHeld(page, () => target.reload(...args))
+        : key === "locator"
+          ? (selector, ...rest) =>
+              selector === "#lock"
+                ? heldLock(target.locator(selector, ...rest))
+                : target.locator(selector, ...rest)
+          : typeof target[key] === "function"
+            ? target[key].bind(target)
+            : target[key],
+  });
   await exerciseServerFilters(heldPage);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(

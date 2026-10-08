@@ -690,8 +690,9 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     );
     return (await openVault(record, passphrase)).data;
   }
+  // Lock reloads the page, so it and the refresh below hold the hub first.
   const lock = async () => {
-    await page.locator("#lock").click();
+    await hub.navigateWithHubHeld(page, () => page.locator("#lock").click());
     await page.locator("#lockscreen").waitFor();
   };
   const unlock = async () => {
@@ -893,7 +894,7 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   await helperWindow("after the third restore", helperBox);
 
   // A browser refresh restores the same way.
-  await page.reload();
+  await hub.navigateWithHubHeld(page, () => page.reload());
   await page.locator("#lockscreen").waitFor();
   await unlock();
   await waitFor(restored, "restore after a refresh", 90000);
