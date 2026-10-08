@@ -2944,7 +2944,7 @@ test("batch13 a crash after hub settlement materializes the receipts without red
 });
 // A hub for the daemon: the ledger, claims, fence checks, merged and finish,
 // and the batch calls unless it is an older hub.
-function daemonHub(b,{batchSupported=true,releaseBatch}={}){
+function daemonHub(b,{batchSupported=true,releaseBatch,unreadable=[]}={}){
  const home=mkdtempSync(join(tmpdir(),"release-batch-daemon-")),statePath=join(home,"hub.json"),tt=join(home,"tt"),configPath=join(home,"deploy.json");
  const jobs=[{...b.lead,state:"verified",generation:1,agentId:undefined,runId:undefined},...b.members];
  writeFileSync(statePath,JSON.stringify({jobs,log:[],batch:[]}));
@@ -2955,6 +2955,7 @@ S.log.push(a.join(' '));
 const end=value=>{fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(S));if(value===undefined)process.exit(2);console.log(JSON.stringify(value));process.exit(0);};
 if(a[0]!=='deployment')end({});
 if(a[1]==='handler')end({id:'agt_0123abcd'});
+if(a[1]==='get'&&${JSON.stringify(unreadable)}.includes(flag('--job')))end({id:flag('--job')});
 if(['list','get'].includes(a[1]))end(releaseReply(S.jobs,a));
 const at=S.jobs.findIndex(j=>j.id===flag('--job')),job=S.jobs[at];
 if(!job||(a[1]!=='check'&&+flag('--generation')!==job.generation))end(undefined);
@@ -3048,6 +3049,85 @@ test("batch15 a size of 3 with five eligible jobs batches three and leaves two w
  assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(receipt.outcome,"released");
  assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,"refs/heads/tasks-hub").split("\n"),["client/a.js","client/b.js","client/c.js"]);
  assert.ok(existsSync(join(h.home,"rel_b2.json"))&&existsSync(join(h.home,"rel_b3.json")));assert.deepEqual([...readBatchSolo(h.home)],[]);
+});
+// The batching exclusion record (wi_a72bba736a8c1daf): every queued candidate
+// the daemon leaves out at claim is in the lead's journal with its reason.
+const GO_CHECKS=[{id:"go-vet",argv:["go","vet","./..."],cwd:"hub",environment:{}},{id:"go-test",argv:["go","test","./..."],cwd:"hub",environment:{}}];
+const BROWSER_CHECK={id:"tests/board-browser.mjs",argv:["node","tests/board-browser.mjs"],cwd:".",environment:{TEST_BROWSER:"1"}};
+// One job per check list, each on the published base; the first is the lead.
+const planned=(...checks)=>{
+ const b=batchJobs(checks.map((_,i)=>[`client/${"abcdef"[i]}.js`,"abcdef"[i]]));
+ for(const [i,job] of [b.lead,...b.members].entries())if(checks[i])job.plan={...job.plan,checks:structuredClone(checks[i])};
+ return b;
+};
+const daemonJournal=h=>JSON.parse(readFileSync(join(h.home,"rel_b1.json"),"utf8"));
+const MISMATCH=[{jobId:"rel_b2",reason:"batch-plan-mismatch"}];
+test("batch16 a Go-only lead records batch-plan-mismatch for a browser-checks member, and a matching member still joins",async()=>{
+ // The lead goes alone: the reason is in its journal though no batch formed.
+ const alone=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]),h=daemonHub(alone,{releaseBatch:{maxJobs:3}});
+ await h.poll();
+ assert.deepEqual(h.seen[0].batch.candidates,[]);assert.deepEqual(h.seen[0].batch.excluded,MISMATCH);
+ let journal=daemonJournal(h);
+ assert.deepEqual(journal.batchDropped,MISMATCH);assert.equal(journal.phase,"complete");
+ for(const key of ["batch","batchOps","batchLead","batchReceipt","batchFallback"])assert.ok(!(key in journal),key);
+ assert.deepEqual(h.read().batch,[]);assert.deepEqual(h.read().jobs.map(j=>[j.id,j.state]),[["rel_b1","released"],["rel_b2","verified"]]);assert.deepEqual(batchFiles(h.home),[]);
+ // A matching member behind the mismatched one joins, and the batch receipt carries the same reason.
+ const mixed=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS),g=daemonHub(mixed,{releaseBatch:{maxJobs:3}});
+ await g.poll();
+ journal=daemonJournal(g);
+ assert.deepEqual(g.seen[0].batch.candidates.map(j=>j.id),["rel_b3"]);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);assert.deepEqual(journal.batchDropped,MISMATCH);
+ assert.deepEqual(g.read().batch,["batch-open","batch-add:tqe_b1","batch-add:tqe_b3"]);assert.deepEqual(g.read().jobs.map(j=>[j.id,j.state,j.generation]).slice(1),[["rel_b2","verified",1],["rel_b3","verified",1]]);
+ const receipt=JSON.parse(readFileSync(join(g.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);assert.deepEqual(receipt.dropped,MISMATCH);assert.equal(receipt.outcome,"released");
+ // The other reasons a full record gives are recorded the same way.
+ const kinds=planned(undefined,undefined,undefined);kinds.members[0].repository="other";kinds.members[1].plan.matrixDigest="e".repeat(64);
+ const k=daemonHub(kinds,{releaseBatch:{maxJobs:3}});await k.poll();
+ assert.deepEqual(daemonJournal(k).batchDropped,[{jobId:"rel_b2",reason:"batch-ineligible"},{jobId:"rel_b3",reason:"batch-other-matrix"}]);assert.ok(!("batch" in daemonJournal(k)));
+});
+test("batch17 an unreadable candidate and those past the read limit are recorded",async()=>{
+ const files=[["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"],["client/e.js","e"]];
+ // The record of rel_b2 cannot be read: it is left out and the next one joins.
+ const h=daemonHub(batchJobs(files.slice(0,3)),{releaseBatch:{maxJobs:3},unreadable:["rel_b2"]});
+ await h.poll();
+ let journal=daemonJournal(h);const unreadable=[{jobId:"rel_b2",reason:"detail-unreadable"}];
+ assert.deepEqual(journal.batchDropped,unreadable);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);
+ assert.deepEqual(JSON.parse(readFileSync(join(h.home,journal.batch.id+"-receipt.json"),"utf8")).dropped,unreadable);
+ // A size of 2 reads two candidates; the two behind them are over the limit and were never read.
+ const g=daemonHub(batchJobs(files),{releaseBatch:{maxJobs:2}});
+ await g.poll();
+ journal=daemonJournal(g);const over=[{jobId:"rel_b4",reason:"over-limit"},{jobId:"rel_b5",reason:"over-limit"}];
+ assert.deepEqual(g.seen[0].batch.candidates.map(j=>j.id),["rel_b2","rel_b3"]);assert.deepEqual(g.seen[0].batch.excluded,over);
+ assert.deepEqual(journal.batchDropped,over);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);
+ assert.deepEqual(g.read().log.filter(l=>l.startsWith("deployment get")).map(l=>l.split(" ")[3]),["rel_b1","rel_b2","rel_b3"]);
+ assert.deepEqual(JSON.parse(readFileSync(join(g.home,journal.batch.id+"-receipt.json"),"utf8")).dropped,over);
+ // Nothing left out: the journal gains no key.
+ const n=daemonHub(batchJobs(files.slice(0,2)),{releaseBatch:{maxJobs:3}});await n.poll();
+ assert.deepEqual(n.seen[0].batch.excluded,[]);assert.ok(!("batchDropped" in daemonJournal(n)));
+});
+test("batch18 an exclusion is recorded once per claim, over repeated polls and a resumed run",async()=>{
+ // The matrix run is not over for two polls, so the same claim is polled three times.
+ for(const checks of [[GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]],[GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS]]){
+  const b=planned(...checks),h=daemonHub(b,{releaseBatch:{maxJobs:3}});let polls=0;
+  const release=(c,adapter)=>{const run=h.release(c,adapter),wait=++polls<3;adapter.verifyIntegrated=async()=>!wait;return run;};
+  const poll=()=>serveDeployment(h.config,{once:true,configPath:h.configPath,release});
+  await poll();
+  assert.equal(daemonJournal(h).phase,"waiting_matrix");assert.deepEqual(daemonJournal(h).batchDropped,MISMATCH);assert.equal(h.read().jobs[0].state,"claimed");
+  await poll();
+  assert.equal(daemonJournal(h).phase,"waiting_matrix");assert.deepEqual(daemonJournal(h).batchDropped,MISMATCH);
+  await poll();
+  assert.equal(polls,3);assert.equal(h.read().jobs[0].state,"released");assert.equal(h.read().log.filter(l=>l.startsWith("deployment claim")).length,1,"one claim");
+  const journal=daemonJournal(h);assert.equal(journal.phase,"complete");assert.deepEqual(journal.batchDropped,MISMATCH);
+  // A batch is read again at each poll and hands the same exclusion over; the lead alone hands none.
+  assert.deepEqual(h.seen.map(c=>c.batch.excluded),checks.length===3?[MISMATCH,MISMATCH,MISMATCH]:[MISMATCH,[],[]]);
+  if(checks.length===3)assert.deepEqual(JSON.parse(readFileSync(join(h.home,journal.batch.id+"-receipt.json"),"utf8")).dropped,MISMATCH);
+ }
+ // A candidate the daemon left out and the runner then refuses again is listed once, with its first reason.
+ const b=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS),a=batchFake(b.lead),c=batchConfig(b,3,{excluded:[...MISMATCH,...MISMATCH]});
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.deepEqual(batchJournal(c).batchDropped,MISMATCH);assert.deepEqual(batchJournal(c).batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);
+ // A size of 1 records nothing even if exclusions are handed over.
+ const one=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]),a1=batchFake(one.lead),c1=batchConfig(one,1,{candidates:[],excluded:MISMATCH});
+ assert.equal((await runRelease(c1,a1)).outcome,"released");assert.ok(!("batchDropped" in batchJournal(c1)));
 });
 // Integrated check selection (wi_e30d4baf0243a036): the plan selects from the
 // tasks-hub tip the candidates were integrated onto, not from the job's base.

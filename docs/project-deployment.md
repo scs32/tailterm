@@ -498,6 +498,56 @@ bounded to 64 bytes), `wrong type for field "NAME"` (`wrong-type`), `malformed
 JSON` (`malformed-json`) or `trailing data after the JSON object`
 (`trailing-data`).
 
+### Release batching (wi_50e80d45647b342a, wi_a72bba736a8c1daf)
+
+With `releaseBatch.maxJobs` above 1 in the private config, the job the deployer
+claims leads a batch: jobs queued behind it are integrated on top of it, share
+one matrix run and are released together. The rule:
+
+**A job joins a batch only if all its checks are already in the lead's plan;
+otherwise it is released on its own.**
+
+A queued job can join only when all of this holds:
+
+- it is `verified` and unclaimed, and queued after the lead;
+- it has the lead's base commit, repository and pause generation, and is not
+  marked to release alone after a failed batch (`batch-solo.json`);
+- its plan names the lead's approved matrix (digest and approval message);
+- every accepted check in its plan is already in the lead's plan, unchanged.
+  Only `go-race` may differ, and only in its packages (the batch tests the
+  union, or `./...`). A Go-only lead therefore never carries a job that also
+  needs browser checks; the reverse order can batch.
+
+The deployer reads at most `2*(maxJobs-1)` candidates, in queue order, and takes
+the first that fit until the batch is full.
+
+Every candidate whose full record the deployer tried to read and left out, and
+every candidate past the read limit, is recorded once in the lead's journal,
+`journalDirectory/ID.json` on the deployer host, as `batchDropped: [{jobId, reason}]`,
+whether or not a batch forms. Candidates are the queue summaries that are
+verified, unclaimed, after the lead, of its base commit and pause generation,
+and not marked batch-solo; a job passed over before that gets no entry, and
+neither does one that fit but met a full batch, so an empty or missing list
+does not tell these cases apart. Later polls of the same claim add nothing. When a
+batch forms, its receipt `journalDirectory/bat_ID-receipt.json` carries the same list as
+`dropped`. The hub's release record and `tt deployment get` do not show it.
+
+| Reason | Meaning |
+| --- | --- |
+| `batch-plan-mismatch` | a check is not in the lead's plan, or differs from it |
+| `batch-other-matrix` | another approved matrix digest or approval message |
+| `batch-ineligible` | the full record is no longer verified, unclaimed, or of the lead's base, repository or pause generation |
+| `detail-unreadable` | the job's full record could not be read |
+| `over-limit` | queued past the `2*(maxJobs-1)` candidates that are read |
+
+The same list also keeps the jobs dropped while the batch was built: a
+cherry-pick failure by its reason, `batch-open-refused` and `batch-add-refused`.
+To see why a job did not ride with the one before it:
+
+```sh
+jq .batchDropped journalDirectory/LEAD_ID.json
+```
+
 ### The runner's own code (wi_2be015df9af54c5c)
 
 A release can change the scripts the deployer itself runs. One process loads

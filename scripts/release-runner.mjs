@@ -632,14 +632,16 @@ export async function runRelease(config, adapter) {
     const lead=job.plan?.checks,race=lead?.map(c=>c.id==="go-race" && state.batch?.goRace?state.batch.goRace:c);
     return mergeAcceptedChecks(race,member.plan?.checks)?.find(c=>c.id==="go-race");
   };
+  // A job left out of this claim's batch is listed once, with its first reason.
+  const noteDropped=entries=>{for(const {jobId,reason} of entries)if(!state.batchDropped?.some(d=>d.jobId===jobId))(state.batchDropped??=[]).push({jobId,reason});};
   const openBatch=async()=>{
-    const members=config.batch.candidates.filter(c=>{const reason=batchMismatch(job,c);if(reason)(state.batchDropped??=[]).push({jobId:c.id,reason});return !reason;});
+    const members=config.batch.candidates.filter(c=>{const reason=batchMismatch(job,c);if(reason)noteDropped([{jobId:c.id,reason}]);return !reason;});
     const result=await integrateBatch(cwd,job,members,config.batch.max,{
       integrated:first=>{state.expected=first.expected;state.integrated=first.integrated;state.batchLead=first.integrated;state.phase="batching";checkpoint();},
       open:async base=>await declare("batch-open",{commit:base})?state.batch.id:false,
       add:(member,from,to)=>{const goRace=member.id===job.id?undefined:mergedGoRace(member);return declare("batch-add",{entryId:member.entryId,commit:to,from,...(goRace?{goRace}:{}),member:{jobId:member.id,entryId:member.entryId,generation:member.generation,commit:member.commit,verificationDigest:member.verificationDigest}});},
     });
-    if(result.dropped.length)(state.batchDropped??=[]).push(...result.dropped);
+    noteDropped(result.dropped);
     return closeBatch();
   };
   // Resuming a stopped declaration: the unconfirmed call is replayed before
@@ -647,7 +649,7 @@ export async function runRelease(config, adapter) {
   // is the checkout put on its tip.
   const resumeBatch=async()=>{
     const pending=state.batchOps?.find(o=>o.status==="sending");
-    if(pending && !await settleBatchOp(pending) && pending.op==="batch-add" && pending.member?.jobId!==job.id)(state.batchDropped??=[]).push({jobId:pending.member.jobId,reason:"batch-add-refused"});
+    if(pending && !await settleBatchOp(pending) && pending.op==="batch-add" && pending.member?.jobId!==job.id)noteDropped([{jobId:pending.member.jobId,reason:"batch-add-refused"}]);
     for(const record of state.batchOps||[])if(record.op!=="batch-drop")applyBatchOp(record,record.status==="done");
     if(batchDropped())state.batch=null;
     const integration=await closeBatch();
@@ -739,6 +741,10 @@ export async function runRelease(config, adapter) {
     // runs of its earlier attempts: until each is confirmed stopped, ended or
     // set aside, nothing here touches the checkout, starts a run or refuses.
     if(state.phase==="prepared" && adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return {jobId:job.id,outcome:"waiting_matrix"};
+    // The candidates the daemon left out at this claim, saved before anything
+    // is integrated; a resumed run (any later poll) adds none, and with or
+    // without a batch the lead's journal keeps them.
+    if(state.phase==="prepared" && config.batch?.max>1 && Array.isArray(config.batch.excluded))noteDropped(config.batch.excluded);
     checkpoint();await fence();
     let integration;
     if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
@@ -1788,12 +1794,20 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // The batch key for a claimed lead: the candidates' full records while its
   // batch may still be declared or verified, else none.
   const batchFor=(read,jobs,current)=>{
-    const batch={max:batchPolicy.max,importWaitMs:batchPolicy.importWaitMs,candidates:[],onFallback:ids=>addBatchSolo(config.journalDirectory,ids)};
+    const batch={max:batchPolicy.max,importWaitMs:batchPolicy.importWaitMs,candidates:[],excluded:[],onFallback:ids=>addBatchSolo(config.journalDirectory,ids)};
     let journal=null;try{journal=JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8"));}catch{}
     if(current.state!=="claimed" || current.integratedVerification || (journal && journal.phase!=="batching" && !journal.batch))return batch;
     let solo;try{solo=readBatchSolo(config.journalDirectory);}catch{process.stderr.write("Batch solo file unreadable; releasing one job at a time.\n");return batch;}
-    for(const summary of batchCandidates(jobs,current,solo).slice(0,2*(batchPolicy.max-1))){
-      try{const detail=readReleaseDetail(read,summary,{bookend:false});if(!batchMismatch(current,detail))batch.candidates.push(detail);}catch{}
+    // Every queued candidate left out here is handed over with its reason;
+    // the release records them in the lead's journal once, at this claim.
+    const limit=2*(batchPolicy.max-1);
+    for(const [at,summary] of batchCandidates(jobs,current,solo).entries()){
+      let reason="over-limit";
+      if(at<limit){
+        try{const detail=readReleaseDetail(read,summary,{bookend:false});reason=batchMismatch(current,detail);if(!reason)batch.candidates.push(detail);}
+        catch{reason="detail-unreadable";}
+      }
+      if(reason)batch.excluded.push({jobId:summary.id,reason});
     }
     return batch;
   };
