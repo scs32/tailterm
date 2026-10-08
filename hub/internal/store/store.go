@@ -1222,6 +1222,8 @@ func (s *Store) writeAgentStatus(ctx context.Context, id, status string, by api.
 
 // Messages
 
+const selfAddressedMessage = "a directed message to yourself wakes nobody; use tt event or a scheduled wake"
+
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
 	if err := api.NormalizeEnvelopePost(&req); err != nil {
 		return api.Message{}, err
@@ -1386,6 +1388,12 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	// A typed message's stated recipient must be the one it is routed to.
 	if e := req.Envelope; e != nil && e.To != "" && e.To != "owner" && !strings.HasPrefix(e.To, "role:") && (req.To == "" || (target.ID != e.To && target.Name != e.To)) {
 		return api.Message{}, &api.EnvelopeError{Problems: []api.Problem{{Field: "to", Reason: "must name the agent the message is addressed to"}}}
+	}
+	// A message an agent addresses to itself, by name or through a role it
+	// holds, is never unread, wakes nobody and obliges nobody. A conflict, so
+	// the reason reaches the sender.
+	if req.AgentID != "" && req.To == req.AgentID {
+		return api.Message{}, workItemConflict(selfAddressedMessage)
 	}
 	m, err := s.insertMessageWithResume(ctx, tx, t, req, target, by, false, ownerReply, !ownerReply)
 	if err != nil {

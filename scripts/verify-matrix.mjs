@@ -2179,11 +2179,15 @@ function reportingTT(args, what) {
     );
   return result.stdout;
 }
+// The hub's reason for refusing a directed message whose recipient is its
+// sender (selfAddressedMessage in hub/internal/store/store.go).
+const SELF_ADDRESSED_REFUSAL = "a directed message to yourself wakes nobody";
 // A run withdrawn by a signal while it was queued tells its item lead why, so
 // the loss is not only in its own log directory. The deployer reports its own
 // runs and a person's shell has no agent identity: neither sends anything. The
 // place is already released when this runs, and a failed report is recorded
-// and never retried.
+// and never retried. A lead that launched the run itself has nobody to tell:
+// the hub refuses the notice and that is recorded as a skip.
 function reportWithdrawal({ output, signal, item, commit }, environment = process.env) {
   if (environment.TAILTERM_MATRIX_RELEASE !== undefined) return;
   if (!environment.TAILTERM_AGENT || !environment.TAILTERM_TASK) return;
@@ -2235,8 +2239,16 @@ function reportWithdrawal({ output, signal, item, commit }, environment = proces
     Object.assign(report, { reported: true }, seq ? { messageSeq: Number(seq[1]) } : {});
     console.log("matrix run: reported the withdrawal to the lead");
   } catch (error) {
-    Object.assign(report, { reported: false, reason: error.message });
-    console.log("matrix run: could not report the withdrawal to the lead: " + error.message);
+    // The launcher is the item's lead: the hub refuses a message to its own
+    // sender, which would wake nobody. Nobody else is owed the notice, so this
+    // is a skip, not a failed report.
+    if (error.message.includes(SELF_ADDRESSED_REFUSAL)) {
+      Object.assign(report, { reported: false, skipped: "the launcher is the item's lead" });
+      console.log("matrix run: the launcher is the item's lead; no withdrawal notice was sent");
+    } else {
+      Object.assign(report, { reported: false, reason: error.message });
+      console.log("matrix run: could not report the withdrawal to the lead: " + error.message);
+    }
   }
   try {
     writeFileSync(join(output, "withdrawal-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
