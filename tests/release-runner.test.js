@@ -1,7 +1,7 @@
 import test from "node:test";
 import {createServer} from "node:http";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync,realpathSync} from "node:fs";
+import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync,realpathSync,utimesSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
@@ -504,12 +504,12 @@ test("retention removes a terminal job's backup copies of every generation and n
  assert.deepEqual(j.names(),[...others,...live].sort());
 });
 test("a8 retention defaults apply, an invalid value stops the daemon before any command, and a failed sweep does not hold the poll",async()=>{
- assert.deepEqual(retentionPolicy({}),{releasedBackups:3,backupBudgetBytes:4294967296});assert.deepEqual(retentionPolicy({retention:{releasedBackups:0}}),{releasedBackups:0,backupBudgetBytes:4294967296});
+ assert.deepEqual(retentionPolicy({}),{releasedBackups:3,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:3});assert.deepEqual(retentionPolicy({retention:{releasedBackups:0,attemptDays:0}}),{releasedBackups:0,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:0});
  const cwd=mkdtempSync(join(tmpdir(),"release-retention-daemon-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");
  const jobs=[...["rel_1","rel_2","rel_3","rel_4"].map((id,i)=>({id,state:"released",settledAt:`2026-09-30T1${i}:00:00Z`})),{id:"next",state:"verified",generation:1}];
  writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify(jobs)},a)));else process.exit(2);`);chmodSync(fakeTT,0o755);
  const base={version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT};
- for(const retention of [{releasedBackups:-1},{releasedBackups:1.5},{releasedBackups:"3"},{backupBudgetBytes:-1},{backupBudgetBytes:0.5},{backupBudgetBytes:null},"3",[3]])await assert.rejects(serveDeployment({...base,retention},{once:true}),/Invalid journal retention/);
+ for(const retention of [{releasedBackups:-1},{releasedBackups:1.5},{releasedBackups:"3"},{backupBudgetBytes:-1},{backupBudgetBytes:0.5},{backupBudgetBytes:null},{releasedDists:-1},{releasedDists:1.5},{releasedDists:"3"},{releasedDists:null},{attemptDays:-1},{attemptDays:0.5},{attemptDays:"3"},{attemptDays:null},"3",[3]])await assert.rejects(serveDeployment({...base,retention},{once:true}),/Invalid journal retention/);
  assert.ok(!existsSync(log),"no command ran");
  // The default policy keeps three released copies: the poll removes the oldest and still tries the waiting job.
  for(const x of jobs.slice(0,4))writeFileSync(join(cwd,copyOf(x.id)),"copy");
@@ -518,6 +518,147 @@ test("a8 retention defaults apply, an invalid value stops the daemon before any 
  // A removal record that cannot be written fails the sweep: the copy stays and the poll goes on to the claim.
  rmSync(log);rmSync(join(cwd,"retention.jsonl"));mkdirSync(join(cwd,"retention.jsonl"));
  await serveDeployment({...base,retention:{releasedBackups:0}},{once:true});assert.ok(existsSync(join(cwd,copyOf("rel_4"))));assert.match(readFileSync(log,"utf8"),/deployment claim --job next /);
+});
+// Dist and attempt retention (wi_d203eb94ef27d8f8), tests t1-t7 of order #30140's plan.
+// C(n) is a commit of one repeated hex digit; a dist holds 15 bytes in two files, one nested.
+const C=n=>String(n).repeat(40),DIST=n=>"tailos-dist-"+C(n),SWEEP_AT=Date.parse("2026-10-01T09:30:00Z");
+const tailosJob=(id,n,settledAt)=>({id,state:"released",settledAt,commit:C(n),receipt:{commit:C(n),outcome:"released",targets:[{target:"hub",outcome:"unchanged"},{target:"tailos",outcome:"released"}]}});
+const fiveReleased=()=>[3,1,5,2,4].map(n=>tailosJob("rel_"+n,n,`2026-09-2${n}T10:00:00Z`));
+function addDist(j,n){mkdirSync(join(j.dir,DIST(n),"assets"),{recursive:true});writeFileSync(join(j.dir,DIST(n),"index.html"),"x".repeat(10));writeFileSync(join(j.dir,DIST(n),"assets","app.js"),"x".repeat(5));}
+function distFixture(...ns){const j=journalFixture({});for(const n of ns)addDist(j,n);return j;}
+const sweepAt=(j,jobs,retention,options={})=>pruneJournal({journalDirectory:j.dir,retention},jobs,{now:()=>SWEEP_AT,...options});
+const distRecord=(jobId,n,reason)=>({version:1,at:"2026-10-01T09:30:00.000Z",jobId,file:DIST(n),kind:"dist",bytes:15,reason});
+// An attempt directory: files maps a name to [content, age in days at the sweep].
+function addAttempt(j,id,files,attempt=C(7)+"-r0"){
+ const dir=join(j.dir,id+"-integrated-verification",attempt);mkdirSync(dir,{recursive:true});
+ for(const [name,[content,days]] of Object.entries(files)){writeFileSync(join(dir,name),content);const at=new Date(SWEEP_AT-days*86400000);utimesSync(join(dir,name),at,at);}
+ return dir;
+}
+const EVIDENCE={"receipt.json":["receipt",9],"context.json":["context",9],"plan.json":["plan",9],"plan.preserved.json":["preserved",9],[C(8)+".attempt-1.log"]:["check log",9],"host-lock.log":["lock log",9]};
+const BULK={"tailterm-hub-test":["h".repeat(40),5],"run.out":["out",5],"host-lock.json":["{}",3],"test-binaries.json":["[]",4]},YOUNG={"tailterm-tt-test":["t".repeat(20),2]};
+const attemptRecord=(jobId,name,bytes,attempt=C(7)+"-r0")=>({version:1,at:"2026-10-01T09:30:00.000Z",jobId,file:`${jobId}-integrated-verification/${attempt}/${name}`,kind:"attempt",bytes,reason:"age"});
+const bulkRecords=id=>[["host-lock.json",2],["run.out",3],["tailterm-hub-test",40],["test-binaries.json",2]].map(([name,bytes])=>attemptRecord(id,name,bytes));
+test("t1 dist retention keeps the newest released TailOS commits and removes older copies and a copy left before them",()=>{
+ // rel_old_rb rolled back before the oldest kept release (rel_3); rel_new_rb after it.
+ const jobs=[...fiveReleased(),tailosJob("rel_0",0,"2026-09-20T10:00:00Z"),{id:"rel_old_rb",state:"rolled_back",settledAt:"2026-09-21T12:00:00Z",commit:C("e"),integratedCommit:C("a")},{id:"rel_new_rb",state:"rolled_back",settledAt:"2026-09-24T12:00:00Z",commit:C("b"),receipt:{commit:C("b"),outcome:"rolled_back",targets:[{target:"tailos",outcome:"rolled_back"}]}}];
+ const build=()=>{
+  const j=distFixture(1,2,3,4,5,"a","b","c"),elsewhere=mkdtempSync(join(tmpdir(),"release-dist-elsewhere-"));
+  mkdirSync(join(j.dir,"tailos-dist-x.tmp"));writeFileSync(join(j.dir,DIST(1)+".tmp"),"partial");writeFileSync(join(elsewhere,"index.html"),"elsewhere");symlinkSync(elsewhere,join(j.dir,DIST(0)));
+  return {j,elsewhere,untouched:[DIST("c"),"tailos-dist-x.tmp",DIST(1)+".tmp",DIST(0)]};
+ };
+ const d=build(),removed=sweepAt(d.j,jobs,{}),expected=[distRecord("rel_1",1,"count"),distRecord("rel_2",2,"count"),distRecord("rel_old_rb","a","not-released")];
+ assert.deepEqual(removed,expected);assert.deepEqual(d.j.lines(),expected);
+ assert.deepEqual(d.j.names(),[DIST(3),DIST(4),DIST(5),DIST("b"),...d.untouched].sort(),"the newest three stay, and so does a copy no listed job accounts for");
+ assert.equal(readFileSync(join(d.elsewhere,"index.html"),"utf8"),"elsewhere","a link named like a copy is neither followed nor removed");
+ assert.equal(readFileSync(join(d.j.dir,DIST(5),"assets","app.js"),"utf8").length,5);
+ assert.deepEqual(sweepAt(d.j,jobs,{}),[],"a second sweep removes nothing");
+ // At zero only the newest released commit and a named copy stay; a superseded job that cites a TailOS hand release is the newest.
+ const z=build(),hand={id:"rel_hand",state:"superseded",settledAt:"2026-09-26T10:00:00Z",supersession:{releasedCommit:C(6),targets:["tailos"]}};addDist(z.j,6);
+ assert.deepEqual(sweepAt(z.j,[...jobs,hand],{releasedDists:0},{keepDists:[C(2),undefined,"not a commit"]}).map(r=>[r.jobId,r.file,r.reason]),[["rel_1",DIST(1),"count"],["rel_3",DIST(3),"count"],["rel_4",DIST(4),"count"],["rel_5",DIST(5),"count"],["rel_old_rb",DIST("a"),"not-released"],["rel_new_rb",DIST("b"),"not-released"]]);
+ assert.deepEqual(z.j.names(),[DIST(2),DIST(6),...z.untouched].sort());
+ // With no released TailOS job in the list nothing is known to be old.
+ const n=distFixture(1,"a");assert.deepEqual(sweepAt(n,jobs.filter(x=>x.state!=="released"),{releasedDists:0}),[]);assert.deepEqual(n.names(),[DIST(1),DIST("a")]);
+});
+test("t2 a dist named by a non-terminal job's inputs or rollback program stays until that job is terminal",()=>{
+ const pending={id:"rel_next",state:"claimed",commit:C(8),integratedCommit:C(9)},jobs=state=>[...fiveReleased(),{...pending,state,...(state==="claimed"?{}:{settledAt:"2026-09-30T10:00:00Z"})}];
+ const manifest=(j,n)=>JSON.stringify({version:1,jobId:"rel_next",targets:{tailos:{rollbackSafe:true,rollbackProgram:["npx","wrangler","pages","deploy",join(j.dir,DIST(n)),"--project-name","tailos"]}}});
+ const j=distFixture(1,2,3,4,5,8,9);writeFileSync(join(j.dir,"rel_next-g2-inputs.json"),manifest(j,1));writeFileSync(join(j.dir,"rel_1-g1-inputs.json"),manifest(j,2));writeFileSync(join(j.dir,"xrel_next-g2-inputs.json"),manifest(j,2));
+ // rel_1's copy is named by the claimed job; rel_2's only by a terminal job's manifest and another job's.
+ assert.deepEqual(sweepAt(j,jobs("claimed"),{}),[distRecord("rel_2",2,"count")]);
+ for(const n of [1,8,9])assert.ok(existsSync(join(j.dir,DIST(n),"index.html")),"kept "+n);
+ for(const state of ["verified","merged","blocked","some_future_state"])assert.deepEqual(sweepAt(j,jobs(state),{}),[],state);
+ assert.deepEqual(sweepAt(j,jobs("refused"),{}),[distRecord("rel_1",1,"count")],"once the job is terminal its named copy goes");
+ // A manifest from before names carried a generation protects too.
+ const legacy=distFixture(1,3,4,5);writeFileSync(join(legacy.dir,"rel_next-inputs.json"),manifest(legacy,1));assert.deepEqual(sweepAt(legacy,jobs("claimed"),{}),[]);
+ // A non-terminal job's manifest that cannot be read as a regular file keeps every copy.
+ const unreadable=distFixture(1,2,3,4,5);mkdirSync(join(unreadable.dir,"rel_next-g3-inputs.json"));
+ const linked=distFixture(1,2,3,4,5);writeFileSync(join(linked.dir,"elsewhere.json"),"{}");symlinkSync(join(linked.dir,"elsewhere.json"),join(linked.dir,"rel_next-g3-inputs.json"));
+ for(const k of [unreadable,linked]){assert.deepEqual(sweepAt(k,jobs("claimed"),{releasedDists:0}),[]);assert.equal(k.names().filter(n=>n.startsWith("tailos-dist-")).length,5);assert.deepEqual(k.lines(),[]);}
+ assert.equal(sweepAt(unreadable,jobs("released"),{releasedDists:0}).length,4,"the same journal once that job is terminal");
+});
+test("t3 a dist that holds a link stays whole, with the link's target intact and no record",()=>{
+ const j=distFixture(1,2,3,4,5),outside=join(mkdtempSync(join(tmpdir(),"release-dist-outside-")),"kept");writeFileSync(outside,"outside");
+ symlinkSync(outside,join(j.dir,DIST(1),"assets","link"));symlinkSync(dirname(outside),join(j.dir,DIST(1),"linked-directory"));
+ assert.deepEqual(sweepAt(j,fiveReleased(),{}),[distRecord("rel_2",2,"count")]);assert.deepEqual(j.lines(),[distRecord("rel_2",2,"count")]);
+ assert.deepEqual(readdirSync(join(j.dir,DIST(1))).sort(),["assets","index.html","linked-directory"]);assert.deepEqual(readdirSync(join(j.dir,DIST(1),"assets")).sort(),["app.js","link"]);
+ assert.equal(readFileSync(outside,"utf8"),"outside");
+});
+test("t4 attempt retention removes old files that are not evidence, only from a terminal job's ended attempts",()=>{
+ const jobs=[{id:"rel_live",state:"claimed"},{id:"rel_future",state:"some_future_state"},{id:"rel_started",state:"released"},{id:"rel_broken",state:"refused"},{id:"rel_ended",state:"released"},{id:"rel_aside",state:"rolled_back"},{id:"rel_none",state:"superseded"}];
+ const j=journalFixture({}),run=state=>({"run.json":[JSON.stringify({version:1,state}),9]}),all={...EVIDENCE,...BULK,...YOUNG},dirs={};
+ for(const [id,record] of [["rel_live",run("ended")],["rel_future",run("ended")],["rel_started",run("started")],["rel_broken",{"run.json":["not json",9]}],["rel_ended",run("ended")],["rel_aside",{"run.json.set-aside":[JSON.stringify({version:1,state:"started"}),9]}],["rel_none",{}]])dirs[id]={dir:addAttempt(j,id,{...all,...record}),names:Object.keys({...all,...record}).sort()};
+ // A second attempt of the same job is judged by its own record.
+ const second=addAttempt(j,"rel_ended",{...all,...run("starting")},C(7)+"-r1");
+ // Files directly in the parent (the layout before attempts) and a directory that is not an attempt are left.
+ writeFileSync(join(j.dir,"rel_ended-integrated-verification","tailterm-hub-test"),"flat");mkdirSync(join(j.dir,"rel_ended-integrated-verification","notes"));writeFileSync(join(j.dir,"rel_ended-integrated-verification","notes","run.out"),"old");
+ const removed=sweepAt(j,jobs,{}),expected=["rel_ended","rel_aside","rel_none"].flatMap(bulkRecords);
+ assert.deepEqual(removed,expected);assert.deepEqual(j.lines(),expected);
+ for(const id of ["rel_live","rel_future","rel_started","rel_broken"])assert.deepEqual(readdirSync(dirs[id].dir).sort(),dirs[id].names,id+" loses nothing");
+ assert.equal(readdirSync(second).length,Object.keys(all).length+1,"an attempt whose run has not ended loses nothing");
+ for(const id of ["rel_ended","rel_aside","rel_none"]){
+  assert.deepEqual(readdirSync(dirs[id].dir).sort(),dirs[id].names.filter(n=>!(n in BULK)),id);
+  for(const [name,[content]] of Object.entries({...EVIDENCE,...YOUNG}))assert.equal(readFileSync(join(dirs[id].dir,name),"utf8"),content,id+" "+name);
+ }
+ assert.equal(readFileSync(join(dirs.rel_ended.dir,"run.json"),"utf8"),JSON.stringify({version:1,state:"ended"}));assert.ok(existsSync(join(dirs.rel_aside.dir,"run.json.set-aside")));
+ assert.deepEqual(readdirSync(join(j.dir,"rel_ended-integrated-verification")).sort(),[C(7)+"-r0",C(7)+"-r1","notes","tailterm-hub-test"]);
+ assert.deepEqual(sweepAt(j,jobs,{}),[],"a second sweep removes nothing; the two-day-old file is younger than attemptDays");
+ assert.deepEqual(sweepAt(j,jobs,{attemptDays:2}),["rel_ended","rel_aside","rel_none"].map(id=>attemptRecord(id,"tailterm-tt-test",20)));
+ // At zero a terminal job's ended attempt keeps only its evidence, however new the rest is.
+ const fresh=journalFixture({}),dir=addAttempt(fresh,"rel_ended",{...EVIDENCE,...run("ended"),"tailterm-hub-test":["h",0]});
+ assert.deepEqual(sweepAt(fresh,jobs,{}),[]);assert.deepEqual(sweepAt(fresh,jobs,{attemptDays:0}),[attemptRecord("rel_ended","tailterm-hub-test",1)]);assert.deepEqual(readdirSync(dir).sort(),[...Object.keys(EVIDENCE),"run.json"].sort());
+});
+test("t5 attempt retention follows and removes no link, and enters no linked or misplaced directory",()=>{
+ const j=journalFixture({}),elsewhere=mkdtempSync(join(tmpdir(),"release-attempt-elsewhere-")),old=new Date(SWEEP_AT-9*86400000),ended={"run.json":[JSON.stringify({version:1,state:"ended"}),9]};
+ const outside=join(elsewhere,"binary");writeFileSync(outside,"outside");utimesSync(outside,old,old);
+ const jobs=["rel_in","rel_attempt","rel_parent","rel_file","rel_record","rel_absent"].map(id=>({id,state:"released"}));
+ // A link and a subdirectory inside an ended attempt.
+ const inside=addAttempt(j,"rel_in",{...ended,"run.out":["out",9]});symlinkSync(outside,join(inside,"tailterm-hub-test"));mkdirSync(join(inside,"sub"));writeFileSync(join(inside,"sub","tailterm-tt-test"),"nested");utimesSync(join(inside,"sub","tailterm-tt-test"),old,old);
+ // An attempt directory that is a link, and a parent that is a link, each to a directory with an old binary.
+ const target=join(elsewhere,"attempt");mkdirSync(target);writeFileSync(join(target,"tailterm-hub-test"),"linked attempt");utimesSync(join(target,"tailterm-hub-test"),old,old);
+ mkdirSync(join(j.dir,"rel_attempt-integrated-verification"));symlinkSync(target,join(j.dir,"rel_attempt-integrated-verification",C(7)+"-r0"));
+ const parent=join(elsewhere,"parent");mkdirSync(join(parent,C(7)+"-r0"),{recursive:true});writeFileSync(join(parent,C(7)+"-r0","tailterm-hub-test"),"linked parent");utimesSync(join(parent,C(7)+"-r0","tailterm-hub-test"),old,old);
+ symlinkSync(parent,join(j.dir,"rel_parent-integrated-verification"));
+ // A parent that is a regular file, and a run record that is a link to an ended one.
+ writeFileSync(join(j.dir,"rel_file-integrated-verification"),"not a directory");
+ const record=addAttempt(j,"rel_record",{"tailterm-hub-test":["binary",9]});writeFileSync(join(elsewhere,"run.json"),JSON.stringify({version:1,state:"ended"}));symlinkSync(join(elsewhere,"run.json"),join(record,"run.json"));
+ assert.deepEqual(sweepAt(j,jobs,{attemptDays:0}),[attemptRecord("rel_in","run.out",3)]);
+ assert.deepEqual(readdirSync(inside).sort(),["run.json","sub","tailterm-hub-test"]);assert.equal(readFileSync(outside,"utf8"),"outside");assert.equal(readFileSync(join(inside,"sub","tailterm-tt-test"),"utf8"),"nested");
+ assert.equal(readFileSync(join(target,"tailterm-hub-test"),"utf8"),"linked attempt");assert.equal(readFileSync(join(parent,C(7)+"-r0","tailterm-hub-test"),"utf8"),"linked parent");
+ assert.equal(readFileSync(join(j.dir,"rel_file-integrated-verification"),"utf8"),"not a directory");assert.deepEqual(readdirSync(record).sort(),["run.json","tailterm-hub-test"]);assert.ok(existsSync(join(elsewhere,"run.json")));
+});
+test("t6 every dist and attempt removal is one retention.jsonl line written before it, after the backup records",()=>{
+ const jobs=fiveReleased(),j=distFixture(1,2,3,4,5);writeFileSync(join(j.dir,copyOf("rel_1")),"x".repeat(30));
+ addAttempt(j,"rel_1",{...EVIDENCE,"tailterm-hub-test":["h".repeat(40),9],"run.out":["out",9]});
+ const expected=[{version:1,at:"2026-10-01T09:30:00.000Z",jobId:"rel_1",file:copyOf("rel_1"),kind:"backup",bytes:30,reason:"count"},distRecord("rel_1",1,"count"),distRecord("rel_2",2,"count"),attemptRecord("rel_1","run.out",3),attemptRecord("rel_1","tailterm-hub-test",40)];
+ // Each record is already on disk when its removal happens: a sweep stopped at the second dist leaves two lines and that dist.
+ const real=join(j.dir,"retention.jsonl");let calls=0;
+ assert.throws(()=>pruneJournal({journalDirectory:j.dir,retention:{}},jobs,{now:()=>{if(++calls===3){assert.deepEqual(j.lines(),expected.slice(0,2));assert.ok(!existsSync(join(j.dir,DIST(1))));assert.ok(existsSync(join(j.dir,DIST(2))));throw new Error("stopped");}return SWEEP_AT;}}),/stopped/);
+ assert.deepEqual(j.lines(),expected.slice(0,2));assert.ok(existsSync(join(j.dir,DIST(2),"index.html")),"a failed sweep removes nothing further");
+ assert.deepEqual(sweepAt(j,jobs,{}),expected.slice(2));assert.deepEqual(j.lines(),expected);
+ for(const line of j.lines())assert.deepEqual(Object.keys(line),["version","at","jobId","file","kind","bytes","reason"]);
+ assert.equal(statSync(real).mode&0o777,0o600);
+ assert.deepEqual(sweepAt(j,jobs,{}),[],"a second sweep removes nothing");assert.deepEqual(j.lines(),expected);
+});
+test("t7 the daemon sweeps dists and attempts at a poll, and a failed sweep keeps them, prints the notice and still claims",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-dist-daemon-")),home=join(cwd,"journal"),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");mkdirSync(home);
+ const jobs=[...fiveReleased(),{id:"next",state:"verified",generation:1}],old=new Date(Date.now()-10*86400000);
+ writeFileSync(fakeTT,"#!"+process.execPath+"\n"+releaseReplySource+`const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},a.join(' ')+'\\n');if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify(jobs)},a)));else process.exit(2);`);chmodSync(fakeTT,0o755);
+ const base={version:1,enabled:true,cwd,journalDirectory:home,tt:fakeTT},j={dir:home},binary=join(home,"rel_1-integrated-verification",C(7)+"-r0","tailterm-hub-test");
+ const build=()=>{for(const n of [1,2,3,4,5])addDist(j,n);mkdirSync(dirname(binary),{recursive:true});writeFileSync(binary,"binary");utimesSync(binary,old,old);writeFileSync(join(dirname(binary),"receipt.json"),"receipt");utimesSync(join(dirname(binary),"receipt.json"),old,old);};
+ const said=[],write=process.stderr.write;process.stderr.write=text=>{said.push(String(text));return true;};
+ try{
+  // The record cannot be written: every copy and file stays, the one-line notice is printed and the poll goes on to the claim.
+  build();mkdirSync(join(home,"retention.jsonl"));
+  await serveDeployment(base,{once:true});
+  for(const n of [1,2,3,4,5])assert.ok(existsSync(join(home,DIST(n),"assets","app.js")),"kept "+n);assert.ok(existsSync(binary));
+  assert.ok(said.includes("Journal retention sweep failed; remaining backup copies kept.\n"));assert.match(readFileSync(log,"utf8"),/deployment claim --job next /);
+  // With the record writable, the default policy applies at the next poll.
+  rmSync(log);rmSync(join(home,"retention.jsonl"),{recursive:true});said.length=0;
+  await serveDeployment(base,{once:true});
+  assert.deepEqual(readdirSync(home).filter(n=>n.startsWith("tailos-dist-")).sort(),[DIST(3),DIST(4),DIST(5)]);assert.deepEqual(readdirSync(dirname(binary)),["receipt.json"]);
+  assert.ok(!said.some(text=>text.includes("retention sweep failed")));assert.match(readFileSync(log,"utf8"),/deployment claim --job next /);
+  assert.deepEqual(readFileSync(join(home,"retention.jsonl"),"utf8").split("\n").filter(Boolean).map(l=>{const r=JSON.parse(l);return [r.jobId,r.file,r.kind,r.reason];}),[["rel_1",DIST(1),"dist","count"],["rel_2",DIST(2),"dist","count"],["rel_1","rel_1-integrated-verification/"+C(7)+"-r0/tailterm-hub-test","attempt","age"]]);
+ }finally{process.stderr.write=write;}
 });
 test("b2 independently records restored Mini after failed TailOS rollback",async()=>{
  const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});change(f,"hub/cmd/tt/main.go","fixture");const j=job(f,change(f,"client/a.js","a")),a=fake();let receipt;

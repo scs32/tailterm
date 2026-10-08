@@ -1717,7 +1717,7 @@ export function retentionPolicy(config){
   const retention=config?.retention??{};
   if(typeof retention!=="object" || Array.isArray(retention))throw releaseError("Invalid journal retention");
   const value=(key,fallback)=>{const v=retention[key]===undefined?fallback:retention[key];if(!Number.isSafeInteger(v) || v<0)throw releaseError("Invalid journal retention "+key);return v;};
-  return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296)};
+  return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296),releasedDists:value("releasedDists",3),attemptDays:value("attemptDays",3)};
 }
 // Removes only the exact backup and rehearsal copy names of jobs in the
 // deployment list, each a regular file directly in the journal directory or
@@ -1725,17 +1725,37 @@ export function retentionPolicy(config){
 // known to be terminal keeps everything; a terminal job loses its leftover
 // rehearsal copy, and its backup copy unless it is one of the newest released
 // jobs within the size budget. In a state directory only regular files go,
-// then the directory once empty; a link is never followed or removed. Every
-// removal is appended to retention.jsonl before the file goes. Returns the
+// then the directory once empty; a link is never followed or removed.
+//
+// Then the TailOS copies tailos-dist-COMMIT (wi_d203eb94ef27d8f8). The newest
+// released TailOS commit, each of keepDists, the newest releasedDists released
+// commits and every commit a non-terminal job carries or names in its inputs
+// manifests (its rollback program is there) keep theirs. An older released
+// commit's copy goes, and so does the copy a terminal job left without
+// releasing it once that job settled before the oldest kept release. A copy no
+// listed job accounts for stays, as does one holding anything but regular
+// files and directories; an unreadable manifest of a non-terminal job keeps
+// every copy.
+//
+// Last, matrix attempt directories ID-integrated-verification/COMMIT-rN of
+// terminal jobs whose run record is ended or absent: each regular file
+// directly in one that is not evidence (ATTEMPT_KEPT, and every .log) goes
+// once it is attemptDays old. The directory itself always stays.
+//
+// Every removal is appended to retention.jsonl before it happens. Returns the
 // records written.
-export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
+const DIST=/^tailos-dist-([a-f0-9]{40})$/,ATTEMPT_KEPT=["receipt.json","context.json","plan.json","plan.preserved.json","run.json","run.json.set-aside"];
+export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
   const policy=retentionPolicy(config),dir=config.journalDirectory,records=[];
   const size=file=>{try{const s=lstatSync(join(dir,file));return s.isFile()?s.size:null;}catch{return null;}};
-  const remove=(jobId,file,kind,reason)=>{
-    const bytes=size(file);if(bytes===null)return 0;
+  const recorded=(jobId,file,kind,bytes,reason,gone)=>{
     const record={version:1,at:new Date(now()).toISOString(),jobId,file,kind,bytes,reason};
     const fd=openSync(join(dir,"retention.jsonl"),"a",0o600);try{writeFileSync(fd,JSON.stringify(record)+"\n");fsyncSync(fd);}finally{closeSync(fd);}
-    rmSync(join(dir,file));records.push(record);return bytes;
+    gone();records.push(record);return bytes;
+  };
+  const remove=(jobId,file,kind,reason)=>{
+    const bytes=size(file);if(bytes===null)return 0;
+    return recorded(jobId,file,kind,bytes,reason,()=>rmSync(join(dir,file)));
   };
   // A job's backup copy names of every generation, and those from before
   // names carried one, read from the directory once. A rehearsal leftover
@@ -1772,7 +1792,77 @@ export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
   total+=kept.reduce((sum,entry)=>sum+entry.bytes,0);
   // Oldest kept released copy first; a non-terminal job's copy stays even over budget.
   while(policy.backupBudgetBytes>0 && total>policy.backupBudgetBytes && kept.length){const entry=kept.pop();total-=entry.bytes;drop(entry,"budget");}
+  pruneDists();pruneAttempts();
   return records;
+  function pruneDists(){
+    const dists=listed.filter(name=>DIST.test(name) && isDirectory(name));if(!dists.length)return;
+    // Released TailOS commits by the rule releaseBaselines uses, newest first.
+    const events=[],carried=new Map(),keep=new Set(keepDists.filter(sha));
+    const settled=job=>{const at=Date.parse(job.settledAt??"");return Number.isNaN(at)?-Infinity:at;};
+    for(const [index,job] of jobs.entries()){
+      if(!job || typeof job!=="object")continue;
+      const at=settled(job);
+      if(job.receipt?.outcome==="released"){if(Array.isArray(job.receipt.targets) && job.receipt.targets.some(t=>t?.target==="tailos" && t.outcome==="released"))events.push({at,index,commit:job.receipt.commit,id:job.id});}
+      else if(job.state==="superseded" && Array.isArray(job.supersession?.targets) && job.supersession.targets.includes("tailos"))events.push({at,index,commit:job.supersession.releasedCommit,id:job.id});
+      if(TERMINAL.includes(job.state)){
+        for(const commit of [job.commit,job.integratedCommit,job.receipt?.commit])if(sha(commit) && !(carried.get(commit)?.at>=at))carried.set(commit,{at,id:job.id});
+        continue;
+      }
+      for(const commit of [job.commit,job.integratedCommit])if(sha(commit))keep.add(commit);
+      // An inputs manifest that cannot be read as a regular file may name any copy.
+      if(typeof job.id!=="string" || !/^[A-Za-z0-9_-]+$/.test(job.id))return;
+      const manifest=new RegExp(`^${job.id}-(?:g[1-9][0-9]*-)?inputs\\.json$`);
+      for(const name of listed){
+        if(!manifest.test(name))continue;
+        let text;try{if(!lstatSync(join(dir,name)).isFile())return;text=readFileSync(join(dir,name),"utf8");}catch{return;}
+        for(const m of text.matchAll(/tailos-dist-([a-f0-9]{40})(?![a-f0-9])/g))keep.add(m[1]);
+      }
+    }
+    events.sort((a,b)=>a.at===b.at?b.index-a.index:b.at-a.at);
+    const released=new Map();for(const event of events)if(sha(event.commit) && !released.has(event.commit))released.set(event.commit,event);
+    const order=[...released.values()],held=order.slice(0,Math.max(policy.releasedDists,1));
+    if(!held.length)return;
+    for(const event of held)keep.add(event.commit);
+    const oldest=held.at(-1).at;
+    for(const name of dists){
+      const commit=DIST.exec(name)[1];if(keep.has(commit))continue;
+      const owner=released.get(commit),left=carried.get(commit);
+      if(!owner && !(left && left.at<oldest))continue;
+      const bytes=treeBytes(join(dir,name));if(bytes===null)continue;
+      recorded(owner?owner.id:left.id,name,"dist",bytes,owner?"count":"not-released",()=>rmSync(join(dir,name),{recursive:true}));
+    }
+  }
+  function pruneAttempts(){
+    const age=policy.attemptDays*86400000;
+    for(const job of jobs){
+      if(typeof job?.id!=="string" || !/^[A-Za-z0-9_-]+$/.test(job.id) || !TERMINAL.includes(job.state))continue;
+      const parent=job.id+"-integrated-verification";if(!isDirectory(parent))continue;
+      for(const attempt of readdirSync(join(dir,parent)).sort()){
+        const at=`${parent}/${attempt}`;if(!ATTEMPT.test(attempt) || !isDirectory(at))continue;
+        // A run record that is a link or unreadable is not known to have ended.
+        if(lstatSync(join(dir,at,"run.json"),{throwIfNoEntry:false})?.isFile()===false)continue;
+        const run=readRun(join(dir,at));if(run!==null && run.state!=="ended")continue;
+        for(const name of readdirSync(join(dir,at)).sort()){
+          if(ATTEMPT_KEPT.includes(name) || name.endsWith(".log"))continue;
+          const s=lstatSync(join(dir,at,name),{throwIfNoEntry:false});
+          if(s?.isFile() && now()-s.mtimeMs>=age)remove(job.id,`${at}/${name}`,"attempt","age");
+        }
+      }
+    }
+  }
+  function isDirectory(name){return lstatSync(join(dir,name),{throwIfNoEntry:false})?.isDirectory()===true;}
+  // The regular-file bytes under a directory, or null when it holds anything
+  // that is neither a regular file nor a directory. Nothing is followed.
+  function treeBytes(path){
+    let bytes=0;
+    for(const name of readdirSync(path)){
+      const s=lstatSync(join(path,name));
+      if(s.isFile())bytes+=s.size;
+      else if(s.isDirectory()){const inner=treeBytes(join(path,name));if(inner===null)return null;bytes+=inner;}
+      else return null;
+    }
+    return bytes;
+  }
 }
 // The four configured baselines, read from the private config at every poll
 // without restarting the daemon. A recorded hand release advances baselines
@@ -1898,7 +1988,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     bookendReleaseLedger(read,jobs.releaseSnapshot,jobs.releaseHead);
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
-    try{pruneJournal(config,jobs);}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
+    try{pruneJournal(config,jobs,{keepDists:[baselines.tailos]});}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
     // The runner's own code, once per poll and before any claim. It restarts
     // when idle: no claimed, merged or blocked job, no matrix run of this
     // process and no host release lock. It also restarts when its only owned

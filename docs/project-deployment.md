@@ -1323,7 +1323,7 @@ targets.bridge   {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-
 targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...], hostSetup, hostRollback (both optional argv; default: tt host setup)}
 targets.tailos   {url (optional), switchWindowMs (optional, 0-300000, default 90000)}
 inputs.planTemplate  path to the handler's last TrueNAS preflight plan (template)
-retention        {releasedBackups (optional, integer >= 0, default 3), backupBudgetBytes (optional, integer >= 0, default 4294967296; 0 = no budget)}
+retention        {releasedBackups (optional, integer >= 0, default 3), backupBudgetBytes (optional, integer >= 0, default 4294967296; 0 = no budget), releasedDists (optional, integer >= 0, default 3), attemptDays (optional, integer >= 0, default 3)}
 matrixPriority   optional: urgent, high or normal; the integrated run's place class on the verification host (default high)
 matrixHostWaitMs optional: how long the integrated run waits for the verification host (default 7200000)
 ```
@@ -1393,9 +1393,9 @@ aside or requeued, the length of its `reconciliations`).
   run writes a complete fresh set and a fresh TrueNAS backup. No file is
   renamed or moved by hand. The earlier attempt's files and its TrueNAS backup
   are never opened for writing, renamed or removed; they stay as evidence.
-  Pruning earlier attempts' manifests, plans, receipts and TrueNAS backups is
-  retention work under `wi_d203eb94ef27d8f8`; the local backup copies of every
-  generation already follow "Journal retention" below.
+  No retention removes earlier attempts' manifests, plans, receipts or TrueNAS
+  backups. The local backup copies of every generation, the TailOS copies and
+  the matrix attempt directories follow "Journal retention" below.
 - **Running the inputs command again at the same generation is safe.** When the
   manifest exists it returns the same path, digest, targets and import command
   and makes no probe, backup or backup copy, and changes no file; a manifest whose binding differs
@@ -1531,7 +1531,7 @@ effort. A runner killed mid-rehearsal can leave `tt-rehearsal-ID` behind
 (`container ls -a`); the `started` marker refuses that job, and the container is
 removed by hand with `container delete -f tt-rehearsal-ID`.
 
-### Journal retention (wi_e83171b4c215f626)
+### Journal retention (wi_e83171b4c215f626, wi_d203eb94ef27d8f8)
 
 **Where backups live.** The authoritative pre-release backup is on TrueNAS at
 `/mnt/deepfreeze/tailterm-hub/backups/before-ID-gN-NAME.sqlite` (N is the job
@@ -1564,7 +1564,7 @@ whose inputs run made a new copy, is rehearsed on that copy.
 
 **Retention rule.** At every poll, after reconciliation and before any claim,
 the daemon sweeps the journal directory. It considers only jobs in
-`tt deployment list` and only the names `ID-gN-truenas-backup.sqlite`,
+`tt deployment list`. For backups it considers only the names `ID-gN-truenas-backup.sqlite`,
 `ID-gN-hub-backup.sqlite`, `ID-gN-bridge-backup.sqlite` of every generation N,
 the same names without `gN-` from before generations were named, and their
 rehearsal copies,
@@ -1592,24 +1592,85 @@ rehearsal state directory:
    0 means no budget), the oldest kept released copy is removed (reason
    `budget`). A non-terminal job's copy is never removed, even over budget.
 
-Files of a job not in the list, markers, journals, manifests, receipts, plans,
-`ID-migration`, `ID-mini-before`, `tailos-dist-COMMIT` and anything that is not a
-regular file are never touched. Both keys are optional; a value that is not a
-non-negative integer stops the daemon at startup.
+**TailOS copies.** The same sweep then considers every directory directly in
+`journalDirectory` named exactly `tailos-dist-COMMIT` (40 hex), the copy the
+retain step makes at each TailOS release (kind `dist`). The released TailOS
+commits come from the job list by the rule the baselines use: a job whose
+receipt is `released` with a `released` `tailos` target gives its receipt's
+commit, and a superseded job whose hand release shipped `tailos` gives that
+record's released commit. They are ordered newest first by `settledAt`, as the
+backups are.
 
-**Removal record.** Before each file is removed, one JSON line is appended and
-synced to `journalDirectory/retention.jsonl` (0600):
+1. These copies always stay: the newest released TailOS commit's; the current
+   TailOS baseline's (so a baseline that came from the config is covered); and,
+   for every job that is not terminal, the copy of its accepted and integrated
+   commits and every `tailos-dist-COMMIT` its inputs manifests
+   (`ID-gN-inputs.json`, `ID-inputs.json`) name. The next job's TailOS rollback
+   program and probe are in that manifest, so the copy a pending rollback needs
+   stays. When such a manifest is not a readable regular file, no TailOS copy
+   is removed in that sweep.
+2. The newest `retention.releasedDists` (default 3) released TailOS commits
+   keep their copies; at 0 only rule 1 keeps any. An older released commit's
+   copy is removed (reason `count`, `jobId` the job that released it).
+3. A copy whose commit is the accepted, integrated or receipt commit of a
+   terminal job and is not a released TailOS commit, for example a rolled back
+   job's, is removed once that job settled before the oldest release that
+   keeps its copy (reason `not-released`, `jobId` that job). Until then it
+   stays.
+
+A copy is removed whole, after one record giving the bytes of its regular
+files. A copy holding anything that is neither a regular file nor a directory
+(a link, for example) stays whole with no record. A link named like a copy,
+`tailos-dist-COMMIT.tmp`, a copy whose commit no listed job carries, and every
+copy while the list has no released TailOS job are never touched.
+
+**Matrix attempt directories.** Last, the sweep considers
+`ID-integrated-verification/COMMIT-rN` of every listed job (kind `attempt`).
+Measured on the Mini on 2026-10-08, three compiled test binaries
+(`tailterm-hub-test`, `tailterm-historical-hub-test`, `tailterm-tt-test`, about
+61 MiB per attempt together) were 98% of 7.5 GiB in 240 attempt directories;
+everything else was about 67 MiB.
+
+1. A job that is not terminal loses nothing from any attempt.
+2. An attempt of a terminal job whose `run.json` says `starting` or `started`,
+   or is unreadable or not a regular file, loses nothing. An attempt with an
+   `ended` record, a `run.json.set-aside` or no record at all counts as ended.
+3. In an ended attempt of a terminal job, each regular file directly in the
+   attempt directory is removed once it is `retention.attemptDays` days old by
+   its own modification time (default 3; 0 removes it at the first sweep after
+   the job is terminal), reason `age`, one record per file. These names always
+   stay: `receipt.json`, `context.json`, `plan.json`, `plan.preserved.json`,
+   `run.json`, `run.json.set-aside` and every file ending `.log` (the check
+   logs the receipt cites by `logURI` and `logDigest`).
+
+The attempt directory and its parent always stay; no whole attempt is removed
+at any age. A link or directory inside an attempt, an attempt or parent that is
+itself a link, a name that is not `COMMIT-rN`, and files directly in the parent
+(the layout from before attempts) are neither followed nor removed.
+
+Files of a job not in the list, markers, journals, manifests, receipts, plans,
+`ID-migration`, `ID-mini-before` and, outside a TailOS copy, anything that is
+not a regular file are never touched. All four keys are optional; a value that
+is not a non-negative integer stops the daemon at startup.
+
+**Removal record.** Before each removal, one JSON line is appended and synced
+to `journalDirectory/retention.jsonl` (0600):
 
 ```
-{version: 1, at, jobId, file, kind: "backup" | "rehearsal", bytes, reason: "terminal" | "not-released" | "count" | "budget"}
+{version: 1, at, jobId, file, kind: "backup" | "rehearsal" | "dist" | "attempt", bytes, reason: "terminal" | "not-released" | "count" | "budget" | "age"}
 ```
 
 `file` is the name inside the journal directory; a file of a rehearsal state
-directory is `DIRECTORY/NAME`. A sweep with nothing to remove
-writes nothing. A sweep that fails (for example the record cannot be written)
-removes nothing further, prints "Journal retention sweep failed; remaining
-backup copies kept." and the poll continues. The first poll after this change
-is deployed removes the existing backlog under the same rule.
+directory is `DIRECTORY/NAME`, a TailOS copy is `tailos-dist-COMMIT` and an
+attempt file is `ID-integrated-verification/COMMIT-rN/NAME`. Kind `dist` has
+reason `count` or `not-released`; kind `attempt` has reason `age`. A sweep
+with nothing to remove writes nothing. A sweep removes backups first, then
+TailOS copies, then attempt files. A sweep that fails (for example the record
+cannot be written) removes nothing further, prints "Journal retention sweep
+failed; remaining backup copies kept." and the poll continues. The first poll
+after a change to this rule is deployed removes the existing backlog under it;
+a TailOS copy whose removal was interrupted is recorded and removed again at
+the next sweep.
 
 ## Operator runbook (d7)
 
