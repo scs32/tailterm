@@ -269,9 +269,9 @@ test("Planned delivery verifies alongside review and verifies exactly what merge
     verifier = prompt("verifier"),
     handler = prompt("database"),
     builder = prompt("builder");
-  assert.match(lead, /send reviewer a REVIEW naming that commit, the scope and the criteria, and start its verification at once/);
-  assert.match(lead, /Verify alongside review: freeze the plan on the current tasks-hub tip with tt verification plan and REQUEST the distinct verifier/);
-  assert.match(lead, /Each later candidate gets a fresh run, targeted from the previous candidate for fixes; withdraw the superseded REQUEST/);
+  assert.match(lead, /send reviewer a REVIEW naming that commit, the scope and the criteria\. Two review rounds/);
+  assert.match(lead, /Verify alongside review, at once: freeze the plan on the current tasks-hub tip with tt verification plan and REQUEST the distinct verifier/);
+  assert.match(lead, /Each later candidate gets a fresh run, targeted from the previous one for fixes; withdraw the superseded REQUEST/);
   assert.match(lead, /final candidate, rebased onto the current tip, gets the full plan once/);
   assert.match(lead, /hub-saved passing receipt for the exact final SHA/);
   assert.doesNotMatch(lead, /Before acceptance, REQUEST the distinct verifier/);
@@ -387,7 +387,24 @@ test("queue teams, handlers and docs state one Start rule", () => {
   const go = read("../hub/cmd/tt/coordination.go");
   assert.equal(count(go, rule), 1);
   assert.equal(count(go, accept), 1);
+
+  // wi_2b66e2a634afa39d: every text that states the rule also says which
+  // revisions are amendments, in the words of the queue doc.
+  const amendment = "An amendment changes owned paths, criteria or scope; any other revision needs no Start.";
+  for (const id of ["planned", "small"])
+    for (const member of exampleTeam(id).members) {
+      const wanted = ["lead", "builder"].includes(member.name) ? 1 : 0;
+      assert.equal(count(member.prompt, `${rule} ${amendment}`), wanted, `${id}/${member.name}`);
+      assert.equal(count(member.prompt, amendment), wanted, `${id}/${member.name}`);
+    }
+  assert.equal(count(go, amendment), 1);
+  assert.equal(count(go, 'queueTeamStartHandlerRule + " " + queueTeamStartAmendmentRule'), 2);
+  assert.ok(read("../hub/internal/teamplan/plan.mjs").includes(amendment), "generated plan.mjs lacks the amendment definition");
   const queueDoc = read("../docs/project-queue.md");
+  assert.ok(
+    queueDoc.replace(/\s+/g, " ").includes("changes the owned paths, the criteria or the scope"),
+    "the queue doc no longer defines a scope amendment",
+  );
   assert.equal(count(queueDoc, rule), 1);
   assert.equal(count(queueDoc, accept), 1);
   assert.equal(count(queueDoc, "\n## Queue team Start evidence\n"), 1);
@@ -425,8 +442,10 @@ test("lead and verifier run the validated hub operations without a handler turn"
   assert.match(verifier, /Never import a targeted-receipt\.json/);
   assert.match(builder, /Begin only on lead's ASSIGN, which after an amendment follows that Start REQUEST/);
 
-  // No lead, builder or verifier prompt asks the handler for a Start, plan,
-  // assignment, freeze, import or done-save turn.
+  // A lead sends the handler one Start REQUEST after a scope amendment and
+  // nothing else. These are the retired handler-gate phrasings: no lead,
+  // builder or verifier prompt asks for a per-step Start, plan or assignment
+  // gate, or for a handler freeze, import or done-save turn.
   for (const [name, text] of [["planned lead", lead], ["small lead", small], ["builder", builder], ["verifier", verifier]])
     for (const handlerTurn of [
       /For each live Start, plan or assignment gate/,
@@ -480,4 +499,61 @@ test("the steward proposes the small lane for small bugs and names a reason for 
   assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
   const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
   assert.equal(bundle.split(rule).length - 1, 1, "generated plan.mjs lacks the steward lane rule");
+});
+
+// wi_2b66e2a634afa39d (FINDING #29036): the unsharded store race no longer
+// fits 30 minutes, so the planner and verifier name the sharded command the
+// matrix runs and both leads say a store race is sharded. No team or role
+// text may carry an unsharded store race command or one under 45 minutes.
+test("store race checks name the sharded matrix command", () => {
+  const count = (text, clause) => text.split(clause).length - 1;
+  const matrix = JSON.parse(readFileSync(new URL("../verification/matrix.json", import.meta.url), "utf8"));
+  const shards = matrix.goRaceShards["./internal/store"];
+  const full = `A store race check names the sharded command the matrix uses, run from hub/: node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=${shards} ./internal/store.`;
+  const short = "Store race checks run sharded.";
+  const members = (id) => Object.fromEntries(exampleTeam(id).members.map((member) => [member.name, member.prompt]));
+  const planned = members("planned"),
+    small = members("small");
+  for (const [name, prompt] of Object.entries(planned)) {
+    assert.equal(count(prompt, full), ["planner", "verifier"].includes(name) ? 1 : 0, `planned/${name}`);
+    assert.equal(count(prompt, short), name === "lead" ? 1 : 0, `planned/${name}`);
+  }
+  assert.equal(count(small.lead, short), 1);
+  assert.equal(count(small.lead, full), 0);
+
+  // A store race command is the sentence around a -race flag, up to the next
+  // one, when it names the store package. It is refused without the shard flag
+  // or with a timeout under 45 minutes.
+  const unsafe = (text) => {
+    const found = [];
+    for (const line of text.split("\n"))
+      for (let at = line.indexOf("-race"); at >= 0; ) {
+        const next = line.indexOf("-race", at + 1);
+        const start = Math.max(line.lastIndexOf(". ", at), line.lastIndexOf("; ", at)) + 1;
+        const command = line.slice(start, next < 0 ? line.length : next);
+        const timeout = /-timeout[= ](\d+)m/.exec(command);
+        if (
+          command.includes("./internal/store") &&
+          (!command.includes("-shards=./internal/store=") || !timeout || Number(timeout[1]) < 45)
+        )
+          found.push(command.trim());
+        at = next;
+      }
+    return found;
+  };
+  assert.equal(unsafe("Run go test -race -timeout 30m ./internal/store").length, 1);
+  assert.equal(unsafe("Run go test -race ./internal/store").length, 1);
+  assert.equal(unsafe("node ../scripts/verify-matrix.mjs go-race -timeout=30m -shards=./internal/store=4 ./internal/store").length, 1);
+  assert.equal(unsafe("Run go test -timeout 60m -race ./internal/store").length, 1);
+  assert.equal(unsafe(`${full} Then go test -race -timeout 30m ./internal/store`).length, 1);
+  assert.equal(unsafe("Run go test -race ./cmd/tt").length, 0);
+  assert.equal(unsafe(full).length, 0);
+  const texts = [
+    ...[...TEAM_EXAMPLES, ...QUEUE_TEAM_TEMPLATES].flatMap((team) =>
+      exampleTeam(team.id).members.map((member) => [`${team.id}/${member.name}`, member.prompt]),
+    ),
+    ...Object.entries(PROJECT_ROLE_TEMPLATES).map(([role, template]) => [role, template.prompt]),
+    ["plan.mjs", readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8")],
+  ];
+  for (const [name, text] of texts) assert.deepEqual(unsafe(text), [], name);
 });

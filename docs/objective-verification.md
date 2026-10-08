@@ -353,6 +353,10 @@ go-race by an integrated one only when the argv before the first package is
 equal. Without the key the argv is `go test -race …` as before. `go-test` and
 every other check are unchanged.
 
+**Locally.** To run the store race yourself, from `hub/`:
+`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store`.
+The unsharded `go test -race -timeout 30m ./internal/store` no longer fits 30 minutes.
+
 **What the command does.** It accepts only `-timeout=Nm`, `-shards=PKG=K` and
 `./` packages.
 

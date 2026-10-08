@@ -4,6 +4,10 @@ import { AGENT_ID_RE, AGENT_NAME_RE, TASK_ID_RE } from "./task-ref.js";
 
 export const DATABASE_HANDLER_ROLE = "database_handler";
 export const MAX_HANDLER_PLANS = 200;
+// The lane default for a handler queue proposal (wi_2b66e2a634afa39d).
+// hub/cmd/tt/coordination.go (handlerLaneRule) carries the same sentences.
+const handlerLaneRule =
+  "Lane: every queue proposal names the team template. Propose --template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned.";
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
@@ -52,7 +56,9 @@ const handlerPrompt =
   "setting, report the real limit and use only a separately authorized " +
   "supported launch path or an owner-approved allowance change. Never " +
   "clear or spoof identity, reuse closed workers, or " +
-  "bypass a denial. Priority informs " +
+  "bypass a denial. " +
+  handlerLaneRule +
+  " Priority informs " +
   "selection among ready items; it never overrides dependencies, ownership or " +
   "capacity and does not force FIFO. If no work is ready, state the actual " +
   "dependency, shared-file conflict, exhausted capacity or no-ready condition " +

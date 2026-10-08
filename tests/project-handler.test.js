@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   withDatabaseHandler,
   normalizeHandlerPlan,
@@ -196,4 +197,23 @@ test("previous handler settings survive normalization with one bounded recovery 
     { ...input.previous, previous: input.previous },
   ])
     assert.throws(() => normalizeHandlerPlan({ ...input, previous }));
+});
+
+// wi_2b66e2a634afa39d: a handler queue proposal defaults a qualifying bug to
+// the Small lane and names one reason for Planned. The sentences are pinned
+// whole, so removing or rewording them fails here, and the tt handler guidance
+// in hub/cmd/tt/coordination.go carries the same text.
+test("handler prompt defaults qualifying bugs to the Small lane and names a reason for Planned", () => {
+  const lane =
+    "Lane: every queue proposal names the team template. Propose --template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned.";
+  const count = (text, clause) => text.split(clause).length - 1;
+  const prompt = withDatabaseHandler(plan())[1].fields.prompt;
+  assert.equal(count(prompt, lane), 1);
+  assert.ok(
+    prompt.includes(`bypass a denial. ${lane} Priority informs selection among ready items`),
+    "the lane rule is not in the allocation passage",
+  );
+  assert.ok(prompt.length <= 8192, `handler prompt is ${prompt.length} characters`);
+  const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
+  assert.equal(count(go, lane), 1);
 });

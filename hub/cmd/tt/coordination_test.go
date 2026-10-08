@@ -780,6 +780,12 @@ func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
 	if n := strings.Count(primaryHandlerGuidance, rule+" "+accept); n != 1 {
 		t.Fatalf("handler role text states the rule %d times", n)
 	}
+	// wi_2b66e2a634afa39d: the sentence that says which revisions are
+	// amendments follows the rule wherever a handler or worker reads it.
+	amended := accept + " " + queueTeamStartAmendmentRule
+	if n := strings.Count(primaryHandlerGuidance, amended); n != 1 {
+		t.Fatalf("handler role text defines an amendment %d times", n)
+	}
 	task := api.Task{Name: "Project", Orchestrator: "lead"}
 	primaryRoster := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}}
 	auxiliaryRoster := append(append([]api.Agent{}, primaryRoster...), api.Agent{Name: "handler-aux", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning})
@@ -798,6 +804,9 @@ func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
 		{"auxiliary handler", auxiliary, accept, 1},
 		{"builder", builder, rule, 1},
 		{"builder", builder, accept, 1},
+		{"primary handler", primary, amended, 2},
+		{"auxiliary handler", auxiliary, amended, 1},
+		{"builder", builder, amended, 1},
 	} {
 		if n := strings.Count(check.briefing, check.clause); n != check.want {
 			t.Fatalf("%s briefing states %q %d times, want %d", check.name, check.clause, n, check.want)
@@ -818,6 +827,32 @@ func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
 	}
 	if !strings.Contains(string(plan), rule) {
 		t.Fatal("team plan bundle does not carry the queue team Start rule")
+	}
+	if !strings.Contains(string(plan), queueTeamStartAmendmentRule) {
+		t.Fatal("team plan bundle does not define a scope amendment")
+	}
+}
+
+// wi_2b66e2a634afa39d: the primary handler's guidance carries the lane
+// default once, in the allocation passage, and the browser handler prompt in
+// client/project-handler.js carries the same sentences.
+func TestPrimaryHandlerGuidanceDefaultsQualifyingBugsToSmallLane(t *testing.T) {
+	const lane = "Lane: every queue proposal names the team template. Propose --template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned."
+	if handlerLaneRule != lane {
+		t.Fatalf("lane rule changed: %q", handlerLaneRule)
+	}
+	if n := strings.Count(primaryHandlerGuidance, lane); n != 1 {
+		t.Fatalf("handler role text states the lane rule %d times", n)
+	}
+	if !strings.Contains(primaryHandlerGuidance, "bypass a denial. "+lane+" Priority informs selection among ready items") {
+		t.Fatal("lane rule is not in the allocation passage")
+	}
+	browser, err := os.ReadFile("../../../client/project-handler.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(browser), lane); n != 1 {
+		t.Fatalf("browser handler prompt states the lane rule %d times", n)
 	}
 }
 
