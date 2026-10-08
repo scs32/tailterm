@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -28,6 +29,8 @@ import (
 // It also raises minCommandTimeout to testCommandTimeout for the whole
 // package, after saving the value the binary ships with. A test that needs
 // the shipped deadlines sets minCommandTimeout back for its own duration.
+//
+// The tests then run with a temporary home of their own; see runWithOwnHome.
 func TestMain(m *testing.M) {
 	for _, kv := range os.Environ() {
 		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "TAILTERM_") {
@@ -36,7 +39,139 @@ func TestMain(m *testing.M) {
 	}
 	productionMinCommandTimeout = minCommandTimeout
 	minCommandTimeout = testCommandTimeout
-	os.Exit(runWithOwnTmuxDir(m))
+	os.Exit(runWithOwnHome(func() int { return runWithOwnTmuxDir(m) }))
+}
+
+// runWithOwnHome runs the package's tests with HOME pointing at an empty
+// directory only this test process owns, and removes it afterwards. A test
+// that forgets its own isolation, and any process it starts, then resolves
+// relay.json, hub.json, handoff.json, the relay state and the tool ledger
+// under that directory, never under the home of the user running the tests
+// (wi_fc17a11cbecb5af7: a child test binary once read the host's redaction
+// setting and lost ledger rows).
+//
+// The guard is checked before and after the run, and fails it with the path
+// that would have been read. A child that is this test binary again inherits
+// the real homes in testRealHomesEnv and checks the home it was given, so a
+// test that starts one with the user's home fails with that child's message.
+// A child may have another temporary home; it never gets one of its own here.
+//
+// CODEX_HOME and CLAUDE_CONFIG_DIR are dropped like the TAILTERM_ variables:
+// an agent's shell sets them to the user's own directories. The Go caches
+// keep their places, because several tests build a binary and an empty home
+// would rebuild the module and download its dependencies.
+func runWithOwnHome(run func() int) int {
+	os.Unsetenv("CODEX_HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	if _, child := os.LookupEnv(testRealHomesEnv); child {
+		return guardedRun(run)
+	}
+	// user.Current does not read HOME where cgo is on, so a caller's
+	// temporary HOME does not hide the user's own.
+	candidates := []string{}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, home)
+	}
+	if u, err := user.Current(); err == nil {
+		candidates = append(candidates, u.HomeDir)
+	}
+	var real []string
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		real = append(real, dir)
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != dir {
+			real = append(real, resolved)
+		}
+	}
+	if out, err := exec.Command("go", "env", "GOCACHE", "GOMODCACHE", "GOPATH", "GOENV").Output(); err == nil {
+		if values := strings.Split(strings.TrimSpace(string(out)), "\n"); len(values) == 4 {
+			for i, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "GOENV"} {
+				os.Setenv(name, values[i])
+			}
+		}
+	}
+	dir, err := os.MkdirTemp("", "tt-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "private home directory:", err)
+		return 1
+	}
+	os.Setenv("HOME", dir)
+	os.Setenv(testRealHomesEnv, strings.Join(real, string(os.PathListSeparator)))
+	code := guardedRun(run)
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintln(os.Stderr, "remove private home directory:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	return code
+}
+
+// guardedRun checks the guard on both sides of the run, so a test that left
+// the process environment pointing at the user's home fails the run too.
+func guardedRun(run func() int) int {
+	if err := realHomeGuard(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	code := run()
+	if err := realHomeGuard(); err != nil {
+		fmt.Fprintln(os.Stderr, "after the tests:", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	return code
+}
+
+// testRealHomesEnv lists the homes of the user running the tests, as the
+// first test process found them.
+const testRealHomesEnv = "TT_TEST_REAL_HOMES"
+
+// realHomeGuard returns an error naming the first path this process would
+// read under a real home: the home itself, or a setting, state or runtime
+// directory that the environment points into one.
+func realHomeGuard() error {
+	home, _ := os.UserHomeDir()
+	paths := []struct{ what, path string }{
+		{"the user home", home},
+		{"the redaction setting", toolRedactSettingPath()},
+		{"the relay state", relayDir()},
+		{"the handoff config", handoffConfigPath()},
+		{"the handoff directory", handoffRoot()},
+		{"the tool ledger", toolLedgerRoot()},
+		{"the Codex home", codexHome()},
+	}
+	for _, real := range filepath.SplitList(os.Getenv(testRealHomesEnv)) {
+		if real == "" {
+			continue
+		}
+		owned := []string{filepath.Join(real, ".config"), filepath.Join(real, ".local"), filepath.Join(real, ".codex"), filepath.Join(real, ".claude")}
+		for i, p := range paths {
+			if p.path == "" {
+				continue
+			}
+			path := filepath.Clean(p.path)
+			if resolved, err := filepath.EvalSymlinks(path); err == nil {
+				path = resolved
+			}
+			breach := i == 0 && path == filepath.Clean(real)
+			for _, dir := range owned {
+				if rel, err := filepath.Rel(dir, path); i > 0 && err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					breach = true
+				}
+			}
+			if breach && i == 0 {
+				return fmt.Errorf("real-home guard: the home of this hub/cmd/tt test process is the real user home %s; a test and every process it starts must use a temporary home (see runWithOwnHome)", p.path)
+			}
+			if breach {
+				return fmt.Errorf("real-home guard: this hub/cmd/tt test process resolves %s to %s, inside the real user home %s; a test and every process it starts must use a temporary home (see runWithOwnHome)", p.what, p.path, real)
+			}
+		}
+	}
+	return nil
 }
 
 // runWithOwnTmuxDir runs the package's tests with TMUX_TMPDIR pointing at a
