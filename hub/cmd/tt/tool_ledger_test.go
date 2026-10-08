@@ -179,6 +179,12 @@ func TestHookRegistryHoldsToolAndHandoff(t *testing.T) {
 // a1: the hook returns nil, silently, inside the bound whatever stdin, the
 // disk or the lock do. A timing miss is retried twice, since a stalled test
 // host is not the property; every attempt must still return nil and silent.
+//
+// The row is a separate expectation (bug wi_4f795d41e0038d04). A hook that
+// reaches its own deadline returns on time and drops the row, by design, so
+// on a loaded host a slow attempt can be inside the bound and leave nothing.
+// That attempt is retried too. An attempt that returned before the deadline
+// saw its work finish, and must have left exactly the expected row.
 func TestToolLedgerNeverBlocks(t *testing.T) {
 	pre := toolPayload("PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}})
 	post := toolPayload("PostToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}})
@@ -187,11 +193,14 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 		rows []map[string]any
 	}
 	cases := []struct {
-		name  string
-		run   func(t *testing.T, e env, root string) toolHookRun
-		check func(t *testing.T, rows []map[string]any)
+		name string
+		// stalls marks a case that holds the hook until its deadline on
+		// every attempt, so its row check is the deadline outcome itself.
+		stalls bool
+		run    func(t *testing.T, e env, root string) toolHookRun
+		check  func(t *testing.T, rows []map[string]any)
 	}{
-		{"stdin held open", func(t *testing.T, e env, root string) toolHookRun {
+		{"stdin held open", true, func(t *testing.T, e env, root string) toolHookRun {
 			r, w, err := os.Pipe()
 			if err != nil {
 				t.Fatal(err)
@@ -204,7 +213,7 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 				t.Fatalf("rows from an unfinished input: %v", rows)
 			}
 		}},
-		{"write blocks", func(t *testing.T, e env, root string) toolHookRun {
+		{"write blocks", false, func(t *testing.T, e env, root string) toolHookRun {
 			release := make(chan struct{})
 			t.Cleanup(func() { close(release) })
 			setToolLedger(t, &toolLedgerWrite, func(*os.File, []byte) error {
@@ -216,17 +225,17 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 			})
 			return runToolHook(t, e, "tool", post, nil)
 		}, nil},
-		{"write panics", func(t *testing.T, e env, root string) toolHookRun {
+		{"write panics", false, func(t *testing.T, e env, root string) toolHookRun {
 			setToolLedger(t, &toolLedgerWrite, func(*os.File, []byte) error { panic("disk on fire") })
 			return runToolHook(t, e, "tool", post, nil)
 		}, nil},
-		{"unwritable ledger directory", func(t *testing.T, e env, root string) toolHookRun {
+		{"unwritable ledger directory", false, func(t *testing.T, e env, root string) toolHookRun {
 			if err := os.WriteFile(root, []byte("not a directory"), 0600); err != nil {
 				t.Fatal(err)
 			}
 			return runToolHook(t, e, "tool", post, nil)
 		}, nil},
-		{"lock held elsewhere", func(t *testing.T, e env, root string) toolHookRun {
+		{"lock held elsewhere", false, func(t *testing.T, e env, root string) toolHookRun {
 			if err := os.MkdirAll(filepath.Join(root, e.agent), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -244,21 +253,21 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 				t.Fatalf("row written past a held lock = %v", rows)
 			}
 		}},
-		{"empty input", func(t *testing.T, e env, root string) toolHookRun {
+		{"empty input", false, func(t *testing.T, e env, root string) toolHookRun {
 			return runToolHook(t, e, "tool", "", nil)
 		}, func(t *testing.T, rows []map[string]any) {
 			if len(rows) != 1 || rows[0]["outcome"] != "unreadable" || rows[0]["oversize"] != nil {
 				t.Fatalf("rows = %v", rows)
 			}
 		}},
-		{"malformed input", func(t *testing.T, e env, root string) toolHookRun {
+		{"malformed input", false, func(t *testing.T, e env, root string) toolHookRun {
 			return runToolHook(t, e, "tool", `{"hook_event_name":"PreToolUse","tool_name":`, nil)
 		}, func(t *testing.T, rows []map[string]any) {
 			if len(rows) != 1 || rows[0]["outcome"] != "unreadable" || rows[0]["tool"] != "" {
 				t.Fatalf("rows = %v", rows)
 			}
 		}},
-		{"9 MiB input", func(t *testing.T, e env, root string) toolHookRun {
+		{"9 MiB input", false, func(t *testing.T, e env, root string) toolHookRun {
 			return runToolHook(t, e, "tool", toolPayload("PostToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Read", "tool_response": strings.Repeat("r", 9<<20)}), nil)
 		}, func(t *testing.T, rows []map[string]any) {
 			if len(rows) != 1 || rows[0]["outcome"] != "unreadable" || rows[0]["oversize"] != true || rows[0]["tool"] != "" {
@@ -269,6 +278,7 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var last result
+			deadline := toolLedgerDeadline
 			for attempt := 0; attempt < 3; attempt++ {
 				t.Run(strconv.Itoa(attempt), func(t *testing.T) {
 					e, root := toolLedgerSandbox(t)
@@ -281,16 +291,25 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 				if last.run.err != nil || last.run.out != "" {
 					t.Fatalf("hook = %v, output %q; want nil and no output", last.run.err, last.run.out)
 				}
-				if last.run.elapsed < toolLedgerBound {
-					break
+				if last.run.elapsed >= toolLedgerBound {
+					continue // a timing miss
 				}
+				if c.check == nil {
+					return
+				}
+				// Inside the bound. Only a hook that reached its deadline and
+				// left nothing has no row to judge; a row it did leave, and
+				// every row of a faster attempt, is checked in full.
+				if !c.stalls && last.run.elapsed >= deadline && len(last.rows) == 0 {
+					continue
+				}
+				c.check(t, last.rows)
+				return
 			}
 			if last.run.elapsed >= toolLedgerBound {
 				t.Fatalf("hook took %v three times; want under %v", last.run.elapsed, toolLedgerBound)
 			}
-			if c.check != nil {
-				c.check(t, last.rows)
-			}
+			t.Fatalf("no attempt in three left a row to check; the last reached the hook's %v deadline in %v and left none", deadline, last.run.elapsed)
 		})
 	}
 }
