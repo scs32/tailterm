@@ -742,10 +742,12 @@ func (s *Store) SetUsageWarning(ctx context.Context, task string, req api.UsageW
 // held. It runs inside the upload's transaction and never fails the upload
 // over a warning: each item's work sits in a savepoint that is rolled back
 // whole on any error, so the next new or revised turn tries again. Only a
-// cancelled context or a failing savepoint statement is returned.
-func (s *Store) warnTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string, items map[string]bool) error {
+// cancelled context or a failing savepoint statement is returned. It reports
+// whether it posted a notice, so the caller can notify event waiters once the
+// upload has committed.
+func (s *Store) warnTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string, items map[string]bool) (bool, error) {
 	if len(items) == 0 {
-		return nil
+		return false, nil
 	}
 	guarded := func(work func() error) error {
 		if _, err := tx.ExecContext(ctx, `SAVEPOINT usage_warning`); err != nil {
@@ -769,51 +771,58 @@ func (s *Store) warnTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string,
 		loaded = err == nil
 		return err
 	}); err != nil || !loaded {
-		return err
+		return false, err
 	}
 	if task.Status != api.TaskOpen {
 		// A closed project still takes late usage; it gets no new Board message.
-		return nil
+		return false, nil
 	}
 	ids := make([]string, 0, len(items))
 	for id := range items {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	posted := false
 	for _, id := range ids {
-		if err := guarded(func() error { return s.warnTokenBudget(ctx, tx, task, id) }); err != nil {
+		if err := guarded(func() error {
+			// A warning that fails is rolled back, so it posted nothing.
+			warned, err := s.warnTokenBudget(ctx, tx, task, id)
+			posted = posted || (warned && err == nil)
 			return err
+		}); err != nil {
+			return false, err
 		}
 	}
-	return nil
+	return posted, nil
 }
 
-// warnTokenBudget is one item's warning; its caller holds the savepoint.
-func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, item string) error {
+// warnTokenBudget is one item's warning; its caller holds the savepoint. It
+// reports whether it posted and recorded one.
+func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, item string) (bool, error) {
 	budget, actual, err := loadTokenBudgetActual(ctx, tx, task.ID, item)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if budget.Estimate == nil || budget.ActualState == "not measured" {
-		return nil
+		return false, nil
 	}
 	estimate := budget.Estimate.Tokens
 	threshold, level, _, err := usageWarningThreshold(ctx, tx, task.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Exact, and strictly greater: an item at the level has not passed it. A
 	// partial actual is a lower bound, so passing the level is still real.
 	if actual.Cmp(level.Mul(level, big.NewRat(estimate, 1))) <= 0 {
-		return nil
+		return false, nil
 	}
 	var warned int
 	err = tx.QueryRowContext(ctx, `SELECT 1 FROM usage_budget_warnings WHERE task_id=? AND item_id=? AND estimate_tokens=?`, task.ID, item, estimate).Scan(&warned)
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	// The exact running lead of the item, as the reply copy resolves it; no
 	// fallback to the project lead.
@@ -822,25 +831,25 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 		lead, err = api.Agent{}, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	helper, ok, err := currentOwnerHelper(ctx, tx, task.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
 		helper = api.Agent{}
 	}
 	if lead.ID == "" && helper.ID == "" {
-		return nil // no row: the next new or revised turn looks again
+		return false, nil // no row: the next new or revised turn looks again
 	}
 	var title, entry string
 	if err = tx.QueryRowContext(ctx, `SELECT title FROM work_items WHERE task_id=? AND id=?`, task.ID, item).Scan(&title); err != nil {
-		return err
+		return false, err
 	}
 	err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task.ID, item).Scan(&entry)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	refs := map[string]string{"item": item, "estimateTokens": strconv.FormatInt(estimate, 10), "actualTokens": budget.ActualTokens, "actualState": budget.ActualState, "ratio": budget.Ratio, "threshold": threshold}
 	bound, team := "", "No team is running it."
@@ -889,7 +898,7 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 	var leadSeq, helperSeq int64
 	if lead.ID != "" {
 		if leadSeq, err = post(lead); err != nil {
-			return err
+			return false, err
 		}
 	}
 	switch {
@@ -898,10 +907,10 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 		helperSeq = leadSeq
 	default:
 		if helperSeq, err = post(helper); err != nil {
-			return err
+			return false, err
 		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO usage_budget_warnings(task_id,item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, item, estimate, threshold, budget.ActualTokens, budget.ActualState, lead.ID, leadSeq, helper.ID, helperSeq, ts(s.now()))
-	return err
+	return err == nil, err
 }

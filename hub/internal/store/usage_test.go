@@ -1617,3 +1617,79 @@ func TestUsageWarningClosedProjectIsSilent(t *testing.T) {
 	f.use(0, 1)
 	f.want("reopened project", 1, 1, 1)
 }
+
+// A committed warning wakes event waiters, as any post does (review f1). An
+// upload that posts no warning leaves a waiter waiting, as before.
+func TestUsageWarningNotifiesEventWaiters(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	ctx := context.Background()
+	f.setEstimate(0, 1000)
+	waiting := func() bool {
+		f.s.mu.Lock()
+		defer f.s.mu.Unlock()
+		_, ok := f.s.waiters[f.task.ID]
+		return ok
+	}
+	type waited struct {
+		events []api.Event
+		took   time.Duration
+		err    error
+	}
+	// wait starts a long poll after the project's latest event and returns
+	// once it is parked on the store's change channel.
+	wait := func(limit time.Duration) chan waited {
+		t.Helper()
+		events, err := f.s.ListEvents(ctx, f.task.ID, 0, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after := int64(0)
+		if len(events) > 0 {
+			after = events[len(events)-1].Seq
+		}
+		done := make(chan waited, 1)
+		go func() {
+			start := time.Now()
+			got, err := f.s.WaitEvents(ctx, f.task.ID, after, 10, limit)
+			done <- waited{got, time.Since(start), err}
+		}()
+		for deadline := time.Now().Add(5 * time.Second); !waiting(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the event waiter never parked")
+			}
+		}
+		return done
+	}
+	quiet := wait(500 * time.Millisecond)
+	f.use(0, 1500)
+	if !waiting() {
+		t.Fatal("an upload that posted no warning woke the event waiter")
+	}
+	if got := <-quiet; got.err != nil || len(got.events) != 0 {
+		t.Fatalf("quiet upload: %+v", got)
+	}
+	f.want("at the level", 0, 0, 0)
+
+	woken := wait(30 * time.Second)
+	f.use(0, 1)
+	f.want("crossing", 1, 1, 1)
+	select {
+	case got := <-woken:
+		if got.err != nil || len(got.events) == 0 || got.took > 10*time.Second {
+			t.Fatalf("crossing upload: %d events after %s, %v", len(got.events), got.took, got.err)
+		}
+		messages := map[int64]bool{}
+		for _, e := range got.events {
+			if e.Kind == api.EventMessage {
+				if seq, ok := e.Data["seq"].(float64); ok {
+					messages[int64(seq)] = true
+				}
+			}
+		}
+		if lead, helper := f.notices(f.lead)[0].Seq, f.notices(f.helper)[0].Seq; !messages[lead] || !messages[helper] {
+			t.Fatalf("message events %v do not name notices %d and %d", messages, lead, helper)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the crossing upload did not wake the event waiter")
+	}
+}

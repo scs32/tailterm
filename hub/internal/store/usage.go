@@ -230,7 +230,8 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 			}
 		}
 	}
-	if err = s.warnTokenBudgets(ctx, tx, task, touched); err != nil {
+	warned, err := s.warnTokenBudgets(ctx, tx, task, touched)
+	if err != nil {
 		return zero, err
 	}
 	if err = storeUsageSpans(ctx, tx, task, agent, b.RunID, b.Spans, provenance); err != nil {
@@ -248,6 +249,10 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	}
 	if err = tx.Commit(); err != nil {
 		return api.UsageReceipt{}, err
+	}
+	if warned {
+		// A warning notice was committed: wake event waiters, as a post does.
+		s.notify(task)
 	}
 	return zero, nil
 }
