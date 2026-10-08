@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,7 +62,8 @@ Commands
   withdraw SEQ --reason T | --obligation ID --reason T  withdraw your own open request
   ack SEQ | progress SEQ [--text T]  acknowledge or record progress on an obligation
   reassign OBLIGATION_ID --to AGENT [--reason T]  move an open obligation (lead or owner)
-  inbox [--unread [--mark-read] [--wait 9m]] [--before N|--after N] [--seq N] [--limit N] [--json]
+  inbox [--unread [--mark-read] [--wait 9m]] [--board] [--before N|--after N] [--seq N] [--limit N] [--json]
+                               read Board history in pages: tt inbox --board --after N --limit 200, one call at a time; --seq is for one message
   context [--json]             print this exact run's bound work-item context
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
   owner intervene --task ID --kind K --item ID [--product-item ID] --text T  record an owner intervention
@@ -137,8 +139,29 @@ func (e env) client(timeout time.Duration) (*api.Client, error) {
 	c, err := api.NewClient(e.hub, max(timeout, minCommandTimeout))
 	if c != nil {
 		c.Token = e.token
+		if e.agent != "" {
+			c.HTTP.Transport = callerIdentityTransport{base: http.DefaultTransport, agent: e.agent, run: e.runID}
+		}
 	}
 	return c, err
+}
+
+// callerIdentityTransport names the agent run on every hub request, so the
+// hub bounds this run's requests by itself and not with every agent on the
+// host. A client without an agent (the relay, the owner's CLI) sends neither
+// header and is counted in the hub's reserved lane.
+type callerIdentityTransport struct {
+	base       http.RoundTripper
+	agent, run string
+}
+
+func (t callerIdentityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("X-Tailterm-Agent", t.agent)
+	if t.run != "" {
+		req.Header.Set("X-Tailterm-Run", t.run)
+	}
+	return t.base.RoundTrip(req)
 }
 
 func (e env) requireTask() (string, error) {
@@ -602,9 +625,15 @@ func cmdInbox(e env, args []string) error {
 	asJSON := fs.Bool("json", false, "JSON output")
 	limit := fs.Int("limit", 50, "maximum messages per page (at most 200)")
 	wait := fs.Duration("wait", 0, "with --unread, block up to this long (max 9m) until an unread message arrives")
-	seq := fs.Int64("seq", 0, "print message N in full")
+	seq := fs.Int64("seq", 0, "print message N in full (one message; page history with --board --after N)")
 	before := fs.Int64("before", 0, "only messages older than N")
 	after := fs.Int64("after", 0, "only messages newer than N, oldest first")
+	board := fs.Bool("board", false, "page the whole project Board, not only this agent's inbox; read-only, with --before/--after")
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "usage: tt inbox [--unread [--mark-read] [--wait 9m]] [--board] [--before N|--after N] [--seq N] [--limit N] [--json]")
+		fmt.Fprintln(fs.Output(), inboxHistoryHelp)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -614,6 +643,8 @@ func cmdInbox(e env, args []string) error {
 	switch {
 	case *seq < 0 || *before < 0 || *after < 0 || *limit < 1:
 		return &exitError{2, errors.New("--seq, --before and --after must not be negative, and --limit must be positive")}
+	case *board && (*unread || *mark || *wait > 0 || *seq > 0):
+		return &exitError{2, errors.New("--board pages the project Board read-only; it takes only --before, --after, --limit and --json")}
 	case *seq > 0 && (*unread || *mark || *wait > 0 || *before > 0 || *after > 0):
 		return &exitError{2, errors.New("--seq prints one message; it takes only --json")}
 	case *unread && (*before > 0 || *after > 0):
@@ -659,18 +690,27 @@ func cmdInbox(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	agents, err := c.ListAgents(ctx, task)
-	if err != nil {
-		return err
-	}
 	names := map[string]string{}
-	for _, a := range agents {
-		names[a.ID] = a.Name
+	// A JSON Board page prints no names, so it is exactly one hub request.
+	if !(*board && *asJSON) {
+		agents, err := c.ListAgents(ctx, task)
+		if err != nil {
+			return err
+		}
+		for _, a := range agents {
+			names[a.ID] = a.Name
+		}
 	}
 	if !*unread {
 		// Without --unread the newest page is shown, so recent messages are
 		// always reachable; --before/--after page from there.
 		page := api.MessagePageQuery{After: *after, Before: *before, To: e.agent, Newest: *after == 0 || *before > 0, Limit: *limit}
+		hint := "tt inbox"
+		if *board {
+			// A page without a recipient is the whole project Board: the hub
+			// narrows a page to the bound item only for a named recipient.
+			page.To, hint = "", "tt inbox --board"
+		}
 		msgs, err := c.ListMessagesPage(ctx, task, page)
 		if err != nil {
 			return err
@@ -687,9 +727,9 @@ func cmdInbox(e env, args []string) error {
 			fmt.Println("(no messages)")
 		case len(msgs) < *limit:
 		case page.Newest:
-			fmt.Printf("(older: tt inbox --before %d)\n", msgs[0].Seq)
+			fmt.Printf("(older: %s --before %d)\n", hint, msgs[0].Seq)
 		default:
-			fmt.Printf("(newer: tt inbox --after %d)\n", msgs[len(msgs)-1].Seq)
+			fmt.Printf("(newer: %s --after %d)\n", hint, msgs[len(msgs)-1].Seq)
 		}
 		return nil
 	}
@@ -785,6 +825,10 @@ func printInboxMessage(c *api.Client, task string, seq int64, asJSON bool) error
 	fmt.Println(formatMessage(msgs[0], names))
 	return nil
 }
+
+// inboxHistoryHelp is the one way to read Board history; the hub refuses a
+// loop of --seq reads and names this command.
+const inboxHistoryHelp = "read Board history in pages: tt inbox --board --after N --limit 200, one call at a time; --seq is for one message"
 
 // maxInboxWait stays under Claude Code's 10-minute shell command limit.
 const maxInboxWait = 9 * time.Minute

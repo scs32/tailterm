@@ -277,13 +277,211 @@ func productionTeamRunner() teamRunner {
 	}
 }
 
+// Slow queue listings (docs/project-overview.md, "Reading Board history").
+// A listing that times out starts an episode: the tick keeps acting on the
+// last good listing for the entries it already knows, tries a live listing
+// again only after a growing delay, and tells the owner helper once.
+const (
+	queueListingMaxAge     = 10 * time.Minute
+	queueListingRetryFirst = 6 * time.Second
+	queueListingRetryMax   = time.Minute
+	queueListingSlowTitle  = "Queue listing slow"
+)
+
+type queueListingAt struct {
+	list api.TeamQueueList
+	at   time.Time
+}
+
+type slowListingEpisode struct {
+	start, next time.Time
+	delay       time.Duration
+	cause       error
+	// noticed holds the projects whose owner helper was told in this episode.
+	noticed map[string]bool
+}
+
+// hubQueueListings is one hub's last good listings and its slow episode.
+type hubQueueListings struct {
+	mu      sync.Mutex
+	host    map[string]queueListingAt
+	active  map[string]queueListingAt
+	episode *slowListingEpisode
+}
+
+var (
+	queueListingsMu sync.Mutex
+	queueListings   = map[string]*hubQueueListings{}
+)
+
+func queueListingsFor(hub string) *hubQueueListings {
+	queueListingsMu.Lock()
+	defer queueListingsMu.Unlock()
+	hub = strings.TrimRight(hub, "/")
+	h := queueListings[hub]
+	if h == nil {
+		h = &hubQueueListings{host: map[string]queueListingAt{}, active: map[string]queueListingAt{}}
+		queueListings[hub] = h
+	}
+	return h
+}
+
+// resetQueueListings forgets every hub's listings and episodes.
+func resetQueueListings() {
+	queueListingsMu.Lock()
+	defer queueListingsMu.Unlock()
+	queueListings = map[string]*hubQueueListings{}
+}
+
+// queueListingTimedOut reports a listing that got no answer in time. Any
+// other failure is a hub answer and keeps its own handling.
+func queueListingTimedOut(err error) bool {
+	var timeout interface{ Timeout() bool }
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout())
+}
+
+// liveDue reports whether this tick may ask the hub for a listing.
+func (h *hubQueueListings) liveDue(now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.episode == nil || !now.Before(h.episode.next)
+}
+
+// timedOut starts or continues the episode and pushes the next live listing
+// out: six seconds first, doubling to a minute.
+func (h *hubQueueListings) timedOut(now time.Time, cause error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.episode == nil {
+		h.episode = &slowListingEpisode{start: now, noticed: map[string]bool{}}
+	}
+	ep := h.episode
+	ep.delay = min(max(2*ep.delay, queueListingRetryFirst), queueListingRetryMax)
+	ep.next, ep.cause = now.Add(ep.delay), cause
+}
+
+// recovered ends the episode after a tick whose listings all answered.
+func (h *hubQueueListings) recovered(now time.Time) {
+	h.mu.Lock()
+	ep := h.episode
+	h.episode = nil
+	h.mu.Unlock()
+	if ep != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue listing answers again after %s slow\n", now.Sub(ep.start).Round(time.Second))
+	}
+}
+
+// slowErr is what a tick reports when it has no listing young enough to use.
+func (h *hubQueueListings) slowErr() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.episode == nil {
+		return errors.New("team queue listing unavailable")
+	}
+	return fmt.Errorf("team queue listing timed out with no last good listing under %s old; next attempt in %s: %w", queueListingMaxAge, h.episode.delay, h.episode.cause)
+}
+
+func (h *hubQueueListings) save(kind map[string]queueListingAt, key string, list api.TeamQueueList, now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	kind[key] = queueListingAt{list: list, at: now}
+}
+
+// lastGood returns a saved listing young enough to act on.
+func (h *hubQueueListings) lastGood(kind map[string]queueListingAt, key string, now time.Time) (queueListingAt, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	saved, ok := kind[key]
+	if !ok || now.Sub(saved.at) > queueListingMaxAge {
+		delete(kind, key)
+		return queueListingAt{}, false
+	}
+	return saved, true
+}
+
+// noticeSlowListing tells the project's owner helper, once per episode, that
+// the relay is working from an old listing or from none. A failed post is
+// tried again on a later tick under the same request identity.
+func (r teamRunner) noticeSlowListing(ctx context.Context, c *api.Client, h *hubQueueListings, taskID, host string, used *queueListingAt, now time.Time) {
+	h.mu.Lock()
+	ep := h.episode
+	if ep == nil || ep.noticed[taskID] {
+		h.mu.Unlock()
+		return
+	}
+	start, cause := ep.start, ep.cause
+	h.mu.Unlock()
+	var helper api.Agent
+	if detail, err := c.GetTask(ctx, taskID); err == nil {
+		for _, a := range detail.Agents {
+			if a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.Status != api.AgentRetired {
+				helper = a
+			}
+		}
+	}
+	basis := "It has no last good listing under " + queueListingMaxAge.String() + " old, so this project's queue is not advanced until a listing answers."
+	if used != nil {
+		basis = fmt.Sprintf("It is acting on the last good listing, now %s old: launching and running teams still advance, and queued entries start only after a live listing.", now.Sub(used.at).Round(time.Second))
+	}
+	limit := "its time limit"
+	if c.HTTP != nil && c.HTTP.Timeout > 0 {
+		limit = "the " + c.HTTP.Timeout.String() + " limit"
+	}
+	notice := api.Envelope{Kind: api.EnvelopeKindNotice, To: helper.Name, Subject: queueListingSlowTitle,
+		Refs: map[string]string{"host": host, "project": taskID},
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("The relay on host %s got no answer to the team queue listing for project %s within %s (%v). %s It tries a live listing again after a delay that grows from %s to %s, and sends this once per slow episode. Look for one caller looping hub reads.",
+			host, taskID, limit, cause, basis, queueListingRetryFirst, queueListingRetryMax)}}
+	post := *c
+	if c.HTTP != nil {
+		marked := *c.HTTP
+		marked.Transport = relayAuthorTransport{base: c.HTTP.Transport}
+		post.HTTP = &marked
+	}
+	_, err := post.PostMessage(ctx, taskID, api.PostMessageRequest{Envelope: &notice, Text: api.RenderText(notice), To: helper.ID,
+		RequestID: fmt.Sprintf("queue-listing-slow-%s-%d", taskID, start.Unix())})
+	var response *api.HTTPError
+	if err != nil && (!errors.As(err, &response) || response.Status != 409) {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue project %s: slow listing notice: %v\n", taskID, err)
+		return
+	}
+	h.mu.Lock()
+	if h.episode == ep {
+		ep.noticed[taskID] = true
+	}
+	h.mu.Unlock()
+}
+
 func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string) error {
-	list, err := c.TeamQueueByHost(ctx, host)
-	if err != nil {
-		return err
+	now := r.clock()
+	listings := queueListingsFor(c.Base)
+	// live is whether this tick still asks the hub for listings. It is false
+	// between the attempts of a slow episode, and after the first timeout of
+	// this tick, so one tick waits out at most one slow listing.
+	live := listings.liveDue(now)
+	var list api.TeamQueueList
+	if live {
+		var err error
+		if list, err = c.TeamQueueByHost(ctx, host); err == nil {
+			listings.save(listings.host, host, list, now)
+		} else if !queueListingTimedOut(err) {
+			return err
+		} else {
+			listings.timedOut(now, err)
+			live = false
+		}
+	}
+	hostListed := live
+	if !hostListed {
+		saved, ok := listings.lastGood(listings.host, host, now)
+		if !ok {
+			return listings.slowErr()
+		}
+		list = saved.list
 	}
 	var hostBudgetErr error
-	if list.HostPolicy != nil && len(list.Entries) > 0 && r.census != nil {
+	// The census is a hub write from the listing's usage, so an old listing
+	// takes none; nothing new launches from one either.
+	if hostListed && list.HostPolicy != nil && len(list.Entries) > 0 && r.census != nil {
 		domain, domainErr := canonicalLimiterDomain(c.Base)
 		if domainErr != nil || domain != list.HostPolicy.LimiterDomain {
 			hostBudgetErr = errors.New("host policy limiter domain differs from relay hub")
@@ -307,15 +505,52 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	}
 	var projectErrors []error
 	for _, taskID := range projects {
-		queue, err := c.ListTeamQueuePage(ctx, taskID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
-		if err != nil {
-			projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
-			continue
+		var queue api.TeamQueueList
+		if live {
+			var err error
+			if queue, err = c.ListTeamQueuePage(ctx, taskID, api.TeamQueueListOptions{View: api.TeamQueueViewActive}); err == nil {
+				listings.save(listings.active, taskID, queue, now)
+			} else if !queueListingTimedOut(err) {
+				projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
+				continue
+			} else {
+				listings.timedOut(now, err)
+				live = false
+			}
+		}
+		// stale marks a project served from its last good listing.
+		stale := !live
+		if stale {
+			saved, ok := listings.lastGood(listings.active, taskID, now)
+			if !ok {
+				r.noticeSlowListing(ctx, c, listings, taskID, host, nil, now)
+				projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, listings.slowErr()))
+				continue
+			}
+			r.noticeSlowListing(ctx, c, listings, taskID, host, &saved, now)
+			queue = saved.list
 		}
 		parallel := queueParallel(queue.ConcurrencyLimit)
 		for _, q := range queue.Entries {
 			if q.Host != host {
 				continue
+			}
+			if stale {
+				// An old listing starts no launch, and names which teams are
+				// in progress, not their state: each is read again by itself,
+				// so the tick never acts on an entry that has since moved on.
+				if q.State != "launching" && q.State != "running" && q.State != "failed" {
+					continue
+				}
+				fresh, err := c.GetTeamQueueEntry(ctx, taskID, q.ID)
+				if err != nil {
+					projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
+					continue
+				}
+				if fresh.State == "queued" {
+					continue
+				}
+				q = fresh
 			}
 			if q.State != "launching" {
 				r.retries.drop(launchRetryKey(c.Base, q.TaskID, q.ID))
@@ -363,6 +598,11 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				break
 			}
 		}
+		if stale {
+			// Worktree cleanup, handler provisioning and stall notices all
+			// read the listing itself, so they wait for a live one.
+			continue
+		}
 		if r.worktrees != nil {
 			// Finished teams' worktrees go once their release lands. The
 			// cleanup is local: it logs and never fails the tick or entry.
@@ -382,11 +622,14 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		}
 		r.noticeStalls(ctx, c, queue, host)
 	}
-	if r.roundRobin {
+	if r.roundRobin && hostListed {
 		// A host census fault is local to new parallel launch effects. Returning
 		// it would activate the relay's global queue backoff and delay serial
 		// projects even though their own progress was safe.
 		reportTeamHostBudget(hostBudgetErr, time.Now())
+	}
+	if live {
+		listings.recovered(now)
 	}
 	return errors.Join(projectErrors...)
 }

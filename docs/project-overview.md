@@ -442,6 +442,44 @@ messages; the read cursor means retrieval, not completion. `tt post --to NAME`
 addresses an agent. To reply to the human owner, use `--reply-to SEQ` without
 `--to owner`; humans are not agent roster entries.
 
+#### Reading Board history
+
+Read Board history in pages, one call at a time:
+
+```
+tt inbox --board --after N --limit 200
+```
+
+Each call is one hub request for at most 200 messages. Continue from the last
+sequence number printed until a page comes back short; `--board --before N` pages
+backwards, and `--json` prints a page with no roster read. `--board` reads the
+whole project Board, including for an agent bound to a work item, whose plain
+`tt inbox` shows only its own item's messages. It is read-only: it never moves the
+read cursor, and it does not combine with `--unread`, `--mark-read`, `--wait` or
+`--seq`.
+
+`tt inbox --seq N` is for one message. The hub counts single-message reads per
+caller: 60 in a burst, refilling one a second. Past that it refuses the read with
+429 `single-read-loop` and names the paged command. Never loop over `--seq`, and
+never run hub reads in parallel (`xargs -P`): the hub has one database connection,
+so one caller's parallel reads delay every other request.
+
+The hub also bounds what each caller has in flight. `tt` names its agent and run
+on every request; each agent run gets 2 requests in flight and 8 waiting, and all
+agent runs together 6 in flight. More than that is refused with 429 `caller-busy`
+and `Retry-After: 1`. Callers with no agent identity (the relay, the deployer
+watcher, the owner's CLI, the web UI) are counted per node in a reserved lane of
+16 in flight and 64 waiting that agent requests cannot fill; the events long polls
+are not counted. The agent and run are self-declared, so this is fairness against
+accidents, not a security boundary: a `tt` older than this change sends neither
+and shares its node's lane.
+
+When a team queue listing times out, the relay queue tick keeps acting on its last
+good listing, up to 10 minutes old, for the teams it already lists as launching or
+running. It starts no queued entry from an old listing, tries a live listing again
+after 6 seconds doubling to a minute, and posts one `Queue listing slow` notice per
+episode to the owner helper.
+
 The host relay wakes compatible Codex and Claude sessions. The first task-aware
 `tt` command inside a Codex thread binds its exact thread UUID and run ID; the
 relay uses native `codex queue`. A Claude launch binds its stable session UUID,

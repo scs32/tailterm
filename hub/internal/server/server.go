@@ -25,10 +25,19 @@ type Server struct {
 	mux      *http.ServeMux
 	limiter  *limiter
 	logf     func(string, ...any)
+	// gate bounds the requests each caller may have in flight; singleReads
+	// bounds one caller's loop of single-message Board reads.
+	gate        *admission
+	singleReads *limiter
+	// admitted, when set by a test, runs while an admitted request holds its
+	// slot, so the test can keep that request in flight.
+	admitted func(key string, r *http.Request)
 }
 
 func New(st *store.Store, identity Identity) *Server {
-	s := &Server{store: st, identity: identity, mux: http.NewServeMux(), limiter: newLimiter(20, 40), logf: log.Printf}
+	s := &Server{store: st, identity: identity, mux: http.NewServeMux(), limiter: newLimiter(20, 40), logf: log.Printf, gate: newAdmission()}
+	s.singleReads = newLimiter(singleReadsPerSecond, singleReadBurst)
+	s.singleReads.maxKeys = singleReadMaxKeys
 	s.profileRoutes()
 	m := s.mux
 	m.HandleFunc("GET /v1/whoami", s.whoami)
@@ -205,10 +214,216 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.mux.ServeHTTP(w, r)
+	key, agentLane, ok := s.callerKey(r)
+	if _, pattern := s.mux.Handler(r); !ok || admissionExempt[pattern] {
+		// An unidentified request takes the handler's own 403. A long poll
+		// would pin a slot for its whole wait, so it is never counted.
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	release, held, err := s.gate.acquire(r.Context(), key, agentLane)
+	if err != nil {
+		if errors.Is(err, errCallerBusy) {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusTooManyRequests, api.ErrorResponse{Code: callerBusyCode,
+				Error: "this caller already has " + strconv.Itoa(held) + " hub requests in flight or waiting; run hub reads one at a time"})
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "the request ended while it waited for a hub slot")
+		return
+	}
+	defer release()
+	if s.admitted != nil {
+		s.admitted(key, r)
+	}
+	s.mux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, key)))
 }
 
 type ctxKey struct{}
+
+// Request admission. The store has one database connection, handed out in
+// arrival order, so what a caller may have in flight is its share of that
+// queue. An agent run that names itself gets a small share of a bounded agent
+// lane; every caller without an agent identity (the relay, the deployer
+// watcher, the owner's CLI, the web UI, the bridge) is counted per node in a
+// reserved lane that agent requests never fill. The headers are self-declared:
+// this is fairness against accidents, not a security boundary.
+const (
+	agentHeader = "X-Tailterm-Agent"
+	runHeader   = "X-Tailterm-Run"
+	maxRunBytes = 80
+
+	agentCallerInFlight = 2
+	agentCallerWaiting  = 8
+	agentLaneInFlight   = 6
+	nodeCallerInFlight  = 16
+	nodeCallerWaiting   = 64
+
+	callerBusyCode = "caller-busy"
+
+	singleReadBurst      = 60
+	singleReadsPerSecond = 1
+	singleReadMaxKeys    = 1024
+	singleReadLoopCode   = "single-read-loop"
+)
+
+var admissionExempt = map[string]bool{
+	"GET /v1/events":            true,
+	"GET /v1/tasks/{id}/events": true,
+}
+
+var errCallerBusy = errors.New("caller busy")
+
+// callerKey names who a request is counted against. ok is false when the
+// caller has no agent identity and its node cannot be resolved.
+func (s *Server) callerKey(r *http.Request) (key string, agentLane, ok bool) {
+	agent, run := r.Header.Get(agentHeader), r.Header.Get(runHeader)
+	if api.ValidID(agent, "agt") && run != "" && len(run) <= maxRunBytes {
+		return "agent:" + agent + "/" + run, true, true
+	}
+	c, err := s.identity(r)
+	if err != nil {
+		return "", false, false
+	}
+	return "node:" + c.Node, false, true
+}
+
+// requestCallerKey is the key ServeHTTP admitted this request under.
+func (s *Server) requestCallerKey(r *http.Request) string {
+	if key, ok := r.Context().Value(ctxKey{}).(string); ok {
+		return key
+	}
+	key, _, _ := s.callerKey(r)
+	return key
+}
+
+type admission struct {
+	mu sync.Mutex
+	// Limits; a test may lower them before the first request.
+	agentCaller, agentWaiting, agentTotal int
+	nodeCaller, nodeWaiting               int
+	callers                               map[string]*callerLoad
+	agentInFlight                         int
+	// queue holds every waiting request in arrival order.
+	queue []*admitWaiter
+}
+
+type callerLoad struct {
+	inFlight, waiting int
+	agentLane         bool
+}
+
+type admitWaiter struct {
+	key      string
+	load     *callerLoad
+	ready    chan struct{}
+	admitted bool
+}
+
+func newAdmission() *admission {
+	return &admission{agentCaller: agentCallerInFlight, agentWaiting: agentCallerWaiting, agentTotal: agentLaneInFlight,
+		nodeCaller: nodeCallerInFlight, nodeWaiting: nodeCallerWaiting, callers: map[string]*callerLoad{}}
+}
+
+// free reports whether one more request of this caller may run now.
+func (a *admission) free(l *callerLoad) bool {
+	if l.agentLane {
+		return l.inFlight < a.agentCaller && a.agentInFlight < a.agentTotal
+	}
+	return l.inFlight < a.nodeCaller
+}
+
+func (a *admission) start(l *callerLoad) {
+	l.inFlight++
+	if l.agentLane {
+		a.agentInFlight++
+	}
+}
+
+// acquire admits one request of the caller, waiting in arrival order for a
+// slot. When the caller's waiting room is full it returns errCallerBusy and
+// how many requests that caller already holds.
+func (a *admission) acquire(ctx context.Context, key string, agentLane bool) (release func(), held int, err error) {
+	a.mu.Lock()
+	l := a.callers[key]
+	if l == nil {
+		l = &callerLoad{agentLane: agentLane}
+		a.callers[key] = l
+	}
+	if l.waiting == 0 && a.free(l) {
+		a.start(l)
+		a.mu.Unlock()
+		return func() { a.release(key, l) }, 0, nil
+	}
+	room := a.nodeWaiting
+	if agentLane {
+		room = a.agentWaiting
+	}
+	if l.waiting >= room {
+		held = l.inFlight + l.waiting
+		a.mu.Unlock()
+		return nil, held, errCallerBusy
+	}
+	w := &admitWaiter{key: key, load: l, ready: make(chan struct{})}
+	l.waiting++
+	a.queue = append(a.queue, w)
+	a.mu.Unlock()
+	select {
+	case <-w.ready:
+		return func() { a.release(key, l) }, 0, nil
+	case <-ctx.Done():
+	}
+	a.mu.Lock()
+	if w.admitted {
+		a.mu.Unlock()
+		a.release(key, l)
+		return nil, 0, ctx.Err()
+	}
+	for i, queued := range a.queue {
+		if queued == w {
+			a.queue = append(a.queue[:i], a.queue[i+1:]...)
+			break
+		}
+	}
+	l.waiting--
+	a.drop(key, l)
+	a.mu.Unlock()
+	return nil, 0, ctx.Err()
+}
+
+func (a *admission) release(key string, l *callerLoad) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	l.inFlight--
+	if l.agentLane {
+		a.agentInFlight--
+	}
+	// Admit in arrival order every waiter whose caller and lane now have room;
+	// a caller at its own cap is passed over, not allowed to block the rest.
+	kept := a.queue[:0]
+	for _, w := range a.queue {
+		if a.free(w.load) {
+			w.load.waiting--
+			a.start(w.load)
+			w.admitted = true
+			close(w.ready)
+			continue
+		}
+		kept = append(kept, w)
+	}
+	for i := len(kept); i < len(a.queue); i++ {
+		a.queue[i] = nil
+	}
+	a.queue = kept
+	a.drop(key, l)
+}
+
+// drop forgets an idle caller so the map does not grow with past runs.
+func (a *admission) drop(key string, l *callerLoad) {
+	if l.inFlight == 0 && l.waiting == 0 && a.callers[key] == l {
+		delete(a.callers, key)
+	}
+}
 
 func (s *Server) caller(w http.ResponseWriter, r *http.Request) (api.Caller, bool) {
 	c, err := s.identity(r)
@@ -1009,6 +1224,14 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 		page.Before = before
 	}
 	page.Newest = r.URL.Query().Get("latest") == "1"
+	// One message at a time is the costly way to read Board history: a loop of
+	// such reads is refused and pointed at the paged read.
+	if page.Limit == 1 && to == "" && !page.Newest && !s.singleReads.allow(s.requestCallerKey(r)) {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, api.ErrorResponse{Code: singleReadLoopCode,
+			Error: "too many single-message reads from one caller; page Board history with: tt inbox --board --after N --limit 200"})
+		return
+	}
 	if r.URL.Query().Get("directed") == "1" {
 		if to == "" {
 			writeError(w, http.StatusBadRequest, "directed requires to")
@@ -1134,6 +1357,8 @@ type limiter struct {
 	rate    float64
 	burst   float64
 	buckets map[string]*bucket
+	// maxKeys, when positive, prunes refilled buckets once the map passes it.
+	maxKeys int
 }
 
 type bucket struct {
@@ -1151,6 +1376,13 @@ func (l *limiter) allow(key string) bool {
 	now := time.Now()
 	b, ok := l.buckets[key]
 	if !ok {
+		if l.maxKeys > 0 && len(l.buckets) >= l.maxKeys {
+			for k, idle := range l.buckets {
+				if idle.tokens+now.Sub(idle.last).Seconds()*l.rate >= l.burst {
+					delete(l.buckets, k)
+				}
+			}
+		}
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[key] = b
 	}

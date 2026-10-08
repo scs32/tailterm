@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +26,7 @@ type client struct {
 	srv *httptest.Server
 	st  *store.Store
 	who api.Caller
+	s   *Server
 }
 
 func newClient(t *testing.T) *client {
@@ -39,6 +43,7 @@ func newClient(t *testing.T) *client {
 		}
 		return c.who, nil
 	})
+	c.s = s
 	c.srv = httptest.NewServer(s)
 	t.Cleanup(c.srv.Close)
 	return c
@@ -451,4 +456,315 @@ func syntheticServerTestContext(t *testing.T, item api.WorkItem, order api.Messa
 		t.Fatal(err)
 	}
 	return data
+}
+
+// getAs reads path as one agent run (or with no agent identity when agent is
+// empty) and returns the status, the response headers and the decoded error.
+func (c *client) getAs(agent, run, path string, out any) (int, http.Header, api.ErrorResponse) {
+	req, err := http.NewRequest("GET", c.srv.URL+path, nil)
+	if err != nil {
+		c.t.Error(err)
+		return 0, nil, api.ErrorResponse{}
+	}
+	if agent != "" {
+		req.Header.Set(agentHeader, agent)
+		req.Header.Set(runHeader, run)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Error(err)
+		return 0, nil, api.ErrorResponse{}
+	}
+	defer res.Body.Close()
+	var refusal api.ErrorResponse
+	if res.StatusCode >= 400 {
+		_ = json.NewDecoder(res.Body).Decode(&refusal)
+	} else if out != nil {
+		_ = json.NewDecoder(res.Body).Decode(out)
+	}
+	// Drain so a flood reuses its connections instead of opening new ones.
+	_, _ = io.Copy(io.Discard, res.Body)
+	return res.StatusCode, res.Header, refusal
+}
+
+// gateLoad reads one caller's in-flight and waiting counts.
+func (c *client) gateLoad(key string) (inFlight, waiting int) {
+	c.s.gate.mu.Lock()
+	defer c.s.gate.mu.Unlock()
+	if l := c.s.gate.callers[key]; l != nil {
+		return l.inFlight, l.waiting
+	}
+	return 0, 0
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestCallerFloodLeavesOtherCallerServed(t *testing.T) {
+	c := newClient(t)
+	task := c.task("flood")
+	flooder, other := c.agent(task, "flooder"), c.agent(task, "other")
+	floodKey := "agent:" + flooder.ID + "/run_flood"
+	var peak atomic.Int64
+	c.s.admitted = func(key string, _ *http.Request) {
+		if key != floodKey {
+			return
+		}
+		inFlight, _ := c.gateLoad(key)
+		for {
+			seen := peak.Load()
+			if int64(inFlight) <= seen || peak.CompareAndSwap(seen, int64(inFlight)) {
+				break
+			}
+		}
+		// Each flood read is slow, as on a busy database connection.
+		time.Sleep(5 * time.Millisecond)
+	}
+	path := "/v1/tasks/" + task.ID + "/messages?after=0&limit=50"
+	stop := make(chan struct{})
+	var served, refused atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				code, _, refusal := c.getAs(flooder.ID, "run_flood", path, nil)
+				switch {
+				case code == 200:
+					served.Add(1)
+				case code == 429 && refusal.Code == callerBusyCode:
+					refused.Add(1)
+				default:
+					t.Errorf("flood read: %d %+v", code, refusal)
+					return
+				}
+			}
+		}()
+	}
+	waitUntil(t, "the flood to fill its share", func() bool { return peak.Load() == agentCallerInFlight && refused.Load() > 0 })
+	var slowest time.Duration
+	for i := 0; i < 20; i++ {
+		started := time.Now()
+		code, _, refusal := c.getAs(other.ID, "run_other", path, nil)
+		took := time.Since(started)
+		slowest = max(slowest, took)
+		if code != 200 || took > 2*time.Second {
+			t.Fatalf("other caller request %d during the flood: %d %+v in %s", i, code, refusal, took)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if got := peak.Load(); got != agentCallerInFlight {
+		t.Fatalf("flood peak in flight = %d, want %d", got, agentCallerInFlight)
+	}
+	if served.Load() == 0 || refused.Load() == 0 {
+		t.Fatalf("flood served %d, refused %d: want both", served.Load(), refused.Load())
+	}
+	if inFlight, waiting := c.gateLoad(floodKey); inFlight != 0 || waiting != 0 {
+		t.Fatalf("flood left %d in flight and %d waiting", inFlight, waiting)
+	}
+	t.Logf("flood served %d and refused %d; the other caller's slowest request took %s", served.Load(), refused.Load(), slowest)
+}
+
+func TestCallerBusyRefusalNamesReason(t *testing.T) {
+	c := newClient(t)
+	task := c.task("busy")
+	a := c.agent(task, "busy")
+	key := "agent:" + a.ID + "/run_one"
+	hold := make(chan struct{})
+	c.s.admitted = func(admittedKey string, _ *http.Request) {
+		if admittedKey == key {
+			<-hold
+		}
+	}
+	path := "/v1/tasks/" + task.ID + "/agents"
+	codes := make(chan int, agentCallerInFlight+agentCallerWaiting)
+	send := func() {
+		code, _, _ := c.getAs(a.ID, "run_one", path, nil)
+		codes <- code
+	}
+	for i := 0; i < agentCallerInFlight; i++ {
+		go send()
+	}
+	waitUntil(t, "two requests in flight", func() bool { inFlight, _ := c.gateLoad(key); return inFlight == agentCallerInFlight })
+	for i := 0; i < agentCallerWaiting; i++ {
+		go send()
+	}
+	waitUntil(t, "eight requests waiting", func() bool { _, waiting := c.gateLoad(key); return waiting == agentCallerWaiting })
+	if inFlight, _ := c.gateLoad(key); inFlight != agentCallerInFlight {
+		t.Fatalf("in flight = %d with a full waiting room, want %d", inFlight, agentCallerInFlight)
+	}
+	code, header, refusal := c.getAs(a.ID, "run_one", path, nil)
+	if code != 429 || refusal.Code != callerBusyCode || header.Get("Retry-After") != "1" ||
+		refusal.Error != "this caller already has 10 hub requests in flight or waiting; run hub reads one at a time" {
+		t.Fatalf("eleventh request: %d retry-after=%q %+v", code, header.Get("Retry-After"), refusal)
+	}
+	// Another run of the same agent is another caller.
+	if code, _, refusal := c.getAs(a.ID, "run_two", path, nil); code != 200 {
+		t.Fatalf("a different run of the agent: %d %+v", code, refusal)
+	}
+	close(hold)
+	for i := 0; i < agentCallerInFlight+agentCallerWaiting; i++ {
+		if code := <-codes; code != 200 {
+			t.Fatalf("held or waiting request finished with %d", code)
+		}
+	}
+	if n := len(c.s.gate.callers); n != 0 {
+		t.Fatalf("%d idle callers kept after every request finished", n)
+	}
+}
+
+func TestReservedLaneServedWhileAgentLaneFull(t *testing.T) {
+	c := newClient(t)
+	task := c.task("lanes")
+	path := "/v1/tasks/" + task.ID + "/agents"
+	hold := make(chan struct{})
+	c.s.admitted = func(key string, _ *http.Request) {
+		if strings.HasPrefix(key, "agent:") {
+			<-hold
+		}
+	}
+	held := agentLaneInFlight / agentCallerInFlight
+	codes := make(chan int, agentLaneInFlight+1)
+	var agents []api.Agent
+	for i := 0; i <= held; i++ {
+		agents = append(agents, c.agent(task, fmt.Sprintf("agent%d", i)))
+	}
+	for _, a := range agents[:held] {
+		for i := 0; i < agentCallerInFlight; i++ {
+			go func() {
+				code, _, _ := c.getAs(a.ID, "run_held", path, nil)
+				codes <- code
+			}()
+		}
+	}
+	lane := func() int {
+		c.s.gate.mu.Lock()
+		defer c.s.gate.mu.Unlock()
+		return c.s.gate.agentInFlight
+	}
+	waitUntil(t, "every agent slot held", func() bool { return lane() == agentLaneInFlight })
+	// One more agent run has room of its own but none in the lane: it waits.
+	last := agents[held]
+	lastKey := "agent:" + last.ID + "/run_late"
+	go func() {
+		code, _, _ := c.getAs(last.ID, "run_late", path, nil)
+		codes <- code
+	}()
+	waitUntil(t, "a seventh agent request to wait", func() bool { _, waiting := c.gateLoad(lastKey); return waiting == 1 })
+	within := func(what, agent, run, target string) {
+		t.Helper()
+		started := time.Now()
+		code, _, refusal := c.getAs(agent, run, target, nil)
+		if took := time.Since(started); code != 200 || took > 2*time.Second {
+			t.Fatalf("%s with the agent lane full: %d %+v in %s", what, code, refusal, took)
+		}
+	}
+	// A caller with no agent identity (the relay, the deployer watcher, the
+	// owner) is served from the reserved lane.
+	within("a request without agent headers", "", "", path)
+	within("a team queue listing without agent headers", "", "", "/v1/tasks/"+task.ID+"/team-queue?view=active")
+	// Events routes are long polls: they are never counted, even for an agent.
+	within("global events from a waiting agent", last.ID, "run_late", "/v1/events?after=0")
+	within("task events from a holding agent", agents[0].ID, "run_held", "/v1/tasks/"+task.ID+"/events?after=0")
+	if got := lane(); got != agentLaneInFlight {
+		t.Fatalf("agent lane holds %d after the exempt and reserved requests, want %d", got, agentLaneInFlight)
+	}
+	if inFlight, waiting := c.gateLoad("node:" + c.who.Node); inFlight != 0 || waiting != 0 {
+		t.Fatalf("reserved lane kept %d in flight and %d waiting", inFlight, waiting)
+	}
+	close(hold)
+	for i := 0; i < agentLaneInFlight+1; i++ {
+		if code := <-codes; code != 200 {
+			t.Fatalf("held or waiting agent request finished with %d", code)
+		}
+	}
+}
+
+func TestSingleMessageReadLoopRefused(t *testing.T) {
+	c := newClient(t)
+	task := c.task("history")
+	a, b := c.agent(task, "looper"), c.agent(task, "bystander")
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/messages", api.PostMessageRequest{Text: "one"}, nil); code != 201 {
+		t.Fatalf("post: %d", code)
+	}
+	if singleReadBurst != 60 || singleReadsPerSecond != 1 {
+		t.Fatalf("single-read bound is %d in a burst refilling %d a second, want 60 and 1", singleReadBurst, singleReadsPerSecond)
+	}
+	// Stop the refill so a slow host cannot earn a read back mid-burst.
+	c.s.singleReads.rate = 0
+	single := "/v1/tasks/" + task.ID + "/messages?after=0&limit=1"
+	for i := 1; i <= singleReadBurst; i++ {
+		var page api.MessageList
+		if code, _, refusal := c.getAs(a.ID, "run_loop", single, &page); code != 200 || len(page.Messages) != 1 {
+			t.Fatalf("single read %d: %d %+v %+v", i, code, refusal, page)
+		}
+	}
+	code, header, refusal := c.getAs(a.ID, "run_loop", single, nil)
+	if code != 429 || refusal.Code != singleReadLoopCode || header.Get("Retry-After") != "1" ||
+		!strings.Contains(refusal.Error, "tt inbox --board --after N --limit 200") {
+		t.Fatalf("read 61 of the burst: %d retry-after=%q %+v", code, header.Get("Retry-After"), refusal)
+	}
+	// The paged read stays open to the refused caller, as do reads that are
+	// not a walk of the Board: its own inbox and the newest message.
+	for _, query := range []string{"after=0&limit=200", "after=0&limit=1&to=" + a.ID, "limit=1&latest=1"} {
+		var page api.MessageList
+		if code, _, refusal := c.getAs(a.ID, "run_loop", "/v1/tasks/"+task.ID+"/messages?"+query, &page); code != 200 || len(page.Messages) != 1 {
+			t.Fatalf("read %q after the refusal: %d %+v %+v", query, code, refusal, page)
+		}
+	}
+	// Another agent run, and a caller with no agent identity, have their own bound.
+	if code, _, refusal := c.getAs(b.ID, "run_other", single, nil); code != 200 {
+		t.Fatalf("another caller's single read: %d %+v", code, refusal)
+	}
+	if code, _, refusal := c.getAs("", "", single, nil); code != 200 {
+		t.Fatalf("a single read without agent headers: %d %+v", code, refusal)
+	}
+}
+
+func TestMessagesWithoutRecipientReturnWholeBoard(t *testing.T) {
+	c := newClient(t)
+	task := c.task("board")
+	a, b, reader := c.agent(task, "a"), c.agent(task, "b"), c.agent(task, "reader")
+	post := func(req api.PostMessageRequest) {
+		t.Helper()
+		if code := c.do("POST", "/v1/tasks/"+task.ID+"/messages", req, nil); code != 201 {
+			t.Fatalf("post %q: %d", req.Text, code)
+		}
+	}
+	post(api.PostMessageRequest{Text: "for everyone", AgentID: a.ID})
+	post(api.PostMessageRequest{Text: "just for b", AgentID: a.ID, To: b.ID})
+	post(api.PostMessageRequest{Text: "just for the reader", AgentID: a.ID, To: reader.ID})
+	texts := func(query string) string {
+		t.Helper()
+		var page api.MessageList
+		if code, _, refusal := c.getAs(reader.ID, "run_reader", "/v1/tasks/"+task.ID+"/messages?after=0&limit=200"+query, &page); code != 200 {
+			t.Fatalf("read %q: %d %+v", query, code, refusal)
+		}
+		var out []string
+		for _, m := range page.Messages {
+			out = append(out, m.Text)
+		}
+		return strings.Join(out, "|")
+	}
+	if got := texts(""); got != "for everyone|just for b|just for the reader" {
+		t.Fatalf("read without a recipient = %q, want the whole Board", got)
+	}
+	if got := texts("&to=" + reader.ID); got != "for everyone|just for the reader" {
+		t.Fatalf("read with a recipient = %q, want the reader's own view", got)
+	}
 }

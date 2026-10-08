@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -495,6 +497,168 @@ func TestCloseStillRefusesAvailableHandlerAndPersistentRoles(t *testing.T) {
 					t.Fatalf("refused close changed the agent: status %s -> %s, session alive %v", status, got, f.sessionAlive(a))
 				}
 			})
+		}
+	}
+}
+
+func TestClientSendsAgentAndRunHeaders(t *testing.T) {
+	var seen []http.Header
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Clone())
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"node":"n","user":"u"}`)
+	}))
+	t.Cleanup(hub.Close)
+	whoami := func(e env, budget bool) http.Header {
+		t.Helper()
+		c, err := e.client(time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if budget {
+			attachRelayBudget(c, new(relayRateBudget))
+		}
+		seen = nil
+		if _, err := c.Whoami(context.Background()); err != nil || len(seen) != 1 {
+			t.Fatalf("whoami: %v, %d requests", err, len(seen))
+		}
+		return seen[0]
+	}
+	bound := env{hub: hub.URL, token: "secret", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	for _, budget := range []bool{false, true} {
+		h := whoami(bound, budget)
+		if h.Get("X-Tailterm-Agent") != bound.agent || h.Get("X-Tailterm-Run") != bound.runID || h.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("agent client (relay budget %v) sent agent %q, run %q, authorization %q", budget, h.Get("X-Tailterm-Agent"), h.Get("X-Tailterm-Run"), h.Get("Authorization"))
+		}
+	}
+	// The relay and the owner's CLI have no agent: they send neither header,
+	// even with a run in the environment, and land in the hub's reserved lane.
+	for _, e := range []env{{hub: hub.URL}, {hub: hub.URL, runID: "run_0123456789abcdef"}} {
+		for _, budget := range []bool{false, true} {
+			h := whoami(e, budget)
+			if _, ok := h["X-Tailterm-Agent"]; ok {
+				t.Fatalf("client without an agent sent an agent header: %v", h)
+			}
+			if _, ok := h["X-Tailterm-Run"]; ok {
+				t.Fatalf("client without an agent sent a run header: %v", h)
+			}
+		}
+	}
+}
+
+func TestInboxBoardPagesProjectHistoryOneCallPerPage(t *testing.T) {
+	h := newInboxHub(t)
+	e, bound, _, _ := h.bind(t, "history-bound")
+	// A second listener on the same store records every hub request tt makes.
+	type call struct{ method, path, query, agent, run string }
+	var calls []call
+	inner := server.New(h.st, func(*http.Request) (api.Caller, error) { return h.by, nil })
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, call{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Tailterm-Agent"), r.Header.Get("X-Tailterm-Run")})
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(hub.Close)
+	e.hub = hub.URL
+	before, err := h.c.GetAgent(context.Background(), e.task, e.agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 450 Board messages that are not linked to the bound agent's item.
+	history := h.post(t, api.PostMessageRequest{Text: "project history", AgentID: h.lead.ID}, 450)
+	start := history[0].Seq - 1
+
+	// The agent's own inbox is narrowed to its item, which is why a paged
+	// read of project history needs --board.
+	out, err := captureStdout(t, func() error {
+		return cmdInbox(e, []string{"--json", "--after", fmt.Sprint(start), "--limit", "200"})
+	})
+	var own []api.Message
+	if err != nil || json.Unmarshal([]byte(out), &own) != nil || len(own) != 0 {
+		t.Fatalf("item-bound inbox page = %d messages, %v; want none of the unlinked history", len(own), err)
+	}
+
+	calls = nil
+	var read []api.Message
+	after, pages := start, 0
+	for {
+		out, err := captureStdout(t, func() error {
+			return cmdInbox(e, []string{"--board", "--json", "--after", fmt.Sprint(after), "--limit", "200"})
+		})
+		var page []api.Message
+		if err != nil || json.Unmarshal([]byte(out), &page) != nil {
+			t.Fatalf("board page after #%d: %v\n%s", after, err, out)
+		}
+		pages++
+		read = append(read, page...)
+		if len(page) < 200 {
+			break
+		}
+		after = page[len(page)-1].Seq
+	}
+	if pages != 3 || len(read) != 450 || read[0].Seq != history[0].Seq || read[449].Seq != history[449].Seq {
+		t.Fatalf("read %d messages in %d pages, want 450 in 3", len(read), pages)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("450 messages took %d hub requests, want 3: %+v", len(calls), calls)
+	}
+	for _, c := range calls {
+		query, err := url.ParseQuery(c.query)
+		if err != nil || c.method != "GET" || c.path != "/v1/tasks/"+e.task+"/messages" || query.Has("to") || query.Get("limit") != "200" {
+			t.Fatalf("board page request = %+v, want one GET of 200 messages without a recipient", c)
+		}
+		if c.agent != e.agent || c.run != e.runID {
+			t.Fatalf("board page request named agent %q run %q, want %q %q", c.agent, c.run, e.agent, e.runID)
+		}
+	}
+	// Read-only: the read cursor and unread count did not move.
+	got, err := h.c.GetAgent(context.Background(), e.task, e.agent)
+	if err != nil || got.ReadUpTo != before.ReadUpTo || got.ID != bound.ID {
+		t.Fatalf("read cursor = %d after board paging, %v; want %d", got.ReadUpTo, err, before.ReadUpTo)
+	}
+
+	// Text pages keep the flag in their paging hints, and a range before N works.
+	out, err = captureStdout(t, func() error {
+		return cmdInbox(e, []string{"--board", "--after", fmt.Sprint(start), "--limit", "200"})
+	})
+	if want := fmt.Sprintf("(newer: tt inbox --board --after %d)", history[199].Seq); err != nil || !strings.Contains(out, want) {
+		t.Fatalf("board text page: %v, want the hint %q in\n%s", err, want, out[max(0, len(out)-300):])
+	}
+	out, err = captureStdout(t, func() error {
+		return cmdInbox(e, []string{"--board", "--before", fmt.Sprint(history[449].Seq), "--limit", "200"})
+	})
+	if want := fmt.Sprintf("(older: tt inbox --board --before %d)", history[249].Seq); err != nil || !strings.Contains(out, want) {
+		t.Fatalf("board text page before: %v, want the hint %q in\n%s", err, want, out[max(0, len(out)-300):])
+	}
+}
+
+func TestInboxHelpNamesPagedHistory(t *testing.T) {
+	const sentence = "read Board history in pages: tt inbox --board --after N --limit 200, one call at a time; --seq is for one message"
+	const synopsis = "inbox [--unread [--mark-read] [--wait 9m]] [--board] [--before N|--after N] [--seq N] [--limit N] [--json]"
+	if !strings.Contains(usage, "  "+synopsis+"\n") || !strings.Contains(usage, sentence+"\n") {
+		t.Fatalf("usage does not name --board and the paged-history sentence:\n%s", usage)
+	}
+	var help strings.Builder
+	restore := captureStderr(t, &help)
+	err := cmdInbox(env{}, []string{"-h"})
+	restore()
+	if err != nil {
+		t.Fatalf("inbox -h: %v", err)
+	}
+	for _, want := range []string{"usage: tt " + synopsis, sentence, "-board", "page the whole project Board", "print message N in full (one message; page history with --board --after N)"} {
+		if !strings.Contains(help.String(), want) {
+			t.Errorf("inbox -h does not contain %q:\n%s", want, help.String())
+		}
+	}
+	// --board is a read-only page: it refuses the cursor and single-message
+	// flags before it reaches a hub.
+	for _, args := range [][]string{{"--board", "--unread"}, {"--board", "--unread", "--mark-read"}, {"--board", "--mark-read"}, {"--board", "--wait", "1s"}, {"--board", "--unread", "--wait", "1s"}, {"--board", "--seq", "7"}} {
+		var stderr strings.Builder
+		restore := captureStderr(t, &stderr)
+		err := cmdInbox(env{}, args)
+		restore()
+		var exit *exitError
+		if !errors.As(err, &exit) || exit.code != 2 || !strings.Contains(err.Error(), "--board") {
+			t.Errorf("inbox %v = %v, want exit 2 naming --board", args, err)
 		}
 	}
 }

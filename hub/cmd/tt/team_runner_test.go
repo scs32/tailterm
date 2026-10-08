@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2029,5 +2030,317 @@ func TestTeamRunnerFrozenLaunchFollowsDeadPrimaryHandoff(t *testing.T) {
 				t.Fatalf("members were briefed with handler %v, want the successor %s", handlerFlags, successor.ID)
 			}
 		})
+	}
+}
+
+// slowListingHub serves a fixture's store through a hub whose team queue
+// listings can stop answering. A slow listing is held until its caller gives
+// up, and the client gives a listing a short time limit while the hub is
+// slow, so the runner meets a real timed-out request without a real wait.
+type slowListingHub struct {
+	e          env
+	c          *api.Client
+	task       string
+	slowActive atomic.Bool
+	slowHost   atomic.Bool
+	mu         sync.Mutex
+	active     int
+	host       int
+}
+
+func (h *slowListingHub) slow(r *http.Request) bool {
+	if r.Method != "GET" {
+		return false
+	}
+	return (h.slowActive.Load() && r.URL.Path == "/v1/tasks/"+h.task+"/team-queue") || (h.slowHost.Load() && r.URL.Path == "/v1/team-queues")
+}
+
+func (h *slowListingHub) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !h.slow(r) {
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
+	defer cancel()
+	return http.DefaultTransport.RoundTrip(r.WithContext(ctx))
+}
+
+// listings reports how many active and host listings reached the hub.
+func (h *slowListingHub) listings() (active, host int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active, h.host
+}
+
+func newSlowListingHub(t *testing.T, f teamFixture) *slowListingHub {
+	t.Helper()
+	resetQueueListings()
+	t.Cleanup(resetQueueListings)
+	h := &slowListingHub{task: f.task.ID}
+	inner := server.New(f.st, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "team-fixture", User: "owner"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			h.mu.Lock()
+			switch r.URL.Path {
+			case "/v1/tasks/" + h.task + "/team-queue":
+				h.active++
+			case "/v1/team-queues":
+				h.host++
+			}
+			h.mu.Unlock()
+		}
+		if h.slow(r) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(30 * time.Second):
+			}
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 20*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.HTTP.Transport = h
+	h.e, h.c = env{hub: srv.URL, task: f.task.ID}, c
+	return h
+}
+
+// slowListingNotices lists the project's slow listing notices in order.
+func slowListingNotices(t *testing.T, f teamFixture) []api.Message {
+	t.Helper()
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == queueListingSlowTitle {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// wi_765e7089fd176b08 f3: a timed-out active listing does not blind the tick.
+// It advances a running team from the last good listing, tries the listing
+// again only after a growing delay, and tells the owner helper once per
+// episode.
+func TestTeamRunnerSlowListingReusesLastGoodAndNoticesOnce(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "slow-listing-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "slow-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	tick := func(what string) {
+		t.Helper()
+		if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	entry := func() api.TeamQueueEntry {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	// Two live ticks: the first launches the team, the second lists it running.
+	tick("launch tick")
+	tick("running tick")
+	if got := entry(); got.State != "running" || len(got.CloseJSON) != 0 {
+		t.Fatalf("entry before the slow episode: %s, close frozen %v", got.State, len(got.CloseJSON) != 0)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lead, helper api.Agent
+	for _, a := range detail.Agents {
+		switch {
+		case a.Name == "correction-lead-0":
+			lead = a
+		case a.Role == api.AgentRoleOwnerHelper:
+			helper = a
+		}
+	}
+	if lead.ID == "" || helper.ID == "" {
+		t.Fatalf("lead %q or owner helper %q missing", lead.ID, helper.ID)
+	}
+	// The item ends while the lead still owes a reply, so the next step of
+	// the running team is to freeze its close and wait.
+	terminal := "dismissed"
+	if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "confirm delivery", To: lead.ID, RequestID: "slow-owner-request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	obligations, err := f.c.ListObligationsFrom(ctx, f.task.ID, lead.ID, msg.Seq, msg.Seq)
+	if err != nil || len(obligations) != 1 {
+		t.Fatalf("obligation %+v %v", obligations, err)
+	}
+
+	// Episode one: the active listing stops answering.
+	activeBefore, hostBefore := hub.listings()
+	hub.slowActive.Store(true)
+	tick("first slow tick")
+	if got := entry(); got.State != "running" || len(got.CloseJSON) == 0 {
+		t.Fatalf("the slow tick did not advance the running entry from the last good listing: %s, close frozen %v", got.State, len(got.CloseJSON) != 0)
+	}
+	now = now.Add(time.Second)
+	tick("second slow tick, inside the backoff")
+	now = now.Add(queueListingRetryFirst)
+	tick("third slow tick, after the backoff")
+	// Three slow ticks made two live attempts: the second tick fell inside
+	// the six-second delay and asked the hub for no listing at all.
+	if active, host := hub.listings(); active-activeBefore != 2 || host-hostBefore != 2 {
+		t.Fatalf("three slow ticks made %d active and %d host listing calls, want 2 and 2", active-activeBefore, host-hostBefore)
+	}
+	// The delay doubled: six more seconds is still inside it.
+	now = now.Add(queueListingRetryFirst)
+	tick("fourth slow tick, inside the doubled backoff")
+	if active, _ := hub.listings(); active-activeBefore != 2 {
+		t.Fatalf("a tick inside the doubled delay made listing call %d", active-activeBefore)
+	}
+	notices := slowListingNotices(t, f)
+	if len(notices) != 1 || notices[0].To != helper.ID || notices[0].Envelope.Kind != api.EnvelopeKindNotice || notices[0].Envelope.To != helper.Name ||
+		!strings.Contains(notices[0].Text, "last good listing") || !strings.Contains(notices[0].Text, f.task.ID) || !strings.Contains(notices[0].Text, "fixture") {
+		t.Fatalf("slow ticks posted %d notices, want one to the owner helper %s: %+v", len(notices), helper.ID, notices)
+	}
+
+	// Recovery: the next due attempt answers and ends the episode.
+	hub.slowActive.Store(false)
+	now = now.Add(queueListingRetryMax)
+	activeBefore, _ = hub.listings()
+	tick("recovery tick")
+	tick("tick after recovery")
+	if active, _ := hub.listings(); active-activeBefore != 2 {
+		t.Fatalf("two ticks after recovery made %d active listing calls, want one each", active-activeBefore)
+	}
+	if got := entry(); got.State != "running" {
+		t.Fatalf("entry after recovery: %s", got.State)
+	}
+	if n := len(slowListingNotices(t, f)); n != 1 {
+		t.Fatalf("%d notices after recovery, want still one", n)
+	}
+
+	// Episode two: the reply arrives, the listing is slow again, and the
+	// running team still closes and finishes from the last good listing.
+	if _, err := f.c.CancelObligation(ctx, f.task.ID, obligations[0].ID, api.ObligationCancelRequest{Reason: "fixture resolved", RequestID: "slow-cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	hub.slowActive.Store(true)
+	now = now.Add(time.Minute)
+	tick("second episode, first tick")
+	if got := entry(); got.State != "finished" {
+		t.Fatalf("second episode did not finish the running entry from the last good listing: %s", got.State)
+	}
+	// The entry it knows has moved on; later slow ticks leave it alone.
+	now = now.Add(time.Second)
+	tick("second episode, second tick")
+	notices = slowListingNotices(t, f)
+	if len(notices) != 2 || notices[1].To != helper.ID || notices[0].Seq == notices[1].Seq {
+		t.Fatalf("second episode: %d notices, want a second one to the owner helper: %+v", len(notices), notices)
+	}
+}
+
+// wi_765e7089fd176b08 f3: an old listing starts no launch, and one older than
+// ten minutes is not used at all.
+func TestTeamRunnerSlowListingStartsNoLaunch(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "slow-queued-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	spawns := 0
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	spawn := r.spawn
+	r.spawn = func(e env, args []string) error {
+		spawns++
+		return spawn(e, args)
+	}
+	state := func() string {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.State
+	}
+	// Seed a good listing of the queued entry without launching it: the
+	// project is paused for that one tick.
+	pause := func(op string) {
+		t.Helper()
+		db, err := sql.Open("sqlite", f.dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Exec(`UPDATE tasks SET pause_state=? WHERE id=?`, op, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pause("paused")
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	pause(api.ProjectPauseActive)
+	if spawns != 0 || state() != "queued" {
+		t.Fatalf("seed tick: %d spawns, entry %s; want a queued entry listed and not launched", spawns, state())
+	}
+
+	// Both listings stop answering: the tick works from the last good ones,
+	// where the entry is queued, and launches nothing.
+	hub.slowActive.Store(true)
+	hub.slowHost.Store(true)
+	for i, step := range []time.Duration{0, time.Second, queueListingRetryFirst, 2 * queueListingRetryFirst} {
+		now = now.Add(step)
+		if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("slow tick %d on the last good listing: %v", i, err)
+		}
+		if spawns != 0 || state() != "queued" {
+			t.Fatalf("slow tick %d on the last good listing: %d spawns, entry %s; want no launch", i, spawns, state())
+		}
+	}
+	if n := len(slowListingNotices(t, f)); n != 1 {
+		t.Fatalf("%d slow listing notices on the last good listing, want one", n)
+	}
+
+	// Past ten minutes the last good listing is not used: the tick reports
+	// the timeout and still launches nothing.
+	now = now.Add(queueListingMaxAge)
+	err = r.tick(ctx, hub.e, hub.c, "fixture")
+	if err == nil || !queueListingTimedOut(err) || !strings.Contains(err.Error(), "no last good listing") {
+		t.Fatalf("tick on a listing older than %s = %v, want the listing timeout", queueListingMaxAge, err)
+	}
+	if spawns != 0 || state() != "queued" {
+		t.Fatalf("tick on an expired listing: %d spawns, entry %s; want no launch", spawns, state())
+	}
+
+	// A live listing launches the entry.
+	hub.slowActive.Store(false)
+	hub.slowHost.Store(false)
+	now = now.Add(queueListingRetryMax)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if spawns != 1 || state() != "running" {
+		t.Fatalf("live tick after the episode: %d spawns, entry %s; want the launch", spawns, state())
 	}
 }
