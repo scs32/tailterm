@@ -4851,6 +4851,14 @@ test("bundle v4 a browser suite is found by its marker or by importing a marked 
     "imports-not-helper.mjs": 'import "./not-helper.mjs";\n',
   };
   inventory(mentions, [])();
+  // A helper marker exempts only a module some other tests module imports:
+  // one nothing imports is a suite like any other, launching or not.
+  const orphan = "// verify-matrix: browser-helper\nimport { chromium } from 'playwright';\nconst b = await chromium.launch();\n";
+  assert.throws(inventory({ "new-browser.mjs": orphan }, []), changed);
+  inventory({ "new-browser.mjs": orphan }, ["new-browser.mjs"])();
+  inventory({ "new-browser.mjs": orphan }, [], ["new-browser.mjs"])();
+  assert.throws(inventory({ "quiet.mjs": "// verify-matrix: browser-helper\n" }, []), changed);
+  assert.throws(inventory({ "self.mjs": '// verify-matrix: browser-helper\nimport "./self.mjs";\n' }, []), changed);
   // The literal call still classifies a file, as before.
   inventory({ "direct.mjs": "await chromium.launch();\n" }, ["direct.mjs"])();
   assert.throws(inventory({ "direct.mjs": "await chromium.launch();\n" }, []), changed);

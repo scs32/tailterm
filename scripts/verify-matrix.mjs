@@ -244,7 +244,9 @@ const importedTestModules = (text) =>
   );
 // A browser suite is a tests module that calls .launch( itself, carries the
 // suite marker, or imports a module carrying the helper marker (one import
-// level). Each marker is a whole line. A helper is not itself a suite.
+// level). Each marker is a whole line. A helper that another tests module
+// imports is not itself a suite; one that nothing imports is, so the marker
+// cannot hide an undeclared file.
 const BROWSER_SUITE_MARKER = /^\/\/ verify-matrix: browser-suite$/m;
 const BROWSER_HELPER_MARKER = /^\/\/ verify-matrix: browser-helper$/m;
 export function assertInventory(matrix, cwd) {
@@ -253,14 +255,19 @@ export function assertInventory(matrix, cwd) {
       .filter((f) => f.endsWith(".mjs"))
       .map((f) => [f, readFileSync(join(cwd, "tests", f), "utf8")]),
   );
-  const helpers = new Set(
+  const marked = new Set(
     [...texts].filter(([, text]) => BROWSER_HELPER_MARKER.test(text)).map(([f]) => f),
   );
+  const imported = new Set(
+    [...texts].flatMap(([f, text]) => [...importedTestModules(text)].filter((name) => name !== f)),
+  );
+  const helpers = new Set([...marked].filter((f) => imported.has(f)));
   const inventory = [...texts]
     .filter(
       ([f, text]) =>
         !helpers.has(f) &&
-        (text.includes(".launch(") ||
+        (marked.has(f) ||
+          text.includes(".launch(") ||
           BROWSER_SUITE_MARKER.test(text) ||
           [...importedTestModules(text)].some((name) => helpers.has(name))),
     )
