@@ -77,6 +77,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/usage", s.usageReport)
 	m.HandleFunc("GET /v1/tasks/{id}/usage/prices", s.usagePrices)
 	m.HandleFunc("PUT /v1/tasks/{id}/usage/prices", s.setUsagePrices)
+	m.HandleFunc("GET /v1/tasks/{id}/usage/warning", s.usageWarnings)
+	m.HandleFunc("PUT /v1/tasks/{id}/usage/warning", s.setUsageWarning)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/work-context", s.getAgentWorkContext)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/current-assignment", s.currentAssignment)
 	m.HandleFunc("GET /v1/tasks/{id}/agents/{aid}/delivery-coverage", s.deliveryCoverage)

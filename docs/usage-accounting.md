@@ -109,7 +109,7 @@ Known limits: a long open turn is invisible until it ends; a transitive wait (a 
 
 ## Token estimate and budget
 
-Feature `wi_899863352c81e3b0`, revision 1, owner order #28848; builder assignment #28954. Phase 1 of the token guardrails: each work item can carry a token estimate, shown against what the item actually used. Nothing warns, holds or pauses on it yet.
+Feature `wi_899863352c81e3b0`, revision 1, owner order #28848; builder assignment #28954. Phase 1 of the token guardrails: each work item can carry a token estimate, shown against what the item actually used. Phase 2 adds a [warning](#warning) when an item passes a multiple of its estimate. Nothing holds or pauses on it.
 
 ### Set an estimate
 
@@ -154,6 +154,47 @@ One line per done item, by item sequence: lane (the template of the item's lates
 
 `work_items` gains six `estimate_*` columns. Budgets do not scan the ledger: each stored request also writes its per-item shares to `usage_item_shares` (reported tokens, share denominator, partial flag), and a budget is one indexed read by item. Share rows are derived data. At every open the hub fills them for any stored request that has none at its current revision, which covers requests stored before the table existed and requests an older binary wrote or revised after a rollback. Both tables and the columns are additive, and an older binary ignores them. The audit export's `workItems` rows include the estimate columns; the estimate history table is not exported yet.
 
+### Warning
+
+Feature `wi_3228104e700006c5`, revision 1, owner order #29142; builder assignment #29186. Phase 2 of the token guardrails.
+
+**Rule.** When a usage upload takes an item's lifetime attributed tokens past the project's warning level times its saved estimate, the hub posts a notice. The level is `1.5` unless the project sets its own. "Past" is strictly greater, compared exactly: 1,500,000 tokens against an estimate of 1,000,000 has not passed 1.5, and one more token has. The actual is the budget's `actualTokens`. A partial actual is a lower bound, so passing the level on it is a real crossing; the notice then says "at least". An item with no estimate never warns and stays listed as "no estimate" in `tt usage`, `tt work-items get` and the queue list.
+
+**Nothing is paused or held.** The warning is a message and nothing else: no turn, team, queue entry or admission changes, and nobody owes a reply.
+
+**Recipients.** One directed notice to the item's running lead (the lead of its running team, not the project lead) and one to the project's owner helper. With no running lead, only the owner helper gets one and the text says no team is running the item. If the same agent is both, it gets one. If there is neither, or the project is closed, nothing is posted or recorded, and the next eligible upload looks again. A retired or exited owner helper still gets the notice in its inbox; the notice does not change its status and no wake is leased to it.
+
+The notice is of kind `notice`, with the subject "An item has passed its token estimate warning level", sent by `system` / `usage-warning`:
+
+```
+Item wi_… (Title) has used 18300000 tokens against an estimate of 12000000: 1.53 times, past the warning level of 1.5. Running team: lead lead-…, queue entry tqe_…. Nothing is paused or held. No reply is needed.
+```
+
+Its refs carry `item`, `estimateTokens`, `actualTokens` and `ratio` (exact rational strings), `actualState`, `threshold`, and `lead` and `entry` when there is a running team. The item is named in refs rather than linked, so the notice is not a work message. It carries a delivery-only obligation: the broker wakes a live recipient once, the obligation closes when the recipient fetches what it owes, and it never becomes overdue.
+
+**Once per estimate value.** An item warns once for each estimate value, recorded in `usage_budget_warnings`. Repeated uploads, replayed batches and further usage post nothing more. Saving a different estimate re-arms the warning; the save itself posts nothing. The check runs when the next **new or revised** turn attributed to the item is stored: a batch whose turns are all unchanged checks nothing, so an item that is already past a newly saved estimate warns at its next new or revised turn. A lowered estimate is also a new value and can warn. Returning to a value that already warned does not warn again, and neither does changing the level.
+
+**Set the level.**
+
+```
+tt usage warning get --project PROJECT_ID
+tt usage warning get --project PROJECT_ID --json
+tt usage warning set --project PROJECT_ID --threshold 2
+```
+
+The level is a plain decimal from 1 to 100 with at most three decimals. The owner sets it; an agent may only if it is the project's owner helper, and any other agent gets "only the owner helper sets the warning threshold". `get` prints the level, whether it is the default, and one line per warning posted, with the Board numbers of its notices:
+
+```
+Warning level: 1.5× estimate (default)
+  wi_…: estimate 12.00M · lifetime actual 18.36M · 1.53× · level 1.5× · lead #29301 · owner helper #29302 · 2026-10-08T04:00:00Z
+```
+
+Over HTTP it is `GET` and `PUT /v1/tasks/{id}/usage/warning` with `{"threshold":"2"}`. A saved level of `1.5` reads as set, not as the default.
+
+**A warning never blocks usage.** The check runs inside the upload's transaction, after its turns are stored, with each item's warning in its own savepoint. If anything in a warning fails (a read, a post, the record), all of that item's warning is rolled back: no message, receipt, obligation, wake job or record remains. The upload still commits, and the next new or revised turn for the item tries again. Such a failure is not reported anywhere. Only a cancelled request or a failing savepoint statement fails the upload.
+
+**Storage.** `usage_budget_warnings` holds one row per item and estimate value (level, actual and state at the crossing, both recipients and their message numbers, time). `usage_warning_settings` holds one row per project that set a level. Both are additive, and an older binary ignores them. On a database that already has estimated items past the level, each such item warns once at its next new or revised turn after the upgrade.
+
 ## Verification boundary
 
 Synthetic tests cover both runtimes, normalization, streaming/deduplication, resets, two-item persistent-role attribution, overhead conservation, phase/role averages, prices, receipt loss/restart/archive and relay budget. A loopback fixture exercises the real relay append path through HTTP into the store. Chromium and WebKit exercise Usage through Projects, including stale/offline/older-hub behavior, filters, prices, escaping, narrow layout and focus continuity.
@@ -167,3 +208,5 @@ Round-one correction provenance: REQUEST #12757 / disposition #12758, renewed ow
 Final focused b1 provenance: final general review #12779, disposition #12780, focused order #12781, own Start #12783, saved handler release #12784. This correction preserves Claude output only; Codex’s existing unavailable-subset handling is unchanged. Lifetime two general rounds remain exhausted, with original-reviewer focused verification still required.
 
 Token estimates add store tests for the unchanged revision and revision-bound records, refusals, clear and delayed replay, a queued and an accepted unreleased entry with the release gate, the budget against the unfiltered report (shared request, closed run, revised and partial turns, share rebuild), every queue list form across a history page, and a database returned to the base schema. CLI tests cover the estimate flags, the text forms, the queue list and the calibration read past both page limits. Chromium and WebKit render every budget form in the Usage disclosure. Opening a database built by the base binary, and the base binary reopening it, is a verifier matrix step.
+
+Token estimate warnings add store tests on isolated databases for the crossing (at the level and one token past it), no estimate, replayed and repeated uploads, a raised estimate, an item without a team, a project with no recipient yet, the per-project level and its refusals, three injected faults that must leave the upload stored and nothing of the warning behind, wake and delivery of the notice, a retired owner helper, a batch of unchanged turns, and a shared partial request. One server test covers the two routes and one CLI test runs `tt usage warning` against a real hub over HTTP.

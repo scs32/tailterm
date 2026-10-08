@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/store"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUsageCLIRealHTTPFiltersJSONAndPrices(t *testing.T) {
@@ -131,5 +136,76 @@ func TestUsageTextReadable(t *testing.T) {
 	}
 	if strings.Contains(text, "map[") || regexp.MustCompile(`[0-9]/[0-9]`).MatchString(text) {
 		t.Errorf("text output still prints a raw map or rational:\n%s", text)
+	}
+}
+
+// tt usage warning against a real hub over HTTP (wi_3228104e700006c5, a9).
+func TestUsageWarningCLI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "fixture", User: "owner"}
+	srv := httptest.NewServer(server.New(st, func(r *http.Request) (api.Caller, error) { return by, nil }))
+	t.Cleanup(srv.Close)
+	task, err := st.CreateTask(context.Background(), api.CreateTaskRequest{Name: "Usage warning CLI synthetic"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: srv.URL, task: task.ID}
+	read := func(args ...string) api.UsageWarnings {
+		t.Helper()
+		text, err := captureStdout(t, func() error { return cmdUsage(e, append([]string{"warning"}, args...)) })
+		if err != nil {
+			t.Fatal(args, err)
+		}
+		var out api.UsageWarnings
+		if err = json.Unmarshal([]byte(text), &out); err != nil {
+			t.Fatal(text, err)
+		}
+		return out
+	}
+	if out := read("get", "--json"); out.Threshold != "1.5" || !out.Default {
+		t.Fatalf("default %+v", out)
+	}
+	text, err := captureStdout(t, func() error { return cmdUsage(e, []string{"warning", "set", "--threshold", "2"}) })
+	if err != nil || text != "Warning level: 2× estimate\nNo warnings posted.\n" {
+		t.Fatalf("set %q %v", text, err)
+	}
+	if out := read("get", "--json"); out.Threshold != "2" || out.Default || len(out.Warnings) != 0 {
+		t.Fatalf("after set %+v", out)
+	}
+	if out := read("get", "--project", task.ID, "--json"); out.Threshold != "2" {
+		t.Fatalf("explicit project %+v", out)
+	}
+	for _, bad := range [][]string{{"warning"}, {"warning", "show"}, {"warning", "set"}, {"warning", "get", "--threshold", "3"}, {"warning", "set", "--threshold", "abc"}, {"warning", "set", "--threshold", "0.5"}, {"warning", "get", "extra"}} {
+		if _, err = captureStdout(t, func() error { return cmdUsage(e, bad) }); err == nil {
+			t.Fatalf("%v was accepted", bad)
+		}
+	}
+	// An agent identity is named in the request, and only the owner helper's is accepted.
+	worker, err := st.AddAgent(context.Background(), task.ID, api.AddAgentRequest{Name: "worker", Host: "fixture", Session: "synthetic", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asWorker := e
+	asWorker.agent = worker.ID
+	if _, err = captureStdout(t, func() error { return cmdUsage(asWorker, []string{"warning", "set", "--threshold", "3"}) }); err == nil || !strings.Contains(err.Error(), "only the owner helper sets the warning threshold") {
+		t.Fatalf("a worker set the threshold: %v", err)
+	}
+	if out := read("get", "--json"); out.Threshold != "2" {
+		t.Fatalf("a refused set changed the threshold: %+v", out)
+	}
+	at := time.Date(2026, 10, 8, 4, 0, 0, 0, time.UTC)
+	got := formatUsageWarnings(api.UsageWarnings{Threshold: "1.5", Default: true, Warnings: []api.UsageWarning{
+		{ItemID: "wi_1111111111111111", EstimateTokens: 12000000, ActualTokens: "18360000", ActualState: "measured", Ratio: "153/100", Threshold: "1.5", LeadMessageSeq: 12, HelperMessageSeq: 13, At: at},
+		{ItemID: "wi_2222222222222222", EstimateTokens: 1000, ActualTokens: "3001/2", ActualState: "partial", Ratio: "3001/2000", Threshold: "1.5", HelperMessageSeq: 14, At: at}}})
+	want := "Warning level: 1.5× estimate (default)\n" +
+		"  wi_1111111111111111: estimate 12.00M · lifetime actual 18.36M · 1.53× · level 1.5× · lead #12 · owner helper #13 · 2026-10-08T04:00:00Z\n" +
+		"  wi_2222222222222222: estimate 1.0k · lifetime actual at least 1.5k · at least 1.50× · level 1.5× · no lead · owner helper #14 · 2026-10-08T04:00:00Z\n"
+	if got != want {
+		t.Fatalf("text\n%s\nwant\n%s", got, want)
 	}
 }

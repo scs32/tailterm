@@ -66,3 +66,27 @@ func (s *Server) setUsagePrices(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
+func (s *Server) usageWarnings(w http.ResponseWriter, r *http.Request) {
+	out, err := s.store.UsageWarnings(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+func (s *Server) setUsageWarning(w http.ResponseWriter, r *http.Request) {
+	by, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	var req api.UsageWarningRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	out, err := s.store.SetUsageWarning(r.Context(), r.PathValue("id"), req, by)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}

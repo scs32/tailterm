@@ -36,6 +36,15 @@ func migrateUsage(db *sql.DB) error {
  CREATE TABLE IF NOT EXISTS usage_price_receipts(
  task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,result TEXT NOT NULL,
  PRIMARY KEY(task_id,request_id));
+ CREATE TABLE IF NOT EXISTS usage_budget_warnings(
+ task_id TEXT NOT NULL,item_id TEXT NOT NULL,estimate_tokens INTEGER NOT NULL,threshold TEXT NOT NULL,
+ actual_tokens TEXT NOT NULL,actual_state TEXT NOT NULL,lead_agent TEXT NOT NULL DEFAULT '',
+ lead_message_seq INTEGER NOT NULL DEFAULT 0,helper_agent TEXT NOT NULL DEFAULT '',
+ helper_message_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
+ PRIMARY KEY(task_id,item_id,estimate_tokens));
+ CREATE TABLE IF NOT EXISTS usage_warning_settings(
+ task_id TEXT PRIMARY KEY,threshold TEXT NOT NULL,updated_at TEXT NOT NULL,
+ by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '');
  ` + usageSpansSchema)
 	return err
 }
@@ -166,6 +175,8 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	if json.Unmarshal([]byte(frozen), &provenance) != nil {
 		return zero, api.ErrConflict
 	}
+	// Items whose attributed usage this batch added or revised.
+	touched := map[string]bool{}
 	for _, t := range b.Turns {
 		payload, _ := json.Marshal(t)
 		var oldPayload, oldProjection string
@@ -212,6 +223,15 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 		if err = replaceUsageItemShares(ctx, tx, task, agent, b.RunID, projection); err != nil {
 			return zero, err
 		}
+		for _, share := range projection.Shares {
+			// Like the budget, only the project's own items.
+			if share.ItemID != "" && share.TaskID == task {
+				touched[share.ItemID] = true
+			}
+		}
+	}
+	if err = s.warnTokenBudgets(ctx, tx, task, touched); err != nil {
+		return zero, err
 	}
 	if err = storeUsageSpans(ctx, tx, task, agent, b.RunID, b.Spans, provenance); err != nil {
 		return zero, err

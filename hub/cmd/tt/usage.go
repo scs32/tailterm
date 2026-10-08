@@ -20,6 +20,9 @@ func cmdUsage(e env, args []string) error {
 	if len(args) > 0 && args[0] == "prices" {
 		return cmdUsagePrices(e, args[1:])
 	}
+	if len(args) > 0 && args[0] == "warning" {
+		return cmdUsageWarning(e, args[1:])
+	}
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	project := fs.String("project", e.task, "project ID")
 	item := fs.String("item", "", "item ID")
@@ -319,6 +322,89 @@ func cmdUsagePrices(e env, args []string) error {
 	}
 	printJSON(out)
 	return nil
+}
+
+// cmdUsageWarning reads or sets the multiple of an item's saved estimate past
+// which the hub warns the item's lead and the owner helper.
+func cmdUsageWarning(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "get" && args[0] != "set") {
+		return errors.New("usage: tt usage warning get [--project ID] [--json] | set --threshold N [--project ID] [--json]")
+	}
+	fs := flag.NewFlagSet("usage warning", flag.ContinueOnError)
+	project := fs.String("project", e.task, "project ID")
+	threshold := fs.String("threshold", "", "multiple of the estimate, 1 to 100 with at most three decimals")
+	asJSON := fs.Bool("json", false, "JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return errors.New("usage: tt usage warning get [--project ID] [--json] | set --threshold N [--project ID] [--json]")
+	}
+	if args[0] == "get" && *threshold != "" {
+		return errors.New("get takes no threshold; use tt usage warning set --threshold N")
+	}
+	if args[0] == "set" && *threshold == "" {
+		return errors.New("set requires --threshold")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	var out api.UsageWarnings
+	if args[0] == "get" {
+		out, err = c.UsageWarnings(ctx, *project)
+	} else {
+		// An agent names itself; the hub accepts only the owner helper.
+		out, err = c.SetUsageWarning(ctx, *project, api.UsageWarningRequest{Threshold: *threshold, AgentID: e.agent})
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Print(formatUsageWarnings(out))
+	return nil
+}
+
+// formatUsageWarnings is the text form of the warning level and the warnings
+// posted, one line each.
+func formatUsageWarnings(out api.UsageWarnings) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Warning level: %s× estimate", out.Threshold)
+	if out.Default {
+		b.WriteString(" (default)")
+	}
+	b.WriteString("\n")
+	if len(out.Warnings) == 0 {
+		b.WriteString("No warnings posted.\n")
+	}
+	for _, w := range out.Warnings {
+		bound := ""
+		if w.ActualState == "partial" {
+			bound = "at least "
+		}
+		fmt.Fprintf(&b, "  %s: estimate %s · lifetime actual %s%s", w.ItemID, formatTokenCount(strconv.FormatInt(w.EstimateTokens, 10)), bound, formatTokenCount(w.ActualTokens))
+		if ratio, ok := new(big.Rat).SetString(w.Ratio); ok {
+			fmt.Fprintf(&b, " · %s%s×", bound, ratio.FloatString(2))
+		}
+		fmt.Fprintf(&b, " · level %s×", w.Threshold)
+		if w.LeadMessageSeq > 0 {
+			fmt.Fprintf(&b, " · lead #%d", w.LeadMessageSeq)
+		} else {
+			b.WriteString(" · no lead")
+		}
+		if w.HelperMessageSeq > 0 {
+			fmt.Fprintf(&b, " · owner helper #%d", w.HelperMessageSeq)
+		} else {
+			b.WriteString(" · no owner helper")
+		}
+		fmt.Fprintf(&b, " · %s\n", w.At.UTC().Format(time.RFC3339))
+	}
+	return b.String()
 }
 
 // formatTokenBudget renders an item's estimate against its lifetime actual:

@@ -1007,3 +1007,613 @@ func TestUsageReportReadCostBounded(t *testing.T) {
 	}
 	t.Logf("3000 turns: %s, %d obligation queries", took, large)
 }
+
+// Token estimate warning (wi_3228104e700006c5, plan r2). When a new or revised
+// attributed turn first takes an item past the project's warning level times
+// its saved estimate, the hub posts one directed notice to the item's running
+// lead and one to the owner helper, once per item per estimate value.
+
+const usageWarningTestSubject = "An item has passed its token estimate warning level"
+
+type usageWarningFixture struct {
+	t        *testing.T
+	s        *Store
+	task     api.Task
+	metered  api.Agent
+	items    []api.WorkItem
+	orders   []api.Message
+	lead     api.Agent
+	helper   api.Agent
+	entry    string
+	turns    int
+	batches  int
+	estimate int
+}
+
+// newUsageWarningFixture is the synthetic usage project, optionally with a
+// running lead and queue entry on item 0 and a registered owner helper.
+func newUsageWarningFixture(t *testing.T, withLead, withHelper bool) *usageWarningFixture {
+	t.Helper()
+	s, task, metered, items, orders := usageFixture(t)
+	f := &usageWarningFixture{t: t, s: s, task: task, metered: metered, items: items, orders: orders}
+	if withLead {
+		f.addLead()
+	}
+	if withHelper {
+		f.addHelper()
+	}
+	return f
+}
+func (f *usageWarningFixture) addLead() {
+	f.t.Helper()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	lead, err := f.s.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{Name: "lead-item", AgentID: api.NewID("agt"), Runtime: "codex", Host: "fixture", Session: "lead"}, by)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.lead, f.entry = lead, "tqe_"+strings.Repeat("a", 16)
+	now := ts(time.Now())
+	if _, err = f.s.db.Exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.items[0].ID, lead.ID, lead.RunID); err != nil {
+		f.t.Fatal(err)
+	}
+	if _, err = f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,created_at,updated_at,repository,base_commit) VALUES(?,?,?,?,1,'planned',1,'running',1,?,?,'fixture',?)`,
+		f.entry, f.task.ID, f.items[0].ID, f.items[0].Revision, now, now, strings.Repeat("c", 40)); err != nil {
+		f.t.Fatal(err)
+	}
+}
+func (f *usageWarningFixture) addHelper() {
+	f.t.Helper()
+	f.helper = *registerHelper(f.t, f.s, f.task.ID, helperRequest("warning-helper"), api.Caller{Node: "fixture", User: "owner"}).Agent
+}
+
+// setEstimate saves an estimate on item i as the owner.
+func (f *usageWarningFixture) setEstimate(i int, tokens int64) {
+	f.t.Helper()
+	f.estimate++
+	basis := "synthetic"
+	if tokens == 0 {
+		basis = "" // a clear takes no basis
+	}
+	req := estimateRequest(f.items[i].Revision, fmt.Sprintf("warning-estimate-%d", f.estimate), tokens, basis, api.Agent{})
+	if _, _, err := f.s.CreateWorkItemUpdate(context.Background(), f.task.ID, f.items[i].ID, req, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// turn is a complete synthetic request of exactly tokens, attributed to item
+// i by an acknowledgement of its order.
+func (f *usageWarningFixture) turn(i int, tokens int64) api.UsageTurn {
+	f.turns++
+	turn := syntheticUsageTurn(fmt.Sprintf("warning-turn-%d", f.turns))
+	turn.Tokens = map[string]int64{"input": tokens, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0}
+	turn.Raw = map[string]int64{"input_tokens": tokens, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+	turn.Handled = []api.UsageEvidence{{TaskID: f.task.ID, Seq: f.orders[i].Seq, Operation: "ack", At: turn.At}}
+	return turn
+}
+
+// upload stores the turns as one new batch and returns it for a replay.
+func (f *usageWarningFixture) upload(turns ...api.UsageTurn) api.UsageBatch {
+	f.t.Helper()
+	f.batches++
+	batch := usageBatch(f.metered, fmt.Sprintf("warning-batch-%d", f.batches), turns...)
+	f.replay(batch)
+	return batch
+}
+func (f *usageWarningFixture) replay(batch api.UsageBatch) {
+	f.t.Helper()
+	if receipt, err := f.s.ReportUsage(context.Background(), f.task.ID, f.metered.ID, batch); err != nil || receipt.Turns != len(batch.Turns) {
+		f.t.Fatalf("usage upload %+v %v", receipt, err)
+	}
+}
+
+// use uploads one new turn of tokens for item i.
+func (f *usageWarningFixture) use(i int, tokens int64) api.UsageBatch {
+	f.t.Helper()
+	return f.upload(f.turn(i, tokens))
+}
+
+// notices are the warning notices addressed to one agent, oldest first.
+func (f *usageWarningFixture) notices(agent api.Agent) []api.Message {
+	f.t.Helper()
+	if agent.ID == "" {
+		return nil
+	}
+	messages, err := f.s.ListMessages(context.Background(), f.task.ID, 0, agent.ID, 500)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	out := []api.Message{}
+	for _, m := range messages {
+		if m.To == agent.ID && m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice && m.Envelope.Subject == usageWarningTestSubject {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+func (f *usageWarningFixture) count(query string, args ...any) int {
+	f.t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		f.t.Fatal(query, err)
+	}
+	return n
+}
+
+// want asserts the warning notices of the lead and the helper and the rows
+// recorded for the project.
+func (f *usageWarningFixture) want(why string, lead, helper, rows int) {
+	f.t.Helper()
+	if got := len(f.notices(f.lead)); got != lead {
+		f.t.Fatalf("%s: lead has %d warning notices, want %d", why, got, lead)
+	}
+	if got := len(f.notices(f.helper)); got != helper {
+		f.t.Fatalf("%s: owner helper has %d warning notices, want %d", why, got, helper)
+	}
+	if got := f.count(`SELECT count(*) FROM usage_budget_warnings WHERE task_id=?`, f.task.ID); got != rows {
+		f.t.Fatalf("%s: %d warning rows, want %d", why, got, rows)
+	}
+}
+
+func TestUsageWarningOnCrossing(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	f.use(0, 900)
+	f.use(0, 600)
+	f.want("1500 of 1000 is at the level, not past it", 0, 0, 0)
+	f.use(0, 1)
+	f.want("1501 of 1000 is past 1.5", 1, 1, 1)
+	item := f.items[0]
+	for _, m := range []api.Message{f.notices(f.lead)[0], f.notices(f.helper)[0]} {
+		e := m.Envelope
+		want := map[string]string{"item": item.ID, "estimateTokens": "1000", "actualTokens": "1501", "actualState": "measured", "ratio": "1501/1000", "threshold": "1.5", "entry": f.entry, "lead": f.lead.Name}
+		if !reflect.DeepEqual(e.Refs, want) {
+			t.Fatalf("refs %v, want %v", e.Refs, want)
+		}
+		text := "Item " + item.ID + " (Item 0) has used 1501 tokens against an estimate of 1000: 1.50 times, past the warning level of 1.5. Running team: lead " + f.lead.Name + ", queue entry " + f.entry + ". Nothing is paused or held. No reply is needed."
+		if e.Body.Text != text {
+			t.Fatalf("text %q\nwant %q", e.Body.Text, text)
+		}
+		if m.From.AgentID != "" || m.From.Node != "system" || m.From.User != "usage-warning" || len(m.WorkItems) != 0 {
+			t.Fatalf("sender or links %+v %+v", m.From, m.WorkItems)
+		}
+	}
+	var estimate, leadSeq, helperSeq int64
+	var threshold, actual, state, leadAgent, helperAgent string
+	if err := f.s.db.QueryRow(`SELECT estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq FROM usage_budget_warnings WHERE task_id=? AND item_id=?`, f.task.ID, item.ID).
+		Scan(&estimate, &threshold, &actual, &state, &leadAgent, &leadSeq, &helperAgent, &helperSeq); err != nil {
+		t.Fatal(err)
+	}
+	if estimate != 1000 || threshold != "1.5" || actual != "1501" || state != "measured" || leadAgent != f.lead.ID || helperAgent != f.helper.ID || leadSeq != f.notices(f.lead)[0].Seq || helperSeq != f.notices(f.helper)[0].Seq {
+		t.Fatal("warning row", estimate, threshold, actual, state, leadAgent, leadSeq, helperAgent, helperSeq)
+	}
+}
+
+func TestUsageWarningNeverWithoutEstimate(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.use(0, 5_000_000)
+	f.use(0, 5_000_000)
+	f.want("no estimate", 0, 0, 0)
+	item, err := f.s.GetWorkItem(context.Background(), f.task.ID, f.items[0].ID)
+	if err != nil || item.Budget == nil || item.Budget.Estimate != nil || item.Budget.ActualTokens != "10000000" || item.Budget.Ratio != "" {
+		t.Fatalf("budget %+v %v", item.Budget, err)
+	}
+	// Clearing an estimate returns the item to never warning.
+	f.setEstimate(0, 1000)
+	f.setEstimate(0, 0)
+	f.use(0, 1)
+	f.want("cleared estimate", 0, 0, 0)
+}
+
+func TestUsageWarningOncePerEstimateValue(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	crossing := f.use(0, 1501)
+	f.want("crossing", 1, 1, 1)
+	messages := f.count(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+	f.replay(crossing)
+	f.use(0, 400)
+	f.upload(f.turn(0, 10), f.turn(0, 20))
+	f.replay(crossing)
+	f.want("replay and new turns", 1, 1, 1)
+	if got := f.count(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID); got != messages {
+		t.Fatalf("messages grew from %d to %d", messages, got)
+	}
+}
+
+func TestUsageWarningRaisedEstimateRearms(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	f.use(0, 1600)
+	f.want("first estimate", 1, 1, 1)
+	f.setEstimate(0, 2000)
+	f.want("the estimate save posts nothing", 1, 1, 1)
+	f.use(0, 1400)
+	f.want("3000 of 2000 is at the level", 1, 1, 1)
+	f.use(0, 1)
+	f.want("3001 of 2000 is past 1.5", 2, 2, 2)
+	f.use(0, 500)
+	f.want("once for the raised value", 2, 2, 2)
+	second := f.notices(f.lead)[1].Envelope
+	if second.Refs["estimateTokens"] != "2000" || second.Refs["actualTokens"] != "3001" {
+		t.Fatalf("second notice refs %v", second.Refs)
+	}
+	// Returning to a value that already warned stays silent.
+	f.setEstimate(0, 1000)
+	f.use(0, 1)
+	f.want("returning to a warned value", 2, 2, 2)
+}
+
+func TestUsageWarningWithoutTeam(t *testing.T) {
+	f := newUsageWarningFixture(t, false, true)
+	f.setEstimate(0, 1000)
+	f.use(0, 1501)
+	f.want("no lead", 0, 1, 1)
+	e := f.notices(f.helper)[0].Envelope
+	if !strings.Contains(e.Body.Text, " No team is running it. Nothing is paused or held.") || e.Refs["lead"] != "" || e.Refs["entry"] != "" {
+		t.Fatalf("notice %q %v", e.Body.Text, e.Refs)
+	}
+	if got := f.count(`SELECT count(*) FROM usage_budget_warnings WHERE task_id=? AND lead_agent='' AND lead_message_seq=0 AND helper_agent=?`, f.task.ID, f.helper.ID); got != 1 {
+		t.Fatal("row does not record the missing lead")
+	}
+	if got := f.count(`SELECT count(*) FROM messages WHERE task_id=? AND envelope LIKE ?`, f.task.ID, "%"+usageWarningTestSubject+"%"); got != 1 {
+		t.Fatalf("%d warning messages, want 1", got)
+	}
+}
+
+func TestUsageWarningWaitsForRecipient(t *testing.T) {
+	f := newUsageWarningFixture(t, false, false)
+	f.setEstimate(0, 1000)
+	warnings := func() int {
+		return f.count(`SELECT count(*) FROM messages WHERE task_id=? AND envelope LIKE ?`, f.task.ID, "%"+usageWarningTestSubject+"%")
+	}
+	crossing := f.use(0, 1501)
+	if got := f.count(`SELECT count(*) FROM usage_turns WHERE task_id=?`, f.task.ID); got != 1 {
+		t.Fatalf("%d turns stored, want 1", got)
+	}
+	f.want("no recipient", 0, 0, 0)
+	if warnings() != 0 {
+		t.Fatal("a warning was posted with no recipient")
+	}
+	f.addHelper()
+	f.replay(crossing)
+	f.want("a replay checks nothing", 0, 0, 0)
+	f.use(0, 1)
+	f.want("the next new turn warns", 0, 1, 1)
+	f.use(0, 1)
+	f.want("then once only", 0, 1, 1)
+	if warnings() != 1 {
+		t.Fatalf("%d warning messages, want 1", warnings())
+	}
+}
+
+// second adds another project with its own metered agent, item, order and
+// owner helper to the same database.
+func (f *usageWarningFixture) second() *usageWarningFixture {
+	f.t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := f.s.CreateTask(ctx, api.CreateTaskRequest{Name: "Second synthetic usage", Swarm: true}, by)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	a, err := f.s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "shared-two", AgentID: api.NewID("agt"), Runtime: "codex", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "synthetic"}, by)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	item, err := f.s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Second item", RequestID: "create-second"}, by)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	m, err := f.s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, RequestID: "order-second", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Handle synthetic evidence", Body: api.EnvelopeBody{Ask: "Record synthetic data"}}}, by)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	g := &usageWarningFixture{t: f.t, s: f.s, task: task, metered: a, items: []api.WorkItem{item}, orders: []api.Message{m}, turns: 1000, batches: 1000, estimate: 1000}
+	g.addHelper()
+	return g
+}
+
+func TestUsageWarningThresholdPerProject(t *testing.T) {
+	f := newUsageWarningFixture(t, false, true)
+	g := f.second()
+	ctx := context.Background()
+	owner := api.Caller{Node: "fixture", User: "owner"}
+	got, err := f.s.UsageWarnings(ctx, f.task.ID)
+	if err != nil || got.Threshold != "1.5" || !got.Default || len(got.Warnings) != 0 {
+		t.Fatalf("default %+v %v", got, err)
+	}
+	got, err = f.s.SetUsageWarning(ctx, f.task.ID, api.UsageWarningRequest{Threshold: "2"}, owner)
+	if err != nil || got.Threshold != "2" || got.Default {
+		t.Fatalf("set %+v %v", got, err)
+	}
+	if other, err := f.s.UsageWarnings(ctx, g.task.ID); err != nil || other.Threshold != "1.5" || !other.Default {
+		t.Fatalf("the second project changed: %+v %v", other, err)
+	}
+	for _, bad := range []string{"0.9", "101", "abc", "1.2345", "", "1.", ".5", "-2", "+2", "1e1", " 2", "02", "100.001"} {
+		if _, err = f.s.SetUsageWarning(ctx, f.task.ID, api.UsageWarningRequest{Threshold: bad}, owner); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("threshold %q: %v", bad, err)
+		}
+	}
+	if _, err = f.s.SetUsageWarning(ctx, f.task.ID, api.UsageWarningRequest{Threshold: "3", AgentID: f.metered.ID}, owner); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("an agent that is not the owner helper set the threshold", err)
+	}
+	if _, err = f.s.SetUsageWarning(ctx, f.task.ID, api.UsageWarningRequest{Threshold: "3", AgentID: g.helper.ID}, owner); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("another project's owner helper set the threshold", err)
+	}
+	if _, err = f.s.SetUsageWarning(ctx, "tsk_0000000000000000", api.UsageWarningRequest{Threshold: "3"}, owner); !errors.Is(err, api.ErrNotFound) {
+		t.Fatal("unknown project", err)
+	}
+	if got, err = f.s.UsageWarnings(ctx, f.task.ID); err != nil || got.Threshold != "2" {
+		t.Fatalf("a refused save changed the threshold: %+v %v", got, err)
+	}
+	for _, bounds := range []string{"1", "100", "1.001"} {
+		if _, err = g.s.SetUsageWarning(ctx, g.task.ID, api.UsageWarningRequest{Threshold: bounds, AgentID: g.helper.ID}, owner); err != nil {
+			t.Fatalf("threshold %q by the owner helper: %v", bounds, err)
+		}
+	}
+	if _, err = g.s.SetUsageWarning(ctx, g.task.ID, api.UsageWarningRequest{Threshold: "1.5", AgentID: g.helper.ID}, owner); err != nil {
+		t.Fatal(err)
+	}
+	f.setEstimate(0, 1000)
+	g.setEstimate(0, 1000)
+	f.use(0, 1600)
+	g.use(0, 1600)
+	f.want("1.6 times under a level of 2", 0, 0, 0)
+	g.want("1.6 times under the 1.5 level of the second project", 0, 1, 1)
+	f.use(0, 401)
+	f.want("2001 of 1000 is past 2", 0, 1, 1)
+	if e := f.notices(f.helper)[0].Envelope; e.Refs["threshold"] != "2" || !strings.Contains(e.Body.Text, "past the warning level of 2. ") {
+		t.Fatalf("notice %q %v", e.Body.Text, e.Refs)
+	}
+	got, err = f.s.UsageWarnings(ctx, f.task.ID)
+	if err != nil || len(got.Warnings) != 1 {
+		t.Fatalf("warnings %+v %v", got, err)
+	}
+	w := got.Warnings[0]
+	if w.ItemID != f.items[0].ID || w.EstimateTokens != 1000 || w.ActualTokens != "2001" || w.ActualState != "measured" || w.Ratio != "2001/1000" || w.Threshold != "2" || w.LeadAgent != "" || w.HelperAgent != f.helper.ID || w.HelperMessageSeq != f.notices(f.helper)[0].Seq || w.At.IsZero() {
+		t.Fatalf("warning %+v", w)
+	}
+	// A changed level never re-warns an estimate value that already warned.
+	if _, err = f.s.SetUsageWarning(ctx, f.task.ID, api.UsageWarningRequest{Threshold: "1.5"}, owner); err != nil {
+		t.Fatal(err)
+	}
+	f.use(0, 1)
+	f.want("changed level", 0, 1, 1)
+}
+
+func TestUsageWarningFailureKeepsUpload(t *testing.T) {
+	stored := func(f *usageWarningFixture, turns int) {
+		f.t.Helper()
+		if got := f.count(`SELECT count(*) FROM usage_turns WHERE task_id=?`, f.task.ID); got != turns {
+			f.t.Fatalf("%d turns stored, want %d", got, turns)
+		}
+		if got := f.count(`SELECT count(*) FROM usage_item_shares WHERE task_id=? AND item_id=?`, f.task.ID, f.items[0].ID); got != turns {
+			f.t.Fatalf("%d share rows, want %d", got, turns)
+		}
+		if got := f.count(`SELECT count(*) FROM usage_receipts WHERE task_id=?`, f.task.ID); got != turns {
+			f.t.Fatalf("%d usage receipts, want %d", got, turns)
+		}
+	}
+	exec := func(f *usageWarningFixture, statement string) {
+		f.t.Helper()
+		if _, err := f.s.db.Exec(statement); err != nil {
+			f.t.Fatal(statement, err)
+		}
+	}
+	warnings := func(f *usageWarningFixture) int {
+		return f.count(`SELECT count(*) FROM messages WHERE task_id=? AND envelope LIKE ?`, f.task.ID, "%"+usageWarningTestSubject+"%")
+	}
+	t.Run("dedupe read", func(t *testing.T) {
+		f := newUsageWarningFixture(t, true, true)
+		f.setEstimate(0, 1000)
+		exec(f, `ALTER TABLE usage_budget_warnings RENAME TO usage_budget_warnings_away`)
+		f.use(0, 1501)
+		stored(f, 1)
+		if warnings(f) != 0 {
+			t.Fatal("a warning was posted without its once-only record")
+		}
+		exec(f, `ALTER TABLE usage_budget_warnings_away RENAME TO usage_budget_warnings`)
+		f.use(0, 1)
+		stored(f, 2)
+		f.want("after the fault clears", 1, 1, 1)
+	})
+	t.Run("dedupe table dropped", func(t *testing.T) {
+		f := newUsageWarningFixture(t, true, true)
+		f.setEstimate(0, 1000)
+		exec(f, `DROP TABLE usage_budget_warnings`)
+		f.use(0, 1501)
+		stored(f, 1)
+		if warnings(f) != 0 {
+			t.Fatal("a warning was posted without its once-only record")
+		}
+	})
+	t.Run("settings read", func(t *testing.T) {
+		f := newUsageWarningFixture(t, true, true)
+		f.setEstimate(0, 1000)
+		exec(f, `ALTER TABLE usage_warning_settings RENAME TO usage_warning_settings_away`)
+		f.use(0, 1501)
+		stored(f, 1)
+		f.want("the threshold cannot be read", 0, 0, 0)
+		exec(f, `ALTER TABLE usage_warning_settings_away RENAME TO usage_warning_settings`)
+		f.use(0, 1)
+		stored(f, 2)
+		f.want("after the fault clears", 1, 1, 1)
+	})
+	t.Run("after the notices", func(t *testing.T) {
+		f := newUsageWarningFixture(t, true, true)
+		f.setEstimate(0, 1000)
+		exec(f, `CREATE TRIGGER usage_warning_fault BEFORE INSERT ON usage_budget_warnings BEGIN SELECT RAISE(ABORT,'injected warning fault'); END`)
+		tables := []string{"messages", "message_post_requests", "obligations", "wake_jobs", "usage_budget_warnings", "events"}
+		counts := func() []int {
+			out := []int{}
+			for _, table := range tables {
+				out = append(out, f.count(`SELECT count(*) FROM `+table))
+			}
+			return out
+		}
+		before := counts()
+		crossing := f.use(0, 1501)
+		stored(f, 1)
+		if after := counts(); !reflect.DeepEqual(before, after) {
+			t.Fatalf("a failed warning left rows behind: %v before %v, after %v", tables, before, after)
+		}
+		f.want("the row insert fails", 0, 0, 0)
+		exec(f, `DROP TRIGGER usage_warning_fault`)
+		f.replay(crossing)
+		f.want("a replay checks nothing", 0, 0, 0)
+		f.use(0, 1)
+		stored(f, 2)
+		f.want("the next new turn warns", 1, 1, 1)
+		f.use(0, 1)
+		f.want("then once only", 1, 1, 1)
+	})
+	// A cancelled upload is not a warning failure: it stores nothing.
+	t.Run("cancelled", func(t *testing.T) {
+		f := newUsageWarningFixture(t, true, true)
+		f.setEstimate(0, 1000)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := f.s.ReportUsage(ctx, f.task.ID, f.metered.ID, usageBatch(f.metered, "cancelled", f.turn(0, 1501))); err == nil {
+			t.Fatal("a cancelled upload was stored")
+		}
+		stored(f, 0)
+		f.want("cancelled", 0, 0, 0)
+	})
+}
+
+func TestUsageWarningWakeAndDelivery(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	ctx := context.Background()
+	f.setEstimate(0, 1000)
+	f.use(0, 1501)
+	f.want("crossing", 1, 1, 1)
+	now := time.Now()
+	overdue := func(why string) {
+		t.Helper()
+		late, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{Overdue: true}, now.Add(48*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range late {
+			if o.MessageSeq == f.notices(f.lead)[0].Seq || o.MessageSeq == f.notices(f.helper)[0].Seq {
+				t.Fatalf("%s: warning notice %d is overdue: %+v", why, o.MessageSeq, o)
+			}
+		}
+	}
+	for _, to := range []api.Agent{f.lead, f.helper} {
+		seq := f.notices(to)[0].Seq
+		if got := f.count(`SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND agent_id=? AND needs=? AND source_kind='notice' AND state<>?`, f.task.ID, seq, to.ID, api.ObligationNeedsDelivery, api.ObligationClosed); got != 1 {
+			t.Fatalf("%s: %d open delivery obligations for its notice, want 1", to.Name, got)
+		}
+		if got := f.count(`SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=?`, f.task.ID, seq); got != 1 {
+			t.Fatalf("%s: %d obligations for its notice, want 1", to.Name, got)
+		}
+		if got := f.count(`SELECT count(*) FROM wake_jobs w JOIN obligations o ON o.id=w.obligation_id WHERE o.message_seq=? AND w.agent_id=? AND w.state=?`, seq, to.ID, wakePending); got != 1 {
+			t.Fatalf("%s: %d pending wake jobs for its notice, want 1", to.Name, got)
+		}
+	}
+	overdue("unread")
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(now), f.lead.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.s.LeaseWakeJob(ctx, f.task.ID, f.lead.ID, f.lead.RunID, now.Add(time.Second))
+	if err != nil || job == nil || job.MessageSeq != f.notices(f.lead)[0].Seq || job.AgentID != f.lead.ID {
+		t.Fatalf("lead wake %+v %v", job, err)
+	}
+	for _, to := range []api.Agent{f.lead, f.helper} {
+		seq := f.notices(to)[0].Seq
+		// Reading alone settles nothing; a delivery-only obligation closes
+		// when the recipient's current run fetches what it owes.
+		if err = f.s.MarkRead(ctx, f.task.ID, api.MarkReadRequest{AgentID: to.ID, UpTo: seq}); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.s.MarkObligationsDelivered(ctx, f.task.ID, to.ID, to.RunID, now.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.count(`SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND state=? AND outcome=?`, f.task.ID, seq, api.ObligationClosed, api.OutcomeDelivered); got != 1 {
+			t.Fatalf("%s: the notice obligation stayed open after delivery", to.Name)
+		}
+	}
+	overdue("read")
+}
+
+func TestUsageWarningRetiredHelperNotResumed(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	ctx := context.Background()
+	now := time.Now()
+	if _, err := f.s.db.Exec(`UPDATE agents SET status=?,last_seen_at=? WHERE id=?`, api.AgentRetired, ts(now), f.helper.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.setEstimate(0, 1000)
+	f.use(0, 1501)
+	f.want("a retired helper still gets its notice", 1, 1, 1)
+	helper, err := f.s.GetAgent(ctx, f.helper.ID)
+	if err != nil || helper.Status != api.AgentRetired || helper.RunID != f.helper.RunID {
+		t.Fatalf("helper %+v %v", helper, err)
+	}
+	if !agentOnlineAt(helper, now.Add(time.Second)) {
+		t.Fatal("fixture: the retired helper must be online for the lease to be refused by status")
+	}
+	job, err := f.s.LeaseWakeJob(ctx, f.task.ID, f.helper.ID, f.helper.RunID, now.Add(time.Second))
+	if err != nil || job != nil {
+		t.Fatalf("a retired helper was leased a wake: %+v %v", job, err)
+	}
+	if got := f.count(`SELECT count(*) FROM wake_jobs WHERE agent_id=? AND state=?`, f.helper.ID, wakeLeased); got != 0 {
+		t.Fatalf("%d leased wake jobs for the retired helper", got)
+	}
+	if got := f.count(`SELECT count(*) FROM wake_jobs WHERE agent_id=?`, f.helper.ID); got != 1 {
+		t.Fatalf("%d wake jobs for the retired helper, want the 1 pending", got)
+	}
+}
+
+func TestUsageWarningUnchangedTurnsDoNotCheck(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	turn := f.turn(0, 2000)
+	f.upload(turn)
+	f.want("first estimate", 1, 1, 1)
+	f.setEstimate(0, 1200)
+	f.upload(turn)
+	f.want("a batch of unchanged turns checks nothing", 1, 1, 1)
+	revised := turn
+	revised.Revision = 2
+	revised.Tokens = map[string]int64{"input": 2001, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0}
+	revised.Raw = map[string]int64{"input_tokens": 2001, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+	f.upload(revised)
+	f.want("a revised turn checks the new estimate value", 2, 2, 2)
+	if refs := f.notices(f.helper)[1].Envelope.Refs; refs["estimateTokens"] != "1200" || refs["actualTokens"] != "2001" {
+		t.Fatalf("refs %v", refs)
+	}
+}
+
+// A request shared by two items and an incomplete request keep the warning
+// exact: the actual is a rational, and a partial actual says "at least".
+func TestUsageWarningSharedAndPartialActual(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	shared := f.turn(0, 3001)
+	shared.Handled = append(shared.Handled, api.UsageEvidence{TaskID: f.task.ID, Seq: f.orders[1].Seq, Operation: "ack", At: shared.At})
+	shared.Complete = false
+	f.upload(shared)
+	f.want("half of 3001 is past 1500", 1, 1, 1)
+	e := f.notices(f.lead)[0].Envelope
+	if e.Refs["actualTokens"] != "3001/2" || e.Refs["actualState"] != "partial" || e.Refs["ratio"] != "3001/2000" || !strings.Contains(e.Body.Text, "has used at least 1501 tokens against an estimate of 1000: 1.50 times") {
+		t.Fatalf("notice %q %v", e.Body.Text, e.Refs)
+	}
+}
+
+// A closed project still takes late usage, and gets no new Board message.
+func TestUsageWarningClosedProjectIsSilent(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	if _, err := f.s.db.Exec(`UPDATE tasks SET status=? WHERE id=?`, api.TaskClosed, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.use(0, 1501)
+	f.want("closed project", 0, 0, 0)
+	if _, err := f.s.db.Exec(`UPDATE tasks SET status=? WHERE id=?`, api.TaskOpen, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.use(0, 1)
+	f.want("reopened project", 1, 1, 1)
+}

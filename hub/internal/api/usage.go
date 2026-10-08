@@ -250,6 +250,40 @@ type UsagePriceRequest struct {
 	Rows             []UsagePrice `json:"rows"`
 }
 
+// DefaultUsageWarningThreshold is the multiple of an item's saved estimate
+// past which the hub warns, unless the project sets its own.
+const DefaultUsageWarningThreshold = "1.5"
+
+// UsageWarningRequest sets a project's warning threshold: a decimal from 1 to
+// 100 with at most three decimals. An agent caller names itself in AgentID
+// and must be the project's owner helper.
+type UsageWarningRequest struct {
+	Threshold string `json:"threshold"`
+	AgentID   string `json:"agentId,omitempty"`
+}
+
+// UsageWarning records the one warning an item got for one estimate value.
+// Quantities are exact rational strings, as in TokenBudget. A message number
+// is zero when that recipient was absent.
+type UsageWarning struct {
+	ItemID           string    `json:"itemId"`
+	EstimateTokens   int64     `json:"estimateTokens"`
+	ActualTokens     string    `json:"actualTokens"`
+	ActualState      string    `json:"actualState"`
+	Ratio            string    `json:"ratio"`
+	Threshold        string    `json:"threshold"`
+	LeadAgent        string    `json:"leadAgent,omitempty"`
+	LeadMessageSeq   int64     `json:"leadMessageSeq,omitempty"`
+	HelperAgent      string    `json:"helperAgent,omitempty"`
+	HelperMessageSeq int64     `json:"helperMessageSeq,omitempty"`
+	At               time.Time `json:"at"`
+}
+type UsageWarnings struct {
+	Threshold string         `json:"threshold"`
+	Default   bool           `json:"default"`
+	Warnings  []UsageWarning `json:"warnings"`
+}
+
 func (c *Client) ReportUsage(ctx context.Context, task, agent string, b UsageBatch) (UsageReceipt, error) {
 	var out UsageReceipt
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/agents/"+url.PathEscape(agent)+"/usage", b, &out)
@@ -278,6 +312,16 @@ func (c *Client) UsagePrices(ctx context.Context, task string) (UsagePrices, err
 func (c *Client) SetUsagePrices(ctx context.Context, task string, req UsagePriceRequest) (UsagePrices, error) {
 	var out UsagePrices
 	err := c.do(ctx, "PUT", "/v1/tasks/"+url.PathEscape(task)+"/usage/prices", req, &out)
+	return out, err
+}
+func (c *Client) UsageWarnings(ctx context.Context, task string) (UsageWarnings, error) {
+	var out UsageWarnings
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/usage/warning", nil, &out)
+	return out, err
+}
+func (c *Client) SetUsageWarning(ctx context.Context, task string, req UsageWarningRequest) (UsageWarnings, error) {
+	var out UsageWarnings
+	err := c.do(ctx, "PUT", "/v1/tasks/"+url.PathEscape(task)+"/usage/warning", req, &out)
 	return out, err
 }
 

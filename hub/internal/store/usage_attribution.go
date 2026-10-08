@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"sort"
 	"strconv"
@@ -555,13 +556,19 @@ func backfillUsageItemShares(db *sql.DB) error {
 // tokens over every run, open and closed. It reads usage_item_shares by item,
 // so its cost does not grow with the project's usage history.
 func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, error) {
+	budget, _, err := loadTokenBudgetActual(ctx, q, task, item)
+	return budget, err
+}
+
+// loadTokenBudgetActual also returns the exact actual the budget prints.
+func loadTokenBudgetActual(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, *big.Rat, error) {
 	budget := &api.TokenBudget{ActualTokens: "0", ActualState: "not measured"}
 	var estimate api.WorkItemEstimate
 	var setAt string
 	err := q.QueryRowContext(ctx, `SELECT estimate_tokens,estimate_basis,estimate_set_at,estimate_agent,estimate_node,estimate_user FROM work_items WHERE task_id=? AND id=?`, task, item).
 		Scan(&estimate.Tokens, &estimate.Basis, &setAt, &estimate.SetBy.AgentID, &estimate.SetBy.Node, &estimate.SetBy.User)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
+		return nil, nil, err
 	}
 	if err == nil && estimate.Tokens > 0 {
 		estimate.SetAt = parseTS(setAt)
@@ -570,7 +577,7 @@ func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api
 	// Like the report, only the project's own turns count toward its items.
 	rows, err := q.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE item_task_id=? AND item_id=? AND task_id=? GROUP BY denominator`, task, item, task)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	actual := new(big.Rat)
@@ -578,7 +585,7 @@ func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api
 		var denominator, tokens int64
 		var partial int
 		if err = rows.Scan(&denominator, &tokens, &partial); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if denominator < 1 {
 			continue
@@ -592,11 +599,309 @@ func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api
 		}
 	}
 	if err = rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	budget.ActualTokens = actual.RatString()
 	if budget.Estimate != nil && budget.ActualState != "not measured" {
 		budget.Ratio = new(big.Rat).Quo(actual, big.NewRat(budget.Estimate.Tokens, 1)).RatString()
 	}
-	return budget, nil
+	return budget, actual, nil
+}
+
+// usageWarningSubject is the constant subject of a token estimate warning.
+const usageWarningSubject = "An item has passed its token estimate warning level"
+
+// parseUsageWarningThreshold accepts a plain decimal from 1 to 100 with at
+// most three decimals, such as "1.5" or "2".
+func parseUsageWarningThreshold(text string) (*big.Rat, bool) {
+	whole, fraction, dotted := strings.Cut(text, ".")
+	if whole == "" || len(whole) > 3 || whole[0] == '0' || (dotted && (fraction == "" || len(fraction) > 3)) {
+		return nil, false
+	}
+	for _, r := range whole + fraction {
+		if r < '0' || r > '9' {
+			return nil, false
+		}
+	}
+	level, ok := new(big.Rat).SetString(text)
+	if !ok || level.Cmp(big.NewRat(1, 1)) < 0 || level.Cmp(big.NewRat(100, 1)) > 0 {
+		return nil, false
+	}
+	return level, true
+}
+
+// usageWarningThreshold is the project's warning level as saved text and as
+// an exact number, and whether it is the default.
+func usageWarningThreshold(ctx context.Context, q queryRower, task string) (string, *big.Rat, bool, error) {
+	text, standard := api.DefaultUsageWarningThreshold, false
+	err := q.QueryRowContext(ctx, `SELECT threshold FROM usage_warning_settings WHERE task_id=?`, task).Scan(&text)
+	if errors.Is(err, sql.ErrNoRows) {
+		standard, err = true, nil
+	}
+	if err != nil {
+		return "", nil, false, err
+	}
+	level, ok := parseUsageWarningThreshold(text)
+	if !ok {
+		return "", nil, false, usageInvalid("stored warning threshold " + strconv.Quote(text))
+	}
+	return text, level, standard, nil
+}
+
+func readUsageWarnings(ctx context.Context, q queryRower, task string) (api.UsageWarnings, error) {
+	out := api.UsageWarnings{Warnings: []api.UsageWarning{}}
+	if !api.ValidID(task, "tsk") {
+		return out, api.ErrInvalid
+	}
+	var n int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE id=?`, task).Scan(&n); err != nil {
+		return out, err
+	}
+	if n == 0 {
+		return out, api.ErrNotFound
+	}
+	var err error
+	if out.Threshold, _, out.Default, err = usageWarningThreshold(ctx, q, task); err != nil {
+		return out, err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at FROM usage_budget_warnings WHERE task_id=? ORDER BY created_at,rowid`, task)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var w api.UsageWarning
+		var at string
+		if err = rows.Scan(&w.ItemID, &w.EstimateTokens, &w.Threshold, &w.ActualTokens, &w.ActualState, &w.LeadAgent, &w.LeadMessageSeq, &w.HelperAgent, &w.HelperMessageSeq, &at); err != nil {
+			return out, err
+		}
+		if actual, ok := new(big.Rat).SetString(w.ActualTokens); ok && w.EstimateTokens > 0 {
+			w.Ratio = actual.Quo(actual, big.NewRat(w.EstimateTokens, 1)).RatString()
+		}
+		w.At = parseTS(at)
+		out.Warnings = append(out.Warnings, w)
+	}
+	return out, rows.Err()
+}
+
+// UsageWarnings reads the project's warning threshold and the warnings posted.
+func (s *Store) UsageWarnings(ctx context.Context, task string) (api.UsageWarnings, error) {
+	return readUsageWarnings(ctx, s.db, task)
+}
+
+// SetUsageWarning saves the project's warning threshold. An agent caller must
+// be the project's owner helper. It never re-warns an estimate value that has
+// already warned, and it posts nothing itself.
+func (s *Store) SetUsageWarning(ctx context.Context, task string, req api.UsageWarningRequest, by api.Caller) (api.UsageWarnings, error) {
+	zero := api.UsageWarnings{}
+	if !api.ValidID(task, "tsk") || (req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) {
+		return zero, api.ErrInvalid
+	}
+	if _, ok := parseUsageWarningThreshold(req.Threshold); !ok {
+		return zero, usageInvalid("warning threshold must be a decimal from 1 to 100 with at most three decimals")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	var n int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE id=?`, task).Scan(&n); err != nil {
+		return zero, err
+	}
+	if n == 0 {
+		return zero, api.ErrNotFound
+	}
+	if req.AgentID != "" {
+		helper, ok, err := currentOwnerHelper(ctx, tx, task)
+		if err != nil {
+			return zero, err
+		}
+		if !ok || helper.ID != req.AgentID {
+			return zero, workItemConflict("only the owner helper sets the warning threshold")
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO usage_warning_settings(task_id,threshold,updated_at,by_agent,by_node,by_user) VALUES(?,?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET threshold=excluded.threshold,updated_at=excluded.updated_at,by_agent=excluded.by_agent,by_node=excluded.by_node,by_user=excluded.by_user`,
+		task, req.Threshold, ts(s.now()), req.AgentID, by.Node, by.User); err != nil {
+		return zero, err
+	}
+	out, err := readUsageWarnings(ctx, tx, task)
+	if err != nil {
+		return zero, err
+	}
+	return out, tx.Commit()
+}
+
+// warnTokenBudgets posts the token estimate warning for each of the items a
+// usage upload just changed that has passed the project's warning level times
+// its saved estimate: one directed notice to the item's running lead and one
+// to the owner helper, once per item per estimate value. Nothing is paused or
+// held. It runs inside the upload's transaction and never fails the upload
+// over a warning: each item's work sits in a savepoint that is rolled back
+// whole on any error, so the next new or revised turn tries again. Only a
+// cancelled context or a failing savepoint statement is returned.
+func (s *Store) warnTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string, items map[string]bool) error {
+	if len(items) == 0 {
+		return nil
+	}
+	guarded := func(work func() error) error {
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT usage_warning`); err != nil {
+			return err
+		}
+		if workErr := work(); workErr != nil {
+			if _, err := tx.ExecContext(ctx, `ROLLBACK TO usage_warning`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `RELEASE usage_warning`); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
+	var task api.Task
+	loaded := false
+	if err := guarded(func() error {
+		var err error
+		task, err = scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+		loaded = err == nil
+		return err
+	}); err != nil || !loaded {
+		return err
+	}
+	if task.Status != api.TaskOpen {
+		// A closed project still takes late usage; it gets no new Board message.
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	for id := range items {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := guarded(func() error { return s.warnTokenBudget(ctx, tx, task, id) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// warnTokenBudget is one item's warning; its caller holds the savepoint.
+func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, item string) error {
+	budget, actual, err := loadTokenBudgetActual(ctx, tx, task.ID, item)
+	if err != nil {
+		return err
+	}
+	if budget.Estimate == nil || budget.ActualState == "not measured" {
+		return nil
+	}
+	estimate := budget.Estimate.Tokens
+	threshold, level, _, err := usageWarningThreshold(ctx, tx, task.ID)
+	if err != nil {
+		return err
+	}
+	// Exact, and strictly greater: an item at the level has not passed it. A
+	// partial actual is a lower bound, so passing the level is still real.
+	if actual.Cmp(level.Mul(level, big.NewRat(estimate, 1))) <= 0 {
+		return nil
+	}
+	var warned int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM usage_budget_warnings WHERE task_id=? AND item_id=? AND estimate_tokens=?`, task.ID, item, estimate).Scan(&warned)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// The exact running lead of the item, as the reply copy resolves it; no
+	// fallback to the project lead.
+	lead, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND status NOT IN ('closed','exited','retired') AND EXISTS (SELECT 1 FROM item_team_leads l WHERE l.task_id=? AND l.item_id=? AND l.state='running' AND l.agent_id=agents.id AND l.run_id=agents.run_id)`, task.ID, task.ID, item))
+	if errors.Is(err, sql.ErrNoRows) {
+		lead, err = api.Agent{}, nil
+	}
+	if err != nil {
+		return err
+	}
+	helper, ok, err := currentOwnerHelper(ctx, tx, task.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		helper = api.Agent{}
+	}
+	if lead.ID == "" && helper.ID == "" {
+		return nil // no row: the next new or revised turn looks again
+	}
+	var title, entry string
+	if err = tx.QueryRowContext(ctx, `SELECT title FROM work_items WHERE task_id=? AND id=?`, task.ID, item).Scan(&title); err != nil {
+		return err
+	}
+	err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task.ID, item).Scan(&entry)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	refs := map[string]string{"item": item, "estimateTokens": strconv.FormatInt(estimate, 10), "actualTokens": budget.ActualTokens, "actualState": budget.ActualState, "ratio": budget.Ratio, "threshold": threshold}
+	bound, team := "", "No team is running it."
+	if budget.ActualState == "partial" {
+		bound = "at least "
+	}
+	if lead.ID != "" {
+		refs["lead"] = lead.Name
+		team = "Running team: lead " + lead.Name
+		if entry != "" {
+			team += ", queue entry " + entry
+		}
+		team += "."
+	} else if entry != "" {
+		team = "Queue entry " + entry + " is running without a running lead."
+	}
+	if entry != "" {
+		refs["entry"] = entry
+	}
+	ratio := new(big.Rat).Quo(actual, big.NewRat(estimate, 1))
+	text := fmt.Sprintf("Item %s (%s) has used %s%s tokens against an estimate of %d: %s times, past the warning level of %s. %s Nothing is paused or held. No reply is needed.",
+		item, stallNoticeDetail(title), bound, actual.FloatString(0), estimate, ratio.FloatString(2), threshold, team)
+	by := api.Caller{Node: "system", User: "usage-warning"}
+	post := func(to api.Agent) (int64, error) {
+		copied := make(map[string]string, len(refs))
+		for k, v := range refs {
+			copied[k] = v
+		}
+		req := api.PostMessageRequest{To: to.ID, RequestID: fmt.Sprintf("usage-warning-%s-%d-%s", item, estimate, to.ID), Envelope: &api.Envelope{
+			Kind: api.EnvelopeKindNotice, To: to.Name, Subject: usageWarningSubject, Refs: copied, Body: api.EnvelopeBody{Text: text}}}
+		if err := api.NormalizeEnvelopePost(&req); err != nil {
+			return 0, err
+		}
+		// A hub notice never resumes a retired agent.
+		message, err := s.insertMessageWithResume(ctx, tx, task, req, to, by, false, false, false)
+		if err != nil {
+			return 0, err
+		}
+		if err = insertMessagePostReceipt(ctx, tx, &message, req.RequestID, requestHash(req), by); err != nil {
+			return 0, err
+		}
+		// A delivery-only obligation, so the broker's wake job reaches the
+		// recipient; nobody owes a reply.
+		return message.Seq, s.createObligations(ctx, tx, message, req, false)
+	}
+	var leadSeq, helperSeq int64
+	if lead.ID != "" {
+		if leadSeq, err = post(lead); err != nil {
+			return err
+		}
+	}
+	switch {
+	case helper.ID == "":
+	case helper.ID == lead.ID:
+		helperSeq = leadSeq
+	default:
+		if helperSeq, err = post(helper); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO usage_budget_warnings(task_id,item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, item, estimate, threshold, budget.ActualTokens, budget.ActualState, lead.ID, leadSeq, helper.ID, helperSeq, ts(s.now()))
+	return err
 }

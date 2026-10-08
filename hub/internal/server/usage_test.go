@@ -66,3 +66,51 @@ func TestUsageHTTPExactRequestReplayPricesAndFilters(t *testing.T) {
 		t.Fatal("changed batch accepted", err)
 	}
 }
+
+// Token estimate warning threshold over HTTP (wi_3228104e700006c5, a8).
+func TestUsageWarningHTTP(t *testing.T) {
+	f := newClient(t)
+	ctx := context.Background()
+	task, err := f.st.CreateTask(ctx, api.CreateTaskRequest{Name: "Usage warning HTTP synthetic"}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := api.NewClient(f.srv.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.UsageWarnings(ctx, task.ID)
+	if err != nil || api.DefaultUsageWarningThreshold != "1.5" || got.Threshold != "1.5" || !got.Default || got.Warnings == nil || len(got.Warnings) != 0 {
+		t.Fatalf("default %+v %v", got, err)
+	}
+	got, err = c.SetUsageWarning(ctx, task.ID, api.UsageWarningRequest{Threshold: "2"})
+	if err != nil || got.Threshold != "2" || got.Default {
+		t.Fatalf("set %+v %v", got, err)
+	}
+	got, err = c.UsageWarnings(ctx, task.ID)
+	if err != nil || got.Threshold != "2" || got.Default {
+		t.Fatalf("get after set %+v %v", got, err)
+	}
+	var httpErr *api.HTTPError
+	for _, bad := range []string{"0.9", "101", "abc", "1.2345", ""} {
+		_, err = c.SetUsageWarning(ctx, task.ID, api.UsageWarningRequest{Threshold: bad})
+		if !errors.As(err, &httpErr) || httpErr.Status != 400 {
+			t.Fatalf("threshold %q: %v", bad, err)
+		}
+	}
+	a, err := f.st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "fixture", Session: "synthetic", Runtime: "claude"}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.SetUsageWarning(ctx, task.ID, api.UsageWarningRequest{Threshold: "3", AgentID: a.ID})
+	if !errors.As(err, &httpErr) || httpErr.Status != 409 {
+		t.Fatalf("an agent that is not the owner helper: %v", err)
+	}
+	_, err = c.UsageWarnings(ctx, "tsk_0000000000000000")
+	if !errors.As(err, &httpErr) || httpErr.Status != 404 {
+		t.Fatalf("unknown project: %v", err)
+	}
+	if got, err = c.UsageWarnings(ctx, task.ID); err != nil || got.Threshold != "2" {
+		t.Fatalf("a refused save changed the threshold: %+v %v", got, err)
+	}
+}
