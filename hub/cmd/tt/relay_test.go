@@ -2404,6 +2404,46 @@ func TestRelayHoldGate(t *testing.T) {
 		t.Fatal("the stall pass is off for another run of the agent")
 	}
 
+	// The next inbox attempt for the held binding waits a minute: inside it,
+	// with the message still unread, no hub read past the agent's own is made.
+	if !p.NextHeldAttempt.Equal(now.Add(relayHeldRetry)) || relayHeldRetry < time.Minute {
+		t.Fatalf("next attempt after a held result at %s, want %s", p.NextHeldAttempt, now.Add(relayHeldRetry))
+	}
+	for _, wait := range []time.Duration{16 * time.Second, 45 * time.Second, 59 * time.Second} {
+		if err := relayOne(ctx, b, &p, c, now.Add(wait), queue); err != nil {
+			t.Fatal(err)
+		}
+		calls = hub.takeCalls()
+		if holds, _ := holdCalls(calls); holds != 0 || len(calls) != 2 || len(queued) != 1 || p.Wakes != wakes {
+			t.Fatalf("%s after a held result: calls %v, queued %d, wakes %d", wait, calls, len(queued), p.Wakes)
+		}
+	}
+	// At the minute it asks again, once, and is withheld again.
+	now = now.Add(relayHeldRetry)
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 1 || p.Wakes != wakes || !p.NextHeldAttempt.Equal(now.Add(relayHeldRetry)) {
+		t.Fatalf("a minute after a held result: %d holds reads, queued %d, wakes %d", holds, len(queued), p.Wakes)
+	}
+	// Continue: the very next attempt delivers the withheld message, and the
+	// spacing is gone. The hold is then written again for the cases below.
+	hub.update(func(h *needsInputHub) { h.heldRun = "" })
+	now = now.Add(relayHeldRetry)
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 2 || p.TeamHeld || !p.NextHeldAttempt.IsZero() || p.Skip != nil || p.Through != seq {
+		t.Fatalf("first attempt after continue: %d holds reads, queued %d, through %d", holds, len(queued), p.Through)
+	}
+	queued = queued[:1]
+	hub.update(func(h *needsInputHub) { h.heldRun = b.Run })
+	unread()
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil || !p.TeamHeld || len(queued) != 1 {
+		t.Fatalf("held again: %v queued %d", err, len(queued))
+	}
+	hub.takeCalls()
+
 	// The broker path makes no holds read: it asks for a lease as always, and
 	// the hub leases nothing for the held run.
 	job("wake_1")

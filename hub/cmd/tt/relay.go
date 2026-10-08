@@ -63,6 +63,10 @@ type relayProgress struct {
 	// hold fresh every time. The relay makes no read to learn of a hold it
 	// has not met on the inbox path.
 	TeamHeld bool `json:"teamHeld,omitempty"`
+	// NextHeldAttempt spaces inbox attempts after one was withheld by a
+	// hold: the hold ends only by an owner decision, so asking again every
+	// 15 seconds would only load the hub.
+	NextHeldAttempt time.Time `json:"nextHeldAttempt,omitempty"`
 	// Skip is host-local diagnostics for tt relay --status and the relay log.
 	// It never flows into Wake, the activity snapshot or any hub write.
 	Skip *relaySkip `json:"lastSkip,omitempty"`
@@ -644,6 +648,10 @@ func relayTeamHeld(ctx context.Context, c *api.Client, b runtimeBinding, a api.A
 	return holds.Held, nil
 }
 
+// relayHeldRetry is the least time between a withheld inbox attempt and the
+// next attempt for that binding.
+const relayHeldRetry = time.Minute
+
 // relayStallPassDue reports whether the stalled-turn pass runs for a binding.
 // A held team's quiet turn is the hold working, so it is never treated as a
 // stall and never interrupted.
@@ -829,7 +837,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		return nil
 	}
 	// The 15-second spacing defers a wake; it is not a skip.
-	if a.Unread == 0 || now.Sub(p.LastAttempt) < 15*time.Second {
+	if a.Unread == 0 || now.Sub(p.LastAttempt) < 15*time.Second || now.Before(p.NextHeldAttempt) {
 		return nil
 	}
 	if now.Sub(p.Window) >= 5*time.Minute {
@@ -903,10 +911,12 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if err != nil {
 		return err
 	}
-	p.TeamHeld = held
+	p.TeamHeld, p.NextHeldAttempt = held, time.Time{}
 	if held {
 		// Withheld, not attempted: it does not count toward the wake window.
+		// The next attempt for this binding waits a minute.
 		p.Wakes--
+		p.NextHeldAttempt = now.Add(relayHeldRetry)
 		recordRelaySkip(p, b.Agent, relayTeamHeldReason, seqs, 0, 0, now)
 		return nil
 	}
