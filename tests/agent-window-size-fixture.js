@@ -114,23 +114,42 @@ function endPrivateServer(socket) {
 }
 
 // Rejects with the name of the awaited step, so a hang reads as that step
-// instead of running to the check timeout.
+// instead of running to the check timeout. A step that timed out is kept in
+// stillPending until its promise settles after all.
+const stillPending = new Set();
 export function step(label, promise, ms = SIZING_STEP_TIMEOUT_MS) {
   let timer;
+  const late = { label },
+    settled = () => stillPending.delete(late);
+  Promise.resolve(promise).then(settled, settled);
   return Promise.race([
     promise,
     new Promise((resolve, reject) => {
-      timer = setTimeout(
-        () =>
-          reject(
-            Error(
-              `Agent sizing test step still pending after ${ms} ms: ${label}`,
-            ),
+      timer = setTimeout(() => {
+        stillPending.add(late);
+        reject(
+          Error(
+            `Agent sizing test step still pending after ${ms} ms: ${label}`,
           ),
-        ms,
-      );
+        );
+      }, ms);
     }),
   ]).finally(() => clearTimeout(timer));
+}
+// For a test file's after hook. A sizer whose command never returns keeps
+// polling, so the file's process would outlive its failed test and run to the
+// check timeout. When a timed out step is still pending, this ends the process
+// after ms, naming the step. The timer is unref'd and is armed only then, so
+// a file with nothing pending exits as it always did.
+export function exitIfStepsStayPending(ms = 3000) {
+  if (!stillPending.size) return;
+  setTimeout(() => {
+    if (!stillPending.size) return;
+    process.stderr.write(
+      `Agent sizing test file ended by force, step still pending: ${[...stillPending].map((late) => late.label).join("; ")}\n`,
+    );
+    process.exit(1);
+  }, ms).unref();
 }
 
 // A sizing command guards on one identity format. When tmux cuts that format

@@ -1,9 +1,11 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import vm from "node:vm";
 import { agentWindowSizeCommand } from "../shared/tmux-command.js";
 import {
+  exitIfStepsStayPending,
   readTmuxFormat,
   runBounded,
   setupAgentWindowFixture,
@@ -43,6 +45,10 @@ const valid = () => ({
 // Bound for a test that starts no private server. With the fixture's bound on
 // the others, every test in this file ends within its own timeout.
 const UNIT_TEST_TIMEOUT_MS = 20000;
+
+// A step that timed out and never settled would keep this file's process
+// running past its failed test; end it by name instead.
+after(() => exitIfStepsStayPending());
 
 // Runs one sizing command for this target and binding against the fixture's
 // private server: bounded, and run again when a loaded host cut the reply.
@@ -1497,10 +1503,12 @@ test(
   async () => {
     const started = Date.now();
     assert.equal(await step("a step that resolves", Promise.resolve(7), 40), 7);
+    let open;
     await assert.rejects(
-      step("A's claim reaches the gate", new Promise(() => {}), 40),
+      step("A's claim reaches the gate", new Promise((r) => (open = r)), 40),
       /^Error: Agent sizing test step still pending after 40 ms: A's claim reaches the gate$/,
     );
+    open(); // nothing stays pending behind this test
     const waiting = [];
     let answering = false;
     const c = createAgentWindowSizer({
@@ -1525,6 +1533,66 @@ test(
       await step("the sizer settles once its command is answered", c.settled());
     }
     assert.ok(Date.now() - started < 5000, "both hangs are reported fast");
+  },
+);
+
+test(
+  "a pending step that keeps the event loop alive ends its test file by name, and a file with none exits untouched",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    const dir = mkdtempSync(tmpdir() + "/tailterm-pending-step-");
+    const script = dir + "/held.mjs";
+    const url = (file) => JSON.stringify(new URL(file, import.meta.url).href);
+    // A test file of its own: with "held" its sizer's command never returns,
+    // so settled() polls for good and only the after hook can end the process.
+    writeFileSync(
+      script,
+      `import test, { after } from "node:test";
+import { step, exitIfStepsStayPending } from ${url("./agent-window-size-fixture.js")};
+import { createAgentWindowSizer } from ${url("../client/agent-window-size.js")};
+after(() => exitIfStepsStayPending(200));
+const held = process.argv[2] === "held";
+test("child", async () => {
+  const c = createAgentWindowSizer({
+    snapshot: () => (${JSON.stringify(valid())}),
+    token: () => "viewer_0000000000000001",
+    execute: (command) =>
+      held
+        ? new Promise(() => {})
+        : Promise.resolve(command.includes("ready:") ? "ready:" : "sized"),
+  });
+  c.refresh({ focus: true });
+  await step("the child sizer settles after focus", c.settled(), 100);
+  c.dispose();
+  await step("the child sizer settles after dispose", c.settled(), 100);
+});
+`,
+    );
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !k.startsWith("NODE_TEST")),
+    );
+    try {
+      const started = Date.now();
+      const stuck = runBounded(process.execPath, [script, "held"], {
+        env,
+        timeoutMs: 10000,
+      });
+      assert.equal(stuck.status, 1, stuck.stderr);
+      assert.match(
+        stuck.stderr,
+        /^Agent sizing test file ended by force, step still pending: the child sizer settles after focus$/m,
+      );
+      assert.match(stuck.stdout, /child/, "its test had already reported");
+      assert.ok(Date.now() - started < 5000, "the file ends fast");
+      const clean = runBounded(process.execPath, [script], {
+        env,
+        timeoutMs: 10000,
+      });
+      assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+      assert.doesNotMatch(clean.stderr, /ended by force/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 );
 
