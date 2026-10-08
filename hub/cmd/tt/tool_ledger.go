@@ -19,8 +19,12 @@ import (
 // The tool-call ledger (feature wi_f38d51348f280538) is observe-only. Claude
 // Code runs `tt hook tool` on PreToolUse, PostToolUse and PostToolUseFailure;
 // each tool call leaves one private local row. The hook never writes to
-// stdout or stderr, never talks to the hub, and cannot make tt exit non-zero,
-// so it cannot deny, delay or rewrite a call. See docs/claude-wake.md.
+// stderr, never talks to the hub, and cannot make tt exit non-zero, so it
+// cannot deny or delay a call. See docs/claude-wake.md.
+//
+// It writes to stdout in one case only: secret redaction (tool_redact.go),
+// which is off unless the host's relay.json says otherwise, answers a
+// PostToolUse with the same output and its token-shaped values replaced.
 //
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
@@ -66,10 +70,18 @@ type toolLedger struct {
 	lockWait   time.Duration
 	now        func() time.Time
 	write      func(*os.File, []byte) error
+	// Secret redaction (tool_redact.go). The token is compared against tool
+	// output in memory and never written.
+	token        string
+	redactMode   string
+	redactBudget time.Duration
+	redactMax    int
+	stdout       io.Writer
 }
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error,
-// cwd and transcript_path are skipped by the decoder and never kept.
+// cwd and transcript_path are skipped by the decoder and never kept. Secret
+// redaction decodes tool_response itself, and only when it is switched on.
 type toolHookInput struct {
 	Event       string          `json:"hook_event_name"`
 	Session     string          `json:"session_id"`
@@ -94,6 +106,11 @@ type toolLedgerRow struct {
 	DurationMs     *int64 `json:"durationMs,omitempty"`
 	DurationSource string `json:"durationSource,omitempty"`
 	Oversize       bool   `json:"oversize,omitempty"`
+	// Absent unless secret redaction is switched on for the host.
+	RedactMode  string         `json:"redactMode,omitempty"`
+	RedactCount *int           `json:"redactCount,omitempty"`
+	RedactKinds map[string]int `json:"redactKinds,omitempty"`
+	RedactSkip  string         `json:"redactSkip,omitempty"`
 }
 
 type toolLedgerPending struct {
@@ -149,6 +166,7 @@ func toolLedgerHook(e env, _ []string) {
 		started: time.Now(), deadline: toolLedgerDeadline,
 		maxInput: toolLedgerMaxInput, maxBytes: toolLedgerMaxBytes, maxPending: toolLedgerMaxPending,
 		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
+		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -198,6 +216,10 @@ func (l toolLedger) record(in io.Reader) {
 		return
 	case "PostToolUse":
 		row.Outcome = "ok"
+		// Off, the default, leaves tool_response undecoded and stdout empty.
+		if l.redactMode = toolRedactMode(); l.redactMode != toolRedactOff {
+			l.redact(&row, data)
+		}
 	case "PostToolUseFailure":
 		row.Outcome = "error"
 		if p.IsInterrupt {

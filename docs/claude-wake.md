@@ -205,7 +205,7 @@ Every tool call in a Tailterm Claude agent session leaves one private local row:
 
 `tt hook tool` can never deny, delay, rewrite or fail a tool call:
 
-- It writes nothing to stdout or stderr, so Claude Code has no decision to read.
+- It writes nothing to stderr, and nothing to stdout unless secret redaction is switched on for the host (see "Secret redaction"; it is off by default). Even then it cannot deny or fail a call: its only answer is the same output with values replaced.
 - It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
 - It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
@@ -288,7 +288,7 @@ A pre hook writes a pending file of at most 512 bytes with the start time, sessi
 - Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
 - A helper closed on the hub is still ledgered while this host's helper file names the session's thread. Telling would need a hub request, which the hook never makes. The rows are for calls that session really made, under the agent and run the file names. Registering the helper again from another session ends it.
 - Every Claude Code session on the host that is not a Tailterm agent now lists the relay state directory once per tool hook, to learn that it is not the helper.
-- Hub upload, deny or rewrite rules and budget caps are not part of this version.
+- Hub upload, deny rules and budget caps are not part of this version. The one rewrite is secret redaction, below.
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.
 
@@ -344,3 +344,129 @@ Why 5 seconds: the hook normally takes 6 to 12 ms and at most about 360 ms on th
 The same timeout was not given to the four older hooks, and it is not shown to be safe for them. `tt hook session-start`, `prompt`, `stop` and `notification` each make hub requests with client timeouts of 2 and 5 seconds, several in a row, so a slow hub can take them past 5 seconds while they are working correctly. Cutting off `tt hook stop` would also drop its decision to hold a turn open on unacknowledged work. A timeout for them needs its own measurement and is follow-up work.
 
 Replacing the `tt` binary while hooks run, measured with the candidate binary outside Claude Code: host setup installs by rename, so a call in flight keeps the binary it started with and exits 0, and the next call runs the new file. Across 300 consecutive calls with the binary replaced twice, every call exited 0 with no output and wrote its row. The first call after each replacement took 216 and 228 ms, against a median of 7 ms: macOS checks a new binary file on its first run. So the 200 ms bound is passed once after each install. This was not tried inside a Claude Code session.
+
+## Secret redaction
+
+Feature `wi_79001641d97cd64c` revision 3, owner build order #28624 on the design accepted in #28619, builder assignment #28649. This source change is a candidate. It ships switched off.
+
+When a tool call in a Tailterm Claude session returns output that holds a recognizable token or key, `tt hook tool` can count it (`report`) or replace it with a placeholder such as `[tt-redacted:github-token]` before the model receives it (`redact`). It is a step inside the ledger's existing `PostToolUse` hook: no hook entry is added, removed or changed, and `tt host setup` behaves as before. It is not a Claude Code mod.
+
+**Do not set `redact` on any host until the owner has answered decision D7** (see "The editing risk"). `report` changes no output and is the mode meant for the first week.
+
+### The host setting
+
+One key in `~/.config/tailterm/relay.json`, the file that holds `claudeStallAction`:
+
+```json
+{"claudeSecretRedaction": "report"}
+```
+
+| Value | Effect |
+| --- | --- |
+| `"off"`, a missing file, a file that cannot be read, a file over 64 KiB, malformed JSON, a missing key, any other value | Nothing. The hook does not decode the tool's output, writes nothing to stdout, and writes the same ledger row as before this feature. |
+| `"report"` | The output is scanned and the matches are counted in the ledger row. Nothing is printed and no output changes. Report mode never calls the rewrite. |
+| `"redact"` | Matches in groups A and B are replaced and all matches counted. Not to be used before D7 is answered. |
+
+The key must be spelled exactly `claudeSecretRedaction`; a key in another case is not it. The owner or the owner helper edits the file by hand, per host. There is no `tt` command for it, and neither `tt host setup` nor any release step creates or changes `relay.json`: a release leaves every host off, or at whatever the owner set. The file is read on each `PostToolUse`, so a change applies at the next tool call of every affected session, in both directions, with no restart. `TAILTERM_REDACT_SETTING_FILE` names another file; tests use it.
+
+### Which sessions
+
+The step runs only where the ledger writes a row: Claude sessions with a Tailterm agent identity, and the registered owner helper's Claude session. The owner's other Claude Code sessions on the host return before reading their input, as before, whatever the setting. Codex workers have no tool hook and are not covered. Only `PostToolUse`, a successful call, is scanned.
+
+### What is recognized
+
+A match lies inside one string value of the tool's structured output; object keys are not scanned. Group A is applied before group B, and overlapping matches become one replaced span named after the leftmost.
+
+**Group A, values this host holds** (`host-credential`): the hub token `tt` loaded, and the values of exactly these environment variables, each only when at least 16 characters long: `TAILTERM_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_API_KEY`, `DISCORD_TOKEN`, `DISCORD_BOT_TOKEN`, `TS_AUTHKEY`, `TS_API_KEY`. No other variable is read. The comparison is exact and in memory.
+
+**Group B, token shapes.** Each must start where the previous character is not a letter, digit or underscore. "Exactly" means a longer run of the same characters is a different string and is left alone; "at least" means the whole run is replaced, however long, so no tail is left. A value one character short is not a match: a truncated secret passes.
+
+| Name | Shape | Basis for the bounds |
+| --- | --- | --- |
+| `private-key` | a `BEGIN … PRIVATE KEY` header line (label of capitals, digits and spaces) through its matching `END` line; with no `END` line, everything to the end of that string value | the PEM format |
+| `github-token` | `gh` + one of `p o u s r` + `_` + exactly 36 letters or digits; or `github_pat_` + exactly 82 letters, digits or underscores | prefixes published by GitHub; lengths are the ones in use, not published |
+| `anthropic-key` | `sk-ant-` + at least 80 letters, digits, `_` or `-` | observed |
+| `openai-key` | `sk-proj-` + at least 40 letters, digits, `_` or `-`; or `sk-` + at least 40 letters or digits, and for this bare form not directly after a `-` either | observed |
+| `aws-access-key` | `AKIA` or `ASIA` + exactly 16 capitals or digits | prefixes published by AWS; length is the one in use |
+| `slack-token` | `xox` + one of `a b p r s` + `-` + at least 10 letters, digits or `-` | `xoxb-` and `xoxp-` published by Slack; the others are older forms |
+| `tailscale-key` | `tskey-` + `auth`, `api` or `client` + `-` + at least 20 letters, digits or `-` | observed |
+| `stripe-key` | `sk_live_` or `rk_live_` + at least 24 letters or digits | prefixes published by Stripe |
+| `npm-token` | `npm_` + exactly 36 letters or digits | prefix published by npm; length is the one in use |
+
+The vendor pages were read on 2026-10-07. They publish prefixes; none of those read publishes a length. Where a length is "exactly", a vendor that lengthens its tokens makes that shape miss, not misfire. Whether the unpublished lengths are confirmation enough for group B is for the owner helper to accept or change.
+
+**Group C, counted and never rewritten:** `assigned-secret` (20 or more varied characters after a name such as `api_key`, `secret`, `token` or `password` and `=` or `:`), `bearer` (the value after an `Authorization: Bearer` header), `jwt` (three dot-separated base64url parts whose first two decode as JSON objects), `url-password` (the password in a `scheme://user:password@host` address), `aws-secret-key` (40 characters after the AWS secret key name), and two shapes with no vendor-published bounds, moved here from the design's group B: `google-api-key` (`AIza` + exactly 35) and `discord-token` (three dot-separated parts). A group C match that a group A or B match already covers is not counted twice.
+
+Not attempted: bare high-entropy strings with no prefix and no name. They cannot be told from git hashes, digests and ids.
+
+### Fails open
+
+The hook can do two things on `PostToolUse`: print nothing, or print one JSON object carrying the rewritten output and a notice. It always exits 0 and never writes to stderr. There is one timer, the ledger's 150 ms: redaction has none of its own and does not lengthen it. The scan gives up 100 ms after the handler started.
+
+| Event | The session gets | Ledger row |
+| --- | --- | --- |
+| The scan reaches 100 ms | the original output | `redactSkip: "timeout"` |
+| `tool_response` is over 1 MiB | the original output, not scanned | `redactSkip: "oversize"` |
+| `tool_response` is missing or not JSON | the original output | `redactSkip: "unreadable"` |
+| The rewritten value would differ from the original in anything but string text | the original output | `redactSkip: "shape"` |
+| The 150 ms runs out anywhere, a blocked stdout included | the original output; the process exits 0 | possibly none |
+
+Fail-open means a secret passes whenever redaction is skipped. The answer is written before the row, because protecting the output matters more than recording it.
+
+Measured on the Mini (200 runs each, 95th percentile): a 100 KiB Bash output adds 2.4 ms; an output of the 1 MiB cap takes 22 ms, under the 50 ms the cap is required to fit in. `TT_REDACT_BENCH=1 go test -run TestToolRedactBenchmark ./cmd/tt` repeats it.
+
+### What is recorded
+
+Only the existing ledger row gains fields, absent when the setting is off:
+
+| Field | Content |
+| --- | --- |
+| `redactMode` | `report` or `redact` |
+| `redactCount` | number of matches in this output, all groups; absent when the scan was skipped |
+| `redactKinds` | match count per pattern name, for example `{"github-token": 1}`; absent when nothing matched |
+| `redactSkip` | `timeout`, `oversize`, `shape` or `unreadable` |
+
+Never written anywhere, by the hook, its tests or this document: the matched text, any part of it, its length, its position or a hash of it; the tool output or input; the hub token, environment values or vault content. No new file, hub request, log line or board message exists. The ledger's `argsDigest` is unchanged: a token typed into a command is inside that SHA-256.
+
+In `redact` mode the answer also carries a notice to the model, as hook context: how many values were replaced, and that a placeholder must not be written into any file. It is advice, not a control.
+
+### The editing risk (decision D7, unanswered)
+
+In `redact` mode an agent that reads a file holding a secret sees the placeholder. An exact-match edit that includes the placeholder fails harmlessly. A whole-file write would save the placeholder over the real value. The notice asks the model not to; nothing enforces it. The owner has not yet accepted this risk, chosen to leave the Read tool's output unrewritten, or declined the mode. Until that answer is recorded, `redact` must not be switched on.
+
+### What Claude Code does with the answer
+
+Observed with Claude Code 2.1.293 on 2026-10-07 by the opt-in sandbox probe (`TT_LIVE_CLAUDE=1 go test -run TestSecretRedactionSandboxProbe ./cmd/tt`): disposable `claude -p` sessions in a temporary project, an environment built from nothing (`PATH`, `TERM`, the real `HOME` for Claude Code's own login, sandbox paths, a made-up identity, an unreachable hub, a generated token), and a value generated for each check. Checks 1, 2, 5, 7 and 8 ran the freshly built `tt hook tool`; 3, 4 and 6 ran a test helper that misbehaves.
+
+| Check | Observed |
+| --- | --- |
+| 1. `redact`, Bash command that prints the value | The model received the placeholder in the tool result and repeated it; the value reached neither. The session transcript holds the placeholder only. No other file Claude Code wrote during the run holds the value. |
+| 2. `report`, same command | Output unchanged; the row counted one `github-token`. The transcript holds the value, in the tool-result row and the reply. |
+| 3. An answer of the wrong shape (a string for an object) | Claude Code used the original output. |
+| 4. A hook that hangs | Claude Code used the original output 5.1 seconds after the call, the entry's timeout. |
+| 5. `redact`, a Bash command that prints the value and exits non-zero | The value reached the model and the transcript. `PostToolUseFailure` cannot be rewritten. |
+| 6. Half of a JSON answer | Claude Code used the original output. |
+| 7. `redact`, the Read tool on a file holding the value | As check 1: placeholder in the tool result, the reply and the transcript. Read's output is an object with `file` and `type`; the value is in `file.content`. |
+| 8. `report`, the Read tool | As check 2. |
+
+On that evidence the owner helper resolved decision D5 in #28664: after a rewrite, the transcript holds the rewritten output.
+
+Limits of these findings: three runs in all (two with a test helper doing the rewrite, one with the built `tt`), the haiku model, the Bash and Read tools only, one short single-line file. Other tools' output shapes were not tried. Files were searched only where Claude Code wrote during the run (its home folder, its JSON file, its cache and its temporary folder). **Network telemetry cannot be observed from the host and is treated as unprotected**: Claude Code may send the original output before the hook runs.
+
+The probe touches the real home in two stated ways: Claude Code reads its own login, and writes the disposable sessions' transcript folder, which the probe deletes. The installed `tt hook tool` also runs in those sessions and, given the sandbox environment, wrote only under the sandbox. Before cleanup the probe searches the working tree for every generated value and requires none; after it, the sandbox and the transcript folder must be gone.
+
+### Limits
+
+- Output of a failed tool call is not covered (check 5). A command that prints a token and exits non-zero reaches the model unredacted.
+- Tool input, the owner's prompts, pasted text, attachments and hook context are not covered.
+- Codex workers, messages posted to the board or the hub, existing transcripts and ledger files, and anything exposed before the setting was switched on are not covered.
+- A secret split across two string values, a truncated secret, and a secret with no recognizable prefix or name pass.
+- Two tokens of an exact-length shape written with nothing between them are one longer run and pass.
+- A private key header with no end line hides the rest of that string value, which is the intent for a cut-off key and a cost when the header is only being quoted.
+- If another `PostToolUse` hook also rewrites output, Claude Code runs both on the original and the last answer wins. Today tt's is the only one.
+- Report counts measure how often a pattern fires, not whether a hit was a real secret: the ledger stores no text. Judging a hit takes a person looking at that session.
+- False positives are measured by a labelled corpus in the default test run: every group B shape is replaced in six contexts, and group B matches nothing in 18,000 generated look-alikes (git hashes, digests, UUIDs, base64 data, message numbers, item ids). The look-alikes come from a fixed seed, so the result is the same on every run. With random look-alikes the bare `sk-` shape matched dash-joined base64url text about once in five runs, which is why it now refuses a start after a `-`. What remains is base64url text that itself begins with `sk-` and 40 letters or digits, about one in a million such strings. Over the repository's tracked files it matches only four files that hold deliberate secret-shaped fixtures, pinned in the test by pattern and count (accepted in #29033): `client/main.js` (one `private-key`, a text box placeholder), `hub/cmd/tt/handoff_test.go` (one `private-key`), `hub/internal/bridge/helper_test.go` (two `aws-access-key`, one `github-token`, one `private-key`, two `slack-token`) and `hub/internal/jev/testdata/redact_corpus.json` (one `github-token`). Any other match, or a change in those counts, fails the test.
+
+### Activation and rollback
+
+A release changes nothing by itself: the new `tt` reads a setting that no host has. To start the report week on a host, the owner or owner helper adds `"claudeSecretRedaction": "report"` to that host's `relay.json`. To stop, remove the key or set `"off"`; it applies at the next tool call. Rolling `tt` back with `tt host setup --rollback` removes the feature with the binary; an older `tt` ignores the key.

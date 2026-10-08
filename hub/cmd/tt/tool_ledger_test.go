@@ -35,6 +35,9 @@ func toolLedgerSandbox(t *testing.T) (env, string) {
 	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(t.TempDir(), "relay"))
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
 	t.Setenv("CODEX_THREAD_ID", "")
+	// Secret redaction is off: its setting file is one that does not exist,
+	// never this host's relay.json.
+	t.Setenv("TAILTERM_REDACT_SETTING_FILE", filepath.Join(t.TempDir(), "relay.json"))
 	return env{hub: "http://127.0.0.1:9", task: "tsk_ledger", agent: "agt_ledger", runID: "run_ledger"}, root
 }
 
@@ -1143,5 +1146,47 @@ func TestToolLedgerHelperStoresNoSecrets(t *testing.T) {
 		if rows[i]["agent"] != file.Agent || rows[i]["task"] != file.Task || rows[i]["run"] != file.Run {
 			t.Errorf("row %d identity = %v %v %v", i, rows[i]["agent"], rows[i]["task"], rows[i]["run"])
 		}
+	}
+}
+
+// Secret redaction off, which is the default and every unusable setting:
+// a PostToolUse whose output holds a token-shaped value prints nothing and
+// writes exactly the row the ledger wrote before redaction existed.
+func TestToolLedgerRedactionOffChangesNothing(t *testing.T) {
+	c := redactShapeCases[0]
+	value := c.make(t, c.n)
+	settings := map[string]string{
+		"no file": "", "off": `{"claudeSecretRedaction":"off"}`, "another value": `{"claudeSecretRedaction":"yes"}`,
+		"another case": `{"claudesecretredaction":"redact"}`, "malformed": `{"claudeSecretRedaction":"redact"`, "no key": `{"claudeStallAction":"report"}`,
+		"a directory": "/",
+	}
+	for label, content := range settings {
+		t.Run(label, func(t *testing.T) {
+			e, root := toolLedgerSandbox(t)
+			path := os.Getenv("TAILTERM_REDACT_SETTING_FILE")
+			switch content {
+			case "":
+			case "/":
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.token = value
+			input := map[string]any{"command": "cat value.txt"}
+			toolHook(t, e, "PostToolUse", map[string]any{"session_id": "s1", "tool_name": "Bash", "tool_use_id": "u1", "tool_input": input, "duration_ms": 12,
+				"tool_response": map[string]any{"stdout": value + "\n", "stderr": "", "interrupted": false}})
+			rows := toolLedgerRows(t, root, e.agent)
+			canonical, _ := json.Marshal(input)
+			want := map[string]any{"v": float64(1), "time": rows[0]["time"], "task": "tsk_ledger", "agent": "agt_ledger", "run": "run_ledger", "session": "s1", "tool": "Bash", "toolUseId": "u1",
+				"argsDigest": toolArgsDigest(canonical), "outcome": "ok", "durationMs": float64(12), "durationSource": "claude"}
+			// fmt prints a map's keys in sorted order.
+			if len(rows) != 1 || fmt.Sprint(rows[0]) != fmt.Sprint(want) {
+				t.Fatalf("the row with redaction off is not the ledger's own row: %d rows", len(rows))
+			}
+		})
 	}
 }
