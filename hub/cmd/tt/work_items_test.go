@@ -57,16 +57,55 @@ func captureCLIOutput(t *testing.T, fn func() error) (string, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.Stdout = w
-	runErr := fn()
-	_ = w.Close()
-	os.Stdout = old
-	data, readErr := io.ReadAll(r)
-	_ = r.Close()
-	if readErr != nil {
-		t.Fatal(readErr)
+	// Read while fn runs: a pipe holds only one buffer (64 KiB on macOS), so a
+	// command that prints more would otherwise block in write forever.
+	type captured struct {
+		data []byte
+		err  error
 	}
-	return string(data), runErr
+	done := make(chan captured, 1)
+	go func() {
+		defer r.Close()
+		data, err := io.ReadAll(r)
+		done <- captured{data, err}
+	}()
+	os.Stdout = w
+	runErr := func() error {
+		defer func() {
+			os.Stdout = old
+			_ = w.Close()
+		}()
+		return fn()
+	}()
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	return string(out.data), runErr
+}
+
+func TestCaptureCLIOutputReturnsOutputLargerThanAPipeBuffer(t *testing.T) {
+	var want bytes.Buffer
+	for i := 0; want.Len() <= 1<<20; i++ {
+		fmt.Fprintf(&want, "line %07d of output larger than one pipe buffer\n", i)
+	}
+	old := os.Stdout
+	failure := fmt.Errorf("command failed after printing")
+	got, err := captureCLIOutput(t, func() error {
+		if _, err := os.Stdout.Write(want.Bytes()); err != nil {
+			return err
+		}
+		return failure
+	})
+	if err != failure {
+		t.Fatalf("error = %v, want the command's own error", err)
+	}
+	if os.Stdout != old {
+		t.Fatal("os.Stdout was not restored")
+	}
+	if got != want.String() {
+		t.Fatalf("captured %d bytes, want %d bytes returned intact", len(got), want.Len())
+	}
 }
 
 func TestWorkItemsCLIUsesBodyFilesAndDurableReceipts(t *testing.T) {
