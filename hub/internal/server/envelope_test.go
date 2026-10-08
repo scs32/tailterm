@@ -338,3 +338,76 @@ func TestRelayMarkedNoticeRepliesToNothing(t *testing.T) {
 		t.Fatalf("unmarked envelope reply author %+v replyTo %d, want the owner replying to %d", reply.From, reply.ReplyTo, asked.Seq)
 	}
 }
+
+// The relay finds the receipt of a notice it posted as itself: the lookup
+// applies the marker the way the post does, and only there, so the marker
+// reads nothing but the relay's own posts (wi_a151ecf5bd12748e).
+func TestRelayMarkedReceiptLookup(t *testing.T) {
+	h := newTokenHub(t)
+	task, _, _ := h.project()
+	builder := h.agentNamed(task, "builder")
+	path := "/v1/tasks/" + task.ID + "/messages"
+	do := func(token, method, target string, marked bool, body, out any) int {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buf).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequest(method, h.url+target, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		if marked {
+			req.Header.Set(RelayAuthorHeader, "1")
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		if out != nil {
+			_ = json.NewDecoder(res.Body).Decode(out)
+		}
+		return res.StatusCode
+	}
+	post := func(marked bool, req api.PostMessageRequest) api.Message {
+		t.Helper()
+		var m api.Message
+		if code := do(ownerToken, "POST", path, marked, req, &m); code != 201 {
+			t.Fatalf("post %q: %d", req.RequestID, code)
+		}
+		return m
+	}
+	notice := &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A relay notice", Body: api.EnvelopeBody{Text: "text"}}
+	relayed := post(true, api.PostMessageRequest{Envelope: notice, RequestID: "relay-notice-0001"})
+	if relayed.From != (api.Sender{Node: RelayNode, User: RelayUser}) {
+		t.Fatalf("marked notice author %+v, want the relay", relayed.From)
+	}
+	owned := post(false, api.PostMessageRequest{Text: "an owner post", RequestID: "owner-post-0001"})
+	agent := post(false, api.PostMessageRequest{Text: "an agent post", AgentID: builder.ID, RequestID: "agent-post-0001"})
+
+	for _, tc := range []struct {
+		name, token, target string
+		marked              bool
+		code                int
+		seq                 int64
+	}{
+		{"the relay's notice with the marker", ownerToken, "relay-notice-0001", true, 200, relayed.Seq},
+		{"the relay's notice without the marker", ownerToken, "relay-notice-0001", false, 404, 0},
+		{"the relay's notice from the bridge with the marker", bridgeToken, "relay-notice-0001", true, 400, 0},
+		{"the relay's notice with the marker and an agent", ownerToken, "relay-notice-0001?agentId=" + builder.ID, true, 400, 0},
+		{"an owner post with the marker", ownerToken, "owner-post-0001", true, 404, 0},
+		{"an owner post without the marker", ownerToken, "owner-post-0001", false, 200, owned.Seq},
+		{"an agent post with the marker", ownerToken, "agent-post-0001", true, 404, 0},
+		{"an agent post with the marker and its agent", ownerToken, "agent-post-0001?agentId=" + builder.ID, true, 400, 0},
+		{"an agent post without the marker", ownerToken, "agent-post-0001?agentId=" + builder.ID, false, 200, agent.Seq},
+	} {
+		var found api.Message
+		if code := do(tc.token, "GET", path+"/receipts/"+tc.target, tc.marked, nil, &found); code != tc.code || found.Seq != tc.seq {
+			t.Fatalf("lookup of %s: status %d seq %d, want %d and %d", tc.name, code, found.Seq, tc.code, tc.seq)
+		}
+	}
+}

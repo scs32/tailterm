@@ -752,9 +752,18 @@ func (s *Server) getMessagePostReceipt(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	message, err := s.store.GetMessagePostReceipt(
-		r.Context(), id, r.PathValue("requestID"), r.URL.Query().Get("agentId"), c,
-	)
+	agentID := r.URL.Query().Get("agentId")
+	// postMessage records a relay-marked notice as the relay's, so its receipt
+	// is looked up under the same author. The marker is accepted only where a
+	// post accepts it, so it reads nothing but what the relay itself posted.
+	if r.Header.Get(RelayAuthorHeader) != "" {
+		if c.Node == api.BridgeNode || agentID != "" {
+			writeError(w, http.StatusBadRequest, "a relay-authored receipt lookup comes from no bridge and names no agent")
+			return
+		}
+		c = api.Caller{Node: RelayNode, User: RelayUser}
+	}
+	message, err := s.store.GetMessagePostReceipt(r.Context(), id, r.PathValue("requestID"), agentID, c)
 	if err != nil {
 		fail(w, err)
 		return
