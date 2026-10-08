@@ -501,6 +501,77 @@ The first scheduled run on a host deletes whatever a manual
 `--min-idle 6h --apply` would. Run the manual dry run with `--min-idle 6h`
 first, then read `--journal` after the run.
 
+**Go build cache trim.** The sweep leaves the shared Go build cache alone.
+A separate trim, in the same relay pass and before the sweep, removes build
+cache entries that no build has used for a set time. It is off by default and
+is turned on per host, by the owner, in that host's
+`~/.config/tailterm/relay.json`, read at each check:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `goBuildCacheTrim` | absent, which is off | `"on"` turns the trim on for this host; `"off"` or no key is off. |
+| `goBuildCacheTrimMaxAge` | `"24h"` | Entries whose modification time is older than this go. A Go duration; at least `2h`. |
+| `goBuildCacheTrimInterval` | `"1h"` | Time between trims, a Go duration; at least `5m`. |
+
+`go` refreshes an entry's modification time when it uses the entry and the
+time is more than an hour old, which is why the age cannot be set under 2
+hours. A value under its floor uses the floor and a bad value uses the
+default; each says so once on the relay's stderr. A `goBuildCacheTrim` value
+other than `"on"` or `"off"` skips the run (`settings`). A missing or
+unreadable file is off. The sweep's own switch, `worktreeSweep`, does not
+affect the trim.
+
+The never-clear rule still holds (`docs/go-build-cache.md`): nothing may clear
+the Go build cache, and this trim is not a clear. It never runs `go clean`,
+and it never touches the module cache (`~/go/pkg/mod`) or any other cache.
+
+- The cache is the directory `go env GOCACHE` names. If `go` cannot be run the
+  trim is skipped (`no-go`); there is no fallback path.
+- The directory is trimmed only if it is a real directory, not a symlink, that
+  holds Go's own `README`, and is not the home directory, the module cache, a
+  directory holding either, or a directory inside the module cache
+  (`not-a-cache` otherwise, with the cause in `detail`).
+- Only regular files whose names end `-a` or `-d`, directly inside the cache's
+  two-hex-digit directories (`00` to `ff`), are removed. The cache directory,
+  every directory in it, `README`, `trim.txt`, `fuzz` and any other name stay.
+- No symlink is followed. The cache and each two-hex directory are opened once
+  and all work is relative to those open directories, so a path swapped for a
+  symlink during a run redirects nothing.
+- One trim runs at a time on a host (`go-cache-trim.lock` in the relay state
+  directory). A skipped or failed attempt is tried again 5 minutes later.
+
+*Receipt.* Each run appends one line to the sweep's journal,
+`worktree-sweep.jsonl`, read with `tt team queue sweep-worktrees --journal`:
+
+```json
+{"at":"…","source":"go-cache-trim","outcome":"trimmed","reason":"",
+ "filesRemoved":812,"bytesFreed":123,"cacheBytesAfter":456,
+ "freeBytesAfter":789,"maxAge":"24h0m0s","lowSpace":false,"durationMs":950}
+```
+
+The line also carries the sweep's other keys, unused. `outcome` is `trimmed`,
+`skipped` (`settings`, `no-go`, `not-a-cache`) or `failed` (`state`, `walk`).
+`filesRemoved` counts the entries removed and `bytesFreed` is the sum of their
+sizes. `cacheBytesAfter` is the sum of the sizes of the regular files left
+directly inside the two-hex directories, whatever their names; it leaves out
+`README`, `trim.txt`, `fuzz` and anything deeper, and it is file size, not
+disk blocks, so it differs from `du`. `freeBytesAfter` is the free space of
+the cache's own volume, or `-1` when it could not be read. All three counts
+are written when they are zero. `detail` says `stopped early` when the pass's
+time ran out, and counts entries that could not be removed.
+
+*Low space.* The trim never posts a message. Its line sets `lowSpace` when the
+cache's volume is below `worktreeSweepLowSpaceGiB`, and the sweep's one notice
+per low-space episode ends with the trim's last run: when it ran, how many
+entries it removed, what it freed and what the cache now holds, or that the
+trim is off or has not run. Limit: an episode begins only from the sweep's
+reading of the repositories' volumes. A Go build cache on a volume that holds
+no repository can run low without any notice; its `lowSpace` shows only in
+the journal.
+
+Turning it on: add `"goBuildCacheTrim": "on"` to the host's `relay.json` and
+read the first receipt with `--journal`. No relay restart is needed.
+
 ## Queue chores the product handles
 
 **Narrowing after acceptance.** Once the handler's acceptance is saved on a

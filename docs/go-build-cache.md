@@ -5,12 +5,22 @@ Mini reached 48 GB (#15923) and grew about 0.5 GB an hour (#16305).
 
 ## Policy
 
-- Never delete, clear or trim `~/Library/Caches/go-build` or `~/go/pkg`
-  (owner rule). No script, test or cleanup runs `go clean -cache`,
-  `go clean -modcache` or removes files there.
-- Go's own trim is the only eviction: at most once a day, `go` removes cache
+- Never clear `~/Library/Caches/go-build` and never delete, clear or trim
+  `~/go/pkg` (owner rule). No script, test or cleanup runs `go clean -cache`,
+  `go clean -modcache` or removes files there. A full clear forces slow
+  rebuilds for every team on the host.
+- One exception, for the build cache only: the relay's age trim (feature
+  `wi_cdd0f429675a3bae`, work order #28960; "Go build cache trim" in
+  `docs/team-launch.md`). It removes only build cache entries unused for
+  longer than a set age, 24 hours by default, and never the cache directory,
+  its `README`, `trim.txt` or the module cache. It is off by default and the
+  owner turns it on per host with `goBuildCacheTrim` in
+  `~/.config/tailterm/relay.json`.
+- Go's own trim still runs as well: at most once a day, `go` removes cache
   entries unused for 5 days (`trimInterval` and `trimLimit` in
-  `cmd/go/internal/cache`).
+  `cmd/go/internal/cache`). Under team load the cache grows far faster than
+  that removes (about 1 GiB an hour on the Mini on 2026-10-07), which is why
+  the age trim exists.
 - Measurements and experiments use a scratch `GOCACHE` (and `GOMODCACHE`) in a
   temporary directory.
 

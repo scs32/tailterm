@@ -1437,7 +1437,9 @@ with `--min-idle 6h` by default, set or switched off in
 line to `worktree-sweep.jsonl`, which `--journal` prints, and the owner helper
 gets one notice per low-space episode. `docs/team-launch.md` ("Scheduled
 sweep") has the settings, the skip reasons, the matrix lock rules, the journal
-fields and the notice rule.
+fields and the notice rule. The same section describes the Go build cache
+trim (`goBuildCacheTrim`, off by default), which writes its receipts to the
+same journal.
 
 Without `--apply` it is a dry run that writes nothing: no manifest, no
 receipt, no ref. It lists each verifier checkout and session temp folder with

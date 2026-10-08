@@ -71,6 +71,31 @@ func sweepSettingsWarn(key, raw, used string) {
 	}
 }
 
+// readRelayConfig reads ~/.config/tailterm/relay.json as its top-level keys.
+// A missing file is no keys and no fault; a file that exists but cannot be
+// read, is over 64 KiB or is not a JSON object is a fault.
+func readRelayConfig() (map[string]json.RawMessage, string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, "no home directory"
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".config", "tailterm", "relay.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, ""
+	}
+	if err != nil {
+		return nil, "relay.json cannot be read"
+	}
+	if len(data) > 64<<10 {
+		return nil, "relay.json is larger than 64 KiB"
+	}
+	var config map[string]json.RawMessage
+	if json.Unmarshal(data, &config) != nil || config == nil {
+		return nil, "relay.json is not a JSON object"
+	}
+	return config, ""
+}
+
 // readSweepSettings reads the four worktreeSweep keys from
 // ~/.config/tailterm/relay.json, each by its exact name (see
 // relayStallAction). A missing file means the defaults. A file that exists but
@@ -80,23 +105,9 @@ func sweepSettingsWarn(key, raw, used string) {
 // its default and says so once on stderr.
 func readSweepSettings() (sweepSettings, string) {
 	settings := defaultSweepSettings()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return settings, "no home directory"
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".config", "tailterm", "relay.json"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return settings, ""
-	}
-	if err != nil {
-		return settings, "relay.json cannot be read"
-	}
-	if len(data) > 64<<10 {
-		return settings, "relay.json is larger than 64 KiB"
-	}
-	var config map[string]json.RawMessage
-	if json.Unmarshal(data, &config) != nil || config == nil {
-		return settings, "relay.json is not a JSON object"
+	config, fault := readRelayConfig()
+	if fault != "" {
+		return settings, fault
 	}
 	if raw, ok := config["worktreeSweep"]; ok {
 		var value string
@@ -168,6 +179,8 @@ type sweepState struct {
 	Episode        *sweepEpisode  `json:"episode,omitempty"`
 	PendingNotices []sweepNotice  `json:"pendingNotices,omitempty"`
 	Intents        []detachIntent `json:"intents,omitempty"`
+	// GoCacheTrim is the Go build cache trim's schedule and last receipt.
+	GoCacheTrim *goCacheTrimState `json:"goCacheTrim,omitempty"`
 }
 
 func sweepStatePath() string { return filepath.Join(relayDir(), "worktree-sweep-state.json") }
@@ -669,6 +682,11 @@ type sweepJournalLine struct {
 	NoticePending     string         `json:"noticePending"`
 	// NoticesDropped counts pending notices dropped because the list was full.
 	NoticesDropped int `json:"noticesDropped,omitempty"`
+	// Set on every Go build cache trim line (source go-cache-trim), so a zero
+	// is written; absent from sweep lines.
+	FilesRemoved    *int64 `json:"filesRemoved,omitempty"`
+	CacheBytesAfter *int64 `json:"cacheBytesAfter,omitempty"`
+	MaxAge          string `json:"maxAge,omitempty"`
 }
 
 func sweepJournalPath() string { return filepath.Join(relayDir(), "worktree-sweep.jsonl") }
@@ -737,6 +755,10 @@ func printSweepJournal(limit int, jsonOut bool) error {
 		return nil
 	}
 	for _, l := range lines {
+		if l.Source == goCacheTrimSource {
+			fmt.Println(goCacheTrimJournalText(l))
+			continue
+		}
 		if l.Outcome != "swept" {
 			text := fmt.Sprintf("%s %s %s", l.At, l.Outcome, l.Reason)
 			if l.Detail != "" {
@@ -902,7 +924,7 @@ func sweepNoticeRequestID(host string, start time.Time) string {
 // helper across the hub's projects, in that helper's project, or with no
 // recipient to the Board of the project of this host's newest queue entry.
 // It returns false when there is nowhere to post.
-func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, threshold int64, kept []sweepKept, now time.Time) (sweepNotice, bool) {
+func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, threshold int64, kept []sweepKept, trim *goCacheTrimState, now time.Time) (sweepNotice, bool) {
 	var helper api.Agent
 	for _, a := range hub.agents {
 		if a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
@@ -936,6 +958,7 @@ func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, th
 		text += " Nothing it kept holds any data."
 	}
 	text += " The relay sends this once per low-space episode. Read the runs with tt team queue sweep-worktrees --journal."
+	text += " " + goCacheTrimNoticeSentence(trim)
 	envelope := api.Envelope{Kind: api.EnvelopeKindNotice, To: helper.Name, Subject: sweepNoticeSubject, Refs: map[string]string{"host": host}, Body: api.EnvelopeBody{Text: text}}
 	return sweepNotice{RequestID: sweepNoticeRequestID(host, now), TaskID: task, To: helper.ID, ToName: helper.Name, Envelope: envelope, Text: api.RenderText(envelope), FrozenAt: now.UTC()}, true
 }
@@ -1094,7 +1117,7 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	line.LowSpace = line.FreeBytesAfter >= 0 && line.FreeBytesAfter < settings.LowSpaceBytes
 	var notice *sweepNotice
 	if line.LowSpace && state.Episode == nil {
-		if frozen, ok := freezeSweepNotice(host, hub, line, settings.LowSpaceBytes, largestKept(all), now); ok {
+		if frozen, ok := freezeSweepNotice(host, hub, line, settings.LowSpaceBytes, largestKept(all), state.GoCacheTrim, now); ok {
 			notice = &frozen
 		}
 	}
@@ -1148,8 +1171,10 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	return true
 }
 
-// relaySweepSchedule is the relay's scheduled sweep; tests replace it.
+// relaySweepSchedule is the relay's scheduled sweep, with the Go build cache
+// trim before it; tests replace it.
 var relaySweepSchedule = func(ctx context.Context) {
+	goCacheTrimAttempt(ctx, nativeGoCacheTrimDeps())
 	sweepScheduleAttempt(ctx, nativeSweepScheduleDeps())
 }
 
