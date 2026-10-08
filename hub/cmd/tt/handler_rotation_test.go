@@ -824,10 +824,9 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	if strings.Contains(briefing, "an unscoped queued entry waits until nothing else runs") {
 		t.Fatal("queue handler briefing still asks for hand scoping")
 	}
-	// The lane default and the amendment definition (wi_2b66e2a634afa39d)
-	// change the template again.
-	const before = "13fde4ef0dfd1e49c301770b452e76fb7aa5f9a62e6d5388487c59bd26664030" // f9c15ca
-	const current = "099dff2eecaadc67c6b90a6a9709331b23922e50663ec20c4c5b28a2fbcd98b4"
+	// The evidence note rule (wi_85148428c4ab9c9b) changes the template again.
+	const before = "099dff2eecaadc67c6b90a6a9709331b23922e50663ec20c4c5b28a2fbcd98b4" // 8d0cd83
+	const current = "e47b2530c7f23eefc0f55a75352a760a095b9e371533d218f0a799d3c5e69683"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}

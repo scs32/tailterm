@@ -901,3 +901,33 @@ func TestBriefingNamesLeadAndVerifierOperationException(t *testing.T) {
 		t.Fatalf("handler briefing carries the agent rule: %s", handler)
 	}
 }
+
+// wi_85148428c4ab9c9b: the primary handler records evidence on an existing
+// item as a note, never as a description change, and the browser handler
+// prompt in client/project-handler.js carries the same sentences.
+func TestPrimaryHandlerGuidanceRecordsEvidenceAsNotes(t *testing.T) {
+	const rule = "Record a recurrence, log reference or other evidence on an existing item with tt work-items note --request-id KEY --title T --body-file F WI_ID: it changes neither the item revision nor the scope revision. Never append evidence to the description of an accepted or released item. The hub refuses a title or description change while an accepted candidate awaits release; pass --scope-change only for a recorded scope amendment, because it invalidates that release."
+	if handlerEvidenceRule != rule {
+		t.Fatalf("evidence rule changed: %q", handlerEvidenceRule)
+	}
+	if n := strings.Count(primaryHandlerGuidance, rule); n != 1 || strings.Count(primaryHandlerGuidance, "tt work-items note") != 1 || strings.Count(primaryHandlerGuidance, "--scope-change") != 1 {
+		t.Fatalf("handler role text states the evidence rule %d times", n)
+	}
+	browser, err := os.ReadFile("../../../client/project-handler.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(browser), rule); n != 1 {
+		t.Fatalf("browser handler prompt states the evidence rule %d times", n)
+	}
+	const steward = "To record a recurrence or new evidence on an existing item, ask the database handler for an evidence note (tt work-items note). Never ask for a description append on an accepted or released item: it advances the scope revision and blocks the release."
+	for _, path := range []string{"../../../client/team-examples.js", "../../internal/teamplan/plan.mjs", "../../../docs/backlog-steward.md"} {
+		text, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := strings.Count(string(text), steward); n != 1 {
+			t.Fatalf("%s states the steward evidence rule %d times", path, n)
+		}
+	}
+}

@@ -1234,3 +1234,136 @@ func TestTokenBudgetMigratesBaseSchema(t *testing.T) {
 		t.Fatalf("a second open changed the database:\n%s\n%s", first, second)
 	}
 }
+
+// releaseEntryItem returns the bug behind a releaseEntry queue entry.
+func releaseEntryItem(t *testing.T, s *Store, task api.Task, entry string) api.WorkItem {
+	t.Helper()
+	var itemID string
+	if err := s.db.QueryRow(`SELECT item_id FROM team_queue_entries WHERE id=?`, entry).Scan(&itemID); err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.GetWorkItem(context.Background(), task.ID, itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
+}
+
+// A title or description change is refused by both update routes while the
+// item's accepted candidate awaits release, and the refusal names the job.
+func TestScopeEditRefusedWhileAcceptedCandidateAwaitsRelease(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	item := releaseEntryItem(t, s, task, entry)
+	appended, retitled := item.Description+"\nRecurrence: seen again", "Renamed after acceptance"
+	refused := func(when string, wants ...string) {
+		t.Helper()
+		_, legacy := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &appended}, by)
+		_, _, keyed := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Title: &retitled, RequestID: "refused-" + when}, by)
+		for route, err := range map[string]error{"PATCH": legacy, "keyed": keyed} {
+			if !errors.Is(err, api.ErrConflict) {
+				t.Fatalf("%s %s: err=%v, want a conflict", when, route, err)
+			}
+			for _, want := range append(wants, "--scope-change", "tt work-items note", entry) {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s %s: %q does not name %q", when, route, err, want)
+				}
+			}
+		}
+		got, err := s.GetWorkItem(ctx, task.ID, item.ID)
+		if err != nil || got.Revision != item.Revision || got.ScopeRevision != item.ScopeRevision || got.Description != item.Description || got.Title != item.Title {
+			t.Fatalf("%s: a refused edit changed the item: %+v err=%v", when, got, err)
+		}
+	}
+	refused("no-job", "no release job yet")
+	// The marker means nothing without a title or description.
+	high := "high"
+	if _, _, err := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &high, ScopeChange: true, RequestID: "marker-alone"}, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("scope change marker without title or description: %v", err)
+	}
+	if _, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Priority: &high, ScopeChange: true}, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("PATCH scope change marker without title or description: %v", err)
+	}
+
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused("verified", j.ID, "state "+j.State)
+	action := func(op string) api.ReleaseRequest {
+		return api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+	}
+	if j, err = s.ReleaseAction(ctx, task.ID, action("claim")); err != nil {
+		t.Fatal(err)
+	}
+	refused("claimed", j.ID, "state claimed")
+	merged := action("merged")
+	merged.IntegratedCommit = j.Commit
+	if j, err = s.ReleaseAction(ctx, task.ID, merged); err != nil {
+		t.Fatal(err)
+	}
+	finish := action("finish")
+	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+	if j, err = s.ReleaseAction(ctx, task.ID, finish); err != nil || j.State != "released" {
+		t.Fatalf("finish: state=%q err=%v", j.State, err)
+	}
+	saved, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &appended}, by)
+	if err != nil || saved.Description != appended || saved.ScopeRevision != item.ScopeRevision+1 {
+		t.Fatalf("PATCH after release: %+v err=%v", saved, err)
+	}
+	if _, _, err = s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: saved.Revision, Title: &retitled, RequestID: "after-release"}, by); err != nil {
+		t.Fatalf("keyed update after release: %v", err)
+	}
+	if got, err := s.GetWorkItem(ctx, task.ID, item.ID); err != nil || got.Title != retitled || got.ScopeRevision != saved.ScopeRevision+1 {
+		t.Fatalf("keyed update after release: %+v err=%v", got, err)
+	}
+
+	// An item with no accepted queue entry is never refused, queued or not.
+	plain, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Unaccepted", RequestID: "plain"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,created_at,updated_at,repository,base_commit) VALUES(?,?,?,?,1,'planned',2,'running',?,?, 'fixture',?)`, api.NewID("tqe"), task.ID, plain.ID, plain.Revision, ts(time.Now()), ts(time.Now()), candidateA); err != nil {
+		t.Fatal(err)
+	}
+	if plain, err = s.UpdateWorkItem(ctx, task.ID, plain.ID, api.UpdateWorkItemRequest{Revision: plain.Revision, Description: &appended}, by); err != nil {
+		t.Fatalf("PATCH on an unaccepted item: %v", err)
+	}
+	if _, _, err = s.CreateWorkItemUpdate(ctx, task.ID, plain.ID, api.CreateWorkItemUpdate{ExpectedRevision: plain.Revision, Title: &retitled, RequestID: "plain-update"}, by); err != nil {
+		t.Fatalf("keyed update on an unaccepted item: %v", err)
+	}
+}
+
+// A deliberate scope change saves through the guard, and the release then
+// refuses the accepted candidate as before.
+func TestDeliberateScopeChangeStillBlocksRelease(t *testing.T) {
+	for _, route := range []string{"PATCH", "keyed"} {
+		t.Run(route, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "fixture", User: "owner"}
+			item := releaseEntryItem(t, s, task, entry)
+			j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+			if err != nil {
+				t.Fatal(err)
+			}
+			amended := "Amended scope: also cover the second pane"
+			var saved api.WorkItem
+			if route == "PATCH" {
+				saved, err = s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &amended, ScopeChange: true}, by)
+			} else {
+				if _, _, err = s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Description: &amended, ScopeChange: true, RequestID: "amend"}, by); err == nil {
+					saved, err = s.GetWorkItem(ctx, task.ID, item.ID)
+				}
+			}
+			if err != nil || saved.Description != amended || saved.Revision != item.Revision+1 || saved.ScopeRevision != item.ScopeRevision+1 {
+				t.Fatalf("deliberate scope change: %+v err=%v", saved, err)
+			}
+			_, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact accepted SHA and current verification required") {
+				t.Fatalf("claim after a deliberate scope change: %v", err)
+			}
+		})
+	}
+}

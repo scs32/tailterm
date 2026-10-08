@@ -102,6 +102,21 @@ The steward's procedure for each intake:
    `--ref source=SEQ`, and related or duplicate items as `--related` refs and in
    the description. The handler creates the item; the steward never does.
 
+### Recurrences and new evidence on an existing item
+
+The steward template carries this rule:
+
+> To record a recurrence or new evidence on an existing item, ask the database handler for an evidence note (tt work-items note). Never ask for a description append on an accepted or released item: it advances the scope revision and blocks the release.
+
+The handler saves the note with
+`tt work-items note --request-id KEY --title T --body-file F [--kind recurrence|log|note] WI_ID`.
+A note is a narrative artifact: it changes neither the item revision nor the
+scope revision, so an accepted fix stays releasable. A description or title
+change does advance the scope revision, and the hub refuses one while the
+item's accepted candidate awaits release unless the handler marks it a
+deliberate scope change (see `docs/project-work-items.md`). The steward asks for
+that only as a real scope amendment, never to attach evidence.
+
 ### Held follow-ups and Discord-filed items
 
 At each readiness pass the steward also refines items that reached the backlog

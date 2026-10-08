@@ -111,6 +111,10 @@ type UpdateWorkItemRequest struct {
 	Priority         *string             `json:"priority,omitempty"`
 	AgentID          string              `json:"agentId"`
 	CompletionReport *NarrativeReportPin `json:"completionReport,omitempty"`
+	// ScopeChange marks a title or description change as a deliberate scope
+	// amendment, which the hub otherwise refuses while the item's accepted
+	// candidate awaits release.
+	ScopeChange bool `json:"scopeChange,omitempty"`
 }
 
 // CreateWorkItemUpdate is the recoverable, request-keyed update contract. The
@@ -134,6 +138,10 @@ type CreateWorkItemUpdate struct {
 	// Only the database handler or the owner sets it.
 	EstimateTokens *int64  `json:"estimateTokens,omitempty"`
 	EstimateBasis  *string `json:"estimateBasis,omitempty"`
+	// ScopeChange marks a title or description change as a deliberate scope
+	// amendment, which the hub otherwise refuses while the item's accepted
+	// candidate awaits release.
+	ScopeChange bool `json:"scopeChange,omitempty"`
 }
 
 // WorkItemQueueAcceptance is the Git tuple of the accepted builder result for

@@ -104,6 +104,40 @@ link, coverage and report writes. `tt work-items update` accepts
 `--report-scope-revision` when completing a feature. Agent database workflow
 still routes these operations through the project's Database handler.
 
+## Evidence notes and scope changes
+
+Bugs take narrative artifacts and links as features do; coverage declarations
+and reports remain feature-only. To record a recurrence, a log reference or any
+other evidence on an existing bug or feature, save a note:
+
+```
+tt work-items note --request-id KEY --title T --body-file F [--kind recurrence|log|note] WI_ID
+```
+
+It stores a narrative artifact (namespace `note`, source ID the request ID,
+provenance `agent-note`) and prints the artifact ID and narrative sequence. A
+note changes neither the item revision nor the scope revision, so the item's
+accepted candidate stays claimable for release. Repeating the command with the
+same request ID and content replays the saved artifact.
+
+A title or description change advances the scope revision, and a release claim
+refuses a candidate accepted at an earlier scope. So while an item's accepted
+candidate awaits release (its latest accepted queue entry has no release job
+yet, or that job is neither `released` nor `superseded`) both update routes
+refuse a title or description change with 409:
+
+```
+accepted candidate awaits release (job rel_X, state S, entry tqe_Y); a title or description change would invalidate it. Record evidence with tt work-items note, or repeat with --scope-change to change scope deliberately
+```
+
+With no job yet the text reads `(entry tqe_Y, no release job yet)`. For a
+recorded scope amendment pass `tt work-items update --scope-change` with
+`--title` or `--body-file` (API field `scopeChange`). The change then saves as
+before and invalidates that release: the candidate must be re-verified and
+re-accepted. `--scope-change` without a title or description is refused. Status
+and priority changes are not guarded. Never append evidence to the description
+of an accepted or released item.
+
 ## Database handler
 
 New projects launch their orchestrator, a visible Database handler, then the

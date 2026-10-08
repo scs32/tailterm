@@ -698,3 +698,129 @@ func TestTokenBudgetTextForms(t *testing.T) {
 		}
 	}
 }
+
+// --scope-change reaches the hub as the request's marker and only rides a
+// title or description change.
+func TestWorkItemUpdateScopeChangeFlag(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Scope marker", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
+	var updates []api.CreateWorkItemUpdate
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/updates") {
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			var req api.CreateWorkItemUpdate
+			if err = json.Unmarshal(raw, &req); err != nil {
+				t.Error(err)
+			}
+			if req.ScopeChange != strings.Contains(string(raw), `"scopeChange":true`) {
+				t.Errorf("scope change marker on the wire: %s", raw)
+			}
+			updates = append(updates, req)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	e := env{hub: srv.URL, task: task.ID}
+	bodyPath := filepath.Join(t.TempDir(), "description.txt")
+	if err = os.WriteFile(bodyPath, []byte("Amended scope."), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"update", "--revision", "1", "--request-id", "marker-status", "--status", "in_progress", "--scope-change", item.ID},
+		{"update", "--revision", "1", "--request-id", "marker-estimate", "--estimate-tokens", "100", "--estimate-basis", "Small, 2 paths", "--scope-change", item.ID},
+	} {
+		if _, err = captureCLIOutput(t, func() error { return cmdWorkItems(e, args) }); err == nil || !strings.Contains(err.Error(), "scope-change") {
+			t.Fatalf("%v: err=%v, want a --scope-change usage error", args, err)
+		}
+	}
+	if len(updates) != 0 {
+		t.Fatalf("a refused flag reached the hub: %+v", updates)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"update", "--revision", "1", "--request-id", "marked", "--body-file", bodyPath, "--scope-change", item.ID})
+	})
+	if err != nil || !strings.Contains(out, "revision 2") || len(updates) != 1 || !updates[0].ScopeChange || updates[0].Description == nil {
+		t.Fatalf("marked update = %q %v %+v", out, err, updates)
+	}
+	out, err = captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"update", "--revision", "2", "--request-id", "unmarked", "--title", "Scope marker renamed", item.ID})
+	})
+	if err != nil || !strings.Contains(out, "revision 3") || len(updates) != 2 || updates[1].ScopeChange {
+		t.Fatalf("unmarked update = %q %v %+v", out, err, updates)
+	}
+	got, err := st.GetWorkItem(ctx, task.ID, item.ID)
+	if err != nil || got.Description != "Amended scope." || got.ScopeRevision != item.ScopeRevision+2 {
+		t.Fatalf("saved item: %+v %v", got, err)
+	}
+}
+
+// tt work-items note stores a narrative artifact on a bug and leaves the
+// item's revision and scope revision alone.
+func TestWorkItemNoteRecordsArtifact(t *testing.T) {
+	e, c, task, _ := cliWorkItemFixture(t)
+	ctx := context.Background()
+	out, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(e, []string{"create", "--kind", "bug", "--title", "Pane stays stale", "--request-id", "note-item"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	itemID := strings.TrimSpace(out)
+	before, err := c.GetWorkItem(ctx, task.ID, itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyPath := filepath.Join(t.TempDir(), "note.txt")
+	if err = os.WriteFile(bodyPath, []byte("Seen again at 17:12Z.\nLog: relay.log line 88."), 0600); err != nil {
+		t.Fatal(err)
+	}
+	note := []string{"note", "--request-id", "recurrence-1", "--title", "Recurrence on the Mini", "--body-file", bodyPath, "--kind", "recurrence", itemID}
+	out, err = captureCLIOutput(t, func() error { return cmdWorkItems(e, note) })
+	if err != nil || !strings.Contains(out, itemID+" artifact nart_") || !strings.Contains(out, "version 1 narrative seq 1") {
+		t.Fatalf("note = %q %v", out, err)
+	}
+	replay, err := captureCLIOutput(t, func() error { return cmdWorkItems(e, note) })
+	if err != nil || replay != out {
+		t.Fatalf("note replay = %q %v, want %q", replay, err, out)
+	}
+	artifacts, err := c.ListNarrativeArtifacts(ctx, task.ID, itemID, "", 10)
+	if err != nil || len(artifacts.Artifacts) != 1 {
+		t.Fatalf("artifacts: %+v %v", artifacts, err)
+	}
+	a := artifacts.Artifacts[0].Latest
+	if a.Namespace != "note" || a.SourceID != "recurrence-1" || a.SourceVersion != "1" || a.Kind != "recurrence" || a.Title != "Recurrence on the Mini" || a.Provenance != "agent-note" || a.CaptureState != "stored-content" || a.Availability != "available" || a.IngestedBy.AgentID != e.agent {
+		t.Fatalf("stored note: %+v", a)
+	}
+	after, err := c.GetWorkItem(ctx, task.ID, itemID)
+	if err != nil || after.Revision != before.Revision || after.ScopeRevision != before.ScopeRevision || after.Description != before.Description {
+		t.Fatalf("note changed the item: %+v -> %+v %v", before, after, err)
+	}
+	for _, bad := range [][]string{
+		{"note", "--request-id", "k", "--title", "T", itemID},
+		{"note", "--request-id", "k", "--body-file", bodyPath, itemID},
+		{"note", "--title", "T", "--body-file", bodyPath, itemID},
+		{"note", "--request-id", "k", "--title", "T", "--body-file", bodyPath, "--kind", "essay", itemID},
+	} {
+		if _, err = captureCLIOutput(t, func() error { return cmdWorkItems(e, bad) }); err == nil {
+			t.Fatalf("%v was accepted", bad)
+		}
+	}
+}

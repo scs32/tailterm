@@ -8,6 +8,11 @@ export const MAX_HANDLER_PLANS = 200;
 // hub/cmd/tt/coordination.go (handlerLaneRule) carries the same sentences.
 const handlerLaneRule =
   "Lane: every queue proposal names the team template. Propose --template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned.";
+// Evidence on an existing item is a note, never a description change
+// (wi_85148428c4ab9c9b). hub/cmd/tt/coordination.go (handlerEvidenceRule)
+// carries the same sentences.
+const handlerEvidenceRule =
+  "Record a recurrence, log reference or other evidence on an existing item with tt work-items note --request-id KEY --title T --body-file F WI_ID: it changes neither the item revision nor the scope revision. Never append evidence to the description of an accepted or released item. The hub refuses a title or description change while an accepted candidate awaits release; pass --scope-change only for a recorded scope amendment, because it invalidates that release.";
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
@@ -81,7 +86,8 @@ const handlerPrompt =
   "dependency conflicts. Never close unfinished workers or tasks to create " +
   "capacity. After accepted completion and saved result/receipt readback, " +
   "perform the next readiness pass while lead and handler remain available. " +
-  "These are auditable instructions, not a persisted scheduler or a guarantee " +
+  handlerEvidenceRule +
+  " These are auditable instructions, not a persisted scheduler or a guarantee " +
   "of model obedience.";
 
 function spawnFields(value) {

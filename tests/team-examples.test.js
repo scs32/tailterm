@@ -175,6 +175,20 @@ test("the steward proposes a token estimate with every filing and ranking", () =
   assert.doesNotMatch(steward, /--estimate-tokens/);
 });
 
+// wi_85148428c4ab9c9b: the steward asks the handler for an evidence note and
+// never for a description append on an accepted or released item.
+test("the steward records recurrences through an evidence note", () => {
+  const steward = PROJECT_ROLE_TEMPLATES.backlog_steward.prompt;
+  const rule =
+    "To record a recurrence or new evidence on an existing item, ask the database handler for an evidence note (tt work-items note). Never ask for a description append on an accepted or released item: it advances the scope revision and blocks the release.";
+  assert.equal(steward.split(rule).length - 1, 1);
+  assert.equal(steward.split("tt work-items note").length - 1, 1);
+  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
+  assert.ok(Buffer.byteLength(steward) < 8192);
+  const guide = readFileSync(new URL("../docs/backlog-steward.md", import.meta.url), "utf8");
+  assert.equal(guide.split(rule).length - 1, 1);
+});
+
 test("documented project role prompts exactly include every generated template", () => {
   const documentation = readFileSync(
     new URL("../docs/team-examples.md", import.meta.url),

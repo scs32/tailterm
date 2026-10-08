@@ -65,6 +65,34 @@ func workItemConflict(message string) error {
 	return fmt.Errorf("%w: %s", api.ErrConflict, message)
 }
 
+// refuseScopeEditBeforeRelease refuses a title or description change while the
+// item's accepted candidate awaits release: the change advances the scope
+// revision, and the release claim then refuses the accepted candidate. The
+// caller skips it for a deliberate scope change.
+func refuseScopeEditBeforeRelease(ctx context.Context, q queryRower, item api.WorkItem) error {
+	var entry string
+	err := q.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND acceptance_json<>'' ORDER BY position DESC LIMIT 1`, item.TaskID, item.ID).Scan(&entry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	const advice = "a title or description change would invalidate it. Record evidence with tt work-items note, or repeat with --scope-change to change scope deliberately"
+	var job, state string
+	err = q.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, item.TaskID, entry).Scan(&job, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return workItemConflict(fmt.Sprintf("accepted candidate awaits release (entry %s, no release job yet); %s", entry, advice))
+	}
+	if err != nil {
+		return err
+	}
+	if state == "released" || state == "superseded" {
+		return nil
+	}
+	return workItemConflict(fmt.Sprintf("accepted candidate awaits release (job %s, state %s, entry %s); %s", job, state, entry, advice))
+}
+
 func scanWorkItem(row interface{ Scan(...any) error }) (api.WorkItem, error) {
 	var item api.WorkItem
 	var created, updated string
@@ -315,7 +343,8 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req api.UpdateWorkItemRequest, by api.Caller) (api.WorkItem, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || req.Revision < 1 || (req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil) {
+	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || req.Revision < 1 || (req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil) ||
+		(req.ScopeChange && req.Title == nil && req.Description == nil) {
 		return api.WorkItem{}, api.ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -343,6 +372,11 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	}
 	if item.Revision != req.Revision {
 		return api.WorkItem{}, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	if (req.Title != nil || req.Description != nil) && !req.ScopeChange {
+		if err = refuseScopeEditBeforeRelease(ctx, tx, item); err != nil {
+			return api.WorkItem{}, err
+		}
 	}
 	if req.Status != nil && *req.Status == "done" {
 		gateItem := item
@@ -472,7 +506,7 @@ func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemU
 	}
 	if req.EstimateTokens != nil || req.EstimateBasis != nil {
 		// An estimate is saved alone: it never rides a change to the item.
-		if req.EstimateTokens == nil || req.Title != nil || req.Description != nil || req.Status != nil || req.Priority != nil || req.CompletionReport != nil || req.QueueAcceptance != nil {
+		if req.EstimateTokens == nil || req.Title != nil || req.Description != nil || req.Status != nil || req.Priority != nil || req.CompletionReport != nil || req.QueueAcceptance != nil || req.ScopeChange {
 			return api.ErrInvalid
 		}
 		tokens, basis := *req.EstimateTokens, ""
@@ -485,6 +519,9 @@ func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemU
 		return nil
 	}
 	if req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil {
+		return api.ErrInvalid
+	}
+	if req.ScopeChange && req.Title == nil && req.Description == nil {
 		return api.ErrInvalid
 	}
 	if req.Title != nil && !validWorkItemTitle(*req.Title) {
@@ -679,6 +716,11 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	if req.EstimateTokens != nil {
 		result, err := s.saveWorkItemEstimate(ctx, tx, item, req, payload, by)
 		return result, false, err
+	}
+	if (req.Title != nil || req.Description != nil) && !req.ScopeChange {
+		if err = refuseScopeEditBeforeRelease(ctx, tx, item); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
 	}
 	var queueEntry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" {

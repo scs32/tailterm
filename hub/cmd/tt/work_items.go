@@ -60,7 +60,7 @@ func bodyFile(path string) (string, error) {
 
 func cmdWorkItems(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|scope|evidence|narrative|triage>")
+		return errors.New("usage: tt work-items <list|get|create|update|receipt|dispatch|revisions|messages|scope|evidence|narrative|note|triage>")
 	}
 	switch args[0] {
 	case "list":
@@ -85,11 +85,67 @@ func cmdWorkItems(e env, args []string) error {
 		return cmdWorkItemEvidence(e, args[1:])
 	case "narrative":
 		return cmdWorkItemNarrative(e, args[1:])
+	case "note":
+		return cmdWorkItemNote(e, args[1:])
 	case "triage":
 		return cmdWorkItemTriage(e, args[1:])
 	default:
 		return fmt.Errorf("unknown work-items command %q", args[0])
 	}
+}
+
+// cmdWorkItemNote records evidence on a bug or feature (a recurrence, a log
+// reference or a note) as a narrative artifact. Unlike a description change it
+// moves neither the item revision nor the scope revision, so an accepted
+// candidate stays releasable.
+func cmdWorkItemNote(e env, args []string) error {
+	const usage = "usage: tt work-items note --request-id KEY --title T --body-file F [--kind recurrence|log|note] WI_ID"
+	fs := flag.NewFlagSet("work-items note", flag.ContinueOnError)
+	projectFlag := fs.String("project", e.task, "owning project id")
+	requestID := fs.String("request-id", "", "stable retry key (required)")
+	title := fs.String("title", "", "one-line title of the note (required)")
+	body := fs.String("body-file", "", "note text file, or - for stdin (required)")
+	kind := fs.String("kind", "note", "recurrence, log or note")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *requestID == "" || *title == "" || *body == "" {
+		return errors.New(usage)
+	}
+	if *kind != "recurrence" && *kind != "log" && *kind != "note" {
+		return fmt.Errorf("--kind must be recurrence, log or note, not %q", *kind)
+	}
+	project, err := workItemProject(e, *projectFlag)
+	if err != nil {
+		return err
+	}
+	content, err := bodyFile(*body)
+	if err != nil {
+		return err
+	}
+	if content == "" {
+		return errors.New("the note body is empty")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	out, err := c.PutNarrativeArtifact(ctx, project, fs.Arg(0), api.PutNarrativeArtifactRequest{
+		RequestID: *requestID, Namespace: "note", SourceID: *requestID, SourceVersion: "1", Kind: *kind, Title: *title,
+		AgentID: e.agent, RunID: e.runID, Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: content,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Printf("%s artifact %s version %d narrative seq %d\n", out.ItemID, out.ArtifactID, out.Version, out.NarrativeSeq)
+	return nil
 }
 
 func cmdWorkItemList(e env, args []string) error {
@@ -249,6 +305,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	branch := fs.String("branch", "", "accepted branch")
 	commit := fs.String("commit", "", "accepted commit SHA")
 	acceptanceEvidence := fs.String("evidence", "", "queue acceptance evidence (default: the saved completion receipt)")
+	scopeChange := fs.Bool("scope-change", false, "mark a --title or --body-file change as a deliberate scope amendment (it invalidates an accepted candidate awaiting release)")
 	estimateTokens := fs.Int64("estimate-tokens", 0, "token estimate, saved without a new revision (database handler or owner; 0 clears it)")
 	estimateBasis := fs.String("estimate-basis", "", "one-line basis of the estimate, such as \"Small, 2 paths, median of 8 Small items\"")
 	asJSON := fs.Bool("json", false, "JSON output")
@@ -289,7 +346,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 		if !visited["estimate-tokens"] {
 			return errors.New("--estimate-basis needs --estimate-tokens")
 		}
-		for _, name := range []string{"title", "body-file", "status", "priority", "report-id", "report-version", "report-digest", "report-scope-revision", "worktree", "branch", "commit", "evidence"} {
+		for _, name := range []string{"title", "body-file", "status", "priority", "report-id", "report-version", "report-digest", "report-scope-revision", "worktree", "branch", "commit", "evidence", "scope-change"} {
 			if visited[name] {
 				return fmt.Errorf("--estimate-tokens is saved alone; drop --%s", name)
 			}
@@ -329,6 +386,12 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	}
 	if req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil {
 		return errors.New("at least one update field is required")
+	}
+	if *scopeChange {
+		if req.Title == nil && req.Description == nil {
+			return errors.New("--scope-change marks a title or description change; add --title or --body-file")
+		}
+		req.ScopeChange = true
 	}
 	c, err := e.client(10 * time.Second)
 	if err != nil {

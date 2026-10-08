@@ -4587,3 +4587,40 @@ func TestDeployerLivenessSweepGapRestartsJobWait(t *testing.T) {
 		t.Fatalf("gap with a one minute bound: %s", got)
 	}
 }
+
+// Evidence notes on an accepted bug, before and after its release job is
+// enqueued, leave the accepted candidate claimable.
+func TestReleaseStaysClaimableAfterEvidenceNote(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	var itemID string
+	if err := s.db.QueryRow(`SELECT item_id FROM team_queue_entries WHERE id=?`, entry).Scan(&itemID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetWorkItem(ctx, task.ID, itemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := func(key string) {
+		t.Helper()
+		req := api.PutNarrativeArtifactRequest{RequestID: key, Namespace: "note", SourceID: key, SourceVersion: "1", Kind: "recurrence", Title: "Recurrence " + key, Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: "seen again", AgentID: h.ID, RunID: h.RunID}
+		if _, _, err := s.PutNarrativeArtifact(ctx, task.ID, itemID, req, by); err != nil {
+			t.Fatal(key, err)
+		}
+	}
+	note("before-enqueue")
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	note("after-enqueue")
+	after, err := s.GetWorkItem(ctx, task.ID, itemID)
+	if err != nil || after.Revision != before.Revision || after.ScopeRevision != before.ScopeRevision {
+		t.Fatalf("notes moved the bug: revision %d->%d scope %d->%d err=%v", before.Revision, after.Revision, before.ScopeRevision, after.ScopeRevision, err)
+	}
+	claimed, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+	if err != nil || claimed.State != "claimed" {
+		t.Fatalf("claim after evidence notes: state=%q err=%v", claimed.State, err)
+	}
+}

@@ -595,7 +595,9 @@ If a teammate leaves directed work without a reply for 30 minutes, send that tea
 const stewardAgreement = `STEWARD WORKING AGREEMENT
 Read the task briefing, repository instructions, tt agents, the latest backlog summary (tt steward summary get) and tt inbox --unread --mark-read before acting. When anyone sends you an ASSIGN, REQUEST, REVIEW or QUESTION, run tt ack SEQ before you start: it is not a board post, and until then the hub refuses your other posts. The owner's actual instructions override this template. Never ask through an interactive terminal prompt: ask the owner with tt ask, a teammate with tt send --kind question.
 
-You are a persistent project role, not an item team member: you are never leased to a queue entry, never an item lead, and tt team close leaves you open. Do not busy-poll. When nothing is addressed to you, save the summary if it changed, mark your turn done with a waiting explanation and end the turn; a directed message resumes you. Report evidence, not confidence alone, and keep routine board messages short.`;
+You are a persistent project role, not an item team member: you are never leased to a queue entry, never an item lead, and tt team close leaves you open. Do not busy-poll. When nothing is addressed to you, save the summary if it changed, mark your turn done with a waiting explanation and end the turn; a directed message resumes you. Report evidence, not confidence alone, and keep routine board messages short.
+
+To record a recurrence or new evidence on an existing item, ask the database handler for an evidence note (tt work-items note). Never ask for a description append on an accepted or released item: it advances the scope revision and blocks the release.`;
 export const PROJECT_ROLE_TEMPLATES = {
   backlog_steward: {
     id: "backlog_steward",

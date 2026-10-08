@@ -229,7 +229,23 @@ func validateNarrativeActor(q queryRower, ctx context.Context, taskID, agentID, 
 	return nil
 }
 
+// loadWritableFeature is loadWritableItem for the feature-only writes: coverage
+// and reports pin the feature completion report.
 func loadWritableFeature(q queryRower, ctx context.Context, taskID, itemID string) (api.WorkItem, error) {
+	item, err := loadWritableItem(q, ctx, taskID, itemID)
+	if err != nil {
+		return item, err
+	}
+	if item.Kind != "feature" {
+		return item, api.ErrInvalid
+	}
+	return item, nil
+}
+
+// loadWritableItem loads a bug or feature of an open project. Artifacts and
+// links are evidence either kind accepts: they write narrative tables only, so
+// neither the item revision nor the scope revision moves.
+func loadWritableItem(q queryRower, ctx context.Context, taskID, itemID string) (api.WorkItem, error) {
 	task, err := scanTask(q.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.WorkItem{}, api.ErrNotFound
@@ -240,14 +256,7 @@ func loadWritableFeature(q queryRower, ctx context.Context, taskID, itemID strin
 	if task.Status != api.TaskOpen {
 		return api.WorkItem{}, api.ErrClosed
 	}
-	item, err := getWorkItem(q, ctx, taskID, itemID)
-	if err != nil {
-		return item, err
-	}
-	if item.Kind != "feature" {
-		return item, api.ErrInvalid
-	}
-	return item, nil
+	return getWorkItem(q, ctx, taskID, itemID)
 }
 
 func nextNarrativeSeq(ctx context.Context, tx *sql.Tx, taskID, itemID string) (int64, error) {
@@ -390,7 +399,7 @@ func (s *Store) PutNarrativeArtifact(ctx context.Context, taskID, itemID string,
 	if prior, ok, err := replayNarrativeReceipt[api.NarrativeArtifactVersion](tx, ctx, taskID, itemID, "artifact", req.RequestID, req.AgentID, payload, by); ok || err != nil {
 		return prior, ok, err
 	}
-	if _, err = loadWritableFeature(tx, ctx, taskID, itemID); err != nil {
+	if _, err = loadWritableItem(tx, ctx, taskID, itemID); err != nil {
 		return api.NarrativeArtifactVersion{}, false, err
 	}
 	if err = validateNarrativeActor(tx, ctx, taskID, req.AgentID, req.RunID); err != nil {
@@ -686,7 +695,7 @@ func (s *Store) PutNarrativeLink(ctx context.Context, taskID, itemID string, req
 	if prior, ok, e := replayNarrativeReceipt[api.NarrativeLinkVersion](tx, ctx, taskID, itemID, "link", req.RequestID, req.AgentID, payload, by); ok || e != nil {
 		return prior, ok, e
 	}
-	item, err := loadWritableFeature(tx, ctx, taskID, itemID)
+	item, err := loadWritableItem(tx, ctx, taskID, itemID)
 	if err != nil {
 		return api.NarrativeLinkVersion{}, false, err
 	}

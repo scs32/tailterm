@@ -217,3 +217,19 @@ test("handler prompt defaults qualifying bugs to the Small lane and names a reas
   const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
   assert.equal(count(go, lane), 1);
 });
+
+// wi_85148428c4ab9c9b: evidence on an existing item is a note, never a
+// description change. The sentences are pinned whole, and the tt handler
+// guidance in hub/cmd/tt/coordination.go carries the same text.
+test("handler prompt records evidence as a note and never as a description append", () => {
+  const rule =
+    "Record a recurrence, log reference or other evidence on an existing item with tt work-items note --request-id KEY --title T --body-file F WI_ID: it changes neither the item revision nor the scope revision. Never append evidence to the description of an accepted or released item. The hub refuses a title or description change while an accepted candidate awaits release; pass --scope-change only for a recorded scope amendment, because it invalidates that release.";
+  const count = (text, clause) => text.split(clause).length - 1;
+  const prompt = withDatabaseHandler(plan())[1].fields.prompt;
+  assert.equal(count(prompt, rule), 1);
+  assert.equal(count(prompt, "tt work-items note"), 1);
+  assert.equal(count(prompt, "--scope-change"), 1);
+  assert.ok(prompt.length <= 8192, `handler prompt is ${prompt.length} characters`);
+  const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
+  assert.equal(count(go, rule), 1);
+});

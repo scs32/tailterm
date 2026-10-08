@@ -1672,7 +1672,7 @@ func (f *rebindFixture) amend(t *testing.T, key string) (api.WorkItem, api.Messa
 		t.Fatal(err)
 	}
 	description := "amended scope " + key
-	updated, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Description: &description}, api.Caller{Node: "fixture", User: "amender"})
+	updated, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Description: &description, ScopeChange: true}, api.Caller{Node: "fixture", User: "amender"})
 	if err != nil {
 		t.Fatal(err)
 	}

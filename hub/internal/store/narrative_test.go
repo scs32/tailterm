@@ -308,3 +308,45 @@ func TestNarrativeDecodedReportLimitAndBoundedOverviewCoverage(t *testing.T) {
 		seenSources[entry.Source] = true
 	}
 }
+
+// A bug takes evidence as artifacts and links without moving its revision or
+// its scope revision; coverage and reports stay feature-only.
+func TestNarrativeEvidenceOnBugKeepsRevisions(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	project, _ := workItemProject(t, s, ctx, by, "Bug evidence", "lead")
+	bug, err := s.CreateWorkItem(ctx, project.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Pane stays stale", RequestID: "bug-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := s.PostMessage(ctx, project.ID, api.PostMessageRequest{Text: "It happened again"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactReq := api.PutNarrativeArtifactRequest{RequestID: "recurrence-1", Namespace: "note", SourceID: "recurrence-1", SourceVersion: "1", Kind: "recurrence", Title: "Recurrence on the Mini", Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: "seen again at 17:12Z"}
+	artifact, replay, err := s.PutNarrativeArtifact(ctx, project.ID, bug.ID, artifactReq, by)
+	if err != nil || replay || artifact.Version != 1 || artifact.ItemID != bug.ID {
+		t.Fatalf("artifact=%+v replay=%v err=%v", artifact, replay, err)
+	}
+	if again, replay, err := s.PutNarrativeArtifact(ctx, project.ID, bug.ID, artifactReq, by); err != nil || !replay || again.ArtifactID != artifact.ArtifactID {
+		t.Fatalf("artifact retry=%+v replay=%v err=%v", again, replay, err)
+	}
+	link, _, err := s.PutNarrativeLink(ctx, project.ID, bug.ID, api.PutNarrativeLinkRequest{RequestID: "link-1", Action: "link", Relationship: "recurrence", Target: api.NarrativeReference{Kind: "message", TaskID: project.ID, MessageSeq: message.Seq}}, by)
+	if err != nil || link.Revision != 1 || link.ItemID != bug.ID {
+		t.Fatalf("link=%+v err=%v", link, err)
+	}
+	got, err := s.GetWorkItem(ctx, project.ID, bug.ID)
+	if err != nil || got.Revision != bug.Revision || got.ScopeRevision != bug.ScopeRevision {
+		t.Fatalf("evidence moved the bug: revision %d->%d scope %d->%d err=%v", bug.Revision, got.Revision, bug.ScopeRevision, got.ScopeRevision, err)
+	}
+	artifacts, err := s.ListNarrativeArtifacts(ctx, project.ID, bug.ID, "", 10)
+	if err != nil || len(artifacts.Artifacts) != 1 {
+		t.Fatalf("artifacts=%+v err=%v", artifacts, err)
+	}
+	coverage := api.PutNarrativeCoverageRequest{RequestID: "coverage-1", Source: "note", Scope: "One recurrence", CaptureState: "stored-content", CapturedIDs: []string{"recurrence-1"}, Assessment: "independently-verified", AssessmentText: "Compared with the log.", EvidenceReferences: []api.NarrativeReference{{Kind: "artifact-version", ArtifactID: artifact.ArtifactID, Version: 1, Label: "the note"}}, AssessedBy: api.Sender{Node: "independent-review", User: "verifier"}}
+	if _, _, err = s.PutNarrativeCoverage(ctx, project.ID, bug.ID, coverage, by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("coverage on a bug=%v", err)
+	}
+	if _, _, err = s.PutNarrativeReport(ctx, project.ID, bug.ID, completeReportRequest(bug, "report-1", 64), by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("report on a bug=%v", err)
+	}
+}
