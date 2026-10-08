@@ -59,9 +59,10 @@ func TestMain(m *testing.M) {
 // user's: it runs under the guard with that home.
 //
 // Two runs keep the home they were given, unguarded. With TT_LIVE_CLAUDE=1
-// the opt-in live tests start a real Claude Code session, which needs the
-// caller's home for its own login. And the redaction probe helper is not a
-// test: it is that session's hook and exits inside its test function.
+// or TT_LIVE_RUNTIME_PROMPT=1 the opt-in live tests start a real Claude Code
+// session, which needs the caller's home for its own login. And the
+// redaction probe helper is not a test: it is that session's hook and exits
+// inside its test function.
 //
 // CODEX_HOME and CLAUDE_CONFIG_DIR are dropped like the TAILTERM_ variables:
 // an agent's shell sets them to the user's own directories. The Go build and
@@ -72,9 +73,12 @@ func runWithOwnHome(run func() int) int {
 		return run()
 	}
 	_, child := os.LookupEnv(testRealHomesEnv)
-	if os.Getenv("TT_LIVE_CLAUDE") == "1" {
+	for _, live := range []string{"TT_LIVE_CLAUDE", "TT_LIVE_RUNTIME_PROMPT"} {
+		if os.Getenv(live) != "1" {
+			continue
+		}
 		if !child {
-			fmt.Fprintln(os.Stderr, "TT_LIVE_CLAUDE=1: these tests keep the caller's HOME, because Claude Code needs its own login; the real-home guard is off for this run")
+			fmt.Fprintln(os.Stderr, live+"=1: these tests keep the caller's HOME, because Claude Code needs its own login; the real-home guard is off for this run")
 		}
 		os.Setenv(testRealHomesEnv, "")
 		return run()
