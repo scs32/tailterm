@@ -133,6 +133,9 @@ type UsageItemReport struct {
 	PhaseRoles []UsageGroup `json:"phaseRoles"`
 	// Time is absent when the item has no spans: its time was not measured.
 	Time *UsageTime `json:"time,omitempty"`
+	// Budget is the item's estimate against its lifetime actual. The From/To
+	// filter never changes it. Project overhead has none.
+	Budget *TokenBudget `json:"budget,omitempty"`
 }
 
 // UsageTime says where an item's wall time went. Every duration is exact

@@ -209,6 +209,9 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 		if err != nil {
 			return zero, err
 		}
+		if err = replaceUsageItemShares(ctx, tx, task, agent, b.RunID, projection); err != nil {
+			return zero, err
+		}
 	}
 	if err = storeUsageSpans(ctx, tx, task, agent, b.RunID, b.Spans, provenance); err != nil {
 		return zero, err

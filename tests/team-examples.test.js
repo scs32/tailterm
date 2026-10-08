@@ -161,6 +161,20 @@ test("documented team prompts exactly include every generated template", () => {
       );
 });
 
+test("the steward proposes a token estimate with every filing and ranking", () => {
+  const steward = PROJECT_ROLE_TEMPLATES.backlog_steward.prompt;
+  const rule =
+    'Estimate: every filing and ranking REQUEST proposes a token estimate for the item with a one-line basis, such as "Small, 2 paths, median of 8 Small items", taken from the lane, the owned-path count and comparable done items in tt usage --calibration; the handler records it.';
+  assert.equal(steward.split(rule).length - 1, 1);
+  assert.equal(steward.split("token estimate").length - 1, 1);
+  assert.equal(steward.split("tt usage --calibration").length - 1, 1);
+  // The spawn command caps the prompt at 8192 characters.
+  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
+  assert.ok(Buffer.byteLength(steward) < 8192);
+  // The steward proposes; only the handler saves it.
+  assert.doesNotMatch(steward, /--estimate-tokens/);
+});
+
 test("documented project role prompts exactly include every generated template", () => {
   const documentation = readFileSync(
     new URL("../docs/team-examples.md", import.meta.url),

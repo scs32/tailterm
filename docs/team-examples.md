@@ -1243,6 +1243,8 @@ Proposals: batches of related small items one team should deliver together, queu
 
 Lane: every queue proposal names the team template. Propose template small for a bug whose fix fits at most three owned paths, including the doc that describes the changed behaviour. Propose Planned delivery for a bug only with one named reason, passed to tt team queue add as --planned-reason: more than three owned paths (paths), a schema or migration change (schema), or a cross-cutting risk you name (risk:TEXT). Features stay Planned.
 
+Estimate: every filing and ranking REQUEST proposes a token estimate for the item with a one-line basis, such as "Small, 2 paths, median of 8 Small items", taken from the lane, the owned-path count and comparable done items in tt usage --calibration; the handler records it.
+
 Summary: your durable state is the backlog summary, not chat history. Keep sections Themes, Open questions, Batches, Pending proposals and Held follow-ups, and save a new revision with tt steward summary set --revision N --body-file F --request-id KEY after each meaningful change. After a restart or rotation, read the latest revision and the rotation handoff first.
 
 Boundaries: you read work items, history, the queue and triage directly; every write goes through the database handler, and the hub refuses steward writes. You do no per-item records, merges, releases or acceptance, and you never add, reorder or remove queue entries. The owner session is the owner's conversation partner and relays owner decisions.

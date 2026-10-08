@@ -656,6 +656,9 @@ func (s *Store) enrichTeamQueueEntry(ctx context.Context, e *api.TeamQueueEntry)
 	if e.Rebinds, err = teamQueueRebinds(ctx, s.db, e.TaskID, e.ID); err != nil {
 		return err
 	}
+	if e.Budget, err = loadTokenBudget(ctx, s.db, e.TaskID, e.ItemID); err != nil {
+		return err
+	}
 	return attachHandlerArm(ctx, s.db, e)
 }
 
@@ -883,6 +886,9 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 			return out, err
 		}
 		if err := attachHandlerArm(ctx, s.db, &out.Entries[i]); err != nil {
+			return out, err
+		}
+		if out.Entries[i].Budget, err = loadTokenBudget(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID); err != nil {
 			return out, err
 		}
 	}
@@ -1115,12 +1121,31 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	if err == nil {
 		e.Rebinds, err = teamQueueRebinds(ctx, s.db, task, e.ID)
 	}
+	if err == nil {
+		e.Budget, err = loadTokenBudget(ctx, s.db, task, e.ItemID)
+	}
 	return e, err
 }
 
-// TeamQueueAction serializes every state change with ordinary project writes and
-// keeps retry results durable. Effect attempts are recorded before host effects.
+// TeamQueueAction runs one queue operation and returns its entry with the
+// item's budget, like an entry read. The budget is read after the action
+// committed and is not part of the saved retry result, so a retry returns the
+// same entry with the budget as it is then.
 func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQueueRequest) (api.TeamQueueEntry, error) {
+	e, err := s.teamQueueAction(ctx, task, req)
+	if err != nil || e.ID == "" {
+		return e, err
+	}
+	// The action is committed: a failed budget read must not report it failed.
+	if budget, budgetErr := loadTokenBudget(ctx, s.db, e.TaskID, e.ItemID); budgetErr == nil {
+		e.Budget = budget
+	}
+	return e, nil
+}
+
+// teamQueueAction serializes every state change with ordinary project writes and
+// keeps retry results durable. Effect attempts are recorded before host effects.
+func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQueueRequest) (api.TeamQueueEntry, error) {
 	var zero api.TeamQueueEntry
 	if !api.ValidID(task, "tsk") || !validRequestID(req.RequestID) {
 		return zero, api.ErrInvalid

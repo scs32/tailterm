@@ -819,10 +819,27 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	if strings.Contains(briefing, "an unscoped queued entry waits until nothing else runs") {
 		t.Fatal("queue handler briefing still asks for hand scoping")
 	}
-	const before = "4556752233b1d6c05364c7b689d2485781534d3411a2493738e467619a70d0bf" // c6a8ec1
-	const current = "6b3b35c98a12cfae03a3c640a54df752f026e0789721341237bd0594c9ffce11"
+	// The estimate rule (wi_899863352c81e3b0) changes the template again.
+	const before = "6b3b35c98a12cfae03a3c640a54df752f026e0789721341237bd0594c9ffce11" // 7ada115
+	const current = "13fde4ef0dfd1e49c301770b452e76fb7aa5f9a62e6d5388487c59bd26664030"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
+	}
+}
+
+// The primary handler is told once to record a proposed token estimate, with
+// the flags that save it and the fact that the item revision stays.
+func TestPrimaryHandlerGuidanceRecordsEstimates(t *testing.T) {
+	if n := strings.Count(primaryHandlerGuidance, handlerEstimateRule); n != 1 || strings.Count(primaryHandlerGuidance, "--estimate-tokens") != 1 {
+		t.Fatalf("the estimate rule appears %d times in the handler guidance", n)
+	}
+	for _, want := range []string{"When a filing or ranking REQUEST proposes a token estimate, record it", "--estimate-tokens N --estimate-basis TEXT", "leaves the item revision unchanged"} {
+		if !strings.Contains(handlerEstimateRule, want) {
+			t.Fatalf("handler estimate rule lacks %q", want)
+		}
+	}
+	if strings.Contains(queueHandlerAcceptanceBriefing(), "--estimate-tokens") {
+		t.Fatal("the estimate rule is repeated in the queue acceptance briefing")
 	}
 }
 

@@ -151,6 +151,23 @@ Features stay Planned and need no reason. `tt team queue add` applies the same
 default when `--template` is omitted; see
 [project-queue.md](project-queue.md#small-change-lane).
 
+**Estimate.** Every filing and ranking REQUEST proposes a token estimate for the
+item with a one-line basis, such as "Small, 2 paths, median of 8 Small items"
+(owner decision relayed in #28208, `wi_899863352c81e3b0`). The steward takes it
+from the item's lane, its owned-path count and comparable done items:
+
+```
+tt usage --calibration --project PROJECT_ID
+tt usage --calibration --project PROJECT_ID --json
+```
+
+Each line is one done item with its lane, owned-path count, team shape,
+lifetime actual tokens, saved estimate and ratio. The steward only proposes:
+the handler records the estimate with `tt work-items update --estimate-tokens N
+--estimate-basis TEXT`, which leaves the item revision unchanged. An item
+without one shows "no estimate" and nothing else changes; see
+[usage-accounting.md](usage-accounting.md#token-estimate-and-budget).
+
 The steward applies nothing itself. After an answer it sends a REQUEST citing
 the decision:
 

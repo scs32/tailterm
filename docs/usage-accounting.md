@@ -107,6 +107,53 @@ A completed turn is uploaded once, as chunks of at most 32 intervals and segment
 
 Known limits: a long open turn is invisible until it ends; a transitive wait (a builder idle while its lead waits for the owner) is `owner` only through the item link, otherwise `unknown`; work done before collection started is not reconstructed.
 
+## Token estimate and budget
+
+Feature `wi_899863352c81e3b0`, revision 1, owner order #28848; builder assignment #28954. Phase 1 of the token guardrails: each work item can carry a token estimate, shown against what the item actually used. Nothing warns, holds or pauses on it yet.
+
+### Set an estimate
+
+```
+tt work-items update --revision N --request-id KEY --estimate-tokens 12000000 --estimate-basis "Small, 2 paths, median of 8 Small items" WI_ID
+tt work-items update --revision N --request-id KEY --estimate-tokens 0 WI_ID
+```
+
+An estimate is a token count from 1 to 1,000,000,000,000 with a one-line basis of at most 240 bytes; `0` clears it and takes no basis. Only the project's database handler, or the owner with no agent identity, may save one: any other agent gets "only the database handler sets an estimate", and the backlog steward its usual write refusal. The steward proposes an estimate with every filing and ranking, and the handler records it ([backlog-steward.md](backlog-steward.md#proposals)).
+
+`--revision` is the item's current revision, and **the save does not change it**. The item keeps its revision, scope revision, updated time and updater, gets no new revision in `tt work-items revisions`, and no queue entry is re-synced. A queued, running or accepted entry, a frozen verification plan, a bound agent's work context and a pending release are therefore unaffected. For the same reason an estimate is saved alone: combining the flags with `--title`, `--body-file`, `--status`, `--priority`, a completion report or queue acceptance is refused. The legacy PATCH update cannot set one.
+
+Each accepted save appends one row to the estimate history (`work_item_estimates`) and returns a receipt whose result revision is that unchanged revision. Repeating a request with the same key and payload, or reading it with `tt work-items receipt --request-id KEY WI_ID`, returns the estimate **that request** saved, even after a later save or clear replaced it on the item. A project event `work_item_updated` with `fields: ["estimate"]` and the unchanged revision announces the save.
+
+### Read the budget
+
+Work item get and list, every team queue listing, entry read and action result, and each item of the usage report carry a `budget`:
+
+```json
+{"estimate":{"tokens":12000000,"basis":"Small, 2 paths, median of 8 Small items","setAt":"2026-10-07T16:00:00Z","setBy":{"agentId":"agt_…","node":"…","user":"owner"}},
+ "actualTokens":"15300000","actualState":"measured","ratio":"51/40"}
+```
+
+- `estimate` is absent when the item has none ("no estimate").
+- `actualTokens` is the item's **lifetime** attributed tokens: the sum of every reported token class over all of its runs, open and closed, as an exact rational string. It is the `tokens` figure of an unfiltered `tt usage --item ID`. `--from`/`--to`, and From/To in the Usage disclosure, change the report rows and never the budget.
+- `actualState` is `measured`, `partial` or `not measured`, the state that unfiltered report gives the item. It is `partial` when any contributing request was incomplete, carried a normalization gap or lacked a token class. A partial actual is a **lower bound**, and so is its ratio.
+- `ratio` is actual divided by estimate, absent without an estimate or when not measured.
+- A missing `budget` key means an older hub. Project overhead has no budget.
+
+Text forms say the same in one line. `tt work-items get` prints `Budget: estimate 12.00M · lifetime actual 15.30M · 1.28×` and the basis with who set it; `tt team queue list` and `tt usage` print a `budget:` line under each entry and item. A partial actual reads `lifetime actual at least 15.30M (partial) · at least 1.28×`, never a bare ratio. Without usage the line ends `lifetime actual not measured`. The Usage disclosure shows the line in each item's summary and, inside the item, with the basis. The queue entry's older `tokens` field is unchanged: it sums the activity of agents currently bound to the item, not the lifetime ledger.
+
+### Calibrate from history
+
+```
+tt usage --calibration --project PROJECT_ID
+tt usage --calibration --project PROJECT_ID --json
+```
+
+One line per done item, by item sequence: lane (the template of the item's latest team queue entry, `small` or `planned`, or `none` if it was never queued), owned-path count, team shape (`plan-review` or `plan-only`), lifetime actual with its state, and the saved estimate and ratio. The read follows the done items and the queue history to their last pages, so no item is cut off at a page limit. Usage before collection began (2026-09-27) is not in the ledger, so older items read "not measured".
+
+### Storage
+
+`work_items` gains six `estimate_*` columns. Budgets do not scan the ledger: each stored request also writes its per-item shares to `usage_item_shares` (reported tokens, share denominator, partial flag), and a budget is one indexed read by item. Share rows are derived data. At every open the hub fills them for any stored request that has none at its current revision, which covers requests stored before the table existed and requests an older binary wrote or revised after a rollback. Both tables and the columns are additive, and an older binary ignores them. The audit export's `workItems` rows include the estimate columns; the estimate history table is not exported yet.
+
 ## Verification boundary
 
 Synthetic tests cover both runtimes, normalization, streaming/deduplication, resets, two-item persistent-role attribution, overhead conservation, phase/role averages, prices, receipt loss/restart/archive and relay budget. A loopback fixture exercises the real relay append path through HTTP into the store. Chromium and WebKit exercise Usage through Projects, including stale/offline/older-hub behavior, filters, prices, escaping, narrow layout and focus continuity.
@@ -118,3 +165,5 @@ Time accounting adds synthetic Codex and Claude transcripts under `hub/cmd/tt/te
 Round-one correction provenance: REQUEST #12757 / disposition #12758, renewed own Start #12763, handler release #12764; fixes b1–b5 plus existing c6 top-phase finding `wi_687271d49143fe15`. Other review findings remain held and do not widen this implementation.
 
 Final focused b1 provenance: final general review #12779, disposition #12780, focused order #12781, own Start #12783, saved handler release #12784. This correction preserves Claude output only; Codex’s existing unavailable-subset handling is unchanged. Lifetime two general rounds remain exhausted, with original-reviewer focused verification still required.
+
+Token estimates add store tests for the unchanged revision and revision-bound records, refusals, clear and delayed replay, a queued and an accepted unreleased entry with the release gate, the budget against the unfiltered report (shared request, closed run, revised and partial turns, share rebuild), every queue list form across a history page, and a database returned to the base schema. CLI tests cover the estimate flags, the text forms, the queue list and the calibration read past both page limits. Chromium and WebKit render every budget form in the Usage disclosure. Opening a database built by the base binary, and the base binary reopening it, is a verifier matrix step.

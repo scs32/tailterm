@@ -149,7 +149,10 @@ func (s *Store) GetWorkItem(ctx context.Context, taskID, itemID string) (api.Wor
 	if err != nil {
 		return item, err
 	}
-	err = loadLastDispatch(s.db, ctx, &item)
+	if err = loadLastDispatch(s.db, ctx, &item); err != nil {
+		return item, err
+	}
+	item.Budget, err = loadTokenBudget(ctx, s.db, item.TaskID, item.ID)
 	return item, err
 }
 
@@ -201,6 +204,9 @@ func (s *Store) ListWorkItems(ctx context.Context, taskID, kind, status string, 
 	rows.Close()
 	for i := range items {
 		if err = loadLastDispatch(s.db, ctx, &items[i]); err != nil {
+			return api.WorkItemList{}, err
+		}
+		if items[i].Budget, err = loadTokenBudget(ctx, s.db, items[i].TaskID, items[i].ID); err != nil {
 			return api.WorkItemList{}, err
 		}
 	}
@@ -461,8 +467,24 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 
 func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemUpdate) error {
 	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || req.ExpectedRevision < 1 || !validRequestID(req.RequestID) ||
-		(req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil) ||
 		(req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) || (req.RunID != "" && (req.AgentID == "" || !validRunID(req.RunID))) {
+		return api.ErrInvalid
+	}
+	if req.EstimateTokens != nil || req.EstimateBasis != nil {
+		// An estimate is saved alone: it never rides a change to the item.
+		if req.EstimateTokens == nil || req.Title != nil || req.Description != nil || req.Status != nil || req.Priority != nil || req.CompletionReport != nil || req.QueueAcceptance != nil {
+			return api.ErrInvalid
+		}
+		tokens, basis := *req.EstimateTokens, ""
+		if req.EstimateBasis != nil {
+			basis = *req.EstimateBasis
+		}
+		if tokens < 0 || tokens > api.MaxEstimateTokens || (tokens == 0) != (basis == "") || !validEstimateBasis(basis) {
+			return api.ErrInvalid
+		}
+		return nil
+	}
+	if req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil {
 		return api.ErrInvalid
 	}
 	if req.Title != nil && !validWorkItemTitle(*req.Title) {
@@ -481,6 +503,19 @@ func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemU
 		return api.ErrInvalid
 	}
 	return nil
+}
+
+// validEstimateBasis accepts one line of at most MaxEstimateBasisBytes.
+func validEstimateBasis(basis string) bool {
+	if len(basis) > api.MaxEstimateBasisBytes || !utf8.ValidString(basis) || strings.TrimSpace(basis) != basis {
+		return false
+	}
+	for _, r := range basis {
+		if r < 0x20 || r == 0x7f || r == '\u2028' || r == '\u2029' {
+			return false
+		}
+	}
+	return true
 }
 
 func scanWorkItemUpdateReceipt(row rowScanner) (api.WorkItemUpdateReceipt, string, error) {
@@ -509,7 +544,86 @@ func findAnyWorkItemUpdateReceipt(q queryRower, ctx context.Context, taskID, req
 
 func loadWorkItemUpdateResult(q queryRower, ctx context.Context, receipt api.WorkItemUpdateReceipt) (api.WorkItemUpdateResult, error) {
 	revision, err := scanWorkItemRevision(q.QueryRowContext(ctx, `SELECT `+workItemRevisionCols+` FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision=?`, receipt.TaskID, receipt.ItemID, receipt.ResultRevision))
-	return api.WorkItemUpdateResult{Revision: revision, Receipt: receipt}, err
+	result := api.WorkItemUpdateResult{Revision: revision, Receipt: receipt}
+	if err != nil {
+		return result, err
+	}
+	// An estimate save returns the estimate that request saved, whatever the
+	// item shows now.
+	var estimate api.WorkItemEstimate
+	var created string
+	err = q.QueryRowContext(ctx, `SELECT tokens,basis,agent_id,by_node,by_user,created_at FROM work_item_estimates WHERE receipt_id=?`, receipt.ID).Scan(&estimate.Tokens, &estimate.Basis, &estimate.SetBy.AgentID, &estimate.SetBy.Node, &estimate.SetBy.User, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	estimate.SetAt = parseTS(created)
+	result.Estimate = &estimate
+	return result, nil
+}
+
+// saveWorkItemEstimate stores a token estimate beside the item. The item
+// keeps its revision, scope revision, updated time and updater, and gets no
+// revision row or queue sync, so a queued, running or accepted entry and a
+// frozen verification plan stay valid. The caller holds the write lock and
+// has replayed a prior receipt, gated acknowledgements and matched revision.
+func (s *Store) saveWorkItemEstimate(ctx context.Context, tx *sql.Tx, item api.WorkItem, req api.CreateWorkItemUpdate, payload string, by api.Caller) (api.WorkItemUpdateResult, error) {
+	zero := api.WorkItemUpdateResult{}
+	if err := validateWorkItemAgent(tx, ctx, item.TaskID, req.AgentID); err != nil {
+		return zero, err
+	}
+	if err := refuseStewardWrite(tx, ctx, item.TaskID, req.AgentID); err != nil {
+		return zero, err
+	}
+	if req.AgentID != "" {
+		var role, currentRun string
+		if err := tx.QueryRowContext(ctx, `SELECT role,run_id FROM agents WHERE task_id=? AND id=?`, item.TaskID, req.AgentID).Scan(&role, &currentRun); err != nil {
+			return zero, err
+		}
+		if role != api.AgentRoleDatabaseHandler {
+			return zero, workItemConflict("only the database handler sets an estimate")
+		}
+		if req.RunID != "" && currentRun != req.RunID {
+			return zero, workItemConflict("agent run changed; refresh identity before updating")
+		}
+	}
+	tokens, basis := *req.EstimateTokens, ""
+	if req.EstimateBasis != nil {
+		basis = *req.EstimateBasis
+	}
+	now := s.now()
+	setter := api.Sender{AgentID: req.AgentID, Node: by.Node, User: by.User}
+	update, err := tx.ExecContext(ctx, `UPDATE work_items SET estimate_tokens=?,estimate_basis=?,estimate_set_at=?,estimate_agent=?,estimate_node=?,estimate_user=? WHERE task_id=? AND id=? AND revision=?`,
+		tokens, basis, ts(now), setter.AgentID, setter.Node, setter.User, item.TaskID, item.ID, req.ExpectedRevision)
+	if err != nil {
+		return zero, err
+	}
+	if rows, err := update.RowsAffected(); err != nil {
+		return zero, err
+	} else if rows != 1 {
+		return zero, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	receipt := api.WorkItemUpdateReceipt{ID: api.NewID("wir"), RequestID: req.RequestID, TaskID: item.TaskID, ItemID: item.ID, ResultRevision: item.Revision, CreatedAt: now}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_update_requests(receipt_id,task_id,item_id,agent_id,run_id,by_node,by_user,request_id,payload_hash,result_revision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, receipt.ID, item.TaskID, item.ID, req.AgentID, req.RunID, by.Node, by.User, req.RequestID, payload, item.Revision, ts(now)); err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO work_item_estimates(receipt_id,task_id,item_id,item_revision,tokens,basis,agent_id,run_id,by_node,by_user,request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, receipt.ID, item.TaskID, item.ID, item.Revision, tokens, basis, req.AgentID, req.RunID, by.Node, by.User, req.RequestID, ts(now)); err != nil {
+		return zero, err
+	}
+	if _, err = s.insertEvent(ctx, tx, item.TaskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": []string{"estimate"}, "requestId": req.RequestID}, by); err != nil {
+		return zero, err
+	}
+	result, err := loadWorkItemUpdateResult(tx, ctx, receipt)
+	if err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(item.TaskID)
+	return result, nil
 }
 
 // CreateWorkItemUpdate performs a recoverable CAS update. Receipt lookup occurs
@@ -561,6 +675,10 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	if item.Revision != req.ExpectedRevision {
 		return api.WorkItemUpdateResult{}, false, workItemConflict("work item revision changed; refresh it before updating")
+	}
+	if req.EstimateTokens != nil {
+		result, err := s.saveWorkItemEstimate(ctx, tx, item, req, payload, by)
+		return result, false, err
 	}
 	var queueEntry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" {

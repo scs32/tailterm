@@ -76,6 +76,10 @@ type TeamQueueEntry struct {
 	// arm policy (docs/handler-ab.md).
 	HandlerArm *TeamQueueHandlerArm `json:"handlerArm,omitempty"`
 
+	// Budget is the item's token estimate against its lifetime attributed
+	// usage over every run, open and closed, unlike Tokens above.
+	Budget *TokenBudget `json:"budget,omitempty"`
+
 	// HandlerNeed explains a queued entry that waits only for a database
 	// handler: what it needs and whether the runner may add one
 	// (docs/handler-ab.md, "Automatic provisioning"). It is computed on read.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -440,4 +441,162 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 		return "build", reason, 0, nil
 	}
 	return "hand-offs", reason, 0, nil
+}
+
+// usageTurnPartial is the report's rule for a turn that makes its item's
+// actual a lower bound (usageAccumulator.add).
+func usageTurnPartial(t api.UsageTurn) bool {
+	return !t.Complete || t.Gap != "" || len(t.Tokens) < len(api.UsageClasses)
+}
+
+// replaceUsageItemShares rewrites one stored turn's rows in usage_item_shares
+// from its projection: per attributed item (” is project overhead) the turn's
+// reported token classes summed, the share denominator and whether the turn is
+// partial. Budgets read these rows instead of decoding every projection.
+func replaceUsageItemShares(ctx context.Context, tx *sql.Tx, task, agent, run string, p api.UsageProjection) error {
+	t := p.Turn
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_item_shares WHERE task_id=? AND agent_id=? AND run_id=? AND request_id=?`, task, agent, run, t.ID); err != nil {
+		return err
+	}
+	var tokens int64
+	for _, class := range api.UsageClasses {
+		tokens += t.Tokens[class]
+	}
+	partial := 0
+	if usageTurnPartial(t) {
+		partial = 1
+	}
+	type shareKey struct{ task, item string }
+	sums := map[shareKey]*big.Rat{}
+	order := []shareKey{}
+	for _, share := range p.Shares {
+		if share.Denominator < 1 {
+			continue // the report skips these too
+		}
+		k := shareKey{share.TaskID, share.ItemID}
+		if sums[k] == nil {
+			sums[k] = new(big.Rat)
+			order = append(order, k)
+		}
+		sums[k].Add(sums[k], big.NewRat(tokens, share.Denominator))
+	}
+	for _, k := range order {
+		// One share per item is the rule; a repeated item is kept exact as one
+		// reduced fraction.
+		num, den := sums[k].Num(), sums[k].Denom()
+		if !num.IsInt64() || !den.IsInt64() {
+			return usageInvalid("share exceeds the stored range")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO usage_item_shares(task_id,agent_id,run_id,request_id,turn_revision,item_task_id,item_id,denominator,tokens,partial) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			task, agent, run, t.ID, t.Revision, k.task, k.item, den.Int64(), num.Int64(), partial); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillUsageItemShares gives share rows to every stored turn that has none
+// at its current revision: turns stored before the table existed, and turns an
+// older binary wrote or revised after a rollback. It is idempotent and works
+// in bounded transactions, so an interrupted open resumes.
+func backfillUsageItemShares(db *sql.DB) error {
+	ctx := context.Background()
+	type turn struct {
+		rowid                                 int64
+		task, agent, run, request, projection string
+	}
+	after := int64(0)
+	for {
+		rows, err := db.QueryContext(ctx, `SELECT t.rowid,t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turns t
+ WHERE t.rowid>? AND NOT EXISTS (SELECT 1 FROM usage_item_shares s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
+ ORDER BY t.rowid LIMIT 500`, after)
+		if err != nil {
+			return err
+		}
+		batch := []turn{}
+		for rows.Next() {
+			var x turn
+			if err = rows.Scan(&x.rowid, &x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
+				rows.Close()
+				return err
+			}
+			batch = append(batch, x)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, x := range batch {
+			after = x.rowid
+			var p api.UsageProjection
+			if json.Unmarshal([]byte(x.projection), &p) != nil || p.Turn.ID != x.request {
+				continue // the report cannot read this row either
+			}
+			if err = replaceUsageItemShares(ctx, tx, x.task, x.agent, x.run, p); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+	}
+}
+
+// loadTokenBudget reads an item's saved estimate and its lifetime attributed
+// tokens over every run, open and closed. It reads usage_item_shares by item,
+// so its cost does not grow with the project's usage history.
+func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, error) {
+	budget := &api.TokenBudget{ActualTokens: "0", ActualState: "not measured"}
+	var estimate api.WorkItemEstimate
+	var setAt string
+	err := q.QueryRowContext(ctx, `SELECT estimate_tokens,estimate_basis,estimate_set_at,estimate_agent,estimate_node,estimate_user FROM work_items WHERE task_id=? AND id=?`, task, item).
+		Scan(&estimate.Tokens, &estimate.Basis, &setAt, &estimate.SetBy.AgentID, &estimate.SetBy.Node, &estimate.SetBy.User)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if err == nil && estimate.Tokens > 0 {
+		estimate.SetAt = parseTS(setAt)
+		budget.Estimate = &estimate
+	}
+	// Like the report, only the project's own turns count toward its items.
+	rows, err := q.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE item_task_id=? AND item_id=? AND task_id=? GROUP BY denominator`, task, item, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	actual := new(big.Rat)
+	for rows.Next() {
+		var denominator, tokens int64
+		var partial int
+		if err = rows.Scan(&denominator, &tokens, &partial); err != nil {
+			return nil, err
+		}
+		if denominator < 1 {
+			continue
+		}
+		actual.Add(actual, big.NewRat(tokens, denominator))
+		if budget.ActualState == "not measured" {
+			budget.ActualState = "measured"
+		}
+		if partial != 0 {
+			budget.ActualState = "partial"
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	budget.ActualTokens = actual.RatString()
+	if budget.Estimate != nil && budget.ActualState != "not measured" {
+		budget.Ratio = new(big.Rat).Quo(actual, big.NewRat(budget.Estimate.Tokens, 1)).RatString()
+	}
+	return budget, nil
 }

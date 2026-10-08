@@ -410,6 +410,10 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 	for _, k := range keys {
 		report := items[k].finish()
 		report.Time = times[report.ItemID]
+		// The budget is lifetime: the From/To filter never changes it.
+		if report.Budget, err = loadTokenBudget(ctx, tx, task, report.ItemID); err != nil {
+			return out, err
+		}
 		out.Items = append(out.Items, report)
 	}
 	return out, nil

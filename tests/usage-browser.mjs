@@ -66,12 +66,16 @@ const item=(id,title,cost,n=1,complete=true)=>({taskId:open.id,itemId:id,title,s
 const split=(key,model,tool,waiting)=>({key,modelMs:String(model),toolMs:String(tool),waitingMs:String(waiting)});
 const time={wallMs:'3600000',from:'2026-01-01T10:00:00Z',to:'2026-01-01T11:00:00Z',unmeasuredMs:'0',modelMs:'1920000',toolMs:'1020000',waitingMs:'11460000',agents:[{agentId:'agt_1111111111111111',name:'builder',role:'builder',modelMs:'480000',toolMs:'600000',waitingMs:'2520000',unmeasuredMs:'0',polls:2,pollMs:'3000'}],phases:[split('a minor',480000,120000,3000000),split('z dominant',480000,600000,2520000)],roles:[split('builder',480000,600000,2520000)],phaseRoles:[],timeline:{modelMs:'1680000',toolsOnlyMs:'900000',idleMs:'1020000',unmeasuredMs:'0'},waits:[{cause:'owner',messageSeq:12620,subject:'<b>Approve</b> the matrix <img src=x onerror=alert(1)>',awaitedBy:'builder, reviewer',ms:'5760000'},{cause:'unknown',awaitedBy:'builder',ms:'305000'}],causes:{owner:'5760000',handler:'0',teammate:'0',unknown:'305000'},polls:2,pollMs:'3000'};
 const waitingOnly={...time,wallMs:'600000',modelMs:'0',toolMs:'0',waitingMs:'600000',phases:[split('waiting only',0,0,600000)],roles:[],timeline:{modelMs:'0',toolsOnlyMs:'0',idleMs:'600000',unmeasuredMs:'0'},waits:[],polls:0,pollMs:'0'};
-const report={version:1,timeVersion:1,projectId:open.id,priceRevision:0,summary:summary(4,3),items:[{...item('wi_1111111111111111','Low',1),time:waitingOnly},{...item('wi_2222222222222222','High',2),time},item('wi_3333333333333333','Not measured',null,0),item('wi_4444444444444444','<b>Unknown model</b>',10,1,false)],overhead:item('','Project overhead',null)};
+// Budgets: no estimate, measured with a markup basis, estimate without usage, and a partial actual. Project overhead has none.
+const estimate=(tokens,basis)=>({tokens,basis,setAt:'2026-10-07T16:00:00Z',setBy:{agentId:'agt_1111111111111111',node:'fixture',user:'owner'}});
+const budgets={wi_1111111111111111:{actualTokens:'4200000',actualState:'measured'},wi_2222222222222222:{estimate:estimate(12000000,'<img src=x onerror=alert(1)>Small, 2 paths, median of 8 <b>Small</b> items'),actualTokens:'15300000',actualState:'measured',ratio:'51/40'},wi_3333333333333333:{estimate:estimate(5000000,'Small, 1 path'),actualTokens:'0',actualState:'not measured'},wi_4444444444444444:{estimate:estimate(12000000,'Planned, 9 paths'),actualTokens:'30600001/2',actualState:'partial',ratio:'30600001/24000000'}};
+const budgeted=row=>({...row,budget:budgets[row.itemId]});
+const report={version:1,timeVersion:1,projectId:open.id,priceRevision:0,summary:summary(4,3),items:[{...item('wi_1111111111111111','Low',1),time:waitingOnly},{...item('wi_2222222222222222','High',2),time},item('wi_3333333333333333','Not measured',null,0),item('wi_4444444444444444','<b>Unknown model</b>',10,1,false)].map(budgeted),overhead:item('','Project overhead',null)};
 let prices={revision:0,rows:[]};window.calls=[];window.pending=[];window.delay=false;window.offline=false;window.oldHub=false;
 const scroll=${scroll ? "true" : "false"};
 const fillers=scroll?Array.from({length:40},(_,i)=>({...open,id:'tsk_'+String(i+10).padStart(16,'0'),name:'Filler '+i})):[];
 const team=scroll?Array.from({length:12},(_,i)=>({id:'agt_'+String(i+10).padStart(16,'0'),name:'member-'+i,status:'running',host:'fixture',session:'s'+i,activity:{},createdAt:'2026-09-27T00:00:00Z'})):[];
-const client={listTasks:async()=>[...fillers,open,closed],getTask:async id=>({task:id===open.id?open:id===closed.id?closed:fillers.find(t=>t.id===id),agents:id===open.id?team:[]}),listTeamDelivery:async()=>({entries:[],concurrencyLimit:1}),listOwnerObligations:async()=>[],capabilities:async()=>({}),subscribe:(_id,cb)=>{window.push=cb;return{stop(){}}},cacheStatus:()=>({label:window.offline?'Saved data · offline':''}),getUsage:async(id,filters)=>{window.calls.push({id,filters});if(window.oldHub){const error=new Error('missing');error.status=404;throw error;}const data=structuredClone({...report,projectId:id});if(window.delay)return await new Promise(resolve=>window.pending.push(()=>resolve(data)));return data;},getUsagePrices:async()=>structuredClone(prices),setUsagePrices:async(id,body)=>{if(body.expectedRevision!==prices.revision){const e=new Error('conflict');e.status=409;throw e;}prices={revision:prices.revision+1,rows:body.rows};return structuredClone(prices);}};
+const client={listTasks:async()=>[...fillers,open,closed],getTask:async id=>({task:id===open.id?open:id===closed.id?closed:fillers.find(t=>t.id===id),agents:id===open.id?team:[]}),listTeamDelivery:async()=>({entries:[],concurrencyLimit:1}),listOwnerObligations:async()=>[],capabilities:async()=>({}),subscribe:(_id,cb)=>{window.push=cb;return{stop(){}}},cacheStatus:()=>({label:window.offline?'Saved data · offline':''}),getUsage:async(id,filters)=>{window.calls.push({id,filters});if(window.oldHub){const error=new Error('missing');error.status=404;throw error;}const data=structuredClone({...report,projectId:id});if((filters.from||'').startsWith('2099')){/* like the hub: a window with no requests empties the rows and keeps each lifetime budget */for(const row of data.items){row.summary=summary(0,null);row.phases=[];row.roles=[];row.models=[];row.phaseRoles=[];delete row.time;}}if(window.delay)return await new Promise(resolve=>window.pending.push(()=>resolve(data)));return data;},getUsagePrices:async()=>structuredClone(prices),setUsagePrices:async(id,body)=>{if(body.expectedRevision!==prices.revision){const e=new Error('conflict');e.status=409;throw e;}prices={revision:prices.revision+1,rows:body.rows};return structuredClone(prices);}};
 window.fixture={client,report,open,prices:()=>prices};
 const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>false,groupOf:()=>null},getTabs:()=>[],activate:()=>{},notice:()=>{},confirm:async()=>true,openBoard:()=>{},openWorkItems:()=>{},configure:()=>{}});view.mount(document.querySelector(scroll?'#mode-view':'#projects'));window.ready=view.show();window.reload=()=>view.reload();
 </script></body></html>`;
@@ -398,6 +402,116 @@ try {
         "Time not measured",
       );
       assert.equal(await page.locator("[data-usage-time]").count(), 5);
+      // Budget: each item's estimate against its lifetime actual, in the
+      // item's summary line and again with its basis inside the item.
+      const budgetOf = (id) =>
+        page.locator(`[data-usage-item="${id}"] [data-usage-budget]`);
+      const summaryOf = (id) =>
+        page.locator(`[data-usage-item="${id}"] > summary`).innerText();
+      const budgetTexts = async () => ({
+        high: await summaryOf("wi_2222222222222222"),
+        low: await summaryOf("wi_1111111111111111"),
+        unmeasured: await summaryOf("wi_3333333333333333"),
+        partial: await summaryOf("wi_4444444444444444"),
+        overhead: await summaryOf("overhead"),
+      });
+      const wantBudgets = {
+        high: "High · Estimated USD 2 · Estimate 12.0M · lifetime actual 15.3M · 1.28×",
+        low: "Low · Estimated USD 1 · No estimate · lifetime actual 4.2M",
+        unmeasured:
+          "Not measured · Tokens only · Estimate 5.0M · lifetime actual not measured",
+        partial:
+          "<b>Unknown model</b> · Partially priced subtotal USD 10 · Estimate 12.0M · lifetime actual at least 15.3M (partial) · at least 1.28×",
+        // No budget key: the row is as it was before budgets existed.
+        overhead: "Project overhead · Tokens only",
+      };
+      assert.deepEqual(await budgetTexts(), wantBudgets);
+      // A partial actual never shows a bare ratio.
+      assert.ok(!/\(partial\) · \d/.test(wantBudgets.partial));
+      assert.equal(
+        await budgetOf("wi_2222222222222222").innerText(),
+        "Estimate 12.0M · lifetime actual 15.3M · 1.28×\nEstimate basis: <img src=x onerror=alert(1)>Small, 2 paths, median of 8 <b>Small</b> items",
+      );
+      assert.equal(
+        await budgetOf("wi_1111111111111111").innerText(),
+        "No estimate · lifetime actual 4.2M",
+      );
+      assert.equal(await page.locator("[data-usage-budget]").count(), 4);
+      assert.equal(await budgetOf("overhead").count(), 0);
+      assert.equal(
+        await page
+          .locator(".usage-item script,.usage-item b,.usage-item img")
+          .count(),
+        0,
+      );
+      // The role rows of the expanded item stay beside its budget.
+      assert.match(
+        await high.locator("[data-usage-group]").nth(1).innerText(),
+        /Roles · wi_2222222222222222[\s\S]*builder/,
+      );
+      // From/To changes the rows below; the budget is lifetime and stays.
+      const filterFrom = page.locator('[data-usage-field="from"]');
+      await filterFrom.fill("2099-01-01T00:00:00Z");
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[data-usage-item="wi_2222222222222222"] > p')
+            ?.textContent === "Not measured",
+      );
+      assert.equal(
+        (await page.evaluate(() => window.calls.at(-1).filters)).from,
+        "2099-01-01T00:00:00Z",
+      );
+      assert.equal(await high.locator("[data-usage-group] tr").count(), 0);
+      assert.deepEqual(await budgetTexts(), {
+        ...wantBudgets,
+        high: "High · Tokens only · Estimate 12.0M · lifetime actual 15.3M · 1.28×",
+        low: "Low · Tokens only · No estimate · lifetime actual 4.2M",
+        partial:
+          "<b>Unknown model</b> · Tokens only · Estimate 12.0M · lifetime actual at least 15.3M (partial) · at least 1.28×",
+      });
+      assert.match(
+        await budgetOf("wi_2222222222222222").innerText(),
+        /^Estimate 12\.0M · lifetime actual 15\.3M · 1\.28×/,
+      );
+      await filterFrom.fill("");
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(
+        () => document.querySelectorAll("[data-usage-time]").length === 5,
+      );
+      assert.deepEqual(await budgetTexts(), wantBudgets);
+      assert.match(
+        await high.locator("[data-usage-group]").nth(1).innerText(),
+        /builder[\s\S]*Time: model 8m 0s · tool 10m 0s · waiting 42m 0s/,
+      );
+      // A report from a hub that sends no budget renders as before.
+      const beforeBudget = await page.evaluate(() => {
+        const saved = structuredClone(window.fixture.report);
+        for (const row of window.fixture.report.items) delete row.budget;
+        return saved;
+      });
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(
+        () => document.querySelectorAll("[data-usage-budget]").length === 0,
+      );
+      assert.deepEqual(await budgetTexts(), {
+        high: "High · Estimated USD 2",
+        low: "Low · Estimated USD 1",
+        unmeasured: "Not measured · Tokens only",
+        partial: "<b>Unknown model</b> · Partially priced subtotal USD 10",
+        overhead: "Project overhead · Tokens only",
+      });
+      assert.doesNotMatch(
+        await high.innerText(),
+        /Estimate \d|Estimate basis|No estimate|lifetime/,
+      );
+      await page.evaluate((saved) => {
+        Object.assign(window.fixture.report, saved);
+      }, beforeBudget);
+      await page.locator("[data-usage-refresh]").click();
+      await page.waitForFunction(
+        () => document.querySelectorAll("[data-usage-budget]").length === 4,
+      );
       if (process.env.USAGE_SCREENSHOT_DIR)
         await page.screenshot({
           path: join(
@@ -630,7 +744,7 @@ try {
       await context.close();
       console.log(
         engine.name() +
-          ": Usage project integration, cost order, time, waits, editor, stale/offline/closed/focus/narrow checks pass",
+          ": Usage project integration, cost order, budget, time, waits, editor, stale/offline/closed/focus/narrow checks pass",
       );
       await scrollSection(browser, engine.name());
     } finally {

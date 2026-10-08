@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,14 +26,18 @@ func cmdUsage(e env, args []string) error {
 	from := fs.String("from", "", "inclusive RFC3339 request time")
 	to := fs.String("to", "", "exclusive RFC3339 request time")
 	asJSON := fs.Bool("json", false, "versioned JSON report")
+	calibration := fs.Bool("calibration", false, "list done items with actual tokens, lane, owned paths, template and estimate")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
-	if fs.NArg() != 0 || !api.ValidID(*project, "tsk") {
-		return errors.New("usage: tt usage [--project ID] [--item ID] [--from RFC3339] [--to RFC3339] [--json]")
+	if fs.NArg() != 0 || !api.ValidID(*project, "tsk") || (*calibration && (*item != "" || *from != "" || *to != "")) {
+		return errors.New("usage: tt usage [--project ID] [--item ID] [--from RFC3339] [--to RFC3339] [--json] | tt usage --calibration [--project ID] [--json]")
+	}
+	if *calibration {
+		return usageCalibration(e, *project, *asJSON)
 	}
 	q := api.UsageQuery{Item: *item}
 	var err error
@@ -68,6 +73,9 @@ func cmdUsage(e env, args []string) error {
 	fmt.Printf("Usage %s · prices revision %d · UTC request times\n", out.ProjectID, out.PriceRevision)
 	for _, row := range append(out.Items, out.Overhead) {
 		printUsageRow(row.Title, row.Summary)
+		if text := formatTokenBudget(row.Budget); text != "" {
+			fmt.Println("  budget: " + text)
+		}
 		if out.TimeVersion > 0 {
 			printUsageTime(row.Time)
 		}
@@ -311,4 +319,182 @@ func cmdUsagePrices(e env, args []string) error {
 	}
 	printJSON(out)
 	return nil
+}
+
+// formatTokenBudget renders an item's estimate against its lifetime actual:
+// "estimate 12.00M · lifetime actual 15.30M · 1.28×". A partial actual is a
+// lower bound, so it and its ratio say "at least". A nil budget (an older
+// hub) prints nothing.
+func formatTokenBudget(b *api.TokenBudget) string {
+	if b == nil {
+		return ""
+	}
+	parts := []string{"no estimate"}
+	if b.Estimate != nil {
+		parts[0] = "estimate " + formatTokenCount(strconv.FormatInt(b.Estimate.Tokens, 10))
+	}
+	bound := ""
+	switch b.ActualState {
+	case "measured":
+		parts = append(parts, "lifetime actual "+formatTokenCount(b.ActualTokens))
+	case "partial":
+		bound = "at least "
+		parts = append(parts, "lifetime actual at least "+formatTokenCount(b.ActualTokens)+" (partial)")
+	default:
+		parts = append(parts, "lifetime actual not measured")
+	}
+	if ratio := formatBudgetRatio(b); ratio != "" {
+		parts = append(parts, bound+ratio)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatBudgetRatio prints actual/estimate as "1.28×", or nothing when the
+// budget has no ratio.
+func formatBudgetRatio(b *api.TokenBudget) string {
+	if b == nil || b.Ratio == "" {
+		return ""
+	}
+	n, ok := new(big.Rat).SetString(b.Ratio)
+	if !ok {
+		return ""
+	}
+	return n.FloatString(2) + "×"
+}
+
+// usageCalibrationRow is one done item for estimating from history.
+type usageCalibrationRow struct {
+	ItemID string `json:"itemId"`
+	Seq    int64  `json:"seq"`
+	Kind   string `json:"kind"`
+	Title  string `json:"title"`
+	// Lane is the template of the item's latest team queue entry, small or
+	// planned, or "none" when the item was never queued.
+	Lane       string `json:"lane"`
+	OwnedPaths int    `json:"ownedPaths"`
+	// Template is that entry's team shape, plan-review or plan-only.
+	Template       string `json:"template,omitempty"`
+	ActualTokens   string `json:"actualTokens"`
+	ActualState    string `json:"actualState"`
+	EstimateTokens int64  `json:"estimateTokens,omitempty"`
+	EstimateBasis  string `json:"estimateBasis,omitempty"`
+	Ratio          string `json:"ratio,omitempty"`
+}
+
+type usageCalibrationReport struct {
+	ProjectID string                `json:"projectId"`
+	Items     []usageCalibrationRow `json:"items"`
+}
+
+// launchTeamShape mirrors the hub's team shape for an entry listed in full,
+// which carries its launch instead of the summary's teamShape.
+func launchTeamShape(q api.TeamQueueEntry) string {
+	if q.TeamShape != "" || len(q.LaunchJSON) == 0 {
+		return q.TeamShape
+	}
+	var launch struct {
+		Members []struct {
+			Fields struct {
+				Role string `json:"role"`
+			} `json:"fields"`
+		} `json:"members"`
+	}
+	if json.Unmarshal(q.LaunchJSON, &launch) != nil || len(launch.Members) == 0 {
+		return ""
+	}
+	for _, m := range launch.Members {
+		if m.Fields.Role == "Plan review" {
+			return "plan-review"
+		}
+	}
+	return "plan-only"
+}
+
+// collectUsageCalibration reads every done item and every team queue entry of
+// the project to their last pages, so no item is cut off at a page limit.
+func collectUsageCalibration(ctx context.Context, c *api.Client, project string) (usageCalibrationReport, error) {
+	out := usageCalibrationReport{ProjectID: project, Items: []usageCalibrationRow{}}
+	latest := map[string]api.TeamQueueEntry{}
+	keep := func(entries []api.TeamQueueEntry) {
+		for _, q := range entries {
+			if prior, ok := latest[q.ItemID]; !ok || q.Position > prior.Position {
+				latest[q.ItemID] = q
+			}
+		}
+	}
+	after := int64(0)
+	for {
+		page, err := c.ListTeamQueuePage(ctx, project, api.TeamQueueListOptions{Limit: api.MaxLimit, After: after})
+		if err != nil {
+			return out, err
+		}
+		// Every page repeats the active entries; history is cut to the page.
+		keep(page.Entries)
+		if page.History == nil || page.History.NextAfter == 0 {
+			break
+		}
+		after = page.History.NextAfter
+	}
+	seq := int64(0)
+	for {
+		list, err := c.ListWorkItems(ctx, project, "", "done", seq, api.MaxLimit)
+		if err != nil {
+			return out, err
+		}
+		if len(list.Items) == 0 {
+			break
+		}
+		for _, item := range list.Items {
+			row := usageCalibrationRow{ItemID: item.ID, Seq: item.Seq, Kind: item.Kind, Title: item.Title, Lane: "none", ActualTokens: "0", ActualState: "not measured"}
+			if q, ok := latest[item.ID]; ok {
+				row.Lane, row.OwnedPaths, row.Template = q.Template, len(q.Ownership), launchTeamShape(q)
+				if row.Lane == "" {
+					row.Lane = "planned" // an entry saved before templates were recorded
+				}
+			}
+			if b := item.Budget; b != nil {
+				row.ActualTokens, row.ActualState, row.Ratio = b.ActualTokens, b.ActualState, b.Ratio
+				if b.Estimate != nil {
+					row.EstimateTokens, row.EstimateBasis = b.Estimate.Tokens, b.Estimate.Basis
+				}
+			}
+			out.Items = append(out.Items, row)
+			seq = item.Seq
+		}
+	}
+	return out, nil
+}
+
+func usageCalibration(e env, project string, asJSON bool) error {
+	c, err := e.client(30 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(2 * time.Minute)
+	defer cancel()
+	out, err := collectUsageCalibration(ctx, c, project)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		printJSON(out)
+		return nil
+	}
+	for _, row := range out.Items {
+		fmt.Println(formatCalibrationRow(row))
+	}
+	return nil
+}
+
+// formatCalibrationRow prints one done item on one line.
+func formatCalibrationRow(row usageCalibrationRow) string {
+	budget := &api.TokenBudget{ActualTokens: row.ActualTokens, ActualState: row.ActualState, Ratio: row.Ratio}
+	if row.EstimateTokens > 0 {
+		budget.Estimate = &api.WorkItemEstimate{Tokens: row.EstimateTokens, Basis: row.EstimateBasis}
+	}
+	template := row.Template
+	if template == "" {
+		template = "none"
+	}
+	return fmt.Sprintf("#%d %s %s lane=%s paths=%d template=%s · %s · %s", row.Seq, row.ItemID, row.Kind, row.Lane, row.OwnedPaths, template, formatTokenBudget(budget), row.Title)
 }

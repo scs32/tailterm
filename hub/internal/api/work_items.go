@@ -39,6 +39,36 @@ type WorkItem struct {
 	UpdatedAt        time.Time           `json:"updatedAt"`
 	LastDispatch     *WorkItemDispatch   `json:"lastDispatch,omitempty"`
 	CompletionReport *NarrativeReportPin `json:"completionReport,omitempty"`
+	// Budget is the token estimate beside the lifetime attributed usage. A
+	// current hub always sends it on reads; a missing key means an older hub.
+	Budget *TokenBudget `json:"budget,omitempty"`
+}
+
+// MaxEstimateTokens and MaxEstimateBasisBytes bound a saved estimate.
+const (
+	MaxEstimateTokens     = int64(1e12)
+	MaxEstimateBasisBytes = 240
+)
+
+// WorkItemEstimate is one saved token estimate. Tokens 0 is a clear.
+type WorkItemEstimate struct {
+	Tokens int64     `json:"tokens"`
+	Basis  string    `json:"basis,omitempty"`
+	SetAt  time.Time `json:"setAt"`
+	SetBy  Sender    `json:"setBy"`
+}
+
+// TokenBudget shows an item's estimate against its lifetime attributed
+// tokens. ActualTokens is an exact rational string over every run, open and
+// closed, and "0" when not measured. ActualState is "measured", "partial" or
+// "not measured", the state the unfiltered usage report gives the item; a
+// partial actual and its ratio are lower bounds. Ratio is actual/estimate,
+// absent without an estimate or when not measured.
+type TokenBudget struct {
+	Estimate     *WorkItemEstimate `json:"estimate,omitempty"`
+	ActualTokens string            `json:"actualTokens"`
+	ActualState  string            `json:"actualState"`
+	Ratio        string            `json:"ratio,omitempty"`
 }
 
 type WorkItemDispatch struct {
@@ -87,6 +117,11 @@ type CreateWorkItemUpdate struct {
 	// the same transaction as a done save. The hub fills the repository, base,
 	// item revision and completion report from the entry and the saved item.
 	QueueAcceptance *WorkItemQueueAcceptance `json:"queueAcceptance,omitempty"`
+	// EstimateTokens saves a token estimate with its basis and nothing else:
+	// the item keeps its revision. 0 clears the estimate and takes no basis.
+	// Only the database handler or the owner sets it.
+	EstimateTokens *int64  `json:"estimateTokens,omitempty"`
+	EstimateBasis  *string `json:"estimateBasis,omitempty"`
 }
 
 // WorkItemQueueAcceptance is the Git tuple of the accepted builder result for
@@ -469,6 +504,9 @@ type WorkItemUpdateReceipt struct {
 type WorkItemUpdateResult struct {
 	Revision WorkItemRevision      `json:"revision"`
 	Receipt  WorkItemUpdateReceipt `json:"receipt"`
+	// Estimate is the estimate this request saved, on the first save, a
+	// replay and a receipt read alike; later saves do not change it.
+	Estimate *WorkItemEstimate `json:"estimate,omitempty"`
 }
 
 type WorkItemHistoryGapResponse struct {

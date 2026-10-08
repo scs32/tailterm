@@ -9,7 +9,47 @@ import {
   usageTimeline,
   usageTimeSplit,
   usageWait,
+  rational,
 } from "./usage-format.js";
+
+// Token counts in the budget line: 950, 12.1k, 15.3M, 1.2B.
+const budgetTokens = (value) => {
+  const r = rational(value);
+  if (!r) return "unavailable";
+  const n = Number(r[0]) / Number(r[1]);
+  for (const [size, unit] of [
+    [1e9, "B"],
+    [1e6, "M"],
+    [1e3, "k"],
+  ])
+    if (n >= size) return (n / size).toFixed(1) + unit;
+  return String(Math.round(n));
+};
+// The item's estimate against its lifetime actual. The From/To filter does
+// not change it. A partial actual is a lower bound, so it and its ratio say
+// "at least". A report without a budget (an older hub) shows nothing.
+export function usageBudget(budget) {
+  if (!budget) return "";
+  const estimate = budget.estimate;
+  const parts = [
+    estimate ? `Estimate ${budgetTokens(String(estimate.tokens))}` : "No estimate",
+  ];
+  const partial = budget.actualState === "partial";
+  if (budget.actualState === "measured" || partial)
+    parts.push(
+      `lifetime actual ${partial ? "at least " : ""}${budgetTokens(budget.actualTokens)}${partial ? " (partial)" : ""}`,
+    );
+  else parts.push("lifetime actual not measured");
+  const ratio = rational(budget.ratio);
+  if (estimate && ratio) {
+    // Exact hundredths, rounded half up like tt: 51/40 is 1.28×, not 1.27×.
+    const hundredths = (ratio[0] * 200n + ratio[1]) / (ratio[1] * 2n);
+    parts.push(
+      `${partial ? "at least " : ""}${hundredths / 100n}.${String(hundredths % 100n).padStart(2, "0")}×`,
+    );
+  }
+  return parts.join(" · ");
+}
 
 // Optional disclosure owns its own requests. Slow usage reads never hold core
 // Projects/roster/Board rendering, and every response pins client/project/epoch.
@@ -81,8 +121,12 @@ export function createUsageView({ client, notice = () => {} }) {
       const waits = (row.time.waits || []).map(usageWait);
       return `<p data-usage-time>${esc(usageTimeSummary(row.time))}<br>${esc(usageTimeline(row.time))}</p>${waits.length ? `<table class="usage-breakdown usage-waits" data-usage-waits><tbody>${waits.map((w) => `<tr><td>${esc(w.cause)}</td><td>${esc(w.target)}<br>${esc(w.detail)}</td></tr>`).join("")}</tbody></table>` : ""}`;
     };
+    const budget = (row) =>
+      row.budget
+        ? `<p data-usage-budget>${esc(usageBudget(row.budget))}${row.budget.estimate?.basis ? `<br>Estimate basis: ${esc(row.budget.estimate.basis)}` : ""}</p>`
+        : "";
     const item = (row) =>
-      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}</summary><p>${esc(usageSummary(row.summary))}</p>${time(row)}${groups("Phases · " + (row.itemId || "overhead"), sortUsagePhases(row.phases), row.time?.phases)}${groups("Roles · " + (row.itemId || "overhead"), row.roles, row.time?.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles, row.time?.phaseRoles)}</details>`;
+      `<details class="usage-item" data-usage-item="${esc(row.itemId || "overhead")}" ${s.expanded.has(row.itemId || "overhead") ? "open" : ""}><summary>${esc(row.title)} · ${esc(formatUsageCost(row.summary))}${row.budget ? ` · ${esc(usageBudget(row.budget))}` : ""}</summary><p>${esc(usageSummary(row.summary))}</p>${budget(row)}${time(row)}${groups("Phases · " + (row.itemId || "overhead"), sortUsagePhases(row.phases), row.time?.phases)}${groups("Roles · " + (row.itemId || "overhead"), row.roles, row.time?.roles)}${groups("Models · " + (row.itemId || "overhead"), row.models)}${groups("Phase and role · " + (row.itemId || "overhead"), row.phaseRoles, row.time?.phaseRoles)}</details>`;
     const coverage = [
       ...new Set(
         (s.report?.coverage || [])

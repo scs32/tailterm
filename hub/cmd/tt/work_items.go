@@ -167,8 +167,30 @@ func cmdWorkItemGet(e env, args []string) error {
 		printJSON(item)
 		return nil
 	}
-	fmt.Printf("%s %s %s [%s]\n%s\n", strings.ToUpper(item.Kind), item.ID, item.Title, item.Status, item.Description)
+	fmt.Printf("%s %s %s [%s]\n", strings.ToUpper(item.Kind), item.ID, item.Title, item.Status)
+	for _, line := range workItemBudgetLines(item.Budget) {
+		fmt.Println(line)
+	}
+	fmt.Println(item.Description)
 	return nil
+}
+
+// workItemBudgetLines is the budget block of tt work-items get: the estimate
+// against the lifetime actual, then the estimate's basis and who set it. An
+// older hub sends no budget and gets no lines.
+func workItemBudgetLines(b *api.TokenBudget) []string {
+	if b == nil {
+		return nil
+	}
+	lines := []string{"Budget: " + formatTokenBudget(b)}
+	if est := b.Estimate; est != nil {
+		setter := est.SetBy.AgentID
+		if setter == "" {
+			setter = est.SetBy.User
+		}
+		lines = append(lines, fmt.Sprintf("Estimate basis: %s (set %s by %s)", est.Basis, est.SetAt.UTC().Format(time.RFC3339), setter))
+	}
+	return lines
 }
 
 func cmdWorkItemCreate(e env, args []string) error {
@@ -227,12 +249,14 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	branch := fs.String("branch", "", "accepted branch")
 	commit := fs.String("commit", "", "accepted commit SHA")
 	acceptanceEvidence := fs.String("evidence", "", "queue acceptance evidence (default: the saved completion receipt)")
+	estimateTokens := fs.Int64("estimate-tokens", 0, "token estimate, saved without a new revision (database handler or owner; 0 clears it)")
+	estimateBasis := fs.String("estimate-basis", "", "one-line basis of the estimate, such as \"Small, 2 paths, median of 8 Small items\"")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 1 {
-		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] [--worktree DIR --branch B --commit SHA] WI_ID")
+		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] [--worktree DIR --branch B --commit SHA] WI_ID | tt work-items update --revision N --request-id KEY --estimate-tokens N --estimate-basis TEXT WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)
 	if err != nil {
@@ -259,6 +283,49 @@ func cmdWorkItemUpdate(e env, args []string) error {
 			return err
 		}
 		req.Description = &description
+	}
+	if visited["estimate-tokens"] || visited["estimate-basis"] {
+		// An estimate is saved alone and leaves the item revision unchanged.
+		if !visited["estimate-tokens"] {
+			return errors.New("--estimate-basis needs --estimate-tokens")
+		}
+		for _, name := range []string{"title", "body-file", "status", "priority", "report-id", "report-version", "report-digest", "report-scope-revision", "worktree", "branch", "commit", "evidence"} {
+			if visited[name] {
+				return fmt.Errorf("--estimate-tokens is saved alone; drop --%s", name)
+			}
+		}
+		if *estimateTokens < 0 || *estimateTokens > api.MaxEstimateTokens {
+			return fmt.Errorf("--estimate-tokens must be between 0 and %d", api.MaxEstimateTokens)
+		}
+		if *estimateTokens == 0 && *estimateBasis != "" {
+			return errors.New("--estimate-tokens 0 clears the estimate and takes no --estimate-basis")
+		}
+		if *estimateTokens > 0 && (*estimateBasis == "" || len(*estimateBasis) > api.MaxEstimateBasisBytes || strings.ContainsAny(*estimateBasis, "\r\n") || strings.TrimSpace(*estimateBasis) != *estimateBasis) {
+			return fmt.Errorf("--estimate-basis is required: one line of at most %d bytes", api.MaxEstimateBasisBytes)
+		}
+		if *requestID == "" {
+			return errors.New("--request-id is required")
+		}
+		req.EstimateTokens = estimateTokens
+		if *estimateTokens > 0 {
+			req.EstimateBasis = estimateBasis
+		}
+		c, err := e.client(10 * time.Second)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := ctxTimeout(30 * time.Second)
+		defer cancel()
+		result, err := c.CreateWorkItemUpdate(ctx, project, fs.Arg(0), req)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(result)
+			return nil
+		}
+		fmt.Println(estimateSaveLine(result))
+		return nil
 	}
 	if req.Title == nil && req.Description == nil && req.Status == nil && req.Priority == nil {
 		return errors.New("at least one update field is required")
@@ -396,10 +463,26 @@ func cmdWorkItemReceipt(e env, args []string) error {
 	}
 	if *asJSON {
 		printJSON(result)
+	} else if result.Estimate != nil {
+		fmt.Println(estimateSaveLine(result))
 	} else {
 		fmt.Printf("%s revision %d receipt %s\n", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
 	}
 	return nil
+}
+
+// estimateSaveLine reports the estimate one request saved. The revision is
+// the item's unchanged revision.
+func estimateSaveLine(result api.WorkItemUpdateResult) string {
+	line := fmt.Sprintf("%s revision %d (unchanged) receipt %s", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
+	est := result.Estimate
+	if est == nil {
+		return line // an older hub ignores the estimate fields
+	}
+	if est.Tokens == 0 {
+		return line + " estimate cleared"
+	}
+	return line + fmt.Sprintf(" estimate %d tokens: %s", est.Tokens, est.Basis)
 }
 
 func cmdWorkItemRevisions(e env, args []string) error {

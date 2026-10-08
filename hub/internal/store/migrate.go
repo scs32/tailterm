@@ -299,6 +299,13 @@ CREATE TABLE IF NOT EXISTS project_pause_receipts (
 		{"completion_report_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"completion_report_digest", "TEXT NOT NULL DEFAULT ''"},
 		{"completion_scope_revision", "INTEGER NOT NULL DEFAULT 0"},
+		// The token estimate sits beside the item and outside its revisions.
+		{"estimate_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"estimate_basis", "TEXT NOT NULL DEFAULT ''"},
+		{"estimate_set_at", "TEXT NOT NULL DEFAULT ''"},
+		{"estimate_agent", "TEXT NOT NULL DEFAULT ''"},
+		{"estimate_node", "TEXT NOT NULL DEFAULT ''"},
+		{"estimate_user", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('work_items') WHERE name=?`, c.name).Scan(&n); err != nil {
@@ -434,6 +441,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateUsage(db); err != nil {
 		return err
 	}
+	if err := migrateTokenBudget(db); err != nil {
+		return err
+	}
 	if err := migrateActivity(db); err != nil {
 		return err
 	}
@@ -536,4 +546,45 @@ CREATE TABLE IF NOT EXISTS delivery_recovery_incidents (
 );
 CREATE INDEX IF NOT EXISTS delivery_recovery_incidents_delivery ON delivery_recovery_incidents(delivery_id,created_at,id);`)
 	return err
+}
+
+// migrateTokenBudget adds the append-only estimate history and the per-item
+// usage shares that budgets read, then fills shares for turns stored without
+// them. Both tables are additive: an older binary ignores them. The share
+// index covers the budget read, so a budget never visits the table.
+func migrateTokenBudget(db *sql.DB) error {
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS work_item_estimates (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  receipt_id TEXT NOT NULL UNIQUE,
+  task_id TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  item_revision INTEGER NOT NULL,
+  tokens INTEGER NOT NULL,
+  basis TEXT NOT NULL DEFAULT '',
+  agent_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  by_node TEXT NOT NULL,
+  by_user TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(task_id,item_id) REFERENCES work_items(task_id,id)
+);
+CREATE INDEX IF NOT EXISTS work_item_estimates_item ON work_item_estimates(task_id,item_id,seq);
+CREATE TABLE IF NOT EXISTS usage_item_shares (
+  task_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  turn_revision INTEGER NOT NULL,
+  item_task_id TEXT NOT NULL,
+  item_id TEXT NOT NULL DEFAULT '',
+  denominator INTEGER NOT NULL,
+  tokens INTEGER NOT NULL,
+  partial INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(task_id,agent_id,run_id,request_id,item_task_id,item_id)
+);
+CREATE INDEX IF NOT EXISTS usage_item_shares_item ON usage_item_shares(item_task_id,item_id,task_id,denominator,tokens,partial);`); err != nil {
+		return err
+	}
+	return backfillUsageItemShares(db)
 }
