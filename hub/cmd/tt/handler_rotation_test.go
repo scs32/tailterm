@@ -213,14 +213,19 @@ func (f *rotationCLI) handlers(t *testing.T) (open, total int) {
 	return open, total
 }
 
-// executions waits briefly for want launches of the fake tt, then reports
-// the count; each launch appends one byte once tmux starts it.
+// executions waits for want launches of the fake tt, then reports the count
+// for the caller to assert; each launch appends one byte once tmux starts it.
+// The wait is bounded by handlerLaunchWait because that start can trail the
+// launch on a loaded host. More than want is reported at once.
 func (f *rotationCLI) executions(t *testing.T, want int) int {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(handlerLaunchWait)
 	for {
 		data, _ := os.ReadFile(f.marker)
-		if len(data) >= want || time.Now().After(deadline) {
+		if len(data) > want {
+			return len(data)
+		}
+		if len(data) == want || !time.Now().Before(deadline) {
 			time.Sleep(50 * time.Millisecond)
 			data, _ = os.ReadFile(f.marker)
 			return len(data)

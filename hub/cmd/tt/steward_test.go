@@ -116,17 +116,22 @@ func (f *stewardCLI) db(t *testing.T) *sql.DB {
 	return db
 }
 
+// executions waits until the fake tt has run exactly n times, bounded by
+// handlerLaunchWait because tmux starts it after the launch has returned. It
+// fails at once on more than n, so an extra launch is never waited out.
 func (f *stewardCLI) executions(t *testing.T, n int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if data, _ := os.ReadFile(f.marker); len(data) == n {
+	deadline := time.Now().Add(handlerLaunchWait)
+	for {
+		data, _ := os.ReadFile(f.marker)
+		if len(data) == n {
 			return
+		}
+		if len(data) > n || !time.Now().Before(deadline) {
+			t.Fatalf("expected %d launches, got %q", n, data)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	data, _ := os.ReadFile(f.marker)
-	t.Fatalf("expected %d launches, got %q", n, data)
 }
 
 // spawnArgs are tt spawn flags for a steward with a fixed synthetic template.
