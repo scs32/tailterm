@@ -55,39 +55,49 @@ func TestMain(m *testing.M) {
 // the real homes in testRealHomesEnv and checks the home it was given, so a
 // test that starts one with the user's home fails with that child's message.
 // A child may have another temporary home; it never gets one of its own here.
+// Neither does a process whose caller already gave it a home that is not the
+// user's: it runs under the guard with that home.
+//
+// Two runs keep the home they were given, unguarded. With TT_LIVE_CLAUDE=1
+// the opt-in live tests start a real Claude Code session, which needs the
+// caller's home for its own login. And the redaction probe helper is not a
+// test: it is that session's hook and exits inside its test function.
 //
 // CODEX_HOME and CLAUDE_CONFIG_DIR are dropped like the TAILTERM_ variables:
-// an agent's shell sets them to the user's own directories. The Go caches
-// keep their places, because several tests build a binary and an empty home
-// would rebuild the module and download its dependencies.
+// an agent's shell sets them to the user's own directories. The Go build and
+// module caches keep their places, because several tests build a binary and
+// an empty home would rebuild the module and download its dependencies.
 func runWithOwnHome(run func() int) int {
+	if os.Getenv(redactProbeHelperEnv) != "" {
+		return run()
+	}
+	_, child := os.LookupEnv(testRealHomesEnv)
+	if os.Getenv("TT_LIVE_CLAUDE") == "1" {
+		if !child {
+			fmt.Fprintln(os.Stderr, "TT_LIVE_CLAUDE=1: these tests keep the caller's HOME, because Claude Code needs its own login; the real-home guard is off for this run")
+		}
+		os.Setenv(testRealHomesEnv, "")
+		return run()
+	}
 	os.Unsetenv("CODEX_HOME")
 	os.Unsetenv("CLAUDE_CONFIG_DIR")
-	if _, child := os.LookupEnv(testRealHomesEnv); child {
+	if child {
 		return guardedRun(run)
 	}
+	home, _ := os.UserHomeDir()
 	// user.Current does not read HOME where cgo is on, so a caller's
 	// temporary HOME does not hide the user's own.
-	candidates := []string{}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, home)
+	real := home
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		real = u.HomeDir
 	}
-	if u, err := user.Current(); err == nil {
-		candidates = append(candidates, u.HomeDir)
+	os.Setenv(testRealHomesEnv, real)
+	if home != "" && !pathWithinAny(home, []string{real}) {
+		return guardedRun(run)
 	}
-	var real []string
-	for _, dir := range candidates {
-		if dir == "" {
-			continue
-		}
-		real = append(real, dir)
-		if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != dir {
-			real = append(real, resolved)
-		}
-	}
-	if out, err := exec.Command("go", "env", "GOCACHE", "GOMODCACHE", "GOPATH", "GOENV").Output(); err == nil {
-		if values := strings.Split(strings.TrimSpace(string(out)), "\n"); len(values) == 4 {
-			for i, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "GOENV"} {
+	if out, err := exec.Command("go", "env", "GOCACHE", "GOMODCACHE", "GOPATH").Output(); err == nil {
+		if values := strings.Split(strings.TrimSpace(string(out)), "\n"); len(values) == 3 {
+			for i, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
 				os.Setenv(name, values[i])
 			}
 		}
@@ -98,7 +108,6 @@ func runWithOwnHome(run func() int) int {
 		return 1
 	}
 	os.Setenv("HOME", dir)
-	os.Setenv(testRealHomesEnv, strings.Join(real, string(os.PathListSeparator)))
 	code := guardedRun(run)
 	if err := os.RemoveAll(dir); err != nil {
 		fmt.Fprintln(os.Stderr, "remove private home directory:", err)
@@ -127,51 +136,65 @@ func guardedRun(run func() int) int {
 }
 
 // testRealHomesEnv lists the homes of the user running the tests, as the
-// first test process found them.
+// first test process found them. Set but empty, it turns the guard off.
 const testRealHomesEnv = "TT_TEST_REAL_HOMES"
 
 // realHomeGuard returns an error naming the first path this process would
 // read under a real home: the home itself, or a setting, state or runtime
-// directory that the environment points into one.
+// directory anywhere below one. A path under the temporary directory, or
+// under a home that is not the user's, is this run's own even when that
+// directory lies below the user's home.
 func realHomeGuard() error {
+	real := filepath.SplitList(os.Getenv(testRealHomesEnv))
 	home, _ := os.UserHomeDir()
-	paths := []struct{ what, path string }{
-		{"the user home", home},
+	const rule = "a test and every process it starts must use a temporary home (see runWithOwnHome)"
+	own := []string{os.TempDir()}
+	for _, dir := range real {
+		if home != "" && pathWithinAny(dir, []string{home}) && pathWithinAny(home, []string{dir}) {
+			return fmt.Errorf("real-home guard: the home of this hub/cmd/tt test process is the real user home %s; %s", home, rule)
+		}
+	}
+	if home != "" {
+		own = append(own, home)
+	}
+	for _, p := range []struct{ what, path string }{
 		{"the redaction setting", toolRedactSettingPath()},
 		{"the relay state", relayDir()},
 		{"the handoff config", handoffConfigPath()},
 		{"the handoff directory", handoffRoot()},
 		{"the tool ledger", toolLedgerRoot()},
 		{"the Codex home", codexHome()},
-	}
-	for _, real := range filepath.SplitList(os.Getenv(testRealHomesEnv)) {
-		if real == "" {
-			continue
-		}
-		owned := []string{filepath.Join(real, ".config"), filepath.Join(real, ".local"), filepath.Join(real, ".codex"), filepath.Join(real, ".claude")}
-		for i, p := range paths {
-			if p.path == "" {
-				continue
-			}
-			path := filepath.Clean(p.path)
-			if resolved, err := filepath.EvalSymlinks(path); err == nil {
-				path = resolved
-			}
-			breach := i == 0 && path == filepath.Clean(real)
-			for _, dir := range owned {
-				if rel, err := filepath.Rel(dir, path); i > 0 && err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-					breach = true
-				}
-			}
-			if breach && i == 0 {
-				return fmt.Errorf("real-home guard: the home of this hub/cmd/tt test process is the real user home %s; a test and every process it starts must use a temporary home (see runWithOwnHome)", p.path)
-			}
-			if breach {
-				return fmt.Errorf("real-home guard: this hub/cmd/tt test process resolves %s to %s, inside the real user home %s; a test and every process it starts must use a temporary home (see runWithOwnHome)", p.what, p.path, real)
-			}
+	} {
+		if p.path != "" && !pathWithinAny(p.path, own) && pathWithinAny(p.path, real) {
+			return fmt.Errorf("real-home guard: this hub/cmd/tt test process resolves %s to %s, inside the real user home; %s", p.what, p.path, rule)
 		}
 	}
 	return nil
+}
+
+// pathWithinAny reports whether path is one of dirs or below one, comparing
+// the paths as written and with their symbolic links resolved.
+func pathWithinAny(path string, dirs []string) bool {
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if resolved, err := filepath.EvalSymlinks(p); err == nil && resolved != out[0] {
+			out = append(out, resolved)
+		}
+		return out
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		for _, d := range forms(dir) {
+			for _, p := range forms(path) {
+				if rel, err := filepath.Rel(d, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // runWithOwnTmuxDir runs the package's tests with TMUX_TMPDIR pointing at a
