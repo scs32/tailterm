@@ -552,23 +552,114 @@ func backfillUsageItemShares(db *sql.DB) error {
 	}
 }
 
+// sumUsageItemShares adds the grouped share rows of one item to an exact
+// total and reports its state: "partial" if any counted row is partial,
+// "measured" if any row counted, else "not measured".
+func sumUsageItemShares(rows *sql.Rows, total *big.Rat, state string) (string, error) {
+	defer rows.Close()
+	for rows.Next() {
+		var denominator, tokens int64
+		var partial int
+		if err := rows.Scan(&denominator, &tokens, &partial); err != nil {
+			return state, err
+		}
+		if denominator < 1 {
+			continue
+		}
+		total.Add(total, big.NewRat(tokens, denominator))
+		if state == "not measured" {
+			state = "measured"
+		}
+		if partial != 0 {
+			state = "partial"
+		}
+	}
+	return state, rows.Err()
+}
+
+// loadEntryTokenActual reads what the team of an item's running queue entry
+// has spent on the item: the entry id (empty when no entry is running), the
+// exact total and its state. This is the figure the token warning compares
+// with the estimate, and the one the phase 3 pause must compare too.
+//
+// The team is the runs bound to the item whose agent has no project role (a
+// database handler, backlog steward or owner helper never counts, bound or
+// not) and whose binding is not older than the entry. A binding carries its
+// agent's creation time, so an earlier entry's agents stay excluded and a
+// replacement or extra agent of this entry is included. No bound on the turn
+// time is needed: such a run did not exist before the entry did.
+func loadEntryTokenActual(ctx context.Context, q queryRower, task, item string) (string, *big.Rat, string, error) {
+	actual, state := new(big.Rat), "not measured"
+	var entry, created string
+	err := q.QueryRowContext(ctx, `SELECT id,created_at FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task, item).Scan(&entry, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", actual, state, nil
+	}
+	if err != nil {
+		return "", nil, "", err
+	}
+	admitted := parseTS(created)
+	if admitted.IsZero() {
+		return entry, actual, state, nil // no readable admission: count nothing
+	}
+	rows, err := q.QueryContext(ctx, `SELECT b.agent_id,b.run_id,b.created_at FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id
+ WHERE b.item_task_id=? AND b.item_id=? AND a.role='' ORDER BY b.agent_id,b.run_id`, task, item)
+	if err != nil {
+		return "", nil, "", err
+	}
+	type run struct{ agent, id string }
+	runs := []run{}
+	for rows.Next() {
+		var r run
+		var bound string
+		if err = rows.Scan(&r.agent, &r.id, &bound); err != nil {
+			rows.Close()
+			return "", nil, "", err
+		}
+		// Instants are compared as times: the stored text drops trailing
+		// zeros and does not sort.
+		if at := parseTS(bound); !at.IsZero() && !at.Before(admitted) {
+			runs = append(runs, r)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return "", nil, "", err
+	}
+	for _, r := range runs {
+		// Like the lifetime figure, only the project's own turns count.
+		shares, err := q.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE task_id=? AND agent_id=? AND run_id=? AND item_task_id=? AND item_id=? GROUP BY denominator`, task, r.agent, r.id, task, item)
+		if err != nil {
+			return "", nil, "", err
+		}
+		if state, err = sumUsageItemShares(shares, actual, state); err != nil {
+			return "", nil, "", err
+		}
+	}
+	return entry, actual, state, nil
+}
+
 // loadTokenBudget reads an item's saved estimate and its lifetime attributed
-// tokens over every run, open and closed. It reads usage_item_shares by item,
-// so its cost does not grow with the project's usage history.
+// tokens over every run, open and closed, and, while the item has a running
+// queue entry, what that entry's team has spent on it. It reads
+// usage_item_shares by item, so its cost does not grow with the project's
+// usage history.
 func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, error) {
-	budget, _, err := loadTokenBudgetActual(ctx, q, task, item)
+	budget, _, _, err := loadTokenBudgetActual(ctx, q, task, item)
 	return budget, err
 }
 
-// loadTokenBudgetActual also returns the exact actual the budget prints.
-func loadTokenBudgetActual(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, *big.Rat, error) {
+// loadTokenBudgetActual also returns the exact lifetime actual the budget
+// prints and the exact actual of the running entry's team.
+func loadTokenBudgetActual(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, *big.Rat, *big.Rat, error) {
 	budget := &api.TokenBudget{ActualTokens: "0", ActualState: "not measured"}
 	var estimate api.WorkItemEstimate
 	var setAt string
 	err := q.QueryRowContext(ctx, `SELECT estimate_tokens,estimate_basis,estimate_set_at,estimate_agent,estimate_node,estimate_user FROM work_items WHERE task_id=? AND id=?`, task, item).
 		Scan(&estimate.Tokens, &estimate.Basis, &setAt, &estimate.SetBy.AgentID, &estimate.SetBy.Node, &estimate.SetBy.User)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err == nil && estimate.Tokens > 0 {
 		estimate.SetAt = parseTS(setAt)
@@ -577,35 +668,27 @@ func loadTokenBudgetActual(ctx context.Context, q queryRower, task, item string)
 	// Like the report, only the project's own turns count toward its items.
 	rows, err := q.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE item_task_id=? AND item_id=? AND task_id=? GROUP BY denominator`, task, item, task)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	defer rows.Close()
 	actual := new(big.Rat)
-	for rows.Next() {
-		var denominator, tokens int64
-		var partial int
-		if err = rows.Scan(&denominator, &tokens, &partial); err != nil {
-			return nil, nil, err
-		}
-		if denominator < 1 {
-			continue
-		}
-		actual.Add(actual, big.NewRat(tokens, denominator))
-		if budget.ActualState == "not measured" {
-			budget.ActualState = "measured"
-		}
-		if partial != 0 {
-			budget.ActualState = "partial"
-		}
-	}
-	if err = rows.Err(); err != nil {
-		return nil, nil, err
+	if budget.ActualState, err = sumUsageItemShares(rows, actual, budget.ActualState); err != nil {
+		return nil, nil, nil, err
 	}
 	budget.ActualTokens = actual.RatString()
 	if budget.Estimate != nil && budget.ActualState != "not measured" {
 		budget.Ratio = new(big.Rat).Quo(actual, big.NewRat(budget.Estimate.Tokens, 1)).RatString()
 	}
-	return budget, actual, nil
+	entry, team, state, err := loadEntryTokenActual(ctx, q, task, item)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if entry != "" {
+		budget.Team = &api.TeamTokenBudget{EntryID: entry, ActualTokens: team.RatString(), ActualState: state}
+		if budget.Estimate != nil && state != "not measured" {
+			budget.Team.Ratio = new(big.Rat).Quo(team, big.NewRat(budget.Estimate.Tokens, 1)).RatString()
+		}
+	}
+	return budget, actual, team, nil
 }
 
 // usageWarningSubject is the constant subject of a token estimate warning.
@@ -664,24 +747,39 @@ func readUsageWarnings(ctx context.Context, q queryRower, task string) (api.Usag
 	if out.Threshold, _, out.Default, err = usageWarningThreshold(ctx, q, task); err != nil {
 		return out, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at FROM usage_budget_warnings WHERE task_id=? ORDER BY created_at,rowid`, task)
-	if err != nil {
-		return out, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var w api.UsageWarning
-		var at string
-		if err = rows.Scan(&w.ItemID, &w.EstimateTokens, &w.Threshold, &w.ActualTokens, &w.ActualState, &w.LeadAgent, &w.LeadMessageSeq, &w.HelperAgent, &w.HelperMessageSeq, &at); err != nil {
+	// usage_budget_warnings holds the warnings recorded while the lifetime
+	// figure was compared; it is read and never written. Its rows have no
+	// entry and no separate lifetime figure.
+	for _, query := range []string{
+		`SELECT item_id,'',estimate_tokens,threshold,actual_tokens,actual_state,'','',lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at FROM usage_budget_warnings WHERE task_id=? ORDER BY created_at,rowid`,
+		`SELECT item_id,entry_id,estimate_tokens,threshold,team_tokens,team_state,lifetime_tokens,lifetime_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at FROM usage_entry_warnings WHERE task_id=? ORDER BY created_at,rowid`,
+	} {
+		if err = func() error {
+			rows, err := q.QueryContext(ctx, query, task)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var w api.UsageWarning
+				var at string
+				if err = rows.Scan(&w.ItemID, &w.EntryID, &w.EstimateTokens, &w.Threshold, &w.ActualTokens, &w.ActualState, &w.LifetimeTokens, &w.LifetimeState, &w.LeadAgent, &w.LeadMessageSeq, &w.HelperAgent, &w.HelperMessageSeq, &at); err != nil {
+					return err
+				}
+				if actual, ok := new(big.Rat).SetString(w.ActualTokens); ok && w.EstimateTokens > 0 {
+					w.Ratio = actual.Quo(actual, big.NewRat(w.EstimateTokens, 1)).RatString()
+				}
+				w.At = parseTS(at)
+				out.Warnings = append(out.Warnings, w)
+			}
+			return rows.Err()
+		}(); err != nil {
 			return out, err
 		}
-		if actual, ok := new(big.Rat).SetString(w.ActualTokens); ok && w.EstimateTokens > 0 {
-			w.Ratio = actual.Quo(actual, big.NewRat(w.EstimateTokens, 1)).RatString()
-		}
-		w.At = parseTS(at)
-		out.Warnings = append(out.Warnings, w)
 	}
-	return out, rows.Err()
+	// One list, oldest first; the instants are compared as times.
+	sort.SliceStable(out.Warnings, func(i, j int) bool { return out.Warnings[i].At.Before(out.Warnings[j].At) })
+	return out, nil
 }
 
 // UsageWarnings reads the project's warning threshold and the warnings posted.
@@ -738,9 +836,12 @@ func (s *Store) SetUsageWarning(ctx context.Context, task string, req api.UsageW
 // warnTokenBudgets posts the token estimate warning for each of the items a
 // usage upload just changed that has passed the project's warning level times
 // its saved estimate: one directed notice to the item's running lead and one
-// to the owner helper, once per item per estimate value. Nothing is paused or
-// held. It runs inside the upload's transaction and never fails the upload
-// over a warning: each item's work sits in a savepoint that is rolled back
+// to the owner helper, once per item, queue entry and estimate value. The
+// figure compared is what the team of the item's running queue entry has
+// spent on it (loadEntryTokenActual), never the item's lifetime figure, so an
+// item without a running entry never warns. Nothing is paused or held. It
+// runs inside the upload's transaction and never fails the upload over a
+// warning: each item's work sits in a savepoint that is rolled back
 // whole on any error, so the next new or revised turn tries again. Only a
 // cancelled context or a failing savepoint statement is returned. It reports
 // whether it posted a notice, so the caller can notify event waiters once the
@@ -799,25 +900,25 @@ func (s *Store) warnTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string,
 // warnTokenBudget is one item's warning; its caller holds the savepoint. It
 // reports whether it posted and recorded one.
 func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, item string) (bool, error) {
-	budget, actual, err := loadTokenBudgetActual(ctx, tx, task.ID, item)
+	budget, lifetime, actual, err := loadTokenBudgetActual(ctx, tx, task.ID, item)
 	if err != nil {
 		return false, err
 	}
-	if budget.Estimate == nil || budget.ActualState == "not measured" {
+	if budget.Estimate == nil || budget.Team == nil || budget.Team.ActualState == "not measured" {
 		return false, nil
 	}
-	estimate := budget.Estimate.Tokens
+	estimate, entry, team := budget.Estimate.Tokens, budget.Team.EntryID, budget.Team
 	threshold, level, _, err := usageWarningThreshold(ctx, tx, task.ID)
 	if err != nil {
 		return false, err
 	}
-	// Exact, and strictly greater: an item at the level has not passed it. A
+	// Exact, and strictly greater: a team at the level has not passed it. A
 	// partial actual is a lower bound, so passing the level is still real.
 	if actual.Cmp(level.Mul(level, big.NewRat(estimate, 1))) <= 0 {
 		return false, nil
 	}
 	var warned int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM usage_budget_warnings WHERE task_id=? AND item_id=? AND estimate_tokens=?`, task.ID, item, estimate).Scan(&warned)
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM usage_entry_warnings WHERE task_id=? AND item_id=? AND entry_id=? AND estimate_tokens=?`, task.ID, item, entry, estimate).Scan(&warned)
 	if err == nil {
 		return false, nil
 	}
@@ -843,42 +944,36 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 	if lead.ID == "" && helper.ID == "" {
 		return false, nil // no row: the next new or revised turn looks again
 	}
-	var title, entry string
+	var title string
 	if err = tx.QueryRowContext(ctx, `SELECT title FROM work_items WHERE task_id=? AND id=?`, task.ID, item).Scan(&title); err != nil {
 		return false, err
 	}
-	err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task.ID, item).Scan(&entry)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, err
+	// actualTokens, actualState and ratio are the compared team figure.
+	refs := map[string]string{"item": item, "entry": entry, "estimateTokens": strconv.FormatInt(estimate, 10), "actualTokens": team.ActualTokens, "actualState": team.ActualState, "ratio": team.Ratio,
+		"lifetimeTokens": budget.ActualTokens, "lifetimeState": budget.ActualState, "threshold": threshold}
+	bound := func(state string) string {
+		if state == "partial" {
+			return "at least "
+		}
+		return ""
 	}
-	refs := map[string]string{"item": item, "estimateTokens": strconv.FormatInt(estimate, 10), "actualTokens": budget.ActualTokens, "actualState": budget.ActualState, "ratio": budget.Ratio, "threshold": threshold}
-	bound, team := "", "No team is running it."
-	if budget.ActualState == "partial" {
-		bound = "at least "
-	}
+	running := "Queue entry " + entry + " is running without a running lead."
 	if lead.ID != "" {
 		refs["lead"] = lead.Name
-		team = "Running team: lead " + lead.Name
-		if entry != "" {
-			team += ", queue entry " + entry
-		}
-		team += "."
-	} else if entry != "" {
-		team = "Queue entry " + entry + " is running without a running lead."
-	}
-	if entry != "" {
-		refs["entry"] = entry
+		running = "Running team: lead " + lead.Name + "."
 	}
 	ratio := new(big.Rat).Quo(actual, big.NewRat(estimate, 1))
-	text := fmt.Sprintf("Item %s (%s) has used %s%s tokens against an estimate of %d: %s times, past the warning level of %s. %s Nothing is paused or held. No reply is needed.",
-		item, stallNoticeDetail(title), bound, actual.FloatString(0), estimate, ratio.FloatString(2), threshold, team)
+	text := fmt.Sprintf("Item %s (%s): the team of queue entry %s has used %s%s tokens on it against an estimate of %d: %s times, past the warning level of %s. The item's lifetime total is %s%s tokens, which includes work before this entry. %s Nothing is paused or held. No reply is needed.",
+		item, stallNoticeDetail(title), entry, bound(team.ActualState), actual.FloatString(0), estimate, ratio.FloatString(2), threshold, bound(budget.ActualState), lifetime.FloatString(0), running)
 	by := api.Caller{Node: "system", User: "usage-warning"}
 	post := func(to api.Agent) (int64, error) {
 		copied := make(map[string]string, len(refs))
 		for k, v := range refs {
 			copied[k] = v
 		}
-		req := api.PostMessageRequest{To: to.ID, RequestID: fmt.Sprintf("usage-warning-%s-%d-%s", item, estimate, to.ID), Envelope: &api.Envelope{
+		// The entry is part of the request id: without it a later entry's
+		// notice would replay an earlier entry's post receipt and post nothing.
+		req := api.PostMessageRequest{To: to.ID, RequestID: fmt.Sprintf("usage-warning-%s-%s-%d-%s", item, entry, estimate, to.ID), Envelope: &api.Envelope{
 			Kind: api.EnvelopeKindNotice, To: to.Name, Subject: usageWarningSubject, Refs: copied, Body: api.EnvelopeBody{Text: text}}}
 		if err := api.NormalizeEnvelopePost(&req); err != nil {
 			return 0, err
@@ -910,7 +1005,7 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 			return false, err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO usage_budget_warnings(task_id,item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		task.ID, item, estimate, threshold, budget.ActualTokens, budget.ActualState, lead.ID, leadSeq, helper.ID, helperSeq, ts(s.now()))
+	_, err = tx.ExecContext(ctx, `INSERT INTO usage_entry_warnings(task_id,item_id,entry_id,estimate_tokens,threshold,team_tokens,team_state,lifetime_tokens,lifetime_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, item, entry, estimate, threshold, team.ActualTokens, team.ActualState, budget.ActualTokens, budget.ActualState, lead.ID, leadSeq, helper.ID, helperSeq, ts(s.now()))
 	return err == nil, err
 }

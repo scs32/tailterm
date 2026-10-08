@@ -42,6 +42,13 @@ func migrateUsage(db *sql.DB) error {
  lead_message_seq INTEGER NOT NULL DEFAULT 0,helper_agent TEXT NOT NULL DEFAULT '',
  helper_message_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
  PRIMARY KEY(task_id,item_id,estimate_tokens));
+ CREATE TABLE IF NOT EXISTS usage_entry_warnings(
+ task_id TEXT NOT NULL,item_id TEXT NOT NULL,entry_id TEXT NOT NULL,estimate_tokens INTEGER NOT NULL,
+ threshold TEXT NOT NULL,team_tokens TEXT NOT NULL,team_state TEXT NOT NULL,
+ lifetime_tokens TEXT NOT NULL,lifetime_state TEXT NOT NULL,
+ lead_agent TEXT NOT NULL DEFAULT '',lead_message_seq INTEGER NOT NULL DEFAULT 0,
+ helper_agent TEXT NOT NULL DEFAULT '',helper_message_seq INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
+ PRIMARY KEY(task_id,item_id,entry_id,estimate_tokens));
  CREATE TABLE IF NOT EXISTS usage_warning_settings(
  task_id TEXT PRIMARY KEY,threshold TEXT NOT NULL,updated_at TEXT NOT NULL,
  by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '');

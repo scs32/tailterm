@@ -262,15 +262,22 @@ type UsageWarningRequest struct {
 	AgentID   string `json:"agentId,omitempty"`
 }
 
-// UsageWarning records the one warning an item got for one estimate value.
-// Quantities are exact rational strings, as in TokenBudget. A message number
-// is zero when that recipient was absent.
+// UsageWarning records the one warning an item got for one queue entry and
+// one estimate value. Quantities are exact rational strings, as in
+// TokenBudget. ActualTokens, ActualState and Ratio are the compared figure:
+// with an EntryID, what that entry's team spent on the item, beside the
+// item's lifetime figure at that moment; without one, a warning recorded
+// before entries were compared, whose compared figure was the lifetime one. A
+// message number is zero when that recipient was absent.
 type UsageWarning struct {
 	ItemID           string    `json:"itemId"`
+	EntryID          string    `json:"entryId,omitempty"`
 	EstimateTokens   int64     `json:"estimateTokens"`
 	ActualTokens     string    `json:"actualTokens"`
 	ActualState      string    `json:"actualState"`
 	Ratio            string    `json:"ratio"`
+	LifetimeTokens   string    `json:"lifetimeTokens,omitempty"`
+	LifetimeState    string    `json:"lifetimeState,omitempty"`
 	Threshold        string    `json:"threshold"`
 	LeadAgent        string    `json:"leadAgent,omitempty"`
 	LeadMessageSeq   int64     `json:"leadMessageSeq,omitempty"`

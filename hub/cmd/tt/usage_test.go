@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
@@ -201,11 +203,189 @@ func TestUsageWarningCLI(t *testing.T) {
 	at := time.Date(2026, 10, 8, 4, 0, 0, 0, time.UTC)
 	got := formatUsageWarnings(api.UsageWarnings{Threshold: "1.5", Default: true, Warnings: []api.UsageWarning{
 		{ItemID: "wi_1111111111111111", EstimateTokens: 12000000, ActualTokens: "18360000", ActualState: "measured", Ratio: "153/100", Threshold: "1.5", LeadMessageSeq: 12, HelperMessageSeq: 13, At: at},
-		{ItemID: "wi_2222222222222222", EstimateTokens: 1000, ActualTokens: "3001/2", ActualState: "partial", Ratio: "3001/2000", Threshold: "1.5", HelperMessageSeq: 14, At: at}}})
+		{ItemID: "wi_2222222222222222", EstimateTokens: 1000, ActualTokens: "3001/2", ActualState: "partial", Ratio: "3001/2000", Threshold: "1.5", HelperMessageSeq: 14, At: at},
+		// A warning with a queue entry compared that entry's team figure.
+		{ItemID: "wi_1111111111111111", EntryID: "tqe_3333333333333333", EstimateTokens: 12000000, ActualTokens: "18360000", ActualState: "measured", Ratio: "153/100", LifetimeTokens: "41200000", LifetimeState: "measured", Threshold: "1.5", LeadMessageSeq: 15, HelperMessageSeq: 16, At: at},
+		{ItemID: "wi_2222222222222222", EntryID: "tqe_4444444444444444", EstimateTokens: 1000, ActualTokens: "3001/2", ActualState: "partial", Ratio: "3001/2000", LifetimeTokens: "9001/2", LifetimeState: "partial", Threshold: "1.5", HelperMessageSeq: 17, At: at},
+		{ItemID: "wi_2222222222222222", EntryID: "tqe_5555555555555555", EstimateTokens: 2000, ActualTokens: "3001", ActualState: "measured", Ratio: "3001/2000", LifetimeTokens: "9001/2", LifetimeState: "partial", Threshold: "1.5", HelperMessageSeq: 18, At: at}}})
 	want := "Warning level: 1.5× estimate (default)\n" +
 		"  wi_1111111111111111: estimate 12.00M · lifetime actual 18.36M · 1.53× · level 1.5× · lead #12 · owner helper #13 · 2026-10-08T04:00:00Z\n" +
-		"  wi_2222222222222222: estimate 1.0k · lifetime actual at least 1.5k · at least 1.50× · level 1.5× · no lead · owner helper #14 · 2026-10-08T04:00:00Z\n"
+		"  wi_2222222222222222: estimate 1.0k · lifetime actual at least 1.5k · at least 1.50× · level 1.5× · no lead · owner helper #14 · 2026-10-08T04:00:00Z\n" +
+		"  wi_1111111111111111: entry tqe_3333333333333333 · estimate 12.00M · team actual 18.36M · 1.53× · lifetime 41.20M · level 1.5× · lead #15 · owner helper #16 · 2026-10-08T04:00:00Z\n" +
+		"  wi_2222222222222222: entry tqe_4444444444444444 · estimate 1.0k · team actual at least 1.5k · at least 1.50× · lifetime at least 4.5k · level 1.5× · no lead · owner helper #17 · 2026-10-08T04:00:00Z\n" +
+		"  wi_2222222222222222: entry tqe_5555555555555555 · estimate 2.0k · team actual 3.0k · 1.50× · lifetime at least 4.5k · level 1.5× · no lead · owner helper #18 · 2026-10-08T04:00:00Z\n"
 	if got != want {
 		t.Fatalf("text\n%s\nwant\n%s", got, want)
+	}
+}
+
+// The budget line shows the running entry's team figure after the unchanged
+// lifetime parts, and nothing more without a measured team.
+func TestUsageTeamBudgetText(t *testing.T) {
+	lifetime := api.TokenBudget{ActualTokens: "41200000", ActualState: "measured", Ratio: "103/30", Estimate: &api.WorkItemEstimate{Tokens: 12000000}}
+	const plain = "estimate 12.00M · lifetime actual 41.20M · 3.43×"
+	team := func(t *api.TeamTokenBudget) *api.TokenBudget {
+		b := lifetime
+		b.Team = t
+		return &b
+	}
+	for want, b := range map[string]*api.TokenBudget{
+		plain:                                team(nil),
+		plain + " ":                          team(&api.TeamTokenBudget{EntryID: "tqe_3333333333333333", ActualTokens: "0", ActualState: "not measured"}),
+		plain + " · this team 3.10M · 0.26×": team(&api.TeamTokenBudget{EntryID: "tqe_3333333333333333", ActualTokens: "3100000", ActualState: "measured", Ratio: "31/120"}),
+		plain + " · this team at least 3.10M · at least 0.26×":  team(&api.TeamTokenBudget{EntryID: "tqe_3333333333333333", ActualTokens: "3100000", ActualState: "partial", Ratio: "31/120"}),
+		"no estimate · lifetime actual 4.20M · this team 1.20M": {ActualTokens: "4200000", ActualState: "measured", Team: &api.TeamTokenBudget{EntryID: "tqe_3333333333333333", ActualTokens: "1200000", ActualState: "measured"}},
+	} {
+		if got := formatTokenBudget(b); got != strings.TrimSuffix(want, " ") {
+			t.Fatalf("budget text %q, want %q", got, strings.TrimSuffix(want, " "))
+		}
+	}
+}
+
+// tt usage warning get and tt usage --item against a real hub: a warning
+// recorded for a queue entry names the entry and labels the team and lifetime
+// figures apart, beside a warning recorded before entries were compared
+// (wi_12d5c1ef9a73ceae).
+func TestUsageEntryWarningCLI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	srv := httptest.NewServer(server.New(st, func(r *http.Request) (api.Caller, error) { return by, nil }))
+	t.Cleanup(srv.Close)
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Entry warning CLI synthetic", Swarm: true}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Synthetic item", RequestID: "create-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, basis := int64(1000000), "synthetic"
+	if _, _, err = st.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, RequestID: "estimate", EstimateTokens: &tokens, EstimateBasis: &basis}, by); err != nil {
+		t.Fatal(err)
+	}
+	// agent registers an agent and returns it with an order for the item.
+	agent := func(name, role string) (api.Agent, api.Message) {
+		t.Helper()
+		a, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Runtime: "codex", Role: role, Host: "fixture", Session: name}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, RequestID: "order-" + name, WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Handle synthetic evidence", Body: api.EnvelopeBody{Ask: "Record synthetic data"}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a, m
+	}
+	uploads := 0
+	use := func(a api.Agent, order api.Message, tokens int64) {
+		t.Helper()
+		uploads++
+		at := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+		turn := api.UsageTurn{ID: fmt.Sprintf("turn-%d", uploads), Revision: 1, Runtime: "codex", Session: "synthetic-session", Model: "synthetic-model", At: at, SourceDigest: strings.Repeat("a", 64), Activation: "activation-one", Complete: true,
+			Tokens:  map[string]int64{"input": tokens, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0},
+			Raw:     map[string]int64{"input_tokens": tokens, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0},
+			Handled: []api.UsageEvidence{{TaskID: task.ID, Seq: order.Seq, Operation: "ack", At: at}}}
+		batch := api.UsageBatch{Version: 1, RequestID: fmt.Sprintf("batch-%d", uploads), RunID: a.RunID, Session: "synthetic-session", StartedAt: at.Add(-time.Hour), Coverage: "synthetic complete", Turns: []api.UsageTurn{turn}}
+		if receipt, err := st.ReportUsage(ctx, task.ID, a.ID, batch); err != nil || receipt.Turns != 1 {
+			t.Fatalf("usage upload %+v %v", receipt, err)
+		}
+	}
+	handler, handlerOrder := agent("handler", api.AgentRoleDatabaseHandler)
+	member, memberOrder := agent("member", "")
+	lead, _ := agent("lead", "")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(query, args...); err != nil {
+			t.Fatal(query, err)
+		}
+	}
+	admitted := time.Now().UTC().Truncate(time.Second)
+	stamp := func(at time.Time) string { return at.Format(time.RFC3339Nano) }
+	entry := api.NewID("tqe")
+	exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,created_at,updated_at,repository,base_commit) VALUES(?,?,?,1,1,'planned',1,'running',1,?,?,'fixture',?)`,
+		entry, task.ID, item.ID, stamp(admitted), stamp(admitted), strings.Repeat("c", 40))
+	for _, a := range []api.Agent{member, lead} {
+		exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,team_role,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'member',?,'{}',?)`,
+			a.ID, a.RunID, task.ID, item.ID, task.ID, memberOrder.Seq, strings.Repeat("d", 64), stamp(admitted.Add(500*time.Millisecond)))
+	}
+	exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, task.ID, item.ID, lead.ID, lead.RunID)
+	// A warning recorded while the lifetime figure was the one compared.
+	exec(`INSERT INTO usage_budget_warnings(task_id,item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,500000,'1.5','900000','measured','',0,'',0,?)`,
+		task.ID, item.ID, stamp(admitted.Add(-time.Hour)))
+
+	e := env{hub: srv.URL, task: task.ID}
+	run := func(args ...string) string {
+		t.Helper()
+		text, err := captureStdout(t, func() error { return cmdUsage(e, args) })
+		if err != nil {
+			t.Fatal(args, err)
+		}
+		return text
+	}
+	old := "  " + item.ID + ": estimate 500.0k · lifetime actual 900.0k · 1.80× · level 1.5× · no lead · no owner helper · " + admitted.Add(-time.Hour).Format(time.RFC3339) + "\n"
+	use(handler, handlerOrder, 10000000)
+	use(member, memberOrder, 1500000)
+	if text := run("warning", "get"); text != "Warning level: 1.5× estimate (default)\n"+old {
+		t.Fatalf("a team at the level, with 10M earlier tokens on the item:\n%s", text)
+	}
+	if text := run("--item", item.ID); !strings.Contains(text, "  budget: estimate 1.00M · lifetime actual 11.50M · 11.50× · this team 1.50M · 1.50×\n") {
+		t.Fatalf("budget line with a running entry:\n%s", text)
+	}
+	use(member, memberOrder, 1)
+	text := run("warning", "get")
+	row := regexp.MustCompile(`^  ` + item.ID + `: entry ` + entry + ` · estimate 1\.00M · team actual 1\.50M · 1\.50× · lifetime 11\.50M · level 1\.5× · lead #\d+ · no owner helper · \S+\n$`)
+	if rest, ok := strings.CutPrefix(text, "Warning level: 1.5× estimate (default)\n"+old); !ok || !row.MatchString(rest) {
+		t.Fatalf("warning list:\n%s", text)
+	}
+	var list struct {
+		Warnings []map[string]any `json:"warnings"`
+	}
+	if err = json.Unmarshal([]byte(run("warning", "get", "--json")), &list); err != nil || len(list.Warnings) != 2 {
+		t.Fatalf("warning JSON %+v %v", list, err)
+	}
+	was, now := list.Warnings[0], list.Warnings[1]
+	for _, key := range []string{"entryId", "lifetimeTokens", "lifetimeState"} {
+		if _, ok := was[key]; ok {
+			t.Fatalf("the earlier warning has %s: %v", key, was)
+		}
+	}
+	if was["actualTokens"] != "900000" || now["entryId"] != entry || now["actualTokens"] != "1500001" || now["actualState"] != "measured" || now["lifetimeTokens"] != "11500001" || now["lifetimeState"] != "measured" || now["ratio"] != "1500001/1000000" {
+		t.Fatalf("warning JSON %v\n%v", was, now)
+	}
+	var report struct {
+		Items []struct {
+			Budget map[string]any `json:"budget"`
+		} `json:"items"`
+	}
+	if err = json.Unmarshal([]byte(run("--item", item.ID, "--json")), &report); err != nil || len(report.Items) != 1 {
+		t.Fatalf("usage JSON %+v %v", report, err)
+	}
+	budget := report.Items[0].Budget
+	if team, _ := budget["team"].(map[string]any); budget["actualTokens"] != "11500001" || team["entryId"] != entry || team["actualTokens"] != "1500001" || team["actualState"] != "measured" || team["ratio"] != "1500001/1000000" {
+		t.Fatalf("budget JSON %v", budget)
+	}
+	// Without a running entry the line is the lifetime one alone.
+	exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, stamp(admitted.Add(time.Second)), entry)
+	if text = run("--item", item.ID); !strings.Contains(text, "  budget: estimate 1.00M · lifetime actual 11.50M · 11.50×\n") || strings.Contains(text, "this team") {
+		t.Fatalf("budget line without a running entry:\n%s", text)
+	}
+	report.Items = nil // a fresh decode: an existing map would keep its keys
+	if err = json.Unmarshal([]byte(run("--item", item.ID, "--json")), &report); err != nil || len(report.Items) != 1 {
+		t.Fatalf("usage JSON %+v %v", report, err)
+	}
+	if _, ok := report.Items[0].Budget["team"]; ok || report.Items[0].Budget["actualTokens"] != "11500001" {
+		t.Fatalf("budget JSON without a running entry %v", report.Items[0].Budget)
 	}
 }

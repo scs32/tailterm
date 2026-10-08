@@ -63,12 +63,24 @@ type WorkItemEstimate struct {
 // closed, and "0" when not measured. ActualState is "measured", "partial" or
 // "not measured", the state the unfiltered usage report gives the item; a
 // partial actual and its ratio are lower bounds. Ratio is actual/estimate,
-// absent without an estimate or when not measured.
+// absent without an estimate or when not measured. Team is present only while
+// the item has a running queue entry.
 type TokenBudget struct {
 	Estimate     *WorkItemEstimate `json:"estimate,omitempty"`
 	ActualTokens string            `json:"actualTokens"`
 	ActualState  string            `json:"actualState"`
 	Ratio        string            `json:"ratio,omitempty"`
+	Team         *TeamTokenBudget  `json:"team,omitempty"`
+}
+
+// TeamTokenBudget is what the team of an item's running queue entry has spent
+// on the item: the figure the token warning compares with the estimate. Its
+// fields read as TokenBudget's do, over that team's runs only.
+type TeamTokenBudget struct {
+	EntryID      string `json:"entryId"`
+	ActualTokens string `json:"actualTokens"`
+	ActualState  string `json:"actualState"`
+	Ratio        string `json:"ratio,omitempty"`
 }
 
 type WorkItemDispatch struct {

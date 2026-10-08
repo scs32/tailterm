@@ -371,7 +371,9 @@ func cmdUsageWarning(e env, args []string) error {
 }
 
 // formatUsageWarnings is the text form of the warning level and the warnings
-// posted, one line each.
+// posted, one line each. A warning with a queue entry compared that entry's
+// team figure and shows the item's lifetime figure beside it; one without an
+// entry was recorded when the lifetime figure itself was compared.
 func formatUsageWarnings(out api.UsageWarnings) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Warning level: %s× estimate", out.Threshold)
@@ -387,9 +389,23 @@ func formatUsageWarnings(out api.UsageWarnings) string {
 		if w.ActualState == "partial" {
 			bound = "at least "
 		}
-		fmt.Fprintf(&b, "  %s: estimate %s · lifetime actual %s%s", w.ItemID, formatTokenCount(strconv.FormatInt(w.EstimateTokens, 10)), bound, formatTokenCount(w.ActualTokens))
+		estimate, compared := formatTokenCount(strconv.FormatInt(w.EstimateTokens, 10)), "lifetime actual"
+		if w.EntryID != "" {
+			compared = "team actual"
+			fmt.Fprintf(&b, "  %s: entry %s · estimate %s", w.ItemID, w.EntryID, estimate)
+		} else {
+			fmt.Fprintf(&b, "  %s: estimate %s", w.ItemID, estimate)
+		}
+		fmt.Fprintf(&b, " · %s %s%s", compared, bound, formatTokenCount(w.ActualTokens))
 		if ratio, ok := new(big.Rat).SetString(w.Ratio); ok {
 			fmt.Fprintf(&b, " · %s%s×", bound, ratio.FloatString(2))
+		}
+		if w.EntryID != "" {
+			b.WriteString(" · lifetime ")
+			if w.LifetimeState == "partial" {
+				b.WriteString("at least ")
+			}
+			b.WriteString(formatTokenCount(w.LifetimeTokens))
 		}
 		fmt.Fprintf(&b, " · level %s×", w.Threshold)
 		if w.LeadMessageSeq > 0 {
@@ -409,8 +425,10 @@ func formatUsageWarnings(out api.UsageWarnings) string {
 
 // formatTokenBudget renders an item's estimate against its lifetime actual:
 // "estimate 12.00M · lifetime actual 15.30M · 1.28×". A partial actual is a
-// lower bound, so it and its ratio say "at least". A nil budget (an older
-// hub) prints nothing.
+// lower bound, so it and its ratio say "at least". While the item has a
+// running queue entry whose team has measured tokens on it, the figure the
+// warning compares follows: " · this team 3.10M · 0.26×". A nil budget (an
+// older hub) prints nothing.
 func formatTokenBudget(b *api.TokenBudget) string {
 	if b == nil {
 		return ""
@@ -431,6 +449,16 @@ func formatTokenBudget(b *api.TokenBudget) string {
 	}
 	if ratio := formatBudgetRatio(b); ratio != "" {
 		parts = append(parts, bound+ratio)
+	}
+	if t := b.Team; t != nil && (t.ActualState == "measured" || t.ActualState == "partial") {
+		bound = ""
+		if t.ActualState == "partial" {
+			bound = "at least "
+		}
+		parts = append(parts, "this team "+bound+formatTokenCount(t.ActualTokens))
+		if ratio, ok := new(big.Rat).SetString(t.Ratio); ok {
+			parts = append(parts, bound+ratio.FloatString(2)+"×")
+		}
 	}
 	return strings.Join(parts, " · ")
 }

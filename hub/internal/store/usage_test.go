@@ -1008,35 +1008,49 @@ func TestUsageReportReadCostBounded(t *testing.T) {
 	t.Logf("3000 turns: %s, %d obligation queries", took, large)
 }
 
-// Token estimate warning (wi_3228104e700006c5, plan r2). When a new or revised
-// attributed turn first takes an item past the project's warning level times
-// its saved estimate, the hub posts one directed notice to the item's running
-// lead and one to the owner helper, once per item per estimate value.
+// Token estimate warning (wi_3228104e700006c5, plan r2; compared figure
+// wi_12d5c1ef9a73ceae). When a new or revised attributed turn first takes the
+// team of an item's running queue entry past the project's warning level
+// times the item's saved estimate, the hub posts one directed notice to the
+// item's running lead and one to the owner helper, once per item, queue entry
+// and estimate value.
 
 const usageWarningTestSubject = "An item has passed its token estimate warning level"
 
 type usageWarningFixture struct {
-	t        *testing.T
-	s        *Store
-	task     api.Task
-	metered  api.Agent
+	t    *testing.T
+	s    *Store
+	task api.Task
+	// metered uploads the turns of use and turn, acknowledging orders. It is
+	// the fixture's database handler until an entry runs, then that entry's
+	// team member.
+	metered api.Agent
+	orders  []api.Message
+	// handler is the fixture's database handler and source its orders, which
+	// the bindings name as their work order.
+	handler  api.Agent
+	source   []api.Message
 	items    []api.WorkItem
-	orders   []api.Message
 	lead     api.Agent
 	helper   api.Agent
 	entry    string
+	admitted time.Time
+	entries  int
+	agents   int
 	turns    int
 	batches  int
 	estimate int
 }
 
 // newUsageWarningFixture is the synthetic usage project, optionally with a
-// running lead and queue entry on item 0 and a registered owner helper.
+// running queue entry on item 0 that has a team member and a running lead,
+// and a registered owner helper.
 func newUsageWarningFixture(t *testing.T, withLead, withHelper bool) *usageWarningFixture {
 	t.Helper()
 	s, task, metered, items, orders := usageFixture(t)
-	f := &usageWarningFixture{t: t, s: s, task: task, metered: metered, items: items, orders: orders}
+	f := &usageWarningFixture{t: t, s: s, task: task, metered: metered, orders: orders, handler: metered, source: orders, items: items}
 	if withLead {
+		f.addEntry()
 		f.addLead()
 	}
 	if withHelper {
@@ -1044,22 +1058,112 @@ func newUsageWarningFixture(t *testing.T, withLead, withHelper bool) *usageWarni
 	}
 	return f
 }
-func (f *usageWarningFixture) addLead() {
+
+// register adds an agent with the given project role.
+func (f *usageWarningFixture) register(name, role string) api.Agent {
 	f.t.Helper()
+	a, _ := f.agent(name, role, false)
+	return a
+}
+
+// agent registers an agent with the given project role and, when ordered,
+// gives it an order for each item, so its turns can be attributed to them.
+func (f *usageWarningFixture) agent(name, role string, ordered bool) (api.Agent, []api.Message) {
+	f.t.Helper()
+	ctx := context.Background()
 	by := api.Caller{Node: "fixture", User: "owner"}
-	lead, err := f.s.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{Name: "lead-item", AgentID: api.NewID("agt"), Runtime: "codex", Host: "fixture", Session: "lead"}, by)
+	f.agents++
+	name = fmt.Sprintf("%s-%d", name, f.agents)
+	a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Runtime: "codex", Host: "fixture", Session: name}, by)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	f.lead, f.entry = lead, "tqe_"+strings.Repeat("a", 16)
-	now := ts(time.Now())
-	if _, err = f.s.db.Exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.items[0].ID, lead.ID, lead.RunID); err != nil {
+	if role != "" {
+		if _, err = f.s.db.Exec(`UPDATE agents SET role=? WHERE id=?`, role, a.ID); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	if !ordered {
+		return a, nil
+	}
+	return a, f.order(a)
+}
+
+// order gives an agent an order for each item.
+func (f *usageWarningFixture) order(a api.Agent) []api.Message {
+	f.t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	orders := []api.Message{}
+	for i, item := range f.items {
+		m, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: a.ID, RequestID: fmt.Sprintf("order-%s-%d", a.ID, i), WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Handle synthetic evidence", Body: api.EnvelopeBody{Ask: "Record synthetic data"}}}, by)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		orders = append(orders, m)
+	}
+	return orders
+}
+
+// bind records the agent's current run as bound to item 0 at an instant.
+func (f *usageWarningFixture) bind(a api.Agent, at time.Time, teamRole string) {
+	f.t.Helper()
+	if _, err := f.s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,team_role,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,?,?,'{}',?)`,
+		a.ID, a.RunID, f.task.ID, f.items[0].ID, f.task.ID, f.source[0].Seq, teamRole, strings.Repeat("d", 64), ts(at)); err != nil {
 		f.t.Fatal(err)
 	}
-	if _, err = f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,created_at,updated_at,repository,base_commit) VALUES(?,?,?,?,1,'planned',1,'running',1,?,?,'fixture',?)`,
-		f.entry, f.task.ID, f.items[0].ID, f.items[0].Revision, now, now, strings.Repeat("c", 40)); err != nil {
+}
+
+// addEntry gives item 0 a running queue entry and a team member bound to the
+// item, who becomes the metered agent. The first entry is admitted on a whole
+// second and a later one two and a half seconds after the one before; a team
+// is bound half a second after its entry. So entries and bindings share
+// seconds and differ only in fractions, where the stored text does not sort.
+func (f *usageWarningFixture) addEntry() {
+	f.t.Helper()
+	if f.entry == "" {
+		f.admitted = time.Now().UTC().Truncate(time.Second)
+	} else {
+		f.admitted = f.admitted.Add(2500 * time.Millisecond)
+	}
+	f.entry = api.NewID("tqe")
+	f.entries++
+	if _, err := f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,attempt,created_at,updated_at,repository,base_commit) VALUES(?,?,?,?,1,'planned',1,'running',1,?,?,?,'fixture',?)`,
+		f.entry, f.task.ID, f.items[0].ID, f.items[0].Revision, f.entries, ts(f.admitted), ts(f.admitted), strings.Repeat("c", 40)); err != nil {
 		f.t.Fatal(err)
 	}
+	f.metered, f.orders = f.agent("member", "", true)
+	f.bind(f.metered, f.admitted.Add(500*time.Millisecond), "member")
+}
+
+// addLead gives the running entry's team its running lead.
+func (f *usageWarningFixture) addLead() {
+	f.t.Helper()
+	f.lead = f.register("lead", "")
+	f.bind(f.lead, f.admitted.Add(500*time.Millisecond), "lead")
+	if _, err := f.s.db.Exec(`INSERT OR REPLACE INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.items[0].ID, f.lead.ID, f.lead.RunID); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// release ends the running entry and its lead, as a finished team does.
+func (f *usageWarningFixture) release() {
+	f.t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, ts(f.admitted.Add(time.Second)), f.entry); err != nil {
+		f.t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE item_team_leads SET state='closed' WHERE task_id=? AND item_id=?`, f.task.ID, f.items[0].ID); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// as runs work with another agent as the metered one.
+func (f *usageWarningFixture) as(a api.Agent, orders []api.Message, work func()) {
+	f.t.Helper()
+	metered, own := f.metered, f.orders
+	f.metered, f.orders = a, orders
+	work()
+	f.metered, f.orders = metered, own
 }
 func (f *usageWarningFixture) addHelper() {
 	f.t.Helper()
@@ -1149,9 +1253,19 @@ func (f *usageWarningFixture) want(why string, lead, helper, rows int) {
 	if got := len(f.notices(f.helper)); got != helper {
 		f.t.Fatalf("%s: owner helper has %d warning notices, want %d", why, got, helper)
 	}
-	if got := f.count(`SELECT count(*) FROM usage_budget_warnings WHERE task_id=?`, f.task.ID); got != rows {
+	if got := f.count(`SELECT count(*) FROM usage_entry_warnings WHERE task_id=?`, f.task.ID); got != rows {
 		f.t.Fatalf("%s: %d warning rows, want %d", why, got, rows)
 	}
+}
+
+// budget is item 0's budget as a work item read returns it.
+func (f *usageWarningFixture) budget() *api.TokenBudget {
+	f.t.Helper()
+	item, err := f.s.GetWorkItem(context.Background(), f.task.ID, f.items[0].ID)
+	if err != nil || item.Budget == nil {
+		f.t.Fatalf("budget %+v %v", item.Budget, err)
+	}
+	return item.Budget
 }
 
 func TestUsageWarningOnCrossing(t *testing.T) {
@@ -1165,11 +1279,11 @@ func TestUsageWarningOnCrossing(t *testing.T) {
 	item := f.items[0]
 	for _, m := range []api.Message{f.notices(f.lead)[0], f.notices(f.helper)[0]} {
 		e := m.Envelope
-		want := map[string]string{"item": item.ID, "estimateTokens": "1000", "actualTokens": "1501", "actualState": "measured", "ratio": "1501/1000", "threshold": "1.5", "entry": f.entry, "lead": f.lead.Name}
+		want := map[string]string{"item": item.ID, "estimateTokens": "1000", "actualTokens": "1501", "actualState": "measured", "ratio": "1501/1000", "lifetimeTokens": "1501", "lifetimeState": "measured", "threshold": "1.5", "entry": f.entry, "lead": f.lead.Name}
 		if !reflect.DeepEqual(e.Refs, want) {
 			t.Fatalf("refs %v, want %v", e.Refs, want)
 		}
-		text := "Item " + item.ID + " (Item 0) has used 1501 tokens against an estimate of 1000: 1.50 times, past the warning level of 1.5. Running team: lead " + f.lead.Name + ", queue entry " + f.entry + ". Nothing is paused or held. No reply is needed."
+		text := "Item " + item.ID + " (Item 0): the team of queue entry " + f.entry + " has used 1501 tokens on it against an estimate of 1000: 1.50 times, past the warning level of 1.5. The item's lifetime total is 1501 tokens, which includes work before this entry. Running team: lead " + f.lead.Name + ". Nothing is paused or held. No reply is needed."
 		if e.Body.Text != text {
 			t.Fatalf("text %q\nwant %q", e.Body.Text, text)
 		}
@@ -1178,12 +1292,12 @@ func TestUsageWarningOnCrossing(t *testing.T) {
 		}
 	}
 	var estimate, leadSeq, helperSeq int64
-	var threshold, actual, state, leadAgent, helperAgent string
-	if err := f.s.db.QueryRow(`SELECT estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq FROM usage_budget_warnings WHERE task_id=? AND item_id=?`, f.task.ID, item.ID).
-		Scan(&estimate, &threshold, &actual, &state, &leadAgent, &leadSeq, &helperAgent, &helperSeq); err != nil {
+	var entry, threshold, actual, state, lifetime, lifetimeState, leadAgent, helperAgent string
+	if err := f.s.db.QueryRow(`SELECT entry_id,estimate_tokens,threshold,team_tokens,team_state,lifetime_tokens,lifetime_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq FROM usage_entry_warnings WHERE task_id=? AND item_id=?`, f.task.ID, item.ID).
+		Scan(&entry, &estimate, &threshold, &actual, &state, &lifetime, &lifetimeState, &leadAgent, &leadSeq, &helperAgent, &helperSeq); err != nil {
 		t.Fatal(err)
 	}
-	if estimate != 1000 || threshold != "1.5" || actual != "1501" || state != "measured" || leadAgent != f.lead.ID || helperAgent != f.helper.ID || leadSeq != f.notices(f.lead)[0].Seq || helperSeq != f.notices(f.helper)[0].Seq {
+	if entry != f.entry || lifetime != "1501" || lifetimeState != "measured" || estimate != 1000 || threshold != "1.5" || actual != "1501" || state != "measured" || leadAgent != f.lead.ID || helperAgent != f.helper.ID || leadSeq != f.notices(f.lead)[0].Seq || helperSeq != f.notices(f.helper)[0].Seq {
 		t.Fatal("warning row", estimate, threshold, actual, state, leadAgent, leadSeq, helperAgent, helperSeq)
 	}
 }
@@ -1246,13 +1360,21 @@ func TestUsageWarningRaisedEstimateRearms(t *testing.T) {
 func TestUsageWarningWithoutTeam(t *testing.T) {
 	f := newUsageWarningFixture(t, false, true)
 	f.setEstimate(0, 1000)
+	// No entry is running, so there is no team figure to compare.
+	f.use(0, 5_000_000)
+	f.want("no running entry", 0, 0, 0)
+	if b := f.budget(); b.Team != nil || b.ActualTokens != "5000000" || b.Ratio != "5000" {
+		t.Fatalf("budget without a running entry %+v", b)
+	}
+	// A running entry without a running lead still warns the owner helper.
+	f.addEntry()
 	f.use(0, 1501)
 	f.want("no lead", 0, 1, 1)
 	e := f.notices(f.helper)[0].Envelope
-	if !strings.Contains(e.Body.Text, " No team is running it. Nothing is paused or held.") || e.Refs["lead"] != "" || e.Refs["entry"] != "" {
+	if !strings.Contains(e.Body.Text, " Queue entry "+f.entry+" is running without a running lead. Nothing is paused or held.") || e.Refs["lead"] != "" || e.Refs["entry"] != f.entry {
 		t.Fatalf("notice %q %v", e.Body.Text, e.Refs)
 	}
-	if got := f.count(`SELECT count(*) FROM usage_budget_warnings WHERE task_id=? AND lead_agent='' AND lead_message_seq=0 AND helper_agent=?`, f.task.ID, f.helper.ID); got != 1 {
+	if got := f.count(`SELECT count(*) FROM usage_entry_warnings WHERE task_id=? AND entry_id=? AND lead_agent='' AND lead_message_seq=0 AND helper_agent=?`, f.task.ID, f.entry, f.helper.ID); got != 1 {
 		t.Fatal("row does not record the missing lead")
 	}
 	if got := f.count(`SELECT count(*) FROM messages WHERE task_id=? AND envelope LIKE ?`, f.task.ID, "%"+usageWarningTestSubject+"%"); got != 1 {
@@ -1262,6 +1384,7 @@ func TestUsageWarningWithoutTeam(t *testing.T) {
 
 func TestUsageWarningWaitsForRecipient(t *testing.T) {
 	f := newUsageWarningFixture(t, false, false)
+	f.addEntry()
 	f.setEstimate(0, 1000)
 	warnings := func() int {
 		return f.count(`SELECT count(*) FROM messages WHERE task_id=? AND envelope LIKE ?`, f.task.ID, "%"+usageWarningTestSubject+"%")
@@ -1286,8 +1409,8 @@ func TestUsageWarningWaitsForRecipient(t *testing.T) {
 	}
 }
 
-// second adds another project with its own metered agent, item, order and
-// owner helper to the same database.
+// second adds another project with its own item, running queue entry, team
+// member and owner helper to the same database.
 func (f *usageWarningFixture) second() *usageWarningFixture {
 	f.t.Helper()
 	ctx := context.Background()
@@ -1308,13 +1431,15 @@ func (f *usageWarningFixture) second() *usageWarningFixture {
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	g := &usageWarningFixture{t: f.t, s: f.s, task: task, metered: a, items: []api.WorkItem{item}, orders: []api.Message{m}, turns: 1000, batches: 1000, estimate: 1000}
+	g := &usageWarningFixture{t: f.t, s: f.s, task: task, metered: a, orders: []api.Message{m}, handler: a, source: []api.Message{m}, items: []api.WorkItem{item}, agents: 1000, turns: 1000, batches: 1000, estimate: 1000}
+	g.addEntry()
 	g.addHelper()
 	return g
 }
 
 func TestUsageWarningThresholdPerProject(t *testing.T) {
 	f := newUsageWarningFixture(t, false, true)
+	f.addEntry()
 	g := f.second()
 	ctx := context.Background()
 	owner := api.Caller{Node: "fixture", User: "owner"}
@@ -1370,7 +1495,7 @@ func TestUsageWarningThresholdPerProject(t *testing.T) {
 		t.Fatalf("warnings %+v %v", got, err)
 	}
 	w := got.Warnings[0]
-	if w.ItemID != f.items[0].ID || w.EstimateTokens != 1000 || w.ActualTokens != "2001" || w.ActualState != "measured" || w.Ratio != "2001/1000" || w.Threshold != "2" || w.LeadAgent != "" || w.HelperAgent != f.helper.ID || w.HelperMessageSeq != f.notices(f.helper)[0].Seq || w.At.IsZero() {
+	if w.EntryID != f.entry || w.LifetimeTokens != "2001" || w.LifetimeState != "measured" || w.ItemID != f.items[0].ID || w.EstimateTokens != 1000 || w.ActualTokens != "2001" || w.ActualState != "measured" || w.Ratio != "2001/1000" || w.Threshold != "2" || w.LeadAgent != "" || w.HelperAgent != f.helper.ID || w.HelperMessageSeq != f.notices(f.helper)[0].Seq || w.At.IsZero() {
 		t.Fatalf("warning %+v", w)
 	}
 	// A changed level never re-warns an estimate value that already warned.
@@ -1406,13 +1531,13 @@ func TestUsageWarningFailureKeepsUpload(t *testing.T) {
 	t.Run("dedupe read", func(t *testing.T) {
 		f := newUsageWarningFixture(t, true, true)
 		f.setEstimate(0, 1000)
-		exec(f, `ALTER TABLE usage_budget_warnings RENAME TO usage_budget_warnings_away`)
+		exec(f, `ALTER TABLE usage_entry_warnings RENAME TO usage_entry_warnings_away`)
 		f.use(0, 1501)
 		stored(f, 1)
 		if warnings(f) != 0 {
 			t.Fatal("a warning was posted without its once-only record")
 		}
-		exec(f, `ALTER TABLE usage_budget_warnings_away RENAME TO usage_budget_warnings`)
+		exec(f, `ALTER TABLE usage_entry_warnings_away RENAME TO usage_entry_warnings`)
 		f.use(0, 1)
 		stored(f, 2)
 		f.want("after the fault clears", 1, 1, 1)
@@ -1420,7 +1545,7 @@ func TestUsageWarningFailureKeepsUpload(t *testing.T) {
 	t.Run("dedupe table dropped", func(t *testing.T) {
 		f := newUsageWarningFixture(t, true, true)
 		f.setEstimate(0, 1000)
-		exec(f, `DROP TABLE usage_budget_warnings`)
+		exec(f, `DROP TABLE usage_entry_warnings`)
 		f.use(0, 1501)
 		stored(f, 1)
 		if warnings(f) != 0 {
@@ -1442,8 +1567,8 @@ func TestUsageWarningFailureKeepsUpload(t *testing.T) {
 	t.Run("after the notices", func(t *testing.T) {
 		f := newUsageWarningFixture(t, true, true)
 		f.setEstimate(0, 1000)
-		exec(f, `CREATE TRIGGER usage_warning_fault BEFORE INSERT ON usage_budget_warnings BEGIN SELECT RAISE(ABORT,'injected warning fault'); END`)
-		tables := []string{"messages", "message_post_requests", "obligations", "wake_jobs", "usage_budget_warnings", "events"}
+		exec(f, `CREATE TRIGGER usage_warning_fault BEFORE INSERT ON usage_entry_warnings BEGIN SELECT RAISE(ABORT,'injected warning fault'); END`)
+		tables := []string{"messages", "message_post_requests", "obligations", "wake_jobs", "usage_entry_warnings", "usage_budget_warnings", "events"}
 		counts := func() []int {
 			out := []int{}
 			for _, table := range tables {
@@ -1597,7 +1722,8 @@ func TestUsageWarningSharedAndPartialActual(t *testing.T) {
 	f.upload(shared)
 	f.want("half of 3001 is past 1500", 1, 1, 1)
 	e := f.notices(f.lead)[0].Envelope
-	if e.Refs["actualTokens"] != "3001/2" || e.Refs["actualState"] != "partial" || e.Refs["ratio"] != "3001/2000" || !strings.Contains(e.Body.Text, "has used at least 1501 tokens against an estimate of 1000: 1.50 times") {
+	if e.Refs["actualTokens"] != "3001/2" || e.Refs["actualState"] != "partial" || e.Refs["ratio"] != "3001/2000" || e.Refs["lifetimeTokens"] != "3001/2" || e.Refs["lifetimeState"] != "partial" ||
+		!strings.Contains(e.Body.Text, "has used at least 1501 tokens on it against an estimate of 1000: 1.50 times") || !strings.Contains(e.Body.Text, "lifetime total is at least 1501 tokens") {
 		t.Fatalf("notice %q %v", e.Body.Text, e.Refs)
 	}
 }
@@ -1691,5 +1817,199 @@ func TestUsageWarningNotifiesEventWaiters(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the crossing upload did not wake the event waiter")
+	}
+}
+
+// The compared figure is the running entry's team's (wi_12d5c1ef9a73ceae):
+// an item's earlier tokens are shown as its lifetime figure and never warn.
+func TestUsageEntryWarningIgnoresEarlierTokens(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	f.as(f.handler, f.source, func() { f.use(0, 10000) })
+	f.use(0, 1400)
+	f.want("10000 earlier tokens and a team at 1400 of 1000", 0, 0, 0)
+	if b := f.budget(); b.ActualTokens != "11400" || b.ActualState != "measured" || b.Ratio != "57/5" || b.Team == nil || *b.Team != (api.TeamTokenBudget{EntryID: f.entry, ActualTokens: "1400", ActualState: "measured", Ratio: "7/5"}) {
+		t.Fatalf("budget %+v team %+v", b, b.Team)
+	}
+	f.use(0, 100)
+	f.want("a team at 1500 of 1000 is at the level", 0, 0, 0)
+	f.use(0, 1)
+	f.want("a team at 1501 of 1000 is past 1.5", 1, 1, 1)
+	for _, m := range []api.Message{f.notices(f.lead)[0], f.notices(f.helper)[0]} {
+		e := m.Envelope
+		if e.Refs["entry"] != f.entry || e.Refs["actualTokens"] != "1501" || e.Refs["actualState"] != "measured" || e.Refs["ratio"] != "1501/1000" || e.Refs["lifetimeTokens"] != "11501" || e.Refs["lifetimeState"] != "measured" {
+			t.Fatalf("refs %v", e.Refs)
+		}
+		if !strings.Contains(e.Body.Text, ": the team of queue entry "+f.entry+" has used 1501 tokens on it against an estimate of 1000: 1.50 times, past the warning level of 1.5. The item's lifetime total is 11501 tokens, which includes work before this entry. ") {
+			t.Fatalf("text %q", e.Body.Text)
+		}
+	}
+	got, err := f.s.UsageWarnings(context.Background(), f.task.ID)
+	if err != nil || len(got.Warnings) != 1 {
+		t.Fatalf("warnings %+v %v", got, err)
+	}
+	if w := got.Warnings[0]; w.EntryID != f.entry || w.ActualTokens != "1501" || w.ActualState != "measured" || w.Ratio != "1501/1000" || w.LifetimeTokens != "11501" || w.LifetimeState != "measured" {
+		t.Fatalf("warning %+v", w)
+	}
+	if b := f.budget(); b.ActualTokens != "11501" || b.Team == nil || b.Team.ActualTokens != "1501" || b.Team.Ratio != "1501/1000" {
+		t.Fatalf("budget %+v team %+v", b, b.Team)
+	}
+}
+
+// After admission, only turns of the entry's team count: not an agent without
+// a binding, not a bound database handler, backlog steward or owner helper,
+// and not an agent bound to the item before the entry.
+func TestUsageEntryWarningCountsOnlyTheTeam(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	f.setEstimate(0, 1000)
+	bound := f.admitted.Add(500 * time.Millisecond)
+	unbound, unboundOrders := f.agent("unbound", "", true)
+	f.as(unbound, unboundOrders, func() { f.use(0, 1_000_000) })
+	f.want("an agent with no binding", 0, 0, 0)
+	f.bind(f.handler, bound, "")
+	f.as(f.handler, f.source, func() { f.use(0, 1_000_000) })
+	f.want("a bound database handler", 0, 0, 0)
+	steward, stewardOrders := f.agent("steward", api.AgentRoleBacklogSteward, true)
+	f.bind(steward, bound, "member")
+	f.as(steward, stewardOrders, func() { f.use(0, 1_000_000) })
+	f.want("a bound backlog steward", 0, 0, 0)
+	f.bind(f.helper, bound, "member")
+	f.as(f.helper, f.order(f.helper), func() { f.use(0, 1_000_000) })
+	f.want("the bound owner helper", 0, 0, 0)
+	for _, a := range []api.Agent{f.handler, steward, f.helper} {
+		if got := f.count(`SELECT count(*) FROM agents WHERE id=? AND role<>''`, a.ID); got != 1 {
+			t.Fatalf("fixture: %s has no project role", a.Name)
+		}
+	}
+	// Bound in the entry's own second, half a second before it.
+	earlier, earlierOrders := f.agent("earlier", "", true)
+	f.bind(earlier, f.admitted.Add(-500*time.Millisecond), "member")
+	f.as(earlier, earlierOrders, func() { f.use(0, 1_000_000) })
+	f.want("an agent bound before the entry", 0, 0, 0)
+	if b := f.budget(); b.ActualTokens != "5000000" || b.Team == nil || b.Team.EntryID != f.entry || b.Team.ActualTokens != "0" || b.Team.ActualState != "not measured" || b.Team.Ratio != "" {
+		t.Fatalf("budget %+v team %+v", b, b.Team)
+	}
+	// A second member bound at the entry's own instant counts with the first.
+	extra, extraOrders := f.agent("extra", "", true)
+	f.bind(extra, f.admitted, "member")
+	f.as(extra, extraOrders, func() { f.use(0, 800) })
+	f.use(0, 700)
+	f.want("two members at 1500 of 1000", 0, 0, 0)
+	f.use(0, 1)
+	f.want("the team crosses", 1, 1, 1)
+	if refs := f.notices(f.lead)[0].Envelope.Refs; refs["actualTokens"] != "1501" || refs["lifetimeTokens"] != "5001501" {
+		t.Fatalf("refs %v", refs)
+	}
+}
+
+// A new entry on the same item and estimate warns on its own team's tokens,
+// once, whatever the earlier entry's team spent and whether it warned.
+func TestUsageEntryWarningSecondEntry(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	ctx := context.Background()
+	f.setEstimate(0, 1000)
+	f.use(0, 1600)
+	f.want("the first entry crosses", 1, 1, 1)
+	first, firstLead, firstMember, firstOrders := f.entry, f.lead, f.metered, f.orders
+	f.release()
+	f.use(0, 1000)
+	f.want("no entry is running", 1, 1, 1)
+	// Bound on a whole second, half a second before the second entry: as
+	// text that instant sorts after the entry's.
+	between, betweenOrders := f.agent("between", "", true)
+	f.bind(between, f.admitted.Add(2*time.Second), "member")
+	f.addEntry()
+	f.addLead()
+	if f.entry == first || f.lead.ID == firstLead.ID || f.metered.ID == firstMember.ID {
+		t.Fatal("fixture: the second entry reuses the first entry's team")
+	}
+	f.as(firstMember, firstOrders, func() { f.use(0, 5000) })
+	f.as(between, betweenOrders, func() { f.use(0, 5000) })
+	f.use(0, 1500)
+	f.want("the second team is at the level", 0, 1, 1)
+	if b := f.budget(); b.ActualTokens != "14100" || b.Team == nil || b.Team.EntryID != f.entry || b.Team.ActualTokens != "1500" {
+		t.Fatalf("budget %+v team %+v", b, b.Team)
+	}
+	f.use(0, 1)
+	f.want("the second team crosses", 1, 2, 2)
+	if got := len(f.notices(firstLead)); got != 1 {
+		t.Fatalf("the first entry's lead has %d notices, want 1", got)
+	}
+	for _, m := range []api.Message{f.notices(f.lead)[0], f.notices(f.helper)[1]} {
+		if refs := m.Envelope.Refs; refs["entry"] != f.entry || refs["estimateTokens"] != "1000" || refs["actualTokens"] != "1501" || refs["lifetimeTokens"] != "14101" || refs["lead"] != f.lead.Name {
+			t.Fatalf("second entry refs %v", refs)
+		}
+	}
+	crossing := f.use(0, 400)
+	f.replay(crossing)
+	f.as(firstMember, firstOrders, func() { f.use(0, 5000) })
+	f.want("once for the second entry", 1, 2, 2)
+	for _, entry := range []string{first, f.entry} {
+		if got := f.count(`SELECT count(*) FROM usage_entry_warnings WHERE task_id=? AND item_id=? AND entry_id=? AND estimate_tokens=1000`, f.task.ID, f.items[0].ID, entry); got != 1 {
+			t.Fatalf("%d rows for entry %s, want 1", got, entry)
+		}
+	}
+	got, err := f.s.UsageWarnings(ctx, f.task.ID)
+	if err != nil || len(got.Warnings) != 2 || got.Warnings[0].EntryID != first || got.Warnings[0].ActualTokens != "1600" || got.Warnings[0].LifetimeTokens != "1600" || got.Warnings[1].EntryID != f.entry || got.Warnings[1].ActualTokens != "1501" || got.Warnings[1].LifetimeTokens != "14101" {
+		t.Fatalf("warnings %+v %v", got, err)
+	}
+	// A raised estimate re-arms the second entry only.
+	f.setEstimate(0, 2000)
+	f.use(0, 1100)
+	f.want("3001 of 2000 for the second team", 2, 3, 3)
+}
+
+// A warning recorded before entries were compared stays where it is and is
+// listed with the new ones (wi_12d5c1ef9a73ceae, D6).
+func TestUsageEntryWarningKeepsEarlierRows(t *testing.T) {
+	f := newUsageWarningFixture(t, true, true)
+	ctx := context.Background()
+	row := func() string {
+		t.Helper()
+		var out string
+		if err := f.s.db.QueryRow(`SELECT group_concat(task_id||'|'||item_id||'|'||estimate_tokens||'|'||threshold||'|'||actual_tokens||'|'||actual_state||'|'||lead_agent||'|'||lead_message_seq||'|'||helper_agent||'|'||helper_message_seq||'|'||created_at,';') FROM usage_budget_warnings`).Scan(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	// The same item and estimate value as the entry's warning below.
+	if _, err := f.s.db.Exec(`INSERT INTO usage_budget_warnings(task_id,item_id,estimate_tokens,threshold,actual_tokens,actual_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,1000,'1.5','28700000','partial','',0,?,7,?)`,
+		f.task.ID, f.items[0].ID, f.helper.ID, ts(f.admitted.Add(-time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	before := row()
+	var seq int
+	var name, path string
+	if err := f.s.db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &path); err != nil || path == "" {
+		t.Fatal("database path", path, err)
+	}
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal("a database with an earlier warning row did not open:", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	f.s = reopened
+	if after := row(); after != before {
+		t.Fatalf("the earlier row changed on open:\n%s\nwas\n%s", after, before)
+	}
+	f.setEstimate(0, 1000)
+	f.use(0, 1501)
+	f.want("the entry warns although the item and estimate have an earlier row", 1, 1, 1)
+	if after := row(); after != before {
+		t.Fatalf("the earlier row changed on a warning:\n%s\nwas\n%s", after, before)
+	}
+	got, err := f.s.UsageWarnings(ctx, f.task.ID)
+	if err != nil || len(got.Warnings) != 2 {
+		t.Fatalf("warnings %+v %v", got, err)
+	}
+	old, entry := got.Warnings[0], got.Warnings[1]
+	if old.EntryID != "" || old.LifetimeTokens != "" || old.LifetimeState != "" || old.ItemID != f.items[0].ID || old.EstimateTokens != 1000 || old.ActualTokens != "28700000" || old.ActualState != "partial" || old.Ratio != "28700" || old.HelperAgent != f.helper.ID || old.HelperMessageSeq != 7 || !old.At.Equal(f.admitted.Add(-time.Hour)) {
+		t.Fatalf("earlier warning %+v", old)
+	}
+	if entry.EntryID != f.entry || entry.ActualTokens != "1501" || entry.LifetimeTokens != "1501" || entry.LifetimeState != "measured" {
+		t.Fatalf("entry warning %+v", entry)
 	}
 }
