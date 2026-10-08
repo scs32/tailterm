@@ -52,6 +52,9 @@ var teamQueueEntryColumns = []struct{ name, definition string }{
 	{"owner_integration_json", "TEXT NOT NULL DEFAULT ''"},
 	{"attempt", "INTEGER NOT NULL DEFAULT 1"},
 	{"retry_of", "TEXT NOT NULL DEFAULT ''"},
+	// When the entry was claimed for launch. Empty means not recorded: readers
+	// fall back to created_at.
+	{"admitted_at", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // teamQueueEntryColumnsSQL is the column list of a new team_queue_entries
@@ -191,6 +194,7 @@ func migrateTeamQueue(db *sql.DB) error {
 		{"owner_integration_json", "TEXT NOT NULL DEFAULT ''"},
 		{"attempt", "INTEGER NOT NULL DEFAULT 1"},
 		{"retry_of", "TEXT NOT NULL DEFAULT ''"},
+		{"admitted_at", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		var count int
 		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name=?`, column.name).Scan(&count); err != nil {
@@ -417,6 +421,9 @@ func liveItemRuns(ctx context.Context, q queryRower, task, item string) (int, er
 // exist and a requeue starts the later order's team. Nothing went wrong, so
 // no owner escalation is posted. A team without a queue entry matches no row.
 func failQueueEntryForOpenClose(ctx context.Context, tx *sql.Tx, task, item, reason, now string) error {
+	if err := stopItemBudgetHolds(ctx, tx, task, item, now); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `UPDATE team_queue_entries SET state='failed',failure=?,revision=revision+1,updated_at=? WHERE task_id=? AND item_id=? AND state='running' AND released_at=''`,
 		"Team closed with the item open: "+reason, now, task, item)
 	return err
@@ -541,13 +548,13 @@ func smallChangeOwnership(ownership []string, serial bool) error {
 	return nil
 }
 
-const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,attempt,retry_of,updated_at`
+const teamQueueCols = `id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,close_json,failure,escalation_seq,released_at,repository,ownership_json,handler_id,handler_run_id,handler_lease_generation,base_commit,acceptance_json,integration_json,serial,owner_integration_json,attempt,retry_of,admitted_at,updated_at`
 
 func scanTeamQueue(row interface{ Scan(...any) error }) (api.TeamQueueEntry, error) {
 	var e api.TeamQueueEntry
 	var launch, close []byte
 	var ownership, acceptance, integration, ownerIntegration string
-	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration, &e.Serial, &ownerIntegration, &e.Attempt, &e.RetryOf, &e.UpdatedAt)
+	err := row.Scan(&e.ID, &e.TaskID, &e.ItemID, &e.ItemRevision, &e.OrderMessageSeq, &e.Template, &e.Position, &e.State, &e.Revision, &e.Host, &e.Cwd, &e.PauseGeneration, &launch, &close, &e.Failure, &e.EscalationSeq, &e.ReleasedAt, &e.Repository, &ownership, &e.HandlerID, &e.HandlerRunID, &e.HandlerLeaseGeneration, &e.BaseCommit, &acceptance, &integration, &e.Serial, &ownerIntegration, &e.Attempt, &e.RetryOf, &e.AdmittedAt, &e.UpdatedAt)
 	if err != nil {
 		return e, err
 	}
@@ -818,6 +825,13 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 	if err := s.explainQueueStalls(ctx, reader, capacityTx, out); err != nil {
 		return err
 	}
+	// Waiting for the token budget, or behind a team held past its estimate,
+	// is not a stall.
+	budgetHeld, err := explainQueueBudget(ctx, reader, task, out, s.now())
+	if err != nil {
+		return err
+	}
+	suppressBudgetStalls(out, budgetHeld)
 	// A stall behind an entry that only shares the checkout keeps the move,
 	// which frees the queued entry at once; the stall notice carries it too.
 	for i := range out.Entries {
@@ -1132,6 +1146,13 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	}
 	if err == nil {
 		e.Budget, err = loadTokenBudget(ctx, s.db, task, e.ItemID)
+	}
+	if err == nil {
+		// The same budget fields a listing shows for the entry.
+		one := api.TeamQueueList{Entries: []api.TeamQueueEntry{e}}
+		if _, err = explainQueueBudget(ctx, s.db, task, &one, s.now()); err == nil {
+			e = one.Entries[0]
+		}
 	}
 	return e, err
 }
@@ -1580,7 +1601,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
 		}
-	case "remove", "reorder", "claim", "freeze", "attempt", "unattempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue":
+	case "remove", "reorder", "claim", "freeze", "attempt", "unattempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue", "budget_continue":
 		if !validTeamQueueID(req.EntryID) {
 			return zero, api.ErrInvalid
 		}
@@ -1595,6 +1616,12 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 		}
 		switch req.Operation {
+		case "budget_continue":
+			// The owner helper's answer to a hold past the token estimate:
+			// the team's wakes resume. Stop is the fail operation below.
+			if err := continueEntryBudget(ctx, tx, task, e, req, now); err != nil {
+				return zero, err
+			}
 		case "requeue":
 			// The failed entry stays as history; e becomes the new attempt.
 			if e, err = requeueTeamQueueEntry(ctx, tx, task, e, req, now); err != nil {
@@ -1746,6 +1773,9 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if _, err = tx.ExecContext(ctx, `DELETE FROM team_launch_reservations WHERE task_id=? AND entry_id=?`, task, e.ID); err != nil {
 				return zero, err
 			}
+			if err = stopEntryBudgetHold(ctx, tx, task, e.ID, now, req.Caller); err != nil {
+				return zero, err
+			}
 		case "release":
 			limit, err := queueConcurrencyLimit(ctx, tx, task)
 			if err != nil {
@@ -1774,6 +1804,9 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 			if _, err = tx.ExecContext(ctx, `UPDATE item_team_leads SET state='closed',revision=revision+1 WHERE task_id=? AND item_id=? AND state<>'closed'`, task, e.ItemID); err != nil {
+				return zero, err
+			}
+			if err = stopEntryBudgetHold(ctx, tx, task, e.ID, now, req.Caller); err != nil {
 				return zero, err
 			}
 			e.ReleasedAt = now
@@ -1904,6 +1937,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			var head string
+			budget := newQueueBudgetCheck(task, s.now())
 			for _, candidate := range candidates {
 				// An entry waiting for a rebind does not hold the head.
 				current, err := queueItemRevision(ctx, tx, task, candidate.ItemID)
@@ -1911,6 +1945,13 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 					return zero, err
 				}
 				if current != candidate.ItemRevision {
+					continue
+				}
+				// Nor does one the token budget cannot cover yet: it stays
+				// queued and later entries that fit still launch.
+				if held, err := budget.admission(ctx, tx, candidate); err != nil {
+					return zero, err
+				} else if held != "" {
 					continue
 				}
 				conflict := false
@@ -1939,6 +1980,8 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, err
 			}
 			e.State = "launching"
+			// Admission: team tokens are counted from here, not from the enqueue.
+			e.AdmittedAt = now
 			e.PauseGeneration = t.PauseGeneration
 			e.HandlerID, e.HandlerRunID = chosen.ID, chosen.RunID
 			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(handler_lease_generation),0)+1 FROM team_queue_entries WHERE handler_id=?`, chosen.ID).Scan(&e.HandlerLeaseGeneration); err != nil {
@@ -2264,6 +2307,9 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err = finishHandlerArmAssignment(ctx, tx, e, now); err != nil {
 				return zero, err
 			}
+			if err = stopEntryBudgetHold(ctx, tx, task, e.ID, now, req.Caller); err != nil {
+				return zero, err
+			}
 		case "fail":
 			if e.State != "queued" && e.State != "launching" && e.State != "running" || strings.TrimSpace(req.Failure) == "" {
 				return zero, api.ErrConflict
@@ -2280,6 +2326,11 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				return zero, insertErr
 			}
 			e.EscalationSeq = message.Seq
+			// Failing a held entry is the owner helper's stop: the hold is
+			// resolved here, and its team stays unwoken until the release.
+			if err = stopEntryBudgetHold(ctx, tx, task, e.ID, now, req.Caller); err != nil {
+				return zero, err
+			}
 		}
 		if req.Operation != "remove" && req.Operation != "reorder" && req.Operation != "requeue" {
 			e.Revision++
@@ -2299,7 +2350,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				ownerIntegrationJSON = string(data)
 			}
 			ownedJSON, _ := json.Marshal(e.Ownership)
-			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET item_revision=?,state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,cwd=?,updated_at=? WHERE id=?`, e.ItemRevision, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, e.Cwd, now, e.ID)
+			_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET item_revision=?,state=?,revision=?,pause_generation=?,launch_json=?,close_json=?,failure=?,escalation_seq=?,released_at=?,handler_id=?,handler_run_id=?,handler_lease_generation=?,acceptance_json=?,integration_json=?,base_commit=?,ownership_json=?,owner_integration_json=?,serial=?,cwd=?,admitted_at=?,updated_at=? WHERE id=?`, e.ItemRevision, e.State, e.Revision, e.PauseGeneration, string(e.LaunchJSON), string(e.CloseJSON), e.Failure, e.EscalationSeq, e.ReleasedAt, e.HandlerID, e.HandlerRunID, e.HandlerLeaseGeneration, acceptanceJSON, integrationJSON, e.BaseCommit, string(ownedJSON), ownerIntegrationJSON, e.Serial, e.Cwd, e.AdmittedAt, now, e.ID)
 			if err != nil {
 				return zero, err
 			}

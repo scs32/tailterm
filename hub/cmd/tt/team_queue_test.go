@@ -1679,3 +1679,49 @@ func TestTeamQueueCLIDefaultLaneJSONStdoutIsOnlyTheEntry(t *testing.T) {
 		}
 	}
 }
+
+// a9: the text queue list labels an entry admitted on a lane default, shows
+// nothing of the kind once the item has a saved estimate, and prints a held
+// line for an entry whose team is held.
+func TestTeamQueueListDefaultEstimateAndHold(t *testing.T) {
+	f := newBudgetCLIFixture(t)
+	list := func() string {
+		t.Helper()
+		out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if out := list(); strings.Contains(out, "default estimate") || strings.Contains(out, "held:") {
+		t.Fatalf("no defaults set: %s", out)
+	}
+	if _, err := f.usage("defaults", "set", "--small", "18000000", "--small-race", "17000000", "--planned", "44000000", "--planned-race", "70000000"); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture entry is Planned and declares no ownership, so its
+	// verification runs everything, the Go race check included.
+	if out := list(); !strings.Contains(out, "\n  budget: no estimate · lifetime actual not measured · default estimate 70.00M (planned, Go race)\n") || strings.Contains(out, "held:") {
+		t.Fatalf("lane default label: %s", out)
+	}
+	if got := formatEstimateDefault(&api.TeamQueueEstimateDefault{Tokens: 18_000_000, Lane: "small"}); got != " · default estimate 18.00M (small)" || formatEstimateDefault(nil) != "" {
+		t.Fatalf("label %q", got)
+	}
+	f.estimate(2_000_000)
+	if out := list(); strings.Contains(out, "default estimate") || !strings.Contains(out, "\n  budget: estimate 2.00M · lifetime actual not measured\n") {
+		t.Fatalf("a saved estimate still shows a default: %s", out)
+	}
+	f.held()
+	out := list()
+	if strings.Contains(out, "default estimate") || !strings.Contains(out, "\n  held: past 3 times its token estimate since ") || !strings.Contains(out, "(team 3.0k, estimate 1.0k); no new turns start. Continue: tt usage hold continue --project "+f.task.ID+" --entry "+f.entry.ID+". Stop, from an unbound owner shell: tt team queue fail --task "+f.task.ID+" --entry "+f.entry.ID+" --reason TEXT\n") {
+		t.Fatalf("held line: %s", out)
+	}
+	if !strings.Contains(out, "reason=Held past 3 times its token estimate") {
+		t.Fatalf("held reason: %s", out)
+	}
+	var listed api.TeamQueueList
+	text, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--json"}) })
+	if err != nil || json.Unmarshal([]byte(text), &listed) != nil || len(listed.Entries) != 1 || listed.Entries[0].BudgetHold == nil || listed.Entries[0].EstimateDefault != nil || listed.Entries[0].AdmittedAt == "" {
+		t.Fatalf("json list %s %v", text, err)
+	}
+}

@@ -57,6 +57,10 @@ type TeamQueueEntry struct {
 	// entry is a new entry; RetryOf names the entry it retries.
 	Attempt int64  `json:"attempt,omitempty"`
 	RetryOf string `json:"retryOf,omitempty"`
+	// AdmittedAt is when the entry was claimed for launch; the team's tokens
+	// are counted from then. Empty on a queued entry and on one admitted by an
+	// older hub.
+	AdmittedAt string `json:"admittedAt,omitempty"`
 	// Rebinds is the entry's history of moves to a later item revision,
 	// oldest first. Summaries leave it out.
 	Rebinds []TeamQueueRebind `json:"rebinds,omitempty"`
@@ -88,6 +92,15 @@ type TeamQueueEntry struct {
 	// limit that exceeds the available database handlers.
 	Warning string `json:"warning,omitempty"`
 
+	// EstimateDefault is the lane default admission compares with the budget
+	// for an entry whose item has no saved estimate. It is computed on read
+	// for queued, launching and running entries, and absent when the item has
+	// a saved estimate or the project has no lane defaults.
+	EstimateDefault *TeamQueueEstimateDefault `json:"estimateDefault,omitempty"`
+	// BudgetHold is the entry's hold past BudgetHoldMultiple times its saved
+	// estimate, while it keeps the team from starting turns.
+	BudgetHold *BudgetHold `json:"budgetHold,omitempty"`
+
 	// Summary marks a trimmed history entry in a listing: it carries no
 	// launch, close or activities and bounded reviews, verification and
 	// release. GET .../team-queue/{entry} returns it in full.
@@ -95,6 +108,15 @@ type TeamQueueEntry struct {
 	// TeamShape is "plan-review" or "plan-only", derived from the launch a
 	// summary entry no longer carries.
 	TeamShape string `json:"teamShape,omitempty"`
+}
+
+// TeamQueueEstimateDefault is a lane default estimate: the tokens, the lane
+// ("small" or "planned") and whether the entry's owned paths select the Go
+// race check.
+type TeamQueueEstimateDefault struct {
+	Tokens int64  `json:"tokens"`
+	Lane   string `json:"lane"`
+	GoRace bool   `json:"goRace"`
 }
 
 // TeamQueueRebind records one move of a queued or running entry, and of a
@@ -374,6 +396,9 @@ type TeamQueueRequest struct {
 	// pairs (never the prompt), so a refusal can print a complete command
 	// that saves the corrected spec.
 	HandlerSpecArgs []string `json:"handlerSpecArgs,omitempty"`
+	// AgentID is the agent a budget_continue caller names itself as; the hub
+	// accepts only the project's owner helper. No other operation reads it.
+	AgentID string `json:"agentId,omitempty"`
 	// Caller is the authenticated caller, set by the hub's HTTP layer and
 	// never read from the wire. A rebind records it as the approver.
 	Caller Caller `json:"-"`

@@ -918,6 +918,11 @@ func (s *Store) LeaseWakeJob(ctx context.Context, taskID, agentID, runID string,
 	if pause != api.ProjectPauseActive || status != api.TaskOpen {
 		return nil, nil
 	}
+	// A team held past its token estimate is not woken: its due job stays
+	// pending and is leased once the hold is lifted.
+	if held, err := budgetHeldRun(ctx, tx, taskID, agentID, runID); err != nil || held {
+		return nil, err
+	}
 	t := ts(now)
 	// Wakes for obligations that have since closed are no longer needed.
 	if _, err := tx.ExecContext(ctx, `UPDATE wake_jobs SET state='cancelled',reported_at=? WHERE agent_id=? AND state IN (?,?) AND obligation_id IN (SELECT id FROM obligations WHERE state=?)`,

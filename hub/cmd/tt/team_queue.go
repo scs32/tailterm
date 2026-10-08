@@ -229,8 +229,11 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm), queueAttemptText(q))
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
-			if text := formatTokenBudget(q.Budget); text != "" {
+			if text := strings.TrimPrefix(formatTokenBudget(q.Budget)+formatEstimateDefault(q.EstimateDefault), " · "); text != "" {
 				fmt.Printf("  budget: %s\n", text)
+			}
+			if q.BudgetHold != nil {
+				fmt.Printf("  %s\n", formatBudgetHold(*task, q.BudgetHold))
 			}
 			for _, member := range q.Activities {
 				fmt.Printf("  %s %s\n", member.Name, queueMemberActivity(member.Activity))

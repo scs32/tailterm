@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -213,5 +216,98 @@ func TestVerificationEnrollmentRolloutPreservesLegacyAndCannotOptNewAdmissionsOu
 	entries, err = f.s.VerificationEnrollment(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
 	if err != nil || len(entries) != 2 {
 		t.Fatal(entries, err)
+	}
+}
+
+// A database from before the admission time opens with the column empty on
+// entries without a launch reservation, the reservation's time on one that
+// has it, and the same team figures as before for the first kind; a second
+// open changes nothing.
+func TestMigrateAddsQueueAdmissionTime(t *testing.T) {
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Admission fixture"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := s.now().UTC().Truncate(time.Second)
+	reserved := created.Add(90 * time.Second)
+	var entries, items []string
+	for i, state := range []string{"running", "running", "queued", "finished"} {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Admitted " + state, RequestID: fmt.Sprintf("item-%d", i)}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := api.NewID("tqe")
+		if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,created_at,updated_at) VALUES(?,?,?,1,1,'planned',?,?,?,?)`, id, task.ID, item.ID, i+1, state, ts(created), ts(created)); err != nil {
+			t.Fatal(err)
+		}
+		entries, items = append(entries, id), append(items, item.ID)
+	}
+	// Only the first running entry still holds its launch reservation.
+	if _, err := s.db.Exec(`INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,?,?,'token',0,'running',?)`, task.ID, entries[0], items[0], ts(reserved)); err != nil {
+		t.Fatal(err)
+	}
+	order, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "bounded order", RequestID: "order"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One agent bound to each running item between its creation and the
+	// reservation, with 500 tokens attributed to the item.
+	for i := 0; i < 2; i++ {
+		a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: fmt.Sprintf("member-%d", i), AgentID: api.NewID("agt"), Host: "fixture", Session: fmt.Sprintf("member-%d", i)}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,team_role,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'member',?,'{}',?)`,
+			a.ID, a.RunID, task.ID, items[i], task.ID, order.Seq, strings.Repeat("d", 64), ts(created.Add(30*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO usage_item_shares(task_id,agent_id,run_id,request_id,turn_revision,item_task_id,item_id,denominator,tokens,partial) VALUES(?,?,?,'turn',1,?,?,1,500,0)`, task.ID, a.ID, a.RunID, task.ID, items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	team := func(s *Store, i int) string {
+		t.Helper()
+		entry, total, _, err := loadEntryTokenActual(ctx, s.db, task.ID, items[i])
+		if err != nil || entry != entries[i] {
+			t.Fatalf("team of entry %d: %q %v", i, entry, err)
+		}
+		return total.RatString()
+	}
+	// The shape before this column existed.
+	if _, err := s.db.Exec(`ALTER TABLE team_queue_entries DROP COLUMN admitted_at`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		if s, err = Open(path); err != nil {
+			t.Fatalf("open %d: %v", pass, err)
+		}
+		want := []string{ts(reserved), "", "", ""}
+		for i, id := range entries {
+			var got string
+			if err := s.db.QueryRow(`SELECT admitted_at FROM team_queue_entries WHERE id=?`, id).Scan(&got); err != nil || got != want[i] {
+				t.Fatalf("open %d: entry %d admitted_at %q %v, want %q", pass, i, got, err, want[i])
+			}
+		}
+		// The backfilled entry stops counting the agent bound before its
+		// claim; the one without a reservation counts it as before.
+		if got := team(s, 0); got != "0" {
+			t.Fatalf("open %d: backfilled team %s, want 0", pass, got)
+		}
+		if got := team(s, 1); got != "500" {
+			t.Fatalf("open %d: unrecorded team %s, want 500 as before", pass, got)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -2722,3 +2722,30 @@ func TestOwnerIntegratedRefusedWhileReleaseJobHeld(t *testing.T) {
 		t.Fatalf("owner integration after the job finished: %v", err)
 	}
 }
+
+// A claim records the admission time; a queued entry has none, and later
+// operations keep it.
+func TestTeamQueueClaimWritesAdmissionTime(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil || q.AdmittedAt != "" {
+		t.Fatalf("queued entry %+v %v", q, err)
+	}
+	clock := s.now().UTC().Truncate(time.Second).Add(3 * time.Second)
+	s.now = func() time.Time { return clock }
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	if err != nil || q.State != "launching" || q.AdmittedAt != ts(clock) {
+		t.Fatalf("claimed entry %s admitted %q %v, want %q", q.State, q.AdmittedAt, err, ts(clock))
+	}
+	admitted := q.AdmittedAt
+	clock = clock.Add(time.Minute)
+	q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture"})
+	if err != nil || q.AdmittedAt != admitted {
+		t.Fatalf("failed entry admitted %q %v", q.AdmittedAt, err)
+	}
+	got, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID)
+	if err != nil || got.AdmittedAt != admitted || listedEntry(t, s, task.ID, q.ID).AdmittedAt != admitted {
+		t.Fatalf("read entry admitted %q %v", got.AdmittedAt, err)
+	}
+}

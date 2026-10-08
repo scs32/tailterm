@@ -389,3 +389,220 @@ func TestUsageEntryWarningCLI(t *testing.T) {
 		t.Fatalf("budget JSON without a running entry %v", report.Items[0].Budget)
 	}
 }
+
+// budgetCLIFixture is a real hub over HTTP with one queued entry for the team
+// fixture's item. held drives the entry to running and its one bound member
+// past 3 times a saved estimate. No agent session is started.
+type budgetCLIFixture struct {
+	teamFixture
+	t     *testing.T
+	entry api.TeamQueueEntry
+}
+
+func newBudgetCLIFixture(t *testing.T) *budgetCLIFixture {
+	t.Helper()
+	f := &budgetCLIFixture{teamFixture: newTeamFixture(t, true), t: t}
+	old := usageBudgetHost
+	usageBudgetHost = func() string { return "fixture" }
+	t.Cleanup(func() { usageBudgetHost = old })
+	var err error
+	if f.entry, err = f.c.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: "budget-cli-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func (f *budgetCLIFixture) estimate(tokens int64) {
+	f.t.Helper()
+	basis := "synthetic"
+	if _, _, err := f.st.CreateWorkItemUpdate(context.Background(), f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: f.item.Revision, RequestID: fmt.Sprintf("budget-cli-estimate-%d", tokens), EstimateTokens: &tokens, EstimateBasis: &basis}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// held runs the entry and has a bound member report 3001 tokens against a
+// saved estimate of 1000. It returns the member.
+func (f *budgetCLIFixture) held() api.Agent {
+	f.t.Helper()
+	ctx := context.Background()
+	f.estimate(1000)
+	f.entry = runQueueEntry(f.t, f.teamFixture, f.entry.ID)
+	member, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "member-a", Host: "fixture", Session: "member-a", Runtime: "codex", WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, WorkOrderMessage: api.MessageReference{TaskID: f.task.ID, Seq: f.order}, ContextBundle: teamCloseCLIContext(f.t, f.item, api.Message{TaskID: f.task.ID, Seq: f.order, Text: "bounded fixture order"})}})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	turn := api.UsageTurn{ID: "budget-cli-turn", Revision: 1, Runtime: "codex", Session: "synthetic-session", Model: "synthetic-model", At: at, SourceDigest: strings.Repeat("a", 64), Activation: "activation-one", Complete: true,
+		Tokens:  map[string]int64{"input": 3001, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0},
+		Raw:     map[string]int64{"input_tokens": 3001, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0},
+		Handled: []api.UsageEvidence{{TaskID: f.task.ID, Seq: f.order, Operation: "ack", At: at}}}
+	if _, err := f.c.ReportUsage(ctx, f.task.ID, member.ID, api.UsageBatch{Version: 1, RequestID: "budget-cli-batch", RunID: member.RunID, Session: "synthetic-session", StartedAt: at.Add(-time.Hour), Coverage: "synthetic complete", Turns: []api.UsageTurn{turn}}); err != nil {
+		f.t.Fatal(err)
+	}
+	holds, err := f.c.UsageHolds(ctx, f.task.ID, member.ID, member.RunID)
+	if err != nil || !holds.Held {
+		f.t.Fatalf("fixture: the member is not held: %+v %v", holds, err)
+	}
+	return member
+}
+
+func (f *budgetCLIFixture) usage(args ...string) (string, error) {
+	f.t.Helper()
+	return captureStdout(f.t, func() error { return cmdUsage(f.e, args) })
+}
+
+// a1, a5: tt usage budget set, get and clear round-trip a row over a real
+// hub; bad values and unauthorised agents are refused with a named reason;
+// with no row, get prints "not configured".
+func TestUsageBudgetCLI(t *testing.T) {
+	f := newBudgetCLIFixture(t)
+	text, err := f.usage("budget", "get")
+	if err != nil || text != "Token budget: not configured\n" {
+		t.Fatalf("get with no row: %q %v", text, err)
+	}
+	reset := time.Now().UTC().Add(-time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	text, err = f.usage("budget", "set", "--runtime", "claude", "--window", "five_hour", "--allowance", "200000000", "--reserve", "10", "--reset-at", reset, "--stale", "10m")
+	want := "claude five_hour: allowance 200.00M · reserve 10% · reading stale after 10m0s · owner reset " + reset + " · source allowance minus reported usage · remaining 200.00M · resets "
+	if err != nil || !strings.HasPrefix(text, want) || !strings.HasSuffix(text, " · provider reading for host fixture is not reported\n") {
+		t.Fatalf("set: %q %v", text, err)
+	}
+	text, err = f.usage("budget", "get", "--json")
+	var out api.UsageBudgets
+	if err != nil || json.Unmarshal([]byte(text), &out) != nil || !out.Configured || len(out.Budgets) != 1 {
+		t.Fatalf("get --json: %q %v", text, err)
+	}
+	row := out.Budgets[0]
+	if row.Runtime != "claude" || row.Window != api.UsageWindowFiveHour || row.AllowanceTokens != 200_000_000 || row.ReservePercent != 10 || row.ResetAt != reset || row.StaleSeconds != 600 || row.Status == nil || row.Status.Host != "fixture" {
+		t.Fatalf("round trip %+v", row)
+	}
+	// A provider reading for the named host becomes the source.
+	now := time.Now().UTC()
+	if _, err := f.c.ReportProviderUsage(context.Background(), api.ProviderUsageReport{Host: "air", Runtime: "claude", State: api.ProviderUsageOK, CapturedAt: now.Format(time.RFC3339Nano),
+		Windows: []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 13, ResetsAt: now.Add(2 * time.Hour).Format(time.RFC3339)}}}); err != nil {
+		t.Fatal(err)
+	}
+	if text, err = f.usage("budget", "get", "--host", "air"); err != nil || !strings.Contains(text, " · source provider reading for host air · remaining 174.00M · resets ") {
+		t.Fatalf("get --host: %q %v", text, err)
+	}
+	// With no reset and no reading, the row says admission is held.
+	if text, err = f.usage("budget", "set", "--runtime", "codex", "--window", "seven_day", "--allowance", "5"); err != nil || !strings.Contains(text, "codex seven_day: allowance 5 · reserve 0% · reading stale after 15m0s · no usable source: provider reading for host fixture is not reported and no reset time is set; admission is held\n") {
+		t.Fatalf("set with no source: %q %v", text, err)
+	}
+	for name, bad := range map[string][]string{
+		"no subcommand":     {"budget"},
+		"unknown":           {"budget", "show"},
+		"missing allowance": {"budget", "set", "--runtime", "claude", "--window", "five_hour"},
+		"zero allowance":    {"budget", "set", "--runtime", "claude", "--window", "five_hour", "--allowance", "0"},
+		"unknown window":    {"budget", "set", "--runtime", "claude", "--window", "daily", "--allowance", "5"},
+		"unknown runtime":   {"budget", "set", "--runtime", "gemini", "--window", "five_hour", "--allowance", "5"},
+		"reserve too high":  {"budget", "set", "--runtime", "claude", "--window", "five_hour", "--allowance", "5", "--reserve", "95"},
+		"values on get":     {"budget", "get", "--allowance", "5"},
+		"clear with value":  {"budget", "clear", "--runtime", "claude", "--window", "five_hour", "--allowance", "5"},
+		"clear without row": {"budget", "clear", "--runtime", "claude"},
+		"extra argument":    {"budget", "get", "extra"},
+	} {
+		if _, err := f.usage(bad...); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+	if _, err := f.usage("budget", "set", "--runtime", "claude", "--window", "daily", "--allowance", "5"); err == nil || !strings.Contains(err.Error(), "budget window must be five_hour or seven_day") {
+		t.Fatalf("unknown window reason: %v", err)
+	}
+	worker, err := f.c.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "worker", Host: "fixture", Session: "worker", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asWorker, asHandler := f.e, f.e
+	asWorker.agent, asHandler.agent = worker.ID, f.handler.ID
+	for _, args := range [][]string{{"budget", "set", "--runtime", "claude", "--window", "five_hour", "--allowance", "5"}, {"budget", "clear", "--runtime", "claude", "--window", "five_hour"}} {
+		if _, err := captureStdout(t, func() error { return cmdUsage(asWorker, args) }); err == nil || !strings.Contains(err.Error(), "only the owner, the owner helper or a database handler sets the token budget") {
+			t.Fatalf("a worker ran %v: %v", args, err)
+		}
+	}
+	if _, err := captureStdout(t, func() error {
+		return cmdUsage(asHandler, []string{"budget", "set", "--runtime", "claude", "--window", "five_hour", "--allowance", "300000000"})
+	}); err != nil {
+		t.Fatalf("a database handler set the budget: %v", err)
+	}
+	if text, err = f.usage("budget", "clear", "--runtime", "codex", "--window", "seven_day"); err != nil || strings.Contains(text, "codex") || !strings.Contains(text, "claude five_hour: allowance 300.00M") {
+		t.Fatalf("clear one row: %q %v", text, err)
+	}
+	if text, err = f.usage("budget", "clear", "--runtime", "claude", "--window", "five_hour"); err != nil || text != "Token budget: not configured\n" {
+		t.Fatalf("clear the last row: %q %v", text, err)
+	}
+}
+
+// a8: tt usage defaults set then get round-trips the four figures.
+func TestUsageDefaultsCLI(t *testing.T) {
+	f := newBudgetCLIFixture(t)
+	text, err := f.usage("defaults", "get")
+	if err != nil || text != "Lane default estimates: not set (tt usage defaults set)\n" {
+		t.Fatalf("get with none: %q %v", text, err)
+	}
+	text, err = f.usage("defaults", "set", "--small", "18000000", "--small-race", "17000000", "--planned", "44000000", "--planned-race", "70000000")
+	if err != nil || !strings.HasPrefix(text, "Lane default estimates: small 18.00M · small with Go race 17.00M · planned 44.00M · planned with Go race 70.00M · set ") {
+		t.Fatalf("set: %q %v", text, err)
+	}
+	text, err = f.usage("defaults", "get", "--json")
+	var out api.UsageEstimateDefaults
+	if err != nil || json.Unmarshal([]byte(text), &out) != nil || !out.Configured || out.SmallTokens != 18_000_000 || out.SmallRaceTokens != 17_000_000 || out.PlannedTokens != 44_000_000 || out.PlannedRaceTokens != 70_000_000 {
+		t.Fatalf("get --json: %q %v", text, err)
+	}
+	for name, bad := range map[string][]string{
+		"no subcommand": {"defaults"},
+		"three figures": {"defaults", "set", "--small", "1", "--small-race", "1", "--planned", "1"},
+		"values on get": {"defaults", "get", "--small", "1"},
+		"extra":         {"defaults", "get", "extra"},
+	} {
+		if _, err := f.usage(bad...); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+	worker, err := f.c.AddAgent(context.Background(), f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "worker", Host: "fixture", Session: "worker", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asWorker := f.e
+	asWorker.agent = worker.ID
+	if _, err := captureStdout(t, func() error {
+		return cmdUsage(asWorker, []string{"defaults", "set", "--small", "1", "--small-race", "1", "--planned", "1", "--planned-race", "1"})
+	}); err == nil || !strings.Contains(err.Error(), "the lane default estimates") {
+		t.Fatalf("a worker set the defaults: %v", err)
+	}
+}
+
+// a16: tt usage hold list shows a held team with both commands; continue is
+// refused for an agent that is not the owner helper and lifts the hold for
+// the owner.
+func TestUsageHoldCLI(t *testing.T) {
+	f := newBudgetCLIFixture(t)
+	text, err := f.usage("hold", "list")
+	if err != nil || text != "No token budget holds.\n" {
+		t.Fatalf("list with none: %q %v", text, err)
+	}
+	member := f.held()
+	text, err = f.usage("hold", "list")
+	want := f.entry.ID + " " + f.item.ID + " held: past 3 times its token estimate since "
+	if err != nil || !strings.HasPrefix(text, want) || !strings.Contains(text, "(team 3.0k, estimate 1.0k); no new turns start. Continue: tt usage hold continue --project "+f.task.ID+" --entry "+f.entry.ID+". Stop, from an unbound owner shell: tt team queue fail --task "+f.task.ID+" --entry "+f.entry.ID+" --reason TEXT\n") {
+		t.Fatalf("list: %q %v", text, err)
+	}
+	for name, bad := range map[string][]string{"no subcommand": {"hold"}, "continue without entry": {"hold", "continue"}, "list with entry": {"hold", "list", "--entry", f.entry.ID}, "unknown entry": {"hold", "continue", "--entry", "tqe_0000000000000000"}} {
+		if _, err := f.usage(bad...); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+	asMember := f.e
+	asMember.agent, asMember.runID = member.ID, member.RunID
+	if _, err := captureStdout(t, func() error { return cmdUsage(asMember, []string{"hold", "continue", "--entry", f.entry.ID}) }); err == nil || !strings.Contains(err.Error(), "only the owner or the owner helper continues a held team") {
+		t.Fatalf("a team member continued its own hold: %v", err)
+	}
+	if text, err = f.usage("hold", "continue", "--entry", f.entry.ID); err != nil || text != "Continued entry "+f.entry.ID+"; its team is woken again.\nNo token budget holds.\n" {
+		t.Fatalf("continue: %q %v", text, err)
+	}
+	if holds, err := f.c.UsageHolds(context.Background(), f.task.ID, member.ID, member.RunID); err != nil || holds.Held {
+		t.Fatalf("after continue: %+v %v", holds, err)
+	}
+	if _, err := f.usage("hold", "continue", "--entry", f.entry.ID); err == nil || !strings.Contains(err.Error(), "has no token budget hold in force") {
+		t.Fatalf("continue with no hold: %v", err)
+	}
+}

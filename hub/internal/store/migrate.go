@@ -20,6 +20,13 @@ func migrate(db *sql.DB) error {
 	if err := migrateTeamQueue(db); err != nil {
 		return err
 	}
+	// An entry admitted before the admission time was recorded takes its
+	// launch reservation's time, which the claim wrote in the same step. One
+	// without a reservation stays empty and is read as its creation time.
+	if _, err := db.Exec(`UPDATE team_queue_entries SET admitted_at=(SELECT r.created_at FROM team_launch_reservations r WHERE r.task_id=team_queue_entries.task_id AND r.entry_id=team_queue_entries.id)
+ WHERE admitted_at='' AND EXISTS (SELECT 1 FROM team_launch_reservations r WHERE r.task_id=team_queue_entries.task_id AND r.entry_id=team_queue_entries.id AND r.entry_id<>'')`); err != nil {
+		return err
+	}
 	if err := migrateWorkOrderScope(db); err != nil {
 		return err
 	}
@@ -442,6 +449,9 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 		return err
 	}
 	if err := migrateUsage(db); err != nil {
+		return err
+	}
+	if err := migrateTeamQueueBudget(db); err != nil {
 		return err
 	}
 	if err := migrateTokenBudget(db); err != nil {

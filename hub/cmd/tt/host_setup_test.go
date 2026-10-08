@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/adapters"
+	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
@@ -500,6 +501,8 @@ func TestHostSetupMergesHooks(t *testing.T) {
 	wantClaude, wantCodex := decodeJSONFile(t, s.p.claudeSettings), decodeJSONFile(t, s.p.codexHooks)
 	out := s.mustRun("--from", s.artifact("tt-v1"))
 	s.requireCanonicalHooks()
+	// The capture status line is the one other key host setup adds.
+	wantClaude["statusLine"] = map[string]any{"type": "command", "command": s.p.claudeUsageScript}
 	if got := withoutTTHooks(decodeJSONFile(t, s.p.claudeSettings), claudeHookEvents); !reflect.DeepEqual(got, wantClaude) {
 		t.Fatalf("Claude settings lost or changed user content:\n got %v\nwant %v", got, wantClaude)
 	}
@@ -1281,6 +1284,289 @@ func TestHostSetupRelayProbeSchedule(t *testing.T) {
 			}
 		} else if code != 1 || len(probes) != 1 || !strings.Contains(out, "failed: relay") {
 			t.Fatalf("%s: exit %d, %d probes; want one immediate probe and no wait:\n%s", c.name, code, len(probes), out)
+		}
+	}
+}
+
+// statusLineOf reads the statusLine value of a settings file.
+func statusLineOf(t *testing.T, path string) any {
+	t.Helper()
+	return decodeJSONFile(t, path)["statusLine"]
+}
+
+// a18: host setup installs the capture command and its statusLine entry,
+// keeps the settings backup, changes nothing on a second run, and --check
+// reports missing, outdated and current.
+func TestHostSetupClaudeUsageInstallAndCheck(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	s.write(s.p.claudeSettings, userClaudeSettings, 0o600)
+	source := s.artifact("tt-v1")
+	script := s.p.claudeUsageScript
+	if script != filepath.Join(s.home, ".local", "bin", "tt-claude-usage-capture") || claudeUsageScriptPath() != script || claudeUsageCapturePath() != filepath.Join(s.home, ".local", "state", "tailterm", "claude-usage.json") {
+		t.Fatalf("capture paths %s %s %s", script, claudeUsageScriptPath(), claudeUsageCapturePath())
+	}
+	// Before anything is installed, --check says missing and writes nothing.
+	out, code := s.run("--check", "--from", source)
+	if code != 1 || !strings.Contains(out, "missing    claude-usage   would install "+script+" and set it as the statusLine in "+s.p.claudeSettings) || exists(script) {
+		t.Fatalf("check of a fresh host (exit %d):\n%s", code, out)
+	}
+	if raw, _ := os.ReadFile(s.p.claudeSettings); string(raw) != userClaudeSettings {
+		t.Fatal("--check changed the settings")
+	}
+	out = s.mustRun("--from", source)
+	if !strings.Contains(out, "installed  claude-usage   "+script+" set as the statusLine in "+s.p.claudeSettings+"; remove with tt host setup --remove-claude-usage") {
+		t.Fatalf("install output:\n%s", out)
+	}
+	data, err := os.ReadFile(script)
+	info, statErr := os.Stat(script)
+	if err != nil || statErr != nil || string(data) != claudeUsageCaptureScript || info.Mode().Perm() != 0o755 {
+		t.Fatalf("installed capture command: %v %v %v", err, statErr, info)
+	}
+	want := map[string]any{"type": "command", "command": script}
+	if got := statusLineOf(t, s.p.claudeSettings); !reflect.DeepEqual(got, want) {
+		t.Fatalf("statusLine %v, want %v", got, want)
+	}
+	// The settings as they were before Tailterm first changed them are kept,
+	// and everything the user had is still there.
+	if backup, err := os.ReadFile(s.p.claudeSettings + hostBackupSuffix); err != nil || string(backup) != userClaudeSettings {
+		t.Fatalf("settings backup: %v\n%s", err, backup)
+	}
+	doc := decodeJSONFile(t, s.p.claudeSettings)
+	if doc["model"] != "opus" || fmt.Sprint(doc["big"]) != "12345678901234567890" || doc["permissions"] == nil {
+		t.Fatalf("user settings lost: %v", doc)
+	}
+	s.requireCanonicalHooks()
+
+	// A second run changes nothing.
+	s.calls()
+	before := s.tree()
+	out = s.mustRun("--from", source)
+	if after := s.tree(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("a re-run changed files:\nbefore %v\nafter  %v", before, after)
+	}
+	if !strings.Contains(out, "current    claude-usage   "+script+" is the statusLine in "+s.p.claudeSettings) {
+		t.Fatalf("re-run output:\n%s", out)
+	}
+	if out, code := s.run("--check", "--from", source); code != 0 || !strings.Contains(out, "current    claude-usage") {
+		t.Fatalf("check of a current host (exit %d):\n%s", code, out)
+	}
+
+	// Outdated: an older version of the command is installed.
+	s.write(script, "#!/bin/sh\n# an older capture\nexit 0\n", 0o755)
+	before = s.tree()
+	out, code = s.run("--check", "--from", source)
+	if code != 1 || !strings.Contains(out, "outdated   claude-usage   would update "+script) || !reflect.DeepEqual(before, s.tree()) {
+		t.Fatalf("check of an outdated command (exit %d):\n%s", code, out)
+	}
+	if out = s.mustRun("--from", source); !strings.Contains(out, "updated    claude-usage   "+script) {
+		t.Fatalf("update output:\n%s", out)
+	}
+	if data, _ := os.ReadFile(script); string(data) != claudeUsageCaptureScript {
+		t.Fatal("the outdated command was not replaced")
+	}
+	// A command that lost its execute bit is outdated too.
+	if err := os.Chmod(script, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, code = s.run("--check", "--from", source); code != 1 || !strings.Contains(out, "outdated   claude-usage") {
+		t.Fatalf("check of a non-executable command (exit %d):\n%s", code, out)
+	}
+	s.mustRun("--from", source)
+	if info, _ := os.Stat(script); info.Mode().Perm() != 0o755 {
+		t.Fatalf("command mode %v", info.Mode())
+	}
+
+	// Missing: the command is gone though its entry is there, and the entry
+	// is gone though the command is there.
+	if err := os.Remove(script); err != nil {
+		t.Fatal(err)
+	}
+	if out, code = s.run("--check", "--from", source); code != 1 || !strings.Contains(out, "missing    claude-usage   would install "+script) {
+		t.Fatalf("check with the command removed (exit %d):\n%s", code, out)
+	}
+	s.mustRun("--from", source)
+	withoutEntry := decodeJSONFile(t, s.p.claudeSettings)
+	delete(withoutEntry, "statusLine")
+	raw, _ := json.Marshal(withoutEntry)
+	s.write(s.p.claudeSettings, string(raw), 0o600)
+	if out, code = s.run("--check", "--from", source); code != 1 || !strings.Contains(out, "missing    claude-usage   would set "+script+" as the statusLine in "+s.p.claudeSettings) {
+		t.Fatalf("check with the entry removed (exit %d):\n%s", code, out)
+	}
+	if out = s.mustRun("--from", source); !strings.Contains(out, "updated    claude-usage") || !reflect.DeepEqual(statusLineOf(t, s.p.claudeSettings), want) {
+		t.Fatalf("entry restored:\n%s", out)
+	}
+	// The backup is still the file as it was before the first change.
+	if backup, _ := os.ReadFile(s.p.claudeSettings + hostBackupSuffix); string(backup) != userClaudeSettings {
+		t.Fatal("a later run replaced the settings backup")
+	}
+	var report hostReport
+	out = s.mustRun("--check", "--from", source, "--json")
+	if err := json.Unmarshal([]byte(out[:strings.LastIndex(out, "}")+1]), &report); err != nil || report.Paths["claudeUsageScript"] != script {
+		t.Fatalf("json report paths %v %v", report.Paths, err)
+	}
+}
+
+// a18: a different existing statusLine is left byte-identical and reported as
+// a conflict showing its value; nothing of the capture is written.
+func TestHostSetupClaudeUsageConflict(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	source := s.artifact("tt-v1")
+	// The hooks are installed first, so the only thing left to change is the
+	// status line.
+	s.mustRun("--from", source)
+	s.mustRun("--remove-claude-usage")
+	doc := decodeJSONFile(t, s.p.claudeSettings)
+	doc["statusLine"] = map[string]any{"type": "command", "command": "~/bin/my-status --fancy", "padding": 0}
+	raw, _ := json.MarshalIndent(doc, "", "    ")
+	settings := string(raw) + "\n"
+	s.write(s.p.claudeSettings, settings, 0o600)
+	before := s.tree()
+	for _, args := range [][]string{{"--check", "--from", source}, {"--from", source}} {
+		out, code := s.run(args...)
+		if code != 1 || !strings.Contains(out, "conflict   claude-usage   "+s.p.claudeSettings+" already has a different statusLine, left unchanged: ") ||
+			!strings.Contains(out, `"command":"~/bin/my-status --fancy"`) || !strings.Contains(out, "Claude usage is not captured on this host") {
+			t.Fatalf("%v with another statusLine (exit %d):\n%s", args, code, out)
+		}
+		if got, _ := os.ReadFile(s.p.claudeSettings); string(got) != settings {
+			t.Fatalf("%v changed the settings:\n%s", args, got)
+		}
+		if exists(s.p.claudeUsageScript) || !reflect.DeepEqual(before, s.tree()) {
+			t.Fatalf("%v wrote files beside a different statusLine", args)
+		}
+	}
+	// Removal leaves a different status line alone and says so.
+	out := s.mustRun("--remove-claude-usage")
+	if !strings.Contains(out, "current    claude-usage   the capture status line was not installed; a different statusLine is set and was left unchanged: ") || !strings.Contains(out, "my-status") {
+		t.Fatalf("removal beside another statusLine:\n%s", out)
+	}
+	if got, _ := os.ReadFile(s.p.claudeSettings); string(got) != settings || !reflect.DeepEqual(before, s.tree()) {
+		t.Fatal("removal changed files beside a different statusLine")
+	}
+	// A statusLine that only mentions the capture command is still different.
+	doc["statusLine"] = map[string]any{"type": "command", "command": s.p.claudeUsageScript + " | tee /dev/null"}
+	raw, _ = json.Marshal(doc)
+	s.write(s.p.claudeSettings, string(raw), 0o600)
+	if out, code := s.run("--check", "--from", source); code != 1 || !strings.Contains(out, "conflict   claude-usage") {
+		t.Fatalf("a wrapping statusLine (exit %d):\n%s", code, out)
+	}
+}
+
+// a18: one command removes the capture status line and its command, and
+// nothing else; it takes no other option.
+func TestHostSetupClaudeUsageRemove(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	s.write(s.p.claudeSettings, userClaudeSettings, 0o600)
+	source := s.artifact("tt-v1")
+	s.mustRun("--from", source)
+	withCapture := decodeJSONFile(t, s.p.claudeSettings)
+	s.calls()
+	out := s.mustRun("--remove-claude-usage")
+	if !strings.Contains(out, "removed    claude-usage   removed "+s.p.claudeUsageScript+" and its statusLine entry in "+s.p.claudeSettings) || !strings.Contains(out, "host remove-claude-usage: ok") {
+		t.Fatalf("removal output:\n%s", out)
+	}
+	if exists(s.p.claudeUsageScript) {
+		t.Fatal("the capture command was left behind")
+	}
+	after := decodeJSONFile(t, s.p.claudeSettings)
+	if _, set := after["statusLine"]; set {
+		t.Fatalf("statusLine left behind: %v", after["statusLine"])
+	}
+	delete(withCapture, "statusLine")
+	if !reflect.DeepEqual(after, withCapture) {
+		t.Fatalf("removal changed other settings:\n%v\n%v", after, withCapture)
+	}
+	s.requireCanonicalHooks()
+	// Nothing else ran: no service command, and tt itself is still installed.
+	if calls := s.calls(); len(calls) != 0 || !exists(s.p.install) {
+		t.Fatalf("removal ran %q", calls)
+	}
+	before := s.tree()
+	if out = s.mustRun("--remove-claude-usage"); !strings.Contains(out, "current    claude-usage   the capture status line was not installed") || !reflect.DeepEqual(before, s.tree()) {
+		t.Fatalf("a second removal:\n%s", out)
+	}
+	for _, args := range [][]string{{"--remove-claude-usage", "--check"}, {"--remove-claude-usage", "--rollback"}, {"--remove-claude-usage", "--from", source}, {"--remove-claude-usage", "--hub", s.hubURL}, {"--remove-claude-usage", "--service", "agent"}} {
+		if out, code := s.run(args...); code != 2 || !strings.Contains(out, "--remove-claude-usage takes no other option but --json") {
+			t.Fatalf("%v (exit %d):\n%s", args, code, out)
+		}
+	}
+	// Host setup installs it again.
+	if out = s.mustRun("--from", source); !strings.Contains(out, "installed  claude-usage") || !exists(s.p.claudeUsageScript) {
+		t.Fatalf("install after removal:\n%s", out)
+	}
+}
+
+// a18: without the Claude runtime the step is not needed and writes nothing.
+func TestHostSetupClaudeUsageWithoutClaude(t *testing.T) {
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	hostSetupRuntimes = func() []string { return []string{"codex"} }
+	out := s.mustRun("--from", s.artifact("tt-v1"))
+	if !strings.Contains(out, "current    claude-usage   claude runtime not installed; usage capture not needed") || exists(s.p.claudeUsageScript) || exists(s.p.claudeSettings) {
+		t.Fatalf("a host without claude:\n%s", out)
+	}
+}
+
+// a18: the installed command, fed a sample status JSON on stdin, prints
+// nothing and writes a file the reader parses. It runs under the sandbox
+// home only.
+func TestHostSetupClaudeUsageCommandCaptures(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("the capture command needs python3, which this host lacks")
+	}
+	s := newHostSandbox(t, "home")
+	s.holdRelayLock()
+	s.mustRun("--from", s.artifact("tt-v1"))
+	capture := claudeUsageCapturePath()
+	if !strings.HasPrefix(capture, s.home+string(filepath.Separator)) {
+		t.Fatalf("capture file %s is outside the sandbox home", capture)
+	}
+	run := func(stdin string) string {
+		t.Helper()
+		cmd := exec.Command(s.p.claudeUsageScript)
+		cmd.Env = []string{"HOME=" + s.home, "PATH=" + os.Getenv("PATH")}
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("capture command: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	sample := `{"session_id":"s","model":{"id":"claude-opus-5-5","display_name":"Opus"},"version":"2.1.292","workspace":{"current_dir":"/work"},
+ "rate_limits":{"five_hour":{"used_percentage":13,"resets_at":1791470000},"seven_day":{"used_percentage":37.5,"resets_at":1791970000}}}`
+	started := time.Now().Add(-2 * time.Second)
+	if out := run(sample); out != "" {
+		t.Fatalf("the capture command printed %q", out)
+	}
+	got := readClaudeUsageCapture(capture)
+	if got.State != api.ProviderUsageOK || got.Version != "2.1.292" || len(got.Windows) != 2 || got.Windows[0].UsedPercent != 13 || got.Windows[1].UsedPercent != 37.5 ||
+		got.Windows[0].ResetsAt != time.Unix(1791470000, 0).UTC().Format(time.RFC3339) || got.CapturedAt.Before(started) || got.CapturedAt.After(time.Now().Add(2*time.Second)) {
+		t.Fatalf("captured reading %+v", got)
+	}
+	// Only the fields the budget needs are saved.
+	saved := decodeJSONFile(t, capture)
+	if len(saved) != 3 || saved["rate_limits"] == nil || saved["capturedAt"] == nil || saved["version"] != "2.1.292" {
+		t.Fatalf("capture file %v", saved)
+	}
+	// Input that is not a status object leaves the last capture in place.
+	for _, bad := range []string{"", "not json", "[1,2]"} {
+		if out := run(bad); out != "" {
+			t.Fatalf("the capture command printed %q for %q", out, bad)
+		}
+		if again := readClaudeUsageCapture(capture); again.State != api.ProviderUsageOK || !again.CapturedAt.Equal(got.CapturedAt) {
+			t.Fatalf("after %q: %+v", bad, again)
+		}
+	}
+	// A status without rate limits is saved, and read as malformed: unknown.
+	if out := run(`{"version":"2.1.292"}`); out != "" || readClaudeUsageCapture(capture).State != api.ProviderUsageMalformed {
+		t.Fatalf("a status without rate limits: %q %+v", out, readClaudeUsageCapture(capture))
+	}
+	entries, _ := os.ReadDir(filepath.Dir(capture))
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("the capture command left a temporary file: %s", entry.Name())
 		}
 	}
 }

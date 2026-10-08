@@ -109,7 +109,7 @@ Known limits: a long open turn is invisible until it ends; a transitive wait (a 
 
 ## Token estimate and budget
 
-Feature `wi_899863352c81e3b0`, revision 1, owner order #28848; builder assignment #28954. Phase 1 of the token guardrails: each work item can carry a token estimate, shown against what the item actually used. Phase 2 adds a [warning](#warning) when an item passes a multiple of its estimate. Nothing holds or pauses on it.
+Feature `wi_899863352c81e3b0`, revision 1, owner order #28848; builder assignment #28954. Phase 1 of the token guardrails: each work item can carry a token estimate, shown against what the item actually used. Phase 2 adds a [warning](#warning) when an item passes a multiple of its estimate. Neither holds nor pauses anything; phase 3, the [token budget](#token-budget), does.
 
 ### Set an estimate
 
@@ -202,9 +202,133 @@ A line with `entry` is a warning on that entry's team: `team actual` and the rat
 
 Over HTTP it is `GET` and `PUT /v1/tasks/{id}/usage/warning` with `{"threshold":"2"}`. A saved level of `1.5` reads as set, not as the default.
 
+A warning compares only an estimate saved on the item: an item admitted on a [lane default](#lane-defaults) never warns. The team is counted from the entry's admission, not its enqueue ([Hold past 3 times](#hold-past-3-times)).
+
 **A warning never blocks usage.** The check runs inside the upload's transaction, after its turns are stored, with each item's warning in its own savepoint. If anything in a warning fails (a read, a post, the record), all of that item's warning is rolled back: no message, receipt, obligation, wake job or record remains. The upload still commits, and the next new or revised turn for the item tries again. Such a failure is not reported anywhere. Only a cancelled request or a failing savepoint statement fails the upload.
 
 **Storage.** `usage_entry_warnings` holds one row per item, queue entry and estimate value: the level, the team figure and the lifetime figure with their states at the crossing, both recipients and their message numbers, and the time. `usage_budget_warnings` holds the warnings recorded before entries were compared, one row per item and estimate value with the lifetime figure that was compared then; it is read for the list and never written, and no row of it is copied, changed or deleted. `usage_warning_settings` holds one row per project that set a level. All three are additive, and an older binary ignores the ones it does not know. An entry that was already running at the upgrade has no row in the new table, so it warns once if its team is past the level at its next new or revised turn, even if the item warned before under the old rule.
+
+## Token budget
+
+Feature `wi_1d2fbde2c149989e`, revision 4, owner order #30088 with clarifications #30095 and #30120 and path decision #30165; builder assignment #30197. Phase 3 of the token guardrails. It delivers `wi_eed9581348ad7f40` (team tokens counted from admission) as part of the hold. Two things are added, and neither interrupts a turn, closes a session or refuses a write:
+
+- **Admission.** A queued team is admitted only when the remaining budget covers its estimate plus a reserve. Otherwise it stays queued with a stated reason, so no team is cut off mid-item. A running team is never touched by the budget.
+- **Hold.** A running team that has spent more than 3 times its item's **saved** estimate is held: no new turn is started for it, and the owner helper is asked to continue or stop.
+
+With no budget row the queue admits exactly as before, and `tt usage budget get` prints `Token budget: not configured`. The hold does not depend on a budget row.
+
+### Budget rows
+
+```
+tt usage budget set --runtime claude --window five_hour --allowance 200000000 --reserve 10
+tt usage budget set --runtime claude --window seven_day --allowance 900000000 --reserve 10
+tt usage budget get [--host H]
+tt usage budget clear --runtime claude --window five_hour
+```
+
+A row is per project, runtime (`codex` or `claude`) and provider window (`five_hour` or `seven_day`).
+
+- `--allowance` is required: **the tokens that 100 percent of that window represents.** A provider percentage is converted with it, so the estimate is always compared in tokens. There is no percent-only mode.
+- `--reserve` is the percent of the allowance, 0 to 90, kept back from admission.
+- `--reset-at` is an optional reset instant (RFC 3339). It is used only when no provider reading gives one, and rolls forward by whole windows.
+- `--stale` is how old a provider reading may be and still decide, 15 minutes unless set. Keep it above the clock difference you expect between the agent host and the hub.
+
+The owner, the owner helper and a database handler of the project may set or clear a row; any other agent is refused with "only the owner, the owner helper or a database handler sets the token budget". A missing or zero allowance, an unknown runtime or window, a reserve above 90 and a malformed reset time are refused with the value named. `get` prints each row with the source in use for a host (this host unless `--host` names another), the remaining tokens, the reset time and, when the provider reading is not the source, why. Over HTTP it is `GET`, `PUT` and `DELETE /v1/tasks/{id}/usage/budget`.
+
+### Sources
+
+For each row, admission uses the first source that applies. Remaining is before the reserve is taken off.
+
+1. **Provider reading.** The reading reported for the entry's host is `ok`, not older than the staleness bound, and its reset is still ahead. Remaining is the allowance times the unused percentage; the reset is the reading's.
+2. **Allowance, reset from the reading.** The reading is `ok` but stale, or its reset has passed. Remaining is the allowance minus the project's reported tokens of that runtime since the window start. The window start is the reading's reset minus the window length while that reset is ahead; once it has passed it is that reset, or the window length ago if that is later. A passed reset is never counted as zero use.
+3. **Allowance, owner reset.** There is no `ok` reading (never reported, or invalidated) and the row has `--reset-at`. The window start is the latest reset that is not after now.
+4. **None.** The entry is held. Unknown is never treated as plenty.
+
+The fit is `remaining − allowance × reserve ÷ 100 ≥ estimate`, and an entry must fit **every** row of the project. The check is recomputed at every claim and every list, so a reset, a new reading, a changed row or changed lane defaults admits a held entry with no other action.
+
+### Admission reasons
+
+A held entry shows one of these as its `blockReason` in `tt team queue list`, when nothing earlier (slots, host capacity, the agent cap, a handler) already explains the wait:
+
+- `Token budget (claude five_hour): needs about 44.00M tokens (default, planned); 31.20M remain before the reset at 2026-10-08T22:00:00Z, reserve 10% (source: provider reading)`
+- `Token budget (codex five_hour): needs about 750.00K tokens; 800.00K remain before the reset at …, reserve 10% (source: allowance minus reported usage; provider reading for host mini is stale (captured …))`. The reading part reads `is stale (captured T)`, `has a reset that passed at T`, `is not reported`, `is missing`, `is unreadable` or `is malformed`.
+- `Token budget (claude five_hour): no usable source. Provider reading for host mini is not reported and no reset time is set` (or `is missing`, `is unreadable`, `is malformed`).
+- `Token budget: no estimate and no lane default; set one with tt usage defaults set`
+
+`(default, planned)` or `(default, planned, Go race)` after the figure means the item has no saved estimate and a lane default was compared.
+
+### Lane defaults
+
+```
+tt usage defaults set --small 18000000 --small-race 17000000 --planned 44000000 --planned-race 70000000
+tt usage defaults get
+```
+
+An item with no saved estimate is compared with its lane default: the figure for the entry's template (`small` or `planned`) and for whether its verification includes the Go race check. The four figures are a per-project setting, not constants in the code; the backlog steward recomputes them from `tt usage --calibration` and sets them again. The same three kinds of caller as for a budget row may set them. Over HTTP it is `GET` and `PUT /v1/tasks/{id}/usage/defaults`.
+
+**With Go race** follows the verification matrix: a path under `hub/` selects the Go group, which always runs the race check. So an entry is with Go race when any owned path is `hub` or starts with `hub/` (a file such as `hub/go.mod`, or a directory such as `hub/internal/store`), and when it declares no ownership at all, because a serial or unscoped entry is verified against everything. An entry that owns only other paths, docs for example, is without.
+
+A lane default is labelled in the queue list (`default estimate 70.00M (planned, Go race)`, JSON `estimateDefault`), and it is used for admission only. **It never warns at 1.5 times and never holds at 3 times**: both compare only an estimate saved on the item.
+
+### Hold past 3 times
+
+When a usage upload changes an item's attributed tokens and the team of its running queue entry has spent **strictly more than 3 times** the item's saved estimate, the hub records one hold for that entry and estimate value. At exactly 3 times there is none.
+
+- **What is counted.** The same figure the [warning](#warning) compares: runs bound to the item by agents with no project role, **bound at or after the entry's admission** (its claim for launch, `admittedAt`), not its enqueue. An agent bound while the entry waited in the queue is not counted. The database handler, backlog steward, deployment agent and owner helper carry a role, so they are neither counted nor held. An entry admitted before the admission time was recorded takes its launch reservation's time at the upgrade, and one without a reservation is read from its creation, as before.
+- **What it does.** The hub refuses nothing: a held agent's posts, acknowledgements, work-item writes and usage uploads are stored, so a turn in progress and any write finish. Wakes are withheld in two places. The hub's wake-job lease returns no job for a held run, so nothing is written and the job stays due; it is leased on the first attempt after the hold is lifted. This binds every relay, on any host and version. And before the relay delivers an inbox wake it asks the hub, fresh every time, whether that exact run is held, and if so delivers nothing; `tt relay --status` shows `skip="team held past 3 times its token estimate"`, and the withheld attempt does not count toward the wake limit. A job leased before the hold existed is still delivered, and a lease that expires during the hold is not renewed. The relay's stalled-turn pass is skipped for a run whose last inbox attempt was withheld, so that a held team's quiet turn is not treated as a stall; the relay makes no read to learn of a hold it has not met on the inbox path, so a held run that only ever had broker wakes still gets the usual stall handling.
+- **The ask.** One `question` to the owner helper, subject "A team has passed three times its token estimate and is held", from `system` / `usage-hold`, with the item, entry, estimate, team tokens and both commands. It obliges an answer: the owner helper runs `tt ack SEQ`, acts, then answers it with `tt send --kind answer --reply-to SEQ`. Until it is acknowledged the helper's other posts are refused after the usual grace period. With no owner helper the Board gets a notice with the same figures and `escalation=owner`.
+- **Once.** There is no second hold or ask for the same entry and estimate value, however often uploads repeat or replay. Like a warning, a failed hold leaves the upload stored and nothing of the hold behind, and the next new or revised turn tries again.
+- **The list.** `tt team queue list` prints a `held:` line under the entry, and its reason starts `Held past 3 times its token estimate`. `tt usage hold list` lists the holds. A queued entry that waits behind a held team shows `Waits behind entry tqe_…, held past 3 times its token estimate until the owner helper continues or stops it` instead of a stall, and no stall notice is posted for it.
+
+**Continue.**
+
+```
+tt usage hold continue --project PROJECT_ID --entry tqe_ID
+```
+
+Only the owner, with no agent identity, or the project's owner helper may; anyone else gets "only the owner or the owner helper continues a held team". The hub leases the team's due jobs again and the relay delivers again on its next pass. Continue writes no estimate. To arm the hold again, have the handler save a larger one (`tt work-items update --estimate-tokens`): the team is then held when it passes 3 times the new value. Without a new estimate the entry is never held again at that value.
+
+**Stop.**
+
+```
+tt team queue fail --task PROJECT_ID --entry tqe_ID --reason TEXT
+```
+
+Stop is the existing owner fail of the entry. Run it from an **unbound owner shell**: the CLI refuses owner-side queue changes from a session that carries an agent identity, the owner helper's included. The entry becomes `failed` with the reason, the usual "Team queue failed and requires owner action" notice is posted, and the hold is resolved as stopped in the same step. The stopped team still starts no new turn: its runs stay listed as held while the entry is failed and not released. What follows is the ordinary failed-entry cleanup. The list shows `Failed; N item-bound runs are still live or uncleaned`; close the members with `tt close NAME` on their host, close the lead by the owner's team close once its open obligations are answered or cancelled, and the runner releases the entry. The team's own close is not the stop: only the item lead may run it, it refuses while team obligations are open, and a held lead is not woken to run it.
+
+A hold also ends, as stopped, when its entry finishes, is released, is recorded as owner-integrated or its team closes with the item open. Over HTTP the holds are `GET /v1/tasks/{id}/usage/holds`; with `?agent=AGENT&run=RUN` the answer says only whether that exact run is held. Continue is the `budget_continue` operation of `POST /v1/tasks/{id}/team-queue/actions`, with `agentId` naming an agent caller.
+
+### Provider reading
+
+Claude Code gives its status line command the account's rate limits. `tt host setup` installs a capture-only status line ([host-setup.md](host-setup.md#claude-usage-capture)) that saves them to `~/.local/state/tailterm/claude-usage.json` and prints nothing. The relay on that host reads the file every pass and reports it to the hub at once when its state, a percentage or a reset differs from its last report. Claude Code rewrites the file every few seconds with the same figures; that is not a change, and while it goes on the relay sends one keep-fresh report at most every 5 minutes, so the hub can tell a live reading from a stale one. Keep a row's `--stale` above 5 minutes for that reason. A capture time or file time that moved alone is never a reason to report, a missing file is not reported when no good reading ever was, and the last report is kept in the relay state directory, so a restarted relay does not send it again. The hub keeps the reading by host and runtime, and admission reads the rows for the entry's host.
+
+A file that is missing, unreadable or malformed (not JSON, no capture time, no `rate_limits`, or a window without a numeric `used_percentage` from 0 to 100 and a `resets_at`) is reported too, as an **invalidation**: the hub overwrites both windows with that state and no figure, so nothing of the earlier reading remains. Admission then uses the allowance source, or holds with the no-source reason. `GET /v1/provider-usage?host=H` shows what the hub holds; the relay writes with `PUT /v1/provider-usage`.
+
+The file is refreshed only while some Claude Code session on the host is active. A quiet host therefore goes stale, and admission falls to the allowance source, which sees only this project's reported usage.
+
+### Rollout
+
+Nothing is enforced until step 3. After the release, in this order:
+
+1. On each agent host run `tt host setup`, then `tt host setup --check`. On a host where the capture status line was installed by hand with the same command, this takes it over.
+2. `tt usage defaults set --project PROJECT_ID --small 18000000 --small-race 17000000 --planned 44000000 --planned-race 70000000` (the owner's figures in order #30088), then `tt usage defaults get`. The steward repeats this with recomputed figures.
+3. `tt usage budget set --project PROJECT_ID --runtime claude --window five_hour --allowance N --reserve 10`, and the `seven_day` row. To calibrate N, divide the project's reported Claude tokens over a recent window by the change in `used_percentage` the capture file showed over the same time. Then read `tt usage budget get` and `tt team queue list` before relying on the reasons.
+4. To switch admission off again, `tt usage budget clear` each row.
+
+An entry that is already running at the upgrade is held at once if its team is past 3 times a saved estimate, so the owner helper may be asked on the day of the deploy.
+
+### Limits
+
+- **Every row applies to every entry**, whatever runtime its team uses. A Claude row holds a Codex team too; set rows only for runtimes that teams spend. Every reason names the runtime and window.
+- **A held entry is passed at the head.** Like an entry waiting for a rebind it does not hold the queue, so a later entry that fits launches first, and a large item can be passed by smaller ones until the budget covers it. The claim of a held entry gets the quiet "not queue head" answer.
+- **Codex has no provider reading.** The reading is the Claude capture only; a Codex row uses the allowance source, with `--reset-at`.
+- The pause multiple is 3 and is not a setting.
+- The allowance source counts reported usage of this project only, and reads the window's stored requests at each claim and list.
+- **Relay requests.** The broker path adds none: the lease itself answers for a held run. The inbox path adds one read, fresh and never cached, only immediately before a delivery to an agent with no project role. The provider usage report goes out when a figure changed and otherwise at most every 5 minutes while the file is still being rewritten. A pass with nothing to deliver and no changed reading makes no added request.
+
+### Storage
+
+`usage_budgets` holds one row per project, runtime and window; `usage_provider_readings` one per host, runtime and window; `usage_estimate_defaults` one per project; `team_queue_budget_holds` one per project, entry and estimate value, with its state (`held`, `continued`, `stopped`), the compared figure, the ask and who resolved it. `team_queue_entries` gains `admitted_at`. All are additive and an older binary ignores them.
 
 ## Verification boundary
 
@@ -223,3 +347,5 @@ Token estimates add store tests for the unchanged revision and revision-bound re
 Token estimate warnings add store tests on isolated databases for the crossing (at the level and one token past it), no estimate, replayed and repeated uploads, a raised estimate, an item without a team, a project with no recipient yet, the per-project level and its refusals, three injected faults that must leave the upload stored and nothing of the warning behind, wake and delivery of the notice, a retired owner helper, a batch of unchanged turns, and a shared partial request. One server test covers the two routes and one CLI test runs `tt usage warning` against a real hub over HTTP.
 
 The compared-figure correction (`wi_12d5c1ef9a73ceae`) moves those cases onto a running entry with a bound team member, admitted on a whole second with its team bound half a second later, and adds store tests for an item with large earlier tokens and a team below, at and past the level; turns by an unbound agent, a bound database handler, backlog steward and owner helper, and an agent bound before the entry; an item with no running entry; a second entry on the same item and estimate, with the first entry's team and an agent bound between the two still spending; and a database holding an earlier `usage_budget_warnings` row, closed and reopened. CLI tests cover both warning line forms, the `this team` budget forms, and `tt usage warning get` and `tt usage --item` against a real hub over HTTP with and without a running entry.
+
+The token budget adds store tests on isolated databases with an injected clock for budget rows and their refusals, each source at both sides of the staleness bound and of a reset, an invalidation, lane defaults and the Go race rule, admission that fits, does not fit, fits after a reset and after a changed row, a held head passed by a later entry, a project with no row, the hold at exactly 3 times and one token past it, replayed uploads, two injected faults, acknowledge then answer, continue, stop by entry fail with open lead obligations, the excluded roles, an agent bound before admission through the store's own queue calls, and the two stall cases. Server and CLI tests run every route and `tt usage budget`, `defaults` and `hold` against a real hub over HTTP. Store tests cover the lease guard: a due job before, during and after a hold, a job leased before it, an expired lease, another run id, a stopped team and a bound role agent. Relay tests cover the inbox gate with a fake hub and a recording queue function, and the capture reader and report rule with fake files under a temporary home; the pinned relay request counts are unchanged. No test starts or pauses an agent, and none opens the real `~/.claude/settings.json` or state file.

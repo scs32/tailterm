@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -51,6 +54,21 @@ func migrateUsage(db *sql.DB) error {
  PRIMARY KEY(task_id,item_id,entry_id,estimate_tokens));
  CREATE TABLE IF NOT EXISTS usage_warning_settings(
  task_id TEXT PRIMARY KEY,threshold TEXT NOT NULL,updated_at TEXT NOT NULL,
+ by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '');
+ CREATE TABLE IF NOT EXISTS usage_budgets(
+ task_id TEXT NOT NULL,runtime TEXT NOT NULL,window TEXT NOT NULL,
+ allowance_tokens INTEGER NOT NULL CHECK(allowance_tokens>0),reserve_percent INTEGER NOT NULL,
+ reset_at TEXT NOT NULL DEFAULT '',stale_seconds INTEGER NOT NULL DEFAULT 900,updated_at TEXT NOT NULL,
+ by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(task_id,runtime,window));
+ CREATE TABLE IF NOT EXISTS usage_provider_readings(
+ host TEXT NOT NULL,runtime TEXT NOT NULL,window TEXT NOT NULL,state TEXT NOT NULL,
+ used_percent TEXT NOT NULL DEFAULT '',resets_at TEXT NOT NULL DEFAULT '',captured_at TEXT NOT NULL DEFAULT '',
+ reported_at TEXT NOT NULL,version TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(host,runtime,window));
+ CREATE TABLE IF NOT EXISTS usage_estimate_defaults(
+ task_id TEXT PRIMARY KEY,small_tokens INTEGER NOT NULL,small_race_tokens INTEGER NOT NULL,
+ planned_tokens INTEGER NOT NULL,planned_race_tokens INTEGER NOT NULL,updated_at TEXT NOT NULL,
  by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '');
  ` + usageSpansSchema)
 	return err
@@ -250,6 +268,10 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	if err != nil {
 		return zero, err
 	}
+	held, err := s.holdTokenBudgets(ctx, tx, task, touched)
+	if err != nil {
+		return zero, err
+	}
 	if err = storeUsageSpans(ctx, tx, task, agent, b.RunID, b.Spans, provenance); err != nil {
 		return zero, err
 	}
@@ -266,12 +288,502 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	if err = tx.Commit(); err != nil {
 		return api.UsageReceipt{}, err
 	}
-	if warned {
-		// A warning notice was committed: wake event waiters, as a post does.
+	if warned || held {
+		// A warning notice or a hold with its ask was committed: wake event
+		// waiters, as a post does.
 		s.notify(task)
 	}
 	return zero, nil
 }
 func usageInvalid(reason string) error {
 	return fmt.Errorf("%w: usage %s", api.ErrInvalid, strings.TrimSpace(reason))
+}
+
+// usageBudgetWindows lists the budget windows in a stable order.
+var usageBudgetWindows = []string{api.UsageWindowFiveHour, api.UsageWindowSevenDay}
+
+func usageBudgetRuntime(runtime string) bool { return runtime == "codex" || runtime == "claude" }
+
+// usageProjectExists refuses an unknown project.
+func usageProjectExists(ctx context.Context, q queryRower, task string) error {
+	var n int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM tasks WHERE id=?`, task).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return api.ErrNotFound
+	}
+	return nil
+}
+
+// usageSettingsWriter allows the owner (no agent identity), the project's
+// owner helper and its database handlers to change what the token budget
+// compares; any other agent is refused with a named reason.
+func usageSettingsWriter(ctx context.Context, tx *sql.Tx, task, agent, what string) error {
+	if agent == "" {
+		return nil
+	}
+	helper, ok, err := currentOwnerHelper(ctx, tx, task)
+	if err != nil {
+		return err
+	}
+	if ok && helper.ID == agent {
+		return nil
+	}
+	var role, status string
+	err = tx.QueryRowContext(ctx, `SELECT role,status FROM agents WHERE task_id=? AND id=?`, task, agent).Scan(&role, &status)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && role == api.AgentRoleDatabaseHandler && status != api.AgentClosed && status != api.AgentExited && status != api.AgentRetired {
+		return nil
+	}
+	return workItemConflict("only the owner, the owner helper or a database handler sets " + what)
+}
+
+// usageBudgetRow is one stored budget row.
+type usageBudgetRow struct {
+	api.UsageBudget
+	resetAt time.Time
+}
+
+func loadUsageBudgetRows(ctx context.Context, q queryRower, task string) ([]usageBudgetRow, error) {
+	rows, err := q.QueryContext(ctx, `SELECT runtime,window,allowance_tokens,reserve_percent,reset_at,stale_seconds,updated_at,by_agent,by_node,by_user FROM usage_budgets WHERE task_id=? ORDER BY runtime,window`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []usageBudgetRow{}
+	for rows.Next() {
+		var r usageBudgetRow
+		if err := rows.Scan(&r.Runtime, &r.Window, &r.AllowanceTokens, &r.ReservePercent, &r.ResetAt, &r.StaleSeconds, &r.UpdatedAt, &r.UpdatedBy.AgentID, &r.UpdatedBy.Node, &r.UpdatedBy.User); err != nil {
+			return nil, err
+		}
+		r.resetAt = parseTS(r.ResetAt)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// usageBudgetState is what admission uses for one budget row now.
+type usageBudgetState struct {
+	row       usageBudgetRow
+	source    string
+	remaining *big.Rat // nil when the source is none
+	reset     time.Time
+	// reading says why the provider reading is not the source; empty when it is.
+	reading string
+}
+
+// usageRuntimeTokensSince sums the project's reported tokens of one runtime in
+// turns at or after an instant. The stored instant text drops trailing zeros
+// and does not sort within a second, so the query takes the whole second and
+// the instants are compared as times.
+func usageRuntimeTokensSince(ctx context.Context, q queryRower, task, runtime string, since time.Time) (int64, error) {
+	rows, err := q.QueryContext(ctx, `SELECT projection FROM usage_turns WHERE task_id=? AND at>=?`, task, since.UTC().Format("2006-01-02T15:04:05"))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var total int64
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return 0, err
+		}
+		var p struct {
+			Turn struct {
+				Runtime string           `json:"runtime"`
+				At      time.Time        `json:"at"`
+				Tokens  map[string]int64 `json:"tokens"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(raw, &p) != nil || p.Turn.Runtime != runtime || p.Turn.At.Before(since) {
+			continue
+		}
+		for _, class := range api.UsageClasses {
+			total += p.Turn.Tokens[class]
+		}
+	}
+	return total, rows.Err()
+}
+
+// usageBudgetStatus computes, for each budget row of the project, what
+// admission on a host would use now. The first source that applies wins:
+//
+//  1. provider: the host's reading is ok, not older than the row's staleness
+//     bound and its reset is still ahead. Remaining is the allowance times the
+//     unused percentage.
+//  2. allowance, reset from the reading: the reading is ok but stale, or its
+//     reset has passed. Remaining is the allowance minus the project's
+//     reported tokens of the runtime since the window start. A passed reset is
+//     never counted as zero use.
+//  3. allowance, owner reset: no ok reading and the row has a reset instant.
+//  4. none: nothing to measure against; admission holds.
+//
+// Unknown is never treated as plenty.
+func usageBudgetStatus(ctx context.Context, q queryRower, task, host string, now time.Time) ([]usageBudgetState, error) {
+	rows, err := loadUsageBudgetRows(ctx, q, task)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	out := make([]usageBudgetState, 0, len(rows))
+	for _, row := range rows {
+		state := usageBudgetState{row: row, source: api.UsageBudgetSourceNone}
+		length := api.UsageWindowLength(row.Window)
+		allowance := big.NewRat(row.AllowanceTokens, 1)
+		var readingState, used, resets, captured string
+		err := q.QueryRowContext(ctx, `SELECT state,used_percent,resets_at,captured_at FROM usage_provider_readings WHERE host=? AND runtime=? AND window=?`, host, row.Runtime, row.Window).Scan(&readingState, &used, &resets, &captured)
+		if errors.Is(err, sql.ErrNoRows) {
+			readingState, err = "not reported", nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		percent, percentOK := new(big.Rat).SetString(used)
+		resetsAt, capturedAt := parseTS(resets), parseTS(captured)
+		usable := readingState == api.ProviderUsageOK && percentOK && !resetsAt.IsZero() && !capturedAt.IsZero()
+		var start time.Time
+		switch {
+		case usable && now.Sub(capturedAt) <= time.Duration(row.StaleSeconds)*time.Second && resetsAt.After(now):
+			state.source, state.reset = api.UsageBudgetSourceProvider, resetsAt
+			unused := new(big.Rat).Sub(big.NewRat(100, 1), percent)
+			state.remaining = unused.Mul(unused, allowance).Quo(unused, big.NewRat(100, 1))
+		case usable:
+			if resetsAt.After(now) {
+				start, state.reset = resetsAt.Add(-length), resetsAt
+				state.reading = fmt.Sprintf("is stale (captured %s)", capturedAt.UTC().Format(time.RFC3339))
+			} else {
+				start = resetsAt
+				if floor := now.Add(-length); floor.After(start) {
+					start = floor
+				}
+				state.reset = start.Add(length)
+				state.reading = fmt.Sprintf("has a reset that passed at %s", resetsAt.UTC().Format(time.RFC3339))
+			}
+		case !row.resetAt.IsZero():
+			// The latest reset_at + k windows that is not after now.
+			k := now.Sub(row.resetAt) / length
+			if now.Before(row.resetAt) && now.Sub(row.resetAt)%length != 0 {
+				k--
+			}
+			start = row.resetAt.Add(k * length)
+			state.reset = start.Add(length)
+			state.reading = "is " + readingState
+			if readingState == api.ProviderUsageOK {
+				state.reading = "is malformed"
+			}
+		default:
+			state.reading = "is " + readingState
+			if readingState == api.ProviderUsageOK {
+				state.reading = "is malformed"
+			}
+		}
+		if !start.IsZero() {
+			spent, err := usageRuntimeTokensSince(ctx, q, task, row.Runtime, start)
+			if err != nil {
+				return nil, err
+			}
+			state.source = api.UsageBudgetSourceAllowance
+			state.remaining = new(big.Rat).Sub(allowance, big.NewRat(spent, 1))
+		}
+		out = append(out, state)
+	}
+	return out, nil
+}
+
+func readUsageBudgets(ctx context.Context, q queryRower, task, host string, now time.Time) (api.UsageBudgets, error) {
+	out := api.UsageBudgets{Host: host, Budgets: []api.UsageBudget{}}
+	if !api.ValidID(task, "tsk") || len(host) > 255 {
+		return out, api.ErrInvalid
+	}
+	if err := usageProjectExists(ctx, q, task); err != nil {
+		return out, err
+	}
+	states, err := usageBudgetStatus(ctx, q, task, host, now)
+	if err != nil {
+		return out, err
+	}
+	for _, state := range states {
+		budget := state.row.UsageBudget
+		status := api.UsageBudgetStatus{Host: host, Source: state.source, Reading: state.reading}
+		if state.remaining != nil {
+			status.RemainingTokens = state.remaining.RatString()
+		}
+		if !state.reset.IsZero() {
+			status.ResetAt = ts(state.reset)
+		}
+		budget.Status = &status
+		out.Budgets = append(out.Budgets, budget)
+	}
+	out.Configured = len(out.Budgets) > 0
+	return out, nil
+}
+
+// UsageBudgets reads the project's budget rows with the source admission on
+// the named host would use now. A project with no row is not configured.
+func (s *Store) UsageBudgets(ctx context.Context, task, host string) (api.UsageBudgets, error) {
+	return readUsageBudgets(ctx, s.db, task, host, s.now())
+}
+
+// maxUsageBudgetStaleSeconds bounds a budget row's staleness setting.
+const maxUsageBudgetStaleSeconds = 24 * 60 * 60
+
+// SetUsageBudget saves one budget row. The allowance is required: the
+// estimate is always compared in tokens.
+func (s *Store) SetUsageBudget(ctx context.Context, task string, req api.UsageBudgetRequest, by api.Caller) (api.UsageBudgets, error) {
+	zero := api.UsageBudgets{}
+	if !api.ValidID(task, "tsk") || (req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) {
+		return zero, api.ErrInvalid
+	}
+	if !usageBudgetRuntime(req.Runtime) {
+		return zero, usageInvalid("budget runtime must be codex or claude")
+	}
+	if api.UsageWindowLength(req.Window) == 0 {
+		return zero, usageInvalid("budget window must be five_hour or seven_day")
+	}
+	if req.AllowanceTokens < 1 || req.AllowanceTokens > 1e15 {
+		return zero, usageInvalid("budget needs an allowance in tokens: what 100 percent of the window represents")
+	}
+	if req.ReservePercent < 0 || req.ReservePercent > 90 {
+		return zero, usageInvalid("budget reserve must be 0 to 90 percent")
+	}
+	stale := req.StaleSeconds
+	if stale == 0 {
+		stale = api.DefaultUsageBudgetStaleSeconds
+	}
+	if stale < 1 || stale > maxUsageBudgetStaleSeconds {
+		return zero, usageInvalid("budget staleness bound must be 1 second to 24 hours")
+	}
+	reset := ""
+	if req.ResetAt != "" {
+		at, err := time.Parse(time.RFC3339Nano, req.ResetAt)
+		if err != nil {
+			return zero, usageInvalid("budget reset time must be RFC 3339")
+		}
+		reset = ts(at)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	if err = usageProjectExists(ctx, tx, task); err != nil {
+		return zero, err
+	}
+	if err = usageSettingsWriter(ctx, tx, task, req.AgentID, "the token budget"); err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO usage_budgets(task_id,runtime,window,allowance_tokens,reserve_percent,reset_at,stale_seconds,updated_at,by_agent,by_node,by_user) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ ON CONFLICT(task_id,runtime,window) DO UPDATE SET allowance_tokens=excluded.allowance_tokens,reserve_percent=excluded.reserve_percent,reset_at=excluded.reset_at,stale_seconds=excluded.stale_seconds,updated_at=excluded.updated_at,by_agent=excluded.by_agent,by_node=excluded.by_node,by_user=excluded.by_user`,
+		task, req.Runtime, req.Window, req.AllowanceTokens, req.ReservePercent, reset, stale, ts(s.now()), req.AgentID, by.Node, by.User); err != nil {
+		return zero, err
+	}
+	out, err := readUsageBudgets(ctx, tx, task, "", s.now())
+	if err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	// A budget change can admit a held entry: wake the queue's waiters.
+	s.notify(task)
+	return out, nil
+}
+
+// DeleteUsageBudget clears one budget row; clearing the last one switches the
+// budget check off for the project.
+func (s *Store) DeleteUsageBudget(ctx context.Context, task string, req api.UsageBudgetRequest, by api.Caller) (api.UsageBudgets, error) {
+	zero := api.UsageBudgets{}
+	if !api.ValidID(task, "tsk") || (req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) {
+		return zero, api.ErrInvalid
+	}
+	if !usageBudgetRuntime(req.Runtime) || api.UsageWindowLength(req.Window) == 0 {
+		return zero, usageInvalid("name the budget row to clear: runtime codex or claude, window five_hour or seven_day")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	if err = usageProjectExists(ctx, tx, task); err != nil {
+		return zero, err
+	}
+	if err = usageSettingsWriter(ctx, tx, task, req.AgentID, "the token budget"); err != nil {
+		return zero, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM usage_budgets WHERE task_id=? AND runtime=? AND window=?`, task, req.Runtime, req.Window)
+	if err != nil {
+		return zero, err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return zero, api.ErrNotFound
+	}
+	out, err := readUsageBudgets(ctx, tx, task, "", s.now())
+	if err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(task)
+	return out, nil
+}
+
+func readUsageEstimateDefaults(ctx context.Context, q queryRower, task string) (api.UsageEstimateDefaults, error) {
+	var out api.UsageEstimateDefaults
+	err := q.QueryRowContext(ctx, `SELECT small_tokens,small_race_tokens,planned_tokens,planned_race_tokens,updated_at,by_agent,by_node,by_user FROM usage_estimate_defaults WHERE task_id=?`, task).
+		Scan(&out.SmallTokens, &out.SmallRaceTokens, &out.PlannedTokens, &out.PlannedRaceTokens, &out.UpdatedAt, &out.UpdatedBy.AgentID, &out.UpdatedBy.Node, &out.UpdatedBy.User)
+	if errors.Is(err, sql.ErrNoRows) {
+		return out, nil
+	}
+	out.Configured = err == nil
+	return out, err
+}
+
+// UsageEstimateDefaults reads the project's lane default estimates.
+func (s *Store) UsageEstimateDefaults(ctx context.Context, task string) (api.UsageEstimateDefaults, error) {
+	if !api.ValidID(task, "tsk") {
+		return api.UsageEstimateDefaults{}, api.ErrInvalid
+	}
+	if err := usageProjectExists(ctx, s.db, task); err != nil {
+		return api.UsageEstimateDefaults{}, err
+	}
+	return readUsageEstimateDefaults(ctx, s.db, task)
+}
+
+// SetUsageEstimateDefaults saves the four lane defaults. They are data, not
+// constants: the backlog steward recomputes them from history.
+func (s *Store) SetUsageEstimateDefaults(ctx context.Context, task string, req api.UsageEstimateDefaultsRequest, by api.Caller) (api.UsageEstimateDefaults, error) {
+	zero := api.UsageEstimateDefaults{}
+	if !api.ValidID(task, "tsk") || (req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) {
+		return zero, api.ErrInvalid
+	}
+	for _, tokens := range []int64{req.SmallTokens, req.SmallRaceTokens, req.PlannedTokens, req.PlannedRaceTokens} {
+		if tokens < 1 || tokens > api.MaxEstimateTokens {
+			return zero, usageInvalid("each lane default must be 1 to " + strconv.FormatInt(api.MaxEstimateTokens, 10) + " tokens")
+		}
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	if err = usageProjectExists(ctx, tx, task); err != nil {
+		return zero, err
+	}
+	if err = usageSettingsWriter(ctx, tx, task, req.AgentID, "the lane default estimates"); err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO usage_estimate_defaults(task_id,small_tokens,small_race_tokens,planned_tokens,planned_race_tokens,updated_at,by_agent,by_node,by_user) VALUES(?,?,?,?,?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET small_tokens=excluded.small_tokens,small_race_tokens=excluded.small_race_tokens,planned_tokens=excluded.planned_tokens,planned_race_tokens=excluded.planned_race_tokens,updated_at=excluded.updated_at,by_agent=excluded.by_agent,by_node=excluded.by_node,by_user=excluded.by_user`,
+		task, req.SmallTokens, req.SmallRaceTokens, req.PlannedTokens, req.PlannedRaceTokens, ts(s.now()), req.AgentID, by.Node, by.User); err != nil {
+		return zero, err
+	}
+	out, err := readUsageEstimateDefaults(ctx, tx, task)
+	if err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(task)
+	return out, nil
+}
+
+func readProviderUsage(ctx context.Context, q queryRower, host string) (api.ProviderUsage, error) {
+	out := api.ProviderUsage{Host: host, Readings: []api.ProviderReading{}}
+	rows, err := q.QueryContext(ctx, `SELECT runtime,window,state,used_percent,resets_at,captured_at,reported_at,version FROM usage_provider_readings WHERE host=? ORDER BY runtime,window`, host)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r api.ProviderReading
+		if err := rows.Scan(&r.Runtime, &r.Window, &r.State, &r.UsedPercent, &r.ResetsAt, &r.CapturedAt, &r.ReportedAt, &r.Version); err != nil {
+			return out, err
+		}
+		out.Readings = append(out.Readings, r)
+	}
+	return out, rows.Err()
+}
+
+// ProviderUsage reads every stored provider reading of one host.
+func (s *Store) ProviderUsage(ctx context.Context, host string) (api.ProviderUsage, error) {
+	if host == "" || len(host) > 255 {
+		return api.ProviderUsage{}, api.ErrInvalid
+	}
+	return readProviderUsage(ctx, s.db, host)
+}
+
+// ReportProviderUsage replaces a host's reading for one runtime with what its
+// relay just read from the runtime's usage capture. A state other than ok is
+// an invalidation: both windows are overwritten with the state and no figure,
+// so nothing of an earlier reading remains to be mistaken for headroom.
+func (s *Store) ReportProviderUsage(ctx context.Context, report api.ProviderUsageReport) (api.ProviderUsage, error) {
+	zero := api.ProviderUsage{}
+	if report.Host == "" || len(report.Host) > 255 || strings.ContainsRune(report.Host, '\x00') || !usageBudgetRuntime(report.Runtime) || len(report.Version) > 80 {
+		return zero, api.ErrInvalid
+	}
+	type reading struct{ window, used, resets string }
+	var readings []reading
+	captured := ""
+	switch report.State {
+	case api.ProviderUsageOK:
+		at, err := time.Parse(time.RFC3339Nano, report.CapturedAt)
+		if err != nil || len(report.Windows) == 0 {
+			return zero, usageInvalid("an ok provider reading needs its capture time and at least one window")
+		}
+		captured = ts(at)
+		seen := map[string]bool{}
+		for _, w := range report.Windows {
+			resets, err := time.Parse(time.RFC3339Nano, w.ResetsAt)
+			if api.UsageWindowLength(w.Window) == 0 || seen[w.Window] || err != nil || !(w.UsedPercent >= 0 && w.UsedPercent <= 100) {
+				return zero, usageInvalid("a provider window needs a known name, a used percentage from 0 to 100 and a reset time")
+			}
+			seen[w.Window] = true
+			readings = append(readings, reading{w.Window, strconv.FormatFloat(w.UsedPercent, 'f', -1, 64), ts(resets)})
+		}
+	case api.ProviderUsageMissing, api.ProviderUsageUnreadable, api.ProviderUsageMalformed:
+		if len(report.Windows) != 0 {
+			return zero, usageInvalid("an invalidation carries no figures")
+		}
+		for _, window := range usageBudgetWindows {
+			readings = append(readings, reading{window: window})
+		}
+	default:
+		return zero, usageInvalid("provider reading state must be ok, missing, unreadable or malformed")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM usage_provider_readings WHERE host=? AND runtime=?`, report.Host, report.Runtime); err != nil {
+		return zero, err
+	}
+	version := report.Version
+	if report.State != api.ProviderUsageOK {
+		version = ""
+	}
+	now := ts(s.now())
+	for _, r := range readings {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO usage_provider_readings(host,runtime,window,state,used_percent,resets_at,captured_at,reported_at,version) VALUES(?,?,?,?,?,?,?,?,?)`,
+			report.Host, report.Runtime, r.window, report.State, r.used, r.resets, captured, now, version); err != nil {
+			return zero, err
+		}
+	}
+	out, err := readProviderUsage(ctx, tx, report.Host)
+	if err != nil {
+		return zero, err
+	}
+	return out, tx.Commit()
 }

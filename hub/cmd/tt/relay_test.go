@@ -302,6 +302,8 @@ func TestRelayClearsErrorOnOtherSuccessfulPaths(t *testing.T) {
 					}
 					reports.Add(1)
 					_, _ = w.Write([]byte(`{}`))
+				case strings.HasSuffix(r.URL.Path, "/usage/holds"), r.URL.Path == "/v1/provider-usage":
+					http.NotFound(w, r) // Nor has it the token budget routes.
 				case strings.Contains(r.URL.Path, "/agents/"):
 					_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: path != "inactive", Unread: 0})
 				default:
@@ -382,6 +384,8 @@ func TestRelayActivityFailureLeavesQueueAndInboxDeliveryWorking(t *testing.T) {
 			http.NotFound(w, r)
 		case strings.HasSuffix(r.URL.Path, "/messages"):
 			_ = json.NewEncoder(w).Encode(api.MessageList{Messages: []api.Message{{Seq: 1, To: b.Agent, From: api.Sender{Node: "fixture", User: "owner"}, Text: "synthetic"}}})
+		case strings.HasSuffix(r.URL.Path, "/usage/holds"), r.URL.Path == "/v1/provider-usage":
+			http.NotFound(w, r) // Nor has it the token budget routes.
 		case strings.Contains(r.URL.Path, "/agents/"):
 			// Retirement adds one identity read before the three delivery reads.
 			if agentReads.Add(1) > 4 {
@@ -629,6 +633,12 @@ type needsInputHub struct {
 	jobs     []api.WakeJob
 	reports  []api.WakeJobReport
 	calls    []string
+	// The token budget hold of the agent's team: heldRun is the exact run the
+	// hub lists as held (empty: none), noHolds a hub without the holds route
+	// and holdsStatus a failing holds read.
+	heldRun     string
+	noHolds     bool
+	holdsStatus int
 }
 
 func (h *needsInputHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -643,9 +653,20 @@ func (h *needsInputHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			state = "paused"
 		}
 		_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: state})
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/usage/holds"):
+		switch {
+		case h.noHolds:
+			http.NotFound(w, r)
+		case h.holdsStatus != 0:
+			http.Error(w, `{"error":"synthetic"}`, h.holdsStatus)
+		default:
+			q := r.URL.Query()
+			_ = json.NewEncoder(w).Encode(api.UsageHolds{Held: h.heldRun != "" && q.Get("agent") == h.agent.ID && q.Get("run") == h.heldRun, Holds: []api.BudgetHold{}})
+		}
 	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
 		job := api.WakeJob{}
-		if len(h.jobs) > 0 {
+		// Like the hub, lease nothing for a held run of an agent with no role.
+		if held := h.heldRun != "" && h.heldRun == h.agent.RunID && h.agent.Role == "" && !h.noHolds; len(h.jobs) > 0 && !held {
 			job, h.jobs = h.jobs[0], h.jobs[1:]
 		}
 		_ = json.NewEncoder(w).Encode(job)
@@ -1398,6 +1419,9 @@ func (h *noticeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(api.MessageList{Messages: page})
+	case strings.HasSuffix(r.URL.Path, "/usage/holds"):
+		// No team of this fixture is held past its token estimate.
+		_ = json.NewEncoder(w).Encode(api.UsageHolds{Holds: []api.BudgetHold{}})
 	case r.URL.Path == "/v1/tasks" && h.fail["tasks"] != 0:
 		http.Error(w, "refused", h.fail["tasks"])
 	case r.URL.Path == "/v1/tasks":
@@ -2293,5 +2317,212 @@ func TestRelayDeployerNoticeCleanReleaseWakesNobody(t *testing.T) {
 	before := replay(t, "")
 	if before[noticeHandler] != len(subjects) || before[noticeHelper] != len(subjects) || len(before) != 2 {
 		t.Fatalf("the same release untagged woke %v, want %d each", before, len(subjects))
+	}
+}
+
+// holdCalls counts the holds reads and wake-job leases among hub calls.
+func holdCalls(calls []string) (holds, leases int) {
+	for _, call := range calls {
+		if strings.HasSuffix(call, "/usage/holds") {
+			holds++
+		}
+		if strings.HasSuffix(call, "/wake-jobs/lease") {
+			leases++
+		}
+	}
+	return holds, leases
+}
+
+// a14, relay half: the broker path makes no holds read, because the hub
+// leases nothing for a held run. The inbox path reads the hold fresh, for the
+// binding's exact run, immediately before a delivery, and withholds it. A
+// different run, an agent with a project role and a hub without the route
+// are delivered as before; a pass with nothing to deliver reads nothing.
+func TestRelayHoldGate(t *testing.T) {
+	b, hub, c, _ := needsInputFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 8, 16, 0, 0, 0, time.UTC)
+	var queued []string
+	queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		queued = append(queued, prompt)
+		return nil
+	}
+	owner := api.Sender{Node: "workspace", User: "owner"}
+	seq := int64(40)
+	// unread gives the agent one new directed message, and due makes the
+	// inbox and broker paths due again.
+	unread := func() {
+		seq++
+		hub.update(func(h *needsInputHub) {
+			h.agent.ReadUpTo, h.agent.Unread = seq-1, 1
+			h.messages = append(h.messages, api.Message{Seq: seq, To: b.Agent, From: owner})
+		})
+		now = now.Add(time.Minute)
+	}
+	job := func(id string) {
+		hub.update(func(h *needsInputHub) {
+			h.jobs = append(h.jobs, api.WakeJob{ID: id, MessageSeq: seq, Prompt: "Tailterm obligation #" + strconv.FormatInt(seq, 10), LeaseToken: "lease-" + id})
+		})
+	}
+	var p relayProgress
+
+	// Starting with no hold: one holds read, then delivery.
+	unread()
+	hub.takeCalls()
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 1 || p.TeamHeld || p.Skip != nil {
+		t.Fatalf("no hold: %d holds reads, queued %q, skip %+v", holds, queued, p.Skip)
+	}
+	if !relayStallPassDue(b, p) {
+		t.Fatal("the stall pass is off for a binding that is not held")
+	}
+
+	// A hold is written. The very next inbox attempt delivers nothing after
+	// exactly one holds read, and records the skip with its reason.
+	hub.update(func(h *needsInputHub) { h.heldRun = b.Run })
+	unread()
+	wakes := p.Wakes
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	calls := hub.takeCalls()
+	if holds, _ := holdCalls(calls); holds != 1 || len(queued) != 1 || !p.TeamHeld || !strings.HasSuffix(calls[len(calls)-1], "/usage/holds") {
+		t.Fatalf("held inbox attempt: calls %v, queued %q", calls, queued)
+	}
+	if p.Skip == nil || p.Skip.Reason != relayTeamHeldReason || fmt.Sprint(p.Skip.MessageSeqs) != fmt.Sprint([]int64{seq}) || p.Wakes != wakes || p.Through >= seq {
+		t.Fatalf("held skip %+v wakes %d through %d", p.Skip, p.Wakes, p.Through)
+	}
+	// The stall pass is not run for a held binding.
+	if relayStallPassDue(b, p) {
+		t.Fatal("the stall pass would run for a held binding")
+	}
+	other := b
+	other.Run = "run_0000000000000002"
+	if !relayStallPassDue(other, p) {
+		t.Fatal("the stall pass is off for another run of the agent")
+	}
+
+	// The broker path makes no holds read: it asks for a lease as always, and
+	// the hub leases nothing for the held run.
+	job("wake_1")
+	now = now.Add(time.Minute)
+	if handled, err := relayWakeJob(ctx, b, &p, c, now, queue); err != nil || handled {
+		t.Fatalf("held broker attempt: %v %v", handled, err)
+	}
+	calls = hub.takeCalls()
+	if holds, leases := holdCalls(calls); holds != 0 || leases != 1 || len(queued) != 1 || len(hub.jobs) != 1 || !p.TeamHeld {
+		t.Fatalf("held broker attempt: calls %v, queued %q, jobs %d", calls, queued, len(hub.jobs))
+	}
+
+	// A pass with nothing to deliver makes no holds read: the broker path is
+	// not due and the agent has nothing unread.
+	hub.update(func(h *needsInputHub) { h.agent.Unread = 0 })
+	if err := relayPass(b, &p, c, now.Add(time.Second), queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, leases := holdCalls(hub.takeCalls()); holds != 0 || leases != 0 || len(queued) != 1 {
+		t.Fatalf("an idle pass made %d holds reads and %d leases", holds, leases)
+	}
+	// Nor does one inside the 15-second inbox spacing.
+	hub.update(func(h *needsInputHub) { h.agent.Unread = 1 })
+	p.LastAttempt = now
+	if err := relayOne(ctx, b, &p, c, now.Add(5*time.Second), queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 0 {
+		t.Fatalf("a deferred inbox pass made %d holds reads", holds)
+	}
+
+	// A failing holds read skips the inbox pass: nothing is delivered.
+	hub.update(func(h *needsInputHub) { h.holdsStatus = http.StatusInternalServerError })
+	now = now.Add(time.Minute)
+	if err := relayOne(ctx, b, &p, c, now, queue); err == nil {
+		t.Fatal("a failing holds read did not fail the inbox pass")
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 1 {
+		t.Fatalf("a failing holds read: %d reads, queued %q", holds, queued)
+	}
+	hub.update(func(h *needsInputHub) { h.holdsStatus = 0 })
+
+	// Continue: the hold is lifted, and the next attempt leases and delivers.
+	hub.update(func(h *needsInputHub) { h.heldRun = "" })
+	now = now.Add(time.Minute)
+	if handled, err := relayWakeJob(ctx, b, &p, c, now, queue); err != nil || !handled {
+		t.Fatalf("broker attempt after continue: %v %v", handled, err)
+	}
+	calls = hub.takeCalls()
+	if holds, leases := holdCalls(calls); holds != 0 || leases != 1 || len(queued) != 2 || !strings.Contains(queued[1], "wake_1") || len(hub.reports) != 1 || hub.reports[0].Status != "accepted" {
+		t.Fatalf("after continue: calls %v, queued %q, reports %+v", calls, queued, hub.reports)
+	}
+	// The inbox path delivers again too, and clears the skip and the
+	// remembered hold.
+	p.BrokerWakes = false
+	now = now.Add(time.Minute)
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 3 || p.Skip != nil || p.TeamHeld {
+		t.Fatalf("inbox attempt after continue: %d holds reads, queued %d, skip %+v", holds, len(queued), p.Skip)
+	}
+	if !relayStallPassDue(b, p) {
+		t.Fatal("the stall pass stays off after the hold is lifted")
+	}
+
+	// The hold names another run of this agent: this binding is not held.
+	hub.update(func(h *needsInputHub) { h.heldRun = "run_0000000000000002" })
+	unread()
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || len(queued) != 4 || p.TeamHeld {
+		t.Fatalf("a hold on another run: %d holds reads, queued %d", holds, len(queued))
+	}
+
+	// An agent with a project role is woken and causes no holds read, even
+	// when the hub would list its run.
+	hub.update(func(h *needsInputHub) { h.heldRun = b.Run })
+	for _, role := range []string{api.AgentRoleDatabaseHandler, api.AgentRoleBacklogSteward, api.AgentRoleDeployment, api.AgentRoleOwnerHelper} {
+		hub.update(func(h *needsInputHub) { h.agent.Role = role })
+		unread()
+		job("wake_" + role)
+		before := len(queued)
+		if handled, err := relayWakeJob(ctx, b, &p, c, now, queue); err != nil || !handled {
+			t.Fatalf("%s broker attempt: %v %v", role, handled, err)
+		}
+		p.BrokerWakes = false
+		now = now.Add(time.Minute)
+		if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+			t.Fatalf("%s inbox attempt: %v", role, err)
+		}
+		if holds, leases := holdCalls(hub.takeCalls()); holds != 0 || leases != 1 || len(queued) != before+2 || p.TeamHeld {
+			t.Fatalf("%s: %d holds reads, %d leases, queued %d of %d", role, holds, leases, len(queued)-before, 2)
+		}
+	}
+	// So does a binding that carries the role itself.
+	hub.update(func(h *needsInputHub) { h.agent.Role = "" })
+	if held, err := relayTeamHeld(ctx, c, runtimeBinding{Hub: b.Hub, Task: b.Task, Agent: b.Agent, Run: b.Run, Role: api.AgentRoleOwnerHelper}, hub.agent); err != nil || held {
+		t.Fatalf("a role binding: %v %v", held, err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 0 {
+		t.Fatalf("a role binding made %d holds reads", holds)
+	}
+
+	// A hub without the holds route wakes as before.
+	hub.update(func(h *needsInputHub) { h.noHolds = true })
+	unread()
+	job("wake_older")
+	before := len(queued)
+	if handled, err := relayWakeJob(ctx, b, &p, c, now, queue); err != nil || !handled {
+		t.Fatalf("older hub broker attempt: %v %v", handled, err)
+	}
+	p.BrokerWakes = false
+	now = now.Add(time.Minute)
+	if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+		t.Fatalf("older hub inbox attempt: %v", err)
+	}
+	if _, leases := holdCalls(hub.takeCalls()); leases != 1 || len(queued) != before+2 || p.TeamHeld {
+		t.Fatalf("older hub: %d leases, queued %d", leases, len(queued)-before)
 	}
 }

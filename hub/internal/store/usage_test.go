@@ -2015,3 +2015,367 @@ func TestUsageEntryWarningKeepsEarlierRows(t *testing.T) {
 		t.Fatalf("entry warning %+v", entry)
 	}
 }
+
+// usageTurnFor is a complete synthetic request of exactly tokens, attributed
+// to the item of an order by an acknowledgement of it.
+func usageTurnFor(id string, order api.Message, tokens int64) api.UsageTurn {
+	turn := syntheticUsageTurn(id)
+	turn.Tokens = map[string]int64{"input": tokens, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0}
+	turn.Raw = map[string]int64{"input_tokens": tokens, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+	turn.Handled = []api.UsageEvidence{{TaskID: order.TaskID, Seq: order.Seq, Operation: "ack", At: turn.At}}
+	return turn
+}
+
+// The team of a running entry is counted from its admission, the claim, not
+// from its enqueue. The entry, its admission, the bindings and the lead all
+// come from the store's own queue and agent calls: no row is written by hand.
+func TestUsageTeamCountsFromAdmission(t *testing.T) {
+	f := newRebindFixture(t, false)
+	clock := f.s.now().UTC().Truncate(time.Second).Add(time.Second)
+	f.s.now = func() time.Time { return clock }
+	// Bound while the entry waits in the queue.
+	waiter := f.member(t, "waiter")
+	clock = clock.Add(2 * time.Second)
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Host: "mini"})
+	if f.entry.AdmittedAt != ts(clock) {
+		t.Fatalf("claim admitted at %q, want %q", f.entry.AdmittedAt, ts(clock))
+	}
+	clock = clock.Add(2 * time.Second)
+	lead, member := f.member(t, "lead"), f.member(t, "member")
+	plan, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": f.item.ID, "revision": f.item.Revision, "order": f.order.Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": lead.RunID, "fields": map[string]any{"agentId": lead.ID, "name": lead.Name, "cwd": "/worktrees/rebind"}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: plan}, {Operation: "attempt"}, {Operation: "started", MemberRunID: lead.RunID}, {Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = f.entry.ID, f.entry.Revision
+		f.entry = f.action(t, step)
+	}
+	if f.entry.State != "running" || f.entry.AdmittedAt != ts(clock.Add(-2*time.Second)) {
+		t.Fatalf("running entry %s admitted at %q", f.entry.State, f.entry.AdmittedAt)
+	}
+	if _, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, estimateRequest(f.item.Revision, "admission-estimate", 1000, "synthetic", api.Agent{}), f.by); err != nil {
+		t.Fatal(err)
+	}
+	team := func(why, tokens, state string) {
+		t.Helper()
+		item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+		if err != nil || item.Budget == nil || item.Budget.Team == nil {
+			t.Fatalf("%s: budget %+v %v", why, item.Budget, err)
+		}
+		if got := item.Budget.Team; got.EntryID != f.entry.ID || got.ActualTokens != tokens || got.ActualState != state {
+			t.Fatalf("%s: team %+v, want %s %s", why, got, tokens, state)
+		}
+	}
+	upload := func(a api.Agent, key string, tokens int64) {
+		t.Helper()
+		batch := usageBatch(a, key, usageTurnFor(key, f.order, tokens))
+		if receipt, err := f.s.ReportUsage(f.ctx, f.task.ID, a.ID, batch); err != nil || receipt.Turns != 1 {
+			t.Fatalf("upload %s: %+v %v", key, receipt, err)
+		}
+	}
+	upload(waiter, "waiter-turn", 1_000_000)
+	team("an agent bound between enqueue and admission", "0", "not measured")
+	if n := queueBudgetHoldRows(t, f.s, f.task.ID); n != 0 {
+		t.Fatalf("an agent bound before admission caused %d holds", n)
+	}
+	upload(member, "member-turn", 700)
+	team("a member bound after admission", "700", "measured")
+	upload(lead, "lead-turn", 300)
+	team("the lead bound after admission", "1000", "measured")
+}
+
+// budgetTurn is a complete synthetic request of one runtime at an instant.
+func budgetTurn(id, runtime string, at time.Time, tokens int64) api.UsageTurn {
+	turn := syntheticUsageTurn(id)
+	turn.Runtime, turn.At = runtime, at
+	turn.Tokens = map[string]int64{"input": tokens, "cached": 0, "cacheWrite": 0, "output": 0, "reasoning": 0}
+	turn.Raw = map[string]int64{"input_tokens": tokens, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0}
+	if runtime == "claude" {
+		turn.Raw = map[string]int64{"input_tokens": tokens, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 0, "output_tokens_details.thinking_tokens": 0}
+	}
+	return turn
+}
+
+// budgetStatus is the one budget row's status for a host.
+func budgetStatus(t *testing.T, s *Store, task, host, runtime, window string) api.UsageBudgetStatus {
+	t.Helper()
+	out, err := s.UsageBudgets(context.Background(), task, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range out.Budgets {
+		if b.Runtime == runtime && b.Window == window && b.Status != nil {
+			return *b.Status
+		}
+	}
+	t.Fatalf("no %s %s budget in %+v", runtime, window, out)
+	return api.UsageBudgetStatus{}
+}
+
+// a1, a5: budget rows round-trip, refuse bad values and unauthorised agents,
+// and a project without one is not configured.
+func TestUsageBudgetSettings(t *testing.T) {
+	s, task, handler, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	out, err := s.UsageBudgets(ctx, task.ID, "mini")
+	if err != nil || out.Configured || len(out.Budgets) != 0 {
+		t.Fatalf("a project with no budget row: %+v %v", out, err)
+	}
+	clock := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return clock }
+	reset := "2026-10-08T10:00:00Z"
+	out, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 200_000_000, ReservePercent: 10, ResetAt: reset, StaleSeconds: 600}, by)
+	if err != nil || !out.Configured || len(out.Budgets) != 1 {
+		t.Fatalf("set %+v %v", out, err)
+	}
+	want := api.UsageBudget{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 200_000_000, ReservePercent: 10, ResetAt: reset, StaleSeconds: 600, UpdatedAt: ts(clock), UpdatedBy: api.Sender{Node: "fixture", User: "owner"}}
+	got := out.Budgets[0]
+	got.Status = nil
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("saved row %+v, want %+v", got, want)
+	}
+	// A second window, with the default staleness bound, and an update in place.
+	if _, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowSevenDay, AllowanceTokens: 900_000_000}, by); err != nil {
+		t.Fatal(err)
+	}
+	out, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 250_000_000, ReservePercent: 20, AgentID: handler.ID}, by)
+	if err != nil || len(out.Budgets) != 2 || out.Budgets[0].AllowanceTokens != 250_000_000 || out.Budgets[0].ReservePercent != 20 || out.Budgets[0].ResetAt != "" || out.Budgets[0].StaleSeconds != api.DefaultUsageBudgetStaleSeconds || out.Budgets[0].UpdatedBy.AgentID != handler.ID || out.Budgets[1].StaleSeconds != api.DefaultUsageBudgetStaleSeconds {
+		t.Fatalf("update by a database handler %+v %v", out, err)
+	}
+	helper := *registerHelper(t, s, task.ID, helperRequest("budget-helper"), by).Agent
+	if _, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 1, AgentID: helper.ID}, by); err != nil {
+		t.Fatalf("set by the owner helper: %v", err)
+	}
+	other, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", AgentID: api.NewID("agt"), Host: "fixture", Session: "builder"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, req := range map[string]api.UsageBudgetRequest{
+		"missing allowance": {Runtime: "claude", Window: api.UsageWindowFiveHour},
+		"zero allowance":    {Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 0, ReservePercent: 10},
+		"unknown window":    {Runtime: "claude", Window: "daily", AllowanceTokens: 5},
+		"unknown runtime":   {Runtime: "gemini", Window: api.UsageWindowFiveHour, AllowanceTokens: 5},
+		"reserve too high":  {Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 5, ReservePercent: 91},
+		"bad reset time":    {Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 5, ResetAt: "tomorrow"},
+	} {
+		if _, err := s.SetUsageBudget(ctx, task.ID, req, by); !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "budget") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 5, AgentID: other.ID}, by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only the owner, the owner helper or a database handler sets the token budget") {
+		t.Fatalf("an ordinary agent: %v", err)
+	}
+	if _, err = s.DeleteUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AgentID: other.ID}, by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("clear by an ordinary agent: %v", err)
+	}
+	if _, err = s.SetUsageBudget(ctx, "tsk_0000000000000000", api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 5}, by); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("unknown project: %v", err)
+	}
+	for _, row := range [][2]string{{"claude", api.UsageWindowFiveHour}, {"claude", api.UsageWindowSevenDay}, {"codex", api.UsageWindowFiveHour}} {
+		if out, err = s.DeleteUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: row[0], Window: row[1]}, by); err != nil {
+			t.Fatalf("clear %v: %v", row, err)
+		}
+	}
+	if out.Configured || len(out.Budgets) != 0 {
+		t.Fatalf("after clearing every row: %+v", out)
+	}
+	if _, err = s.DeleteUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour}, by); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("clear a row that is not set: %v", err)
+	}
+}
+
+// a1: with no reading, remaining is the allowance minus the project's tokens
+// of that runtime since the last owner-entered reset. Earlier turns and other
+// runtimes are not counted, and the reset rolls forward by whole windows.
+func TestUsageBudgetAllowanceRemaining(t *testing.T) {
+	s, task, agent, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	reset := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	clock := reset.Add(2 * time.Hour)
+	s.now = func() time.Time { return clock }
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ReservePercent: 10, ResetAt: ts(reset)}, by); err != nil {
+		t.Fatal(err)
+	}
+	status := func() api.UsageBudgetStatus {
+		return budgetStatus(t, s, task.ID, "mini", "codex", api.UsageWindowFiveHour)
+	}
+	if got := status(); got.Source != api.UsageBudgetSourceAllowance || got.RemainingTokens != "1000" || got.ResetAt != ts(reset.Add(5*time.Hour)) || got.Reading != "is not reported" || got.Host != "mini" {
+		t.Fatalf("no usage: %+v", got)
+	}
+	batch := usageBatch(agent, "budget-batch",
+		budgetTurn("before-reset", "codex", reset.Add(-time.Second), 400),
+		// In the reset's own second, half a second before and at it.
+		budgetTurn("just-before", "codex", reset.Add(time.Second).Add(-500*time.Millisecond), 30),
+		budgetTurn("at-reset", "codex", reset.Add(time.Second), 70),
+		budgetTurn("after-reset", "codex", reset.Add(time.Hour), 200),
+		budgetTurn("other-runtime", "claude", reset.Add(time.Hour), 5000))
+	if _, err := s.ReportUsage(ctx, task.ID, agent.ID, batch); err != nil {
+		t.Fatal(err)
+	}
+	// Move the reset one second on, so the two turns in that second straddle it.
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ReservePercent: 10, ResetAt: ts(reset.Add(time.Second))}, by); err != nil {
+		t.Fatal(err)
+	}
+	if got := status(); got.RemainingTokens != "730" {
+		t.Fatalf("since the reset, codex only: %+v", got)
+	}
+	// One window later the same row starts again from its second reset.
+	clock = reset.Add(6 * time.Hour)
+	if got := status(); got.RemainingTokens != "1000" || got.ResetAt != ts(reset.Add(time.Second).Add(10*time.Hour)) {
+		t.Fatalf("after the next reset: %+v", got)
+	}
+	// A reset entered for the future counts back whole windows: the window
+	// that ends at it holds every turn but the one at the reset itself.
+	clock = reset.Add(-2 * time.Hour)
+	if got := status(); got.ResetAt != ts(reset.Add(time.Second)) || got.RemainingTokens != "300" {
+		t.Fatalf("before the entered reset: %+v", got)
+	}
+}
+
+// a6, a7 hub half: a fresh reading decides by percentage; a stale one and one
+// whose reset has passed fall to the allowance minus usage, never zero use;
+// an invalidation leaves no figure of the old reading behind.
+func TestUsageBudgetProviderSources(t *testing.T) {
+	s, task, agent, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	base := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	clock := base
+	s.now = func() time.Time { return clock }
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, StaleSeconds: 600}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowSevenDay, AllowanceTokens: 9000, StaleSeconds: 600}, by); err != nil {
+		t.Fatal(err)
+	}
+	five := func(host string) api.UsageBudgetStatus {
+		return budgetStatus(t, s, task.ID, host, "claude", api.UsageWindowFiveHour)
+	}
+	if got := five("mini"); got.Source != api.UsageBudgetSourceNone || got.RemainingTokens != "" || got.Reading != "is not reported" {
+		t.Fatalf("no reading and no reset: %+v", got)
+	}
+	resets := base.Add(3 * time.Hour)
+	report := api.ProviderUsageReport{Host: "mini", Runtime: "claude", State: api.ProviderUsageOK, CapturedAt: ts(base), Version: "2.1.292", Windows: []api.ProviderUsageWindow{
+		{Window: api.UsageWindowFiveHour, UsedPercent: 13, ResetsAt: ts(resets)},
+		{Window: api.UsageWindowSevenDay, UsedPercent: 37.5, ResetsAt: ts(base.Add(100 * time.Hour))}}}
+	stored, err := s.ReportProviderUsage(ctx, report)
+	if err != nil || len(stored.Readings) != 2 || stored.Readings[0].UsedPercent != "13" || stored.Readings[1].UsedPercent != "37.5" || stored.Readings[0].Version != "2.1.292" || stored.Readings[0].ReportedAt != ts(base) {
+		t.Fatalf("stored reading %+v %v", stored, err)
+	}
+	if got := five("mini"); got.Source != api.UsageBudgetSourceProvider || got.RemainingTokens != "870" || got.ResetAt != ts(resets) || got.Reading != "" {
+		t.Fatalf("fresh reading: %+v", got)
+	}
+	if got := budgetStatus(t, s, task.ID, "mini", "claude", api.UsageWindowSevenDay); got.Source != api.UsageBudgetSourceProvider || got.RemainingTokens != "5625" {
+		t.Fatalf("fresh seven day reading: %+v", got)
+	}
+	// Another host has reported nothing.
+	if got := five("air"); got.Source != api.UsageBudgetSourceNone {
+		t.Fatalf("a host with no reading: %+v", got)
+	}
+	// Usage before and inside the reading's window (it began two hours ago),
+	// and after its reset.
+	batch := usageBatch(agent, "provider-batch",
+		budgetTurn("before-window", "claude", base.Add(-3*time.Hour), 500),
+		budgetTurn("in-window", "claude", base.Add(-time.Hour), 120),
+		budgetTurn("after-old-reset", "claude", resets.Add(10*time.Minute), 45),
+		budgetTurn("codex-turn", "codex", base.Add(-time.Hour), 9999))
+	if _, err := s.ReportUsage(ctx, task.ID, agent.ID, batch); err != nil {
+		t.Fatal(err)
+	}
+	// At the staleness bound the reading still decides; one second past it the
+	// percentage is not used.
+	clock = base.Add(600 * time.Second)
+	if got := five("mini"); got.Source != api.UsageBudgetSourceProvider || got.RemainingTokens != "870" {
+		t.Fatalf("at the staleness bound: %+v", got)
+	}
+	clock = base.Add(601 * time.Second)
+	if got := five("mini"); got.Source != api.UsageBudgetSourceAllowance || got.RemainingTokens != "835" || got.ResetAt != ts(resets) || !strings.Contains(got.Reading, "is stale") {
+		t.Fatalf("stale reading: %+v", got)
+	}
+	// The reading's reset has passed: usage since that reset, never zero use.
+	clock = resets.Add(time.Hour)
+	if got := five("mini"); got.Source != api.UsageBudgetSourceAllowance || got.RemainingTokens != "955" || got.ResetAt != ts(resets.Add(5*time.Hour)) || !strings.Contains(got.Reading, "reset that passed") {
+		t.Fatalf("passed reset: %+v", got)
+	}
+	// Long after, the window is the last five hours.
+	clock = resets.Add(9 * time.Hour)
+	if got := five("mini"); got.Source != api.UsageBudgetSourceAllowance || got.RemainingTokens != "1000" || got.ResetAt != ts(clock) {
+		t.Fatalf("long passed reset: %+v", got)
+	}
+	// Invalidation: no figure of the old reading remains, in either window.
+	clock = base.Add(time.Minute)
+	for _, state := range []string{api.ProviderUsageMissing, api.ProviderUsageUnreadable, api.ProviderUsageMalformed} {
+		if _, err := s.ReportProviderUsage(ctx, report); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := s.ReportProviderUsage(ctx, api.ProviderUsageReport{Host: "mini", Runtime: "claude", State: state})
+		if err != nil || len(stored.Readings) != 2 {
+			t.Fatalf("%s: %+v %v", state, stored, err)
+		}
+		for _, r := range stored.Readings {
+			if r.State != state || r.UsedPercent != "" || r.ResetsAt != "" || r.CapturedAt != "" || r.Version != "" {
+				t.Fatalf("%s kept a figure: %+v", state, r)
+			}
+		}
+		if got := five("mini"); got.Source != api.UsageBudgetSourceNone || got.RemainingTokens != "" || got.Reading != "is "+state {
+			t.Fatalf("after %s: %+v", state, got)
+		}
+	}
+	// With an owner reset the invalidated host falls to the allowance source.
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ResetAt: ts(base.Add(-2 * time.Hour))}, by); err != nil {
+		t.Fatal(err)
+	}
+	if got := five("mini"); got.Source != api.UsageBudgetSourceAllowance || got.RemainingTokens != "835" || got.Reading != "is malformed" {
+		t.Fatalf("invalidated with an owner reset: %+v", got)
+	}
+	for name, bad := range map[string]api.ProviderUsageReport{
+		"no host":            {Runtime: "claude", State: api.ProviderUsageMissing},
+		"unknown runtime":    {Host: "mini", Runtime: "gemini", State: api.ProviderUsageMissing},
+		"unknown state":      {Host: "mini", Runtime: "claude", State: "fine"},
+		"ok without windows": {Host: "mini", Runtime: "claude", State: api.ProviderUsageOK, CapturedAt: ts(base)},
+		"percent over 100":   {Host: "mini", Runtime: "claude", State: api.ProviderUsageOK, CapturedAt: ts(base), Windows: []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 101, ResetsAt: ts(resets)}}},
+		"no reset":           {Host: "mini", Runtime: "claude", State: api.ProviderUsageOK, CapturedAt: ts(base), Windows: []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 5}}},
+		"figures in a miss":  {Host: "mini", Runtime: "claude", State: api.ProviderUsageMissing, Windows: []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 5, ResetsAt: ts(resets)}}},
+	} {
+		if _, err := s.ReportProviderUsage(ctx, bad); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// a8: the four lane defaults round-trip; values and writers are checked.
+func TestUsageEstimateDefaults(t *testing.T) {
+	s, task, handler, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	out, err := s.UsageEstimateDefaults(ctx, task.ID)
+	if err != nil || out.Configured {
+		t.Fatalf("no defaults: %+v %v", out, err)
+	}
+	req := api.UsageEstimateDefaultsRequest{SmallTokens: 18_000_000, SmallRaceTokens: 17_000_000, PlannedTokens: 44_000_000, PlannedRaceTokens: 70_000_000, AgentID: handler.ID}
+	if out, err = s.SetUsageEstimateDefaults(ctx, task.ID, req, by); err != nil {
+		t.Fatal(err)
+	}
+	read, err := s.UsageEstimateDefaults(ctx, task.ID)
+	if err != nil || !reflect.DeepEqual(read, out) || !read.Configured || read.SmallTokens != 18_000_000 || read.SmallRaceTokens != 17_000_000 || read.PlannedTokens != 44_000_000 || read.PlannedRaceTokens != 70_000_000 || read.UpdatedBy.AgentID != handler.ID || read.UpdatedBy.User != "owner" {
+		t.Fatalf("defaults %+v %+v %v", read, out, err)
+	}
+	req.PlannedTokens, req.AgentID = 50_000_000, ""
+	if out, err = s.SetUsageEstimateDefaults(ctx, task.ID, req, by); err != nil || out.PlannedTokens != 50_000_000 || out.UpdatedBy.AgentID != "" {
+		t.Fatalf("recomputed defaults %+v %v", out, err)
+	}
+	req.SmallTokens = 0
+	if _, err = s.SetUsageEstimateDefaults(ctx, task.ID, req, by); !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "lane default") {
+		t.Fatalf("a zero default: %v", err)
+	}
+	other, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "builder", AgentID: api.NewID("agt"), Host: "fixture", Session: "builder"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SmallTokens, req.AgentID = 1, other.ID
+	if _, err = s.SetUsageEstimateDefaults(ctx, task.ID, req, by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "the lane default estimates") {
+		t.Fatalf("an ordinary agent: %v", err)
+	}
+	if _, err = s.UsageEstimateDefaults(ctx, "tsk_0000000000000000"); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("unknown project: %v", err)
+	}
+}

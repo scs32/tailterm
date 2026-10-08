@@ -57,6 +57,12 @@ type relayProgress struct {
 	ClaudePendingInbox  bool             `json:"claudePendingInbox,omitempty"`
 	// LastHeartbeat spaces the owner helper's relay heartbeats.
 	LastHeartbeat time.Time `json:"lastHeartbeat,omitempty"`
+	// TeamHeld records that this run's last inbox attempt was withheld by a
+	// hold; a holds read that says not held clears it. It only keeps the
+	// stall pass off a held team; it never decides a wake, which reads the
+	// hold fresh every time. The relay makes no read to learn of a hold it
+	// has not met on the inbox path.
+	TeamHeld bool `json:"teamHeld,omitempty"`
 	// Skip is host-local diagnostics for tt relay --status and the relay log.
 	// It never flows into Wake, the activity snapshot or any hub write.
 	Skip *relaySkip `json:"lastSkip,omitempty"`
@@ -611,6 +617,40 @@ func relayProjectActive(ctx context.Context, c *api.Client, b runtimeBinding) (b
 	return status.State == "" || status.State == api.ProjectPauseActive, nil
 }
 
+// relayTeamHeldReason is the skip reason of a wake withheld for a hold.
+const relayTeamHeldReason = "team held past 3 times its token estimate"
+
+// relayTeamHeld asks the hub, fresh every time, whether this binding's exact
+// run belongs to a team held past its token estimate (or stopped and not yet
+// released). It is the last gate before an inbox wake is delivered, and
+// nothing else: no turn is interrupted and no write is refused. The broker
+// path makes no such read, because the hub's wake-job lease returns no job
+// for a held run. An agent with a project role (database handler, backlog
+// steward, deployment agent, owner helper) is never held, and no read is made
+// for it. A hub without the holds route means not held; any other error is
+// returned, so the pass skips, as relayProjectActive does.
+func relayTeamHeld(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent) (bool, error) {
+	if b.Role != "" || a.Role != "" {
+		return false, nil
+	}
+	holds, err := c.UsageHolds(ctx, b.Task, b.Agent, b.Run)
+	var httpErr *api.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return holds.Held, nil
+}
+
+// relayStallPassDue reports whether the stalled-turn pass runs for a binding.
+// A held team's quiet turn is the hold working, so it is never treated as a
+// stall and never interrupted.
+func relayStallPassDue(b runtimeBinding, p relayProgress) bool {
+	return !(p.TeamHeld && p.Run == b.Run && p.Thread == b.Thread)
+}
+
 // relayWakeJob delivers one broker wake job (broker phase 2a) and reports how
 // Codex answered. The hub owns job identity and leasing, so there is no
 // relay-derived request ID that could collide and starve a recipient. It
@@ -856,6 +896,18 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	}
 	if reason := relayAgentSkipReason(a, b); reason != "" {
 		recordRelaySkip(p, b.Agent, reason, seqs, 0, 0, now)
+		return nil
+	}
+	// The hold is read immediately before delivery, after every other read.
+	held, err := relayTeamHeld(ctx, c, b, a)
+	if err != nil {
+		return err
+	}
+	p.TeamHeld = held
+	if held {
+		// Withheld, not attempted: it does not count toward the wake window.
+		p.Wakes--
+		recordRelaySkip(p, b.Agent, relayTeamHeldReason, seqs, 0, 0, now)
 		return nil
 	}
 	prompt := wakePrompt(b, through)
@@ -1136,7 +1188,9 @@ func cmdRelay(args []string) error {
 						// interrupt it is interrupted, before delivery, so the
 						// wake it held back is typed in this same pass. The
 						// wrapper notes that wake in the stall record.
-						claudeStallPass(ctx, b, nativeClaudeStallOps(c))
+						if relayStallPassDue(b, progress) {
+							claudeStallPass(ctx, b, nativeClaudeStallOps(c))
+						}
 						queue = claudeStallWake(claudeQueue, time.Now)
 					}
 					queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, queue)
@@ -1185,6 +1239,16 @@ func cmdRelay(args []string) error {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] frozen usage:", err)
 			}
+			// The runtime's own usage capture, reported to each hub this host
+			// serves when it changed, for the token budget's admission check.
+			hubs := map[string]bool{}
+			for _, path := range paths {
+				var b runtimeBinding
+				if data, readErr := os.ReadFile(path); readErr == nil && json.Unmarshal(data, &b) == nil && validBinding(b) {
+					hubs[b.Hub] = true
+				}
+			}
+			relayProviderUsage(hubs, time.Now().UTC())
 		}
 		if *status {
 			fmt.Printf("archived bindings=%d\n", relayArchiveCount(dir))

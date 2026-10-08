@@ -584,21 +584,26 @@ func sumUsageItemShares(rows *sql.Rows, total *big.Rat, state string) (string, e
 //
 // The team is the runs bound to the item whose agent has no project role (a
 // database handler, backlog steward or owner helper never counts, bound or
-// not) and whose binding is not older than the entry. A binding carries its
-// agent's creation time, so an earlier entry's agents stay excluded and a
-// replacement or extra agent of this entry is included. No bound on the turn
-// time is needed: such a run did not exist before the entry did.
+// not) and whose binding is not older than the entry's admission (its claim
+// for launch; an entry admitted before that was recorded falls back to its
+// creation). A binding carries its agent's creation time, so an earlier
+// entry's agents and an agent bound while the entry waited stay excluded, and
+// a replacement or extra agent of this entry is included. No bound on the
+// turn time is needed: such a run did not exist before the admission.
 func loadEntryTokenActual(ctx context.Context, q queryRower, task, item string) (string, *big.Rat, string, error) {
 	actual, state := new(big.Rat), "not measured"
-	var entry, created string
-	err := q.QueryRowContext(ctx, `SELECT id,created_at FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task, item).Scan(&entry, &created)
+	var entry, created, claimed string
+	err := q.QueryRowContext(ctx, `SELECT id,created_at,admitted_at FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' AND released_at='' ORDER BY id LIMIT 1`, task, item).Scan(&entry, &created, &claimed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", actual, state, nil
 	}
 	if err != nil {
 		return "", nil, "", err
 	}
-	admitted := parseTS(created)
+	admitted := parseTS(claimed)
+	if admitted.IsZero() {
+		admitted = parseTS(created)
+	}
 	if admitted.IsZero() {
 		return entry, actual, state, nil // no readable admission: count nothing
 	}
@@ -1008,4 +1013,72 @@ func (s *Store) warnTokenBudget(ctx context.Context, tx *sql.Tx, task api.Task, 
 	_, err = tx.ExecContext(ctx, `INSERT INTO usage_entry_warnings(task_id,item_id,entry_id,estimate_tokens,threshold,team_tokens,team_state,lifetime_tokens,lifetime_state,lead_agent,lead_message_seq,helper_agent,helper_message_seq,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, item, entry, estimate, threshold, team.ActualTokens, team.ActualState, budget.ActualTokens, budget.ActualState, lead.ID, leadSeq, helper.ID, helperSeq, ts(s.now()))
 	return err == nil, err
+}
+
+// holdTokenBudgets holds the team of each item a usage upload just changed
+// whose running queue entry has spent strictly more than
+// api.BudgetHoldMultiple times the item's saved estimate. Like the warning it
+// compares the entry's team tokens since admission, so an item without a
+// running entry is never held, and an item with no saved estimate (one that
+// was admitted on a lane default) is never held either. It runs inside the
+// upload's transaction and never fails the upload: each item's work sits in a
+// savepoint rolled back whole on any error, so nothing of a failed hold
+// remains and the next new or revised turn tries again. It reports whether it
+// wrote a hold, so the caller can notify event waiters after the commit.
+func (s *Store) holdTokenBudgets(ctx context.Context, tx *sql.Tx, taskID string, items map[string]bool) (bool, error) {
+	if len(items) == 0 {
+		return false, nil
+	}
+	guarded := func(work func() error) error {
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT usage_hold`); err != nil {
+			return err
+		}
+		if workErr := work(); workErr != nil {
+			if _, err := tx.ExecContext(ctx, `ROLLBACK TO usage_hold`); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `RELEASE usage_hold`); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
+	var task api.Task
+	loaded := false
+	if err := guarded(func() error {
+		var err error
+		task, err = scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))
+		loaded = err == nil
+		return err
+	}); err != nil || !loaded || task.Status != api.TaskOpen {
+		return false, err
+	}
+	ids := make([]string, 0, len(items))
+	for id := range items {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	held := false
+	for _, id := range ids {
+		if err := guarded(func() error {
+			budget, _, actual, err := loadTokenBudgetActual(ctx, tx, task.ID, id)
+			if err != nil {
+				return err
+			}
+			if budget.Estimate == nil || budget.Team == nil || budget.Team.ActualState == "not measured" {
+				return nil
+			}
+			// Exact, and strictly greater: a team at the multiple has not
+			// passed it. A partial actual is a lower bound, so passing is real.
+			if actual.Cmp(big.NewRat(budget.Estimate.Tokens*api.BudgetHoldMultiple, 1)) <= 0 {
+				return nil
+			}
+			wrote, err := s.holdEntryBudget(ctx, tx, task, id, budget.Team.EntryID, budget.Estimate.Tokens, budget.Team, actual)
+			held = held || (wrote && err == nil)
+			return err
+		}); err != nil {
+			return false, err
+		}
+	}
+	return held, nil
 }

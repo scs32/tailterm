@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 	"math"
 	"math/big"
 	"os"
@@ -22,6 +23,15 @@ func cmdUsage(e env, args []string) error {
 	}
 	if len(args) > 0 && args[0] == "warning" {
 		return cmdUsageWarning(e, args[1:])
+	}
+	if len(args) > 0 && args[0] == "budget" {
+		return cmdUsageBudget(e, args[1:])
+	}
+	if len(args) > 0 && args[0] == "defaults" {
+		return cmdUsageDefaults(e, args[1:])
+	}
+	if len(args) > 0 && args[0] == "hold" {
+		return cmdUsageHold(e, args[1:])
 	}
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	project := fs.String("project", e.task, "project ID")
@@ -611,4 +621,268 @@ func formatCalibrationRow(row usageCalibrationRow) string {
 		template = "none"
 	}
 	return fmt.Sprintf("#%d %s %s lane=%s paths=%d template=%s · %s · %s", row.Seq, row.ItemID, row.Kind, row.Lane, row.OwnedPaths, template, formatTokenBudget(budget), row.Title)
+}
+
+// usageBudgetHost names this host as the queue runner and the relay do, so
+// tt usage budget shows the reading admission here would use.
+var usageBudgetHost = spawn.Host
+
+const usageBudgetUsage = "usage: tt usage budget get | set --runtime codex|claude --window five_hour|seven_day --allowance TOKENS [--reserve PCT] [--reset-at RFC3339] [--stale 15m] | clear --runtime R --window W, each with [--host H] [--project ID] [--json]"
+
+// cmdUsageBudget reads, sets or clears the project's token budget rows. With
+// no row the queue ignores budgets; with any row a queued team is admitted
+// only when its estimate fits what remains after the reserve.
+func cmdUsageBudget(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "get" && args[0] != "set" && args[0] != "clear") {
+		return errors.New(usageBudgetUsage)
+	}
+	fs := flag.NewFlagSet("usage budget", flag.ContinueOnError)
+	project := fs.String("project", e.task, "project ID")
+	runtime := fs.String("runtime", "", "codex or claude")
+	window := fs.String("window", "", "five_hour or seven_day")
+	allowance := fs.Int64("allowance", 0, "tokens that 100 percent of the window represents")
+	reserve := fs.Int("reserve", 0, "percent of the allowance kept back from admission, 0 to 90")
+	resetAt := fs.String("reset-at", "", "RFC3339 reset instant, used when no provider reading gives one")
+	stale := fs.Duration("stale", 0, "how old a provider reading may be and still decide (default 15m)")
+	host := fs.String("host", "", "the host whose provider reading is shown (default: this host)")
+	asJSON := fs.Bool("json", false, "JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 || !api.ValidID(*project, "tsk") {
+		return errors.New(usageBudgetUsage)
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	switch args[0] {
+	case "get":
+		if set["runtime"] || set["window"] || set["allowance"] || set["reserve"] || set["reset-at"] || set["stale"] {
+			return errors.New("get takes no budget values; use tt usage budget set")
+		}
+	case "set":
+		if *runtime == "" || *window == "" || *allowance < 1 {
+			return errors.New("set requires --runtime, --window and --allowance: the tokens that 100 percent of the window represents")
+		}
+		if *stale < 0 || *stale%time.Second != 0 {
+			return errors.New("--stale is a whole number of seconds, such as 15m")
+		}
+	case "clear":
+		if *runtime == "" || *window == "" || set["allowance"] || set["reserve"] || set["reset-at"] || set["stale"] {
+			return errors.New("clear requires --runtime and --window and takes no other budget value")
+		}
+	}
+	if *host == "" {
+		*host = usageBudgetHost()
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	var out api.UsageBudgets
+	// An agent names itself; the hub accepts the owner helper or a database handler.
+	req := api.UsageBudgetRequest{Runtime: *runtime, Window: *window, AllowanceTokens: *allowance, ReservePercent: *reserve, ResetAt: *resetAt, StaleSeconds: int(*stale / time.Second), AgentID: e.agent}
+	switch args[0] {
+	case "set":
+		if _, err = c.SetUsageBudget(ctx, *project, req); err != nil {
+			return err
+		}
+	case "clear":
+		if _, err = c.DeleteUsageBudget(ctx, *project, api.UsageBudgetRequest{Runtime: *runtime, Window: *window, AgentID: e.agent}); err != nil {
+			return err
+		}
+	}
+	// Every form prints the rows with the source this host's admission would use.
+	if out, err = c.UsageBudgets(ctx, *project, *host); err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Print(formatUsageBudgets(out))
+	return nil
+}
+
+// formatUsageBudgets is the text form of the budget rows: "not configured",
+// or one line per row with the source in use, the remaining tokens, the reset
+// time and, when the provider reading is not the source, why.
+func formatUsageBudgets(out api.UsageBudgets) string {
+	if !out.Configured || len(out.Budgets) == 0 {
+		return "Token budget: not configured\n"
+	}
+	var b strings.Builder
+	for _, row := range out.Budgets {
+		fmt.Fprintf(&b, "%s %s: allowance %s · reserve %d%% · reading stale after %s", row.Runtime, row.Window, formatTokenCount(strconv.FormatInt(row.AllowanceTokens, 10)), row.ReservePercent, time.Duration(row.StaleSeconds)*time.Second)
+		if row.ResetAt != "" {
+			b.WriteString(" · owner reset " + row.ResetAt)
+		}
+		if status := row.Status; status != nil {
+			host := status.Host
+			if host == "" {
+				host = "this host"
+			}
+			switch status.Source {
+			case api.UsageBudgetSourceProvider:
+				fmt.Fprintf(&b, " · source provider reading for host %s · remaining %s · resets %s", host, formatTokenCount(status.RemainingTokens), status.ResetAt)
+			case api.UsageBudgetSourceAllowance:
+				fmt.Fprintf(&b, " · source allowance minus reported usage · remaining %s · resets %s · provider reading for host %s %s", formatTokenCount(status.RemainingTokens), status.ResetAt, host, status.Reading)
+			default:
+				fmt.Fprintf(&b, " · no usable source: provider reading for host %s %s and no reset time is set; admission is held", host, status.Reading)
+			}
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+const usageDefaultsUsage = "usage: tt usage defaults get | set --small N --small-race N --planned N --planned-race N, each with [--project ID] [--json]"
+
+// cmdUsageDefaults reads or sets the lane default estimates: what admission
+// compares with the budget for an item that has no saved estimate. They are
+// data the backlog steward recomputes; they never warn and never pause a team.
+func cmdUsageDefaults(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "get" && args[0] != "set") {
+		return errors.New(usageDefaultsUsage)
+	}
+	fs := flag.NewFlagSet("usage defaults", flag.ContinueOnError)
+	project := fs.String("project", e.task, "project ID")
+	small := fs.Int64("small", 0, "tokens for a Small item without the Go race check")
+	smallRace := fs.Int64("small-race", 0, "tokens for a Small item with the Go race check")
+	planned := fs.Int64("planned", 0, "tokens for a Planned item without the Go race check")
+	plannedRace := fs.Int64("planned-race", 0, "tokens for a Planned item with the Go race check")
+	asJSON := fs.Bool("json", false, "JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 || !api.ValidID(*project, "tsk") {
+		return errors.New(usageDefaultsUsage)
+	}
+	values := *small != 0 || *smallRace != 0 || *planned != 0 || *plannedRace != 0
+	if args[0] == "get" && values {
+		return errors.New("get takes no values; use tt usage defaults set")
+	}
+	if args[0] == "set" && (*small < 1 || *smallRace < 1 || *planned < 1 || *plannedRace < 1) {
+		return errors.New("set requires all four: --small, --small-race, --planned and --planned-race")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	var out api.UsageEstimateDefaults
+	if args[0] == "get" {
+		out, err = c.UsageEstimateDefaults(ctx, *project)
+	} else {
+		out, err = c.SetUsageEstimateDefaults(ctx, *project, api.UsageEstimateDefaultsRequest{SmallTokens: *small, SmallRaceTokens: *smallRace, PlannedTokens: *planned, PlannedRaceTokens: *plannedRace, AgentID: e.agent})
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Print(formatUsageEstimateDefaults(out))
+	return nil
+}
+
+func formatUsageEstimateDefaults(out api.UsageEstimateDefaults) string {
+	if !out.Configured {
+		return "Lane default estimates: not set (tt usage defaults set)\n"
+	}
+	count := func(n int64) string { return formatTokenCount(strconv.FormatInt(n, 10)) }
+	return fmt.Sprintf("Lane default estimates: small %s · small with Go race %s · planned %s · planned with Go race %s · set %s\n",
+		count(out.SmallTokens), count(out.SmallRaceTokens), count(out.PlannedTokens), count(out.PlannedRaceTokens), out.UpdatedAt)
+}
+
+// formatEstimateDefault is the queue list's label for an entry admitted on a
+// lane default: " · default estimate 70.00M (planned, Go race)".
+func formatEstimateDefault(d *api.TeamQueueEstimateDefault) string {
+	if d == nil {
+		return ""
+	}
+	lane := d.Lane
+	if d.GoRace {
+		lane += ", Go race"
+	}
+	return " · default estimate " + formatTokenCount(strconv.FormatInt(d.Tokens, 10)) + " (" + lane + ")"
+}
+
+// formatBudgetHold is the queue list's line for an entry whose team is held
+// past the hold multiple of its saved estimate, with the two ways out.
+func formatBudgetHold(task string, h *api.BudgetHold) string {
+	if h == nil {
+		return ""
+	}
+	bound := ""
+	if h.TeamState == "partial" {
+		bound = "at least "
+	}
+	return fmt.Sprintf("held: past %d times its token estimate since %s (team %s%s, estimate %s); no new turns start. Continue: tt usage hold continue --project %s --entry %s. Stop, from an unbound owner shell: tt team queue fail --task %s --entry %s --reason TEXT",
+		api.BudgetHoldMultiple, h.CreatedAt, bound, formatTokenCount(h.TeamTokens), formatTokenCount(strconv.FormatInt(h.EstimateTokens, 10)), task, h.EntryID, task, h.EntryID)
+}
+
+const usageHoldUsage = "usage: tt usage hold list | continue --entry tqe_ID, each with [--project ID] [--json]"
+
+// cmdUsageHold lists the project's token budget holds, or continues one: the
+// owner's or the owner helper's answer that lifts it. Stopping a held team is
+// tt team queue fail.
+func cmdUsageHold(e env, args []string) error {
+	if len(args) == 0 || (args[0] != "list" && args[0] != "continue") {
+		return errors.New(usageHoldUsage)
+	}
+	fs := flag.NewFlagSet("usage hold", flag.ContinueOnError)
+	project := fs.String("project", e.task, "project ID")
+	entry := fs.String("entry", "", "continue: the held queue entry")
+	asJSON := fs.Bool("json", false, "JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 || !api.ValidID(*project, "tsk") || (args[0] == "list") != (*entry == "") {
+		return errors.New(usageHoldUsage)
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(15 * time.Second)
+	defer cancel()
+	if args[0] == "continue" {
+		q, err := c.GetTeamQueueEntry(ctx, *project, *entry)
+		if err != nil {
+			return err
+		}
+		// An agent names itself; the hub accepts only the owner helper. The
+		// request id names the hold, so a retry returns the first result.
+		id := fmt.Sprintf("usage-hold-continue-%s-%d", q.ID, q.Revision)
+		if _, err = c.TeamQueueAction(ctx, *project, api.TeamQueueRequest{RequestID: id, Operation: "budget_continue", EntryID: q.ID, ExpectedRevision: q.Revision, AgentID: e.agent}); err != nil {
+			return err
+		}
+		if !*asJSON {
+			fmt.Printf("Continued entry %s; its team is woken again.\n", q.ID)
+		}
+	}
+	out, err := c.UsageHolds(ctx, *project, "", "")
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	if len(out.Holds) == 0 {
+		fmt.Println("No token budget holds.")
+		return nil
+	}
+	for _, h := range out.Holds {
+		if h.State == api.BudgetHoldHeld {
+			fmt.Printf("%s %s %s\n", h.EntryID, h.ItemID, formatBudgetHold(*project, &h))
+			continue
+		}
+		fmt.Printf("%s %s stopped at %s; its %d runs stay unwoken until the failed entry is released\n", h.EntryID, h.ItemID, h.ResolvedAt, len(h.Runs))
+	}
+	return nil
 }

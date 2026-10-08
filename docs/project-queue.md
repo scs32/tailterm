@@ -1676,3 +1676,82 @@ applies only to ordinary worktrees and branch checkouts.
 - The cache trim does not reach Go build or module caches in a verification
   run's private home, `.build/go`, or any cache under a folder not named for
   an item: nothing on disk proves the harness made them.
+
+## Team queue token budget
+
+Feature `wi_1d2fbde2c149989e`, owner order #30088. The settings, sources and
+commands are in [usage-accounting.md](usage-accounting.md#token-budget); this
+section is what the queue does with them.
+
+**Admission.** With at least one budget row for the project, the claim skips a
+queued entry whose estimate the remaining budget cannot cover, the same way it
+skips an entry that waits for a rebind. The skipped entry stays `queued`,
+nothing is written, and its claim gets the existing "not queue head" conflict,
+which the runner treats as quiet. A later entry that fits is claimed past it.
+The estimate is the item's saved estimate or, without one, the project's lane
+default for the entry's template and Go race. The check runs only for queued
+entries: a launching or running entry is never failed, held or changed by it.
+With no budget row the queue admits and lists exactly as before.
+
+**The reason.** A budget-held entry shows its reason as `blockReason` when no
+earlier reason (slots, host capacity, the agent cap, a handler, ownership)
+already explains the wait:
+
+```
+Token budget (claude five_hour): needs about 44.00M tokens (default, planned); 31.20M remain before the reset at 2026-10-08T22:00:00Z, reserve 10% (source: provider reading)
+Token budget (claude five_hour): no usable source. Provider reading for host mini is not reported and no reset time is set
+Token budget: no estimate and no lane default; set one with tt usage defaults set
+```
+
+It is recomputed at every list and claim, so the entry is admitted after the
+reset, a new provider reading or a changed budget with no other action.
+Waiting for the budget is ordinary waiting, like host capacity: a budget-held
+entry has no `stall`, and a stall notice for it is refused.
+
+**The list.** An entry whose item has no saved estimate carries
+`estimateDefault` (`{"tokens":70000000,"lane":"planned","goRace":true}`), and
+its text `budget:` line ends ` · default estimate 70.00M (planned, Go race)`.
+An item with a saved estimate carries none. Every entry carries `admittedAt`
+once it has been claimed.
+
+**The entry hold.** When a running entry's team has spent more than 3 times
+its item's saved estimate, the entry carries `budgetHold` and the list prints:
+
+```
+  held: past 3 times its token estimate since 2026-10-08T19:00:00Z (team 36.10M, estimate 12.00M); no new turns start. Continue: tt usage hold continue --project tsk_… --entry tqe_…. Stop, from an unbound owner shell: tt team queue fail --task tsk_… --entry tqe_… --reason TEXT
+```
+
+The entry stays `running` and keeps its slot, handler lease and ownership. Its
+reason starts `Held past 3 times its token estimate`. The hold is a row beside
+the entry (`team_queue_budget_holds`); the project pause barrier is not used
+and the project stays active. It refuses no write. The hub's wake-job lease
+returns no job for a held run, and the relay delivers no inbox wake to one.
+
+- **Continue** is the queue operation `budget_continue` (`tt usage hold
+  continue`), allowed for the owner and the owner helper. The entry's revision
+  advances and the hold becomes `continued`.
+- **Stop** is the existing `fail` (`tt team queue fail`, from an unbound owner
+  shell). The hold becomes `stopped` in the same transaction, and the team's
+  runs stay unwoken while the entry is failed and not released. The failed
+  entry is then reconciled and released as any other.
+- A hold in force also ends as `stopped` when the entry finishes, is released,
+  is recorded as owner-integrated, or its team closes with the item open.
+
+A queued entry that would stall behind a held running entry (the held team is
+idle, by design) has no `stall`. Its reason is `Waits behind entry tqe_…, held
+past 3 times its token estimate until the owner helper continues or stops it`,
+and no stall notice is posted: the hold's own ask already carries the
+decision. If that entry is also blocked by something else, it shows the hold
+wait until the hold is resolved.
+
+**Admission time.** `team_queue_entries.admitted_at` is written by the claim.
+The team's token figure, the warning and the hold count runs bound at or after
+it. At the upgrade an entry that still has its launch reservation takes the
+reservation's time; any other entry keeps an empty value and is read from its
+creation time, as before. A backfilled entry's team figure can therefore be
+smaller than before, never larger.
+
+Limits: every budget row applies to every entry whatever its runtime; a large
+held entry can be passed by smaller ones for as long as the budget does not
+cover it; and stopping a held team does not end its sessions, which is the
+failed-entry cleanup above.

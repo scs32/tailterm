@@ -332,6 +332,257 @@ func (c *Client) SetUsageWarning(ctx context.Context, task string, req UsageWarn
 	return out, err
 }
 
+// Budget windows: the provider's rolling limits a budget row describes.
+const (
+	UsageWindowFiveHour = "five_hour"
+	UsageWindowSevenDay = "seven_day"
+)
+
+// UsageWindowLength is the length of a budget window; zero for an unknown one.
+func UsageWindowLength(window string) time.Duration {
+	switch window {
+	case UsageWindowFiveHour:
+		return 5 * time.Hour
+	case UsageWindowSevenDay:
+		return 7 * 24 * time.Hour
+	}
+	return 0
+}
+
+// Budget sources, in the order admission tries them.
+const (
+	UsageBudgetSourceProvider  = "provider"
+	UsageBudgetSourceAllowance = "allowance"
+	UsageBudgetSourceNone      = "none"
+)
+
+// DefaultUsageBudgetStaleSeconds is how old a provider reading may be and
+// still decide admission, unless the row sets its own bound.
+const DefaultUsageBudgetStaleSeconds = 900
+
+// UsageBudget is one owner-set budget row of a project: a runtime and one of
+// its provider windows. AllowanceTokens is the tokens that 100 percent of the
+// window represents; a provider percentage is converted with it and it is the
+// fallback when no reading is usable. ReservePercent of the allowance is kept
+// back from admission. ResetAt is an optional owner-entered reset instant,
+// used only when no reading gives one. Status is computed on read for the
+// host the read names.
+type UsageBudget struct {
+	Runtime         string             `json:"runtime"`
+	Window          string             `json:"window"`
+	AllowanceTokens int64              `json:"allowanceTokens"`
+	ReservePercent  int                `json:"reservePercent"`
+	ResetAt         string             `json:"resetAt,omitempty"`
+	StaleSeconds    int                `json:"staleSeconds"`
+	UpdatedAt       string             `json:"updatedAt,omitempty"`
+	UpdatedBy       Sender             `json:"updatedBy"`
+	Status          *UsageBudgetStatus `json:"status,omitempty"`
+}
+
+// UsageBudgetStatus is what admission would use for a budget row now: the
+// source, the remaining tokens (an exact rational string) before the reserve
+// is taken off, when the window resets, and, when the provider reading is not
+// the source, why. Source "none" has no remaining figure and holds admission.
+type UsageBudgetStatus struct {
+	Host            string `json:"host,omitempty"`
+	Source          string `json:"source"`
+	RemainingTokens string `json:"remainingTokens,omitempty"`
+	ResetAt         string `json:"resetAt,omitempty"`
+	Reading         string `json:"reading,omitempty"`
+}
+
+// UsageBudgets is a project's budget rows. With none, admission ignores
+// budgets altogether.
+type UsageBudgets struct {
+	Configured bool          `json:"configured"`
+	Host       string        `json:"host,omitempty"`
+	Budgets    []UsageBudget `json:"budgets"`
+}
+
+// UsageBudgetRequest sets one budget row, or with DELETE names the row to
+// clear. ResetAt is RFC 3339 or empty; StaleSeconds 0 means the default. An
+// agent caller names itself in AgentID and must be the project's owner helper
+// or a database handler of the project.
+type UsageBudgetRequest struct {
+	Runtime         string `json:"runtime"`
+	Window          string `json:"window"`
+	AllowanceTokens int64  `json:"allowanceTokens,omitempty"`
+	ReservePercent  int    `json:"reservePercent,omitempty"`
+	ResetAt         string `json:"resetAt,omitempty"`
+	StaleSeconds    int    `json:"staleSeconds,omitempty"`
+	AgentID         string `json:"agentId,omitempty"`
+}
+
+// UsageEstimateDefaults is a project's lane default estimates: what admission
+// compares with the budget for an item that has no saved estimate. They never
+// warn and never pause a team. "Race" is the figure for an entry whose owned
+// paths select the Go race check.
+type UsageEstimateDefaults struct {
+	Configured        bool   `json:"configured"`
+	SmallTokens       int64  `json:"smallTokens"`
+	SmallRaceTokens   int64  `json:"smallRaceTokens"`
+	PlannedTokens     int64  `json:"plannedTokens"`
+	PlannedRaceTokens int64  `json:"plannedRaceTokens"`
+	UpdatedAt         string `json:"updatedAt,omitempty"`
+	UpdatedBy         Sender `json:"updatedBy"`
+}
+
+// UsageEstimateDefaultsRequest sets all four lane defaults. AgentID is as in
+// UsageBudgetRequest.
+type UsageEstimateDefaultsRequest struct {
+	SmallTokens       int64  `json:"smallTokens"`
+	SmallRaceTokens   int64  `json:"smallRaceTokens"`
+	PlannedTokens     int64  `json:"plannedTokens"`
+	PlannedRaceTokens int64  `json:"plannedRaceTokens"`
+	AgentID           string `json:"agentId,omitempty"`
+}
+
+// Provider reading states. Anything but ok carries no figure.
+const (
+	ProviderUsageOK         = "ok"
+	ProviderUsageMissing    = "missing"
+	ProviderUsageUnreadable = "unreadable"
+	ProviderUsageMalformed  = "malformed"
+)
+
+// ProviderUsageWindow is one window of a provider reading: the percentage of
+// the window used, 0 to 100, and when the window resets.
+type ProviderUsageWindow struct {
+	Window      string  `json:"window"`
+	UsedPercent float64 `json:"usedPercent"`
+	ResetsAt    string  `json:"resetsAt"`
+}
+
+// ProviderUsageReport is what a host's relay reports from the runtime's own
+// usage capture. A state other than ok is an invalidation: the hub then keeps
+// no figure of an earlier reading for that host and runtime.
+type ProviderUsageReport struct {
+	Host       string                `json:"host"`
+	Runtime    string                `json:"runtime"`
+	State      string                `json:"state"`
+	CapturedAt string                `json:"capturedAt,omitempty"`
+	Version    string                `json:"version,omitempty"`
+	Windows    []ProviderUsageWindow `json:"windows,omitempty"`
+}
+
+// ProviderReading is one stored window of a host's provider reading.
+type ProviderReading struct {
+	Runtime     string `json:"runtime"`
+	Window      string `json:"window"`
+	State       string `json:"state"`
+	UsedPercent string `json:"usedPercent,omitempty"`
+	ResetsAt    string `json:"resetsAt,omitempty"`
+	CapturedAt  string `json:"capturedAt,omitempty"`
+	ReportedAt  string `json:"reportedAt"`
+	Version     string `json:"version,omitempty"`
+}
+
+// ProviderUsage is every stored reading of one host.
+type ProviderUsage struct {
+	Host     string            `json:"host"`
+	Readings []ProviderReading `json:"readings"`
+}
+
+// Budget hold states. A held team starts no new turns until the owner helper
+// continues it or stops it by failing its queue entry.
+const (
+	BudgetHoldHeld      = "held"
+	BudgetHoldContinued = "continued"
+	BudgetHoldStopped   = "stopped"
+)
+
+// BudgetHoldMultiple is how many times its saved estimate a running entry's
+// team may spend before it is held. The comparison is strictly greater.
+const BudgetHoldMultiple = 3
+
+// BudgetHoldRun is one exact run of a held team.
+type BudgetHoldRun struct {
+	AgentID string `json:"agentId"`
+	RunID   string `json:"runId"`
+}
+
+// BudgetHold records that a running queue entry's team passed
+// BudgetHoldMultiple times the item's saved estimate. There is one per entry
+// and estimate value. TeamTokens is the exact rational figure compared. Runs
+// lists the team's runs while the relay must not wake them: while the hold is
+// held, and while it is stopped and the entry is failed and unreleased.
+type BudgetHold struct {
+	EntryID        string          `json:"entryId"`
+	ItemID         string          `json:"itemId"`
+	EstimateTokens int64           `json:"estimateTokens"`
+	TeamTokens     string          `json:"teamTokens"`
+	TeamState      string          `json:"teamState"`
+	State          string          `json:"state"`
+	AskAgent       string          `json:"askAgent,omitempty"`
+	AskSeq         int64           `json:"askSeq,omitempty"`
+	CreatedAt      string          `json:"createdAt"`
+	ResolvedAt     string          `json:"resolvedAt,omitempty"`
+	ResolvedBy     *Sender         `json:"resolvedBy,omitempty"`
+	Runs           []BudgetHoldRun `json:"runs,omitempty"`
+}
+
+// UsageHolds is a project's budget holds that still keep runs from waking,
+// and Held whether there is any. With an agent and run named in the read,
+// Held says whether that exact run is one of the held runs, and Holds carries
+// only its hold.
+type UsageHolds struct {
+	Held  bool         `json:"held"`
+	Holds []BudgetHold `json:"holds"`
+}
+
+func (c *Client) UsageBudgets(ctx context.Context, task, host string) (UsageBudgets, error) {
+	var out UsageBudgets
+	query := ""
+	if host != "" {
+		query = "?host=" + url.QueryEscape(host)
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/usage/budget"+query, nil, &out)
+	return out, err
+}
+func (c *Client) SetUsageBudget(ctx context.Context, task string, req UsageBudgetRequest) (UsageBudgets, error) {
+	var out UsageBudgets
+	err := c.do(ctx, "PUT", "/v1/tasks/"+url.PathEscape(task)+"/usage/budget", req, &out)
+	return out, err
+}
+func (c *Client) DeleteUsageBudget(ctx context.Context, task string, req UsageBudgetRequest) (UsageBudgets, error) {
+	var out UsageBudgets
+	err := c.do(ctx, "DELETE", "/v1/tasks/"+url.PathEscape(task)+"/usage/budget", req, &out)
+	return out, err
+}
+func (c *Client) UsageEstimateDefaults(ctx context.Context, task string) (UsageEstimateDefaults, error) {
+	var out UsageEstimateDefaults
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/usage/defaults", nil, &out)
+	return out, err
+}
+func (c *Client) SetUsageEstimateDefaults(ctx context.Context, task string, req UsageEstimateDefaultsRequest) (UsageEstimateDefaults, error) {
+	var out UsageEstimateDefaults
+	err := c.do(ctx, "PUT", "/v1/tasks/"+url.PathEscape(task)+"/usage/defaults", req, &out)
+	return out, err
+}
+
+// UsageHolds reads the project's holds. With agent and run it asks only
+// whether that exact run is held. A hub without holds answers 404, which is
+// returned as it is.
+func (c *Client) UsageHolds(ctx context.Context, task, agent, run string) (UsageHolds, error) {
+	var out UsageHolds
+	query := ""
+	if agent != "" || run != "" {
+		query = "?" + url.Values{"agent": {agent}, "run": {run}}.Encode()
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/usage/holds"+query, nil, &out)
+	return out, err
+}
+func (c *Client) ReportProviderUsage(ctx context.Context, report ProviderUsageReport) (ProviderUsage, error) {
+	var out ProviderUsage
+	err := c.do(ctx, "PUT", "/v1/provider-usage", report, &out)
+	return out, err
+}
+func (c *Client) ProviderUsage(ctx context.Context, host string) (ProviderUsage, error) {
+	var out ProviderUsage
+	err := c.do(ctx, "GET", "/v1/provider-usage?host="+url.QueryEscape(host), nil, &out)
+	return out, err
+}
+
 // NormalizeUsageTokens version 1 preserves missing class availability.
 func NormalizeUsageTokens(runtime string, raw map[string]int64) (map[string]int64, string) {
 	out := map[string]int64{}

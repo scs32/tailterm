@@ -29,16 +29,19 @@ import (
 // and runs doctor. --check reports the same steps without changing anything;
 // --rollback restores the previous binary. See docs/host-setup.md.
 
-const hostSetupUsage = `usage: tt host setup [--hub URL] [--from PATH] [--service agent|daemon] [--check | --rollback] [--json]
+const hostSetupUsage = `usage: tt host setup [--hub URL] [--from PATH] [--service agent|daemon] [--check | --rollback | --remove-claude-usage] [--json]
 
-Installs or updates tt, the Codex and Claude Code hooks and the inbox relay
-service on this machine, then runs tt doctor. Safe to run again.
+Installs or updates tt, the Codex and Claude Code hooks, the Claude usage
+capture status line and the inbox relay service on this machine, then runs
+tt doctor. Safe to run again.
 
   --hub URL         write ~/.config/tailterm/hub.json with this hub URL when absent
   --from PATH       the tt binary to install (default: the running executable)
   --service MODE    agent: a user LaunchAgent (default); daemon: a system LaunchDaemon (uses sudo)
   --check           report what is missing or out of date; change nothing; exit 1 if anything is
   --rollback        restore the previous tt binary and restart the relay
+  --remove-claude-usage
+                    remove the Claude usage capture status line and its command; change nothing else
   --json            print the steps and every path the run may write as JSON
 `
 
@@ -71,6 +74,7 @@ const (
 	hostOutdated  = "outdated"
 	hostConflict  = "conflict"
 	hostFailed    = "failed"
+	hostRemoved   = "removed"
 )
 
 type hostStep struct {
@@ -92,7 +96,9 @@ type hostReport struct {
 type hostPaths struct {
 	home, install, staged, rollback, rollbackTmp string
 	codexHooks, claudeSettings, hubConfig        string
-	agentPlist, daemonPlist, logDir, relayLock   string
+	// claudeUsageScript is the capture status line command.
+	claudeUsageScript                          string
+	agentPlist, daemonPlist, logDir, relayLock string
 	// restartPending exists from the moment a new binary is installed until
 	// the relay has been restarted on it, so a later run finishes the job.
 	restartPending, daemonStaged string
@@ -110,20 +116,21 @@ func newHostPaths() (hostPaths, error) {
 	}
 	root := or(os.Getenv("TAILTERM_HOST_SETUP_ROOT"), "/")
 	return hostPaths{
-		home:           home,
-		install:        filepath.Join(bin, "tt"),
-		staged:         filepath.Join(bin, "tt.new"),
-		rollback:       filepath.Join(bin, "tt.previous"),
-		rollbackTmp:    filepath.Join(bin, "tt.previous.tmp"),
-		codexHooks:     filepath.Join(codexHome(), "hooks.json"),
-		claudeSettings: filepath.Join(claude, "settings.json"),
-		hubConfig:      filepath.Join(home, ".config", "tailterm", "hub.json"),
-		agentPlist:     filepath.Join(home, "Library", "LaunchAgents", hostRelayLabel+".plist"),
-		daemonPlist:    filepath.Join(root, "Library", "LaunchDaemons", hostRelayLabel+".plist"),
-		logDir:         filepath.Join(home, "Library", "Logs", "Tailterm"),
-		relayLock:      filepath.Join(relayDir(), "relay.lock"),
-		restartPending: filepath.Join(home, ".local", "state", "tailterm", "host-setup-restart-pending"),
-		daemonStaged:   filepath.Join(home, ".local", "state", "tailterm", hostRelayLabel+".daemon.plist.staged"),
+		home:              home,
+		install:           filepath.Join(bin, "tt"),
+		staged:            filepath.Join(bin, "tt.new"),
+		rollback:          filepath.Join(bin, "tt.previous"),
+		rollbackTmp:       filepath.Join(bin, "tt.previous.tmp"),
+		codexHooks:        filepath.Join(codexHome(), "hooks.json"),
+		claudeSettings:    filepath.Join(claude, "settings.json"),
+		claudeUsageScript: filepath.Join(bin, claudeUsageCaptureName),
+		hubConfig:         filepath.Join(home, ".config", "tailterm", "hub.json"),
+		agentPlist:        filepath.Join(home, "Library", "LaunchAgents", hostRelayLabel+".plist"),
+		daemonPlist:       filepath.Join(root, "Library", "LaunchDaemons", hostRelayLabel+".plist"),
+		logDir:            filepath.Join(home, "Library", "Logs", "Tailterm"),
+		relayLock:         filepath.Join(relayDir(), "relay.lock"),
+		restartPending:    filepath.Join(home, ".local", "state", "tailterm", "host-setup-restart-pending"),
+		daemonStaged:      filepath.Join(home, ".local", "state", "tailterm", hostRelayLabel+".daemon.plist.staged"),
 	}, nil
 }
 
@@ -159,6 +166,7 @@ func (p hostPaths) resolved() map[string]string {
 		"codexHooksBackup":     codex + hostBackupSuffix,
 		"claudeSettings":       claude,
 		"claudeSettingsBackup": claude + hostBackupSuffix,
+		"claudeUsageScript":    resolvePath(p.claudeUsageScript),
 		"hubConfig":            resolvePath(p.hubConfig),
 		"agentPlist":           resolvePath(p.agentPlist),
 		"daemonPlist":          resolvePath(p.daemonPlist),
@@ -199,6 +207,7 @@ func cmdHost(args []string) error {
 	service := fs.String("service", "", "")
 	check := fs.Bool("check", false, "")
 	rollback := fs.Bool("rollback", false, "")
+	removeUsage := fs.Bool("remove-claude-usage", false, "")
 	asJSON := fs.Bool("json", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -216,6 +225,8 @@ func cmdHost(args []string) error {
 		return hostUsageError("--service must be agent or daemon")
 	case *rollback && (*hub != "" || *from != "" || *service != ""):
 		return hostUsageError("--rollback takes no --hub, --from or --service")
+	case *removeUsage && (*check || *rollback || *hub != "" || *from != "" || *service != ""):
+		return hostUsageError("--remove-claude-usage takes no other option but --json")
 	}
 	// As root every file written would be root-owned in the agent user's
 	// home, so refuse before any step. Only the daemon's plist and launchctl
@@ -238,6 +249,9 @@ func cmdHost(args []string) error {
 		}
 		h.restartRelay()
 		h.doctor(&doctor)
+	case *removeUsage:
+		report.Mode = "remove-claude-usage"
+		h.removeClaudeUsage()
 	default:
 		if *check {
 			report.Mode = "check"
@@ -246,6 +260,7 @@ func cmdHost(args []string) error {
 		h.hubConfig()
 		h.hooks("codex-hooks", "codex", p.codexHooks, codexHookEvents)
 		h.hooks("claude-hooks", "claude", p.claudeSettings, claudeHookEvents)
+		h.claudeUsage()
 		report.Service = h.relayService()
 		h.doctor(&doctor)
 	}
@@ -779,6 +794,190 @@ func (h *hostSetup) hooks(name, runtimeName, path string, events []hookEvent) {
 	default:
 		h.add(name, hostUpdated, path+" (the file as it was is kept at "+resolvePath(path)+hostBackupSuffix+")")
 	}
+}
+
+// ---- Claude usage capture ----
+
+// The capture status line is a Claude Code statusLine command that saves the
+// account's rate limits for the token budget and prints nothing
+// (provider_usage.go). Claude Code has one statusLine, so a different one the
+// user set is never replaced: it is left as it is and reported.
+
+// claudeUsageStatusLine is the settings entry host setup manages.
+func claudeUsageStatusLine(script string) map[string]any {
+	return map[string]any{"type": "command", "command": script}
+}
+
+// ownClaudeUsageStatusLine reports whether a statusLine value is the capture
+// command: a command entry that runs the installed script and nothing else.
+func ownClaudeUsageStatusLine(value any, script string) bool {
+	entry, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	command, _ := entry["command"].(string)
+	kind, _ := entry["type"].(string)
+	return command == script && (kind == "command" || kind == "")
+}
+
+// statusLineText prints a statusLine value on one line for a report.
+func statusLineText(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(raw)
+}
+
+// claudeUsageScriptState is missing, outdated or current for the installed
+// capture command.
+func claudeUsageScriptState(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return hostMissing, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if string(data) != claudeUsageCaptureScript || info.Mode().Perm()&0o111 == 0 {
+		return hostOutdated, nil
+	}
+	return hostCurrent, nil
+}
+
+// claudeUsage installs or checks the capture status line: the command at
+// ~/.local/bin/tt-claude-usage-capture and the statusLine entry in the Claude
+// settings. A different existing statusLine is a conflict: nothing is
+// written and the report shows its value.
+func (h *hostSetup) claudeUsage() {
+	const name = "claude-usage"
+	installed := false
+	for _, r := range hostSetupRuntimes() {
+		installed = installed || r == "claude"
+	}
+	if !installed {
+		h.add(name, hostCurrent, "claude runtime not installed; usage capture not needed")
+		return
+	}
+	script, settings := h.p.claudeUsageScript, h.p.claudeSettings
+	// Settings the hooks step refused are not touched here either.
+	for _, step := range h.steps {
+		if step.Name == "claude-hooks" && step.State == hostFailed {
+			h.add(name, hostFailed, "not installed: "+settings+" was refused by claude-hooks; fix it first; nothing was changed")
+			return
+		}
+	}
+	// Look first, so a conflict writes nothing at all.
+	var existing any
+	probe, err := mergeJSONFile(settings, false, func(doc map[string]any) (bool, error) {
+		existing = doc["statusLine"]
+		return existing == nil, nil
+	})
+	if err != nil {
+		h.add(name, hostFailed, err.Error()+"; nothing was changed")
+		return
+	}
+	if existing != nil && !ownClaudeUsageStatusLine(existing, script) {
+		h.add(name, hostConflict, fmt.Sprintf("%s already has a different statusLine, left unchanged: %s. Claude usage is not captured on this host; to capture it, have that status line command also run %s with the same input, or remove it and run tt host setup again", settings, statusLineText(existing), script))
+		return
+	}
+	scriptState, err := claudeUsageScriptState(script)
+	if err != nil {
+		h.add(name, hostFailed, err.Error()+"; nothing was changed")
+		return
+	}
+	if scriptState == hostCurrent && !probe.changed {
+		h.add(name, hostCurrent, script+" is the statusLine in "+settings)
+		return
+	}
+	if !h.apply {
+		// Missing: the command or its statusLine entry is not there.
+		// Outdated: both are, and the command is an older version.
+		state, detail := hostOutdated, "would update "+script
+		switch {
+		case scriptState == hostMissing && probe.changed:
+			state, detail = hostMissing, "would install "+script+" and set it as the statusLine in "+settings
+		case probe.changed:
+			state, detail = hostMissing, "would set "+script+" as the statusLine in "+settings
+		case scriptState == hostMissing:
+			state, detail = hostMissing, "would install "+script
+		}
+		h.add(name, state, detail)
+		return
+	}
+	if scriptState != hostCurrent {
+		if err := writeFileAtomic(script, []byte(claudeUsageCaptureScript), 0o755, 0o755); err != nil {
+			h.add(name, hostFailed, err.Error())
+			return
+		}
+	}
+	out, err := mergeJSONFile(settings, true, func(doc map[string]any) (bool, error) {
+		if current := doc["statusLine"]; current != nil {
+			if !ownClaudeUsageStatusLine(current, script) {
+				return false, errors.New("statusLine changed while host setup ran")
+			}
+			return false, nil
+		}
+		doc["statusLine"] = claudeUsageStatusLine(script)
+		return true, nil
+	})
+	switch {
+	case err != nil:
+		h.add(name, hostFailed, err.Error())
+	case scriptState == hostMissing && out.changed:
+		h.add(name, hostInstalled, script+" set as the statusLine in "+settings+"; remove with tt host setup --remove-claude-usage")
+	case out.changed:
+		h.add(name, hostUpdated, script+" set as the statusLine in "+settings+" (the file as it was is kept at "+resolvePath(settings)+hostBackupSuffix+")")
+	default:
+		h.add(name, hostUpdated, script)
+	}
+}
+
+// removeClaudeUsage is the one command that takes the capture status line
+// out again: our statusLine entry and the command file, nothing else. A
+// different statusLine is left alone and reported. The last capture file
+// stays where it is; nothing refreshes it, so the hub stops using it once it
+// is older than the budget's staleness bound.
+func (h *hostSetup) removeClaudeUsage() {
+	const name = "claude-usage"
+	script, settings := h.p.claudeUsageScript, h.p.claudeSettings
+	var other any
+	out, err := mergeJSONFile(settings, true, func(doc map[string]any) (bool, error) {
+		current, ok := doc["statusLine"]
+		if !ok || current == nil {
+			return false, nil
+		}
+		if !ownClaudeUsageStatusLine(current, script) {
+			other = current
+			return false, nil
+		}
+		delete(doc, "statusLine")
+		return true, nil
+	})
+	if err != nil {
+		h.add(name, hostFailed, err.Error()+"; nothing was changed")
+		return
+	}
+	removed := out.changed
+	if err := os.Remove(script); err == nil {
+		removed = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		h.add(name, hostFailed, err.Error())
+		return
+	}
+	detail := "the capture status line was not installed"
+	state := hostCurrent
+	if removed {
+		state, detail = hostRemoved, "removed "+script+" and its statusLine entry in "+settings
+	}
+	if other != nil {
+		detail += "; a different statusLine is set and was left unchanged: " + statusLineText(other)
+	}
+	h.add(name, state, detail)
 }
 
 // ---- relay service ----
