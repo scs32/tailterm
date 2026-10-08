@@ -619,8 +619,17 @@ const (
 )
 
 // a7: processes appending and rotating at once lose no row.
+//
+// Each child is this test binary again, with an empty temporary directory as
+// its home, so it reads no relay.json, hub.json or handoff.json of the host
+// (bug wi_fc17a11cbecb5af7: the host's redaction setting once made every row
+// longer, and the ledger rotated twice). A child that sees any other home
+// fails before it writes a row.
 func TestToolLedgerRotationAcrossProcesses(t *testing.T) {
 	if child := os.Getenv(toolLedgerChildEnv); child != "" {
+		if home, err := os.UserHomeDir(); err != nil || home == "" || home != os.Getenv(toolLedgerChildEnv+"_HOME") {
+			t.Fatalf("child home = %q, %v; want the parent's temporary home %q", home, err, os.Getenv(toolLedgerChildEnv+"_HOME"))
+		}
 		// The parent set the ledger root in the child's environment, which
 		// TestMain then cleared with every other TAILTERM_ variable.
 		t.Setenv("TAILTERM_TOOL_LEDGER_DIR", os.Getenv(toolLedgerChildEnv+"_DIR"))
@@ -633,11 +642,16 @@ func TestToolLedgerRotationAcrossProcesses(t *testing.T) {
 		return
 	}
 	root := filepath.Join(t.TempDir(), "tool-ledger")
+	home := filepath.Join(t.TempDir(), "home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
 	cmds := make([]*exec.Cmd, toolLedgerChildren)
 	outs := make([]bytes.Buffer, toolLedgerChildren)
 	for i := range cmds {
 		cmds[i] = exec.Command(os.Args[0], "-test.run=^TestToolLedgerRotationAcrossProcesses$", "-test.count=1")
-		cmds[i].Env = append(os.Environ(), toolLedgerChildEnv+"="+strconv.Itoa(i), toolLedgerChildEnv+"_DIR="+root)
+		// A later HOME replaces the inherited one.
+		cmds[i].Env = append(os.Environ(), "HOME="+home, toolLedgerChildEnv+"_HOME="+home, toolLedgerChildEnv+"="+strconv.Itoa(i), toolLedgerChildEnv+"_DIR="+root)
 		cmds[i].Stdout, cmds[i].Stderr = &outs[i], &outs[i]
 		if err := cmds[i].Start(); err != nil {
 			t.Fatal(err)
@@ -651,6 +665,12 @@ func TestToolLedgerRotationAcrossProcesses(t *testing.T) {
 	seen := map[string]int{}
 	for _, row := range toolLedgerRows(t, root, "agt_ledger", "ledger.jsonl.1", "ledger.jsonl") { // also fails on a line that does not parse
 		seen[fmt.Sprint(row["toolUseId"])]++
+		if row["redactMode"] != nil {
+			t.Fatalf("row %v carries a redaction setting; a child read a host setting", row["toolUseId"])
+		}
+	}
+	if entries, err := os.ReadDir(home); err != nil || len(entries) != 0 {
+		t.Fatalf("the children's home holds %v, %v; want it left empty", entries, err)
 	}
 	for child := 0; child < toolLedgerChildren; child++ {
 		for i := 0; i < toolLedgerChildRows; i++ {
