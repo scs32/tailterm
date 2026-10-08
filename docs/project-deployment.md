@@ -43,7 +43,7 @@ bases, conflicts, verification mismatches and release-ref races. A changed SHA
 waits before publication for a separate handler-imported release verification
 receipt covering the approved matrix on that exact integrated commit. The
 waiting-matrix journal can resume only with the same clean detached commit;
-other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-inputs.json` binds version 1, jobId, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job. A reused manifest or different SHA is refused. A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains; when a later job is waiting it posts a fence-wait notice, and a waiting claim with no effects can be set aside (see "Setting aside a job that holds the fence"). The release branch update
+other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-gN-inputs.json` (N is the job generation the handler's inputs run read) binds version 1, jobId, that generation, the attempt, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job generation. The runner uses the generation-named manifest whose bytes hash to the imported digest and refuses one that records another generation or attempt (see "Handler inputs procedure"). A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains; when a later job is waiting it posts a fence-wait notice, and a waiting claim with no effects can be set aside (see "Setting aside a job that holds the fence"). The release branch update
 uses Git compare-and-swap, and after every selected target is live-verified the
 runner fast-forward pushes `tasks-hub` to `origin` (see "Effects on tasks-hub").
 
@@ -1297,11 +1297,11 @@ release job"), the project handler, on the Mini in the dedicated checkout:
    the job, generation, commit, selected targets and release names.
 2. `node scripts/release-inputs.mjs --config PRIVATE --job ID`. It writes one
    TrueNAS plan from `inputs.planTemplate`: when hub and bridge are both
-   selected, `ID-truenas-plan.json` with `deployment.targets = ["hub","bridge"]`,
+   selected, `ID-gN-truenas-plan.json` with `deployment.targets = ["hub","bridge"]`,
    release `ID-SHA12-truenas` for both binaries and backup
-   `before-ID-truenas.sqlite`; when only one is selected, `ID-TARGET-plan.json`
+   `before-ID-gN-truenas.sqlite`; when only one is selected, `ID-gN-TARGET-plan.json`
    with `deployment.targets = [TARGET]`, release `ID-SHA12-TARGET`, backup
-   `before-ID-TARGET.sqlite` and the other target's live mount retained. For
+   `before-ID-gN-TARGET.sqlite` and the other target's live mount retained. For
    each plan it runs `truenas_release_preflight.py --plan --receipt-output` once
    to create the backup, pins the receipt hash and copies the backup locally when
    the store schema changed. `tests/truenas-release-preflight.test.js` builds its
@@ -1309,13 +1309,82 @@ release job"), the project handler, on the Mini in the dedicated checkout:
    directory's group. Each hub/bridge manifest entry records its
    `planTargets` and names `--rollback-to` and rollback probe commands for that
    target's own probed live release. Mini and TailOS get their rollback probe and retained-dist program.
-   The manifest `journalDirectory/ID-inputs.json` is written once, mode 0600.
+   The manifest `journalDirectory/ID-gN-inputs.json` is written once, mode 0600.
 3. Run the printed `tt deployment inputs --job ID --generation N --commit SHA
 --file PATH --request-id KEY` and reply to the deployer's request with the
    saved result. The deployer resumes on its next pass.
 
 A refused run prints only its own reason. A manifest that already exists is
-never rewritten; a changed job needs handler reconciliation.
+never rewritten.
+
+**Names carry the job generation (wi_f1f0ec6eda73d8eb).** `ID-gN` is the job id
+and the generation N the inputs run read from the hub, the same N it prints as
+`--generation N`. NAME is `truenas` for a paired plan, otherwise `hub` or
+`bridge`.
+
+| Artifact or identity | Name |
+|---|---|
+| Manifest | `journalDirectory/ID-gN-inputs.json` |
+| Plan | `journalDirectory/ID-gN-NAME-plan.json` |
+| Preflight receipt | `journalDirectory/ID-gN-NAME-preflight.json` |
+| Manifest copy for a deployer on the earlier scripts | `journalDirectory/ID-inputs.json` (only when absent) |
+| Local backup copy (schema change only) | `journalDirectory/ID-gN-NAME-backup.sqlite` |
+| TrueNAS backup | `backups/before-ID-gN-NAME.sqlite` |
+| Preflight request id | `ID-gN-NAME-backup` |
+| Hub import request id | `ID-gN-inputs-SHA12` |
+| Deployer's request to the handler | names `ID-gN-inputs.json`, request id `ID-gN-inputs-SHA` |
+
+The release name `ID-SHA12-NAME`, the journal `ID.json`, `ID-receipt.json`,
+`ID-migration` and `ID-mini-before` are unchanged. The manifest body also
+records `generation` (N) and `attempt` (the number of times the job was set
+aside or requeued, the length of its `reconciliations`).
+
+- **A job set aside and claimed again** is at a later generation, so its inputs
+  run writes a complete fresh set and a fresh TrueNAS backup. No file is
+  renamed or moved by hand. The earlier attempt's files and its TrueNAS backup
+  are never opened for writing, renamed or removed; they stay as evidence.
+  Pruning earlier attempts' manifests, plans, receipts and TrueNAS backups is
+  retention work under `wi_d203eb94ef27d8f8`; the local backup copies of every
+  generation already follow "Journal retention" below.
+- **Running the inputs command again at the same generation is safe.** When the
+  manifest exists it returns the same path, digest, targets and import command
+  and makes no probe, backup or backup copy, and changes no file; a manifest whose binding differs
+  is refused ("Job manifest already written for this generation with a
+  different binding"). When an earlier run stopped before the manifest, it
+  reuses the plan it left (refused as "Job plan already written with different
+  inputs" if the plan made now differs), sends preflight the same request id
+  and destination, which the tool answers `already-satisfied`, and replaces
+  only that generation's own unfinished backup copy.
+- **Once inputs are bound the command refuses** ("Job inputs already bound; set
+  the job aside before preparing new inputs"); `--dry-run` still prints.
+- **Which manifest the deployer reads.** The hub keeps the imported digest, not
+  the generation it was imported at, and the import itself moves the job on.
+  So the runner lists `ID-gN-inputs.json` files and uses the one whose bytes
+  hash to the job's `inputsDigest`. It refuses with "Input manifest bound to
+  another generation" when that file records a generation other than its
+  name's, a generation that is not below the job's current one, or another
+  attempt, and when only manifests of other generations exist. With no
+  generation-named manifest at all the refusal is "Handler input digest
+  binding required". A manifest that records a generation must also name a
+  backup containing `ID-gN-`.
+- **Transition: a manifest from before this change.** `ID-inputs.json` with no
+  `generation` field is still used when it hashes to the imported digest and
+  no generation-named manifest does, so a job already bound when the deployer
+  restarts goes on unchanged. The same file with a `generation` field and no
+  generation-named manifest of that digest, or another digest, is refused.
+- **Transition: a deployer still on the earlier scripts.** The inputs command
+  runs from the deployer's checkout, which the runner moves to the candidate
+  before it asks for inputs, while the running deployer keeps the scripts it
+  loaded until it restarts. Those earlier scripts read only `ID-inputs.json`
+  and check its digest. So after writing (or finding) `ID-gN-inputs.json` the
+  inputs command also creates `ID-inputs.json` with the same bytes, mode 0600,
+  when no file has that name. The printed command still imports the
+  generation-named path, and a runner with this change still selects that file
+  by digest. A file already named `ID-inputs.json` belongs to an earlier
+  attempt: it is never rewritten, renamed or removed, and is not an error; an
+  earlier-scripts deployer would refuse that retried job, as before this
+  change. The copy is a transition aid and can be dropped once no deployer
+  runs the earlier scripts.
 
 ### Migration rehearsal container (wi_78521ba68a8ad197)
 
@@ -1415,20 +1484,21 @@ removed by hand with `container delete -f tt-rehearsal-ID`.
 ### Journal retention (wi_e83171b4c215f626)
 
 **Where backups live.** The authoritative pre-release backup is on TrueNAS at
-`/mnt/deepfreeze/tailterm-hub/backups/before-ID-NAME.sqlite` (NAME is `truenas`
-for a paired plan, otherwise `hub` or `bridge`). The deployer has no code path
+`/mnt/deepfreeze/tailterm-hub/backups/before-ID-gN-NAME.sqlite` (N is the job
+generation of that inputs run, NAME is `truenas` for a paired plan, otherwise
+`hub` or `bridge`; before `wi_f1f0ec6eda73d8eb` the names had no `gN-`). The deployer has no code path
 to it and never removes it. When the store schema changed, the handler's inputs
-run also copies it to the Mini as `journalDirectory/ID-NAME-backup.sqlite`. That
+run also copies it to the Mini as `journalDirectory/ID-gN-NAME-backup.sqlite`. That
 local copy is read only by its own job's migration rehearsal; no rollback reads
 it.
 
 **Rehearsal copy.** The rehearsal migrates `hub.sqlite` in the state directory
-`ID-NAME-backup.sqlite.rehearsal-ID.state/` (0700), a copy of the local copy
+`ID-gN-NAME-backup.sqlite.rehearsal-ID.state/` (0700), a copy of the local copy
 mounted into the container as `/state`, and removes the whole directory (the
 copy, its SQLite sidecars `-wal`, `-shm`, `-journal` and any temporary file)
 when the rehearsal ends, pass or fail. A failed cleanup never changes the
 rehearsal's result. Before copying it saves the marker
-`ID-NAME-backup.sqlite.rehearsal-ID.json` (0600):
+`ID-gN-NAME-backup.sqlite.rehearsal-ID.json` (0600):
 
 ```
 {version: 1, jobId, backupSHA256, startedAt, outcome: "started"}
@@ -1438,12 +1508,16 @@ rehearsal's result. Before copying it saves the marker
 The marker holds no path, output or error text. A job whose marker exists is
 never rehearsed again ("Rehearsal already attempted; inspect prior attempt"),
 whatever the outcome, including `started` left by a run stopped mid-rehearsal.
-A state directory with no marker does not refuse; it is replaced.
+A state directory with no marker does not refuse; it is replaced. The marker is
+named for one generation's copy, so a job that was set aside and claimed again,
+whose inputs run made a new copy, is rehearsed on that copy.
 
 **Retention rule.** At every poll, after reconciliation and before any claim,
 the daemon sweeps the journal directory. It considers only jobs in
-`tt deployment list` and only the exact names `ID-truenas-backup.sqlite`,
-`ID-hub-backup.sqlite`, `ID-bridge-backup.sqlite` and their rehearsal copies,
+`tt deployment list` and only the names `ID-gN-truenas-backup.sqlite`,
+`ID-gN-hub-backup.sqlite`, `ID-gN-bridge-backup.sqlite` of every generation N,
+the same names without `gN-` from before generations were named, and their
+rehearsal copies,
 as regular files directly in `journalDirectory` or directly in a job's
 rehearsal state directory:
 

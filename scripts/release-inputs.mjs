@@ -5,11 +5,18 @@
 // It selects targets exactly as the deployer does, creates each TrueNAS
 // backup through the handler-owned preflight (one plan for hub and bridge
 // together, else one per target), pins its receipt, and names rollback
-// programs for the probed live releases. It writes
-// journalDirectory/ID-inputs.json (0600) once and prints the exact
-// `tt deployment inputs` command to import its digest. --dry-run reads the job
-// and prints the planned bindings without host calls or writes. Nothing
-// printed carries credentials or captured program output.
+// programs for the probed live releases. Every file and remote identity is
+// named ID-gG, G being the job generation read here, so a job that is set
+// aside and claimed again writes a fresh set and an earlier attempt's files
+// stay as they are. It writes journalDirectory/ID-gG-inputs.json (0600) once,
+// recording that generation and the attempt, and prints the exact
+// `tt deployment inputs` command to import its digest. Run again at the same
+// generation it returns the written manifest, or finishes a set a failed run
+// left. It also leaves the same bytes at journalDirectory/ID-inputs.json when
+// no file has that name, for a deployer still running the scripts from before
+// names carried a generation. --dry-run reads the job and prints the planned bindings without host
+// calls or writes. Nothing printed carries credentials or captured program
+// output.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, openSync, readSync, writeFileSync, closeSync, readFileSync, rmSync } from "node:fs";
@@ -129,28 +136,47 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   if (!summary) throw new Error("Only a claimed job waiting for inputs gets a manifest");
   const job = readReleaseDetail(deps.tt, summary, {bookend:!dryRun});
   if (job?.state !== "claimed") throw new Error("Only a claimed job waiting for inputs gets a manifest");
+  // The import moves the generation, so a run after it would write a second
+  // set under new names beside the bound one.
+  if (!dryRun && job.inputsDigest) throw new Error("Job inputs already bound; set the job aside before preparing new inputs");
   // Fast-forward releases have no imported integrated commit.
   const commit = job.integratedCommit || job.commit;
   if (!Number.isSafeInteger(job.generation) || job.generation < 1 || !sha(commit) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest || "")) throw new Error("Exact job binding required");
   deps.git(["cat-file", "-e", `${commit}^{commit}`]);
   const baselines = deploymentBaselines(config.baselines, jobs), selected = selectReleaseTargets(config.cwd, baselines, commit);
   const schema = schemaChanged(config.cwd, baselines.hub, commit);
-  const dir = config.journalDirectory, manifestPath = join(dir, `${job.id}-inputs.json`);
-  const command = [config.tt || "tt", "deployment", "inputs", "--job", job.id, "--generation", String(job.generation), "--commit", commit, "--file", manifestPath, "--request-id", `${job.id}-inputs-${commit.slice(0, 12)}`];
-  const binding = { version: 1, jobId: job.id, commit, acceptedCommit: job.commit, verificationDigest: job.verificationDigest };
+  // One key per generation names every file and remote identity of this
+  // attempt. The attempt is the count of set-asides and requeues so far.
+  const key = `${job.id}-g${job.generation}`;
+  const dir = config.journalDirectory, manifestPath = join(dir, `${key}-inputs.json`);
+  // A deployer that loaded its scripts before names carried a generation reads
+  // only ID-inputs.json and checks its digest. It gets the manifest's bytes
+  // under that name when the name is free; a file already there belongs to an
+  // earlier attempt and is left as it is.
+  const unkeyedCopy = raw => { try { writePrivate(join(dir, `${job.id}-inputs.json`), raw); } catch (error) { if (error.code !== "EEXIST") throw error; } };
+  const command = [config.tt || "tt", "deployment", "inputs", "--job", job.id, "--generation", String(job.generation), "--commit", commit, "--file", manifestPath, "--request-id", `${key}-inputs-${commit.slice(0, 12)}`];
+  const binding = { version: 1, jobId: job.id, generation: job.generation, attempt: job.reconciliations?.length || 0, commit, acceptedCommit: job.commit, verificationDigest: job.verificationDigest };
   // Hub and bridge selected together share ONE plan, release and backup:
   // two plans made before either deploy would each pin the other's
   // pre-release mount, and the second would put the old partner back.
   const pair = ["hub", "bridge"].filter(t => selected.includes(t));
   const planTargets = t => pair.length === 2 ? pair : [t], planName = t => pair.length === 2 ? "truenas" : t;
   const releaseOf = t => `${job.id}-${commit.slice(0, 12)}-${BINARY[t] ? planName(t) : t}`;
-  const plannedTrueNAS = t => { const name = planName(t); return { backupJobId: job.id, backup: `${BASE}/backups/before-${job.id}-${name}.sqlite`, planPath: join(dir, `${job.id}-${name}-plan.json`), preflightReceipt: join(dir, `${job.id}-${name}-preflight.json`), ...(schema ? { backupCopy: join(dir, `${job.id}-${name}-backup.sqlite`) } : {}), planTargets: planTargets(t) }; };
+  const plannedTrueNAS = t => { const name = planName(t); return { backupJobId: job.id, backup: `${BASE}/backups/before-${key}-${name}.sqlite`, planPath: join(dir, `${key}-${name}-plan.json`), preflightReceipt: join(dir, `${key}-${name}-preflight.json`), ...(schema ? { backupCopy: join(dir, `${key}-${name}-backup.sqlite`) } : {}), planTargets: planTargets(t) }; };
   if (!dryRun) bookendReleaseLedger(deps.tt, jobs.releaseSnapshot, jobs.releaseHead);
   if (dryRun) {
     const targets = Object.fromEntries(selected.map(t => [t, { release: releaseOf(t), ...(BINARY[t] ? plannedTrueNAS(t) : {}) }]));
-    return { dryRun: true, ...binding, generation: job.generation, schemaChanged: schema, targets, manifest: manifestPath, command };
+    return { dryRun: true, ...binding, schemaChanged: schema, targets, manifest: manifestPath, command };
   }
-  if (existsSync(manifestPath)) throw new Error("Job manifest already written; the imported digest is immutable");
+  // Run again at the same generation: the written manifest is the answer, and
+  // nothing is probed, backed up or copied.
+  if (existsSync(manifestPath)) {
+    const raw = readFileSync(manifestPath, "utf8");
+    let written; try { written = JSON.parse(raw); } catch {}
+    if (!written || Object.keys(binding).some(k => written[k] !== binding[k]) || !written.targets || typeof written.targets !== "object") throw new Error("Job manifest already written for this generation with a different binding");
+    unkeyedCopy(raw);
+    return { manifest: manifestPath, sha256: createHash("sha256").update(raw).digest("hex"), targets: Object.keys(written.targets), command };
+  }
   const live = {};
   for (const t of selected) {
     if (BINARY[t]) for (const s of ["hub", "bridge"]) live[s] ??= await deps.probe(["live", s]);
@@ -171,12 +197,18 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
           // A target this job does not change keeps its live retained mount.
           deployment[field] = changing ? `${BASE}/releases/${release}/${binary}` : `${BASE}/releases/${live[s].release}/${binary}`;
         }
-        writePrivate(planned.planPath, JSON.stringify({ ...template, requestId: `${job.id}-${planName(t)}-backup`, backupDestination: planned.backup, deployment }));
+        // A plan an earlier run at this generation left is reused only when it
+        // is the plan made now; preflight then replays the same request.
+        const plan = JSON.stringify({ ...template, requestId: `${key}-${planName(t)}-backup`, backupDestination: planned.backup, deployment });
+        if (!existsSync(planned.planPath)) writePrivate(planned.planPath, plan);
+        else if (readFileSync(planned.planPath, "utf8") !== plan) throw new Error("Job plan already written with different inputs");
         deps.preflight(planned.planPath, planned.preflightReceipt);
         const receipt = JSON.parse(readFileSync(planned.preflightReceipt, "utf8"));
         if (!["success", "already-satisfied"].includes(receipt.status) || receipt.backupDestination !== planned.backup || !/^[a-f0-9]{64}$/.test(receipt.sha256 || "")) throw new Error("Verified job backup receipt required");
         if (planned.backupCopy) {
-          deps.copyBackup(planned.backup, planned.backupCopy);
+          // This generation's own unfinished copy is the only file replaced.
+          if (existsSync(planned.backupCopy) && fileSHA(planned.backupCopy) !== receipt.sha256) rmSync(planned.backupCopy);
+          if (!existsSync(planned.backupCopy)) deps.copyBackup(planned.backup, planned.backupCopy);
           if (fileSHA(planned.backupCopy) !== receipt.sha256) { rmSync(planned.backupCopy); throw new Error("Backup copy hash mismatch"); }
         }
         return { backupSHA256: receipt.sha256, preflightReceiptSHA256: fileSHA(planned.preflightReceipt) };
@@ -198,6 +230,7 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   }
   const raw = JSON.stringify({ ...binding, targets });
   writePrivate(manifestPath, raw);
+  unkeyedCopy(raw);
   return { manifest: manifestPath, sha256: createHash("sha256").update(raw).digest("hex"), targets: Object.keys(targets), command };
 }
 

@@ -1240,12 +1240,27 @@ export class HostAdapter {
   async verifyInputs(commit){
     const current=this.detail(this.job.id);
     if(current?.inputsCommit===commit && /^[a-f0-9]{64}$/.test(current.inputsDigest||"")){this.job=current;this.jobInputs(commit);return true;}
-    this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,this.job.id+"-inputs.json")} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);return false;
+    this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,`${this.job.id}-g${current.generation}-inputs.json`)} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-g${current.generation}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);return false;
   }
+  // The manifest the handler bound is the generation-named file whose bytes
+  // hash to the hub's digest. The hub does not keep the generation it was
+  // imported at and this run's own is later, so the name is found, not built.
+  // The file must record its name's generation, which is below the job's, and
+  // this attempt (the count of set-asides and requeues). A manifest written
+  // before names carried a generation is still read when it is the bound one.
   jobInputs(commit){
-    const path=join(this.config.journalDirectory,this.job.id+"-inputs.json"),raw=readFileSync(path,"utf8");
-    if(fileDigest(path)!==this.job.inputsDigest || this.job.inputsCommit!==commit)throw releaseError("Handler input digest binding required");
-    const input=JSON.parse(raw);
+    if(this.job.inputsCommit!==commit)throw releaseError("Handler input digest binding required");
+    const dir=this.config.journalDirectory,keyed=[];
+    for(const name of readdirSync(dir)){
+      const m=/^(.+)-g([1-9][0-9]*)-inputs\.json$/.exec(name);
+      if(m && m[1]===this.job.id)keyed.push({path:join(dir,name),generation:Number(m[2])});
+    }
+    const bound=path=>{try{return lstatSync(path).isFile() && fileDigest(path)===this.job.inputsDigest;}catch{return false;}};
+    const other=()=>releaseError("Input manifest bound to another generation");
+    const found=keyed.sort((a,b)=>b.generation-a.generation).find(f=>bound(f.path)),legacy=join(dir,this.job.id+"-inputs.json");
+    if(!found && !bound(legacy))throw keyed.length?other():releaseError("Handler input digest binding required");
+    const input=JSON.parse(readFileSync(found?found.path:legacy,"utf8"));
+    if(found?input.generation!==found.generation || !(input.generation<this.job.generation) || input.attempt!==(this.job.reconciliations?.length||0):input.generation!==undefined)throw other();
     if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw releaseError("Exact job input binding required");
     // Two TrueNAS plans made before either deploy would each pin the other's
     // pre-release mount, so hub and bridge together must share one plan.
@@ -1253,6 +1268,9 @@ export class HostAdapter {
     if(hub && bridge && (!same(hub.planTargets,PAIR) || !same(bridge.planTargets,PAIR) || ["release","planPath","preflightReceipt","preflightReceiptSHA256","backup","backupSHA256"].some(k=>hub[k]!==bridge[k])))throw releaseError("Hub and bridge need one paired plan");
     return input;
   }
+  // What a job's backup destination must contain: the job and, for a manifest
+  // that records one, its generation.
+  backupKey(input){return input.generation===undefined?this.job.id:`${this.job.id}-g${input.generation}-`;}
   captureMiniRollback(artifact){
     const path=join(this.config.journalDirectory,this.job.id+"-mini-before");
     copyFileSync(artifact.installPath,path,constants.COPYFILE_EXCL);
@@ -1286,7 +1304,7 @@ export class HostAdapter {
       artifact.artifactPath=output;artifact.artifactSHA256=fileDigest(output);if(target==="mini")artifact.version=commit;
     }
     if(artifact.schemaChanged){
-      if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.job.id))throw releaseError("Fresh job backup identity required");
+      if(perJob.backupJobId!==this.job.id || !perJob.backup || !perJob.backup.includes(this.backupKey(input)))throw releaseError("Fresh job backup identity required");
       artifact.migrationBinary=join(this.config.journalDirectory,this.job.id+"-migration");
       // Built for Linux at the release host's own architecture: it only ever
       // runs inside the rehearsal container, never on the host.
@@ -1295,7 +1313,7 @@ export class HostAdapter {
       artifact.migrationBinarySHA256=fileDigest(artifact.migrationBinary);
     }
     if(["hub","bridge"].includes(target)){
-      if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.job.id))throw releaseError("Fresh job backup identity required");
+      if(perJob.backupJobId!==this.job.id || !perJob.backup?.includes(this.backupKey(input)))throw releaseError("Fresh job backup identity required");
       const plan=JSON.parse(readFileSync(perJob.planPath,"utf8"));
       if(plan.deployment.releaseName!==release || plan.backupDestination!==perJob.backup || fileDigest(perJob.preflightReceipt)!==perJob.preflightReceiptSHA256)throw releaseError("Exact job preflight binding required");
       // Every target the plan changes mounts this release; a partner pinned
@@ -1633,7 +1651,7 @@ const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integr
 // waiting, running or held): that run may be using the checkout, and the host
 // release lock is not held while it runs. Unless the caller says otherwise, a
 // job waiting for its matrix is taken to have such a run. The request id
-// omits generations, which every fence check bumps. A holder waiting for the
+// omits generations, which move on each handler import. A holder waiting for the
 // handler's own step (the matrix import or the inputs binding) is routine,
 // since the handler already holds the directed request for it; a blocked or
 // merged holder, or one another deployer run claimed, needs attention.
@@ -1713,10 +1731,19 @@ export function pruneJournal(config,jobs,{now=()=>Date.now()}={}){
     const fd=openSync(join(dir,"retention.jsonl"),"a",0o600);try{writeFileSync(fd,JSON.stringify(record)+"\n");fsyncSync(fd);}finally{closeSync(fd);}
     rmSync(join(dir,file));records.push(record);return bytes;
   };
+  // A job's backup copy names of every generation, and those from before
+  // names carried one, read from the directory once. A rehearsal leftover
+  // names its copy too, so it is found after the copy has gone.
+  let listed=[];try{listed=readdirSync(dir).sort();}catch{}
+  const copiesOf=id=>{
+    const pattern=new RegExp(`^(${id}-(?:g[1-9][0-9]*-)?(${BACKUP_NAMES.join("|")})-backup\\.sqlite)(?:\\.rehearsal-${id}.*)?$`),found=new Map();
+    for(const name of listed){const m=pattern.exec(name);if(m)found.set(m[1],BACKUP_NAMES.indexOf(m[2]));}
+    return [...found.keys()].sort((a,b)=>found.get(a)-found.get(b));
+  };
   let total=0;const released=[];
   jobs.forEach((job,index)=>{
     if(typeof job?.id!=="string" || !/^[A-Za-z0-9_-]+$/.test(job.id))return;
-    const backups=BACKUP_NAMES.map(name=>`${job.id}-${name}-backup.sqlite`);
+    const backups=copiesOf(job.id);
     const held=()=>backups.reduce((sum,file)=>sum+(size(file)??0),0);
     if(!TERMINAL.includes(job.state)){total+=held();return;}
     for(const file of backups)for(const suffix of COPY_FILES)remove(job.id,`${file}.rehearsal-${job.id}${suffix}`,"rehearsal","terminal");
