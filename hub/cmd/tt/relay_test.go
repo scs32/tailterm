@@ -9,7 +9,6 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -122,33 +121,46 @@ func TestClaudeWakeRejectsIneligibleHubRuns(t *testing.T) {
 
 func captureRelayOutput(t *testing.T, stderr bool, run func() error) (string, error) {
 	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	var original *os.File
 	if stderr {
-		original, os.Stderr = os.Stderr, w
-		defer func() { os.Stderr = original }()
-	} else {
-		original, os.Stdout = os.Stdout, w
-		defer func() { os.Stdout = original }()
+		return captureStream(t, &os.Stderr, run)
 	}
-	runErr := run()
-	if stderr {
-		os.Stderr = original
-	} else {
-		os.Stdout = original
+	return captureStream(t, &os.Stdout, run)
+}
+
+func TestCaptureRelayOutputReturnsOutputLargerThanAPipeBuffer(t *testing.T) {
+	var want strings.Builder
+	for i := 0; want.Len() <= 1<<20; i++ {
+		fmt.Fprintf(&want, "line %07d of relay output larger than one pipe buffer\n", i)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
+	for _, stderr := range []bool{false, true} {
+		name := "stdout"
+		if stderr {
+			name = "stderr"
+		}
+		t.Run(name, func(t *testing.T) {
+			oldStdout, oldStderr := os.Stdout, os.Stderr
+			failure := errors.New("command failed after printing")
+			got, err := captureRelayOutput(t, stderr, func() error {
+				stream := os.Stdout
+				if stderr {
+					stream = os.Stderr
+				}
+				if _, err := stream.WriteString(want.String()); err != nil {
+					return err
+				}
+				return failure
+			})
+			if err != failure {
+				t.Fatalf("error = %v, want the command's own error", err)
+			}
+			if os.Stdout != oldStdout || os.Stderr != oldStderr {
+				t.Fatal("os.Stdout or os.Stderr was not restored")
+			}
+			if got != want.String() {
+				t.Fatalf("captured %d bytes, want %d bytes returned intact", len(got), want.Len())
+			}
+		})
 	}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data), runErr
 }
 
 func TestRelayClearsRecoveredErrorAndLogsSameFailureAgain(t *testing.T) {

@@ -147,18 +147,66 @@ func TestInbox11759(t *testing.T) {
 
 func captureCLIStderr(t *testing.T, fn func()) string {
 	t.Helper()
-	old := os.Stderr
+	out, _ := captureStream(t, &os.Stderr, func() error {
+		fn()
+		return nil
+	})
+	return out
+}
+
+// captureStream points *stream (os.Stdout or os.Stderr) at a pipe while fn
+// runs and returns what fn wrote there, with fn's own error.
+func captureStream(t *testing.T, stream **os.File, fn func() error) (string, error) {
+	t.Helper()
+	old := *stream
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.Stderr = w
-	fn()
-	_ = w.Close()
-	os.Stderr = old
-	data, _ := io.ReadAll(r)
-	_ = r.Close()
-	return string(data)
+	// Read while fn runs: a pipe holds only one buffer (64 KiB on macOS), so a
+	// command that prints more would otherwise block in write forever.
+	type captured struct {
+		data []byte
+		err  error
+	}
+	done := make(chan captured, 1)
+	go func() {
+		defer r.Close()
+		data, err := io.ReadAll(r)
+		done <- captured{data, err}
+	}()
+	*stream = w
+	runErr := func() error {
+		defer func() {
+			*stream = old
+			_ = w.Close()
+		}()
+		return fn()
+	}()
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	return string(out.data), runErr
+}
+
+func TestCaptureCLIStderrReturnsOutputLargerThanAPipeBuffer(t *testing.T) {
+	var want strings.Builder
+	for i := 0; want.Len() <= 1<<20; i++ {
+		fmt.Fprintf(&want, "line %07d of stderr larger than one pipe buffer\n", i)
+	}
+	old := os.Stderr
+	got := captureCLIStderr(t, func() {
+		if _, err := os.Stderr.WriteString(want.String()); err != nil {
+			t.Errorf("write to the captured stderr: %v", err)
+		}
+	})
+	if os.Stderr != old {
+		t.Fatal("os.Stderr was not restored")
+	}
+	if got != want.String() {
+		t.Fatalf("captured %d bytes, want %d bytes returned intact", len(got), want.Len())
+	}
 }
 
 func TestInboxNewestAndPaging(t *testing.T) {
