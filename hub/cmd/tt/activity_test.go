@@ -1923,7 +1923,7 @@ func TestOwnerHelperCodexDiscoveryHeartbeatAndOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.tmux(t, "new-session", "-d", "-s", "codex-owner", filepath.Join(processDir, "codex")+" 300")
-	t.Setenv("TMUX_PANE", f.tmux(t, "display-message", "-p", "-t", "codex-owner:", "#{pane_id}"))
+	f.enter(t, "codex-owner")
 	a := *f.mustRegister(t).Agent
 	b, _ := readBinding(t, f.owner.hub, a.ID)
 	receipt, err := nativeRuntimeDiscovery(context.Background(), b, a)

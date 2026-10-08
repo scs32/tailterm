@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,14 +96,41 @@ func (f helperFixture) tmux(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// session starts a one-pane session running the fake claude and points
-// $TMUX_PANE at it, as if tt ran inside that Claude Code session.
-func (f helperFixture) session(t *testing.T, name string) (id, created string) {
+// enter stands the test in the named session's pane: $TMUX_PANE names it and
+// the registering process is the pane's own process.
+func (f helperFixture) enter(t *testing.T, name string) {
 	t.Helper()
-	f.tmux(t, "new-session", "-d", "-s", name, "-x", "200", "-y", "50", filepath.Join(f.bin, "claude")+" 300")
+	f.pointAt(t, name)
+	pid, err := strconv.Atoi(f.tmux(t, "display-message", "-p", "-t", name+":", "#{pane_pid}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.callerPID(t, pid)
+}
+
+// pointAt sets only $TMUX_PANE to the named session's pane, as an inherited
+// variable would, and returns the pane id.
+func (f helperFixture) pointAt(t *testing.T, name string) string {
+	t.Helper()
 	pane := f.tmux(t, "display-message", "-p", "-t", name+":", "#{pane_id}")
 	t.Setenv("TMUX", "/private/fixture/"+f.sock+",1,0")
 	t.Setenv("TMUX_PANE", pane)
+	return pane
+}
+
+func (f helperFixture) callerPID(t *testing.T, pid int) {
+	t.Helper()
+	previous := helperCallerPID
+	helperCallerPID = func() int { return pid }
+	t.Cleanup(func() { helperCallerPID = previous })
+}
+
+// session starts a one-pane session running the fake claude and stands the
+// test in its pane, as if tt ran inside that Claude Code session.
+func (f helperFixture) session(t *testing.T, name string) (id, created string) {
+	t.Helper()
+	f.tmux(t, "new-session", "-d", "-s", name, "-x", "200", "-y", "50", filepath.Join(f.bin, "claude")+" 300")
+	f.enter(t, name)
 	parts := strings.Fields(f.tmux(t, "display-message", "-p", "-t", name+":", "#{session_id} #{session_created}"))
 	return parts[0], parts[1]
 }
@@ -1860,5 +1888,142 @@ func TestHelperRegisterInheritedOtherProjectIdentity(t *testing.T) {
 	}
 	if tags := f.tags(t, "owner"); tags["TAILTERM_TASK"] != second.ID || tags["TAILTERM_AGENT"] != helpers[0].ID {
 		t.Fatalf("tags after take-session: %v", tags)
+	}
+}
+
+// helperLocalState is everything a registration writes on the host for the
+// fixture's project: the host helper file and every relay binding.
+func (f helperFixture) localState(t *testing.T) string {
+	t.Helper()
+	state, _ := os.ReadFile(ownerHelperPath(f.owner.hub, f.task.ID))
+	out := "helper file: " + string(state)
+	paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.binding.json"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out += "\n" + filepath.Base(path) + ": " + string(data)
+	}
+	return out
+}
+
+func (f helperFixture) helpers(t *testing.T) []api.Agent {
+	t.Helper()
+	agents, err := f.c.ListAgents(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var helpers []api.Agent
+	for _, agent := range agents {
+		if agent.Role == api.AgentRoleOwnerHelper {
+			helpers = append(helpers, agent)
+		}
+	}
+	return helpers
+}
+
+// stalePaneRefusal reproduces the incident: a working helper in session
+// owner, and a registration from that pane whose inherited $TMUX_PANE names
+// the live pane of session generic. It returns the helper and both pane ids.
+func stalePaneRefusal(t *testing.T, f helperFixture) (a api.Agent, ownerPane, genericPane string) {
+	t.Helper()
+	a = *f.mustRegister(t).Agent
+	ownerPane = f.tmux(t, "display-message", "-p", "-t", "owner:", "#{pane_id}")
+	tagsBefore, stateBefore := f.tags(t, "owner"), f.localState(t)
+	f.tmux(t, "new-session", "-d", "-s", "generic", "-x", "200", "-y", "50", filepath.Join(f.bin, "claude")+" 300")
+	genericPane = f.pointAt(t, "generic")
+
+	_, err := f.register(t, f.owner)
+	want := "TMUX_PANE names pane " + genericPane + " (tmux session generic), but this command does not run in that pane: it runs in pane " + ownerPane + " (tmux session owner). Nothing was registered and the current helper is unchanged. Run it again with TMUX_PANE=" + ownerPane + "."
+	if err == nil || err.Error() != want {
+		t.Fatalf("stale pane: %v\nwant %s", err, want)
+	}
+	if current, err := f.c.GetAgent(context.Background(), f.task.ID, a.ID); err != nil || current.RunID != a.RunID || current.Session != "owner" {
+		t.Fatalf("refused registration changed the helper: %+v %v", current, err)
+	}
+	if helpers := f.helpers(t); len(helpers) != 1 {
+		t.Fatalf("helpers %+v", helpers)
+	}
+	if tags := f.tags(t, "owner"); fmt.Sprint(tags) != fmt.Sprint(tagsBefore) || tags["TAILTERM_AGENT"] != a.ID || tags["TAILTERM_RUN"] != a.RunID {
+		t.Fatalf("owner tags %v, want %v", tags, tagsBefore)
+	}
+	if tags := f.tags(t, "generic"); len(tags) != 0 {
+		t.Fatalf("the stale pane's session was tagged: %v", tags)
+	}
+	if state := f.localState(t); state != stateBefore {
+		t.Fatalf("local state changed:\n%s\nwant\n%s", state, stateBefore)
+	}
+	return a, ownerPane, genericPane
+}
+
+func TestHelperRegisterRefusesPaneCallerIsNotIn(t *testing.T) {
+	f := newHelperFixture(t)
+	stalePaneRefusal(t, f)
+	// No flag overrides the check.
+	if _, err := f.register(t, f.owner, "--take-session"); err == nil || !strings.Contains(err.Error(), "does not run in that pane") {
+		t.Fatalf("--take-session overrode the pane check: %v", err)
+	}
+}
+
+func TestHelperRegisterRefusesCallerOutsideAnyPane(t *testing.T) {
+	f := newHelperFixture(t)
+	pane := f.tmux(t, "display-message", "-p", "-t", "owner:", "#{pane_id}")
+	// The test process itself: it runs in no pane of the fixture's server.
+	f.callerPID(t, os.Getpid())
+	_, err := f.register(t, f.owner)
+	want := "TMUX_PANE names pane " + pane + " (tmux session owner), but this command does not run in that pane or in any pane of this tmux server. Nothing was registered and the current helper is unchanged. Run tt helper register inside the owner's runtime session."
+	if err == nil || err.Error() != want {
+		t.Fatalf("outside any pane: %v\nwant %s", err, want)
+	}
+	if helpers := f.helpers(t); len(helpers) != 0 {
+		t.Fatalf("refused registration reached the hub: %+v", helpers)
+	}
+	if state := f.localState(t); state != "helper file: " {
+		t.Fatalf("refused registration wrote local state: %s", state)
+	}
+	if tags := f.tags(t, "owner"); len(tags) != 0 {
+		t.Fatalf("refused registration tagged the session: %v", tags)
+	}
+}
+
+func TestHelperRegisterRefusesUnreadableProcessTable(t *testing.T) {
+	f := newHelperFixture(t)
+	pane := f.tmux(t, "display-message", "-p", "-t", "owner:", "#{pane_id}")
+	// No process has this id, so the caller cannot be placed in the table.
+	f.callerPID(t, 1<<30)
+	_, err := f.register(t, f.owner)
+	want := "cannot check that this command runs in pane " + pane + " (tmux session owner): this command's process is not in the process table. Nothing was registered and the current helper is unchanged."
+	if err == nil || err.Error() != want {
+		t.Fatalf("unusable process table: %v\nwant %s", err, want)
+	}
+	if helpers := f.helpers(t); len(helpers) != 0 {
+		t.Fatalf("refused registration reached the hub: %+v", helpers)
+	}
+	if state := f.localState(t); state != "helper file: " {
+		t.Fatalf("refused registration wrote local state: %s", state)
+	}
+	if tags := f.tags(t, "owner"); len(tags) != 0 {
+		t.Fatalf("refused registration tagged the session: %v", tags)
+	}
+}
+
+func TestHelperRegisterAcceptsExplicitOwnPane(t *testing.T) {
+	f := newHelperFixture(t)
+	a, ownerPane, _ := stalePaneRefusal(t, f)
+	// The refusal's advice: the same command with the caller's own pane.
+	t.Setenv("TMUX_PANE", ownerPane)
+	out := f.mustRegister(t)
+	if out.Registration.Mode != api.OwnerHelperReplaced || out.Agent.ID != a.ID || out.Agent.RunID == a.RunID || out.Agent.Session != "owner" {
+		t.Fatalf("own pane: %+v %+v", out.Agent, out.Registration)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != a.ID || tags["TAILTERM_RUN"] != out.Agent.RunID || tags["TAILTERM_ROLE"] != api.AgentRoleOwnerHelper {
+		t.Fatalf("owner tags %v", tags)
+	}
+	if tags := f.tags(t, "generic"); len(tags) != 0 {
+		t.Fatalf("the other session was tagged: %v", tags)
+	}
+	if b, ok := readBinding(t, f.owner.hub, a.ID); !ok || b.Session != "owner" || b.Run != out.Agent.RunID {
+		t.Fatalf("binding %+v", b)
 	}
 }

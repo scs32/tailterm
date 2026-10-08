@@ -45,6 +45,25 @@ It checks, before writing anything:
   executable and optional `CODEX_HOME` to absolute paths before writing state;
 - it is not an agent session, unless that session carries this project's helper
   identity (a pane of the helper's own tmux session);
+- the command really runs in the tmux pane that `TMUX_PANE` names: its process
+  must descend from that pane's own process. An inherited `TMUX_PANE` can name
+  another live pane, and registering there would replace a working helper with
+  one that cannot be woken. No flag overrides this, and a `TMUX_PANE` set by
+  hand is judged the same way. Outside tmux (`TMUX` or `TMUX_PANE` unset) the
+  check does not run. The refusals:
+
+  ```text
+  TMUX_PANE names pane %206 (tmux session Generic), but this command does not run in that pane: it runs in pane %1015 (tmux session Codex_Orchestrator). Nothing was registered and the current helper is unchanged. Run it again with TMUX_PANE=%1015.
+  TMUX_PANE names pane %206 (tmux session Generic), but this command does not run in that pane or in any pane of this tmux server. Nothing was registered and the current helper is unchanged. Run tt helper register inside the owner's runtime session.
+  cannot check that this command runs in pane %206 (tmux session Generic): REASON. Nothing was registered and the current helper is unchanged.
+  ```
+
+  The first names the pane the command is really in; registration never picks
+  that pane itself. The third is printed when the host's process table cannot
+  be read or does not place the command, and registration stops there rather
+  than trusting the variable. If the panes of the tmux server cannot be listed
+  for the wording, the second is printed without "or in any pane of this tmux
+  server";
 - the tmux session name is a valid agent session name (rename it if not);
 - the tmux session is not already another project's live owner helper (see
   [One project per tmux session](#one-project-per-tmux-session));

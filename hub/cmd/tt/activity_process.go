@@ -260,6 +260,61 @@ type discoveredProcess struct {
 	started, executable string
 }
 
+// readProcessTable reads the identity columns of every process on the host.
+func readProcessTable(ctx context.Context) (map[int]discoveredProcess, error) {
+	raw, err := runtimeDiscoveryCommand(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=")
+	if err != nil {
+		return nil, err
+	}
+	processes := map[int]discoveredProcess{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		row := runtimeProcessRow.FindStringSubmatch(line)
+		if row == nil {
+			return nil, errors.New("process identity format unavailable")
+		}
+		pid, _ := strconv.Atoi(row[1])
+		parent, _ := strconv.Atoi(row[2])
+		if pid < 1 || len(processes) >= 4096 {
+			return nil, errors.New("process discovery budget exhausted")
+		}
+		if _, exists := processes[pid]; exists {
+			return nil, errors.New("duplicate process identity")
+		}
+		processes[pid] = discoveredProcess{pid, parent, strings.TrimSpace(row[3]), row[4]}
+	}
+	return processes, nil
+}
+
+// processDescendsFrom reports whether anchor is p itself or one of its
+// ancestors, following parents that were created no later than their child.
+func processDescendsFrom(processes map[int]discoveredProcess, p discoveredProcess, anchor int) (bool, error) {
+	current := p
+	seen := map[int]bool{}
+	for depth := 0; depth < maxRuntimeLineage; depth++ {
+		if seen[current.pid] {
+			break
+		}
+		seen[current.pid] = true
+		if current.pid == anchor {
+			return true, nil
+		}
+		parent, ok := processes[current.parent]
+		if !ok {
+			break
+		}
+		childTime, e1 := time.Parse("Mon Jan _2 15:04:05 2006", current.started)
+		parentTime, e2 := time.Parse("Mon Jan _2 15:04:05 2006", parent.started)
+		if e1 != nil || e2 != nil || parentTime.After(childTime) {
+			return false, errors.New("process lineage creation mismatch")
+		}
+		if depth == maxRuntimeLineage-1 {
+			return false, errors.New("runtime lineage budget exhausted")
+		}
+		current = parent
+	}
+	return false, nil
+}
+
 func nativeRuntimeDiscovery(ctx context.Context, b runtimeBinding, a api.Agent) (runtimeProcessReceipt, error) {
 	var zero runtimeProcessReceipt
 	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "pane_pid"}
@@ -291,25 +346,9 @@ func nativeRuntimeDiscovery(ctx context.Context, b runtimeBinding, a api.Agent) 
 	if err != nil || anchor < 1 {
 		return zero, errors.New("pane pid unavailable")
 	}
-	raw, err = runtimeDiscoveryCommand(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=")
+	processes, err := readProcessTable(ctx)
 	if err != nil {
 		return zero, err
-	}
-	processes := map[int]discoveredProcess{}
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		row := runtimeProcessRow.FindStringSubmatch(line)
-		if row == nil {
-			return zero, errors.New("process identity format unavailable")
-		}
-		pid, _ := strconv.Atoi(row[1])
-		parent, _ := strconv.Atoi(row[2])
-		if pid < 1 || len(processes) >= 4096 {
-			return zero, errors.New("process discovery budget exhausted")
-		}
-		if _, exists := processes[pid]; exists {
-			return zero, errors.New("duplicate process identity")
-		}
-		processes[pid] = discoveredProcess{pid, parent, strings.TrimSpace(row[3]), row[4]}
 	}
 	root, ok := processes[anchor]
 	if !ok {
@@ -333,31 +372,9 @@ func nativeRuntimeDiscovery(ctx context.Context, b runtimeBinding, a api.Agent) 
 		if executable != runtime {
 			continue
 		}
-		current := p
-		seen := map[int]bool{}
-		owned := false
-		for depth := 0; depth < maxRuntimeLineage; depth++ {
-			if seen[current.pid] {
-				break
-			}
-			seen[current.pid] = true
-			if current.pid == anchor {
-				owned = true
-				break
-			}
-			parent, ok := processes[current.parent]
-			if !ok {
-				break
-			}
-			childTime, e1 := time.Parse("Mon Jan _2 15:04:05 2006", current.started)
-			parentTime, e2 := time.Parse("Mon Jan _2 15:04:05 2006", parent.started)
-			if e1 != nil || e2 != nil || parentTime.After(childTime) {
-				return zero, errors.New("process lineage creation mismatch")
-			}
-			if depth == maxRuntimeLineage-1 {
-				return zero, errors.New("runtime lineage budget exhausted")
-			}
-			current = parent
+		owned, err := processDescendsFrom(processes, p, anchor)
+		if err != nil {
+			return zero, err
 		}
 		if owned {
 			found = append(found, p)

@@ -189,14 +189,80 @@ type helperSession struct {
 	Panes             int
 }
 
-// currentHelperSession reads the session of $TMUX_PANE. Outside tmux it
-// returns ok=false.
+// helperCallerPID is the process whose tmux pane a registration binds. Only
+// tests replace it.
+var helperCallerPID = os.Getpid
+
+const helperPaneUnchanged = "Nothing was registered and the current helper is unchanged."
+
+// checkHelperPane refuses a $TMUX_PANE the calling process does not descend
+// from. An inherited variable can name another live pane, and registering
+// there replaces a working helper with one that cannot be woken. It fails
+// closed: a process table it cannot use is a refusal.
+func checkHelperPane(ctx context.Context, pane, sessionName, panePID string) error {
+	named := fmt.Sprintf("pane %s (tmux session %s)", pane, sessionName)
+	unusable := func(reason string) error {
+		return fmt.Errorf("cannot check that this command runs in %s: %s. %s", named, reason, helperPaneUnchanged)
+	}
+	anchor, err := strconv.Atoi(panePID)
+	if err != nil || anchor < 1 {
+		return unusable("pane pid unavailable")
+	}
+	processes, err := readProcessTable(ctx)
+	if err != nil {
+		return unusable(err.Error())
+	}
+	caller, ok := processes[helperCallerPID()]
+	if !ok {
+		return unusable("this command's process is not in the process table")
+	}
+	owned, err := processDescendsFrom(processes, caller, anchor)
+	if err != nil {
+		return unusable(err.Error())
+	}
+	if owned {
+		return nil
+	}
+	// The remaining lookup only words the refusal; it never selects a pane.
+	refused := "TMUX_PANE names " + named + ", but this command does not run in that pane"
+	raw, err := startupTmux(ctx, "list-panes", "-a", "-F", `["#{q/e:pane_id}","#{q/e:pane_pid}","#{q/e:session_name}"]`)
+	if err != nil {
+		return fmt.Errorf("%s. %s Run tt helper register inside the owner's runtime session.", refused, helperPaneUnchanged)
+	}
+	panes := map[int][2]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var values []string
+		if json.Unmarshal([]byte(line), &values) != nil || len(values) != 3 {
+			continue
+		}
+		if pid, err := strconv.Atoi(values[1]); err == nil && pid > 0 {
+			panes[pid] = [2]string{values[0], values[2]}
+		}
+	}
+	current := caller
+	seen := map[int]bool{}
+	for depth := 0; depth < maxRuntimeLineage && !seen[current.pid]; depth++ {
+		seen[current.pid] = true
+		if actual, ok := panes[current.pid]; ok {
+			return fmt.Errorf("%s: it runs in pane %s (tmux session %s). %s Run it again with TMUX_PANE=%s.", refused, actual[0], actual[1], helperPaneUnchanged, actual[0])
+		}
+		parent, ok := processes[current.parent]
+		if !ok {
+			break
+		}
+		current = parent
+	}
+	return fmt.Errorf("%s or in any pane of this tmux server. %s Run tt helper register inside the owner's runtime session.", refused, helperPaneUnchanged)
+}
+
+// currentHelperSession reads the session of $TMUX_PANE and checks that the
+// caller runs in that pane. Outside tmux it returns ok=false.
 func currentHelperSession(ctx context.Context) (helperSession, bool, error) {
 	pane := os.Getenv("TMUX_PANE")
 	if os.Getenv("TMUX") == "" || pane == "" {
 		return helperSession{}, false, nil
 	}
-	fields := []string{"session_id", "session_created", "session_name"}
+	fields := []string{"session_id", "session_created", "session_name", "pane_pid"}
 	for i, f := range fields {
 		fields[i] = `"#{q/e:` + f + `}"`
 	}
@@ -205,12 +271,15 @@ func currentHelperSession(ctx context.Context) (helperSession, bool, error) {
 		return helperSession{}, false, fmt.Errorf("read this tmux session: %w", err)
 	}
 	var values []string
-	if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &values) != nil || len(values) != 3 {
+	if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &values) != nil || len(values) != 4 {
 		return helperSession{}, false, errors.New("cannot read this tmux session's identity")
 	}
 	s := helperSession{ID: values[0], Created: values[1], Name: values[2]}
 	if !sessionIDPattern.MatchString(s.ID) || !sessionTimePattern.MatchString(s.Created) {
 		return helperSession{}, false, errors.New("cannot read this tmux session's identity")
+	}
+	if err := checkHelperPane(ctx, pane, s.Name, values[3]); err != nil {
+		return helperSession{}, false, err
 	}
 	if !api.ValidName(s.Name) {
 		return helperSession{}, false, fmt.Errorf("tmux session name %q cannot be an agent session; rename it first (tmux rename-session owner)", s.Name)
