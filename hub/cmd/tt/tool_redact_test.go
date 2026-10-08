@@ -749,11 +749,33 @@ func (c redactShapeCase) make(t *testing.T, n int) string {
 
 func redactText(t *testing.T, s string, exact ...string) string {
 	t.Helper()
-	out, ok := redactRewriteValue(s, exact, time.Now().Add(time.Minute))
+	out, ok := redactRewriteRaw(redactJSON(t, s), exact, time.Now().Add(time.Minute))
 	if !ok {
 		t.Fatal("the rewrite ran out of time")
 	}
-	return out.(string)
+	var text string
+	if err := json.Unmarshal(out, &text); err != nil {
+		t.Fatalf("the rewritten string is not JSON: %v", err)
+	}
+	return text
+}
+
+// redactJSON encodes a value as Claude Code would send it, without Go's
+// HTML escaping.
+func redactJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		t.Fatal(err)
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+}
+
+func redactCountValue(t *testing.T, v any) redactResult {
+	t.Helper()
+	return redactCountRaw(redactJSON(t, v), nil, time.Now().Add(time.Minute))
 }
 
 // requireRedact fails without printing either string: a failure names the
@@ -860,7 +882,6 @@ func TestToolRedactHostValues(t *testing.T) {
 // Group C is counted and never rewritten, and is not counted where a group
 // A or B match already covers it.
 func TestToolRedactGroupCCountsOnly(t *testing.T) {
-	far := time.Now().Add(time.Minute)
 	header, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
 	claims, _ := json.Marshal(map[string]string{"sub": redactRandomFrom(t, redactAlnum, 12)})
 	jwt := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims) + "." + redactRandomFrom(t, redactAlnum+"_-", 43)
@@ -874,7 +895,7 @@ func TestToolRedactGroupCCountsOnly(t *testing.T) {
 		"google-api-key":  "key " + "AIza" + redactRandomFrom(t, redactAlnum, 35),
 		"discord-token":   "bot " + discord,
 	} {
-		found := redactCountValue(map[string]any{"stdout": text}, nil, far)
+		found := redactCountValue(t, map[string]any{"stdout": text})
 		if found.timeout || found.rewrite != 0 || len(found.kinds) != 1 || found.kinds[name] != 1 {
 			t.Errorf("%s: kinds %v, rewriting matches %d; want that one name counted once", name, found.kinds, found.rewrite)
 		}
@@ -882,13 +903,13 @@ func TestToolRedactGroupCCountsOnly(t *testing.T) {
 	}
 	// Not secrets: a short value, a repeated character, a plain URL.
 	for _, text := range []string{"password: hunter2", "token=" + strings.Repeat("x", 40), "https://example.com/a:b@c", "secret_count: 12"} {
-		if found := redactCountValue(text, nil, far); found.count() != 0 {
+		if found := redactCountValue(t, text); found.count() != 0 {
 			t.Errorf("a non-secret was counted: kinds %v", found.kinds)
 		}
 	}
 	// A named GitHub token is one github-token, not also an assigned-secret.
 	c := redactShapeCases[0]
-	if found := redactCountValue("token: "+c.make(t, c.n), nil, far); found.count() != 1 || found.kinds["github-token"] != 1 || found.rewrite != 1 {
+	if found := redactCountValue(t, "token: "+c.make(t, c.n)); found.count() != 1 || found.kinds["github-token"] != 1 || found.rewrite != 1 {
 		t.Errorf("a named token was counted as %v", found.kinds)
 	}
 }
@@ -924,7 +945,7 @@ func requireNoRedactFields(t *testing.T, label string, row map[string]any) {
 // prints nothing and the rewrite is never called.
 func TestToolRedactReportMode(t *testing.T) {
 	e, root := redactSandbox(t, toolRedactReport)
-	setToolLedger(t, &toolRedactRewrite, func(any, []string, time.Time) (any, bool) {
+	setToolLedger(t, &toolRedactRewrite, func([]byte, []string, time.Time) ([]byte, bool) {
 		t.Error("report mode called the rewrite")
 		return nil, false
 	})
@@ -1064,11 +1085,13 @@ func TestToolRedactRedactMode(t *testing.T) {
 		}
 	}
 	// A rewrite that would change the shape is not sent.
-	setToolLedger(t, &toolRedactRewrite, func(v any, _ []string, _ time.Time) (any, bool) { return []any{v}, true })
+	setToolLedger(t, &toolRedactRewrite, func(raw []byte, _ []string, _ time.Time) ([]byte, bool) {
+		return append(append([]byte("["), raw...), ']'), true
+	})
 	if out, row := redactPost(t, e, root, map[string]any{"stdout": value}); out != "" || row["redactSkip"] != "shape" {
 		t.Fatalf("shape: stdout %d bytes, skip %v", len(out), row["redactSkip"])
 	}
-	setToolLedger(t, &toolRedactRewrite, func(any, []string, time.Time) (any, bool) { return nil, false })
+	setToolLedger(t, &toolRedactRewrite, func([]byte, []string, time.Time) ([]byte, bool) { return nil, false })
 	if out, row := redactPost(t, e, root, map[string]any{"stdout": value}); out != "" || row["redactSkip"] != "timeout" {
 		t.Fatalf("late rewrite: stdout %d bytes, skip %v", len(out), row["redactSkip"])
 	}
@@ -1329,7 +1352,9 @@ func TestToolRedactLabelledCorpus(t *testing.T) {
 
 // a6: run with TT_REDACT_BENCH=1 on the host being measured. A 100 KiB
 // output must add under 20 ms at the 95th percentile, and an output of the
-// size cap must be scanned within 50 ms.
+// size cap must be scanned, and in redact mode rewritten, within 50 ms. The
+// outputs measured are ordinary source text, the worst cases above, an
+// output that is nothing but tokens, and one of many small strings.
 func TestToolRedactBenchmark(t *testing.T) {
 	if os.Getenv("TT_REDACT_BENCH") != "1" {
 		t.Skip("requires an explicit benchmark run")
@@ -1338,10 +1363,14 @@ func TestToolRedactBenchmark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p95 := func(size int, mode string) time.Duration {
-		text := strings.Repeat(string(source), size/len(source)+1)[:size]
-		data := []byte(toolPayload("PostToolUse", map[string]any{"tool_name": "Bash", "tool_response": map[string]any{"stdout": text, "stderr": "", "interrupted": false}}))
-		times := make([]time.Duration, 200)
+	c := redactShapeCases[0]
+	texts := map[string]string{"source text": string(source), "tokens only": c.make(t, c.n) + "\n"}
+	for _, unit := range redactWorstCases {
+		texts[fmt.Sprintf("%q", unit)] = unit
+	}
+	p95 := func(response any, mode string, runs int) time.Duration {
+		data := []byte(toolPayload("PostToolUse", map[string]any{"tool_name": "Bash", "tool_response": response}))
+		times := make([]time.Duration, runs)
 		for i := range times {
 			l := toolLedger{started: time.Now(), redactBudget: time.Hour, redactMax: 64 << 20, redactMode: mode, stdout: io.Discard}
 			var row toolLedgerRow
@@ -1354,13 +1383,39 @@ func TestToolRedactBenchmark(t *testing.T) {
 		sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
 		return times[len(times)*95/100]
 	}
-	small, capped := p95(100<<10, toolRedactReport), p95(toolRedactMaxBytes-1024, toolRedactReport)
-	t.Logf("p95 of 200 runs: 100 KiB output %s; %d KiB output (the size cap) %s", small, toolRedactMaxBytes>>10, capped)
+	fill := func(unit string, size int) any {
+		return map[string]any{"stdout": strings.Repeat(unit, size/len(unit)+1)[:size], "stderr": "", "interrupted": false}
+	}
+	var small, capped time.Duration
+	var smallName, cappedName string
+	measure := func(name string, at100, atCap any) {
+		for _, mode := range []string{toolRedactReport, toolRedactRedact} {
+			if d := p95(at100, mode, 100); d > small {
+				small, smallName = d, name+", "+mode
+			}
+			if d := p95(atCap, mode, 40); d > capped {
+				capped, cappedName = d, name+", "+mode
+			}
+		}
+	}
+	for name, unit := range texts {
+		measure(name, fill(unit, 100<<10), fill(unit, toolRedactMaxBytes-1024))
+	}
+	many := func(size int) any {
+		var list []any
+		for n := 0; n < size; n += 24 {
+			list = append(list, "a short line of output")
+		}
+		return list
+	}
+	measure("many small strings", many(100<<10), many(toolRedactMaxBytes-1024))
+	plain := p95(fill(string(source), 100<<10), toolRedactReport, 200)
+	t.Logf("p95: 100 KiB of source text, report mode, %s; slowest 100 KiB output %s (%s); slowest output of the %d KiB cap %s (%s)", plain, small, smallName, toolRedactMaxBytes>>10, capped, cappedName)
 	if small >= 20*time.Millisecond {
-		t.Errorf("a 100 KiB output adds %s at the 95th percentile, want under 20 ms", small)
+		t.Errorf("a 100 KiB output adds %s at the 95th percentile (%s), want under 20 ms", small, smallName)
 	}
 	if capped >= 50*time.Millisecond {
-		t.Errorf("an output of the size cap takes %s at the 95th percentile, want under 50 ms", capped)
+		t.Errorf("an output of the size cap takes %s at the 95th percentile (%s), want under 50 ms", capped, cappedName)
 	}
 }
 
@@ -1416,5 +1471,164 @@ func TestToolRedactHostSetupLeavesSettingsAndRelayJSON(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// redactWorstCases are texts built to make a careless scan slow: a prefix
+// that is refused again and again inside one long run, a name whose value
+// runs to the end of the text, and the like.
+var redactWorstCases = []string{
+	"_sk-ant-", "_tskey-auth-", "token=", "plain text ", "-sk-", "asecret:", "aaaatoken=", "-eyJ", "eyJ.", ".aaaaaa", "AIza", "://", "://a:b",
+	"-----BEGIN ", "-----BEGIN " + "PRIVATE KEY-----", "aws_secret_access_key=", "authorization: bearer ", "password: '", "xoxb-", "_ghp_", "api_key=x",
+}
+
+// Review b1: every loop of the scan is linear and honours the deadline. Each
+// worst case, up to the size cap, is scanned well inside the 100 ms budget,
+// and a scan whose deadline has passed returns at once.
+func TestToolRedactScanIsBounded(t *testing.T) {
+	exact := []string{strings.Repeat("ab", 10), "token=token=token=token="}
+	slowest, slowestUnit := time.Duration(0), ""
+	for _, unit := range redactWorstCases {
+		for _, size := range []int{64 << 10, 256 << 10, toolRedactMaxBytes} {
+			text := strings.Repeat(unit, size/len(unit))
+			start := time.Now()
+			_, _, ok := redactScan(text, exact, start.Add(100*time.Millisecond))
+			elapsed := time.Since(start)
+			if elapsed > slowest {
+				slowest, slowestUnit = elapsed, fmt.Sprintf("%q at %d KiB", unit, size>>10)
+			}
+			if elapsed > 130*time.Millisecond {
+				t.Errorf("unit %q, %d KiB: the scan returned after %s, ok=%v; its budget is 100 ms", unit, size>>10, elapsed.Round(time.Millisecond), ok)
+			}
+			start = time.Now()
+			if _, _, ok := redactScan(text, exact, start.Add(-time.Second)); ok || time.Since(start) > 30*time.Millisecond {
+				t.Errorf("unit %q, %d KiB: a scan already past its deadline returned ok=%v after %s", unit, size>>10, ok, time.Since(start).Round(time.Millisecond))
+			}
+		}
+	}
+	t.Logf("slowest worst-case scan: %s for %s", slowest.Round(100*time.Microsecond), slowestUnit)
+}
+
+// Review b1, at the hook: a generated value on the first line followed by a
+// worst-case text up to the cap still leaves a row, with its count or with
+// the timeout skip, and the hook returns inside its deadline.
+func TestToolRedactWorstCaseLeavesARow(t *testing.T) {
+	c := redactShapeCases[0]
+	for _, mode := range []string{toolRedactReport, toolRedactRedact} {
+		e, root := redactSandbox(t, mode)
+		for _, unit := range []string{"_sk-ant-", "token=", "plain text "} {
+			for _, size := range []int{64 << 10, 256 << 10, 1000 << 10} {
+				value := c.make(t, c.n)
+				before := len(toolLedgerRows(t, root, e.agent))
+				fields := map[string]any{"session_id": "s1", "tool_name": "Bash", "tool_use_id": redactRandomFrom(t, redactAlnum, 8), "tool_input": map[string]any{},
+					"tool_response": map[string]any{"stdout": value + "\n" + strings.Repeat(unit, size/len(unit))}}
+				payload := toolPayload("PostToolUse", fields)
+				label := fmt.Sprintf("%s, %q, %d KiB", mode, unit, size>>10)
+				// The ledger decodes its input before any scan starts. Where
+				// that alone takes a large part of the 150 ms, as under the
+				// race detector, this size cannot leave a row on this run.
+				decodeStart := time.Now()
+				var probe toolHookInput
+				_ = json.Unmarshal([]byte(payload), &probe)
+				if spent := time.Since(decodeStart); spent > 25*time.Millisecond {
+					t.Logf("%s: not run, decoding the input alone took %s here", label, spent.Round(time.Millisecond))
+					continue
+				}
+				r := runToolHook(t, e, "tool", payload, nil)
+				rows := toolLedgerRows(t, root, e.agent)
+				if r.err != nil || r.elapsed > 200*time.Millisecond || len(rows) != before+1 {
+					t.Fatalf("%s: err %v, %s, %d new rows; want one row inside 200 ms", label, r.err, r.elapsed.Round(time.Millisecond), len(rows)-before)
+				}
+				row := rows[len(rows)-1]
+				if row["redactSkip"] == "timeout" {
+					if r.out != "" {
+						t.Fatalf("%s: a timed-out scan printed %d bytes", label, len(r.out))
+					}
+					continue // a loaded host: the stated fail-open result
+				}
+				kinds, _ := row["redactKinds"].(map[string]any)
+				if row["redactSkip"] != nil || kinds["github-token"] != float64(1) {
+					t.Fatalf("%s: row skip %v, kinds %v; want the value counted", label, row["redactSkip"], kinds)
+				}
+				if mode == toolRedactRedact && (strings.Contains(r.out, value) || !strings.Contains(r.out, "[tt-redacted:github-token]")) {
+					t.Fatalf("%s: the answer of %d bytes does not replace the value", label, len(r.out))
+				}
+			}
+		}
+	}
+}
+
+// Review f1: a redact answer is the output as it was written, byte for byte,
+// with only the value cut out. A lone surrogate escape, other escapes,
+// spacing, key order and number forms all pass through untouched.
+func TestToolRedactAnswerPreservesBytes(t *testing.T) {
+	e, _ := redactSandbox(t, toolRedactRedact)
+	c := redactShapeCases[0]
+	value := c.make(t, c.n)
+	const hold = "[tt-redacted:github-token]"
+	for label, raw := range map[string]string{
+		"lone surrogate":     `{"stdout":"pre \ud83d mid ` + value + ` end","stderr":""}`,
+		"escapes and spaces": `{ "z" : 1.50, "a":"x\/y \u00e9 \ud83d\ude00 \"q\" \\ \t<&> ` + value + `\n", "big":12345678901234567890 ,"e":1e3, "k\u0065y":[ "` + value + `" , null ] }`,
+		"a bare string":      `"\u0041 ` + value + ` \udc00"`,
+		"value at both ends": `["` + value + `\n` + value + `"]`,
+	} {
+		// The payload is written by hand: json.Marshal would rewrite the
+		// raw output's escapes before the hook ever saw them.
+		input := `{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_use_id":"u1","tool_input":{},"tool_response":` + raw + `}`
+		r := runToolHook(t, e, "tool", input, nil)
+		want := `{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":` + strings.ReplaceAll(raw, value, hold) + `,"additionalContext":`
+		if r.err != nil || !strings.HasPrefix(r.out, want) || strings.Contains(r.out, "\ufffd") {
+			t.Errorf("%s: the answer is not the output with only the value replaced (%d bytes, err %v)", label, len(r.out), r.err)
+		}
+		var answer map[string]any
+		if err := json.Unmarshal([]byte(r.out), &answer); err != nil {
+			t.Errorf("%s: the answer is not JSON: %v", label, err)
+		}
+	}
+	// A value that is itself written with escapes is still found, and the
+	// whole of its written form is cut out.
+	escaped := `\u0067hp\u005f` + value[4:len(value)-1] + fmt.Sprintf(`\u%04x`, value[len(value)-1])
+	raw := `{"stdout":"a ` + escaped + ` b \ud83d"}`
+	r := runToolHook(t, e, "tool", `{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_use_id":"u2","tool_input":{},"tool_response":`+raw+`}`, nil)
+	if want := `"updatedToolOutput":{"stdout":"a ` + hold + ` b \ud83d"},`; !strings.Contains(r.out, want) {
+		t.Errorf("an escaped value was not cut out whole (%d bytes)", len(r.out))
+	}
+}
+
+// redactDecode reads a string token as encoding/json does, and its offsets
+// point at the written form of each decoded byte.
+func TestToolRedactDecode(t *testing.T) {
+	for _, token := range []string{
+		`""`, `"plain"`, `"caf\u00e9"`, `"\ud83d\ude00 pair"`, `"lone \ud83d high"`, `"lone \ude00 low"`, `"\ud83d\u0041"`, `"\ud83d"`,
+		`"\" \\ \/ \b \f \n \r \t"`, `"é raw and \u00E9 escaped"`, `"end \\"`, `"\u0000"`,
+	} {
+		var want string
+		if err := json.Unmarshal([]byte(token), &want); err != nil {
+			t.Fatalf("%s: %v", token, err)
+		}
+		got, offsets := redactDecode([]byte(token))
+		if got != want {
+			t.Errorf("%s decoded to %q, want %q", token, got, want)
+		}
+		if offsets == nil {
+			continue
+		}
+		if len(offsets) != len(got)+1 || int(offsets[len(got)]) != len(token)-1 {
+			t.Errorf("%s: %d offsets for %d bytes", token, len(offsets), len(got))
+		}
+		for i := 1; i < len(offsets); i++ {
+			if offsets[i] < offsets[i-1] || offsets[i] < 1 {
+				t.Errorf("%s: offsets go backwards at %d", token, i)
+			}
+		}
+	}
+	// Keys are skipped, values are found, in order.
+	var found []string
+	raw := []byte(`{"k1":"v1","k\"2":{"k3":["v2",{"k4":"v\"3"},"v4"],"k5":"v5"},"k6":7,"k7":[["v6"]]}`)
+	if !redactEachString(raw, func(start, end int) bool { found = append(found, string(raw[start:end])); return true }) {
+		t.Fatal("the walk stopped")
+	}
+	if want := []string{`"v1"`, `"v2"`, `"v\"3"`, `"v4"`, `"v5"`, `"v6"`}; !reflect.DeepEqual(found, want) {
+		t.Errorf("string values found: %q, want %q", found, want)
 	}
 }

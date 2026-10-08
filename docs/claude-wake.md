@@ -395,13 +395,13 @@ A match lies inside one string value of the tool's structured output; object key
 
 The vendor pages were read on 2026-10-07. They publish prefixes; none of those read publishes a length. Where a length is "exactly", a vendor that lengthens its tokens makes that shape miss, not misfire. Whether the unpublished lengths are confirmation enough for group B is for the owner helper to accept or change.
 
-**Group C, counted and never rewritten:** `assigned-secret` (20 or more varied characters after a name such as `api_key`, `secret`, `token` or `password` and `=` or `:`), `bearer` (the value after an `Authorization: Bearer` header), `jwt` (three dot-separated base64url parts whose first two decode as JSON objects), `url-password` (the password in a `scheme://user:password@host` address), `aws-secret-key` (40 characters after the AWS secret key name), and two shapes with no vendor-published bounds, moved here from the design's group B: `google-api-key` (`AIza` + exactly 35) and `discord-token` (three dot-separated parts). A group C match that a group A or B match already covers is not counted twice.
+**Group C, counted and never rewritten:** `assigned-secret` (20 or more characters, at least 8 different ones among the first 64, after a name such as `api_key`, `secret`, `token` or `password` and `=` or `:`), `bearer` (the value after an `Authorization: Bearer` header), `jwt` (three dot-separated base64url parts whose first two decode as JSON objects; a candidate that starts inside the one before it is not looked at), `url-password` (the password in a `scheme://user:password@host` address), `aws-secret-key` (40 characters after the AWS secret key name), and two shapes with no vendor-published bounds, moved here from the design's group B: `google-api-key` (`AIza` + exactly 35) and `discord-token` (three dot-separated parts). A group C match that a group A or B match already covers is not counted twice.
 
 Not attempted: bare high-entropy strings with no prefix and no name. They cannot be told from git hashes, digests and ids.
 
 ### Fails open
 
-The hook can do two things on `PostToolUse`: print nothing, or print one JSON object carrying the rewritten output and a notice. It always exits 0 and never writes to stderr. There is one timer, the ledger's 150 ms: redaction has none of its own and does not lengthen it. The scan gives up 100 ms after the handler started.
+The hook can do two things on `PostToolUse`: print nothing, or print one JSON object carrying the rewritten output and a notice. The rewritten output is the original as Claude Code wrote it, byte for byte, with each match cut out of its string and the placeholder put in its place: escapes, spacing, key order and number forms are not re-encoded. It always exits 0 and never writes to stderr. There is one timer, the ledger's 150 ms: redaction has none of its own and does not lengthen it. The scan gives up 100 ms after the handler started.
 
 | Event | The session gets | Ledger row |
 | --- | --- | --- |
@@ -413,7 +413,7 @@ The hook can do two things on `PostToolUse`: print nothing, or print one JSON ob
 
 Fail-open means a secret passes whenever redaction is skipped. The answer is written before the row, because protecting the output matters more than recording it.
 
-Measured on the Mini (200 runs each, 95th percentile): a 100 KiB Bash output adds 2.4 ms; an output of the 1 MiB cap takes 22 ms, under the 50 ms the cap is required to fit in. `TT_REDACT_BENCH=1 go test -run TestToolRedactBenchmark ./cmd/tt` repeats it.
+The scan is linear in the output: a run of token characters is measured once however many prefixes sit inside it, and a value that could be long is measured only as far as its bound. Every loop also checks the deadline, at every step in a string over 4 KiB. Measured on the Mini at the 95th percentile, over ordinary source text, an output that is nothing but tokens, one of many small strings and 21 texts built to be slow (a refused prefix or a secret's name repeated to the cap), in both modes: 100 KiB of source text adds 2.1 ms in report mode; the slowest 100 KiB output takes 4.0 ms; the slowest output of the 1 MiB cap takes 38 ms (tokens only, redact mode), under the 50 ms the cap is required to fit in. `TT_REDACT_BENCH=1 go test -run TestToolRedactBenchmark ./cmd/tt` repeats it. Before the scan starts the ledger has already read and decoded its input; on a host where that alone takes most of the 150 ms, a call with an output near the cap can still leave no row.
 
 ### What is recorded
 

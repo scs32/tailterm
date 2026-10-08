@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Secret redaction (feature wi_79001641d97cd64c) is a step inside the
@@ -39,7 +41,7 @@ var (
 	// in 50 ms: TestToolRedactBenchmark measures it.
 	toolRedactMaxBytes = 1 << 20
 	// toolRedactRewrite builds the redacted output. Only redact mode calls it.
-	toolRedactRewrite = redactRewriteValue
+	toolRedactRewrite = redactRewriteRaw
 )
 
 // toolRedactEnv lists the only environment variables whose values are
@@ -191,9 +193,10 @@ func redactGroupBNames() []string {
 	return names
 }
 
-func redactRun(s string, at int, class *redactClass) int {
+// redactRunMax counts the class bytes from at, stopping once past max.
+func redactRunMax(s string, at int, class *redactClass, max int) int {
 	n := 0
-	for at+n < len(s) && class[s[at+n]] {
+	for at+n < len(s) && n <= max && class[s[at+n]] {
 		n++
 	}
 	return n
@@ -203,12 +206,49 @@ func redactBoundary(s string, at int) bool {
 	return at == 0 || !redactWU[s[at-1]]
 }
 
+// redactClock tells a scan when its deadline has passed. Every loop in a
+// scan takes a step per turn. In a short string the time is read once every
+// 256 steps; in a long one, where a single step can search the whole string,
+// it is read at every step. So no loop runs on for long after the deadline.
+type redactClock struct {
+	deadline time.Time
+	steps    int
+	mask     int
+	expired  bool
+}
+
+func newRedactClock(deadline time.Time, size int) *redactClock {
+	if size > 4<<10 {
+		return &redactClock{deadline: deadline}
+	}
+	return &redactClock{deadline: deadline, mask: 255}
+}
+
+func (c *redactClock) late() bool {
+	if c.expired {
+		return true
+	}
+	if c.steps++; c.steps&c.mask != 0 {
+		return false
+	}
+	return c.now()
+}
+
+func (c *redactClock) now() bool {
+	c.expired = c.expired || !time.Now().Before(c.deadline)
+	return c.expired
+}
+
 // redactScan finds what group A and group B match in one string value, and
 // what group C matches outside those. Overlapping matches are merged into one
 // span named after the leftmost. It reports false when the deadline passed
 // before it finished; the spans are then incomplete and must not be used.
+//
+// Every loop is linear in the string: a run of token characters is measured
+// once and remembered for the later prefixes inside it, and a value that
+// could be long is measured only as far as its bound.
 func redactScan(s string, exact []string, deadline time.Time) (rewrite, counted []redactSpan, ok bool) {
-	late := func() bool { return !time.Now().Before(deadline) }
+	clock := newRedactClock(deadline, len(s))
 	// Group A: values this host holds.
 	for _, value := range exact {
 		for at := 0; ; {
@@ -218,10 +258,10 @@ func redactScan(s string, exact []string, deadline time.Time) (rewrite, counted 
 			}
 			rewrite = append(rewrite, redactSpan{at + i, at + i + len(value), "host-credential"})
 			at += i + len(value)
+			if clock.late() {
+				return nil, nil, false
+			}
 		}
-	}
-	if late() {
-		return nil, nil, false
 	}
 	// Group B: private keys, from the header line through the matching end
 	// line, or to the end of the value when there is none.
@@ -231,9 +271,12 @@ func redactScan(s string, exact []string, deadline time.Time) (rewrite, counted 
 		if i < 0 {
 			break
 		}
+		if clock.late() {
+			return nil, nil, false
+		}
 		start := at + i
 		label := start + len(begin)
-		n := redactRun(s, label, redactHeader)
+		n := redactRunMax(s, label, redactHeader, 40+len("PRIVATE KEY"))
 		at = label
 		if n > 40+len("PRIVATE KEY") || !strings.HasSuffix(s[label:label+n], "PRIVATE KEY") || !strings.HasPrefix(s[label+n:], "-----") {
 			continue
@@ -248,17 +291,29 @@ func redactScan(s string, exact []string, deadline time.Time) (rewrite, counted 
 	}
 	// Group B: prefixed tokens.
 	for _, shape := range redactShapes {
-		if late() {
+		if clock.late() {
 			return nil, nil, false
 		}
+		// runEnd is where the last measured run of this shape's class ends.
+		// A later prefix whose body starts inside it ends at the same place.
+		runEnd := 0
 		for at := 0; ; {
 			i := strings.Index(s[at:], shape.prefix)
 			if i < 0 {
 				break
 			}
+			if clock.late() {
+				return nil, nil, false
+			}
 			start := at + i
 			body := start + len(shape.prefix)
-			n := redactRun(s, body, shape.class)
+			if body >= runEnd {
+				runEnd = body
+				for runEnd < len(s) && shape.class[s[runEnd]] {
+					runEnd++
+				}
+			}
+			n := runEnd - body
 			at = body
 			if !redactBoundary(s, start) || shape.noDash && start > 0 && s[start-1] == '-' || n < shape.min || shape.exact && n != shape.min {
 				continue
@@ -268,17 +323,18 @@ func redactScan(s string, exact []string, deadline time.Time) (rewrite, counted 
 		}
 	}
 	rewrite = redactMerge(rewrite)
-	if late() {
+	// Group C: counted, never rewritten.
+	context, ok := redactContext(s, clock)
+	if !ok {
 		return nil, nil, false
 	}
-	// Group C: counted, never rewritten.
-	for _, span := range redactMerge(redactContext(s)) {
+	for _, span := range redactMerge(context) {
 		i := sort.Search(len(rewrite), func(i int) bool { return rewrite[i].end > span.start })
 		if i == len(rewrite) || rewrite[i].start >= span.end {
 			counted = append(counted, span)
 		}
 	}
-	return rewrite, counted, !late()
+	return rewrite, counted, !clock.now()
 }
 
 // redactMerge sorts spans and joins the ones that overlap.
@@ -301,27 +357,28 @@ func redactMerge(spans []redactSpan) []redactSpan {
 	return merged
 }
 
-// redactAssigned parses `= value` or `: value` after a name ending at `at`,
-// allowing quotes and spaces, and returns the value's bounds.
-func redactAssigned(s string, at int, class *redactClass) (start, end int, ok bool) {
+// redactValueByte reports whether a byte can be part of an unquoted value.
+func redactValueByte(c byte) bool {
+	return c > ' ' && c != '"' && c != '\'' && c != 0x7f
+}
+
+// redactAssigned parses `=` or `:` after a name ending at `at`, allowing
+// quotes and spaces, and returns where the value starts.
+func redactAssigned(s string, at int) (int, bool) {
 	skip := func(chars string) {
-		for at < len(s) && strings.IndexByte(chars, s[at]) >= 0 {
+		for n := 0; at < len(s) && n < 8 && strings.IndexByte(chars, s[at]) >= 0; n++ {
 			at++
 		}
 	}
 	skip(`"'`)
 	skip(" \t")
 	if at >= len(s) || s[at] != '=' && s[at] != ':' {
-		return 0, 0, false
+		return 0, false
 	}
 	at++
 	skip(" \t")
 	skip(`"'`)
-	start = at
-	for at < len(s) && (class == nil && s[at] > ' ' && s[at] != '"' && s[at] != '\'' && s[at] != 0x7f || class != nil && class[s[at]]) {
-		at++
-	}
-	return start, at, true
+	return at, true
 }
 
 // redactLower lowers ASCII letters only, so every offset stays the same.
@@ -338,12 +395,13 @@ func redactLower(s string) string {
 	return string(b)
 }
 
-// redactContext finds the context-keyed shapes of group C.
-func redactContext(s string) []redactSpan {
+// redactContext finds the context-keyed shapes of group C. It reports false
+// when the clock ran out.
+func redactContext(s string, clock *redactClock) ([]redactSpan, bool) {
 	var spans []redactSpan
 	lower := redactLower(s)
 	each := func(needle string, found func(at int)) {
-		for at := 0; ; {
+		for at := 0; !clock.late(); {
 			i := strings.Index(lower[at:], needle)
 			if i < 0 {
 				return
@@ -352,33 +410,50 @@ func redactContext(s string) []redactSpan {
 			at += i + len(needle)
 		}
 	}
-	// assigned-secret: 20 or more varied characters after a secret's name.
+	// assigned-secret: 20 or more characters, varied within the first 64,
+	// after a secret's name. valueEnd remembers where the last measured
+	// value ends: a later name inside it has a value ending at the same place.
+	valueEnd := 0
 	for _, name := range []string{"api_key", "api-key", "apikey", "secret", "token", "password"} {
+		valueEnd = 0
 		each(name, func(at int) {
-			start, end, ok := redactAssigned(s, at+len(name), nil)
-			if !ok || end-start < 20 {
+			start, ok := redactAssigned(s, at+len(name))
+			if !ok {
 				return
 			}
-			distinct := map[byte]bool{}
-			for i := start; i < end; i++ {
-				distinct[s[i]] = true
+			if start >= valueEnd {
+				valueEnd = start
+				for valueEnd < len(s) && redactValueByte(s[valueEnd]) {
+					valueEnd++
+				}
 			}
-			if len(distinct) >= 8 {
-				spans = append(spans, redactSpan{start, end, "assigned-secret"})
+			if valueEnd-start < 20 {
+				return
+			}
+			var seen [256]bool
+			distinct := 0
+			for i := start; i < valueEnd && i < start+64 && distinct < 8; i++ {
+				if !seen[s[i]] {
+					seen[s[i]], distinct = true, distinct+1
+				}
+			}
+			if distinct >= 8 {
+				spans = append(spans, redactSpan{start, valueEnd, "assigned-secret"})
 			}
 		})
 	}
 	// aws-secret-key: exactly 40 characters after the AWS secret key name.
 	each("aws_secret_access_key", func(at int) {
-		if start, end, ok := redactAssigned(s, at+len("aws_secret_access_key"), redactBase64); ok && end-start == 40 {
-			spans = append(spans, redactSpan{start, end, "aws-secret-key"})
+		if start, ok := redactAssigned(s, at+len("aws_secret_access_key")); ok && redactRunMax(s, start, redactBase64, 40) == 40 {
+			spans = append(spans, redactSpan{start, start + 40, "aws-secret-key"})
 		}
 	})
-	// bearer: the value after Authorization: Bearer.
+	// bearer: the value after Authorization: Bearer. The name holds a space
+	// and a value does not, so one value is never measured twice.
 	each("authorization: bearer ", func(at int) {
 		start := at + len("authorization: bearer ")
 		end := start
-		for end < len(s) && s[end] > ' ' && s[end] != '"' && s[end] != '\'' && s[end] != 0x7f {
+		for end < len(s) && redactValueByte(s[end]) {
 			end++
 		}
 		if end-start >= 8 {
@@ -386,9 +461,11 @@ func redactContext(s string) []redactSpan {
 		}
 	})
 	// jwt: three base64url segments whose first two decode as JSON objects.
-	// An encoded object starts with `{"`, which encodes as eyJ.
+	// An encoded object starts with `{"`, which encodes as eyJ. A candidate
+	// that starts inside the one before it is not looked at again.
+	jwtEnd := 0
 	each("eyj", func(at int) {
-		if s[at:at+3] != "eyJ" || !redactBoundary(s, at) {
+		if at < jwtEnd || s[at:at+3] != "eyJ" || !redactBoundary(s, at) {
 			return
 		}
 		end, dots := at, 0
@@ -398,6 +475,7 @@ func redactContext(s string) []redactSpan {
 			}
 			end++
 		}
+		jwtEnd = end
 		parts := strings.Split(s[at:end], ".")
 		if len(parts) != 3 || parts[2] == "" || end-at > toolRedactLongest*4 {
 			return
@@ -414,23 +492,23 @@ func redactContext(s string) []redactSpan {
 	// google-api-key and discord-token have no vendor-published bounds, so
 	// they are counted here and not rewritten.
 	each("aiza", func(at int) {
-		if s[at:at+4] == "AIza" && redactBoundary(s, at) && redactRun(s, at+4, redactWUD) == 35 {
+		if s[at:at+4] == "AIza" && redactBoundary(s, at) && redactRunMax(s, at+4, redactWUD, 35) == 35 {
 			spans = append(spans, redactSpan{at, at + 39, "google-api-key"})
 		}
 	})
-	for at := 0; at < len(s); at++ {
+	for at := 0; at < len(s) && !clock.late(); at++ {
 		i := strings.IndexByte(s[at:], '.')
 		if i < 0 {
 			break
 		}
 		at += i
 		// The middle part is exactly six characters between two dots.
-		if redactRun(s, at+1, redactWUD) != 6 || at+7 >= len(s) || s[at+7] != '.' {
+		if redactRunMax(s, at+1, redactWUD, 6) != 6 || at+7 >= len(s) || s[at+7] != '.' {
 			continue
 		}
-		last := redactRun(s, at+8, redactWUD)
+		last := redactRunMax(s, at+8, redactWUD, 38)
 		first := 0
-		for first < at && redactWUD[s[at-1-first]] {
+		for first < at && first <= 26 && redactWUD[s[at-1-first]] {
 			first++
 		}
 		start := at - first
@@ -440,7 +518,8 @@ func redactContext(s string) []redactSpan {
 		spans = append(spans, redactSpan{start, at + 8 + last, "discord-token"})
 		at += 7 + last
 	}
-	// url-password: the password in scheme://user:password@host.
+	// url-password: the password in scheme://user:password@host. The scan
+	// stops at the first slash, so it never passes the next "://".
 	each("://", func(at int) {
 		colon, end := -1, at+3
 		for ; end < len(s) && s[end] > ' ' && s[end] != '/' && s[end] != '@' && s[end] != '"' && s[end] != '\''; end++ {
@@ -452,7 +531,119 @@ func redactContext(s string) []redactSpan {
 			spans = append(spans, redactSpan{colon + 1, end, "url-password"})
 		}
 	})
-	return spans
+	return spans, !clock.expired
+}
+
+// redactEachString calls found with the bounds, quotes included, of every
+// string value in a JSON document, in order. Object keys are structure, not
+// output, and are skipped. The document is one encoding/json already
+// accepted, so this only has to tell keys from values.
+func redactEachString(raw []byte, found func(start, end int) bool) bool {
+	var objects []bool // one entry per open container: true for an object
+	key := false       // the next string is an object key
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '{':
+			objects, key = append(objects, true), true
+		case '[':
+			objects, key = append(objects, false), false
+		case '}', ']':
+			if len(objects) > 0 {
+				objects = objects[:len(objects)-1]
+			}
+			key = false
+		case ',':
+			key = len(objects) > 0 && objects[len(objects)-1]
+		case ':':
+			key = false
+		case '"':
+			end := i + 1
+			for end < len(raw) && raw[end] != '"' {
+				if raw[end] == '\\' {
+					end++
+				}
+				end++
+			}
+			if end >= len(raw) {
+				return false
+			}
+			if !key && !found(i, end+1) {
+				return false
+			}
+			i = end
+		}
+	}
+	return true
+}
+
+// redactDecode returns the text of one JSON string token. With no escape in
+// the token, the text is the bytes between the quotes and offsets is nil.
+// Otherwise offsets[i] is where, in the token, the escape or byte that
+// produced decoded byte i begins, with one more entry for the closing quote,
+// so a match found in the text can be cut out of the token and every other
+// byte of it left exactly as it was written.
+func redactDecode(token []byte) (text string, offsets []int32) {
+	body := token[1 : len(token)-1]
+	if bytes.IndexByte(body, '\\') < 0 {
+		return string(body), nil
+	}
+	out := make([]byte, 0, len(body))
+	offsets = make([]int32, 0, len(body)+1)
+	put := func(at int, b ...byte) {
+		for range b {
+			offsets = append(offsets, int32(at))
+		}
+		out = append(out, b...)
+	}
+	hex := func(at int) (rune, bool) {
+		if at+6 > len(token)-1 || token[at] != '\\' || token[at+1] != 'u' {
+			return 0, false
+		}
+		n, err := strconv.ParseUint(string(token[at+2:at+6]), 16, 16)
+		return rune(n), err == nil
+	}
+	for i := 1; i < len(token)-1; {
+		if token[i] != '\\' {
+			put(i, token[i])
+			i++
+			continue
+		}
+		switch c := token[i+1]; c {
+		case 'u':
+			r, _ := hex(i)
+			size := 6
+			if utf16.IsSurrogate(r) {
+				// A pair is one character; a lone half has no text form.
+				if low, ok := hex(i + 6); ok && utf16.IsSurrogate(low) && utf16.DecodeRune(r, low) != utf8.RuneError {
+					r, size = utf16.DecodeRune(r, low), 12
+				} else {
+					r = utf8.RuneError
+				}
+			}
+			put(i, []byte(string(r))...)
+			i += size
+		case 'b':
+			put(i, '\b')
+			i += 2
+		case 'f':
+			put(i, '\f')
+			i += 2
+		case 'n':
+			put(i, '\n')
+			i += 2
+		case 'r':
+			put(i, '\r')
+			i += 2
+		case 't':
+			put(i, '\t')
+			i += 2
+		default: // a quote, a backslash or a slash
+			put(i, c)
+			i += 2
+		}
+	}
+	offsets = append(offsets, int32(len(token)-1))
+	return string(out), offsets
 }
 
 // redactResult is what one scan of a tool's output found.
@@ -470,84 +661,62 @@ func (r redactResult) count() int {
 	return n
 }
 
-// redactCountValue scans every string value inside a decoded tool output.
-// Object keys are structure, not output, and are not scanned.
-func redactCountValue(v any, exact []string, deadline time.Time) redactResult {
+// redactCountRaw scans every string value of a tool's output and counts the
+// matches. It changes nothing and builds no output.
+func redactCountRaw(raw []byte, exact []string, deadline time.Time) redactResult {
 	r := redactResult{kinds: map[string]int{}}
-	var walk func(v any) bool
-	walk = func(v any) bool {
-		switch x := v.(type) {
-		case string:
-			rewrite, counted, ok := redactScan(x, exact, deadline)
-			if !ok {
-				return false
-			}
-			r.rewrite += len(rewrite)
-			for _, span := range append(rewrite, counted...) {
-				r.kinds[span.name]++
-			}
-		case []any:
-			for _, item := range x {
-				if !walk(item) {
-					return false
-				}
-			}
-		case map[string]any:
-			for _, item := range x {
-				if !walk(item) {
-					return false
-				}
-			}
+	r.timeout = !redactEachString(raw, func(start, end int) bool {
+		text, _ := redactDecode(raw[start:end])
+		rewrite, counted, ok := redactScan(text, exact, deadline)
+		if !ok {
+			return false
+		}
+		r.rewrite += len(rewrite)
+		for _, span := range rewrite {
+			r.kinds[span.name]++
+		}
+		for _, span := range counted {
+			r.kinds[span.name]++
 		}
 		return true
-	}
-	r.timeout = !walk(v)
+	})
 	return r
 }
 
-// redactRewriteValue returns a copy of a decoded tool output in which each
-// group A and group B match is replaced by its placeholder. Only text inside
-// string values changes: every key, type, number and position is kept. It
-// reports false when the deadline passed first.
-func redactRewriteValue(v any, exact []string, deadline time.Time) (any, bool) {
-	switch x := v.(type) {
-	case string:
-		spans, _, ok := redactScan(x, exact, deadline)
+// redactRewriteRaw returns a tool's output with each group A and group B
+// match cut out of its string and the placeholder put in its place. Every
+// other byte is copied as it was written: structure, numbers, spacing,
+// escapes and the text around a match. It reports false when the deadline
+// passed first.
+func redactRewriteRaw(raw []byte, exact []string, deadline time.Time) ([]byte, bool) {
+	out := make([]byte, 0, len(raw))
+	copied := 0
+	ok := redactEachString(raw, func(start, end int) bool {
+		token := raw[start:end]
+		text, offsets := redactDecode(token)
+		spans, _, ok := redactScan(text, exact, deadline)
 		if !ok {
-			return nil, false
+			return false
 		}
-		if len(spans) == 0 {
-			return x, true
-		}
-		var b strings.Builder
-		at := 0
 		for _, span := range spans {
-			b.WriteString(x[at:span.start])
-			b.WriteString("[tt-redacted:" + span.name + "]")
-			at = span.end
-		}
-		b.WriteString(x[at:])
-		return b.String(), true
-	case []any:
-		out := make([]any, len(x))
-		for i, item := range x {
-			var ok bool
-			if out[i], ok = redactRewriteValue(item, exact, deadline); !ok {
-				return nil, false
+			from, to := span.start+1, span.end+1
+			if offsets != nil {
+				// Step past the other bytes of a character the match ends in.
+				for span.end < len(text) && span.end > 0 && offsets[span.end] == offsets[span.end-1] {
+					span.end++
+				}
+				from, to = int(offsets[span.start]), int(offsets[span.end])
 			}
+			out = append(out, raw[copied:start+from]...)
+			out = append(out, "[tt-redacted:"+span.name+"]"...)
+			copied = start + to
 		}
-		return out, true
-	case map[string]any:
-		out := make(map[string]any, len(x))
-		for key, item := range x {
-			var ok bool
-			if out[key], ok = redactRewriteValue(item, exact, deadline); !ok {
-				return nil, false
-			}
-		}
-		return out, true
+		return true
+	})
+	if !ok {
+		return nil, false
 	}
-	return v, true
+	return append(out, raw[copied:]...), true
 }
 
 // redactSameShape reports whether two decoded values differ only in the text
@@ -584,6 +753,19 @@ func redactSameShape(a, b any) bool {
 	return a == b
 }
 
+// redactSameShapeRaw decodes both documents and compares their shapes.
+func redactSameShapeRaw(a, b []byte) bool {
+	decode := func(raw []byte) (any, bool) {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var v any
+		return v, dec.Decode(&v) == nil && !dec.More()
+	}
+	x, okX := decode(a)
+	y, okY := decode(b)
+	return okX && okY && redactSameShape(x, y)
+}
+
 // redact is the PostToolUse step. It fills the row's redaction fields and, in
 // redact mode with something to replace and time left, writes Claude Code the
 // one JSON object carrying the rewritten output. Every other path writes
@@ -602,16 +784,13 @@ func (l toolLedger) redact(row *toolLedgerRow, data []byte) {
 		skip("oversize")
 		return
 	}
-	dec := json.NewDecoder(bytes.NewReader(in.Response))
-	dec.UseNumber()
-	var output any
-	if dec.Decode(&output) != nil {
-		skip("unreadable")
+	deadline := l.started.Add(l.redactBudget)
+	if !time.Now().Before(deadline) {
+		skip("timeout") // reading the input used the whole budget
 		return
 	}
-	deadline := l.started.Add(l.redactBudget)
 	exact := toolRedactExact(l.token)
-	found := redactCountValue(output, exact, deadline)
+	found := redactCountRaw(in.Response, exact, deadline)
 	if found.timeout {
 		skip("timeout")
 		return
@@ -624,27 +803,29 @@ func (l toolLedger) redact(row *toolLedgerRow, data []byte) {
 	if l.redactMode != toolRedactRedact || found.rewrite == 0 {
 		return
 	}
-	updated, ok := toolRedactRewrite(output, exact, deadline)
+	updated, ok := toolRedactRewrite(in.Response, exact, deadline)
 	if !ok {
 		skip("timeout")
 		return
 	}
-	if !redactSameShape(output, updated) {
+	if !redactSameShapeRaw(in.Response, updated) {
 		skip("shape")
 		return
 	}
-	var out bytes.Buffer
-	enc := json.NewEncoder(&out)
-	enc.SetEscapeHTML(false)
-	err := enc.Encode(map[string]any{"hookSpecificOutput": map[string]any{
-		"hookEventName":     "PostToolUse",
-		"updatedToolOutput": updated,
-		"additionalContext": redactNotice(found.rewrite),
-	}})
+	notice, err := json.Marshal(redactNotice(found.rewrite))
 	if err != nil {
 		skip("shape")
 		return
 	}
+	// The answer is assembled by hand so the output's own bytes are not
+	// encoded a second time.
+	var out bytes.Buffer
+	out.Grow(len(updated) + len(notice) + 128)
+	out.WriteString(`{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":`)
+	out.Write(updated)
+	out.WriteString(`,"additionalContext":`)
+	out.Write(notice)
+	out.WriteString("}}\n")
 	if !time.Now().Before(deadline) {
 		skip("timeout")
 		return
