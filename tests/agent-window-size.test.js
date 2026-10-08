@@ -40,6 +40,10 @@ const valid = () => ({
   connection: 1,
 });
 
+// Bound for a test that starts no private server. With the fixture's bound on
+// the others, every test in this file ends within its own timeout.
+const UNIT_TEST_TIMEOUT_MS = 20000;
+
 // Runs one sizing command for this target and binding against the fixture's
 // private server: bounded, and run again when a loaded host cut the reply.
 // raw wraps the real run, for a test that injects replies.
@@ -61,192 +65,232 @@ function sizingRun(f, { target, binding }, { raw, ...options } = {}) {
   });
 }
 
-test("eligibility excludes hidden, background, helper, shell, unverified and obsolete panes", () => {
-  assert.equal(eligibleAgentViewport(valid()), true);
-  for (const [key, value] of Object.entries({
-    staticMode: false,
-    connected: false,
-    tmux: false,
-    verified: false,
-    ignoreSize: false,
-    home: true,
-    disposed: true,
-    locked: true,
-    mode: "board",
-    active: false,
-    foreground: false,
-    visible: false,
-    cols: 0,
-    rows: 0,
-    target: null,
-  }))
+test(
+  "eligibility excludes hidden, background, helper, shell, unverified and obsolete panes",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    assert.equal(eligibleAgentViewport(valid()), true);
+    for (const [key, value] of Object.entries({
+      staticMode: false,
+      connected: false,
+      tmux: false,
+      verified: false,
+      ignoreSize: false,
+      home: true,
+      disposed: true,
+      locked: true,
+      mode: "board",
+      active: false,
+      foreground: false,
+      visible: false,
+      cols: 0,
+      rows: 0,
+      target: null,
+    }))
+      assert.equal(
+        eligibleAgentViewport({ ...valid(), [key]: value }),
+        false,
+        key,
+      );
     assert.equal(
-      eligibleAgentViewport({ ...valid(), [key]: value }),
+      eligibleAgentViewport({
+        ...valid(),
+        binding: { ...valid().binding, role: "owner_helper" },
+      }),
       false,
-      key,
     );
-  assert.equal(
-    eligibleAgentViewport({
-      ...valid(),
-      binding: { ...valid().binding, role: "owner_helper" },
-    }),
-    false,
-  );
-});
+  },
+);
 
-test("same-size focus claims again; resize never claims, and hidden retains no authority", async () => {
-  let s = valid(),
-    sequence = 0;
-  const commands = [];
-  const c = createAgentWindowSizer({
-    snapshot: () => s,
-    token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
-    execute: async (command) => {
-      commands.push(command);
-      return command.includes("ready:")
-        ? "ready:"
-        : command.includes("released")
-          ? "released"
-          : "sized";
-    },
-  });
-  c.refresh();
-  await c.settled();
-  assert.equal(commands.length, 2);
-  s.cols = 240;
-  c.refresh();
-  c.refresh();
-  await c.settled();
-  assert.equal(commands.length, 3);
-  assert.match(commands[2], /superseded/);
-  c.refresh({ focus: true });
-  await c.settled();
-  assert.equal(commands.length, 6);
-  assert.notEqual(commands[1], commands[5]);
-  s.visible = false;
-  c.refresh();
-  await c.settled();
-  assert.equal(commands.length, 7);
-  s.cols = 16;
-  c.refresh();
-  await c.settled();
-  assert.equal(commands.length, 7);
-  c.dispose();
-  await c.settled();
-});
-
-test("single flight rechecks current state after awaits and does not retry command failures", async () => {
-  let s = valid(),
-    finish;
-  const commands = [],
-    errors = [];
-  const c = createAgentWindowSizer({
-    snapshot: () => s,
-    token: () => "viewer_0000000000000001",
-    execute: (command) => {
-      commands.push(command);
-      return commands.length === 1
-        ? new Promise((r) => {
-            finish = r;
-          })
-        : Promise.resolve("released");
-    },
-    error: (e) => errors.push(e.message),
-  });
-  c.refresh();
-  await new Promise((r) => setTimeout(r, 0));
-  s.visible = false;
-  s.cols = 16;
-  c.refresh();
-  finish("ready:");
-  await c.settled();
-  assert.equal(
-    commands.length,
-    1,
-    "hidden during inspect never sends a mutation",
-  );
-  assert.deepEqual(errors, []);
-  c.dispose();
-  await c.settled();
-  const fail = createAgentWindowSizer({
-    snapshot: valid,
-    token: () => "viewer_0000000000000001",
-    execute: async () => {
-      throw Error("SSH failed");
-    },
-    error: (e) => errors.push(e.message),
-  });
-  fail.refresh();
-  await fail.settled();
-  fail.refresh();
-  await fail.settled();
-  assert.deepEqual(errors, ["SSH failed"]);
-  fail.dispose();
-  await fail.settled();
-});
-
-test("ordinary adoption main callback preserves changed/deleted endpoints and reattaches unchanged profiles", () => {
-  const source = readFileSync(
-    new URL("../client/main.js", import.meta.url),
-    "utf8",
-  );
-  const fn = source.slice(
-    source.indexOf("function reattachBoundAgent(t)"),
-    source.indexOf("\nfunction tabVisible(t)"),
-  );
-  for (const change of [
-    "host",
-    "port",
-    "username",
-    "tmuxPath",
-    "deleted",
-    "unchanged",
-  ]) {
-    const original = {
-      id: "profile",
-      host: "host-a",
-      port: 22,
-      username: "user",
-      tmuxPath: "",
-    };
-    const current = { ...original };
-    if (!["deleted", "unchanged"].includes(change))
-      current[change] = change === "port" ? 23 : "changed";
-    const t = {
-      ...valid(),
-      id: "original",
-      server: original,
-      task: valid().binding,
-      session: "agent",
-      tmuxVerified: true,
-      attachIgnoresSize: false,
-    };
-    const calls = [];
-    vm.runInNewContext(fn + "\nreattachBoundAgent(t)", {
-      t,
-      staticMode: true,
-      active: t.id,
-      data: { servers: change === "deleted" ? [] : [current] },
-      endpointKey,
-      helperReattach,
-      homeAgent,
-      reattachOptions,
-      notice() {},
-      connect(...args) {
-        calls.push(args);
-        return Promise.resolve();
+test(
+  "same-size focus claims again; resize never claims, and hidden retains no authority",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async () => {
+    let s = valid(),
+      sequence = 0;
+    const commands = [];
+    const c = createAgentWindowSizer({
+      snapshot: () => s,
+      token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
+      execute: async (command) => {
+        commands.push(command);
+        return command.includes("ready:")
+          ? "ready:"
+          : command.includes("released")
+            ? "released"
+            : "sized";
       },
     });
-    assert.equal(calls.length, change === "unchanged" ? 1 : 0, change);
-    assert.equal(t.server, original);
-    if (calls.length) {
-      assert.equal(calls[0][0], current);
-      assert.equal(calls[0][3].replace, t);
-      assert.equal(calls[0][3].target, t.target);
-      assert.equal(calls[0][3].home, false);
+    c.refresh();
+    await step(
+      "same-size focus: the sizer settles after its first refresh",
+      c.settled(),
+    );
+    assert.equal(commands.length, 2);
+    s.cols = 240;
+    c.refresh();
+    c.refresh();
+    await step(
+      "same-size focus: the sizer settles after two resize refreshes",
+      c.settled(),
+    );
+    assert.equal(commands.length, 3);
+    assert.match(commands[2], /superseded/);
+    c.refresh({ focus: true });
+    await step(
+      "same-size focus: the sizer settles after a focus refresh",
+      c.settled(),
+    );
+    assert.equal(commands.length, 6);
+    assert.notEqual(commands[1], commands[5]);
+    s.visible = false;
+    c.refresh();
+    await step("same-size focus: the sizer settles after hiding", c.settled());
+    assert.equal(commands.length, 7);
+    s.cols = 16;
+    c.refresh();
+    await step(
+      "same-size focus: the sizer settles after a hidden resize",
+      c.settled(),
+    );
+    assert.equal(commands.length, 7);
+    c.dispose();
+    await step("same-size focus: the sizer settles after dispose", c.settled());
+  },
+);
+
+test(
+  "single flight rechecks current state after awaits and does not retry command failures",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async () => {
+    let s = valid(),
+      finish;
+    const commands = [],
+      errors = [];
+    const c = createAgentWindowSizer({
+      snapshot: () => s,
+      token: () => "viewer_0000000000000001",
+      execute: (command) => {
+        commands.push(command);
+        return commands.length === 1
+          ? new Promise((r) => {
+              finish = r;
+            })
+          : Promise.resolve("released");
+      },
+      error: (e) => errors.push(e.message),
+    });
+    c.refresh();
+    await new Promise((r) => setTimeout(r, 0));
+    s.visible = false;
+    s.cols = 16;
+    c.refresh();
+    finish("ready:");
+    await step(
+      "single flight: the sizer settles after its held inspect is answered",
+      c.settled(),
+    );
+    assert.equal(
+      commands.length,
+      1,
+      "hidden during inspect never sends a mutation",
+    );
+    assert.deepEqual(errors, []);
+    c.dispose();
+    await step("single flight: the sizer settles after dispose", c.settled());
+    const fail = createAgentWindowSizer({
+      snapshot: valid,
+      token: () => "viewer_0000000000000001",
+      execute: async () => {
+        throw Error("SSH failed");
+      },
+      error: (e) => errors.push(e.message),
+    });
+    fail.refresh();
+    await step(
+      "single flight: the failing sizer settles after its first refresh",
+      fail.settled(),
+    );
+    fail.refresh();
+    await step(
+      "single flight: the failing sizer settles after its second refresh",
+      fail.settled(),
+    );
+    assert.deepEqual(errors, ["SSH failed"]);
+    fail.dispose();
+    await step(
+      "single flight: the failing sizer settles after dispose",
+      fail.settled(),
+    );
+  },
+);
+
+test(
+  "ordinary adoption main callback preserves changed/deleted endpoints and reattaches unchanged profiles",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    const source = readFileSync(
+      new URL("../client/main.js", import.meta.url),
+      "utf8",
+    );
+    const fn = source.slice(
+      source.indexOf("function reattachBoundAgent(t)"),
+      source.indexOf("\nfunction tabVisible(t)"),
+    );
+    for (const change of [
+      "host",
+      "port",
+      "username",
+      "tmuxPath",
+      "deleted",
+      "unchanged",
+    ]) {
+      const original = {
+        id: "profile",
+        host: "host-a",
+        port: 22,
+        username: "user",
+        tmuxPath: "",
+      };
+      const current = { ...original };
+      if (!["deleted", "unchanged"].includes(change))
+        current[change] = change === "port" ? 23 : "changed";
+      const t = {
+        ...valid(),
+        id: "original",
+        server: original,
+        task: valid().binding,
+        session: "agent",
+        tmuxVerified: true,
+        attachIgnoresSize: false,
+      };
+      const calls = [];
+      vm.runInNewContext(fn + "\nreattachBoundAgent(t)", {
+        t,
+        staticMode: true,
+        active: t.id,
+        data: { servers: change === "deleted" ? [] : [current] },
+        endpointKey,
+        helperReattach,
+        homeAgent,
+        reattachOptions,
+        notice() {},
+        connect(...args) {
+          calls.push(args);
+          return Promise.resolve();
+        },
+      });
+      assert.equal(calls.length, change === "unchanged" ? 1 : 0, change);
+      assert.equal(t.server, original);
+      if (calls.length) {
+        assert.equal(calls[0][0], current);
+        assert.equal(calls[0][3].replace, t);
+        assert.equal(calls[0][3].target, t.target);
+        assert.equal(calls[0][3].home, false);
+      }
     }
-  }
-});
+  },
+);
 
 test(
   "private tmux controllers reject obsolete claims delayed past hide, dispose or reconnect",
@@ -1347,8 +1391,17 @@ test(
     try {
       // What a loaded host returns when tmux cuts the format: a short inspect,
       // the else branch of a cut identity, and no status branch at all. Each is
-      // returned once, without contacting tmux, for that numbered run.
-      const cut = { 1: "ready::200x\n", 3: "refused\n", 5: "" };
+      // returned once, without contacting tmux, as the first reply to that
+      // kind of command, so a real cut during this test moves none of them.
+      const cut = { inspect: "ready::200x\n", claim: "refused\n", resize: "" };
+      const kind = (command) =>
+        command.includes("ready:")
+          ? "inspect"
+          : command.includes("@tailterm_size_revision},")
+            ? "claim"
+            : command.includes("resize-window")
+              ? "resize"
+              : "other";
       // The re-run lines go to stderr. They are collected here instead, so a
       // count of that line in a run's output counts real cut replies only.
       const lines = [],
@@ -1357,9 +1410,17 @@ test(
         String(chunk).startsWith("tmux sizing re-run")
           ? (lines.push(String(chunk)), true)
           : write.call(process.stderr, chunk, ...rest);
-      let runs = 0;
+      let runs = 0,
+        injected = 0;
       const x = lossySizer(f, "cut-reply", {
-        raw: (real) => (command) => cut[++runs] ?? real(command),
+        raw: (real) => (command) => {
+          runs++;
+          const reply = cut[kind(command)];
+          if (reply === undefined) return real(command);
+          delete cut[kind(command)];
+          injected++;
+          return reply;
+        },
       });
       try {
         await x.focus();
@@ -1370,8 +1431,11 @@ test(
         assert.deepEqual(x.errors, []);
         assert.equal(x.sent.length, 3);
         assert.equal(x.state(), "240x59|" + x.token);
-        assert.equal(runs, 6, "each cut reply cost exactly one more run");
-        assert.deepEqual(lines, [
+        assert.equal(injected, 3, "each kind of cut reply was returned once");
+        assert.ok(runs >= 6, "each cut reply cost one more run");
+        // A first re-run here can only follow an injected reply.
+        const first = (line) => line.startsWith("tmux sizing re-run 1:");
+        assert.deepEqual(lines.filter(first), [
           'tmux sizing re-run 1: "ready::200x" while identity holds\n',
           'tmux sizing re-run 1: "refused" while identity holds\n',
           'tmux sizing re-run 1: "" while identity holds\n',
@@ -1386,11 +1450,16 @@ test(
           timeoutMs: 150,
           pauseMs: 10,
         });
+        const beforeStuck = lines.length;
         assert.throws(
           () => stuck(resize),
           /^Error: tmux sizing reply stayed "refused" for 150 ms while identity holds: resize$/,
         );
-        assert.ok(lines.length > 3, "every re-run is written");
+        assert.equal(
+          lines[beforeStuck],
+          'tmux sizing re-run 1: "refused" while identity holds\n',
+          "a reply that stays cut is written before it throws",
+        );
         // A real refusal: the identity does not hold, so nothing runs twice.
         const written = lines.length;
         let refusals = 0;
@@ -1422,196 +1491,255 @@ test(
   },
 );
 
-test("a pending step is rejected by name within its bound, for a gate and for a command that never returns", async () => {
-  const started = Date.now();
-  assert.equal(await step("a step that resolves", Promise.resolve(7), 40), 7);
-  await assert.rejects(
-    step("A's claim reaches the gate", new Promise(() => {}), 40),
-    /^Error: Agent sizing test step still pending after 40 ms: A's claim reaches the gate$/,
-  );
-  const waiting = [];
-  let answering = false;
-  const c = createAgentWindowSizer({
-    snapshot: valid,
-    token: () => "viewer_0000000000000001",
-    execute: (command) =>
-      answering
-        ? Promise.resolve(command.includes("ready:") ? "ready:" : "sized")
-        : new Promise((r) => waiting.push(r)),
-  });
-  c.refresh({ focus: true });
-  try {
+test(
+  "a pending step is rejected by name within its bound, for a gate and for a command that never returns",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async () => {
+    const started = Date.now();
+    assert.equal(await step("a step that resolves", Promise.resolve(7), 40), 7);
     await assert.rejects(
-      step("the sizer settles after focus", c.settled(), 40),
-      /^Error: Agent sizing test step still pending after 40 ms: the sizer settles after focus$/,
+      step("A's claim reaches the gate", new Promise(() => {}), 40),
+      /^Error: Agent sizing test step still pending after 40 ms: A's claim reaches the gate$/,
     );
-  } finally {
-    // settled() polls while a command is held: answer it before leaving.
-    answering = true;
-    for (const answer of waiting) answer("ready:");
-    c.dispose();
-    await step("the sizer settles once its command is answered", c.settled());
-  }
-  assert.ok(Date.now() - started < 5000, "both hangs are reported fast");
-});
-
-test("a teardown the host refuses or never answers is dropped after a bounded number of rounds", async () => {
-  for (const mode of ["refuses", "never answers"]) {
-    // Hidden pane whose host is gone: focus changes must not repeat forever.
-    let s = valid(),
-      sequence = 0,
-      dead = false;
-    const commands = [],
-      errors = [];
+    const waiting = [];
+    let answering = false;
     const c = createAgentWindowSizer({
-      snapshot: () => s,
-      token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
-      error: (e) => errors.push(e.message),
-      execute: async (command) => {
-        commands.push(command);
-        if (command.includes("ready:")) return "ready::200x50";
-        if (!/resize-window|restored/.test(command) && !dead) return "released";
-        if (!dead || command.includes("@tailterm_size_revision},"))
-          return "sized";
-        if (mode === "refuses") return "refused";
-        throw Error("transport lost");
-      },
+      snapshot: valid,
+      token: () => "viewer_0000000000000001",
+      execute: (command) =>
+        answering
+          ? Promise.resolve(command.includes("ready:") ? "ready:" : "sized")
+          : new Promise((r) => waiting.push(r)),
     });
     c.refresh({ focus: true });
-    await c.settled();
-    assert.equal(commands.length, 2, mode);
-    dead = true;
-    s.visible = false;
-    c.refresh();
-    await c.settled();
-    for (let i = 0; i < 3; i++) {
-      c.refresh({ focus: true });
-      await c.settled();
-    }
-    // One refusal is final; a silent host gets three rounds of two attempts.
-    assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
-    assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
-    for (let i = 0; i < 20; i++) {
-      c.refresh({ focus: true });
-      await c.settled();
-    }
-    assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
-    assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
-
-    // Ten identity changes, each leaving a claim on a target that is gone.
-    s = { ...valid(), connection: 2 };
-    c.refresh({ focus: true });
-    await c.settled();
-    for (let i = 3; i < 13; i++) {
-      s = { ...s, connection: i };
-      const before = commands.length;
-      c.refresh();
-      await c.settled();
-      assert.ok(
-        commands.length - before <= 3 * 2 + 2,
-        mode + ": at most three kept claims are retried per change",
+    try {
+      await assert.rejects(
+        step("the sizer settles after focus", c.settled(), 40),
+        /^Error: Agent sizing test step still pending after 40 ms: the sizer settles after focus$/,
       );
+    } finally {
+      // settled() polls while a command is held: answer it before leaving.
+      answering = true;
+      for (const answer of waiting) answer("ready:");
+      c.dispose();
+      await step("the sizer settles once its command is answered", c.settled());
     }
-    s.visible = false;
-    for (let i = 0; i < 4; i++) {
+    assert.ok(Date.now() - started < 5000, "both hangs are reported fast");
+  },
+);
+
+test(
+  "a teardown the host refuses or never answers is dropped after a bounded number of rounds",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async () => {
+    for (const mode of ["refuses", "never answers"]) {
+      // Hidden pane whose host is gone: focus changes must not repeat forever.
+      let s = valid(),
+        sequence = 0,
+        dead = false;
+      const commands = [],
+        errors = [];
+      const c = createAgentWindowSizer({
+        snapshot: () => s,
+        token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
+        error: (e) => errors.push(e.message),
+        execute: async (command) => {
+          commands.push(command);
+          if (command.includes("ready:")) return "ready::200x50";
+          if (!/resize-window|restored/.test(command) && !dead)
+            return "released";
+          if (!dead || command.includes("@tailterm_size_revision},"))
+            return "sized";
+          if (mode === "refuses") return "refused";
+          throw Error("transport lost");
+        },
+      });
       c.refresh({ focus: true });
-      await c.settled();
-    }
-    const count = commands.length,
-      reported = errors.length;
-    for (let i = 0; i < 20; i++) {
+      await step(
+        `teardown ${mode}: the sizer settles after its first focus`,
+        c.settled(),
+      );
+      assert.equal(commands.length, 2, mode);
+      dead = true;
+      s.visible = false;
+      c.refresh();
+      await step(
+        `teardown ${mode}: the sizer settles after the host dies and the pane hides`,
+        c.settled(),
+      );
+      for (let i = 0; i < 3; i++) {
+        c.refresh({ focus: true });
+        await step(
+          `teardown ${mode}: the sizer settles after hidden focus ${i}`,
+          c.settled(),
+        );
+      }
+      // One refusal is final; a silent host gets three rounds of two attempts.
+      assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
+      assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
+      for (let i = 0; i < 20; i++) {
+        c.refresh({ focus: true });
+        await step(
+          `teardown ${mode}: the sizer settles after settled focus ${i}`,
+          c.settled(),
+        );
+      }
+      assert.equal(commands.length, mode === "refuses" ? 3 : 8, mode);
+      assert.equal(errors.length, mode === "refuses" ? 1 : 3, mode);
+
+      // Ten identity changes, each leaving a claim on a target that is gone.
+      s = { ...valid(), connection: 2 };
       c.refresh({ focus: true });
-      await c.settled();
+      await step(
+        `teardown ${mode}: the sizer settles after a focus on connection 2`,
+        c.settled(),
+      );
+      for (let i = 3; i < 13; i++) {
+        s = { ...s, connection: i };
+        const before = commands.length;
+        c.refresh();
+        await step(
+          `teardown ${mode}: the sizer settles after the change to connection ${i}`,
+          c.settled(),
+        );
+        assert.ok(
+          commands.length - before <= 3 * 2 + 2,
+          mode + ": at most three kept claims are retried per change",
+        );
+      }
+      s.visible = false;
+      for (let i = 0; i < 4; i++) {
+        c.refresh({ focus: true });
+        await step(
+          `teardown ${mode}: the sizer settles after hidden focus ${i} with kept claims`,
+          c.settled(),
+        );
+      }
+      const count = commands.length,
+        reported = errors.length;
+      for (let i = 0; i < 20; i++) {
+        c.refresh({ focus: true });
+        await step(
+          `teardown ${mode}: the sizer settles after final focus ${i}`,
+          c.settled(),
+        );
+      }
+      assert.equal(commands.length, count, mode + ": nothing is owed any more");
+      assert.equal(errors.length, reported, mode);
+      c.dispose();
+      await step(
+        `teardown ${mode}: the sizer settles after dispose`,
+        c.settled(),
+      );
+      assert.equal(commands.length, count, mode);
     }
-    assert.equal(commands.length, count, mode + ": nothing is owed any more");
-    assert.equal(errors.length, reported, mode);
-    c.dispose();
-    await c.settled();
-    assert.equal(commands.length, count, mode);
-  }
-});
+  },
+);
 
-test("tmux format read returns a complete reading after a cut one", () => {
-  const formats = [],
-    values = ["240x", "240x59|viewer_1" + TMUX_FORMAT_END];
-  const run = (...args) => (formats.push(args.at(-1)), values.shift());
-  assert.equal(
-    readTmuxFormat(run, ["display-message", "-p", "#{a}x#{b}|#{c}"], {
-      pauseMs: 1,
-    }),
-    "240x59|viewer_1",
-  );
-  assert.deepEqual(formats, Array(2).fill("#{a}x#{b}|#{c}" + TMUX_FORMAT_END));
-});
+test(
+  "tmux format read returns a complete reading after a cut one",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    const formats = [],
+      values = ["240x", "240x59|viewer_1" + TMUX_FORMAT_END];
+    const run = (...args) => (formats.push(args.at(-1)), values.shift());
+    assert.equal(
+      readTmuxFormat(run, ["display-message", "-p", "#{a}x#{b}|#{c}"], {
+        pauseMs: 1,
+      }),
+      "240x59|viewer_1",
+    );
+    assert.deepEqual(
+      formats,
+      Array(2).fill("#{a}x#{b}|#{c}" + TMUX_FORMAT_END),
+    );
+  },
+);
 
-test("tmux format read keeps a legitimately empty field on the first read", () => {
-  let reads = 0;
-  const run = () => (reads++, "240x59|" + TMUX_FORMAT_END + "\n");
-  assert.equal(
-    readTmuxFormat(run, ["display-message", "-p", "#{a}|#{c}"], {
-      shape: /^\d+x\d+\|[^|]*$/,
-    }),
-    "240x59|",
-  );
-  assert.equal(reads, 1);
-  assert.equal(
-    readTmuxFormat(() => TMUX_FORMAT_END, ["-p", "#{c}"]),
-    "",
-  );
-});
+test(
+  "tmux format read keeps a legitimately empty field on the first read",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    let reads = 0;
+    const run = () => (reads++, "240x59|" + TMUX_FORMAT_END + "\n");
+    assert.equal(
+      readTmuxFormat(run, ["display-message", "-p", "#{a}|#{c}"], {
+        shape: /^\d+x\d+\|[^|]*$/,
+      }),
+      "240x59|",
+    );
+    assert.equal(reads, 1);
+    assert.equal(
+      readTmuxFormat(() => TMUX_FORMAT_END, ["-p", "#{c}"]),
+      "",
+    );
+  },
+);
 
-test("tmux format read re-reads a complete reading that fails its shape", () => {
-  const values = ["x59", "240x59", "1x2\n3x"].map((v) =>
-    v.replaceAll(/$/gm, TMUX_FORMAT_END),
-  );
-  const run = () => values.shift();
-  assert.equal(
-    readTmuxFormat(run, ["-p", "#{a}x#{b}"], {
-      shape: /^\d+x\d+$/,
-      pauseMs: 1,
-    }),
-    "240x59",
-  );
-  assert.throws(
-    () =>
-      readTmuxFormat(run, ["list-windows", "-F", "#{a}x#{b}"], {
+test(
+  "tmux format read re-reads a complete reading that fails its shape",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    const values = ["x59", "240x59", "1x2\n3x"].map((v) =>
+      v.replaceAll(/$/gm, TMUX_FORMAT_END),
+    );
+    const run = () => values.shift();
+    assert.equal(
+      readTmuxFormat(run, ["-p", "#{a}x#{b}"], {
         shape: /^\d+x\d+$/,
-        timeoutMs: 0,
+        pauseMs: 1,
       }),
-    /incomplete tmux reading after 1 reads/,
-  );
-});
+      "240x59",
+    );
+    assert.throws(
+      () =>
+        readTmuxFormat(run, ["list-windows", "-F", "#{a}x#{b}"], {
+          shape: /^\d+x\d+$/,
+          timeoutMs: 0,
+        }),
+      /incomplete tmux reading after 1 reads/,
+    );
+  },
+);
 
-test("tmux format read throws loudly when every reading stays cut", () => {
-  let reads = 0;
-  const started = Date.now();
-  assert.throws(
-    () =>
-      readTmuxFormat(() => (reads++, "240x"), ["-p", "#{a}x#{b}"], {
-        timeoutMs: 60,
-        pauseMs: 5,
-      }),
-    (e) =>
-      /^incomplete tmux reading after \d+ reads: #\{a\}x#\{b\} got "240x"$/.test(
-        e.message,
-      ) && e.message.includes(`after ${reads} reads`),
-  );
-  assert.ok(reads > 1 && Date.now() - started < 2000, String(reads));
-  assert.throws(
-    () => readTmuxFormat(() => "", ["-p", "#{a}"], { timeoutMs: 0 }),
-    /incomplete tmux reading after 1 reads: #\{a\} got ""/,
-  );
-});
+test(
+  "tmux format read throws loudly when every reading stays cut",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    let reads = 0;
+    const started = Date.now();
+    assert.throws(
+      () =>
+        readTmuxFormat(() => (reads++, "240x"), ["-p", "#{a}x#{b}"], {
+          timeoutMs: 60,
+          pauseMs: 5,
+        }),
+      (e) =>
+        /^incomplete tmux reading after \d+ reads: #\{a\}x#\{b\} got "240x"$/.test(
+          e.message,
+        ) && e.message.includes(`after ${reads} reads`),
+    );
+    assert.ok(reads > 1 && Date.now() - started < 2000, String(reads));
+    assert.throws(
+      () => readTmuxFormat(() => "", ["-p", "#{a}"], { timeoutMs: 0 }),
+      /incomplete tmux reading after 1 reads: #\{a\} got ""/,
+    );
+  },
+);
 
-test("tmux format read lets the runner's own error through", () => {
-  let reads = 0;
-  const run = () => {
-    reads++;
-    throw Error("no server running");
-  };
-  assert.throws(
-    () => readTmuxFormat(run, ["-p", "#{a}"]),
-    /^Error: no server running$/,
-  );
-  assert.equal(reads, 1);
-});
+test(
+  "tmux format read lets the runner's own error through",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  () => {
+    let reads = 0;
+    const run = () => {
+      reads++;
+      throw Error("no server running");
+    };
+    assert.throws(
+      () => readTmuxFormat(run, ["-p", "#{a}"]),
+      /^Error: no server running$/,
+    );
+    assert.equal(reads, 1);
+  },
+);

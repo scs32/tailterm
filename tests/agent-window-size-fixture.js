@@ -197,13 +197,13 @@ export function sizingReply({
         (reply.startsWith("ready:") &&
           !/^ready:(?:[a-zA-Z0-9_-]{16,64})?:\d+x\d+$/.test(reply));
       if (!suspect || !holds()) return output;
+      process.stderr.write(
+        `tmux sizing re-run ${runs}: ${JSON.stringify(reply)} while identity holds\n`,
+      );
       if (Date.now() >= deadline)
         throw Error(
           `tmux sizing reply stayed ${JSON.stringify(reply)} for ${timeoutMs} ms while identity holds: ${sizingAction(command)}`,
         );
-      process.stderr.write(
-        `tmux sizing re-run ${runs}: ${JSON.stringify(reply)} while identity holds\n`,
-      );
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pauseMs);
     }
   };
