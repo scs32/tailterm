@@ -451,7 +451,7 @@ Observed with Claude Code 2.1.293 on 2026-10-07 by the opt-in sandbox probe (`TT
 
 On that evidence the owner helper resolved decision D5 in #28664: after a rewrite, the transcript holds the rewritten output.
 
-Limits of these findings: three runs in all (two with a test helper doing the rewrite, one with the built `tt`), the haiku model, the Bash and Read tools only, one short single-line file. Other tools' output shapes were not tried. Files were searched only where Claude Code wrote during the run (its home folder, its JSON file, its cache and its temporary folder). **Network telemetry cannot be observed from the host and is treated as unprotected**: Claude Code may send the original output before the hook runs.
+Limits of these findings: four runs in all (two with a test helper doing the rewrite, two with the built `tt`), the haiku model, the Bash and Read tools only, one short single-line file. Other tools' output shapes were not tried. Files were searched only where Claude Code wrote during the run (its home folder, its JSON file, its cache and its temporary folder). **Network telemetry cannot be observed from the host and is treated as unprotected**: Claude Code may send the original output before the hook runs.
 
 The probe touches the real home in two stated ways: Claude Code reads its own login, and writes the disposable sessions' transcript folder, which the probe deletes. The installed `tt hook tool` also runs in those sessions and, given the sandbox environment, wrote only under the sandbox. Before cleanup the probe searches the working tree for every generated value and requires none; after it, the sandbox and the transcript folder must be gone.
 
