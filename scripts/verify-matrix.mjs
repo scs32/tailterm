@@ -32,15 +32,20 @@ import {
   acquireHostLock,
   releaseRun,
   resolveRunPriority,
+  resolvePriority,
   receiptKeys,
   minutesFlag,
   DEFAULT_HOST_WAIT_MS,
+  lockPaths,
+  takeMutex,
+  releaseMutex,
 } from "./verify-matrix-host-lock.mjs";
 
 const binarySuites = new Set([
   "profile-sync", "task-form", "lead-replacement", "project-work-items",
   "board-compose", "item-message-compose", "project-queue", "board-decisions",
   "owner-obligations", "dropdown-continuity", "board-audit-old-hub",
+  "interventions",
 ]);
 const historicalHubCommit = "58f9185981625b148b30ad4b5070a1a658e17f77";
 
@@ -79,11 +84,24 @@ export function diffPaths(cwd, base, commit) {
 }
 // A plan verifies exactly what merges only when the candidate contains its
 // base, so the candidate lands on that base as a fast-forward.
-export function assertFastForward(cwd, base, commit) {
+// A targeted run's base is the previous candidate, which a rebased fix no
+// longer contains: its refusal names that relation and both commits instead of
+// advising the rebase that caused it.
+export function assertFastForward(cwd, base, commit, { targeted = false } = {}) {
   const ancestry = spawnSync("git", ["merge-base", "--is-ancestor", base, commit], {
     cwd,
     encoding: "utf8",
   });
+  if (ancestry.status === 1 && targeted) {
+    const common = spawnSync("git", ["merge-base", base, commit], { cwd, encoding: "utf8" });
+    const mergeBase = common.status === 0 && /^[a-f0-9]{40}$/.test(common.stdout.trim())
+      ? common.stdout.trim()
+      : "none";
+    throw new Error(
+      `fix candidate ${commit} does not contain previous candidate ${base} (merge base ${mergeBase}). ` +
+        "A targeted run needs the fix committed on top of the previous candidate; after a rebase run the full plan on the new candidate.",
+    );
+  }
   if (ancestry.status === 1)
     throw new Error(
       "candidate is not a fast-forward of its base; rebase onto the current tip",
@@ -217,14 +235,36 @@ export function selectChecks(
     add("wasm-test-build", ["bash", "scripts/build-wasm.sh", "--test"]);
   return checks.sort((a, b) => a.id.localeCompare(b.id, "en"));
 }
+// The ./name.mjs modules a tests file imports, statically or dynamically.
+const importedTestModules = (text) =>
+  new Set(
+    [...text.matchAll(/\b(?:from|import)\s*\(?\s*["']\.\/([\w.-]+\.mjs)["']/g)].map(
+      (found) => found[1],
+    ),
+  );
+// A browser suite is a tests module that calls .launch( itself, carries the
+// suite marker, or imports a module carrying the helper marker (one import
+// level). Each marker is a whole line. A helper is not itself a suite.
+const BROWSER_SUITE_MARKER = /^\/\/ verify-matrix: browser-suite$/m;
+const BROWSER_HELPER_MARKER = /^\/\/ verify-matrix: browser-helper$/m;
 export function assertInventory(matrix, cwd) {
-  const inventory = readdirSync(join(cwd, "tests"))
+  const texts = new Map(
+    readdirSync(join(cwd, "tests"))
+      .filter((f) => f.endsWith(".mjs"))
+      .map((f) => [f, readFileSync(join(cwd, "tests", f), "utf8")]),
+  );
+  const helpers = new Set(
+    [...texts].filter(([, text]) => BROWSER_HELPER_MARKER.test(text)).map(([f]) => f),
+  );
+  const inventory = [...texts]
     .filter(
-      (f) =>
-        f.endsWith(".mjs") &&
-        readFileSync(join(cwd, "tests", f), "utf8").includes(".launch("),
+      ([f, text]) =>
+        !helpers.has(f) &&
+        (text.includes(".launch(") ||
+          BROWSER_SUITE_MARKER.test(text) ||
+          [...importedTestModules(text)].some((name) => helpers.has(name))),
     )
-    .map((f) => "tests/" + f)
+    .map(([f]) => "tests/" + f)
     .sort();
   const declared = [
     ...matrix.browserSuites.map((s) => s.file),
@@ -232,6 +272,27 @@ export function assertInventory(matrix, cwd) {
   ].sort();
   if (canonical(inventory) !== canonical(declared))
     throw new Error("Browser inventory changed; update approved matrix");
+}
+// binarySuites decides whether a run builds the test binaries, so it must name
+// exactly the declared suites that import the binary helper.
+export function assertBinarySuites(matrix, cwd) {
+  const declared = matrix.browserSuites.map((s) => s.file);
+  const users = declared.filter((file) =>
+    importedTestModules(readFileSync(join(cwd, file), "utf8")).has("test-binaries.mjs"),
+  );
+  const listed = declared.filter((file) => {
+    const found = /^tests\/(.+)-browser\.mjs$/.exec(file);
+    return found && binarySuites.has(found[1]);
+  });
+  const only = (from, other) => from.filter((file) => !other.includes(file)).sort();
+  const unlisted = only(users, listed),
+    unused = only(listed, users);
+  if (unlisted.length || unused.length)
+    throw new Error(
+      "Binary suite list disagrees with the suites that import tests/test-binaries.mjs" +
+        (unlisted.length ? `; helper users not listed: ${unlisted.join(", ")}` : "") +
+        (unused.length ? `; listed without the helper: ${unused.join(", ")}` : ""),
+    );
 }
 export function matrixPolicy(matrix, checks) {
   if (matrix.maxAttempts === undefined && matrix.knownFailures === undefined)
@@ -598,9 +659,14 @@ function selectionRule(context, cwd) {
     paths.some(
       (p) =>
         typeof p !== "string" ||
-        !p ||
         isAbsolute(p) ||
-        p.split("/").includes("..") ||
+        // Git names no path with an empty or dot segment, so one that has
+        // any is not a path this selection may be narrowed by. One trailing
+        // slash is an owned directory prefix, as plans record them.
+        p
+          .replace(/\/$/, "")
+          .split("/")
+          .some((part) => part === "" || part === "." || part === "..") ||
         /[\0\n]/.test(p),
     )
   )
@@ -649,6 +715,7 @@ export function planWithPreservation(
       "Independent owner-approved matrix digest and source required",
     );
   assertInventory(matrix, cwd);
+  assertBinarySuites(matrix, cwd);
   assertFastForward(cwd, context.baseCommit, context.commit);
   const packages = candidateGoPackages(cwd, context.commit);
   let selection = selectionRule(context, cwd),
@@ -1041,32 +1108,95 @@ function homeRoots(home) {
 const underRoots = (roots, path) =>
   roots.some((root) => path === root || path.startsWith(root + "/"));
 
+// How much older than the verifier home an unreadable process must be to count
+// as started before it.
+const UNREADABLE_START_MARGIN_MS = 5000;
+// Linux refuses /proc/PID/environ for a same-user process that is not
+// dumpable (an ssh-agent, a keyring daemon). Such a process is proven
+// unrelated to the verifier home only when it started before the home was
+// created: this run cannot have started it, and the home's random name did not
+// exist when its environment was set. Those are reported and skipped; a pid
+// that is gone by the time ps runs is skipped like any exited process; every
+// other case throws (wi_19db6841a2a50d57).
+function skipUnreadableOlderThanHome(unreadable, table, { run, self, now, homeCreatedMs, onUnreadable }) {
+  const pids = unreadable.map(({ pid }) => pid);
+  const unproven = (why, which = pids) =>
+    new Error(
+      `Cannot read the environment of ${which.length} same-user process${which.length === 1 ? "" : "es"} ` +
+        `(pid ${which.slice(0, 10).join(", ")}${which.length > 10 ? ", ..." : ""}) ` +
+        `or prove ${which.length === 1 ? "it" : "them"} unrelated to the verifier home: ${why}`,
+    );
+  if (!Number.isFinite(homeCreatedMs)) throw unproven("the home's creation time is not known");
+  // The runner's own pid keeps ps at exit 0 with a row when every listed
+  // process has gone.
+  let listing;
+  try {
+    listing = run("ps", ["-o", "pid=,etimes=", "-p", [...pids, self].join(",")]);
+  } catch (error) {
+    throw unproven("ps could not report start times: " + error.message);
+  }
+  // etimes is whole seconds elapsed when ps ran, so the clock is read after
+  // it: a slow ps can then only make a process look younger.
+  const at = now();
+  const elapsed = new Map();
+  for (const line of listing.split("\n")) {
+    if (!line.trim()) continue;
+    const found = /^\s*(\d+)\s+(\S+)\s*$/.exec(line);
+    if (!found) throw unproven("ps printed a line that could not be read");
+    elapsed.set(Number(found[1]), found[2]);
+  }
+  if (!elapsed.has(self)) throw unproven("ps did not list the runner itself");
+  const older = [],
+    young = [];
+  for (const { pid, code } of unreadable) {
+    if (!elapsed.has(pid)) continue;
+    const seconds = elapsed.get(pid);
+    const startedMs = /^\d+$/.test(seconds) ? at - Number(seconds) * 1000 : NaN;
+    if (startedMs < homeCreatedMs - UNREADABLE_START_MARGIN_MS)
+      older.push({
+        pid,
+        code,
+        startedAt: new Date(startedMs).toISOString(),
+        command: (table.get(pid)?.command ?? "").slice(0, 300),
+      });
+    else young.push(pid);
+  }
+  for (const entry of older) onUnreadable?.(entry);
+  if (young.length)
+    throw unproven("not started before the home was created, or start time unknown", young);
+}
+
 // HOME, TMPDIR or PWD values of each listed process. Raw environments hold
 // other processes' credentials, so they are matched here and never kept.
-function environmentMatches(run, table, roots) {
+function environmentMatches(table, roots, probes) {
+  const { platform, run, readEnviron } = probes;
   const matches = new Set(),
     variable = /(?:^|\s)(?:HOME|TMPDIR|PWD)=(\S+)/g;
-  if (process.platform === "darwin") {
+  if (platform === "darwin") {
     for (const line of run("ps", ["-axww", "-E", "-o", "pid=,command="]).split("\n")) {
       const found = /^\s*(\d+)\s(.*)$/.exec(line);
       if (found && table.has(Number(found[1])))
         for (const [, value] of found[2].matchAll(variable))
           if (underRoots(roots, value)) matches.add(Number(found[1]));
     }
-  } else if (process.platform === "linux") {
+  } else if (platform === "linux") {
+    const unreadable = [];
     for (const pid of table.keys()) {
       let environ;
       try {
-        environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+        environ = readEnviron(pid);
       } catch (error) {
         if (error.code === "ENOENT" || error.code === "ESRCH") continue;
-        throw error;
+        if (error.code !== "EACCES" && error.code !== "EPERM") throw error;
+        unreadable.push({ pid, code: error.code });
+        continue;
       }
       for (const entry of environ.split("\0")) {
         const found = /^(?:HOME|TMPDIR|PWD)=(.*)$/.exec(entry);
         if (found && underRoots(roots, found[1])) matches.add(pid);
       }
     }
+    if (unreadable.length) skipUnreadableOlderThanHome(unreadable, table, probes);
   } else throw new Error("Unsupported platform for the verifier home sweep");
   return matches;
 }
@@ -1074,16 +1204,27 @@ function environmentMatches(run, table, roots) {
 // Processes of this user that still live in or hold files under the verifier
 // home, found by environment, argv[0], cwd or any open file. The caller and
 // its ancestors are never listed. ps or lsof failure throws (fail closed).
-export function verifierHomeProcesses(home) {
-  const roots = homeRoots(home),
-    uid = process.getuid();
-  const run = (command, args) =>
-    execFileSync(command, args, {
-      encoding: "utf8",
-      timeout: 60_000,
-      maxBuffer: 512 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+// probes replaces the platform, the commands, the environ read, the user, the
+// runner's pid and the clock for tests, and carries homeCreatedMs and
+// onUnreadable for the unreadable-environment rule above.
+export function verifierHomeProcesses(home, probes = {}) {
+  const {
+    platform = process.platform,
+    run = (command, args) =>
+      execFileSync(command, args, {
+        encoding: "utf8",
+        timeout: 60_000,
+        maxBuffer: 512 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    readEnviron = (pid) => readFileSync(`/proc/${pid}/environ`, "utf8"),
+    uid = process.getuid(),
+    self = process.pid,
+    now = Date.now,
+    homeCreatedMs,
+    onUnreadable,
+  } = probes;
+  const roots = homeRoots(home);
   const all = new Map();
   for (const line of run("ps", ["-axww", "-o", "pid=,ppid=,uid=,command="]).split("\n")) {
     const found = /^\s*(\d+)\s+(\d+)\s+(\d+)\s(.*)$/.exec(line);
@@ -1095,7 +1236,7 @@ export function verifierHomeProcesses(home) {
       });
   }
   const excluded = new Set([0, 1]);
-  for (let pid = process.pid; pid > 1 && !excluded.has(pid); pid = all.get(pid)?.ppid ?? 0)
+  for (let pid = self; pid > 1 && !excluded.has(pid); pid = all.get(pid)?.ppid ?? 0)
     excluded.add(pid);
   const table = new Map(
     [...all].filter(([pid, entry]) => entry.uid === uid && !excluded.has(pid)),
@@ -1108,7 +1249,16 @@ export function verifierHomeProcesses(home) {
     if (!hit.reasons.includes(reason)) hit.reasons.push(reason);
     found.set(pid, hit);
   };
-  for (const pid of environmentMatches(run, table, roots)) add(pid, "env");
+  for (const pid of environmentMatches(table, roots, {
+    platform,
+    run,
+    readEnviron,
+    self,
+    now,
+    homeCreatedMs,
+    onUnreadable,
+  }))
+    add(pid, "env");
   for (const [pid, entry] of table)
     if (underRoots(roots, entry.command.split(" ")[0])) add(pid, "argv");
   let pid = 0;
@@ -1131,7 +1281,7 @@ const processAlive = (pid) => {
 // Stops every process verifierHomeProcesses finds: SIGTERM, then SIGKILL for
 // survivors, rescanning for children that appear later. Throws if any
 // remains, so the home is kept and no receipt stands.
-export async function stopVerifierHomeProcesses(home, find = verifierHomeProcesses) {
+export async function stopVerifierHomeProcesses(home, find = verifierHomeProcesses, probes) {
   const stopped = new Map();
   const signal = (pids, kind) => {
     for (const pid of pids)
@@ -1146,7 +1296,7 @@ export async function stopVerifierHomeProcesses(home, find = verifierHomeProcess
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   };
   for (let round = 0; round < 3; round++) {
-    const found = find(home);
+    const found = find(home, probes);
     if (!found.length) return [...stopped.values()];
     for (const hit of found) stopped.set(hit.pid, hit);
     const pids = found.map((hit) => hit.pid);
@@ -1156,7 +1306,7 @@ export async function stopVerifierHomeProcesses(home, find = verifierHomeProcess
     signal(survivors, "SIGKILL");
     await settle(survivors);
   }
-  const remaining = find(home);
+  const remaining = find(home, probes);
   if (remaining.length)
     throw new Error(
       "processes survived SIGKILL: " + remaining.map((hit) => hit.pid).join(", "),
@@ -1582,6 +1732,9 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
   const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   // Keep the unique private home independent of arbitrarily deep inherited
   // TMPDIR. createHome is injectable like the cleanup hooks for failure tests.
+  // Read before the home exists: only a process older than this can be
+  // shown unrelated to the home when its environment cannot be read.
+  const homeCreatedMs = Date.now();
   const home = createHome();
   const receiptPath = join(output, receiptName);
   let receiptWritten = false;
@@ -1682,11 +1835,29 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     // Kept homes keep their files, not their processes. A process left under
     // the home (a setsid'd daemon a check started) would otherwise outlive the
     // run and pin the removed files it holds open.
+    // Each sweep of one stop reports an unreadable process again.
+    const unreadable = new Map();
     let stopped;
     try {
-      stopped = await stopHomeProcesses(home);
+      stopped = await stopHomeProcesses(home, undefined, {
+        homeCreatedMs,
+        onUnreadable: (entry) => unreadable.set(entry.pid, entry),
+      });
     } catch (error) {
       throw cleanupFailed("stop processes under", error);
+    } finally {
+      if (unreadable.size)
+        try {
+          writeFileSync(
+            join(output, "home-sweep-unreadable.json"),
+            JSON.stringify(
+              { home, count: unreadable.size, processes: [...unreadable.values()].slice(0, 200) },
+              null,
+              2,
+            ) + "\n",
+            { mode: 0o600 },
+          );
+        } catch {}
     }
     if (stopped.length)
       try {
@@ -1720,7 +1891,8 @@ export function makeTargetedPlan(context, cwd) {
   const raw = readFileSync(join(cwd, "verification/matrix.json"), "utf8"),
     matrix = JSON.parse(raw);
   assertInventory(matrix, cwd);
-  assertFastForward(cwd, context.baseCommit, context.commit);
+  assertBinarySuites(matrix, cwd);
+  assertFastForward(cwd, context.baseCommit, context.commit, { targeted: true });
   const changed = diffPaths(cwd, context.baseCommit, context.commit);
   const checks = selectChecks(
     matrix,
@@ -1845,55 +2017,78 @@ function recordedRunAlive(record) {
   const ps = spawnSync("ps", ["-p", String(record.pid), "-o", "command="], { encoding: "utf8" });
   return ps.status === 0 && ps.stdout.includes("verify-matrix.mjs");
 }
+// How long a launcher waits for another launcher's decision on one directory.
+const LAUNCH_MUTEX_WAIT_MS = 5000;
+const LAUNCH_MUTEX_POLL_MS = 50;
 // Starts the run detached, or re-attaches to the one the output directory
-// already records, follows its log, and resolves to the exit code.
+// already records, follows its log, and resolves to the exit code. Reading the
+// record, deciding and starting happen under a mutex beside the record, so
+// launchers started together start one run and the rest re-attach or are
+// refused (wi_19db6841a2a50d57).
 async function launchDetached(argv, output) {
-  const recorded = readRunnerRecord(output);
+  // Created here, with the default mode, before the mutex would create it.
   mkdirSync(output, { recursive: true });
   const logPath = join(output, "runner.log");
-  let offset = existsSync(logPath) ? statSync(logPath).size : 0;
-  let pid, child, ended;
-  if (recordedRunAlive(recorded)) {
-    // Only the same command from the same directory follows that run; any
-    // other is refused as the host lock refuses a directory already in use.
-    if (recorded.cwd !== process.cwd() || JSON.stringify(recorded.argv) !== JSON.stringify(argv))
+  const paths = lockPaths(join(output, "runner.json"));
+  let token;
+  for (const deadline = Date.now() + LAUNCH_MUTEX_WAIT_MS; ; ) {
+    const busy = {};
+    if ((token = takeMutex(paths, {}, busy))) break;
+    if (Date.now() >= deadline)
       throw new Error(
-        `Host lock output/record directory is already in use by a different matrix run (pid ${recorded.pid})`,
+        `Another matrix launcher${Number.isSafeInteger(busy.owner?.pid) ? ` (pid ${busy.owner.pid})` : ""} ` +
+          `holds ${paths.mutex}; no run was started. If no launcher for this output directory is running, remove that file and run the command again`,
       );
-    pid = recorded.pid;
-    console.log(`matrix run: re-attached to pid ${pid}`);
-  } else {
-    const log = openSync(logPath, "a", 0o600);
-    try {
-      child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+    await new Promise((resolve) => setTimeout(resolve, LAUNCH_MUTEX_POLL_MS));
+  }
+  let offset, pid, child, ended;
+  try {
+    const recorded = readRunnerRecord(output);
+    offset = existsSync(logPath) ? statSync(logPath).size : 0;
+    if (recordedRunAlive(recorded)) {
+      // Only the same command from the same directory follows that run; any
+      // other is refused as the host lock refuses a directory already in use.
+      if (recorded.cwd !== process.cwd() || JSON.stringify(recorded.argv) !== JSON.stringify(argv))
+        throw new Error(
+          `Host lock output/record directory is already in use by a different matrix run (pid ${recorded.pid})`,
+        );
+      pid = recorded.pid;
+      console.log(`matrix run: re-attached to pid ${pid}`);
+    } else {
+      const log = openSync(logPath, "a", 0o600);
+      try {
+        child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+          cwd: process.cwd(),
+          detached: true,
+          stdio: ["ignore", log, log],
+          env: { ...process.env, TAILTERM_MATRIX_RUN_CHILD: "1" },
+        });
+      } finally {
+        closeSync(log);
+      }
+      child.on("error", (error) => (ended ??= { error }));
+      child.on("exit", (code, signal) => (ended ??= { code, signal }));
+      if (!child.pid) {
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error("Could not start the detached matrix run: " + (ended?.error?.message || "no pid"));
+      }
+      pid = child.pid;
+      writeRunnerRecord(output, {
+        version: 1,
+        pid,
+        startedAt: new Date().toISOString(),
+        argv,
         cwd: process.cwd(),
-        detached: true,
-        stdio: ["ignore", log, log],
-        env: { ...process.env, TAILTERM_MATRIX_RUN_CHILD: "1" },
+        log: logPath,
       });
-    } finally {
-      closeSync(log);
+      child.unref();
+      console.log(
+        `matrix run: detached as pid ${pid}; log ${logPath}; it keeps running if this command is stopped. ` +
+          `Run the same command to re-attach; stop the run with: kill ${pid}`,
+      );
     }
-    child.on("error", (error) => (ended ??= { error }));
-    child.on("exit", (code, signal) => (ended ??= { code, signal }));
-    if (!child.pid) {
-      await new Promise((resolve) => setImmediate(resolve));
-      throw new Error("Could not start the detached matrix run: " + (ended?.error?.message || "no pid"));
-    }
-    pid = child.pid;
-    writeRunnerRecord(output, {
-      version: 1,
-      pid,
-      startedAt: new Date().toISOString(),
-      argv,
-      cwd: process.cwd(),
-      log: logPath,
-    });
-    child.unref();
-    console.log(
-      `matrix run: detached as pid ${pid}; log ${logPath}; it keeps running if this command is stopped. ` +
-        `Run the same command to re-attach; stop the run with: kill ${pid}`,
-    );
+  } finally {
+    releaseMutex(paths, token);
   }
   const logFile = openSync(logPath, "r");
   const buffer = Buffer.alloc(65536);
@@ -2253,12 +2448,80 @@ export async function runGoRace(
     if (interrupted()) return interrupted();
     const ranOnce = names.filter((name) => counts.get(name) === 1).length;
     write(`${line.replace(" partition ", ` ran-once=${ranOnce} partition `)} peak-shard-processes=${peak}\n`);
+    // A shard that exited before running its own tests is the failure to
+    // report: its identity and exit first, then a bounded sample of what it
+    // left unrun, instead of every missing name.
+    const early = results
+      .map((r, i) => ({ r, i, unrun: parts[i].filter((name) => !counts.has(name)) }))
+      .filter(({ r, unrun }) => r.code !== 0 && unrun.length);
+    if (early.length) {
+      const label = (i) => `shard ${i + 1}/${shards.k}`,
+        theirs = new Set(early.flatMap(({ i }) => parts[i]));
+      const other = [
+        [names.filter((name) => !theirs.has(name) && !counts.has(name)).length, "not run in other shards"],
+        [[...counts.values()].filter((count) => count > 1).length, "run more than once"],
+        [[...counts.keys()].filter((name) => !names.includes(name)).length, "unlisted"],
+      ].filter(([count]) => count);
+      throw Object.assign(
+        new Error(
+          [
+            ...early.map(
+              ({ r, i, unrun }) =>
+                `go-race: ${label(i)} ${r.code < 0 ? "ended without an exit code" : `exited ${r.code}`}` +
+                ` before running ${unrun.length} of its ${parts[i].length} tests`,
+            ),
+            ...early.map(
+              ({ i, unrun }) =>
+                `${label(i)} not run (first ${Math.min(10, unrun.length)} of ${unrun.length}): ` +
+                unrun.slice(0, 10).join(", "),
+            ),
+            ...(other.length
+              ? ["other coverage problems: " + other.map(([count, what]) => `${count} ${what}`).join(", ")]
+              : []),
+          ].join("\n"),
+        ),
+        { exitCode: failed(early[0].r.code) },
+      );
+    }
     assertRanExactlyOnce(names, counts);
     const bad = results.find((r) => r.code !== 0);
     return bad ? failed(bad.code) : 0;
   } finally {
     abortSignal?.removeEventListener("abort", forward);
   }
+}
+
+// The flags of a run or targeted command. The launcher reads them before it
+// starts anything and the run reads them again, so both refuse the same ones.
+function parseRunFlags(flags) {
+  let keepHome = false;
+  let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
+  let jobs = defaultJobs();
+  let priority, item;
+  let maxWaitMs = DEFAULT_HOST_WAIT_MS;
+  for (let i = 0; i < flags.length; i++) {
+    if (flags[i] === "--keep-home") keepHome = true;
+    else if (flags[i] === "--priority") priority = flags[++i] ?? "";
+    else if (flags[i] === "--item") {
+      item = flags[++i];
+      if (!item) throw new Error("--item requires an item ID");
+    } else if (flags[i] === "--host-wait-minutes")
+      maxWaitMs = minutesFlag("--host-wait-minutes", flags[++i], 1440);
+    else if (flags[i] === "--jobs") {
+      const value = flags[++i];
+      if (!/^[1-9][0-9]?$/.test(value || ""))
+        throw new Error("--jobs requires an integer from 1 to 16");
+      jobs = validJobs(Number(value));
+    } else if (flags[i] === "--min-free-bytes") {
+      const value = flags[++i];
+      if (!/^(0|[1-9][0-9]*)$/.test(value || ""))
+        throw new Error("--min-free-bytes requires a nonnegative integer byte count");
+      minFreeBytes = Number(value);
+      if (!Number.isSafeInteger(minFreeBytes))
+        throw new Error("--min-free-bytes requires a safe integer byte count");
+    } else throw new Error("Unknown verifier run option: " + flags[i]);
+  }
+  return { keepHome, minFreeBytes, jobs, priority, maxWaitMs, item };
 }
 
 const invokedDirectly =
@@ -2294,8 +2557,12 @@ if (invokedDirectly && process.argv[2] === "go-race") {
   let input, item;
   try {
     input = JSON.parse(readFileSync(file, "utf8"));
-    if (launches)
+    if (launches) {
+      // A command the run would refuse for its flags starts no run and
+      // creates nothing. The item's priority lookup stays with the run.
+      resolvePriority(parseRunFlags(flags).priority);
       process.exitCode = await launchDetached(process.argv.slice(2), resolve(output));
+    }
     else if (mode === "plan") {
       const { plan, preserved, selection, goRaceShards } =
         planWithPreservation(input, process.cwd());
@@ -2338,38 +2605,9 @@ if (invokedDirectly && process.argv[2] === "go-race") {
         );
       }
     } else if (mode === "run" || mode === "targeted") {
-      let keepHome = false;
-      let minFreeBytes = DEFAULT_MIN_FREE_BYTES;
-      let jobs = defaultJobs();
-      let priority;
-      let maxWaitMs = DEFAULT_HOST_WAIT_MS;
-      for (let i = 0; i < flags.length; i++) {
-        if (flags[i] === "--keep-home") keepHome = true;
-        else if (flags[i] === "--priority") priority = flags[++i] ?? "";
-        else if (flags[i] === "--item") {
-          item = flags[++i];
-          if (!item) throw new Error("--item requires an item ID");
-        } else if (flags[i] === "--host-wait-minutes")
-          maxWaitMs = minutesFlag("--host-wait-minutes", flags[++i], 1440);
-        else if (flags[i] === "--jobs") {
-          const value = flags[++i];
-          if (!/^[1-9][0-9]?$/.test(value || ""))
-            throw new Error("--jobs requires an integer from 1 to 16");
-          jobs = validJobs(Number(value));
-        }
-        else if (flags[i] === "--min-free-bytes") {
-          const value = flags[++i];
-          if (!/^(0|[1-9][0-9]*)$/.test(value || ""))
-            throw new Error(
-              "--min-free-bytes requires a nonnegative integer byte count",
-            );
-          minFreeBytes = Number(value);
-          if (!Number.isSafeInteger(minFreeBytes))
-            throw new Error(
-              "--min-free-bytes requires a safe integer byte count",
-            );
-        } else throw new Error("Unknown verifier run option: " + flags[i]);
-      }
+      const parsed = parseRunFlags(flags);
+      const { keepHome, minFreeBytes, jobs, priority, maxWaitMs } = parsed;
+      item = parsed.item;
       const selection = mode === "run" ? recordedSelection(file) : undefined;
       const r = await (mode === "run" ? runPlan : runTargeted)(
         input,
@@ -2386,7 +2624,8 @@ if (invokedDirectly && process.argv[2] === "go-race") {
             // The deployer marks its integrated run; only run mode honours it.
             ...(mode === "run" && releaseRun(process.env) ? { release: true } : {}),
             maxWaitMs,
-            item,
+            // The item the priority above was looked up for.
+            item: input?.itemId || item,
             print: (line) => console.log(line),
           },
         },

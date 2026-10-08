@@ -861,7 +861,10 @@ test("test binary build failure starts no matrix check", async (t) => {
   mkdirSync(join(f.cwd, ".build"));
   for (const name of ["test.wasm", "speech-fixture.wav", "go-modules.txt"])
     writeFileSync(join(f.cwd, ".build", name), "fixture");
-  writeFileSync(join(f.cwd, "tests/profile-sync-browser.mjs"), "// browser.launch(\n");
+  writeFileSync(
+    join(f.cwd, "tests/profile-sync-browser.mjs"),
+    '// browser.launch(\nimport { prepareTestBinary } from "./test-binaries.mjs";\n',
+  );
   writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify({
     version: 1, browserSuites: [{ file: "tests/profile-sync-browser.mjs", mode: "both" }],
     excludedBrowserSuites: [], rules: [{ prefixes: ["docs/"], groups: ["browser"] }],
@@ -921,10 +924,12 @@ test("a prepared test binary changed by a check leaves no receipt", { timeout: 1
   // in and appends a byte to the first prepared binary.
   const f = browserFixture(t, {
     "profile-sync-browser.mjs":
-      `import fs from 'node:fs';const m=JSON.parse(fs.readFileSync(process.env.TAILTERM_TEST_BINARIES,'utf8'));` +
+      `import './test-binaries.mjs';import fs from 'node:fs';const m=JSON.parse(fs.readFileSync(process.env.TAILTERM_TEST_BINARIES,'utf8'));` +
       `fs.writeFileSync(${JSON.stringify(suiteRecord)},JSON.stringify({home:process.env.HOME,binary:m.binaries[0].path}));` +
       `fs.appendFileSync(m.binaries[0].path,'x');`,
   });
+  // A listed binary suite imports the binary helper; a stand-in here.
+  writeFileSync(join(f.cwd, "tests/test-binaries.mjs"), "export {};\n");
   mkdirSync(join(f.cwd, "hub"));
   writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.22\n");
   // Planned on its own commit, so the hub tree selects no Go check.
@@ -1948,7 +1953,7 @@ test("plans and targeted runs refuse a base the candidate does not contain", asy
   );
   assert.throws(
     () => makeTargetedPlan({ baseCommit: diverged, commit: f.commit }, f.cwd),
-    /not a fast-forward/,
+    /does not contain previous candidate/,
   );
   assert.equal(makePlan({ ...context, baseCommit: f.commit }, f.cwd).changed.length, 0);
   assert.deepEqual(linear.changed, ["docs/old.md", "docs/new.md"]);
@@ -4605,4 +4610,636 @@ test("go-race command stopped through its process group leaves no shard process 
   assert.equal(signal ?? code, 143);
   for (let i = 0; i < 100 && group.alive(); i++) await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(group.alive(), false, "a process of the check's group survived");
+});
+
+// wi_19db6841a2a50d57 (order #29140): the verify-matrix runner bundle. Each
+// test below is named for the criterion it covers.
+test("bundle v8 a targeted run joins the host under its context's item, the one its priority was looked up for", async (t) => {
+  const f = fixture(t);
+  const targeted = async (context, flags, expected) => {
+    const file = join(tempDir(t, "bundle-v8-context-"), "context.json"),
+      output = tempDir(t, "bundle-v8-logs-");
+    writeFileSync(file, JSON.stringify({ baseCommit: f.base, commit: f.commit, ...context }));
+    const before = fakeTTLookups().length;
+    const holder = await holdHost("wi_v8_holder");
+    const child = matrixCLI(t, f, ["targeted", file, output, "--min-free-bytes", "0", ...flags], { FAKE_TT_PRIORITY: "high" });
+    let waiter;
+    try {
+      await untilHost(() => (waiter = readHostState(hostLockFile()).waiters[0]), "the waiter; saw " + child.text);
+    } finally {
+      await holder.release();
+    }
+    const [code] = await once(child, "close");
+    assert.equal(code, 0, child.text);
+    const request = readJournal(hostLockFile()).find((entry) => entry.id === waiter.id && entry.event === "request");
+    const sidecar = JSON.parse(readFileSync(join(output, "host-lock.json"), "utf8"));
+    assert.deepEqual(
+      {
+        waiter: [waiter.item, waiter.kind, waiter.priority, waiter.prioritySource],
+        request: request.item,
+        sidecar: sidecar.item,
+        lookups: fakeTTLookups().slice(before),
+      },
+      {
+        waiter: [expected, "targeted", "high", "item"],
+        request: expected,
+        sidecar: expected,
+        lookups: [["work-items", "get", "--json", expected]],
+      },
+      JSON.stringify(flags),
+    );
+  };
+  await targeted({ itemId: "wi_ctx" }, [], "wi_ctx");
+  await targeted({ itemId: "wi_ctx" }, ["--item", "wi_other"], "wi_ctx");
+  await targeted({}, ["--item", "wi_cli"], "wi_cli");
+});
+
+test("bundle v6 a targeted run on a rebased fix names the previous candidate, the fix and their merge base", (t) => {
+  const f = fixture(t);
+  // The previous candidate P sits on base B; the fix was rebuilt on a newer
+  // tip B2, so it no longer contains P.
+  const previous = f.commit;
+  const fix = commitChange(f, "docs/fix.md", "fix\n", "fix on the previous candidate");
+  f.git("checkout", "-q", "--detach", f.base);
+  commitChange(f, "docs/other.md", "moved\n", "the tip moved");
+  const rebased = commitChange(f, "docs/fix.md", "fix\n", "fix after the rebase");
+  const refusal = (baseCommit, commit) => {
+    try {
+      makeTargetedPlan({ baseCommit, commit }, f.cwd);
+    } catch (error) {
+      return error.message;
+    }
+    return assert.fail("the targeted plan was not refused");
+  };
+  const message = refusal(previous, rebased);
+  assert.equal(
+    message,
+    `fix candidate ${rebased} does not contain previous candidate ${previous} (merge base ${f.base}). ` +
+      "A targeted run needs the fix committed on top of the previous candidate; after a rebase run the full plan on the new candidate.",
+  );
+  assert.doesNotMatch(message, /rebase onto the current tip|fast-forward/);
+  // Histories that share nothing have no merge base to name.
+  const orphan = f.git("commit-tree", "-m", "unrelated", f.git("rev-parse", f.base + "^{tree}"));
+  assert.match(refusal(orphan, rebased), new RegExp(`previous candidate ${orphan} \\(merge base none\\)`));
+  // A fix committed on top of the previous candidate is planned as before.
+  assert.deepEqual(makeTargetedPlan({ baseCommit: previous, commit: fix }, f.cwd).changed, ["docs/fix.md"]);
+  // Plans keep their own wording.
+  assert.throws(
+    () => makePlan({ baseCommit: previous, commit: rebased, owned: ["docs/"] }, f.cwd),
+    { message: "candidate is not a fast-forward of its base; rebase onto the current tip" },
+  );
+});
+
+// A stand-in go for runGoRace: it lists 300 generated tests and, for a shard,
+// emits a run event per selected test. STUB_GO_SHARD makes the first shard
+// (the one selected with -run) exit 2 after one output line, kill itself, or
+// fail after running everything. No Go toolchain and no race load.
+function stubGoRace(t) {
+  const cwd = tempDir(t, "bundle-v9-"),
+    bin = join(cwd, "bin"),
+    names = Array.from({ length: 300 }, (_, i) => "TestCase" + String(i).padStart(3, "0"));
+  mkdirSync(join(cwd, "pkg"));
+  mkdirSync(bin);
+  writeFileSync(
+    join(cwd, "pkg", "cases_test.go"),
+    'package pkg\n\nimport "testing"\n\n' + names.map((name) => `func ${name}(t *testing.T) {}\n`).join(""),
+  );
+  writeFileSync(
+    join(bin, "go"),
+    `#!${process.execPath}
+const args = process.argv.slice(2), names = ${JSON.stringify(names)};
+const say = (event) => console.log(JSON.stringify(event));
+if (args.includes("-list")) console.log(names.join("\\n") + "\\nok");
+else {
+  const run = args.indexOf("-run"), skip = args.indexOf("-skip"), mode = run >= 0 ? process.env.STUB_GO_SHARD : "";
+  say({ Action: "output", Output: "stub shard starting\\n" });
+  if (mode === "exit2") process.exit(2);
+  if (mode === "kill") process.kill(process.pid, "SIGKILL");
+  const selected = run >= 0 ? new RegExp(args[run + 1]) : null, skipped = skip >= 0 ? new RegExp(args[skip + 1]) : null;
+  for (const name of names)
+    if ((!selected || selected.test(name)) && !(skipped && skipped.test(name))) say({ Action: "run", Test: name });
+  if (mode === "fail") process.exit(1);
+}
+`,
+    { mode: 0o755 },
+  );
+  return async (mode) => {
+    let text = "";
+    const outcome = { text: () => text };
+    try {
+      outcome.code = await matrixRunner.runGoRace(["-shards=./pkg=2", "./pkg"], {
+        cwd,
+        env: { ...process.env, PATH: bin + ":" + process.env.PATH, VERIFICATION_JOBS: "2", STUB_GO_SHARD: mode },
+        write: (chunk) => (text += chunk),
+      });
+    } catch (error) {
+      outcome.error = error;
+    }
+    return outcome;
+  };
+}
+test("bundle v9 a race shard that stops early is reported by its shard and exit, with a bounded list of the tests it did not run", async (t) => {
+  const run = stubGoRace(t);
+  const bounded = (error) => {
+    assert(error, "the command did not reject");
+    assert(error.message.length < 1000, `${error.message.length} characters`);
+    const lists = error.message.split("\n").filter((line) => line.includes("not run (first"));
+    assert.equal(lists.length, 1, error.message);
+    assert.match(lists[0], /^shard 1\/2 not run \(first 10 of \d+\): (TestCase\d{3}, ){9}TestCase\d{3}$/);
+    assert.doesNotMatch(error.message, /did not run every test exactly once/);
+  };
+  let { error, text } = await run("exit2");
+  bounded(error);
+  assert.equal(error.exitCode, 2);
+  const [first] = error.message.split("\n");
+  const [, unrun, own] = /^go-race: shard 1\/2 exited 2 before running (\d+) of its (\d+) tests$/.exec(first) ?? [];
+  assert(own > 100 && unrun === own, error.message);
+  // The shard's own summary line is still printed before the error.
+  assert.match(text(), /^stub shard starting\ngo-race shard 1\/2: 0 tests, [0-9.]+ s, exit 2$/m);
+
+  // A killed shard has no exit code: the command exits 1 and never says -1.
+  ({ error } = await run("kill"));
+  bounded(error);
+  assert.equal(error.exitCode, 1);
+  assert.match(error.message.split("\n")[0], /^go-race: shard 1\/2 ended without an exit code before running \d+ of its \d+ tests$/);
+  assert.doesNotMatch(error.message, /-1/);
+
+  // A shard that fails after running every test is an ordinary failure.
+  let outcome = await run("fail");
+  assert.equal(outcome.error, undefined);
+  assert.equal(outcome.code, 1);
+  assert.doesNotMatch(outcome.text(), /before running/);
+  assert.match(outcome.text(), /tests=300 ran-once=300 /);
+  outcome = await run("");
+  assert.deepEqual([outcome.error, outcome.code], [undefined, 0]);
+});
+
+test("bundle v5 the binary suite list must name exactly the declared suites that import the binary helper", (t) => {
+  const helper = 'import { prepareTestBinary } from "./test-binaries.mjs";\n';
+  const check = (suites) => {
+    const cwd = tempDir(t, "bundle-v5-");
+    mkdirSync(join(cwd, "tests"));
+    for (const [name, text] of Object.entries(suites)) writeFileSync(join(cwd, "tests", name), text);
+    const declared = { browserSuites: Object.keys(suites).map((name) => ({ file: "tests/" + name, mode: "both" })) };
+    return () => matrixRunner.assertBinarySuites(declared, cwd);
+  };
+  // A suite that starts importing the helper without joining the list.
+  assert.throws(check({ "new-thing-browser.mjs": helper, "task-form-browser.mjs": helper }), {
+    message:
+      "Binary suite list disagrees with the suites that import tests/test-binaries.mjs; helper users not listed: tests/new-thing-browser.mjs",
+  });
+  assert.throws(
+    check({ "lazy-browser.mjs": 'const { prepareTestBinary } = await import("./test-binaries.mjs");\n' }),
+    /helper users not listed: tests\/lazy-browser\.mjs$/,
+  );
+  // A listed suite that no longer imports it.
+  assert.throws(check({ "task-form-browser.mjs": "// no helper\n", "plain-browser.mjs": "" }), {
+    message:
+      "Binary suite list disagrees with the suites that import tests/test-binaries.mjs; listed without the helper: tests/task-form-browser.mjs",
+  });
+  assert.throws(
+    check({ "new-thing-browser.mjs": helper, "task-form-browser.mjs": "" }),
+    /; helper users not listed: tests\/new-thing-browser\.mjs; listed without the helper: tests\/task-form-browser\.mjs$/,
+  );
+  // Agreement, with listed names the fixture does not declare ignored.
+  check({ "task-form-browser.mjs": helper, "interventions-browser.mjs": helper, "plain-browser.mjs": "" })();
+  check({})();
+  // The real tree agrees with the approved matrix.
+  matrixRunner.assertBinarySuites(matrix, new URL("..", import.meta.url).pathname);
+  // Plans and targeted plans refuse the drift before selecting anything.
+  const f = browserFixture(t, { "new-thing-browser.mjs": helper });
+  const drift = /helper users not listed: tests\/new-thing-browser\.mjs/;
+  assert.throws(() => makePlan({ baseCommit: f.base, commit: f.commit, owned: ["docs/"] }, f.cwd), drift);
+  assert.throws(() => makeTargetedPlan({ baseCommit: f.base, commit: f.commit }, f.cwd), drift);
+});
+
+test("bundle v4 a browser suite is found by its marker or by importing a marked helper, without a literal launch call", (t) => {
+  const inventory = (files, declared, excluded = []) => {
+    const cwd = tempDir(t, "bundle-v4-");
+    mkdirSync(join(cwd, "tests"));
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(cwd, "tests", name), text);
+    return () =>
+      assertInventory(
+        { browserSuites: declared.map((name) => ({ file: "tests/" + name })), excludedBrowserSuites: excluded.map((name) => "tests/" + name) },
+        cwd,
+      );
+  };
+  const changed = /Browser inventory changed; update approved matrix/;
+  const files = {
+    "helper.mjs": "// verify-matrix: browser-helper\nexport const open = (engine) => engine.launch();\n",
+    "a-browser.mjs": 'import { open } from "./helper.mjs";\nawait open();\n',
+    "b-browser.mjs": "// A suite started some other way.\n// verify-matrix: browser-suite\n",
+    "util.mjs": "export const sum = (a, b) => a + b;\n",
+    "util-user.mjs": 'import { sum } from "./util.mjs";\n',
+    "notes.js": "browser.launch(\n",
+  };
+  inventory(files, ["a-browser.mjs", "b-browser.mjs"])();
+  inventory(files, ["a-browser.mjs"], ["b-browser.mjs"])();
+  // A helper-launched or marked suite missing from the matrix is refused.
+  assert.throws(inventory(files, ["b-browser.mjs"]), changed);
+  assert.throws(inventory(files, ["a-browser.mjs"]), changed);
+  // The helper is not a suite, so declaring it is refused too.
+  assert.throws(inventory(files, ["a-browser.mjs", "b-browser.mjs", "helper.mjs"]), changed);
+  // A dynamic import of the helper counts.
+  const dynamic = { ...files, "c-browser.mjs": 'const { open } = await import("./helper.mjs");\n' };
+  assert.throws(inventory(dynamic, ["a-browser.mjs", "b-browser.mjs"]), changed);
+  inventory(dynamic, ["a-browser.mjs", "b-browser.mjs", "c-browser.mjs"])();
+  // A marker counts only as a whole line.
+  const mentions = {
+    "mention.mjs": "// see verify-matrix: browser-suite above\nconst s = '// verify-matrix: browser-suite';\n  // verify-matrix: browser-suite\n",
+    "not-helper.mjs": "// not a // verify-matrix: browser-helper\n",
+    "imports-not-helper.mjs": 'import "./not-helper.mjs";\n',
+  };
+  inventory(mentions, [])();
+  // The literal call still classifies a file, as before.
+  inventory({ "direct.mjs": "await chromium.launch();\n" }, ["direct.mjs"])();
+  assert.throws(inventory({ "direct.mjs": "await chromium.launch();\n" }, []), changed);
+});
+
+test("bundle v2 a launch with a bad flag is refused by the launcher and creates or changes nothing", async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');");
+  const context = join(tempDir(t, "bundle-v2-context-"), "context.json");
+  writeFileSync(context, JSON.stringify({ baseCommit: f.base, commit: f.git("rev-parse", "HEAD") }));
+  const cases = [
+    ["run", ["--bogus"], {}, "Unknown verifier run option: --bogus"],
+    ["run", ["--min-free-bytes", "0", "--jobs", "0"], {}, "--jobs requires an integer from 1 to 16"],
+    ["run", ["--item"], {}, "--item requires an item ID"],
+    ["run", ["--priority", "loud"], {}, "--priority must be urgent, high or normal"],
+    ["run", ["--host-wait-minutes", "x"], {}, "--host-wait-minutes requires a whole number of minutes from 1 to 1440"],
+    ["run", ["--min-free-bytes", "-1"], {}, "--min-free-bytes requires a nonnegative integer byte count"],
+    ["run", [], { TAILTERM_MATRIX_PRIORITY: "loud" }, "TAILTERM_MATRIX_PRIORITY must be urgent, high or normal"],
+    ["targeted", ["--bogus"], {}, "Unknown verifier run option: --bogus"],
+  ];
+  for (const [mode, flags, environment, message] of cases) {
+    const file = mode === "run" ? planFile : context,
+      what = mode + " " + flags.join(" ");
+    // Into a path that does not exist: not even the directory is created.
+    const missing = join(tempDir(t, "bundle-v2-logs-"), "logs");
+    const fresh = launcherCLI(t, f, [mode, file, missing, ...flags], environment);
+    assert.equal(await fresh.closed, 1, what + ": " + fresh.text);
+    assert.equal(fresh.text, message + "\n", what);
+    assert(!existsSync(missing), what + ": the output directory was created");
+    // The run itself refuses the same flags with the same message.
+    const foreground = matrixCLI(t, f, [mode, file, missing, ...flags], environment);
+    assert.equal((await once(foreground, "close"))[0], 1, what);
+    assert.equal(foreground.text, message + "\n", what);
+    // Into a finished run's directory: its files are byte-identical after.
+    const finished = tempDir(t, "bundle-v2-logs-");
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const files = {
+      "runner.json": JSON.stringify({ version: 1, pid: dead, argv: [mode, file, finished], cwd: f.cwd, exitCode: 0 }) + "\n",
+      "runner.log": "an earlier run's log\n",
+      "receipt.json": '{"an":"earlier receipt"}\n',
+    };
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(finished, name), text);
+    const again = launcherCLI(t, f, [mode, file, finished, ...flags], environment);
+    assert.equal(await again.closed, 1, what + ": " + again.text);
+    assert.equal(again.text, message + "\n", what);
+    assert.deepEqual(
+      Object.fromEntries(readdirSync(finished).sort().map((name) => [name, readFileSync(join(finished, name), "utf8")])),
+      Object.fromEntries(Object.entries(files).sort(([a], [b]) => (a < b ? -1 : 1))),
+      what,
+    );
+  }
+  assert.deepEqual(readHostState(hostLockFile())?.waiters ?? [], [], "no refused launch joined the host");
+});
+
+// The files of a queued detached run's output directory: the host lock's wait
+// log, and the launcher's record and log.
+const queuedRunFiles = ["host-lock.log", "runner.json", "runner.log"];
+const within = (promise, ms, what) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for " + what)), ms).unref()),
+  ]);
+const stopQueuedRun = async (output) => {
+  const record = runnerRecord(output);
+  if (!record || !pidAlive(record.pid)) return;
+  process.kill(record.pid, "SIGTERM");
+  await untilHost(() => !pidAlive(record.pid), "the queued run to stop");
+};
+test("bundle v1 launchers started together into one directory start one run; the rest re-attach or are refused", { timeout: 240000 }, async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');");
+  const requests = (from) =>
+    readJournal(hostLockFile()).slice(from).filter((entry) => entry.event === "request" && entry.agent !== "holder");
+  // The same command, four at once, five times.
+  for (let round = 0; round < 5; round++) {
+    const output = tempDir(t, "bundle-v1-logs-"),
+      journalBefore = readJournal(hostLockFile()).length;
+    const holder = await holdHost("wi_bundle_v1_holder");
+    let released = false;
+    try {
+      const launchers = Array.from({ length: 4 }, () => launcherCLI(t, f, ["run", planFile, output]));
+      await untilHost(
+        () => launchers.every((child) => /^matrix run: (detached as|re-attached to) pid \d+/m.test(child.text)),
+        "every launcher's decision; saw " + launchers.map((child) => child.text).join("|"),
+      );
+      const started = launchers.flatMap((child) => /detached as pid (\d+)/.exec(child.text)?.[1] ?? []),
+        attached = launchers.flatMap((child) => /re-attached to pid (\d+)/.exec(child.text)?.[1] ?? []);
+      assert.equal(started.length, 1, `round ${round}: ${started.length} runs were started`);
+      assert.deepEqual(attached, [started[0], started[0], started[0]], `round ${round}`);
+      const { record } = await queuedRun(output, "the one run");
+      assert.equal(String(record.pid), started[0]);
+      await untilHost(() => readFileSync(join(output, "runner.log"), "utf8").includes("matrix host: waiting"), "the waiting line");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(readFileSync(join(output, "runner.log"), "utf8").match(/matrix host: waiting/g).length, 1, "one run wrote the log");
+      assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => w.pid), [record.pid], "one waiter");
+      assert.deepEqual(requests(journalBefore).map((entry) => entry.pid), [record.pid], "one request");
+      assert.deepEqual(readdirSync(output).sort(), queuedRunFiles, "no mutex, guard, temporary or journal file is left");
+      released = true;
+      await holder.release();
+      assert.deepEqual(await Promise.all(launchers.map((child) => child.closed)), [0, 0, 0, 0], launchers.map((child) => child.text).join("|"));
+      assert.deepEqual(requests(journalBefore).length, 1, "still one request");
+    } finally {
+      if (!released) await holder.release();
+    }
+  }
+
+  // Two different commands at once: one starts, the other is refused.
+  const output = tempDir(t, "bundle-v1-logs-"),
+    journalBefore = readJournal(hostLockFile()).length;
+  const holder = await holdHost("wi_bundle_v1_holder");
+  try {
+    const pair = [
+      launcherCLI(t, f, ["run", planFile, output]),
+      launcherCLI(t, f, ["run", planFile, output, "--jobs", "1"]),
+    ];
+    const { record } = await queuedRun(output, "the one run");
+    const refused = await within(Promise.race(pair.map((child) => child.closed.then(() => child))), 20000, "the refused launcher");
+    assert.equal(await refused.closed, 1, refused.text);
+    assert.equal(refused.text, `Host lock output/record directory is already in use by a different matrix run (pid ${record.pid})\n`);
+    const winner = pair.find((child) => child !== refused);
+    assert.match(winner.text, new RegExp(`^matrix run: detached as pid ${record.pid};`));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => w.pid), [record.pid], "one waiter");
+    assert.deepEqual(requests(journalBefore).map((entry) => entry.pid), [record.pid], "one request");
+    assert.deepEqual(readdirSync(output).sort(), queuedRunFiles);
+    await stopQueuedRun(output);
+    assert.equal(await winner.closed, 143, winner.text);
+  } finally {
+    await holder.release();
+  }
+});
+
+test("bundle v1 a launch mutex left by a dead launcher is recovered, and one that cannot be reclaimed refuses with the file to remove", { timeout: 120000 }, async (t) => {
+  const { f, planFile } = plannedFixture(t, "console.log('ran');");
+  const holder = await holdHost("wi_bundle_v1_holder");
+  try {
+    // A live owner (this process) and an owner record that does not parse are
+    // never reclaimed: no run starts and the refusal names the file.
+    for (const [what, owner, holderText] of [
+      ["live owner", JSON.stringify({ pid: process.pid, token: "live", at: new Date().toISOString() }) + "\n", ` (pid ${process.pid})`],
+      ["unparseable owner", "{", ""],
+    ]) {
+      const output = tempDir(t, "bundle-v1-logs-"),
+        lock = join(output, "runner.json.lock");
+      writeFileSync(lock, owner);
+      const started = Date.now();
+      const child = launcherCLI(t, f, ["run", planFile, output]);
+      assert.equal(await within(child.closed, 20000, `the ${what} refusal; saw ${child.text}`), 1, child.text);
+      assert(Date.now() - started >= 5000, what + ": the launcher waited for the holder");
+      assert.equal(
+        child.text,
+        `Another matrix launcher${holderText} holds ${lock}; no run was started. ` +
+          "If no launcher for this output directory is running, remove that file and run the command again\n",
+        what,
+      );
+      assert.deepEqual(readdirSync(output), ["runner.json.lock"], what);
+      assert.equal(readFileSync(lock, "utf8"), owner, what);
+      assert.deepEqual(readHostState(hostLockFile()).waiters, [], what + ": nothing joined the host");
+    }
+    // A dead owner is reclaimed; the recovery is journalled beside the record.
+    const output = tempDir(t, "bundle-v1-logs-"),
+      dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    assert(!pidAlive(dead));
+    writeFileSync(join(output, "runner.json.lock"), JSON.stringify({ pid: dead, token: "dead", at: new Date().toISOString() }) + "\n");
+    const child = launcherCLI(t, f, ["run", planFile, output]);
+    const { record } = await queuedRun(output, "the run after the recovery; saw " + child.text);
+    assert.match(child.text, new RegExp(`^matrix run: detached as pid ${record.pid};`));
+    await untilHost(() => existsSync(join(output, "host-lock.log")), "the run's host lock files");
+    assert.deepEqual(readdirSync(output).sort(), ["host.journal.jsonl", ...queuedRunFiles].sort());
+    assert.deepEqual(
+      readFileSync(join(output, "host.journal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line)).map((entry) => [entry.event, entry.deadPid, entry.token]),
+      [["mutex-recovered", dead, "dead"]],
+    );
+    assert.deepEqual(readHostState(hostLockFile()).waiters.map((w) => w.pid), [record.pid], "one waiter");
+    await stopQueuedRun(output);
+    assert.equal(await child.closed, 143, child.text);
+  } finally {
+    await holder.release();
+  }
+});
+
+test("bundle v3 a selection path that is not a canonical repository path selects from the job's base", (t) => {
+  const f = tipFixture(t);
+  const before = makePlan(withoutSelection(f.context), f.cwd);
+  assert.deepEqual(checkIds(before), ["go-race", "go-test", "go-vet", "npm-unit"]);
+  // The well-formed selection is narrower, so honouring a malformed one
+  // under the tip rule would drop the Go checks.
+  assert.deepEqual(checkIds(matrixRunner.planWithPreservation(f.context, f.cwd).plan), ["npm-unit"]);
+  const sparse = ["docs/x.md"];
+  sparse.length = 3;
+  const shapes = {
+    "a null entry": [null],
+    "an object entry": [{}],
+    "a nested array": [["docs/x.md"]],
+    "a sparse array": sparse,
+    "an object": {},
+    "a leading dot segment": ["./docs/x.md"],
+    "a doubled slash": ["docs//x.md"],
+    "an inner dot segment": ["docs/./x.md"],
+    "a doubled trailing slash": ["docs//"],
+    "a slash alone": ["/"],
+    "a well-formed path beside a doubled slash": ["docs/x.md", "docs//x.md"],
+  };
+  for (const [what, selectionPaths] of Object.entries(shapes)) {
+    const { plan, selection } = matrixRunner.planWithPreservation({ ...f.context, selectionPaths }, f.cwd);
+    assert.deepEqual(plan, before, what);
+    assert.deepEqual(selection, { rule: "job-base", baseCommit: f.base, reason: "invalid-selection-paths" }, what);
+  }
+  // An owned directory prefix, as plans record them, is still a selection path.
+  const owned = matrixRunner.planWithPreservation({ ...f.context, selectionPaths: ["docs/"] }, f.cwd);
+  assert.equal(owned.selection.rule, "integration-tip");
+  assert.deepEqual(checkIds(owned.plan), ["npm-unit"]);
+});
+
+// A Linux process table for the home sweep, with nothing live behind it:
+// canned ps and lsof output, an environ read that fails as told, and a clock.
+function linuxSweep(t, processes, { psFails = false, psSeconds = 0, dropSelfRow = false, garbageRow = false } = {}) {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), "bundle-v7-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const self = 500,
+    uid = 501,
+    homeCreatedMs = 1_000_000_000_000;
+  let clock = homeCreatedMs + 600_000;
+  const calls = [],
+    reported = [];
+  const probes = {
+    platform: "linux",
+    uid,
+    self,
+    homeCreatedMs,
+    now: () => clock,
+    onUnreadable: (entry) => reported.push(entry),
+    readEnviron: (pid) => {
+      const entry = processes[pid];
+      if (entry.environ === undefined) throw Object.assign(new Error("environ " + (entry.code ?? "EACCES")), { code: entry.code ?? "EACCES" });
+      return entry.environ(home);
+    },
+    run: (command, args) => {
+      calls.push([command, ...args].join(" "));
+      if (command === "lsof") return "";
+      if (args.includes("-axww"))
+        return [`${self} 1 ${uid} node runner`, ...Object.entries(processes).map(([pid, entry]) => `${pid} 1 ${uid} ${entry.command ?? "daemon"}`)].join("\n") + "\n";
+      // ps -o pid=,etimes= -p LIST. A slow ps samples each elapsed time as
+      // it finishes, psSeconds after it was called.
+      clock += psSeconds * 1000;
+      const startedAtCall = clock;
+      if (psFails) throw new Error("ps exited 1");
+      const row = (pid, startedMs) => `${String(pid).padStart(7)} ${String(Math.floor((startedAtCall - startedMs) / 1000)).padStart(7)}`;
+      return [
+        ...(dropSelfRow ? [] : [row(self, homeCreatedMs - 60_000)]),
+        ...(garbageRow ? ["ps: bad output"] : []),
+        ...args.at(-1).split(",").map(Number).filter((pid) => pid !== self && processes[pid] && !processes[pid].gone)
+          .map((pid) => (processes[pid].etimes !== undefined ? `${pid} ${processes[pid].etimes}` : row(pid, homeCreatedMs + processes[pid].startedAfterHomeMs))),
+      ].join("\n") + "\n";
+    },
+  };
+  return { home, probes, calls, reported, self, homeCreatedMs, find: (override = {}) => matrixRunner.verifierHomeProcesses(home, { ...probes, ...override }) };
+}
+test("bundle v7 an unreadable environ is skipped only for a process that started before the verifier home, and fails closed otherwise", async (t) => {
+  const hourBefore = -3_600_000;
+  const unproven = /Cannot read the environment of 1 same-user process \(pid 700\) or prove it unrelated to the verifier home: /;
+  // Older than the home: skipped, reported, nothing fails. A readable
+  // process under the home is still found and a vanished one still skipped.
+  let sweep = linuxSweep(t, {
+    700: { command: "ssh-agent -s", startedAfterHomeMs: hourBefore },
+    701: { code: "EPERM", startedAfterHomeMs: hourBefore },
+    710: { command: "leftover", environ: (home) => `PATH=/bin\0HOME=${home}\0` },
+    711: { environ: () => "HOME=/somewhere/else\0" },
+    712: { code: "ENOENT" },
+  });
+  assert.deepEqual(sweep.find(), [{ pid: 710, reasons: ["env"], command: "leftover" }]);
+  assert.deepEqual(sweep.reported, [
+    { pid: 700, code: "EACCES", startedAt: new Date(sweep.homeCreatedMs + hourBefore).toISOString(), command: "ssh-agent -s" },
+    { pid: 701, code: "EPERM", startedAt: new Date(sweep.homeCreatedMs + hourBefore).toISOString(), command: "daemon" },
+  ]);
+  // One ps for start times, naming the unreadable pids and the runner itself;
+  // the open-file sweep still runs.
+  assert.deepEqual(sweep.calls, [
+    "ps -axww -o pid=,ppid=,uid=,command=",
+    "ps -o pid=,etimes= -p 700,701,500",
+    `lsof -nP -w -u 501 -F pn`,
+  ]);
+  // No unreadable process: no second ps.
+  sweep = linuxSweep(t, { 711: { environ: () => "HOME=/somewhere/else\0" } });
+  assert.deepEqual(sweep.find(), []);
+  assert.equal(sweep.calls.length, 2);
+
+  // Started after the home, or inside the margin before it: unproven.
+  for (const startedAfterHomeMs of [10_000, 0, -4_000]) {
+    sweep = linuxSweep(t, { 700: { startedAfterHomeMs }, 701: { startedAfterHomeMs: hourBefore } });
+    assert.throws(
+      () => sweep.find(),
+      {
+        message:
+          "Cannot read the environment of 1 same-user process (pid 700) or prove it unrelated to the verifier home: " +
+          "not started before the home was created, or start time unknown",
+      },
+      String(startedAfterHomeMs),
+    );
+    assert.deepEqual(sweep.reported.map((entry) => entry.pid), [701], "the proven one is still reported");
+  }
+  assert.deepEqual(linuxSweep(t, { 700: { startedAfterHomeMs: -6_000 } }).find(), []);
+  // An unknown start time: unparseable, ps failing, a line ps should not
+  // print, or no row for the runner itself.
+  for (const [processes, options, why] of [
+    [{ 700: { etimes: "-" } }, {}, /start time unknown$/],
+    [{ 700: { etimes: "12:01" } }, {}, /start time unknown$/],
+    [{ 700: { startedAfterHomeMs: hourBefore } }, { psFails: true }, /ps could not report start times: ps exited 1$/],
+    [{ 700: { startedAfterHomeMs: hourBefore } }, { garbageRow: true }, /ps printed a line that could not be read$/],
+    [{ 700: { startedAfterHomeMs: hourBefore } }, { dropSelfRow: true }, /ps did not list the runner itself$/],
+  ]) {
+    sweep = linuxSweep(t, processes, options);
+    assert.throws(() => sweep.find(), (error) => unproven.test(error.message) && why.test(error.message), String(why));
+    assert.deepEqual(sweep.reported, [], String(why));
+  }
+  // It exited between the environ read and ps: gone, like any exited process.
+  sweep = linuxSweep(t, { 700: { gone: true } });
+  assert.deepEqual(sweep.find(), []);
+  assert.deepEqual(sweep.reported, []);
+  // A slow ps: the process started 10 s after the home and ps took 30 s. A
+  // clock read before ps would place its start 20 s before the home.
+  sweep = linuxSweep(t, { 700: { startedAfterHomeMs: 10_000 } }, { psSeconds: 30 });
+  assert.throws(() => sweep.find(), unproven);
+  assert.deepEqual(sweep.reported, []);
+  // Without the home's creation time nothing is proven.
+  sweep = linuxSweep(t, { 700: { startedAfterHomeMs: hourBefore } });
+  assert.throws(() => sweep.find({ homeCreatedMs: undefined }), /the home's creation time is not known$/);
+  assert.equal(sweep.calls.length, 1, "no start-time ps without it");
+  // Any other read error still throws as it is, and many pids are bounded.
+  sweep = linuxSweep(t, { 700: { code: "EIO" } });
+  assert.throws(() => sweep.find(), { message: "environ EIO" });
+  sweep = linuxSweep(t, Object.fromEntries(Array.from({ length: 14 }, (_, i) => [800 + i, { startedAfterHomeMs: 1000 }])));
+  assert.throws(() => sweep.find(), /Cannot read the environment of 14 same-user processes \(pid 800, 801, 802, 803, 804, 805, 806, 807, 808, 809, \.\.\.\) or prove them unrelated/);
+
+  // The stop passes the probes to each sweep.
+  sweep = linuxSweep(t, { 700: { startedAfterHomeMs: hourBefore } });
+  assert.deepEqual(await matrixRunner.stopVerifierHomeProcesses(sweep.home, undefined, sweep.probes), []);
+  assert.deepEqual(sweep.reported.map((entry) => entry.pid), [700]);
+  sweep = linuxSweep(t, { 700: { startedAfterHomeMs: 1000 } });
+  await assert.rejects(() => matrixRunner.stopVerifierHomeProcesses(sweep.home, undefined, sweep.probes), unproven);
+});
+
+test("bundle v7 a run records the unreadable processes it skipped once each, and an unproven one still leaves no receipt", async (t) => {
+  const f = fixture(t),
+    plan = commandPlan(f, "console.log('check passed');");
+  const entry = { pid: 700, code: "EACCES", startedAt: "2026-01-01T00:00:00.000Z", command: "ssh-agent -s" };
+  const output = tempDir(t, "bundle-v7-logs-");
+  let given;
+  const before = Date.now();
+  const receipt = await runPlan(plan, f.cwd, output, {
+    stopHomeProcesses: async (home, find, probes) => {
+      given = { home, find, homeCreatedMs: probes.homeCreatedMs };
+      // One report per sweep of the stop.
+      for (let sweep = 0; sweep < 4; sweep++) probes.onUnreadable(entry);
+      probes.onUnreadable({ ...entry, pid: 701, code: "EPERM" });
+      return [];
+    },
+  });
+  assert(receiptEligible(receipt));
+  assert(existsSync(join(output, "receipt.json")));
+  assert.equal(given.find, undefined);
+  assert(given.homeCreatedMs >= before && given.homeCreatedMs <= Date.now(), "the home's creation time is passed down");
+  assert(!existsSync(given.home), "the home was still removed");
+  assert.deepEqual(JSON.parse(readFileSync(join(output, "home-sweep-unreadable.json"), "utf8")), {
+    home: given.home,
+    count: 2,
+    processes: [entry, { ...entry, pid: 701, code: "EPERM" }],
+  });
+  assert(!existsSync(join(output, "home-processes.json")));
+  // An unproven process fails the stop: no receipt, the home kept, and what
+  // was skipped before it is still recorded.
+  const failed = tempDir(t, "bundle-v7-logs-");
+  let retained = "";
+  t.after(() => retained && existsSync(retained) && removeVerifierHome(retained));
+  await assert.rejects(
+    () =>
+      runPlan(plan, f.cwd, failed, {
+        stopHomeProcesses: async (home, find, probes) => {
+          retained = home;
+          probes.onUnreadable(entry);
+          throw new Error("Cannot read the environment of 1 same-user process (pid 702)");
+        },
+      }),
+    /Failed to stop processes under verifier home .*Cannot read the environment of 1 same-user process \(pid 702\)/,
+  );
+  assert(existsSync(retained), "the home is kept");
+  assert(!existsSync(join(failed, "receipt.json")));
+  assert.match(JSON.parse(readFileSync(join(failed, "cleanup-error.json"), "utf8")).error, /pid 702/);
+  assert.deepEqual(JSON.parse(readFileSync(join(failed, "home-sweep-unreadable.json"), "utf8")).processes, [entry]);
+  // A run with nothing unreadable writes no such file.
+  const plain = tempDir(t, "bundle-v7-logs-");
+  await runPlan(plan, f.cwd, plain);
+  assert(!existsSync(join(plain, "home-sweep-unreadable.json")));
 });

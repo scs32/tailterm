@@ -311,8 +311,9 @@ targeted receipt is advisory iteration evidence. It has no plan binding, and the
 handler never imports it. The full plan runs once, on the final candidate.
 
 Both `plan`/`run` and `targeted` refuse a base that the candidate does not
-contain, with "candidate is not a fast-forward of its base; rebase onto the
-current tip". Equal and linear commits are accepted. At acceptance,
+contain: `plan`/`run` with "candidate is not a fast-forward of its base; rebase
+onto the current tip", and `targeted` by naming the fix candidate, the previous
+candidate it does not contain and their merge base. Equal and linear commits are accepted. At acceptance,
 `tt team queue accept` and the leased handler's done save read the item's current
 verification plan. `--commit` must equal the plan commit, and the accepted
 worktree must be a fast-forward of the plan base. That base is saved as the
