@@ -453,6 +453,24 @@ func TestGeneratedBriefingDescribesFullAllocationIntentTupleAndRecovery(t *testi
 	}
 }
 
+// g1/g2 (wi_67aab89d028bf652): the spawn policy tells a launcher that an
+// item-bound member also needs the item's team reservation, and names the
+// hub's refusal, so the reservation is checked before spawning.
+func TestGeneratedSpawnPolicyNamesTheItemTeamReservation(t *testing.T) {
+	const want = "A fresh item-bound --team-role member launch also needs the item's team reservation, which the queue's own launch creates; without it the hub refuses the launch with \"item has no matching reserved team\", so check that the reservation exists before spawning."
+	task := api.Task{Name: "Project", Orchestrator: "lead", AllowAgentSpawn: true, MaxNewAgents: 4}
+	roster := []api.Agent{{Name: "lead", Status: api.AgentRunning}}
+	for _, name := range []string{"lead", "worker"} {
+		if got := taskBriefingForRoster(task, name, "", roster, 0); strings.Count(got, want) != 1 {
+			t.Fatalf("%s briefing states the team reservation %d times, want once", name, strings.Count(got, want))
+		}
+	}
+	task.AllowAgentSpawn = false
+	if got := taskBriefingForRoster(task, "worker", "", roster, 0); strings.Contains(got, "team reservation") {
+		t.Fatal("a briefing with spawning disabled carries the spawn reservation sentence")
+	}
+}
+
 func TestSpawnRejectsInvalidPlannedTeamSizeBeforeContactingHub(t *testing.T) {
 	e := env{hub: "http://127.0.0.1:1", task: "tsk_0000000000000001"}
 	err := cmdSpawn(e, []string{"--name", "lead", "--run", "codex", "--planned-team-members", "33"})
