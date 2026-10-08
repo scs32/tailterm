@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { spawnSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   tmuxCommand,
@@ -20,7 +20,12 @@ import {
   shellQuote,
 } from "../shared/tmux-command.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
-import { readTmuxFormat } from "./agent-window-size-fixture.js";
+import {
+  readTmuxFormat,
+  runBounded,
+  sizingReply,
+  TMUX_CALL_TIMEOUT_MS,
+} from "./agent-window-size-fixture.js";
 
 test("real private tmux sizing serializes claims and rejects stale viewers and identities", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-size-"));
@@ -35,10 +40,16 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       ([k]) => !k.startsWith("TAILTERM_") && k !== "TMUX",
     ),
   );
+  const socket = dir + "/socket";
   const run = (...args) => {
-    const r = spawnSync(binary, args, { env, encoding: "utf8" });
+    const r = runBounded(binary, args, { env, socket });
     assert.equal(r.status, 0, r.stderr);
     return r.stdout.trim();
+  };
+  const shell = (command) => {
+    const r = runBounded("/bin/sh", ["-c", command], { env, socket });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
   };
   const binding = {
     taskId: "tsk_0000000000000001",
@@ -86,28 +97,29 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       action: "claim",
       expectedRevision: "",
     };
-    const invoke = (changes = {}) =>
-      spawnSync(
-        "/bin/sh",
-        [
-          "-c",
-          agentWindowSizeCommand(
-            {
-              ...params,
-              expectedRevision: readTmuxFormat(run, [
-                "display-message",
-                "-p",
-                "-t",
-                id + ":agent",
-                "#{@tailterm_size_revision}",
-              ]),
-              ...changes,
-            },
-            binary,
-          ),
-        ],
-        { env, encoding: "utf8" },
-      );
+    // A reply cut by a loaded host is run again; a real refusal, whose
+    // identity does not hold for this call's target and binding, is not.
+    const invoke = (changes = {}) => {
+      const call = {
+        ...params,
+        expectedRevision: readTmuxFormat(run, [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{@tailterm_size_revision}",
+        ]),
+        ...changes,
+      };
+      return {
+        stdout: sizingReply({
+          run: shell,
+          read: run,
+          target: call.target,
+          binding: call.binding,
+        })(agentWindowSizeCommand(call, binary)),
+      };
+    };
     const size = () =>
       readTmuxFormat(
         run,
@@ -178,23 +190,29 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       contenders.map(
         (c) =>
           new Promise((resolve, reject) => {
-            const p = spawn(
-              "/bin/sh",
-              [
-                "-c",
-                agentWindowSizeCommand(
-                  { ...params, expectedRevision: revision, ...c },
-                  binary,
-                ),
-              ],
-              { env },
+            const command = agentWindowSizeCommand(
+              { ...params, expectedRevision: revision, ...c },
+              binary,
             );
+            const p = spawn("/bin/sh", ["-c", command], { env });
             let output = "",
               stderr = "";
+            const timer = setTimeout(() => {
+              p.kill("SIGKILL");
+              reject(
+                Error(
+                  `tmux command hung after ${TMUX_CALL_TIMEOUT_MS} ms: ${command}`,
+                ),
+              );
+            }, TMUX_CALL_TIMEOUT_MS);
             p.stdout.on("data", (d) => (output += d));
             p.stderr.on("data", (d) => (stderr += d));
-            p.on("error", reject);
+            p.on("error", (e) => {
+              clearTimeout(timer);
+              reject(e);
+            });
             p.on("close", (code) => {
+              clearTimeout(timer);
               try {
                 assert.equal(code, 0, stderr);
                 assert.ok(["sized", "superseded"].includes(output.trim()));
@@ -265,7 +283,74 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
       /identity/,
     );
   } finally {
-    spawnSync(binary, ["kill-server"], { env });
+    try {
+      runBounded(binary, ["kill-server"], { env, socket });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a hung tmux command fails fast and names the command", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-hung-"));
+  const socket = dir + "/socket",
+    stub = path.join(dir, "tmux");
+  // A client that never returns, as at a stuck server's first new-session.
+  writeFileSync(stub, "#!/bin/sh\nexec sleep 600\n", { mode: 0o700 });
+  const answering = path.join(dir, "answering");
+  writeFileSync(answering, "#!/bin/sh\nprintf 'ok %s\\n' \"$1\"\nexit 3\n", {
+    mode: 0o700,
+  });
+  // Stands in for the stuck private server: a detached process in its own
+  // group whose command line carries the socket path. The test starts it, so
+  // it exists before the bounded call however loaded the host is.
+  const server = spawn("/usr/bin/perl", ["-e", "sleep 600", socket], {
+    detached: true,
+    stdio: "ignore",
+  });
+  server.unref();
+  try {
+    const started = Date.now();
+    assert.throws(
+      () =>
+        runBounded(stub, ["new-session", "-d", "-s", "stuck"], {
+          timeoutMs: 300,
+          socket,
+        }),
+      (e) => {
+        assert.match(
+          e.message,
+          /^tmux command hung after 300 ms: .*new-session -d -s stuck; killed private server process group\(s\) \d+/,
+        );
+        assert.ok(e.message.includes(String(server.pid)), e.message);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - started < 5000, "the hang is reported fast");
+    assert.ok(server.pid > 1);
+    let gone = false;
+    for (let i = 0; i < 100 && !gone; i++) {
+      try {
+        process.kill(server.pid, 0);
+        await new Promise((r) => setTimeout(r, 20));
+      } catch (e) {
+        assert.equal(e.code, "ESRCH");
+        gone = true;
+      }
+    }
+    assert.ok(gone, "the stand-in server process is gone");
+    assert.throws(
+      () => runBounded(stub, ["kill-server"], { timeoutMs: 300 }),
+      /^Error: tmux command hung after 300 ms: .*kill-server; no private socket was given$/,
+    );
+    const answered = runBounded(answering, ["list-sessions"], { socket });
+    assert.equal(answered.status, 3);
+    assert.equal(answered.stdout, "ok list-sessions\n");
+    assert.equal(answered.error, undefined);
+  } finally {
+    try {
+      process.kill(server.pid, "SIGKILL");
+    } catch {}
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -278,7 +363,7 @@ test("tmux launch resolves SSH PATH and preserves real tmux failures", () => {
       "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'fixture: terminal initialization failed\\n' >&2\nexit 23\n",
       { mode: 0o700 },
     );
-    const result = spawnSync("/bin/sh", ["-c", tmuxCommand("work")], {
+    const result = runBounded("/bin/sh", ["-c", tmuxCommand("work")], {
       encoding: "utf8",
       env: { ...process.env, PATH: dir },
     });
@@ -302,7 +387,7 @@ test("explicit tmux executable works outside PATH, including spaces and quotes, 
     writeFileSync(binary, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", {
       mode: 0o700,
     });
-    const launch = spawnSync(
+    const launch = runBounded(
       "/bin/sh",
       ["-c", tmuxCommand("work-01", binary)],
       { encoding: "utf8" },
@@ -313,7 +398,7 @@ test("explicit tmux executable works outside PATH, including spaces and quotes, 
       /^-u\n-T\nclipboard\nnew-session\n-A\n-s\nwork-01\n;/,
     );
     assert.match(launch.stdout, /set-option\nmouse\non/);
-    const list = spawnSync("/bin/sh", ["-c", tmuxListCommand(binary)], {
+    const list = runBounded("/bin/sh", ["-c", tmuxListCommand(binary)], {
       encoding: "utf8",
     });
     assert.equal(list.status, 0);
@@ -321,7 +406,7 @@ test("explicit tmux executable works outside PATH, including spaces and quotes, 
       list.stdout,
       "list-sessions\n-F\n#{session_name}|#{session_windows}|#{session_attached}|#{session_id}|#{session_created}\n",
     );
-    const missing = spawnSync(
+    const missing = runBounded(
       "/bin/sh",
       ["-c", tmuxCommand("main", path.join(dir, "absent"))],
       { encoding: "utf8" },
@@ -379,7 +464,7 @@ test("agent tiles attach with ignore-size on tmux 3.2+ only; other attaches neve
       { mode: 0o700 },
     );
     const run = (cmd, version) =>
-      spawnSync("/bin/sh", ["-c", cmd], {
+      runBounded("/bin/sh", ["-c", cmd], {
         encoding: "utf8",
         env: { ...process.env, PATH: dir, FAKE_TMUX_VERSION: version },
       });
@@ -447,7 +532,7 @@ esac
       options,
     );
     for (const version of ["3.7b", "3.1c"]) {
-      const result = spawnSync("/bin/sh", ["-c", command], {
+      const result = runBounded("/bin/sh", ["-c", command], {
         encoding: "utf8",
         env: {
           ...process.env,
@@ -476,7 +561,7 @@ esac
       assert.match(guard, /set-option -w -t '\$4:@12' window-size latest/);
       assert.doesNotMatch(guard, /resize-window|-g /);
     }
-    const refused = spawnSync("/bin/sh", ["-c", command], {
+    const refused = runBounded("/bin/sh", ["-c", command], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -540,10 +625,14 @@ test("agent launch forwards an explicit model as one argument and omits defaults
       prompt: "First line\nSecond line",
     };
     const launch = (extra) =>
-      spawnSync("/bin/sh", ["-c", agentSpawnCommand({ ...fields, ...extra })], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: dir },
-      });
+      runBounded(
+        "/bin/sh",
+        ["-c", agentSpawnCommand({ ...fields, ...extra })],
+        {
+          encoding: "utf8",
+          env: { ...process.env, PATH: dir },
+        },
+      );
     const selected = launch({ model: "provider/model:latest" });
     assert.equal(selected.status, 0);
     assert.match(selected.stdout, /--model\nprovider\/model:latest\n$/);
@@ -610,7 +699,7 @@ test("agent launch forwards one bounded item context and optional replacement id
         history: { coverage: { complete: true } },
       },
     };
-    const result = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
+    const result = runBounded("/bin/sh", ["-c", agentSpawnCommand(fields)], {
       encoding: "utf8",
       env: { ...process.env, PATH: dir },
     });
@@ -661,11 +750,15 @@ test("browser shell transport preserves measured and 512 KiB UTF-8 contexts", as
           workOrderMessageSeq: 1,
           workContextBundle: context,
         };
-        const result = spawnSync("/bin/sh", ["-c", agentSpawnCommand(fields)], {
-          encoding: "utf8",
-          env: { ...process.env, PATH: dir },
-          maxBuffer: 4 * 1024 * 1024,
-        });
+        const result = runBounded(
+          "/bin/sh",
+          ["-c", agentSpawnCommand(fields)],
+          {
+            encoding: "utf8",
+            env: { ...process.env, PATH: dir },
+            maxBuffer: 4 * 1024 * 1024,
+          },
+        );
         assert.equal(
           result.status,
           0,
@@ -677,7 +770,7 @@ test("browser shell transport preserves measured and 512 KiB UTF-8 contexts", as
           false,
           "private context file survived success",
         );
-        const failure = spawnSync(
+        const failure = runBounded(
           "/bin/sh",
           ["-c", agentSpawnCommand(fields)],
           {
@@ -744,7 +837,7 @@ test("staged 512 KiB context uses a bounded verified command and always cleans u
       command,
       new RegExp(Buffer.from(context.slice(0, 48)).toString("base64")),
     );
-    const result = spawnSync("/bin/sh", ["-c", command], {
+    const result = runBounded("/bin/sh", ["-c", command], {
       encoding: "utf8",
       env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
       maxBuffer: 2 * 1024 * 1024,
@@ -754,7 +847,7 @@ test("staged 512 KiB context uses a bounded verified command and always cleans u
     assert.equal(existsSync(staged), false);
 
     writeFileSync(staged, context.slice(0, -1) + " ", { mode: 0o600 });
-    const changed = spawnSync("/bin/sh", ["-c", command], {
+    const changed = runBounded("/bin/sh", ["-c", command], {
       encoding: "utf8",
       env: { ...process.env, PATH: `${dir}:/usr/bin:/bin` },
       maxBuffer: 2 * 1024 * 1024,

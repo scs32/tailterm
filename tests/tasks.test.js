@@ -23,8 +23,9 @@ import {
 } from "../client/tasks.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
 import { tmuxCommand, shellQuote } from "../shared/tmux-command.js";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { runBounded } from "./agent-window-size-fixture.js";
 
 const servers = [
   {
@@ -537,7 +538,14 @@ test("helperReattach and reattachOptions force an ignore-size attach", () => {
 // Real PTYs and generated attach commands on TWO private sockets. No inherited
 // session/configuration/credential state participates in the sizing policy.
 test("helper latest policy follows lone TailOS and defers to the owner across transitions", (t) => {
-  const version = execFileSync("tmux", ["-V"], { encoding: "utf8" }).trim();
+  // Every process call is bounded; a nonzero exit throws, as before.
+  const bounded = (file, args, options) => {
+    const r = runBounded(file, args, options);
+    if (r.error) throw r.error;
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  const version = bounded("tmux", ["-V"]);
   assert.match(
     version,
     /^tmux (?:3\.[2-9]|[4-9]\.)/,
@@ -551,21 +559,18 @@ test("helper latest policy follows lone TailOS and defers to the owner across tr
     ),
   );
   const binary = dir + "/tmux";
-  const tmuxPath = execFileSync("/bin/sh", ["-c", "command -v tmux"], {
-    env,
-    encoding: "utf8",
-  }).trim();
+  const tmuxPath = bounded("/bin/sh", ["-c", "command -v tmux"], { env });
   writeFileSync(
     binary,
     `#!/bin/sh\nexec '${tmuxPath}' -S '${dir}/target' -f /dev/null "$@"\n`,
     { mode: 0o700 },
   );
   const run = (socket, ...args) =>
-    execFileSync(
-      tmuxPath,
-      ["-S", dir + "/" + socket, "-f", "/dev/null", ...args],
-      { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    ).trim();
+    bounded(tmuxPath, ["-S", dir + "/" + socket, "-f", "/dev/null", ...args], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      socket: dir + "/" + socket,
+    });
   const target = (...args) => run("target", ...args);
   const viewer = (...args) => run("viewer", ...args);
   t.after(() => {
@@ -596,13 +601,15 @@ rm -rf '${dir}'`,
     run(socket, "start-server", ";", "set-option", "-g", "exit-empty", "off");
   // tmux stops expanding a format after 100 ms and leaves the rest empty, still
   // exiting 0, so a loaded host can cut a reading short. Read until complete.
+  const pause = () =>
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   const whole = (shape, ...args) => {
     const deadline = Date.now() + 5000;
     for (;;) {
       const value = target(...args);
       if (value.split("\n").every((line) => shape.test(line))) return value;
       assert.ok(Date.now() < deadline, `incomplete tmux reading: ${value}`);
-      execFileSync("sleep", ["0.05"]);
+      pause();
     }
   };
   const binding = attachOptions(taskBinding(TASK, helperFixture));
@@ -649,7 +656,7 @@ rm -rf '${dir}'`,
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
       if (predicate()) return;
-      execFileSync("sleep", ["0.05"]);
+      pause();
     }
     assert.fail(
       `${label}: window ${dimensions()}, clients ${target("list-clients", "-F", "#{client_width}x#{client_height}|#{client_flags}")}`,
@@ -813,10 +820,10 @@ rm -rf '${dir}'`,
   const refuse = (options, exact, label) => {
     manual();
     const command = tmuxCommand("helper-fx", binary, true, exact, "", options);
-    const result = spawnSync("/bin/sh", ["-c", command], {
+    const result = runBounded("/bin/sh", ["-c", command], {
       env,
-      encoding: "utf8",
-      timeout: 5000,
+      timeoutMs: 5000,
+      socket: dir + "/target",
     });
     assert.equal(result.status, 1, `${label}: ${result.stderr}`);
     assert.equal(dimensions(), "200x50", label);
@@ -857,10 +864,10 @@ rm -rf '${dir}'`,
     "-F",
     "#{window_id}|#{window-size}|#{window_width}x#{window_height}",
   );
-  const result = spawnSync(
+  const result = runBounded(
     "/bin/sh",
     ["-c", tmuxCommand("helper-fx", binary, true, identity, "", binding)],
-    { env, encoding: "utf8", timeout: 5000 },
+    { env, timeoutMs: 5000, socket: dir + "/target" },
   );
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /linked/);

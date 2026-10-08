@@ -45,6 +45,170 @@ export function readTmuxFormat(
   }
 }
 
+// Bounds for the private tmux tests: one synchronous process call, one awaited
+// step, and one whole test that starts a private server.
+export const TMUX_CALL_TIMEOUT_MS = 20000,
+  SIZING_STEP_TIMEOUT_MS = 15000,
+  SIZING_TEST_TIMEOUT_MS = 60000;
+
+// The only synchronous process call in the private tmux tests. A call that
+// outlives its bound is killed and reported by name. A stuck tmux server has
+// ignored SIGTERM, so with a private socket path every process group whose
+// command line carries that exact path is killed too. The path sits in a fresh
+// temporary directory, so no other server can match it.
+export function runBounded(
+  file,
+  args,
+  { timeoutMs = TMUX_CALL_TIMEOUT_MS, socket, ...options } = {},
+) {
+  const r = spawnSync(file, args, {
+    encoding: "utf8",
+    ...options,
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+  });
+  if (r.error?.code !== "ETIMEDOUT") return r;
+  const text = [file, ...args].join(" "),
+    command = text.length > 600 ? text.slice(0, 600) + "..." : text;
+  throw Error(
+    `tmux command hung after ${timeoutMs} ms: ${command}; ` +
+      (socket
+        ? `killed private server process group(s) ${endPrivateServer(socket).join(", ") || "none found"}`
+        : "no private socket was given"),
+  );
+}
+function endPrivateServer(socket) {
+  const killed = [];
+  if (!socket.startsWith("/")) return killed;
+  let listing;
+  try {
+    listing = runBounded("ps", ["-axww", "-o", "pid=,pgid=,command="], {
+      timeoutMs: 5000,
+      maxBuffer: 64 * 1024 * 1024,
+    }).stdout;
+  } catch {
+    return killed;
+  }
+  const rows = String(listing || "")
+    .split("\n")
+    .map((line) => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line))
+    .filter(Boolean)
+    .map(([, pid, pgid, command]) => ({ pid: +pid, pgid: +pgid, command }));
+  // Children of this process share its group; never signal that one.
+  const own = rows.find((row) => row.pid === process.pid)?.pgid;
+  if (!own) return killed;
+  const groups = new Set(
+    rows
+      .filter(
+        (row) =>
+          row.command.includes(socket) && row.pgid !== own && row.pgid > 1,
+      )
+      .map((row) => row.pgid),
+  );
+  for (const pgid of groups)
+    try {
+      process.kill(-pgid, "SIGKILL");
+      killed.push(pgid);
+    } catch {}
+  return killed;
+}
+
+// Rejects with the name of the awaited step, so a hang reads as that step
+// instead of running to the check timeout.
+export function step(label, promise, ms = SIZING_STEP_TIMEOUT_MS) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            Error(
+              `Agent sizing test step still pending after ${ms} ms: ${label}`,
+            ),
+          ),
+        ms,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// A sizing command guards on one identity format. When tmux cuts that format
+// at its 100 ms limit the guard is empty, so the command prints "refused" (or
+// nothing, or a short "ready:") and exits 0 having changed nothing: the same
+// bytes as a real refusal. So for such a reply the identity is read whole and
+// compared here. If it does not hold, the reply is a real refusal and is
+// returned at once. If it holds, the reply was cut and the command runs again.
+const SIZING_IDENTITY =
+  "#{session_id}|#{session_created}|#{TAILTERM_TASK}|#{TAILTERM_AGENT}|#{TAILTERM_RUN}|#{TAILTERM_ROLE}|#{window_name}|#{window_panes}";
+const sizingAction = (command) =>
+  command.includes("ready:")
+    ? "inspect"
+    : command.includes("-p restored")
+      ? "restore"
+      : command.includes("-p released")
+        ? "release"
+        : command.includes("@tailterm_size_revision},")
+          ? "claim"
+          : "resize";
+export function sizingReply({
+  run,
+  read,
+  target,
+  binding,
+  timeoutMs = 5000,
+  pauseMs = 50,
+}) {
+  const holds = () => {
+    let facts;
+    try {
+      facts = readTmuxFormat(
+        read,
+        ["display-message", "-p", "-t", target.id + ":agent", SIZING_IDENTITY],
+        { shape: /^[^|]*(?:\|[^|]*){7}$/ },
+      );
+    } catch (e) {
+      // A hung or unreadable server is a fixture failure, not a refusal.
+      if (/^(?:tmux command hung|incomplete tmux reading)/.test(e.message))
+        throw e;
+      return false; // the target does not exist
+    }
+    const [id, created, task, agent, runId, role, name, panes] =
+      facts.split("|");
+    return (
+      id === target.id &&
+      created === String(target.created) &&
+      task === binding.taskId &&
+      agent === binding.agentId &&
+      runId === binding.runId &&
+      role !== "owner_helper" &&
+      name === "agent" &&
+      panes === "1"
+    );
+  };
+  return (command) => {
+    const deadline = Date.now() + timeoutMs;
+    for (let runs = 1; ; runs++) {
+      const output = run(command),
+        reply = String(output).trim();
+      const suspect =
+        reply === "refused" ||
+        reply === "" ||
+        (reply.startsWith("ready:") &&
+          !/^ready:(?:[a-zA-Z0-9_-]{16,64})?:\d+x\d+$/.test(reply));
+      if (!suspect || !holds()) return output;
+      if (Date.now() >= deadline)
+        throw Error(
+          `tmux sizing reply stayed ${JSON.stringify(reply)} for ${timeoutMs} ms while identity holds: ${sizingAction(command)}`,
+        );
+      process.stderr.write(
+        `tmux sizing re-run ${runs}: ${JSON.stringify(reply)} while identity holds\n`,
+      );
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pauseMs);
+    }
+  };
+}
+
 export function setupAgentWindowFixture() {
   const dir = mkdtempSync(tmpdir() + "/tailterm-agent-sizing-");
   const wrapper = dir + "/private-tmux";
@@ -63,10 +227,10 @@ export function setupAgentWindowFixture() {
     { mode: 0o700 },
   );
   const tmux = (...args) => {
-    const r = spawnSync(wrapper, args, {
+    const r = runBounded(wrapper, args, {
       env,
-      encoding: "utf8",
-      timeout: 5000,
+      timeoutMs: 5000,
+      socket: dir + "/socket",
     });
     assert.equal(r.status, 0, r.stderr || String(r.error));
     return r.stdout.trim();
@@ -234,14 +398,17 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
       return true;
     },
     async cleanup() {
-      for (const c of contexts) await c.close();
-      spawnSync(wrapper, ["kill-server"], { env });
-      for (const p of processes) {
-        p.stdin.end();
-        p.kill();
+      try {
+        for (const c of contexts) await c.close();
+        runBounded(wrapper, ["kill-server"], { env, socket: dir + "/socket" });
+      } finally {
+        for (const p of processes) {
+          p.stdin.end();
+          p.kill();
+        }
+        await pause(100);
+        rmSync(dir, { recursive: true, force: true });
       }
-      await pause(100);
-      rmSync(dir, { recursive: true, force: true });
     },
   };
 }
@@ -660,7 +827,7 @@ export async function exerciseAgentWindowSizing({
   assert.equal(size(), "240x59");
   assert.equal(owner(), bToken, "blurred viewport resize cannot claim");
   const invoke = (action, token, changes = {}) => {
-    const r = spawnSync(
+    const r = runBounded(
       "/bin/sh",
       [
         "-c",
@@ -684,7 +851,7 @@ export async function exerciseAgentWindowSizing({
           f.wrapper,
         ),
       ],
-      { env: f.env, encoding: "utf8" },
+      { env: f.env, socket: f.dir + "/socket" },
     );
     assert.equal(r.status, 0, r.stderr);
     return r.stdout.trim();
@@ -806,7 +973,7 @@ export async function exerciseAgentWindowSizing({
     "90x30",
   );
   const prior = size();
-  const fail = spawnSync(
+  const fail = runBounded(
     "/bin/sh",
     [
       "-c",
@@ -823,11 +990,11 @@ export async function exerciseAgentWindowSizing({
         f.wrapper,
       ),
     ],
-    { env: f.env },
+    { env: f.env, socket: f.dir + "/socket" },
   );
   assert.equal(fail.stdout.toString().trim(), "refused");
   assert.equal(size(), prior);
-  const missingBinary = spawnSync(
+  const missingBinary = runBounded(
     "/bin/sh",
     [
       "-c",
@@ -844,7 +1011,7 @@ export async function exerciseAgentWindowSizing({
         f.dir + "/missing-tmux",
       ),
     ],
-    { env: f.env },
+    { env: f.env, socket: f.dir + "/socket" },
   );
   assert.equal(missingBinary.status, 127);
   assert.equal(size(), prior);
