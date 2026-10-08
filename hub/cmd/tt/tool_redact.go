@@ -37,9 +37,10 @@ const (
 // Variables rather than constants so tests can change them.
 var (
 	toolRedactScanBudget = 100 * time.Millisecond // from the handler's start; then the scan gives up
-	// Largest tool_response scanned, in bytes. The Mini scans more than this
-	// in 50 ms: TestToolRedactBenchmark measures it.
-	toolRedactMaxBytes = 1 << 20
+	// Largest tool_response scanned, in bytes. It is set by measurement: the
+	// Mini, under load from other work, scans the slowest text of this size
+	// inside 50 ms, half the scan budget. TestToolRedactBenchmark measures it.
+	toolRedactMaxBytes = 512 << 10
 	// toolRedactRewrite builds the redacted output. Only redact mode calls it.
 	toolRedactRewrite = redactRewriteRaw
 )
@@ -209,7 +210,7 @@ func redactBoundary(s string, at int) bool {
 // redactClock tells a scan when its deadline has passed. Every loop in a
 // scan takes a step per turn. In a short string the time is read once every
 // 256 steps; in a long one, where a single step can search the whole string,
-// it is read at every step. So no loop runs on for long after the deadline.
+// once every 16. So no loop runs on for long after the deadline.
 type redactClock struct {
 	deadline time.Time
 	steps    int
@@ -219,7 +220,7 @@ type redactClock struct {
 
 func newRedactClock(deadline time.Time, size int) *redactClock {
 	if size > 4<<10 {
-		return &redactClock{deadline: deadline}
+		return &redactClock{deadline: deadline, mask: 15}
 	}
 	return &redactClock{deadline: deadline, mask: 255}
 }
@@ -469,18 +470,19 @@ func redactContext(s string, clock *redactClock) ([]redactSpan, bool) {
 			return
 		}
 		end, dots := at, 0
+		var dot [2]int
 		for end < len(s) && (redactWUD[s[end]] || s[end] == '.' && dots < 2) {
 			if s[end] == '.' {
+				dot[dots] = end
 				dots++
 			}
 			end++
 		}
 		jwtEnd = end
-		parts := strings.Split(s[at:end], ".")
-		if len(parts) != 3 || parts[2] == "" || end-at > toolRedactLongest*4 {
+		if dots != 2 || dot[1]+1 == end || end-at > toolRedactLongest*4 {
 			return
 		}
-		for _, part := range parts[:2] {
+		for _, part := range []string{s[at:dot[0]], s[dot[0]+1 : dot[1]]} {
 			raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(part, "="))
 			var object map[string]json.RawMessage
 			if err != nil || json.Unmarshal(raw, &object) != nil {

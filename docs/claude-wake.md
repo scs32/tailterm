@@ -406,14 +406,14 @@ The hook can do two things on `PostToolUse`: print nothing, or print one JSON ob
 | Event | The session gets | Ledger row |
 | --- | --- | --- |
 | The scan reaches 100 ms | the original output | `redactSkip: "timeout"` |
-| `tool_response` is over 1 MiB | the original output, not scanned | `redactSkip: "oversize"` |
+| `tool_response` is over 512 KiB | the original output, not scanned | `redactSkip: "oversize"` |
 | `tool_response` is missing or not JSON | the original output | `redactSkip: "unreadable"` |
 | The rewritten value would differ from the original in anything but string text | the original output | `redactSkip: "shape"` |
 | The 150 ms runs out anywhere, a blocked stdout included | the original output; the process exits 0 | possibly none |
 
 Fail-open means a secret passes whenever redaction is skipped. The answer is written before the row, because protecting the output matters more than recording it.
 
-The scan is linear in the output: a run of token characters is measured once however many prefixes sit inside it, and a value that could be long is measured only as far as its bound. Every loop also checks the deadline, at every step in a string over 4 KiB. Measured on the Mini at the 95th percentile, over ordinary source text, an output that is nothing but tokens, one of many small strings and 21 texts built to be slow (a refused prefix or a secret's name repeated to the cap), in both modes: 100 KiB of source text adds 2.1 ms in report mode; the slowest 100 KiB output takes 4.0 ms; the slowest output of the 1 MiB cap takes 38 ms (tokens only, redact mode), under the 50 ms the cap is required to fit in. `TT_REDACT_BENCH=1 go test -run TestToolRedactBenchmark ./cmd/tt` repeats it. Before the scan starts the ledger has already read and decoded its input; on a host where that alone takes most of the 150 ms, a call with an output near the cap can still leave no row.
+The scan is linear in the output: a run of token characters is measured once however many prefixes sit inside it, and a value that could be long is measured only as far as its bound. Every loop also checks the deadline, every 16 steps in a string over 4 KiB. Measured on the Mini at the 95th percentile, over ordinary source text, an output that is nothing but tokens, one of many small strings and 21 texts built to be slow (a refused prefix or a secret's name repeated to the cap), in both modes: over three runs on 2026-10-07 with the host busy (load average about 7), 100 KiB of source text adds 2.1 to 4.0 ms in report mode; the slowest 100 KiB output takes 4.2 to 6.2 ms; the slowest output of the 512 KiB cap takes 17 to 32 ms (tokens only, redact mode), under the 50 ms the cap is required to fit in. The cap was first 1 MiB; one worst case then took 60 ms on the busy host, so it was halved. `TT_REDACT_BENCH=1 go test -run TestToolRedactBenchmark ./cmd/tt` repeats it. Before the scan starts the ledger has already read and decoded its input; on a host where that alone takes most of the 150 ms, a call with an output near the cap can still leave no row.
 
 ### What is recorded
 

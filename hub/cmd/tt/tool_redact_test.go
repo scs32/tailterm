@@ -988,7 +988,7 @@ func TestToolRedactReportMode(t *testing.T) {
 	if out, row := redactPost(t, e, root, map[string]any{"stdout": value + strings.Repeat(" ", 64)}); out != "" || row["redactSkip"] != "oversize" || row["redactCount"] != nil {
 		t.Fatalf("oversize: stdout %d bytes, skip %v", len(out), row["redactSkip"])
 	}
-	setToolLedger(t, &toolRedactMaxBytes, 1<<20)
+	setToolLedger(t, &toolRedactMaxBytes, 512<<10)
 	setToolLedger(t, &toolRedactScanBudget, 0)
 	if out, row := redactPost(t, e, root, map[string]any{"stdout": value}); out != "" || row["redactSkip"] != "timeout" || row["redactCount"] != nil {
 		t.Fatalf("timeout: stdout %d bytes, skip %v", len(out), row["redactSkip"])
@@ -1164,6 +1164,9 @@ func TestToolRedactTimeBounds(t *testing.T) {
 			lines.WriteString(c.make(t, c.n) + "\n")
 		}
 		payload := toolPayload("PostToolUse", map[string]any{"session_id": "s1", "tool_name": "Bash", "tool_use_id": "blocked", "tool_input": map[string]any{}, "tool_response": map[string]any{"stdout": lines.String()}})
+		if len(payload) > toolRedactMaxBytes {
+			t.Fatalf("the payload of %d bytes is over the size cap", len(payload))
+		}
 		path := filepath.Join(t.TempDir(), "stdin")
 		if err := os.WriteFile(path, []byte(payload), 0600); err != nil {
 			t.Fatal(err)
@@ -1497,6 +1500,9 @@ func TestToolRedactScanIsBounded(t *testing.T) {
 			if elapsed > slowest {
 				slowest, slowestUnit = elapsed, fmt.Sprintf("%q at %d KiB", unit, size>>10)
 			}
+			if size == toolRedactMaxBytes && testing.Verbose() {
+				t.Logf("%q at the cap: %s", unit, elapsed.Round(100*time.Microsecond))
+			}
 			if elapsed > 130*time.Millisecond {
 				t.Errorf("unit %q, %d KiB: the scan returned after %s, ok=%v; its budget is 100 ms", unit, size>>10, elapsed.Round(time.Millisecond), ok)
 			}
@@ -1517,7 +1523,7 @@ func TestToolRedactWorstCaseLeavesARow(t *testing.T) {
 	for _, mode := range []string{toolRedactReport, toolRedactRedact} {
 		e, root := redactSandbox(t, mode)
 		for _, unit := range []string{"_sk-ant-", "token=", "plain text "} {
-			for _, size := range []int{64 << 10, 256 << 10, 1000 << 10} {
+			for _, size := range []int{64 << 10, 256 << 10, 500 << 10} {
 				value := c.make(t, c.n)
 				before := len(toolLedgerRows(t, root, e.agent))
 				fields := map[string]any{"session_id": "s1", "tool_name": "Bash", "tool_use_id": redactRandomFrom(t, redactAlnum, 8), "tool_input": map[string]any{},
