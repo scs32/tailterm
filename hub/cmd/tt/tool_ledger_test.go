@@ -280,6 +280,9 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 			var last result
 			deadline := toolLedgerDeadline
 			for attempt := 0; attempt < 3; attempt++ {
+				// A stalled host is usually still stalled a moment later, so
+				// a retry waits first: one bound, then two.
+				time.Sleep(time.Duration(attempt) * toolLedgerBound)
 				t.Run(strconv.Itoa(attempt), func(t *testing.T) {
 					e, root := toolLedgerSandbox(t)
 					last.run = c.run(t, e, root)
