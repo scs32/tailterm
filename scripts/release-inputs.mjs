@@ -12,7 +12,7 @@
 // printed carries credentials or captured program output.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, openSync, writeFileSync, closeSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, openSync, readSync, writeFileSync, closeSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
@@ -21,7 +21,17 @@ import { probe } from "./release-probe.mjs";
 const BASE = "/mnt/deepfreeze/tailterm-hub";
 const BINARY = { hub: ["binaryDestination", "tailterm-hub"], bridge: ["bridgeBinaryDestination", "tailterm-discord"] };
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
-const fileSHA = p => createHash("sha256").update(readFileSync(p)).digest("hex");
+// The SHA-256 of a file's bytes, read through one fixed buffer: a database
+// backup outgrows the 2 GiB that a whole-file read allows. The release
+// runner hashes its pinned files with this too.
+export const FILE_HASH_CHUNK_BYTES = 1024 * 1024;
+export function fileSHA256(path) {
+  const hash = createHash("sha256"), chunk = Buffer.allocUnsafe(FILE_HASH_CHUNK_BYTES), fd = openSync(path, "r");
+  try { for (let n; (n = readSync(fd, chunk, 0, chunk.length, null)) > 0;) hash.update(n === chunk.length ? chunk : chunk.subarray(0, n)); }
+  finally { closeSync(fd); }
+  return hash.digest("hex");
+}
+const fileSHA = fileSHA256;
 function writePrivate(path, text) {
   const fd = openSync(path, "wx", 0o600);
   try { writeFileSync(fd, text); } finally { closeSync(fd); }

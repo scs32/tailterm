@@ -1,4 +1,4 @@
-import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines } from "./release-inputs.mjs";
+import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256 } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,7 @@ import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState,
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
 
-const fileDigest = p => createHash("sha256").update(readFileSync(p)).digest("hex");
+const fileDigest = fileSHA256;
 const TRUENAS_BASE = "/mnt/deepfreeze/tailterm-hub", PAIR = ["hub", "bridge"];
 const DESTINATION = { hub: ["binaryDestination", "tailterm-hub"], bridge: ["bridgeBinaryDestination", "tailterm-discord"] };
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -1478,7 +1478,7 @@ export const RUNNER_CODE_FILES=["../tests/test-binaries.mjs","release-inputs.mjs
 const HEX64=/^[a-f0-9]{64}$/,bytesDigest=bytes=>createHash("sha256").update(bytes).digest("hex");
 export const codeDigest=files=>bytesDigest(RUNNER_CODE_FILES.map(n=>`${n}:${files[n]}`).join("\n"));
 export function diskCode(directory){
-  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(readFileSync(join(directory,n)))]));
+  const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,fileDigest(join(directory,n))]));
   return {files,digest:codeDigest(files)};
 }
 // Read once as this process starts: the bytes beside this module, which are

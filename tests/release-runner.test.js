@@ -3327,3 +3327,60 @@ test("wake a11 a refused send of a tagged notice leaves the poll running, is jou
  const kept=JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8")).failures;assert.equal(kept.length,1);
  assert.deepEqual(kept[0].argv,[h.tt,...fence[0]]);assert.equal(kept[0].exitCode,1);assert.equal(kept[0].count,2);assert.match(kept[0].stderr,/request id reused with different data/);
 });
+
+// File hashes stream through one fixed buffer (k1, k2, k4): a hub backup
+// larger than 2 GiB is hashed without ever being held in memory.
+import {openSync as openFile,ftruncateSync,closeSync as closeFile} from "node:fs";
+import {randomBytes} from "node:crypto";
+import {fileSHA256,FILE_HASH_CHUNK_BYTES,buildInputs as buildReleaseInputs} from "../scripts/release-inputs.mjs";
+test("the streamed file hash equals a whole-file hash at every chunk boundary",t=>{
+ const home=mkdtempSync(join(tmpdir(),"release-file-hash-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ assert.equal(FILE_HASH_CHUNK_BYTES,1024*1024);
+ // Empty, under one chunk, either side of a chunk, an exact multiple, and several chunks with a remainder.
+ for(const size of [0,5,FILE_HASH_CHUNK_BYTES-1,FILE_HASH_CHUNK_BYTES,FILE_HASH_CHUNK_BYTES+1,2*FILE_HASH_CHUNK_BYTES,3*FILE_HASH_CHUNK_BYTES+7]){
+  const path=join(home,"f"+size);writeFileSync(path,randomBytes(size));
+  assert.equal(fileSHA256(path),createHash("sha256").update(readFileSync(path)).digest("hex"),`${size} bytes`);
+ }
+ assert.throws(()=>fileSHA256(join(home,"absent")),{code:"ENOENT"});
+});
+test("a sparse backup over 2 GiB hashes through the input producer and the rehearsal check in bounded memory",{timeout:600000},async t=>{
+ // The size of the hub backup that the whole-file read refused.
+ const SIZE=2209042432,GIB2=2*1024**3;assert.ok(SIZE>GIB2);
+ // The reference: that many zero bytes streamed through the hash, with no file involved.
+ const zeros=Buffer.alloc(1024*1024),reference=createHash("sha256");
+ for(let left=SIZE;left>0;left-=zeros.length)reference.update(left<zeros.length?zeros.subarray(0,left):zeros);
+ const expected=reference.digest("hex");
+ const f=fixture(),home=mkdtempSync(join(tmpdir(),"release-large-backup-")),template=join(home,"plan-template.json");
+ t.after(()=>{for(const d of [home,f.cwd,f.origin])rmSync(d,{recursive:true,force:true});});
+ mkdirSync(join(f.cwd,"hub/internal/store"),{recursive:true});const commit=change(f,"hub/internal/store/x.go","schema");
+ writeFileSync(template,JSON.stringify({version:1,deployment:{stateDirectory:"/mnt/deepfreeze/tailterm-hub/state",binaryDestination:"stale",bridgeBinaryDestination:"stale"}}));
+ const config={version:1,cwd:f.cwd,journalDirectory:home,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(x=>[x,f.base])),inputs:{planTemplate:template}};
+ const j={...job(f,commit),id:"rel_0123abcd",taskId:"tsk_fixture",generation:2,agentId:"agt_fixture",runId:"run_fixture",pauseGeneration:0,integratedCommit:commit};
+ const sparse=path=>{const fd=openFile(path,"wx",0o600);try{ftruncateSync(fd,SIZE);}finally{closeFile(fd);}};
+ const live={commit:"1".repeat(40),artifactSHA256:"2".repeat(64),integrity:true,release:"rel_prev-111111111111-hub"};
+ const deps={configPath:join(home,"deploy.json"),tt:argv=>JSON.stringify(releaseReply([j],argv)),git:argv=>git(f.cwd,...argv),probe:async()=>live,
+  preflight:(plan,receipt)=>writeFileSync(receipt,JSON.stringify({status:"success",backupDestination:JSON.parse(readFileSync(plan,"utf8")).backupDestination,sha256:expected})),
+  copyBackup:(remote,local)=>sparse(local)};
+ // Every buffer asked for while the two scripts hash the backup, and the peak resident size around them.
+ const asked=[],real={};for(const name of ["alloc","allocUnsafe","allocUnsafeSlow"]){real[name]=Buffer[name];Buffer[name]=function(size,...rest){asked.push(size);return real[name].call(Buffer,size,...rest);};}
+ const peakBefore=process.resourceUsage().maxRSS;let out,hub;
+ try{
+  // The release-inputs path: the backup copy is hashed against the preflight receipt.
+  out=await buildReleaseInputs(config,j.id,{deps});hub=JSON.parse(readFileSync(out.manifest,"utf8")).targets.hub;
+  assert.equal(hub.backupSHA256,expected);assert.equal(statSync(hub.backupCopy).size,SIZE);
+  // The runner's rehearsal check on that manifest entry: the hash matches, so the next refusal is the stopped runtime.
+  const adapter=new HostAdapter({cwd:home,journalDirectory:home},{id:j.id});adapter.command=()=>assert.fail("host command");adapter.container=()=>({status:1,stdout:"",stderr:""});
+  const artifact={backupCopy:hub.backupCopy,backupSHA256:hub.backupSHA256,migrationBinary:join(home,"migration"),planPath:hub.planPath,release:hub.release};
+  await assert.rejects(adapter.rehearse(artifact),/^Error: Rehearsal container runtime not running$/);
+  // One changed digit is still the unchanged refusal, so the check read the file.
+  await assert.rejects(adapter.rehearse({...artifact,backupSHA256:expected.replace(/.$/,c=>c==="0"?"1":"0")}),/^Error: Imported backup hash mismatch$/);
+ }finally{Object.assign(Buffer,real);}
+ const grewKiB=process.resourceUsage().maxRSS-peakBefore;
+ assert.ok(asked.filter(size=>size===FILE_HASH_CHUNK_BYTES).length>=3,"each hash asks for one chunk buffer");
+ assert.ok(Math.max(...asked)<=FILE_HASH_CHUNK_BYTES,`largest buffer asked for was ${Math.max(...asked)} bytes`);
+ assert.ok(grewKiB<256*1024,`peak resident memory grew ${grewKiB} KiB`);
+ // The sparse copy took no real space, was not copied, and left no rehearsal state behind.
+ assert.ok(statSync(hub.backupCopy).blocks*512<SIZE/64,"the backup copy is sparse");
+ assert.deepEqual(readdirSync(home).filter(n=>n.includes(".rehearsal-")),[]);
+ assert.deepEqual(out.targets,["hub","bridge","mini"]);
+});
