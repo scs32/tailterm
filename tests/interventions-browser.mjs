@@ -383,7 +383,20 @@ view.mount(document.querySelector('#projects'));window.ready=view.show();window.
 
       await page.setViewportSize({ width: 390, height: 844 });
       await page.locator(`[data-task-select="${shadow.id}"]`).click();
-      await page.locator("[data-interventions-headline]").waitFor();
+      // The neighbour's own headline is still in the page until the shadow
+      // project's detail renders, so wait for the shadow heading and its own
+      // summary rather than any headline before measuring.
+      await page.waitForFunction(() => {
+        const detail = document.querySelector(".tasks-detail");
+        return (
+          detail
+            ?.querySelector("h2")
+            ?.textContent.includes("Synthetic shadow week") &&
+          detail
+            .querySelector("[data-interventions-headline]")
+            ?.textContent.includes("4 interventions")
+        );
+      });
       const dimensions = await page.evaluate(() => ({
         scroll: document.documentElement.scrollWidth,
         width: window.innerWidth,

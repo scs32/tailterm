@@ -62,7 +62,8 @@ function holdNextMessage() {
 // the detached select it resolved as "option being selected is not enabled"
 // until its whole timeout, so wait for a connected, enabled option, select
 // through a freshly resolved locator with a short action timeout, and report
-// the option's state if it never becomes selectable.
+// the option's state if it never becomes selectable. Each retry is logged
+// with its attempt number and the state it observed, so none is silent.
 async function selectAuditKind(page, value) {
   const optionState = () =>
     page.evaluate((expected) => {
@@ -99,8 +100,9 @@ async function selectAuditKind(page, value) {
       `Audit kind ${JSON.stringify(value)} ${reason}: ${JSON.stringify(await optionState())}`,
       { cause },
     );
+  const attempts = 3;
   let failure;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       await page.waitForFunction(selectable, value, { timeout: 10000 });
     } catch (error) {
@@ -125,6 +127,9 @@ async function selectAuditKind(page, value) {
     } catch (error) {
       if (error.name !== "TimeoutError") throw error;
       failure = error;
+      console.log(
+        `selectAuditKind ${JSON.stringify(value)} attempt ${attempt} of ${attempts} did not hold (${error.message.split("\n")[0]}): ${JSON.stringify(await optionState())}`,
+      );
     }
   }
   throw await unselectable("could not be selected", failure);
@@ -374,7 +379,26 @@ try {
       const input = page.locator("#board-text");
       const sendButton = page.locator("#board-compose button[type=submit]");
       await input.waitFor();
+      // The composer paints before the first load finishes and before the
+      // page publishes its Board handle; the walk below needs that handle.
+      await page.waitForFunction(() => window.qa?.board);
       let renderChecked = false;
+      // Board renders keep arriving in the background and each one replaces
+      // the composer. A locator resolves its node in one command and reads it
+      // in the next, so a render between the two leaves it reading a detached
+      // textarea: never the active element, and with no computed style at
+      // all. Read the live composer and its focus in a single evaluation.
+      const composerFocus = () =>
+        page.evaluate(() => {
+          const element = document.querySelector("#board-text");
+          const style = getComputedStyle(element);
+          return {
+            focused: element === document.activeElement,
+            borderColor: style.borderColor,
+            boxShadow: style.boxShadow,
+            outlineStyle: style.outlineStyle,
+          };
+        });
       const focusedControl = () =>
         page.evaluate(() => {
           const element = document.activeElement;
@@ -388,8 +412,7 @@ try {
           ].join("|");
         });
       for (let step = 0; step < 40; step++) {
-        if (await input.evaluate((element) => element === document.activeElement))
-          break;
+        if ((await composerFocus()).focused) break;
         await page.keyboard.press("Tab");
         const control = renderChecked ? "" : await focusedControl();
         if (control) {
@@ -411,25 +434,18 @@ try {
         renderChecked,
         `${name}: the Tab walk must reach a Board control before the composer`,
       );
+      const reached = await composerFocus();
       assert.equal(
-        await input.evaluate((element) => element === document.activeElement),
+        reached.focused,
         true,
         `${name}: keyboard focus did not reach the composer`,
       );
-      const composerFocus = await input.evaluate((element) => {
-        const style = getComputedStyle(element);
-        return {
-          borderColor: style.borderColor,
-          boxShadow: style.boxShadow,
-          outlineStyle: style.outlineStyle,
-        };
-      });
       assert.ok(
-        ["", "none"].includes(composerFocus.outlineStyle),
+        ["", "none"].includes(reached.outlineStyle),
         `${name}: composer focus retained a detached outline`,
       );
       assert.match(
-        composerFocus.boxShadow,
+        reached.boxShadow,
         /inset/,
         `${name}: composer focus lost its inset keyboard indicator`,
       );
