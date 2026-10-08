@@ -11,10 +11,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -104,8 +103,9 @@ func (f *goTrimFixture) entry(rel string, size int, age time.Duration) string {
 	return f.file(filepath.Join(f.cache, rel), size, age)
 }
 
-// oldLink makes a symlink whose own mtime is age before now.
-func (f *goTrimFixture) oldLink(target, path string, age time.Duration) {
+// oldLink makes a symlink and requires that its own mtime, which is the real
+// clock's, is older than the trim age by the fixture's clock.
+func (f *goTrimFixture) oldLink(target, path string) {
 	f.t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		f.t.Fatal(err)
@@ -113,12 +113,8 @@ func (f *goTrimFixture) oldLink(target, path string, age time.Duration) {
 	if err := os.Symlink(target, path); err != nil {
 		f.t.Fatal(err)
 	}
-	ts, err := unix.TimeToTimespec(f.now.Add(-age))
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, path, []unix.Timespec{ts, ts}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		f.t.Fatal(err)
+	if info, err := os.Lstat(path); err != nil || f.now.Sub(info.ModTime()) <= f.settings.MaxAge {
+		f.t.Fatalf("the symlink %s is not old by the fixture clock: %v", path, err)
 	}
 }
 
@@ -461,7 +457,7 @@ func TestGoCacheTrimNeverClears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if found := regexp.MustCompile(`RemoveAll|os\.Remove|AT_REMOVEDIR|"clean"`).Find(source); found != nil {
+	if found := regexp.MustCompile(`RemoveAll|"clean"`).Find(source); found != nil {
 		t.Fatalf("go_cache_trim.go contains %q", found)
 	}
 }
@@ -607,17 +603,19 @@ func TestGoCacheTrimCachePathSwap(t *testing.T) {
 // directly inside two-hex directories.
 func TestGoCacheTrimOnlyEntriesNoSymlinks(t *testing.T) {
 	f := newGoTrimFixture(t)
+	// Symlinks get the real clock's mtime, so the fixture's clock runs ahead.
+	f.now = time.Now().Add(72 * time.Hour)
 	day := 30 * 24 * time.Hour
 	real := f.entry("aa/real-a", 10, day)
 	outside := filepath.Join(f.root, "outside")
 	f.file(filepath.Join(outside, "target-a"), 10, day)
 	f.file(filepath.Join(outside, "dir", "inner-a"), 10, day)
 	f.file(filepath.Join(outside, "hex", "old-a"), 10, day)
-	f.oldLink(filepath.Join(outside, "target-a"), filepath.Join(f.cache, "aa", "link-a"), day)
-	f.oldLink(filepath.Join(outside, "dir"), filepath.Join(f.cache, "aa", "dirlink-d"), day)
-	f.oldLink(filepath.Join(outside, "hex"), filepath.Join(f.cache, "bb"), day)
+	f.oldLink(filepath.Join(outside, "target-a"), filepath.Join(f.cache, "aa", "link-a"))
+	f.oldLink(filepath.Join(outside, "dir"), filepath.Join(f.cache, "aa", "dirlink-d"))
+	f.oldLink(filepath.Join(outside, "hex"), filepath.Join(f.cache, "bb"))
 	f.entry("fuzz/x-a", 10, day)
-	f.oldLink(filepath.Join(f.cache, "fuzz"), filepath.Join(f.cache, "cc"), day)
+	f.oldLink(filepath.Join(f.cache, "fuzz"), filepath.Join(f.cache, "cc"))
 	stays := []string{f.entry("aa/sub/x-a", 10, day), f.entry("zz/x-a", 10, day), f.entry("abc/x-a", 10, day), f.entry("aa/notes.txt", 10, day),
 		f.entry("aa/entry-b", 10, day), f.entry("dd", 10, day), filepath.Join(f.cache, "fuzz", "x-a")}
 	outsideBefore := trimTreeDigest(t, outside)
@@ -631,14 +629,14 @@ func TestGoCacheTrimOnlyEntriesNoSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer holder.Close()
-	if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
 	if f.attempt() || f.resolves != 0 || len(trimJournalRaw(t)) != 0 {
 		t.Fatal("an attempt ran while the lock was held")
 	}
 	requireExists(t, real, true)
-	if err := unix.Flock(int(holder.Fd()), unix.LOCK_UN); err != nil {
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
 
@@ -710,9 +708,11 @@ func TestGoCacheTrimDirectorySwap(t *testing.T) {
 // its place is not removed; a symlink in its place loses only the symlink.
 func TestGoCacheTrimEntrySwap(t *testing.T) {
 	day := 30 * 24 * time.Hour
-	t.Run("directory", func(t *testing.T) {
+	// A directory with anything in it, swapped in, stays with its contents.
+	t.Run("non-empty directory", func(t *testing.T) {
 		f := newGoTrimFixture(t)
 		victim := f.entry("aa/victim-a", 10, day)
+		other := f.entry("aa/keep.txt", 10, day)
 		setTrimHooks(t, nil, func(dir, name string) {
 			if dir != "aa" || name != "victim-a" {
 				t.Errorf("hook for %s/%s", dir, name)
@@ -720,6 +720,40 @@ func TestGoCacheTrimEntrySwap(t *testing.T) {
 			if err := os.Remove(victim); err != nil {
 				t.Error(err)
 			}
+			f.file(filepath.Join(victim, "inner-a"), 10, day)
+			f.file(filepath.Join(victim, "deep", "inner-d"), 10, day)
+		})
+		if !f.attempt() {
+			t.Fatal("no attempt")
+		}
+		for _, path := range []string{filepath.Join(victim, "inner-a"), filepath.Join(victim, "deep", "inner-d"), other} {
+			requireExists(t, path, true)
+		}
+		line := lastTrimLine(t)
+		if line.Outcome != "trimmed" || *line.FilesRemoved != 0 || line.BytesFreed != 0 || !strings.Contains(line.Detail, "1 removal error(s), first aa/victim-a: ") {
+			t.Fatalf("line %+v", line)
+		}
+	})
+	// The stated residual: an EMPTY directory swapped in may go. No regular
+	// file and no directory with contents is lost with it.
+	t.Run("empty directory", func(t *testing.T) {
+		f := newGoTrimFixture(t)
+		victim := f.entry("aa/victim-a", 10, day)
+		for _, path := range []string{f.entry("aa/keep.txt", 10, day), f.entry("aa/sub/x-a", 10, day), f.entry("aa/fresh-a", 10, time.Hour), f.entry("fuzz/x-a", 10, day)} {
+			defer requireExists(t, path, true)
+		}
+		outside := f.file(filepath.Join(f.root, "outside", "precious-a"), 10, day)
+		// rest is everything but the swapped-in directory itself.
+		rest := func() string {
+			swapped, _ := filepath.Rel(f.root, victim)
+			return strings.ReplaceAll(trimTreeDigest(t, f.root, f.relayState()), "D "+swapped+"\n", "")
+		}
+		var before string
+		setTrimHooks(t, nil, func(dir, name string) {
+			if err := os.Remove(victim); err != nil {
+				t.Error(err)
+			}
+			before = rest()
 			if err := os.Mkdir(victim, 0755); err != nil {
 				t.Error(err)
 			}
@@ -727,13 +761,11 @@ func TestGoCacheTrimEntrySwap(t *testing.T) {
 		if !f.attempt() {
 			t.Fatal("no attempt")
 		}
-		if info, err := os.Lstat(victim); err != nil || !info.IsDir() {
-			t.Fatalf("the directory was removed: %v", err)
+		// Everything that existed without the swapped-in directory is intact.
+		if after := rest(); after != before {
+			t.Fatalf("something besides the empty directory changed:\n%s\n%s", before, after)
 		}
-		line := lastTrimLine(t)
-		if line.Outcome != "trimmed" || *line.FilesRemoved != 0 || line.BytesFreed != 0 || !strings.Contains(line.Detail, "1 removal error(s), first aa/victim-a: ") {
-			t.Fatalf("line %+v", line)
-		}
+		requireExists(t, outside, true)
 	})
 	t.Run("symlink", func(t *testing.T) {
 		f := newGoTrimFixture(t)

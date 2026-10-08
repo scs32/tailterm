@@ -534,9 +534,15 @@ and it never touches the module cache (`~/go/pkg/mod`) or any other cache.
 - Only regular files whose names end `-a` or `-d`, directly inside the cache's
   two-hex-digit directories (`00` to `ff`), are removed. The cache directory,
   every directory in it, `README`, `trim.txt`, `fuzz` and any other name stay.
-- No symlink is followed. The cache and each two-hex directory are opened once
-  and all work is relative to those open directories, so a path swapped for a
-  symlink during a run redirects nothing.
+- No symlink is followed. The cache and each two-hex directory are opened once,
+  only when the name is a real directory, and all work is relative to those
+  open directories, so a path swapped for a symlink during a run redirects
+  nothing.
+- One window remains, between the last look at an old entry and its removal.
+  An entry replaced there by a symlink loses the symlink, never its target,
+  and one replaced by an empty directory loses that empty directory. No
+  regular file other than an old entry, and no directory with anything in it,
+  can be removed.
 - One trim runs at a time on a host (`go-cache-trim.lock` in the relay state
   directory). A skipped or failed attempt is tried again 5 minutes later.
 

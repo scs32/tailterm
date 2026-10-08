@@ -5,22 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The Go build cache trim. On a host whose owner turned it on in
 // ~/.config/tailterm/relay.json, the relay unlinks build cache entries unused
 // for longer than a set age, in the same pass as the scheduled sweep and
 // before it. It never empties the cache: only old regular entry files directly
-// inside the cache's two-hex-digit directories go, and every directory, the
-// README, trim.txt and the module cache stay. Each run adds one line to the
+// inside the cache's two-hex-digit directories go, and the cache directory,
+// the README, trim.txt and the module cache stay. Each run adds one line to the
 // sweep's journal and posts nothing; the sweep's low-space notice carries the
 // last run's numbers.
 
@@ -166,46 +167,80 @@ func goCacheTrimJournalText(l sweepJournalLine) string {
 
 // Test hooks, nil in production. goCacheTrimAfterList runs after the
 // top-level listing and before each two-hex directory is opened;
-// goCacheTrimBeforeUnlink runs between an entry's second look and its unlink.
+// goCacheTrimBeforeUnlink runs between an entry's second look and its removal.
 var (
 	goCacheTrimAfterList    func(name string)
 	goCacheTrimBeforeUnlink func(dir, name string)
 )
 
-const goCacheDirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-
-// goCacheHandle is the cache directory, opened once without following a
-// symlink at its path. All file work is relative to it, so nothing that
-// happens to the path afterwards redirects the trim.
+// goCacheHandle is the cache directory, opened once as a root. All file work
+// is relative to it, so nothing that happens to the path afterwards redirects
+// the trim.
 type goCacheHandle struct {
-	dir *os.File
+	root *os.Root
 }
 
-func (h *goCacheHandle) fd() int { return int(h.dir.Fd()) }
+func (h *goCacheHandle) close() { _ = h.root.Close() }
 
-func (h *goCacheHandle) close() { _ = h.dir.Close() }
-
+// openGoBuildCache opens dir as a root, and only if the name is a real
+// directory: the opened directory must be the file a no-follow look at the
+// path saw, so a symlink at the path, or one put there in between, fails.
 func openGoBuildCache(dir string) (*goCacheHandle, error) {
-	fd, err := openNoFollow(unix.AT_FDCWD, dir, goCacheDirFlags)
+	seen, err := os.Lstat(dir)
 	if err != nil {
 		return nil, err
 	}
-	return &goCacheHandle{dir: os.NewFile(uintptr(fd), dir)}, nil
-}
-
-func openNoFollow(dirFD int, name string, flags int) (int, error) {
-	for {
-		fd, err := unix.Openat(dirFD, name, flags, 0)
-		if err != unix.EINTR {
-			return fd, err
-		}
+	if !seen.IsDir() {
+		return nil, errors.New("not a directory")
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(seen, opened) {
+		_ = root.Close()
+		return nil, errors.New("the path changed while it was opened")
+	}
+	return &goCacheHandle{root: root}, nil
 }
 
-func isRegular(st *unix.Stat_t) bool { return uint32(st.Mode)&unix.S_IFMT == unix.S_IFREG }
+// openGoCacheDirectory opens one name inside parent as its own root, under
+// the same rule: a real directory, and the same file the no-follow look saw.
+// It returns nil for anything else, including a name that has gone.
+func openGoCacheDirectory(parent *os.Root, name string) (*os.Root, error) {
+	seen, err := parent.Lstat(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !seen.IsDir() {
+		return nil, nil
+	}
+	sub, err := parent.OpenRoot(name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if opened, err := sub.Stat("."); err != nil || !os.SameFile(seen, opened) {
+		_ = sub.Close()
+		return nil, nil
+	}
+	return sub, nil
+}
 
-func sameFile(a, b *unix.Stat_t) bool {
-	return uint64(a.Dev) == uint64(b.Dev) && uint64(a.Ino) == uint64(b.Ino)
+func rootNames(root *os.Root) ([]string, error) {
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	sort.Strings(names)
+	return names, err
 }
 
 func isTwoHex(name string) bool {
@@ -239,18 +274,23 @@ func validateGoBuildCache(cache *goCacheHandle, dir, modCache string) string {
 	if modCache == "" || !filepath.IsAbs(modCache) {
 		return "the module cache path is unknown"
 	}
-	readme, err := openNoFollow(cache.fd(), "README", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC)
+	seen, err := cache.root.Lstat("README")
 	if err != nil {
 		return "no README"
 	}
-	file := os.NewFile(uintptr(readme), "README")
-	defer file.Close()
-	var st unix.Stat_t
-	if err := unix.Fstat(readme, &st); err != nil || !isRegular(&st) {
+	if !seen.Mode().IsRegular() {
+		return "README is not a regular file"
+	}
+	readme, err := cache.root.Open("README")
+	if err != nil {
+		return "README cannot be read"
+	}
+	defer readme.Close()
+	if opened, err := readme.Stat(); err != nil || !os.SameFile(seen, opened) {
 		return "README is not a regular file"
 	}
 	head := make([]byte, len(goCacheReadmeLine)+1)
-	n, _ := file.Read(head)
+	n, _ := io.ReadFull(readme, head)
 	head = head[:n]
 	if string(head) != goCacheReadmeLine && string(head) != goCacheReadmeLine+"\n" {
 		return "README is not the Go build cache's"
@@ -265,21 +305,21 @@ func validateGoBuildCache(cache *goCacheHandle, dir, modCache string) string {
 	if pathHolds(realMod, real) {
 		return "the path is inside the module cache"
 	}
-	var self, other unix.Stat_t
-	if err := unix.Fstat(cache.fd(), &self); err != nil {
+	self, err := cache.root.Stat(".")
+	if err != nil {
 		return "the directory cannot be read"
 	}
-	if unix.Stat(home, &other) == nil && sameFile(&self, &other) {
+	if other, err := os.Stat(home); err == nil && os.SameFile(self, other) {
 		return "the directory is the home directory"
 	}
-	if unix.Stat(modCache, &other) == nil && sameFile(&self, &other) {
+	if other, err := os.Stat(modCache); err == nil && os.SameFile(self, other) {
 		return "the directory is the module cache"
 	}
 	return ""
 }
 
 type goCacheTrimResult struct {
-	// FilesRemoved counts successful unlinks and BytesFreed their sizes.
+	// FilesRemoved counts successful removals and BytesFreed their sizes.
 	FilesRemoved int64
 	BytesFreed   int64
 	// CacheBytesAfter is the apparent size of the regular files left directly
@@ -301,22 +341,23 @@ func (r *goCacheTrimResult) fail(what string, err error) {
 	}
 }
 
-// trimGoBuildCache unlinks the entries of an opened cache whose mtime is more
-// than maxAge before now. It opens only two-hex directories, each without
-// following a symlink, and in them looks only at regular files named as go
-// names entries (ending -a or -d). The unlink is unlinkat with no flags,
-// which cannot take a directory. It never descends further.
+// trimGoBuildCache removes the entries of an opened cache whose mtime is more
+// than maxAge before now. It opens only two-hex directories, each as its own
+// root and only when the name is a real directory, and in them looks only at
+// regular files named as go names entries (ending -a or -d). It never
+// descends further, and a root cannot reach outside its directory.
 //
-// One window remains: an entry swapped for a symlink between its second look
-// and the unlink loses that symlink; the symlink's target is not touched.
+// One window remains, between an entry's second look and its removal: an
+// entry swapped there for a symlink loses that symlink, never its target, and
+// one swapped for an empty directory loses that empty directory. No regular
+// file other than an old entry and no directory with anything in it can go.
 func trimGoBuildCache(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time) goCacheTrimResult {
 	var res goCacheTrimResult
-	names, err := cache.dir.Readdirnames(-1)
+	names, err := rootNames(cache.root)
 	if err != nil {
 		res.WalkError = err.Error()
 		return res
 	}
-	sort.Strings(names)
 	for _, name := range names {
 		if !isTwoHex(name) {
 			continue
@@ -328,73 +369,73 @@ func trimGoBuildCache(ctx context.Context, cache *goCacheHandle, maxAge time.Dur
 		if hook := goCacheTrimAfterList; hook != nil {
 			hook(name)
 		}
-		fd, err := openNoFollow(cache.fd(), name, goCacheDirFlags)
+		sub, err := openGoCacheDirectory(cache.root, name)
 		if err != nil {
-			// A symlink, a file, or a name that has gone is not a cache directory.
-			if err != unix.ELOOP && err != unix.ENOTDIR && err != unix.ENOENT {
-				res.fail(name, err)
-			}
+			res.fail(name, err)
 			continue
 		}
-		sub := os.NewFile(uintptr(fd), name)
+		if sub == nil {
+			// A symlink, a file, or a name that has gone is not a cache directory.
+			continue
+		}
 		trimGoCacheDirectory(sub, name, maxAge, now, &res)
 		_ = sub.Close()
 	}
 	return res
 }
 
-func trimGoCacheDirectory(sub *os.File, dir string, maxAge time.Duration, now time.Time, res *goCacheTrimResult) {
-	names, err := sub.Readdirnames(-1)
+func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now time.Time, res *goCacheTrimResult) {
+	names, err := rootNames(sub)
 	if err != nil {
 		res.fail(dir, err)
 		return
 	}
-	sort.Strings(names)
-	fd := int(sub.Fd())
-	old := func(st *unix.Stat_t) bool {
-		return now.Sub(time.Unix(int64(st.Mtim.Sec), int64(st.Mtim.Nsec))) > maxAge
-	}
 	for _, name := range names {
-		var st unix.Stat_t
+		// look is a no-follow stat: the size of a regular file, or false.
+		var size int64
+		var mtime time.Time
 		look := func() bool {
-			if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-				if err != unix.ENOENT {
+			info, err := sub.Lstat(name)
+			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
 					res.fail(dir+"/"+name, err)
 				}
 				return false
 			}
-			return isRegular(&st)
+			size, mtime = info.Size(), info.ModTime()
+			return info.Mode().IsRegular()
 		}
+		old := func() bool { return now.Sub(mtime) > maxAge }
 		if !look() {
 			continue
 		}
-		if !(strings.HasSuffix(name, "-a") || strings.HasSuffix(name, "-d")) || !old(&st) {
-			res.CacheBytesAfter += st.Size
+		if !(strings.HasSuffix(name, "-a") || strings.HasSuffix(name, "-d")) || !old() {
+			res.CacheBytesAfter += size
 			continue
 		}
-		// A second look just before the unlink: a build may have used the
+		// A second look just before the removal: a build may have used the
 		// entry, or something else may have taken its name.
 		if !look() {
 			continue
 		}
-		if !old(&st) {
-			res.CacheBytesAfter += st.Size
+		if !old() {
+			res.CacheBytesAfter += size
 			continue
 		}
 		if hook := goCacheTrimBeforeUnlink; hook != nil {
 			hook(dir, name)
 		}
-		size := st.Size
-		switch err := unix.Unlinkat(fd, name, 0); err {
-		case nil:
+		freed := size
+		switch err := sub.Remove(name); {
+		case err == nil:
 			res.FilesRemoved++
-			res.BytesFreed += size
-		case unix.ENOENT:
+			res.BytesFreed += freed
+		case errors.Is(err, fs.ErrNotExist):
 			// go's own trim got there first.
 		default:
 			res.fail(dir+"/"+name, err)
 			if look() {
-				res.CacheBytesAfter += st.Size
+				res.CacheBytesAfter += size
 			}
 		}
 	}
@@ -463,11 +504,11 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		return false
 	}
 	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		// Another trim is running; it writes the receipt.
 		return false
 	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
 	var zero, removed, cacheBytes int64
 	line := sweepJournalLine{At: now.UTC().Format(time.RFC3339Nano), Source: goCacheTrimSource, Kept: map[string]int{}, FreeBytesAfter: -1,
