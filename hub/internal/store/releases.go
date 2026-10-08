@@ -737,8 +737,8 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		if hash != prior {
 			return zero, releaseConflict("retry changed")
 		}
-		err = json.Unmarshal([]byte(raw), &zero)
-		return zero, err
+		// A compact receipt names its check lists; they are filled back in.
+		return rebuildReleaseJob(ctx, tx, []byte(raw))
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
@@ -1146,7 +1146,16 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			return zero, err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(b)); err != nil {
+	// The receipt holds the job without its check lists; each list is stored
+	// once and named by its digest.
+	record, lists, err := compactReleaseJob(j)
+	if err != nil {
+		return zero, err
+	}
+	if err = insertReleaseCheckLists(ctx, tx, lists); err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(record)); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(); err != nil {

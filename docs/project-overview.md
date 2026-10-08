@@ -604,6 +604,41 @@ Fullscreen uses the browser Fullscreen API for the whole UI. Expand changes the
 workspace view by hiding the sidebar. The two controls are independent. Files is
 hidden, but SFTP remains in use for project-folder selection and uploads.
 
+## Storage rules for repeated documents
+
+The hub keeps one copy of five kinds of document. `hub/internal/store/retention.go`
+holds the helpers. Every reader accepts the older form as well, and no existing
+row is rewritten.
+
+| Table                     | Stored from this release on                                                                                                                                                           | Reader                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `usage_turns`             | `payload` is empty; the turn is in `projection.turn`, written as before.                                                                                                              | The revision check takes the turn from `projection.turn` when `payload` is empty.                             |
+| `usage_turn_revisions`    | Only a revision that has been replaced, with the revision number, payload and projection `usage_turns` held. The current revision is in `usage_turns` only.                           | None.                                                                                                         |
+| `usage_receipts`          | `payload` is `sha256:` and the hash of the upload batch.                                                                                                                              | A retry is compared by hash when the stored value starts `sha256:`, byte for byte otherwise.                  |
+| `release_action_receipts` | The job with each non-empty check list replaced by an empty array, and a storage-only `checkLists` member naming each list's hash. The lists are in `release_check_lists`, once each. | A retry fills the lists back in. A named list that is not stored is an error, never an empty list.            |
+| `team_queue_requests`     | The entry without `launch`, and `launch_digest` holding the hash of the plan as it stood.                                                                                             | A retry with a hash replies with the plan `team_queue_entries.launch_json` holds now, or none if it has none. |
+
+Rules for a change to any of these:
+
+- A hash is SHA-256, lower-case hex, of the exact bytes that would otherwise have
+  been stored.
+- Add no column to `usage_turns`, `usage_turn_revisions`, `usage_receipts` or
+  `release_action_receipts`. The hub inserts into them by position, and the
+  previous hub must keep working after a rollback.
+- Never change how `usage_turns.projection` is built or stored, or how the hub
+  writes `usage_item_shares`, `usage_spans`, `usage_budget_warnings`,
+  `usage_entry_warnings` and `usage_warning_settings`. The usage view and the
+  token guardrails read those.
+- `release_action_receipts` and `release_check_lists` take inserts only. Their
+  triggers refuse every update and delete.
+- No test and no log prints a batch, a turn, a check list, a launch plan or a
+  message body. Tests compare lengths, counts and hashes.
+
+After a rollback the previous hub still reports usage, budgets and the audit
+export correctly. It refuses a re-report of a turn, and a retry of a batch, that
+this hub stored. It replays a release action or a queue request that this hub
+answered without the check lists or the launch plan.
+
 ## Validation and known limits
 
 Unit tests cover encryption, schemas, matching, lifecycle, command quoting, and

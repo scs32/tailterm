@@ -8,6 +8,9 @@ func migrate(db *sql.DB) error {
 	if err := migrateReleaseJobs(db); err != nil {
 		return err
 	}
+	if err := migrateRetention(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec(verificationSchema); err != nil {
 		return err
 	}

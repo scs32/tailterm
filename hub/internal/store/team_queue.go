@@ -153,13 +153,22 @@ func migrateTeamQueue(db *sql.DB) error {
 		}
 	}
 	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS team_queue_entries (` + teamQueueEntryColumnsSQL + `);
- CREATE TABLE IF NOT EXISTS team_queue_requests(task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result_json BLOB NOT NULL,PRIMARY KEY(task_id,request_id));
+ CREATE TABLE IF NOT EXISTS team_queue_requests(task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,result_json BLOB NOT NULL,launch_digest TEXT NOT NULL DEFAULT '',PRIMARY KEY(task_id,request_id));
  CREATE TABLE IF NOT EXISTS team_launch_reservations(task_id TEXT NOT NULL REFERENCES tasks(id),entry_id TEXT NOT NULL DEFAULT '',item_id TEXT NOT NULL, token TEXT NOT NULL,
  pause_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','launching','running')), created_at TEXT NOT NULL,PRIMARY KEY(task_id,entry_id));`)
 	if err != nil {
 		return err
 	}
 	var n int
+	// A request result is stored without its launch plan; this is its hash.
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_requests') WHERE name='launch_digest'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err = tx.Exec(`ALTER TABLE team_queue_requests ADD COLUMN launch_digest TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
 	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_entries') WHERE name='released_at'`).Scan(&n); err != nil {
 		return err
 	}
@@ -1165,9 +1174,9 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 	hash := hex.EncodeToString(h[:])
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	var oldHash string
+	var oldHash, launchDigest string
 	var old []byte
-	err := s.db.QueryRowContext(ctx, `SELECT payload_hash,result_json FROM team_queue_requests WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&oldHash, &old)
+	err := s.db.QueryRowContext(ctx, `SELECT payload_hash,result_json,launch_digest FROM team_queue_requests WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&oldHash, &old, &launchDigest)
 	if err == nil {
 		if oldHash != hash {
 			return zero, fmt.Errorf("%w: team queue retry differs", api.ErrConflict)
@@ -1179,8 +1188,17 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 		}
 		var e api.TeamQueueEntry
-		err = json.Unmarshal(old, &e)
-		return e, err
+		if err = json.Unmarshal(old, &e); err != nil {
+			return zero, err
+		}
+		if launchDigest != "" {
+			// The result was stored without its launch plan: reply with the
+			// plan the entry holds now.
+			if err = refillQueueResult(ctx, s.db, &e); err != nil {
+				return zero, err
+			}
+		}
+		return e, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
@@ -2308,8 +2326,12 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, err
 		}
 	}
-	encoded, _ := json.Marshal(e)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO team_queue_requests(task_id,request_id,payload_hash,result_json) VALUES(?,?,?,?)`, task, req.RequestID, hash, encoded); err != nil {
+	// The launch plan stays in the entry; the stored result keeps its hash.
+	encoded, launchDigest, err := compactQueueResult(e)
+	if err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO team_queue_requests(task_id,request_id,payload_hash,result_json,launch_digest) VALUES(?,?,?,?,?)`, task, req.RequestID, hash, encoded, launchDigest); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(); err != nil {

@@ -201,7 +201,8 @@ func TestUsageSharedConservationOverheadReceiptsAndClosure(t *testing.T) {
 	path := s.db
 	_ = path
 	var n int
-	if err = s.db.QueryRow(`SELECT count(*) FROM usage_turn_revisions`).Scan(&n); err != nil || n != 3 {
+	// Three new turns and no revision of any: nothing is superseded.
+	if err = s.db.QueryRow(`SELECT count(*) FROM usage_turn_revisions`).Scan(&n); err != nil || n != 0 {
 		t.Fatal(n, err)
 	}
 }
@@ -909,7 +910,8 @@ func TestUsageRecordedTurnsReclassifiedOnRead(t *testing.T) {
 	f.requests("builder", 6*m, 2)
 	// Rewrite every stored projection the way the previous classifier recorded
 	// these requests: hand-offs, whatever the builder was doing.
-	for _, table := range []string{"usage_turns", "usage_turn_revisions"} {
+	// No turn here was revised, so only usage_turns holds rows.
+	for table, want := range map[string]int{"usage_turns": 55, "usage_turn_revisions": 0} {
 		rows, err := f.s.db.Query(`SELECT rowid,projection FROM ` + table)
 		if err != nil {
 			t.Fatal(err)
@@ -930,7 +932,7 @@ func TestUsageRecordedTurnsReclassifiedOnRead(t *testing.T) {
 			stored[id] = string(old)
 		}
 		rows.Close()
-		if len(stored) != 55 {
+		if len(stored) != want {
 			t.Fatalf("%s: %d rows", table, len(stored))
 		}
 		for id, raw := range stored {
@@ -940,7 +942,7 @@ func TestUsageRecordedTurnsReclassifiedOnRead(t *testing.T) {
 		}
 	}
 	before := usageLedgerRows(t, f.s)
-	if len(before) != 110 || strings.Contains(strings.Join(before, "\n"), `"phase":"build"`) {
+	if len(before) != 55 || strings.Contains(strings.Join(before, "\n"), `"phase":"build"`) {
 		t.Fatal("fixture rows must all be stored as hand-offs", len(before))
 	}
 	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{})

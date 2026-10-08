@@ -147,7 +147,7 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	var prior, receipt, priorAgent, priorRun string
 	err = tx.QueryRowContext(ctx, `SELECT payload,receipt,agent_id,run_id FROM usage_receipts WHERE task_id=? AND request_id=?`, task, b.RequestID).Scan(&prior, &receipt, &priorAgent, &priorRun)
 	if err == nil {
-		if prior != string(raw) || priorAgent != agent || priorRun != b.RunID {
+		if !sameUsageBatch(prior, raw) || priorAgent != agent || priorRun != b.RunID {
 			return zero, api.ErrConflict
 		}
 		err = json.Unmarshal([]byte(receipt), &zero)
@@ -185,13 +185,21 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	// Items whose attributed usage this batch added or revised.
 	touched := map[string]bool{}
 	for _, t := range b.Turns {
-		payload, _ := json.Marshal(t)
+		var oldRevision int64
 		var oldPayload, oldProjection string
-		err = tx.QueryRowContext(ctx, `SELECT payload,projection FROM usage_turns WHERE task_id=? AND agent_id=? AND run_id=? AND request_id=?`, task, agent, b.RunID, t.ID).Scan(&oldPayload, &oldProjection)
+		err = tx.QueryRowContext(ctx, `SELECT revision,payload,projection FROM usage_turns WHERE task_id=? AND agent_id=? AND run_id=? AND request_id=?`, task, agent, b.RunID, t.ID).Scan(&oldRevision, &oldPayload, &oldProjection)
 		var projection api.UsageProjection
 		if err == nil {
+			// A turn is stored once, in its projection; a row written before
+			// that also holds it as the payload.
 			var old api.UsageTurn
-			if json.Unmarshal([]byte(oldPayload), &old) != nil {
+			if oldPayload == "" {
+				var stored api.UsageProjection
+				if json.Unmarshal([]byte(oldProjection), &stored) != nil {
+					return zero, api.ErrConflict
+				}
+				old = stored.Turn
+			} else if json.Unmarshal([]byte(oldPayload), &old) != nil {
 				return zero, api.ErrConflict
 			}
 			if reflect.DeepEqual(old, t) {
@@ -202,6 +210,11 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 			}
 			if json.Unmarshal([]byte(oldProjection), &projection) != nil {
 				return zero, api.ErrConflict
+			}
+			// Only the revision being replaced is kept as history; one stored
+			// by an earlier hub is already there.
+			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_turn_revisions VALUES(?,?,?,?,?,?,?)`, task, agent, b.RunID, t.ID, oldRevision, oldPayload, oldProjection); err != nil {
+				return zero, err
 			}
 			// Only explicitly provisional requests can finalize their handled set.
 			if !reflect.DeepEqual(old.Handled, t.Handled) {
@@ -219,11 +232,7 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 			return zero, err
 		}
 		encoded, _ := json.Marshal(projection)
-		_, err = tx.ExecContext(ctx, `INSERT INTO usage_turn_revisions VALUES(?,?,?,?,?,?,?)`, task, agent, b.RunID, t.ID, t.Revision, string(payload), string(encoded))
-		if err != nil {
-			return zero, err
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO usage_turns VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,agent_id,run_id,request_id) DO UPDATE SET revision=excluded.revision,at=excluded.at,payload=excluded.payload,projection=excluded.projection`, task, agent, b.RunID, t.ID, t.Revision, ts(t.At), string(payload), string(encoded))
+		_, err = tx.ExecContext(ctx, `INSERT INTO usage_turns VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task_id,agent_id,run_id,request_id) DO UPDATE SET revision=excluded.revision,at=excluded.at,payload=excluded.payload,projection=excluded.projection`, task, agent, b.RunID, t.ID, t.Revision, ts(t.At), "", string(encoded))
 		if err != nil {
 			return zero, err
 		}
@@ -250,7 +259,7 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 	}
 	zero = api.UsageReceipt{RequestID: b.RequestID, Turns: len(b.Turns), Spans: len(b.Spans)}
 	encoded, _ := json.Marshal(zero)
-	_, err = tx.ExecContext(ctx, `INSERT INTO usage_receipts VALUES(?,?,?,?,?,?)`, task, b.RequestID, agent, b.RunID, string(raw), string(encoded))
+	_, err = tx.ExecContext(ctx, `INSERT INTO usage_receipts VALUES(?,?,?,?,?,?)`, task, b.RequestID, agent, b.RunID, usageBatchHash(raw), string(encoded))
 	if err != nil {
 		return api.UsageReceipt{}, err
 	}
