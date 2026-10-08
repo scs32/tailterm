@@ -33,13 +33,17 @@ backend.stderr.on("data", (chunk) => { childStderr = (childStderr + chunk.toStri
 const childClosed = once(backend, "close").catch(() => []);
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><div id="workspace"><aside><button id="profile-sync"><span class="nav-label">Profile sync</span></button></aside><main><header>Profile check</header><div id="status"></div></main></div><dialog id="dialog"></dialog></div><script type="module">
 import * as vault from '/client/local-vault.js';import {createProfileSync} from '/client/profile-sync.js';import {confirmDialog} from '/client/confirm-dialog.js';
-let online=false, sync, requests=0, unavailable=false, gate=null, release=null, held=0;
-const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(gate){held++;await gate}if(unavailable)throw new Error("Host temporarily unavailable");return fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
-window.qa={vault,async holdSync(){gate=new Promise(r=>release=r);while(!held){void sync.connected();await new Promise(r=>setTimeout(r,10))}},releaseOffline(){online=false;gate=null;held=0;release()},unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
+let online=false, sync, requests=0, unavailable=false, gate=null, release=null, held=0, settled=0, stalled=false;
+const host={getIPN:()=>online?{fetch:async(url,init)=>{requests++;if(stalled)await new Promise(()=>{});const gated=!!gate;if(gated){held++;await gate}try{if(unavailable)throw new Error("Host temporarily unavailable");return await fetch(url.replace('http://profile-fixture:18765',location.origin+'/profile-hub'),init)}finally{if(gated)settled++}}}:null,getPeers:()=>[{name:'profile-fixture.',online:true}],getData:()=>vault.localData(),getAppearance:()=>({theme:'default',font:'system',idleMinutes:15}),connect(){},notice:text=>document.querySelector('#status').textContent=text,download(){},confirm:(title,message)=>confirmDialog({title,message}),reloadData:async()=>{},dialog:(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>d.close();d.showModal()}};
+window.qa={vault,async holdSync(ms=15000){gate=new Promise(r=>release=r);settled=0;const deadline=Date.now()+ms;while(!held){if(Date.now()>deadline){gate=null;release();const p=vault.localData().profile||{};throw new Error('holdSync: no sync request reached the gate within '+ms+' ms: '+JSON.stringify({requests,online,stalled,unavailable,hub:!!p.hub,revision:p.revision,dirty:p.dirty,masterKey:!!vault.profileMasterKey(),status:document.querySelector('#profile-sync-status')?.textContent}))}void sync.connected();await new Promise(r=>setTimeout(r,10))}},offline(){online=false},releaseSync(){gate=null;held=0;release()},held:()=>held,settled:()=>settled,stall(){stalled=true},unavailable:value=>unavailable=value,async unlock(username,password){await vault.localAPI('/unlock','POST',{username,password});sync=createProfileSync(host,vault);document.querySelector('#profile-sync').onclick=()=>sync.show();},online:async(value)=>{online=value;return sync.connected()},show:()=>sync.show(),data:()=>vault.localData(),requests:()=>requests,stop:()=>sync.stop(),async addServer(name,password){await vault.localAPI('/servers','POST',{name,host:'test.example',port:22,username:'test',mode:'ssh'});await vault.rememberCredential(vault.localData().servers.at(-1).id,{password})},async rename(name){const s=vault.localData().servers[0];return vault.localAPI('/servers','POST',{...s,name})},async configure(){await vault.localAPI('/hub','POST',{url:location.origin+'/profile-hub',token:'fixture-token-not-live'})}};
 </script></body></html>`;
 let vite;
 let origin;
 const pass = "A sufficiently long profile passphrase";
+// PROFILE_SYNC_INJECT=stalled-fetch makes the run fail on purpose: every sync
+// request then stalls before the gate, which shows that holdSync gives up.
+const inject = process.env.PROFILE_SYNC_INJECT || "";
+assert.ok(["", "stalled-fetch"].includes(inject), "unknown PROFILE_SYNC_INJECT: " + inject);
 try {
 vite = await createVite({
   configFile: false,
@@ -264,8 +268,19 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
       // and the finishing tick replaces the refusal with its own status, so
       // record every status. Hold one tick in flight to make the refusal
       // certain, then release it with B offline, where no tick can start, and
-      // click again once that tick has reported.
+      // click again once that tick has finished. A window focus or
+      // profile-change event also reports a status while the tick is still
+      // running, so a status that is not the refusal is no evidence. The tick
+      // has finished when its held request has settled and a status follows
+      // that an offline event cannot report. Both events are sent while the
+      // tick is held to show they do not satisfy the wait.
       const refusal = "Profile sync is already running. Try again shortly.";
+      const waiting = "Saved locally · waiting for Tailscale";
+      const tickFinished = (eventStatuses) =>
+        qa.settled() > 0 &&
+        window.statuses
+          .slice(window.released)
+          .some((s) => !eventStatuses.includes(s));
       await b.evaluate(() => {
         const status = document.querySelector("#profile-sync-status");
         window.statuses = [];
@@ -274,6 +289,7 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
         ).observe(status, { childList: true });
       });
       try {
+        if (inject === "stalled-fetch") await b.evaluate(() => qa.stall());
         await b.evaluate(() => qa.holdSync());
         await b.locator("#profile-disconnect").click();
         await b.waitForFunction((r) => window.statuses.includes(r), refusal);
@@ -281,14 +297,41 @@ origin = "http://127.0.0.1:" + vite.httpServer.address().port;
           await b.evaluate(() => qa.data().profile.hub),
           "disconnect must be refused while sync is running",
         );
-        await b.evaluate(() => qa.releaseOffline());
-        await b.waitForFunction((r) => window.statuses.at(-1) !== r, refusal);
+        await b.evaluate(() => {
+          qa.offline();
+          window.released = window.statuses.length;
+          for (const name of ["focus", "tailterm-profile-change"])
+            window.dispatchEvent(new Event(name));
+        });
+        await b.waitForFunction(
+          (w) => window.statuses.slice(window.released).includes(w),
+          waiting,
+        );
+        assert.deepEqual(
+          await b.evaluate(() => [
+            qa.held(),
+            qa.settled(),
+            window.statuses.at(-1),
+          ]),
+          [1, 0, waiting],
+          "the events must report while the sync is still held",
+        );
+        assert.equal(
+          await b.evaluate(tickFinished, [refusal, waiting]),
+          false,
+          "an event status must not count as the held sync finishing",
+        );
+        await b.evaluate(() => qa.releaseSync());
+        await b.waitForFunction(tickFinished, [refusal, waiting]);
         await b.locator("#profile-disconnect").click();
         await b.waitForFunction(() => !qa.data().profile.hub);
       } catch (error) {
         const observed = await b.evaluate(() => ({
           status: document.querySelector("#profile-sync-status")?.textContent,
           statuses: window.statuses,
+          released: window.released,
+          held: qa.held(),
+          settled: qa.settled(),
           hub: !!qa.data().profile.hub,
           autoRestore: qa.data().profile.autoRestore,
           revision: qa.data().profile.revision,
