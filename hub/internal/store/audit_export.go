@@ -105,6 +105,14 @@ var allocationIntentExportQueries = []exportQuery{
 	{"agentAllocationIntents", `SELECT agent_id,target_task_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,team_role,context_digest,author_agent_id,author_run_id,expected_run_id,expected_launcher_agent_id,expected_launcher_run_id,request_id,created_by_node,created_by_user,created_at,consumed_at,consumed_by_run_id,launcher_agent_id,launcher_run_id,invalidated_at,invalidated_pause_generation FROM agent_allocation_intents WHERE target_task_id=? ORDER BY created_at,agent_id`, oneArg},
 }
 
+// workItemEstimateExportQueries is format-3-only for the same reason: the
+// work_item_estimates table postdates format 2. It carries who set which
+// estimate and when; receipt_id joins to workItemUpdateReceipts. Columns are
+// named so a later column cannot change the export unnoticed.
+var workItemEstimateExportQueries = []exportQuery{
+	{"workItemEstimates", `SELECT seq,receipt_id,task_id,item_id,item_revision,tokens,basis,agent_id,run_id,by_node,by_user,request_id,created_at FROM work_item_estimates WHERE task_id=? ORDER BY seq`, oneArg},
+}
+
 var projectPauseExportQueries = []exportQuery{
 	{"projectPauseTaskState", `SELECT id,pause_state,lifecycle_generation,pause_generation,paused_at FROM tasks WHERE id=?`, oneArg},
 	{"projectPauseCycles", `SELECT * FROM project_pause_cycles WHERE task_id=? ORDER BY pause_generation`, oneArg},
@@ -472,6 +480,7 @@ func (s *Store) CreateAuditExport(ctx context.Context, taskID string, req api.Cr
 	queries := exportQueries
 	if req.FormatVersion == api.AuditExportFormatVersion {
 		queries = append(append(append(append([]exportQuery(nil), exportQueries...), allocationIntentExportQueries...), projectPauseExportQueries...), queueExportQueries...)
+		queries = append(queries, workItemEstimateExportQueries...)
 		queries = append(queries, phaseSuccessorExportQueries[:2]...)
 		legacyPresent, err := hasLegacyPhaseSuccessorTables(ctx, tx)
 		if err != nil {

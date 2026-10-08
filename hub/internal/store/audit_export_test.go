@@ -304,6 +304,109 @@ func TestAuditExportAllocationIntentStreamOnlyInV3(t *testing.T) {
 	}
 }
 
+// TestAuditExportEstimateHistoryOnlyInV3 holds the estimate history stream
+// (wi_9e0f1615ffa97c71): every work_item_estimates row of the project, in
+// save order, with the stored setter and receipt provenance. The table
+// postdates format 2, so format 2 stays unchanged and omits it.
+func TestAuditExportEstimateHistoryOnlyInV3(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	now := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	task, _ := workItemProject(t, s, ctx, by, "estimate export", "lead")
+	other, _ := workItemProject(t, s, ctx, by, "estimate export other", "otherlead")
+	handler := estimateHandler(t, s, ctx, by, task)
+	otherHandler := estimateHandler(t, s, ctx, by, other)
+	item := createWorkItem(t, s, ctx, by, task, "estimate-export-item")
+	otherItem := createWorkItem(t, s, ctx, by, other, "estimate-export-other-item")
+	basis := "two paths and one test"
+	now = now.Add(time.Minute)
+	firstAt := now
+	first, _, err := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, estimateRequest(item.Revision, "estimate-export-1", 400000, basis, handler), by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if _, _, err = s.CreateWorkItemUpdate(ctx, other.ID, otherItem.ID, estimateRequest(otherItem.Revision, "estimate-export-other", 777, "other project", otherHandler), by); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	secondAt := now
+	ownerTokens, ownerBasis := int64(650000), "owner raised it after the plan"
+	second, _, err := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, RequestID: "estimate-export-2", EstimateTokens: &ownerTokens, EstimateBasis: &ownerBasis}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	v2, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "estimate-v2", FormatVersion: 2}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "estimate-v3", FormatVersion: 3}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(meta api.AuditExport) []byte {
+		t.Helper()
+		var content []byte
+		for offset := int64(0); ; {
+			chunk, chunkErr := s.GetAuditExportChunk(ctx, task.ID, meta.ID, offset, 31, by)
+			if chunkErr != nil {
+				t.Fatal(chunkErr)
+			}
+			content = append(content, chunk.Data...)
+			offset = chunk.NextOffset
+			if chunk.Complete {
+				return content
+			}
+		}
+	}
+	var v2Document, v3Document struct {
+		FormatVersion int                         `json:"formatVersion"`
+		Streams       map[string][]map[string]any `json:"streams"`
+		Cutoffs       map[string]any              `json:"streamCutoffs"`
+	}
+	if err = json.Unmarshal(read(v2), &v2Document); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(read(v3), &v3Document); err != nil {
+		t.Fatal(err)
+	}
+	_, v2Stream := v2Document.Streams["workItemEstimates"]
+	_, v2Cutoff := v2Document.Cutoffs["workItemEstimates"]
+	if v2Document.FormatVersion != 2 || v2Stream || v2Cutoff || v2.StreamCutoffs["workItemEstimates"] != nil {
+		t.Fatalf("v2 claimed estimate history: stream=%v cutoff=%v", v2Document.Streams["workItemEstimates"], v2Document.Cutoffs["workItemEstimates"])
+	}
+	rows, present := v3Document.Streams["workItemEstimates"]
+	if v3Document.FormatVersion != 3 || !present {
+		t.Fatalf("v3 export has no workItemEstimates stream: format=%d", v3Document.FormatVersion)
+	}
+	if len(rows) != 2 || v3Document.Cutoffs["workItemEstimates"] != float64(2) || v3.StreamCutoffs["workItemEstimates"] != 2 {
+		t.Fatalf("v3 estimate history rows=%v cutoff=%v meta=%v", rows, v3Document.Cutoffs["workItemEstimates"], v3.StreamCutoffs["workItemEstimates"])
+	}
+	want := []map[string]any{
+		{"task_id": task.ID, "item_id": item.ID, "item_revision": float64(item.Revision), "tokens": float64(400000), "basis": basis, "agent_id": handler.ID, "run_id": handler.RunID, "by_node": by.Node, "by_user": by.User, "request_id": "estimate-export-1", "receipt_id": first.Receipt.ID, "created_at": ts(firstAt)},
+		{"task_id": task.ID, "item_id": item.ID, "item_revision": float64(item.Revision), "tokens": float64(650000), "basis": ownerBasis, "agent_id": "", "run_id": "", "by_node": by.Node, "by_user": by.User, "request_id": "estimate-export-2", "receipt_id": second.Receipt.ID, "created_at": ts(secondAt)},
+	}
+	for index, row := range rows {
+		if len(row) != len(want[index])+1 {
+			t.Fatalf("estimate row %d keys=%v", index, row)
+		}
+		for key, value := range want[index] {
+			if row[key] != value {
+				t.Fatalf("estimate row %d %s=%v want %v", index, key, row[key], value)
+			}
+		}
+	}
+	firstSeq, _ := rows[0]["seq"].(float64)
+	secondSeq, _ := rows[1]["seq"].(float64)
+	if firstSeq < 1 || secondSeq <= firstSeq {
+		t.Fatalf("estimate rows out of save order: seq %v then %v", rows[0]["seq"], rows[1]["seq"])
+	}
+	if handler.ID == "" || handler.RunID == "" || first.Receipt.ID == "" || second.Receipt.ID == "" || first.Receipt.ID == second.Receipt.ID {
+		t.Fatalf("test provenance is empty: handler=%+v receipts=%q %q", handler, first.Receipt.ID, second.Receipt.ID)
+	}
+}
+
 func TestAuditExportContentAndProjectByteLimitsFailBeforeReceipt(t *testing.T) {
 	ctx := context.Background()
 	caller := api.Caller{Node: "n", User: "u"}
@@ -357,6 +460,31 @@ func TestAuditExportContentAndProjectByteLimitsFailBeforeReceipt(t *testing.T) {
 		var exports, receipts int
 		if err = s.db.QueryRow(`SELECT (SELECT count(*) FROM audit_exports),(SELECT count(*) FROM audit_export_receipts)`).Scan(&exports, &receipts); err != nil || exports != 0 || receipts != 0 {
 			t.Fatalf("many-row partial commit exports=%d receipts=%d err=%v", exports, receipts, err)
+		}
+	})
+	t.Run("estimate history content", func(t *testing.T) {
+		s, err := Open(":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "estimate bound"}, caller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Estimate bound", RequestID: "estimate-bound-item"}, caller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.db.ExecContext(ctx, `INSERT INTO work_item_estimates(receipt_id,task_id,item_id,item_revision,tokens,basis,by_node,by_user,request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, "wir_0000000000000001", task.ID, item.ID, item.Revision, 1, strings.Repeat("e", api.MaxAuditExportBytes), caller.Node, caller.User, "estimate-bound", ts(s.now())); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.CreateAuditExport(ctx, task.ID, api.CreateAuditExportRequest{RequestID: "estimate-too-large", FormatVersion: 3}, caller); !errors.Is(err, api.ErrLimit) {
+			t.Fatalf("estimate content limit err=%v", err)
+		}
+		var exports, receipts int
+		if err = s.db.QueryRow(`SELECT (SELECT count(*) FROM audit_exports),(SELECT count(*) FROM audit_export_receipts)`).Scan(&exports, &receipts); err != nil || exports != 0 || receipts != 0 {
+			t.Fatalf("estimate partial limit commit exports=%d receipts=%d err=%v", exports, receipts, err)
 		}
 	})
 	t.Run("project ready bytes", func(t *testing.T) {
