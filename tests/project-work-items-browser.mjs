@@ -128,10 +128,14 @@ const servers=[
   {id:'a',name:'Host A',host:'host-a',username:'fixture',runtimes:['codex','claude']},
   {id:'b',name:'Host B',host:'host-b',username:'fixture',runtimes:['claude','codex']}
 ];
+// Hub requests the page has not finished reading, so the test can wait for a
+// quiet page before it navigates (see hubQuiet below).
+const hubRequests=new Map();let hubRequestID=0;
+const hubFetch=async(url,init)=>{const id=++hubRequestID,done=()=>hubRequests.delete(id);hubRequests.set(id,String(url));try{const res=await fetch(url,init),text=res.text.bind(res);res.text=()=>text().finally(done);return res}catch(error){done();throw error}};
 const dialog=(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close" type="button">×</button></div>'+body;d.querySelector('#dialog-close').onclick=()=>host.closeDialog();d.showModal()};
-const client=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>fetch(url,init)});
+const client=createHubClient({baseURL:location.origin,fetchImpl:hubFetch});
 const host={
-  getIPN:()=>({fetch:(url,init)=>fetch(url,init)}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model:{groups:[]},sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,
+  getIPN:()=>({fetch:hubFetch}),getData:()=>data,getServers:()=>servers,currentServer:()=>servers[0],currentTab:()=>null,getTabs:()=>[],paneGroups:()=>({model:{groups:[]},sync(){}}),render(){},scheduleWorkspaceSave(){},bookmark(){},closeTab(){},connect:async()=>null,
   notice:text=>document.querySelector('#notice').textContent=text,
   dialog,closeDialog:()=>{const d=document.querySelector('#dialog');d.close();d.replaceChildren()},
   api:async(url,method,body)=>{if(url==='/project-handler-plans'&&method==='POST')data.projectHandlerPlans=[...data.projectHandlerPlans.filter(p=>p.hub!==body.hub||p.taskId!==body.taskId),structuredClone(body)];return {sessions:[]}},reloadData:async()=>{},
@@ -142,7 +146,7 @@ const taskHub=createTaskHub(host);taskHub.refresh();
 const bugs=createWorkItemsView({kind:'bug',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard,draftPersistence});
 const features=createWorkItemsView({kind:'feature',client:()=>client,dialog,closeDialog:host.closeDialog,notice:host.notice,configure(){},openBoard:host.openBoard,draftPersistence});
 const modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{bugs.hide();features.hide();view.replaceChildren();if(mode==='bugs'){bugs.mount(view);bugs.show()}if(mode==='features'){features.mount(view);features.show()}}});
-window.qa={client,bugs,features,modes,taskHub,data,commands:[],failLaunch:false,lastBoard:null};
+window.qa={client,bugs,features,modes,taskHub,data,commands:[],failLaunch:false,lastBoard:null,hubRequests:()=>[...hubRequests]};
 </script></body></html>`;
 
 const web = createServer(async (req, res) => {
@@ -247,6 +251,35 @@ async function submitDispatch(page, sourceTaskID, itemID, targetTask) {
   await page.waitForFunction((expected) =>
     document.querySelector('#notice')?.textContent === expected, expectedNotice);
   assert.equal(await page.locator('#notice').textContent(), expectedNotice);
+}
+// A reload must not interrupt a refresh. WebKit cancels the in-flight request
+// quietly, but the page script still running in the old document then starts
+// the next one (the view's queued reload or the subscription's next poll), and
+// WebKit reports a request started during unload as a page error: "Fetch API
+// cannot load … due to access control checks". So wait until the page has read
+// every hub event and holds nothing but its idle long-polls.
+async function hubQuiet(page) {
+  // Read after a timer turn: consecutive requests of one refresh are only
+  // microtasks apart, so none is between two requests here.
+  const pending = () =>
+    page.evaluate(() => new Promise((resolve) => setTimeout(() => resolve(qa.hubRequests()), 0)));
+  let seen = [];
+  for (let attempt = 0; attempt < 400; attempt++) {
+    seen = await pending();
+    const polls = seen.map(([, url]) => new URL(url)).filter((url) => url.searchParams.has("wait"));
+    if (polls.length && polls.length === seen.length) {
+      let caughtUp = true;
+      for (const url of polls) {
+        const after = url.searchParams.get("after");
+        const unread = await rateLimitedAPI("GET", `${url.pathname}?after=${after}&limit=1`);
+        if (unread.events.length) caughtUp = false;
+      }
+      const now = await pending();
+      if (caughtUp && JSON.stringify(now) === JSON.stringify(seen)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`hub requests did not settle before navigation: ${JSON.stringify(seen)}`);
 }
 async function assertRowInModeViewport(page, label) {
   const geometry = await page.evaluate(() => {
@@ -398,6 +431,7 @@ try {
       assert.equal(await page.locator('#work-item-title').inputValue(), `${name} persisted edit`, "lost update response discarded the draft");
       // Reload after the hub commit but before confirmation. The recovered draft
       // must replay the original key and original expectedRevision exactly.
+      await hubQuiet(page);
       await page.reload();
       await page.waitForFunction(() => !!window.qa);
       await page.locator('[data-mode="bugs"]').click();
@@ -468,6 +502,7 @@ try {
       await page.locator('#dialog').waitFor({ state: "hidden" });
       const feature = (await allItems("feature")).find((entry) => entry.title === `${name} feature`);
       assert.ok(feature, "feature was not persisted as a feature");
+      await hubQuiet(page);
       await page.reload();
       await page.locator('[data-mode="features"]').click();
       await page.locator(`[data-work-item="${feature.id}"]`).waitFor();
