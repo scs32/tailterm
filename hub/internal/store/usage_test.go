@@ -2467,6 +2467,9 @@ func TestUsageTurnTotalsBackfill(t *testing.T) {
 // stored turns and no totals row the first open fills them within its bound,
 // and the next open, with nothing to fill, is fast and changes nothing.
 func TestUsageTurnTotalsBackfillOpenTime(t *testing.T) {
+	if raceBuilt() {
+		t.Skip("open time bounds are not checked in race runs; TestUsageTurnTotalsBackfill covers the backfill there")
+	}
 	path := filepath.Join(t.TempDir(), "usage.sqlite")
 	s, err := Open(path)
 	if err != nil {
