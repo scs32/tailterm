@@ -775,6 +775,38 @@ func TestQueueBudgetFailedReservationAloneIsAStall(t *testing.T) {
 	}
 }
 
+// Review f1: the failed-reservation stall is only for an entry nothing else
+// holds. An entry that also overlaps a working team waits for that team: it
+// gets no stall and no notice, and keeps its budget reason and the entry it is
+// blocked by.
+func TestQueueBudgetFailedReservationNoStallBehindWorkingOverlap(t *testing.T) {
+	f := newBudgetQueueOf(t, 3, 3, 0)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 250_000)
+	f.estimate(2, 100_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a := f.run(t, f.add(t, 0, "src/a"))
+	working := f.run(t, f.add(t, 2, "src/b"))
+	b := f.add(t, 1, "src/b/part")
+	failed := f.fail(t, a)
+	f.member(t, 0, "member-a")
+	f.member(t, 2, "member-working")
+	// Only the failed entry's reservation keeps the budget from covering it:
+	// 1M - 100K fits its 250K, 1M - 800K does not.
+	want := fmt.Sprintf("Token budget (codex five_hour): needs about 250.00K tokens; 1.00M remain before the reset at %s, reserve 0%%, 800.00K reserved for 2 admitted teams: %s, %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), failed.ID, working.ID)
+	f.advance(10 * time.Minute)
+	got := f.listed(b.ID)
+	if got.Stall != nil || got.BlockReason != want || len(got.BlockedBy) != 1 || got.BlockedBy[0] != working.ID {
+		t.Fatalf("behind a working overlap: stall %+v blocked by %v reason\n%q\nwant\n%q", got.Stall, got.BlockedBy, got.BlockReason, want)
+	}
+	notice := api.TeamQueueStall{BlockerEntryID: failed.ID, BlockerRevision: failed.Revision, Cause: api.StallFailedEntry}.NoticeRequestID(b.ID)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: notice, Operation: "stall_notice", EntryID: b.ID}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "the stall is stale or has cleared") {
+		t.Fatalf("stall notice behind a working overlap: %v", err)
+	}
+}
+
 // r2: the reservation's cost with several running teams. Three running teams
 // of 2,500 turns each on their items, a codex row on the allowance source and
 // a claude row on a provider reading (two source instants), 20 queued entries

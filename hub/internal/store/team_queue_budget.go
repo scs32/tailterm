@@ -776,8 +776,9 @@ func budgetHeldReason(task string, h api.BudgetHold) string {
 // reason and is not returned: it waits for the slot, and the reservation ends
 // with the entry that holds it. An entry that only the reservation of a
 // failed, unreleased entry holds is not returned either: its wait ends with a
-// release, so its stall stays, and where nothing else explained its wait it
-// gets the stall that names that entry, followed by the budget reason.
+// release, so its stall stays, and where nothing else explained its wait (no
+// earlier reason and no entry it is blocked by) it gets the stall that names
+// that entry, followed by the budget reason.
 func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api.TeamQueueList, now time.Time) (map[string]string, error) {
 	check := newQueueBudgetCheck(task, now)
 	held := map[string]string{}
@@ -835,7 +836,9 @@ func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api
 			continue
 		}
 		e.BlockReason = reason
-		if !release || e.Stall != nil {
+		// A path or checkout overlap fills only BlockedBy: that entry waits
+		// for a holding team too, so the reservation is not all that holds it.
+		if !release || e.Stall != nil || len(e.BlockedBy) > 0 {
 			continue
 		}
 		blocker, stall, err := check.failedReservationStall(ctx, q, *e)
