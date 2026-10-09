@@ -7,8 +7,10 @@ import (
 	"github.com/scs32/tailterm/hub/internal/spawn"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,5 +245,79 @@ func TestResolveCloseAgentRejectsSameNameReplacementAmbiguity(t *testing.T) {
 	resolved, err := resolveCloseAgent(context.Background(), c, task, name)
 	if err != nil || resolved != agents[1].ID {
 		t.Fatalf("resolved replacement = %q, %v", resolved, err)
+	}
+}
+
+// cutListTmux puts a tmux stand-in alone on PATH, so no tmux server is
+// reached. Its first cuts readings of the session list print the second row
+// the way tmux prints a format it stopped expanding: an unterminated array,
+// exit 0. Later readings print both rows whole. It returns the number of
+// list readings made so far.
+func cutListTmux(t *testing.T, cuts int) func() int {
+	t.Helper()
+	dir := t.TempDir()
+	seen := filepath.Join(dir, "seen")
+	script := `#!/bin/sh
+case " $* " in *" list-sessions "*) ;; *) echo "unexpected tmux $*" >&2; exit 2 ;; esac
+printf 'read\n' >> ` + spawn.ShellQuote(seen) + `
+reads=0
+while read -r _; do reads=$((reads + 1)); done < ` + spawn.ShellQuote(seen) + `
+printf '%s\n' '["$1","1760000001","first","http://hub","tsk_1","agt_1","run_1","lead"]'
+if [ "$reads" -le ` + strconv.Itoa(cuts) + ` ]; then
+  printf '%s\n' '["$2","1760000002","second","http://hub","'
+else
+  printf '%s\n' '["$2","1760000002","second","http://hub","tsk_2","agt_2","run_2"]'
+fi
+`
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("TT_TMUX_SOCKET", "tt-cut-list-"+strings.TrimPrefix(api.NewID("agt"), "agt_"))
+	return func() int {
+		raw, err := os.ReadFile(seen)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		return strings.Count(string(raw), "\n")
+	}
+}
+
+func TestLocalSessionsReadsACutListAgainOnce(t *testing.T) {
+	whole := []ownedSession{
+		{"$1", "1760000001", "first", "http://hub", "tsk_1", "agt_1", "run_1", "lead"},
+		{"$2", "1760000002", "second", "http://hub", "tsk_2", "agt_2", "run_2", ""},
+	}
+	for _, c := range []struct {
+		name  string
+		cuts  int
+		reads int
+		fail  bool
+	}{
+		{"whole", 0, 1, false},
+		{"cut once", 1, 2, false},
+		{"cut twice", 2, 2, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			reads := cutListTmux(t, c.cuts)
+			sessions, err := localSessions(context.Background())
+			if n := reads(); n != c.reads {
+				t.Fatalf("%d list readings, want %d", n, c.reads)
+			}
+			if c.fail {
+				if err == nil || err.Error() != "cannot verify tmux session identities" || sessions != nil {
+					t.Fatalf("a list cut twice returned %v, %v", sessions, err)
+				}
+				return
+			}
+			if err != nil || len(sessions) != len(whole) {
+				t.Fatalf("sessions %v, %v", sessions, err)
+			}
+			for i := range whole {
+				if sessions[i] != whole[i] {
+					t.Fatalf("session %d is %+v, want %+v", i, sessions[i], whole[i])
+				}
+			}
+		})
 	}
 }

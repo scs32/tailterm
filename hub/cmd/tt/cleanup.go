@@ -40,34 +40,48 @@ func (s ownedSession) valid() bool {
 func (s ownedSession) path() string {
 	return filepath.Join(relayDir(), bindingKey(runtimeBinding{Hub: s.Hub, Agent: s.Agent})+"-"+s.Run+".session.json")
 }
+
+// localSessions lists the tmux sessions with their identity tags. tmux stops
+// expanding a format after 100 ms and expands the rest to nothing, still
+// exiting 0, so a row cut there is not a whole JSON array. When any row is not
+// whole the list is read once more, and only a second cut reading is an error.
 func localSessions(ctx context.Context) ([]ownedSession, error) {
 	fields := []string{"session_id", "session_created", "session_name", "TAILTERM_HUB", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "TAILTERM_ROLE"}
 	for i, f := range fields {
 		fields[i] = `"#{q/e:` + f + `}"`
 	}
-	raw, err := startupTmux(ctx, "list-sessions", "-F", "["+strings.Join(fields, ",")+"]")
-	if err != nil {
-		var e *exec.ExitError
-		if errors.As(err, &e) && (strings.Contains(string(e.Stderr), "no server running") || strings.Contains(string(e.Stderr), "No such file or directory")) {
-			return nil, nil
+	for read := 0; ; read++ {
+		raw, err := startupTmux(ctx, "list-sessions", "-F", "["+strings.Join(fields, ",")+"]")
+		if err != nil {
+			var e *exec.ExitError
+			if errors.As(err, &e) && (strings.Contains(string(e.Stderr), "no server running") || strings.Contains(string(e.Stderr), "No such file or directory")) {
+				return nil, nil
+			}
+			return nil, err
 		}
-		return nil, err
-	}
-	var sessions []ownedSession
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if line == "" {
-			continue
+		var sessions []ownedSession
+		cut := false
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var f []string
+			// Real tmux prints every requested field; seven is the pre-role line
+			// that synthetic tmux fixtures print, read as no role.
+			if json.Unmarshal([]byte(line), &f) != nil || (len(f) != 8 && len(f) != 7) {
+				cut = true
+				break
+			}
+			f = append(f, "")
+			sessions = append(sessions, ownedSession{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]})
 		}
-		var f []string
-		// Real tmux prints every requested field; seven is the pre-role line
-		// that synthetic tmux fixtures print, read as no role.
-		if json.Unmarshal([]byte(line), &f) != nil || (len(f) != 8 && len(f) != 7) {
+		if !cut {
+			return sessions, nil
+		}
+		if read == 1 {
 			return nil, errors.New("cannot verify tmux session identities")
 		}
-		f = append(f, "")
-		sessions = append(sessions, ownedSession{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]})
 	}
-	return sessions, nil
 }
 func rememberSessions(ctx context.Context, hub string) ([]ownedSession, error) {
 	sessions, err := localSessions(ctx)
