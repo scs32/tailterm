@@ -168,8 +168,7 @@ export function createAgentWindowSizer({
                 /^ready:([a-zA-Z0-9_-]{16,64})?(?::(\d+)x(\d+))?$/.exec(
                   response,
                 );
-              if (!ready)
-                throw new Error("Agent pane sizing was refused by the host.");
+              if (!ready) throw unusable(response);
               if (!fresh()) break;
               const current = snapshot();
               claim = {
@@ -238,18 +237,25 @@ export function createAgentWindowSizer({
       const response = (
         await execute(agentWindowSizeCommand({ ...c, action }, c.path))
       ).trim();
-      const refused = new Error("Agent pane sizing was refused by the host.");
-      if (final && response === "refused") error(refused);
+      if (final && response === "refused") error(unusable(response));
       else if (
         !["sized", "released", "restored", "superseded"].includes(response)
       )
-        throw refused;
+        throw unusable(response);
       // Keep a superseded token locally: resize must not reclaim authority.
       return response;
     } catch (e) {
       report(e);
       // Retain the token so a later hide can release an uncertain claim.
     }
+  }
+  // Only the host's own "refused" is a refusal; a reply tmux cut short is not.
+  function unusable(response) {
+    return new Error(
+      response === "refused"
+        ? "Agent pane sizing was refused by the host."
+        : "Agent pane sizing got an incomplete reply from the host.",
+    );
   }
   function fail(e) {
     failed = true;

@@ -37,21 +37,17 @@ func reconcileAgentWindowSizes(ctx context.Context, run func(context.Context, ..
 	if len(owned) == 0 {
 		return 0, nil
 	}
-	raw, err := run(ctx, "list-windows", "-a", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window-size}")
+	windows, err := listAgentWindows(ctx, run)
 	if err != nil {
-		return 0, fmt.Errorf("list agent windows: %w", err)
+		return 0, err
 	}
 	changed := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		f := strings.Split(line, "\t")
-		if len(f) != 6 || !owned[f[0]] || !windowIDPattern(f[2]) {
+	for _, f := range windows {
+		if !owned[f[0]] {
 			continue
 		}
-		cols, colsErr := strconv.Atoi(f[3])
-		rows, rowsErr := strconv.Atoi(f[4])
-		if colsErr != nil || rowsErr != nil {
-			continue
-		}
+		cols, _ := strconv.Atoi(f[3])
+		rows, _ := strconv.Atoi(f[4])
 		if f[5] == "manual" && cols >= spawn.MinUsableCols && rows >= spawn.MinUsableRows {
 			continue
 		}
@@ -65,6 +61,49 @@ func reconcileAgentWindowSizes(ctx context.Context, run func(context.Context, ..
 		logf("[tt relay] %s %s window resized %dx%d -> %s (window-size was %s)\n", time.Now().UTC().Format(time.RFC3339), f[1], cols, rows, spawn.AgentDefaultSize, f[5])
 	}
 	return changed, nil
+}
+
+// listAgentWindows returns the whole rows of list-windows. tmux stops
+// expanding a format after 100 ms and expands the rest to nothing, still
+// exiting 0, so a cut row can keep its six fields with the last one empty: a
+// manual window would then read as not manual and be resized. When any row is
+// not whole the list is read once more; rows still cut are left out.
+func listAgentWindows(ctx context.Context, run func(context.Context, ...string) ([]byte, error)) ([][]string, error) {
+	for read := 0; ; read++ {
+		raw, err := run(ctx, "list-windows", "-a", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window-size}")
+		if err != nil {
+			return nil, fmt.Errorf("list agent windows: %w", err)
+		}
+		var rows [][]string
+		cut := false
+		for _, line := range strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n") {
+			if f := strings.Split(line, "\t"); wholeWindowRow(f) {
+				rows = append(rows, f)
+			} else if len(raw) > 0 {
+				cut = true
+			}
+		}
+		if !cut || read == 1 {
+			return rows, nil
+		}
+	}
+}
+
+func wholeWindowRow(f []string) bool {
+	if len(f) != 6 || !windowIDPattern(f[2]) {
+		return false
+	}
+	if _, err := strconv.Atoi(f[3]); err != nil {
+		return false
+	}
+	if _, err := strconv.Atoi(f[4]); err != nil {
+		return false
+	}
+	switch f[5] {
+	case "manual", "largest", "smallest", "latest":
+		return true
+	}
+	return false
 }
 
 func windowIDPattern(id string) bool {

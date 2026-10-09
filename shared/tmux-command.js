@@ -31,9 +31,29 @@ export function validateTarget(target) {
   )
     throw new Error("Invalid tmux session identity.");
 }
+// A cut reading (see the note above identityHolds) loses its last field, so a
+// reading is whole when every field has its strict shape. A cut one decides
+// nothing and is read again. A missing session reads the same as a cut one,
+// so has-session, which expands no format, tells them apart.
+// digitsAfter tests that $tailterm_tmux_field is prefix plus digits. Its
+// patterns open with "(" because bash 3.2 misreads a bare ")" inside $( ).
+const digitsAfter = (prefix) =>
+  `case "$tailterm_tmux_field" in (${prefix || "''"}|${prefix}*[!0-9]*) false ;; ${prefix ? `(${prefix}*) : ;; (*) false ;; ` : ""}esac`;
+// Tests that $variable is "<prefix><digits>|<digits>", as an id and a time.
+const bothWhole = (variable, prefix) =>
+  `{ tailterm_tmux_field=\${${variable}%%|*}; ${digitsAfter(prefix)} && tailterm_tmux_field=\${${variable}#*|} && ${digitsAfter("")}; }`;
 function exactTarget(target) {
   validateTarget(target);
-  return `tailterm_tmux_target=${shellQuote(target.id)}; if [ "$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{session_id}|#{session_created}' 2>/dev/null)" != ${shellQuote(target.id + "|" + target.created)} ]; then printf 'The original tmux session no longer exists. Choose a session from the launcher.\\n' >&2; exit 1; fi; `;
+  return (
+    `tailterm_tmux_target=${shellQuote(target.id)}; ` +
+    rereadWhile(
+      "tailterm_tmux_identity",
+      "cut",
+      `tailterm_tmux_identity=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{session_id}|#{session_created}' 2>/dev/null) && if ! ${bothWhole("tailterm_tmux_identity", "\\$")} && "$tailterm_tmux_bin" has-session -t "$tailterm_tmux_target" 2>/dev/null; then tailterm_tmux_identity=cut; fi`,
+    ) +
+    `if [ "$tailterm_tmux_identity" = cut ]; then ${UNREAD_IDENTITY}; fi; ` +
+    `if [ "$tailterm_tmux_identity" != ${shellQuote(target.id + "|" + target.created)} ]; then printf 'The original tmux session no longer exists. Choose a session from the launcher.\\n' >&2; exit 1; fi; `
+  );
 }
 export function validateStartDirectory(cwd) {
   if (
@@ -88,11 +108,16 @@ export function tmuxCommand(
 // which only survives a whole expansion, is still there. Each guard is a list
 // of [field, value, wanted] terms, where wanted false means "must differ".
 const allOf = (conditions) => conditions.reduce((a, b) => `#{&&:${a},${b}}`);
+// A comparison whose operands were cut compares nothing with nothing and reads
+// true. The trailing literal is lost with them, so a proved condition is false.
+const proved = (condition) => `#{&&:${condition},1}`;
 const identityHolds = (terms) =>
-  allOf(
-    terms.map(
-      ([field, value, wanted = true]) =>
-        `#{${wanted ? "==" : "!="}:#{${field}},${value}}`,
+  proved(
+    allOf(
+      terms.map(
+        ([field, value, wanted = true]) =>
+          `#{${wanted ? "==" : "!="}:#{${field}},${value}}`,
+      ),
     ),
   );
 const identityDiffers = (terms) =>
@@ -104,11 +129,13 @@ const identityDiffers = (terms) =>
     .reduce((a, b) => `#{||:${a},${b}}`)},1}`;
 // A guard whose reading was cut changed nothing, so it is run again.
 const IDENTITY_READS = 5;
+const UNREAD_IDENTITY = `printf 'tmux did not finish reading the session identity. Try again.\\n' >&2; exit 75`;
 const rereadWhile = (reply, word, read) =>
   `tailterm_identity_reads=0; while :; do ${read}; if [ "$${reply}" != ${word} ]; then break; fi; tailterm_identity_reads=$((tailterm_identity_reads + 1)); if [ "$tailterm_identity_reads" -ge ${IDENTITY_READS} ]; then break; fi; sleep 0.2 2>/dev/null || sleep 1; done; `;
 // Helpers use native client precedence, not the ordinary-agent manual-size
 // controller. Resolve the selected window once, then guard and mutate it in a
 // synchronous tmux queue. A window linked to another session is unsupported.
+const HELPER_UNCHECKED = `printf 'Helper sizing was not checked: tmux did not finish reading the window identity. Try again.\\n' >&2; exit 1`;
 function helperWindowPolicy(binding, target) {
   if (
     binding?.role !== "owner_helper" ||
@@ -129,7 +156,12 @@ function helperWindowPolicy(binding, target) {
   ];
   const window = "$tailterm_tmux_target:$tailterm_tmux_window";
   return (
-    `tailterm_tmux_window_identity=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{window_id}|#{session_created}') || exit 1; ` +
+    rereadWhile(
+      "tailterm_tmux_window_identity",
+      "cut",
+      `tailterm_tmux_window_identity=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{window_id}|#{session_created}') || exit 1; if ! ${bothWhole("tailterm_tmux_window_identity", "@")}; then tailterm_tmux_window_identity=cut; fi`,
+    ) +
+    `if [ "$tailterm_tmux_window_identity" = cut ]; then ${HELPER_UNCHECKED}; fi; ` +
     `tailterm_tmux_window=\${tailterm_tmux_window_identity%%|*}; ` +
     `tailterm_tmux_created=${target ? shellQuote(String(target.created)) : '"${tailterm_tmux_window_identity#*|}"'}; ` +
     `case "$tailterm_tmux_window" in @*[!0-9]*|@|'') printf 'Invalid helper window identity.\\n' >&2; exit 1 ;; @*) ;; *) exit 1 ;; esac; ` +
@@ -138,7 +170,7 @@ function helperWindowPolicy(binding, target) {
       "helper-incomplete",
       `tailterm_helper_policy=$("$tailterm_tmux_bin" if-shell -F -t "${window}" "${identityHolds(identity)}" "set-option -w -t '${window}' window-size latest ; display-message -p helper-ready" "if-shell -F -t '${window}' '${identityDiffers(identity)}' 'display-message -p helper-refused' 'display-message -p helper-incomplete'") || exit 1`,
     ) +
-    `if [ "$tailterm_helper_policy" = helper-incomplete ]; then printf 'Helper sizing was not checked: tmux did not finish reading the window identity. Try again.\\n' >&2; exit 1; fi; ` +
+    `if [ "$tailterm_helper_policy" = helper-incomplete ]; then ${HELPER_UNCHECKED}; fi; ` +
     `if [ "$tailterm_helper_policy" != helper-ready ]; then printf 'Helper sizing refused: session identity changed or window is linked to another session.\\n' >&2; exit 1; fi; `
   );
 }
@@ -189,7 +221,14 @@ export function tmuxHistoryCommand(target, path = "") {
     shellQuote(
       resolver(path) +
         exactTarget(target) +
-        `tailterm_history_pane=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{pane_id}') || exit; exec "$tailterm_tmux_bin" capture-pane -p -e -J -S -5000 -t "$tailterm_history_pane"`,
+        // An empty pane target would capture whichever pane tmux picks.
+        rereadWhile(
+          "tailterm_history_pane",
+          "cut",
+          `tailterm_history_pane=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{pane_id}') || exit; case "$tailterm_history_pane" in %|%*[!0-9]*) tailterm_history_pane=cut ;; %*) ;; *) tailterm_history_pane=cut ;; esac`,
+        ) +
+        `if [ "$tailterm_history_pane" = cut ]; then printf 'tmux did not finish reading the pane. Try again.\\n' >&2; exit 75; fi; ` +
+        `exec "$tailterm_tmux_bin" capture-pane -p -e -J -S -5000 -t "$tailterm_history_pane"`,
     )
   );
 }
@@ -267,14 +306,17 @@ export function agentWindowSizeCommand(
     ]
       .map(
         ([value, height]) =>
-          `if-shell -F -t ${window} ${shellQuote(eq("status", value))} ${shellQuote(size(height))}`,
+          `if-shell -F -t ${window} ${shellQuote(proved(eq("status", value)))} ${shellQuote(size(height))}`,
       )
       .join(" ; ");
   }
+  // Superseded is proved like a refusal; an unproved one is "incomplete".
+  const whileCurrent = (field, value, then) =>
+    `if-shell -F -t ${window} ${shellQuote(proved(eq(field, value)))} ${shellQuote(then)} ${shellQuote(`if-shell -F -t ${window} ${shellQuote(proved(`#{!=:#{${field}},${value}}`))} 'display-message -p superseded' 'display-message -p incomplete'`)}`;
   if (action === "claim")
-    mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_revision", expectedRevision))} ${shellQuote(mutate)} 'display-message -p superseded'`;
+    mutate = whileCurrent("@tailterm_size_revision", expectedRevision, mutate);
   if (["resize", "release", "restore"].includes(action))
-    mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_viewer", token))} ${shellQuote(mutate)} 'display-message -p superseded'`;
+    mutate = whileCurrent("@tailterm_size_viewer", token, mutate);
   // A refusal the server could not prove is "incomplete": nothing was changed.
   const refuse = `if-shell -F -t ${window} ${shellQuote(identityDiffers(identity))} 'display-message -p refused' 'display-message -p incomplete'`;
   return (
@@ -284,7 +326,9 @@ export function agentWindowSizeCommand(
         rereadWhile(
           "tailterm_size_reply",
           "incomplete",
-          `tailterm_size_reply=$("$tailterm_tmux_bin" if-shell -F -t ${window} ${shellQuote(identityHolds(identity))} ${shellQuote(mutate)} ${shellQuote(refuse)}); tailterm_size_status=$?`,
+          // No reply means no branch ran, and a ready line is whole only with
+          // its last field, the height.
+          `tailterm_size_reply=$("$tailterm_tmux_bin" if-shell -F -t ${window} ${shellQuote(identityHolds(identity))} ${shellQuote(mutate)} ${shellQuote(refuse)}); tailterm_size_status=$?; if [ "$tailterm_size_status" -eq 0 ]; then case "$tailterm_size_reply" in ${action === "inspect" ? "ready:*:*[0-9]x[0-9]*) ;; ''|ready:*" : "''"}) tailterm_size_reply=incomplete ;; esac; fi`,
         ) +
         `if [ -n "$tailterm_size_reply" ]; then printf '%s\\n' "$tailterm_size_reply"; fi; ` +
         `if [ "$tailterm_size_reply" = incomplete ]; then printf 'tmux did not finish reading the agent pane identity; nothing was sized.\\n' >&2; exit 75; fi; ` +
@@ -293,8 +337,19 @@ export function agentWindowSizeCommand(
   );
 }
 
+// A whole row ends with its session id, whatever its name holds. When the
+// name is on no whole row and some row was cut, the session may be the cut
+// one, so the list is read again.
 function exactSession(name) {
-  return `tailterm_tmux_target=$("$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_id}' | while IFS='|' read -r tailterm_tmux_name tailterm_tmux_id; do if [ "$tailterm_tmux_name" = ${shellQuote(name)} ]; then printf '%s' "$tailterm_tmux_id"; break; fi; done); if [ -z "$tailterm_tmux_target" ]; then printf 'That tmux session no longer exists. Start a new session from the launcher.\\n' >&2; exit 1; fi; `;
+  return (
+    rereadWhile(
+      "tailterm_tmux_target",
+      "cut",
+      `tailterm_tmux_target=$("$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_id}' | { tailterm_tmux_cut=; while IFS= read -r tailterm_tmux_row; do tailterm_tmux_field=\${tailterm_tmux_row##*|}; if ${digitsAfter("\\$")}; then if [ "$tailterm_tmux_row" = ${shellQuote(name)}"|$tailterm_tmux_field" ]; then printf '%s' "$tailterm_tmux_field"; exit 0; fi; else tailterm_tmux_cut=cut; fi; done; printf '%s' "$tailterm_tmux_cut"; })`,
+    ) +
+    `if [ "$tailterm_tmux_target" = cut ]; then ${UNREAD_IDENTITY}; fi; ` +
+    `if [ -z "$tailterm_tmux_target" ]; then printf 'That tmux session no longer exists. Start a new session from the launcher.\\n' >&2; exit 1; fi; `
+  );
 }
 
 const TT_CANDIDATES = [

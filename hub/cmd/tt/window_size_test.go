@@ -228,3 +228,69 @@ func TestWindowSizeSkipsOwnerHelper(t *testing.T) {
 		t.Fatalf("agent window not reconciled: %q", got)
 	}
 }
+
+// slowTmuxFormat expands to nothing but takes tmux longer than its 100 ms
+// format limit on a server with four sessions, so every field after it in the
+// same format is cut: expanded to nothing, exit status 0.
+func slowTmuxFormat() string {
+	slow := "#{session_id}"
+	for i := 0; i < 14; i++ {
+		slow = "#{S:" + slow + "}"
+	}
+	return "#{?#{!=:" + slow + ",},,}"
+}
+
+func TestWindowSizeKeepsManualWindowWhenListIsCut(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	for _, cuts := range []int{1, 2} {
+		t.Run(fmt.Sprintf("cut %d", cuts), func(t *testing.T) {
+			sock := fmt.Sprintf("tt-cut-size-%d-%d", os.Getpid(), time.Now().UnixNano())
+			t.Setenv("TT_TMUX_SOCKET", sock)
+			t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
+			run := func(args ...string) string {
+				out, err := exec.Command("tmux", append([]string{"-L", sock, "-f", "/dev/null"}, args...)...).CombinedOutput()
+				if err != nil {
+					t.Fatalf("tmux %v: %v: %s", args, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			// An owner's deliberate larger manual size on an agent window.
+			run("new-session", "-d", "-s", "big-agent", "-n", spawn.AgentWindow, "-x", "200", "-y", "50",
+				"-e", "TAILTERM_HUB=http://hub.test", "-e", "TAILTERM_TASK=tsk_0000000000000001",
+				"-e", "TAILTERM_AGENT=agt_0000000000000001", "-e", "TAILTERM_RUN=run_0000000000000001", "sleep 60")
+			run("set-option", "-w", "-t", "big-agent:", "window-size", "manual")
+			run("resize-window", "-t", "big-agent:", "-x", "300", "-y", "80")
+			// The slow format walks these sessions.
+			for i := 0; i < 3; i++ {
+				run("new-session", "-d", "-s", fmt.Sprintf("human-%d", i), "sleep 60")
+			}
+			lists := 0
+			var writes []string
+			cutting := func(ctx context.Context, args ...string) ([]byte, error) {
+				if args[0] != "list-windows" {
+					writes = append(writes, strings.Join(args, " "))
+					return startupTmux(ctx, args...)
+				}
+				lists++
+				if lists <= cuts {
+					args = append([]string{}, args...)
+					last := len(args) - 1
+					args[last] = strings.Replace(args[last], "#{window-size}", slowTmuxFormat()+"#{window-size}", 1)
+				}
+				return startupTmux(ctx, args...)
+			}
+			changed, err := reconcileAgentWindowSizes(context.Background(), cutting, func(string, ...any) {})
+			if err != nil || changed != 0 || len(writes) != 0 {
+				t.Fatalf("changed=%d err=%v writes=%v", changed, err, writes)
+			}
+			if lists != 2 {
+				t.Fatalf("list-windows ran %d times, want one reading again", lists)
+			}
+			if got := run("display-message", "-p", "-t", "big-agent:", "#{window_width}x#{window_height} #{window-size}"); got != "300x80 manual" {
+				t.Fatalf("deliberate manual size changed: %q", got)
+			}
+		})
+	}
+}

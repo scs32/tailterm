@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -266,12 +267,11 @@ func currentHelperSession(ctx context.Context) (helperSession, bool, error) {
 	for i, f := range fields {
 		fields[i] = `"#{q/e:` + f + `}"`
 	}
-	raw, err := startupTmux(ctx, "display-message", "-p", "-t", pane, "-F", "["+strings.Join(fields, ",")+"]")
+	values, whole, err := tmuxJSONFields(ctx, len(fields), "display-message", "-p", "-t", pane, "-F", "["+strings.Join(fields, ",")+"]")
 	if err != nil {
 		return helperSession{}, false, fmt.Errorf("read this tmux session: %w", err)
 	}
-	var values []string
-	if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &values) != nil || len(values) != 4 {
+	if !whole {
 		return helperSession{}, false, errors.New("cannot read this tmux session's identity")
 	}
 	s := helperSession{ID: values[0], Created: values[1], Name: values[2]}
@@ -284,12 +284,44 @@ func currentHelperSession(ctx context.Context) (helperSession, bool, error) {
 	if !api.ValidName(s.Name) {
 		return helperSession{}, false, fmt.Errorf("tmux session name %q cannot be an agent session; rename it first (tmux rename-session owner)", s.Name)
 	}
-	panes, err := startupTmux(ctx, "list-panes", "-s", "-t", s.ID, "-F", "#{pane_id}")
-	if err != nil {
-		return helperSession{}, false, fmt.Errorf("list this session's panes: %w", err)
+	// A cut row is blank, which would count one pane too few: read once more.
+	for read := 0; ; read++ {
+		panes, err := startupTmux(ctx, "list-panes", "-s", "-t", s.ID, "-F", "#{pane_id}")
+		if err != nil {
+			return helperSession{}, false, fmt.Errorf("list this session's panes: %w", err)
+		}
+		rows := strings.Split(strings.TrimSuffix(string(panes), "\n"), "\n")
+		s.Panes = 0
+		for _, row := range rows {
+			if paneIDPattern.MatchString(row) {
+				s.Panes++
+			}
+		}
+		if s.Panes == len(rows) || read == 1 {
+			return s, true, nil
+		}
 	}
-	s.Panes = len(strings.Fields(string(panes)))
-	return s, true, nil
+}
+
+var paneIDPattern = regexp.MustCompile(`^%[0-9]+$`)
+
+// tmuxJSONFields reads a tmux format that prints one JSON array of n strings.
+// tmux stops expanding a format after 100 ms and expands the rest to nothing,
+// still exiting 0. A reading cut there is not such an array, so it is read
+// once more; whole is false when both readings were cut.
+func tmuxJSONFields(ctx context.Context, n int, args ...string) (values []string, whole bool, err error) {
+	for read := 0; ; read++ {
+		raw, err := startupTmux(ctx, args...)
+		if err != nil {
+			return nil, false, err
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &values) == nil && len(values) == n {
+			return values, true, nil
+		}
+		if read == 1 {
+			return nil, false, nil
+		}
+	}
 }
 
 // tagHelperSession sets the identity tags in one tmux command, TAILTERM_ROLE
@@ -331,9 +363,25 @@ func clearHelperTags(ctx context.Context, sessionID, created, agent string) erro
 		for i, name := range helperTagNames {
 			unset[i] = "set-environment -u -t " + spawn.ShellQuote(sessionID) + " " + name
 		}
-		cond := fmt.Sprintf("#{&&:#{==:#{session_created},%s},#{&&:#{==:#{TAILTERM_AGENT},%s},#{==:#{TAILTERM_ROLE},%s}}}", created, agent, api.AgentRoleOwnerHelper)
-		_, err = startupTmux(ctx, "if-shell", "-F", "-t", sessionID, cond, strings.Join(unset, " ; "))
-		return err
+		// A comparison cut at tmux's 100 ms format limit compares nothing with
+		// nothing and reads true; the trailing literal is lost with it, so each
+		// condition is false when cut. A changed session is proved the same
+		// way, and a reading that proves neither is taken once more.
+		cond := fmt.Sprintf("#{&&:#{&&:#{==:#{session_created},%s},#{&&:#{==:#{TAILTERM_AGENT},%s},#{==:#{TAILTERM_ROLE},%s}}},1}", created, agent, api.AgentRoleOwnerHelper)
+		differs := fmt.Sprintf("#{&&:#{||:#{!=:#{session_created},%s},#{||:#{!=:#{TAILTERM_AGENT},%s},#{!=:#{TAILTERM_ROLE},%s}}},1}", created, agent, api.AgentRoleOwnerHelper)
+		unproved := "if-shell -F -t " + spawn.ShellQuote(sessionID) + " " + spawn.ShellQuote(differs) + " 'display-message -p changed' 'display-message -p incomplete'"
+		for read := 0; ; read++ {
+			out, err := startupTmux(ctx, "if-shell", "-F", "-t", sessionID, cond, strings.Join(unset, " ; ")+" ; display-message -p cleared", unproved)
+			if err != nil {
+				return err
+			}
+			if reply := strings.TrimSpace(string(out)); reply == "cleared" || reply == "changed" {
+				return nil
+			}
+			if read == 1 {
+				return errors.New("tmux did not finish reading that session's tags; they were left in place")
+			}
+		}
 	}
 	return nil
 }
@@ -350,12 +398,11 @@ func otherProjectHelper(ctx context.Context, c *api.Client, sessionID, hub, task
 	for i, f := range fields {
 		fields[i] = `"#{q/e:` + f + `}"`
 	}
-	raw, err := startupTmux(ctx, "display-message", "-p", "-t", sessionID, "-F", "["+strings.Join(fields, ",")+"]")
+	f, whole, err := tmuxJSONFields(ctx, len(fields), "display-message", "-p", "-t", sessionID, "-F", "["+strings.Join(fields, ",")+"]")
 	if err != nil {
 		return ownedSession{}, false, fmt.Errorf("read this tmux session's tags: %w", err)
 	}
-	var f []string
-	if json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &f) != nil || len(f) != 5 {
+	if !whole {
 		return ownedSession{}, false, errors.New("cannot read this tmux session's tags")
 	}
 	s := ownedSession{ID: sessionID, Hub: f[0], Task: f[1], Agent: f[2], Run: f[3], Role: f[4]}

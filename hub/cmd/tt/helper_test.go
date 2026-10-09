@@ -2027,3 +2027,175 @@ func TestHelperRegisterAcceptsExplicitOwnPane(t *testing.T) {
 		t.Fatalf("binding %+v", b)
 	}
 }
+
+// helperCuts is a tmux stand-in first on PATH that cuts chosen formats the way
+// a loaded host does. While cuts remain, a command with an argument containing
+// find gets slowTmuxFormat in front of find's first place in each such
+// argument: tmux expands that field and the rest of the format to nothing and
+// still exits 0. Every other command reaches the real tmux untouched.
+type helperCuts struct{ dir, real string }
+
+func cutHelperTmux(t *testing.T, f helperFixture) helperCuts {
+	t.Helper()
+	real, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := helperCuts{dir: t.TempDir(), real: real}
+	script := `#!/bin/sh
+dir=` + spawn.ShellQuote(c.dir) + `
+find=$(cat "$dir/find" 2>/dev/null)
+hit=
+if [ -n "$find" ]; then for a in "$@"; do case "$a" in *"$find"*) hit=1 ;; esac; done; fi
+if [ -n "$hit" ]; then
+  printf 'read\n' >> "$dir/seen"
+  count=$(cat "$dir/count")
+  if [ "$count" -gt 0 ]; then
+    printf '%s\n' "$((count - 1))" > "$dir/count"
+    if [ -x "$dir/before" ]; then "$dir/before"; fi
+    n=$#
+    while [ "$n" -gt 0 ]; do
+      a=$1; shift; n=$((n - 1))
+      case "$a" in *"$find"*) a="${a%%"$find"*}"` + spawn.ShellQuote(slowTmuxFormat()) + `"$find${a#*"$find"}" ;; esac
+      set -- "$@" "$a"
+    done
+  fi
+fi
+exec ` + spawn.ShellQuote(real) + ` "$@"
+`
+	if err := os.WriteFile(filepath.Join(c.dir, "tmux"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// The slow format walks these sessions.
+	for i := 0; i < 3; i++ {
+		f.tmux(t, "new-session", "-d", "-s", fmt.Sprintf("filler-%d", i), "sleep 300")
+	}
+	t.Setenv("PATH", c.dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return c
+}
+
+// cut arms the next count commands that carry find; an empty find disarms.
+func (c helperCuts) cut(t *testing.T, find string, count int) {
+	t.Helper()
+	_ = os.Remove(filepath.Join(c.dir, "seen"))
+	for name, value := range map[string]string{"find": find, "count": strconv.Itoa(count)} {
+		if err := os.WriteFile(filepath.Join(c.dir, name), []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// reads is how many commands carried find since the last cut call.
+func (c helperCuts) reads(t *testing.T) int {
+	t.Helper()
+	data, _ := os.ReadFile(filepath.Join(c.dir, "seen"))
+	return strings.Count(string(data), "\n")
+}
+
+func TestHelperRegisterReadsCutSessionAgain(t *testing.T) {
+	for _, read := range []struct{ name, find, failure string }{
+		{"identity", `"#{q/e:pane_pid}"]`, "cannot read this tmux session's identity"},
+		{"tags", `["#{q/e:TAILTERM_HUB}"`, "cannot read this tmux session's tags"},
+	} {
+		// One cut reading is read again and the registration goes through.
+		t.Run(read.name+" cut once", func(t *testing.T) {
+			f := newHelperFixture(t)
+			c := cutHelperTmux(t, f)
+			c.cut(t, read.find, 1)
+			result, err := f.register(t, f.owner)
+			if err != nil {
+				t.Fatalf("register after one cut reading: %v", err)
+			}
+			if reads := c.reads(t); reads < 2 {
+				t.Fatalf("%d readings, want the cut one read again", reads)
+			}
+			c.cut(t, "", 0)
+			if a := *result.Agent; a.Session != "owner" || f.tags(t, "owner")["TAILTERM_AGENT"] != a.ID {
+				t.Fatalf("helper %+v tags %v", a, f.tags(t, "owner"))
+			}
+		})
+		// Both readings cut: the existing refusal, and nothing registered.
+		t.Run(read.name+" cut twice", func(t *testing.T) {
+			f := newHelperFixture(t)
+			c := cutHelperTmux(t, f)
+			c.cut(t, read.find, 2)
+			if _, err := f.register(t, f.owner); err == nil || err.Error() != read.failure {
+				t.Fatalf("register with both readings cut: %v", err)
+			}
+			if reads := c.reads(t); reads != 2 {
+				t.Fatalf("%d readings, want 2", reads)
+			}
+			c.cut(t, "", 0)
+			if helpers := f.helpers(t); len(helpers) != 0 {
+				t.Fatalf("registered after a cut reading: %+v", helpers)
+			}
+			if tags := f.tags(t, "owner"); len(tags) != 0 {
+				t.Fatalf("tagged after a cut reading: %v", tags)
+			}
+		})
+	}
+}
+
+func TestHelperPaneCountReadsCutRowAgain(t *testing.T) {
+	f := newHelperFixture(t)
+	c := cutHelperTmux(t, f)
+	c.cut(t, "#{pane_id}", 1)
+	s, ok, err := currentHelperSession(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("session ok=%v err=%v", ok, err)
+	}
+	if reads := c.reads(t); s.Panes != 1 || reads < 2 {
+		t.Fatalf("one-pane session counted %d panes after %d readings", s.Panes, reads)
+	}
+}
+
+func TestClearHelperTagsProvesItsCondition(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	id, created := f.tmux(t, "display-message", "-p", "-t", "owner:", "#{session_id}"), f.tmux(t, "display-message", "-p", "-t", "owner:", "#{session_created}")
+	a := *f.mustRegister(t).Agent
+	b, ok := readBinding(t, f.owner.hub, a.ID)
+	if !ok {
+		t.Fatal("no binding to tag from")
+	}
+	c := cutHelperTmux(t, f)
+	// One cut reading is read again and the old session's tags are cleared.
+	c.cut(t, "#{session_created}", 1)
+	if err := clearHelperTags(ctx, id, created, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	c.cut(t, "", 0)
+	if tags := f.tags(t, "owner"); len(tags) != 0 {
+		t.Fatalf("old session kept tags after one cut reading: %v", tags)
+	}
+	// Every reading cut: nothing is proved, so the tags stay and it says so.
+	if err := tagHelperSession(ctx, id, b); err != nil {
+		t.Fatal(err)
+	}
+	c.cut(t, "#{session_created}", 99)
+	if err := clearHelperTags(ctx, id, created, a.ID); err == nil || !strings.Contains(err.Error(), "did not finish reading") {
+		t.Fatalf("clear with every reading cut: %v", err)
+	}
+	if reads := c.reads(t); reads != 2 {
+		t.Fatalf("%d readings, want 2", reads)
+	}
+	c.cut(t, "", 0)
+	if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != a.ID {
+		t.Fatalf("tags changed on a cut reading: %v", tags)
+	}
+	// The role changes just before the condition and the cut falls inside the
+	// last comparison, which then compares nothing with nothing: the session
+	// is no longer this helper's, so its tags stay.
+	before := fmt.Sprintf("#!/bin/sh\nrm -f \"$0\"\nexec %s -L %s set-environment -t %s TAILTERM_ROLE other\n", spawn.ShellQuote(c.real), spawn.ShellQuote(f.sock), spawn.ShellQuote(id))
+	if err := os.WriteFile(filepath.Join(c.dir, "before"), []byte(before), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.cut(t, "#{TAILTERM_ROLE}", 1)
+	if err := clearHelperTags(ctx, id, created, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	c.cut(t, "", 0)
+	if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != a.ID || tags["TAILTERM_ROLE"] != "other" {
+		t.Fatalf("tags of a session that changed role were cleared: %v", tags)
+	}
+}

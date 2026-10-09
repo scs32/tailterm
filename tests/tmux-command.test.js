@@ -16,6 +16,7 @@ import {
   tmuxListCommand,
   validateTmuxPath,
   tmuxRenameCommand,
+  tmuxHistoryCommand,
   agentWindowSizeCommand,
   shellQuote,
 } from "../shared/tmux-command.js";
@@ -524,6 +525,385 @@ exec tmux -f /dev/null -S ${shellQuote(socket)} "$@"
     }
   }
 });
+
+// A private server behind a stand-in tmux that cuts chosen formats the way a
+// loaded host does. cut(find, count) puts a format too slow to finish in front
+// of `find` in the next `count` commands that carry it: tmux then expands that
+// field and everything after it to nothing and still exits 0. Only the first
+// place is cut, or every place with { all: true }. Read counts are asserted as
+// lower bounds, since a loaded host cuts readings of its own.
+function cutFixture(t) {
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-cuts-"));
+  const socket = dir + "/socket",
+    binary = path.join(dir, "tmux"),
+    state = dir + "/cut.json";
+  const slow = Array.from({ length: 14 }).reduce(
+    (format) => `#{W:${format}}`,
+    "#{window_id}",
+  );
+  writeFileSync(
+    dir + "/stand-in.mjs",
+    `import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+let args = process.argv.slice(2);
+const state = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));
+const at = state.find ? args.findIndex((a) => a.includes(state.find)) : -1;
+if (at >= 0) {
+  state.seen++;
+  if (state.count > 0) {
+    state.count--;
+    const cut = () => ${JSON.stringify(`#{?#{!=:${slow},},,}`)} + state.find;
+    args = args.map((a, i) =>
+      state.all ? a.replaceAll(state.find, cut) : i === at ? a.replace(state.find, cut) : a,
+    );
+  }
+  writeFileSync(${JSON.stringify(state)}, JSON.stringify(state));
+}
+const r = spawnSync("tmux", ["-f", "/dev/null", "-S", ${JSON.stringify(socket)}, ...args], { stdio: "inherit" });
+process.exit(r.status ?? 1);
+`,
+  );
+  writeFileSync(
+    binary,
+    `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(dir + "/stand-in.mjs")} "$@"\n`,
+    { mode: 0o700 },
+  );
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k]) => !k.startsWith("TAILTERM_") && k !== "TMUX",
+    ),
+  );
+  const cut = (find = "", count = 0, { all = false } = {}) =>
+    writeFileSync(state, JSON.stringify({ find, count, all, seen: 0 }));
+  const run = (...args) => {
+    cut();
+    const r = runBounded(binary, args, { env, socket });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  t.after(() => {
+    try {
+      cut();
+      runBounded(binary, ["kill-server"], { env, socket });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  const binding = {
+    taskId: "tsk_0000000000000001",
+    agentId: "agt_0000000000000001",
+    runId: "run_0000000000000001",
+  };
+  run(
+    "new-session",
+    "-d",
+    "-s",
+    "lab",
+    "-n",
+    "agent",
+    "-x",
+    "200",
+    "-y",
+    "50",
+    "-e",
+    "TAILTERM_TASK=" + binding.taskId,
+    "-e",
+    "TAILTERM_AGENT=" + binding.agentId,
+    "-e",
+    "TAILTERM_RUN=" + binding.runId,
+    "printf 'LAB-HISTORY\\n'; sleep 60",
+  );
+  // The slow format walks these windows; the agent window stays current.
+  for (let i = 0; i < 3; i++) run("new-window", "-d", "-t", "lab", "sleep 60");
+  const window = "lab:agent";
+  const read = (format, shape, target = window) =>
+    readTmuxFormat(run, ["display-message", "-p", "-t", target, format], {
+      shape,
+    });
+  const [id, created] = read(
+    "#{session_id}|#{session_created}",
+    /^\$\d+\|\d+$/,
+  ).split("|");
+  return {
+    binary,
+    binding,
+    run,
+    read,
+    window,
+    target: { id, created },
+    size: () => read("#{window_width}x#{window_height}", /^\d+x\d+$/),
+    option: (name) => run("show-options", "-w", "-v", "-t", window, name),
+    // Runs one generated command with the next `count` readings of find cut.
+    under(find, count, command, options) {
+      cut(find, count, options);
+      const r = runBounded("/bin/sh", ["-c", command], { env, socket });
+      return {
+        status: r.status,
+        stdout: r.stdout,
+        reply: r.stdout.trim(),
+        stderr: r.stderr,
+        reads: JSON.parse(readFileSync(state, "utf8")).seen,
+      };
+    },
+  };
+}
+const CUT_TEST_TIMEOUT_MS = 120000;
+
+test(
+  "a cut session identity is read again, and a lasting cut is never a missing session",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  (t) => {
+    const f = cutFixture(t);
+    // A foreign name with the separator in it never makes the list look cut.
+    f.run("new-session", "-d", "-s", "odd|name", "sleep 60");
+    const gone = /no longer exists/,
+      unread =
+        /^tmux did not finish reading the session identity\. Try again\.\n$/;
+    const exact = [
+      "exact identity",
+      "|#{session_created}",
+      (target = f.target) => tmuxHistoryCommand(target, f.binary),
+      /^The original tmux session no longer exists\. /,
+    ];
+    const named = [
+      "session name",
+      "|#{session_id}",
+      (name = "lab") => tmuxCommand(name, f.binary, true),
+      /^That tmux session no longer exists\. /,
+    ];
+    const whole = f.under("", 0, exact[2]());
+    assert.equal(whole.status, 0, whole.stderr);
+    assert.match(whole.stdout, /LAB-HISTORY/);
+    for (const [label, find, command] of [exact, named]) {
+      const reread = f.under(find, 2, command());
+      assert.doesNotMatch(reread.stderr, gone, label);
+      assert.doesNotMatch(reread.stderr, /did not finish/, label);
+      assert.ok(reread.reads >= 3, `${label}: two cut readings read again`);
+      const lasting = f.under(find, 99, command());
+      assert.deepEqual([lasting.status, lasting.reads], [75, 5], label);
+      assert.match(lasting.stderr, unread, label);
+      assert.equal(lasting.stdout, "", label);
+    }
+    // Past its identity the history command prints the pane; the attach has no
+    // terminal here, so tmux itself fails after the session was found.
+    const history = f.under(exact[1], 2, exact[2]());
+    assert.equal(history.status, 0, history.stderr);
+    assert.match(history.stdout, /LAB-HISTORY/);
+    assert.match(
+      f.under(named[1], 2, named[2]()).stderr,
+      /tmux failed with exit status/,
+    );
+    // A session that is really gone or replaced is still answered as such.
+    for (const cuts of [0, 1]) {
+      for (const [label, target] of [
+        ["wrong created time", { ...f.target, created: "0" }],
+        ["missing session", { id: "$99999", created: f.target.created }],
+      ]) {
+        const refused = f.under(exact[1], cuts, exact[2](target));
+        assert.equal(refused.status, 1, `${label} with ${cuts} cut`);
+        assert.match(refused.stderr, exact[3], `${label} with ${cuts} cut`);
+        assert.equal(refused.stdout, "");
+      }
+      const absent = f.under(named[1], cuts, named[2]("absent"));
+      assert.equal(absent.status, 1, `absent name with ${cuts} cut`);
+      assert.match(absent.stderr, named[3], `absent name with ${cuts} cut`);
+    }
+  },
+);
+
+test(
+  "a cut helper window reading is read again, and a lasting cut is unchecked, never refused",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  (t) => {
+    const f = cutFixture(t);
+    f.run(
+      "set-environment",
+      "-t",
+      f.target.id,
+      "TAILTERM_ROLE",
+      "owner_helper",
+    );
+    // The helper attach names no target: the created time comes from this read.
+    const helper = tmuxCommand("lab", f.binary, true, undefined, "", {
+      ignoreSize: true,
+      helperBinding: { ...f.binding, role: "owner_helper" },
+    });
+    for (const find of ["|#{session_created}", "#{window_id}|"]) {
+      f.run("set-option", "-w", "-t", f.window, "window-size", "manual");
+      const lasting = f.under(find, 99, helper);
+      assert.match(lasting.stderr, /^Helper sizing was not checked: /, find);
+      assert.doesNotMatch(
+        lasting.stderr,
+        /refused|Invalid helper window identity|tmux failed/,
+        find,
+      );
+      assert.deepEqual([lasting.status, lasting.reads], [1, 5], find);
+      assert.equal(f.option("window-size"), "manual", find);
+      // Past the policy the attach has no terminal here and tmux itself fails.
+      const reread = f.under(find, 2, helper);
+      assert.ok(reread.reads >= 3, `${find}: two cut readings read again`);
+      assert.doesNotMatch(reread.stderr, /Helper sizing|Invalid/, find);
+      assert.match(reread.stderr, /tmux failed with exit status/, find);
+      assert.equal(f.option("window-size"), "latest", find);
+    }
+  },
+);
+
+test(
+  "a cut pane reading never shows another session's history",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  (t) => {
+    const f = cutFixture(t);
+    f.run(
+      "new-session",
+      "-d",
+      "-s",
+      "other",
+      "printf 'OTHER-SESSION-SECRET\\n'; sleep 60",
+    );
+    const history = tmuxHistoryCommand(f.target, f.binary);
+    const lasting = f.under("#{pane_id}", 99, history);
+    assert.deepEqual(
+      [lasting.status, lasting.stdout, lasting.reads],
+      [75, "", 5],
+    );
+    assert.match(
+      lasting.stderr,
+      /^tmux did not finish reading the pane\. Try again\.\n$/,
+    );
+    const reread = f.under("#{pane_id}", 2, history);
+    assert.equal(reread.status, 0, reread.stderr);
+    assert.ok(reread.reads >= 3, "two cut readings read again");
+    assert.match(reread.stdout, /LAB-HISTORY/);
+    assert.doesNotMatch(reread.stdout, /OTHER-SESSION-SECRET/);
+  },
+);
+
+test(
+  "a cut inspect line is read again and is never answered short",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  (t) => {
+    const f = cutFixture(t);
+    const token = "viewer_0000000000000001";
+    const sizing = (action) =>
+      agentWindowSizeCommand(
+        {
+          target: f.target,
+          binding: f.binding,
+          token,
+          action,
+          cols: 120,
+          rows: 35,
+          expectedRevision: "",
+        },
+        f.binary,
+      );
+    f.run("set-option", "-t", f.target.id, "status", "off");
+    assert.equal(f.under("", 0, sizing("claim")).reply, "sized");
+    const ready = `ready:${token}:120x35`;
+    assert.equal(f.under("", 0, sizing("inspect")).reply, ready);
+    for (const find of [
+      "#{@tailterm_size_revision}",
+      "#{window_width}",
+      "#{window_height}",
+    ]) {
+      const reread = f.under(find, 2, sizing("inspect"));
+      assert.deepEqual(
+        [reread.reply, reread.status, reread.reads >= 3],
+        [ready, 0, true],
+        find + " cut twice",
+      );
+      const lasting = f.under(find, 99, sizing("inspect"));
+      assert.deepEqual(
+        [lasting.reply, lasting.status, lasting.reads],
+        ["incomplete", 75, 5],
+        find + " cut every time",
+      );
+    }
+  },
+);
+
+test(
+  "a cut comparison never sizes, releases or claims for the wrong viewer",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  (t) => {
+    const f = cutFixture(t);
+    const A = "viewer_000000000000000A",
+      B = "viewer_000000000000000B";
+    const sizing = (changes) =>
+      agentWindowSizeCommand(
+        {
+          target: f.target,
+          binding: f.binding,
+          token: A,
+          action: "resize",
+          cols: 120,
+          rows: 35,
+          ...changes,
+        },
+        f.binary,
+      );
+    const viewer = "#{@tailterm_size_viewer}",
+      revision = "#{@tailterm_size_revision}";
+    const held = () => [
+      f.size(),
+      f.option("@tailterm_size_viewer"),
+      f.option("@tailterm_size_revision"),
+    ];
+    f.run("set-option", "-t", f.target.id, "status", "off");
+    assert.equal(
+      f.under("", 0, sizing({ action: "claim", expectedRevision: "" })).reply,
+      "sized",
+    );
+    const before = held();
+    assert.deepEqual(before, ["120x35", A, A]);
+    const other = { token: B, cols: 170, rows: 40 };
+    // The comparison alone is cut: the server proves the viewer differs.
+    for (const [find, changes] of [
+      [viewer, { action: "resize" }],
+      [viewer, { action: "release" }],
+      [viewer, { action: "restore" }],
+      [revision, { action: "claim", expectedRevision: B }],
+    ]) {
+      const label = `${changes.action} by another viewer`;
+      const once = f.under(find, 1, sizing({ ...other, ...changes }));
+      assert.deepEqual([once.reply, once.status], ["superseded", 0], label);
+      assert.deepEqual(held(), before, label + " changed nothing");
+      // Its proof is cut too: nothing is decided, and nothing is changed.
+      const lasting = f.under(find, 99, sizing({ ...other, ...changes }), {
+        all: true,
+      });
+      assert.deepEqual(
+        [lasting.reply, lasting.status, lasting.reads],
+        ["incomplete", 75, 5],
+        label + " with every reading cut",
+      );
+      assert.deepEqual(held(), before, label + " changed nothing");
+    }
+    // The viewer that holds the window is read again and then sized.
+    const own = f.under(viewer, 2, sizing({ cols: 150 }), { all: true });
+    assert.deepEqual(
+      [own.reply, own.status, own.reads >= 3, f.size()],
+      ["sized", 0, true, "150x35"],
+    );
+    // One status branch runs, whichever comparisons were cut.
+    f.run("set-option", "-t", f.target.id, "status", "2");
+    const status = f.under("#{status}", 1, sizing({ cols: 160, rows: 40 }), {
+      all: true,
+    });
+    assert.deepEqual(
+      [status.reply, status.status, f.size()],
+      ["sized", 0, "160x38"],
+    );
+    // A split window is refused even when the pane count is the cut term.
+    f.run("split-window", "-d", "-t", f.window, "sleep 60");
+    const split = f.under("#{window_panes}", 1, sizing({ cols: 180 }));
+    assert.deepEqual(
+      [split.reply, split.status, f.size()],
+      ["refused", 0, "160x38"],
+    );
+  },
+);
 
 test("a hung tmux command fails fast and names the command", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-hung-"));

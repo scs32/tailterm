@@ -1811,3 +1811,42 @@ test(
     assert.equal(reads, 1);
   },
 );
+
+test(
+  "a reply tmux cut short is reported as incomplete, and only refused as a refusal",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async () => {
+    const revision = "viewer_0000000000000009";
+    const replies = [
+      [
+        "incomplete",
+        /^Agent pane sizing got an incomplete reply from the host\.$/,
+      ],
+      ["", /incomplete reply/],
+      [`ready:${revision}:`, /incomplete reply/],
+      ["refused", /^Agent pane sizing was refused by the host\.$/],
+    ];
+    // The reply answers the first read of the window, or the claim after it.
+    for (const site of ["inspect", "claim"])
+      for (const [reply, message] of replies) {
+        const errors = [],
+          label = `${site} answered ${JSON.stringify(reply)}`;
+        const c = createAgentWindowSizer({
+          snapshot: valid,
+          token: () => "viewer_0000000000000001",
+          error: (e) => errors.push(e.message),
+          execute: async (command) =>
+            site === "claim" && command.includes("ready:")
+              ? "ready::200x50"
+              : reply + "\n",
+        });
+        c.refresh({ focus: true });
+        await step(`${label}: the sizer settles`, c.settled());
+        assert.equal(errors.length, 1, label);
+        assert.match(errors[0], message, label);
+        assert.equal(/refused/.test(errors[0]), reply === "refused", label);
+        c.dispose();
+        await step(`${label}: the sizer settles once disposed`, c.settled());
+      }
+  },
+);
