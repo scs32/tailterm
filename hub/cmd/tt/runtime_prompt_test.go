@@ -562,6 +562,16 @@ func (r *promptRig) menu(path, after string) *fakeMenu {
 	return menu
 }
 
+// promptFingerprint is the fingerprint the relay reports for a fixture.
+func promptFingerprint(t *testing.T, r *promptRig, path string) string {
+	t.Helper()
+	m, ok := classifyRuntimePrompt(r.b.Runtime, plainRuntimeScreen(r.fixture(path)))
+	if !ok {
+		t.Fatalf("%s is not a prompt", path)
+	}
+	return m.Fingerprint
+}
+
 func (r *promptRig) ownerNotices() int {
 	r.t.Helper()
 	var n int
@@ -877,6 +887,74 @@ func TestRuntimePromptReturn(t *testing.T) {
 			}
 		})
 	}
+	// Bug wi_3efb6a33a98d5798: a prompt the answer never settles is answered
+	// runtimePromptReturnLimit times in the run, then escalated once.
+	t.Run("return limit escalates once", func(t *testing.T) {
+		r := newPromptRig(t, "codex")
+		r.transcript(r.clock.Add(-30*time.Second), false)
+		start := r.clock
+		answered := 0
+		for answered < runtimePromptReturnLimit {
+			r.menu(fixture, idle)
+			got := r.tick().Prompt
+			if got == nil {
+				t.Fatalf("after %d answers: no prompt", answered)
+			}
+			switch got.Outcome {
+			case api.RuntimePromptConfirmed:
+				answered++
+			case api.RuntimePromptSkipped:
+				// The five minute answer limit still paces the answers.
+				if !strings.Contains(got.Reason, "answer limit") || answered%runtimePromptAnswerLimit != 0 {
+					t.Fatalf("after %d answers: skipped %+v", answered, got)
+				}
+				r.clock = r.clock.Add(runtimePromptAnswerWindow)
+			default:
+				t.Fatalf("after %d answers: prompt %+v", answered, got)
+			}
+			if len(r.keys) != 3*answered || r.ownerNotices() != 0 {
+				t.Fatalf("after %d answers: keys %d owner notices %d", answered, len(r.keys), r.ownerNotices())
+			}
+		}
+		if r.clock.Sub(start) <= runtimePromptAnswerWindow {
+			t.Fatalf("the answers took %s, want more than one answer window", r.clock.Sub(start))
+		}
+		// A relay restart reads the count from the run's state file.
+		if seen := loadRuntimePromptLocal(r.b).Seen[promptFingerprint(t, r, fixture)]; seen.Answered != runtimePromptReturnLimit {
+			t.Fatalf("saved answer count %d, want %d", seen.Answered, runtimePromptReturnLimit)
+		}
+		// The window has room again, so only the return limit holds the answer.
+		r.clock = r.clock.Add(2 * runtimePromptAnswerWindow)
+		keys := len(r.keys)
+		reason := fmt.Sprintf("returned after %d confirmed answers", runtimePromptReturnLimit)
+		r.menu(fixture, idle)
+		over := r.tick().Prompt
+		if over == nil || over.Outcome != api.RuntimePromptEscalated || over.Reason != reason || over.Action != api.RuntimePromptKeepCurrentNeverShow {
+			t.Fatalf("return past the limit %+v", over)
+		}
+		if len(r.keys) != keys || r.ownerNotices() != 1 {
+			t.Fatalf("return past the limit: keys %d, want %d; owner notices %d, want 1", len(r.keys), keys, r.ownerNotices())
+		}
+		// Later ticks, a clear and further returns, each in a fresh answer
+		// window, type nothing and repeat the same report.
+		for i := 0; i < 3; i++ {
+			r.clock = r.clock.Add(2 * runtimePromptAnswerWindow)
+			if got := r.tick().Prompt; got == nil || got.Outcome != api.RuntimePromptEscalated || !got.Since.Equal(over.Since) || !got.At.Equal(over.At) {
+				t.Fatalf("tick %d on the escalated prompt %+v, want %+v", i+1, got, over)
+			}
+			r.screen = r.fixture(idle)
+			if got := r.tick().Prompt; got != nil {
+				t.Fatalf("cleared prompt still reported %+v", got)
+			}
+			r.menu(fixture, idle)
+			if got := r.tick().Prompt; got == nil || got.Outcome != api.RuntimePromptEscalated || got.Reason != reason || !got.Since.Equal(over.Since) {
+				t.Fatalf("return %d after the escalation %+v, want %+v", i+1, got, over)
+			}
+		}
+		if len(r.keys) != keys || r.ownerNotices() != 1 {
+			t.Fatalf("after the escalation: keys %d, want %d; owner notices %d, want 1", len(r.keys), keys, r.ownerNotices())
+		}
+	})
 	t.Run("returns under an escalate policy", func(t *testing.T) {
 		r := newPromptRig(t, "codex")
 		r.transcript(r.clock.Add(-30*time.Second), false)

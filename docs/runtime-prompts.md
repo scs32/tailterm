@@ -101,7 +101,14 @@ a Claude wake:
 Each prompt fingerprint gets at most one attempt per run, unless the prompt
 returns after a confirmed answer: that answer saw the prompt gone, so the same
 fingerprint showing again is decided afresh, inside the answer limit, and
-reported with a new `since`. A failed or ambiguous answer is never resent,
+reported with a new `since`. One fingerprint gets at most six confirmed answers
+per agent run (`runtimePromptReturnLimit`); the run's state file keeps the
+count, so a relay restart does not reset it. When the prompt returns after the
+sixth, the answer is not settling it: the relay sends no key and reports it
+`escalated` with the reason `returned after 6 confirmed answers`, and the hub
+posts the owner notice below, once. That outcome is final for the run: later
+ticks and returns send no key and repeat the same report, which posts nothing
+more. A failed or ambiguous answer is never resent,
 including after a relay restart mid-answer, and escalates. A skipped answer
 (paused project, retired agent, pane or prompt changed, answer limit) sends no
 key and is retried on a later tick.
@@ -168,7 +175,8 @@ Limits:
 ## Checks
 
 `go test ./cmd/tt -run 'TestRuntimePrompt|TestPromptPolicyCLI|TestAgentsRuntimePrompt'`
-(`TestRuntimePromptRepeat` covers a dialog whose rows change while it is open),
+(`TestRuntimePromptRepeat` covers a dialog whose rows change while it is open;
+`TestRuntimePromptReturn` covers the return limit with an injected clock),
 `go test ./internal/store ./internal/server -run TestRuntimePrompt`,
 `node tests/activity-browser.mjs` and `node --test tests/activity-format.test.js`.
 Fixtures and their provenance are in `hub/cmd/tt/testdata/runtime-prompt/`.

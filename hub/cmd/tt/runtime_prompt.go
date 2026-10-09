@@ -297,6 +297,11 @@ const (
 	runtimePromptSeenCap      = 64
 )
 
+// runtimePromptReturnLimit is the most confirmed answers one prompt
+// fingerprint gets in an agent run. A prompt that returns after that many is
+// not being settled by the answer, so it escalates instead.
+const runtimePromptReturnLimit = 6
+
 // runtimePromptTargets names the option each answering action selects.
 var runtimePromptTargets = map[string]map[string]string{
 	api.RuntimePromptCodexRateLimit: {
@@ -348,6 +353,8 @@ type runtimePromptSeen struct {
 	Reason    string    `json:"reason,omitempty"`
 	At        time.Time `json:"at,omitempty"`
 	Attempted bool      `json:"attempted,omitempty"`
+	// Answered counts this fingerprint's confirmed answers in the run.
+	Answered int `json:"answered,omitempty"`
 }
 
 // runtimePromptIntent is the answer in progress, written before any key.
@@ -533,9 +540,10 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 	undecided := err != nil && len(kind.Actions) > 1
 	seen, known := l.Seen[match.Fingerprint]
 	// A confirmed answer saw this prompt gone, so the same fingerprint has
-	// come back: it is decided afresh, inside the answer limit.
+	// come back: it is decided afresh, inside the answer limit, and keeps the
+	// run's count of its confirmed answers.
 	if returned := known && seen.Outcome == api.RuntimePromptConfirmed; !known || returned {
-		seen = runtimePromptSeen{Kind: match.Kind, Since: now}
+		seen = runtimePromptSeen{Kind: match.Kind, Since: now, Answered: seen.Answered}
 		if !returned && len(l.Seen) >= runtimePromptSeenCap {
 			oldest := ""
 			for fp, s := range l.Seen {
@@ -546,6 +554,7 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 			delete(l.Seen, oldest)
 		}
 	}
+	answers := api.RuntimePromptAnswers(action) && runtime == "codex" && runtimePromptTargets[match.Kind][action] != ""
 	switch {
 	case seen.Attempted && seen.Outcome == "":
 		// A relay stopped between intent and outcome. Never type again.
@@ -559,7 +568,12 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 			fmt.Fprintf(os.Stderr, "[tt relay] %s runtime prompt policy unavailable; retrying: %v\n", b.Agent, err)
 		}
 		seen.Action, seen.Outcome, seen.Reason, seen.At = api.RuntimePromptEscalate, api.RuntimePromptSkipped, reason, now
-	case api.RuntimePromptAnswers(action) && runtime == "codex" && runtimePromptTargets[match.Kind][action] != "":
+	case answers && seen.Answered >= runtimePromptReturnLimit:
+		// The answer does not settle this prompt. Escalated is final for the
+		// run, so no later return is typed into.
+		seen.Action, seen.Outcome, seen.At = action, api.RuntimePromptEscalated, now
+		seen.Reason = fmt.Sprintf("returned after %d confirmed answers", runtimePromptReturnLimit)
+	case answers:
 		seen.Action = action
 		l.Seen[match.Fingerprint] = seen
 		// An answer outlives the tick's short budget: its confirmation alone
@@ -570,6 +584,9 @@ func observeRuntimePrompt(ctx context.Context, deps *runtimePromptDeps, b runtim
 		seen.At = deps.now().UTC()
 		if seen.Outcome != api.RuntimePromptSkipped {
 			seen.Attempted = true
+		}
+		if seen.Outcome == api.RuntimePromptConfirmed {
+			seen.Answered++
 		}
 	case action == api.RuntimePromptReport:
 		seen.Action, seen.Outcome, seen.Reason, seen.At = action, api.RuntimePromptReported, "", now
