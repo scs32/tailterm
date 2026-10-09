@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +45,9 @@ type rotationCLI struct {
 	spawnArgs [][]string
 	briefings []string
 	dueCalls  atomic.Int32
-	actions   atomic.Int32
+	// agentPolls counts single-agent reads, which a resume's online wait makes.
+	agentPolls atomic.Int32
+	actions    atomic.Int32
 	// auth is the owner's authorization passed to rotate; zero for an ordinary rotation.
 	auth rotationAuthorization
 }
@@ -71,6 +74,9 @@ func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
 		}
 		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/handler-rotations") {
 			f.actions.Add(1)
+		}
+		if r.Method == "GET" && strings.Contains(r.URL.Path, "/agents/") {
+			f.agentPolls.Add(1)
 		}
 		handler.ServeHTTP(w, r)
 	}))
@@ -1334,6 +1340,10 @@ func TestHandlerDeathRunnerAbortsWhenSecondProbeIsNotGone(t *testing.T) {
 			if f.journalExists() {
 				t.Fatal("the journal was left behind")
 			}
+			// An unconfirmed death is not a failed resume: nothing is posted.
+			if n := f.subjects(t, rotationStuckSubject); n != 0 {
+				t.Fatalf("stuck rotation notices: %d", n)
+			}
 			detail, err := f.c.GetTask(context.Background(), f.task.ID)
 			if err != nil || detail.Task.PrimaryHandlerID != "" || detail.Task.HandlerRevision != 1 {
 				t.Fatalf("task: %+v %v", detail.Task, err)
@@ -2102,4 +2112,313 @@ func TestHandlerDeathRunnerLeavesExitedPrimaryOnDoubt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stuckRotation is a runner rotation whose successor never comes online: a
+// due template rotation with the fixture's launcher leaving the successor
+// offline, an owner helper to tell, and one request the old handler owes.
+type stuckRotation struct {
+	*rotationCLI
+	helper api.Agent
+	owed   []string
+}
+
+func newStuckRotation(t *testing.T) *stuckRotation {
+	t.Helper()
+	f := &stuckRotation{rotationCLI: newRotationCLI(t, handlerTemplateDigest("an older assignment"))}
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	setRotationPolicy(t, f.rotationCLI, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true})
+	reg, err := f.c.RegisterOwnerHelper(context.Background(), f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "stuck-helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.helper, err = f.c.GetAgent(context.Background(), f.task.ID, reg.Registration.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	f.request(t, f.old.Name, "Record the stuck fixture item")
+	f.owed = f.owedByOld(t)
+	f.online = false
+	f.deps.online = 100 * time.Millisecond
+	return f
+}
+
+// owedByOld lists the old handler's open obligations other than deliveries.
+func (f *stuckRotation) owedByOld(t *testing.T) []string {
+	t.Helper()
+	obligations, err := f.c.ListObligations(context.Background(), f.task.ID, "", "", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owed []string
+	for _, o := range obligations {
+		if o.Needs != api.ObligationNeedsDelivery {
+			owed = append(owed, o.ID+" "+o.AgentID+" "+o.State)
+		}
+	}
+	return owed
+}
+
+// try runs one runner tick and returns its error.
+func (f *stuckRotation) try(r *rotationRunner) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return r.tick(ctx, f.e, f.c, "fixture")
+}
+
+// stuckNotices returns the stuck rotation notices on the Board.
+func (f *stuckRotation) stuckNotices(t *testing.T) []api.Message {
+	t.Helper()
+	messages, err := f.c.ListMessages(context.Background(), f.task.ID, 0, "", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notices []api.Message
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == rotationStuckSubject {
+			notices = append(notices, m)
+		}
+	}
+	return notices
+}
+
+// assertHeld checks what the ceiling must leave alone: the rotation prepared
+// with its journal, one successor identity, the old handler open and still
+// the primary by the hub's rule, and its obligations where they were.
+func (f *stuckRotation) assertHeld(t *testing.T) api.HandlerRotation {
+	t.Helper()
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared || !f.journalExists() {
+		t.Fatalf("the rotation must stay prepared with its journal: %+v journal=%v", rotations, f.journalExists())
+	}
+	if open, total := f.handlers(t); open != 2 || total != 2 {
+		t.Fatalf("handlers open=%d total=%d, want the old handler and one successor", open, total)
+	}
+	detail, err := f.c.GetTask(context.Background(), f.task.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != "" || detail.Task.HandlerRevision != 1 {
+		t.Fatalf("task: %+v %v", detail.Task, err)
+	}
+	if primary, ok := currentPrimaryHandler(detail); !ok || primary.ID != f.old.ID || primary.RunID != f.old.RunID {
+		t.Fatalf("primary: %+v", primary)
+	}
+	if owed := f.owedByOld(t); !reflect.DeepEqual(owed, f.owed) {
+		t.Fatalf("obligations moved: %v, want %v", owed, f.owed)
+	}
+	return rotations[0]
+}
+
+// toCeiling starts the rotation and fails its resumes up to the ceiling.
+func (f *stuckRotation) toCeiling(t *testing.T, r *rotationRunner) {
+	t.Helper()
+	for i := 0; i <= rotationResumeCeiling; i++ {
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "did not come online") {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+}
+
+// wi_3d0125f240e4296b: a prepared rotation whose successor never comes online
+// was resumed on every runner tick without end and with no notice. The
+// runner now stops after three failed resumes, leaves the rotation prepared
+// and tells the owner helper and the handler once.
+func TestHandlerRotationRunnerStopsResumingStuckRotation(t *testing.T) {
+	f := newStuckRotation(t)
+	r := f.runner()
+	// The first tick prepares the rotation and launches the successor.
+	if err := f.try(r); err == nil || !strings.Contains(err.Error(), "did not come online") {
+		t.Fatalf("first tick: %v", err)
+	}
+	if n := len(f.stuckNotices(t)); n != 0 {
+		t.Fatalf("notices before any resume: %d", n)
+	}
+	for i := 1; i <= 3; i++ {
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "did not come online") {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+		if n := len(f.stuckNotices(t)); (i < 3 && n != 0) || (i == 3 && n != 2) {
+			t.Fatalf("notices after failed resume %d: %d", i, n)
+		}
+	}
+	// At the ceiling: later ticks, and a restarted runner, resume nothing.
+	polls := f.agentPolls.Load()
+	for i := 0; i < 4; i++ {
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick %d after the ceiling resumed the rotation: %v", i+1, err)
+		}
+	}
+	if err := f.try(f.runner()); err != nil {
+		t.Fatalf("a restarted runner resumed the rotation: %v", err)
+	}
+	if f.agentPolls.Load() != polls || f.spawns != 1 || f.actions.Load() != 1 {
+		t.Fatalf("after the ceiling: successor polls %d (was %d) spawns=%d actions=%d", f.agentPolls.Load(), polls, f.spawns, f.actions.Load())
+	}
+	rotation := f.assertHeld(t)
+	notices := f.stuckNotices(t)
+	if len(notices) != 2 {
+		t.Fatalf("stuck notices: %d, want one each for the owner helper and the handler", len(notices))
+	}
+	to := map[string]bool{}
+	for _, m := range notices {
+		to[m.To] = true
+		text := m.Envelope.Body.Text
+		for _, want := range []string{f.task.ID, rotation.SuccessorName, rotation.SuccessorAgentID, "host fixture", "3 failed", "did not come online",
+			"tt handler rotate --task " + f.task.ID, "tt handler rotate --abort --task " + f.task.ID} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("notice lacks %q: %s", want, text)
+			}
+		}
+	}
+	if !to[f.helper.ID] || !to[f.old.ID] {
+		t.Fatalf("notice recipients: %v", to)
+	}
+}
+
+// A launch the host cannot confirm counts like a successor that stays
+// offline, and every attempt names the one successor the journal records.
+func TestHandlerRotationRunnerCountsUnconfirmedLaunches(t *testing.T) {
+	f := newStuckRotation(t)
+	var ids []string
+	f.deps.spawn = func(_ env, args []string) error {
+		for i, a := range args {
+			if a == "--agent-id" {
+				ids = append(ids, args[i+1])
+			}
+		}
+		return errors.New("fixture launcher is out of capacity")
+	}
+	r := f.runner()
+	for i := 0; i <= 3; i++ {
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "successor launch unconfirmed") {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick %d after the ceiling: %v", i+1, err)
+		}
+	}
+	if len(ids) != 4 || ids[0] != ids[1] || ids[0] != ids[2] || ids[0] != ids[3] {
+		t.Fatalf("launch attempts: %v, want four of one successor", ids)
+	}
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared || rotations[0].SuccessorAgentID != ids[0] || !f.journalExists() {
+		t.Fatalf("rotations: %+v", rotations)
+	}
+	notices := f.stuckNotices(t)
+	if len(notices) != 2 || !strings.Contains(notices[0].Envelope.Body.Text, "fixture launcher is out of capacity") {
+		t.Fatalf("notices: %+v", notices)
+	}
+}
+
+// Below the ceiling a successor that comes online completes the rotation as
+// before, and nothing is posted.
+func TestHandlerRotationRunnerCompletesBelowTheCeiling(t *testing.T) {
+	f := newStuckRotation(t)
+	r := f.runner()
+	for i := 0; i < 3; i++ { // the start and two failed resumes
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "did not come online") {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+	rotation := f.assertHeld(t)
+	f.bringOnline(t, rotation.SuccessorAgentID)
+	f.tick(t, r)
+	f.assertRotated(t, f.rotations(t)[0], 1)
+	if f.spawns != 1 || len(f.stuckNotices(t)) != 0 || f.journalExists() {
+		t.Fatalf("spawns=%d notices=%d journal=%v", f.spawns, len(f.stuckNotices(t)), f.journalExists())
+	}
+}
+
+func (f *stuckRotation) bringOnline(t *testing.T, agentID string) {
+	t.Helper()
+	a, err := f.c.GetAgent(context.Background(), f.task.ID, agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.c.PostEvent(context.Background(), f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// After the ceiling a person still resumes or aborts the rotation by hand.
+func TestHandlerRotationManualRecoveryAfterTheCeiling(t *testing.T) {
+	t.Run("resume", func(t *testing.T) {
+		f := newStuckRotation(t)
+		f.toCeiling(t, f.runner())
+		// A manual resume that fails again posts nothing more and the runner stays stopped.
+		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), "did not come online") {
+			t.Fatalf("manual resume: %v", err)
+		}
+		if err := f.try(f.runner()); err != nil || len(f.stuckNotices(t)) != 2 {
+			t.Fatalf("after a failed manual resume: %v notices=%d", err, len(f.stuckNotices(t)))
+		}
+		f.bringOnline(t, f.assertHeld(t).SuccessorAgentID)
+		rotation, err := f.rotate(t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The successor takes over the request and the old handler's notice.
+		detail, err := f.c.GetTask(context.Background(), f.task.ID)
+		if err != nil || rotation.State != api.HandlerRotationCommitted || detail.Task.PrimaryHandlerID != rotation.SuccessorAgentID || rotation.Receipt == nil || rotation.Receipt.Reissued != 2 {
+			t.Fatalf("manual resume: %+v task %+v %v", rotation, detail.Task, err)
+		}
+		if f.spawns != 1 || f.journalExists() {
+			t.Fatalf("spawns=%d journal=%v", f.spawns, f.journalExists())
+		}
+	})
+	t.Run("abort", func(t *testing.T) {
+		f := newStuckRotation(t)
+		r := f.runner()
+		f.toCeiling(t, r)
+		stuck := f.assertHeld(t)
+		aborted, err := abortHandlerRotation(context.Background(), f.deps, f.e, f.c, f.task.ID)
+		if err != nil || aborted.State != api.HandlerRotationAborted || f.journalExists() {
+			t.Fatalf("abort: %+v %v journal=%v", aborted, err, f.journalExists())
+		}
+		// The next due tick starts a fresh rotation with its own count and notice.
+		f.online = true
+		f.tick(t, r)
+		rotations := f.rotations(t)
+		var committed *api.HandlerRotation
+		for i := range rotations {
+			if rotations[i].State == api.HandlerRotationCommitted {
+				committed = &rotations[i]
+			}
+		}
+		if len(rotations) != 2 || committed == nil || committed.SuccessorAgentID == stuck.SuccessorAgentID || len(f.stuckNotices(t)) != 2 {
+			t.Fatalf("rotations: %+v notices=%d", rotations, len(f.stuckNotices(t)))
+		}
+	})
+}
+
+// A busy refusal is a wait, not a failed resume: it is not counted and
+// posts nothing, however often it recurs.
+func TestHandlerRotationRunnerBusyRefusalIsNotAnAttempt(t *testing.T) {
+	f := newStuckRotation(t)
+	f.online = true
+	stop := errors.New("simulated crash")
+	for i := 0; i < 5; i++ {
+		// The host stops after journaling and before the hub prepares; the
+		// handler is working by the time the runner resumes.
+		f.activity(t, f.old, "idle", "", 0)
+		f.deps.after = func(string) error { return stop }
+		if _, err := f.rotate(t); !errors.Is(err, stop) {
+			t.Fatalf("expected the simulated crash, got %v", err)
+		}
+		f.deps.after = nil
+		f.activity(t, f.old, "working", "", 0)
+		if err := f.try(f.runner()); err != nil {
+			t.Fatalf("busy resume %d: %v", i+1, err)
+		}
+		if f.journalExists() || f.spawns != 0 {
+			t.Fatalf("busy resume %d: journal=%v spawns=%d", i+1, f.journalExists(), f.spawns)
+		}
+	}
+	if n := len(f.stuckNotices(t)); n != 0 {
+		t.Fatalf("busy refusals posted %d notices", n)
+	}
+	f.activity(t, f.old, "idle", "", 0)
+	f.tick(t, f.runner())
+	f.assertRotated(t, f.rotations(t)[0], 1)
 }

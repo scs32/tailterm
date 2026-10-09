@@ -151,6 +151,10 @@ type handlerRotationJournal struct {
 	// The host's evidence for a dead_primary rotation, as sent at prepare, so
 	// a replayed prepare carries the same payload.
 	DeathEvidence *api.HandlerDeathEvidence `json:"deathEvidence,omitempty"`
+	// ResumeFailures counts the runner's resumes of this rotation that ended
+	// with no successor online; it is kept here so a relay restart keeps it.
+	ResumeFailures  int    `json:"resumeFailures,omitempty"`
+	LastResumeError string `json:"lastResumeError,omitempty"`
 }
 
 // rotationAuthorization is the owner's authorization for a rotation that may
@@ -620,7 +624,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		launch := e
 		launch.hub, launch.task, launch.agent, launch.agentName, launch.runID = hub, task, "", "", ""
 		if err := d.spawn(launch, args); err != nil {
-			return zero, fmt.Errorf("successor launch unconfirmed; rerun to resume or abort with tt handler rotate --abort: %w", err)
+			return zero, successorStartError{fmt.Errorf("successor launch unconfirmed; rerun to resume or abort with tt handler rotate --abort: %w", err)}
 		}
 		if err = save(rotationPhaseSpawned); err != nil {
 			return zero, err
@@ -634,7 +638,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 				break
 			}
 			if !time.Now().Before(deadline) {
-				return zero, fmt.Errorf("successor %s did not come online within %s; the rotation stays prepared: rerun to resume or abort with tt handler rotate --abort", j.SuccessorName, d.online)
+				return zero, successorStartError{fmt.Errorf("successor %s did not come online within %s; the rotation stays prepared: rerun to resume or abort with tt handler rotate --abort", j.SuccessorName, d.online)}
 			}
 			select {
 			case <-ctx.Done():
@@ -681,6 +685,36 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		return zero, err
 	}
 	return c.GetHandlerRotation(ctx, task, j.RotationID)
+}
+
+// successorStartError marks a rotation left prepared because its successor
+// could not be launched or did not come online. Only these count toward the
+// runner's resume ceiling.
+type successorStartError struct{ err error }
+
+func (e successorStartError) Error() string { return e.err.Error() }
+func (e successorStartError) Unwrap() error { return e.err }
+
+// recordResumeFailure adds one failed resume to the journal the runner just
+// resumed and returns it as saved. It returns nil when that journal is gone
+// or now records a different rotation.
+func recordResumeFailure(ctx context.Context, hub, task string, resumed *handlerRotationJournal, cause error) (*handlerRotationJournal, error) {
+	path := handlerRotationJournalPath(hub, task)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	j, err := loadRotationJournal(hub, task)
+	if err != nil || j == nil || j.PrepareRequestID != resumed.PrepareRequestID {
+		return nil, err
+	}
+	j.ResumeFailures++
+	j.LastResumeError = cause.Error()
+	if len(j.LastResumeError) > 400 {
+		j.LastResumeError = j.LastResumeError[:400]
+	}
+	return j, writePrivateJSON(path, *j)
 }
 
 // errDeathNotConfirmed marks a dead primary rotation the runner aborted
@@ -1167,6 +1201,12 @@ type rotationRunner struct {
 
 const rotationQuietCache = 5 * time.Minute
 
+// rotationResumeCeiling is how many failed resumes of one prepared rotation
+// the runner makes before it stops and tells the owner helper and the handler.
+const rotationResumeCeiling = 3
+
+const rotationStuckSubject = "A handler rotation is stuck because its successor never came online"
+
 var hostRotationRunner = &rotationRunner{deps: productionRotationDeps(), now: time.Now, interval: time.Minute, notified: map[string]bool{}}
 
 func relayHandlerRotationTick(ctx context.Context) error {
@@ -1294,8 +1334,27 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				errs = append(errs, fmt.Errorf("handler rotation %s: the launch spec was removed during a rotation", d.TaskID))
 				continue
 			}
-			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
+			// A rotation whose successor failed to start at every resume up to
+			// the ceiling stays prepared for a person to resume or abort.
+			if journal.ResumeFailures >= rotationResumeCeiling {
+				if err := r.notifyStuckRotation(ctx, c, host, d, journal); err != nil {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			_, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{})
+			if err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
+			}
+			if errors.As(err, &successorStartError{}) {
+				saved, err := recordResumeFailure(ctx, hub, d.TaskID, journal, err)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
+				} else if saved != nil && saved.ResumeFailures >= rotationResumeCeiling {
+					if err := r.notifyStuckRotation(ctx, c, host, d, saved); err != nil {
+						errs = append(errs, err)
+					}
+				}
 			}
 			continue
 		}
@@ -1386,6 +1445,46 @@ func (r *rotationRunner) notifyMissingSpec(ctx context.Context, c *api.Client, h
 			d.Agent.Name, d.Agent.ID, d.Agent.RunID, strings.Join(reasons, ", "), host, d.TaskID, d.TaskID)}}
 	if _, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key}); err != nil {
 		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+	}
+	r.notified[key] = true
+	return nil
+}
+
+// notifyStuckRotation tells the project's owner helper and the handler being
+// replaced, once each per rotation, that the runner stopped resuming it. The
+// request identities name the rotation, so a restarted relay posts no second
+// notice; a failed post is tried again on a later tick.
+func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client, host string, d api.HandlerRotationDue, j *handlerRotationJournal) error {
+	key := "handler-rotation-stuck-" + strings.TrimPrefix(j.PrepareRequestID, "rotation-prepare-")
+	if r.notified[key] {
+		return nil
+	}
+	detail, err := c.GetTask(ctx, d.TaskID)
+	if err != nil {
+		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+	}
+	// The owner helper first; with none registered the notice goes to the Board.
+	recipients := []api.Agent{{}}
+	for _, a := range detail.Agents {
+		if a.Role == api.AgentRoleOwnerHelper && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.Status != api.AgentRetired {
+			recipients[0] = a
+		}
+	}
+	old := j.OldAgentID
+	for _, a := range detail.Agents {
+		if a.ID == j.OldAgentID && a.Status != api.AgentClosed {
+			recipients = append(recipients, a)
+			old = a.Name + " (" + a.ID + ")"
+		}
+	}
+	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. Fix the launch (the saved spec from tt handler spec, or the host's capacity), then resume it on that host with tt handler rotate --task %s, or abort it with tt handler rotate --abort --task %s.",
+		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, j.LastResumeError, d.TaskID, d.TaskID)
+	for i, to := range recipients {
+		env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: rotationStuckSubject,
+			Refs: map[string]string{"host": host, "project": d.TaskID, "successor": j.SuccessorAgentID}, Body: api.EnvelopeBody{Text: text}}
+		if _, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: fmt.Sprintf("%s-%d", key, i)}); err != nil {
+			return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+		}
 	}
 	r.notified[key] = true
 	return nil

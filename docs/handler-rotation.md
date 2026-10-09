@@ -172,7 +172,9 @@ routine keeps a journal of its phases next to the spec: `preparing`, `prepared`,
    handler prompt, plus a line telling it to wait for the handoff NOTICE. Its
    template digest is recorded for its exact run.
 3. **Wait.** The routine waits up to two minutes for the successor to come
-   online. If it does not, the rotation stays prepared.
+   online. If it does not, the rotation stays prepared. The runner resumes it
+   only up to a ceiling; see
+   [A successor that never comes online](#a-successor-that-never-comes-online).
 4. **Commit.** In one hub transaction, the hub:
    - re-checks that the old handler is idle
    - verifies the successor is online on the same host and directory, and on
@@ -551,7 +553,8 @@ loops every 3 seconds, so the tick spaces these requests: at most one a minute
 while a listed policy is enabled, and an empty answer is cached for 5 minutes.
 For each listed project:
 
-- A local journal for the project: resume that rotation.
+- A local journal for the project: resume that rotation, unless it has
+  reached the resume ceiling below.
 - Due and idle with a saved spec: rotate, with trigger `runner` and the first
   due reason.
 - Due but busy: nothing this tick. It rotates on the first idle tick.
@@ -564,6 +567,46 @@ For each listed project:
   the limits and never by them.
 - Policy disabled: the project is listed only while its primary is a dead
   candidate, and the runner acts on no limit for it.
+
+### A successor that never comes online
+
+A prepared rotation whose successor cannot start, because of a bad launch spec
+or a host out of capacity, is not resumed without end. The runner counts each
+resume that ends with the launch unconfirmed or the successor not online
+within the two minute wait. The count is kept with the rotation in the host
+journal (`resumeFailures`, `lastResumeError`), so a relay restart does not
+reset it.
+
+After 3 failed resumes of one rotation the runner stops resuming it:
+
+- The rotation stays prepared. The runner does not abort it.
+- The same successor identity is used for every attempt, and no other
+  successor is launched.
+- The old handler stays the primary, with its leases and obligations.
+- The runner posts one NOTICE to the project's owner helper and one to the
+  handler being replaced, once per rotation and not per tick. With no owner
+  helper registered, that copy goes to the Board. Each names the project, the
+  handler, the successor, the host, the number of failed resumes and the last
+  error, with the two recovery commands. The request identities name the
+  rotation, so a restarted relay posts no second notice.
+
+The run that prepares the rotation is not a resume, so the successor gets
+four chances in all. A busy refusal and a dead primary refusal are waits and
+are not counted. A successor that comes online on a resume below the ceiling
+commits as usual, and nothing is posted.
+
+Recovery is by hand, on the handler's host, after fixing the launch (the saved
+spec from `tt handler spec`, or the host's capacity):
+
+```sh
+tt handler rotate --task TASK          # resume the prepared rotation
+tt handler rotate --abort --task TASK  # abort it; the old handler stays primary
+```
+
+Both work after the ceiling. A manual resume that fails again leaves the
+runner stopped and posts nothing more. After an abort, a rotation that is
+still due starts fresh with its own count. While a rotation is stuck, queue
+dispatch still leases neither handler, as for any prepared rotation.
 
 ## API
 
@@ -633,8 +676,9 @@ directory are inert without the new CLI.
 - An exited primary that is not busy is not replaced by this rule; see the
   handler floor and follow-up `wi_42be87739d7bbfc9`.
 - The queue's waiting reason for a project whose primary exited is unchanged.
-- A dead primary rotation whose successor cannot start stays prepared and is
-  resumed from the journal, with no retry ceiling.
+- The resume ceiling counts only a successor that could not be launched or
+  did not come online. A resume that fails another way, such as a hub that
+  cannot be reached at commit, is still retried on every tick.
 - The hub does not reprovision a handler when the count reaches zero; that is
   follow-up `wi_42be87739d7bbfc9`.
 - `tt close` still refuses a database handler that is not retired on the client
