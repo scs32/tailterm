@@ -534,15 +534,17 @@ func (s *Store) ListObligations(ctx context.Context, taskID string, f Obligation
 }
 
 // MarkObligationsDelivered records that the recipient's current run fetched
-// its obligations. Delivery is not acknowledgement; delivery-only obligations
-// close here.
+// its obligations. Delivery is not acknowledgement. A delivery-only obligation
+// closes here only once the recipient has read its message: tt obligations and
+// its Stop hook do not show it to the agent, so an unread one stays queued for
+// its wake (wi_d7f867abcc87999c).
 func (s *Store) MarkObligationsDelivered(ctx context.Context, taskID, agentID, runID string, now time.Time) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := s.requireCurrentRun(ctx, s.db, taskID, agentID, runID); err != nil {
 		return err
 	}
-	return s.markDelivered(ctx, s.db, `task_id=? AND agent_id=?`, []any{taskID, agentID}, now)
+	return s.markDelivered(ctx, s.db, `task_id=? AND agent_id=?`, []any{taskID, agentID}, now, true)
 }
 
 type execer interface {
@@ -550,16 +552,25 @@ type execer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func (s *Store) markDelivered(ctx context.Context, db execer, where string, args []any, now time.Time) error {
+// markDelivered closes queued delivery-only obligations and marks the other
+// queued ones delivered. With readOnly, a delivery-only obligation closes only
+// when its message is at or below the recipient's read cursor, checked in the
+// same statement as the update.
+func (s *Store) markDelivered(ctx context.Context, db execer, where string, args []any, now time.Time, readOnly bool) error {
 	t := ts(now)
-	if _, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,delivered_at=?,closed_at=?,changed_at=? WHERE `+where+` AND state=? AND needs=?`,
+	read := ""
+	if readOnly {
+		read = ` AND message_seq<=COALESCE((SELECT up_to FROM read_cursors WHERE read_cursors.task_id=obligations.task_id AND read_cursors.agent_id=obligations.agent_id),0)`
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,outcome=?,delivered_at=?,closed_at=?,changed_at=? WHERE `+where+` AND state=? AND needs=?`+read,
 		append([]any{api.ObligationClosed, api.OutcomeDelivered, t, t, t}, append(args, api.ObligationQueued, api.ObligationNeedsDelivery)...)...); err != nil {
 		return err
 	}
-	// The ack deadline runs from delivery, never earlier than first set.
+	// The ack deadline runs from delivery, never earlier than first set. A
+	// delivery-only obligation left queued above keeps its state.
 	ackDue := ts(now.Add(api.ObligationAckDeadline))
-	_, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,delivered_at=?,changed_at=?,ack_due_at=CASE WHEN ack_due_at<? THEN ? ELSE ack_due_at END WHERE `+where+` AND state=?`,
-		append([]any{api.ObligationDelivered, t, t, ackDue, ackDue}, append(args, api.ObligationQueued)...)...)
+	_, err := db.ExecContext(ctx, `UPDATE obligations SET state=?,delivered_at=?,changed_at=?,ack_due_at=CASE WHEN ack_due_at<? THEN ? ELSE ack_due_at END WHERE `+where+` AND state=? AND needs<>?`,
+		append([]any{api.ObligationDelivered, t, t, ackDue, ackDue}, append(args, api.ObligationQueued, api.ObligationNeedsDelivery)...)...)
 	return err
 }
 
@@ -1060,7 +1071,7 @@ func (s *Store) ReportWakeJob(ctx context.Context, taskID, jobID string, r api.W
 		return err
 	}
 	if r.Status == wakeAccepted {
-		if err := s.markDelivered(ctx, tx, `task_id=? AND agent_id=? AND message_seq<=?`, []any{taskID, agentID, covered}, now); err != nil {
+		if err := s.markDelivered(ctx, tx, `task_id=? AND agent_id=? AND message_seq<=?`, []any{taskID, agentID, covered}, now, false); err != nil {
 			return err
 		}
 		// Wakes deferred behind this one are now covered.

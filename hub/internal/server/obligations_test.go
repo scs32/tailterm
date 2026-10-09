@@ -87,6 +87,15 @@ func TestRecentWithdrawnQueryIsBoundedAcrossClosedHistory(t *testing.T) {
 			}
 		}
 	}
+	// The builder reads its withdrawal and cancellation notices; fetching what
+	// it owes then closes them.
+	var readTo int64
+	for _, o := range f.list(t, store.ObligationFilter{AgentID: f.builder.ID}, time.Now()) {
+		readTo = max(readTo, o.MessageSeq)
+	}
+	if err := f.c.st.MarkRead(f.ctx, f.task.ID, api.MarkReadRequest{AgentID: f.builder.ID, UpTo: readTo}); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.c.st.MarkObligationsDelivered(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -584,5 +593,76 @@ func TestSettlementNeedsFittingKindAndRun(t *testing.T) {
 		if o.MessageSeq == a.Seq && o.Outcome != api.OutcomeResult {
 			t.Fatalf("current run's result did not settle the assignment: %+v", o)
 		}
+	}
+}
+
+// wi_d7f867abcc87999c: listing what an agent owes (the Stop hook runs
+// tt obligations) is not delivery of a notice it has not read. The notice's
+// obligation stays queued, so its wake job still wakes the recipient.
+func TestListingObligationsLeavesAnUnreadNoticeUndelivered(t *testing.T) {
+	f := newOblFixture(t)
+	notice := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: f.builder.Name, Subject: "The release window moved to tomorrow", Body: api.EnvelopeBody{Text: "Hold the rebase until then."}}})
+	assign := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID, Envelope: assignFrom(f.lead, f.builder.Name)})
+	f.heartbeat(t, f.builder)
+	bySeq := func(seq int64) api.Obligation {
+		t.Helper()
+		rows := f.list(t, store.ObligationFilter{FromSeq: seq, ToSeq: seq}, time.Now())
+		if len(rows) != 1 {
+			t.Fatalf("obligation for #%d: %+v", seq, rows)
+		}
+		return rows[0]
+	}
+	before := bySeq(notice.Seq)
+	if before.Needs != api.ObligationNeedsDelivery || before.State != api.ObligationQueued {
+		t.Fatalf("notice obligation before the listing: %+v", before)
+	}
+	listPath := "/v1/tasks/" + f.task.ID + "/obligations?open=1&agentId=" + f.builder.ID + "&runId=" + f.builder.RunID
+	var listed api.ObligationList
+	for i := 0; i < 2; i++ {
+		if code := f.c.do("GET", listPath, nil, &listed); code != 200 || len(listed.Obligations) != 2 {
+			t.Fatalf("listing %d: %d %+v", i, code, listed)
+		}
+	}
+	after := bySeq(notice.Seq)
+	if after.State != before.State || after.Outcome != "" || after.DeliveredAt != nil || after.ClosedAt != nil {
+		t.Fatalf("listing changed the unread notice's delivery state: %+v", after)
+	}
+	if n, err := f.c.st.Unread(f.ctx, f.task.ID, f.builder.ID); err != nil || n != 2 {
+		t.Fatalf("unread after the listing: %d %v", n, err)
+	}
+	// The listing does show the agent the work it owes, so that is delivered
+	// (never acknowledged) as before.
+	if o := bySeq(assign.Seq); o.State != api.ObligationDelivered || o.DeliveredAt == nil || o.AckedAt != nil {
+		t.Fatalf("listed assignment: %+v", o)
+	}
+	// The notice's wake is still due and still names it.
+	now := time.Now().UTC().Add(time.Second)
+	job, err := f.c.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, now)
+	if err != nil || job == nil || job.MessageSeq != notice.Seq || !containsAll(job.Prompt, "#"+itoa(notice.Seq)) {
+		t.Fatalf("wake for the unread notice: %v %+v", err, job)
+	}
+	// Acknowledging still closes it as delivered.
+	o, err := f.c.st.ObligationAction(f.ctx, f.task.ID, notice.Seq, "ack", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, now)
+	if err != nil || o.State != api.ObligationClosed || o.Outcome != api.OutcomeDelivered {
+		t.Fatalf("ack of the notice: %v %+v", err, o)
+	}
+	// Once the recipient has read a notice, a listing closes it as delivered;
+	// a later one it has not read stays queued.
+	read := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: f.builder.Name, Subject: "The release window is confirmed", Body: api.EnvelopeBody{Text: "Tomorrow at ten."}}})
+	if code := f.c.do("POST", "/v1/tasks/"+f.task.ID+"/messages/read", api.MarkReadRequest{AgentID: f.builder.ID, UpTo: read.Seq}, nil); code != 200 {
+		t.Fatalf("mark read: %d", code)
+	}
+	unread := f.post(t, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: f.builder.ID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, To: f.builder.Name, Subject: "The release window moved again", Body: api.EnvelopeBody{Text: "Now Friday."}}})
+	if code := f.c.do("GET", listPath, nil, &listed); code != 200 {
+		t.Fatalf("listing after the read: %d", code)
+	}
+	if o := bySeq(read.Seq); o.State != api.ObligationClosed || o.Outcome != api.OutcomeDelivered || o.DeliveredAt == nil {
+		t.Fatalf("listing left a read notice open: %+v", o)
+	}
+	if o := bySeq(unread.Seq); o.State != api.ObligationQueued || o.Outcome != "" || o.DeliveredAt != nil {
+		t.Fatalf("listing closed a notice sent after the read: %+v", o)
 	}
 }
