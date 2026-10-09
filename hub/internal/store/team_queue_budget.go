@@ -84,8 +84,14 @@ type queueBudgetCheck struct {
 	// reserved is nil until loadReserved has run.
 	reserved []budgetReservedEntry
 	// outstanding caches reservedOutstanding by the instant the source
-	// reflects, in Unix nanoseconds; zero is the allowance source.
-	outstanding map[int64]budgetReservation
+	// reflects, in Unix nanoseconds (zero is the allowance source), and by
+	// whether failed entries were left out.
+	outstanding map[budgetReservationKey]budgetReservation
+}
+
+type budgetReservationKey struct {
+	upTo       int64
+	skipFailed bool
 }
 
 // budgetReservedEntry is a slot-holding entry with the estimate it was
@@ -104,7 +110,7 @@ type budgetReservation struct {
 }
 
 func newQueueBudgetCheck(task string, now time.Time) *queueBudgetCheck {
-	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}, outstanding: map[int64]budgetReservation{}}
+	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}, outstanding: map[budgetReservationKey]budgetReservation{}}
 }
 
 // loadReserved reads the project's entries that hold a slot (launching,
@@ -184,15 +190,16 @@ func budgetTeamSpend(ctx context.Context, q queryRower, task, item string, runs 
 // reflects). The allowance source subtracts every reported turn, so all of a
 // team's spend is reflected. A provider reading reflects use only up to its
 // capture instant, so spend uploaded after it does not shrink the reservation
-// until a newer reading arrives.
-func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower, state usageBudgetState) (budgetReservation, error) {
+// until a newer reading arrives. With skipFailed the failed entries are left
+// out: what would be reserved if every failed entry were released.
+func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower, state usageBudgetState, skipFailed bool) (budgetReservation, error) {
 	var upTo time.Time
 	if state.source == api.UsageBudgetSourceProvider {
 		upTo = state.captured
 	}
-	key := int64(0)
+	key := budgetReservationKey{skipFailed: skipFailed}
 	if !upTo.IsZero() {
-		key = upTo.UnixNano()
+		key.upTo = upTo.UnixNano()
 	}
 	if cached, ok := c.outstanding[key]; ok {
 		return cached, nil
@@ -202,6 +209,9 @@ func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower
 	}
 	out := budgetReservation{tokens: new(big.Rat)}
 	for _, r := range c.reserved {
+		if skipFailed && r.entry.State == "failed" {
+			continue
+		}
 		spent, err := budgetTeamSpend(ctx, q, c.task, r.entry.ItemID, r.runs, upTo)
 		if err != nil {
 			return budgetReservation{}, err
@@ -267,6 +277,28 @@ func estimateDefaultText(d api.TeamQueueEstimateDefault) string {
 // usable source and the entry's estimate fits what remains after the reserve
 // and what the slot-holding teams have not yet drawn from that source.
 func (c *queueBudgetCheck) admission(ctx context.Context, q queryRower, e api.TeamQueueEntry) (string, error) {
+	return c.admissionReason(ctx, q, e, false)
+}
+
+// heldOnlyByFailed reports whether a queued entry the budget holds would fit
+// if every failed entry were released: it waits for a release, not for the
+// budget, so its stall behind the failed entry must stay visible.
+func (c *queueBudgetCheck) heldOnlyByFailed(ctx context.Context, q queryRower, e api.TeamQueueEntry) (bool, error) {
+	if err := c.loadReserved(ctx, q); err != nil {
+		return false, err
+	}
+	failed := false
+	for _, r := range c.reserved {
+		failed = failed || r.entry.State == "failed"
+	}
+	if !failed {
+		return false, nil
+	}
+	reason, err := c.admissionReason(ctx, q, e, true)
+	return reason == "", err
+}
+
+func (c *queueBudgetCheck) admissionReason(ctx context.Context, q queryRower, e api.TeamQueueEntry, skipFailed bool) (string, error) {
 	states, loaded := c.states[e.Host]
 	if !loaded {
 		var err error
@@ -296,7 +328,7 @@ func (c *queueBudgetCheck) admission(ctx context.Context, q queryRower, e api.Te
 			return fmt.Sprintf("%s: no usable source. Provider reading for host %s %s and no reset time is set", name, e.Host, state.reading), nil
 		}
 		reserve := big.NewRat(row.AllowanceTokens*int64(row.ReservePercent), 100)
-		admitted, err := c.reservedOutstanding(ctx, q, state)
+		admitted, err := c.reservedOutstanding(ctx, q, state, skipFailed)
 		if err != nil {
 			return "", err
 		}
@@ -633,6 +665,8 @@ func budgetHeldReason(task string, h api.BudgetHold) string {
 // default of an entry whose item has no saved estimate, the hold of a running
 // entry, and the reason the budget holds a queued entry, which it returns by
 // entry id. A reason is written only where nothing earlier explained the wait.
+// An entry that only the reservation of a failed, unreleased entry holds is
+// not returned: its wait ends with a release, so its stall stays.
 func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api.TeamQueueList, now time.Time) (map[string]string, error) {
 	check := newQueueBudgetCheck(task, now)
 	held := map[string]string{}
@@ -664,9 +698,15 @@ func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api
 			return nil, err
 		}
 		if reason != "" {
-			held[e.ID] = reason
 			if e.BlockReason == "" {
 				e.BlockReason = reason
+			}
+			release, err := check.heldOnlyByFailed(ctx, q, *e)
+			if err != nil {
+				return nil, err
+			}
+			if !release {
+				held[e.ID] = reason
 			}
 		}
 	}

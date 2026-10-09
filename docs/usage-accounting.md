@@ -251,7 +251,7 @@ The fit is `remaining − allowance × reserve ÷ 100 − reserved ≥ estimate`
 - **Allowance source.** Remaining already subtracts every reported turn, so all of the team's reported tokens on its item are reflected: the reservation falls by exactly what the team reports, and is zero once the team is past its estimate.
 - **Provider source.** The reading reflects use only up to its capture instant, so only the team's turns at or before that instant are reflected. Tokens uploaded after it do not shrink the reservation until a newer reading arrives.
 
-A failed entry reserves until it is released, because its runs can still spend. A queued entry reserves nothing. An entry admitted before the window began is still reserved, and every slot-holding team of the project is reserved against every row, on every host.
+A failed entry reserves until it is released, because its runs can still spend. A queued entry that would fit if the failed entries were released waits for that release, not for the budget: its claim is still refused, but it keeps its stall, which names the failed entry and the release, and its stall notice is sent. A queued entry reserves nothing. An entry admitted before the window began is still reserved, and every slot-holding team of the project is reserved against every row, on every host.
 
 ### Admission reasons
 

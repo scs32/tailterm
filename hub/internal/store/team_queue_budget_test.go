@@ -546,8 +546,21 @@ func TestQueueBudgetFailedEntryReservesUntilRelease(t *testing.T) {
 	if got := f.held(b, "the failed entry still reserves"); got != before {
 		t.Fatalf("behind a failed entry\n%q\nwant\n%q", got, before)
 	}
-	// The release needs the started lead of the frozen plan closed and cleaned
-	// up, as the runner leaves it.
+	f.releaseFailed(failed)
+	if got := f.listed(b.ID).BlockReason; got != "" {
+		t.Fatalf("after the release: %q", got)
+	}
+	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim after the release: %+v %v", claimed, err)
+	}
+}
+
+// releaseFailed closes and cleans up the started lead of a failed entry's
+// frozen plan and every team agent, as the runner leaves them, and releases
+// the entry.
+func (f *budgetQueue) releaseFailed(failed api.TeamQueueEntry) {
+	f.t.Helper()
+	t := f.t
 	var plan struct {
 		Members []struct {
 			RunID  string `json:"runId"`
@@ -564,14 +577,44 @@ func TestQueueBudgetFailedEntryReservesUntilRelease(t *testing.T) {
 	if _, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: lead.Fields.Name, AgentID: lead.Fields.AgentID, Host: "mini", Session: lead.Fields.Name}, f.by); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.s.db.Exec(`UPDATE agents SET run_id=?,status='closed',cleanup_done=1 WHERE task_id=? AND id=?`, lead.RunID, f.task.ID, lead.Fields.AgentID); err != nil {
+	if _, err := f.s.db.Exec(`UPDATE agents SET run_id=? WHERE task_id=? AND id=?`, lead.RunID, f.task.ID, lead.Fields.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed',cleanup_done=1 WHERE task_id=? AND role=''`, f.task.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "release", EntryID: failed.ID, ExpectedRevision: failed.Revision}); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if got := f.listed(b.ID).BlockReason; got != "" {
-		t.Fatalf("after the release: %q", got)
+}
+
+// Review b1: an entry that fits alone and waits only for the reservation of a
+// failed, unreleased entry keeps its stall, which names that entry and the
+// release, and its stall notice is accepted. Its claim stays refused until the
+// release.
+func TestQueueBudgetFailedReservationKeepsStall(t *testing.T) {
+	f := newBudgetQueue(t, 2)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a := f.run(t, f.add(t, 0, "src"))
+	b := f.add(t, 1, "src/b")
+	failed := f.fail(t, a)
+	f.member(t, 0, "member-a")
+	assertStall(t, f.choresQueue, b.ID, api.StallFailedEntry, failed.ID)
+	stall := f.stall(t, b.ID)
+	f.advance(time.Hour)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: stall.NoticeRequestID(b.ID), Operation: "stall_notice", EntryID: b.ID}); err != nil {
+		t.Fatalf("stall notice behind a failed entry that reserves: %v", err)
+	}
+	if _, err := f.claim(b); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("claim behind the failed entry: %v", err)
+	}
+	f.releaseFailed(failed)
+	if got := f.listed(b.ID); got.Stall != nil || got.BlockReason != "" {
+		t.Fatalf("after the release: stall %+v reason %q", got.Stall, got.BlockReason)
 	}
 	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
 		t.Fatalf("claim after the release: %+v %v", claimed, err)

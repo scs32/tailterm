@@ -1705,7 +1705,9 @@ allowance source every reported turn of the team is reflected, so the
 reservation falls as the team reports usage. On the provider source only the
 team's turns at or before the reading's capture instant are reflected, so the
 reservation shrinks only when a newer reading arrives. A failed entry reserves
-until it is released; a queued entry reserves nothing. The reason then carries
+until it is released; a queued entry reserves nothing. A queued entry that
+only a failed entry's reservation holds keeps its stall behind that entry, so
+the release it waits for stays visible. The reason then carries
 `, 700.00K reserved for 1 admitted team` before its source.
 
 **The reason.** A budget-held entry shows its reason as `blockReason` when no
