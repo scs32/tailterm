@@ -1687,10 +1687,12 @@ section is what the queue does with them.
 queued entry whose estimate the remaining budget cannot cover, the same way it
 skips an entry that waits for a rebind. The skipped entry stays `queued`,
 nothing is written, and its claim gets the existing "not queue head" conflict,
-which the runner treats as quiet. In a parallel project a later entry that
-fits is claimed past it. In a serial project the runner tries only the first
-queued entry each pass, so a budget-held head keeps the later entries queued
-until the budget covers it: the head skip helps only parallel projects.
+which the runner treats as quiet. A later entry that fits is claimed past it.
+In a serial project the runner tries one queued entry each pass, and an entry
+whose listed reason starts `Token budget` does not take that turn and costs no
+request, so the next queued entry is tried. A serial head listed with a slot or
+handler reason, which come before the budget reason, is still the only entry
+tried that pass.
 The estimate is the item's saved estimate or, without one, the project's lane
 default for the entry's template and Go race. The check runs only for queued
 entries: a launching or running entry is never failed, held or changed by it.
@@ -1781,8 +1783,7 @@ reservation's time; any other entry keeps an empty value and is read from its
 creation time, as before. A backfilled entry's team figure can therefore be
 smaller than before, never larger.
 
-Limits: every budget row applies to every entry whatever its runtime; in a
-serial project a budget-held head holds the whole queue; in a parallel one a
-large held entry can be passed by smaller ones for as long as the budget does not
-cover it; and stopping a held team does not end its sessions, which is the
+Limits: every budget row applies to every entry whatever its runtime; a large
+held entry can be passed by smaller ones for as long as the budget does not
+cover it, in a serial project as in a parallel one; and stopping a held team does not end its sessions, which is the
 failed-entry cleanup above.

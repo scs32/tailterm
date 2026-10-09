@@ -279,13 +279,15 @@ func productionTeamRunner() teamRunner {
 
 // Slow queue listings (docs/project-overview.md, "Reading Board history").
 // A listing that times out starts an episode: the tick keeps acting on the
-// last good listing for the entries it already knows, tries a live listing
-// again only after a growing delay, and tells the owner helper once.
+// last good listing for the entries it already knows, however old, tries a
+// live listing again only after a growing delay, and tells the owner helper
+// once. The episode ends after queueListingRecoverTicks ticks in a row whose
+// listings all answered, so a hub that flaps stays in one episode.
 const (
-	queueListingMaxAge     = 10 * time.Minute
-	queueListingRetryFirst = 6 * time.Second
-	queueListingRetryMax   = time.Minute
-	queueListingSlowTitle  = "Queue listing slow"
+	queueListingRetryFirst   = 6 * time.Second
+	queueListingRetryMax     = time.Minute
+	queueListingRecoverTicks = 3
+	queueListingSlowTitle    = "Queue listing slow"
 )
 
 type queueListingAt struct {
@@ -297,6 +299,11 @@ type slowListingEpisode struct {
 	start, next time.Time
 	delay       time.Duration
 	cause       error
+	// good counts the ticks in a row whose listings all answered.
+	good int
+	// unowned records that the relay log was told no owner helper is bound
+	// here to notice for a host listing with no last good copy.
+	unowned bool
 	// noticed holds the projects whose owner helper was told in this episode.
 	noticed map[string]bool
 }
@@ -357,28 +364,38 @@ func (h *hubQueueListings) timedOut(now time.Time, cause error) {
 	}
 	ep := h.episode
 	ep.delay = min(max(2*ep.delay, queueListingRetryFirst), queueListingRetryMax)
-	ep.next, ep.cause = now.Add(ep.delay), cause
+	ep.next, ep.cause, ep.good = now.Add(ep.delay), cause, 0
 }
 
-// recovered ends the episode after a tick whose listings all answered.
+// recovered counts a tick whose listings all answered. The episode ends at
+// queueListingRecoverTicks such ticks in a row; until then the next tick
+// lists live again, and a timeout continues the same episode.
 func (h *hubQueueListings) recovered(now time.Time) {
 	h.mu.Lock()
 	ep := h.episode
+	if ep == nil {
+		h.mu.Unlock()
+		return
+	}
+	ep.good++
+	if ep.good < queueListingRecoverTicks {
+		ep.next = now
+		h.mu.Unlock()
+		return
+	}
 	h.episode = nil
 	h.mu.Unlock()
-	if ep != nil {
-		fmt.Fprintf(os.Stderr, "[tt relay] team queue listing answers again after %s slow\n", now.Sub(ep.start).Round(time.Second))
-	}
+	fmt.Fprintf(os.Stderr, "[tt relay] team queue listing answers again after %s slow\n", now.Sub(ep.start).Round(time.Second))
 }
 
-// slowErr is what a tick reports when it has no listing young enough to use.
+// slowErr is what a tick reports when it has no last good listing to use.
 func (h *hubQueueListings) slowErr() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.episode == nil {
 		return errors.New("team queue listing unavailable")
 	}
-	return fmt.Errorf("team queue listing timed out with no last good listing under %s old; next attempt in %s: %w", queueListingMaxAge, h.episode.delay, h.episode.cause)
+	return fmt.Errorf("team queue listing timed out with no last good listing; next attempt in %s: %w", h.episode.delay, h.episode.cause)
 }
 
 func (h *hubQueueListings) save(kind map[string]queueListingAt, key string, list api.TeamQueueList, now time.Time) {
@@ -387,16 +404,50 @@ func (h *hubQueueListings) save(kind map[string]queueListingAt, key string, list
 	kind[key] = queueListingAt{list: list, at: now}
 }
 
-// lastGood returns a saved listing young enough to act on.
-func (h *hubQueueListings) lastGood(kind map[string]queueListingAt, key string, now time.Time) (queueListingAt, bool) {
+// lastGood returns the saved listing, whatever its age. It is read only
+// inside a slow episode, where it names the entries already known: a stale
+// pass reads each in-progress entry again by itself and starts nothing.
+func (h *hubQueueListings) lastGood(kind map[string]queueListingAt, key string) (queueListingAt, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	saved, ok := kind[key]
-	if !ok || now.Sub(saved.at) > queueListingMaxAge {
-		delete(kind, key)
-		return queueListingAt{}, false
+	return saved, ok
+}
+
+// noticeNoHostListing handles a host listing that timed out with no last good
+// copy, so no project is known from the hub. It tells the owner helper of
+// each project that has an owner helper bound to this hub in the relay state
+// directory, once per episode, and with no such binding says so once in the
+// relay log. It runs only on a tick that tried the live listing.
+func (r teamRunner) noticeNoHostListing(ctx context.Context, c *api.Client, h *hubQueueListings, host string, now time.Time) {
+	hub := strings.TrimRight(c.Base, "/")
+	paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.binding.json"))
+	seen := map[string]bool{}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var b runtimeBinding
+		if json.Unmarshal(data, &b) != nil || !validBinding(b) || b.Role != api.AgentRoleOwnerHelper || strings.TrimRight(b.Hub, "/") != hub || seen[b.Task] {
+			continue
+		}
+		seen[b.Task] = true
+		r.noticeSlowListing(ctx, c, h, b.Task, host, nil, now)
 	}
-	return saved, true
+	if len(seen) > 0 {
+		return
+	}
+	h.mu.Lock()
+	ep := h.episode
+	logged := ep == nil || ep.unowned
+	if ep != nil {
+		ep.unowned = true
+	}
+	h.mu.Unlock()
+	if !logged {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue host listing timed out with no last good listing, and no owner helper is bound on this host to be told\n")
+	}
 }
 
 // noticeSlowListing tells the project's owner helper, once per episode, that
@@ -419,9 +470,9 @@ func (r teamRunner) noticeSlowListing(ctx context.Context, c *api.Client, h *hub
 			}
 		}
 	}
-	basis := "It has no last good listing under " + queueListingMaxAge.String() + " old, so this project's queue is not advanced until a listing answers."
+	basis := "It has no last good listing, so this project's queue is not advanced until a listing answers."
 	if used != nil {
-		basis = fmt.Sprintf("It is acting on the last good listing, now %s old: launching and running teams still advance, and queued entries start only after a live listing.", now.Sub(used.at).Round(time.Second))
+		basis = fmt.Sprintf("It is acting on the last good listing, now %s old: running teams still advance, queued entries start only after a live listing, and a parallel launch continues only on a tick whose host listing answered.", now.Sub(used.at).Round(time.Second))
 	}
 	limit := "its time limit"
 	if c.HTTP != nil && c.HTTP.Timeout > 0 {
@@ -458,6 +509,8 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	// between the attempts of a slow episode, and after the first timeout of
 	// this tick, so one tick waits out at most one slow listing.
 	live := listings.liveDue(now)
+	// hostTimedOut is whether this tick's own host listing timed out.
+	hostTimedOut := false
 	var list api.TeamQueueList
 	if live {
 		var err error
@@ -467,13 +520,16 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			return err
 		} else {
 			listings.timedOut(now, err)
-			live = false
+			live, hostTimedOut = false, true
 		}
 	}
 	hostListed := live
 	if !hostListed {
-		saved, ok := listings.lastGood(listings.host, host, now)
+		saved, ok := listings.lastGood(listings.host, host)
 		if !ok {
+			if hostTimedOut {
+				r.noticeNoHostListing(ctx, c, listings, host, now)
+			}
 			return listings.slowErr()
 		}
 		list = saved.list
@@ -521,7 +577,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		// stale marks a project served from its last good listing.
 		stale := !live
 		if stale {
-			saved, ok := listings.lastGood(listings.active, taskID, now)
+			saved, ok := listings.lastGood(listings.active, taskID)
 			if !ok {
 				r.noticeSlowListing(ctx, c, listings, taskID, host, nil, now)
 				projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, listings.slowErr()))
@@ -556,9 +612,10 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				r.retries.drop(launchRetryKey(c.Base, q.TaskID, q.ID))
 			}
 			// An unsafe host observation cannot start or continue a parallel
-			// launch. Serial teams and already-running parallel teams still
-			// advance through their own close and cleanup paths.
-			if parallel && (hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
+			// launch, and a cached host listing is no observation: it took
+			// no census. Serial teams and already-running parallel teams
+			// still advance through their own close and cleanup paths.
+			if parallel && (!hostListed || hostBudgetErr != nil || list.HostPolicy == nil) && (q.State == "queued" || q.State == "launching") {
 				continue
 			}
 			if q.State == "failed" && q.OwnerIntegration != nil {
@@ -583,6 +640,13 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				continue
 			}
 			if q.State != "queued" && q.State != "launching" && q.State != "running" {
+				continue
+			}
+			if !parallel && q.State == "queued" && strings.HasPrefix(q.BlockReason, tokenBudgetPrefix) {
+				// The hub lists this entry as held by the token budget and
+				// skips it at the head, so it does not take a serial
+				// project's turn and costs no request: the next entry is
+				// tried. The hub still decides that entry's claim.
 				continue
 			}
 			err := r.advance(ctx, e, c, q, host)
@@ -912,6 +976,10 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 // not fit under the project's open-agent cap (docs/project-queue.md, "Project
 // agent cap").
 const projectAgentCapPrefix = "project agent cap: "
+
+// tokenBudgetPrefix starts the hub's listed reason for a queued entry the
+// token budget holds (docs/usage-accounting.md, "Admission reasons").
+const tokenBudgetPrefix = "Token budget"
 
 // registrationAtAgentCap reports a spawn whose agent registration the hub
 // refused because the project is at its open-agent cap. Registration comes

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -420,5 +421,87 @@ func TestProviderUsageInvalidationReachesAdmission(t *testing.T) {
 	}
 	if got := reason(); got != "" {
 		t.Fatalf("allowance source admits: %q", got)
+	}
+}
+
+// runCaptureScript writes the capture command under the test's home and
+// returns a function that runs it there with the given status line JSON.
+func runCaptureScript(t *testing.T) func(stdin string) {
+	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("the capture command needs python3, which this host lacks")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), claudeUsageCaptureName)
+	if err := os.WriteFile(script, []byte(claudeUsageCaptureScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return func(stdin string) {
+		t.Helper()
+		cmd := exec.Command("/bin/sh", script)
+		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+		cmd.Stdin = strings.NewReader(stdin)
+		if out, err := cmd.CombinedOutput(); err != nil || len(out) != 0 {
+			t.Fatalf("capture command: %v, printed %q", err, out)
+		}
+	}
+}
+
+// r3: a status line JSON with no usable rate limits (a session before its
+// first response) leaves the last good capture in place, with its capture
+// time, and the relay reports no invalidation for it.
+func TestClaudeUsageCaptureKeepsGoodReadingWithoutRateLimits(t *testing.T) {
+	path := captureHome(t)
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	run := runCaptureScript(t)
+	run(`{"version":"2.1.292","rate_limits":{"five_hour":{"used_percentage":13,"resets_at":1791470000},"seven_day":{"used_percentage":37,"resets_at":1791970000}}}`)
+	good := readClaudeUsageCapture(path)
+	if good.State != api.ProviderUsageOK || len(good.Windows) != 2 {
+		t.Fatalf("the first capture: %+v", good)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := &providerHub{}
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	state := &providerUsageState{}
+	if err := providerUsageTick(context.Background(), c, "mini", now, state); err != nil {
+		t.Fatal(err)
+	}
+	if got := hub.take(); len(got) != 1 || got[0].State != api.ProviderUsageOK {
+		t.Fatalf("the good reading was reported as %+v", got)
+	}
+	for _, input := range []string{`{"version":"2.1.292"}`, `{"version":"2.1.292","rate_limits":null}`, `{"version":"2.1.292","rate_limits":{}}`, `{"version":"2.1.292","rate_limits":[1]}`} {
+		run(input)
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readClaudeUsageCapture(path); got.State != api.ProviderUsageOK || !got.CapturedAt.Equal(good.CapturedAt) || string(after) != string(before) {
+			t.Errorf("after %s the capture reads %+v, file %s; want the first good reading %s", input, got, after, before)
+		}
+		now = now.Add(10 * time.Minute)
+		if err := providerUsageTick(context.Background(), c, "mini", now, state); err != nil {
+			t.Fatal(err)
+		}
+		if got := hub.take(); len(got) != 0 {
+			t.Errorf("after %s the relay reported %+v, want no report", input, got)
+		}
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Errorf("the capture command left a temporary file: %s", entry.Name())
+		}
 	}
 }

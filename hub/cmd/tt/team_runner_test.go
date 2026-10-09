@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2220,14 +2221,16 @@ func TestTeamRunnerSlowListingReusesLastGoodAndNoticesOnce(t *testing.T) {
 		t.Fatalf("slow ticks posted %d notices, want one to the owner helper %s: %+v", len(notices), helper.ID, notices)
 	}
 
-	// Recovery: the next due attempt answers and ends the episode.
+	// Recovery: the next due attempt answers, and three good ticks in a
+	// row end the episode. Each lists live, with no delay between them.
 	hub.slowActive.Store(false)
 	now = now.Add(queueListingRetryMax)
 	activeBefore, _ = hub.listings()
 	tick("recovery tick")
-	tick("tick after recovery")
-	if active, _ := hub.listings(); active-activeBefore != 2 {
-		t.Fatalf("two ticks after recovery made %d active listing calls, want one each", active-activeBefore)
+	tick("second tick after recovery")
+	tick("third tick after recovery")
+	if active, _ := hub.listings(); active-activeBefore != 3 {
+		t.Fatalf("three ticks after recovery made %d active listing calls, want one each", active-activeBefore)
 	}
 	if got := entry(); got.State != "running" {
 		t.Fatalf("entry after recovery: %s", got.State)
@@ -2256,8 +2259,8 @@ func TestTeamRunnerSlowListingReusesLastGoodAndNoticesOnce(t *testing.T) {
 	}
 }
 
-// wi_765e7089fd176b08 f3: an old listing starts no launch, and one older than
-// ten minutes is not used at all.
+// wi_765e7089fd176b08 f3: an old listing starts no launch. r5 (f1): past ten
+// minutes it is still used, and still starts none.
 func TestTeamRunnerSlowListingStartsNoLaunch(t *testing.T) {
 	f := newTeamFixture(t, true)
 	ctx := context.Background()
@@ -2322,15 +2325,17 @@ func TestTeamRunnerSlowListingStartsNoLaunch(t *testing.T) {
 		t.Fatalf("%d slow listing notices on the last good listing, want one", n)
 	}
 
-	// Past ten minutes the last good listing is not used: the tick reports
-	// the timeout and still launches nothing.
-	now = now.Add(queueListingMaxAge)
-	err = r.tick(ctx, hub.e, hub.c, "fixture")
-	if err == nil || !queueListingTimedOut(err) || !strings.Contains(err.Error(), "no last good listing") {
-		t.Fatalf("tick on a listing older than %s = %v, want the listing timeout", queueListingMaxAge, err)
+	// Thirty minutes on, the last good listing is still used: the tick
+	// reports no error and still launches nothing.
+	now = now.Add(30 * time.Minute)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("tick on a listing 30 minutes old: %v", err)
 	}
 	if spawns != 0 || state() != "queued" {
-		t.Fatalf("tick on an expired listing: %d spawns, entry %s; want no launch", spawns, state())
+		t.Fatalf("tick on a listing 30 minutes old: %d spawns, entry %s; want no launch", spawns, state())
+	}
+	if n := len(slowListingNotices(t, f)); n != 1 {
+		t.Fatalf("%d slow listing notices 30 minutes into the episode, want still one", n)
 	}
 
 	// A live listing launches the entry.
@@ -2342,5 +2347,467 @@ func TestTeamRunnerSlowListingStartsNoLaunch(t *testing.T) {
 	}
 	if spawns != 1 || state() != "running" {
 		t.Fatalf("live tick after the episode: %d spawns, entry %s; want the launch", spawns, state())
+	}
+}
+
+// slowRunningTeam queues the fixture's item through a slow listing hub and
+// ticks it to a running team, with an owner helper registered.
+func slowRunningTeam(t *testing.T, f teamFixture, hub *slowListingHub, r teamRunner) (api.TeamQueueEntry, api.Agent, api.Agent) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "slow-listing-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "slow-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, what := range []string{"launch tick", "running tick"} {
+		if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || q.State != "running" {
+		t.Fatalf("entry before the slow episode: %s %v", q.State, err)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lead, helper api.Agent
+	for _, a := range detail.Agents {
+		switch {
+		case a.Name == "correction-lead-0":
+			lead = a
+		case a.Role == api.AgentRoleOwnerHelper:
+			helper = a
+		}
+	}
+	if lead.ID == "" || helper.ID == "" {
+		t.Fatalf("lead %q or owner helper %q missing", lead.ID, helper.ID)
+	}
+	return q, lead, helper
+}
+
+// r5 (wi_100a2639af8b6946): thirty minutes after the last good listing, with
+// both listings slow, the tick still advances a running team from that
+// listing and reports no error.
+func TestTeamRunnerSlowListingStillAdvancesPastTenMinutes(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	now := time.Now()
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	q, lead, _ := slowRunningTeam(t, f, hub, r)
+	terminal := "dismissed"
+	if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "confirm delivery", To: lead.ID, RequestID: "slow-owner-request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	obligations, err := f.c.ListObligationsFrom(ctx, f.task.ID, lead.ID, msg.Seq, msg.Seq)
+	if err != nil || len(obligations) != 1 {
+		t.Fatalf("obligation %+v %v", obligations, err)
+	}
+	entry := func() api.TeamQueueEntry {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	hub.slowActive.Store(true)
+	hub.slowHost.Store(true)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("first slow tick: %v", err)
+	}
+	if got := entry(); got.State != "running" || len(got.CloseJSON) == 0 {
+		t.Fatalf("first slow tick: %s, close frozen %v", got.State, len(got.CloseJSON) != 0)
+	}
+	// The lead's reply arrives 30 minutes into the episode: the team still
+	// closes and finishes from the last good listing.
+	if _, err := f.c.CancelObligation(ctx, f.task.ID, obligations[0].ID, api.ObligationCancelRequest{Reason: "fixture resolved", RequestID: "slow-cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Minute)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("tick 30 minutes into the slow episode: %v", err)
+	}
+	if got := entry(); got.State != "finished" {
+		t.Fatalf("30 minutes into the slow episode the running entry is %s, want finished from the last good listing", got.State)
+	}
+	if n := len(slowListingNotices(t, f)); n != 1 {
+		t.Fatalf("%d slow listing notices, want one", n)
+	}
+}
+
+// r5 (wi_a560e272cfae1c7d): a relay whose first host listing times out has no
+// last good copy and knows no project from the hub. It still tells the owner
+// helper bound on this host, once per episode; with no such binding it posts
+// nothing and reports only the slow listing.
+func TestTeamRunnerSlowHostListingWithNoCopyNoticesBoundHelper(t *testing.T) {
+	for _, bound := range []bool{true, false} {
+		t.Run(fmt.Sprintf("bound=%v", bound), func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			hub := newSlowListingHub(t, f)
+			if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "slow-listing-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+				t.Fatal(err)
+			}
+			detail, err := f.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var helper api.Agent
+			for _, a := range detail.Agents {
+				if a.Role == api.AgentRoleOwnerHelper {
+					helper = a
+				}
+			}
+			if helper.ID == "" {
+				t.Fatal("owner helper missing")
+			}
+			if bound {
+				// Two bindings of this hub and one of another hub: one
+				// notice for the project, none for the other hub's.
+				for i, b := range []runtimeBinding{
+					{Hub: hub.e.hub, Task: f.task.ID, Agent: helper.ID, Run: helper.RunID, Thread: "11111111-2222-3333-4444-555555555555", Runtime: "claude", Session: "owner", Role: api.AgentRoleOwnerHelper},
+					{Hub: hub.e.hub + "/", Task: f.task.ID, Agent: api.NewID("agt"), Run: helper.RunID, Thread: "11111111-2222-3333-4444-555555555556", Runtime: "claude", Session: "owner", Role: api.AgentRoleOwnerHelper},
+					{Hub: "http://other.invalid", Task: api.NewID("tsk"), Agent: api.NewID("agt"), Run: helper.RunID, Thread: "11111111-2222-3333-4444-555555555557", Runtime: "claude", Session: "owner", Role: api.AgentRoleOwnerHelper},
+					{Hub: hub.e.hub, Task: api.NewID("tsk"), Agent: api.NewID("agt"), Run: helper.RunID, Thread: "11111111-2222-3333-4444-555555555558", Runtime: "claude", Session: "member"},
+				} {
+					if !validBinding(b) {
+						t.Fatalf("binding %d is not valid: %+v", i, b)
+					}
+					if err := writePrivateJSON(filepath.Join(relayDir(), bindingKey(b)+".binding.json"), b); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			now := time.Now()
+			r := queueCorrectionRunner(t, f, 1)
+			r.now = func() time.Time { return now }
+			hub.slowHost.Store(true)
+			_, hostBefore := hub.listings()
+			for i, step := range []time.Duration{0, time.Second, queueListingRetryFirst, 2 * queueListingRetryFirst, 4 * queueListingRetryFirst, queueListingRetryMax} {
+				now = now.Add(step)
+				err := r.tick(ctx, hub.e, hub.c, "fixture")
+				if err == nil || !queueListingTimedOut(err) || !strings.Contains(err.Error(), "no last good listing") || strings.Contains(err.Error(), "\n") {
+					t.Fatalf("slow tick %d = %v, want only the slow listing error", i, err)
+				}
+			}
+			// Six ticks, five live attempts: the second fell inside the delay.
+			if _, host := hub.listings(); host-hostBefore != 5 {
+				t.Fatalf("six slow ticks made %d host listing calls, want 5", host-hostBefore)
+			}
+			notices := slowListingNotices(t, f)
+			if !bound {
+				if len(notices) != 0 {
+					t.Fatalf("with no owner helper bound here %d notices were posted: %+v", len(notices), notices)
+				}
+				return
+			}
+			if len(notices) != 1 || notices[0].To != helper.ID || notices[0].Envelope.To != helper.Name || !strings.Contains(notices[0].Text, "It has no last good listing, so") || !strings.Contains(notices[0].Text, f.task.ID) {
+				t.Fatalf("six slow ticks with no last good host listing posted %d notices, want one to the owner helper %s: %+v", len(notices), helper.ID, notices)
+			}
+		})
+	}
+}
+
+// r5 (wi_98cbb984acd23d81): a listing that alternates between timing out and
+// answering stays in one slow episode and posts one notice. Only three good
+// ticks in a row end it, so a later timeout posts a second notice.
+func TestTeamRunnerFlappingListingNoticesOncePerSustainedEpisode(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	now := time.Now()
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	_, _, helper := slowRunningTeam(t, f, hub, r)
+	tick := func(what string, slow bool) {
+		t.Helper()
+		hub.slowActive.Store(slow)
+		now = now.Add(2 * queueListingRetryMax)
+		before, _ := hub.listings()
+		if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if after, _ := hub.listings(); after-before != 1 {
+			t.Fatalf("%s made %d active listing calls, want one live attempt", what, after-before)
+		}
+	}
+	for flap := 1; flap <= 5; flap++ {
+		tick(fmt.Sprintf("flap %d, slow", flap), true)
+		tick(fmt.Sprintf("flap %d, first good tick", flap), false)
+		if flap%2 == 0 {
+			// Two good ticks in a row are not a sustained recovery either.
+			tick(fmt.Sprintf("flap %d, second good tick", flap), false)
+		}
+		if n := len(slowListingNotices(t, f)); n != 1 {
+			t.Fatalf("after flap %d there are %d slow listing notices, want one", flap, n)
+		}
+	}
+	tick("a slow tick after the flaps", true)
+	for i := 1; i <= queueListingRecoverTicks; i++ {
+		tick(fmt.Sprintf("good tick %d of the recovery", i), false)
+	}
+	if n := len(slowListingNotices(t, f)); n != 1 {
+		t.Fatalf("%d slow listing notices after the sustained recovery, want still one", n)
+	}
+	tick("a timeout after the sustained recovery", true)
+	notices := slowListingNotices(t, f)
+	if len(notices) != 2 || notices[1].To != helper.ID || notices[0].Seq == notices[1].Seq {
+		t.Fatalf("a timeout after three good ticks: %d notices, want a second one to the owner helper: %+v", len(notices), notices)
+	}
+}
+
+// r5 (wi_7a64eec43384d77d): on a tick served from the last good host listing
+// there is no host census, so a parallel team left launching by a spawn the
+// project agent cap refused is not spawned again. The next live tick takes the census first and
+// then continues the launch.
+func TestTeamRunnerCachedHostListingHoldsParallelLaunch(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	domain, err := canonicalLimiterDomain(hub.c.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cached-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: domain, HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	free := int64(1 << 20)
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cached-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: &free}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cached-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "cached-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/cached"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	var events []string
+	failSpawn := true
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	r.census = func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
+		events = append(events, "census")
+		return nil
+	}
+	spawn := r.spawn
+	r.spawn = func(e env, args []string) error {
+		events = append(events, "spawn")
+		if failSpawn {
+			return fmt.Errorf("register agent: %w", &api.HTTPError{Status: 409, Msg: api.ErrLimit.Error()})
+		}
+		return spawn(e, args)
+	}
+	state := func() string {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.State
+	}
+	// A live tick claims the entry and its first spawn is refused at the
+	// agent cap: the entry is left launching, and both listings are saved.
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err == nil || !strings.Contains(err.Error(), projectAgentCapPrefix) {
+		t.Fatalf("first tick = %v, want the agent cap refusal", err)
+	}
+	if got := strings.Join(events, ","); got != "census,spawn" || state() != "launching" {
+		t.Fatalf("first tick: events %s, entry %s; want census,spawn and a launching entry", got, state())
+	}
+	// A second live tick lists the entry as launching, so the saved listings
+	// name it in that state, and its spawn is refused again.
+	events = nil
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err == nil || state() != "launching" {
+		t.Fatalf("second tick = %v, entry %s", err, state())
+	}
+	if got := strings.Join(events, ","); got != "census,spawn" {
+		t.Fatalf("second tick: events %s, want census,spawn", got)
+	}
+
+	// The host listing stops answering: this tick works from the cached one.
+	events, failSpawn = nil, false
+	hub.slowHost.Store(true)
+	now = now.Add(time.Second)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("tick on a cached host listing: %v", err)
+	}
+	if got := strings.Join(events, ","); got != "" || state() != "launching" {
+		t.Fatalf("tick on a cached host listing: events %q, entry %s; want no census, no spawn and a launching entry", got, state())
+	}
+	// Still none on a later tick of the episode that tries the listing again.
+	now = now.Add(queueListingRetryFirst)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("second tick on a cached host listing: %v", err)
+	}
+	if got := strings.Join(events, ","); got != "" || state() != "launching" {
+		t.Fatalf("second tick on a cached host listing: events %q, entry %s; want no census and no spawn", got, state())
+	}
+
+	// A live host listing: the census runs, then the launch continues.
+	hub.slowHost.Store(false)
+	now = now.Add(queueListingRetryMax)
+	if err := r.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+		t.Fatalf("live tick after the episode: %v", err)
+	}
+	if got := strings.Join(events, ","); got != "census,spawn" || state() != "running" {
+		t.Fatalf("live tick after the episode: events %s, entry %s; want census,spawn and a running entry", got, state())
+	}
+}
+
+// requestLog records the requests a client sends, as "METHOD path" with the
+// body of a POST appended.
+type requestLog struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (l *requestLog) RoundTrip(r *http.Request) (*http.Response, error) {
+	line := r.Method + " " + r.URL.Path
+	if r.Body != nil && r.Method == http.MethodPost {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		line += " " + string(body)
+	}
+	l.mu.Lock()
+	l.seen = append(l.seen, line)
+	l.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+func (l *requestLog) take() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := l.seen
+	l.seen = nil
+	return out
+}
+
+// r2 (wi_3755e4b181d0d590): in a serial project a queue head the token budget
+// holds does not take the pass. The runner spends no request on it and claims
+// the next entry, which fits; the head stays queued. The store decides both:
+// its listed reason for the head starts with the runner's prefix.
+func TestTeamRunnerSerialPassesBudgetHeldHead(t *testing.T) {
+	f := newTeamFixture(t, true)
+	relayState := os.Getenv("TAILTERM_RELAY_STATE")
+	capture := captureHome(t)
+	t.Setenv("TAILTERM_RELAY_STATE", relayState)
+	ctx := context.Background()
+	by := api.Caller{Node: "team-fixture", User: "owner"}
+	estimate := func(item api.WorkItem, tokens int64) {
+		t.Helper()
+		basis := "synthetic"
+		if _, _, err := f.st.CreateWorkItemUpdate(ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, RequestID: "serial-budget-estimate-" + item.ID, EstimateTokens: &tokens, EstimateBasis: &basis}, by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The head is a large second item; the fixture's own item, which the
+	// runner's plan launches, is queued behind it later.
+	big, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "large", RequestID: "serial-budget-large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "large bounded order", RequestID: "serial-budget-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: big.ID, ItemRevision: big.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.confirmOrder(t, big, order.Seq)
+	head, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "serial-budget-head", Operation: "add", ItemID: big.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimate(big, 600_000)
+	if _, err := f.c.SetUsageBudget(ctx, f.task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	// Half the window is used: 500K remain, which does not cover 600K.
+	at := time.Now().UTC()
+	writeCapture(t, capture, captureJSON(at.Unix(), 50, at.Add(2*time.Hour).Unix()))
+	var reading providerUsageState
+	if err := providerUsageTick(ctx, f.c, "fixture", at, &reading); err != nil {
+		t.Fatal(err)
+	}
+	if limit, err := f.c.ListTeamQueue(ctx, f.task.ID); err != nil || queueParallel(limit.ConcurrencyLimit) {
+		t.Fatalf("the fixture project is not serial: limit %d, %v", limit.ConcurrencyLimit, err)
+	}
+	log := &requestLog{}
+	counted := *f.c
+	transport := *f.c.HTTP
+	transport.Transport = log
+	counted.HTTP = &transport
+	spawns := 0
+	r := queueCorrectionRunner(t, f, 1)
+	spawn := r.spawn
+	r.spawn = func(e env, args []string) error {
+		spawns++
+		return spawn(e, args)
+	}
+	state := func(id string) string {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.State
+	}
+
+	// The held head alone. On base 40fc6ef this tick cost six requests: the
+	// host listing, the active listing, and for the head a task read, a
+	// listing, an item read and a claim. Now the head costs none.
+	const baseHeldHeadTick = 6
+	if err := r.tick(ctx, f.e, &counted, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	alone := log.take()
+	for _, line := range alone {
+		if strings.Contains(line, big.ID) || strings.Contains(line, `"claim"`) {
+			t.Fatalf("the tick spent a request on the budget-held head: %s", line)
+		}
+	}
+	if len(alone) > baseHeldHeadTick-4 || spawns != 0 || state(head.ID) != "queued" {
+		t.Fatalf("a tick with only the budget-held head made %d requests (base %d, want at most %d), %d spawns, head %s:\n%s", len(alone), baseHeldHeadTick, baseHeldHeadTick-4, spawns, state(head.ID), strings.Join(alone, "\n"))
+	}
+
+	// A second entry that fits is queued behind it.
+	later, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "serial-budget-later", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimate(f.item, 100_000)
+	list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || len(list.Entries) != 2 || list.Entries[0].ID != head.ID || list.Entries[1].ID != later.ID {
+		t.Fatalf("active listing %+v %v", list.Entries, err)
+	}
+	if !strings.HasPrefix(list.Entries[0].BlockReason, tokenBudgetPrefix) || !strings.Contains(list.Entries[0].BlockReason, "needs about 600.00K tokens; 500.00K remain") {
+		t.Fatalf("the head's listed reason %q does not start with the runner's prefix %q", list.Entries[0].BlockReason, tokenBudgetPrefix)
+	}
+	if strings.HasPrefix(list.Entries[1].BlockReason, tokenBudgetPrefix) {
+		t.Fatalf("the second entry is budget-held too: %q", list.Entries[1].BlockReason)
+	}
+	log.take()
+	if err := r.tick(ctx, f.e, &counted, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	claims := 0
+	for _, line := range log.take() {
+		if strings.Contains(line, big.ID) || strings.Contains(line, `"queue-claim-`+head.ID+`"`) {
+			t.Fatalf("the tick spent a request on the budget-held head: %s", line)
+		}
+		if strings.Contains(line, `"queue-claim-`+later.ID+`"`) {
+			claims++
+		}
+	}
+	if claims != 1 || spawns != 1 || state(later.ID) != "running" || state(head.ID) != "queued" {
+		t.Fatalf("one tick: %d claims of the second entry, %d spawns, second %s, head %s; want the second entry claimed and running past a queued head", claims, spawns, state(later.ID), state(head.ID))
 	}
 }

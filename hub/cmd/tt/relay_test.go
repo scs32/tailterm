@@ -2566,3 +2566,119 @@ func TestRelayHoldGate(t *testing.T) {
 		t.Fatalf("older hub: %d leases, queued %d", leases, len(queued)-before)
 	}
 }
+
+// r1 (wi_f9d82dcb91a5e002): a binding remembered as held whose agent then has
+// nothing unread, because its running turn read the withheld message, is
+// asked about again at most every five minutes. The first answer that says
+// not held forgets the hold, so the stall pass runs again; nothing is queued
+// by that read, and no read is made once the hold is forgotten.
+func TestRelayHoldRecheck(t *testing.T) {
+	b, hub, c, _ := needsInputFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 9, 16, 0, 0, 0, time.UTC)
+	var queued []string
+	queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		queued = append(queued, prompt)
+		return nil
+	}
+	var p relayProgress
+	// pass runs one inbox pass and returns its holds reads.
+	pass := func(what string) int {
+		t.Helper()
+		if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		holds, _ := holdCalls(hub.takeCalls())
+		return holds
+	}
+	// The team is held and one message is withheld.
+	hub.update(func(h *needsInputHub) {
+		h.heldRun = b.Run
+		h.agent.ReadUpTo, h.agent.Unread = 40, 1
+		h.messages = append(h.messages, api.Message{Seq: 41, To: b.Agent, From: api.Sender{Node: "workspace", User: "owner"}})
+	})
+	hub.takeCalls()
+	if holds := pass("withheld attempt"); holds != 1 || !p.TeamHeld || !p.HeldChecked.Equal(now) || p.Skip == nil || relayStallPassDue(b, p) {
+		t.Fatalf("withheld attempt: %d holds reads, progress %+v", holds, p)
+	}
+	withheld := now
+	// The agent's running turn reads the message, and the hold stays.
+	hub.update(func(h *needsInputHub) { h.agent.ReadUpTo, h.agent.Unread = 41, 0 })
+	for _, wait := range []time.Duration{time.Second, time.Minute, relayHeldRecheck - time.Second} {
+		now = withheld.Add(wait)
+		if holds := pass("an empty inbox " + wait.String() + " after the holds read"); holds != 0 || !p.TeamHeld || relayStallPassDue(b, p) {
+			t.Fatalf("%s after the holds read: %d holds reads, held %v", wait, holds, p.TeamHeld)
+		}
+	}
+	// At five minutes: one read. Still held, so nothing else changes, and
+	// no further read is made for another five minutes.
+	now = withheld.Add(relayHeldRecheck)
+	if holds := pass("the first re-check"); holds != 1 || !p.TeamHeld || relayStallPassDue(b, p) || p.Skip == nil || p.Skip.Reason != relayTeamHeldReason || !p.HeldChecked.Equal(now) {
+		t.Fatalf("the first re-check, still held: %d holds reads, progress %+v", holds, p)
+	}
+	checked := now
+	for _, wait := range []time.Duration{3 * time.Second, time.Minute, relayHeldRecheck - time.Second} {
+		now = checked.Add(wait)
+		if holds := pass("an empty inbox " + wait.String() + " after the re-check"); holds != 0 || !p.TeamHeld {
+			t.Fatalf("%s after a re-check that said held: %d holds reads, held %v", wait, holds, p.TeamHeld)
+		}
+	}
+	// The owner continues the hold. Before the next re-check is due the
+	// relay has not asked, so the stall pass is still off.
+	hub.update(func(h *needsInputHub) { h.heldRun = "" })
+	if holds := pass("continued, before the re-check is due"); holds != 0 || relayStallPassDue(b, p) {
+		t.Fatalf("continued, before the re-check is due: %d holds reads, stall pass due %v", holds, relayStallPassDue(b, p))
+	}
+	// A failed read counts as made: the next one waits five minutes.
+	hub.update(func(h *needsInputHub) { h.holdsStatus = http.StatusInternalServerError })
+	now = checked.Add(relayHeldRecheck)
+	if err := relayOne(ctx, b, &p, c, now, queue); err == nil {
+		t.Fatal("a failing re-check did not fail the pass")
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || !p.TeamHeld {
+		t.Fatalf("a failing re-check: %d holds reads, held %v", holds, p.TeamHeld)
+	}
+	hub.update(func(h *needsInputHub) { h.holdsStatus = 0 })
+	failed := now
+	now = failed.Add(relayHeldRecheck - time.Second)
+	if holds := pass("inside five minutes of a failed re-check"); holds != 0 || !p.TeamHeld {
+		t.Fatalf("inside five minutes of a failed re-check: %d holds reads, held %v", holds, p.TeamHeld)
+	}
+	// At five minutes: exactly one read, the hold is forgotten with its
+	// skip and spacing, the stall pass is due, and nothing was queued.
+	now = failed.Add(relayHeldRecheck)
+	if holds := pass("the re-check after continue"); holds != 1 || p.TeamHeld || !p.NextHeldAttempt.IsZero() || !p.HeldChecked.IsZero() || p.Skip != nil || !relayStallPassDue(b, p) || len(queued) != 0 {
+		t.Fatalf("the re-check after continue: %d holds reads, queued %q, progress %+v", holds, queued, p)
+	}
+	// It stops there: an empty inbox makes no holds read again, however long.
+	for _, wait := range []time.Duration{time.Second, relayHeldRecheck, 3 * relayHeldRecheck} {
+		now = now.Add(wait)
+		if holds := pass("an empty inbox after the hold is forgotten"); holds != 0 || p.TeamHeld {
+			t.Fatalf("%s after the hold is forgotten: %d holds reads", wait, holds)
+		}
+	}
+
+	// A progress file saved before this field existed has no check time: a
+	// binding saved as held is asked about once, at once, then spaced.
+	old := relayProgress{Run: b.Run, Thread: b.Thread, TeamHeld: true}
+	hub.update(func(h *needsInputHub) { h.heldRun = b.Run })
+	for i, want := range []int{1, 0} {
+		now = now.Add(time.Second)
+		if err := relayOne(ctx, b, &old, c, now, queue); err != nil {
+			t.Fatal(err)
+		}
+		if holds, _ := holdCalls(hub.takeCalls()); holds != want || !old.TeamHeld {
+			t.Fatalf("pass %d on an older progress file: %d holds reads, want %d", i, holds, want)
+		}
+	}
+	// An agent with a project role is never held: the hold is forgotten
+	// with no read.
+	hub.update(func(h *needsInputHub) { h.agent.Role = api.AgentRoleDatabaseHandler })
+	now = now.Add(relayHeldRecheck)
+	if err := relayOne(ctx, b, &old, c, now, queue); err != nil {
+		t.Fatal(err)
+	}
+	if holds, _ := holdCalls(hub.takeCalls()); holds != 0 || old.TeamHeld || len(queued) != 0 {
+		t.Fatalf("a role agent remembered as held: %d holds reads, held %v, queued %q", holds, old.TeamHeld, queued)
+	}
+}

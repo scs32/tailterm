@@ -475,10 +475,18 @@ accidents, not a security boundary: a `tt` older than this change sends neither
 and shares its node's lane.
 
 When a team queue listing times out, the relay queue tick keeps acting on its last
-good listing, up to 10 minutes old, for the teams it already lists as launching or
-running. It starts no queued entry from an old listing, tries a live listing again
-after 6 seconds doubling to a minute, and posts one `Queue listing slow` notice per
-episode to the owner helper.
+good listing, whatever its age, for the teams it already lists as launching or
+running, and reads each of those entries again by itself before acting. It starts
+no queued entry from an old listing, and on a tick whose host listing did not
+answer it takes no host census, so a parallel team that is launching waits for a
+live host listing. It tries a live listing again after 6 seconds doubling to a
+minute, and posts one `Queue listing slow` notice per episode to the owner helper.
+An episode ends only after three ticks in a row whose listings all answered, so a
+hub that alternates between slow and answering stays in one episode with one
+notice. A relay that has never had a host listing knows no project from the hub:
+it posts the notice to each project whose owner helper is bound on that host, says
+it has no last good listing, and advances no queue until a listing answers. With no
+owner helper bound there it writes one line per episode to the relay log.
 
 The host relay wakes compatible Codex and Claude sessions. The first task-aware
 `tt` command inside a Codex thread binds its exact thread UUID and run ID; the

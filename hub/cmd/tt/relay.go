@@ -63,6 +63,9 @@ type relayProgress struct {
 	// hold fresh every time. The relay makes no read to learn of a hold it
 	// has not met on the inbox path.
 	TeamHeld bool `json:"teamHeld,omitempty"`
+	// HeldChecked is when a holds read last answered for this remembered
+	// hold. It spaces the re-check made while the agent's inbox is empty.
+	HeldChecked time.Time `json:"heldChecked,omitempty"`
 	// NextHeldAttempt spaces inbox attempts after one was withheld by a
 	// hold: the hold ends only by an owner decision, so asking again every
 	// 15 seconds would only load the hub.
@@ -652,6 +655,31 @@ func relayTeamHeld(ctx context.Context, c *api.Client, b runtimeBinding, a api.A
 // next attempt for that binding.
 const relayHeldRetry = time.Minute
 
+// relayHeldRecheck is the least time between holds reads for a binding that
+// is remembered as held while its agent has nothing unread. With unread input
+// the inbox attempt reads the hold itself; with none, this read is the only
+// way the relay learns the hold was continued, so that the stall pass resumes.
+const relayHeldRecheck = 5 * time.Minute
+
+// relayHeldRecheckDue makes that read when it is due and forgets the hold on
+// the first answer that says not held. It decides no wake. A failed read
+// counts as made: the next one waits the same five minutes.
+func relayHeldRecheckDue(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, p *relayProgress, now time.Time) error {
+	if !p.TeamHeld || now.Sub(p.HeldChecked) < relayHeldRecheck {
+		return nil
+	}
+	p.HeldChecked = now
+	held, err := relayTeamHeld(ctx, c, b, a)
+	if err != nil || held {
+		return err
+	}
+	p.TeamHeld, p.NextHeldAttempt, p.HeldChecked = false, time.Time{}, time.Time{}
+	if p.Skip != nil && p.Skip.Reason == relayTeamHeldReason {
+		p.Skip = nil
+	}
+	return nil
+}
+
 // relayStallPassDue reports whether the stalled-turn pass runs for a binding.
 // A held team's quiet turn is the hold working, so it is never treated as a
 // stall and never interrupted.
@@ -836,8 +864,14 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		}
 		return nil
 	}
+	if a.Unread == 0 {
+		// Nothing to deliver. A hold remembered from a withheld attempt is
+		// asked about again, at most every five minutes, because the agent
+		// may have read the withheld message itself.
+		return relayHeldRecheckDue(ctx, c, b, a, p, now)
+	}
 	// The 15-second spacing defers a wake; it is not a skip.
-	if a.Unread == 0 || now.Sub(p.LastAttempt) < 15*time.Second || now.Before(p.NextHeldAttempt) {
+	if now.Sub(p.LastAttempt) < 15*time.Second || now.Before(p.NextHeldAttempt) {
 		return nil
 	}
 	if now.Sub(p.Window) >= 5*time.Minute {
@@ -911,8 +945,9 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if err != nil {
 		return err
 	}
-	p.TeamHeld, p.NextHeldAttempt = held, time.Time{}
+	p.TeamHeld, p.NextHeldAttempt, p.HeldChecked = held, time.Time{}, time.Time{}
 	if held {
+		p.HeldChecked = now
 		// Withheld, not attempted: it does not count toward the wake window.
 		// The next attempt for this binding waits a minute.
 		p.Wakes--
