@@ -311,3 +311,49 @@ func TestMigrateAddsQueueAdmissionTime(t *testing.T) {
 		}
 	}
 }
+
+// The storage cleanup is the last migration step: on a database an earlier
+// hub left without the launch digest column, the open that adds the column
+// also converts the old queue result. A second open enters no step again and
+// changes no row and no ledger column.
+func TestMigrateRunsStorageCleanupLastAndOnce(t *testing.T) {
+	f := newRetentionFixture(t)
+	old := f.oldForm(3)
+	if _, err := f.s.db.Exec(`ALTER TABLE team_queue_requests DROP COLUMN launch_digest`); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count(`SELECT count(*) FROM storage_migrations`); n != 0 {
+		t.Fatalf("%d ledger rows before the open", n)
+	}
+
+	f.reopen()
+	for _, step := range retentionSteps {
+		if state, _, converted, _ := f.ledger(step.name); state != "done" || converted == 0 {
+			t.Fatalf("%s after the open: %s, converted %d", step.name, state, converted)
+		}
+	}
+	if got := f.text(`SELECT launch_digest FROM team_queue_requests WHERE request_id=?`, old.freeze.RequestID); len(got) != 64 {
+		t.Fatal("the open that added the digest column did not convert the old queue result")
+	}
+	if n := f.count(`SELECT count(*) FROM usage_turns WHERE payload<>''`); n != 1 {
+		t.Fatalf("%d turns kept a payload, want the one that differs from its projection", n)
+	}
+
+	rows := func() map[string]string {
+		t.Helper()
+		out := f.keptTables()
+		out["storage_migrations"] = retentionLedger(t, f.s.db, "*")
+		return out
+	}
+	before := rows()
+	f.reopen()
+	f.reopen()
+	for name, want := range before {
+		if got := rows()[name]; got != want {
+			t.Fatalf("%s changed on a later open: %s, then %s", name, want, got)
+		}
+	}
+	if strings.HasPrefix(before["storage_migrations"], "0 rows") {
+		t.Fatal("no ledger rows")
+	}
+}

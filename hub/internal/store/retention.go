@@ -14,7 +14,8 @@ import (
 )
 
 // Storage forms that keep one copy of a document. Every reader accepts the
-// older form as well, and no existing row is rewritten.
+// older form as well; retention_migrate.go rewrites the rows stored before
+// these forms, except release receipts, which are never rewritten.
 
 // usageReceiptHashPrefix marks a usage receipt payload that holds the hash of
 // the upload batch in place of the batch itself.
@@ -40,12 +41,20 @@ func sameUsageBatch(stored string, raw []byte) bool {
 	return stored == string(raw)
 }
 
-// migrateRetention creates the table that holds each release check list once.
-// It is as immutable as the receipts that name its rows.
+// migrateRetention creates the table that holds each release check list once,
+// as immutable as the receipts that name its rows, and the ledger of the
+// cleanup that rewrites rows stored before these forms. The ledger holds step
+// names and numbers only, in one b-tree so it takes one page.
 func migrateRetention(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS release_check_lists(digest TEXT PRIMARY KEY,body TEXT NOT NULL);
  CREATE TRIGGER IF NOT EXISTS release_check_list_no_update BEFORE UPDATE ON release_check_lists BEGIN SELECT RAISE(ABORT,'immutable release check list'); END;
- CREATE TRIGGER IF NOT EXISTS release_check_list_no_delete BEFORE DELETE ON release_check_lists BEGIN SELECT RAISE(ABORT,'immutable release check list'); END;`)
+ CREATE TRIGGER IF NOT EXISTS release_check_list_no_delete BEFORE DELETE ON release_check_lists BEGIN SELECT RAISE(ABORT,'immutable release check list'); END;
+ CREATE TABLE IF NOT EXISTS storage_migrations(
+ step TEXT PRIMARY KEY,state TEXT NOT NULL,cursor INTEGER NOT NULL DEFAULT 0,
+ examined INTEGER NOT NULL DEFAULT 0,converted INTEGER NOT NULL DEFAULT 0,"left" INTEGER NOT NULL DEFAULT 0,
+ bytes_before INTEGER NOT NULL DEFAULT 0,bytes_after INTEGER NOT NULL DEFAULT 0,wal_peak_bytes INTEGER NOT NULL DEFAULT 0,
+ freelist_before INTEGER NOT NULL DEFAULT 0,freelist_after INTEGER NOT NULL DEFAULT 0,
+ started_at TEXT NOT NULL DEFAULT '',finished_at TEXT NOT NULL DEFAULT '') WITHOUT ROWID;`)
 	return err
 }
 
