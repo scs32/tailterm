@@ -90,6 +90,17 @@ func main() {
 		}
 		return
 	}
+	// The usage digest opens the supplied file read-only, migrates nothing and
+	// prints hashes, counts, sizes and times only.
+	if len(os.Args) == 3 && os.Args[1] == "--usage-digest" {
+		if err := store.UsageDigest(context.Background(), os.Args[2], os.Stdout); err != nil {
+			if errors.Is(err, store.ErrUsageDigestWAL) {
+				log.Fatal("usage digest refused: the write-ahead log is not empty")
+			}
+			log.Fatal("usage digest failed")
+		}
+		return
+	}
 	stateDir := env("TAILTERM_STATE", "/state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)
