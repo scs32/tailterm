@@ -25,7 +25,14 @@ type budgetQueue struct {
 
 func newBudgetQueue(t *testing.T, n int) *budgetQueue {
 	t.Helper()
-	f := &budgetQueue{choresQueue: newChoresQueue(t, n, 2, 0), t: t, ctx: context.Background()}
+	return newBudgetQueueOf(t, n, 2, 0)
+}
+
+// newBudgetQueueOf is the same fixture with h database handlers and a
+// concurrency limit: 1 is the serial queue.
+func newBudgetQueueOf(t *testing.T, n, h, limit int) *budgetQueue {
+	t.Helper()
+	f := &budgetQueue{choresQueue: newChoresQueue(t, n, h, limit), t: t, ctx: context.Background()}
 	f.advance = f.clock(t)
 	return f
 }
@@ -353,7 +360,7 @@ func TestQueueBudgetLaneDefaults(t *testing.T) {
 	// alone, but the planned team just admitted has drawn none of its 44M.
 	f.defaults(18_000_000, 17_000_000, 44_000_000, 50_000_000)
 	f.refused(plannedRace, "50M default against 55M with 44M reserved")
-	want = fmt.Sprintf("Token budget (codex five_hour): needs about 50.00M tokens (default, planned, Go race); 55.00M remain before the reset at %s, reserve 0%%, 44.00M reserved for 1 admitted team (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339))
+	want = fmt.Sprintf("Token budget (codex five_hour): needs about 50.00M tokens (default, planned, Go race); 55.00M remain before the reset at %s, reserve 0%%, 44.00M reserved for 1 admitted team: %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), planned.ID)
 	if got := f.listed(plannedRace.ID).BlockReason; got != want {
 		t.Fatalf("reserved reason\n%q\nwant\n%q", got, want)
 	}
@@ -470,14 +477,14 @@ func TestQueueBudgetReservesAdmittedTeams(t *testing.T) {
 	reason := func(remain, reserved string) string {
 		return fmt.Sprintf("Token budget (codex five_hour): needs about 400.00K tokens; %s remain before the reset at %s, reserve 0%%%s (source: allowance minus reported usage; provider reading for host mini is not reported)", remain, end, reserved)
 	}
-	if got, want := f.held(b, "the first estimate is reserved"), reason("1.00M", ", 700.00K reserved for 1 admitted team"); got != want {
+	if got, want := f.held(b, "the first estimate is reserved"), reason("1.00M", ", 700.00K reserved for 1 admitted team: "+a.ID); got != want {
 		t.Fatalf("second entry\n%q\nwant\n%q", got, want)
 	}
 	// The team spends 250K: the remaining and the reserved amounts both fall
 	// by exactly that.
 	member := f.member(t, 0, "member-a")
 	f.teamSpend(member, 0, "codex", 250_000)
-	if got, want := f.held(b, "250K of the estimate is spent"), reason("750.00K", ", 450.00K reserved for 1 admitted team"); got != want {
+	if got, want := f.held(b, "250K of the estimate is spent"), reason("750.00K", ", 450.00K reserved for 1 admitted team: "+a.ID); got != want {
 		t.Fatalf("after the team spent 250K\n%q\nwant\n%q", got, want)
 	}
 	// Past its estimate the team reserves nothing, and never a negative amount.
@@ -505,7 +512,7 @@ func TestQueueBudgetProviderReservationWaitsForReading(t *testing.T) {
 	a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
 	a = f.run(t, a)
 	reason := func(remain, reserved string) string {
-		return fmt.Sprintf("Token budget (claude five_hour): needs about 400.00K tokens; %s remain before the reset at %s, reserve 0%%, %s reserved for 1 admitted team (source: provider reading)", remain, resets.Format(time.RFC3339), reserved)
+		return fmt.Sprintf("Token budget (claude five_hour): needs about 400.00K tokens; %s remain before the reset at %s, reserve 0%%, %s reserved for 1 admitted team: %s (source: provider reading)", remain, resets.Format(time.RFC3339), reserved, a.ID)
 	}
 	before := f.held(b, "the first estimate is reserved")
 	if want := reason("1.00M", "700.00K"); before != want {
@@ -618,6 +625,263 @@ func TestQueueBudgetFailedReservationKeepsStall(t *testing.T) {
 	}
 	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
 		t.Fatalf("claim after the release: %+v %v", claimed, err)
+	}
+}
+
+// r1: in a serial project the claim of every queued entry is refused for the
+// slot before the budget is read. An entry that fits the budget alone and only
+// the running team's reservation holds shows no budget reason while no slot is
+// free: not in the read of the one entry, where nothing else explains its
+// wait, and its ordinary wait in the list is unchanged. An entry the budget
+// cannot cover even with nothing reserved still shows its reason, which names
+// the reserving entry: in the read of the one entry, and in the list wherever
+// the budget reason replaces a stall.
+func TestQueueBudgetSerialSlotWaitShowsNoReservationReason(t *testing.T) {
+	f := newBudgetQueueOf(t, 3, 1, 1)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.estimate(2, 2_000_000)
+	a := f.run(t, f.add(t, 0))
+	fits, large := f.add(t, 1), f.add(t, 2)
+	read := func(q api.TeamQueueEntry) api.TeamQueueEntry {
+		t.Helper()
+		got, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	// The waits before any budget row exists are the ordinary ones.
+	ordinary, ordinaryRead := f.listed(fits.ID), read(fits)
+	if ordinary.Stall != nil || ordinary.BlockReason != "All team slots are reserved" || ordinaryRead.BlockReason != "" {
+		t.Fatalf("before the budget: stall %+v reason %q, one entry read %q", ordinary.Stall, ordinary.BlockReason, ordinaryRead.BlockReason)
+	}
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	// The reservation does hold it: 1M - 700K reserved is under its 400K.
+	prefix := func(needs string) string {
+		return "Token budget (codex five_hour): needs about " + needs + " tokens; 1.00M remain before the reset at " + reset.Add(5*time.Hour).Format(time.RFC3339) + ", reserve 0%"
+	}
+	reserved := ", 700.00K reserved for 1 admitted team: " + a.ID + " (source: allowance minus reported usage; provider reading for host mini is not reported)"
+	if got, err := queueBudgetAdmission(f.ctx, f.s.db, f.task.ID, fits, f.s.now()); err != nil || got != prefix("400.00K")+reserved {
+		t.Fatalf("admission of the entry that fits alone: %q %v", got, err)
+	}
+	if got := f.listed(fits.ID); got.Stall != nil || got.BlockReason != ordinary.BlockReason {
+		t.Fatalf("slot wait behind a reserving team: stall %+v reason %q, want the ordinary wait %q", got.Stall, got.BlockReason, ordinary.BlockReason)
+	}
+	if got := read(fits).BlockReason; got != "" {
+		t.Fatalf("one entry read of the entry that fits alone: %q", got)
+	}
+	if got, want := read(large).BlockReason, prefix("2.00M")+reserved; got != want {
+		t.Fatalf("one entry read of the entry the budget cannot cover alone\n%q\nwant\n%q", got, want)
+	}
+	if got := f.listed(large.ID).BlockReason; got != ordinary.BlockReason {
+		t.Fatalf("list reason of the entry the budget cannot cover alone: %q, want the slot wait", got)
+	}
+	if _, err := f.claim(fits); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "all team slots are reserved") {
+		t.Fatalf("claim behind the running entry: %v, want the full slot refusal", err)
+	}
+	// The running entry fails and halts the serial queue: still no slot. The
+	// entry that fits alone keeps its stall, and the one the budget cannot
+	// cover shows its budget reason in the list instead of a stall.
+	failed := f.fail(t, a)
+	assertStall(t, f.choresQueue, fits.ID, api.StallSerialHalted, failed.ID)
+	if got := f.listed(large.ID); got.Stall != nil || got.BlockReason != prefix("2.00M")+reserved {
+		t.Fatalf("behind a failed entry, the entry the budget cannot cover alone: stall %+v reason %q", got.Stall, got.BlockReason)
+	}
+}
+
+// r1, second half: several reserving teams are named in queue order.
+func TestQueueBudgetReasonNamesReservingEntries(t *testing.T) {
+	f := newBudgetQueueOf(t, 3, 3, 0)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 300_000)
+	f.estimate(1, 300_000)
+	f.estimate(2, 500_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a := f.run(t, f.add(t, 0, "src/a"))
+	b := f.run(t, f.add(t, 1, "src/b"))
+	c := f.add(t, 2, "src/c")
+	want := fmt.Sprintf("Token budget (codex five_hour): needs about 500.00K tokens; 1.00M remain before the reset at %s, reserve 0%%, 600.00K reserved for 2 admitted teams: %s, %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), a.ID, b.ID)
+	if got := f.held(c, "two teams reserve"); got != want {
+		t.Fatalf("reason\n%q\nwant\n%q", got, want)
+	}
+	// A team past its estimate reserves nothing and is not named.
+	f.teamSpend(f.member(t, 0, "member-a"), 0, "codex", 300_000)
+	want = fmt.Sprintf("Token budget (codex five_hour): needs about 500.00K tokens; 700.00K remain before the reset at %s, reserve 0%%, 300.00K reserved for 1 admitted team: %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), b.ID)
+	if got := f.held(c, "one team has spent its estimate"); got != want {
+		t.Fatalf("reason\n%q\nwant\n%q", got, want)
+	}
+}
+
+// r3, r4: parallel project, a free slot, a free handler and no path overlap. A
+// queued entry that fits alone and that only a failed, unreleased entry's
+// reservation holds gets a stall naming that entry and its release, and its
+// notice is accepted. The budget alone refuses its claim: with the budget row
+// gone it launches beside the failed entry.
+func TestQueueBudgetFailedReservationAloneIsAStall(t *testing.T) {
+	f := newBudgetQueue(t, 2)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a := f.run(t, f.add(t, 0, "src/a"))
+	b := f.add(t, 1, "src/b")
+	failed := f.fail(t, a)
+	if b.Cwd == failed.Cwd || queueEntryConflicts(b, failed) {
+		t.Fatalf("fixture: entries overlap: %q %v and %q %v", b.Cwd, b.Ownership, failed.Cwd, failed.Ownership)
+	}
+	reason := fmt.Sprintf("Token budget (codex five_hour): needs about 400.00K tokens; 1.00M remain before the reset at %s, reserve 0%%, 700.00K reserved for 1 admitted team: %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), failed.ID)
+	// With no run left the runner releases the failed entry on its next pass:
+	// that is ordinary waiting, with the budget reason and no stall.
+	if got := f.listed(b.ID); got.Stall != nil || got.BlockReason != reason {
+		t.Fatalf("failed entry with no live run: stall %+v reason %q", got.Stall, got.BlockReason)
+	}
+	f.member(t, 0, "member-a")
+	// The stall is the one the stall pass gives a failed parallel entry.
+	blocker, err := f.s.classifyStallBlocker(f.ctx, f.s.db, failed, true)
+	if err != nil || blocker == nil {
+		t.Fatalf("classify the failed entry: %+v %v", blocker, err)
+	}
+	assertStall(t, f.choresQueue, b.ID, api.StallFailedEntry, failed.ID, "tt team queue integrated --task "+f.task.ID+" --entry "+failed.ID, "tt close --team --task "+f.task.ID+" --item "+failed.ItemID, "so it can be released")
+	got := f.listed(b.ID)
+	if got.Stall.Cause != blocker.cause || got.Stall.Fix != blocker.fix || got.Stall.Since != blocker.since.UTC().Format(time.RFC3339Nano) || got.Stall.BlockerRevision != failed.Revision {
+		t.Fatalf("stall %+v, want the stall pass's %+v", got.Stall, blocker)
+	}
+	if want := fmt.Sprintf("Stalled: %s (%s): %s. Fix: %s. Its reservation holds this entry: %s", failed.ID, failed.ItemID, stallCauseText[api.StallFailedEntry], blocker.fix, reason); got.BlockReason != want {
+		t.Fatalf("block reason\n%q\nwant\n%q", got.BlockReason, want)
+	}
+	// r4: the refusal is the budget's, and nothing else holds the entry.
+	if held, err := queueBudgetAdmission(f.ctx, f.s.db, f.task.ID, b, f.s.now()); err != nil || held != reason {
+		t.Fatalf("admission\n%q %v\nwant\n%q", held, err, reason)
+	}
+	f.held(b, "the failed entry's reservation")
+	f.advance(time.Hour)
+	noticed, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: got.Stall.NoticeRequestID(b.ID), Operation: "stall_notice", EntryID: b.ID})
+	if err != nil || noticed.ID != b.ID {
+		t.Fatalf("stall notice for the reservation of a failed entry: %+v %v", noticed, err)
+	}
+	if _, err := f.s.DeleteUsageBudget(f.ctx, f.task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.listed(b.ID); got.Stall != nil || got.BlockReason != "" {
+		t.Fatalf("without the budget row: stall %+v reason %q", got.Stall, got.BlockReason)
+	}
+	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim beside the failed entry without the budget row: %+v %v", claimed, err)
+	}
+}
+
+// r2: the reservation's cost with several running teams. Three running teams
+// of 2,500 turns each on their items, a codex row on the allowance source and
+// a claude row on a provider reading (two source instants), 20 queued entries
+// that fit and one that does not. One list and one claim are each bounded at
+// 250 ms without the race detector.
+func TestQueueBudgetReservationCost(t *testing.T) {
+	const teams, turns, perTurn, queued = 3, 2500, 100, 20
+	f := newBudgetQueueOf(t, teams+queued+1, teams+2, 0)
+	f.within()
+	now := f.s.now().UTC().Truncate(time.Second)
+	reset := now.Add(-time.Hour)
+	for i := 0; i < teams; i++ {
+		f.estimate(i, 1_000_000)
+	}
+	for i := teams; i < teams+queued; i++ {
+		f.estimate(i, 1_000)
+	}
+	f.estimate(teams+queued, 7_500_000)
+	f.budget("codex", api.UsageWindowFiveHour, 10_000_000, 0, reset)
+	f.budget("claude", api.UsageWindowFiveHour, 10_000_000, 0, time.Time{})
+	f.reading("mini", 0, now.Add(3*time.Hour))
+	var running []api.TeamQueueEntry
+	var members []api.Agent
+	for i := 0; i < teams; i++ {
+		running = append(running, f.run(t, f.add(t, i, fmt.Sprintf("src/running-%d", i))))
+		members = append(members, f.member(t, i, fmt.Sprintf("member-%d", i)))
+	}
+	tx, err := f.s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, err := tx.Prepare(`INSERT INTO usage_turn_totals(task_id,agent_id,run_id,request_id,turn_revision,runtime,at_ns,tokens) VALUES(?,?,?,?,1,'codex',?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	share, err := tx.Prepare(`INSERT INTO usage_item_shares(task_id,agent_id,run_id,request_id,turn_revision,item_task_id,item_id,denominator,tokens,partial) VALUES(?,?,?,?,1,?,?,1,?,0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, member := range members {
+		for n := 0; n < turns; n++ {
+			id := fmt.Sprintf("cost-%d-%d", i, n)
+			// Every turn is inside the codex window and before the reading's
+			// capture, so both sources reflect it.
+			at := now.Add(-time.Duration(n+1) * time.Second)
+			if _, err := total.Exec(f.task.ID, member.ID, member.RunID, id, at.UnixNano(), perTurn); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := share.Exec(f.task.ID, member.ID, member.RunID, id, f.task.ID, f.items[i].ID, perTurn); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	total.Close()
+	share.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var fitting []api.TeamQueueEntry
+	for i := teams; i < teams+queued; i++ {
+		fitting = append(fitting, f.add(t, i, fmt.Sprintf("src/queued-%d", i)))
+	}
+	large := f.add(t, teams+queued, "src/large")
+	// Each team spent 250K of its 1M: 2.25M reserved on both rows. The claude
+	// reading leaves 7.75M free and the codex row 10M - 750K - 2.25M = 7M, so
+	// the 7.5M entry is held by the codex row alone.
+	ids := []string{}
+	for _, e := range running {
+		ids = append(ids, e.ID)
+	}
+	want := fmt.Sprintf("Token budget (codex five_hour): needs about 7.50M tokens; 9.25M remain before the reset at %s, reserve 0%%, 2.25M reserved for 3 admitted teams: %s (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339), strings.Join(ids, ", "))
+	var list api.TeamQueueList
+	listed := bestOf(t, func() {
+		if list, err = f.s.ListTeamQueue(f.ctx, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
+	waiting := 0
+	for _, e := range list.Entries {
+		switch {
+		case e.ID == large.ID && e.BlockReason != want:
+			t.Fatalf("entry past the reservation\n%q\nwant\n%q", e.BlockReason, want)
+		case e.State == "queued" && e.BlockReason == "":
+			waiting++
+		}
+	}
+	if waiting != queued {
+		t.Fatalf("%d queued entries pass the budget, want %d", waiting, queued)
+	}
+	if got, want := budgetStatus(t, f.s, f.task.ID, "mini", "codex", api.UsageWindowFiveHour).RemainingTokens, fmt.Sprint(10_000_000-teams*turns*perTurn); got != want {
+		t.Fatalf("codex remaining %s, want %s", got, want)
+	}
+	started := time.Now()
+	claimed, err := f.claim(fitting[0])
+	claim := time.Since(started)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("claim %+v %v", claimed, err)
+	}
+	t.Logf("with %d running teams of %d turns each and %d queued entries one list took %s (best of three) and one claim took %s", teams, turns, queued+1, listed, claim)
+	if raceBuilt() {
+		return
+	}
+	if listed >= 250*time.Millisecond {
+		t.Fatalf("the list took %s, want under 250ms", listed)
+	}
+	if claim >= 250*time.Millisecond {
+		t.Fatalf("the claim took %s, want under 250ms", claim)
 	}
 }
 

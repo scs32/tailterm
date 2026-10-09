@@ -81,17 +81,42 @@ type queueBudgetCheck struct {
 	now      time.Time
 	states   map[string][]usageBudgetState
 	defaults *api.UsageEstimateDefaults
-	// reserved is nil until loadReserved has run.
+	// reserved is nil until loadReserved has run. holding counts every
+	// slot-holding entry, with or without an estimate.
 	reserved []budgetReservedEntry
+	holding  int
 	// outstanding caches reservedOutstanding by the instant the source
 	// reflects, in Unix nanoseconds (zero is the allowance source), and by
-	// whether failed entries were left out.
+	// the entries left out.
 	outstanding map[budgetReservationKey]budgetReservation
+	// spent caches each reserved team's spend by entry and source instant, so
+	// one claim or list sums a team's turns once per instant.
+	spent map[budgetSpendKey]*big.Rat
+	// limit is the project's concurrency limit, read once.
+	limit *int
 }
 
+// budgetSkip names the reservations a fit is computed without.
+type budgetSkip int
+
+const (
+	// budgetSkipNone counts every slot-holding entry: the admission check.
+	budgetSkipNone budgetSkip = iota
+	// budgetSkipFailed leaves the failed entries out: the fit once every
+	// failed entry is released.
+	budgetSkipFailed
+	// budgetSkipAll leaves every reservation out: the fit of the entry alone.
+	budgetSkipAll
+)
+
 type budgetReservationKey struct {
-	upTo       int64
-	skipFailed bool
+	upTo int64
+	skip budgetSkip
+}
+
+type budgetSpendKey struct {
+	entry string
+	upTo  int64
 }
 
 // budgetReservedEntry is a slot-holding entry with the estimate it was
@@ -103,14 +128,14 @@ type budgetReservedEntry struct {
 }
 
 // budgetReservation is what the slot-holding teams have not yet drawn from a
-// budget row's source, and how many of them that is.
+// budget row's source, and the entries that hold a part of it, in queue order.
 type budgetReservation struct {
-	tokens *big.Rat
-	teams  int
+	tokens  *big.Rat
+	entries []string
 }
 
 func newQueueBudgetCheck(task string, now time.Time) *queueBudgetCheck {
-	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}, outstanding: map[budgetReservationKey]budgetReservation{}}
+	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}, outstanding: map[budgetReservationKey]budgetReservation{}, spent: map[budgetSpendKey]*big.Rat{}}
 }
 
 // loadReserved reads the project's entries that hold a slot (launching,
@@ -155,8 +180,25 @@ func (c *queueBudgetCheck) loadReserved(ctx context.Context, q queryRower) error
 		}
 		reserved = append(reserved, budgetReservedEntry{entry: e, estimate: estimate, runs: runs})
 	}
-	c.reserved = reserved
+	c.reserved, c.holding = reserved, len(entries)
 	return nil
+}
+
+// slotsFull reports whether the project's slot-holding entries reach its
+// concurrency limit: the claim of any queued entry is then refused for the
+// slot before the budget is read.
+func (c *queueBudgetCheck) slotsFull(ctx context.Context, q queryRower) (bool, error) {
+	if err := c.loadReserved(ctx, q); err != nil {
+		return false, err
+	}
+	if c.limit == nil {
+		limit, err := queueConcurrencyLimit(ctx, q, c.task)
+		if err != nil {
+			return false, err
+		}
+		c.limit = &limit
+	}
+	return queueSlotsFull(*c.limit, c.holding), nil
 }
 
 // budgetTeamSpend sums what a team's runs have spent on their item, in turns
@@ -190,14 +232,18 @@ func budgetTeamSpend(ctx context.Context, q queryRower, task, item string, runs 
 // reflects). The allowance source subtracts every reported turn, so all of a
 // team's spend is reflected. A provider reading reflects use only up to its
 // capture instant, so spend uploaded after it does not shrink the reservation
-// until a newer reading arrives. With skipFailed the failed entries are left
-// out: what would be reserved if every failed entry were released.
-func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower, state usageBudgetState, skipFailed bool) (budgetReservation, error) {
+// until a newer reading arrives. skip leaves entries out: the failed ones
+// (what would be reserved if every failed entry were released) or all of them.
+func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower, state usageBudgetState, skip budgetSkip) (budgetReservation, error) {
+	out := budgetReservation{tokens: new(big.Rat)}
+	if skip == budgetSkipAll {
+		return out, nil
+	}
 	var upTo time.Time
 	if state.source == api.UsageBudgetSourceProvider {
 		upTo = state.captured
 	}
-	key := budgetReservationKey{skipFailed: skipFailed}
+	key := budgetReservationKey{skip: skip}
 	if !upTo.IsZero() {
 		key.upTo = upTo.UnixNano()
 	}
@@ -207,18 +253,22 @@ func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower
 	if err := c.loadReserved(ctx, q); err != nil {
 		return budgetReservation{}, err
 	}
-	out := budgetReservation{tokens: new(big.Rat)}
 	for _, r := range c.reserved {
-		if skipFailed && r.entry.State == "failed" {
+		if skip == budgetSkipFailed && r.entry.State == "failed" {
 			continue
 		}
-		spent, err := budgetTeamSpend(ctx, q, c.task, r.entry.ItemID, r.runs, upTo)
-		if err != nil {
-			return budgetReservation{}, err
+		spentKey := budgetSpendKey{entry: r.entry.ID, upTo: key.upTo}
+		spent, ok := c.spent[spentKey]
+		if !ok {
+			var err error
+			if spent, err = budgetTeamSpend(ctx, q, c.task, r.entry.ItemID, r.runs, upTo); err != nil {
+				return budgetReservation{}, err
+			}
+			c.spent[spentKey] = spent
 		}
 		if left := new(big.Rat).Sub(big.NewRat(r.estimate, 1), spent); left.Sign() > 0 {
 			out.tokens.Add(out.tokens, left)
-			out.teams++
+			out.entries = append(out.entries, r.entry.ID)
 		}
 	}
 	c.outstanding[key] = out
@@ -277,7 +327,7 @@ func estimateDefaultText(d api.TeamQueueEstimateDefault) string {
 // usable source and the entry's estimate fits what remains after the reserve
 // and what the slot-holding teams have not yet drawn from that source.
 func (c *queueBudgetCheck) admission(ctx context.Context, q queryRower, e api.TeamQueueEntry) (string, error) {
-	return c.admissionReason(ctx, q, e, false)
+	return c.admissionReason(ctx, q, e, budgetSkipNone)
 }
 
 // heldOnlyByFailed reports whether a queued entry the budget holds would fit
@@ -294,11 +344,68 @@ func (c *queueBudgetCheck) heldOnlyByFailed(ctx context.Context, q queryRower, e
 	if !failed {
 		return false, nil
 	}
-	reason, err := c.admissionReason(ctx, q, e, true)
+	reason, err := c.admissionReason(ctx, q, e, budgetSkipFailed)
 	return reason == "", err
 }
 
-func (c *queueBudgetCheck) admissionReason(ctx context.Context, q queryRower, e api.TeamQueueEntry, skipFailed bool) (string, error) {
+// heldOnlyByReservation reports whether a queued entry the budget holds would
+// fit with nothing reserved: the budget alone covers it, and only the teams
+// already admitted stand in its way.
+func (c *queueBudgetCheck) heldOnlyByReservation(ctx context.Context, q queryRower, e api.TeamQueueEntry) (bool, error) {
+	reason, err := c.admissionReason(ctx, q, e, budgetSkipAll)
+	return reason == "", err
+}
+
+// failedReservationStall is the stall of a queued entry that only the
+// reservation of failed, unreleased entries holds, in a parallel project: the
+// first failed entry that still reserves on the entry's host and has runs that
+// are not yet closed and cleaned, with the cause, time and fix
+// classifyStallBlocker gives a failed parallel entry. It is nil when the queue
+// is serial, the project is paused, or the runner will release every such
+// entry on its next pass, as explainQueueStalls has it.
+func (c *queueBudgetCheck) failedReservationStall(ctx context.Context, q queryRower, e api.TeamQueueEntry) (*api.TeamQueueEntry, *stallBlocker, error) {
+	if c.limit == nil || !queueParallel(*c.limit) {
+		return nil, nil, nil
+	}
+	var pauseState string
+	if err := q.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, c.task).Scan(&pauseState); err != nil {
+		return nil, nil, err
+	}
+	if pauseState != api.ProjectPauseActive {
+		return nil, nil, nil
+	}
+	reserving := map[string]bool{}
+	for _, state := range c.states[e.Host] {
+		if state.source == api.UsageBudgetSourceNone {
+			continue
+		}
+		admitted, err := c.reservedOutstanding(ctx, q, state, budgetSkipNone)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, id := range admitted.entries {
+			reserving[id] = true
+		}
+	}
+	for i := range c.reserved {
+		failed := &c.reserved[i].entry
+		if failed.State != "failed" || !reserving[failed.ID] {
+			continue
+		}
+		live, err := liveItemRuns(ctx, q, c.task, failed.ItemID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if live == 0 {
+			continue
+		}
+		return failed, &stallBlocker{cause: api.StallFailedEntry, since: parseStallTime(failed.UpdatedAt),
+			fix: fmt.Sprintf("if its candidate shipped, tt team queue integrated --task %s --entry %s --commit SHA; otherwise close its team once the item is terminal (tt close --team --task %s --item %s) so it can be released", c.task, failed.ID, c.task, failed.ItemID)}, nil
+	}
+	return nil, nil, nil
+}
+
+func (c *queueBudgetCheck) admissionReason(ctx context.Context, q queryRower, e api.TeamQueueEntry, skip budgetSkip) (string, error) {
 	states, loaded := c.states[e.Host]
 	if !loaded {
 		var err error
@@ -328,7 +435,7 @@ func (c *queueBudgetCheck) admissionReason(ctx context.Context, q queryRower, e 
 			return fmt.Sprintf("%s: no usable source. Provider reading for host %s %s and no reset time is set", name, e.Host, state.reading), nil
 		}
 		reserve := big.NewRat(row.AllowanceTokens*int64(row.ReservePercent), 100)
-		admitted, err := c.reservedOutstanding(ctx, q, state, skipFailed)
+		admitted, err := c.reservedOutstanding(ctx, q, state, skip)
 		if err != nil {
 			return "", err
 		}
@@ -337,10 +444,10 @@ func (c *queueBudgetCheck) admissionReason(ctx context.Context, q queryRower, e 
 			continue
 		}
 		teams := ""
-		if admitted.teams == 1 {
-			teams = fmt.Sprintf(", %s reserved for 1 admitted team", budgetTokenText(admitted.tokens))
-		} else if admitted.teams > 1 {
-			teams = fmt.Sprintf(", %s reserved for %d admitted teams", budgetTokenText(admitted.tokens), admitted.teams)
+		if n := len(admitted.entries); n == 1 {
+			teams = fmt.Sprintf(", %s reserved for 1 admitted team: %s", budgetTokenText(admitted.tokens), admitted.entries[0])
+		} else if n > 1 {
+			teams = fmt.Sprintf(", %s reserved for %d admitted teams: %s", budgetTokenText(admitted.tokens), n, strings.Join(admitted.entries, ", "))
 		}
 		source := "provider reading"
 		if state.source == api.UsageBudgetSourceAllowance {
@@ -665,8 +772,12 @@ func budgetHeldReason(task string, h api.BudgetHold) string {
 // default of an entry whose item has no saved estimate, the hold of a running
 // entry, and the reason the budget holds a queued entry, which it returns by
 // entry id. A reason is written only where nothing earlier explained the wait.
-// An entry that only the reservation of a failed, unreleased entry holds is
-// not returned: its wait ends with a release, so its stall stays.
+// While no slot is free, an entry that only the reservation holds gets no
+// reason and is not returned: it waits for the slot, and the reservation ends
+// with the entry that holds it. An entry that only the reservation of a
+// failed, unreleased entry holds is not returned either: its wait ends with a
+// release, so its stall stays, and where nothing else explained its wait it
+// gets the stall that names that entry, followed by the budget reason.
 func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api.TeamQueueList, now time.Time) (map[string]string, error) {
 	check := newQueueBudgetCheck(task, now)
 	held := map[string]string{}
@@ -697,17 +808,43 @@ func explainQueueBudget(ctx context.Context, q queryRower, task string, out *api
 		if err != nil {
 			return nil, err
 		}
-		if reason != "" {
-			if e.BlockReason == "" {
-				e.BlockReason = reason
-			}
-			release, err := check.heldOnlyByFailed(ctx, q, *e)
+		if reason == "" {
+			continue
+		}
+		full, err := check.slotsFull(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		if full {
+			alone, err := check.heldOnlyByReservation(ctx, q, *e)
 			if err != nil {
 				return nil, err
 			}
-			if !release {
-				held[e.ID] = reason
+			if alone {
+				continue
 			}
+		}
+		release, err := check.heldOnlyByFailed(ctx, q, *e)
+		if err != nil {
+			return nil, err
+		}
+		if !release {
+			held[e.ID] = reason
+		}
+		if e.BlockReason != "" {
+			continue
+		}
+		e.BlockReason = reason
+		if !release || e.Stall != nil {
+			continue
+		}
+		blocker, stall, err := check.failedReservationStall(ctx, q, *e)
+		if err != nil {
+			return nil, err
+		}
+		if stall != nil {
+			setQueueStall(e, blocker, stall.cause, stall.fix, stall.since)
+			e.BlockReason += ". Its reservation holds this entry: " + reason
 		}
 	}
 	return held, nil
