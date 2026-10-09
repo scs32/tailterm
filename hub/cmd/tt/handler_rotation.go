@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
@@ -695,6 +696,23 @@ type successorStartError struct{ err error }
 func (e successorStartError) Error() string { return e.err.Error() }
 func (e successorStartError) Unwrap() error { return e.err }
 
+// noticeSafeError makes an error text safe for a Board envelope: a launcher's
+// error can carry terminal escapes, and the hub refuses control characters.
+// Each one, and each invalid byte, becomes a space; the text is cut to 400
+// runes.
+func noticeSafeError(text string) string {
+	runes := []rune(strings.ToValidUTF8(text, " "))
+	for i, c := range runes {
+		if unicode.IsControl(c) {
+			runes[i] = ' '
+		}
+	}
+	if len(runes) > 400 {
+		runes = runes[:400]
+	}
+	return strings.TrimSpace(string(runes))
+}
+
 // recordResumeFailure adds one failed resume to the journal the runner just
 // resumed and returns it as saved. It returns nil when that journal is gone
 // or now records a different rotation.
@@ -710,10 +728,7 @@ func recordResumeFailure(ctx context.Context, hub, task string, resumed *handler
 		return nil, err
 	}
 	j.ResumeFailures++
-	j.LastResumeError = cause.Error()
-	if len(j.LastResumeError) > 400 {
-		j.LastResumeError = j.LastResumeError[:400]
-	}
+	j.LastResumeError = noticeSafeError(cause.Error())
 	return j, writePrivateJSON(path, *j)
 }
 
@@ -1478,7 +1493,7 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 		}
 	}
 	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. Fix the launch (the saved spec from tt handler spec, or the host's capacity), then resume it on that host with tt handler rotate --task %s, or abort it with tt handler rotate --abort --task %s.",
-		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, j.LastResumeError, d.TaskID, d.TaskID)
+		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), d.TaskID, d.TaskID)
 	for i, to := range recipients {
 		env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: rotationStuckSubject,
 			Refs: map[string]string{"host": host, "project": d.TaskID, "successor": j.SuccessorAgentID}, Body: api.EnvelopeBody{Text: text}}

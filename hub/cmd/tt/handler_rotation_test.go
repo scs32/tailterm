@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
@@ -2421,4 +2423,44 @@ func TestHandlerRotationRunnerBusyRefusalIsNotAnAttempt(t *testing.T) {
 	f.activity(t, f.old, "idle", "", 0)
 	f.tick(t, f.runner())
 	f.assertRotated(t, f.rotations(t)[0], 1)
+}
+
+// Review blocker b1 (#30822): a launcher error carrying terminal escapes or
+// a NUL must not keep the notice from posting once the runner has stopped.
+func TestHandlerRotationRunnerStuckNoticeSurvivesControlCharacters(t *testing.T) {
+	f := newStuckRotation(t)
+	f.deps.spawn = func(env, []string) error {
+		return errors.New("\x1b[31mlauncher failed\x1b[0m\x00 caf\xc3 " + strings.Repeat("\u00e9", 500))
+	}
+	r := f.runner()
+	for i := 0; i <= 3; i++ {
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "successor launch unconfirmed") {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick %d after the ceiling: %v", i+1, err)
+		}
+	}
+	if err := f.try(f.runner()); err != nil {
+		t.Fatalf("a restarted runner: %v", err)
+	}
+	notices := f.stuckNotices(t)
+	if len(notices) != 2 {
+		t.Fatalf("stuck notices: %d", len(notices))
+	}
+	for _, m := range notices {
+		text := m.Envelope.Body.Text
+		if !strings.Contains(text, "[31mlauncher failed") || !utf8.ValidString(text) || strings.ContainsFunc(text, unicode.IsControl) {
+			t.Fatalf("notice text: %q", text)
+		}
+	}
+	// A journal an earlier build saved with the raw text still posts.
+	if got := noticeSafeError("a\x1bb\x00c\nd"); got != "a b c d" {
+		t.Fatalf("sanitised: %q", got)
+	}
+	if got := noticeSafeError(strings.Repeat("\u00e9", 500)); utf8.RuneCountInString(got) != 400 || !utf8.ValidString(got) {
+		t.Fatalf("cut: %d runes", utf8.RuneCountInString(got))
+	}
 }
