@@ -2697,3 +2697,69 @@ func TestUsageEstimateDefaults(t *testing.T) {
 		t.Fatalf("unknown project: %v", err)
 	}
 }
+
+// wi_44b17e10c6450225 v3: the corrections label is judged inside the review
+// stage that holds the ASSIGN. The first build ASSIGN after a findings stage
+// that left blockers is build; an ASSIGN after a blocker round of its own
+// stage is still corrections.
+func TestUsagePhaseCorrectionsStayInsideReviewStage(t *testing.T) {
+	s, task, a, items, _ := usageFixture(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`UPDATE agents SET role='' WHERE id=?`, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"members": []any{map[string]any{"fields": map[string]any{"agentId": a.ID, "role": "builder"}, "runId": a.RunID}}})
+	if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,created_at,updated_at) VALUES(?,?,?,1,1,'planned',1,'running',1,'fixture','/tmp',0,?,?,?)`, api.NewID("tqe"), task.ID, items[0].ID, string(plan), ts(s.now()), ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	specs := []struct {
+		kind, want string
+	}{{"assign", "build"}, {"review", "review round 1"}, {"assign", "corrections"}, {"assign", "build"}, {"review", "review round 1"}, {"assign", "corrections"}}
+	messages := []api.Message{}
+	for i, spec := range specs {
+		e := api.Envelope{Kind: spec.kind, Subject: "Synthetic phase request", Refs: map[string]string{"item": items[0].ID}}
+		if spec.kind == "review" {
+			e.Review = &api.ReviewMetadata{Mode: "general"}
+		}
+		raw, _ := json.Marshal(e)
+		r, err := s.db.Exec(`INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,envelope) VALUES(?,'','fixture','owner',?,'synthetic',?,?)`, task.ID, a.ID, ts(at.Add(time.Duration(i)*time.Minute)), string(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq, _ := r.LastInsertId()
+		messages = append(messages, api.Message{Seq: seq})
+	}
+	blockers := []api.ReviewFinding{{ID: "blocker", Title: "Synthetic blocker"}}
+	// Stage one is a findings stage that left a blocker; messages[3] opens stage two.
+	state := api.ReviewConvergence{ItemID: items[0].ID,
+		Stages: []api.ReviewStage{{Number: 1, ScopeRevision: 1, AssignmentSeq: messages[0].Seq}, {Number: 2, OrderSeq: 1, ScopeRevision: 2, AssignmentSeq: messages[3].Seq}},
+		Rounds: []api.ReviewRound{{Number: 1, RequestSeq: messages[1].Seq, ResultSeq: messages[1].Seq, Blockers: blockers}, {Number: 1, RequestSeq: messages[4].Seq, ResultSeq: messages[4].Seq, Blockers: blockers}}}
+	raw, _ := json.Marshal(state)
+	if _, err := s.db.Exec(`INSERT INTO review_convergence VALUES(?,?,?)`, task.ID, items[0].ID, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range messages {
+		turn := syntheticUsageTurn(fmt.Sprintf("stage-phase-%d", i))
+		turn.At = at.Add(time.Duration(i)*time.Minute + time.Second)
+		turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: m.Seq, Operation: "ack", At: turn.At}}
+		if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, fmt.Sprintf("stage-phase-batch-%d", i), turn)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := s.Usage(ctx, task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, x := range report.Items {
+		if x.ItemID == items[0].ID {
+			for _, g := range x.Phases {
+				got[g.Key] = g.Summary.Requests
+			}
+		}
+	}
+	if want := map[string]int{"build": 2, "corrections": 2, "review round 1": 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("phases\n got %+v\nwant %+v", got, want)
+	}
+}

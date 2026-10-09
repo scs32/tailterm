@@ -887,6 +887,7 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 		}
 		round.Blockers = round.Findings[:5]
 		reviews.Rounds = append(reviews.Rounds, round)
+		reviews.Stages = append(reviews.Stages, api.ReviewStage{Number: r, OrderSeq: int64(90 + r), ScopeRevision: int64(r), AssignmentSeq: int64(100 + r)})
 		reviews.Scopes = append(reviews.Scopes, api.ReviewScope{ScopeRevision: int64(r), Criteria: map[string]string{"a1": big(2048)}})
 		reviews.Focused = append(reviews.Focused, api.FocusedReview{RequestSeq: int64(r), Fix: big(2048)})
 	}
@@ -946,6 +947,14 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 		if round.Number != i+1 || round.Findings != nil || round.Criteria != nil || round.Blockers != nil {
 			t.Fatalf("round %d %+v", i, round)
 		}
+	}
+	// The summary keeps the recorded stages and each round's request sequence,
+	// so a reader counts the current stage: here one round, four earlier.
+	if !reflect.DeepEqual(rv.Stages, reviews.Stages) || !strings.Contains(string(raw), `"stages":[{"number":1,"orderSeq":91,"scopeRevision":1,"assignmentSeq":101},`) {
+		t.Fatalf("review stages %+v", rv.Stages)
+	}
+	if n, rounds, earlier := rv.CurrentStage(); n != 5 || len(rounds) != 1 || earlier != 4 {
+		t.Fatal("summary current stage", n, len(rounds), earlier)
 	}
 	for i, f := range rv.FollowUps {
 		if f.ItemID != fmt.Sprint("wi_follow", i) || len(f.Finding.Title) > summaryTitleBytes || !strings.HasPrefix(f.Finding.Title, "é") || f.Finding.Description != "" {

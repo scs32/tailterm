@@ -8,6 +8,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -698,6 +699,10 @@ func TestReviewConvergenceReassignmentRetainsRoundAndExactIdentity(t *testing.T)
 	state := f.state(t)
 	if len(state.Rounds) != 1 || state.Rounds[0].RequestSeq != r.Seq || state.Rounds[0].ActiveRequestSeq != moved.Seq || state.Rounds[0].ReviewerRun != replacement.RunID {
 		t.Fatal(state)
+	}
+	// Reassignment saves the whole ledger, with its recorded stage.
+	if len(state.Stages) != 1 || state.Stages[0].Number != 1 || state.Stages[0].AssignmentSeq != state.Scopes[0].AssignmentSeq {
+		t.Fatal("reassignment lost the recorded stage", state.Stages)
 	}
 }
 
@@ -2940,4 +2945,381 @@ func TestReviewStageUnknownLegacyHistoryGetsNoFreshCount(t *testing.T) {
 		t.Fatal("legacy history became known")
 	}
 	refusedWith(t, "fresh review on unknown history", f.reviewErr(candidateB), "legacy review history is unknown")
+}
+
+// doneSave saves the item done, which runs the review done check.
+func (f *convergenceFixture) doneSave() error {
+	done := "done"
+	_, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &done}, f.by)
+	return err
+}
+
+// f1 merge (wi_44b17e10c6450225): the scope that opened stage two is later
+// also confirmed under the findings order, at the same item revision, so the
+// findings order becomes that scope's earliest confirmation. The recorded
+// stage stays: an amendment under the build order continues stage two and
+// gets no third general review.
+func TestReviewStageLaterConfirmationUnderEarlierOrderKeepsStage(t *testing.T) {
+	f, handler := findingsStage(t)
+	f.rescope(t, "Build order one")
+	build := f.ownerOrder(t, "build-order")
+	f.confirmScope(t, handler, build, "build-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateC, passConvergence, api.ReviewMetadata{})
+	before := stageJSON(t, f.state(t))
+	var findings api.Message
+	if err := f.s.db.QueryRow(`SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND request_id='findings-scope'`, f.task.ID).Scan(&findings.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if findings.Seq >= build.Seq {
+		t.Fatal("findings order is not the earlier order", findings.Seq, build.Seq)
+	}
+	f.confirmScope(t, handler, findings, "rebind-scope")
+	refusedWith(t, "third review of stage two after the rebind", f.reviewErr(candidateC), "third general review refused")
+	if got := stageJSON(t, f.state(t)); got != before {
+		t.Fatalf("ledger changed\n got %s\nwant %s", got, before)
+	}
+	f.rescope(t, "Build order one, amended")
+	f.confirmScope(t, handler, build, "amended-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	refusedWith(t, "third review of stage two after its amendment", f.reviewErr(candidateC), "third general review refused")
+	if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal("stage two's reviews no longer answer acceptance:", err)
+	}
+	if err := f.doneSave(); err != nil {
+		t.Fatal("stage two's reviews no longer answer the done check:", err)
+	}
+}
+
+// f1 split (wi_44b17e10c6450225): a scope assigned unconfirmed and accepted
+// on its stage's reviews is confirmed under a new owner order afterwards. The
+// confirmation opens nothing: the stage's reviews still answer the done check.
+func TestReviewStageConfirmationAfterAssignNeverSplits(t *testing.T) {
+	f := newConvergenceFixture(t)
+	handler := f.stageHandler(t)
+	f.confirmScope(t, handler, f.ownerOrder(t, "findings-order"), "findings-scope")
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.rescope(t, "Amended inside the stage")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.acceptCandidate(candidateA, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	before := stageJSON(t, f.state(t))
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "late-scope")
+	if err := f.doneSave(); err != nil {
+		t.Fatal("confirmation after the scope's ASSIGN split the stage:", err)
+	}
+	if got := stageJSON(t, f.state(t)); got != before {
+		t.Fatalf("ledger changed\n got %s\nwant %s", got, before)
+	}
+}
+
+// The later-revision form of the f1 merge: a non-scope edit moves the item
+// revision before the stage-two scope is confirmed again under the findings
+// order. That row is never the scope's earliest, so it changed nothing before
+// stages were recorded either; it must keep changing nothing.
+func TestReviewStageLaterRevisionRebindKeepsStage(t *testing.T) {
+	f, handler := findingsStage(t)
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateC, passConvergence, api.ReviewMetadata{})
+	if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	before := stageJSON(t, f.state(t))
+	priority := "high"
+	var err error
+	if f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Priority: &priority}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if f.item.ScopeRevision != 2 {
+		t.Fatal("priority edit moved the scope revision", f.item.ScopeRevision)
+	}
+	var findings api.Message
+	if err = f.s.db.QueryRow(`SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND request_id='findings-scope'`, f.task.ID).Scan(&findings.Seq); err != nil {
+		t.Fatal(err)
+	}
+	f.confirmScope(t, handler, findings, "rebind-scope")
+	refusedWith(t, "third review of stage two after the rebind", f.reviewErr(candidateC), "third general review refused")
+	if got := stageJSON(t, f.state(t)); got != before {
+		t.Fatalf("ledger changed\n got %s\nwant %s", got, before)
+	}
+	if err = f.doneSave(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func wantStages(t *testing.T, name string, got []api.ReviewStage, want ...api.ReviewStage) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: stages\n got %+v\nwant %+v", name, got, want)
+	}
+}
+
+// v1 (wi_44b17e10c6450225): the stage is stored when its ASSIGN is saved, with
+// its order, scope revision and assignment sequence. A refused ASSIGN leaves
+// none behind, and a third stage is recorded the same way.
+func TestReviewStageRecordedAtAssign(t *testing.T) {
+	f := newConvergenceFixture(t)
+	handler := f.stageHandler(t)
+	first := f.state(t)
+	wantStages(t, "first ASSIGN", first.Stages, api.ReviewStage{Number: 1, ScopeRevision: 1, AssignmentSeq: first.Scopes[0].AssignmentSeq})
+	findings := f.ownerOrder(t, "findings-order")
+	f.confirmScope(t, handler, findings, "findings-scope")
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	// A confirmation saved after the ASSIGN does not rewrite the stored stage.
+	wantStages(t, "after a late confirmation", f.state(t).Stages, first.Stages...)
+
+	f.rescope(t, "Build order one")
+	build := f.ownerOrder(t, "build-order")
+	f.confirmScope(t, handler, build, "build-scope")
+	// R1: an ASSIGN refused after the stage decision rolls the stage back.
+	refusedWith(t, "non-contiguous criteria", f.assign(map[string]string{"a1": "builds", "a3": "skips"}, nil), "contiguous a1..aN")
+	wantStages(t, "after a refused ASSIGN", f.state(t).Stages, first.Stages...)
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	second := f.state(t)
+	one := api.ReviewStage{Number: 1, OrderSeq: findings.Seq, ScopeRevision: 1, AssignmentSeq: first.Scopes[0].AssignmentSeq}
+	two := api.ReviewStage{Number: 2, OrderSeq: build.Seq, ScopeRevision: 2, AssignmentSeq: second.Scopes[1].AssignmentSeq}
+	wantStages(t, "second-stage ASSIGN", second.Stages, one, two)
+	if !strings.Contains(stageJSON(t, second), fmt.Sprintf(`"stages":[{"number":1,"orderSeq":%d,"scopeRevision":1,"assignmentSeq":%d},{"number":2,"orderSeq":%d,"scopeRevision":2,"assignmentSeq":%d}]`, one.OrderSeq, one.AssignmentSeq, two.OrderSeq, two.AssignmentSeq)) {
+		t.Fatal("stored stage shape", stageJSON(t, second))
+	}
+	if n, rounds, earlier := second.CurrentStage(); n != 2 || len(rounds) != 0 || earlier != 2 {
+		t.Fatal("current stage after its ASSIGN", n, len(rounds), earlier)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	// A re-ASSIGN of the same scope and an amendment under the same order
+	// stay in stage two.
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.rescope(t, "Build order one, amended")
+	f.confirmScope(t, handler, build, "amended-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	wantStages(t, "same order amendment", f.state(t).Stages, one, two)
+	refusedWith(t, "third review of stage two", f.reviewErr(candidateB), "third general review refused")
+
+	f.rescope(t, "Build order two")
+	third := f.ownerOrder(t, "third-order")
+	f.confirmScope(t, handler, third, "third-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateC, passConvergence, api.ReviewMetadata{})
+	st := f.state(t)
+	wantStages(t, "third-stage ASSIGN", st.Stages, one, two, api.ReviewStage{Number: 3, OrderSeq: third.Seq, ScopeRevision: 4, AssignmentSeq: st.Scopes[3].AssignmentSeq})
+	if n, rounds, earlier := st.CurrentStage(); n != 3 || len(rounds) != 1 || earlier != 4 || rounds[0].Number != 1 {
+		t.Fatal("current stage of three", n, len(rounds), earlier)
+	}
+	if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.doneSave(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A first stage recorded before its scope was confirmed is named, at the next
+// scope's first ASSIGN, from the earliest confirmation among its own scopes;
+// with none it takes the new scope's order and stays one stage.
+func TestReviewStageUnnamedFirstStageIsNamedFromItsOwnScopes(t *testing.T) {
+	t.Run("own confirmation saved after the ASSIGN", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		findings := f.ownerOrder(t, "findings-order")
+		f.confirmScope(t, handler, findings, "findings-scope")
+		if st := f.state(t); st.Stages[0].OrderSeq != 0 {
+			t.Fatal("confirmation after the ASSIGN named the stage early", st.Stages)
+		}
+		f.rescope(t, "Build order one")
+		build := f.ownerOrder(t, "build-order")
+		f.confirmScope(t, handler, build, "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		st := f.state(t)
+		if len(st.Stages) != 2 || st.Stages[0].OrderSeq != findings.Seq || st.Stages[1].OrderSeq != build.Seq {
+			t.Fatal("stage one was not named from its own scope", st.Stages)
+		}
+	})
+	t.Run("no confirmation of its own", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		f.rescope(t, "First confirmed scope")
+		order := f.ownerOrder(t, "first-order")
+		f.confirmScope(t, handler, order, "first-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		st := f.state(t)
+		wantStages(t, "adopted order", st.Stages, api.ReviewStage{Number: 1, OrderSeq: order.Seq, ScopeRevision: 1, AssignmentSeq: st.Scopes[0].AssignmentSeq})
+	})
+}
+
+// stripStages rewrites the stored ledger as one saved before stages were
+// recorded.
+func (f *convergenceFixture) stripStages(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE review_convergence SET state_json=json_remove(state_json,'$.stages') WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.state(t); len(st.Stages) != 0 {
+		t.Fatal("stages not stripped", st.Stages)
+	}
+}
+
+// v1 legacy (wi_44b17e10c6450225): a ledger stored without stages keeps the
+// derived boundary, is pinned by its next saved transition and does not move
+// afterwards. Unknown history records no stage.
+func TestReviewStageLegacyLedgerIsDerivedOnceThenPinned(t *testing.T) {
+	t.Run("two stages", func(t *testing.T) {
+		f, handler := findingsStage(t)
+		f.rescope(t, "Build order one")
+		build := f.ownerOrder(t, "build-order")
+		f.confirmScope(t, handler, build, "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		recorded := f.state(t).Stages
+		f.stripStages(t)
+		// R3: a reader cannot derive, so the stripped ledger reads as one stage.
+		if n, rounds, earlier := f.state(t).CurrentStage(); n != 1 || len(rounds) != 3 || earlier != 0 {
+			t.Fatal("stripped ledger reader", n, len(rounds), earlier)
+		}
+		// A refusal and the done check derive in memory and store nothing (R6).
+		refusedWith(t, "accept on the findings stage's candidate", f.acceptCandidate(candidateA, api.Agent{}), "changed candidate needs exact focused verification")
+		refusedWith(t, "done check before acceptance", f.doneSave(), "saved lead acceptance required")
+		if st := f.state(t); len(st.Stages) != 0 {
+			t.Fatal("a refused transition stored stages", st.Stages)
+		}
+		// The next saved transition pins the derived stages: stage two still
+		// has one review left, as it had before the strip.
+		f.generalRound(t, candidateC, passConvergence, api.ReviewMetadata{})
+		pinned := f.state(t)
+		wantStages(t, "pinned", pinned.Stages, recorded...)
+		if pinned.Rounds[3].Number != 2 {
+			t.Fatal("derived stage numbering", pinned.Rounds)
+		}
+		refusedWith(t, "third review of the pinned stage", f.reviewErr(candidateC), "third general review refused")
+		// Pinned, it no longer moves: the f1 merge row changes nothing.
+		var findings api.Message
+		if err := f.s.db.QueryRow(`SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND request_id='findings-scope'`, f.task.ID).Scan(&findings.Seq); err != nil {
+			t.Fatal(err)
+		}
+		f.confirmScope(t, handler, findings, "rebind-scope")
+		if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+			t.Fatal(err)
+		}
+		wantStages(t, "after the rebind", f.state(t).Stages, recorded...)
+		if err := f.doneSave(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("one scope", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		findings := f.ownerOrder(t, "findings-order")
+		f.confirmScope(t, handler, findings, "findings-scope")
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.stripStages(t)
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		if st := f.state(t); len(st.Stages) != 0 || len(st.Rounds) != 2 {
+			t.Fatal("a one-scope ledger has nothing to derive", st.Stages)
+		}
+		f.rescope(t, "Build order one")
+		build := f.ownerOrder(t, "build-order")
+		f.confirmScope(t, handler, build, "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		st := f.state(t)
+		wantStages(t, "next scope's ASSIGN", st.Stages, api.ReviewStage{Number: 1, OrderSeq: findings.Seq, ScopeRevision: 1, AssignmentSeq: st.Scopes[0].AssignmentSeq}, api.ReviewStage{Number: 2, OrderSeq: build.Seq, ScopeRevision: 2, AssignmentSeq: st.Scopes[1].AssignmentSeq})
+	})
+	t.Run("unknown history", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		f.confirmScope(t, handler, f.ownerOrder(t, "legacy-order"), "legacy-scope")
+		if _, err := f.s.db.Exec(`UPDATE review_convergence SET state_json=json_set(json_remove(state_json,'$.stages'),'$.history','unknown') WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+			t.Fatal(err)
+		}
+		f.rescope(t, "Build order one")
+		f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		if st := f.state(t); st.History != "unknown" || len(st.Stages) != 0 || len(st.Scopes) != 2 {
+			t.Fatal("unknown history recorded a stage", st.History, st.Stages)
+		}
+	})
+}
+
+// v2 (wi_44b17e10c6450225): only an order the owner wrote opens a stage. A
+// scope confirmed under a linked message an agent wrote stays in its stage.
+func TestReviewStageOnlyOwnerWrittenOrderOpensStage(t *testing.T) {
+	run := func(t *testing.T, ownerWritten bool) (*convergenceFixture, api.Agent, api.Message) {
+		f, handler := findingsStage(t)
+		f.rescope(t, "Build order one")
+		var order api.Message
+		if ownerWritten {
+			order = f.ownerOrder(t, "build-order")
+		} else {
+			var err error
+			order, err = f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "build-order", RequestID: "build-order", AgentID: handler.ID, RunID: handler.RunID, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if order.From.AgentID != handler.ID {
+				t.Fatal("fixture order is not agent-written", order.From)
+			}
+		}
+		f.confirmScope(t, handler, order, "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		return f, handler, order
+	}
+	t.Run("agent-written", func(t *testing.T) {
+		f, handler, _ := run(t, false)
+		refusedWith(t, "third review under an agent-written order", f.reviewErr(candidateB), "third general review refused")
+		if st := f.state(t); len(st.Stages) != 1 || len(st.Rounds) != 2 {
+			t.Fatal("agent-written order opened a stage", st.Stages)
+		}
+		// Recovery: the owner posts the order and a new scope revision takes it.
+		f.rescope(t, "Build order one, owner order")
+		order := f.ownerOrder(t, "owner-build-order")
+		f.confirmScope(t, handler, order, "owner-build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		if st := f.state(t); len(st.Stages) != 2 || st.Stages[1].OrderSeq != order.Seq || st.Stages[1].ScopeRevision != 3 {
+			t.Fatal("owner order after an agent-written one", st.Stages)
+		}
+	})
+	t.Run("owner-written", func(t *testing.T) {
+		f, _, order := run(t, true)
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		if st := f.state(t); len(st.Stages) != 2 || st.Stages[1].OrderSeq != order.Seq || len(st.Rounds) != 3 {
+			t.Fatal("owner-written order opened no stage", st.Stages)
+		}
+	})
 }

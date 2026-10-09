@@ -112,14 +112,38 @@ type ReviewReconciliation struct {
 	RunID      string                  `json:"runId"`
 }
 
+// ReviewStage is recorded when the ASSIGN that opens it is saved, and is
+// never recomputed. The first stage's OrderSeq is 0 until an order is known
+// for it.
+type ReviewStage struct {
+	Number        int   `json:"number"`
+	OrderSeq      int64 `json:"orderSeq,omitempty"`
+	ScopeRevision int64 `json:"scopeRevision"`
+	AssignmentSeq int64 `json:"assignmentSeq"`
+}
+
 type ReviewConvergence struct {
 	Reconciliations []ReviewReconciliation `json:"reconciliations,omitempty"`
 	Dispositions    []ReviewDisposition    `json:"dispositions,omitempty"`
 	ItemID          string                 `json:"itemId"`
 	History         string                 `json:"history"` // recorded or unknown; never inferred zero
 	Scopes          []ReviewScope          `json:"scopes"`
+	Stages          []ReviewStage          `json:"stages,omitempty"`
 	Rounds          []ReviewRound          `json:"rounds"`
 	FollowUps       []ReviewFollowUp       `json:"followUps"`
 	Focused         []FocusedReview        `json:"focused"`
 	Disposition     *ReviewDisposition     `json:"disposition,omitempty"`
+}
+
+// CurrentStage returns the current stage number (1 when none is recorded),
+// that stage's rounds and the number of rounds in earlier stages.
+func (r ReviewConvergence) CurrentStage() (number int, rounds []ReviewRound, earlier int) {
+	if len(r.Stages) < 2 {
+		return 1, r.Rounds, 0
+	}
+	last := r.Stages[len(r.Stages)-1]
+	for earlier < len(r.Rounds) && r.Rounds[earlier].RequestSeq < last.AssignmentSeq {
+		earlier++
+	}
+	return last.Number, r.Rounds[earlier:], earlier
 }

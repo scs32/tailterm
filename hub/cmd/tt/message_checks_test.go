@@ -121,3 +121,25 @@ func TestReviewConvergenceNativeCLISummaryAndProjection(t *testing.T) {
 		}
 	}
 }
+
+// wi_44b17e10c6450225 v4: the summary counts the current review stage against
+// the limit. The numbers match the Board fixture in
+// tests/team-delivery-view.test.js.
+func TestSummarizeReviewsCountsCurrentStage(t *testing.T) {
+	rounds := []api.ReviewRound{{Number: 1, RequestSeq: 10}, {Number: 2, RequestSeq: 20}, {Number: 1, RequestSeq: 40}}
+	followUps := make([]api.ReviewFollowUp, 3)
+	stages := []api.ReviewStage{{Number: 1, OrderSeq: 3, ScopeRevision: 1, AssignmentSeq: 5}, {Number: 2, OrderSeq: 25, ScopeRevision: 2, AssignmentSeq: 30}}
+	got := summarizeReviews([]api.ReviewConvergence{
+		{ItemID: "wi_two", History: "recorded", Stages: stages, Rounds: rounds, FollowUps: followUps},
+		{ItemID: "wi_one", History: "recorded", Stages: stages[:1], Rounds: rounds[:2], FollowUps: followUps[:1]},
+		{ItemID: "wi_none", History: "recorded", Rounds: rounds[:2], FollowUps: followUps[:1]},
+		{ItemID: "wi_unknown", History: "unknown"},
+	})
+	want := "wi_two stage 2: reviews 1/2 (earlier stages: 2); follow-ups: 3\n" +
+		"wi_one reviews: 2/2; follow-ups: 1\n" +
+		"wi_none reviews: 2/2; follow-ups: 1\n" +
+		"wi_unknown reviews: unknown; follow-ups: unknown\n"
+	if got != want {
+		t.Fatalf("summary\n got %q\nwant %q", got, want)
+	}
+}

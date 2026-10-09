@@ -65,3 +65,18 @@ test("the panel says when older finished entries are not shown", () => {
   const whole = renderTeamDelivery({ entries, history: { total: 50, limit: 50 } });
   assert.ok(!whole.includes("Showing"));
 });
+
+// wi_44b17e10c6450225 v4: only the current review stage counts against the
+// limit. The numbers match TestSummarizeReviewsCountsCurrentStage in
+// hub/cmd/tt/message_checks_test.go.
+test("the review count is the current stage's, with earlier stages named", () => {
+  const rounds = [{ number: 1, requestSeq: 10 }, { number: 2, requestSeq: 20 }, { number: 1, requestSeq: 40 }];
+  const followUps = [1, 2, 3].map((n) => ({ itemId: `wi_follow${n}`, finding: { id: `F${n}`, title: `Title ${n}` } }));
+  const stages = [{ number: 1, orderSeq: 3, scopeRevision: 1, assignmentSeq: 5 }, { number: 2, orderSeq: 25, scopeRevision: 2, assignmentSeq: 30 }];
+  const text = (reviews) => renderTeamDelivery({ entries: [{ itemId: "wi_stage", state: "running", reviews: { history: "recorded", scopes: [], focused: [], ...reviews } }] }).match(/data-testid="review-convergence-summary">([^<]*)</)[1];
+  assert.equal(text({ stages, rounds, followUps, disposition: { kind: "accept" } }), "Stage 2 · Reviews 1/2 · Earlier stages 2 · Follow-ups 3 · accept");
+  assert.equal(text({ stages: stages.slice(0, 1), rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1");
+  assert.equal(text({ rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1");
+  assert.equal(text({ stages, rounds: rounds.slice(0, 2), followUps: [] }), "Stage 2 · Reviews 0/2 · Earlier stages 2 · Follow-ups 0");
+  assert.equal(renderTeamDelivery({ entries: [{ itemId: "wi_legacy", state: "running", reviews: { history: "unknown", stages, rounds, followUps } }] }).match(/data-testid="review-convergence-summary">([^<]*)</)[1], "Reviews unknown · Follow-ups unknown");
+});

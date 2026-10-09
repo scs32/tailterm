@@ -97,6 +97,29 @@ its first stage, so it opens no new one. The stage opens at that scope
 revision's first ASSIGN: until then an open review of the current stage still
 takes its result, and afterwards the earlier stage takes no further result.
 
+The stage start is recorded, not recomputed (bug `wi_44b17e10c6450225`, owner
+order #31258). When a scope revision's first ASSIGN is saved, the hub reads that
+scope's confirmation once, decides the stage and stores it in the item's review
+ledger as a `stages` entry: stage number, order message, scope revision and the
+ASSIGN's sequence. Every later transition, the done check and every reader take
+the boundary from that entry. A refused ASSIGN stores nothing.
+
+The order must be owner-written. The check is made at that first ASSIGN, the one
+place a stage is created (`openReviewStage` in
+`hub/internal/store/review_convergence.go`): the order message must carry no
+agent identity and must not be a system message, the same rule as an owner matrix
+approval. A scope confirmed under a linked message that an agent wrote stays in
+its stage, and the build meets the usual "third general review refused". To
+recover, the owner posts the order and the handler confirms a new scope revision
+under it. The check is on the order's authorship because a stage grants two more
+general reviews; the handler's confirmation alone is not the control.
+
+A first stage whose scope had no confirmation at its ASSIGN is recorded without
+an order. It is named once, at the next scope revision's first ASSIGN, from the
+earliest confirmation among its own scope revisions; if it has none, it takes
+that scope's order and stays one stage. A recorded order, and any stage after
+the first, is never rewritten.
+
 The two-round cap, the frozen verdicts and the no-reclassification rule,
 blockers, focused verification, follow-up IDs and acceptance are all evaluated
 inside the current stage. A new stage starts at round one with its own a1..aN,
@@ -116,11 +139,31 @@ item's history across several.
 Limits. A new owner order needs its own scope revision: the handler records the
 order in the item with a revision-checked edit, then confirms that scope. An
 order confirmed on an unchanged scope revision opens no stage. Unknown legacy
-history still gets no fresh count. A confirmation saved after a scope's reviews
-already continued the stage's numbering does not split that stage; the next scope
-revision under the new order opens it. A reviewer of any stage still cannot be
-the item's independent verifier. Readers that show a total, such as the Board's
-review count, count the rounds of every stage.
+history still gets no fresh count and records no stage. A confirmation saved
+after a scope revision's first ASSIGN opens, moves and erases nothing, whichever
+order it names: the stage that scope was assigned into is already recorded, and
+the next scope revision under the new order opens the stage. A reviewer of any
+stage still cannot be the item's independent verifier.
+
+Ledgers saved before stages were recorded. A recorded ledger with two or more
+scope revisions and no `stages` entry has its stages derived once, by the
+earlier rule (the earliest confirmation of each scope revision), and the next
+saved transition stores them; after that they do not move. Such a ledger with
+three or more stages is stored as two, everything before the latest boundary
+being one earlier stage: the count against the limit is the same and only the
+stage number shown is lower. Readers do not derive, so until its next
+transition a two-stage ledger of this kind still shows its summed total.
+
+Totals are per stage. `tt message-checks --summary` and the Board's Delivery row
+show the current stage's review count against the limit, with earlier stages
+named but not summed: `stage 2: reviews 1/2 (earlier stages: 2)` and
+`Stage 2 · Reviews 1/2 · Earlier stages 2`. The queue summary carries the
+recorded stages so the Board can make that split. An item with one
+stage reads as before, `reviews: 2/2`. Follow-ups stay a total across stages:
+they are open work items whichever stage filed them. The usage report labels an
+ASSIGN "corrections" only when a completed round of its own stage left
+blockers. The helper's round label and the usage report's "review round N" key
+are not stage-aware yet.
 
 ### Scope and legacy reconciliation
 

@@ -26,7 +26,12 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
     const refEffects = release?.receipt ? `${release.receipt.push ? ` · push ${esc(release.receipt.push.outcome)}` : ""}${release.receipt.revert ? ` · tasks-hub revert ${esc(release.receipt.revert.outcome)}${release.receipt.revert.commit ? " " + esc(release.receipt.revert.commit) : ""}` : ""}` : "";
     const releaseText = release ? `<span class="fine" data-testid="release-summary" style="overflow-wrap:anywhere">Accepted → verified${merged ? " → merged" : ""}${release.state === "released" ? " → released" : ""}${superseded} · ${esc(release.state)} · job ${esc(release.id)} · verification ${esc(release.verificationDigest)}${release.integratedCommit ? " · commit " + esc(release.integratedCommit) : ""}${release.receipt?.targets?.map(t => " · " + esc(t.target) + ": " + esc(t.outcome) + (t.rollback ? " · rollback " + esc(t.rollback) : "") + " · " + esc(t.release) + (t.deployment ? " · " + esc(t.deployment) : "")).join("") || ""}${refEffects}</span>` : "";
     const review = entry.reviews;
-    const reviewText = review?.history === "recorded" ? `Reviews ${review.rounds.length}/2 · Follow-ups ${review.followUps.length}${review.disposition ? ` · ${review.disposition.kind}` : ""}` : "Reviews unknown · Follow-ups unknown";
+    // Only the current review stage counts against the limit. A stage is
+    // recorded by the hub with the ASSIGN that opened it; follow-ups are a total.
+    const stage = review?.stages?.length > 1 ? review.stages[review.stages.length - 1] : null;
+    const earlierRounds = stage ? review.rounds.filter((round) => round.requestSeq < stage.assignmentSeq).length : 0;
+    const reviewCount = stage ? `Stage ${stage.number} · Reviews ${review.rounds.length - earlierRounds}/2 · Earlier stages ${earlierRounds}` : `Reviews ${review?.rounds?.length}/2`;
+    const reviewText = review?.history === "recorded" ? `${reviewCount} · Follow-ups ${review.followUps.length}${review.disposition ? ` · ${review.disposition.kind}` : ""}` : "Reviews unknown · Follow-ups unknown";
     const followUps = review?.followUps?.length ? `<span class="fine" style="overflow-wrap:anywhere">${review.followUps.map((f) => `${esc(f.itemId)}: ${esc(f.finding.title)}`).join(" · ")}</span>` : "";
     const verification = entry.verification;
     const notableChecks = verification?.checks?.filter(c => c.status !== "pass" || c.knownFailure || c.nowPassing) || [];

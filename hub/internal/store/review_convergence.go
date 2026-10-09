@@ -46,43 +46,106 @@ func saveReviewState(ctx context.Context, tx *sql.Tx, task string, state api.Rev
 }
 
 // A review stage is the run of scope revisions worked under one owner order.
-// A scope revision opens a new stage when its saved scope confirmation names a
-// different owner order than the stage before it. Earlier stages stay stored
-// unchanged; the two-round count, verdicts, blockers, focused records and
-// follow-up IDs are evaluated inside the current stage only.
+// It is recorded in the ledger when the ASSIGN that opens it is saved and is
+// read from there afterwards, never recomputed: a confirmation saved after a
+// scope's first ASSIGN cannot open, move or erase a stage. Earlier stages stay
+// stored unchanged; the two-round count, verdicts, blockers, focused records
+// and follow-up IDs are evaluated inside the current stage only.
 type earlierReviewStages struct {
 	rounds    []api.ReviewRound
 	focused   []api.FocusedReview
 	followUps []api.ReviewFollowUp
 }
 
-// reviewStageStart returns the assignment sequence that opens the current
-// stage, or 0 in the first stage. Only an assignment opens a stage: assign is
-// the sequence of an ASSIGN being applied to scope revision current, else 0, so
-// an open review of the current stage still takes its result after a new owner
-// order is confirmed. Unknown legacy history never opens a stage. A scope with
-// no saved confirmation, or one whose rounds continue an earlier scope's
-// numbering, stays in its stage.
-func reviewStageStart(ctx context.Context, q queryRower, task string, state api.ReviewConvergence, current, assign int64) (int64, error) {
-	scopes := state.Scopes
-	if assign != 0 && scopeFor(&state, current) == nil {
-		scopes = append(scopes[:len(scopes):len(scopes)], api.ReviewScope{ScopeRevision: current, AssignmentSeq: assign})
-	}
-	if state.History == "unknown" || len(scopes) < 2 {
+// scopeOrder returns the order named by the scope's earliest saved
+// confirmation, or 0 when it has none.
+func scopeOrder(ctx context.Context, q queryRower, task, item string, scope int64) (int64, error) {
+	var order int64
+	err := q.QueryRowContext(ctx, `SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND scope_revision=? ORDER BY item_revision,order_seq LIMIT 1`, task, item, scope).Scan(&order)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
-	var start, order int64
-	for _, sc := range scopes {
-		var confirmed int64
-		err := q.QueryRowContext(ctx, `SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND scope_revision=? ORDER BY item_revision,order_seq LIMIT 1`, task, state.ItemID, sc.ScopeRevision).Scan(&confirmed)
-		if errors.Is(err, sql.ErrNoRows) {
+	return order, err
+}
+
+// nameReviewStage fills the order of a first stage recorded without one from
+// the earliest confirmation among that stage's own scopes. A recorded order is
+// never rewritten.
+func nameReviewStage(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence) error {
+	stage := &state.Stages[len(state.Stages)-1]
+	for _, sc := range state.Scopes {
+		if stage.OrderSeq != 0 {
+			break
+		}
+		if sc.AssignmentSeq < stage.AssignmentSeq {
 			continue
 		}
+		var err error
+		if stage.OrderSeq, err = scopeOrder(ctx, q, task, state.ItemID, sc.ScopeRevision); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// firstReviewStage is stage one of a ledger that has assigned scopes and no
+// recorded stage.
+func firstReviewStage(state api.ReviewConvergence) []api.ReviewStage {
+	return []api.ReviewStage{{Number: 1, ScopeRevision: state.Scopes[0].ScopeRevision, AssignmentSeq: state.Scopes[0].AssignmentSeq}}
+}
+
+// openReviewStage decides the stage of a later scope's first ASSIGN (assign is
+// its sequence) and records a new stage when that scope's saved confirmation
+// names a different order that the owner wrote. A scope with no saved
+// confirmation, the same order, or an order an agent wrote stays in its stage.
+func openReviewStage(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence, scope, assign int64) error {
+	if len(state.Stages) == 0 {
+		state.Stages = firstReviewStage(*state)
+	}
+	order, err := scopeOrder(ctx, q, task, state.ItemID, scope)
+	if err != nil || order == 0 {
+		return err
+	}
+	if err = nameReviewStage(ctx, q, task, state); err != nil {
+		return err
+	}
+	stage := &state.Stages[len(state.Stages)-1]
+	if stage.OrderSeq == 0 {
+		stage.OrderSeq = order // the first known order names the first stage
+	}
+	if stage.OrderSeq == order {
+		return nil
+	}
+	// Only an owner order opens a stage: the same authorship rule as an owner
+	// matrix approval.
+	var owner int
+	if err = q.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE task_id=? AND seq=? AND from_agent='' AND from_node<>'system'`, task, order).Scan(&owner); err != nil || owner == 0 {
+		return err
+	}
+	state.Stages = append(state.Stages, api.ReviewStage{Number: stage.Number + 1, OrderSeq: order, ScopeRevision: scope, AssignmentSeq: assign})
+	return nil
+}
+
+// legacyReviewStages derives the stages of a ledger saved before stages were
+// recorded, with the rule that ledger was written under: a scope opens a stage
+// when its earliest confirmation names a different order than the stage before
+// it, unless its rounds continue an earlier scope's numbering. Everything
+// before the latest boundary is one earlier stage. The next saved transition
+// stores the result and it is not derived again.
+func legacyReviewStages(ctx context.Context, q queryRower, task string, state api.ReviewConvergence) ([]api.ReviewStage, error) {
+	stages := firstReviewStage(state)
+	var start api.ReviewScope
+	var order int64
+	for _, sc := range state.Scopes {
+		confirmed, err := scopeOrder(ctx, q, task, state.ItemID, sc.ScopeRevision)
 		if err != nil {
-			return 0, err
+			return nil, err
+		}
+		if confirmed == 0 {
+			continue
 		}
 		if order == 0 {
-			order = confirmed // the first known order names the first stage
+			order, stages[0].OrderSeq = confirmed, confirmed
 		}
 		if confirmed == order {
 			continue
@@ -95,20 +158,41 @@ func reviewStageStart(ctx context.Context, q queryRower, task string, state api.
 			}
 		}
 		if !continued {
-			start, order = sc.AssignmentSeq, confirmed
+			start, order = sc, confirmed
 		}
 	}
-	return start, nil
+	if start.AssignmentSeq != 0 {
+		stages = append(stages, api.ReviewStage{Number: 2, OrderSeq: order, ScopeRevision: start.ScopeRevision, AssignmentSeq: start.AssignmentSeq})
+	}
+	return stages, nil
 }
 
 // currentReviewStage narrows state to its current stage and returns the
-// earlier stages' records for saveReviewStage.
+// earlier stages' records for saveReviewStage. The boundary is the recorded
+// one. Only an assignment opens a stage: assign is the sequence of an ASSIGN
+// being applied to scope revision current, else 0, so an open review of the
+// current stage still takes its result after a new owner order is confirmed.
+// Unknown legacy history never opens a stage.
 func currentReviewStage(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence, current, assign int64) (earlierReviewStages, error) {
 	var earlier earlierReviewStages
-	start, err := reviewStageStart(ctx, q, task, *state, current, assign)
-	if err != nil || start == 0 {
-		return earlier, err
+	if state.History == "unknown" {
+		return earlier, nil
 	}
+	var err error
+	if len(state.Stages) == 0 && len(state.Scopes) > 1 {
+		if state.Stages, err = legacyReviewStages(ctx, q, task, *state); err != nil {
+			return earlier, err
+		}
+	}
+	if assign != 0 && len(state.Scopes) > 0 && scopeFor(state, current) == nil {
+		if err = openReviewStage(ctx, q, task, state, current, assign); err != nil {
+			return earlier, err
+		}
+	}
+	if len(state.Stages) < 2 {
+		return earlier, nil
+	}
+	start := state.Stages[len(state.Stages)-1].AssignmentSeq
 	n := 0
 	for n < len(state.Rounds) && state.Rounds[n].RequestSeq < start {
 		n++
@@ -638,6 +722,14 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 			if legacyReviews == 0 {
 				state.History = "recorded"
+			}
+		}
+		if state.History == "recorded" && len(state.Stages) == 0 {
+			// Stage one is recorded with its ASSIGN, named by the order its
+			// scope is confirmed under when there is one.
+			state.Stages = firstReviewStage(state)
+			if err = nameReviewStage(ctx, tx, m.TaskID, &state); err != nil {
+				return err
 			}
 		}
 		state.Disposition = nil

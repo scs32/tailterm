@@ -351,6 +351,9 @@ func summarizeReviews(list []api.ReviewConvergence) string {
 	for _, item := range list {
 		if item.History == "unknown" {
 			fmt.Fprintf(&out, "%s reviews: unknown; follow-ups: unknown\n", item.ItemID)
+		} else if stage, rounds, earlier := item.CurrentStage(); stage > 1 {
+			// Only the current stage counts against the limit; follow-ups are a total.
+			fmt.Fprintf(&out, "%s stage %d: reviews %d/2 (earlier stages: %d); follow-ups: %d\n", item.ItemID, stage, len(rounds), earlier, len(item.FollowUps))
 		} else {
 			fmt.Fprintf(&out, "%s reviews: %d/2; follow-ups: %d\n", item.ItemID, len(item.Rounds), len(item.FollowUps))
 		}

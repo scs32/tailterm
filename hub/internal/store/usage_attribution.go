@@ -433,8 +433,15 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 			if err != nil {
 				return "", "", 0, err
 			}
+			// Blockers count inside the review stage that holds this ASSIGN.
+			var stage int64
+			for _, st := range state.Stages {
+				if st.AssignmentSeq <= selected.Seq {
+					stage = st.AssignmentSeq
+				}
+			}
 			for _, r := range state.Rounds {
-				if r.ResultSeq > 0 && r.ResultSeq < selected.Seq && len(r.Blockers) > 0 {
+				if r.RequestSeq >= stage && r.ResultSeq > 0 && r.ResultSeq < selected.Seq && len(r.Blockers) > 0 {
 					return "corrections", reason, 0, nil
 				}
 			}

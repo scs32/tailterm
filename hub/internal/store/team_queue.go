@@ -1062,13 +1062,14 @@ func teamShape(launch json.RawMessage) string {
 
 // summarizeTeamQueueEntry trims a history entry for a listing: no launch,
 // close or activities, and reviews, verification, release and evidence cut
-// to what the Delivery view and tt show. Tokens and identity stay.
+// to what the Delivery view and tt show. Tokens and identity stay. Review
+// stages stay so a reader can count the current stage's rounds.
 func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 	e.Summary = true
 	e.TeamShape = teamShape(e.LaunchJSON)
 	e.LaunchJSON, e.CloseJSON, e.Activities, e.Rebinds = nil, nil, nil, nil
 	if r := e.Reviews; r != nil {
-		sum := api.ReviewConvergence{ItemID: r.ItemID, History: r.History, Disposition: r.Disposition, Scopes: []api.ReviewScope{}, Rounds: make([]api.ReviewRound, 0, len(r.Rounds)), FollowUps: make([]api.ReviewFollowUp, 0, len(r.FollowUps)), Focused: []api.FocusedReview{}}
+		sum := api.ReviewConvergence{ItemID: r.ItemID, History: r.History, Disposition: r.Disposition, Stages: r.Stages, Scopes: []api.ReviewScope{}, Rounds: make([]api.ReviewRound, 0, len(r.Rounds)), FollowUps: make([]api.ReviewFollowUp, 0, len(r.FollowUps)), Focused: []api.FocusedReview{}}
 		for _, round := range r.Rounds {
 			round.Findings, round.Criteria, round.VerificationCriteria, round.Blockers = nil, nil, nil, nil
 			sum.Rounds = append(sum.Rounds, round)
