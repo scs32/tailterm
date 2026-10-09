@@ -539,16 +539,18 @@ test("store race checks name the sharded matrix command", () => {
   // nearest period, semicolon or comma on each side and no further than the
   // next -race flag, when it names the store package or ./..., which includes
   // it. It is refused without the shard flag or with a timeout under 45
-  // minutes, judged on that clause alone.
-  const breaks = [". ", "; ", ", "];
+  // minutes, judged on that clause alone. The last dot of ./... is part of the
+  // pattern, not a period.
+  const breaks = /(?<!\.\/\.\.)\. |; |, /g;
   const unsafe = (text) => {
     const found = [];
-    for (const line of text.split("\n"))
+    for (const line of text.split("\n")) {
+      const marks = [...line.matchAll(breaks)].map((mark) => mark.index);
       for (let at = line.indexOf("-race"); at >= 0; ) {
         const next = line.indexOf("-race", at + 1);
-        const start = Math.max(...breaks.map((mark) => line.lastIndexOf(mark, at))) + 1;
-        const ends = [next, ...breaks.map((mark) => line.indexOf(mark, at))].filter((end) => end >= 0);
-        const command = line.slice(start, ends.length ? Math.min(...ends) : line.length);
+        const start = (marks.findLast((mark) => mark < at) ?? -1) + 1;
+        const end = Math.min(next < 0 ? line.length : next, marks.find((mark) => mark > at) ?? line.length);
+        const command = line.slice(start, end);
         const timeout = /-timeout[= ](\d+)m/.exec(command);
         if (
           (command.includes("./internal/store") || command.includes("./...")) &&
@@ -557,6 +559,7 @@ test("store race checks name the sharded matrix command", () => {
           found.push(command.trim());
         at = next;
       }
+    }
     return found;
   };
   assert.equal(unsafe("Run go test -race -timeout 30m ./internal/store").length, 1);
@@ -570,6 +573,11 @@ test("store race checks name the sharded matrix command", () => {
   ]);
   assert.equal(unsafe("Run go test -race ./...").length, 1);
   assert.equal(unsafe("Run go test -race -timeout 30m ./...").length, 1);
+  assert.equal(unsafe("Run go test -race ./... from hub/").length, 1);
+  assert.equal(unsafe("Run go test -race -timeout 30m ./... before the review").length, 1);
+  assert.equal(unsafe("Run go test -race ./... Then report").length, 1);
+  assert.equal(unsafe("Run go test ./... -race from hub/").length, 1);
+  assert.equal(unsafe("Run go test -race ./...; then report").length, 1);
   assert.equal(unsafe(`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=${shards} ./...`).length, 0);
   assert.equal(unsafe("Run go test -race ./cmd/tt").length, 0);
   assert.equal(unsafe(full).length, 0);
