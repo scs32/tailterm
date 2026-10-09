@@ -291,6 +291,7 @@
   "defaultTimeoutMs": 600000,
   "checkTimeoutMs": {
     "go-race": 3000000,
+    "go-test": 1200000,
     "npm-unit": 480000,
     "00-static-build": 120000,
     "01-static-release-verify": 120000

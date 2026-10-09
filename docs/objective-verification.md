@@ -131,7 +131,8 @@ argv arrays and repository-relative cwd. The receipt retains the absolute worktr
 allowlisted environment, prerequisite digests, command start/end/duration, exit,
 external log path and exact SHA-256. It runs every selected check and retains
 failures. The approved matrix records a default ten-minute per-check timeout,
-with explicit overrides (race: fifteen minutes; unit/build/release: two minutes).
+with explicit overrides in `checkTimeoutMs` (go-race: fifty minutes; go-test:
+twenty minutes; npm-unit: eight minutes; the two static checks: two minutes).
 Each planned check carries `VERIFICATION_TIMEOUT_MS` in its recorded environment.
 A timeout sends SIGTERM, then SIGKILL after 250 ms, only to that check's newly
 spawned POSIX process group; its receipt records exit 124 and
@@ -285,6 +286,21 @@ key keeps the previous argv. The first value was `-timeout=14m` under a
 15-minute go-race check timeout; the matrix now has `-timeout=45m` under a
 50-minute one (`checkTimeoutMs`), raised as the suite grew. Each change of the
 matrix bytes needed a new owner approval of the digest.
+
+go-test kept the ten-minute default until `hub/cmd/tt` outgrew it. On
+2026-10-09 a go-test attempt from a cold build cache was killed at 600254 ms
+with `hub/cmd/tt` still running, and the retry passed in 473660 ms with every
+other package cached and `hub/cmd/tt` taking 467.4 s alone (#30899, #30901).
+That left about 126 s of margin on a warm cache and none on a cold one, and
+each team verifies in a fresh worktree. So `checkTimeoutMs` now gives go-test
+1200000 ms (20 minutes): twice the killed cold attempt, rounded down to the
+minute, which is 2.53 times the warm run and 726340 ms above it. The cold
+total is not known, because that attempt never finished, and no new cold
+timing was run beside other matrix work; if a receipt's go-test passes 15
+minutes, measure it alone and raise the limit. `goTestFlags` is unchanged:
+go-test already carries `-timeout=45m`, so go test's 600 s package default
+cannot trip under the 20-minute check limit. This matrix change also needed a
+new owner approval of the digest.
 
 The serialization rules live in runner code and derive from the plan, so they
 never change `verification/matrix.json` or its approval. Attempts stay
