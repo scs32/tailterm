@@ -1725,3 +1725,137 @@ func TestTeamQueueListDefaultEstimateAndHold(t *testing.T) {
 		t.Fatalf("json list %s %v", text, err)
 	}
 }
+
+// wi_44cabd7e6233bc1b a1 and a2: tt team queue wait set and clear round trip
+// against a test hub. The owner and a database handler may record a wait, a
+// bound non-handler session may not, and the list prints the wait's sentence
+// under the waiting entry and in its reason.
+func TestTeamQueueCLIWaitSetListAndClear(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	second, secondOrder := queueFixtureItem(t, f, "waits-behind")
+	add := func(key, item string, order int64) api.TeamQueueEntry {
+		t.Helper()
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item, OrderMessageSeq: order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	pred, waiting := add("wait-pred", f.item.ID, f.order), add("wait-waiting", second.ID, secondOrder)
+	run := func(e env, args ...string) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(e, append([]string{"wait"}, args...)) })
+	}
+	for name, args := range map[string][]string{
+		"no verb":              {},
+		"an unknown verb":      {"show", "--entry", waiting.ID, "--on", pred.ID},
+		"set without a path":   {"set", "--entry", waiting.ID, "--on", pred.ID, "--until", "accepted"},
+		"set without until":    {"set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go"},
+		"set with a bad until": {"set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--until", "merged"},
+		"set without --on":     {"set", "--entry", waiting.ID, "--owns", "hub/a.go", "--until", "accepted"},
+		"set with a reason":    {"set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--until", "accepted", "--reason", "x"},
+		"clear with a path":    {"clear", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go"},
+		"clear with until":     {"clear", "--entry", waiting.ID, "--on", pred.ID, "--until", "accepted"},
+		"clear without --on":   {"clear", "--entry", waiting.ID},
+	} {
+		if _, err := run(f.e, args...); err == nil || !strings.Contains(err.Error(), "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"scope", "--entry", waiting.ID, "--owns", "hub", "--on", pred.ID})
+	}); err == nil || !strings.Contains(err.Error(), "--on and --until apply only to tt team queue wait") {
+		t.Fatalf("--on outside wait: %v", err)
+	}
+	if !strings.Contains(teamQueueUsage, "|wait|") {
+		t.Fatalf("usage lacks wait: %s", teamQueueUsage)
+	}
+
+	sentence := fmt.Sprintf("waits on %s for hub/cmd/tt/tool_ledger_test.go, docs/project-queue.md until accepted", f.item.ID)
+	out, err := run(f.e, "set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/cmd/tt/tool_ledger_test.go", "--owns", "docs/project-queue.md", "--until", "accepted")
+	if err != nil || out != fmt.Sprintf("wait set %s %s: %s\n", waiting.ID, second.ID, sentence) {
+		t.Fatalf("owner wait set: %q %v", out, err)
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); got.Revision != waiting.Revision {
+		t.Fatalf("wait set moved the entry revision %d to %d", waiting.Revision, got.Revision)
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entryLine string
+	lines := strings.Split(list, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, " "+waiting.ID+" ") {
+			entryLine = line
+			if i+1 >= len(lines) || lines[i+1] != "  "+sentence {
+				t.Fatalf("list does not print the wait under its entry:\n%s", list)
+			}
+		}
+	}
+	if !strings.Contains(entryLine, "reason=") || !strings.Contains(entryLine, sentence) || strings.Count(list, sentence) != 2 {
+		t.Fatalf("list reason lacks the wait, or another entry shows it:\n%s", list)
+	}
+	jsonList, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--json"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded api.TeamQueueList
+	if err := json.Unmarshal([]byte(jsonList), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range decoded.Entries {
+		if q.ID == pred.ID && len(q.Waits) != 0 {
+			t.Fatalf("predecessor carries waits: %+v", q.Waits)
+		}
+		if q.ID != waiting.ID {
+			continue
+		}
+		if len(q.Waits) != 1 || q.Waits[0].OnItemID != f.item.ID || q.Waits[0].OnEntryID != pred.ID || q.Waits[0].Until != "accepted" || q.Waits[0].State != "waiting" || strings.Join(q.Waits[0].Paths, ",") != "hub/cmd/tt/tool_ledger_test.go,docs/project-queue.md" {
+			t.Fatalf("json waits %+v", q.Waits)
+		}
+	}
+	for _, field := range []string{`"waits"`, `"onItemId"`, `"onEntryId"`, `"paths"`, `"until"`, `"state": "waiting"`} {
+		if !strings.Contains(jsonList, field) {
+			t.Fatalf("list json lacks %s", field)
+		}
+	}
+
+	// A bound session that is not a database handler is refused before the hub is asked to write.
+	worker, err := f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "worker", Host: "fixture", Session: "worker", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerEnv := f.e
+	workerEnv.agent, workerEnv.runID = worker.ID, worker.RunID
+	if _, err := run(workerEnv, "clear", "--entry", waiting.ID, "--on", pred.ID); err == nil || !strings.Contains(err.Error(), "only the owner or a database handler may set or clear a shared-path wait") {
+		t.Fatalf("worker wait clear: %v", err)
+	}
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	staleEnv := handlerEnv
+	staleEnv.runID = api.NewID("run")
+	if _, err := run(staleEnv, "clear", "--entry", waiting.ID, "--on", pred.ID); err == nil || !strings.Contains(err.Error(), "only the owner or a database handler") {
+		t.Fatalf("stale handler run cleared a wait: %v", err)
+	}
+	out, err = run(handlerEnv, "clear", "--entry", waiting.ID, "--on", pred.ID, "--reason", "predecessor was requeued")
+	if err != nil || out != fmt.Sprintf("wait clear %s %s: no longer waits on entry %s\n", waiting.ID, second.ID, pred.ID) {
+		t.Fatalf("handler wait clear: %q %v", out, err)
+	}
+	if list, err = captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || strings.Contains(list, "waits on") {
+		t.Fatalf("cleared wait still listed: %v\n%s", err, list)
+	}
+	if _, err := run(f.e, "clear", "--entry", waiting.ID, "--on", pred.ID); err == nil {
+		t.Fatal("clearing a cleared wait succeeded")
+	}
+	out, err = run(handlerEnv, "set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--until", "released")
+	if err != nil || !strings.Contains(out, fmt.Sprintf("waits on %s for hub/a.go until released", f.item.ID)) {
+		t.Fatalf("handler wait set: %q %v", out, err)
+	}
+	if _, err := run(f.e, "set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/b.go", "--until", "released"); err == nil || !strings.Contains(err.Error(), "clear it first") {
+		t.Fatalf("conflicting wait set: %v", err)
+	}
+}

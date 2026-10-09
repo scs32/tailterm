@@ -29,7 +29,11 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|scope|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+
+// teamQueueWaitUsage is the shared-path wait command (docs/project-queue.md,
+// "Team queue shared-path waits").
+const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -123,6 +127,15 @@ func cmdTeamQueue(e env, args []string) error {
 		return errors.New(teamQueueUsage)
 	}
 	sub := args[0]
+	rest := args[1:]
+	// wait takes a verb, set or clear, before its flags.
+	waitVerb := ""
+	if sub == "wait" {
+		if len(rest) == 0 || (rest[0] != "set" && rest[0] != "clear") {
+			return errors.New(teamQueueWaitUsage)
+		}
+		waitVerb, rest = rest[0], rest[1:]
+	}
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
 	task := fs.String("task", e.task, "project ID")
 	hub := fs.String("hub", e.hub, "hub URL")
@@ -147,7 +160,9 @@ func cmdTeamQueue(e env, args []string) error {
 	newWorktree := fs.Bool("new-worktree", false, "add, scope: create the entry's own detached worktree under .build/worktrees (scope: at its frozen base)")
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
 	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
-	reason := fs.String("reason", "", "fail: why the owner is failing this entry")
+	reason := fs.String("reason", "", "fail: why the owner is failing this entry; wait clear: why the wait is cleared")
+	waitOn := fs.String("on", "", "wait: the predecessor queue entry ID")
+	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released")
 	source := fs.Int64("source", 0, "rebind: the amendment's message sequence")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
@@ -159,11 +174,26 @@ func cmdTeamQueue(e env, args []string) error {
 	policyHeadroom := fs.Int("headroom-percent", 0, "reserved host limiter headroom percent")
 	auto := fs.String("auto", "", "provision: automatic handler provisioning, on or off")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || !api.ValidID(*task, "tsk") || *hub == "" {
 		return errors.New("team queue requires a project and hub")
+	}
+	if sub != "wait" && (*waitOn != "" || *waitUntil != "") {
+		return errors.New("--on and --until apply only to tt team queue wait")
+	}
+	if sub == "wait" {
+		// Checked before any hub call, so a mistyped command costs nothing.
+		ok := validTeamQueueEntryID(*entry) && validTeamQueueEntryID(*waitOn)
+		if waitVerb == "set" {
+			ok = ok && len(ownership) > 0 && api.ValidTeamQueueWaitUntil(*waitUntil) && *reason == ""
+		} else {
+			ok = ok && len(ownership) == 0 && *waitUntil == ""
+		}
+		if !ok {
+			return errors.New(teamQueueWaitUsage)
+		}
 	}
 	if sub != "add" && *plannedReason != "" {
 		return errors.New("--planned-reason applies only to tt team queue add")
@@ -228,6 +258,9 @@ func cmdTeamQueue(e env, args []string) error {
 				state += " (released)"
 			}
 			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm), queueAttemptText(q))
+			for _, w := range q.Waits {
+				fmt.Printf("  %s\n", w.Text())
+			}
 			fmt.Printf("  team last-transition tokens=%d\n", q.Tokens.Total)
 			if text := strings.TrimPrefix(formatTokenBudget(q.Budget)+formatEstimateDefault(q.EstimateDefault), " · "); text != "" {
 				fmt.Printf("  budget: %s\n", text)
@@ -264,7 +297,7 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		return nil
 	}
-	if e.agent != "" && sub != "accept" && sub != "scope" && sub != "rebind" && sub != "requeue" {
+	if e.agent != "" && sub != "accept" && sub != "scope" && sub != "rebind" && sub != "requeue" && sub != "wait" {
 		return errors.New("owner-side team queue changes require an unbound CLI session")
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
@@ -409,6 +442,31 @@ func cmdTeamQueue(e env, args []string) error {
 			if err != nil {
 				return err
 			}
+		}
+	case "wait":
+		// A structured shared-path wait: the hub tells the waiting lead once
+		// when the predecessor meets the condition. The entry's revision is
+		// not part of the request; the wait is its own record.
+		req.Operation, req.EntryID, req.WaitOnEntryID = "wait_"+waitVerb, *entry, *waitOn
+		if waitVerb == "set" {
+			req.WaitPaths, req.WaitUntil = ownership, *waitUntil
+		} else {
+			req.WaitReason = *reason
+		}
+		if e.agent != "" {
+			// Only the owner or a database handler records a wait; a
+			// handler names its exact run and the hub checks it is live.
+			if e.runID == "" {
+				return errors.New("wait from an agent session needs its exact run")
+			}
+			self, selfErr := c.GetAgent(ctx, *task, e.agent)
+			if selfErr != nil {
+				return selfErr
+			}
+			if self.Role != api.AgentRoleDatabaseHandler {
+				return errors.New("only the owner or a database handler may set or clear a shared-path wait; ask the database handler")
+			}
+			req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
 		}
 	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated", "rebind", "requeue":
 		if !validTeamQueueEntryID(*entry) {
@@ -787,6 +845,14 @@ func cmdTeamQueue(e env, args []string) error {
 			fmt.Printf("rebind %s %s%s (%s)\n", result.ID, result.ItemID, queueAttemptText(result), result.State)
 		} else if sub == "requeue" {
 			fmt.Printf("requeue %s %s at %d item-revision=%d%s\n", result.ID, result.ItemID, result.Position, result.ItemRevision, queueAttemptText(result))
+		} else if sub == "wait" {
+			text := "no longer waits on entry " + *waitOn
+			for _, w := range result.Waits {
+				if w.OnEntryID == *waitOn {
+					text = w.Text()
+				}
+			}
+			fmt.Printf("wait %s %s %s: %s\n", waitVerb, result.ID, result.ItemID, text)
 		} else {
 			fmt.Printf("%s %s %s at %d\n", sub, result.ID, result.ItemID, result.Position)
 		}

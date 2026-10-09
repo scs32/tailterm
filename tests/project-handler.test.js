@@ -218,6 +218,22 @@ test("handler prompt defaults qualifying bugs to the Small lane and names a reas
   assert.equal(count(go, lane), 1);
 });
 
+// wi_44cabd7e6233bc1b: shared-path sequencing is a structured queue wait,
+// not only a note. The sentences are pinned whole, and the tt handler
+// guidance in hub/cmd/tt/coordination.go carries the same text.
+test("handler prompt records shared-path sequencing as a structured wait", () => {
+  const rule =
+    "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
+  const count = (text, clause) => text.split(clause).length - 1;
+  const prompt = withDatabaseHandler(plan())[1].fields.prompt;
+  assert.equal(count(prompt, rule), 1);
+  assert.equal(count(prompt, "tt team queue wait set"), 1);
+  assert.equal(count(prompt, "tt team queue wait clear"), 1);
+  assert.ok(prompt.length <= 8192, `handler prompt is ${prompt.length} characters`);
+  const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
+  assert.equal(count(go, rule), 1);
+});
+
 // wi_85148428c4ab9c9b: evidence on an existing item is a note, never a
 // description change. The sentences are pinned whole, and the tt handler
 // guidance in hub/cmd/tt/coordination.go carries the same text.

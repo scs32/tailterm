@@ -711,6 +711,100 @@ entry, its `Stalled:` reason, and the stall notice posted to the Board, ends
 with `Or: Shares checkout DIR with active entry tqe_A; move it: ...`, since
 moving frees it at once.
 
+## Team queue shared-path waits
+
+Two admitted teams sometimes share a path by sequencing: one edits it first
+and the other waits for that work to land. A sequencing note records this only
+as prose, so nothing can tell the waiting lead when the path frees
+(`wi_44cabd7e6233bc1b`: a lead sat idle about 85 minutes past its resume
+condition). Record the sequencing as a structured wait as well as, or instead
+of, the note:
+
+```sh
+tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
+  --owns PATH [--owns PATH...] --until accepted|done|released
+tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]
+```
+
+Only the owner or a live database handler sets or clears a wait; an item lead
+is refused and asks the handler. `--until` names the resume condition:
+
+| Condition | Met when | Commit named in the notice |
+|---|---|---|
+| `accepted` | the predecessor entry has a saved acceptance | the accepted commit |
+| `done` | the predecessor's item is saved done | the accepted commit when there is one, else `none recorded` |
+| `released` | the predecessor entry's latest release job is `released` | the integrated commit of that job, else its commit |
+
+The hub refuses a wait of an entry on itself, a predecessor that is not an
+entry of this project, a condition outside the three, no path, and a waiting
+entry that is finished or released. The predecessor's item is read from its
+entry. Setting the identical wait again changes nothing; a different wait on
+the same pair of entries is a conflict that names `wait clear`. Neither
+command reads or moves the waiting entry's revision.
+
+A wait is a record and a notice trigger only. It does not hold a queued entry
+out of admission and changes no ownership check.
+
+`tt team queue list` prints each open wait under its waiting entry, the JSON
+listing carries it as `waits[]` (`onItemId`, `onEntryId`, `paths`, `until`,
+`state`), and the same sentence is appended to the entry's `blockReason`, which
+the queue view shows:
+
+- `waits on ITEM for PATHS until CONDITION` while it waits;
+- `wait on ITEM met (CONDITION, commit SHA): rebase before editing PATHS` once
+  the lead was told;
+- `wait on ITEM needs a handler decision: REASON` when the predecessor can no
+  longer meet the condition.
+
+A listing shows the recorded state and evaluates nothing: a wait whose
+condition already holds reads `waiting` until the next broker tick.
+
+### What the broker tick does
+
+The broker evaluates waits on its tick (30 seconds), for open projects that
+are not paused. The message and the state change commit in one transaction, so
+a repeated tick or a restarted hub posts nothing twice.
+
+- **Met.** The first tick after the condition holds posts one NOTICE to the
+  waiting entry's lead, `A shared path this team waited on is now free`. It
+  names the predecessor item and entry, the condition, the commit and whether
+  it is the accepted or the released one, the paths now free, and says to
+  rebase before editing them. A waiting entry with no live lead yet (it is
+  still queued) keeps waiting and is told once it has one.
+- **Idle after met.** If no member of the waiting team posts after that
+  notice and every live member is done or idle for the bound, the owner helper
+  and the primary handler each get one NOTICE, `A team is idle after its
+  shared path wait was met`. The bound is 15 minutes, or
+  `TAILTERM_QUEUE_WAIT_IDLE_MINUTES` (1 to 1440) in the hub's environment. A
+  team that shows activity once ends the wait as resumed and is never
+  reported for it.
+- **Needs a handler decision.** When the predecessor can no longer meet the
+  condition, the primary handler gets one NOTICE, `A shared path wait needs a
+  handler decision`, with the reason and both commands. The waiting lead is
+  told nothing and the wait is not released. The cases: the predecessor entry
+  was removed; it failed and was released; the owner integrated it outside
+  the acceptance path; its item was dismissed; it finished without what the
+  condition needs (no acceptance, item not done, no release job); or, for
+  `released`, its latest release job is superseded, refused or rolled back. A
+  running predecessor, or a failed one not yet released, is still pending. The
+  handler clears the wait and tells the waiting lead, or clears it and sets a
+  new wait, for example on the entry that retries the predecessor's item.
+- **Waiting entry ended.** A wait whose own entry finished, was released as
+  failed or was removed is cleared without a message.
+
+`released` is judged once: a release that is rolled back after the notice is
+not evaluated again.
+
+Cost: one indexed read per tick, which returns nothing while no wait is open,
+and no write on a tick where nothing changes. Each wait that changes state
+costs one write transaction, at most three times in its life. A met wait
+costs two more reads per tick until it resumes or the bound passes. A listing
+adds one indexed read for the project, not one per entry. The relay makes no
+new request: the notices use the ordinary delivery obligation and wake.
+
+The table `team_queue_waits` is new and no existing table changes, so an older
+hub ignores it and a rollback needs no migration.
+
 ## Team queue listing
 
 `GET /v1/tasks/{id}/team-queue` returns the project's active entries in full,

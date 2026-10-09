@@ -2749,3 +2749,111 @@ func TestTeamQueueClaimWritesAdmissionTime(t *testing.T) {
 		t.Fatalf("read entry admitted %q %v", got.AdmittedAt, err)
 	}
 }
+
+// wi_44cabd7e6233bc1b: the queue migration creates the shared-path wait
+// table with its open-state index, and reopening the store changes nothing.
+func TestTeamQueueMigrationCreatesWaitTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	schema := func() string {
+		t.Helper()
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		rows, err := s.db.Query(`SELECT type||' '||name||' '||coalesce(sql,'') FROM sqlite_master WHERE tbl_name='team_queue_waits' ORDER BY type,name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, line)
+		}
+		return strings.Join(out, "\n")
+	}
+	first := schema()
+	for _, want := range []string{"table team_queue_waits", "index team_queue_waits_open", "PRIMARY KEY(task_id,entry_id,on_entry_id)", "WHERE state IN ('waiting','met','orphaned')"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("migrated schema lacks %q: %s", want, first)
+		}
+	}
+	if again := schema(); again != first {
+		t.Fatalf("reopening changed the wait schema:\n%s\n%s", first, again)
+	}
+}
+
+// wi_44cabd7e6233bc1b a2 and a7: a wait's sentence is appended to the reason
+// a queued entry already has, never put before it, in the full listing and
+// the active page alike. A listing evaluates nothing: a wait whose condition
+// already holds still reads waiting until the broker's sweep.
+func TestTeamQueueListingAppendsWaitAndEvaluatesNothing(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	add := func(i int) api.TeamQueueEntry {
+		t.Helper()
+		q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "add", ItemID: items[i].ID, OrderMessageSeq: orders[i].Seq, Host: "mini", Cwd: "/work"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	first, second := add(0), add(1)
+	first, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "claim", EntryID: first.ID, ExpectedRevision: first.Revision, Host: "mini"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := func(list api.TeamQueueList, id string) (string, []api.TeamQueueWait) {
+		t.Helper()
+		for _, e := range list.Entries {
+			if e.ID == id {
+				return e.BlockReason, e.Waits
+			}
+		}
+		t.Fatalf("entry %s is not listed", id)
+		return "", nil
+	}
+	list, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, waits := reason(list, second.ID)
+	if before == "" || len(waits) != 0 {
+		t.Fatalf("queued entry behind a claimed one has reason %q and waits %+v", before, waits)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: second.ID, WaitOnEntryID: first.ID, WaitPaths: []string{"hub/shared.go", "docs/shared.md"}, WaitUntil: api.TeamQueueWaitAccepted}); err != nil {
+		t.Fatal(err)
+	}
+	// The condition already holds; only the sweep may say so.
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET acceptance_json=? WHERE id=?`, `{"commit":"`+checkoutBase+`"}`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	sentence := fmt.Sprintf("waits on %s for hub/shared.go, docs/shared.md until accepted", items[0].ID)
+	page, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list, err = s.ListTeamQueue(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	for name, l := range map[string]api.TeamQueueList{"full listing": list, "active page": page} {
+		got, waits := reason(l, second.ID)
+		if got != before+". "+sentence {
+			t.Fatalf("%s: reason %q, want %q then the wait", name, got, before)
+		}
+		if len(waits) != 1 || waits[0].State != api.TeamQueueWaitWaiting || waits[0].MetAt != "" || waits[0].Text() != sentence {
+			t.Fatalf("%s: waits %+v", name, waits)
+		}
+		if _, waits := reason(l, first.ID); len(waits) != 0 {
+			t.Fatalf("%s: the predecessor shows the wait: %+v", name, waits)
+		}
+	}
+	var state string
+	if err := s.db.QueryRow(`SELECT state FROM team_queue_waits`).Scan(&state); err != nil || state != api.TeamQueueWaitWaiting {
+		t.Fatalf("listing changed the wait to %s %v", state, err)
+	}
+}

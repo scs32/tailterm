@@ -333,6 +333,9 @@ func migrateTeamQueue(db *sql.DB) error {
 			return err
 		}
 	}
+	if _, err := tx.Exec(teamQueueWaitsSQL); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -864,7 +867,8 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			e.BlockReason = fmt.Sprintf("Item is at revision %d; entry is bound to %d. %s", current, e.ItemRevision, queueRebindCommand(task, e.ID))
 		}
 	}
-	return nil
+	// Shared-path waits come last and only append to a reason.
+	return attachQueueWaits(ctx, reader, task, out)
 }
 
 func sharedCheckoutHint(e api.TeamQueueEntry, active string) string {
@@ -1600,6 +1604,12 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		_, err = tx.ExecContext(ctx, `INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,repository,ownership_json,base_commit,serial,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, serial, now, now)
 		if err != nil {
 			return zero, fmt.Errorf("%w: duplicate item or queue entry: %v", api.ErrConflict, err)
+		}
+	case "wait_set", "wait_clear":
+		// A shared-path wait is its own record: the entry row and its
+		// revision are not touched, so no expected revision is needed.
+		if e, err = s.teamQueueWaitAction(ctx, tx, t, req, now); err != nil {
+			return zero, err
 		}
 	case "remove", "reorder", "claim", "freeze", "attempt", "unattempt", "started", "running", "replace_lead", "close", "close_refresh", "accept", "finish", "fail", "release", "scope", "owner_integrated", "rebind", "requeue", "budget_continue":
 		if !validTeamQueueID(req.EntryID) {

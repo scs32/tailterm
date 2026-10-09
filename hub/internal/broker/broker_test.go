@@ -862,3 +862,239 @@ func TestBrokerTickRunsDeployerLivenessSweep(t *testing.T) {
 		t.Fatalf("copies after later ticks: handler %d, owner helper %d", h, o)
 	}
 }
+
+// waitProject queues two entries in the fixture's project, the second
+// sequenced behind the first, with a live database handler and an owner
+// helper. db is this test's own handle on its database file, for the rows
+// that have no short public path from this package.
+type waitProject struct {
+	handler, helper api.Agent
+	predItem        api.WorkItem
+	pred, waiting   api.TeamQueueEntry
+	db              *sql.DB
+}
+
+func (f *fixture) waitProject(t *testing.T) *waitProject {
+	t.Helper()
+	p := &waitProject{}
+	var err error
+	if p.handler, err = f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Host: "h", Session: "db-handler", Runtime: "codex"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: p.handler.ID, RunID: p.handler.RunID, Kind: api.EventRunning}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if p.helper, err = f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "owner-helper", Host: "h", Session: "owner-helper", Runtime: "codex"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	queue := func(key string) (api.WorkItem, api.TeamQueueEntry) {
+		t.Helper()
+		item, err := f.st.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Shares a path " + key, RequestID: key}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		order, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "bounded order " + key, RequestID: key + "-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.st.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: key + "-scope", AgentID: p.handler.ID, RunID: p.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+		q, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: key + "-add", Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "h", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item, q
+	}
+	p.predItem, p.pred = queue("wait-pred")
+	_, p.waiting = queue("wait-waiting")
+	if p.db, err = sql.Open("sqlite", f.path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.db.Close() })
+	p.exec(t, `UPDATE agents SET role=? WHERE id=?`, api.AgentRoleOwnerHelper, p.helper.ID)
+	return p
+}
+
+func (p *waitProject) exec(t *testing.T, query string, args ...any) {
+	t.Helper()
+	if _, err := p.db.Exec(query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *fixture) setWait(t *testing.T, p *waitProject, until string) {
+	t.Helper()
+	if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: p.waiting.ID, WaitOnEntryID: p.pred.ID, WaitPaths: []string{"hub/cmd/tt/tool_ledger_test.go"}, WaitUntil: until,
+		HandlerAgentID: p.handler.ID, HandlerRunID: p.handler.RunID}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitSteps runs one Tick and returns its shared-path wait steps.
+func (f *fixture) waitSteps(t *testing.T, now time.Time) []string {
+	t.Helper()
+	steps, err := (&Broker{Store: f.st}).Tick(f.ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, s := range steps {
+		if strings.HasPrefix(s.Action, "wait-") {
+			if s.TaskID != f.task.ID || s.MessageSeq == 0 {
+				t.Fatalf("step %+v", s)
+			}
+			out = append(out, s.Action)
+		}
+	}
+	return out
+}
+
+// waitNotices counts the hub's notices with a subject, by recipient.
+func (f *fixture) waitNotices(t *testing.T, subject string) map[string]int {
+	t.Helper()
+	msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]int{}
+	for _, m := range msgs {
+		if m.From.Node == api.BrokerNode && m.Envelope != nil && m.Envelope.Subject == subject {
+			out[m.To]++
+		}
+	}
+	return out
+}
+
+const (
+	waitMetSubject      = "A shared path this team waited on is now free"
+	waitOverdueSubject  = "A team is idle after its shared path wait was met"
+	waitOrphanedSubject = "A shared path wait needs a handler decision"
+)
+
+// wi_44cabd7e6233bc1b a3 and a4: the Tick tells the waiting lead once when
+// the predecessor is accepted, across later ticks and a hub restart, and
+// reports the team once when it stays idle for the bound.
+func TestBrokerTickNotifiesMetWaitOnceAndReportsIdleTeamOnce(t *testing.T) {
+	f := newFixture(t)
+	p := f.waitProject(t)
+	f.setWait(t, p, api.TeamQueueWaitAccepted)
+	now := time.Now().UTC()
+	want(t, "before the condition", f.waitSteps(t, now))
+	p.exec(t, `UPDATE team_queue_entries SET acceptance_json=? WHERE id=?`, `{"commit":"`+strings.Repeat("b", 40)+`"}`, p.pred.ID)
+	// The listing shows the recorded state only: still waiting before a tick.
+	list, err := f.st.ListTeamQueue(f.ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list.Entries {
+		if e.ID == p.waiting.ID && (len(e.Waits) != 1 || e.Waits[0].State != api.TeamQueueWaitWaiting) {
+			t.Fatalf("listing evaluated the wait: %+v", e.Waits)
+		}
+	}
+	met := now.Add(30 * time.Second)
+	want(t, "at the condition", f.waitSteps(t, met), "wait-met")
+	for i := 1; i <= 5; i++ {
+		want(t, "a later tick", f.waitSteps(t, met.Add(time.Duration(i)*30*time.Second)))
+	}
+	f.restart(t)
+	for i := 6; i <= 10; i++ {
+		want(t, "a tick after restart", f.waitSteps(t, met.Add(time.Duration(i)*30*time.Second)))
+	}
+	if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[f.lead.ID] != 1 {
+		t.Fatalf("met notices by recipient %v, want one to the lead", got)
+	}
+
+	want(t, "one second before the bound", f.waitSteps(t, met.Add(15*time.Minute-time.Second)))
+	want(t, "at the bound", f.waitSteps(t, met.Add(15*time.Minute)), "wait-overdue")
+	f.restart(t)
+	for i := 1; i <= 10; i++ {
+		want(t, "after the report", f.waitSteps(t, met.Add(15*time.Minute+time.Duration(i)*time.Minute)))
+	}
+	if got := f.waitNotices(t, waitOverdueSubject); len(got) != 2 || got[p.helper.ID] != 1 || got[p.handler.ID] != 1 {
+		t.Fatalf("overdue notices by recipient %v, want one each to the owner helper and the handler", got)
+	}
+	if got := f.waitNotices(t, waitMetSubject); got[f.lead.ID] != 1 {
+		t.Fatalf("met notices %v", got)
+	}
+}
+
+// a3: done and released each produce one wait-met step.
+func TestBrokerTickNotifiesDoneAndReleasedWaits(t *testing.T) {
+	for until, meet := range map[string]func(*testing.T, *fixture, *waitProject){
+		api.TeamQueueWaitDone: func(t *testing.T, f *fixture, p *waitProject) {
+			p.exec(t, `UPDATE work_items SET status='done' WHERE task_id=? AND id=?`, f.task.ID, p.predItem.ID)
+		},
+		api.TeamQueueWaitReleased: func(t *testing.T, f *fixture, p *waitProject) {
+			p.exec(t, `INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'released',1,?)`, f.task.ID, api.NewID("rel"), p.pred.ID, `{"integratedCommit":"`+strings.Repeat("c", 40)+`"}`)
+		},
+	} {
+		t.Run(until, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.waitProject(t)
+			f.setWait(t, p, until)
+			now := time.Now().UTC()
+			want(t, "before the condition", f.waitSteps(t, now))
+			meet(t, f, p)
+			want(t, "at the condition", f.waitSteps(t, now.Add(30*time.Second)), "wait-met")
+			f.restart(t)
+			for i := 2; i <= 11; i++ {
+				want(t, "a later tick", f.waitSteps(t, now.Add(time.Duration(i)*30*time.Second)))
+			}
+			if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[f.lead.ID] != 1 {
+				t.Fatalf("met notices by recipient %v, want one to the lead", got)
+			}
+		})
+	}
+}
+
+// a5: a predecessor removed from the queue is reported once to the primary
+// handler; the waiting lead is told nothing.
+func TestBrokerTickReportsOrphanedWaitToHandlerOnce(t *testing.T) {
+	f := newFixture(t)
+	p := f.waitProject(t)
+	f.setWait(t, p, api.TeamQueueWaitAccepted)
+	if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "remove-pred", Operation: "remove", EntryID: p.pred.ID, ExpectedRevision: p.pred.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	want(t, "after the removal", f.waitSteps(t, now), "wait-orphaned")
+	f.restart(t)
+	for i := 1; i <= 10; i++ {
+		want(t, "a later tick", f.waitSteps(t, now.Add(time.Duration(i)*time.Minute)))
+	}
+	if got := f.waitNotices(t, waitOrphanedSubject); len(got) != 1 || got[p.handler.ID] != 1 {
+		t.Fatalf("orphan notices by recipient %v, want one to the handler", got)
+	}
+	if got := f.waitNotices(t, waitMetSubject); len(got) != 0 {
+		t.Fatalf("the lead was told of an unmet wait: %v", got)
+	}
+}
+
+// a6: with no wait recorded, a Tick over a project whose entry is accepted,
+// done and released takes no wait step and posts no wait notice.
+func TestBrokerTickWithoutAWaitPostsNothing(t *testing.T) {
+	f := newFixture(t)
+	p := f.waitProject(t)
+	p.exec(t, `UPDATE team_queue_entries SET acceptance_json=? WHERE id=?`, `{"commit":"`+strings.Repeat("b", 40)+`"}`, p.pred.ID)
+	p.exec(t, `UPDATE work_items SET status='done' WHERE task_id=? AND id=?`, f.task.ID, p.predItem.ID)
+	p.exec(t, `INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'released',1,'{}')`, f.task.ID, api.NewID("rel"), p.pred.ID)
+	var before int
+	if err := p.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		want(t, "a tick without a wait", f.waitSteps(t, now.Add(time.Duration(i)*20*time.Minute)))
+	}
+	var after, rows int
+	if err := p.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.db.QueryRow(`SELECT count(*) FROM team_queue_waits`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if after != before || rows != 0 {
+		t.Fatalf("%d new messages and %d wait rows without a wait", after-before, rows)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // TeamCloseWaitError is a definite close refusal. A queue runner may refresh
@@ -76,6 +77,12 @@ type TeamQueueEntry struct {
 	Stall     *TeamQueueStall `json:"stall,omitempty"`
 	UpdatedAt string          `json:"updatedAt,omitempty"`
 
+	// Waits are the entry's open shared-path waits on other entries
+	// (docs/project-queue.md, "Team queue shared-path waits"). A listing
+	// attaches them and appends each one's sentence to BlockReason; it never
+	// evaluates their conditions.
+	Waits []TeamQueueWait `json:"waits,omitempty"`
+
 	// HandlerArm is the arm assignment of the current lease under a handler
 	// arm policy (docs/handler-ab.md).
 	HandlerArm *TeamQueueHandlerArm `json:"handlerArm,omitempty"`
@@ -108,6 +115,58 @@ type TeamQueueEntry struct {
 	// TeamShape is "plan-review" or "plan-only", derived from the launch a
 	// summary entry no longer carries.
 	TeamShape string `json:"teamShape,omitempty"`
+}
+
+// The conditions a shared-path wait resumes on, and its states.
+const (
+	TeamQueueWaitAccepted = "accepted"
+	TeamQueueWaitDone     = "done"
+	TeamQueueWaitReleased = "released"
+
+	TeamQueueWaitWaiting  = "waiting"
+	TeamQueueWaitMet      = "met"
+	TeamQueueWaitResumed  = "resumed"
+	TeamQueueWaitOverdue  = "overdue"
+	TeamQueueWaitOrphaned = "orphaned"
+	TeamQueueWaitCleared  = "cleared"
+)
+
+// ValidTeamQueueWaitUntil reports whether until is one of the three conditions.
+func ValidTeamQueueWaitUntil(until string) bool {
+	return until == TeamQueueWaitAccepted || until == TeamQueueWaitDone || until == TeamQueueWaitReleased
+}
+
+// TeamQueueWait is one entry's recorded wait for paths another entry owns.
+// The broker tick moves it from waiting to met and tells the waiting lead
+// once; orphaned means the predecessor can no longer meet the condition and
+// a handler must decide.
+type TeamQueueWait struct {
+	OnItemID  string   `json:"onItemId"`
+	OnEntryID string   `json:"onEntryId"`
+	Paths     []string `json:"paths"`
+	Until     string   `json:"until"`
+	State     string   `json:"state"`
+	SetAt     string   `json:"setAt,omitempty"`
+	MetAt     string   `json:"metAt,omitempty"`
+	MetCommit string   `json:"metCommit,omitempty"`
+	NoticeSeq int64    `json:"noticeSeq,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+}
+
+// Text is the wait's one sentence in a listing and in BlockReason.
+func (w TeamQueueWait) Text() string {
+	paths := strings.Join(w.Paths, ", ")
+	switch w.State {
+	case TeamQueueWaitMet:
+		commit := w.MetCommit
+		if commit == "" {
+			commit = "none recorded"
+		}
+		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", w.OnItemID, w.Until, commit, paths)
+	case TeamQueueWaitOrphaned:
+		return fmt.Sprintf("wait on %s needs a handler decision: %s", w.OnItemID, w.Reason)
+	}
+	return fmt.Sprintf("waits on %s for %s until %s", w.OnItemID, paths, w.Until)
 }
 
 // TeamQueueEstimateDefault is a lane default estimate: the tokens, the lane
@@ -396,6 +455,13 @@ type TeamQueueRequest struct {
 	// pairs (never the prompt), so a refusal can print a complete command
 	// that saves the corrected spec.
 	HandlerSpecArgs []string `json:"handlerSpecArgs,omitempty"`
+	// wait_set and wait_clear: EntryID is the waiting entry, WaitOnEntryID
+	// the predecessor entry. WaitPaths and WaitUntil (accepted, done or
+	// released) belong to wait_set; WaitReason is wait_clear's optional why.
+	WaitOnEntryID string   `json:"waitOnEntryId,omitempty"`
+	WaitPaths     []string `json:"waitPaths,omitempty"`
+	WaitUntil     string   `json:"waitUntil,omitempty"`
+	WaitReason    string   `json:"waitReason,omitempty"`
 	// AgentID is the agent a budget_continue caller names itself as; the hub
 	// accepts only the project's owner helper. No other operation reads it.
 	AgentID string `json:"agentId,omitempty"`

@@ -902,6 +902,26 @@ func TestBriefingNamesLeadAndVerifierOperationException(t *testing.T) {
 	}
 }
 
+// wi_44cabd7e6233bc1b: the primary handler records shared-path sequencing as
+// a structured queue wait, and the browser handler prompt in
+// client/project-handler.js carries the same sentences.
+func TestPrimaryHandlerGuidanceRecordsSharedPathWaits(t *testing.T) {
+	const rule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
+	if handlerWaitRule != rule {
+		t.Fatalf("wait rule changed: %q", handlerWaitRule)
+	}
+	if n := strings.Count(primaryHandlerGuidance, rule); n != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait set") != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait clear") != 1 {
+		t.Fatalf("handler role text states the wait rule %d times", n)
+	}
+	browser, err := os.ReadFile("../../../client/project-handler.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(browser), rule); n != 1 {
+		t.Fatalf("browser handler prompt states the wait rule %d times", n)
+	}
+}
+
 // wi_85148428c4ab9c9b: the primary handler records evidence on an existing
 // item as a note, never as a description change, and the browser handler
 // prompt in client/project-handler.js carries the same sentences.

@@ -223,3 +223,88 @@ func TestTeamQueueRebindAndRequeueHTTP(t *testing.T) {
 		t.Fatalf("listing %+v %v", list, err)
 	}
 }
+
+// wi_44cabd7e6233bc1b: the existing queue action route carries wait_set and
+// wait_clear unchanged; the listing shows the wait, and a malformed
+// condition is a 400 with its reason.
+func TestTeamQueueWaitHTTP(t *testing.T) {
+	c := newClient(t)
+	st, ctx := c.st, context.Background()
+	c.who = api.Caller{Node: "owner-laptop", User: "owner@example.com"}
+	task := c.task("team-queue-wait")
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "handler"}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}, c.who); err != nil {
+		t.Fatal(err)
+	}
+	hub, err := api.NewClient(c.srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := func(key string) (api.WorkItem, api.TeamQueueEntry) {
+		t.Helper()
+		var item api.WorkItem
+		if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: "Shares a path " + key, Description: "scope", RequestID: key}, &item); code != 201 {
+			t.Fatalf("item = %d", code)
+		}
+		order, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: key, RequestID: key + "-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, c.who)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ConfirmWorkOrderScope(ctx, task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+		q, err := hub.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item, q
+	}
+	predItem, pred := queue("first")
+	_, waiting := queue("second")
+
+	set := api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: waiting.ID, WaitOnEntryID: pred.ID, WaitPaths: []string{"hub/cmd/tt/tool_ledger_test.go"}, WaitUntil: "merged"}
+	_, err = hub.TeamQueueAction(ctx, task.ID, set)
+	var response *api.HTTPError
+	if !errors.As(err, &response) || response.Status != http.StatusBadRequest || !strings.Contains(response.Msg, "accepted, done or released") {
+		t.Fatalf("malformed condition = %v, want 400 naming the three conditions", err)
+	}
+	set.RequestID, set.WaitUntil = api.NewID("req"), api.TeamQueueWaitReleased
+	saved, err := hub.TeamQueueAction(ctx, task.ID, set)
+	if err != nil || len(saved.Waits) != 1 || saved.Revision != waiting.Revision {
+		t.Fatalf("wait set over HTTP %+v %v", saved, err)
+	}
+	sentence := "waits on " + predItem.ID + " for hub/cmd/tt/tool_ledger_test.go until released"
+	listed := func() api.TeamQueueEntry {
+		t.Helper()
+		var list api.TeamQueueList
+		if code := c.do("GET", "/v1/tasks/"+task.ID+"/team-queue", nil, &list); code != 200 {
+			t.Fatalf("list = %d", code)
+		}
+		for _, e := range list.Entries {
+			if e.ID == waiting.ID {
+				return e
+			}
+		}
+		t.Fatal("waiting entry is not listed")
+		return api.TeamQueueEntry{}
+	}
+	got := listed()
+	if len(got.Waits) != 1 || got.Waits[0].OnItemID != predItem.ID || got.Waits[0].OnEntryID != pred.ID || got.Waits[0].Until != api.TeamQueueWaitReleased || got.Waits[0].State != api.TeamQueueWaitWaiting ||
+		!reflect.DeepEqual(got.Waits[0].Paths, []string{"hub/cmd/tt/tool_ledger_test.go"}) || !strings.HasSuffix(got.BlockReason, sentence) {
+		t.Fatalf("listed wait %+v reason %q", got.Waits, got.BlockReason)
+	}
+	// A different wait on the same pair is a 409 that names the clear command.
+	set.RequestID, set.WaitUntil = api.NewID("req"), api.TeamQueueWaitAccepted
+	if _, err = hub.TeamQueueAction(ctx, task.ID, set); !errors.As(err, &response) || response.Status != http.StatusConflict || !strings.Contains(response.Msg, "tt team queue wait clear") {
+		t.Fatalf("conflicting wait = %v, want 409 naming wait clear", err)
+	}
+	if _, err := hub.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_clear", EntryID: waiting.ID, WaitOnEntryID: pred.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := listed(); len(got.Waits) != 0 || strings.Contains(got.BlockReason, "waits on") {
+		t.Fatalf("cleared wait still listed: %+v %q", got.Waits, got.BlockReason)
+	}
+}

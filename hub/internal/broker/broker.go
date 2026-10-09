@@ -3,12 +3,15 @@
 // takes at most one step per obligation: re-wake, nudge, escalate, or close
 // when the recipient is gone. A restarted hub makes the same decisions, so a
 // deadline missed during downtime fires once rather than once per missed tick.
+// A Tick also runs the team queue's shared-path wait sweep
+// (docs/project-queue.md, "Team queue shared-path waits").
 package broker
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -27,7 +30,7 @@ type Step struct {
 	ObligationID string
 	MessageSeq   int64
 	WindowID     string // delegation-expired only
-	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent
+	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent, wait-met, wait-overdue, wait-orphaned
 }
 
 func wakesDue(o store.BrokerObligation, now time.Time) int {
@@ -65,6 +68,16 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 	silent, err := b.Store.DeployerLivenessSweep(ctx, now)
 	for _, n := range silent {
 		steps = append(steps, Step{TaskID: n.TaskID, MessageSeq: n.MessageSeq, Action: "deployer-silent"})
+	}
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// Shared-path waits of the team queue: one read per tick, and one notice
+	// per wait when its condition is met, its team then stays idle, or its
+	// predecessor can no longer meet it. Paused projects are not evaluated.
+	waits, err := b.Store.QueueWaitSweep(ctx, now)
+	for _, w := range waits {
+		steps = append(steps, Step{TaskID: w.TaskID, MessageSeq: w.MessageSeq, Action: w.Action})
 	}
 	if err != nil && firstErr == nil {
 		firstErr = err
@@ -191,7 +204,7 @@ func (b *Broker) Start(ctx context.Context) <-chan struct{} {
 				for _, s := range steps {
 					if s.Action == "delegation-expired" {
 						b.Log("broker: %s %s", s.Action, s.WindowID)
-					} else if s.Action == "deployer-silent" {
+					} else if s.Action == "deployer-silent" || strings.HasPrefix(s.Action, "wait-") {
 						b.Log("broker: %s %s message %d", s.Action, s.TaskID, s.MessageSeq)
 					} else if s.Action != "wake" {
 						b.Log("broker: %s %s message %d", s.Action, s.ObligationID, s.MessageSeq)
