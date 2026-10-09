@@ -1531,6 +1531,101 @@ effort. A runner killed mid-rehearsal can leave `tt-rehearsal-ID` behind
 (`container ls -a`); the `started` marker refuses that job, and the container is
 removed by hand with `container delete -f tt-rehearsal-ID`.
 
+### Storage cleanup at the first start (wi_e7748bbeb64236db)
+
+The first hub start after this release rewrites the rows stored before each
+usage turn, upload batch and launch plan was kept once. It is the last
+migration step, so the rehearsal container above runs it on the copy of the
+imported backup before any deploy step, and the hub does not listen until it
+has finished.
+
+**What it does.** Four steps in a fixed order, each walking its table by rowid
+in transactions of 500 rows:
+
+| Step | Table | Change |
+|---|---|---|
+| `revisions` | `usage_turn_revisions` | deletes a row that `usage_turns` also holds: same key, same revision, the same bytes. Superseded revisions stay. |
+| `turn-payload` | `usage_turns` | empties `payload` when it equals the `turn` member of the row's `projection`, byte for byte. |
+| `receipt-batch` | `usage_receipts` | replaces the stored upload batch with `sha256:` and its hash. This is the approved loss: the batch itself is gone, a retry of it still gets its receipt. |
+| `queue-launch` | `team_queue_requests` | takes the launch plan out of a stored result that re-encodes to its stored bytes, leaving what a new request stores. |
+
+A row that is not provably convertible is left as it is and counted. No step
+writes a column a usage report, a token budget, a warning or the audit export
+reads, and none touches `release_action_receipts`: old release receipts keep
+their check lists (owner decision D1).
+
+**Resumable.** Each transaction also writes the step's cursor and counters to
+the `storage_migrations` table, so a start that is killed resumes at the next
+batch on the following start. A step recorded `done` is never entered again; a
+later start reads four rows and changes nothing. The table holds step names,
+counts, byte totals and times only.
+
+**The file does not shrink.** Freed pages go to SQLite's free list and are
+reused by later writes. The cleanup never compacts the file; returning the
+space to the disk is a separate, explicitly triggered step (order three of the
+same item). The first start may add one page for the ledger table.
+
+**Measured.** On clones of the production backup of 2026-10-09 (2.41 GB, 589,295
+pages, 124,907 turns), measured before release:
+
+| Run | Whole start | Of which cleanup |
+|---|---|---|
+| Mac mini host | 53 to 68 s | 28 to 40 s |
+| Rehearsal container (512 MiB, one CPU) | 123 to 187 s | 70 to 107 s |
+| A later start, host | 32 s | none |
+
+It deleted 115,105 duplicate revisions and kept 82,953 superseded ones,
+emptied 115,105 turn payloads, replaced 58,722 upload batches with their
+hashes and took the launch plan out of 3,611 queue results; 96 queue results
+did not re-encode to their stored bytes and were left. 182,373 pages (747 MB)
+went to the free list, the write-ahead log peaked at 7.7 MB, and the file grew
+by one page, for the ledger. The usage digest was the same before and after on
+every project and table line. Not measured: the TrueNAS disk and the
+linux/amd64 build.
+
+**Release hold (owner decision D4).** A release that contains this cleanup is
+put on owner hold when its candidate is accepted, and the owner or owner helper
+releases it when no teams are running, because the hub is down for the length
+of the first start. A measured time over 300 seconds returns to the owner
+helper before any release. The rehearsal itself refuses a migration that runs
+over its limit.
+
+**Rollback.** The previous hub opens a cleaned database and reports the same
+usage. The cleanup is not reversed; the data rollback is the release's own
+backup.
+
+**Usage digest.** `tailterm-hub --usage-digest PATH` proves that a database
+reports the same usage as another, for example a backup copy before and after
+the cleanup. It opens the file read-only and immutable, runs no migration,
+creates no file, starts no listener and reads no state directory, and it
+refuses a file whose write-ahead log is not empty, so it is for a copy or a
+stopped hub's file, never the live one. It prints hashes, counts, sizes and
+times only:
+
+| Line | Content |
+|---|---|
+| `file` | size, page count, free pages |
+| `table NAME` | row count and SHA-256 of the rows: every column for the tables the cleanup does not write, the kept columns and rows for the four it does |
+| `form NAME` | rows in the single-copy form and in the form before it |
+| `step NAME` | the ledger: state, rows examined, converted and left, bytes before and after, peak write-ahead log, free pages before and after, seconds |
+| `export omits=…` | the one column the export hash leaves out |
+| `project HASH` | turn count and SHA-256 of the usage report, the item token budgets, the warnings, the queue entry budgets and the audit export's rows |
+
+Two runs on one file print the same bytes. To compare two files, compare their
+`project` and `table` lines:
+
+```sh
+tailterm-hub --usage-digest before.sqlite | grep -E '^(project|table) ' > a
+tailterm-hub --usage-digest after.sqlite | grep -E '^(project|table) ' > b
+cmp a b
+```
+
+Every ordinary start writes its own time to
+`work_item_history_state.checked_at`, which the audit export includes, so the
+export of one database differs between any two starts in that column alone.
+The digest's export hash leaves out that one column and nothing else (owner
+clarification #31372).
+
 ### Journal retention (wi_e83171b4c215f626, wi_d203eb94ef27d8f8)
 
 **Where backups live.** The authoritative pre-release backup is on TrueNAS at
