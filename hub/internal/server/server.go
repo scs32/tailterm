@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -485,7 +486,7 @@ func fail(w http.ResponseWriter, err error) {
 	case errors.As(err, &envelopeErr):
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Error: "invalid envelope", Code: "invalid-envelope", Problems: envelopeErr.Problems})
 	case errors.Is(err, api.ErrInvalid):
-		writeError(w, http.StatusBadRequest, "invalid request")
+		writeError(w, http.StatusBadRequest, invalidRequestText(err))
 	case errors.Is(err, api.ErrConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, api.ErrNarrativeReportRequired):
@@ -501,6 +502,18 @@ func fail(w http.ResponseWriter, err error) {
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+// invalidRequestText is the 400 body for a validation refusal. A refusal that
+// wraps api.ErrInvalid as "%w: reason" keeps its reason, which is validation
+// text about the caller's own request. A bare api.ErrInvalid, and any error
+// that puts other text before it, stays generic.
+func invalidRequestText(err error) string {
+	reason, ok := strings.CutPrefix(err.Error(), api.ErrInvalid.Error()+": ")
+	if !ok || strings.TrimSpace(reason) == "" {
+		return "invalid request"
+	}
+	return "invalid request: " + reason
 }
 
 func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {

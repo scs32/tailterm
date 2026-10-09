@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -766,5 +767,62 @@ func TestMessagesWithoutRecipientReturnWholeBoard(t *testing.T) {
 	}
 	if got := texts("&to=" + reader.ID); got != "for everyone|just for the reader" {
 		t.Fatalf("read with a recipient = %q, want the reader's own view", got)
+	}
+}
+
+// A validation refusal that names its reason reaches an HTTP client with that
+// reason; a bare one still answers "invalid request". Both are 400.
+func TestValidationRefusalReasonReachesHTTPClient(t *testing.T) {
+	c := newClient(t)
+	task := c.task("validation-reason")
+	add := api.TeamQueueRequest{RequestID: "add-comma", Operation: "add", ItemID: api.NewID("wi"), OrderMessageSeq: 1, Host: "mini", Cwd: "/tmp", Ownership: []string{"src/a.go,src/b.go"}}
+	var refused api.ErrorResponse
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/team-queue/actions", add, &refused); code != http.StatusBadRequest {
+		t.Fatalf("comma ownership add = %d, want 400", code)
+	}
+	if want := `invalid request: ownership path "src/a.go,src/b.go" contains a comma; give each path separately`; refused.Error != want || refused.Code != "" {
+		t.Fatalf("comma ownership refusal = %+v, want %q", refused, want)
+	}
+	var list api.TeamQueueList
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/team-queue", nil, &list); code != http.StatusOK || len(list.Entries) != 0 {
+		t.Fatalf("refused add left entries: %d %+v", code, list.Entries)
+	}
+	// The same action without a host is refused by a bare api.ErrInvalid.
+	add.RequestID, add.Host, add.Ownership = "add-no-host", "", []string{"src/a.go"}
+	var bare api.ErrorResponse
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/team-queue/actions", add, &bare); code != http.StatusBadRequest || bare.Error != "invalid request" {
+		t.Fatalf("bare refusal = %d %+v, want 400 invalid request", code, bare)
+	}
+}
+
+// fail keeps only a reason that directly follows api.ErrInvalid; text put in
+// front of it, and an error class with its own answer, are left as they were.
+func TestFailInvalidRequestText(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		want   string
+	}{
+		{"bare", api.ErrInvalid, 400, "invalid request"},
+		{"reason", fmt.Errorf("%w: scope needs at least one owned path", api.ErrInvalid), 400, "invalid request: scope needs at least one owned path"},
+		{"reason then suffix", fmt.Errorf("%w (entry tq_1)", fmt.Errorf("%w: unknown queue template", api.ErrInvalid)), 400, "invalid request: unknown queue template (entry tq_1)"},
+		{"blank reason", fmt.Errorf("%w:  ", api.ErrInvalid), 400, "invalid request"},
+		{"text in front", fmt.Errorf("read /private/state: %w", api.ErrInvalid), 400, "invalid request"},
+		{"text in front of a reason", fmt.Errorf("decode: %w", fmt.Errorf("%w: reason", api.ErrInvalid)), 400, "invalid request"},
+		{"joined", errors.Join(errors.New("other"), api.ErrInvalid), 400, "invalid request"},
+		{"not found", fmt.Errorf("%w: no such entry", api.ErrNotFound), 404, "not found"},
+		{"conflict", fmt.Errorf("%w: unresolved failed queue entry", api.ErrConflict), 409, "conflict: unresolved failed queue entry"},
+		{"unknown", errors.New("disk full"), 500, "internal error"},
+	} {
+		rec := httptest.NewRecorder()
+		fail(rec, tc.err)
+		var got api.ErrorResponse
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if rec.Code != tc.status || got.Error != tc.want {
+			t.Errorf("%s: %d %q, want %d %q", tc.name, rec.Code, got.Error, tc.status, tc.want)
+		}
 	}
 }
