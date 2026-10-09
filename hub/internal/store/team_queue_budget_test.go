@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -348,10 +349,18 @@ func TestQueueBudgetLaneDefaults(t *testing.T) {
 	if claimed, err := claimEntry(f.s, f.task, planned); err != nil || claimed.State != "launching" {
 		t.Fatalf("the planned default fits and passes the held head: %+v %v", claimed, err)
 	}
-	// The steward recomputes the defaults: the held entry is admitted.
+	// The steward recomputes the defaults: the 50M default would fit the 55M
+	// alone, but the planned team just admitted has drawn none of its 44M.
 	f.defaults(18_000_000, 17_000_000, 44_000_000, 50_000_000)
+	f.refused(plannedRace, "50M default against 55M with 44M reserved")
+	want = fmt.Sprintf("Token budget (codex five_hour): needs about 50.00M tokens (default, planned, Go race); 55.00M remain before the reset at %s, reserve 0%%, 44.00M reserved for 1 admitted team (source: allowance minus reported usage; provider reading for host mini is not reported)", reset.Add(5*time.Hour).Format(time.RFC3339))
+	if got := f.listed(plannedRace.ID).BlockReason; got != want {
+		t.Fatalf("reserved reason\n%q\nwant\n%q", got, want)
+	}
+	// A larger allowance covers both: the held entry is admitted.
+	f.budget("codex", api.UsageWindowFiveHour, 200_000_000, 0, reset)
 	if claimed, err := claimEntry(f.s, f.task, plannedRace); err != nil || claimed.State != "launching" {
-		t.Fatalf("claim after the defaults changed: %+v %v", claimed, err)
+		t.Fatalf("claim after the allowance was raised: %+v %v", claimed, err)
 	}
 	// A claimed entry keeps its label in the list.
 	if got := f.listed(plannedRace.ID); got.EstimateDefault == nil || got.EstimateDefault.Tokens != 50_000_000 {
@@ -387,43 +396,304 @@ func TestQueueBudgetHeldEntryHasNoStall(t *testing.T) {
 	assertStall(t, f.choresQueue, b.ID, api.StallFailedEntry, failed.ID)
 }
 
-// R9: the allowance source scans the window's turns inside the claim. With
-// several thousand turns in the window the check stays fast.
-func TestQueueBudgetAllowanceScanIsBounded(t *testing.T) {
-	f := newBudgetQueue(t, 1)
+// within puts the fixture's calls under a 30 second deadline, so a query
+// blocked on the store's one connection fails by name.
+func (f *budgetQueue) within() {
+	f.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	f.t.Cleanup(cancel)
+	f.ctx = ctx
+}
+
+// claim claims an entry under the fixture's context.
+func (f *budgetQueue) claim(q api.TeamQueueEntry) (api.TeamQueueEntry, error) {
+	return f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+}
+
+// held asserts that a claim of the entry under the fixture's context gets the
+// quiet "not queue head" conflict and writes nothing, and returns the reason
+// the list gives for the entry.
+func (f *budgetQueue) held(q api.TeamQueueEntry, why string) string {
+	f.t.Helper()
+	before := f.queueState()
+	_, err := f.claim(q)
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "not queue head") {
+		f.t.Fatalf("%s: claim %v, want the not queue head conflict", why, err)
+	}
+	if after := f.queueState(); after != before {
+		f.t.Fatalf("%s: the refused claim wrote\n%s\nwas\n%s", why, after, before)
+	}
+	list, err := f.s.ListTeamQueue(f.ctx, f.task.ID)
+	if err != nil {
+		f.t.Fatalf("%s: list %v", why, err)
+	}
+	for _, e := range list.Entries {
+		if e.ID == q.ID {
+			return e.BlockReason
+		}
+	}
+	f.t.Fatalf("%s: entry %s is not listed", why, q.ID)
+	return ""
+}
+
+// teamSpend uploads one turn of a team member attributed to item i, of a
+// runtime, at the store's now.
+func (f *budgetQueue) teamSpend(a api.Agent, i int, runtime string, tokens int64) {
+	f.t.Helper()
+	f.uploads++
+	key := fmt.Sprintf("budget-team-%d", f.uploads)
+	turn := budgetTurn(key, runtime, f.s.now(), tokens)
+	turn.Handled = []api.UsageEvidence{{TaskID: f.orders[i].TaskID, Seq: f.orders[i].Seq, Operation: "ack", At: turn.At}}
+	if _, err := f.s.ReportUsage(f.ctx, f.task.ID, a.ID, usageBatch(a, key, turn)); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// s3, allowance source: two entries that each fit alone and not together are
+// not both admitted, and the reservation is the part of the admitted team's
+// estimate it has not spent yet.
+func TestQueueBudgetReservesAdmittedTeams(t *testing.T) {
+	f := newBudgetQueue(t, 2)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+	for _, q := range []api.TeamQueueEntry{a, b} {
+		if got := f.listed(q.ID).BlockReason; got != "" {
+			t.Fatalf("each entry fits alone: %q", got)
+		}
+	}
+	a = f.run(t, a)
+	end := reset.Add(5 * time.Hour).Format(time.RFC3339)
+	reason := func(remain, reserved string) string {
+		return fmt.Sprintf("Token budget (codex five_hour): needs about 400.00K tokens; %s remain before the reset at %s, reserve 0%%%s (source: allowance minus reported usage; provider reading for host mini is not reported)", remain, end, reserved)
+	}
+	if got, want := f.held(b, "the first estimate is reserved"), reason("1.00M", ", 700.00K reserved for 1 admitted team"); got != want {
+		t.Fatalf("second entry\n%q\nwant\n%q", got, want)
+	}
+	// The team spends 250K: the remaining and the reserved amounts both fall
+	// by exactly that.
+	member := f.member(t, 0, "member-a")
+	f.teamSpend(member, 0, "codex", 250_000)
+	if got, want := f.held(b, "250K of the estimate is spent"), reason("750.00K", ", 450.00K reserved for 1 admitted team"); got != want {
+		t.Fatalf("after the team spent 250K\n%q\nwant\n%q", got, want)
+	}
+	// Past its estimate the team reserves nothing, and never a negative amount.
+	f.teamSpend(member, 0, "codex", 500_000)
+	if got, want := f.held(b, "the team is past its estimate"), reason("250.00K", ""); got != want {
+		t.Fatalf("after the team passed its estimate\n%q\nwant\n%q", got, want)
+	}
+	f.budget("codex", api.UsageWindowFiveHour, 1_150_000, 0, reset)
+	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
+		t.Fatalf("400K against 400K with nothing reserved: %+v %v", claimed, err)
+	}
+}
+
+// s3, provider source: remaining comes from the reading, which reflects use
+// only up to its capture. Spend uploaded after it does not shrink the
+// reservation until a newer reading arrives.
+func TestQueueBudgetProviderReservationWaitsForReading(t *testing.T) {
+	f := newBudgetQueue(t, 2)
+	f.within()
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.budget("claude", api.UsageWindowFiveHour, 1_000_000, 0, time.Time{})
+	resets := f.s.now().UTC().Truncate(time.Second).Add(3 * time.Hour)
+	f.reading("mini", 0, resets)
+	a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+	a = f.run(t, a)
+	reason := func(remain, reserved string) string {
+		return fmt.Sprintf("Token budget (claude five_hour): needs about 400.00K tokens; %s remain before the reset at %s, reserve 0%%, %s reserved for 1 admitted team (source: provider reading)", remain, resets.Format(time.RFC3339), reserved)
+	}
+	before := f.held(b, "the first estimate is reserved")
+	if want := reason("1.00M", "700.00K"); before != want {
+		t.Fatalf("second entry\n%q\nwant\n%q", before, want)
+	}
+	// 400K in turns after the reading's capture: the reading does not show
+	// them, so the reservation stays whole.
+	member := f.member(t, 0, "member-a")
+	f.advance(time.Minute)
+	f.teamSpend(member, 0, "claude", 400_000)
+	if got := f.held(b, "spend the reading does not reflect"); got != before {
+		t.Fatalf("after an upload with no newer reading\n%q\nwant\n%q", got, before)
+	}
+	// A newer reading, captured after those turns, shows them.
+	f.advance(time.Minute)
+	f.reading("mini", 40, resets)
+	if got, want := f.held(b, "a newer reading reflects the spend"), reason("600.00K", "300.00K"); got != want {
+		t.Fatalf("after a newer reading\n%q\nwant\n%q", got, want)
+	}
+}
+
+// s3: a failed entry holds its slot and its runs can still spend, so it
+// reserves until it is released.
+func TestQueueBudgetFailedEntryReservesUntilRelease(t *testing.T) {
+	f := newBudgetQueue(t, 2)
+	f.within()
+	reset := f.s.now().UTC().Truncate(time.Second).Add(-time.Hour)
+	f.estimate(0, 700_000)
+	f.estimate(1, 400_000)
+	f.budget("codex", api.UsageWindowFiveHour, 1_000_000, 0, reset)
+	a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+	a = f.run(t, a)
+	before := f.held(b, "the running entry reserves")
+	if !strings.Contains(before, "1.00M remain") || !strings.Contains(before, ", 700.00K reserved for 1 admitted team") {
+		t.Fatalf("behind a running entry: %q", before)
+	}
+	failed := f.fail(t, a)
+	if got := f.held(b, "the failed entry still reserves"); got != before {
+		t.Fatalf("behind a failed entry\n%q\nwant\n%q", got, before)
+	}
+	// The release needs the started lead of the frozen plan closed and cleaned
+	// up, as the runner leaves it.
+	var plan struct {
+		Members []struct {
+			RunID  string `json:"runId"`
+			Fields struct {
+				AgentID string `json:"agentId"`
+				Name    string `json:"name"`
+			} `json:"fields"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(failed.LaunchJSON, &plan); err != nil || len(plan.Members) != 1 {
+		t.Fatalf("frozen plan %s: %v", failed.LaunchJSON, err)
+	}
+	lead := plan.Members[0]
+	if _, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: lead.Fields.Name, AgentID: lead.Fields.AgentID, Host: "mini", Session: lead.Fields.Name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET run_id=?,status='closed',cleanup_done=1 WHERE task_id=? AND id=?`, lead.RunID, f.task.ID, lead.Fields.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "release", EntryID: failed.ID, ExpectedRevision: failed.Revision}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := f.listed(b.ID).BlockReason; got != "" {
+		t.Fatalf("after the release: %q", got)
+	}
+	if claimed, err := f.claim(b); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim after the release: %+v %v", claimed, err)
+	}
+}
+
+// s4: listing cost on a production-shaped window. The allowance source reads
+// one indexed sum over the window's totals rows: 60,000 codex turns in a
+// seven day window beside 10,000 claude turns and 20,000 older codex turns,
+// with 20 queued entries and a running team. The window sum is bounded at 250
+// ms without the race detector, and one list and one claim at 2 seconds.
+func TestQueueBudgetWindowSumCost(t *testing.T) {
+	const queued, inWindow, otherRuntime, older, perTurn = 20, 60000, 10000, 20000, 1050
+	f := newBudgetQueue(t, queued+1)
+	f.within()
 	now := f.s.now().UTC().Truncate(time.Second)
-	f.estimate(0, 1_000)
-	f.budget("codex", api.UsageWindowSevenDay, 1_000_000_000, 0, now.Add(-24*time.Hour))
-	a := f.add(t, 0, "src/a")
-	const turns = 6000
+	week, fiveHours := api.UsageWindowLength(api.UsageWindowSevenDay), api.UsageWindowLength(api.UsageWindowFiveHour)
+	// The seven day window began one second after now minus seven days.
+	start := now.Add(-week).Add(time.Second)
+	for i := 0; i <= queued; i++ {
+		f.estimate(i, 1_000)
+	}
+	f.budget("codex", api.UsageWindowSevenDay, 1_000_000_000, 0, start)
+	f.budget("claude", api.UsageWindowFiveHour, 1_000_000_000, 0, now.Add(-time.Hour))
+	running := f.run(t, f.add(t, 0, "src/running"))
+	f.teamSpend(f.member(t, 0, "member-running"), 0, "codex", 300)
+	entries := []api.TeamQueueEntry{}
+	for i := 1; i <= queued; i++ {
+		entries = append(entries, f.add(t, i, fmt.Sprintf("src/queued-%d", i)))
+	}
 	tx, err := f.s.db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < turns; i++ {
-		at := now.Add(-time.Duration(i) * 10 * time.Second)
-		projection := fmt.Sprintf(`{"turn":{"id":"t%d","revision":1,"runtime":"codex","session":"s","model":"m","at":%q,"tokens":{"input":100,"cached":900,"cacheWrite":0,"output":40,"reasoning":10},"raw":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10},"sourceDigest":%q,"activation":"a","complete":true},"agentId":%q,"runId":%q,"role":"builder","roleSource":"name","phase":"build","phaseReason":"synthetic","shares":[{"taskId":%q,"denominator":1,"reason":"synthetic"}]}`,
-			i, at.Format(time.RFC3339Nano), strings.Repeat("a", 64), f.handlers[0].ID, f.handlers[0].RunID, f.task.ID)
-		if _, err := tx.Exec(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`, f.task.ID, f.handlers[0].ID, f.handlers[0].RunID, fmt.Sprintf("t%d", i), ts(at), projection); err != nil {
+	insert, err := tx.Prepare(`INSERT INTO usage_turn_totals(task_id,agent_id,run_id,request_id,turn_revision,runtime,at_ns,tokens) VALUES(?,?,?,?,1,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := f.handlers[0]
+	codexSpent, claudeSpent := int64(300), int64(0)
+	row := func(id, runtime string, at time.Time) {
+		if _, err := insert.Exec(f.task.ID, agent.ID, agent.RunID, id, runtime, at.UnixNano(), perTurn); err != nil {
 			t.Fatal(err)
 		}
 	}
+	for i := 0; i < inWindow; i++ {
+		at := now.Add(-time.Duration(i) * 10 * time.Second)
+		if at.Before(start) {
+			t.Fatalf("codex turn %d at %s is before the window start %s", i, at, start)
+		}
+		row(fmt.Sprintf("codex-%d", i), "codex", at)
+		codexSpent += perTurn
+	}
+	for i := 0; i < otherRuntime; i++ {
+		at := now.Add(-time.Duration(i) * time.Minute)
+		row(fmt.Sprintf("claude-%d", i), "claude", at)
+		if !at.Before(now.Add(-time.Hour)) {
+			claudeSpent += perTurn
+		}
+	}
+	for i := 0; i < older; i++ {
+		row(fmt.Sprintf("old-%d", i), "codex", start.Add(-time.Duration(i+1)*10*time.Second))
+	}
+	insert.Close()
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	if fiveHours >= week || claudeSpent != 61*perTurn {
+		t.Fatalf("fixture: claude turns in its window spent %d", claudeSpent)
+	}
+	// (i) The window sum over all 60,000 codex turns in range.
+	var sum int64
+	took := bestOf(t, func() {
+		if sum, err = usageRuntimeTokensSince(f.ctx, f.s.db, f.task.ID, "codex", start); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("window sum over %d turns in the window took %s (best of three)", inWindow, took)
+	if sum != codexSpent {
+		t.Fatalf("window sum %d, want %d", sum, codexSpent)
+	}
+	if !raceBuilt() && took >= 250*time.Millisecond {
+		t.Fatalf("window sum over %d turns took %s, want under 250ms", inWindow, took)
+	}
+	// (iii) The remaining figure is the arithmetic sum.
+	if got, want := budgetStatus(t, f.s, f.task.ID, "mini", "codex", api.UsageWindowSevenDay).RemainingTokens, fmt.Sprint(1_000_000_000-codexSpent); got != want {
+		t.Fatalf("codex remaining %s, want %s", got, want)
+	}
+	if got, want := budgetStatus(t, f.s, f.task.ID, "mini", "claude", api.UsageWindowFiveHour).RemainingTokens, fmt.Sprint(1_000_000_000-claudeSpent); got != want {
+		t.Fatalf("claude remaining %s, want %s", got, want)
+	}
+	// (ii) One list and one claim.
 	started := time.Now()
-	reason, err := queueBudgetAdmission(f.ctx, f.s.db, f.task.ID, a, f.s.now())
-	took := time.Since(started)
-	if err != nil || reason != "" {
-		t.Fatalf("admission %q %v", reason, err)
+	list, err := f.s.ListTeamQueue(f.ctx, f.task.ID)
+	listed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
 	}
-	status := budgetStatus(t, f.s, f.task.ID, "mini", "codex", api.UsageWindowSevenDay)
-	if want := fmt.Sprint(1_000_000_000 - turns*1050); status.RemainingTokens != want {
-		t.Fatalf("remaining %s, want %s", status.RemainingTokens, want)
+	waiting := 0
+	for _, e := range list.Entries {
+		if e.State == "queued" && e.BlockReason == "" {
+			waiting++
+		}
+		if e.ID == running.ID && e.State != "running" {
+			t.Fatalf("running entry is %s", e.State)
+		}
 	}
-	t.Logf("budget admission over %d turns in the window took %s", turns, took)
-	if took > 5*time.Second {
-		t.Fatalf("budget admission over %d turns took %s", turns, took)
+	if waiting != queued {
+		t.Fatalf("%d queued entries pass the budget, want %d", waiting, queued)
+	}
+	started = time.Now()
+	claimed, err := f.claim(entries[0])
+	claim := time.Since(started)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("claim %+v %v", claimed, err)
+	}
+	t.Logf("with %d turns in the window and %d queued entries one list took %s and one claim took %s", inWindow, queued, listed, claim)
+	if listed >= 2*time.Second {
+		t.Fatalf("the list took %s, want under 2s", listed)
+	}
+	if claim >= 2*time.Second {
+		t.Fatalf("the claim took %s, want under 2s", claim)
 	}
 }
 

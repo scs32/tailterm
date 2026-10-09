@@ -142,7 +142,7 @@ func TestUsageBudgetDefaultsAndProviderHTTP(t *testing.T) {
 		t.Fatalf("no budget: %+v %v", budgets, err)
 	}
 	reset := time.Now().UTC().Add(-time.Hour).Truncate(time.Second).Format(time.RFC3339)
-	budgets, err = c.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ReservePercent: 10, ResetAt: reset, StaleSeconds: 300})
+	budgets, err = c.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ReservePercent: 10, ResetAt: reset, StaleSeconds: 360})
 	if err != nil || !budgets.Configured || len(budgets.Budgets) != 1 {
 		t.Fatalf("set budget: %+v %v", budgets, err)
 	}
@@ -151,7 +151,7 @@ func TestUsageBudgetDefaultsAndProviderHTTP(t *testing.T) {
 		t.Fatalf("get budget: %+v %v", budgets, err)
 	}
 	row := budgets.Budgets[0]
-	if row.Runtime != "claude" || row.Window != api.UsageWindowFiveHour || row.AllowanceTokens != 1000 || row.ReservePercent != 10 || row.ResetAt != reset || row.StaleSeconds != 300 || row.UpdatedBy.User != f.who.User ||
+	if row.Runtime != "claude" || row.Window != api.UsageWindowFiveHour || row.AllowanceTokens != 1000 || row.ReservePercent != 10 || row.ResetAt != reset || row.StaleSeconds != 360 || row.UpdatedBy.User != f.who.User ||
 		row.Status == nil || row.Status.Source != api.UsageBudgetSourceAllowance || row.Status.RemainingTokens != "1000" || row.Status.Host != "fixture" || row.Status.Reading != "is not reported" {
 		t.Fatalf("budget row %+v status %+v", row, row.Status)
 	}

@@ -1696,6 +1696,18 @@ default for the entry's template and Go race. The check runs only for queued
 entries: a launching or running entry is never failed, held or changed by it.
 With no budget row the queue admits and lists exactly as before.
 
+Admission also reserves for the teams already admitted, so two entries that
+each fit alone are not both admitted past the remaining budget. For every
+entry that holds a slot (launching, running, or failed and not yet released)
+it sets aside `max(0, estimate - team spend the source already reflects)` and
+an entry must fit what is left after the reserve and that sum. On the
+allowance source every reported turn of the team is reflected, so the
+reservation falls as the team reports usage. On the provider source only the
+team's turns at or before the reading's capture instant are reflected, so the
+reservation shrinks only when a newer reading arrives. A failed entry reserves
+until it is released; a queued entry reserves nothing. The reason then carries
+`, 700.00K reserved for 1 admitted team` before its source.
+
 **The reason.** A budget-held entry shows its reason as `blockReason` when no
 earlier reason (slots, host capacity, the agent cap, a handler, ownership)
 already explains the wait:

@@ -2169,6 +2169,45 @@ func TestUsageBudgetSettings(t *testing.T) {
 	if _, err = s.SetUsageBudget(ctx, "tsk_0000000000000000", api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 5}, by); !errors.Is(err, api.ErrNotFound) {
 		t.Fatalf("unknown project: %v", err)
 	}
+	// The staleness bound has a floor the relay can keep fresh: a refused bound
+	// names both figures and writes no row.
+	budgetRows := func() string {
+		return tableDump(t, s, `SELECT runtime,window,allowance_tokens,stale_seconds,updated_at FROM usage_budgets WHERE task_id=? ORDER BY runtime,window`, task.ID)
+	}
+	rowsBefore := budgetRows()
+	for _, stale := range []int{1, 299, 300, 359} {
+		_, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowSevenDay, AllowanceTokens: 5, StaleSeconds: stale}, by)
+		if !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "6 minutes") || !strings.Contains(err.Error(), "5 minutes") {
+			t.Fatalf("staleness bound of %d seconds: %v", stale, err)
+		}
+	}
+	if _, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowSevenDay, AllowanceTokens: 5, StaleSeconds: 86401}, by); !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("staleness bound over 24 hours: %v", err)
+	}
+	if got := budgetRows(); got != rowsBefore {
+		t.Fatalf("a refused staleness bound wrote\n%s\nwas\n%s", got, rowsBefore)
+	}
+	for stale, want := range map[int]int{360: 360, 86400: 86400, 0: api.DefaultUsageBudgetStaleSeconds} {
+		out, err = s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowSevenDay, AllowanceTokens: 5, StaleSeconds: stale}, by)
+		if err != nil {
+			t.Fatalf("staleness bound of %d seconds: %v", stale, err)
+		}
+		saved := -1
+		for _, b := range out.Budgets {
+			if b.Runtime == "codex" && b.Window == api.UsageWindowSevenDay {
+				saved = b.StaleSeconds
+			}
+		}
+		if saved != want {
+			t.Fatalf("staleness bound of %d seconds saved %d, want %d", stale, saved, want)
+		}
+	}
+	if api.DefaultUsageBudgetStaleSeconds != 900 {
+		t.Fatalf("default staleness bound %d, want 900", api.DefaultUsageBudgetStaleSeconds)
+	}
+	if _, err = s.DeleteUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowSevenDay}, by); err != nil {
+		t.Fatal(err)
+	}
 	for _, row := range [][2]string{{"claude", api.UsageWindowFiveHour}, {"claude", api.UsageWindowSevenDay}, {"codex", api.UsageWindowFiveHour}} {
 		if out, err = s.DeleteUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: row[0], Window: row[1]}, by); err != nil {
 			t.Fatalf("clear %v: %v", row, err)
@@ -2228,6 +2267,282 @@ func TestUsageBudgetAllowanceRemaining(t *testing.T) {
 	clock = reset.Add(-2 * time.Hour)
 	if got := status(); got.ResetAt != ts(reset.Add(time.Second)) || got.RemainingTokens != "300" {
 		t.Fatalf("before the entered reset: %+v", got)
+	}
+}
+
+// usageTurnTotals is every totals row of the project.
+func usageTurnTotals(t *testing.T, s *Store, task string) string {
+	t.Helper()
+	return tableDump(t, s, `SELECT agent_id,run_id,request_id,turn_revision,runtime,at_ns,tokens FROM usage_turn_totals WHERE task_id=? ORDER BY agent_id,run_id,request_id`, task)
+}
+
+// s1: the allowance read uses usage_turn_totals alone, through its covering
+// index. With every stored projection of the project made unreadable, the
+// remaining figure and an admission reason do not change.
+func TestUsageBudgetAllowanceReadsTotalsOnly(t *testing.T) {
+	s, task, agent, items, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	reset := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	clock := reset.Add(2 * time.Hour)
+	s.now = func() time.Time { return clock }
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ResetAt: ts(reset)}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateWorkItemUpdate(ctx, task.ID, items[0].ID, estimateRequest(items[0].Revision, "totals-only-estimate", 900, "synthetic", api.Agent{}), by); err != nil {
+		t.Fatal(err)
+	}
+	batch := usageBatch(agent, "totals-only",
+		budgetTurn("before-reset", "codex", reset.Add(-time.Minute), 400),
+		budgetTurn("first", "codex", reset.Add(time.Minute), 120),
+		budgetTurn("second", "codex", reset.Add(time.Hour), 80),
+		budgetTurn("other-runtime", "claude", reset.Add(time.Hour), 5000))
+	if _, err := s.ReportUsage(ctx, task.ID, agent.ID, batch); err != nil {
+		t.Fatal(err)
+	}
+	read := func() (string, string) {
+		t.Helper()
+		reason, err := queueBudgetAdmission(ctx, s.db, task.ID, api.TeamQueueEntry{TaskID: task.ID, ItemID: items[0].ID, Host: "mini"}, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return budgetStatus(t, s, task.ID, "mini", "codex", api.UsageWindowFiveHour).RemainingTokens, reason
+	}
+	remaining, reason := read()
+	if remaining != "800" || !strings.Contains(reason, "needs about 900 tokens; 800 remain") {
+		t.Fatalf("before: remaining %s reason %q", remaining, reason)
+	}
+	result, err := s.db.Exec(`UPDATE usage_turns SET projection='not json' WHERE task_id=?`, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := result.RowsAffected(); n != 4 {
+		t.Fatalf("overwrote %d projections, want 4", n)
+	}
+	if gotRemaining, gotReason := read(); gotRemaining != remaining || gotReason != reason {
+		t.Fatalf("with unreadable projections: remaining %s reason %q, want %s %q", gotRemaining, gotReason, remaining, reason)
+	}
+	rows, err := s.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+usageRuntimeTokensSinceSQL, task.ID, "codex", reset.UnixNano())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "USING COVERING INDEX usage_turn_totals_window") || strings.Contains(plan, "usage_turns") {
+		t.Fatalf("allowance read plan:\n%s", plan)
+	}
+}
+
+// s1: a turn counts once at its current revision. A revision with more tokens
+// moves the remaining figure by exactly the difference, and a replay of either
+// upload changes neither the figure nor the totals rows.
+func TestUsageTurnTotalsFollowRevisions(t *testing.T) {
+	s, task, agent, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	reset := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	clock := reset.Add(2 * time.Hour)
+	s.now = func() time.Time { return clock }
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 1000, ResetAt: ts(reset)}, by); err != nil {
+		t.Fatal(err)
+	}
+	remaining := func() string {
+		return budgetStatus(t, s, task.ID, "mini", "codex", api.UsageWindowFiveHour).RemainingTokens
+	}
+	upload := func(why string, batch api.UsageBatch) {
+		t.Helper()
+		if _, err := s.ReportUsage(ctx, task.ID, agent.ID, batch); err != nil {
+			t.Fatalf("%s: %v", why, err)
+		}
+	}
+	one := budgetTurn("revised", "codex", reset.Add(time.Hour), 100)
+	first := usageBatch(agent, "revision-one", one, budgetTurn("steady", "codex", reset.Add(time.Hour), 50))
+	upload("revision 1", first)
+	if got := remaining(); got != "850" {
+		t.Fatalf("after revision 1: %s", got)
+	}
+	two := budgetTurn("revised", "codex", reset.Add(time.Hour), 160)
+	two.Revision = 2
+	second := usageBatch(agent, "revision-two", two)
+	upload("revision 2", second)
+	if got := remaining(); got != "790" {
+		t.Fatalf("after revision 2 with 60 more tokens: %s", got)
+	}
+	totals := usageTurnTotals(t, s, task.ID)
+	if strings.Count(totals, "\n") != 2 {
+		t.Fatalf("totals rows:\n%s", totals)
+	}
+	upload("replay of revision 1", first)
+	upload("replay of revision 2", second)
+	// The same turn under a new upload key is unchanged and writes nothing.
+	upload("revision 2 in a new upload", usageBatch(agent, "revision-two-again", two))
+	if got := remaining(); got != "790" {
+		t.Fatalf("after replays: %s", got)
+	}
+	if got := usageTurnTotals(t, s, task.ID); got != totals {
+		t.Fatalf("replays changed the totals rows\n%s\nwas\n%s", got, totals)
+	}
+}
+
+// s1: turns stored before the totals table existed are counted after the
+// upgrade. With every totals row gone, one left at an older revision with a
+// wrong figure and one projection unreadable, the backfill restores the
+// figure less only the unreadable turn, and a second pass changes nothing.
+func TestUsageTurnTotalsBackfill(t *testing.T) {
+	s, task, agent, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	reset := time.Date(2026, 10, 8, 10, 0, 0, 0, time.UTC)
+	clock := reset.Add(2 * time.Hour)
+	s.now = func() time.Time { return clock }
+	if _, err := s.SetUsageBudget(ctx, task.ID, api.UsageBudgetRequest{Runtime: "codex", Window: api.UsageWindowFiveHour, AllowanceTokens: 10_000_000, ResetAt: ts(reset)}, by); err != nil {
+		t.Fatal(err)
+	}
+	const turns = 1200
+	for start := 0; start < turns; start += 60 {
+		batch := []api.UsageTurn{}
+		for i := start; i < start+60; i++ {
+			batch = append(batch, budgetTurn(fmt.Sprintf("turn-%04d", i), "codex", reset.Add(time.Duration(i+1)*time.Second), int64(i+1)))
+		}
+		if _, err := s.ReportUsage(ctx, task.ID, agent.ID, usageBatch(agent, fmt.Sprintf("backfill-%d", start), batch...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remaining := func() int64 {
+		t.Helper()
+		var n int64
+		if _, err := fmt.Sscan(budgetStatus(t, s, task.ID, "mini", "codex", api.UsageWindowFiveHour).RemainingTokens, &n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := remaining()
+	if want := int64(10_000_000 - turns*(turns+1)/2); before != want {
+		t.Fatalf("remaining after %d uploads %d, want %d", turns, before, want)
+	}
+	// turn-0006 (7 tokens) keeps a row from an older revision with a wrong
+	// figure; turn-0700 (701 tokens) loses its projection.
+	for _, statement := range []string{
+		`DELETE FROM usage_turn_totals WHERE task_id=? AND request_id<>'turn-0006'`,
+		`UPDATE usage_turn_totals SET turn_revision=0,tokens=999999 WHERE task_id=?`,
+		`UPDATE usage_turns SET projection='not json' WHERE task_id=? AND request_id='turn-0700'`,
+	} {
+		if _, err := s.db.Exec(statement, task.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := remaining(); got != 10_000_000-999999 {
+		t.Fatalf("remaining with the totals removed: %d", got)
+	}
+	if err := backfillUsageTurnTotals(s.db); err != nil {
+		t.Fatal(err)
+	}
+	if got := remaining(); got != before+701 {
+		t.Fatalf("remaining after the backfill %d, want %d", got, before+701)
+	}
+	totals := usageTurnTotals(t, s, task.ID)
+	if n := strings.Count(totals, "\n"); n != turns-1 || strings.Contains(totals, "turn-0700") {
+		t.Fatalf("%d totals rows after the backfill, want %d without the unreadable turn", n, turns-1)
+	}
+	if err := backfillUsageTurnTotals(s.db); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageTurnTotals(t, s, task.ID); got != totals {
+		t.Fatal("a second backfill changed the totals rows")
+	}
+}
+
+// s1, s4: the backfill runs at every open. On a file-backed store with 60,000
+// stored turns and no totals row the first open fills them within its bound,
+// and the next open, with nothing to fill, is fast and changes nothing.
+func TestUsageTurnTotalsBackfillOpenTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			s.Close()
+		}
+	}()
+	const turns = 60000
+	task, agent, run := "tsk_00000000000000aa", "agt_00000000000000aa", "run_00000000000000aa"
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.Prepare(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < turns; i++ {
+		at := now.Add(-time.Duration(i) * 10 * time.Second)
+		projection := fmt.Sprintf(`{"turn":{"id":"t%d","revision":1,"runtime":"codex","session":"s","model":"m","at":%q,"tokens":{"input":100,"cached":900,"cacheWrite":0,"output":40,"reasoning":10},"raw":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10},"sourceDigest":%q,"activation":"a","complete":true},"agentId":%q,"runId":%q,"role":"builder","roleSource":"name","phase":"build","phaseReason":"synthetic","shares":[{"taskId":%q,"denominator":1,"reason":"synthetic"}]}`,
+			i, at.Format(time.RFC3339Nano), strings.Repeat("a", 64), agent, run, task)
+		if _, err := insert.Exec(task, agent, run, fmt.Sprintf("t%d", i), ts(at), projection); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var none int
+	if err := s.db.QueryRow(`SELECT count(*) FROM usage_turn_totals`).Scan(&none); err != nil || none != 0 {
+		t.Fatalf("%d totals rows before the first open %v", none, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() time.Duration {
+		t.Helper()
+		started := time.Now()
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(started)
+	}
+	first := reopen()
+	var count, tokens, oldest, newest int64
+	if err := s.db.QueryRow(`SELECT count(*),sum(tokens),min(at_ns),max(at_ns) FROM usage_turn_totals WHERE task_id=? AND runtime='codex'`, task).Scan(&count, &tokens, &oldest, &newest); err != nil {
+		t.Fatal(err)
+	}
+	if count != turns || tokens != turns*1050 || oldest != now.Add(-time.Duration(turns-1)*10*time.Second).UnixNano() || newest != now.UnixNano() {
+		t.Fatalf("totals after the first open: %d rows, %d tokens, from %d to %d", count, tokens, oldest, newest)
+	}
+	totals := usageTurnTotals(t, s, task)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := reopen()
+	same := usageTurnTotals(t, s, task) == totals
+	closed = true
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("open with %d turns to backfill took %s; the next open took %s", turns, first, second)
+	if !same {
+		t.Fatal("the second open changed the totals rows")
+	}
+	if first >= 30*time.Second {
+		t.Fatalf("the first open with %d turns to backfill took %s, want under 30s", turns, first)
+	}
+	if second >= 3*time.Second {
+		t.Fatalf("the second open with nothing to backfill took %s, want under 3s", second)
 	}
 }
 

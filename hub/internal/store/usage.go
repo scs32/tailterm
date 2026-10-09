@@ -26,6 +26,11 @@ func migrateUsage(db *sql.DB) error {
  revision INTEGER NOT NULL,at TEXT NOT NULL,payload TEXT NOT NULL,projection TEXT NOT NULL,
  PRIMARY KEY(task_id,agent_id,run_id,request_id));
  CREATE INDEX IF NOT EXISTS usage_turns_time ON usage_turns(task_id,at);
+ CREATE TABLE IF NOT EXISTS usage_turn_totals(
+ task_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,request_id TEXT NOT NULL,
+ turn_revision INTEGER NOT NULL,runtime TEXT NOT NULL,at_ns INTEGER NOT NULL,tokens INTEGER NOT NULL,
+ PRIMARY KEY(task_id,agent_id,run_id,request_id));
+ CREATE INDEX IF NOT EXISTS usage_turn_totals_window ON usage_turn_totals(task_id,runtime,at_ns,tokens);
  CREATE TABLE IF NOT EXISTS usage_turn_revisions(
  task_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,request_id TEXT NOT NULL,
  revision INTEGER NOT NULL,payload TEXT NOT NULL,projection TEXT NOT NULL,
@@ -71,7 +76,89 @@ func migrateUsage(db *sql.DB) error {
  planned_tokens INTEGER NOT NULL,planned_race_tokens INTEGER NOT NULL,updated_at TEXT NOT NULL,
  by_agent TEXT NOT NULL DEFAULT '',by_node TEXT NOT NULL DEFAULT '',by_user TEXT NOT NULL DEFAULT '');
  ` + usageSpansSchema)
+	if err != nil {
+		return err
+	}
+	return backfillUsageTurnTotals(db)
+}
+
+// replaceUsageTurnTotal writes one stored turn's row in usage_turn_totals: its
+// runtime, its instant as Unix nanoseconds and its reported token classes
+// summed. The allowance source of the token budget sums these rows through
+// usage_turn_totals_window instead of decoding every projection.
+func replaceUsageTurnTotal(ctx context.Context, tx *sql.Tx, task, agent, run, request string, revision int64, runtime string, at time.Time, counts map[string]int64) error {
+	var tokens int64
+	for _, class := range api.UsageClasses {
+		tokens += counts[class]
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO usage_turn_totals(task_id,agent_id,run_id,request_id,turn_revision,runtime,at_ns,tokens) VALUES(?,?,?,?,?,?,?,?)
+ ON CONFLICT(task_id,agent_id,run_id,request_id) DO UPDATE SET turn_revision=excluded.turn_revision,runtime=excluded.runtime,at_ns=excluded.at_ns,tokens=excluded.tokens`,
+		task, agent, run, request, revision, runtime, at.UnixNano(), tokens)
 	return err
+}
+
+// backfillUsageTurnTotals gives a totals row to every stored turn that has
+// none at its current revision: turns stored before the table existed, and
+// turns an older binary wrote or revised after a rollback. Like
+// backfillUsageItemShares it is idempotent and works in bounded transactions,
+// so an interrupted open resumes. A turn whose projection does not decode gets
+// no row, as the allowance read skipped it before.
+func backfillUsageTurnTotals(db *sql.DB) error {
+	ctx := context.Background()
+	type turn struct {
+		rowid, revision                       int64
+		task, agent, run, request, projection string
+	}
+	after := int64(0)
+	for {
+		rows, err := db.QueryContext(ctx, `SELECT t.rowid,t.revision,t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turns t
+ WHERE t.rowid>? AND NOT EXISTS (SELECT 1 FROM usage_turn_totals s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
+ ORDER BY t.rowid LIMIT 500`, after)
+		if err != nil {
+			return err
+		}
+		batch := []turn{}
+		for rows.Next() {
+			var x turn
+			if err = rows.Scan(&x.rowid, &x.revision, &x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
+				rows.Close()
+				return err
+			}
+			batch = append(batch, x)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, x := range batch {
+			after = x.rowid
+			var p struct {
+				Turn struct {
+					Runtime string           `json:"runtime"`
+					At      time.Time        `json:"at"`
+					Tokens  map[string]int64 `json:"tokens"`
+				} `json:"turn"`
+			}
+			if json.Unmarshal([]byte(x.projection), &p) != nil {
+				continue
+			}
+			if err = replaceUsageTurnTotal(ctx, tx, x.task, x.agent, x.run, x.request, x.revision, p.Turn.Runtime, p.Turn.At, p.Turn.Tokens); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+	}
 }
 func validUsageTurn(t api.UsageTurn) bool {
 	if !validRequestID(t.ID) || t.Revision < 1 || t.At.IsZero() || t.Session == "" || len(t.Session) > 128 || len(t.Model) > 160 || len(t.SourceDigest) != 64 || len(t.Activation) > 160 || len(t.Gap) > 240 || len(t.Handled) > 64 {
@@ -254,6 +341,9 @@ func (s *Store) ReportUsage(ctx context.Context, task, agent string, b api.Usage
 		if err != nil {
 			return zero, err
 		}
+		if err = replaceUsageTurnTotal(ctx, tx, task, agent, b.RunID, t.ID, t.Revision, projection.Turn.Runtime, projection.Turn.At, projection.Turn.Tokens); err != nil {
+			return zero, err
+		}
 		if err = replaceUsageItemShares(ctx, tx, task, agent, b.RunID, projection); err != nil {
 			return zero, err
 		}
@@ -373,40 +463,23 @@ type usageBudgetState struct {
 	reset     time.Time
 	// reading says why the provider reading is not the source; empty when it is.
 	reading string
+	// captured is the reading's capture instant when the source is the
+	// provider: the reading reflects use only up to it.
+	captured time.Time
 }
 
 // usageRuntimeTokensSince sums the project's reported tokens of one runtime in
-// turns at or after an instant. The stored instant text drops trailing zeros
-// and does not sort within a second, so the query takes the whole second and
-// the instants are compared as times.
+// turns at or after an instant. It reads one sum from usage_turn_totals through
+// the covering index usage_turn_totals_window: one index entry per turn in the
+// window, no usage_turns row and no JSON. Instants are Unix nanoseconds, so the
+// boundary is exact.
 func usageRuntimeTokensSince(ctx context.Context, q queryRower, task, runtime string, since time.Time) (int64, error) {
-	rows, err := q.QueryContext(ctx, `SELECT projection FROM usage_turns WHERE task_id=? AND at>=?`, task, since.UTC().Format("2006-01-02T15:04:05"))
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
 	var total int64
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			return 0, err
-		}
-		var p struct {
-			Turn struct {
-				Runtime string           `json:"runtime"`
-				At      time.Time        `json:"at"`
-				Tokens  map[string]int64 `json:"tokens"`
-			} `json:"turn"`
-		}
-		if json.Unmarshal(raw, &p) != nil || p.Turn.Runtime != runtime || p.Turn.At.Before(since) {
-			continue
-		}
-		for _, class := range api.UsageClasses {
-			total += p.Turn.Tokens[class]
-		}
-	}
-	return total, rows.Err()
+	err := q.QueryRowContext(ctx, usageRuntimeTokensSinceSQL, task, runtime, since.UnixNano()).Scan(&total)
+	return total, err
 }
+
+const usageRuntimeTokensSinceSQL = `SELECT COALESCE(sum(tokens),0) FROM usage_turn_totals WHERE task_id=? AND runtime=? AND at_ns>=?`
 
 // usageBudgetStatus computes, for each budget row of the project, what
 // admission on a host would use now. The first source that applies wins:
@@ -446,7 +519,7 @@ func usageBudgetStatus(ctx context.Context, q queryRower, task, host string, now
 		var start time.Time
 		switch {
 		case usable && now.Sub(capturedAt) <= time.Duration(row.StaleSeconds)*time.Second && resetsAt.After(now):
-			state.source, state.reset = api.UsageBudgetSourceProvider, resetsAt
+			state.source, state.reset, state.captured = api.UsageBudgetSourceProvider, resetsAt, capturedAt
 			unused := new(big.Rat).Sub(big.NewRat(100, 1), percent)
 			state.remaining = unused.Mul(unused, allowance).Quo(unused, big.NewRat(100, 1))
 		case usable:
@@ -526,8 +599,16 @@ func (s *Store) UsageBudgets(ctx context.Context, task, host string) (api.UsageB
 	return readUsageBudgets(ctx, s.db, task, host, s.now())
 }
 
-// maxUsageBudgetStaleSeconds bounds a budget row's staleness setting.
-const maxUsageBudgetStaleSeconds = 24 * 60 * 60
+// minUsageBudgetStaleSeconds and maxUsageBudgetStaleSeconds bound a budget
+// row's staleness setting. The floor is what the relay can keep fresh: it
+// re-reports an unchanged reading every 5 minutes (providerUsageKeepFresh in
+// cmd/tt/provider_usage.go) and retries a failed report after 1 minute
+// (providerUsageRetry), so a smaller bound would make the reading stale most
+// of the time. The store cannot import cmd/tt; keep the three in step.
+const (
+	minUsageBudgetStaleSeconds = 6 * 60
+	maxUsageBudgetStaleSeconds = 24 * 60 * 60
+)
 
 // SetUsageBudget saves one budget row. The allowance is required: the
 // estimate is always compared in tokens.
@@ -552,8 +633,8 @@ func (s *Store) SetUsageBudget(ctx context.Context, task string, req api.UsageBu
 	if stale == 0 {
 		stale = api.DefaultUsageBudgetStaleSeconds
 	}
-	if stale < 1 || stale > maxUsageBudgetStaleSeconds {
-		return zero, usageInvalid("budget staleness bound must be 1 second to 24 hours")
+	if stale < minUsageBudgetStaleSeconds || stale > maxUsageBudgetStaleSeconds {
+		return zero, usageInvalid("budget staleness bound must be 6 minutes (360 seconds) to 24 hours: the relay re-reports an unchanged reading every 5 minutes and retries a failed report after 1 minute")
 	}
 	reset := ""
 	if req.ResetAt != "" {

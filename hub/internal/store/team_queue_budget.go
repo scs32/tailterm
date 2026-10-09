@@ -17,6 +17,9 @@ import (
 // entry while the remaining budget cannot cover its estimate plus the reserve,
 // and the entry hold that keeps a running team from starting new turns once it
 // has spent more than api.BudgetHoldMultiple times its item's saved estimate.
+// Admission also reserves, for every team that still holds a slot, the part of
+// its estimate the budget's source does not show as spent yet, so entries that
+// each fit alone are not admitted together past what remains.
 // Neither interrupts a turn, closes a session or refuses a write: the
 // admission check only skips a queued entry at the head, and the hold is read
 // by the relay before it wakes one of the team's runs.
@@ -70,17 +73,146 @@ func budgetTokenText(n *big.Rat) string {
 }
 
 // queueBudgetCheck is the budget check of one claim or one listing. It reads
-// the project's budget status once per host and its lane defaults once, so a
-// list of many queued entries costs one scan.
+// the project's budget status once per host, its lane defaults once and the
+// slot-holding entries with their teams' spend once, so a list of many queued
+// entries costs one indexed window sum per budget row and host.
 type queueBudgetCheck struct {
 	task     string
 	now      time.Time
 	states   map[string][]usageBudgetState
 	defaults *api.UsageEstimateDefaults
+	// reserved is nil until loadReserved has run.
+	reserved []budgetReservedEntry
+	// outstanding caches reservedOutstanding by the instant the source
+	// reflects, in Unix nanoseconds; zero is the allowance source.
+	outstanding map[int64]budgetReservation
+}
+
+// budgetReservedEntry is a slot-holding entry with the estimate it was
+// admitted against and its team's runs.
+type budgetReservedEntry struct {
+	entry    api.TeamQueueEntry
+	estimate int64
+	runs     []api.BudgetHoldRun
+}
+
+// budgetReservation is what the slot-holding teams have not yet drawn from a
+// budget row's source, and how many of them that is.
+type budgetReservation struct {
+	tokens *big.Rat
+	teams  int
 }
 
 func newQueueBudgetCheck(task string, now time.Time) *queueBudgetCheck {
-	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}}
+	return &queueBudgetCheck{task: task, now: now, states: map[string][]usageBudgetState{}, outstanding: map[int64]budgetReservation{}}
+}
+
+// loadReserved reads the project's entries that hold a slot (launching,
+// running, or failed and not yet released: a failed team's runs can still
+// spend), each with its estimate and its team. An entry with neither a saved
+// estimate nor a lane default reserves nothing. Every result set is closed
+// before the next query: a claim's transaction has one connection.
+func (c *queueBudgetCheck) loadReserved(ctx context.Context, q queryRower) error {
+	if c.reserved != nil {
+		return nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND `+queueHoldsSQL+` ORDER BY position,id`, c.task)
+	if err != nil {
+		return err
+	}
+	entries := []api.TeamQueueEntry{}
+	for rows.Next() {
+		e, err := scanTeamQueue(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		entries = append(entries, e)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	reserved := []budgetReservedEntry{}
+	for _, e := range entries {
+		estimate, _, err := c.entryEstimate(ctx, q, e)
+		if err != nil {
+			return err
+		}
+		if estimate == 0 {
+			continue
+		}
+		runs, err := budgetHoldTeam(ctx, q, c.task, e.ID)
+		if err != nil {
+			return err
+		}
+		reserved = append(reserved, budgetReservedEntry{entry: e, estimate: estimate, runs: runs})
+	}
+	c.reserved = reserved
+	return nil
+}
+
+// budgetTeamSpend sums what a team's runs have spent on their item, in turns
+// at or before an instant when one is given. It reads usage_item_shares joined
+// to usage_turn_totals for the turn's instant; a share whose turn has no
+// totals row is not counted, which errs toward a larger reservation.
+func budgetTeamSpend(ctx context.Context, q queryRower, task, item string, runs []api.BudgetHoldRun, upTo time.Time) (*big.Rat, error) {
+	spent := new(big.Rat)
+	for _, r := range runs {
+		query := `SELECT s.denominator,sum(s.tokens),max(s.partial) FROM usage_item_shares s
+ JOIN usage_turn_totals t ON t.task_id=s.task_id AND t.agent_id=s.agent_id AND t.run_id=s.run_id AND t.request_id=s.request_id
+ WHERE s.task_id=? AND s.agent_id=? AND s.run_id=? AND s.item_task_id=? AND s.item_id=?`
+		args := []any{task, r.AgentID, r.RunID, task, item}
+		if !upTo.IsZero() {
+			query += ` AND t.at_ns<=?`
+			args = append(args, upTo.UnixNano())
+		}
+		rows, err := q.QueryContext(ctx, query+` GROUP BY s.denominator`, args...)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = sumUsageItemShares(rows, spent, "not measured"); err != nil {
+			return nil, err
+		}
+	}
+	return spent, nil
+}
+
+// reservedOutstanding is, for one budget row's source, the sum over the
+// slot-holding entries of max(0, estimate - team spend the source already
+// reflects). The allowance source subtracts every reported turn, so all of a
+// team's spend is reflected. A provider reading reflects use only up to its
+// capture instant, so spend uploaded after it does not shrink the reservation
+// until a newer reading arrives.
+func (c *queueBudgetCheck) reservedOutstanding(ctx context.Context, q queryRower, state usageBudgetState) (budgetReservation, error) {
+	var upTo time.Time
+	if state.source == api.UsageBudgetSourceProvider {
+		upTo = state.captured
+	}
+	key := int64(0)
+	if !upTo.IsZero() {
+		key = upTo.UnixNano()
+	}
+	if cached, ok := c.outstanding[key]; ok {
+		return cached, nil
+	}
+	if err := c.loadReserved(ctx, q); err != nil {
+		return budgetReservation{}, err
+	}
+	out := budgetReservation{tokens: new(big.Rat)}
+	for _, r := range c.reserved {
+		spent, err := budgetTeamSpend(ctx, q, c.task, r.entry.ItemID, r.runs, upTo)
+		if err != nil {
+			return budgetReservation{}, err
+		}
+		if left := new(big.Rat).Sub(big.NewRat(r.estimate, 1), spent); left.Sign() > 0 {
+			out.tokens.Add(out.tokens, left)
+			out.teams++
+		}
+	}
+	c.outstanding[key] = out
+	return out, nil
 }
 
 // entryEstimate is what admission compares with the budget for an entry: the
@@ -132,7 +264,8 @@ func estimateDefaultText(d api.TeamQueueEstimateDefault) string {
 
 // admission returns why the budget holds a queued entry, or "" when it does
 // not: the project has no budget row (the check is off), or every row has a
-// usable source and the entry's estimate fits what remains after the reserve.
+// usable source and the entry's estimate fits what remains after the reserve
+// and what the slot-holding teams have not yet drawn from that source.
 func (c *queueBudgetCheck) admission(ctx context.Context, q queryRower, e api.TeamQueueEntry) (string, error) {
 	states, loaded := c.states[e.Host]
 	if !loaded {
@@ -163,14 +296,25 @@ func (c *queueBudgetCheck) admission(ctx context.Context, q queryRower, e api.Te
 			return fmt.Sprintf("%s: no usable source. Provider reading for host %s %s and no reset time is set", name, e.Host, state.reading), nil
 		}
 		reserve := big.NewRat(row.AllowanceTokens*int64(row.ReservePercent), 100)
-		if new(big.Rat).Sub(state.remaining, reserve).Cmp(big.NewRat(estimate, 1)) >= 0 {
+		admitted, err := c.reservedOutstanding(ctx, q, state)
+		if err != nil {
+			return "", err
+		}
+		free := new(big.Rat).Sub(state.remaining, reserve)
+		if free.Sub(free, admitted.tokens).Cmp(big.NewRat(estimate, 1)) >= 0 {
 			continue
+		}
+		teams := ""
+		if admitted.teams == 1 {
+			teams = fmt.Sprintf(", %s reserved for 1 admitted team", budgetTokenText(admitted.tokens))
+		} else if admitted.teams > 1 {
+			teams = fmt.Sprintf(", %s reserved for %d admitted teams", budgetTokenText(admitted.tokens), admitted.teams)
 		}
 		source := "provider reading"
 		if state.source == api.UsageBudgetSourceAllowance {
 			source = fmt.Sprintf("allowance minus reported usage; provider reading for host %s %s", e.Host, state.reading)
 		}
-		return fmt.Sprintf("%s: needs about %s; %s remain before the reset at %s, reserve %d%% (source: %s)", name, needs, budgetTokenText(state.remaining), state.reset.UTC().Format(time.RFC3339), row.ReservePercent, source), nil
+		return fmt.Sprintf("%s: needs about %s; %s remain before the reset at %s, reserve %d%%%s (source: %s)", name, needs, budgetTokenText(state.remaining), state.reset.UTC().Format(time.RFC3339), row.ReservePercent, teams, source), nil
 	}
 	return "", nil
 }
