@@ -523,3 +523,73 @@ func TestDelegatedAnswerIsNeverAMatrixApproval(t *testing.T) {
 		t.Fatal("a delegated answer served as the owner's matrix approval", err)
 	}
 }
+
+// Opening a window routes what still waits on the owner: not a decision whose
+// requester is closed or exited, and not a withdrawn or superseded owner
+// request.
+func TestDelegationOpenRoutesOnlyLiveRequests(t *testing.T) {
+	f := newDelegationFixture(t)
+	ctx := context.Background()
+	gone, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "gone", Host: "fixture", Session: "gone", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ask := func(key string, from api.Agent) api.Message {
+		t.Helper()
+		m, err := f.s.CreateDecision(ctx, f.task.ID, api.CreateDecisionRequest{AgentID: from.ID, RequestID: key, DecisionRequest: api.DecisionRequest{
+			Question: "Which rollout should the fixture use?", RecommendedOptionID: "staged", RecommendationReason: "Limits impact.",
+			Options: []api.DecisionOption{{ID: "staged", Label: "Staged", Description: "A few first."}, {ID: "all", Label: "All", Description: "Everyone at once."}}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	closed, exited := ask("closed", f.other), ask("exited", gone)
+	for id, status := range map[string]string{f.other.ID: api.AgentClosed, gone.ID: api.AgentExited} {
+		if _, err := f.s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, status, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withdrawn := f.ownerRequest(t, "withdrawn", "", "")
+	if _, err := f.s.WithdrawObligation(ctx, f.task.ID, withdrawn.ID, api.ObligationWithdrawRequest{AgentID: f.worker.ID, RunID: f.worker.RunID, Reason: "no longer needed", RequestID: "withdraw"}); err != nil {
+		t.Fatal(err)
+	}
+	superseded := f.ownerRequest(t, "superseded", "", "")
+	if _, err := f.s.db.Exec(`UPDATE obligations SET state=?,outcome=? WHERE id=?`, api.ObligationClosed, api.OutcomeSuperseded, superseded.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(48 * time.Hour)
+	live, waiting := ask("live", f.worker), f.ownerRequest(t, "waiting", "", "")
+	w := f.open(t, "open", api.DelegationScopeDecisions, time.Hour)
+	if routed(w, "decision", closed.Seq) != nil || routed(w, "decision", exited.Seq) != nil {
+		t.Fatalf("routed a decision from a closed or exited requester: %+v", w.Routes)
+	}
+	if routed(w, "obligation", withdrawn.MessageSeq) != nil || routed(w, "obligation", superseded.MessageSeq) != nil {
+		t.Fatalf("routed a withdrawn or superseded owner request: %+v", w.Routes)
+	}
+	if routed(w, "decision", live.Seq) == nil || routed(w, "obligation", waiting.MessageSeq) == nil || len(w.Routes) != 2 {
+		t.Fatalf("live requests %+v", w.Routes)
+	}
+	// The left-out decision stays with the owner, who can still answer it.
+	if _, err := f.s.AnswerDecision(ctx, f.task.ID, closed.Seq, api.AnswerDecisionRequest{RequestID: "owner", OptionID: "staged"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A request the window never routed: the delegate's stale run is refused as
+// forbidden, its current run as a conflict.
+func TestDelegationUnroutedRequestStaleRunIsForbidden(t *testing.T) {
+	f := newDelegationFixture(t)
+	f.open(t, "open", api.DelegationScopeDecisions, time.Hour)
+	merge := f.ownerRequest(t, "merge", "merge", "")
+	if routed(f.window(t), "obligation", merge.MessageSeq) != nil {
+		t.Fatal("routed an out-of-scope request")
+	}
+	stale := api.Agent{ID: f.lead.ID, RunID: "run_0000000000000000"}
+	if _, err := f.delegateAnswer("stale", merge.ID, "Merge it", "because", stale); !errors.Is(err, api.ErrDelegationForbidden) || errors.Is(err, api.ErrConflict) {
+		t.Fatalf("stale run on an unrouted request: %v", err)
+	}
+	if _, err := f.delegateAnswer("current", merge.ID, "Merge it", "because", f.lead); !errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrDelegationForbidden) {
+		t.Fatalf("current run on an unrouted request: %v", err)
+	}
+}

@@ -53,6 +53,14 @@ A request is routed when an open window covers it:
 - in the same transaction that creates it, if the window is open and before its end;
 - when a window opens, for every covered request still waiting on the owner.
 
+Still waiting means, when a window opens:
+
+- an owner request whose obligation is not closed. A withdrawn or superseded owner
+  request is closed, so it is not routed;
+- an unanswered decision whose requester is not closed or exited. A decision has no
+  state of its own and cannot be withdrawn or superseded, so its requester's status
+  is the only test. A decision left out stays with the owner, who can still answer it.
+
 It is never routed when it is a matrix approval, outside the scope, **authored by
 the delegate itself** (no self-approval), or when the delegate agent is closed or
 exited. Routing records a route row and sends the delegate a directed NOTICE with
@@ -86,6 +94,10 @@ window's delegate and its current run, a route exists, the window is open and
 | another agent, a stale run, or no window routes it to you | 403    |
 | window ended, request returned, outside scope, matrix,    | 409    |
 | already answered (by the owner or the delegate)           |        |
+
+A stale run of the delegate gets 403 whether or not the request was routed to it.
+The delegate's current run gets 409 for a request that is outside the scope or was
+never routed.
 
 An agent with no window keeps its previous behaviour: decisions answer 403, owner
 requests need a per-request `tt owner delegate` session grant (unchanged). An owner

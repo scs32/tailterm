@@ -267,7 +267,10 @@ func (s *Store) routeIfDelegated(ctx context.Context, tx *sql.Tx, taskID string,
 	return s.routeRequest(ctx, tx, task, w, delegate, r, now)
 }
 
-// openRequests lists the project's unanswered owner requests and decisions.
+// openRequests lists the project's unanswered owner requests and decisions. A
+// decision waits only while its requester does: one from a closed or exited
+// agent is left out. A superseded or withdrawn owner request is closed, so the
+// state filter already leaves it out.
 func openRequests(ctx context.Context, tx *sql.Tx, taskID string) ([]routable, error) {
 	var out []routable
 	rows, err := tx.QueryContext(ctx, `SELECT id,message_seq,subject FROM obligations WHERE task_id=? AND recipient_kind=? AND state<>? ORDER BY message_seq`, taskID, api.ObligationRecipientOwner, api.ObligationClosed)
@@ -286,7 +289,9 @@ func openRequests(ctx context.Context, tx *sql.Tx, taskID string) ([]routable, e
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT r.message_seq FROM decision_requests r LEFT JOIN decision_answers a ON a.task_id=r.task_id AND a.request_seq=r.message_seq WHERE r.task_id=? AND a.message_seq IS NULL ORDER BY r.message_seq`, taskID)
+	rows, err = tx.QueryContext(ctx, `SELECT r.message_seq FROM decision_requests r JOIN messages m ON m.seq=r.message_seq JOIN agents g ON g.id=m.from_agent
+LEFT JOIN decision_answers a ON a.task_id=r.task_id AND a.request_seq=r.message_seq
+WHERE r.task_id=? AND a.message_seq IS NULL AND g.status NOT IN (?,?) ORDER BY r.message_seq`, taskID, api.AgentClosed, api.AgentExited)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +673,8 @@ type delegatedRoute struct {
 // verifyWindowDelegate checks, at answer time and independent of the broker,
 // that agentID's current run holds an active window that routed this request
 // within its scope. 403: not the delegate, a stale run or no window; 409: the
-// window ended, the request was returned or is outside the scope.
+// window ended, the request was returned or is outside the scope. A stale run
+// gets 403 whether or not the request was routed.
 func (s *Store) verifyWindowDelegate(ctx context.Context, tx *sql.Tx, taskID, kind string, seq int64, agentID, runID string, now time.Time) (delegatedRoute, error) {
 	var out delegatedRoute
 	rows, err := tx.QueryContext(ctx, `SELECT r.window_id,r.request_kind,r.request_seq,r.obligation_id,r.category,r.notice_seq,r.routed_at,r.returned_at,r.answer_seq,r.answered_by_agent_id,r.answered_by_run_id,r.rationale,r.followed_recommendation,r.answered_at
@@ -681,10 +687,20 @@ WHERE r.task_id=? AND r.request_kind=? AND r.request_seq=? AND w.delegate_agent_
 	if err != nil {
 		return out, err
 	}
+	currentRun := func() error {
+		err := s.requireCurrentRun(ctx, tx, taskID, agentID, runID)
+		if errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrNotFound) {
+			return fmt.Errorf("%w: only the delegate's current run may answer", api.ErrDelegationForbidden)
+		}
+		return err
+	}
 	if len(routes) == 0 {
 		if w, ok, err := openWindow(ctx, tx, taskID); err != nil {
 			return out, err
 		} else if ok && w.DelegateAgentID == agentID {
+			if err := currentRun(); err != nil {
+				return out, err
+			}
 			return out, fmt.Errorf("%w: this request is outside the delegation window's scope or was not routed to you; it stays with the owner", api.ErrConflict)
 		}
 		return out, fmt.Errorf("%w: no owner delegation window routes this request to you", api.ErrDelegationForbidden)
@@ -693,10 +709,7 @@ WHERE r.task_id=? AND r.request_kind=? AND r.request_seq=? AND w.delegate_agent_
 	if out.window, err = loadWindow(ctx, tx, taskID, out.route.WindowID); err != nil {
 		return out, err
 	}
-	if err := s.requireCurrentRun(ctx, tx, taskID, agentID, runID); err != nil {
-		if errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrNotFound) {
-			return out, fmt.Errorf("%w: only the delegate's current run may answer", api.ErrDelegationForbidden)
-		}
+	if err := currentRun(); err != nil {
 		return out, err
 	}
 	if !out.window.Active(now) {
