@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -1046,14 +1047,35 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 }
 
+// reviewFindingTitleRefusal names the finding whose title cannot become a work
+// item title, in the words tt send uses for the same title. The reason never
+// repeats the title, and control characters in the finding ID become spaces,
+// so the text is safe to return to the client.
+func reviewFindingTitleRefusal(f api.ReviewFinding) error {
+	reason := fmt.Sprintf("must be a work item title of 1 to %d characters", api.MaxReviewFindingTitleLen)
+	if problems := api.ReviewFindingTitleProblems(&api.ReviewMetadata{Findings: []api.ReviewFinding{f}}); len(problems) > 0 {
+		reason = problems[0].Reason
+	}
+	id := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(f.ID, " "))
+	return fmt.Errorf("%w: review.findings[%s].title: %s", api.ErrInvalid, id, reason)
+}
+
 func (s *Store) fileReviewFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, f api.ReviewFinding, m api.Message, by api.Caller) (api.ReviewFollowUp, error) {
 	out := api.ReviewFollowUp{Finding: f, MessageSeq: m.Seq}
 	kind := f.Kind
 	if kind == "" {
 		kind = "bug"
 	}
-	if !validWorkItemKind(kind) || !validWorkItemTitle(f.Title) {
+	if !validWorkItemKind(kind) {
 		return out, api.ErrInvalid
+	}
+	if !validWorkItemTitle(f.Title) {
+		return out, reviewFindingTitleRefusal(f)
 	}
 	raw, _ := json.Marshal(f)
 	now := s.now()

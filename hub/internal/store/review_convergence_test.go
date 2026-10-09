@@ -749,6 +749,113 @@ func TestReviewConvergenceFollowUpRollbackIsAtomic(t *testing.T) {
 	}
 }
 
+// findingTitleReason is the reason a client reads after "invalid request: ":
+// the text that follows api.ErrInvalid in a "%w: reason" refusal.
+func findingTitleReason(t *testing.T, err error) string {
+	t.Helper()
+	var envelopeErr *api.EnvelopeError
+	if !errors.Is(err, api.ErrInvalid) || errors.As(err, &envelopeErr) {
+		t.Fatalf("want a store refusal wrapping api.ErrInvalid, got %T %v", err, err)
+	}
+	reason, ok := strings.CutPrefix(err.Error(), api.ErrInvalid.Error()+": ")
+	if !ok || reason == "" {
+		t.Fatalf("refusal has no named reason: %q", err)
+	}
+	for _, r := range reason {
+		if r < 0x20 || r == 0x7f {
+			t.Fatalf("reason carries a control character: %q", reason)
+		}
+	}
+	return reason
+}
+
+// A round-two blocker that is new and not a regression is filed as a
+// follow-up. The envelope check covers review.findings only, so its title
+// first meets the work item title rule here.
+func TestReviewConvergenceRoundTwoBlockerTitleRefusalNamesFinding(t *testing.T) {
+	long := strings.Repeat("x", 121)
+	rule := "; a title is 1 to 120 characters"
+	for name, tc := range map[string]struct{ title, want string }{
+		"too long": {long, "review.findings[b2].title: must be at most 120 characters, has 121"},
+		"padded":   {" Retry drops receipt ", "review.findings[b2].title: must not start or end with a space" + rule},
+		"control":  {"Retry drops\x1b[31m receipt\x00", "review.findings[b2].title: must not contain control characters" + rule},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			r := f.review(t, candidateA)
+			if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			r2 := f.review(t, candidateB)
+			before, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+			b := api.ReviewFinding{ID: "b2", Criterion: "a2", Title: tc.title, File: "fixture.go", Line: 6}
+			failed := map[string]string{"a1": "pass", "a2": "fail"}
+			_, err := f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r2.Seq, f.reviewer)
+			if reason := findingTitleReason(t, err); reason != tc.want || strings.Contains(reason, tc.title) {
+				t.Fatalf("reason %q, want %q", reason, tc.want)
+			}
+			after, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+			st := f.state(t)
+			if len(before.Items) != len(after.Items) || st.Rounds[1].ResultSeq != 0 || len(st.FollowUps) != 0 {
+				t.Fatal("refused result saved something", len(before.Items), len(after.Items), st)
+			}
+			// The same result with a title at the limit files the follow-up.
+			b.Title = long[:120]
+			if _, err = f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r2.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			st = f.state(t)
+			if st.Rounds[1].ResultSeq == 0 || len(st.FollowUps) != 1 {
+				t.Fatal("valid title not filed", st)
+			}
+			follow, err := f.s.GetWorkItem(f.ctx, f.task.ID, st.FollowUps[0].ItemID)
+			if err != nil || follow.Title != b.Title || follow.Kind != "bug" || follow.Status != "open" {
+				t.Fatal(follow, err)
+			}
+		})
+	}
+}
+
+// fileReviewFollowUp is the last check before a finding becomes a work item,
+// whatever path reached it.
+func TestReviewFollowUpTitleRefusalNamesFieldAndFinding(t *testing.T) {
+	f := newConvergenceFixture(t)
+	file := func(finding api.ReviewFinding) error {
+		t.Helper()
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		_, err = f.s.fileReviewFollowUp(f.ctx, tx, f.item, finding, api.Message{TaskID: f.task.ID, Seq: 1}, f.by)
+		return err
+	}
+	rule := "; a title is 1 to 120 characters"
+	for name, tc := range map[string]struct{ id, title, want string }{
+		"empty":      {"f3", "", "review.findings[f3].title: must not be empty" + rule},
+		"too long":   {"f3", strings.Repeat("\u00e9", 121), "review.findings[f3].title: must be at most 120 characters, has 121"},
+		"padded":     {"f3", "Padded title ", "review.findings[f3].title: must not start or end with a space" + rule},
+		"control":    {"f3", "Tab\there", "review.findings[f3].title: must not contain control characters" + rule},
+		"control id": {"f\x1b3\n", "", "review.findings[f 3 ].title: must not be empty" + rule},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reason := findingTitleReason(t, file(api.ReviewFinding{ID: tc.id, Title: tc.title, File: "fixture.go", Line: 3}))
+			if reason != tc.want || tc.title != "" && strings.Contains(reason, tc.title) {
+				t.Fatalf("reason %q, want %q", reason, tc.want)
+			}
+		})
+	}
+	// An invalid kind keeps its bare refusal, even with an invalid title.
+	for _, title := range []string{"Valid title", ""} {
+		if err := file(api.ReviewFinding{ID: "f3", Kind: "task", Title: title, File: "fixture.go", Line: 3}); err != api.ErrInvalid {
+			t.Fatalf("invalid kind with title %q: %v", title, err)
+		}
+	}
+	if err := file(api.ReviewFinding{ID: "f3", Title: strings.Repeat("\u00e9", 120), File: "fixture.go", Line: 3}); err != nil {
+		t.Fatal("title at the limit refused", err)
+	}
+}
+
 func TestReviewConvergenceVerifierMustBeBoundToLinkedItem(t *testing.T) {
 	f := newConvergenceFixture(t)
 	b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
