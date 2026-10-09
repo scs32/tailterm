@@ -1515,9 +1515,38 @@ func TestToolRedactScanIsBounded(t *testing.T) {
 	t.Logf("slowest worst-case scan: %s for %s", slowest.Round(100*time.Microsecond), slowestUnit)
 }
 
+// redactRetryMiss calls run until it reports a run that did not give up, three
+// times at most. run says whether the hook gave up, failing open at its
+// deadline or its scan budget, and how that was seen. A run that gave up has
+// no result to judge; when all three do, the test fails and says so.
+func redactRetryMiss(t *testing.T, label string, run func() (miss bool, seen string)) {
+	t.Helper()
+	const attempts = 3
+	for n := 0; ; n++ {
+		// A stalled host is usually still stalled a moment later, so a
+		// retry waits first: one bound, then two.
+		time.Sleep(time.Duration(n) * toolLedgerBound)
+		miss, seen := run()
+		if !miss {
+			return
+		}
+		if n == attempts-1 {
+			t.Fatalf("%s: the hook gave up on every one of %d attempts; on the last, %s", label, attempts, seen)
+		}
+		t.Logf("%s: attempt %d not judged: %s", label, n, seen)
+	}
+}
+
 // Review b1, at the hook: a generated value on the first line followed by a
 // worst-case text up to the cap still leaves a row, with its count or with
 // the timeout skip, and the hook returns inside its deadline.
+//
+// A hook that reaches its own 150 ms deadline is a different outcome (bug
+// wi_0594374c301fe096): it returns on time and drops the row, by design, so
+// on a loaded host a correct hook can leave nothing. A run that took the
+// whole deadline and left no row is run again, three times at most. A run
+// that left a row, and every run that returned before the deadline, is
+// checked exactly as before.
 func TestToolRedactWorstCaseLeavesARow(t *testing.T) {
 	c := redactShapeCases[0]
 	for _, mode := range []string{toolRedactReport, toolRedactRedact} {
@@ -1540,8 +1569,20 @@ func TestToolRedactWorstCaseLeavesARow(t *testing.T) {
 					t.Logf("%s: not run, decoding the input alone took %s here", label, spent.Round(time.Millisecond))
 					continue
 				}
-				r := runToolHook(t, e, "tool", payload, nil)
-				rows := toolLedgerRows(t, root, e.agent)
+				var r toolHookRun
+				var rows []map[string]any
+				redactRetryMiss(t, label, func() (bool, string) {
+					r = runToolHook(t, e, "tool", payload, nil)
+					rows = toolLedgerRows(t, root, e.agent)
+					if r.err != nil || len(rows) != before || r.elapsed < toolLedgerDeadline {
+						return false, ""
+					}
+					// The worker this run left behind may still write its row,
+					// so the next run gets a ledger of its own.
+					e, root = redactSandbox(t, mode)
+					before = 0
+					return true, fmt.Sprintf("the hook took %s, its whole deadline, and left no row", r.elapsed.Round(time.Millisecond))
+				})
 				if r.err != nil || r.elapsed > 200*time.Millisecond || len(rows) != before+1 {
 					t.Fatalf("%s: err %v, %s, %d new rows; want one row inside 200 ms", label, r.err, r.elapsed.Round(time.Millisecond), len(rows)-before)
 				}
@@ -1567,8 +1608,38 @@ func TestToolRedactWorstCaseLeavesARow(t *testing.T) {
 // Review f1: a redact answer is the output as it was written, byte for byte,
 // with only the value cut out. A lone surrogate escape, other escapes,
 // spacing, key order and number forms all pass through untouched.
+//
+// A hook that gave up is a different outcome (bug wi_0594374c301fe096). On a
+// loaded host the scan can use its whole budget, which leaves a row marked as
+// a timeout and no answer, or the hook can reach its deadline before it
+// answers; both are the stated fail-open result. Such a run is run again,
+// three times at most. Any answer, and an empty one from a run that did
+// neither, is checked exactly as before.
 func TestToolRedactAnswerPreservesBytes(t *testing.T) {
-	e, _ := redactSandbox(t, toolRedactRedact)
+	e, root := redactSandbox(t, toolRedactRedact)
+	answer := func(label, input string) toolHookRun {
+		var r toolHookRun
+		redactRetryMiss(t, label, func() (bool, string) {
+			before := len(toolLedgerRows(t, root, e.agent))
+			r = runToolHook(t, e, "tool", input, nil)
+			if r.err != nil || r.out != "" {
+				return false, ""
+			}
+			reason := ""
+			if rows := toolLedgerRows(t, root, e.agent); len(rows) > before && rows[len(rows)-1]["redactSkip"] == "timeout" {
+				reason = "the scan used its whole budget and the row records a timeout"
+			} else if r.elapsed >= toolLedgerDeadline {
+				reason = fmt.Sprintf("the hook took %s, its whole deadline, before it answered", r.elapsed.Round(time.Millisecond))
+			} else {
+				return false, ""
+			}
+			// A worker left behind may still write its row, so the next
+			// run gets a ledger of its own.
+			e, root = redactSandbox(t, toolRedactRedact)
+			return true, reason
+		})
+		return r
+	}
 	c := redactShapeCases[0]
 	value := c.make(t, c.n)
 	const hold = "[tt-redacted:github-token]"
@@ -1581,7 +1652,7 @@ func TestToolRedactAnswerPreservesBytes(t *testing.T) {
 		// The payload is written by hand: json.Marshal would rewrite the
 		// raw output's escapes before the hook ever saw them.
 		input := `{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_use_id":"u1","tool_input":{},"tool_response":` + raw + `}`
-		r := runToolHook(t, e, "tool", input, nil)
+		r := answer(label, input)
 		want := `{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":` + strings.ReplaceAll(raw, value, hold) + `,"additionalContext":`
 		if r.err != nil || !strings.HasPrefix(r.out, want) || strings.Contains(r.out, "\ufffd") {
 			t.Errorf("%s: the answer is not the output with only the value replaced (%d bytes, err %v)", label, len(r.out), r.err)
@@ -1595,7 +1666,7 @@ func TestToolRedactAnswerPreservesBytes(t *testing.T) {
 	// whole of its written form is cut out.
 	escaped := `\u0067hp\u005f` + value[4:len(value)-1] + fmt.Sprintf(`\u%04x`, value[len(value)-1])
 	raw := `{"stdout":"a ` + escaped + ` b \ud83d"}`
-	r := runToolHook(t, e, "tool", `{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_use_id":"u2","tool_input":{},"tool_response":`+raw+`}`, nil)
+	r := answer("an escaped value", `{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_use_id":"u2","tool_input":{},"tool_response":`+raw+`}`)
 	if want := `"updatedToolOutput":{"stdout":"a ` + hold + ` b \ud83d"},`; !strings.Contains(r.out, want) {
 		t.Errorf("an escaped value was not cut out whole (%d bytes)", len(r.out))
 	}

@@ -722,9 +722,17 @@ func TestHandoffHookLate(t *testing.T) {
 
 // a3: the hook makes no hub request. With a listening hub nothing connects;
 // with an unreachable one the notes and the capture log are the same.
+//
+// The notes are a separate expectation (bug wi_0594374c301fe096). A hook that
+// reaches its own deadline returns on time and may print no note and leave no
+// stamp, by design, so on a loaded host a correct hook can leave a scenario
+// with a note missing. A scenario in which a hook call reached the deadline
+// is run again in a fresh box, three times at most. A scenario whose every
+// call returned before the deadline saw its work finish and is judged in
+// full, and no attempt may connect to the hub.
 func TestHandoffHookNoNetwork(t *testing.T) {
 	type result struct{ notes, captures string }
-	scenario := func(t *testing.T, hub string) result {
+	attempt := func(t *testing.T, hub string) (result, time.Duration) {
 		b := newHandoffBox(t)
 		b.on()
 		b.helper.Hub = hub
@@ -733,12 +741,14 @@ func TestHandoffHookNoNetwork(t *testing.T) {
 		b.asHelper()
 		b.must(handoffAddArgs(handoffKinds[0], nil)...)
 		var notes strings.Builder
+		var slowest time.Duration
 		for _, ev := range handoffEvents {
 			r := b.hook(ev.event, b.helper.Thread, ev.extra)
 			if r.err != nil {
 				t.Fatal(r.err)
 			}
 			notes.WriteString(r.out)
+			slowest = max(slowest, r.elapsed)
 		}
 		// A candidate successor asks tmux, and still not the hub.
 		b.fakeTmux(`["` + b.helper.SessionID + `","` + b.helper.SessionCreated + `"]`)
@@ -749,11 +759,31 @@ func TestHandoffHookNoNetwork(t *testing.T) {
 				t.Fatal(r.err)
 			}
 			notes.WriteString(r.out)
+			slowest = max(slowest, r.elapsed)
+		}
+		if slowest >= handoffDeadline {
+			// A call reached the deadline: there is no finished run to judge.
+			return result{notes.String(), ""}, slowest
 		}
 		if !strings.Contains(notes.String(), "i1 active instruction") || !strings.Contains(notes.String(), "not registered as the owner helper") {
 			t.Fatalf("the scenario did not exercise the hook:\n%s", notes.String())
 		}
-		return result{notes.String(), string(b.bytes("captures.jsonl"))}
+		return result{notes.String(), string(b.bytes("captures.jsonl"))}, slowest
+	}
+	scenario := func(t *testing.T, hub string) result {
+		var last result
+		var slowest time.Duration
+		for n := 0; n < 3; n++ {
+			// A stalled host is usually still stalled a moment later, so a
+			// retry waits first: one bound, then two.
+			time.Sleep(time.Duration(n) * handoffBound)
+			if last, slowest = attempt(t, hub); slowest < handoffDeadline {
+				return last
+			}
+			t.Logf("attempt %d: a hook call took %s and reached the hook's %s deadline; not judged", n, slowest.Round(time.Millisecond), handoffDeadline)
+		}
+		t.Fatalf("no attempt in three finished inside the hook's %s deadline; the last took %s and left these notes:\n%s", handoffDeadline, slowest.Round(time.Millisecond), last.notes)
+		return last
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
