@@ -291,6 +291,240 @@ test("real private tmux sizing serializes claims and rejects stale viewers and i
   }
 });
 
+// tmux 3.7 stops a format expansion at 100 ms and expands the rest to nothing.
+// The wrapper makes that happen to the identity guard of the next `cuts`
+// sizing commands by putting a format too slow to finish in front of it; every
+// later format, including the server's own check of a refusal, is untouched.
+test("a cut identity reading is read again and never reported as a refusal", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tailterm-cut-"));
+  const socket = dir + "/socket",
+    binary = path.join(dir, "tmux");
+  const slow = Array.from({ length: 14 }).reduce(
+    (format) => `#{W:${format}}`,
+    "#{window_id}",
+  );
+  writeFileSync(
+    binary,
+    `#!/bin/sh
+if [ "$1" = if-shell ]; then
+  printf 'guard\\n' >> ${shellQuote(dir + "/guards")}
+  cuts=$(cat ${shellQuote(dir + "/cuts")})
+  if [ "$cuts" -gt 0 ]; then
+    printf '%s\\n' "$((cuts - 1))" > ${shellQuote(dir + "/cuts")}
+    exec tmux -f /dev/null -S ${shellQuote(socket)} if-shell -F -t "$4" "#{&&:#{!=:${slow},},$5}" "$6" "$7"
+  fi
+fi
+exec tmux -f /dev/null -S ${shellQuote(socket)} "$@"
+`,
+    { mode: 0o700 },
+  );
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k]) => !k.startsWith("TAILTERM_") && k !== "TMUX",
+    ),
+  );
+  const run = (...args) => {
+    const r = runBounded(binary, args, { env, socket });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  // Runs one generated command with the next `cuts` identity guards cut.
+  const under = (cuts, command) => {
+    writeFileSync(dir + "/cuts", cuts + "\n");
+    writeFileSync(dir + "/guards", "");
+    const r = runBounded("/bin/sh", ["-c", command], { env, socket });
+    return {
+      status: r.status,
+      reply: r.stdout.trim(),
+      stderr: r.stderr,
+      guards: readFileSync(dir + "/guards", "utf8").split("\n").length - 1,
+    };
+  };
+  const binding = {
+    taskId: "tsk_0000000000000001",
+    agentId: "agt_0000000000000001",
+    runId: "run_0000000000000001",
+  };
+  try {
+    run(
+      "new-session",
+      "-d",
+      "-s",
+      "sizing",
+      "-n",
+      "agent",
+      "-x",
+      "200",
+      "-y",
+      "50",
+      "-e",
+      "TAILTERM_TASK=" + binding.taskId,
+      "-e",
+      "TAILTERM_AGENT=" + binding.agentId,
+      "-e",
+      "TAILTERM_RUN=" + binding.runId,
+      "sleep 60",
+    );
+    // The slow format walks these windows; the guarded one stays single-pane.
+    for (let i = 0; i < 3; i++)
+      run("new-window", "-d", "-t", "sizing", "sleep 60");
+    const [id, created] = readTmuxFormat(
+      run,
+      [
+        "display-message",
+        "-p",
+        "-t",
+        "sizing",
+        "#{session_id}|#{session_created}",
+      ],
+      { shape: /^\$\d+\|\d+$/ },
+    ).split("|");
+    const target = { id, created };
+    const token = "viewer_0000000000000001";
+    const sizing = (changes = {}) =>
+      agentWindowSizeCommand(
+        {
+          target,
+          binding,
+          token,
+          action: "resize",
+          cols: 120,
+          rows: 35,
+          ...changes,
+        },
+        binary,
+      );
+    const size = () =>
+      readTmuxFormat(
+        run,
+        [
+          "display-message",
+          "-p",
+          "-t",
+          id + ":agent",
+          "#{window_width}x#{window_height}",
+        ],
+        { shape: /^\d+x\d+$/ },
+      );
+    const windowSize = () =>
+      run("show-options", "-w", "-v", "-t", id + ":agent", "window-size");
+    run("set-option", "-t", id, "status", "off");
+
+    // The wrapper's cut is real: a guard that holds reads false once cut. The
+    // counts below are lower bounds, since a loaded host cuts readings too.
+    const guard = (cuts) =>
+      under(
+        cuts,
+        `${shellQuote(binary)} if-shell -F -t ${shellQuote(id + ":agent")} '#{==:#{window_name},agent}' 'display-message -p whole' 'display-message -p cut'`,
+      ).reply;
+    assert.equal(guard(1), "cut");
+
+    const claimed = under(0, sizing({ action: "claim", expectedRevision: "" }));
+    assert.deepEqual(
+      [claimed.reply, claimed.status, size()],
+      ["sized", 0, "120x35"],
+      "a whole reading sizes",
+    );
+
+    const reread = under(2, sizing({ cols: 150 }));
+    assert.deepEqual(
+      [reread.reply, reread.status, reread.guards >= 3, size()],
+      ["sized", 0, true, "150x35"],
+      "two cut readings are read again and the third sizes",
+    );
+
+    const before = size();
+    for (const action of ["inspect", "claim", "resize", "release", "restore"]) {
+      const cut = under(
+        99,
+        sizing({ action, cols: 170, rows: 40, expectedRevision: token }),
+      );
+      assert.deepEqual(
+        [cut.reply, cut.status, cut.guards],
+        ["incomplete", 75, 5],
+        action + " with every reading cut",
+      );
+      assert.match(
+        cut.stderr,
+        /did not finish reading the agent pane identity/,
+      );
+      assert.equal(size(), before, action + " changed nothing");
+    }
+    assert.equal(
+      run(
+        "show-options",
+        "-w",
+        "-v",
+        "-t",
+        id + ":agent",
+        "@tailterm_size_viewer",
+      ),
+      token,
+      "a cut release keeps the viewer",
+    );
+
+    // A real mismatch is proved by the server in the same command, so it is
+    // refused at once whether or not the guard itself was cut.
+    const refusals = [
+      ["wrong created time", { target: { id, created: "0" } }],
+      ["wrong run", { binding: { ...binding, runId: "run_0000000000000002" } }],
+      ["missing session", { target: { id: "$99999", created } }],
+    ];
+    for (const cuts of [0, 1])
+      for (const [label, changes] of refusals) {
+        const refused = under(cuts, sizing({ cols: 180, ...changes }));
+        assert.deepEqual(
+          [refused.reply, refused.status, size()],
+          ["refused", 0, before],
+          `${label} with ${cuts} cut`,
+        );
+      }
+
+    // The helper policy guards the same way. An owner helper is also the one
+    // identity an agent sizing command must refuse.
+    run("set-environment", "-t", id, "TAILTERM_ROLE", "owner_helper");
+    for (const cuts of [0, 1]) {
+      const refused = under(cuts, sizing({ cols: 180 }));
+      assert.deepEqual(
+        [refused.reply, refused.status, size()],
+        ["refused", 0, before],
+        `owner helper role with ${cuts} cut`,
+      );
+    }
+    const helper = (changes = {}) =>
+      tmuxCommand("sizing", binary, true, target, "", {
+        ignoreSize: true,
+        helperBinding: { ...binding, role: "owner_helper", ...changes },
+      });
+    assert.equal(windowSize(), "manual");
+    const unchecked = under(99, helper());
+    assert.deepEqual([unchecked.status, unchecked.guards], [1, 5]);
+    assert.match(unchecked.stderr, /^Helper sizing was not checked: /);
+    assert.doesNotMatch(unchecked.stderr, /refused|tmux failed/);
+    assert.equal(windowSize(), "manual");
+    for (const cuts of [0, 1]) {
+      const refused = under(cuts, helper({ runId: "run_0000000000000002" }));
+      assert.equal(refused.status, 1);
+      assert.match(refused.stderr, /^Helper sizing refused: /);
+      assert.doesNotMatch(refused.stderr, /tmux failed/);
+      assert.equal(windowSize(), "manual", "a refused helper changes nothing");
+    }
+    // Past the guard the command attaches, which needs a terminal this test
+    // does not have: tmux itself fails, after the policy was applied.
+    const ready = under(2, helper());
+    assert.ok(ready.guards >= 3, "two cut readings were read again");
+    assert.doesNotMatch(ready.stderr, /Helper sizing/);
+    assert.match(ready.stderr, /tmux failed with exit status/);
+    assert.equal(windowSize(), "latest");
+  } finally {
+    try {
+      runBounded(binary, ["kill-server"], { env, socket });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a hung tmux command fails fast and names the command", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-hung-"));
   const socket = dir + "/socket",

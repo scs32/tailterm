@@ -82,6 +82,30 @@ export function tmuxCommand(
     )
   );
 }
+// tmux 3.7 stops expanding a format after 100 ms and expands the rest to
+// nothing, so on a loaded host a true identity guard reads false. A refusal is
+// therefore proved separately: some field differs and the trailing literal,
+// which only survives a whole expansion, is still there. Each guard is a list
+// of [field, value, wanted] terms, where wanted false means "must differ".
+const allOf = (conditions) => conditions.reduce((a, b) => `#{&&:${a},${b}}`);
+const identityHolds = (terms) =>
+  allOf(
+    terms.map(
+      ([field, value, wanted = true]) =>
+        `#{${wanted ? "==" : "!="}:#{${field}},${value}}`,
+    ),
+  );
+const identityDiffers = (terms) =>
+  `#{&&:${terms
+    .map(
+      ([field, value, wanted = true]) =>
+        `#{${wanted ? "!=" : "=="}:#{${field}},${value}}`,
+    )
+    .reduce((a, b) => `#{||:${a},${b}}`)},1}`;
+// A guard whose reading was cut changed nothing, so it is run again.
+const IDENTITY_READS = 5;
+const rereadWhile = (reply, word, read) =>
+  `tailterm_identity_reads=0; while :; do ${read}; if [ "$${reply}" != ${word} ]; then break; fi; tailterm_identity_reads=$((tailterm_identity_reads + 1)); if [ "$tailterm_identity_reads" -ge ${IDENTITY_READS} ]; then break; fi; sleep 0.2 2>/dev/null || sleep 1; done; `;
 // Helpers use native client precedence, not the ordinary-agent manual-size
 // controller. Resolve the selected window once, then guard and mutate it in a
 // synchronous tmux queue. A window linked to another session is unsupported.
@@ -93,23 +117,28 @@ function helperWindowPolicy(binding, target) {
     !/^run_[0-9a-f]{16}$/.test(binding.runId || "")
   )
     throw new Error("Invalid helper sizing identity.");
-  const eq = (field, value) => `#{==:#{${field}},${value}}`;
   const identity = [
-    eq("session_id", "$tailterm_tmux_target"),
-    eq("session_created", "$tailterm_tmux_created"),
-    eq("window_id", "$tailterm_tmux_window"),
-    eq("TAILTERM_TASK", binding.taskId),
-    eq("TAILTERM_AGENT", binding.agentId),
-    eq("TAILTERM_RUN", binding.runId),
-    eq("TAILTERM_ROLE", "owner_helper"),
-    eq("window_linked", 0),
-  ].reduce((a, b) => `#{&&:${a},${b}}`);
+    ["session_id", "$tailterm_tmux_target"],
+    ["session_created", "$tailterm_tmux_created"],
+    ["window_id", "$tailterm_tmux_window"],
+    ["TAILTERM_TASK", binding.taskId],
+    ["TAILTERM_AGENT", binding.agentId],
+    ["TAILTERM_RUN", binding.runId],
+    ["TAILTERM_ROLE", "owner_helper"],
+    ["window_linked", 0],
+  ];
+  const window = "$tailterm_tmux_target:$tailterm_tmux_window";
   return (
     `tailterm_tmux_window_identity=$("$tailterm_tmux_bin" display-message -p -t "$tailterm_tmux_target" '#{window_id}|#{session_created}') || exit 1; ` +
     `tailterm_tmux_window=\${tailterm_tmux_window_identity%%|*}; ` +
     `tailterm_tmux_created=${target ? shellQuote(String(target.created)) : '"${tailterm_tmux_window_identity#*|}"'}; ` +
     `case "$tailterm_tmux_window" in @*[!0-9]*|@|'') printf 'Invalid helper window identity.\\n' >&2; exit 1 ;; @*) ;; *) exit 1 ;; esac; ` +
-    `tailterm_helper_policy=$("$tailterm_tmux_bin" if-shell -F -t "$tailterm_tmux_target:$tailterm_tmux_window" "${identity}" "set-option -w -t '$tailterm_tmux_target:$tailterm_tmux_window' window-size latest ; display-message -p helper-ready" 'display-message -p helper-refused') || exit 1; ` +
+    rereadWhile(
+      "tailterm_helper_policy",
+      "helper-incomplete",
+      `tailterm_helper_policy=$("$tailterm_tmux_bin" if-shell -F -t "${window}" "${identityHolds(identity)}" "set-option -w -t '${window}' window-size latest ; display-message -p helper-ready" "if-shell -F -t '${window}' '${identityDiffers(identity)}' 'display-message -p helper-refused' 'display-message -p helper-incomplete'") || exit 1`,
+    ) +
+    `if [ "$tailterm_helper_policy" = helper-incomplete ]; then printf 'Helper sizing was not checked: tmux did not finish reading the window identity. Try again.\\n' >&2; exit 1; fi; ` +
     `if [ "$tailterm_helper_policy" != helper-ready ]; then printf 'Helper sizing refused: session identity changed or window is linked to another session.\\n' >&2; exit 1; fi; `
   );
 }
@@ -200,17 +229,16 @@ export function agentWindowSizeCommand(
     throw new Error("Invalid agent viewport size.");
   const window = shellQuote(target.id + ":agent");
   const eq = (field, value) => `#{==:#{${field}},${value}}`;
-  const all = (conditions) => conditions.reduce((a, b) => `#{&&:${a},${b}}`);
-  const identity = all([
-    eq("session_id", target.id),
-    eq("session_created", target.created),
-    eq("TAILTERM_TASK", binding.taskId),
-    eq("TAILTERM_AGENT", binding.agentId),
-    eq("TAILTERM_RUN", binding.runId),
-    "#{!=:#{TAILTERM_ROLE},owner_helper}",
-    eq("window_name", "agent"),
-    eq("window_panes", 1),
-  ]);
+  const identity = [
+    ["session_id", target.id],
+    ["session_created", target.created],
+    ["TAILTERM_TASK", binding.taskId],
+    ["TAILTERM_AGENT", binding.agentId],
+    ["TAILTERM_RUN", binding.runId],
+    ["TAILTERM_ROLE", "owner_helper", false],
+    ["window_name", "agent"],
+    ["window_panes", 1],
+  ];
   let mutate;
   if (action === "inspect") {
     // The reported size lets a claim that lands after its pane hid be undone.
@@ -247,11 +275,20 @@ export function agentWindowSizeCommand(
     mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_revision", expectedRevision))} ${shellQuote(mutate)} 'display-message -p superseded'`;
   if (["resize", "release", "restore"].includes(action))
     mutate = `if-shell -F -t ${window} ${shellQuote(eq("@tailterm_size_viewer", token))} ${shellQuote(mutate)} 'display-message -p superseded'`;
+  // A refusal the server could not prove is "incomplete": nothing was changed.
+  const refuse = `if-shell -F -t ${window} ${shellQuote(identityDiffers(identity))} 'display-message -p refused' 'display-message -p incomplete'`;
   return (
     "/bin/sh -c " +
     shellQuote(
       resolver(path) +
-        `exec "$tailterm_tmux_bin" if-shell -F -t ${window} ${shellQuote(identity)} ${shellQuote(mutate)} 'display-message -p refused'`,
+        rereadWhile(
+          "tailterm_size_reply",
+          "incomplete",
+          `tailterm_size_reply=$("$tailterm_tmux_bin" if-shell -F -t ${window} ${shellQuote(identityHolds(identity))} ${shellQuote(mutate)} ${shellQuote(refuse)}); tailterm_size_status=$?`,
+        ) +
+        `if [ -n "$tailterm_size_reply" ]; then printf '%s\\n' "$tailterm_size_reply"; fi; ` +
+        `if [ "$tailterm_size_reply" = incomplete ]; then printf 'tmux did not finish reading the agent pane identity; nothing was sized.\\n' >&2; exit 75; fi; ` +
+        `exit "$tailterm_size_status"`,
     )
   );
 }
