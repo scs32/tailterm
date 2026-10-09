@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -503,5 +504,91 @@ func TestClaudeUsageCaptureKeepsGoodReadingWithoutRateLimits(t *testing.T) {
 		if strings.HasSuffix(entry.Name(), ".tmp") {
 			t.Errorf("the capture command left a temporary file: %s", entry.Name())
 		}
+	}
+}
+
+// A status line JSON whose rate limit window is present but unusable is not
+// written: the last good capture stays byte for byte, one good window beside
+// an unusable one included. Whatever the reader would call malformed, the
+// command does not save.
+func TestClaudeUsageCaptureKeepsGoodReadingWithUnusableWindow(t *testing.T) {
+	path := captureHome(t)
+	run := runCaptureScript(t)
+	run(`{"version":"2.1.292","rate_limits":{"five_hour":{"used_percentage":13,"resets_at":1791470000},"seven_day":{"used_percentage":37,"resets_at":1791970000}}}`)
+	good := readClaudeUsageCapture(path)
+	if good.State != api.ProviderUsageOK || len(good.Windows) != 2 {
+		t.Fatalf("the first capture: %+v", good)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noTemp := func(input string) {
+		t.Helper()
+		entries, _ := os.ReadDir(filepath.Dir(path))
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".tmp") {
+				t.Errorf("after %s the capture command left a temporary file: %s", input, entry.Name())
+			}
+		}
+	}
+	const goodWindow = `{"used_percentage":50,"resets_at":1791480000}`
+	for name, limits := range map[string]string{
+		"window null":                      `{"five_hour":null}`,
+		"window a number":                  `{"five_hour":7}`,
+		"window a list":                    `{"seven_day":[1]}`,
+		"window a string":                  `{"five_hour":"13"}`,
+		"no used_percentage":               `{"five_hour":{"resets_at":1791470000}}`,
+		"used_percentage null":             `{"five_hour":{"used_percentage":null,"resets_at":1791470000}}`,
+		"used_percentage a string":         `{"five_hour":{"used_percentage":"13","resets_at":1791470000}}`,
+		"used_percentage a boolean":        `{"five_hour":{"used_percentage":true,"resets_at":1791470000}}`,
+		"used_percentage NaN":              `{"five_hour":{"used_percentage":NaN,"resets_at":1791470000}}`,
+		"used_percentage below 0":          `{"five_hour":{"used_percentage":-1,"resets_at":1791470000}}`,
+		"used_percentage above 100":        `{"seven_day":{"used_percentage":100.5,"resets_at":1791970000}}`,
+		"used_percentage too large":        `{"five_hour":{"used_percentage":1e999,"resets_at":1791470000}}`,
+		"no resets_at":                     `{"five_hour":{"used_percentage":13}}`,
+		"resets_at null":                   `{"five_hour":{"used_percentage":13,"resets_at":null}}`,
+		"resets_at a string":               `{"five_hour":{"used_percentage":13,"resets_at":"2026-10-09T12:00:00Z"}}`,
+		"resets_at zero":                   `{"five_hour":{"used_percentage":13,"resets_at":0}}`,
+		"resets_at negative":               `{"five_hour":{"used_percentage":13,"resets_at":-5}}`,
+		"resets_at in milliseconds":        `{"five_hour":{"used_percentage":13,"resets_at":1791470000000}}`,
+		"good five_hour, null seven_day":   `{"five_hour":` + goodWindow + `,"seven_day":null}`,
+		"good seven_day, broken five_hour": `{"five_hour":{"used_percentage":13},"seven_day":` + goodWindow + `}`,
+		"good five_hour, seven_day over":   `{"five_hour":` + goodWindow + `,"seven_day":{"used_percentage":101,"resets_at":1791970000}}`,
+	} {
+		input := `{"version":"2.1.292","rate_limits":` + limits + `}`
+		run(input)
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readClaudeUsageCapture(path); got.State != api.ProviderUsageOK || !got.CapturedAt.Equal(good.CapturedAt) || string(after) != string(before) {
+			t.Errorf("%s: after %s the capture reads %+v, file %s; want the first good reading %s", name, input, got, after, before)
+			if err := os.WriteFile(path, before, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		noTemp(input)
+	}
+	rfc := func(epoch int64) string { return time.Unix(epoch, 0).UTC().Format(time.RFC3339) }
+	// A reading the reader accepts is still written: both windows, one
+	// window alone, fractional figures, and fields the reader does not use.
+	for name, c := range map[string]struct {
+		limits string
+		want   []api.ProviderUsageWindow
+	}{
+		"both windows":    {`{"five_hour":{"used_percentage":21,"resets_at":1791471000},"seven_day":{"used_percentage":0,"resets_at":1791971000}}`, []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 21, ResetsAt: rfc(1791471000)}, {Window: api.UsageWindowSevenDay, UsedPercent: 0, ResetsAt: rfc(1791971000)}}},
+		"five_hour alone": {`{"five_hour":{"used_percentage":100,"resets_at":1791472000}}`, []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 100, ResetsAt: rfc(1791472000)}}},
+		"seven_day alone": {`{"seven_day":{"used_percentage":64,"resets_at":1791973000}}`, []api.ProviderUsageWindow{{Window: api.UsageWindowSevenDay, UsedPercent: 64, ResetsAt: rfc(1791973000)}}},
+		"fractional":      {`{"five_hour":{"used_percentage":12.25,"resets_at":1791474000.5},"seven_day":{"used_percentage":37.5,"resets_at":1791974000}}`, []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 12.25, ResetsAt: rfc(1791474000)}, {Window: api.UsageWindowSevenDay, UsedPercent: 37.5, ResetsAt: rfc(1791974000)}}},
+		"unused fields":   {`{"five_hour":{"used_percentage":5,"resets_at":1791475000,"label":"x"},"other":"y"}`, []api.ProviderUsageWindow{{Window: api.UsageWindowFiveHour, UsedPercent: 5, ResetsAt: rfc(1791475000)}}},
+	} {
+		input := `{"version":"2.1.292","rate_limits":` + c.limits + `}`
+		run(input)
+		got := readClaudeUsageCapture(path)
+		if got.State != api.ProviderUsageOK || got.Version != "2.1.292" || !reflect.DeepEqual(got.Windows, c.want) {
+			t.Errorf("%s: after %s the capture reads %+v, want ok with %+v", name, input, got, c.want)
+		}
+		noTemp(input)
 	}
 }

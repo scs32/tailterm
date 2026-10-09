@@ -135,8 +135,11 @@ installs a capture-only status line:
 - the command `~/.local/bin/tt-claude-usage-capture` (mode 755), which reads
   the status line JSON on stdin, saves `capturedAt`, `rate_limits` and
   `version` to `~/.local/state/tailterm/claude-usage.json`, and prints
-  nothing, so no status line shows. Input without a `five_hour` or `seven_day`
-  rate limit window leaves the file as it was;
+  nothing, so no status line shows. Of `rate_limits` it saves the
+  `used_percentage` and `resets_at` of the `five_hour` and `seven_day`
+  windows. Input without either window, or with a window that is present but
+  unusable (not an object, `used_percentage` not a number from 0 to 100, or
+  `resets_at` not a plausible time in seconds), leaves the file as it was;
 - the `statusLine` entry in `~/.claude/settings.json` (or
   `$CLAUDE_CONFIG_DIR`): `{"type":"command","command":"<home>/.local/bin/tt-claude-usage-capture"}`.
 

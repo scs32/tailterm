@@ -32,8 +32,11 @@ const claudeUsageCaptureName = "tt-claude-usage-capture"
 // status line JSON on stdin, saves the rate limit fields atomically and
 // prints nothing, so no status line shows. Input with no rate limits (a
 // session before its first response) leaves the last capture as it is, so
-// one such session never replaces a good reading with an unusable one. It
-// never fails Claude Code.
+// one such session never replaces a good reading with an unusable one. So
+// does input with a window that is present but unusable: the command applies
+// the reader's rule (readClaudeUsageCapture) and saves only the two fields
+// of each window the reader uses, so it writes nothing the reader would call
+// malformed. It never fails Claude Code.
 const claudeUsageCaptureScript = `#!/bin/sh
 # Tailterm capture-only Claude Code status line (installed by tt host setup).
 # Reads the status line JSON on stdin and saves the account rate limit fields
@@ -52,9 +55,25 @@ except Exception:
 if not isinstance(j,dict):
     sys.exit(0)
 r=j.get("rate_limits")
-if not isinstance(r,dict) or not ("five_hour" in r or "seven_day" in r):
+if not isinstance(r,dict):
     sys.exit(0)
-json.dump({"capturedAt":int(time.time()),"rate_limits":j.get("rate_limits"),"version":j.get("version")},sys.stdout)
+def num(v):
+    return isinstance(v,(int,float)) and not isinstance(v,bool)
+out={}
+for k in ("five_hour","seven_day"):
+    if k not in r:
+        continue
+    w=r[k]
+    if not isinstance(w,dict):
+        sys.exit(0)
+    u=w.get("used_percentage"); t=w.get("resets_at")
+    if not num(u) or not num(t) or not 0<=u<=100 or not 0<t<1e11:
+        sys.exit(0)
+    out[k]={"used_percentage":u,"resets_at":t}
+if not out:
+    sys.exit(0)
+v=j.get("version")
+json.dump({"capturedAt":int(time.time()),"rate_limits":out,"version":v if isinstance(v,str) else None},sys.stdout)
 ' > "$T" 2>/dev/null && [ -s "$T" ] && mv -f "$T" "$F" 2>/dev/null
 rm -f "$T" 2>/dev/null
 exit 0
@@ -91,7 +110,9 @@ type claudeUsageReading struct {
 // the named state that makes the file unusable: missing, unreadable, or
 // malformed (not JSON, no capture time, no rate_limits, or a window without a
 // numeric used_percentage from 0 to 100 and a resets_at). At least one of the
-// two windows must be present; a window that is present must be whole.
+// two windows must be present; a window that is present must be whole. The
+// capture command checks the same rule before it writes, so a malformed file
+// is one something else wrote or damaged.
 func readClaudeUsageCapture(path string) claudeUsageReading {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
