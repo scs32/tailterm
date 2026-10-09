@@ -656,14 +656,19 @@ func relayTeamHeld(ctx context.Context, c *api.Client, b runtimeBinding, a api.A
 const relayHeldRetry = time.Minute
 
 // relayHeldRecheck is the least time between holds reads for a binding that
-// is remembered as held while its agent has nothing unread. With unread input
-// the inbox attempt reads the hold itself; with none, this read is the only
-// way the relay learns the hold was continued, so that the stall pass resumes.
+// is remembered as held while its agent has nothing the inbox path delivers:
+// nothing unread, or only unread mail that path leaves alone (messages broker
+// wake jobs deliver, its own posts, hub notices). With unread input the inbox
+// path delivers, the inbox attempt reads the hold itself; without, this read
+// is the only way the relay learns the hold was continued, so that the stall
+// pass resumes.
 const relayHeldRecheck = 5 * time.Minute
 
 // relayHeldRecheckDue makes that read when it is due and forgets the hold on
 // the first answer that says not held. It decides no wake. A failed read
-// counts as made: the next one waits the same five minutes.
+// counts as made: the next one waits the same five minutes. Both returns of
+// relayOne that make no inbox attempt call it: nothing unread, and an unread
+// page with nothing the inbox path delivers.
 func relayHeldRecheckDue(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, p *relayProgress, now time.Time) error {
 	if !p.TeamHeld || now.Sub(p.HeldChecked) < relayHeldRecheck {
 		return nil
@@ -919,7 +924,10 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		// unsafe attempts with their sequences, and an unsafe one returns the
 		// message to this path.
 		p.Through = max(p.Through, through)
-		return nil
+		// No inbox attempt reads the hold here either, so a remembered hold
+		// is asked about again as it is with nothing unread: a stalled turn
+		// usually leaves such mail unread.
+		return relayHeldRecheckDue(ctx, c, b, a, p, now)
 	}
 	seqs := wakeSeqsFor(eligibleMsgs, b.Agent, deployers)
 	p.LastAttempt = now

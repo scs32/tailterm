@@ -2682,3 +2682,133 @@ func TestRelayHoldRecheck(t *testing.T) {
 		t.Fatalf("a role agent remembered as held: %d holds reads, held %v, queued %q", holds, old.TeamHeld, queued)
 	}
 }
+
+// h1, h2 (wi_42d04ab3c5f392df): a binding remembered as held whose agent has
+// unread mail, none of which the inbox path delivers, makes no inbox attempt,
+// so the same spaced read asks about the hold: none before five minutes, one
+// at five minutes, a failed read spaced the same way, and the first answer
+// that says not held turns the stall pass back on. The read queues nothing,
+// and progress through the page is saved, also when the read fails.
+func TestRelayHoldRecheckWithOnlyUndeliveredUnread(t *testing.T) {
+	const teammate = "agt_00000000000000bb"
+	for _, tc := range []struct {
+		name string
+		// broker: the binding's obligations are woken by broker wake jobs.
+		broker bool
+		unread func(b runtimeBinding) []api.Message
+	}{
+		{"own post and hub notice", false, func(b runtimeBinding) []api.Message {
+			return []api.Message{
+				{Seq: 42, From: api.Sender{AgentID: b.Agent}, Text: "Progress posted by the held agent"},
+				{Seq: 43, To: b.Agent, From: api.Sender{Node: api.BrokerNode}, Text: "A hub notice"},
+			}
+		}},
+		{"broker-covered kind", true, func(b runtimeBinding) []api.Message {
+			return []api.Message{
+				{Seq: 42, To: b.Agent, From: api.Sender{AgentID: teammate}, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, Subject: "A request the broker wake job delivers"}},
+				{Seq: 43, To: b.Agent, From: api.Sender{AgentID: teammate}, Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A notice the broker wake job delivers"}},
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, hub, c, _ := needsInputFixture(t)
+			ctx := context.Background()
+			now := time.Date(2026, 10, 9, 19, 0, 0, 0, time.UTC)
+			var queued []string
+			queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+				queued = append(queued, prompt)
+				return nil
+			}
+			p := relayProgress{Run: b.Run, Thread: b.Thread, BrokerWakes: tc.broker}
+			// pass runs one inbox pass and returns its holds reads.
+			pass := func(what string) int {
+				t.Helper()
+				if err := relayOne(ctx, b, &p, c, now, queue); err != nil {
+					t.Fatalf("%s: %v", what, err)
+				}
+				holds, _ := holdCalls(hub.takeCalls())
+				return holds
+			}
+			// The team is held and one message is withheld.
+			hub.update(func(h *needsInputHub) {
+				h.heldRun = b.Run
+				h.agent.ReadUpTo, h.agent.Unread = 40, 1
+				h.messages = append(h.messages, api.Message{Seq: 41, To: b.Agent, From: api.Sender{Node: "workspace", User: "owner"}})
+			})
+			hub.takeCalls()
+			if holds := pass("withheld attempt"); holds != 1 || !p.TeamHeld || p.Skip == nil || p.Skip.Reason != relayTeamHeldReason || relayStallPassDue(b, p) || p.Through >= 41 {
+				t.Fatalf("withheld attempt: %d holds reads, progress %+v", holds, p)
+			}
+			withheld := now
+			// The agent's running turn reads the withheld message. What is
+			// unread after it is only mail the inbox path does not deliver.
+			hub.update(func(h *needsInputHub) {
+				h.agent.ReadUpTo, h.agent.Unread = 41, 2
+				h.messages = append(h.messages, tc.unread(b)...)
+			})
+			for _, wait := range []time.Duration{time.Second, relayHeldRetry, relayHeldRecheck - time.Second} {
+				now = withheld.Add(wait)
+				if holds := pass(wait.String() + " after the holds read"); holds != 0 || !p.TeamHeld || relayStallPassDue(b, p) || len(queued) != 0 {
+					t.Fatalf("%s after the holds read: %d holds reads, held %v, queued %q", wait, holds, p.TeamHeld, queued)
+				}
+			}
+			// The page was read and found to hold nothing to deliver: progress
+			// through it is saved without a holds read.
+			if p.Through != 43 {
+				t.Fatalf("progress through the page = %d, want 43", p.Through)
+			}
+			// At five minutes: one read. Still held, so the stall pass stays
+			// off and no further read is made for another five minutes.
+			now = withheld.Add(relayHeldRecheck)
+			if holds := pass("the first re-check"); holds != 1 || !p.TeamHeld || relayStallPassDue(b, p) || p.Skip == nil || p.Skip.Reason != relayTeamHeldReason || !p.HeldChecked.Equal(now) {
+				t.Fatalf("the first re-check, still held: %d holds reads, progress %+v", holds, p)
+			}
+			checked := now
+			for _, wait := range []time.Duration{time.Minute, relayHeldRecheck - time.Second} {
+				now = checked.Add(wait)
+				if holds := pass(wait.String() + " after the re-check"); holds != 0 || !p.TeamHeld {
+					t.Fatalf("%s after a re-check that said held: %d holds reads, held %v", wait, holds, p.TeamHeld)
+				}
+			}
+			// The owner continues the hold. Before the next re-check is due
+			// the relay has not asked, so the stall pass is still off.
+			hub.update(func(h *needsInputHub) { h.heldRun = "" })
+			if holds := pass("continued, before the re-check is due"); holds != 0 || relayStallPassDue(b, p) {
+				t.Fatalf("continued, before the re-check is due: %d holds reads, stall pass due %v", holds, relayStallPassDue(b, p))
+			}
+			// A failed read counts as made, and the page read before it is
+			// not lost: one more own post arrives and progress covers it.
+			hub.update(func(h *needsInputHub) {
+				h.holdsStatus = http.StatusInternalServerError
+				h.agent.Unread = 3
+				h.messages = append(h.messages, api.Message{Seq: 44, From: api.Sender{AgentID: b.Agent}, Text: "Another post by the held agent"})
+			})
+			now = checked.Add(relayHeldRecheck)
+			if err := relayOne(ctx, b, &p, c, now, queue); err == nil {
+				t.Fatal("a failing re-check did not fail the pass")
+			}
+			if holds, _ := holdCalls(hub.takeCalls()); holds != 1 || !p.TeamHeld || p.Through != 44 {
+				t.Fatalf("a failing re-check: %d holds reads, held %v, through %d", holds, p.TeamHeld, p.Through)
+			}
+			hub.update(func(h *needsInputHub) { h.holdsStatus = 0 })
+			failed := now
+			now = failed.Add(relayHeldRecheck - time.Second)
+			if holds := pass("inside five minutes of a failed re-check"); holds != 0 || !p.TeamHeld || relayStallPassDue(b, p) {
+				t.Fatalf("inside five minutes of a failed re-check: %d holds reads, held %v", holds, p.TeamHeld)
+			}
+			// At five minutes: exactly one read, the hold is forgotten with
+			// its skip and spacing, the stall pass is due, nothing was queued.
+			now = failed.Add(relayHeldRecheck)
+			if holds := pass("the re-check after continue"); holds != 1 || p.TeamHeld || !p.NextHeldAttempt.IsZero() || !p.HeldChecked.IsZero() || p.Skip != nil || !relayStallPassDue(b, p) || len(queued) != 0 || p.Through != 44 {
+				t.Fatalf("the re-check after continue: %d holds reads, queued %q, progress %+v", holds, queued, p)
+			}
+			// It stops there: the same unread mail makes no holds read again.
+			for _, wait := range []time.Duration{time.Second, relayHeldRecheck, 3 * relayHeldRecheck} {
+				now = now.Add(wait)
+				if holds := pass("after the hold is forgotten"); holds != 0 || p.TeamHeld || len(queued) != 0 {
+					t.Fatalf("%s after the hold is forgotten: %d holds reads, queued %q", wait, holds, queued)
+				}
+			}
+		})
+	}
+}
