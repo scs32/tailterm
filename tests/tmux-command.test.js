@@ -905,6 +905,21 @@ test(
   },
 );
 
+// The static browser suite's SSH stand-in finds the session of an attach by
+// this exact comparison, so the by-name lookup has to keep printing it.
+test("an attach by name still names its session the way the browser stand-in reads it", () => {
+  for (const command of [
+    tmuxCommand("sizer", "", true),
+    tmuxCommand("sizer", "", true, undefined, "", { ignoreSize: true }),
+  ])
+    assert.equal(
+      command
+        .replace(/'\\''/g, "'")
+        .match(/"\$tailterm_tmux_name" = '([^']+)'/)?.[1],
+      "sizer",
+    );
+});
+
 test("a hung tmux command fails fast and names the command", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "tailterm-hung-"));
   const socket = dir + "/socket",

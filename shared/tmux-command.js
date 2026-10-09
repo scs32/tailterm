@@ -345,7 +345,7 @@ function exactSession(name) {
     rereadWhile(
       "tailterm_tmux_target",
       "cut",
-      `tailterm_tmux_target=$("$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_id}' | { tailterm_tmux_cut=; while IFS= read -r tailterm_tmux_row; do tailterm_tmux_field=\${tailterm_tmux_row##*|}; if ${digitsAfter("\\$")}; then if [ "$tailterm_tmux_row" = ${shellQuote(name)}"|$tailterm_tmux_field" ]; then printf '%s' "$tailterm_tmux_field"; exit 0; fi; else tailterm_tmux_cut=cut; fi; done; printf '%s' "$tailterm_tmux_cut"; })`,
+      `tailterm_tmux_target=$("$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_id}' | { tailterm_tmux_cut=; while IFS= read -r tailterm_tmux_row; do tailterm_tmux_name=\${tailterm_tmux_row%|*}; tailterm_tmux_field=\${tailterm_tmux_row##*|}; if ${digitsAfter("\\$")}; then if [ "$tailterm_tmux_name" = ${shellQuote(name)} ]; then printf '%s' "$tailterm_tmux_field"; exit 0; fi; else tailterm_tmux_cut=cut; fi; done; printf '%s' "$tailterm_tmux_cut"; })`,
     ) +
     `if [ "$tailterm_tmux_target" = cut ]; then ${UNREAD_IDENTITY}; fi; ` +
     `if [ -z "$tailterm_tmux_target" ]; then printf 'That tmux session no longer exists. Start a new session from the launcher.\\n' >&2; exit 1; fi; `
