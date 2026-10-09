@@ -1859,3 +1859,146 @@ func TestTeamQueueCLIWaitSetListAndClear(t *testing.T) {
 		t.Fatalf("conflicting wait set: %v", err)
 	}
 }
+
+// q1, q2 (wi_09e8be006c508126): a requeue without --cwd copies the failed
+// entry's checkout and base, so the CLI refuses a checkout that was cleaned, a
+// checkout it cannot check from another host, and a base that is not the
+// checkout's HEAD. Each refusal queues nothing; --cwd DIR is the fix it names.
+func TestTeamQueueCLIRequeueChecksCopiedCheckoutAndBase(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, base := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		output, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture"}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v %s", args, err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+	// failedEntry queues an item on host in its own worktree at the base
+	// commit, then fails and releases the entry.
+	failedEntry := func(key, item string, order int64, host string) api.TeamQueueEntry {
+		t.Helper()
+		worktree := filepath.Join(repo, ".build", "worktrees", key)
+		git(repo, "worktree", "add", "-q", "--detach", worktree, base)
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key + "-add", Operation: "add", ItemID: item, OrderMessageSeq: order, Host: host, Cwd: worktree, Repository: filepath.Join(repo, ".git"), BaseCommit: base, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key + "-fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+			t.Fatal(err)
+		}
+		if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	requeue := func(q api.TeamQueueEntry, extra ...string) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error {
+			return cmdTeamQueue(f.e, append([]string{"requeue", "--entry", q.ID}, extra...))
+		})
+	}
+	attempts := func(item string) []api.TeamQueueEntry {
+		t.Helper()
+		list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found []api.TeamQueueEntry
+		for _, e := range list.Entries {
+			if e.ItemID == item {
+				found = append(found, e)
+			}
+		}
+		return found
+	}
+	refused := func(why string, q api.TeamQueueEntry, err error, wants ...string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: the requeue was accepted", why)
+		}
+		for _, want := range wants {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("%s: %q lacks %q", why, err, want)
+			}
+		}
+		if got := attempts(q.ItemID); len(got) != 1 || got[0].ID != q.ID {
+			t.Fatalf("%s queued an attempt: %+v", why, got)
+		}
+	}
+
+	// Another host cannot check the checkout, with or without it on disk.
+	elsewhereItem, elsewhereOrder := queueFixtureItem(t, f, "requeue-elsewhere")
+	elsewhere := failedEntry("queue-elsewhere", elsewhereItem.ID, elsewhereOrder, "another-host")
+	_, err := requeue(elsewhere)
+	refused("another host", elsewhere, err, "launches on another-host", "requeue it from another-host", "or pass --cwd DIR there")
+
+	// The copied checkout exists, but its HEAD moved past the copied base.
+	q := failedEntry("queue-main", f.item.ID, f.order, spawn.Host())
+	git(q.Cwd, "commit", "-q", "--allow-empty", "-m", "moved")
+	moved := git(q.Cwd, "rev-parse", "HEAD")
+	_, err = requeue(q)
+	refused("HEAD differs from the base", q, err, "base "+base, "HEAD "+moved, "pass --cwd "+q.Cwd)
+
+	// The copied checkout was cleaned.
+	git(repo, "worktree", "remove", "--force", q.Cwd)
+	_, err = requeue(q)
+	refused("checkout removed", q, err, q.Cwd+" is not a directory", "create a fresh worktree and pass --cwd DIR", "takes its HEAD as the base")
+
+	// A directory at that path which is not a checkout has no HEAD to compare.
+	if err := os.MkdirAll(q.Cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(q.Cwd, ".git"), []byte("gitdir: /nonexistent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = requeue(q)
+	refused("checkout is not a worktree", q, err, "has no readable HEAD", "pass --cwd DIR")
+	if err := os.RemoveAll(q.Cwd); err != nil {
+		t.Fatal(err)
+	}
+	git(repo, "worktree", "prune")
+
+	// Recreated at the copied base, the checkout and base are kept.
+	git(repo, "worktree", "add", "-q", "--detach", q.Cwd, base)
+	out, err := requeue(q)
+	if err != nil || !strings.HasPrefix(out, "requeue ") {
+		t.Fatalf("requeue with HEAD at the base: %q %v", out, err)
+	}
+	got := attempts(q.ItemID)
+	if len(got) != 2 {
+		t.Fatalf("attempts after the requeue: %+v", got)
+	}
+	for _, e := range got {
+		if e.ID != q.ID && (e.RetryOf != q.ID || e.Attempt != 2 || e.Cwd != q.Cwd || e.BaseCommit != base) {
+			t.Fatalf("requeued attempt %+v", e)
+		}
+	}
+
+	// --cwd is the named fix: it replaces a cleaned checkout and takes the
+	// new checkout's HEAD as the base.
+	cleanedItem, cleanedOrder := queueFixtureItem(t, f, "requeue-cleaned")
+	cleaned := failedEntry("queue-cleaned", cleanedItem.ID, cleanedOrder, spawn.Host())
+	git(repo, "worktree", "remove", "--force", cleaned.Cwd)
+	_, err = requeue(cleaned)
+	refused("second checkout removed", cleaned, err, "is not a directory")
+	fresh := filepath.Join(repo, ".build", "worktrees", "queue-fresh")
+	git(repo, "worktree", "add", "-q", "--detach", fresh, moved)
+	if out, err = requeue(cleaned, "--cwd", fresh); err != nil {
+		t.Fatalf("requeue with --cwd: %q %v", out, err)
+	}
+	for _, e := range attempts(cleaned.ItemID) {
+		if e.ID != cleaned.ID && (e.RetryOf != cleaned.ID || e.Cwd != fresh || e.BaseCommit != moved) {
+			t.Fatalf("attempt requeued with --cwd %+v", e)
+		}
+	}
+	if got := attempts(cleaned.ItemID); len(got) != 2 {
+		t.Fatalf("attempts after --cwd: %+v", got)
+	}
+}

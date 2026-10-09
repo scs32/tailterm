@@ -1387,10 +1387,31 @@ Preconditions, each refused with a 409 naming the entry:
 The attempt copies the failed entry's order, template, host, checkout,
 repository, ownership and base commit unless a flag overrides them. `--cwd DIR`
 names another checkout of the same repository on the launch host and takes its
-HEAD as the base. The attempt passes the same checks as `add`: a `small`
-attempt needs a bug and at most three owned paths, and `--template planned`
-retries a failed small entry as Planned delivery. The owner's unbound CLI or
-any available database handler may requeue.
+HEAD as the base.
+
+Without `--cwd`, an entry with a repository keeps its checkout and base, so
+the CLI checks both before it asks the hub, and a refusal queues nothing:
+
+- Run on the entry's launch host, it refuses when the copied checkout is not a
+  directory (a worktree cleaned after the failed attempt): `entry tqe_ID's
+  checkout DIR is not a directory; create a fresh worktree and pass --cwd DIR,
+  which also takes its HEAD as the base`. A directory with no readable HEAD is
+  refused with the same fix.
+- Run from another host, it cannot check the checkout and refuses: `entry
+  tqe_ID launches on HOST, so its checkout DIR cannot be checked from this
+  host; requeue it from HOST, or pass --cwd DIR there to name a fresh
+  worktree`.
+- When the checkout exists but its HEAD is not the copied base (the worktree
+  was recreated or moved on since the failed attempt), it refuses and names
+  both commits: `entry tqe_ID's base BASE is not the HEAD HEAD of its
+  checkout; pass --cwd DIR to take that HEAD as the base`. A running entry's
+  base cannot be changed, so a stale one is stopped here. When HEAD equals the
+  base, the requeue proceeds and keeps both.
+
+An entry with no repository is not checked. The attempt passes the same checks
+as `add`: a `small` attempt needs a bug and at most three owned paths, and
+`--template planned` retries a failed small entry as Planned delivery. The
+owner's unbound CLI or any available database handler may requeue.
 
 `tt team queue add` and a manual team launch still take only an item's first
 entry. For an item that already has one they are refused naming it, for

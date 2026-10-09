@@ -701,8 +701,25 @@ func cmdTeamQueue(e env, args []string) error {
 						return err
 					}
 				}
-			} else if len(ownership) > 0 && q.Repository != "" && q.Cwd != "" {
-				if _, statErr := os.Stat(q.Cwd); statErr == nil {
+			} else if q.Repository != "" && q.Cwd != "" {
+				// The attempt would copy the failed entry's checkout and base.
+				// A checkout that was cleaned fails the launch, and a base
+				// behind the checkout's HEAD cannot be changed once the team
+				// is admitted, so both are refused before the hub call.
+				if q.Host != spawn.Host() {
+					return fmt.Errorf("entry %s launches on %s, so its checkout %s cannot be checked from this host; requeue it from %s, or pass --cwd DIR there to name a fresh worktree", q.ID, q.Host, q.Cwd, q.Host)
+				}
+				if info, statErr := os.Stat(q.Cwd); statErr != nil || !info.IsDir() {
+					return fmt.Errorf("entry %s's checkout %s is not a directory; create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd)
+				}
+				head, headErr := queueGitCommit(q.Cwd)
+				if headErr != nil {
+					return fmt.Errorf("entry %s's checkout %s has no readable HEAD (%v); create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd, headErr)
+				}
+				if head != q.BaseCommit {
+					return fmt.Errorf("entry %s's base %s is not the HEAD %s of its checkout; pass --cwd %s to take that HEAD as the base", q.ID, q.BaseCommit, head, q.Cwd)
+				}
+				if len(ownership) > 0 {
 					if _, scopeErr := queueRepositoryScope(q.Cwd, ownership); scopeErr != nil {
 						return scopeErr
 					}
