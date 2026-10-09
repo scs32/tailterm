@@ -536,8 +536,8 @@ test("store race checks name the sharded matrix command", () => {
   assert.equal(count(small.lead, full), 0);
 
   // A store race command is the sentence around a -race flag, up to the next
-  // one, when it names the store package. It is refused without the shard flag
-  // or with a timeout under 45 minutes.
+  // one, when it names the store package or ./..., which includes it. It is
+  // refused without the shard flag or with a timeout under 45 minutes.
   const unsafe = (text) => {
     const found = [];
     for (const line of text.split("\n"))
@@ -547,7 +547,7 @@ test("store race checks name the sharded matrix command", () => {
         const command = line.slice(start, next < 0 ? line.length : next);
         const timeout = /-timeout[= ](\d+)m/.exec(command);
         if (
-          command.includes("./internal/store") &&
+          (command.includes("./internal/store") || command.includes("./...")) &&
           (!command.includes("-shards=./internal/store=") || !timeout || Number(timeout[1]) < 45)
         )
           found.push(command.trim());
@@ -560,6 +560,10 @@ test("store race checks name the sharded matrix command", () => {
   assert.equal(unsafe("node ../scripts/verify-matrix.mjs go-race -timeout=30m -shards=./internal/store=4 ./internal/store").length, 1);
   assert.equal(unsafe("Run go test -timeout 60m -race ./internal/store").length, 1);
   assert.equal(unsafe(`${full} Then go test -race -timeout 30m ./internal/store`).length, 1);
+  assert.equal(unsafe(`Run go test -race -timeout 30m ./internal/store. ${full}`).length, 1);
+  assert.equal(unsafe("Run go test -race ./...").length, 1);
+  assert.equal(unsafe("Run go test -race -timeout 30m ./...").length, 1);
+  assert.equal(unsafe(`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=${shards} ./...`).length, 0);
   assert.equal(unsafe("Run go test -race ./cmd/tt").length, 0);
   assert.equal(unsafe(full).length, 0);
   const texts = [
