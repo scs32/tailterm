@@ -710,6 +710,224 @@ func TestRuntimePromptAnswer(t *testing.T) {
 	})
 }
 
+// policyReads makes every policy read answer status while *status is not
+// zero, and returns the count of policy reads the hub received.
+func (r *promptRig) policyReads(status *int) *int {
+	reads := new(int)
+	r.override = func(w http.ResponseWriter, req *http.Request) bool {
+		if req.Method != "GET" || !strings.HasSuffix(req.URL.Path, "/runtime-prompt/policy") {
+			return false
+		}
+		*reads++
+		if *status == 0 {
+			return false
+		}
+		http.Error(w, `{"error":"fixture"}`, *status)
+		return true
+	}
+	return reads
+}
+
+// TestRuntimePromptPolicyRead: a failed policy read decides nothing for a
+// kind the policy can change, and the next good read decides the same open
+// prompt; an older hub's missing policy is read once a minute, not every tick
+// (bug wi_4768f081ea8d3aa9 p1, p2).
+func TestRuntimePromptPolicyRead(t *testing.T) {
+	const retrying = "policy unavailable; retrying"
+	t.Run("transient error then answer", func(t *testing.T) {
+		r := newPromptRig(t, "codex")
+		r.transcript(r.clock.Add(-30*time.Second), false)
+		r.menu("runtime-prompt/codex-rate-limit.reconstructed.ansi", "runtime-prompt/codex-idle-composer.ansi")
+		status := http.StatusInternalServerError
+		reads := r.policyReads(&status)
+		var first *api.RuntimePrompt
+		logged, err := captureRelayOutput(t, true, func() error {
+			for i := 0; i < 3; i++ {
+				before := *reads
+				got := r.tick()
+				if got.State != "runtime_prompt" || got.Prompt == nil || got.Prompt.Outcome != api.RuntimePromptSkipped || got.Prompt.Reason != retrying {
+					t.Fatalf("tick %d: activity %+v prompt %+v", i+1, got, got.Prompt)
+				}
+				if *reads == before {
+					t.Fatalf("tick %d made no policy read; a failed read was cached", i+1)
+				}
+				if first == nil {
+					first = got.Prompt
+				}
+			}
+			return nil
+		})
+		if err != nil || strings.Count(logged, "policy unavailable; retrying: ") != 1 {
+			t.Errorf("outage log %q %v, want one policy line", logged, err)
+		}
+		seen := loadRuntimePromptLocal(r.b).Seen[first.Fingerprint]
+		if seen.Outcome != api.RuntimePromptSkipped || seen.Attempted || len(r.keys) != 0 || r.ownerNotices() != 0 {
+			t.Fatalf("outage saved %+v, keys %v, owner notices %d", seen, r.keys, r.ownerNotices())
+		}
+		status = 0
+		got := r.tick()
+		if strings.Join(r.keys, ",") != "Down,Down,Enter" || got.Prompt == nil || got.Prompt.Outcome != api.RuntimePromptConfirmed ||
+			got.Prompt.Action != api.RuntimePromptKeepCurrentNeverShow || got.Prompt.Fingerprint != first.Fingerprint || !got.Prompt.Since.Equal(first.Since) {
+			t.Fatalf("after the read worked: keys %v prompt %+v, first %+v", r.keys, got.Prompt, first)
+		}
+		if r.ownerNotices() != 0 {
+			t.Errorf("owner notices %d, want 0", r.ownerNotices())
+		}
+	})
+	// The same open prompt under each non-answering policy action.
+	for _, tc := range []struct {
+		name, kind, fixture, action, outcome string
+		notices                              int
+	}{
+		{"transient error then report", api.RuntimePromptCodexTrust, "runtime-prompt/codex-trust.ansi", api.RuntimePromptReport, api.RuntimePromptReported, 0},
+		{"transient error then escalate", api.RuntimePromptCodexRateLimit, "runtime-prompt/codex-rate-limit.reconstructed.ansi", api.RuntimePromptEscalate, api.RuntimePromptEscalated, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPromptRig(t, "codex")
+			r.policy(tc.kind, tc.action)
+			r.transcript(r.clock.Add(-30*time.Second), false)
+			r.screen = r.fixture(tc.fixture)
+			status := http.StatusBadGateway
+			r.policyReads(&status)
+			first := r.tick().Prompt
+			if first == nil || first.Kind != tc.kind || first.Outcome != api.RuntimePromptSkipped || first.Reason != retrying || r.ownerNotices() != 0 {
+				t.Fatalf("outage prompt %+v, owner notices %d", first, r.ownerNotices())
+			}
+			status = 0
+			got := r.tick().Prompt
+			if got == nil || got.Outcome != tc.outcome || got.Action != tc.action || got.Fingerprint != first.Fingerprint || len(r.keys) != 0 || r.ownerNotices() != tc.notices {
+				t.Fatalf("after the read worked: prompt %+v keys %v owner notices %d", got, r.keys, r.ownerNotices())
+			}
+		})
+	}
+	// No policy can change a kind whose only action is escalate.
+	t.Run("escalate-only kind needs no policy", func(t *testing.T) {
+		r := newPromptRig(t, "claude")
+		r.transcript(r.clock.Add(-30*time.Second), true)
+		r.screen = r.fixture("claude-pane/permission-dialog.ansi")
+		status := http.StatusInternalServerError
+		r.policyReads(&status)
+		got := r.tick()
+		if got.Prompt == nil || got.Prompt.Outcome != api.RuntimePromptEscalated || r.ownerNotices() != 1 || len(r.keys) != 0 {
+			t.Fatalf("permission dialog %+v, owner notices %d, keys %v", got.Prompt, r.ownerNotices(), r.keys)
+		}
+	})
+	for _, old := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		t.Run(fmt.Sprintf("older hub %d is cached", old), func(t *testing.T) {
+			r := newPromptRig(t, "codex")
+			r.transcript(r.clock.Add(-30*time.Second), false)
+			r.menu("runtime-prompt/codex-rate-limit.reconstructed.ansi", "runtime-prompt/codex-idle-composer.ansi")
+			status := old
+			reads := r.policyReads(&status)
+			for i := 0; i < 3; i++ { // 32 s apart in all, inside the minute
+				if got := r.tick(); got.State == "runtime_prompt" || got.Prompt != nil {
+					t.Fatalf("tick %d: older hub reported %+v", i+1, got)
+				}
+			}
+			if *reads != 1 || len(r.keys) != 0 || r.ownerNotices() != 0 {
+				t.Fatalf("policy reads %d, want 1; keys %v, owner notices %d", *reads, r.keys, r.ownerNotices())
+			}
+			r.clock = r.clock.Add(time.Minute)
+			if got := r.tick(); got.Prompt != nil || *reads != 2 {
+				t.Fatalf("after the cache window: prompt %+v, policy reads %d, want 2", got.Prompt, *reads)
+			}
+		})
+	}
+}
+
+// TestRuntimePromptReturn: a fingerprint that comes back in the same run after
+// a confirmed answer is answered again inside the answer limit, and a relay
+// stopped mid-answer still never types (bug wi_4768f081ea8d3aa9 p3).
+func TestRuntimePromptReturn(t *testing.T) {
+	const fixture, idle = "runtime-prompt/codex-rate-limit.reconstructed.ansi", "runtime-prompt/codex-idle-composer.ansi"
+	for _, cleared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("answered again, clearing tick %v", cleared), func(t *testing.T) {
+			r := newPromptRig(t, "codex")
+			r.transcript(r.clock.Add(-30*time.Second), false)
+			var last *api.RuntimePrompt
+			for n := 1; n <= runtimePromptAnswerLimit; n++ {
+				menu := r.menu(fixture, idle)
+				got := r.tick().Prompt
+				if got == nil || got.Outcome != api.RuntimePromptConfirmed || len(r.keys) != 3*n || !menu.intentFirst {
+					t.Fatalf("showing %d: prompt %+v keys %v intentFirst=%v", n, got, r.keys, menu.intentFirst)
+				}
+				if last != nil && (got.Fingerprint != last.Fingerprint || !got.Since.After(last.Since) || !got.At.After(last.At)) {
+					t.Fatalf("showing %d reported %+v, want the fingerprint of %+v with a later since", n, got, last)
+				}
+				last = got
+				if cleared {
+					if next := r.tick(); next.Prompt != nil {
+						t.Fatalf("answered prompt still reported %+v", next.Prompt)
+					}
+				}
+			}
+			// The fourth showing inside five minutes is over the answer limit.
+			r.menu(fixture, idle)
+			over := r.tick().Prompt
+			if over == nil || over.Outcome != api.RuntimePromptSkipped || !strings.Contains(over.Reason, "answer limit") || len(r.keys) != 3*runtimePromptAnswerLimit {
+				t.Fatalf("fourth showing %+v keys %v", over, r.keys)
+			}
+			// It is answered once the window has room again.
+			r.clock = r.clock.Add(runtimePromptAnswerWindow)
+			if got := r.tick().Prompt; got == nil || got.Outcome != api.RuntimePromptConfirmed || len(r.keys) != 3*(runtimePromptAnswerLimit+1) {
+				t.Fatalf("after the window %+v keys %v", got, r.keys)
+			}
+			if r.ownerNotices() != 0 {
+				t.Errorf("owner notices %d, want 0", r.ownerNotices())
+			}
+		})
+	}
+	t.Run("returns under an escalate policy", func(t *testing.T) {
+		r := newPromptRig(t, "codex")
+		r.transcript(r.clock.Add(-30*time.Second), false)
+		r.menu(fixture, idle)
+		if got := r.tick().Prompt; got == nil || got.Outcome != api.RuntimePromptConfirmed {
+			t.Fatalf("first showing %+v", got)
+		}
+		r.tick()
+		r.policy(api.RuntimePromptCodexRateLimit, api.RuntimePromptEscalate)
+		r.menu(fixture, idle)
+		got := r.tick().Prompt
+		if got == nil || got.Outcome != api.RuntimePromptEscalated || got.Action != api.RuntimePromptEscalate || len(r.keys) != 3 || r.ownerNotices() != 1 {
+			t.Fatalf("returned prompt %+v keys %v owner notices %d", got, r.keys, r.ownerNotices())
+		}
+	})
+	t.Run("stopped mid-answer on the return never types", func(t *testing.T) {
+		r := newPromptRig(t, "codex")
+		r.transcript(r.clock.Add(-30*time.Second), false)
+		r.menu(fixture, idle)
+		first := r.tick().Prompt
+		if first == nil || first.Outcome != api.RuntimePromptConfirmed {
+			t.Fatalf("first showing %+v", first)
+		}
+		r.tick()
+		// The relay stops after the first key of the second answer.
+		menu := r.menu(fixture, idle)
+		send := r.deps.send
+		r.deps.send = func(ctx context.Context, pane string, keys ...string) error {
+			_ = send(ctx, pane, keys...)
+			panic("relay stopped")
+		}
+		func() {
+			defer func() { _ = recover() }()
+			r.tick()
+		}()
+		if seen := loadRuntimePromptLocal(r.b).Seen[first.Fingerprint]; !seen.Attempted || seen.Outcome != "" || len(r.keys) != 5 {
+			t.Fatalf("stopped relay saved %+v keys %v", seen, r.keys)
+		}
+		r.deps.send = send
+		menu.entered = false
+		for i := 0; i < 3; i++ {
+			if got := r.tick().Prompt; got == nil || got.Outcome != api.RuntimePromptAmbiguous || len(r.keys) != 5 {
+				t.Fatalf("tick %d after the stop: prompt %+v keys %v", i+1, got, r.keys)
+			}
+		}
+		if r.ownerNotices() != 1 {
+			t.Errorf("owner notices %d, want 1", r.ownerNotices())
+		}
+	})
+}
+
 // TestRuntimePromptTmuxReplay drives the native pane path on a private tmux
 // socket: exact pane identity, process discovery, capture-pane and send-keys.
 // The pane runs testdata/runtime-prompt/replay built under the runtime's
