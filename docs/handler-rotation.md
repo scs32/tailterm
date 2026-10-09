@@ -587,8 +587,17 @@ After 3 failed resumes of one rotation the runner stops resuming it:
   handler being replaced, once per rotation and not per tick. With no owner
   helper registered, that copy goes to the Board. Each names the project, the
   handler, the successor, the host, the number of failed resumes and the last
-  error, with the two recovery commands. The request identities name the
-  rotation, so a restarted relay posts no second notice.
+  error, with the recovery advice for the rotation's state (below).
+- Each notice's request identity names the rotation and its recipient: the
+  owner helper's agent, the handler's agent, or the Board. A restarted relay
+  therefore posts no second copy to anyone. If the recipients changed while
+  it was down, it tells the ones not told before: an owner helper that
+  registered after the Board copy gets its own notice, and when the helper
+  has left, one copy goes to the Board. If the notice would now read
+  differently for a recipient already told (the rotation moved to another
+  state, or the project was renamed), the hub refuses the reused identity
+  and the runner treats that recipient as told; it does not retry. Any other
+  failed post is tried again on a later tick.
 
 The run that prepares the rotation is not a resume, so the successor gets
 four chances in all. A busy refusal and a dead primary refusal are waits and
@@ -596,17 +605,35 @@ are not counted. A successor that comes online on a resume below the ceiling
 commits as usual, and nothing is posted.
 
 Recovery is by hand, on the handler's host, after fixing the launch (the saved
-spec from `tt handler spec`, or the host's capacity):
+spec from `tt handler spec`, or the host's capacity). What a resume does
+depends on how far the rotation got, and the notice gives the advice for that
+state:
 
-```sh
-tt handler rotate --task TASK          # resume the prepared rotation
-tt handler rotate --abort --task TASK  # abort it; the old handler stays primary
-```
+- **The launch was never confirmed** (journal phase `prepared`). A resume
+  launches the successor again, so resume or abort:
 
-Both work after the ceiling. A manual resume that fails again leaves the
-runner stopped and posts nothing more. After an abort, a rotation that is
-still due starts fresh with its own count. While a rotation is stuck, queue
-dispatch still leases neither handler, as for any prepared rotation.
+  ```sh
+  tt handler rotate --task TASK          # resume: launch the successor again
+  tt handler rotate --abort --task TASK  # abort it; the old handler stays primary
+  ```
+
+- **The successor was launched but is not online** (journal phase `spawned`).
+  A resume only waits two minutes for that same session again; it never
+  launches another. Abort the rotation. A rotation that is still due then
+  starts fresh with a new successor, at the runner's next tick or at once:
+
+  ```sh
+  tt handler rotate --abort --task TASK  # abort it; the old handler stays primary
+  tt handler rotate --task TASK          # optional: start the fresh rotation now
+  ```
+
+  A resume finishes this rotation only if that launched session can still
+  come online.
+
+Both commands are accepted after the ceiling. A manual resume that fails again
+leaves the runner stopped and posts nothing more. After an abort, a rotation
+that is still due starts fresh with its own count. While a rotation is stuck,
+queue dispatch still leases neither handler, as for any prepared rotation.
 
 ## API
 

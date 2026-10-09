@@ -1466,9 +1466,10 @@ func (r *rotationRunner) notifyMissingSpec(ctx context.Context, c *api.Client, h
 }
 
 // notifyStuckRotation tells the project's owner helper and the handler being
-// replaced, once each per rotation, that the runner stopped resuming it. The
-// request identities name the rotation, so a restarted relay posts no second
-// notice; a failed post is tried again on a later tick.
+// replaced, once each per rotation, that the runner stopped resuming it. Each
+// request identity names the rotation and its recipient, so a restarted relay
+// posts no second copy to anyone and tells a recipient who was not there
+// before. A failed post is tried again on a later tick.
 func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client, host string, d api.HandlerRotationDue, j *handlerRotationJournal) error {
 	key := "handler-rotation-stuck-" + strings.TrimPrefix(j.PrepareRequestID, "rotation-prepare-")
 	if r.notified[key] {
@@ -1492,15 +1493,43 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 			old = a.Name + " (" + a.ID + ")"
 		}
 	}
-	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. Fix the launch (the saved spec from tt handler spec, or the host's capacity), then resume it on that host with tt handler rotate --task %s, or abort it with tt handler rotate --abort --task %s.",
-		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), d.TaskID, d.TaskID)
-	for i, to := range recipients {
+	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s",
+		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), stuckRotationRecovery(j.Phase, d.TaskID))
+	for _, to := range recipients {
 		env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: rotationStuckSubject,
 			Refs: map[string]string{"host": host, "project": d.TaskID, "successor": j.SuccessorAgentID}, Body: api.EnvelopeBody{Text: text}}
-		if _, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: fmt.Sprintf("%s-%d", key, i)}); err != nil {
+		requestID := key + "-board"
+		if to.ID != "" {
+			requestID = key + "-" + strings.TrimPrefix(to.ID, "agt_")
+		}
+		_, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: requestID})
+		// The identity is this rotation's notice to this recipient, so a
+		// conflict means an earlier run already sent it with other words (the
+		// project was renamed, the old handler closed, or a manual resume
+		// moved the rotation on). The recipient has been told; it is not retried.
+		if err != nil && !requestIdentityConflict(err) {
 			return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
 		}
 	}
 	r.notified[key] = true
 	return nil
+}
+
+// requestIdentityConflict reports the hub's refusal of a request identity
+// that was already used with different message data.
+func requestIdentityConflict(err error) bool {
+	var httpErr *api.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict && strings.Contains(httpErr.Msg, "request ID was already used")
+}
+
+// stuckRotationRecovery is the stuck notice's advice for the journal's
+// phase. A resume launches the successor only while the rotation is prepared;
+// once the launch is recorded a resume only waits for that session again.
+func stuckRotationRecovery(phase, task string) string {
+	const fix = "Fix the launch (the saved spec from tt handler spec, or the host's capacity)"
+	if phase == rotationPhaseSpawned {
+		return fmt.Sprintf("The successor was launched, and a resume only waits for that same session again: it never launches another. %s, then on that host abort the rotation with tt handler rotate --abort --task %s; a rotation that is still due then starts fresh with a new successor, at the runner's next tick or at once with tt handler rotate --task %s. Only if that launched session can still come online does a resume, the same tt handler rotate --task %s, finish this rotation.",
+			fix, task, task, task)
+	}
+	return fmt.Sprintf("The successor's launch was never confirmed, so a resume launches it again. %s, then resume it on that host with tt handler rotate --task %s, or abort it with tt handler rotate --abort --task %s.", fix, task, task)
 }

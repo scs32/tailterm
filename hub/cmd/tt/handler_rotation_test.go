@@ -2127,11 +2127,29 @@ type stuckRotation struct {
 
 func newStuckRotation(t *testing.T) *stuckRotation {
 	t.Helper()
+	f := newStuckRotationWithoutHelper(t)
+	f.registerHelper(t)
+	return f
+}
+
+// newStuckRotationWithoutHelper leaves the project with no owner helper, so
+// the helper's copy of a stuck notice goes to the Board.
+func newStuckRotationWithoutHelper(t *testing.T) *stuckRotation {
+	t.Helper()
 	f := &stuckRotation{rotationCLI: newRotationCLI(t, handlerTemplateDigest("an older assignment"))}
 	if err := saveHandlerSpec(f.spec); err != nil {
 		t.Fatal(err)
 	}
 	setRotationPolicy(t, f.rotationCLI, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true})
+	f.request(t, f.old.Name, "Record the stuck fixture item")
+	f.owed = f.owedByOld(t)
+	f.online = false
+	f.deps.online = 100 * time.Millisecond
+	return f
+}
+
+func (f *stuckRotation) registerHelper(t *testing.T) {
+	t.Helper()
 	reg, err := f.c.RegisterOwnerHelper(context.Background(), f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "stuck-helper"})
 	if err != nil {
 		t.Fatal(err)
@@ -2139,11 +2157,30 @@ func newStuckRotation(t *testing.T) *stuckRotation {
 	if f.helper, err = f.c.GetAgent(context.Background(), f.task.ID, reg.Registration.AgentID); err != nil {
 		t.Fatal(err)
 	}
-	f.request(t, f.old.Name, "Record the stuck fixture item")
-	f.owed = f.owedByOld(t)
-	f.online = false
-	f.deps.online = 100 * time.Millisecond
-	return f
+}
+
+// noticesTo counts the stuck notices by recipient agent; "" is the Board.
+func (f *stuckRotation) noticesTo(t *testing.T) map[string]int {
+	t.Helper()
+	to := map[string]int{}
+	for _, m := range f.stuckNotices(t) {
+		to[m.To]++
+	}
+	return to
+}
+
+// restarts runs ticks of fresh runners, as a restarted relay does, and
+// requires each to return no error.
+func (f *stuckRotation) restarts(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		r := f.runner()
+		for tick := 0; tick < 2; tick++ {
+			if err := f.try(r); err != nil {
+				t.Fatalf("restart %d tick %d: %v", i+1, tick+1, err)
+			}
+		}
+	}
 }
 
 // owedByOld lists the old handler's open obligations other than deliveries.
@@ -2463,4 +2500,155 @@ func TestHandlerRotationRunnerStuckNoticeSurvivesControlCharacters(t *testing.T)
 	if got := noticeSafeError(strings.Repeat("\u00e9", 500)); utf8.RuneCountInString(got) != 400 || !utf8.ValidString(got) {
 		t.Fatalf("cut: %d runes", utf8.RuneCountInString(got))
 	}
+}
+
+// wi_95d90c0453d964a4 n1: the notice identities were numbered by position,
+// so a restarted relay that found another recipient in the first position
+// replayed that identity with other data and the hub answered 409 on every
+// tick. Each identity now names its recipient.
+func TestHandlerRotationRunnerStuckNoticeAfterRestartWithChangedRecipients(t *testing.T) {
+	t.Run("an owner helper registers after the Board copy", func(t *testing.T) {
+		f := newStuckRotationWithoutHelper(t)
+		f.toCeiling(t, f.runner())
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.old.ID: 1}) {
+			t.Fatalf("notices with no owner helper: %v", to)
+		}
+		f.registerHelper(t)
+		f.restarts(t, 3)
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.old.ID: 1, f.helper.ID: 1}) {
+			t.Fatalf("notices after the helper registered: %v", to)
+		}
+		f.assertHeld(t)
+	})
+	t.Run("the owner helper leaves", func(t *testing.T) {
+		f := newStuckRotation(t)
+		f.toCeiling(t, f.runner())
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{f.helper.ID: 1, f.old.ID: 1}) {
+			t.Fatalf("notices with an owner helper: %v", to)
+		}
+		if _, err := f.c.CloseAgent(context.Background(), f.task.ID, f.helper.ID, f.helper.RunID); err != nil {
+			t.Fatal(err)
+		}
+		f.restarts(t, 3)
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.helper.ID: 1, f.old.ID: 1}) {
+			t.Fatalf("notices after the helper left: %v", to)
+		}
+		f.assertHeld(t)
+	})
+	// The same recipients, but the notice would now read differently: they
+	// were told once, so the hub's conflict settles it and nothing is retried.
+	t.Run("the notice words changed", func(t *testing.T) {
+		f := newStuckRotation(t)
+		launches := 0
+		f.deps.spawn = func(env, []string) error {
+			launches++
+			return errors.New("fixture launcher is out of capacity")
+		}
+		r := f.runner()
+		for i := 0; i <= rotationResumeCeiling; i++ {
+			if err := f.try(r); err == nil || !strings.Contains(err.Error(), "successor launch unconfirmed") {
+				t.Fatalf("tick %d: %v", i+1, err)
+			}
+		}
+		before := f.stuckNotices(t)
+		if len(before) != 2 || !strings.Contains(before[0].Envelope.Body.Text, "a resume launches it again") {
+			t.Fatalf("notices: %+v", before)
+		}
+		// A manual resume launches the successor again, as that notice says;
+		// it stays offline and the journal moves on to the spawned phase.
+		f.deps.spawn = f.spawn
+		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), "did not come online") {
+			t.Fatalf("manual resume: %v", err)
+		}
+		if launches != 4 || f.spawns != 1 {
+			t.Fatalf("launch attempts: %d failed, %d confirmed", launches, f.spawns)
+		}
+		f.restarts(t, 3)
+		after := f.stuckNotices(t)
+		if to := f.noticesTo(t); len(after) != 2 || to[f.helper.ID] != 1 || to[f.old.ID] != 1 || after[0].Seq != before[0].Seq || after[1].Seq != before[1].Seq {
+			t.Fatalf("notices after the phase changed: %v", to)
+		}
+	})
+}
+
+// wi_95d90c0453d964a4 n2: once the successor's launch is recorded a resume
+// only waits for that session and never launches another, so the notice for
+// that state must not offer a resume as the fix.
+func TestHandlerRotationStuckNoticeAdviceMatchesThePhase(t *testing.T) {
+	t.Run("launched and never online", func(t *testing.T) {
+		f := newStuckRotation(t)
+		f.toCeiling(t, f.runner())
+		notices := f.stuckNotices(t)
+		if len(notices) != 2 {
+			t.Fatalf("notices: %d", len(notices))
+		}
+		for _, m := range notices {
+			text := m.Envelope.Body.Text
+			for _, want := range []string{"a resume only waits for that same session again: it never launches another",
+				"abort the rotation with tt handler rotate --abort --task " + f.task.ID, "starts fresh with a new successor"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("notice lacks %q: %s", want, text)
+				}
+			}
+			for _, wrong := range []string{"then resume it", "a resume launches it again"} {
+				if strings.Contains(text, wrong) {
+					t.Fatalf("notice recommends a resume that cannot relaunch (%q): %s", wrong, text)
+				}
+			}
+		}
+		// What the notice says holds: a resume launches nothing, and the abort
+		// it names lets the next due tick start a new successor.
+		stuck := f.assertHeld(t)
+		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), "did not come online") || f.spawns != 1 {
+			t.Fatalf("manual resume: %v spawns=%d", err, f.spawns)
+		}
+		if _, err := abortHandlerRotation(context.Background(), f.deps, f.e, f.c, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+		f.online = true
+		f.tick(t, f.runner())
+		rotations := f.rotations(t)
+		if f.spawns != 2 || len(rotations) != 2 || rotations[0].SuccessorAgentID == rotations[1].SuccessorAgentID {
+			t.Fatalf("after the abort: spawns=%d rotations=%+v", f.spawns, rotations)
+		}
+		for _, r := range rotations {
+			if (r.ID == stuck.ID) != (r.State == api.HandlerRotationAborted) || (r.ID != stuck.ID && r.State != api.HandlerRotationCommitted) {
+				t.Fatalf("rotations: %+v", rotations)
+			}
+		}
+	})
+	t.Run("launch never confirmed", func(t *testing.T) {
+		f := newStuckRotation(t)
+		launches := 0
+		f.deps.spawn = func(env, []string) error {
+			launches++
+			return errors.New("fixture launcher is out of capacity")
+		}
+		r := f.runner()
+		for i := 0; i <= rotationResumeCeiling; i++ {
+			if err := f.try(r); err == nil || !strings.Contains(err.Error(), "successor launch unconfirmed") {
+				t.Fatalf("tick %d: %v", i+1, err)
+			}
+		}
+		notices := f.stuckNotices(t)
+		if len(notices) != 2 {
+			t.Fatalf("notices: %d", len(notices))
+		}
+		for _, m := range notices {
+			text := m.Envelope.Body.Text
+			for _, want := range []string{"a resume launches it again", "then resume it on that host with tt handler rotate --task " + f.task.ID,
+				"abort it with tt handler rotate --abort --task " + f.task.ID} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("notice lacks %q: %s", want, text)
+				}
+			}
+			if strings.Contains(text, "only waits") {
+				t.Fatalf("notice gives the launched state's advice: %s", text)
+			}
+		}
+		// The recommended resume does launch the successor again.
+		if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), "successor launch unconfirmed") || launches != 5 {
+			t.Fatalf("manual resume: %v launches=%d", err, launches)
+		}
+	})
 }
