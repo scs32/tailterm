@@ -32,9 +32,12 @@ reproducible defects remain release gates.
    There is no third general review or additional approval tour. Focused
    verification references specific blocker IDs and the changed candidate.
 5. Retries, correction commits, new candidate hashes, restarts and reassignment
-   preserve the review count. Scope revisions preserve the same lifetime two-round cap; no new cycle
-   or owner override resets the counter (owner decisions #11650/#11651). Existing qualified releases keep moving;
-   historical reviews without adequate evidence remain unknown.
+   preserve the review count. Inside one review stage, scope revisions preserve
+   the same two-round cap; no new cycle or owner override resets the counter
+   (owner decisions #11650/#11651). Only a new owner order opens a new stage with
+   its own two rounds; see [Review stages](#review-stages). Existing qualified
+   releases keep moving; historical reviews without adequate evidence remain
+   unknown.
 
 The lead owns delivery and release disposition. The database handler owns native
 records, source links, revision checks, retry receipts and saved acceptance.
@@ -74,9 +77,50 @@ An item with verification-owned criteria needs that receipt even if older
 enrollment says verification was optional. Existing completed rounds and verdicts
 remain immutable; their owner-accept route is preserved without a third round.
 A revision-checked title/description update permits a new scope snapshot, but
-never another general review beyond two. Follow-ups are native open work items
+never another general review beyond two inside the same review stage. Follow-ups are native open work items
 with source-message provenance and a parent relationship in the review ledger;
 they remain outside the delivery queue pending deliberate triage.
+
+### Review stages
+
+Bug `wi_5225af9140ef7a19`, owner order #30603. The policy above was written for
+one build per item. Staged orders (measure, then design, then build) run several
+on one item, and a findings stage that used both general reviews left the later
+build with no review and no way to reuse a1..aN.
+
+A review stage is the run of scope revisions worked under one owner order. A
+scope revision opens a new stage when the database handler's saved scope
+confirmation for it names a different owner order message than the stage before
+it. A scope revision with no saved confirmation, or one confirmed under the same
+order, stays in the current stage. The first saved confirmation of an item names
+its first stage, so it opens no new one. The stage opens at that scope
+revision's first ASSIGN: until then an open review of the current stage still
+takes its result, and afterwards the earlier stage takes no further result.
+
+The two-round cap, the frozen verdicts and the no-reclassification rule,
+blockers, focused verification, follow-up IDs and acceptance are all evaluated
+inside the current stage. A new stage starts at round one with its own a1..aN,
+verification designation and blocker IDs. Earlier stages stay in the ledger
+unchanged, each round with its scope revision; they neither block nor satisfy the
+new stage's acceptance. Inside one stage nothing changes: a third general review
+and a reclassified completed verdict are still refused.
+
+The key is the owner order, not the scope revision, because the scope revision
+also moves on every revision-checked title or description edit inside one build.
+Keying on it would hand two fresh reviews to any mid-build amendment or scope
+reduction and reverse point five. The owner order is what starts a stage. The
+alternative, requiring a new linked item for each staged order, was not chosen:
+it keeps the cost that prompted this change (question #29943) and splits one
+item's history across several.
+
+Limits. A new owner order needs its own scope revision: the handler records the
+order in the item with a revision-checked edit, then confirms that scope. An
+order confirmed on an unchanged scope revision opens no stage. Unknown legacy
+history still gets no fresh count. A confirmation saved after a scope's reviews
+already continued the stage's numbering does not split that stage; the next scope
+revision under the new order opens it. A reviewer of any stage still cannot be
+the item's independent verifier. Readers that show a total, such as the Board's
+review count, count the rounds of every stage.
 
 ### Scope and legacy reconciliation
 

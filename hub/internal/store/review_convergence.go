@@ -42,6 +42,102 @@ func saveReviewState(ctx context.Context, tx *sql.Tx, task string, state api.Rev
 	_, err = tx.ExecContext(ctx, `INSERT INTO review_convergence(task_id,item_id,state_json) VALUES(?,?,?) ON CONFLICT(task_id,item_id) DO UPDATE SET state_json=excluded.state_json`, task, state.ItemID, string(raw))
 	return err
 }
+
+// A review stage is the run of scope revisions worked under one owner order.
+// A scope revision opens a new stage when its saved scope confirmation names a
+// different owner order than the stage before it. Earlier stages stay stored
+// unchanged; the two-round count, verdicts, blockers, focused records and
+// follow-up IDs are evaluated inside the current stage only.
+type earlierReviewStages struct {
+	rounds    []api.ReviewRound
+	focused   []api.FocusedReview
+	followUps []api.ReviewFollowUp
+}
+
+// reviewStageStart returns the assignment sequence that opens the current
+// stage, or 0 in the first stage. Only an assignment opens a stage: assign is
+// the sequence of an ASSIGN being applied to scope revision current, else 0, so
+// an open review of the current stage still takes its result after a new owner
+// order is confirmed. Unknown legacy history never opens a stage. A scope with
+// no saved confirmation, or one whose rounds continue an earlier scope's
+// numbering, stays in its stage.
+func reviewStageStart(ctx context.Context, q queryRower, task string, state api.ReviewConvergence, current, assign int64) (int64, error) {
+	scopes := state.Scopes
+	if assign != 0 && scopeFor(&state, current) == nil {
+		scopes = append(scopes[:len(scopes):len(scopes)], api.ReviewScope{ScopeRevision: current, AssignmentSeq: assign})
+	}
+	if state.History == "unknown" || len(scopes) < 2 {
+		return 0, nil
+	}
+	var start, order int64
+	for _, sc := range scopes {
+		var confirmed int64
+		err := q.QueryRowContext(ctx, `SELECT order_seq FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND scope_revision=? ORDER BY item_revision,order_seq LIMIT 1`, task, state.ItemID, sc.ScopeRevision).Scan(&confirmed)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if order == 0 {
+			order = confirmed // the first known order names the first stage
+		}
+		if confirmed == order {
+			continue
+		}
+		continued := false
+		for _, r := range state.Rounds {
+			if r.RequestSeq >= sc.AssignmentSeq {
+				continued = r.Number != 1
+				break
+			}
+		}
+		if !continued {
+			start, order = sc.AssignmentSeq, confirmed
+		}
+	}
+	return start, nil
+}
+
+// currentReviewStage narrows state to its current stage and returns the
+// earlier stages' records for saveReviewStage.
+func currentReviewStage(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence, current, assign int64) (earlierReviewStages, error) {
+	var earlier earlierReviewStages
+	start, err := reviewStageStart(ctx, q, task, *state, current, assign)
+	if err != nil || start == 0 {
+		return earlier, err
+	}
+	n := 0
+	for n < len(state.Rounds) && state.Rounds[n].RequestSeq < start {
+		n++
+	}
+	earlier.rounds, state.Rounds = state.Rounds[:n:n], state.Rounds[n:]
+	n = 0
+	for n < len(state.Focused) && state.Focused[n].RequestSeq < start {
+		n++
+	}
+	earlier.focused, state.Focused = state.Focused[:n:n], state.Focused[n:]
+	n = 0
+	for n < len(state.FollowUps) && state.FollowUps[n].MessageSeq < start {
+		n++
+	}
+	earlier.followUps, state.FollowUps = state.FollowUps[:n:n], state.FollowUps[n:]
+	return earlier, nil
+}
+
+// saveReviewStage saves the current stage after the unchanged earlier stages.
+func saveReviewStage(ctx context.Context, tx *sql.Tx, task string, earlier earlierReviewStages, state api.ReviewConvergence) error {
+	if len(earlier.rounds) > 0 {
+		state.Rounds = append(earlier.rounds, state.Rounds...)
+	}
+	if len(earlier.focused) > 0 {
+		state.Focused = append(earlier.focused, state.Focused...)
+	}
+	if len(earlier.followUps) > 0 {
+		state.FollowUps = append(earlier.followUps, state.FollowUps...)
+	}
+	return saveReviewState(ctx, tx, task, state)
+}
 func (s *Store) ListReviewConvergence(ctx context.Context, task string) ([]api.ReviewConvergence, error) {
 	if !api.ValidID(task, "tsk") {
 		return nil, api.ErrInvalid
@@ -398,6 +494,9 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
 	if err != nil {
 		return err
 	}
+	if _, err = currentReviewStage(ctx, tx, item.TaskID, &state, item.ScopeRevision, 0); err != nil {
+		return err
+	}
 	accepted := candidate
 	if accepted == "" && state.Disposition != nil {
 		accepted = state.Disposition.Candidate
@@ -487,6 +586,14 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	if err != nil {
 		return err
 	}
+	var assigning int64
+	if e.Kind == "assign" {
+		assigning = m.Seq
+	}
+	earlier, err := currentReviewStage(ctx, tx, m.TaskID, &state, item.ScopeRevision, assigning)
+	if err != nil {
+		return err
+	}
 	meta := e.Review
 	if meta != nil && req.AgentID != "" {
 		var current, status string
@@ -525,7 +632,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 		}
 		state.Disposition = nil
-		return saveReviewState(ctx, tx, m.TaskID, state)
+		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 	}
 	if e.Kind == "review" {
 		if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
@@ -555,7 +662,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, Criteria: sc.Criteria, VerificationCriteria: normalizedVerificationCriteria(sc.VerificationCriteria), RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
 		state.Disposition = nil
-		return saveReviewState(ctx, tx, m.TaskID, state)
+		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 	}
 	if meta == nil {
 		if e.Kind == "result" {
@@ -625,7 +732,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		state.Disposition = &api.ReviewDisposition{Kind: meta.Disposition, Candidate: meta.Candidate, MessageSeq: m.Seq, AgentID: req.AgentID, RunID: req.RunID}
 		state.Dispositions = append(state.Dispositions, *state.Disposition)
-		return saveReviewState(ctx, tx, m.TaskID, state)
+		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 	}
 	sc := scopeFor(&state, item.ScopeRevision)
 	if meta.Mode == "focused" {
@@ -811,7 +918,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		} else {
 			return reviewConflict("focused path uses REQUEST or RESULT")
 		}
-		return saveReviewState(ctx, tx, m.TaskID, state)
+		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 	}
 	if meta.Mode != "general" || e.Kind != "result" {
 		return reviewConflict("invalid review transition")
@@ -936,7 +1043,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	if round.Number == 2 && len(meta.BlockerIDs) > 0 {
 		state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: round.RequestSeq, ResultSeq: m.Seq, Candidate: round.Candidate, Fix: "round two blocker verification: " + meta.Fix, BlockerIDs: meta.BlockerIDs, ScopeResolvedIDs: scopeResolvedIDs, ReviewerID: req.AgentID, ReviewerRun: req.RunID, Passed: true})
 	}
-	return saveReviewState(ctx, tx, m.TaskID, state)
+	return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 }
 
 func (s *Store) fileReviewFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, f api.ReviewFinding, m api.Message, by api.Caller) (api.ReviewFollowUp, error) {

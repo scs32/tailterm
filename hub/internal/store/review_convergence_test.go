@@ -2420,3 +2420,316 @@ func TestReviewConvergenceDocumentedFocusedExamples(t *testing.T) {
 		t.Fatal("expected one settlement, one treeDiffers and one equivalence example", settles, differs, equivalence)
 	}
 }
+
+// stageHandler adds the database handler that files scope confirmations.
+func (f *convergenceFixture) stageHandler(t *testing.T) api.Agent {
+	t.Helper()
+	handler, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Host: "fixture", Session: "db-handler", Role: api.AgentRoleDatabaseHandler}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
+}
+
+// rescope advances the item's scope revision with a revision-checked edit.
+func (f *convergenceFixture) rescope(t *testing.T, description string) {
+	t.Helper()
+	var err error
+	if f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &description}, f.by); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ownerOrder posts an owner order linked to the current item revision.
+func (f *convergenceFixture) ownerOrder(t *testing.T, key string) api.Message {
+	t.Helper()
+	return unconfirmedOrder(t, f.s, f.task, f.item, key)
+}
+
+// confirmScope saves the handler's confirmation of the current scope under order.
+func (f *convergenceFixture) confirmScope(t *testing.T, handler api.Agent, order api.Message, key string) {
+	t.Helper()
+	req := api.ConfirmWorkOrderScopeRequest{RequestID: key, AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, req); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *convergenceFixture) assign(criteria map[string]string, verificationCriteria []string) error {
+	_, err := f.post(api.Envelope{Kind: "assign", Subject: "Implement the staged fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: criteria, VerificationCriteria: verificationCriteria}}, f.builder.ID, 0, api.Agent{})
+	return err
+}
+
+func (f *convergenceFixture) reviewErr(candidate string) error {
+	_, err := f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: f.criteria, VerificationCriteria: f.verificationCriteria}}, f.reviewer.ID, 0, api.Agent{})
+	return err
+}
+
+func refusedWith(t *testing.T, name string, err error, reason string) {
+	t.Helper()
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), reason) {
+		t.Fatalf("%s: want refusal %q, got %v", name, reason, err)
+	}
+}
+
+func stageJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// findingsStage runs a first stage confirmed under its own owner order: two
+// general reviews that leave a2 failed with blocker b1, a failed focused
+// verification, a follow-up and a follow-ups disposition.
+func findingsStage(t *testing.T) (*convergenceFixture, api.Agent) {
+	t.Helper()
+	f := newConvergenceFixture(t)
+	handler := f.stageHandler(t)
+	f.confirmScope(t, handler, f.ownerOrder(t, "findings-order"), "findings-scope")
+	blocker := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: "Findings stage retry gap", Command: "fixture retry", Output: "FAIL lost state"}
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	f.generalRound(t, candidateA, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{blocker}, Findings: []api.ReviewFinding{{ID: "f1", Title: "Explain the findings stage", Kind: "feature", File: "fixture.go", Line: 3}}})
+	f.generalRound(t, candidateA, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{blocker}})
+	f.focusedCheck(t, api.ReviewMetadata{Mode: "focused", Candidate: candidateC, Fix: "Retry fix attempt", BlockerIDs: []string{"b1"}}, map[string]string{"b1": "fail"}, receiptProof(candidateC))
+	if _, err := f.post(api.Envelope{Kind: "notice", Subject: "File the findings stage follow-ups", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "follow-ups", Candidate: candidateA}, Body: api.EnvelopeBody{Text: "Findings only"}}, "", 0, api.Agent{}); err != nil {
+		t.Fatal(err)
+	}
+	refusedWith(t, "third review in the findings stage", f.reviewErr(candidateA), "third general review refused")
+	return f, handler
+}
+
+// a1, a3 (wi_5225af9140ef7a19): after a findings stage used both general
+// reviews, a scope confirmed under a new owner order takes an ASSIGN that
+// reuses a1..aN with verification designation, then its own two reviews.
+func TestReviewStageNewOwnerOrderOpensFreshReviews(t *testing.T) {
+	f, handler := findingsStage(t)
+	before := f.state(t)
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+	f.criteria, f.verificationCriteria = map[string]string{"a1": "builds", "a2": "matrix passes"}, []string{"a2"}
+	if err := f.assign(f.criteria, f.verificationCriteria); err != nil {
+		t.Fatal("build ASSIGN reusing a1..aN with verification designation", err)
+	}
+	// The new stage has its own blocker and finding IDs.
+	blocker := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Build stage defect", Command: "fixture build", Output: "FAIL build"}
+	f.generalRound(t, candidateB, map[string]string{"a1": "fail", "a2": "pending-verification"}, api.ReviewMetadata{Blockers: []api.ReviewFinding{blocker}, Findings: []api.ReviewFinding{{ID: "f1", Title: "Explain the build stage", Kind: "feature", File: "build.go", Line: 9}}})
+	f.generalRound(t, candidateC, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{BlockerIDs: []string{"b1"}, Fix: "fixed the build"})
+	refusedWith(t, "third review in the build stage", f.reviewErr(candidateC), "third general review refused")
+
+	after := f.state(t)
+	if len(after.Rounds) != 4 || len(after.Scopes) != 2 {
+		t.Fatalf("rounds %d scopes %d", len(after.Rounds), len(after.Scopes))
+	}
+	for i, want := range []struct {
+		number int
+		scope  int64
+	}{{1, 1}, {2, 1}, {1, 2}, {2, 2}} {
+		if r := after.Rounds[i]; r.Number != want.number || r.ScopeRevision != want.scope || r.ResultSeq == 0 {
+			t.Fatalf("round %d: number %d scope %d result %d", i, r.Number, r.ScopeRevision, r.ResultSeq)
+		}
+	}
+	// The findings stage is stored unchanged, with its scope revision.
+	if got, want := stageJSON(t, after.Rounds[:2]), stageJSON(t, before.Rounds); got != want {
+		t.Fatalf("earlier rounds changed\n got %s\nwant %s", got, want)
+	}
+	if got, want := stageJSON(t, after.Scopes[:1]), stageJSON(t, before.Scopes); got != want {
+		t.Fatalf("earlier scope changed\n got %s\nwant %s", got, want)
+	}
+	if got, want := stageJSON(t, after.Focused[:len(before.Focused)]), stageJSON(t, before.Focused); got != want || len(before.Focused) != 1 || len(after.Focused) != 2 {
+		t.Fatalf("earlier focused records changed\n got %s\nwant %s", got, want)
+	}
+	if got, want := stageJSON(t, after.FollowUps[:len(before.FollowUps)]), stageJSON(t, before.FollowUps); got != want || len(before.FollowUps) != 1 || len(after.FollowUps) != 2 {
+		t.Fatalf("earlier follow-ups changed\n got %s\nwant %s", got, want)
+	}
+	if got, want := stageJSON(t, after.Dispositions), stageJSON(t, before.Dispositions); got != want || len(before.Dispositions) != 1 {
+		t.Fatalf("earlier dispositions changed\n got %s\nwant %s", got, want)
+	}
+	// Inside the build stage a completed verdict still cannot be reclassified.
+	f.rescope(t, "Build order one, amended")
+	refusedWith(t, "reclassified build verdict", f.assign(f.criteria, []string{"a1", "a2"}), "cannot reclassify")
+}
+
+// a3: an earlier stage neither blocks nor satisfies acceptance of the new one.
+func TestReviewStageAcceptanceIgnoresEarlierStages(t *testing.T) {
+	t.Run("earlier failure does not block", func(t *testing.T) {
+		f, handler := findingsStage(t)
+		f.rescope(t, "Build order one")
+		f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		refusedWith(t, "accept before any build review", f.acceptCandidate(candidateA, api.Agent{}), "completed review required")
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		// The findings stage left a2 failed with blocker b1 unresolved.
+		if err := f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+			t.Fatal("earlier stage blocked acceptance", err)
+		}
+		done := "done"
+		if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &done}, f.by); err != nil {
+			t.Fatal("earlier stage blocked the done save", err)
+		}
+	})
+	t.Run("earlier pass does not satisfy", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		f.confirmScope(t, handler, f.ownerOrder(t, "first-order"), "first-scope")
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		if err := f.acceptCandidate(candidateA, api.Agent{}); err != nil {
+			t.Fatal(err)
+		}
+		f.rescope(t, "Build order one")
+		f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		// Identical criteria: inside one stage these verdicts would stay usable.
+		refusedWith(t, "accept on the earlier stage's pass", f.acceptCandidate(candidateA, api.Agent{}), "completed review required")
+		done := "done"
+		_, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &done}, f.by)
+		refusedWith(t, "done on the earlier stage's pass", err, "saved lead acceptance required")
+		// A focused request cannot reach back into the earlier stage either.
+		_, err = f.focusedRequest(api.ReviewMetadata{Mode: "focused", Candidate: candidateB, Fix: "fix b1", BlockerIDs: []string{"b1"}})
+		refusedWith(t, "focused request on the earlier stage", err, "focused path requires two completed general reviews")
+	})
+}
+
+// a2: a scope revision opens no fresh count unless its saved confirmation
+// names a different owner order.
+func TestReviewStageSameStageKeepsLimits(t *testing.T) {
+	t.Run("no saved confirmation", func(t *testing.T) {
+		f, _ := findingsStage(t)
+		f.rescope(t, "Amended without a confirmation")
+		refusedWith(t, "reclassified verdict", f.assign(f.criteria, []string{"a2"}), "cannot reclassify")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		refusedWith(t, "third review", f.reviewErr(candidateB), "third general review refused")
+	})
+	t.Run("same owner order", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		order := f.ownerOrder(t, "findings-order")
+		f.confirmScope(t, handler, order, "findings-scope")
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.rescope(t, "Amended under the same order")
+		f.confirmScope(t, handler, order, "amended-scope")
+		refusedWith(t, "reclassified verdict", f.assign(f.criteria, []string{"a2"}), "cannot reclassify")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		refusedWith(t, "third review", f.reviewErr(candidateB), "third general review refused")
+		if st := f.state(t); len(st.Rounds) != 2 || len(st.Scopes) != 2 {
+			t.Fatal("same order changed the ledger", st)
+		}
+	})
+	t.Run("first confirmation names no earlier order", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		f.rescope(t, "First confirmed scope")
+		f.confirmScope(t, handler, f.ownerOrder(t, "first-order"), "first-scope")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		refusedWith(t, "third review", f.reviewErr(candidateB), "third general review refused")
+	})
+	t.Run("new order before its assignment", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		handler := f.stageHandler(t)
+		f.confirmScope(t, handler, f.ownerOrder(t, "findings-order"), "findings-scope")
+		f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+		open := f.review(t, candidateA)
+		f.rescope(t, "Build order one")
+		f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+		// Only the ASSIGN opens the stage: the open review still takes its result.
+		if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", open.Seq, f.reviewer); err != nil {
+			t.Fatal("open review result after a confirmed new order", err)
+		}
+		refusedWith(t, "review before the build assignment", f.reviewErr(candidateB), "third general review refused")
+		if err := f.assign(f.criteria, nil); err != nil {
+			t.Fatal(err)
+		}
+		f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+		if st := f.state(t); len(st.Rounds) != 3 || st.Rounds[1].Number != 2 || st.Rounds[1].ResultSeq == 0 || st.Rounds[2].Number != 1 {
+			t.Fatal("stage opened before its assignment", st.Rounds)
+		}
+	})
+}
+
+// a3: a confirmation saved after a scope already continued a stage's
+// numbering never splits or renumbers that stage; the next scope under the
+// new order opens the fresh count.
+func TestReviewStageLateConfirmationNeverRenumbers(t *testing.T) {
+	f := newConvergenceFixture(t)
+	handler := f.stageHandler(t)
+	f.confirmScope(t, handler, f.ownerOrder(t, "findings-order"), "findings-scope")
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.rescope(t, "Amended inside the stage")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	before := stageJSON(t, f.state(t).Rounds)
+	build := f.ownerOrder(t, "build-order")
+	f.confirmScope(t, handler, build, "late-scope")
+	refusedWith(t, "third review after a late confirmation", f.reviewErr(candidateC), "third general review refused")
+	if err := f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+		t.Fatal("late confirmation hid the stage's reviews", err)
+	}
+	if got := stageJSON(t, f.state(t).Rounds); got != before {
+		t.Fatalf("rounds changed\n got %s\nwant %s", got, before)
+	}
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, build, "build-scope")
+	if err := f.assign(f.criteria, []string{"a2"}); err != nil {
+		t.Fatal(err)
+	}
+	f.verificationCriteria = []string{"a2"}
+	f.generalRound(t, candidateC, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{})
+	if st := f.state(t); len(st.Rounds) != 3 || st.Rounds[2].Number != 1 || st.Rounds[2].ScopeRevision != 3 || stageJSON(t, st.Rounds[:2]) != before {
+		t.Fatal("build stage numbering", st.Rounds)
+	}
+}
+
+// a3: unknown legacy history gets no fresh count from a new owner order.
+func TestReviewStageUnknownLegacyHistoryGetsNoFreshCount(t *testing.T) {
+	f := newConvergenceFixture(t)
+	handler := f.stageHandler(t)
+	f.confirmScope(t, handler, f.ownerOrder(t, "legacy-order"), "legacy-scope")
+	if _, err := f.s.db.Exec(`DELETE FROM review_convergence WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	task, err := f.s.GetTask(f.ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := f.req(api.Envelope{Kind: "review", Subject: "Legacy exact native fixture review", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: f.criteria}}, f.reviewer.ID, 0, api.Agent{})
+	if _, err = f.s.insertMessage(f.ctx, tx, task, legacy, f.reviewer, f.by, false, false); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+	if err = f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.state(t).History != "unknown" {
+		t.Fatal("legacy history became known")
+	}
+	refusedWith(t, "fresh review on unknown history", f.reviewErr(candidateB), "legacy review history is unknown")
+}
