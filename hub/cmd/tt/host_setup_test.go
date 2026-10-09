@@ -1559,8 +1559,8 @@ func TestHostSetupClaudeUsageCommandCaptures(t *testing.T) {
 			t.Fatalf("after %q: %+v", bad, again)
 		}
 	}
-	// A status without rate limits is saved, and read as malformed: unknown.
-	if out := run(`{"version":"2.1.292"}`); out != "" || readClaudeUsageCapture(capture).State != api.ProviderUsageMalformed {
+	// A status without rate limits leaves the last capture in place too.
+	if out := run(`{"version":"2.1.292"}`); out != "" || readClaudeUsageCapture(capture).State != api.ProviderUsageOK || !readClaudeUsageCapture(capture).CapturedAt.Equal(got.CapturedAt) {
 		t.Fatalf("a status without rate limits: %q %+v", out, readClaudeUsageCapture(capture))
 	}
 	entries, _ := os.ReadDir(filepath.Dir(capture))

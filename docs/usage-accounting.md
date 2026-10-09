@@ -314,6 +314,8 @@ Claude Code gives its status line command the account's rate limits. `tt host se
 
 A file that is missing, unreadable or malformed (not JSON, no capture time, no `rate_limits`, or a window without a numeric `used_percentage` from 0 to 100 and a `resets_at`) is reported too, as an **invalidation**: the hub overwrites both windows with that state and no figure, so nothing of the earlier reading remains. Admission then uses the allowance source, or holds with the no-source reason. `GET /v1/provider-usage?host=H` shows what the hub holds; the relay writes with `PUT /v1/provider-usage`.
 
+The capture command writes the file only when the status line JSON carries `rate_limits` with a `five_hour` or `seven_day` window. A session that has none yet, such as one before its first response, leaves the file as it was, capture time included, so it never replaces a good reading with a malformed one and causes no invalidation. A host whose sessions never send rate limits therefore goes stale by the row's own bound: unknown is still never treated as plenty.
+
 The file is refreshed only while some Claude Code session on the host is active. A quiet host therefore goes stale, and admission falls to the allowance source, which sees only this project's reported usage.
 
 ### Rollout

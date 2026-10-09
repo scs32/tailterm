@@ -30,7 +30,10 @@ const claudeUsageCaptureName = "tt-claude-usage-capture"
 
 // claudeUsageCaptureScript is the capture status line command. It reads the
 // status line JSON on stdin, saves the rate limit fields atomically and
-// prints nothing, so no status line shows. It never fails Claude Code.
+// prints nothing, so no status line shows. Input with no rate limits (a
+// session before its first response) leaves the last capture as it is, so
+// one such session never replaces a good reading with an unusable one. It
+// never fails Claude Code.
 const claudeUsageCaptureScript = `#!/bin/sh
 # Tailterm capture-only Claude Code status line (installed by tt host setup).
 # Reads the status line JSON on stdin and saves the account rate limit fields
@@ -47,6 +50,9 @@ try:
 except Exception:
     sys.exit(0)
 if not isinstance(j,dict):
+    sys.exit(0)
+r=j.get("rate_limits")
+if not isinstance(r,dict) or not ("five_hour" in r or "seven_day" in r):
     sys.exit(0)
 json.dump({"capturedAt":int(time.time()),"rate_limits":j.get("rate_limits"),"version":j.get("version")},sys.stdout)
 ' > "$T" 2>/dev/null && [ -s "$T" ] && mv -f "$T" "$F" 2>/dev/null

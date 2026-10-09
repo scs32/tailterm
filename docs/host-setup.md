@@ -135,7 +135,8 @@ installs a capture-only status line:
 - the command `~/.local/bin/tt-claude-usage-capture` (mode 755), which reads
   the status line JSON on stdin, saves `capturedAt`, `rate_limits` and
   `version` to `~/.local/state/tailterm/claude-usage.json`, and prints
-  nothing, so no status line shows;
+  nothing, so no status line shows. Input without a `five_hour` or `seven_day`
+  rate limit window leaves the file as it was;
 - the `statusLine` entry in `~/.claude/settings.json` (or
   `$CLAUDE_CONFIG_DIR`): `{"type":"command","command":"<home>/.local/bin/tt-claude-usage-capture"}`.
 
@@ -148,7 +149,9 @@ missing.
 
 `--check` reports `missing` when the command or its entry is not there,
 `outdated` when the installed command is an older version or not executable,
-and `current` otherwise.
+and `current` otherwise. A release that changes the command shows `outdated`
+on every host until `tt host setup` is run there again; until then the host
+keeps running the older command.
 
 **A different status line is never replaced.** Claude Code has one
 `statusLine`. If the settings already have another one, the step is a
