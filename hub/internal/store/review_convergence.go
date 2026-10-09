@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -259,8 +260,15 @@ func completeVerdicts(criteria map[string]string, owned []string, verdicts map[s
 	return nil
 }
 func evidenceFinding(f api.ReviewFinding, candidate string, criteria map[string]string, blocker bool) error {
-	if f.ID == "" || strings.TrimSpace(f.Title) == "" {
-		return reviewConflict("finding needs stable ID and title")
+	field := "review.findings"
+	if blocker {
+		field = "review.blockers"
+	}
+	if f.ID == "" {
+		return reviewConflict(field + " entry needs a stable ID")
+	}
+	if strings.TrimSpace(f.Title) == "" {
+		return reviewFindingTitleRefusal(field, f)
 	}
 	if f.Criterion != "" && criteria[f.Criterion] == "" {
 		return reviewConflict("unknown criterion")
@@ -802,7 +810,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				}
 				for _, blocker := range meta.BlockerIDs {
 					if blocker == id {
-						return reviewConflict("criterion ID " + id + " is also a named blocker ID")
+						return reviewConflict("criterion ID " + reviewFindingIDEcho(id) + " is also a named blocker ID")
 					}
 				}
 				settling[id] = true
@@ -952,6 +960,8 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	}
 	blockers := []api.ReviewFinding{}
 	findings := append([]api.ReviewFinding{}, meta.Findings...)
+	// A demoted blocker is still named under the field the client sent it in.
+	demoted := map[string]bool{}
 	for _, b := range meta.Blockers {
 		allowedCriteria := sc.Criteria
 		old, known := prior[b.ID]
@@ -970,6 +980,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 			if !known && !b.Regression {
 				findings = append(findings, b)
+				demoted[b.ID] = true
 				continue
 			}
 		}
@@ -991,7 +1002,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		for id := range prior {
 			if !seen[id] && !resolved[id] {
-				return reviewConflict("round two must retain or explicitly resolve " + id)
+				return reviewConflict("round two must retain or explicitly resolve " + reviewFindingIDEcho(id))
 			}
 		}
 		for id := range resolved {
@@ -1027,7 +1038,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 		}
 		if !existing {
-			follow, err := s.fileReviewFollowUp(ctx, tx, item, f, m, by)
+			field := "review.findings"
+			if demoted[f.ID] {
+				field = "review.blockers"
+			}
+			follow, err := s.fileReviewFollowUpFrom(ctx, tx, item, field, f, m, by)
 			if err != nil {
 				return err
 			}
@@ -1047,25 +1062,48 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 }
 
-// reviewFindingTitleRefusal names the finding whose title cannot become a work
-// item title, in the words tt send uses for the same title. The reason never
-// repeats the title, and control characters in the finding ID become spaces,
-// so the text is safe to return to the client.
-func reviewFindingTitleRefusal(f api.ReviewFinding) error {
-	reason := fmt.Sprintf("must be a work item title of 1 to %d characters", api.MaxReviewFindingTitleLen)
-	if problems := api.ReviewFindingTitleProblems(&api.ReviewMetadata{Findings: []api.ReviewFinding{f}}); len(problems) > 0 {
-		reason = problems[0].Reason
-	}
-	id := strings.Map(func(r rune) rune {
+// maxReviewFindingIDEcho caps the bytes of a finding ID a refusal repeats.
+const maxReviewFindingIDEcho = 64
+
+// reviewFindingIDEcho makes a finding ID safe to return to the client: control
+// characters become spaces, and an ID over the cap is cut on a character
+// boundary and ends with an ellipsis.
+func reviewFindingIDEcho(id string) string {
+	id = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
-	}, strings.ToValidUTF8(f.ID, " "))
-	return fmt.Errorf("%w: review.findings[%s].title: %s", api.ErrInvalid, id, reason)
+	}, strings.ToValidUTF8(id, " "))
+	if len(id) <= maxReviewFindingIDEcho {
+		return id
+	}
+	cut := maxReviewFindingIDEcho
+	for cut > 0 && !utf8.RuneStart(id[cut]) {
+		cut--
+	}
+	return id[:cut] + "\u2026"
+}
+
+// reviewFindingTitleRefusal names the finding whose title cannot become a work
+// item title, in the words tt send uses for the same title. Field is the list
+// the client sent the finding in: review.findings or review.blockers. The
+// reason never repeats the title, and the finding ID is echoed through
+// reviewFindingIDEcho, so the text is safe to return to the client.
+func reviewFindingTitleRefusal(field string, f api.ReviewFinding) error {
+	reason := fmt.Sprintf("must be a work item title of 1 to %d characters", api.MaxReviewFindingTitleLen)
+	if problems := api.ReviewFindingTitleProblems(&api.ReviewMetadata{Findings: []api.ReviewFinding{f}}); len(problems) > 0 {
+		reason = problems[0].Reason
+	}
+	return fmt.Errorf("%w: %s[%s].title: %s", api.ErrInvalid, field, reviewFindingIDEcho(f.ID), reason)
 }
 
 func (s *Store) fileReviewFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, f api.ReviewFinding, m api.Message, by api.Caller) (api.ReviewFollowUp, error) {
+	return s.fileReviewFollowUpFrom(ctx, tx, parent, "review.findings", f, m, by)
+}
+
+// fileReviewFollowUpFrom files a finding the client sent under field.
+func (s *Store) fileReviewFollowUpFrom(ctx context.Context, tx *sql.Tx, parent api.WorkItem, field string, f api.ReviewFinding, m api.Message, by api.Caller) (api.ReviewFollowUp, error) {
 	out := api.ReviewFollowUp{Finding: f, MessageSeq: m.Seq}
 	kind := f.Kind
 	if kind == "" {
@@ -1075,7 +1113,7 @@ func (s *Store) fileReviewFollowUp(ctx context.Context, tx *sql.Tx, parent api.W
 		return out, api.ErrInvalid
 	}
 	if !validWorkItemTitle(f.Title) {
-		return out, reviewFindingTitleRefusal(f)
+		return out, reviewFindingTitleRefusal(field, f)
 	}
 	raw, _ := json.Marshal(f)
 	now := s.now()

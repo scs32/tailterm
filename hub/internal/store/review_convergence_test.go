@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestReviewConvergenceBaselineCap(t *testing.T) {
@@ -771,14 +772,15 @@ func findingTitleReason(t *testing.T, err error) string {
 
 // A round-two blocker that is new and not a regression is filed as a
 // follow-up. The envelope check covers review.findings only, so its title
-// first meets the work item title rule here.
+// first meets the work item title rule here, and the refusal names
+// review.blockers, the field the client sent it in.
 func TestReviewConvergenceRoundTwoBlockerTitleRefusalNamesFinding(t *testing.T) {
 	long := strings.Repeat("x", 121)
 	rule := "; a title is 1 to 120 characters"
 	for name, tc := range map[string]struct{ title, want string }{
-		"too long": {long, "review.findings[b2].title: must be at most 120 characters, has 121"},
-		"padded":   {" Retry drops receipt ", "review.findings[b2].title: must not start or end with a space" + rule},
-		"control":  {"Retry drops\x1b[31m receipt\x00", "review.findings[b2].title: must not contain control characters" + rule},
+		"too long": {long, "review.blockers[b2].title: must be at most 120 characters, has 121"},
+		"padded":   {" Retry drops receipt ", "review.blockers[b2].title: must not start or end with a space" + rule},
+		"control":  {"Retry drops\x1b[31m receipt\x00", "review.blockers[b2].title: must not contain control characters" + rule},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newConvergenceFixture(t)
@@ -816,6 +818,104 @@ func TestReviewConvergenceRoundTwoBlockerTitleRefusalNamesFinding(t *testing.T) 
 	}
 }
 
+// A blank title is refused like any other title a work item cannot carry: the
+// reason names the list the client sent the entry in, the finding ID and
+// .title. An entry with no ID has nothing to name and keeps a plain refusal.
+func TestReviewFindingBlankTitleRefusalNamesFieldAndFinding(t *testing.T) {
+	rule := "; a title is 1 to 120 characters"
+	criteria := map[string]string{"a1": "one", "a2": "two"}
+	for name, tc := range map[string]struct {
+		title   string
+		blocker bool
+		want    string
+	}{
+		"empty blocker": {"", true, "review.blockers[x1].title: must not be empty" + rule},
+		"blank blocker": {" \t ", true, "review.blockers[x1].title: must not start or end with a space" + rule},
+		"empty finding": {"", false, "review.findings[x1].title: must not be empty" + rule},
+		"blank finding": {"  ", false, "review.findings[x1].title: must not start or end with a space" + rule},
+	} {
+		t.Run(name, func(t *testing.T) {
+			finding := api.ReviewFinding{ID: "x1", Criterion: "a2", Title: tc.title, File: "fixture.go", Line: 6}
+			if reason := findingTitleReason(t, evidenceFinding(finding, candidateA, criteria, tc.blocker)); reason != tc.want {
+				t.Fatalf("reason %q, want %q", reason, tc.want)
+			}
+		})
+	}
+	for field, blocker := range map[string]bool{"review.blockers": true, "review.findings": false} {
+		err := evidenceFinding(api.ReviewFinding{Criterion: "a2", Title: "Has no ID", File: "fixture.go", Line: 6}, candidateA, criteria, blocker)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), field+" entry needs a stable ID") {
+			t.Fatalf("missing ID under %s: %v", field, err)
+		}
+	}
+	// The posted path: a first-round blocker stays a blocker and is never
+	// filed, so only this check sees its blank title.
+	f := newConvergenceFixture(t)
+	r := f.review(t, candidateA)
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	for title, want := range map[string]string{
+		"":   "review.blockers[b1].title: must not be empty" + rule,
+		"  ": "review.blockers[b1].title: must not start or end with a space" + rule,
+	} {
+		b := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: title, File: "fixture.go", Line: 6}
+		_, err := f.post(f.resultEnv(candidateA, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r.Seq, f.reviewer)
+		if reason := findingTitleReason(t, err); reason != want {
+			t.Fatalf("posted reason %q, want %q", reason, want)
+		}
+	}
+	noID := api.ReviewFinding{Criterion: "a2", Title: "Has no ID", File: "fixture.go", Line: 6}
+	_, err := f.post(f.resultEnv(candidateA, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{noID}}), "", r.Seq, f.reviewer)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "review.blockers entry needs a stable ID") {
+		t.Fatal("posted missing ID", err)
+	}
+	if st := f.state(t); st.Rounds[0].ResultSeq != 0 || len(st.Rounds[0].Blockers) != 0 {
+		t.Fatal("refused result saved something", st)
+	}
+}
+
+// Every refusal that repeats a finding ID caps it at 64 bytes, cut on a
+// character boundary, with control characters still replaced.
+func TestReviewFindingIDEchoIsCapped(t *testing.T) {
+	exact := strings.Repeat("a", 64)
+	for name, tc := range map[string]struct{ id, want string }{
+		"short":        {"f3", "f3"},
+		"at the cap":   {exact, exact},
+		"over the cap": {exact + "b", exact + "\u2026"},
+		// 63 bytes then a two-byte character: the cut backs up to byte 63.
+		"character boundary": {strings.Repeat("a", 63) + "\u00e9tail", strings.Repeat("a", 63) + "\u2026"},
+		"multibyte":          {strings.Repeat("\u00e9", 40), strings.Repeat("\u00e9", 32) + "\u2026"},
+		"control":            {"f\x1b3\n" + strings.Repeat("z", 70), "f 3 " + strings.Repeat("z", 60) + "\u2026"},
+		"invalid utf8":       {"f\xff3", "f 3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := reviewFindingIDEcho(tc.id)
+			if got != tc.want || !utf8.ValidString(got) {
+				t.Fatalf("echo %q, want %q", got, tc.want)
+			}
+			rule := "; a title is 1 to 120 characters"
+			for _, field := range []string{"review.findings", "review.blockers"} {
+				want := field + "[" + tc.want + "].title: must not be empty" + rule
+				if reason := findingTitleReason(t, reviewFindingTitleRefusal(field, api.ReviewFinding{ID: tc.id})); reason != want {
+					t.Fatalf("reason %q, want %q", reason, want)
+				}
+			}
+		})
+	}
+	// A round-two result that drops a prior blocker repeats that blocker's ID.
+	f := newConvergenceFixture(t)
+	long := strings.Repeat("k", 200)
+	r := f.review(t, candidateA)
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	b := api.ReviewFinding{ID: long, Criterion: "a2", Title: "Retry drops receipt", File: "fixture.go", Line: 6}
+	if _, err := f.post(f.resultEnv(candidateA, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	r2 := f.review(t, candidateB)
+	_, err := f.post(f.resultEnv(candidateB, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r2.Seq, f.reviewer)
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "explicitly resolve "+long[:64]+"\u2026") {
+		t.Fatal("dropped blocker refusal", err)
+	}
+}
+
 // fileReviewFollowUp is the last check before a finding becomes a work item,
 // whatever path reached it.
 func TestReviewFollowUpTitleRefusalNamesFieldAndFinding(t *testing.T) {
@@ -837,6 +937,7 @@ func TestReviewFollowUpTitleRefusalNamesFieldAndFinding(t *testing.T) {
 		"padded":     {"f3", "Padded title ", "review.findings[f3].title: must not start or end with a space" + rule},
 		"control":    {"f3", "Tab\there", "review.findings[f3].title: must not contain control characters" + rule},
 		"control id": {"f\x1b3\n", "", "review.findings[f 3 ].title: must not be empty" + rule},
+		"long id":    {strings.Repeat("i", 65), "", "review.findings[" + strings.Repeat("i", 64) + "\u2026].title: must not be empty" + rule},
 	} {
 		t.Run(name, func(t *testing.T) {
 			reason := findingTitleReason(t, file(api.ReviewFinding{ID: tc.id, Title: tc.title, File: "fixture.go", Line: 3}))
