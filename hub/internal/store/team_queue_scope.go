@@ -18,6 +18,11 @@ func canonicalQueueOwnership(paths []string) ([]string, error) {
 	out := make([]string, 0, len(paths))
 	seen := map[string]bool{}
 	for _, p := range paths {
+		// A comma is the mark of several paths joined into one value, which
+		// would own none of them.
+		if strings.Contains(p, ",") {
+			return nil, fmt.Errorf("%w: ownership path %q contains a comma; give each path separately", api.ErrInvalid, p)
+		}
 		if !utf8.ValidString(p) || p == "" || len(p) > 1024 || strings.HasPrefix(p, "/") || strings.ContainsAny(p, "\\\x00") || strings.Contains(p, "//") || strings.HasSuffix(p, "/") || strings.Contains(p, ":") {
 			return nil, fmt.Errorf("%w: invalid ownership path", api.ErrInvalid)
 		}
