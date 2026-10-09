@@ -69,18 +69,7 @@ func queueWaitIdleBound() time.Duration {
 
 // queueWaitPathsText lists paths for a notice body, cut to fit it.
 func queueWaitPathsText(paths []string) string {
-	var b strings.Builder
-	for i, p := range paths {
-		if b.Len()+len(p) > queueWaitPathsBytes && i > 0 {
-			fmt.Fprintf(&b, " and %d more", len(paths)-i)
-			break
-		}
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(p)
-	}
-	return b.String()
+	return api.TeamQueueWaitPaths(paths, queueWaitPathsBytes)
 }
 
 func sameQueueWaitPaths(a, b []string) bool {
@@ -288,6 +277,8 @@ type queueWaitRow struct {
 	noticeSeq                          int64
 	// The waiting entry; waitingState is empty when its row is gone.
 	waitingState, waitingReleased, waitingOwner string
+	// hasLead: the waiting item has its own live team lead to tell.
+	hasLead bool
 	// The predecessor entry, its item and its latest release job.
 	predExists                                         bool
 	predState, predReleased, predAcceptance, predOwner string
@@ -375,16 +366,21 @@ func (w queueWaitRow) orphaned() string {
 
 // QueueWaitSweep runs the broker tick's pass over shared-path waits at now.
 // It reads every open wait of the open, unpaused projects in one query. A
-// tick with nothing to change writes nothing; each wait that changes state
-// commits its notice and its new state together, so a retried tick and a
-// restarted hub read the durable state and post nothing twice.
+// tick with nothing to change writes nothing and takes no write lock: a met
+// wait whose entry has no lead yet is seen in that read, and a wait to
+// report with no primary handler costs two more reads per project. Each wait
+// that changes state commits its notice and its new state together, so a
+// retried tick and a restarted hub read the durable state and post nothing
+// twice.
 func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitStep, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT w.task_id,w.entry_id,w.item_id,w.on_entry_id,w.on_item_id,w.paths_json,w.until,w.state,w.met_at,w.met_commit,w.notice_seq,
- COALESCE(we.state,''),COALESCE(we.released_at,''),COALESCE(we.owner_integration_json,''),
+ COALESCE(we.state,''),COALESCE(we.released_at,''),COALESCE(we.owner_integration_json,''),la.id IS NOT NULL,
  pe.id IS NOT NULL,COALESCE(pe.state,''),COALESCE(pe.released_at,''),COALESCE(pe.acceptance_json,''),COALESCE(pe.owner_integration_json,''),
  COALESCE(pi.status,''),COALESCE(rj.state,''),COALESCE(rj.record_json,'')
  FROM team_queue_waits w JOIN tasks t ON t.id=w.task_id
  LEFT JOIN team_queue_entries we ON we.task_id=w.task_id AND we.id=w.entry_id
+ LEFT JOIN item_team_leads l ON l.task_id=w.task_id AND l.item_id=w.item_id AND l.state<>'closed'
+ LEFT JOIN agents la ON la.id=l.agent_id AND la.run_id=l.run_id AND la.task_id=w.task_id AND la.status NOT IN ('closed','exited')
  LEFT JOIN team_queue_entries pe ON pe.task_id=w.task_id AND pe.id=w.on_entry_id
  LEFT JOIN work_items pi ON pi.task_id=w.task_id AND pi.id=w.on_item_id
  LEFT JOIN release_jobs rj ON rj.task_id=w.task_id AND rj.entry_id=w.on_entry_id
@@ -399,7 +395,7 @@ func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitS
 		var w queueWaitRow
 		var paths string
 		if err := rows.Scan(&w.task, &w.entry, &w.item, &w.onEntry, &w.onItem, &paths, &w.until, &w.state, &w.metAt, &w.metCommit, &w.noticeSeq,
-			&w.waitingState, &w.waitingReleased, &w.waitingOwner,
+			&w.waitingState, &w.waitingReleased, &w.waitingOwner, &w.hasLead,
 			&w.predExists, &w.predState, &w.predReleased, &w.predAcceptance, &w.predOwner, &w.itemStatus, &w.jobState, &w.jobRecord); err != nil {
 			rows.Close()
 			return nil, err
@@ -415,8 +411,23 @@ func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitS
 	}
 	var steps []QueueWaitStep
 	var firstErr error
+	// Whether a project has a primary handler to tell, read at most once per
+	// sweep and only for a project with a wait to report.
+	handlers := map[string]bool{}
+	hasHandler := func(task string) (bool, error) {
+		if known, ok := handlers[task]; ok {
+			return known, nil
+		}
+		t, err := scanTask(s.db.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
+		if err != nil {
+			return false, err
+		}
+		handler, err := queueWaitHandler(ctx, s.db, t)
+		handlers[task] = handler.ID != ""
+		return handlers[task], err
+	}
 	for _, w := range open {
-		step, err := s.sweepQueueWait(ctx, w, now)
+		step, err := s.sweepQueueWait(ctx, w, now, hasHandler)
 		if err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("queue wait sweep %s on %s: %w", w.entry, w.onEntry, err)
 		}
@@ -428,7 +439,7 @@ func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitS
 }
 
 // sweepQueueWait takes at most one step for one wait.
-func (s *Store) sweepQueueWait(ctx context.Context, w queueWaitRow, now time.Time) (*QueueWaitStep, error) {
+func (s *Store) sweepQueueWait(ctx context.Context, w queueWaitRow, now time.Time, hasHandler func(string) (bool, error)) (*QueueWaitStep, error) {
 	if w.waitingEnded() {
 		return nil, s.queueWaitTx(ctx, w, func(tx *sql.Tx, _ api.Task) (bool, error) {
 			_, err := tx.ExecContext(ctx, `UPDATE team_queue_waits SET state=?,closed_at=?,reason=? WHERE task_id=? AND entry_id=? AND on_entry_id=?`,
@@ -439,9 +450,17 @@ func (s *Store) sweepQueueWait(ctx context.Context, w queueWaitRow, now time.Tim
 	switch w.state {
 	case api.TeamQueueWaitWaiting:
 		if ok, commit, kind := w.met(); ok {
+			if !w.hasLead {
+				// A queued entry has no team yet; its own lead is told once
+				// it exists. Nothing is locked or written until then.
+				return nil, nil
+			}
 			return s.queueWaitMet(ctx, w, commit, kind, now)
 		}
 		if reason := w.orphaned(); reason != "" {
+			if ok, err := hasHandler(w.task); err != nil || !ok {
+				return nil, err
+			}
 			return s.queueWaitOrphaned(ctx, w, reason, now)
 		}
 	case api.TeamQueueWaitMet:
@@ -503,13 +522,32 @@ func (w queueWaitRow) refs(activity string) map[string]string {
 	return map[string]string{"activity": activity, "entry": w.entry, "item": w.item, "predecessor": w.onItem, "predecessorEntry": w.onEntry, "condition": w.until}
 }
 
+// queueWaitLead is the waiting item's own live team lead. It never falls
+// back to the project orchestrator, which may lead another item: a queued
+// entry's lead does not exist yet and must be the one told.
+func queueWaitLead(ctx context.Context, tx *sql.Tx, task, item string) (api.Agent, error) {
+	var agentID, runID string
+	err := tx.QueryRowContext(ctx, `SELECT agent_id,run_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, task, item).Scan(&agentID, &runID)
+	if err == nil {
+		var lead api.Agent
+		lead, err = scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND run_id=? AND status NOT IN (?,?)`, task, agentID, runID, api.AgentClosed, api.AgentExited))
+		if err == nil {
+			return lead, nil
+		}
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return api.Agent{}, nil
+	}
+	return api.Agent{}, err
+}
+
 // queueWaitMet tells the waiting entry's lead that the condition is met and
 // marks the wait met in the same transaction. With no live lead yet, the
 // wait stays waiting and the next tick tries again.
 func (s *Store) queueWaitMet(ctx context.Context, w queueWaitRow, commit, kind string, now time.Time) (*QueueWaitStep, error) {
 	var step *QueueWaitStep
 	err := s.queueWaitTx(ctx, w, func(tx *sql.Tx, task api.Task) (bool, error) {
-		lead, err := queueEntryLead(ctx, tx, task, w.item)
+		lead, err := queueWaitLead(ctx, tx, w.task, w.item)
 		if err != nil || lead.ID == "" {
 			return false, err
 		}
@@ -543,8 +581,8 @@ func (s *Store) queueWaitMet(ctx context.Context, w queueWaitRow, commit, kind s
 
 // queueWaitHandler is the project's primary handler when it can be told: a
 // missing or retired one is no recipient.
-func queueWaitHandler(ctx context.Context, tx *sql.Tx, task api.Task) (api.Agent, error) {
-	handler, err := primaryHandler(ctx, tx, task)
+func queueWaitHandler(ctx context.Context, q queryRower, task api.Task) (api.Agent, error) {
+	handler, err := primaryHandler(ctx, q, task)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && handler.Status == api.AgentRetired) {
 		return api.Agent{}, nil
 	}
@@ -585,8 +623,9 @@ func (s *Store) queueWaitOrphaned(ctx context.Context, w queueWaitRow, reason st
 
 // queueWaitTeamIdle reports whether the waiting team has done nothing since
 // its wait notice: no message from a live member after it, and every live
-// member done, idle or finished silent (the stall check's member rule).
-func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow) (bool, error) {
+// member done, idle or finished silent and none waiting for or holding the
+// matrix host (the stall check's member rule, team_queue_stall.go).
+func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.Time) (bool, error) {
 	const members = `SELECT b.agent_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN ('closed','exited')`
 	var posted int
@@ -594,19 +633,39 @@ func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow) (bool, er
 		w.task, w.noticeSeq, w.task, w.item, api.AgentRoleDatabaseHandler).Scan(&posted); err != nil || posted > 0 {
 		return false, err
 	}
-	var busy int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
+	rows, err := s.db.QueryContext(ctx, `SELECT a.status,COALESCE(x.state,''),COALESCE(x.payload,'') FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  LEFT JOIN agent_activity x ON x.agent_id=b.agent_id AND x.run_id=b.run_id
- WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN ('closed','exited',?) AND COALESCE(x.state,'') NOT IN ('idle','finished_silent')`,
-		w.task, w.item, api.AgentRoleDatabaseHandler, api.AgentDone).Scan(&busy)
-	return busy == 0, err
+ WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN ('closed','exited')`, w.task, w.item, api.AgentRoleDatabaseHandler)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	idle := true
+	for rows.Next() {
+		var status, state, payload string
+		if err := rows.Scan(&status, &state, &payload); err != nil {
+			return false, err
+		}
+		if status != api.AgentDone && state != "idle" && state != "finished_silent" {
+			idle = false
+		}
+		// A member's verification run waiting for or holding the matrix
+		// host is the team's open work, whatever the member's own state.
+		if strings.Contains(payload, `"matrixWait"`) {
+			var activity api.AgentActivity
+			if json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && now.Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound {
+				idle = false
+			}
+		}
+	}
+	return idle, rows.Err()
 }
 
 // queueWaitIdle follows a met wait: a team that shows activity ends it as
 // resumed; a team idle for the bound is reported once to the owner helper
 // and the primary handler. With neither to tell, the wait stays met.
 func (s *Store) queueWaitIdle(ctx context.Context, w queueWaitRow, now time.Time) (*QueueWaitStep, error) {
-	idle, err := s.queueWaitTeamIdle(ctx, w)
+	idle, err := s.queueWaitTeamIdle(ctx, w, now)
 	if err != nil {
 		return nil, err
 	}

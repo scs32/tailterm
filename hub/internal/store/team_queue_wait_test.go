@@ -822,3 +822,215 @@ func TestQueueWaitNoticeFitsManyPaths(t *testing.T) {
 		t.Fatalf("notice %+v", got)
 	}
 }
+
+// Review b1: a wait with many paths keeps the listed sentence and the
+// entry's blockReason small, so the stall notice that carries blockReason
+// still posts; the JSON waits list keeps every path.
+func TestQueueWaitManyPathsKeepStallNoticePostable(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 2)
+	ctx := context.Background()
+	s.queueStallGrace = time.Nanosecond
+	a := addCheckoutEntry(t, s, task, items[0], orders[0], "/main", "src/a")
+	b := addCheckoutEntry(t, s, task, items[1], orders[1], "/main", "src/b")
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-a", Operation: "claim", EntryID: a.ID, ExpectedRevision: a.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	before := listedEntry(t, s, task.ID, b.ID)
+	if before.Stall == nil {
+		t.Fatalf("no stall: %q", before.BlockReason)
+	}
+	var owns []string
+	for i := 0; i < 60; i++ {
+		owns = append(owns, fmt.Sprintf("hub/internal/store/some_reasonably_long_directory/file_number_%03d_test.go", i))
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "wait-b", Operation: "wait_set", EntryID: b.ID, WaitOnEntryID: a.ID, WaitPaths: owns, WaitUntil: api.TeamQueueWaitAccepted}); err != nil {
+		t.Fatal(err)
+	}
+	got := listedEntry(t, s, task.ID, b.ID)
+	if got.Stall == nil || len(got.Waits) != 1 || len(got.Waits[0].Paths) != 60 {
+		t.Fatalf("stall %v, waits %+v", got.Stall, got.Waits)
+	}
+	sentence := got.Waits[0].Text()
+	if grown := len(got.BlockReason) - len(before.BlockReason); grown != len(". "+sentence) || len(sentence) > 600 || !strings.HasPrefix(got.BlockReason, before.BlockReason) {
+		t.Fatalf("blockReason grew %d bytes for a %d byte sentence: %q", grown, len(sentence), got.BlockReason)
+	}
+	if !strings.HasPrefix(sentence, "waits on "+items[0].ID+" for "+owns[0]+", "+owns[1]) || !strings.HasSuffix(sentence, " more until accepted") || strings.Contains(sentence, owns[59]) {
+		t.Fatalf("sentence %q", sentence)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: got.Stall.NoticeRequestID(b.ID), Operation: "stall_notice", EntryID: b.ID}); err != nil {
+		t.Fatalf("stall notice of an entry with a 60 path wait: %v", err)
+	}
+	// The largest wait the store accepts still fits the notice body.
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "clear-b", Operation: "wait_clear", EntryID: b.ID, WaitOnEntryID: a.ID}); err != nil {
+		t.Fatal(err)
+	}
+	owns = owns[:0]
+	for i := 0; i < 256; i++ {
+		owns = append(owns, fmt.Sprintf("%03d/%s", i, strings.Repeat("p", 1020)))
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "wait-b-max", Operation: "wait_set", EntryID: b.ID, WaitOnEntryID: a.ID, WaitPaths: owns, WaitUntil: api.TeamQueueWaitAccepted}); err != nil {
+		t.Fatal(err)
+	}
+	if got = listedEntry(t, s, task.ID, b.ID); len(got.Waits) != 1 || len(got.Waits[0].Paths) != 256 || len(got.BlockReason) > len(before.BlockReason)+1200 || !strings.Contains(got.BlockReason, "and 255 more until accepted") {
+		t.Fatalf("largest wait: %d paths, blockReason %d bytes", len(got.Waits[0].Paths), len(got.BlockReason))
+	}
+}
+
+// Review f1: a queued waiting entry has no lead of its own. The project
+// orchestrator, here another team's lead, is not told and the wait stays
+// waiting; the entry's own lead is told once it exists.
+func TestQueueWaitMetNeverFallsBackToProjectOrchestrator(t *testing.T) {
+	f := newWaitFixture(t)
+	ref := api.MessageReference{TaskID: f.task.ID, Seq: f.orders[0].Seq}
+	other, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "pred-lead", AgentID: api.NewID("agt"), Host: "mini", Session: "pred-lead",
+		WorkItem: &api.AgentWorkItemRequest{ItemTaskID: f.task.ID, ItemID: f.items[0].ID, ItemRevision: f.items[0].Revision, WorkOrderMessage: ref, ContextBundle: syntheticPreparedContext(t, f.items[0], ref, syntheticHistory(f.items[0], f.orders[0]))}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(t, `UPDATE tasks SET orchestrator='pred-lead' WHERE id=?`, f.task.ID)
+	f.exec(t, `INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.items[0].ID, other.ID, other.RunID)
+	f.set(t, api.TeamQueueWaitAccepted)
+	f.meet(t, api.TeamQueueWaitAccepted)
+	before := f.messageCount(t)
+	for i := 0; i < 3; i++ {
+		if steps := f.sweep(t); len(steps) != 0 || f.state(t) != api.TeamQueueWaitWaiting {
+			t.Fatalf("queued entry without a lead: steps %v, state %s", steps, f.state(t))
+		}
+	}
+	if f.messageCount(t) != before || len(f.notices(t, other, queueWaitMetSubject)) != 0 {
+		t.Fatal("the project orchestrator was told of another entry's wait")
+	}
+	// A closed lead row, or a lead whose agent is closed, is no lead either.
+	f.team(t)
+	f.exec(t, `UPDATE item_team_leads SET state='closed' WHERE item_id=?`, f.items[1].ID)
+	if steps := f.sweep(t); len(steps) != 0 {
+		t.Fatalf("closed lead row: %v", steps)
+	}
+	f.exec(t, `UPDATE item_team_leads SET state='running' WHERE item_id=?`, f.items[1].ID)
+	f.exec(t, `UPDATE agents SET status='closed' WHERE id=?`, f.lead.ID)
+	if steps := f.sweep(t); len(steps) != 0 || f.state(t) != api.TeamQueueWaitWaiting {
+		t.Fatalf("closed lead agent: %v", steps)
+	}
+	f.exec(t, `UPDATE agents SET status='done' WHERE id=?`, f.lead.ID)
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+		t.Fatalf("with its own lead: %v", steps)
+	}
+	if own, orchestrator := f.notices(t, f.lead, queueWaitMetSubject), f.notices(t, other, queueWaitMetSubject); len(own) != 1 || len(orchestrator) != 0 {
+		t.Fatalf("%d notices to the entry's lead, %d to the orchestrator", len(own), len(orchestrator))
+	}
+	if steps := f.sweep(t); len(steps) != 0 {
+		t.Fatalf("told twice: %v", steps)
+	}
+}
+
+// Review f2: a member waiting for or holding the matrix host is the team's
+// open work, as in the stall check: the team is not reported as idle. A
+// matrix wait the relay stopped updating counts only within its bound.
+func TestQueueWaitMatrixWaitIsNotIdle(t *testing.T) {
+	for name, c := range map[string]struct {
+		wait  func(now time.Time) *api.MatrixWait
+		state string
+		steps int
+	}{
+		"waiting for the host": {func(now time.Time) *api.MatrixWait {
+			return &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 1, Since: now}
+		}, api.TeamQueueWaitResumed, 0},
+		"holding the host": {func(now time.Time) *api.MatrixWait {
+			return &api.MatrixWait{Role: api.MatrixWaitRunning, Since: now}
+		}, api.TeamQueueWaitResumed, 0},
+		"a wait past its bound": {func(now time.Time) *api.MatrixWait {
+			return &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 1, Since: now.Add(-defaultQueueMatrixWaitBound)}
+		}, api.TeamQueueWaitOverdue, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			helper := f.helper(t)
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.meet(t, api.TeamQueueWaitAccepted)
+			f.sweep(t)
+			// Every member is done and idle; only the matrix run is open.
+			if _, err := f.s.ReportActivity(f.ctx, f.task.ID, f.member.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: f.member.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: f.clock, MatrixWait: c.wait(f.clock)}}); err != nil {
+				t.Fatal(err)
+			}
+			f.exec(t, `UPDATE agents SET status='done' WHERE id=?`, f.member.ID)
+			f.clock = f.clock.Add(15 * time.Minute)
+			if steps := f.sweep(t); len(steps) != c.steps || f.state(t) != c.state {
+				t.Fatalf("steps %v, state %s, want %d and %s", steps, f.state(t), c.steps, c.state)
+			}
+			if n := len(f.notices(t, helper, queueWaitOverdueSubject)) + len(f.notices(t, f.handler, queueWaitOverdueSubject)); n != 2*c.steps {
+				t.Fatalf("%d overdue notices", n)
+			}
+		})
+	}
+}
+
+// Review f3: a tick where a wait cannot step takes no write lock. The test
+// holds the store's write lock, so a sweep that needed it would not return.
+func TestQueueWaitSweepTakesNoWriteLockWhenNoOneCanBeTold(t *testing.T) {
+	for name, arrange := range map[string]func(*testing.T, *waitFixture){
+		"met with no lead yet": func(t *testing.T, f *waitFixture) {
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.meet(t, api.TeamQueueWaitAccepted)
+		},
+		"orphaned with no primary handler": func(t *testing.T, f *waitFixture) {
+			f.team(t)
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.exec(t, `UPDATE team_queue_entries SET state='finished' WHERE id=?`, f.pred.ID)
+			f.exec(t, `UPDATE agents SET status='closed' WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleDatabaseHandler)
+		},
+		"orphaned with a retired primary handler": func(t *testing.T, f *waitFixture) {
+			f.team(t)
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.exec(t, `UPDATE team_queue_entries SET state='finished' WHERE id=?`, f.pred.ID)
+			f.exec(t, `UPDATE agents SET status='retired' WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleDatabaseHandler)
+		},
+		"waiting on a pending predecessor": func(t *testing.T, f *waitFixture) {
+			f.team(t)
+			f.set(t, api.TeamQueueWaitReleased)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			arrange(t, f)
+			before := f.messageCount(t)
+			f.s.writeMu.Lock()
+			done := make(chan error, 1)
+			go func() {
+				steps, err := f.s.QueueWaitSweep(f.ctx, f.clock)
+				if err == nil && len(steps) != 0 {
+					err = fmt.Errorf("steps %v", steps)
+				}
+				done <- err
+			}()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				err = errors.New("the sweep waited for the write lock")
+			}
+			f.s.writeMu.Unlock()
+			if err != nil {
+				<-done
+				t.Fatal(err)
+			}
+			if f.state(t) != api.TeamQueueWaitWaiting || f.messageCount(t) != before {
+				t.Fatalf("state %s, %d new messages", f.state(t), f.messageCount(t)-before)
+			}
+		})
+	}
+	// With someone to tell, the same waits step on the next sweep.
+	f := newWaitFixture(t)
+	f.team(t)
+	f.set(t, api.TeamQueueWaitAccepted)
+	f.exec(t, `UPDATE team_queue_entries SET state='finished' WHERE id=?`, f.pred.ID)
+	f.exec(t, `UPDATE agents SET status='closed' WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleDatabaseHandler)
+	if steps := f.sweep(t); len(steps) != 0 {
+		t.Fatalf("no handler: %v", steps)
+	}
+	f.exec(t, `UPDATE agents SET status='running' WHERE id=?`, f.handler.ID)
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-orphaned" {
+		t.Fatalf("handler back: %v", steps)
+	}
+}

@@ -756,6 +756,11 @@ the queue view shows:
 - `wait on ITEM needs a handler decision: REASON` when the predecessor can no
   longer meet the condition.
 
+The sentence names the first path and then whole paths up to about 300 bytes,
+then `and N more`, so a wait with many paths keeps `blockReason` small (a stall
+notice carries that reason in a 4 KiB body). `waits[].paths` always lists
+every path.
+
 A listing shows the recorded state and evaluates nothing: a wait whose
 condition already holds reads `waiting` until the next broker tick.
 
@@ -769,12 +774,14 @@ a repeated tick or a restarted hub posts nothing twice.
   waiting entry's lead, `A shared path this team waited on is now free`. It
   names the predecessor item and entry, the condition, the commit and whether
   it is the accepted or the released one, the paths now free, and says to
-  rebase before editing them. A waiting entry with no live lead yet (it is
-  still queued) keeps waiting and is told once it has one.
+  rebase before editing them. Only the waiting item's own team lead is told,
+  never the project orchestrator in its place: a waiting entry with no live
+  lead yet (it is still queued) keeps waiting and is told once it has one.
 - **Idle after met.** If no member of the waiting team posts after that
-  notice and every live member is done or idle for the bound, the owner helper
-  and the primary handler each get one NOTICE, `A team is idle after its
-  shared path wait was met`. The bound is 15 minutes, or
+  notice and every live member is done or idle for the bound, with none
+  waiting for or holding the matrix host (the stall check's member rule), the
+  owner helper and the primary handler each get one NOTICE, `A team is idle
+  after its shared path wait was met`. The bound is 15 minutes, or
   `TAILTERM_QUEUE_WAIT_IDLE_MINUTES` (1 to 1440) in the hub's environment. A
   team that shows activity once ends the wait as resumed and is never
   reported for it.
@@ -795,10 +802,13 @@ a repeated tick or a restarted hub posts nothing twice.
 `released` is judged once: a release that is rolled back after the notice is
 not evaluated again.
 
-Cost: one indexed read per tick, which returns nothing while no wait is open,
-and no write on a tick where nothing changes. Each wait that changes state
-costs one write transaction, at most three times in its life. A met wait
-costs two more reads per tick until it resumes or the bound passes. A listing
+Cost: one indexed read per tick, which returns nothing while no wait is open.
+A tick where nothing changes writes nothing and takes no write lock: a met
+condition whose entry has no lead yet is seen in that one read, and a wait to
+report while the project has no primary handler costs two more reads per
+project per tick. Each wait that changes state costs one write transaction,
+at most three times in its life. A met wait costs two more reads per tick
+until it resumes or the bound passes. A listing
 adds one indexed read for the project, not one per entry. The relay makes no
 new request: the notices use the ordinary delivery obligation and wake.
 

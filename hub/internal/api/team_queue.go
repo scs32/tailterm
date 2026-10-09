@@ -153,9 +153,32 @@ type TeamQueueWait struct {
 	Reason    string   `json:"reason,omitempty"`
 }
 
-// Text is the wait's one sentence in a listing and in BlockReason.
+// TeamQueueWaitTextPathBytes caps the path list in a wait's sentence. The
+// sentence is appended to BlockReason, which a stall notice carries in a body
+// of at most MaxEnvelopeBodyBytes; Paths itself always lists every path.
+const TeamQueueWaitTextPathBytes = 300
+
+// TeamQueueWaitPaths lists paths in one line of about max bytes: the first
+// path always, then whole paths while they fit, then "and N more".
+func TeamQueueWaitPaths(paths []string, max int) string {
+	var b strings.Builder
+	for i, p := range paths {
+		if i > 0 && b.Len()+len(p) > max {
+			fmt.Fprintf(&b, " and %d more", len(paths)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(p)
+	}
+	return b.String()
+}
+
+// Text is the wait's one sentence in a listing and in BlockReason, with a
+// long path list cut short.
 func (w TeamQueueWait) Text() string {
-	paths := strings.Join(w.Paths, ", ")
+	paths := TeamQueueWaitPaths(w.Paths, TeamQueueWaitTextPathBytes)
 	switch w.State {
 	case TeamQueueWaitMet:
 		commit := w.MetCommit

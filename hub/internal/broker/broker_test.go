@@ -869,9 +869,22 @@ func TestBrokerTickRunsDeployerLivenessSweep(t *testing.T) {
 // that have no short public path from this package.
 type waitProject struct {
 	handler, helper api.Agent
-	predItem        api.WorkItem
-	pred, waiting   api.TeamQueueEntry
-	db              *sql.DB
+	// waitingLead is the waiting item's own lead once giveLead has run. The
+	// fixture's project orchestrator, f.lead, leads neither item.
+	waitingLead           api.Agent
+	predItem, waitingItem api.WorkItem
+	pred, waiting         api.TeamQueueEntry
+	db                    *sql.DB
+}
+
+// giveLead gives the waiting item its own live team lead, as its launch does.
+func (f *fixture) giveLead(t *testing.T, p *waitProject) {
+	t.Helper()
+	var err error
+	if p.waitingLead, err = f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "waiting-lead", Host: "h", Session: "waiting-lead", Runtime: "codex"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	p.exec(t, `INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, p.waitingItem.ID, p.waitingLead.ID, p.waitingLead.RunID)
 }
 
 func (f *fixture) waitProject(t *testing.T) *waitProject {
@@ -907,7 +920,7 @@ func (f *fixture) waitProject(t *testing.T) *waitProject {
 		return item, q
 	}
 	p.predItem, p.pred = queue("wait-pred")
-	_, p.waiting = queue("wait-waiting")
+	p.waitingItem, p.waiting = queue("wait-waiting")
 	if p.db, err = sql.Open("sqlite", f.path); err != nil {
 		t.Fatal(err)
 	}
@@ -992,6 +1005,13 @@ func TestBrokerTickNotifiesMetWaitOnceAndReportsIdleTeamOnce(t *testing.T) {
 			t.Fatalf("listing evaluated the wait: %+v", e.Waits)
 		}
 	}
+	// The waiting entry is still queued and has no lead of its own: the
+	// project orchestrator is not told in its place (review f1).
+	want(t, "met with no lead yet", f.waitSteps(t, now.Add(10*time.Second)))
+	if got := f.waitNotices(t, waitMetSubject); len(got) != 0 {
+		t.Fatalf("told before the entry had a lead: %v", got)
+	}
+	f.giveLead(t, p)
 	met := now.Add(30 * time.Second)
 	want(t, "at the condition", f.waitSteps(t, met), "wait-met")
 	for i := 1; i <= 5; i++ {
@@ -1001,8 +1021,8 @@ func TestBrokerTickNotifiesMetWaitOnceAndReportsIdleTeamOnce(t *testing.T) {
 	for i := 6; i <= 10; i++ {
 		want(t, "a tick after restart", f.waitSteps(t, met.Add(time.Duration(i)*30*time.Second)))
 	}
-	if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[f.lead.ID] != 1 {
-		t.Fatalf("met notices by recipient %v, want one to the lead", got)
+	if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[p.waitingLead.ID] != 1 {
+		t.Fatalf("met notices by recipient %v, want one to the waiting entry's lead", got)
 	}
 
 	want(t, "one second before the bound", f.waitSteps(t, met.Add(15*time.Minute-time.Second)))
@@ -1014,7 +1034,7 @@ func TestBrokerTickNotifiesMetWaitOnceAndReportsIdleTeamOnce(t *testing.T) {
 	if got := f.waitNotices(t, waitOverdueSubject); len(got) != 2 || got[p.helper.ID] != 1 || got[p.handler.ID] != 1 {
 		t.Fatalf("overdue notices by recipient %v, want one each to the owner helper and the handler", got)
 	}
-	if got := f.waitNotices(t, waitMetSubject); got[f.lead.ID] != 1 {
+	if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[p.waitingLead.ID] != 1 {
 		t.Fatalf("met notices %v", got)
 	}
 }
@@ -1032,6 +1052,7 @@ func TestBrokerTickNotifiesDoneAndReleasedWaits(t *testing.T) {
 		t.Run(until, func(t *testing.T) {
 			f := newFixture(t)
 			p := f.waitProject(t)
+			f.giveLead(t, p)
 			f.setWait(t, p, until)
 			now := time.Now().UTC()
 			want(t, "before the condition", f.waitSteps(t, now))
@@ -1041,8 +1062,8 @@ func TestBrokerTickNotifiesDoneAndReleasedWaits(t *testing.T) {
 			for i := 2; i <= 11; i++ {
 				want(t, "a later tick", f.waitSteps(t, now.Add(time.Duration(i)*30*time.Second)))
 			}
-			if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[f.lead.ID] != 1 {
-				t.Fatalf("met notices by recipient %v, want one to the lead", got)
+			if got := f.waitNotices(t, waitMetSubject); len(got) != 1 || got[p.waitingLead.ID] != 1 {
+				t.Fatalf("met notices by recipient %v, want one to the waiting entry's lead", got)
 			}
 		})
 	}
@@ -1053,6 +1074,7 @@ func TestBrokerTickNotifiesDoneAndReleasedWaits(t *testing.T) {
 func TestBrokerTickReportsOrphanedWaitToHandlerOnce(t *testing.T) {
 	f := newFixture(t)
 	p := f.waitProject(t)
+	f.giveLead(t, p)
 	f.setWait(t, p, api.TeamQueueWaitAccepted)
 	if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "remove-pred", Operation: "remove", EntryID: p.pred.ID, ExpectedRevision: p.pred.Revision}); err != nil {
 		t.Fatal(err)
