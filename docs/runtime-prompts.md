@@ -101,10 +101,10 @@ a Claude wake:
 Each prompt fingerprint gets at most one attempt per run, unless the prompt
 returns after a confirmed answer: that answer saw the prompt gone, so the same
 fingerprint showing again is decided afresh, inside the answer limit, and
-reported with a new `since`. A failed or
-ambiguous answer is never resent, including after a relay restart mid-answer,
-and escalates. A skipped answer (paused project, retired agent, pane or
-prompt changed, answer limit) sends no key and is retried on a later tick.
+reported with a new `since`. A failed or ambiguous answer is never resent,
+including after a relay restart mid-answer, and escalates. A skipped answer
+(paused project, retired agent, pane or prompt changed, answer limit) sends no
+key and is retried on a later tick.
 
 Outcomes: `confirmed`, `failed`, `ambiguous`, `escalated`, `reported`,
 `skipped`.

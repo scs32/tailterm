@@ -1709,10 +1709,15 @@ until it is released; a queued entry reserves nothing. A queued entry that
 only a failed entry's reservation holds keeps its stall behind that entry, so
 the release it waits for stays visible. That holds with no shared path too: in
 a parallel project with a free slot, a free handler and no path overlap it
-gets a `failed-entry` stall naming the first failed entry that still reserves,
-and its reason is the stall's followed by `Its reservation holds this entry:`
-and the budget reason. An entry that an earlier reason explains, or that
-overlaps a holding entry, keeps its budget reason and gets no such stall. When
+gets a `failed-entry` stall naming the first failed entry, in queue order,
+that still reserves on the entry's host and still has runs that are not closed
+and cleaned; its reason is the stall's followed by
+`Its reservation holds this entry:` and the budget reason. When no failed
+entry has such a run, the runner releases it on its next pass, and the queued
+entry shows the budget reason and no stall until then. An entry that an
+earlier reason explains shows that earlier reason, an entry blocked by a
+holding entry it overlaps keeps its budget reason, and neither gets this
+stall. When
 something is reserved the reason carries
 `, 700.00K reserved for 1 admitted team: tqe_1f0c…` (or
 `, 600.00K reserved for 2 admitted teams: tqe_1f0c…, tqe_8a52…`) before its
