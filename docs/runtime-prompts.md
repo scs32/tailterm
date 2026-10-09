@@ -74,8 +74,12 @@ tt prompt-policy set --task tsk_… --revision N --action codex_rate_limit_switc
 `set` is the owner's: it refuses inside an agent session, the hub refuses an
 agent caller, a stale revision is a conflict and a disallowed action is
 refused. The API is `GET/PUT /v1/tasks/{id}/runtime-prompt/policy`. The relay
-caches a project's policy for a minute. If the policy cannot be read it
-escalates; an older hub without the endpoint gets no `runtime_prompt` reports.
+caches a project's policy for a minute. An older hub without the endpoint gets
+no `runtime_prompt` reports, and its missing policy is cached for a minute
+too. Any other failed read is not cached, so the next tick reads again. Until
+a read succeeds, a prompt whose kind allows more than one action is reported
+`skipped` with the reason `policy unavailable; retrying` and is decided on the
+next good read; a kind whose only action is `escalate` escalates at once.
 
 ## Answers
 
@@ -94,7 +98,10 @@ a Claude wake:
 5. The answer is confirmed when, within five seconds, the pane no longer shows
    that prompt.
 
-Each prompt fingerprint gets at most one attempt per run. A failed or
+Each prompt fingerprint gets at most one attempt per run, unless the prompt
+returns after a confirmed answer: that answer saw the prompt gone, so the same
+fingerprint showing again is decided afresh, inside the answer limit, and
+reported with a new `since`. A failed or
 ambiguous answer is never resent, including after a relay restart mid-answer,
 and escalates. A skipped answer (paused project, retired agent, pane or
 prompt changed, answer limit) sends no key and is retried on a later tick.

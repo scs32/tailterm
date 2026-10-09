@@ -1707,8 +1707,16 @@ team's turns at or before the reading's capture instant are reflected, so the
 reservation shrinks only when a newer reading arrives. A failed entry reserves
 until it is released; a queued entry reserves nothing. A queued entry that
 only a failed entry's reservation holds keeps its stall behind that entry, so
-the release it waits for stays visible. The reason then carries
-`, 700.00K reserved for 1 admitted team` before its source.
+the release it waits for stays visible. That holds with no shared path too: in
+a parallel project with a free slot, a free handler and no path overlap it
+gets a `failed-entry` stall naming the first failed entry that still reserves,
+and its reason is the stall's followed by `Its reservation holds this entry:`
+and the budget reason. An entry that an earlier reason explains, or that
+overlaps a holding entry, keeps its budget reason and gets no such stall. When
+something is reserved the reason carries
+`, 700.00K reserved for 1 admitted team: tqe_1f0c…` (or
+`, 600.00K reserved for 2 admitted teams: tqe_1f0c…, tqe_8a52…`) before its
+source, naming the reserving queue entries in queue order.
 
 **The reason.** A budget-held entry shows its reason as `blockReason` when no
 earlier reason (slots, host capacity, the agent cap, a handler, ownership)
