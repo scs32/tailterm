@@ -78,6 +78,15 @@ The hub (`POST /v1/tasks/{id}/owner-helper`, owner only) then, in one transactio
 | exited                    | the same agent with a new run (`reattached`)      |
 | live (any open status)    | the same agent with its run replaced (`replaced`) |
 
+**Conditional registration.** The request may carry `expectedRunId`. Then, inside
+the same transaction, the run is replaced only if the helper's current run is that
+run and the helper is running, done or needs-input. Otherwise the hub answers 409
+with the reason (the run changed, or the helper is retired, closed or exited) and
+writes no agent change, receipt, event or saved request, so a retry is judged
+again. A malformed run id is 400. Without the field the route behaves exactly as
+the table says. Only `tt handoff restore` sends it
+([session-handoff.md](session-handoff.md)); `tt helper register` never does.
+
 A retired helper keeps `retired` when its run is replaced; only `tt resume` undoes
 retirement. The helper's name is fixed while it is open: another `--name` is refused
 until the helper is closed. A name held by any other open agent is refused.
@@ -88,7 +97,10 @@ helper's read cursor starts at the latest message, so earlier Board history is n
 unread input for it. At most one helper per project is open (not closed or exited):
 a partial unique index and the transaction check both enforce it.
 
-Then, on this host, `tt helper register`:
+Then, on this host, `tt helper register`, holding an exclusive lock on
+`<helper file>.lock` from before it reads the helper file until it returns, so two
+registrations on one host never interleave (a second one waits, and after 15
+seconds stops with "another registration is in progress on this host"):
 
 1. verifies the returned agent is the live `owner_helper` whose current run is the
    returned run, and otherwise writes nothing;
@@ -124,8 +136,10 @@ ID, and the old binding's transcript no longer moves. The wake then fails closed
 **What the session was holding** (its scheduled wakes, standing instructions and
 orders in flight) can be kept in a host-local record that a new session is told
 about at start: see [session-handoff.md](session-handoff.md). It is off until the
-host turns it on, and in this version it registers nothing and restores nothing:
-the new session still runs `tt helper register` and re-creates its wakes by hand.
+host turns it on. With it on, the new session is prompted to run
+`tt handoff restore --task tsk_...`, which registers it through this same code,
+conditional on the run the previous session held, and lists the wakes to create
+again. The hook itself registers nothing.
 
 ## Hand off between Claude Code and Codex
 
@@ -149,8 +163,10 @@ Mini `tt`, and relay update; source changes alone do not update a running relay.
 
 With the session handoff record switched on ([session-handoff.md](session-handoff.md)),
 run `tt handoff write --task tsk_... --out PATH` in the outgoing session before
-step 1, and `tt handoff show --task tsk_...` in the destination after step 2. The
-record is not proof of registration; step 2 is.
+step 1, and `tt handoff restore --task tsk_...` in the destination after step 2. The
+record is not proof of registration; step 2 is, and restore verifies it against
+the hub. In a Codex destination restore reports every wake as "not restored: this
+runtime has no session timer" and leaves them active in the record.
 
 Codex uses its registered executable and `CODEX_HOME` for native queue delivery.
 Both inbox and broker wakes name `tt helper inbox --task T`. Outside tmux either
@@ -356,7 +372,7 @@ and the Discord bridge credential cannot call the route.
 
 ```sh
 cd hub
-go test ./internal/store ./internal/server -run 'OwnerHelper' -count=1
+go test ./internal/api ./internal/store ./internal/server -run 'OwnerHelper' -count=1
 go test ./cmd/tt -run 'Helper|OwnerHelper|WindowSizeSkipsOwnerHelper|CleanupSkipsOwnerHelper|RetryClaudeBindingSkipsOwnerHelper' -count=1
 cd ..
 node --test tests/owner-helper.test.js
