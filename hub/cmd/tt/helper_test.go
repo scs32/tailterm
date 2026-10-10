@@ -2211,6 +2211,9 @@ type helperFront struct {
 	// answered runs after the hub answered a request and before the caller
 	// gets that answer.
 	answered func(r helperFrontRequest, status int)
+	// lose reports a request whose answer is dropped after the hub committed
+	// it: the caller sees a broken connection.
+	lose func(r helperFrontRequest, status int) bool
 }
 
 type helperFrontRequest struct {
@@ -2226,7 +2229,7 @@ func newHelperFront(t *testing.T, f helperFixture) *helperFront {
 		seen := helperFrontRequest{Method: r.Method, Path: r.URL.Path, Body: body}
 		front.mu.Lock()
 		front.log = append(front.log, seen)
-		answered := front.answered
+		answered, lose := front.answered, front.lose
 		front.mu.Unlock()
 		req, err := http.NewRequest(r.Method, f.owner.hub+r.URL.RequestURI(), bytes.NewReader(body))
 		if err != nil {
@@ -2244,6 +2247,9 @@ func newHelperFront(t *testing.T, f helperFixture) *helperFront {
 		if answered != nil {
 			answered(seen, res.StatusCode)
 		}
+		if lose != nil && lose(seen, res.StatusCode) {
+			panic(http.ErrAbortHandler)
+		}
 		for k, v := range res.Header {
 			w.Header()[k] = v
 		}
@@ -2259,6 +2265,12 @@ func (h *helperFront) onAnswer(fn func(r helperFrontRequest, status int)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.answered = fn
+}
+
+func (h *helperFront) loseAnswer(fn func(r helperFrontRequest, status int) bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lose = fn
 }
 
 // writes are the requests seen so far that could change the hub.
@@ -2622,6 +2634,65 @@ func TestHelperRegisterAfterAnswerGaps(t *testing.T) {
 		}
 		if sent := front.registers(); len(sent) != 1 {
 			t.Fatalf("register requests %v", sent)
+		}
+	})
+	// A restore whose registration answer is lost leaves a pending request and
+	// a hub run the helper file does not name. The next restore does not
+	// resend in order to adopt that run: it refuses on g3 and names the
+	// ordinary recovery, tt helper register.
+	t.Run("a lost answer", func(t *testing.T) {
+		f := newHelperFixture(t)
+		root := t.TempDir()
+		t.Setenv("TAILTERM_HANDOFF_DIR", filepath.Join(root, "handoff"))
+		t.Setenv("TAILTERM_HANDOFF_CONFIG", filepath.Join(root, "handoff.json"))
+		t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(root, "tool-ledger"))
+		if err := os.WriteFile(filepath.Join(root, "handoff.json"), []byte(`{"sessionHandoff": "on"}`+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		front := newHelperFront(t, f)
+		ctx := context.Background()
+		first, err := f.register(t, front.e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restore := func() (string, error) {
+			return captureCLIOutput(t, func() error { return cmdHandoff(front.e, []string{"restore", "--task", f.task.ID}) })
+		}
+		newHelperThread(t)
+		var lost atomic.Bool
+		front.loseAnswer(func(r helperFrontRequest, status int) bool {
+			return r.Method == http.MethodPost && strings.HasSuffix(r.Path, "/owner-helper") && status == http.StatusCreated && !lost.Swap(true)
+		})
+		front.reset()
+		out, err := restore()
+		if err == nil || !strings.Contains(out, "registration: not restored: the registration did not complete") {
+			t.Fatalf("restore with a lost answer = %v\n%s", err, out)
+		}
+		state, _ := loadOwnerHelperFile(front.e.hub, f.task.ID)
+		committed, _ := f.c.GetAgent(ctx, f.task.ID, first.Agent.ID)
+		if state.PendingRequest == "" || state.Run != first.Agent.RunID || committed.RunID == first.Agent.RunID {
+			t.Fatalf("after the lost answer: file %+v, hub run %s", state, committed.RunID)
+		}
+		local, hub := f.helperLocal(t, front.e.hub, "owner"), f.helperHubState(t)
+		front.reset()
+		out, err = restore()
+		if err == nil || out != "" || !strings.Contains(err.Error(), "restore refused by guard g3 current run:") ||
+			!strings.Contains(err.Error(), "if this session's own registration answer was lost, run `tt helper register --task "+f.task.ID+"`") {
+			t.Fatalf("the next restore = %v\n%s", err, out)
+		}
+		if sent := front.writes(); len(sent) != 0 {
+			t.Fatalf("the refused restore sent %v", sent)
+		}
+		if f.helperLocal(t, front.e.hub, "owner") != local || f.helperHubState(t) != hub {
+			t.Fatal("the refused restore changed the host or the hub")
+		}
+		// The ordinary recovery registers this session deliberately, and
+		// restore then finds nothing to do.
+		if _, err := f.register(t, front.e); err != nil {
+			t.Fatalf("tt helper register after a lost answer: %v", err)
+		}
+		if out, err := restore(); err != nil || !strings.Contains(out, "registration: already correct") {
+			t.Fatalf("restore after the recovery = %v\n%s", err, out)
 		}
 	})
 }
