@@ -1226,10 +1226,21 @@ func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffS
 	case "SessionEnd":
 		r.Capture.Open = false
 	}
-	if unlock == nil || late() {
+	// A start is logged even when the record could not take it: the lock was
+	// held or the save failed. Wake receipts are judged against the latest
+	// start in the record or the log, so an unsaved start must not leave the
+	// earlier ones standing.
+	start := event == "SessionStart"
+	if late() {
 		return r, noEnd, nil
 	}
-	if s.save(r, previous) == nil {
+	if unlock == nil {
+		if start {
+			s.appendCapture(event, stamp, match)
+		}
+		return r, noEnd, nil
+	}
+	if s.save(r, previous) == nil || start {
 		s.appendCapture(event, stamp, match)
 	}
 	return r, noEnd, nil
@@ -2708,15 +2719,26 @@ func handoffRefusal(guard, reason, instead string) error {
 	return errors.New(text)
 }
 
-// handoffOwnPending reports a helper file with no pending registration, or
-// with one this same session left: its plain register or its own restore.
-func handoffOwnPending(f ownerHelperFile, req api.RegisterOwnerHelperRequest, thread, expected string) bool {
+// handoffPendingRefusal is why a helper file's pending registration stops a
+// restore, and what to run instead; both are empty when it has none or has
+// only this session's own restore, which the register code replays. It makes
+// the comparison the register code makes for a conditional registration, so
+// restore passes nothing that code then refuses. This session's own plain
+// tt helper register is a different request with an unknown outcome: only
+// that command can finish it.
+func handoffPendingRefusal(f ownerHelperFile, req api.RegisterOwnerHelperRequest, thread, expected, register string) (reason, instead string) {
 	if f.PendingRequest == "" {
-		return true
+		return "", ""
 	}
 	plain := helperRequestHash(req, thread)
 	req.ExpectedRunID = expected
-	return f.PendingHash == plain || f.PendingHash == helperRequestHash(req, thread)
+	switch f.PendingHash {
+	case helperRequestHash(req, thread):
+		return "", ""
+	case plain:
+		return "this session's own `tt helper register` is still pending and its outcome is unknown", "run `tt helper register --task " + f.Task + "` again to finish it"
+	}
+	return "the helper file holds a pending registration request from another session", register
 }
 
 // handoffRestoreCommand makes this session the project's registered owner
@@ -2793,8 +2815,8 @@ func handoffRestoreCommand(e env, args []string) error {
 		return err
 	}
 	req := helperRegisterRequest(handoffOr(file.Name, api.DefaultOwnerHelperName), runtime, cwd, session, true)
-	if !handoffOwnPending(file, req, thread, expected) {
-		return handoffRefusal("g5 no competing successor", "the helper file holds a pending registration request from another session", register)
+	if reason, instead := handoffPendingRefusal(file, req, thread, expected, register); reason != "" {
+		return handoffRefusal("g5 no competing successor", reason, instead)
 	}
 
 	// g3, g4 and g6: reads only.
@@ -2858,8 +2880,9 @@ func handoffRestoreCommand(e env, args []string) error {
 		return handoffRefusal("g5 no competing successor", "the helper file could not be read again", register)
 	case again.Run != expected || again.Agent != file.Agent || again.Thread != file.Thread || again.Runtime != file.Runtime:
 		return handoffRefusal("g5 no competing successor", fmt.Sprintf("another restore or registration completed while this one waited: the helper file no longer names run %s", expected), "run `tt handoff restore --task "+*task+"` again; it will be judged afresh")
-	case !handoffOwnPending(again, req, thread, expected):
-		return handoffRefusal("g5 no competing successor", "the helper file holds a pending registration request from another session", register)
+	}
+	if reason, instead := handoffPendingRefusal(again, req, thread, expected, register); reason != "" {
+		return handoffRefusal("g5 no competing successor", reason, instead)
 	}
 
 	// The guards have passed. From here every step is reported as restored,
@@ -2890,6 +2913,13 @@ func handoffRestoreCommand(e env, args []string) error {
 		var refused *helperExpectedRunRefused
 		switch {
 		case errors.As(err, &refused) && refused.guard != "":
+			// The register code refused under its own lock, before any
+			// request: say which of its two reasons the helper file shows.
+			if now, err := loadOwnerHelperFile(file.Hub, *task); err == nil && now.Run == expected {
+				if reason, instead := handoffPendingRefusal(now, req, thread, expected, register); reason != "" {
+					return handoffRefusal("g5 no competing successor", reason, instead)
+				}
+			}
 			return handoffRefusal("g5 no competing successor", fmt.Sprintf("another registration completed while this one waited: the helper file no longer names run %s", expected), "run `tt handoff restore --task "+*task+"` again; it will be judged afresh")
 		case errors.As(err, &httpErr):
 			step("registration", handoffNotRestored, "hub-refused", err.Error())

@@ -2420,6 +2420,25 @@ func TestHandoffRestoreGuards(t *testing.T) {
 			})
 			return []string{"a pending registration request from another session"}
 		}},
+		// This session's own plain tt helper register, its answer lost and
+		// the request not landed: restore names it and the command that
+		// finishes it, and never calls it another session's or says to run
+		// restore again.
+		{"this session's own plain registration is pending", "g5 no competing successor", func(t *testing.T, f *handoffHubFixture) []string {
+			session, inTmux, err := currentHelperSession(ctx)
+			if err != nil || !inTmux {
+				t.Fatalf("the fixture's tmux session: %+v %v %v", session, inTmux, err)
+			}
+			cwd, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			rewrite(t, f, func(file *ownerHelperFile) {
+				req := helperRegisterRequest(file.Name, "claude", cwd, session, true)
+				file.PendingRequest, file.PendingHash = "ohreg-0123456789abcdef", helperRequestHash(req, os.Getenv("CLAUDE_CODE_SESSION_ID"))
+			})
+			return []string{"this session's own `tt helper register` is still pending and its outcome is unknown", "Instead: run `tt helper register --task " + f.task.ID + "` again to finish it"}
+		}},
 	}
 	for _, g := range guards {
 		t.Run(g.name, func(t *testing.T) {
@@ -2448,6 +2467,10 @@ func TestHandoffRestoreGuards(t *testing.T) {
 				t.Fatalf("a refused restore wrote restore.json:\n%s", b.bytes("restore.json"))
 			}
 			switch g.name {
+			case "this session's own plain registration is pending":
+				if strings.Contains(err.Error(), "another session") || strings.Contains(err.Error(), "tt handoff restore") {
+					t.Fatalf("the refusal calls the session's own registration a competing one:\n%v", err)
+				}
 			case "retired":
 				if helpers := f.helpers(t); len(helpers) != 1 || helpers[0].Status != api.AgentRetired || helpers[0].RunID != b.helper.Run {
 					t.Fatalf("the retired helper changed: %+v", helpers)
@@ -3134,6 +3157,71 @@ func TestHandoffWakes(t *testing.T) {
 				if out, err := confirm(b, "w1"); err != nil || !strings.Contains(out, toolB) {
 					t.Fatalf("confirm after a %s start = %v, %q", source, err, out)
 				}
+			})
+		}
+	})
+	// A start the hook could not save in the record still puts every earlier
+	// receipt before it: the lock was held, or the record could not be replaced.
+	t.Run("a start the hook could not save", func(t *testing.T) {
+		for _, c := range []struct {
+			name  string
+			block func(t *testing.T, b *handoffBox) (release func())
+		}{
+			{"the record lock is held", func(t *testing.T, b *handoffBox) func() {
+				f, err := os.OpenFile(b.file("handoff.lock"), os.O_CREATE|os.O_RDWR, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+					t.Fatal(err)
+				}
+				return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
+			}},
+			{"the record cannot be replaced", func(t *testing.T, b *handoffBox) func() {
+				// The previous copy's place is taken by a directory with a file in it.
+				if err := os.Remove(b.file("record.json.1")); err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(b.file("record.json.1"), "held"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				return func() {
+					if err := os.RemoveAll(b.file("record.json.1")); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				b := begin(t)
+				b.ledger(b.cron("w1", toolA))
+				if _, err := confirm(b, "w1"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := confirm(b, "w2", "--asserted"); err != nil {
+					t.Fatal(err)
+				}
+				saved := b.record().Capture.Start
+				b.now = b.now.Add(time.Minute)
+				release := c.block(t, b)
+				r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"})
+				release()
+				if r.err != nil {
+					t.Fatal(r.err)
+				}
+				// The case is real: the record's start stamp is the earlier one.
+				if now := b.record().Capture.Start; saved == nil || now == nil || *now != *saved {
+					t.Fatalf("the hook saved the start: %+v, was %+v", now, saved)
+				}
+				status := b.must("status")
+				for _, id := range []string{"w1", "w2"} {
+					if !strings.Contains(status, id+" not restored: its receipt is from before this session's latest start") {
+						t.Fatalf("after a start the hook could not save, %s is not shown as not restored:\n%s", id, status)
+					}
+				}
+				// The row from before that start no longer restores the wake.
+				b.now = b.now.Add(time.Minute)
+				notRestored(t, b, "w1", "the row from before the unsaved start")
 			})
 		}
 	})

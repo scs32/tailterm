@@ -205,7 +205,7 @@ All six are checked before anything is written to the hub, the helper file, the 
 | g2 Exact candidate | Exactly one helper file on this host names the project, and either its thread is this session's or its tmux session id and creation time are this pane's. A file naming another tmux session means the helper lives elsewhere |
 | g3 Current run | The hub's helper is the file's agent and its current run is the file's run |
 | g4 Status | The hub's helper is running, done or needs-input. Closed or exited is refused, because registering would make a new agent or run. Retired is refused with "retired; only tt resume re-enables it" |
-| g5 No competing successor | The helper file holds no pending registration from another session, and after restore has the record lock the file still names the run restore read first |
+| g5 No competing successor | The helper file holds no pending registration from another session and no unfinished `tt helper register` of this session's own, and after restore has the record lock the file still names the run restore read first |
 | g6 Project active | The project is not paused, cleaning up for a pause or resuming |
 
 When g3 refuses, restore prints the hub's current run and "host of the current registration", the host on the helper's agent row, which only a registration sets. It prints "registration time: unavailable": the agent row has no registration time, and the one route that returns the registration event pages through the whole project feed. It adds that if this session's own registration answer was lost, `tt helper register --task T` is the recovery. Restore itself never resends a request in order to take over a run it did not expect.
