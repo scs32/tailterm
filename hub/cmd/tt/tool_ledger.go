@@ -30,6 +30,10 @@ import (
 // Bash command matches a protected-operation rule leaves one extra row per
 // rule. It prints nothing and denies nothing.
 //
+// The owned-paths report (tool_scope.go) is report-only too: a PreToolUse of
+// an edit tool whose file is outside the paths of the agent's latest ASSIGN
+// leaves one extra row. It prints nothing and denies nothing.
+//
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
 // session, read from the host helper file (bug wi_b3e8ecd5a2ee01b3).
@@ -84,11 +88,14 @@ type toolLedger struct {
 	// The would-deny report (tool_deny.go), run after a pre is recorded.
 	deny    func(toolLedger, toolLedgerRow, string, json.RawMessage)
 	denyMax int
+	// The owned-paths report (tool_scope.go), run after the would-deny report.
+	scope func(toolLedger, toolLedgerRow, string, json.RawMessage, string)
 }
 
-// toolHookInput holds only the fields the ledger uses. tool_response, error,
-// cwd and transcript_path are skipped by the decoder and never kept. Secret
-// redaction decodes tool_response itself, and only when it is switched on.
+// toolHookInput holds only the fields the ledger uses. tool_response, error
+// and transcript_path are skipped by the decoder and never kept. cwd is
+// decoded for the owned-paths report and never stored. Secret redaction
+// decodes tool_response itself, and only when it is switched on.
 type toolHookInput struct {
 	Event       string          `json:"hook_event_name"`
 	Session     string          `json:"session_id"`
@@ -97,6 +104,7 @@ type toolHookInput struct {
 	Input       json.RawMessage `json:"tool_input"`
 	DurationMS  *float64        `json:"duration_ms"`
 	IsInterrupt bool            `json:"is_interrupt"`
+	Cwd         string          `json:"cwd"`
 }
 
 type toolLedgerRow struct {
@@ -122,6 +130,10 @@ type toolLedgerRow struct {
 	DenyRule    string `json:"denyRule,omitempty"`
 	DenyKind    string `json:"denyKind,omitempty"`
 	DenySummary string `json:"denySummary,omitempty"`
+	// Only on a would_report row (tool_scope.go).
+	ReportRule string `json:"reportRule,omitempty"`
+	ReportPath string `json:"reportPath,omitempty"`
+	AssignSeq  int64  `json:"assignSeq,omitempty"`
 }
 
 type toolLedgerPending struct {
@@ -178,7 +190,7 @@ func toolLedgerHook(e env, _ []string) {
 		maxInput: toolLedgerMaxInput, maxBytes: toolLedgerMaxBytes, maxPending: toolLedgerMaxPending,
 		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
-		deny: toolDenyCheck, denyMax: toolDenyMaxCommand,
+		deny: toolDenyCheck, denyMax: toolDenyMaxCommand, scope: toolScopeCheck,
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -228,6 +240,9 @@ func (l toolLedger) record(in io.Reader) {
 		// After the pending entry is written, so the check cannot lose the pairing.
 		if l.deny != nil {
 			l.deny(l, row, p.Tool, p.Input)
+		}
+		if l.scope != nil {
+			l.scope(l, row, p.Tool, p.Input, p.Cwd)
 		}
 		return
 	case "PostToolUse":

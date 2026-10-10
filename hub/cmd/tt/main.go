@@ -670,8 +670,19 @@ func cmdInbox(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	var mine []api.Message // what this agent's inbox fetch returned
+	defer func() { toolScopeRemember(e, mine) }()
 	if *seq > 0 {
-		return printInboxMessage(c, task, *seq, *asJSON)
+		err := printInboxMessage(c, task, *seq, *asJSON)
+		if err == nil && e.agent != "" {
+			ctx, cancel := ctxTimeout(10 * time.Second)
+			defer cancel()
+			// For the owns cache only; a failure here changes nothing.
+			if one, ferr := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: *seq - 1, To: e.agent, Limit: 1}); ferr == nil && len(one) == 1 && one[0].Seq == *seq {
+				mine = one
+			}
+		}
+		return err
 	}
 	if *wait > 0 {
 		// Park cheaply: runtimes without relay wake-up (Claude) run this as one
@@ -715,6 +726,7 @@ func cmdInbox(e env, args []string) error {
 		if err != nil {
 			return err
 		}
+		mine = msgs
 		if *asJSON {
 			printJSON(msgs)
 			return nil
@@ -760,6 +772,7 @@ func cmdInbox(e env, args []string) error {
 		}
 		extras = notFrom(newer, e.agent)
 	}
+	mine = append(fetched[:len(fetched):len(fetched)], extras...)
 	if *asJSON {
 		printJSON(append(msgs, extras...))
 	} else {

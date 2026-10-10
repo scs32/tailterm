@@ -554,6 +554,20 @@ func TestToolLedgerStoresNoRawContent(t *testing.T) {
 	if r := runToolHook(t, e, "tool", `{"tool_input":"MARK-INPUT","error":"MARK-ERROR"`, nil); r.err != nil { // malformed
 		t.Fatal(r.err)
 	}
+	// An edit outside the owned paths: the row keeps the path relative to the
+	// repository root, and nothing of the root, the cwd or the content.
+	repo := filepath.Join(t.TempDir(), "MARK-ROOT")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cache, _ := json.Marshal(toolScopeCache{V: 1, Run: e.runID, AssignSeq: 7, Owns: []string{"owned.go"}})
+	if err := os.WriteFile(filepath.Join(root, e.agent, toolScopeCacheName), cache, 0600); err != nil {
+		t.Fatal(err)
+	}
+	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u4", "tool_name": "Edit", // stays pending
+		"tool_input": map[string]any{"file_path": filepath.Join(repo, "src", "outside.go"), "old_string": "MARK-INPUT", "new_string": "MARK-INPUT"},
+		"cwd":        filepath.Join(repo, "MARK-CWD"), "transcript_path": "/MARK-TRANSCRIPT.jsonl"})
+	markers = append(markers, "MARK-ROOT")
 	files := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -571,11 +585,15 @@ func TestToolLedgerStoresNoRawContent(t *testing.T) {
 		}
 		return nil
 	})
-	if err != nil || files != 4 { // ledger, lock, two pending
+	if err != nil || files != 6 { // ledger, lock, three pending, the owns cache
 		t.Fatalf("read %d files, %v", files, err)
 	}
-	if rows := toolLedgerRows(t, root, e.agent); len(rows) != 3 {
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 4 {
 		t.Fatalf("rows = %v", rows)
+	}
+	if last := rows[3]; last["outcome"] != "would_report" || last["reportPath"] != "src/outside.go" || last["assignSeq"] != 7.0 {
+		t.Fatalf("would-report row = %v", last)
 	}
 }
 
