@@ -28,6 +28,7 @@ export function targetsForPaths(paths) {
     else if (/^scripts\/(deploy-static\.mjs|deploy-remote-static\.py|deploy-apple-web\.py|cloudflare-domain\.mjs|container-dev\.sh)$/.test(p)) continue; // manual, old-site and local container tooling; release deploys tailos with wrangler
     else if (/^((hub\/)?(Dockerfile|\.dockerignore)|Dockerfile\.static|deploy\/(Caddyfile(\.container)?|compose\.yaml))$/.test(p)) continue; // container images and example deployments; hub/bridge ship binaries via deploy-truenas-hub.py
     else if (/^tools\/jev-kit\//.test(p)) continue; // separate evaluation kit module; nothing ships from it
+    else if (/^tools\/claude-mods\//.test(p)) continue; // Claude Code mods loaded only by --plugin-dir; nothing ships from them
     else if (/^(\.github\/workflows\/[^/]+\.ya?ml|hub\/README\.md)$/.test(p)) continue; // CI configuration and documentation
     else throw new Error("Unknown release path");
   }
