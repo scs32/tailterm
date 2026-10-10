@@ -561,9 +561,23 @@ func lockOwnerHelperFile(ctx context.Context, hub, task string) (func(), error) 
 	}
 }
 
+// helperRegisterRequest is the register request for this session, without its
+// request ID or expected run. tt handoff restore builds the same request to
+// recognise its own pending one.
+func helperRegisterRequest(name, runtime, cwd string, session helperSession, inTmux bool) api.RegisterOwnerHelperRequest {
+	req := api.RegisterOwnerHelperRequest{Name: name, Host: spawn.Host(), Session: "terminal", Runtime: runtime, Cwd: cwd}
+	if inTmux {
+		req.Session = session.Name
+	}
+	return req
+}
+
 // helperExpectedRunRefused is a refusal of a conditional registration made on
 // this host, before the hub was asked or after it answered.
-type helperExpectedRunRefused struct{ reason string }
+type helperExpectedRunRefused struct {
+	guard  string // set when the hub was not asked and nothing was written
+	reason string
+}
 
 func (e *helperExpectedRunRefused) Error() string { return e.reason }
 
@@ -630,10 +644,7 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 	if err != nil {
 		return api.OwnerActionResult{}, err
 	}
-	req := api.RegisterOwnerHelperRequest{Name: *name, Host: spawn.Host(), Session: "terminal", Runtime: runtime, Cwd: cwd}
-	if inTmux {
-		req.Session = session.Name
-	}
+	req := helperRegisterRequest(*name, runtime, cwd, session, inTmux)
 	req.ExpectedRunID = o.expectedRun
 	unlock, err := lockOwnerHelperFile(ctx, e.hub, *task)
 	if err != nil {
@@ -651,9 +662,9 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 		// registration won meanwhile: refuse, and never continue with that run.
 		switch {
 		case state.Run != o.expectedRun:
-			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5 no competing successor: the helper file no longer names run " + o.expectedRun + "; another registration completed on this host. Nothing was registered or written"}
+			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5", "g5 no competing successor: the helper file no longer names run " + o.expectedRun + "; another registration completed on this host. Nothing was registered or written"}
 		case state.PendingRequest != "" && state.PendingHash != hash:
-			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5 no competing successor: the helper file holds a pending registration request from another session. Nothing was registered or written"}
+			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5", "g5 no competing successor: the helper file holds a pending registration request from another session. Nothing was registered or written"}
 		}
 	}
 	// Before thread-aware hashes, Claude stored only the request shape. A
@@ -710,7 +721,7 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 		// The hub's run was the expected one a moment ago, so a replayed
 		// result is not this command's registration: it is never adopted.
 		clearPending()
-		return api.OwnerActionResult{}, &helperExpectedRunRefused{"the hub replayed an earlier registration instead of registering this session; nothing was written on this host"}
+		return api.OwnerActionResult{}, &helperExpectedRunRefused{reason: "the hub replayed an earlier registration instead of registering this session; nothing was written on this host"}
 	}
 	// Verify before any local write, so a stale replay never tags a session.
 	a := out.Agent
@@ -729,7 +740,7 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 	if conditional && current.Status != api.AgentRunning && current.Status != api.AgentDone && current.Status != api.AgentNeedsInput {
 		// Retired after the hub answered: this session is not bound to it.
 		clearPending()
-		return api.OwnerActionResult{}, &helperExpectedRunRefused{"the owner helper is " + current.Status + " now; this session was not bound to it and nothing was written on this host"}
+		return api.OwnerActionResult{}, &helperExpectedRunRefused{reason: "the owner helper is " + current.Status + " now; this session was not bound to it and nothing was written on this host"}
 	}
 	if legacyPending && (state.Thread == "" || state.Agent != a.ID || state.Run != a.RunID) {
 		// An older saved helper thread can belong to the previous run, not this

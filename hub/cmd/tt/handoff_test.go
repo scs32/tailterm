@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 // Session handoff, stage A (feature wi_3dae763822d9c061). Criteria a1 to a15
@@ -1250,7 +1251,7 @@ var (
 const (
 	handoffCandidateSentence = "This session is not registered as the owner helper. The record below is what the previous session left. It is not authority until the registration is verified."
 	handoffCitedSentence     = "Entries cite Board messages by number. Read each cited message before relying on the entry."
-	handoffNextAction        = "Registration and wakes are not restored automatically in this version.\n"
+	handoffNextAction        = "Next: run `tt handoff restore --task %s`.\n"
 )
 
 // requireNote checks the shape every injected note must have and returns the
@@ -1270,10 +1271,9 @@ func requireNote(t *testing.T, b *handoffBox, note string, candidate bool) (show
 	if candidate == strings.Contains(note, "The host file names this session as the owner helper.") {
 		t.Fatalf("the registered sentence is wrong for candidate=%v:\n%s", candidate, note)
 	}
-	next := fmt.Sprintf("Next: run `tt handoff show`. To register this session run `tt helper register --task %s` (see docs/owner-helper.md). "+
-		"Re-create each active wake by hand and note it with `tt handoff note wake add`. %s", b.helper.Task, handoffNextAction)
+	next := fmt.Sprintf(handoffNextAction, b.helper.Task)
 	if !strings.HasSuffix(note, next) {
-		t.Fatalf("note does not end with the stage A next action:\n%s", note)
+		t.Fatalf("note does not end with the next action:\n%s", note)
 	}
 	at := strings.Index(note, "Full record: `tt handoff show`. "+handoffCitedSentence)
 	if at < 0 {
@@ -1580,7 +1580,10 @@ func TestHandoffInjection(t *testing.T) {
 			}
 		}
 		sort.Strings(commands)
-		want := []string{"tt handoff note wake add", "tt handoff show", "tt helper env --task " + b.helper.Task, "tt helper register --task " + b.helper.Task, "tt inbox --seq <number>"}
+		want := []string{"tt handoff restore --task " + b.helper.Task, "tt handoff show", "tt helper env --task " + b.helper.Task, "tt inbox --seq <number>"}
+		// Stage B's other commands are not in the note; the binary has them too.
+		commands = append(commands, "tt handoff status", "tt handoff wake confirm w1", "tt handoff wake due w1")
+		want = append(want, commands[len(want):]...)
 		if strings.Join(commands, "|") != strings.Join(want, "|") {
 			t.Fatalf("the notes name %q; want %q", commands, want)
 		}
@@ -1618,21 +1621,29 @@ func TestHandoffInjection(t *testing.T) {
 				t.Errorf("%q is not a command this binary accepts:\n%s", command, out)
 			}
 			if words := strings.Fields(command); words[1] == "handoff" {
-				if run, used := handoffRoute(words[2:]); run == nil || used != len(words)-2 {
+				// The route consumes the command's own words: everything before
+				// its first flag or id.
+				own := 0
+				for _, word := range words[2:] {
+					if !regexp.MustCompile(`^[a-z]+$`).MatchString(word) {
+						break
+					}
+					own++
+				}
+				if run, used := handoffRoute(words[2:]); run == nil || used != own {
 					t.Errorf("%q is not in the tt handoff dispatch", command)
 				}
 			}
 		}
-		// The check can fail: stage B's commands and made-up ones are refused.
-		for _, command := range []string{"tt handoff restore --task " + b.helper.Task, "tt handoff status", "tt handoff wake confirm w1", "tt handoff wake due w1",
-			"tt handoff note wake remove", "tt helper restore --task " + b.helper.Task, "tt nosuchcommand"} {
+		// The check can fail: made-up commands are refused.
+		for _, command := range []string{"tt handoff note wake remove", "tt handoff wake", "tt handoff wake cancel w1", "tt helper restore --task " + b.helper.Task, "tt nosuchcommand"} {
 			if ok, out := dispatch(command); ok {
 				t.Errorf("%q was accepted by this binary:\n%s", command, out)
 			}
 		}
-		for _, words := range [][]string{{"restore"}, {"status"}, {"wake", "confirm", "w1"}, {"wake", "due", "w1"}, {"note", "wake"}, {"note", "wake", "remove"}, {"note", "timer", "add"}, {}} {
+		for _, words := range [][]string{{"wake"}, {"wake", "cancel", "w1"}, {"note", "wake"}, {"note", "wake", "remove"}, {"note", "timer", "add"}, {}} {
 			if run, _ := handoffRoute(words); run != nil {
-				t.Errorf("tt handoff %v is routed in stage A", words)
+				t.Errorf("tt handoff %v is routed", words)
 			}
 		}
 	})
@@ -1934,7 +1945,7 @@ func TestHandoffWrite(t *testing.T) {
 	}
 	for _, want := range []string{"As of " + s.AsOf + ". Read the hub again before acting.", "- helper status: running", "delegation window: " + s.Window.ID + ", scope decisions",
 		fmt.Sprintf("  - %s msg #%d request from %s due ", owed[0].ID, owed[0].MessageSeq, f.lead.ID), fmt.Sprintf("  - msg #%d from %s open", decision.Seq, f.lead.ID),
-		"tt helper register --task " + f.task.ID, "tt handoff show --task " + f.task.ID} {
+		"tt helper register --task " + f.task.ID, "tt handoff restore --task " + f.task.ID} {
 		if !strings.Contains(string(rendered), want) {
 			t.Errorf("--out lacks %q:\n%s", want, rendered)
 		}
@@ -1942,7 +1953,7 @@ func TestHandoffWrite(t *testing.T) {
 	if show := b.must("show"); !strings.HasPrefix(string(rendered), show) {
 		t.Errorf("--out does not render the same facts as show:\n%s\n---\n%s", rendered, show)
 	}
-	if !strings.Contains(out, b.file("record.json")) || !strings.Contains(out, "bytes") || strings.Contains(string(rendered)+out, "handoff restore") {
+	if !strings.Contains(out, b.file("record.json")) || !strings.Contains(out, "bytes") || !strings.Contains(out, "tt handoff restore --task "+f.task.ID) || strings.Contains(string(rendered)+out, "not restored automatically") {
 		t.Errorf("write printed:\n%s", out)
 	}
 	for _, text := range []string{ask, question} {
@@ -2120,6 +2131,699 @@ func TestHandoffWriteCapsAndText(t *testing.T) {
 	}
 }
 
+// ---- stage B: tt handoff restore ----
+
+// successor makes this process a new Claude session in the helper's own tmux
+// pane, as after a /clear or a restart: the old session's end, then the new
+// one's start, which the hook logs as a candidate. It returns the new thread.
+func (f *handoffHubFixture) successor(t *testing.T) string {
+	t.Helper()
+	b := f.b
+	b.quiet("SessionEnd", f.thread, map[string]any{"reason": "clear"})
+	thread := newHelperThread(t)
+	b.now = b.now.Add(time.Minute)
+	if r := b.hook("SessionStart", thread, map[string]any{"source": "clear"}); r.err != nil || !strings.Contains(r.out, fmt.Sprintf(handoffNextAction, f.task.ID)) {
+		t.Fatalf("the successor's start = %v, %q", r.err, r.out)
+	}
+	b.now = b.now.Add(time.Minute)
+	return thread
+}
+
+// state is everything a restore could change: the hub's helper agents and
+// registration receipts, and this host's helper file, wake bindings and tmux
+// tags.
+func (f *handoffHubFixture) state(t *testing.T) string {
+	t.Helper()
+	return f.helperHubState(t) + f.helperLocal(t, f.owner.hub, "owner")
+}
+
+// writes are the requests since the last call that could change the hub.
+func (f *handoffHubFixture) writes() []string {
+	var out []string
+	for _, r := range f.seen() {
+		if !strings.HasPrefix(r, "GET ") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (f *handoffHubFixture) restore() (string, error) {
+	return f.b.run("restore", "--task", f.task.ID)
+}
+
+// a1 (b1): restore in the session that is already the registered helper
+// changes nothing on the hub and reports "already correct".
+func TestHandoffRestoreAlreadyRegistered(t *testing.T) {
+	f := newHandoffHubFixture(t)
+	b := f.b
+	before := f.state(t)
+	f.seen()
+	out, err := f.restore()
+	if err != nil {
+		t.Fatalf("restore = %v\n%s", err, out)
+	}
+	if sent := f.writes(); len(sent) != 0 {
+		t.Fatalf("restore sent %v; want reads only", sent)
+	}
+	for _, want := range []string{"registration: already correct: this session is the registered helper thread; run " + b.helper.Run,
+		"wake binding: already correct", "hub state: restored", "helper status: running"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("restore output lacks %q:\n%s", want, out)
+		}
+	}
+	if after := f.state(t); after != before {
+		t.Fatalf("restore changed the hub or the host:\nbefore %s\nafter  %s", before, after)
+	}
+	if n := strings.Count(before, "registration ohr_"); n != 1 {
+		t.Fatalf("the fixture has %d registration receipts; want 1:\n%s", n, before)
+	}
+	requireHandoffValues(t, b.bytes("restore.json"))
+	if status := b.must("status", "--task", f.task.ID); !strings.Contains(status, "registration: already correct") || !strings.Contains(status, "0 not restored then") {
+		t.Fatalf("status:\n%s", status)
+	}
+	// It is the same after a compaction, which keeps the session id.
+	b.now = b.now.Add(time.Minute)
+	b.hook("SessionStart", f.thread, map[string]any{"source": "compact"})
+	f.seen()
+	if out, err := f.restore(); err != nil || !strings.Contains(out, "registration: already correct") || len(f.writes()) != 0 || f.state(t) != before {
+		t.Fatalf("restore after a compaction = %v\n%s", err, out)
+	}
+}
+
+// a2 (b2): restore from a new session in the helper's tmux session registers
+// it, conditionally on the run the helper file named.
+func TestHandoffRestoreSuccessor(t *testing.T) {
+	f := newHandoffHubFixture(t)
+	b, ctx := f.b, context.Background()
+	old := b.helper
+	b.must(handoffAddArgs(handoffKinds[1], nil)...)
+	b.hook("SessionStart", f.thread, map[string]any{"source": "startup"})
+	thread := f.successor(t)
+	candidate := b.bytes("record.json")
+	f.seen()
+	out, err := f.restore()
+	// The wake is not restored yet, so the exit is non-zero.
+	if err == nil || !strings.Contains(err.Error(), "restore incomplete: 1 not restored") {
+		t.Fatalf("restore = %v\n%s", err, out)
+	}
+	if sent := f.writes(); len(sent) != 1 || sent[0] != "POST /v1/tasks/"+f.task.ID+"/owner-helper" {
+		t.Fatalf("restore sent %v; want exactly the one registration", sent)
+	}
+	helpers := f.helpers(t)
+	if len(helpers) != 1 || helpers[0].ID != old.Agent || helpers[0].RunID == old.Run || helpers[0].Status != api.AgentRunning {
+		t.Fatalf("helpers after restore: %+v", helpers)
+	}
+	now := helpers[0]
+	// The registration receipt names the previous run.
+	list, err := f.c.Events(ctx, f.task.ID, 0, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := ""
+	for _, e := range list.Events {
+		if e.Kind == api.EventAgentAdded && e.Data["runId"] == now.RunID {
+			if e.Data["previousRunId"] != old.Run || e.Data["mode"] != api.OwnerHelperReplaced {
+				t.Fatalf("registration event %v", e.Data)
+			}
+			receipt, _ = e.Data["registration"].(string)
+		}
+	}
+	if !handoffID(receipt, "ohr") {
+		t.Fatalf("no registration receipt for run %s", now.RunID)
+	}
+	file, err := loadOwnerHelperFile(f.owner.hub, f.task.ID)
+	if err != nil || file.Thread != thread || file.Run != now.RunID || file.Registration != receipt || file.PendingRequest != "" {
+		t.Fatalf("helper file %+v %v", file, err)
+	}
+	binding, bound := readBinding(t, f.owner.hub, now.ID)
+	if !bound || binding.Thread != thread || binding.Run != now.RunID {
+		t.Fatalf("binding %+v", binding)
+	}
+	if tags := f.tags(t, "owner"); tags["TAILTERM_RUN"] != now.RunID || tags["TAILTERM_AGENT"] != now.ID {
+		t.Fatalf("tags %v", tags)
+	}
+	for _, want := range []string{fmt.Sprintf("registration: restored: run %s, receipt %s (replaced %s)", now.RunID, receipt, old.Run),
+		"wake binding: restored: the relay binding names this thread and run " + now.RunID, "hub state: restored",
+		"handoff record: restored: identity copied from the helper file; this session's start of ", "w1 not restored: nothing has confirmed it in this session"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("restore output lacks %q:\n%s", want, out)
+		}
+	}
+	// The record now carries the new identity and this session's own start,
+	// which the hook had only logged while the session was a candidate.
+	if bytes.Contains(candidate, []byte(thread)) {
+		t.Fatalf("the candidate's start was in the record before restore:\n%s", candidate)
+	}
+	record := b.record()
+	if record.Identity.Thread != thread || record.Identity.Run != now.RunID || record.Capture.Start == nil || record.Capture.Start.Session != thread ||
+		record.Capture.Start.Detail != "clear" || !record.Capture.Open || len(record.Notes.Wakes.Entries) != 1 || record.Notes.Wakes.Entries[0].State != "active" {
+		t.Fatalf("record after restore: %+v", record)
+	}
+	requireHandoffValues(t, b.bytes("record.json"))
+	requireHandoffValues(t, b.bytes("restore.json"))
+	var report handoffRestoreReport
+	if err := json.Unmarshal(b.bytes("restore.json"), &report); err != nil || report.Run != now.RunID || report.PreviousRun != old.Run || report.Registration != receipt ||
+		report.Session != thread || report.NotRestored != 1 || len(report.Wakes) != 1 || report.Wakes[0].State != handoffNotRestored {
+		t.Fatalf("restore.json %+v %v", report, err)
+	}
+	status := b.must("status", "--task", f.task.ID)
+	for _, want := range []string{"registration: restored", "wake binding: restored", "1 not restored then", "then: w1 not restored", "1 active wakes not restored now"} {
+		if !strings.Contains(status, want) {
+			t.Fatalf("status lacks %q:\n%s", want, status)
+		}
+	}
+	// A second restore finds this session registered and registers nothing.
+	before := f.state(t)
+	f.seen()
+	if out, _ := f.restore(); !strings.Contains(out, "registration: already correct") || len(f.writes()) != 0 || f.state(t) != before {
+		t.Fatalf("a second restore:\n%s", out)
+	}
+}
+
+// a3 (b3): every guard refuses before any write. The hub's helper agents and
+// receipts, the helper file, the wake bindings and the tmux tags are the same
+// before and after, nothing is printed, and no restore.json is written.
+func TestHandoffRestoreGuards(t *testing.T) {
+	type guard struct {
+		name  string
+		guard string
+		// arrange changes the fixture after the successor session started. It
+		// returns what the refusal must say besides the guard's name.
+		arrange func(t *testing.T, f *handoffHubFixture) []string
+	}
+	rewrite := func(t *testing.T, f *handoffHubFixture, change func(*ownerHelperFile)) {
+		t.Helper()
+		file, err := loadOwnerHelperFile(f.owner.hub, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(&file)
+		if err := writePrivateJSON(ownerHelperPath(f.owner.hub, f.task.ID), file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	guards := []guard{
+		{"outside tmux", "g1 in tmux, one pane", func(t *testing.T, f *handoffHubFixture) []string {
+			t.Setenv("TMUX", "")
+			t.Setenv("TMUX_PANE", "")
+			return []string{"not running inside tmux"}
+		}},
+		{"two panes", "g1 in tmux, one pane", func(t *testing.T, f *handoffHubFixture) []string {
+			f.tmux(t, "split-window", "-d", "-t", "owner:", "sleep 300")
+			return []string{"has 2 panes"}
+		}},
+		{"no helper file", "g2 exact candidate", func(t *testing.T, f *handoffHubFixture) []string {
+			if err := os.Remove(ownerHelperPath(f.owner.hub, f.task.ID)); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"no owner helper file"}
+		}},
+		{"two helper files", "g2 exact candidate", func(t *testing.T, f *handoffHubFixture) []string {
+			other := f.b.helper
+			other.Hub = "http://127.0.0.1:9"
+			if err := writePrivateJSON(ownerHelperPath(other.Hub, other.Task), other); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"2 owner helper files name this project"}
+		}},
+		{"a helper file naming another tmux session", "g2 exact candidate", func(t *testing.T, f *handoffHubFixture) []string {
+			pane := os.Getenv("TMUX_PANE")
+			id, created := f.session(t, "elsewhere")
+			// Back in the owner session's pane, where the successor runs.
+			f.enter(t, "owner")
+			if os.Getenv("TMUX_PANE") != pane {
+				t.Fatalf("the test is not back in the owner pane")
+			}
+			rewrite(t, f, func(file *ownerHelperFile) {
+				file.Session, file.SessionID, file.SessionCreated = "elsewhere", id, created
+			})
+			return []string{"the helper file names tmux session elsewhere, not this one: the helper lives elsewhere"}
+		}},
+		{"hub run differs", "g3 current run", func(t *testing.T, f *handoffHubFixture) []string {
+			other, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Later activity moves lastSeenAt and lastEventAt on the agent row;
+			// neither is a registration time.
+			time.Sleep(1100 * time.Millisecond)
+			if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{Kind: api.EventDone, AgentID: other.Agent.ID, RunID: other.Agent.RunID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.GetAgent(ctx, f.task.ID, other.Agent.ID); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"the hub's helper run is " + other.Agent.RunID + ", not the helper file's " + f.b.helper.Run, "host of the current registration: other-host",
+				"registration time: unavailable", "if this session's own registration answer was lost, run `tt helper register --task " + f.task.ID + "`"}
+		}},
+		{"closed", "g4 status", func(t *testing.T, f *handoffHubFixture) []string {
+			if _, err := f.c.CloseAgent(ctx, f.task.ID, f.b.helper.Agent, f.b.helper.Run); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"the owner helper is closed"}
+		}},
+		{"exited", "g4 status", func(t *testing.T, f *handoffHubFixture) []string {
+			if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{Kind: api.EventExited, AgentID: f.b.helper.Agent, RunID: f.b.helper.Run}); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"the owner helper is exited"}
+		}},
+		{"retired", "g4 status", func(t *testing.T, f *handoffHubFixture) []string {
+			status := api.AgentRetired
+			if _, err := f.c.UpdateAgent(ctx, f.task.ID, f.b.helper.Agent, api.UpdateAgentRequest{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"retired; only tt resume re-enables it"}
+		}},
+		{"project paused", "g6 project active", func(t *testing.T, f *handoffHubFixture) []string {
+			agents, err := f.c.ListAgents(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := api.PauseProjectRequest{Version: 1, RequestID: "pause"}
+			for _, a := range agents {
+				if a.Status != api.AgentClosed && a.Status != api.AgentExited {
+					request.Targets = append(request.Targets, api.ProjectPauseTargetRequest{AgentID: a.ID, RunID: a.RunID, ServiceDisposition: api.PauseServiceNone})
+				}
+			}
+			paused, err := f.c.PauseProject(ctx, f.task.ID, request)
+			if err != nil || paused.State == api.ProjectPauseActive {
+				t.Fatalf("pause %+v %v", paused, err)
+			}
+			return []string{"the project is " + paused.State}
+		}},
+		{"a pending registration from another thread", "g5 no competing successor", func(t *testing.T, f *handoffHubFixture) []string {
+			rewrite(t, f, func(file *ownerHelperFile) {
+				file.PendingRequest, file.PendingHash = "ohreg-0123456789abcdef", strings.Repeat("ab", 32)
+			})
+			return []string{"a pending registration request from another session"}
+		}},
+	}
+	for _, g := range guards {
+		t.Run(g.name, func(t *testing.T) {
+			f := newHandoffHubFixture(t)
+			b := f.b
+			f.successor(t)
+			wants := g.arrange(t, f)
+			before := f.state(t)
+			f.seen()
+			out, err := f.restore()
+			if err == nil || out != "" {
+				t.Fatalf("restore = %v, printed %q; want a refusal and no output", err, out)
+			}
+			for _, want := range append(wants, "restore refused by guard "+g.guard+":", "Nothing was registered, written or changed.") {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("the refusal lacks %q:\n%v", want, err)
+				}
+			}
+			if sent := f.writes(); len(sent) != 0 {
+				t.Fatalf("a refused restore sent %v", sent)
+			}
+			if after := f.state(t); after != before {
+				t.Fatalf("a refused restore changed the hub or the host:\nbefore %s\nafter  %s", before, after)
+			}
+			if b.bytes("restore.json") != nil {
+				t.Fatalf("a refused restore wrote restore.json:\n%s", b.bytes("restore.json"))
+			}
+			switch g.name {
+			case "retired":
+				if helpers := f.helpers(t); len(helpers) != 1 || helpers[0].Status != api.AgentRetired || helpers[0].RunID != b.helper.Run {
+					t.Fatalf("the retired helper changed: %+v", helpers)
+				}
+			case "hub run differs":
+				// No time from the agent row is printed as a registration time.
+				if regexp.MustCompile(`[0-9]{4}-[0-9]{2}-[0-9]{2}`).MatchString(err.Error()) {
+					t.Fatalf("the refusal prints a time:\n%v", err)
+				}
+			}
+		})
+	}
+
+	// A restore that waited for the record lock while another restore or
+	// registration completed refuses on the predecessor it fixed at its start.
+	// It never registers with the winner's run.
+	t.Run("waited while another completed", func(t *testing.T) {
+		f := newHandoffHubFixture(t)
+		b := f.b
+		f.successor(t)
+		setToolLedger(t, &handoffCommandLockWait, 30*time.Second)
+		store, _ := handoffStoreFor(b.helper.Agent, time.Second)
+		if err := store.prepare(); err != nil {
+			t.Fatal(err)
+		}
+		release := store.lock()
+		if release == nil {
+			t.Fatal("the test could not take the record lock")
+		}
+		// The access hook sees restore reach for the lock.
+		waiting := make(chan struct{})
+		var once sync.Once
+		inner := handoffAccessHook
+		setToolLedger(t, &handoffAccessHook, func(path string) {
+			inner(path)
+			if filepath.Base(path) == "handoff.lock" {
+				once.Do(func() { close(waiting) })
+			}
+		})
+		type result struct {
+			out string
+			err error
+		}
+		done := make(chan result, 1)
+		f.seen()
+		go func() {
+			out, err := f.restore()
+			done <- result{out, err}
+		}()
+		select {
+		case <-waiting:
+		case got := <-done:
+			release()
+			t.Fatalf("restore returned before it reached the lock: %v\n%s", got.err, got.out)
+		case <-time.After(30 * time.Second):
+			release()
+			t.Fatal("restore never reached the record lock")
+		}
+		// Another session's registration completes: the hub has a new run and
+		// this host's helper file names it.
+		winner, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: spawn.Host(), Session: "owner", Runtime: "claude", RequestID: "winner-1"})
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		rewrite(t, f, func(file *ownerHelperFile) {
+			file.Run, file.Registration, file.Thread = winner.Agent.RunID, winner.Registration.ID, handoffOtherID
+		})
+		before := f.state(t)
+		f.seen()
+		release()
+		got := <-done
+		if got.err == nil || got.out != "" || !strings.Contains(got.err.Error(), "restore refused by guard g5 no competing successor:") ||
+			!strings.Contains(got.err.Error(), "the helper file no longer names run "+b.helper.Run) {
+			t.Fatalf("restore = %v, printed %q", got.err, got.out)
+		}
+		if sent := f.writes(); len(sent) != 0 {
+			t.Fatalf("the restore that lost sent %v", sent)
+		}
+		if after := f.state(t); after != before {
+			t.Fatalf("the restore that lost changed the hub or the host:\nbefore %s\nafter  %s", before, after)
+		}
+		if helpers := f.helpers(t); len(helpers) != 1 || helpers[0].RunID != winner.Agent.RunID {
+			t.Fatalf("the winner's run does not stand: %+v", helpers)
+		}
+		if b.bytes("restore.json") != nil {
+			t.Fatal("the restore that lost wrote restore.json")
+		}
+	})
+}
+
+// a5 (b5): restore prints the helper's obligations, the open owner decisions
+// and the queue entries read live, with what closed and what is new since the
+// record's snapshot. The stored snapshot is not replaced.
+func TestHandoffRestoreHubDifferences(t *testing.T) {
+	f := newHandoffHubFixture(t)
+	b, ctx := f.b, context.Background()
+	lead := env{hub: f.owner.hub, task: f.task.ID, agent: f.lead.ID, agentName: f.lead.Name, runID: f.lead.RunID}
+	const first, second, question = "Summarise the first overnight queue please", "Summarise the second overnight queue please", "Which colour should the second launch button be?"
+	handoffForbid(first, second, question, "Tell the helper about queue one", "Tell the helper about queue two", "Mauve looks calmer", "Use mauve for the button", "Use amber for the button")
+	send := func(subject, ask, key string) {
+		t.Helper()
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdSend(lead, []string{"--kind", "request", "--to", api.DefaultOwnerHelperName, "--subject", subject, "--ask", ask, "--request-id", key})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decide := func(key string) api.Message {
+		t.Helper()
+		m, err := f.c.CreateDecision(ctx, f.task.ID, api.CreateDecisionRequest{AgentID: f.lead.ID, RequestID: key, DecisionRequest: api.DecisionRequest{
+			Question: question, RecommendedOptionID: "mauve", RecommendationReason: "Mauve looks calmer",
+			Options: []api.DecisionOption{{ID: "mauve", Label: "Mauve", Description: "Use mauve for the button"}, {ID: "amber", Label: "Amber", Description: "Use amber for the button"}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	owed := func() map[string]api.Obligation {
+		t.Helper()
+		list, err := f.c.ListObligations(ctx, f.task.ID, b.helper.Agent, "", true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]api.Obligation{}
+		for _, o := range list {
+			out[o.ID] = o
+		}
+		return out
+	}
+	send("Tell the helper about queue one", first, "differences-request-1")
+	decide("differences-decision-1")
+	b.must("write", "--task", f.task.ID)
+	stored := b.record()
+	// A queue entry in the snapshot that the hub no longer has.
+	stored.Snapshot.Queue = append(stored.Snapshot.Queue, handoffQueueRow{ID: "tqe_0123456789abcdef", Item: "wi_0123456789abcdef", Revision: 2, Order: 31581, State: "running"})
+	b.save(stored)
+	snapshot := b.bytes("record.json")
+	was := owed()
+
+	// Since the record: the first request is withdrawn, a second arrives, and
+	// a second decision is asked.
+	var withdrawn api.Obligation
+	for _, o := range was {
+		if o.SourceKind == "request" {
+			withdrawn = o
+		}
+	}
+	if _, err := f.c.WithdrawObligation(ctx, f.task.ID, withdrawn.ID, api.ObligationWithdrawRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Reason: "superseded", RequestID: "differences-withdraw"}); err != nil {
+		t.Fatal(err)
+	}
+	send("Tell the helper about queue two", second, "differences-request-2")
+	added := decide("differences-decision-2")
+	is := owed()
+	closed, fresh := 0, 0
+	var arrived api.Obligation
+	for id := range was {
+		if _, ok := is[id]; !ok {
+			closed++
+		}
+	}
+	for id, o := range is {
+		if _, ok := was[id]; !ok {
+			fresh++
+			if o.SourceKind == "request" {
+				arrived = o
+			}
+		}
+	}
+	if closed < 1 || fresh < 1 || arrived.ID == "" {
+		t.Fatalf("the fixture did not change the helper's obligations: %d closed, %d new", closed, fresh)
+	}
+	b.now = b.now.Add(time.Hour)
+	f.seen()
+	out, err := f.restore()
+	if err != nil {
+		t.Fatalf("restore = %v\n%s", err, out)
+	}
+	if sent := f.writes(); len(sent) != 0 {
+		t.Fatalf("restore sent %v", sent)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("read at %s; differences are from the record's snapshot of %s", handoffStamped(b.now), stored.Snapshot.AsOf),
+		fmt.Sprintf("obligations the helper owes: %d: %d closed since the record, %d new", len(is), closed, fresh),
+		fmt.Sprintf("%s msg #%d request from %s due ", arrived.ID, arrived.MessageSeq, f.lead.ID),
+		"open owner decisions: 2: 0 closed since the record, 1 new",
+		fmt.Sprintf("msg #%d from %s open (new)", added.Seq, f.lead.ID),
+		"queue entries launching or running: 0: 1 closed since the record, 0 new",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("restore output lacks %q:\n%s", want, out)
+		}
+	}
+	// The new obligation's line is marked; the withdrawn one is not listed.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, arrived.ID) && !strings.HasSuffix(line, "(new)") {
+			t.Fatalf("the new obligation is not marked new: %q", line)
+		}
+		if strings.Contains(line, withdrawn.ID) {
+			t.Fatalf("the withdrawn obligation is listed as live: %q", line)
+		}
+	}
+	// No message text is printed or stored, and the snapshot is as it was.
+	for _, text := range []string{first, second, question} {
+		if strings.Contains(out, text) || bytes.Contains(b.bytes("restore.json"), []byte(text)) {
+			t.Fatalf("message text %q was printed or stored", text)
+		}
+	}
+	if !bytes.Equal(b.bytes("record.json"), snapshot) {
+		t.Fatal("restore replaced the stored record or its snapshot")
+	}
+	var report handoffRestoreReport
+	if err := json.Unmarshal(b.bytes("restore.json"), &report); err != nil || report.Hub == nil || report.Hub.ObligationsClosed != closed || report.Hub.ObligationsNew != fresh ||
+		report.Hub.DecisionsNew != 1 || report.Hub.QueueClosed != 1 || report.Hub.SnapshotAsOf != stored.Snapshot.AsOf {
+		t.Fatalf("restore.json hub %+v %v", report.Hub, err)
+	}
+	requireHandoffValues(t, b.bytes("restore.json"))
+	// With no snapshot there is nothing to compare with, and restore says so.
+	stored.Snapshot = nil
+	b.save(stored)
+	if out, err := f.restore(); err != nil || !strings.Contains(out, "the record holds no snapshot to compare with") || strings.Contains(out, "closed since the record") {
+		t.Fatalf("restore with no snapshot = %v\n%s", err, out)
+	}
+}
+
+// a6 (b6): a switch to Codex. The record is written, the Codex session
+// registers deliberately, and restore verifies that registration and reports
+// every wake as not restorable in a runtime with no session timer. The wakes
+// stay active in the record.
+func TestHandoffRestoreCodex(t *testing.T) {
+	f := newHandoffHubFixture(t)
+	b := f.b
+	b.must(handoffAddArgs(handoffKinds[1], nil)...)
+	b.must("note", "wake", "add", "--schedule=30 7 * * *", "--kind=morning-summary", "--message=31581")
+	b.must("write", "--task", f.task.ID)
+	thread := "00000000-0000-4000-8000-" + strings.TrimPrefix(api.NewID("agt"), "agt_")[:12]
+	helperTestRuntime(t, f.helperFixture, "codex", thread)
+	// The record names this thread, and the leak check treats every other
+	// environment value as foreign: clear it before the box's own cleanup.
+	defer t.Setenv("CODEX_THREAD_ID", "")
+	registered, err := f.register(t, f.owner)
+	if err != nil || registered.Agent.Runtime != "codex" {
+		t.Fatalf("codex register %+v %v", registered.Agent, err)
+	}
+	before := f.state(t)
+	f.seen()
+	out, err := f.restore()
+	if err == nil || !strings.Contains(err.Error(), "restore incomplete: 2 not restored") {
+		t.Fatalf("restore = %v\n%s", err, out)
+	}
+	if sent := f.writes(); len(sent) != 0 || f.state(t) != before {
+		t.Fatalf("restore sent %v or changed state", sent)
+	}
+	for _, want := range []string{"registration: already correct: this session is the registered helper thread; run " + registered.Agent.RunID, "wake binding: already correct",
+		"w1 not restored: this runtime has no session timer", "w2 not restored: this runtime has no session timer"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("restore output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "arguments for") || strings.Contains(out, "wake confirm") {
+		t.Fatalf("restore offered a Codex session a cron:\n%s", out)
+	}
+	for _, e := range b.record().Notes.Wakes.Entries {
+		if e.State != "active" || e.Receipt != "" {
+			t.Fatalf("wake %+v", e)
+		}
+	}
+	// A Codex session cannot confirm one either.
+	if _, err := b.run("wake", "confirm", "w1", "--asserted", "--task", f.task.ID); err == nil || !strings.Contains(err.Error(), "this runtime has no session timer") {
+		t.Fatalf("codex wake confirm = %v", err)
+	}
+	var report handoffRestoreReport
+	if err := json.Unmarshal(b.bytes("restore.json"), &report); err != nil || report.Runtime != "codex" || len(report.Wakes) != 2 || report.Wakes[0].Reason != "no-session-timer" {
+		t.Fatalf("restore.json %+v %v", report, err)
+	}
+}
+
+// a7 (b7): what restore never does. After a restore that registers and after
+// one that is refused, the delegation window, the helper's obligations and
+// the queue are as they were, and a retired helper is still retired.
+func TestHandoffRestoreScope(t *testing.T) {
+	type hubView struct {
+		windows, obligations, queue string
+	}
+	view := func(t *testing.T, f *handoffHubFixture) hubView {
+		t.Helper()
+		ctx := context.Background()
+		windows, err := f.c.ListDelegationWindows(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v hubView
+		for _, w := range windows.Windows {
+			v.windows += fmt.Sprintf("%s delegate %s scope %s ends %s state %s created %s\n", w.ID, w.DelegateAgentID, w.Scope, w.EndsAt.UTC().Format(time.RFC3339Nano), w.State, w.CreatedAt.UTC().Format(time.RFC3339Nano))
+		}
+		obligations, err := f.c.ListObligations(ctx, f.task.ID, f.b.helper.Agent, "", false, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range obligations {
+			v.obligations += fmt.Sprintf("%s msg %d state %s delivered %v acked %v closed %v\n", o.ID, o.MessageSeq, o.State, o.DeliveredAt != nil, o.AckedAt != nil, o.ClosedAt != nil)
+		}
+		queue, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range queue.Entries {
+			v.queue += fmt.Sprintf("%s %s rev %d %s\n", q.ID, q.ItemID, q.ItemRevision, q.State)
+		}
+		return v
+	}
+	arrange := func(t *testing.T) *handoffHubFixture {
+		f := newHandoffHubFixture(t)
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdOwner(f.owner, []string{"delegation", "open", "--delegate", api.DefaultOwnerHelperName, "--for", "3h", "--scope", "decisions", "--request-id", "scope-window"})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		lead := env{hub: f.owner.hub, task: f.task.ID, agent: f.lead.ID, agentName: f.lead.Name, runID: f.lead.RunID}
+		const ask = "Summarise the scope fixture queue for the owner"
+		handoffForbid(ask, "Tell the helper about the scope fixture")
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdSend(lead, []string{"--kind", "request", "--to", api.DefaultOwnerHelperName, "--subject", "Tell the helper about the scope fixture", "--ask", ask, "--request-id", "scope-request"})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		f.b.must("note", "instruction", "add", "--message=31581", "--by=owner")
+		f.successor(t)
+		return f
+	}
+	t.Run("a restore that registers", func(t *testing.T) {
+		f := arrange(t)
+		before := view(t, f)
+		if !strings.Contains(before.windows, "state open") || !strings.Contains(before.obligations, "state queued delivered false acked false") {
+			t.Fatalf("the fixture has no open window or no queued obligation: %+v", before)
+		}
+		f.seen()
+		out, err := f.restore()
+		if err != nil || !strings.Contains(out, "registration: restored") {
+			t.Fatalf("restore = %v\n%s", err, out)
+		}
+		// Exactly one request could change the hub: the registration.
+		if sent := f.writes(); len(sent) != 1 || sent[0] != "POST /v1/tasks/"+f.task.ID+"/owner-helper" {
+			t.Fatalf("restore sent %v", sent)
+		}
+		if after := view(t, f); after != before {
+			t.Fatalf("restore changed a window, an obligation or the queue:\nbefore %+v\nafter  %+v", before, after)
+		}
+		// The instruction is printed for the session to read; nothing acts on it.
+		if !strings.Contains(out, "instructions still active (read each cited message before relying on it):\n  i1 active instruction msg #31581 by owner") {
+			t.Fatalf("restore did not print the instruction:\n%s", out)
+		}
+	})
+	t.Run("a restore that is refused", func(t *testing.T) {
+		f := arrange(t)
+		status := api.AgentRetired
+		if _, err := f.c.UpdateAgent(context.Background(), f.task.ID, f.b.helper.Agent, api.UpdateAgentRequest{Status: &status}); err != nil {
+			t.Fatal(err)
+		}
+		before, state := view(t, f), f.state(t)
+		f.seen()
+		if out, err := f.restore(); err == nil || out != "" || !strings.Contains(err.Error(), "g4 status") {
+			t.Fatalf("restore = %v\n%s", err, out)
+		}
+		if sent := f.writes(); len(sent) != 0 {
+			t.Fatalf("a refused restore sent %v", sent)
+		}
+		if after := view(t, f); after != before || f.state(t) != state {
+			t.Fatalf("a refused restore changed something:\nbefore %+v\nafter  %+v", before, after)
+		}
+		if helpers := f.helpers(t); len(helpers) != 1 || helpers[0].Status != api.AgentRetired || helpers[0].RunID != f.b.helper.Run {
+			t.Fatalf("the retired helper was resumed or replaced: %+v", helpers)
+		}
+	})
+}
+
 // handoffValuePatterns is this test's own statement of what each stored
 // value may look like, by its place in the record. It shares nothing with
 // the code under test.
@@ -2153,9 +2857,21 @@ var handoffValuePatterns = func() map[string]*regexp.Regexp {
 			"schedule": `[0-9*/,-]{1,20}( [0-9*/,-]{1,20}){4}`, "kind": `hourly-update|morning-summary|queue-check|obligation-check|authority-expiry|other`,
 			"expires": stamp + `|none`, "by": `owner|delegate|delegated|helper`, "given": stamp, "item": `wi` + hex,
 			"last": `send-order|await-start|await-result|review|verify|release|answer-owner|other`, "next": `send-order|await-start|await-result|review|verify|release|answer-owner|other`,
+			// Stage B: a wake's receipt and its last firing.
+			"receipt": `restored|asserted`, "receiptSession": uuid, "receiptTool": `toolu_[A-Za-z0-9_-]{6,100}`, "receiptAt": stamp, "fired": stamp,
 		} {
 			patterns[at+"entries[]."+key] = pattern
 		}
+	}
+	// Stage B: restore.json, the last restore's report. Its reasons are short
+	// names from a fixed list, never the hub's or anyone's words.
+	const reasons = `no-receipt|another-session|earlier-start|no-start-captured|no-session-timer|hub-refused|register-failed|no-binding|binding-mismatch|registration-missing|hub-read-failed|record-unreadable`
+	for path, pattern := range map[string]string{
+		"at": stamp, "task": `tsk` + hex, "agent": `agt` + hex, "run": `run` + hex, "previousRun": `run` + hex, "registration": `ohr` + hex, "runtime": `claude|codex`, "session": uuid,
+		"steps[].name": `registration|wake-binding|hub-state|record`, "steps[].state": `restored|already-correct|not-restored`, "steps[].reason": reasons,
+		"hub.asOf": stamp, "hub.snapshotAsOf": stamp, "wakes[].id": `w[1-9][0-9]{0,8}`, "wakes[].state": `restored|asserted|not-restored|expired|cancelled`, "wakes[].reason": reasons,
+	} {
+		patterns[path] = pattern
 	}
 	out := map[string]*regexp.Regexp{}
 	for path, pattern := range patterns {
