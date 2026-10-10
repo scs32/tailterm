@@ -1370,6 +1370,7 @@ func TestHandoffInjection(t *testing.T) {
 		// The new session after /clear: another id, the same tmux session.
 		b.asCandidate()
 		t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+		before := b.bytes("record.json")
 		r := b.hook("SessionStart", handoffOtherID, map[string]any{"source": "clear"})
 		if r.err != nil {
 			t.Fatal(r.err)
@@ -1377,11 +1378,15 @@ func TestHandoffInjection(t *testing.T) {
 		if shown, _ := requireNote(t, b, r.out, true); shown["wakes"] != 1 {
 			t.Fatalf("the candidate was not shown the wake:\n%s", r.out)
 		}
-		record := b.record()
-		if record.Capture.Start == nil || record.Capture.Start.Session != handoffOtherID || record.Capture.Start.Detail != "clear" || record.Identity.Thread != b.helper.Thread {
+		// Stage B (b10): a candidate is not the helper's own process, so the
+		// record's capture part is unchanged and only the log names it.
+		if !bytes.Equal(b.bytes("record.json"), before) {
+			t.Fatalf("a candidate's start rewrote the record:\nbefore %s\nafter  %s", before, b.bytes("record.json"))
+		}
+		if record := b.record(); record.Capture.Start != nil || record.Identity.Thread != b.helper.Thread {
 			t.Fatalf("capture %+v identity thread %s", record.Capture.Start, record.Identity.Thread)
 		}
-		if lines := strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n"); !strings.Contains(lines[len(lines)-1], `"match":"candidate"`) {
+		if lines := strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n"); !strings.Contains(lines[len(lines)-1], `"match":"candidate"`) || !strings.Contains(lines[len(lines)-1], handoffOtherID) {
 			t.Fatalf("the capture line does not say candidate: %s", lines[len(lines)-1])
 		}
 		// The helper file is untouched: the hook registers nothing.
@@ -1632,6 +1637,155 @@ func TestHandoffInjection(t *testing.T) {
 		}
 	})
 }
+
+// b10 and b11: the record's start, compaction and end stamps belong to the
+// helper's own runtime process, the one whose event payload names the
+// registered thread. Any other Claude process in the helper's tmux session,
+// such as a claude -p run from the helper's own pane, is logged as a candidate
+// or not at all, and never changes the record.
+func TestHandoffStampOwnership(t *testing.T) {
+	type fixture struct {
+		b                *handoffBox
+		record, previous []byte
+		captures         []byte
+	}
+	// The helper's session has started and noted a wake; a second process then
+	// runs in the same tmux session.
+	start := func(t *testing.T) *fixture {
+		b := newHandoffBox(t)
+		b.on()
+		b.asHelper()
+		b.asCandidate() // every process here sits in the helper's tmux session
+		b.must(handoffAddArgs(handoffKinds[1], nil)...)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "startup"}); r.err != nil || r.out == "" {
+			t.Fatalf("the helper's start = %v, %q", r.err, r.out)
+		}
+		b.now = b.now.Add(time.Minute)
+		return &fixture{b: b, record: b.bytes("record.json"), previous: b.bytes("record.json.1"), captures: b.bytes("captures.jsonl")}
+	}
+	unchanged := func(t *testing.T, f *fixture, what string) {
+		t.Helper()
+		if got := f.b.bytes("record.json"); !bytes.Equal(got, f.record) {
+			t.Fatalf("%s changed record.json:\nbefore %s\nafter  %s", what, f.record, got)
+		}
+		if got := f.b.bytes("record.json.1"); !bytes.Equal(got, f.previous) {
+			t.Fatalf("%s changed record.json.1", what)
+		}
+	}
+	captureLines := func(t *testing.T, b *handoffBox) []map[string]any {
+		t.Helper()
+		var rows []map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n") {
+			var row map[string]any
+			if err := json.Unmarshal([]byte(line), &row); err != nil {
+				t.Fatalf("captures line %q: %v", line, err)
+			}
+			rows = append(rows, row)
+		}
+		return rows
+	}
+	// payload is a hook payload with the given session_id, or with none.
+	payload := func(event string, session *string, fields map[string]any) string {
+		doc := map[string]any{"hook_event_name": event, "cwd": "/work/secret-project-dir"}
+		if session != nil {
+			doc["session_id"] = *session
+		}
+		for k, v := range fields {
+			doc[k] = v
+		}
+		data, _ := json.Marshal(doc)
+		return string(data)
+	}
+
+	t.Run("the helper's own events write the stamps", func(t *testing.T) {
+		f := start(t)
+		b := f.b
+		record := b.record()
+		if s := record.Capture.Start; s == nil || s.Session != b.helper.Thread || s.Detail != "startup" || !record.Capture.Open {
+			t.Fatalf("start stamp %+v open %v", s, record.Capture.Open)
+		}
+		b.quiet("PreCompact", b.helper.Thread, map[string]any{"trigger": "auto"})
+		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "logout"})
+		record = b.record()
+		if c := record.Capture; c.Compact == nil || c.Compact.Session != b.helper.Thread || c.End == nil || c.End.Session != b.helper.Thread || c.End.Detail != "logout" || c.Open {
+			t.Fatalf("capture %+v", c)
+		}
+		rows := captureLines(t, b)
+		if len(rows) != 3 {
+			t.Fatalf("capture lines %v", rows)
+		}
+		for _, row := range rows {
+			if row["match"] != handoffAsRegistered || row["session"] != b.helper.Thread {
+				t.Fatalf("capture line %v", row)
+			}
+		}
+	})
+	t.Run("second process", func(t *testing.T) {
+		// claude -p from the helper's pane: its own valid session id.
+		f := start(t)
+		b := f.b
+		t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+		r := b.hook("SessionStart", handoffOtherID, map[string]any{"source": "startup"})
+		if r.err != nil || !strings.Contains(r.out, handoffCandidateSentence) {
+			t.Fatalf("the second process's start = %v, %q", r.err, r.out)
+		}
+		unchanged(t, f, "the second process's start")
+		b.quiet("PreCompact", handoffOtherID, map[string]any{"trigger": "manual"})
+		unchanged(t, f, "the second process's compaction")
+		b.quiet("SessionEnd", handoffOtherID, map[string]any{"reason": "prompt_input_exit"})
+		unchanged(t, f, "the second process's end")
+		// It is recorded separately: three candidate lines in the capture log.
+		rows := captureLines(t, b)
+		if len(rows) != 4 {
+			t.Fatalf("capture lines %v", rows)
+		}
+		for i, event := range []string{"SessionStart", "PreCompact", "SessionEnd"} {
+			if row := rows[i+1]; row["event"] != event || row["match"] != handoffAsCandidate || row["session"] != handoffOtherID {
+				t.Fatalf("capture line %d = %v", i+1, row)
+			}
+		}
+		// The helper's session is still open and its start stamp is its own:
+		// its next start reports nothing missing only after its own end.
+		record := b.record()
+		if s := record.Capture.Start; s.Session != b.helper.Thread || !record.Capture.Open || record.Capture.End != nil {
+			t.Fatalf("capture %+v", record.Capture)
+		}
+		t.Setenv("CLAUDE_CODE_SESSION_ID", b.helper.Thread)
+		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "logout"})
+		if record := b.record(); record.Capture.End == nil || record.Capture.End.Session != b.helper.Thread || record.Capture.Open {
+			t.Fatalf("the helper's own end was not stamped: %+v", record.Capture)
+		}
+	})
+	for name, session := range map[string]*string{"missing session id": nil, "invalid session id": ptr("not-a-session-id")} {
+		t.Run(name, func(t *testing.T) {
+			// A nested process inherits the helper's CLAUDE_CODE_SESSION_ID. Its
+			// payload does not name the registered thread, so nothing is written.
+			f := start(t)
+			b := f.b
+			t.Setenv("CLAUDE_CODE_SESSION_ID", b.helper.Thread)
+			if r := b.hookRaw(payload("SessionStart", session, map[string]any{"source": "startup"}), nil); r.err != nil {
+				t.Fatalf("start = %v, %q", r.err, r.out)
+			}
+			unchanged(t, f, "a start with "+name)
+			if r := b.hookRaw(payload("PreCompact", session, map[string]any{"trigger": "auto"}), nil); r.err != nil || r.out != "" {
+				t.Fatalf("compaction = %v, %q", r.err, r.out)
+			}
+			unchanged(t, f, "a compaction with "+name)
+			if r := b.hookRaw(payload("SessionEnd", session, map[string]any{"reason": "logout"}), nil); r.err != nil || r.out != "" {
+				t.Fatalf("end = %v, %q", r.err, r.out)
+			}
+			unchanged(t, f, "an end with "+name)
+			if got := b.bytes("captures.jsonl"); !bytes.Equal(got, f.captures) {
+				t.Fatalf("an event with %s was logged:\n%s", name, got)
+			}
+			if record := b.record(); !record.Capture.Open || record.Capture.End != nil || record.Capture.Start.Session != b.helper.Thread {
+				t.Fatalf("capture %+v", record.Capture)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 // handoffHubFixture is a temporary hub with a registered owner helper, seen
 // through a proxy that records every request.

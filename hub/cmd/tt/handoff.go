@@ -1081,12 +1081,16 @@ func (h *handoffHookRun) work() {
 	default:
 		return
 	}
+	// Only the payload says which process sent the event: a process started
+	// inside the helper's session inherits CLAUDE_CODE_SESSION_ID. The
+	// environment may still choose which note a start prints; it never leads
+	// to a write.
 	thread := p.Session
-	if !threadIDPattern.MatchString(thread) {
-		thread = os.Getenv("CLAUDE_CODE_SESSION_ID")
-	}
-	if threadIDPattern.MatchString(thread) {
+	named := threadIDPattern.MatchString(thread)
+	if named {
 		stamp.Session = strings.ToLower(thread)
+	} else {
+		thread = os.Getenv("CLAUDE_CODE_SESSION_ID")
 	}
 	files, ok := handoffHelperFiles()
 	if !ok || len(files) == 0 {
@@ -1111,9 +1115,20 @@ func (h *handoffHookRun) work() {
 	if h.late() {
 		return
 	}
+	// The record's stamps belong to the helper's own runtime process: the
+	// event whose payload names the registered thread. Another Claude process
+	// in the helper's tmux session is logged as a candidate and changes no
+	// stamp; an event that does not say who sent it is not logged at all.
+	writes := handoffStampNothing
+	switch {
+	case named && match == handoffAsRegistered:
+		writes = handoffStampRecord
+	case named:
+		writes = handoffStampLog
+	}
 	note := handoffBrokenLine
 	if store, ok := handoffStoreFor(helper.Agent, handoffHookLockWait); ok {
-		if r, noEnd, err := store.stamp(helper, p.Event, stamp, slot, match, h.late); err == nil {
+		if r, noEnd, err := store.stamp(helper, p.Event, stamp, slot, match, writes, h.late); err == nil {
 			note = handoffNote(r, match, noEnd, handoffNow())
 		}
 	}
@@ -1128,14 +1143,22 @@ func (h *handoffHookRun) work() {
 	h.mu.Unlock()
 }
 
-// stamp records one hook event in the record's capture part and the capture
-// log, leaving the notes and the snapshot as they were. It returns the record
-// and whether the previous session left no end stamp. A record that cannot
-// be written is still returned, so the note is printed from what was read.
-func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffStamp, slot func(*handoffCapture) **handoffStamp, match string, late func() bool) (handoffRecord, bool, error) {
-	prepared := s.prepare() == nil
+// What one hook event may write.
+const (
+	handoffStampNothing = iota // read the record for the note only
+	handoffStampLog            // one captures.jsonl line; the record is left alone
+	handoffStampRecord         // the record's capture part and a captures.jsonl line
+)
+
+// stamp records one hook event, leaving the notes and the snapshot as they
+// were. With handoffStampRecord it writes the record's capture part and the
+// capture log; with handoffStampLog only the capture log; with
+// handoffStampNothing it reads. It returns the record and whether the helper's
+// previous session left no end stamp. A record that cannot be written is
+// still returned, so the note is printed from what was read.
+func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffStamp, slot func(*handoffCapture) **handoffStamp, match string, writes int, late func() bool) (handoffRecord, bool, error) {
 	var unlock func()
-	if prepared {
+	if writes != handoffStampNothing && s.prepare() == nil {
 		unlock = s.lock()
 	}
 	if unlock != nil {
@@ -1152,6 +1175,12 @@ func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffS
 	// previous session was killed; a compaction continues the same session.
 	noEnd := event == "SessionStart" && stamp.Detail != "compact" && r.Capture.Open
 	r.refreshIdentity(helper)
+	if writes != handoffStampRecord {
+		if writes == handoffStampLog && unlock != nil && !late() {
+			s.appendCapture(event, stamp, match)
+		}
+		return r, noEnd, nil
+	}
 	*slot(&r.Capture) = &stamp
 	switch event {
 	case "SessionStart":
