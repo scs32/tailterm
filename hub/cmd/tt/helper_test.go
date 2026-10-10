@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2198,4 +2199,429 @@ func TestClearHelperTagsProvesItsCondition(t *testing.T) {
 	if tags := f.tags(t, "owner"); tags["TAILTERM_AGENT"] != a.ID || tags["TAILTERM_ROLE"] != "other" {
 		t.Fatalf("tags of a session that changed role were cleared: %v", tags)
 	}
+}
+
+// helperFront is a logging proxy in front of the fixture's hub. Commands run
+// against it, so a test can assert which requests a command sent and act
+// between the hub's answer to a request and the command seeing it.
+type helperFront struct {
+	e   env
+	mu  sync.Mutex
+	log []helperFrontRequest
+	// answered runs after the hub answered a request and before the caller
+	// gets that answer.
+	answered func(r helperFrontRequest, status int)
+}
+
+type helperFrontRequest struct {
+	Method, Path string
+	Body         []byte
+}
+
+func newHelperFront(t *testing.T, f helperFixture) *helperFront {
+	t.Helper()
+	front := &helperFront{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seen := helperFrontRequest{Method: r.Method, Path: r.URL.Path, Body: body}
+		front.mu.Lock()
+		front.log = append(front.log, seen)
+		answered := front.answered
+		front.mu.Unlock()
+		req, err := http.NewRequest(r.Method, f.owner.hub+r.URL.RequestURI(), bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		req.Header = r.Header.Clone()
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer res.Body.Close()
+		answer, _ := io.ReadAll(res.Body)
+		if answered != nil {
+			answered(seen, res.StatusCode)
+		}
+		for k, v := range res.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(res.StatusCode)
+		_, _ = w.Write(answer)
+	}))
+	t.Cleanup(srv.Close)
+	front.e = env{hub: srv.URL, task: f.task.ID}
+	return front
+}
+
+func (h *helperFront) onAnswer(fn func(r helperFrontRequest, status int)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.answered = fn
+}
+
+// writes are the requests seen so far that could change the hub.
+func (h *helperFront) writes() []helperFrontRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []helperFrontRequest
+	for _, r := range h.log {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (h *helperFront) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.log = nil
+}
+
+// registers are the bodies of the register requests seen so far.
+func (h *helperFront) registers() []map[string]any {
+	var out []map[string]any
+	for _, r := range h.writes() {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.Path, "/owner-helper") {
+			var body map[string]any
+			_ = json.Unmarshal(r.Body, &body)
+			out = append(out, body)
+		}
+	}
+	return out
+}
+
+// helperLocal is the host state a registration writes: the helper file, every
+// wake binding and the tmux tags of the named sessions.
+func (f helperFixture) helperLocal(t *testing.T, hub string, sessions ...string) string {
+	t.Helper()
+	state, _ := os.ReadFile(ownerHelperPath(hub, f.task.ID))
+	out := "helper file: " + string(state)
+	paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.binding.json"))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out += "\n" + filepath.Base(path) + ": " + string(data)
+	}
+	for _, s := range sessions {
+		out += fmt.Sprintf("\ntags %s: %v", s, f.tags(t, s))
+	}
+	return out
+}
+
+// helperHubState is what a registration can write on the hub.
+func (f helperFixture) helperHubState(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	agents, err := f.c.ListAgents(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ""
+	for _, a := range agents {
+		if a.Role == api.AgentRoleOwnerHelper {
+			out += fmt.Sprintf("agent %s run %s status %s host %s session %s runtime %s\n", a.ID, a.RunID, a.Status, a.Host, a.Session, a.Runtime)
+		}
+	}
+	list, err := f.c.Events(ctx, f.task.ID, 0, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := list.Events
+	for _, e := range events {
+		if e.Kind == api.EventAgentAdded && e.Data["role"] == api.AgentRoleOwnerHelper {
+			out += fmt.Sprintf("registration %v run %v previous %v host %v\n", e.Data["registration"], e.Data["runId"], e.Data["previousRunId"], e.Data["host"])
+		}
+	}
+	return out + fmt.Sprintf("agents %d events %d\n", len(agents), len(events))
+}
+
+// newHelperThread makes this process a fresh Claude session: a new thread with
+// a transcript, as a successor session in the same pane would be.
+func newHelperThread(t *testing.T) string {
+	t.Helper()
+	thread := "00000000-0000-4000-8000-" + strings.TrimPrefix(api.NewID("agt"), "agt_")[:12]
+	writeHelperTranscript(t, os.Getenv("HOME"), thread)
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE_SESSION_ID", thread)
+	return thread
+}
+
+func TestHelperRegisterExpectedRun(t *testing.T) {
+	f := newHelperFixture(t)
+	front := newHelperFront(t, f)
+	ctx := context.Background()
+	first, err := f.register(t, front.e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A plain registration sends no expected run at all, so stored pending
+	// requests still hash as they did.
+	if sent := front.registers(); len(sent) != 1 {
+		t.Fatalf("register requests %v", sent)
+	} else if _, present := sent[0]["expectedRunId"]; present {
+		t.Fatalf("a plain register sent expectedRunId: %v", sent[0])
+	}
+	front.reset()
+
+	// A successor thread registers with the run it expects to replace.
+	thread := newHelperThread(t)
+	out, err := registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: first.Agent.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := front.registers()
+	if len(sent) != 1 || sent[0]["expectedRunId"] != first.Agent.RunID {
+		t.Fatalf("register requests %v", sent)
+	}
+	if out.Replay || out.Agent.ID != first.Agent.ID || out.Agent.RunID == first.Agent.RunID || out.Registration.PreviousRunID != first.Agent.RunID {
+		t.Fatalf("result %+v %+v", out.Agent, out.Registration)
+	}
+	state, _ := loadOwnerHelperFile(front.e.hub, f.task.ID)
+	b, bound := readBinding(t, front.e.hub, out.Agent.ID)
+	if state.Run != out.Agent.RunID || state.Thread != thread || state.PendingRequest != "" || !bound || b.Thread != thread || b.Run != out.Agent.RunID || f.tags(t, "owner")["TAILTERM_RUN"] != out.Agent.RunID {
+		t.Fatalf("local state %+v binding %+v", state, b)
+	}
+	front.reset()
+
+	// An expected run the helper file no longer names is refused on this host:
+	// nothing is sent and nothing is written.
+	newHelperThread(t)
+	local, hub := f.helperLocal(t, front.e.hub, "owner"), f.helperHubState(t)
+	_, err = registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: first.Agent.RunID})
+	var refused *helperExpectedRunRefused
+	if !errors.As(err, &refused) || !strings.Contains(err.Error(), "g5") {
+		t.Fatalf("stale expected run: %v", err)
+	}
+	if got := front.writes(); len(got) != 0 {
+		t.Fatalf("a refused registration sent %v", got)
+	}
+	if after := f.helperLocal(t, front.e.hub, "owner"); after != local {
+		t.Fatalf("local state changed:\n%s\n%s", local, after)
+	}
+	if after := f.helperHubState(t); after != hub {
+		t.Fatalf("hub changed:\n%s\n%s", hub, after)
+	}
+
+	// The hub refuses a run that is no longer current, with its reason, and
+	// the host state is byte-identical afterwards.
+	other, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub = f.helperHubState(t)
+	_, err = registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: out.Agent.RunID})
+	var httpErr *api.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusConflict || !strings.Contains(err.Error(), "run changed") {
+		t.Fatalf("hub refusal: %v", err)
+	}
+	if sent := front.registers(); len(sent) != 1 || sent[0]["expectedRunId"] != out.Agent.RunID {
+		t.Fatalf("register requests %v", sent)
+	}
+	if after := f.helperLocal(t, front.e.hub, "owner"); after != local {
+		t.Fatalf("local state changed after a hub refusal:\n%s\n%s", local, after)
+	}
+	if after := f.helperHubState(t); after != hub {
+		t.Fatalf("hub changed after a refusal:\n%s\n%s", hub, after)
+	}
+	if now, _ := f.c.GetAgent(ctx, f.task.ID, first.Agent.ID); now.RunID != other.Agent.RunID {
+		t.Fatalf("the other registration does not stand: %+v", now)
+	}
+}
+
+// TestHelperRegisterSerialized: a refused conditional registration and a plain
+// registration on one host never interleave their writes of the helper file.
+func TestHelperRegisterSerialized(t *testing.T) {
+	f := newHelperFixture(t)
+	front := newHelperFront(t, f)
+	ctx := context.Background()
+	first, err := f.register(t, front.e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another host registers, so the hub will refuse the run this host's
+	// helper file still names.
+	if _, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"}); err != nil {
+		t.Fatal(err)
+	}
+	front.reset()
+
+	answered, release, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var answers, waits atomic.Int32
+	previousAnswer, previousWaiting := helperAfterAnswer, helperLockWaiting
+	t.Cleanup(func() { helperAfterAnswer, helperLockWaiting = previousAnswer, previousWaiting })
+	helperAfterAnswer = func() {
+		if answers.Add(1) == 1 { // only the refused call stops here
+			close(answered)
+			<-release
+		}
+	}
+	helperLockWaiting = func() {
+		if waits.Add(1) == 1 {
+			close(waiting)
+		}
+	}
+
+	// The restore-style registration: a successor thread, a stale expected run.
+	newHelperThread(t)
+	refusedDone := make(chan error, 1)
+	go func() {
+		_, err := registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: first.Agent.RunID})
+		refusedDone <- err
+	}()
+	select {
+	case <-answered:
+	case err := <-refusedDone:
+		t.Fatalf("the refused call returned before its seam: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the refused call never reached the hub")
+	}
+	if sent := front.registers(); len(sent) != 1 || sent[0]["expectedRunId"] != first.Agent.RunID {
+		t.Fatalf("register requests %v", sent)
+	}
+	held := f.helperLocal(t, front.e.hub, "owner")
+	if state, _ := loadOwnerHelperFile(front.e.hub, f.task.ID); state.PendingRequest == "" || state.Run != first.Agent.RunID {
+		t.Fatalf("the refused call's pending request is not in the file: %+v", state)
+	}
+
+	// A plain registration from another thread starts while the first holds
+	// the lock. The identity is read from the environment before the lock, so
+	// the first call already has its own.
+	plainThread := newHelperThread(t)
+	type plainResult struct {
+		out api.OwnerActionResult
+		err error
+	}
+	plainDone := make(chan plainResult, 1)
+	stdout := os.Stdout
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = devnull // the plain register prints its result
+	t.Cleanup(func() { os.Stdout = stdout; devnull.Close() })
+	go func() {
+		out, err := registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, asJSON: true})
+		plainDone <- plainResult{out, err}
+	}()
+	select {
+	case <-waiting:
+	case got := <-plainDone:
+		t.Fatalf("the plain register did not wait for the lock: %+v %v", got.out, got.err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the plain register never reached the lock")
+	}
+	// While it waits it has sent nothing and written nothing.
+	if sent := front.registers(); len(sent) != 1 {
+		t.Fatalf("the waiting register sent a request: %v", sent)
+	}
+	if now := f.helperLocal(t, front.e.hub, "owner"); now != held {
+		t.Fatalf("the helper file changed while the lock was held:\n%s\n%s", held, now)
+	}
+
+	close(release)
+	refusedErr := <-refusedDone
+	var httpErr *api.HTTPError
+	if !errors.As(refusedErr, &httpErr) || httpErr.Status != http.StatusConflict {
+		t.Fatalf("refused call: %v", refusedErr)
+	}
+	plain := <-plainDone
+	os.Stdout = stdout
+	if plain.err != nil || plain.out.Agent == nil {
+		t.Fatalf("plain register: %+v %v", plain.out, plain.err)
+	}
+	// The plain register completed after the refused one, and the host state
+	// is the plain register's: no stale copy was written over it.
+	state, _ := loadOwnerHelperFile(front.e.hub, f.task.ID)
+	b, bound := readBinding(t, front.e.hub, plain.out.Agent.ID)
+	tags := f.tags(t, "owner")
+	if state.Run != plain.out.Agent.RunID || state.Thread != plainThread || state.Registration != plain.out.Registration.ID || state.PendingRequest != "" ||
+		!bound || b.Run != plain.out.Agent.RunID || b.Thread != plainThread || tags["TAILTERM_RUN"] != plain.out.Agent.RunID || tags["TAILTERM_AGENT"] != plain.out.Agent.ID {
+		t.Fatalf("host state is not the plain register's: file %+v binding %+v tags %v", state, b, tags)
+	}
+	if now, _ := f.c.GetAgent(ctx, f.task.ID, plain.out.Agent.ID); now.RunID != plain.out.Agent.RunID {
+		t.Fatalf("hub run %s, plain register's %s", now.RunID, plain.out.Agent.RunID)
+	}
+	sent := front.registers()
+	if _, present := sent[len(sent)-1]["expectedRunId"]; len(sent) != 2 || present {
+		t.Fatalf("register requests %v", sent)
+	}
+}
+
+// TestHelperRegisterAfterAnswerGaps acts between the hub's answer to a
+// conditional registration and the command's read-back of it.
+func TestHelperRegisterAfterAnswerGaps(t *testing.T) {
+	gap := func(t *testing.T, act func(f helperFixture, helper api.Agent)) (helperFixture, *helperFront, api.OwnerActionResult, error, string, string) {
+		f := newHelperFixture(t)
+		front := newHelperFront(t, f)
+		first, err := f.register(t, front.e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local := f.helperLocal(t, front.e.hub, "owner")
+		var once sync.Once
+		front.onAnswer(func(r helperFrontRequest, status int) {
+			if r.Method == http.MethodPost && strings.HasSuffix(r.Path, "/owner-helper") && status == http.StatusCreated {
+				once.Do(func() {
+					current, err := f.c.GetAgent(context.Background(), f.task.ID, first.Agent.ID)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					act(f, current)
+				})
+			}
+		})
+		front.reset()
+		newHelperThread(t)
+		_, err = registerHelperSession(front.e, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: first.Agent.RunID})
+		return f, front, first, err, local, f.helperLocal(t, front.e.hub, "owner")
+	}
+	t.Run("retired in the gap", func(t *testing.T) {
+		f, front, first, err, before, after := gap(t, func(f helperFixture, helper api.Agent) {
+			status := api.AgentRetired
+			if _, err := f.c.UpdateAgent(context.Background(), f.task.ID, helper.ID, api.UpdateAgentRequest{Status: &status}); err != nil {
+				t.Error(err)
+			}
+		})
+		var refused *helperExpectedRunRefused
+		if !errors.As(err, &refused) || !strings.Contains(err.Error(), "retired") {
+			t.Fatalf("want a refusal naming retired, got %v", err)
+		}
+		if after != before {
+			t.Fatalf("host state changed:\nbefore %s\nafter  %s", before, after)
+		}
+		if now, _ := f.c.GetAgent(context.Background(), f.task.ID, first.Agent.ID); now.Status != api.AgentRetired {
+			t.Fatalf("helper is %s, want retired", now.Status)
+		}
+		if sent := front.registers(); len(sent) != 1 {
+			t.Fatalf("register requests %v", sent)
+		}
+	})
+	t.Run("superseded in the gap", func(t *testing.T) {
+		var winner api.OwnerActionResult
+		f, front, first, err, before, after := gap(t, func(f helperFixture, helper api.Agent) {
+			var regErr error
+			winner, regErr = f.c.RegisterOwnerHelper(context.Background(), f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"})
+			if regErr != nil {
+				t.Error(regErr)
+			}
+		})
+		if err == nil || !strings.Contains(err.Error(), "no longer the helper's current run") {
+			t.Fatalf("want a refusal, got %v", err)
+		}
+		if after != before {
+			t.Fatalf("host state changed:\nbefore %s\nafter  %s", before, after)
+		}
+		if now, _ := f.c.GetAgent(context.Background(), f.task.ID, first.Agent.ID); winner.Agent == nil || now.RunID != winner.Agent.RunID || now.Host != "other-host" {
+			t.Fatalf("the winner's run does not stand: %+v", now)
+		}
+		if sent := front.registers(); len(sent) != 1 {
+			t.Fatalf("register requests %v", sent)
+		}
+	})
 }

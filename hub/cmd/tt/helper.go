@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -500,9 +501,82 @@ func helperRegister(e env, args []string) error {
 	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
 		return errors.New(helperUsage)
 	}
+	_, err := registerHelperSession(e, helperRegistration{task: *task, name: *name, requestID: *requestID, takeSession: *takeSession, asJSON: *asJSON})
+	return err
+}
+
+// helperRegistration is one registration of this session as a project's helper.
+// expectedRun is set only by tt handoff restore: the registration is then
+// conditional on that run still being the helper's (docs/session-handoff.md),
+// and the caller prints the result.
+type helperRegistration struct {
+	task, name, requestID string
+	takeSession, asJSON   bool
+	expectedRun           string
+}
+
+// Test seams; only tests replace them. helperLockWaiting runs when a
+// registration finds the helper-file lock held and starts to wait for it.
+// helperAfterAnswer runs after the hub has answered a register request and
+// before the helper file is written again.
+var (
+	helperLockWaiting = func() {}
+	helperAfterAnswer = func() {}
+)
+
+const helperLockRetry = 20 * time.Millisecond
+
+// lockOwnerHelperFile takes the host lock every writer of the helper file
+// holds, so two registrations on one host never interleave their reads and
+// writes of it. The lock file sits beside the helper file under a name no
+// helper-file listing matches, and is never removed. The wait ends with ctx.
+func lockOwnerHelperFile(ctx context.Context, hub, task string) (func(), error) {
+	path := ownerHelperPath(hub, task) + ".lock"
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	for waiting := false; ; {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = f.Close()
+			return nil, err
+		}
+		if !waiting {
+			waiting = true
+			helperLockWaiting()
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, errors.New("another registration is in progress on this host; nothing was registered or written. Run the command again")
+		case <-time.After(helperLockRetry):
+		}
+	}
+}
+
+// helperExpectedRunRefused is a refusal of a conditional registration made on
+// this host, before the hub was asked or after it answered.
+type helperExpectedRunRefused struct{ reason string }
+
+func (e *helperExpectedRunRefused) Error() string { return e.reason }
+
+// registerHelperSession registers this runtime session as the project's owner
+// helper and writes the helper file, the wake binding and the tmux tags. It is
+// the one writer of the helper file on this host, and holds its lock from
+// before the file is loaded until it returns.
+func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, error) {
+	task, name, requestID, takeSession, asJSON := &o.task, &o.name, &o.requestID, &o.takeSession, &o.asJSON
+	conditional := o.expectedRun != ""
 	c, err := e.client(10 * time.Second)
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	ctx, cancel := ctxTimeout(15 * time.Second)
 	defer cancel()
@@ -523,23 +597,23 @@ func helperRegister(e env, args []string) error {
 			}
 		}
 		if !isHelper {
-			return errors.New("tt helper register runs in the owner's own Claude Code or Codex session, not an agent session")
+			return api.OwnerActionResult{}, errors.New("tt helper register runs in the owner's own Claude Code or Codex session, not an agent session")
 		}
 	}
 	runtime, thread, codex, codexHome, err := helperRuntimeIdentity()
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	session, inTmux, err := currentHelperSession(ctx)
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	// One project per tmux session: checked before anything is registered or
 	// written.
 	if inTmux {
 		other, live, err := otherProjectHelper(ctx, c, session.ID, e.hub, *task)
 		if err != nil {
-			return err
+			return api.OwnerActionResult{}, err
 		}
 		if live {
 			where := "project " + other.Task
@@ -547,24 +621,41 @@ func helperRegister(e env, args []string) error {
 				where += " on " + other.Hub
 			}
 			if !*takeSession {
-				return fmt.Errorf("tmux session %s is the owner helper of %s; one project per tmux session: register from another tmux session, or pass --take-session to move this one (that project's helper wake stops)", session.Name, where)
+				return api.OwnerActionResult{}, fmt.Errorf("tmux session %s is the owner helper of %s; one project per tmux session: register from another tmux session, or pass --take-session to move this one (that project's helper wake stops)", session.Name, where)
 			}
 			fmt.Fprintf(os.Stderr, "[tt] warning: taking tmux session %s from the owner helper of %s; its wake-ups stop and it shows offline until it registers from another tmux session\n", session.Name, where)
 		}
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	req := api.RegisterOwnerHelperRequest{Name: *name, Host: spawn.Host(), Session: "terminal", Runtime: runtime, Cwd: cwd}
 	if inTmux {
 		req.Session = session.Name
 	}
+	req.ExpectedRunID = o.expectedRun
+	unlock, err := lockOwnerHelperFile(ctx, e.hub, *task)
+	if err != nil {
+		return api.OwnerActionResult{}, err
+	}
+	defer unlock()
 	state, err := loadOwnerHelperFile(e.hub, *task)
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	hash := helperRequestHash(req, thread)
+	if conditional {
+		// The caller fixed its expected predecessor before it waited for
+		// anything. A helper file that names another run now means another
+		// registration won meanwhile: refuse, and never continue with that run.
+		switch {
+		case state.Run != o.expectedRun:
+			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5 no competing successor: the helper file no longer names run " + o.expectedRun + "; another registration completed on this host. Nothing was registered or written"}
+		case state.PendingRequest != "" && state.PendingHash != hash:
+			return api.OwnerActionResult{}, &helperExpectedRunRefused{"g5 no competing successor: the helper file holds a pending registration request from another session. Nothing was registered or written"}
+		}
+	}
 	// Before thread-aware hashes, Claude stored only the request shape. A
 	// matching key can recover its receipt, but is not proof of its thread.
 	legacyReq := req
@@ -575,14 +666,14 @@ func helperRegister(e env, args []string) error {
 		state.PendingHash == hex.EncodeToString(legacySum[:]) &&
 		(*requestID == "" || *requestID == state.PendingRequest)
 	if legacyPending && (state.Runtime != "" && state.Runtime != runtime || state.Thread != "" && state.Thread != thread) {
-		return errors.New("legacy registration retry belongs to another saved runtime/thread; use a new key")
+		return api.OwnerActionResult{}, errors.New("legacy registration retry belongs to another saved runtime/thread; use a new key")
 	}
 	switch {
 	case legacyPending:
 		req.RequestID = state.PendingRequest
 	case *requestID != "":
 		if state.PendingRequest == *requestID && state.PendingHash != hash || state.RequestID == *requestID && state.RequestHash != hash {
-			return errors.New("registration retry key belongs to another runtime/thread; use a new key")
+			return api.OwnerActionResult{}, errors.New("registration retry key belongs to another runtime/thread; use a new key")
 		}
 		req.RequestID = *requestID
 	case state.PendingRequest != "" && state.PendingHash == hash:
@@ -590,13 +681,13 @@ func helperRegister(e env, args []string) error {
 		req.RequestID = state.PendingRequest
 	default:
 		if req.RequestID, err = newHelperRequestID(); err != nil {
-			return err
+			return api.OwnerActionResult{}, err
 		}
 	}
 	if !legacyPending {
 		state.PendingRequest, state.PendingHash = req.RequestID, hash
 		if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
-			return err
+			return api.OwnerActionResult{}, err
 		}
 	}
 	clearPending := func() {
@@ -607,26 +698,38 @@ func helperRegister(e env, args []string) error {
 		_ = writePrivateJSON(ownerHelperPath(e.hub, *task), state)
 	}
 	out, err := c.RegisterOwnerHelper(ctx, *task, req)
+	helperAfterAnswer()
 	if err != nil {
 		var httpErr *api.HTTPError
 		if errors.As(err, &httpErr) {
 			clearPending() // a definite refusal: nothing was registered
 		}
-		return err
+		return api.OwnerActionResult{}, err
+	}
+	if conditional && out.Replay {
+		// The hub's run was the expected one a moment ago, so a replayed
+		// result is not this command's registration: it is never adopted.
+		clearPending()
+		return api.OwnerActionResult{}, &helperExpectedRunRefused{"the hub replayed an earlier registration instead of registering this session; nothing was written on this host"}
 	}
 	// Verify before any local write, so a stale replay never tags a session.
 	a := out.Agent
 	if a == nil || out.Registration == nil || a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited || out.Registration.RunID != a.RunID || a.Runtime != runtime || out.Registration.Runtime != runtime {
 		clearPending()
-		return errors.New("the hub did not return a live owner helper run; register again")
+		return api.OwnerActionResult{}, errors.New("the hub did not return a live owner helper run; register again")
 	}
 	current, err := c.GetAgent(ctx, *task, a.ID)
 	if err != nil {
-		return err
+		return api.OwnerActionResult{}, err
 	}
 	if current.Runtime != runtime || current.RunID != a.RunID || current.Role != api.AgentRoleOwnerHelper || current.Status == api.AgentClosed || current.Status == api.AgentExited {
 		clearPending()
-		return errors.New("the registered run is no longer the helper's current run; register again")
+		return api.OwnerActionResult{}, errors.New("the registered run is no longer the helper's current run; register again")
+	}
+	if conditional && current.Status != api.AgentRunning && current.Status != api.AgentDone && current.Status != api.AgentNeedsInput {
+		// Retired after the hub answered: this session is not bound to it.
+		clearPending()
+		return api.OwnerActionResult{}, &helperExpectedRunRefused{"the owner helper is " + current.Status + " now; this session was not bound to it and nothing was written on this host"}
 	}
 	if legacyPending && (state.Thread == "" || state.Agent != a.ID || state.Run != a.RunID) {
 		// An older saved helper thread can belong to the previous run, not this
@@ -642,12 +745,12 @@ func helperRegister(e env, args []string) error {
 		} else {
 			fmt.Printf("recovered receipt %s for helper %s, run %s\n%s\n", out.Registration.ID, a.ID, a.RunID, detail)
 		}
-		return nil
+		return out, nil
 	}
 	b := runtimeBinding{Hub: e.hub, Task: *task, Agent: a.ID, Run: a.RunID, Thread: thread, Runtime: runtime, Codex: codex, CodexHome: codexHome, Role: api.AgentRoleOwnerHelper, Session: req.Session, Cwd: cwd, CreatedAt: time.Now().UTC()}
 	if inTmux {
 		if err := tagHelperSession(ctx, session.ID, b); err != nil {
-			return fmt.Errorf("tag this tmux session: %w", err)
+			return api.OwnerActionResult{}, fmt.Errorf("tag this tmux session: %w", err)
 		}
 	}
 	if state.SessionID != "" && (!inTmux || state.SessionID != session.ID || state.SessionCreated != session.Created) {
@@ -660,7 +763,7 @@ func helperRegister(e env, args []string) error {
 	}
 	if inTmux {
 		if err := writeRelayBinding(b); err != nil {
-			return fmt.Errorf("write the wake binding: %w", err)
+			return api.OwnerActionResult{}, fmt.Errorf("write the wake binding: %w", err)
 		}
 	} else {
 		_ = os.Remove(filepath.Join(relayDir(), bindingKey(b)+".binding.json"))
@@ -670,11 +773,14 @@ func helperRegister(e env, args []string) error {
 		state.SessionID, state.SessionCreated = session.ID, session.Created
 	}
 	if err := writePrivateJSON(ownerHelperPath(e.hub, *task), state); err != nil {
-		return err
+		return api.OwnerActionResult{}, err
+	}
+	if conditional {
+		return out, nil // tt handoff restore prints the result
 	}
 	if *asJSON {
 		printJSON(out)
-		return nil
+		return out, nil
 	}
 	r := out.Registration
 	fmt.Printf("owner helper %s (%s) %s: run %s", a.Name, a.ID, r.Mode, a.RunID)
@@ -689,7 +795,7 @@ func helperRegister(e env, args []string) error {
 		fmt.Fprintf(os.Stderr, "[tt] warning: tmux session %s has %d panes; wake-ups need exactly one\n", session.Name, session.Panes)
 	}
 	fmt.Printf("act as the helper: eval \"$(tt helper env --task %s)\"\n", *task)
-	return nil
+	return out, nil
 }
 
 // helperOffline reports an owner helper whose session is not running: it is
