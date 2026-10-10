@@ -1,0 +1,7 @@
+{
+  "name": "clean-view",
+  "version": "0.1.0",
+  "description": "Hides tool calls, results and progress rows from the transcript; /clean-view toggles it.",
+  "author": { "name": "Tailterm" },
+  "types": "./types/index.d.ts"
+}
