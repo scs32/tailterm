@@ -44,6 +44,11 @@ func (s *Store) RegisterOwnerHelper(ctx context.Context, taskID string, req api.
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
+		if req.ExpectedRunID != "" {
+			if err := expectedOwnerHelperRun(ctx, tx, taskID, req.ExpectedRunID, helper, found); err != nil {
+				return api.OwnerActionResult{}, err
+			}
+		}
 		if found && helper.Name != req.Name {
 			return api.OwnerActionResult{}, fmt.Errorf("%w: the owner helper is registered as %s; close it before choosing another name", api.ErrConflict, helper.Name)
 		}
@@ -126,6 +131,33 @@ func currentOwnerHelper(ctx context.Context, tx *sql.Tx, taskID string) (api.Age
 		return a, false, nil
 	}
 	return a, err == nil, err
+}
+
+// expectedOwnerHelperRun is the conditional registration (docs/owner-helper.md):
+// the caller's expected run must be the helper's current run, and the helper
+// must be running, done or needs-input. It reads inside the register
+// transaction and refuses before any write, so a refusal saves no owner action
+// and a retry is judged again.
+func expectedOwnerHelperRun(ctx context.Context, tx *sql.Tx, taskID, expected string, helper api.Agent, found bool) error {
+	if !found || helper.RunID != expected {
+		var closed int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE task_id=? AND role=? AND run_id=? AND status=?`, taskID, api.AgentRoleOwnerHelper, expected, api.AgentClosed).Scan(&closed); err != nil {
+			return err
+		}
+		if closed > 0 {
+			return fmt.Errorf("%w: the owner helper is closed; run %s was not replaced", api.ErrConflict, expected)
+		}
+		return fmt.Errorf("%w: the owner helper's run changed; run %s was not replaced", api.ErrConflict, expected)
+	}
+	switch helper.Status {
+	case api.AgentRunning, api.AgentDone, api.AgentNeedsInput:
+		return nil
+	case api.AgentRetired:
+		return fmt.Errorf("%w: the owner helper is retired; only tt resume re-enables it", api.ErrConflict)
+	case api.AgentExited:
+		return fmt.Errorf("%w: the owner helper has exited; run %s was not replaced", api.ErrConflict, expected)
+	}
+	return fmt.Errorf("%w: the owner helper is %s; run %s was not replaced", api.ErrConflict, helper.Status, expected)
 }
 
 // ListOwnerHelperRegistrations returns a project's registration receipts,

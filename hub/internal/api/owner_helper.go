@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -29,14 +30,23 @@ const (
 
 // RegisterOwnerHelperRequest binds the project's helper to one owner session.
 // Session is the tmux session name, or "terminal" outside tmux.
+//
+// ExpectedRunID, when set, makes the registration conditional: the hub replaces
+// the run only if the helper's current run is this one and the helper is
+// running, done or needs-input, and otherwise refuses with a conflict and
+// writes nothing. It must stay omitempty: stored pending requests are replayed
+// by the hash of this JSON.
 type RegisterOwnerHelperRequest struct {
-	Name      string `json:"name,omitempty"`
-	Host      string `json:"host"`
-	Session   string `json:"session"`
-	Runtime   string `json:"runtime"`
-	Cwd       string `json:"cwd,omitempty"`
-	RequestID string `json:"requestId"`
+	Name          string `json:"name,omitempty"`
+	Host          string `json:"host"`
+	Session       string `json:"session"`
+	Runtime       string `json:"runtime"`
+	Cwd           string `json:"cwd,omitempty"`
+	RequestID     string `json:"requestId"`
+	ExpectedRunID string `json:"expectedRunId,omitempty"`
 }
+
+var ownerHelperRunRE = regexp.MustCompile(`^run_[0-9a-f]{16}$`)
 
 // OwnerHelperRegistration is the receipt of one registration.
 type OwnerHelperRegistration struct {
@@ -72,6 +82,8 @@ func ValidateRegisterOwnerHelper(req *RegisterOwnerHelperRequest) error {
 		return fmt.Errorf("%w: the owner helper runtime must be claude or codex", ErrInvalid)
 	case !ValidText(req.Cwd, 1024) || (req.Cwd != "" && !filepath.IsAbs(req.Cwd)):
 		return fmt.Errorf("%w: cwd must be an absolute path", ErrInvalid)
+	case req.ExpectedRunID != "" && !ownerHelperRunRE.MatchString(req.ExpectedRunID):
+		return fmt.Errorf("%w: expectedRunId must be a run ID", ErrInvalid)
 	}
 	return nil
 }

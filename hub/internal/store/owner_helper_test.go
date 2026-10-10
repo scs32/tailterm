@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -413,4 +414,289 @@ func TestOwnerHelperNoActivityAlert(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatalf("alerts posted for the owner helper: %d -> %d", len(before), len(after))
 	}
+}
+
+// helperWrites is everything a registration can write, for the conditional
+// registration's "a refusal writes nothing" checks.
+type helperWrites struct {
+	agents, actions int
+	agent           api.Agent
+	receipts        []string
+	events          []int64
+}
+
+func helperWritesOf(t *testing.T, s *Store, task, agent string) helperWrites {
+	t.Helper()
+	ctx := context.Background()
+	var w helperWrites
+	if err := s.db.QueryRow(`SELECT count(*) FROM agents WHERE task_id=?`, task).Scan(&w.agents); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM owner_actions WHERE task_id=?`, task).Scan(&w.actions); err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.GetAgent(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Online and Unread are derived on read; the stored row is what must not move.
+	a.Online, a.Unread = false, 0
+	w.agent = a
+	list, err := s.ListOwnerHelperRegistrations(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range list {
+		w.receipts = append(w.receipts, r.ID+" "+r.RunID+" "+r.PreviousRunID+" "+r.Host)
+	}
+	events, err := s.ListEvents(ctx, task, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		w.events = append(w.events, e.Seq)
+	}
+	return w
+}
+
+func (w helperWrites) same(t *testing.T, after helperWrites, what string) {
+	t.Helper()
+	if w.agents != after.agents || w.actions != after.actions || !reflect.DeepEqual(w.agent, after.agent) ||
+		!reflect.DeepEqual(w.receipts, after.receipts) || !reflect.DeepEqual(w.events, after.events) {
+		t.Fatalf("%s wrote something:\nbefore %+v\nafter  %+v", what, w, after)
+	}
+}
+
+func expectedRequest(key, run string) api.RegisterOwnerHelperRequest {
+	req := helperRequest(key)
+	req.ExpectedRunID = run
+	return req
+}
+
+func setHelperStatus(t *testing.T, s *Store, agent, status string) {
+	t.Helper()
+	if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, status, agent); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// refusedExpectedRun registers with an expected run and requires a conflict
+// naming the reason and no write of any kind.
+func refusedExpectedRun(t *testing.T, s *Store, task, agent string, req api.RegisterOwnerHelperRequest, by api.Caller, reason string) {
+	t.Helper()
+	before := helperWritesOf(t, s, task, agent)
+	out, err := s.RegisterOwnerHelper(context.Background(), task, req, by)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), reason) {
+		t.Fatalf("expected run %s: want a conflict naming %q, got %+v %v", req.ExpectedRunID, reason, out, err)
+	}
+	if out.Agent != nil || out.Registration != nil {
+		t.Fatalf("refusal returned a result %+v", out)
+	}
+	before.same(t, helperWritesOf(t, s, task, agent), "refused registration ("+reason+")")
+}
+
+func TestOwnerHelperExpectedRun(t *testing.T) {
+	ctx := context.Background()
+	t.Run("matching run on an eligible helper registers", func(t *testing.T) {
+		for _, status := range []string{api.AgentRunning, api.AgentDone, api.AgentNeedsInput} {
+			f := newDeliveryFixture(t)
+			first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+			setHelperStatus(t, f.s, first.Agent.ID, status)
+			req := expectedRequest("restore-1", first.Agent.RunID)
+			req.Session, req.Host = "owner-2", "owner-host-2"
+			second := registerHelper(t, f.s, f.task.ID, req, f.by)
+			if second.Replay || second.Agent.ID != first.Agent.ID || second.Agent.RunID == first.Agent.RunID || second.Agent.Status != api.AgentRunning || second.Agent.Session != "owner-2" ||
+				second.Registration.Mode != api.OwnerHelperReplaced || second.Registration.PreviousRunID != first.Agent.RunID || second.Registration.RunID != second.Agent.RunID {
+				t.Fatalf("%s: %+v %+v", status, second.Agent, second.Registration)
+			}
+			list, _ := f.s.ListOwnerHelperRegistrations(ctx, f.task.ID)
+			if len(list) != 2 || len(helperEvents(t, f.s, f.task.ID, first.Agent.ID)) != 2 {
+				t.Fatalf("%s: receipts %+v", status, list)
+			}
+			// The same request replays; the run it named is no longer current, and
+			// the replay still does not register again.
+			replay, err := f.s.RegisterOwnerHelper(ctx, f.task.ID, req, f.by)
+			if err != nil || !replay.Replay || replay.Agent.RunID != second.Agent.RunID {
+				t.Fatalf("%s: replay %+v %v", status, replay, err)
+			}
+			if list, _ := f.s.ListOwnerHelperRegistrations(ctx, f.task.ID); len(list) != 2 {
+				t.Fatalf("%s: replay wrote a receipt %+v", status, list)
+			}
+		}
+	})
+	t.Run("a different run is refused", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", api.NewID("run")), f.by, "run changed")
+		// A refusal saved no owner action, so the same request ID is judged again.
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", api.NewID("run")), f.by, "run changed")
+		if a, _ := f.s.GetAgent(ctx, first.Agent.ID); a.RunID != first.Agent.RunID || a.Status != api.AgentRunning {
+			t.Fatalf("helper %+v", a)
+		}
+	})
+	t.Run("no helper at all is refused", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		refusedExpectedRun(t, f.s, f.task.ID, f.lead.ID, expectedRequest("restore-1", api.NewID("run")), f.by, "run changed")
+		var helpers int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM agents WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleOwnerHelper).Scan(&helpers); err != nil || helpers != 0 {
+			t.Fatalf("helpers %d %v", helpers, err)
+		}
+	})
+	t.Run("the right run on a retired helper is refused", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		setHelperStatus(t, f.s, first.Agent.ID, api.AgentRetired)
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", first.Agent.RunID), f.by, "retired; only tt resume re-enables it")
+		if a, _ := f.s.GetAgent(ctx, first.Agent.ID); a.RunID != first.Agent.RunID || a.Status != api.AgentRetired {
+			t.Fatalf("helper %+v", a)
+		}
+	})
+	t.Run("the right run on an exited helper is refused", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{Kind: api.EventExited, AgentID: first.Agent.ID, RunID: first.Agent.RunID}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", first.Agent.RunID), f.by, "exited")
+		if a, _ := f.s.GetAgent(ctx, first.Agent.ID); a.RunID != first.Agent.RunID || a.Status != api.AgentExited {
+			t.Fatalf("helper %+v", a)
+		}
+	})
+	t.Run("the right run on a closed helper is refused", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		if _, err := f.s.CloseAgentRun(ctx, first.Agent.ID, first.Agent.RunID, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", first.Agent.RunID), f.by, "closed")
+		if a, _ := f.s.GetAgent(ctx, first.Agent.ID); a.RunID != first.Agent.RunID || a.Status != api.AgentClosed {
+			t.Fatalf("helper %+v", a)
+		}
+	})
+	t.Run("a malformed expected run is invalid", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		before := helperWritesOf(t, f.s, f.task.ID, first.Agent.ID)
+		for _, bad := range []string{"run_1", "agt_0123456789abcdef", "run_0123456789ABCDEF", first.Agent.RunID + "0", " " + first.Agent.RunID} {
+			if _, err := f.s.RegisterOwnerHelper(ctx, f.task.ID, expectedRequest("bad-run", bad), f.by); !errors.Is(err, api.ErrInvalid) {
+				t.Fatalf("%q: %v", bad, err)
+			}
+		}
+		before.same(t, helperWritesOf(t, f.s, f.task.ID, first.Agent.ID), "invalid expected run")
+	})
+	t.Run("an absent field keeps a retired helper's replacement", func(t *testing.T) {
+		// Today's behaviour, which only the field changes: without it a retired
+		// helper's run is replaced and it stays retired.
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		setHelperStatus(t, f.s, first.Agent.ID, api.AgentRetired)
+		second := registerHelper(t, f.s, f.task.ID, helperRequest("reg-2"), f.by)
+		if second.Agent.Status != api.AgentRetired || second.Agent.RunID == first.Agent.RunID {
+			t.Fatalf("plain register on a retired helper %+v", second.Agent)
+		}
+	})
+}
+
+// The store serialises writers, so each interleaving is a fixed sequence: a
+// read of the helper's run R stands for a restore whose guards have passed.
+func TestOwnerHelperExpectedRunInterleavings(t *testing.T) {
+	ctx := context.Background()
+	t.Run("i two restores started together", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		r := first.Agent.RunID
+		type result struct {
+			out api.OwnerActionResult
+			err error
+		}
+		results := make([]result, 2)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range results {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				req := expectedRequest("restore-"+string(rune('a'+i)), r)
+				req.Session = "owner-" + string(rune('a'+i))
+				results[i].out, results[i].err = f.s.RegisterOwnerHelper(ctx, f.task.ID, req, f.by)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		winner, loser := -1, -1
+		for i, got := range results {
+			switch {
+			case got.err == nil:
+				winner = i
+			case errors.Is(got.err, api.ErrConflict) && strings.Contains(got.err.Error(), "run changed"):
+				loser = i
+			default:
+				t.Fatalf("restore %d: %+v %v", i, got.out, got.err)
+			}
+		}
+		if winner < 0 || loser < 0 {
+			t.Fatalf("want one new run and one refusal: %+v", results)
+		}
+		r2 := results[winner].out.Agent.RunID
+		if r2 == r || results[winner].out.Registration.PreviousRunID != r {
+			t.Fatalf("winner %+v", results[winner].out.Registration)
+		}
+		// The loser, sent again with R under its own request ID and under a new
+		// one, is refused again: it never registers over the winner.
+		for _, key := range []string{"restore-" + string(rune('a'+loser)), "restore-again"} {
+			req := expectedRequest(key, r)
+			req.Session = "owner-" + string(rune('a'+loser))
+			refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, req, f.by, "run changed")
+		}
+		a, _ := f.s.GetAgent(ctx, first.Agent.ID)
+		list, _ := f.s.ListOwnerHelperRegistrations(ctx, f.task.ID)
+		if a.RunID != r2 || a.Session != "owner-"+string(rune('a'+winner)) || len(list) != 2 || list[0].RunID != r2 || len(helperEvents(t, f.s, f.task.ID, first.Agent.ID)) != 2 {
+			t.Fatalf("after the race: agent %+v receipts %+v", a, list)
+		}
+	})
+	t.Run("ii retired in the gap", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		r := first.Agent.RunID
+		status := api.AgentRetired
+		if _, err := f.s.UpdateAgent(ctx, first.Agent.ID, api.UpdateAgentRequest{Status: &status}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", r), f.by, "retired")
+		if a, _ := f.s.GetAgent(ctx, first.Agent.ID); a.Status != api.AgentRetired || a.RunID != r {
+			t.Fatalf("helper %+v", a)
+		}
+	})
+	t.Run("iii another host registers in the gap", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		r := first.Agent.RunID
+		other := helperRequest("other-host")
+		other.Host, other.Session = "other-host", "owner-other"
+		won := registerHelper(t, f.s, f.task.ID, other, f.by)
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", r), f.by, "run changed")
+		a, _ := f.s.GetAgent(ctx, first.Agent.ID)
+		list, _ := f.s.ListOwnerHelperRegistrations(ctx, f.task.ID)
+		if a.RunID != won.Agent.RunID || a.Host != "other-host" || a.Session != "owner-other" || len(list) != 2 || list[0].ID != won.Registration.ID || list[0].Host != "other-host" {
+			t.Fatalf("the other registration does not stand: agent %+v receipts %+v", a, list)
+		}
+	})
+	t.Run("iv closed in the gap", func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		first := registerHelper(t, f.s, f.task.ID, helperRequest("reg-1"), f.by)
+		r := first.Agent.RunID
+		if _, err := f.s.CloseAgentRun(ctx, first.Agent.ID, r, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refusedExpectedRun(t, f.s, f.task.ID, first.Agent.ID, expectedRequest("restore-1", r), f.by, "closed")
+		var helpers int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM agents WHERE task_id=? AND role=?`, f.task.ID, api.AgentRoleOwnerHelper).Scan(&helpers); err != nil || helpers != 1 {
+			t.Fatalf("a closed helper's restore made an agent: %d %v", helpers, err)
+		}
+		// A fresh helper registered deliberately afterwards is not the expected
+		// run either, and the reason is still the closed one.
+		fresh := registerHelper(t, f.s, f.task.ID, helperRequest("fresh"), f.by)
+		refusedExpectedRun(t, f.s, f.task.ID, fresh.Agent.ID, expectedRequest("restore-2", r), f.by, "closed")
+	})
 }

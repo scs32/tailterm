@@ -1,7 +1,13 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,4 +149,266 @@ func TestOwnerHelperRegisterRefusedWhilePaused(t *testing.T) {
 	if code != http.StatusCreated || after.Agent.ID == helper.Agent.ID || after.Registration.Mode != api.OwnerHelperCreated {
 		t.Fatalf("after resume %d %+v", code, after)
 	}
+}
+
+// helperHTTPState is what a registration can change, read over HTTP and from
+// the store's receipts, for the conditional registration's "no writes" checks.
+type helperHTTPState struct {
+	agents   []api.Agent
+	receipts []string
+	events   []int64
+}
+
+func helperHTTPStateOf(c *client, task string) helperHTTPState {
+	c.t.Helper()
+	var s helperHTTPState
+	if code := c.do("GET", "/v1/tasks/"+task+"/agents", nil, &s.agents); code != http.StatusOK {
+		c.t.Fatalf("agents %d", code)
+	}
+	for i := range s.agents {
+		// Derived on read; the stored row is what must not move.
+		s.agents[i].Online, s.agents[i].Unread = false, 0
+	}
+	list, err := c.st.ListOwnerHelperRegistrations(context.Background(), task)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	for _, r := range list {
+		s.receipts = append(s.receipts, r.ID+" "+r.RunID+" "+r.PreviousRunID+" "+r.Host)
+	}
+	var events []api.Event
+	if code := c.do("GET", "/v1/tasks/"+task+"/events?limit=1000", nil, &events); code != http.StatusOK {
+		c.t.Fatalf("events %d", code)
+	}
+	for _, e := range events {
+		s.events = append(s.events, e.Seq)
+	}
+	return s
+}
+
+func TestOwnerHelperExpectedRunHTTP(t *testing.T) {
+	type fixture struct {
+		c     *client
+		task  api.Task
+		base  string
+		agent api.Agent
+	}
+	register := func(c *client, base, key, host, expected string) (int, api.OwnerActionResult, string) {
+		c.t.Helper()
+		// The body is decoded twice: a result on success, the error text on refusal.
+		var raw json.RawMessage
+		code := c.do("POST", base+"/owner-helper", api.RegisterOwnerHelperRequest{Host: host, Session: "owner", Runtime: "claude", RequestID: key, ExpectedRunID: expected}, &raw)
+		var out api.OwnerActionResult
+		var failed api.ErrorResponse
+		_ = json.Unmarshal(raw, &out)
+		_ = json.Unmarshal(raw, &failed)
+		return code, out, failed.Error
+	}
+	start := func(t *testing.T) fixture {
+		c := newClient(t)
+		task := c.task("synthetic helper expected run")
+		f := fixture{c: c, task: task, base: "/v1/tasks/" + task.ID}
+		code, out, _ := register(c, f.base, "reg-1", "owner-mac", "")
+		if code != http.StatusCreated || out.Agent == nil {
+			t.Fatalf("register %d %+v", code, out)
+		}
+		f.agent = *out.Agent
+		return f
+	}
+	current := func(f fixture) api.Agent {
+		f.c.t.Helper()
+		var a api.Agent
+		if code := f.c.do("GET", f.base+"/agents/"+f.agent.ID, nil, &a); code != http.StatusOK {
+			f.c.t.Fatalf("agent %d", code)
+		}
+		return a
+	}
+	// refused requires 409 with the reason in the response and nothing written.
+	refused := func(f fixture, key, expected, reason string) {
+		f.c.t.Helper()
+		before := helperHTTPStateOf(f.c, f.task.ID)
+		code, out, text := register(f.c, f.base, key, "owner-mac-2", expected)
+		if code != http.StatusConflict || !strings.Contains(text, reason) || out.Agent != nil || out.Registration != nil {
+			f.c.t.Fatalf("want 409 naming %q, got %d %q %+v", reason, code, text, out)
+		}
+		if after := helperHTTPStateOf(f.c, f.task.ID); !reflect.DeepEqual(before, after) {
+			f.c.t.Fatalf("refusal (%s) wrote something:\nbefore %+v\nafter  %+v", reason, before, after)
+		}
+	}
+	event := func(f fixture, kind string) {
+		f.c.t.Helper()
+		if code := f.c.do("POST", f.base+"/events", api.PostEventRequest{Kind: kind, AgentID: f.agent.ID, RunID: f.agent.RunID}, nil); code != http.StatusCreated {
+			f.c.t.Fatalf("%s event %d", kind, code)
+		}
+	}
+	retire := func(f fixture) {
+		f.c.t.Helper()
+		status := api.AgentRetired
+		if code := f.c.do("PATCH", f.base+"/agents/"+f.agent.ID, api.UpdateAgentRequest{Status: &status}, nil); code != http.StatusOK {
+			f.c.t.Fatalf("retire %d", code)
+		}
+	}
+	closeHelper := func(f fixture) {
+		f.c.t.Helper()
+		if code := f.c.do("DELETE", f.base+"/agents/"+f.agent.ID+"?runId="+f.agent.RunID, nil, nil); code != http.StatusOK {
+			f.c.t.Fatalf("close %d", code)
+		}
+	}
+
+	t.Run("matching run registers", func(t *testing.T) {
+		for _, kind := range []string{"", api.EventDone, api.EventNeedsInput} {
+			f := start(t)
+			want := api.AgentRunning
+			if kind != "" {
+				event(f, kind)
+				want = kind
+			}
+			if got := current(f); got.Status != want {
+				t.Fatalf("fixture status %s, want %s", got.Status, want)
+			}
+			code, out, _ := register(f.c, f.base, "restore-1", "owner-mac-2", f.agent.RunID)
+			if code != http.StatusCreated || out.Agent == nil || out.Agent.ID != f.agent.ID || out.Agent.RunID == f.agent.RunID || out.Agent.Status != api.AgentRunning ||
+				out.Registration == nil || out.Registration.PreviousRunID != f.agent.RunID || out.Registration.Mode != api.OwnerHelperReplaced {
+				t.Fatalf("status %q: %d %+v", kind, code, out)
+			}
+			if got := current(f); got.RunID != out.Agent.RunID || got.Host != "owner-mac-2" {
+				t.Fatalf("status %q: helper %+v", kind, got)
+			}
+		}
+	})
+	t.Run("a different run is 409", func(t *testing.T) {
+		f := start(t)
+		refused(f, "restore-1", api.NewID("run"), "run changed")
+		if got := current(f); got.RunID != f.agent.RunID || got.Status != api.AgentRunning {
+			t.Fatalf("helper %+v", got)
+		}
+	})
+	t.Run("retired is 409", func(t *testing.T) {
+		f := start(t)
+		retire(f)
+		refused(f, "restore-1", f.agent.RunID, "retired; only tt resume re-enables it")
+	})
+	t.Run("exited is 409", func(t *testing.T) {
+		f := start(t)
+		event(f, api.EventExited)
+		refused(f, "restore-1", f.agent.RunID, "exited")
+		if got := current(f); got.Status != api.AgentExited || got.RunID != f.agent.RunID {
+			t.Fatalf("helper %+v", got)
+		}
+	})
+	t.Run("closed is 409", func(t *testing.T) {
+		f := start(t)
+		closeHelper(f)
+		refused(f, "restore-1", f.agent.RunID, "closed")
+	})
+	t.Run("a malformed run is 400", func(t *testing.T) {
+		f := start(t)
+		before := helperHTTPStateOf(f.c, f.task.ID)
+		for _, bad := range []string{"run_1", "agt_0123456789abcdef", f.agent.RunID + "0"} {
+			if code, _, _ := register(f.c, f.base, "bad-run", "owner-mac-2", bad); code != http.StatusBadRequest {
+				t.Fatalf("%q: %d", bad, code)
+			}
+		}
+		if after := helperHTTPStateOf(f.c, f.task.ID); !reflect.DeepEqual(before, after) {
+			t.Fatalf("an invalid request wrote something")
+		}
+	})
+
+	// The four interleavings of the store test, through HTTP. A read of the
+	// helper's run R stands for a restore whose guards have passed.
+	t.Run("i two restores started together", func(t *testing.T) {
+		f := start(t)
+		r := current(f).RunID
+		type result struct {
+			code int
+			out  api.OwnerActionResult
+			text string
+		}
+		results := make([]result, 2)
+		begin := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range results {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-begin
+				var raw json.RawMessage
+				// c.do is not used here: it may call t.Fatal, which a goroutine must not.
+				body, _ := json.Marshal(api.RegisterOwnerHelperRequest{Host: "restore-host-" + string(rune('a'+i)), Session: "owner", Runtime: "claude", RequestID: "restore-" + string(rune('a'+i)), ExpectedRunID: r})
+				res, err := http.Post(f.c.srv.URL+f.base+"/owner-helper", "application/json", bytes.NewReader(body))
+				if err != nil {
+					results[i].text = err.Error()
+					return
+				}
+				defer res.Body.Close()
+				_ = json.NewDecoder(res.Body).Decode(&raw)
+				var failed api.ErrorResponse
+				_ = json.Unmarshal(raw, &results[i].out)
+				_ = json.Unmarshal(raw, &failed)
+				results[i].code, results[i].text = res.StatusCode, failed.Error
+			}()
+		}
+		close(begin)
+		wg.Wait()
+		winner, loser := -1, -1
+		for i, got := range results {
+			switch {
+			case got.code == http.StatusCreated && got.out.Agent != nil:
+				winner = i
+			case got.code == http.StatusConflict && strings.Contains(got.text, "run changed"):
+				loser = i
+			default:
+				t.Fatalf("restore %d: %d %q %+v", i, got.code, got.text, got.out)
+			}
+		}
+		if winner < 0 || loser < 0 {
+			t.Fatalf("want one new run and one refusal: %+v", results)
+		}
+		r2 := results[winner].out.Agent.RunID
+		if r2 == r || results[winner].out.Registration.PreviousRunID != r {
+			t.Fatalf("winner %+v", results[winner].out.Registration)
+		}
+		// The loser, sent again with R, is refused again.
+		refused(f, "restore-"+string(rune('a'+loser)), r, "run changed")
+		refused(f, "restore-again", r, "run changed")
+		if got := current(f); got.RunID != r2 || got.Host != "restore-host-"+string(rune('a'+winner)) {
+			t.Fatalf("after the race %+v", got)
+		}
+		if state := helperHTTPStateOf(f.c, f.task.ID); len(state.receipts) != 2 {
+			t.Fatalf("receipts %+v", state.receipts)
+		}
+	})
+	t.Run("ii retired in the gap", func(t *testing.T) {
+		f := start(t)
+		r := current(f).RunID
+		retire(f)
+		refused(f, "restore-1", r, "retired")
+		if got := current(f); got.Status != api.AgentRetired || got.RunID != r {
+			t.Fatalf("helper %+v", got)
+		}
+	})
+	t.Run("iii another host registers in the gap", func(t *testing.T) {
+		f := start(t)
+		r := current(f).RunID
+		code, won, _ := register(f.c, f.base, "other-host", "other-host", "")
+		if code != http.StatusCreated {
+			t.Fatalf("other host %d", code)
+		}
+		refused(f, "restore-1", r, "run changed")
+		got := current(f)
+		state := helperHTTPStateOf(f.c, f.task.ID)
+		if got.RunID != won.Agent.RunID || got.Host != "other-host" || len(state.receipts) != 2 || !strings.HasPrefix(state.receipts[0], won.Registration.ID+" ") {
+			t.Fatalf("the other registration does not stand: %+v %+v", got, state.receipts)
+		}
+	})
+	t.Run("iv closed in the gap", func(t *testing.T) {
+		f := start(t)
+		r := current(f).RunID
+		closeHelper(f)
+		before := len(helperHTTPStateOf(f.c, f.task.ID).agents)
+		refused(f, "restore-1", r, "closed")
+		if after := len(helperHTTPStateOf(f.c, f.task.ID).agents); after != before {
+			t.Fatalf("agents %d -> %d", before, after)
+		}
+	})
 }
