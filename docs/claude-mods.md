@@ -35,9 +35,10 @@ with clean view **on**.
 
 ### Agent sessions
 
-Agent sessions never load it. Nothing in `tt host setup`, the hub, the relay or
-the launch scripts names the folder, and `tests/clean-view-mod.test.js` checks
-that this stays true.
+Agent sessions never load it. Nothing in `tt host setup`, the hub, the relay,
+the client or the launch scripts loads the folder. Its only mention there is the
+release target map, which says nothing ships from it.
+`tests/clean-view-mod.test.js` checks that this stays true.
 
 Do not put the folder in `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`.
 Every Claude Code session on the host, agent sessions included, would then load

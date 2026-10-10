@@ -79,12 +79,15 @@ test("clean view manifest names its hooks module and state contract, and the mod
 });
 
 test("no launch or setup path names the mods folder or the plugin dirs setting", () => {
-  for (const needle of ["claude-mods", "CLAUDE_CODE_PLUGIN_DIRS"]) {
-    const found = git("grep", "-l", needle, "--", ...LAUNCH_PATHS);
-    // git grep exits 1 when nothing matches.
-    assert.equal(found.status, 1, `${needle} is named in: ${found.stdout}${found.stderr}`);
-    assert.equal(found.stdout, "");
-  }
+  // The release target map names the folder once, to say nothing ships from it.
+  const named = git("grep", "-n", "claude-mods", "--", ...LAUNCH_PATHS);
+  const lines = named.stdout.split("\n").filter(Boolean);
+  assert.equal(lines.length, 1, named.stdout + named.stderr);
+  assert.match(lines[0], /^scripts\/release-targets\.mjs:\d+:.*\) continue;/);
+  const setting = git("grep", "-l", "CLAUDE_CODE_PLUGIN_DIRS", "--", ...LAUNCH_PATHS);
+  // git grep exits 1 when nothing matches.
+  assert.equal(setting.status, 1, `the setting is named in: ${setting.stdout}${setting.stderr}`);
+  assert.equal(setting.stdout, "");
 });
 
 test("claude plugin validate --strict passes and reports the command and the four row kinds", (t) => {
