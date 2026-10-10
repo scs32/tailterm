@@ -71,6 +71,7 @@ func TestToolDenyClassify(t *testing.T) {
 		{"old-site-deploy", `node scripts/deploy-static.mjs`},
 		{"old-site-deploy", `cd repo && node ./scripts/deploy-static.mjs --dry`},
 		{"old-site-deploy", `pnpm run deploy:static`},
+		{"old-site-deploy", `node scripts/deploy-static.mjs --check`},
 		{"old-site-deploy", `./scripts/deploy-static.mjs`},
 
 		{"truenas-tailscale", `ssh truenas tailscale status`},
@@ -120,7 +121,6 @@ func TestToolDenyClassify(t *testing.T) {
 		`cat scripts/deploy-static.mjs`,
 		`grep -n deploy:static package.json`,
 		`node --check scripts/deploy-static.mjs`,
-		`node scripts/deploy-static.mjs --check`,
 		`node -e "console.log(1)" scripts/deploy-static.mjs`,
 		`git log -- scripts/deploy-static.mjs`,
 		`tt send --subject "do not run npm run deploy:static"`,
@@ -269,6 +269,7 @@ func TestToolDenySummary(t *testing.T) {
 		{`pkill -f ab12cd34`, []string{"host-pkill: pkill -f (+1 args)"}},
 		{`ssh truenas tailscale up --authkey=zzQ-not-a-shape`, []string{"truenas-tailscale: ssh truenas tailscale up (+1 args)"}},
 		{`node scripts/deploy-static.mjs hunter2-positional`, []string{"old-site-deploy: node deploy-static.mjs (+1 args)"}},
+		{`node scripts/deploy-static.mjs --check`, []string{"old-site-deploy: node deploy-static.mjs (+1 args)"}},
 		{`TOKEN=assigned-secret-value pkill -9 -f "go test"`, []string{"host-pkill: pkill -9 -f (+1 args)"}},
 		{`pkill -f ` + github, []string{"host-pkill: pkill -f (+1 args)"}},
 		{`killall -SIGKILL -q ` + e.token, []string{"host-pkill: killall -KILL -q (+1 args)"}},

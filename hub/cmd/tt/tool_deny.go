@@ -337,7 +337,8 @@ func (c *toolDenyScan) npm(name string, args []string) {
 }
 
 // node fires old-site-deploy when the script it runs is deploy-static.mjs.
-// A syntax check or an inline script does not run it.
+// A syntax check or an inline script, asked for before the file name, does
+// not run it. What follows the name is the script's own and changes nothing.
 func (c *toolDenyScan) node(args []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -353,11 +354,6 @@ func (c *toolDenyScan) node(args []string) {
 		}
 		if toolDenyBase(a) != "deploy-static.mjs" {
 			return
-		}
-		for _, later := range args[i+1:] {
-			if later == "--check" || later == "-c" {
-				return
-			}
 		}
 		sum := toolDenySum{}
 		sum.add("node")
