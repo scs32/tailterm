@@ -2941,6 +2941,44 @@ func TestHandoffWakes(t *testing.T) {
 		}
 		requireHandoffValues(t, b.bytes("record.json"))
 	})
+	// The row a real session left in the isolated cron check (b9, Claude Code
+	// 2.1.296, 2026-10-10): its ids, tool name, outcome, time and digest, and
+	// no other content. The wake and project are the ones that check used.
+	t.Run("the row of the live cron check", func(t *testing.T) {
+		const (
+			liveTask    = "tsk_c8ae9d0d78272b1a"
+			liveAgent   = "agt_c6cdec912db7387b"
+			liveSession = "00000000-0000-4000-8000-6f74191bed5b"
+			liveToolUse = "toolu_01DaETr6BDNzVFRQZLXnWtdp"
+			liveDigest  = "e6cdb6e0c2d0033020f2979858bef80fad02ef9f06dd0bb85e933626fd26f0f1"
+			liveArgs    = `{"cron":"7 3 1 1 *","prompt":"Tailterm handoff wake w1. Run tt handoff wake due w1 --task tsk_c8ae9d0d78272b1a."}`
+		)
+		created := time.Date(2026, 10, 10, 4, 21, 22, 346836000, time.UTC)
+		b := newHandoffBox(t)
+		b.on()
+		b.helper.Task, b.helper.Agent, b.helper.Thread = liveTask, liveAgent, liveSession
+		b.asHelper()
+		if !handoffLedgerMatching {
+			t.Fatal("ledger matching ships switched off, but the live check restored a wake from this row")
+		}
+		b.now = time.Date(2026, 10, 10, 4, 21, 16, 0, time.UTC)
+		b.must("note", "wake", "add", "--schedule=7 3 1 1 *", "--kind=other", "--message=1")
+		b.hook("SessionStart", liveSession, map[string]any{"source": "startup"})
+		// The arguments tt prints for that wake are the ones the session sent.
+		if got := string(handoffWakeArgs(b.wake("w1"), liveTask)); got != liveArgs || toolArgsDigest(json.RawMessage(got)) != liveDigest || handoffCronTool != "CronCreate" {
+			t.Fatalf("tt prints %s for the wake; the live session's arguments were %s (digest %s)", got, liveArgs, liveDigest)
+		}
+		b.now = created.Add(5 * time.Second)
+		b.ledger(handoffLedgerFixture{Session: liveSession, Tool: "CronCreate", ToolUse: liveToolUse, Outcome: "ok", Digest: liveDigest, At: created})
+		out, err := confirm(b, "w1")
+		if err != nil || out != "wake w1 restored: this session created its cron at 2026-10-10T04:21:22Z (tool use "+liveToolUse+")\n" {
+			t.Fatalf("confirm = %v, %q", err, out)
+		}
+		if w := b.wake("w1"); w.Receipt != handoffRestored || w.ReceiptTool != liveToolUse || w.ReceiptSession != liveSession || w.ReceiptAt != "2026-10-10T04:21:22Z" {
+			t.Fatalf("receipt %+v", w)
+		}
+		requireHandoffValues(t, b.bytes("record.json"))
+	})
 	t.Run("a row backs one wake only", func(t *testing.T) {
 		b := begin(t)
 		b.ledger(b.cron("w1", toolA))
@@ -3831,6 +3869,9 @@ type handoffLiveRun struct {
 	hung, failed            string // the scripts a hung or failing entry runs
 	failMark                string
 	launched, exits, debugs int
+	// tools allows the three tool events and the candidate's own tt hook tool
+	// entries, for the stage B cron check only. Every other run is strict.
+	tools bool
 }
 
 const (
@@ -4180,14 +4221,21 @@ func (r *handoffLiveRun) isolated(events map[string]int) {
 		}
 		for _, m := range handoffLiveHook.FindAllStringSubmatch(debug, -1) {
 			named++
-			if !strings.Contains(m[2], prefix) || m[1] != "SessionStart" && m[1] != "PreCompact" && m[1] != "SessionEnd" {
+			session := m[1] == "SessionStart" || m[1] == "PreCompact" || m[1] == "SessionEnd"
+			tool := r.tools && (m[1] == "PreToolUse" || m[1] == "PostToolUse" || m[1] == "PostToolUseFailure")
+			if !strings.Contains(m[2], prefix) || !session && !tool {
 				t.Errorf("%s: Claude Code ran a hook that is not under test: %s [%s]", r.name, m[1], m[2])
 			}
 		}
 		starts += strings.Count(debug, `Hook SessionStart:`)
 		for _, foreign := range []string{" hook session-start", " hook prompt", " hook tool", " hook stop", " hook notification"} {
-			if strings.Contains(debug, foreign) {
-				t.Errorf("%s: the debug output names an installed tt hook (%s): user settings were loaded", r.name, foreign)
+			for _, line := range strings.Split(debug, "\n") {
+				// In the cron check a tt hook tool is foreign only when it is not
+				// the candidate's, under the run's own directory.
+				if strings.Contains(line, foreign) && !(r.tools && foreign == " hook tool" && strings.Contains(line, prefix)) {
+					t.Errorf("%s: the debug output names an installed tt hook (%s): user settings were loaded", r.name, foreign)
+					break
+				}
 			}
 		}
 	}
@@ -4414,4 +4462,201 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 			what, measured.Round(100*time.Millisecond), baseline.Round(100*time.Millisecond), extra.Round(100*time.Millisecond), compaction,
 			reply.Round(100*time.Millisecond), replyTook.Round(100*time.Millisecond), said, cutoff, shown)
 	}
+}
+
+// ---- b9: the stage B cron check ----
+
+// candidate runs the candidate tt as the run's own session would, with an
+// explicit environment: the run's temporary home, state directories and
+// ledger, and the session id. Nothing of the user's is in it.
+func (r *handoffLiveRun) candidate(args ...string) (string, error) {
+	cmd := exec.Command(r.l.tt, args...)
+	cmd.Dir = filepath.Join(r.dir, "project")
+	cmd.Env = r.candidateEnv()
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func (r *handoffLiveRun) candidateEnv() []string {
+	return []string{"HOME=" + filepath.Join(r.dir, "home"), "PATH=/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+		"TAILTERM_HANDOFF_DIR=" + filepath.Join(r.dir, "handoff"), "TAILTERM_HANDOFF_CONFIG=" + filepath.Join(r.dir, "cfg", "handoff.json"),
+		"TAILTERM_RELAY_STATE=" + filepath.Join(r.dir, "relay"), "TAILTERM_TOOL_LEDGER_DIR=" + filepath.Join(r.dir, "tool-ledger"),
+		"TAILTERM_HANDOFF_ACCESS_LOG=" + filepath.Join(r.dir, "access.log"), "CLAUDE_CODE_SESSION_ID=" + r.thread}
+}
+
+// ledgerRows are the rows the candidate tt hook tool wrote for this run.
+func (r *handoffLiveRun) ledgerRows() []toolLedgerRow {
+	var rows []toolLedgerRow
+	for _, line := range strings.Split(strings.TrimSpace(r.read("tool-ledger", r.helper.Agent, "ledger.jsonl")), "\n") {
+		var row toolLedgerRow
+		if line != "" && json.Unmarshal([]byte(line), &row) == nil {
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+// TestHandoffLiveCronCheck is b9, the isolated check behind condition c2: does
+// the tool ledger see a real session create a cron, with a digest tt can
+// predict, so that tt handoff wake confirm can call a wake restored. Run it by
+// hand:
+//
+//	TT_LIVE_CLAUDE=1 go test ./cmd/tt -run '^TestHandoffLiveCronCheck$' -count=1 -v -timeout 20m
+//
+// It is the stage A harness with two additions: the project settings also
+// hold the candidate tt hook tool entries, and the candidate's ledger is a
+// temporary directory. It starts one disposable Claude Code session on a
+// private tmux socket, asks it for one cron that cannot fire during the check
+// and then to delete it. It needs the user's Claude login and nothing else of
+// the user's.
+func TestHandoffLiveCronCheck(t *testing.T) {
+	if os.Getenv("TT_LIVE_CLAUDE") != "1" {
+		t.Skip("requires an explicit live Claude check")
+	}
+	l := newHandoffLive(t)
+	version, _ := exec.Command(l.claude, "--version").Output()
+	t.Logf("Claude Code %s; candidate tt built from this tree; %s; ledger matching in this tree: %v", strings.TrimSpace(string(version)), time.Now().UTC().Format(time.RFC3339), handoffLedgerMatching)
+	r := l.run("cron", nil)
+	r.tools = true
+	task, q := r.helper.Task, spawnQuote
+
+	// The tool hook: the candidate tt hook tool under env -i, writing its
+	// ledger under the run directory. It logs its label and the names of its
+	// variables to its own file.
+	env := "env -i HOME=" + q(filepath.Join(r.dir, "home")) + " PATH=/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" +
+		" TAILTERM_RELAY_STATE=" + q(filepath.Join(r.dir, "relay")) + " TAILTERM_TOOL_LEDGER_DIR=" + q(filepath.Join(r.dir, "tool-ledger")) +
+		" TAILTERM_HANDOFF_DIR=" + q(filepath.Join(r.dir, "handoff")) + " TAILTERM_HANDOFF_CONFIG=" + q(filepath.Join(r.dir, "cfg", "handoff.json")) +
+		" TAILTERM_HANDOFF_ACCESS_LOG=" + q(filepath.Join(r.dir, "access.log")) + " CLAUDE_CODE_SESSION_ID=\"$CLAUDE_CODE_SESSION_ID\""
+	script := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(r.dir, "bin", name)
+		if err := os.WriteFile(path, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	tools := script("tools.sh", "#!/bin/sh\necho \"$1 $(env | sed 's/=.*//' | sort | tr '\\n' ' ')\" >> "+q(filepath.Join(r.dir, "tools.log"))+"\nexec "+env+" "+q(l.tt)+" hook tool\n")
+	// What the session itself runs to confirm the wake: the candidate, never
+	// the installed tt, with the same temporary state.
+	confirm := script("confirm.sh", "#!/bin/sh\nexec "+env+" "+q(l.tt)+" handoff wake confirm w1 --task "+task+"\n")
+	settingsPath := filepath.Join(r.dir, "project", ".claude", "settings.json")
+	var settings map[string]any
+	data, err := os.ReadFile(settingsPath)
+	if err != nil || json.Unmarshal(data, &settings) != nil {
+		t.Fatalf("the run's project settings: %v", err)
+	}
+	hooks := settings["hooks"].(map[string]any)
+	for _, event := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"} {
+		hooks[event] = []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": q(tools) + " " + event, "timeout": 5}}}}
+	}
+	settings["permissions"] = map[string]any{"allow": []string{"CronCreate", "CronDelete", "CronList", "ToolSearch", "Bash(" + confirm + ")"}}
+	if data, err = json.MarshalIndent(settings, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, append(data, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// One active wake, on a schedule that cannot fire during the check.
+	if out, err := r.candidate("handoff", "note", "wake", "add", "--schedule=7 3 1 1 *", "--kind=other", "--message=1", "--task", task); err != nil {
+		t.Fatalf("note wake add: %v\n%s", err, out)
+	}
+	var record handoffRecord
+	if err := json.Unmarshal([]byte(r.read("handoff", r.helper.Agent, "record.json")), &record); err != nil || len(record.Notes.Wakes.Entries) != 1 {
+		t.Fatalf("the run's record: %v", err)
+	}
+	wake := record.Notes.Wakes.Entries[0]
+	args := string(handoffWakeArgs(wake, task))
+	want := toolArgsDigest(json.RawMessage(args))
+
+	r.launch("--session-id " + r.thread)
+	if first, _ := r.capture(1, "SessionStart", "startup", "registered"); first.Session != r.thread {
+		t.Fatalf("start capture session = %s; want %s", first.Session, r.thread)
+	}
+	time.Sleep(1100 * time.Millisecond) // a row counts only from the second after the start
+	r.ask("Do these two steps and nothing else. Step 1: create exactly one cron job with the "+handoffCronTool+" tool, passing exactly this JSON object as its arguments and no other argument: "+args+
+		" Step 2: run this shell command exactly as written: "+confirm+" Then reply with the single word CRONDONE.", regexp.MustCompile(`⏺ CRONDONE\b`))
+
+	// What the ledger saw, by tool name and outcome only.
+	var created []toolLedgerRow
+	seen := map[string]int{}
+	r.wait("the tool ledger to settle", 20*time.Second, func() bool {
+		created, seen = nil, map[string]int{}
+		for _, row := range r.ledgerRows() {
+			seen[row.Tool+" "+row.Outcome]++
+			if row.Tool == handoffCronTool && row.Outcome == "ok" {
+				created = append(created, row)
+			}
+		}
+		return len(created) > 0 || len(seen) > 0
+	})
+	t.Logf("tool ledger rows by tool and outcome: %v", seen)
+	t.Logf("tool hook entries ran (names only of what they were given): %s", strings.SplitN(r.read("tools.log"), "\n", 2)[0])
+	// The argument shapes a session might send, to say which one it did.
+	shapes := map[string]string{"cron and prompt": args}
+	for name, extra := range map[string]string{"recurring true": `"recurring":true`, "recurring false": `"recurring":false`, "durable false": `"durable":false`, "durable true": `"durable":true`,
+		"recurring true, durable false": `"recurring":true,"durable":false`, "recurring true, durable true": `"recurring":true,"durable":true`} {
+		shapes["cron, prompt, "+name] = strings.TrimSuffix(args, "}") + "," + extra + "}"
+	}
+	matched := "none of the shapes tried"
+	for _, row := range created {
+		for name, shape := range shapes {
+			if toolArgsDigest(json.RawMessage(shape)) == row.ArgsDigest {
+				matched = name
+			}
+		}
+		t.Logf("cron row: time %s session %s tool %s toolUseId %s outcome %s argsDigest %s; its arguments were: %s", row.Time, row.Session, row.Tool, row.ToolUseID, row.Outcome, row.ArgsDigest, matched)
+	}
+	t.Logf("digest of the arguments restore prints (%s): %s", args, want)
+
+	// The harness confirms too, with the session's id: a second confirm of a
+	// restored wake changes nothing.
+	out, confirmErr := r.candidate("handoff", "wake", "confirm", "w1", "--task", task)
+	t.Logf("tt handoff wake confirm w1: %v: %s", confirmErr, strings.TrimSpace(out))
+	if err := json.Unmarshal([]byte(r.read("handoff", r.helper.Agent, "record.json")), &record); err != nil {
+		t.Fatal(err)
+	}
+	wake = record.Notes.Wakes.Entries[0]
+	status, _ := r.candidate("handoff", "status", "--task", task)
+	t.Logf("tt handoff status:\n%s", status)
+
+	if handoffLedgerMatching {
+		// Outcome 1: a real row restored the wake.
+		if len(created) != 1 || created[0].Session != r.thread || created[0].ArgsDigest != want || !handoffToolUsePattern.MatchString(created[0].ToolUseID) {
+			t.Errorf("no single %s row with outcome ok, this session and the predicted digest: %+v", handoffCronTool, created)
+		}
+		if confirmErr != nil || wake.Receipt != handoffRestored || wake.ReceiptSession != r.thread || len(created) == 1 && wake.ReceiptTool != created[0].ToolUseID {
+			t.Errorf("the wake was not restored from the row: %v; receipt %+v", confirmErr, wake)
+		}
+		if !strings.Contains(status, "w1 restored: this session created its cron at ") {
+			t.Errorf("status does not show the wake restored:\n%s", status)
+		}
+	} else {
+		// Outcome 2: matching ships switched off. Confirm says so and records
+		// nothing; a wake can only be session-asserted.
+		if confirmErr == nil || !strings.Contains(out, "tool-ledger matching is off in this version") || wake.Receipt == handoffRestored {
+			t.Errorf("with matching off the wake was restored or confirm did not say so: %v: %s; receipt %+v", confirmErr, out, wake)
+		}
+		if out, err := r.candidate("handoff", "wake", "confirm", "w1", "--asserted", "--task", task); err != nil || !strings.Contains(out, "session-asserted, not verified") {
+			t.Errorf("confirm --asserted = %v: %s", err, out)
+		}
+	}
+
+	r.ask("Delete the cron job you created, using the CronDelete tool. Then reply with the single word CRONGONE.", regexp.MustCompile(`⏺ CRONGONE\b`))
+	deleted := 0
+	for _, row := range r.ledgerRows() {
+		if row.Tool == "CronDelete" && row.Outcome == "ok" {
+			deleted++
+		}
+	}
+	if deleted != 1 {
+		t.Errorf("the session's cron was not deleted through CronDelete: %d rows", deleted)
+	}
+	r.exit()
+	r.capture(2, "SessionEnd", "", "registered")
+	time.Sleep(time.Second)
+	if left := r.left(); left != "" {
+		t.Errorf("a hook process is left running:\n%s", left)
+	}
+	r.isolated(map[string]int{"SessionStart": 1, "SessionEnd": 1})
 }

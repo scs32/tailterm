@@ -2034,14 +2034,17 @@ const (
 var handoffToolUsePattern = regexp.MustCompile(`^toolu_[A-Za-z0-9_-]{6,100}$`)
 
 // handoffLedgerMatching says whether a tool-ledger row may turn a wake to
-// restored. It is set from the isolated cron check (docs/session-handoff.md,
-// "The stage B cron check"). Off, every confirmed wake is session-asserted.
-// A variable so that the tests prove the matching either way.
-var handoffLedgerMatching = false
+// restored. It is on because the isolated cron check (docs/session-handoff.md,
+// "The stage B cron check") saw a real session's cron in the ledger with the
+// digest tt predicts. Off, every confirmed wake is session-asserted. A
+// variable so that the tests prove the matching either way.
+var handoffLedgerMatching = true
 
 // handoffCronTool is the Claude Code tool that creates a session cron, as the
 // tool ledger names it. handoffWakeArgs are the exact arguments restore prints
-// for one wake and the ledger row's digest must equal.
+// for one wake and the ledger row's digest must equal: cron and prompt and
+// nothing else, which is what the session in the cron check sent (Claude Code
+// 2.1.296). A session that adds an optional argument gets no receipt.
 const handoffCronTool = "CronCreate"
 
 // handoffWakePrompt is the one fixed prompt every wake is created with. It
