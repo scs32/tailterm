@@ -59,14 +59,30 @@ On Claude Code 2.1.296:
 
   The result has `"is_error":false`, `"num_turns":0` and
   `"result":"clean-view: Clean view off: tool calls are shown."`.
-- `node --test tests/clean-view-mod.test.js` runs the mod under the engine's
-  own test kit (`claude plugin test`): each of the four row kinds is drawn as an
-  empty box while clean view is on, `/clean-view` brings the row back, and a
-  second `/clean-view` hides it again. Without a `claude` binary these tests
-  skip.
+- `CLEAN_VIEW_CLAUDE_CHECK=1 node --test tests/clean-view-mod.test.js` runs the
+  validate command and then the mod under the engine's own test kit
+  (`claude plugin test`): each of the four row kinds is drawn as an empty box
+  while clean view is on, `/clean-view` brings the row back, and a second
+  `/clean-view` hides it again.
 
-The mod API is early access and may change between Claude Code releases. After
-an update, run the validate command and the node test again.
+### Check it after each Claude Code upgrade
+
+The mod API is early access and may change between Claude Code releases, and
+Claude Code updates itself. So the two tests that need the installed Claude
+Code are opt-in. The default unit run (`npm test`) skips both, with a reason
+that names `CLEAN_VIEW_CLAUDE_CHECK`, and starts no `claude` process. Its result
+does not depend on the installed version. The manifest and "nothing loads it"
+tests always run.
+
+Run the opted-in check on purpose after each Claude Code upgrade, before relying
+on the mod. From the repository root:
+
+```
+CLEAN_VIEW_CLAUDE_CHECK=1 node --test tests/clean-view-mod.test.js
+```
+
+Expect 4 pass and 0 skipped. With the variable set, a `claude` binary that is
+missing or has no `plugin test` fails the two tests; it does not skip them.
 
 ### Not yet checked: how it looks
 

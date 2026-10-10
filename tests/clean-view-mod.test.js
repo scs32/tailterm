@@ -1,10 +1,12 @@
 // The clean view Claude Code mod (tools/claude-mods/clean-view, see
 // docs/claude-mods.md). The manifest and "nothing loads it" tests always run.
-// The validate and row filter tests need a claude binary with `plugin test`
-// and skip without one (CI has none). The row filter test runs the engine's
-// own test kit on a temporary copy of the mod, so the kit test file below
-// never lands in the repository. CLEAN_VIEW_MOD_DIR points that one test at
-// another copy of the mod, for a mutation check.
+// The validate and row filter tests depend on the installed Claude Code, whose
+// mod API is early access. They run only with CLEAN_VIEW_CLAUDE_CHECK=1 and
+// otherwise skip, so the default unit run starts no claude process. Opted in,
+// a claude binary without `plugin test` fails them. The row filter test runs
+// the engine's own test kit on a temporary copy of the mod, so the kit test
+// file below never lands in the repository. CLEAN_VIEW_MOD_DIR points that one
+// test at another copy of the mod, for a mutation check.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -19,13 +21,18 @@ const MOD_DIR = join(ROOT, MOD);
 const COMPONENTS = ["ToolUse", "ToolResult", "ToolGroup", "ToolProgress"];
 // Where a launch or setup path would have to name the mod to load it.
 const LAUNCH_PATHS = ["hub", "scripts", "client", "src", "package.json"];
-const NO_CLAUDE = "claude with plugin test is not installed";
+const OPTED_IN = process.env.CLEAN_VIEW_CLAUDE_CHECK === "1";
+const NOT_OPTED_IN = "depends on the installed Claude Code; set CLEAN_VIEW_CLAUDE_CHECK=1 to run it";
 
 // An agent's identity must not reach a claude child of this test.
 const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("TAILTERM_")));
 const run = (cmd, args) => spawnSync(cmd, args, { cwd: ROOT, env, encoding: "utf8", timeout: 60000 });
 const git = (...args) => run("git", args);
-const hasClaude = run("claude", ["plugin", "test", "--help"]).status === 0;
+// Opted in, a missing or changed claude is a failure, not a skip.
+const requireClaude = () => {
+  const probe = run("claude", ["plugin", "test", "--help"]);
+  assert.equal(probe.status, 0, `CLEAN_VIEW_CLAUDE_CHECK=1 needs a claude binary with plugin test: ${probe.error?.message || probe.stderr || probe.stdout || `exit ${probe.status}`}`);
+};
 
 const KIT_TEST = `import { test, expect } from 'claude-code/testing'
 
@@ -91,7 +98,8 @@ test("no launch or setup path names the mods folder or the plugin dirs setting",
 });
 
 test("claude plugin validate --strict passes and reports the command and the four row kinds", (t) => {
-  if (!hasClaude) return t.skip(NO_CLAUDE);
+  if (!OPTED_IN) return t.skip(NOT_OPTED_IN);
+  requireClaude();
   const out = run("claude", ["plugin", "validate", "--strict", "--json", MOD_DIR]);
   assert.equal(out.status, 0, out.stdout + out.stderr);
   const report = JSON.parse(out.stdout);
@@ -110,7 +118,8 @@ test("claude plugin validate --strict passes and reports the command and the fou
 });
 
 test("the mod hides the four row kinds and /clean-view toggles them, under the engine's test kit", (t) => {
-  if (!hasClaude) return t.skip(NO_CLAUDE);
+  if (!OPTED_IN) return t.skip(NOT_OPTED_IN);
+  requireClaude();
   const dir = mkdtempSync(join(tmpdir(), "clean-view-mod-"));
   try {
     const copy = join(dir, "clean-view");
