@@ -147,7 +147,7 @@ func newHandoffBox(t *testing.T) *handoffBox {
 		"TAILTERM_HANDOFF_CONFIG": filepath.Join(root, "config", "handoff.json"), "TAILTERM_RELAY_STATE": filepath.Join(root, "relay"),
 		"TAILTERM_TOOL_LEDGER_DIR": filepath.Join(root, "tool-ledger"), "TAILTERM_HANDOFF_ACCESS_LOG": "",
 		"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "TMUX": "", "TMUX_PANE": "", "TT_TMUX_SOCKET": "tt-handoff-test-unused",
-		"CLAUDE_CONFIG_DIR": "",
+		"CLAUDE_CONFIG_DIR": "", "CLAUDE_PID": "",
 	} {
 		t.Setenv(name, value)
 	}
@@ -300,6 +300,40 @@ const (
 4002 4001 4002 4001 ttys009 T claude
 4001 4000 4001 4001 ttys009 T -zsh
 4000 1 4000 0 ?? T tmux new -s owner`
+	// The reviewer's two shapes (#31818): a one-shot under the helper whose
+	// program is the versioned binary the claude link points to, or node
+	// running the agent SDK's CLI.
+	handoffPSVersionedOneShot = `SELF 4004 SELF 0 ?? T /bin/zsh -c tt handoff
+4004 4003 4003 0 ?? T /Users/someone/.local/share/claude/versions/2.1.296 -p Reply
+4003 4002 4003 0 ?? T /bin/zsh -c claude -p
+4002 4001 4001 4001 ttys009 T claude --model claude-opus-5-5
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	handoffPSAgentSDKOneShot = `SELF 4004 SELF 0 ?? T /bin/zsh -c tt handoff
+4004 4003 4003 0 ?? T node /work/node_modules/@anthropic-ai/claude-agent-sdk/cli.js --output-format stream-json --print hi
+4003 4002 4003 0 ?? T /bin/zsh -c node
+4002 4001 4001 4001 ttys009 T claude --model claude-opus-5-5
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// Print mode inside a combined short flag, typed at the pane's prompt.
+	handoffPSCombinedFlag = `SELF 4002 SELF 4002 ?? T /bin/zsh -c tt handoff
+4002 4001 4002 4002 ttys009 T claude -cp Reply
+4001 4000 4001 4002 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// A one-shot runtime under a program name nothing recognises, under the
+	// helper. Only what it says of itself in CLAUDE_PID (4004) shows it.
+	handoffPSUnknownOneShot = `SELF 4004 SELF 0 ?? T /bin/zsh -c tt handoff
+4004 4003 4003 0 ?? T /opt/tools/some-claude-build -p Reply
+4003 4002 4003 0 ?? T /bin/zsh -c some-claude-build
+4002 4001 4001 4001 ttys009 T claude --model claude-opus-5-5
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// The real interactive session, shown by ps as the versioned binary, as
+	// one on this host was on 2026-10-10; its shell tool ran mkdir -p first.
+	handoffPSVersionedInteractive = `SELF 4002 SELF 4002 ?? T /bin/zsh -c mkdir -p x && tt handoff
+4002 4001 4001 4001 ttys009 T /Users/someone/.local/share/claude/versions/2.1.296 --resume 00000000-0000-4000-8000-000000000001
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
 	// A shell with no Claude Code process above it.
 	handoffPSShell = `SELF 4001 SELF SELF ttys009 T tt handoff
 4001 4000 4001 SELF ttys009 T -zsh
@@ -313,6 +347,7 @@ const (
 var handoffHostProcessTable = handoffProcessTable
 
 func init() {
+	_ = os.Unsetenv("CLAUDE_PID")
 	handoffProcessTable = handoffFixedProcessTable(handoffPSInteractive, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 }
 
@@ -333,6 +368,20 @@ func handoffFixedProcessTable(table string, started time.Time) func(context.Cont
 func (b *handoffBox) ps(table string, started time.Time) {
 	b.t.Helper()
 	setToolLedger(b.t, &handoffProcessTable, handoffFixedProcessTable(table, started))
+	b.t.Setenv("CLAUDE_PID", handoffPSClaudePID(table))
+}
+
+// handoffPSClaudePID is what the runtime that started the command says of
+// itself in CLAUDE_PID under one of the tables: the Claude Code process
+// straight above the command's shell, and nothing in a plain shell.
+func handoffPSClaudePID(table string) string {
+	switch {
+	case table == "" || table == handoffPSShell:
+		return ""
+	case strings.Contains(table, "\n4004 "):
+		return "4004"
+	}
+	return "4002"
 }
 
 // transcript appends rows to a Claude Code session's transcript under the
@@ -3540,7 +3589,7 @@ func TestHandoffOneShotProcess(t *testing.T) {
 	// The hook of the one-shot run, and a command the interactive session's
 	// own shell tool would run (its shell, 40803, stands in for it).
 	oneShot, interactive := chainOf(observed, 42258), chainOf(observed, 40803)
-	if got := handoffOneShot(oneShot); got != "print-mode" {
+	if got := handoffOneShot(oneShot, 0); got != "print-mode" {
 		t.Fatalf("the observed claude -p = %q", got)
 	}
 	if p, _, ok := handoffSessionProcess(oneShot); !ok || p.pid != 40839 || p.tty != "??" || p.tpgid != 0 || !p.started.Equal(time.Date(2026, 10, 10, 7, 43, 5, 0, time.UTC)) {
@@ -3549,11 +3598,11 @@ func TestHandoffOneShotProcess(t *testing.T) {
 	// The interactive session is not refused for a prompt that holds "-p":
 	// only an argument that is exactly -p or --print counts. Here it does
 	// hold one, and refusing is the safe side.
-	if got := handoffOneShot(interactive); got != "print-mode" {
+	if got := handoffOneShot(interactive, 0); got != "print-mode" {
 		t.Fatalf("an interactive session whose arguments hold a bare -p = %q", got)
 	}
 	plain := strings.Replace(observed, "a prompt with -p in it", "a prompt about --printing and x-p", 1)
-	if got := handoffOneShot(chainOf(plain, 40803)); got != "" {
+	if got := handoffOneShot(chainOf(plain, 40803), 0); got != "" {
 		t.Fatalf("the observed interactive session = %q", got)
 	}
 	if p, _, _ := handoffSessionProcess(chainOf(plain, 40803)); p.pid != 12699 || p.tty != "ttys010" || p.pgid != p.tpgid {
@@ -3561,13 +3610,40 @@ func TestHandoffOneShotProcess(t *testing.T) {
 	}
 	self := strconv.Itoa(os.Getpid())
 	for table, want := range map[string]string{handoffPSInteractive: "", handoffPSOneShot: "print-mode", handoffPSPrintAtPrompt: "print-mode",
-		handoffPSNested: "nested-claude", handoffPSBackground: "no-terminal", handoffPSShell: "no-claude-process"} {
+		handoffPSNested: "nested-claude", handoffPSBackground: "no-terminal", handoffPSShell: "no-claude-process",
+		handoffPSVersionedOneShot: "print-mode", handoffPSAgentSDKOneShot: "print-mode", handoffPSCombinedFlag: "print-mode",
+		handoffPSUnknownOneShot: "unrecognised-runtime", handoffPSVersionedInteractive: ""} {
 		text := strings.ReplaceAll(strings.ReplaceAll(table, "SELF", self), " T ", " Sat Oct 10 07:43:05 2026 ")
-		if got := handoffOneShot(chainOf(text, os.Getpid())); got != want {
+		// What the runtime that started the command says of itself: the
+		// process straight above the command's shell.
+		claudePID, _ := strconv.Atoi(handoffPSClaudePID(table))
+		if got := handoffOneShot(chainOf(text, os.Getpid()), claudePID); got != want {
 			t.Errorf("handoffOneShot = %q, want %q, for\n%s", got, want, table)
 		}
 		if _, ok := handoffReasons[want]; want != "" && !ok {
 			t.Errorf("%q is not a named reason", want)
+		}
+	}
+	// With no CLAUDE_PID the names alone decide: the recognised shapes are
+	// still refused, and only the unknown program name is passed over.
+	for table, want := range map[string]string{handoffPSVersionedOneShot: "print-mode", handoffPSAgentSDKOneShot: "print-mode", handoffPSUnknownOneShot: "", handoffPSVersionedInteractive: ""} {
+		text := strings.ReplaceAll(strings.ReplaceAll(table, "SELF", self), " T ", " Sat Oct 10 07:43:05 2026 ")
+		if got := handoffOneShot(chainOf(text, os.Getpid()), 0); got != want {
+			t.Errorf("without CLAUDE_PID handoffOneShot = %q, want %q, for\n%s", got, want, table)
+		}
+	}
+	for args, want := range map[string]bool{"claude": false, "claude -p x": true, "claude --print": true, "claude --print=x": true, "claude -cp x": true, "claude -pc": true,
+		"claude -c": false, "claude --permission-mode plan": false, "claude --resume x-p": false, "claude -r x": false, "claude - p": false} {
+		if got := (handoffProcess{args: strings.Fields(args)}).printMode(); got != want {
+			t.Errorf("printMode(%q) = %v, want %v", args, got, want)
+		}
+	}
+	for program, want := range map[string]bool{"claude": true, "/Users/x/.local/bin/claude": true, "/Users/x/.local/share/claude/versions/2.1.296": true,
+		"/Users/x/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude": true, "node /lib/node_modules/@anthropic-ai/claude-code/cli.js": true,
+		"node /work/node_modules/@anthropic-ai/claude-agent-sdk/cli.js": true, "/Applications/Claude.app/Contents/MacOS/Claude": false, "node /work/server.js": false,
+		"/opt/versions/2.1.296": false, "/bin/zsh -c claude": false, "tmux new -s claude": false} {
+		if got := (handoffProcess{args: strings.Fields(program)}).claude(); got != want {
+			t.Errorf("claude(%q) = %v, want %v", program, got, want)
 		}
 	}
 	// The host's own ps, unfaked: this process is found, with a start time.
@@ -3588,7 +3664,27 @@ func TestHandoffOneShotProcess(t *testing.T) {
 // registered thread or as a candidate, and what the hook writes is as before.
 func TestHandoffOneShotNote(t *testing.T) {
 	tables := map[string]string{"claude -p from the pane": handoffPSOneShot, "claude --print at the prompt": handoffPSPrintAtPrompt, "a nested claude": handoffPSNested,
-		"a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": ""}
+		"a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": "", "the versioned binary -p": handoffPSVersionedOneShot,
+		"the agent SDK cli --print": handoffPSAgentSDKOneShot, "claude -cp at the prompt": handoffPSCombinedFlag, "an unknown program -p": handoffPSUnknownOneShot}
+	// The real interactive session under the versioned binary's name gets
+	// the note, registered and as a candidate.
+	t.Run("the versioned binary, interactive", func(t *testing.T) {
+		b := newHandoffBox(t)
+		b.on()
+		b.asCandidate()
+		b.ps(handoffPSVersionedInteractive, b.now)
+		t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+		if r := b.hook("SessionStart", handoffOtherID, map[string]any{"source": "clear"}); r.err != nil || !strings.Contains(r.out, handoffCandidateSentence) {
+			t.Fatalf("an interactive candidate under the versioned binary = %v, %q", r.err, r.out)
+		}
+		b = newHandoffBox(t)
+		b.on()
+		b.asHelper()
+		b.ps(handoffPSVersionedInteractive, b.now)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "startup"}); r.err != nil || r.out == "" || strings.Contains(r.out, handoffCandidateSentence) {
+			t.Fatalf("the interactive helper under the versioned binary = %v, %q", r.err, r.out)
+		}
+	})
 	for name, table := range tables {
 		t.Run(name, func(t *testing.T) {
 			// As a candidate: its own session id, in the helper's tmux session.
@@ -3638,9 +3734,13 @@ func TestHandoffOneShotNote(t *testing.T) {
 // interactive session in the same pane then restores.
 func TestHandoffRestoreOneShot(t *testing.T) {
 	reasons := map[string]string{handoffPSOneShot: handoffReasons["print-mode"], handoffPSPrintAtPrompt: handoffReasons["print-mode"], handoffPSNested: handoffReasons["nested-claude"],
-		handoffPSBackground: handoffReasons["no-terminal"], handoffPSShell: handoffReasons["no-claude-process"], "": "the process table could not be read"}
+		handoffPSBackground: handoffReasons["no-terminal"], handoffPSShell: handoffReasons["no-claude-process"], "": "the process table could not be read",
+		handoffPSVersionedOneShot: handoffReasons["print-mode"], handoffPSAgentSDKOneShot: handoffReasons["print-mode"], handoffPSCombinedFlag: handoffReasons["print-mode"],
+		handoffPSUnknownOneShot: handoffReasons["unrecognised-runtime"]}
 	for name, table := range map[string]string{"claude -p from the pane": handoffPSOneShot, "claude --print at the prompt": handoffPSPrintAtPrompt,
-		"a nested claude": handoffPSNested, "a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": ""} {
+		"a nested claude": handoffPSNested, "a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": "",
+		"the versioned binary -p": handoffPSVersionedOneShot, "the agent SDK cli --print": handoffPSAgentSDKOneShot, "claude -cp at the prompt": handoffPSCombinedFlag,
+		"an unknown program -p": handoffPSUnknownOneShot} {
 		t.Run(name, func(t *testing.T) {
 			f := newHandoffHubFixture(t)
 			b := f.b
@@ -3685,6 +3785,22 @@ func TestHandoffRestoreOneShot(t *testing.T) {
 				t.Fatalf("the interactive restore sent %v", sent)
 			}
 		})
+	}
+}
+
+// r2: the real interactive session restores when ps shows its program as the
+// versioned binary the claude link points to, as on the Mini.
+func TestHandoffRestoreVersionedBinary(t *testing.T) {
+	f := newHandoffHubFixture(t)
+	f.b.ps(handoffPSVersionedInteractive, f.b.now.Add(-time.Hour))
+	f.successor(t)
+	f.seen()
+	out, err := f.restore()
+	if err != nil || !strings.Contains(out, "registration: restored") {
+		t.Fatalf("restore under the versioned binary = %v\n%s", err, out)
+	}
+	if sent := f.writes(); len(sent) != 1 || sent[0] != "POST /v1/tasks/"+f.task.ID+"/owner-helper" {
+		t.Fatalf("restore sent %v", sent)
 	}
 }
 

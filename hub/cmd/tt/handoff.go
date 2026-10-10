@@ -1120,17 +1120,48 @@ func handoffProcessRow(line string) (handoffProcess, bool) {
 	return handoffProcess{pid: n[0], ppid: n[1], pgid: n[2], tpgid: n[3], tty: f[4], started: started, args: f[10:]}, true
 }
 
-// claude reports whether the process is a Claude Code runtime: its program,
-// or node running it, is named claude.
+// claude reports whether the process is a Claude Code runtime, by the forms
+// its program takes: `claude`, wherever it is installed; the versioned binary
+// that name links to (.../claude/versions/2.1.296), which is also how Claude
+// Code starts its own children; and node running the CLI or the agent SDK's.
 func (p handoffProcess) claude() bool {
 	if len(p.args) == 0 {
 		return false
 	}
-	program := filepath.Base(p.args[0])
-	if program == "node" && len(p.args) > 1 {
-		return filepath.Base(p.args[1]) == "claude" || strings.Contains(p.args[1], "/@anthropic-ai/claude-code/")
+	program := p.args[0]
+	if filepath.Base(program) == "node" && len(p.args) > 1 {
+		return filepath.Base(p.args[1]) == "claude" || strings.Contains(p.args[1], "/@anthropic-ai/claude-")
 	}
-	return program == "claude"
+	versions := filepath.Dir(program)
+	return filepath.Base(program) == "claude" || filepath.Base(versions) == "versions" && filepath.Base(filepath.Dir(versions)) == "claude"
+}
+
+// printMode reports whether the arguments ask for a one-shot run: -p or
+// --print, alone, with a value, or inside a combined short flag such as -cp.
+func (p handoffProcess) printMode() bool {
+	for _, arg := range p.args[1:] {
+		switch {
+		case arg == "--print" || strings.HasPrefix(arg, "--print="):
+			return true
+		case handoffShortFlags.MatchString(arg) && strings.Contains(arg, "p"):
+			return true
+		}
+	}
+	return false
+}
+
+var handoffShortFlags = regexp.MustCompile(`^-[A-Za-z]+$`)
+
+// handoffClaudePID is the Claude Code process that started this command, as
+// that process itself says in CLAUDE_PID; 0 when it does not say. Every
+// Claude Code runtime sets it for its own children, whatever its program is
+// called, so it names a runtime the table's names would not.
+func handoffClaudePID() int {
+	pid, err := strconv.Atoi(os.Getenv("CLAUDE_PID"))
+	if err != nil || pid < 2 {
+		return 0
+	}
+	return pid
 }
 
 // handoffSessionProcess is the Claude Code process this command or hook runs
@@ -1150,15 +1181,23 @@ func handoffSessionProcess(chain []handoffProcess) (handoffProcess, []handoffPro
 // foreground job of a terminal, was not started in print mode and was not
 // started by another Claude Code process. A `claude -p` run from a session's
 // own pane, by its shell tool or by hand, fails all three; any one refuses.
-func handoffOneShot(chain []handoffProcess) string {
+//
+// A runtime is recognised by its program's name, and a one-shot under a name
+// this does not know would be passed over for the session above it. So when
+// the runtime that started the command names itself (claudePID, from
+// CLAUDE_PID), it must be the process found. The arguments of the processes
+// between are not read: a shell's command line holds words such as -p that
+// are not its own flags.
+func handoffOneShot(chain []handoffProcess, claudePID int) string {
 	p, above, ok := handoffSessionProcess(chain)
 	if !ok {
 		return "no-claude-process"
 	}
-	for _, arg := range p.args[1:] {
-		if arg == "-p" || arg == "--print" {
-			return "print-mode"
-		}
+	if claudePID > 0 && claudePID != p.pid {
+		return "unrecognised-runtime"
+	}
+	if p.printMode() {
+		return "print-mode"
 	}
 	for _, parent := range above {
 		if parent.claude() {
@@ -1289,7 +1328,7 @@ func handoffSessionFloor(session string) (floor string, reason string) {
 		return "", "session-process-unknown"
 	}
 	p, _, ok := handoffSessionProcess(chain)
-	if !ok {
+	if pid := handoffClaudePID(); !ok || pid > 0 && pid != p.pid {
 		return "", "session-process-unknown"
 	}
 	if p.started.After(at) {
@@ -1395,7 +1434,7 @@ func (h *handoffHookRun) interactive(ctx context.Context) bool {
 		h.mu.Unlock()
 	}()
 	chain, err := handoffProcessChain(ctx, h.startChild)
-	return err == nil && handoffOneShot(chain) == ""
+	return err == nil && handoffOneShot(chain, handoffClaudePID()) == ""
 }
 
 func (h *handoffHookRun) late() bool { return time.Since(h.started) >= h.deadline }
@@ -2384,6 +2423,7 @@ var handoffReasons = map[string]string{
 	"session-process-unknown": "this command is not running under this session's Claude Code process, so its latest start is not known",
 	"no-claude-process":       "no Claude Code process is above this command in the process table",
 	"print-mode":              "this Claude Code process was started in print mode (-p): it is a one-shot run",
+	"unrecognised-runtime":    "this command was started by a Claude Code runtime other than the one found above it in the process table",
 	"nested-claude":           "this Claude Code process was started by another Claude Code process",
 	"no-terminal":             "this Claude Code process is not the foreground job of a terminal",
 	"hub-refused":             "the hub refused the registration",
@@ -3142,7 +3182,7 @@ func handoffRestoreCommand(e env, args []string) error {
 		if err != nil {
 			return handoffRefusal("g7 interactive session", "the process table could not be read, so this command could not be placed under an interactive Claude Code session", "run it in the helper's interactive session")
 		}
-		if reason := handoffOneShot(chain); reason != "" {
+		if reason := handoffOneShot(chain, handoffClaudePID()); reason != "" {
 			return handoffRefusal("g7 interactive session", handoffReasons[reason], "run it in the helper's interactive session, at its own prompt")
 		}
 	}
