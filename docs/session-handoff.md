@@ -14,7 +14,7 @@ Stage A changes no registration, tmux tag, relay binding or wake.
 
 Stage B (feature `wi_e403542387af7deb`, owner order #31581) adds what a session runs after it has been told:
 
-- `tt handoff restore` makes a new session in the helper's tmux pane the registered helper, behind six guards and one conditional hub registration, and reports what is and is not restored.
+- `tt handoff restore` makes a new session in the helper's tmux pane the registered helper, behind seven guards and one conditional hub registration, and reports what is and is not restored.
 - `tt handoff status` prints that report again, with each wake's state now.
 - `tt handoff wake confirm` and `tt handoff wake due` record, for each wake, whether this session created its cron and when it last fired.
 
@@ -51,7 +51,8 @@ What each session then experiences:
 | A Tailterm agent (`TAILTERM_AGENT` set) | same | Nothing: it returns before reading stdin |
 | A session that is not the helper and not in the helper's tmux session | same | Nothing, after one directory listing and at most one `tmux` query |
 | The registered owner helper session | same | A stamp in the record at start, compaction and end; the note at start |
-| Any other Claude process in the helper's tmux session: a new session after `/clear`, or `claude -p` run from the helper's pane | same | One line in the capture log marked `candidate`; the note at start, saying the session is not registered. The record is not changed |
+| Another interactive Claude session in the helper's tmux session, such as the new session after `/clear` | same | One line in the capture log marked `candidate`; the note at start, saying the session is not registered. The record is not changed |
+| A one-shot Claude process in the helper's tmux session, such as `claude -p` run from the helper's pane | same | One line in the capture log marked `candidate`. No note. The record is not changed |
 
 A session does not run the hook at all when it opts out of user settings or of hooks: `--bare`, `--setting-sources` without `user`, another `CLAUDE_CONFIG_DIR`, or a setting or policy that disables hooks. Another user account on the host is not affected. Codex sessions run no such hook; they can use the `tt handoff` commands.
 
@@ -59,7 +60,7 @@ A session does not run the hook at all when it opts out of user settings or of h
 
 Two separate bounds apply.
 
-**The hook's own target: 500 ms.** The work, the stdin read included, runs in a goroutine the handler waits on for at most 400 ms. Its one possible subprocess, a single `tmux display-message`, runs in its own process group under the same deadline. If it has not answered when the handler's wait ends, the handler itself kills the group before it returns, so no child outlives the hook; `TestHandoffHookLeavesNoChild` runs the hook as a process 120 times against a `tmux` that never answers and finds none left. The hook makes no hub request and opens no connection. `TestHandoffHookBound` holds it to 500 ms with stdin held open, 10,000 unrelated files in the relay state, a `tmux` that never answers, an unwritable state directory and the record's lock held by another process.
+**The hook's own target: 500 ms.** The work, the stdin read included, runs in a goroutine the handler waits on for at most 400 ms. It starts at most two subprocesses, one after the other: a single `tmux display-message`, and at a matched `SessionStart` a single `ps` (see "Only the pane's interactive session"). Each runs in its own process group under the same deadline. If one has not answered when the handler's wait ends, the handler itself kills the group before it returns, so no child outlives the hook; `TestHandoffHookLeavesNoChild` runs the hook as a process 120 times against a `tmux` that never answers and finds none left. The hook makes no hub request and opens no connection. `TestHandoffHookBound` holds it to 500 ms with stdin held open, 10,000 unrelated files in the relay state, a `tmux` that never answers, an unwritable state directory and the record's lock held by another process.
 
 **Claude Code's outside cut-off: 5 seconds.** The handler cannot bound what happens before it runs: process start, and the `PATH` and `hub.json` read every `tt` command does first. The settings entry carries `"timeout": 5` for that. The live check below shows Claude Code honours it on all three events: it gave a hung entry up 4.9 to 5.2 seconds after it started.
 
@@ -69,7 +70,7 @@ It also cannot decide anything:
 
 - The exit code is always 0. The handler has no return value.
 - On `PreCompact` and `SessionEnd` it writes nothing to stdout or stderr, in every case including errors, so there is no decision for Claude Code to read.
-- On `SessionStart` it prints at most 8,192 bytes of plain text. If it runs out of time after it has recognised the session, it prints one fixed line: ``Tailterm handoff: not read in time; run `tt handoff show` ``.
+- On `SessionStart` it prints at most 8,192 bytes of plain text. If it runs out of time after it has recognised the session and placed its process as interactive, it prints one fixed line: ``Tailterm handoff: not read in time; run `tt handoff show` ``.
 
 ## What is recorded, and where
 
@@ -109,7 +110,7 @@ What costs: the record alone does not say what an instruction is. The note and `
 *Who writes the stamps.* Only the helper's own runtime process does: an event whose payload carries a valid `session_id` equal to the thread the helper file registers. The environment's `CLAUDE_CODE_SESSION_ID` is not evidence of who sent an event, because a process started inside the helper's session inherits it. So:
 
 - a payload naming another valid session id, from a process in the helper's tmux session, is written to `captures.jsonl` only, marked `candidate`. That is a successor session after `/clear`, and equally a `claude -p` run from the helper's own pane;
-- a payload with no session id, or an invalid one, writes nothing at all, whatever the environment says. At a start it may still be shown the note.
+- a payload with no session id, or an invalid one, writes nothing at all, whatever the environment says. At a start an interactive session may still be shown the note.
 
 `TestHandoffStampOwnership` runs a second process's start, compaction and end in each of those three forms and requires `record.json` to be byte-identical afterwards. A successor's own start reaches the record when `tt handoff restore` registers it.
 
@@ -163,7 +164,7 @@ tt handoff wake due ID [--task T]
 - **`show`** is local and works with the setting off. It prints the identity with its date, the capture stamps, the snapshot with its as-of time, the current entries of each list, then expired, revoked and cancelled instructions and wakes under "Expired: not authority", then the other closed entries, and for each list when it last changed and how many entries it dropped. With `--json` it prints the record with expiry applied.
 - **`write`** reads the hub for the snapshot and rewrites the record. It reads the helper agent, its delegation windows, the obligations it owes, one Board message per obligation for who sent it, the open owner decisions and the team queue. It reads no work-item record, makes only `GET` requests and marks nothing delivered. `--out PATH` also writes the same text `show` prints, with the destination's next commands, for a person or another runtime to read.
 
-- **`restore`**, **`status`** and the two **`wake`** commands are described under "Restoring a session" and "Wakes" below. `restore`, `wake confirm` and `wake due` need the setting on; `status` is local and works with it off. Changing a wake's schedule with `note wake set` clears its receipt.
+- **`restore`**, **`status`** and the two **`wake`** commands are described under "Restoring a session" and "Wakes" below. `restore`, `wake confirm` and `wake due` need the setting on; `status` is local and works with it off. `status` and `wake confirm` judge receipts only when run inside the session they speak for; see "The latest start is read, not only captured". Changing a wake's schedule with `note wake set` clears its receipt.
 
 `note`, `write` and the `wake` commands act for the helper registered from this runtime session, or with `--task` for that project's helper on this host. A Claude or Codex session other than the registered one is refused, and so is an agent that is not the helper. `show` also works from a new session in the helper's tmux session, and when the host has only one record.
 
@@ -185,6 +186,24 @@ Lines are added in order until the next one would take the note past 8,192 bytes
 
 The next action is one sentence: "Next: run `tt handoff restore --task T`." The note names no command this binary does not have; `TestHandoffInjection` takes every `tt` command out of the note and runs it through the binary's own dispatch.
 
+### Only the pane's interactive session
+
+The note ends with "run `tt handoff restore`", so it is printed only into the pane's interactive Claude Code session. A one-shot process started in the helper's pane, such as `claude -p` run by the helper's shell tool or typed at the pane's prompt, is matched by rules 1 and 2 like any other process there: it inherits `TMUX_PANE`, and with no session id in its payload it inherits the helper's session id too. It is logged as before and shown nothing.
+
+The environment cannot tell the two apart, so the hook reads the host's process table once (`ps -A -o pid=,ppid=,pgid=,tpgid=,tty=,lstart=,args=`) and walks up from itself to the nearest Claude Code process: one whose program is named `claude`, or `node` running it. That process is the pane's interactive session only when all three hold:
+
+| Check | Refused as | What fails it |
+| --- | --- | --- |
+| No argument is exactly `-p` or `--print` | `print-mode` | `claude -p`, wherever it was started |
+| No other Claude Code process is above it | `nested-claude` | anything a Claude session started, with or without `-p` |
+| It has a controlling terminal and is that terminal's foreground job | `no-terminal` | a process started by a shell tool (which has no terminal), or one in the background |
+
+With no Claude Code process above the hook (`no-claude-process`), or when `ps` fails or does not answer in time, nothing is printed: a process that cannot be placed is not invited to restore. `tt handoff restore` makes the same check as guard g7.
+
+The fixture is what `ps` showed on 2026-10-10 (Claude Code 2.1.296) for the start hook of a `claude -p` run from an interactive session's shell tool, in an isolated project with only that hook: the one-shot process had terminal `??` and foreground group 0 and sat under the interactive `claude`, which had terminal `ttys010` and was its foreground job. `TestHandoffOneShotProcess` holds those rows, `TestHandoffOneShotNote` runs the hook under each shape, and the live check's working run, run again on this change on 2026-10-10 at 08:33Z, showed the note still reaching a real interactive session at its start, after a compaction and, as a candidate, after `/clear`, with the host's own `ps`.
+
+Not compared: the terminal against the pane's own. Guard g1 already places a restore in the pane, and a process that inherited the pane's environment from the helper is a descendant of the helper and fails the second or third check.
+
 A session that is killed runs no `SessionEnd` hook. Nothing is lost by that: the notes were written when they were made. Only the end stamp is missing, and the next start says so. That holds for the registered helper session. A session that was never registered, such as a successor killed before it ran `tt handoff restore`, was never the helper and left no start stamp, so its missing end is not reported.
 
 ## Restoring a session
@@ -197,7 +216,7 @@ tt handoff restore --task tsk_...
 
 ### The guards
 
-All six are checked before anything is written to the hub, the helper file, the relay binding, the tmux tags or the record. A refusal names its guard, says what a person could run instead, prints nothing else, writes no `restore.json` and exits non-zero.
+All seven are checked before anything is written to the hub, the helper file, the relay binding, the tmux tags or the record. A refusal names its guard, says what a person could run instead, prints nothing else, writes no `restore.json` and exits non-zero.
 
 | Guard | Passes when |
 | --- | --- |
@@ -207,6 +226,7 @@ All six are checked before anything is written to the hub, the helper file, the 
 | g4 Status | The hub's helper is running, done or needs-input. Closed or exited is refused, because registering would make a new agent or run. Retired is refused with "retired; only tt resume re-enables it" |
 | g5 No competing successor | The helper file holds no pending registration from another session and no unfinished `tt helper register` of this session's own, and after restore has the record lock the file still names the run restore read first |
 | g6 Project active | The project is not paused, cleaning up for a pause or resuming |
+| g7 Interactive session | For a Claude Code session: the command runs under the pane's interactive Claude Code process, by the process table and the three checks under "Only the pane's interactive session". A `claude -p` or other one-shot process started in the helper's pane is refused with the reason: started in print mode, started by another Claude Code process, not the foreground job of a terminal, no Claude Code process above the command, or the process table could not be read. It is checked after g1, before the hub is asked anything |
 
 When g3 refuses, restore prints the hub's current run and "host of the current registration", the host on the helper's agent row, which only a registration sets. It prints "registration time: unavailable": the agent row has no registration time, and the one route that returns the registration event pages through the whole project feed. It adds that if this session's own registration answer was lost, `tt helper register --task T` is the recovery. Restore itself never resends a request in order to take over a run it did not expect.
 
@@ -229,7 +249,7 @@ Once the guards pass, each step is printed as restored, already correct, or not 
 
 It writes `restore.json` and exits non-zero while the registration, the wake binding or the hub read is not restored, or any active wake is not restored or only session-asserted. `tt handoff status` prints the same steps later, with each wake's state at that moment, and exits 0.
 
-Restore never opens or renews a delegation window, acknowledges or answers an obligation, changes a queue entry, resumes a retired helper or acts on an instruction. Its only request that can change the hub is the one registration; `TestHandoffRestoreScope` checks the request log and the hub before and after.
+Restore never opens or renews a delegation window, acknowledges or answers an obligation, changes a queue entry, resumes a retired helper or acts on an instruction. Its only request that can change the hub is the one registration; `TestHandoffRestoreScope` checks the request log and the hub before and after. `TestHandoffRestoreOneShot` runs restore from each one-shot shape in the helper's pane, with the successor's session id and with the helper's own: g7 refuses, the hub receives no request at all, the hub's state, the helper file, the bindings, the tags and the record are unchanged and no `restore.json` is written; the interactive session in the same pane then restores.
 
 ## Wakes
 
@@ -243,7 +263,15 @@ Every wake is created with the same arguments: its stored schedule as `cron`, an
 
 `tt handoff wake confirm ID` without `--asserted` only searches the ledger. It accepts no cron id or other value from the session.
 
-**A start resets them.** A receipt counts only for the session it names and only while it is later than that session's latest captured start. So after a start of any source (`startup`, `resume`, `clear`, `compact`, `fork`) every wake shows as not restored until confirmed again. Compaction is included on purpose: whether a session's crons survive one is not known. Another Claude process in the pane does not reset the helper's wakes.
+**A start resets them.** A receipt counts only for the session it names and only while it is later than that session's latest start. So after a start of any source (`startup`, `resume`, `clear`, `compact`, `fork`) every wake shows as not restored until confirmed again. Compaction is included on purpose: whether a session's crons survive one is not known. Another Claude process in the pane does not reset the helper's wakes.
+
+**The latest start is read, not only captured.** The hook's stamp alone is not enough: a later start whose hook ran past its deadline, or ran while the state folder could not be written, leaves no stamp, and the receipts from before it would still count. So `restore`, `status` and `wake confirm` each read, for the session asking, evidence the hook does not write, and judge a receipt against the latest of all of it (owner decision in order #31789: fail closed):
+
+- **The session's own transcript**, found by its session id under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects`): the first row with a time (a new session's file begins at its start, and `/clear` begins a new file), every `SessionStart` hook row whatever its outcome (`hook_success`, `hook_cancelled`, `hook_non_blocking_error`), and every `compact_boundary` row. Only a row's type, subtype, hook event and time are decoded; nothing from the transcript is stored or printed.
+- **The start time of the session's Claude Code process**, the nearest one above the command in the process table. A resume writes no row: on 2026-10-10 (Claude Code 2.1.296) a session resumed with `claude --resume`, interactively and with `-p`, ran its `SessionStart` hook with source `resume` and its transcript gained nothing for it, where its startup and its compaction had each left a hook row and the compaction a boundary row. A resume is always a new process, so the process start covers it.
+- **The captured start**, as before. A session with none captured still gets "no start was captured".
+
+`wake confirm` searches the ledger from that same latest start, so a cron created after a lost start can be confirmed and one created before it cannot. When either reading fails nothing counts, with a named reason: `transcript-unreadable` (no transcript for the session, one that cannot be opened, or none with a timed row) or `session-process-unknown` (the process table could not be read, no Claude Code process is above the command, or the command was typed in a shell outside the session). `TestHandoffWakeFloor` covers a later start lost to a late hook and to an unwritable state folder, each kind of transcript row, a resume, and both failed readings, through `status`, `confirm` and `restore`.
 
 **Expired and cancelled wakes** are printed and never offered: no arguments are printed for them and `confirm` and `due` refuse them.
 
@@ -260,7 +288,7 @@ cd hub
 TT_LIVE_CLAUDE=1 go test ./cmd/tt -run '^TestHandoffLiveCronCheck$' -count=1 -v -timeout 20m
 ```
 
-It is the live check's harness (below) with two additions. The project settings also hold the candidate `tt hook tool` entries for `PreToolUse`, `PostToolUse` and `PostToolUseFailure`, each a wrapper that runs the candidate under `env -i` with its ledger in the run directory. And the record holds one wake, on a schedule that cannot fire during the check. The session is asked for one cron with exactly the printed arguments, to run the candidate's `tt handoff wake confirm`, and then to delete the cron. The isolation proofs are the same three, with the candidate's own tool entries allowed.
+It is the live check's harness (below) with two additions. The project settings also hold the candidate `tt hook tool` entries for `PreToolUse`, `PostToolUse` and `PostToolUseFailure`, each a wrapper that runs the candidate under `env -i` with its ledger in the run directory. And the record holds one wake, on a schedule that cannot fire during the check. The session is asked for one cron with exactly the printed arguments, to run the candidate's `tt handoff wake confirm`, and then to delete the cron. Because a receipt is judged against the session's own transcript, the script the session runs first copies that one file from the real home into the run directory (the script does, not `tt`), points the candidate at the copy with `CLAUDE_CONFIG_DIR`, and after the confirm prints `tt handoff status` from inside the session. The harness's own confirm, outside the session and with no transcript, must be refused. The isolation proofs are the same three, with the candidate's own tool entries allowed.
 
 **Result.** Run on 2026-10-10 at 04:21Z on the Mini with Claude Code **2.1.296**, on the stage B candidate. **It passed, with the first outcome: a real ledger row restored a wake, so ledger matching ships switched on.**
 
@@ -271,6 +299,8 @@ It is the live check's harness (below) with two additions. The project settings 
 - Isolation: 64 paths opened, all under the run directory; only the expected session entries ran; the real settings file's hash and the real handoff directory were unchanged.
 
 That row, with its ids, tool name, outcome, time and digest and nothing else, is the fixture of `TestHandoffWakes`, subtest "the row of the live cron check", which also requires `tt` to print for that wake the arguments whose digest the session's call had.
+
+**Run again on 2026-10-10 at 08:31Z** with the same Claude Code, on the candidate that judges a receipt against the transcript and the process start (bug `wi_4fb9a73b93635e68`, order #31789): it passed. Run from inside the real interactive session, `confirm` restored the wake from the `CronCreate` row and `status` showed it restored, so the host's own `ps` placed the command under the session's Claude Code process and the session's transcript was read. The harness's confirm outside the session was refused: "this session's transcript could not be read". 69 paths opened, all under the run directory.
 
 Not covered by the check: a session that adds `recurring` or `durable` to the call. Its digest differs, so it gets no receipt and the wake stays not restored; it can be asserted. Also not covered: a cron firing, and a compaction, since the schedule was chosen not to fire.
 
@@ -430,12 +460,14 @@ All within the 7-second budget. After each run no hook process was left. For H2 
 
 - **Restore does not create wakes.** It registers the session and says which wakes to create again. The session creates each cron and confirms it.
 - **A receipt proves creation, not that the cron still exists.** A cron deleted later is not seen. Claude Code's recurring session crons also expire after 7 days, by the tool's own description, so a wake confirmed once stops firing after that with nothing recording it.
-- **A receipt needs the session's start to have been captured.** If the start hook ran out of time, `confirm` says no start was captured and the wake can only be asserted. Times are kept to the second, so a row in the same second as a start does not count.
-- **A `claude -p` run from the helper's own pane passes g1 and g2.** It sits in a one-pane tmux session that matches the helper file, and it is shown the note. If it ran `tt handoff restore` it would register over the live helper. The guards do not cover this. Found during planning and not built; it is a follow-up.
+- **A receipt needs the session's start to have been captured.** If the session's only start hook ran out of time, `confirm` says no start was captured and the wake can only be asserted. Times are kept to the second, so a row in the same second as a start does not count.
+- **A later start the hook lost is found another way, and only from inside the session.** When a later `SessionStart` leaves no stamp (its hook ran past the deadline, or the state folder could not be written), the transcript and the process start still place it, and earlier receipts stop counting. That needs the command to run under the session's own Claude Code process: `status` or `wake confirm` typed in a plain shell shows every receipt as not restored, "not running under this session's Claude Code process". A long transcript is read from start to end each time.
+- **The one-shot check reads arguments as `ps` prints them.** An interactive session started with a prompt argument holding a bare `-p` or `--print` word is refused as print mode; start the helper without one. A Claude Code installed under a program name other than `claude` (or `node` running it) is not recognised, and restore refuses.
+- **The one-shot check is for Claude Code.** A Codex helper's restore is not checked by g7; a `codex exec` run from a Codex helper's pane is not covered.
 - **g3 cannot say when the other registration happened**, only from which host. A route that returns the receipt for a run would be a follow-up.
 - **The session keeps the notes current.** No hook can know that a session scheduled a wake or took a decision. Every list shows when it last changed, so a stale record looks stale.
 - **The record is not proof.** Its identity is what one host file said at a time, and its snapshot is what the hub said at a time. Only `tt helper env` or `tt helper register` checks a registration with the hub.
-- **A second Claude session in the helper's tmux session** is shown the note as a candidate successor. The note says it is not registered. With two panes, g1 refuses a restore.
+- **A second interactive Claude session in the helper's tmux session** is shown the note as a candidate successor. The note says it is not registered. With two panes, g1 refuses a restore.
 - **A wake's line in the note includes its schedule only when the line fits in 120 bytes.** `tt handoff show` always prints it.
 - **Decisions stay current until closed.** A list of 50 recorded decisions refuses a new one until one is closed.
 - **Claude Code 2.1.293 reports the `PreCompact` hook under `/compact`**, where the model sees it: "completed successfully" normally, and the one line "failed: Hook cancelled" if the hook process hung past 5 seconds. The compaction completes either way. See the live check's result.

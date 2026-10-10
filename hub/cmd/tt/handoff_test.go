@@ -147,6 +147,7 @@ func newHandoffBox(t *testing.T) *handoffBox {
 		"TAILTERM_HANDOFF_CONFIG": filepath.Join(root, "config", "handoff.json"), "TAILTERM_RELAY_STATE": filepath.Join(root, "relay"),
 		"TAILTERM_TOOL_LEDGER_DIR": filepath.Join(root, "tool-ledger"), "TAILTERM_HANDOFF_ACCESS_LOG": "",
 		"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "", "TMUX": "", "TMUX_PANE": "", "TT_TMUX_SOCKET": "tt-handoff-test-unused",
+		"CLAUDE_CONFIG_DIR": "",
 	} {
 		t.Setenv(name, value)
 	}
@@ -155,6 +156,9 @@ func newHandoffBox(t *testing.T) *handoffBox {
 			t.Fatal(err)
 		}
 	}
+	// Every test runs under a made-up interactive Claude Code session, never
+	// under whatever started the test.
+	b.ps(handoffPSInteractive, b.now.Add(-time.Hour))
 	setToolLedger(t, &handoffNow, func() time.Time { return b.now })
 	setToolLedger(t, &handoffAccessHook, func(path string) {
 		if path != root && !strings.HasPrefix(path, root+string(filepath.Separator)) {
@@ -261,6 +265,106 @@ func (b *handoffBox) fakeTmux(body string) {
 	b.t.Setenv("TMUX_PANE", "%1")
 }
 
+// The process tables the box's ps prints. SELF is the process that ran ps,
+// which is the one asking; T is the session process's start time. The one-shot
+// shapes are those `ps` showed for a real `claude -p` started from an
+// interactive session's shell tool on 2026-10-10 (Claude Code 2.1.296): no
+// controlling terminal, and the interactive session above it.
+const (
+	handoffPSInteractive = `SELF 4002 SELF 4002 ?? T /bin/zsh -c tt handoff
+4002 4001 4001 4001 ttys009 T claude --model claude-opus-5-5 --session-id 00000000-0000-4000-8000-000000000001
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
+	handoffPSOneShot = `SELF 4004 SELF 0 ?? T /bin/sh /tmp/hook.sh
+4004 4003 4003 0 ?? T claude -p --setting-sources project Reply with one word.
+4003 4002 4003 0 ?? T /bin/zsh -c claude -p
+4002 4001 4001 4001 ttys009 T claude --model claude-opus-5-5
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
+	// claude -p typed at the pane's own shell prompt: a terminal's foreground
+	// job with no Claude Code process above it.
+	handoffPSPrintAtPrompt = `SELF 4002 SELF 4002 ?? T /bin/zsh -c tt handoff
+4002 4001 4002 4002 ttys009 T claude --print Reply with one word.
+4001 4000 4001 4002 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// An interactive claude started by a session's shell tool: no -p, but no
+	// terminal and a Claude Code process above it.
+	handoffPSNested = `SELF 4004 SELF 0 ?? T /bin/zsh -c tt handoff
+4004 4003 4003 0 ?? T node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js
+4003 4002 4003 0 ?? T /bin/zsh -c claude
+4002 4001 4001 4001 ttys009 T claude
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// A Claude Code process in the background of its terminal.
+	handoffPSBackground = `SELF 4002 SELF 4001 ?? T /bin/zsh -c tt handoff
+4002 4001 4002 4001 ttys009 T claude
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// A shell with no Claude Code process above it.
+	handoffPSShell = `SELF 4001 SELF SELF ttys009 T tt handoff
+4001 4000 4001 SELF ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+)
+
+// handoffHostProcessTable is the host's own ps. Every test in this package,
+// including those of other files that run restore, reads a made-up
+// interactive table instead: what started the test run (a shell, a Claude
+// Code agent whose prompt holds "-p") must not decide a test.
+var handoffHostProcessTable = handoffProcessTable
+
+func init() {
+	handoffProcessTable = handoffFixedProcessTable(handoffPSInteractive, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+}
+
+func handoffFixedProcessTable(table string, started time.Time) func(context.Context, func(*exec.Cmd) error) ([]byte, error) {
+	table = strings.ReplaceAll(table, "SELF", strconv.Itoa(os.Getpid()))
+	table = strings.ReplaceAll(table, " T ", " "+started.UTC().Format("Mon Jan _2 15:04:05 2006")+" ")
+	return func(context.Context, func(*exec.Cmd) error) ([]byte, error) {
+		if table == "" {
+			return nil, errors.New("ps failed")
+		}
+		return []byte(table + "\n"), nil
+	}
+}
+
+// ps makes the process table the handoff code reads one of the tables above,
+// with the session process started at the given time; an empty table makes
+// the read fail. No test reads the table of whatever started it.
+func (b *handoffBox) ps(table string, started time.Time) {
+	b.t.Helper()
+	setToolLedger(b.t, &handoffProcessTable, handoffFixedProcessTable(table, started))
+}
+
+// transcript appends rows to a Claude Code session's transcript under the
+// box's home, as Claude Code writes them: a start hook's row (any outcome), a
+// compaction boundary, or an ordinary row.
+func (b *handoffBox) transcript(session string, at time.Time, kind string) {
+	b.t.Helper()
+	dir := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "-work-project")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		b.t.Fatal(err)
+	}
+	stamp := at.UTC().Format("2006-01-02T15:04:05.000Z")
+	row := `{"type":"user","timestamp":"` + stamp + `","message":{"role":"user","content":"quoting \"hookEvent\":\"SessionStart\" changes nothing"}}`
+	switch kind {
+	case "hook_success", "hook_cancelled", "hook_non_blocking_error":
+		row = `{"parentUuid":null,"attachment":{"type":"` + kind + `","hookName":"SessionStart:startup","hookEvent":"SessionStart"},"type":"attachment","timestamp":"` + stamp + `","entrypoint":"cli"}`
+	case "compact_boundary":
+		row = `{"type":"system","subtype":"compact_boundary","timestamp":"` + stamp + `"}`
+	case "user":
+	default:
+		b.t.Fatalf("unknown transcript row kind %q", kind)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, strings.ToLower(session)+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(`{"type":"mode","mode":"default"}` + "\n" + row + "\n"); err != nil {
+		b.t.Fatal(err)
+	}
+}
+
 // asCandidate makes this process a new Claude session in the helper's tmux
 // session: the helper file names another thread.
 func (b *handoffBox) asCandidate() {
@@ -285,6 +389,10 @@ func init() {
 
 func (b *handoffBox) hook(event, session string, fields map[string]any) toolHookRun {
 	b.t.Helper()
+	// Claude Code writes a start hook's row to the session's transcript.
+	if event == "SessionStart" && threadIDPattern.MatchString(session) {
+		b.transcript(session, b.now, "hook_success")
+	}
 	return b.hookRaw(handoffPayload(event, session, fields), nil)
 }
 
@@ -1195,7 +1303,8 @@ func TestHandoffCapture(t *testing.T) {
 			t.Fatalf("step %d: record.json.1 is not the record before the stamp", i)
 		}
 	}
-	// A session id that is not a UUID is not stored; the environment's is used.
+	// An event whose session id is not a UUID writes nothing, whatever the
+	// environment says: the end stamp is still the helper's own, from above.
 	b.quiet("SessionEnd", "not a session id", map[string]any{"reason": "clear"})
 	if stamp := b.record().Capture.End; stamp.Session != b.helper.Thread {
 		t.Fatalf("stamp session = %q", stamp.Session)
@@ -1683,18 +1792,6 @@ func TestHandoffStampOwnership(t *testing.T) {
 			t.Fatalf("%s changed record.json.1", what)
 		}
 	}
-	captureLines := func(t *testing.T, b *handoffBox) []map[string]any {
-		t.Helper()
-		var rows []map[string]any
-		for _, line := range strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n") {
-			var row map[string]any
-			if err := json.Unmarshal([]byte(line), &row); err != nil {
-				t.Fatalf("captures line %q: %v", line, err)
-			}
-			rows = append(rows, row)
-		}
-		return rows
-	}
 	// payload is a hook payload with the given session_id, or with none.
 	payload := func(event string, session *string, fields map[string]any) string {
 		doc := map[string]any{"hook_event_name": event, "cwd": "/work/secret-project-dir"}
@@ -1732,7 +1829,7 @@ func TestHandoffStampOwnership(t *testing.T) {
 		}
 	})
 	t.Run("second process", func(t *testing.T) {
-		// claude -p from the helper's pane: its own valid session id.
+		// A second Claude process in the helper's pane: its own valid session id.
 		f := start(t)
 		b := f.b
 		t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
@@ -3081,6 +3178,8 @@ func TestHandoffWakes(t *testing.T) {
 			setToolLedger(t, &handoffLedgerMatching, true)
 			b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581")
 			b.ledger(b.cron("w1", toolA))
+			// The session has a transcript, but its start hook left no stamp.
+			b.transcript(b.helper.Thread, b.now.Add(-time.Minute), "hook_cancelled")
 			before := b.bytes("record.json")
 			if _, err := confirm(b, "w1"); err == nil || !strings.Contains(err.Error(), "no start was captured for this session") || !bytes.Equal(before, b.bytes("record.json")) {
 				t.Fatalf("confirm with no start = %v", err)
@@ -3390,6 +3489,372 @@ func TestHandoffWakes(t *testing.T) {
 // handoffValuePatterns is this test's own statement of what each stored
 // value may look like, by its place in the record. It shares nothing with
 // the code under test.
+// captureLines is the capture log's rows; none when the file is absent.
+func captureLines(t *testing.T, b *handoffBox) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(b.file("captures.jsonl"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("captures line %q: %v", line, err)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// r1: how a one-shot Claude Code process is told from a pane's interactive
+// session. The rows are what ps printed on 2026-10-10 (Claude Code 2.1.296)
+// for a start hook of `claude -p` run by an interactive session's shell tool,
+// with the prompt and paths shortened; the other tables are the box's.
+func TestHandoffOneShotProcess(t *testing.T) {
+	const observed = `42258 40839 42258     0 ??       Sat Oct 10 07:43:06 2026 /bin/sh /private/tmp/probe/hook.sh
+40839 40803 40803     0 ??       Sat Oct 10 07:43:05 2026 claude -p --setting-sources project --model claude-haiku-5-5 --session-id 0324fdd8-29d0-4757-b16d-27b4ca35461a Reply
+40803 12699 40803     0 ??       Sat Oct 10 07:43:05 2026 /bin/zsh -c source /Users/someone/.claude/shell-snapshots/snapshot.sh
+12699 12695 12693 12693 ttys010  Sat Oct 10 07:39:37 2026 claude --model claude-opus-5-5 --effort high --session-id 28c99d07-d1d4-4843-889a-600834497020 a prompt with -p in it
+12695 12693 12693 12693 ttys010  Sat Oct 10 07:39:37 2026 /bin/zsh /var/folders/p8/T/.tailterm-runtime-command-1649919538
+12693  1611 12693 12693 ttys010  Sat Oct 10 07:39:37 2026 /Users/someone/.local/bin/tt wrap --shell-file /var/folders/p8/T/.tailterm-agent-command-645480000
+ 1611     1  1611     0 ??       Thu Oct  1 09:00:00 2026 tmux new -s codex`
+	chainOf := func(table string, self int) []handoffProcess {
+		rows := map[int]handoffProcess{}
+		for _, line := range strings.Split(table, "\n") {
+			p, ok := handoffProcessRow(line)
+			if !ok {
+				t.Fatalf("row not parsed: %q", line)
+			}
+			rows[p.pid] = p
+		}
+		var chain []handoffProcess
+		for pid := self; pid > 1; pid = rows[pid].ppid {
+			chain = append(chain, rows[pid])
+		}
+		return chain
+	}
+	// The hook of the one-shot run, and a command the interactive session's
+	// own shell tool would run (its shell, 40803, stands in for it).
+	oneShot, interactive := chainOf(observed, 42258), chainOf(observed, 40803)
+	if got := handoffOneShot(oneShot); got != "print-mode" {
+		t.Fatalf("the observed claude -p = %q", got)
+	}
+	if p, _, ok := handoffSessionProcess(oneShot); !ok || p.pid != 40839 || p.tty != "??" || p.tpgid != 0 || !p.started.Equal(time.Date(2026, 10, 10, 7, 43, 5, 0, time.UTC)) {
+		t.Fatalf("the observed one-shot process = %+v %v", p, ok)
+	}
+	// The interactive session is not refused for a prompt that holds "-p":
+	// only an argument that is exactly -p or --print counts. Here it does
+	// hold one, and refusing is the safe side.
+	if got := handoffOneShot(interactive); got != "print-mode" {
+		t.Fatalf("an interactive session whose arguments hold a bare -p = %q", got)
+	}
+	plain := strings.Replace(observed, "a prompt with -p in it", "a prompt about --printing and x-p", 1)
+	if got := handoffOneShot(chainOf(plain, 40803)); got != "" {
+		t.Fatalf("the observed interactive session = %q", got)
+	}
+	if p, _, _ := handoffSessionProcess(chainOf(plain, 40803)); p.pid != 12699 || p.tty != "ttys010" || p.pgid != p.tpgid {
+		t.Fatalf("the observed interactive process = %+v", p)
+	}
+	self := strconv.Itoa(os.Getpid())
+	for table, want := range map[string]string{handoffPSInteractive: "", handoffPSOneShot: "print-mode", handoffPSPrintAtPrompt: "print-mode",
+		handoffPSNested: "nested-claude", handoffPSBackground: "no-terminal", handoffPSShell: "no-claude-process"} {
+		text := strings.ReplaceAll(strings.ReplaceAll(table, "SELF", self), " T ", " Sat Oct 10 07:43:05 2026 ")
+		if got := handoffOneShot(chainOf(text, os.Getpid())); got != want {
+			t.Errorf("handoffOneShot = %q, want %q, for\n%s", got, want, table)
+		}
+		if _, ok := handoffReasons[want]; want != "" && !ok {
+			t.Errorf("%q is not a named reason", want)
+		}
+	}
+	// The host's own ps, unfaked: this process is found, with a start time.
+	setToolLedger(t, &handoffProcessTable, handoffHostProcessTable)
+	chain, err := handoffProcessChain(context.Background(), nil)
+	if err != nil || chain[0].pid != os.Getpid() || chain[0].started.IsZero() || chain[0].started.After(time.Now().Add(time.Minute)) || len(chain[0].args) == 0 {
+		t.Fatalf("the host's process table: %v, %+v", err, chain)
+	}
+	for _, bad := range []string{"", "1 2 3", "a 1 1 1 ?? Sat Oct 10 07:43:05 2026 claude", "1 1 1 1 ?? Sat Oct 10 07:43:05 claude -p x y"} {
+		if _, ok := handoffProcessRow(bad); ok {
+			t.Errorf("a malformed row was parsed: %q", bad)
+		}
+	}
+}
+
+// r1: the start note is not printed into a process that is not a pane's
+// interactive Claude Code session, whether the hook matched it as the
+// registered thread or as a candidate, and what the hook writes is as before.
+func TestHandoffOneShotNote(t *testing.T) {
+	tables := map[string]string{"claude -p from the pane": handoffPSOneShot, "claude --print at the prompt": handoffPSPrintAtPrompt, "a nested claude": handoffPSNested,
+		"a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": ""}
+	for name, table := range tables {
+		t.Run(name, func(t *testing.T) {
+			// As a candidate: its own session id, in the helper's tmux session.
+			b := newHandoffBox(t)
+			b.on()
+			b.asCandidate()
+			b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581", "--task", b.helper.Task)
+			record := b.bytes("record.json")
+			t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+			b.ps(table, b.now)
+			b.quiet("SessionStart", handoffOtherID, map[string]any{"source": "startup"})
+			if !bytes.Equal(record, b.bytes("record.json")) {
+				t.Fatal("a one-shot start changed the record")
+			}
+			if rows := captureLines(t, b); len(rows) != 1 || rows[0]["event"] != "SessionStart" || rows[0]["match"] != handoffAsCandidate {
+				t.Fatalf("capture lines %v; want the one candidate line, as before", rows)
+			}
+			// The same process table as an interactive session: the note.
+			b.ps(handoffPSInteractive, b.now)
+			if r := b.hook("SessionStart", handoffOtherID, map[string]any{"source": "startup"}); r.err != nil || !strings.Contains(r.out, handoffCandidateSentence) || !strings.Contains(r.out, "w1 active") {
+				t.Fatalf("an interactive candidate's start = %v, %q", r.err, r.out)
+			}
+
+			// Matched as the registered thread: a payload with no session id,
+			// in a process that inherited the helper's environment.
+			b = newHandoffBox(t)
+			b.on()
+			b.asHelper()
+			b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581")
+			b.ps(table, b.now)
+			if r := b.hookRaw(`{"hook_event_name":"SessionStart","source":"startup"}`, nil); r.err != nil || r.out != "" {
+				t.Fatalf("a one-shot start under the helper's environment = %v, %q", r.err, r.out)
+			}
+			// And one naming the registered thread, as claude -p --resume would.
+			b.quiet("SessionStart", b.helper.Thread, map[string]any{"source": "resume"})
+			b.ps(handoffPSInteractive, b.now)
+			r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "startup"})
+			if r.err != nil || !strings.Contains(r.out, "w1 active") || strings.Contains(r.out, handoffCandidateSentence) {
+				t.Fatalf("the interactive helper's start = %v, %q", r.err, r.out)
+			}
+		})
+	}
+}
+
+// r1, r2: restore run by a one-shot process in the helper's pane is refused by
+// guard g7 before anything is written, on the hub and on the host, and the
+// interactive session in the same pane then restores.
+func TestHandoffRestoreOneShot(t *testing.T) {
+	reasons := map[string]string{handoffPSOneShot: handoffReasons["print-mode"], handoffPSPrintAtPrompt: handoffReasons["print-mode"], handoffPSNested: handoffReasons["nested-claude"],
+		handoffPSBackground: handoffReasons["no-terminal"], handoffPSShell: handoffReasons["no-claude-process"], "": "the process table could not be read"}
+	for name, table := range map[string]string{"claude -p from the pane": handoffPSOneShot, "claude --print at the prompt": handoffPSPrintAtPrompt,
+		"a nested claude": handoffPSNested, "a background claude": handoffPSBackground, "no claude process": handoffPSShell, "ps failed": ""} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffHubFixture(t)
+			b := f.b
+			// The one-shot process has its own session id and sits in the
+			// helper's one-pane tmux session, so g1 and g2 pass for it.
+			thread := newHelperThread(t)
+			b.ps(table, b.now)
+			b.quiet("SessionStart", thread, map[string]any{"source": "startup"})
+			state, record := f.state(t), b.bytes("record.json")
+			f.seen()
+			out, err := f.restore()
+			if err == nil || out != "" || !strings.Contains(err.Error(), "restore refused by guard g7 interactive session: ") || !strings.Contains(err.Error(), "Nothing was registered, written or changed.") {
+				t.Fatalf("restore from %s = %v\n%s", name, err, out)
+			}
+			if !strings.Contains(err.Error(), reasons[table]) {
+				t.Fatalf("the refusal does not name its reason %q: %v", reasons[table], err)
+			}
+			if sent := f.seen(); len(sent) != 0 {
+				t.Fatalf("a refused restore asked the hub: %v", sent)
+			}
+			if f.state(t) != state || !bytes.Equal(record, b.bytes("record.json")) {
+				t.Fatal("a refused restore changed the hub, the helper file, a binding, a tag or the record")
+			}
+			if _, err := os.Stat(b.file("restore.json")); !os.IsNotExist(err) {
+				t.Fatalf("a refused restore wrote restore.json: %v", err)
+			}
+			// The registered helper's own thread, in such a process, likewise.
+			t.Setenv("CLAUDE_CODE_SESSION_ID", f.thread)
+			f.seen()
+			if out, err := f.restore(); err == nil || out != "" || !strings.Contains(err.Error(), "g7 interactive session") || len(f.seen()) != 0 || f.state(t) != state {
+				t.Fatalf("restore under the helper's own thread from %s = %v\n%s", name, err, out)
+			}
+			f.seen()
+			// The interactive session in that pane restores.
+			t.Setenv("CLAUDE_CODE_SESSION_ID", thread)
+			b.ps(handoffPSInteractive, b.now.Add(-time.Hour))
+			out, err = f.restore()
+			if err != nil || !strings.Contains(out, "registration: restored") {
+				t.Fatalf("the interactive session's restore = %v\n%s", err, out)
+			}
+			if sent := f.writes(); len(sent) != 1 || sent[0] != "POST /v1/tasks/"+f.task.ID+"/owner-helper" {
+				t.Fatalf("the interactive restore sent %v", sent)
+			}
+		})
+	}
+}
+
+// r5: a wake receipt counts only after the session's latest start as the
+// session's own transcript and Claude Code process show it, which the hook
+// does not write. A start the hook lost still puts earlier receipts before it.
+func TestHandoffWakeFloor(t *testing.T) {
+	const toolA, toolB = "toolu_01HandoffFixtureAAAAAAAA", "toolu_01HandoffFixtureBBBBBBBB"
+	// A registered helper session whose wake w1 is restored.
+	begin := func(t *testing.T) *handoffBox {
+		b := newHandoffBox(t)
+		b.on()
+		b.asHelper()
+		setToolLedger(t, &handoffLedgerMatching, true)
+		b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581")
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "startup"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		b.now = b.now.Add(time.Minute)
+		b.ledger(b.cron("w1", toolA))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil || !strings.Contains(out, "wake w1 restored") {
+			t.Fatalf("confirm = %v, %q", err, out)
+		}
+		if status := b.must("status"); !strings.Contains(status, "w1 restored: this session created its cron") || !strings.Contains(status, "0 active wakes not restored now") {
+			t.Fatalf("status:\n%s", status)
+		}
+		b.now = b.now.Add(time.Minute)
+		return b
+	}
+	// lost requires status and confirm to say not restored for the reason,
+	// with the record and its capture stamps untouched.
+	lost := func(t *testing.T, b *handoffBox, reason string) {
+		t.Helper()
+		before := b.bytes("record.json")
+		status := b.must("status", "--task", b.helper.Task)
+		if !strings.Contains(status, "w1 not restored: "+handoffReasons[reason]) || !strings.Contains(status, "1 active wakes not restored now") {
+			t.Fatalf("status; want w1 not restored: %s\n%s", reason, status)
+		}
+		out, err := b.run("wake", "confirm", "w1", "--task", b.helper.Task)
+		if err == nil || out != "" || !strings.Contains(err.Error(), "wake w1 not restored") {
+			t.Fatalf("confirm = %v, %q; want not restored", err, out)
+		}
+		if !bytes.Equal(before, b.bytes("record.json")) {
+			t.Fatal("the record changed")
+		}
+	}
+	// A later start whose hook left nothing: each kind of transcript row.
+	for _, row := range []string{"hook_cancelled", "hook_non_blocking_error", "hook_success", "compact_boundary"} {
+		t.Run("a later start the hook lost: "+row, func(t *testing.T) {
+			b := begin(t)
+			start := b.record().Capture.Start.Time
+			b.transcript(b.helper.Thread, b.now, row)
+			if b.record().Capture.Start.Time != start {
+				t.Fatal("the fixture captured the later start")
+			}
+			lost(t, b, "earlier-start")
+			// A row from before the lost start does not restore it, and one
+			// from after it does: the ledger is searched from the same start.
+			b.ledger(handoffLedgerFixture{Session: b.helper.Thread, Tool: handoffCronTool, ToolUse: toolB, Outcome: "ok",
+				Digest: toolArgsDigest(handoffWakeArgs(b.wake("w1"), b.helper.Task)), At: b.now.Add(-30 * time.Second)})
+			lost(t, b, "earlier-start")
+			b.now = b.now.Add(time.Minute)
+			b.ledger(b.cron("w1", toolB))
+			if out, err := b.run("wake", "confirm", "w1"); err != nil || !strings.Contains(out, "wake w1 restored") || b.wake("w1").ReceiptTool != toolB {
+				t.Fatalf("confirm after the lost start = %v, %q", err, out)
+			}
+		})
+	}
+	t.Run("a later start lost to a late hook", func(t *testing.T) {
+		b := begin(t)
+		start, lines := b.record().Capture.Start.Time, len(captureLines(t, b))
+		setToolLedger(t, &handoffDeadline, time.Nanosecond)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		if b.record().Capture.Start.Time != start || len(captureLines(t, b)) != lines {
+			t.Fatal("the late hook recorded the start: the case is not the lost one")
+		}
+		lost(t, b, "earlier-start")
+	})
+	t.Run("a later start lost to an unwritable state folder", func(t *testing.T) {
+		b := begin(t)
+		start, lines := b.record().Capture.Start.Time, len(captureLines(t, b))
+		// Nothing in the folder can be written: not the record, the capture
+		// log or the lock.
+		dir := filepath.Dir(b.file("record.json"))
+		files, err := filepath.Glob(filepath.Join(dir, "*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mode := func(file, folder os.FileMode) {
+			for _, path := range files {
+				if err := os.Chmod(path, file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Chmod(dir, folder); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mode(0400, 0500)
+		r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "resume"})
+		mode(0600, 0700)
+		if r.err != nil || b.record().Capture.Start.Time != start || len(captureLines(t, b)) != lines {
+			t.Fatalf("the hook recorded the start in a folder it could not write: %v", r.err)
+		}
+		lost(t, b, "earlier-start")
+	})
+	t.Run("a resume: a new process and no transcript row", func(t *testing.T) {
+		b := begin(t)
+		b.ps(handoffPSInteractive, b.now)
+		lost(t, b, "earlier-start")
+	})
+	t.Run("the transcript cannot be read", func(t *testing.T) {
+		b := begin(t)
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "-work-project", b.helper.Thread+".jsonl")
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		lost(t, b, "transcript-unreadable")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		lost(t, b, "transcript-unreadable")
+		// A transcript with no timed row says nothing either.
+		if err := os.WriteFile(path, []byte(`{"type":"mode","mode":"default"}`+"\n"+`not json`+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		lost(t, b, "transcript-unreadable")
+	})
+	t.Run("the session's process cannot be found", func(t *testing.T) {
+		b := begin(t)
+		b.ps("", b.now)
+		lost(t, b, "session-process-unknown")
+		b.ps(handoffPSShell, b.now)
+		lost(t, b, "session-process-unknown")
+		// A shell with no runtime session speaks for the registered thread,
+		// and is not that session's process.
+		b.ps(handoffPSInteractive, b.now.Add(-time.Hour))
+		t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+		lost(t, b, "session-process-unknown")
+	})
+	t.Run("restore reports it and stores the reason", func(t *testing.T) {
+		f := newHandoffHubFixture(t)
+		b := f.b
+		setToolLedger(t, &handoffLedgerMatching, true)
+		b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581")
+		b.hook("SessionStart", f.thread, map[string]any{"source": "startup"})
+		b.now = b.now.Add(time.Minute)
+		b.ledger(b.cron("w1", toolA))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil {
+			t.Fatalf("confirm = %v, %q", err, out)
+		}
+		if out, err := f.restore(); err != nil || !strings.Contains(out, "w1 restored: this session created its cron") {
+			t.Fatalf("restore = %v\n%s", err, out)
+		}
+		b.now = b.now.Add(time.Minute)
+		b.transcript(f.thread, b.now, "hook_cancelled")
+		out, err := f.restore()
+		if err == nil || !strings.Contains(err.Error(), "restore incomplete: 1 not restored") || !strings.Contains(out, "w1 not restored: "+handoffReasons["earlier-start"]) || !strings.Contains(out, "arguments for "+handoffCronTool) {
+			t.Fatalf("restore after a lost start = %v\n%s", err, out)
+		}
+		report, ok, err := handoffStore{dir: filepath.Dir(b.file("restore.json"))}.loadRestore()
+		if err != nil || !ok || len(report.Wakes) != 1 || report.Wakes[0].State != handoffNotRestored || report.Wakes[0].Reason != "earlier-start" {
+			t.Fatalf("restore.json = %+v %v %v", report, ok, err)
+		}
+		requireHandoffValues(t, b.bytes("restore.json"))
+	})
+}
+
 var handoffValuePatterns = func() map[string]*regexp.Regexp {
 	const (
 		stamp = `[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z`
@@ -4625,8 +5090,17 @@ func TestHandoffLiveCronCheck(t *testing.T) {
 	}
 	tools := script("tools.sh", "#!/bin/sh\necho \"$1 $(env | sed 's/=.*//' | sort | tr '\\n' ' ')\" >> "+q(filepath.Join(r.dir, "tools.log"))+"\nexec "+env+" "+q(l.tt)+" hook tool\n")
 	// What the session itself runs to confirm the wake: the candidate, never
-	// the installed tt, with the same temporary state.
-	confirm := script("confirm.sh", "#!/bin/sh\nexec "+env+" "+q(l.tt)+" handoff wake confirm w1 --task "+task+"\n")
+	// the installed tt, with the same temporary state. A receipt is judged
+	// against the session's own transcript, which Claude Code keeps under the
+	// real home: the script, not tt, copies that one file into the run
+	// directory, and the candidate reads the copy. It then prints the status
+	// from inside the session, whose process the judgement also needs.
+	config := filepath.Join(r.dir, "claude")
+	env += " CLAUDE_CONFIG_DIR=" + q(config)
+	confirm := script("confirm.sh", "#!/bin/sh\nmkdir -p "+q(filepath.Join(config, "projects", "session"))+
+		" && cp \"$HOME\"/.claude/projects/*/\"$CLAUDE_CODE_SESSION_ID\".jsonl "+q(filepath.Join(config, "projects", "session"))+"/ || exit 1\n"+
+		env+" "+q(l.tt)+" handoff wake confirm w1 --task "+task+"\ncode=$?\n"+
+		env+" "+q(l.tt)+" handoff status --task "+task+" > "+q(filepath.Join(r.dir, "status.txt"))+" 2>&1\nexit $code\n")
 	settingsPath := filepath.Join(r.dir, "project", ".claude", "settings.json")
 	var settings map[string]any
 	data, err := os.ReadFile(settingsPath)
@@ -4697,16 +5171,25 @@ func TestHandoffLiveCronCheck(t *testing.T) {
 	}
 	t.Logf("digest of the arguments restore prints (%s): %s", args, want)
 
-	// The harness confirms too, with the session's id: a second confirm of a
-	// restored wake changes nothing.
-	out, confirmErr := r.candidate("handoff", "wake", "confirm", "w1", "--task", task)
-	t.Logf("tt handoff wake confirm w1: %v: %s", confirmErr, strings.TrimSpace(out))
-	if err := json.Unmarshal([]byte(r.read("handoff", r.helper.Agent, "record.json")), &record); err != nil {
+	// The harness confirms too, with the session's id but outside the
+	// session: it has no transcript to read, so nothing counts for it and the
+	// record is left alone.
+	recordBefore := r.read("handoff", r.helper.Agent, "record.json")
+	out, outsideErr := r.candidate("handoff", "wake", "confirm", "w1", "--task", task)
+	t.Logf("tt handoff wake confirm w1, outside the session: %v: %s", outsideErr, strings.TrimSpace(out))
+	if handoffLedgerMatching && (outsideErr == nil || !strings.Contains(out, handoffReasons["transcript-unreadable"]) || r.read("handoff", r.helper.Agent, "record.json") != recordBefore) {
+		t.Errorf("a confirm outside the session was not refused for its transcript, or changed the record: %v: %s", outsideErr, out)
+	}
+	var confirmErr error // the session's own confirm shows in the receipt
+	if !handoffLedgerMatching {
+		confirmErr = outsideErr
+	}
+	if err := json.Unmarshal([]byte(recordBefore), &record); err != nil {
 		t.Fatal(err)
 	}
 	wake = record.Notes.Wakes.Entries[0]
-	status, _ := r.candidate("handoff", "status", "--task", task)
-	t.Logf("tt handoff status:\n%s", status)
+	status := r.read("status.txt")
+	t.Logf("tt handoff status, run by the session:\n%s", status)
 
 	if handoffLedgerMatching {
 		// Outcome 1: a real row restored the wake.

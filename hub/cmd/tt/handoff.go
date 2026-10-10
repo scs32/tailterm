@@ -1011,6 +1011,293 @@ func handoffKillGroup(p *os.Process) error {
 	return p.Kill()
 }
 
+// ---- which Claude Code process this is ----
+
+// handoffProcess is one row of the host's process table.
+type handoffProcess struct {
+	pid, ppid, pgid, tpgid int
+	tty                    string    // the controlling terminal; "??" or "?" for none
+	started                time.Time // to the second
+	args                   []string
+}
+
+const (
+	handoffProcessMax    = 16 << 20 // bytes of ps output read
+	handoffProcessLayout = "Mon Jan 2 15:04:05 2006"
+)
+
+// handoffProcessChain is this process and its ancestors, nearest first, from
+// one ps of the host. The process table is the evidence the environment is
+// not: a child inherits CLAUDE_CODE_SESSION_ID and TMUX_PANE, but not its
+// parent's place in the table.
+//
+// start starts ps; nil means cmd.Start. The hook passes its own, so that the
+// handler knows the child and can kill it before it returns.
+func handoffProcessChain(ctx context.Context, start func(*exec.Cmd) error) ([]handoffProcess, error) {
+	raw, err := handoffProcessTable(ctx, start)
+	if err != nil {
+		return nil, err
+	}
+	table := map[int]handoffProcess{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if p, ok := handoffProcessRow(line); ok {
+			table[p.pid] = p
+		}
+	}
+	var chain []handoffProcess
+	for pid := os.Getpid(); pid > 1 && len(chain) < 64; {
+		p, ok := table[pid]
+		if !ok {
+			break
+		}
+		chain = append(chain, p)
+		pid = p.ppid
+	}
+	if len(chain) == 0 {
+		return nil, errors.New("this process is not in the process table")
+	}
+	return chain, nil
+}
+
+// handoffProcessTable prints the host's process table. A variable so tests
+// can put a made-up table in its place.
+var handoffProcessTable = func(ctx context.Context, start func(*exec.Cmd) error) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "ps", "-A", "-ww", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,lstart=,args=")
+	// The start time is printed in the C locale and in UTC, whatever the
+	// session's own settings are.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return handoffKillGroup(cmd.Process) }
+	cmd.WaitDelay = 20 * time.Millisecond
+	var raw bytes.Buffer
+	cmd.Stdout = &handoffCapWriter{to: &raw, left: handoffProcessMax}
+	if start == nil {
+		start = (*exec.Cmd).Start
+	}
+	if err := start(cmd); err != nil {
+		return nil, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+	return raw.Bytes(), nil
+}
+
+// handoffCapWriter keeps the first left bytes and drops the rest, so a child
+// that prints without end fills no memory and still never blocks.
+type handoffCapWriter struct {
+	to   *bytes.Buffer
+	left int
+}
+
+func (w *handoffCapWriter) Write(p []byte) (int, error) {
+	if keep := min(len(p), w.left); keep > 0 {
+		w.to.Write(p[:keep])
+		w.left -= keep
+	}
+	return len(p), nil
+}
+
+// handoffProcessRow parses one ps line: four numbers, the terminal, the five
+// words of the start time and the arguments.
+func handoffProcessRow(line string) (handoffProcess, bool) {
+	f := strings.Fields(line)
+	if len(f) < 11 {
+		return handoffProcess{}, false
+	}
+	var n [4]int
+	for i := range n {
+		v, err := strconv.Atoi(f[i])
+		if err != nil {
+			return handoffProcess{}, false
+		}
+		n[i] = v
+	}
+	started, err := time.ParseInLocation(handoffProcessLayout, strings.Join(f[5:10], " "), time.UTC)
+	if err != nil {
+		return handoffProcess{}, false
+	}
+	return handoffProcess{pid: n[0], ppid: n[1], pgid: n[2], tpgid: n[3], tty: f[4], started: started, args: f[10:]}, true
+}
+
+// claude reports whether the process is a Claude Code runtime: its program,
+// or node running it, is named claude.
+func (p handoffProcess) claude() bool {
+	if len(p.args) == 0 {
+		return false
+	}
+	program := filepath.Base(p.args[0])
+	if program == "node" && len(p.args) > 1 {
+		return filepath.Base(p.args[1]) == "claude" || strings.Contains(p.args[1], "/@anthropic-ai/claude-code/")
+	}
+	return program == "claude"
+}
+
+// handoffSessionProcess is the Claude Code process this command or hook runs
+// under: the nearest one above it.
+func handoffSessionProcess(chain []handoffProcess) (handoffProcess, []handoffProcess, bool) {
+	for i, p := range chain {
+		if i > 0 && p.claude() {
+			return p, chain[i+1:], true
+		}
+	}
+	return handoffProcess{}, nil, false
+}
+
+// handoffOneShot says why the Claude Code process this command or hook runs
+// under is not a pane's interactive session, by a short name from
+// handoffReasons; "" means it is one. An interactive session is the
+// foreground job of a terminal, was not started in print mode and was not
+// started by another Claude Code process. A `claude -p` run from a session's
+// own pane, by its shell tool or by hand, fails all three; any one refuses.
+func handoffOneShot(chain []handoffProcess) string {
+	p, above, ok := handoffSessionProcess(chain)
+	if !ok {
+		return "no-claude-process"
+	}
+	for _, arg := range p.args[1:] {
+		if arg == "-p" || arg == "--print" {
+			return "print-mode"
+		}
+	}
+	for _, parent := range above {
+		if parent.claude() {
+			return "nested-claude"
+		}
+	}
+	if p.tty == "" || strings.HasPrefix(p.tty, "?") || p.tpgid < 1 || p.tpgid != p.pgid {
+		return "no-terminal"
+	}
+	return ""
+}
+
+// ---- when the running session last started ----
+
+// handoffTranscriptStart is the time of the latest start a Claude Code
+// session's own transcript shows: the first row with a time (a new session's
+// file begins at its start, and /clear begins a new file), every SessionStart
+// hook row whatever its outcome, and every compaction boundary. The session's
+// files are found by its id under the Claude Code projects directory; with
+// more than one, the latest start in any of them counts, and one that cannot
+// be read makes the answer unknown.
+//
+// Only a row's type, subtype, hook event and time are decoded. Nothing from
+// the transcript is stored or printed.
+func handoffTranscriptStart(session string) (time.Time, bool) {
+	if !threadIDPattern.MatchString(session) {
+		return time.Time{}, false
+	}
+	base := os.Getenv("CLAUDE_CONFIG_DIR")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return time.Time{}, false
+		}
+		base = filepath.Join(home, ".claude")
+	}
+	handoffTouch(filepath.Join(base, "projects"))
+	paths, err := filepath.Glob(filepath.Join(base, "projects", "*", strings.ToLower(session)+".jsonl"))
+	if err != nil || len(paths) == 0 {
+		return time.Time{}, false
+	}
+	var latest time.Time
+	for _, path := range paths {
+		handoffTouch(path)
+		f, err := os.Open(path)
+		if err != nil {
+			return time.Time{}, false
+		}
+		at, err := handoffTranscriptScan(f)
+		_ = f.Close()
+		if err != nil {
+			return time.Time{}, false
+		}
+		if at.After(latest) {
+			latest = at
+		}
+	}
+	// A file with no timed row says nothing; with none in any file the
+	// session's start is not known.
+	return latest, !latest.IsZero()
+}
+
+var (
+	handoffTranscriptHook    = []byte(`"hookEvent":"SessionStart"`)
+	handoffTranscriptCompact = []byte(`"subtype":"compact_boundary"`)
+)
+
+// handoffTranscriptScan reads one transcript to its end. A row is decoded
+// only until the first time is found and, after that, when its bytes name a
+// start hook or a compaction boundary, so a long session costs one pass.
+func handoffTranscriptScan(in io.Reader) (time.Time, error) {
+	var latest time.Time
+	first := false
+	lines := bufio.NewReaderSize(in, 1<<16)
+	for {
+		line, err := lines.ReadBytes('\n')
+		if len(line) > 0 && (!first || bytes.Contains(line, handoffTranscriptHook) || bytes.Contains(line, handoffTranscriptCompact)) {
+			var row struct {
+				Type       string `json:"type"`
+				Subtype    string `json:"subtype"`
+				Timestamp  string `json:"timestamp"`
+				Attachment struct {
+					HookEvent string `json:"hookEvent"`
+				} `json:"attachment"`
+			}
+			if json.Unmarshal(line, &row) == nil {
+				if at, perr := time.Parse(time.RFC3339Nano, row.Timestamp); perr == nil {
+					start := !first ||
+						row.Type == "attachment" && row.Attachment.HookEvent == "SessionStart" ||
+						row.Type == "system" && row.Subtype == "compact_boundary"
+					first = true
+					if start && at.After(latest) {
+						latest = at
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			return latest, nil
+		}
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+}
+
+// handoffSessionFloor is the earliest moment after which a wake receipt can
+// count for the session asking: the later of the latest start in the
+// session's own transcript and the start of the Claude Code process the
+// command runs under. Neither comes from the hook, so a start the hook lost
+// (it ran past its deadline, or the state directory could not be written)
+// still puts every earlier receipt before it. A resume writes no row to the
+// transcript; it is a new process, which is why the process start counts.
+// When either cannot be read the reason is returned and no receipt counts.
+func handoffSessionFloor(session string) (floor string, reason string) {
+	at, ok := handoffTranscriptStart(session)
+	if !ok {
+		return "", "transcript-unreadable"
+	}
+	_, current, single := sessionHelperThread()
+	if !single || !strings.EqualFold(current, session) {
+		return "", "session-process-unknown"
+	}
+	ctx, cancel := ctxTimeout(5 * time.Second)
+	defer cancel()
+	chain, err := handoffProcessChain(ctx, nil)
+	if err != nil {
+		return "", "session-process-unknown"
+	}
+	p, _, ok := handoffSessionProcess(chain)
+	if !ok {
+		return "", "session-process-unknown"
+	}
+	if p.started.After(at) {
+		at = p.started
+	}
+	return handoffStamped(at), ""
+}
+
 // ---- the hook ----
 
 // handoffHookInput holds the only fields decoded from Claude Code's payload.
@@ -1070,7 +1357,7 @@ type handoffHookRun struct {
 	mu       sync.Mutex
 	owes     bool        // a matched SessionStart has not printed yet
 	closed   bool        // the handler has returned; print nothing more, start nothing more
-	child    *os.Process // the tmux query, while it runs
+	child    *os.Process // the tmux or ps query, while it runs
 }
 
 // matchTmux asks tmux through startChild and forgets the child once the
@@ -1097,6 +1384,18 @@ func (h *handoffHookRun) startChild(cmd *exec.Cmd) error {
 	}
 	h.child = cmd.Process
 	return nil
+}
+
+// interactive asks ps through startChild, as matchTmux asks tmux, and reports
+// whether this hook's Claude Code process is a pane's interactive session.
+func (h *handoffHookRun) interactive(ctx context.Context) bool {
+	defer func() {
+		h.mu.Lock()
+		h.child = nil
+		h.mu.Unlock()
+	}()
+	chain, err := handoffProcessChain(ctx, h.startChild)
+	return err == nil && handoffOneShot(chain) == ""
 }
 
 func (h *handoffHookRun) late() bool { return time.Since(h.started) >= h.deadline }
@@ -1144,7 +1443,11 @@ func (h *handoffHookRun) work() {
 	} else {
 		return
 	}
-	start := p.Event == "SessionStart"
+	// The note is for the pane's interactive session only. A one-shot run in
+	// the helper's pane, such as claude -p, is matched like any other process
+	// there, and what it may write is unchanged; it is shown nothing, and so
+	// is a process the table could not place.
+	start := p.Event == "SessionStart" && h.interactive(ctx)
 	if start {
 		h.mu.Lock()
 		h.owes = !h.closed
@@ -2072,18 +2375,24 @@ func handoffWakeArgs(e handoffEntry, task string) json.RawMessage {
 // The fixed reasons a wake or a restore step is not restored. They are stored
 // in restore.json by their short name and printed by their sentence.
 var handoffReasons = map[string]string{
-	"no-receipt":           "nothing has confirmed it in this session",
-	"another-session":      "its receipt is from another session",
-	"earlier-start":        "its receipt is from before this session's latest start",
-	"no-start-captured":    "no start was captured for this session, so nothing can be placed after it",
-	"no-session-timer":     "this runtime has no session timer",
-	"hub-refused":          "the hub refused the registration",
-	"register-failed":      "the registration did not complete",
-	"no-binding":           "no wake binding names this helper on this host",
-	"binding-mismatch":     "the wake binding names another thread or run",
-	"registration-missing": "the registration is not restored",
-	"hub-read-failed":      "the hub could not be read",
-	"record-unreadable":    "the handoff record could not be read",
+	"no-receipt":              "nothing has confirmed it in this session",
+	"another-session":         "its receipt is from another session",
+	"earlier-start":           "its receipt is from before this session's latest start",
+	"no-start-captured":       "no start was captured for this session, so nothing can be placed after it",
+	"no-session-timer":        "this runtime has no session timer",
+	"transcript-unreadable":   "this session's transcript could not be read, so its latest start is not known",
+	"session-process-unknown": "this command is not running under this session's Claude Code process, so its latest start is not known",
+	"no-claude-process":       "no Claude Code process is above this command in the process table",
+	"print-mode":              "this Claude Code process was started in print mode (-p): it is a one-shot run",
+	"nested-claude":           "this Claude Code process was started by another Claude Code process",
+	"no-terminal":             "this Claude Code process is not the foreground job of a terminal",
+	"hub-refused":             "the hub refused the registration",
+	"register-failed":         "the registration did not complete",
+	"no-binding":              "no wake binding names this helper on this host",
+	"binding-mismatch":        "the wake binding names another thread or run",
+	"registration-missing":    "the registration is not restored",
+	"hub-read-failed":         "the hub could not be read",
+	"record-unreadable":       "the handoff record could not be read",
 }
 
 // latestStart is the latest SessionStart captured for one runtime session: in
@@ -2126,9 +2435,25 @@ func (s handoffStore) latestStart(r handoffRecord, session string) (handoffStamp
 	return latest, found
 }
 
+// sessionStart is the start a wake receipt is judged against for one Claude
+// Code session: the latest captured start, moved up to the session's floor
+// when that is later. unknown is the reason the floor could not be read; no
+// receipt counts then. Another runtime has no session timer and is not read.
+func (s handoffStore) sessionStart(r handoffRecord, runtime, session string) (start handoffStamp, started bool, unknown string) {
+	start, started = s.latestStart(r, session)
+	if runtime != "claude" {
+		return start, started, ""
+	}
+	floor, unknown := handoffSessionFloor(session)
+	if unknown == "" && started && floor > start.Time {
+		start.Time = floor
+	}
+	return start, started, unknown
+}
+
 // handoffWakeFor is a wake's state for one runtime session, and the reason
 // when it is not restored. An expired or cancelled wake keeps that state.
-func handoffWakeFor(e handoffEntry, runtime, session string, start handoffStamp, started bool, now time.Time) (state, reason string) {
+func handoffWakeFor(e handoffEntry, runtime, session string, start handoffStamp, started bool, unknown string, now time.Time) (state, reason string) {
 	if state := handoffEntryState(e, now); state != "active" {
 		return state, ""
 	}
@@ -2139,6 +2464,8 @@ func handoffWakeFor(e handoffEntry, runtime, session string, start handoffStamp,
 		return handoffNotRestored, "no-receipt"
 	case !strings.EqualFold(e.ReceiptSession, session):
 		return handoffNotRestored, "another-session"
+	case unknown != "":
+		return handoffNotRestored, unknown
 	case !started:
 		return handoffNotRestored, "no-start-captured"
 	case e.ReceiptAt <= start.Time:
@@ -2356,8 +2683,8 @@ func handoffWakeConfirmCommand(e env, args []string) error {
 		if state := handoffEntryState(*entry, now); state != "active" {
 			return false, fmt.Errorf("wake %s is %s: it is not offered for re-creation and nothing was recorded", id, state)
 		}
-		start, started := w.store.latestStart(r, w.session)
-		if state, _ := handoffWakeFor(*entry, w.runtime, w.session, start, started, now); state == handoffRestored {
+		start, started, unknown := w.store.sessionStart(r, w.runtime, w.session)
+		if state, _ := handoffWakeFor(*entry, w.runtime, w.session, start, started, unknown, now); state == handoffRestored {
 			fmt.Printf("wake %s restored: this session created its cron at %s (tool use %s)\n", id, entry.ReceiptAt, entry.ReceiptTool)
 			return false, nil
 		}
@@ -2368,6 +2695,9 @@ func handoffWakeConfirmCommand(e env, args []string) error {
 		}
 		if !handoffLedgerMatching {
 			return false, fmt.Errorf("wake %s not restored: tool-ledger matching is off in this version, so no cron can be verified. Run `tt handoff wake confirm %s --asserted --task %s` to record it as session-asserted", id, id, w.helper.Task)
+		}
+		if unknown != "" {
+			return false, fmt.Errorf("wake %s not restored: %s", id, handoffReasons[unknown])
 		}
 		if !started {
 			return false, fmt.Errorf("wake %s not restored: %s", id, handoffReasons["no-start-captured"])
@@ -2422,13 +2752,13 @@ func handoffWakeDueCommand(e env, args []string) error {
 // and the duplicate firings recorded. With offer set, each active wake that is
 // not restored comes with the exact arguments to create its cron with.
 func handoffWakeReport(b *strings.Builder, s handoffStore, r handoffRecord, runtime, session string, offer bool, now time.Time) (rows []handoffRestoreWake, pending int, duplicates int64) {
-	start, started := s.latestStart(r, session)
+	start, started, unknown := s.sessionStart(r, runtime, session)
 	task := r.Identity.Task
 	if len(r.Notes.Wakes.Entries) == 0 {
 		b.WriteString("  none in the record\n")
 	}
 	for _, e := range r.Notes.Wakes.Entries {
-		state, reason := handoffWakeFor(e, runtime, session, start, started, now)
+		state, reason := handoffWakeFor(e, runtime, session, start, started, unknown, now)
 		rows = append(rows, handoffRestoreWake{ID: e.ID, State: state, Reason: reason})
 		duplicates += e.Duplicates
 		what := fmt.Sprintf("%s msg #%d cron %q expires %s", e.Kind, e.Message, e.Schedule, e.Expires)
@@ -2743,7 +3073,7 @@ func handoffPendingRefusal(f ownerHelperFile, req api.RegisterOwnerHelperRequest
 
 // handoffRestoreCommand makes this session the project's registered owner
 // helper when it is the previous helper session's successor, and reports what
-// is and is not restored (docs/session-handoff.md). Guards g1 to g6 are all
+// is and is not restored (docs/session-handoff.md). Guards g1 to g7 are all
 // checked before anything is written. It registers through tt helper
 // register's own code, conditional on the run it read first; it never opens
 // or renews a delegation window, acknowledges or answers an obligation,
@@ -2803,6 +3133,18 @@ func handoffRestoreCommand(e env, args []string) error {
 		return handoffRefusal("g1 in tmux, one pane", "this command is not running inside tmux, so the session could not be woken", "run it in the helper's tmux session")
 	case session.Panes != 1:
 		return handoffRefusal("g1 in tmux, one pane", fmt.Sprintf("tmux session %s has %d panes; wake-ups need exactly one", session.Name, session.Panes), "close the other panes")
+	}
+
+	// g7: under the pane's interactive Claude Code session, by the process
+	// table. A one-shot run started in the helper's pane passes g1 and g2.
+	if runtime == "claude" {
+		chain, err := handoffProcessChain(ctx, nil)
+		if err != nil {
+			return handoffRefusal("g7 interactive session", "the process table could not be read, so this command could not be placed under an interactive Claude Code session", "run it in the helper's interactive session")
+		}
+		if reason := handoffOneShot(chain); reason != "" {
+			return handoffRefusal("g7 interactive session", handoffReasons[reason], "run it in the helper's interactive session, at its own prompt")
+		}
 	}
 
 	// g2, second half, and g5's pending check.
