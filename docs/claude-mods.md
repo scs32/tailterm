@@ -16,14 +16,25 @@ dialogs are a different component and still show.
 
 ### Switch it on
 
-From the repository root:
+Give the absolute path of the folder. This works from any folder. On the Mini
+checkout:
+
+```
+claude --plugin-dir /Users/stephenspeicher/projects/tailterm/tools/claude-mods/clean-view
+```
+
+The relative form works only when `claude` is started from the repository root:
 
 ```
 claude --plugin-dir tools/claude-mods/clean-view
 ```
 
-From anywhere else, give the absolute path of the folder. The session starts
-with clean view **on**.
+Claude Code gives no error when the folder is not found. Started from any other
+folder, the relative form opens an ordinary session without the mod. The owner
+hit exactly this on 10-10.
+
+The session starts with clean view **on**. The first `/clean-view` turns it
+off, which shows the tool calls.
 
 ### Switch it off
 
@@ -40,9 +51,11 @@ the client or the launch scripts loads the folder. Its only mention there is the
 release target map, which says nothing ships from it.
 `tests/clean-view-mod.test.js` checks that this stays true.
 
-Do not put the folder in `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`.
-Every Claude Code session on the host, agent sessions included, would then load
-it.
+Do not put the folder in `CLAUDE_CODE_PLUGIN_DIRS`. It is an environment
+variable, and it counts from any source: the shell, the `env` block of a
+settings file such as `~/.claude/settings.json`, or a launch script. Every
+Claude Code session that gets the variable, agent sessions included, would then
+load the mod.
 
 ### What has been checked
 
@@ -89,11 +102,23 @@ missing or has no `plugin test` fails the two tests; it does not skip them.
 The checks above show what the mod returns to the engine, not what the terminal
 paints. Whether the rows vanish cleanly, with no blank lines left behind, and
 whether the toggle redraws rows already on screen, needs an interactive session.
-That check is pending the owner's first interactive try.
+
+The owner helper tried it on 10-10, on Claude Code 2.1.296, in two throwaway
+interactive sessions. With the mod, the folded `Ran 1 shell command` row is
+hidden and the assistant text stays. `/clean-view` shows in the command list and
+brings the row back. Blank lines and the redraw of rows already on screen were
+not part of that try and are still unchecked.
 
 ### Known side effect
 
-By the engine's documentation, an interactive `--plugin-dir` session writes
-editor types into `tools/claude-mods/clean-view/.claude-plugin/types/`. The team
-has not observed this, because the non-interactive checks do not do it. The
-files are untracked and safe to delete.
+An interactive `--plugin-dir` session writes editor files into the mod folder.
+The non-interactive checks do not. An interactive session on 10-10 left two
+things in `tools/claude-mods/clean-view/`:
+
+- `tsconfig.json` at the mod root. It is one line that extends
+  `./.claude-plugin/types/tsconfig.json`.
+- `.claude-plugin/types/`, the editor types. The folder carries its own
+  `.gitignore`.
+
+Git ignores both, so `git status` stays clean afterwards. The root `.gitignore`
+covers `tools/claude-mods/*/tsconfig.json`. The files are safe to delete.

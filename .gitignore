@@ -27,3 +27,5 @@ dist-static-before-*/
 /Screenshot *.png
 /hub/tailterm-hub
 /hub/tt
+# Written by an interactive Claude Code --plugin-dir session (docs/claude-mods.md).
+tools/claude-mods/*/tsconfig.json

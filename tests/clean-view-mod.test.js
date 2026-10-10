@@ -20,7 +20,7 @@ const MOD = "tools/claude-mods/clean-view";
 const MOD_DIR = join(ROOT, MOD);
 const COMPONENTS = ["ToolUse", "ToolResult", "ToolGroup", "ToolProgress"];
 // Where a launch or setup path would have to name the mod to load it.
-const LAUNCH_PATHS = ["hub", "scripts", "client", "src", "package.json"];
+const LAUNCH_PATHS = ["hub", "scripts", "client", "server", "shared", "package.json"];
 const OPTED_IN = process.env.CLEAN_VIEW_CLAUDE_CHECK === "1";
 const NOT_OPTED_IN = "depends on the installed Claude Code; set CLEAN_VIEW_CLAUDE_CHECK=1 to run it";
 
