@@ -41,7 +41,7 @@ Class, code and status together are the exact error class. No provider message, 
 
 ## Notifications
 
-A block from its first report until the agent reports another state is one episode. A replayed report, a flap that returns with the same class and `since`, and a relay restart all find the same episode and notify no one again.
+A block from its first report until the agent reports a completed or running turn (`working`, `idle` or `finished_silent`) is one episode. An unknown probe, a crash, a stall state or a runtime prompt says nothing about the provider and leaves the episode open, so it still gets its ping and its recovery wake. A replayed report, a flap that returns with the same class and `since`, and a relay restart all find the same episode and notify no one again.
 
 - **Item lead**: one directed notice when the episode opens, naming the agent, provider, class, model, `since` and the recovery action. A blocked lead is not told about itself.
 - **Owner**: one notice per episode, sent by the broker tick once the episode is 90 seconds old (`TAILTERM_PROVIDER_BLOCK_GRACE`, 1 to 3600 seconds, on the hub). A block that still needs action pings the owner on Discord (`refs.escalation=owner`) and names the fix and the host, for example "run /login in any Claude session on mini". That includes a block whose run ended meanwhile, because the cause is still there for the next agent on that host. An episode that cleared inside the grace still gets its notice, which says it has cleared and is recorded without a ping. The ping is promised within five minutes of the block; a grace above about 240 seconds breaks that.
@@ -53,8 +53,8 @@ The grace period is what makes the outage a single notice: reports arrive one ag
 
 When an agent with an open `auth` episode reports a completed or running turn (`working`, `idle` or `finished_silent`), its login works again. In the same transaction the hub looks for other live agents of the same project, runtime and host that still have an open `auth` episode.
 
-- Each one that is online, in a project that is not paused, gets one directed notice, "Provider login restored; resume your work". A directed notice queues an ordinary broker wake job, so the relay prompts the agent without anyone typing into its terminal.
-- The owner gets one notice, "Provider login restored on a host", naming the host, the runtime, the agents woken and the sessions that were not woken, with the reason (offline, or project paused). It pings only when a session still needs a prompt typed.
+- Each one whose wake the relay can lease (online, not a deployment agent, not held past its token estimate, in a project that is not paused) gets one directed notice, "Provider login restored; resume your work". A directed notice queues an ordinary broker wake job, so the relay prompts the agent without anyone typing into its terminal.
+- The owner gets one notice, "Provider login restored on a host", naming the host, the runtime, the agents woken and the sessions that were not woken, with the reason (project paused, deployment agent, offline, or held past its token estimate). It pings only when a session still needs a prompt typed.
 - Each episode is woken at most once (table `provider_block_recoveries`), so a woken agent's own recovery starts no second round. With no other blocked agent nothing is posted.
 - Other classes, other hosts, other runtimes and other projects are not woken. Agents of another project on that host are woken when an agent of their own project recovers.
 - If a woken agent's login is still expired (the recovery was on a different account), its wake fails, it stays blocked and its episode keeps the ping it already had.
@@ -72,7 +72,7 @@ Nothing logs in or switches a model. After an `auth` block clears on one agent, 
 | `rate_limited` | Wait and prompt the agent again; run fewer agents in parallel if it repeats. | The same. |
 | `server_error` | Check the provider's status and prompt the agent again when it recovers. | The same. |
 
-After the fix, prompt the agent again. Its next successful reply clears the block. For `auth`, one agent's successful reply is enough: the hub wakes the others, and a manual prompt is still needed only for the sessions the owner notice names (offline, or in a paused project) and for an agent with nothing recovered beside it.
+After the fix, prompt the agent again. Its next successful reply clears the block. For `auth`, one agent's successful reply is enough: the hub wakes the others, and a manual prompt is still needed only for the sessions the owner notice names and for an agent with nothing recovered beside it.
 
 Automatic model fallback is not built. Whether the harness may switch a blocked agent to another model, to which model, and who may apply it, is an owner decision (#19856); until the owner decides, recovery is manual.
 

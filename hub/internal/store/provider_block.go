@@ -104,11 +104,18 @@ func providerBlockText(p api.ProviderBlock) string {
 // providerBlockHook runs in the activity report transaction. A provider_blocked
 // report opens an episode and tells the item lead once; replays, flaps back to
 // the same class and since, and relay restarts find the row and post nothing.
-// A report in any other state clears the run's open episodes.
+// Only a completed or running turn (working, idle, finished_silent) clears the
+// run's open episodes; an unknown probe, a crash or a runtime prompt says
+// nothing about the provider and leaves them open.
 func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	now := ts(s.now())
 	p := activity.Provider
 	if activity.State != "provider_blocked" || p == nil {
+		switch activity.State {
+		case "working", "idle", "finished_silent":
+		default:
+			return nil
+		}
 		var runtime string
 		err := tx.QueryRowContext(ctx, `SELECT runtime FROM provider_block_episodes WHERE agent_id=? AND run_id=? AND cleared_at='' AND class=? LIMIT 1`, agent, run, api.ProviderBlockAuth).Scan(&runtime)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -117,13 +124,9 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 		if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE agent_id=? AND run_id=? AND cleared_at=''`, now, agent, run); err != nil {
 			return err
 		}
-		// A completed or running turn after an auth block means the login
-		// works again; a runtime prompt, an unknown probe or a crash does not.
-		switch activity.State {
-		case "working", "idle", "finished_silent":
-			if runtime != "" {
-				return s.providerRecoveryWake(ctx, tx, task, agent, runtime)
-			}
+		// A turn after an auth block means the login works again.
+		if runtime != "" {
+			return s.providerRecoveryWake(ctx, tx, task, agent, runtime)
 		}
 		return nil
 	}
@@ -461,12 +464,25 @@ func (s *Store) providerRecoveryWake(ctx context.Context, tx *sql.Tx, task, agen
 		if err != nil {
 			return err
 		}
+		// Only an agent whose wake job the relay can lease counts as woken
+		// (createObligations, LeaseWakeJob); the rest are named with the reason.
+		held, err := budgetHeldRun(ctx, tx, task, to.ID, to.RunID)
+		if err != nil {
+			return err
+		}
+		reason := ""
 		switch {
 		case paused:
-			manual = append(manual, to.Name+" (project paused)")
-			continue
+			reason = "project paused"
+		case to.Role == api.AgentRoleDeployment:
+			reason = "deployment agent, takes no wake"
 		case !agentOnlineAt(to, now):
-			manual = append(manual, to.Name+" (offline)")
+			reason = "offline"
+		case held:
+			reason = "held past its token estimate"
+		}
+		if reason != "" {
+			manual = append(manual, fmt.Sprintf("%s (%s)", to.Name, reason))
 			continue
 		}
 		text := fmt.Sprintf("The %s login on %s works again: %s completed a turn after its auth block. Your turns were failing for the same reason. Continue the turn that was interrupted, then run `tt obligations` and `tt inbox --unread --mark-read` for anything that arrived meanwhile.", runtime, recovered.Host, recovered.Name)
