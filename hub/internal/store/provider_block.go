@@ -17,7 +17,10 @@ import (
 // Provider blocks (docs/provider-blocked.md). An episode is one run of
 // provider failures of one class for one agent run. The item lead hears of a
 // new episode at once; the owner hears after a grace period, so agents of one
-// runtime that block together become a single outage notice.
+// runtime that block together become a single outage notice. A notice that
+// still needs the owner carries escalation=owner, which the Discord bridge
+// turns into a ping. When an auth block clears, the agents of that runtime and
+// host that are still blocked are woken.
 
 func migrateProviderBlock(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS provider_block_episodes (
@@ -32,14 +35,18 @@ CREATE TABLE IF NOT EXISTS provider_outages (
  id TEXT PRIMARY KEY, task_id TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT NOT NULL,
  opened_at TEXT NOT NULL, closed_at TEXT NOT NULL DEFAULT '', notice_seq INTEGER NOT NULL DEFAULT 0,
  agent_count INTEGER NOT NULL DEFAULT 0);
-CREATE UNIQUE INDEX IF NOT EXISTS provider_outages_open ON provider_outages(task_id,runtime) WHERE closed_at='';`)
+CREATE UNIQUE INDEX IF NOT EXISTS provider_outages_open ON provider_outages(task_id,runtime) WHERE closed_at='';
+CREATE TABLE IF NOT EXISTS provider_block_recoveries (
+ episode_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);`)
 	return err
 }
 
 const (
-	providerBlockLeadSubject   = "An agent is blocked by its provider"
-	providerBlockOwnerSubject  = "An agent is blocked by its provider and needs the owner"
-	providerBlockOutageSubject = "Provider outage is blocking every active agent of one runtime"
+	providerBlockLeadSubject     = "An agent is blocked by its provider"
+	providerBlockOwnerSubject    = "An agent is blocked by its provider and needs the owner"
+	providerBlockOutageSubject   = "Provider outage is blocking every active agent of one runtime"
+	providerRecoveryWakeSubject  = "Provider login restored; resume your work"
+	providerRecoveryOwnerSubject = "Provider login restored on a host"
 
 	providerOwnerPending = "pending"
 	providerOwnerAgent   = "agent"
@@ -59,8 +66,9 @@ func providerBlockGrace() time.Duration {
 }
 
 // providerBlockRecovery is the manual recovery for a class (the table in
-// docs/provider-blocked.md). Nothing is switched or typed automatically.
-func providerBlockRecovery(runtime, class string) string {
+// docs/provider-blocked.md), naming the host where a login is needed. Nothing
+// logs in or switches a model automatically.
+func providerBlockRecovery(runtime, class, host string) string {
 	switch class {
 	case api.ProviderBlockUsageLimit:
 		if runtime == "codex" {
@@ -69,9 +77,9 @@ func providerBlockRecovery(runtime, class string) string {
 		return "wait for the reset, or run /model in the agent's terminal to pick a model with quota, or /usage-credits"
 	case api.ProviderBlockAuth:
 		if runtime == "codex" {
-			return "run codex login on the host, then resume the agent"
+			return fmt.Sprintf("run codex login on %s, then prompt the agent again", host)
 		}
-		return "run /login in the agent's terminal"
+		return fmt.Sprintf("run /login in any Claude session on %s; one login restores every Claude agent on that host", host)
 	case api.ProviderBlockRateLimited:
 		return "wait and prompt the agent again; run fewer agents in parallel if it repeats"
 	}
@@ -101,16 +109,28 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 	now := ts(s.now())
 	p := activity.Provider
 	if activity.State != "provider_blocked" || p == nil {
-		_, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE agent_id=? AND run_id=? AND cleared_at=''`, now, agent, run)
-		return err
+		var runtime string
+		err := tx.QueryRowContext(ctx, `SELECT runtime FROM provider_block_episodes WHERE agent_id=? AND run_id=? AND cleared_at='' AND class=? LIMIT 1`, agent, run, api.ProviderBlockAuth).Scan(&runtime)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE agent_id=? AND run_id=? AND cleared_at=''`, now, agent, run); err != nil {
+			return err
+		}
+		// A completed or running turn after an auth block means the login
+		// works again; a runtime prompt, an unknown probe or a crash does not.
+		switch activity.State {
+		case "working", "idle", "finished_silent":
+			if runtime != "" {
+				return s.providerRecoveryWake(ctx, tx, task, agent, runtime)
+			}
+		}
+		return nil
 	}
+	// The owner helper opens an episode like any agent: the owner may be away.
 	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agent))
 	if err != nil {
 		return err
-	}
-	// The owner helper is the owner's own session; the owner already sees it.
-	if a.Role == api.AgentRoleOwnerHelper {
-		return nil
 	}
 	since := ts(p.Since)
 	// A change of class or since ends the earlier episode of this run.
@@ -159,7 +179,7 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 	}
 	refs := map[string]string{"agent": agent, "run": run, "activity": activity.State, "item": item, "provider": p.Provider, "providerClass": p.Class}
 	text := fmt.Sprintf("%s is blocked by its provider: %s. Its turns fail until this is fixed; it is not stalled or crashed. Recovery: %s. Nothing is switched automatically (docs/provider-blocked.md).",
-		a.Name, providerBlockText(*p), providerBlockRecovery(p.Runtime, p.Class))
+		a.Name, providerBlockText(*p), providerBlockRecovery(p.Runtime, p.Class, a.Host))
 	if err := s.postBrokerNotice(ctx, tx, project, lead, lead.Name, providerBlockLeadSubject, providerBlockLeadSubject, text, refs); err != nil {
 		return err
 	}
@@ -169,6 +189,7 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 
 type providerEpisode struct {
 	id, agentID, runID, name string
+	host                     string
 	block                    api.ProviderBlock
 	openedAt                 time.Time
 	cleared, live            bool
@@ -218,7 +239,7 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		return 0, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.agent_id,e.run_id,a.name,e.provider,e.model,e.class,e.code,e.status,e.since,e.opened_at,e.cleared_at<>'',
+	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.agent_id,e.run_id,a.name,a.host,e.provider,e.model,e.class,e.code,e.status,e.since,e.opened_at,e.cleared_at<>'',
  a.run_id=e.run_id AND `+liveAgentFilter+` FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id
  WHERE e.task_id=? AND e.runtime=? AND e.owner_state=? ORDER BY e.opened_at,e.id`, task, runtime, providerOwnerPending)
 	if err != nil {
@@ -228,7 +249,7 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 	for rows.Next() {
 		e := providerEpisode{block: api.ProviderBlock{Runtime: runtime}}
 		var since, opened string
-		if err := rows.Scan(&e.id, &e.agentID, &e.runID, &e.name, &e.block.Provider, &e.block.Model, &e.block.Class, &e.block.Code, &e.block.Status, &since, &opened, &e.cleared, &e.live); err != nil {
+		if err := rows.Scan(&e.id, &e.agentID, &e.runID, &e.name, &e.host, &e.block.Provider, &e.block.Model, &e.block.Class, &e.block.Code, &e.block.Status, &since, &opened, &e.cleared, &e.live); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -311,19 +332,22 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 			// heard about while a peer was still working.
 			classes := map[string]bool{}
 			names := map[string]bool{}
+			hosts := map[string]bool{}
+			fixes := map[string]bool{}
 			var earliest time.Time
-			open, err := tx.QueryContext(ctx, `SELECT a.name,e.class,e.since FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+			open, err := tx.QueryContext(ctx, `SELECT a.name,a.host,e.class,e.since FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
  WHERE e.task_id=? AND e.runtime=? AND e.cleared_at='' AND `+liveAgentFilter, task, runtime)
 			if err != nil {
 				return 0, err
 			}
 			for open.Next() {
-				var name, class, since string
-				if err := open.Scan(&name, &class, &since); err != nil {
+				var name, host, class, since string
+				if err := open.Scan(&name, &host, &class, &since); err != nil {
 					open.Close()
 					return 0, err
 				}
-				classes[class], names[name] = true, true
+				classes[class], names[name], hosts[host] = true, true, true
+				fixes[providerBlockRecovery(runtime, class, host)] = true
 				if at := parseTS(since); earliest.IsZero() || at.Before(earliest) {
 					earliest = at
 				}
@@ -332,9 +356,11 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 				return 0, err
 			}
 			provider := pending[0].block.Provider
-			text := fmt.Sprintf("Provider outage for runtime %s (%s): %d agents are blocked and none of that runtime is working. Classes: %s. Earliest failure %s. Agents: %s. This is one notice for the runtime; agents that block while it lasts are added without another. Recovery per class is in docs/provider-blocked.md; nothing is switched automatically.",
-				runtime, provider, blocked, strings.Join(sortedKeys(classes), ", "), earliest.UTC().Format(time.RFC3339), strings.Join(sortedKeys(names), ", "))
-			refs := map[string]string{"activity": "provider_blocked", "runtime": runtime, "provider": provider, "outage": outage, "recipientKind": "owner"}
+			// The fix and the host come first: the Discord ping shows only the
+			// start of a long notice.
+			text := fmt.Sprintf("Fix on %s: %s. Provider outage for runtime %s (%s): %d agents are blocked and none of that runtime is working. Classes: %s. Earliest failure %s. Agents: %s. This is one notice for the runtime; agents that block while it lasts are added without another. Nothing is switched automatically (docs/provider-blocked.md).",
+				providerNameList(sortedKeys(hosts), 120), truncateRunes(strings.Join(sortedKeys(fixes), "; "), 600), runtime, provider, blocked, strings.Join(sortedKeys(classes), ", "), earliest.UTC().Format(time.RFC3339), providerNameList(sortedKeys(names), 2000))
+			refs := map[string]string{"activity": "provider_blocked", "runtime": runtime, "provider": provider, "outage": outage, "recipientKind": "owner", "escalation": "owner"}
 			if err := s.postBrokerNotice(ctx, tx, project, api.Agent{}, "", providerBlockOutageSubject, providerBlockOutageSubject, text, refs); err != nil {
 				return 0, err
 			}
@@ -352,16 +378,22 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 			if now.Before(e.openedAt.Add(providerBlockGrace())) {
 				continue
 			}
-			text := fmt.Sprintf("%s is blocked by its provider: %s.", e.name, providerBlockText(e.block))
+			text := fmt.Sprintf("%s on %s is blocked by its provider: %s.", e.name, e.host, providerBlockText(e.block))
+			refs := map[string]string{"agent": e.agentID, "run": e.runID, "activity": "provider_blocked", "provider": e.block.Provider, "providerClass": e.block.Class, "recipientKind": "owner"}
+			// A block that already cleared is recorded without a ping. Any other
+			// still needs the owner, a run that ended while blocked included:
+			// the cause is still there for the next agent on that host.
+			recovery := providerBlockRecovery(runtime, e.block.Class, e.host)
 			switch {
 			case e.cleared:
 				text = fmt.Sprintf("%s was blocked by its provider: %s. The block has already cleared; no action is needed.", e.name, providerBlockText(e.block))
 			case !e.live:
-				text += " That run has since ended."
+				text += fmt.Sprintf(" That run has since ended. Recovery: %s. Nothing is switched automatically (docs/provider-blocked.md).", recovery)
+				refs["escalation"] = "owner"
 			default:
-				text += fmt.Sprintf(" Its turns fail until this is fixed. Recovery: %s. Nothing is switched automatically (docs/provider-blocked.md).", providerBlockRecovery(runtime, e.block.Class))
+				text += fmt.Sprintf(" Its turns fail until this is fixed. Recovery: %s. Nothing is switched automatically (docs/provider-blocked.md).", recovery)
+				refs["escalation"] = "owner"
 			}
-			refs := map[string]string{"agent": e.agentID, "run": e.runID, "activity": "provider_blocked", "provider": e.block.Provider, "providerClass": e.block.Class, "recipientKind": "owner"}
 			if err := s.postBrokerNotice(ctx, tx, project, api.Agent{}, "", providerBlockOwnerSubject, providerBlockOwnerSubject, text, refs); err != nil {
 				return 0, err
 			}
@@ -378,6 +410,103 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		s.notify(task)
 	}
 	return posted, nil
+}
+
+// providerRecoveryWake runs when an auth block has cleared on agent: its login
+// works again, so the other agents of the project, runtime and host that are
+// still blocked by auth are woken with a directed notice (an ordinary broker
+// wake job), and the owner is told which were woken and which sessions need a
+// prompt typed. Each episode is woken at most once, so a woken agent's own
+// recovery starts no second round.
+func (s *Store) providerRecoveryWake(ctx context.Context, tx *sql.Tx, task, agent, runtime string) error {
+	recovered, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agent))
+	if err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.agent_id FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+ WHERE e.task_id=? AND e.runtime=? AND e.class=? AND e.cleared_at='' AND a.host=? AND a.id<>? AND `+liveAgentFilter+`
+ AND NOT EXISTS (SELECT 1 FROM provider_block_recoveries r WHERE r.episode_id=e.id) ORDER BY a.name,e.id`, task, runtime, api.ProviderBlockAuth, recovered.Host, agent)
+	if err != nil {
+		return err
+	}
+	type target struct{ episode, agent string }
+	var targets []target
+	for rows.Next() {
+		var t target
+		if err := rows.Scan(&t.episode, &t.agent); err != nil {
+			rows.Close()
+			return err
+		}
+		targets = append(targets, t)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	project, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE tasks.id=?`, task))
+	if err != nil {
+		return err
+	}
+	// A wake job is leased only in an open, active project (LeaseWakeJob).
+	paused := project.Status != api.TaskOpen || (project.PauseState != "" && project.PauseState != api.ProjectPauseActive)
+	now := s.now()
+	var woken, manual []string
+	for _, t := range targets {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO provider_block_recoveries(episode_id,task_id,created_at) VALUES(?,?,?)`, t.episode, task, ts(now)); err != nil {
+			return err
+		}
+		to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, t.agent))
+		if err != nil {
+			return err
+		}
+		switch {
+		case paused:
+			manual = append(manual, to.Name+" (project paused)")
+			continue
+		case !agentOnlineAt(to, now):
+			manual = append(manual, to.Name+" (offline)")
+			continue
+		}
+		text := fmt.Sprintf("The %s login on %s works again: %s completed a turn after its auth block. Your turns were failing for the same reason. Continue the turn that was interrupted, then run `tt obligations` and `tt inbox --unread --mark-read` for anything that arrived meanwhile.", runtime, recovered.Host, recovered.Name)
+		refs := map[string]string{"activity": "provider_recovered", "agent": to.ID, "run": to.RunID, "runtime": runtime, "host": recovered.Host}
+		if err := s.postBrokerNotice(ctx, tx, project, to, to.Name, providerRecoveryWakeSubject, providerRecoveryWakeSubject, text, refs); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE provider_block_recoveries SET notice_seq=(SELECT max(seq) FROM messages WHERE task_id=?) WHERE episode_id=?`, task, t.episode); err != nil {
+			return err
+		}
+		woken = append(woken, to.Name)
+	}
+	text := fmt.Sprintf("The %s login on %s works again (%s completed a turn after its auth block).", runtime, recovered.Host, recovered.Name)
+	refs := map[string]string{"activity": "provider_recovered", "runtime": runtime, "host": recovered.Host, "recipientKind": "owner"}
+	if len(manual) > 0 {
+		text += fmt.Sprintf(" These sessions were not woken and need a prompt typed in their terminal: %s.", providerNameList(manual, 1500))
+		refs["escalation"] = "owner"
+	}
+	if len(woken) > 0 {
+		text += fmt.Sprintf(" Woken by the hub, no action needed: %s.", providerNameList(woken, 1500))
+	}
+	text += " An agent whose turns still fail stays blocked and keeps its own notice."
+	return s.postBrokerNotice(ctx, tx, project, api.Agent{}, "", providerRecoveryOwnerSubject, providerRecoveryOwnerSubject, text, refs)
+}
+
+// providerNameList joins names, stopping before budget bytes so a notice
+// naming many agents stays inside the envelope body limit.
+func providerNameList(names []string, budget int) string {
+	var b strings.Builder
+	for i, name := range names {
+		if i > 0 && b.Len()+len(name)+2 > budget {
+			fmt.Fprintf(&b, " and %d more", len(names)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(name)
+	}
+	return b.String()
 }
 
 func sortedKeys(m map[string]bool) []string {

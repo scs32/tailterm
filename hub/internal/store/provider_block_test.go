@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -114,6 +115,37 @@ func (f *providerFixture) lastText(subject string) string {
 		f.t.Fatal(err)
 	}
 	return text
+}
+
+// lastRef is a ref of the newest notice with subject, or "" when it has none.
+func (f *providerFixture) lastRef(subject, ref string) string {
+	f.t.Helper()
+	var value string
+	if err := f.s.db.QueryRow(`SELECT COALESCE(json_extract(envelope,'$.refs.'||?),'') FROM messages WHERE task_id=? AND envelope<>'' AND json_extract(envelope,'$.subject')=? ORDER BY seq DESC LIMIT 1`, ref, f.task.ID, subject).Scan(&value); err != nil {
+		f.t.Fatal(err)
+	}
+	return value
+}
+
+func (f *providerFixture) helper(name, runtime string) api.Agent {
+	f.t.Helper()
+	a := f.agent(name, runtime, -1)
+	if _, err := f.s.db.Exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleOwnerHelper, a.ID); err != nil {
+		f.t.Fatal(err)
+	}
+	return a
+}
+
+// seen sets an agent's heartbeat to now (online) or to an hour ago (offline).
+func (f *providerFixture) seen(a api.Agent, online bool) {
+	f.t.Helper()
+	at := f.clock
+	if !online {
+		at = at.Add(-time.Hour)
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(at), a.ID); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 func TestProviderBlockLeadNotice(t *testing.T) {
@@ -229,17 +261,32 @@ func TestProviderBlockOwnerNotice(t *testing.T) {
 		t.Fatalf("first owner notice: swept %d", n)
 	}
 	text := f.lastText(providerBlockOwnerSubject)
-	for _, part := range []string{"reviewer", "anthropic usage_limit", "model claude-fable-5-1", "Recovery:", "Nothing is switched automatically"} {
+	for _, part := range []string{"reviewer on mini", "anthropic usage_limit", "model claude-fable-5-1", "Recovery:", "Nothing is switched automatically"} {
 		if !strings.Contains(text, part) {
 			t.Fatalf("owner notice lacks %q: %s", part, text)
 		}
 	}
+	// An open block on a live run needs the owner: the notice is a ping.
+	if got := f.lastRef(providerBlockOwnerSubject, "escalation"); got != "owner" {
+		t.Fatalf("owner notice escalation ref %q", got)
+	}
+	// A second sweep and a replayed report post no second notice.
 	if n := f.sweep(); n != 0 {
 		t.Fatalf("second sweep posted %d", n)
+	}
+	if err := f.report(first, "block-1", api.AgentActivity{State: "provider_blocked", Provider: providerBlock("claude", "usage_limit", f.clock.Add(-91*time.Second))}); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.sweep(); n != 0 || f.notices(providerBlockOwnerSubject, "") != 1 {
+		t.Fatalf("replayed report posted %d", n)
 	}
 	f.advance(10 * time.Second)
 	if n := f.sweep(); n != 1 || f.notices(providerBlockOwnerSubject, "") != 2 || !strings.Contains(f.lastText(providerBlockOwnerSubject), "verifier") {
 		t.Fatalf("second agent's owner notice: swept %d", n)
+	}
+	// An expired login names the fix and the host it is run on.
+	if text := f.lastText(providerBlockOwnerSubject); !strings.Contains(text, "run /login in any Claude session on mini") || f.lastRef(providerBlockOwnerSubject, "escalation") != "owner" {
+		t.Fatalf("auth owner notice: %s", text)
 	}
 	f.advance(time.Hour)
 	if n := f.sweep(); n != 0 || f.notices(providerBlockOwnerSubject, "") != 2 || f.notices(providerBlockOutageSubject, "") != 0 {
@@ -255,6 +302,21 @@ func TestProviderBlockOwnerNotice(t *testing.T) {
 	if n := f.sweep(); n != 1 || !strings.Contains(f.lastText(providerBlockOwnerSubject), "planner was blocked") || !strings.Contains(f.lastText(providerBlockOwnerSubject), "already cleared") {
 		t.Fatalf("cleared episode notice: swept %d: %s", n, f.lastText(providerBlockOwnerSubject))
 	}
+	// Nothing is left to do, so the cleared notice is no ping.
+	if got := f.lastRef(providerBlockOwnerSubject, "escalation"); got != "" {
+		t.Fatalf("cleared notice escalation ref %q", got)
+	}
+	// A run that ended while blocked still pings: the login is still expired
+	// on that host for the next agent.
+	fourth := f.agent("builder", "claude", 1)
+	f.block(fourth, "claude", "auth")
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='closed' WHERE id=?`, fourth.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(91 * time.Second)
+	if n := f.sweep(); n != 1 || !strings.Contains(f.lastText(providerBlockOwnerSubject), "That run has since ended. Recovery: run /login in any Claude session on mini") || f.lastRef(providerBlockOwnerSubject, "escalation") != "owner" {
+		t.Fatalf("ended run notice: swept %d ref %q: %s", n, f.lastRef(providerBlockOwnerSubject, "escalation"), f.lastText(providerBlockOwnerSubject))
+	}
 	// The grace period is configurable and bounded.
 	t.Setenv("TAILTERM_PROVIDER_BLOCK_GRACE", "300")
 	if providerBlockGrace() != 300*time.Second {
@@ -264,14 +326,164 @@ func TestProviderBlockOwnerNotice(t *testing.T) {
 	if providerBlockGrace() != 90*time.Second {
 		t.Fatal("grace override not bounded")
 	}
-	// The owner helper is the owner's own session and opens no episode.
-	helper := f.agent("owner-helper", "claude", -1)
-	if _, err := f.s.db.Exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleOwnerHelper, helper.ID); err != nil {
+}
+
+// p2 (wi_1ef7c41da8711d4b): the owner helper's block opens an episode like any
+// agent's, and the owner notice comes from the sweep, not from the helper.
+func TestProviderBlockOwnerHelperEpisode(t *testing.T) {
+	f := newProviderFixture(t)
+	f.state(f.leads[0], "working") // a working Claude peer: not an outage
+	helper := f.helper("owner-helper", "claude")
+	f.block(helper, "claude", "auth")
+	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, helper.ID); n != 1 {
+		t.Fatalf("owner helper episodes %d", n)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=? AND from_node=?`, f.task.ID, api.BrokerNode); n != 0 {
+		t.Fatalf("notices at once for an unbound helper: %d", n)
+	}
+	f.advance(60 * time.Second)
+	if n := f.sweep(); n != 0 {
+		t.Fatalf("notice inside the grace period: %d", n)
+	}
+	f.advance(31 * time.Second)
+	if n := f.sweep(); n != 1 || f.notices(providerBlockOwnerSubject, "") != 1 {
+		t.Fatalf("owner helper notice: swept %d", n)
+	}
+	if text, ref := f.lastText(providerBlockOwnerSubject), f.lastRef(providerBlockOwnerSubject, "escalation"); ref != "owner" || !strings.Contains(text, "owner-helper on mini") || !strings.Contains(text, "run /login in any Claude session on mini") {
+		t.Fatalf("owner helper notice ref %q: %s", ref, text)
+	}
+	f.advance(time.Hour)
+	if n := f.sweep(); n != 0 || f.notices(providerBlockOwnerSubject, "") != 1 {
+		t.Fatalf("later sweep posted %d", n)
+	}
+
+	// The helper and one more blocked agent of its runtime, none working: one
+	// outage notice that names both.
+	g := newProviderFixture(t)
+	helper = g.helper("owner-helper", "claude")
+	peer := g.agent("reviewer", "claude", 0)
+	g.block(helper, "claude", "auth")
+	g.advance(20 * time.Second)
+	g.block(peer, "claude", "auth")
+	g.advance(71 * time.Second)
+	if n := g.sweep(); n != 1 || g.notices(providerBlockOutageSubject, "") != 1 || g.notices(providerBlockOwnerSubject, "") != 0 {
+		t.Fatalf("helper outage: swept %d outage=%d per-agent=%d", n, g.notices(providerBlockOutageSubject, ""), g.notices(providerBlockOwnerSubject, ""))
+	}
+	if text, ref := g.lastText(providerBlockOutageSubject), g.lastRef(providerBlockOutageSubject, "escalation"); ref != "owner" || !strings.Contains(text, "owner-helper, reviewer") {
+		t.Fatalf("helper outage notice ref %q: %s", ref, text)
+	}
+	g.advance(time.Hour)
+	if n := g.sweep(); n != 0 || g.notices(providerBlockOutageSubject, "") != 1 || g.notices(providerBlockOwnerSubject, "") != 0 {
+		t.Fatalf("helper outage repeat sweep posted %d", n)
+	}
+}
+
+// p3 (wi_1ef7c41da8711d4b): when an auth block clears on one agent, the other
+// agents of that runtime and host that are still blocked are woken once, and
+// the owner is told which sessions the hub could not wake.
+func TestProviderBlockRecoveryWake(t *testing.T) {
+	f := newProviderFixture(t)
+	first := f.agent("reviewer", "claude", 0)
+	online := f.agent("verifier", "claude", 0)
+	offline := f.agent("planner", "claude", 1)
+	elsewhere := f.agent("builder-air", "claude", 1)
+	if _, err := f.s.db.Exec(`UPDATE agents SET host='air' WHERE id=?`, elsewhere.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.block(helper, "claude", "usage_limit")
-	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=?`, helper.ID); n != 0 {
-		t.Fatalf("owner helper episodes %d", n)
+	codex := f.agent("codex-0", "codex", 0)
+	limited := f.agent("builder", "claude", 0)
+	for _, a := range []api.Agent{first, online, offline, elsewhere} {
+		f.block(a, "claude", "auth")
+	}
+	f.block(codex, "codex", "auth")
+	f.block(limited, "claude", "usage_limit")
+	f.advance(10 * time.Minute)
+	for _, a := range []api.Agent{first, online, elsewhere, codex, limited} {
+		f.seen(a, true)
+	}
+	f.seen(offline, false)
+	wakes := func(a api.Agent) int {
+		return countRows(t, f.s, `SELECT count(*) FROM wake_jobs w JOIN obligations o ON o.id=w.obligation_id WHERE w.agent_id=? AND w.state=? AND o.subject=?`, a.ID, wakePending, providerRecoveryWakeSubject)
+	}
+	before := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+
+	f.state(first, "working")
+	if n := f.notices(providerRecoveryWakeSubject, online.ID); n != 1 || wakes(online) != 1 {
+		t.Fatalf("online peer: notices=%d wake jobs=%d", n, wakes(online))
+	}
+	if got := f.lastRef(providerRecoveryWakeSubject, "activity"); got != "provider_recovered" {
+		t.Fatalf("wake notice activity ref %q", got)
+	}
+	for _, a := range []api.Agent{first, offline, elsewhere, codex, limited} {
+		if n := f.notices(providerRecoveryWakeSubject, a.ID); n != 0 || wakes(a) != 0 {
+			t.Fatalf("%s was woken: notices=%d wake jobs=%d", a.Name, n, wakes(a))
+		}
+	}
+	if n := f.notices(providerRecoveryOwnerSubject, ""); n != 1 {
+		t.Fatalf("owner recovery notices %d", n)
+	}
+	text := f.lastText(providerRecoveryOwnerSubject)
+	for _, part := range []string{"claude login on mini", "need a prompt typed in their terminal: planner (offline).", "Woken by the hub, no action needed: verifier."} {
+		if !strings.Contains(text, part) {
+			t.Fatalf("owner recovery notice lacks %q: %s", part, text)
+		}
+	}
+	for _, name := range []string{"builder-air", "codex-0", "builder,", "builder."} {
+		if strings.Contains(text, name) {
+			t.Fatalf("owner recovery notice names %q: %s", name, text)
+		}
+	}
+	if got := f.lastRef(providerRecoveryOwnerSubject, "escalation"); got != "owner" {
+		t.Fatalf("owner recovery escalation ref %q", got)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID); n != before+2 {
+		t.Fatalf("recovery posted %d messages, want 2", n-before)
+	}
+	// No cascade: the woken agent's own recovery, and a repeat by the first,
+	// post nothing more, even though the offline one is still blocked.
+	f.advance(time.Minute)
+	f.state(online, "working")
+	f.state(first, "idle")
+	f.state(first, "working")
+	if n := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID); n != before+2 {
+		t.Fatalf("second recovery posted %d more messages", n-before-2)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, offline.ID); n != 1 {
+		t.Fatalf("offline agent's episode: %d open", n)
+	}
+
+	// Every peer woken: the owner notice is a record, not a ping. A runtime
+	// prompt or an unknown probe is not recovery and wakes no one.
+	g := newProviderFixture(t)
+	a, b := g.agent("codex-0", "codex", 0), g.agent("codex-1", "codex", 0)
+	g.block(a, "codex", "auth")
+	g.block(b, "codex", "auth")
+	g.seen(b, true)
+	g.state(a, "unknown")
+	if n := g.notices(providerRecoveryWakeSubject, b.ID) + g.notices(providerRecoveryOwnerSubject, ""); n != 0 {
+		t.Fatalf("an unknown probe woke a peer: %d", n)
+	}
+	g.block(a, "codex", "auth")
+	g.state(a, "idle")
+	if wake, owner := g.notices(providerRecoveryWakeSubject, b.ID), g.notices(providerRecoveryOwnerSubject, ""); wake != 1 || owner != 1 {
+		t.Fatalf("codex recovery: wake=%d owner=%d", wake, owner)
+	}
+	if text, ref := g.lastText(providerRecoveryOwnerSubject), g.lastRef(providerRecoveryOwnerSubject, "escalation"); ref != "" || strings.Contains(text, "need a prompt") || !strings.Contains(text, "no action needed: codex-1.") {
+		t.Fatalf("all-woken owner notice ref %q: %s", ref, text)
+	}
+
+	// With no other blocked agent, and for a class other than auth, a
+	// recovery posts nothing.
+	h := newProviderFixture(t)
+	x, y := h.agent("reviewer", "claude", 0), h.agent("verifier", "claude", 0)
+	h.seen(y, true)
+	h.block(x, "claude", "auth")
+	h.state(x, "working")
+	h.block(x, "claude", "usage_limit")
+	h.block(y, "claude", "auth")
+	h.state(x, "working")
+	if n := countRows(t, h.s, `SELECT count(*) FROM messages WHERE task_id=? AND from_node=? AND json_extract(envelope,'$.refs.activity')='provider_recovered'`, h.task.ID, api.BrokerNode); n != 0 {
+		t.Fatalf("recovery notices without a blocked auth peer: %d", n)
 	}
 }
 
@@ -315,6 +527,14 @@ func TestProviderBlockOutage(t *testing.T) {
 	}
 	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE runtime='codex' AND owner_state='outage' AND outage_id<>''`); n != 3 {
 		t.Fatalf("episodes attached to the outage: %d", n)
+	}
+	// The one outage notice is the one ping, and it leads with the fix and
+	// the host, ahead of the bridge's cut.
+	if got := f.lastRef(providerBlockOutageSubject, "escalation"); got != "owner" {
+		t.Fatalf("outage escalation ref %q", got)
+	}
+	if head := text[:300]; !strings.HasPrefix(text, "Fix on mini: ") || !strings.Contains(head, "run codex login on mini") {
+		t.Fatalf("outage notice does not lead with the fix and host: %s", text)
 	}
 	// The blocked Claude agent is handled on its own.
 	f.advance(10 * time.Second)
@@ -379,6 +599,34 @@ func TestProviderBlockOutage(t *testing.T) {
 	}
 	if outage, agent := owner(); outage != 2 || agent != 3 {
 		t.Fatalf("working peer: outage=%d per-agent=%d", outage, agent)
+	}
+}
+
+// a2 (wi_1ef7c41da8711d4b): thirty agents blocked inside the grace period are
+// one outage notice whose body fits the envelope, with the fix still first.
+func TestProviderBlockOutageManyAgents(t *testing.T) {
+	f := newProviderFixture(t)
+	f.s.MaxAgents = 64 // room for thirty beside the fixture's leads
+	for i := 0; i < 30; i++ {
+		a := f.agent(fmt.Sprintf("reviewer-with-a-long-team-name-%02d", i), "claude", i%2)
+		f.block(a, "claude", "auth")
+		f.advance(time.Second)
+	}
+	f.advance(61 * time.Second)
+	if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 || f.notices(providerBlockOwnerSubject, "") != 0 {
+		t.Fatalf("outage sweep posted %d: outage=%d per-agent=%d", n, f.notices(providerBlockOutageSubject, ""), f.notices(providerBlockOwnerSubject, ""))
+	}
+	f.advance(5 * time.Minute)
+	if n := f.sweep(); n != 0 || f.notices(providerBlockOutageSubject, "") != 1 || f.notices(providerBlockOwnerSubject, "") != 0 {
+		t.Fatalf("later sweep posted %d", n)
+	}
+	text := f.lastText(providerBlockOutageSubject)
+	body, err := json.Marshal(api.EnvelopeBody{Text: text})
+	if err != nil || len(body) >= api.MaxEnvelopeBodyBytes {
+		t.Fatalf("outage body %d bytes (limit %d): %v", len(body), api.MaxEnvelopeBodyBytes, err)
+	}
+	if head := text[:300]; !strings.Contains(head, "Fix on mini: run /login in any Claude session on mini") || !strings.Contains(text, "30 agents") || !strings.Contains(text, "reviewer-with-a-long-team-name-29") {
+		t.Fatalf("outage notice: %s", text)
 	}
 }
 

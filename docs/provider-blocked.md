@@ -1,6 +1,6 @@
 # Provider-blocked agents
 
-Bug `wi_72f41bd375032cf0` revision 1, owner order #11854, plan request #19860, builder assignment #19880.
+Bug `wi_72f41bd375032cf0` revision 1, owner order #11854, plan request #19860, builder assignment #19880. The owner ping, the owner helper's episode and the wake after a restored login: bug `wi_1ef7c41da8711d4b` revision 2, owner order #31849, builder assignment #31882.
 
 On 2026-09-25 every Codex request failed with a 401 for about ninety minutes, and on 2026-09-26 a Claude reviewer hit a model usage limit before its first reply. Both looked idle. The relay activity monitor now reports a distinct state, `provider_blocked`, when the provider refuses an agent's requests. It is separate from the stall states (`stuck`, `hung_tool`, `looping`, `crashed`): the agent is healthy, and its turns fail until someone fixes the account, the login or the model.
 
@@ -44,25 +44,35 @@ Class, code and status together are the exact error class. No provider message, 
 A block from its first report until the agent reports another state is one episode. A replayed report, a flap that returns with the same class and `since`, and a relay restart all find the same episode and notify no one again.
 
 - **Item lead**: one directed notice when the episode opens, naming the agent, provider, class, model, `since` and the recovery action. A blocked lead is not told about itself.
-- **Owner**: one notice per episode, sent by the broker tick once the episode is 90 seconds old (`TAILTERM_PROVIDER_BLOCK_GRACE`, 1 to 3600 seconds, on the hub). An episode that cleared inside that time still gets its notice, which says it has cleared.
-- **Outage**: when, at that point, two or more live agents of one runtime in the project are blocked and none of that runtime is working, the owner gets one notice that names the runtime instead of one per agent. Every waiting episode of that runtime joins it, and agents that block while it lasts join without another notice. The outage lasts only while that condition holds. It ends when an agent in it recovers (a new completed or running turn), when a live agent of the runtime is working, or when no live agent of the runtime is blocked; a runtime prompt, an unknown probe or a crash is not recovery. A block that opens after it ended is judged afresh: it gets its own owner notice after the grace period, or one new outage notice if two or more are blocked and none is working again. The end is evaluated at the broker tick, so a block that opened during the outage but after the last tick before it ended is treated as a later one. Idle agents make no provider calls and count neither way. Agents of another runtime are handled separately.
+- **Owner**: one notice per episode, sent by the broker tick once the episode is 90 seconds old (`TAILTERM_PROVIDER_BLOCK_GRACE`, 1 to 3600 seconds, on the hub). A block that still needs action pings the owner on Discord (`refs.escalation=owner`) and names the fix and the host, for example "run /login in any Claude session on mini". That includes a block whose run ended meanwhile, because the cause is still there for the next agent on that host. An episode that cleared inside the grace still gets its notice, which says it has cleared and is recorded without a ping. The ping is promised within five minutes of the block; a grace above about 240 seconds breaks that.
+- **Outage**: the one outage notice is the one ping, and it states the fix and the host first. When, at that point, two or more live agents of one runtime in the project are blocked and none of that runtime is working, the owner gets one notice that names the runtime instead of one per agent. Every waiting episode of that runtime joins it, and agents that block while it lasts join without another notice. The outage lasts only while that condition holds. It ends when an agent in it recovers (a new completed or running turn), when a live agent of the runtime is working, or when no live agent of the runtime is blocked; a runtime prompt, an unknown probe or a crash is not recovery. A block that opens after it ended is judged afresh: it gets its own owner notice after the grace period, or one new outage notice if two or more are blocked and none is working again. The end is evaluated at the broker tick, so a block that opened during the outage but after the last tick before it ended is treated as a later one. Idle agents make no provider calls and count neither way. Agents of another runtime are handled separately.
 
-The grace period is what makes the outage a single notice: reports arrive one agent at a time, so an immediate owner notice would always go out per agent before the outage is visible. Paused projects are swept too. The owner helper is the owner's own session and opens no episode.
+The grace period is what makes the outage a single notice: reports arrive one agent at a time, so an immediate owner notice would always go out per agent before the outage is visible. Paused projects are swept too. The owner helper's block opens an episode like any agent's, because the owner may be away: the notice is posted by the hub and pinged by the bridge, and does not depend on the helper's session. The helper has no item, so no lead is told.
+
+### After a login is restored
+
+When an agent with an open `auth` episode reports a completed or running turn (`working`, `idle` or `finished_silent`), its login works again. In the same transaction the hub looks for other live agents of the same project, runtime and host that still have an open `auth` episode.
+
+- Each one that is online, in a project that is not paused, gets one directed notice, "Provider login restored; resume your work". A directed notice queues an ordinary broker wake job, so the relay prompts the agent without anyone typing into its terminal.
+- The owner gets one notice, "Provider login restored on a host", naming the host, the runtime, the agents woken and the sessions that were not woken, with the reason (offline, or project paused). It pings only when a session still needs a prompt typed.
+- Each episode is woken at most once (table `provider_block_recoveries`), so a woken agent's own recovery starts no second round. With no other blocked agent nothing is posted.
+- Other classes, other hosts, other runtimes and other projects are not woken. Agents of another project on that host are woken when an agent of their own project recovers.
+- If a woken agent's login is still expired (the recovery was on a different account), its wake fails, it stays blocked and its episode keeps the ping it already had.
 
 The state shows as `activity=provider_blocked` with a `provider-blocked provider=… model=… class=… status=… since=…` line in `tt agents`, as `activity=provider_blocked provider=… class=…` on the member line of `tt team queue list`, and as "Provider blocked: Anthropic usage limit · claude-fable-5-1 · since 11:53" in TailOS.
 
 ## Recovery
 
-Detection only notifies. Nothing types into an agent's terminal, switches a model or logs in.
+Nothing logs in or switches a model. After an `auth` block clears on one agent, the hub queues an ordinary broker wake for the others of that runtime and host (see "After a login is restored"); every other recovery is manual.
 
 | Class | Claude | Codex |
 | --- | --- | --- |
 | `usage_limit` | Wait for the reset, or run `/model` in the agent's terminal to pick a model with quota, or `/usage-credits`. | Answer the usage-limit prompt (see [runtime-prompts.md](runtime-prompts.md)). |
-| `auth` | Run `/login` in the agent's terminal. | Run `codex login` on the host, then resume the agent. |
+| `auth` | Run `/login` in any Claude session on the host; one login restores every Claude agent there. | Run `codex login` on the host, then prompt the agent again. |
 | `rate_limited` | Wait and prompt the agent again; run fewer agents in parallel if it repeats. | The same. |
 | `server_error` | Check the provider's status and prompt the agent again when it recovers. | The same. |
 
-After the fix, prompt the agent again. Its next successful reply clears the block.
+After the fix, prompt the agent again. Its next successful reply clears the block. For `auth`, one agent's successful reply is enough: the hub wakes the others, and a manual prompt is still needed only for the sessions the owner notice names (offline, or in a paused project) and for an agent with nothing recovered beside it.
 
 Automatic model fallback is not built. Whether the harness may switch a blocked agent to another model, to which model, and who may apply it, is an owner decision (#19856); until the owner decides, recovery is manual.
 
@@ -70,8 +80,9 @@ Automatic model fallback is not built. Whether the harness may switch a blocked 
 
 - A relay newer than the hub: the hub answers 400 to the new state once. The relay remembers that for the agent's run and reports the legacy form instead, which for Claude is `idle` or `finished_silent` with the turn-end reason and for Codex is `unknown` with reason `provider_blocked: <class>`. Later transitions are reported as usual.
 - A hub newer than the relay keeps accepting the legacy form. Handler arm limits accept both ([handler-ab.md](handler-ab.md)).
-- The hub adds two tables, `provider_block_episodes` and `provider_outages`. No existing table is rebuilt.
+- The hub adds three tables, `provider_block_episodes`, `provider_outages` and `provider_block_recoveries`. No existing table is rebuilt.
+- The ping and the wake need no relay or bridge change: the bridge already pings a notice with `refs.escalation=owner`, and the relay already leases wake jobs.
 
 ## Checks
 
-From `hub/`: `go test ./cmd/tt -run 'TestActivityProviderBlocked|TestActivityCLI'`, `go test ./internal/store -run 'TestProviderBlock|TestHandlerArmLimit'` and `go test ./internal/broker -run TestBrokerProviderBlockSweep`. From the repository root: `node --test tests/activity-format.test.js` and `node tests/activity-browser.mjs`. The transcripts under `hub/cmd/tt/testdata/provider-blocked/` are written by hand with the observed error texts; the key in the Codex fixture is made up. No check reads a real transcript or touches the live hub or relay.
+From `hub/`: `go test ./cmd/tt -run 'TestActivityProviderBlocked|TestActivityCLI'`, `go test ./internal/store -run 'TestProviderBlock|TestHandlerArmLimit'` and `go test ./internal/broker -run 'TestBrokerProviderBlockSweep|TestBrokerProviderRecoveryWake'` and `go test ./internal/bridge -run TestProviderBlockPingsTheOwner`. From the repository root: `node --test tests/activity-format.test.js` and `node tests/activity-browser.mjs`. The transcripts under `hub/cmd/tt/testdata/provider-blocked/` are written by hand with the observed error texts; the key in the Codex fixture is made up. No check reads a real transcript or touches the live hub, relay or Discord channel: the bridge test uses a fake Discord. The live Discord check is done once after release, in the daytime with the owner helper present, in a disposable project with a synthetic `provider_blocked` report, including one sent as an owner helper.

@@ -537,6 +537,115 @@ func TestEscalationsReachTheOwner(t *testing.T) {
 	}
 }
 
+// wi_1ef7c41da8711d4b p1, p2: a provider block that still needs the owner is
+// one Discord ping naming the fix and the host, for the owner helper's own
+// block too; a block that already cleared mirrors no line. The store and the
+// sweep are real, Discord is the fake.
+func TestProviderBlockPingsTheOwner(t *testing.T) {
+	h := newHarness(t)
+	add := func(name string) api.Agent {
+		t.Helper()
+		a, err := h.st.AddAgent(h.ctx, h.task.ID, api.AddAgentRequest{Name: name, Host: "mini", Session: "tt-" + name, Runtime: "claude"}, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	n := 0
+	report := func(a api.Agent, state, class string) {
+		t.Helper()
+		n++
+		activity := api.AgentActivity{State: state, ObservedAt: time.Now().UTC()}
+		if state == "provider_blocked" {
+			activity.Provider = &api.ProviderBlock{Provider: "anthropic", Runtime: "claude", Model: "claude-opus-5-5", Class: class, Code: "authentication_failed", Status: 401, Since: time.Now().UTC().Add(-time.Minute)}
+		}
+		if _, err := h.st.ReportActivity(h.ctx, h.task.ID, a.ID, api.ActivityReport{RequestID: fmt.Sprintf("activity-%d", n), RunID: a.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// sweep runs the broker's owner-notice sweep as if the grace had passed.
+	sweep := func() {
+		t.Helper()
+		if posted, err := h.st.ProviderBlockSweep(h.ctx, time.Now().Add(2*time.Minute)); err != nil || posted != 1 {
+			t.Fatalf("sweep posted %d: %v", posted, err)
+		}
+		h.cycle()
+	}
+	ping := func(m *fakeMessage, who, host string) {
+		t.Helper()
+		if !strings.HasPrefix(m.Content, "<@"+ownerID+"> ⚠️ **An agent is blocked by its provider and needs the owner**") {
+			t.Fatalf("%s: not an owner ping: %q", who, m.Content)
+		}
+		if m.AllowedMentions == nil || len(m.AllowedMentions.Users) != 1 || m.AllowedMentions.Users[0] != ownerID || len(m.AllowedMentions.Parse) != 0 {
+			t.Fatalf("%s: mentions %+v", who, m.AllowedMentions)
+		}
+		for _, part := range []string{who + " on " + host, "run /login in any Claude session on " + host} {
+			if !strings.Contains(m.Content, part) {
+				t.Fatalf("%s: ping lacks %q: %q", who, part, m.Content)
+			}
+		}
+		if len(m.Components) != 1 || len(m.Components[0].Components) == 0 {
+			t.Fatalf("%s: action row %+v", who, m.Components)
+		}
+	}
+	h.cycle()
+	base := len(h.lines())
+
+	reviewer := add("reviewer")
+	report(reviewer, "provider_blocked", "auth")
+	h.cycle()
+	if got := len(h.lines()); got != base {
+		t.Fatalf("%d lines before the grace passed, want %d", got, base)
+	}
+	sweep()
+	lines := h.lines()
+	if len(lines) != base+1 {
+		t.Fatalf("%d lines after the block, want %d", len(lines), base+1)
+	}
+	ping(lines[base], "reviewer", "mini")
+	// A later sweep and cycle add no second ping for the episode.
+	if posted, err := h.st.ProviderBlockSweep(h.ctx, time.Now().Add(time.Hour)); err != nil || posted != 0 {
+		t.Fatalf("repeat sweep posted %d: %v", posted, err)
+	}
+	h.cycle()
+	if got := len(h.lines()); got != base+1 {
+		t.Fatalf("%d lines after a repeat sweep, want %d", got, base+1)
+	}
+
+	// The owner helper's own block is the same ping, sent without it.
+	report(reviewer, "working", "")
+	out, err := h.st.RegisterOwnerHelper(h.ctx, h.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", Cwd: "/work/tailterm", RequestID: "ohreg-provider-block"}, owner)
+	if err != nil || out.Agent == nil || out.Agent.Role != api.AgentRoleOwnerHelper {
+		t.Fatalf("register helper: %+v %v", out, err)
+	}
+	report(*out.Agent, "provider_blocked", "auth")
+	sweep()
+	lines = h.lines()
+	if len(lines) != base+2 {
+		t.Fatalf("%d lines after the helper's block, want %d", len(lines), base+2)
+	}
+	ping(lines[base+1], out.Agent.Name, "owner-mac")
+
+	// A block that cleared inside the grace is recorded on the board and
+	// mirrors no line.
+	planner := add("planner")
+	report(planner, "provider_blocked", "usage_limit")
+	report(planner, "idle", "")
+	sweep()
+	if got := len(h.lines()); got != base+2 {
+		t.Fatalf("%d lines after a cleared block, want %d", got, base+2)
+	}
+	cleared := 0
+	for _, m := range h.boardMessages() {
+		if m.Envelope != nil && strings.Contains(m.Envelope.Body.Text, "planner was blocked") && m.Envelope.Refs["escalation"] == "" {
+			cleared++
+		}
+	}
+	if cleared != 1 {
+		t.Fatalf("cleared notices on the board: %d", cleared)
+	}
+}
+
 // d9: owner messages become human board messages; a reply to an agent's
 // mirrored message addresses that agent and obliges it.
 func TestOwnerMessagesReachTheBoard(t *testing.T) {

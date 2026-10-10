@@ -739,6 +739,11 @@ func TestBrokerProviderBlockSweep(t *testing.T) {
 						if !strings.Contains(m.Envelope.Body.Text, "openai auth") {
 							t.Fatalf("notice text %q", m.Envelope.Body.Text)
 						}
+						// wi_1ef7c41da8711d4b: the notice is the owner's ping
+						// and names the fix and the host.
+						if m.Envelope.Refs["escalation"] != "owner" || !strings.Contains(m.Envelope.Body.Text, "run codex login on h") {
+							t.Fatalf("notice refs %v text %q", m.Envelope.Refs, m.Envelope.Body.Text)
+						}
 						n++
 					}
 				}
@@ -754,6 +759,65 @@ func TestBrokerProviderBlockSweep(t *testing.T) {
 				t.Fatalf("second tick: %v notices=%d", err, owner())
 			}
 		})
+	}
+}
+
+// p3 (wi_1ef7c41da8711d4b): when one of two agents blocked by an expired
+// login recovers, the other is woken through the ordinary wake job, with no
+// one typing into its terminal, and the tick adds nothing to it.
+func TestBrokerProviderRecoveryWake(t *testing.T) {
+	f := newFixture(t)
+	now := time.Now().UTC()
+	report := func(a api.Agent, key string, activity api.AgentActivity) {
+		t.Helper()
+		activity.ObservedAt = time.Now().UTC()
+		if _, err := f.st.ReportActivity(f.ctx, f.task.ID, a.ID, api.ActivityReport{RequestID: key, RunID: a.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	block := api.AgentActivity{State: "provider_blocked",
+		Provider: &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: "auth", Code: "other", Status: 401, Since: now.Add(-time.Minute)}}
+	report(f.lead, "blocked-lead", block)
+	report(f.builder, "blocked-builder", block)
+	if _, err := f.st.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, Kind: api.EventHeartbeat}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if job, err := f.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now()); err != nil || job != nil {
+		t.Fatalf("wake job while both are blocked: %+v %v", job, err)
+	}
+	report(f.lead, "recovered-lead", api.AgentActivity{State: "working"})
+	recovery := func() (seqs []int64) {
+		t.Helper()
+		msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			if m.From.Node == api.BrokerNode && m.To == f.builder.ID && m.Envelope != nil && m.Envelope.Subject == "Provider login restored; resume your work" {
+				seqs = append(seqs, m.Seq)
+			}
+		}
+		return seqs
+	}
+	seqs := recovery()
+	if len(seqs) != 1 {
+		t.Fatalf("recovery notices to the blocked agent: %v", seqs)
+	}
+	b := &Broker{Store: f.st}
+	if _, err := b.Tick(f.ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.st.LeaseWakeJob(f.ctx, f.task.ID, f.builder.ID, f.builder.RunID, time.Now())
+	if err != nil || job == nil {
+		t.Fatalf("no wake job after the recovery: %+v %v", job, err)
+	}
+	if want := fmt.Sprintf("#%d notice: Provider login restored; resume your work", seqs[0]); job.MessageSeq != seqs[0] || !strings.Contains(job.Prompt, want) {
+		t.Fatalf("wake job seq %d prompt %q, want %q", job.MessageSeq, job.Prompt, want)
+	}
+	// The woken agent's own recovery starts no second round.
+	report(f.builder, "recovered-builder", api.AgentActivity{State: "working"})
+	if got := recovery(); len(got) != 1 {
+		t.Fatalf("recovery notices after the woken agent recovered: %v", got)
 	}
 }
 
