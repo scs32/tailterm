@@ -28,7 +28,6 @@ test("paths that ship or build map to the targets that consume them", () => {
     "hub/Dockerfile": [],
     "deploy/compose.yaml": [],
     "tools/jev-kit/v_A.go": [],
-    "tools/claude-mods/clean-view/hooks/register.tsx": [],
     ".github/workflows/checks.yml": [],
     "hub/README.md": [],
     // Existing rules keep their targets.

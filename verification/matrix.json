@@ -286,10 +286,6 @@
         "public/"
       ],
       "groups": ["unit"]
-    },
-    {
-      "prefixes": ["tools/claude-mods/"],
-      "groups": ["unit"]
     }
   ],
   "defaultTimeoutMs": 600000,
