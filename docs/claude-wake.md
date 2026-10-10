@@ -195,9 +195,11 @@ and relay regressions. No live owner/agent sessions are test fixtures.
 
 ## Tool-call ledger
 
-Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. This source change is a candidate.
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. The would-deny report was added by feature `wi_23ca1183c7d59c79` revision 2, owner order #31851, builder assignment #31889. This source change is a candidate.
 
 Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The owner helper's Claude session is covered too (see "Owner helper session"). The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
+
+A Bash call that matches a protected-operation rule leaves one extra row per matched rule, written when the call is attempted (see "Would-deny report"). The report blocks nothing. Codex sessions are not covered by it either: Codex has only a Stop hook, so no Codex tool call is seen.
 
 ### Hooks
 
@@ -207,6 +209,7 @@ Every tool call in a Tailterm Claude agent session leaves one private local row:
 
 - It writes nothing to stderr, and nothing to stdout unless secret redaction is switched on for the host (see "Secret redaction"; it is off by default). Even then it cannot deny or fail a call: its only answer is the same output with values replaced.
 - It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
+- The would-deny report changes none of this. It only appends rows: it prints nothing, has no return value, and a command it cannot read or classify is left unreported.
 - It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
 - With `TAILTERM_AGENT` set, the session is an agent's and nothing below changes it. If `TAILTERM_TASK` or the hub is then missing, it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
@@ -238,13 +241,14 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 | `tool` | `tool_name`, cut to 128 bytes |
 | `toolUseId` | `tool_use_id`, cut to 128 bytes |
 | `argsDigest` | lower-case hex SHA-256 of `tool_input` after it is decoded and encoded again by Go's `encoding/json` (object keys sorted, numbers kept as written); empty when there is no `tool_input` |
-| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use) |
+| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use), `would_deny` (a PreToolUse that matched a protected-operation rule; the call still gets its own row when it ends) |
 | `durationMs`, `durationSource` | `duration_ms` from Claude Code (`claude`), else the time since the call's pre hook (`measured`), else absent |
 | `oversize` | `true` only when the input passed the 8 MiB cap |
+| `denyRule`, `denyKind`, `denySummary` | only on a `would_deny` row: the rule id, the operation kind and a summary of fixed words (see "Would-deny report") |
 
 Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
 
-Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table. From a helper file only `task`, `agent` and `run` reach a row; its registration and request fields do not.
+Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table. From a helper file only `task`, `agent` and `run` reach a row; its registration and request fields do not. A `would_deny` row is no exception: its summary is put together from fixed words and a count, and no text is copied from the command.
 
 ### Owner helper session
 
@@ -280,6 +284,53 @@ A pre hook writes a pending file of at most 512 bytes with the start time, sessi
 - Pending: before a pre creates its file, entries older than 24 hours and the oldest entries beyond 255 are each written as an `unknown` row and removed, at most 32 per invocation. After any pre there are at most 256 pending files per agent. Pres racing in parallel can pass that by the number racing; the next pre brings it back.
 - Ledger: every append takes `flock` on `ledger.lock`, retrying every 2 ms for at most 50 ms. Under the lock the size is read again, and a `ledger.jsonl` of 4 MiB or more is renamed over `ledger.jsonl.1` before the row is appended in one write. If the lock is not obtained the row is appended without rotating. One agent therefore holds about 8 MiB at most.
 
+### Would-deny report
+
+Report-only. On PreToolUse, after the call's pending entry is written, the hook reads the `command` of a `Bash` call and checks it against four rules. Each rule that matches adds one row with `outcome` `would_deny`, the call's `session`, `tool`, `toolUseId` and `argsDigest`, the usual `task`, `agent`, `run` and `time`, and the three `deny` fields. A command that matches two rules leaves two rows. The call is not blocked, delayed past the hook's own wait, or changed, and it gets its ordinary row when it ends. Turning blocking on is a later owner decision and is not built: it would mean exit 2 on PreToolUse and a change to the contract above.
+
+| `denyRule` | Fires when | `denyKind` |
+| --- | --- | --- |
+| `host-pkill` | the command is `pkill` or `killall` with none of the options that narrow it: `-U`, `-u`, `-P`, `-g`, `-G`, `-s`, `-t`, `-F` for pkill, `-u`, `-t` for killall. `killall -l` and `killall -s` only list and do not fire. | `pkill`, `killall` |
+| `deployer-signal` | the command is `kill`, `pkill`, `killall`, or `tmux` with `kill-session`, `kill-window`, `kill-pane`, `send-keys`, `respawn-pane` or `respawn-window` (or a tmux alias of one), and its own words contain `tt-deployer`. That prefix covers `tt-deployer-compact` and the `tt-deployer-<agent>` sessions. | `kill`, `pkill`, `killall`, `tmux-kill-session`, `tmux-send-keys` and so on |
+| `old-site-deploy` | `npm`, `pnpm`, `yarn` or `bun` with `run` or `run-script` and the script `deploy:static`; or `node` running a file named `deploy-static.mjs`, or that file run directly. `node --check` does not fire. | `npm-run`, `node-script` |
+| `truenas-tailscale` | `ssh` to the TrueNAS host with a remote command that contains `tailscale`, in any case. The host is recognised by a name containing `truenas`, in any case, after an optional `user@`, or by the one address `100.116.238.37`. | `ssh` |
+
+How a command is read: it is split into simple commands at `;`, `&&`, `||`, `|`, `&`, new lines and the bounds of `$( )`, backticks, `( )` and `{ }`. Quotes and backslashes are honoured, so text inside `echo "…"`, a commit message or a board post is an argument and never a command. Heredoc bodies and comments are skipped. Leading `NAME=value` assignments, the shell words `if`, `then`, `else`, `elif`, `do`, `while`, `until` and `!`, and the wrappers `sudo`, `env`, `command`, `exec`, `nohup`, `time`, `timeout` and `xargs` are stepped over, and the command is compared by its base name, so `/usr/bin/pkill` is `pkill`. The argument of `bash -c`, `sh -c`, `zsh -c` and `eval`, and the remote command of any `ssh`, are read as commands in turn, three deep.
+
+These do not fire: `pkill -U self node`, `pkill -P 12345 node`, `kill 12345`, `pgrep -f node`, `echo pkill node`, `tmux has-session -t tt-deployer-compact`, `tmux ls | grep tt-deployer`, `npm run deploy:tailos`, `cat scripts/deploy-static.mjs`, `tailscale status` on this host, `ssh truenas midclt call app.query`, `ssh air tailscale status`. A tool other than Bash never fires, whatever its input holds.
+
+`denySummary` is at most 120 bytes and is built only from:
+
+- the command word the rule matched: `pkill`, `killall`, `kill`, `tmux`, `npm`, `pnpm`, `yarn`, `bun`, `node`, `ssh`, `deploy-static.mjs`;
+- a subcommand from a fixed list: the tmux subcommands above, `run`, `run-script`, and after ssh the word `tailscale` and one of `up`, `down`, `set`, `status`, `serve`, `funnel`, `login`, `logout`, `update`, `cert`, `ip`;
+- option names from a fixed list, never an option's value: pkill `-f -x -i -n -o -l -a`, killall `-e -I -q -v -w -m`, tmux `-t`, npm `--prefix`, ssh `-o -p -i -l -t`, and a signal that is a known name or a number from 1 to 31;
+- the protected name: `tt-deployer`, with its suffix only when the whole word is `tt-deployer-` and up to 32 lower-case letters and digits; `deploy:static`; `deploy-static.mjs`; `truenas` for any host name, or the address above;
+- `(+N args)`, the number of other words left out. After eight words the rest are only counted.
+
+Examples: `pkill -9 -f (+1 args)`, `tmux kill-session -t tt-deployer-compact`, `kill tt-deployer (+1 args)`, `npm run deploy:static`, `node deploy-static.mjs (+1 args)`, `ssh truenas tailscale up (+2 args)`. A pattern, path, host, user, option value or any other argument never reaches a row. The finished text is still passed through the secret scan of "Secret redaction", whatever that feature's mode, and anything it finds is written as `[redacted]`; if the scan cannot finish in its time the row is written with an empty summary.
+
+Fail open: nothing extra is written for input the hook cannot read (the `unreadable` cases above), a `tool_input` with no `command` string, a command longer than 64 KiB (it is not classified in part, because a cut inside a quote could invent a match), substitutions nested more than eight deep, a panic in the check, or a check that ends after the 150 ms wait. The pending entry is written before the check, so none of these changes the call's ordinary row.
+
+To count would-deny rows by rule and agent for this host:
+
+```sh
+awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.outcome == "would_deny") | "\(.denyRule)\t\(.agent)"' | sort | uniq -c
+```
+
+Each line is a count, a rule id and an agent id. It reads the current and the rotated file of every agent and skips a torn line. `awk 1` ends every file with a new line, so a torn last line in one file cannot swallow the first row of the next.
+
+Cost, measured on the Mini on 2026-10-10 by `TestToolDenyCost`, which runs the same hook 100 times with the check and 100 times without and compares the medians: under 0.03 ms for a short command that matches nothing, about 0.1 ms for a match (the extra append), and about 1 ms for a command at the 64 KiB cap, matching or not. The test fails if the check adds 5 ms to the median or if a run with the check does not return, rows written, before the 150 ms deadline.
+
+Limits of the report:
+
+- It reads the command text only. A kill by a bare PID learned in an earlier call, a script that runs pkill, or a variable holding the session name is not seen. So a kill of the deployer by PID is not seen: the hook may not start a process to resolve one.
+- `pkill -U` or `-u` counts as narrowed. On the Mini every agent runs as one user, so it is still wide. That needs deciding before blocking is ever switched on.
+- TrueNAS is recognised only by a name containing `truenas` or by the address above. Another address, or an alias without `truenas` in it, is not seen.
+- `truenas-tailscale` reports reads such as `tailscale status` as well as changes.
+- The remote command of an ssh to any host is read as a command, so `ssh air pkill node` is a `host-pkill` row although the Mini is not the target.
+- `tmux kill-server`, `kill -1` and `wrangler` called directly are not rules.
+- Bash only. Other tools, and Codex sessions, are not covered.
+
 ### Known limits
 
 - A denied or abandoned call has a pre and no post. It appears as `unknown` only when a later pre evicts it.
@@ -288,7 +339,7 @@ A pre hook writes a pending file of at most 512 bytes with the start time, sessi
 - Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
 - A helper closed on the hub is still ledgered while this host's helper file names the session's thread. Telling would need a hub request, which the hook never makes. The rows are for calls that session really made, under the agent and run the file names. Registering the helper again from another session ends it.
 - Every Claude Code session on the host that is not a Tailterm agent now lists the relay state directory once per tool hook, to learn that it is not the helper.
-- Hub upload, deny rules and budget caps are not part of this version. The one rewrite is secret redaction, below.
+- Hub upload, blocking and budget caps are not part of this version. Protected operations are reported, not denied (see "Would-deny report"). The one rewrite is secret redaction, below.
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.
 

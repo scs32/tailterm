@@ -26,6 +26,10 @@ import (
 // which is off unless the host's relay.json says otherwise, answers a
 // PostToolUse with the same output and its token-shaped values replaced.
 //
+// The would-deny report (tool_deny.go) is report-only: a PreToolUse whose
+// Bash command matches a protected-operation rule leaves one extra row per
+// rule. It prints nothing and denies nothing.
+//
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
 // session, read from the host helper file (bug wi_b3e8ecd5a2ee01b3).
@@ -77,6 +81,9 @@ type toolLedger struct {
 	redactBudget time.Duration
 	redactMax    int
 	stdout       io.Writer
+	// The would-deny report (tool_deny.go), run after a pre is recorded.
+	deny    func(toolLedger, toolLedgerRow, string, json.RawMessage)
+	denyMax int
 }
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error,
@@ -111,6 +118,10 @@ type toolLedgerRow struct {
 	RedactCount *int           `json:"redactCount,omitempty"`
 	RedactKinds map[string]int `json:"redactKinds,omitempty"`
 	RedactSkip  string         `json:"redactSkip,omitempty"`
+	// Only on a would_deny row (tool_deny.go).
+	DenyRule    string `json:"denyRule,omitempty"`
+	DenyKind    string `json:"denyKind,omitempty"`
+	DenySummary string `json:"denySummary,omitempty"`
 }
 
 type toolLedgerPending struct {
@@ -167,6 +178,7 @@ func toolLedgerHook(e env, _ []string) {
 		maxInput: toolLedgerMaxInput, maxBytes: toolLedgerMaxBytes, maxPending: toolLedgerMaxPending,
 		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
+		deny: toolDenyCheck, denyMax: toolDenyMaxCommand,
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -213,6 +225,10 @@ func (l toolLedger) record(in io.Reader) {
 	switch p.Event {
 	case "PreToolUse":
 		l.pre(row, p.Session)
+		// After the pending entry is written, so the check cannot lose the pairing.
+		if l.deny != nil {
+			l.deny(l, row, p.Tool, p.Input)
+		}
 		return
 	case "PostToolUse":
 		row.Outcome = "ok"
@@ -247,11 +263,13 @@ func (l toolLedger) record(in io.Reader) {
 }
 
 // toolLedgerCut bounds a stored name or id without splitting a character.
-func toolLedgerCut(s string) string {
-	if len(s) <= toolLedgerFieldBytes {
+func toolLedgerCut(s string) string { return toolLedgerCutTo(s, toolLedgerFieldBytes) }
+
+func toolLedgerCutTo(s string, max int) string {
+	if len(s) <= max {
 		return s
 	}
-	s = s[:toolLedgerFieldBytes]
+	s = s[:max]
 	for len(s) > 0 && !utf8.ValidString(s) {
 		s = s[:len(s)-1]
 	}
