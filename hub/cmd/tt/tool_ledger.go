@@ -94,7 +94,8 @@ type toolLedger struct {
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error
 // and transcript_path are skipped by the decoder and never kept. cwd is
-// decoded for the owned-paths report and never stored. Secret redaction
+// kept raw, so a cwd of the wrong type cannot fail the decode, read as a
+// string for the owned-paths report and never stored. Secret redaction
 // decodes tool_response itself, and only when it is switched on.
 type toolHookInput struct {
 	Event       string          `json:"hook_event_name"`
@@ -104,7 +105,7 @@ type toolHookInput struct {
 	Input       json.RawMessage `json:"tool_input"`
 	DurationMS  *float64        `json:"duration_ms"`
 	IsInterrupt bool            `json:"is_interrupt"`
-	Cwd         string          `json:"cwd"`
+	Cwd         json.RawMessage `json:"cwd"`
 }
 
 type toolLedgerRow struct {
@@ -242,7 +243,9 @@ func (l toolLedger) record(in io.Reader) {
 			l.deny(l, row, p.Tool, p.Input)
 		}
 		if l.scope != nil {
-			l.scope(l, row, p.Tool, p.Input, p.Cwd)
+			var cwd string // stays empty when cwd is absent or not a string
+			_ = json.Unmarshal(p.Cwd, &cwd)
+			l.scope(l, row, p.Tool, p.Input, cwd)
 		}
 		return
 	case "PostToolUse":

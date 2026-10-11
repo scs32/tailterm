@@ -9,6 +9,10 @@ import (
 	"go/token"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -605,6 +609,62 @@ func TestToolScopeCacheNeverFailsInbox(t *testing.T) {
 	})
 }
 
+// a3: the extra fetch of a --seq read is for the cache only. With a hub that
+// never answers it, tt inbox --seq prints and returns the same, about one
+// second later, and caches nothing.
+func TestToolScopeCacheSeqStalledFetch(t *testing.T) {
+	h := newScopeInboxHub(t)
+	real, err := url.Parse(h.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(real)
+	release := make(chan struct{})
+	var stalled atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only the cache fetch names a recipient on a one-message page.
+		if q := r.URL.Query(); q.Get("to") != "" && q.Get("limit") == "1" {
+			stalled.Add(1)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	// TestMain raised the floor under every command deadline; this test is
+	// about the shipped one-second bound.
+	previous := minCommandTimeout
+	minCommandTimeout = productionMinCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
+	root := scopeLedgerDir(t)
+	args := []string{"--seq", fmt.Sprint(h.assign.Seq)}
+	want, err := captureCLIOutput(t, func() error { return cmdInbox(env{hub: h.e.hub, task: h.e.task}, args) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := h.e
+	e.hub = srv.URL
+	start := time.Now()
+	got, err := captureCLIOutput(t, func() error { return cmdInbox(e, args) })
+	elapsed := time.Since(start)
+	if err != nil || got != want {
+		t.Fatalf("--seq with a stalled cache fetch printed %q, %v; want %q", got, err, want)
+	}
+	if stalled.Load() != 1 {
+		t.Fatalf("the cache fetch was stalled %d times; want once", stalled.Load())
+	}
+	if elapsed < 900*time.Millisecond || elapsed > 4*time.Second {
+		t.Fatalf("--seq returned after %v; want about the one-second bound of the cache fetch", elapsed)
+	}
+	if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
+		t.Fatalf("a failed cache fetch wrote %v", names)
+	}
+}
+
 // a4: each edit tool outside the owned paths leaves exactly one row.
 func TestToolScopeRow(t *testing.T) {
 	long := strings.Repeat("é", 150) + ".go" // 303 bytes; the cut falls inside a character
@@ -982,7 +1042,11 @@ func TestToolScopeFailsOpen(t *testing.T) {
 		}},
 		{"missing cwd", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = "" }},
 		{"relative cwd", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = "repo" }},
-		{"cwd of another type", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = nil }},
+		{"cwd is null", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = nil }},
+		{"cwd is a number", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = 7 }},
+		{"cwd is an object", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = map[string]any{"path": s.repo} }},
+		{"cwd is an array", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = []string{s.repo} }},
+		{"cwd is a bool", func(t *testing.T, s *sandbox) { valid(t, s); s.pre["cwd"] = true }},
 		{"no .git above cwd", func(t *testing.T, s *sandbox) {
 			valid(t, s)
 			if err := os.Remove(filepath.Join(s.repo, ".git")); err != nil {

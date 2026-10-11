@@ -357,8 +357,8 @@ Report-only. It records an edit outside the files an agent was assigned, and blo
 - The file is 0600 in the 0700 agent directory. It is written to a temporary file and renamed, so a reader sees the old file or the new one.
 - The latest ASSIGN wins: a higher message number replaces the cache, so an amended ASSIGN replaces the one before it. An equal or lower number for the same run writes nothing.
 - An ASSIGN stays the agent's across a recovery run. A message names an agent, not a run, so a new run of the same agent that reads an ASSIGN caches it under its own run, whatever its number. The hook uses a cache only when its `run` is the hook's own run.
-- The read of the current file, the comparison and the rename happen under `flock` on `owns.lock`, tried every 2 ms for at most 200 ms. Without the lock nothing is written, and the next inbox read that fetches the ASSIGN caches it. That 200 ms is the most the cache can delay `tt inbox`.
-- `tt inbox --seq N` fetches the message once more for the cache, after printing it: one extra hub request per `--seq` read made by an agent.
+- The read of the current file, the comparison and the rename happen under `flock` on `owns.lock`, tried every 2 ms for at most 200 ms. Without the lock nothing is written, and the next inbox read that fetches the ASSIGN caches it. That 200 ms is the most the cache write can delay `tt inbox`.
+- `tt inbox --seq N` fetches the message once more for the cache, after printing it: one extra hub request per `--seq` read made by an agent. That request is given 1 second, so with a hub that does not answer a `--seq` read can end up to 1 second later, and then up to the 200 ms above for the write. The other forms make no extra request.
 - It never changes what `tt inbox` prints or returns. A ledger directory that cannot be written, or any other failure, writes nothing.
 
 **What the hook does.** On PreToolUse of `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, after the pending entry is written and after the would-deny report:
@@ -382,7 +382,7 @@ So an entry that names an existing file or directory only ever owns that file or
 
 `reportPath` is the path relative to the repository root, passed through the secret scan of "Secret redaction" whatever that feature's mode, then cut to 200 bytes without splitting a character. File contents are never read or stored.
 
-Fail open: nothing extra is written for a missing, unreadable, malformed or oversized `owns.json`, one marked `overflow`, one with no usable entry, or one written by another run; a missing or relative `cwd`; no `.git` above `cwd`; a `tool_input` without its path string; a path scan that cannot finish in its time (a row must carry its path, so none is written); a panic in the check; or a check that ends after the 150 ms wait. The row's append never waits for the ledger lock past that deadline and checks the deadline again immediately before its one write. The pending entry is written before the check, so none of these changes the call's ordinary row.
+Fail open: nothing extra is written for a missing, unreadable, malformed or oversized `owns.json`, one marked `overflow`, one with no usable entry, or one written by another run; a missing or relative `cwd`, or one that is not a string; no `.git` above `cwd`; a `tool_input` without its path string; a path scan that cannot finish in its time (a row must carry its path, so none is written); a panic in the check; or a check that ends after the 150 ms wait. The row's append never waits for the ledger lock past that deadline and checks the deadline again immediately before its one write. The pending entry is written before the check, so none of these changes the call's ordinary row.
 
 To count would-report rows by rule and agent for this host:
 

@@ -675,9 +675,10 @@ func cmdInbox(e env, args []string) error {
 	if *seq > 0 {
 		err := printInboxMessage(c, task, *seq, *asJSON)
 		if err == nil && e.agent != "" {
-			ctx, cancel := ctxTimeout(10 * time.Second)
+			ctx, cancel := ctxTimeout(time.Second)
 			defer cancel()
-			// For the owns cache only; a failure here changes nothing.
+			// For the owns cache only, so it may hold the command for a
+			// second at most; a failure here changes nothing.
 			if one, ferr := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: *seq - 1, To: e.agent, Limit: 1}); ferr == nil && len(one) == 1 && one[0].Seq == *seq {
 				mine = one
 			}
