@@ -258,7 +258,7 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 | `oversize` | `true` only when the input passed the 8 MiB cap |
 | `denyRule`, `denyKind`, `denySummary` | only on a `would_deny` row: the rule id, the operation kind and a summary of fixed words (see "Would-deny report") |
 | `reportRule`, `reportPath`, `assignSeq` | only on a `would_report` row: the rule id, the file's path relative to the repository root cut to 200 bytes, and the number of the ASSIGN it was judged against (see "Owned-paths report"). An `edit-before-assign` row has `reportRule` and `reportPath` and no `assignSeq` (see "Edit-before-assign report"). A handler-gate row has `reportRule` and neither of the other two |
-| `reportTag`, `reportSummary`, `agentName` | only on a handler-gate `would_report` row: who ran the command (`handler`, `lead-allowed`, `owner-helper` or `none`), a summary of fixed words, and the agent's name (see "Handler-gate report") |
+| `reportTag`, `reportSummary`, `agentName` | only on a handler-gate `would_report` row: who ran the command (`handler`, `lead-allowed`, `verifier-allowed`, `owner-helper` or `none`), a summary of fixed words, and the agent's name (see "Handler-gate report") |
 
 Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
 
@@ -304,14 +304,14 @@ Report-only. On PreToolUse, after the call's pending entry is written, the hook 
 
 | `denyRule` | Fires when | `denyKind` |
 | --- | --- | --- |
-| `host-pkill` | the command is `pkill` or `killall` with none of the options that narrow it: `-U`, `-u`, `-P`, `-g`, `-G`, `-s`, `-t`, `-F` for pkill, `-u`, `-t` for killall. `killall -l` and `killall -s` only list and do not fire. | `pkill`, `killall` |
-| `deployer-signal` | the command is `kill`, `pkill`, `killall`, or `tmux` with `kill-session`, `kill-window`, `kill-pane`, `send-keys`, `respawn-pane` or `respawn-window` (or a tmux alias of one), and its own words contain `tt-deployer`. That prefix covers `tt-deployer-compact` and the `tt-deployer-<agent>` sessions. | `kill`, `pkill`, `killall`, `tmux-kill-session`, `tmux-send-keys` and so on |
-| `old-site-deploy` | `npm`, `pnpm`, `yarn` or `bun` with `run` or `run-script` and the script `deploy:static`; or `node` running a file named `deploy-static.mjs`, or that file run directly. `node --check` does not fire. | `npm-run`, `node-script` |
-| `truenas-tailscale` | `ssh` to the TrueNAS host with a remote command that contains `tailscale`, in any case. The host is recognised by a name containing `truenas`, in any case, after an optional `user@`, or by the one address `100.116.238.37`. | `ssh` |
+| `host-pkill` | the command is `pkill` or `killall` with none of the options that narrow it: `-U`, `-u`, `-P`, `-g`, `-G`, `-s`, `-t`, `-F` for pkill, `-u`, `-t` for killall. `killall -l` and `killall -s` only list and do not fire. Nor does a call that signals nothing: `--help`, `--version`, the probe `-0`, or `killall -d`. | `pkill`, `killall` |
+| `deployer-signal` | the command is `kill`, `pkill` or `killall` and its own words contain `tt-deployer`; or it is `tmux` with `kill-session`, `kill-window`, `kill-pane`, `send-keys`, `respawn-pane` or `respawn-window` (or a tmux alias of one) and that command's target, the value of its `-t`, contains `tt-deployer`. The keys of `send-keys` and other words after the options are not a target. Every command of one tmux call is looked at: they are separated by a `;` word, typed `\;`. That prefix covers `tt-deployer-compact` and the `tt-deployer-<agent>` sessions. `kill`, `pkill` and `killall` forms that signal nothing (`--help`, `--version`, `-0`, `killall -l`, `-s` or `-d`) do not fire. | `kill`, `pkill`, `killall`, `tmux-kill-session`, `tmux-send-keys` and so on |
+| `old-site-deploy` | `npm`, `pnpm`, `yarn` or `bun` with `run` or `run-script` and the script `deploy:static`; `yarn deploy:static`, which runs the script without `run`; or `node` running a file named `deploy-static.mjs`, or that file run directly. `node --check` does not fire. | `npm-run`, `node-script` |
+| `truenas-tailscale` | `ssh` to the TrueNAS host with a remote command that contains `tailscale`, in any case. The host is recognised by a name containing `truenas`, in any case, after an optional `user@`, or by the one address `100.116.238.37`. A heredoc is the remote command when none is typed, or when the one typed is `bash`, `sh` or `zsh` reading its standard input. | `ssh` |
 
-How a command is read: it is split into simple commands at `;`, `&&`, `||`, `|`, `&`, new lines and the bounds of `$( )`, backticks, `( )` and `{ }`. Quotes and backslashes are honoured, so text inside `echo "…"`, a commit message or a board post is an argument and never a command. Heredoc bodies and comments are skipped. Leading `NAME=value` assignments, the shell words `if`, `then`, `else`, `elif`, `do`, `while`, `until` and `!`, and the wrappers `sudo`, `env`, `command`, `exec`, `nohup`, `time`, `timeout` and `xargs` are stepped over, and the command is compared by its base name, so `/usr/bin/pkill` is `pkill`. The argument of `bash -c`, `sh -c`, `zsh -c` and `eval`, and the remote command of any `ssh`, are read as commands in turn, three deep.
+How a command is read: it is split into simple commands at `;`, `&&`, `||`, `|`, `&`, new lines and the bounds of `$( )`, backticks, `( )` and `{ }`. Quotes and backslashes are honoured, so text inside `echo "…"`, a commit message or a board post is an argument and never a command. These hold words and no commands, apart from any substitution inside them: an array literal `NAME=( … )` or `NAME+=( … )`, the patterns of a `case` up to their `)`, a `[[ … ]]` condition, and an arithmetic `(( … ))` or `$(( … ))`, where `<<` is a shift and opens no heredoc. Comments are skipped. A heredoc body is skipped unless it feeds a shell: after `bash`, `sh` or `zsh` with `-s` or with no script file and no `-c`, or after an `ssh` as the table says, the body is read as commands. Leading `NAME=value` assignments, the shell words `if`, `then`, `else`, `elif`, `do`, `while`, `until` and `!`, and the wrappers `sudo`, `env`, `command`, `exec`, `nohup`, `time`, `timeout`, `nice` and `xargs` are stepped over, and the command is compared by its base name, so `/usr/bin/pkill` is `pkill`. The argument of `bash -c`, `sh -c`, `zsh -c` and `eval`, a heredoc fed to a shell, and the remote command of any `ssh`, are read as commands in turn, three deep.
 
-These do not fire: `pkill -U self node`, `pkill -P 12345 node`, `kill 12345`, `pgrep -f node`, `echo pkill node`, `tmux has-session -t tt-deployer-compact`, `tmux ls | grep tt-deployer`, `npm run deploy:tailos`, `cat scripts/deploy-static.mjs`, `tailscale status` on this host, `ssh truenas midclt call app.query`, `ssh air tailscale status`. A tool other than Bash never fires, whatever its input holds.
+These do not fire: `pkill -U self node`, `pkill -P 12345 node`, `kill 12345`, `pgrep -f node`, `echo pkill node`, `tmux has-session -t tt-deployer-compact`, `tmux ls | grep tt-deployer`, `npm run deploy:tailos`, `cat scripts/deploy-static.mjs`, `tailscale status` on this host, `ssh truenas midclt call app.query`, `ssh air tailscale status`, `files=(scripts/deploy-static.mjs x)`, `case "$x" in pkill|killall) … ;; esac`, `[[ $x =~ ^(pkill|killall)$ ]]`, `tmux send-keys -t tt-builder-1 'check tt-deployer-compact status' Enter`, `pkill --help`, `pkill -0 -f vite`, `killall -d node`, and a heredoc that is data, as in `cat > notes.txt <<'EOF'` or `bash run.sh <<'EOF'`. A tool other than Bash never fires, whatever its input holds.
 
 `denySummary` is at most 120 bytes and is built only from:
 
@@ -343,6 +343,12 @@ Limits of the report:
 - `truenas-tailscale` reports reads such as `tailscale status` as well as changes.
 - The remote command of an ssh to any host is read as a command, so `ssh air pkill node` is a `host-pkill` row although the Mini is not the target.
 - `tmux kill-server`, `kill -1` and `wrangler` called directly are not rules.
+- The tmux socket is not judged. A `-L` or `-S` option is stepped over, so a target named `tt-deployer…` is reported on any socket, a private test socket included: `tmux -L other-socket kill-session -t tt-deployer-compact` leaves a row.
+- A tmux target is read from `-t` only. A session reached without one (the current session, `kill-session -a`) is not seen. Commands of one tmux call are split only at a word that is `;` alone.
+- A script reaches a shell as text only through `-c`, `eval`, an ssh remote command or a heredoc on the shell's own standard input. One piped in (`echo 'pkill node' | bash`, `cat <<'EOF' | bash`), read from a file or a here-string, or fed to an interpreter other than `bash`, `sh` and `zsh` is not seen. A heredoc after `bash --rcfile FILE` or another long option that takes a value is not read either.
+- `pnpm deploy:static` and `bun deploy:static`, which also run a script without `run`, are not seen; only `yarn` is.
+- `case`, `in`, `esac`, `[[` and `]]` are recognised as written, whether or not they are quoted, and `case` and `[[` only at the start of a command or after the shell words above. A `[[` that is never closed makes the rest of that command text operands, so a command after it is not seen.
+- Of the wrappers that only change how a command runs, `nice` is stepped over; `ionice`, `caffeinate`, `stdbuf` and others are not, so a command after one is not seen.
 - Bash only. Other tools, and Codex sessions, are not covered.
 
 ### Owned-paths report
@@ -417,7 +423,7 @@ Limits of the report:
 
 ### Edit-before-assign report
 
-Report-only. It records a queue builder's edit made before any assignment was cached for its run, and blocks nothing. It does not check for a saved Start, and it asks the hub nothing.
+Report-only. It records a queue builder's edit made before any assignment was cached for its run, and blocks nothing. It does not check for a saved Start, and it asks the hub nothing. `tt inbox` creates the agent's ledger directory and the marker below for an agent of any runtime, Codex included; only Claude Code hooks ever read them.
 
 **The rule.** On PreToolUse of `Edit`, `Write`, `MultiEdit` or `NotebookEdit` of a file inside the session's repository, the hook appends one row, `reportRule` `edit-before-assign`, only when all three hold:
 
@@ -427,7 +433,7 @@ Report-only. It records a queue builder's edit made before any assignment was ca
 
 With this run's `owns.json` present the rule is not looked at, and the owned-paths report applies exactly as before.
 
-**The marker.** After a successful fetch of its agent's own messages, `tt inbox` writes `inbox.json` beside the agent's ledger:
+**The marker.** After a successful fetch of its agent's own messages, `tt inbox` writes `inbox.json` beside the agent's ledger, creating that directory when it is not there. It does so whatever runtime the agent runs in:
 
 | Key | Meaning |
 | --- | --- |
@@ -444,9 +450,9 @@ With this run's `owns.json` present the rule is not looked at, and the owned-pat
 - `owns.json` is renamed first, and a cache that could not be written leaves no marker. The hook therefore never finds this run's marker while the ASSIGN fetched by the same read is still uncached.
 - It never changes what `tt inbox` prints or returns.
 
-**What the hook does.** In the owned-paths check, when `owns.json` could not be used or is another run's:
+**What the hook does.** The owned-paths check comes first: for every `Edit`, `Write`, `MultiEdit` or `NotebookEdit` it reads `owns.json` once, whoever the agent is. When that file could not be used or is another run's:
 
-1. A session identified by the owner helper's file, a name that is not a builder's, or an empty run stops here, with no file touched.
+1. A session identified by the owner helper's file, a name that is not a builder's, or an empty run stops here. That one read of `owns.json` has already happened; no other file is touched.
 2. If `owns.json` was not readable, one stat call: a file that is there and cannot be used (unreadable, malformed, oversized, another version, a directory) stops here. Only a missing file goes on.
 3. It reads `inbox.json`, at most 512 bytes. Missing, unreadable, malformed, oversized, another version or another run's: it stops.
 4. It reads `owns.json` once more. If it is now this run's, an ASSIGN arrived meanwhile, and it stops.
@@ -470,7 +476,7 @@ Cost, measured on the Mini on 2026-10-10 by `TestToolScopeBeforeAssignCost`, by 
 Limits of the report:
 
 - Edits made through Bash (`sed -i`, a redirection, a script, `git apply`) are not seen.
-- Codex sessions are not covered.
+- Codex sessions are not covered: no hook reads the marker there, although `tt inbox` writes it, and the agent's directory, for a Codex agent as for any other.
 - Roles other than a builder are not covered, and a builder is recognised by the name convention only. The hook does not ask the hub for the agent's role, so an agent of any role that carries a builder's name is treated as one.
 - A builder named outside the convention is not covered: `builder2-facccbae`, a second builder on a team, gets no row.
 - A builder that never ran `tt inbox` in its run has no marker, and nothing is reported for it. The same holds for one that only read `--board`.
@@ -499,9 +505,10 @@ What makes a request a write:
 
 - curl: `-X` or `--request` with a value other than GET (`-XPOST` and `--request=POST` too), or any of `-d`, `--data`, `--data-raw`, `--data-binary`, `--data-urlencode`, `--json`, `-F`, `--form`, `-T`, `--upload-file`, `-I`, `--head`. HEAD counts as a write: only GET is a read. curl `-G` or `--get` with data is a GET, because the data becomes the query, and does not match unless a non-GET method is also given.
 - wget: `--post-data`, `--post-file`, `--body-data`, `--body-file`, or `--method` other than GET.
-- `http`, `https`, `xh`: a first word that is a method other than GET, or a request item after the URL that is a body field (its first separator is `=`, `:=` or `@`). A header (`Name:value`) and a query parameter (`name==value`) are not body fields.
+- `http`, `https`, `xh`: a first word that is a method other than GET, a request item after the URL that is a body field (its first separator is `=`, `:=` or `@`), a `--raw` body, or standard input that the command text shows to be fed, which is sent as the body: a pipe into the command, a `<` redirect, a here-string or a heredoc, unless `--ignore-stdin` or `-I` is given. A first word made only of letters, with another word after it, is the method, as these clients read it, so `http PURGE :18765/x` is a write. A header (`Name:value`) and a query parameter (`name==value`) are not body fields.
+- curl `--next` or `-:` starts another request with its own options. Each request is judged alone, and the first that is a write to the hub is the match, so a POST to another host followed by a GET of the hub is not one.
 
-What has the hub's authority: a URL is judged by its authority alone, which is what follows an optional `scheme://` and an optional `user:pass@`, up to the first `/`, `?` or `#`. It is the hub when its host and port are those of the `TAILTERM_HUB` environment value (a missing port is 80, or 443 for https), or when its port is 18765 on any host. A word that starts with the text `$TAILTERM_HUB` or `${TAILTERM_HUB}`, followed by the end of the word or by `/`, `?` or `#`, is the hub too. For curl and wget every word that is not an option or an option's value is a URL, and so is the value of curl `--url`; for `http`, `https` and `xh` only the first such word after the method is. The value of `-H`, `-d`, `-o`, `-u` and every other option that takes one is skipped by a fixed table and never read, so the hub's address inside a header, a body, a query, a path or a fragment is not a match, and `@file` is a word: no file is opened.
+What has the hub's authority: a URL is judged by its authority alone, which is what follows an optional `scheme://` and an optional `user:pass@`, up to the first `/`, `?` or `#`. It is the hub when its host and port are those of the `TAILTERM_HUB` environment value (a missing port is 80, or 443 for https), or when its port is 18765 on any host. A word that starts with the text `$TAILTERM_HUB` or `${TAILTERM_HUB}`, followed by the end of the word or by `/`, `?` or `#`, is the hub too, and so is one that starts with a strip of that variable's end or start, `${TAILTERM_HUB%…}` or `${TAILTERM_HUB#…}`, such as `${TAILTERM_HUB%/}/api`. For curl and wget every word that is not an option or an option's value is a URL, and so is the value of curl `--url` and `--expand-url`; for `http`, `https` and `xh` only the first such word after the method is. The value of `-H`, `-d`, `-o`, `-u` and every other option that takes one is skipped by a fixed table and never read, so the hub's address inside a header, a body, a query, a path or a fragment is not a match, and `@file` is a word: no file is opened.
 
 For `sqlite3` the operand is the first word that is not an option or the value of `-cmd`, `-init`, `-separator`, `-newline`, `-nullvalue`, `-vfs`, `-maxsize`, `-mmap`, `-lookaside`, `-pagecache` or `-heap`. A leading `file:` is dropped, with the empty or `localhost` authority of `file:///path` and `file://localhost/path`, and so is anything from the first `?`. A `file:` URI naming another host does not match. Later words are SQL text and are never judged.
 
@@ -513,10 +520,11 @@ These do not fire: `tt work-items list`, `tt send --subject 'tt work-items creat
 | --- | --- |
 | `owner-helper` | the session has no agent identity and was ledgered as the owner helper from its helper file (see "Owner helper session"). It acts under the owner's delegation |
 | `handler` | the agent's name starts with `db-handler` |
-| `lead-allowed` | the agent's name starts with `lead-` and the match is `tt verification plan`, `tt verification receipt`, or the done save with queue acceptance: `tt work-items update` with `--status done` (or `--status=done`) and all of `--worktree`, `--branch` and `--commit` (owner helper answer #18182, AGENTS.md). A lead's other writes are `none` |
+| `lead-allowed` | the agent's name starts with `lead-` and the match is `tt verification plan`, `tt verification receipt`, `tt team queue scope`, or the done save with queue acceptance: `tt work-items update` with `--status done` (or `--status=done`) and all of `--worktree`, `--branch` and `--commit`, each typed with two dashes or one (owner helper answer #18182, AGENTS.md; queue scope by owner helper decision #32108). A lead's other writes are `none` |
+| `verifier-allowed` | the agent's name starts with `verifier-` and the match is `tt verification receipt` (AGENTS.md). A verifier's other writes are `none` |
 | `none` | everything else, an agent with no name included |
 
-The name is `TAILTERM_AGENT_NAME`, or the helper file's `name`. A command holding both a write a lead may make and one it may not is tagged by the one it may not. `agentName` is that name cut to 128 bytes, and absent unless it is made only of letters, digits, `_`, `-` and `.`.
+The name is `TAILTERM_AGENT_NAME`, or the helper file's `name`. A command holding both a write a lead may make and one it may not is tagged by the one it may not, and the same holds for a verifier. `agentName` is that name cut to 128 bytes, and absent unless it is made only of letters, digits, `_`, `-` and `.`.
 
 `reportSummary` is at most 120 bytes and is built only from fixed words and a count, as `denySummary` is, and passes the same secret scan:
 
@@ -536,7 +544,7 @@ To count handler-gate rows by rule, tag and agent name for this host:
 awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.reportTag != null) | "\(.reportRule)\t\(.reportTag)\t\(.agentName // "-")"' | sort | uniq -c
 ```
 
-Each line is a count, a rule id, a tag and an agent name, or `-` for a row without one. Rows tagged `none` are the ones to look at; the others are the handler, a lead's allowed commands and the owner helper. It reads every agent's current and rotated file and skips a torn line, as the would-deny command does.
+Each line is a count, a rule id, a tag and an agent name, or `-` for a row without one. Rows tagged `none` are the ones to look at; the others are the handler, a lead's and a verifier's allowed commands and the owner helper. It reads every agent's current and rotated file and skips a torn line, as the would-deny command does.
 
 Cost, measured on the Mini on 2026-10-10 by `TestToolGateCost`, by the method of `TestToolDenyCost` with the gate switched on and off and the would-deny check on in both: under 0.01 ms for a short command that matches nothing and for a `tt` command that is no write; about 0.09 ms for one rule or all three (the extra append); under 0.01 ms when the call already writes would-deny rows, since the rows share one write; about 0.05 ms for a 64 KiB command that matches nothing and about 0.2 ms for one that matches all three. The test fails if the gate adds 5 ms to the median (25 ms under the race detector), or if more than 2 of 100 runs with the gate do not return, rows written, before the 150 ms deadline.
 
@@ -545,10 +553,11 @@ Limits of the report:
 - It reads the command text only. A write made by a script file the agent runs (python, node, a shell script) is not seen, nor is one made through an MCP tool or the TailOS UI.
 - Bash in Claude Code sessions only. Codex sessions are not covered.
 - The handler is told by its name prefix, a convention and not a role. A handler named otherwise is reported with tag `none`, and any agent named `db-handler…` is tagged `handler`.
-- `lead-allowed` is a name-and-form heuristic. The hook keeps no state and may not ask the hub, so it cannot check that the item or queue entry in the command is that lead's own: a lead running one of the three forms on another item is still tagged `lead-allowed`. A verifier's permitted `tt verification receipt` is tagged `none`.
-- The hub is known by the `TAILTERM_HUB` value, the port 18765 and the two spellings of that one variable. A hub address held in another variable, or one on another port with `TAILTERM_HUB` unset, is not seen.
-- curl `-K` and other config files are not read, so a method, body or URL given there is not seen. `--data-ascii` and `--form-string` are not in the list of body options.
-- `tt` words are matched by position, as `tt` reads them today. A form `tt` does not accept, such as an option before the subcommand, does not match.
+- `lead-allowed` and `verifier-allowed` are name-and-form heuristics. The hook keeps no state and may not ask the hub, so it cannot check that the item, queue entry or plan in the command is that agent's own: a lead running one of the four forms on another item or entry is still tagged `lead-allowed`, and an agent named `verifier-…` saving a receipt for a plan that names another verifier is still tagged `verifier-allowed`. A lead or a verifier named otherwise is tagged `none`.
+- The hub is known by the `TAILTERM_HUB` value, the port 18765 and the spellings of that one variable given above. `${TAILTERM_HUB%/}`-style strips are seen; any other expansion of it (`${TAILTERM_HUB:-…}`, `${TAILTERM_HUB/a/b}`, `${TAILTERM_HUB:0:5}`) is not, nor is a hub address held in another variable, or one on another port with `TAILTERM_HUB` unset.
+- For `http`, `https` and `xh`, fed standard input is known from the command text alone: a pipe, a `<` redirect, a here-string or a heredoc on that same command. Input inherited from an enclosing script or a `while read` loop is not seen, and a pipe is counted even when it carries nothing. A method word is told by its letters, so a host named by one bare word of letters before the URL is read as a method, as the client itself would.
+- curl `-K` and other config files are not read, so a method, body or URL given there is not seen. `--data-ascii` and `--form-string` are not in the list of body options. Of curl's `--expand-` options only `--expand-url` is read, and its `{{variable}}` text is not expanded.
+- `tt` words are matched by position, as `tt` reads them today. A form `tt` does not accept, such as an option before the subcommand, does not match. The done save's flags are read with one dash or two, as `tt` accepts them.
 - `sqlite3` only, and only by its operand: an `ATTACH` of the hub database from another file, a relative path from inside the hub directory, `cp`, `scp` or `rsync` of the file, and other database clients are not seen. The remote command of an ssh to any host is read, so the rule fires whether or not the host is TrueNAS.
 - A request to port 18765 on any host is reported, whatever serves it.
 - The hub itself refuses only the backlog steward's work-item writes, so for every other role this report is the only record of a bypass, and it is a report: nothing is denied.

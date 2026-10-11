@@ -47,14 +47,17 @@ const (
 	toolGateHubWrite = "hub-direct-write"
 	toolGateHubDB    = "hub-db-direct"
 
-	toolGateTagHelper  = "owner-helper"
-	toolGateTagHandler = "handler"
-	toolGateTagLead    = "lead-allowed"
-	toolGateTagNone    = "none"
+	toolGateTagHelper   = "owner-helper"
+	toolGateTagHandler  = "handler"
+	toolGateTagLead     = "lead-allowed"
+	toolGateTagVerifier = "verifier-allowed"
+	toolGateTagNone     = "none"
 
-	toolGateHandlerPrefix = "db-handler"
-	toolGateLeadPrefix    = "lead-"
-	toolGateLeadForm      = "lead-form" // the kind of a write the item lead may make itself
+	toolGateHandlerPrefix  = "db-handler"
+	toolGateLeadPrefix     = "lead-"
+	toolGateVerifierPrefix = "verifier-"
+	toolGateLeadForm       = "lead-form"    // the kind of a write the item lead may make itself
+	toolGateReceiptForm    = "receipt-form" // the kind of the one the plan's verifier may make too
 
 	toolGateHubPort   = "18765"
 	toolGateHubDir    = "/mnt/deepfreeze/tailterm-hub"
@@ -157,6 +160,7 @@ type toolDenyScan struct {
 	gate             bool
 	hubHost, hubPort string
 	gates            []toolDenyMatch
+	fed              bool // the command being matched has its standard input fed
 }
 
 func (c *toolDenyScan) add(rule, kind string, sum toolDenySum) {
@@ -183,8 +187,8 @@ func (c *toolDenyScan) shell(text string, depth int) {
 		c.failed = true
 		return
 	}
-	for _, words := range p.cmds {
-		c.command(words, depth)
+	for i, words := range p.cmds {
+		c.command(words, depth, p.stdin[i])
 	}
 }
 
@@ -194,18 +198,21 @@ func (c *toolDenyScan) nested(text string, depth int) {
 	}
 }
 
-func (c *toolDenyScan) command(words []string, depth int) {
+func (c *toolDenyScan) command(words []string, depth int, in toolDenyStdin) {
 	words = toolDenyCommandWords(words)
 	if len(words) == 0 {
 		return
 	}
 	name, args := toolDenyBase(words[0]), words[1:]
 	switch name {
-	case "pkill", "killall":
-		c.pkill(name, args)
-		c.deployer(name, name, "", args)
-	case "kill":
-		c.deployer(name, name, "", args)
+	case "pkill", "killall", "kill":
+		if toolDenySendsNothing(name, args) {
+			return
+		}
+		if name != "kill" {
+			c.pkill(name, args)
+		}
+		c.deployer(name, name, "", 0, args)
 	case "tmux":
 		c.tmux(args)
 	case "npm", "pnpm", "yarn", "bun":
@@ -218,28 +225,64 @@ func (c *toolDenyScan) command(words []string, depth int) {
 		sum.omitted += len(args)
 		c.add(toolDenyOldSite, "node-script", sum)
 	case "ssh":
-		c.ssh(args, depth)
+		c.ssh(args, depth, in)
 	case "tt", "curl", "wget", "http", "https", "xh", "sqlite3":
 		if c.gate {
+			c.fed = in.fed
 			c.guarded(name, args)
 		}
 	case "bash", "sh", "zsh":
-		for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") || i < len(args) && strings.HasPrefix(args[i], "+"); i++ {
-			a := args[i]
-			if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
-				i++
-				continue
-			}
-			if a[0] == '-' && !strings.HasPrefix(a, "--") && strings.Contains(a, "c") {
-				if i+1 < len(args) {
-					c.nested(args[i+1], depth)
-				}
-				break
-			}
+		inline, stdin := toolDenyShellArgs(args)
+		c.nested(inline, depth)
+		if stdin {
+			c.nested(in.doc, depth) // a heredoc fed to the shell is its script
 		}
 	case "eval":
 		c.nested(strings.Join(args, " "), depth)
 	}
+}
+
+// toolDenyShellArgs reads the options of bash, sh or zsh. It returns the
+// text of -c when there is one, and otherwise whether the shell reads its
+// commands from standard input: with -s, or with no script file named.
+func toolDenyShellArgs(args []string) (inline string, stdin bool) {
+	i := 0
+	for ; i < len(args) && (strings.HasPrefix(args[i], "-") || strings.HasPrefix(args[i], "+")); i++ {
+		a := args[i]
+		if a == "-o" || a == "+o" || a == "-O" || a == "+O" {
+			i++
+			continue
+		}
+		if a[0] == '-' && !strings.HasPrefix(a, "--") {
+			if strings.Contains(a, "c") {
+				if i+1 < len(args) {
+					inline = args[i+1]
+				}
+				return inline, false
+			}
+			stdin = stdin || strings.Contains(a, "s")
+		}
+	}
+	return "", stdin || i >= len(args)
+}
+
+// toolDenySendsNothing reports a kill, pkill or killall that signals no
+// process: it asks for help or a version, probes with signal 0 or, for
+// killall, only lists (-l), shows (-s) or describes (-d) what it would do.
+func toolDenySendsNothing(name string, args []string) bool {
+	for _, a := range args {
+		switch {
+		case a == "--":
+			return false
+		case a == "--help" || a == "--version" || a == "-0":
+			return true
+		case name == "killall" && len(a) > 1 && a[0] == '-' && a[1] != '-':
+			if _, signal := toolDenySignal(a[1:]); !signal && strings.ContainsAny(a[1:], "lsd") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pkill fires host-pkill unless an option narrows the match to a user,
@@ -273,8 +316,9 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 }
 
 // deployer fires deployer-signal for a signalling command whose own words
-// name the deployer's tmux session.
-func (c *toolDenyScan) deployer(name, kind, sub string, args []string) {
+// name the deployer's tmux session. For tmux, sub is the subcommand and at
+// the index of its word; the caller has checked that its target is named.
+func (c *toolDenyScan) deployer(name, kind, sub string, at int, args []string) {
 	named := false
 	for _, a := range args {
 		if strings.Contains(a, toolDenyDeployerPrefix) {
@@ -300,11 +344,8 @@ func (c *toolDenyScan) deployer(name, kind, sub string, args []string) {
 	if sub != "" {
 		sum.add(sub)
 		// The words before the subcommand, and the word itself, are tmux's own.
-		for skip < len(args) && toolDenyTmuxCommands[args[skip]] != sub {
-			skip++
-			sum.omitted++
-		}
-		skip++
+		sum.omitted += at
+		skip = at + 1
 	}
 	named = false
 	for i := skip; i < len(args); i++ {
@@ -332,24 +373,58 @@ func (c *toolDenyScan) deployer(name, kind, sub string, args []string) {
 	c.add(toolDenyDeployer, kind, sum)
 }
 
+// tmux fires deployer-signal for the first of its commands that ends or
+// types into a session and whose target, the value of -t, names the
+// deployer. One call may hold several commands, separated by a ";" word.
 func (c *toolDenyScan) tmux(args []string) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if len(a) > 1 && a[0] == '-' {
-			if len(a) == 2 && strings.IndexByte("LSfcT", a[1]) >= 0 {
-				i++
-			}
-			continue
+	i := 0
+	for ; i < len(args) && len(args[i]) > 1 && args[i][0] == '-'; i++ {
+		if a := args[i]; len(a) == 2 && strings.IndexByte("LSfcT", a[1]) >= 0 {
+			i++
 		}
-		if sub := toolDenyTmuxCommands[a]; sub != "" {
-			c.deployer("tmux", "tmux-"+sub, sub, args)
+	}
+	for i < len(args) {
+		end := i
+		for end < len(args) && args[end] != ";" {
+			end++
 		}
-		return
+		if sub := toolDenyTmuxCommands[args[i]]; sub != "" && toolDenyTmuxTarget(args[i+1:end]) {
+			c.deployer("tmux", "tmux-"+sub, sub, i, args)
+			return
+		}
+		i = end + 1
 	}
 }
 
+// toolDenyTmuxTarget reports whether the options of one tmux command give a
+// target that names the deployer. The words after the options, such as the
+// keys of send-keys, are not a target.
+func toolDenyTmuxTarget(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(a) < 2 || a[0] != '-' || a == "--" {
+			break
+		}
+		// The first letter that takes a value ends the option letters.
+		at := strings.IndexAny(a, "tNce")
+		if at < 0 {
+			continue
+		}
+		value := a[at+1:]
+		if value == "" && i+1 < len(args) {
+			i++
+			value = args[i]
+		}
+		if a[at] == 't' && strings.Contains(value, toolDenyDeployerPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // npm fires old-site-deploy for `run deploy:static` or `run-script
-// deploy:static`, with any options before either word.
+// deploy:static`, with any options before either word. yarn runs a script
+// named without `run` too.
 func (c *toolDenyScan) npm(name string, args []string) {
 	sum := toolDenySum{}
 	sum.add(name)
@@ -371,12 +446,13 @@ func (c *toolDenyScan) npm(name string, args []string) {
 		}
 	}
 	options()
-	if i >= len(args) || args[i] != "run" && args[i] != "run-script" {
+	if i < len(args) && (args[i] == "run" || args[i] == "run-script") {
+		sum.add(args[i])
+		i++
+		options()
+	} else if name != "yarn" {
 		return
 	}
-	sum.add(args[i])
-	i++
-	options()
 	if i >= len(args) || args[i] != "deploy:static" {
 		return
 	}
@@ -415,8 +491,9 @@ func (c *toolDenyScan) node(args []string) {
 
 // ssh fires truenas-tailscale when the destination is the TrueNAS host and
 // the remote command names tailscale. The remote command of any ssh is also
-// classified as shell text of its own.
-func (c *toolDenyScan) ssh(args []string, depth int) {
+// classified as shell text of its own. A heredoc is the remote command when
+// none is given, or when the one given is a shell reading its standard input.
+func (c *toolDenyScan) ssh(args []string, depth int, in toolDenyStdin) {
 	sum := toolDenySum{}
 	sum.add("ssh")
 	i := 0
@@ -449,6 +526,16 @@ func (c *toolDenyScan) ssh(args []string, depth int) {
 		host = host[at+1:]
 	}
 	remote := strings.Join(args[i+1:], " ")
+	if in.doc != "" {
+		shell := toolDenyCommandWords(strings.Fields(remote))
+		stdin := len(shell) == 0
+		if !stdin && (toolDenyBase(shell[0]) == "bash" || toolDenyBase(shell[0]) == "sh" || toolDenyBase(shell[0]) == "zsh") {
+			_, stdin = toolDenyShellArgs(shell[1:])
+		}
+		if stdin {
+			remote = in.doc
+		}
+	}
 	label := ""
 	if strings.Contains(strings.ToLower(host), "truenas") {
 		label = "truenas"
@@ -602,6 +689,8 @@ func toolDenyCommandWords(words []string) []string {
 			words = toolDenySkipOptions(words[1:], "a")
 		case "time":
 			words = toolDenySkipOptions(words[1:], "")
+		case "nice":
+			words = toolDenySkipOptions(words[1:], "n")
 		case "timeout":
 			if words = toolDenySkipOptions(words[1:], "sk"); len(words) > 0 {
 				words = words[1:] // the duration
@@ -642,12 +731,22 @@ func toolDenySkipOptions(words []string, valued string) []string {
 
 // toolDenyParser splits shell text into simple commands, each a list of
 // words with the quoting removed. Text inside quotes is part of a word and
-// never a command; a heredoc body is skipped. A substitution is kept, as
-// written, in the word that holds it and its commands are listed too.
+// never a command, and neither are the words of an array literal, a case
+// pattern, a [[ ]] condition or an arithmetic (( )). A heredoc body is kept
+// for the command it feeds and is otherwise skipped. A substitution is kept,
+// as written, in the word that holds it and its commands are listed too.
 type toolDenyParser struct {
-	s      string
-	cmds   [][]string
-	failed bool // substitutions nested too deep to follow
+	s       string
+	cmds    [][]string
+	stdin   map[int]toolDenyStdin // by index in cmds, for the commands that are fed
+	scanned int                   // bytes read looking for the end of an arithmetic
+	failed  bool                  // substitutions nested too deep to follow
+}
+
+// toolDenyStdin is what a simple command's standard input is known to be.
+type toolDenyStdin struct {
+	fed bool   // a pipe, a redirect or a heredoc feeds it
+	doc string // the body of its heredoc
 }
 
 // toolDenySpecial marks the bytes that can end a run of plain word text.
@@ -659,8 +758,30 @@ var toolDenySpecial = func() (special [256]bool) {
 }()
 
 type toolDenyHeredoc struct {
-	end  string
-	tabs bool // <<-: leading tabs are stripped from the terminator line
+	end   string
+	tabs  bool // <<-: leading tabs are stripped from the terminator line
+	stdin bool // it is standard input, not another descriptor
+	cmd   int  // the index in cmds of the command it feeds, or -1
+}
+
+// toolDenyLeads reports whether every word so far is a shell keyword, so
+// that the next word starts a command.
+func toolDenyLeads(words []string) bool {
+	for _, w := range words {
+		switch w {
+		case "if", "then", "else", "elif", "do", "while", "until", "!", "time":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// toolDenyArrayName reports whether a word is NAME= or NAME+=, which an
+// opening parenthesis turns into an array assignment.
+func toolDenyArrayName(word string) bool {
+	name, ok := strings.CutSuffix(word, "=")
+	return ok && toolDenyAssignment(strings.TrimSuffix(name, "+")+"=")
 }
 
 // parse reads from pos to the terminator of a substitution, ')' or '`', or
@@ -673,30 +794,101 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 		inWord   bool
 		skipNext bool // the next word is a redirect's target
 		heredocs []toolDenyHeredoc
+		docsFrom int  // heredocs[docsFrom:] were opened by the command being read
+		fed      bool // the command being read has its standard input redirected
+		piped    bool // the command before this one pipes into it
 		parens   int
+		array    bool // inside NAME=( ), whose words are values
+		cases    int  // case statements not yet closed by esac
+		caseWait int  // words still to come before the "in" of a case
+		pattern  bool // inside a case pattern list, up to its ")"
+		cond     bool // inside [[ ]]
 	)
 	endWord := func() {
 		if !inWord {
 			return
 		}
-		if skipNext {
-			skipNext = false
-		} else {
-			words = append(words, word.String())
-		}
+		w := word.String()
 		word.Reset()
 		inWord = false
+		if skipNext {
+			skipNext = false
+			return
+		}
+		switch {
+		case array:
+			return
+		case pattern:
+			if w == "esac" {
+				cases--
+				pattern = false
+			}
+			return
+		case cond:
+			cond = w != "]]"
+		case caseWait > 0:
+			if caseWait--; caseWait == 0 && w == "in" {
+				cases++
+				pattern = true
+				words = nil
+				return
+			}
+		case w == "esac" && cases > 0 && len(words) == 0:
+			cases--
+			return
+		case w == "case" && toolDenyLeads(words):
+			caseWait = 2
+		case w == "[[" && toolDenyLeads(words):
+			cond = true
+		}
+		words = append(words, w)
 	}
 	endCmd := func() {
 		endWord()
 		skipNext = false
+		caseWait = 0
 		if len(words) > 0 {
+			if fed || piped {
+				if p.stdin == nil {
+					p.stdin = map[int]toolDenyStdin{}
+				}
+				p.stdin[len(p.cmds)] = toolDenyStdin{fed: true}
+			}
+			for i := docsFrom; i < len(heredocs); i++ {
+				if heredocs[i].stdin {
+					heredocs[i].cmd = len(p.cmds)
+				}
+			}
 			p.cmds = append(p.cmds, words)
 			words = nil
+			piped = false
 		}
+		docsFrom = len(heredocs)
+		fed = false
 	}
 	for pos < len(s) {
 		c := s[pos]
+		if cond && strings.IndexByte("()|&<>", c) >= 0 {
+			// Operators of the condition, unless it has just been closed.
+			if !inWord || word.String() != "]]" {
+				word.WriteByte(c)
+				inWord = true
+				pos++
+				continue
+			}
+			endWord()
+		}
+		if c == ')' && (array || pattern) {
+			endWord()
+			array, pattern = false, false
+			pos++
+			continue
+		}
+		if pattern && (c == '|' || c == '(') {
+			endWord()
+			pos++
+			continue
+		}
 		switch {
 		case c == '`' && term == '`':
 			endCmd()
@@ -712,6 +904,19 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			endCmd()
 			pos++
 		case c == '(':
+			if !inWord && strings.HasPrefix(s[pos:], "((") {
+				if end := p.arithmetic(pos+2, nest); end >= 0 {
+					pos = end
+					continue
+				}
+			}
+			if inWord && !array && toolDenyArrayName(word.String()) {
+				word.Reset()
+				inWord = false
+				array = true
+				pos++
+				continue
+			}
 			endCmd()
 			parens++
 			pos++
@@ -720,11 +925,23 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			pos++
 		case c == '\n':
 			endCmd()
-			pos = toolDenySkipHeredocs(s, pos+1, heredocs)
-			heredocs = nil
+			pos = p.heredocs(pos+1, heredocs)
+			heredocs, docsFrom = nil, 0
 		case c == ';' || c == '|':
 			endCmd()
 			pos++
+			switch {
+			case c == '|' && pos < len(s) && s[pos] == '|': // "||" is not a pipe
+				pos++
+			case c == '|':
+				piped = true
+			case cases > 0 && pos < len(s) && (s[pos] == ';' || s[pos] == '&'):
+				// ";;", ";&" and ";;&" end a case clause: patterns follow.
+				for pos < len(s) && (s[pos] == ';' || s[pos] == '&') {
+					pos++
+				}
+				pattern = true
+			}
 		case c == '&':
 			if pos+1 < len(s) && s[pos+1] == '>' { // &> and &>> redirect
 				endWord()
@@ -736,7 +953,9 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 				pos++
 			}
 		case c == '<' || c == '>':
+			stdin := c == '<'
 			if inWord && toolDenyDigits(word.String()) {
+				stdin = stdin && word.String() == "0"
 				word.Reset() // the descriptor number of 2>file
 				inWord = false
 			} else {
@@ -745,7 +964,9 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			if strings.HasPrefix(s[pos:], "<<") && !strings.HasPrefix(s[pos:], "<<<") {
 				var doc toolDenyHeredoc
 				if pos, doc = toolDenyHeredocWord(s, pos+2); doc.end != "" {
+					doc.cmd, doc.stdin = -1, stdin
 					heredocs = append(heredocs, doc)
+					fed = fed || stdin
 				}
 				continue
 			}
@@ -753,6 +974,7 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			}
 			// <(command) and >(command) hold a command, not a file name.
 			skipNext = pos >= len(s) || s[pos] != '('
+			fed = fed || stdin && skipNext
 		case c == '#' && !inWord:
 			for pos < len(s) && s[pos] != '\n' {
 				pos++
@@ -797,6 +1019,57 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 	return len(s)
 }
 
+// arithmetic reads the body of (( )) or $(( )) from pos and returns the
+// index after its "))", or -1 when the text is not one: then the parentheses
+// are subshells. Only the substitutions inside it hold commands, so a "<<"
+// there is a shift and opens no heredoc. The bytes read are bounded over the
+// whole text, so many unclosed openings cost no more than a few passes.
+func (p *toolDenyParser) arithmetic(pos, nest int) int {
+	s := p.s
+	if p.scanned > 4*len(s)+1024 {
+		return -1
+	}
+	end, depth := -1, 0
+	i := pos
+	for ; i < len(s) && end < 0; i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			} else if i+1 < len(s) && s[i+1] == ')' {
+				end = i
+			} else {
+				p.scanned += i - pos
+				return -1
+			}
+		case '\\':
+			i++
+		case '\'', '"':
+			quote := strings.IndexByte(s[i+1:], s[i])
+			if quote < 0 {
+				quote = len(s)
+			}
+			i += quote + 1
+		}
+	}
+	p.scanned += i - pos
+	if end < 0 {
+		return -1
+	}
+	var unused strings.Builder
+	for i = pos; i < end; {
+		if s[i] == '`' || s[i] == '$' && s[i+1] == '(' {
+			i = p.expansion(i, &unused, nest, true)
+			unused.Reset()
+		} else {
+			i++
+		}
+	}
+	return end + 2
+}
+
 // quoted reads a double-quoted string and returns the index after it.
 func (p *toolDenyParser) quoted(pos int, word *strings.Builder, nest int) int {
 	s := p.s
@@ -838,7 +1111,13 @@ func (p *toolDenyParser) expansion(pos int, word *strings.Builder, nest int, quo
 	case s[pos] == '`':
 		end = p.substitution(pos+1, '`', nest) + 1
 	case strings.HasPrefix(s[pos:], "$("):
-		end = p.substitution(pos+2, ')', nest) + 1
+		end = -1
+		if strings.HasPrefix(s[pos:], "$((") {
+			end = p.arithmetic(pos+3, nest)
+		}
+		if end < 0 {
+			end = p.substitution(pos+2, ')', nest) + 1
+		}
 	case strings.HasPrefix(s[pos:], "${"):
 		if close := strings.IndexByte(s[pos:], '}'); close >= 0 {
 			end = pos + close + 1
@@ -896,24 +1175,29 @@ func toolDenyHeredocWord(s string, pos int) (int, toolDenyHeredoc) {
 	return pos, doc
 }
 
-// toolDenySkipHeredocs returns the index after the bodies of the heredocs
-// opened on the line that just ended.
-func toolDenySkipHeredocs(s string, pos int, heredocs []toolDenyHeredoc) int {
+// heredocs returns the index after the bodies of the heredocs opened on the
+// line that just ended, and keeps the body of each one that feeds a command.
+func (p *toolDenyParser) heredocs(pos int, heredocs []toolDenyHeredoc) int {
+	s := p.s
 	for _, doc := range heredocs {
+		start, end := pos, len(s)
 		for pos < len(s) {
-			end := strings.IndexByte(s[pos:], '\n')
-			line := s[pos:]
-			next := len(s)
-			if end >= 0 {
-				line, next = s[pos:pos+end], pos+end+1
+			at := pos
+			line, next := s[pos:], len(s)
+			if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+				line, next = line[:nl], pos+nl+1
 			}
 			pos = next
 			if doc.tabs {
 				line = strings.TrimLeft(line, "\t")
 			}
 			if line == doc.end {
+				end = at
 				break
 			}
+		}
+		if doc.cmd >= 0 {
+			p.stdin[doc.cmd] = toolDenyStdin{fed: true, doc: s[start:end]}
 		}
 	}
 	return pos
@@ -1117,18 +1401,30 @@ func (c *toolDenyScan) gateCommand(name string, args []string) {
 }
 
 // addGate keeps one match per gate rule: the first found, except that a
-// write the item lead may make itself gives way to a later one it may not,
-// so one allowed command cannot tag a whole call lead-allowed.
+// write a lead or a verifier may make itself gives way to a later one that
+// fewer may make, so one allowed command cannot tag a whole call allowed.
 func (c *toolDenyScan) addGate(rule, kind string, sum toolDenySum) {
 	for i, m := range c.gates {
 		if m.rule == rule {
-			if m.kind == toolGateLeadForm && kind != toolGateLeadForm {
+			if toolGateRank(kind) > toolGateRank(m.kind) {
 				c.gates[i] = toolDenyMatch{rule, kind, sum.done()}
 			}
 			return
 		}
 	}
 	c.gates = append(c.gates, toolDenyMatch{rule, kind, sum.done()})
+}
+
+// toolGateRank orders the kinds of a work-item write by how few may make
+// it: the lead and the verifier, the lead alone, the handler alone.
+func toolGateRank(kind string) int {
+	switch kind {
+	case toolGateReceiptForm:
+		return 0
+	case toolGateLeadForm:
+		return 1
+	}
+	return 2
 }
 
 // tt fires work-item-write when the leading words are a write subcommand.
@@ -1149,14 +1445,21 @@ func (c *toolDenyScan) tt(args []string) {
 	}
 	kind, kept := "", words
 	switch {
+	case args[0] == "verification" && args[1] == "receipt":
+		kind = toolGateReceiptForm
 	case args[0] == "verification":
 		kind = toolGateLeadForm
+	case words == 3 && args[0] == "team" && args[2] == "scope":
+		kind = toolGateLeadForm // the lead's scope amendment of its own queue entry
 	case args[0] == "work-items" && args[1] == "update":
 		// The done save with queue acceptance: --status done and all three
 		// of --worktree, --branch and --commit. Only the option names are kept.
 		done, seen, named := false, map[string]bool{}, 0
 		for i := words; i < len(args); i++ {
 			name, value, attached := strings.Cut(args[i], "=")
+			if len(name) > 1 && name[0] == '-' && name[1] != '-' {
+				name = "-" + name // tt's flags take one dash as well as two
+			}
 			switch name {
 			case "--status":
 				if !attached && i+1 < len(args) {
@@ -1201,26 +1504,42 @@ func (c *toolDenyScan) http(name string, args []string) {
 	}
 	switch name {
 	case "curl":
-		get, head := false, false
+		// --next starts another request with its own options. The first
+		// request that is a write to the hub is the match.
+		var m, t string
+		data, get, head := false, false, false
+		request := func() {
+			if !write && t != "" && (m != "" && m != "GET" || (data || head) && !get) {
+				if method = m; head && m == "" {
+					method = "HEAD"
+				}
+				target, body, write = t, data, true
+			}
+			m, t, data, get, head = "", "", false, false, false
+		}
 		toolGateCurl.walk(args, func(opt, value string) {
 			switch opt {
 			case "-X", "--request":
-				method = strings.ToUpper(value)
+				m = strings.ToUpper(value)
 			case "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file":
-				body = true
+				data = true
 			case "-I", "--head":
 				head = true
-			case "-G", "--get":
+			case "-G", "--get": // the data becomes a query, so the request stays a GET
 				get = true
-			case "--url":
-				url(value)
+			case "--url", "--expand-url":
+				if t == "" {
+					t = c.target(value, scheme)
+				}
+			case "--next", "-:":
+				request()
 			}
-		}, url)
-		// -G turns the data into a query, so the request stays a GET.
-		write = method != "" && method != "GET" || (body || head) && !get
-		if head && method == "" {
-			method = "HEAD"
-		}
+		}, func(word string) {
+			if t == "" {
+				t = c.target(word, scheme)
+			}
+		})
+		request()
 	case "wget":
 		toolGateWget.walk(args, func(opt, value string) {
 			switch opt {
@@ -1233,8 +1552,17 @@ func (c *toolDenyScan) http(name string, args []string) {
 		write = body || method != "" && method != "GET"
 	default:
 		var words []string
-		toolGateHTTPie.walk(args, func(string, string) {}, func(word string) { words = append(words, word) })
-		if len(words) > 1 && toolGateMethods[strings.ToUpper(words[0])] {
+		stdin := c.fed
+		toolGateHTTPie.walk(args, func(opt, _ string) {
+			switch opt {
+			case "--raw":
+				body = true
+			case "--ignore-stdin", "-I":
+				stdin = false
+			}
+		}, func(word string) { words = append(words, word) })
+		// A first word made of letters, with another after it, is the method.
+		if len(words) > 1 && toolGateLetters(words[0]) {
 			method, words = strings.ToUpper(words[0]), words[1:]
 		}
 		if len(words) == 0 {
@@ -1245,6 +1573,8 @@ func (c *toolDenyScan) http(name string, args []string) {
 		for _, item := range words[1:] {
 			body = body || toolGateBodyItem(item)
 		}
+		// Standard input that is fed is sent as the body.
+		body = body || stdin
 		write = body || method != "" && method != "GET"
 	}
 	if !write || target == "" {
@@ -1267,6 +1597,15 @@ func (c *toolDenyScan) http(name string, args []string) {
 	c.addGate(toolGateHubWrite, "", sum)
 }
 
+func toolGateLetters(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i] | 0x20; c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	return s != ""
+}
+
 // toolGateBodyItem reports whether an HTTPie request item is a body field:
 // its first separator is =, := or @. A header (name:value) and a query
 // parameter (name==value) leave the request a GET.
@@ -1282,12 +1621,21 @@ func toolGateBodyItem(item string) bool {
 // target judges one word by its URL authority alone and returns the fixed
 // word for the hub it names, or nothing. A path, a query and a fragment are
 // never read. The parser keeps a variable as written, so a word that starts
-// with the TAILTERM_HUB variable has the hub in its authority position.
+// with the TAILTERM_HUB variable, whole or with one end stripped, has the
+// hub in its authority position.
 func (c *toolDenyScan) target(word, scheme string) string {
-	for _, variable := range []string{"$TAILTERM_HUB", "${TAILTERM_HUB}"} {
-		if rest, ok := strings.CutPrefix(word, variable); ok && (rest == "" || strings.IndexByte("/?#", rest[0]) >= 0) {
-			return toolGateTargetHub
+	rest, ok := strings.CutPrefix(word, "$TAILTERM_HUB")
+	if !ok {
+		// ${TAILTERM_HUB}, or with a strip of its end or start: ${TAILTERM_HUB%/}.
+		if rest, ok = strings.CutPrefix(word, "${TAILTERM_HUB"); ok {
+			end := strings.IndexByte(rest, '}')
+			if ok = end == 0 || end > 0 && (rest[0] == '%' || rest[0] == '#'); ok {
+				rest = rest[end+1:]
+			}
 		}
+	}
+	if ok && (rest == "" || strings.IndexByte("/?#", rest[0]) >= 0) {
+		return toolGateTargetHub
 	}
 	host, port := toolGateAuthority(word, scheme)
 	switch {
@@ -1371,16 +1719,19 @@ func (c *toolDenyScan) sqlite(args []string) {
 }
 
 // gateTag names who ran a gate match, from what the hook already holds. The
-// handler and the lead are told by name prefix and, for the lead, by the
-// form of the command: the hook cannot ask the hub whose entry it names.
+// handler, the lead and the verifier are told by name prefix and, for the
+// last two, by the form of the command: the hook cannot ask the hub whose
+// entry or plan it names.
 func (l toolLedger) gateTag(m toolDenyMatch) string {
 	switch {
 	case l.helper:
 		return toolGateTagHelper
 	case strings.HasPrefix(l.name, toolGateHandlerPrefix):
 		return toolGateTagHandler
-	case strings.HasPrefix(l.name, toolGateLeadPrefix) && m.kind == toolGateLeadForm:
+	case strings.HasPrefix(l.name, toolGateLeadPrefix) && (m.kind == toolGateLeadForm || m.kind == toolGateReceiptForm):
 		return toolGateTagLead
+	case strings.HasPrefix(l.name, toolGateVerifierPrefix) && m.kind == toolGateReceiptForm:
+		return toolGateTagVerifier
 	}
 	return toolGateTagNone
 }

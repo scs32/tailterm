@@ -82,6 +82,38 @@ func TestToolDenyClassify(t *testing.T) {
 		{"truenas-tailscale", `ssh -p 22 TrueNAS.local Tailscale down`},
 
 		{"host-pkill,deployer-signal,old-site-deploy,truenas-tailscale", `pkill -f tt-deployer; npm run deploy:static && ssh truenas tailscale status`},
+
+		// k2: a heredoc fed to a shell, here or over ssh, is its script.
+		{"host-pkill", "bash <<'EOF'\npkill node\nEOF"},
+		{"host-pkill", "sudo bash -s -- one <<EOF\necho start\nkillall node\nEOF\necho done"},
+		{"host-pkill", "ssh air <<'EOF'\npkill node\nEOF"},
+		{"truenas-tailscale", "ssh truenas <<'EOF'\nsudo tailscale up\nEOF"},
+		{"truenas-tailscale", "ssh truenas 'bash -s' <<-EOF\n\ttailscale up\n\tEOF"},
+		{"host-pkill,truenas-tailscale", "ssh truenas sudo sh <<'EOF'\ntailscale down; pkill node\nEOF"},
+		// k2: nice, yarn without run, a second tmux command, and a shift that is no heredoc.
+		{"host-pkill", `nice pkill node`},
+		{"host-pkill", `nice -n 10 sudo pkill node`},
+		{"old-site-deploy", `yarn deploy:static`},
+		{"old-site-deploy", `yarn --cwd site deploy:static`},
+		{"deployer-signal", `tmux new -d \; kill-session -t tt-deployer-compact`},
+		{"deployer-signal", `tmux -L main new -d \; send-keys -t x y \; killw -t tt-deployer-compact:1`},
+		{"host-pkill", "(( n << 2 ))\npkill node"},
+		{"host-pkill", "x=$(( n << 2 ))\npkill node"},
+		{"host-pkill", "for (( i = 0; i < 1 << n; i++ )); do\npkill node\ndone"},
+		// What k1 leaves alone still runs: a command after or inside each form.
+		{"host-pkill", `files=(a b); pkill node`},
+		{"host-pkill", `files=($(pkill node) b)`},
+		{"host-pkill", `case "$x" in a|b) pkill node ;; esac`},
+		{"host-pkill", `case "$x" in a) echo a ;; *) echo b; esac; pkill node`},
+		{"host-pkill", `case "$x" in $(pkill node)) echo a ;; esac`},
+		{"host-pkill", `if [[ $x =~ ^(a|b)$ ]]; then pkill node; fi`},
+		{"host-pkill", `[[ -f x ]]&& pkill node`},
+		{"host-pkill", `[[ -f x || -f y ]] || pkill node`},
+		{"host-pkill", `((pkill node); echo done)`},
+		{"host-pkill", `echo $(( $(pkill node; echo 1) + 1 ))`},
+		{"deployer-signal", `tmux send-keys -t tt-deployer-compact 'check status' Enter`},
+		{"deployer-signal", `tmux kill-session -ttt-deployer-compact`},
+		{"deployer-signal", `pkill -f tt-deployer -u "$USER"`},
 	}
 	for _, c := range fires {
 		t.Run("fires/"+c.command, func(t *testing.T) {
@@ -109,6 +141,30 @@ func TestToolDenyClassify(t *testing.T) {
 		`echo ok # pkill node`,
 		toolDenyHeredocNearMiss,
 		"git commit -m \"$(cat <<'EOF'\nDon't run pkill node (or killall node)\nEOF\n)\"",
+		// k1: words that are values, patterns or operands, and calls that signal nothing.
+		`files=(scripts/deploy-static.mjs x)`,
+		`cmds+=(pkill killall)`,
+		"declare -a cmds=(\n  pkill\n  'killall node'\n)",
+		`case "$x" in pkill|killall) echo no ;; esac`,
+		`case $x in a) echo a ;; pkill) echo b ;; (killall | pkill) echo c ;& *) echo d ;; esac`,
+		"case $x in\n  pkill)\n    echo b\n    ;;\n  killall) echo c\nesac",
+		`echo $(case $x in pkill) echo b ;; esac)`,
+		`[[ $x =~ ^(pkill|killall)$ ]]`,
+		`if [[ $x == pkill || $x =~ (killall|pkill) ]]; then echo yes; fi`,
+		`[[ $x < pkill ]] && echo yes`,
+		`pkill --help`,
+		`pkill -0 -f vite`,
+		`killall -d node`,
+		`killall --version`,
+		`pkill -0 -f tt-deployer`,
+		`kill -0 $(tmux list-panes -t tt-deployer-compact -F '#{pane_pid}')`,
+		// A heredoc that is data, not the script.
+		"bash run.sh <<'EOF'\npkill node\nEOF",
+		"bash -c 'cat' <<'EOF'\npkill node\nEOF",
+		"ssh truenas cat <<'EOF'\ntailscale up\nEOF",
+		"ssh air 'cat > notes.txt' <<'EOF'\npkill node\nEOF",
+		"bash 3<<'EOF'\npkill node\nEOF",
+		`echo $(( 1 << 2 )) pkill node`,
 		// deployer-signal
 		`tmux has-session -t tt-deployer-compact`,
 		`tmux capture-pane -p -t tt-deployer-compact`,
@@ -116,6 +172,10 @@ func TestToolDenyClassify(t *testing.T) {
 		`tmux kill-session -t tt-builder-1`,
 		`tmux -L test kill-server`,
 		`echo tt-deployer-compact; kill 12345`,
+		`tmux send-keys -t tt-builder-1 'check tt-deployer-compact status' Enter`,
+		`tmux send-keys -t tt-builder-1 -- -t tt-deployer-compact`,
+		`tmux new -s tt-deployer-compact \; kill-session -t tt-builder-1`,
+		`tmux kill-session -t tt-builder-1 \; has-session -t tt-deployer-compact`,
 		// old-site-deploy
 		`npm run deploy:tailos`,
 		`npm run build`,
@@ -125,6 +185,9 @@ func TestToolDenyClassify(t *testing.T) {
 		`node -e "console.log(1)" scripts/deploy-static.mjs`,
 		`git log -- scripts/deploy-static.mjs`,
 		`tt send --subject "do not run npm run deploy:static"`,
+		`npm deploy:static`,
+		`pnpm deploy:static`,
+		`yarn add deploy:static`,
 		// truenas-tailscale
 		`tailscale status`,
 		`tailscale ip -4`,
@@ -286,6 +349,13 @@ func TestToolDenySummary(t *testing.T) {
 		{`ssh -o BatchMode=yes truenas "midclt call app.query; systemctl restart tailscaled"`, []string{"truenas-tailscale: ssh -o truenas tailscale (+7 args)"}},
 		{`ssh -i /srv/site/id -p 2222 truenas_admin@100.116.238.37 tailscale status`, []string{"truenas-tailscale: ssh -i -p 100.116.238.37 tailscale status (+2 args)"}},
 		{`pkill ` + strings.Repeat("-f ", 40) + `node`, []string{"host-pkill: pkill -f -f -f -f -f -f -f (+34 args)"}},
+		{"bash <<'EOF'\npkill -f ab12cd34\nEOF", []string{"host-pkill: pkill -f (+1 args)"}},
+		{"ssh truenas <<'EOF'\nsudo tailscale up --authkey=zzQ-not-a-shape\nEOF", []string{"truenas-tailscale: ssh truenas tailscale up (+2 args)"}},
+		{`nice -n 5 pkill -f ab12cd34`, []string{"host-pkill: pkill -f (+1 args)"}},
+		{`yarn deploy:static --token ` + github, []string{"old-site-deploy: yarn deploy:static (+2 args)"}},
+		{`tmux new -d -s ab12cd34 \; kill-session -t tt-deployer-compact`, []string{"deployer-signal: tmux kill-session -t tt-deployer-compact (+5 args)"}},
+		{"(( n << 2 ))\npkill -f ab12cd34", []string{"host-pkill: pkill -f (+1 args)"}},
+		{`files=(scripts/deploy-static.mjs ab12cd34); case $x in pkill|killall) tmux send-keys -t tt-builder-1 'tt-deployer-compact' ;; esac; [[ $x =~ (pkill|killall) ]]; pkill --help; pkill -0 -f vite; killall -d node`, nil},
 	}
 	for i, c := range cases {
 		id := fmt.Sprintf("u%d", i)
@@ -636,6 +706,9 @@ func gateRowTexts(rows []map[string]any) []string {
 
 const toolGateDoneSave = "tt work-items update wi_0123456789abcdef --status done --worktree /w/queue-x --branch fix-x --commit 0123abc"
 
+// k5: the same save with the single-dash flags Go's flag package accepts.
+const toolGateDoneSaveOneDash = "tt work-items update wi_0123456789abcdef -status done -worktree /w/queue-x -branch fix-x -commit 0123abc"
+
 // toolGateWriteForms is every write form of the plan's table.
 func toolGateWriteForms() []string {
 	forms := []string{
@@ -725,6 +798,24 @@ func TestToolGateClassify(t *testing.T) {
 		{toolGateHubWrite, toolGateTestHub, `ssh air 'curl -X POST http://127.0.0.1:18765/api/x'`},
 		{toolGateHubWrite, toolGateTestHub, `bash -c "curl -X POST http://127.0.0.1:18765/api/x"`},
 		{toolGateHubWrite, toolGateTestHub, `TOKEN=$(cat t) && sudo curl -X POST http://` + hub + `/x`},
+		// k5: HTTPie posts what it is fed, a --raw body, and any method but GET.
+		{toolGateHubWrite, toolGateTestHub, `echo '{}' | http ` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `cat body.json | sudo xh $TAILTERM_HUB/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `http ` + hub + `/api/x < body.json`},
+		{toolGateHubWrite, toolGateTestHub, "http " + hub + "/api/x <<'EOF'\n{}\nEOF"},
+		{toolGateHubWrite, toolGateTestHub, `http ` + hub + `/api/x <<< '{}'`},
+		{toolGateHubWrite, "", `http --raw '{}' :18765/x`},
+		{toolGateHubWrite, "", `http --raw='{}' :18765/x`},
+		{toolGateHubWrite, "", `http PURGE :18765/x`},
+		{toolGateHubWrite, toolGateTestHub, `xh purge ` + hub + `/x`},
+		// k5: curl's --expand-url is a URL, a strip of the variable is still the hub, and --next starts a new request.
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST --expand-url http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -d x --expand-url=http://` + hub + `/api/{{name}}`},
+		{toolGateHubWrite, "", `curl -X POST "${TAILTERM_HUB%/}/api/x"`},
+		{toolGateHubWrite, "", `curl -d x ${TAILTERM_HUB%%/}`},
+		{toolGateHubWrite, "", `curl -d x "${TAILTERM_HUB#http://}/api/x"`},
+		{toolGateHubWrite, toolGateTestHub, `curl https://example.com --next -X POST http://` + hub + `/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -d x http://` + hub + `/x -: https://example.com`},
 
 		{toolGateHubDB, "", `sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`},
 		{toolGateHubDB, "", `sqlite3 /mnt/deepfreeze/tailterm-hub`},
@@ -777,6 +868,15 @@ func TestToolGateClassify(t *testing.T) {
 		`wget --header 'X: http://h:18765' --post-data a=b https://example.com`,
 		`http GET ` + hub + `/api/x`, `http ` + hub + `/api/x q==1 X-Trace:on`, `http POST example.com Host:h:18765 next=http://h:18765`,
 		`xh ` + port + `/api/x`, `echo curl -X POST http://h:18765`, `echo "curl -X POST http://h:18765/x"`,
+		// k5: the write and the hub in different requests of one curl, input that is not fed or not read, and other expansions.
+		`curl -X POST https://example.com --next http://` + port + `/x`, `curl -d x https://example.com -: http://` + hub + `/x`,
+		`curl http://` + hub + `/x --next -I https://example.com`, `curl -X POST --expand-url https://example.com/x`,
+		`echo '{}' | http --ignore-stdin ` + hub + `/api/x`, `echo '{}' | xh -I ` + hub + `/api/x`, `http ` + hub + `/api/x | jq .`,
+		`true || http ` + hub + `/api/x`, `echo '{}' | curl http://` + hub + `/api/x`, `echo '{}' | tee b.json; http ` + hub + `/api/x`,
+		`http ` + hub + `/api/x > out.json`, `http ` + hub + `/api/x 2< body.json`, `http <(echo x) ` + hub, `http get ` + hub + `/api/x`,
+		`http --raw '{}' example.com/x`, `http PURGE example.com/x`, `http localhost q==1`,
+		`curl -X POST ${TAILTERM_HUBS%/}/x`, `curl -X POST "${TAILTERM_HUB%:*}:9/x"`, `curl -X POST ${TAILTERM_HUB:-https://example.com}/x`,
+		`curl -X POST ${TAILTERM_HUB/8443/9}/x`, `curl -X POST https://example.com/${TAILTERM_HUB%/}`,
 		// Another file, a sibling name, and the directory only in SQL text or an option's value.
 		`sqlite3 /tmp/x.db`, `sqlite3 ./hub.db`, `sqlite3`, `sqlite3 -readonly`, `ls /mnt/deepfreeze/tailterm-hub`,
 		`echo sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`, `sqlite3 /mnt/deepfreeze/tailterm-hub-backup/hub.db`,
@@ -818,6 +918,17 @@ func TestToolGateClassify(t *testing.T) {
 		`curl -d x http://` + hub:                                                              "curl data hub (+2 args)",
 		`wget --method=PUT --body-data x http://` + hub:                                        "wget PUT data hub (+3 args)",
 		`http POST ` + hub + `/x a=b`:                                                          "http POST data hub (+2 args)",
+		`echo '{"a":1}' | http ` + hub + `/x`:                                                  "http data hub",
+		`http --raw '{"a":1}' ` + hub + `/x`:                                                   "http data hub (+2 args)",
+		`http PURGE ` + hub + `/x`:                                                             "http method hub (+1 args)",
+		`curl -sS --expand-url http://` + hub + `/x -X PUT`:                                    "curl PUT hub (+4 args)",
+		`curl -d x "${TAILTERM_HUB%/}/api/x"`:                                                  "curl data hub (+2 args)",
+		`curl https://example.com --next -I http://` + port + `/x`:                             "curl HEAD port-18765 (+3 args)",
+		toolGateDoneSaveOneDash:                                                                "tt work-items update --status done --worktree --branch --commit (+4 args)",
+		"tt work-items update wi_1 -status=done -worktree=/w -branch=b --commit=c":             "tt work-items update --status done --worktree --branch --commit (+1 args)",
+		"tt work-items update wi_1 -status done -branch b -commit c":                           "tt work-items update (+7 args)",
+		"tt team queue scope --entry tqe_1 --owns a.go":                                        "tt team queue scope (+4 args)",
+		"tt verification receipt --item wi_1 --check v1":                                       "tt verification receipt (+4 args)",
 		`sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`:                                          "sqlite3 hub-db",
 		`sqlite3 -readonly /mnt/deepfreeze/tailterm-hub/hub.db "select 1"`:                     "sqlite3 hub-db (+2 args)",
 	}
@@ -827,10 +938,19 @@ func TestToolGateClassify(t *testing.T) {
 			t.Errorf("%s: matches %v; want the summary %q", command, gates, want)
 		}
 	}
-	// One match per rule. A write the lead may make gives way to one it may not, in either order.
+	// One match per rule. A write the lead may make gives way to one it may not, in either order,
+	// and the receipt a verifier may save too gives way to both.
 	for command, want := range map[string]string{
 		"tt verification plan --item wi_1":                                 toolGateLeadForm,
 		toolGateDoneSave:                                                   toolGateLeadForm,
+		toolGateDoneSaveOneDash:                                            toolGateLeadForm,
+		"tt team queue scope --entry tqe_1":                                toolGateLeadForm,
+		"tt team queue accept --entry tqe_1":                               "",
+		"tt verification receipt --item wi_1":                              toolGateReceiptForm,
+		"tt verification receipt --item wi_1; tt verification plan":        toolGateLeadForm,
+		"tt verification plan; tt verification receipt --item wi_1":        toolGateLeadForm,
+		"tt verification receipt --item wi_1; tt work-items create":        "",
+		"tt work-items create; tt verification receipt --item wi_1":        "",
 		"tt work-items update wi_1 --status done":                          "",
 		"tt verification plan --item wi_1; tt work-items create --title x": "",
 		"tt work-items create --title x; tt verification plan --item wi_1": "",
@@ -930,6 +1050,7 @@ func TestToolGateRow(t *testing.T) {
 // lead, the form of the command. Tagged rows are written, not dropped.
 func TestToolGateTags(t *testing.T) {
 	const create, plan, receipt = "tt work-items create --title x", "tt verification plan --item wi_1 --file p.json", "tt verification receipt --item wi_1 --check v1"
+	const scope = "tt team queue scope --entry tqe_1 --owns a.go"
 	// The item id in toolGateDoneSave belongs to no entry the hook knows of:
 	// it keeps no state and may not ask the hub whose entry a command names.
 	// So a lead running the done save for an item that is not its own is
@@ -948,7 +1069,30 @@ func TestToolGateTags(t *testing.T) {
 		{"lead-x", toolGateAllRules, "none,none,none", "lead-x"},
 		{"builder-x", create, "none", "builder-x"},
 		{"builder-x", plan, "none", "builder-x"},
-		{"verifier-x", receipt, "none", "verifier-x"},
+		// k7: a lead's scope of a queue entry and a verifier's receipt are allowed.
+		{"verifier-x", receipt, "verifier-allowed", "verifier-x"},
+		{"verifier-9ac4285c", "cd /w && " + receipt + " 2>&1 | tail -3", "verifier-allowed", "verifier-9ac4285c"},
+		{"verifier-x", plan, "none", "verifier-x"},
+		{"verifier-x", scope, "none", "verifier-x"},
+		{"verifier-x", toolGateDoneSave, "none", "verifier-x"},
+		{"verifier-x", receipt + "; " + plan, "none", "verifier-x"},
+		{"verifier-x", create + "; " + receipt, "none", "verifier-x"},
+		{"verifier-x", toolGateAllRules, "none,none,none", "verifier-x"},
+		{"builder-x", receipt, "none", "builder-x"},
+		{"reviewer-x", receipt, "none", "reviewer-x"},
+		{"my-verifier-x", receipt, "none", "my-verifier-x"},
+		{"db-handler-o3", receipt, "handler", "db-handler-o3"},
+		{"lead-x", scope, "lead-allowed", "lead-x"},
+		{"lead-x", receipt + "; " + plan + "; " + scope, "lead-allowed", "lead-x"},
+		{"lead-x", scope + "; " + create, "none", "lead-x"},
+		{"lead-x", "tt team queue wait set --entry tqe_1 --on tqe_2", "none", "lead-x"},
+		{"builder-x", scope, "none", "builder-x"},
+		{"my-lead-x", scope, "none", "my-lead-x"},
+		// k5: the done save typed with single-dash flags.
+		{"lead-x", toolGateDoneSaveOneDash, "lead-allowed", "lead-x"},
+		{"lead-x", "tt work-items update wi_1 -status=done -worktree=/w -branch=b -commit=c", "lead-allowed", "lead-x"},
+		{"lead-x", "tt work-items update wi_1 -status done -worktree /w", "none", "lead-x"},
+		{"builder-x", toolGateDoneSaveOneDash, "none", "builder-x"},
 		{"my-db-handler", create, "none", "my-db-handler"},
 		{"", create, "none", ""},
 		{"bad name; rm", create, "none", ""},
