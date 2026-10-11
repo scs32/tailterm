@@ -207,6 +207,44 @@ func TestToolDenyClassify(t *testing.T) {
 	}
 }
 
+// m2: a help, version or signal-zero word silences kill, pkill and killall
+// only where the tool reads it: as the first argument, and for killall's
+// own options anywhere before its first operand.
+func TestToolDenySilencingWords(t *testing.T) {
+	for _, c := range []struct{ rules, command string }{
+		{"host-pkill", `pkill -f '--help'`},
+		{"host-pkill", `pkill -9 -f node -0`},
+		{"deployer-signal", `killall -s KILL tt-deployer-compact`},
+		{"host-pkill", `pkill -f -- --help`},
+		{"host-pkill", `pkill node --version`},
+		{"host-pkill", `pkill -f -0 vite`},
+		{"host-pkill", `killall node -d`},
+		{"host-pkill", `killall node -0`},
+		{"host-pkill,deployer-signal", `killall tt-deployer-compact --help`},
+		{"deployer-signal", `killall -9 tt-deployer-compact -l`},
+		{"deployer-signal", `kill -9 tt-deployer -0`},
+		{"deployer-signal", `kill -TERM tt-deployer --help`},
+		{"deployer-signal", `killall -s 9 tt-deployer`},
+		{"deployer-signal", `ssh air 'killall -s TERM tt-deployer-compact'`},
+	} {
+		if got := denyRuleNames(toolDenyClassify(c.command)); got != c.rules {
+			t.Errorf("%s: rules = %q; want %q", c.command, got, c.rules)
+		}
+	}
+	for _, command := range []string{
+		`pkill --help`, `pkill --version`, `pkill -0 -f vite`, `pkill -0 -f tt-deployer`, `sudo pkill --help`,
+		`kill --help`, `kill --version tt-deployer`, `kill -0 tt-deployer`,
+		`killall --help`, `killall --version`, `killall -0 node`, `killall -v -0 node`, `killall -0 tt-deployer-compact`,
+		`killall -d node`, `killall -v -d tt-deployer`, `killall -KILL -d node`, `killall -l`, `killall -q -l`,
+		`killall -s node`, `killall -s tt-deployer-compact`, `killall -v -s tt-deployer-compact`, `killall -s 0 tt-deployer`,
+		`killall -u stephen -d tt-deployer`, `killall -c tt -s tt-deployer`,
+	} {
+		if got := toolDenyClassify(command); len(got) != 0 {
+			t.Errorf("%s: rules = %q; want none", command, denyRuleNames(got))
+		}
+	}
+}
+
 // A command the parser cannot follow matches nothing, and no input makes
 // it panic or run long.
 func TestToolDenyClassifyBounds(t *testing.T) {
@@ -514,6 +552,12 @@ func toolDenyCapCommand(head string) string {
 	return head + strings.Repeat(filler, (toolDenyMaxCommand-len(head))/len(filler))
 }
 
+// toolDenyKeywordCommand is one simple command of keyword words and then
+// unit repeated, about 60 KiB in all, and after it a command that matches.
+func toolDenyKeywordCommand(unit string) string {
+	return strings.Repeat("! ", 15000) + strings.Repeat(unit, 30000/len(unit)) + "\npkill node"
+}
+
 const toolDenyAllRules = "pkill -f tt-deployer; npm run deploy:static; ssh truenas tailscale status"
 
 // a6: the added cost of the check per PreToolUse, measured against the same
@@ -545,6 +589,10 @@ func TestToolDenyCost(t *testing.T) {
 		{"four rules", toolDenyAllRules, 4},
 		{"one rule at the 64 KiB cap", toolDenyCapCommand("pkill node; "), 1},
 		{"no match at the 64 KiB cap", toolDenyCapCommand(""), 0},
+		// m1: 15,000 keyword words, then a case or a [[ ]] at every third
+		// word, about 60 KiB. Reading the words again at each one cost 30 ms.
+		{"keywords then repeated case", toolDenyKeywordCommand("case a b "), 1},
+		{"keywords then repeated [[ ]]", toolDenyKeywordCommand("[[ ]] "), 1},
 	}
 	for n, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -907,7 +955,7 @@ func TestToolGateClassify(t *testing.T) {
 		"tt work-items scope confirm wi_1 --owns a.go --owns b.go --criteria g1 --order 7": "tt work-items scope confirm (+9 args)",
 		"tt team queue wait set --entry tqe_1 --on tqe_2 --until released":                 "tt team queue wait set (+6 args)",
 		"tt work-items evidence wi_1": "tt work-items evidence (+1 args)",
-		"tt verification plan":        "tt verification plan",
+		"tt verification plan wi_1":   "tt verification plan (+1 args)",
 		toolGateDoneSave:              "tt work-items update --status done --worktree --branch --commit (+4 args)",
 		"tt work-items update wi_1 --status=done --worktree=/w --branch=b --commit=c":          "tt work-items update --status done --worktree --branch --commit (+1 args)",
 		"tt work-items update wi_1 --status done --branch b --commit c":                        "tt work-items update (+7 args)",
@@ -947,10 +995,10 @@ func TestToolGateClassify(t *testing.T) {
 		"tt team queue scope --entry tqe_1":                                toolGateLeadForm,
 		"tt team queue accept --entry tqe_1":                               "",
 		"tt verification receipt --item wi_1":                              toolGateReceiptForm,
-		"tt verification receipt --item wi_1; tt verification plan":        toolGateLeadForm,
-		"tt verification plan; tt verification receipt --item wi_1":        toolGateLeadForm,
-		"tt verification receipt --item wi_1; tt work-items create":        "",
-		"tt work-items create; tt verification receipt --item wi_1":        "",
+		"tt verification receipt --item wi_1; tt verification plan wi_1":   toolGateLeadForm,
+		"tt verification plan wi_1; tt verification receipt --item wi_1":   toolGateLeadForm,
+		"tt verification receipt --item wi_1; tt work-items create x":      "",
+		"tt work-items create x; tt verification receipt --item wi_1":      "",
 		"tt work-items update wi_1 --status done":                          "",
 		"tt verification plan --item wi_1; tt work-items create --title x": "",
 		"tt work-items create --title x; tt verification plan --item wi_1": "",
@@ -1260,10 +1308,10 @@ func TestToolGateFailsOpen(t *testing.T) {
 	})
 	t.Run("substitutions nested nine deep", func(t *testing.T) {
 		e, root := gateSandbox(t)
-		deep := strings.Repeat("$(", toolDenyMaxNest+1) + "tt work-items create" + strings.Repeat(")", toolDenyMaxNest+1)
+		deep := strings.Repeat("$(", toolDenyMaxNest+1) + "tt work-items create x" + strings.Repeat(")", toolDenyMaxNest+1)
 		toolHook(t, e, "PreToolUse", bashPre("u1", "echo "+deep))
 		finish(t, e, root, 0)
-		eight := strings.Repeat("$(", toolDenyMaxNest) + "tt work-items create" + strings.Repeat(")", toolDenyMaxNest)
+		eight := strings.Repeat("$(", toolDenyMaxNest) + "tt work-items create x" + strings.Repeat(")", toolDenyMaxNest)
 		toolHook(t, e, "PreToolUse", bashPre("u2", "echo "+eight))
 		if rows := toolLedgerRows(t, root, e.agent); len(wouldReportRows(rows)) != 1 {
 			t.Fatalf("rows = %v; want the row of a command nested to the bound", rows)
@@ -1418,6 +1466,57 @@ func TestToolGateCost(t *testing.T) {
 				t.Fatalf("the gate adds %v to the median hook; want under %v", gated-base, limit)
 			}
 		})
+	}
+}
+
+// m5: a tt write subcommand alone, or followed only by help or version
+// words, writes no work-item-write row. Any other word after it does.
+func TestToolGateHelpCalls(t *testing.T) {
+	for _, command := range []string{
+		"tt work-items update", "tt work-items update --help", "tt work-items update -h", "tt work-items update -help",
+		"tt work-items update -version", "tt work-items update --version", "tt work-items create -h --help",
+		"tt work-items create", "tt work-items scope confirm --help", "tt queue action", "tt queue action -h",
+		"tt team queue wait set", "tt team queue wait set --help", "tt team queue scope --help", "tt team queue accept",
+		"tt verification plan", "tt verification plan --help", "tt verification receipt -version",
+		"sudo /Users/x/.local/bin/tt work-items update --help", "bash -c 'tt work-items update --help'",
+		"ssh air 'tt work-items create -h'", "tt work-items update --help 2>&1 | head -20", "tt work-items update --help; tt work-items list",
+	} {
+		if _, gates := toolGateClassify(command, toolGateTestHub, true); len(gates) != 0 {
+			t.Errorf("%s: matches %v; want none", command, gates)
+		}
+	}
+	for command, want := range map[string]struct{ kind, summary string }{
+		toolGateDoneSave:                                       {toolGateLeadForm, "tt work-items update --status done --worktree --branch --commit (+4 args)"},
+		toolGateDoneSave + " --help":                           {toolGateLeadForm, "tt work-items update --status done --worktree --branch --commit (+5 args)"},
+		"tt work-items update wi_1":                            {"", "tt work-items update (+1 args)"},
+		"tt work-items update wi_1 --status open":              {"", "tt work-items update (+3 args)"},
+		"tt work-items update wi_1 --help":                     {"", "tt work-items update (+2 args)"},
+		"tt work-items update --help wi_1":                     {"", "tt work-items update (+2 args)"},
+		"tt work-items update help":                            {"", "tt work-items update (+1 args)"},
+		"tt work-items update --helpful":                       {"", "tt work-items update (+1 args)"},
+		"tt work-items update -H":                              {"", "tt work-items update (+1 args)"},
+		"tt work-items update --help=true":                     {"", "tt work-items update (+1 args)"},
+		"tt work-items update ''":                              {"", "tt work-items update (+1 args)"},
+		"tt team queue wait set --help --entry tqe_1":          {"", "tt team queue wait set (+3 args)"},
+		"tt verification receipt --help --item wi_1":           {toolGateReceiptForm, "tt verification receipt (+3 args)"},
+		"tt work-items update --help; tt work-items note wi_1": {"", "tt work-items note (+1 args)"},
+		"tt work-items note wi_1; tt work-items update --help": {"", "tt work-items note (+1 args)"},
+	} {
+		_, gates := toolGateClassify(command, toolGateTestHub, true)
+		if len(gates) != 1 || gates[0].rule != toolGateWorkItem || gates[0].kind != want.kind || strings.Join(gates[0].parts, " ") != want.summary {
+			t.Errorf("%s: matches %v; want one %s of kind %q, summary %q", command, gates, toolGateWorkItem, want.kind, want.summary)
+		}
+	}
+	// Through the hook: the help call leaves no report row, the write its one.
+	e, root := gateSandbox(t)
+	toolHook(t, e, "PreToolUse", bashPre("u1", "tt work-items update --help"))
+	toolHook(t, e, "PreToolUse", bashPre("u2", "tt work-items update"))
+	if rows := wouldReportRows(toolLedgerRows(t, root, e.agent)); len(rows) != 0 {
+		t.Fatalf("rows = %v; want none for a help call", rows)
+	}
+	toolHook(t, e, "PreToolUse", bashPre("u3", "tt work-items update wi_1 --status open"))
+	if rows := wouldReportRows(toolLedgerRows(t, root, e.agent)); len(rows) != 1 || rows[0]["reportSummary"] != "tt work-items update (+3 args)" {
+		t.Fatalf("rows = %v; want the one row of the write", rows)
 	}
 }
 

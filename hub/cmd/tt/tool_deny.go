@@ -269,17 +269,44 @@ func toolDenyShellArgs(args []string) (inline string, stdin bool) {
 // toolDenySendsNothing reports a kill, pkill or killall that signals no
 // process: it asks for help or a version, probes with signal 0 or, for
 // killall, only lists (-l), shows (-s) or describes (-d) what it would do.
+//
+// Each word counts only where the tool reads it. --help, --version and -0
+// count as the first argument, where kill and pkill take their signal: later
+// they are a pattern, an operand or a usage error. killall reads options up
+// to its first operand, so its -0, -l, -s and -d count anywhere before it,
+// the values of -u, -t and -c stepped over. A -s whose next word is a signal
+// is Linux killall's "-s SIGNAL", which sends it.
 func toolDenySendsNothing(name string, args []string) bool {
-	for _, a := range args {
-		switch {
-		case a == "--":
-			return false
-		case a == "--help" || a == "--version" || a == "-0":
+	if len(args) == 0 {
+		return false
+	}
+	if a := args[0]; a == "--help" || a == "--version" || a == "-0" {
+		return true
+	}
+	if name != "killall" {
+		return false
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(a) < 2 || a[0] != '-' || a[1] == '-' {
+			return false // the first operand, or "--"
+		}
+		if a == "-0" {
 			return true
-		case name == "killall" && len(a) > 1 && a[0] == '-' && a[1] != '-':
-			if _, signal := toolDenySignal(a[1:]); !signal && strings.ContainsAny(a[1:], "lsd") {
-				return true
+		}
+		if _, signal := toolDenySignal(a[1:]); signal {
+			continue
+		}
+		if a == "-s" && i+1 < len(args) {
+			if _, signal := toolDenySignal(args[i+1]); signal {
+				return false
 			}
+		}
+		if strings.ContainsAny(a[1:], "lsd") {
+			return true
+		}
+		if len(a) == 2 && strings.IndexByte("utc", a[1]) >= 0 {
+			i++
 		}
 	}
 	return false
@@ -764,17 +791,14 @@ type toolDenyHeredoc struct {
 	cmd   int  // the index in cmds of the command it feeds, or -1
 }
 
-// toolDenyLeads reports whether every word so far is a shell keyword, so
-// that the next word starts a command.
-func toolDenyLeads(words []string) bool {
-	for _, w := range words {
-		switch w {
-		case "if", "then", "else", "elif", "do", "while", "until", "!", "time":
-		default:
-			return false
-		}
+// toolDenyLeads reports whether a word is a shell keyword that leaves the
+// next word at the start of a command.
+func toolDenyLeads(word string) bool {
+	switch word {
+	case "if", "then", "else", "elif", "do", "while", "until", "!", "time":
+		return true
 	}
-	return true
+	return false
 }
 
 // toolDenyArrayName reports whether a word is NAME= or NAME+=, which an
@@ -803,6 +827,9 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 		caseWait int  // words still to come before the "in" of a case
 		pattern  bool // inside a case pattern list, up to its ")"
 		cond     bool // inside [[ ]]
+		// Every word of the command so far is a keyword, so the next starts
+		// a command. Kept as words grows, never found by reading them again.
+		leads = true
 	)
 	endWord := func() {
 		if !inWord {
@@ -830,18 +857,19 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			if caseWait--; caseWait == 0 && w == "in" {
 				cases++
 				pattern = true
-				words = nil
+				words, leads = nil, true
 				return
 			}
 		case w == "esac" && cases > 0 && len(words) == 0:
 			cases--
 			return
-		case w == "case" && toolDenyLeads(words):
+		case w == "case" && leads:
 			caseWait = 2
-		case w == "[[" && toolDenyLeads(words):
+		case w == "[[" && leads:
 			cond = true
 		}
 		words = append(words, w)
+		leads = leads && toolDenyLeads(w)
 	}
 	endCmd := func() {
 		endWord()
@@ -860,7 +888,7 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 				}
 			}
 			p.cmds = append(p.cmds, words)
-			words = nil
+			words, leads = nil, true
 			piped = false
 		}
 		docsFrom = len(heredocs)
@@ -1436,6 +1464,19 @@ func (c *toolDenyScan) tt(args []string) {
 		}
 	}
 	if words == 0 {
+		return
+	}
+	// A write subcommand alone, or followed only by help or version words,
+	// is taken for a help call and not a write.
+	asks := true
+	for _, word := range args[words:] {
+		switch word {
+		case "-h", "-help", "--help", "-version", "--version":
+		default:
+			asks = false
+		}
+	}
+	if asks {
 		return
 	}
 	sum := toolDenySum{}
