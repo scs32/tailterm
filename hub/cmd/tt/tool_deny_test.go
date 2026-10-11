@@ -730,6 +730,8 @@ func TestToolGateClassify(t *testing.T) {
 		{toolGateHubDB, "", `sqlite3 /mnt/deepfreeze/tailterm-hub`},
 		{toolGateHubDB, "", `sqlite3 -readonly /mnt/deepfreeze/tailterm-hub/hub.db .tables`},
 		{toolGateHubDB, "", `sqlite3 'file:/mnt/deepfreeze/tailterm-hub/hub.db?mode=ro'`},
+		{toolGateHubDB, "", `sqlite3 file:///mnt/deepfreeze/tailterm-hub/hub.db .tables`},
+		{toolGateHubDB, "", `sqlite3 'file://localhost/mnt/deepfreeze/tailterm-hub/hub.db?mode=ro'`},
 		{toolGateHubDB, "", `sqlite3 -cmd '.timeout 5' /mnt/deepfreeze/tailterm-hub/hub.db`},
 		{toolGateHubDB, "", `sqlite3 -header -separator , /mnt/deepfreeze/tailterm-hub/data/hub.db "select 1"`},
 		{toolGateHubDB, "", `ssh truenas 'sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db .tables'`},
@@ -778,7 +780,9 @@ func TestToolGateClassify(t *testing.T) {
 		// Another file, a sibling name, and the directory only in SQL text or an option's value.
 		`sqlite3 /tmp/x.db`, `sqlite3 ./hub.db`, `sqlite3`, `sqlite3 -readonly`, `ls /mnt/deepfreeze/tailterm-hub`,
 		`echo sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`, `sqlite3 /mnt/deepfreeze/tailterm-hub-backup/hub.db`,
-		`sqlite3 /mnt/deepfreeze/tailterm-hubx.db`, `sqlite3 /tmp/x.db "ATTACH '/mnt/deepfreeze/tailterm-hub/hub.db' AS h"`,
+		`sqlite3 /mnt/deepfreeze/tailterm-hubx.db`, `sqlite3 file://otherhost/mnt/deepfreeze/tailterm-hub/hub.db`,
+		`sqlite3 file:///tmp/x.db`, `sqlite3 //mnt/deepfreeze/tailterm-hub/hub.db`, `sqlite3 file://localhost`,
+		`sqlite3 /tmp/x.db "ATTACH '/mnt/deepfreeze/tailterm-hub/hub.db' AS h"`,
 		`sqlite3 /tmp/x.db "select '/mnt/deepfreeze/tailterm-hub/hub.db'"`, `sqlite3 -cmd '/mnt/deepfreeze/tailterm-hub/hub.db' /tmp/x.db`,
 		`sqlite3 /tmp/x.db /mnt/deepfreeze/tailterm-hub/hub.db`, `ssh truenas ls -la /mnt/deepfreeze/tailterm-hub/hub.db`,
 	}

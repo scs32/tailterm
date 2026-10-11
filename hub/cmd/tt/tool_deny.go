@@ -1347,7 +1347,15 @@ func (c *toolDenyScan) sqlite(args []string) {
 			}
 			continue
 		}
-		a = strings.TrimPrefix(a, "file:")
+		if uri, ok := strings.CutPrefix(a, "file:"); ok {
+			a = uri
+			// file:///path and file://localhost/path name the same file.
+			if rest, ok := strings.CutPrefix(a, "//"); ok {
+				if slash := strings.IndexByte(rest, '/'); slash >= 0 && (rest[:slash] == "" || rest[:slash] == "localhost") {
+					a = rest[slash:]
+				}
+			}
+		}
 		if query := strings.IndexByte(a, '?'); query >= 0 {
 			a = a[:query]
 		}
