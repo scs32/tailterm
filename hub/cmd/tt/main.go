@@ -671,7 +671,8 @@ func cmdInbox(e env, args []string) error {
 		return err
 	}
 	var mine []api.Message // what this agent's inbox fetch returned
-	defer func() { toolScopeRemember(e, mine) }()
+	fetchOK := false       // a fetch of this agent's own messages succeeded
+	defer func() { toolScopeInbox(e, mine, fetchOK) }()
 	if *seq > 0 {
 		err := printInboxMessage(c, task, *seq, *asJSON)
 		if err == nil && e.agent != "" {
@@ -679,8 +680,11 @@ func cmdInbox(e env, args []string) error {
 			defer cancel()
 			// For the owns cache only, so it may hold the command for a
 			// second at most; a failure here changes nothing.
-			if one, ferr := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: *seq - 1, To: e.agent, Limit: 1}); ferr == nil && len(one) == 1 && one[0].Seq == *seq {
-				mine = one
+			if one, ferr := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: *seq - 1, To: e.agent, Limit: 1}); ferr == nil {
+				fetchOK = true
+				if len(one) == 1 && one[0].Seq == *seq {
+					mine = one
+				}
 			}
 		}
 		return err
@@ -727,7 +731,7 @@ func cmdInbox(e env, args []string) error {
 		if err != nil {
 			return err
 		}
-		mine = msgs
+		mine, fetchOK = msgs, !*board
 		if *asJSON {
 			printJSON(msgs)
 			return nil
@@ -773,7 +777,7 @@ func cmdInbox(e env, args []string) error {
 		}
 		extras = notFrom(newer, e.agent)
 	}
-	mine = append(fetched[:len(fetched):len(fetched)], extras...)
+	mine, fetchOK = append(fetched[:len(fetched):len(fetched)], extras...), true
 	if *asJSON {
 		printJSON(append(msgs, extras...))
 	} else {

@@ -195,13 +195,15 @@ and relay regressions. No live owner/agent sessions are test fixtures.
 
 ## Tool-call ledger
 
-Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. The would-deny report was added by feature `wi_23ca1183c7d59c79` revision 2, owner order #31851, builder assignment #31889. The owned-paths report was added by feature `wi_c1ef66c9f6c8aadc` revision 3, owner order #31964, builder assignment #31979. The handler-gate report was added by feature `wi_cbc08bd2b2a419a0` revision 2, owner order #32007 with decision answer #32034, builder assignment #32041. This source change is a candidate.
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. The would-deny report was added by feature `wi_23ca1183c7d59c79` revision 2, owner order #31851, builder assignment #31889. The owned-paths report was added by feature `wi_c1ef66c9f6c8aadc` revision 3, owner order #31964, builder assignment #31979. The handler-gate report was added by feature `wi_cbc08bd2b2a419a0` revision 2, owner order #32007 with decision answer #32034, builder assignment #32041. The edit-before-assign report was added by feature `wi_03fe150782cc7a8e` revision 2, owner order #32066, builder assignment #32082. This source change is a candidate.
 
 Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The owner helper's Claude session is covered too (see "Owner helper session"). The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
 
 A Bash call that matches a protected-operation rule leaves one extra row per matched rule, written when the call is attempted (see "Would-deny report"). The report blocks nothing. Codex sessions are not covered by it either: Codex has only a Stop hook, so no Codex tool call is seen.
 
 An Edit, Write, MultiEdit or NotebookEdit of a file outside the paths of the agent's latest ASSIGN leaves one extra row too (see "Owned-paths report"). That report also blocks nothing and does not cover Codex.
+
+The same four tools, used by a queue builder that has read its inbox and has no ASSIGN cached for its run, leave one extra row for a file inside the repository (see "Edit-before-assign report"). That report blocks nothing and does not cover Codex either.
 
 A Bash call that writes a work item through `tt`, sends a non-GET request to the hub or opens the hub database with `sqlite3` leaves one extra row per rule as well, tagged with who ran it (see "Handler-gate report"). That report blocks nothing and does not cover Codex either.
 
@@ -215,6 +217,7 @@ A Bash call that writes a work item through `tt`, sends a non-GET request to the
 - It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
 - The would-deny report changes none of this. It only appends rows: it prints nothing, has no return value, and a command it cannot read or classify is left unreported.
 - The owned-paths report changes none of this either. It only appends rows, and anything it cannot read or judge is left unreported.
+- The edit-before-assign report is the same check with a second rule. It only appends rows, and anything it cannot read or judge is left unreported.
 - Nor does the handler-gate report. Its rows are appended in the would-deny report's one write, and a command that cannot be read or classified is left unreported.
 - It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
@@ -234,7 +237,8 @@ When the 150 ms runs out, that invocation writes nothing more. A pre cut off lea
 - `ledger.lock`: the lock for appends and rotation.
 - `pending/`: one small file per call that has started and not finished.
 - `owns.json`: the owned paths of the agent's latest ASSIGN, written by `tt inbox` and read by the hook (see "Owned-paths report").
-- `owns.lock`: the lock for writing `owns.json`.
+- `owns.lock`: the lock for writing `owns.json` and `inbox.json`.
+- `inbox.json`: the marker that this run of the agent has fetched its own messages, written by `tt inbox` and read by the hook (see "Edit-before-assign report").
 
 Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `tool-ledger` directory; tests use it.
 
@@ -249,11 +253,11 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 | `tool` | `tool_name`, cut to 128 bytes |
 | `toolUseId` | `tool_use_id`, cut to 128 bytes |
 | `argsDigest` | lower-case hex SHA-256 of `tool_input` after it is decoded and encoded again by Go's `encoding/json` (object keys sorted, numbers kept as written); empty when there is no `tool_input` |
-| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use), `would_deny` (a PreToolUse that matched a protected-operation rule; the call still gets its own row when it ends), `would_report` (a PreToolUse of an edit outside the agent's owned paths, or of a Bash command that matched a handler-gate rule; the call still gets its own row when it ends) |
+| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use), `would_deny` (a PreToolUse that matched a protected-operation rule; the call still gets its own row when it ends), `would_report` (a PreToolUse of an edit outside the agent's owned paths, of a queue builder's edit before any ASSIGN is cached for its run, or of a Bash command that matched a handler-gate rule; the call still gets its own row when it ends) |
 | `durationMs`, `durationSource` | `duration_ms` from Claude Code (`claude`), else the time since the call's pre hook (`measured`), else absent |
 | `oversize` | `true` only when the input passed the 8 MiB cap |
 | `denyRule`, `denyKind`, `denySummary` | only on a `would_deny` row: the rule id, the operation kind and a summary of fixed words (see "Would-deny report") |
-| `reportRule`, `reportPath`, `assignSeq` | only on a `would_report` row: the rule id, the file's path relative to the repository root cut to 200 bytes, and the number of the ASSIGN it was judged against (see "Owned-paths report"). A handler-gate row has `reportRule` and neither of the other two |
+| `reportRule`, `reportPath`, `assignSeq` | only on a `would_report` row: the rule id, the file's path relative to the repository root cut to 200 bytes, and the number of the ASSIGN it was judged against (see "Owned-paths report"). An `edit-before-assign` row has `reportRule` and `reportPath` and no `assignSeq` (see "Edit-before-assign report"). A handler-gate row has `reportRule` and neither of the other two |
 | `reportTag`, `reportSummary`, `agentName` | only on a handler-gate `would_report` row: who ran the command (`handler`, `lead-allowed`, `owner-helper` or `none`), a summary of fixed words, and the agent's name (see "Handler-gate report") |
 
 Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
@@ -394,7 +398,7 @@ To count would-report rows by rule and agent for this host:
 awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.outcome == "would_report") | "\(.reportRule)\t\(.agent)"' | sort | uniq -c
 ```
 
-Each line is a count, a rule id and an agent id, read the same way as the would-deny command above. Handler-gate rows are `would_report` rows too, so this command now counts their three rules beside `outside-owned-paths`; the command under "Handler-gate report" counts them alone, by tag.
+Each line is a count, a rule id and an agent id, read the same way as the would-deny command above. Handler-gate rows are `would_report` rows too, so this command now counts their three rules beside `outside-owned-paths`; the command under "Handler-gate report" counts them alone, by tag. It counts `edit-before-assign` rows as well; the command under "Edit-before-assign report" lists those alone, by path.
 
 Cost, measured on the Mini on 2026-10-10 by `TestToolScopeCost`, by the method of `TestToolDenyCost`: under 0.01 ms for a Bash call and for an edit with no cache; about 0.06 ms for an owned edit against a 256-entry cache; about 0.15 ms for an edit outside it (the extra append); about 0.8 ms for a Write outside it with 1 MiB of content; about 0.45 ms for an edit outside 256 glob entries (one stat call each). The test fails if the check adds 5 ms to the median or if a run with the check does not return, row written, before the 150 ms deadline.
 
@@ -410,6 +414,72 @@ Limits of the report:
 - A later ASSIGN that lists fewer paths replaces the earlier list. Edits to files only the earlier ASSIGN named are then reported, with the later `assignSeq`.
 - An entry form the rules above do not know, such as a note other than ` (new)`, owns only its literal name, so edits to the file it meant are reported.
 - Nothing removes `owns.json` when an agent's work ends.
+
+### Edit-before-assign report
+
+Report-only. It records a queue builder's edit made before any assignment was cached for its run, and blocks nothing. It does not check for a saved Start, and it asks the hub nothing.
+
+**The rule.** On PreToolUse of `Edit`, `Write`, `MultiEdit` or `NotebookEdit` of a file inside the session's repository, the hook appends one row, `reportRule` `edit-before-assign`, only when all three hold:
+
+1. The agent's name, from `TAILTERM_AGENT_NAME`, has the queue team builder form: `builder-` followed by eight characters of `0-9a-f`, lower case, 16 bytes in all.
+2. `inbox.json` exists for this exact run.
+3. No `owns.json` exists for this run: the file is missing, or it is a readable cache written by another run.
+
+With this run's `owns.json` present the rule is not looked at, and the owned-paths report applies exactly as before.
+
+**The marker.** After a successful fetch of its agent's own messages, `tt inbox` writes `inbox.json` beside the agent's ledger:
+
+| Key | Meaning |
+| --- | --- |
+| `v` | 1 |
+| `run` | `TAILTERM_RUN` of the `tt inbox` that wrote the file |
+| `time` | UTC RFC 3339 time of the write |
+
+- It holds nothing else: no message text, number or count.
+- The file is 0600 in the 0700 agent directory, written to a temporary file and renamed.
+- It is written at most once per run. A later read of the same run finds it, writes nothing and, with no ASSIGN to cache, takes no lock. A new run of the same agent replaces it once.
+- These forms write it: `--unread` (with or without `--mark-read` and `--wait`), the history page (no flags, `--before N`, `--after N`) and `--seq N`, as text or `--json`, whether or not any message came back. For `--seq N` the fetch that counts is the extra one-second request described under "Owned-paths report"; if that request fails or times out the message is still printed and no marker is written.
+- These write none: `--board`, which pages the project Board and not the agent's own messages (it still caches an ASSIGN it shows, as before); a fetch that failed; a `tt inbox` with no agent identity, with an agent id that is not a safe directory name, or with no `TAILTERM_RUN`.
+- It is written under the same hold of `owns.lock` as `owns.json`, after it. One read that has both files to write waits for the lock once, so the most `tt inbox` is delayed is still the single 200 ms bound. Without the lock neither file is written, and the next read writes them.
+- `owns.json` is renamed first, and a cache that could not be written leaves no marker. The hook therefore never finds this run's marker while the ASSIGN fetched by the same read is still uncached.
+- It never changes what `tt inbox` prints or returns.
+
+**What the hook does.** In the owned-paths check, when `owns.json` could not be used or is another run's:
+
+1. A session identified by the owner helper's file, a name that is not a builder's, or an empty run stops here, with no file touched.
+2. If `owns.json` was not readable, one stat call: a file that is there and cannot be used (unreadable, malformed, oversized, another version, a directory) stops here. Only a missing file goes on.
+3. It reads `inbox.json`, at most 512 bytes. Missing, unreadable, malformed, oversized, another version or another run's: it stops.
+4. It reads `owns.json` once more. If it is now this run's, an ASSIGN arrived meanwhile, and it stops.
+5. It resolves the file and the repository root as the owned-paths report does. A file outside the root is ignored.
+6. It appends one row: `outcome` `would_report`, `reportRule` `edit-before-assign`, `reportPath`, and the call's `session`, `tool`, `toolUseId`, `argsDigest`, `task`, `agent`, `run` and `time`. There is no `assignSeq`.
+
+`reportPath` is made as for the owned-paths report: relative to the repository root, through the secret scan, cut to 200 bytes without splitting a character. The call is not blocked, delayed past the hook's own wait, or changed, and it gets its ordinary row when it ends. Nothing is printed, no process is started and no hub request is made. One row is written per edit, so a builder that keeps editing before its ASSIGN writes one row each time; rotation at 4 MiB bounds the file.
+
+Fail open: besides the stops above, nothing extra is written for a missing or relative `cwd`, or one that is not a string; no `.git` above `cwd`; a `tool_input` without its path string; a path scan that cannot finish in its time; a panic in the check; or a check that ends after the 150 ms wait. The append is the owned-paths report's, with the same deadline checks. None of these changes the call's ordinary row.
+
+To list edit-before-assign rows by agent and path for this host:
+
+```sh
+awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.reportRule == "edit-before-assign") | "\(.agent)\t\(.reportPath)"' | sort | uniq -c
+```
+
+Each line is a count, an agent id and a path. The would-report command under "Owned-paths report" counts these rows too, by rule and agent.
+
+Cost, measured on the Mini on 2026-10-10 by `TestToolScopeBeforeAssignCost`, by the method of `TestToolScopeCost`: about 0.12 ms for a builder's edit that gets the row (one stat call, the marker read, a second open of the missing cache and the append); under 0.01 ms for a builder with no marker, for an agent that is not a builder, and for a Bash call; about 0.06 ms for a builder's owned edit against this run's 256-entry cache, the same as before this rule. The test fails if the check adds 5 ms to the median or if a run with the check does not return, row written, before the 150 ms deadline.
+
+Limits of the report:
+
+- Edits made through Bash (`sed -i`, a redirection, a script, `git apply`) are not seen.
+- Codex sessions are not covered.
+- Roles other than a builder are not covered, and a builder is recognised by the name convention only. The hook does not ask the hub for the agent's role, so an agent of any role that carries a builder's name is treated as one.
+- A builder named outside the convention is not covered: `builder2-facccbae`, a second builder on a team, gets no row.
+- A builder that never ran `tt inbox` in its run has no marker, and nothing is reported for it. The same holds for one that only read `--board`.
+- A recovery run is reported until it reads its ASSIGN again. `tt inbox --unread` writes the new run's marker but does not fetch an ASSIGN behind the read cursor the earlier run advanced, so `owns.json` stays the earlier run's and every edit is reported until a plain `tt inbox` or `tt inbox --seq N` shows the ASSIGN to the new run.
+- An ASSIGN posted as plain text, or a typed one with no `owns` entry, is never cached, so every later edit of that run is reported.
+- An ASSIGN whose paths could not be cached within the 200 ms lock wait leaves no marker from that read either; if an earlier read already left one, edits are reported until a later read caches the ASSIGN.
+- Files outside the session's repository are ignored, as in the owned-paths report.
+- The rule knows nothing of a saved Start, a queue admission or the work order. It reports only that no ASSIGN with owned paths had been cached for the run when the edit was attempted.
+- Nothing removes `inbox.json` when an agent's work ends.
 
 ### Handler-gate report
 
@@ -491,7 +561,7 @@ Limits of the report:
 - Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
 - A helper closed on the hub is still ledgered while this host's helper file names the session's thread. Telling would need a hub request, which the hook never makes. The rows are for calls that session really made, under the agent and run the file names. Registering the helper again from another session ends it.
 - Every Claude Code session on the host that is not a Tailterm agent now lists the relay state directory once per tool hook, to learn that it is not the helper.
-- Hub upload, blocking and budget caps are not part of this version. Protected operations are reported, not denied (see "Would-deny report"). Edits outside an agent's owned paths are reported, not denied, with the limits listed under "Owned-paths report". Writes that go around the database handler are reported, not denied, with the limits listed under "Handler-gate report". The one rewrite is secret redaction, below.
+- Hub upload, blocking and budget caps are not part of this version. Protected operations are reported, not denied (see "Would-deny report"). Edits outside an agent's owned paths are reported, not denied, with the limits listed under "Owned-paths report". A queue builder's edits before its ASSIGN are reported, not denied, with the limits listed under "Edit-before-assign report". Writes that go around the database handler are reported, not denied, with the limits listed under "Handler-gate report". The one rewrite is secret redaction, below.
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.
 

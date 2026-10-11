@@ -221,8 +221,13 @@ func TestToolScopeCacheWrite(t *testing.T) {
 					t.Errorf("%s mode = %v, %v; want %v", name, info.Mode().Perm(), err, mode)
 				}
 			}
-			if names := strings.Join(scopeDirNames(t, dir), ","); names != "owns.json,owns.lock" {
-				t.Fatalf("directory holds %s; want the cache and its lock only", names)
+			// A Board page is no fetch of the agent's own messages: it leaves no marker.
+			wantNames := "inbox.json,owns.json,owns.lock"
+			if len(args) > 0 && args[0] == "--board" {
+				wantNames = "owns.json,owns.lock"
+			}
+			if names := strings.Join(scopeDirNames(t, dir), ","); names != wantNames {
+				t.Fatalf("directory holds %s; want %s only", names, wantNames)
 			}
 		})
 	}
@@ -248,8 +253,13 @@ func TestToolScopeCacheWrite(t *testing.T) {
 		}
 		toolScopeRemember(e, []api.Message{h.other, h.plain, h.text})
 		toolScopeRemember(e, nil)
-		if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
-			t.Fatalf("an inbox read with no ASSIGN for the agent wrote %v", names)
+		// The two --before reads fetched e's own messages, so they left its
+		// marker; nothing else wrote anything, and there is no cache.
+		if names := strings.Join(scopeDirNames(t, root), ","); names != e.agent {
+			t.Fatalf("the ledger root holds %s; want only %s", names, e.agent)
+		}
+		if names := strings.Join(scopeDirNames(t, filepath.Join(root, e.agent)), ","); names != "inbox.json,owns.lock" {
+			t.Fatalf("an inbox read with no ASSIGN for the agent left %s; want the marker and the lock only", names)
 		}
 	})
 }
@@ -298,8 +308,14 @@ func TestToolScopeCacheSeq(t *testing.T) {
 		if _, err := captureCLIOutput(t, func() error { return cmdInbox(env{hub: e.hub, task: e.task}, []string{"--seq", seq}) }); err != nil {
 			t.Fatal(err)
 		}
-		if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
-			t.Fatalf("--seq of a message that is no ASSIGN for the agent wrote %v", names)
+		// Each --seq read by e fetched its own messages, so its marker is
+		// there; the read without an agent made no directory, and there is
+		// no cache.
+		if names := strings.Join(scopeDirNames(t, root), ","); names != e.agent {
+			t.Fatalf("the ledger root holds %s; want only %s", names, e.agent)
+		}
+		if names := strings.Join(scopeDirNames(t, filepath.Join(root, e.agent)), ","); names != "inbox.json,owns.lock" {
+			t.Fatalf("--seq of a message that is no ASSIGN for the agent left %s; want the marker and the lock only", names)
 		}
 	}
 }
@@ -1477,6 +1493,985 @@ func TestToolScopeDocCommand(t *testing.T) {
 		got = append(got, strings.Join(strings.Fields(line), " "))
 	}
 	want := []string{"1 a-later-rule agt_a", "2 outside-owned-paths agt_a", "1 outside-owned-paths agt_b"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("summary = %q; want %q", got, want)
+	}
+}
+
+// The edit-before-assign report (feature wi_03fe150782cc7a8e).
+
+const scopeBuilderName = "builder-0a1b2c3d"
+
+// scopeBuilder is toolLedgerSandbox with a queue builder's name.
+func scopeBuilder(t *testing.T) (env, string) {
+	t.Helper()
+	e, root := toolLedgerSandbox(t)
+	e.agentName = scopeBuilderName
+	return e, root
+}
+
+// scopeMark leaves e's marker as a successful own-message fetch does.
+func scopeMark(t *testing.T, e env, root string) {
+	t.Helper()
+	toolScopeInbox(e, nil, true)
+	if mark, ok := toolScopeMarkLoad(filepath.Join(root, e.agent)); !ok || mark.Run != e.runID {
+		t.Fatalf("fixture marker = %+v, %v", mark, ok)
+	}
+}
+
+func scopeWriteFile(t *testing.T, root, agent, name string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, agent), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, agent, name), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func beforeAssignRows(rows []map[string]any) []map[string]any {
+	var out []map[string]any
+	for _, row := range rows {
+		if row["reportRule"] == toolScopeBeforeRule {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// scopeMarkCheck requires a well-formed marker of the run in dir.
+func scopeMarkCheck(t *testing.T, dir, run string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, toolScopeMarkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		t.Fatalf("%s: %v", data, err)
+	}
+	if got := rowKeysRaw(keys); got != "run,time,v" {
+		t.Fatalf("marker keys = %s", got)
+	}
+	var mark toolScopeMark
+	if err := json.Unmarshal(data, &mark); err != nil || mark.V != 1 || mark.Run != run {
+		t.Fatalf("marker = %s, %v; want v 1 and run %q", data, err, run)
+	}
+	if stamp, err := time.Parse(time.RFC3339, mark.Time); err != nil || stamp.Location() != time.UTC {
+		t.Fatalf("time = %q, %v; want UTC RFC 3339", mark.Time, err)
+	}
+	if len(data) > toolScopeMarkBytes || strings.Contains(string(data), "MARK-") {
+		t.Fatalf("marker of %d bytes: %s", len(data), data)
+	}
+	for name, mode := range map[string]os.FileMode{dir: 0700, filepath.Join(dir, toolScopeMarkName): 0600} {
+		if info, err := os.Stat(name); err != nil || info.Mode().Perm() != mode {
+			t.Fatalf("%s mode = %v, %v; want %v", name, info.Mode().Perm(), err, mode)
+		}
+	}
+	for _, name := range scopeDirNames(t, dir) {
+		if strings.HasSuffix(name, ".tmp") {
+			t.Fatalf("a temp file was left: %s", name)
+		}
+	}
+	return data
+}
+
+// a1: every form of tt inbox that fetches the agent's own messages leaves
+// the marker, whether or not there was an ASSIGN to cache.
+func TestToolScopeMarkWrite(t *testing.T) {
+	h := newScopeInboxHub(t)
+	fresh, err := h.st.AddAgent(context.Background(), h.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: scopeBuilderName, Host: "host", Session: "builder", Runtime: "claude"}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.RunID == "" {
+		t.Fatal("the fixture agent has no run")
+	}
+	seq, before := fmt.Sprint(h.assign.Seq), fmt.Sprint(h.assign.Seq)
+	forms := [][]string{{"--unread"}, {"--unread", "--json"}, {"--unread", "--mark-read"}, {}, {"--json"}, {"--after", fmt.Sprint(h.assign.Seq - 1)}, {"--before", before}, {"--seq", seq}}
+	for who, e := range map[string]env{"an agent with an ASSIGN": h.e, "a fresh agent with no message": {hub: h.e.hub, task: h.e.task, agent: fresh.ID, agentName: fresh.Name, runID: fresh.RunID}} {
+		for _, args := range forms {
+			t.Run(who+": tt inbox "+strings.Join(args, " "), func(t *testing.T) {
+				root := scopeLedgerDir(t)
+				if _, err := captureCLIOutput(t, func() error { return cmdInbox(e, args) }); err != nil {
+					t.Fatal(err)
+				}
+				scopeMarkCheck(t, filepath.Join(root, e.agent), e.runID)
+				if info, err := os.Stat(filepath.Join(root, e.agent, "owns.lock")); err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("owns.lock: %v", err)
+				}
+				_, cached := scopeReadCache(t, root, e.agent)
+				// --before N stops short of the ASSIGN, so it caches nothing.
+				if want := e.agent == h.e.agent && (len(args) == 0 || args[0] != "--before"); cached != want {
+					t.Fatalf("owns.json present = %v; want %v", cached, want)
+				}
+			})
+		}
+	}
+}
+
+// a2: the marker is written at most once per run, after the cache of the
+// same read, and concurrent reads leave one well-formed file.
+func TestToolScopeMarkOnce(t *testing.T) {
+	t.Run("a second read of the run rewrites nothing and takes no lock", func(t *testing.T) {
+		e, root := toolLedgerSandbox(t)
+		dir := filepath.Join(root, e.agent)
+		setToolLedger(t, &toolLedgerNow, func() time.Time { return time.Date(2026, 10, 1, 2, 3, 4, 0, time.UTC) })
+		toolScopeInbox(e, nil, true)
+		first := scopeMarkCheck(t, dir, e.runID)
+		old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		if err := os.Chtimes(filepath.Join(dir, toolScopeMarkName), old, old); err != nil {
+			t.Fatal(err)
+		}
+		// A rewrite would carry the later time and a new modification time.
+		toolLedgerNow = func() time.Time { return time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC) }
+		// With the lock held elsewhere and a minute's wait, only a read that
+		// takes no lock returns at once.
+		setToolLedger(t, &toolScopeLockWait, time.Minute)
+		release := scopeHoldLock(t, root, e.agent, "owns.lock")
+		done := make(chan struct{})
+		go func() {
+			toolScopeInbox(e, nil, true)
+			toolScopeInbox(e, []api.Message{scopeAssign(env{agent: "agt_other"}, 4, "x")}, true)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("a later read of the same run waited for the lock")
+		}
+		release()
+		toolScopeInbox(e, []api.Message{scopeAssign(e, 7, "a.go")}, true)
+		info, err := os.Stat(filepath.Join(dir, toolScopeMarkName))
+		if err != nil || !info.ModTime().Equal(old) || string(scopeMarkCheck(t, dir, e.runID)) != string(first) {
+			t.Fatalf("the marker was rewritten: modified %v, %v", info.ModTime(), err)
+		}
+		if names := strings.Join(scopeDirNames(t, dir), ","); names != "inbox.json,owns.json,owns.lock" {
+			t.Fatalf("directory holds %s", names)
+		}
+	})
+	t.Run("a new run replaces it once", func(t *testing.T) {
+		e, root := toolLedgerSandbox(t)
+		dir := filepath.Join(root, e.agent)
+		toolScopeInbox(e, nil, true)
+		next := e
+		next.runID = "run_recovery"
+		toolScopeInbox(next, nil, true)
+		first := scopeMarkCheck(t, dir, "run_recovery")
+		old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		if err := os.Chtimes(filepath.Join(dir, toolScopeMarkName), old, old); err != nil {
+			t.Fatal(err)
+		}
+		setToolLedger(t, &toolLedgerNow, func() time.Time { return time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC) })
+		toolScopeInbox(next, nil, true)
+		if info, err := os.Stat(filepath.Join(dir, toolScopeMarkName)); err != nil || !info.ModTime().Equal(old) || string(scopeMarkCheck(t, dir, "run_recovery")) != string(first) {
+			t.Fatalf("the new run's marker was rewritten: %v", err)
+		}
+	})
+	t.Run("the cache is renamed before the marker", func(t *testing.T) {
+		e, root := toolLedgerSandbox(t)
+		dir := filepath.Join(root, e.agent)
+		holds := 0
+		setToolLedger(t, &toolScopeHold, func() {
+			holds++
+			if mark, ok := toolScopeMarkLoad(dir); ok && mark.Run == e.runID {
+				t.Errorf("this run's marker is on disk before its ASSIGN is cached: %+v", mark)
+			}
+		})
+		toolScopeInbox(e, []api.Message{scopeAssign(e, 7, "a.go")}, true)
+		if cache, ok := scopeReadCache(t, root, e.agent); holds != 1 || !ok || cache.AssignSeq != 7 {
+			t.Fatalf("holds = %d, cache = %+v, %v", holds, cache, ok)
+		}
+		scopeMarkCheck(t, dir, e.runID)
+	})
+	t.Run("a cache that could not be written leaves no marker", func(t *testing.T) {
+		e, root := toolLedgerSandbox(t)
+		dir := filepath.Join(root, e.agent)
+		// A directory with something in it where owns.json goes: the rename fails.
+		scopeWriteFile(t, root, filepath.Join(e.agent, toolScopeCacheName), "blocker", nil)
+		toolScopeInbox(e, []api.Message{scopeAssign(e, 7, "a.go")}, true)
+		if names := strings.Join(scopeDirNames(t, dir), ","); names != "owns.json,owns.lock" {
+			t.Fatalf("directory holds %s; want no marker and no temp file", names)
+		}
+	})
+	t.Run("16 concurrent reads", func(t *testing.T) {
+		e, root := toolLedgerSandbox(t)
+		dir := filepath.Join(root, e.agent)
+		setToolLedger(t, &toolScopeLockWait, time.Minute)
+		var wg sync.WaitGroup
+		for n := 1; n <= 16; n++ {
+			wg.Add(1)
+			go func(seq int64) {
+				defer wg.Done()
+				var msgs []api.Message
+				if seq%2 == 0 {
+					msgs = []api.Message{scopeAssign(e, seq, fmt.Sprintf("seq-%d", seq))}
+				}
+				toolScopeInbox(e, msgs, true)
+			}(int64(n))
+		}
+		wg.Wait()
+		scopeMarkCheck(t, dir, e.runID)
+		if cache, _ := scopeReadCache(t, root, e.agent); cache.AssignSeq != 16 {
+			t.Fatalf("cache ended at %+v; want seq 16", cache)
+		}
+		if names := strings.Join(scopeDirNames(t, dir), ","); names != "inbox.json,owns.json,owns.lock" {
+			t.Fatalf("readers left %s", names)
+		}
+	})
+}
+
+// scopeStalledHub proxies to hub and never answers the one-message fetch a
+// --seq read makes for the cache, as TestToolScopeCacheSeqStalledFetch does.
+func scopeStalledHub(t *testing.T, hub string) string {
+	t.Helper()
+	real, err := url.Parse(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(real)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query(); q.Get("to") != "" && q.Get("limit") == "1" {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv.URL
+}
+
+// a3: no marker without a successful fetch of the agent's own messages.
+func TestToolScopeMarkNotWritten(t *testing.T) {
+	h := newScopeInboxHub(t)
+	e := h.e
+	seq := fmt.Sprint(h.assign.Seq)
+	own := [][]string{{"--unread"}, {"--unread", "--mark-read"}, {}, {"--json"}, {"--seq", seq}}
+	none := func(t *testing.T, root string) {
+		t.Helper()
+		var found []string
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.Name() == toolScopeMarkName {
+				found = append(found, path)
+			}
+			return nil
+		})
+		if len(found) != 0 {
+			t.Fatalf("marker written: %v", found)
+		}
+	}
+	failing := func(t *testing.T, who env, forms [][]string) {
+		t.Helper()
+		root := scopeLedgerDir(t)
+		for _, args := range forms {
+			if _, err := captureCLIOutput(t, func() error { return cmdInbox(who, args) }); err == nil {
+				t.Fatalf("tt inbox %v succeeded; the case proves nothing", args)
+			}
+		}
+		if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
+			t.Fatalf("a failed fetch wrote %v", names)
+		}
+	}
+	t.Run("hub answers 500", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "the hub is on fire", http.StatusInternalServerError)
+		}))
+		t.Cleanup(srv.Close)
+		who := e
+		who.hub = srv.URL
+		failing(t, who, own)
+	})
+	t.Run("hub is closed", func(t *testing.T) {
+		srv := httptest.NewServer(http.NotFoundHandler())
+		who := e
+		who.hub = srv.URL
+		srv.Close()
+		failing(t, who, own)
+	})
+	t.Run("--seq of a message that does not exist", func(t *testing.T) {
+		failing(t, e, [][]string{{"--seq", fmt.Sprint(h.assign.Seq + 1000)}, {"--seq", fmt.Sprint(h.assign.Seq + 1000), "--json"}})
+	})
+	t.Run("--seq whose own-message fetch stalls", func(t *testing.T) {
+		previous := minCommandTimeout
+		minCommandTimeout = productionMinCommandTimeout
+		t.Cleanup(func() { minCommandTimeout = previous })
+		root := scopeLedgerDir(t)
+		who := e
+		who.hub = scopeStalledHub(t, e.hub)
+		if out, err := captureCLIOutput(t, func() error { return cmdInbox(who, []string{"--seq", seq}) }); err != nil || !strings.Contains(out, "MARK-SUBJECT") {
+			t.Fatalf("--seq printed %q, %v", out, err)
+		}
+		if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
+			t.Fatalf("a stalled fetch wrote %v", names)
+		}
+	})
+	t.Run("a Board read", func(t *testing.T) {
+		root := scopeLedgerDir(t)
+		for _, args := range [][]string{{"--board"}, {"--board", "--json"}, {"--board", "--after", "0"}} {
+			if _, err := captureCLIOutput(t, func() error { return cmdInbox(e, args) }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The Board showed e its ASSIGN, which is cached as before.
+		if names := strings.Join(scopeDirNames(t, filepath.Join(root, e.agent)), ","); names != "owns.json,owns.lock" {
+			t.Fatalf("a Board read left %s; want the cache and its lock only", names)
+		}
+	})
+	t.Run("no agent, a bad agent id, an empty run", func(t *testing.T) {
+		root := scopeLedgerDir(t)
+		noAgent := env{hub: e.hub, task: e.task, runID: e.runID}
+		for _, args := range [][]string{{}, {"--json"}, {"--unread"}, {"--seq", seq}} {
+			if _, err := captureCLIOutput(t, func() error { return cmdInbox(noAgent, args) }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		toolScopeInbox(noAgent, nil, true)
+		toolScopeInbox(env{hub: e.hub, task: e.task, agent: "../agt_escape", runID: "run_escape"}, []api.Message{h.assign}, true)
+		toolScopeInbox(env{hub: e.hub, task: e.task, agent: strings.Repeat("a", toolLedgerFieldBytes+1), runID: "run_long"}, nil, true)
+		if names := scopeDirNames(t, filepath.Dir(root)); len(names) != 0 {
+			t.Fatalf("a read without a usable agent id wrote %v", names)
+		}
+		noRun := e
+		noRun.runID = ""
+		for _, args := range own {
+			if _, err := captureCLIOutput(t, func() error { return cmdInbox(noRun, args) }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		toolScopeInbox(noRun, nil, true)
+		none(t, root)
+		// The empty run's ASSIGN is cached as before.
+		if cache, ok := scopeReadCache(t, root, e.agent); !ok || cache.Run != "" {
+			t.Fatalf("cache of the empty run = %+v, %v", cache, ok)
+		}
+	})
+	t.Run("fetchOK false", func(t *testing.T) {
+		root := scopeLedgerDir(t)
+		toolScopeInbox(e, []api.Message{h.assign}, false)
+		toolScopeInbox(e, nil, false)
+		none(t, root)
+	})
+}
+
+// a4: tt inbox prints and returns the same whether or not the marker and the
+// cache can be written, and a held lock is waited for once, not once per file.
+func TestToolScopeMarkNeverChangesInbox(t *testing.T) {
+	h := newScopeInboxHub(t)
+	e := h.e
+	forms := [][]string{{"--unread"}, {"--unread", "--json"}, {}, {"--json"}, {"--before", fmt.Sprint(h.assign.Seq)}, {"--seq", fmt.Sprint(h.assign.Seq)}, {"--seq", fmt.Sprint(h.plain.Seq), "--json"}, {"--seq", fmt.Sprint(h.assign.Seq + 1000)}}
+	type result struct{ out, err string }
+	run := func(args []string) (result, time.Duration) {
+		t.Helper()
+		start := time.Now()
+		out, err := captureCLIOutput(t, func() error { return cmdInbox(e, args) })
+		elapsed := time.Since(start)
+		return result{out, fmt.Sprint(err)}, elapsed
+	}
+	key := func(args []string) string { return strings.Join(args, " ") }
+	// The reference is a host where nothing can be written at all.
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(blocker, "tool-ledger"))
+	want := map[string]result{}
+	for _, args := range forms {
+		want[key(args)], _ = run(args)
+	}
+	t.Run("writable, first and later reads", func(t *testing.T) {
+		for _, args := range forms {
+			root := scopeLedgerDir(t)
+			for read := 0; read < 2; read++ {
+				if got, _ := run(args); got != want[key(args)] {
+					t.Errorf("read %d: tt inbox %v = %+v; want %+v", read, args, got, want[key(args)])
+				}
+			}
+			if _, ok := toolScopeMarkLoad(filepath.Join(root, e.agent)); ok != (key(args) != "--seq "+fmt.Sprint(h.assign.Seq+1000)) {
+				t.Errorf("tt inbox %v: marker present = %v", args, ok)
+			}
+		}
+	})
+	t.Run("read-only agent directory", func(t *testing.T) {
+		root := scopeLedgerDir(t)
+		if err := os.MkdirAll(root, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, e.agent), 0500); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range forms {
+			if got, _ := run(args); got != want[key(args)] {
+				t.Errorf("tt inbox %v = %+v; want %+v", args, got, want[key(args)])
+			}
+		}
+		if names := scopeDirNames(t, filepath.Join(root, e.agent)); os.Getuid() != 0 && len(names) != 0 {
+			t.Errorf("a read-only directory gained %v", names)
+		}
+	})
+	t.Run("held lock", func(t *testing.T) {
+		// Every form here has both files to write: the ASSIGN and, in a
+		// fresh directory, the marker. A wait taken once per file would add
+		// twice the lock wait.
+		both := [][]string{{"--unread"}, {}, {"--json"}, {"--seq", fmt.Sprint(h.assign.Seq)}}
+		markOnly := [][]string{{"--before", fmt.Sprint(h.assign.Seq)}, {"--seq", fmt.Sprint(h.plain.Seq), "--json"}}
+		for _, lockWait := range []time.Duration{200 * time.Millisecond, 500 * time.Millisecond} {
+			setToolLedger(t, &toolScopeLockWait, lockWait)
+			root := scopeLedgerDir(t)
+			scopeHoldLock(t, root, e.agent, "owns.lock")
+			for _, args := range append(both, markOnly...) {
+				var added time.Duration
+				for attempt := 0; attempt < 3; attempt++ {
+					t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(t.TempDir(), "free"))
+					_, free := run(args)
+					t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+					got, held := run(args)
+					if got != want[key(args)] {
+						t.Fatalf("tt inbox %v under a held lock = %+v; want %+v", args, got, want[key(args)])
+					}
+					if added = held - free; added < 2*lockWait-lockWait/4 {
+						break
+					}
+				}
+				t.Logf("lock wait %v: a held lock delayed tt inbox %v by %v", lockWait, args, added)
+				if added >= 2*lockWait-lockWait/4 {
+					t.Fatalf("a held lock delayed tt inbox %v by %v three times; want one wait of %v, not two", args, added, lockWait)
+				}
+				if added < lockWait/2 {
+					t.Fatalf("tt inbox %v was delayed %v; the writer did not wait for the lock, so the test proves nothing", args, added)
+				}
+			}
+			if names := strings.Join(scopeDirNames(t, filepath.Join(root, e.agent)), ","); names != "owns.lock" {
+				t.Fatalf("a writer without the lock left %s", names)
+			}
+		}
+	})
+}
+
+// a5: a queue builder's edit inside the repository, with this run's marker
+// and no cache of this run, leaves exactly one edit-before-assign row.
+func TestToolScopeBeforeAssignRow(t *testing.T) {
+	long := strings.Repeat("é", 150) + ".go" // 303 bytes; the cut falls inside a character
+	secret := "ghp_" + strings.Repeat("a1B2", 9)
+	type rowCase struct {
+		name, tool, cwd, file string
+		absolute, staleCache  bool
+		wantPath              string
+	}
+	var cases []rowCase
+	for _, tool := range []string{"Edit", "Write", "MultiEdit", "NotebookEdit"} {
+		cases = append(cases,
+			rowCase{name: tool + ", absolute path", tool: tool, file: "hub/cmd/tt/a.go", absolute: true, wantPath: "hub/cmd/tt/a.go"},
+			rowCase{name: tool + ", relative path from a subdirectory", tool: tool, cwd: "hub/cmd", file: "../internal/./x.go", wantPath: "hub/internal/x.go"})
+	}
+	cases = append(cases,
+		rowCase{name: "a path over 200 bytes", tool: "Edit", file: long, absolute: true, wantPath: strings.Repeat("é", 100)},
+		rowCase{name: "a token-shaped segment", tool: "Write", file: "keys/" + secret + "/a.go", absolute: true, wantPath: "keys/[redacted]/a.go"},
+		rowCase{name: "a stale cache of another run", tool: "Edit", file: "docs/a.md", absolute: true, staleCache: true, wantPath: "docs/a.md"})
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e, root := scopeBuilder(t)
+			repo := scopeRepo(t)
+			scopeTouch(t, repo, "hub/cmd", true)
+			if c.staleCache {
+				previous := e
+				previous.runID = "run_previous"
+				// It owns the edited file, and is another run's all the same.
+				toolScopeRemember(previous, []api.Message{scopeAssign(e, 5, "docs")})
+			}
+			scopeMark(t, e, root)
+			cwd := filepath.Join(repo, filepath.FromSlash(c.cwd))
+			file := c.file
+			if c.absolute {
+				file = filepath.Join(repo, filepath.FromSlash(c.file))
+			}
+			pre := scopePre(c.tool, "u1", cwd, file)
+			toolHook(t, e, "PreToolUse", pre)
+			rows := toolLedgerRows(t, root, e.agent)
+			if len(rows) != 1 {
+				t.Fatalf("rows = %v; want exactly one", rows)
+			}
+			row := rows[0]
+			want := map[string]any{"v": 1.0, "task": e.task, "agent": e.agent, "run": e.runID, "session": "s1", "tool": c.tool, "toolUseId": "u1",
+				"argsDigest": toolArgsDigest(json.RawMessage(mustJSON(t, pre["tool_input"]))), "outcome": "would_report", "reportRule": "edit-before-assign", "reportPath": c.wantPath}
+			if _, err := time.Parse(time.RFC3339Nano, fmt.Sprint(row["time"])); err != nil {
+				t.Fatalf("time = %v", row["time"])
+			}
+			delete(row, "time")
+			if !reflect.DeepEqual(row, want) {
+				t.Fatalf("row = %v\nwant  %v", row, want)
+			}
+			if path := row["reportPath"].(string); len(path) > toolScopePathBytes || !utf8.ValidString(path) || strings.Contains(path, repo) || strings.Contains(path, secret) {
+				t.Fatalf("reportPath = %q", path)
+			}
+			// The call still gets its ordinary row when it ends.
+			toolHook(t, e, "PostToolUse", pre)
+			if rows = toolLedgerRows(t, root, e.agent); len(rows) != 2 || rows[1]["outcome"] != "ok" || rows[1]["reportRule"] != nil || rows[1]["toolUseId"] != "u1" {
+				t.Fatalf("rows after the post = %v", rows)
+			}
+		})
+	}
+}
+
+// a6: every other case leaves no edit-before-assign row, prints nothing and
+// keeps the call's ordinary row.
+func TestToolScopeBeforeAssignSilent(t *testing.T) {
+	type sandbox struct {
+		e          env
+		root, repo string
+		pre        map[string]any
+		events     []string
+		outside    int // outside-owned-paths rows the case expects
+	}
+	mark := func(t *testing.T, s *sandbox) { scopeMark(t, s.e, s.root) }
+	markFile := func(data string) func(*testing.T, *sandbox) {
+		return func(t *testing.T, s *sandbox) { scopeWriteFile(t, s.root, s.e.agent, toolScopeMarkName, []byte(data)) }
+	}
+	named := func(name string) func(*testing.T, *sandbox) {
+		return func(t *testing.T, s *sandbox) { mark(t, s); s.e.agentName = name }
+	}
+	cacheFile := func(s *sandbox) string { return filepath.Join(s.root, s.e.agent, toolScopeCacheName) }
+	run := func(t *testing.T, prepare func(*testing.T, *sandbox)) []map[string]any {
+		t.Helper()
+		var s sandbox
+		s.e, s.root = scopeBuilder(t)
+		s.repo = scopeRepo(t)
+		s.pre = scopePre("Edit", "u1", s.repo, filepath.Join(s.repo, "outside.go"))
+		s.events = []string{"PreToolUse", "PostToolUse"}
+		if prepare != nil {
+			prepare(t, &s)
+		}
+		for _, event := range s.events {
+			if r := runToolHook(t, s.e, "tool", toolPayload(event, s.pre), nil); r.err != nil || r.out != "" {
+				t.Fatalf("%s = %v, output %q; want nil and no output", event, r.err, r.out)
+			}
+		}
+		agent := s.e.agent
+		if agent == "" {
+			agent = helperLedgerAgent
+		}
+		rows := toolLedgerRows(t, s.root, agent)
+		if len(rows) == 0 {
+			t.Fatal("no rows at all")
+		}
+		if last := rows[len(rows)-1]; last["outcome"] != "ok" || last["toolUseId"] != "u1" || len(s.events) == 2 && last["durationSource"] != "measured" {
+			t.Fatalf("the call's ordinary row is missing or unpaired: %v", rows)
+		}
+		reports := wouldReportRows(rows)
+		if len(reports) != s.outside {
+			t.Fatalf("would-report rows = %v; want %d", reports, s.outside)
+		}
+		for _, row := range reports {
+			if row["reportRule"] != toolScopeRule || row["assignSeq"] != 5.0 || row["reportPath"] != "outside.go" {
+				t.Fatalf("the outside-owned-paths row = %v", row)
+			}
+		}
+		return rows
+	}
+	t.Run("control: marker and builder name give the row", func(t *testing.T) {
+		var s sandbox
+		s.e, s.root = scopeBuilder(t)
+		s.repo = scopeRepo(t)
+		mark(t, &s)
+		toolHook(t, s.e, "PreToolUse", scopePre("Edit", "u1", s.repo, filepath.Join(s.repo, "outside.go")))
+		if rows := beforeAssignRows(toolLedgerRows(t, s.root, s.e.agent)); len(rows) != 1 {
+			t.Fatalf("control rows = %v; the cases below would prove nothing", rows)
+		}
+	})
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	for _, c := range []struct {
+		name    string
+		prepare func(*testing.T, *sandbox)
+	}{
+		{"marker missing", nil},
+		{"marker malformed", markFile(`{"v":1,"run":"run_ledger","time":"` + stamp)},
+		{"marker oversized", markFile(`{"v":1,"run":"run_ledger","time":"` + stamp + `"}` + strings.Repeat(" ", toolScopeMarkBytes))},
+		{"marker of another version", markFile(`{"v":2,"run":"run_ledger","time":"` + stamp + `"}`)},
+		{"marker of another run", markFile(`{"v":1,"run":"run_previous","time":"` + stamp + `"}`)},
+		{"marker with no run, hook with a run", markFile(`{"v":1,"time":"` + stamp + `"}`)},
+		{"marker with no run, hook with no run", func(t *testing.T, s *sandbox) {
+			markFile(`{"v":1,"run":"","time":"`+stamp+`"}`)(t, s)
+			s.e.runID = ""
+		}},
+		{"marker unreadable", func(t *testing.T, s *sandbox) {
+			if os.Getuid() == 0 {
+				t.Skip("root reads a mode 000 file")
+			}
+			mark(t, s)
+			if err := os.Chmod(filepath.Join(s.root, s.e.agent, toolScopeMarkName), 0); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a directory named inbox.json", func(t *testing.T, s *sandbox) {
+			if err := os.MkdirAll(filepath.Join(s.root, s.e.agent, toolScopeMarkName), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+
+		{"name lead-0a1b2c3d", named("lead-0a1b2c3d")},
+		{"name builder2-0a1b2c3d", named("builder2-0a1b2c3d")},
+		{"name builder-0A1B2C3D", named("builder-0A1B2C3D")},
+		{"name builder-0a1b2c3", named("builder-0a1b2c3")},
+		{"name builder-0a1b2c3d9", named("builder-0a1b2c3d9")},
+		{"name xbuilder-0a1b2c3d", named("xbuilder-0a1b2c3d")},
+		{"name builder-0a1b2c3g", named("builder-0a1b2c3g")},
+		{"name builder_0a1b2c3d", named("builder_0a1b2c3d")},
+		{"empty name", named("")},
+		{"the owner helper session, its file named as a builder", func(t *testing.T, s *sandbox) {
+			s.root, _ = helperLedgerSandbox(t)
+			file := helperLedgerFile()
+			file.Name = scopeBuilderName
+			writeHelperLedgerFile(t, file)
+			t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+			scopeMark(t, env{agent: file.Agent, runID: file.Run}, s.root)
+			s.e = helperLedgerEnv(t)
+			s.pre["session_id"] = file.Thread
+		}},
+
+		{"file outside the repository", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre = scopePre("Edit", "u1", s.repo, filepath.Join(t.TempDir(), "notes.md"))
+		}},
+		{"file outside the repository, relative", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre = scopePre("Write", "u1", s.repo, "../sibling/file.go")
+		}},
+		{"no .git above cwd", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			if err := os.Remove(filepath.Join(s.repo, ".git")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"cwd missing", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["cwd"] = "" }},
+		{"cwd relative", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["cwd"] = "repo" }},
+		{"cwd is null", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["cwd"] = nil }},
+		{"cwd is a number", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["cwd"] = 7 }},
+		{"cwd is an array", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["cwd"] = []string{s.repo} }},
+		{"tool input without its path", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre["tool_input"] = map[string]any{"old_string": "a", "notebook_path": filepath.Join(s.repo, "outside.ipynb")}
+		}},
+		{"empty path", func(t *testing.T, s *sandbox) { mark(t, s); s.pre["tool_input"] = map[string]any{"file_path": ""} }},
+		{"no tool input", func(t *testing.T, s *sandbox) { mark(t, s); delete(s.pre, "tool_input") }},
+
+		{"this run's cache, owned edit", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			toolScopeRemember(s.e, []api.Message{scopeAssign(s.e, 5, "outside.go")})
+		}},
+		{"this run's cache, edit outside it", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			toolScopeRemember(s.e, []api.Message{scopeAssign(s.e, 5, "owned.go")})
+			s.outside = 1
+		}},
+		{"this run's cache and marker written by one read", func(t *testing.T, s *sandbox) {
+			toolScopeInbox(s.e, []api.Message{scopeAssign(s.e, 5, "owned.go")}, true)
+			s.outside = 1
+		}},
+		{"this run's overflow cache", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			toolScopeRemember(s.e, []api.Message{scopeAssign(s.e, 5, make([]string, toolScopeMaxEntries+1)...)})
+			if cache, _ := scopeReadCache(t, s.root, s.e.agent); !cache.Overflow {
+				t.Fatal("fixture is not an overflow cache")
+			}
+		}},
+		{"this run's cache with no usable entry", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			toolScopeRemember(s.e, []api.Message{scopeAssign(s.e, 5, "  ", "../up")})
+		}},
+		{"cache malformed", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			scopeWriteFile(t, s.root, s.e.agent, toolScopeCacheName, []byte(`{"v":1,"run":"run_previous","assignSeq":5,"owns":["owned.go"`))
+		}},
+		{"cache of another version", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			scopeWriteFile(t, s.root, s.e.agent, toolScopeCacheName, []byte(`{"v":2,"run":"run_previous","assignSeq":5,"owns":["owned.go"]}`))
+		}},
+		{"cache oversized", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			scopeWriteFile(t, s.root, s.e.agent, toolScopeCacheName, []byte(`{"v":1,"run":"run_previous","assignSeq":5,"owns":["owned.go"]}`+strings.Repeat(" ", toolScopeCacheBytes)))
+		}},
+		{"cache unreadable", func(t *testing.T, s *sandbox) {
+			if os.Getuid() == 0 {
+				t.Skip("root reads a mode 000 file")
+			}
+			mark(t, s)
+			scopeWriteFile(t, s.root, s.e.agent, toolScopeCacheName, []byte(`{"v":1,"run":"run_previous","assignSeq":5,"owns":["owned.go"]}`))
+			if err := os.Chmod(cacheFile(s), 0); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"cache is a directory", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			if err := os.MkdirAll(cacheFile(s), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"an ASSIGN is cached between the marker read and the second cache read", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			e := s.e
+			setToolLedger(t, &toolScopeRecheck, func() { toolScopeRemember(e, []api.Message{scopeAssign(e, 5, "owned.go")}) })
+		}},
+
+		{"Bash", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre = bashPre("u1", "sed -i s/a/b/ outside.go")
+			s.pre["cwd"] = s.repo
+		}},
+		{"Read", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre = scopePre("Read", "u1", s.repo, filepath.Join(s.repo, "outside.go"))
+		}},
+		{"lower-case edit", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			s.pre = scopePre("edit", "u1", s.repo, filepath.Join(s.repo, "outside.go"))
+		}},
+		{"PostToolUse of Edit alone", func(t *testing.T, s *sandbox) { mark(t, s); s.events = []string{"PostToolUse"} }},
+		{"a panic between the two reads", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			setToolLedger(t, &toolScopeRecheck, func() { panic("recheck on fire") })
+		}},
+		{"a write panics inside the check", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			setToolLedger(t, &toolLedgerWrite, func(f *os.File, b []byte) error {
+				if strings.Contains(string(b), toolScopeBeforeRule) {
+					panic("disk on fire")
+				}
+				_, err := f.Write(b)
+				return err
+			})
+		}},
+		{"the hook deadline already passed", func(t *testing.T, s *sandbox) {
+			mark(t, s)
+			setToolLedger(t, &toolScopeSince, func(time.Time) time.Duration { return toolLedgerDeadline })
+		}},
+		{"the path scan cannot finish", func(t *testing.T, s *sandbox) { mark(t, s); setToolLedger(t, &toolRedactScanBudget, 0) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if rows := beforeAssignRows(run(t, c.prepare)); len(rows) != 0 {
+				t.Fatalf("edit-before-assign rows = %v; want none", rows)
+			}
+		})
+	}
+	t.Run("builder name form", func(t *testing.T) {
+		for name, want := range map[string]bool{"builder-0a1b2c3d": true, "builder-82cc7a8e": true, "builder-00000000": true, "builder-ffffffff": true,
+			"builder-0a1b2c3": false, "builder-0a1b2c3d9": false, "builder-0A1B2C3D": false, "Builder-0a1b2c3d": false, "builder2-facccbae": false,
+			"builder-0a1b2c3g": false, "builder-0a1b2c3é": false, "builder-": false, "": false, "lead-82cc7a8e": false, " builder-0a1b2c3d": false} {
+			if got := toolScopeBuilder(name); got != want {
+				t.Errorf("toolScopeBuilder(%q) = %v; want %v", name, got, want)
+			}
+		}
+	})
+}
+
+// a7: the added cost of the check per PreToolUse with the new rule, by the
+// method of TestToolScopeCost, and its limits.
+func TestToolScopeBeforeAssignCost(t *testing.T) {
+	const runs = 100
+	limit := 5 * time.Millisecond
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "-race" && setting.Value == "true" {
+				limit = 25 * time.Millisecond
+				setToolLedger(t, &toolLedgerDeadline, 5*toolLedgerDeadline)
+				setToolLedger(t, &toolRedactScanBudget, 5*toolRedactScanBudget)
+				t.Logf("race detector on: the added-cost limit is %v, the hook deadline %v and the scan budget %v", limit, toolLedgerDeadline, toolRedactScanBudget)
+			}
+		}
+	}
+	e, root := toolLedgerSandbox(t)
+	repo := scopeRepo(t)
+	plain := make([]string, toolScopeMaxEntries)
+	for i := range plain {
+		plain[i] = fmt.Sprintf("pkg/dir%03d/file.go", i)
+	}
+	inside := scopePre("Edit", "u1", repo, filepath.Join(repo, "hub/cmd/tt/a.go"))
+	real := toolScopeCheck
+	cases := []struct {
+		name, agentName string
+		marker          bool
+		owns            []string
+		pre             map[string]any
+		rows            int
+	}{
+		{"builder, marker, no cache, edit inside", scopeBuilderName, true, nil, inside, 1},
+		{"builder, no marker", scopeBuilderName, false, nil, inside, 0},
+		{"not a builder, marker present", "reviewer-0a1b2c3d", true, nil, inside, 0},
+		{"builder, this run's 256-entry cache, owned edit", scopeBuilderName, true, plain, scopePre("Edit", "u1", repo, filepath.Join(repo, "pkg/dir255/file.go")), 0},
+		{"Bash, builder with marker", scopeBuilderName, true, nil, bashPre("u1", "go test ./cmd/tt -run TestToolScope -count=1"), 0},
+	}
+	for n, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.pre["cwd"] = repo
+			payload := toolPayload("PreToolUse", c.pre)
+			var with, without []time.Duration
+			late := 0
+			var worst time.Duration
+			for i := 0; i < 2*runs; i++ {
+				// Alternate, and swap which goes first each pair.
+				check := (i+i/2)%2 == 0
+				e.agent, e.agentName = fmt.Sprintf("agt_before_cost_%d_%d", n, i), c.agentName
+				toolScopeInbox(e, nil, c.marker)
+				if c.owns != nil {
+					toolScopeRemember(e, []api.Message{scopeAssign(e, 5, c.owns...)})
+				}
+				toolScopeCheck = nil
+				if check {
+					toolScopeCheck = real
+				}
+				r := runToolHook(t, e, "tool", payload, nil)
+				toolScopeCheck = real
+				if r.err != nil || r.out != "" {
+					t.Fatalf("hook = %v, output %q", r.err, r.out)
+				}
+				reports := wouldReportRows(toolLedgerRows(t, root, e.agent))
+				rows := len(reports)
+				if rows != len(beforeAssignRows(reports)) {
+					t.Fatalf("run %d wrote a would-report row of another rule: %v", i, reports)
+				}
+				switch {
+				case !check:
+					if rows != 0 {
+						t.Fatalf("baseline run wrote %d would-report rows", rows)
+					}
+					without = append(without, r.elapsed)
+				case r.elapsed >= toolLedgerDeadline:
+					late++
+					t.Logf("run %d reached the %v deadline in %v with %d of %d rows", i, toolLedgerDeadline, r.elapsed, rows, c.rows)
+				default:
+					if rows != c.rows {
+						t.Fatalf("run %d returned in %v with %d edit-before-assign rows; want %d", i, r.elapsed, rows, c.rows)
+					}
+					with = append(with, r.elapsed)
+					worst = max(worst, r.elapsed)
+				}
+			}
+			if late > 2 {
+				t.Fatalf("%d of %d runs reached the hook deadline; at most 2 are put down to a stalled host", late, runs)
+			}
+			base, checked := toolDenyMedian(without), toolDenyMedian(with)
+			t.Logf("%d-byte input: baseline median %v, with the check %v, added %v, worst run with the check %v", len(payload), base, checked, checked-base, worst)
+			if checked-base >= limit {
+				t.Fatalf("the check adds %v to the median hook; want under %v", checked-base, limit)
+			}
+		})
+	}
+}
+
+// a7: the new rule opens no hub connection either.
+func TestToolScopeBeforeAssignNoHub(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			defer conn.Close() // accepted and never answered
+		}
+	}()
+	e, root := scopeBuilder(t)
+	e.hub = "http://" + ln.Addr().String()
+	t.Setenv("TAILTERM_HUB", e.hub)
+	repo := scopeRepo(t)
+	scopeMark(t, e, root)
+	for i, file := range []string{"a.go", "docs/b.md", "../elsewhere.go"} {
+		call := scopePre("Edit", fmt.Sprintf("u%d", i), repo, filepath.Join(repo, file))
+		for _, event := range []string{"PreToolUse", "PostToolUse"} {
+			if r := runToolHook(t, e, "tool", toolPayload(event, call), nil); r.err != nil || r.out != "" || r.elapsed >= toolLedgerBound {
+				t.Fatalf("%s %s = %v, output %q, in %v", event, file, r.err, r.out, r.elapsed)
+			}
+		}
+	}
+	if rows := toolLedgerRows(t, root, e.agent); len(rows) != 5 || len(beforeAssignRows(rows)) != 2 {
+		t.Fatalf("rows = %v; want three calls and two reports", rows)
+	}
+	if n := connections.Load(); n != 0 {
+		t.Fatalf("the hook opened %d hub connection(s)", n)
+	}
+}
+
+// a8: the command docs/claude-wake.md gives lists edit-before-assign rows by
+// agent and path, and the doc names each limit of the rule.
+func TestToolScopeBeforeAssignDocCommand(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "claude-wake.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(doc), "\n### Edit-before-assign report\n")
+	end := strings.Index(string(doc), "\n### Handler-gate report\n")
+	if start < 0 || end < start || strings.Index(string(doc), "\n### Owned-paths report\n") > start {
+		t.Fatal("docs/claude-wake.md has no Edit-before-assign report section between the owned-paths and handler-gate sections")
+	}
+	section := string(doc)[start:end]
+	for _, phrase := range []string{
+		"`edit-before-assign`", "`inbox.json`", "`builder-` followed by eight", "`--board`", "200 ms",
+		"Edits made through Bash", "Codex sessions", "by the name convention only", "never ran `tt inbox`", "`builder2-", "recovery run", "plain text",
+	} {
+		if !strings.Contains(section, phrase) {
+			t.Errorf("the Edit-before-assign report section does not say %q", phrase)
+		}
+	}
+	command := ""
+	for _, line := range strings.Split(string(doc), "\n") {
+		if strings.Contains(line, `select(.reportRule == "edit-before-assign")`) {
+			if command != "" {
+				t.Fatal("docs/claude-wake.md gives the edit-before-assign summary command more than once")
+			}
+			command = line
+		}
+	}
+	const jq = "/usr/bin/jq"
+	if !strings.HasPrefix(command, "awk 1 ~/.local/state/tailterm/tool-ledger/") || !strings.Contains(command, jq) || !strings.Contains(section, command) {
+		t.Fatalf("the Edit-before-assign report section does not give the summary command: %q", command)
+	}
+	if _, err := os.Stat(jq); err != nil {
+		t.Skipf("%s is not installed", jq)
+	}
+	home := t.TempDir()
+	write := func(agent, name string, lines ...string) {
+		dir := filepath.Join(home, ".local", "state", "tailterm", "tool-ledger", agent)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(lines, "\n")), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row := func(agent, outcome, rule, path string) string {
+		r := toolLedgerRow{V: 1, Agent: agent, Tool: "Edit", Outcome: outcome, ReportRule: rule, ReportPath: path}
+		if rule == toolScopeRule {
+			r.AssignSeq = 7
+		}
+		b, _ := json.Marshal(r)
+		return string(b)
+	}
+	write("agt_a", "ledger.jsonl.1", row("agt_a", "would_report", "edit-before-assign", "docs/a.md"), row("agt_a", "ok", "", ""), "")
+	write("agt_a", "ledger.jsonl", row("agt_a", "would_report", "edit-before-assign", "docs/a.md"), row("agt_a", "would_report", "outside-owned-paths", "docs/a.md"),
+		row("agt_a", "would_report", "edit-before-assign", "hub/cmd/tt/b.go"), `{"v":1,"agent":"agt_a","outcome":"would_report","reportRule":"edit-before-ass`)
+	write("agt_b", "ledger.jsonl", row("agt_b", "ok", "", ""), row("agt_b", "would_report", "edit-before-assign", "docs/a.md"), "")
+	write("agt_b", toolScopeMarkName, `{"v":1,"run":"r","time":"t"}`)
+	write("agt_c", "ledger.jsonl", row("agt_c", "would_report", "outside-owned-paths", "x.go"), "")
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", command, err, out)
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		got = append(got, strings.Join(strings.Fields(line), " "))
+	}
+	want := []string{"2 agt_a docs/a.md", "1 agt_a hub/cmd/tt/b.go", "1 agt_b docs/a.md"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("summary = %q; want %q", got, want)
 	}

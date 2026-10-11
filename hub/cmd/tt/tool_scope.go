@@ -22,9 +22,16 @@ import (
 // would_report row for an Edit, Write, MultiEdit or NotebookEdit whose file
 // is inside the session's repository and outside those paths.
 //
+// The edit-before-assign report (feature wi_03fe150782cc7a8e) is report-only
+// too. After a successful fetch of its agent's own messages `tt inbox` leaves
+// a marker, inbox.json, beside that cache, once per run. The hook appends one
+// would_report row, rule edit-before-assign, for the same four tools when the
+// agent has a queue builder's name, the marker is this run's and no owned
+// paths are cached for this run.
+//
 // It blocks nothing and prints nothing, and any failure writes nothing
-// extra. The hook reads the cache and makes stat calls only: no process is
-// started and the hub is never asked. See docs/claude-wake.md.
+// extra. The hook reads the cache and the marker and makes stat calls only:
+// no process is started and the hub is never asked. See docs/claude-wake.md.
 
 // Variables rather than constants so tests can change them.
 var (
@@ -32,6 +39,7 @@ var (
 	toolScopeLockWait = 200 * time.Millisecond // the most a cache write delays tt inbox
 	toolScopeHold     = func() {}              // runs under the cache lock, between the read and the rename
 	toolScopeSince    = time.Since             // the clock the scope row's own deadline checks read
+	toolScopeRecheck  = func() {}              // runs in the hook between the marker read and the second cache read
 )
 
 const (
@@ -44,6 +52,10 @@ const (
 	toolScopeMaxLevels  = 64        // directories walked up to find the repository root
 	toolScopeNote       = " (new)"  // the one note an entry may end with
 	toolScopeCacheName  = "owns.json"
+
+	toolScopeBeforeRule = "edit-before-assign"
+	toolScopeMarkName   = "inbox.json"
+	toolScopeMarkBytes  = 512 // largest marker file the hook reads
 )
 
 var errToolScopeLate = errors.New("the hook deadline passed")
@@ -62,10 +74,24 @@ type toolScopeCache struct {
 	Overflow bool `json:"overflow,omitempty"`
 }
 
+// toolScopeMark is inbox.json: this run of the agent has fetched its own
+// messages. It holds nothing else.
+type toolScopeMark struct {
+	V    int    `json:"v"`
+	Run  string `json:"run"` // the run of the tt inbox that wrote it
+	Time string `json:"time"`
+}
+
 // toolScopeRemember caches the owned paths of the newest typed ASSIGN among
-// msgs that is addressed to this agent. It returns nothing and prints
-// nothing, so it cannot change what tt inbox prints or returns.
-func toolScopeRemember(e env, msgs []api.Message) {
+// msgs that is addressed to this agent, and writes no marker.
+func toolScopeRemember(e env, msgs []api.Message) { toolScopeInbox(e, msgs, false) }
+
+// toolScopeInbox caches the owned paths of the newest typed ASSIGN among msgs
+// that is addressed to this agent and, when fetchOK says a fetch of the
+// agent's own messages succeeded, leaves this run's marker once. It returns
+// nothing and prints nothing, so it cannot change what tt inbox prints or
+// returns.
+func toolScopeInbox(e env, msgs []api.Message, fetchOK bool) {
 	defer func() { _ = recover() }()
 	root := toolLedgerRoot()
 	if root == "" || !toolLedgerAgentOK(e.agent) {
@@ -81,67 +107,103 @@ func toolScopeRemember(e env, msgs []api.Message) {
 			assign = m
 		}
 	}
-	if assign == nil {
-		return
-	}
-	next := toolScopeCache{V: 1, Run: toolLedgerCut(e.runID), AssignSeq: assign.Seq, Time: toolLedgerNow().UTC().Format(time.RFC3339)}
-	for i, link := range assign.WorkItems {
-		if i == 0 || link.Relationship == "primary" {
-			next.Item, next.ItemRevision = toolLedgerCut(link.ItemID), link.ItemRevision
-		}
-		if link.Relationship == "primary" {
-			break
+	dir, run := filepath.Join(root, e.agent), toolLedgerCut(e.runID)
+	// The marker is written once per run: a later read finds it here, without
+	// the lock, and with no ASSIGN to cache takes no lock at all.
+	needMark := fetchOK && run != ""
+	if needMark {
+		if mark, ok := toolScopeMarkLoad(dir); ok && mark.Run == run {
+			needMark = false
 		}
 	}
-	next.Owns = assign.Envelope.Body.Owns
-	if len(next.Owns) > toolScopeMaxEntries {
-		next.Owns, next.Overflow = nil, true
-	}
-	for _, entry := range next.Owns {
-		if len(entry) > toolScopeEntryBytes {
+	var next toolScopeCache
+	var data []byte
+	if assign != nil {
+		next = toolScopeCache{V: 1, Run: run, AssignSeq: assign.Seq, Time: toolLedgerNow().UTC().Format(time.RFC3339)}
+		for i, link := range assign.WorkItems {
+			if i == 0 || link.Relationship == "primary" {
+				next.Item, next.ItemRevision = toolLedgerCut(link.ItemID), link.ItemRevision
+			}
+			if link.Relationship == "primary" {
+				break
+			}
+		}
+		next.Owns = assign.Envelope.Body.Owns
+		if len(next.Owns) > toolScopeMaxEntries {
 			next.Owns, next.Overflow = nil, true
-			break
+		}
+		for _, entry := range next.Owns {
+			if len(entry) > toolScopeEntryBytes {
+				next.Owns, next.Overflow = nil, true
+				break
+			}
+		}
+		var err error
+		data, err = json.Marshal(next)
+		if err == nil && len(data) > toolScopeCacheBytes {
+			// Escaping grew the file past what the hook reads.
+			next.Owns, next.Overflow = nil, true
+			data, err = json.Marshal(next)
+		}
+		if err != nil {
+			return
 		}
 	}
-	data, err := json.Marshal(next)
-	if err == nil && len(data) > toolScopeCacheBytes {
-		// Escaping grew the file past what the hook reads.
-		next.Owns, next.Overflow = nil, true
-		data, err = json.Marshal(next)
-	}
-	if err != nil {
+	if assign == nil && !needMark {
 		return
 	}
-	dir := filepath.Join(root, e.agent)
 	if os.MkdirAll(dir, 0700) != nil {
 		return
 	}
 	// The read, the comparison and the rename happen under one lock, so two
 	// tt inbox processes cannot leave the older ASSIGN in place. Without the
-	// lock nothing is written; a later read of the ASSIGN caches it.
+	// lock nothing is written; a later read of the ASSIGN caches it. The
+	// marker is written under the same hold of the lock, so the two files
+	// together wait for it once.
 	unlock := toolScopeLock(dir)
 	if unlock == nil {
 		return
 	}
 	defer unlock()
-	if old, ok := toolScopeLoad(dir); ok && old.Run == next.Run && old.AssignSeq >= next.AssignSeq {
+	if assign != nil {
+		if old, ok := toolScopeLoad(dir); !ok || old.Run != next.Run || old.AssignSeq < next.AssignSeq {
+			toolScopeHold()
+			if !toolScopeWrite(dir, "owns-*.tmp", toolScopeCacheName, data) {
+				return
+			}
+		}
+	}
+	// The cache is renamed first: the hook never sees this run's marker while
+	// the ASSIGN the same read fetched is still uncached.
+	if !needMark {
 		return
 	}
-	toolScopeHold()
-	f, err := os.CreateTemp(dir, "owns-*.tmp") // created 0600
-	if err != nil {
+	if mark, ok := toolScopeMarkLoad(dir); ok && mark.Run == run {
 		return
+	}
+	if data, err := json.Marshal(toolScopeMark{V: 1, Run: run, Time: toolLedgerNow().UTC().Format(time.RFC3339)}); err == nil {
+		toolScopeWrite(dir, "inbox-*.tmp", toolScopeMarkName, data)
+	}
+}
+
+// toolScopeWrite puts data at name in dir through a temp file and a rename,
+// and reports whether it did. A failure leaves no temp file.
+func toolScopeWrite(dir, pattern, name string, data []byte) bool {
+	f, err := os.CreateTemp(dir, pattern) // created 0600
+	if err != nil {
+		return false
 	}
 	_, err = f.Write(data)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Rename(f.Name(), filepath.Join(dir, toolScopeCacheName))
+		err = os.Rename(f.Name(), filepath.Join(dir, name))
 	}
 	if err != nil {
 		_ = os.Remove(f.Name())
 	}
+	return err == nil
 }
 
 // toolScopeLock takes the cache lock the way toolLedger.lock takes the
@@ -182,6 +244,22 @@ func toolScopeLoad(dir string) (toolScopeCache, bool) {
 	return cache, true
 }
 
+// toolScopeMarkLoad reads inbox.json. A missing, unreadable, oversized or
+// malformed file, or one of another version, is no marker.
+func toolScopeMarkLoad(dir string) (toolScopeMark, bool) {
+	var mark toolScopeMark
+	f, err := os.Open(filepath.Join(dir, toolScopeMarkName))
+	if err != nil {
+		return mark, false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, toolScopeMarkBytes+1))
+	if err != nil || len(data) > toolScopeMarkBytes || json.Unmarshal(data, &mark) != nil || mark.V != 1 {
+		return toolScopeMark{}, false
+	}
+	return mark, true
+}
+
 // toolScopePathField names where each edit tool's input carries its file.
 var toolScopePathField = map[string]string{
 	"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
@@ -189,7 +267,8 @@ var toolScopePathField = map[string]string{
 
 // wouldReport appends the would_report row of a pre whose file is inside the
 // repository and outside the cached owned paths. The steps are ordered so a
-// call that is not an edit, or has no cache, costs next to nothing.
+// call that is not an edit, or has no cache, costs next to nothing. With no
+// cache of this run it is beforeAssign that decides.
 func (l toolLedger) wouldReport(row toolLedgerRow, tool string, input json.RawMessage, cwd string) {
 	defer func() { _ = recover() }()
 	field := toolScopePathField[tool]
@@ -197,24 +276,16 @@ func (l toolLedger) wouldReport(row toolLedgerRow, tool string, input json.RawMe
 		return
 	}
 	cache, ok := toolScopeLoad(l.dir)
-	if !ok || cache.Overflow || len(cache.Owns) == 0 || cache.Run != l.run {
+	if !ok || cache.Run != l.run {
+		l.beforeAssign(row, input, field, cwd, ok)
 		return
 	}
-	file, ok := toolScopeField(input, field)
-	if !ok || file == "" || !filepath.IsAbs(cwd) {
+	if cache.Overflow || len(cache.Owns) == 0 {
 		return
 	}
-	cwd = filepath.Clean(cwd)
-	if !filepath.IsAbs(file) {
-		file = filepath.Join(cwd, file)
-	}
-	root := toolScopeRoot(cwd)
-	if root == "" {
-		return
-	}
-	rel, ok := toolScopeRel(root, filepath.Clean(file))
+	root, rel, ok := toolScopeFile(input, field, cwd)
 	if !ok {
-		return // outside the repository
+		return
 	}
 	exists := func(form string) bool {
 		_, err := os.Lstat(filepath.Join(root, filepath.FromSlash(form)))
@@ -223,6 +294,75 @@ func (l toolLedger) wouldReport(row toolLedgerRow, tool string, input json.RawMe
 	if owned, usable := toolScopeOwned(root, rel, cache.Owns, exists); owned || !usable {
 		return
 	}
+	l.scopeRow(row, toolScopeRule, cache.AssignSeq, rel)
+}
+
+// toolScopeBuilder reports whether name has the queue team builder form:
+// builder- and eight lower-case hex digits.
+func toolScopeBuilder(name string) bool {
+	const prefix = "builder-"
+	if len(name) != len(prefix)+8 || name[:len(prefix)] != prefix {
+		return false
+	}
+	for i := len(prefix); i < len(name); i++ {
+		if c := name[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// beforeAssign appends the edit-before-assign row of a pre by a queue builder
+// whose run has fetched its inbox and has no owned paths cached. loaded says
+// owns.json was read, and so is another run's. The steps are ordered so any
+// other agent touches no file.
+func (l toolLedger) beforeAssign(row toolLedgerRow, input json.RawMessage, field, cwd string, loaded bool) {
+	if l.helper || !toolScopeBuilder(l.name) || l.run == "" {
+		return
+	}
+	if !loaded {
+		// A cache that is there and cannot be used is not "no ASSIGN cached".
+		if _, err := os.Lstat(filepath.Join(l.dir, toolScopeCacheName)); !errors.Is(err, os.ErrNotExist) {
+			return
+		}
+	}
+	if mark, ok := toolScopeMarkLoad(l.dir); !ok || mark.Run != l.run {
+		return
+	}
+	// tt inbox renames the cache before the marker, so a second read settles
+	// an ASSIGN that landed between the first read and the marker's.
+	toolScopeRecheck()
+	if cache, ok := toolScopeLoad(l.dir); ok && cache.Run == l.run {
+		return
+	}
+	if _, rel, ok := toolScopeFile(input, field, cwd); ok {
+		l.scopeRow(row, toolScopeBeforeRule, 0, rel)
+	}
+}
+
+// toolScopeFile resolves the file an edit names to the repository root above
+// cwd and the file's path relative to it. It gives false for an input without
+// its path, a cwd that is not absolute, no repository, or a file outside it.
+func toolScopeFile(input json.RawMessage, field, cwd string) (root, rel string, ok bool) {
+	file, ok := toolScopeField(input, field)
+	if !ok || file == "" || !filepath.IsAbs(cwd) {
+		return "", "", false
+	}
+	cwd = filepath.Clean(cwd)
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(cwd, file)
+	}
+	root = toolScopeRoot(cwd)
+	if root == "" {
+		return "", "", false
+	}
+	rel, ok = toolScopeRel(root, filepath.Clean(file))
+	return root, rel, ok // not ok: outside the repository
+}
+
+// scopeRow appends one would_report row of the rule for rel, a path relative
+// to the repository root.
+func (l toolLedger) scopeRow(row toolLedgerRow, rule string, assignSeq int64, rel string) {
 	// The path goes through the secret scan as a would-deny summary does. A
 	// scan that did not finish gives no path, and so no row.
 	rewrite, counted, ok := redactScan(rel, toolRedactExact(l.token), l.started.Add(l.redactBudget))
@@ -237,7 +377,7 @@ func (l toolLedger) wouldReport(row toolLedgerRow, tool string, input json.RawMe
 		at = span.end
 	}
 	out.WriteString(rel[at:])
-	row.Outcome, row.ReportRule, row.AssignSeq = toolScopeOutcome, toolScopeRule, cache.AssignSeq
+	row.Outcome, row.ReportRule, row.AssignSeq = toolScopeOutcome, rule, assignSeq
 	if row.ReportPath = toolLedgerCutTo(out.String(), toolScopePathBytes); row.ReportPath == "" {
 		return
 	}
