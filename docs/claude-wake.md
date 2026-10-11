@@ -195,13 +195,15 @@ and relay regressions. No live owner/agent sessions are test fixtures.
 
 ## Tool-call ledger
 
-Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. The would-deny report was added by feature `wi_23ca1183c7d59c79` revision 2, owner order #31851, builder assignment #31889. The owned-paths report was added by feature `wi_c1ef66c9f6c8aadc` revision 3, owner order #31964, builder assignment #31979. This source change is a candidate.
+Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25980 and #26096 and answers #25999 and #26032, builder assignments #26043 and #26116. The owner helper session was added by bug `wi_b3e8ecd5a2ee01b3` revision 3, owner order #26838 with amendment #26841, builder assignment #26858. The would-deny report was added by feature `wi_23ca1183c7d59c79` revision 2, owner order #31851, builder assignment #31889. The owned-paths report was added by feature `wi_c1ef66c9f6c8aadc` revision 3, owner order #31964, builder assignment #31979. The handler-gate report was added by feature `wi_cbc08bd2b2a419a0` revision 2, owner order #32007 with decision answer #32034, builder assignment #32041. This source change is a candidate.
 
 Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The owner helper's Claude session is covered too (see "Owner helper session"). The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
 
 A Bash call that matches a protected-operation rule leaves one extra row per matched rule, written when the call is attempted (see "Would-deny report"). The report blocks nothing. Codex sessions are not covered by it either: Codex has only a Stop hook, so no Codex tool call is seen.
 
 An Edit, Write, MultiEdit or NotebookEdit of a file outside the paths of the agent's latest ASSIGN leaves one extra row too (see "Owned-paths report"). That report also blocks nothing and does not cover Codex.
+
+A Bash call that writes a work item through `tt`, sends a non-GET request to the hub or opens the hub database with `sqlite3` leaves one extra row per rule as well, tagged with who ran it (see "Handler-gate report"). That report blocks nothing and does not cover Codex either.
 
 ### Hooks
 
@@ -213,6 +215,7 @@ An Edit, Write, MultiEdit or NotebookEdit of a file outside the paths of the age
 - It always exits 0. The handler has no return value and `cmdHook` returns nil after it.
 - The would-deny report changes none of this. It only appends rows: it prints nothing, has no return value, and a command it cannot read or classify is left unreported.
 - The owned-paths report changes none of this either. It only appends rows, and anything it cannot read or judge is left unreported.
+- Nor does the handler-gate report. Its rows are appended in the would-deny report's one write, and a command that cannot be read or classified is left unreported.
 - It makes no hub request and opens no network connection. A slow or unreachable hub does not matter.
 - The whole command returns within 200 ms. The handler reads stdin and does its work in a goroutine and waits at most 150 ms for it; when the handler returns the process exits, which ends work still blocked on stdin or the disk. This holds for stdin that is closed, held open, empty, malformed or oversized.
 - With `TAILTERM_AGENT` set, the session is an agent's and nothing below changes it. If `TAILTERM_TASK` or the hub is then missing, it returns before reading stdin and touches no file. An agent id with characters other than letters, digits, `_` and `-` is also a no-op, because the id becomes a directory name.
@@ -246,15 +249,16 @@ Directories are 0700 and files 0600. `TAILTERM_TOOL_LEDGER_DIR` replaces the `to
 | `tool` | `tool_name`, cut to 128 bytes |
 | `toolUseId` | `tool_use_id`, cut to 128 bytes |
 | `argsDigest` | lower-case hex SHA-256 of `tool_input` after it is decoded and encoded again by Go's `encoding/json` (object keys sorted, numbers kept as written); empty when there is no `tool_input` |
-| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use), `would_deny` (a PreToolUse that matched a protected-operation rule; the call still gets its own row when it ends), `would_report` (a PreToolUse of an edit outside the agent's owned paths; the call still gets its own row when it ends) |
+| `outcome` | `ok` (PostToolUse), `error` (PostToolUseFailure), `interrupted` (failure with `is_interrupt`), `unknown` (a call that started and never finished), `unreadable` (input the hook could not use), `would_deny` (a PreToolUse that matched a protected-operation rule; the call still gets its own row when it ends), `would_report` (a PreToolUse of an edit outside the agent's owned paths, or of a Bash command that matched a handler-gate rule; the call still gets its own row when it ends) |
 | `durationMs`, `durationSource` | `duration_ms` from Claude Code (`claude`), else the time since the call's pre hook (`measured`), else absent |
 | `oversize` | `true` only when the input passed the 8 MiB cap |
 | `denyRule`, `denyKind`, `denySummary` | only on a `would_deny` row: the rule id, the operation kind and a summary of fixed words (see "Would-deny report") |
-| `reportRule`, `reportPath`, `assignSeq` | only on a `would_report` row: the rule id, the file's path relative to the repository root cut to 200 bytes, and the number of the ASSIGN it was judged against (see "Owned-paths report") |
+| `reportRule`, `reportPath`, `assignSeq` | only on a `would_report` row: the rule id, the file's path relative to the repository root cut to 200 bytes, and the number of the ASSIGN it was judged against (see "Owned-paths report"). A handler-gate row has `reportRule` and neither of the other two |
+| `reportTag`, `reportSummary`, `agentName` | only on a handler-gate `would_report` row: who ran the command (`handler`, `lead-allowed`, `owner-helper` or `none`), a summary of fixed words, and the agent's name (see "Handler-gate report") |
 
 Claude Code gives no numeric exit code. A Bash command that exits non-zero arrives as PostToolUseFailure, so it is an `error` row.
 
-Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table, and for the owned-paths report `cwd` and the one path field of an edit tool's `tool_input`. Neither is stored, with one exception: the repository-relative path of a reported edit, in `reportPath`. The repository root and `cwd` never reach a row. From a helper file only `task`, `agent` and `run` reach a row; its registration and request fields do not. A `would_deny` row is no exception: its summary is put together from fixed words and a count, and no text is copied from the command.
+Never stored, in the ledger or in a pending file: `tool_input`, `tool_response`, `error`, `cwd`, `transcript_path`, file contents, tokens or any environment value. The hook decodes only the fields in the table, and for the owned-paths report `cwd` and the one path field of an edit tool's `tool_input`. Neither is stored, with one exception: the repository-relative path of a reported edit, in `reportPath`. The repository root and `cwd` never reach a row. From a helper file only `task`, `agent` and `run` reach a row; its registration and request fields do not. A `would_deny` row is no exception: its summary is put together from fixed words and a count, and no text is copied from the command. A handler-gate row's summary is built the same way. That row holds one environment value, the agent's name from `TAILTERM_AGENT_NAME`, or the helper file's `name` for the owner helper, and only when it is made of letters, digits, `_`, `-` and `.`. The hub address in `TAILTERM_HUB` is compared against the command and never stored.
 
 ### Owner helper session
 
@@ -390,7 +394,7 @@ To count would-report rows by rule and agent for this host:
 awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.outcome == "would_report") | "\(.reportRule)\t\(.agent)"' | sort | uniq -c
 ```
 
-Each line is a count, a rule id and an agent id, read the same way as the would-deny command above.
+Each line is a count, a rule id and an agent id, read the same way as the would-deny command above. Handler-gate rows are `would_report` rows too, so this command now counts their three rules beside `outside-owned-paths`; the command under "Handler-gate report" counts them alone, by tag.
 
 Cost, measured on the Mini on 2026-10-10 by `TestToolScopeCost`, by the method of `TestToolDenyCost`: under 0.01 ms for a Bash call and for an edit with no cache; about 0.06 ms for an owned edit against a 256-entry cache; about 0.15 ms for an edit outside it (the extra append); about 0.8 ms for a Write outside it with 1 MiB of content; about 0.45 ms for an edit outside 256 glob entries (one stat call each). The test fails if the check adds 5 ms to the median or if a run with the check does not return, row written, before the 150 ms deadline.
 
@@ -407,6 +411,78 @@ Limits of the report:
 - An entry form the rules above do not know, such as a note other than ` (new)`, owns only its literal name, so edits to the file it meant are reported.
 - Nothing removes `owns.json` when an agent's work ends.
 
+### Handler-gate report
+
+Report-only. Work-item reads and writes belong to the project's database handler (AGENTS.md). On PreToolUse the would-deny check also matches the `command` of a `Bash` call, from the same parse, against three rules for going around the handler. Each rule that matches adds one row with `outcome` `would_report`, `reportRule`, `reportTag`, `reportSummary` and `agentName`, the call's `session`, `tool`, `toolUseId` and `argsDigest`, and the usual `task`, `agent`, `run` and `time`. `reportPath` and `assignSeq` are absent. A command that matches all three leaves three rows, and one that also matches a would-deny rule leaves that row as before; all of a call's rows go out in one write. Nothing is blocked, delayed past the hook's own wait, printed or changed, the call gets its ordinary row when it ends, and the would-deny and owned-paths rows are as they were.
+
+A command is read as the would-deny report reads it (see "How a command is read" there): split into simple commands, quotes honoured, heredoc bodies and comments skipped, wrappers stepped over, the base name compared, and the arguments of `bash -c`, `eval` and any `ssh` read in turn. So `sudo /Users/x/.local/bin/tt work-items create …` and `ssh truenas 'sqlite3 …'` match, and `echo "tt work-items create"`, a commit message or a board post never does.
+
+| `reportRule` | Fires when |
+| --- | --- |
+| `work-item-write` | the command is `tt` and its next words, by position, are a write: `work-items` with `create`, `update`, `dispatch`, `note`, `evidence`, `scope confirm`, `scope save`, `narrative artifact-put`, `narrative link-put`, `narrative coverage-put`, `narrative report-put`, `triage set` or `triage confirm`; `queue action`; `team queue` with `add`, `policy`, `limit`, `provision`, `scope`, `wait set`, `wait clear`, `rebind`, `requeue`, `fail`, `accept`, `integrated`, `replace-lead`, `remove`, `reorder`, `release` or `abandon`; `verification plan` or `verification receipt` |
+| `hub-direct-write` | the command is `curl`, `wget`, `http`, `https` or `xh`, its own options make the request a write, and one of its URLs has the hub's authority (both in the same simple command) |
+| `hub-db-direct` | the command is `sqlite3` and its database operand is `/mnt/deepfreeze/tailterm-hub` or a path under it. Reads count: the rule is direct access |
+
+Reads never match `work-item-write`: `tt work-items list`, `get`, `receipt`, `revisions`, `messages`, `triage` with flags only, `scope get`, `scope receipt`, every `narrative` read (`overview`, `timeline`, `artifacts`, `artifact-versions`, `artifact-get`, `links`, `coverage`, `reports`, `report-get`, `receipt`); `tt queue list`, `get`, `history`, `changes`, `receipt`; `tt team queue list` and `sweep-worktrees`, `tt team launch`; `tt verification history` and `enrollment`; and every other `tt` command, `tt work-items` alone, or an unknown word in a subcommand position. `tt work-items evidence` is a hub read that writes a private local file; the order lists it as a write, so it matches, and its summary names it. `tt work-items triage set` and `triage confirm` do not exist in this `tt` and match only so a later command is covered.
+
+What makes a request a write:
+
+- curl: `-X` or `--request` with a value other than GET (`-XPOST` and `--request=POST` too), or any of `-d`, `--data`, `--data-raw`, `--data-binary`, `--data-urlencode`, `--json`, `-F`, `--form`, `-T`, `--upload-file`, `-I`, `--head`. HEAD counts as a write: only GET is a read. curl `-G` or `--get` with data is a GET, because the data becomes the query, and does not match unless a non-GET method is also given.
+- wget: `--post-data`, `--post-file`, `--body-data`, `--body-file`, or `--method` other than GET.
+- `http`, `https`, `xh`: a first word that is a method other than GET, or a request item after the URL that is a body field (its first separator is `=`, `:=` or `@`). A header (`Name:value`) and a query parameter (`name==value`) are not body fields.
+
+What has the hub's authority: a URL is judged by its authority alone, which is what follows an optional `scheme://` and an optional `user:pass@`, up to the first `/`, `?` or `#`. It is the hub when its host and port are those of the `TAILTERM_HUB` environment value (a missing port is 80, or 443 for https), or when its port is 18765 on any host. A word that starts with the text `$TAILTERM_HUB` or `${TAILTERM_HUB}`, followed by the end of the word or by `/`, `?` or `#`, is the hub too. For curl and wget every word that is not an option or an option's value is a URL, and so is the value of curl `--url`; for `http`, `https` and `xh` only the first such word after the method is. The value of `-H`, `-d`, `-o`, `-u` and every other option that takes one is skipped by a fixed table and never read, so the hub's address inside a header, a body, a query, a path or a fragment is not a match, and `@file` is a word: no file is opened.
+
+For `sqlite3` the operand is the first word that is not an option or the value of `-cmd`, `-init`, `-separator`, `-newline`, `-nullvalue`, `-vfs`, `-maxsize`, `-mmap`, `-lookaside`, `-pagecache` or `-heap`. A leading `file:` and anything from the first `?` are dropped. Later words are SQL text and are never judged.
+
+These do not fire: `tt work-items list`, `tt send --subject 'tt work-items create'`, `curl $TAILTERM_HUB/api/tasks`, `curl -X GET http://h:18765/x`, `curl -G -d a=b http://h:18765/x`, `curl -X POST https://example.com/x`, `curl -X POST host:8765`, `curl -H 'X: http://h:18765' https://example.com -d x`, `curl -X POST 'https://example.com/x?next=http://h:18765/y'`, `curl -X POST https://example.com/p:18765/x`, `curl -X POST https://example.com/$TAILTERM_HUB`, `wget http://h:18765/x`, `sqlite3 /tmp/x.db`, `sqlite3 /mnt/deepfreeze/tailterm-hub-backup/hub.db`, `sqlite3 /tmp/x.db "ATTACH '/mnt/deepfreeze/tailterm-hub/hub.db' AS h"`, `sqlite3 -cmd '/mnt/deepfreeze/tailterm-hub/hub.db' /tmp/x.db`, `ls /mnt/deepfreeze/tailterm-hub`. A tool other than Bash never fires.
+
+`reportTag` says who ran the command. It is recorded, and the row is written whatever it is; no tag drops a row. The first that applies:
+
+| `reportTag` | Given when |
+| --- | --- |
+| `owner-helper` | the session has no agent identity and was ledgered as the owner helper from its helper file (see "Owner helper session"). It acts under the owner's delegation |
+| `handler` | the agent's name starts with `db-handler` |
+| `lead-allowed` | the agent's name starts with `lead-` and the match is `tt verification plan`, `tt verification receipt`, or the done save with queue acceptance: `tt work-items update` with `--status done` (or `--status=done`) and all of `--worktree`, `--branch` and `--commit` (owner helper answer #18182, AGENTS.md). A lead's other writes are `none` |
+| `none` | everything else, an agent with no name included |
+
+The name is `TAILTERM_AGENT_NAME`, or the helper file's `name`. A command holding both a write a lead may make and one it may not is tagged by the one it may not. `agentName` is that name cut to 128 bytes, and absent unless it is made only of letters, digits, `_`, `-` and `.`.
+
+`reportSummary` is at most 120 bytes and is built only from fixed words and a count, as `denySummary` is, and passes the same secret scan:
+
+- `work-item-write`: `tt` and the subcommand words matched; for the done save the option names `--status done --worktree --branch --commit` as well; then `(+N args)`, the number of words after them that are left out. Examples: `tt work-items scope confirm (+9 args)`, `tt team queue wait set (+6 args)`, `tt work-items update --status done --worktree --branch --commit (+4 args)`.
+- `hub-direct-write`: the client's name; the method when it is POST, PUT, PATCH, DELETE, HEAD or OPTIONS and the word `method` for any other; `data` when a body option or body field is present; `hub` for the `TAILTERM_HUB` address or variable, or `port-18765`; then `(+N args)`, every word after the client's name but the matched URL. Example: `curl POST data port-18765 (+7 args)`.
+- `hub-db-direct`: `sqlite3 hub-db (+N args)`.
+
+An item id, a flag's value, a path, a URL, a host, a user name, a header, a body, a token and the SQL text never reach a row.
+
+No credential is read. The gate opens no file: not `hub.json`, not a file named with `@`, not the database. It takes the hub address from the `TAILTERM_HUB` environment value alone, never from the configured one, and makes no hub request. One read is not the gate's and remains: every `tt` command, `tt hook tool` included, reads `~/.config/tailterm/hub.json` when it starts, before any hook handler runs, which is how the redaction token arrives (decision #32034). Nothing from that file reaches a gate row.
+
+Fail open, as the would-deny report does and by the same path: nothing extra is written for input the hook cannot read, a `tool_input` with no `command` string, a command longer than 64 KiB, substitutions nested more than eight deep, a panic in the check, or a check that ends after the 150 ms wait. A panic inside the gate's own rules ends the gate for that call only: its would-deny rows are still written. The pending entry is written first, so none of these changes the call's ordinary row.
+
+To count handler-gate rows by rule, tag and agent name for this host:
+
+```sh
+awk 1 ~/.local/state/tailterm/tool-ledger/*/ledger.jsonl* 2>/dev/null | /usr/bin/jq -Rr 'fromjson? | select(.reportTag != null) | "\(.reportRule)\t\(.reportTag)\t\(.agentName // "-")"' | sort | uniq -c
+```
+
+Each line is a count, a rule id, a tag and an agent name, or `-` for a row without one. Rows tagged `none` are the ones to look at; the others are the handler, a lead's allowed commands and the owner helper. It reads every agent's current and rotated file and skips a torn line, as the would-deny command does.
+
+Cost, measured on the Mini on 2026-10-10 by `TestToolGateCost`, by the method of `TestToolDenyCost` with the gate switched on and off and the would-deny check on in both: under 0.01 ms for a short command that matches nothing and for a `tt` command that is no write; about 0.09 ms for one rule or all three (the extra append); under 0.01 ms when the call already writes would-deny rows, since the rows share one write; about 0.05 ms for a 64 KiB command that matches nothing and about 0.2 ms for one that matches all three. The test fails if the gate adds 5 ms to the median (25 ms under the race detector), or if more than 2 of 100 runs with the gate do not return, rows written, before the 150 ms deadline.
+
+Limits of the report:
+
+- It reads the command text only. A write made by a script file the agent runs (python, node, a shell script) is not seen, nor is one made through an MCP tool or the TailOS UI.
+- Bash in Claude Code sessions only. Codex sessions are not covered.
+- The handler is told by its name prefix, a convention and not a role. A handler named otherwise is reported with tag `none`, and any agent named `db-handler…` is tagged `handler`.
+- `lead-allowed` is a name-and-form heuristic. The hook keeps no state and may not ask the hub, so it cannot check that the item or queue entry in the command is that lead's own: a lead running one of the three forms on another item is still tagged `lead-allowed`. A verifier's permitted `tt verification receipt` is tagged `none`.
+- The hub is known by the `TAILTERM_HUB` value, the port 18765 and the two spellings of that one variable. A hub address held in another variable, or one on another port with `TAILTERM_HUB` unset, is not seen.
+- curl `-K` and other config files are not read, so a method, body or URL given there is not seen. `--data-ascii` and `--form-string` are not in the list of body options.
+- `tt` words are matched by position, as `tt` reads them today. A form `tt` does not accept, such as an option before the subcommand, does not match.
+- `sqlite3` only, and only by its operand: an `ATTACH` of the hub database from another file, a relative path from inside the hub directory, `cp`, `scp` or `rsync` of the file, and other database clients are not seen. The remote command of an ssh to any host is read, so the rule fires whether or not the host is TrueNAS.
+- A request to port 18765 on any host is reported, whatever serves it.
+- The hub itself refuses only the backlog steward's work-item writes, so for every other role this report is the only record of a bypass, and it is a report: nothing is denied.
+
 ### Known limits
 
 - A denied or abandoned call has a pre and no post. It appears as `unknown` only when a later pre evicts it.
@@ -415,7 +491,7 @@ Limits of the report:
 - Nothing removes the directory of an agent that no longer exists. A retention rule is follow-up work.
 - A helper closed on the hub is still ledgered while this host's helper file names the session's thread. Telling would need a hub request, which the hook never makes. The rows are for calls that session really made, under the agent and run the file names. Registering the helper again from another session ends it.
 - Every Claude Code session on the host that is not a Tailterm agent now lists the relay state directory once per tool hook, to learn that it is not the helper.
-- Hub upload, blocking and budget caps are not part of this version. Protected operations are reported, not denied (see "Would-deny report"). Edits outside an agent's owned paths are reported, not denied, with the limits listed under "Owned-paths report". The one rewrite is secret redaction, below.
+- Hub upload, blocking and budget caps are not part of this version. Protected operations are reported, not denied (see "Would-deny report"). Edits outside an agent's owned paths are reported, not denied, with the limits listed under "Owned-paths report". Writes that go around the database handler are reported, not denied, with the limits listed under "Handler-gate report". The one rewrite is secret redaction, below.
 
 The hook input field names (`hook_event_name`, `session_id`, `tool_name`, `tool_input`, `tool_use_id`, `tool_response`, `duration_ms`, `error`, `is_interrupt`) were read from the installed Claude Code 2.1.291 binary. A live `claude -p` run on 2026-10-06, with a made-up agent identity, an unreachable hub, a temporary ledger directory and the three hooks in a temporary project's `.claude/settings.json`, confirmed the ones a row is built from: a Bash `true` gave an `ok` row and a Bash `false` an `error` row, each with the session id, a `toolu_` tool-use id, a digest and a `claude` duration, and no pending entry was left. `is_interrupt` was not exercised.
 

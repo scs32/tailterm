@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -596,6 +597,745 @@ func TestToolDenyDocCommand(t *testing.T) {
 		got = append(got, strings.Join(strings.Fields(line), " "))
 	}
 	want := []string{"2 host-pkill agt_a", "1 old-site-deploy agt_a", "1 truenas-tailscale agt_b"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("summary = %q; want %q", got, want)
+	}
+}
+
+// The handler-gate report (feature wi_cbc08bd2b2a419a0). As above, every
+// command is text for the classifier or the hook: none is run, no hub is
+// asked and no database is opened.
+
+const (
+	toolGateTestHub  = "http://gatehub.test:8443"
+	toolGateAllRules = "tt work-items create --title x; curl -X POST http://gatehub.test:8443/api/x; sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db .tables"
+)
+
+// gateSandbox is toolLedgerSandbox with a named agent and a hub address the
+// tests choose, whatever the session running them has in its environment.
+func gateSandbox(t *testing.T) (env, string) {
+	t.Helper()
+	e, root := toolLedgerSandbox(t)
+	t.Setenv("TAILTERM_HUB", toolGateTestHub)
+	e.agentName = "builder-x"
+	return e, root
+}
+
+func gateRuleNames(command, hub string) string {
+	_, gates := toolGateClassify(command, hub, true)
+	return denyRuleNames(gates)
+}
+
+func gateRowTexts(rows []map[string]any) []string {
+	var out []string
+	for _, row := range wouldReportRows(rows) {
+		out = append(out, fmt.Sprintf("%v/%v/%v", row["reportRule"], row["reportTag"], row["reportSummary"]))
+	}
+	return out
+}
+
+const toolGateDoneSave = "tt work-items update wi_0123456789abcdef --status done --worktree /w/queue-x --branch fix-x --commit 0123abc"
+
+// toolGateWriteForms is every write form of the plan's table.
+func toolGateWriteForms() []string {
+	forms := []string{
+		"tt work-items create --kind bug --title x",
+		"tt work-items update wi_1 --status open",
+		"tt work-items dispatch wi_1 --to lead-x",
+		"tt work-items note wi_1 --text x",
+		"tt work-items evidence wi_1",
+		"tt work-items scope confirm wi_1 --owns a.go",
+		"tt work-items scope save wi_1 --owns a.go",
+		"tt work-items narrative artifact-put wi_1 --file f",
+		"tt work-items narrative link-put wi_1",
+		"tt work-items narrative coverage-put wi_1",
+		"tt work-items narrative report-put wi_1",
+		"tt work-items triage set wi_1 --lane small",
+		"tt work-items triage confirm wi_1",
+		"tt queue action pull --item wi_1",
+		"tt team queue wait set --entry tqe_1 --on tqe_2",
+		"tt team queue wait clear --entry tqe_1 --on tqe_2",
+		"tt verification plan --item wi_1 --file plan.json",
+		"tt verification receipt --item wi_1 --check v1",
+		toolGateDoneSave,
+		"tt work-items update wi_1 --status=done --worktree=/w --branch=b --commit=c",
+	}
+	for _, sub := range strings.Fields("add policy limit provision scope rebind requeue fail accept integrated replace-lead remove reorder release abandon") {
+		forms = append(forms, "tt team queue "+sub+" --entry tqe_1")
+	}
+	return forms
+}
+
+// a1, a2, a3: every rule fires on its write forms, alone and wrapped, and
+// on none of its read forms and near-misses.
+func TestToolGateClassify(t *testing.T) {
+	for _, form := range toolGateWriteForms() {
+		for _, command := range []string{
+			form, "sudo " + form, "/Users/x/.local/bin/" + form, "bash -c '" + form + "'", `eval "` + form + `"`,
+			"ssh air '" + form + "'", "echo $(" + form + ")", "cd /w && FOO=1 timeout 30 " + form + " 2>&1 | tail -3",
+		} {
+			if got := gateRuleNames(command, toolGateTestHub); got != toolGateWorkItem {
+				t.Errorf("%s: rules = %q; want %s", command, got, toolGateWorkItem)
+			}
+			if got := toolDenyClassify(command); len(got) != 0 {
+				t.Errorf("%s: deny rules = %q; want none", command, denyRuleNames(got))
+			}
+		}
+	}
+	const hub, port = "gatehub.test:8443", "other.test:18765"
+	fires := []struct{ rule, hub, command string }{
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST http://` + hub + `/api/tasks`},
+		{toolGateHubWrite, toolGateTestHub, `curl -XPUT http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl --request=DELETE http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl --request DELETE http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -d a=b http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl --data-binary @f http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl --json '{"a":1}' http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -F file=@f http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -T f http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -I http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl --head http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -sS -H "Authorization: Bearer x" -X POST ` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST http://user:pw@` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST HTTP://GATEHUB.test:8443`},
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST --url http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -o out.json -X PATCH https://example.com/a http://` + hub + `/b`},
+		{toolGateHubWrite, toolGateTestHub, `wget --post-data a=b http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `wget --post-file f http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `wget --method=PUT --body-file=f http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `wget -q --method DELETE http://` + hub + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `http POST ` + hub + `/api/x a=b`},
+		{toolGateHubWrite, toolGateTestHub, `http ` + hub + `/api/x count:=3`},
+		{toolGateHubWrite, toolGateTestHub, `xh PUT http://` + hub + `/api/x`},
+		// The hub's port on another host, with TAILTERM_HUB set, unset and on its scheme's port.
+		{toolGateHubWrite, toolGateTestHub, `curl -sSXPOST http://` + port + `/api/x`},
+		{toolGateHubWrite, toolGateTestHub, `curl -d x 100.64.0.9:18765`},
+		{toolGateHubWrite, toolGateTestHub, `curl -X POST 'http://[fd7a::1]:18765/api/x'`},
+		{toolGateHubWrite, "", `curl -X POST http://` + port + `/api/x`},
+		{toolGateHubWrite, "", `wget --method=PUT http://` + port + `/api/x`},
+		{toolGateHubWrite, "", `http POST :18765/api/x`},
+		{toolGateHubWrite, "", `https DELETE ` + port + `/api/x`},
+		{toolGateHubWrite, "https://tailhub.test", `curl -X POST https://tailhub.test/api/x`},
+		{toolGateHubWrite, "https://tailhub.test", `https POST tailhub.test/api/x`},
+		// The variable as written, in the authority position.
+		{toolGateHubWrite, "", `curl -X POST $TAILTERM_HUB/api/x`},
+		{toolGateHubWrite, "", `curl -X POST "${TAILTERM_HUB}/api/x"`},
+		{toolGateHubWrite, "", `curl -d x $TAILTERM_HUB`},
+		{toolGateHubWrite, "", `curl -X POST "$TAILTERM_HUB?x=1"`},
+		{toolGateHubWrite, toolGateTestHub, `ssh air 'curl -X POST http://127.0.0.1:18765/api/x'`},
+		{toolGateHubWrite, toolGateTestHub, `bash -c "curl -X POST http://127.0.0.1:18765/api/x"`},
+		{toolGateHubWrite, toolGateTestHub, `TOKEN=$(cat t) && sudo curl -X POST http://` + hub + `/x`},
+
+		{toolGateHubDB, "", `sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`},
+		{toolGateHubDB, "", `sqlite3 /mnt/deepfreeze/tailterm-hub`},
+		{toolGateHubDB, "", `sqlite3 -readonly /mnt/deepfreeze/tailterm-hub/hub.db .tables`},
+		{toolGateHubDB, "", `sqlite3 'file:/mnt/deepfreeze/tailterm-hub/hub.db?mode=ro'`},
+		{toolGateHubDB, "", `sqlite3 -cmd '.timeout 5' /mnt/deepfreeze/tailterm-hub/hub.db`},
+		{toolGateHubDB, "", `sqlite3 -header -separator , /mnt/deepfreeze/tailterm-hub/data/hub.db "select 1"`},
+		{toolGateHubDB, "", `ssh truenas 'sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db .tables'`},
+		{toolGateHubDB, "", `ssh truenas sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db .tables`},
+		{toolGateHubDB, "", `sudo /usr/bin/sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`},
+
+		{"work-item-write,hub-direct-write,hub-db-direct", toolGateTestHub, toolGateAllRules},
+		{"work-item-write,hub-direct-write,hub-db-direct", toolGateTestHub, "sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db; curl -d x :18765; tt queue action pull"},
+	}
+	for _, c := range fires {
+		if got := gateRuleNames(c.command, c.hub); got != c.rule {
+			t.Errorf("%s (hub %q): rules = %q; want %s", c.command, c.hub, got, c.rule)
+		}
+	}
+	nearMisses := []string{
+		// Reads and other tt commands.
+		"tt work-items list --status open", "tt work-items get wi_1", "tt work-items receipt wir_1", "tt work-items revisions wi_1",
+		"tt work-items messages wi_1", "tt work-items triage --json", "tt work-items triage", "tt work-items scope get wi_1",
+		"tt work-items scope receipt wir_1", "tt work-items narrative overview wi_1", "tt work-items narrative timeline wi_1",
+		"tt work-items narrative artifacts wi_1", "tt work-items narrative artifact-versions wi_1", "tt work-items narrative artifact-get wi_1",
+		"tt work-items narrative links wi_1", "tt work-items narrative coverage wi_1", "tt work-items narrative reports wi_1",
+		"tt work-items narrative report-get wi_1", "tt work-items narrative receipt wir_1",
+		"tt queue list", "tt queue get wi_1", "tt queue history wi_1", "tt queue changes", "tt queue receipt qr_1",
+		"tt team queue list", "tt team queue sweep-worktrees", "tt team launch --template small", "tt team queue wait", "tt team queue wait show",
+		"tt verification history --item wi_1", "tt verification enrollment",
+		"tt send --kind result --subject 'tt work-items create'", `tt post "tt work-items update wi_1"`, "tt ack 7", "tt inbox --unread --mark-read",
+		"tt status", "tt", "tt work-items", "tt work-items --help", "tt work-items bogus create", "tt --task x work-items create",
+		"tt team queue", "tt queue", "tt verification", "ttx work-items create", "echo tt work-items create", `echo "tt work-items create"`,
+		"command -v tt", `git commit -m "tt work-items update wi_1 --status done"`, "grep -n 'tt queue action' docs/handoff.md",
+		"cat > notes.txt <<'EOF'\ntt work-items create\ncurl -X POST http://h:18765/x\nsqlite3 /mnt/deepfreeze/tailterm-hub/hub.db\nEOF\necho done",
+		// A GET, another host or port, and the hub named anywhere but a URL's authority.
+		`curl $TAILTERM_HUB/api/tasks`, `curl http://` + hub + `/api/tasks`, `curl -sS -H "Authorization: Bearer x" http://` + port + `/api/x`,
+		`curl -X GET http://` + port + `/api/x`, `curl -G -d a=b http://` + port + `/api/x`, `curl --get --data-urlencode q=x http://` + hub + `/x`,
+		`curl -X POST https://example.com/x`, `curl -X POST host:8765`, `curl -X POST http://gatehub.test:8444/x`, `curl -X POST http://gatehub.test/x`,
+		`curl -X POST https://` + hub[:len(hub)-5] + `/x`,
+		`curl -H 'X: http://h:18765' https://example.com -d x`, `curl -H "Referer: http://` + hub + `/" -X POST https://example.com`,
+		`curl -X POST 'https://example.com/x?next=http://h:18765/y'`, `curl -X POST https://example.com/18765`,
+		`curl -X POST https://example.com/p:18765/x`, `curl -X POST https://example.com/$TAILTERM_HUB`,
+		`curl -X POST "https://example.com/?u=$TAILTERM_HUB"`, `curl -X POST https://example.com/#:18765`,
+		`curl -X POST $TAILTERM_HUB_OLD/x`, `curl -X POST ${TAILTERM_HUBS}/x`, `curl -d 'http://h:18765' https://example.com`,
+		`curl -d @http://h:18765 -o h:18765 -u u:18765 https://example.com`, `curl --data=x --proxy http://p:18765 https://example.com`,
+		`wget http://h:18765/x`, `wget -O out http://` + hub + `/x`, `wget --method=GET http://h:18765/x`,
+		`wget --header 'X: http://h:18765' --post-data a=b https://example.com`,
+		`http GET ` + hub + `/api/x`, `http ` + hub + `/api/x q==1 X-Trace:on`, `http POST example.com Host:h:18765 next=http://h:18765`,
+		`xh ` + port + `/api/x`, `echo curl -X POST http://h:18765`, `echo "curl -X POST http://h:18765/x"`,
+		// Another file, a sibling name, and the directory only in SQL text or an option's value.
+		`sqlite3 /tmp/x.db`, `sqlite3 ./hub.db`, `sqlite3`, `sqlite3 -readonly`, `ls /mnt/deepfreeze/tailterm-hub`,
+		`echo sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`, `sqlite3 /mnt/deepfreeze/tailterm-hub-backup/hub.db`,
+		`sqlite3 /mnt/deepfreeze/tailterm-hubx.db`, `sqlite3 /tmp/x.db "ATTACH '/mnt/deepfreeze/tailterm-hub/hub.db' AS h"`,
+		`sqlite3 /tmp/x.db "select '/mnt/deepfreeze/tailterm-hub/hub.db'"`, `sqlite3 -cmd '/mnt/deepfreeze/tailterm-hub/hub.db' /tmp/x.db`,
+		`sqlite3 /tmp/x.db /mnt/deepfreeze/tailterm-hub/hub.db`, `ssh truenas ls -la /mnt/deepfreeze/tailterm-hub/hub.db`,
+	}
+	for _, command := range nearMisses {
+		if got := gateRuleNames(command, toolGateTestHub); got != "" {
+			t.Errorf("near-miss %s: rules = %q; want none", command, got)
+		}
+	}
+	// The hub address is the TAILTERM_HUB value: without it only the port is known.
+	if got := gateRuleNames(`curl -X POST http://`+hub+`/api/x`, ""); got != "" {
+		t.Errorf("a write to another address with no hub set: rules = %q; want none", got)
+	}
+	// With the gate off the same parse returns the deny matches and no others.
+	if deny, gates := toolGateClassify("pkill node; "+toolGateAllRules, toolGateTestHub, false); denyRuleNames(deny) != "host-pkill" || len(gates) != 0 {
+		t.Errorf("gate off: deny %q, gate %q", denyRuleNames(deny), denyRuleNames(gates))
+	}
+	if deny, gates := toolGateClassify("pkill node; "+toolGateAllRules, toolGateTestHub, true); denyRuleNames(deny) != "host-pkill" || len(gates) != 3 {
+		t.Errorf("gate on: deny %q, gate %q", denyRuleNames(deny), denyRuleNames(gates))
+	}
+
+	summaries := map[string]string{
+		"tt work-items scope confirm wi_1 --owns a.go --owns b.go --criteria g1 --order 7": "tt work-items scope confirm (+9 args)",
+		"tt team queue wait set --entry tqe_1 --on tqe_2 --until released":                 "tt team queue wait set (+6 args)",
+		"tt work-items evidence wi_1": "tt work-items evidence (+1 args)",
+		"tt verification plan":        "tt verification plan",
+		toolGateDoneSave:              "tt work-items update --status done --worktree --branch --commit (+4 args)",
+		"tt work-items update wi_1 --status=done --worktree=/w --branch=b --commit=c":          "tt work-items update --status done --worktree --branch --commit (+1 args)",
+		"tt work-items update wi_1 --status done --branch b --commit c":                        "tt work-items update (+7 args)",
+		"tt work-items update wi_1 --status open --worktree /w --branch b --commit c":          "tt work-items update (+9 args)",
+		`curl -sS -X POST -H "Authorization: Bearer x" -d '{"a":1}' http://` + port + `/api/x`: "curl POST data port-18765 (+7 args)",
+		`curl -X PURGE http://` + hub + `/x`:                                                   "curl method hub (+2 args)",
+		`curl -I $TAILTERM_HUB/x`:                                                              "curl HEAD hub (+1 args)",
+		`curl -d x http://` + hub:                                                              "curl data hub (+2 args)",
+		`wget --method=PUT --body-data x http://` + hub:                                        "wget PUT data hub (+3 args)",
+		`http POST ` + hub + `/x a=b`:                                                          "http POST data hub (+2 args)",
+		`sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db`:                                          "sqlite3 hub-db",
+		`sqlite3 -readonly /mnt/deepfreeze/tailterm-hub/hub.db "select 1"`:                     "sqlite3 hub-db (+2 args)",
+	}
+	for command, want := range summaries {
+		_, gates := toolGateClassify(command, toolGateTestHub, true)
+		if len(gates) != 1 || strings.Join(gates[0].parts, " ") != want {
+			t.Errorf("%s: matches %v; want the summary %q", command, gates, want)
+		}
+	}
+	// One match per rule. A write the lead may make gives way to one it may not, in either order.
+	for command, want := range map[string]string{
+		"tt verification plan --item wi_1":                                 toolGateLeadForm,
+		toolGateDoneSave:                                                   toolGateLeadForm,
+		"tt work-items update wi_1 --status done":                          "",
+		"tt verification plan --item wi_1; tt work-items create --title x": "",
+		"tt work-items create --title x; tt verification plan --item wi_1": "",
+	} {
+		_, gates := toolGateClassify(command, "", true)
+		if len(gates) != 1 || gates[0].kind != want {
+			t.Errorf("%s: matches %v; want one of kind %q", command, gates, want)
+		}
+	}
+	// No input makes the gate panic, whatever stands around its commands.
+	for _, command := range []string{"", `"`, `'`, "`", `$(`, `${`, `\`, `<<`, `(`, `{`, "tt", "tt work-items", "tt team queue wait", "tt work-items update --status", "curl", "curl -X", "curl -", "curl --", "curl --url", "curl -d", "wget --method", "http", "http POST", "xh", "https", "sqlite3", "sqlite3 -cmd", "sqlite3 file:", "curl ://", "curl @", "curl :", "curl ]:18765 -d x", "curl -X POST [", strings.Repeat("(", 5000)} {
+		toolGateClassify(command, toolGateTestHub, true)
+		for i := range command {
+			toolGateClassify(command[i:]+" tt work-items create; curl -X POST :18765; sqlite3 x; "+command[:i], toolGateTestHub, true)
+		}
+	}
+}
+
+// a4: a gate match leaves one would_report row per rule with the rule, the
+// tag, the summary and the agent name, beside the call's ordinary row.
+func TestToolGateRow(t *testing.T) {
+	e, root := gateSandbox(t)
+	const command = "tt work-items create --kind bug --title x"
+	toolHook(t, e, "PreToolUse", bashPre("u1", command))
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 1 {
+		t.Fatalf("rows after a matching pre = %v; want one", rows)
+	}
+	want := map[string]any{
+		"v": float64(1), "task": e.task, "agent": e.agent, "run": e.runID, "session": "s1", "tool": "Bash", "toolUseId": "u1",
+		"argsDigest": toolArgsDigest(json.RawMessage(`{"command":"` + command + `"}`)),
+		"outcome":    "would_report", "reportRule": "work-item-write", "reportTag": "none",
+		"reportSummary": "tt work-items create (+4 args)", "agentName": "builder-x",
+	}
+	for k, v := range want {
+		if rows[0][k] != v {
+			t.Errorf("%s = %v; want %v", k, rows[0][k], v)
+		}
+	}
+	if len(rows[0]) != len(want)+1 || rows[0]["time"] == nil {
+		t.Errorf("row fields = %s; want those of %v and time", rowKeys(rows[0]), want)
+	}
+	if pending := toolPendingFiles(t, root, e.agent); len(pending) != 1 {
+		t.Fatalf("pending files = %d; want the call's one", len(pending))
+	}
+	toolHook(t, e, "PostToolUse", bashPre("u1", command))
+	rows = toolLedgerRows(t, root, e.agent)
+	if len(rows) != 2 || rows[1]["outcome"] != "ok" || rows[1]["durationSource"] != "measured" || rows[1]["reportRule"] != nil ||
+		rows[1]["reportTag"] != nil || rows[1]["reportSummary"] != nil || rows[1]["agentName"] != nil {
+		t.Fatalf("rows after the post = %v", rows)
+	}
+
+	// One row per rule, in rule order.
+	toolHook(t, e, "PreToolUse", bashPre("u2", toolGateAllRules))
+	got := gateRowTexts(toolLedgerRows(t, root, e.agent))[1:]
+	wantRows := []string{
+		"work-item-write/none/tt work-items create (+2 args)",
+		"hub-direct-write/none/curl POST hub (+2 args)",
+		"hub-db-direct/none/sqlite3 hub-db (+1 args)",
+	}
+	if strings.Join(got, "\n") != strings.Join(wantRows, "\n") {
+		t.Fatalf("rows = %q; want %q", got, wantRows)
+	}
+
+	// A deny rule and a gate rule: one row of each, the would-deny row as before.
+	count := len(toolLedgerRows(t, root, e.agent))
+	toolHook(t, e, "PreToolUse", bashPre("u3", "pkill node; tt queue action pull --item wi_1"))
+	rows = toolLedgerRows(t, root, e.agent)[count:]
+	if len(rows) != 2 || len(wouldDenyRows(rows)) != 1 || len(wouldReportRows(rows)) != 1 {
+		t.Fatalf("rows = %v; want one would_deny and one would_report", rows)
+	}
+	if rowKeys(rows[0]) != "agent,argsDigest,denyKind,denyRule,denySummary,outcome,run,session,task,time,tool,toolUseId,v" || rows[0]["denySummary"] != "pkill (+1 args)" {
+		t.Fatalf("would-deny row = %v", rows[0])
+	}
+	if rowKeys(rows[1]) != "agent,agentName,argsDigest,outcome,reportRule,reportSummary,reportTag,run,session,task,time,tool,toolUseId,v" || rows[1]["reportSummary"] != "tt queue action (+3 args)" {
+		t.Fatalf("would-report row = %v", rows[1])
+	}
+
+	// A read, a post, a tool other than Bash and the gate switched off leave nothing.
+	count = len(toolLedgerRows(t, root, e.agent))
+	toolHook(t, e, "PreToolUse", bashPre("u4", "tt work-items list; curl http://gatehub.test:8443/api/x; sqlite3 /tmp/x.db"))
+	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u5", "tool_name": "Write", "tool_input": map[string]any{"file_path": "/repo/run.sh", "command": command, "content": command}})
+	setToolLedger(t, &toolGateOn, false)
+	toolHook(t, e, "PreToolUse", bashPre("u6", toolGateAllRules))
+	setToolLedger(t, &toolGateOn, true)
+	if rows := toolLedgerRows(t, root, e.agent); len(rows) != count {
+		t.Fatalf("rows from calls that match nothing = %v", rows[count:])
+	}
+	toolHook(t, e, "PostToolUse", bashPre("u7", toolGateAllRules))
+	toolHook(t, e, "PostToolUseFailure", bashPre("u8", toolGateAllRules))
+	if rows := toolLedgerRows(t, root, e.agent); len(rows) != count+2 || len(wouldReportRows(rows[count:])) != 0 {
+		t.Fatalf("rows from a post and a failure = %v", rows[count:])
+	}
+}
+
+// a5: the tag comes from the identity the hook already holds and, for a
+// lead, the form of the command. Tagged rows are written, not dropped.
+func TestToolGateTags(t *testing.T) {
+	const create, plan, receipt = "tt work-items create --title x", "tt verification plan --item wi_1 --file p.json", "tt verification receipt --item wi_1 --check v1"
+	// The item id in toolGateDoneSave belongs to no entry the hook knows of:
+	// it keeps no state and may not ask the hub whose entry a command names.
+	// So a lead running the done save for an item that is not its own is
+	// still lead-allowed. The tag is a name-and-form heuristic.
+	cases := []struct{ name, command, tag, agentName string }{
+		{"db-handler-o3", create, "handler", "db-handler-o3"},
+		{"db-handler-o3", toolGateAllRules, "handler,handler,handler", "db-handler-o3"},
+		{"db-handler", plan, "handler", "db-handler"},
+		{"lead-x", plan, "lead-allowed", "lead-x"},
+		{"lead-x", receipt, "lead-allowed", "lead-x"},
+		{"lead-x", toolGateDoneSave, "lead-allowed", "lead-x"},
+		{"lead-x", create, "none", "lead-x"},
+		{"lead-x", "tt work-items update wi_1 --status done", "none", "lead-x"},
+		{"lead-x", "tt team queue accept --entry tqe_1", "none", "lead-x"},
+		{"lead-x", plan + "; " + create, "none", "lead-x"},
+		{"lead-x", toolGateAllRules, "none,none,none", "lead-x"},
+		{"builder-x", create, "none", "builder-x"},
+		{"builder-x", plan, "none", "builder-x"},
+		{"verifier-x", receipt, "none", "verifier-x"},
+		{"my-db-handler", create, "none", "my-db-handler"},
+		{"", create, "none", ""},
+		{"bad name; rm", create, "none", ""},
+		{strings.Repeat("n", 200), create, "none", strings.Repeat("n", 128)},
+	}
+	for i, c := range cases {
+		e, root := gateSandbox(t)
+		e.agentName = c.name
+		toolHook(t, e, "PreToolUse", bashPre(fmt.Sprintf("u%d", i), c.command))
+		rows := wouldReportRows(toolLedgerRows(t, root, e.agent))
+		var tags []string
+		for _, row := range rows {
+			tags = append(tags, fmt.Sprint(row["reportTag"]))
+			if name, _ := row["agentName"].(string); name != c.agentName {
+				t.Errorf("%q running %s: agentName = %v; want %q", c.name, c.command, row["agentName"], c.agentName)
+			}
+		}
+		if strings.Join(tags, ",") != c.tag {
+			t.Errorf("%q running %s: tags = %q; want %q", c.name, c.command, tags, c.tag)
+		}
+	}
+
+	// The owner helper: the identity, and the name, come from its file.
+	root, _ := helperLedgerSandbox(t)
+	t.Setenv("TAILTERM_REDACT_SETTING_FILE", filepath.Join(t.TempDir(), "relay.json"))
+	file := helperLedgerFile()
+	writeHelperLedgerFile(t, file)
+	t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+	e := helperLedgerEnv(t)
+	t.Setenv("TAILTERM_HUB", toolGateTestHub)
+	for i, command := range []string{toolGateAllRules, plan, toolGateDoneSave} {
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": file.Thread, "tool_use_id": fmt.Sprintf("h%d", i), "tool_name": "Bash", "tool_input": map[string]any{"command": command}})
+	}
+	rows := wouldReportRows(toolLedgerRows(t, root, file.Agent))
+	if len(rows) != 5 {
+		t.Fatalf("helper rows = %v; want five", rows)
+	}
+	for _, row := range rows {
+		if row["reportTag"] != "owner-helper" || row["agentName"] != file.Name || row["agent"] != file.Agent {
+			t.Errorf("helper row = %v; want the owner-helper tag and the file's name", row)
+		}
+	}
+}
+
+// a6: nothing typed in the command reaches the ledger, no file it names is
+// opened, and nothing the host's hub.json holds reaches a row.
+func TestToolGateRedaction(t *testing.T) {
+	e, root := gateSandbox(t)
+	dir := t.TempDir()
+	// A FIFO with no writer blocks whoever opens it for reading. The hook
+	// returning with its rows written shows neither was opened: the file a
+	// command names with @, and hub.json where the configuration is read.
+	// This test calls the handler directly, after that read would have run.
+	config := filepath.Join(dir, "home", ".config", "tailterm")
+	if err := os.MkdirAll(config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	fifo := filepath.Join(dir, "headers-sentinel.txt")
+	for _, path := range []string{fifo, filepath.Join(config, "hub.json")} {
+		if err := syscall.Mkfifo(path, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The two values the configuration read can take from hub.json. The gate
+	// reads the hub address from TAILTERM_HUB alone, which is another one.
+	e.token, e.hub, e.configHub = "tok-config-sentinel-0123456789abcdef", "http://confighub-sentinel.test:18999", "http://confighub-sentinel.test:18999"
+	t.Setenv("TAILTERM_TOKEN", "")
+	const bearer = "tt_bearer-sentinel-0123456789abcdefghij"
+	commands := []string{
+		`curl -sS -X POST -H "Authorization: Bearer ` + bearer + `" -H @` + fifo + ` -d '{"title":"body-sentinel"}' http://user-sentinel:pass-sentinel@gatehub.test:8443/api/tasks/tsk_sentinel/work-items`,
+		`curl --data-binary @` + fifo + ` "$TAILTERM_HUB/api/path-sentinel?key=query-sentinel"`,
+		`tt work-items update wi_sentinel0123 --status done --worktree /private/wt-sentinel --branch branch-sentinel --commit c0ffee-sentinel --hub http://flaghub-sentinel:18765 --token flagtoken-sentinel`,
+		`sqlite3 -cmd '.read ` + fifo + `' /mnt/deepfreeze/tailterm-hub/db-sentinel.sqlite "select 'sql-sentinel'"`,
+		`ssh root-sentinel@truenas "sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db 'update sql-sentinel'"`,
+	}
+	for i, command := range commands {
+		toolHook(t, e, "PreToolUse", bashPre(fmt.Sprintf("u%d", i), command))
+	}
+	// A write to the configured address is no hub write: only TAILTERM_HUB counts.
+	toolHook(t, e, "PreToolUse", bashPre("u9", `curl -X POST http://confighub-sentinel.test:18999/api/x`))
+	rows := toolLedgerRows(t, root, e.agent)
+	want := []string{
+		"hub-direct-write/none/curl POST data hub (+9 args)",
+		"hub-direct-write/none/curl data hub (+2 args)",
+		"work-item-write/none/tt work-items update --status done --worktree --branch --commit (+8 args)",
+		"hub-db-direct/none/sqlite3 hub-db (+3 args)",
+		"hub-db-direct/none/sqlite3 hub-db (+1 args)",
+	}
+	if got := gateRowTexts(rows); len(rows) != len(want) || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("rows = %q of %d; want %q", got, len(rows), want)
+	}
+	ledger, err := os.ReadFile(filepath.Join(root, e.agent, "ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := append([]string{"sentinel", bearer, e.token, "Bearer", "Authorization", "gatehub", "8443", "18999", "18765\"", "truenas", "/mnt/", "deepfreeze", fifo, dir, "@", "://"}, commands...)
+	for _, secret := range secrets {
+		if strings.Contains(string(ledger), secret) {
+			t.Errorf("the ledger holds %q:\n%s", secret, ledger)
+		}
+	}
+}
+
+// a7: whatever goes wrong, no gate row is written, the hook returns nil and
+// prints nothing, and the call's ordinary row is written when it ends.
+func TestToolGateFailsOpen(t *testing.T) {
+	const command = "pkill node; " + toolGateAllRules
+	finish := func(t *testing.T, e env, root string, deny int) {
+		t.Helper()
+		rows := toolLedgerRows(t, root, e.agent)
+		if len(wouldReportRows(rows)) != 0 || len(wouldDenyRows(rows)) != deny || len(rows) != deny {
+			t.Fatalf("rows = %v; want %d would-deny rows and no others", rows, deny)
+		}
+		if files := toolPendingFiles(t, root, e.agent); len(files) != 1 {
+			t.Fatalf("pending files = %d; want 1", len(files))
+		}
+		toolHook(t, e, "PostToolUse", bashPre("u1", command))
+		if rows := toolLedgerRows(t, root, e.agent); len(rows) != deny+1 || rows[deny]["outcome"] != "ok" || rows[deny]["durationSource"] != "measured" {
+			t.Fatalf("rows after the post = %v", rows)
+		}
+	}
+	t.Run("gate panics", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolGateMatch, func(*toolDenyScan, string, []string) { panic("gate on fire") })
+		toolHook(t, e, "PreToolUse", bashPre("u1", command))
+		finish(t, e, root, 1) // the would-deny row is written as before
+	})
+	t.Run("gate panics after a match", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolGateMatch, func(c *toolDenyScan, name string, args []string) {
+			c.gateCommand(name, args)
+			if name == "sqlite3" {
+				panic("gate on fire")
+			}
+		})
+		toolHook(t, e, "PreToolUse", bashPre("u1", command))
+		finish(t, e, root, 1)
+	})
+	t.Run("check panics", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolDenyCheck, func(toolLedger, toolLedgerRow, string, json.RawMessage) { panic("classifier on fire") })
+		toolHook(t, e, "PreToolUse", bashPre("u1", command))
+		finish(t, e, root, 0)
+	})
+	t.Run("write panics inside the check", func(t *testing.T) {
+		_, root := gateSandbox(t)
+		l := toolLedger{dir: filepath.Join(root, "agt_ledger"), agent: "agt_ledger", started: time.Now(), deadline: time.Minute, denyMax: toolDenyMaxCommand, redactBudget: time.Minute, gate: true, name: "builder-x"}
+		l.wouldDeny(toolLedgerRow{}, "Bash", json.RawMessage(`{"command":"`+toolGateAllRules+`"}`)) // l.now is nil
+		requireEmptyRoot(t, root)
+	})
+	t.Run("command over the cap", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolDenyMaxCommand, len(command)+8)
+		toolHook(t, e, "PreToolUse", bashPre("u1", command+"; echo "+strings.Repeat("x", 8)))
+		finish(t, e, root, 0)
+	})
+	t.Run("command at the cap", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolDenyMaxCommand, len(command))
+		toolHook(t, e, "PreToolUse", bashPre("u1", command))
+		if rows := toolLedgerRows(t, root, e.agent); len(wouldReportRows(rows)) != 3 || len(wouldDenyRows(rows)) != 1 {
+			t.Fatalf("rows = %v; want the four rows", rows)
+		}
+	})
+	t.Run("substitutions nested nine deep", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		deep := strings.Repeat("$(", toolDenyMaxNest+1) + "tt work-items create" + strings.Repeat(")", toolDenyMaxNest+1)
+		toolHook(t, e, "PreToolUse", bashPre("u1", "echo "+deep))
+		finish(t, e, root, 0)
+		eight := strings.Repeat("$(", toolDenyMaxNest) + "tt work-items create" + strings.Repeat(")", toolDenyMaxNest)
+		toolHook(t, e, "PreToolUse", bashPre("u2", "echo "+eight))
+		if rows := toolLedgerRows(t, root, e.agent); len(wouldReportRows(rows)) != 1 {
+			t.Fatalf("rows = %v; want the row of a command nested to the bound", rows)
+		}
+	})
+	t.Run("no command", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "tool_input": map[string]any{"command": 7, "script": command}})
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u2", "tool_name": "Bash", "tool_input": command})
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u3", "tool_name": "Bash"})
+		if rows := toolLedgerRows(t, root, e.agent); len(rows) != 0 {
+			t.Fatalf("rows = %v; want none", rows)
+		}
+	})
+	t.Run("deadline passed", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
+		finished := make(chan struct{})
+		setToolLedger(t, &toolDenyCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage) {
+			defer close(finished)
+			time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
+			l.wouldDeny(row, tool, input)
+		})
+		toolHook(t, e, "PreToolUse", bashPre("u1", command))
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the late check never finished")
+		}
+		setToolLedger(t, &toolLedgerDeadline, 150*time.Millisecond)
+		finish(t, e, root, 0)
+	})
+	t.Run("unreadable input", func(t *testing.T) {
+		e, root := gateSandbox(t)
+		pre := toolPayload("PreToolUse", bashPre("u1", command))
+		for _, payload := range []string{pre[:len(pre)-1], "", `{"hook_event_name":"Nope","tool_name":"Bash","tool_input":{"command":"tt work-items create"}}`} {
+			if r := runToolHook(t, e, "tool", payload, nil); r.err != nil || r.out != "" {
+				t.Fatalf("hook = %v, output %q", r.err, r.out)
+			}
+		}
+		setToolLedger(t, &toolLedgerMaxInput, 256)
+		big := bashPre("u2", command)
+		big["description"] = strings.Repeat("d", 512)
+		toolHook(t, e, "PreToolUse", big)
+		rows := toolLedgerRows(t, root, e.agent)
+		if len(rows) != 4 {
+			t.Fatalf("rows = %v; want four", rows)
+		}
+		for _, row := range rows {
+			if row["outcome"] != "unreadable" || row["reportRule"] != nil || row["agentName"] != nil {
+				t.Fatalf("row = %v; want unreadable only", row)
+			}
+		}
+	})
+}
+
+// a7: matching and non-matching calls alike return nil and print nothing,
+// on all three events.
+func TestToolGatePrintsNothing(t *testing.T) {
+	e, root := gateSandbox(t)
+	for i, command := range []string{"tt work-items list", "tt work-items create --title x", toolGateAllRules, "pkill node; " + toolGateAllRules} {
+		for _, event := range []string{"PreToolUse", "PostToolUse", "PreToolUse", "PostToolUseFailure"} {
+			if r := runToolHook(t, e, "tool", toolPayload(event, bashPre(fmt.Sprintf("u%d", i), command)), nil); r.err != nil || r.out != "" {
+				t.Fatalf("%s %q = %v, output %q; want nil and no output", event, command, r.err, r.out)
+			}
+		}
+	}
+	rows := toolLedgerRows(t, root, e.agent)
+	if got := len(wouldReportRows(rows)); got != 2*(0+1+3+3) {
+		t.Fatalf("would-report rows = %d; want 14", got)
+	}
+	if got := len(wouldDenyRows(rows)); got != 2 {
+		t.Fatalf("would-deny rows = %d; want 2", got)
+	}
+}
+
+func toolGateCapCommand(head string) string {
+	filler := `echo "a quoted tt work-items create; curl -X POST http://h:18765/x" 'sqlite3 /mnt/deepfreeze/tailterm-hub/hub.db' $(date) | grep -c x && tt work-items list && curl -sS http://gatehub.test:8443/api/x; `
+	return head + strings.Repeat(filler, (toolDenyMaxCommand-len(head))/len(filler))
+}
+
+// a9: the added cost of the gate per PreToolUse, measured against the same
+// hook with the gate switched off and the would-deny check on in both.
+// Every run with the gate returns before the hook's deadline with its rows
+// already written. The limits are those of TestToolDenyCost.
+func TestToolGateCost(t *testing.T) {
+	const runs = 100
+	limit := 5 * time.Millisecond
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "-race" && setting.Value == "true" {
+				limit = 25 * time.Millisecond
+				t.Logf("race detector on: the added-cost limit is %v", limit)
+			}
+		}
+	}
+	e, root := gateSandbox(t)
+	cases := []struct {
+		name, command string
+		rows, deny    int
+	}{
+		{"no match, short", "go test ./cmd/tt -run TestToolGate -count=1", 0, 0},
+		{"tt command that is no write", `tt send --kind result --to lead-x --subject "Tests pass" --outcome done`, 0, 0},
+		{"one rule", "tt work-items create --title x", 1, 0},
+		{"three rules", toolGateAllRules, 3, 0},
+		{"three rules and four deny rules", toolGateAllRules + "; " + toolDenyAllRules, 3, 4},
+		{"no match at the 64 KiB cap", toolGateCapCommand(""), 0, 0},
+		{"three rules at the 64 KiB cap", toolGateCapCommand(toolGateAllRules + "; "), 3, 0},
+	}
+	for n, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var with, without []time.Duration
+			late := 0
+			var worst time.Duration
+			for i := 0; i < 2*runs; i++ {
+				// Alternate, and swap which goes first each pair.
+				gate := (i+i/2)%2 == 0
+				toolGateOn = gate
+				e.agent = fmt.Sprintf("agt_gate_%d_%d", n, i)
+				r := runToolHook(t, e, "tool", toolPayload("PreToolUse", bashPre("u1", c.command)), nil)
+				toolGateOn = true
+				if r.err != nil || r.out != "" {
+					t.Fatalf("hook = %v, output %q", r.err, r.out)
+				}
+				all := toolLedgerRows(t, root, e.agent)
+				rows, deny := len(wouldReportRows(all)), len(wouldDenyRows(all))
+				switch {
+				case r.elapsed >= toolLedgerDeadline:
+					if gate {
+						late++
+					}
+					t.Logf("run %d (gate %v) reached the %v deadline in %v with %d of %d rows", i, gate, toolLedgerDeadline, r.elapsed, rows+deny, c.rows+c.deny)
+				case !gate:
+					if rows != 0 || deny != c.deny {
+						t.Fatalf("baseline run wrote %d would-report and %d would-deny rows; want 0 and %d", rows, deny, c.deny)
+					}
+					without = append(without, r.elapsed)
+				default:
+					if rows != c.rows || deny != c.deny {
+						t.Fatalf("run %d returned in %v with %d would-report and %d would-deny rows; want %d and %d", i, r.elapsed, rows, deny, c.rows, c.deny)
+					}
+					with = append(with, r.elapsed)
+					worst = max(worst, r.elapsed)
+				}
+			}
+			if late > 2 {
+				t.Fatalf("%d of %d runs reached the hook deadline; at most 2 are put down to a stalled host", late, runs)
+			}
+			base, gated := toolDenyMedian(without), toolDenyMedian(with)
+			t.Logf("%d bytes: baseline median %v, with the gate %v, added %v, worst run with the gate %v", len(c.command), base, gated, gated-base, worst)
+			if gated-base >= limit {
+				t.Fatalf("the gate adds %v to the median hook; want under %v", gated-base, limit)
+			}
+		})
+	}
+}
+
+// a10: the command docs/claude-wake.md gives counts handler-gate rows by
+// rule, tag and agent name, across agents and a rotated file, past a torn
+// last line, and counts no other kind of row.
+func TestToolGateDocCommand(t *testing.T) {
+	const jq = "/usr/bin/jq"
+	if _, err := os.Stat(jq); err != nil {
+		t.Skipf("%s is not installed", jq)
+	}
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "claude-wake.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ""
+	for _, line := range strings.Split(string(doc), "\n") {
+		if strings.Contains(line, `select(.reportTag != null)`) {
+			if command != "" {
+				t.Fatal("docs/claude-wake.md gives the handler-gate summary command more than once")
+			}
+			command = line
+		}
+	}
+	if !strings.HasPrefix(command, "awk 1 ~/.local/state/tailterm/tool-ledger/") || !strings.Contains(command, jq) || strings.Contains(command, ".outcome ==") {
+		t.Fatalf("docs/claude-wake.md does not give the handler-gate summary command: %q", command)
+	}
+	home := t.TempDir()
+	write := func(agent, name string, lines ...string) {
+		dir := filepath.Join(home, ".local", "state", "tailterm", "tool-ledger", agent)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(lines, "\n")), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := func(agent, name, rule, tag string) string {
+		b, _ := json.Marshal(toolLedgerRow{V: 1, Agent: agent, Tool: "Bash", Outcome: "would_report", ReportRule: rule, ReportTag: tag, AgentName: name})
+		return string(b)
+	}
+	other := func(row toolLedgerRow) string {
+		b, _ := json.Marshal(row)
+		return string(b)
+	}
+	scope := other(toolLedgerRow{V: 1, Agent: "agt_a", Tool: "Edit", Outcome: "would_report", ReportRule: "outside-owned-paths", ReportPath: "docs/x.md", AssignSeq: 7})
+	deny := other(toolLedgerRow{V: 1, Agent: "agt_a", Tool: "Bash", Outcome: "would_deny", DenyRule: "host-pkill"})
+	write("agt_a", "ledger.jsonl.1", gate("agt_a", "builder-x", "work-item-write", "none"), other(toolLedgerRow{V: 1, Agent: "agt_a", Outcome: "ok"}), "")
+	write("agt_a", "ledger.jsonl", gate("agt_a", "builder-x", "work-item-write", "none"), gate("agt_a", "builder-x", "hub-direct-write", "none"), scope, deny, `{"v":1,"agent":"agt_a","outcome":"would_rep`)
+	write("agt_b", "ledger.jsonl", gate("agt_b", "db-handler-o3", "work-item-write", "handler"), gate("agt_b", "db-handler-o3", "work-item-write", "handler"), gate("agt_b", "db-handler-o3", "hub-db-direct", "handler"), "")
+	write("agt_c", "ledger.jsonl", gate("agt_c", "lead-x", "work-item-write", "lead-allowed"), gate("agt_c", "", "work-item-write", "none"), "")
+	write("agt_d", "ledger.jsonl", gate("agt_d", "owner-helper", "hub-direct-write", "owner-helper"), scope, "")
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", command, err, out)
+	}
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		got = append(got, strings.Join(strings.Fields(line), " "))
+	}
+	want := []string{
+		"1 hub-db-direct handler db-handler-o3", "1 hub-direct-write none builder-x", "1 hub-direct-write owner-helper owner-helper",
+		"2 work-item-write handler db-handler-o3", "1 work-item-write lead-allowed lead-x", "1 work-item-write none -", "2 work-item-write none builder-x",
+	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("summary = %q; want %q", got, want)
 	}

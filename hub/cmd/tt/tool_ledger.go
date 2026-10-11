@@ -34,6 +34,11 @@ import (
 // an edit tool whose file is outside the paths of the agent's latest ASSIGN
 // leaves one extra row. It prints nothing and denies nothing.
 //
+// The handler-gate report (tool_deny.go) is report-only as well: a PreToolUse
+// whose Bash command is a work-item write through tt, a non-GET call to the
+// hub or direct sqlite3 access to the hub database leaves one extra row per
+// rule, tagged with who ran it. It prints nothing and denies nothing.
+//
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
 // session, read from the host helper file (bug wi_b3e8ecd5a2ee01b3).
@@ -90,6 +95,13 @@ type toolLedger struct {
 	denyMax int
 	// The owned-paths report (tool_scope.go), run after the would-deny report.
 	scope func(toolLedger, toolLedgerRow, string, json.RawMessage, string)
+	// The handler-gate report (tool_deny.go), part of the would-deny check.
+	// hub is the TAILTERM_HUB environment value alone, never the configured
+	// address; it is compared against the command and never written.
+	gate   bool
+	name   string // the agent's name, or the helper file's
+	helper bool   // the identity came from the owner helper's file
+	hub    string
 }
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error
@@ -131,10 +143,15 @@ type toolLedgerRow struct {
 	DenyRule    string `json:"denyRule,omitempty"`
 	DenyKind    string `json:"denyKind,omitempty"`
 	DenySummary string `json:"denySummary,omitempty"`
-	// Only on a would_report row (tool_scope.go).
-	ReportRule string `json:"reportRule,omitempty"`
-	ReportPath string `json:"reportPath,omitempty"`
-	AssignSeq  int64  `json:"assignSeq,omitempty"`
+	// Only on a would_report row: the rule, then the path and ASSIGN of an
+	// owned-paths row (tool_scope.go) or the tag, summary and agent name of a
+	// handler-gate row (tool_deny.go).
+	ReportRule    string `json:"reportRule,omitempty"`
+	ReportPath    string `json:"reportPath,omitempty"`
+	AssignSeq     int64  `json:"assignSeq,omitempty"`
+	ReportTag     string `json:"reportTag,omitempty"`
+	ReportSummary string `json:"reportSummary,omitempty"`
+	AgentName     string `json:"agentName,omitempty"`
 }
 
 type toolLedgerPending struct {
@@ -192,6 +209,7 @@ func toolLedgerHook(e env, _ []string) {
 		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
 		deny: toolDenyCheck, denyMax: toolDenyMaxCommand, scope: toolScopeCheck,
+		gate: toolGateOn, name: e.agentName, hub: os.Getenv("TAILTERM_HUB"),
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -205,6 +223,7 @@ func toolLedgerHook(e env, _ []string) {
 				return
 			}
 			e.task, e.agent, e.runID = helper.Task, helper.Agent, helper.Run
+			l.helper, l.name = true, helper.Name
 			if time.Since(l.started) >= l.deadline {
 				return // the handler has already returned; leave stdin alone
 			}

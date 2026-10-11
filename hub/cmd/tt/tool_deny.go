@@ -13,12 +13,21 @@ import (
 // It blocks nothing and prints nothing, and any failure in the check writes
 // nothing extra. It only reads the command text: no process is started, no
 // file is read and the hub is never asked. See docs/claude-wake.md.
+//
+// The handler-gate report (feature wi_cbc08bd2b2a419a0) is report-only too
+// and shares that check: the same parse of the same command is also matched
+// against three rules for work the database handler owns, and each match
+// appends one would_report row tagged with who ran it. It opens no file and
+// takes the hub address from the TAILTERM_HUB environment value alone.
 
 // Variables rather than constants so tests can change them. A hook call
 // copies them once, before its goroutine starts.
 var (
 	toolDenyCheck      = toolLedger.wouldDeny
 	toolDenyMaxCommand = 64 << 10 // a longer command is not classified at all
+	toolGateOn         = true     // off, the handler-gate rules are not matched
+	// Read once per classified command, so a test can make the gate panic.
+	toolGateMatch = (*toolDenyScan).gateCommand
 )
 
 const (
@@ -33,6 +42,24 @@ const (
 	toolDenyTrueNAS   = "truenas-tailscale"
 
 	toolDenyDeployerPrefix = "tt-deployer"
+
+	toolGateWorkItem = "work-item-write"
+	toolGateHubWrite = "hub-direct-write"
+	toolGateHubDB    = "hub-db-direct"
+
+	toolGateTagHelper  = "owner-helper"
+	toolGateTagHandler = "handler"
+	toolGateTagLead    = "lead-allowed"
+	toolGateTagNone    = "none"
+
+	toolGateHandlerPrefix = "db-handler"
+	toolGateLeadPrefix    = "lead-"
+	toolGateLeadForm      = "lead-form" // the kind of a write the item lead may make itself
+
+	toolGateHubPort   = "18765"
+	toolGateHubDir    = "/mnt/deepfreeze/tailterm-hub"
+	toolGateTargetHub = "hub"        // the authority of TAILTERM_HUB
+	toolGateTargetAny = "port-18765" // the hub's port on any other host
 )
 
 // toolDenyRules is the order matches are returned in.
@@ -92,26 +119,44 @@ type toolDenyMatch struct {
 // rule order. It is a pure function of the text. A command it cannot follow
 // to the end, nested too deep or too often, matches nothing.
 func toolDenyClassify(command string) []toolDenyMatch {
-	c := toolDenyScan{budget: 8*len(command) + 1024}
+	deny, _ := toolGateClassify(command, "", false)
+	return deny
+}
+
+// toolGateClassify parses the command once and returns the deny matches as
+// toolDenyClassify does and, when gate is set, the handler-gate matches the
+// same way: at most one per rule, in toolGateRules order. hub is the
+// TAILTERM_HUB value. The gate matches never change the deny matches.
+func toolGateClassify(command, hub string, gate bool) (deny, gates []toolDenyMatch) {
+	c := toolDenyScan{budget: 8*len(command) + 1024, gate: gate}
+	if gate {
+		c.hubHost, c.hubPort = toolGateAuthority(hub, "")
+	}
 	c.shell(command, 0)
 	if c.failed {
-		return nil
+		return nil, nil
 	}
-	var matches []toolDenyMatch
-	for _, rule := range toolDenyRules {
-		for _, m := range c.matches {
-			if m.rule == rule {
-				matches = append(matches, m)
+	ordered := func(rules []string, found []toolDenyMatch) (matches []toolDenyMatch) {
+		for _, rule := range rules {
+			for _, m := range found {
+				if m.rule == rule {
+					matches = append(matches, m)
+				}
 			}
 		}
+		return
 	}
-	return matches
+	return ordered(toolDenyRules, c.matches), ordered(toolGateRules, c.gates)
 }
 
 type toolDenyScan struct {
 	budget  int // bytes of shell text still allowed, nested commands included
 	failed  bool
 	matches []toolDenyMatch
+	// The handler-gate report.
+	gate             bool
+	hubHost, hubPort string
+	gates            []toolDenyMatch
 }
 
 func (c *toolDenyScan) add(rule, kind string, sum toolDenySum) {
@@ -174,6 +219,10 @@ func (c *toolDenyScan) command(words []string, depth int) {
 		c.add(toolDenyOldSite, "node-script", sum)
 	case "ssh":
 		c.ssh(args, depth)
+	case "tt", "curl", "wget", "http", "https", "xh", "sqlite3":
+		if c.gate {
+			c.guarded(name, args)
+		}
 	case "bash", "sh", "zsh":
 		for i := 0; i < len(args) && strings.HasPrefix(args[i], "-") || i < len(args) && strings.HasPrefix(args[i], "+"); i++ {
 			a := args[i]
@@ -871,7 +920,8 @@ func toolDenySkipHeredocs(s string, pos int, heredocs []toolDenyHeredoc) int {
 }
 
 // wouldDeny appends one would_deny row for each rule a Bash command
-// matches. It has no result: a command it cannot read or classify, a panic
+// matches, and one would_report row for each handler-gate rule it matches,
+// in one write. It has no result: a command it cannot read or classify, a panic
 // or a deadline that has passed leaves the ledger as it was.
 func (l toolLedger) wouldDeny(row toolLedgerRow, tool string, input json.RawMessage) {
 	defer func() { _ = recover() }()
@@ -887,17 +937,19 @@ func (l toolLedger) wouldDeny(row toolLedgerRow, tool string, input json.RawMess
 	if json.Unmarshal(input, &in) != nil || in.Command == "" || len(in.Command) > l.denyMax {
 		return
 	}
-	matches := toolDenyClassify(in.Command)
-	if len(matches) == 0 {
+	matches, gates := toolGateClassify(in.Command, l.hub, l.gate)
+	if len(matches)+len(gates) == 0 {
 		return
 	}
 	exact := toolRedactExact(l.token)
-	rows := make([]toolLedgerRow, 0, len(matches))
+	rows := make([]toolLedgerRow, 0, len(matches)+len(gates))
+	call := row
 	for _, m := range matches {
 		row.Outcome, row.DenyRule, row.DenyKind = "would_deny", m.rule, m.kind
 		row.DenySummary = toolDenySummary(m.parts, exact, l.started.Add(l.redactBudget))
 		rows = append(rows, row)
 	}
+	rows = append(rows, l.gateRows(call, gates, exact)...)
 	if time.Since(l.started) >= l.deadline {
 		return // the handler has already returned; write nothing late
 	}
@@ -922,4 +974,436 @@ func toolDenySummary(parts, exact []string, deadline time.Time) string {
 	}
 	out.WriteString(text[at:])
 	return toolLedgerCutTo(out.String(), toolDenySummaryBytes)
+}
+
+// The handler-gate report: three rules for work the database handler owns.
+
+// toolGateRules is the order gate matches are returned in.
+var toolGateRules = []string{toolGateWorkItem, toolGateHubWrite, toolGateHubDB}
+
+// toolGateWrites holds the tt subcommand words, as tt reads them by position,
+// that change a work item, the Queue, the team queue or a verification
+// record. Every other word in those positions is a read or no command.
+var toolGateWrites = func() map[string]bool {
+	writes := map[string]bool{}
+	for prefix, subs := range map[string]string{
+		"work-items":           "create update dispatch note evidence",
+		"work-items scope":     "confirm save",
+		"work-items narrative": "artifact-put link-put coverage-put report-put",
+		"work-items triage":    "set confirm",
+		"queue":                "action",
+		"team queue":           "add policy limit provision scope rebind requeue fail accept integrated replace-lead remove reorder release abandon",
+		"team queue wait":      "set clear",
+		"verification":         "plan receipt",
+	} {
+		for _, sub := range strings.Fields(subs) {
+			writes[prefix+" "+sub] = true
+		}
+	}
+	return writes
+}()
+
+// toolGateOptions names the options of one client that take a value.
+type toolGateOptions struct {
+	short string
+	long  map[string]bool
+}
+
+func toolGateLong(names string) map[string]bool {
+	long := map[string]bool{}
+	for _, name := range strings.Fields(names) {
+		long["--"+name] = true
+	}
+	return long
+}
+
+var toolGateCurl = toolGateOptions{"AbcCdDeEFHKmoPQrtTuUwxXyYz", toolGateLong(`
+	request data data-raw data-binary data-urlencode data-ascii json form form-string upload-file header user
+	user-agent output output-dir cookie cookie-jar config connect-timeout max-time retry retry-delay retry-max-time
+	proxy proxy-user proxy-header proxy-cacert proxy-cert proxy-key proxy-pass preproxy noproxy socks4 socks4a socks5
+	socks5-hostname cacert capath cert cert-type key key-type pass pinnedpubkey crlfile ciphers tls-max tls13-ciphers
+	resolve connect-to interface local-port dns-servers doh-url referer range write-out url oauth2-bearer aws-sigv4
+	unix-socket abstract-unix-socket limit-rate rate max-redirs max-filesize dump-header trace trace-ascii stderr
+	proto proto-default proto-redir keepalive-time netrc-file request-target expect100-timeout speed-limit speed-time
+	time-cond quote continue-at alt-svc hsts etag-save etag-compare create-file-mode parallel-max delegation krb
+	login-options service-name mail-from mail-rcpt mail-auth ftp-port ftp-account ftp-method pubkey engine
+	happy-eyeballs-timeout-ms variable expand-url libcurl`)}
+
+var toolGateWget = toolGateOptions{"OoPtTweUaiQlARDIXB", toolGateLong(`
+	header post-data post-file body-data body-file method output-document output-file append-output user password
+	user-agent directory-prefix tries timeout dns-timeout connect-timeout read-timeout wait waitretry execute
+	input-file load-cookies save-cookies referer http-user http-password proxy-user proxy-password ca-certificate
+	ca-directory certificate private-key bind-address limit-rate quota base level accept reject domains
+	exclude-domains include-directories exclude-directories secure-protocol progress restrict-file-names
+	max-redirect config`)}
+
+// http, https and xh share HTTPie's options.
+var toolGateHTTPie = toolGateOptions{"aAops", toolGateLong(`
+	auth auth-type output session session-read-only proxy verify cert cert-key cert-key-pass timeout max-redirects
+	max-headers print style pretty format-options response-charset response-mime raw boundary ssl ciphers
+	default-scheme http-version unix-socket interface resolve`)}
+
+var toolGateSqliteValued = map[string]bool{
+	"cmd": true, "init": true, "separator": true, "newline": true, "nullvalue": true, "vfs": true,
+	"maxsize": true, "mmap": true, "lookaside": true, "pagecache": true, "heap": true,
+}
+
+// The methods a summary may name. Any other is written as "method".
+var toolGateMethods = map[string]bool{
+	"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true, "HEAD": true, "OPTIONS": true,
+}
+
+// walk hands every option to opt, with its value when the tables or an
+// attached "=" give one, and every other word to pos. A value is never
+// handed to pos, so a URL inside a header or a body is not a target.
+func (o toolGateOptions) walk(args []string, opt func(name, value string), pos func(word string)) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			for _, word := range args[i+1:] {
+				pos(word)
+			}
+			return
+		case strings.HasPrefix(a, "--"):
+			name, value, attached := strings.Cut(a, "=")
+			if !attached && o.long[name] && i+1 < len(args) {
+				i++
+				value = args[i]
+			}
+			opt(name, value)
+		case len(a) > 1 && a[0] == '-':
+			// The first letter that takes a value ends the letters: its value
+			// is the rest of the word or, when nothing is left, the next word.
+			for at := 1; at < len(a); at++ {
+				if strings.IndexByte(o.short, a[at]) < 0 {
+					opt(a[:1]+a[at:at+1], "")
+					continue
+				}
+				value := a[at+1:]
+				if value == "" && i+1 < len(args) {
+					i++
+					value = args[i]
+				}
+				opt(a[:1]+a[at:at+1], value)
+				break
+			}
+		default:
+			pos(a)
+		}
+	}
+}
+
+// guarded runs the gate rules on one command. A panic there ends the gate
+// for this call and leaves the deny matches as they are.
+func (c *toolDenyScan) guarded(name string, args []string) {
+	defer func() {
+		if recover() != nil {
+			c.gate, c.gates = false, nil
+		}
+	}()
+	toolGateMatch(c, name, args)
+}
+
+func (c *toolDenyScan) gateCommand(name string, args []string) {
+	switch name {
+	case "tt":
+		c.tt(args)
+	case "sqlite3":
+		c.sqlite(args)
+	default:
+		c.http(name, args)
+	}
+}
+
+// addGate keeps one match per gate rule: the first found, except that a
+// write the item lead may make itself gives way to a later one it may not,
+// so one allowed command cannot tag a whole call lead-allowed.
+func (c *toolDenyScan) addGate(rule, kind string, sum toolDenySum) {
+	for i, m := range c.gates {
+		if m.rule == rule {
+			if m.kind == toolGateLeadForm && kind != toolGateLeadForm {
+				c.gates[i] = toolDenyMatch{rule, kind, sum.done()}
+			}
+			return
+		}
+	}
+	c.gates = append(c.gates, toolDenyMatch{rule, kind, sum.done()})
+}
+
+// tt fires work-item-write when the leading words are a write subcommand.
+func (c *toolDenyScan) tt(args []string) {
+	words := 0
+	for n := min(4, len(args)); n >= 2 && words == 0; n-- {
+		if toolGateWrites[strings.Join(args[:n], " ")] {
+			words = n
+		}
+	}
+	if words == 0 {
+		return
+	}
+	sum := toolDenySum{}
+	sum.add("tt")
+	for _, word := range args[:words] {
+		sum.add(word)
+	}
+	kind, kept := "", words
+	switch {
+	case args[0] == "verification":
+		kind = toolGateLeadForm
+	case args[0] == "work-items" && args[1] == "update":
+		// The done save with queue acceptance: --status done and all three
+		// of --worktree, --branch and --commit. Only the option names are kept.
+		done, seen, named := false, map[string]bool{}, 0
+		for i := words; i < len(args); i++ {
+			name, value, attached := strings.Cut(args[i], "=")
+			switch name {
+			case "--status":
+				if !attached && i+1 < len(args) {
+					i++
+					value = args[i]
+					named++
+				}
+				if done = value == "done"; done {
+					named++
+				}
+			case "--worktree", "--branch", "--commit":
+				if !seen[name] {
+					named++
+				}
+				seen[name] = true
+			}
+		}
+		if done && len(seen) == 3 {
+			kind, kept = toolGateLeadForm, words+named
+			for _, word := range []string{"--status", "done", "--worktree", "--branch", "--commit"} {
+				sum.add(word)
+			}
+		}
+	}
+	sum.omitted += max(0, len(args)-kept)
+	c.addGate(toolGateWorkItem, kind, sum)
+}
+
+// http fires hub-direct-write for a client whose own options make the
+// request a write and one of whose URLs has the hub's authority.
+func (c *toolDenyScan) http(name string, args []string) {
+	var method, target string
+	body, write := false, false
+	scheme := ""
+	if name == "https" {
+		scheme = "https"
+	}
+	url := func(word string) {
+		if target == "" {
+			target = c.target(word, scheme)
+		}
+	}
+	switch name {
+	case "curl":
+		get, head := false, false
+		toolGateCurl.walk(args, func(opt, value string) {
+			switch opt {
+			case "-X", "--request":
+				method = strings.ToUpper(value)
+			case "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file":
+				body = true
+			case "-I", "--head":
+				head = true
+			case "-G", "--get":
+				get = true
+			case "--url":
+				url(value)
+			}
+		}, url)
+		// -G turns the data into a query, so the request stays a GET.
+		write = method != "" && method != "GET" || (body || head) && !get
+		if head && method == "" {
+			method = "HEAD"
+		}
+	case "wget":
+		toolGateWget.walk(args, func(opt, value string) {
+			switch opt {
+			case "--post-data", "--post-file", "--body-data", "--body-file":
+				body = true
+			case "--method":
+				method = strings.ToUpper(value)
+			}
+		}, url)
+		write = body || method != "" && method != "GET"
+	default:
+		var words []string
+		toolGateHTTPie.walk(args, func(string, string) {}, func(word string) { words = append(words, word) })
+		if len(words) > 1 && toolGateMethods[strings.ToUpper(words[0])] {
+			method, words = strings.ToUpper(words[0]), words[1:]
+		}
+		if len(words) == 0 {
+			return
+		}
+		// The first word is the URL; the rest are request items.
+		url(words[0])
+		for _, item := range words[1:] {
+			body = body || toolGateBodyItem(item)
+		}
+		write = body || method != "" && method != "GET"
+	}
+	if !write || target == "" {
+		return
+	}
+	sum := toolDenySum{}
+	sum.add(name)
+	switch {
+	case method == "" || method == "GET":
+	case toolGateMethods[method]:
+		sum.add(method)
+	default:
+		sum.add("method")
+	}
+	if body {
+		sum.add("data")
+	}
+	sum.add(target)
+	sum.omitted += len(args) - 1 // every word but the target
+	c.addGate(toolGateHubWrite, "", sum)
+}
+
+// toolGateBodyItem reports whether an HTTPie request item is a body field:
+// its first separator is =, := or @. A header (name:value) and a query
+// parameter (name==value) leave the request a GET.
+func toolGateBodyItem(item string) bool {
+	at := strings.IndexAny(item, ":=@")
+	if at < 0 {
+		return false
+	}
+	rest := item[at:]
+	return rest[0] == '@' || strings.HasPrefix(rest, ":=") || rest[0] == '=' && !strings.HasPrefix(rest, "==")
+}
+
+// target judges one word by its URL authority alone and returns the fixed
+// word for the hub it names, or nothing. A path, a query and a fragment are
+// never read. The parser keeps a variable as written, so a word that starts
+// with the TAILTERM_HUB variable has the hub in its authority position.
+func (c *toolDenyScan) target(word, scheme string) string {
+	for _, variable := range []string{"$TAILTERM_HUB", "${TAILTERM_HUB}"} {
+		if rest, ok := strings.CutPrefix(word, variable); ok && (rest == "" || strings.IndexByte("/?#", rest[0]) >= 0) {
+			return toolGateTargetHub
+		}
+	}
+	host, port := toolGateAuthority(word, scheme)
+	switch {
+	case c.hubHost != "" && port == c.hubPort && strings.EqualFold(host, c.hubHost):
+		return toolGateTargetHub
+	case port == toolGateHubPort:
+		return toolGateTargetAny
+	}
+	return ""
+}
+
+// toolGateAuthority returns the host and port of a URL's authority: what
+// follows an optional scheme:// and an optional user:pass@, up to the first
+// "/", "?" or "#". A missing port is the scheme's.
+func toolGateAuthority(word, scheme string) (host, port string) {
+	if at := strings.Index(word, "://"); at > 0 && toolGateScheme(word[:at]) {
+		scheme, word = strings.ToLower(word[:at]), word[at+3:]
+	}
+	if end := strings.IndexAny(word, "/?#"); end >= 0 {
+		word = word[:end]
+	}
+	word = word[strings.LastIndexByte(word, '@')+1:]
+	host = word
+	if end := strings.LastIndexByte(word, ']'); end >= 0 { // [address]:port
+		host, port = word[:end+1], strings.TrimPrefix(word[end+1:], ":")
+	} else if colon := strings.LastIndexByte(word, ':'); colon >= 0 {
+		host, port = word[:colon], word[colon+1:]
+	}
+	if port == "" {
+		port = "80"
+		if scheme == "https" {
+			port = "443"
+		}
+	}
+	return host, port
+}
+
+func toolGateScheme(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (i == 0 || (c < '0' || c > '9') && c != '+' && c != '-' && c != '.') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// sqlite fires hub-db-direct when the database operand, the first word that
+// is neither an option nor an option's value, is the hub directory or under
+// it. Later words are SQL text and are never judged.
+func (c *toolDenyScan) sqlite(args []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(a) > 1 && a[0] == '-' {
+			if toolGateSqliteValued[strings.TrimLeft(a, "-")] {
+				i++
+			}
+			continue
+		}
+		a = strings.TrimPrefix(a, "file:")
+		if query := strings.IndexByte(a, '?'); query >= 0 {
+			a = a[:query]
+		}
+		if a == toolGateHubDir || strings.HasPrefix(a, toolGateHubDir+"/") {
+			sum := toolDenySum{}
+			sum.add("sqlite3")
+			sum.add("hub-db")
+			sum.omitted += len(args) - 1
+			c.addGate(toolGateHubDB, "", sum)
+		}
+		return
+	}
+}
+
+// gateTag names who ran a gate match, from what the hook already holds. The
+// handler and the lead are told by name prefix and, for the lead, by the
+// form of the command: the hook cannot ask the hub whose entry it names.
+func (l toolLedger) gateTag(m toolDenyMatch) string {
+	switch {
+	case l.helper:
+		return toolGateTagHelper
+	case strings.HasPrefix(l.name, toolGateHandlerPrefix):
+		return toolGateTagHandler
+	case strings.HasPrefix(l.name, toolGateLeadPrefix) && m.kind == toolGateLeadForm:
+		return toolGateTagLead
+	}
+	return toolGateTagNone
+}
+
+// toolGateName is the agent name a gate row may hold: cut to the stored
+// length, and nothing unless every byte is a letter, a digit, "_", "-" or ".".
+func toolGateName(name string) string {
+	name = toolLedgerCut(name)
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' && c != '-' && c != '.' {
+			return ""
+		}
+	}
+	return name
+}
+
+// gateRows builds the would_report row of each gate match from the call's
+// row. A panic here gives no gate rows and leaves the would-deny rows alone.
+func (l toolLedger) gateRows(call toolLedgerRow, gates []toolDenyMatch, exact []string) (rows []toolLedgerRow) {
+	defer func() {
+		if recover() != nil {
+			rows = nil
+		}
+	}()
+	name := toolGateName(l.name)
+	for _, m := range gates {
+		row := call
+		row.Outcome, row.ReportRule, row.ReportTag, row.AgentName = toolScopeOutcome, m.rule, l.gateTag(m), name
+		row.ReportSummary = toolDenySummary(m.parts, exact, l.started.Add(l.redactBudget))
+		rows = append(rows, row)
+	}
+	return rows
 }
