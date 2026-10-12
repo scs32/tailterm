@@ -15,7 +15,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 
 - Each watch posts **one notice per episode**. An episode is one stretch of quiet for one subject: the helper, or one queue entry.
 - An episode ends silently. No notice says that the subject is back.
-- A later episode needs a fresh 20 or 30 minutes, because whatever ended the earlier one also restarts the quiet time.
+- A later episode needs a fresh 20 or 30 minutes. Whatever ended the earlier one restarts the quiet time: a post, a working report, or the end of a never-quiet case (see [Never quiet](#never-quiet)).
 - The thresholds are fixed. They are not settings.
 
 ### Nights (D2)
@@ -23,7 +23,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 From 22:00 to 07:00 Pacific no owner ping is sent. This covers every owner notice of this feature, from either watch.
 
 - At night the notice is a plain channel line with no mention. Its last sentence says that the owner is pinged at 07:00 Pacific if the episode is still open.
-- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep.
+- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep. A team ping says why the owner hears it, as the night line did.
 - An episode that ended in the night never pings. Neither does one whose subject is in a never-quiet case at 07:00: closing is decided before pinging.
 - A team notice directed to the helper is sent at any hour.
 - The zone is `America/Los_Angeles`, so the rule follows daylight saving time.
@@ -46,13 +46,15 @@ Only projects that are open and not paused are swept.
 - a report that leaves `working` stores its observed time;
 - any other report writes nothing. That includes a repeated `working` report, a wake outcome and a changed reason.
 
+The same row marks a reported matrix wait, and the first report without the wait stores when it ended.
+
 The transcript time and the report time are not used. The first moves on every transcript record and not on worktree-only work; the second moves on wake-only reports. For an offline agent whose stored state is still `working`, the last working time is its last heartbeat.
 
 **Last post.** The newest message posted by the exact run. A post by an earlier run of the same agent does not count.
 
 **Owes the owner.** The helper holds at least one open obligation, other than delivery-only, whose message came from a person: a directed message or a typed request. Hub notices and teammates' requests do not count.
 
-**Helper quiet since.** The latest of: the oldest owed item, the run's last post, its last working time, and the registration of its current run.
+**Helper quiet since.** The latest of: the oldest owed item, the run's last post, its last working time, the registration of its current run, and the end of its last never-quiet case.
 
 **Helper quiet.** The helper owes the owner, no never-quiet case holds, and 20 minutes have passed since "helper quiet since".
 
@@ -60,7 +62,7 @@ The transcript time and the report time are not used. The first moves on every t
 
 **Team.** The live runs bound to the entry's item at or after its admission, with no project role and a status that is not closed, exited or retired. A run bound before this admission belongs to an earlier team: its posts and working reports neither count as progress nor end an episode. A team with no member is left to the queue's `nothing-running` stall ([project-queue.md](project-queue.md)).
 
-**Team quiet since.** The latest of: the admission, the newest exact-run post by a member, each member's last working time, and the newest member binding.
+**Team quiet since.** The latest of: the admission, the newest exact-run post by a member, each member's last working time, the newest member binding, and the end of the team's last never-quiet case.
 
 **Team quiet.** No never-quiet case holds and 30 minutes have passed since "team quiet since".
 
@@ -88,6 +90,27 @@ For the helper:
 - its current run has an unanswered `tt ask`: the owner already holds the next step.
 
 A helper in `unknown`, or with status `needs_input` and no stored decision request, is **not** exempt. It is pinged and the state is named.
+
+### When a never-quiet case ends
+
+Time spent in a never-quiet case is not quiet time. When the case ends, the quiet time starts afresh:
+
+- no notice is posted at the moment the case ends;
+- none is posted until a full 20 or 30 minutes after it;
+- an episode that the case closed does not post again when the case ends. A new episode needs the full threshold after that.
+
+The hub reads the end of each case from rows that already exist:
+
+| Case | The end is |
+| --- | --- |
+| open owner decision | the time of the owner's answer to a request from that run |
+| held entry | the time the hold was continued or stopped |
+| shared-path wait | the time the wait was closed (resumed, overdue or cleared) |
+| matrix wait | the first activity report without the wait, or 4 h 30 min after its start when the relay stopped reporting |
+| owner pause | the project's last resume |
+| working | the last working time |
+
+These times are compared to the second.
 
 ## When an episode ends
 
@@ -126,7 +149,7 @@ Every notice has four parts, in this order:
 3. "Before resuming, record why it stopped (the recovery prime directive: cause, incident, prevention)."
 4. One suggestion, introduced by "Once that is recorded, the usual next step for this state is:".
 
-No notice names a cause that the state does not prove. The words restart, resume, prompt and Escape appear only in part 4, after that condition.
+No notice names a cause that the state does not prove. As whole words, restart, resume, prompt and Escape appear only in part 4, after that condition.
 
 | Helper state | Suggested next step, after the record |
 | --- | --- |
@@ -158,7 +181,7 @@ Both message reads are bounded:
 
 ## Tables
 
-- `stall_watch_progress`: one row per run with its last working time. Written only by the activity report.
+- `stall_watch_progress`: one row per run with its last working time, whether it reports a matrix wait, and when that wait last ended. Written only by the activity report.
 - `stall_watch_episodes`: one row per episode with its subject, the state named, quiet-since, open and close times, the close reason, the recipient, the owner state (`deferred` or `pinged`), the notice and ping message numbers and the message cursor. A partial unique index allows one open episode per subject.
 
 The migration only creates these tables. Nothing is altered or back-filled.

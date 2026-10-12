@@ -25,7 +25,8 @@ import (
 func migrateStallWatch(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS stall_watch_progress (
  agent_id TEXT NOT NULL, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
- last_working_at TEXT NOT NULL, PRIMARY KEY(agent_id,run_id));
+ last_working_at TEXT NOT NULL, matrix_wait INTEGER NOT NULL DEFAULT 0,
+ wait_ended_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(agent_id,run_id));
 CREATE TABLE IF NOT EXISTS stall_watch_episodes (
  id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
  kind TEXT NOT NULL CHECK(kind IN ('helper','team')),
@@ -104,15 +105,26 @@ func stallWatchNight(now time.Time) bool {
 }
 
 // stallWatchActivityHook runs in the activity report transaction, which
-// reaches it only when the report changed something. It keeps the time a run
-// last worked: the report that enters working and the report that leaves it.
-// Any other report writes nothing.
+// reaches it only when the report changed something. It keeps two times for a
+// run: when it last worked (the report that enters working and the report
+// that leaves it) and when its matrix wait last ended (the first report
+// without the wait). Any other report changes no row.
 func (s *Store) stallWatchActivityHook(ctx context.Context, tx *sql.Tx, task, agent, run, oldState string, activity api.AgentActivity) error {
+	observed := ts(activity.ObservedAt)
+	waiting := activity.MatrixWait.Valid()
+	if !waiting {
+		if _, err := tx.ExecContext(ctx, `UPDATE stall_watch_progress SET matrix_wait=0,wait_ended_at=? WHERE agent_id=? AND run_id=? AND matrix_wait=1`, observed, agent, run); err != nil {
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, `INSERT INTO stall_watch_progress(agent_id,run_id,task_id,last_working_at,matrix_wait) VALUES(?,?,?,'',1)
+ ON CONFLICT(agent_id,run_id) DO UPDATE SET matrix_wait=1`, agent, run, task); err != nil {
+		return err
+	}
 	if activity.State != "working" && oldState != "working" {
 		return nil
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO stall_watch_progress(agent_id,run_id,task_id,last_working_at) VALUES(?,?,?,?)
- ON CONFLICT(agent_id,run_id) DO UPDATE SET last_working_at=excluded.last_working_at`, agent, run, task, ts(activity.ObservedAt))
+	_, err := tx.ExecContext(ctx, `INSERT INTO stall_watch_progress(agent_id,run_id,task_id,last_working_at,matrix_wait) VALUES(?,?,?,?,?)
+ ON CONFLICT(agent_id,run_id) DO UPDATE SET last_working_at=excluded.last_working_at`, agent, run, task, observed, waiting)
 	return err
 }
 
@@ -123,6 +135,9 @@ type stallAgent struct {
 	state                                  string    // stored activity state
 	activity                               *api.AgentActivity
 	decisions                              int // its unanswered owner decisions
+	// lifted is when a never-quiet case of this run last ended: the owner
+	// answered its decision request, or its matrix wait ended.
+	lifted time.Time
 }
 
 func (a stallAgent) online(now time.Time) bool {
@@ -164,6 +179,15 @@ func (a stallAgent) matrixWait(now time.Time) bool {
 	return a.activity != nil && a.activity.MatrixWait.Valid() && now.Sub(a.activity.MatrixWait.Since) < defaultQueueMatrixWaitBound
 }
 
+// liftedAt is when the run's last never-quiet case ended. A reported matrix
+// wait that outlived its bound ended at the bound.
+func (a stallAgent) liftedAt(now time.Time) time.Time {
+	if a.activity != nil && a.activity.MatrixWait.Valid() && !a.matrixWait(now) {
+		return latest(a.lifted, a.activity.MatrixWait.Since.Add(defaultQueueMatrixWaitBound))
+	}
+	return a.lifted
+}
+
 type stallHelper struct {
 	stallAgent
 	owed      int
@@ -171,10 +195,16 @@ type stallHelper struct {
 	oldestSeq int64
 }
 
+// stallLifts is when the project's or an entry's planned waits last ended.
+// Time spent in a never-quiet case is not quiet time, so each is a floor of
+// quiet-since.
+type stallLifts struct{ resumed, released time.Time }
+
 type stallTeam struct {
 	entry, item   string
 	admission     time.Time
 	waiting, held bool
+	lifts         stallLifts // project resume; hold released or shared-path wait closed
 	members       []stallAgent
 }
 
@@ -187,7 +217,8 @@ type stallEpisode struct {
 // stallView is everything the watch reads about one project.
 type stallView struct {
 	task     string
-	active   bool // open and not paused
+	active   bool      // open and not paused
+	resumed  time.Time // the project's last resume from a pause
 	helper   *stallHelper
 	teams    []*stallTeam
 	episodes []stallEpisode
@@ -203,6 +234,14 @@ func stallActivity(payload string, full bool) *api.AgentActivity {
 	}
 	return &a
 }
+
+// The times below are compared as text, which orders RFC 3339 times to the
+// second; that is exact enough for thresholds of minutes.
+const stallAnsweredSQL = `(SELECT COALESCE(MAX(d.created_at),'') FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
+ JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq
+ WHERE r.task_id=a.task_id AND m.from_agent=a.id AND m.from_run_id=a.run_id)`
+
+const stallResumedSQL = `(SELECT COALESCE(MAX(c.resumed_at),'') FROM project_pause_cycles c WHERE c.task_id=t.id)`
 
 const stallDecisionsSQL = `(SELECT count(*) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
  LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq
@@ -248,6 +287,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	// that is not delivery-only. Who sent it is judged below.
 	rows, err = q.QueryContext(ctx, `SELECT a.task_id,a.id,a.name,a.host,a.runtime,a.run_id,a.status,COALESCE(a.last_seen_at,''),
  COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),`+stallDecisionsSQL+`,
+ COALESCE(p.wait_ended_at,''),`+stallAnsweredSQL+`,`+stallResumedSQL+`,
  COALESCE((SELECT g.created_at FROM owner_helper_registrations g WHERE g.task_id=a.task_id AND g.agent_id=a.id AND g.run_id=a.run_id),''),
  COALESCE(o.message_seq,0),COALESCE(o.created_at,''),COALESCE(m.from_agent,''),COALESCE(m.from_node,'')
  FROM agents a JOIN tasks t ON t.id=a.task_id
@@ -263,15 +303,16 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	}
 	for rows.Next() {
 		var a stallAgent
-		var id, seen, payload, worked, registered, owedAt, fromAgent, fromNode string
+		var id, seen, payload, worked, waited, answered, resumed, registered, owedAt, fromAgent, fromNode string
 		var seq int64
-		if err := rows.Scan(&id, &a.id, &a.name, &a.host, &a.runtime, &a.runID, &a.status, &seen, &a.state, &payload, &worked, &a.decisions, &registered, &seq, &owedAt, &fromAgent, &fromNode); err != nil {
+		if err := rows.Scan(&id, &a.id, &a.name, &a.host, &a.runtime, &a.runID, &a.status, &seen, &a.state, &payload, &worked, &a.decisions, &waited, &answered, &resumed, &registered, &seq, &owedAt, &fromAgent, &fromNode); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		v := view(id)
-		v.active = true
+		v.active, v.resumed = true, parseTS(resumed)
 		if v.helper == nil {
+			a.lifted = latest(parseTS(waited), parseTS(answered))
 			a.lastSeen, a.lastWorking, a.bound, a.activity = parseTS(seen), parseTS(worked), parseTS(registered), stallActivity(payload, true)
 			v.helper = &stallHelper{stallAgent: a}
 		}
@@ -295,7 +336,10 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
  EXISTS(SELECT 1 FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state IN ('waiting','met','orphaned')),
  EXISTS(SELECT 1 FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state='held'),
  COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),
- COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END
+ COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END,
+ COALESCE(p.wait_ended_at,''),CASE WHEN a.id IS NULL THEN '' ELSE `+stallAnsweredSQL+` END,`+stallResumedSQL+`,
+ (SELECT COALESCE(MAX(h.resolved_at),'') FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state<>'held'),
+ (SELECT COALESCE(MAX(w.closed_at),'') FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state NOT IN ('waiting','met','orphaned'))
  FROM team_queue_entries e JOIN tasks t ON t.id=e.task_id
  LEFT JOIN agent_work_item_bindings b ON b.item_task_id=e.task_id AND b.item_id=e.item_id
  LEFT JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id AND a.role='' AND a.status NOT IN ('closed','exited','retired')
@@ -308,19 +352,21 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	}
 	for rows.Next() {
 		var a stallAgent
-		var id, entry, item, created, admitted, seen, bound, payload, worked string
+		var id, entry, item, created, admitted, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
 		var waiting, held bool
-		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.state, &payload, &worked, &a.decisions); err != nil {
+		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.state, &payload, &worked, &a.decisions,
+			&waited, &answered, &resumed, &released, &cleared); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		v := view(id)
-		v.active = true
+		v.active, v.resumed = true, parseTS(resumed)
 		var team *stallTeam
 		if n := len(v.teams); n > 0 && v.teams[n-1].entry == entry {
 			team = v.teams[n-1]
 		} else {
-			team = &stallTeam{entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held}
+			team = &stallTeam{entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held,
+				lifts: stallLifts{resumed: v.resumed, released: latest(parseTS(released), parseTS(cleared))}}
 			if team.admission.IsZero() {
 				team.admission = parseTS(created)
 			}
@@ -332,6 +378,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 			continue
 		}
 		a.lastSeen, a.lastWorking, a.activity = parseTS(seen), parseTS(worked), stallActivity(payload, false)
+		a.lifted = latest(parseTS(waited), parseTS(answered))
 		team.members = append(team.members, a)
 	}
 	return views, rows.Close()
@@ -511,14 +558,15 @@ func (v *stallView) helperNeverQuiet(now time.Time) string {
 }
 
 // helperQuiet is the helper definition: it owes the owner, no never-quiet
-// case holds, and neither a post, a working report, a newer owed item nor the
-// registration of its current run falls inside the threshold.
+// case holds, and neither a post, a working report, a newer owed item, the
+// registration of its current run nor the end of a never-quiet case falls
+// inside the threshold.
 func (v *stallView) helperQuiet(now time.Time, reads *stallReads) (time.Time, bool, error) {
 	h := v.helper
 	if h == nil || h.owed == 0 || v.helperNeverQuiet(now) != "" {
 		return time.Time{}, false, nil
 	}
-	since := latest(h.owedSince, h.workedAt(now), h.bound)
+	since := latest(h.owedSince, h.workedAt(now), h.bound, h.liftedAt(now), v.resumed)
 	if now.Sub(since) < stallWatchHelperQuiet {
 		return since, false, nil
 	}
@@ -631,7 +679,12 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		e, isOpen := open[stallKindTeam+":"+t.entry]
 		if isOpen {
 			if e.ownerState == stallOwnerDeferred && !night {
-				plan.pings = append(plan.pings, stallPing{e.id, t.notice(e.id, e.quietSince, now, "", false, true, e.noticeSeq)})
+				// The recipient was chosen when the episode opened.
+				why := helperState
+				if why == "" {
+					why = "available again, but was not when this episode opened"
+				}
+				plan.pings = append(plan.pings, stallPing{e.id, t.notice(e.id, e.quietSince, now, why, false, true, e.noticeSeq)})
 			}
 			continue
 		}
@@ -639,9 +692,10 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		if len(t.members) == 0 || t.neverQuiet(now) != "" {
 			continue
 		}
-		since := t.admission
+		// The end of a planned wait starts the quiet time afresh.
+		since := latest(t.admission, t.lifts.resumed, t.lifts.released)
 		for _, m := range t.members {
-			since = latest(since, m.workedAt(now), m.bound)
+			since = latest(since, m.workedAt(now), m.bound, m.liftedAt(now))
 		}
 		if now.Sub(since) < stallWatchTeamQuiet {
 			continue

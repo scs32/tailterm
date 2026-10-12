@@ -437,7 +437,12 @@ func TestStallWatchHelperDowntime(t *testing.T) {
 func TestStallWatchProgressHook(t *testing.T) {
 	f := newStallFixture(t, stallNoon)
 	h := f.helper()
-	row := func() string { return tableDump(t, f.s, `SELECT * FROM stall_watch_progress`) }
+	row := func() string {
+		return tableDump(t, f.s, `SELECT agent_id,run_id,task_id,last_working_at FROM stall_watch_progress`)
+	}
+	wait := func() string {
+		return tableDump(t, f.s, `SELECT matrix_wait,wait_ended_at FROM stall_watch_progress`)
+	}
 	others := func() string {
 		return tableDump(t, f.s, `SELECT count(*) FROM messages`) + tableDump(t, f.s, `SELECT * FROM stall_watch_episodes`) + tableDump(t, f.s, `SELECT count(*) FROM obligations`)
 	}
@@ -474,6 +479,24 @@ func TestStallWatchProgressHook(t *testing.T) {
 	f.state(h, "stuck")
 	if row() != want {
 		t.Fatalf("other reports wrote progress: %s", row())
+	}
+	// A matrix wait is marked while reported; the first report without it
+	// stores when it ended. Neither moves the last working time.
+	if wait() != "matrix_wait=0|wait_ended_at=|\n" {
+		t.Fatalf("no wait yet: %s", wait())
+	}
+	f.advance(time.Minute)
+	f.report(h, stallMatrixWait(f.now()))
+	if wait() != "matrix_wait=1|wait_ended_at=|\n" || row() != want {
+		t.Fatalf("entering a matrix wait: %s %s", wait(), row())
+	}
+	f.advance(time.Minute)
+	ended := f.now()
+	f.state(h, "idle")
+	f.advance(time.Minute)
+	f.state(h, "unknown")
+	if wait() != "matrix_wait=0|wait_ended_at="+ts(ended)+"|\n" || row() != want {
+		t.Fatalf("leaving a matrix wait: %s %s", wait(), row())
 	}
 	if others() != base {
 		t.Fatal("the hook wrote outside stall_watch_progress")
@@ -623,6 +646,39 @@ func TestStallWatchNightHelper(t *testing.T) {
 	}
 }
 
+// answer records the owner's answer, now, to the project's newest decision
+// request.
+func (f *stallFixture) answer() {
+	f.t.Helper()
+	m, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{Text: "Owner answers the decision"}, stallOwner)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.exec(`INSERT INTO decision_answers(message_seq,task_id,request_seq,option_id,created_at) VALUES(?,?,(SELECT max(message_seq) FROM decision_requests WHERE task_id=?),'yes',?)`,
+		m.Seq, f.task.ID, f.task.ID, ts(f.now()))
+}
+
+// pause and resume move the project as the pause handler's rows do.
+func (f *stallFixture) pause() {
+	f.t.Helper()
+	f.exec(`UPDATE tasks SET pause_state='paused' WHERE id=?`, f.task.ID)
+}
+
+func (f *stallFixture) resume() {
+	f.t.Helper()
+	f.n++
+	f.exec(`UPDATE tasks SET pause_state='active' WHERE id=?`, f.task.ID)
+	f.exec(`INSERT INTO project_pause_cycles(id,task_id,pause_generation,lifecycle_generation,state,retained_handoff_digest,created_at,resumed_at) VALUES(?,?,?,1,'resumed','digest',?,?)`,
+		api.NewID("ppc"), f.task.ID, f.n, ts(f.now()), ts(f.now()))
+}
+
+// beforeWrite sets the sweep's test hook for the rest of the test.
+func (f *stallFixture) beforeWrite(fn func()) {
+	f.t.Helper()
+	stallWatchBeforeWrite = fn
+	f.t.Cleanup(func() { stallWatchBeforeWrite = nil })
+}
+
 func stallMatrixWait(since time.Time) api.AgentActivity {
 	return api.AgentActivity{State: "idle", MatrixWait: &api.MatrixWait{Role: "waiting", Position: 1, Length: 1, Since: since}}
 }
@@ -649,7 +705,10 @@ func TestStallWatchNightTeam(t *testing.T) {
 	f.none("06:59:59")
 	f.at(stallSevenAM)
 	_, ping, to := f.one(stallActionTeamPing)
-	if to != "" || ping.Refs["escalation"] != "owner" || ping.Refs["episode"] != line.Refs["episode"] || ping.Refs["item"] != f.items[0].ID {
+	// The 07:00 ping says why the owner hears it, as the night line did.
+	const why = "The owner helper is not registered, so this goes to the owner."
+	if to != "" || ping.Refs["escalation"] != "owner" || ping.Refs["episode"] != line.Refs["episode"] || ping.Refs["item"] != f.items[0].ID ||
+		!strings.Contains(line.Body.Text, why) || !strings.Contains(ping.Body.Text, why) {
 		t.Fatalf("team deferred ping refs %+v", ping.Refs)
 	}
 	checkStallText(t, ping.Body.Text)
@@ -963,7 +1022,8 @@ func TestStallWatchNeverQuiet(t *testing.T) {
 			}
 		})
 	}
-	// An answered decision no longer exempts the helper.
+	// An answered decision no longer exempts the helper, a full threshold
+	// after the answer.
 	t.Run("helper/answered decision", func(t *testing.T) {
 		f := root.project(t, stallNoon)
 		h := f.helper()
@@ -972,7 +1032,11 @@ func TestStallWatchNeverQuiet(t *testing.T) {
 		f.decision(h, owed.Seq)
 		f.advance(time.Hour)
 		f.none("unanswered")
-		f.exec(`INSERT INTO decision_answers(message_seq,task_id,request_seq,option_id,created_at) VALUES(?,?,(SELECT max(message_seq) FROM decision_requests WHERE task_id=?),'yes',?)`, owed.Seq, f.task.ID, f.task.ID, ts(f.now()))
+		f.answer()
+		f.none("at the answer")
+		f.advance(20*time.Minute - time.Second)
+		f.none("19 m 59 s after the answer")
+		f.advance(time.Second)
 		f.one(stallActionHelper)
 	})
 	// Retired, closed, exited and role agents are not members.
@@ -1245,7 +1309,7 @@ func TestStallWatchRevalidatesInWrite(t *testing.T) {
 			s := build(t, tc.team, stallNoon)
 			s.f.advance(30 * time.Minute)
 			called := 0
-			stallWatchBeforeWrite = func() { called++; tc.change(s) }
+			s.f.beforeWrite(func() { called++; tc.change(s) })
 			s.f.none("changed between the read and the write")
 			if called != 1 || s.f.episodes() != 0 {
 				t.Fatalf("hook calls %d, episodes %d", called, s.f.episodes())
@@ -1259,7 +1323,7 @@ func TestStallWatchRevalidatesInWrite(t *testing.T) {
 			}
 			s.f.at(stallSevenAM)
 			called := 0
-			stallWatchBeforeWrite = func() { called++; tc.change(s) }
+			s.f.beforeWrite(func() { called++; tc.change(s) })
 			s.f.none("changed between the read and the write")
 			if called != 1 || s.f.open() != 0 || s.f.count(`SELECT count(*) FROM stall_watch_episodes WHERE ping_seq<>0 AND task_id=?`, s.f.task.ID) != 0 {
 				t.Fatalf("hook calls %d, open %d", called, s.f.open())
@@ -1274,7 +1338,7 @@ func TestStallWatchRevalidatesInWrite(t *testing.T) {
 		s := build(t, team, stallNoon)
 		s.f.advance(30 * time.Minute)
 		called := 0
-		stallWatchBeforeWrite = func() { called++ }
+		s.f.beforeWrite(func() { called++ })
 		if steps := s.f.sweep(); len(steps) != 1 || called != 1 {
 			t.Fatalf("unchanged sweep: steps %+v hook %d", steps, called)
 		}
@@ -1404,5 +1468,121 @@ func TestStallWatchBoundedMessageReads(t *testing.T) {
 		f.post(h, owed.Seq)
 		f.none("the helper's post")
 		f.closed("posted")
+	})
+}
+
+// b1: time spent in a never-quiet case is not quiet time. No notice is posted
+// when the case lifts, nor until a full threshold after it, and an episode
+// that such a case closed does not post again when the case lifts.
+func TestStallWatchQuietAfterWaitLifts(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	hold := func(f *stallFixture, entry string) {
+		f.exec(`INSERT INTO team_queue_budget_holds(task_id,entry_id,item_id,estimate_tokens,team_tokens,team_state,state,created_at) VALUES(?,?,?,1,'2','running','held',?)`,
+			f.task.ID, entry, f.items[0].ID, ts(f.now()))
+	}
+	cases := []struct {
+		name        string
+		team        bool
+		apply, lift func(f *stallFixture, entry string, a api.Agent, owed int64)
+	}{
+		{"helper/own decision answered", false,
+			func(f *stallFixture, _ string, h api.Agent, owed int64) { f.decision(h, owed) },
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.answer() }},
+		{"helper/matrix wait cleared", false,
+			func(f *stallFixture, _ string, h api.Agent, _ int64) { f.report(h, stallMatrixWait(f.now())) },
+			func(f *stallFixture, _ string, h api.Agent, _ int64) { f.state(h, "idle") }},
+		{"helper/pause resumed", false,
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.pause() },
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.resume() }},
+		{"team/decision answered", true,
+			func(f *stallFixture, _ string, lead api.Agent, _ int64) { f.decision(lead, 0) },
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.answer() }},
+		{"team/hold released", true,
+			func(f *stallFixture, entry string, _ api.Agent, _ int64) { hold(f, entry) },
+			func(f *stallFixture, entry string, _ api.Agent, _ int64) {
+				f.exec(`UPDATE team_queue_budget_holds SET state='continued',resolved_at=? WHERE task_id=? AND entry_id=?`, ts(f.now()), f.task.ID, entry)
+			}},
+		{"team/shared-path wait cleared", true,
+			func(f *stallFixture, entry string, _ api.Agent, _ int64) { f.wait(entry, "waiting") },
+			func(f *stallFixture, entry string, _ api.Agent, _ int64) {
+				f.exec(`UPDATE team_queue_waits SET state='cleared',closed_at=? WHERE task_id=? AND entry_id=?`, ts(f.now()), f.task.ID, entry)
+			}},
+		{"team/matrix wait cleared", true,
+			func(f *stallFixture, _ string, lead api.Agent, _ int64) { f.report(lead, stallMatrixWait(f.now())) },
+			func(f *stallFixture, _ string, lead api.Agent, _ int64) { f.state(lead, "idle") }},
+		{"team/pause resumed", true,
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.pause() },
+			func(f *stallFixture, _ string, _ api.Agent, _ int64) { f.resume() }},
+	}
+	for _, tc := range cases {
+		threshold, action := stallWatchHelperQuiet, stallActionHelper
+		if tc.team {
+			threshold, action = stallWatchTeamQuiet, stallActionTeam
+		}
+		// build returns the watched subject: the owing helper, or a team's lead
+		// with an available helper that owes nothing.
+		build := func(t *testing.T) (*stallFixture, string, api.Agent, int64) {
+			f := root.project(t, stallNoon)
+			h := f.helper()
+			f.state(h, "idle")
+			if !tc.team {
+				return f, "", h, f.owe(h).Seq
+			}
+			entry := f.entry(0)
+			lead := f.member("lead-a", 0)
+			f.state(lead, "idle")
+			return f, entry, lead, 0
+		}
+		after := func(t *testing.T, f *stallFixture) {
+			t.Helper()
+			f.none("when the case lifts")
+			f.advance(threshold - time.Second)
+			f.none("a second short of the threshold after the lift")
+			f.advance(time.Second)
+			f.one(action)
+			f.advance(time.Minute)
+			f.none("one notice")
+		}
+		t.Run(tc.name+"/held past the threshold", func(t *testing.T) {
+			f, entry, a, owed := build(t)
+			f.advance(time.Minute)
+			tc.apply(f, entry, a, owed)
+			for i := 0; i < 3; i++ {
+				f.advance(threshold)
+				f.none("during the case")
+			}
+			tc.lift(f, entry, a, owed)
+			after(t, f)
+			if f.episodes() != 1 {
+				t.Fatalf("%d episodes, want one", f.episodes())
+			}
+		})
+		t.Run(tc.name+"/closes an open episode", func(t *testing.T) {
+			f, entry, a, owed := build(t)
+			f.advance(threshold)
+			f.one(action)
+			f.advance(time.Minute)
+			tc.apply(f, entry, a, owed)
+			f.none("the case closes the episode")
+			if f.open() != 0 {
+				t.Fatal("the episode stayed open")
+			}
+			f.advance(time.Minute)
+			tc.lift(f, entry, a, owed)
+			after(t, f)
+		})
+	}
+	// A matrix wait the relay stopped reporting ends at its bound.
+	t.Run("team/matrix wait outlives its bound", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.report(lead, stallMatrixWait(f.now()))
+		f.advance(defaultQueueMatrixWaitBound - time.Second)
+		f.none("inside the bound")
+		f.advance(stallWatchTeamQuiet)
+		f.none("a second short of the threshold after the bound")
+		f.advance(time.Second)
+		f.one(stallActionTeam)
 	})
 }
