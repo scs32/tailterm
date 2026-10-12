@@ -302,6 +302,32 @@ go-test already carries `-timeout=45m`, so go test's 600 s package default
 cannot trip under the 20-minute check limit. This matrix change also needed a
 new owner approval of the digest.
 
+**npm-unit file budget.** npm-unit is `node --test tests/*.test.js`: the test
+files run in parallel and the tests inside one file run one after another, so
+the check lasts about as long as its slowest file. The rule: no test file may
+take more than half of `checkTimeoutMs["npm-unit"]` in a passing npm-unit
+attempt (240 s under the present 480000 ms), and a full npm-unit run alone on
+the host finishes within that same half. When a file passes the half, split
+it; do not raise the limit for it.
+
+The two slowest files were split under this rule on 2026-10-12
+(`wi_ae63ff4bc52842dc`), with no matrix change, because new `tests/*.test.js`
+files are already selected by the `tests/` rule and the `npm test` glob.
+`tests/release-runner.test.js` (475 s in a passing attempt beside the rest of
+the suite, 315 s alone) is now that file plus `tests/release-runner-2.test.js`,
+`tests/release-runner-3.test.js` and `tests/release-runner-4.test.js`, with
+shared helpers in `tests/release-runner-fixtures.mjs`.
+`tests/verification.test.js` (319 s in that attempt, 282 s alone) is now that
+file plus `tests/verification-2.test.js` and `tests/verification-3.test.js`,
+with helpers in `tests/verification-fixtures.mjs`. After the split a full run
+under the host lock took 159 s and its slowest file 143 s. Tests that Go
+comments name (`wake a1`, the batch id vector) stay in
+`tests/release-runner.test.js`. A fixtures module is a `.mjs` file under
+`tests/`, so the browser inventory reads it: it must not contain the text
+`.launch(` or a `verify-matrix:` marker line. One test, `held s1`, takes about
+50 s alone because its 41 cases each build a git repository and run two polls,
+about 2,200 child processes; it waits on no timer.
+
 The serialization rules live in runner code and derive from the plan, so they
 never change `verification/matrix.json` or its approval. Attempts stay
 sequential within a check. Receipts list checks in plan order with the same
