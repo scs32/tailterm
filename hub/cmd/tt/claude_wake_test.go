@@ -2172,6 +2172,48 @@ func TestClaudeWakeSkipNoticeTurnAges(t *testing.T) {
 			[]string{"its last transcript event was 10m30s ago", "so the turn looks stopped, or is inside one long tool call (Bash), which writes nothing until it returns.", "Check the session, or wake it by hand."},
 			[]string{"not stuck", "No action is needed"})
 	})
+	// Review round one, b1 to b3. busy reads a transcript from zero, as a
+	// restarted relay does, and returns what the idle check says of the turn.
+	busy := func(t *testing.T, at time.Time, records ...string) claudeTurnBusyError {
+		t.Helper()
+		b, _ := claudeTranscriptFixture(t, "queue-idle", records...)
+		_, err := claudeTranscriptSnapshot(b, at)
+		var got claudeTurnBusyError
+		if !errors.As(err, &got) {
+			t.Fatalf("idle check = %v, want a turn in progress", err)
+		}
+		return got
+	}
+	start := time.Date(2026, 10, 10, 6, 0, 0, 0, time.UTC)
+	t.Run("a turn no prompt began starts at its first record, not at an earlier prompt", func(t *testing.T) {
+		// A scheduled wake: the fixture's own prompt and completed turn come
+		// first, then a fire record, a meta user record and the answer.
+		fire := `{"type":"system","subtype":"scheduled_task_fire","timestamp":"` + stamp(start) + `","content":"Fixture wake."}`
+		meta := `{"type":"user","isMeta":true,"timestamp":"` + stamp(start) + `","message":{"role":"user","content":"Fixture scheduled prompt."}}`
+		got := busy(t, start.Add(11*time.Minute), fire, meta, toolUse(start.Add(10*time.Second), "toolu_1"))
+		if !got.TurnStartAt.Equal(start.Add(10*time.Second)) || !got.LastEventAt.Equal(start.Add(10*time.Second)) {
+			t.Fatalf("turn = %+v, want it to begin at its first assistant record, %s", got, stamp(start.Add(10*time.Second)))
+		}
+		skip := claudeWakeSkip{Run: testClaudeBinding().Run, Reason: claudeTurnBusyReason, Since: start.Add(time.Minute), LastAt: start.Add(11 * time.Minute), TurnStartedAt: got.TurnStartAt, LastEventAt: got.LastEventAt, Tool: got.Tool}
+		has(t, claudeSkipNoticeText(testClaudeBinding(), skip), []string{"The turn began 10m50s ago"}, nil)
+	})
+	t.Run("user text inside a running turn does not move its start", func(t *testing.T) {
+		mid := `{"type":"user","timestamp":"` + stamp(start.Add(40*time.Minute)) + `","message":{"role":"user","content":"One more thing."}}`
+		got := busy(t, start.Add(42*time.Minute), userPrompt(start), toolUse(start.Add(time.Minute), "toolu_1"), mid, toolUse(start.Add(41*time.Minute), "toolu_2"))
+		if !got.TurnStartAt.Equal(start) || !got.LastEventAt.Equal(start.Add(41*time.Minute)) {
+			t.Fatalf("turn = %+v, want the start left at the prompt, %s", got, stamp(start))
+		}
+	})
+	t.Run("a snapshot's nested timestamp is not an event on a fresh read", func(t *testing.T) {
+		snapshot := `{"type":"file-history-snapshot","messageId":"m1","snapshot":{"messageId":"m1","trackedFileBackups":{},"timestamp":"` + stamp(start.Add(2*time.Minute)) + `"},"isSnapshotUpdate":false}`
+		at := start.Add(20 * time.Minute)
+		got := busy(t, at, userPrompt(start), toolUse(start.Add(time.Minute), "toolu_1"), snapshot)
+		if !got.LastEventAt.Equal(start.Add(time.Minute)) || !got.TurnStartAt.Equal(start) {
+			t.Fatalf("turn = %+v, want the last event at the last record with its own timestamp, %s", got, stamp(start.Add(time.Minute)))
+		}
+		skip := claudeWakeSkip{Run: testClaudeBinding().Run, Reason: claudeTurnBusyReason, Since: at.Add(-claudeWakeSkipBound), LastAt: at, TurnStartedAt: got.TurnStartAt, LastEventAt: got.LastEventAt, Tool: got.Tool}
+		has(t, claudeSkipNoticeText(testClaudeBinding(), skip), []string{"its last transcript event was 19m0s ago", "looks stopped"}, []string{"not stuck"})
+	})
 	t.Run("the bound itself counts as stopped; other reasons keep the plain text", func(t *testing.T) {
 		b := testClaudeBinding()
 		at := time.Date(2026, 10, 10, 3, 45, 12, 0, time.UTC)

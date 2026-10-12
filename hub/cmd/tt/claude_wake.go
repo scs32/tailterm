@@ -412,23 +412,44 @@ type claudeTranscriptState struct {
 	unknownReason string
 	unknownTypes  []string
 	records       int
-	// lastEventAt is the timestamp of the last record that carries one, and
-	// turnStartAt that of the prompt that began the current turn. The cursor's
-	// LastEventAt is not used for these: Claude Code writes records with no
-	// timestamp inside a turn (last-prompt, mode, ai-title), and the cursor
-	// gives those the time they were read.
+	// lastEventAt is the timestamp of the last record that carries its own
+	// (claudeRecordTime). The cursor's LastEventAt is not used: Claude Code
+	// writes records with no timestamp inside a turn (last-prompt, mode,
+	// ai-title, file-history-snapshot), and the cursor gives those the time
+	// they were read.
 	lastEventAt time.Time
+	// turnStartAt is the timestamp of the record that took the turn state
+	// from complete, or never seen, to in progress: a user prompt, or the
+	// first assistant record of a turn no prompt began (a scheduled wake, a
+	// stop-hook continuation). Later records of that turn never move it.
 	turnStartAt time.Time
 }
 
-// claudeTimestampKey marks a record that carries its own timestamp.
-var claudeTimestampKey = []byte(`"timestamp":"`)
+// claudeRecordTime returns a record's own top-level timestamp, or the zero
+// time when it has none. A timestamp nested deeper, as in
+// file-history-snapshot, is not the record's.
+func claudeRecordTime(line []byte) time.Time {
+	if !bytes.Contains(line, []byte(`"timestamp"`)) {
+		return time.Time{}
+	}
+	var rec struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if json.Unmarshal(line, &rec) != nil {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339Nano, rec.Timestamp)
+	if err != nil {
+		return time.Time{}
+	}
+	return at
+}
 
 // claudeTurnBusyReason is the idle check's refusal for a turn still running.
 const claudeTurnBusyReason = "Claude transcript busy, incomplete, or unknown: turn in progress"
 
 // claudeTurnBusyError is that refusal with what the transcript shows of the
-// turn: when its prompt arrived, when its last record was written, and a tool
+// turn: when it began, when its last record was written, and a tool
 // call that has not returned (a running tool writes nothing). The skip report
 // uses them to tell a working turn from one that stopped writing
 // (claudeSkipNoticeText). Before bug wi_b1959d28e4cb3905 the report had only
@@ -493,10 +514,17 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 		before, file := cursor.Offset, cursor.FileID
 		if err := readActivityAppend(path, cursor, func(line []byte, cursor *activityCursor) error {
 			st.records++
+			wasOpen := cursor.SeenTurn && !cursor.TurnComplete
 			err := parseClaudeActivity(line, cursor)
 			var unknown unknownClaudeRecordError
-			if (err == nil || errors.As(err, &unknown)) && bytes.Contains(line, claudeTimestampKey) {
-				st.lastEventAt = cursor.LastEventAt
+			if err == nil || errors.As(err, &unknown) {
+				at := claudeRecordTime(line)
+				if !at.IsZero() {
+					st.lastEventAt = at
+				}
+				if !wasOpen && cursor.SeenTurn && !cursor.TurnComplete {
+					st.turnStartAt = at
+				}
 			}
 			if errors.As(err, &unknown) {
 				kind := claudeClip(unknown.Type, 64)
@@ -515,9 +543,6 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 				// A later fully completed turn supersedes an older malformed
 				// record. Malformed data after that boundary still blocks input.
 				st.strictUnknown, st.unknownReason = false, ""
-			} else if cursor.SeenTurn && !cursor.TurnComplete && claudeUserText(line) != "" {
-				// The same test parseClaudeActivity uses to start a turn.
-				st.turnStartAt = st.lastEventAt
 			}
 			return err
 		}); err != nil {
