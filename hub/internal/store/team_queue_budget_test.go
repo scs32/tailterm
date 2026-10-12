@@ -404,7 +404,9 @@ func TestQueueBudgetHeldEntryHasNoStall(t *testing.T) {
 }
 
 // within puts the fixture's calls under a 30 second deadline, so a query
-// blocked on the store's one connection fails by name.
+// blocked on the store's one connection fails by name. A second call starts a
+// new 30 seconds: a test that fills a large fixture calls it again after the
+// fill, so the fill does not use up the deadline of the calls it guards.
 func (f *budgetQueue) within() {
 	f.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -978,6 +980,9 @@ func TestQueueBudgetWindowSumCost(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	// The 90,000 row fill above takes about 17 seconds under the race detector
+	// and longer on a loaded host, so the calls below get their own deadline.
+	f.within()
 	if fiveHours >= week || claudeSpent != 61*perTurn {
 		t.Fatalf("fixture: claude turns in its window spent %d", claudeSpent)
 	}
