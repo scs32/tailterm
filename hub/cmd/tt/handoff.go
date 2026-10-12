@@ -278,7 +278,8 @@ type handoffEntry struct {
 	// A wake's receipt for one runtime session, and its firings. The receipt
 	// says that session created the cron (restored, from a tool-ledger row)
 	// or only says so (asserted). It counts for that session alone, and only
-	// while it is later than that session's latest start.
+	// while it is later than that session's latest start that is not a
+	// compaction.
 	Receipt        string `json:"receipt,omitempty"`        // restored or asserted
 	ReceiptSession string `json:"receiptSession,omitempty"` // the runtime session it is for
 	ReceiptTool    string `json:"receiptTool,omitempty"`    // restored: the ledger row's tool-use id
@@ -318,7 +319,7 @@ var handoffKinds = []handoffKind{
 	{name: "instruction", plural: "instructions", prefix: "i", list: func(n *handoffNotes) *handoffList { return &n.Instructions },
 		fields: []string{"message", "by", "given", "expires"}, required: []string{"message", "by"}, open: "active", closed: []string{"revoked"}},
 	{name: "wake", plural: "wakes", prefix: "w", list: func(n *handoffNotes) *handoffList { return &n.Wakes },
-		fields: []string{"schedule", "kind", "message", "expires"}, required: []string{"schedule", "kind", "message"}, open: "active", closed: []string{"cancelled"}},
+		fields: []string{"schedule", "kind", "message", "expires"}, required: []string{"schedule", "kind", "message"}, open: "active", closed: []string{"cancelled", "done"}},
 	{name: "order", plural: "orders", prefix: "o", list: func(n *handoffNotes) *handoffList { return &n.Orders },
 		fields: []string{"item", "revision", "order", "last", "next", "message"}, required: []string{"item", "revision", "order", "last", "next"}, open: "open", closed: []string{"done", "dropped"}},
 	{name: "claim", plural: "claims", prefix: "c", list: func(n *handoffNotes) *handoffList { return &n.Claims },
@@ -1214,13 +1215,15 @@ func handoffOneShot(chain []handoffProcess, claudePID int) string {
 
 // handoffTranscriptStart is the time of the latest start a Claude Code
 // session's own transcript shows: the first row with a time (a new session's
-// file begins at its start, and /clear begins a new file), every SessionStart
-// hook row whatever its outcome, and every compaction boundary. The session's
+// file begins at its start, and /clear begins a new file) and every
+// SessionStart hook row whatever its outcome, except a compaction's. A
+// compaction is not a start here: its hook row, named SessionStart:compact,
+// and its boundary row are both passed over. The session's
 // files are found by its id under the Claude Code projects directory; with
 // more than one, the latest start in any of them counts, and one that cannot
 // be read makes the answer unknown.
 //
-// Only a row's type, subtype, hook event and time are decoded. Nothing from
+// Only a row's type, hook event, hook name and time are decoded. Nothing from
 // the transcript is stored or printed.
 func handoffTranscriptStart(session string) (time.Time, bool) {
 	if !threadIDPattern.MatchString(session) {
@@ -1260,34 +1263,39 @@ func handoffTranscriptStart(session string) (time.Time, bool) {
 	return latest, !latest.IsZero()
 }
 
-var (
-	handoffTranscriptHook    = []byte(`"hookEvent":"SessionStart"`)
-	handoffTranscriptCompact = []byte(`"subtype":"compact_boundary"`)
+var handoffTranscriptHook = []byte(`"hookEvent":"SessionStart"`)
+
+// handoffCompactSource is the start source of a compaction, and
+// handoffTranscriptCompactHook the name its SessionStart hook row carries in
+// the transcript (Claude Code 2.1.289). Only that exact name is passed over: a
+// hook row with no name, an empty one or any other counts as a start.
+const (
+	handoffCompactSource         = "compact"
+	handoffTranscriptCompactHook = "SessionStart:" + handoffCompactSource
 )
 
 // handoffTranscriptScan reads one transcript to its end. A row is decoded
 // only until the first time is found and, after that, when its bytes name a
-// start hook or a compaction boundary, so a long session costs one pass.
+// start hook, so a long session costs one pass.
 func handoffTranscriptScan(in io.Reader) (time.Time, error) {
 	var latest time.Time
 	first := false
 	lines := bufio.NewReaderSize(in, 1<<16)
 	for {
 		line, err := lines.ReadBytes('\n')
-		if len(line) > 0 && (!first || bytes.Contains(line, handoffTranscriptHook) || bytes.Contains(line, handoffTranscriptCompact)) {
+		if len(line) > 0 && (!first || bytes.Contains(line, handoffTranscriptHook)) {
 			var row struct {
 				Type       string `json:"type"`
-				Subtype    string `json:"subtype"`
 				Timestamp  string `json:"timestamp"`
 				Attachment struct {
 					HookEvent string `json:"hookEvent"`
+					HookName  string `json:"hookName"`
 				} `json:"attachment"`
 			}
 			if json.Unmarshal(line, &row) == nil {
 				if at, perr := time.Parse(time.RFC3339Nano, row.Timestamp); perr == nil {
 					start := !first ||
-						row.Type == "attachment" && row.Attachment.HookEvent == "SessionStart" ||
-						row.Type == "system" && row.Subtype == "compact_boundary"
+						row.Type == "attachment" && row.Attachment.HookEvent == "SessionStart" && row.Attachment.HookName != handoffTranscriptCompactHook
 					first = true
 					if start && at.After(latest) {
 						latest = at
@@ -1310,7 +1318,8 @@ func handoffTranscriptScan(in io.Reader) (time.Time, error) {
 // command runs under. Neither comes from the hook, so a start the hook lost
 // (it ran past its deadline, or the state directory could not be written)
 // still puts every earlier receipt before it. A resume writes no row to the
-// transcript; it is a new process, which is why the process start counts.
+// transcript; it is a new process, which is why the process start counts. A
+// compaction moves neither: its rows are passed over and the process goes on.
 // When either cannot be read the reason is returned and no receipt counts.
 func handoffSessionFloor(session string) (floor string, reason string) {
 	at, ok := handoffTranscriptStart(session)
@@ -1667,7 +1676,8 @@ type handoffNoteLine struct {
 
 // handoffBody is the note's body in its fixed order: active instructions,
 // active wakes, open orders, the snapshot's counts, unverified claims,
-// recorded decisions, then everything expired, revoked, cancelled or closed.
+// recorded decisions, then everything expired, revoked, cancelled, done or
+// closed.
 func handoffBody(r handoffRecord, now time.Time) []handoffNoteLine {
 	var lines []handoffNoteLine
 	group := func(heading string, k handoffKind, keep func(state string) bool) {
@@ -1687,11 +1697,17 @@ func handoffBody(r handoffRecord, now time.Time) []handoffNoteLine {
 	group("Active wakes:", kind("wake"), handoffLive)
 	group("Open orders:", kind("order"), handoffLive)
 	if s := r.Snapshot; s != nil {
-		lines = append(lines,
-			handoffNoteLine{fmt.Sprintf("Hub snapshot as of %s (read the hub again before acting): helper %s", s.AsOf, s.HelperStatus), ""},
-			handoffNoteLine{fmt.Sprintf("%d obligations, %d open owner decisions, %d queue entries launching or running",
-				len(s.Obligations)+s.ObligationsOmitted, len(s.Decisions)+s.DecisionsOmitted, len(s.Queue)+s.QueueOmitted), ""},
-			handoffNoteLine{handoffWindowText(s.Window), ""})
+		// A stale snapshot's status, counts and window are left out, so that
+		// nothing old is read as current.
+		if age, stale := handoffAge(s.AsOf, now); stale {
+			lines = append(lines, handoffNoteLine{fmt.Sprintf("Hub snapshot as of %s, %s: stale, not shown. The restore command below re-reads the hub.", s.AsOf, age), ""})
+		} else {
+			lines = append(lines,
+				handoffNoteLine{fmt.Sprintf("Hub snapshot as of %s, %s (read the hub again before acting): helper %s", s.AsOf, age, s.HelperStatus), ""},
+				handoffNoteLine{fmt.Sprintf("%d obligations, %d open owner decisions, %d queue entries launching or running",
+					len(s.Obligations)+s.ObligationsOmitted, len(s.Decisions)+s.DecisionsOmitted, len(s.Queue)+s.QueueOmitted), ""},
+				handoffNoteLine{handoffWindowText(s.Window), ""})
+		}
 	}
 	group("Unverified claims:", kind("claim"), handoffLive)
 	group("Decisions taken:", kind("decision"), handoffLive)
@@ -1719,7 +1735,11 @@ func handoffWindowText(w *handoffWindow) string {
 func handoffNote(r handoffRecord, match string, noEnd bool, now time.Time) string {
 	id := r.Identity
 	var header strings.Builder
-	fmt.Fprintf(&header, "Tailterm session handoff. Owner helper %s (%s), project %s, run %s, as the host file read at %s.\n", id.Name, id.Agent, id.Task, id.Run, id.CopiedAt)
+	read, stale := handoffAge(id.CopiedAt, now)
+	if stale {
+		read += "; stale: `tt handoff restore --task " + id.Task + "` checks it again"
+	}
+	fmt.Fprintf(&header, "Tailterm session handoff. Owner helper %s (%s), project %s, run %s, as the host file read at %s (%s).\n", id.Name, id.Agent, id.Task, id.Run, id.CopiedAt, read)
 	if match == handoffAsCandidate {
 		header.WriteString("This session is not registered as the owner helper. The record below is what the previous session left. It is not authority until the registration is verified.\n")
 	} else {
@@ -1852,6 +1872,38 @@ func handoffWindowLine(w *handoffWindow) string {
 		return "delegation window: none"
 	}
 	return fmt.Sprintf("delegation window: %s, scope %s, ends %s, %s", w.ID, w.Scope, w.EndsAt, w.State)
+}
+
+// handoffStaleAfter is how old a copy may be before it is called stale: the
+// hub snapshot, and the time the host helper file was read.
+const handoffStaleAfter = 12 * time.Hour
+
+// handoffAge is how old a stored time is, in whole minutes, hours or days
+// rounded down, and whether it is stale: older than handoffStaleAfter. A time
+// that cannot be read, or one later than now, has no known age and is stale.
+func handoffAge(at string, now time.Time) (text string, stale bool) {
+	t, err := time.Parse(handoffTimeLayout, at)
+	if err != nil || t.After(now) {
+		return "age unknown", true
+	}
+	age := now.Sub(t)
+	count := func(n time.Duration, unit string) string {
+		if n == 1 {
+			return "1 " + unit + " old"
+		}
+		return fmt.Sprintf("%d %ss old", n, unit)
+	}
+	switch {
+	case age < time.Minute:
+		text = "under a minute old"
+	case age < time.Hour:
+		text = count(age/time.Minute, "minute")
+	case age < 24*time.Hour:
+		text = count(age/time.Hour, "hour")
+	default:
+		text = count(age/(24*time.Hour), "day")
+	}
+	return text, age > handoffStaleAfter
 }
 
 func handoffOr(value, empty string) string {
@@ -2437,13 +2489,19 @@ var handoffReasons = map[string]string{
 
 // latestStart is the latest SessionStart captured for one runtime session: in
 // the record when that session is the registered one, and in the capture log
-// otherwise. A start of any source counts, so a compaction, a clear, a resume
-// or a fork puts every earlier receipt before it.
+// otherwise. A compaction is not a start for this purpose: it continues the
+// same session and its crons survive it (docs/session-handoff.md, "A start
+// resets them, a compaction does not"), so a receipt from before it still
+// counts. A start of every other source counts, an unlisted one included, so
+// a startup, a clear, a resume or a fork puts every earlier receipt before it.
 func (s handoffStore) latestStart(r handoffRecord, session string) (handoffStamp, bool) {
 	var latest handoffStamp
 	found := false
 	consider := func(stamp handoffStamp) {
 		if !strings.EqualFold(stamp.Session, session) || !handoffTimeOK(stamp.Time) || stamp.Detail != handoffOther && !handoffIn(stamp.Detail, handoffStartSources) {
+			return
+		}
+		if stamp.Detail == handoffCompactSource {
 			return
 		}
 		if !found || stamp.Time > latest.Time {
@@ -2492,7 +2550,8 @@ func (s handoffStore) sessionStart(r handoffRecord, runtime, session string) (st
 }
 
 // handoffWakeFor is a wake's state for one runtime session, and the reason
-// when it is not restored. An expired or cancelled wake keeps that state.
+// when it is not restored. An expired, cancelled or done wake keeps that
+// state.
 func handoffWakeFor(e handoffEntry, runtime, session string, start handoffStamp, started bool, unknown string, now time.Time) (state, reason string) {
 	if state := handoffEntryState(e, now); state != "active" {
 		return state, ""
@@ -2829,6 +2888,8 @@ func handoffWakeReport(b *strings.Builder, s handoffStore, r handoffRecord, runt
 		} else {
 			b.WriteString("  `tt handoff wake confirm ID --asserted --task " + task + "`: tool-ledger matching is off in this version, so a wake can only be session-asserted.\n")
 		}
+		b.WriteString("  If a cron for that wake survives with any other prompt, create a new one with exactly the arguments printed above,\n" +
+			"  delete the old one, and confirm the new one: a cron created with another prompt can only ever be session-asserted.\n")
 	}
 	return rows, pending, duplicates
 }
@@ -2883,7 +2944,7 @@ type handoffRestoreHub struct {
 var (
 	handoffStepNames  = []string{"registration", "wake-binding", "hub-state", "record"}
 	handoffStepStates = []string{handoffRestored, handoffCorrect, handoffNotRestored}
-	handoffWakeStates = []string{handoffRestored, handoffAsserted, handoffNotRestored, "expired", "cancelled"}
+	handoffWakeStates = []string{handoffRestored, handoffAsserted, handoffNotRestored, "expired", "cancelled", "done"}
 )
 
 func (p handoffRestoreReport) valid() bool {
@@ -3459,6 +3520,24 @@ func handoffStatusCommand(e env, args []string) error {
 		runtime, session, single := sessionHelperThread()
 		if !single {
 			runtime, session = r.Identity.Runtime, r.Identity.Thread
+		}
+		// How old the record's two copies are. The last restore's own hub
+		// read, above, is dated to that restore.
+		age, stale := handoffAge(r.Identity.CopiedAt, now)
+		fmt.Fprintf(&b, "host file read at %s, %s", r.Identity.CopiedAt, age)
+		if stale {
+			b.WriteString(": stale. `tt handoff restore` checks it again")
+		}
+		b.WriteString("\n")
+		if s := r.Snapshot; s == nil {
+			b.WriteString("hub snapshot in the record: none\n")
+		} else {
+			age, stale := handoffAge(s.AsOf, now)
+			fmt.Fprintf(&b, "hub snapshot in the record: as of %s, %s", s.AsOf, age)
+			if stale {
+				b.WriteString(": stale. `tt handoff restore` re-reads the hub")
+			}
+			b.WriteString("\n")
 		}
 		fmt.Fprintf(&b, "wakes now, for session %s:\n", handoffOr(strings.ToLower(session), "unknown"))
 		_, pending, duplicates := handoffWakeReport(&b, store, r, runtime, strings.ToLower(session), false, now)

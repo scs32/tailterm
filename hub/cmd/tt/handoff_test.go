@@ -386,8 +386,9 @@ func handoffPSClaudePID(table string) string {
 
 // transcript appends rows to a Claude Code session's transcript under the
 // box's home, as Claude Code writes them: a start hook's row (any outcome), a
-// compaction boundary, or an ordinary row.
-func (b *handoffBox) transcript(session string, at time.Time, kind string) {
+// compaction boundary, or an ordinary row. A hook row is named for a startup
+// unless hookName gives another name; an empty one leaves the name out.
+func (b *handoffBox) transcript(session string, at time.Time, kind string, hookName ...string) {
 	b.t.Helper()
 	dir := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "-work-project")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -397,7 +398,13 @@ func (b *handoffBox) transcript(session string, at time.Time, kind string) {
 	row := `{"type":"user","timestamp":"` + stamp + `","message":{"role":"user","content":"quoting \"hookEvent\":\"SessionStart\" changes nothing"}}`
 	switch kind {
 	case "hook_success", "hook_cancelled", "hook_non_blocking_error":
-		row = `{"parentUuid":null,"attachment":{"type":"` + kind + `","hookName":"SessionStart:startup","hookEvent":"SessionStart"},"type":"attachment","timestamp":"` + stamp + `","entrypoint":"cli"}`
+		name := `"hookName":"SessionStart:startup",`
+		if len(hookName) > 0 {
+			if name = ""; hookName[0] != "" {
+				name = `"hookName":"` + hookName[0] + `",`
+			}
+		}
+		row = `{"parentUuid":null,"attachment":{"type":"` + kind + `",` + name + `"hookEvent":"SessionStart"},"type":"attachment","timestamp":"` + stamp + `","entrypoint":"cli"}`
 	case "compact_boundary":
 		row = `{"type":"system","subtype":"compact_boundary","timestamp":"` + stamp + `"}`
 	case "user":
@@ -438,9 +445,17 @@ func init() {
 
 func (b *handoffBox) hook(event, session string, fields map[string]any) toolHookRun {
 	b.t.Helper()
-	// Claude Code writes a start hook's row to the session's transcript.
+	// Claude Code writes a start hook's row to the session's transcript,
+	// named for the start's source, and a boundary row for a compaction.
 	if event == "SessionStart" && threadIDPattern.MatchString(session) {
-		b.transcript(session, b.now, "hook_success")
+		source, _ := fields["source"].(string)
+		if source == "" {
+			source = "startup"
+		}
+		b.transcript(session, b.now, "hook_success", "SessionStart:"+source)
+		if source == "compact" {
+			b.transcript(session, b.now, "compact_boundary")
+		}
 	}
 	return b.hookRaw(handoffPayload(event, session, fields), nil)
 }
@@ -2108,7 +2123,7 @@ func TestHandoffWrite(t *testing.T) {
 		}
 	}
 	// The injected note carries the snapshot's counts and its date.
-	if r := b.hook("SessionStart", f.thread, map[string]any{"source": "startup"}); !strings.Contains(r.out, "Hub snapshot as of "+s.AsOf+" (read the hub again before acting): helper running\n"+strconv.Itoa(len(all))+" obligations, 1 open owner decisions, 0 queue entries launching or running\ndelegation window open at the snapshot") {
+	if r := b.hook("SessionStart", f.thread, map[string]any{"source": "startup"}); !strings.Contains(r.out, "Hub snapshot as of "+s.AsOf+", under a minute old (read the hub again before acting): helper running\n"+strconv.Itoa(len(all))+" obligations, 1 open owner decisions, 0 queue entries launching or running\ndelegation window open at the snapshot") {
 		t.Fatalf("the note lacks the snapshot:\n%s", r.out)
 	}
 	// Another session on the host is refused, and changes nothing.
@@ -3266,8 +3281,18 @@ func TestHandoffWakes(t *testing.T) {
 		}
 		requireHandoffValues(t, b.bytes("record.json"))
 	})
-	t.Run("every start returns every wake to not restored", func(t *testing.T) {
+	t.Run("every start but a compaction returns every wake to not restored", func(t *testing.T) {
+		// Every listed source but compact, and one that is not listed.
+		sources := []string{"a-source-not-listed"}
 		for _, source := range handoffStartSources {
+			if source != "compact" {
+				sources = append(sources, source)
+			}
+		}
+		if len(sources) != len(handoffStartSources) {
+			t.Fatalf("the start sources are %v; want compact among them once", handoffStartSources)
+		}
+		for _, source := range sources {
 			t.Run(source, func(t *testing.T) {
 				b := begin(t)
 				b.ledger(b.cron("w1", toolA))
@@ -3306,6 +3331,89 @@ func TestHandoffWakes(t *testing.T) {
 					t.Fatalf("confirm after a %s start = %v, %q", source, err, out)
 				}
 			})
+		}
+	})
+	// h1: a compaction continues the same session and its crons survive it,
+	// so its receipts still count. The next start of any other source resets.
+	t.Run("a compaction keeps every receipt", func(t *testing.T) {
+		b := begin(t)
+		b.ledger(b.cron("w1", toolA))
+		if _, err := confirm(b, "w1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := confirm(b, "w2", "--asserted"); err != nil {
+			t.Fatal(err)
+		}
+		kept := func(what string) {
+			t.Helper()
+			status := b.must("status")
+			if !strings.Contains(status, "w1 restored: this session created its cron at") || !strings.Contains(status, "(tool use "+toolA+")") ||
+				!strings.Contains(status, "w2 session-asserted, not verified") || !strings.Contains(status, "1 active wakes not restored now") {
+				t.Fatalf("%s:\n%s", what, status)
+			}
+		}
+		// Another session's compaction changes nothing.
+		b.asCandidate()
+		b.now = b.now.Add(time.Minute)
+		b.hook("SessionStart", handoffOtherID, map[string]any{"source": "compact"})
+		kept("after another session's compaction")
+		// The helper session's own compaction: the hook stamps it, and the
+		// transcript gains its hook row and its boundary row.
+		before := b.wake("w1")
+		for i := 0; i < 2; i++ {
+			b.now = b.now.Add(time.Minute)
+			if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+				t.Fatal(r.err)
+			}
+			if start := b.record().Capture.Start; start == nil || start.Detail != "compact" || start.Time != handoffStamped(b.now) || start.Session != b.helper.Thread {
+				t.Fatalf("the compaction was not captured as the record's last start: %+v", start)
+			}
+			kept("after the session's own compaction")
+		}
+		// Confirming again keeps the receipt it had: nothing is rewritten.
+		b.now = b.now.Add(time.Minute)
+		record := b.bytes("record.json")
+		if out, err := confirm(b, "w1"); err != nil || !strings.Contains(out, "wake w1 restored") || !bytes.Equal(record, b.bytes("record.json")) || b.wake("w1") != before {
+			t.Fatalf("confirm after a compaction = %v, %q", err, out)
+		}
+		// A start of another source after the compaction resets both.
+		b.now = b.now.Add(time.Minute)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "resume"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		status := b.must("status")
+		for _, id := range []string{"w1", "w2"} {
+			if !strings.Contains(status, id+" not restored: its receipt is from before this session's latest start") {
+				t.Fatalf("after a resume that followed a compaction %s is not shown as not restored:\n%s", id, status)
+			}
+		}
+		if !strings.Contains(status, "2 active wakes not restored now") {
+			t.Fatalf("status:\n%s", status)
+		}
+		b.now = b.now.Add(time.Minute)
+		notRestored(t, b, "w1", "the row from before the resume")
+		requireHandoffValues(t, b.bytes("record.json"))
+	})
+	// h1: confirm searches the ledger from the same start, so a cron created
+	// before a compaction can be confirmed after it, and one created before
+	// the last start that is not a compaction still cannot.
+	t.Run("a cron created before a compaction confirms after it", func(t *testing.T) {
+		b := begin(t)
+		early := b.cron("w2", toolB)
+		early.At = b.now.Add(-time.Hour) // before the session's startup
+		b.ledger(b.cron("w1", toolA), early)
+		created := handoffStamped(b.now)
+		b.now = b.now.Add(time.Minute)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		b.now = b.now.Add(time.Minute)
+		if out, err := confirm(b, "w1"); err != nil || out != fmt.Sprintf("wake w1 restored: this session created its cron at %s (tool use %s)\n", created, toolA) {
+			t.Fatalf("confirm of a cron from before the compaction = %v, %q", err, out)
+		}
+		notRestored(t, b, "w2", "a row from before the startup, after a compaction")
+		if status := b.must("status"); !strings.Contains(status, "w1 restored: this session created its cron at "+created) || !strings.Contains(status, "1 active wakes not restored now") {
+			t.Fatalf("status:\n%s", status)
 		}
 	})
 	// A start the hook could not save in the record still puts every earlier
@@ -3352,7 +3460,7 @@ func TestHandoffWakes(t *testing.T) {
 				saved := b.record().Capture.Start
 				b.now = b.now.Add(time.Minute)
 				release := c.block(t, b)
-				r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"})
+				r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "resume"})
 				release()
 				if r.err != nil {
 					t.Fatal(r.err)
@@ -3394,6 +3502,50 @@ func TestHandoffWakes(t *testing.T) {
 		if !strings.Contains(status, "w1 expired: not offered for re-creation") || !strings.Contains(status, "w2 cancelled: not offered for re-creation") ||
 			!strings.Contains(status, "0 active wakes not restored now") || strings.Contains(status, "arguments for") {
 			t.Fatalf("status:\n%s", status)
+		}
+	})
+	// h3: a wake that fired and was answered is closed as done, and is then
+	// treated as any closed wake.
+	t.Run("a done wake is closed and never offered", func(t *testing.T) {
+		b := begin(t)
+		if _, err := b.run("note", "wake", "close", "w1", "--state=fired"); err == nil || b.wake("w1").State != "active" {
+			t.Fatalf("a wake was closed with a state that is not one: %v", err)
+		}
+		if out := b.must("note", "wake", "close", "w1", "--state", "done"); !strings.HasPrefix(out, "w1 done wake") {
+			t.Fatalf("close --state done printed %q", out)
+		}
+		// With no state a close still cancels.
+		if out := b.must("note", "wake", "close", "w2"); !strings.HasPrefix(out, "w2 cancelled wake") {
+			t.Fatalf("close printed %q", out)
+		}
+		if w := b.wake("w1"); w.State != "done" {
+			t.Fatalf("the wake is %+v", w)
+		}
+		if r := b.record(); !r.valid() {
+			t.Fatal("a record with a done wake is not valid")
+		}
+		requireHandoffValues(t, b.bytes("record.json"))
+		b.now = b.now.Add(time.Minute)
+		b.ledger(b.cron("w1", toolA))
+		before := b.bytes("record.json")
+		for _, args := range [][]string{{"wake", "confirm", "w1"}, {"wake", "confirm", "w1", "--asserted"}, {"wake", "due", "w1"}} {
+			if out, err := b.run(args...); err == nil || out != "" || !strings.Contains(err.Error(), "wake w1 is done") {
+				t.Fatalf("%v = %v, %q", args, err, out)
+			}
+		}
+		if !bytes.Equal(before, b.bytes("record.json")) {
+			t.Fatal("a refused command changed the record")
+		}
+		status := b.must("status")
+		if !strings.Contains(status, "w1 done: not offered for re-creation") || !strings.Contains(status, "w2 cancelled: not offered for re-creation") ||
+			!strings.Contains(status, "0 active wakes not restored now") || strings.Contains(status, "arguments for") {
+			t.Fatalf("status:\n%s", status)
+		}
+		// It is listed with the other closed wakes, not with the active ones.
+		show := b.must("show")
+		closed := strings.Index(show, "Expired: not authority. Expired, revoked and cancelled wakes:")
+		if at := strings.Index(show, "- w1 done wake hourly-update"); closed < 0 || at < closed || strings.Contains(show, "Current wakes:") {
+			t.Fatalf("show does not list the done wake as closed:\n%s", show)
 		}
 	})
 	t.Run("two firings within half the period are a duplicate", func(t *testing.T) {
@@ -3492,6 +3644,8 @@ func TestHandoffWakes(t *testing.T) {
 		b.must("note", "wake", "add", "--schedule=30 7 * * *", "--kind=morning-summary", "--message=31590", "--expires=30s")
 		b.must("note", "wake", "add", "--schedule=15 9 * * 1", "--kind=queue-check", "--message=31600")
 		b.must("note", "wake", "close", "w3")
+		b.must("note", "wake", "add", "--schedule=45 6 * * *", "--kind=morning-summary", "--message=31610")
+		b.must("note", "wake", "close", "w4", "--state=done")
 		thread := f.successor(t)
 		out, err := f.restore()
 		if err == nil || !strings.Contains(err.Error(), "restore incomplete: 1 not restored") {
@@ -3502,7 +3656,10 @@ func TestHandoffWakes(t *testing.T) {
 		for _, want := range []string{"w1 not restored: nothing has confirmed it in this session. hourly-update msg #31581", "    arguments for CronCreate: " + args,
 			"list this session's crons. If one already has that wake's prompt, keep it and run", "`tt handoff wake confirm ID --asserted --task " + f.task.ID + "`",
 			"Otherwise create it with exactly the arguments printed above and run", "`tt handoff wake confirm ID --task " + f.task.ID + "`.",
-			"w2 expired: not offered for re-creation", "w3 cancelled: not offered for re-creation"} {
+			"w2 expired: not offered for re-creation", "w3 cancelled: not offered for re-creation", "w4 done: not offered for re-creation",
+			// h2: a surviving cron with another prompt is re-created, so that it can be verified.
+			"`tt handoff wake confirm ID --task " + f.task.ID + "`.\n  If a cron for that wake survives with any other prompt, create a new one with exactly the arguments printed above,\n" +
+				"  delete the old one, and confirm the new one: a cron created with another prompt can only ever be session-asserted.\n"} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("restore output lacks %q:\n%s", want, out)
 			}
@@ -3532,6 +3689,11 @@ func TestHandoffWakes(t *testing.T) {
 		}
 		requireHandoffValues(t, b.bytes("record.json"))
 		requireHandoffValues(t, b.bytes("restore.json"))
+		// h3: the saved report holds the done wake in that state.
+		report, found, err := handoffStore{dir: filepath.Dir(b.file("restore.json"))}.loadRestore()
+		if err != nil || !found || len(report.Wakes) != 4 || report.Wakes[3] != (handoffRestoreWake{ID: "w4", State: "done"}) || report.NotRestored != 0 {
+			t.Fatalf("restore.json = %+v, %v, %v", report, found, err)
+		}
 	})
 }
 
@@ -3788,6 +3950,160 @@ func TestHandoffRestoreOneShot(t *testing.T) {
 	}
 }
 
+// h4: the injected note and tt handoff status say how old the record's two
+// copies are, the hub snapshot and the host-file read. Past 12 hours each is
+// called stale, and the note shows none of a stale snapshot's status, counts
+// or window.
+func TestHandoffAge(t *testing.T) {
+	at := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		after time.Duration
+		text  string
+		stale bool
+	}{
+		{0, "under a minute old", false}, {59 * time.Second, "under a minute old", false}, {time.Minute, "1 minute old", false}, {59*time.Minute + 59*time.Second, "59 minutes old", false},
+		{time.Hour, "1 hour old", false}, {12 * time.Hour, "12 hours old", false}, {12*time.Hour + time.Second, "12 hours old", true}, {24*time.Hour - time.Second, "23 hours old", true},
+		{24 * time.Hour, "1 day old", true}, {4*24*time.Hour + 3*time.Minute, "4 days old", true}, {-time.Second, "age unknown", true},
+	} {
+		if text, stale := handoffAge(handoffStamped(at), at.Add(c.after)); text != c.text || stale != c.stale {
+			t.Errorf("age after %s = %q, stale %v; want %q, stale %v", c.after, text, stale, c.text, c.stale)
+		}
+	}
+	for _, bad := range []string{"", "yesterday", "2026-10-07 14:00:00", "2026-13-40T14:00:00Z"} {
+		if text, stale := handoffAge(bad, at); text != "age unknown" || !stale {
+			t.Errorf("age of %q = %q, stale %v; want age unknown, stale", bad, text, stale)
+		}
+	}
+
+	b := newHandoffBox(t)
+	b.on()
+	b.asHelper()
+	start := map[string]any{"source": "startup"}
+	if r := b.hook("SessionStart", b.helper.Thread, start); r.err != nil {
+		t.Fatal(r.err)
+	}
+	// No snapshot yet: status says so, and the note has no snapshot line.
+	read := b.record().Identity.CopiedAt
+	if status := b.must("status"); !strings.Contains(status, "host file read at "+read+", under a minute old\nhub snapshot in the record: none\nwakes now, for session ") {
+		t.Fatalf("status with no snapshot:\n%s", status)
+	}
+	taken := b.now
+	set := func(status string, snapshot, hostFile time.Time) {
+		t.Helper()
+		record := b.record()
+		record.Identity.CopiedAt = handoffStamped(hostFile)
+		record.Snapshot = &handoffSnapshot{AsOf: handoffStamped(snapshot), HelperStatus: status, ObligationsOmitted: 3, DecisionsOmitted: 1,
+			Window:      &handoffWindow{ID: "dlw_0123456789abcdef", Scope: api.DelegationScopeDecisions, EndsAt: handoffStamped(taken.Add(48 * time.Hour)), State: api.DelegationOpen},
+			Obligations: []handoffObligation{}, Decisions: []handoffDecision{}, Queue: []handoffQueueRow{}}
+		b.save(record)
+	}
+	note := func(candidate bool) string {
+		t.Helper()
+		session := b.helper.Thread
+		if candidate {
+			session = handoffOtherID
+		}
+		r := b.hook("SessionStart", session, start)
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		requireNote(t, b, r.out, candidate)
+		return r.out
+	}
+	const stale = "stale"
+	current := []string{" obligations, ", "delegation window", "helper running", "read the hub again before acting"}
+	restore := "`tt handoff restore --task " + b.helper.Task + "`"
+
+	// Fresh, to the edge: 12 hours exactly is not stale.
+	for after, age := range map[time.Duration]string{3*time.Hour + 20*time.Minute: "3 hours old", 12 * time.Hour: "12 hours old"} {
+		b.now = taken.Add(after)
+		set(api.AgentRunning, taken, taken)
+		stamp := handoffStamped(taken)
+		out := note(false)
+		for _, want := range []string{"as the host file read at " + stamp + " (" + age + ").\n",
+			"Hub snapshot as of " + stamp + ", " + age + " (read the hub again before acting): helper running\n3 obligations, 1 open owner decisions, 0 queue entries launching or running\n" +
+				"delegation window open at the snapshot, ends " + handoffStamped(taken.Add(48*time.Hour)) + "\n"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("the note of a %s snapshot lacks %q:\n%s", age, want, out)
+			}
+		}
+		if strings.Contains(out, stale) {
+			t.Fatalf("the note calls a %s copy stale:\n%s", age, out)
+		}
+		status := b.must("status")
+		if !strings.Contains(status, "host file read at "+stamp+", "+age+"\nhub snapshot in the record: as of "+stamp+", "+age+"\nwakes now, for session ") || strings.Contains(status, stale) {
+			t.Fatalf("status of a %s snapshot:\n%s", age, status)
+		}
+	}
+
+	// A second past 12 hours, and the 10-11 case: a snapshot 4 days old and
+	// a host-file read 2 days old.
+	for _, c := range []struct {
+		snapshot, hostFile       time.Duration
+		snapshotAge, hostFileAge string
+	}{
+		{12*time.Hour + time.Second, 12*time.Hour + time.Second, "12 hours old", "12 hours old"},
+		{4*24*time.Hour + 5*time.Hour, 2*24*time.Hour + time.Hour, "4 days old", "2 days old"},
+	} {
+		b.now = taken.Add(5 * 24 * time.Hour)
+		snapshot, hostFile := handoffStamped(b.now.Add(-c.snapshot)), handoffStamped(b.now.Add(-c.hostFile))
+		set(api.AgentRunning, b.now.Add(-c.snapshot), b.now.Add(-c.hostFile))
+		out := note(false)
+		for _, want := range []string{"as the host file read at " + hostFile + " (" + c.hostFileAge + "; stale: " + restore + " checks it again).\n",
+			"\nHub snapshot as of " + snapshot + ", " + c.snapshotAge + ": stale, not shown. The restore command below re-reads the hub.\n",
+			"\nNext: run " + restore + ".\n"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("the note of a %s snapshot lacks %q:\n%s", c.snapshotAge, want, out)
+			}
+		}
+		for _, not := range current {
+			if strings.Contains(out, not) {
+				t.Fatalf("the note shows %q of a stale snapshot as current:\n%s", not, out)
+			}
+		}
+		status := b.must("status")
+		if !strings.Contains(status, "host file read at "+hostFile+", "+c.hostFileAge+": stale. `tt handoff restore` checks it again\n"+
+			"hub snapshot in the record: as of "+snapshot+", "+c.snapshotAge+": stale. `tt handoff restore` re-reads the hub\nwakes now, for session ") {
+			t.Fatalf("status of a %s snapshot:\n%s", c.snapshotAge, status)
+		}
+	}
+
+	// One stale and one fresh: each is judged on its own.
+	set(api.AgentRunning, b.now.Add(-time.Hour), b.now.Add(-30*time.Hour))
+	if out := note(false); !strings.Contains(out, " (1 day old; stale: "+restore+" checks it again).\n") || !strings.Contains(out, ", 1 hour old (read the hub again before acting): helper running\n3 obligations, ") {
+		t.Fatalf("a stale host-file read with a fresh snapshot:\n%s", out)
+	}
+	set(api.AgentRunning, b.now.Add(-30*time.Hour), b.now.Add(-time.Hour))
+	out := note(false)
+	if !strings.Contains(out, " (1 hour old).\n") || !strings.Contains(out, ", 1 day old: stale, not shown. The restore command below re-reads the hub.\n") {
+		t.Fatalf("a fresh host-file read with a stale snapshot:\n%s", out)
+	}
+	for _, not := range current {
+		if strings.Contains(out, not) {
+			t.Fatalf("the note shows %q of a stale snapshot as current:\n%s", not, out)
+		}
+	}
+
+	// The widest header still fits: a candidate, a retired helper, no end
+	// recorded and a stale host-file read with the longest age.
+	set(api.AgentNeedsInput, b.now.Add(-13*time.Hour), b.now.Add(-9999*24*time.Hour))
+	record := b.record()
+	record.Snapshot.HelperStatus = api.AgentRetired
+	b.save(record)
+	b.asCandidate()
+	out = note(true)
+	for _, want := range []string{" (9999 days old; stale: " + restore + " checks it again).\n", "The helper was retired on the hub at ", "No end was recorded for the previous session.\n",
+		", 13 hours old: stale, not shown. The restore command below re-reads the hub.\n"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the widest note lacks %q:\n%s", want, out)
+		}
+	}
+	// The same record and the same clock give the same bytes.
+	if again := b.hook("SessionStart", handoffOtherID, start); again.out != out {
+		t.Fatalf("two runs on the same record differ:\n%s\n---\n%s", out, again.out)
+	}
+}
+
 // r2: the real interactive session restores when ps shows its program as the
 // versioned binary the claude link points to, as on the Mini.
 func TestHandoffRestoreVersionedBinary(t *testing.T) {
@@ -3847,12 +4163,15 @@ func TestHandoffWakeFloor(t *testing.T) {
 			t.Fatal("the record changed")
 		}
 	}
-	// A later start whose hook left nothing: each kind of transcript row.
-	for _, row := range []string{"hook_cancelled", "hook_non_blocking_error", "hook_success", "compact_boundary"} {
-		t.Run("a later start the hook lost: "+row, func(t *testing.T) {
+	// A later start whose hook left nothing: each kind of transcript row. A
+	// hook row counts whatever its outcome and whatever it is named, with no
+	// name at all, or with one that only resembles a compaction's.
+	for _, row := range [][]string{{"hook_cancelled"}, {"hook_non_blocking_error"}, {"hook_success"}, {"hook_success", ""}, {"hook_success", "SessionStart:resume"},
+		{"hook_success", "SessionStart:clear"}, {"hook_success", "SessionStart:compaction"}, {"hook_success", "sessionstart:compact"}, {"hook_cancelled", "SessionStart"}} {
+		t.Run("a later start the hook lost: "+strings.Join(row, " named "), func(t *testing.T) {
 			b := begin(t)
 			start := b.record().Capture.Start.Time
-			b.transcript(b.helper.Thread, b.now, row)
+			b.transcript(b.helper.Thread, b.now, row[0], row[1:]...)
 			if b.record().Capture.Start.Time != start {
 				t.Fatal("the fixture captured the later start")
 			}
@@ -3869,11 +4188,77 @@ func TestHandoffWakeFloor(t *testing.T) {
 			}
 		})
 	}
+	// h1: a compaction's rows are not a start. Its hook row, of any outcome,
+	// and its boundary row leave the receipt standing, with or without the
+	// hook's own stamp.
+	restored := func(t *testing.T, b *handoffBox, what string) {
+		t.Helper()
+		before := b.bytes("record.json")
+		status := b.must("status", "--task", b.helper.Task)
+		if !strings.Contains(status, "w1 restored: this session created its cron at") || !strings.Contains(status, "0 active wakes not restored now") {
+			t.Fatalf("%s: status; want w1 restored\n%s", what, status)
+		}
+		if out, err := b.run("wake", "confirm", "w1", "--task", b.helper.Task); err != nil || !strings.Contains(out, "wake w1 restored") || !strings.Contains(out, toolA) {
+			t.Fatalf("%s: confirm = %v, %q", what, err, out)
+		}
+		if !bytes.Equal(before, b.bytes("record.json")) {
+			t.Fatalf("%s: the record changed", what)
+		}
+	}
+	for _, row := range [][]string{{"compact_boundary"}, {"hook_success", "SessionStart:compact"}, {"hook_cancelled", "SessionStart:compact"}, {"hook_non_blocking_error", "SessionStart:compact"}} {
+		t.Run("a compaction row is not a start: "+strings.Join(row, " named "), func(t *testing.T) {
+			b := begin(t)
+			b.transcript(b.helper.Thread, b.now, row[0], row[1:]...)
+			b.now = b.now.Add(time.Minute)
+			restored(t, b, "after the row")
+		})
+	}
+	t.Run("a compaction keeps the receipt", func(t *testing.T) {
+		b := begin(t)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		// The case is real: the stamp, the hook row and the boundary row.
+		if start := b.record().Capture.Start; start.Detail != "compact" || start.Time != handoffStamped(b.now) {
+			t.Fatalf("the compaction was not captured: %+v", start)
+		}
+		transcript, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), ".claude", "projects", "-work-project", b.helper.Thread+".jsonl"))
+		if err != nil || !strings.Contains(string(transcript), `"hookName":"SessionStart:compact"`) || !strings.Contains(string(transcript), `"subtype":"compact_boundary"`) {
+			t.Fatalf("the fixture's transcript has no compaction rows: %v\n%s", err, transcript)
+		}
+		b.now = b.now.Add(time.Minute)
+		restored(t, b, "after a compaction")
+		// A new process after it is a resume or a restart: that still resets.
+		b.ps(handoffPSInteractive, b.now)
+		lost(t, b, "earlier-start")
+	})
+	// With only compactions left in the capture log for the session, no start
+	// is known to place a receipt after, and none counts.
+	t.Run("only compactions are captured for the session", func(t *testing.T) {
+		b := begin(t)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		var kept []string
+		for _, line := range strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n") {
+			if !strings.Contains(line, `"startup"`) {
+				kept = append(kept, line)
+			}
+		}
+		if len(kept) != 1 || !strings.Contains(kept[0], `"compact"`) || b.record().Capture.Start.Detail != "compact" {
+			t.Fatalf("the capture log without its startup rows is %q", kept)
+		}
+		if err := os.WriteFile(b.file("captures.jsonl"), []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		b.now = b.now.Add(time.Minute)
+		lost(t, b, "no-start-captured")
+	})
 	t.Run("a later start lost to a late hook", func(t *testing.T) {
 		b := begin(t)
 		start, lines := b.record().Capture.Start.Time, len(captureLines(t, b))
 		setToolLedger(t, &handoffDeadline, time.Nanosecond)
-		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "startup"}); r.err != nil {
 			t.Fatal(r.err)
 		}
 		if b.record().Capture.Start.Time != start || len(captureLines(t, b)) != lines {
@@ -4013,7 +4398,7 @@ var handoffValuePatterns = func() map[string]*regexp.Regexp {
 	for path, pattern := range map[string]string{
 		"at": stamp, "task": `tsk` + hex, "agent": `agt` + hex, "run": `run` + hex, "previousRun": `run` + hex, "registration": `ohr` + hex, "runtime": `claude|codex`, "session": uuid,
 		"steps[].name": `registration|wake-binding|hub-state|record`, "steps[].state": `restored|already-correct|not-restored`, "steps[].reason": reasons,
-		"hub.asOf": stamp, "hub.snapshotAsOf": stamp, "wakes[].id": `w[1-9][0-9]{0,8}`, "wakes[].state": `restored|asserted|not-restored|expired|cancelled`, "wakes[].reason": reasons,
+		"hub.asOf": stamp, "hub.snapshotAsOf": stamp, "wakes[].id": `w[1-9][0-9]{0,8}`, "wakes[].state": `restored|asserted|not-restored|expired|cancelled|done`, "wakes[].reason": reasons,
 	} {
 		patterns[path] = pattern
 	}
