@@ -2059,6 +2059,150 @@ func TestClaudeWakeSkipEscalatesOnce(t *testing.T) {
 	})
 }
 
+// Bug wi_b1959d28e4cb3905: on 2026-10-10 the skip report told a handler twice
+// that an agent's unread input was not reaching it, while that agent was in a
+// healthy long turn (last transcript event 10 s and 3 min 18 s old) and read
+// its inbox itself. The report now states the turn's age and the age of its
+// last transcript event, and says which case it is.
+func TestClaudeWakeSkipNoticeTurnAges(t *testing.T) {
+	prompt := "Tailterm messages #31579. Run tt inbox --unread --mark-read."
+	stamp := func(at time.Time) string { return at.UTC().Format(time.RFC3339Nano) }
+	userPrompt := func(at time.Time) string {
+		return `{"type":"user","timestamp":"` + stamp(at) + `","message":{"role":"user","content":"Start the work."}}`
+	}
+	toolUse := func(at time.Time, id string) string {
+		return `{"type":"assistant","timestamp":"` + stamp(at) + `","message":{"id":"msg_` + id + `","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"` + id + `","name":"Bash","input":{}}]}}`
+	}
+	toolResult := func(at time.Time, id string) string {
+		return `{"type":"user","timestamp":"` + stamp(at) + `","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"ok"}]}}`
+	}
+	// Claude Code writes these inside a turn with no timestamp of their own.
+	const untimed = `{"type":"mode","mode":"normal","sessionId":"11111111-1111-4111-8111-111111111111"}`
+	// run starts a turn at start, makes the first wake attempt wait later, and
+	// attempts every 15 seconds until the relay reports. each runs before
+	// every attempt and may append records.
+	run := func(t *testing.T, wait time.Duration, first []func(time.Time) string, each func(path string, start, now time.Time)) (claudeWakeSkip, string) {
+		t.Helper()
+		start := time.Date(2026, 10, 10, 3, 33, 35, 0, time.UTC)
+		b, transcript := claudeTranscriptFixture(t, "queue-idle", userPrompt(start))
+		for _, record := range first {
+			appendClaudeRecords(t, transcript, record(start))
+		}
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		now := start.Add(wait)
+		var sent []string
+		var reported []claudeWakeSkip
+		for len(reported) == 0 && now.Sub(start) < time.Hour {
+			if each != nil {
+				each(transcript, start, now)
+			}
+			ops := transcriptWakeOps(t, transcript, &now, &sent)
+			ops.escalate = func(_ context.Context, _ runtimeBinding, skip claudeWakeSkip) error {
+				reported = append(reported, skip)
+				return nil
+			}
+			if err := claudeWakeWith(context.Background(), b, prompt, ops); !errors.Is(err, errClaudeWakeUnsafe) || !strings.HasSuffix(err.Error(), ": turn in progress") {
+				t.Fatalf("busy turn not skipped: %v", err)
+			}
+			now = now.Add(15 * time.Second)
+		}
+		if len(reported) != 1 || len(sent) != 0 {
+			t.Fatalf("reports = %d, typed = %q; want one report and no input", len(reported), sent)
+		}
+		var saved claudeWakeSkip
+		data, _ := os.ReadFile(claudeWakeSkipPath(b))
+		if json.Unmarshal(data, &saved) != nil || !saved.TurnStartedAt.Equal(start) || saved.LastEventAt.IsZero() {
+			t.Fatalf("skip record lacks the turn's times: %s", data)
+		}
+		return reported[0], claudeSkipNoticeText(b, reported[0])
+	}
+	has := func(t *testing.T, text string, want, not []string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(text, w) {
+				t.Errorf("notice lacks %q: %s", w, text)
+			}
+		}
+		for _, n := range not {
+			if strings.Contains(text, n) {
+				t.Errorf("notice has %q: %s", n, text)
+			}
+		}
+	}
+
+	t.Run("a working turn is waiting, not stuck", func(t *testing.T) {
+		// One tool call a minute, as a lead waiting on its inbox writes.
+		last := time.Time{}
+		skip, text := run(t, 15*time.Second, nil, func(path string, start, now time.Time) {
+			if last.IsZero() || now.Sub(last) >= time.Minute {
+				id := fmt.Sprintf("toolu_%d", now.Unix())
+				appendClaudeRecords(t, path, toolUse(now.Add(-2*time.Second), id), toolResult(now.Add(-time.Second), id), untimed)
+				last = now
+			}
+		})
+		if !skip.LastEventAt.Equal(skip.LastAt.Add(-time.Second)) || skip.Tool != "" {
+			t.Fatalf("skip = %+v, want a last event one second before the report and no pending tool", skip)
+		}
+		has(t, text,
+			[]string{"since 2026-10-10T03:33:50Z", "turn in progress", "The turn began 10m15s ago and its last transcript event was 1s ago", "inside the 10m skip bound", "the agent is working", "waiting for the turn to end, not stuck", "No action is needed", "keeps trying"},
+			[]string{"looks stopped", "not reaching it", "Check the session", "wake it by hand"})
+	})
+	t.Run("a turn with no event for the bound looks stopped", func(t *testing.T) {
+		// The turn's last event is 30 seconds in. Records with no timestamp
+		// keep arriving and must not count as events.
+		skip, text := run(t, time.Minute, []func(time.Time) string{
+			func(start time.Time) string { return toolUse(start.Add(20*time.Second), "toolu_1") },
+			func(start time.Time) string { return toolResult(start.Add(30*time.Second), "toolu_1") },
+		}, func(path string, _, _ time.Time) { appendClaudeRecords(t, path, untimed) })
+		if skip.LastAt.Sub(skip.LastEventAt) != 10*time.Minute+30*time.Second {
+			t.Fatalf("skip = %+v, want a last event 10m30s before the report", skip)
+		}
+		has(t, text,
+			[]string{"The turn began 11m0s ago and its last transcript event was 10m30s ago", "at or past the 10m skip bound, so the turn looks stopped.", "Its unread input is not reaching it. Check the session, or wake it by hand.", "keeps trying"},
+			[]string{"not stuck", "is working", "No action is needed", "long tool call"})
+	})
+	t.Run("a stopped turn with a tool call still out names it", func(t *testing.T) {
+		skip, text := run(t, time.Minute, []func(time.Time) string{
+			func(start time.Time) string { return toolUse(start.Add(30*time.Second), "toolu_1") },
+		}, nil)
+		if skip.Tool != "Bash" {
+			t.Fatalf("skip = %+v, want the pending Bash call", skip)
+		}
+		has(t, text,
+			[]string{"its last transcript event was 10m30s ago", "so the turn looks stopped, or is inside one long tool call (Bash), which writes nothing until it returns.", "Check the session, or wake it by hand."},
+			[]string{"not stuck", "No action is needed"})
+	})
+	t.Run("the bound itself counts as stopped; other reasons keep the plain text", func(t *testing.T) {
+		b := testClaudeBinding()
+		at := time.Date(2026, 10, 10, 3, 45, 12, 0, time.UTC)
+		skip := claudeWakeSkip{Run: b.Run, Reason: claudeTurnBusyReason, Since: at.Add(-claudeWakeSkipBound), LastAt: at, TurnStartedAt: at.Add(-20 * time.Minute)}
+		skip.LastEventAt = at.Add(-claudeWakeSkipBound + time.Second)
+		has(t, claudeSkipNoticeText(b, skip), []string{"its last transcript event was 9m59s ago", "not stuck"}, []string{"looks stopped"})
+		skip.LastEventAt = at.Add(-claudeWakeSkipBound)
+		has(t, claudeSkipNoticeText(b, skip), []string{"its last transcript event was 10m0s ago", "looks stopped"}, []string{"not stuck"})
+
+		// A dialog is not a turn: no times are kept and none are stated.
+		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+		var got []claudeWakeSkip
+		now := at
+		ops := claudeWakeOps{now: func() time.Time { return now }, escalate: func(_ context.Context, _ runtimeBinding, skip claudeWakeSkip) error {
+			got = append(got, skip)
+			return nil
+		}}
+		for i := 0; i < 3; i++ { // five minutes apart, inside claudeWakeSkipGap
+			claudeWakeTrackSkip(context.Background(), b, ops, fmt.Errorf("%w: Claude pane has a permission or selection prompt", errClaudeWakeUnsafe))
+			now = now.Add(claudeWakeSkipBound / 2)
+		}
+		if len(got) != 1 || !got[0].TurnStartedAt.IsZero() || !got[0].LastEventAt.IsZero() {
+			t.Fatalf("dialog skip = %+v, want one report with no turn times", got)
+		}
+		want := "The relay has skipped every wake to agent " + b.Agent + " (run " + b.Run + ", tmux session " + b.Session + ") since 2026-10-10T03:45:12Z, always for the same reason: Claude pane has a permission or selection prompt. Its unread input is not reaching it. Check the session, or wake it by hand. The relay sends this once for this reason and keeps trying."
+		if text := claudeSkipNoticeText(b, got[0]); text != want {
+			t.Fatalf("plain notice changed:\n got %s\nwant %s", text, want)
+		}
+	})
+}
+
 // a2: against an isolated hub that requires its token, as production does,
 // the escalation is exactly one notice to the database handler. When the
 // skipped agent is that handler it goes to the owner helper, and with neither

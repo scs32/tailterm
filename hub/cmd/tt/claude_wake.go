@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -411,7 +412,35 @@ type claudeTranscriptState struct {
 	unknownReason string
 	unknownTypes  []string
 	records       int
+	// lastEventAt is the timestamp of the last record that carries one, and
+	// turnStartAt that of the prompt that began the current turn. The cursor's
+	// LastEventAt is not used for these: Claude Code writes records with no
+	// timestamp inside a turn (last-prompt, mode, ai-title), and the cursor
+	// gives those the time they were read.
+	lastEventAt time.Time
+	turnStartAt time.Time
 }
+
+// claudeTimestampKey marks a record that carries its own timestamp.
+var claudeTimestampKey = []byte(`"timestamp":"`)
+
+// claudeTurnBusyReason is the idle check's refusal for a turn still running.
+const claudeTurnBusyReason = "Claude transcript busy, incomplete, or unknown: turn in progress"
+
+// claudeTurnBusyError is that refusal with what the transcript shows of the
+// turn: when its prompt arrived, when its last record was written, and a tool
+// call that has not returned (a running tool writes nothing). The skip report
+// uses them to tell a working turn from one that stopped writing
+// (claudeSkipNoticeText). Before bug wi_b1959d28e4cb3905 the report had only
+// the reason, and on 2026-10-10 it told a handler twice that a healthy long
+// turn could not be reached.
+type claudeTurnBusyError struct {
+	TurnStartAt time.Time
+	LastEventAt time.Time
+	Tool        string
+}
+
+func (claudeTurnBusyError) Error() string { return claudeTurnBusyReason }
 
 // claudeTranscriptCache keeps that place per run for the life of this relay
 // process, so a check reads only the records appended since the last one. It
@@ -466,6 +495,9 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 			st.records++
 			err := parseClaudeActivity(line, cursor)
 			var unknown unknownClaudeRecordError
+			if (err == nil || errors.As(err, &unknown)) && bytes.Contains(line, claudeTimestampKey) {
+				st.lastEventAt = cursor.LastEventAt
+			}
 			if errors.As(err, &unknown) {
 				kind := claudeClip(unknown.Type, 64)
 				if !slices.Contains(st.unknownTypes, kind) {
@@ -483,6 +515,9 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 				// A later fully completed turn supersedes an older malformed
 				// record. Malformed data after that boundary still blocks input.
 				st.strictUnknown, st.unknownReason = false, ""
+			} else if cursor.SeenTurn && !cursor.TurnComplete && claudeUserText(line) != "" {
+				// The same test parseClaudeActivity uses to start a turn.
+				st.turnStartAt = st.lastEventAt
 			}
 			return err
 		}); err != nil {
@@ -534,6 +569,13 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 		reason = unknownReason
 	case cursor.Unknown:
 		reason = "transcript format unknown"
+	}
+	if reason == "turn in progress" {
+		busy := claudeTurnBusyError{TurnStartAt: st.turnStartAt, LastEventAt: st.lastEventAt}
+		if ids := slices.Sorted(maps.Keys(cursor.Pending)); len(ids) != 0 {
+			busy.Tool = cursor.Pending[ids[0]].Name
+		}
+		return claudeWakeSnapshot{}, busy
 	}
 	if reason != "" {
 		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", reason)
@@ -962,6 +1004,12 @@ type claudeWakeSkip struct {
 	EscalatedAt time.Time `json:"escalatedAt,omitempty"`
 	// TriedAt is the last report attempt, successful or not.
 	TriedAt time.Time `json:"triedAt,omitempty"`
+	// TurnStartedAt, LastEventAt and Tool describe the turn at the latest
+	// skip, when the reason is a turn in progress (claudeTurnBusyError); zero
+	// for every other reason.
+	TurnStartedAt time.Time `json:"turnStartedAt,omitempty"`
+	LastEventAt   time.Time `json:"lastEventAt,omitempty"`
+	Tool          string    `json:"tool,omitempty"`
 }
 
 const (
@@ -994,8 +1042,11 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 // turn, a pending tool, a dialog, an unreadable transcript. A confirmed wake
 // ends the episode; an unconfirmed one has its own retry and stuck reporting
 // and leaves the episode as it is. A changed reason starts a new episode, so
-// an agent that moves between tools is working, not reported. A failed report
-// is tried again at most once a minute, under the same request identity.
+// an agent that moves between tools is working, not reported. A turn in
+// progress is one reason for the whole turn, whatever tools it runs, so the
+// record also keeps that turn's start and last transcript event for the
+// report to state. A failed report is tried again at most once a minute,
+// under the same request identity.
 func claudeWakeTrackSkip(ctx context.Context, b runtimeBinding, ops claudeWakeOps, wakeErr error) {
 	path := claudeWakeSkipPath(b)
 	if wakeErr == nil {
@@ -1015,6 +1066,9 @@ func claudeWakeTrackSkip(ctx context.Context, b runtimeBinding, ops claudeWakeOp
 		skip = claudeWakeSkip{Run: b.Run, Reason: reason, Since: now}
 	}
 	skip.LastAt = now
+	var busy claudeTurnBusyError
+	_ = errors.As(wakeErr, &busy)
+	skip.TurnStartedAt, skip.LastEventAt, skip.Tool = busy.TurnStartAt.UTC(), busy.LastEventAt.UTC(), claudeClip(busy.Tool, 64)
 	if skip.EscalatedAt.IsZero() && now.Sub(skip.Since) >= claudeWakeSkipBound && ops.escalate != nil && (skip.TriedAt.IsZero() || now.Sub(skip.TriedAt) >= claudeWakeEscalateRetry) {
 		skip.TriedAt = now
 		if err := ops.escalate(ctx, b, skip); err != nil {
@@ -1069,11 +1123,36 @@ func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWake
 	to := claudeEscalationRecipient(agents, b.Agent)
 	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: "The relay cannot wake a Claude agent that has unread input",
 		Refs: map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session},
-		Body: api.EnvelopeBody{Text: fmt.Sprintf("The relay has skipped every wake to agent %s (run %s, tmux session %s) since %s, always for the same reason: %s. Its unread input is not reaching it. Check the session, or wake it by hand. The relay sends this once for this reason and keeps trying.",
-			b.Agent, b.Run, b.Session, skip.Since.Format(time.RFC3339), skip.Reason)}}
+		Body: api.EnvelopeBody{Text: claudeSkipNoticeText(b, skip)}}
 	key := fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(b.Run, "run_"), skip.Since.Unix())
 	_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: key})
 	return err
+}
+
+// claudeSkipNoticeText is the body of the skip report. For a turn in progress
+// it states the turn's age and the age of its last transcript event, both at
+// the latest skip. An event newer than claudeWakeSkipBound means the agent is
+// working: the wake is waiting for the turn to end, not stuck. An event that
+// old or older means the turn looks stopped, or, when a tool call has not
+// returned, is inside one long tool call. Every other reason, and a turn
+// whose times are not known, keeps the plain text.
+func claudeSkipNoticeText(b runtimeBinding, skip claudeWakeSkip) string {
+	head := fmt.Sprintf("The relay has skipped every wake to agent %s (run %s, tmux session %s) since %s, always for the same reason: %s.",
+		b.Agent, b.Run, b.Session, skip.Since.Format(time.RFC3339), skip.Reason)
+	const act, once = " Its unread input is not reaching it. Check the session, or wake it by hand.", " The relay sends this once for this reason and keeps trying."
+	if skip.TurnStartedAt.IsZero() || skip.LastEventAt.IsZero() || skip.LastAt.IsZero() {
+		return head + act + once
+	}
+	age := func(t time.Time) string { return max(0, skip.LastAt.Sub(t)).Round(time.Second).String() }
+	ages := fmt.Sprintf(" The turn began %s ago and its last transcript event was %s ago", age(skip.TurnStartedAt), age(skip.LastEventAt))
+	bound := strings.TrimSuffix(claudeWakeSkipBound.String(), "0s")
+	switch {
+	case skip.LastAt.Sub(skip.LastEventAt) < claudeWakeSkipBound:
+		return head + ages + fmt.Sprintf(", inside the %s skip bound, so the agent is working: the wake is waiting for the turn to end, not stuck. It is delivered when the turn ends, unless the agent reads its inbox itself first. No action is needed.", bound) + once
+	case skip.Tool != "":
+		return head + ages + fmt.Sprintf(", at or past the %s skip bound, so the turn looks stopped, or is inside one long tool call (%s), which writes nothing until it returns.", bound, skip.Tool) + act + once
+	}
+	return head + ages + fmt.Sprintf(", at or past the %s skip bound, so the turn looks stopped.", bound) + act + once
 }
 
 // claudeEscalationRecipient picks who hears that agent skipped cannot be
@@ -1124,7 +1203,8 @@ func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops
 	}
 	first, cleared, err := claudeWakeEmpty(ctx, b, ops, "", "")
 	if err != nil {
-		return fmt.Errorf("%w: %v", errClaudeWakeUnsafe, err)
+		// Both are wrapped so the skip record can read a busy turn's times.
+		return fmt.Errorf("%w: %w", errClaudeWakeUnsafe, err)
 	}
 	if !emptyClaudeInput(first.Screen) || !claudeWakeIdle(first, ops.now()) {
 		return errClaudeWakeUnsafe
