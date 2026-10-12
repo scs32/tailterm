@@ -1278,8 +1278,10 @@ func TestToolScopeAppendDeadline(t *testing.T) {
 
 // a7: the added cost of the check per PreToolUse, measured against the same
 // hook with the check replaced by nothing, by the method of TestToolDenyCost.
-// Every run with the check returns before the hook's deadline with its row
-// already written.
+// Every run with the check that returns before the earlier of the path
+// scan's budget and the hook's deadline has its row already written. A run
+// that took longer is put down to a stalled host and run again, at most
+// three times, and a case allows ten such attempts in all.
 //
 // The 5 ms limit is for the binary that ships. Under the race detector the
 // hook's own decode of a 1 MiB input takes over 100 ms before the check
@@ -1335,8 +1337,13 @@ func TestToolScopeCost(t *testing.T) {
 			// (docs/claude-wake.md), so it is put down to a stalled host and
 			// run again as a new agent. Stalls come in bursts (the hook blocked
 			// in a file system call), so each new attempt waits first.
+			//
+			// A check that is itself slow must still fail, so the stalled
+			// attempts of a case are capped as well. On the Mini at load 5 to
+			// 7, 200 counts of the 1 MiB case had at most 6 in one count, and
+			// 145 counts had none.
 			stall := min(toolLedgerDeadline, toolRedactScanBudget)
-			const attempts = 3
+			const attempts, maxStalled = 3, 10
 			for i := 0; i < 2*runs; i++ {
 				// Alternate, and swap which goes first each pair.
 				check := (i+i/2)%2 == 0
@@ -1367,6 +1374,9 @@ func TestToolScopeCost(t *testing.T) {
 						if attempt == attempts {
 							t.Fatalf("run %d took %v or longer %d times in a row; a stalled host does not explain that", i, stall, attempts)
 						}
+						if late > maxStalled {
+							t.Fatalf("%d attempts in %d runs took %v or longer; at most %d are put down to a stalled host", late, runs, stall, maxStalled)
+						}
 						time.Sleep(time.Duration(attempt) * time.Second)
 						continue
 					default:
@@ -1380,7 +1390,7 @@ func TestToolScopeCost(t *testing.T) {
 				}
 			}
 			if late > 0 {
-				t.Logf("%d run(s) with the check were put down to a stalled host and run again", late)
+				t.Logf("%d attempt(s) with the check were put down to a stalled host and run again; the cap is %d", late, maxStalled)
 			}
 			base, checked := toolDenyMedian(without), toolDenyMedian(with)
 			t.Logf("%d-byte input: baseline median %v, with the check %v, added %v, worst run with the check %v", len(payload), base, checked, checked-base, worst)
