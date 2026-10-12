@@ -194,6 +194,8 @@ One obligation per (message, recipient). States:
 | progress silence | 30 min in `acknowledged`/`working` without progress | nudge recipient; after 2 nudges escalate to lead |
 | outcome due | `due`, or 2 h for assign/review, 30 min for question | escalate to lead |
 | lead escalation unanswered | 15 min | escalate to owner (Discord) |
+| helper watch ([stall-watch.md](stall-watch.md)) | 20 min with no post and no `working` report while the owner helper owes the owner | one owner ping per episode; from 22:00 to 07:00 Pacific a channel line, then one ping at 07:00 if still open |
+| team watch ([stall-watch.md](stall-watch.md)) | 30 min with no post, no `working` report and no matrix wait from a running queue entry's team | one notice per episode to the owner helper, or to the owner when the helper is quiet, offline or absent |
 
 - **A block that waits on a queued fix never reaches the owner.** When an
   obligation is `blocked` and its holder's latest BLOCK reply links an item

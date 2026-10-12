@@ -4,7 +4,8 @@
 // when the recipient is gone. A restarted hub makes the same decisions, so a
 // deadline missed during downtime fires once rather than once per missed tick.
 // A Tick also runs the team queue's shared-path wait sweep
-// (docs/project-queue.md, "Team queue shared-path waits").
+// (docs/project-queue.md, "Team queue shared-path waits") and the stall
+// watch sweep (docs/stall-watch.md).
 package broker
 
 import (
@@ -30,7 +31,7 @@ type Step struct {
 	ObligationID string
 	MessageSeq   int64
 	WindowID     string // delegation-expired only
-	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent, wait-met, wait-overdue, wait-orphaned
+	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent, wait-met, wait-overdue, wait-orphaned, helper-quiet, helper-quiet-ping, team-quiet, team-quiet-ping
 }
 
 func wakesDue(o store.BrokerObligation, now time.Time) int {
@@ -78,6 +79,16 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 	waits, err := b.Store.QueueWaitSweep(ctx, now)
 	for _, w := range waits {
 		steps = append(steps, Step{TaskID: w.TaskID, MessageSeq: w.MessageSeq, Action: w.Action})
+	}
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// The stall watch: one notice per episode when the owner helper is quiet
+	// while it owes the owner, or a running entry's team is quiet. It alerts
+	// only and changes no agent, queue or work-item state.
+	quiet, err := b.Store.StallWatchSweep(ctx, now)
+	for _, q := range quiet {
+		steps = append(steps, Step{TaskID: q.TaskID, MessageSeq: q.MessageSeq, Action: q.Action})
 	}
 	if err != nil && firstErr == nil {
 		firstErr = err
@@ -204,7 +215,7 @@ func (b *Broker) Start(ctx context.Context) <-chan struct{} {
 				for _, s := range steps {
 					if s.Action == "delegation-expired" {
 						b.Log("broker: %s %s", s.Action, s.WindowID)
-					} else if s.Action == "deployer-silent" || strings.HasPrefix(s.Action, "wait-") {
+					} else if s.Action == "deployer-silent" || strings.HasPrefix(s.Action, "wait-") || strings.HasPrefix(s.Action, "helper-quiet") || strings.HasPrefix(s.Action, "team-quiet") {
 						b.Log("broker: %s %s message %d", s.Action, s.TaskID, s.MessageSeq)
 					} else if s.Action != "wake" {
 						b.Log("broker: %s %s message %d", s.Action, s.ObligationID, s.MessageSeq)

@@ -1184,3 +1184,135 @@ func TestBrokerTickWithoutAWaitPostsNothing(t *testing.T) {
 		t.Fatalf("%d new messages and %d wait rows without a wait", after-before, rows)
 	}
 }
+
+// a8 (wi_fa5f10477f93c57d): a Tick runs the stall watch sweep once and
+// returns one step per notice it posted; a sweep error is kept as the first
+// error and the obligation pass still runs.
+func TestBrokerTickRunsStallWatchSweep(t *testing.T) {
+	// 22:30 Pacific, so the first notices are night lines and 07:00 pings.
+	start := time.Date(2026, 10, 13, 5, 30, 0, 0, time.UTC)
+	sevenAM := time.Date(2026, 10, 13, 14, 0, 0, 0, time.UTC)
+	setup := func(t *testing.T, at time.Time) (*fixture, *sql.DB, api.Agent) {
+		t.Helper()
+		f := newFixture(t)
+		f.st.SetClockForTest(func() time.Time { return at })
+		out, err := f.st.RegisterOwnerHelper(f.ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-host", Session: "owner", Runtime: "claude", Cwd: "/work/tailterm", RequestID: "stall-helper"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The owner asks the helper for something; the helper stays silent.
+		if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{To: out.Agent.ID, Text: "Owner asks the helper for a status"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", f.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return f, db, *out.Agent
+	}
+	stall := func(t *testing.T, f *fixture, at time.Time) []Step {
+		t.Helper()
+		steps, err := (&Broker{Store: f.st}).Tick(f.ctx, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []Step
+		for _, s := range steps {
+			if strings.HasPrefix(s.Action, "helper-quiet") || strings.HasPrefix(s.Action, "team-quiet") {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	actions := func(steps []Step) (out []string) {
+		for _, s := range steps {
+			out = append(out, s.Action)
+		}
+		return out
+	}
+	t.Run("one step per notice", func(t *testing.T) {
+		f, db, _ := setup(t, start)
+		// A running queue entry whose one member, the builder, is silent. The
+		// rows go into this test's own database file.
+		item, err := f.st.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Quiet team", RequestID: "stall-item"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		at := start.Format(time.RFC3339Nano)
+		for _, stmt := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,created_at,updated_at,admitted_at) VALUES('tqe_stall',?,?,1,1,'planned',1,'running',?,?,?)`, []any{f.task.ID, item.ID, at, at, at}},
+			{`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,1,0,'digest','{}',?)`,
+				[]any{f.builder.ID, f.builder.RunID, f.task.ID, item.ID, f.task.ID, at}},
+		} {
+			if _, err := db.Exec(stmt.query, stmt.args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want(t, "19 minutes", actions(stall(t, f, start.Add(19*time.Minute))))
+		night := stall(t, f, start.Add(30*time.Minute))
+		want(t, "23:00", actions(night), "helper-quiet", "team-quiet")
+		want(t, "23:00 again", actions(stall(t, f, start.Add(30*time.Minute))))
+		want(t, "06:59", actions(stall(t, f, sevenAM.Add(-time.Minute))))
+		day := stall(t, f, sevenAM)
+		want(t, "07:00", actions(day), "helper-quiet-ping", "team-quiet-ping")
+		want(t, "07:00 again", actions(stall(t, f, sevenAM)))
+		// Each step names the notice it posted.
+		msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		notices := map[int64]*api.Envelope{}
+		for _, m := range msgs {
+			if m.From.Node == api.BrokerNode && m.Envelope != nil && m.Envelope.Refs["stallWatch"] != "" {
+				notices[m.Seq] = m.Envelope
+			}
+		}
+		if len(notices) != 4 {
+			t.Fatalf("%d stall watch notices, want 4", len(notices))
+		}
+		for i, s := range append(night, day...) {
+			env := notices[s.MessageSeq]
+			escalation := "lead"
+			if i >= 2 {
+				escalation = "owner"
+			}
+			if env == nil || s.TaskID != f.task.ID || env.Refs["escalation"] != escalation || !strings.HasPrefix(s.Action, env.Refs["stallWatch"]+"-quiet") {
+				t.Fatalf("step %+v does not name its notice %+v", s, env)
+			}
+		}
+	})
+	t.Run("a paused project returns none", func(t *testing.T) {
+		f, db, _ := setup(t, start.Add(14*time.Hour)) // 12:30 Pacific
+		at := start.Add(14*time.Hour + 20*time.Minute)
+		if _, err := db.Exec(`UPDATE tasks SET pause_state='paused' WHERE id=?`, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+		want(t, "paused", actions(stall(t, f, at)))
+		if _, err := db.Exec(`UPDATE tasks SET pause_state='active' WHERE id=?`, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+		want(t, "active again", actions(stall(t, f, at)), "helper-quiet")
+	})
+	t.Run("a sweep error is the first error and obligations still run", func(t *testing.T) {
+		f, db, _ := setup(t, start.Add(14*time.Hour))
+		o := f.assign(t, "")
+		if _, err := db.Exec(`ALTER TABLE stall_watch_episodes RENAME TO stall_watch_episodes_gone`); err != nil {
+			t.Fatal(err)
+		}
+		steps, err := (&Broker{Store: f.st}).Tick(f.ctx, start.Add(14*time.Hour+2*time.Minute))
+		if err == nil || !strings.Contains(err.Error(), "stall watch sweep") {
+			t.Fatalf("tick error %v, want the stall watch sweep's", err)
+		}
+		var woke bool
+		for _, s := range steps {
+			woke = woke || (s.ObligationID == o.ID && s.Action == "wake")
+		}
+		if !woke {
+			t.Fatalf("the obligation pass did not run: %+v", steps)
+		}
+	})
+}

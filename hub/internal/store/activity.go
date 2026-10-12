@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS agent_activity_receipts (
 	if err := migrateOwnerHelper(db); err != nil {
 		return err
 	}
-	return migrateProviderBlock(db)
+	if err := migrateProviderBlock(db); err != nil {
+		return err
+	}
+	return migrateStallWatch(db)
 }
 
 func validActivity(a api.AgentActivity) bool {
@@ -148,6 +151,9 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 		return zero, err
 	}
 	if err := s.providerBlockHook(ctx, tx, task, agent, run, report.Activity); err != nil {
+		return zero, err
+	}
+	if err := s.stallWatchActivityHook(ctx, tx, task, agent, run, oldState, report.Activity); err != nil {
 		return zero, err
 	}
 	if err = tx.Commit(); err != nil {
