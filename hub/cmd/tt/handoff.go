@@ -203,7 +203,12 @@ type handoffStamp struct {
 }
 
 type handoffCapture struct {
-	Start   *handoffStamp `json:"start,omitempty"`
+	Start *handoffStamp `json:"start,omitempty"`
+	// Began is the last start stamped to the record whose source is not a
+	// compaction. A compaction's stamp replaces Start, so without Began the
+	// session's real start would be found only in the capture log, which
+	// rotates.
+	Began   *handoffStamp `json:"began,omitempty"`
 	Compact *handoffStamp `json:"compact,omitempty"`
 	End     *handoffStamp `json:"end,omitempty"`
 	// Open is true from a session start until the next session end. The
@@ -581,7 +586,7 @@ func (r handoffRecord) valid() bool {
 	for _, c := range []struct {
 		stamp *handoffStamp
 		list  []string
-	}{{r.Capture.Start, handoffStartSources}, {r.Capture.Compact, handoffTriggers}, {r.Capture.End, handoffEndReasons}} {
+	}{{r.Capture.Start, handoffStartSources}, {r.Capture.Began, handoffStartSources}, {r.Capture.Compact, handoffTriggers}, {r.Capture.End, handoffEndReasons}} {
 		if s := c.stamp; s != nil && (!handoffTimeOK(s.Time) || s.Detail != handoffOther && !handoffIn(s.Detail, c.list) || s.Session != "" && !threadIDPattern.MatchString(s.Session)) {
 			return false
 		}
@@ -1570,6 +1575,20 @@ func (s handoffStore) stamp(helper ownerHelperFile, event string, stamp handoffS
 		}
 		return r, noEnd, nil
 	}
+	if event == "SessionStart" {
+		// Began keeps the session's last start that is not a compaction. A
+		// record written before Began existed gives it its Start at the
+		// session's next compaction, when that Start is still a real one.
+		c := &r.Capture
+		if stamp.Detail != handoffCompactSource {
+			began := stamp
+			c.Began = &began
+		} else if old := c.Start; old != nil && old.Detail != handoffCompactSource && stamp.Session != "" && old.Session == stamp.Session &&
+			(c.Began == nil || c.Began.Session != stamp.Session) {
+			began := *old
+			c.Began = &began
+		}
+	}
 	*slot(&r.Capture) = &stamp
 	switch event {
 	case "SessionStart":
@@ -1746,7 +1765,12 @@ func handoffNote(r handoffRecord, match string, noEnd bool, now time.Time) strin
 		fmt.Fprintf(&header, "The host file names this session as the owner helper. The hub was not asked; `tt helper env --task %s` verifies it.\n", id.Task)
 	}
 	if s := r.Snapshot; s != nil && handoffIn(s.HelperStatus, []string{api.AgentRetired, api.AgentClosed, api.AgentExited}) {
-		fmt.Fprintf(&header, "The helper was %s on the hub at %s.\n", s.HelperStatus, s.AsOf)
+		// The snapshot's own 12-hour rule: an older one says how old it is.
+		at := s.AsOf
+		if age, stale := handoffAge(s.AsOf, now); stale {
+			at += " (" + age + "; stale)"
+		}
+		fmt.Fprintf(&header, "The helper was %s on the hub at %s.\n", s.HelperStatus, at)
 	}
 	if noEnd {
 		header.WriteString("No end was recorded for the previous session.\n")
@@ -2494,8 +2518,25 @@ var handoffReasons = map[string]string{
 // resets them, a compaction does not"), so a receipt from before it still
 // counts. A start of every other source counts, an unlisted one included, so
 // a startup, a clear, a resume or a fork puts every earlier receipt before it.
+// The record's kept start (Began) is read as well, so after a compaction the
+// answer does not depend on the capture log.
 func (s handoffStore) latestStart(r handoffRecord, session string) (handoffStamp, bool) {
+	start, found, _ := s.captured(r, session)
+	return start, found
+}
+
+// captured reads the record and the capture log once for one runtime session:
+// its latest start as latestStart describes it, and the time of its latest
+// captured SessionEnd, empty when there is none. The end is returned apart
+// from the start and never folded into the stamp: restore stores the start.
+func (s handoffStore) captured(r handoffRecord, session string) (handoffStamp, bool, string) {
 	var latest handoffStamp
+	end := ""
+	ended := func(stamp handoffStamp) {
+		if strings.EqualFold(stamp.Session, session) && handoffTimeOK(stamp.Time) && stamp.Time > end {
+			end = stamp.Time
+		}
+	}
 	found := false
 	consider := func(stamp handoffStamp) {
 		if !strings.EqualFold(stamp.Session, session) || !handoffTimeOK(stamp.Time) || stamp.Detail != handoffOther && !handoffIn(stamp.Detail, handoffStartSources) {
@@ -2511,6 +2552,12 @@ func (s handoffStore) latestStart(r handoffRecord, session string) (handoffStamp
 	if r.Capture.Start != nil {
 		consider(*r.Capture.Start)
 	}
+	if r.Capture.Began != nil {
+		consider(*r.Capture.Began)
+	}
+	if r.Capture.End != nil {
+		ended(*r.Capture.End)
+	}
 	for _, name := range []string{"captures.jsonl.1", "captures.jsonl"} {
 		path := s.path(name)
 		handoffTouch(path)
@@ -2524,21 +2571,37 @@ func (s handoffStore) latestStart(r handoffRecord, session string) (handoffStamp
 			var row struct {
 				Time, Event, Detail, Session string
 			}
-			if json.Unmarshal(lines.Bytes(), &row) == nil && row.Event == "SessionStart" {
-				consider(handoffStamp{Time: row.Time, Detail: row.Detail, Session: strings.ToLower(row.Session)})
+			if json.Unmarshal(lines.Bytes(), &row) != nil {
+				continue
+			}
+			switch stamp := (handoffStamp{Time: row.Time, Detail: row.Detail, Session: strings.ToLower(row.Session)}); row.Event {
+			case "SessionStart":
+				consider(stamp)
+			case "SessionEnd":
+				ended(stamp)
 			}
 		}
 		_ = f.Close()
 	}
-	return latest, found
+	return latest, found, end
 }
 
 // sessionStart is the start a wake receipt is judged against for one Claude
 // Code session: the latest captured start, moved up to the session's floor
 // when that is later. unknown is the reason the floor could not be read; no
 // receipt counts then. Another runtime has no session timer and is not read.
+//
+// A captured end of the session that is later than its latest start moves the
+// start up to that end: a session that ended and is asking again has started
+// again since, whether or not that start left a stamp, a transcript row or a
+// new process (a resume inside a running Claude Code process leaves none when
+// its hook is lost). It only ever raises the start, so it cannot make a
+// receipt count that did not.
 func (s handoffStore) sessionStart(r handoffRecord, runtime, session string) (start handoffStamp, started bool, unknown string) {
-	start, started = s.latestStart(r, session)
+	start, started, end := s.captured(r, session)
+	if started && end > start.Time {
+		start.Time = end
+	}
 	if runtime != "claude" {
 		return start, started, ""
 	}
@@ -3414,7 +3477,8 @@ func handoffRestoreCommand(e env, args []string) error {
 		r.refreshIdentity(current)
 		detail := "identity copied from the helper file; no start was captured for this session, so the last start stamp is left as it was"
 		if start, ok := store.latestStart(handoffRecord{}, thread); ok {
-			r.Capture.Start, r.Capture.Open = &start, true
+			began := start
+			r.Capture.Start, r.Capture.Began, r.Capture.Open = &start, &began, true
 			detail = "identity copied from the helper file; this session's start of " + start.Time + " is now the last start"
 		}
 		if err := store.save(r, previous); err != nil {

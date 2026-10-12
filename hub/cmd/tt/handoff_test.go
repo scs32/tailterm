@@ -4104,6 +4104,69 @@ func TestHandoffAge(t *testing.T) {
 	}
 }
 
+// s3: the note header's line for a helper that was retired, closed or exited
+// follows the snapshot's 12-hour rule: up to 12 hours it is the plain line,
+// and past that it carries the snapshot's age and the word stale.
+func TestHandoffRetiredLine(t *testing.T) {
+	b := newHandoffBox(t)
+	b.on()
+	b.asHelper()
+	start := map[string]any{"source": "startup"}
+	if r := b.hook("SessionStart", b.helper.Thread, start); r.err != nil {
+		t.Fatal(r.err)
+	}
+	taken := b.now
+	stamp := handoffStamped(taken)
+	note := func(status string, after time.Duration, candidate bool) string {
+		t.Helper()
+		b.now = taken.Add(after)
+		record := b.record()
+		record.Identity.CopiedAt = handoffStamped(b.now)
+		record.Snapshot = &handoffSnapshot{AsOf: stamp, HelperStatus: status, Obligations: []handoffObligation{}, Decisions: []handoffDecision{}, Queue: []handoffQueueRow{}}
+		b.save(record)
+		session := b.helper.Thread
+		if candidate {
+			session = handoffOtherID
+		}
+		r := b.hook("SessionStart", session, start)
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		requireNote(t, b, r.out, candidate)
+		if len(r.out) > handoffNoteBytes {
+			t.Fatalf("the note is %d bytes", len(r.out))
+		}
+		return r.out
+	}
+	cases := []struct {
+		after time.Duration
+		age   string
+	}{{3 * time.Hour, ""}, {12 * time.Hour, ""}, {12*time.Hour + time.Second, " (12 hours old; stale)"}, {4*24*time.Hour + 5*time.Hour, " (4 days old; stale)"}, {-time.Minute, " (age unknown; stale)"}}
+	for _, candidate := range []bool{false, true} {
+		if candidate {
+			b.asCandidate()
+		}
+		for _, c := range cases {
+			for _, status := range []string{api.AgentRetired, api.AgentClosed, api.AgentExited} {
+				out := note(status, c.after, candidate)
+				header, _, _ := strings.Cut(out, "\n\n")
+				want := "\nThe helper was " + status + " on the hub at " + stamp + c.age + ".\n"
+				if !strings.Contains(out, want) || strings.Count(out, "The helper was ") != 1 {
+					t.Fatalf("candidate %v, %s after %s: the note lacks %q:\n%s", candidate, status, c.after, want, out)
+				}
+				if stale := strings.Contains(header, "; stale)"); stale != (c.age != "") {
+					t.Fatalf("candidate %v, %s after %s: stale in the header is %v:\n%s", candidate, status, c.after, stale, out)
+				}
+			}
+			for _, status := range []string{api.AgentRunning, api.AgentDone, api.AgentNeedsInput} {
+				if out := note(status, c.after, candidate); strings.Contains(out, "The helper was ") {
+					t.Fatalf("candidate %v, %s after %s: the note has a line for a helper that is not gone:\n%s", candidate, status, c.after, out)
+				}
+			}
+		}
+	}
+}
+
 // r2: the real interactive session restores when ps shows its program as the
 // versioned binary the claude link points to, as on the Mini.
 func TestHandoffRestoreVersionedBinary(t *testing.T) {
@@ -4251,6 +4314,11 @@ func TestHandoffWakeFloor(t *testing.T) {
 		if err := os.WriteFile(b.file("captures.jsonl"), []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
+		// The record's kept start is cleared too, as in a record that had
+		// compacted before it was kept.
+		record := b.record()
+		record.Capture.Began = nil
+		b.save(record)
 		b.now = b.now.Add(time.Minute)
 		lost(t, b, "no-start-captured")
 	})
@@ -4354,6 +4422,359 @@ func TestHandoffWakeFloor(t *testing.T) {
 		}
 		requireHandoffValues(t, b.bytes("restore.json"))
 	})
+
+	// s1: the record keeps the session's last start that is not a compaction,
+	// so a compaction's stamp no longer leaves it to the capture log alone.
+	store := func(t *testing.T, b *handoffBox) handoffStore {
+		t.Helper()
+		s, ok := handoffStoreFor(b.helper.Agent, time.Second)
+		if !ok {
+			t.Fatal("no store")
+		}
+		return s
+	}
+	// logged is whether either capture file holds the text.
+	logged := func(b *handoffBox, text string) bool {
+		return bytes.Contains(b.bytes("captures.jsonl"), []byte(text)) || bytes.Contains(b.bytes("captures.jsonl.1"), []byte(text))
+	}
+	// rotate makes every later capture line rotate the log, and out sends two
+	// lines after the rows now in it, so that neither file still holds them.
+	rotate := func(t *testing.T) { setToolLedger(t, &handoffCaptureMax, int64(1)) }
+	out := func(t *testing.T, b *handoffBox) {
+		t.Helper()
+		for i := 0; i < 2; i++ {
+			b.quiet("PreCompact", b.helper.Thread, map[string]any{"trigger": "auto"})
+		}
+	}
+	// compacted is begin, then a compaction, with the startup row rotated out
+	// of both capture files.
+	compacted := func(t *testing.T) *handoffBox {
+		t.Helper()
+		b := begin(t)
+		began := *b.record().Capture.Start
+		rotate(t)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		out(t, b)
+		c := b.record().Capture
+		if logged(b, `"startup"`) || logged(b, `"SessionStart"`) || len(b.bytes("captures.jsonl.1")) == 0 {
+			t.Fatalf("the start row is still in the capture log:\n%s%s", b.bytes("captures.jsonl.1"), b.bytes("captures.jsonl"))
+		}
+		if c.Start == nil || c.Start.Detail != "compact" || c.Began == nil || *c.Began != began || began.Detail != "startup" || began.Session != b.helper.Thread {
+			t.Fatalf("after the compaction start = %+v, began = %+v; want the compaction and the startup %+v", c.Start, c.Began, began)
+		}
+		b.now = b.now.Add(time.Minute)
+		return b
+	}
+	t.Run("a compaction after the start row rotated out", func(t *testing.T) {
+		b := compacted(t)
+		restored(t, b, "with the start only in the record")
+		requireHandoffValues(t, b.bytes("record.json"))
+	})
+	t.Run("after it a new process still resets", func(t *testing.T) {
+		b := compacted(t)
+		b.ps(handoffPSInteractive, b.now)
+		lost(t, b, "earlier-start")
+	})
+	// Only the stamp says so here: the start leaves no transcript row and no
+	// new process, and its row is rotated out of the log.
+	for source, detail := range map[string]string{"startup": "startup", "resume": "resume", "clear": "clear", "fork": "fork", "reboot": handoffOther} {
+		t.Run("after it a start of source "+source+" resets and is kept", func(t *testing.T) {
+			b := compacted(t)
+			if r := b.hookRaw(handoffPayload("SessionStart", b.helper.Thread, map[string]any{"source": source}), nil); r.err != nil {
+				t.Fatal(r.err)
+			}
+			at := handoffStamped(b.now)
+			out(t, b)
+			if logged(b, `"SessionStart"`) {
+				t.Fatal("the start row is still in the capture log")
+			}
+			if c := b.record().Capture; c.Began == nil || *c.Began != (handoffStamp{Time: at, Detail: detail, Session: b.helper.Thread}) || *c.Start != *c.Began {
+				t.Fatalf("after a %s start began = %+v, start = %+v", source, c.Began, c.Start)
+			}
+			b.now = b.now.Add(time.Minute)
+			lost(t, b, "earlier-start")
+		})
+	}
+	// A record written before the start was kept has none, or still holds one
+	// of an earlier session. Its next compaction keeps the start it replaces.
+	for name, old := range map[string]*handoffStamp{"no kept start": nil, "the kept start of another session": {Time: "2026-10-07T19:00:00Z", Detail: "startup", Session: handoffOtherID}} {
+		t.Run("an old record takes the start at its next compaction: "+name, func(t *testing.T) {
+			b := begin(t)
+			record := b.record()
+			began := *record.Capture.Start
+			record.Capture.Began = old
+			b.save(record)
+			rotate(t)
+			if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+				t.Fatal(r.err)
+			}
+			out(t, b)
+			if c := b.record().Capture; logged(b, `"SessionStart"`) || c.Start.Detail != "compact" || c.Began == nil || *c.Began != began {
+				t.Fatalf("after the compaction start = %+v, began = %+v; want began %+v and no start row logged", c.Start, c.Began, began)
+			}
+			// A second compaction leaves the kept start alone.
+			b.now = b.now.Add(time.Minute)
+			if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+				t.Fatal(r.err)
+			}
+			if c := b.record().Capture; c.Start.Time != handoffStamped(b.now) || *c.Began != began {
+				t.Fatalf("after a second compaction start = %+v, began = %+v", c.Start, c.Began)
+			}
+			b.now = b.now.Add(time.Minute)
+			restored(t, b, "after the old record compacted")
+		})
+	}
+	// strip removes the session's startup rows from the capture log, as a
+	// rotation would, leaving its compaction row.
+	strip := func(t *testing.T, b *handoffBox) {
+		t.Helper()
+		var kept []string
+		for _, line := range strings.Split(strings.TrimSpace(string(b.bytes("captures.jsonl"))), "\n") {
+			if !strings.Contains(line, `"startup"`) {
+				kept = append(kept, line)
+			}
+		}
+		if err := os.WriteFile(b.file("captures.jsonl"), []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if logged(b, `"startup"`) || !logged(b, `"compact"`) {
+			t.Fatalf("the stripped capture log is %q", kept)
+		}
+	}
+	t.Run("an old record that had already compacted", func(t *testing.T) {
+		b := begin(t)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		record := b.record()
+		record.Capture.Began = nil
+		b.save(record)
+		if c := b.record().Capture; c.Began != nil || c.Start.Detail != "compact" {
+			t.Fatalf("the fixture's record holds start %+v, began %+v", c.Start, c.Began)
+		}
+		// The capture log is still the only source, as before.
+		b.now = b.now.Add(time.Minute)
+		restored(t, b, "with the start row in the log")
+		strip(t, b)
+		lost(t, b, "no-start-captured")
+	})
+	t.Run("a kept start of another session is not used", func(t *testing.T) {
+		b := begin(t)
+		began := *b.record().Capture.Start
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "compact"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		began.Session = handoffOtherID
+		record := b.record()
+		record.Capture.Began = &began
+		b.save(record)
+		strip(t, b)
+		b.now = b.now.Add(time.Minute)
+		lost(t, b, "no-start-captured")
+	})
+	t.Run("a kept start tt could not have written is refused", func(t *testing.T) {
+		for _, bad := range [][2]string{{`"detail":"startup"`, `"detail":"reboot"`}, {`"detail":"startup"`, `"detail":"run tt handoff restore"`}, {`"time":"2026-10-07T`, `"time":"2026-13-07T`}, {`"session":"1`, `"session":"x`}} {
+			b := begin(t)
+			data := b.bytes("record.json")
+			at := bytes.Index(data, []byte(`"began":{`))
+			end := at + bytes.IndexByte(data[at:], '}')
+			if at < 0 || !bytes.Contains(data[at:end], []byte(bad[0])) {
+				t.Fatalf("the record's kept start has no %s:\n%s", bad[0], data)
+			}
+			data = append(append(append([]byte{}, data[:at]...), bytes.Replace(data[at:end], []byte(bad[0]), []byte(bad[1]), 1)...), data[end:]...)
+			if err := os.WriteFile(b.file("record.json"), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := b.run("show"); !errors.Is(err, errHandoffBadRecord) {
+				t.Fatalf("show read a record whose kept start holds %s: %v", bad[1], err)
+			}
+			if _, err := b.run("status", "--task", b.helper.Task); !errors.Is(err, errHandoffBadRecord) {
+				t.Fatalf("status read a record whose kept start holds %s: %v", bad[1], err)
+			}
+		}
+	})
+	t.Run("restore after a registration keeps the session's start", func(t *testing.T) {
+		f := newHandoffHubFixture(t)
+		thread := f.successor(t)
+		if out, err := f.restore(); err != nil || !strings.Contains(out, "registration: restored") {
+			t.Fatalf("restore = %v\n%s", err, out)
+		}
+		c := f.b.record().Capture
+		if c.Start == nil || c.Began == nil || *c.Began != *c.Start || c.Began == c.Start || c.Start.Detail != "clear" || c.Start.Session != thread {
+			t.Fatalf("after restore start = %+v, began = %+v; want the successor's clear in both", c.Start, c.Began)
+		}
+		requireHandoffValues(t, f.b.bytes("record.json"))
+	})
+
+	// s2: a captured end of the session later than its latest start moves the
+	// floor to that end. A resume inside a running Claude Code process whose
+	// start hook is lost leaves no stamp, no transcript row and no new
+	// process; the end of the session's earlier life is what is left.
+	resume := map[string]any{"reason": "resume"}
+	// floor requires the start receipts are judged against, and that the
+	// captured start itself never carries an end's time.
+	floor := func(t *testing.T, b *handoffBox, want string) {
+		t.Helper()
+		s, r := store(t, b), b.record()
+		start, started, unknown := s.sessionStart(r, "claude", b.helper.Thread)
+		if !started || unknown != "" || start.Time != want {
+			t.Fatalf("session start = %+v, %v, %q; want %s", start, started, unknown, want)
+		}
+		if latest, ok := s.latestStart(r, b.helper.Thread); !ok || latest != *r.Capture.Began {
+			t.Fatalf("latest start = %+v, %v; want the kept start %+v", latest, ok, r.Capture.Began)
+		}
+	}
+	// ended is begin, then the session's end, with no start after it.
+	ended := func(t *testing.T) (*handoffBox, string) {
+		t.Helper()
+		b := begin(t)
+		start, lines := *b.record().Capture.Start, len(captureLines(t, b))
+		b.quiet("SessionEnd", b.helper.Thread, resume)
+		at := handoffStamped(b.now)
+		if c := b.record().Capture; c.End == nil || c.End.Time != at || c.End.Session != b.helper.Thread || *c.Start != start || *c.Began != start || len(captureLines(t, b)) != lines+1 {
+			t.Fatalf("after the end the record holds %+v", c)
+		}
+		b.now = b.now.Add(time.Minute)
+		return b, at
+	}
+	t.Run("a resume whose start hook is lost: the end is in the record", func(t *testing.T) {
+		b, at := ended(t)
+		lost(t, b, "earlier-start")
+		floor(t, b, at)
+		// A row from before the end does not restore it, and one from after
+		// it does: the ledger is searched from the same floor.
+		b.ledger(handoffLedgerFixture{Session: b.helper.Thread, Tool: handoffCronTool, ToolUse: toolB, Outcome: "ok",
+			Digest: toolArgsDigest(handoffWakeArgs(b.wake("w1"), b.helper.Task)), At: b.now.Add(-90 * time.Second)})
+		lost(t, b, "earlier-start")
+		b.ledger(b.cron("w1", toolB))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil || !strings.Contains(out, "wake w1 restored") || b.wake("w1").ReceiptTool != toolB {
+			t.Fatalf("confirm after the end = %v, %q", err, out)
+		}
+	})
+	t.Run("a resume whose start hook is lost: the end is only in the capture log", func(t *testing.T) {
+		b, at := ended(t)
+		record := b.record()
+		record.Capture.End = nil
+		b.save(record)
+		if b.record().Capture.End != nil || !logged(b, `"SessionEnd"`) {
+			t.Fatal("the fixture's end is not in the capture log alone")
+		}
+		lost(t, b, "earlier-start")
+		floor(t, b, at)
+	})
+	t.Run("an end of another session moves nothing", func(t *testing.T) {
+		b := begin(t)
+		record := b.record()
+		start := record.Capture.Start.Time
+		other := handoffStamp{Time: handoffStamped(b.now), Detail: "resume", Session: handoffOtherID}
+		record.Capture.End = &other
+		b.save(record)
+		s := store(t, b)
+		if unlock := s.lock(); unlock != nil {
+			s.appendCapture("SessionEnd", other, handoffAsCandidate)
+			unlock()
+		}
+		if !logged(b, `"SessionEnd"`) || !logged(b, handoffOtherID) {
+			t.Fatal("the fixture logged no end of the other session")
+		}
+		b.now = b.now.Add(time.Minute)
+		restored(t, b, "after another session's end")
+		floor(t, b, start)
+	})
+	t.Run("an end, then a captured resume", func(t *testing.T) {
+		b, _ := ended(t)
+		if r := b.hook("SessionStart", b.helper.Thread, map[string]any{"source": "resume"}); r.err != nil {
+			t.Fatal(r.err)
+		}
+		at := handoffStamped(b.now)
+		lost(t, b, "earlier-start")
+		floor(t, b, at)
+		b.now = b.now.Add(time.Minute)
+		b.ledger(b.cron("w1", toolB))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil || !strings.Contains(out, "wake w1 restored") || b.wake("w1").ReceiptTool != toolB {
+			t.Fatalf("confirm after the resume = %v, %q", err, out)
+		}
+	})
+	t.Run("an end in the same second as the start is not later than it", func(t *testing.T) {
+		b := begin(t)
+		record := b.record()
+		start := record.Capture.Start.Time
+		record.Capture.End = &handoffStamp{Time: start, Detail: "clear", Session: b.helper.Thread}
+		b.save(record)
+		restored(t, b, "with an end in the start's second")
+		floor(t, b, start)
+	})
+	t.Run("an end with no start captured is still no start", func(t *testing.T) {
+		b, _ := ended(t)
+		record := b.record()
+		record.Capture.Start, record.Capture.Began = nil, nil
+		b.save(record)
+		for _, name := range []string{"captures.jsonl", "captures.jsonl.1"} {
+			var kept []string
+			for _, line := range strings.Split(strings.TrimSpace(string(b.bytes(name))), "\n") {
+				if line != "" && !strings.Contains(line, `"SessionStart"`) {
+					kept = append(kept, line)
+				}
+			}
+			if len(b.bytes(name)) > 0 {
+				if err := os.WriteFile(b.file(name), []byte(strings.Join(kept, "\n")+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		lost(t, b, "no-start-captured")
+	})
+	t.Run("restore reports a resume whose start hook is lost and stores the reason", func(t *testing.T) {
+		f := newHandoffHubFixture(t)
+		b := f.b
+		setToolLedger(t, &handoffLedgerMatching, true)
+		b.must("note", "wake", "add", "--schedule=0 * * * *", "--kind=hourly-update", "--message=31581")
+		b.hook("SessionStart", f.thread, map[string]any{"source": "startup"})
+		b.now = b.now.Add(time.Minute)
+		b.ledger(b.cron("w1", toolA))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil {
+			t.Fatalf("confirm = %v, %q", err, out)
+		}
+		if out, err := f.restore(); err != nil || !strings.Contains(out, "w1 restored: this session created its cron") {
+			t.Fatalf("restore = %v\n%s", err, out)
+		}
+		b.now = b.now.Add(time.Minute)
+		b.quiet("SessionEnd", f.thread, resume)
+		b.now = b.now.Add(time.Minute)
+		out, err := f.restore()
+		if err == nil || !strings.Contains(err.Error(), "restore incomplete: 1 not restored") || !strings.Contains(out, "w1 not restored: "+handoffReasons["earlier-start"]) || !strings.Contains(out, "arguments for "+handoffCronTool) {
+			t.Fatalf("restore after the end = %v\n%s", err, out)
+		}
+		report, ok, err := handoffStore{dir: filepath.Dir(b.file("restore.json"))}.loadRestore()
+		if err != nil || !ok || len(report.Wakes) != 1 || report.Wakes[0].State != handoffNotRestored || report.Wakes[0].Reason != "earlier-start" {
+			t.Fatalf("restore.json = %+v %v %v", report, ok, err)
+		}
+		requireHandoffValues(t, b.bytes("restore.json"))
+		// The cron created after the end confirms, and restore is whole again.
+		b.ledger(b.cron("w1", toolB))
+		if out, err := b.run("wake", "confirm", "w1"); err != nil || b.wake("w1").ReceiptTool != toolB {
+			t.Fatalf("confirm after the end = %v, %q", err, out)
+		}
+		if out, err := f.restore(); err != nil || !strings.Contains(out, "w1 restored: this session created its cron") {
+			t.Fatalf("restore after the new cron = %v\n%s", err, out)
+		}
+	})
+	// docs/session-handoff.md, "Known limits": an in-session resume does not move
+	// the floor when its start hook left no stamp, the session's earlier life
+	// left no captured end, and the receipt is later than the start of the
+	// process now running it. Nothing on the host shows that case.
+	t.Run("the documented limit: an in-session resume with no start stamp and no captured end", func(t *testing.T) {
+		b := begin(t)
+		if c := b.record().Capture; c.End != nil || logged(b, `"SessionEnd"`) {
+			t.Fatalf("the fixture captured an end: %+v", c.End)
+		}
+		start := b.record().Capture.Start.Time
+		b.now = b.now.Add(time.Minute)
+		restored(t, b, "with nothing captured for the resume")
+		floor(t, b, start)
+	})
 }
 
 var handoffValuePatterns = func() map[string]*regexp.Regexp {
@@ -4367,7 +4788,7 @@ var handoffValuePatterns = func() map[string]*regexp.Regexp {
 		"identity.hub": `http://127\.0\.0\.1:[0-9]{1,5}`, "identity.task": `tsk` + hex, "identity.agent": `agt` + hex, "identity.name": `[a-zA-Z0-9_-]{1,64}`,
 		"identity.run": `run` + hex, "identity.registration": `ohr` + hex, "identity.runtime": `claude|codex`, "identity.thread": uuid,
 		"identity.session": `[a-zA-Z0-9_-]{1,64}`, "identity.sessionId": `\$[0-9]{1,11}`, "identity.sessionCreated": `[0-9]{1,12}`, "identity.copiedAt": stamp,
-		"capture.start.detail": `startup|resume|clear|compact|fork|other`, "capture.compact.detail": `manual|auto|other`, "capture.end.detail": `clear|resume|logout|prompt_input_exit|other`,
+		"capture.start.detail": `startup|resume|clear|compact|fork|other`, "capture.began.detail": `startup|resume|clear|compact|fork|other`, "capture.compact.detail": `manual|auto|other`, "capture.end.detail": `clear|resume|logout|prompt_input_exit|other`,
 		"snapshot.asOf": stamp, "snapshot.helperStatus": `starting|running|done|retired|needs_input|closed|exited|other`,
 		"snapshot.window.id": `dlw` + hex, "snapshot.window.scope": `decisions|decisions_merges_deploys|other`, "snapshot.window.endsAt": stamp, "snapshot.window.state": `open|expired|closed`,
 		"snapshot.obligations[].id": `obl` + hex, "snapshot.obligations[].kind": `assign|request|review|question|block|notice|finding|result|answer|decline|human|decision|other`,
@@ -4375,7 +4796,7 @@ var handoffValuePatterns = func() map[string]*regexp.Regexp {
 		"snapshot.decisions[].sender": agent, "snapshot.decisions[].state": `open`,
 		"snapshot.queue[].id": `tqe` + hex, "snapshot.queue[].item": `wi` + hex, "snapshot.queue[].state": `launching|running`,
 	}
-	for _, part := range []string{"start", "compact", "end"} {
+	for _, part := range []string{"start", "began", "compact", "end"} {
 		patterns["capture."+part+".time"], patterns["capture."+part+".session"] = stamp, uuid
 	}
 	for _, list := range []string{"instructions", "wakes", "orders", "claims", "decisions"} {
