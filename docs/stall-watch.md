@@ -1,6 +1,7 @@
 # Stall watch
 
 Feature `wi_fa5f10477f93c57d` revision 2, owner order #32210, builder assignment #32236.
+Follow-up feature `wi_830e10326defc8ee`, owner order #32312, builder assignment #32351: the helper states that send a team notice to the owner, and the hold after a hub start.
 
 On 2026-10-10 the owner helper went quiet and the first owner ping came 4 h 20 min later, because the helper is itself the escalation point for team stalls and nothing watched it. A team that goes quiet as a whole was noticed only through obligation timers, measured in hours. The hub now watches both.
 
@@ -11,7 +12,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 | Watch | Fires when | Threshold (D1) | Who hears it |
 | --- | --- | --- | --- |
 | Helper watch | the owner helper owes the owner something and shows no post and no `working` report | 20 minutes | the owner, as a Discord ping |
-| Team watch | the team of a running queue entry shows no post, no `working` report and no matrix wait | 30 minutes | the owner helper, as a directed notice; the owner instead when the helper is quiet too, offline or not registered |
+| Team watch | the team of a running queue entry shows no post, no `working` report and no matrix wait | 30 minutes | the owner helper, as a directed notice; the owner instead when the helper is quiet too, offline, not registered, crashed, stuck or blocked by its provider |
 
 - Each watch posts **one notice per episode**. An episode is one stretch of quiet for one subject: the helper, or one queue entry.
 - An episode ends silently. No notice says that the subject is back.
@@ -23,7 +24,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 From 22:00 to 07:00 Pacific no owner ping is sent. This covers every owner notice of this feature, from either watch.
 
 - At night the notice is a plain channel line with no mention. Its last sentence says that the owner is pinged at 07:00 Pacific if the episode is still open.
-- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep. A team ping says why the owner hears it, as the night line did.
+- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep, or, for a subject it has not heard from since it started, when the hold after the start ends (see [After a hub start](#after-a-hub-start)). A team ping says why the owner hears it, as the night line did.
 - An episode that ended in the night never pings. Neither does one whose subject is in a never-quiet case at 07:00: closing is decided before pinging.
 - A team notice directed to the helper is sent at any hour.
 - The zone is `America/Los_Angeles`, so the rule follows daylight saving time.
@@ -112,6 +113,19 @@ The hub reads the end of each case from rows that already exist:
 
 These times are compared to the second.
 
+## After a hub start
+
+While the hub is down it stores no heartbeat. On its first sweeps every agent therefore looks offline, and a member that was working looks quiet since its last heartbeat. So the hub process records when it started, and for 60 seconds after that an agent it has not heard from since is **unheard** and is not judged:
+
+- no helper episode opens for an unheard helper, and its 07:00 ping is not sent;
+- no team episode opens, and no team 07:00 ping is sent, while the helper or a member of that team is unheard. The helper counts because an unheard helper would read as offline and send the team notice to the owner;
+- an agent that has heartbeated since the start is judged at once, on its stored state and its old quiet time;
+- after 60 seconds an agent that is still silent is offline, and is judged with its old quiet time.
+
+Closing is not held. A held sweep still ends an open episode and moves message cursors; it opens no episode and posts nothing.
+
+The hold is 60 seconds, two heartbeat intervals. Agents heartbeat every 30 seconds and the watch sweeps every 30 seconds, so a hold of one interval would let the second sweep race the first heartbeat.
+
 ## When an episode ends
 
 A helper episode ends when:
@@ -172,6 +186,7 @@ A team notice suggests reading the team's last messages and looking at its lead'
 - It adds no hub request. In particular there is no per-tool-call request: the last working time rides on the activity report that the relay already sends.
 - **The directed helper notice is delivered like any directed notice.** The hub creates its delivery-only obligation and wake job, and the relay's ordinary delivery wakes the helper to read it. That is the only way this feature reaches a session.
 - With nothing quiet and no open episode, a sweep makes three reads and no write.
+- A sweep held after a hub start opens no episode and posts nothing. It still closes ended episodes and moves cursors.
 - The decision is made twice. An unlocked read nominates projects; the write transaction then decides again from fresh rows, so a post, a working report, a pause, a hold, a closed obligation or a replaced run that arrives in between stops the notice, including the 07:00 ping.
 
 Both message reads are bounded:
@@ -188,8 +203,11 @@ The migration only creates these tables. Nothing is altered or back-filled.
 
 ## Limits
 
-- **Routing of team notices.** With no live helper, or an offline one, the team notice goes to the owner.
-- **The recipient is chosen once**, when the team episode opens. If the helper goes quiet afterwards, that team episode does not move to the owner; the helper watch covers the helper itself.
+- **Routing of team notices.** With no live helper, an offline one, or one whose state is `crashed`, `stuck` or `provider_blocked`, the team notice goes to the owner. A helper in `hung_tool`, `looping`, `runtime_prompt`, `finished_silent`, `unknown` or `needs_input` still gets the directed notice.
+- **The recipient is chosen once**, when the team episode opens. If the helper goes quiet, crashes, sticks or is blocked afterwards, that team episode does not move to the owner; the helper watch covers a helper that owes the owner.
+- **A crashed, stuck or provider-blocked helper that owes nothing is not watched itself.** The owner learns of it from the next team notice, which names the state.
+- **Hub downtime counts as quiet time** for an agent that was already quiet. Only the judgement of unheard agents is held, and only for 60 seconds.
+- **The hub start is kept in memory**, set by the hub process. The hold follows every start, after a short restart as after a long outage. A relay that takes more than 60 seconds to reach the restarted hub can still be judged offline.
 - **Delegated owner requests do not count as owed.** A request routed to the helper during a delegation window is addressed by an agent, so it does not start the helper watch.
 - **First deployment.** A run that stopped working before the hub with this feature started has no progress row. Its quiet time then rests on its posts and its oldest owed item, which can make the first notice earlier than a longer history would, never suppress it.
 - **An exited helper is not watched.** Its obligations are closed as recipient-gone. A closed pane normally shows as `offline`, which is watched.

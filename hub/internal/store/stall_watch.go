@@ -53,6 +53,10 @@ const (
 	stallWatchPostWindow = 30 * time.Minute
 	// Rows one episode read takes from the messages after its cursor.
 	stallWatchScanLimit = 500
+	// How long after a hub start an agent that has not heartbeated since is
+	// not judged: two broker ticks, so the second sweep does not race the
+	// first 30 s heartbeat.
+	stallWatchStartHold = 60 * time.Second
 
 	stallKindHelper = "helper"
 	stallKindTeam   = "team"
@@ -81,6 +85,26 @@ const (
 // stallWatchBeforeWrite is nil in production. Tests set it to change state
 // between the sweep's unlocked read and its write transactions.
 var stallWatchBeforeWrite func()
+
+// stallWatchStarts holds when each store's hub process started. Only the hub
+// sets it; a store without one holds nothing.
+var stallWatchStarts sync.Map // *Store -> time.Time
+
+// StallWatchHubStarted records that the hub process started at at. For
+// stallWatchStartHold after it the sweep does not judge an agent the hub has
+// not heard from since.
+func (s *Store) StallWatchHubStarted(at time.Time) { stallWatchStarts.Store(s, at.UTC()) }
+
+// stallWatchStarted sets the recorded hub start, if any, on each view.
+func (s *Store) stallWatchStarted(views map[string]*stallView) {
+	at, ok := stallWatchStarts.Load(s)
+	if !ok {
+		return
+	}
+	for _, v := range views {
+		v.started = at.(time.Time)
+	}
+}
 
 // StallWatchStep is one notice a sweep posted.
 type StallWatchStep struct {
@@ -219,6 +243,7 @@ type stallView struct {
 	task     string
 	active   bool      // open and not paused
 	resumed  time.Time // the project's last resume from a pause
+	started  time.Time // the hub process start, when the hub recorded one
 	helper   *stallHelper
 	teams    []*stallTeam
 	episodes []stallEpisode
@@ -541,6 +566,13 @@ func latest(times ...time.Time) time.Time {
 	return out
 }
 
+// unheard reports whether the hub started less than the hold ago and has not
+// heard from the agent since. Such an agent is offline only as far as the hub
+// knows, so it is not judged.
+func (v *stallView) unheard(a stallAgent, now time.Time) bool {
+	return !v.started.IsZero() && !now.Before(v.started) && now.Sub(v.started) < stallWatchStartHold && a.lastSeen.Before(v.started)
+}
+
 // helperNeverQuiet names the case that keeps the helper from being quiet, or
 // is empty: it works, waits for the matrix host, or waits for the owner's
 // answer to its own decision request.
@@ -647,7 +679,9 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 	if err != nil {
 		return plan, err
 	}
-	if h := v.helper; h != nil {
+	// An unheard helper is neither opened nor pinged; closing above is not held.
+	helperUnheard := v.helper != nil && v.unheard(v.helper.stallAgent, now)
+	if h := v.helper; h != nil && !helperUnheard {
 		e, isOpen := open[stallKindHelper+":"+h.id]
 		switch {
 		case isOpen && e.ownerState == stallOwnerDeferred && !night:
@@ -663,7 +697,8 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		}
 	}
 	// Who hears a team episode, decided when it opens: the helper when one is
-	// live, online and not itself quiet; otherwise the owner.
+	// live, online, not itself quiet and not crashed, stuck or blocked by its
+	// provider; otherwise the owner.
 	helperState := "not registered"
 	if h := v.helper; h != nil {
 		switch {
@@ -671,11 +706,22 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 			helperState = "offline"
 		case helperQuiet:
 			helperState = "quiet too"
+		case stallHelperDown[h.effective(now)] != "":
+			helperState = stallHelperDown[h.effective(now)]
 		default:
 			helperState = ""
 		}
 	}
 	for _, t := range v.teams {
+		// After a hub start no team is opened or pinged while the helper or
+		// one of its members is unheard.
+		held := helperUnheard
+		for _, m := range t.members {
+			held = held || v.unheard(m, now)
+		}
+		if held {
+			continue
+		}
 		e, isOpen := open[stallKindTeam+":"+t.entry]
 		if isOpen {
 			if e.ownerState == stallOwnerDeferred && !night {
@@ -792,6 +838,11 @@ func stallDuration(d time.Duration) string {
 	return fmt.Sprintf("%d h %d min", minutes/60, minutes%60)
 }
 
+// stallHelperDown names a helper that heartbeats but cannot act on a notice.
+var stallHelperDown = map[string]string{
+	"crashed": "crashed", "stuck": "stuck", "provider_blocked": "blocked by its provider",
+}
+
 // stallHelperNextStep is the usual step for a helper state. It is offered
 // only after the record of why the helper stopped, never as the cause.
 func stallHelperNextStep(state, runtime, class, host string) string {
@@ -894,6 +945,7 @@ func (s *Store) StallWatchSweep(ctx context.Context, now time.Time) ([]StallWatc
 	if err != nil {
 		return nil, fmt.Errorf("stall watch sweep: %w", err)
 	}
+	s.stallWatchStarted(views)
 	var tasks []string
 	for id := range views {
 		tasks = append(tasks, id)
@@ -941,6 +993,7 @@ func (s *Store) stallWatchWrite(ctx context.Context, task string, now time.Time)
 	if err != nil {
 		return nil, err
 	}
+	s.stallWatchStarted(views)
 	v := views[task]
 	if v == nil {
 		return nil, nil

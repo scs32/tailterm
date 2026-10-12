@@ -1586,3 +1586,330 @@ func TestStallWatchQuietAfterWaitLifts(t *testing.T) {
 		f.one(stallActionTeam)
 	})
 }
+
+// stallOwnerTeamNotice asserts a team notice that went to the owner by day
+// because of the named helper state.
+func stallOwnerTeamNotice(t *testing.T, env api.Envelope, to, state string) {
+	t.Helper()
+	if to != "" || env.Subject != stallTeamOwnerSubject || env.Refs["escalation"] != "owner" || env.Refs["recipientKind"] != "owner" ||
+		!strings.Contains(env.Body.Text, "The owner helper is "+state+", so this goes to the owner.") {
+		t.Fatalf("owner team notice to %q refs %+v text %s", to, env.Refs, env.Body.Text)
+	}
+	checkStallText(t, env.Body.Text)
+}
+
+// q1: a helper that heartbeats but is crashed, stuck or blocked by its
+// provider does not receive the team notice; the owner does.
+func TestStallWatchTeamRecipientHelperState(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	set := func(f *stallFixture, h api.Agent, state string) {
+		f.t.Helper()
+		if state == "provider_blocked" {
+			f.report(h, api.AgentActivity{State: state, Provider: providerBlock("claude", api.ProviderBlockUsageLimit, f.now())})
+			return
+		}
+		f.state(h, state)
+	}
+	build := func(t *testing.T, start time.Time, state string) (*stallFixture, api.Agent) {
+		f := root.project(t, start)
+		h := f.helper()
+		set(f, h, state)
+		f.entry(0)
+		f.member("lead-a", 0)
+		return f, h
+	}
+	helperEpisodes := func(f *stallFixture) int {
+		return f.count(`SELECT count(*) FROM stall_watch_episodes WHERE kind='helper' AND task_id=?`, f.task.ID)
+	}
+	for state, named := range map[string]string{"crashed": "crashed", "stuck": "stuck", "provider_blocked": "blocked by its provider"} {
+		t.Run(state+" goes to the owner", func(t *testing.T) {
+			f, h := build(t, stallNoon, state)
+			f.advance(30*time.Minute - time.Second)
+			f.none("29 m 59 s")
+			f.advance(time.Second)
+			_, env, to := f.one(stallActionTeam)
+			stallOwnerTeamNotice(t, env, to, named)
+			if f.count(`SELECT count(*) FROM stall_watch_episodes WHERE kind='team' AND recipient='owner' AND owner_state='pinged' AND closed_at='' AND task_id=?`, f.task.ID) != 1 {
+				t.Fatal("team episode row")
+			}
+			// The helper heartbeats, owes nothing, and is sent nothing.
+			if !agentOnlineAt(api.Agent{Status: h.Status, LastSeenAt: f.now()}, f.now()) || f.count(`SELECT count(*) FROM agents WHERE id=? AND last_seen_at=?`, h.ID, ts(f.now())) != 1 {
+				t.Fatal("the helper is not heartbeating")
+			}
+			if n := f.count(`SELECT count(*) FROM messages WHERE task_id=? AND from_node=? AND to_agent=? AND envelope LIKE '%stallWatch%'`, f.task.ID, api.BrokerNode, h.ID); n != 0 {
+				t.Fatalf("%d stall watch notices directed to the helper", n)
+			}
+			if helperEpisodes(f) != 0 {
+				t.Fatal("a helper that owes nothing was watched")
+			}
+			f.advance(10 * time.Minute)
+			f.none("one notice")
+		})
+	}
+	for _, state := range []string{"idle", "hung_tool", "looping"} {
+		t.Run(state+" still goes to the helper", func(t *testing.T) {
+			f, h := build(t, stallNoon, state)
+			f.advance(30 * time.Minute)
+			_, env, to := f.one(stallActionTeam)
+			if to != h.ID || env.Subject != stallTeamSubject || env.Refs["recipientKind"] != "" || strings.Contains(env.Body.Text, "The owner helper is") {
+				t.Fatalf("directed team notice to %q refs %+v text %s", to, env.Refs, env.Body.Text)
+			}
+			if f.count(`SELECT count(*) FROM stall_watch_episodes WHERE kind='team' AND recipient='helper' AND owner_state='' AND closed_at='' AND task_id=?`, f.task.ID) != 1 {
+				t.Fatal("team episode row")
+			}
+		})
+	}
+	t.Run("crashed at night is a line, then one 07:00 ping", func(t *testing.T) {
+		f, _ := build(t, stallElevenPM.Add(-30*time.Minute), "crashed")
+		f.at(stallElevenPM)
+		const why = "The owner helper is crashed, so this goes to the owner."
+		_, line, to := f.one(stallActionTeam)
+		if to != "" || line.Subject != stallTeamOwnerSubject || line.Refs["escalation"] != "lead" || !strings.Contains(line.Body.Text, why) || !strings.HasSuffix(line.Body.Text, stallNightLine) {
+			t.Fatalf("night line to %q refs %+v text %s", to, line.Refs, line.Body.Text)
+		}
+		checkStallText(t, line.Body.Text)
+		if f.count(`SELECT count(*) FROM stall_watch_episodes WHERE kind='team' AND recipient='owner' AND owner_state='deferred' AND closed_at='' AND task_id=?`, f.task.ID) != 1 {
+			t.Fatal("the episode is not deferred")
+		}
+		f.at(stallSevenAM.Add(-time.Second))
+		f.none("06:59:59")
+		f.at(stallSevenAM)
+		_, ping, to := f.one(stallActionTeamPing)
+		if to != "" || ping.Refs["escalation"] != "owner" || ping.Refs["episode"] != line.Refs["episode"] || !strings.Contains(ping.Body.Text, why) {
+			t.Fatalf("deferred ping to %q refs %+v text %s", to, ping.Refs, ping.Body.Text)
+		}
+		checkStallText(t, ping.Body.Text)
+		f.none("after the ping")
+		if helperEpisodes(f) != 0 {
+			t.Fatal("a helper that owes nothing was watched")
+		}
+	})
+	t.Run("crashed and owing for 5 minutes is named crashed", func(t *testing.T) {
+		f, h := build(t, stallNoon, "crashed")
+		f.advance(25 * time.Minute)
+		f.owe(h)
+		f.advance(5 * time.Minute)
+		_, env, to := f.one(stallActionTeam)
+		stallOwnerTeamNotice(t, env, to, "crashed")
+		if helperEpisodes(f) != 0 {
+			t.Fatal("the helper watch fired before its 20 minutes")
+		}
+	})
+}
+
+// hubStarts records a hub start now for the fixture's store, until the test
+// ends.
+func (f *stallFixture) hubStarts() {
+	f.t.Helper()
+	f.s.StallWatchHubStarted(f.now())
+	f.t.Cleanup(func() { stallWatchStarts.Delete(f.s) })
+}
+
+// q2: for stallWatchStartHold after a hub start, an agent the hub has not
+// heard from since is not judged.
+func TestStallWatchAfterHubStart(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	// outage is an idle helper that owes nothing and a one-member team, both
+	// silent for 31 minutes because the hub was down.
+	outage := func(t *testing.T, member string) (*stallFixture, api.Agent, api.Agent) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.state(lead, member)
+		delete(f.online, h.ID)
+		delete(f.online, lead.ID)
+		f.advance(31 * time.Minute)
+		return f, h, lead
+	}
+	t.Run("a working team is not judged on the first sweep", func(t *testing.T) {
+		f, _, _ := outage(t, "working")
+		f.hubStarts()
+		f.none("first sweep after the outage")
+		f.advance(stallWatchStartHold - time.Second)
+		f.none("one second before the hold ends")
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened during the hold")
+		}
+		// Nobody came back: they are offline and judged with the old times.
+		f.advance(time.Second)
+		_, env, to := f.one(stallActionTeam)
+		stallOwnerTeamNotice(t, env, to, "offline")
+		if !strings.Contains(env.Body.Text, "lead-a (offline)") {
+			t.Fatalf("text %s", env.Body.Text)
+		}
+	})
+	t.Run("no start recorded keeps the old behaviour", func(t *testing.T) {
+		f, _, _ := outage(t, "working")
+		_, env, to := f.one(stallActionTeam)
+		stallOwnerTeamNotice(t, env, to, "offline")
+	})
+	t.Run("members that report are working", func(t *testing.T) {
+		f, h, lead := outage(t, "working")
+		f.hubStarts()
+		f.none("first sweep after the outage")
+		f.online[h.ID], f.online[lead.ID] = true, true
+		f.advance(5 * time.Second)
+		f.none("both reported")
+		f.advance(2 * time.Hour)
+		f.none("still working")
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened")
+		}
+	})
+	t.Run("a member that reports and really is quiet is judged at once", func(t *testing.T) {
+		f, h, lead := outage(t, "idle")
+		f.hubStarts()
+		f.none("first sweep after the outage")
+		f.online[h.ID], f.online[lead.ID] = true, true
+		f.advance(5 * time.Second)
+		_, env, to := f.one(stallActionTeam)
+		if to != h.ID || env.Subject != stallTeamSubject || !strings.Contains(env.Body.Text, "quiet for 31 min") {
+			t.Fatalf("directed team notice to %q refs %+v text %s", to, env.Refs, env.Body.Text)
+		}
+	})
+	t.Run("the helper alone is unheard", func(t *testing.T) {
+		f, _, lead := outage(t, "idle")
+		f.hubStarts()
+		f.online[lead.ID] = true
+		f.advance(5 * time.Second)
+		f.none("the helper has not reported")
+		f.advance(stallWatchStartHold - 6*time.Second)
+		f.none("one second before the hold ends")
+		f.advance(time.Second)
+		_, env, to := f.one(stallActionTeam)
+		stallOwnerTeamNotice(t, env, to, "offline")
+	})
+	// owing is a helper that owes the owner, reported working and then fell
+	// silent for 31 minutes.
+	owing := func(t *testing.T) (*stallFixture, api.Agent) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.owe(h)
+		f.state(h, "working")
+		delete(f.online, h.ID)
+		f.advance(31 * time.Minute)
+		return f, h
+	}
+	t.Run("an unheard helper is judged when the hold ends", func(t *testing.T) {
+		f, _ := owing(t)
+		f.hubStarts()
+		f.none("first sweep after the outage")
+		f.advance(stallWatchStartHold - time.Second)
+		f.none("one second before the hold ends")
+		f.advance(time.Second)
+		_, env, _ := f.one(stallActionHelper)
+		if env.Refs["activity"] != "offline" || !strings.Contains(env.Body.Text, "quiet for 32 min") {
+			t.Fatalf("notice %+v %s", env.Refs, env.Body.Text)
+		}
+	})
+	t.Run("a helper that reports is working", func(t *testing.T) {
+		f, h := owing(t)
+		f.hubStarts()
+		f.none("first sweep after the outage")
+		f.online[h.ID] = true
+		f.advance(5 * time.Second)
+		f.none("the helper reported")
+		f.advance(2 * time.Hour)
+		f.none("still working")
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened")
+		}
+	})
+	t.Run("a helper's 07:00 ping waits for the hold", func(t *testing.T) {
+		f := root.project(t, stallElevenPM.Add(-20*time.Minute))
+		h := f.helper()
+		f.state(h, "idle")
+		f.owe(h)
+		f.at(stallElevenPM)
+		f.one(stallActionHelper)
+		// The hub is down from the night until 10:00.
+		delete(f.online, h.ID)
+		f.at(stallSevenAM.Add(3 * time.Hour))
+		f.hubStarts()
+		f.none("first daytime sweep")
+		f.advance(stallWatchStartHold - time.Second)
+		f.none("one second before the hold ends")
+		f.advance(time.Second)
+		f.one(stallActionHelperPing)
+		f.none("after the ping")
+	})
+	t.Run("a team's 07:00 ping waits for the hold", func(t *testing.T) {
+		// No helper is registered, so the team notice is the owner's.
+		f := root.project(t, stallElevenPM.Add(-30*time.Minute))
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.at(stallElevenPM)
+		f.one(stallActionTeam)
+		delete(f.online, lead.ID)
+		f.at(stallSevenAM.Add(3 * time.Hour))
+		f.hubStarts()
+		f.none("first daytime sweep")
+		// A member that reports lifts the hold for its team.
+		f.online[lead.ID] = true
+		f.advance(5 * time.Second)
+		f.one(stallActionTeamPing)
+		f.none("after the ping")
+	})
+	t.Run("a held sweep still closes episodes and moves cursors", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		owed := f.owe(h)
+		first := f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.advance(30 * time.Minute)
+		if steps := f.sweep(); len(steps) != 2 || f.open() != 2 {
+			t.Fatalf("steps %+v open %d, want a helper and a team episode", steps, f.open())
+		}
+		// A second team that is quiet for 31 minutes when the hub starts.
+		second := f.entry(1)
+		other := f.member("lead-b", 1)
+		// More later messages than one episode read takes, none by a member.
+		tx, err := f.s.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < stallWatchScanLimit+100; i++ {
+			if _, err := tx.Exec(`INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at) VALUES(?,'agt_0000000000000000','workspace','owner','','filler',?)`, f.task.ID, ts(f.now())); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		f.exec(`UPDATE obligations SET state=? WHERE message_seq=?`, api.ObligationClosed, owed.Seq)
+		delete(f.online, h.ID)
+		delete(f.online, lead.ID)
+		delete(f.online, other.ID)
+		f.advance(31 * time.Minute)
+		f.hubStarts()
+		cursor := func() int {
+			return f.count(`SELECT scanned_seq FROM stall_watch_episodes WHERE kind='team' AND subject_id=? AND closed_at=''`, first)
+		}
+		before, changes := cursor(), f.count(`SELECT total_changes()`)
+		f.none("held sweep")
+		if f.episodes() != 2 || f.count(`SELECT count(*) FROM stall_watch_episodes WHERE subject_id=?`, second) != 0 {
+			t.Fatalf("episodes %d: the held sweep opened one", f.episodes())
+		}
+		// The helper episode closed and the open team episode's cursor moved.
+		if f.count(`SELECT count(*) FROM stall_watch_episodes WHERE kind='helper' AND close_reason='nothing-owed' AND closed_at=? AND task_id=?`, ts(f.now()), f.task.ID) != 1 {
+			t.Fatal("the held sweep did not close the helper episode")
+		}
+		if moved := cursor() - before; moved <= 0 || moved > stallWatchScanLimit+1 {
+			t.Fatalf("cursor moved %d in the held sweep", moved)
+		}
+		// Those two rows are all it wrote.
+		if n := f.count(`SELECT total_changes()`) - changes; n != 2 {
+			t.Fatalf("the held sweep changed %d rows, want the close and the cursor", n)
+		}
+		// When the hold ends the second team is judged: one notice.
+		f.advance(stallWatchStartHold)
+		_, env, to := f.one(stallActionTeam)
+		stallOwnerTeamNotice(t, env, to, "offline")
+		if env.Refs["entry"] != second {
+			t.Fatalf("notice for entry %s, want %s", env.Refs["entry"], second)
+		}
+	})
+}
