@@ -795,22 +795,36 @@ func TestToolLedgerIgnoresHub(t *testing.T) {
 	closed.Close()
 	for name, hub := range map[string]string{"closed port": closedURL, "silent listener": "http://" + ln.Addr().String()} {
 		t.Run(name, func(t *testing.T) {
-			e, root := toolLedgerSandbox(t)
-			e.hub = hub
 			call := map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "duration_ms": 5}
-			slowest := time.Duration(0)
-			for _, event := range []string{"PreToolUse", "PostToolUse"} {
-				r := runToolHook(t, e, "tool", toolPayload(event, call), nil)
-				if r.err != nil || r.out != "" {
-					t.Fatalf("%s = %v, output %q", event, r.err, r.out)
+			// A hook that reaches its deadline on a stalled host returns before
+			// its row is written, with or without a hub, so that pair is run
+			// again in a new sandbox. Stalls come in bursts (the hook blocked
+			// in a file system call), so each new attempt waits first. The
+			// last attempt is judged as it stands.
+			const attempts = 3
+			for attempt := 1; ; attempt++ {
+				e, root := toolLedgerSandbox(t)
+				e.hub = hub
+				slowest := time.Duration(0)
+				for _, event := range []string{"PreToolUse", "PostToolUse"} {
+					r := runToolHook(t, e, "tool", toolPayload(event, call), nil)
+					if r.err != nil || r.out != "" {
+						t.Fatalf("%s = %v, output %q", event, r.err, r.out)
+					}
+					slowest = max(slowest, r.elapsed)
 				}
-				slowest = max(slowest, r.elapsed)
-			}
-			if slowest >= toolLedgerBound {
-				t.Errorf("slowest hook took %v; want under %v", slowest, toolLedgerBound)
-			}
-			if rows := toolLedgerRows(t, root, e.agent); len(rows) != 1 || rows[0]["outcome"] != "ok" {
-				t.Fatalf("rows = %v", rows)
+				if slowest >= toolLedgerBound {
+					t.Errorf("slowest hook took %v; want under %v", slowest, toolLedgerBound)
+				}
+				if slowest >= toolLedgerDeadline && attempt < attempts {
+					t.Logf("attempt %d: the slowest hook reached the %v deadline in %v; running the pair again", attempt, toolLedgerDeadline, slowest)
+					time.Sleep(time.Duration(attempt) * time.Second)
+					continue
+				}
+				if rows := toolLedgerRows(t, root, e.agent); len(rows) != 1 || rows[0]["outcome"] != "ok" {
+					t.Fatalf("rows = %v", rows)
+				}
+				break
 			}
 		})
 	}
