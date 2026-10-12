@@ -4109,6 +4109,10 @@ func TestHandoffAge(t *testing.T) {
 // and past that it carries the snapshot's age and the word stale.
 func TestHandoffRetiredLine(t *testing.T) {
 	b := newHandoffBox(t)
+	// The test is of the note's text, not of the hook's deadline: a candidate's
+	// note runs a tmux query, which under load can pass the real deadline and
+	// leave no note at all.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	b.on()
 	b.asHelper()
 	start := map[string]any{"source": "startup"}
