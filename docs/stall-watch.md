@@ -24,7 +24,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 From 22:00 to 07:00 Pacific no owner ping is sent. This covers every owner notice of this feature, from either watch.
 
 - At night the notice is a plain channel line with no mention. Its last sentence says that the owner is pinged at 07:00 Pacific if the episode is still open.
-- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep, or, for a subject it has not heard from since it started, when the hold after the start ends (see [After a hub start](#after-a-hub-start)). A team ping says why the owner hears it, as the night line did.
+- On the first sweep at or after 07:00, an episode that is still open gets exactly one owner ping. A hub that was down at 07:00 sends it on its first daytime sweep, or, for a helper or team held after the hub start, on the first sweep on which it is no longer held (see [After a hub start](#after-a-hub-start)). A team ping says why the owner hears it, as the night line did.
 - An episode that ended in the night never pings. Neither does one whose subject is in a never-quiet case at 07:00: closing is decided before pinging.
 - A team notice directed to the helper is sent at any hour.
 - The zone is `America/Los_Angeles`, so the rule follows daylight saving time.
@@ -120,9 +120,9 @@ While the hub is down it stores no heartbeat. On its first sweeps every agent th
 - no helper episode opens for an unheard helper, and its 07:00 ping is not sent;
 - no team episode opens, and no team 07:00 ping is sent, while the helper or a member of that team is unheard. The helper counts because an unheard helper would read as offline and send the team notice to the owner;
 - an agent that has heartbeated since the start is judged at once, on its stored state and its old quiet time;
-- after 60 seconds an agent that is still silent is offline, and is judged with its old quiet time.
+- after 60 seconds an agent that is still silent is judged as usual, on its last heartbeat and its old quiet time. It is offline once that heartbeat is 90 seconds old, so after a short restart it can read as online, on its stored state, for up to 30 seconds more.
 
-Closing is not held. A held sweep still ends an open episode and moves message cursors; it opens no episode and posts nothing.
+The hold applies to a helper or a team, not to a whole sweep. A sweep inside the 60 seconds still opens an episode, and posts its notice, for a helper or team whose agents have all reported. Closing is not held either: for a held helper or team the sweep still ends an open episode and moves its message cursor; it only opens no episode and sends no 07:00 ping for it.
 
 The hold is 60 seconds, two heartbeat intervals. Agents heartbeat every 30 seconds and the watch sweeps every 30 seconds, so a hold of one interval would let the second sweep race the first heartbeat.
 
@@ -186,7 +186,7 @@ A team notice suggests reading the team's last messages and looking at its lead'
 - It adds no hub request. In particular there is no per-tool-call request: the last working time rides on the activity report that the relay already sends.
 - **The directed helper notice is delivered like any directed notice.** The hub creates its delivery-only obligation and wake job, and the relay's ordinary delivery wakes the helper to read it. That is the only way this feature reaches a session.
 - With nothing quiet and no open episode, a sweep makes three reads and no write.
-- A sweep held after a hub start opens no episode and posts nothing. It still closes ended episodes and moves cursors.
+- For a helper or team held after a hub start, a sweep opens no episode and posts nothing. It still closes that subject's ended episode and moves its cursor, and it judges every subject that is not held as usual.
 - The decision is made twice. An unlocked read nominates projects; the write transaction then decides again from fresh rows, so a post, a working report, a pause, a hold, a closed obligation or a replaced run that arrives in between stops the notice, including the 07:00 ping.
 
 Both message reads are bounded:
