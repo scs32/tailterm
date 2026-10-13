@@ -23,7 +23,9 @@ import (
 // The wrapper writes this local receipt for its exact runtime child. It stays
 // on the launch host and contains no transcript, arguments or credentials.
 // SessionError is set only when both reads of the tmux session identity
-// failed, so the receipt was saved without SessionID and SessionCreated.
+// failed. The receipt then has no SessionID and SessionCreated unless a
+// complete adopted receipt already saved for the same run supplied them and
+// its pane fields.
 type runtimeProcessReceipt struct {
 	Hub            string    `json:"hub"`
 	Task           string    `json:"task"`
@@ -91,7 +93,21 @@ func recordRuntimeProcess(e env, pid int) {
 		}
 		break
 	}
-	_ = writePrivateJSON(runtimeProcessPath(e.hub, e.agent, e.runID), receipt)
+	path := runtimeProcessPath(e.hub, e.agent, e.runID)
+	if receipt.SessionError != "" {
+		// Runtime adoption may have saved a complete receipt for this run while
+		// the reads were failing. The pane fields mark it: discovery always
+		// records the pane it started from and the wrapper never does, so a
+		// receipt the wrapper wrote earlier is not a source. The session
+		// identity and the pane of that session are kept; PID and Started stay
+		// the wrapper's own exact child.
+		var saved runtimeProcessReceipt
+		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &saved) == nil && saved.Hub == receipt.Hub && saved.Task == receipt.Task && saved.Agent == receipt.Agent && saved.Run == receipt.Run && saved.Session == receipt.Session && saved.Socket == receipt.Socket && saved.SessionID != "" && saved.SessionCreated != "" && saved.PanePID > 0 && saved.PaneStarted != "" {
+			receipt.SessionID, receipt.SessionCreated = saved.SessionID, saved.SessionCreated
+			receipt.PanePID, receipt.PaneStarted = saved.PanePID, saved.PaneStarted
+		}
+	}
+	_ = writePrivateJSON(path, receipt)
 }
 
 func recordRuntimeExit(e env) {

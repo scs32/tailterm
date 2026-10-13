@@ -214,6 +214,129 @@ func TestWrapperRetriesSessionIdentityReadOnce(t *testing.T) {
 	}
 }
 
+// A tmux that answers only after the first read's deadline is read on the
+// retry. One that outlasts both deadlines leaves a receipt without a session
+// identity, unless a complete adopted receipt for the same run and session was
+// already saved: its session identity and pane fields are kept.
+func TestWrapperSessionReadDeadlines(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+	t.Setenv(spawn.EnvSession, "tt-handler-0123456789abcdef")
+	t.Setenv("TT_TMUX_SOCKET", "synthetic-activity-deadline")
+	if err := os.WriteFile(filepath.Join(home, "ps"), []byte("#!/bin/sh\nprintf 'synthetic-start\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	line := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
+	// The slow fake cannot answer before half a second, however fast the host
+	// is, so a shorter deadline is always missed; the other mode fails at once.
+	// The sleep keeps no pipe open, so a killed read returns at its deadline.
+	fake := "#!/bin/sh\nif [ \"$FAKE_TMUX_MODE\" = fail ]; then exit 1; fi\nsleep 0.5 >/dev/null 2>&1\nprintf '%s\\n' '" + line + "'\n"
+	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte(fake), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	product := runtimeSessionReadTimeouts
+	t.Cleanup(func() { runtimeSessionReadTimeouts = product })
+	e := env{hub: "https://synthetic.invalid", task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	path := runtimeProcessPath(e.hub, e.agent, e.runID)
+	// What the wrapper saves with nothing to keep, but for SessionError.
+	bare := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: "tt-handler-0123456789abcdef", Socket: "synthetic-activity-deadline", PID: 4321, Started: "synthetic-start"}
+	adopted := bare
+	adopted.PID, adopted.Started, adopted.PanePID, adopted.PaneStarted = 99, "adopted-start", 98, "adopted-pane-start"
+	adopted.SessionID, adopted.SessionCreated = "$7", "777"
+	record := func(name, mode string, first, second time.Duration, existing any) runtimeProcessReceipt {
+		t.Helper()
+		t.Setenv("FAKE_TMUX_MODE", mode)
+		runtimeSessionReadTimeouts = [2]time.Duration{first, second}
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		switch v := existing.(type) {
+		case string:
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(v), 0600); err != nil {
+				t.Fatal(err)
+			}
+		case runtimeProcessReceipt:
+			if err := writePrivateJSON(path, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		recordRuntimeProcess(e, 4321)
+		var receipt runtimeProcessReceipt
+		data, err := os.ReadFile(path)
+		if err != nil || json.Unmarshal(data, &receipt) != nil {
+			t.Fatalf("%s: receipt unreadable: %v", name, err)
+		}
+		return receipt
+	}
+	unread := func(name string, receipt runtimeProcessReceipt) runtimeProcessReceipt {
+		t.Helper()
+		if !strings.Contains(receipt.SessionError, "unread after 2 attempts") {
+			t.Fatalf("%s: session error: %+v", name, receipt)
+		}
+		receipt.SessionError = ""
+		return receipt
+	}
+	read := bare
+	read.SessionID, read.SessionCreated = "$1", "123"
+	kept := bare
+	kept.SessionID, kept.SessionCreated = "$7", "777"
+	kept.PanePID, kept.PaneStarted = 98, "adopted-pane-start"
+
+	// The first read misses its deadline and the retry answers. What tmux
+	// reported replaces an adopted identity, as any successful read does.
+	if got := record("retry answers", "slow", 50*time.Millisecond, 30*time.Second, nil); got != read {
+		t.Fatalf("first deadline missed, retry answered: %+v", got)
+	}
+	if got := record("retry answers over adopted", "slow", 50*time.Millisecond, 30*time.Second, adopted); got != read {
+		t.Fatalf("first deadline missed, retry answered over an adopted receipt: %+v", got)
+	}
+
+	// Both reads miss their deadlines.
+	got := record("nothing to keep", "slow", 50*time.Millisecond, 100*time.Millisecond, nil)
+	if unread("nothing to keep", got) != bare || nativeRuntimeSessionProbe(got) == nil {
+		t.Fatalf("both deadlines missed with no receipt: %+v", got)
+	}
+	got = record("keep", "slow", 50*time.Millisecond, 100*time.Millisecond, adopted)
+	if unread("keep", got) != kept {
+		t.Fatalf("both deadlines missed over an adopted receipt: %+v", got)
+	}
+
+	// Both reads fail at once: every receipt that is not a complete adopted
+	// one for this run and session leaves the wrapper's receipt as it was.
+	change := func(edit func(*runtimeProcessReceipt)) runtimeProcessReceipt {
+		r := adopted
+		edit(&r)
+		return r
+	}
+	for name, existing := range map[string]any{
+		"unreadable":         "{invalid",
+		"other hub":          change(func(r *runtimeProcessReceipt) { r.Hub = "https://other.invalid" }),
+		"other task":         change(func(r *runtimeProcessReceipt) { r.Task = "tsk_fedcba9876543210" }),
+		"other agent":        change(func(r *runtimeProcessReceipt) { r.Agent = "agt_fedcba9876543210" }),
+		"other run":          change(func(r *runtimeProcessReceipt) { r.Run = "run_fedcba9876543210" }),
+		"other session":      change(func(r *runtimeProcessReceipt) { r.Session = "tt-handler-fedcba9876543210" }),
+		"other socket":       change(func(r *runtimeProcessReceipt) { r.Socket = "synthetic-other" }),
+		"no session id":      change(func(r *runtimeProcessReceipt) { r.SessionID = "" }),
+		"no session created": change(func(r *runtimeProcessReceipt) { r.SessionCreated = "" }),
+		"wrapper's own":      change(func(r *runtimeProcessReceipt) { r.PanePID, r.PaneStarted = 0, "" }),
+		"no pane pid":        change(func(r *runtimeProcessReceipt) { r.PanePID = 0 }),
+		"no pane started":    change(func(r *runtimeProcessReceipt) { r.PaneStarted = "" }),
+	} {
+		got := record(name, "fail", time.Second, time.Second, existing)
+		if unread(name, got) != bare {
+			t.Fatalf("%s: kept an identity that was not this run's: %+v", name, got)
+		}
+	}
+	got = record("keep after failed reads", "fail", time.Second, time.Second, adopted)
+	if unread("keep after failed reads", got) != kept {
+		t.Fatalf("both reads failed over an adopted receipt: %+v", got)
+	}
+}
+
 // The fake commands expose precisely the columns used by production discovery.
 func TestActivityHandlerRuntimeAdoption(t *testing.T) {
 	home := t.TempDir()
