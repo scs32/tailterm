@@ -369,6 +369,161 @@ func TestRetentionCleanupConvertsOldRowsLosslessly(t *testing.T) {
 	}
 }
 
+// A revision row that shares its key and revision with the current turn but
+// not its bytes is not a copy of that turn. The cleanup leaves it byte for
+// byte, still deletes the copies that are equal, and treats the turn itself as
+// any other.
+func TestRetentionCleanupLeavesARevisionThatDiffersFromItsCurrentTurn(t *testing.T) {
+	f := newRetentionFixture(t)
+	old := f.oldForm(3)
+	const current = ` FROM usage_turn_revisions r JOIN usage_turns t ON t.task_id=r.task_id AND t.agent_id=r.agent_id AND t.run_id=r.run_id AND t.request_id=r.request_id AND t.revision=r.revision`
+	// One copy differs from its turn in the payload alone, by letter case and
+	// not by length; another in the projection alone, by one trailing space.
+	inPayload, inProjection := old.turns[0], old.turns[1]
+	payload := strings.Replace(old.payloads[inPayload.ID], retentionMarkerTurn, strings.ToUpper(retentionMarkerTurn), 1)
+	if payload == old.payloads[inPayload.ID] || len(payload) != len(old.payloads[inPayload.ID]) {
+		t.Fatal("the fixture payload does not carry the turn marker")
+	}
+	for _, change := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE usage_turn_revisions SET payload=? WHERE request_id=? AND revision=?`, []any{payload, inPayload.ID, inPayload.Revision}},
+		{`UPDATE usage_turn_revisions SET projection=projection||' ' WHERE request_id=? AND revision=?`, []any{inProjection.ID, inProjection.Revision}},
+	} {
+		result, err := f.s.db.Exec(change.query, change.args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, err := result.RowsAffected(); err != nil || n != 1 {
+			t.Fatal("the fixture revision was not changed", n, err)
+		}
+	}
+	differing := map[string]string{
+		inPayload.ID:    `r.payload<>t.payload AND length(r.payload)=length(t.payload) AND r.projection=t.projection`,
+		inProjection.ID: `r.payload=t.payload AND r.projection<>t.projection`,
+	}
+	type row struct{ payload, projection string }
+	read := func(id string) (out row) {
+		t.Helper()
+		if err := f.s.db.QueryRow(`SELECT r.payload,r.projection`+current+` WHERE r.request_id=?`, id).Scan(&out.payload, &out.projection); err != nil {
+			t.Fatal("a revision that differs from its current turn is missing", err)
+		}
+		return
+	}
+	kept := map[string]row{}
+	for id, differs := range differing {
+		if n := f.count(`SELECT count(*)`+current+` WHERE r.request_id=? AND `+differs, id); n != 1 {
+			t.Fatalf("%d revisions differ from their turn as the fixture intends", n)
+		}
+		kept[id] = read(id)
+	}
+	if n := f.count(`SELECT count(*)` + current + ` WHERE r.payload=t.payload AND r.projection=t.projection`); n != 2 {
+		t.Fatalf("%d byte-equal copies of a current turn, want 2", n)
+	}
+	if n := f.count(`SELECT count(*) FROM usage_turn_revisions`); n != 5 {
+		t.Fatalf("%d revision rows before the cleanup", n)
+	}
+	superseded := f.tableRows("usage_turn_revisions WHERE revision=1 AND request_id='"+old.turns[3].ID+"'", "payload,projection")
+	projections := map[string]string{}
+	for _, turn := range old.turns {
+		projections[turn.ID] = f.text(`SELECT projection FROM usage_turns WHERE request_id=?`, turn.ID)
+	}
+	report := func() []byte {
+		t.Helper()
+		r, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return retentionJSON(t, r)
+	}
+	before, reportBefore := f.keptTables(), report()
+	digestBefore := f.digest()
+
+	if err := runRetentionCleanup(f.s.db, retentionRun{}); err != nil {
+		t.Fatal(err)
+	}
+	after, digestAfter := f.keptTables(), f.digest()
+
+	// The two differing rows are there, with the bytes they had.
+	for id, want := range kept {
+		if got := read(id); got != want {
+			t.Fatalf("a differing revision was rewritten: payload sha256 %s, then %s; projection sha256 %s, then %s",
+				retentionSum([]byte(want.payload)), retentionSum([]byte(got.payload)), retentionSum([]byte(want.projection)), retentionSum([]byte(got.projection)))
+		}
+	}
+	// The equal copies are gone, and the superseded revision is as it was.
+	for _, turn := range old.turns[2:] {
+		if n := f.count(`SELECT count(*) FROM usage_turn_revisions WHERE request_id=? AND revision=?`, turn.ID, turn.Revision); n != 0 {
+			t.Fatal("a copy of a current revision was kept")
+		}
+	}
+	if got := f.tableRows("usage_turn_revisions WHERE revision=1 AND request_id='"+old.turns[3].ID+"'", "payload,projection"); got != superseded || !strings.HasPrefix(got, "1 rows") {
+		t.Fatalf("superseded revision: %s, then %s", superseded, got)
+	}
+	if n := f.count(`SELECT count(*) FROM usage_turn_revisions`); n != 3 {
+		t.Fatalf("%d revision rows, want the two differing ones and the superseded one", n)
+	}
+
+	// Every turn, the two with a differing revision among them, is converted
+	// as in a fixture without one: no payload, the projection it had.
+	for _, turn := range old.turns {
+		if got := f.text(`SELECT payload FROM usage_turns WHERE request_id=?`, turn.ID); got != "" {
+			t.Fatalf("turn kept %d payload bytes", len(got))
+		}
+		var projection struct {
+			Turn json.RawMessage `json:"turn"`
+		}
+		raw := f.text(`SELECT projection FROM usage_turns WHERE request_id=?`, turn.ID)
+		if raw != projections[turn.ID] || json.Unmarshal([]byte(raw), &projection) != nil {
+			t.Fatal("a projection changed")
+		}
+		retentionSame(t, "a turn does not rebuild", []byte(old.payloads[turn.ID]), projection.Turn)
+	}
+	if got := f.text(`SELECT payload FROM usage_turns WHERE request_id='turn-odd'`); got != old.payloads["turn-odd"] {
+		t.Fatal("an unequal payload was rewritten")
+	}
+	if n := f.count(`SELECT count(*) FROM usage_turns`); n != 5 {
+		t.Fatalf("%d turns", n)
+	}
+
+	// Totals and what a report reads did not move.
+	for _, table := range []string{"usage_item_shares", "usage_turn_totals", "release_action_receipts", "release_check_lists", "team_queue_entries"} {
+		if before[table] != after[table] {
+			t.Fatalf("%s changed: %s, then %s", table, before[table], after[table])
+		}
+	}
+	retentionSame(t, "usage report changed", reportBefore, report())
+	if a, b := digestLines(digestBefore, "project", "table"), digestLines(digestAfter, "project", "table"); a != b || a == "" {
+		t.Fatalf("digest project and table lines changed: sha256 %s, then %s", retentionSum([]byte(a)), retentionSum([]byte(b)))
+	}
+	for digest, wants := range map[string][]string{
+		digestBefore: {"table usage_turns rows=5 ", "table usage_turn_revisions.superseded rows=1 ", "form usage_turns new=0 old=5\n", "form usage_turn_revisions new=1 old=4\n"},
+		digestAfter:  {"table usage_turns rows=5 ", "table usage_turn_revisions.superseded rows=1 ", "form usage_turns new=4 old=1\n", "form usage_turn_revisions new=1 old=2\n"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(digest, want) {
+				t.Fatalf("a digest lacks a line starting %q", want)
+			}
+		}
+	}
+
+	// The ledger counts the two differing rows as left with the superseded
+	// one, and the turn step as it does without them.
+	for _, want := range []struct {
+		step                      string
+		examined, converted, left int
+	}{
+		{"revisions", 5, 2, 3},
+		{"turn-payload", 5, 4, 1},
+	} {
+		state, examined, converted, left := f.ledger(want.step)
+		if state != "done" || examined != want.examined || converted != want.converted || left != want.left {
+			t.Fatalf("%s: %s examined %d converted %d left %d", want.step, state, examined, converted, left)
+		}
+	}
+}
+
 // retentionCopy copies a closed database file.
 func retentionCopy(t *testing.T, from, to string) {
 	t.Helper()
