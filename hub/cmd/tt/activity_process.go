@@ -22,6 +22,8 @@ import (
 
 // The wrapper writes this local receipt for its exact runtime child. It stays
 // on the launch host and contains no transcript, arguments or credentials.
+// SessionError is set only when both reads of the tmux session identity
+// failed, so the receipt was saved without SessionID and SessionCreated.
 type runtimeProcessReceipt struct {
 	Hub            string    `json:"hub"`
 	Task           string    `json:"task"`
@@ -35,8 +37,16 @@ type runtimeProcessReceipt struct {
 	Started        string    `json:"started,omitempty"`
 	SessionID      string    `json:"sessionId,omitempty"`
 	SessionCreated string    `json:"sessionCreated,omitempty"`
+	SessionError   string    `json:"sessionError,omitempty"`
 	ExitedAt       time.Time `json:"exitedAt,omitempty"`
 }
+
+// A busy host can take longer than the first deadline just to start tmux, and
+// a receipt saved without its session identity is never completed later: the
+// session probe reports that run as unknown for the rest of its life. So a
+// failed read is retried once with a longer deadline before the receipt is
+// saved without it.
+var runtimeSessionReadTimeouts = [2]time.Duration{2 * time.Second, 10 * time.Second}
 
 func runtimeProcessPath(hub, agent, run string) string {
 	b := runtimeBinding{Hub: hub, Agent: agent}
@@ -64,16 +74,23 @@ func recordRuntimeProcess(e env, pid int) {
 	}
 	identity, _ := runtimeProcessIdentity(pid)
 	receipt := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: os.Getenv(spawn.EnvSession), Socket: os.Getenv("TT_TMUX_SOCKET"), PID: pid, Started: identity}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if sessions, err := localSessions(ctx); err == nil {
+	for attempt, timeout := range runtimeSessionReadTimeouts {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		sessions, err := localSessions(ctx)
+		cancel()
+		if err != nil {
+			receipt.SessionError = fmt.Sprintf("tmux session identity unread after %d attempts: %v", attempt+1, err)
+			continue
+		}
+		receipt.SessionError = ""
 		for _, s := range sessions {
 			if s.valid() && s.Hub == receipt.Hub && s.Task == receipt.Task && s.Agent == receipt.Agent && s.Run == receipt.Run && s.Name == receipt.Session {
 				receipt.SessionID, receipt.SessionCreated = s.ID, s.Created
 				break
 			}
 		}
+		break
 	}
-	cancel()
 	_ = writePrivateJSON(runtimeProcessPath(e.hub, e.agent, e.runID), receipt)
 }
 

@@ -165,6 +165,55 @@ func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 	}
 }
 
+// A failed read of the tmux session identity is retried once; only two failed
+// reads save a receipt without it, and that receipt says so.
+func TestWrapperRetriesSessionIdentityReadOnce(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+	t.Setenv(spawn.EnvSession, "tt-handler-0123456789abcdef")
+	t.Setenv("TT_TMUX_SOCKET", "synthetic-activity-retry")
+	if err := os.WriteFile(filepath.Join(home, "ps"), []byte("#!/bin/sh\nprintf 'synthetic-start\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	calls := filepath.Join(home, "calls")
+	line := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
+	// The fake tmux fails its first FAILS calls, then prints the session.
+	fake := "#!/bin/sh\nprintf x >> '" + calls + "'\nif [ \"$(wc -c < '" + calls + "')\" -le \"$FAKE_TMUX_FAILS\" ]; then echo 'synthetic tmux failure' >&2; exit 1; fi\nprintf '%s\\n' '" + line + "'\n"
+	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte(fake), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	e := env{hub: "https://synthetic.invalid", task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	record := func(fails string) (runtimeProcessReceipt, int) {
+		t.Helper()
+		t.Setenv("FAKE_TMUX_FAILS", fails)
+		if err := os.RemoveAll(calls); err != nil {
+			t.Fatal(err)
+		}
+		recordRuntimeProcess(e, 4321)
+		var receipt runtimeProcessReceipt
+		data, err := os.ReadFile(runtimeProcessPath(e.hub, e.agent, e.runID))
+		if err != nil || json.Unmarshal(data, &receipt) != nil {
+			t.Fatalf("receipt after %s failed reads: %v", fails, err)
+		}
+		made, _ := os.ReadFile(calls)
+		return receipt, len(made)
+	}
+	if receipt, made := record("0"); made != 1 || receipt.SessionID != "$1" || receipt.SessionCreated != "123" || receipt.SessionError != "" {
+		t.Fatalf("first read succeeded: %d reads %+v", made, receipt)
+	}
+	if receipt, made := record("1"); made != 2 || receipt.SessionID != "$1" || receipt.SessionCreated != "123" || receipt.SessionError != "" {
+		t.Fatalf("one failed read then success: %d reads %+v", made, receipt)
+	}
+	receipt, made := record("2")
+	if made != 2 || receipt.SessionID != "" || receipt.SessionCreated != "" || !strings.Contains(receipt.SessionError, "unread after 2 attempts") {
+		t.Fatalf("two failed reads: %d reads %+v", made, receipt)
+	}
+	if receipt.PID != 4321 || receipt.Started != "synthetic-start" || nativeRuntimeSessionProbe(receipt) == nil {
+		t.Fatalf("receipt without session identity: %+v", receipt)
+	}
+}
+
 // The fake commands expose precisely the columns used by production discovery.
 func TestActivityHandlerRuntimeAdoption(t *testing.T) {
 	home := t.TempDir()
