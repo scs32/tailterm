@@ -543,7 +543,10 @@ test("store race checks name the sharded matrix command", () => {
   // package named across a comma or a period still counts. A reading that
   // names the store package or ./..., which includes it, is refused without
   // the shard flag or with a timeout under 45 minutes. The last dot of ./...
-  // is part of the pattern and does not end a clause.
+  // is part of the pattern and does not end a clause. A third reading keeps to
+  // one command: from the nearest go test or verify-matrix.mjs before the flag
+  // to the next one after it, so a command joined to the sharded one by words,
+  // a bracket or a colon cannot borrow its shard flag and timeout.
   const breaks = /(?<!\.\/\.\.)\. |; |, /g;
   const refused = (command) => {
     const timeout = /-timeout[= ](\d+)m/.exec(command);
@@ -552,17 +555,22 @@ test("store race checks name the sharded matrix command", () => {
       (!command.includes("-shards=./internal/store=") || !timeout || Number(timeout[1]) < 45)
     );
   };
+  const starts = /go test|verify-matrix\.mjs/g;
   const unsafe = (text) => {
     const found = [];
     for (const line of text.split("\n")) {
       const marks = [...line.matchAll(breaks)].map((mark) => mark.index);
+      const heads = [...line.matchAll(starts)].map((head) => head.index);
       for (let at = line.indexOf("-race"); at >= 0; ) {
         const next = line.indexOf("-race", at + 1);
         const stop = next < 0 ? line.length : next;
         const clause = line.slice((marks.findLast((mark) => mark < at) ?? -1) + 1, Math.min(stop, marks.find((mark) => mark > at) ?? stop));
         const sentence = line.slice(Math.max(line.lastIndexOf(". ", at), line.lastIndexOf("; ", at)) + 1, stop);
+        const head = heads.findLast((start) => start < at);
+        const command = head === undefined ? "" : line.slice(head, heads.find((start) => start > at) ?? line.length);
         if (refused(clause)) found.push(clause.trim());
         else if (refused(sentence)) found.push(sentence.trim());
+        else if (refused(command)) found.push(command.trim());
         at = next;
       }
     }
@@ -591,6 +599,20 @@ test("store race checks name the sharded matrix command", () => {
   assert.equal(unsafe("Run go test -race -timeout 30m. Use ./internal/store").length, 1);
   assert.equal(unsafe("Run go test -race ./cmd/tt").length, 0);
   assert.equal(unsafe(full).length, 0);
+  const sharded = full.slice(0, -1);
+  assert.deepEqual(unsafe(`${sharded} (not go test -race -timeout 30m ./internal/store).`), [
+    "go test -race -timeout 30m ./internal/store).",
+  ]);
+  assert.equal(unsafe(`${sharded} [not go test -race -timeout 30m ./internal/store]`).length, 1);
+  assert.equal(unsafe(`${sharded} instead of go test -race -timeout 30m ./internal/store`).length, 1);
+  assert.equal(unsafe(`${sharded} or go test -race ./...`).length, 1);
+  assert.equal(unsafe(`${sharded} or go test -race -timeout 60m ./internal/store`).length, 1);
+  assert.equal(unsafe(`${sharded}: not go test -race ./internal/store`).length, 1);
+  assert.equal(unsafe(`${sharded}, or go test -race ./...`).length, 1);
+  assert.equal(unsafe(`${sharded}\nnot go test -race -timeout 30m ./internal/store`).length, 1);
+  assert.equal(unsafe(`${sharded}\nor go test -race ./...`).length, 1);
+  assert.equal(unsafe(`${sharded} (run from hub/)`).length, 0);
+  assert.equal(unsafe(`${sharded} instead of go test ./internal/store`).length, 0);
   const texts = [
     ...[...TEAM_EXAMPLES, ...QUEUE_TEAM_TEMPLATES].flatMap((team) =>
       exampleTeam(team.id).members.map((member) => [`${team.id}/${member.name}`, member.prompt]),
