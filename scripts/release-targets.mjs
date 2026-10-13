@@ -66,8 +66,9 @@ process.stdout.write(JSON.stringify(JSON.parse(input).map(p => { try { return { 
 // scripts/ and tests/ unmodified, so the module and its imports are the
 // candidate's files. Any failure (no map in the commit, another HEAD, a failed
 // or slow child, output of any other shape, a target outside the four names)
-// answers null for every path asked: the path stays unknown.
-export function candidateKnown(cwd, commit) {
+// answers null for every path asked: the path stays unknown. A child still
+// running at timeoutMs is killed with SIGKILL, which it cannot trap.
+export function candidateKnown(cwd, commit, { timeoutMs = 20000 } = {}) {
   const answers = new Map(), git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   let usable;
   const ask = paths => {
@@ -78,7 +79,7 @@ export function candidateKnown(cwd, commit) {
         usable = git("rev-parse", "HEAD").trim() === commit && git("status", "--porcelain", "--untracked-files=no", "--", "scripts", "tests") === "";
       }
       if (!usable) return null;
-      const raw = execFileSync(process.execPath, ["--input-type=module", "-e", CANDIDATE_MAP], { cwd, env: { PATH: process.env.PATH || "" }, input: JSON.stringify(paths), encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], timeout: 20000, maxBuffer: 1024 * 1024 });
+      const raw = execFileSync(process.execPath, ["--input-type=module", "-e", CANDIDATE_MAP], { cwd, env: { PATH: process.env.PATH || "" }, input: JSON.stringify(paths), encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 });
       const said = JSON.parse(raw);
       const shaped = e => e && typeof e === "object" && !Array.isArray(e) && Object.keys(e).length === 1 && (e.unknown === true || (Array.isArray(e.targets) && e.targets.every(t => targets.includes(t))));
       return Array.isArray(said) && said.length === paths.length && said.every(shaped) ? said : null;

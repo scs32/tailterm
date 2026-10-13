@@ -207,7 +207,9 @@ and the first release are separate operational steps.
   checkout would leave its working tree showing the release reversed. Before
   publication this is the ordinary refusal: one escalation, no fence.
 - **Target selection.** Targets are selected from the integrated commit before
-  the integrated matrix run, the inputs request and the push. A changed path that
+  a single job's integrated matrix run, the inputs request and the push. For a
+  batch, selection comes after the batch's matrix run and before the inputs
+  request and the push. A changed path that
   no map knows is the ordinary refusal before publication: one escalation whose
   reason is `Unknown release path: PATH` (with `and N more` for further paths),
   journal step `select`, no revert and no bug request. A path the running map

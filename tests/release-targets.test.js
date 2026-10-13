@@ -5,7 +5,7 @@ import {mkdirSync, mkdtempSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {releaseBaselines, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
+import {candidateKnown, releaseBaselines, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -197,6 +197,17 @@ test("t2 a path the running map does not know is accepted only when the candidat
   const strict = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": standIn(`throw new Error("Unknown release path");`)});
   writeFileSync(join(strict.cwd, "scripts/release-targets.mjs"), KNOWS_FOLDER);
   assert.equal(reasonOf(() => selectReleaseTargets(strict.cwd, all(strict.base), strict.candidate)), NEW_REASON, "an uncommitted edit to the map");
+});
+
+test("t2 a candidate map that traps SIGTERM and never exits is killed at the timeout and leaves the path unknown", () => {
+  const hung = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": `process.on("SIGTERM", () => {});\nawait new Promise(() => setInterval(() => {}, 1000));\n` + KNOWS_FOLDER});
+  const started = Date.now();
+  assert.equal(reasonOf(() => targetsForPaths([NEW_FILE], candidateKnown(hung.cwd, hung.candidate, {timeoutMs: 1500}))), NEW_REASON);
+  const took = Date.now() - started;
+  assert.ok(took >= 1400 && took < 15000, `returned after ${took} ms`);
+  // The same map without the wait answers, so the refusal above is the kill.
+  const quick = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": `process.on("SIGTERM", () => {});\n` + KNOWS_FOLDER});
+  assert.deepEqual(targetsForPaths([NEW_FILE], candidateKnown(quick.cwd, quick.candidate)), []);
 });
 
 test("t2 the running map is the floor: the candidate's map adds targets for unknown paths and removes none", () => {

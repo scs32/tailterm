@@ -758,8 +758,9 @@ export async function runRelease(config, adapter) {
       const waiting=await verifyBatch();if(waiting)return waiting;
       integration={expected:state.expected,integrated:state.integrated};
     }
-    // Targets are selected before the integrated matrix run, the inputs
-    // request and the push, so a path no map knows refuses the job unpublished.
+    // Targets are selected before a single job's integrated matrix run, the
+    // inputs request and the push (for a batch, after the batch's matrix run
+    // above), so a path no map knows refuses the job unpublished.
     // A resumed wait selects again; the answer depends only on the commits.
     step={step:"select"};const selected=selectReleaseTargets(cwd,baselines,integration.integrated);step=null;
     if(!state.batch && integration.integrated!==job.commit){
