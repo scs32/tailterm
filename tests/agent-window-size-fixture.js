@@ -10,12 +10,27 @@ import { agentWindowSizeCommand, shellQuote } from "../shared/tmux-command.js";
 import { useDomRenderer } from "./dom-renderer.mjs";
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-async function wait(fn, label) {
-  for (let i = 0; i < 200; i++) {
+// A resize crosses a real SSH exec, a PTY and private tmux, and on a loaded
+// host it may arrive later than the 200 polls (about 8 s) this wait once
+// allowed. First attempts failed here and passed on retry, and the cause was
+// not established. So the wait ends on the clock instead, at the 30 s the work
+// order sets as the least. A met condition returns at once, as before. A
+// timeout states the elapsed time and the last probe, which tells a late
+// resize from a wrong or missing one.
+const WAIT_DEADLINE_MS = 30000;
+async function waitUntil(fn, label, probe) {
+  const started = Date.now();
+  do {
     if (await fn()) return;
     await pause(40);
-  }
-  throw Error("Agent sizing fixture timed out: " + label);
+  } while (Date.now() - started < WAIT_DEADLINE_MS);
+  const last = probe?.() ?? {},
+    seen = ["cols", "rows", "winch"].every((k) => Number.isInteger(last[k]))
+      ? `cols=${last.cols} rows=${last.rows} winch=${last.winch}`
+      : "unreadable";
+  throw Error(
+    `Agent sizing fixture timed out: ${label} after ${Date.now() - started} ms; last probe ${seen}`,
+  );
 }
 
 // tmux stops expanding a format after 100 ms and leaves the rest empty, still
@@ -540,6 +555,7 @@ export async function exerciseAgentWindowSizing({
       return {};
     }
   };
+  const wait = (fn, label) => waitUntil(fn, label, probe);
   const record = await source.evaluate(
     () =>
       new Promise((resolve, reject) => {
