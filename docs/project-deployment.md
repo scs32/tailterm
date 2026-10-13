@@ -678,6 +678,54 @@ directory of the deployer.`, once per job and reason for a process. That notice
 goes through the CLI that just failed, so it is best effort; the private record
 and the terminal line remain.
 
+**Transport errors are retried (wi_9cb499ac2a14a1a0).** A call of the
+configured `tt` that fails because the hub was not reached is made again
+before anything is refused. One slow call on a busy host must not refuse a
+release that has passed verification (incident of 2026-10-13).
+
+- **Bound.** At most 3 tries: the second 5 s after the first fails, the third
+  20 s after the second fails. No retry starts later than 60 s after the first
+  call began, and a retried call runs under at most 60 s. A call that hung for
+  its whole command timeout (600 s by default) is therefore made once. The
+  deployer waits synchronously, so nothing else in it runs during a wait.
+- **Transport error.** Read from the last line of the call's stderr: a
+  timeout (`context deadline exceeded`, `i/o timeout`, `timed out`, or a call
+  stopped at the runner's own command timeout), `connection refused`,
+  `connection reset`, or the hub line `hub: 502`, `hub: 503` or `hub: 504`.
+  Any other answer of the hub is final and is never retried: a refusal or a
+  validation answer (4xx with a reason) and a 500, whatever words it holds.
+- **Idempotent call.** Only these are retried: a `tt send` or a
+  `tt deployment` call that carries `--request-id` (the hub answers a repeat of
+  the id with the original), and the reads `tt deployment get`, `list` and
+  `handler` and `tt agents`. Any other call of the CLI is made once. No other
+  program is ever retried: not a build, a deploy, `wrangler` or a rollback
+  program. Publication to `tasks-hub` is a git step and is not repeated.
+- **A request sent at every poll waits.** The inputs request ("Import
+  immutable inputs for this release job") and the integrated verification
+  request ("Import verification for the integrated release commit") are sent
+  again at every poll under one request id, each after a read of the job. When
+  such a read or request still fails in transport after its tries, the job is
+  not refused: it stays in `waiting_inputs` or `waiting_matrix` and the next
+  poll, 30 s later, sends it again. The terminal prints "Release waits: a hub
+  call failed in transport; the next poll retries." and the Board gets the "A
+  deployer CLI call failed" notice above, once per job and reason for a
+  process. A refusal of such a request still fails the job as before.
+- **Any other call.** Once its tries are spent the job fails as it did
+  before the retry existed: refused when nothing was published, rolled back
+  otherwise. A rollback is delayed by at most the bound above per call. The
+  reason in the job journal (`refusalReason`, `failureDetail`) and in the
+  "Release refused before publication" notice names the cause and the number
+  of tries, for example `tt send timed out: context deadline exceeded, 3
+  tries` or `tt deployment check hub answered 503, 3 tries`, in place of
+  `tt send exit 1`. A fence check that fails this way is named so, not as
+  `release fence lost`. A transport error of a call that is not retried reads
+  `..., 1 try`. Only these fixed words reach the journal and the Board, never
+  the stderr line.
+- **Private record.** Every failed try is recorded in `cli-failures.json`,
+  including one a later try made good: a call that timed out once and then
+  succeeded leaves one record with `count` 1 and no notice, and three failed
+  tries of one call leave one record with `count` 3.
+
 ### Which notices wake (wi_991125f66a787459)
 
 Every notice the deployer posts with no recipient carries one ref, `wake`,

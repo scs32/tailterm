@@ -54,11 +54,12 @@ export function failureDetail(error) {
 // its first one or two argv words when they are plain lowercase words. No
 // flag, value or path of the call is ever part of it.
 const CLI_WORD = /^[a-z][a-z-]{0,23}$/;
-function childReason(argv, error, cli) {
+function childReason(argv, error, cli, transport) {
   const base = p => String(p).split("/").pop(), program = /\.(py|mjs)$/.test(argv[1] || "") ? base(argv[1]) : base(argv[0]);
   const word = i => argv[0] === cli && CLI_WORD.test(argv[i] || "") ? " " + argv[i] : "";
   const name = (/^[A-Za-z0-9._-]{1,64}$/.test(program) ? program : "program") + word(1) + (word(1) ? word(2) : "");
   if(error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")return `${name} ENOBUFS (command buffer overflow)`;
+  if(transport)return `${name} ${transport.cause}, ${transport.tries} ${transport.tries === 1 ? "try" : "tries"}`;
   const how = error.code === "ETIMEDOUT" ? "timeout" : /^SIG[A-Z0-9]{1,12}$/.test(error.signal || "") ? `signal ${error.signal}` : Number.isInteger(error.status) ? `exit ${error.status}` : "not started";
   let fields = "";
   try {
@@ -68,13 +69,43 @@ function childReason(argv, error, cli) {
   } catch {}
   return `${name} ${how}${fields}`;
 }
+// A transport error of a call of the configured CLI (wi_9cb499ac2a14a1a0): the
+// hub was not reached, or a proxy answered for it. It is read from the last
+// line of the call's stderr, and only one of these fixed phrases is returned,
+// never the line. A line that carries the hub's own answer ("hub: STATUS ...")
+// is a transport error only for 502, 503 and 504: a refusal or a validation
+// answer (4xx with a reason) and a 500 are the hub's decision. A call killed
+// at the runner's own command timeout printed nothing and counts as timed out.
+const TRANSPORT = [[/context deadline exceeded/i, "timed out: context deadline exceeded"], [/connection refused/i, "connection refused"], [/connection reset/i, "connection reset"], [/i\/o timeout|timed out|timeout/i, "timed out"]];
+function transportCause(error) {
+  if (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return null;
+  const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
+  const line = (text.slice(-CLI_STDERR_BYTES).trim().split("\n").at(-1) || "").slice(-1024), hub = /\bhub: (\d{3})\b/.exec(line);
+  if (hub) return ["502", "503", "504"].includes(hub[1]) ? `hub answered ${hub[1]}` : null;
+  return TRANSPORT.find(([shape]) => shape.test(line))?.[1] ?? (error.code === "ETIMEDOUT" ? "timed out" : null);
+}
+// The calls a transport error may repeat: a send or a deployment call that
+// carries a request id (the hub answers a repeat of the id with the original),
+// and the reads. Any other call is made once.
+function cliIdempotent(argv) {
+  const id = argv.indexOf("--request-id");
+  if (["send", "deployment"].includes(argv[1]) && id > 1 && argv[id + 1]) return true;
+  return (argv[1] === "deployment" && ["get", "list", "handler"].includes(argv[2])) || argv[1] === "agents";
+}
+// The bound of that retry: at most tries calls, delaysMs before the second and
+// the third, and no retry that would start later than windowMs after the first
+// call began. A retried call runs under at most windowMs, so a call that hung
+// for its whole command timeout (600 s by default) is never made again. The
+// wait is synchronous, like the calls; tests replace sleep.
+export const cliRetry = {tries: 3, delaysMs: [5000, 20000], windowMs: 60000, sleep: ms => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }};
 // What the private journal directory keeps of a failed call of the configured
 // CLI, in cli-failures.json (0600): the exact argv, working directory, exit
 // code, signal and the end of stderr. argv can hold Board text and private
 // paths, so none of it leaves this file; the Board and the job journal get
 // only childReason's text. The newest CLI_FAILURES distinct failures are kept;
 // a repeat of a kept one only raises its count and lastAt, so a failing poll
-// cannot grow the file. A record that cannot be written is dropped.
+// cannot grow the file. A record that cannot be written is dropped. Every
+// failed try of a retried call is recorded, a later success notwithstanding.
 const CLI_FAILURES = 20, CLI_STDERR_BYTES = 16384;
 // The hub's 409 for a native release call sent at a generation the job has
 // left (releaseConflict "generation changed"), as the CLI prints it. Only this
@@ -1007,13 +1038,25 @@ export class HostAdapter {
     this.cliFailures=[];}
   command(argv,cwd=this.config.cwd,{timeout=600000}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
-    try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout});}
-    catch(error){
-      const cli=this.config.tt||"tt",failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli);
-      if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
-      if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
-      if(argv[0]===cli && this.config.journalDirectory){try{this.cliFailures.push(recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now()));}catch{}}
-      throw failed;
+    // Only an idempotent call of the configured CLI is made again, and only
+    // after a transport error (cliRetry). The error thrown carries transport
+    // when the last try ended in one, and its reason names the cause and the
+    // number of tries.
+    const cli=this.config.tt||"tt",began=Date.now();
+    for(let tries=1;;tries++){
+      try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout:tries===1?timeout:Math.min(timeout,cliRetry.windowMs)});}
+      catch(error){
+        const cause=argv[0]===cli?transportCause(error):null,failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli,cause?{cause,tries}:null);
+        let kept=null;
+        if(argv[0]===cli && this.config.journalDirectory){try{kept=recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now());}catch{}}
+        const wait=cliRetry.delaysMs[tries-1];
+        if(cause && cliIdempotent(argv) && tries<cliRetry.tries && Number.isFinite(wait) && Date.now()-began+wait<=cliRetry.windowMs){cliRetry.sleep(wait);continue;}
+        if(cause)failed.transport=true;
+        if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
+        if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
+        if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
+        throw failed;
+      }
     }
   }
   detail(id){
@@ -1033,7 +1076,9 @@ export class HostAdapter {
   }
   // "generation-changed" when the hub refused the check only because the job's
   // generation moved; runRelease then decides whether to re-read (adoptGeneration).
-  async fence(){try{this.native("check");return true;}catch(error){return error?.generationChanged===true?"generation-changed":false;}}
+  // A check that could not reach the hub after its tries is thrown as it is,
+  // so the job's failure names that cause instead of a lost fence.
+  async fence(){try{this.native("check");return true;}catch(error){if(error?.transport===true)throw error;return error?.generationChanged===true?"generation-changed":false;}}
   // One re-read after a "generation changed" answer. detail() refuses a job
   // that is no longer this exact claim (agent and run), whose pause generation,
   // immutable pins, integrated commit or input pins differ, or that left
@@ -1065,7 +1110,9 @@ export class HostAdapter {
   async verifyIntegrated(job){
     // Independent release verification is imported by the handler. It is not
     // satisfied by deployer self-certification or a candidate-SHA receipt.
-    const current=this.detail(job.id);
+    // This read and the import request below are repeated at every poll, so
+    // a transport failure that outlasted its tries leaves the job waiting.
+    let current;try{current=this.detail(job.id);}catch(error){if(error?.transport===true)return false;throw error;}
     if(current?.integratedCommit===job.integratedCommit && current.integratedVerification?.commit===job.integratedCommit){this.job=current;return true;}
     // One directory per integrated commit and requeue attempt: a handler
     // requeue (a new reconciliation) never reuses an earlier attempt's host
@@ -1084,7 +1131,8 @@ export class HostAdapter {
     if(!existsSync(receiptPath))throw releaseError("Integrated matrix run ended without a receipt");
     // The receipt is read only once its run is gone, and imported only when eligible.
     if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
-    this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);
+    try{this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);}
+    catch(error){if(error?.transport===true)return false;throw error;}
     this.matrixImportRequested=true;
     return false;
   }
@@ -1268,9 +1316,14 @@ export class HostAdapter {
     return settled;
   }
   async verifyInputs(commit){
-    const current=this.detail(this.job.id);
+    // The read and the request are repeated at every poll under one request
+    // id, so a transport failure that outlasted its tries leaves the job
+    // waiting for the next poll.
+    let current;try{current=this.detail(this.job.id);}catch(error){if(error?.transport===true)return false;throw error;}
     if(current?.inputsCommit===commit && /^[a-f0-9]{64}$/.test(current.inputsDigest||"")){this.job=current;this.jobInputs(commit);return true;}
-    this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,`${this.job.id}-g${current.generation}-inputs.json`)} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-g${current.generation}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);return false;
+    try{this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import immutable inputs for this release job","--ask",`Prepare the private manifest ${join(this.config.journalDirectory,`${this.job.id}-g${current.generation}-inputs.json`)} for exact job ${this.job.id} accepted ${this.job.commit} integrated ${commit}; import its digest with tt deployment inputs --job --generation --commit --file. Include fresh exact-job backup/preflight pins and rollback programs; publication waits for saved handler input binding.`,"--request-id",`${this.job.id}-g${current.generation}-inputs-${commit}`,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`]);}
+    catch(error){if(error?.transport!==true)throw error;}
+    return false;
   }
   // The manifest the handler bound is the generation-named file whose bytes
   // hash to the hub's digest. The hub does not keep the generation it was
@@ -2076,7 +2129,12 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       // A batch's own members are not waiting behind its lead.
       let waiting=jobs;
       if(batch){try{const members=new Set(JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8")).batch?.jobs?.map(j=>j.jobId));waiting=jobs.filter(j=>!members.has(j.id));}catch{}}
-      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,waiting,adapter.job||current,result.outcome);
+      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome)){
+        notify(reader,waiting,adapter.job||current,result.outcome);
+        // A wait that follows a transport failure is named once, like a hold.
+        const unreached=adapter.cliFailures.filter(f=>f.transport===true);
+        if(unreached.length){process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");cliNotify(reader,unreached);}
+      }
       matrixNotify(reader,adapter.job||current,adapter);
       break;
     }

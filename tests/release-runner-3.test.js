@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
@@ -757,4 +757,136 @@ test("held s2 a stale runner whose only owned job is held restarts once, at the 
   assert.equal(sent[0].requestId,`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-restart-held-rel_held`);
   assert.match(err,/^Deployer restarting itself onto the published scripts\.\n/,name);
  }
+});
+
+// Transport retry (wi_9cb499ac2a14a1a0). A fake hub CLI over one claimed job
+// kept in a file: it answers get, check, handler, merged, refuse, finish and
+// send, logs every call, and fails a call with a rule's stderr and exit 1 when
+// the call is the from..to th of its operation (to null: every later one). A
+// send's operation is "send:" and its subject. The retry's wait is recorded
+// instead of slept.
+const DEADLINE='tt: Post "http://hub.invalid/api/tasks/tsk_fixture/messages": context deadline exceeded',INPUTS_SEND="send:Import immutable inputs for this release job",MATRIX_SEND="send:Import verification for the integrated release commit";
+function retryHost(t,rules=[]){
+ const f=fixture(),commit=change(f,"client/a.js","a"),home=mkdtempSync(join(tmpdir(),"release-retry-"));t.after(()=>{for(const d of [home,f.cwd,f.origin])rmSync(d,{recursive:true,force:true});});
+ const tt=join(home,"tt"),log=join(home,"calls.jsonl"),jobPath=join(home,"job.json"),faultPath=join(home,"faults.json");
+ const claimed={...job(f,commit),id:"rel_retry",itemId:"wi_0123456789abcdef",itemRevision:1,orderMessageSeq:7,generation:2,agentId:"agt_fixture",runId:"run_fixture"};
+ const fault=next=>writeFileSync(faultPath,JSON.stringify({rules:next,seen:{}}));fault(rules);writeFileSync(jobPath,JSON.stringify(claimed));
+ writeFileSync(tt,"#!"+process.execPath+`\nconst fs=require('fs'),a=process.argv.slice(2),flag=n=>a[a.indexOf(n)+1],op=a[0]==='send'?'send:'+flag('--subject'):a[1]||a[0];
+const faults=JSON.parse(fs.readFileSync(${JSON.stringify(faultPath)},'utf8')),n=faults.seen[op]=(faults.seen[op]||0)+1;fs.writeFileSync(${JSON.stringify(faultPath)},JSON.stringify(faults));
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({op,argv:a})+'\\n');
+const rule=faults.rules.find(r=>r.op===op&&n>=r.from&&(r.to===null||n<=r.to));if(rule){fs.writeSync(2,rule.stderr+'\\n');process.exit(1);}
+const job=JSON.parse(fs.readFileSync(${JSON.stringify(jobPath)},'utf8')),save=()=>{fs.writeFileSync(${JSON.stringify(jobPath)},JSON.stringify(job));console.log(JSON.stringify(job));};
+if(a[0]==='send')process.exit(0);
+if(a[1]==='handler')console.log(JSON.stringify({id:'agt_0123abcd'}));
+else if(['get','check'].includes(a[1]))console.log(JSON.stringify(job));
+else if(a[1]==='merged'){job.state='merged';job.generation++;job.integratedCommit=flag('--commit');save();}
+else if(a[1]==='refuse'){job.state='refused';job.generation++;save();}
+else if(a[1]==='finish'){const r=JSON.parse(fs.readFileSync(flag('--file'),'utf8'));job.state=r.outcome;job.generation++;job.receipt=r;save();}
+else process.exit(2);`);chmodSync(tt,0o755);
+ const slept=[],sleep=cliRetry.sleep;cliRetry.sleep=ms=>{slept.push(ms);};t.after(()=>{cliRetry.sleep=sleep;});
+ const saved=()=>JSON.parse(readFileSync(jobPath,"utf8"));
+ // A poll's adapter: the real CLI paths, with the target steps stubbed.
+ const adapter=()=>Object.assign(new HostAdapter({cwd:f.cwd,tt,journalDirectory:home},saved()),{prepare:async()=>({release:"fixture-release",artifactSHA256:"b".repeat(64)}),deploy:async()=>{},check:async()=>true,rollback:async()=>true,retain:async()=>{},jobInputs:()=>({targets:{}})});
+ const calls=()=>existsSync(log)?readFileSync(log,"utf8").trim().split("\n").filter(Boolean).map(l=>JSON.parse(l)):[];
+ const ops=name=>calls().filter(c=>c.op===name),journal=join(home,"rel_retry.json");
+ const release=a=>runRelease({...config(f,claimed),journalPath:journal},a);
+ const failures=()=>JSON.parse(readFileSync(join(home,"cli-failures.json"),"utf8")).failures;
+ return {f,commit,home,tt,claimed,fault,saved,bind:fields=>writeFileSync(jobPath,JSON.stringify({...saved(),...fields})),adapter,calls,ops,slept,journal,state:()=>JSON.parse(readFileSync(journal,"utf8")),release,failures};
+}
+const requestId=c=>c.argv[c.argv.indexOf("--request-id")+1];
+test("retry t4 a request that times out once is sent again and the release goes on: nothing is refused and one failure is recorded",async t=>{
+ const h=retryHost(t,[{op:INPUTS_SEND,from:1,to:1,stderr:DEADLINE}]),first=h.adapter();
+ assert.deepEqual(await h.release(first),{jobId:"rel_retry",outcome:"waiting_inputs"});
+ // The same keyed request twice, one wait between, and nothing left to report.
+ const sent=h.ops(INPUTS_SEND);assert.equal(sent.length,2);assert.equal(requestId(sent[0]),`rel_retry-g2-inputs-${h.commit}`);assert.equal(requestId(sent[1]),requestId(sent[0]));
+ assert.deepEqual(h.slept,[cliRetry.delaysMs[0]]);assert.deepEqual(first.cliFailures,[]);assert.equal(h.state().phase,"waiting_inputs");
+ let kept=h.failures();assert.equal(kept.length,1);assert.equal(kept[0].count,1);assert.equal(kept[0].exitCode,1);assert.equal(kept[0].stderr,DEADLINE+"\n");assert.equal(kept[0].jobId,"rel_retry");
+ // The handler binds the inputs; the next poll publishes and finishes.
+ h.bind({inputsCommit:h.commit,inputsDigest:"d".repeat(64)});
+ const receipt=await h.release(h.adapter());assert.equal(receipt.outcome,"released");assert.equal(receipt.commit,h.commit);
+ assert.equal(h.saved().state,"released");assert.equal(h.state().phase,"complete");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.commit);assert.equal(remoteHead(h.f),h.commit);
+ assert.equal(h.ops("refuse").length,0);assert.equal(h.ops("merged").length,1);assert.equal(h.ops("finish").length,1);assert.equal(h.ops("send:Release refused before publication").length,0);
+ assert.equal(h.state().refusalReason,undefined);assert.deepEqual(h.slept,[cliRetry.delaysMs[0]]);kept=h.failures();assert.equal(kept.length,1);assert.equal(kept[0].count,1);
+});
+test("retry t3 t4 a call that never succeeds is refused after three tries, and the journal and the notice name the cause",async t=>{
+ const h=retryHost(t,[{op:"check",from:2,to:null,stderr:DEADLINE}]),a=h.adapter(),reason="tt deployment check timed out: context deadline exceeded, 3 tries";
+ await assert.rejects(h.release(a),/Release refused before publication/);
+ // One good check, then three tries of the next with the two waits between.
+ assert.equal(h.ops("check").length,4);assert.deepEqual(h.slept,cliRetry.delaysMs);assert.equal(cliRetry.tries,3);assert.equal(new Set(h.ops("check").slice(1).map(requestId)).size,1);
+ const state=h.state();assert.equal(state.phase,"refused");assert.equal(state.refusalReason,reason);assert.equal(state.failureDetail.text,reason);assert.deepEqual(state.effects,[]);assert.notEqual(state.published,true);
+ const notice=h.ops("send:Release refused before publication");assert.equal(notice.length,1);const text=sendOf(notice[0]).text;
+ assert.ok(text.includes(`Reason: ${reason}.`));assert.match(text,SAFE_TEXT);assert.ok(!text.includes("hub.invalid"));assert.ok(!text.includes("exit 1"));
+ assert.equal(h.ops("refuse").length,1);assert.equal(h.saved().state,"refused");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.f.base);
+ // One private record counted three times; the adapter keeps the one spent failure.
+ const kept=h.failures();assert.equal(kept.length,1);assert.equal(kept[0].count,3);
+ assert.deepEqual(a.cliFailures.map(x=>[x.reason,x.transport]),[[reason,true]]);assert.equal(cliFailureNotice(a.cliFailures[0],CODE_RUN).text.includes(reason),true);
+});
+test("retry t1 t4 a hub refusal is never sent again, and only an idempotent call of the configured CLI is retried",async t=>{
+ // A 4xx on the fence check: one call, the fence is lost as before and nothing waits.
+ const h=retryHost(t,[{op:"check",from:2,to:null,stderr:"tt: hub: 409 conflict: release: job is not claimed"}]);
+ await assert.rejects(h.release(h.adapter()),/Release refused before publication/);
+ assert.equal(h.ops("check").length,2);assert.deepEqual(h.slept,[]);assert.equal(h.state().refusalReason,"release fence lost");assert.equal(h.failures()[0].count,1);
+ const get=[h.tt,"deployment","get","--job","rel_retry"],keyed=[h.tt,"send","--kind","notice","--subject","Keyed","--text","x","--request-id","rel_retry-keyed"];
+ const tried=(rules,argv,why)=>{h.fault(rules);const a=h.adapter(),before=h.calls().length,waits=h.slept.length;let reason="";try{a.command(argv);}catch(error){reason=failureReason(error);assert.equal(error.transport===true,/ tr(y|ies)$/.test(reason),why);}
+  return [h.calls().length-before,h.slept.length-waits,reason];};
+ // What counts as a transport error: the fixed causes, and 502, 503 and 504 only.
+ for(const [stderr,cause] of [[DEADLINE,"timed out: context deadline exceeded"],['tt: Get "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: connection refused',"connection refused"],["tt: read tcp 192.0.2.1:1->192.0.2.2:2: read: connection reset by peer","connection reset"],["tt: dial tcp 192.0.2.1:18765: i/o timeout","timed out"],["tt: hub: 502 Bad Gateway","hub answered 502"],["tt: hub: 503 Service Unavailable","hub answered 503"],["tt: hub: 504 Gateway Timeout","hub answered 504"]])
+  assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[3,2,`tt deployment get ${cause}, 3 tries`],stderr);
+ // The hub's own answer is final whatever its words: a refusal, a validation answer, a 500.
+ for(const stderr of ["tt: hub: 409 conflict: release: generation changed","tt: hub: 422 validation: subject mentions a timeout","tt: hub: 400 bad request: context deadline exceeded is not a subject","tt: hub: 404 not found","tt: hub: 500 internal: database connection reset"])
+  assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[1,0,"tt deployment get exit 1"],stderr);
+ assert.deepEqual(tried([{op:"send:Keyed",from:1,to:null,stderr:"tt: hub: 409 conflict: request id reused with other data"}],keyed,"keyed 409"),[1,0,"tt send exit 1"]);
+ // A keyed send and a keyed deployment call are retried; a success ends the tries.
+ assert.deepEqual(tried([{op:"send:Keyed",from:1,to:2,stderr:DEADLINE}],keyed,"keyed"),[3,2,""]);
+ assert.deepEqual(tried([{op:"refuse",from:1,to:null,stderr:DEADLINE}],[h.tt,"deployment","refuse","--job","rel_retry","--generation","2","--request-id","rel_retry-refuse-2"],"native"),[3,2,"tt deployment refuse timed out: context deadline exceeded, 3 tries"]);
+ // A call without a request id that is not a read is made once, and names its cause.
+ assert.deepEqual(tried([{op:"send:Bare",from:1,to:null,stderr:DEADLINE}],[h.tt,"send","--kind","notice","--subject","Bare","--text","x"],"bare send"),[1,0,"tt send timed out: context deadline exceeded, 1 try"]);
+ assert.deepEqual(tried([{op:"refuse",from:1,to:null,stderr:DEADLINE}],[h.tt,"deployment","refuse","--job","rel_retry","--generation","2"],"bare native"),[1,0,"tt deployment refuse timed out: context deadline exceeded, 1 try"]);
+ assert.deepEqual(tried([{op:"spawn",from:1,to:null,stderr:DEADLINE}],[h.tt,"spawn"],"other subcommand"),[1,0,"tt spawn timed out: context deadline exceeded, 1 try"]);
+ // Another program is never retried, whatever it prints.
+ const other=h.adapter(),waits=h.slept.length;assert.throws(()=>other.command([process.execPath,"-e","process.stderr.write('connection refused\\n');process.exit(5)"]),e=>failureReason(e)==="node exit 5"&&e.transport===undefined);assert.equal(h.slept.length,waits);
+ // No retry starts after the window: a wait that would pass it is not begun.
+ const window=cliRetry.windowMs;t.after(()=>{cliRetry.windowMs=window;});cliRetry.windowMs=cliRetry.delaysMs[0]-1;
+ assert.deepEqual(tried([{op:"get",from:1,to:null,stderr:DEADLINE}],get,"window"),[1,0,"tt deployment get timed out: context deadline exceeded, 1 try"]);
+ cliRetry.windowMs=cliRetry.delaysMs[0]+2000;
+ assert.deepEqual(tried([{op:"get",from:1,to:null,stderr:DEADLINE}],get,"window"),[2,1,"tt deployment get timed out: context deadline exceeded, 2 tries"]);
+});
+test("retry t2 a request sent at every poll waits for the next poll when its transport failure outlasts the tries",async t=>{
+ // The inputs request: three tries, then the job waits, unrefused, and the next poll sends the same request.
+ const h=retryHost(t,[{op:INPUTS_SEND,from:1,to:null,stderr:"tt: hub: 503 Service Unavailable"}]),a=h.adapter();
+ assert.deepEqual(await h.release(a),{jobId:"rel_retry",outcome:"waiting_inputs"});
+ assert.equal(h.ops(INPUTS_SEND).length,3);assert.deepEqual(h.slept,cliRetry.delaysMs);assert.equal(h.state().phase,"waiting_inputs");assert.equal(h.state().refusalReason,undefined);assert.equal(h.ops("refuse").length,0);assert.equal(h.saved().state,"claimed");
+ assert.deepEqual(a.cliFailures.map(x=>[x.reason,x.transport,x.jobId]),[["tt send hub answered 503, 3 tries",true,"rel_retry"]]);
+ h.fault([]);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_retry",outcome:"waiting_inputs"});
+ assert.equal(h.ops(INPUTS_SEND).length,4);assert.equal(new Set(h.ops(INPUTS_SEND).map(requestId)).size,1);
+ // Its reads wait the same way; a refusal of the request still fails the job's step.
+ const v=h.adapter();
+ h.fault([{op:"get",from:1,to:null,stderr:DEADLINE}]);assert.equal(await v.verifyInputs(h.commit),false);
+ h.fault([{op:"handler",from:1,to:null,stderr:DEADLINE}]);assert.equal(await v.verifyInputs(h.commit),false);
+ h.fault([{op:INPUTS_SEND,from:1,to:null,stderr:"tt: hub: 422 validation: the ask is too long"}]);const sends=h.ops(INPUTS_SEND).length;
+ await assert.rejects(v.verifyInputs(h.commit),reasonIs("tt send exit 1"));assert.equal(h.ops(INPUTS_SEND).length,sends+1);
+ // The integrated verification import request, from an ended run with an eligible receipt.
+ const integrated={...h.claimed,integratedCommit:h.commit},dir=join(h.home,"rel_retry-integrated-verification",h.commit+"-r0");mkdirSync(dir,{recursive:true});
+ writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"ended",reason:"receipt"}));writeFileSync(join(dir,"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));
+ const m=h.adapter();h.fault([{op:MATRIX_SEND,from:1,to:null,stderr:"tt: read tcp 192.0.2.1:1->192.0.2.2:2: read: connection reset by peer"}]);
+ assert.equal(await m.verifyIntegrated(integrated),false);assert.equal(h.ops(MATRIX_SEND).length,3);assert.notEqual(m.matrixImportRequested,true);
+ h.fault([{op:"get",from:1,to:null,stderr:DEADLINE}]);assert.equal(await m.verifyIntegrated(integrated),false);assert.equal(h.ops(MATRIX_SEND).length,3);
+ h.fault([{op:MATRIX_SEND,from:1,to:null,stderr:"tt: hub: 403 forbidden: not the deployer"}]);await assert.rejects(m.verifyIntegrated(integrated),reasonIs("tt send exit 1"));assert.equal(h.ops(MATRIX_SEND).length,4);
+ h.fault([]);assert.equal(await m.verifyIntegrated(integrated),false);assert.equal(m.matrixImportRequested,true);assert.equal(new Set(h.ops(MATRIX_SEND).map(requestId)).size,1);
+ assert.equal(requestId(h.ops(MATRIX_SEND)[0]),`rel_retry-integrated-matrix-${h.commit}`);
+});
+test("retry t2 t3 the deployer names a waiting job's spent transport failure once, in safe words, and holds nothing",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-retry-wait-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const sleep=cliRetry.sleep,slept=[];cliRetry.sleep=ms=>{slept.push(ms);};t.after(()=>{cliRetry.sleep=sleep;});
+ const h=codeHost(t,cwd,`if(a[1]==='handler'){fs.writeSync(2,'tt: Get "http://hub.invalid/'+${JSON.stringify(HELD_SECRET)}+'": dial tcp: connect: connection refused\\n');process.exit(1);}`);h.setJobs([verifiedJob("rel_wait")]);
+ const waits=async(c,adapter)=>{try{adapter.handler();}catch(error){assert.equal(error.transport,true);}return {jobId:c.job.id,outcome:"waiting_inputs"};};
+ const reason="tt deployment handler connection refused, 3 tries",line="Release waits: a hub call failed in transport; the next poll retries.\n";
+ assert.equal(await h.poll(null,waits),line);assert.deepEqual(slept,cliRetry.delaysMs);
+ const told=()=>h.sends().filter(s=>s.subject==="A deployer CLI call failed");
+ assert.equal(told().length,1);assert.equal(told()[0].text,cliFailureNotice({reason,jobId:"rel_wait"},CODE_RUN).text);assert.ok(told()[0].text.includes(`Deployer CLI call failed: ${reason} (release rel_wait).`));assert.match(told()[0].text,SAFE_TEXT);
+ for(const c of h.calls())for(const word of c.argv)assert.ok(!word.includes(HELD_SECRET)&&!word.includes("hub.invalid"));
+ assert.equal(h.calls().filter(c=>c.argv[1]==="handler").length,3);assert.equal(existsSync(join(h.home,"rel_wait.json")),false);
+ // A job that waits with no transport failure prints and posts nothing more.
+ const quiet=codeHost(t,cwd);quiet.setJobs([verifiedJob("rel_quiet")]);
+ assert.equal(await quiet.poll(null,async c=>({jobId:c.job.id,outcome:"waiting_inputs"})),"");assert.equal(quiet.sends().filter(s=>s.subject==="A deployer CLI call failed").length,0);
 });
