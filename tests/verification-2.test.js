@@ -1129,8 +1129,11 @@ test("matrix timeout kills its own process group descendants and retains failed 
   // descendant to kill (seen at load 6 to 8: one of three recorded). Each
   // attempt's timeout is held, one more period at a time and at most 40, until
   // that attempt's descendant has recorded its listener; every other timer is
-  // untouched. The periods added are taken off the promptness bound, which
-  // still allows the same 10 s for three timeouts and their kills.
+  // untouched. The periods added are taken off the promptness bound. That
+  // bound is 30 s, not 10 s: the three timeouts and kills take 5.25 s and the
+  // rest is the runner's own start, home and cleanup work, which alone passed
+  // 5 s under a process-start load. A run that waited on the descendants,
+  // which ignore SIGTERM and never exit, would not return at all.
   const realSetTimeout = globalThis.setTimeout;
   t.after(() => {
     globalThis.setTimeout = realSetTimeout;
@@ -1154,7 +1157,7 @@ test("matrix timeout kills its own process group descendants and retains failed 
   const started = Date.now();
   const receipt = await runPlan(plan, f.cwd, external);
   globalThis.setTimeout = realSetTimeout;
-  assert(Date.now() - started - heldMs < 10000, "timeout completes promptly");
+  assert(Date.now() - started - heldMs < 30000, "timeout completes promptly");
   assert(
     !existsSync(receipt.environment.HOME),
     "timed out run removed its home",
