@@ -594,6 +594,66 @@ func TestVerificationLegacyCompletionPreserved(t *testing.T) {
 	}
 }
 
+// A legacy plan (maxAttempts 0, no known failures) keeps a failed receipt as
+// evidence, but no completion path may accept it. The reviewer has passed the
+// candidate, so the receipt is the only thing each gate can refuse.
+func TestVerificationLegacyFailedReceiptImportsButBlocksCompletion(t *testing.T) {
+	// Accept and the queue gate name the candidate, so they reach the failed
+	// check. The done saves have no saved acceptance to take a candidate from
+	// and are refused one step earlier.
+	const failed = "unlisted exhausted failure blocks completion"
+	const unaccepted = "passing receipt for current scope and exact accepted candidate required"
+	for _, c := range []struct {
+		reason string
+		code   int
+	}{{"exit", 1}, {"timeout", 124}} {
+		t.Run(c.reason, func(t *testing.T) {
+			f, h, p := verificationFixture(t)
+			if p.MaxAttempts != 0 || len(p.KnownFailures) != 0 {
+				t.Fatal("fixture plan is not legacy", p.MaxAttempts, p.KnownFailures)
+			}
+			request := f.review(t, p.Commit)
+			if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "legacy-plan", AgentID: h.ID, RunID: h.RunID, Plan: &p}); err != nil {
+				t.Fatal(err)
+			}
+			r := passingVerification(p)
+			r.Checks[0].ExitCode = c.code
+			r.Checks[0].FailureReason = c.reason
+			if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "legacy-failed-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+				t.Fatal("failed legacy receipt rejected", err)
+			}
+			history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+			if err != nil || len(history) != 2 || !reflect.DeepEqual(history[1].Receipt, &r) {
+				t.Fatal("failed legacy receipt not in history", history, err)
+			}
+			refused := func(gate, reason string, err error) {
+				t.Helper()
+				if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), reason) {
+					t.Fatal(gate, err)
+				}
+			}
+			accept := api.Envelope{Kind: "notice", Subject: "Accept exact fixture candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: p.Commit}}
+			_, err = f.post(accept, "", 0, api.Agent{})
+			refused("accept gate", failed, err)
+			done := "done"
+			_, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by)
+			refused("PATCH gate", unaccepted, err)
+			_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{RequestID: "keyed-done", ExpectedRevision: 1, Status: &done}, f.by)
+			refused("keyed gate", unaccepted, err)
+			tx, _ := f.s.db.BeginTx(f.ctx, nil)
+			err = reviewCompletion(f.ctx, tx, f.item, p.Commit)
+			tx.Rollback()
+			refused("queue gate", failed, err)
+			if item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID); err != nil || item.Status == "done" || item.Revision != 1 {
+				t.Fatal("refused completion changed the item", item, err)
+			}
+		})
+	}
+}
+
 func retryVerification(p api.VerificationPlan, codes ...int) api.VerificationReceipt {
 	r := passingVerification(p)
 	for i := range r.Checks {
