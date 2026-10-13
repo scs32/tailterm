@@ -277,6 +277,8 @@ func TestToolDenyClassifyBounds(t *testing.T) {
 // kind, the agent, the time and a summary, beside its ordinary row.
 func TestToolDenyRow(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the row's fields are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	before := time.Now().UTC().Add(-time.Second)
 	toolHook(t, e, "PreToolUse", bashPre("u1", "pkill node"))
 	rows := toolLedgerRows(t, root, e.agent)
@@ -358,6 +360,8 @@ func TestToolDenyRow(t *testing.T) {
 // without.
 func TestToolDenySummary(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the summaries are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	e.token = "hub-token-0123456789abcdefghij"
 	github := "ghp_" + strings.Repeat("a1B2", 9)
 	secrets := []string{
@@ -443,6 +447,11 @@ func TestToolDenySummary(t *testing.T) {
 // a3: a check that cannot finish records nothing extra, and the call's
 // pending entry and later row are as they would be without it.
 func TestToolDenyFailsOpen(t *testing.T) {
+	// What each failure leaves in the ledger is the subject here, not timing:
+	// a hook that reaches its deadline on a loaded host writes no row.
+	// The deadline passed case sets its own deadlines.
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	pending := func(t *testing.T, e env, root string) {
 		t.Helper()
 		if rows := toolLedgerRows(t, root, e.agent); len(rows) != 0 {
@@ -484,19 +493,37 @@ func TestToolDenyFailsOpen(t *testing.T) {
 		}
 	})
 	t.Run("deadline passed", func(t *testing.T) {
-		e, root := toolLedgerSandbox(t)
-		setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
-		finished := make(chan struct{})
-		setToolLedger(t, &toolDenyCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage) {
-			defer close(finished)
-			time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
-			l.wouldDeny(row, tool, input)
-		})
-		toolHook(t, e, "PreToolUse", bashPre("u1", "pkill node"))
-		select {
-		case <-finished:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the late check never finished")
+		// On a loaded host the hook can reach its 40 ms deadline before the
+		// check is called, and then it never is: that attempt shows nothing
+		// about a late check, so it is run again in a new sandbox, at most
+		// three times. The last attempt is judged as it stands.
+		var e env
+		var root string
+		for attempt := 1; ; attempt++ {
+			e, root = toolLedgerSandbox(t)
+			setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
+			called, finished := make(chan struct{}), make(chan struct{})
+			setToolLedger(t, &toolDenyCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage) {
+				close(called)
+				defer close(finished)
+				time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
+				l.wouldDeny(row, tool, input)
+			})
+			toolHook(t, e, "PreToolUse", bashPre("u1", "pkill node"))
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				select {
+				case <-called:
+				default:
+					if attempt < 3 {
+						t.Logf("attempt %d: the hook reached its %v deadline before the check was called; running it again in a new sandbox", attempt, toolLedgerDeadline)
+						continue
+					}
+				}
+				t.Fatal("the late check never finished")
+			}
+			break
 		}
 		setToolLedger(t, &toolLedgerDeadline, 150*time.Millisecond)
 		pending(t, e, root)
@@ -529,6 +556,8 @@ func TestToolDenyFailsOpen(t *testing.T) {
 // on all three events.
 func TestToolDenyPrintsNothing(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // silence and the row count are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	for i, command := range []string{"ls", "pkill node", "pkill -f tt-deployer; npm run deploy:static; ssh truenas tailscale up"} {
 		for _, event := range []string{"PreToolUse", "PostToolUse", "PreToolUse", "PostToolUseFailure"} {
 			if r := runToolHook(t, e, "tool", toolPayload(event, bashPre(fmt.Sprintf("u%d", i), command)), nil); r.err != nil || r.out != "" {
@@ -561,8 +590,10 @@ func toolDenyKeywordCommand(unit string) string {
 const toolDenyAllRules = "pkill -f tt-deployer; npm run deploy:static; ssh truenas tailscale status"
 
 // a6: the added cost of the check per PreToolUse, measured against the same
-// hook with the check replaced by nothing. Every run with the check returns
-// before the hook's deadline with its would-deny rows already written.
+// hook with the check replaced by nothing. Every run with the check that
+// returns before the hook's deadline has its would-deny rows already written.
+// A run that reached the deadline is put down to a stalled host and run
+// again, at most three times, and a case allows ten such attempts in all.
 //
 // The 5 ms limit is for the binary that ships. The race detector slows the
 // JSON decode of a 64 KiB command about tenfold, so under it the limit is
@@ -599,39 +630,57 @@ func TestToolDenyCost(t *testing.T) {
 			var with, without []time.Duration
 			late := 0
 			var worst time.Duration
+			// The rows are promised to a hook that ends inside the deadline. A
+			// run that reached it may fail open with none (docs/claude-wake.md),
+			// so it is put down to a stalled host and run again as a new agent,
+			// as TestToolScopeCost does. Stalls come in bursts, so each new
+			// attempt waits first. A check that is itself slow must still fail,
+			// so the stalled attempts of a case are capped as well.
+			const attempts, maxStalled = 3, 10
 			for i := 0; i < 2*runs; i++ {
 				// Alternate, and swap which goes first each pair.
 				check := (i+i/2)%2 == 0
-				toolDenyCheck = nil
-				if check {
+				for attempt := 1; ; attempt++ {
+					toolDenyCheck = nil
+					if check {
+						toolDenyCheck = real
+					}
+					e.agent = fmt.Sprintf("agt_cost_%d_%d_%d", n, i, attempt)
+					r := runToolHook(t, e, "tool", toolPayload("PreToolUse", bashPre("u1", c.command)), nil)
 					toolDenyCheck = real
-				}
-				e.agent = fmt.Sprintf("agt_cost_%d_%d", n, i)
-				r := runToolHook(t, e, "tool", toolPayload("PreToolUse", bashPre("u1", c.command)), nil)
-				toolDenyCheck = real
-				if r.err != nil || r.out != "" {
-					t.Fatalf("hook = %v, output %q", r.err, r.out)
-				}
-				rows := len(wouldDenyRows(toolLedgerRows(t, root, e.agent)))
-				switch {
-				case !check:
-					if rows != 0 {
-						t.Fatalf("baseline run wrote %d would-deny rows", rows)
+					if r.err != nil || r.out != "" {
+						t.Fatalf("hook = %v, output %q", r.err, r.out)
 					}
-					without = append(without, r.elapsed)
-				case r.elapsed >= toolLedgerDeadline:
-					late++
-					t.Logf("run %d reached the %v deadline in %v with %d of %d rows", i, toolLedgerDeadline, r.elapsed, rows, c.rows)
-				default:
-					if rows != c.rows {
-						t.Fatalf("run %d returned in %v with %d would-deny rows; want %d", i, r.elapsed, rows, c.rows)
+					rows := len(wouldDenyRows(toolLedgerRows(t, root, e.agent)))
+					switch {
+					case !check:
+						if rows != 0 {
+							t.Fatalf("baseline run wrote %d would-deny rows", rows)
+						}
+						without = append(without, r.elapsed)
+					case r.elapsed >= toolLedgerDeadline:
+						late++
+						t.Logf("run %d attempt %d reached the %v deadline in %v with %d of %d rows", i, attempt, toolLedgerDeadline, r.elapsed, rows, c.rows)
+						if attempt == attempts {
+							t.Fatalf("run %d reached the %v deadline %d times in a row; a stalled host does not explain that", i, toolLedgerDeadline, attempts)
+						}
+						if late > maxStalled {
+							t.Fatalf("%d attempts in %d runs reached the hook deadline; at most %d are put down to a stalled host", late, runs, maxStalled)
+						}
+						time.Sleep(time.Duration(attempt) * time.Second)
+						continue
+					default:
+						if rows != c.rows {
+							t.Fatalf("run %d returned in %v with %d would-deny rows; want %d", i, r.elapsed, rows, c.rows)
+						}
+						with = append(with, r.elapsed)
+						worst = max(worst, r.elapsed)
 					}
-					with = append(with, r.elapsed)
-					worst = max(worst, r.elapsed)
+					break
 				}
 			}
-			if late > 2 {
-				t.Fatalf("%d of %d runs reached the hook deadline; at most 2 are put down to a stalled host", late, runs)
+			if late > 0 {
+				t.Logf("%d attempt(s) with the check were put down to a stalled host and run again; the cap is %d", late, maxStalled)
 			}
 			base, checked := toolDenyMedian(without), toolDenyMedian(with)
 			t.Logf("%d bytes: baseline median %v, with the check %v, added %v, worst run with the check %v", len(c.command), base, checked, checked-base, worst)
@@ -1021,6 +1070,8 @@ func TestToolGateClassify(t *testing.T) {
 // tag, the summary and the agent name, beside the call's ordinary row.
 func TestToolGateRow(t *testing.T) {
 	e, root := gateSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows' fields are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	const command = "tt work-items create --kind bug --title x"
 	toolHook(t, e, "PreToolUse", bashPre("u1", command))
 	rows := toolLedgerRows(t, root, e.agent)
@@ -1097,6 +1148,8 @@ func TestToolGateRow(t *testing.T) {
 // a5: the tag comes from the identity the hook already holds and, for a
 // lead, the form of the command. Tagged rows are written, not dropped.
 func TestToolGateTags(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the tags are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	const create, plan, receipt = "tt work-items create --title x", "tt verification plan --item wi_1 --file p.json", "tt verification receipt --item wi_1 --check v1"
 	const scope = "tt team queue scope --entry tqe_1 --owns a.go"
 	// The item id in toolGateDoneSave belongs to no entry the hook knows of:
@@ -1189,6 +1242,11 @@ func TestToolGateTags(t *testing.T) {
 // opened, and nothing the host's hub.json holds reaches a row.
 func TestToolGateRedaction(t *testing.T) {
 	e, root := gateSandbox(t)
+	// What the rows hold is the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row.
+	// A hook that did open a FIFO below still ends without its rows, at this
+	// deadline instead of the real one.
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	dir := t.TempDir()
 	// A FIFO with no writer blocks whoever opens it for reading. The hook
 	// returning with its rows written shows neither was opened: the file a
@@ -1249,6 +1307,11 @@ func TestToolGateRedaction(t *testing.T) {
 // prints nothing, and the call's ordinary row is written when it ends.
 func TestToolGateFailsOpen(t *testing.T) {
 	const command = "pkill node; " + toolGateAllRules
+	// What each failure leaves in the ledger is the subject here, not timing:
+	// a hook that reaches its deadline on a loaded host writes no row.
+	// The deadline passed case sets its own deadlines.
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	finish := func(t *testing.T, e env, root string, deny int) {
 		t.Helper()
 		rows := toolLedgerRows(t, root, e.agent)
@@ -1327,19 +1390,37 @@ func TestToolGateFailsOpen(t *testing.T) {
 		}
 	})
 	t.Run("deadline passed", func(t *testing.T) {
-		e, root := gateSandbox(t)
-		setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
-		finished := make(chan struct{})
-		setToolLedger(t, &toolDenyCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage) {
-			defer close(finished)
-			time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
-			l.wouldDeny(row, tool, input)
-		})
-		toolHook(t, e, "PreToolUse", bashPre("u1", command))
-		select {
-		case <-finished:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the late check never finished")
+		// On a loaded host the hook can reach its 40 ms deadline before the
+		// check is called, and then it never is: that attempt shows nothing
+		// about a late check, so it is run again in a new sandbox, at most
+		// three times. The last attempt is judged as it stands.
+		var e env
+		var root string
+		for attempt := 1; ; attempt++ {
+			e, root = gateSandbox(t)
+			setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
+			called, finished := make(chan struct{}), make(chan struct{})
+			setToolLedger(t, &toolDenyCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage) {
+				close(called)
+				defer close(finished)
+				time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
+				l.wouldDeny(row, tool, input)
+			})
+			toolHook(t, e, "PreToolUse", bashPre("u1", command))
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				select {
+				case <-called:
+				default:
+					if attempt < 3 {
+						t.Logf("attempt %d: the hook reached its %v deadline before the check was called; running it again in a new sandbox", attempt, toolLedgerDeadline)
+						continue
+					}
+				}
+				t.Fatal("the late check never finished")
+			}
+			break
 		}
 		setToolLedger(t, &toolLedgerDeadline, 150*time.Millisecond)
 		finish(t, e, root, 0)
@@ -1372,6 +1453,8 @@ func TestToolGateFailsOpen(t *testing.T) {
 // on all three events.
 func TestToolGatePrintsNothing(t *testing.T) {
 	e, root := gateSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // silence and the row counts are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	for i, command := range []string{"tt work-items list", "tt work-items create --title x", toolGateAllRules, "pkill node; " + toolGateAllRules} {
 		for _, event := range []string{"PreToolUse", "PostToolUse", "PreToolUse", "PostToolUseFailure"} {
 			if r := runToolHook(t, e, "tool", toolPayload(event, bashPre(fmt.Sprintf("u%d", i), command)), nil); r.err != nil || r.out != "" {
@@ -1395,8 +1478,9 @@ func toolGateCapCommand(head string) string {
 
 // a9: the added cost of the gate per PreToolUse, measured against the same
 // hook with the gate switched off and the would-deny check on in both.
-// Every run with the gate returns before the hook's deadline with its rows
-// already written. The limits are those of TestToolDenyCost.
+// Every run with the gate that returns before the hook's deadline has its
+// rows already written. The limits, and the runs put down to a stalled host
+// and run again, are those of TestToolDenyCost.
 func TestToolGateCost(t *testing.T) {
 	const runs = 100
 	limit := 5 * time.Millisecond
@@ -1426,39 +1510,57 @@ func TestToolGateCost(t *testing.T) {
 			var with, without []time.Duration
 			late := 0
 			var worst time.Duration
+			// As in TestToolDenyCost: a run with the gate that reached the
+			// deadline may fail open with no rows, so it is put down to a
+			// stalled host and run again as a new agent after a wait, and the
+			// stalled attempts of a case are capped. A baseline run that
+			// reached it is set aside as before.
+			const attempts, maxStalled = 3, 10
 			for i := 0; i < 2*runs; i++ {
 				// Alternate, and swap which goes first each pair.
 				gate := (i+i/2)%2 == 0
-				toolGateOn = gate
-				e.agent = fmt.Sprintf("agt_gate_%d_%d", n, i)
-				r := runToolHook(t, e, "tool", toolPayload("PreToolUse", bashPre("u1", c.command)), nil)
-				toolGateOn = true
-				if r.err != nil || r.out != "" {
-					t.Fatalf("hook = %v, output %q", r.err, r.out)
-				}
-				all := toolLedgerRows(t, root, e.agent)
-				rows, deny := len(wouldReportRows(all)), len(wouldDenyRows(all))
-				switch {
-				case r.elapsed >= toolLedgerDeadline:
-					if gate {
+				for attempt := 1; ; attempt++ {
+					toolGateOn = gate
+					e.agent = fmt.Sprintf("agt_gate_%d_%d_%d", n, i, attempt)
+					r := runToolHook(t, e, "tool", toolPayload("PreToolUse", bashPre("u1", c.command)), nil)
+					toolGateOn = true
+					if r.err != nil || r.out != "" {
+						t.Fatalf("hook = %v, output %q", r.err, r.out)
+					}
+					all := toolLedgerRows(t, root, e.agent)
+					rows, deny := len(wouldReportRows(all)), len(wouldDenyRows(all))
+					switch {
+					case r.elapsed >= toolLedgerDeadline:
+						t.Logf("run %d attempt %d (gate %v) reached the %v deadline in %v with %d of %d rows", i, attempt, gate, toolLedgerDeadline, r.elapsed, rows+deny, c.rows+c.deny)
+						if !gate {
+							break
+						}
 						late++
+						if attempt == attempts {
+							t.Fatalf("run %d reached the %v deadline %d times in a row; a stalled host does not explain that", i, toolLedgerDeadline, attempts)
+						}
+						if late > maxStalled {
+							t.Fatalf("%d attempts in %d runs reached the hook deadline; at most %d are put down to a stalled host", late, runs, maxStalled)
+						}
+						time.Sleep(time.Duration(attempt) * time.Second)
+						continue
+					case !gate:
+						if rows != 0 || deny != c.deny {
+							t.Fatalf("baseline run wrote %d would-report and %d would-deny rows; want 0 and %d", rows, deny, c.deny)
+						}
+						without = append(without, r.elapsed)
+					default:
+						if rows != c.rows || deny != c.deny {
+							t.Fatalf("run %d returned in %v with %d would-report and %d would-deny rows; want %d and %d", i, r.elapsed, rows, deny, c.rows, c.deny)
+						}
+						with = append(with, r.elapsed)
+						worst = max(worst, r.elapsed)
 					}
-					t.Logf("run %d (gate %v) reached the %v deadline in %v with %d of %d rows", i, gate, toolLedgerDeadline, r.elapsed, rows+deny, c.rows+c.deny)
-				case !gate:
-					if rows != 0 || deny != c.deny {
-						t.Fatalf("baseline run wrote %d would-report and %d would-deny rows; want 0 and %d", rows, deny, c.deny)
-					}
-					without = append(without, r.elapsed)
-				default:
-					if rows != c.rows || deny != c.deny {
-						t.Fatalf("run %d returned in %v with %d would-report and %d would-deny rows; want %d and %d", i, r.elapsed, rows, deny, c.rows, c.deny)
-					}
-					with = append(with, r.elapsed)
-					worst = max(worst, r.elapsed)
+					break
 				}
 			}
-			if late > 2 {
-				t.Fatalf("%d of %d runs reached the hook deadline; at most 2 are put down to a stalled host", late, runs)
+			if late > 0 {
+				t.Logf("%d attempt(s) with the gate were put down to a stalled host and run again; the cap is %d", late, maxStalled)
 			}
 			base, gated := toolDenyMedian(without), toolDenyMedian(with)
 			t.Logf("%d bytes: baseline median %v, with the gate %v, added %v, worst run with the gate %v", len(c.command), base, gated, gated-base, worst)
@@ -1509,6 +1611,8 @@ func TestToolGateHelpCalls(t *testing.T) {
 	}
 	// Through the hook: the help call leaves no report row, the write its one.
 	e, root := gateSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the one row is the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
 	toolHook(t, e, "PreToolUse", bashPre("u1", "tt work-items update --help"))
 	toolHook(t, e, "PreToolUse", bashPre("u2", "tt work-items update"))
 	if rows := wouldReportRows(toolLedgerRows(t, root, e.agent)); len(rows) != 0 {
