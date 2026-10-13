@@ -1605,6 +1605,9 @@ func TestHandoffInjection(t *testing.T) {
 		b.must(handoffAddArgs(handoffKinds[1], nil)...)
 		b.quiet("SessionEnd", b.helper.Thread, map[string]any{"reason": "clear"})
 		// The new session after /clear: another id, the same tmux session.
+		// Its note is judged, not the hook's deadline, which its tmux query
+		// can pass under load.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		b.asCandidate()
 		t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
 		before := b.bytes("record.json")
@@ -1745,6 +1748,10 @@ func TestHandoffInjection(t *testing.T) {
 				b.helper.Name = strings.Repeat("n", 64)
 				session := b.helper.Thread
 				if candidate {
+					// A candidate's tmux query can pass the real deadline
+					// under load and leave no note: its note is judged here,
+					// and the bound on the registered session below.
+					setToolLedger(t, &handoffDeadline, 30*time.Second)
 					b.asCandidate()
 					session = handoffOtherID
 				} else {
@@ -1758,7 +1765,7 @@ func TestHandoffInjection(t *testing.T) {
 				b.save(record)
 				saved := b.bytes("record.json")
 				r := b.hook("SessionStart", session, start)
-				if r.err != nil || r.elapsed > handoffBound {
+				if r.err != nil || !candidate && r.elapsed > handoffBound {
 					t.Fatalf("hook = %v in %s", r.err, r.elapsed)
 				}
 				shown, omitted := requireNote(t, b, r.out, candidate)
@@ -3371,6 +3378,9 @@ func TestHandoffWakes(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Another Claude process in the session does not reset them.
+				// Its start must be matched, so it is not left to the real
+				// deadline, which its tmux query can pass under load.
+				setToolLedger(t, &handoffDeadline, 30*time.Second)
 				b.asCandidate()
 				b.now = b.now.Add(time.Minute)
 				b.hook("SessionStart", handoffOtherID, map[string]any{"source": source})
@@ -3420,7 +3430,9 @@ func TestHandoffWakes(t *testing.T) {
 				t.Fatalf("%s:\n%s", what, status)
 			}
 		}
-		// Another session's compaction changes nothing.
+		// Another session's compaction changes nothing. It must be matched,
+		// so it is not left to the real deadline.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		b.asCandidate()
 		b.now = b.now.Add(time.Minute)
 		b.hook("SessionStart", handoffOtherID, map[string]any{"source": "compact"})
@@ -3899,6 +3911,9 @@ func TestHandoffOneShotNote(t *testing.T) {
 	// The real interactive session under the versioned binary's name gets
 	// the note, registered and as a candidate.
 	t.Run("the versioned binary, interactive", func(t *testing.T) {
+		// The test is of who gets the note, not of the hook's deadline,
+		// which a candidate's tmux query can pass under load.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		b := newHandoffBox(t)
 		b.on()
 		b.asCandidate()
@@ -3918,6 +3933,7 @@ func TestHandoffOneShotNote(t *testing.T) {
 	for name, table := range tables {
 		t.Run(name, func(t *testing.T) {
 			// As a candidate: its own session id, in the helper's tmux session.
+			setToolLedger(t, &handoffDeadline, 30*time.Second)
 			b := newHandoffBox(t)
 			b.on()
 			b.asCandidate()
