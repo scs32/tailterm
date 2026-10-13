@@ -207,9 +207,15 @@ and the first release are separate operational steps.
   checkout would leave its working tree showing the release reversed. Before
   publication this is the ordinary refusal: one escalation, no fence.
 - **Target selection.** Targets are selected from the integrated commit before
-  a single job's integrated matrix run, the inputs request and the push. For a
-  batch, selection comes after the batch's matrix run and before the inputs
-  request and the push. A changed path that
+  a single job's integrated matrix run, the inputs request and the push. A
+  batch is selected the same way, on the batch's integrated commit before the
+  batch's matrix run starts. A batch whose selection fails starts no matrix
+  run: it is dropped at the hub, its members are marked to release alone, and
+  the journal keeps `batchFallback` with reason `batch-selection-refused` and
+  the selection's reason as `detail`. Each job is then selected alone, so the
+  job that has the path is refused as below and the others release. When the
+  hub refuses the drop, the lead is refused with the selection's reason. A
+  changed path that
   no map knows is the ordinary refusal before publication: one escalation whose
   reason is `Unknown release path: PATH` (with `and N more` for further paths),
   journal step `select`, no revert and no bug request. A path the running map

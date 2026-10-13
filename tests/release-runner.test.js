@@ -486,6 +486,59 @@ test("batch18 an exclusion is recorded once per claim, over repeated polls and a
  const one=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]),a1=batchFake(one.lead),c1=batchConfig(one,1,{candidates:[],excluded:MISMATCH});
  assert.equal((await runRelease(c1,a1)).outcome,"released");assert.ok(!("batchDropped" in batchJournal(c1)));
 });
+test("batch19 a batch with an unknown path starts no matrix run and falls back to per-job releases",async()=>{
+ // A top-level file no map rule knows (the batch fixture creates no folders).
+ const UNKNOWN="newthing.cfg",REASON="Unknown release path: "+UNKNOWN,fellBack=(b,status="done")=>({batchId:batchId("rel_b1",2,b.tip),reason:"batch-selection-refused",detail:REASON,members:["rel_b2","rel_b3"],status});
+ const alone=(b,member)=>{const lead={...member,state:"claimed",generation:2,agentId:"agt_fixture",runId:"run_fixture"},a=batchFake(lead),c=batchConfig({f:b.f,lead,members:[]},3);return {a,c,run:()=>runRelease(c,a)};};
+ // A member adds the path: the batch is dropped before any matrix run and the lead goes on alone.
+ const b=batchJobs([["client/a.js","a"],[UNKNOWN,"b"],["client/c.js","c"]]),a=batchFake(b.lead),c=batchConfig(b,3);
+ const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","batch-drop","verify","merged","deploy:tailos","finish"]);
+ assert.equal(a.verifies.length,1,"the only matrix run is the lead's own");assert.equal(a.verifies[0].batchCovers,undefined);assert.equal(a.verifies[0].integratedCommit,r.commit);
+ let journal=batchJournal(c);
+ assert.deepEqual(journal.batchFallback,fellBack(b));assert.equal(journal.batch,null);assert.equal(journal.batchReceipt,undefined);assert.equal(journal.batchSelected,undefined);assert.equal(journal.failure,undefined);assert.equal(journal.revert,undefined);
+ assert.deepEqual(c.solo,["rel_b2","rel_b3"]);assert.deepEqual([...readBatchSolo(c.home)],["rel_b2","rel_b3"]);assert.deepEqual(batchFiles(c.home),["batch-solo.json"]);
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,r.commit).split("\n"),["client/a.js"]);assert.equal(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.commit);
+ // The member with the path is refused alone, by name, before its matrix run; nothing of it is published.
+ const m2=alone(b,b.members[0]);await assert.rejects(m2.run(),/refused/);
+ assert.deepEqual(m2.a.calls,["refuse","escalate"]);assert.equal(m2.a.verifies.length,0);
+ journal=batchJournal(m2.c);assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,REASON);assert.deepEqual(journal.failure,{step:"select",reason:REASON});
+ assert.notEqual(journal.published,true);assert.deepEqual(journal.effects,[]);assert.equal(journal.revert,undefined);assert.equal(journal.batch,undefined);
+ assert.equal(git(b.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.commit);
+ // The other member releases alone.
+ const m3=alone(b,b.members[1]),r3=await m3.run();
+ assert.equal(r3.outcome,"released");assert.deepEqual(m3.a.calls,["verify","merged","deploy:tailos","finish"]);
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,r3.commit).split("\n"),["client/a.js","client/c.js"]);
+ assert.equal(git(b.f.cwd,"log","--format=%s",b.tip+"..refs/heads/tasks-hub").split("\n").filter(x=>/revert/i.test(x)).length,0,"nothing was reverted");
+ assert.equal(git(b.f.cwd,"ls-tree","--name-only","refs/heads/tasks-hub",UNKNOWN),"");
+ // The lead adds the path: it is refused by name and the members still release alone.
+ const l=batchJobs([[UNKNOWN,"b"],["client/b.js","b"],["client/c.js","c"]]),la=batchFake(l.lead),lc=batchConfig(l,3);
+ await assert.rejects(runRelease(lc,la),/refused/);
+ assert.deepEqual(la.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","batch-drop","refuse","escalate"]);assert.equal(la.verifies.length,0);
+ journal=batchJournal(lc);assert.deepEqual(journal.failure,{step:"select",reason:REASON});assert.equal(journal.refusalReason,REASON);assert.deepEqual(journal.batchFallback,fellBack(l));
+ assert.deepEqual(lc.solo,["rel_b2","rel_b3"]);assert.equal(git(l.f.cwd,"rev-parse","refs/heads/tasks-hub"),l.tip);
+ for(const [i,member] of l.members.entries()){const m=alone(l,member);assert.equal((await m.run()).outcome,"released");assert.equal(git(l.f.cwd,"show",`refs/heads/tasks-hub:client/${"bc"[i]}.js`),"bc"[i]);}
+ // The hub refuses the drop: the lead is refused with the selection's reason, still before any matrix run.
+ const d=batchJobs([["client/a.js","a"],[UNKNOWN,"b"],["client/c.js","c"]]),da=batchFake(d.lead,{refuse:op=>op==="batch-drop"}),dc=batchConfig(d,3);
+ await assert.rejects(runRelease(dc,da),/refused/);
+ assert.equal(da.verifies.length,0);assert.deepEqual(da.calls.slice(-2),["refuse","escalate"]);assert.ok(!da.calls.includes("merged"));
+ journal=batchJournal(dc);assert.deepEqual(journal.failure,{step:"select",reason:REASON});assert.deepEqual(journal.batchFallback,fellBack(d,"refused"));assert.equal(git(d.f.cwd,"rev-parse","refs/heads/tasks-hub"),d.tip);
+ // A batch whose selection passed saves it, and a resumed wait does not select again beside its run.
+ const w=three(),wa=batchFake(w.lead),wc=batchConfig(w,3);let ready=false;
+ wa.verifyIntegrated=async j=>{wa.calls.push("verify");wa.verifies.push(j);return ready;};
+ assert.deepEqual(await runRelease(wc,wa),{jobId:"rel_b1",outcome:"waiting_matrix"});
+ journal=batchJournal(wc);assert.equal(journal.batchSelected,journal.integrated);assert.equal(journal.batchFallback,undefined);
+ ready=true;assert.equal((await runRelease(wc,wa)).outcome,"released");assert.deepEqual(wa.calls.slice(-4),["verify","merged","deploy:tailos","finish"]);assert.ok(!wa.calls.includes("batch-drop"));
+ // A fallback stopped while dropping resumes the drop and starts no batch run.
+ const s=batchJobs([["client/a.js","a"],[UNKNOWN,"b"],["client/c.js","c"]]),sa=batchFake(s.lead),sc=batchConfig(s,3);let over=false;
+ sa.settleMatrixRuns=async()=>sa.ops.length?over:true;
+ assert.deepEqual(await runRelease(sc,sa),{jobId:"rel_b1",outcome:"waiting_matrix"});
+ assert.equal(batchJournal(sc).batchFallback.status,"dropping");assert.ok(!sa.calls.includes("batch-drop"));assert.equal(sa.verifies.length,0);
+ over=true;const sr=await runRelease(sc,sa);
+ assert.equal(sr.outcome,"released");assert.deepEqual(sa.calls.slice(-5),["batch-drop","verify","merged","deploy:tailos","finish"]);assert.equal(sa.verifies.length,1);assert.equal(sa.verifies[0].batchCovers,undefined);
+ assert.deepEqual(batchJournal(sc).batchFallback,fellBack(s));assert.deepEqual(sc.solo,["rel_b2","rel_b3"]);
+});
 test("wake a1 each recipient-less notice has its class at the builder and exactly one wake ref in the argv its sender passes",async t=>{
  const R=WAKE.routine,A=WAKE.attention;assert.deepEqual(WAKE,{routine:"routine",attention:"attention"});
  // rows[n]: the class of plan row n, what its builder returned, and each argv its sender passed.

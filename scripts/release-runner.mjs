@@ -705,6 +705,22 @@ export async function runRelease(config, adapter) {
     // Saved first: every waiting return below resumes from this phase.
     state.phase="waiting_matrix";checkpoint();
     if(state.batchFallback?.status==="dropping"){const fell=await finishFallback();if(fell)return fell===true?null:waiting;}
+    // Targets are selected on the batch's integrated commit before its matrix
+    // run starts, with the checkout on that commit. A selection that fails (a
+    // path no map knows) drops the batch: each job is then selected alone, and
+    // the one with the path is refused. When the hub refuses the drop, the
+    // lead is refused with the selection's own reason. A selection that
+    // passed is saved, so a resumed wait does not ask again beside its run.
+    if(state.batchSelected!==state.integrated){
+      let refusal;
+      try{selectReleaseTargets(cwd,baselines,state.integrated);}catch(error){refusal=error;}
+      if(refusal){
+        const fell=await fallback("batch-selection-refused",failureReason(refusal));
+        if(fell)return fell===true?null:waiting;
+        step={step:"select"};throw refusal;
+      }
+      state.batchSelected=state.integrated;checkpoint();
+    }
     const clock=config.now||(()=>Date.now()),wait=config.batch?.importWaitMs??BATCH_IMPORT_WAIT_MS;
     for(let pass=0;;pass++){
       state.phase="waiting_matrix";checkpoint();await fence();
@@ -759,9 +775,11 @@ export async function runRelease(config, adapter) {
       integration={expected:state.expected,integrated:state.integrated};
     }
     // Targets are selected before a single job's integrated matrix run, the
-    // inputs request and the push (for a batch, after the batch's matrix run
-    // above), so a path no map knows refuses the job unpublished.
-    // A resumed wait selects again; the answer depends only on the commits.
+    // inputs request and the push, so a path no map knows refuses the job
+    // unpublished. A batch was first selected before its matrix run
+    // (verifyBatch) and is selected here again for its targets; a batch that
+    // fell back there is selected here as the lead alone. A resumed wait
+    // selects again; the answer depends only on the commits.
     step={step:"select"};const selected=selectReleaseTargets(cwd,baselines,integration.integrated);step=null;
     if(!state.batch && integration.integrated!==job.commit){
       // Saved before the matrix run is started, so a runner stopped while
