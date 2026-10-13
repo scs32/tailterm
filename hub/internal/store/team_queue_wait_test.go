@@ -49,6 +49,15 @@ func newWaitFixture(t *testing.T) *waitFixture {
 	}
 	// Agents are judged live at the test's clock.
 	f.exec(t, `UPDATE agents SET last_seen_at=? WHERE task_id=?`, ts(f.clock), task.ID)
+	// The project has two live handlers and no explicit primary, so the
+	// primary is the oldest by created_at, compared as text. ts trims
+	// trailing zeros: created in the same millisecond, "….994Z" sorts after
+	// "….994296Z" and aux-handler got the notices. Make database the oldest
+	// by a whole day, and check it is the handler the hub tells.
+	f.exec(t, `UPDATE agents SET created_at=? WHERE id=?`, ts(f.clock.Add(-24*time.Hour)), f.handler.ID)
+	if told, err := queueWaitHandler(f.ctx, s.db, task); err != nil || told.ID == "" || told.ID != f.handler.ID {
+		t.Fatalf("the fixture's handler is not the primary handler: %q, %v", told.Name, err)
+	}
 	f.pred = addCheckoutEntry(t, s, task, items[0], orders[0], "/worktrees/pred", waitPath)
 	f.waiting = addCheckoutEntry(t, s, task, items[1], orders[1], "/worktrees/waiting", "hub/internal/redact")
 	return f
