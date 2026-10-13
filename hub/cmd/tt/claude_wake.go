@@ -32,7 +32,10 @@ import (
 // after input, so a later relay pass never types beside its own text in the
 // prompt: it retries only after a backoff, with Enter alone on its own idle
 // text or one retype into a proven-empty input, clearing stray terminal
-// replies first (claudeWakeRetry, claudeWakeEmpty). The
+// replies first (claudeWakeRetry, claudeWakeEmpty). An abandoned intent keeps
+// its Prompt until a later wake proves the input empty and replaces the file,
+// so its unsubmitted text is still known as the relay's own and that wake
+// clears it instead of skipping it as someone's draft (claudeEarlierWake). The
 // file is private host state, scoped to a run. Phases: uncertain, confirmed,
 // exhausted (retries used up; cooling down) and abandoned (the transcript moved
 // on without it).
@@ -318,6 +321,26 @@ func claudeStrayInput(text, own string) string {
 		return ""
 	}
 	return stray
+}
+
+// claudeEarlierWake reports input text that is exactly own, the wake prompt
+// this binding's intent record says the relay typed and never saw confirmed,
+// alone or with terminal replies before or after it. stray is those replies,
+// empty when the prompt is alone. The whole prompt must be there, compared as
+// exactClaudeInput compares it (whitespace is ignored, because the editor
+// wraps long text across rows), and everything else must be terminal replies.
+// Nothing is matched by its shape: a draft that resembles a wake, another
+// wake's text, or the prompt with a word added, changed or missing is not it.
+func claudeEarlierWake(text, own string) (stray string, ok bool) {
+	compact := func(v string) string { return strings.Join(strings.Fields(v), "") }
+	if own = compact(own); own == "" {
+		return "", false
+	}
+	if compact(text) == own {
+		return "", true
+	}
+	stray = claudeStrayInput(text, own)
+	return stray, stray != "" && strings.Contains(compact(text), own)
 }
 
 // claudeQueueStaleAfter bounds how long queued input can hold a wake after a
@@ -1130,8 +1153,11 @@ func (t relayAuthorTransport) RoundTrip(req *http.Request) (*http.Response, erro
 // marks the post so the hub records the relay, not the owner, as author. The
 // notice goes to the project's database handler; when the skipped agent is
 // that handler, or none is live, to the owner helper; otherwise to the Board
-// with no recipient. The request identity is the run and the episode start,
-// so a retry or a restarted relay cannot post it twice.
+// with no recipient. When the skipped agent is the owner helper, only the
+// owner can clear or wake that session, so the notice is the owner's: no agent
+// recipient, and the refs the Discord bridge pings on (claudeSkipNoticeRefs).
+// The request identity is the run and the episode start, so a retry or a
+// restarted relay cannot post it twice.
 func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWakeSkip) error {
 	e := env{hub: b.Hub}
 	e.loadConfig()
@@ -1145,9 +1171,13 @@ func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWake
 	if err != nil {
 		return err
 	}
-	to := claudeEscalationRecipient(agents, b.Agent)
+	owner := claudeSkippedOwnerHelper(agents, b.Agent)
+	var to api.Agent
+	if !owner {
+		to = claudeEscalationRecipient(agents, b.Agent)
+	}
 	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: "The relay cannot wake a Claude agent that has unread input",
-		Refs: map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session},
+		Refs: claudeSkipNoticeRefs(b, owner),
 		Body: api.EnvelopeBody{Text: claudeSkipNoticeText(b, skip)}}
 	key := fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(b.Run, "run_"), skip.Since.Unix())
 	_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: key})
@@ -1180,9 +1210,33 @@ func claudeSkipNoticeText(b runtimeBinding, skip claudeWakeSkip) string {
 	return head + ages + fmt.Sprintf(", at or past the %s skip bound, so the turn looks stopped.", bound) + act + once
 }
 
-// claudeEscalationRecipient picks who hears that agent skipped cannot be
-// woken: the newest live database handler, else the newest live owner helper,
-// never the skipped agent itself. The zero Agent means the Board.
+// claudeSkippedOwnerHelper reports that the agent that cannot be woken is the
+// project's owner helper. Its session is the owner's own: no agent may type
+// into it, so the report goes to the owner and not to claudeEscalationRecipient.
+func claudeSkippedOwnerHelper(agents []api.Agent, skipped string) bool {
+	for _, a := range agents {
+		if a.ID == skipped {
+			return a.Role == api.AgentRoleOwnerHelper
+		}
+	}
+	return false
+}
+
+// claudeSkipNoticeRefs are the refs of the skip report. For the owner they add
+// what the hub's own owner notices carry: recipientKind owner, and escalation
+// owner, on which the Discord bridge pings.
+func claudeSkipNoticeRefs(b runtimeBinding, owner bool) map[string]string {
+	refs := map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session}
+	if owner {
+		refs["recipientKind"], refs["escalation"] = api.ObligationRecipientOwner, "owner"
+	}
+	return refs
+}
+
+// claudeEscalationRecipient picks who hears that agent skipped, which is not
+// the owner helper, cannot be woken: the newest live database handler, else
+// the newest live owner helper, never the skipped agent itself. The zero Agent
+// means the Board.
 func claudeEscalationRecipient(agents []api.Agent, skipped string) api.Agent {
 	for _, role := range []string{api.AgentRoleDatabaseHandler, api.AgentRoleOwnerHelper} {
 		var found api.Agent
@@ -1207,6 +1261,7 @@ func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops
 	}
 	path := claudeWakePath(b)
 	var previous claudeWakeIntent
+	own := ""
 	if data, err := os.ReadFile(path); err == nil {
 		if json.Unmarshal(data, &previous) != nil {
 			return errors.New("Claude wake guard unreadable; did not confirm")
@@ -1223,10 +1278,16 @@ func claudeWakeAttempt(ctx context.Context, b runtimeBinding, prompt string, ops
 		if previous.Phase == "confirmed" && previous.PromptSHA == claudeWakeHash(prompt) {
 			return nil
 		}
+		if previous.Phase != "confirmed" {
+			// An abandoned intent's wake text may still sit unsubmitted in the
+			// input. No Enter retry will reach it, and the intent is replaced
+			// only after the input is proven empty, so the record still names it.
+			own = previous.Prompt
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	first, cleared, err := claudeWakeEmpty(ctx, b, ops, "", "")
+	first, cleared, err := claudeWakeEmpty(ctx, b, ops, own, false, "")
 	if err != nil {
 		// Both are wrapped so the skip record can read a busy turn's times.
 		return fmt.Errorf("%w: %w", errClaudeWakeUnsafe, err)
@@ -1248,16 +1309,19 @@ func claudeWakeNoteClears(intent *claudeWakeIntent, cleared []string) {
 
 // claudeWakeEmpty inspects for an empty input, as ops.inspect(ctx, b, "")
 // does, and first clears an input that holds only stray terminal replies
-// (claudeStrayInput), with or without the relay's own unsubmitted wake text
-// own. Before a clear it proves, with the usual identity and transcript
-// checks, that the pane is idle and holds exactly the text it read; after it,
-// the empty check runs again, so the caller never types after leftover text.
+// (claudeStrayInput), or exactly the relay's own earlier unsubmitted wake
+// prompt own (claudeEarlierWake; own is the text the binding's intent record
+// holds), alone or with such replies beside it. With keep set, own text alone
+// is left for the Enter retry and not cleared here. Before a clear it proves,
+// with the usual identity and transcript checks, that the pane is idle and
+// holds exactly the text it read; after it, the empty check runs again, so the
+// caller never types after leftover text.
 // Any other text is left untouched and the refusal names it. pane, when set,
 // is the only pane that may be cleared. cleared lists what each clear removed:
 // a count and a clipped sample of the replies, never other input text. Each
 // clear is logged in one line, and an error after a clear names it, so a skip
 // record keeps it. At most claudeStrayClearMax clears run in one call.
-func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, own, pane string) (claudeWakeSnapshot, []string, error) {
+func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, own string, keep bool, pane string) (claudeWakeSnapshot, []string, error) {
 	var cleared []string
 	var before claudeWakeSnapshot
 	fail := func(err error) (claudeWakeSnapshot, []string, error) {
@@ -1279,14 +1343,23 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 			return fail(err)
 		}
 		n := utf8.RuneCountInString(occupied.Text)
-		stray := claudeStrayInput(occupied.Text, own)
+		what, stray := "terminal replies", claudeStrayInput(occupied.Text, "")
+		alone := false
+		if stray == "" {
+			var mine bool
+			if stray, mine = claudeEarlierWake(occupied.Text, own); mine && stray != "" {
+				what = "the relay's own unsubmitted wake text and terminal replies"
+			} else if mine {
+				alone, what = true, "the relay's own earlier unsubmitted wake text"
+			}
+		}
 		switch {
-		case own != "" && strings.Join(strings.Fields(occupied.Text), "") == strings.Join(strings.Fields(own), ""):
-			return fail(err) // the relay's own text alone: the Enter retry's case
-		case stray == "":
+		case alone && keep:
+			return fail(err) // the saved wake's own text alone: the Enter retry's case
+		case !alone && stray == "":
 			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is not a terminal reply; left untouched", err, n))
 		case ops.clear == nil:
-			return fail(fmt.Errorf("%v: stray input in the input line (%d characters of terminal replies); no clear available", err, n))
+			return fail(fmt.Errorf("%v: stray input in the input line (%d characters of %s); no clear available", err, n, what))
 		case n > claudeStrayClearRunes:
 			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is too long to clear", err, n))
 		case len(cleared) >= claudeStrayClearMax:
@@ -1305,11 +1378,10 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 			return fail(errors.New("stray input in the input line not cleared: Claude identity or transcript changed"))
 		}
 		before = held
-		what := "terminal replies"
-		if n > utf8.RuneCountInString(stray) {
-			what = "the relay's own unsubmitted wake text and terminal replies"
-		}
 		note := fmt.Sprintf("cleared %d characters of stray input (%s %q)", n, what, claudeClip(stray, 40))
+		if alone {
+			note = fmt.Sprintf("cleared %d characters of stray input (%s)", n, what)
+		}
 		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s before typing\n", ops.now().UTC().Format(time.RFC3339), b.Agent, note)
 		if err := ops.clear(ctx, held.Pane, n); err != nil {
 			return fail(fmt.Errorf("stray input in the input line not cleared: %v", err))
@@ -1402,8 +1474,9 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 	// One retype of the current prompt when the input is empty, Claude is idle
 	// and the transcript still lacks the earlier prompt. Stray terminal replies,
 	// alone or beside the relay's own unsubmitted text, are cleared first: that
-	// text was never submitted, so the wake is still undelivered.
-	empty, cleared, emptyErr := claudeWakeEmpty(ctx, b, ops, previous.Prompt, previous.Pane)
+	// text was never submitted, so the wake is still undelivered. The saved
+	// prompt alone is the Enter retry's and stays.
+	empty, cleared, emptyErr := claudeWakeEmpty(ctx, b, ops, previous.Prompt, true, previous.Pane)
 	if len(cleared) > 0 {
 		claudeWakeNoteClears(previous, cleared)
 	}

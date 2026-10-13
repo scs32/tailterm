@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2933,5 +2934,324 @@ func TestClaudeTranscriptSnapshotCopiesProviderBlock(t *testing.T) {
 	idle, _ := claudeTranscriptFixture(t, "queue-idle")
 	if snap, err := claudeTranscriptSnapshot(idle, now); err != nil || snap.Cursor.ProviderBlock != nil {
 		t.Fatalf("idle snapshot block %+v (%v)", snap.Cursor.ProviderBlock, err)
+	}
+}
+
+// n1-n3: a wake the relay cannot deliver to the owner helper is the owner's to
+// act on. The notice has no agent recipient and carries the refs the Discord
+// bridge pings on (escalation owner, internal/bridge/render.go), whether or
+// not a database handler is live; it is posted once per skip episode under the
+// same request identity. A builder's skip still goes to the handler, with no
+// owner refs.
+func TestClaudeWakeSkipOwnerHelperNoticePingsOwner(t *testing.T) {
+	ctx := context.Background()
+	h := newStallHub(t)
+	worker := h.add(t, "builder", "")
+	handler := h.add(t, "database", api.AgentRoleDatabaseHandler)
+	helper := h.helper(t, "ohreg-wake-skip-1")
+	since := time.Date(2026, 10, 13, 2, 34, 43, 0, time.UTC)
+	skip := claudeWakeSkip{Run: testClaudeBinding().Run, Since: since,
+		Reason: "Claude cursor is not at an empty input: stray input in the input line (74 characters) is not a terminal reply; left untouched"}
+	for i := 0; i < 2; i++ { // the second stands in for a retry or a restarted relay
+		if err := nativeClaudeEscalate(ctx, h.binding(helper), skip); err != nil {
+			t.Fatalf("owner helper escalation %d: %v", i, err)
+		}
+	}
+	got := h.notices(t)
+	if len(got) != 1 {
+		t.Fatalf("want exactly one notice for the owner helper's skip, got %d: %+v", len(got), got)
+	}
+	owner := got[0]
+	if owner.To != "" || owner.Envelope.To != "" {
+		t.Fatalf("owner helper skip addressed to an agent (%q, %q), handler is %s", owner.To, owner.Envelope.To, handler.ID)
+	}
+	wantRefs := map[string]string{"agent": helper.ID, "run": skip.Run, "session": helper.Session, "recipientKind": "owner", "escalation": "owner"}
+	if !maps.Equal(owner.Envelope.Refs, wantRefs) {
+		t.Fatalf("owner notice refs %v, want %v", owner.Envelope.Refs, wantRefs)
+	}
+	if owner.Envelope.Subject != "The relay cannot wake a Claude agent that has unread input" || owner.Text != api.RenderText(*owner.Envelope) {
+		t.Fatalf("owner notice: %+v", owner)
+	}
+	for _, want := range []string{helper.ID, skip.Run, skip.Reason, "2026-10-13T02:34:43Z", "wake it by hand"} {
+		if !strings.Contains(owner.Envelope.Body.Text, want) {
+			t.Fatalf("owner notice lacks %q: %s", want, owner.Envelope.Body.Text)
+		}
+	}
+	if from := owner.From; from != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+		t.Fatalf("owner notice author %+v, want the relay", from)
+	}
+	if want := fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(skip.Run, "run_"), since.Unix()); owner.PostReceipt == nil || owner.PostReceipt.RequestID != want {
+		t.Fatalf("owner notice request identity %+v, want %s", owner.PostReceipt, want)
+	}
+
+	// A builder's skip keeps the earlier rule and the earlier refs.
+	skip.Since = since.Add(time.Hour)
+	if err := nativeClaudeEscalate(ctx, h.binding(worker), skip); err != nil {
+		t.Fatal(err)
+	}
+	if got = h.notices(t); len(got) != 2 || got[1].To != handler.ID || got[1].Envelope.To != handler.Name ||
+		!maps.Equal(got[1].Envelope.Refs, map[string]string{"agent": worker.ID, "run": skip.Run, "session": worker.Session}) {
+		t.Fatalf("builder skip should reach the handler with no owner refs: %+v", got)
+	}
+	// So does the handler's own skip: to the owner helper, an agent.
+	skip.Since = since.Add(2 * time.Hour)
+	if err := nativeClaudeEscalate(ctx, h.binding(handler), skip); err != nil {
+		t.Fatal(err)
+	}
+	if got = h.notices(t); len(got) != 3 || got[2].To != helper.ID || got[2].Envelope.Refs["escalation"] != "" || got[2].Envelope.Refs["recipientKind"] != "" {
+		t.Fatalf("handler skip should reach the owner helper with no owner refs: %+v", got)
+	}
+
+	// With no handler live the owner helper's skip is still the owner's.
+	alone := newStallHub(t)
+	only := alone.helper(t, "ohreg-wake-skip-2")
+	if err := nativeClaudeEscalate(ctx, alone.binding(only), skip); err != nil {
+		t.Fatal(err)
+	}
+	if got = alone.notices(t); len(got) != 1 || got[0].To != "" || got[0].Envelope.Refs["escalation"] != "owner" || got[0].Envelope.Refs["recipientKind"] != "owner" {
+		t.Fatalf("owner helper skip with no handler: %+v", got)
+	}
+}
+
+// n1, n3: the whole path. An owner's draft holds the owner helper's input, the
+// relay skips every wake and leaves the draft alone, and after ten minutes it
+// posts one owner notice for the episode, however long the skip lasts.
+func TestClaudeWakeSkipOwnerHelperEpisodePingsOnce(t *testing.T) {
+	h := newStallHub(t)
+	h.add(t, "database", api.AgentRoleDatabaseHandler)
+	helper := h.helper(t, "ohreg-wake-skip-3")
+	const draft = "a note the owner is still writing"
+	f := newStrayPane(t, draft)
+	f.submit = true
+	ops := f.ops()
+	ops.escalate = nativeClaudeEscalate
+	b := h.binding(helper)
+	for minute := 0; minute <= 28; minute += 4 {
+		if err := claudeWakeWith(context.Background(), b, "Tailterm messages #32699. Run tt helper inbox --task "+b.Task+".", ops); !errors.Is(err, errClaudeWakeUnsafe) {
+			t.Fatalf("minute %d: %v", minute, err)
+		}
+		f.now = f.now.Add(4 * time.Minute)
+	}
+	if len(f.sends) != 0 || f.input != draft {
+		t.Fatalf("owner draft touched: sends %v input %q", f.sends, f.input)
+	}
+	got := h.notices(t)
+	if len(got) != 1 || got[0].To != "" || got[0].Envelope.Refs["escalation"] != "owner" || got[0].Envelope.Refs["recipientKind"] != "owner" || got[0].Envelope.Refs["agent"] != helper.ID {
+		t.Fatalf("want one owner notice for the episode, got %d: %+v", len(got), got)
+	}
+	if strings.Contains(got[0].Text, "owner is still writing") {
+		t.Fatalf("notice quotes the draft: %s", got[0].Text)
+	}
+}
+
+func TestClaudeEarlierWakeClassifier(t *testing.T) {
+	const own = "Tailterm messages #32699. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	for _, tc := range []struct {
+		name, text, own, stray string
+		ok                     bool
+	}{
+		{"own text alone", own, own, "", true},
+		{"own text wrapped across rows", "Tailterm messages #32699. Run tt helper inbox --task  tsk_e7af3c28a444b09a.", own, "", true},
+		{"own text then replies", own + strayReplies, own, strayReplies, true},
+		{"replies then own text", "?1;2c" + own, own, "?1;2c", true},
+		{"no recorded wake", own, "", "", false},
+		{"replies alone", strayReplies, own, strayReplies, false},
+		{"another message number", "Tailterm messages #32700. Run tt helper inbox --task tsk_e7af3c28a444b09a.", own, "", false},
+		{"another task", "Tailterm messages #32699. Run tt helper inbox --task tsk_0000000000000001.", own, "", false},
+		{"own text and more", own + " and then tell me", own, "", false},
+		{"words before own text", "later: " + own, own, "", false},
+		{"own text twice", own + " " + own, own, "", false},
+		{"own text cut short", strings.TrimSuffix(own, "."), own, "", false},
+		{"own text in another case", strings.ToLower(own), own, "", false},
+		{"own text, replies and a draft", own + strayReplies + " please", own, "", false},
+		{"owner draft", "please check the build", own, "", false},
+		{"empty", "", own, "", false},
+	} {
+		if stray, ok := claudeEarlierWake(tc.text, tc.own); stray != tc.stray || ok != tc.ok {
+			t.Errorf("%s: claudeEarlierWake(%q) = %q, %v; want %q, %v", tc.name, tc.text, stray, ok, tc.stray, tc.ok)
+		}
+	}
+}
+
+// abandonedWake leaves the fixture as the owner helper's session was at 19:34
+// PDT on 2026-10-12: the relay typed the wake for message N, Enter did not
+// submit it, and another user turn (a scheduled prompt) was then submitted, so
+// the intent can no longer confirm while its text still sits in the input.
+func abandonedWake(t *testing.T, b runtimeBinding, prompt string) *strayPane {
+	t.Helper()
+	f := newStrayPane(t, "")
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "did not confirm") {
+		t.Fatalf("unsubmitted wake: %v", err)
+	}
+	if got := f.intent(b); got.Phase != "uncertain" || got.Prompt != prompt || f.input != prompt || len(f.userTurns()) != 0 {
+		t.Fatalf("unsubmitted wake: %+v input %q", got, f.input)
+	}
+	f.appendUser("a scheduled prompt")
+	return f
+}
+
+// n5, n6: the relay's own wake for message N, typed and never submitted, is
+// not foreign input once its intent is abandoned. When message M arrives the
+// input is exactly the recorded earlier wake, alone or with terminal replies,
+// so it is cleared, the current prompt is typed, submitted and confirmed. With
+// no newer message the same prompt is typed again.
+func TestClaudeWakeReplacesEarlierUnsubmittedWake(t *testing.T) {
+	b := testClaudeBinding()
+	// Long enough to wrap in the fixture's 60-column editor.
+	earlier := "Tailterm messages #32699. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	newer := "Tailterm messages #32699,#32708. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	for _, tc := range []struct {
+		name, input, current, cleared string
+	}{
+		{"earlier wake alone", earlier, newer, "cleared 74 characters of stray input (the relay's own earlier unsubmitted wake text)"},
+		{"earlier wake then replies", earlier + strayReplies, newer, `cleared 88 characters of stray input (the relay's own unsubmitted wake text and terminal replies "?1;2c>0;276;0c")`},
+		{"replies then earlier wake", strayReplies + earlier, newer, `cleared 88 characters of stray input (the relay's own unsubmitted wake text and terminal replies "?1;2c>0;276;0c")`},
+		{"no newer message", earlier, earlier, "cleared 74 characters of stray input (the relay's own earlier unsubmitted wake text)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := abandonedWake(t, b, earlier)
+			f.input, f.submit = tc.input, true
+			var log strings.Builder
+			restore := captureStderr(t, &log)
+			err := claudeWakeWith(context.Background(), b, tc.current, f.ops())
+			restore()
+			if err != nil {
+				t.Fatalf("wake after the abandoned one: %v", err)
+			}
+			if want := []string{"text:" + earlier, "Enter", fmt.Sprintf("clear:%d", len([]rune(tc.input))), "text:" + tc.current, "Enter"}; !slices.Equal(f.sends, want) {
+				t.Fatalf("sends %v, want %v", f.sends, want)
+			}
+			if turns := f.userTurns(); !slices.Equal(turns, []string{"a scheduled prompt", tc.current}) || f.input != "" {
+				t.Fatalf("submitted turns %q, input %q", turns, f.input)
+			}
+			got := f.intent(b)
+			if got.Phase != "confirmed" || got.Prompt != tc.current || got.Attempts != 0 || got.Clears != 1 || got.Cleared != tc.cleared || strings.Contains(got.Cleared, "Tailterm") {
+				t.Fatalf("intent: %+v", got)
+			}
+			if !strings.Contains(log.String(), " "+b.Agent+" Claude wake "+tc.cleared+" before typing\n") || strings.Count(log.String(), "Claude wake cleared ") != 1 {
+				t.Fatalf("log %q", log.String())
+			}
+			if _, err := os.Stat(claudeWakeSkipPath(b)); !os.IsNotExist(err) {
+				t.Fatalf("skip record after a confirmed wake: %v", err)
+			}
+		})
+	}
+}
+
+// n5, n6: only text that is exactly the recorded earlier wake of this binding
+// is the relay's own. A draft that resembles a wake, the wake with a word
+// added, changed or missing, and a wake text with no record behind it are left
+// untouched, never cleared, replaced or submitted, and skipped as before.
+func TestClaudeWakeLeavesWakeLookalikeDraftAlone(t *testing.T) {
+	b := testClaudeBinding()
+	earlier := "Tailterm messages #32699. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	newer := "Tailterm messages #32699,#32708. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	untouched := func(t *testing.T, f *strayPane, input string, sent int) {
+		t.Helper()
+		f.input, f.submit = input, true
+		turns := len(f.userTurns())
+		for pass := 0; pass < 2; pass++ {
+			err := claudeWakeWith(context.Background(), b, newer, f.ops())
+			want := fmt.Sprintf("stray input in the input line (%d characters) is not a terminal reply; left untouched", len([]rune(input)))
+			if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), want) {
+				t.Fatalf("pass %d: %v", pass, err)
+			}
+			f.now = f.now.Add(time.Minute)
+		}
+		if len(f.sends) != sent || f.input != input || len(f.clears) != 0 || len(f.userTurns()) != turns {
+			t.Fatalf("draft touched: sends %v input %q turns %q", f.sends, f.input, f.userTurns())
+		}
+	}
+	for name, input := range map[string]string{
+		"another message number":   "Tailterm messages #32700. Run tt helper inbox --task tsk_e7af3c28a444b09a.",
+		"the newer prompt itself":  newer,
+		"wake text and more":       earlier + " and then tell me what you found",
+		"words before the wake":    "later: " + earlier,
+		"wake text cut short":      strings.TrimSuffix(earlier, "."),
+		"wake text typed twice":    earlier + " " + earlier,
+		"wake, replies and a note": earlier + strayReplies + " please",
+		"an ordinary draft":        "Tailterm messages look stuck, can you run the inbox?",
+	} {
+		t.Run(name, func(t *testing.T) {
+			untouched(t, abandonedWake(t, b, earlier), input, 2)
+		})
+	}
+	t.Run("no wake on record", func(t *testing.T) {
+		untouched(t, newStrayPane(t, ""), earlier, 0)
+	})
+	t.Run("recorded wake was confirmed", func(t *testing.T) {
+		f := newStrayPane(t, "")
+		f.submit = true
+		if err := claudeWakeWith(context.Background(), b, earlier, f.ops()); err != nil {
+			t.Fatalf("confirmed wake: %v", err)
+		}
+		// The record says that text was submitted: the same words in the input
+		// now were typed by someone else.
+		untouched(t, f, earlier, 2)
+	})
+}
+
+// n5: clearing the relay's own earlier wake keeps every check a stray-reply
+// clear has: an idle turn, an unchanged pane and transcript, a way to clear,
+// and at most two clears in one pass.
+func TestClaudeWakeEarlierWakeClearIsBoundedAndChecked(t *testing.T) {
+	b := testClaudeBinding()
+	earlier := "Tailterm messages #32699. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	newer := "Tailterm messages #32699,#32708. Run tt helper inbox --task tsk_e7af3c28a444b09a."
+	for name, tc := range map[string]struct {
+		setup func(*strayPane, *claudeWakeOps)
+		want  string
+		sends []string
+		input string
+	}{
+		"busy": {func(f *strayPane, _ *claudeWakeOps) { f.busy = true }, "not cleared: Claude is busy", nil, earlier},
+		"no clear available": {func(_ *strayPane, ops *claudeWakeOps) { ops.clear = nil },
+			"74 characters of the relay's own earlier unsubmitted wake text); no clear available", nil, earlier},
+		"clear fails": {func(_ *strayPane, ops *claudeWakeOps) {
+			ops.clear = func(context.Context, string, int) error { return errors.New("synthetic tmux failure") }
+		}, "not cleared: synthetic tmux failure", nil, earlier},
+		"a draft lands after the clear": {func(f *strayPane, _ *claudeWakeOps) { f.refill = []string{"left by someone"} },
+			"left untouched (after it cleared 74 characters", []string{"clear:74"}, "left by someone"},
+		"replies keep landing": {func(f *strayPane, _ *claudeWakeOps) { f.refill = []string{"?1;2c", "?1;2c", "?1;2c"} },
+			"stray input in the input line returned after 2 clears in one pass", []string{"clear:74", "clear:5"}, "?1;2c"},
+		"transcript grows during the clear": {func(f *strayPane, ops *claudeWakeOps) {
+			clear := ops.clear
+			ops.clear = func(ctx context.Context, pane string, n int) error {
+				f.appendUser("a turn submitted meanwhile")
+				return clear(ctx, pane, n)
+			}
+		}, "Claude identity or transcript changed while stray input was cleared", []string{"clear:74"}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := abandonedWake(t, b, earlier)
+			f.submit = true
+			ops := f.ops()
+			tc.setup(f, &ops)
+			err := claudeWakeWith(context.Background(), b, newer, ops)
+			if !errors.Is(err, errClaudeWakeUnsafe) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%v, want %q", err, tc.want)
+			}
+			if want := append([]string{"text:" + earlier, "Enter"}, tc.sends...); !slices.Equal(f.sends, want) || f.input != tc.input {
+				t.Fatalf("sends %v, want %v; input %q", f.sends, want, f.input)
+			}
+			if got := f.intent(b); got.Prompt != earlier || got.Phase != "abandoned" {
+				t.Fatalf("the record of the earlier wake was replaced before the input was empty: %+v", got)
+			}
+		})
+	}
+	// The record survives a skipped pass and a restarted relay, so the wake
+	// text is still the relay's own on a later pass.
+	f := abandonedWake(t, b, earlier)
+	f.busy = true
+	if err := claudeWakeWith(context.Background(), b, newer, f.ops()); !errors.Is(err, errClaudeWakeUnsafe) {
+		t.Fatalf("busy pass: %v", err)
+	}
+	f.busy, f.submit = false, true
+	f.now = f.now.Add(time.Hour)
+	if err := claudeWakeWith(context.Background(), b, newer, f.ops()); err != nil {
+		t.Fatalf("later pass: %v", err)
+	}
+	if want := []string{"text:" + earlier, "Enter", "clear:74", "text:" + newer, "Enter"}; !slices.Equal(f.sends, want) {
+		t.Fatalf("sends %v, want %v", f.sends, want)
 	}
 }
