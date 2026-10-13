@@ -71,18 +71,31 @@ var handoffVocabulary = strings.Fields(`active revoked cancelled open done dropp
 
 var (
 	handoffRealOnce   sync.Once
-	handoffRealBefore string
+	handoffRealBefore map[string]string // each entry of the real handoff directory, as the first box found it
 )
 
-// handoffRealState describes the real handoff directory of the user running
-// the tests: absent, or every file in it with its content hash. The suite
-// must leave it exactly as it found it.
-func handoffRealState() string {
+// handoffRealDirEnv names a stand-in for the real handoff directory. The
+// checks that plant a write, or keep another process writing, use it; no test
+// may write the real directory itself. TestMain drops TAILTERM_ variables, so
+// the name does not start with that.
+const handoffRealDirEnv = "TT_HANDOFF_TEST_REAL_DIR"
+
+// handoffRealDir is the real handoff directory of the user running the tests,
+// or the stand-in.
+func handoffRealDir() string {
+	if dir := os.Getenv(handoffRealDirEnv); dir != "" {
+		return dir
+	}
 	u, err := user.Current()
 	if err != nil || u.HomeDir == "" {
-		return "no home"
+		return ""
 	}
-	root := filepath.Join(u.HomeDir, ".local", "state", "tailterm", "handoff")
+	return filepath.Join(u.HomeDir, ".local", "state", "tailterm", "handoff")
+}
+
+// handoffTreeState describes a path: absent, or every file under it with its
+// content hash.
+func handoffTreeState(root string) string {
 	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
 		return "absent"
 	}
@@ -100,6 +113,51 @@ func handoffRealState() string {
 		return nil
 	})
 	return strings.Join(lines, "\n")
+}
+
+// handoffRealState describes the whole real handoff directory. Only the live
+// check compares it: another process's write changes it too.
+func handoffRealState() string {
+	root := handoffRealDir()
+	if root == "" {
+		return "no home"
+	}
+	return handoffTreeState(root)
+}
+
+// realChanges is the box's guard on the real handoff directory. The record
+// code writes only under the directory of an agent, so what a test could have
+// put in the real directory is an entry named as one in its own: each such
+// entry must be as the first box found it, which for a test's agent is
+// absent. Every other entry belongs to a live session of the same user, such
+// as the owner helper saving its own record during the run, and is not
+// compared. The access hook reports the code under test opening any path of
+// the real directory, whatever its name.
+func (b *handoffBox) realChanges() []string {
+	root := handoffRealDir()
+	if root == "" {
+		return nil
+	}
+	names := []string{b.helper.Agent}
+	entries, _ := os.ReadDir(b.dir())
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	var changed []string
+	for i, name := range names {
+		if name == "" || name != filepath.Base(name) || i > 0 && name == names[i-1] {
+			continue
+		}
+		before, known := handoffRealBefore[name]
+		if !known {
+			before = "absent"
+		}
+		if after := handoffTreeState(filepath.Join(root, name)); after != before {
+			changed = append(changed, fmt.Sprintf("%s\nbefore %s\nafter  %s", filepath.Join(root, name), before, after))
+		}
+	}
+	return changed
 }
 
 type handoffBox struct {
@@ -136,7 +194,13 @@ func (b *handoffBox) settle() {
 
 func newHandoffBox(t *testing.T) *handoffBox {
 	t.Helper()
-	handoffRealOnce.Do(func() { handoffRealBefore = handoffRealState() })
+	handoffRealOnce.Do(func() {
+		handoffRealBefore = map[string]string{}
+		entries, _ := os.ReadDir(handoffRealDir())
+		for _, entry := range entries {
+			handoffRealBefore[entry.Name()] = handoffTreeState(filepath.Join(handoffRealDir(), entry.Name()))
+		}
+	})
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -179,8 +243,8 @@ func newHandoffBox(t *testing.T) *handoffBox {
 			t.Errorf("a13: the handoff code opened paths outside the temporary root %s: %q", root, b.outside)
 		}
 		b.requireNoLeak()
-		if after := handoffRealState(); after != handoffRealBefore {
-			t.Errorf("a13: the real handoff directory changed:\nbefore %s\nafter  %s", handoffRealBefore, after)
+		for _, change := range b.realChanges() {
+			t.Errorf("a13: this test's entry in the real handoff directory changed: %s", change)
 		}
 	})
 	return b
@@ -1837,6 +1901,10 @@ func TestHandoffStampOwnership(t *testing.T) {
 	// runs in the same tmux session.
 	start := func(t *testing.T) *fixture {
 		b := newHandoffBox(t)
+		// The test is of who may write the stamps, not of the hook's
+		// deadline: a candidate is matched by a tmux query, which under load
+		// can pass the real deadline and leave no note and no capture line.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		b.on()
 		b.asHelper()
 		b.asCandidate() // every process here sits in the helper's tmux session
@@ -3976,6 +4044,10 @@ func TestHandoffAge(t *testing.T) {
 	}
 
 	b := newHandoffBox(t)
+	// The test is of the note's ages, not of the hook's deadline: its
+	// candidate notes run a tmux query, which under load can pass the real
+	// deadline and leave no note at all.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	b.on()
 	b.asHelper()
 	start := map[string]any{"source": "startup"}
@@ -5318,8 +5390,8 @@ func TestHandoffIsolation(t *testing.T) {
 	if !caught {
 		t.Fatal("the box did not catch a path outside its root")
 	}
-	if now := handoffRealState(); now != handoffRealBefore {
-		t.Fatalf("the real handoff directory changed:\nbefore %s\nafter  %s", handoffRealBefore, now)
+	if changed := b.realChanges(); len(changed) > 0 {
+		t.Fatalf("this test's entry in the real handoff directory changed: %s", strings.Join(changed, "\n"))
 	}
 }
 
