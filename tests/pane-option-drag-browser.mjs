@@ -303,23 +303,37 @@ async function run(engine, name) {
       await page.mouse.up();
       await setOption(page, "left", false);
     }
-    // a7: Shift held when the window lost focus does not leak into the next drag.
+    // a7: Left Option held when the window lost focus does not leak into the
+    // next drag: with no keyup and no fresh key event, a pointer-only drag
+    // shows no split preview and swaps. This does not prove the blur handler's
+    // Shift reset, which no test can observe on its own: the keydown that
+    // records Left Option again writes Shift from the event first.
     await reset(page);
-    await page.evaluate(() => {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Shift", shiftKey: true }),
-      );
-      window.dispatchEvent(new Event("blur"));
-    });
-    await beginDrag(page, "a", "c");
+    const aHeld = await page
+        .locator('.pane-header[data-pane="a"]')
+        .boundingBox(),
+      cHeld = await page.locator('.pane-header[data-pane="c"]').boundingBox();
     await setOption(page, "left", true);
+    await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+    await beginDrag(page, "a", "c");
     assert.equal(
       await placementNow(),
-      "right",
-      `${name}: Left Option after blur splits right`,
+      null,
+      `${name}: Left Option held before blur shows no preview on the next drag`,
     );
-    await page.keyboard.press("Escape");
+    assert.equal(await page.locator(".group-drop-target").count(), 1);
     await page.mouse.up();
+    const aLater = await page
+        .locator('.pane-header[data-pane="a"]')
+        .boundingBox(),
+      cLater = await page.locator('.pane-header[data-pane="c"]').boundingBox();
+    assert.ok(
+      Math.abs(aLater.x - cHeld.x) < 1 &&
+        Math.abs(aLater.y - cHeld.y) < 1 &&
+        Math.abs(cLater.x - aHeld.x) < 1 &&
+        Math.abs(cLater.y - aHeld.y) < 1,
+      `${name}: the drag after blur performs the ordinary swap`,
+    );
     await setOption(page, "left", false);
 
     assert.deepEqual(errors, []);
