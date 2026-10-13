@@ -546,7 +546,9 @@ test("store race checks name the sharded matrix command", () => {
   // is part of the pattern and does not end a clause. A third reading keeps to
   // one command: from the nearest go test or verify-matrix.mjs before the flag
   // to the next one after it, so a command joined to the sharded one by words,
-  // a bracket or a colon cannot borrow its shard flag and timeout.
+  // a bracket or a colon cannot borrow its shard flag and timeout. A fourth
+  // reading starts at the flag itself, so a flag joined to the sharded command
+  // with no go test of its own before it is read without that command.
   const breaks = /(?<!\.\/\.\.)\. |; |, /g;
   const refused = (command) => {
     const timeout = /-timeout[= ](\d+)m/.exec(command);
@@ -568,9 +570,11 @@ test("store race checks name the sharded matrix command", () => {
         const sentence = line.slice(Math.max(line.lastIndexOf(". ", at), line.lastIndexOf("; ", at)) + 1, stop);
         const head = heads.findLast((start) => start < at);
         const command = head === undefined ? "" : line.slice(head, heads.find((start) => start > at) ?? line.length);
+        const tail = line.slice(at, stop);
         if (refused(clause)) found.push(clause.trim());
         else if (refused(sentence)) found.push(sentence.trim());
         else if (refused(command)) found.push(command.trim());
+        else if (refused(tail)) found.push(tail.trim());
         at = next;
       }
     }
@@ -611,6 +615,11 @@ test("store race checks name the sharded matrix command", () => {
   assert.equal(unsafe(`${sharded}, or go test -race ./...`).length, 1);
   assert.equal(unsafe(`${sharded}\nnot go test -race -timeout 30m ./internal/store`).length, 1);
   assert.equal(unsafe(`${sharded}\nor go test -race ./...`).length, 1);
+  assert.deepEqual(unsafe(`${sharded} and -race -timeout 30m ./internal/store`), ["-race -timeout 30m ./internal/store"]);
+  assert.deepEqual(unsafe(`${sharded} (-race -timeout 30m ./internal/store)`), ["-race -timeout 30m ./internal/store)"]);
+  assert.equal(unsafe(`${sharded} [or -race ./...]`).length, 1);
+  assert.equal(unsafe(`${sharded} or GOFLAGS=-race go test ./internal/store`).length, 1);
+  assert.equal(unsafe(`${sharded} and -race ./cmd/tt`).length, 0);
   assert.equal(unsafe(`${sharded} (run from hub/)`).length, 0);
   assert.equal(unsafe(`${sharded} instead of go test ./internal/store`).length, 0);
   const texts = [
