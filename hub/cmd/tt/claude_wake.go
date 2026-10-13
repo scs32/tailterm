@@ -255,6 +255,9 @@ func exactClaudeInput(screen, expected string) bool {
 type claudeInputError struct {
 	reason string
 	Text   string
+	// Empty reports a refused read for typed text that found the input box
+	// empty: the text is not drawn yet, or is gone.
+	Empty bool
 }
 
 func (e claudeInputError) Error() string { return e.reason }
@@ -751,7 +754,7 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 		visible = strings.Join(lines[cursorY:], "\n")
 	}
 	if !exactClaudeInput(visible, expected) {
-		return "", claudeInputError{reason: "Claude input is occupied, prompting, or unknown", Text: held}
+		return "", claudeInputError{reason: "Claude input is occupied, prompting, or unknown", Text: held, Empty: expected != "" && emptyClaudeInput(visible)}
 	}
 	return visible, nil
 }
@@ -1518,6 +1521,40 @@ func claudeWakeBackoffAfter(attempts int) time.Duration {
 	return claudeWakeBackoff[attempts]
 }
 
+const (
+	// claudeWakeCheckStep is the wait before each read of the typed wake text.
+	claudeWakeCheckStep = 100 * time.Millisecond
+	// claudeWakeCheckBound is how long after typing the last such read may
+	// start. Until 2026-10-13 there was one read, at 100 ms; when it failed
+	// the wake stayed typed and unsent for minutes (docs/claude-wake.md).
+	claudeWakeCheckBound = time.Second
+)
+
+// claudeWakeCheckSaw classifies the last failed read of the typed wake text
+// for the relay log. It names a class and a length, never the text: the
+// input may hold a person's draft. The read's own refusal follows it in the
+// log line and says why an unreadable input was refused.
+func claudeWakeCheckSaw(err error, prompt string) string {
+	var held claudeInputError
+	if !errors.As(err, &held) {
+		return "input unreadable"
+	}
+	compact := func(v string) string { return strings.Join(strings.Fields(v), "") }
+	text, n := compact(held.Text), len([]rune(held.Text))
+	switch {
+	case held.Empty:
+		return "input empty"
+	case text == "":
+		return "input unreadable"
+	case text == compact(prompt):
+		return fmt.Sprintf("input holds the exact prompt (%d characters) in a layout the check refuses", n)
+	case strings.HasPrefix(compact(prompt), text):
+		return fmt.Sprintf("input holds a prefix of the prompt (%d of %d characters)", n, len([]rune(prompt)))
+	default:
+		return fmt.Sprintf("input holds other text (%d characters)", n)
+	}
+}
+
 // claudeWakeType types prompt into an empty, idle input, verifies it, presses
 // Enter and waits for the transcript to confirm. The intent carries its retry
 // state; it becomes uncertain before any input.
@@ -1553,10 +1590,18 @@ func claudeWakeType(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	if err := writePrivateJSON(path, intent); err != nil {
 		return fmt.Errorf("Claude text receipt save failed; did not confirm: %w", err)
 	}
-	ops.sleep(100 * time.Millisecond)
-	third, err := ops.inspect(ctx, b, prompt)
-	if err != nil {
-		return fmt.Errorf("Claude input verification before Enter failed; did not confirm: %w", err)
+	// The pane may not have drawn the text yet, so the read for the exact
+	// prompt is repeated inside claudeWakeCheckBound. Only that read passing
+	// leads to Enter; a read that fails leaves the input as it is.
+	var third claudeWakeSnapshot
+	for typed := ops.now(); ; {
+		ops.sleep(claudeWakeCheckStep)
+		if third, err = ops.inspect(ctx, b, prompt); err == nil {
+			break
+		}
+		if elapsed := ops.now().Sub(typed); elapsed+claudeWakeCheckStep > claudeWakeCheckBound || ctx.Err() != nil {
+			return fmt.Errorf("Claude input verification before Enter failed; did not confirm: %s after %s: %w", claudeWakeCheckSaw(err, prompt), elapsed.Round(time.Millisecond), err)
+		}
 	}
 	if !sameClaudeSnapshot(first, third) {
 		return errors.New("Claude identity or transcript changed before Enter; did not confirm")

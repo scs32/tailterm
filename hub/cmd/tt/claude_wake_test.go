@@ -3255,3 +3255,197 @@ func TestClaudeWakeEarlierWakeClearIsBoundedAndChecked(t *testing.T) {
 		t.Fatalf("sends %v, want %v", f.sends, want)
 	}
 }
+
+// lagPane is a strayPane that draws what the relay types late: for lag after
+// the literal send, a read sees drawn(typed text) where the text will be.
+// After lag the input is drawn in full. fail, when set, is what every read
+// after the send returns instead. reads counts the reads for typed text.
+type lagPane struct {
+	*strayPane
+	lag     time.Duration
+	drawn   func(typed string) string
+	fail    error
+	typedAt time.Time
+	typed   string
+	reads   int
+}
+
+func (f *lagPane) ops() claudeWakeOps {
+	ops := f.strayPane.ops()
+	inspect, send := ops.inspect, ops.send
+	ops.send = func(ctx context.Context, pane, value string, literal bool) error {
+		if literal {
+			f.typed, f.typedAt = value, f.now
+		}
+		return send(ctx, pane, value, literal)
+	}
+	ops.inspect = func(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+		if expected != "" {
+			f.reads++
+		}
+		if f.typed == "" || !strings.HasSuffix(f.input, f.typed) {
+			return inspect(ctx, b, expected)
+		}
+		if f.fail != nil {
+			return claudeWakeSnapshot{}, f.fail
+		}
+		if f.now.Sub(f.typedAt) < f.lag {
+			full := f.input
+			f.input = strings.TrimSuffix(full, f.typed) + f.drawn(f.typed)
+			defer func() { f.input = full }()
+		}
+		return inspect(ctx, b, expected)
+	}
+	return ops
+}
+
+// e3: a prompt the pane draws later than the first read at 100 ms, but inside
+// the bound, is submitted with one Enter. Until 2026-10-13 the single read at
+// 100 ms failed and the wake stayed typed and unsent.
+func TestClaudeWakeCheckWaitsForSlowRedraw(t *testing.T) {
+	const prompt = "Tailterm messages #33358. Run tt inbox --unread --mark-read."
+	for _, tc := range []struct {
+		name  string
+		lag   time.Duration
+		drawn func(string) string
+		reads int
+	}{
+		{"drawn at once", 0, nil, 1},
+		{"empty until 400 ms", 400 * time.Millisecond, func(string) string { return "" }, 4},
+		{"a prefix until 700 ms", 700 * time.Millisecond, func(v string) string { return v[:23] }, 7},
+		{"empty until the bound", claudeWakeCheckBound, func(string) string { return "" }, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &lagPane{strayPane: newStrayPane(t, ""), lag: tc.lag, drawn: tc.drawn}
+			f.submit = true
+			b := testClaudeBinding()
+			if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err != nil {
+				t.Fatalf("wake: %v", err)
+			}
+			if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) {
+				t.Fatalf("sends %v, want %v", f.sends, want)
+			}
+			if turns := f.userTurns(); !slices.Equal(turns, []string{prompt}) || f.input != "" {
+				t.Fatalf("submitted turns %q, input %q", turns, f.input)
+			}
+			got := f.intent(b)
+			if wait := got.EnterAt.Sub(got.TextAt); got.Phase != "confirmed" || f.reads != tc.reads || wait != time.Duration(tc.reads)*claudeWakeCheckStep || wait > claudeWakeCheckBound {
+				t.Fatalf("reads %d, Enter %v after the text, intent %+v", f.reads, wait, got)
+			}
+		})
+	}
+}
+
+// e1, e3: a prompt the check never reads gets no Enter, as before. The error
+// the relay logs names what the last read saw and how long the check ran,
+// never the text.
+func TestClaudeWakeCheckGivesUpWithClass(t *testing.T) {
+	const prompt = "Tailterm messages #33359. Run tt inbox --unread --mark-read."
+	const refused = ": Claude input is occupied, prompting, or unknown"
+	const dialog = `Claude pane has a permission or selection prompt: "esc to cancel" in prompt area row 4`
+	for _, tc := range []struct {
+		name  string
+		drawn func(string) string
+		fail  error
+		want  string
+	}{
+		{"never drawn", func(string) string { return "" }, nil, "input empty after 1s" + refused},
+		{"part drawn", func(v string) string { return v[:23] }, nil, "input holds a prefix of the prompt (23 of 60 characters) after 1s" + refused},
+		{"one word drawn", func(v string) string { return v[:9] }, nil, "input holds a prefix of the prompt (8 of 60 characters) after 1s" + refused},
+		{"other text", func(v string) string { return "garbled ?1;2c words" }, nil, "input holds other text (19 characters) after 1s" + refused},
+		{"dialog", nil, errors.New(dialog), "input unreadable after 1s: " + dialog},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &lagPane{strayPane: newStrayPane(t, ""), lag: time.Hour, drawn: tc.drawn, fail: tc.fail}
+			f.submit = true
+			b := testClaudeBinding()
+			err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+			if want := "Claude input verification before Enter failed; did not confirm: " + tc.want; err == nil || err.Error() != want {
+				t.Fatalf("error %v, want %s", err, want)
+			}
+			if strings.Contains(err.Error(), "garbled") || strings.Contains(err.Error(), prompt[:8]) {
+				t.Fatalf("error carries pane text: %v", err)
+			}
+			if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 || f.reads != 10 {
+				t.Fatalf("sends %v, clears %v, reads %d; want only the text and ten reads", f.sends, f.clears, f.reads)
+			}
+			if turns := f.userTurns(); len(turns) != 0 || f.input != prompt {
+				t.Fatalf("submitted turns %q, input %q", turns, f.input)
+			}
+			got := f.intent(b)
+			if got.Phase != "uncertain" || got.TextAt.IsZero() || !got.EnterAt.IsZero() || f.now.Sub(got.TextAt) != claudeWakeCheckBound {
+				t.Fatalf("intent %+v, check ran %v", got, f.now.Sub(got.TextAt))
+			}
+		})
+	}
+}
+
+// The classes the check logs. Text that reads as the whole prompt in a layout
+// the read refused is its own class: it is not a prefix and not other text.
+func TestClaudeWakeCheckSawClasses(t *testing.T) {
+	const prompt = "Tailterm messages #7. Run tt inbox."
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"empty", claudeInputError{reason: "r", Empty: true}, "input empty"},
+		{"exact", claudeInputError{reason: "r", Text: prompt}, "input holds the exact prompt (35 characters) in a layout the check refuses"},
+		{"prefix", claudeInputError{reason: "r", Text: "Tailterm messages"}, "input holds a prefix of the prompt (17 of 35 characters)"},
+		{"prompt and more", claudeInputError{reason: "r", Text: prompt + " and a draft"}, "input holds other text (47 characters)"},
+		{"other", claudeInputError{reason: "r", Text: "a draft"}, "input holds other text (7 characters)"},
+		{"unknown layout", claudeInputError{reason: "r"}, "input unreadable"},
+		{"wrapped refusal", fmt.Errorf("outer: %w", claudeInputError{reason: "r", Empty: true}), "input empty"},
+		{"not an input refusal", errors.New("turn in progress"), "input unreadable"},
+	} {
+		if got := claudeWakeCheckSaw(tc.err, prompt); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// e2, e3: a person's draft is never typed over, cleared or submitted. A draft
+// already in the input refuses the wake before anything is typed. Words a
+// person adds after the relay's text make every read fail, so no Enter is
+// sent and the input keeps exactly what it held.
+func TestClaudeWakeCheckLeavesDraftUntouched(t *testing.T) {
+	const prompt = "Tailterm messages #33360. Run tt inbox --unread --mark-read."
+	const draft = "an owner draft, secret words"
+	t.Run("draft before the wake", func(t *testing.T) {
+		f := &lagPane{strayPane: newStrayPane(t, draft)}
+		f.submit = true
+		b := testClaudeBinding()
+		err := claudeWakeWith(context.Background(), b, prompt, f.ops())
+		if !errors.Is(err, errClaudeWakeUnsafe) || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("error %v", err)
+		}
+		if len(f.sends) != 0 || f.input != draft || f.reads != 0 || len(f.userTurns()) != 0 {
+			t.Fatalf("pane touched: sends %v input %q reads %d", f.sends, f.input, f.reads)
+		}
+	})
+	t.Run("draft typed after the wake text", func(t *testing.T) {
+		f := &lagPane{strayPane: newStrayPane(t, "")}
+		f.submit = true
+		b := testClaudeBinding()
+		ops := f.ops()
+		sleep := ops.sleep
+		ops.sleep = func(d time.Duration) {
+			// The person's words land after the relay's text, before the
+			// first read.
+			if sleep(d); f.typed != "" && f.input == f.typed {
+				f.input += " " + draft
+			}
+		}
+		err := claudeWakeWith(context.Background(), b, prompt, ops)
+		const want = "Claude input verification before Enter failed; did not confirm: input holds other text (89 characters) after 1s: Claude input is occupied, prompting, or unknown"
+		if err == nil || err.Error() != want {
+			t.Fatalf("error %v, want %s", err, want)
+		}
+		if strings.Contains(err.Error(), "secret") || f.reads != 10 {
+			t.Fatalf("error %v, reads %d", err, f.reads)
+		}
+		if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 || f.input != prompt+" "+draft || len(f.userTurns()) != 0 {
+			t.Fatalf("sends %v, clears %v, input %q, turns %q", f.sends, f.clears, f.input, f.userTurns())
+		}
+	})
+}
