@@ -1124,9 +1124,37 @@ test("matrix timeout kills its own process group descendants and retains failed 
     },
     f.cwd,
   );
+  // Under host load npm, the check and its descendant can take longer than
+  // the 1500 ms check timeout to start, and that attempt then records no
+  // descendant to kill (seen at load 6 to 8: one of three recorded). Each
+  // attempt's timeout is held, one more period at a time and at most 40, until
+  // that attempt's descendant has recorded its listener; every other timer is
+  // untouched. The periods added are taken off the promptness bound, which
+  // still allows the same 10 s for three timeouts and their kills.
+  const realSetTimeout = globalThis.setTimeout;
+  t.after(() => {
+    globalThis.setTimeout = realSetTimeout;
+  });
+  const recorded = () => (existsSync(info) ? readFileSync(info, "utf8").split("\n").length - 1 : 0);
+  let attempts = 0,
+    heldMs = 0;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 1500) return realSetTimeout(callback, delay, ...args);
+    const attempt = ++attempts;
+    let held = 0;
+    const timer = realSetTimeout(() => {
+      if (held < 40 && recorded() < attempt) {
+        held++;
+        heldMs += delay;
+        timer.refresh();
+      } else callback(...args);
+    }, delay);
+    return timer;
+  };
   const started = Date.now();
   const receipt = await runPlan(plan, f.cwd, external);
-  assert(Date.now() - started < 10000, "timeout completes promptly");
+  globalThis.setTimeout = realSetTimeout;
+  assert(Date.now() - started - heldMs < 10000, "timeout completes promptly");
   assert(
     !existsSync(receipt.environment.HOME),
     "timed out run removed its home",

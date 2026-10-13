@@ -494,10 +494,39 @@ function runnerFixture(t, source) {
   const plan = makePlan({ baseCommit: commit, commit, owned: ["docs/"], approvedMatrixDigest: digest(matrix), matrixApprovalMessageSeq: 1 }, cwd);
   return { cwd, plan };
 }
+// Holds back a timer of exactly `ms` while `ready` is false: it is re-armed
+// for one more period at a time, at most `limit` times, then fires whatever
+// `ready` says so a fixture that never starts fails its test instead of
+// hanging it. The timer's own callback runs unchanged, only never before the
+// thing it stops exists. Every other timer is untouched.
+function holdDeadline(t, ms, ready, limit = 40) {
+  const real = globalThis.setTimeout;
+  const restore = () => {
+    globalThis.setTimeout = real;
+  };
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== ms) return real(callback, delay, ...args);
+    let held = 0;
+    const timer = real(() => {
+      if (held < limit && !ready()) {
+        held++;
+        timer.refresh();
+      } else callback(...args);
+    }, delay);
+    return timer;
+  };
+  t.after(restore);
+  return restore;
+}
 test("L4 a matrix run past its run timeout stops its check, writes no receipt and releases", async (t) => {
   const path = lockFile(t),
     output = tempDir(t, "matrix-host-lock-logs-"),
     pidFile = join(tempDir(t), "check.pid");
+  // Under host load npm can take longer than the 1500 ms run timeout to start
+  // the check, and the run then ends with no check to stop (seen at load 6 to
+  // 8). The run timeout is held until the check has written its pid, so this
+  // proves the stop at any load instead of racing the check's start.
+  const restore = holdDeadline(t, 1500, () => existsSync(pidFile) && readFileSync(pidFile, "utf8") !== "");
   const { cwd, plan } = runnerFixture(
     t,
     `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000);`,
@@ -506,6 +535,7 @@ test("L4 a matrix run past its run timeout stops its check, writes no receipt an
     () => runPlan(plan, cwd, output, { minFreeBytes: 0, hostLock: { path, runTimeoutMs: 1500, pollMs: 20 } }),
     /Verification interrupted by run-timeout/,
   );
+  restore();
   assert(!existsSync(join(output, "receipt.json")), "no receipt");
   assert(existsSync(pidFile), "the check had started");
   assert(pidGone(Number(readFileSync(pidFile, "utf8"))), "the check was stopped");
