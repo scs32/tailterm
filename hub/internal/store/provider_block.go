@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -104,27 +105,62 @@ func providerBlockText(p api.ProviderBlock) string {
 // providerBlockHook runs in the activity report transaction. A provider_blocked
 // report opens an episode and tells the item lead once; replays, flaps back to
 // the same class and since, and relay restarts find the row and post nothing.
-// Only a completed or running turn (working, idle, finished_silent) clears the
-// run's open episodes; an unknown probe, a crash or a runtime prompt says
-// nothing about the provider and leaves them open.
+// A completed or running turn (working, idle, finished_silent) clears the
+// run's open episodes. A report in any other state (an unknown probe, a crash,
+// a stall, a runtime prompt) says nothing about the provider by its state, so
+// it clears an episode only when it shows a model reply since the block: its
+// cumulative output tokens are above those of the episode's own blocked
+// reports (providerBlockOutputBaselines). Without that evidence the episode
+// stays open.
 func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	now := ts(s.now())
 	p := activity.Provider
 	if activity.State != "provider_blocked" || p == nil {
+		turn := false
 		switch activity.State {
 		case "working", "idle", "finished_silent":
-		default:
-			return nil
+			turn = true
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT id,runtime,class,since FROM provider_block_episodes WHERE agent_id=? AND run_id=? AND cleared_at='' ORDER BY opened_at,id`, agent, run)
+		if err != nil {
+			return err
+		}
+		type openEpisode struct{ id, runtime, class, since string }
+		var open []openEpisode
+		for rows.Next() {
+			var e openEpisode
+			if err := rows.Scan(&e.id, &e.runtime, &e.class, &e.since); err != nil {
+				rows.Close()
+				return err
+			}
+			open = append(open, e)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(open) > 0 && !turn {
+			baselines, err := providerBlockOutputBaselines(ctx, tx, task, agent, run)
+			if err != nil {
+				return err
+			}
+			replied := open[:0]
+			for _, e := range open {
+				if base, ok := baselines[providerBlockKey(e.class, e.since)]; ok && activity.Tokens.Output > base {
+					replied = append(replied, e)
+				}
+			}
+			open = replied
 		}
 		var runtime string
-		err := tx.QueryRowContext(ctx, `SELECT runtime FROM provider_block_episodes WHERE agent_id=? AND run_id=? AND cleared_at='' AND class=? LIMIT 1`, agent, run, api.ProviderBlockAuth).Scan(&runtime)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
+		for _, e := range open {
+			if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE id=?`, now, e.id); err != nil {
+				return err
+			}
+			if e.class == api.ProviderBlockAuth && runtime == "" {
+				runtime = e.runtime
+			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE agent_id=? AND run_id=? AND cleared_at=''`, now, agent, run); err != nil {
-			return err
-		}
-		// A turn after an auth block means the login works again.
+		// A turn or a model reply after an auth block means the login works again.
 		if runtime != "" {
 			return s.providerRecoveryWake(ctx, tx, task, agent, runtime)
 		}
@@ -188,6 +224,37 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE provider_block_episodes SET lead_notice_seq=(SELECT max(seq) FROM messages WHERE task_id=?) WHERE id=?`, task, id)
 	return err
+}
+
+func providerBlockKey(class, since string) string { return class + "\x00" + since }
+
+// providerBlockOutputBaselines reads, from the activity receipts already stored
+// for this run, the highest cumulative output token total among the
+// provider_blocked reports of each block (class and since). A failed request
+// produces no model output, so a later report above that total has seen a
+// model reply. A block with no stored blocked report has no baseline.
+func providerBlockOutputBaselines(ctx context.Context, tx *sql.Tx, task, agent, run string) (map[string]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT payload FROM agent_activity_receipts WHERE task_id=? AND agent_id=? AND run_id=? AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.state') END='provider_blocked'`, task, agent, run)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	baselines := map[string]int64{}
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var a api.AgentActivity
+		if json.Unmarshal([]byte(payload), &a) != nil || a.Provider == nil {
+			continue
+		}
+		key := providerBlockKey(a.Provider.Class, ts(a.Provider.Since))
+		if base, ok := baselines[key]; !ok || a.Tokens.Output > base {
+			baselines[key] = a.Tokens.Output
+		}
+	}
+	return baselines, rows.Err()
 }
 
 type providerEpisode struct {
@@ -296,14 +363,18 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 	if outage != "" {
 		// An outage lasts only while its condition holds. It ends when no live
 		// agent of the runtime is blocked, when one of the runtime is working,
-		// or when an agent in it has recovered (a completed or running turn; a
-		// runtime prompt, an unknown probe or a crash is not recovery). Blocks
-		// that open afterwards are judged afresh below, so a stale outage never
-		// swallows a later owner notice.
+		// or when an agent in it has recovered: it reports a completed or
+		// running turn, or its episode in the outage was cleared and it has no
+		// open one (a report in another state that showed a model reply). A
+		// runtime prompt, an unknown probe or a crash without that is not
+		// recovery, and a block replaced by a new class or since is still a
+		// block. Blocks that open afterwards are judged afresh below, so a
+		// stale outage never swallows a later owner notice.
 		var recovered int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
  JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
- WHERE e.outage_id=? AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
+ WHERE e.outage_id=? AND (x.state IN ('working','idle','finished_silent') OR (e.cleared_at<>'' AND NOT EXISTS
+ (SELECT 1 FROM provider_block_episodes o WHERE o.agent_id=e.agent_id AND o.run_id=e.run_id AND o.cleared_at=''))) AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
 			return 0, err
 		}
 		if blocked == 0 || working > 0 || recovered > 0 {

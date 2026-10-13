@@ -779,3 +779,112 @@ func TestProviderBlockOutageEndsOnRecovery(t *testing.T) {
 		t.Fatalf("non-recovery ended the outage: posted %d", n)
 	}
 }
+
+// wi_8204795815c04d72: a report in a state that is not a turn closes the
+// episode when its output tokens show a model reply since the block, and the
+// next sweep ends the outage. Without that evidence both stay open.
+func TestProviderBlockClearsOnModelReply(t *testing.T) {
+	states := map[string]func(f *providerFixture) api.AgentActivity{
+		"needs input": func(*providerFixture) api.AgentActivity {
+			return api.AgentActivity{State: "unknown", Reason: "planned wait or input required"}
+		},
+		"runtime prompt": func(f *providerFixture) api.AgentActivity {
+			return api.AgentActivity{State: "runtime_prompt", Prompt: usageLimitPrompt(api.RuntimePromptEscalated, f.clock)}
+		},
+		"stuck": func(*providerFixture) api.AgentActivity { return api.AgentActivity{State: "stuck"} },
+	}
+	const baseline = 100
+	cases := []struct {
+		name       string
+		output     int64
+		noBaseline bool
+		recovered  bool
+	}{
+		{name: "reply", output: baseline + 1, recovered: true},
+		{name: "equal output", output: baseline},
+		{name: "lower output", output: baseline - 1},
+		{name: "no baseline", output: baseline + 1, noBaseline: true},
+	}
+	for state, activity := range states {
+		for _, c := range cases {
+			t.Run(state+"/"+c.name, func(t *testing.T) {
+				f := newProviderFixture(t)
+				first, second := f.agent("codex-0", "codex", 0), f.agent("codex-1", "codex", 0)
+				for _, a := range []api.Agent{first, second} {
+					blocked := api.AgentActivity{State: "provider_blocked", Provider: providerBlock("codex", "auth", f.clock), Tokens: api.TokenTotals{Output: baseline, Total: baseline}}
+					if err := f.report(a, "blocked-"+a.Name, blocked); err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.advance(91 * time.Second)
+				if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 {
+					t.Fatalf("outage sweep posted %d", n)
+				}
+				if c.noBaseline {
+					if _, err := f.s.db.Exec(`DELETE FROM agent_activity_receipts WHERE agent_id=?`, first.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.advance(10 * time.Minute)
+				f.seen(second, true)
+				report := activity(f)
+				report.Tokens = api.TokenTotals{Output: c.output, Total: c.output}
+				if err := f.report(first, "after", report); err != nil {
+					t.Fatal(err)
+				}
+				f.advance(30 * time.Second)
+				posted := f.sweep()
+				open := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, first.ID)
+				peer := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, second.ID)
+				outages := countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`)
+				wakes := f.notices(providerRecoveryWakeSubject, second.ID)
+				want := 1
+				if c.recovered {
+					want = 0
+				}
+				if posted != 0 || open != want || outages != want || wakes != 1-want || peer != 1 {
+					t.Fatalf("posted=%d open episodes=%d open outages=%d peer wakes=%d peer open=%d, want 0 %d %d %d 1", posted, open, outages, wakes, peer, want, want, 1-want)
+				}
+				if f.notices(providerBlockOutageSubject, "") != 1 || f.notices(providerBlockOwnerSubject, "") != 0 {
+					t.Fatalf("a second owner notice: outage=%d agent=%d", f.notices(providerBlockOutageSubject, ""), f.notices(providerBlockOwnerSubject, ""))
+				}
+			})
+		}
+	}
+}
+
+// A block that returns with a new since is judged against its own blocked
+// report, not the earlier block's lower total.
+func TestProviderBlockReplyBaselineIsPerBlock(t *testing.T) {
+	f := newProviderFixture(t)
+	f.state(f.leads[0], "working")
+	a := f.agent("reviewer", "claude", 0)
+	block := func(key string, output int64) {
+		t.Helper()
+		if err := f.report(a, key, api.AgentActivity{State: "provider_blocked", Provider: providerBlock("claude", "rate_limited", f.clock), Tokens: api.TokenTotals{Output: output, Total: output}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open := func() int {
+		return countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, a.ID)
+	}
+	block("first", 100)
+	f.advance(time.Minute)
+	f.state(a, "idle")
+	f.advance(time.Minute)
+	block("second", 500)
+	f.advance(time.Minute)
+	if err := f.report(a, "stuck", api.AgentActivity{State: "stuck", Tokens: api.TokenTotals{Output: 500, Total: 500}}); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 1 {
+		t.Fatalf("output above only the earlier block's total cleared the episode: %d open", open())
+	}
+	f.advance(time.Minute)
+	if err := f.report(a, "crashed", api.AgentActivity{State: "crashed", Tokens: api.TokenTotals{Output: 501, Total: 501}}); err != nil {
+		t.Fatal(err)
+	}
+	if open() != 0 {
+		t.Fatalf("a reply after the second block left it open: %d", open())
+	}
+}
