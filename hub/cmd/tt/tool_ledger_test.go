@@ -48,6 +48,25 @@ func setToolLedger[T any](t *testing.T, target *T, value T) {
 	t.Cleanup(func() { *target = old })
 }
 
+// toolLedgerClock is a fake toolLedgerNow that a hook goroutine may still read
+// after its call returned at the time bound, while the test moves it on.
+type toolLedgerClock struct{ at atomic.Pointer[time.Time] }
+
+func setToolLedgerClock(t *testing.T, start time.Time) *toolLedgerClock {
+	t.Helper()
+	c := &toolLedgerClock{}
+	c.at.Store(&start)
+	setToolLedger(t, &toolLedgerNow, c.now)
+	return c
+}
+
+func (c *toolLedgerClock) now() time.Time { return *c.at.Load() }
+
+func (c *toolLedgerClock) advance(d time.Duration) {
+	next := c.now().Add(d)
+	c.at.Store(&next)
+}
+
 type toolHookRun struct {
 	out     string // stdout and stderr together
 	err     error
@@ -392,14 +411,13 @@ func TestToolLedgerOneRowPerCall(t *testing.T) {
 
 	// Two interleaved calls, one failing and one interrupted; no duration_ms,
 	// so each duration is measured from its own pre.
-	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
-	setToolLedger(t, &toolLedgerNow, func() time.Time { return now })
+	clock := setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u2", "tool_name": "Bash", "tool_input": input})
-	now = now.Add(time.Second)
+	clock.advance(time.Second)
 	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u3", "tool_name": "Read", "tool_input": map[string]any{"file_path": "/x"}})
-	now = now.Add(time.Second)
+	clock.advance(time.Second)
 	toolHook(t, e, "PostToolUseFailure", map[string]any{"session_id": "s1", "tool_use_id": "u2", "tool_name": "Bash", "tool_input": input, "error": "exit 1"})
-	now = now.Add(time.Second)
+	clock.advance(time.Second)
 	toolHook(t, e, "PostToolUseFailure", map[string]any{"session_id": "s1", "tool_use_id": "u3", "tool_name": "Read", "tool_input": map[string]any{"file_path": "/x"}, "error": "stopped", "is_interrupt": true})
 	// A post with no pre still gives a row, with keys in another order.
 	toolHook(t, e, "PostToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u4", "tool_name": "Bash", "tool_input": json.RawMessage(`{"timeout":5000,"command":"go test ./..."}`)})
@@ -458,22 +476,21 @@ func TestToolLedgerLargeCall(t *testing.T) {
 // pending entries claimed in start order, and sessions do not cross.
 func TestToolLedgerNoToolUseID(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
-	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
-	setToolLedger(t, &toolLedgerNow, func() time.Time { return now })
+	clock := setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	call := func(session string) map[string]any {
 		return map[string]any{"session_id": session, "tool_name": "Bash", "tool_input": map[string]any{"command": "sleep 1"}}
 	}
 	toolHook(t, e, "PreToolUse", call("s1"))
 	toolHook(t, e, "PreToolUse", call("s1")) // same instant: still its own file
-	now = now.Add(time.Second)
+	clock.advance(time.Second)
 	toolHook(t, e, "PreToolUse", call("s1"))
 	if pending := toolPendingFiles(t, root, e.agent); len(pending) != 3 {
 		t.Fatalf("pending = %v; want three separate entries", pending)
 	}
-	now = now.Add(9 * time.Second)
+	clock.advance(9 * time.Second)
 	toolHook(t, e, "PostToolUse", call("s1"))
 	toolHook(t, e, "PostToolUse", call("s1"))
-	now = now.Add(2 * time.Second)
+	clock.advance(2 * time.Second)
 	toolHook(t, e, "PostToolUse", call("s1"))
 	rows := toolLedgerRows(t, root, e.agent)
 	if len(rows) != 3 || rows[0]["durationMs"] != float64(10000) || rows[1]["durationMs"] != float64(10000) || rows[2]["durationMs"] != float64(11000) || rows[2]["durationSource"] != "measured" || rows[0]["toolUseId"] != "" {
@@ -719,10 +736,9 @@ func TestToolLedgerRotationAcrossProcesses(t *testing.T) {
 // a7: pending files are bounded in number, size and age.
 func TestToolLedgerPendingIsBounded(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
-	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
-	setToolLedger(t, &toolLedgerNow, func() time.Time { return now })
+	clock := setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	for i := 0; i < 300; i++ {
-		now = now.Add(time.Millisecond)
+		clock.advance(time.Millisecond)
 		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": fmt.Sprintf("u%d", i), "tool_name": "Bash", "tool_input": map[string]any{"n": i}})
 	}
 	pending := toolPendingFiles(t, root, e.agent)
@@ -745,7 +761,7 @@ func TestToolLedgerPendingIsBounded(t *testing.T) {
 	}
 
 	// Past 24 hours every entry is evicted, at most 32 on each pre.
-	now = now.Add(25 * time.Hour)
+	clock.advance(25 * time.Hour)
 	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "late", "tool_name": "Bash"})
 	if rows, pending := toolLedgerRows(t, root, e.agent), toolPendingFiles(t, root, e.agent); len(rows) != 44+32 || len(pending) != 256-32+1 || rows[44]["toolUseId"] != "u44" {
 		t.Fatalf("after an aged pre: %d rows, %d pending", len(rows), len(pending))
