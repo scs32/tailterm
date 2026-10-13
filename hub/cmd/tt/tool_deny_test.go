@@ -525,7 +525,7 @@ func TestToolDenyFailsOpen(t *testing.T) {
 			}
 			break
 		}
-		setToolLedger(t, &toolLedgerDeadline, 150*time.Millisecond)
+		setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the post hook's row is not about timing: a hook that reaches its deadline on a loaded host writes no row
 		pending(t, e, root)
 	})
 	t.Run("unreadable input", func(t *testing.T) {
@@ -1422,7 +1422,7 @@ func TestToolGateFailsOpen(t *testing.T) {
 			}
 			break
 		}
-		setToolLedger(t, &toolLedgerDeadline, 150*time.Millisecond)
+		setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the post hook's row is not about timing: a hook that reaches its deadline on a loaded host writes no row
 		finish(t, e, root, 0)
 	})
 	t.Run("unreadable input", func(t *testing.T) {

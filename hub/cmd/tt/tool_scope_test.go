@@ -421,6 +421,8 @@ func TestToolScopeCacheBound(t *testing.T) {
 // a2: a recovery run of the same agent re-caches the ASSIGN it reads, even
 // one older than the previous run's.
 func TestToolScopeCacheNewRun(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // which run's hook uses the cache is the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	e, root := toolLedgerSandbox(t)
 	toolScopeRemember(e, []api.Message{scopeAssign(e, 40, "amended")})
 	next := e
@@ -683,6 +685,11 @@ func TestToolScopeCacheSeqStalledFetch(t *testing.T) {
 
 // a4: each edit tool outside the owned paths leaves exactly one row.
 func TestToolScopeRow(t *testing.T) {
+	// The row's fields are the subject here, not timing: a hook that reaches
+	// its deadline on a loaded host writes no row, and one that passes the
+	// scan budget writes no would-report row.
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
 	long := strings.Repeat("é", 150) + ".go" // 303 bytes; the cut falls inside a character
 	for _, c := range []struct {
 		name, tool   string
@@ -763,6 +770,8 @@ func mustJSON(t *testing.T, v any) []byte {
 // a5: owned paths, paths outside the repository and other tools write no
 // row, through the hook and on the real file system.
 func TestToolScopeOwnedWritesNothing(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows and their count are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	e, root := toolLedgerSandbox(t)
 	repo := scopeRepo(t)
 	outside := t.TempDir()
@@ -966,10 +975,15 @@ func scopeNormalRows(rows []map[string]any) string {
 // a6: every fail-open case leaves exactly the rows the same calls leave
 // with the check switched off, and the hook stays silent.
 func TestToolScopeFailsOpen(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows with and without the check are the subject here, not timing; the deadline case below sets its own 40 ms
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	type sandbox struct {
 		e          env
 		root, repo string
 		pre        map[string]any
+		// late, when a case sets it, waits after the PreToolUse call for the
+		// case's late check and reports whether it was called and finished.
+		late func() (called, finished bool)
 	}
 	valid := func(t *testing.T, s *sandbox) {
 		toolScopeRemember(s.e, []api.Message{scopeAssign(s.e, 5, "owned.go")})
@@ -983,31 +997,59 @@ func TestToolScopeFailsOpen(t *testing.T) {
 		}
 	}
 	// run makes the calls in a fresh sandbox and returns its normalised rows.
+	// A case with a late check is run again in a new sandbox, at most three
+	// times, when its hook reached the deadline before the check was called:
+	// that attempt shows nothing about a late check. The last attempt is
+	// judged as it stands.
 	run := func(t *testing.T, check bool, prepare func(*testing.T, *sandbox)) string {
 		t.Helper()
-		var s sandbox
-		s.e, s.root = toolLedgerSandbox(t)
-		s.repo = filepath.Join(t.TempDir(), "repo")
-		if err := os.MkdirAll(filepath.Join(s.repo, ".git"), 0700); err != nil {
-			t.Fatal(err)
-		}
-		s.pre = scopePre("Edit", "u1", s.repo, filepath.Join(s.repo, "outside.go"))
-		if !check {
-			setToolLedger(t, &toolScopeCheck, nil)
-		}
-		if prepare != nil {
-			prepare(t, &s)
-		}
-		for _, event := range []string{"PreToolUse", "PostToolUse"} {
-			if r := runToolHook(t, s.e, "tool", toolPayload(event, s.pre), nil); r.err != nil || r.out != "" {
-				t.Fatalf("%s = %v, output %q; want nil and no output", event, r.err, r.out)
+		for attempt := 1; ; attempt++ {
+			var s sandbox
+			s.e, s.root = toolLedgerSandbox(t)
+			s.repo = filepath.Join(t.TempDir(), "repo")
+			if err := os.MkdirAll(filepath.Join(s.repo, ".git"), 0700); err != nil {
+				t.Fatal(err)
 			}
+			s.pre = scopePre("Edit", "u1", s.repo, filepath.Join(s.repo, "outside.go"))
+			if !check {
+				setToolLedger(t, &toolScopeCheck, nil)
+			}
+			if prepare != nil {
+				prepare(t, &s)
+			}
+			again := false
+			for _, event := range []string{"PreToolUse", "PostToolUse"} {
+				if event == "PostToolUse" {
+					// The call's ordinary row is not about timing: a post hook
+					// that reaches a case's short deadline writes no row.
+					setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+				}
+				if r := runToolHook(t, s.e, "tool", toolPayload(event, s.pre), nil); r.err != nil || r.out != "" {
+					t.Fatalf("%s = %v, output %q; want nil and no output", event, r.err, r.out)
+				}
+				if event == "PreToolUse" && s.late != nil {
+					if called, finished := s.late(); !finished {
+						if !called && attempt < 3 {
+							t.Logf("attempt %d: the hook reached its deadline before the check was called; running it again in a new sandbox", attempt)
+							again = true
+							break
+						}
+						t.Fatal("the late check never finished")
+					}
+				}
+			}
+			if again {
+				continue
+			}
+			rows := toolLedgerRows(t, s.root, s.e.agent)
+			if len(rows) == 0 {
+				t.Fatalf("%s: the calls wrote no row at all", t.Name())
+			}
+			if last := rows[len(rows)-1]; last["outcome"] != "ok" || last["durationSource"] != "measured" || last["toolUseId"] != "u1" {
+				t.Fatalf("the call's ordinary row is missing or unpaired: %v", rows)
+			}
+			return scopeNormalRows(rows)
 		}
-		rows := toolLedgerRows(t, s.root, s.e.agent)
-		if last := rows[len(rows)-1]; last["outcome"] != "ok" || last["durationSource"] != "measured" || last["toolUseId"] != "u1" {
-			t.Fatalf("the call's ordinary row is missing or unpaired: %v", rows)
-		}
-		return scopeNormalRows(rows)
 	}
 	if rows := run(t, true, valid); strings.Count(rows, `"would_report"`) != 1 {
 		t.Fatalf("control: a valid cache gave %s; the cases below would prove nothing", rows)
@@ -1101,28 +1143,35 @@ func TestToolScopeFailsOpen(t *testing.T) {
 		}},
 		{"deadline already passed", func(t *testing.T, s *sandbox) {
 			valid(t, s)
-			setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
-			finished := make(chan struct{})
 			real := toolScopeCheck
 			if real == nil {
-				return // the run with the check switched off
+				return // the run with the check switched off: no check to be late
 			}
-			var once sync.Once
+			setToolLedger(t, &toolLedgerDeadline, 40*time.Millisecond)
+			called, finished := make(chan struct{}), make(chan struct{})
+			var enter, once sync.Once
 			setToolLedger(t, &toolScopeCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage, cwd string) {
 				if tool != "Edit" {
 					return
 				}
+				enter.Do(func() { close(called) })
 				time.Sleep(time.Until(l.started.Add(l.deadline + 20*time.Millisecond)))
 				real(l, row, tool, input, cwd)
 				once.Do(func() { close(finished) })
 			})
-			t.Cleanup(func() {
+			s.late = func() (bool, bool) {
 				select {
 				case <-finished:
+					return true, true
 				case <-time.After(5 * time.Second):
-					t.Error("the late check never finished")
 				}
-			})
+				select {
+				case <-called:
+					return true, false
+				default:
+					return false, false
+				}
+			}
 		}},
 		{"the path scan cannot finish", func(t *testing.T, s *sandbox) {
 			valid(t, s)
@@ -1157,6 +1206,8 @@ func TestToolScopeFailsOpen(t *testing.T) {
 // a6: matching and non-matching calls alike return nil and print nothing,
 // on all three events.
 func TestToolScopePrintsNothing(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // silence and the row count are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	e, root := toolLedgerSandbox(t)
 	repo := scopeRepo(t)
 	toolScopeRemember(e, []api.Message{scopeAssign(e, 5, "owned.go")})
@@ -1404,6 +1455,8 @@ func TestToolScopeCost(t *testing.T) {
 // a8: the hook opens no hub connection, and the new file can neither start
 // a process nor open a socket, nor name the hub's config file.
 func TestToolScopeNoHubNoProcess(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the connections and the rows are the subject here, not the hook's deadline; each call's 200 ms bound below stays
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1981,6 +2034,11 @@ func TestToolScopeMarkNeverChangesInbox(t *testing.T) {
 // a5: a queue builder's edit inside the repository, with this run's marker
 // and no cache of this run, leaves exactly one edit-before-assign row.
 func TestToolScopeBeforeAssignRow(t *testing.T) {
+	// The row's fields are the subject here, not timing: a hook that reaches
+	// its deadline on a loaded host writes no row, and one that passes the
+	// scan budget writes no would-report row.
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
 	long := strings.Repeat("é", 150) + ".go" // 303 bytes; the cut falls inside a character
 	secret := "ghp_" + strings.Repeat("a1B2", 9)
 	type rowCase struct {
@@ -2046,6 +2104,8 @@ func TestToolScopeBeforeAssignRow(t *testing.T) {
 // a6: every other case leaves no edit-before-assign row, prints nothing and
 // keeps the call's ordinary row.
 func TestToolScopeBeforeAssignSilent(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows each case leaves are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	type sandbox struct {
 		e          env
 		root, repo string
@@ -2389,6 +2449,8 @@ func TestToolScopeBeforeAssignCost(t *testing.T) {
 
 // a7: the new rule opens no hub connection either.
 func TestToolScopeBeforeAssignNoHub(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the connections and the rows are the subject here, not the hook's deadline; each call's 200 ms bound below stays
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes no would-report row
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

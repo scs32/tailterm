@@ -944,6 +944,8 @@ func requireNoRedactFields(t *testing.T, label string, row map[string]any) {
 // a2 and a11: report mode is complete on its own. For every input the hook
 // prints nothing and the rewrite is never called.
 func TestToolRedactReportMode(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows and their summaries are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its row with no summary
 	e, root := redactSandbox(t, toolRedactReport)
 	setToolLedger(t, &toolRedactRewrite, func([]byte, []string, time.Time) ([]byte, bool) {
 		t.Error("report mode called the rewrite")
@@ -1024,6 +1026,8 @@ func requireNoValueInLedger(t *testing.T, root, agent string, values ...string) 
 // a3: redact mode answers with one JSON object whose updated output has the
 // input's exact structure, only the value replaced.
 func TestToolRedactRedactMode(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)   // the rows and the rewritten answer are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its row with no summary
 	e, root := redactSandbox(t, toolRedactRedact)
 	c := redactShapeCases[0]
 	value := c.make(t, c.n)
@@ -1120,6 +1124,7 @@ func TestToolRedactSameShape(t *testing.T) {
 // Redaction applies to successful calls in sessions the ledger identifies,
 // and to nothing else.
 func TestToolRedactOnlyIdentifiedSuccessfulCalls(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the rows are the subject here, not timing: a hook that reaches its deadline on a loaded host writes no row
 	e, root := redactSandbox(t, toolRedactRedact)
 	c := redactShapeCases[0]
 	value := c.make(t, c.n)

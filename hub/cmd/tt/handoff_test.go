@@ -980,8 +980,11 @@ func TestHandoffHookLate(t *testing.T) {
 // with a note missing. A scenario in which a hook call reached the deadline
 // is run again in a fresh box, three times at most. A scenario whose every
 // call returned before the deadline saw its work finish and is judged in
-// full, and no attempt may connect to the hub.
+// full, and no attempt may connect to the hub. The test has no time bound of
+// its own, so the hook's deadline is lifted and every scenario is judged
+// under load; the rerun stays as a backstop.
 func TestHandoffHookNoNetwork(t *testing.T) {
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	type result struct{ notes, captures string }
 	attempt := func(t *testing.T, hub string) (result, time.Duration) {
 		b := newHandoffBox(t)

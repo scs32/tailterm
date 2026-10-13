@@ -1150,7 +1150,10 @@ func TestToolLedgerHelperTwoProjects(t *testing.T) {
 
 // a6: the lookup stays inside the hook's bound in a relay directory far
 // larger than a busy host's. A timing miss is retried twice, since a stalled
-// test host is not the property; every attempt must still write its row.
+// test host is not the property. A hook that reached its own deadline writes
+// no row by design, so a first or second attempt whose slowest hook reached
+// it is run again before its row is looked at; an attempt under the deadline
+// must still write its row, and the third is judged as it stands.
 func TestToolLedgerHelperWithinBound(t *testing.T) {
 	root, relay := helperLedgerSandbox(t)
 	for i := 0; i < 10000; i++ {
@@ -1176,6 +1179,10 @@ func TestToolLedgerHelperWithinBound(t *testing.T) {
 				t.Fatalf("%s = %v, output %q", event, r.err, r.out)
 			}
 			slowest = max(slowest, r.elapsed)
+		}
+		if slowest >= toolLedgerDeadline && attempt < 3 {
+			t.Logf("attempt %d: the slowest hook reached the %v deadline in %v; running the pair again", attempt, toolLedgerDeadline, slowest)
+			continue
 		}
 		if slowest < toolLedgerBound {
 			if rows := toolLedgerRows(t, root, file.Agent); len(rows) == 0 || rows[len(rows)-1]["toolUseId"] != call["tool_use_id"] || rows[len(rows)-1]["outcome"] != "ok" {
