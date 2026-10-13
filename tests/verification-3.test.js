@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import {
   selectChecks,
   makePlan as rawMakePlan,
@@ -680,10 +681,29 @@ test("detached a2 a6 a wait that expires exits the launcher 75 and reports nothi
   rmSync(fakeTTCalls, { force: true });
   const { f, planFile } = plannedFixture(t, "console.log('ran');"),
     output = tempDir(t, "verification-detached-logs-");
+  // The run's clock, not the minute: once the detached run prints that it is
+  // waiting, its Date.now is the flag's whole minute ahead, so the unchanged
+  // one minute bound expires on the run's next look at the clock.
+  const clock = join(tempDir(t, "verification-expiry-clock-"), "clock.mjs");
+  writeFileSync(
+    clock,
+    `if (process.env.TAILTERM_MATRIX_RUN_CHILD === "1") {
+  const real = Date.now, write = process.stdout.write;
+  let ahead = 0;
+  Date.now = () => real() + ahead;
+  process.stdout.write = function (chunk, ...rest) {
+    if (String(chunk).startsWith("matrix host: waiting ")) ahead = 60000;
+    return write.call(this, chunk, ...rest);
+  };
+}
+`,
+  );
+  const NODE_OPTIONS = [process.env.NODE_OPTIONS, "--import=" + pathToFileURL(clock).href].filter(Boolean).join(" ");
   const holder = await acquireHostLock({ item: "wi_a2_expiry_holder", agent: "holder", runTimeoutMs: 120000, pollMs: 20 });
   try {
-    const child = launcherCLI(t, f, ["run", planFile, output, "--host-wait-minutes", "1"], agentIdentity);
+    const child = launcherCLI(t, f, ["run", planFile, output, "--host-wait-minutes", "1"], { ...agentIdentity, NODE_OPTIONS });
     assert.equal(await child.closed, 75, child.text);
+    assert.match(child.text, /matrix host: waiting 1 of 1, holder wi_a2_expiry_holder\/holder/);
     assert.match(child.text, /Host lock wait expired after 60000 ms/);
     assert.equal(runnerRecord(output).exitCode, 75);
     assert.deepEqual(readHostState(hostLockFile()).waiters, []);
