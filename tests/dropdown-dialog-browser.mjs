@@ -4,6 +4,7 @@
 // the macOS native popup; selectOption cases below are labelled synthetic.
 import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const expectBaseline = process.env.DROPDOWN_DIALOG_BASELINE === "1";
@@ -36,6 +37,7 @@ window.qa={state,item,view};
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

@@ -2,6 +2,7 @@
 // vault, and hub transport state; no live hub/profile/SSH/tmux access.
 import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { mkdir, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import { activityLabel } from "../client/activity-format.js";
@@ -87,6 +88,7 @@ window.qa={state,views,modes,tasks,items,ids,vault,client,
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [{ name: "board-layout-fixture", configureServer(vite) {

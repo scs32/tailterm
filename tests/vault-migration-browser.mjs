@@ -1,5 +1,6 @@
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const html = `<!doctype html><html><body><script type="module">
@@ -20,6 +21,7 @@ window.qa={password,original,vault,get,put,del,async invalidV2Envelope(kind){ret
 </script></body></html>`;
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

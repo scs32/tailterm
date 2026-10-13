@@ -1,6 +1,7 @@
 // Real Agents/Teams editors + encrypted vault in isolated Chromium/WebKit contexts.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/client/style.css"></head><body><div id="workspace"><aside><div class="brand"><strong>tailterm</strong></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-pressed="true">All</button></div><input id="filter" class="filter" placeholder="Find a server"><nav id="server-list"><button class="server-item selected" aria-pressed="true"><span class="node-icon">◇</span><div><strong>Synthetic machine with a realistically long display name</strong><small>Fixture · SSH</small></div><span class="node-dot online"></span></button></nav><div class="sidebar-bottom"><button>SSH keys</button><button>Lock vault</button></div></aside><main><header><div class="header-right"><button><span class="status-dot"></span><span>Connected test profile</span></button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip"></div><div class="terminal-tools"><button>Find</button><button>Appearance</button></div></div><div id="terminal-body"></div><div class="terminal-footer"><span>Fixture terminal</span></div></section></main></div><dialog id="dialog"></dialog><p id="notice"></p><script type="module">
@@ -18,6 +19,7 @@ agents=createAgentsView(host);teams=createTeamsView(host);modes.refresh();modes.
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

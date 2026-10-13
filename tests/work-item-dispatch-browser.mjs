@@ -2,6 +2,7 @@ import { chromium, webkit, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css">
@@ -51,6 +52,7 @@ window.qa={state,
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

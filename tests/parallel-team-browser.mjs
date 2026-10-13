@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,6 +36,7 @@ window.fixture={queue,agents,rerender(){document.querySelector('#delivery').inne
 
 const vite = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [{ name: "parallel-delivery-fixture", configureServer(server) {

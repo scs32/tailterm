@@ -2,6 +2,7 @@ import { openVault } from "../client/vault-crypto.js";
 // Real vault crypto + real Go hub, isolated browser storage and database.
 import { chromium, webkit } from "@playwright/test";
 import { createServer as createVite } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -47,6 +48,7 @@ assert.ok(["", "stalled-fetch"].includes(inject), "unknown PROFILE_SYNC_INJECT: 
 try {
 vite = await createVite({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: {
     host: "127.0.0.1",

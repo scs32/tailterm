@@ -11,6 +11,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const baselineCommit = "4e8e6c5b38905b25b5173d0044560be45e5b6e88";
 const expectBaseline = process.env.QUEUE_LAYOUT_BASELINE === "1";
@@ -142,6 +143,7 @@ ${stylesheet}<title>Queue layout synthetic fixture</title></head>
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: {
     host: "127.0.0.1",

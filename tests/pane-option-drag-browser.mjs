@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><section class="terminal-shell" style="width:900px;margin:20px"><div class="terminal-tabs"><div id="tabs"></div></div><div id="terminal-body" style="height:600px;position:relative"></div></section><dialog id="dialog"></dialog></div><script type="module">
 import {setupPaneGroups} from "/client/pane-groups.js";
@@ -22,6 +23,7 @@ window.fixture={tree:()=>structuredClone(groups.model.group("a").tree),group:()=
 
 const vite = await createServer({
   configFile: "vite.config.js",
+  cacheDir: viteCacheDir(import.meta.url),
   mode: "static",
   server: { host: "127.0.0.1", port: 0 },
   logLevel: "error",

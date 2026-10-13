@@ -1,5 +1,6 @@
 import { useDomRenderer } from "./dom-renderer.mjs";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { chromium, webkit } from "@playwright/test";
 const engine = process.env.TEST_BROWSER || "chromium";
 if (!["chromium", "webkit"].includes(engine))
@@ -8,6 +9,7 @@ const selectedBrowser = engine === "webkit" ? webkit : chromium;
 import assert from "node:assert/strict";
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   server: { host: "127.0.0.1", port: 0 },
 });
 await server.listen();

@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><main id="projects"></main><script type="module">
 import {createTasksView} from '/client/tasks-view.js';
@@ -16,7 +17,7 @@ view.mount(document.querySelector('#projects'));
 window.ready=view.show();
 </script></body></html>`;
 
-const vite = await createServer({configFile:false,root:process.cwd(),server:{host:"127.0.0.1",port:0},plugins:[{name:"activity-fixture",configureServer(server){server.middlewares.use("/activity-test",(_req,res)=>{res.setHeader("Content-Type","text/html");res.end(html)})}}]});
+const vite = await createServer({configFile:false,cacheDir: viteCacheDir(import.meta.url),root:process.cwd(),server:{host:"127.0.0.1",port:0},plugins:[{name:"activity-fixture",configureServer(server){server.middlewares.use("/activity-test",(_req,res)=>{res.setHeader("Content-Type","text/html");res.end(html)})}}]});
 await vite.listen();
 const origin=`http://127.0.0.1:${vite.httpServer.address().port}`;
 try {

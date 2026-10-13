@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const baselineCommit = "58f9185981625b148b30ad4b5070a1a658e17f77";
 const expectBaseline = process.env.HISTORY_WIDTH_BASELINE === "1";
@@ -72,6 +73,7 @@ window.qa={state,longDescription,longMessage,item,view};
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

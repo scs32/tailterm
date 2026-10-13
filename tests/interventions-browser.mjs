@@ -12,6 +12,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile),
@@ -231,6 +232,7 @@ view.mount(document.querySelector('#projects'));window.ready=view.show();window.
 </script></body></html>`;
   vite = await createServer({
     configFile: false,
+    cacheDir: viteCacheDir(import.meta.url),
     root,
     logLevel: "silent",
     server: { host: "127.0.0.1", port: 0, proxy: { "/v1": hub } },

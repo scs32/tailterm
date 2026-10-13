@@ -53,6 +53,7 @@ try {
 }
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 // The scroll variant differs only in layout and transport: the real rules that
 // make the Projects detail and rail scroll are scoped to #mode-view, the rail
 // lists enough projects to overflow, and subscribe keeps its callback so the
@@ -81,6 +82,7 @@ const view=createTasksView({client:()=>client,taskHub:{hasPendingResume:()=>fals
 </script></body></html>`;
 const vite = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

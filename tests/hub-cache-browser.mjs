@@ -2,6 +2,7 @@
 // The synthetic transport never reaches a hub, profile service, SSH, or tmux.
 import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { mkdir } from "node:fs/promises";
 import assert from "node:assert/strict";
 
@@ -98,6 +99,7 @@ window.qa={state,vault,taskId,password,
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [{

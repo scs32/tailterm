@@ -1,6 +1,7 @@
 import { chromium, webkit, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const taskId = "tsk_1111111111111111";
 const itemId = "wi_2222222222222222";
@@ -27,6 +28,7 @@ const view=createWorkItemsView({kind:'feature',client:()=>client,dialog,closeDia
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

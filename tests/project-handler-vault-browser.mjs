@@ -1,6 +1,7 @@
 // Real encrypted IndexedDB in disposable contexts; no hub or SSH calls.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -10,6 +11,7 @@ const allocationScenarios = JSON.parse(
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   plugins: [
     {
       name: "handler-vault-no-wasm",

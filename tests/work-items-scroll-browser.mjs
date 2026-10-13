@@ -2,6 +2,7 @@
 // Uses only an in-memory client and disposable browser contexts.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const expectReplacementBaseline =
@@ -67,6 +68,7 @@ window.qa={state,view,viewport,place,watchScroll,scrollWatch,
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [{

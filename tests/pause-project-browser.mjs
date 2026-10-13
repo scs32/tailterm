@@ -5,6 +5,7 @@
 import { chromium, webkit } from "@playwright/test";
 import assert from "node:assert/strict";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
@@ -127,6 +128,7 @@ const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

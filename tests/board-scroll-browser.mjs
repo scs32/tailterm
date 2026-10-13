@@ -2,6 +2,7 @@
 // Uses only an in-memory history/client and disposable browser contexts.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const taskId = "tsk_scroll_fixture";
@@ -54,6 +55,7 @@ window.qa={state,board,viewport,place,message,
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

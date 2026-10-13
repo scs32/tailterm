@@ -1,9 +1,10 @@
 // Encrypted Queue intent recovery for wi_a222a4d8a69c1d53 r2, order #1640/#1642.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
-const server = await createServer({ server: { host: "127.0.0.1", port: 0 } });
+const server = await createServer({ cacheDir: viteCacheDir(import.meta.url), server: { host: "127.0.0.1", port: 0 } });
 await server.listen();
 try {
   for (const engine of [chromium, webkit]) {

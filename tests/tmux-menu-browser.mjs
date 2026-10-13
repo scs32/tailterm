@@ -1,6 +1,7 @@
 import { useDomRenderer } from "./dom-renderer.mjs";
 import { once } from "node:events";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { chromium, webkit } from "@playwright/test";
 import { WebSocketServer } from "ws";
 import { spawn, execFileSync } from "node:child_process";
@@ -9,6 +10,7 @@ import assert from "node:assert/strict";
 const socket = "tailterm-menu-test-" + randomUUID();
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   server: { host: "127.0.0.1", port: 0 },
 });
 await server.listen();

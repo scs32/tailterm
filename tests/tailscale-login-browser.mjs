@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import jsQR from "jsqr";
 import { chromium, webkit } from "@playwright/test";
 import { createServer as createViteServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 
 const runtimeFixture = `
 export async function createIPN() {
@@ -50,6 +51,7 @@ const controllerFixture = `<!doctype html><body><dialog id="dialog"></dialog>
 
 const vite = await createViteServer({
   configFile: "vite.config.js",
+  cacheDir: viteCacheDir(import.meta.url),
   mode: "static",
   server: { host: "127.0.0.1", port: 0 },
   // Only the speech worker imports @huggingface/transformers, and Vite's

@@ -2,6 +2,7 @@
 // Protocol clicks expose :open; selectOption and consumed releases are synthetic.
 import { chromium, webkit, expect } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { mkdir, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 const engineFilter = process.env.PULLDOWN_ENGINE;
@@ -29,6 +30,7 @@ window.qa={state,view,async refresh(){state.revision++;await view.reload();retur
 </script></body></html>`;
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"></head><body><div id="app"><section class="terminal-shell" style="margin:20px"><div class="terminal-tabs"><div id="tabs"></div></div><div id="terminal-body" style="height:700px;position:relative"></div></section></div><script type="module">
 import {setupPaneGroups} from '/client/pane-groups.js';
 const tabs=[]; let active='lead';
@@ -575,6 +576,7 @@ async function continuedGroups(browser, origin, name) {
 }
 const vite = await createServer({
   configFile: "vite.config.js",
+  cacheDir: viteCacheDir(import.meta.url),
   mode: "static",
   server: { host: "127.0.0.1", port: 0 },
   logLevel: "error",

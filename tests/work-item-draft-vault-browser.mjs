@@ -2,9 +2,10 @@
 // encrypted browser vault. No hub, profile, or live credential data is used.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
-const server = await createServer({ server: { host: "127.0.0.1", port: 0 } });
+const server = await createServer({ cacheDir: viteCacheDir(import.meta.url), server: { host: "127.0.0.1", port: 0 } });
 await server.listen();
 try {
   for (const engine of [chromium, webkit]) {

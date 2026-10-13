@@ -2,6 +2,7 @@
 // Uses only synthetic in-memory records and disposable browser contexts.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import assert from "node:assert/strict";
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
@@ -39,6 +40,7 @@ view.mount(document.querySelector('#mode-view'));await view.show();window.qa={vi
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   root: process.cwd(),
   server: { host: "127.0.0.1", port: 0 },
   plugins: [

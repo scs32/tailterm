@@ -27,6 +27,7 @@
 import { useDomRenderer } from "./dom-renderer.mjs";
 import { once } from "node:events";
 import { createServer } from "vite";
+import { viteCacheDir } from "./vite-cache.mjs";
 import { chromium, webkit } from "@playwright/test";
 import { WebSocketServer } from "ws";
 import ssh2 from "ssh2";
@@ -204,6 +205,7 @@ wss.on("connection", (ws, request) => {
 
 const server = await createServer({
   configFile: false,
+  cacheDir: viteCacheDir(import.meta.url),
   logLevel: "silent",
   server: { host: "127.0.0.1", port: 0, hmr: false },
 });
