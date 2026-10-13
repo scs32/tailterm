@@ -2342,3 +2342,161 @@ test("V6 receipts record position, grants and overtakes after an urgent run goes
   assert.equal(matrixRunner.checkSet([unit]), "unit");
   assert.equal(matrixRunner.checkSet([go, unit]), "unit");
 });
+
+// Budget warnings (wi_4828c153bd8599f7). Durations are written into fake check
+// results; nothing here waits for a check to be slow.
+const budgetCheck = (id, timeoutMs, attempts) => ({
+  id,
+  environment: { VERIFICATION_TIMEOUT_MS: String(timeoutMs) },
+  ...attempts.at(-1),
+  attempts: attempts.map((a, i) => ({ attempt: i + 1, ...a })),
+});
+const passed = (durationMs) => ({ exitCode: 0, durationMs }),
+  failed = (durationMs, extra = {}) => ({ exitCode: 1, durationMs, ...extra });
+
+test("budget warning: a passing attempt strictly above 70 percent of the timeout warns, exactly 70 percent and below do not", () => {
+  const { budgetWarnings, BUDGET_WARNING_PERCENT } = matrixRunner;
+  assert.equal(BUDGET_WARNING_PERCENT, 70);
+  assert.deepEqual(
+    budgetWarnings([
+      budgetCheck("above", 1000, [passed(701)]),
+      budgetCheck("exact", 1000, [passed(700)]),
+      budgetCheck("below", 1000, [passed(699)]),
+      budgetCheck("npm-unit", 480000, [passed(477000)]),
+      budgetCheck("exact-large", 480000, [passed(336000)]),
+      budgetCheck("just-above-large", 480000, [passed(336001)]),
+    ]),
+    [
+      { check: "above", durationMs: 701, timeoutMs: 1000, percent: 70.1 },
+      { check: "npm-unit", durationMs: 477000, timeoutMs: 480000, percent: 99.38 },
+      { check: "just-above-large", durationMs: 336001, timeoutMs: 480000, percent: 70 },
+    ],
+  );
+  // A plan with no retry policy records the one attempt on the check itself.
+  assert.deepEqual(
+    budgetWarnings([
+      { id: "plain", environment: { VERIFICATION_TIMEOUT_MS: "1000" }, ...passed(900) },
+      { id: "plain-failed", environment: { VERIFICATION_TIMEOUT_MS: "1000" }, ...failed(900) },
+    ]),
+    [{ check: "plain", durationMs: 900, timeoutMs: 1000, percent: 90 }],
+  );
+});
+
+test("budget warning: each check is measured against its planned timeout, its own checkTimeoutMs or else the default", () => {
+  const { budgetWarnings } = matrixRunner;
+  const planned = selectChecks(
+    { ...matrix, defaultTimeoutMs: 600000, checkTimeoutMs: { "npm-unit": 480000 } },
+    ["client/app.js"],
+    [],
+  );
+  const unit = planned.find((c) => c.id === "npm-unit"),
+    other = planned.find((c) => c.id !== "npm-unit" && c.environment.VERIFICATION_TIMEOUT_MS === "600000");
+  assert.equal(unit.environment.VERIFICATION_TIMEOUT_MS, "480000");
+  assert(other, "a check with no checkTimeoutMs entry takes the default");
+  // 400 s is above 70 percent of 480 s (336 s) and below 70 percent of 600 s (420 s).
+  const at = (durationMs) =>
+    budgetWarnings([unit, other].map((c) => ({ ...c, ...passed(durationMs), attempts: [{ attempt: 1, ...passed(durationMs) }] })));
+  assert.deepEqual(at(400000), [
+    { check: "npm-unit", durationMs: 400000, timeoutMs: 480000, percent: 83.33 },
+  ]);
+  assert.deepEqual(at(430000).map((w) => [w.check, w.timeoutMs]), [
+    ["npm-unit", 480000],
+    [other.id, 600000],
+  ]);
+  assert.deepEqual(at(336000), []);
+});
+
+test("budget warning: only passing attempts count, so a slow failure before a faster pass and a check that never passes give none", () => {
+  const { budgetWarnings } = matrixRunner;
+  assert.deepEqual(
+    budgetWarnings([
+      budgetCheck("slow-failure-then-pass", 1000, [failed(990), passed(500)]),
+      budgetCheck("timed-out-then-pass", 1000, [
+        { exitCode: -1, durationMs: 1001, failureReason: "timeout" },
+        passed(700),
+      ]),
+      budgetCheck("never-passes", 1000, [failed(999), failed(999), failed(999)]),
+      budgetCheck("only-timeouts", 1000, [{ exitCode: -1, durationMs: 1001, failureReason: "timeout" }]),
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    budgetWarnings([budgetCheck("fast-failure-then-slow-pass", 1000, [failed(100), passed(800)])]),
+    [{ check: "fast-failure-then-slow-pass", durationMs: 800, timeoutMs: 1000, percent: 80 }],
+  );
+  // The slowest passing attempt decides, wherever it is in the list.
+  assert.deepEqual(
+    budgetWarnings([budgetCheck("two-passes", 1000, [passed(750), passed(200)])]),
+    [{ check: "two-passes", durationMs: 750, timeoutMs: 1000, percent: 75 }],
+  );
+  assert.deepEqual(budgetWarnings([]), []);
+});
+
+test("budget warning: the report writes budget-warnings.json and prints one line per warned check, and an empty list with no line", (t) => {
+  const { reportBudgetWarnings } = matrixRunner;
+  const output = tempDir(t, "verification-budget-"),
+    file = join(output, "budget-warnings.json"),
+    lines = [];
+  const checks = [
+    budgetCheck("npm-unit", 480000, [passed(477000)]),
+    budgetCheck("go-vet", 600000, [passed(1000)]),
+    budgetCheck("go-test", 1200000, [failed(1190000), passed(900000)]),
+  ];
+  const before = JSON.stringify(checks);
+  const expected = [
+    { check: "npm-unit", durationMs: 477000, timeoutMs: 480000, percent: 99.38 },
+    { check: "go-test", durationMs: 900000, timeoutMs: 1200000, percent: 75 },
+  ];
+  assert.deepEqual(reportBudgetWarnings(checks, output, (line) => lines.push(line)), expected);
+  assert.equal(JSON.stringify(checks), before, "the check results are only read");
+  assert.equal(readFileSync(file, "utf8"), JSON.stringify(expected, null, 2) + "\n");
+  assert.deepEqual(lines, [
+    "matrix run: budget warning: npm-unit passed in 477000 ms, 99.38% of its 480000 ms timeout",
+    "matrix run: budget warning: go-test passed in 900000 ms, 75% of its 1200000 ms timeout",
+  ]);
+  assert.deepEqual(readdirSync(output), ["budget-warnings.json"], "no history or cross-run file");
+
+  // A later run with nothing to warn about replaces the list with an empty one.
+  lines.length = 0;
+  assert.deepEqual(
+    reportBudgetWarnings([budgetCheck("npm-unit", 480000, [failed(479000)])], output, (line) => lines.push(line)),
+    [],
+  );
+  assert.equal(readFileSync(file, "utf8"), "[]\n");
+  assert.deepEqual(lines, []);
+
+  // An unwritable directory is reported in a line, never thrown; the warning is still printed.
+  lines.length = 0;
+  assert.deepEqual(
+    reportBudgetWarnings([checks[0]], join(output, "missing"), (line) => lines.push(line)),
+    [expected[0]],
+  );
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^matrix run: could not write budget-warnings\.json: /);
+  assert.match(lines[1], /budget warning: npm-unit /);
+});
+
+for (const code of [0, 1])
+  test(`budget warning: a real ${code ? "failing" : "passing"} run writes an empty list beside an unchanged receipt`, async (t) => {
+    const f = fixture(t),
+      plan = commandPlan(f, `process.exit(${code});`),
+      output = tempDir(t, "verification-budget-run-"),
+      lines = [];
+    const receipt = await runPlan(plan, f.cwd, output, {
+      minFreeBytes: 0,
+      hostLock: { print: (line) => lines.push(line) },
+    });
+    assert.equal(readFileSync(join(output, "budget-warnings.json"), "utf8"), "[]\n");
+    assert.deepEqual(lines.filter((line) => /budget warning/.test(line)), []);
+    const raw = readFileSync(join(output, "receipt.json"), "utf8");
+    assert.equal(raw, JSON.stringify(receipt, null, 2) + "\n");
+    assert(!/budget/i.test(raw.replaceAll(output, "")), "nothing about budgets is in the receipt");
+    assert.equal(receipt.checks[0].status, code ? "fail" : "pass");
+    assert.equal(receiptEligible(receipt), code === 0);
+    const schema = JSON.parse(
+      readFileSync(new URL("../verification/receipt.schema.json", import.meta.url)),
+    );
+    for (const key of Object.keys(receipt)) assert(key in schema.properties, "top-level " + key);
+    for (const key of Object.keys(receipt.checks[0]))
+      assert(key in schema.properties.checks.items.properties, "check " + key);
+  });

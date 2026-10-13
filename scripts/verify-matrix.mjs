@@ -1668,6 +1668,52 @@ export function planRunTimeout(plan) {
   );
 }
 
+// Budget warnings: a check whose slowest passing attempt in this run took
+// strictly more than 70 percent of its planned timeout is close to timing out.
+// Only this run's results are read. A failed or timed-out attempt never
+// counts, so a check with no passing attempt gives no warning.
+export const BUDGET_WARNING_PERCENT = 70;
+export function budgetWarnings(checks) {
+  const warnings = [];
+  for (const check of checks) {
+    const timeoutMs = Number(check.environment?.VERIFICATION_TIMEOUT_MS);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) continue;
+    const passing = (check.attempts?.length ? check.attempts : [check])
+      .filter((a) => a.exitCode === 0 && Number.isFinite(a.durationMs))
+      .map((a) => a.durationMs);
+    if (!passing.length) continue;
+    const durationMs = Math.max(...passing);
+    if (durationMs * 100 > timeoutMs * BUDGET_WARNING_PERCENT)
+      warnings.push({
+        check: check.id,
+        durationMs,
+        timeoutMs,
+        percent: Math.round((durationMs / timeoutMs) * 10000) / 100,
+      });
+  }
+  return warnings;
+}
+// Writes budget-warnings.json beside the receipt (an empty list when nothing
+// warns) and prints one line per warned check. It is advisory: it is not part
+// of the receipt, and a failure to write it is printed, never thrown.
+export function reportBudgetWarnings(checks, output, print = () => {}) {
+  const warnings = budgetWarnings(checks);
+  try {
+    writeFileSync(
+      join(output, "budget-warnings.json"),
+      JSON.stringify(warnings, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    print("matrix run: could not write budget-warnings.json: " + error.message);
+  }
+  for (const w of warnings)
+    print(
+      `matrix run: budget warning: ${w.check} passed in ${w.durationMs} ms, ${w.percent}% of its ${w.timeoutMs} ms timeout`,
+    );
+  return warnings;
+}
+
 // Holds the host lock around one run: waits its turn on the ordered waitlist,
 // re-checks the candidate, runs, and releases after the home is cleaned up.
 // options.hostLock carries the priority, wait bound and test overrides.
@@ -1826,6 +1872,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       mode: 0o600,
     });
     receiptWritten = true;
+    reportBudgetWarnings(results, output, options.hostLock?.print);
     return receipt;
   } finally {
     const cleanupFailed = (what, error) => {

@@ -328,6 +328,42 @@ comments name (`wake a1`, the batch id vector) stay in
 50 s alone because its 41 cases each build a git repository and run two polls,
 about 2,200 child processes; it waits on no timer.
 
+**Budget warnings.** A run warns when a check passed close to its time limit,
+so a check that is about to start timing out is seen before it does (npm-unit
+ran at 477 s of its 480 s for days unnoticed). The rule: a check gets a warning
+when its slowest passing attempt in this run (exit code 0) took strictly more
+than 70 percent of the check's planned timeout, which is its `checkTimeoutMs`
+entry or else `defaultTimeoutMs` (the planned `VERIFICATION_TIMEOUT_MS`).
+Exactly 70 percent gives no warning. A failed or timed-out attempt never
+counts, however slow, so a check with no passing attempt gives no warning.
+Only this run's results are read: there is no history file and no comparison
+with earlier runs.
+
+When the run has written its receipt (`run` and `targeted` alike, failed checks
+included) it writes `budget-warnings.json` beside it and prints one line per
+warned check:
+
+```text
+matrix run: budget warning: npm-unit passed in 477000 ms, 99.38% of its 480000 ms timeout
+```
+
+```json
+[
+  { "check": "npm-unit", "durationMs": 477000, "timeoutMs": 480000, "percent": 99.38 }
+]
+```
+
+A run with no warnings writes an empty list (`[]`) and prints no such line; a
+run that writes no receipt (interrupted or refused) writes no list. The
+warning is advisory and is not in the receipt: `receipt.json`, the receipt
+schema and the hub's receipt import are unchanged, and a warning never changes
+a check's status, the run's verdict or the exit code. A failure to write the
+file is printed (`matrix run: could not write budget-warnings.json: ...`) and
+changes nothing else. When a check warns, look at what made it slow and split
+or speed it up; raising its timeout is a matrix change that needs the owner's
+approval of the new digest. `budgetWarnings(receipt.checks)` in the runner
+gives the same list for any saved receipt.
+
 The serialization rules live in runner code and derive from the plan, so they
 never change `verification/matrix.json` or its approval. Attempts stay
 sequential within a check. Receipts list checks in plan order with the same
