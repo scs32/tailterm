@@ -736,6 +736,7 @@ func TestToolLedgerRotationAcrossProcesses(t *testing.T) {
 // a7: pending files are bounded in number, size and age.
 func TestToolLedgerPendingIsBounded(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the bounds are the subject here, not timing
 	clock := setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	for i := 0; i < 300; i++ {
 		clock.advance(time.Millisecond)
