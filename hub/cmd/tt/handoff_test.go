@@ -77,7 +77,8 @@ var (
 // handoffRealDirEnv names a stand-in for the real handoff directory. The
 // checks that plant a write, or keep another process writing, use it; no test
 // may write the real directory itself. TestMain drops TAILTERM_ variables, so
-// the name does not start with that.
+// the name does not start with that. The planted write subtest of
+// TestHandoffIsolation is its committed user.
 const handoffRealDirEnv = "TT_HANDOFF_TEST_REAL_DIR"
 
 // handoffRealDir is the real handoff directory of the user running the tests,
@@ -91,6 +92,16 @@ func handoffRealDir() string {
 		return ""
 	}
 	return filepath.Join(u.HomeDir, ".local", "state", "tailterm", "handoff")
+}
+
+// handoffRealDirNote is one line saying the stand-in is read in place of the
+// real handoff directory, or empty when it is not set.
+func handoffRealDirNote() string {
+	dir := os.Getenv(handoffRealDirEnv)
+	if dir == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s is set: reading the stand-in %s, not the real handoff directory", handoffRealDirEnv, dir)
 }
 
 // handoffTreeState describes a path: absent, or every file under it with its
@@ -137,6 +148,9 @@ func (b *handoffBox) realChanges() []string {
 	root := handoffRealDir()
 	if root == "" {
 		return nil
+	}
+	if note := handoffRealDirNote(); note != "" {
+		b.t.Log("a13: " + note)
 	}
 	names := []string{b.helper.Agent}
 	entries, _ := os.ReadDir(b.dir())
@@ -5350,7 +5364,9 @@ func TestHandoffFiles(t *testing.T) {
 }
 
 // a13: the box itself. It catches a path outside its root, and the real
-// handoff directory is as it was. Every other test relies on both.
+// handoff directory is as it was. Every other test relies on both. Its
+// planted write subtest shows the guard reports a write under the box's own
+// agent name, in a stand-in directory.
 func TestHandoffIsolation(t *testing.T) {
 	b := newHandoffBox(t)
 	b.on()
@@ -5409,6 +5425,50 @@ func TestHandoffIsolation(t *testing.T) {
 	if changed := b.realChanges(); len(changed) > 0 {
 		t.Fatalf("this test's entry in the real handoff directory changed: %s", strings.Join(changed, "\n"))
 	}
+	// The guard reports a write under the box's own agent name and no other.
+	// The writes go to a stand-in directory, never the real one.
+	t.Run("planted write", func(t *testing.T) {
+		standIn := t.TempDir()
+		t.Setenv(handoffRealDirEnv, standIn)
+		// Every compared name starts from absent, whatever the first box found.
+		saved := handoffRealBefore
+		handoffRealBefore = map[string]string{}
+		t.Cleanup(func() { handoffRealBefore = saved })
+		if handoffRealDir() != standIn {
+			t.Fatalf("a13: the guard reads %s, not the stand-in %s", handoffRealDir(), standIn)
+		}
+		if note := handoffRealDirNote(); !strings.Contains(note, handoffRealDirEnv) || !strings.Contains(note, standIn) {
+			t.Fatalf("a13: the stand-in note does not name the variable and its directory: %q", note)
+		}
+		if changed := b.realChanges(); len(changed) != 0 {
+			t.Fatalf("a13: the guard reports a change with nothing planted: %s", strings.Join(changed, "\n"))
+		}
+		plant := func(name string) string {
+			t.Helper()
+			path := filepath.Join(standIn, name, "record.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("{}\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}
+		const other = "agt_00000000000000ff"
+		if _, err := os.Lstat(filepath.Join(b.dir(), other)); other == b.helper.Agent || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a13: %s is one of the box's own agent names: %v", other, err)
+		}
+		plant(other)
+		if changed := b.realChanges(); len(changed) != 0 {
+			t.Fatalf("a13: the guard reports a write under a name that is not the box's: %s", strings.Join(changed, "\n"))
+		}
+		own := plant(b.helper.Agent)
+		changed := b.realChanges()
+		if len(changed) != 1 || !strings.HasPrefix(changed[0], filepath.Join(standIn, b.helper.Agent)+"\n") ||
+			!strings.Contains(changed[0], own) || strings.Contains(changed[0], other) {
+			t.Fatalf("a13: the guard does not report exactly the write planted at %s: %q", own, changed)
+		}
+	})
 }
 
 // ---- a16: the live check ----
@@ -5510,6 +5570,9 @@ func newHandoffLive(t *testing.T) *handoffLiveCheck {
 	// The real settings file is hashed and never parsed or printed.
 	l.settings = filepath.Join(u.HomeDir, ".claude", "settings.json")
 	l.before, l.realBefore = l.settingsHash(), handoffRealState()
+	if note := handoffRealDirNote(); note != "" {
+		t.Log("a16: " + note)
+	}
 	return l
 }
 
