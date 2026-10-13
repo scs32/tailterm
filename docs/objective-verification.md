@@ -873,6 +873,28 @@ The lock file lives on the machine that runs the matrix, so the list shows the
 waitlist only when it is run there. The hub's idle-entry stall check does not
 read it (`wi_772e88d71e5cd0e5`).
 
+**When your run ends.** Feature `wi_a598ffa55a326699`, orders #33442 and
+#33457. The agent that started a run is told when it ends: within about a
+minute of the run leaving the host lock (finished, failed, withdrawn or
+killed), the hub sends that agent a directed notice with the subject
+`Your matrix run has ended`, which wakes it like any directed message. A
+watcher shell and a message to yourself are not needed. A background shell can
+be killed under memory pressure, and the hub refuses a self-addressed message
+with `a directed message to yourself wakes nobody; the hub sends you a notice
+when your matrix run ends, and to wait for anything else run tt inbox --unread
+--wait 9m in your turn or ask a teammate to message you`. The notice names the
+item and the run's start time and carries no path and no result: read
+`receipt.json` (`targeted-receipt.json` for a targeted run) in the log
+directory you gave the run, and with no receipt read `runner.json` and
+`host-lock.log` there and record why the run stopped before anything else. It
+never authorises another run. It needs the lock entry to name the agent
+(`TAILTERM_AGENT_NAME`) and the relay on the host to be running. A run that
+joins, runs and ends wholly inside one 15-second check of the relay gets no
+notice, and an unknown read of the lock file ends no wait: the relay repeats
+the last confirmed wait the hub holds, up to the 4 hours 30 minutes bound.
+Details and limits: [stall-watch.md](stall-watch.md), "When a matrix run
+ends".
+
 **Limits.** A runner in a checkout older than phase 1 takes no lock until
 it is rebased, and one older than phase 2 records an unclamped run timeout,
 which waiters honour. A waiter in a checkout older than memory-aware admission

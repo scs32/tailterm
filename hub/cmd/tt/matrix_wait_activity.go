@@ -85,9 +85,12 @@ func matrixWaitHost(host string) string {
 	return strings.ToLower(strings.SplitN(strings.TrimSpace(host), ".", 2)[0])
 }
 
-// readMatrixLock returns this host's lock file, or nil when it is absent,
-// unreadable, malformed, of a version other than 1 or 2, or written by
-// another host.
+// readMatrixLock returns this host's lock file as a confirmed read: a file
+// that parsed as version 1 or 2 and names this host. It returns nil for an
+// unknown read: the file is absent, unreadable, malformed, of another version
+// or written by another host, its path is not absolute, or this host's name
+// could not be read. The lock script replaces the file by rename and never
+// removes it, so a run that ended is a confirmed read without its entry.
 func readMatrixLock() *matrixLockFile {
 	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
 	if path == "" {
@@ -115,13 +118,17 @@ func readMatrixLock() *matrixLockFile {
 // lock: one of the host's holders, else its first place in the waitlist, else
 // nil. An entry is the agent's when it names the agent, its process is alive
 // and its item, when both are known, is the agent's bound item.
+//
+// Only a confirmed read ends a wait. On an unknown read the result is the
+// last confirmed wait the hub holds for the agent's current run, so the relay
+// repeats its last accepted report and sends nothing new.
 func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 	if a.Name == "" {
 		return nil
 	}
 	lock := readMatrixLock()
 	if lock == nil {
-		return nil
+		return lastConfirmedMatrixWait(a, now)
 	}
 	match := func(e matrixLockEntry, at string) *api.MatrixWait {
 		if e.Agent != a.Name || !matrixWaitPIDAlive(e.PID) {
@@ -156,6 +163,18 @@ func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 		}
 	}
 	return nil
+}
+
+// lastConfirmedMatrixWait is the wait in the activity the hub holds for the
+// agent's current run, which the relay's last accepted report put there. A
+// wait that is not valid, or that starts after now, is none.
+func lastConfirmedMatrixWait(a api.Agent, now time.Time) *api.MatrixWait {
+	if a.Activity == nil || !a.Activity.MatrixWait.Valid() || a.Activity.MatrixWait.Since.After(now) {
+		return nil
+	}
+	w := *a.Activity.MatrixWait
+	w.Since = w.Since.UTC()
+	return &w
 }
 
 // matrixWaitKey is the part of a matrix wait that makes a new activity

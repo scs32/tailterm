@@ -1222,7 +1222,7 @@ func (s *Store) writeAgentStatus(ctx context.Context, id, status string, by api.
 
 // Messages
 
-const selfAddressedMessage = "a directed message to yourself wakes nobody; use tt event or a scheduled wake"
+const selfAddressedMessage = "a directed message to yourself wakes nobody; the hub sends you a notice when your matrix run ends, and to wait for anything else run tt inbox --unread --wait 9m in your turn or ask a teammate to message you"
 
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
 	if err := api.NormalizeEnvelopePost(&req); err != nil {

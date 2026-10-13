@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -20,7 +21,8 @@ import (
 // into no pane, wakes, restarts, closes or resumes no agent beyond the
 // ordinary delivery of its one directed notice, and changes no queue or
 // work-item state. The sweep writes its notices and stall_watch_episodes;
-// stall_watch_progress is written only by the activity report.
+// stall_watch_progress is written only by the activity report, which also
+// posts the one directed notice that tells an agent its own matrix run ended.
 
 func migrateStallWatch(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS stall_watch_progress (
@@ -132,10 +134,16 @@ func stallWatchNight(now time.Time) bool {
 // reaches it only when the report changed something. It keeps two times for a
 // run: when it last worked (the report that enters working and the report
 // that leaves it) and when its matrix wait last ended (the first report
-// without the wait). Any other report changes no row.
+// without the wait). Any other report changes no row. The report that ends a
+// matrix wait, or replaces it with another run's, also posts that run's one
+// notice to the reporting agent.
 func (s *Store) stallWatchActivityHook(ctx context.Context, tx *sql.Tx, task, agent, run, oldState string, activity api.AgentActivity) error {
 	observed := ts(activity.ObservedAt)
 	waiting := activity.MatrixWait.Valid()
+	var had bool
+	if err := tx.QueryRowContext(ctx, `SELECT matrix_wait FROM stall_watch_progress WHERE agent_id=? AND run_id=?`, agent, run).Scan(&had); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if !waiting {
 		if _, err := tx.ExecContext(ctx, `UPDATE stall_watch_progress SET matrix_wait=0,wait_ended_at=? WHERE agent_id=? AND run_id=? AND matrix_wait=1`, observed, agent, run); err != nil {
 			return err
@@ -144,12 +152,111 @@ func (s *Store) stallWatchActivityHook(ctx context.Context, tx *sql.Tx, task, ag
  ON CONFLICT(agent_id,run_id) DO UPDATE SET matrix_wait=1`, agent, run, task); err != nil {
 		return err
 	}
+	if had {
+		if err := s.postMatrixRunEnded(ctx, tx, task, agent, run, activity); err != nil {
+			return err
+		}
+	}
 	if activity.State != "working" && oldState != "working" {
 		return nil
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO stall_watch_progress(agent_id,run_id,task_id,last_working_at,matrix_wait) VALUES(?,?,?,?,?)
  ON CONFLICT(agent_id,run_id) DO UPDATE SET last_working_at=excluded.last_working_at`, agent, run, task, observed, waiting)
 	return err
+}
+
+// The run-end notice (docs/stall-watch.md, "When a matrix run ends"). The hub
+// is told only that a run left the host's matrix lock, so the text says where
+// the receipt and the outcome are and never that the run passed.
+const (
+	matrixRunEndedSubject = "Your matrix run has ended"
+	matrixRunEndedAction  = "matrix-run-ended"
+	matrixRunEndedRunning = "was no longer in the host's matrix lock at %s: it finished, failed or was killed. " +
+		"The hub is told only that it left, never a path or a result. " +
+		"Read receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
+		"If there is no receipt the run did not finish: read runner.json there for an exit code and host-lock.log for the reason, " +
+		"and record why it stopped (the recovery rule in AGENTS.md) before anything else. "
+	matrixRunEndedWaiting = "left the waitlist at %s without being seen running: it was withdrawn or killed, or it ran and ended inside one 15-second check. " +
+		"The hub is told only that it left, never a path or a result. " +
+		"Look for receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
+		"With no receipt, read runner.json there for an exit code and host-lock.log for the reason, " +
+		"and record why it stopped (the recovery rule in AGENTS.md) before anything else. "
+	matrixRunEndedClose = "This notice does not authorise another run. It is your wake; you need no watcher and no message to yourself."
+	// The report before the one being stored: the newest receipt of the run is
+	// the current report, which ReportActivity inserts before its hooks.
+	matrixRunEndedPrevious = `SELECT payload FROM agent_activity_receipts WHERE agent_id=? AND run_id=? ORDER BY rowid DESC LIMIT 1 OFFSET 1`
+)
+
+// matrixRunReplaced reports whether a report that still carries a wait
+// carries another run's: the earlier run left the lock between two checks. A
+// waiting run that gets the host is the same run.
+func matrixRunReplaced(previous, current *api.MatrixWait) bool {
+	switch {
+	case previous.Item != "" && current.Item != "" && previous.Item != current.Item:
+		return true
+	case previous.Role == api.MatrixWaitRunning:
+		return current.Role == api.MatrixWaitWaiting || !previous.Since.Equal(current.Since)
+	}
+	return current.Role == api.MatrixWaitWaiting && !previous.Since.Equal(current.Since)
+}
+
+// postMatrixRunEnded posts the run-end notice for the wait in the run's
+// previous report, when the current report ends it or carries another run's.
+// It is reached once per stored report whose run was in a wait, and a report
+// is stored once, so a run gets one notice.
+func (s *Store) postMatrixRunEnded(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
+	var ended *api.MatrixWait
+	var payload string
+	if err := tx.QueryRowContext(ctx, matrixRunEndedPrevious, agent, run).Scan(&payload); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if previous := stallActivity(payload, false); previous != nil && previous.MatrixWait.Valid() {
+		ended = previous.MatrixWait
+	}
+	if activity.MatrixWait.Valid() && (ended == nil || !matrixRunReplaced(ended, activity.MatrixWait)) {
+		return nil
+	}
+	to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND run_id=?`, agent, run))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// A retired agent is kept, not woken.
+	if to.Status == api.AgentRetired {
+		return nil
+	}
+	project, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE tasks.id=?`, task))
+	if err != nil {
+		return err
+	}
+	endedAt := activity.ObservedAt.UTC().Format(time.RFC3339)
+	refs := map[string]string{"action": matrixRunEndedAction, "agent": agent, "run": run, "endedAt": endedAt}
+	// With no stored wait to read, the notice names the bound item and no
+	// start time.
+	item, place, body := "", "", matrixRunEndedRunning
+	if ended != nil {
+		item = ended.Item
+		since := ended.Since.UTC().Format(time.RFC3339)
+		refs["matrixRole"], refs["matrixSince"] = ended.Role, since
+		place = ", on the host since " + since + ","
+		if ended.Role == api.MatrixWaitWaiting {
+			place, body = ", waiting for the host since "+since+",", matrixRunEndedWaiting
+		}
+	}
+	if item == "" {
+		if err := tx.QueryRowContext(ctx, `SELECT item_id FROM agent_work_item_bindings WHERE agent_id=? AND run_id=?`, agent, run).Scan(&item); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	text := "Your verification run"
+	if item != "" {
+		refs["item"] = item
+		text += " for " + item
+	}
+	text += place + " " + fmt.Sprintf(body, endedAt) + matrixRunEndedClose
+	return s.postBrokerNotice(ctx, tx, project, to, to.Name, matrixRunEndedSubject, matrixRunEndedSubject, text, refs)
 }
 
 // stallAgent is one watched run: the helper, or a team member.

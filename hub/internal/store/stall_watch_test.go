@@ -490,6 +490,9 @@ func TestStallWatchProgressHook(t *testing.T) {
 	if wait() != "matrix_wait=1|wait_ended_at=|\n" || row() != want {
 		t.Fatalf("entering a matrix wait: %s %s", wait(), row())
 	}
+	if others() != base {
+		t.Fatal("the hook wrote outside stall_watch_progress")
+	}
 	f.advance(time.Minute)
 	ended := f.now()
 	f.state(h, "idle")
@@ -498,8 +501,11 @@ func TestStallWatchProgressHook(t *testing.T) {
 	if wait() != "matrix_wait=0|wait_ended_at="+ts(ended)+"|\n" || row() != want {
 		t.Fatalf("leaving a matrix wait: %s %s", wait(), row())
 	}
-	if others() != base {
-		t.Fatal("the hook wrote outside stall_watch_progress")
+	// Beyond its progress row the hook wrote only the run-end notice, at the
+	// report that ended the wait (TestMatrixRunEndNotice).
+	if got := f.matrixEnded(h); len(got) != 1 || !got[0].CreatedAt.Equal(ended) || f.count(`SELECT count(*) FROM messages WHERE seq>?`, got[0].Seq) != 0 ||
+		f.count(`SELECT count(*) FROM obligations WHERE message_seq<>?`, got[0].Seq) != 0 || f.episodes() != 0 {
+		t.Fatalf("the hook wrote more than its progress row and one run-end notice: %+v", got)
 	}
 }
 
@@ -1910,6 +1916,327 @@ func TestStallWatchAfterHubStart(t *testing.T) {
 		stallOwnerTeamNotice(t, env, to, "offline")
 		if env.Refs["entry"] != second {
 			t.Fatalf("notice for entry %s, want %s", env.Refs["entry"], second)
+		}
+	})
+}
+
+// matrixEnded is the run-end notices the hub sent the agent, oldest first.
+func (f *stallFixture) matrixEnded(a api.Agent) []api.Message {
+	f.t.Helper()
+	rows, err := f.s.db.Query(`SELECT seq,text,created_at FROM messages WHERE task_id=? AND to_agent=? AND from_node=? ORDER BY seq`, f.task.ID, a.ID, api.BrokerNode)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	var found []api.Message
+	for rows.Next() {
+		var m api.Message
+		var created string
+		if err := rows.Scan(&m.Seq, &m.Text, &created); err != nil {
+			f.t.Fatal(err)
+		}
+		m.CreatedAt = parseTS(created)
+		found = append(found, m)
+	}
+	if err := rows.Close(); err != nil {
+		f.t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range found {
+		env, _ := f.notice(m.Seq)
+		if env.Refs["action"] == matrixRunEndedAction {
+			m.Envelope = &env
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func stallMatrixRun(role string, since time.Time, item string) api.AgentActivity {
+	w := &api.MatrixWait{Role: role, Item: item, Since: since}
+	if role == api.MatrixWaitWaiting {
+		w.Position, w.Length = 1, 1
+	}
+	return api.AgentActivity{State: "idle", MatrixWait: w}
+}
+
+// wi_a598ffa55a326699: the report that ends an agent's matrix wait posts one
+// directed notice to that agent, once per run, and the notice is no progress
+// for the stall watch.
+func TestMatrixRunEndNotice(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	stamp := func(at time.Time) string { return at.UTC().Format(time.RFC3339) }
+	// team is a running entry with its lead, idle and in no wait.
+	team := func(t *testing.T) (*stallFixture, api.Agent, string) {
+		f := root.project(t, stallNoon)
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.state(lead, "idle")
+		return f, lead, f.items[0].ID
+	}
+	want := func(t *testing.T, f *stallFixture, a api.Agent, n int) []api.Message {
+		t.Helper()
+		got := f.matrixEnded(a)
+		if len(got) != n {
+			t.Fatalf("%d run-end notice(s), want %d: %+v", len(got), n, got)
+		}
+		return got
+	}
+	// checkText is what every run-end notice says and never says.
+	checkText := func(t *testing.T, m api.Message, parts ...string) {
+		t.Helper()
+		text := m.Envelope.Body.Text
+		if m.Envelope.Subject != matrixRunEndedSubject {
+			t.Fatalf("subject %q", m.Envelope.Subject)
+		}
+		for _, part := range append(parts, "receipt.json", "targeted-receipt.json", "runner.json", "host-lock.log", "never a path or a result",
+			"record why it stopped", "This notice does not authorise another run.", "you need no watcher and no message to yourself") {
+			if !strings.Contains(text, part) {
+				t.Fatalf("text lacks %q: %s", part, text)
+			}
+		}
+		for _, advice := range []string{"start it again", "same command", "rerun", "run it again", "passed", "/"} {
+			if strings.Contains(strings.ToLower(text), advice) {
+				t.Fatalf("text has %q: %s", advice, text)
+			}
+		}
+	}
+
+	t.Run("ended", func(t *testing.T) {
+		f, lead, item := team(t)
+		started := f.now()
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, started, item))
+		f.advance(10 * time.Minute)
+		want(t, f, lead, 0)
+		unreadBefore, err := f.s.Unread(context.Background(), f.task.ID, lead.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.state(lead, "idle")
+		m := want(t, f, lead, 1)[0]
+		checkText(t, m, "Your verification run for "+item+", on the host since "+stamp(started)+", was no longer in the host's matrix lock at "+stamp(f.now()), "it finished, failed or was killed", "its checks are the outcome")
+		for key, value := range map[string]string{"action": "matrix-run-ended", "agent": lead.ID, "run": lead.RunID, "item": item, "matrixRole": "running", "matrixSince": stamp(started), "endedAt": stamp(f.now())} {
+			if m.Envelope.Refs[key] != value {
+				t.Fatalf("ref %s = %q, want %q (%+v)", key, m.Envelope.Refs[key], value, m.Envelope.Refs)
+			}
+		}
+		if len(m.Envelope.Refs) != 7 || m.Envelope.To != lead.Name {
+			t.Fatalf("to %q refs %+v", m.Envelope.To, m.Envelope.Refs)
+		}
+		// It is unread for the agent, obliges only delivery, and has one
+		// pending wake job due at once.
+		if unread, err := f.s.Unread(context.Background(), f.task.ID, lead.ID); err != nil || unread != unreadBefore+1 {
+			t.Fatalf("unread %d after %d, %v", unread, unreadBefore, err)
+		}
+		if n := f.count(`SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND agent_id=? AND needs=?`, f.task.ID, m.Seq, lead.ID, api.ObligationNeedsDelivery); n != 1 {
+			t.Fatalf("%d delivery-only obligation(s), want one", n)
+		}
+		if n := f.count(`SELECT count(*) FROM wake_jobs w JOIN obligations o ON o.id=w.obligation_id WHERE o.message_seq=? AND w.agent_id=? AND w.state=? AND w.due_at=?`, m.Seq, lead.ID, wakePending, ts(m.CreatedAt)); n != 1 {
+			t.Fatalf("%d pending wake job(s) due at the notice's time, want one", n)
+		}
+		if f.count(`SELECT count(*) FROM wake_jobs WHERE agent_id=?`, lead.ID) != 1 {
+			t.Fatal("more than one wake job for the agent")
+		}
+	})
+	t.Run("failed", func(t *testing.T) {
+		// A failed run releases its lease like a passing one: the hub sees the
+		// same end, here together with a state change.
+		f, lead, item := team(t)
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), item))
+		f.advance(time.Minute)
+		f.state(lead, "finished_silent")
+		checkText(t, want(t, f, lead, 1)[0], "it finished, failed or was killed", "If there is no receipt the run did not finish")
+	})
+	t.Run("waiting", func(t *testing.T) {
+		f, lead, item := team(t)
+		requested := f.now()
+		f.report(lead, stallMatrixRun(api.MatrixWaitWaiting, requested, item))
+		f.advance(time.Minute)
+		f.state(lead, "idle")
+		m := want(t, f, lead, 1)[0]
+		checkText(t, m, "Your verification run for "+item+", waiting for the host since "+stamp(requested)+", left the waitlist at "+stamp(f.now())+" without being seen running",
+			"it was withdrawn or killed, or it ran and ended inside one 15-second check")
+		if m.Envelope.Refs["matrixRole"] != "waiting" || strings.Contains(m.Envelope.Body.Text, "finished, failed") {
+			t.Fatalf("waitlist notice: %+v", m.Envelope)
+		}
+	})
+	t.Run("once", func(t *testing.T) {
+		f, lead, item := team(t)
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), item))
+		f.advance(time.Minute)
+		end := api.ActivityReport{RequestID: "run-end-once", RunID: lead.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: f.now()}}
+		for i := 0; i < 2; i++ { // the report and its retry
+			if _, err := f.s.ReportActivity(context.Background(), f.task.ID, lead.ID, end); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.state(lead, "idle")
+		f.advance(time.Minute)
+		f.state(lead, "working")
+		f.state(lead, "idle")
+		want(t, f, lead, 1)
+	})
+	t.Run("not an end", func(t *testing.T) {
+		f, lead, item := team(t)
+		requested := f.now()
+		wait := stallMatrixRun(api.MatrixWaitWaiting, requested, item)
+		wait.MatrixWait.Position, wait.MatrixWait.Length = 2, 3
+		f.report(lead, wait)
+		// A moved position, stored because the state changed with it.
+		moved := stallMatrixRun(api.MatrixWaitWaiting, requested, item)
+		moved.State, moved.MatrixWait.Length = "working", 3
+		f.report(lead, moved)
+		f.advance(time.Minute)
+		// The same run gets the host.
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), item))
+		want(t, f, lead, 0)
+	})
+	t.Run("a second run", func(t *testing.T) {
+		f, lead, item := team(t)
+		first := f.now()
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, first, item))
+		f.advance(time.Minute)
+		f.state(lead, "idle")
+		f.advance(time.Minute)
+		second := f.now()
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, second, item))
+		want(t, f, lead, 1)
+		f.advance(time.Minute)
+		f.state(lead, "idle")
+		got := want(t, f, lead, 2)
+		if got[0].Envelope.Refs["matrixSince"] != stamp(first) || got[1].Envelope.Refs["matrixSince"] != stamp(second) {
+			t.Fatalf("notices name %s and %s", got[0].Envelope.Refs["matrixSince"], got[1].Envelope.Refs["matrixSince"])
+		}
+	})
+	t.Run("owner helper", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		started := f.now()
+		f.report(h, stallMatrixRun(api.MatrixWaitRunning, started, ""))
+		f.advance(time.Minute)
+		f.state(h, "idle")
+		m := want(t, f, h, 1)[0]
+		checkText(t, m, "Your verification run, on the host since "+stamp(started)+", was no longer")
+		if _, named := m.Envelope.Refs["item"]; named || m.Envelope.To != h.Name {
+			t.Fatalf("helper notice to %q refs %+v", m.Envelope.To, m.Envelope.Refs)
+		}
+	})
+	t.Run("retired agent", func(t *testing.T) {
+		f, lead, item := team(t)
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), item))
+		f.advance(time.Minute)
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentRetired, lead.ID)
+		f.state(lead, "idle")
+		want(t, f, lead, 0)
+		if f.count(`SELECT count(*) FROM stall_watch_progress WHERE agent_id=? AND matrix_wait=0 AND wait_ended_at=?`, lead.ID, ts(f.now())) != 1 {
+			t.Fatal("the end of the wait was not stored")
+		}
+	})
+	t.Run("no stored wait to read", func(t *testing.T) {
+		f, lead, item := team(t)
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), ""))
+		f.exec(`UPDATE agent_activity_receipts SET payload='{}' WHERE agent_id=?`, lead.ID)
+		f.advance(time.Minute)
+		f.state(lead, "idle")
+		m := want(t, f, lead, 1)[0]
+		checkText(t, m, "Your verification run for "+item+" was no longer in the host's matrix lock at "+stamp(f.now()))
+		if m.Envelope.Refs["item"] != item || m.Envelope.Refs["matrixSince"] != "" || m.Envelope.Refs["matrixRole"] != "" || strings.Contains(m.Envelope.Body.Text, "since") {
+			t.Fatalf("fallback notice: %+v", m.Envelope)
+		}
+	})
+	t.Run("replaced", func(t *testing.T) {
+		other := root.project(t, stallNoon).items[1].ID
+		for _, tc := range []struct {
+			name             string
+			first, next      string // roles
+			sameSince, items bool   // the next wait keeps the start; it names another item
+			notice           bool
+		}{
+			{"running then running since another time", api.MatrixWaitRunning, api.MatrixWaitRunning, false, false, true},
+			{"running then waiting", api.MatrixWaitRunning, api.MatrixWaitWaiting, false, false, true},
+			{"waiting then waiting since another time", api.MatrixWaitWaiting, api.MatrixWaitWaiting, false, false, true},
+			{"waiting then running for another item", api.MatrixWaitWaiting, api.MatrixWaitRunning, false, true, true},
+			{"waiting then running", api.MatrixWaitWaiting, api.MatrixWaitRunning, false, false, false},
+			{"state only", api.MatrixWaitRunning, api.MatrixWaitRunning, true, false, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f, lead, item := team(t)
+				t1 := f.now()
+				f.report(lead, stallMatrixRun(tc.first, t1, item))
+				f.advance(20 * time.Second)
+				t2, nextItem := f.now(), item
+				if tc.sameSince {
+					t2 = t1
+				}
+				if tc.items {
+					nextItem = other
+				}
+				next := stallMatrixRun(tc.next, t2, nextItem)
+				next.State = "working"
+				f.report(lead, next)
+				if !tc.notice {
+					want(t, f, lead, 0)
+				} else {
+					m := want(t, f, lead, 1)[0]
+					if m.Envelope.Refs["matrixSince"] != stamp(t1) || m.Envelope.Refs["matrixRole"] != tc.first || m.Envelope.Refs["item"] != item || m.Envelope.Refs["endedAt"] != stamp(f.now()) {
+						t.Fatalf("the notice does not name the replaced run: %+v", m.Envelope.Refs)
+					}
+					// The agent is still in a wait: no end is stored.
+					if f.count(`SELECT count(*) FROM stall_watch_progress WHERE agent_id=? AND matrix_wait=1 AND wait_ended_at=''`, lead.ID) != 1 {
+						t.Fatal("a replaced run ended the agent's wait")
+					}
+				}
+				// The run now in the lock gets its own notice when it ends.
+				before := len(f.matrixEnded(lead))
+				f.advance(time.Minute)
+				f.state(lead, "idle")
+				got := want(t, f, lead, before+1)
+				if last := got[len(got)-1].Envelope.Refs; last["matrixSince"] != stamp(t2) || last["matrixRole"] != tc.next {
+					t.Fatalf("the last notice names %+v", last)
+				}
+			})
+		}
+	})
+	// m4: the notice is the hub's, not the team's, so quiet time still runs
+	// from the end of the run.
+	t.Run("quiet from the end of the run", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.state(lead, "idle")
+		f.advance(time.Minute)
+		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), f.items[0].ID))
+		f.advance(2 * time.Hour)
+		f.none("during the run")
+		f.state(lead, "idle")
+		want(t, f, lead, 1)
+		f.none("when the run ends")
+		f.advance(stallWatchTeamQuiet - time.Second)
+		f.none("a second short of 30 minutes after the end")
+		f.advance(time.Second)
+		f.one(stallActionTeam)
+		want(t, f, lead, 1)
+	})
+	// The previous-report read walks the receipts backwards and stops: no sort.
+	t.Run("previous report read", func(t *testing.T) {
+		rows, err := root.s.db.Query(`EXPLAIN QUERY PLAN `+matrixRunEndedPrevious, "agt_x", "run_x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(detail, "TEMP B-TREE") {
+				t.Fatalf("the read sorts: %s", detail)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

@@ -352,3 +352,236 @@ func TestMatrixWaitActivityTick(t *testing.T) {
 		t.Fatalf("report after the version 2 entry left: %+v", last)
 	}
 }
+
+// matrixUnknownReads is every lock read the relay cannot confirm. Each leaves
+// the reader with no parsed lock for this host; set runs after a usable lock
+// was written to the fixture's path.
+func matrixUnknownReads(t *testing.T) map[string]func(t *testing.T) {
+	t.Helper()
+	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
+	replace := func(content string) func(*testing.T) {
+		return func(t *testing.T) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return map[string]func(t *testing.T){
+		"absent": func(t *testing.T) {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"unreadable": func(t *testing.T) {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0700); err != nil { // reading a directory fails for any user
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(path) })
+		},
+		"not JSON":        replace("{"),
+		"unknown version": replace(strings.Replace(matrixLockJSON("test-mini", ""), `"version":1`, `"version":9`, 1)),
+		"another host":    replace(matrixLockJSON("other-mini", "")),
+		"no host":         replace(matrixLockJSON("", "")),
+		"hostname lookup fails": func(t *testing.T) {
+			t.Helper()
+			old := matrixWaitHostname
+			t.Cleanup(func() { matrixWaitHostname = old })
+			matrixWaitHostname = func() (string, error) { return "", os.ErrPermission }
+		},
+		"relative path": func(t *testing.T) {
+			t.Helper()
+			t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "host.json")
+		},
+	}
+}
+
+// wi_a598ffa55a326699: only a confirmed lock read ends a wait. An unknown
+// read repeats the last confirmed wait the hub holds for the agent's run.
+func TestMatrixWaitUnknownLockRead(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	since := now.Add(-20 * time.Minute)
+	mine := matrixEntry("22", matrixTestItem, "lead-a", since.Format(time.RFC3339))
+	held := func(w *api.MatrixWait) api.Agent {
+		a := api.Agent{Name: "lead-a", WorkItem: &api.AgentWorkItemBinding{ItemID: matrixTestItem}}
+		if w != nil {
+			a.Activity = &api.AgentActivity{State: "idle", MatrixWait: w}
+		}
+		return a
+	}
+	running := &api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}
+	waiting := &api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 2, Length: 3, Since: since}
+	write := matrixLockFixture(t, 22)
+	write(matrixLockJSON("test-mini", ""))
+	for name := range matrixUnknownReads(t) {
+		t.Run(name, func(t *testing.T) {
+			write := matrixLockFixture(t, 22)
+			write(matrixLockJSON("test-mini", ""))
+			matrixUnknownReads(t)[name](t)
+			if readMatrixLock() != nil {
+				t.Fatal("the read is confirmed")
+			}
+			for _, w := range []*api.MatrixWait{running, waiting} {
+				got := matrixWaitFor(held(w), now)
+				if got == nil || *got != *w || got == w {
+					t.Fatalf("held %+v: %+v", w, got)
+				}
+			}
+			// With no wait in the hub's activity there is none, as before.
+			if got := matrixWaitFor(held(nil), now); got != nil {
+				t.Fatalf("nothing held: %+v", got)
+			}
+			if got := matrixWaitFor(api.Agent{Name: "lead-a", Activity: &api.AgentActivity{State: "idle"}}, now); got != nil {
+				t.Fatalf("activity without a wait: %+v", got)
+			}
+			// A held wait that is not valid, or starts after now, is none.
+			for _, bad := range []*api.MatrixWait{
+				{Role: api.MatrixWaitRunning, Item: matrixTestItem},
+				{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 4, Length: 3, Since: since},
+				{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: now.Add(time.Second)},
+			} {
+				if got := matrixWaitFor(held(bad), now); got != nil {
+					t.Fatalf("held %+v: %+v", bad, got)
+				}
+			}
+			if got := matrixWaitFor(api.Agent{Activity: &api.AgentActivity{State: "idle", MatrixWait: running}}, now); got != nil {
+				t.Fatalf("agent without a name: %+v", got)
+			}
+		})
+	}
+	// A confirmed read ignores what the hub holds: the entry gone, or its pid
+	// dead, ends the wait, and a live entry is read from the lock.
+	if got := matrixWaitFor(held(running), now); got != nil {
+		t.Fatalf("confirmed read without the entry: %+v", got)
+	}
+	write(matrixLockJSON("test-mini", matrixEntry("33", matrixTestItem, "lead-a", since.Format(time.RFC3339))))
+	if got := matrixWaitFor(held(running), now); got != nil {
+		t.Fatalf("confirmed read with a dead pid: %+v", got)
+	}
+	write(matrixLockJSON("test-mini", "", mine))
+	if got := matrixWaitFor(held(running), now); got == nil || got.Role != api.MatrixWaitWaiting || got.Position != 1 {
+		t.Fatalf("confirmed read with a live waiter: %+v", got)
+	}
+}
+
+// The same rule through the relay's tick against a hub that, like the real
+// one, returns the activity it last accepted for the run: no report on an
+// unknown read, one at the confirmed end, none after it.
+func TestMatrixWaitUnknownLockReadTick(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
+	thread := "12345678-1234-1234-1234-123456789abc"
+	dir := filepath.Join(home, ".codex", "sessions", "2026", "10", "02")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := `{"type":"task_started","timestamp":"2026-10-02T11:00:00Z"}` + "\n" + `{"type":"task_complete","timestamp":"2026-10-02T11:01:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "rollout-test-"+thread+".jsonl"), []byte(transcript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	mine := matrixEntry("22", matrixTestItem, "lead-a", "2026-10-02T11:40:00.000Z")
+	write := matrixLockFixture(t)
+	alive := true
+	matrixWaitPIDAlive = func(pid int) bool { return pid == 22 && alive }
+
+	var accepted *api.AgentActivity
+	var reports []api.AgentActivity
+	var bodies []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents/agt_0123456789abcdef"):
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Name: "lead-a", Status: api.AgentRunning, Online: true, Session: "synthetic",
+				WorkItem: &api.AgentWorkItemBinding{ItemID: matrixTestItem}, Activity: accepted})
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/obligations"):
+			_, _ = io.WriteString(w, `{"obligations":[]}`)
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activity"):
+			body, _ := io.ReadAll(r.Body)
+			var req api.ActivityReport
+			if json.Unmarshal(body, &req) != nil {
+				t.Error("invalid report")
+			}
+			accepted = &req.Activity
+			reports, bodies = append(reports, req.Activity), append(bodies, string(body))
+			_ = json.NewEncoder(w).Encode(req.Activity)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer hub.Close()
+	b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: thread, Runtime: "codex", Codex: filepath.Join(home, "codex")}
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	after := time.Duration(0)
+	// tick is one relay check 16 seconds after the last, by a relay that
+	// keeps nothing in memory: a new client and only the saved cursor.
+	tick := func(what string, posts int) {
+		t.Helper()
+		client, _ := api.NewClient(hub.URL, 5*time.Second)
+		if err := relayActivityTick(context.Background(), b, client, now.Add(after), probe); err != nil {
+			t.Fatal(err)
+		}
+		after += 16 * time.Second
+		if len(reports) != posts {
+			t.Fatalf("%s: %d reports, want %d: %+v", what, len(reports), posts, reports)
+		}
+	}
+	live := matrixLockJSON("test-mini", mine)
+	write(live)
+	tick("the run holds the host", 1)
+	if w := reports[0].MatrixWait; w == nil || w.Role != api.MatrixWaitRunning {
+		t.Fatalf("first report: %+v", reports[0])
+	}
+	// Each unknown read in turn, then the same wait readable again: nothing.
+	names := []string{"absent", "unreadable", "not JSON", "unknown version", "another host", "no host", "hostname lookup fails", "relative path"}
+	if len(names) != len(matrixUnknownReads(t)) {
+		t.Fatal("an unknown read is not exercised")
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			matrixUnknownReads(t)[name](t)
+			tick(name, 1)
+			tick(name+", again", 1)
+		})
+		write(live)
+		tick("readable again after "+name, 1)
+	}
+	// Killed: the entry stays in the lock and its pid is gone. A confirmed
+	// read, so one report without the wait, carrying nothing of the run.
+	alive = false
+	tick("killed", 2)
+	if last := reports[1]; last.State != "idle" || last.MatrixWait != nil {
+		t.Fatalf("report after the kill: %+v", last)
+	}
+	for _, private := range []string{"abc1234", "/private/output", `"pid"`, "outputDir", "matrixWait"} {
+		if strings.Contains(bodies[1], private) {
+			t.Fatalf("report carries %q: %s", private, bodies[1])
+		}
+	}
+	tick("the dead entry is still there", 2)
+	// After the accepted end the hub holds no wait, so an unknown read is none.
+	t.Run("after the end", func(t *testing.T) {
+		matrixUnknownReads(t)["not JSON"](t)
+		tick("unknown read after the end", 2)
+	})
+	// A second run, then an unknown read at its end: the wait is kept until a
+	// confirmed read shows the entry gone, and that is one report.
+	alive = true
+	write(matrixLockJSON("test-mini", matrixEntry("22", matrixTestItem, "lead-a", "2026-10-02T12:05:00.000Z")))
+	tick("a second run", 3)
+	t.Run("unknown at the end", func(t *testing.T) {
+		matrixUnknownReads(t)["absent"](t)
+		tick("unknown read", 3)
+	})
+	write(matrixLockJSON("test-mini", ""))
+	tick("the entry is gone", 4)
+	if reports[3].MatrixWait != nil {
+		t.Fatalf("report after the second run: %+v", reports[3])
+	}
+	tick("steady", 4)
+}

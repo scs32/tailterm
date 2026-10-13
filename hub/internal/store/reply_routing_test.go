@@ -337,9 +337,16 @@ func TestSelfAddressedMessageIsRefused(t *testing.T) {
 			t.Errorf("%s: %+v, %v", name, m, err)
 		}
 	}
-	// The reason names what to do instead.
-	if !strings.Contains(selfAddressedMessage, "wakes nobody") || !strings.Contains(selfAddressedMessage, "tt event") {
+	// The reason names what to do instead: remedies every runtime has. It
+	// keeps its first clause, which scripts/verify-matrix.mjs matches.
+	if !strings.HasPrefix(selfAddressedMessage, "a directed message to yourself wakes nobody; ") ||
+		!strings.Contains(selfAddressedMessage, "a notice when your matrix run ends") || !strings.Contains(selfAddressedMessage, "tt inbox --unread --wait") {
 		t.Errorf("reason = %q", selfAddressedMessage)
+	}
+	for _, gone := range []string{"tt event", "scheduled wake"} {
+		if strings.Contains(selfAddressedMessage, gone) {
+			t.Errorf("reason still names %q: %q", gone, selfAddressedMessage)
+		}
 	}
 	var obligations int
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM obligations WHERE task_id=?`, f.task.ID).Scan(&obligations); err != nil {

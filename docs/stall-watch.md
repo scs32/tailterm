@@ -184,7 +184,7 @@ A team notice suggests reading the team's last messages and looking at its lead'
 - It never types into a pane, presses Escape, or restarts, closes or resumes an agent.
 - It never changes queue or work-item state.
 - It adds no hub request. In particular there is no per-tool-call request: the last working time rides on the activity report that the relay already sends.
-- **The directed helper notice is delivered like any directed notice.** The hub creates its delivery-only obligation and wake job, and the relay's ordinary delivery wakes the helper to read it. That is the only way this feature reaches a session.
+- **The directed helper notice is delivered like any directed notice.** The hub creates its delivery-only obligation and wake job, and the relay's ordinary delivery wakes the helper to read it. That is the only way the watch reaches a session. The run-end notice ([When a matrix run ends](#when-a-matrix-run-ends)) reaches its agent the same way, and is posted by the activity report, not by a sweep.
 - With nothing quiet and no open episode, a sweep makes three reads and no write.
 - For a helper or team held after a hub start, a sweep opens no episode and posts nothing. It still closes that subject's ended episode and moves its cursor, and it judges every subject that is not held as usual.
 - The decision is made twice. An unlocked read nominates projects; the write transaction then decides again from fresh rows, so a post, a working report, a pause, a hold, a closed obligation or a replaced run that arrives in between stops the notice, including the 07:00 ping.
@@ -193,6 +193,40 @@ Both message reads are bounded:
 
 - to open an episode, the sweep reads the project's messages newest first and stops at the first one older than 30 minutes;
 - to end an episode, it reads at most 500 messages after the episode's cursor. When all 500 hold no ending post it moves the cursor, so the next sweep continues from there.
+
+## When a matrix run ends
+
+Feature `wi_a598ffa55a326699` revision 2, owner orders #33442 and #33457, builder assignment #33521.
+
+On 2026-10-13 a lead that was its own verifier sat beside a finished receipt for 33 minutes: its watcher's message to itself was refused, and the day before another lead lost its watcher shell to the memory reaper. The team watch was working as written, since it counts 30 minutes from the end of the run. So the hub now tells the agent itself, at the end.
+
+**What triggers it.** The relay on the agent's host reads the host's matrix lock every 15 seconds ([agent-activity.md](agent-activity.md)). When the agent's run is no longer there, because it finished, failed, was withdrawn or was killed and left a dead process behind, the relay's next activity report carries no `matrixWait`. That report posts the notice, in its own transaction. Nothing depends on the shell that started the run, on a child of the agent, or on the agent's turn. The sweep is not involved.
+
+**Who gets it.** The agent whose report lost the wait, whatever its role: a team member, a lead acting as verifier, or the owner helper. A retired agent gets none.
+
+**The notice.** A directed hub notice with the subject `Your matrix run has ended`, delivered like any directed notice: unread for the agent, with a delivery-only obligation and a wake job due at once. The hub types, restarts and resumes nothing.
+
+- It names the run by its item, its role (`running`, or `waiting` for a run that left the waitlist without being seen running) and its start time, and gives the time the report saw it gone.
+- **It carries no path and no result.** The hub is told only that the run left the lock ([agent-activity.md](agent-activity.md): no pid, commit, path or output of a run leaves the host). The text says where to look: `receipt.json` (`targeted-receipt.json` for a targeted run) in the log directory the agent gave the run, whose checks are the outcome; with no receipt, `runner.json` there for an exit code and `host-lock.log` for the reason, and the recovery rule's record of why it stopped comes first.
+- **It never authorises another run.** The text says so, and suggests none.
+- Refs: `action=matrix-run-ended`, `agent`, `run`, `item` when known, `matrixRole`, `matrixSince`, `endedAt`. When the earlier report cannot be read, the notice names the agent's bound item and no role or start time.
+
+**Once per run.** The notice is posted by the one stored report that ends the wait. A repeated report, a retried request, a later state change and a moved waitlist position post nothing. A second run gets its own notice.
+
+**A replaced run.** A report that still carries a wait, but another run's, posts the notice for the earlier run: running then waiting, running or waiting with a different start time, or a different item. A waiting run that gets the host is the same run and posts nothing. The agent is still in a wait, so no end of the wait is stored.
+
+**Quiet time.** The notice is the hub's message, not the agent's, so it is no progress for either watch. Quiet time still starts at the end of the run, as in [When a never-quiet case ends](#when-a-never-quiet-case-ends), and the team notice still comes 30 minutes later when the agent does nothing.
+
+**Latency.** One 15-second check and one report: normally under 30 seconds.
+
+**Limits.**
+
+- The lock entry must name the agent (`TAILTERM_AGENT_NAME`), and the relay on that host must be running. With the relay down the notice is posted when it next reports.
+- A run that joins the lock, runs and ends wholly inside one 15-second check is never reported and gets no notice. This is recorded, not fixed. A run seen waiting that then runs and ends inside one check gets the waitlist text.
+- Only a confirmed lock read ends a wait. On an unknown read (an absent, unreadable or malformed lock, or one of another version or host) the relay repeats the last confirmed wait the hub holds for that run, so no notice is posted. A wait the relay can no longer confirm ends at the 4 h 30 min bound, for the watch only: no notice is posted then.
+- Two relays with different state directories that report for one agent are not coordinated by this feature.
+- A dead leader process whose process group lives on reads as ended. The text says the run left the lock, never that it passed.
+- An agent that followed its run inside its own turn finds the notice in its inbox as one line.
 
 ## Tables
 
