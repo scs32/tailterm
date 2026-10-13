@@ -340,8 +340,8 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
  WHERE a.task_id=? AND a.runtime=? AND x.state='working' AND `+liveAgentFilter, task, runtime).Scan(&working); err != nil {
 		return 0, err
 	}
-	var outage string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM provider_outages WHERE task_id=? AND runtime=? AND closed_at=''`, task, runtime).Scan(&outage)
+	var outage, outageOpened string
+	err = tx.QueryRowContext(ctx, `SELECT id,opened_at FROM provider_outages WHERE task_id=? AND runtime=? AND closed_at=''`, task, runtime).Scan(&outage, &outageOpened)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
@@ -364,8 +364,10 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		// An outage lasts only while its condition holds. It ends when no live
 		// agent of the runtime is blocked, when one of the runtime is working,
 		// or when an agent in it has recovered: it reports a completed or
-		// running turn, or its episode in the outage was cleared and it has no
-		// open one (a report in another state that showed a model reply). A
+		// running turn, or its episode was cleared after the outage opened and
+		// it has no open one (a report in another state that showed a model
+		// reply). An episode that had already cleared when it joined the
+		// outage says nothing about the agents blocked in it. A
 		// runtime prompt, an unknown probe or a crash without that is not
 		// recovery, and a block replaced by a new class or since is still a
 		// block. Blocks that open afterwards are judged afresh below, so a
@@ -373,8 +375,25 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		var recovered int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
  JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
- WHERE e.outage_id=? AND (x.state IN ('working','idle','finished_silent') OR (e.cleared_at<>'' AND NOT EXISTS
- (SELECT 1 FROM provider_block_episodes o WHERE o.agent_id=e.agent_id AND o.run_id=e.run_id AND o.cleared_at=''))) AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
+ WHERE e.outage_id=? AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
+			return 0, err
+		}
+		cleared, err := tx.QueryContext(ctx, `SELECT e.cleared_at FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+ WHERE e.outage_id=? AND e.cleared_at<>'' AND NOT EXISTS (SELECT 1 FROM provider_block_episodes o WHERE o.agent_id=e.agent_id AND o.run_id=e.run_id AND o.cleared_at='') AND `+liveAgentFilter, outage)
+		if err != nil {
+			return 0, err
+		}
+		for cleared.Next() {
+			var at string
+			if err := cleared.Scan(&at); err != nil {
+				cleared.Close()
+				return 0, err
+			}
+			if parseTS(at).After(parseTS(outageOpened)) {
+				recovered++
+			}
+		}
+		if err := cleared.Close(); err != nil {
 			return 0, err
 		}
 		if blocked == 0 || working > 0 || recovered > 0 {

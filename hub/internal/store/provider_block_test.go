@@ -888,3 +888,48 @@ func TestProviderBlockReplyBaselineIsPerBlock(t *testing.T) {
 		t.Fatalf("a reply after the second block left it open: %d", open())
 	}
 }
+
+// Review f1 (wi_8204795815c04d72): an agent that recovered with a model reply
+// and moved to a non-turn state before its peers blocked joins their outage
+// with an episode already cleared. That is not a recovery in the outage.
+func TestProviderBlockOutageIgnoresEarlierReply(t *testing.T) {
+	f := newProviderFixture(t)
+	early, second, third := f.agent("codex-0", "codex", 0), f.agent("codex-1", "codex", 0), f.agent("codex-2", "codex", 1)
+	blocked := func(a api.Agent) {
+		t.Helper()
+		if err := f.report(a, "blocked-"+a.Name, api.AgentActivity{State: "provider_blocked", Provider: providerBlock("codex", "auth", f.clock), Tokens: api.TokenTotals{Output: 100, Total: 100}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked(early)
+	f.advance(20 * time.Second)
+	if err := f.report(early, "stuck", api.AgentActivity{State: "stuck", Tokens: api.TokenTotals{Output: 150, Total: 150}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, early.ID); n != 0 {
+		t.Fatalf("the reply left the first episode open: %d", n)
+	}
+	f.advance(10 * time.Second)
+	blocked(second)
+	blocked(third)
+	f.advance(91 * time.Second)
+	if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 {
+		t.Fatalf("outage sweep posted %d", n)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND outage_id<>''`, early.ID); n != 1 {
+		t.Fatalf("the cleared episode did not join the outage: %d", n)
+	}
+	f.advance(30 * time.Second)
+	if n := f.sweep(); n != 0 || countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`) != 1 {
+		t.Fatalf("an episode cleared before the outage opened ended it (posted %d)", n)
+	}
+	// A reply from an agent blocked in the outage still ends it.
+	f.advance(time.Minute)
+	if err := f.report(second, "stuck-2", api.AgentActivity{State: "stuck", Tokens: api.TokenTotals{Output: 150, Total: 150}}); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(30 * time.Second)
+	if n := f.sweep(); n != 0 || countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`) != 0 {
+		t.Fatalf("a reply inside the outage left it open (posted %d)", n)
+	}
+}
