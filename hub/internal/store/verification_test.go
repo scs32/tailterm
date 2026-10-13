@@ -654,6 +654,102 @@ func TestVerificationLegacyFailedReceiptImportsButBlocksCompletion(t *testing.T)
 	}
 }
 
+// The legacy test above never puts a done save in front of a failed receipt
+// with an acceptance saved: its done saves stop at the missing acceptance.
+// Each route here saves an acceptance over a failed current receipt, so the
+// done saves take the accepted candidate and must reach the failed check.
+func TestVerificationDoneSavesRefuseFailedReceiptUnderSavedAcceptance(t *testing.T) {
+	const failed = "unlisted exhausted failure blocks completion"
+	disposition := func(f *convergenceFixture, kind, candidate string) error {
+		_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Body: api.EnvelopeBody{Text: kind}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: candidate}}, "", 0, api.Agent{})
+		return err
+	}
+	failedReceipt := func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan, generation int64) {
+		t.Helper()
+		if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-plan", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: generation, Plan: &p}); err != nil {
+			t.Fatal("plan refused", err)
+		}
+		r := passingVerification(p)
+		r.Checks[0].ExitCode = 1
+		r.Checks[0].FailureReason = "exit"
+		if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: generation + 1, Receipt: &r}); err != nil {
+			t.Fatal("failed receipt refused", err)
+		}
+	}
+	for _, route := range []struct {
+		name, kind string
+		build      func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan)
+	}{
+		{"owner-decision then owner-accept over a failed receipt", "owner-accept", func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan) {
+			failedReceipt(t, f, h, p, 0)
+			// Setup: this is how the state is reached today, not a claim
+			// that the store should allow an owner-accept over a failed
+			// receipt. If the store later refuses it, change this setup,
+			// not the assertions below.
+			if err := disposition(f, "owner-decision", p.Commit); err != nil {
+				t.Fatal("owner-decision refused", err)
+			}
+			if err := disposition(f, "owner-accept", p.Commit); err != nil {
+				t.Fatal("owner-accept refused", err)
+			}
+		}},
+		{"accept on a passing receipt then a failed receipt on the same commit", "accept", func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan) {
+			saveFixtureVerification(t, f, h, p, 0)
+			if err := disposition(f, "accept", p.Commit); err != nil {
+				t.Fatal("accept on a passing receipt refused", err)
+			}
+			// Setup: this is how the state is reached today, not a claim
+			// that the store should let a new plan and a failed receipt on
+			// the accepted commit leave the acceptance saved. If the store
+			// later refuses it, change this setup, not the assertions below.
+			again := p
+			again.OperationKey = "fixture-verification-again"
+			failedReceipt(t, f, h, again, 2)
+		}},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			f, h, p := verificationFixture(t)
+			request := f.review(t, p.Commit)
+			if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			route.build(t, f, h, p)
+			// The state is built: the acceptance is saved for the exact
+			// commit and the current receipt for that commit has failed.
+			state := f.state(t)
+			if state.Disposition == nil || state.Disposition.Kind != route.kind || state.Disposition.Candidate != p.Commit {
+				t.Fatal("acceptance not saved", state.Disposition)
+			}
+			history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, receipt := currentVerification(history)
+			if current == nil || receipt == nil || current.Commit != p.Commit || receipt.Checks[0].ExitCode == 0 {
+				t.Fatal("current receipt is not the failed one", current, receipt)
+			}
+			refused := func(gate string, err error) {
+				t.Helper()
+				if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), failed) {
+					t.Fatal(gate, err)
+				}
+			}
+			done := "done"
+			_, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by)
+			refused("PATCH gate", err)
+			_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{RequestID: "keyed-done", ExpectedRevision: 1, Status: &done}, f.by)
+			refused("keyed gate", err)
+			tx, _ := f.s.db.BeginTx(f.ctx, nil)
+			err = reviewCompletion(f.ctx, tx, f.item, p.Commit)
+			tx.Rollback()
+			refused("queue gate", err)
+			if item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID); err != nil || item.Status == "done" || item.Revision != 1 {
+				t.Fatal("refused completion changed the item", item, err)
+			}
+		})
+	}
+}
+
 func retryVerification(p api.VerificationPlan, codes ...int) api.VerificationReceipt {
 	r := passingVerification(p)
 	for i := range r.Checks {
