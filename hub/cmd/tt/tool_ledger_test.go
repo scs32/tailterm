@@ -340,6 +340,7 @@ func TestToolLedgerNeverBlocks(t *testing.T) {
 // could read as a decision.
 func TestToolLedgerPrintsNothing(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // silence is the subject here, not timing; a late hook would drop a counted row
 	call := map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}}
 	for _, event := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "SomethingNew"} {
 		if r := runToolHook(t, e, "tool", toolPayload(event, call), nil); r.err != nil || r.out != "" {
@@ -387,6 +388,7 @@ var toolDigestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // a5: one row per call with every field.
 func TestToolLedgerOneRowPerCall(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the rows and their fields are the subject here, not timing
 	input := map[string]any{"command": "go test ./...", "timeout": 5000}
 	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash", "tool_input": input})
 	if rows := toolLedgerRows(t, root, e.agent); len(rows) != 0 {
@@ -476,6 +478,7 @@ func TestToolLedgerLargeCall(t *testing.T) {
 // pending entries claimed in start order, and sessions do not cross.
 func TestToolLedgerNoToolUseID(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // pairing is the subject here, not timing
 	clock := setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	call := func(session string) map[string]any {
 		return map[string]any{"session_id": session, "tool_name": "Bash", "tool_input": map[string]any{"command": "sleep 1"}}
@@ -521,6 +524,7 @@ func TestToolLedgerNoToolUseID(t *testing.T) {
 // a5: directories 0700, files 0600.
 func TestToolLedgerIsPrivate(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the modes are the subject here, not timing; a late hook would leave a counted path out
 	old := syscall.Umask(0)
 	defer syscall.Umask(old)
 	toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": "u1", "tool_name": "Bash"})
@@ -553,6 +557,7 @@ func TestToolLedgerIsPrivate(t *testing.T) {
 // a6: no raw arguments, responses, errors or paths anywhere under the root.
 func TestToolLedgerStoresNoRawContent(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored content is the subject here, not timing
 	markers := []string{"MARK-INPUT", "MARK-RESPONSE", "MARK-ERROR", "MARK-CWD", "MARK-TRANSCRIPT"}
 	fields := func(id string) map[string]any {
 		return map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash",
@@ -617,6 +622,7 @@ func TestToolLedgerStoresNoRawContent(t *testing.T) {
 // a7: the ledger rotates at the bound into exactly one backup.
 func TestToolLedgerRotates(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // rotation is the subject here, not timing
 	setToolLedger(t, &toolLedgerMaxBytes, 1024)
 	for i := 0; i < 40; i++ {
 		toolHook(t, e, "PostToolUse", map[string]any{"session_id": "s1", "tool_use_id": fmt.Sprintf("u%d", i), "tool_name": "Bash"})
@@ -932,6 +938,7 @@ func rowKeys(row map[string]any) string {
 // written under the helper file's agent, task and run, in the same row
 // format as any agent's, and the file's hub is never contacted.
 func TestToolLedgerHelperSession(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the identity and the row format are the subject here, not timing
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1121,6 +1128,7 @@ func TestToolLedgerHelperNoMatch(t *testing.T) {
 // registered from this thread is written.
 func TestToolLedgerHelperTwoProjects(t *testing.T) {
 	root, _ := helperLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the identity is the subject here, not timing
 	first := helperLedgerFile()
 	second := helperLedgerFile()
 	second.Task, second.Agent, second.Run, second.Thread = "tsk_00000000000000b2", "agt_00000000000000b2", "run_helper_b2", "22222222-2222-4222-8222-222222222222"
@@ -1183,6 +1191,7 @@ func TestToolLedgerHelperWithinBound(t *testing.T) {
 // tool input and none of the helper file's registration fields.
 func TestToolLedgerHelperStoresNoSecrets(t *testing.T) {
 	root, _ := helperLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored content is the subject here, not timing
 	markers := []string{"MARK-TOKEN", "MARK-INPUT", "MARK-REQUEST-ID", "MARK-REQUEST-HASH", "MARK-REGISTRATION"}
 	file := helperLedgerFile()
 	file.RequestID, file.RequestHash, file.Registration = markers[2], markers[3], markers[4]
@@ -1244,6 +1253,7 @@ func TestToolLedgerHelperStoresNoSecrets(t *testing.T) {
 // a PostToolUse whose output holds a token-shaped value prints nothing and
 // writes exactly the row the ledger wrote before redaction existed.
 func TestToolLedgerRedactionOffChangesNothing(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the row is the subject here, not timing
 	c := redactShapeCases[0]
 	value := c.make(t, c.n)
 	settings := map[string]string{
