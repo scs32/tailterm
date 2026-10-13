@@ -475,7 +475,10 @@ test("fixture pid cleanup stops its own child and spares a recorded pid it does 
     const pids = fixturePids(s);
     child = spawn(process.execPath, [join(pids, "child.cjs"), "own"], { stdio: "ignore" });
     childExit = once(child, "exit");
-    for (const deadline = Date.now() + 10_000; !existsSync(join(pids, "own.pid")); ) {
+    // The child creates own.pid before it writes the pid, so wait for the
+    // number itself: an empty file would read as pid 0.
+    const written = () => existsSync(join(pids, "own.pid")) && /^\d+$/.test(readFileSync(join(pids, "own.pid"), "utf8"));
+    for (const deadline = Date.now() + 10_000; !written(); ) {
       assert(child.exitCode === null && Date.now() < deadline, "the fixture child never started");
       await new Promise((resolve) => setTimeout(resolve, 20));
     }

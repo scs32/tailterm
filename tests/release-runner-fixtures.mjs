@@ -258,7 +258,8 @@ export function lockHost(t,child={}){
   const c=spawn(process.execPath,[script,JSON.stringify({path:h.path,dir,marker:join(dir,"marker"),priority:flag("--priority"),item:flag("--item"),mode:"hold",...child})],{detached:true,stdio:"ignore"});
   h.calls.push({argv,dir});h.children.push(c);return c.pid;};
  t.after(()=>{for(const c of h.children){try{process.kill(-c.pid,"SIGKILL");}catch{}}});
- h.marker=()=>until(()=>existsSync(join(h.dir,"marker"))&&JSON.parse(readFileSync(join(h.dir,"marker"),"utf8")),"the run to hold the host");
+ // The child creates the marker before it writes it: an empty or partial marker is not there yet.
+ h.marker=()=>until(()=>{try{return JSON.parse(readFileSync(join(h.dir,"marker"),"utf8"));}catch{return null;}},"the run to hold the host");
  h.starts=()=>h.matrix().filter(c=>c.argv[2]==="run").length;
  h.deadline=()=>{const r=h.run();return r.launchedAt+r.hostWaitMs+r.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS;};
  return h;
