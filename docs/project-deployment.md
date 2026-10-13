@@ -206,6 +206,21 @@ and the first release are separate operational steps.
   checked out (`git worktree list --porcelain`). Moving the ref under such a
   checkout would leave its working tree showing the release reversed. Before
   publication this is the ordinary refusal: one escalation, no fence.
+- **Target selection.** Targets are selected from the integrated commit before
+  the integrated matrix run, the inputs request and the push. A changed path that
+  no map knows is the ordinary refusal before publication: one escalation whose
+  reason is `Unknown release path: PATH` (with `and N more` for further paths),
+  journal step `select`, no revert and no bug request. A path the running map
+  does not know is accepted when the candidate's own
+  `scripts/release-targets.mjs` maps it, so a new folder and its rule ship in
+  one release; that release selects all four targets, because the map file
+  changed. The running map's rules are the floor: the candidate's map is asked
+  only about paths no running rule matches, adds targets and never removes one,
+  and cannot relax the invalid path rule. The candidate's map runs in a short
+  child process in the dedicated checkout, only while that checkout is at the
+  integrated commit with `scripts/` and `tests/` unmodified. When it cannot be
+  evaluated (no map in the commit, another checkout state, a failed child or
+  output of another shape), the path stays unknown.
 - **Push (D2).** After every selected target is live-verified, the journal moves
   to `pushing` and the runner runs `git push origin INTEGRATED:refs/heads/tasks-hub`
   with terminal prompts disabled and credentials from the host's git helper. It
@@ -1288,14 +1303,18 @@ has already exited may return no log lines.
 
 A probe failure prints nothing and exits 1. When a target step fails, the
 journal's `failure` field keeps the first one as `{step, target, reason}`: step
-is `prepare`, `rehearse`, `deploy` or `live-check`. A failed rehearsal container
+is `prepare`, `rehearse`, `deploy` or `live-check`. A failed target selection
+is kept as step `select`, with no target (see "Effects on tasks-hub"). A failed
+rehearsal container
 run adds `rehearsal` (see "Migration rehearsal container"). The reason is at most 160
 characters and is only a fixed message the runner or adapter tagged (for example
 `live verification failed` or `release fence lost`) or, for a host program, its
 name, exit status and the `classification`/`stage` of its last JSON line (for
 example `deploy-truenas-hub.py exit 2: remote-operation-failed at
 bridge-binary-upload`); anything else is `unclassified`. Program stderr,
-messages, paths and credentials never reach it. `scripts/deploy-truenas-hub.py
+messages, paths and credentials never reach it, except that the
+`Unknown release path` reason names one changed repository path made only of
+letters, digits and `_ . / -`. `scripts/deploy-truenas-hub.py
 --rollback-to RELEASE --target hub|bridge --expect-sha256 SHA` verifies the
 retained binary at `BASE/releases/RELEASE/` over SSH, then changes only that
 target's executable mount in the live app definition (`app.update`, `app.start`).

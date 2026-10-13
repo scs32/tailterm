@@ -1344,3 +1344,54 @@ test("m4 end to end: a matrix change on tasks-hub after acceptance verifies unde
  assert.deepEqual(r.a.calls,[]);assert.equal(git(r.f.cwd,"rev-parse","refs/heads/tasks-hub"),r.tip);
  assert.equal(r.j.plan.approvedMatrixDigest,hash(MATRIX_A));
 });
+
+// Target selection before the push, and the candidate's own map (wi_fd1a6890a531e2c1).
+const NEW_FILE="tools/newthing/a.js",NEW_REASON="Unknown release path: tools/newthing/a.js";
+// A stand-in for a candidate's scripts/release-targets.mjs that knows the new folder; no imports.
+const NEW_RULE=`export function targetsForPaths(paths){for(const p of paths)if(!/^tools\\/newthing\\//.test(p))throw new Error("Unknown release path");return [];}\n`;
+// A candidate that adds a new folder, with or without the map rule for it.
+function newFolder(withRule){
+ const f=fixture();mkdirSync(join(f.cwd,"tools/newthing"),{recursive:true});
+ if(withRule){mkdirSync(join(f.cwd,"scripts"));writeFileSync(join(f.cwd,"scripts/release-targets.mjs"),NEW_RULE);}
+ const j=job(f,change(f,NEW_FILE,"a")),a=fake(),c=config(f,j),said=[];
+ a.prepare=async t=>["hub","bridge"].includes(t)?{...PAIRED}:{release:"rel_fixture-"+t,artifactSHA256:"b".repeat(64)};
+ a.escalate=async details=>{said.push(details);a.calls.push("escalate");};
+ for(const gate of ["verifyIntegrated","verifyInputs"])a[gate]=async()=>{a.calls.push(gate);return true;};
+ return {f,j,a,c,said,journal:()=>JSON.parse(readFileSync(c.journalPath,"utf8"))};
+}
+test("r1 a candidate that adds a new folder with its map rule releases in one step",async()=>{
+ const n=newFolder(true),r=await runRelease(n.c,n.a);
+ assert.equal(r.outcome,"released");assert.deepEqual(r.targets.map(t=>[t.target,t.outcome]),["hub","bridge","mini","tailos"].map(t=>[t,"released"]),"the changed map file selects every target");
+ assert.deepEqual(n.a.calls,["verifyInputs","merged","deploy:hub","deploy:mini","deploy:tailos","finish"],"no rollback, escalation, bug request or refusal");
+ const journal=n.journal();assert.equal(journal.published,true);assert.equal(journal.revert,undefined);assert.equal(journal.failure,undefined);assert.equal(journal.phase,"complete");
+ assert.equal(git(n.f.cwd,"rev-parse","refs/heads/tasks-hub"),n.j.commit);assert.equal(remoteHead(n.f),n.j.commit);
+});
+test("r2 a candidate that adds a new folder without a rule is refused unpublished with the tagged reason",async()=>{
+ const n=newFolder(false);await assert.rejects(runRelease(n.c,n.a),/refused/);
+ assert.deepEqual(n.a.calls,["refuse","escalate"],"no merged, deploy, rollback or bug request");
+ assert.deepEqual(n.said,[{jobId:"rel_fixture",outcome:"refused",reason:NEW_REASON}]);
+ const journal=n.journal();assert.notEqual(journal.published,true);assert.deepEqual(journal.effects,[]);assert.equal(journal.revert,undefined);assert.equal(journal.receipt,undefined);
+ assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,NEW_REASON);assert.equal(journal.failureDetail.text,NEW_REASON);assert.deepEqual(journal.failure,{step:"select",reason:NEW_REASON});
+ assert.equal(git(n.f.cwd,"rev-parse","refs/heads/tasks-hub"),n.f.base);assert.equal(remoteHead(n.f),n.f.base);
+ assert.equal(git(n.f.cwd,"log","--format=%s",n.f.base+"..refs/heads/tasks-hub"),"","no revert commit");
+});
+test("r3 the refusal notice names the unknown path",async()=>{
+ const cwd=mkdtempSync(join(tmpdir(),"escalate-adapter-")),calls=[];const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
+ await adapter.escalate({jobId:"rel_fixture",outcome:"refused",reason:NEW_REASON});
+ assert.equal(calls.length,1);const field=n=>calls[0][calls[0].indexOf(n)+1];
+ assert.equal(field("--subject"),"Release refused before publication");assert.ok(field("--text").includes("Reason: Unknown release path: tools/newthing/a.js."));assert.ok(field("--text").includes("nothing was published or deployed"));
+ for(const reason of ["Unknown release path: tools/newthing/a.js and 3 more","Unknown release path (2 paths, names withheld)"]){await adapter.escalate({outcome:"refused",reason});assert.ok(calls.at(-1)[calls.at(-1).indexOf("--text")+1].includes(`Reason: ${reason}.`),reason);}
+});
+test("r4 targets are selected before the integrated matrix run, the inputs request and the push",async()=>{
+ // tasks-hub moved, so the integrated commit differs and a selected job would ask for its matrix run.
+ const refused=newFolder(false);git(refused.f.cwd,"checkout","tasks-hub");const tip=change(refused.f,"client/c.js","c");
+ await assert.rejects(runRelease(refused.c,refused.a),/refused/);
+ assert.deepEqual(refused.a.calls,["refuse","escalate"],"neither verifyIntegrated nor verifyInputs ran");
+ assert.deepEqual(refused.journal().failure,{step:"select",reason:NEW_REASON});assert.notEqual(refused.journal().published,true);
+ assert.equal(git(refused.f.cwd,"rev-parse","refs/heads/tasks-hub"),tip);assert.equal(remoteHead(refused.f),refused.f.base);
+ // The same candidate with its rule: selection passes on the integrated commit, then the gates and the push run in order.
+ const n=newFolder(true);git(n.f.cwd,"checkout","tasks-hub");change(n.f,"client/c.js","c");
+ assert.equal((await runRelease(n.c,n.a)).outcome,"released");
+ assert.deepEqual(n.a.calls,["verifyIntegrated","verifyInputs","merged","deploy:hub","deploy:mini","deploy:tailos","finish"]);
+ assert.notEqual(n.journal().integrated,n.j.commit);assert.equal(remoteHead(n.f),n.journal().integrated);
+});

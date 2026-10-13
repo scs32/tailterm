@@ -18,7 +18,9 @@ const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 // only ever a fixed message this runner or its adapter tagged, or the facts
 // HostAdapter.command derives from a child (program name, exit status and the
 // classification/stage fields of its last JSON line); anything else is
-// "unclassified". Child stderr, messages, paths and tokens never reach it.
+// "unclassified". Child stderr, messages, paths and tokens never reach it,
+// except that the "Unknown release path" tag of release-targets.mjs names one
+// repository path it validated.
 const REASON = /^[A-Za-z0-9 ,.:;()_\/-]{1,160}$/;
 export function releaseError(reason) { const error = new Error(reason); error.releaseReason = reason; return error; }
 export function failureReason(error) { const r = error?.releaseReason; return typeof r === "string" && REASON.test(r) ? r : "unclassified"; }
@@ -756,6 +758,10 @@ export async function runRelease(config, adapter) {
       const waiting=await verifyBatch();if(waiting)return waiting;
       integration={expected:state.expected,integrated:state.integrated};
     }
+    // Targets are selected before the integrated matrix run, the inputs
+    // request and the push, so a path no map knows refuses the job unpublished.
+    // A resumed wait selects again; the answer depends only on the commits.
+    step={step:"select"};const selected=selectReleaseTargets(cwd,baselines,integration.integrated);step=null;
     if(!state.batch && integration.integrated!==job.commit){
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
@@ -766,7 +772,6 @@ export async function runRelease(config, adapter) {
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
     await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
-    const selected=selectReleaseTargets(cwd,baselines,integration.integrated);
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;
     // The batch receipt's intent is saved with the lead's, before any deploy.

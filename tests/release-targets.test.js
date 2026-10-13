@@ -133,3 +133,81 @@ test("b2 legacy rows keep today's baselines", () => {
   // A timed event applies after every legacy one, wherever it is listed.
   assert.equal(releaseBaselines(all(sha("0")), [superseded(sha("s"), ["hub"], "2026-09-30T10:00:00Z"), ...legacy]).hub, sha("s"));
 });
+
+// The unknown-path refusal and the candidate's own map (wi_fd1a6890a531e2c1).
+const REASON = /^[A-Za-z0-9 ,.:;()_\/-]{1,160}$/;
+const reasonOf = fn => { try { fn(); } catch (error) { assert.equal(error.message, error.releaseReason); return error.releaseReason; } assert.fail("did not throw"); };
+
+test("t1 an unknown, invalid or baseline-less selection throws a tagged reason the runner can journal", () => {
+  assert.equal(reasonOf(() => targetsForPaths(["zzz/new.js"])), "Unknown release path: zzz/new.js");
+  assert.equal(reasonOf(() => targetsForPaths(["client/a.js", "zzz/new.js", "zzz/other.js"])), "Unknown release path: zzz/new.js and 1 more");
+  assert.equal(reasonOf(() => targetsForPaths(["zzz/my file.js", "zzz/café.js"])), "Unknown release path (2 paths, names withheld)");
+  assert.equal(reasonOf(() => targetsForPaths(["zzz/my file.js"])), "Unknown release path (1 path, names withheld)");
+  // The first path that may be named is named, wherever it is listed.
+  assert.equal(reasonOf(() => targetsForPaths(["zzz/my file.js", "zzz/ok.js"])), "Unknown release path: zzz/ok.js and 1 more");
+  const long = "zzz/" + "a".repeat(116), tooLong = long + "a";
+  assert.equal(reasonOf(() => targetsForPaths([long, "zzz/b.js"])), `Unknown release path: ${long} and 1 more`);
+  assert.equal(reasonOf(() => targetsForPaths([tooLong])), "Unknown release path (1 path, names withheld)");
+  assert.equal(reasonOf(() => targetsForPaths(["../etc/passwd"])), "Invalid release path");
+  assert.equal(reasonOf(() => selectReleaseTargets(root, {hub: "x"}, "HEAD")), "Missing last successful target baseline");
+  for (const paths of [["zzz/new.js"], ["zzz/new.js", "zzz/b.js"], ["zzz/my file.js"], [long, ...Array.from({length: 1000}, (_, i) => `zzz/${i}.js`)], ["/abs"]]) assert.match(reasonOf(() => targetsForPaths(paths)), REASON);
+});
+
+// A stand-in for a candidate's scripts/release-targets.mjs: no imports, and
+// the body decides what it says about one path.
+const standIn = body => `export function targetsForPaths(paths) {\n  const p = paths[0];\n  ${body}\n}\n`;
+const KNOWS_FOLDER = standIn(`if (/^tools\\/newthing\\//.test(p)) return [];\n  throw new Error("Unknown release path");`);
+const NEW_FILE = "tools/newthing/a.js", NEW_REASON = "Unknown release path: tools/newthing/a.js";
+// A temporary repository whose HEAD is a candidate adding the given files on
+// a base that holds one client file.
+function candidateRepo(files) {
+  const cwd = mkdtempSync(join(tmpdir(), "release-targets-candidate-"));
+  const git = (...args) => execFileSync("git", args, {cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]}).trim();
+  const commit = added => { for (const [file, text] of Object.entries(added)) { mkdirSync(join(cwd, file, ".."), {recursive: true}); writeFileSync(join(cwd, file), text); } git("add", "."); git("commit", "-m", "commit"); return git("rev-parse", "HEAD"); };
+  git("init", "-b", "tasks-hub"); git("config", "user.email", "fixture@example.invalid"); git("config", "user.name", "Fixture");
+  const base = commit({"client/base.js": "base"}), candidate = commit(files);
+  return {cwd, git, commit, base, candidate};
+}
+
+test("t2 a path the running map does not know is accepted only when the candidate's own map maps it", () => {
+  // (a) the candidate adds the folder and its rule: its map vouches for the folder.
+  const a = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": KNOWS_FOLDER});
+  assert.deepEqual(selectReleaseTargets(a.cwd, all(a.base), a.candidate), ["hub", "bridge", "mini", "tailos"], "the changed map file selects every target");
+  // (b) the folder without a rule, and a rule that does not cover the folder.
+  const b = candidateRepo({[NEW_FILE]: "a"});
+  assert.equal(reasonOf(() => selectReleaseTargets(b.cwd, all(b.base), b.candidate)), NEW_REASON);
+  const other = candidateRepo({[NEW_FILE]: "a", "tools/elsewhere/b.js": "b", "scripts/release-targets.mjs": KNOWS_FOLDER});
+  assert.equal(reasonOf(() => selectReleaseTargets(other.cwd, all(other.base), other.candidate)), "Unknown release path: tools/elsewhere/b.js");
+  // (c) a candidate map that cannot be loaded, or that prints something else.
+  for (const text of ["throw new Error('broken map');\n", "export const nothing = 1;\n", KNOWS_FOLDER + "console.log('noise');\n", KNOWS_FOLDER + "process.exit(3);\n"]) {
+    const c = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": text});
+    assert.equal(reasonOf(() => selectReleaseTargets(c.cwd, all(c.base), c.candidate)), NEW_REASON, text);
+  }
+  // (d) a target outside the four names, or an answer that is not a list.
+  for (const body of [`return ["prod"];`, `return ["hub", "prod"];`, `return "hub";`, `return null;`]) {
+    const d = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": standIn(body)});
+    assert.equal(reasonOf(() => selectReleaseTargets(d.cwd, all(d.base), d.candidate)), NEW_REASON, body);
+  }
+  // (e) the checkout is not the candidate: another HEAD, or an edited map file.
+  const e = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": KNOWS_FOLDER});
+  e.git("checkout", "--detach", e.base);
+  assert.equal(reasonOf(() => selectReleaseTargets(e.cwd, all(e.base), e.candidate)), NEW_REASON, "HEAD is the base");
+  e.git("checkout", "--detach", e.candidate);
+  assert.deepEqual(selectReleaseTargets(e.cwd, all(e.base), e.candidate), ["hub", "bridge", "mini", "tailos"]);
+  const strict = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": standIn(`throw new Error("Unknown release path");`)});
+  writeFileSync(join(strict.cwd, "scripts/release-targets.mjs"), KNOWS_FOLDER);
+  assert.equal(reasonOf(() => selectReleaseTargets(strict.cwd, all(strict.base), strict.candidate)), NEW_REASON, "an uncommitted edit to the map");
+});
+
+test("t2 the running map is the floor: the candidate's map adds targets for unknown paths and removes none", () => {
+  // (f) the candidate's map says nothing ships, for every path it is asked.
+  const f = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": standIn(`return [];`)});
+  const next = f.commit({"client/x.js": "x"});
+  assert.deepEqual(selectReleaseTargets(f.cwd, {...all(next), tailos: f.candidate}, next), ["tailos"], "client/x.js still ships TailOS");
+  const asked = [];
+  assert.deepEqual(targetsForPaths(["client/x.js", "docs/a.md", NEW_FILE, "tools/newthing/b.js"], (p, pending) => { asked.push([p, pending]); return p === NEW_FILE ? ["mini"] : []; }), ["mini", "tailos"]);
+  assert.deepEqual(asked, [[NEW_FILE, [NEW_FILE, "tools/newthing/b.js"]], ["tools/newthing/b.js", [NEW_FILE, "tools/newthing/b.js"]]], "only the paths no running rule matches are asked");
+  // The invalid path rule is not the candidate's to relax, and an invalid path is never asked.
+  for (const p of ["../x.js", "/abs/x.js", "tools/../x.js", "a\nb"]) assert.equal(reasonOf(() => targetsForPaths([NEW_FILE, p], () => [])), "Invalid release path", JSON.stringify(p));
+  assert.equal(reasonOf(() => targetsForPaths(["tools/../x.js"], () => assert.fail("asked"))), "Invalid release path");
+});

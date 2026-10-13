@@ -1,11 +1,19 @@
+import { execFileSync } from "node:child_process";
 import { diffPaths } from "./verify-matrix.mjs";
 
 const targets = ["hub", "bridge", "mini", "tailos"];
+// A fixed reason the release runner may journal and post (its REASON pattern).
+function tagged(reason) { const error = new Error(reason); error.releaseReason = reason; return error; }
+// The one unknown path a reason may name; any other is counted, never quoted.
+const NAMED_PATH = /^[A-Za-z0-9_.\/-]{1,120}$/;
 // An unknown source file blocks release rather than silently omitting a target.
-export function targetsForPaths(paths) {
-  const out = new Set();
+// known(path, pending) is asked only about a path no rule here matches: an array
+// adds those targets, anything else leaves the path unknown. It never removes a
+// target a rule here selects and is never asked about an invalid path.
+export function targetsForPaths(paths, known = () => null) {
+  const out = new Set(), pending = [];
   for (const p of paths) {
-    if (!p || p.startsWith("/") || p.split("/").includes("..") || /[\0\r\n]/.test(p)) throw new Error("Invalid release path");
+    if (!p || p.startsWith("/") || p.split("/").includes("..") || /[\0\r\n]/.test(p)) throw tagged("Invalid release path");
     if (/^(docs\/|tests\/|verification\/)|(^|\/)(AGENTS\.md|.*_test\.go)$/.test(p)) continue;
     if (/^hub\/(go\.(mod|sum)|internal\/(api|store|server)\/)/.test(p)) { for (const t of ["hub", "bridge", "mini"]) out.add(t); }
     else if (/^hub\/(cmd\/tailterm-hub\/|internal\/(broker|monitor|jev)\/)/.test(p)) out.add("hub");
@@ -30,14 +38,65 @@ export function targetsForPaths(paths) {
     else if (/^tools\/jev-kit\//.test(p)) continue; // separate evaluation kit module; nothing ships from it
     else if (/^tools\/claude-mods\//.test(p)) continue; // Claude Code mods loaded only by --plugin-dir; nothing ships from them
     else if (/^(\.github\/workflows\/[^/]+\.ya?ml|hub\/README\.md)$/.test(p)) continue; // CI configuration and documentation
-    else throw new Error("Unknown release path");
+    else pending.push(p);
+  }
+  const unknown = [];
+  for (const p of pending) {
+    const vouched = known(p, pending);
+    if (Array.isArray(vouched)) { for (const t of vouched) out.add(t); } else unknown.push(p);
+  }
+  if (unknown.length) {
+    const named = unknown.find(p => NAMED_PATH.test(p));
+    throw tagged(named ? `Unknown release path: ${named}${unknown.length > 1 ? ` and ${unknown.length - 1} more` : ""}` : `Unknown release path (${unknown.length} path${unknown.length === 1 ? "" : "s"}, names withheld)`);
   }
   return targets.filter(t => out.has(t));
 }
+// Run in the candidate's checkout: its own map answers one path per call, and
+// a path it throws on is unknown.
+const CANDIDATE_MAP = `import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const { targetsForPaths } = await import(pathToFileURL(resolve("scripts/release-targets.mjs")).href);
+process.stdout.write(JSON.stringify(JSON.parse(input).map(p => { try { return { targets: targetsForPaths([p]) }; } catch { return { unknown: true }; } })));`;
+// What the candidate's own scripts/release-targets.mjs says about paths the
+// running map does not know, so a new folder and its rule ship in one release.
+// The candidate's map runs in a short child process and is never imported
+// here. It is consulted only when the checkout is at the candidate commit with
+// scripts/ and tests/ unmodified, so the module and its imports are the
+// candidate's files. Any failure (no map in the commit, another HEAD, a failed
+// or slow child, output of any other shape, a target outside the four names)
+// answers null for every path asked: the path stays unknown.
+export function candidateKnown(cwd, commit) {
+  const answers = new Map(), git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  let usable;
+  const ask = paths => {
+    try {
+      if (usable === undefined) {
+        usable = false;
+        git("cat-file", "-e", `${commit}:scripts/release-targets.mjs`);
+        usable = git("rev-parse", "HEAD").trim() === commit && git("status", "--porcelain", "--untracked-files=no", "--", "scripts", "tests") === "";
+      }
+      if (!usable) return null;
+      const raw = execFileSync(process.execPath, ["--input-type=module", "-e", CANDIDATE_MAP], { cwd, env: { PATH: process.env.PATH || "" }, input: JSON.stringify(paths), encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], timeout: 20000, maxBuffer: 1024 * 1024 });
+      const said = JSON.parse(raw);
+      const shaped = e => e && typeof e === "object" && !Array.isArray(e) && Object.keys(e).length === 1 && (e.unknown === true || (Array.isArray(e.targets) && e.targets.every(t => targets.includes(t))));
+      return Array.isArray(said) && said.length === paths.length && said.every(shaped) ? said : null;
+    } catch { return null; }
+  };
+  return (path, pending = [path]) => {
+    if (!answers.has(path)) {
+      const asked = [...new Set([path, ...pending])].filter(p => !answers.has(p)), said = ask(asked);
+      asked.forEach((p, i) => answers.set(p, said?.[i].targets ?? null));
+    }
+    return answers.get(path);
+  };
+}
 export function selectReleaseTargets(cwd, baselines, commit) {
+  const known = candidateKnown(cwd, commit);
   return targets.filter(t => {
-    if (!/^[a-f0-9]{40}$/.test(baselines[t] || "")) throw new Error("Missing last successful target baseline");
-    return targetsForPaths(diffPaths(cwd, baselines[t], commit)).includes(t);
+    if (!/^[a-f0-9]{40}$/.test(baselines[t] || "")) throw tagged("Missing last successful target baseline");
+    return targetsForPaths(diffPaths(cwd, baselines[t], commit), known).includes(t);
   });
 }
 // The last successful commit per target: the configured baselines overlaid
