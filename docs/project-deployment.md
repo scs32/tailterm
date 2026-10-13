@@ -730,7 +730,9 @@ release that has passed verification (incident of 2026-10-13).
   `waiting_inputs`, with the checkout on the integrated commit. The terminal
   prints the same "Release waits: ..." line. A check the hub answers is
   unchanged: a lost fence or a generation that is no longer this claim's still
-  refuses the job. Once `tasks-hub` is published or an effect is journaled, a
+  refuses the job. When the hub answers `generation changed` and the re-read
+  of the job then fails in transport after its tries, the job waits the same
+  way; a re-read that fails for any other reason is a lost fence. Once `tasks-hub` is published or an effect is journaled, a
   check that fails in transport is a failure as before: the rollback path
   runs, with one fence attempt per effect, and nothing is published twice.
 - **A lasting transport wait (wi_f2e585b63f57b6f8).** A transport wait is the
@@ -754,11 +756,17 @@ release that has passed verification (incident of 2026-10-13).
     poll until the hub takes it; an attention notice still owed when the hub
     answers again is posted at that poll, so a wait that outlasted the bound
     is always reported once.
-  - **Notices skip retries during a wait.** While a wait is open, and for the
-    rest of a poll in which a call spent its tries, every notice of the daemon
-    (fence wait, host wait, code, held claim, failed call) is sent once instead
-    of up to three times. Each failed notice would otherwise add up to 25 s to
-    the poll, and the next poll sends it again under the same request id.
+  - **Notices skip retries during a wait.** Every notice of the daemon (fence
+    wait, host wait, code, held claim, failed call) is sent once instead of up
+    to three times in three cases: a wait is open from an earlier poll; a
+    read of this poll's own (the job list, a job detail, an earlier notice)
+    spent its tries; or the release this poll ran recorded such a failure.
+    Each failed notice would otherwise add up to 25 s to the poll. A fence
+    wait, host wait, code or held claim notice that fails is sent again by
+    the next poll under the same request id. A failed call notice is not: it
+    is sent again only when that failure recurs. A claim that fails in
+    transport does not by itself turn the retries off: in the first poll of
+    a wait its held claim notices are still tried up to three times each.
     Notices a release posts itself (a refusal, a failure, a request to the
     handler) keep their retries.
   - **What to do.** Check that `tt status` on the deployer's host reaches the

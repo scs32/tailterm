@@ -1142,13 +1142,15 @@ export class HostAdapter {
   // that is no longer this exact claim (agent and run), whose pause generation,
   // immutable pins, integrated commit or input pins differ, or that left
   // claimed/merged. Only a still claimed job at a later generation is adopted;
-  // anything else, or a failed read, is a lost fence.
+  // anything else, or a failed read, is a lost fence. A read that could not
+  // reach the hub after its tries is thrown like an unreached check, so an
+  // unpublished job waits on it (runRelease re-reads only before publication).
   async adoptGeneration(){
     try{
       const current=this.detail(this.job.id);
       if(!this.job.agentId || !this.job.runId || current.state!=="claimed" || current.generation<=this.job.generation)return false;
       this.job=current;return true;
-    }catch{return false;}
+    }catch(error){if(error?.transport===true)throw error;return false;}
   }
   // The project handler by the project rule (hub operation "handler"): a
   // finished entry holds no item lease, so role addressing is refused there.
@@ -2040,11 +2042,15 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // One fence-wait notice per holder, waiting job and reason per process; the
   // hub returns the original for a restart's identical resend.
   const posted=new Set();
-  // Every notice of the daemon. While a transport wait is open, or once a call
-  // of this poll spent its tries on a transport error, a notice is sent once
-  // instead of up to three times: the hub just failed that long, the notice
-  // would stretch the poll by as much again, and the next poll sends it anew
-  // under the same request id.
+  // Every notice of the daemon. While a transport wait is open from an
+  // earlier poll, once a read of this poll's own adapter spent its tries, or
+  // after this poll's release recorded such a failure, a notice is sent once
+  // instead of up to three times: the hub just failed that long and the
+  // notice would stretch the poll by as much again. A fence wait, host wait,
+  // code or held claim notice that fails is sent again by the next poll under
+  // the same request id; a failed call notice is sent again only when that
+  // failure recurs. A claim that fails in transport is on the job's adapter
+  // and does not by itself turn the retries off.
   let waitOpen=false;
   const say=(reader,argv)=>reader.command(argv,undefined,{retry:!(waitOpen || reader.cliFailures.some(f=>f.transport===true))});
   const notify=(reader,jobs,holder,reason)=>{

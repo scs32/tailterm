@@ -831,6 +831,21 @@ test("fence r1 an unpublished job whose fence check spends its transport tries w
  h.fault([]);const receipt=await h.release(h.adapter());assert.equal(receipt.outcome,"released");assert.equal(receipt.commit,h.commit);
  assert.equal(h.ops("merged").length,1);assert.equal(h.ops("finish").length,1);assert.equal(h.ops("refuse").length,0);assert.equal(h.saved().state,"released");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.commit);assert.equal(remoteHead(h.f),h.commit);
 });
+test("fence r1 a re-read after a generation change that cannot reach the hub leaves the unpublished job waiting, and any other failed re-read is a lost fence",async t=>{
+ const CHANGED="tt: hub: 409 conflict: release: generation changed";
+ // The check is answered with a moved generation, then the re-read spends its three tries: the job waits, unrefused, with no journal.
+ const h=retryHost(t,[{op:"check",from:2,to:2,stderr:CHANGED},{op:"get",from:1,to:null,stderr:DEADLINE}]),a=h.adapter();
+ assert.deepEqual(await h.release(a),{jobId:"rel_retry",outcome:"waiting_transport"});
+ assert.equal(h.ops("check").length,2);assert.equal(h.ops("get").length,cliRetry.tries);assert.deepEqual(h.slept,cliRetry.delaysMs);assert.equal(existsSync(h.journal),false);
+ assert.equal(h.ops("refuse").length,0);assert.equal(h.ops("send:Release refused before publication").length,0);assert.equal(h.saved().state,"claimed");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.f.base);
+ assert.deepEqual(a.cliFailures.filter(x=>x.transport).map(x=>x.reason),["tt deployment get timed out: context deadline exceeded, 3 tries"]);
+ // The next poll, with the hub back, goes on to the inputs wait.
+ h.fault([]);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_retry",outcome:"waiting_inputs"});assert.equal(h.ops("refuse").length,0);
+ // A re-read the hub refuses is a lost fence as before: one read, refused.
+ const r=retryHost(t,[{op:"check",from:2,to:2,stderr:CHANGED},{op:"get",from:1,to:null,stderr:"tt: hub: 500 internal: database is locked"}]);
+ await assert.rejects(r.release(r.adapter()),/Release refused before publication/);
+ assert.equal(r.ops("get").length,1);assert.deepEqual(r.slept,[]);assert.equal(r.state().refusalReason,"release fence lost");assert.equal(r.ops("refuse").length,1);
+});
 test("fence r1 a fence the hub answers still refuses, and after publication an unreached fence check fails and rolls back as before",async t=>{
  // A lost fence and a line that only says timeout are the hub's or the CLI's answer: one call, refused.
  for(const stderr of ["tt: hub: 409 conflict: release: job is not claimed","tt: timeout","tt: the request timed out"]){
