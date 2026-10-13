@@ -676,7 +676,8 @@ call failed" with `Deployer CLI call failed: REASON (release JOB). The exact
 argv, exit code and stderr are kept in cli-failures.json in the private journal
 directory of the deployer.`, once per job and reason for a process. That notice
 goes through the CLI that just failed, so it is best effort; the private record
-and the terminal line remain.
+and the terminal line remain. A failure that is a transport error is told once
+per transport wait instead (A lasting transport wait, below).
 
 **Transport errors are retried (wi_9cb499ac2a14a1a0).** A call of the
 configured `tt` that fails because the hub was not reached is made again
@@ -688,12 +689,19 @@ release that has passed verification (incident of 2026-10-13).
   call began, and a retried call runs under at most 60 s. A call that hung for
   its whole command timeout (600 s by default) is therefore made once. The
   deployer waits synchronously, so nothing else in it runs during a wait.
-- **Transport error.** Read from the last line of the call's stderr: a
-  timeout (`context deadline exceeded`, `i/o timeout`, `timed out`, or a call
-  stopped at the runner's own command timeout), `connection refused`,
-  `connection reset`, or the hub line `hub: 502`, `hub: 503` or `hub: 504`.
-  Any other answer of the hub is final and is never retried: a refusal or a
-  validation answer (4xx with a reason) and a 500, whatever words it holds.
+- **Transport error (wi_f2e585b63f57b6f8).** Read from the last line of the
+  call's stderr. It is one only for the hub line `hub: 502`, `hub: 503` or
+  `hub: 504`, or, on a line with no hub status, one of these phrases of the Go
+  HTTP client: `context deadline exceeded`, `connection refused`,
+  `connection reset`, `i/o timeout`, `Client.Timeout exceeded`. Any other
+  answer of the hub is final and is never retried: a refusal or a validation
+  answer (4xx with a reason) and a 500, whatever words it holds. A line that
+  merely says `timeout` or `timed out` is not a transport error: the call is
+  made once and fails as any other call does. One case has no line at all: a
+  call the runner itself stopped at its command timeout. It stays a transport
+  error (`no answer before the command timeout`), because the hub gave no
+  answer and so decided nothing; treating it otherwise would refuse a release
+  over a hung fence check. It is retried only inside the bound above.
 - **Idempotent call.** Only these are retried: a `tt send` or a
   `tt deployment` call that carries `--request-id` (the hub answers a repeat of
   the id with the original), and the reads `tt deployment get`, `list` and
@@ -710,15 +718,61 @@ release that has passed verification (incident of 2026-10-13).
   call failed in transport; the next poll retries." and the Board gets the "A
   deployer CLI call failed" notice above, once per job and reason for a
   process. A refusal of such a request still fails the job as before.
+- **A fence check before publication waits (wi_f2e585b63f57b6f8).** Every
+  poll of a claimed job starts with `tt deployment check`, and the check is
+  repeated before integration, before each read of verification or inputs and
+  before publication. When a check still fails in transport after its tries
+  and nothing is published and no target effect is journaled, the job is not
+  refused: the release returns `waiting_transport`, the job stays claimed, and
+  the next poll starts again from its journal. A new job has no journal yet
+  and gets none; a job already in `waiting_matrix` or `waiting_inputs` keeps
+  its phase; a check that failed just before publication leaves
+  `waiting_inputs`, with the checkout on the integrated commit. The terminal
+  prints the same "Release waits: ..." line. A check the hub answers is
+  unchanged: a lost fence or a generation that is no longer this claim's still
+  refuses the job. Once `tasks-hub` is published or an effect is journaled, a
+  check that fails in transport is a failure as before: the rollback path
+  runs, with one fence attempt per effect, and nothing is published twice.
+- **A lasting transport wait (wi_f2e585b63f57b6f8).** A transport wait is the
+  run of polls in which some call of the CLI spent its tries on a transport
+  error. It is kept in `transport-wait.json` in the journal directory, mode
+  0600 (`jobId`, `since`, `lastAt`, `polls`, the first and the latest cause in
+  the fixed words above, `routine`, `due`, `escalated`), so it belongs to the
+  job and a restarted or re-executed deployer continues it. A poll that fails
+  before any job is read continues the open wait, or opens one with no job. A
+  failure of another job begins a new wait. The wait ends, and the file is
+  removed, at the first poll in which no call ends in a transport error.
+  - One "A deployer CLI call failed" notice (`wake=routine`) per wait, for its
+    first failure. Its request id is built from when the wait began.
+  - **Bound: 10 minutes.** Once the wait has lasted that long, one "The
+    deployer has not reached the hub for longer than its bound" notice
+    (`wake=attention`, request id `transport-wait-HASH` of the start time and
+    the job) names the job, the start time and the cause at that poll. The
+    terminal prints "Transport wait passed its bound; attention notice
+    posted."
+  - Both notices go through the hub that is failing. Each is tried once per
+    poll until the hub takes it; an attention notice still owed when the hub
+    answers again is posted at that poll, so a wait that outlasted the bound
+    is always reported once.
+  - **Notices skip retries during a wait.** While a wait is open, and for the
+    rest of a poll in which a call spent its tries, every notice of the daemon
+    (fence wait, host wait, code, held claim, failed call) is sent once instead
+    of up to three times. Each failed notice would otherwise add up to 25 s to
+    the poll, and the next poll sends it again under the same request id.
+    Notices a release posts itself (a refusal, a failure, a request to the
+    handler) keep their retries.
+  - **What to do.** Check that `tt status` on the deployer's host reaches the
+    hub. Nothing needs to be requeued: an unpublished job continues at the
+    first poll that reaches it.
 - **Any other call.** Once its tries are spent the job fails as it did
   before the retry existed: refused when nothing was published, rolled back
   otherwise. A rollback is delayed by at most the bound above per call. The
   reason in the job journal (`refusalReason`, `failureDetail`) and in the
   "Release refused before publication" notice names the cause and the number
   of tries, for example `tt send timed out: context deadline exceeded, 3
-  tries` or `tt deployment check hub answered 503, 3 tries`, in place of
-  `tt send exit 1`. A fence check that fails this way is named so, not as
-  `release fence lost`. A transport error of a call that is not retried reads
+  tries` or `tt deployment merged hub answered 503, 3 tries`, in place of
+  `tt send exit 1`. A fence check that fails this way after publication is
+  named so, not as `release fence lost`. A transport error of a call that is not retried reads
   `..., 1 try`. Only these fixed words reach the journal and the Board, never
   the stderr line.
 - **Private record.** Every failed try is recorded in `cli-failures.json`,
@@ -743,6 +797,7 @@ that notice stays unread until they next read their inbox.
 | Deployer is restarting itself onto the published scripts, with or without a held job | `wake=routine` |
 | Deployer now runs the published scripts | `wake=routine` |
 | A deployer CLI call failed | `wake=routine` |
+| The deployer has not reached the hub for longer than its bound | `wake=attention` |
 | A release job is waiting behind a held project fence, when the holder is blocked, merged or claimed by another deployer run | `wake=attention` |
 | A release job is held until its matrix run is confirmed stopped | `wake=attention` |
 | Release refused before publication | `wake=attention` |

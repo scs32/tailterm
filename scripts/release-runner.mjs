@@ -74,15 +74,21 @@ function childReason(argv, error, cli, transport) {
 // line of the call's stderr, and only one of these fixed phrases is returned,
 // never the line. A line that carries the hub's own answer ("hub: STATUS ...")
 // is a transport error only for 502, 503 and 504: a refusal or a validation
-// answer (4xx with a reason) and a 500 are the hub's decision. A call killed
-// at the runner's own command timeout printed nothing and counts as timed out.
-const TRANSPORT = [[/context deadline exceeded/i, "timed out: context deadline exceeded"], [/connection refused/i, "connection refused"], [/connection reset/i, "connection reset"], [/i\/o timeout|timed out|timeout/i, "timed out"]];
+// answer (4xx with a reason) and a 500 are the hub's decision. Without a hub
+// status only these phrases of the Go HTTP client count (wi_f2e585b63f57b6f8):
+// a line that merely says timeout or timed out is not a transport error, so
+// the call is not made again and its failure is judged as any other. A call
+// the runner itself killed at its command timeout (ETIMEDOUT) is kept as a
+// transport error: the hub gave no answer, so it cannot be the hub's decision,
+// and dropping it would turn a hung fence check into a lost fence. It is still
+// never made again when it used up the retry window.
+const TRANSPORT = [[/context deadline exceeded/i, "timed out: context deadline exceeded"], [/connection refused/i, "connection refused"], [/connection reset/i, "connection reset"], [/i\/o timeout/i, "timed out: i/o timeout"], [/Client\.Timeout exceeded/, "timed out: Client.Timeout exceeded"]];
 function transportCause(error) {
   if (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return null;
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
   const line = (text.slice(-CLI_STDERR_BYTES).trim().split("\n").at(-1) || "").slice(-1024), hub = /\bhub: (\d{3})\b/.exec(line);
   if (hub) return ["502", "503", "504"].includes(hub[1]) ? `hub answered ${hub[1]}` : null;
-  return TRANSPORT.find(([shape]) => shape.test(line))?.[1] ?? (error.code === "ETIMEDOUT" ? "timed out" : null);
+  return TRANSPORT.find(([shape]) => shape.test(line))?.[1] ?? (error.code === "ETIMEDOUT" ? "no answer before the command timeout" : null);
 }
 // The calls a transport error may repeat: a send or a deployment call that
 // carries a request id (the hub answers a repeat of the id with the original),
@@ -147,6 +153,32 @@ export function cliFailureNotice(failure, run) {
   const id = createHash("sha256").update(JSON.stringify([failure?.at ?? null, job, reason])).digest("hex").slice(0, 16);
   return {key: `cli-failure ${job} ${reason}`, requestId: `cli-failure-${NAME(run)}-${id}`, jobId: job, wake: WAKE.routine, subject: "A deployer CLI call failed",
     text: `Deployer CLI call failed: ${reason}${job ? ` (release ${job})` : ""}. The exact argv, exit code and stderr are kept in cli-failures.json in the private journal directory of the deployer.`};
+}
+// A transport wait (wi_f2e585b63f57b6f8): the polls, one after another, in
+// which a call of the configured CLI spent its tries on a transport error. It
+// is kept in JOURNAL/transport-wait.json (0600), so it belongs to the job and
+// outlives the process: a restarted or re-executed runner goes on with the
+// same wait. It names the job whose call failed, once one is known; a failure
+// of another job begins a new wait. It ends at the first poll in which no
+// call ends that way. One routine notice (cliFailureNotice of its first
+// failure, keyed by when the wait began) is posted per wait, and one
+// attention notice once it has lasted escalateMs. Either is tried once per
+// poll until the hub takes it, the attention notice also at the poll that
+// ends the wait. The file holds only times, the job id and childReason's
+// fixed phrases. Tests replace now.
+export const transportWait = {escalateMs: 600000, now: () => Date.now()};
+const transportWaitPath = dir => join(dir, "transport-wait.json");
+function readTransportWait(dir) {
+  try { const wait = JSON.parse(readFileSync(transportWaitPath(dir), "utf8")); return wait?.version === 1 && Number.isFinite(Date.parse(wait.since)) ? wait : null; } catch { return null; }
+}
+// The attention notice of a wait that passed the bound. It is built only from
+// what was saved when the bound passed (due), so every resend is identical
+// and the hub answers it with the original.
+export function transportWaitNotice(wait) {
+  const due = wait?.due || {}, job = /^rel_[A-Za-z0-9]{1,40}$/.test(due.jobId || "") ? due.jobId : null, cause = REASON.test(due.cause || "") ? due.cause : "unclassified";
+  const since = new Date(wait?.since).toISOString(), minutes = Number.isSafeInteger(due.minutes) ? due.minutes : 0;
+  return {requestId: `transport-wait-${createHash("sha256").update(JSON.stringify([since, job])).digest("hex").slice(0, 16)}`, jobId: job, wake: WAKE.attention, subject: "The deployer has not reached the hub for longer than its bound",
+    text: `${job ? `Release ${job} has` : "The polls of the deployer have"} waited on hub transport failures since ${since}, longer than the ${minutes} minute bound. Cause: ${cause}. A job that is not yet published stays claimed and unrefused, and the deployer tries again at every poll. Check that the hub answers from the host of the deployer; see the transport wait step in docs/project-deployment.md.`};
 }
 // What the Board may repeat of a refused CLI call's stderr: its last line,
 // word by word. A plain word, a small number or a hub id is kept; any other
@@ -573,7 +605,16 @@ export async function runRelease(config, adapter) {
     if(fenced==="generation-changed" && await adopt(journal))fenced=await adapter.fence(job);
     return fenced===true;
   };
-  if(!finishOnly && !await held(pending))throw releaseError("release fence lost");
+  // A fence check that could not reach the hub after its tries is not a lost
+  // fence (wi_f2e585b63f57b6f8): while nothing is published and no effect is
+  // journaled the job waits for the next poll, claimed and unrefused, with its
+  // journal as the last poll left it. Here nothing was touched yet.
+  const unpublished=journal=>journal?.published!==true && !journal?.effects?.length;
+  if(!finishOnly){
+    let ok;
+    try{ok=await held(pending);}catch(error){if(error?.transport===true && unpublished(pending))return {jobId:job.id,outcome:"waiting_transport"};throw error;}
+    if(!ok)throw releaseError("release fence lost");
+  }
   const lock=hostLockPath(cwd,job);mkdirSync(dirname(lock),{recursive:true,mode:0o700});
   let fd;try{fd=openSync(lock,"wx",0o600);}catch{throw releaseError("Release host locked; inspect prior execution");}
   writeFileSync(fd,JSON.stringify({jobId:job.id,agentId:job.agentId,runId:job.runId}));fsyncSync(fd);
@@ -605,7 +646,13 @@ export async function runRelease(config, adapter) {
   // How often this job went on at a generation the hub advanced under it.
   const noteAdopted=()=>{if(adopted){state.generationAdoptions=(state.generationAdoptions||0)+adopted;adopted=0;}};
   noteAdopted();
-  const fence=async()=>{const ok=await held(state);noteAdopted();if(!ok)throw releaseError("release fence lost");};
+  // fenceWait marks the transport error of a fence check made before
+  // publication; after it, the error is a failure like any other.
+  const fence=async()=>{
+    let ok;
+    try{ok=await held(state);}catch(error){noteAdopted();if(error?.transport===true && unpublished(state))error.fenceWait=true;throw error;}
+    noteAdopted();if(!ok)throw releaseError("release fence lost");
+  };
   // The refusal of an unpublished job with no effects. A refuse call the hub
   // answers with "generation changed" is sent once more at the re-read
   // generation. A failed call leaves the journal in refusing with
@@ -794,7 +841,10 @@ export async function runRelease(config, adapter) {
     // is integrated; a resumed run (any later poll) adds none, and with or
     // without a batch the lead's journal keeps them.
     if(state.phase==="prepared" && config.batch?.max>1 && Array.isArray(config.batch.excluded))noteDropped(config.batch.excluded);
-    checkpoint();await fence();
+    // A new job is journaled only once its fence check answered, so a check
+    // that could not reach the hub leaves no journal for the next poll to
+    // find ambiguous; a resumed one keeps the journal it has.
+    if(state.phase==="prepared"){await fence();checkpoint();}else{checkpoint();await fence();}
     let integration;
     if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
     else if(state.phase==="batching")integration=await resumeBatch();
@@ -873,6 +923,13 @@ export async function runRelease(config, adapter) {
   } catch (error) {
     // A resumed refusal that failed or finished above is not refused again.
     if(refusing)throw error;
+    // An unreached fence check before publication: the job waits. The journal
+    // stays in a phase the next poll resumes (the wait for inputs when the
+    // check came just before publication), and the checkout is left as it is.
+    if(error?.fenceWait===true && unpublished(state)){
+      if(state.phase==="integrated"){state.phase="waiting_inputs";checkpoint();}
+      return {jobId:job.id,outcome:"waiting_transport"};
+    }
     // An unconfirmed batch call: nothing here may touch the checkout or the job.
     if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
@@ -1036,12 +1093,13 @@ export class HostAdapter {
     this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;
     // Failed calls of the configured CLI this adapter recorded privately.
     this.cliFailures=[];}
-  command(argv,cwd=this.config.cwd,{timeout=600000}={}){
+  command(argv,cwd=this.config.cwd,{timeout=600000,retry=true}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
     // Only an idempotent call of the configured CLI is made again, and only
     // after a transport error (cliRetry). The error thrown carries transport
     // when the last try ended in one, and its reason names the cause and the
-    // number of tries.
+    // number of tries. retry false makes the call once: the daemon's notices
+    // during an open transport wait (transportWait).
     const cli=this.config.tt||"tt",began=Date.now();
     for(let tries=1;;tries++){
       try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout:tries===1?timeout:Math.min(timeout,cliRetry.windowMs)});}
@@ -1050,7 +1108,7 @@ export class HostAdapter {
         let kept=null;
         if(argv[0]===cli && this.config.journalDirectory){try{kept=recordCliFailure(this.config,this.job,argv,cwd,error,failed.releaseReason,this.now());}catch{}}
         const wait=cliRetry.delaysMs[tries-1];
-        if(cause && cliIdempotent(argv) && tries<cliRetry.tries && Number.isFinite(wait) && Date.now()-began+wait<=cliRetry.windowMs){cliRetry.sleep(wait);continue;}
+        if(cause && retry && cliIdempotent(argv) && tries<cliRetry.tries && Number.isFinite(wait) && Date.now()-began+wait<=cliRetry.windowMs){cliRetry.sleep(wait);continue;}
         if(cause)failed.transport=true;
         if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
@@ -1076,8 +1134,9 @@ export class HostAdapter {
   }
   // "generation-changed" when the hub refused the check only because the job's
   // generation moved; runRelease then decides whether to re-read (adoptGeneration).
-  // A check that could not reach the hub after its tries is thrown as it is,
-  // so the job's failure names that cause instead of a lost fence.
+  // A check that could not reach the hub after its tries is thrown as it is:
+  // runRelease lets an unpublished job wait on it, and after publication the
+  // job's failure names that cause instead of a lost fence.
   async fence(){try{this.native("check");return true;}catch(error){if(error?.transport===true)throw error;return error?.generationChanged===true?"generation-changed":false;}}
   // One re-read after a "generation changed" answer. detail() refuses a job
   // that is no longer this exact claim (agent and run), whose pause generation,
@@ -1981,12 +2040,19 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // One fence-wait notice per holder, waiting job and reason per process; the
   // hub returns the original for a restart's identical resend.
   const posted=new Set();
+  // Every notice of the daemon. While a transport wait is open, or once a call
+  // of this poll spent its tries on a transport error, a notice is sent once
+  // instead of up to three times: the hub just failed that long, the notice
+  // would stretch the poll by as much again, and the next poll sends it anew
+  // under the same request id.
+  let waitOpen=false;
+  const say=(reader,argv)=>reader.command(argv,undefined,{retry:!(waitOpen || reader.cliFailures.some(f=>f.transport===true))});
   const notify=(reader,jobs,holder,reason)=>{
     let locked=true;try{locked=hostLockNames(config.cwd,holder);}catch{}
     let matrixRun=true;try{matrixRun=matrixRunUnsettled(config.journalDirectory,holder);}catch{}
     const notice=fenceWaitNotice(jobs,holder,reason,locked,matrixRun);
     if(!notice || posted.has(notice.requestId))return;
-    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
+    try{say(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${holder.id}`,"--ref",`waiting-job=${notice.waitingJobId}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
     catch{process.stderr.write("Fence wait notice not posted; the next poll retries.\n");}
   };
   // One notice per place on the verification host's waitlist (position, list
@@ -1994,7 +2060,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   const matrixNotify=(reader,job,adapter)=>{
     for(const notice of [matrixWaitNotice(job,adapter.matrixWait),matrixHeldNotice(job,adapter.matrixHeld)]){
       if(!notice || posted.has(notice.requestId))continue;
-      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${job.id}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
+      try{say(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,"--ref",`release-job=${job.id}`,...wakeRef(notice.wake)]);posted.add(notice.requestId);}
       catch{process.stderr.write("Matrix host notice not posted; the next poll retries.\n");}
     }
   };
@@ -2004,17 +2070,22 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const notice=codeNotice(record,kind);if(!notice)return;
     if(CODE_LINES[kind] && !code.said.has(notice.requestId)){code.said.add(notice.requestId);process.stderr.write(CODE_LINES[kind]);}
     if(code.noticed.has(notice.requestId))return;
-    try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...wakeRef(notice.wake)]);code.noticed.add(notice.requestId);}
+    try{say(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...wakeRef(notice.wake)]);code.noticed.add(notice.requestId);}
     catch{process.stderr.write("Runner code notice not posted; the next poll retries.\n");}
   };
   // One notice per job and safe reason for the CLI failures a held poll or a
   // held release recorded. It goes through the CLI that just failed, so it is
-  // best effort: the private record and the terminal line remain.
+  // best effort: the private record and the terminal line remain. A transport
+  // failure is not told here: it belongs to the transport wait (transportTurn).
+  // The transport wait's two notices are sent in the same form, once each.
+  const failureSend=(send,reader,notice)=>send(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[]),...wakeRef(notice.wake)]);
+  const sayOnce=(reader,argv)=>reader.command(argv,undefined,{retry:false});
   const cliNotify=(reader,failures)=>{
     for(const failure of [...failures]){
+      if(failure.transport===true)continue;
       const notice=cliFailureNotice(failure,process.env.TAILTERM_RUN);
       if(posted.has(notice.key))continue;
-      try{reader.command([config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[]),...wakeRef(notice.wake)]);posted.add(notice.key);}catch{}
+      try{failureSend(say,reader,notice);posted.add(notice.key);}catch{}
     }
   };
   // A skipped job (a refused claim or a held set-aside journal) is told once
@@ -2028,7 +2099,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     if(live.length!==1 || !/^agt_[a-f0-9]+$/.test(live[0].id||""))throw releaseError("One live owner helper required");return live[0].id;}};
   const heldNotify=(reader,job,kind,reason)=>{
     const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);if(!notice)return;
-    const send=(suffix,to)=>reader.command([config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[]),...(to?[]:wakeRef(notice.wake))]);
+    const send=(suffix,to)=>say(reader,[config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[]),...(to?[]:wakeRef(notice.wake))]);
     let missed=false;
     for(const [name,resolve] of Object.entries(HELD_TO)){
       if(posted.has(`${notice.key} ${name}`))continue;
@@ -2039,8 +2110,39 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     if(posted.has(`${notice.key} board`))return;
     try{send("board");posted.add(`${notice.key} board`);}catch{}
   };
+  // The end of every poll that read the hub: failures are the calls of this
+  // poll that spent their tries on a transport error (transportWait).
+  const transportTurn=(reader,failures)=>{
+    const path=transportWaitPath(config.journalDirectory),now=transportWait.now(),at=new Date(now).toISOString(),safe=r=>REASON.test(r||"")?r:"unclassified";
+    const post=notice=>{
+      try{failureSend(sayOnce,reader,notice);return "posted";}
+      catch(error){return error?.transport===true?"unreached":"refused";}
+    };
+    let wait=readTransportWait(config.journalDirectory);
+    const escalate=()=>{
+      if(!wait.due || wait.escalated)return true;
+      const outcome=post(transportWaitNotice(wait));if(outcome==="unreached")return false;
+      wait.escalated=outcome;process.stderr.write(outcome==="posted"?"Transport wait passed its bound; attention notice posted.\n":"Transport wait passed its bound; the hub refused its attention notice.\n");return true;
+    };
+    if(!failures.length){
+      if(!wait)return;
+      // The wait ends here unless its owed attention notice is still unreached.
+      if(escalate()){rmSync(path,{force:true});waitOpen=false;return;}
+    }else{
+      const jobId=failures.find(f=>f.jobId)?.jobId??null;
+      if(!wait || (wait.jobId && jobId && wait.jobId!==jobId))wait={version:1,jobId,since:at,cause:safe(failures[0].reason),polls:0,routine:false,escalated:false};
+      if(!wait.jobId && jobId)wait.jobId=jobId;
+      wait.polls=(Number.isSafeInteger(wait.polls)?wait.polls:0)+1;wait.latest=safe(failures.at(-1).reason);
+      if(!wait.due && now-Date.parse(wait.since)>=transportWait.escalateMs)wait.due={jobId:wait.jobId,cause:wait.latest,minutes:Math.round(transportWait.escalateMs/60000)};
+      if(!wait.routine && post(cliFailureNotice({reason:wait.cause,jobId:wait.jobId,at:wait.since},process.env.TAILTERM_RUN))!=="unreached")wait.routine=true;
+      escalate();
+    }
+    wait.lastAt=at;waitOpen=true;
+    try{save(path,wait);}catch{}
+  };
   while(!signal?.aborted){
-    let reader=null;
+    let reader=null;const ran=[];
+    waitOpen=readTransportWait(config.journalDirectory)!==null;
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
     const configured=configPath?readBaselines(configPath):config.baselines;
@@ -2117,7 +2219,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         let journal;try{journal=setAsideJournal(join(config.journalDirectory,job.id+".json"),job);}catch{journal="held";}
         if(journal==="held"){skipped.add(job.id);process.stderr.write("Set-aside release journal held; handler reconciliation required.\n");heldNotify(reader,job,"journal","the journal is unreadable, shows effects or is not of exactly the set-aside claim");continue;}
       }
-      const adapter=new HostAdapter(config,job);
+      const adapter=new HostAdapter(config,job);ran.push(adapter);
       try{if(job.state==="verified")adapter.native("claim");}
       catch(error){skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");const call=failureReason(error),said=error?.refusal?`${error.refusal} (${call})`:call;heldNotify(reader,job,"claim",said.length<=160?said:call);continue;}
       const current=adapter.job;adapter.baselines=baselines;
@@ -2129,16 +2231,16 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       // A batch's own members are not waiting behind its lead.
       let waiting=jobs;
       if(batch){try{const members=new Set(JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8")).batch?.jobs?.map(j=>j.jobId));waiting=jobs.filter(j=>!members.has(j.id));}catch{}}
-      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome)){
-        notify(reader,waiting,adapter.job||current,result.outcome);
-        // A wait that follows a transport failure is named once, like a hold.
-        const unreached=adapter.cliFailures.filter(f=>f.transport===true);
-        if(unreached.length){process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");cliNotify(reader,unreached);}
-      }
+      const unreached=adapter.cliFailures.some(f=>f.transport===true);if(unreached)waitOpen=true;
+      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,waiting,adapter.job||current,result.outcome);
+      // A wait that follows a transport failure, the fence check's included
+      // (waiting_transport); transportTurn below names it once per wait.
+      if(unreached && ["waiting_matrix","waiting_inputs","waiting_transport"].includes(result?.outcome))process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");
       matrixNotify(reader,adapter.job||current,adapter);
       break;
     }
     } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);if(reader)cliNotify(reader,reader.cliFailures);}
+    if(reader)try{transportTurn(reader,[...reader.cliFailures,...ran.flatMap(a=>a.cliFailures)].filter(f=>f.transport===true));}catch{process.stderr.write("Transport wait not recorded; the next poll retries.\n");}
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));
   }

@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
@@ -808,18 +808,54 @@ test("retry t4 a request that times out once is sent again and the release goes 
  assert.equal(h.ops("refuse").length,0);assert.equal(h.ops("merged").length,1);assert.equal(h.ops("finish").length,1);assert.equal(h.ops("send:Release refused before publication").length,0);
  assert.equal(h.state().refusalReason,undefined);assert.deepEqual(h.slept,[cliRetry.delaysMs[0]]);kept=h.failures();assert.equal(kept.length,1);assert.equal(kept[0].count,1);
 });
-test("retry t3 t4 a call that never succeeds is refused after three tries, and the journal and the notice name the cause",async t=>{
- const h=retryHost(t,[{op:"check",from:2,to:null,stderr:DEADLINE}]),a=h.adapter(),reason="tt deployment check timed out: context deadline exceeded, 3 tries";
- await assert.rejects(h.release(a),/Release refused before publication/);
- // One good check, then three tries of the next with the two waits between.
- assert.equal(h.ops("check").length,4);assert.deepEqual(h.slept,cliRetry.delaysMs);assert.equal(cliRetry.tries,3);assert.equal(new Set(h.ops("check").slice(1).map(requestId)).size,1);
- const state=h.state();assert.equal(state.phase,"refused");assert.equal(state.refusalReason,reason);assert.equal(state.failureDetail.text,reason);assert.deepEqual(state.effects,[]);assert.notEqual(state.published,true);
- const notice=h.ops("send:Release refused before publication");assert.equal(notice.length,1);const text=sendOf(notice[0]).text;
- assert.ok(text.includes(`Reason: ${reason}.`));assert.match(text,SAFE_TEXT);assert.ok(!text.includes("hub.invalid"));assert.ok(!text.includes("exit 1"));
- assert.equal(h.ops("refuse").length,1);assert.equal(h.saved().state,"refused");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.f.base);
- // One private record counted three times; the adapter keeps the one spent failure.
+test("fence r1 an unpublished job whose fence check spends its transport tries waits for the next poll and is not refused",async t=>{
+ // A new job: one good check, then three tries of the next. No journal is left, nothing is refused, the claim stands.
+ const h=retryHost(t,[{op:"check",from:2,to:null,stderr:DEADLINE}]),a=h.adapter(),reason="tt deployment check timed out: context deadline exceeded, 3 tries",waits={jobId:"rel_retry",outcome:"waiting_transport"};
+ const untouched=()=>{assert.equal(h.ops("refuse").length,0);assert.equal(h.ops("merged").length,0);assert.equal(h.ops("send:Release refused before publication").length,0);assert.equal(h.saved().state,"claimed");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.f.base);};
+ assert.deepEqual(await h.release(a),waits);
+ assert.equal(h.ops("check").length,4);assert.deepEqual(h.slept,cliRetry.delaysMs);assert.equal(new Set(h.ops("check").slice(1).map(requestId)).size,1);
+ assert.equal(existsSync(h.journal),false);untouched();assert.deepEqual(a.cliFailures.map(x=>[x.reason,x.transport]),[[reason,true]]);
  const kept=h.failures();assert.equal(kept.length,1);assert.equal(kept[0].count,3);
- assert.deepEqual(a.cliFailures.map(x=>[x.reason,x.transport]),[[reason,true]]);assert.equal(cliFailureNotice(a.cliFailures[0],CODE_RUN).text.includes(reason),true);
+ // The poll's first check, before anything is read or locked, waits the same way.
+ h.fault([{op:"check",from:1,to:null,stderr:"tt: hub: 503 Service Unavailable"}]);assert.deepEqual(await h.release(h.adapter()),waits);assert.equal(existsSync(h.journal),false);untouched();
+ // The hub answers again: the same job goes on to its inputs wait.
+ h.fault([]);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_retry",outcome:"waiting_inputs"});assert.equal(h.state().phase,"waiting_inputs");
+ // A resumed wait keeps its journal byte for byte when the first check is unreached.
+ const before=readFileSync(h.journal,"utf8");
+ h.fault([{op:"check",from:1,to:null,stderr:DEADLINE}]);assert.deepEqual(await h.release(h.adapter()),waits);assert.equal(readFileSync(h.journal,"utf8"),before);untouched();
+ // Inputs bound; the check just before publication is unreached: still unpublished, resumable, unrefused.
+ h.bind({inputsCommit:h.commit,inputsDigest:"d".repeat(64)});
+ h.fault([{op:"check",from:3,to:null,stderr:"tt: dial tcp 192.0.2.1:18765: connect: connection refused"}]);assert.deepEqual(await h.release(h.adapter()),waits);
+ assert.equal(h.ops("check").filter((c,i,all)=>i>=all.length-3).length,3);let state=h.state();assert.equal(state.phase,"waiting_inputs");assert.notEqual(state.published,true);assert.deepEqual(state.effects,[]);assert.equal(state.refusalReason,undefined);assert.equal(state.failure,undefined);untouched();
+ // The next poll publishes once and finishes.
+ h.fault([]);const receipt=await h.release(h.adapter());assert.equal(receipt.outcome,"released");assert.equal(receipt.commit,h.commit);
+ assert.equal(h.ops("merged").length,1);assert.equal(h.ops("finish").length,1);assert.equal(h.ops("refuse").length,0);assert.equal(h.saved().state,"released");assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.commit);assert.equal(remoteHead(h.f),h.commit);
+});
+test("fence r1 a fence the hub answers still refuses, and after publication an unreached fence check fails and rolls back as before",async t=>{
+ // A lost fence and a line that only says timeout are the hub's or the CLI's answer: one call, refused.
+ for(const stderr of ["tt: hub: 409 conflict: release: job is not claimed","tt: timeout","tt: the request timed out"]){
+  const h=retryHost(t,[{op:"check",from:2,to:null,stderr}]);
+  await assert.rejects(h.release(h.adapter()),/Release refused before publication/,stderr);
+  assert.equal(h.ops("check").length,2,stderr);assert.deepEqual(h.slept,[],stderr);assert.equal(h.state().refusalReason,"release fence lost",stderr);assert.equal(h.state().phase,"refused",stderr);assert.equal(h.ops("refuse").length,1,stderr);
+ }
+ // Published, nothing deployed yet: the check before the first target step is unreached. No wait, no refusal: the failure path.
+ const reason="tt deployment check timed out: context deadline exceeded, 3 tries";
+ const bound=async()=>{const h=retryHost(t);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_retry",outcome:"waiting_inputs"});h.bind({inputsCommit:h.commit,inputsDigest:"d".repeat(64)});return h;};
+ const p=await bound();p.fault([{op:"check",from:4,to:null,stderr:DEADLINE}]);
+ await assert.rejects(p.release(p.adapter()),/Release failed/);
+ let state=p.state();assert.equal(state.published,true);assert.equal(state.failure.reason,reason);assert.equal(state.failure.step,"prepare");assert.equal(state.outcome,"blocked");assert.equal(state.revert.outcome,"committed");
+ assert.equal(p.ops("merged").length,1);assert.equal(p.ops("refuse").length,0);assert.equal(p.ops("send:Release failed and requires recovery").length,1);assert.equal(p.ops("check").length,2+3+cliRetry.tries);
+ // An effect is journaled, then the check before the deploy is unreached: one rollback attempt per effect, whose own fence check is tried once and caught.
+ const r=await bound(),ra=r.adapter();let rollbacks=0,deploys=0;ra.rollback=async()=>{rollbacks++;return true;};ra.deploy=async()=>{deploys++;};
+ r.fault([{op:"check",from:5,to:null,stderr:DEADLINE}]);
+ await assert.rejects(r.release(ra),/Release failed/);
+ state=r.state();assert.equal(state.published,true);assert.equal(deploys,0);assert.equal(rollbacks,0);assert.equal(state.effects.length,1);assert.equal(state.effects[0].rollbackAttempted,true);assert.equal(state.effects[0].rollback,"blocked");
+ assert.equal(state.failure.reason,reason);assert.equal(state.failure.step,"deploy");assert.equal(r.ops("check").length,2+4+2*cliRetry.tries);assert.equal(r.ops("merged").length,1);assert.equal(r.ops("refuse").length,0);
+ // With the hub back for the rollback's check, the same failure restores the target: the rollback path is the one it was.
+ const g=await bound(),ga=g.adapter();let restored=0;ga.rollback=async()=>{restored++;return true;};
+ g.fault([{op:"check",from:5,to:7,stderr:DEADLINE}]);
+ await assert.rejects(g.release(ga),/Release failed/);
+ assert.equal(restored,1);assert.equal(g.state().effects[0].rollback,"restored");assert.equal(g.state().outcome,"rolled_back");assert.equal(g.ops("merged").length,1);
 });
 test("retry t1 t4 a hub refusal is never sent again, and only an idempotent call of the configured CLI is retried",async t=>{
  // A 4xx on the fence check: one call, the fence is lost as before and nothing waits.
@@ -830,11 +866,22 @@ test("retry t1 t4 a hub refusal is never sent again, and only an idempotent call
  const tried=(rules,argv,why)=>{h.fault(rules);const a=h.adapter(),before=h.calls().length,waits=h.slept.length;let reason="";try{a.command(argv);}catch(error){reason=failureReason(error);assert.equal(error.transport===true,/ tr(y|ies)$/.test(reason),why);}
   return [h.calls().length-before,h.slept.length-waits,reason];};
  // What counts as a transport error: the fixed causes, and 502, 503 and 504 only.
- for(const [stderr,cause] of [[DEADLINE,"timed out: context deadline exceeded"],['tt: Get "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: connection refused',"connection refused"],["tt: read tcp 192.0.2.1:1->192.0.2.2:2: read: connection reset by peer","connection reset"],["tt: dial tcp 192.0.2.1:18765: i/o timeout","timed out"],["tt: hub: 502 Bad Gateway","hub answered 502"],["tt: hub: 503 Service Unavailable","hub answered 503"],["tt: hub: 504 Gateway Timeout","hub answered 504"]])
+ for(const [stderr,cause] of [[DEADLINE,"timed out: context deadline exceeded"],['tt: Get "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: connection refused',"connection refused"],["tt: read tcp 192.0.2.1:1->192.0.2.2:2: read: connection reset by peer","connection reset"],["tt: dial tcp 192.0.2.1:18765: i/o timeout","timed out: i/o timeout"],['tt: Get "http://hub.invalid/x": net/http: request canceled (Client.Timeout exceeded while awaiting headers)',"timed out: Client.Timeout exceeded"],['tt: Post "http://hub.invalid/x": context deadline exceeded (Client.Timeout exceeded while awaiting headers)',"timed out: context deadline exceeded"],["tt: hub: 502 Bad Gateway","hub answered 502"],["tt: hub: 503 Service Unavailable","hub answered 503"],["tt: hub: 504 Gateway Timeout","hub answered 504"]])
   assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[3,2,`tt deployment get ${cause}, 3 tries`],stderr);
  // The hub's own answer is final whatever its words: a refusal, a validation answer, a 500.
  for(const stderr of ["tt: hub: 409 conflict: release: generation changed","tt: hub: 422 validation: subject mentions a timeout","tt: hub: 400 bad request: context deadline exceeded is not a subject","tt: hub: 404 not found","tt: hub: 500 internal: database connection reset"])
   assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[1,0,"tt deployment get exit 1"],stderr);
+ // r2: with no hub status, a line that only says timeout or timed out is not a transport error and is made once.
+ for(const stderr of ["tt: timeout","tt: timed out","tt: the operation timed out","tt: lock wait timeout exceeded","tt: Timeout","tt: client.timeout exceeded"])
+  assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[1,0,"tt deployment get exit 1"],stderr);
+ assert.deepEqual(tried([{op:"send:Keyed",from:1,to:null,stderr:"tt: timeout"}],keyed,"keyed timeout"),[1,0,"tt send exit 1"]);
+ // r2: a call the runner stops at its own command timeout printed nothing; the hub decided nothing, so it stays a transport error.
+ const hung=join(h.home,"hung");mkdirSync(hung);writeFileSync(join(hung,"tt"),"#!"+process.execPath+"\nsetTimeout(()=>{},600000);");chmodSync(join(hung,"tt"),0o755);
+ const stopped=new HostAdapter({cwd:h.f.cwd,tt:join(hung,"tt")},h.saved()),waited=h.slept.length;
+ assert.throws(()=>stopped.command([join(hung,"tt"),"deployment","get","--job","rel_retry"],undefined,{timeout:250}),e=>failureReason(e)==="tt deployment get no answer before the command timeout, 3 tries"&&e.transport===true);assert.equal(h.slept.length,waited+2);
+ // A notice sent with retry off is made once, whatever its transport error.
+ const once=h.adapter(),sent=h.calls().length;h.fault([{op:"send:Keyed",from:1,to:null,stderr:DEADLINE}]);
+ assert.throws(()=>once.command(keyed,undefined,{retry:false}),e=>failureReason(e)==="tt send timed out: context deadline exceeded, 1 try"&&e.transport===true);assert.equal(h.calls().length,sent+1);
  assert.deepEqual(tried([{op:"send:Keyed",from:1,to:null,stderr:"tt: hub: 409 conflict: request id reused with other data"}],keyed,"keyed 409"),[1,0,"tt send exit 1"]);
  // A keyed send and a keyed deployment call are retried; a success ends the tries.
  assert.deepEqual(tried([{op:"send:Keyed",from:1,to:2,stderr:DEADLINE}],keyed,"keyed"),[3,2,""]);
@@ -889,4 +936,74 @@ test("retry t2 t3 the deployer names a waiting job's spent transport failure onc
  // A job that waits with no transport failure prints and posts nothing more.
  const quiet=codeHost(t,cwd);quiet.setJobs([verifiedJob("rel_quiet")]);
  assert.equal(await quiet.poll(null,async c=>({jobId:c.job.id,outcome:"waiting_inputs"})),"");assert.equal(quiet.sends().filter(s=>s.subject==="A deployer CLI call failed").length,0);
+});
+
+// A lasting transport wait (wi_f2e585b63f57b6f8). The fake hub fails the
+// operations a file names with a transport line; every poll is a new daemon
+// call, so each one is a restarted process over the same journal directory.
+function waitHost(t){
+ const cwd=mkdtempSync(join(tmpdir(),"release-transport-wait-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const sleep=cliRetry.sleep,slept=[];cliRetry.sleep=ms=>{slept.push(ms);};const clock=transportWait.now;let now=Date.parse("2026-10-13T18:00:00.000Z");transportWait.now=()=>now;t.after(()=>{cliRetry.sleep=sleep;transportWait.now=clock;});
+ const faults=join(cwd,"faults.json");let failing=[];const fail=ops=>{failing=ops;writeFileSync(faults,JSON.stringify(ops));};fail([]);
+ const h=codeHost(t,cwd,`const failing=JSON.parse(fs.readFileSync(${JSON.stringify(faults)},'utf8'));if(failing.includes(a[0]==='send'?'send':a[1])){fs.writeSync(2,'tt: Get "http://hub.invalid/'+${JSON.stringify(HELD_SECRET)}+'": dial tcp: connect: connection refused\\n');process.exit(1);}`);
+ // The release reads the handler only while that read is failing: the fake hub has no handler of its own.
+ const waits=async(c,adapter)=>{if(failing.includes("handler")){try{adapter.handler();}catch(error){assert.equal(error.transport,true);}}return {jobId:c.job.id,outcome:"waiting_inputs"};};
+ const of=subject=>h.calls().filter(c=>c.argv[0]==="send").map(sendOf).filter(x=>x.subject===subject),file=join(h.home,"transport-wait.json");
+ return {h,slept,fail,waits,poll:()=>h.poll(null,waits),advance:minutes=>{now+=minutes*60000;},at:()=>new Date(now).toISOString(),routine:()=>of("A deployer CLI call failed"),attention:()=>of(ATTENTION),file,wait:()=>JSON.parse(readFileSync(file,"utf8"))};
+}
+const ATTENTION="The deployer has not reached the hub for longer than its bound",WAITS_LINE="Release waits: a hub call failed in transport; the next poll retries.\n",ESCALATED_LINE="Transport wait passed its bound; attention notice posted.\n";
+test("wait r3 a lasting transport wait posts one routine notice per wait and escalates once past the bound, across restarts, and resets after recovery",async t=>{
+ const w=waitHost(t),reason="tt deployment handler connection refused, 3 tries",began=w.at();w.h.setJobs([verifiedJob("rel_wait")]);w.fail(["handler"]);
+ assert.equal(transportWait.escalateMs,600000);
+ // The first poll opens the wait: one routine notice, kept in the journal directory with the job and fixed words only.
+ assert.equal(await w.poll(),WAITS_LINE);assert.equal(w.routine().length,1);assert.equal(w.attention().length,0);
+ assert.deepEqual(w.wait(),{version:1,jobId:"rel_wait",since:began,cause:reason,polls:1,routine:true,escalated:false,latest:reason,lastAt:began});assert.equal(statSync(w.file).mode&0o777,0o600);
+ assert.equal(w.routine()[0].text,cliFailureNotice({reason,jobId:"rel_wait"},CODE_RUN).text);assert.equal(w.routine()[0].requestId,cliFailureNotice({reason,jobId:"rel_wait",at:began},CODE_RUN).requestId);assert.deepEqual(w.routine()[0].refs,["release-job=rel_wait","wake=routine"]);
+ // A restarted process inside the bound posts nothing more.
+ w.advance(5);assert.equal(await w.poll(),WAITS_LINE);w.advance(4.9);assert.equal(await w.poll(),WAITS_LINE);assert.equal(w.routine().length,1);assert.equal(w.attention().length,0);assert.equal(w.wait().polls,3);assert.equal(w.wait().since,began);
+ // Past the bound: exactly one attention notice, naming the job, the start and the cause.
+ w.advance(0.1);assert.equal(await w.poll(),WAITS_LINE+ESCALATED_LINE);assert.equal(w.attention().length,1);const told=w.attention()[0];
+ assert.equal(told.text,`Release rel_wait has waited on hub transport failures since ${began}, longer than the 10 minute bound. Cause: ${reason}. A job that is not yet published stays claimed and unrefused, and the deployer tries again at every poll. Check that the hub answers from the host of the deployer; see the transport wait step in docs/project-deployment.md.`);
+ assert.match(told.text,SAFE_TEXT);assert.deepEqual(told.refs,["release-job=rel_wait","wake=attention"]);assert.equal(told.requestId,transportWaitNotice(w.wait()).requestId);assert.match(told.requestId,/^transport-wait-[a-f0-9]{16}$/);
+ assert.equal(w.wait().escalated,"posted");assert.deepEqual(w.wait().due,{jobId:"rel_wait",cause:reason,minutes:10});
+ // Later polls and restarts of the same wait repeat neither notice.
+ w.advance(5);assert.equal(await w.poll(),WAITS_LINE);w.advance(30);assert.equal(await w.poll(),WAITS_LINE);assert.equal(w.routine().length,1);assert.equal(w.attention().length,1);
+ for(const c of w.h.calls())for(const word of c.argv)assert.ok(!word.includes(HELD_SECRET)&&!word.includes("hub.invalid"));assert.ok(!readFileSync(w.file,"utf8").includes("hub.invalid"));
+ // The first poll whose calls all succeed ends the wait.
+ w.fail([]);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.routine().length,1);assert.equal(w.attention().length,1);
+ // A later failure is a new wait: its own routine notice, and its own escalation only after its own bound.
+ w.advance(1);w.fail(["handler"]);const again=w.at();assert.equal(await w.poll(),WAITS_LINE);assert.equal(w.routine().length,2);assert.notEqual(w.routine()[1].requestId,w.routine()[0].requestId);assert.equal(w.wait().since,again);
+ w.advance(9);await w.poll();assert.equal(w.attention().length,1);w.advance(1);await w.poll();assert.equal(w.attention().length,2);assert.notEqual(w.attention()[1].requestId,told.requestId);assert.ok(w.attention()[1].text.includes(`since ${again}`));
+ // A failure of another job begins a new wait.
+ w.h.setJobs([verifiedJob("rel_other")]);await w.poll();assert.equal(w.wait().jobId,"rel_other");assert.equal(w.wait().polls,1);assert.equal(w.wait().escalated,false);assert.equal(w.routine().length,3);
+});
+test("wait r3 notices skip retries during a transport wait, and an owed attention notice is posted when the hub answers again",async t=>{
+ const w=waitHost(t),began=w.at();w.h.setJobs([verifiedJob("rel_wait")]);w.fail(["handler","send"]);
+ const sends=()=>w.h.calls().filter(c=>c.argv[0]==="send").length;
+ // The failing read spends its three tries; the routine notice is tried once, not three times, and stays owed.
+ await w.poll();assert.deepEqual(w.slept,cliRetry.delaysMs);assert.equal(sends(),1);assert.equal(w.wait().routine,false);
+ // Past the bound with the hub still failing: one try of each notice per poll, nothing marked posted.
+ w.advance(11);assert.equal(await w.poll(),WAITS_LINE);assert.equal(w.slept.length,2*cliRetry.delaysMs.length);assert.equal(sends(),3);assert.equal(w.routine().length,2);assert.equal(w.attention().length,1);
+ assert.equal(w.wait().routine,false);assert.equal(w.wait().escalated,false);assert.equal(w.wait().due.jobId,"rel_wait");
+ // Sends still fail while reads succeed: the notice's own transport failure keeps the wait open.
+ w.fail(["send"]);w.advance(1);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),true);assert.equal(w.attention().length,2);assert.equal(w.wait().escalated,false);
+ // The hub answers again: the owed attention notice is posted once, identical to the earlier tries, and the wait ends.
+ w.fail([]);w.advance(1);assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(existsSync(w.file),false);
+ const tries=w.attention();assert.equal(tries.length,3);assert.equal(new Set(tries.map(x=>x.requestId+"\n"+x.text)).size,1);assert.ok(tries[0].text.includes(`since ${began}`));
+ await w.poll();assert.equal(w.attention().length,3);
+ // A wait that ends inside the bound owes nothing.
+ w.fail(["handler"]);await w.poll();w.fail([]);w.advance(3);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.attention().length,3);
+});
+test("wait r3 a poll that cannot read the job list at all continues the open wait and opens one of its own",async t=>{
+ const w=waitHost(t);w.h.setJobs([verifiedJob("rel_wait")]);
+ // No job is known: the wait and its attention notice name the polls of the deployer.
+ w.fail(["list"]);const began=w.at();assert.match(await w.poll(),/^Deployment poll held \(tt deployment list connection refused, 3 tries\)/);
+ assert.equal(w.wait().jobId,null);assert.equal(w.routine().length,1);assert.ok(!w.routine()[0].text.includes("release rel_"));
+ w.advance(10);await w.poll();assert.equal(w.attention().length,1);assert.ok(w.attention()[0].text.startsWith(`The polls of the deployer have waited on hub transport failures since ${began}, longer than the 10 minute bound. Cause: tt deployment list connection refused, 3 tries.`));assert.match(w.attention()[0].text,SAFE_TEXT);assert.deepEqual(w.attention()[0].refs,["wake=attention"]);
+ // A job's wait that a whole-poll failure follows stays that job's wait.
+ const j=waitHost(t);j.h.setJobs([verifiedJob("rel_wait")]);j.fail(["handler"]);const first=j.at();await j.poll();j.advance(6);j.fail(["list"]);await j.poll();
+ assert.equal(j.wait().jobId,"rel_wait");assert.equal(j.wait().since,first);assert.equal(j.wait().polls,2);assert.equal(j.wait().latest,"tt deployment list connection refused, 3 tries");
+ j.advance(4);await j.poll();assert.equal(j.attention().length,1);assert.ok(j.attention()[0].text.startsWith("Release rel_wait has waited"));assert.ok(j.attention()[0].text.includes("Cause: tt deployment list connection refused, 3 tries."));
+ // An unreadable wait file is no wait: nothing is escalated from it.
+ writeFileSync(j.file,"{");j.fail([]);assert.equal(await j.poll(),"");assert.equal(j.attention().length,1);
 });
