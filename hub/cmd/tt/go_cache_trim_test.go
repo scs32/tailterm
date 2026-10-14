@@ -56,6 +56,7 @@ func writeGoCacheReadme(t *testing.T, dir string) {
 
 func newGoTrimFixture(t *testing.T) *goTrimFixture {
 	t.Helper()
+	resetStateFaultGates(t)
 	root := t.TempDir()
 	if real, err := filepath.EvalSymlinks(root); err == nil {
 		root = real
@@ -893,6 +894,10 @@ func TestGoCacheTrimReceipt(t *testing.T) {
 	if err != nil || state.GoCacheTrim == nil || state.GoCacheTrim.FilesRemoved != 2 || state.GoCacheTrim.BytesFreed != 350 || state.GoCacheTrim.CacheBytesAfter != wantAfter || !state.GoCacheTrim.LastRunAt.Equal(f.now) {
 		t.Fatalf("state %+v: %v", state.GoCacheTrim, err)
 	}
+	// The sweep reads the low-space volume of the cache this run validated.
+	if state.GoCacheTrim.CacheDir != f.cache {
+		t.Fatalf("recorded cache directory %q, want %q", state.GoCacheTrim.CacheDir, f.cache)
+	}
 	// A skipped line also carries both counts, as zeros.
 	f.resolveErr = errors.New("no go")
 	f.now = f.now.Add(time.Hour)
@@ -902,6 +907,10 @@ func TestGoCacheTrimReceipt(t *testing.T) {
 	raw = trimJournalRaw(t)
 	if len(raw) != 3 || !strings.Contains(raw[2], `"filesRemoved":0`) || !strings.Contains(raw[2], `"cacheBytesAfter":0`) {
 		t.Fatalf("skipped line: %v", raw)
+	}
+	// A skipped attempt keeps the recorded cache directory.
+	if state, err := loadSweepState(); err != nil || state.GoCacheTrim.CacheDir != f.cache || !state.GoCacheTrim.LastAttemptAt.Equal(f.now) {
+		t.Fatalf("state after a skip %+v: %v", state.GoCacheTrim, err)
 	}
 	// The tt read path, as text and as JSON.
 	out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
@@ -1063,4 +1072,108 @@ func TestGoCacheTrimRelayWiring(t *testing.T) {
 	if line := lastTrimLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 1 || line.FreeBytesAfter <= 0 {
 		t.Fatalf("line %+v", line)
 	}
+}
+
+// a9 (k7): a state file the trim cannot read, or cannot save, is journalled
+// once per episode and tried every five minutes, not at every relay check;
+// the cache is not resolved or touched meanwhile.
+func TestGoCacheTrimStateFaultSpacing(t *testing.T) {
+	failedState := func(t *testing.T) int {
+		n := 0
+		for _, line := range trimLines(t) {
+			if line.Outcome == "failed" && line.Reason == "state" {
+				n++
+			}
+		}
+		return n
+	}
+	// checks runs the relay's 30 s checks over 20 minutes of injected time.
+	checks := func(f *goTrimFixture) (attempts int) {
+		for i := 0; i < 40; i++ {
+			if f.attempt() {
+				attempts++
+			}
+			f.now = f.now.Add(sweepCheckInterval)
+		}
+		return attempts
+	}
+	day := 30 * 24 * time.Hour
+	t.Run("unreadable", func(t *testing.T) {
+		f := newGoTrimFixture(t)
+		old := f.entry("aa/old-a", 100, day)
+		writeFixtureFile(t, sweepStatePath(), "{not json")
+		if got := checks(f); got != 1 || failedState(t) != 1 || len(trimLines(t)) != 1 || f.resolves != 0 {
+			t.Fatalf("corrupt state: %d attempts, %d lines, %d resolves", got, len(trimLines(t)), f.resolves)
+		}
+		if line := lastTrimLine(t); !strings.Contains(line.Detail, "not readable JSON") || line.FilesRemoved == nil || *line.FilesRemoved != 0 {
+			t.Fatalf("line %+v", line)
+		}
+		requireExists(t, old, true)
+		// Repaired: the next try trims.
+		if err := os.Remove(sweepStatePath()); err != nil {
+			t.Fatal(err)
+		}
+		f.now = f.now.Add(sweepRetryAfter)
+		if !f.attempt() || f.resolves != 1 || lastTrimLine(t).Outcome != "trimmed" {
+			t.Fatalf("after the repair: %d resolves, %+v", f.resolves, lastTrimLine(t))
+		}
+		requireExists(t, old, false)
+		// Corrupt again: a new episode and one new line.
+		writeFixtureFile(t, sweepStatePath(), "{not json")
+		if got := checks(f); got != 1 || failedState(t) != 2 || len(trimLines(t)) != 3 || f.resolves != 1 {
+			t.Fatalf("corrupt again: %d attempts, %d lines, %d resolves", got, len(trimLines(t)), f.resolves)
+		}
+	})
+	t.Run("unsaveable", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root writes to a read-only directory")
+		}
+		f := newGoTrimFixture(t)
+		if !f.attempt() || f.resolves != 1 {
+			t.Fatalf("first attempt: %d resolves", f.resolves)
+		}
+		old := f.entry("aa/old-a", 100, day)
+		// From here the state file reads but cannot be replaced.
+		if err := os.Chmod(f.relayState(), 0500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(f.relayState(), 0700) })
+		f.now = f.now.Add(time.Hour)
+		if got := checks(f); got != 1 || failedState(t) != 1 || len(trimLines(t)) != 2 || f.resolves != 1 {
+			t.Fatalf("unsaveable state: %d attempts, lines %+v, %d resolves", got, trimLines(t), f.resolves)
+		}
+		// Nothing is trimmed from a state that cannot record the attempt.
+		requireExists(t, old, true)
+		if err := os.Chmod(f.relayState(), 0700); err != nil {
+			t.Fatal(err)
+		}
+		f.now = f.now.Add(sweepRetryAfter)
+		if !f.attempt() || f.resolves != 2 || lastTrimLine(t).Outcome != "trimmed" {
+			t.Fatalf("after the repair: %d resolves, %+v", f.resolves, lastTrimLine(t))
+		}
+		requireExists(t, old, false)
+		if state, err := loadSweepState(); err != nil || !state.GoCacheTrim.LastRunAt.Equal(f.now) {
+			t.Fatalf("state %+v: %v", state.GoCacheTrim, err)
+		}
+	})
+	// The two ticks keep separate episodes over the one state file: each
+	// journals its own line once.
+	t.Run("the sweep and the trim each journal once", func(t *testing.T) {
+		f := newGoTrimFixture(t)
+		writeFixtureFile(t, sweepStatePath(), "{not json")
+		sweep := sweepScheduleDeps{
+			now:      func() time.Time { return f.now },
+			settings: func() (sweepSettings, string) { return defaultSweepSettings(), "" },
+			hub:      func() (*api.Client, string, bool) { t.Error("the sweep reached the hub"); return nil, "", false },
+		}
+		for i := 0; i < 40; i++ {
+			f.attempt()
+			sweepScheduleAttempt(context.Background(), sweep)
+			f.now = f.now.Add(sweepCheckInterval)
+		}
+		lines, err := readSweepJournal(1000)
+		if err != nil || len(lines) != 2 || lines[0].Source != goCacheTrimSource || lines[1].Source != "schedule" || lines[0].Reason != "state" || lines[1].Reason != "state" {
+			t.Fatalf("lines %+v: %v", lines, err)
+		}
+	})
 }

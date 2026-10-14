@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -169,8 +171,9 @@ type sweepNotice struct {
 
 // sweepState is worktree-sweep-state.json in the relay's state directory.
 type sweepState struct {
-	// LastRunAt is the last swept run; LastAttemptAt also counts skipped and
-	// failed attempts.
+	// LastRunAt is the last run that counts for the interval: a swept run, or
+	// one in which every repository failed. LastAttemptAt also counts skipped
+	// and other failed attempts.
 	LastRunAt     time.Time `json:"lastRunAt"`
 	LastAttemptAt time.Time `json:"lastAttemptAt"`
 	// OffSince is set while the owner's switch is off, so the switch is
@@ -271,13 +274,62 @@ func sweepDue(state sweepState, interval time.Duration, now time.Time) bool {
 	return true
 }
 
+// stateFaultGate spaces and journals a state file that cannot be read or
+// saved: one journal line per episode, and one try per sweepRetryAfter while
+// it lasts. It lives in the relay's memory, since the fault is the state
+// directory itself; a relay restart during a fault writes one more line.
+type stateFaultGate struct {
+	mu sync.Mutex
+	// kind is "read" or "save" while a fault is open.
+	kind    string
+	lastTry time.Time
+}
+
+// The scheduled sweep and the Go build cache trim each keep their own.
+var sweepStateFaults, goCacheTrimStateFaults stateFaultGate
+
+const (
+	stateFaultRead = "read"
+	stateFaultSave = "save"
+)
+
+// blocked reports whether an open fault was tried less than sweepRetryAfter
+// ago, so this check does nothing.
+func (g *stateFaultGate) blocked(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.kind != "" && !now.Before(g.lastTry) && now.Sub(g.lastTry) < sweepRetryAfter
+}
+
+// check notes the result of one state read or save. A failure opens or
+// extends the episode, and journal is true only for the episode's first. A
+// good save ends any episode; a good read ends only a read fault, since a
+// state file that reads may still not save.
+func (g *stateFaultGate) check(kind string, err error, now time.Time) (ok, journal bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err == nil {
+		if kind == stateFaultSave || g.kind == kind {
+			g.kind = ""
+		}
+		return true, false
+	}
+	journal = g.kind == ""
+	if journal {
+		g.kind = kind
+	}
+	g.lastTry = now
+	return false, journal
+}
+
 // The matrix lock, as the sweep reads it.
 //
 // scripts/verify-matrix-host-lock.mjs serialises every admission with a mutex
 // file, host.json.lock, taken by linking a private owner record into place.
 // The sweep takes the same mutex the same way for each delete, so a matrix
 // run cannot register on a path between the sweep's final check and its
-// removal. Go never reclaims a mutex and never writes host.json.
+// removal. A mutex left by a process that is gone is reclaimed under the
+// script's own protocol (reclaimMatrixMutex). Go never writes host.json.
 
 // Tests shorten these.
 var (
@@ -294,7 +346,40 @@ var (
 	// exclusiveAfterCheck runs under the mutex after the final check and
 	// before the removal or detach.
 	exclusiveAfterCheck func()
+	// matrixOwnerProbe reports whether a mutex owner's pid is alive and, when
+	// known, when that process started. Tests replace it, so none signals a
+	// real process.
+	matrixOwnerProbe = nativeMatrixOwnerProbe
 )
+
+// matrixOwnerStartMargin is how much later than its own record a live process
+// must have started before the record is taken to be another, dead process's.
+const matrixOwnerStartMargin = 5 * time.Second
+
+// parsePsLstart reads `ps -o lstart=` as printed in the C locale under
+// TZ=UTC, so no local time is read twice when the clocks go back.
+func parsePsLstart(text string) (time.Time, bool) {
+	started, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", strings.Join(strings.Fields(text), " "), time.UTC)
+	return started, err == nil
+}
+
+// nativeMatrixOwnerProbe: only "no such process" is gone, as the script's
+// pidGone; a start time that cannot be read is unknown.
+func nativeMatrixOwnerProbe(pid int) (alive bool, started time.Time, known bool) {
+	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		return false, time.Time{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
+	out, err := cmd.Output()
+	if err != nil {
+		return true, time.Time{}, false
+	}
+	started, known = parsePsLstart(string(out))
+	return true, started, known
+}
 
 // matrixSweepEntry is one holder or waiter's paths.
 type matrixSweepEntry struct {
@@ -474,6 +559,12 @@ type matrixExclusion struct {
 	exceeded    int
 	longestHold time.Duration
 	lastRelease time.Time
+	// busy counts the paths kept only because the mutex could not be taken,
+	// busyOwner names who held it, and reclaimed names each mutex this pass
+	// reclaimed.
+	busy      int
+	busyOwner string
+	reclaimed []string
 }
 
 // loadMatrixExclusion reads and validates this host's matrix lock file. An
@@ -531,10 +622,10 @@ func (m *matrixExclusion) paths() []string {
 	return matrixEntryPaths(m.entries)
 }
 
-// takeMatrixMutex is one attempt, as the script's linkOwner: the owner record
-// is written to a private file and linked into place. It returns the token,
-// or "" when another owner holds the mutex.
-func takeMatrixMutex(mutex string) (string, error) {
+// linkMatrixOwner is one attempt at the mutex or the reclaim guard, as the
+// script's linkOwner: the owner record is written to a private file and
+// linked into place. It returns the token, or "" when target exists.
+func linkMatrixOwner(target string) (string, error) {
 	token, err := randomHex(16)
 	if err != nil {
 		return "", err
@@ -543,7 +634,7 @@ func takeMatrixMutex(mutex string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	temp := fmt.Sprintf("%s.%d.%s.tmp", mutex, os.Getpid(), token)
+	temp := fmt.Sprintf("%s.%d.%s.tmp", target, os.Getpid(), token)
 	file, err := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return "", err
@@ -556,7 +647,7 @@ func takeMatrixMutex(mutex string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.Link(temp, mutex); err != nil {
+	if err := os.Link(temp, target); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return "", nil
 		}
@@ -565,7 +656,109 @@ func takeMatrixMutex(mutex string) (string, error) {
 	return token, nil
 }
 
-// releaseMatrixMutex unlinks the mutex only while it still holds this token.
+// takeMatrixMutex is one attempt. It returns the token, or "" when another
+// owner holds the mutex; it never reclaims.
+func takeMatrixMutex(mutex string) (string, error) { return linkMatrixOwner(mutex) }
+
+// matrixOwner is a mutex or guard owner record. The script identifies an
+// owner by a whole-number pid and a text token; any other record is never
+// reclaimed.
+type matrixOwner struct {
+	PID   int
+	Token string
+	At    time.Time
+	// HasAt is false when the record's time does not parse.
+	HasAt bool
+}
+
+// readMatrixOwner returns the owner of target, or false when the file is
+// absent, unreadable or does not identify one.
+func readMatrixOwner(target string) (matrixOwner, bool) {
+	var owner matrixOwner
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return owner, false
+	}
+	record, ok := jsonObject(data)
+	if !ok {
+		return owner, false
+	}
+	pid, ok := jsonInteger(record["pid"])
+	if !ok || pid <= 0 || pid > 1<<31-1 {
+		return owner, false
+	}
+	if owner.Token, ok = jsonText(record["token"]); !ok {
+		return owner, false
+	}
+	owner.PID = int(pid)
+	if at, ok := jsonText(record["at"]); ok {
+		if parsed, err := time.Parse(time.RFC3339Nano, at); err == nil {
+			owner.At, owner.HasAt = parsed, true
+		}
+	}
+	return owner, true
+}
+
+// matrixOwnerDead reports why an owner cannot be the process that wrote its
+// record, or "" when it may still be: its pid is gone (the script's rule), or
+// the process now holding that pid started more than matrixOwnerStartMargin
+// after the record was written. An unknown start time is alive.
+func matrixOwnerDead(owner matrixOwner) string {
+	alive, started, known := matrixOwnerProbe(owner.PID)
+	if !alive {
+		return fmt.Sprintf("pid %d is gone", owner.PID)
+	}
+	if known && owner.HasAt && started.After(owner.At.Add(matrixOwnerStartMargin)) {
+		return fmt.Sprintf("pid %d now belongs to a process started after the record was written", owner.PID)
+	}
+	return ""
+}
+
+// reclaimMatrixMutex removes a mutex whose owner is dead, as the script's
+// reclaimMutex: only the holder of the guard file removes it, and only after
+// re-reading the same token under the guard, so two reclaimers cannot both
+// win and a mutex taken meanwhile is never removed. A guard whose own owner
+// is gone is left for the operator. It returns a note on a reclaim, or who
+// holds the mutex.
+func reclaimMatrixMutex(mutex string) (reclaimed, holder string) {
+	owner, ok := readMatrixOwner(mutex)
+	if !ok {
+		if _, err := os.Lstat(mutex); errors.Is(err, fs.ErrNotExist) {
+			// Released meanwhile: the next take decides.
+			return "", ""
+		}
+		return "", "an owner record that names no owner"
+	}
+	holder = fmt.Sprintf("owner pid %d", owner.PID)
+	why := matrixOwnerDead(owner)
+	if why == "" {
+		return "", holder
+	}
+	guard := mutex + ".reclaim"
+	token, err := linkMatrixOwner(guard)
+	if err != nil {
+		return "", holder + ", reclaim guard: " + err.Error()
+	}
+	if token == "" {
+		if left, ok := readMatrixOwner(guard); ok {
+			if alive, _, _ := matrixOwnerProbe(left.PID); !alive {
+				return "", fmt.Sprintf("reclaim guard left by pid %d", left.PID)
+			}
+		}
+		return "", holder + ", reclaim in progress"
+	}
+	defer releaseMatrixMutex(guard, token)
+	if again, ok := readMatrixOwner(mutex); !ok || again.Token != owner.Token {
+		return "", holder
+	}
+	if err := os.Remove(mutex); err != nil {
+		return "", holder + ": " + err.Error()
+	}
+	return fmt.Sprintf("reclaimed the matrix mutex left by pid %d (%s)", owner.PID, why), ""
+}
+
+// releaseMatrixMutex unlinks the mutex, or the guard, only while it still
+// holds this token.
 func releaseMatrixMutex(mutex, token string) {
 	data, err := os.ReadFile(mutex)
 	if err != nil {
@@ -583,7 +776,8 @@ func releaseMatrixMutex(mutex, token string) {
 // paths its entries name now; act makes its final check and removes or
 // detaches. It returns a keep reason, without calling act, when the mutex
 // stays busy or the file can no longer be trusted, which also ends the pass;
-// otherwise "" and a note when act outran the hold.
+// otherwise "" and a note when act outran the hold. A busy mutex whose owner
+// is dead is reclaimed, at most once a call.
 // The mutex is released on every path, and at matrixHoldRelease even when act
 // is still running: that removal then finishes outside the mutex and is
 // counted in exceeded.
@@ -598,22 +792,47 @@ func (m *matrixExclusion) run(act func(live []string)) (string, string) {
 		time.Sleep(wait)
 	}
 	mutex := m.file + ".lock"
-	if err := os.MkdirAll(filepath.Dir(m.file), 0700); err != nil {
-		return keepInUse, "matrix lock busy: " + err.Error()
+	busy := func(holder string) (string, string) {
+		m.mu.Lock()
+		m.busy++
+		if holder != "" {
+			m.busyOwner = holder
+		}
+		m.mu.Unlock()
+		if holder == "" {
+			return keepInUse, "matrix lock busy"
+		}
+		return keepInUse, "matrix lock busy (" + holder + ")"
 	}
-	token := ""
+	if err := os.MkdirAll(filepath.Dir(m.file), 0700); err != nil {
+		return busy(err.Error())
+	}
+	token, holder, tried := "", "", false
 	for deadline := time.Now().Add(matrixMutexWait); ; {
 		var err error
 		if token, err = takeMatrixMutex(mutex); err != nil {
-			return keepInUse, "matrix lock busy: " + err.Error()
+			return busy(err.Error())
 		}
-		if token != "" || !time.Now().Before(deadline) {
+		if token != "" {
+			break
+		}
+		if !tried {
+			tried = true
+			var reclaimed string
+			if reclaimed, holder = reclaimMatrixMutex(mutex); reclaimed != "" {
+				m.mu.Lock()
+				m.reclaimed = append(m.reclaimed, reclaimed)
+				m.mu.Unlock()
+				continue
+			}
+		}
+		if !time.Now().Before(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if token == "" {
-		return keepInUse, "matrix lock busy"
+		return busy(holder)
 	}
 	start := time.Now()
 	var once sync.Once
@@ -656,6 +875,14 @@ func (m *matrixExclusion) status() (string, int, time.Duration) {
 	return m.broken, m.exceeded, m.longestHold
 }
 
+// mutexStatus reports how many paths were kept only because the mutex was
+// busy, who held it, and the mutexes this pass reclaimed.
+func (m *matrixExclusion) mutexStatus() (int, string, []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.busy, m.busyOwner, append([]string(nil), m.reclaimed...)
+}
+
 // The journal.
 
 // sweepJournalLine is one attempt in worktree-sweep.jsonl.
@@ -665,14 +892,19 @@ type sweepJournalLine struct {
 	Outcome string `json:"outcome"`
 	Reason  string `json:"reason"`
 	// Detail explains a skip or failure.
-	Detail            string         `json:"detail,omitempty"`
-	Repositories      int            `json:"repositories"`
-	TreesRemoved      int            `json:"treesRemoved"`
-	FoldersRemoved    int            `json:"foldersRemoved"`
-	CachesTrimmed     int            `json:"cachesTrimmed"`
-	Pruned            int            `json:"pruned"`
-	BytesFreed        int64          `json:"bytesFreed"`
-	FreeBytesAfter    int64          `json:"freeBytesAfter"`
+	Detail       string `json:"detail,omitempty"`
+	Repositories int    `json:"repositories"`
+	// RepositoriesFailed counts the repositories whose sweep returned an
+	// error; Detail names them.
+	RepositoriesFailed int   `json:"repositoriesFailed,omitempty"`
+	TreesRemoved       int   `json:"treesRemoved"`
+	FoldersRemoved     int   `json:"foldersRemoved"`
+	CachesTrimmed      int   `json:"cachesTrimmed"`
+	Pruned             int   `json:"pruned"`
+	BytesFreed         int64 `json:"bytesFreed"`
+	FreeBytesAfter     int64 `json:"freeBytesAfter"`
+	// LowestVolume is the path whose volume gave FreeBytesAfter.
+	LowestVolume      string         `json:"lowestVolume,omitempty"`
 	Kept              map[string]int `json:"kept"`
 	MinIdle           string         `json:"minIdle"`
 	DurationMs        int64          `json:"durationMs"`
@@ -691,6 +923,19 @@ type sweepJournalLine struct {
 
 func sweepJournalPath() string { return filepath.Join(relayDir(), "worktree-sweep.jsonl") }
 
+// The journal is bounded by size: an append that leaves it over
+// sweepJournalMaxBytes rewrites it to the whole lines of its newest
+// sweepJournalKeepBytes.
+const (
+	sweepJournalMaxBytes  = 4 << 20
+	sweepJournalKeepBytes = 1 << 20
+	sweepJournalChunk     = 64 << 10
+)
+
+// appendSweepJournal adds one line and keeps the file within its bound. The
+// append and the rewrite run under one lock file, so no writer's line is lost
+// to another's rewrite. When the lock cannot be opened the line is still
+// appended, and the file is left untrimmed.
 func appendSweepJournal(line sweepJournalLine) error {
 	if err := os.MkdirAll(relayDir(), 0700); err != nil {
 		return err
@@ -702,6 +947,14 @@ func appendSweepJournal(line sweepJournalLine) error {
 	if err != nil {
 		return err
 	}
+	locked := false
+	if lock, err := os.OpenFile(sweepJournalPath()+".lock", os.O_CREATE|os.O_RDWR, 0600); err == nil {
+		defer lock.Close()
+		if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX) == nil {
+			locked = true
+			defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		}
+	}
 	file, err := os.OpenFile(sweepJournalPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
@@ -710,29 +963,124 @@ func appendSweepJournal(line sweepJournalLine) error {
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}
+	if err == nil && locked {
+		if trimErr := trimSweepJournal(); trimErr != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] worktree sweep journal trim: %v\n", trimErr)
+		}
+	}
 	return err
+}
+
+// trimSweepJournal rewrites a journal over its bound to its newest whole
+// lines, through a private file renamed into place. Its caller holds the
+// journal lock.
+func trimSweepJournal() error {
+	path := sweepJournalPath()
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Size() <= sweepJournalMaxBytes {
+		return err
+	}
+	tail := make([]byte, sweepJournalKeepBytes)
+	if _, err := file.ReadAt(tail, info.Size()-sweepJournalKeepBytes); err != nil {
+		return err
+	}
+	// The first line is cut short. A single line over the whole keep size
+	// is dropped.
+	cut := bytes.IndexByte(tail, '\n')
+	if cut < 0 {
+		cut = len(tail) - 1
+	}
+	tail = tail[cut+1:]
+	temp, err := os.CreateTemp(filepath.Dir(path), ".worktree-sweep-journal-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temp.Name())
+	_, err = temp.Write(tail)
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(temp.Name(), path)
 }
 
 // readSweepJournal returns the last limit lines, oldest first.
 func readSweepJournal(limit int) ([]sweepJournalLine, error) {
-	data, err := os.ReadFile(sweepJournalPath())
+	file, err := os.Open(sweepJournalPath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return []sweepJournalLine{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	lines := []sweepJournalLine{}
-	for _, raw := range bytes.Split(data, []byte("\n")) {
-		if len(bytes.TrimSpace(raw)) == 0 {
-			continue
-		}
-		var line sweepJournalLine
-		if json.Unmarshal(raw, &line) != nil {
-			continue
-		}
-		lines = append(lines, line)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
 	}
+	return readSweepJournalTail(file, info.Size(), limit)
+}
+
+// readSweepJournalTail reads backwards from the end in chunks until it holds
+// limit readable lines or reaches the start. It reads at most the journal's
+// bound and one chunk, whatever the file's size.
+func readSweepJournalTail(file io.ReaderAt, size int64, limit int) ([]sweepJournalLine, error) {
+	parse := func(data []byte) []sweepJournalLine {
+		lines := []sweepJournalLine{}
+		for _, raw := range bytes.Split(data, []byte("\n")) {
+			if len(bytes.TrimSpace(raw)) == 0 {
+				continue
+			}
+			var line sweepJournalLine
+			if json.Unmarshal(raw, &line) != nil {
+				continue
+			}
+			lines = append(lines, line)
+		}
+		return lines
+	}
+	var tail []byte
+	// whole is the tail from its first whole line.
+	whole := func(offset int64) []byte {
+		if offset > 0 {
+			return tail[bytes.IndexByte(tail, '\n')+1:]
+		}
+		return tail
+	}
+	offset := size
+	// want is the line ends to hold before the tail is parsed again.
+	for want := limit; offset > 0 && len(tail) < sweepJournalMaxBytes; {
+		n := int64(sweepJournalChunk)
+		if n > offset {
+			n = offset
+		}
+		offset -= n
+		chunk := make([]byte, n)
+		if _, err := file.ReadAt(chunk, offset); err != nil && !(errors.Is(err, io.EOF) && offset+n >= size) {
+			return nil, err
+		}
+		tail = append(chunk, tail...)
+		ends := bytes.Count(whole(offset), []byte("\n"))
+		if ends < want {
+			continue
+		}
+		readable := len(parse(whole(offset)))
+		if readable >= limit {
+			break
+		}
+		want = ends + limit - readable
+	}
+	lines := parse(whole(offset))
 	if len(lines) > limit {
 		lines = lines[len(lines)-limit:]
 	}
@@ -780,6 +1128,9 @@ func printSweepJournal(limit int, jsonOut bool) error {
 			free = humanBytes(l.FreeBytesAfter)
 		}
 		text := fmt.Sprintf("%s swept repositories=%d trees=%d folders=%d caches=%d pruned=%d freed=%s free=%s min-idle=%s", l.At, l.Repositories, l.TreesRemoved, l.FoldersRemoved, l.CachesTrimmed, l.Pruned, humanBytes(l.BytesFreed), free, l.MinIdle)
+		if l.Detail != "" {
+			text += "; " + l.Detail
+		}
 		if len(reasons) > 0 {
 			text += "; kept " + strings.Join(reasons, " ")
 		}
@@ -946,8 +1297,18 @@ func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, th
 	if task == "" {
 		return sweepNotice{}, false
 	}
-	text := fmt.Sprintf("Host %s has %s free after the scheduled worktree sweep, below the %s threshold. This run freed %s: %d worktrees, %d session temp folders, %d caches trimmed.",
-		host, humanBytes(line.FreeBytesAfter), humanBytes(threshold), humanBytes(line.BytesFreed), line.TreesRemoved, line.FoldersRemoved, line.CachesTrimmed)
+	volume := ""
+	if line.LowestVolume != "" {
+		volume = " on the volume holding " + line.LowestVolume
+	}
+	text := fmt.Sprintf("Host %s has %s free%s after the scheduled worktree sweep, below the %s threshold. This run freed %s: %d worktrees, %d session temp folders, %d caches trimmed.",
+		host, humanBytes(line.FreeBytesAfter), volume, humanBytes(threshold), humanBytes(line.BytesFreed), line.TreesRemoved, line.FoldersRemoved, line.CachesTrimmed)
+	if line.RepositoriesFailed > 0 {
+		text += fmt.Sprintf(" %d of %d repositories could not be swept and were skipped.", line.RepositoriesFailed, line.Repositories)
+	}
+	if line.Outcome == "skipped" || line.Reason == sweepSkipMatrix {
+		text += " The run was cut short by the matrix lock."
+	}
 	if len(kept) > 0 {
 		parts := make([]string, 0, len(kept))
 		for _, k := range kept {
@@ -988,11 +1349,34 @@ func deliverSweepNotice(ctx context.Context, c *api.Client, n sweepNotice) (int6
 	return matches(found)
 }
 
+// sweepFailedRepositories is the journal's account of the repositories whose
+// sweep failed: the first three with their reasons, then a count.
+func sweepFailedRepositories(failed []string) string {
+	if len(failed) == 0 {
+		return ""
+	}
+	shown := failed
+	if len(shown) > 3 {
+		shown = shown[:3]
+	}
+	text := fmt.Sprintf("%d repositories failed and were skipped: %s", len(failed), strings.Join(shown, "; "))
+	if len(failed) == 1 {
+		text = "1 repository failed and was skipped: " + shown[0]
+	}
+	if more := len(failed) - len(shown); more > 0 {
+		text += fmt.Sprintf("; and %d more", more)
+	}
+	return text
+}
+
 // sweepScheduleAttempt runs one scheduled sweep when it is due. It reports
 // whether it made an attempt, which is exactly when it wrote a journal line.
 func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	now := d.now()
 	started := time.Now()
+	if sweepStateFaults.blocked(now) {
+		return false
+	}
 	settings, fault := d.settings()
 	line := sweepJournalLine{At: now.UTC().Format(time.RFC3339Nano), Source: "schedule", Kept: map[string]int{}, MinIdle: settings.MinIdle.String(), FreeBytesAfter: -1}
 	write := func(outcome, reason, detail string) {
@@ -1002,37 +1386,67 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 			fmt.Fprintf(os.Stderr, "[tt relay] worktree sweep journal: %v\n", err)
 		}
 	}
+	// stateFault journals a state read or save that failed, once per episode.
+	// It reports whether the state is good, and whether a line was written.
+	stateFault := func(kind string, err error, detail string) (ok, wrote bool) {
+		ok, journal := sweepStateFaults.check(kind, err, now)
+		if journal {
+			if detail != "" {
+				detail += "; "
+			}
+			write("failed", "state", detail+err.Error())
+		}
+		return ok, journal
+	}
 	state, err := loadSweepState()
-	if err != nil {
-		write("failed", "state", err.Error())
-		return true
+	if ok, wrote := stateFault(stateFaultRead, err, ""); !ok {
+		return wrote
 	}
 	if fault == "" && settings.Off {
 		if state.OffSince != nil {
 			return false
 		}
 		// The switch is journalled once, not at every check.
-		_ = updateSweepState(func(s *sweepState) error {
+		err := updateSweepState(func(s *sweepState) error {
 			at := now.UTC()
 			s.OffSince = &at
 			return nil
 		})
+		if ok, wrote := stateFault(stateFaultSave, err, "the off switch was not recorded"); !ok {
+			return wrote
+		}
 		write("skipped", sweepSkipOff, "")
 		return true
+	}
+	if fault == "" && state.OffSince != nil {
+		// On again: the next off is a new transition, due or not.
+		err := updateSweepState(func(s *sweepState) error {
+			s.OffSince = nil
+			return nil
+		})
+		if ok, wrote := stateFault(stateFaultSave, err, "the on switch was not recorded"); !ok {
+			return wrote
+		}
+		state.OffSince = nil
 	}
 	if !sweepDue(state, settings.Interval, now) {
 		return false
 	}
-	attempted := func() {
-		_ = updateSweepState(func(s *sweepState) error {
+	// attempted saves the attempt time and writes the line; a save that fails
+	// is journalled in its place, once per episode.
+	attempted := func(outcome, reason, detail string) bool {
+		err := updateSweepState(func(s *sweepState) error {
 			s.LastAttemptAt, s.OffSince = now.UTC(), nil
 			return nil
 		})
+		if ok, wrote := stateFault(stateFaultSave, err, strings.TrimSuffix(outcome+" "+reason+": "+detail, ": ")); !ok {
+			return wrote
+		}
+		write(outcome, reason, detail)
+		return true
 	}
 	if fault != "" {
-		attempted()
-		write("skipped", sweepSkipSettings, fault)
-		return true
+		return attempted("skipped", sweepSkipSettings, fault)
 	}
 	c, host, ok := d.hub()
 	if !ok {
@@ -1040,37 +1454,44 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	}
 	lock, err := worktreeCleanupLock()
 	if err != nil {
-		attempted()
 		if errors.Is(err, errWorktreeCleanupActive) {
-			write("skipped", sweepSkipCleanup, "")
-		} else {
-			write("failed", "lock", err.Error())
+			return attempted("skipped", sweepSkipCleanup, "")
 		}
-		return true
+		return attempted("failed", "lock", err.Error())
 	}
 	defer unlockQueueLaunch(lock)
 	matrix, why := loadMatrixExclusion()
 	if matrix == nil {
-		attempted()
-		write("skipped", sweepSkipMatrix, why)
-		return true
+		return attempted("skipped", sweepSkipMatrix, why)
 	}
 	hub, err := readSweepHub(ctx, c)
 	if err != nil {
-		attempted()
-		write("skipped", sweepSkipHub, err.Error())
-		return true
+		return attempted("skipped", sweepSkipHub, err.Error())
 	}
 	repos := sweepRepositories(host, hub.entries)
 	line.Repositories = len(repos)
 	var all []worktreeDecision
-	failure := ""
+	var failed []string
 	for _, repo := range repos {
 		decisions, err := d.sweep(ctx, hub, host, sweepOptions{Repo: repo, Apply: true, MinIdle: settings.MinIdle, AcceptedAfter: artifactAcceptedAfter(), Now: now, Matrix: matrix})
-		if err != nil && failure == "" {
-			failure = repo + ": " + err.Error()
+		if err != nil {
+			// One repository's failure is journalled and skipped; the others
+			// still count.
+			reason := err.Error()
+			if len(reason) > 200 {
+				reason = strings.ToValidUTF8(reason[:200], "") + "..."
+			}
+			failed = append(failed, repo+": "+reason)
 		}
 		all = append(all, decisions...)
+	}
+	line.RepositoriesFailed = len(failed)
+	// The volumes read for low space: each repository and its artifacts root,
+	// every cache the sweep decided on, and the Go build cache the trim last
+	// validated. The lowest reading is the run's.
+	var volumes []string
+	for _, repo := range repos {
+		volumes = append(volumes, repo, artifactsRootFor(repo))
 	}
 	for _, dec := range all {
 		switch dec.Action {
@@ -1089,31 +1510,54 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 		case "kept":
 			line.Kept[dec.Reason]++
 		}
+		if dec.Kind == kindCache {
+			volumes = append(volumes, dec.Path)
+		}
+	}
+	if trim := state.GoCacheTrim; trim != nil && filepath.IsAbs(trim.CacheDir) {
+		if info, err := os.Stat(trim.CacheDir); err == nil && info.IsDir() {
+			volumes = append(volumes, trim.CacheDir)
+		}
+	}
+	for _, path := range volumes {
+		if path == "" {
+			continue
+		}
+		if free, err := d.freeBytes(path); err == nil && (line.FreeBytesAfter < 0 || free < line.FreeBytesAfter) {
+			line.FreeBytesAfter, line.LowestVolume = free, path
+		}
 	}
 	broken, exceeded, _ := matrix.status()
+	busy, busyOwner, reclaimed := matrix.mutexStatus()
 	line.ExclusionExceeded = exceeded
-	for _, repo := range repos {
-		for _, path := range []string{repo, artifactsRootFor(repo)} {
-			if path == "" {
-				continue
-			}
-			if free, err := d.freeBytes(path); err == nil && (line.FreeBytesAfter < 0 || free < line.FreeBytesAfter) {
-				line.FreeBytesAfter = free
-			}
+	// The outcome. Only a run that swept, or in which every repository
+	// failed, counts as a run for the interval; a run cut short by the matrix
+	// lock is tried again after sweepRetryAfter.
+	outcome, reason, countsAsRun := "swept", "", true
+	var notes []string
+	switch {
+	case broken != "":
+		outcome, reason, countsAsRun = "failed", sweepSkipMatrix, false
+		notes = append(notes, broken)
+	case busy > 0:
+		outcome, reason, countsAsRun = "skipped", sweepSkipMatrix, false
+		if busyOwner == "" {
+			busyOwner = "owner unknown"
 		}
+		notes = append(notes, fmt.Sprintf("%d path(s) kept: matrix mutex busy (%s)", busy, busyOwner))
+	case len(failed) > 0 && len(failed) == len(repos):
+		outcome, reason = "failed", "sweep"
 	}
-	if failure != "" || broken != "" {
-		attempted()
-		if broken != "" {
-			write("failed", sweepSkipMatrix, broken)
-		} else {
-			write("failed", "sweep", failure)
-		}
-		return true
+	if text := sweepFailedRepositories(failed); text != "" {
+		notes = append(notes, text)
 	}
-	// A swept run. An episode begins at the first one that ends below the
-	// threshold and ends at the first one at or above it; its notice is
-	// frozen and saved before anything is posted.
+	notes = append(notes, reclaimed...)
+	detail := strings.Join(notes, "; ")
+	line.Outcome, line.Reason = outcome, reason
+	// Every attempt that read the free space takes part in the low-space
+	// episode: it begins at the first one that ends below the threshold and
+	// ends at the first one at or above it. Its notice is frozen and saved
+	// before anything is posted.
 	line.LowSpace = line.FreeBytesAfter >= 0 && line.FreeBytesAfter < settings.LowSpaceBytes
 	var notice *sweepNotice
 	if line.LowSpace && state.Episode == nil {
@@ -1123,7 +1567,10 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	}
 	var pending []sweepNotice
 	err = updateSweepState(func(s *sweepState) error {
-		s.LastRunAt, s.LastAttemptAt, s.OffSince = now.UTC(), now.UTC(), nil
+		s.LastAttemptAt, s.OffSince = now.UTC(), nil
+		if countsAsRun {
+			s.LastRunAt = now.UTC()
+		}
 		switch {
 		case line.LowSpace && s.Episode == nil:
 			s.Episode = &sweepEpisode{StartedAt: now.UTC()}
@@ -1140,10 +1587,9 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 		pending = append([]sweepNotice(nil), s.PendingNotices...)
 		return nil
 	})
-	if err != nil {
-		// Nothing is posted from a state that was not saved.
-		write("failed", "state", err.Error())
-		return true
+	// Nothing is posted from a state that was not saved.
+	if ok, wrote := stateFault(stateFaultSave, err, strings.TrimSuffix(strings.TrimSpace(outcome+" "+reason)+": "+detail, ": ")); !ok {
+		return wrote
 	}
 	var waiting []string
 	for _, n := range pending {
@@ -1167,7 +1613,7 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 		}
 	}
 	line.NoticePending = strings.Join(waiting, ",")
-	write("swept", "", "")
+	write(outcome, reason, detail)
 	return true
 }
 

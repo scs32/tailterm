@@ -113,6 +113,9 @@ type goCacheTrimState struct {
 	BytesFreed      int64     `json:"bytesFreed"`
 	CacheBytesAfter int64     `json:"cacheBytesAfter"`
 	MaxAge          string    `json:"maxAge,omitempty"`
+	// CacheDir is the build cache the last trimmed run validated; the sweep
+	// reads its volume for the low-space notice.
+	CacheDir string `json:"cacheDir,omitempty"`
 }
 
 // goCacheTrimDue is sweepDue for the trim's own times.
@@ -494,6 +497,9 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	if fault == "" && !settings.On {
 		return false
 	}
+	if goCacheTrimStateFaults.blocked(now) {
+		return false
+	}
 	if err := os.MkdirAll(relayDir(), 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "[tt relay] go build cache trim: %v\n", err)
 		return false
@@ -520,25 +526,37 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 			fmt.Fprintf(os.Stderr, "[tt relay] go build cache trim journal: %v\n", err)
 		}
 	}
+	// stateFault journals a state read or save that failed, once per episode
+	// (see stateFaultGate). It reports whether the state is good, and whether
+	// a line was written.
+	stateFault := func(kind string, err error, detail string) (ok, wrote bool) {
+		ok, journal := goCacheTrimStateFaults.check(kind, err, now)
+		if journal {
+			write("failed", "state", strings.TrimPrefix(detail+"; "+err.Error(), "; "))
+		}
+		return ok, journal
+	}
 	state, err := loadSweepState()
-	if err != nil {
-		write("failed", "state", err.Error())
-		return true
+	if ok, wrote := stateFault(stateFaultRead, err, ""); !ok {
+		return wrote
 	}
 	if !goCacheTrimDue(state.GoCacheTrim, settings.Interval, now) {
 		return false
 	}
-	attempted := func() {
-		_ = updateSweepState(func(s *sweepState) error {
-			if s.GoCacheTrim == nil {
-				s.GoCacheTrim = &goCacheTrimState{}
-			}
-			s.GoCacheTrim.LastAttemptAt = now.UTC()
-			return nil
-		})
+	// The attempt time is saved before the cache is resolved or touched, so
+	// every outcome below is spaced, and a state file that cannot be saved
+	// stops the run here.
+	err = updateSweepState(func(s *sweepState) error {
+		if s.GoCacheTrim == nil {
+			s.GoCacheTrim = &goCacheTrimState{}
+		}
+		s.GoCacheTrim.LastAttemptAt = now.UTC()
+		return nil
+	})
+	if ok, wrote := stateFault(stateFaultSave, err, ""); !ok {
+		return wrote
 	}
 	skip := func(reason, detail string) bool {
-		attempted()
 		write("skipped", reason, detail)
 		return true
 	}
@@ -562,7 +580,6 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	res := trimGoBuildCache(ctx, cache, settings.MaxAge, now)
 	if res.WalkError != "" {
-		attempted()
 		write("failed", goCacheTrimFailWalk, res.WalkError)
 		return true
 	}
@@ -580,13 +597,13 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		notes = append(notes, fmt.Sprintf("%d removal error(s), first %s", res.Errors, res.FirstError))
 	}
 	detail := strings.Join(notes, "; ")
-	if err := updateSweepState(func(s *sweepState) error {
-		s.GoCacheTrim = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String()}
+	err = updateSweepState(func(s *sweepState) error {
+		s.GoCacheTrim = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(), CacheDir: dir}
 		return nil
-	}); err != nil {
-		// The entries are gone, so the line keeps its counts.
-		write("failed", "state", strings.TrimPrefix(detail+"; "+err.Error(), "; "))
-		return true
+	})
+	// The entries are gone, so the line it writes keeps its counts.
+	if ok, wrote := stateFault(stateFaultSave, err, detail); !ok {
+		return wrote
 	}
 	write("trimmed", "", detail)
 	return true
