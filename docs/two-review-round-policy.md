@@ -76,6 +76,10 @@ scope and assignment. Other criteria retain the reviewer pass/fail/partial gate.
 An item with verification-owned criteria needs that receipt even if older
 enrollment says verification was optional. Existing completed rounds and verdicts
 remain immutable; their owner-accept route is preserved without a third round.
+That owner-accept still needs the candidate's passing current receipt wherever
+verification is required, and a newly saved verification plan clears a saved
+`accept` or `owner-accept` until it is recorded again on the new receipt (see
+[An acceptance rests on the current receipt](objective-verification.md#an-acceptance-rests-on-the-current-receipt)).
 A revision-checked title/description update permits a new scope snapshot, but
 never another general review beyond two inside the same review stage. Follow-ups are native open work items
 with source-message provenance and a parent relationship in the review ledger;

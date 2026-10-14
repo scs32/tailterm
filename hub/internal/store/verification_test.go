@@ -656,8 +656,11 @@ func TestVerificationLegacyFailedReceiptImportsButBlocksCompletion(t *testing.T)
 
 // The legacy test above never puts a done save in front of a failed receipt
 // with an acceptance saved: its done saves stop at the missing acceptance.
-// Each route here saves an acceptance over a failed current receipt, so the
+// Each route here stands an acceptance over a failed current receipt, so the
 // done saves take the accepted candidate and must reach the failed check.
+// The store no longer lets either route save that state (bug
+// wi_6ef7f8a5d4f160c4), but a database written before the fix may still hold
+// it, so each setup checks the refusal and then writes that stored row.
 func TestVerificationDoneSavesRefuseFailedReceiptUnderSavedAcceptance(t *testing.T) {
 	const failed = "unlisted exhausted failure blocks completion"
 	disposition := func(f *convergenceFixture, kind, candidate string) error {
@@ -676,35 +679,69 @@ func TestVerificationDoneSavesRefuseFailedReceiptUnderSavedAcceptance(t *testing
 			t.Fatal("failed receipt refused", err)
 		}
 	}
+	// stored writes d as the current disposition, as a row saved before the
+	// fix holds it, adding it to the history when it is not already there.
+	stored := func(t *testing.T, f *convergenceFixture, d api.ReviewDisposition) {
+		t.Helper()
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		state, err := reviewState(f.ctx, tx, f.task.ID, f.item.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.Disposition = &d
+		if n := len(state.Dispositions); n == 0 || state.Dispositions[n-1] != d {
+			state.Dispositions = append(state.Dispositions, d)
+		}
+		if err = saveReviewState(f.ctx, tx, f.task.ID, state); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, route := range []struct {
 		name, kind string
 		build      func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan)
 	}{
 		{"owner-decision then owner-accept over a failed receipt", "owner-accept", func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan) {
 			failedReceipt(t, f, h, p, 0)
-			// Setup: this is how the state is reached today, not a claim
-			// that the store should allow an owner-accept over a failed
-			// receipt. If the store later refuses it, change this setup,
-			// not the assertions below.
 			if err := disposition(f, "owner-decision", p.Commit); err != nil {
 				t.Fatal("owner-decision refused", err)
 			}
-			if err := disposition(f, "owner-accept", p.Commit); err != nil {
-				t.Fatal("owner-accept refused", err)
+			// Setup: owner-accept over a failed receipt is refused now
+			// (policy #33145). Before that rule the store saved it, so
+			// write the owner-accept as such a database still holds it.
+			if err := disposition(f, "owner-accept", p.Commit); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), failed) {
+				t.Fatal("owner-accept over a failed receipt not refused", err)
 			}
+			notice, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "owner-accept saved before the receipt rule"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored(t, f, api.ReviewDisposition{Kind: "owner-accept", Candidate: p.Commit, MessageSeq: notice.Seq})
 		}},
 		{"accept on a passing receipt then a failed receipt on the same commit", "accept", func(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan) {
 			saveFixtureVerification(t, f, h, p, 0)
 			if err := disposition(f, "accept", p.Commit); err != nil {
 				t.Fatal("accept on a passing receipt refused", err)
 			}
-			// Setup: this is how the state is reached today, not a claim
-			// that the store should let a new plan and a failed receipt on
-			// the accepted commit leave the acceptance saved. If the store
-			// later refuses it, change this setup, not the assertions below.
+			// Setup: a new plan on the accepted commit now clears the
+			// acceptance and the history keeps it. Before that rule the
+			// accept stayed current, so restore it as such a database still
+			// holds it.
+			accepted := f.state(t).Disposition
 			again := p
 			again.OperationKey = "fixture-verification-again"
 			failedReceipt(t, f, h, again, 2)
+			state := f.state(t)
+			if state.Disposition != nil || len(state.Dispositions) != 1 || state.Dispositions[0] != *accepted {
+				t.Fatal("new plan did not clear the acceptance into history", state.Disposition, state.Dispositions)
+			}
+			stored(t, f, *accepted)
 		}},
 	} {
 		t.Run(route.name, func(t *testing.T) {
@@ -745,6 +782,202 @@ func TestVerificationDoneSavesRefuseFailedReceiptUnderSavedAcceptance(t *testing
 			refused("queue gate", err)
 			if item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID); err != nil || item.Status == "done" || item.Revision != 1 {
 				t.Fatal("refused completion changed the item", item, err)
+			}
+		})
+	}
+}
+
+// postFixtureDisposition posts an owner-authored review disposition for the
+// exact candidate.
+func postFixtureDisposition(f *convergenceFixture, kind, candidate string) error {
+	_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Body: api.EnvelopeBody{Text: kind}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: candidate}}, "", 0, api.Agent{})
+	return err
+}
+
+// saveFixturePlan saves plan p at generation g with no receipt.
+func saveFixturePlan(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan, g int64) {
+	t.Helper()
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-plan", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: g, Plan: &p}); err != nil {
+		t.Fatal("plan refused", err)
+	}
+}
+
+// saveFixtureReceipt saves a receipt for plan p at generation g, failing its
+// first check when failed is set.
+func saveFixtureReceipt(t *testing.T, f *convergenceFixture, h api.Agent, p api.VerificationPlan, g int64, failed bool) {
+	t.Helper()
+	r := passingVerification(p)
+	if failed {
+		r.Checks[0].ExitCode = 1
+		r.Checks[0].FailureReason = "exit"
+	}
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: g, Receipt: &r}); err != nil {
+		t.Fatal("receipt refused", err)
+	}
+}
+
+func refusedFor(t *testing.T, what, reason string, err error) {
+	t.Helper()
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), reason) {
+		t.Fatal(what, err)
+	}
+}
+
+// Policy #33145 (bug wi_6ef7f8a5d4f160c4): owner-accept resolving an
+// owner-decision needs the candidate's passing current receipt, as lead
+// accept and owner-accept over follow-ups do. A refusal leaves the
+// disposition and its history as they were.
+func TestVerificationOwnerAcceptOverOwnerDecisionNeedsPassingReceipt(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	request := f.review(t, p.Commit)
+	if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		state := f.state(t)
+		if state.Disposition == nil || state.Disposition.Kind != "owner-decision" || len(state.Dispositions) != 1 || state.Dispositions[0] != *state.Disposition {
+			t.Fatal("refused owner-accept changed the disposition "+when, state.Disposition, state.Dispositions)
+		}
+	}
+	saveFixturePlan(t, f, h, p, 0)
+	if err := postFixtureDisposition(f, "owner-decision", p.Commit); err != nil {
+		t.Fatal("owner-decision refused", err)
+	}
+	refusedFor(t, "owner-accept with no receipt", "passing receipt for current scope and exact accepted candidate required", postFixtureDisposition(f, "owner-accept", p.Commit))
+	unchanged("with no receipt")
+	saveFixtureReceipt(t, f, h, p, 1, true)
+	refusedFor(t, "owner-accept over a failed receipt", "unlisted exhausted failure blocks completion", postFixtureDisposition(f, "owner-accept", p.Commit))
+	unchanged("over a failed receipt")
+	// A new plan does not clear owner-decision; its passing receipt lets the
+	// owner resolve it.
+	again := p
+	again.OperationKey = "fixture-verification-again"
+	saveFixturePlan(t, f, h, again, 2)
+	unchanged("after a new plan")
+	saveFixtureReceipt(t, f, h, again, 3, false)
+	if err := postFixtureDisposition(f, "owner-accept", p.Commit); err != nil {
+		t.Fatal("owner-accept on a passing receipt refused", err)
+	}
+	if state := f.state(t); state.Disposition == nil || state.Disposition.Kind != "owner-accept" || state.Disposition.Candidate != p.Commit || len(state.Dispositions) != 2 {
+		t.Fatal("owner-accept not saved", state.Disposition, state.Dispositions)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, p.Commit); err != nil {
+		t.Fatal("queue gate refused an owner-accept on a passing receipt", err)
+	}
+}
+
+// Bug wi_6ef7f8a5d4f160c4: a new verification plan supersedes the receipt an
+// acceptance rested on, so it clears a standing accept or owner-accept. The
+// history keeps the cleared entry, and the acceptance is recorded again on the
+// new receipt. owner-decision and follow-ups are not acceptances and stay.
+func TestVerificationNewPlanSupersedesSavedAcceptance(t *testing.T) {
+	const failed = "unlisted exhausted failure blocks completion"
+	setup := func(t *testing.T) (*convergenceFixture, api.Agent, api.VerificationPlan) {
+		t.Helper()
+		f, h, p := verificationFixture(t)
+		request := f.review(t, p.Commit)
+		if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+		saveFixtureVerification(t, f, h, p, 0)
+		return f, h, p
+	}
+	plan := func(p api.VerificationPlan, key string) api.VerificationPlan {
+		p.OperationKey = key
+		return p
+	}
+	cleared := func(t *testing.T, f *convergenceFixture, history []api.ReviewDisposition) {
+		t.Helper()
+		state := f.state(t)
+		if state.Disposition != nil || !reflect.DeepEqual(state.Dispositions, history) {
+			t.Fatal("new plan did not clear the acceptance into unchanged history", state.Disposition, state.Dispositions, history)
+		}
+	}
+	done := "done"
+	t.Run("lead accept", func(t *testing.T) {
+		f, h, p := setup(t)
+		if err := postFixtureDisposition(f, "accept", p.Commit); err != nil {
+			t.Fatal("accept on a passing receipt refused", err)
+		}
+		history := f.state(t).Dispositions
+		if len(history) != 1 || history[0].Kind != "accept" || history[0].Candidate != p.Commit || history[0].MessageSeq == 0 {
+			t.Fatal("accept not saved", history)
+		}
+		second := plan(p, "fixture-verification-second")
+		saveFixturePlan(t, f, h, second, 2)
+		cleared(t, f, history)
+		_, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by)
+		refusedFor(t, "PATCH done after the acceptance was cleared", "passing receipt for current scope and exact accepted candidate required", err)
+		_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{RequestID: "keyed-done", ExpectedRevision: 1, Status: &done}, f.by)
+		refusedFor(t, "keyed done after the acceptance was cleared", "passing receipt for current scope and exact accepted candidate required", err)
+		tx, err := f.s.db.BeginTx(f.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = reviewCompletion(f.ctx, tx, f.item, p.Commit)
+		tx.Rollback()
+		refusedFor(t, "queue gate after the acceptance was cleared", "passing receipt for current scope and exact accepted candidate required", err)
+		saveFixtureReceipt(t, f, h, second, 3, true)
+		cleared(t, f, history)
+		refusedFor(t, "accept over a failed receipt", failed, postFixtureDisposition(f, "accept", p.Commit))
+		saveFixtureVerification(t, f, h, plan(p, "fixture-verification-third"), 4)
+		if err = postFixtureDisposition(f, "accept", p.Commit); err != nil {
+			t.Fatal("accept on the new passing receipt refused", err)
+		}
+		if state := f.state(t); state.Disposition == nil || state.Disposition.Kind != "accept" || len(state.Dispositions) != 2 || state.Dispositions[0] != history[0] {
+			t.Fatal("acceptance not recorded again", state.Disposition, state.Dispositions)
+		}
+		if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
+			t.Fatal("done on the recorded acceptance refused", err)
+		}
+	})
+	t.Run("owner-accept", func(t *testing.T) {
+		f, h, p := setup(t)
+		if err := postFixtureDisposition(f, "owner-decision", p.Commit); err != nil {
+			t.Fatal("owner-decision refused", err)
+		}
+		if err := postFixtureDisposition(f, "owner-accept", p.Commit); err != nil {
+			t.Fatal("owner-accept on a passing receipt refused", err)
+		}
+		history := f.state(t).Dispositions
+		if len(history) != 2 || history[1].Kind != "owner-accept" {
+			t.Fatal("owner-accept not saved", history)
+		}
+		second := plan(p, "fixture-verification-second")
+		saveFixturePlan(t, f, h, second, 2)
+		cleared(t, f, history)
+		refusedFor(t, "owner-accept with nothing to resolve", "owner-accept resolves an owner-decision or follow-ups disposition", postFixtureDisposition(f, "owner-accept", p.Commit))
+		saveFixtureReceipt(t, f, h, second, 3, false)
+		if err := postFixtureDisposition(f, "owner-decision", p.Commit); err != nil {
+			t.Fatal("owner-decision on the new receipt refused", err)
+		}
+		if err := postFixtureDisposition(f, "owner-accept", p.Commit); err != nil {
+			t.Fatal("owner-accept on the new passing receipt refused", err)
+		}
+		if state := f.state(t); state.Disposition == nil || state.Disposition.Kind != "owner-accept" || len(state.Dispositions) != 4 || !reflect.DeepEqual(state.Dispositions[:2], history) {
+			t.Fatal("acceptance not recorded again", state.Disposition, state.Dispositions)
+		}
+		if _, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by); err != nil {
+			t.Fatal("done on the recorded owner-accept refused", err)
+		}
+	})
+	for _, kind := range []string{"owner-decision", "follow-ups"} {
+		t.Run(kind+" stays", func(t *testing.T) {
+			f, h, p := setup(t)
+			if err := postFixtureDisposition(f, kind, p.Commit); err != nil {
+				t.Fatal(kind+" refused", err)
+			}
+			before := f.state(t)
+			saveFixturePlan(t, f, h, plan(p, "fixture-verification-second"), 2)
+			after := f.state(t)
+			if after.Disposition == nil || *after.Disposition != *before.Disposition || !reflect.DeepEqual(after.Dispositions, before.Dispositions) {
+				t.Fatal("new plan changed a disposition that is not an acceptance", before.Disposition, after.Disposition)
 			}
 		})
 	}

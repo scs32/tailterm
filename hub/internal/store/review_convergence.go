@@ -789,8 +789,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		// owner-accept is the owner's own resolution of an owner-decision or
 		// follow-ups disposition: it binds one exact candidate and never comes
-		// from an agent. Resolving follow-ups also requires the candidate's
-		// independent verification to be ready, as an ordinary accept does.
+		// from an agent. Resolving either kind also requires the candidate's
+		// independent verification to be ready, as an ordinary accept does
+		// (policy #33145): the owner judges criteria and scope, not a failed
+		// receipt.
 		ownerAccept := meta.Disposition == "owner-accept"
 		if ownerAccept {
 			if req.AgentID != "" || req.RunID != "" {
@@ -808,7 +810,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
 			return reviewConflict("owner-accept resolves an owner-decision or follow-ups disposition")
 		}
-		if ownerAccept && state.Disposition.Kind == "follow-ups" {
+		if ownerAccept {
 			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
 				return err
 			}

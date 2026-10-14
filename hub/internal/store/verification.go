@@ -530,6 +530,22 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		if err = validateVerificationPlan(ctx, tx, item, *req.Plan); err != nil {
 			return zero, err
 		}
+		// A new plan supersedes the receipt a standing acceptance rested on,
+		// so the acceptance cannot stand over it: it is cleared and must be
+		// recorded again on the new receipt (lead accept, or owner-decision
+		// then owner-accept). The disposition history keeps it. owner-decision
+		// and follow-ups are not acceptances and stay; the owner-accept that
+		// resolves them reads the new receipt. A retry returned above.
+		state, e := reviewState(ctx, tx, task, itemID)
+		if e != nil {
+			return zero, e
+		}
+		if state.Disposition != nil && (state.Disposition.Kind == "accept" || state.Disposition.Kind == "owner-accept") {
+			state.Disposition = nil
+			if err = saveReviewState(ctx, tx, task, state); err != nil {
+				return zero, err
+			}
+		}
 	} else {
 		kind = "receipt"
 		p, r := currentVerification(records)

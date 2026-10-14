@@ -348,6 +348,34 @@ Enrolled unknown review history cannot bypass the receipt requirement. Existing
 saved historical completion remains readable. This changes completion after new admission;
 it does not certify historical records or deploy a hub/CLI.
 
+## An acceptance rests on the current receipt
+
+Bug `wi_6ef7f8a5d4f160c4`, order #34700, policy answer #33145. A saved
+acceptance cannot stand over a failed or superseded receipt:
+
+- `owner-accept` resolving an `owner-decision` or a `follow-ups` disposition
+  needs the candidate's passing current receipt wherever verification is
+  required, as a lead `accept` does. The owner judges criteria and scope
+  questions; there is no override of a failed receipt. A refused
+  `owner-accept` leaves the disposition and its history unchanged.
+- Saving a new verification plan clears a standing `accept` or `owner-accept`,
+  because the plan supersedes the receipt the acceptance rested on. The
+  disposition history keeps the cleared entry unchanged. The acceptance is
+  recorded again on the new receipt: a lead `accept`, or a lead
+  `owner-decision` followed by the owner's `owner-accept`. Until then the done
+  saves report that a passing receipt for the exact accepted candidate is
+  required. `owner-decision` and `follow-ups` are not acceptances and stay;
+  the `owner-accept` that resolves them reads the new receipt. A same-commit
+  re-verification after acceptance, such as a retried matrix, therefore needs
+  a fresh acceptance.
+- The done saves and the queue gate are unchanged. They still refuse a failed
+  current receipt, including under an acceptance row saved before this rule.
+
+This fits the re-binding of an acceptance to a verified correction
+(`wi_c7a7b97e72fc151b`): the cleared acceptance stays in the disposition
+history, where that re-bind can read it and bind it to the correction's
+passing receipt.
+
 ## Integrated plans keep accepted checks
 
 An integrated plan never runs less than the accepted plan. A superset is
