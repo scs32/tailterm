@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -27,6 +28,7 @@ type escalationFixture struct {
 	task                  api.Task
 	lead, builder, worker api.Agent
 	c, clock              time.Time
+	path                  string
 }
 
 // newEscalationFixture opens one store per test with a first project;
@@ -35,7 +37,8 @@ func newEscalationFixture(t *testing.T) *escalationFixture {
 	t.Helper()
 	f := &escalationFixture{ctx: context.Background(), by: api.Caller{Node: "test", User: "owner"}}
 	f.c = time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
-	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	f.path = filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(f.path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +315,7 @@ func TestEscalationSaysTimeSinceProgress(t *testing.T) {
 	shared := newEscalationFixture(t)
 	t.Run("with progress", func(t *testing.T) {
 		f := shared.fresh(t)
+		f.report(t, f.builder, "idle", nil, 0) // bound: the lines below are unchanged
 		o := f.assign(t, f.builder, "45m")
 		f.act(t, o, f.builder, "ack", time.Minute)
 		f.reply(t, o, f.builder, api.EnvelopeKindNotice, 40*time.Minute)
@@ -328,6 +332,7 @@ func TestEscalationSaysTimeSinceProgress(t *testing.T) {
 	})
 	t.Run("without progress", func(t *testing.T) {
 		f := shared.fresh(t)
+		f.report(t, f.builder, "idle", nil, 0)
 		o := f.assign(t, f.builder, "")
 		f.toOwnerLevel(t, o)
 		wantProgressAge(t, "lead", f.notices(t, o, "lead"), "no progress recorded")
@@ -513,4 +518,196 @@ func TestQueuedFixBlockUnchangedByMatrixWaitRule(t *testing.T) {
 	if n := len(f.notices(t, o, "owner")); n != 1 {
 		t.Fatalf("%d owner notices", n)
 	}
+}
+
+// wi_d1e42f0739e47139 p5: a matrix wait whose ending report never arrives
+// holds the owner escalation only as long as the stall watch counts it
+// (4h30m from the wait's start). Inside that bound the owner hears nothing;
+// past it an obligation still overdue escalates normally.
+func TestMatrixWaitOwnerEscalationIsBounded(t *testing.T) {
+	f := newEscalationFixture(t)
+	o := f.assign(t, f.builder, "45m")
+	f.act(t, o, f.builder, "ack", time.Minute)
+	steps := f.silentRun(t, o, 30*time.Minute, 40*time.Minute, nil)
+	f.report(t, f.builder, "idle", &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 2, Since: f.c.Add(40 * time.Minute)}, 40*time.Minute)
+	steps = f.silentRun(t, o, 41*time.Minute, 5*time.Hour+30*time.Minute, steps)
+	// Held through +5h9m (inside the bound), sent at +5h10m (the bound).
+	wantSteps(t, "bounded wait", steps, "nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@5h10m0s", "project-stalled@5h25m0s")
+	if lead, owner := len(f.notices(t, o, "lead")), len(f.notices(t, o, "owner")); lead != 1 || owner != 1 {
+		t.Fatalf("lead %d owner %d, want 1 and 1", lead, owner)
+	}
+}
+
+// wi_d1e42f0739e47139 p6: progress recorded past the due time extends the
+// outcome window by the silence window. Four `tt progress` records after the
+// lead heard give no further lead notice; once progress stops for 30
+// minutes the lead hears again, and the owner a lead window later.
+func TestProgressPastDueEscalatesOncePerEpisode(t *testing.T) {
+	f := newEscalationFixture(t)
+	o := f.assign(t, f.builder, "45m")
+	f.act(t, o, f.builder, "ack", time.Minute)
+	var steps []string
+	leadBefore := 0
+	for m := 2; m <= 130; m++ {
+		d := time.Duration(m) * time.Minute
+		if m == 50 || m == 60 || m == 70 || m == 80 {
+			f.act(t, o, f.builder, "progress", d)
+		}
+		for _, s := range f.tick(t, o, d) {
+			steps = append(steps, s+"@"+d.String())
+		}
+		if m == 109 {
+			leadBefore = len(f.notices(t, o, "lead"))
+		}
+	}
+	if leadBefore != 1 {
+		t.Fatalf("%d lead notices while progress was fresh, want 1", leadBefore)
+	}
+	wantSteps(t, "progress past due", steps, "nudge@32m0s", "escalate-lead@46m0s", "escalate-lead@1h50m0s", "escalate-owner@2h5m0s")
+	if lead, owner := len(f.notices(t, o, "lead")), len(f.notices(t, o, "owner")); lead != 2 || owner != 1 {
+		t.Fatalf("lead %d owner %d, want 2 and 1", lead, owner)
+	}
+}
+
+// wi_d1e42f0739e47139 b2: an overdue or stall notice for a holder whose
+// current run has no activity report says it is not bound to the relay; a
+// bound holder's notice is unchanged.
+func TestEscalationNamesUnboundHolder(t *testing.T) {
+	shared := newEscalationFixture(t)
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound=%v", bound), func(t *testing.T) {
+			f := shared.fresh(t)
+			if bound {
+				f.report(t, f.builder, "idle", nil, 0)
+			}
+			o := f.assign(t, f.builder, "45m")
+			f.act(t, o, f.builder, "ack", time.Minute)
+			steps := f.silentRun(t, o, 30*time.Minute, 80*time.Minute, nil)
+			wantSteps(t, "unbound", steps, "nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s")
+			lead := f.notices(t, o, "lead")
+			want := fmt.Sprintf("Message #%d (Carry out the execution request) to builder is overdue: past its due time. Sent %s; state acknowledged; last progress 45m ago.%s "+
+				"Options: nudge the recipient, reassign the obligation (tt obligations --overdue lists it), or answer for them.",
+				o.MessageSeq, f.c.UTC().Format(time.RFC3339), map[bool]string{false: " builder is not bound to the relay: its current run has sent no activity report, so a directed message does not wake it."}[bound])
+			if len(lead) != 1 || lead[0].Envelope.Body.Text != want {
+				t.Fatalf("lead notice %+v, want %q", lead, want)
+			}
+			owner := f.notices(t, o, "owner")
+			if len(owner) != 1 || strings.Contains(owner[0].Envelope.Body.Text, "not bound to the relay") == bound {
+				t.Fatalf("owner notice %+v", owner)
+			}
+			stall := f.notices(t, o, "stall")
+			line := "(outcome; last progress 75m ago)"
+			if !bound {
+				line = "(outcome; last progress 75m ago; not bound to the relay)"
+			}
+			if len(stall) != 1 || !strings.Contains(stall[0].Envelope.Body.Text, line) {
+				t.Fatalf("stall notice %+v, want %q", stall, line)
+			}
+		})
+	}
+}
+
+// releaseJob adds a deployment agent and a release job row in the
+// given state through a second handle on the fixture's database (the hold
+// API needs a verified, accepted queue entry; the broker reads only the
+// job's state). It returns the deployer, the job id and a setter for the
+// job's state.
+func (f *escalationFixture) releaseJob(t *testing.T, state string) (api.Agent, string, func(string)) {
+	t.Helper()
+	deployer, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer", Role: api.AgentRoleDeployment, Host: "h", Session: "deployer", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	job := api.NewID("rel")
+	if _, err := db.ExecContext(f.ctx, `INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,'',?,1,?)`, f.task.ID, job, state, fmt.Sprintf(`{"id":%q,"state":%q}`, job, state)); err != nil {
+		t.Fatal(err)
+	}
+	return deployer, job, func(state string) {
+		t.Helper()
+		if _, err := db.ExecContext(f.ctx, `UPDATE release_jobs SET state=?,record_json=json_set(record_json,'$.state',?) WHERE task_id=? AND id=?`, state, state, f.task.ID, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// blockedRequest is the deployer's input REQUEST for a release job to
+// holder, which acknowledges it at +1m and blocks it back at +2m.
+func (f *escalationFixture) blockedRequest(t *testing.T, deployer, holder api.Agent, job string) api.Obligation {
+	t.Helper()
+	m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: deployer.ID, RunID: deployer.RunID, To: holder.ID, Envelope: &api.Envelope{
+		Kind: api.EnvelopeKindRequest, To: holder.Name, Subject: "Bind the inputs for the watch release", Due: "45m", Refs: map[string]string{"releaseJob": job},
+		Body: api.EnvelopeBody{Ask: "Bind the release inputs."}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := f.obligation(t, m.Seq, holder)
+	f.act(t, o, holder, "ack", time.Minute)
+	f.at(2 * time.Minute)
+	if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: holder.ID, RunID: holder.RunID, To: deployer.ID, ReplyTo: o.MessageSeq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindBlock, To: deployer.Name, Subject: "Blocked under the planned night hold", Body: api.EnvelopeBody{Reason: "the owner holds the release overnight", Needs: "the morning handoff", ResumeWhen: "the hold is lifted"}}}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.obligation(t, o.MessageSeq, holder); got.State != api.ObligationBlocked {
+		t.Fatalf("state %s, want blocked", got.State)
+	}
+	return o
+}
+
+// wi_d1e42f0739e47139 p1-p3: a request for a release job on a recorded hold,
+// blocked by its holder, pages no owner and raises no stall while the hold
+// lasts; the lead still hears on time. After the hold lifts an obligation
+// still overdue escalates normally. A block without a hold behaves as today,
+// and a hold that begins after the owner heard keeps it out of the stall.
+func TestReleaseHoldHoldsOwnerEscalation(t *testing.T) {
+	shared := newEscalationFixture(t)
+	t.Run("held overnight", func(t *testing.T) {
+		f := shared.fresh(t)
+		f.report(t, f.builder, "idle", nil, 0)
+		deployer, job, set := f.releaseJob(t, "held")
+		o := f.blockedRequest(t, deployer, f.builder, job)
+		var steps []string
+		for d := 10 * time.Minute; d <= 10*time.Hour; d += 5 * time.Minute {
+			for _, s := range f.tick(t, o, d) {
+				steps = append(steps, s+"@"+d.String())
+			}
+		}
+		wantSteps(t, "overnight", steps, "escalate-lead@50m0s")
+		if owner, stall := len(f.notices(t, o, "owner")), len(f.notices(t, o, "stall")); owner != 0 || stall != 0 {
+			t.Fatalf("owner %d stall %d during the hold", owner, stall)
+		}
+		f.at(10*time.Hour + 2*time.Minute)
+		set("verified") // the morning unhold
+		steps = f.silentRun(t, o, 10*time.Hour+3*time.Minute, 10*time.Hour+20*time.Minute, nil)
+		wantSteps(t, "after the hold lifts", steps, "escalate-owner@10h3m0s", "project-stalled@10h18m0s")
+	})
+	t.Run("no hold", func(t *testing.T) {
+		f := shared.fresh(t)
+		f.report(t, f.builder, "idle", nil, 0)
+		deployer, job, _ := f.releaseJob(t, "verified")
+		o := f.blockedRequest(t, deployer, f.builder, job)
+		steps := f.silentRun(t, o, 3*time.Minute, 80*time.Minute, nil)
+		wantSteps(t, "unheld block", steps, "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s")
+	})
+	t.Run("hold after the owner heard", func(t *testing.T) {
+		f := shared.fresh(t)
+		f.report(t, f.builder, "idle", nil, 0)
+		deployer, job, set := f.releaseJob(t, "verified")
+		o := f.blockedRequest(t, deployer, f.builder, job)
+		steps := f.silentRun(t, o, 3*time.Minute, 62*time.Minute, nil)
+		f.at(62*time.Minute + 30*time.Second)
+		set("held")
+		steps = f.silentRun(t, o, 63*time.Minute, 3*time.Hour, steps)
+		wantSteps(t, "late hold", steps, "escalate-lead@46m0s", "escalate-owner@1h1m0s")
+		if n := len(f.notices(t, o, "stall")); n != 0 {
+			t.Fatalf("%d stall notices for a held obligation", n)
+		}
+		f.at(3*time.Hour + 30*time.Second)
+		set("verified")
+		wantSteps(t, "after the late hold lifts", f.tick(t, o, 3*time.Hour+time.Minute), "project-stalled")
+	})
 }

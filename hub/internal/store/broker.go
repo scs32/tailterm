@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,12 +25,17 @@ type BrokerObligation struct {
 	AgentStatus  string
 	Orchestrator string
 	TaskPaused   bool
+	// RelayBound is true when the holder's current run has an activity
+	// report. The host relay reports activity only for a session it is
+	// bound to, so a run without one is not bound (as far as the hub knows).
+	RelayBound bool
 }
 
 func (s *Store) BrokerOpenObligations(ctx context.Context) ([]BrokerObligation, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.task_id,o.message_seq,o.agent_id,o.subject,o.source_kind,o.needs,o.state,o.outcome,o.outcome_seq,o.reason,
 o.created_at,o.ack_due_at,o.due_at,o.delivered_at,o.acked_at,o.last_progress_at,o.closed_at,o.escalation,o.nudges,
-o.wakes,o.escalated_at,o.nudged_at,o.changed_at,COALESCE(a.name,''),COALESCE(a.status,''),t.orchestrator,t.pause_state,o.recipient_kind
+o.wakes,o.escalated_at,o.nudged_at,o.changed_at,COALESCE(a.name,''),COALESCE(a.status,''),t.orchestrator,t.pause_state,o.recipient_kind,
+EXISTS(SELECT 1 FROM agent_activity aa WHERE aa.agent_id=o.agent_id AND aa.run_id=a.run_id)
 FROM obligations o JOIN tasks t ON t.id=o.task_id LEFT JOIN agents a ON a.id=o.agent_id
 WHERE o.state<>? AND t.status=? ORDER BY o.task_id,o.message_seq`, api.ObligationClosed, api.TaskOpen)
 	if err != nil {
@@ -42,7 +48,7 @@ WHERE o.state<>? AND t.status=? ORDER BY o.task_id,o.message_seq`, api.Obligatio
 		var created, ackDue, due, delivered, acked, progress, closed, escalated, nudged, changed, pause string
 		if err := rows.Scan(&b.ID, &b.TaskID, &b.MessageSeq, &b.AgentID, &b.Subject, &b.SourceKind, &b.Needs, &b.State, &b.Outcome, &b.OutcomeSeq, &b.Reason,
 			&created, &ackDue, &due, &delivered, &acked, &progress, &closed, &b.Escalation, &b.Nudges,
-			&b.Wakes, &escalated, &nudged, &changed, &b.AgentName, &b.AgentStatus, &b.Orchestrator, &pause, &b.RecipientKind); err != nil {
+			&b.Wakes, &escalated, &nudged, &changed, &b.AgentName, &b.AgentStatus, &b.Orchestrator, &pause, &b.RecipientKind, &b.RelayBound); err != nil {
 			return nil, err
 		}
 		b.CreatedAt, b.AckDueAt, b.DueAt = parseTS(created), parseTS(ackDue), parseTS(due)
@@ -107,15 +113,8 @@ var ErrBrokerQueuedFix = errors.New("obligation is blocked on a queued fix")
 // Progress messages (wi_e76872a6abc6d78e) postpone the due time instead;
 // see applyMessageProgress.
 func blockedOnQueuedFix(ctx context.Context, q queryRower, o BrokerObligation) (bool, error) {
-	if o.State != api.ObligationBlocked {
-		return false, nil
-	}
-	var block int64
-	err := q.QueryRowContext(ctx, `SELECT seq FROM messages WHERE task_id=? AND reply_to=? AND from_agent=? AND CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.kind') END=? ORDER BY seq DESC LIMIT 1`, o.TaskID, o.MessageSeq, o.AgentID, api.EnvelopeKindBlock).Scan(&block)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
+	block, err := latestBlock(ctx, q, o)
+	if block == 0 || err != nil {
 		return false, err
 	}
 	var queued int
@@ -124,6 +123,62 @@ func blockedOnQueuedFix(ctx context.Context, q queryRower, o BrokerObligation) (
   UNION SELECT item_task_id,item_id FROM message_audit_links WHERE message_task_id=? AND message_seq=?) l
  WHERE l.item_task_id=q.task_id AND l.item_id=q.item_id)`, o.TaskID, block, o.TaskID, block).Scan(&queued)
 	return queued > 0, err
+}
+
+// latestBlock is the seq of the holder's latest BLOCK reply to a blocked
+// obligation, or 0 when it is not blocked or has none.
+func latestBlock(ctx context.Context, q queryRower, o BrokerObligation) (int64, error) {
+	if o.State != api.ObligationBlocked {
+		return 0, nil
+	}
+	var block int64
+	err := q.QueryRowContext(ctx, `SELECT seq FROM messages WHERE task_id=? AND reply_to=? AND from_agent=? AND CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.kind') END=? ORDER BY seq DESC LIMIT 1`, o.TaskID, o.MessageSeq, o.AgentID, api.EnvelopeKindBlock).Scan(&block)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return block, err
+}
+
+// ErrBrokerPlannedHold means an owner escalation (and the project stall
+// notice) was held back because the holder blocked the obligation on a
+// release job that is on a recorded hold. It wraps ErrBrokerQueuedFix, so
+// the scheduler skips it the same way.
+var ErrBrokerPlannedHold = fmt.Errorf("obligation is blocked on a held release job: %w", ErrBrokerQueuedFix)
+
+// blockedOnReleaseHold reports whether a blocked obligation waits on a
+// planned release hold (wi_d1e42f0739e47139 p1): a ref of its request, or of
+// the holder's latest BLOCK reply to it, names a release job of the project
+// that is in state held. The hold is recorded with its resume condition (an
+// unhold, or the named items releasing), so the owner has nothing to decide
+// until it lifts; the next pass after that escalates normally.
+func blockedOnReleaseHold(ctx context.Context, q queryRower, o BrokerObligation) (bool, error) {
+	block, err := latestBlock(ctx, q, o)
+	if block == 0 || err != nil {
+		return false, err
+	}
+	var held int
+	err = q.QueryRowContext(ctx, `SELECT count(*) FROM release_jobs j WHERE j.task_id=? AND j.state='held' AND j.id IN (
+ SELECT r.value FROM messages m, json_each(CASE WHEN json_valid(m.envelope) THEN m.envelope ELSE '{}' END,'$.refs') r
+ WHERE m.task_id=? AND m.seq IN (?,?) AND r.type='text')`, o.TaskID, o.TaskID, o.MessageSeq, block).Scan(&held)
+	return held > 0, err
+}
+
+// ErrBrokerProgressFresh means a lead re-escalation was held back because
+// the holder recorded progress after the due time and that progress is
+// fresher than the silence window. It wraps ErrBrokerQueuedFix, so the
+// scheduler skips it the same way.
+var ErrBrokerProgressFresh = fmt.Errorf("obligation holder recorded progress past the due time: %w", ErrBrokerQueuedFix)
+
+// progressPastDue reports whether progress recorded after the due time still
+// holds the outcome escalation (wi_d1e42f0739e47139 p6). Recording progress
+// clears the escalation but keeps the due time, so without this every
+// `tt progress` past due re-escalated to the lead on the next pass. Progress
+// past the due time extends the outcome window to ObligationSilenceNudge
+// after the latest progress: one lead notice per overdue episode, and a new
+// one once progress has stopped for that window.
+func progressPastDue(o BrokerObligation, now time.Time) bool {
+	p := o.LastProgressAt
+	return p != nil && p.After(o.DueAt) && now.Sub(*p) < api.ObligationSilenceNudge
 }
 
 // ErrBrokerMatrixWait means an owner escalation was held back because the
@@ -136,16 +191,24 @@ var ErrBrokerMatrixWait = fmt.Errorf("obligation holder is in a matrix wait: %w"
 // ObligationOwnerAfterLead ago, as the activity report recorded it in
 // stall_watch_progress. The holder has a known reason and a known resume
 // condition, so the owner hears only after a full lead window from the
-// wait's end. A wait recorded on an earlier run does not count.
+// wait's end. A wait recorded on an earlier run does not count. A wait whose
+// ending report never arrives holds no longer than the stall watch counts
+// it (wi_d1e42f0739e47139 p5): defaultQueueMatrixWaitBound from the wait's
+// start in the run's latest activity report.
 func inMatrixWait(ctx context.Context, q queryRower, o BrokerObligation, now time.Time) (bool, error) {
 	var waiting bool
-	var ended string
-	err := q.QueryRowContext(ctx, `SELECT p.matrix_wait,p.wait_ended_at FROM agents a JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id WHERE a.id=?`, o.AgentID).Scan(&waiting, &ended)
+	var ended, payload string
+	err := q.QueryRowContext(ctx, `SELECT p.matrix_wait,p.wait_ended_at,COALESCE(aa.payload,'') FROM agents a JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id
+ LEFT JOIN agent_activity aa ON aa.agent_id=a.id AND aa.run_id=a.run_id WHERE a.id=?`, o.AgentID).Scan(&waiting, &ended, &payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if waiting {
+		var activity api.AgentActivity
+		waiting = json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && now.Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound
 	}
 	return waiting || (ended != "" && now.Sub(parseTS(ended)) < api.ObligationOwnerAfterLead), nil
 }
@@ -251,6 +314,10 @@ func (s *Store) BrokerNudge(ctx context.Context, o BrokerObligation, now time.Ti
 // BrokerEscalate raises an overdue obligation to the project lead (level 1)
 // or, when the lead is the recipient, missing or unresponsive, to the owner (level 2).
 func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level int, reason string, now time.Time) error {
+	// Read from the scheduler's view only, so a held pass takes no write lock.
+	if level == 1 && progressPastDue(o, now) {
+		return ErrBrokerProgressFresh
+	}
 	return s.brokerAct(ctx, o, func(tx *sql.Tx, task api.Task) error {
 		var lead api.Agent
 		var linkedItem string
@@ -304,14 +371,20 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 			if held {
 				return ErrBrokerMatrixWait
 			}
+			if held, err = blockedOnReleaseHold(ctx, tx, o); err != nil {
+				return err
+			}
+			if held {
+				return ErrBrokerPlannedHold
+			}
 		}
 		who := o.AgentName
 		if who == "" {
 			who = "an agent"
 		}
-		text := fmt.Sprintf("Message #%d (%s) to %s is overdue: %s. Sent %s; state %s; %s. "+
+		text := fmt.Sprintf("Message #%d (%s) to %s is overdue: %s. Sent %s; state %s; %s.%s "+
 			"Options: nudge the recipient, reassign the obligation (tt obligations --overdue lists it), or answer for them.",
-			o.MessageSeq, o.Subject, who, reason, o.CreatedAt.UTC().Format(time.RFC3339), o.State, progressAge(o.Obligation, now))
+			o.MessageSeq, o.Subject, who, reason, o.CreatedAt.UTC().Format(time.RFC3339), o.State, progressAge(o.Obligation, now), unboundNote(o, who))
 		subject := fmt.Sprintf("Overdue: %s on %s", who, obligationNoun(o.SourceKind))
 		if level == 2 {
 			subject = fmt.Sprintf("Owner attention: %s is overdue on %s", who, obligationNoun(o.SourceKind))
@@ -327,6 +400,16 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 		_, err = tx.ExecContext(ctx, `UPDATE obligations SET escalation=?,escalated_at=? WHERE id=?`, level, ts(now), o.ID)
 		return err
 	})
+}
+
+// unboundNote is the sentence an overdue notice adds when the holder's
+// current run is not bound to the relay (wi_d1e42f0739e47139 b2); a bound
+// holder's notice is unchanged.
+func unboundNote(o BrokerObligation, who string) string {
+	if o.RelayBound {
+		return ""
+	}
+	return fmt.Sprintf(" %s is not bound to the relay: its current run has sent no activity report, so a directed message does not wake it.", who)
 }
 
 // progressAge says how long ago the obligation last recorded progress
@@ -383,6 +466,20 @@ const (
 // that progress. A pass with nothing to record takes no write lock and
 // wakes no waiters.
 func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChange, quietFrom time.Time, overdue []BrokerObligation, now time.Time) (bool, error) {
+	// An obligation blocked on a held release job is a planned wait, even
+	// one that reached the owner before its hold began: it is not listed,
+	// and alone raises no stall.
+	var listed []BrokerObligation
+	for _, o := range overdue {
+		held, err := blockedOnReleaseHold(ctx, s.db, o)
+		if err != nil {
+			return false, err
+		}
+		if !held {
+			listed = append(listed, o)
+		}
+	}
+	overdue = listed
 	if len(overdue) > 0 {
 		latest, err := s.latestTeamProgress(ctx, taskID, now.Add(-api.ObligationProjectStallQuiet))
 		if err != nil {
@@ -420,7 +517,11 @@ func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChang
 		var lines []string
 		size := 0
 		for i, o := range overdue {
-			line := fmt.Sprintf("#%d %s → %s (%s; %s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now), progressAge(o.Obligation, now))
+			unbound := ""
+			if !o.RelayBound {
+				unbound = "; not bound to the relay"
+			}
+			line := fmt.Sprintf("#%d %s → %s (%s; %s%s)", o.MessageSeq, truncateRunes(o.Subject, 80), o.AgentName, ObligationOverdue(o.Obligation, now), progressAge(o.Obligation, now), unbound)
 			if i == maxStallLines || size+len(line) > stallListingBytes {
 				lines = append(lines, fmt.Sprintf("and %d more", len(overdue)-i))
 				break

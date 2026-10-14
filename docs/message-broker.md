@@ -192,8 +192,8 @@ One obligation per (message, recipient). States:
 | wake retry | 1, 3, 7 min after `queued` | re-wake through adapter (max 3) |
 | ack deadline | 10 min after `delivered` | `overdue_ack`, re-wake once, then escalate to lead |
 | progress silence | 30 min in `acknowledged`/`working` without progress | nudge recipient; after 2 nudges escalate to lead |
-| outcome due | `due`, or 2 h for assign/review, 30 min for question | escalate to lead |
-| lead escalation unanswered | 15 min | escalate to owner (Discord); held while the holder is in a matrix wait, then 15 min after the wait ends |
+| outcome due | `due`, or 2 h for assign/review, 30 min for question | escalate to lead; progress recorded after it extends it to 30 min after that progress |
+| lead escalation unanswered | 15 min | escalate to owner (Discord); held while the holder is in a matrix wait (at most 4 h 30 min from its start), then 15 min after the wait ends; held while the holder's block waits on a queued fix or a held release job |
 | helper watch ([stall-watch.md](stall-watch.md)) | 20 min with no post and no `working` report while the owner helper owes the owner | one owner ping per episode; from 22:00 to 07:00 Pacific a channel line, then one ping at 07:00 if still open |
 | team watch ([stall-watch.md](stall-watch.md)) | 30 min with no post, no `working` report and no matrix wait from a running queue entry's team | one notice per episode to the owner helper, or to the owner when the helper is quiet, offline or absent |
 
@@ -217,7 +217,46 @@ One obligation per (message, recipient). States:
   owner, waits too. Once the wait ends (`wait_ended_at`), an obligation that is
   still overdue reaches the owner only after a full lead window (15 min)
   counted from the wait's end. A wait recorded on an earlier run of the agent
-  does not count.
+  does not count. A wait whose ending report never arrives (the relay died or
+  the run is gone) holds no longer than the stall watch counts it: 4 h 30 min
+  (`defaultQueueMatrixWaitBound`) from the wait's start in the run's latest
+  activity report. Past that bound an obligation still overdue reaches the
+  owner on the next pass (bug `wi_d1e42f0739e47139`, order #34523).
+
+- **A block under a planned release hold does not page the owner.** When an
+  obligation is `blocked` by its holder and a ref of its request, or of the
+  holder's latest BLOCK reply to it, names a release job of the project in
+  state `held` (an owner hold saved by the database handler, with its resume
+  condition: an unhold, or the named items releasing), the broker posts no
+  owner escalation for it, and the project stall notice neither lists it nor
+  fires for it alone, even when it reached the owner before the hold began.
+  The lead escalation still happens on time; an obligation the lead holds,
+  which would otherwise go straight to the owner, waits too. Once the job
+  leaves `held`, an obligation that is still overdue escalates normally on
+  the next pass. A BLOCK has no structured resume time, so a block that names
+  no held job behaves as before (bug `wi_d1e42f0739e47139`, order #34523).
+
+- **Progress past the due time re-arms the lead once per episode.** Recording
+  progress (`tt progress`, or an acknowledgement that resumes a block) clears
+  the escalation but keeps the due time. Progress recorded after the due time
+  therefore extends the outcome window to 30 min (the silence window) after
+  the latest such progress: the lead hears once when the outcome first goes
+  overdue, a holder that keeps recording progress causes no further lead
+  notice, and once its progress stops for 30 min the lead hears again (and the
+  owner a lead window after that). A progress message past its postponement
+  cap keeps an escalation already made, so the owner still hears on time
+  (bug `wi_d1e42f0739e47139`, order #34523).
+
+- **Notices name a holder that is not bound to the relay.** The hub has no
+  per-agent relay binding record; the host relay reports activity only for a
+  session it is bound to. So when the holder's current run has no activity
+  report (`agent_activity` row for that agent and run), the lead and owner
+  overdue notices add that the holder is not bound to the relay and a directed
+  message does not wake it, and its project stall line ends with `not bound to
+  the relay`. A bound holder's notice is unchanged. The signal is a proxy: a
+  run bound moments ago that has not reported yet reads as unbound, and a run
+  whose relay later stopped still reads as bound (bug `wi_d1e42f0739e47139`
+  b2, order #34523).
 
 - **Turn-end enforcement.** The existing `tt hook stop` already blocks a Claude turn
   from ending while unread messages exist. It changes to "while this run holds
