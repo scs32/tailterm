@@ -158,8 +158,16 @@ listed directories under worktree and artifact roots; the shared root is under
 neither, so its trimming never applies here. They are written to a temporary
 name and renamed.
 
-**Modules.** Sources are the candidate's `hub` module and, when the historical
-hub binary is prepared, that commit's `hub` (extracted into the home). Every
+**Modules.** Sources are the candidate's `hub` module; when the historical
+hub binary is prepared, that commit's `hub` (extracted into the home); and when
+the plan has `wasm-test-build`, Tailscale's `cmd/tsconnect/wasm` as
+`scripts/build-wasm.sh` builds it. The runner reads that script without running
+it: its `tailscale-<version>` must be the version `hub/go.mod` requires, and its
+`cp wasm/… "$source/cmd/tsconnect/wasm/…"` lines become a `go list -overlay`.
+Go refuses an overlay of files beneath `GOMODCACHE`, so the module is copied
+once per generation to `mod/gen-<hex>.wasm-src/` (an APFS clone on macOS,
+about 27 MB) and listed there for `GOOS=js GOARCH=wasm`, with and without
+`-tags=tailserve_test`. Every
 run validates the generation `current.json` names, with `GOPROXY=off`:
 `go list -deps -test ./...` for completeness and `go mod verify` for integrity,
 per source. All pass: the run is `warm` and has written nothing. A missing
@@ -170,14 +178,18 @@ this safe beside a reader. A failed `go mod verify`, a changed toolchain or an
 unreadable pointer: the runner seeds a new `gen-<random>`, validates it and
 renames `current.json` to it. A pointer whose `dir` is not a single
 `gen-<16 hex>` directly inside `mod/` is refused. Seeding or validation that
-still fails makes the run private. One generation serves every go.sum: modules
+still fails makes the run private, and so does preparation (validation and
+seeding) that runs past ten minutes: it runs under the host lock and outside
+every check timeout, so a stalled proxy cannot hold a slot. One generation
+serves every go.sum: modules
 are stored by path and version, so it grows only by new versions.
 
 **Toolchain.** A host Go at least as new as `hub/go.mod` (its `toolchain` line
 if newer) is used as it is. An older host gets the toolchain from the module
 generation: the runner downloads it once with `GOTOOLCHAIN=<version>`, puts
 its `bin` first on every check's `PATH`, and stamps its tree digest (sorted
-path, size, sha256); a tree that later differs from its stamp is corruption.
+path, size, sha256); a tree that later differs from any stamp of the
+generation, whatever go.sum that stamp was written for, is corruption.
 Every check runs with `GOTOOLCHAIN=local`, so no check downloads or switches
 toolchains.
 
@@ -186,9 +198,12 @@ toolchains.
 `TAILTERM_VERIFICATION_CACHE=<root>`, under each check's own recorded
 environment, so check records, argv, timeouts and `verification/matrix.json`
 are unchanged. `HOME`, `TMPDIR`, `TMUX_TMPDIR` and `GOPATH` stay in the home.
-`scripts/build-wasm.sh` builds Tailscale's own module set, so
-`wasm-test-build` alone keeps a per-home module cache with the network (about
-0.5 GB, 18,000 files) and the shared toolchain; the line says so.
+`wasm-test-build` reads the same generation with the proxy off. Only when the
+script cannot be read that way (no version or copy lines, or a version
+`hub/go.mod` does not require) or the wasm seed fails without corruption does
+that check alone keep a per-home module cache with the network (about 0.5 GB,
+18,000 files), and the line names the cause. The Tailscale source tarball the
+script downloads into each checkout is outside this cache.
 
 **No test result from the cache.** `GOFLAGS=-count=1` makes every go test the
 checks start execute, including the go-race command's plain and sharded
@@ -206,7 +221,8 @@ file is removed whole, and a malformed `-a` index entry is removed; Go then
 rebuilds. A mismatch is removed only once its size and mtime stay put (a peer
 writes outputs in place, last byte last). A directory with a missing or invalid
 marker, or holding anything Go would not write there, is skipped for the next
-free `.2`, `.3` suffix. Limit: bytes that go bad after the scan in the same run
+free `.2`, `.3` suffix. A build directory that is a symlink or whose real path
+is not directly in `<root>/build` is refused, as a module pointer is. Limit: bytes that go bad after the scan in the same run
 are not caught; no test verdict is read from the cache either way.
 
 **Concurrency.** Two runs on the host's two slots share the root. Two runs on an
@@ -235,6 +251,7 @@ use the same default root.
 
 **Report.** One line per run, through the runner's printer:
 `matrix run: go caches: modules <gen> (warm|seeded N modules|rebuilt: <cause>), toolchain <version> (host|cached; host <version> is older than go.mod), build <dir> scanned <n> outputs in <ms> ms, removed <k>`,
+followed by `, wasm-test-build: shared modules` or `, wasm-test-build: per-home modules (<cause>)` when the plan has that check,
 or `matrix run: go caches: private: <cause>`. `<output>/cache-report.json`
 holds the same facts with the download counters.
 

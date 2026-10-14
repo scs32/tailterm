@@ -1133,6 +1133,9 @@ const BUILD_INDEX_LINE = /^v1 [0-9a-f]{64} [0-9a-f]{64} [ 0-9]{19}[0-9] [ 0-9]{1
 const BUILD_FILES = new Set(["README", "trim.txt", "testexpire.txt", "tailterm-cache.json"]);
 const ROOT_ENTRIES = new Set(["mod", "build", "speech-model", "tailterm-cache.json"]);
 const DEFAULT_GOPROXY = "https://proxy.golang.org,direct";
+// A cold seed (toolchain, hub, historical and wasm module sets) took under a
+// minute on the Mini; ten minutes bounds a stalled proxy.
+const CACHE_DEADLINE_MS = 10 * 60 * 1000;
 // Every check family verification/matrix.json defines can run go: hub checks,
 // the wasm build, npm test (release-runner tests build tt) and browser suites
 // (prepared or standalone test binaries). Keyed on ids, not argv.
@@ -1348,15 +1351,89 @@ function moduleSources(cwd, home, plan) {
   return sources;
 }
 
+// scripts/build-wasm.sh builds Tailscale's cmd/tsconnect/wasm with the
+// checkout's wasm/*.go copied in. Read-only: its Tailscale version must be the
+// one hub/go.mod requires, and its cp lines become a go list -overlay. Returns
+// the seed plan, or the cause the wasm check keeps per-home modules.
+export function wasmSeedSpec(cwd) {
+  let script, goMod;
+  try {
+    script = readFileSync(join(cwd, "scripts", "build-wasm.sh"), "utf8");
+    goMod = readFileSync(join(cwd, "hub", "go.mod"), "utf8");
+  } catch (error) {
+    return { cause: "build-wasm.sh or hub/go.mod unreadable: " + error.code };
+  }
+  const version = /^source="\$root\/\.build\/tailscale-(\d+\.\d+\.\d+)"$/m.exec(script)?.[1];
+  const copies = [...script.matchAll(/^cp wasm\/([A-Za-z0-9_.-]+\.go) "\$source\/cmd\/tsconnect\/wasm\/([A-Za-z0-9_.-]+\.go)"$/gm)]
+    .map((found) => ({ from: found[1], to: found[2] }));
+  if (!version || !copies.length) return { cause: "build-wasm.sh has no Tailscale version or copy lines" };
+  const required = /^\s*(?:require\s+)?tailscale\.com\s+v(\S+)/m.exec(goMod)?.[1];
+  if (required !== version)
+    return { cause: `build-wasm.sh builds tailscale ${version} but hub/go.mod requires ${required || "none"}` };
+  return { version, copies };
+}
+// The wasm source: a copy of the Tailscale module beside the generation (Go
+// refuses an overlay of files beneath GOMODCACHE), made once per generation,
+// with the checkout's files overlaid as the script copies them.
+function wasmSource(spec, cwd, home) {
+  const module = `tailscale.com@v${spec.version}`;
+  const overlayPath = join(home, ".verifier-sources", "wasm-overlay.json");
+  const source = {
+    name: "wasm " + module,
+    wasm: true,
+    env: { GOOS: "js", GOARCH: "wasm" },
+    resolve(generation) {
+      const copy = join(`${generation}.wasm-src`, module);
+      if (!existsSync(copy)) {
+        const cached = join(generation, module);
+        if (!existsSync(join(cached, "go.mod"))) throw new CacheRefusal(`${module} is not in ${basename(generation)}`);
+        mkdirSync(dirname(copy), { recursive: true, mode: 0o755 });
+        const temporary = `${copy}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+        execFileSync("cp", [process.platform === "darwin" ? "-cR" : "-R", cached, temporary]);
+        try {
+          renameSync(temporary, copy);
+        } catch (error) {
+          removeVerifierHome(temporary);
+          if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
+        }
+      }
+      mkdirSync(dirname(overlayPath), { recursive: true, mode: 0o700 });
+      writeFileSync(overlayPath, JSON.stringify({
+        Replace: Object.fromEntries(spec.copies.map(({ from, to }) =>
+          [join(copy, "cmd", "tsconnect", "wasm", to), join(cwd, "wasm", from)])),
+      }));
+      this.dir = copy;
+      this.goSumSha256 = createHash("sha256").update(readFileSync(join(copy, "go.sum"))).digest("hex");
+      return copy;
+    },
+    lists: [
+      ["list", "-deps", "-overlay", overlayPath, "./cmd/tsconnect/wasm"],
+      ["list", "-deps", "-tags=tailserve_test", "-overlay", overlayPath, "./cmd/tsconnect/wasm"],
+    ],
+  };
+  return source;
+}
+const sourceLists = (source) => source.lists || [["list", "-deps", "-test", "./..."]];
+const sourceDir = (source, generation) => {
+  try {
+    return source.resolve ? source.resolve(generation) : source.dir;
+  } catch (error) {
+    throw Object.assign(error, { source });
+  }
+};
+
 // Validates a generation for every source with the network off. Returns the
 // first problem: "incomplete" (a module is missing) or "integrity".
 async function validateGeneration(generation, sources, environment, go, abortSignal) {
   const env = { ...environment, GOMODCACHE: generation, GOPROXY: "off" };
   for (const source of sources) {
-    const listed = await go(["list", "-deps", "-test", "./..."], { cwd: source.dir, env, abortSignal });
-    if (listed.code !== 0)
-      return { problem: "incomplete", source, detail: listed.stderr.trim().split("\n")[0] };
-    const verified = await go(["mod", "verify"], { cwd: source.dir, env, abortSignal });
+    const cwd = sourceDir(source, generation);
+    for (const args of sourceLists(source)) {
+      const listed = await go(args, { cwd, env: { ...env, ...source.env }, abortSignal });
+      if (listed.code !== 0)
+        return { problem: "incomplete", source, detail: listed.stderr.trim().split("\n")[0] };
+    }
+    const verified = await go(["mod", "verify"], { cwd, env, abortSignal });
     if (verified.code !== 0) {
       const detail = verified.stderr.trim().split("\n")[0];
       return { problem: /GOPROXY=off|module lookup disabled/.test(verified.stderr) ? "incomplete" : "integrity", source, detail };
@@ -1367,12 +1444,16 @@ async function validateGeneration(generation, sources, environment, go, abortSig
 // Adds a source's module graph and its package modules to a generation.
 async function seedGeneration(generation, sources, environment, goProxy, go, abortSignal) {
   const env = { ...environment, GOMODCACHE: generation, GOPROXY: goProxy };
-  for (const source of sources)
-    for (const args of [["list", "-m", "all"], ["list", "-deps", "-test", "./..."]]) {
-      const run = await go(args, { cwd: source.dir, env, abortSignal });
+  for (const source of sources) {
+    const cwd = sourceDir(source, generation);
+    for (const args of [["list", "-m", "all"], ...sourceLists(source)]) {
+      const run = await go(args, { cwd, env: { ...env, ...source.env }, abortSignal });
       if (run.code !== 0)
-        throw new CacheRefusal(`seeding ${source.name} failed: ${run.stderr.trim().split("\n").at(-1)}`);
+        throw Object.assign(
+          new CacheRefusal(`seeding ${source.name} failed: ${run.stderr.trim().split("\n").at(-1)}`),
+          { source });
     }
+  }
 }
 
 // Selects (and, when needed, seeds) the module generation and toolchain.
@@ -1413,10 +1494,16 @@ async function prepareModules(root, sources, toolchain, environment, context, op
     });
     if (ran.code !== 0 || !ran.stdout.includes(toolchain.version + " ")) return "integrity";
     toolchain.treeSha256 = await treeDigest(tree);
-    const stamped = sources
-      .map((source) => readJson(stampPath(dir, source))?.toolchainTreeSha256)
-      .find(Boolean);
-    return stamped && stamped !== toolchain.treeSha256 ? "integrity" : "";
+    // Every stamp of the generation, whatever go.sum it was written for.
+    let stamps = [];
+    try {
+      stamps = readdirSync(`${dir}.stamps`).filter((name) => name.endsWith(".json"));
+    } catch {}
+    const stamped = stamps
+      .map((name) => readJson(join(`${dir}.stamps`, name)))
+      .filter((stamp) => validCacheMarker(stamp, "stamp") && stamp.toolchain === toolchain.version &&
+        typeof stamp.toolchainTreeSha256 === "string");
+    return stamped.some((stamp) => stamp.toolchainTreeSha256 !== toolchain.treeSha256) ? "integrity" : "";
   };
   const seedToolchain = async (dir) => {
     const run = await go(["version"], {
@@ -1516,6 +1603,11 @@ function selectBuildDir(root, version, context) {
         if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
       }
     }
+    // Confined to <root>/build by real path, like the module generations.
+    const real = realpathSync(dir);
+    if (lstatSync(dir).isSymbolicLink() || real !== join(realpathSync(join(root, "build")), basename(dir)) ||
+        !within(realpathSync(join(root, "build")), root))
+      throw new CacheRefusal(`build directory ${basename(dir)} resolves outside ${join(root, "build")}`);
     if (validBuildDir(dir)) return { dir, skipped };
     skipped.push(basename(dir));
   }
@@ -1596,15 +1688,24 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
     hostGoVersion,
     userGoPaths: paths,
     settleMs,
-    abortSignal,
+    // Runner-side seeding and validation run under the host lock and outside
+    // every check timeout: past this the run goes private.
+    deadlineMs = CACHE_DEADLINE_MS,
+    abortSignal: runSignal,
   } = options;
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort("deadline"), deadlineMs);
+  const abortSignal = runSignal ? AbortSignal.any([runSignal, deadline.signal]) : deadline.signal;
   const privateEnvironment = {
     GOMODCACHE: join(home, "go", "pkg", "mod"),
     GOCACHE: join(home, "go-build"),
     GOTOOLCHAIN: "auto",
     GOFLAGS: "-count=1",
   };
-  if (!sharesGoCaches(plan.checks, cwd)) return { environment: privateEnvironment };
+  if (!sharesGoCaches(plan.checks, cwd)) {
+    clearTimeout(timer);
+    return { environment: privateEnvironment };
+  }
   const context = {
     item: plan.itemId || (plan.orderMessageSeq ? `order ${plan.orderMessageSeq}` : "unknown"),
     run: plan.verifierRunId || output,
@@ -1632,11 +1733,27 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
     const scan = await scanBuildCache(build.dir, settleMs === undefined ? {} : { settleMs });
     const sources = moduleSources(cwd, home, plan);
     const base = { ...environment, GOTOOLCHAIN: "local", GOFLAGS: "-mod=readonly", GOCACHE: build.dir };
-    const modules = await prepareModules(root, sources, toolchain, base, context, { goProxy, go, abortSignal });
+    // wasm-test-build reads Tailscale's module set from the generation too;
+    // only a script the runner cannot read safely, or a wasm seed that fails
+    // without corruption, leaves that one check on per-home modules.
+    let wasm = null;
+    if (plan.checks.some((check) => check.id === "wasm-test-build")) {
+      const spec = wasmSeedSpec(cwd);
+      wasm = spec.cause ? { cause: spec.cause } : { source: wasmSource(spec, cwd, home) };
+    }
+    const prepare = (list) => prepareModules(root, list, toolchain, base, context, { goProxy, go, abortSignal });
+    let modules;
+    try {
+      modules = await prepare(wasm?.source ? [...sources, wasm.source] : sources);
+    } catch (error) {
+      if (!error.source?.wasm || abortSignal.aborted) throw error;
+      wasm = { cause: error.message.split("\n")[0] };
+      modules = await prepare(sources);
+    }
     report.modules = modules.report;
     report.toolchain = { version: toolchain.version, source: toolchain.source, host, required, treeSha256: toolchain.treeSha256 || null };
     report.build = { dir: build.dir, skipped: build.skipped, ...scan };
-    report.wasm = plan.checks.some((check) => check.id === "wasm-test-build") ? "per-home modules" : null;
+    report.wasm = wasm && (wasm.cause ? { modules: "per-home", cause: wasm.cause } : { modules: "shared", source: wasm.source.name });
     report.downloads = { toolchains: modules.report.toolchainDownloads, modules: modules.report.modulesAdded };
     const state = modules.report.state === "rebuilt"
       ? `rebuilt: ${modules.report.cause}`
@@ -1646,7 +1763,7 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
       (modules.report.generations > 1 ? ` of ${modules.report.generations} generations` : "") +
       `, toolchain ${toolchain.version} (${toolchain.source === "host" ? "host" : `cached; host ${host} is older than go.mod`})` +
       `, build ${basename(build.dir)} scanned ${scan.outputs} outputs in ${scan.ms} ms, removed ${scan.removed}` +
-      (report.wasm ? ", wasm-test-build: per-home modules" : "");
+      (wasm?.cause ? `, wasm-test-build: per-home modules (${wasm.cause})` : wasm ? ", wasm-test-build: shared modules" : "");
     writeFileSync(join(output, "cache-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
     return {
       line,
@@ -1660,18 +1777,22 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
         PATH: modules.env.PATH,
         TAILTERM_VERIFICATION_CACHE: root,
       },
-      // build-wasm.sh seeds Tailscale's own module set: that check keeps a
-      // per-home module cache with the network, and the shared toolchain.
-      checkEnvironment: report.wasm
+      // The fallback: that check alone keeps a per-home module cache with the
+      // network, and the shared toolchain and build cache.
+      checkEnvironment: wasm?.cause
         ? { "wasm-test-build": { GOMODCACHE: join(home, "go", "pkg", "mod"), GOPROXY: goProxy } }
         : {},
     };
   } catch (error) {
-    if (abortSignal?.aborted) throw error;
-    const cause = error.message.split("\n")[0];
+    if (runSignal?.aborted) throw error;
+    const cause = deadline.signal.aborted
+      ? `cache preparation exceeded its ${deadlineMs} ms deadline`
+      : error.message.split("\n")[0];
     Object.assign(report, { mode: "private", cause });
     writeFileSync(join(output, "cache-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
     return { line: `matrix run: go caches: private: ${cause}`, report, environment: privateEnvironment };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

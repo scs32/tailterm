@@ -10,6 +10,7 @@ import {
   readdirSync,
   chmodSync,
   realpathSync,
+  appendFileSync,
   lstatSync,
   statSync,
   symlinkSync,
@@ -2584,7 +2585,7 @@ const countTest = (counter, name = "TestCount") =>
   `\tif dep.Value() != 1 {\n\t\tt.Fatal("dependency")\n\t}\n}\n`;
 // A detached fixture checkout whose hub module needs example.com/dep, with
 // go.sum written by go mod tidy against the proxy.
-function sharedCacheFixture(t, { proxy, script = "cd hub && go version && go env GOTOOLCHAIN && go test ./...", files = {}, rules, dependency = true } = {}) {
+function sharedCacheFixture(t, { proxy, script = "cd hub && go version && go env GOTOOLCHAIN && go test ./...", files = {}, rules, dependency = true, extraRequire } = {}) {
   const cwd = tempDir(t, "verification-shared-cache-repo-");
   const counter = join(tempDir(t, "verification-shared-cache-counter-"), "count");
   const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -2598,7 +2599,8 @@ function sharedCacheFixture(t, { proxy, script = "cd hub && go version && go env
   writeFileSync(join(cwd, ".gitignore"), "node_modules/\n");
   writeFileSync(join(cwd, "node_modules/.package-lock.json"), "{}");
   // Without the dependency a check also passes on per-home caches offline.
-  writeFileSync(join(cwd, "hub/go.mod"), "module example.com/hub\n\ngo 1.21\n" + (dependency ? "\nrequire example.com/dep v1.0.0\n" : ""));
+  writeFileSync(join(cwd, "hub/go.mod"), "module example.com/hub\n\ngo 1.21\n" + (dependency ? "\nrequire example.com/dep v1.0.0\n" : "") +
+    (extraRequire ? `\nrequire ${extraRequire}\n` : ""));
   writeFileSync(join(cwd, "hub/count_test.go"), dependency ? countTest(counter)
     : countTest(counter).replace('\n\t"example.com/dep"\n', "\n").replace(/\tif dep\.Value\(\) != 1 \{\n\t\tt\.Fatal\("dependency"\)\n\t\}\n/, ""));
   for (const [name, text] of Object.entries(files)) {
@@ -2619,22 +2621,34 @@ function sharedCacheFixture(t, { proxy, script = "cd hub && go version && go env
   const runs = () => (existsSync(counter) ? readFileSync(counter, "utf8").split("\n").filter(Boolean).length : 0);
   return { cwd, plan, runs, counter };
 }
-// One Go build cache for the whole file, linked into a test's root where
-// the test neither corrupts nor refuses it: each cold cache is thousands of
-// files, which is the churn this feature removes.
+// One warm Go build cache per file, cloned into a test's root where the test
+// neither corrupts nor refuses it: a cold cache is thousands of compiled
+// files, the churn this feature removes. Build directories must be real
+// directories inside the root, so this is a copy (a clone on APFS).
 let fileBuildCache;
 const goPlatform = () => `${process.platform}-${{ x64: "amd64" }[process.arch] || process.arch}`;
-function shareBuildCache(root, version) {
-  if (!fileBuildCache) {
-    fileBuildCache = mkdtempSync(join(tmpdir(), "verification-file-build-cache-"));
-    writeFileSync(join(fileBuildCache, "tailterm-cache.json"),
-      JSON.stringify({ version: 1, kind: "build", owns: ["build"], producer: "tests/verification-2.test.js" }));
-    process.on("exit", () => existsSync(fileBuildCache) && removeVerifierHome(fileBuildCache));
-  }
-  version ??= execFileSync("go", ["env", "GOVERSION"], { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } }).trim();
-  mkdirSync(join(root, "build"), { recursive: true });
-  symlinkSync(fileBuildCache, join(root, "build", `${version}-${goPlatform()}`));
+function templateBuildCache() {
+  if (fileBuildCache) return fileBuildCache;
+  const scratch = mkdtempSync(join(tmpdir(), "verification-file-build-cache-"));
+  process.on("exit", () => existsSync(scratch) && removeVerifierHome(scratch));
+  fileBuildCache = join(scratch, "cache");
+  mkdirSync(fileBuildCache);
+  writeFileSync(join(fileBuildCache, "tailterm-cache.json"),
+    JSON.stringify({ version: 1, kind: "build", owns: ["build"], producer: "tests/verification-2.test.js" }));
+  const module = join(scratch, "module");
+  mkdirSync(module);
+  writeFileSync(join(module, "go.mod"), "module example.com/template\n\ngo 1.21\n");
+  writeFileSync(join(module, "t_test.go"), 'package template\n\nimport (\n\t"os"\n\t"testing"\n)\n\nfunc TestT(t *testing.T) { _ = os.Getpid() }\n');
+  execFileSync("go", ["test", "./..."], { cwd: module, stdio: "pipe", env: { ...process.env, GOCACHE: fileBuildCache,
+    GOMODCACHE: join(scratch, "mod"), GOPATH: join(scratch, "path"), GOFLAGS: "-count=1", GOPROXY: "off", GOTOOLCHAIN: "local" } });
   return fileBuildCache;
+}
+function shareBuildCache(root, version) {
+  version ??= execFileSync("go", ["env", "GOVERSION"], { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } }).trim();
+  const target = join(root, "build", `${version}-${goPlatform()}`);
+  mkdirSync(join(root, "build"), { recursive: true });
+  execFileSync("cp", [process.platform === "darwin" ? "-cR" : "-R", templateBuildCache(), target]);
+  return target;
 }
 async function sharedRun(t, f, plan, root, proxy, extra = {}) {
   const output = tempDir(t, "verification-shared-cache-logs-"), lines = [];
@@ -2783,8 +2797,7 @@ test("shared caches: the sharded go-race path runs every test fresh under the ch
   writeFileSync(join(module, "other/o_test.go"), counting("other", "TestOther"));
   // The check environment's GOFLAGS reaches every go test the command starts.
   const env = fixtureGoEnvironment(t, { GOFLAGS: "-count=1 -mod=readonly", GOPROXY: "off" });
-  const linked = join(tempDir(t, "verification-race-cache-"), "root");
-  env.GOCACHE = shareBuildCache(linked);
+  env.GOCACHE = shareBuildCache(join(tempDir(t, "verification-race-cache-"), "root"));
   const race = async (environment) => {
     let text = "";
     const code = await matrixRunner.runGoRace(["-shards=./internal/store=2", "./..."], {
@@ -2847,8 +2860,16 @@ test("shared caches: an older host Go uses the cached toolchain locally and says
   const stamp = JSON.parse(readFileSync(join(root, "mod", generationOf(root) + ".stamps",
     sha256Hex(readFileSync(join(f.cwd, "hub/go.sum"))) + ".json"), "utf8"));
   assert.match(stamp.toolchainTreeSha256, /^[0-9a-f]{64}$/);
+  // A changed tree is caught by any stamp in the generation, even after a
+  // go.sum change leaves no stamp for the new digest (review f2).
   writeFileSync(join(tree, "bin/extra"), "x");
-  const changed = await sharedRun(t, f, plan, root, proxy, { caches: { hostGoVersion: "go1.20.3" } });
+  appendFileSync(join(f.cwd, "hub/go.sum"), "example.com/unused v1.0.0/go.mod h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+  execFileSync("git", ["commit", "-qam", "new go.sum"], { cwd: f.cwd });
+  const bumped = execFileSync("git", ["rev-parse", "HEAD"], { cwd: f.cwd, encoding: "utf8" }).trim();
+  const newSum = makePlan({ baseCommit: bumped, commit: bumped, owned: ["docs/a.md"] }, f.cwd);
+  assert(!existsSync(join(root, "mod", generationOf(root) + ".stamps",
+    sha256Hex(readFileSync(join(f.cwd, "hub/go.sum"))) + ".json")), "no stamp for the new go.sum yet");
+  const changed = await sharedRun(t, f, newSum, root, proxy, { caches: { hostGoVersion: "go1.20.3" } });
   assert.match(changed.lines[0], /^matrix run: go caches: private: toolchain go1\.21\.0 download failed/);
   assert(insidePath(changed.receipt.environment.GOMODCACHE, changed.receipt.environment.HOME));
 });
@@ -3140,4 +3161,174 @@ test("shared caches: prepared test binaries are built in the verifier environmen
       for (const user of [join(home, "go"), join(home, "Library", "Caches", "go-build")])
         assert(!insidePath(build[key], user), `${key} ${build[key]} is under ${user}`);
   }
+});
+
+test("shared caches: seeding past its deadline runs the checks on per-home caches and says why", { timeout: 120000 }, async (t) => {
+  const proxy = moduleProxy(t);
+  const f = sharedCacheFixture(t, { proxy, script: "cd hub && go test ./...", dependency: false });
+  const root = join(cacheDirectory(t, "verification-cache-deadline-"), "root");
+  // A stand-in that never returns from seeding until it is signalled.
+  let stalled = 0;
+  const go = (args, options) =>
+    args[0] === "list" && args[1] === "-m"
+      ? new Promise((done) => {
+          stalled++;
+          options.abortSignal.addEventListener("abort", () => done({ code: -1, stdout: "", stderr: "stopped" }), { once: true });
+        })
+      : matrixRunner.runGo(args, options);
+  const started = Date.now();
+  const { receipt, lines, report } = await sharedRun(t, f, f.plan(), root, proxy, { caches: { go, deadlineMs: 1500 } });
+  assert.equal(stalled, 1);
+  assert(Date.now() - started < 60000);
+  assert.equal(receipt.checks[0].exitCode, 0, logs(receipt));
+  assert.equal(f.runs(), 1);
+  assert.equal(lines[0], "matrix run: go caches: private: cache preparation exceeded its 1500 ms deadline");
+  assert.equal(report.mode, "private");
+  for (const key of ["GOMODCACHE", "GOCACHE"]) assert(insidePath(receipt.environment[key], receipt.environment.HOME), key);
+});
+
+test("shared caches: a build directory that is a symlink or leaves the root is refused", { timeout: 120000 }, async (t) => {
+  const proxy = moduleProxy(t);
+  const f = sharedCacheFixture(t, { proxy, script: "node -e 0", dependency: false });
+  const host = execFileSync("go", ["env", "GOVERSION"], { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } }).trim();
+  for (const shape of ["directory", "parent"]) {
+    const root = join(cacheDirectory(t, "verification-cache-buildlink-"), "root");
+    const elsewhere = cacheDirectory(t, "verification-cache-elsewhere-");
+    writeFileSync(join(elsewhere, "tailterm-cache.json"), JSON.stringify({ version: 1, kind: "build", owns: ["build"] }));
+    mkdirSync(root);
+    if (shape === "directory") {
+      mkdirSync(join(root, "build"));
+      symlinkSync(elsewhere, join(root, "build", `${host}-${goPlatform()}`));
+    } else {
+      mkdirSync(join(elsewhere, `${host}-${goPlatform()}`));
+      writeFileSync(join(elsewhere, `${host}-${goPlatform()}`, "tailterm-cache.json"),
+        JSON.stringify({ version: 1, kind: "build", owns: ["build"] }));
+      symlinkSync(elsewhere, join(root, "build"));
+    }
+    const before = treeSnapshot(elsewhere);
+    const { receipt, lines } = await sharedRun(t, f, f.plan(), root, proxy);
+    assert.equal(receipt.checks[0].exitCode, 0, logs(receipt));
+    assert.match(lines[0], /^matrix run: go caches: private: build directory go\S+ resolves outside /, shape);
+    assert.deepEqual(treeSnapshot(elsewhere), before, shape);
+    assert(!existsSync(join(root, "mod")), shape);
+  }
+});
+
+test("shared caches: the wasm seed plan is read from build-wasm.sh or the check keeps per-home modules", (t) => {
+  const cwd = tempDir(t, "verification-wasm-spec-");
+  mkdirSync(join(cwd, "scripts"));
+  mkdirSync(join(cwd, "hub"));
+  const script = (version) => `#!/bin/sh\nsource="$root/.build/tailscale-${version}"\n` +
+    `cp wasm/upstream_js.go "$source/cmd/tsconnect/wasm/wasm_js.go"\ncp wasm/ssh_js.go "$source/cmd/tsconnect/wasm/ssh_js.go"\n`;
+  writeFileSync(join(cwd, "hub/go.mod"), "module m\n\ngo 1.21\n\nrequire (\n\ttailscale.com v1.102.3\n)\n");
+  writeFileSync(join(cwd, "scripts/build-wasm.sh"), script("1.102.3"));
+  assert.deepEqual(matrixRunner.wasmSeedSpec(cwd), { version: "1.102.3",
+    copies: [{ from: "upstream_js.go", to: "wasm_js.go" }, { from: "ssh_js.go", to: "ssh_js.go" }] });
+  writeFileSync(join(cwd, "scripts/build-wasm.sh"), script("1.104.0"));
+  assert.equal(matrixRunner.wasmSeedSpec(cwd).cause, "build-wasm.sh builds tailscale 1.104.0 but hub/go.mod requires 1.102.3");
+  writeFileSync(join(cwd, "scripts/build-wasm.sh"), "#!/bin/sh\nmake wasm\n");
+  assert.equal(matrixRunner.wasmSeedSpec(cwd).cause, "build-wasm.sh has no Tailscale version or copy lines");
+  // The real script parses and matches the real hub/go.mod.
+  const repo = new URL("..", import.meta.url).pathname;
+  const real = matrixRunner.wasmSeedSpec(repo);
+  assert.match(real.version, /^\d+\.\d+\.\d+$/, JSON.stringify(real));
+  assert(real.copies.some((copy) => copy.from === "upstream_js.go" && copy.to === "wasm_js.go"));
+});
+
+// A fixture tailscale.com whose cmd/tsconnect/wasm needs example.com/jsdep
+// only through the overlaid wasm/upstream_js.go, as build-wasm.sh copies it.
+function addTailscaleFixture(t, proxy) {
+  const jsdepMod = "module example.com/jsdep\n\ngo 1.21\n";
+  const versions = (path) => {
+    const dir = join(proxy.directory, path, "@v");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  const jsdep = versions("example.com/jsdep");
+  writeFileSync(join(jsdep, "list"), "v1.0.0\n");
+  writeFileSync(join(jsdep, "v1.0.0.info"), '{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}\n');
+  writeFileSync(join(jsdep, "v1.0.0.mod"), jsdepMod);
+  writeFileSync(join(jsdep, "v1.0.0.zip"), storedZip({
+    "example.com/jsdep@v1.0.0/go.mod": jsdepMod,
+    "example.com/jsdep@v1.0.0/jsdep.go": "package jsdep\n\nfunc Value() int { return 2 }\n",
+  }));
+  const source = tempDir(t, "verification-tailscale-source-");
+  const files = {
+    "go.mod": "module tailscale.com\n\ngo 1.21\n\nrequire example.com/jsdep v1.0.0\n",
+    "x/x.go": "package x\n\nfunc V() int { return 1 }\n",
+    "cmd/tsconnect/wasm/main.go": "package main\n\nfunc main() {}\n",
+    "cmd/tsconnect/other/o.go": 'package other\n\nimport _ "example.com/jsdep"\n',
+  };
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(join(source, name, ".."), { recursive: true });
+    writeFileSync(join(source, name), text);
+  }
+  execFileSync("go", ["mod", "tidy"], { cwd: source, env: fixtureGoEnvironment(t, { GOPROXY: proxy.url }), stdio: "pipe" });
+  files["go.sum"] = readFileSync(join(source, "go.sum"), "utf8");
+  files["go.mod"] = readFileSync(join(source, "go.mod"), "utf8");
+  const ts = versions("tailscale.com");
+  writeFileSync(join(ts, "list"), "v1.0.0\n");
+  writeFileSync(join(ts, "v1.0.0.info"), '{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}\n');
+  writeFileSync(join(ts, "v1.0.0.mod"), files["go.mod"]);
+  writeFileSync(join(ts, "v1.0.0.zip"), storedZip(Object.fromEntries(
+    Object.entries(files).map(([name, text]) => ["tailscale.com@v1.0.0/" + name, text]))));
+}
+const wasmScript = (version) => `#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+root=$(pwd)
+source="$root/.build/tailscale-${version}"
+mkdir -p .build
+if [ -d "$source" ]; then chmod -R u+w "$source"; rm -rf "$source"; fi
+(cd hub && go mod download tailscale.com) || true
+cp -R "$(cd hub && go list -m -f '{{.Dir}}' tailscale.com)" "$source"
+chmod -R u+w "$source"
+cp wasm/upstream_js.go "$source/cmd/tsconnect/wasm/wasm_js.go"
+cd "$source"
+echo "wasm GOMODCACHE=$(go env GOMODCACHE) GOPROXY=$(go env GOPROXY)"
+GOOS=js GOARCH=wasm go build -tags=tailserve_test -o "$root/.build/test.wasm" ./cmd/tsconnect/wasm
+`;
+
+test("shared caches: wasm-test-build reads Tailscale's module set from the generation, cold then warm", { timeout: 300000 }, async (t) => {
+  const proxy = moduleProxy(t);
+  addTailscaleFixture(t, proxy);
+  const f = sharedCacheFixture(t, {
+    proxy,
+    rules: [{ prefixes: ["wasm/"], groups: ["wasm"] }],
+    files: {
+      "hub/ts.go": 'package hub\n\nimport "tailscale.com/x"\n\nvar _ = x.V\n',
+      "wasm/upstream_js.go": 'package main\n\nimport _ "example.com/jsdep"\n',
+      "scripts/build-wasm.sh": wasmScript("1.0.0"),
+    },
+    extraRequire: "tailscale.com v1.0.0",
+  });
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\n");
+  execFileSync("git", ["commit", "-qam", "ignore .build"], { cwd: f.cwd });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: f.cwd, encoding: "utf8" }).trim();
+  const plan = makePlan({ baseCommit: commit, commit, owned: ["wasm/upstream_js.go"] }, f.cwd);
+  assert.deepEqual(plan.checks.map((check) => check.id), ["wasm-test-build"]);
+  const root = join(cacheDirectory(t, "verification-cache-wasm-"), "root");
+  shareBuildCache(root);
+  const cold = await sharedRun(t, f, plan, root, proxy);
+  assert.equal(cold.receipt.checks[0].exitCode, 0, logs(cold.receipt));
+  assert.match(cold.lines[0], /\(seeded \d+ modules\).*, wasm-test-build: shared modules$/);
+  const generation = join(realpathSync(root), "mod", generationOf(root));
+  assert(existsSync(join(generation, "cache/download/example.com/jsdep/@v/v1.0.0.zip")), "the overlay's import was seeded");
+  assert.match(logs(cold.receipt), new RegExp(`wasm GOMODCACHE=${generation} GOPROXY=off`));
+  assert.equal(cold.report.wasm.modules, "shared");
+  const warm = await sharedRun(t, f, plan, root, proxy);
+  assert.equal(warm.receipt.checks[0].exitCode, 0, logs(warm.receipt));
+  assert.match(warm.lines[0], /\(warm\).*, wasm-test-build: shared modules$/);
+  assert.deepEqual(warm.report.downloads, { toolchains: 0, modules: 0 });
+
+  // A script whose Tailscale version differs from hub/go.mod: that check
+  // alone keeps per-home modules, with the network.
+  writeFileSync(join(f.cwd, "scripts/build-wasm.sh"), wasmScript("9.9.9"));
+  execFileSync("git", ["commit", "-qam", "other version"], { cwd: f.cwd });
+  const other = execFileSync("git", ["rev-parse", "HEAD"], { cwd: f.cwd, encoding: "utf8" }).trim();
+  const mismatch = await sharedRun(t, f, makePlan({ baseCommit: other, commit: other, owned: ["wasm/upstream_js.go"] }, f.cwd), root, proxy);
+  assert.equal(mismatch.receipt.checks[0].exitCode, 0, logs(mismatch.receipt));
+  assert.match(mismatch.lines[0], /, wasm-test-build: per-home modules \(build-wasm\.sh builds tailscale 9\.9\.9 but hub\/go\.mod requires 1\.0\.0\)$/);
+  const home = mismatch.receipt.environment.HOME;
+  assert.match(logs(mismatch.receipt), new RegExp(`wasm GOMODCACHE=${join(home, "go", "pkg", "mod")} GOPROXY=${proxy.url}`));
 });
