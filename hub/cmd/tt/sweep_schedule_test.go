@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +28,32 @@ import (
 // starts the relay loop gets this no-op, and the schedule tests call
 // sweepScheduleAttempt with their own fixture.
 func init() { relaySweepSchedule = func(context.Context) {} }
+
+// No test in this package probes a real process for the matrix mutex owner:
+// the probe starts as strayMatrixOwnerProbe, newSweepFixture replaces it with
+// a fake table, and only nativeMatrixOwnerProbeFor installs the real one.
+func init() { matrixOwnerProbe = strayMatrixOwnerProbe }
+
+// strayMatrixOwnerProbe fails the test binary at the first owner probe that
+// reaches it, before any signal or ps runs, naming the pid and the fix.
+func strayMatrixOwnerProbe(pid int) (bool, time.Time, bool) {
+	panic(fmt.Sprintf("a test probed matrix mutex owner pid %d without a process table: use newSweepFixture or fakeMatrixOwners, or opt in with nativeMatrixOwnerProbeFor(t, reason)", pid))
+}
+
+// nativeMatrixOwnerProbeFor is the one way a test may signal and inspect a
+// real process to learn whether a mutex owner is alive. The reason says why a
+// fake table cannot serve and is logged with the test; it may not be empty.
+// Only TestSweepMatrixOwnerProbeGuard uses it, and calls no probe.
+func nativeMatrixOwnerProbeFor(t *testing.T, reason string) {
+	t.Helper()
+	if strings.TrimSpace(reason) == "" {
+		t.Fatal("the native matrix owner probe needs a stated reason")
+	}
+	t.Logf("this test signals and inspects real processes: %s", reason)
+	old := matrixOwnerProbe
+	matrixOwnerProbe = nativeMatrixOwnerProbe
+	t.Cleanup(func() { matrixOwnerProbe = old })
+}
 
 const (
 	sweepHost = "fixture-host"
@@ -171,6 +200,10 @@ func newSweepFixture(t *testing.T) *sweepFixture {
 	oldHost := matrixWaitHostname
 	matrixWaitHostname = func() (string, error) { return sweepHost, nil }
 	t.Cleanup(func() { matrixWaitHostname = oldHost })
+	// An empty process table: every mutex owner, including a node child the
+	// test started, is alive with an unknown start and is never reclaimed. A
+	// test that needs a dead or restarted owner passes its own table.
+	fakeMatrixOwners(t, nil)
 	entry := releasedArtifactEntry(sweepItem)
 	entry.ID, entry.TaskID, entry.Host, entry.Repository = "tqe_sweep_repo", sweepTask, sweepHost, r.main
 	f.hub = &sweepHub{cleanupHub: cleanupHub{
@@ -1538,6 +1571,82 @@ func fakeMatrixOwners(t *testing.T, table map[int]fakeMatrixOwner) {
 		return owner.alive, owner.started, owner.known
 	}
 	t.Cleanup(func() { matrixOwnerProbe = old })
+}
+
+// The owner probe outside a fixture refuses before signalling anything,
+// newSweepFixture answers from a fake table, the opt-in installs the native
+// probe only for its own test, and no test file reaches the native probe or
+// replaces the owner probe except through these helpers.
+func TestSweepMatrixOwnerProbeGuard(t *testing.T) {
+	probe := func() uintptr { return reflect.ValueOf(matrixOwnerProbe).Pointer() }
+	stray, native := reflect.ValueOf(strayMatrixOwnerProbe).Pointer(), reflect.ValueOf(nativeMatrixOwnerProbe).Pointer()
+	dead := matrixOwner{PID: 2147483646, Token: "fixture", At: time.Now(), HasAt: true}
+	if probe() != stray {
+		t.Fatal("outside a fixture the owner probe is not the stray guard: a test left its probe behind")
+	}
+	func() {
+		defer func() {
+			if r := recover(); !strings.Contains(fmt.Sprint(r), "matrix mutex owner pid 2147483646 without a process table") {
+				t.Errorf("an owner probe outside a fixture did not refuse: %v", r)
+			}
+		}()
+		matrixOwnerDead(dead)
+	}()
+	t.Run("the fixture installs an empty table", func(t *testing.T) {
+		newSweepFixture(t)
+		if probe() == stray || probe() == native {
+			t.Fatal("newSweepFixture left the owner probe unreplaced")
+		}
+		if why := matrixOwnerDead(dead); why != "" {
+			t.Fatalf("an owner outside the fixture's table: %q", why)
+		}
+	})
+	if probe() != stray {
+		t.Fatal("the fixture did not restore the stray guard")
+	}
+	t.Run("the opt-in installs the native probe for its own test", func(t *testing.T) {
+		nativeMatrixOwnerProbeFor(t, "the guard checks which probe is installed and calls none")
+		if probe() != native {
+			t.Fatal("the opt-in did not install the native probe")
+		}
+	})
+	if probe() != stray {
+		t.Fatal("the opt-in did not restore the stray guard")
+	}
+	// Source check: only the opt-in reaches the native probe, and only the
+	// guard, the fake table and the opt-in replace the owner probe.
+	files, err := filepath.Glob("*_test.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("test files: %v %v", files, err)
+	}
+	fset := token.NewFileSet()
+	for _, file := range files {
+		parsed, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range parsed.Decls {
+			name := ""
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				name = fn.Name.Name
+			}
+			ast.Inspect(decl, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.Ident:
+					if n.Name == "nativeMatrixOwnerProbe" && name != "nativeMatrixOwnerProbeFor" && name != "TestSweepMatrixOwnerProbeGuard" {
+						t.Errorf("%s: %s reaches the native owner probe without nativeMatrixOwnerProbeFor", fset.Position(n.Pos()), name)
+					}
+				case *ast.AssignStmt:
+					for _, lhs := range n.Lhs {
+						if id, ok := lhs.(*ast.Ident); ok && id.Name == "matrixOwnerProbe" && name != "init" && name != "fakeMatrixOwners" && name != "nativeMatrixOwnerProbeFor" {
+							t.Errorf("%s: %s replaces the owner probe outside fakeMatrixOwners and nativeMatrixOwnerProbeFor", fset.Position(n.Pos()), name)
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
 }
 
 // notRepository adds a queue entry whose repository directory exists but is
