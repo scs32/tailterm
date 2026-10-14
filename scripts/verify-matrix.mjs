@@ -15,19 +15,21 @@ import {
   closeSync,
   readSync,
   renameSync,
+  readlinkSync,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute, dirname, basename } from "node:path";
 import {
   tmpdir,
+  homedir,
   availableParallelism,
   totalmem,
   getPriority,
   setPriority,
 } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { buildHistoricalHub, buildMatrixBinaries, fileHash } from "../tests/test-binaries.mjs";
+import { fileHash } from "../tests/test-binaries.mjs";
 import {
   acquireHostLock,
   releaseRun,
@@ -1106,6 +1108,573 @@ exit 1
   return bin;
 }
 
+// Shared verification caches (wi_3c81378998da5acd): one harness-owned root
+// per host holds the Go module generations, the toolchain, a build cache per
+// toolchain and the speech model. Checks only read modules (GOPROXY=off) and
+// every go test runs fresh; see docs/objective-verification.md.
+const CACHE_PRODUCER = "scripts/verify-matrix.mjs";
+// The same rule as scripts/package-speech-model.mjs, which this file does not
+// import (the deployer re-execs on the runner's own imports); a test keeps
+// the two equal. An absolute TAILTERM_VERIFICATION_CACHE, else the user's
+// cache directory.
+export function verificationCacheRoot(environment = process.env) {
+  const named = environment.TAILTERM_VERIFICATION_CACHE;
+  if (named && isAbsolute(named)) return named;
+  const home = environment.HOME || homedir();
+  if (process.platform === "darwin")
+    return join(home, "Library", "Caches", "tailterm-verification");
+  const xdg = environment.XDG_CACHE_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(home, ".cache"), "tailterm-verification");
+}
+const GENERATION = /^gen-[a-f0-9]{16}$/;
+const BUILD_OUTPUT = /^[0-9a-f]{64}-d$/;
+const BUILD_INDEX = /^[0-9a-f]{64}-a$/;
+const BUILD_INDEX_LINE = /^v1 [0-9a-f]{64} [0-9a-f]{64} [ 0-9]{19}[0-9] [ 0-9]{19}[0-9]\n$/;
+const BUILD_FILES = new Set(["README", "trim.txt", "testexpire.txt", "tailterm-cache.json"]);
+const ROOT_ENTRIES = new Set(["mod", "build", "speech-model", "tailterm-cache.json"]);
+const DEFAULT_GOPROXY = "https://proxy.golang.org,direct";
+// Every check family verification/matrix.json defines can run go: hub checks,
+// the wasm build, npm test (release-runner tests build tt) and browser suites
+// (prepared or standalone test binaries). Keyed on ids, not argv.
+const GO_CACHE_FAMILIES = new Set([
+  "go-vet", "go-test", "go-race", "migration-rehearsal", "wasm-test-build",
+  "npm-unit", "00-static-build", "01-static-release-verify",
+]);
+const GO_TEST_CHECKS = new Set(["go-test", "go-race", "migration-rehearsal"]);
+export const goCacheFamily = (check) =>
+  GO_CACHE_FAMILIES.has(check.id) ||
+  /^tests\/[^/]+\.mjs(:(chromium|webkit))?$/.test(check.id);
+// A checkout with no hub/go.sum has no module set to seed (every synthetic
+// fixture): its checks keep per-home Go caches as before.
+export const sharesGoCaches = (checks, cwd) =>
+  existsSync(join(cwd, "hub", "go.sum")) && checks.some(goCacheFamily);
+
+// A go test result line marked (cached), plain or inside -json output.
+export const cachedGoTestResult = (log) =>
+  /(?:^|\n|")ok(?:[ \t]|\\t)+[^\s\\"]+(?:[ \t]|\\t)+\(cached\)/.test(log);
+export function assertFreshGoTest(check, log) {
+  if (GO_TEST_CHECKS.has(check.id) && cachedGoTestResult(log))
+    throw new Error("Go test result came from the build cache: " + check.id);
+}
+
+class CacheRefusal extends Error {}
+const within = (child, parent) => {
+  const rel = relative(parent, child);
+  return rel === "" || (rel.split("/")[0] !== ".." && !isAbsolute(rel));
+};
+// The real path of the deepest existing ancestor plus the rest, so a root that
+// does not exist yet still resolves through symlinked parents.
+function realish(path) {
+  let existing = resolve(path), rest = "";
+  while (!existsSync(existing) && dirname(existing) !== existing) {
+    rest = join(basename(existing), rest);
+    existing = dirname(existing);
+  }
+  return join(realpathSync(existing), rest);
+}
+const goos = () => (process.platform === "win32" ? "windows" : process.platform);
+const goarch = () => ({ x64: "amd64", ia32: "386" })[process.arch] || process.arch;
+
+// Runs go without blocking the event loop (the host lock heartbeats).
+export function runGo(args, { cwd, env, abortSignal }) {
+  return new Promise((done) => {
+    if (abortSignal?.aborted) return done({ code: -1, stdout: "", stderr: "interrupted" });
+    const child = spawn("go", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    const kill = () => child.kill("SIGTERM");
+    abortSignal?.addEventListener("abort", kill, { once: true });
+    child.stdout.setEncoding("utf8").on("data", (data) => (stdout += data));
+    child.stderr.setEncoding("utf8").on("data", (data) => (stderr += data));
+    child.on("error", (error) => {
+      abortSignal?.removeEventListener("abort", kill);
+      done({ code: -1, stdout, stderr: stderr + error.message });
+    });
+    child.on("close", (code) => {
+      abortSignal?.removeEventListener("abort", kill);
+      done({ code: code ?? -1, stdout, stderr });
+    });
+  });
+}
+
+// The Go cache paths of the runner's own environment and the user's defaults.
+function userGoPaths(go = runGo) {
+  return go(["env", "-json", "GOPATH", "GOMODCACHE", "GOCACHE"], {
+    cwd: tmpdir(),
+    env: { ...process.env, GOTOOLCHAIN: "local" },
+  }).then(({ code, stdout, stderr }) => {
+    if (code !== 0) throw new CacheRefusal("go env failed: " + stderr.trim().split("\n")[0]);
+    const found = JSON.parse(stdout);
+    return [
+      join(homedir(), "go"),
+      join(homedir(), "Library", "Caches", "go-build"),
+      ...String(found.GOPATH || "").split(":").filter(Boolean),
+      found.GOMODCACHE,
+      found.GOCACHE,
+    ].filter((path) => path && isAbsolute(path));
+  });
+}
+// Refuses, before anything is created, a root that overlaps a user Go cache
+// or the checkout; returns the root's resolved path.
+export async function validateCacheRoot(root, { cwd, paths }) {
+  if (typeof root !== "string" || !isAbsolute(root))
+    throw new CacheRefusal(`cache root is not an absolute path: ${root}`);
+  const real = realish(root);
+  for (const path of paths) {
+    const other = realish(path);
+    if (within(real, other) || within(other, real))
+      throw new CacheRefusal(`cache root ${root} overlaps the user's Go cache ${path}`);
+  }
+  if (within(real, realish(cwd)))
+    throw new CacheRefusal(`cache root ${root} is inside the checkout`);
+  return real;
+}
+
+function readJson(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+function writeJsonAtomically(path, value) {
+  const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", { mode: 0o644 });
+  renameSync(temporary, path);
+}
+// Fields carried from the marker item (wi_60dbbbe5b36bf66b): producer, item,
+// run, creation time and the owned directories, relative to the root.
+function cacheMarker(kind, context, owns, extra = {}) {
+  return {
+    version: 1,
+    kind,
+    producer: CACHE_PRODUCER + (context.commit ? "@" + context.commit : ""),
+    item: context.item,
+    run: context.run,
+    createdAt: new Date().toISOString(),
+    owns,
+    ...extra,
+  };
+}
+export const validCacheMarker = (marker, kind) =>
+  Boolean(marker) && typeof marker === "object" && marker.version === 1 &&
+  marker.kind === kind && Array.isArray(marker.owns) &&
+  marker.owns.every((path) => typeof path === "string" && path && !isAbsolute(path) &&
+    !path.split("/").includes(".."));
+
+function ensureCacheRoot(root, context) {
+  const markerPath = join(root, "tailterm-cache.json");
+  if (!existsSync(root)) mkdirSync(root, { recursive: true, mode: 0o700 });
+  else if (validCacheMarker(readJson(markerPath), "root")) return;
+  else {
+    const foreign = readdirSync(root).filter((name) => !ROOT_ENTRIES.has(name) && !name.endsWith(".tmp"));
+    if (foreign.length)
+      throw new CacheRefusal(`cache root ${root} has no tailterm marker and holds ${foreign.slice(0, 3).join(", ")}`);
+  }
+  writeJsonAtomically(markerPath, cacheMarker("root", context, ["mod", "build", "speech-model"]));
+}
+
+// Go version strings compare by their numeric release parts.
+const goRelease = (version) => String(version).replace(/^go/, "").split(/[^0-9.]/)[0].split(".").map(Number);
+export function goVersionAtLeast(have, want) {
+  const a = goRelease(have), b = goRelease(want);
+  for (let i = 0; i < Math.max(a.length, b.length); i++)
+    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+  return true;
+}
+export function requiredGoVersion(goMod) {
+  const language = /^go\s+(\d+\.\d+(?:\.\d+)?)\s*$/m.exec(goMod)?.[1];
+  const toolchain = /^toolchain\s+go(\d+\.\d+(?:\.\d+)?)\s*$/m.exec(goMod)?.[1];
+  if (!language) throw new CacheRefusal("hub/go.mod has no go line");
+  let want = toolchain && goVersionAtLeast(toolchain, language) ? toolchain : language;
+  // Since Go 1.21 a two-part go line names the .0 release.
+  if (want.split(".").length === 2 && Number(want.split(".")[1]) >= 21) want += ".0";
+  return "go" + want;
+}
+
+async function treeDigest(dir) {
+  const lines = [];
+  const visit = async (path, rel) => {
+    for (const name of readdirSync(path).sort()) {
+      const full = join(path, name), entry = lstatSync(full);
+      if (entry.isDirectory()) await visit(full, rel + name + "/");
+      else if (entry.isSymbolicLink()) lines.push(`${rel}${name}\0link\0${readlinkSync(full)}`);
+      else if (entry.isFile()) lines.push(`${rel}${name}\0${entry.size}\0${await fileHash(full)}`);
+    }
+  };
+  await visit(dir, "");
+  return createHash("sha256").update(lines.join("\n")).digest("hex");
+}
+const countZips = (dir) => {
+  let count = 0;
+  const visit = (path) => {
+    let names;
+    try {
+      names = readdirSync(path, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of names)
+      if (entry.isDirectory()) {
+        // The toolchain is counted on its own.
+        if (!(entry.name === "toolchain" && basename(path) === "golang.org")) visit(join(path, entry.name));
+      } else if (entry.name.endsWith(".zip")) count++;
+  };
+  visit(join(dir, "cache", "download"));
+  return count;
+};
+
+// The module sources a plan needs: the candidate's hub module, and the
+// historical hub's when that binary is prepared (extracted into the home).
+function moduleSources(cwd, home, plan) {
+  const sources = [{ name: "hub", dir: join(cwd, "hub") }];
+  if (plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs"))) {
+    const dir = join(home, ".verifier-sources", historicalHubCommit);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const archive = execFileSync("git", ["archive", "--format=tar", historicalHubCommit, "hub"], {
+      cwd, maxBuffer: 128 * 1024 * 1024,
+    });
+    execFileSync("tar", ["-xf", "-", "-C", dir], { input: archive });
+    sources.push({ name: "historical " + historicalHubCommit, dir: join(dir, "hub") });
+  }
+  for (const source of sources)
+    source.goSumSha256 = createHash("sha256").update(readFileSync(join(source.dir, "go.sum"))).digest("hex");
+  return sources;
+}
+
+// Validates a generation for every source with the network off. Returns the
+// first problem: "incomplete" (a module is missing) or "integrity".
+async function validateGeneration(generation, sources, environment, go, abortSignal) {
+  const env = { ...environment, GOMODCACHE: generation, GOPROXY: "off" };
+  for (const source of sources) {
+    const listed = await go(["list", "-deps", "-test", "./..."], { cwd: source.dir, env, abortSignal });
+    if (listed.code !== 0)
+      return { problem: "incomplete", source, detail: listed.stderr.trim().split("\n")[0] };
+    const verified = await go(["mod", "verify"], { cwd: source.dir, env, abortSignal });
+    if (verified.code !== 0) {
+      const detail = verified.stderr.trim().split("\n")[0];
+      return { problem: /GOPROXY=off|module lookup disabled/.test(verified.stderr) ? "incomplete" : "integrity", source, detail };
+    }
+  }
+  return {};
+}
+// Adds a source's module graph and its package modules to a generation.
+async function seedGeneration(generation, sources, environment, goProxy, go, abortSignal) {
+  const env = { ...environment, GOMODCACHE: generation, GOPROXY: goProxy };
+  for (const source of sources)
+    for (const args of [["list", "-m", "all"], ["list", "-deps", "-test", "./..."]]) {
+      const run = await go(args, { cwd: source.dir, env, abortSignal });
+      if (run.code !== 0)
+        throw new CacheRefusal(`seeding ${source.name} failed: ${run.stderr.trim().split("\n").at(-1)}`);
+    }
+}
+
+// Selects (and, when needed, seeds) the module generation and toolchain.
+async function prepareModules(root, sources, toolchain, environment, context, options) {
+  const { goProxy, go, abortSignal } = options;
+  const modRoot = join(root, "mod");
+  mkdirSync(modRoot, { recursive: true, mode: 0o700 });
+  const pointerPath = join(modRoot, "current.json");
+  const report = { state: "warm", generation: "", modulesAdded: 0, toolchainDownloads: 0 };
+  let generation, cause = "";
+  const pointer = readJson(pointerPath);
+  if (pointer === null || (pointer !== undefined && !validCacheMarker(pointer, "mod")))
+    cause = "unreadable current.json";
+  else if (pointer) {
+    if (typeof pointer.dir !== "string" || !GENERATION.test(pointer.dir))
+      throw new CacheRefusal(`current.json names an unsafe generation: ${JSON.stringify(pointer.dir)}`);
+    const path = join(modRoot, pointer.dir);
+    if (!existsSync(path)) cause = `generation ${pointer.dir} is missing`;
+    else if (realpathSync(path) !== join(realpathSync(modRoot), pointer.dir) || !statSync(path).isDirectory())
+      throw new CacheRefusal(`current.json generation ${pointer.dir} resolves outside ${modRoot}`);
+    else generation = path;
+  }
+  const stampPath = (dir, source) => join(`${dir}.stamps`, `${source.goSumSha256}.json`);
+  const toolchainDir = (dir) =>
+    join(dir, "golang.org", `toolchain@v0.0.1-${toolchain.version}.${goos()}-${goarch()}`);
+  const env = () => ({
+    ...environment,
+    PATH: toolchain.source === "host" ? environment.PATH : join(toolchainDir(generation), "bin") + ":" + environment.PATH,
+  });
+  // The toolchain an older host needs: present, runnable and, once stamped,
+  // with the same tree digest.
+  const checkToolchain = async (dir) => {
+    if (toolchain.source === "host") return "";
+    const tree = toolchainDir(dir);
+    if (!existsSync(join(tree, "bin", "go"))) return "incomplete";
+    const ran = await go(["version"], {
+      cwd: tmpdir(), env: { ...environment, PATH: join(tree, "bin") + ":" + environment.PATH }, abortSignal,
+    });
+    if (ran.code !== 0 || !ran.stdout.includes(toolchain.version + " ")) return "integrity";
+    toolchain.treeSha256 = await treeDigest(tree);
+    const stamped = sources
+      .map((source) => readJson(stampPath(dir, source))?.toolchainTreeSha256)
+      .find(Boolean);
+    return stamped && stamped !== toolchain.treeSha256 ? "integrity" : "";
+  };
+  const seedToolchain = async (dir) => {
+    const run = await go(["version"], {
+      cwd: tmpdir(),
+      env: { ...environment, GOMODCACHE: dir, GOPROXY: goProxy, GOTOOLCHAIN: toolchain.version },
+      abortSignal,
+    });
+    if (run.code !== 0 || !run.stdout.includes(toolchain.version))
+      throw new CacheRefusal(`toolchain ${toolchain.version} download failed: ${run.stderr.trim().split("\n").at(-1)}`);
+    report.toolchainDownloads++;
+    toolchain.treeSha256 = await treeDigest(toolchainDir(dir));
+  };
+  if (generation) {
+    const tool = await checkToolchain(generation);
+    if (tool === "integrity") {
+      cause = "toolchain tree changed";
+      generation = undefined;
+    } else {
+      if (tool === "incomplete") {
+        await seedToolchain(generation);
+        report.state = "seeded";
+      }
+      let found = await validateGeneration(generation, sources, env(), go, abortSignal);
+      if (found.problem === "incomplete") {
+        const before = countZips(generation);
+        await seedGeneration(generation, sources, env(), goProxy, go, abortSignal);
+        report.modulesAdded += countZips(generation) - before;
+        report.state = "seeded";
+        found = await validateGeneration(generation, sources, env(), go, abortSignal);
+      }
+      if (found.problem) {
+        cause = `${found.problem} (${found.source.name}): ${found.detail}`;
+        generation = undefined;
+      }
+    }
+  }
+  if (!generation) {
+    const name = "gen-" + randomBytes(8).toString("hex");
+    generation = join(modRoot, name);
+    mkdirSync(generation, { mode: 0o755 });
+    if (toolchain.source !== "host") await seedToolchain(generation);
+    await seedGeneration(generation, sources, env(), goProxy, go, abortSignal);
+    report.modulesAdded += countZips(generation);
+    const found = await validateGeneration(generation, sources, env(), go, abortSignal);
+    if (found.problem)
+      throw new CacheRefusal(`new generation ${name} failed validation: ${found.problem}: ${found.detail}`);
+    writeJsonAtomically(pointerPath, cacheMarker("mod", context, ["mod/" + name], { dir: name }));
+    report.state = cause ? "rebuilt" : "seeded";
+    report.cause = cause;
+  }
+  const name = basename(generation);
+  mkdirSync(`${generation}.stamps`, { recursive: true, mode: 0o755 });
+  report.stampsWritten = 0;
+  for (const source of sources) {
+    const stamp = readJson(stampPath(generation, source));
+    if (report.state === "warm" && validCacheMarker(stamp, "stamp") && stamp.toolchain === toolchain.version &&
+        stamp.toolchainTreeSha256 === (toolchain.treeSha256 || null))
+      continue;
+    report.stampsWritten++;
+    writeJsonAtomically(stampPath(generation, source), cacheMarker("stamp", context, ["mod/" + name], {
+      dir: name,
+      goSumSha256: source.goSumSha256,
+      source: source.name,
+      toolchain: toolchain.version,
+      toolchainTreeSha256: toolchain.treeSha256 || null,
+    }));
+  }
+  report.generation = name;
+  report.generations = readdirSync(modRoot).filter((entry) => GENERATION.test(entry)).length;
+  return { generation, env: env(), report };
+}
+
+// A Go build cache directory is ours when its marker is valid and it holds
+// nothing Go would not write there.
+function validBuildDir(dir) {
+  if (!validCacheMarker(readJson(join(dir, "tailterm-cache.json")), "build")) return false;
+  return readdirSync(dir).every((name) =>
+    BUILD_FILES.has(name) || /^[0-9a-f]{2}$/.test(name) || name.endsWith(".tmp"));
+}
+function selectBuildDir(root, version, context) {
+  const base = join(root, "build", `${version}-${goos()}-${goarch()}`);
+  const skipped = [];
+  for (let n = 1; n <= 64; n++) {
+    const dir = n === 1 ? base : `${base}.${n}`;
+    if (!existsSync(dir)) {
+      // Made complete under a temporary name, then renamed: a peer sees either
+      // nothing or a directory with its marker.
+      mkdirSync(dirname(dir), { recursive: true, mode: 0o755 });
+      const temporary = `${dir}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      mkdirSync(temporary, { mode: 0o755 });
+      writeJsonAtomically(join(temporary, "tailterm-cache.json"),
+        cacheMarker("build", context, [relative(root, dir)], { toolchain: version }));
+      try {
+        renameSync(temporary, dir);
+      } catch (error) {
+        rmSync(temporary, { recursive: true, force: true });
+        if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
+      }
+    }
+    if (validBuildDir(dir)) return { dir, skipped };
+    skipped.push(basename(dir));
+  }
+  throw new CacheRefusal(`no usable build cache directory under ${dirname(base)}`);
+}
+
+const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+// Go names each stored output by the sha256 of its bytes and only checks the
+// size when it reads one. Every output whose bytes do not hash to its name is
+// removed (an executable directory whole), so Go rebuilds it; a malformed
+// index entry likewise. A peer writes outputs in place, last byte last: a
+// mismatch is removed only once its size and mtime stay put.
+export async function scanBuildCache(dir, { settleMs = 200, settleTries = 5 } = {}) {
+  const started = Date.now();
+  const result = { outputs: 0, removed: 0, inUse: 0, ms: 0 };
+  const stable = async (path, check) => {
+    let before = statSync(path, { throwIfNoEntry: false });
+    if (!before) return false;
+    for (let i = 0; i < settleTries; i++) {
+      await pause(settleMs);
+      const now = statSync(path, { throwIfNoEntry: false });
+      if (!now) return false;
+      if (now.size === before.size && now.mtimeMs === before.mtimeMs) return !(await check());
+      before = now;
+    }
+    return false;
+  };
+  const hashMatches = async (path, id) => (await fileHash(path)) === id;
+  for (const shard of readdirSync(dir).filter((name) => /^[0-9a-f]{2}$/.test(name)).sort()) {
+    const shardDir = join(dir, shard);
+    for (const name of readdirSync(shardDir)) {
+      const path = join(shardDir, name);
+      const entry = lstatSync(path, { throwIfNoEntry: false });
+      if (!entry) continue;
+      if (BUILD_OUTPUT.test(name)) {
+        const id = name.slice(0, 64);
+        result.outputs++;
+        if (entry.isFile()) {
+          if (await hashMatches(path, id)) continue;
+          if (await stable(path, () => hashMatches(path, id))) {
+            rmSync(path, { force: true });
+            result.removed++;
+          } else result.inUse++;
+        } else if (entry.isDirectory()) {
+          for (const inner of readdirSync(path)) {
+            const file = join(path, inner);
+            if (await hashMatches(file, id)) continue;
+            if (await stable(file, () => hashMatches(file, id))) {
+              rmSync(path, { recursive: true, force: true });
+              result.removed++;
+            } else result.inUse++;
+            break;
+          }
+        }
+      } else if (BUILD_INDEX.test(name) && entry.isFile()) {
+        const wellFormed = () => BUILD_INDEX_LINE.test(readFileSync(path, "latin1"));
+        if (wellFormed()) continue;
+        if (await stable(path, async () => wellFormed())) {
+          rmSync(path, { force: true });
+          result.removed++;
+        } else result.inUse++;
+      }
+    }
+  }
+  result.ms = Date.now() - started;
+  return result;
+}
+
+// Decides the run's Go caches. Shared: modules from the current generation,
+// the toolchain from the host or that generation, a build cache per
+// toolchain. Private (refused or failed): today's per-home caches. Writes
+// cache-report.json and returns the environment additions and the line.
+export async function prepareVerificationCaches({ plan, cwd, home, output, environment, options = {} }) {
+  const {
+    root: cacheRoot = verificationCacheRoot(process.env),
+    goProxy = process.env.GOPROXY && process.env.GOPROXY !== "off" ? process.env.GOPROXY : DEFAULT_GOPROXY,
+    go = runGo,
+    hostGoVersion,
+    userGoPaths: paths,
+    settleMs,
+    abortSignal,
+  } = options;
+  const privateEnvironment = {
+    GOMODCACHE: join(home, "go", "pkg", "mod"),
+    GOCACHE: join(home, "go-build"),
+    GOTOOLCHAIN: "auto",
+    GOFLAGS: "-count=1",
+  };
+  if (!sharesGoCaches(plan.checks, cwd)) return { environment: privateEnvironment };
+  const context = {
+    item: plan.itemId || (plan.orderMessageSeq ? `order ${plan.orderMessageSeq}` : "unknown"),
+    run: plan.verifierRunId || output,
+    commit: plan.commit,
+  };
+  const report = { version: 1, root: cacheRoot, mode: "shared", createdAt: new Date().toISOString() };
+  let line;
+  try {
+    const root = await validateCacheRoot(cacheRoot, { cwd, paths: paths ?? (await userGoPaths(go)) });
+    const required = requiredGoVersion(readFileSync(join(cwd, "hub", "go.mod"), "utf8"));
+    let host = hostGoVersion;
+    if (!host) {
+      const found = await go(["env", "GOVERSION"], {
+        cwd: tmpdir(), env: { ...environment, GOTOOLCHAIN: "local" }, abortSignal,
+      });
+      if (found.code !== 0) throw new CacheRefusal("host go is not runnable: " + found.stderr.trim());
+      host = found.stdout.trim();
+    }
+    const toolchain = goVersionAtLeast(host, required)
+      ? { source: "host", version: host }
+      : { source: "cached", version: required };
+    ensureCacheRoot(root, context);
+    // The build cache is scanned before the run's first Go command uses it.
+    const build = selectBuildDir(root, toolchain.version, context);
+    const scan = await scanBuildCache(build.dir, settleMs === undefined ? {} : { settleMs });
+    const sources = moduleSources(cwd, home, plan);
+    const base = { ...environment, GOTOOLCHAIN: "local", GOFLAGS: "-mod=readonly", GOCACHE: build.dir };
+    const modules = await prepareModules(root, sources, toolchain, base, context, { goProxy, go, abortSignal });
+    report.modules = modules.report;
+    report.toolchain = { version: toolchain.version, source: toolchain.source, host, required, treeSha256: toolchain.treeSha256 || null };
+    report.build = { dir: build.dir, skipped: build.skipped, ...scan };
+    report.wasm = plan.checks.some((check) => check.id === "wasm-test-build") ? "per-home modules" : null;
+    report.downloads = { toolchains: modules.report.toolchainDownloads, modules: modules.report.modulesAdded };
+    const state = modules.report.state === "rebuilt"
+      ? `rebuilt: ${modules.report.cause}`
+      : modules.report.state === "seeded" ? `seeded ${modules.report.modulesAdded} modules` : "warm";
+    line =
+      `matrix run: go caches: modules ${modules.report.generation} (${state})` +
+      (modules.report.generations > 1 ? ` of ${modules.report.generations} generations` : "") +
+      `, toolchain ${toolchain.version} (${toolchain.source === "host" ? "host" : `cached; host ${host} is older than go.mod`})` +
+      `, build ${basename(build.dir)} scanned ${scan.outputs} outputs in ${scan.ms} ms, removed ${scan.removed}` +
+      (report.wasm ? ", wasm-test-build: per-home modules" : "");
+    writeFileSync(join(output, "cache-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
+    return {
+      line,
+      report,
+      environment: {
+        GOMODCACHE: modules.generation,
+        GOCACHE: build.dir,
+        GOPROXY: "off",
+        GOFLAGS: "-count=1 -mod=readonly",
+        GOTOOLCHAIN: "local",
+        PATH: modules.env.PATH,
+        TAILTERM_VERIFICATION_CACHE: root,
+      },
+      // build-wasm.sh seeds Tailscale's own module set: that check keeps a
+      // per-home module cache with the network, and the shared toolchain.
+      checkEnvironment: report.wasm
+        ? { "wasm-test-build": { GOMODCACHE: join(home, "go", "pkg", "mod"), GOPROXY: goProxy } }
+        : {},
+    };
+  } catch (error) {
+    if (abortSignal?.aborted) throw error;
+    const cause = error.message.split("\n")[0];
+    Object.assign(report, { mode: "private", cause });
+    writeFileSync(join(output, "cache-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
+    return { line: `matrix run: go caches: private: ${cause}`, report, environment: privateEnvironment };
+  }
+}
+
 // The spellings a process may use for the verifier home: the path mkdtemp
 // returned and its realpath (/var links to /private/var, and lsof reports the
 // realpath). Resolving the parent keeps this valid after the home is removed.
@@ -1544,6 +2113,7 @@ async function runCheckWithAttempts(check, plan, cwd, output, environment, optio
         ".log",
     );
     writeFileSync(logURI, log, { mode: 0o600 });
+    assertFreshGoTest(check, log);
     attempts.push({
       attempt,
       startedAt,
@@ -1767,6 +2337,45 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   }
 }
 
+// tests/test-binaries.mjs captures its build environment when it is imported,
+// so the binaries are built by a child whose whole environment is the
+// verifier's: its HOME, Go caches and toolchain, never the user's.
+function buildBinariesInVerifierEnvironment(cwd, output, environment, { historical, abortSignal }) {
+  const helper = new URL("../tests/test-binaries.mjs", import.meta.url).href;
+  const source =
+    `const [cwd, output, commit] = process.argv.slice(1);` +
+    `const m = await import(${JSON.stringify(helper)});` +
+    `const binaries = await m.buildMatrixBinaries(cwd, output);` +
+    `if (commit) binaries.push(await m.buildHistoricalHub(cwd, output + "/tailterm-historical-hub-test", commit));` +
+    `process.stdout.write(JSON.stringify(binaries));`;
+  return new Promise((done, fail) => {
+    if (abortSignal?.aborted) return fail(new Error("Verification interrupted by " + abortSignal.reason));
+    const child = spawn(process.execPath,
+      ["--input-type=module", "-e", source, cwd, output, ...(historical ? [historicalHubCommit] : [])],
+      { cwd, env: environment, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    const stop = () => child.kill("SIGTERM");
+    abortSignal?.addEventListener("abort", stop, { once: true });
+    child.stdout.setEncoding("utf8").on("data", (data) => (stdout += data));
+    child.stderr.setEncoding("utf8").on("data", (data) => (stderr += data));
+    child.on("error", (error) => {
+      abortSignal?.removeEventListener("abort", stop);
+      fail(error);
+    });
+    child.on("close", (code, signal) => {
+      abortSignal?.removeEventListener("abort", stop);
+      if (abortSignal?.aborted) return fail(new Error("Verification interrupted by " + abortSignal.reason));
+      if (code !== 0)
+        return fail(new Error(`Test binary preparation failed (${signal || "exit " + code}): ${stderr.trim()}`));
+      try {
+        done(JSON.parse(stdout));
+      } catch (error) {
+        fail(new Error("Test binary preparation printed no binary list: " + error.message));
+      }
+    });
+  });
+}
+
 // Runs a validated plan in a fresh verifier home and writes receiptName only
 // when every check ran to completion on the unchanged clean candidate.
 async function executeHeldPlan(plan, cwd, output, options, receiptName, makeReceipt) {
@@ -1807,15 +2416,20 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       TMPDIR: home,
       TMUX_TMPDIR: join(home, "tmux"),
       GOPATH: join(home, "go"),
-      GOMODCACHE: join(home, "go", "pkg", "mod"),
-      GOCACHE: join(home, "go-build"),
       VERIFICATION_KEEP_HOME: keepHome ? "1" : "0",
       LANG: "en_US.UTF-8",
       CI: "1",
-      GOTOOLCHAIN: "auto",
       VERIFICATION_JOBS: String(jobs),
     };
     mkdirSync(environment.TMUX_TMPDIR, { recursive: true, mode: 0o700 });
+    // Go modules, toolchain and build cache: shared under the harness cache
+    // root when the plan can run Go, else per-home as before.
+    const caches = await prepareVerificationCaches({
+      plan, cwd, home, output, environment,
+      options: { ...options.caches, abortSignal },
+    });
+    Object.assign(environment, caches.environment);
+    if (caches.line) (options.hostLock?.print ?? console.log)(caches.line);
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
     if (plan.checks.some(isBrowserCheck)) {
       environment.PLAYWRIGHT_BROWSERS_PATH =
@@ -1827,11 +2441,10 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     const needsBinaries = plan.checks.some((check) =>
       [...binarySuites].some((suite) => check.id.startsWith(`tests/${suite}-browser.mjs`)));
     if (needsBinaries) {
-      const binaries = await buildMatrixBinaries(cwd, output);
-      if (abortSignal?.aborted)
-        throw new Error("Verification interrupted by " + abortSignal.reason);
-      if (plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")))
-        binaries.push(await buildHistoricalHub(cwd, join(output, "tailterm-historical-hub-test"), historicalHubCommit));
+      const binaries = await buildBinariesInVerifierEnvironment(cwd, output, environment, {
+        historical: plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")),
+        abortSignal,
+      });
       if (abortSignal?.aborted)
         throw new Error("Verification interrupted by " + abortSignal.reason);
       const manifest = join(output, "test-binaries.json");
@@ -1849,7 +2462,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       plan.checks,
       { jobs, abortSignal },
       (check, _index, signal) =>
-        runCheckWithAttempts(check, plan, cwd, output, environment, {
+        runCheckWithAttempts(check, plan, cwd, output, { ...environment, ...caches.checkEnvironment?.[check.id] }, {
           abortSignal: signal,
           minFreeBytes,
           getAvailableBytes,

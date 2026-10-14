@@ -103,14 +103,150 @@ eligible receipt. If home removal fails, the runner removes `receipt.json`, writ
 `cleanup-error.json` beside the logs, exits nonzero, and reports the retained
 home path for manual recovery.
 
-Go's `GOPATH`, `GOMODCACHE`, and `GOCACHE` all resolve inside the disposable
-home for matrix checks. The binary preparation helper runs before those checks
-with its existing host-cache environment; a signal during a preparatory Go build
-is observed when that build returns, before any check or eligible receipt. We
-decline the optional shared module download cache for this phase: it
-would require a separately managed read-only cache with its own ownership,
-integrity and cleanup policy. Keeping both module downloads and build artifacts
-inside the run home for matrix checks preserves the current isolation boundary.
+`GOPATH` always resolves inside the disposable home. `GOMODCACHE` and `GOCACHE`
+come from the shared verification caches described next when the plan can run
+Go, and otherwise resolve inside the home as before. The prepared test binaries
+are built by a child process whose whole environment is the verifier's (its
+home, Go caches and toolchain); a signal stops that child, before any check or
+eligible receipt.
+
+## Shared verification caches
+
+Until wi_3c81378998da5acd (order #33917) every run downloaded the Go toolchain
+and modules and built cold inside its home, then deleted it: on 10-13 one run
+of this item's 69-check plan left 42,056 files and 1.17 GB in its kept home and
+raised 182,351 file-system notifications under it, and every fresh checkout
+downloaded the speech model again. The runner now keeps those inputs in one
+harness-owned cache root shared by every checkout on the host.
+
+**Root.** `TAILTERM_VERIFICATION_CACHE` when it is an absolute path; otherwise
+`~/Library/Caches/tailterm-verification` on macOS and
+`${XDG_CACHE_HOME:-~/.cache}/tailterm-verification` elsewhere, from the
+runner's own `HOME`. Before anything is created the runner resolves real paths
+and refuses a root that is inside, equal to or contains the user's `~/go`,
+`~/Library/Caches/go-build`, or the `GOPATH`, `GOMODCACHE` or `GOCACHE` that
+`go env` reports for the runner's environment, or that lies inside the
+checkout. A root that exists without a valid marker and holds anything but the
+cache's own entries is refused too. A refusal changes nothing: the run uses
+per-home caches.
+
+**Which runs share.** A plan shares when the checkout has a `hub/go.sum` and
+any check belongs to a family `verification/matrix.json` defines (go-vet,
+go-test, go-race, migration-rehearsal, wasm-test-build, npm-unit, the two
+static checks, or a `tests/*.mjs` browser suite), because each of those can run
+`go`: npm-unit builds tt in the release-runner tests and browser suites build
+test binaries (lead answer #33960). A synthetic plan in a checkout with no
+`hub/go.sum` keeps per-home caches.
+
+**Layout.**
+
+```
+<root>/tailterm-cache.json                     root marker
+<root>/mod/current.json                        pointer to the module generation in use
+<root>/mod/gen-<16 hex>/                       GOMODCACHE: modules and, if needed, the toolchain
+<root>/mod/gen-<16 hex>.stamps/<sha256>.json   one stamp per go.sum seeded into it
+<root>/build/<goversion>-<os>-<arch>/          GOCACHE for that toolchain, with its own marker
+<root>/speech-model/<revision>/<model>/<file>  the static build's speech model
+```
+
+Markers, pointer and stamps carry the marker item's fields
+(wi_60dbbbe5b36bf66b): `version: 1`, `kind` (`root`, `mod`, `stamp` or
+`build`), `producer` (`scripts/verify-matrix.mjs@<commit>`), `item`, `run`,
+`createdAt` and `owns`, the owned directories relative to the root; stamps add
+`goSumSha256`, `source`, `toolchain` and `toolchainTreeSha256`. That item trims
+listed directories under worktree and artifact roots; the shared root is under
+neither, so its trimming never applies here. They are written to a temporary
+name and renamed.
+
+**Modules.** Sources are the candidate's `hub` module and, when the historical
+hub binary is prepared, that commit's `hub` (extracted into the home). Every
+run validates the generation `current.json` names, with `GOPROXY=off`:
+`go list -deps -test ./...` for completeness and `go mod verify` for integrity,
+per source. All pass: the run is `warm` and has written nothing. A missing
+module: the runner (never a check) adds it with the network, by
+`go list -m all` and `go list -deps -test ./...` with `-mod=readonly` (so
+`go.sum` never changes), and validates again; Go's own module-cache locks make
+this safe beside a reader. A failed `go mod verify`, a changed toolchain or an
+unreadable pointer: the runner seeds a new `gen-<random>`, validates it and
+renames `current.json` to it. A pointer whose `dir` is not a single
+`gen-<16 hex>` directly inside `mod/` is refused. Seeding or validation that
+still fails makes the run private. One generation serves every go.sum: modules
+are stored by path and version, so it grows only by new versions.
+
+**Toolchain.** A host Go at least as new as `hub/go.mod` (its `toolchain` line
+if newer) is used as it is. An older host gets the toolchain from the module
+generation: the runner downloads it once with `GOTOOLCHAIN=<version>`, puts
+its `bin` first on every check's `PATH`, and stamps its tree digest (sorted
+path, size, sha256); a tree that later differs from its stamp is corruption.
+Every check runs with `GOTOOLCHAIN=local`, so no check downloads or switches
+toolchains.
+
+**What checks get.** `GOMODCACHE=<generation>`, `GOCACHE=<build dir>`,
+`GOPROXY=off`, `GOFLAGS=-count=1 -mod=readonly`, `GOTOOLCHAIN=local`,
+`TAILTERM_VERIFICATION_CACHE=<root>`, under each check's own recorded
+environment, so check records, argv, timeouts and `verification/matrix.json`
+are unchanged. `HOME`, `TMPDIR`, `TMUX_TMPDIR` and `GOPATH` stay in the home.
+`scripts/build-wasm.sh` builds Tailscale's own module set, so
+`wasm-test-build` alone keeps a per-home module cache with the network (about
+0.5 GB, 18,000 files) and the shared toolchain; the line says so.
+
+**No test result from the cache.** `GOFLAGS=-count=1` makes every go test the
+checks start execute, including the go-race command's plain and sharded
+`go test` calls (the shards also pass `-count=1`). After a go-test, go-race or
+migration-rehearsal check, a result line marked `(cached)` in its log, plain or
+inside `-json` output, throws `Go test result came from the build cache: <id>`
+and leaves no receipt. `go vet` may reuse cached analysis, which is not a test
+result.
+
+**Build cache.** Before its first Go command the run scans its `GOCACHE`. Go
+names a stored output by the sha256 of its bytes and only checks its size when
+reading it, so a same-size flip would be used. Every `<2hex>/<id>-d` file whose
+sha256 is not `<id>` is removed, an `<id>-d/` executable directory with such a
+file is removed whole, and a malformed `-a` index entry is removed; Go then
+rebuilds. A mismatch is removed only once its size and mtime stay put (a peer
+writes outputs in place, last byte last). A directory with a missing or invalid
+marker, or holding anything Go would not write there, is skipped for the next
+free `.2`, `.3` suffix. Limit: bytes that go bad after the scan in the same run
+are not caught; no test verdict is read from the cache either way.
+
+**Concurrency.** Two runs on the host's two slots share the root. Two runs on an
+empty root may each seed a generation; the last rename wins and both are
+complete. A run reads `current.json` once and keeps that generation to its end.
+
+**No pruning.** The runner never removes or renames a generation or a build
+directory, so nothing a live run uses can disappear. A generation holds the
+union of module versions ever seeded (about 0.5 GB for the hubs, 0.29 GB per
+toolchain); a new one appears only after detected corruption; Go trims build
+entries unused for five days. The line names the count when there is more than
+one generation. Manual cleanup, with no matrix run live: `chmod -R u+w` and
+remove any `gen-*` (and its `.stamps`) that `current.json` does not name, or
+the whole root.
+
+**Speech model.** `scripts/package-speech-model.mjs` reads each file from
+`<root>/speech-model/`, then from the checkout's own `.build/speech-source/`
+(copying a good one up), and only then downloads it, writing by temporary file
+and rename. Every source passes the manifest's size and sha256 check, and a
+cached file that fails it is fetched again. A failed download throws one error
+naming the file and its cause after a cache miss (for example
+`HTTP 429 Too Many Requests`). It prints
+`Speech model: files=N shared=N checkout=N downloaded=N bytes=B cache=<dir>`.
+The release runner's own static build and a developer's `npm run build:static`
+use the same default root.
+
+**Report.** One line per run, through the runner's printer:
+`matrix run: go caches: modules <gen> (warm|seeded N modules|rebuilt: <cause>), toolchain <version> (host|cached; host <version> is older than go.mod), build <dir> scanned <n> outputs in <ms> ms, removed <k>`,
+or `matrix run: go caches: private: <cause>`. `<output>/cache-report.json`
+holds the same facts with the download counters.
+
+**Why the sweep leaves it alone.** `tt team queue sweep-worktrees` reads queue
+state and removes worktrees under `.build/worktrees` and run directories under
+the artifacts root; its `neverTouchPaths()` refuses anything in or containing
+`~/Library/Caches`. The default root is under neither sweep root and inside
+`~/Library/Caches`, so the existing keep rules already treat it as
+harness-owned and no keep-rule change is needed. Check it without queue state:
+`realpath` of the root is inside `~/Library/Caches` and not inside any path
+from `git worktree list --porcelain`, `~/projects/tailterm-artifacts` or
+`/private/tmp`.
 
 Plans and receipts are append-only. Every mutation has a stable request ID and
 expected generation. Identical retries return the saved record after later
@@ -1053,8 +1189,9 @@ by diagnosis #22770: 58 entrypoints and 79 modules, plus the npm unit suites
 and their subprocess helpers. Correction order #22775 / saved #22788 covers
 only this document, the runner and the host-lock test.
 
-- Each real runner invocation creates a fresh disposable HOME, TMPDIR, GOPATH,
-  GOMODCACHE and GOCACHE, plus a private TMUX_TMPDIR directory beneath its home.
+- Each real runner invocation creates a fresh disposable HOME, TMPDIR and
+  GOPATH (GOMODCACHE and GOCACHE too when its plan does not share the
+  verification caches), plus a private TMUX_TMPDIR directory beneath its home.
   The home uses unique `tv-` plus six mkdtemp bytes beneath canonical `/tmp`
   (`/private/tmp` on the Mini). Its private `tmux` directory is mode 0700.
   macOS `sun_path[104]` leaves a conservative 103 payload bytes after NUL.
