@@ -1015,6 +1015,8 @@ var (
 	relayHandlerRotation = relayHandlerRotationTick
 	relayStewardRotation = relayStewardRotationTick
 	relayLoopPause       = func() bool { time.Sleep(3 * time.Second); return true }
+	// relayHubReachStart starts the hub reachability watch and returns its stop.
+	relayHubReachStart = startHubReachWatch
 )
 
 type relayRotationResult struct {
@@ -1109,6 +1111,11 @@ func cmdRelay(args []string) error {
 			return errors.New("Tailterm relay is already running")
 		}
 		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	}
+	if !*status && !*once {
+		// The watch for a hub this host cannot reach keeps its own timer:
+		// this loop is slowest exactly when the hub does not answer.
+		defer relayHubReachStart(dir)()
 	}
 	var queueBackoff teamQueuePollBackoff
 	var rotation relayRotationPass
@@ -1305,6 +1312,9 @@ func cmdRelay(args []string) error {
 		}
 		if *status {
 			fmt.Printf("archived bindings=%d\n", relayArchiveCount(dir))
+			for _, line := range hubReachStatusLines(dir) {
+				fmt.Println(line)
+			}
 		}
 		if *once || *status {
 			return nil
