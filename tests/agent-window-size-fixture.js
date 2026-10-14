@@ -280,7 +280,7 @@ export function setupAgentWindowFixture() {
   tmux("new-session", "-d", "-s", "fixture-keepalive", "sleep 3600");
   writeFileSync(
     dir + "/probe.py",
-    `import os,sys,signal,termios,tty,json
+    `import os,sys,signal,termios,tty,json,select
 tty.setraw(0)
 count=0
 # A SIGWINCH that lands inside this handler used to run a nested handler whose
@@ -301,12 +301,25 @@ def draw(*args):
   os.write(1, ('\\033[2J\\033[H'+'SIZE %dx%d WINCH %d'%(size.columns,size.lines,count)+'\\r\\n'+('R'*(size.columns-1))+'E'+'\\r\\n\\r\\nINPUT>').encode())
  finally:
   signal.pthread_sigmask(signal.SIG_SETMASK,mask)
+# A SIGWINCH that lands after the loop's last signal check but before a
+# blocking os.read never interrupts it, so draw would not run until input
+# came. The signal also writes a byte to the wakeup pipe, which select is
+# waiting on, so the loop wakes and draw runs and reads the size again.
+wake_r,wake_w=os.pipe()
+os.set_blocking(wake_r,False)
+os.set_blocking(wake_w,False)
+signal.set_wakeup_fd(wake_w,warn_on_full_buffer=False)
 signal.signal(signal.SIGWINCH,draw)
 draw()
 while True:
- data=os.read(0,1024)
- if not data: break
- os.write(1,data)
+ ready=select.select([0,wake_r],[],[])[0]
+ if wake_r in ready:
+  try: os.read(wake_r,512)
+  except BlockingIOError: pass
+ if 0 in ready:
+  data=os.read(0,1024)
+  if not data: break
+  os.write(1,data)
 `,
   );
   writeFileSync(
