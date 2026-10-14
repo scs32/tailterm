@@ -49,7 +49,7 @@ test("a finished summary entry renders its shape, reviews, verification and rele
     release: { id: "rel_summary", state: "released", verificationDigest: "d".repeat(64), plan: {}, receipt: { outcome: "released", targets: [{ target: "hub", outcome: "deployed", release: "r1" }] } },
   }] });
   assert.match(html, /finished · Plan review team/);
-  assert.match(html, /Reviews 2\/2 · Follow-ups 1 · accepted/);
+  assert.match(html, /Reviews 2\/2 · Follow-ups 1 new, 0 folded · accepted/);
   assert.match(html, /wi_follow: Short title/);
   assert.match(html, /Verification passing · a3: fail · known failure/);
   assert.match(html, /Accepted → verified → merged → released · released · job rel_summary/);
@@ -74,9 +74,26 @@ test("the review count is the current stage's, with earlier stages named", () =>
   const followUps = [1, 2, 3].map((n) => ({ itemId: `wi_follow${n}`, finding: { id: `F${n}`, title: `Title ${n}` } }));
   const stages = [{ number: 1, orderSeq: 3, scopeRevision: 1, assignmentSeq: 5 }, { number: 2, orderSeq: 25, scopeRevision: 2, assignmentSeq: 30 }];
   const text = (reviews) => renderTeamDelivery({ entries: [{ itemId: "wi_stage", state: "running", reviews: { history: "recorded", scopes: [], focused: [], ...reviews } }] }).match(/data-testid="review-convergence-summary">([^<]*)</)[1];
-  assert.equal(text({ stages, rounds, followUps, disposition: { kind: "accept" } }), "Stage 2 · Reviews 1/2 · Earlier stages 2 · Follow-ups 3 · accept");
-  assert.equal(text({ stages: stages.slice(0, 1), rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1");
-  assert.equal(text({ rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1");
-  assert.equal(text({ stages, rounds: rounds.slice(0, 2), followUps: [] }), "Stage 2 · Reviews 0/2 · Earlier stages 2 · Follow-ups 0");
+  assert.equal(text({ stages, rounds, followUps, disposition: { kind: "accept" } }), "Stage 2 · Reviews 1/2 · Earlier stages 2 · Follow-ups 3 new, 0 folded · accept");
+  assert.equal(text({ stages: stages.slice(0, 1), rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1 new, 0 folded");
+  assert.equal(text({ rounds: rounds.slice(0, 2), followUps: followUps.slice(0, 1) }), "Reviews 2/2 · Follow-ups 1 new, 0 folded");
+  assert.equal(text({ stages, rounds: rounds.slice(0, 2), followUps: [] }), "Stage 2 · Reviews 0/2 · Earlier stages 2 · Follow-ups 0 new, 0 folded");
   assert.equal(renderTeamDelivery({ entries: [{ itemId: "wi_legacy", state: "running", reviews: { history: "unknown", stages, rounds, followUps } }] }).match(/data-testid="review-convergence-summary">([^<]*)</)[1], "Reviews unknown · Follow-ups unknown");
+});
+
+// wi_ad2010dd554a5d2e: a folded finding was saved on an existing item, so the
+// row counts it apart from new follow-ups and names the item it went into,
+// both for a finished summary entry and a running entry with full reviews.
+test("folded follow-ups are counted apart and named as folded into their item", () => {
+  const followUps = [{ itemId: "wi_new", finding: { id: "F1", title: "New one" } }, { itemId: "wi_target", folded: true, finding: { id: "F2", title: "Folded one" } }];
+  const reviews = { history: "recorded", rounds: [{ number: 1 }], followUps, scopes: [], focused: [] };
+  for (const entry of [{ itemId: "wi_done", state: "finished", summary: true, teamShape: "plan-only", reviews }, { itemId: "wi_running", state: "running", reviews: { ...reviews, stages: [] } }]) {
+    const html = renderTeamDelivery({ entries: [entry] });
+    assert.equal(html.match(/data-testid="review-convergence-summary">([^<]*)</)[1], "Reviews 1/2 · Follow-ups 1 new, 1 folded");
+    assert.equal(html.match(/data-testid="review-follow-ups">([^<]*)</)[1], "wi_new: New one · folded into wi_target: Folded one");
+  }
+  const escaped = renderTeamDelivery({ entries: [{ itemId: "wi_esc", state: "running", reviews: { ...reviews, followUps: [{ itemId: "<b>", folded: true, finding: { id: "F3", title: "<i>x</i>" } }] } }] });
+  assert.match(escaped, /folded into &lt;b&gt;: &lt;i&gt;x&lt;\/i&gt;/);
+  assert.ok(!escaped.includes("<b>") && !escaped.includes("<i>"));
+  assert.match(escaped, /Follow-ups 0 new, 1 folded/);
 });

@@ -31,8 +31,11 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
     const stage = review?.stages?.length > 1 ? review.stages[review.stages.length - 1] : null;
     const earlierRounds = stage ? review.rounds.filter((round) => round.requestSeq < stage.assignmentSeq).length : 0;
     const reviewCount = stage ? `Stage ${stage.number} · Reviews ${review.rounds.length - earlierRounds}/2 · Earlier stages ${earlierRounds}` : `Reviews ${review?.rounds?.length}/2`;
-    const reviewText = review?.history === "recorded" ? `${reviewCount} · Follow-ups ${review.followUps.length}${review.disposition ? ` · ${review.disposition.kind}` : ""}` : "Reviews unknown · Follow-ups unknown";
-    const followUps = review?.followUps?.length ? `<span class="fine" style="overflow-wrap:anywhere">${review.followUps.map((f) => `${esc(f.itemId)}: ${esc(f.finding.title)}`).join(" · ")}</span>` : "";
+    // A folded finding was saved on an existing item, not filed as a new one
+    // (wi_ad2010dd554a5d2e), so it is counted and labelled apart.
+    const folded = review?.followUps?.filter((f) => f.folded).length || 0;
+    const reviewText = review?.history === "recorded" ? `${reviewCount} · Follow-ups ${review.followUps.length - folded} new, ${folded} folded${review.disposition ? ` · ${review.disposition.kind}` : ""}` : "Reviews unknown · Follow-ups unknown";
+    const followUps = review?.followUps?.length ? `<span class="fine" style="overflow-wrap:anywhere" data-testid="review-follow-ups">${review.followUps.map((f) => `${f.folded ? "folded into " : ""}${esc(f.itemId)}: ${esc(f.finding.title)}`).join(" · ")}</span>` : "";
     const verification = entry.verification;
     const notableChecks = verification?.checks?.filter(c => c.status !== "pass" || c.knownFailure || c.nowPassing) || [];
     const verificationText = verification ? `<span class="fine" style="overflow-wrap:anywhere" data-testid="verification-summary">Verification ${esc(verification.state)}${notableChecks.length ? " · " + notableChecks.map(c => `${esc(c.id)}: ${esc(c.status)}${c.knownFailure ? " · known failure" : ""}${c.nowPassing ? " · now passing; remove from known failures" : ""}`).join("; ") : ""}</span>` : "";

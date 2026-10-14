@@ -892,7 +892,7 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 		reviews.Focused = append(reviews.Focused, api.FocusedReview{RequestSeq: int64(r), Fix: big(2048)})
 	}
 	for f := 0; f < 10; f++ {
-		reviews.FollowUps = append(reviews.FollowUps, api.ReviewFollowUp{ItemID: fmt.Sprint("wi_follow", f), MessageSeq: int64(f), Finding: api.ReviewFinding{ID: fmt.Sprint("U", f), Title: "é" + big(1024), Description: big(4096)}})
+		reviews.FollowUps = append(reviews.FollowUps, api.ReviewFollowUp{ItemID: fmt.Sprint("wi_follow", f), MessageSeq: int64(f), Folded: f%2 == 0, Finding: api.ReviewFinding{ID: fmt.Sprint("U", f), Title: "é" + big(1024), Description: big(4096)}})
 	}
 	e.Reviews = &reviews
 	verification := api.VerificationSummary{State: "passing", Commit: "abc"}
@@ -960,6 +960,14 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 		if f.ItemID != fmt.Sprint("wi_follow", i) || len(f.Finding.Title) > summaryTitleBytes || !strings.HasPrefix(f.Finding.Title, "é") || f.Finding.Description != "" {
 			t.Fatalf("follow-up %d %+v", i, f)
 		}
+		// wi_ad2010dd554a5d2e: a folded finding keeps its flag, so the
+		// Delivery view does not show its target as a new follow-up.
+		if f.Folded != (i%2 == 0) {
+			t.Fatalf("follow-up %d folded %v", i, f.Folded)
+		}
+	}
+	if n := strings.Count(string(raw), `"folded":true`); n != 5 {
+		t.Fatalf("summary JSON has %d folded follow-ups, want 5", n)
 	}
 	if v := sum.Verification; v == nil || v.State != "passing" || len(v.Checks) != 3 || v.Checks[0].ID != "check-3" || v.Checks[1].ID != "check-50" || v.Checks[2].ID != "check-150" {
 		t.Fatalf("verification summary %+v", sum.Verification)

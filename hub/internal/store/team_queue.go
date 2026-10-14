@@ -1063,7 +1063,8 @@ func teamShape(launch json.RawMessage) string {
 // summarizeTeamQueueEntry trims a history entry for a listing: no launch,
 // close or activities, and reviews, verification, release and evidence cut
 // to what the Delivery view and tt show. Tokens and identity stay. Review
-// stages stay so a reader can count the current stage's rounds.
+// stages stay so a reader can count the current stage's rounds, and
+// follow-ups keep their item and folded flag.
 func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 	e.Summary = true
 	e.TeamShape = teamShape(e.LaunchJSON)
@@ -1075,7 +1076,7 @@ func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 			sum.Rounds = append(sum.Rounds, round)
 		}
 		for _, f := range r.FollowUps {
-			sum.FollowUps = append(sum.FollowUps, api.ReviewFollowUp{ItemID: f.ItemID, MessageSeq: f.MessageSeq, Finding: api.ReviewFinding{ID: f.Finding.ID, Title: clip(f.Finding.Title, summaryTitleBytes)}})
+			sum.FollowUps = append(sum.FollowUps, api.ReviewFollowUp{ItemID: f.ItemID, MessageSeq: f.MessageSeq, Folded: f.Folded, Finding: api.ReviewFinding{ID: f.Finding.ID, Title: clip(f.Finding.Title, summaryTitleBytes)}})
 		}
 		e.Reviews = &sum
 	}
