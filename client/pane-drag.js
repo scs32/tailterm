@@ -131,7 +131,6 @@ export function setupPaneDrag(shell, { start, move, drop, cancel }) {
   );
   window.addEventListener("blur", () => {
     leftOptions.clear();
-    shift = false;
     finish({}, true);
   });
   document.addEventListener("fullscreenchange", () => finish({}, true));
