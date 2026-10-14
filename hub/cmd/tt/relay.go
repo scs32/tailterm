@@ -179,17 +179,20 @@ func bindRuntime(e env, thread string) error {
 	if !validBinding(b) {
 		return errors.New("a task agent, run, and exact Codex thread UUID are required")
 	}
-	c, err := e.client(3 * time.Second)
+	c, err := e.client(runtimeBindTimeout)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBindTimeout)
 	defer cancel()
 	a, err := c.GetAgent(ctx, b.Task, b.Agent)
 	if err != nil {
+		if hubUnanswered(err) {
+			return &unconfirmedBindError{binding: b, err: err}
+		}
 		return err
 	}
-	if a.RunID != b.Run || a.Runtime != "codex" || a.Status == api.AgentClosed || a.Status == api.AgentExited || a.Status == api.AgentRetired {
+	if !codexRunOpen(a, b) {
 		return errors.New("binding does not match an open Codex agent run")
 	}
 	if a.Role == api.AgentRoleOwnerHelper {
@@ -209,7 +212,124 @@ func bindRuntime(e env, thread string) error {
 	}
 	b.Cwd, b.Session = a.Cwd, a.Session
 	b.CreatedAt = time.Now().UTC()
-	return writeRelayBinding(b)
+	if err := writeRelayBinding(b); err != nil {
+		return err
+	}
+	clearPendingBinding(b)
+	return nil
+}
+
+// runtimeBindTimeout bounds the hub read that confirms a Codex binding.
+var runtimeBindTimeout = 3 * time.Second
+
+func codexRunOpen(a api.Agent, b runtimeBinding) bool {
+	return a.RunID == b.Run && a.Runtime == "codex" && a.Status != api.AgentClosed && a.Status != api.AgentExited && a.Status != api.AgentRetired
+}
+
+// hubUnanswered is a hub read that gave no definite answer: no reply, a
+// timeout, a 5xx or a 429. A 4xx is an answer and refuses the binding.
+func hubUnanswered(err error) bool {
+	var h *api.HTTPError
+	if errors.As(err, &h) {
+		return h.Status >= 500 || h.Status == http.StatusTooManyRequests
+	}
+	return err != nil
+}
+
+// unconfirmedBindError is a Codex binding the hub could not confirm because
+// it did not answer. The binding is complete except for the hub's run check.
+type unconfirmedBindError struct {
+	binding runtimeBinding
+	err     error
+}
+
+func (e *unconfirmedBindError) Error() string { return e.err.Error() }
+func (e *unconfirmedBindError) Unwrap() error { return e.err }
+
+// A Codex agent learns its thread only from its own CODEX_THREAD_ID, and it
+// binds only from its own tt commands. When the hub does not answer those,
+// the agent can end its turn unbound, and an unbound agent is never woken to
+// try again. So the unconfirmed binding is saved here, and the relay writes
+// it once the hub confirms the exact run (retryPendingBindings). The file
+// holds the binding's own fields and no credential.
+const pendingBindingSuffix = ".pending-bind.json"
+
+// pendingBindingTTL drops a startup binding the hub never confirmed.
+const pendingBindingTTL = 24 * time.Hour
+
+func pendingBindingPath(b runtimeBinding) string {
+	return filepath.Join(relayDir(), bindingKey(b)+pendingBindingSuffix)
+}
+
+func savePendingBinding(b runtimeBinding) error {
+	if !validBinding(b) || b.Runtime != "codex" || b.Role != "" {
+		return errors.New("invalid pending Codex binding")
+	}
+	b.CreatedAt = time.Now().UTC()
+	return writePrivateJSON(pendingBindingPath(b), b)
+}
+
+func clearPendingBinding(b runtimeBinding) {
+	_ = os.Remove(pendingBindingPath(b))
+}
+
+// retryPendingBindings writes each pending startup binding the hub now
+// confirms: the same agent and run, the Codex runtime, an open status and no
+// owner-helper role. A refusal, a superseded or closed run, an owner helper,
+// an existing binding for the run, or an expired record drops the pending
+// file without writing a binding. A hub that still does not answer keeps it,
+// and the rest of that hub's records wait for the next pass.
+func retryPendingBindings(ctx context.Context, dir string, now time.Time, client func(hub string) (*api.Client, error)) {
+	paths, _ := filepath.Glob(filepath.Join(dir, "*"+pendingBindingSuffix))
+	silent := map[string]bool{}
+	for _, path := range paths {
+		var b runtimeBinding
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if json.Unmarshal(data, &b) != nil || !validBinding(b) || b.Runtime != "codex" || b.Role != "" || filepath.Base(path) != bindingKey(b)+pendingBindingSuffix || now.Sub(b.CreatedAt) > pendingBindingTTL {
+			_ = os.Remove(path)
+			continue
+		}
+		var current runtimeBinding
+		if data, err := os.ReadFile(filepath.Join(dir, bindingKey(b)+".binding.json")); err == nil && json.Unmarshal(data, &current) == nil {
+			if current.Role == api.AgentRoleOwnerHelper || (current.Run == b.Run && current.Thread == b.Thread && validBinding(current)) {
+				_ = os.Remove(path)
+				continue
+			}
+		}
+		if silent[b.Hub] {
+			continue
+		}
+		c, err := client(b.Hub)
+		if err != nil {
+			continue
+		}
+		readCtx, cancel := context.WithTimeout(ctx, runtimeBindTimeout)
+		a, err := c.GetAgent(readCtx, b.Task, b.Agent)
+		cancel()
+		if err != nil {
+			if hubUnanswered(err) {
+				silent[b.Hub] = true
+			} else {
+				_ = os.Remove(path)
+			}
+			continue
+		}
+		if !codexRunOpen(a, b) || a.Role == api.AgentRoleOwnerHelper {
+			_ = os.Remove(path)
+			continue
+		}
+		b.Cwd, b.Session = a.Cwd, a.Session
+		b.CreatedAt = now.UTC()
+		if err := writeRelayBinding(b); err != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s pending binding: %v\n", b.Agent, err)
+			continue
+		}
+		_ = os.Remove(path)
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s bound after its startup bind went unanswered\n", now.UTC().Format(time.RFC3339), b.Agent)
+	}
 }
 func cmdBind(e env, args []string) error {
 	fs := flag.NewFlagSet("bind", flag.ContinueOnError)
@@ -236,12 +356,21 @@ func autoBindRuntime(e env, command string) {
 	b := runtimeBinding{Hub: e.hub, Agent: e.agent}
 	data, _ := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".binding.json"))
 	var old runtimeBinding
-	if json.Unmarshal(data, &old) == nil && old.Role != api.AgentRoleOwnerHelper && old.Thread == thread && old.Run == e.runID && old.Task == e.task && old.Cwd != "" && old.Session != "" {
+	registered := json.Unmarshal(data, &old) == nil
+	if registered && old.Role != api.AgentRoleOwnerHelper && old.Thread == thread && old.Run == e.runID && old.Task == e.task && old.Cwd != "" && old.Session != "" {
 		return
 	}
-	if err := bindRuntime(e, thread); err != nil {
-		fmt.Fprintln(os.Stderr, "[tt] Automatic inbox wake-up could not bind:", err)
+	err := bindRuntime(e, thread)
+	if err == nil {
+		return
 	}
+	// An owner helper's binding belongs to its registration alone.
+	var unconfirmed *unconfirmedBindError
+	if errors.As(err, &unconfirmed) && !(registered && old.Role == api.AgentRoleOwnerHelper) && savePendingBinding(unconfirmed.binding) == nil {
+		fmt.Fprintln(os.Stderr, "[tt] Automatic inbox wake-up could not bind yet:", err, "- the host relay binds this thread once the hub confirms the run.")
+		return
+	}
+	fmt.Fprintln(os.Stderr, "[tt] Automatic inbox wake-up could not bind:", err)
 }
 
 func bindClaudeRuntime(hub, task string, a api.Agent) error {
@@ -1121,7 +1250,7 @@ func cmdRelay(args []string) error {
 	var rotation relayRotationPass
 	var sweep relaySweepPass
 	promptDeps := nativeRuntimePromptDeps()
-	var lastClaudeRetry, lastWindowSize time.Time
+	var lastClaudeRetry, lastPendingBind, lastWindowSize time.Time
 	var claudeRetryCursor int
 	for {
 		if !*status {
@@ -1176,6 +1305,18 @@ func cmdRelay(args []string) error {
 					}
 				}
 				stopRetry()
+			}
+			if time.Since(lastPendingBind) >= 15*time.Second {
+				lastPendingBind = time.Now()
+				retryPendingBindings(context.Background(), dir, time.Now(), func(hub string) (*api.Client, error) {
+					e := env{hub: hub}
+					e.loadConfig()
+					c, err := e.client(runtimeBindTimeout)
+					if err == nil {
+						attachRelayBudget(c, activeRelayBudget)
+					}
+					return c, err
+				})
 			}
 		}
 		if !*status {

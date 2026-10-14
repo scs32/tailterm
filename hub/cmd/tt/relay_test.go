@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 	"github.com/scs32/tailterm/hub/internal/store"
 	"net/http"
 	"net/http/httptest"
@@ -2810,5 +2811,204 @@ func TestRelayHoldRecheckWithOnlyUndeliveredUnread(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// startupOutageHub is a fake hub that does not answer until up is set: each
+// request waits past the bind deadline. Then it answers for one agent with
+// the given state and one directed message, and records any path it does
+// not model rather than failing on it.
+type startupOutageHub struct {
+	up      atomic.Bool
+	agent   atomic.Pointer[api.Agent]
+	message api.Message
+	mu      sync.Mutex
+	other   []string
+}
+
+func (h *startupOutageHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.up.Load() {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		return
+	}
+	a := *h.agent.Load()
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.URL.Path == "/v1/team-queues":
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	case strings.HasSuffix(r.URL.Path, "/pause"):
+		_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+	case strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(api.MessageList{Messages: []api.Message{h.message}})
+	case r.URL.Path == "/v1/tasks/"+a.TaskID+"/agents/"+a.ID && r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(a)
+	default:
+		h.mu.Lock()
+		h.other = append(h.other, r.Method+" "+r.URL.Path)
+		h.mu.Unlock()
+		http.NotFound(w, r)
+	}
+}
+
+func startupOutageFixture(t *testing.T) (*startupOutageHub, env, string, string) {
+	t.Helper()
+	stateDir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", stateDir)
+	t.Setenv("TT_TMUX_SOCKET", "relay-startup-bind-test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	for _, name := range []string{"TAILTERM_TOKEN", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN", "CODEX_HOME"} {
+		t.Setenv(name, "")
+	}
+	bin := t.TempDir()
+	queued := filepath.Join(stateDir, "queued.txt")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + queued + "'\nprintf 'Queued message\\n'\n"
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	thread := "00000000-0000-4000-8000-0000000000a1"
+	t.Setenv("CODEX_THREAD_ID", thread)
+	t.Setenv(spawn.EnvSession, "tt-startup-bind")
+	previous := runtimeBindTimeout
+	runtimeBindTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { runtimeBindTimeout = previous })
+	a := api.Agent{ID: "agt_00000000000000a1", TaskID: "tsk_00000000000000a1", Name: "db-handler-test", RunID: "run_00000000000000a1", Runtime: "codex", Status: api.AgentDone, Online: true, Unread: 1, Session: "tt-startup-bind", Cwd: stateDir}
+	h := &startupOutageHub{message: api.Message{Seq: 40, TaskID: a.TaskID, To: a.ID, From: api.Sender{AgentID: "agt_00000000000000b2", Node: "workspace", User: "owner"}, Text: "REQUEST: file a bug"}}
+	h.agent.Store(&a)
+	server := httptest.NewServer(h)
+	t.Cleanup(server.Close)
+	t.Setenv("TAILTERM_HUB", server.URL)
+	return h, env{hub: server.URL, task: a.TaskID, agent: a.ID, runID: a.RunID}, thread, queued
+}
+
+func relayTestClient(hub string) (*api.Client, error) { return api.NewClient(hub, runtimeBindTimeout) }
+
+// b1/b3: a Codex agent whose first tt commands all time out against the hub
+// saves its binding as pending and ends its turn unbound. Once the hub
+// answers, one relay pass binds the exact thread and the next directed
+// message wakes the agent, with no command from it and no manual input.
+func TestRelayBindsCodexAgentAfterStartupOutage(t *testing.T) {
+	h, e, thread, queued := startupOutageFixture(t)
+	for _, command := range []string{"status", "agents", "inbox", "event", "post"} {
+		out, _ := captureRelayOutput(t, true, func() error { autoBindRuntime(e, command); return nil })
+		if !strings.Contains(out, "could not bind yet") {
+			t.Fatalf("%s: auto-bind output %q", command, out)
+		}
+	}
+	if _, ok := readBinding(t, e.hub, e.agent); ok {
+		t.Fatal("binding written without a hub confirmation")
+	}
+	pendingPath := pendingBindingPath(runtimeBinding{Hub: e.hub, Agent: e.agent})
+	var pending runtimeBinding
+	if data, err := os.ReadFile(pendingPath); err != nil || json.Unmarshal(data, &pending) != nil {
+		t.Fatalf("pending binding not saved: %v", err)
+	}
+	if pending.Thread != thread || pending.Run != e.runID || pending.Task != e.task || pending.Runtime != "codex" || pending.Role != "" {
+		t.Fatalf("pending binding %+v", pending)
+	}
+	if info, err := os.Stat(pendingPath); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("pending binding mode %v %v", info, err)
+	}
+	// The hub still does not answer: the relay keeps the record, writes nothing.
+	retryPendingBindings(context.Background(), relayDir(), time.Now(), relayTestClient)
+	if _, ok := readBinding(t, e.hub, e.agent); ok {
+		t.Fatal("relay bound while the hub was silent")
+	}
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatalf("pending binding dropped during the outage: %v", err)
+	}
+	h.up.Store(true)
+	out, err := captureRelayOutput(t, true, func() error { return cmdRelay([]string{"--once"}) })
+	if err != nil {
+		t.Fatalf("relay pass: %v\n%s", err, out)
+	}
+	b, ok := readBinding(t, e.hub, e.agent)
+	if !ok || b.Thread != thread || b.Run != e.runID || b.Task != e.task || b.Runtime != "codex" || b.Role != "" || b.Session != "tt-startup-bind" || b.Cwd == "" || !validBinding(b) {
+		t.Fatalf("binding after the hub answered: %+v (ok=%v)\n%s", b, ok, out)
+	}
+	if !strings.Contains(out, "bound after its startup bind went unanswered") {
+		t.Fatalf("relay log missing the startup bind line:\n%s", out)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending binding kept after binding: %v", err)
+	}
+	data, err := os.ReadFile(queued)
+	if err != nil {
+		t.Fatalf("directed message did not wake the agent: %v\nrelay:\n%s\nunmodeled: %v", err, out, h.other)
+	}
+	if got := string(data); !strings.Contains(got, "queue --thread "+thread) || !strings.Contains(got, "through message #40") {
+		t.Fatalf("wake queued %q", got)
+	}
+}
+
+// a2: the pending path writes no binding for an owner helper, a superseded
+// run, a closed, exited or retired agent, a non-Codex runtime, a hub that
+// refuses the agent, or an expired record, and it drops the record. An owner
+// helper whose registration binding exists saves no pending record at all.
+func TestRelayPendingBindingRefusals(t *testing.T) {
+	h, e, thread, _ := startupOutageFixture(t)
+	base := *h.agent.Load()
+	pendingPath := pendingBindingPath(runtimeBinding{Hub: e.hub, Agent: e.agent})
+	cases := []struct {
+		name  string
+		agent func(api.Agent) api.Agent
+		age   time.Duration
+	}{
+		{name: "owner helper", agent: func(a api.Agent) api.Agent { a.Role = api.AgentRoleOwnerHelper; return a }},
+		{name: "superseded run", agent: func(a api.Agent) api.Agent { a.RunID = "run_00000000000000a2"; return a }},
+		{name: "closed", agent: func(a api.Agent) api.Agent { a.Status = api.AgentClosed; return a }},
+		{name: "exited", agent: func(a api.Agent) api.Agent { a.Status = api.AgentExited; return a }},
+		{name: "retired", agent: func(a api.Agent) api.Agent { a.Status = api.AgentRetired; return a }},
+		{name: "claude runtime", agent: func(a api.Agent) api.Agent { a.Runtime = "claude"; return a }},
+		{name: "hub refuses", agent: func(a api.Agent) api.Agent { a.ID = "agt_00000000000000ff"; return a }},
+		{name: "expired", agent: func(a api.Agent) api.Agent { return a }, age: pendingBindingTTL + time.Minute},
+	}
+	for _, tc := range cases {
+		h.up.Store(false)
+		autoBindRuntime(e, "status")
+		if _, err := os.Stat(pendingPath); err != nil {
+			t.Fatalf("%s: pending binding not saved: %v", tc.name, err)
+		}
+		a := tc.agent(base)
+		h.agent.Store(&a)
+		h.up.Store(true)
+		retryPendingBindings(context.Background(), relayDir(), time.Now().Add(tc.age), relayTestClient)
+		if b, ok := readBinding(t, e.hub, e.agent); ok {
+			t.Fatalf("%s: binding written: %+v", tc.name, b)
+		}
+		if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+			t.Fatalf("%s: pending record kept: %v", tc.name, err)
+		}
+	}
+	h.agent.Store(&base)
+
+	// A registered owner helper: its binding is the registration's alone.
+	helper := runtimeBinding{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Thread: thread, Codex: "/usr/local/bin/codex", Runtime: "codex", Session: "owner", Role: api.AgentRoleOwnerHelper, CreatedAt: time.Now().UTC()}
+	helperPath := filepath.Join(relayDir(), bindingKey(helper)+".binding.json")
+	if err := writePrivateJSON(helperPath, helper); err != nil {
+		t.Fatal(err)
+	}
+	h.up.Store(false)
+	t.Setenv("CODEX_THREAD_ID", "00000000-0000-4000-8000-0000000000a9")
+	autoBindRuntime(e, "inbox")
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("owner helper saved a pending record: %v", err)
+	}
+	// A pending record that reaches the relay anyway never replaces it.
+	stray := helper
+	stray.Role, stray.Session, stray.Thread = "", "tt-startup-bind", "00000000-0000-4000-8000-0000000000a9"
+	if err := savePendingBinding(stray); err != nil {
+		t.Fatal(err)
+	}
+	h.up.Store(true)
+	retryPendingBindings(context.Background(), relayDir(), time.Now(), relayTestClient)
+	if kept, _ := readBinding(t, e.hub, e.agent); kept != helper {
+		t.Fatalf("helper registration changed: %+v", kept)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending record kept beside a helper registration: %v", err)
 	}
 }
