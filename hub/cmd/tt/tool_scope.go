@@ -40,6 +40,9 @@ var (
 	toolScopeHold     = func() {}              // runs under the cache lock, between the read and the rename
 	toolScopeSince    = time.Since             // the clock the scope row's own deadline checks read
 	toolScopeRecheck  = func() {}              // runs in the hook between the marker read and the second cache read
+	// runs as toolScopeLock returns: the time it spent trying, and whether it
+	// took the lock. tt inbox only; the hook never takes this lock.
+	toolScopeLockWaited = func(waited time.Duration, locked bool) {}
 )
 
 const (
@@ -214,13 +217,15 @@ func toolScopeLock(dir string) func() {
 	if err != nil {
 		return nil
 	}
-	wait := toolScopeLockWait
+	wait, start := toolScopeLockWait, time.Now()
 	for waited := time.Duration(0); ; waited += toolLedgerLockRetry {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
+			toolScopeLockWaited(time.Since(start), true)
 			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
 		}
 		if (!errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN)) || waited >= wait {
+			toolScopeLockWaited(time.Since(start), false)
 			_ = f.Close()
 			return nil
 		}
@@ -363,9 +368,13 @@ func toolScopeFile(input json.RawMessage, field, cwd string) (root, rel string, 
 // scopeRow appends one would_report row of the rule for rel, a path relative
 // to the repository root.
 func (l toolLedger) scopeRow(row toolLedgerRow, rule string, assignSeq int64, rel string) {
-	// The path goes through the secret scan as a would-deny summary does. A
-	// scan that did not finish gives no path, and so no row.
-	rewrite, counted, ok := redactScan(rel, toolRedactExact(l.token), l.started.Add(l.redactBudget))
+	// The path goes through the secret scan as a would-deny summary does,
+	// but with the time left to the hook's deadline rather than the
+	// redaction budget: a path is short, so a check that starts late still
+	// writes its row. A scan that did not finish gives no path, and so no
+	// row; that happens only once the deadline has passed, when the append
+	// below would not write either.
+	rewrite, counted, ok := redactScan(rel, toolRedactExact(l.token), l.started.Add(l.deadline))
 	if !ok {
 		return
 	}

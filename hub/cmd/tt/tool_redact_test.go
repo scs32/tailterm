@@ -1211,9 +1211,32 @@ func TestToolRedactTimeBounds(t *testing.T) {
 	})
 	t.Run("scan past its budget", func(t *testing.T) {
 		setToolLedger(t, &toolRedactScanBudget, 0)
-		out, row := redactPost(t, e, root, map[string]any{"stdout": c.make(t, c.n)})
-		if out != "" || row["redactSkip"] != "timeout" || row["redactMode"] != "redact" {
-			t.Fatalf("stdout %d bytes, skip %v", len(out), row["redactSkip"])
+		// A hook that reaches its real deadline on a stalled host returns
+		// before its row is written, so that attempt is run again in a new
+		// sandbox, at most three times, each after a wait because stalls
+		// come in bursts. The last attempt is judged as it stands.
+		const attempts = 3
+		for attempt := 1; ; attempt++ {
+			e, root := redactSandbox(t, toolRedactRedact)
+			fields := map[string]any{"session_id": "s1", "tool_name": "Bash", "tool_use_id": "u1", "tool_input": map[string]any{"command": "true"},
+				"tool_response": map[string]any{"stdout": c.make(t, c.n)}}
+			r := runToolHook(t, e, "tool", toolPayload("PostToolUse", fields), nil)
+			if r.err != nil {
+				t.Fatalf("hook error %v", r.err)
+			}
+			rows := toolLedgerRows(t, root, e.agent)
+			if len(rows) == 0 && r.elapsed >= toolLedgerDeadline && attempt < attempts {
+				t.Logf("attempt %d: the hook reached the %v deadline in %v and wrote no row; running it again in a new sandbox", attempt, toolLedgerDeadline, r.elapsed)
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			if len(rows) == 0 {
+				t.Fatal("no ledger row")
+			}
+			if row := rows[len(rows)-1]; r.out != "" || row["redactSkip"] != "timeout" || row["redactMode"] != "redact" {
+				t.Fatalf("stdout %d bytes, skip %v", len(r.out), row["redactSkip"])
+			}
+			break
 		}
 	})
 	t.Run("deadline inside a scan", func(t *testing.T) {
