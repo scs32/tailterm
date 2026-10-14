@@ -4024,15 +4024,19 @@ func (f *livenessFixture) standing(alive bool, then ...func()) api.ReleaseJob {
 	return j
 }
 
-// a2: a silent deployer with a waiting job posts one notice per recipient.
+// a2: a silent deployer with a waiting job posts one notice per recipient. A
+// merged job (its prepare, deploy and live check) waits on the deployer too.
 func TestDeployerLivenessSilentPostsOnePerRecipient(t *testing.T) {
-	for _, state := range []string{"verified", "claimed"} {
+	for _, state := range []string{"verified", "claimed", "merged"} {
 		t.Run(state, func(t *testing.T) {
 			f := newLivenessFixture(t)
 			heartbeat := ts(f.clock)
 			j := f.enqueue()
-			if state == "claimed" {
+			if state != "verified" {
 				j = f.act(j, "claim")
+			}
+			if state == "merged" {
+				j = f.act(j, "merged")
 			}
 			lastNotice := f.say("A release job is waiting for the verification host")
 			if n := f.sweep(); n != 0 {
@@ -4057,7 +4061,7 @@ func TestDeployerLivenessSilentPostsOnePerRecipient(t *testing.T) {
 						t.Fatalf("%s text lacks %q: %s", to.Name, part, e.Body.Text)
 					}
 				}
-				counts := map[string]string{"verified": "Waiting: 1 verified and 0 claimed", "claimed": "Waiting: 0 verified and 1 claimed"}[state]
+				counts := livenessCounts[state]
 				if !strings.Contains(e.Body.Text, counts) {
 					t.Fatalf("%s text lacks %q: %s", to.Name, counts, e.Body.Text)
 				}
@@ -4067,6 +4071,13 @@ func TestDeployerLivenessSilentPostsOnePerRecipient(t *testing.T) {
 			}
 		})
 	}
+}
+
+// livenessCounts is the notice's sentence for one waiting job in each state.
+var livenessCounts = map[string]string{
+	"verified": "Waiting: 1 verified, 0 claimed and 0 merged release jobs;",
+	"claimed":  "Waiting: 0 verified, 1 claimed and 0 merged release jobs;",
+	"merged":   "Waiting: 0 verified, 0 claimed and 1 merged release jobs;",
 }
 
 // a3: a restart announced and not completed is reported though the wrapper
@@ -4214,20 +4225,17 @@ func TestDeployerLivenessQuietCases(t *testing.T) {
 		f.advance(2 * livenessN)
 		quiet(t, f)
 	})
-	for _, last := range []string{"merged", "block"} {
-		t.Run("only "+last+" jobs", func(t *testing.T) {
-			f := newLivenessFixture(t)
-			j := f.act(f.enqueue(), "claim")
-			j = f.act(j, "merged")
-			if last == "block" {
-				if j = f.act(j, "block"); j.State != "blocked" {
-					t.Fatal(j.State)
-				}
-			}
-			f.advance(2 * livenessN)
-			quiet(t, f)
-		})
-	}
+	// A merged job waits on the deployer (TestDeployerLivenessSilentPostsOnePerRecipient);
+	// a blocked one is handed to a person.
+	t.Run("only block jobs", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		j := f.act(f.act(f.enqueue(), "claim"), "merged")
+		if j = f.act(j, "block"); j.State != "blocked" {
+			t.Fatal(j.State)
+		}
+		f.advance(2 * livenessN)
+		quiet(t, f)
+	})
 	t.Run("project paused", func(t *testing.T) {
 		f := newLivenessFixture(t)
 		f.standing(false, func() { f.exec(`UPDATE tasks SET pause_state='paused' WHERE id=?`, f.task.ID) })
@@ -4816,17 +4824,22 @@ func TestDeployerHungWithdrawnSameRun(t *testing.T) {
 }
 
 // a4: a fresh heartbeat with stale progress and a standing job posts one
-// hung notice per recipient, once.
+// hung notice per recipient, once. A lone merged job is a runner hung in its
+// prepare, deploy or live check.
 func TestDeployerHungPostsOnePerRecipient(t *testing.T) {
-	for _, state := range []string{"verified", "claimed"} {
+	for _, state := range []string{"verified", "claimed", "merged"} {
 		t.Run(state, func(t *testing.T) {
 			f := newLivenessFixture(t)
 			f.live = true
 			j := f.enqueue()
-			if state == "claimed" {
+			if state != "verified" {
 				j = f.act(j, "claim")
 			}
-			reported := f.report(api.ReleaseProgress{JobID: j.ID, Phase: "merged", Step: "prerequisites"}).ReportedAt
+			step := "prerequisites"
+			if state == "merged" {
+				j, step = f.act(j, "merged"), "deploy"
+			}
+			reported := f.report(api.ReleaseProgress{JobID: j.ID, Phase: "merged", Step: step}).ReportedAt
 			if n := f.sweep(); n != 0 {
 				t.Fatalf("first sight posted %d", n)
 			}
@@ -4848,8 +4861,8 @@ func TestDeployerHungPostsOnePerRecipient(t *testing.T) {
 				if e.Refs["reason"] != "hung" || e.Refs["deployer"] != f.d.ID || e.Refs["run"] != f.d.RunID {
 					t.Fatalf("%s refs: %v", to.Name, e.Refs)
 				}
-				for _, part := range []string{f.d.Name, f.d.ID, f.d.RunID, "still heartbeats", "reported no progress for 10m0s or more", "Last progress: " + reported + ", phase merged, step prerequisites, job " + j.ID + ", no recorded wait.",
-					"Last heartbeat: " + heartbeat, "oldest " + j.ID, "Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).", "Nothing was restarted or signalled."} {
+				for _, part := range []string{f.d.Name, f.d.ID, f.d.RunID, "still heartbeats", "reported no progress for 10m0s or more", "Last progress: " + reported + ", phase merged, step " + step + ", job " + j.ID + ", no recorded wait.",
+					"Last heartbeat: " + heartbeat, livenessCounts[state], "oldest " + j.ID, "Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).", "Nothing was restarted or signalled."} {
 					if !strings.Contains(e.Body.Text, part) {
 						t.Fatalf("%s text lacks %q: %s", to.Name, part, e.Body.Text)
 					}
@@ -4971,6 +4984,59 @@ func TestDeployerHungNoJobIsQuiet(t *testing.T) {
 		f.advance(30 * time.Second)
 		if n := f.sweep(); n != 2 {
 			t.Fatalf("job stood the bound: posted %d, want 2", n)
+		}
+	})
+}
+
+// A blocked job is handed to a person, so a stale report or a silent deployer
+// with only a blocked job posts nothing; a merged job that leaves claimed
+// starts its bound again (the sweep's first sight is per state).
+func TestDeployerHungBlockedAndStateChange(t *testing.T) {
+	blocked := func(f *livenessFixture) {
+		t.Helper()
+		j := f.act(f.act(f.enqueue(), "claim"), "merged")
+		if j = f.act(j, "block"); j.State != "blocked" {
+			t.Fatal(j.State)
+		}
+	}
+	t.Run("blocked, stale report", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		blocked(f)
+		f.report(api.ReleaseProgress{Phase: "merged", Step: "deploy"})
+		f.quiet("blocked job, fresh heartbeat, stale report")
+	})
+	t.Run("blocked, silent deployer", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		blocked(f)
+		f.advance(3 * livenessN)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("blocked job, silent deployer: posted %d", n)
+		}
+		f.want("blocked job, silent deployer", 0, 0)
+	})
+	t.Run("claimed then merged", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.live = true
+		j := f.act(f.enqueue(), "claim")
+		f.report(api.ReleaseProgress{JobID: j.ID, Phase: "merged", Step: "prerequisites"})
+		f.sweep()
+		f.advance(livenessN - time.Minute)
+		f.act(j, "merged")
+		if n := f.sweep(); n != 0 { // the first sight of merged
+			t.Fatalf("claimed less than the bound: posted %d", n)
+		}
+		f.advance(livenessN - 30*time.Second)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("merged less than the bound: posted %d", n)
+		}
+		f.want("merged less than the bound", 0, 0)
+		f.advance(30 * time.Second)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("merged for the bound: posted %d, want 2", n)
+		}
+		f.want("merged for the bound", 1, 1)
+		if e := f.copies(f.h)[0]; e.Refs["reason"] != "hung" || !strings.Contains(e.Body.Text, livenessCounts["merged"]) {
+			t.Fatalf("handler copy: %+v", e)
 		}
 	})
 }

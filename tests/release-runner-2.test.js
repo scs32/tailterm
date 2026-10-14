@@ -22,7 +22,7 @@ test("buf1 a valid fake tt deployment list above eight MiB parses and polls",t=>
  assert.ok(Buffer.byteLength(raw)>8*1024*1024);const jobs=JSON.parse(raw);
  assert.equal(jobs.version,1);assert.equal(jobs.jobs.length,1);assert.equal(jobs.jobs[0].padding.length,9*1024*1024);
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");assert.equal(poll.stderr,"");
- assert.equal(callLog(f.log),["deployment list --view settled",...START,"deployment list --view active --limit 200","deployment list --view settled --limit 200 --snapshot "+"a".repeat(64),"deployment list --view active --limit 200 --snapshot "+"a".repeat(64),POLL,""].join("\n"));
+ assert.equal(callLog(f.log),["deployment list --view settled",...START,"deployment list --view active --limit 200","deployment list --view settled --limit 200 --snapshot "+"a".repeat(64),"deployment list --view active --limit 200 --snapshot "+"a".repeat(64),POLL,"deployment progress --request-id progress-withdraw-RUN",""].join("\n"));
 });
 test("buf2 real fake tt command overflow names ENOBUFS without payloads or claims",t=>{
  const f=bufferTT(t,`fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');const chunk=Buffer.alloc(1024*1024,120);for(let i=0;i<257;i++)fs.writeSync(2,chunk);`);
@@ -31,15 +31,15 @@ test("buf2 real fake tt command overflow names ENOBUFS without payloads or claim
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");const diagnostic=poll.stderr;
  assert.match(diagnostic,/Deployment poll held.*ENOBUFS.*command buffer overflow/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
  const calls=callLog(f.log).split("\n");assert.deepEqual(calls.slice(0,4),["deployment list",...START,"deployment list --view active --limit 200"]);
- assert.match(calls[4],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list ENOBUFS \(command buffer overflow\)\. /);assert.ok(!calls[4].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(5),[POLL,""]);
+ assert.match(calls[4],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list ENOBUFS \(command buffer overflow\)\. /);assert.ok(!calls[4].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(5),[POLL,"deployment progress --request-id progress-withdraw-RUN",""]);
 });
 test("buf3 fake tt errors and invalid JSON keep bounded non-secret poll diagnostics",t=>{
  for(const body of [`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');process.exit(2);`,`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');`]){
   const f=bufferTT(t,body),poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");
   const diagnostic=poll.stderr;assert.match(diagnostic,/Deployment poll held/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
   assert.match(diagnostic,body.includes("process.exit")?/tt deployment list exit 2/:/unclassified/);const calls=callLog(f.log).split("\n");assert.deepEqual(calls.slice(0,3),[...START,"deployment list --view active --limit 200"]);
-  if(body.includes("process.exit")){assert.match(calls[3],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list exit 2\. /);assert.ok(!calls[3].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(4),[POLL,""]);}
-  else assert.deepEqual(calls.slice(3),[POLL,""]);
+  if(body.includes("process.exit")){assert.match(calls[3],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list exit 2\. /);assert.ok(!calls[3].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(4),[POLL,"deployment progress --request-id progress-withdraw-RUN",""]);}
+  else assert.deepEqual(calls.slice(3),[POLL,"deployment progress --request-id progress-withdraw-RUN",""]);
  }
 });
 test("fast forward pins exact candidate and ref CAS refuses a race",()=>{const f=fixture();const commit=change(f,"client/a.js","a");const out=integrateCandidate(f.cwd,job(f,commit));assert.equal(out.integrated,commit);git(f.cwd,"update-ref","refs/heads/tasks-hub",commit,f.base);assert.throws(()=>publishIntegration(f.cwd,commit,f.base),/race/);});

@@ -1903,8 +1903,8 @@ func deployerLivenessBound() time.Duration {
 }
 
 // deployerProgressBound is how old the release runner's own last progress
-// report may be, with a fresh wrapper heartbeat and a release job standing,
-// before the runner is reported as hung.
+// report may be, with a fresh wrapper heartbeat and a release job standing
+// (verified, claimed or merged), before the runner is reported as hung.
 func deployerProgressBound() time.Duration {
 	v, err := strconv.Atoi(os.Getenv("TAILTERM_DEPLOYER_PROGRESS_MINUTES"))
 	if err != nil || v < 1 || v > 1440 {
@@ -2111,7 +2111,8 @@ type DeployerNotice struct {
 // notice to the primary database handler and the owner helper of every open,
 // active project whose deployer is silent, stuck in a restart, or heartbeating
 // with no progress report from its runner for the progress bound, while a
-// release job has stood in verified or claimed for the bound. It reads only
+// release job has stood in verified, claimed or merged for the bound (a
+// blocked or held job is one a person acts on, so it never counts). It reads only
 // durable rows and never restarts, signals or changes the deployer or a job.
 func (s *Store) DeployerLivenessSweep(ctx context.Context, now time.Time) ([]DeployerNotice, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT a.task_id FROM agents a JOIN tasks t ON t.id=a.task_id WHERE a.role=? AND t.status=? AND t.pause_state='active' ORDER BY a.task_id`, api.AgentRoleDeployment, api.TaskOpen)
@@ -2198,7 +2199,9 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		return nil, err
 	}
 
-	// A job waits once it has stood in verified, or in claimed, for the bound.
+	// A job waits once it has stood in verified, in claimed or in merged (its
+	// prepare, deploy and live check) for the bound. A blocked job is handed to
+	// a person and a held one is the owner's, so neither waits on the deployer.
 	// Jobs carry no state-change time, so the sweep keeps its first sight of
 	// each state: never earlier than the change, so the notice is never early.
 	seen := map[string][2]string{}
@@ -2234,7 +2237,7 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	}
 	type standing struct{ id, state string }
 	var jobs []standing
-	if rows, err = tx.QueryContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND state IN ('verified','claimed') ORDER BY rowid`, taskID); err != nil {
+	if rows, err = tx.QueryContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND state IN ('verified','claimed','merged') ORDER BY rowid`, taskID); err != nil {
 		return nil, err
 	}
 	for rows.Next() {
@@ -2425,9 +2428,9 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		}
 		lastNotice = fmt.Sprintf("#%d at %s, %q", last.seq, last.at, last.subject)
 	}
-	text := fmt.Sprintf("%s Last heartbeat: %s. Last notice: %s. Waiting: %d verified and %d claimed release jobs; oldest %s. Bound: %d minutes. "+
+	text := fmt.Sprintf("%s Last heartbeat: %s. Last notice: %s. Waiting: %d verified, %d claimed and %d merged release jobs; oldest %s. Bound: %d minutes. "+
 		"Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md). Nothing was restarted or signalled.",
-		lead, heartbeat, lastNotice, counts["verified"], counts["claimed"], jobs[0].id, int(bound/time.Minute))
+		lead, heartbeat, lastNotice, counts["verified"], counts["claimed"], counts["merged"], jobs[0].id, int(bound/time.Minute))
 	refs := map[string]string{"activity": "deployer_liveness", "reason": ep.reason, "deployer": d.id, "run": d.run}
 	var posted []int64
 	for _, slot := range []struct {

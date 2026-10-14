@@ -883,11 +883,19 @@ test("retry t1 t4 a hub refusal is never sent again, and only an idempotent call
  // What counts as a transport error: the fixed causes, and 502, 503 and 504 only.
  for(const [stderr,cause] of [[DEADLINE,"timed out: context deadline exceeded"],['tt: Get "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: connection refused',"connection refused"],["tt: read tcp 192.0.2.1:1->192.0.2.2:2: read: connection reset by peer","connection reset"],["tt: dial tcp 192.0.2.1:18765: i/o timeout","timed out: i/o timeout"],['tt: Get "http://hub.invalid/x": net/http: request canceled (Client.Timeout exceeded while awaiting headers)',"timed out: Client.Timeout exceeded"],['tt: Post "http://hub.invalid/x": context deadline exceeded (Client.Timeout exceeded while awaiting headers)',"timed out: context deadline exceeded"],["tt: hub: 502 Bad Gateway","hub answered 502"],["tt: hub: 503 Service Unavailable","hub answered 503"],["tt: hub: 504 Gateway Timeout","hub answered 504"]])
   assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[3,2,`tt deployment get ${cause}, 3 tries`],stderr);
+ // q2: the other connection failures the Go client and the network print are transport errors too, each with its fixed cause.
+ const dial='tt: Get "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: ';
+ for(const [stderr,cause] of [['tt: Post "http://hub.invalid/x": unexpected EOF',"unexpected EOF"],['tt: Get "http://hub.invalid/x": EOF',"connection closed: EOF"],
+  ['tt: Post "http://hub.invalid/x": write tcp 192.0.2.1:1->192.0.2.2:2: write: broken pipe',"broken pipe"],[dial+"network is unreachable","network is unreachable"],[dial+"no route to host","no route to host"],[dial+"host is down","host is down"],
+  [dial+"operation timed out","timed out: connect"],[dial+"connection timed out","timed out: connect"],['tt: Get "http://hub.invalid/x": dial tcp: lookup hub.invalid: no such host',"no such host"],
+  ['tt: Get "http://hub.invalid/x": net/http: TLS handshake timeout',"timed out: TLS handshake"],['tt: Get "http://hub.invalid/x": http: server closed idle connection',"server closed idle connection"]])
+  assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[3,2,`tt deployment get ${cause}, 3 tries`],stderr);
  // The hub's own answer is final whatever its words: a refusal, a validation answer, a 500.
- for(const stderr of ["tt: hub: 409 conflict: release: generation changed","tt: hub: 422 validation: subject mentions a timeout","tt: hub: 400 bad request: context deadline exceeded is not a subject","tt: hub: 404 not found","tt: hub: 500 internal: database connection reset"])
+ for(const stderr of ["tt: hub: 409 conflict: release: generation changed","tt: hub: 422 validation: subject mentions a timeout","tt: hub: 400 bad request: context deadline exceeded is not a subject","tt: hub: 404 not found","tt: hub: 500 internal: database connection reset",
+  "tt: hub: 409 conflict: broken pipe in subject","tt: hub: 422 validation: no route to host is not a reason","tt: hub: 500 internal: unexpected EOF","tt: hub: 400 bad request: network is unreachable","tt: hub: 409 conflict: no such host"])
   assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[1,0,"tt deployment get exit 1"],stderr);
- // r2: with no hub status, a line that only says timeout or timed out is not a transport error and is made once.
- for(const stderr of ["tt: timeout","tt: timed out","tt: the operation timed out","tt: lock wait timeout exceeded","tt: Timeout","tt: client.timeout exceeded"])
+ // r2: with no hub status, a line that only says timeout or timed out is not a transport error and is made once; nor is an EOF not in the client's form (a local read).
+ for(const stderr of ["tt: timeout","tt: timed out","tt: the operation timed out","tt: lock wait timeout exceeded","tt: Timeout","tt: client.timeout exceeded","tt: unexpected EOF","tt: EOF"])
   assert.deepEqual(tried([{op:"get",from:1,to:null,stderr}],get,stderr),[1,0,"tt deployment get exit 1"],stderr);
  assert.deepEqual(tried([{op:"send:Keyed",from:1,to:null,stderr:"tt: timeout"}],keyed,"keyed timeout"),[1,0,"tt send exit 1"]);
  // r2: a call the runner stops at its own command timeout printed nothing; the hub decided nothing, so it stays a transport error.
@@ -956,11 +964,15 @@ test("retry t2 t3 the deployer names a waiting job's spent transport failure onc
 // A lasting transport wait (wi_f2e585b63f57b6f8). The fake hub fails the
 // operations a file names with a transport line; every poll is a new daemon
 // call, so each one is a restarted process over the same journal directory.
+// send:routine and send:attention fail only that notice's send, and
+// refuse:routine makes the hub refuse the routine notice.
 function waitHost(t){
  const cwd=mkdtempSync(join(tmpdir(),"release-transport-wait-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
  const sleep=cliRetry.sleep,slept=[];cliRetry.sleep=ms=>{slept.push(ms);};const clock=transportWait.now;let now=Date.parse("2026-10-13T18:00:00.000Z");transportWait.now=()=>now;t.after(()=>{cliRetry.sleep=sleep;transportWait.now=clock;});
  const faults=join(cwd,"faults.json");let failing=[];const fail=ops=>{failing=ops;writeFileSync(faults,JSON.stringify(ops));};fail([]);
- const h=codeHost(t,cwd,`const failing=JSON.parse(fs.readFileSync(${JSON.stringify(faults)},'utf8'));if(failing.includes(a[0]==='send'?'send':a[1])){fs.writeSync(2,'tt: Get "http://hub.invalid/'+${JSON.stringify(HELD_SECRET)}+'": dial tcp: connect: connection refused\\n');process.exit(1);}`);
+ const h=codeHost(t,cwd,`const failing=JSON.parse(fs.readFileSync(${JSON.stringify(faults)},'utf8'));const notice=a[0]==='send'?{'A deployer CLI call failed':'routine',[${JSON.stringify(ATTENTION)}]:'attention'}[a[a.indexOf('--subject')+1]]:undefined;
+  if(notice&&failing.includes('refuse:'+notice)){fs.writeSync(2,'tt: hub: 409 conflict: request id reused with other data\\n');process.exit(1);}
+  if(failing.includes(a[0]==='send'?'send':a[1])||(notice&&failing.includes('send:'+notice))){fs.writeSync(2,'tt: Get "http://hub.invalid/'+${JSON.stringify(HELD_SECRET)}+'": dial tcp: connect: connection refused\\n');process.exit(1);}`);
  // The release reads the handler only while that read is failing: the fake hub has no handler of its own.
  const waits=async(c,adapter)=>{if(failing.includes("handler")){try{adapter.handler();}catch(error){assert.equal(error.transport,true);}}return {jobId:c.job.id,outcome:"waiting_inputs"};};
  const of=subject=>h.calls().filter(c=>c.argv[0]==="send").map(sendOf).filter(x=>x.subject===subject),file=join(h.home,"transport-wait.json");
@@ -1002,12 +1014,41 @@ test("wait r3 notices skip retries during a transport wait, and an owed attentio
  assert.equal(w.wait().routine,false);assert.equal(w.wait().escalated,false);assert.equal(w.wait().due.jobId,"rel_wait");
  // Sends still fail while reads succeed: the notice's own transport failure keeps the wait open.
  w.fail(["send"]);w.advance(1);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),true);assert.equal(w.attention().length,2);assert.equal(w.wait().escalated,false);
+ // q1: the owed routine notice is tried at that poll too, and stays owed.
+ assert.equal(w.routine().length,3);assert.equal(w.wait().routine,false);
  // The hub answers again: the owed attention notice is posted once, identical to the earlier tries, and the wait ends.
  w.fail([]);w.advance(1);assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(existsSync(w.file),false);
  const tries=w.attention();assert.equal(tries.length,3);assert.equal(new Set(tries.map(x=>x.requestId+"\n"+x.text)).size,1);assert.ok(tries[0].text.includes(`since ${began}`));
- await w.poll();assert.equal(w.attention().length,3);
+ // q1: so is the owed routine notice, identical to its earlier tries.
+ const told=w.routine();assert.equal(told.length,4);assert.equal(new Set(told.map(x=>x.requestId+"\n"+x.text)).size,1);
+ await w.poll();assert.equal(w.attention().length,3);assert.equal(w.routine().length,4);
  // A wait that ends inside the bound owes nothing.
  w.fail(["handler"]);await w.poll();w.fail([]);w.advance(3);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.attention().length,3);
+});
+test("wait r3 q1 the poll that ends a wait tries each owed notice on its own and keeps the wait until neither is unreached",async t=>{
+ // Opens a wait whose routine notice is owed; past the bound when due is set, with the attention notice owed too.
+ const open=async(w,due)=>{w.h.setJobs([verifiedJob("rel_wait")]);w.fail(["handler","send"]);await w.poll();if(due){w.advance(11);await w.poll();}
+  assert.equal(w.wait().routine,false);assert.equal(w.wait().escalated,false);assert.equal(Boolean(w.wait().due),due);w.advance(1);};
+ await t.test("routine owed, attention not due",async t=>{
+  const w=waitHost(t);await open(w,false);w.fail([]);
+  assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.routine().length,2);assert.equal(w.attention().length,0);
+  await w.poll();assert.equal(w.routine().length,2);
+ });
+ await t.test("only the routine send unreached",async t=>{
+  const w=waitHost(t);await open(w,true);w.fail(["send:routine"]);
+  assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(existsSync(w.file),true);assert.equal(w.wait().escalated,"posted");assert.equal(w.wait().routine,false);assert.equal(w.routine().length,3);assert.equal(w.attention().length,2);
+  w.fail([]);w.advance(1);assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.routine().length,4);assert.equal(w.attention().length,2);
+ });
+ await t.test("only the attention send unreached",async t=>{
+  const w=waitHost(t);await open(w,true);w.fail(["send:attention"]);
+  assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),true);assert.equal(w.wait().routine,true);assert.equal(w.wait().escalated,false);assert.equal(w.routine().length,3);assert.equal(w.attention().length,2);
+  w.fail([]);w.advance(1);assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(existsSync(w.file),false);assert.equal(w.routine().length,3);assert.equal(w.attention().length,3);
+ });
+ await t.test("a refused routine notice is taken",async t=>{
+  const w=waitHost(t);await open(w,false);w.fail(["refuse:routine"]);
+  assert.equal(await w.poll(),"");assert.equal(existsSync(w.file),false);assert.equal(w.routine().length,2);
+  w.fail([]);await w.poll();assert.equal(w.routine().length,2);
+ });
 });
 test("wait r3 a poll that cannot read the job list at all continues the open wait and opens one of its own",async t=>{
  const w=waitHost(t);w.h.setJobs([verifiedJob("rel_wait")]);
@@ -1090,7 +1131,7 @@ test("progress a13 a release reports each phase and each step once, in order, wi
   assert.deepEqual(argvOf(h),["deployment progress --phase merged --job rel_fixture --step live-check","deployment progress --phase poll --job rel_fixture --wait matrix --pid 7","deployment progress --phase poll --wait fence"]);
  }finally{rmSync(cwd,{recursive:true,force:true});rmSync(h.home,{recursive:true,force:true});}
 });
-test("progress a14 a failed report is silent: a transport failure is one call, a rejection is followed by one withdraw, and nothing is recorded or posted",async t=>{
+test("progress a14 a failed report is silent: a transport failure is one call, a rejection is followed by a withdraw until one succeeds, and nothing is recorded or posted",async t=>{
  const cwd=mkdtempSync(join(tmpdir(),"release-progress-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
  const waits=async c=>({jobId:c.job.id,outcome:"waiting_inputs"}),quiet=h=>{
   assert.equal(existsSync(join(h.home,"cli-failures.json")),false);assert.equal(existsSync(join(h.home,"transport-wait.json")),false);
@@ -1105,10 +1146,25 @@ test("progress a14 a failed report is silent: a transport failure is one call, a
  assert.equal(await progressRun(t,down,2,waits),plain);
  assert.deepEqual(reports(down),["deployment progress --phase start","deployment progress --phase poll --job rel_p --wait inputs","deployment progress --phase poll --job rel_p --wait inputs"]);assert.deepEqual(slept,[]);quiet(down);
  assert.equal(down.calls().filter(c=>c.argv[0]==="send").length,sends);
- // This tt does not know the command (exit 2): one withdraw, in the form an older tt forwards, once across the polls.
+ // q2: a report that fails in another transport phrase is one call too, and is not withdrawn.
+ const unrouted=codeHost(t,cwd,`if(a[1]==='progress'){fs.writeSync(2,'tt: Post "http://hub.invalid/x": dial tcp 192.0.2.1:18765: connect: no route to host\\n');process.exit(1);}`);
+ const lone=Object.assign(new HostAdapter(unrouted.config,{}),{progressOn:true});lone.progress({phase:"poll"});
+ assert.deepEqual(reports(unrouted),["deployment progress --phase poll"]);assert.deepEqual(slept,[]);quiet(unrouted);
+ // h2: this tt does not know the command (exit 2) and so refuses the withdraw too: it is sent again, in the form an older tt forwards, after each rejected report.
  const old=codeHost(t,cwd);old.setJobs([verifiedJob("rel_p")]);assert.equal(await progressRun(t,old,2,waits),plain);
- assert.deepEqual(reports(old),["deployment progress --phase start","deployment progress --request-id progress-withdraw-"+CODE_RUN,"deployment progress --phase poll --job rel_p --wait inputs","deployment progress --phase poll --job rel_p --wait inputs"]);quiet(old);
+ const withdraw="deployment progress --request-id progress-withdraw-"+CODE_RUN;
+ assert.deepEqual(reports(old),["deployment progress --phase start",withdraw,"deployment progress --phase poll --job rel_p --wait inputs",withdraw,"deployment progress --phase poll --job rel_p --wait inputs",withdraw]);quiet(old);
  assert.equal(old.calls().filter(c=>c.argv[0]==="send").length,sends);
+ // A tt from before the command, which forwards the withdraw form: one withdraw across the polls.
+ const realOld=codeHost(t,cwd,`if(a[1]==='progress'){if(a.includes('--phase'))process.exit(2);console.log('{}');process.exit(0);}`);realOld.setJobs([verifiedJob("rel_p")]);
+ assert.equal(await progressRun(t,realOld,2,waits),plain);
+ assert.deepEqual(reports(realOld),["deployment progress --phase start",withdraw,"deployment progress --phase poll --job rel_p --wait inputs","deployment progress --phase poll --job rel_p --wait inputs"]);quiet(realOld);
+ // A withdraw lost in transport is sent again after the next rejected report; once one succeeds, none follows until a report succeeds.
+ const lost=join(cwd,"lost"),rejecting=join(cwd,"rejecting"),lossy=codeHost(t,cwd,`if(a[1]==='progress'){if(a.includes('--phase')&&fs.existsSync(${JSON.stringify(rejecting)}))process.exit(2);if(a.includes('--request-id')&&fs.existsSync(${JSON.stringify(lost)})){fs.writeSync(2,${JSON.stringify(REFUSED)}+'\\n');process.exit(1);}console.log('{}');process.exit(0);}`);
+ const lossyAdapter=Object.assign(new HostAdapter(lossy.config,{}),{progressOn:true}),tell=()=>lossyAdapter.progress({phase:"poll"});
+ writeFileSync(rejecting,"");writeFileSync(lost,"");tell();rmSync(lost);tell();tell();rmSync(rejecting);tell();writeFileSync(rejecting,"");tell();tell();
+ assert.deepEqual(reports(lossy).map(x=>x.includes("--request-id")?"withdraw":"report"),["report","withdraw","report","withdraw","report","report","report","withdraw","report"]);
+ assert.equal(lossyAdapter.progressState.withdrawn,true);assert.deepEqual(slept,[]);quiet(lossy);
  // Reports resume by themselves, and a rejection after a success is withdrawn again.
  const flaky=join(cwd,"reject"),turns=codeHost(t,cwd,`if(a[1]==='progress'){if(fs.existsSync(${JSON.stringify(flaky)})&&a.includes('--phase'))process.exit(2);console.log('{}');process.exit(0);}`);
  const adapter=Object.assign(new HostAdapter(turns.config,{}),{progressOn:true}),say=()=>adapter.progress({phase:"poll"});
@@ -1127,7 +1183,8 @@ test("claim a15 a claim that fails only in transport is quiet and opens the tran
  // The transport wait opens with that job, as the transport fix built it.
  assert.deepEqual(w.wait(),{version:1,jobId:"rel_first",since:began,cause:reason,polls:1,routine:true,escalated:false,latest:reason,lastAt:began});assert.equal(w.routine().length,1);
  assert.deepEqual(w.routine()[0].refs,["release-job=rel_first","wake=routine"]);
- assert.equal(w.h.calls().at(-1).argv.join(" "),"deployment progress --phase poll --job rel_first --wait transport");
+ // The poll's last report names the transport wait (this fake rejects reports, so a withdraw follows each: h2).
+ assert.equal(w.h.calls().filter(c=>c.argv[1]==="progress"&&c.argv.includes("--phase")).at(-1).argv.join(" "),"deployment progress --phase poll --job rel_first --wait transport");
  // Past the bound the wait escalates by itself; still no held claim.
  w.advance(10);assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(w.attention().length,1);assert.deepEqual(held(),[]);assert.deepEqual(released,[]);
  // The fault clears: the next poll claims the first job and the wait ends.

@@ -75,14 +75,22 @@ function childReason(argv, error, cli, transport) {
 // never the line. A line that carries the hub's own answer ("hub: STATUS ...")
 // is a transport error only for 502, 503 and 504: a refusal or a validation
 // answer (4xx with a reason) and a 500 are the hub's decision. Without a hub
-// status only these phrases of the Go HTTP client count (wi_f2e585b63f57b6f8):
-// a line that merely says timeout or timed out is not a transport error, so
+// status only these phrases of the Go HTTP client and the network count
+// (wi_f2e585b63f57b6f8, wi_27a082e16c37d3cd): a deadline, a refused, reset or
+// closed connection, an EOF the client read in place of an answer, a broken
+// pipe, an unreachable network or host, a host that is down, a connect or TLS
+// handshake that timed out and a host name that does not resolve. The two EOF
+// forms count only as the client prints them (METHOD "URL": EOF), since tt
+// also reads a local --file and a bare "unexpected EOF" may be its own parse.
+// A line that merely says timeout or timed out is not a transport error, so
 // the call is not made again and its failure is judged as any other. A call
 // the runner itself killed at its command timeout (ETIMEDOUT) is kept as a
 // transport error: the hub gave no answer, so it cannot be the hub's decision,
 // and dropping it would turn a hung fence check into a lost fence. It is still
 // never made again when it used up the retry window.
-const TRANSPORT = [[/context deadline exceeded/i, "timed out: context deadline exceeded"], [/connection refused/i, "connection refused"], [/connection reset/i, "connection reset"], [/i\/o timeout/i, "timed out: i/o timeout"], [/Client\.Timeout exceeded/, "timed out: Client.Timeout exceeded"]];
+const TRANSPORT = [[/context deadline exceeded/i, "timed out: context deadline exceeded"], [/connection refused/i, "connection refused"], [/connection reset/i, "connection reset"], [/i\/o timeout/i, "timed out: i/o timeout"], [/Client\.Timeout exceeded/, "timed out: Client.Timeout exceeded"],
+  [/"[^"]*": unexpected EOF$/, "unexpected EOF"], [/"[^"]*": EOF$/, "connection closed: EOF"], [/broken pipe/i, "broken pipe"], [/network is unreachable/i, "network is unreachable"], [/no route to host/i, "no route to host"],
+  [/host is down/i, "host is down"], [/connect: (?:operation|connection) timed out/i, "timed out: connect"], [/no such host/i, "no such host"], [/TLS handshake timeout/, "timed out: TLS handshake"], [/server closed idle connection/, "server closed idle connection"]];
 function transportCause(error) {
   if (error.code === "ENOBUFS" || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return null;
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
@@ -163,9 +171,11 @@ export function cliFailureNotice(failure, run) {
 // call ends that way. One routine notice (cliFailureNotice of its first
 // failure, keyed by when the wait began) is posted per wait, and one
 // attention notice once it has lasted escalateMs. Either is tried once per
-// poll until the hub takes it, the attention notice also at the poll that
-// ends the wait. The file holds only times, the job id and childReason's
-// fixed phrases. Tests replace now.
+// poll until the hub takes it (posts or refuses it). Both are also tried,
+// each on its own, at the poll that ends the wait, and the wait ends only
+// once neither is still owed: an unreached one keeps the file for the next
+// poll. The file holds only times, the job id and childReason's fixed
+// phrases. Tests replace now.
 export const transportWait = {escalateMs: 600000, now: () => Date.now()};
 const transportWaitPath = dir => join(dir, "transport-wait.json");
 function readTransportWait(dir) {
@@ -1114,8 +1124,9 @@ export class HostAdapter {
   // terminal line. A report the CLI or the hub rejects (not a transport
   // error: this tt or hub is older than the runner) is followed by one
   // withdraw, in the form a tt from before the command forwards, so the hub
-  // judges this run as one that never reported. It is withdrawn again only
-  // after a later report succeeded.
+  // judges this run as one that never reported. A withdraw that fails is sent
+  // again after the next rejected report, until one succeeds; after that it is
+  // withdrawn again only after a later report succeeded.
   progress(record){
     if(this.progressOn!==true || typeof record?.phase!=="string")return;
     const cli=this.config.tt||"tt",call=argv=>execFileSync(cli,argv,{cwd:this.config.cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:10000});
@@ -1125,8 +1136,8 @@ export class HostAdapter {
     }catch(error){
       try{
         if(transportCause(error) || this.progressState.withdrawn)return;
-        this.progressState.withdrawn=true;
         call(["deployment","progress","--request-id",`progress-withdraw-${process.env.TAILTERM_RUN||"run"}`]);
+        this.progressState.withdrawn=true;
       }catch{}
     }
   }
@@ -2169,17 +2180,23 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       const outcome=post(transportWaitNotice(wait));if(outcome==="unreached")return false;
       wait.escalated=outcome;process.stderr.write(outcome==="posted"?"Transport wait passed its bound; attention notice posted.\n":"Transport wait passed its bound; the hub refused its attention notice.\n");return true;
     };
+    const routine=()=>{
+      if(!wait.routine && post(cliFailureNotice({reason:wait.cause,jobId:wait.jobId,at:wait.since},process.env.TAILTERM_RUN))!=="unreached")wait.routine=true;
+      return wait.routine;
+    };
     if(!failures.length){
       if(!wait)return;
-      // The wait ends here unless its owed attention notice is still unreached.
-      if(escalate()){rmSync(path,{force:true});waitOpen=false;return;}
+      // The wait ends here unless an owed notice is still unreached; each is
+      // tried whatever the other did.
+      const told=routine(),escalated=escalate();
+      if(told && escalated){rmSync(path,{force:true});waitOpen=false;return;}
     }else{
       const jobId=failures.find(f=>f.jobId)?.jobId??null;
       if(!wait || (wait.jobId && jobId && wait.jobId!==jobId))wait={version:1,jobId,since:at,cause:safe(failures[0].reason),polls:0,routine:false,escalated:false};
       if(!wait.jobId && jobId)wait.jobId=jobId;
       wait.polls=(Number.isSafeInteger(wait.polls)?wait.polls:0)+1;wait.latest=safe(failures.at(-1).reason);
       if(!wait.due && now-Date.parse(wait.since)>=transportWait.escalateMs)wait.due={jobId:wait.jobId,cause:wait.latest,minutes:Math.round(transportWait.escalateMs/60000)};
-      if(!wait.routine && post(cliFailureNotice({reason:wait.cause,jobId:wait.jobId,at:wait.since},process.env.TAILTERM_RUN))!=="unreached")wait.routine=true;
+      routine();
       escalate();
     }
     wait.lastAt=at;waitOpen=true;

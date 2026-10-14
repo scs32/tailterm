@@ -694,8 +694,17 @@ release that has passed verification (incident of 2026-10-13).
 - **Transport error (wi_f2e585b63f57b6f8).** Read from the last line of the
   call's stderr. It is one only for the hub line `hub: 502`, `hub: 503` or
   `hub: 504`, or, on a line with no hub status, one of these phrases of the Go
-  HTTP client: `context deadline exceeded`, `connection refused`,
-  `connection reset`, `i/o timeout`, `Client.Timeout exceeded`. Any other
+  HTTP client and the network: `context deadline exceeded`,
+  `connection refused`, `connection reset`, `i/o timeout`,
+  `Client.Timeout exceeded`, `broken pipe`, `network is unreachable`,
+  `no route to host`, `host is down`, `connect: operation timed out` or
+  `connect: connection timed out`, `no such host`, `TLS handshake timeout`,
+  `server closed idle connection`, and `unexpected EOF` or `EOF` ending the
+  line in the client's form `METHOD "URL": EOF` (wi_27a082e16c37d3cd). A bare
+  `tt: unexpected EOF` or `tt: EOF` is not one: `tt` also reads a local
+  `--file`, so it may be its own parse error. Each phrase is named in the
+  reason by a fixed cause (for example `no route to host`,
+  `connection closed: EOF`, `timed out: connect`). Any other
   answer of the hub is final and is never retried: a refusal or a validation
   answer (4xx with a reason) and a 500, whatever words it holds. A line that
   merely says `timeout` or `timed out` is not a transport error: the call is
@@ -762,9 +771,12 @@ release that has passed verification (incident of 2026-10-13).
     terminal prints "Transport wait passed its bound; attention notice
     posted."
   - Both notices go through the hub that is failing. Each is tried once per
-    poll until the hub takes it; an attention notice still owed when the hub
-    answers again is posted at that poll, so a wait that outlasted the bound
-    is always reported once.
+    poll until the hub takes it (posts it, or refuses it with an answer of
+    its own). At the poll in which the hub answers again, each notice still
+    owed is tried, each on its own whatever the other did, and the wait ends
+    only once neither is still unreached; until then the file stays and each
+    outcome is kept in it. So a wait is always reported once by its routine
+    notice, and a wait that outlasted the bound once by its attention notice.
   - **Notices skip retries during a wait.** Every notice of the daemon (fence
     wait, host wait, code, held claim, failed call) is sent once instead of up
     to three times in three cases: a wait is open from an earlier poll; a
@@ -857,10 +869,15 @@ runs for every open project that is not paused.
 **Rule.** With N the bound (10 minutes unless set, below), the hub posts when
 both hold:
 
-- **A job waits.** At least one release job has stood in `verified`, or in
-  `claimed`, for N without changing state. A job that moves from `verified` to
-  `claimed` starts its N again. `held`, `merged` and `blocked` jobs never count,
-  so an owner hold alone is never reported. The hub times a job from the first
+- **A job waits.** At least one release job has stood in `verified`, in
+  `claimed` or in `merged` for N without changing state. `merged` is the job's
+  prepare, deploy and live check, so a deployer that dies or hangs during the
+  deploy of a lone release is reported too (wi_27a082e16c37d3cd). A job that
+  changes state (`verified` to `claimed`, `claimed` to `merged`) starts its N
+  again. `held` and `blocked` jobs never count: a held job is the owner's and a
+  blocked one has been handed to a person with its own attention notice, so
+  neither waits on the deployer, and an owner hold alone is never reported. A
+  `verified` job queued behind a blocked one still counts. The hub times a job from the first
   tick that sees it in its state, so the notice is never early and at most one
   tick late. The timing does not carry across a gap in the checks: when a
   project has gone unchecked for two minutes or more (for N or more when N is
@@ -893,8 +910,9 @@ runner has made no progress while release jobs wait", with refs
 `activity=deployer_liveness`, `reason=silent`, `reason=restart` or
 `reason=hung`, `deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
 run and status, its last heartbeat, its last message (number, time and
-subject), how many jobs are `verified` and `claimed`, the oldest of them, the
-bound and the recovery.
+subject), how many jobs are `verified`, `claimed` and `merged` ("Waiting: 1
+verified, 0 claimed and 0 merged release jobs"), the oldest of them, the bound
+and the recovery.
 
 **Once per episode.** An episode opens with the first notice and each
 recipient gets one copy in it, however long the silence lasts. A recipient
@@ -948,7 +966,7 @@ changes no job and wakes nobody.
 its current run is 10 minutes old or older. `TAILTERM_DEPLOYER_PROGRESS_MINUTES`
 in the hub's environment sets that bound, a whole number of minutes from 1 to
 1440; any other value, or none, gives 10. Everything else is the check above:
-a job must have stood in `verified` or `claimed` for N, there is one notice
+a job must have stood in `verified`, `claimed` or `merged` for N, there is one notice
 per recipient and episode, silence and an unfinished restart come first so one
 cause opens one episode, and nothing is restarted, signalled or changed. The
 notice adds the time, phase, step, job and wait of the last report.
@@ -972,16 +990,22 @@ report and later lose the ability. Neither case is read as a hang, and neither
 needs a step by hand:
 
 - *The runner is rolled back.* A report older than the run's newest
-  "Deployer is restarting itself onto the published scripts" or "Deployer now
-  runs the published scripts" notice does not count: the scripts that sent it
-  may no longer run. A runner that reports again after such a notice counts
-  again within one poll.
+  "Deployer is restarting itself onto the published scripts", "Deployer now
+  runs the published scripts" or "Deployer is not claiming releases: ..."
+  notice does not count: the scripts that sent it may no longer run. A runner
+  that reports again after such a notice counts again within one poll. Between
+  such a notice and the run's next report (its next phase or step report, or
+  the report at the end of the poll) the hung rule does not see a hang; only
+  the silent rule applies then, and the restart rule too after a restart
+  notice.
 - *`tt` on the deployer's host is rolled back under a runner that still
   reports.* The older `tt` rejects the report; the runner then sends one
   withdraw (`tt deployment progress --request-id KEY`, a form the older `tt`
   forwards), which clears the report and keeps the run judged as one that
-  never reported. Reports are still tried at every point and resume by
-  themselves.
+  never reported. A withdraw that fails (in transport, or refused) is sent
+  again after the next rejected report, until one succeeds; after a success it
+  is not repeated until a report has succeeded again. Reports are still tried
+  at every point and resume by themselves.
 
 A hub rolled back to before this change leaves the table unused and refuses
 the calls; the runner ignores a failed report: it is tried once for at most ten
@@ -989,7 +1013,9 @@ seconds and is never recorded, retried or posted.
 
 **Limit.** A single step that runs longer than the bound without the runner
 getting back to a poll (one command may run ten minutes, the prerequisite
-provisioning fifteen) gives one notice for a healthy runner. Raise the bound
+provisioning fifteen) gives one notice for a healthy runner. Since a `merged`
+job counts, this holds for the prepare, rehearse, deploy and live-check steps
+of every release, a lone one included. Raise the bound
 if that recurs. A hang of the hub's own tick is not covered.
 
 **Command.** `tt deployment progress` prints the stored record: `agentId`,
