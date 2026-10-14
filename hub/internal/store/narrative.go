@@ -432,10 +432,28 @@ func (s *Store) PutNarrativeArtifact(ctx context.Context, taskID, itemID string,
 		}
 	}
 	now := s.now()
+	v, err := insertNarrativeArtifactVersion(ctx, tx, taskID, itemID, id, current, req, by, now)
+	if err != nil {
+		return api.NarrativeArtifactVersion{}, false, err
+	}
+	if _, err = saveNarrativeReceipt(ctx, tx, taskID, itemID, "artifact", req.RequestID, req.AgentID, payload, v, by, now); err != nil {
+		return api.NarrativeArtifactVersion{}, false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return api.NarrativeArtifactVersion{}, false, err
+	}
+	s.notify(taskID)
+	return v, false, nil
+}
+
+// insertNarrativeArtifactVersion writes version current+1 of artifact id inside
+// tx: the artifact row, the immutable version and its timeline entry. The
+// caller has validated req, the item and the actor, and checked current.
+func insertNarrativeArtifactVersion(ctx context.Context, tx *sql.Tx, taskID, itemID, id string, current int64, req api.PutNarrativeArtifactRequest, by api.Caller, now time.Time) (api.NarrativeArtifactVersion, error) {
 	version := current + 1
 	seq, err := nextNarrativeSeq(ctx, tx, taskID, itemID)
 	if err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
+		return api.NarrativeArtifactVersion{}, err
 	}
 	v := api.NarrativeArtifactVersion{ArtifactID: id, TaskID: taskID, ItemID: itemID, Version: version, NarrativeSeq: seq, Namespace: req.Namespace, SourceID: req.SourceID, SourceVersion: req.SourceVersion, Kind: req.Kind, Title: req.Title, OriginalAuthor: req.OriginalAuthor, SourceTime: req.SourceTime, IngestedBy: narrativeActor(req.AgentID, req.RunID, by), IngestedAt: now, Provenance: req.Provenance, CaptureState: req.CaptureState, Availability: req.Availability, Content: req.Content, SuppliedDigest: req.SuppliedDigest, Locator: req.Locator, Size: req.Size, SupersedesVersion: current}
 	if req.CaptureState == "stored-content" {
@@ -448,7 +466,7 @@ func (s *Store) PutNarrativeArtifact(ctx context.Context, taskID, itemID string,
 		_, err = tx.ExecContext(ctx, `UPDATE narrative_artifacts SET latest_version=? WHERE id=? AND latest_version=?`, version, id, current)
 	}
 	if err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
+		return api.NarrativeArtifactVersion{}, err
 	}
 	var sourceTime any
 	if req.SourceTime != nil {
@@ -456,20 +474,13 @@ func (s *Store) PutNarrativeArtifact(ctx context.Context, taskID, itemID string,
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO narrative_artifact_versions(artifact_id,version,task_id,item_id,narrative_seq,source_version,kind,title,original_author,source_time,ingested_by,ingested_at,provenance,capture_state,availability,content,content_digest,supplied_digest,locator,size,supersedes_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, version, taskID, itemID, seq, req.SourceVersion, req.Kind, req.Title, marshalJSON(req.OriginalAuthor), sourceTime, marshalJSON(v.IngestedBy), ts(now), req.Provenance, req.CaptureState, req.Availability, req.Content, v.ContentDigest, req.SuppliedDigest, req.Locator, v.Size, current)
 	if err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
+		return api.NarrativeArtifactVersion{}, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO narrative_timeline(task_id,item_id,seq,kind,object_id,object_version,source,capture_state,source_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, taskID, itemID, seq, "artifact", id, version, req.Namespace, req.CaptureState, sourceTime, ts(now))
 	if err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
+		return api.NarrativeArtifactVersion{}, err
 	}
-	if _, err = saveNarrativeReceipt(ctx, tx, taskID, itemID, "artifact", req.RequestID, req.AgentID, payload, v, by, now); err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
-	}
-	if err = tx.Commit(); err != nil {
-		return api.NarrativeArtifactVersion{}, false, err
-	}
-	s.notify(taskID)
-	return v, false, nil
+	return v, nil
 }
 
 func (s *Store) GetNarrativeArtifactVersion(ctx context.Context, taskID, itemID, artifactID string, version int64) (api.NarrativeArtifactVersion, error) {

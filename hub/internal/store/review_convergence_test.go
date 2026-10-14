@@ -3323,3 +3323,335 @@ func TestReviewStageOnlyOwnerWrittenOrderOpensStage(t *testing.T) {
 		}
 	})
 }
+
+// foldFile is the finding file the fold fixtures name.
+const foldFile = "hub/internal/store/fold.go"
+
+// foldTargets files one item that can take a fold of foldFile and one item
+// per reason it cannot: each names foldFile unless the key says otherwise.
+func foldTargets(t *testing.T, s *Store, task api.Task) map[string]api.WorkItem {
+	t.Helper()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	out := map[string]api.WorkItem{}
+	file := func(key, description string) api.WorkItem {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Fold target " + key, Description: description, Priority: "normal", RequestID: "fold-" + key}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[key] = item
+		return item
+	}
+	owns := "Owned paths: " + foldFile + "."
+	file("eligible", owns)
+	file("second", "- "+foldFile+", hub/internal/store/other.go")
+	done := file("done", owns)
+	if _, _, err := s.CreateWorkItemUpdate(ctx, task.ID, done.ID, api.CreateWorkItemUpdate{ExpectedRevision: done.Revision, Status: ptr("done"), RequestID: "fold-done"}, by); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"accepted", "running", "queued"} {
+		item := file(key, owns)
+		order := contextLinkedMessage(t, s, task, item, "fold order "+key, "fold-order-"+key, nil)
+		if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fold-queue-" + key, Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: "/fold/" + key}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished',acceptance_json='{"commit":"fixture"}' WHERE item_id=?`, out["accepted"].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='running',released_at='' WHERE item_id=?`, out["running"].ID); err != nil {
+		t.Fatal(err)
+	}
+	contextLinkedMessage(t, s, task, file("ordered", owns), "fold order", "fold-order-ordered", nil)
+	file("other-file", "Owned paths: hub/internal/store/unrelated.go.")
+	file("prefix", "Owned paths: hub/internal/store and hub/internal/store/fold.go.bak, x/"+foldFile)
+	return out
+}
+
+// foldCounts counts the rows a refused fold must not write.
+func foldCounts(t *testing.T, s *Store) [5]int {
+	t.Helper()
+	var n [5]int
+	for i, table := range []string{"messages", "work_items", "work_item_revisions", "narrative_artifacts", "narrative_artifact_versions"} {
+		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return n
+}
+
+type foldNote struct {
+	namespace, kind, provenance, title, content, author string
+}
+
+func foldNotes(t *testing.T, s *Store, item string) []foldNote {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT a.namespace,v.kind,v.provenance,v.title,v.content,v.original_author FROM narrative_artifacts a JOIN narrative_artifact_versions v ON v.artifact_id=a.id WHERE a.item_id=? ORDER BY v.narrative_seq`, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []foldNote
+	for rows.Next() {
+		var n foldNote
+		if err := rows.Scan(&n.namespace, &n.kind, &n.provenance, &n.title, &n.content, &n.author); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func itemRevisionCount(t *testing.T, s *Store, item string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM work_item_revisions WHERE item_id=?`, item).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// a1: a finding whose into names an eligible item is saved there as one
+// review-fold evidence note; no item is filed and the target is unchanged.
+func TestReviewFoldSavesEvidenceNote(t *testing.T) {
+	f := newConvergenceFixture(t)
+	targets := foldTargets(t, f.s, f.task)
+	target := targets["eligible"]
+	revisions := itemRevisionCount(t, f.s, target.ID)
+	before, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+	r := f.review(t, candidateA)
+	finding := api.ReviewFinding{ID: "f1", Title: "Fold fixture finding", File: foldFile, Line: 3, Into: target.ID}
+	req := f.req(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{finding}}), "", r.Seq, f.reviewer)
+	m, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A retry of the same post replays it and writes nothing more.
+	if again, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by); err != nil || again.Seq != m.Seq {
+		t.Fatalf("replay %v %v", again.Seq, err)
+	}
+	after, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+	if len(after.Items) != len(before.Items) {
+		t.Fatalf("fold filed an item: %d -> %d", len(before.Items), len(after.Items))
+	}
+	got, err := f.s.GetWorkItem(f.ctx, f.task.ID, target.ID)
+	if err != nil || got.Revision != target.Revision || got.ScopeRevision != target.ScopeRevision || !got.UpdatedAt.Equal(target.UpdatedAt) || got.Description != target.Description || itemRevisionCount(t, f.s, target.ID) != revisions {
+		t.Fatalf("target changed: %+v -> %+v %v", target, got, err)
+	}
+	notes := foldNotes(t, f.s, target.ID)
+	if len(notes) != 1 {
+		t.Fatalf("notes %+v", notes)
+	}
+	n := notes[0]
+	wantHead := fmt.Sprintf("Review finding f1 from %s, message #%d, folded as evidence.\n", f.item.ID, m.Seq)
+	if n.namespace != "review-fold" || n.kind != "note" || n.provenance != "review-fold" || n.title != finding.Title || !strings.HasPrefix(n.content, wantHead) || !strings.Contains(n.author, f.reviewer.ID) {
+		t.Fatalf("note %+v", n)
+	}
+	var saved api.ReviewFinding
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(n.content, wantHead)), &saved); err != nil || !reflect.DeepEqual(saved, finding) {
+		t.Fatalf("note finding %+v %v", saved, err)
+	}
+	st := f.state(t)
+	if len(st.FollowUps) != 1 || st.FollowUps[0].ItemID != target.ID || !st.FollowUps[0].Folded || st.FollowUps[0].MessageSeq != m.Seq || st.Rounds[0].ResultSeq != m.Seq {
+		t.Fatalf("review state %+v", st)
+	}
+	var data string
+	if err := f.s.db.QueryRow(`SELECT data FROM events WHERE task_id=? AND kind='review_finding_folded'`, f.task.ID).Scan(&data); err != nil {
+		t.Fatal(err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(data), &event); err != nil || event["itemId"] != target.ID || event["reviewParent"] != f.item.ID || event["findingId"] != "f1" || event["messageSeq"] != float64(m.Seq) {
+		t.Fatalf("event %s %v", data, err)
+	}
+}
+
+// a2, a12 (iii): each reason a fold is refused, with its exact text and error
+// class; a refused result saves nothing.
+func TestReviewFoldRefusals(t *testing.T) {
+	type tc struct {
+		finding func(f *convergenceFixture, targets map[string]api.WorkItem, other api.WorkItem) api.ReviewMetadata
+		class   error
+		reason  string
+	}
+	finding := func(into, file string) api.ReviewMetadata {
+		return api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{{ID: "f1", Title: "Fold refusal fixture", File: file, Line: 3, Into: into}}}
+	}
+	byKey := func(key string) func(*convergenceFixture, map[string]api.WorkItem, api.WorkItem) api.ReviewMetadata {
+		return func(_ *convergenceFixture, targets map[string]api.WorkItem, _ api.WorkItem) api.ReviewMetadata {
+			return finding(targets[key].ID, foldFile)
+		}
+	}
+	cases := map[string]tc{
+		"no file": {func(_ *convergenceFixture, targets map[string]api.WorkItem, _ api.WorkItem) api.ReviewMetadata {
+			return api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{{ID: "f1", Title: "Fold refusal fixture", Command: "go test", Output: "FAIL", Into: targets["eligible"].ID}}}
+		}, api.ErrInvalid, "review.findings[f1].into: finding names no file"},
+		"absolute file": {func(_ *convergenceFixture, targets map[string]api.WorkItem, _ api.WorkItem) api.ReviewMetadata {
+			return finding(targets["eligible"].ID, "/"+foldFile)
+		}, api.ErrInvalid, "review.findings[f1].into: finding file is not a repository-relative path"},
+		"not an ID": {func(*convergenceFixture, map[string]api.WorkItem, api.WorkItem) api.ReviewMetadata {
+			return finding("fold-target", foldFile)
+		}, api.ErrInvalid, "review.findings[f1].into: must be a work item ID"},
+		"other project": {func(_ *convergenceFixture, _ map[string]api.WorkItem, other api.WorkItem) api.ReviewMetadata {
+			return finding(other.ID, foldFile)
+		}, api.ErrConflict, "review.findings[f1].into: item is not in this project"},
+		"reviewed item": {func(f *convergenceFixture, _ map[string]api.WorkItem, _ api.WorkItem) api.ReviewMetadata {
+			return finding(f.item.ID, foldFile)
+		}, api.ErrConflict, "review.findings[f1].into: item is the reviewed item"},
+		"done":       {byKey("done"), api.ErrConflict, "review.findings[f1].into: item is done"},
+		"accepted":   {byKey("accepted"), api.ErrConflict, "review.findings[f1].into: item is accepted and awaits release"},
+		"running":    {byKey("running"), api.ErrConflict, "review.findings[f1].into: item is running"},
+		"queued":     {byKey("queued"), api.ErrConflict, "review.findings[f1].into: item is queued"},
+		"ordered":    {byKey("ordered"), api.ErrConflict, "review.findings[f1].into: item is ordered"},
+		"other file": {byKey("other-file"), api.ErrConflict, "review.findings[f1].into: item does not name the finding's file"},
+		"prefix":     {byKey("prefix"), api.ErrConflict, "review.findings[f1].into: item does not name the finding's file"},
+		"blocker": {func(_ *convergenceFixture, targets map[string]api.WorkItem, _ api.WorkItem) api.ReviewMetadata {
+			return api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{{ID: "b1", Criterion: "a1", Title: "Fold refusal fixture", File: foldFile, Line: 3, Into: targets["eligible"].ID}}}
+		}, api.ErrInvalid, "review.blockers[b1].into: only a finding can be folded"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			targets := foldTargets(t, f.s, f.task)
+			otherTask, err := f.s.CreateTask(f.ctx, api.CreateTaskRequest{Name: "Other fold project"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other, err := f.s.CreateWorkItem(f.ctx, otherTask.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Other project target", Description: foldFile, RequestID: "other"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := f.review(t, candidateA)
+			before := foldCounts(t, f.s)
+			status := passConvergence
+			if name == "blocker" {
+				status = map[string]string{"a1": "fail", "a2": "pass"}
+			}
+			_, err = f.post(f.resultEnv(candidateA, status, c.finding(f, targets, other)), "", r.Seq, f.reviewer)
+			var envelopeErr *api.EnvelopeError
+			if !errors.Is(err, c.class) || errors.As(err, &envelopeErr) || err.Error() != c.class.Error()+": "+c.reason {
+				t.Fatalf("got %T %v, want %v: %s", err, err, c.class, c.reason)
+			}
+			if c.class == api.ErrInvalid && findingTitleReason(t, err) != c.reason {
+				t.Fatalf("invalid reason %q", err)
+			}
+			if c.class == api.ErrConflict && errors.Is(err, api.ErrInvalid) {
+				t.Fatal("conflict also wraps invalid")
+			}
+			st := f.state(t)
+			if after := foldCounts(t, f.s); after != before || st.Rounds[0].ResultSeq != 0 || len(st.FollowUps) != 0 {
+				t.Fatalf("refused result saved something: %v -> %v %+v", before, after, st)
+			}
+		})
+	}
+}
+
+// a3: a saved finding ID cannot change its target; a result that folds one
+// finding and files another writes exactly one note and one item; a new
+// round-two blocker that is not a regression folds under review.blockers.
+func TestReviewFoldStableIDAndMixedResult(t *testing.T) {
+	f := newConvergenceFixture(t)
+	targets := foldTargets(t, f.s, f.task)
+	before := foldCounts(t, f.s)
+	r := f.review(t, candidateA)
+	folded := api.ReviewFinding{ID: "f1", Title: "Fold fixture finding", File: foldFile, Line: 3, Into: targets["eligible"].ID}
+	filed := api.ReviewFinding{ID: "f2", Title: "File fixture finding", File: foldFile, Line: 4}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{folded, filed}}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	after := foldCounts(t, f.s)
+	if after[1]-before[1] != 1 || after[3]-before[3] != 1 || after[4]-before[4] != 1 {
+		t.Fatalf("mixed result: %v -> %v", before, after)
+	}
+	st := f.state(t)
+	if len(st.FollowUps) != 2 || !st.FollowUps[0].Folded || st.FollowUps[1].Folded || st.FollowUps[1].ItemID == targets["eligible"].ID {
+		t.Fatalf("follow-ups %+v", st.FollowUps)
+	}
+	r2 := f.review(t, candidateB)
+	moved := folded
+	moved.Into = targets["second"].ID
+	if _, err := f.post(f.resultEnv(candidateB, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{moved}}), "", r2.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "follow-up ID changed meaning") {
+		t.Fatalf("moved target: %v", err)
+	}
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	blocker := api.ReviewFinding{ID: "b2", Criterion: "a2", Title: "Round two fold fixture", File: foldFile, Line: 6, Into: targets["queued"].ID}
+	if _, err := f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{blocker}}), "", r2.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: review.blockers[b2].into: item is queued" {
+		t.Fatalf("demoted blocker refusal: %v", err)
+	}
+	blocker.Into = targets["second"].ID
+	if _, err := f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{blocker}}), "", r2.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	st = f.state(t)
+	if len(st.FollowUps) != 3 || !st.FollowUps[2].Folded || st.FollowUps[2].ItemID != targets["second"].ID || len(foldNotes(t, f.s, targets["second"].ID)) != 1 {
+		t.Fatalf("demoted blocker fold %+v", st.FollowUps)
+	}
+}
+
+// a12 (i, ii): into reaches the store through the hub's plain JSON decode of a
+// post, and tt send's strict review-file decode accepts it while still
+// refusing an unknown field.
+func TestReviewFoldWireDecode(t *testing.T) {
+	f := newConvergenceFixture(t)
+	target := foldTargets(t, f.s, f.task)["eligible"]
+	r := f.review(t, candidateA)
+	review := fmt.Sprintf(`{"mode":"general","candidate":%q,"findings":[{"id":"f1","title":"Wire fold fixture","file":%q,"line":3,"into":%q}]}`, candidateA, foldFile, target.ID)
+	var meta api.ReviewMetadata
+	dec := json.NewDecoder(strings.NewReader(review))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&meta); err != nil || len(meta.Findings) != 1 || meta.Findings[0].Into != target.ID {
+		t.Fatalf("strict decode: %+v %v", meta, err)
+	}
+	dec = json.NewDecoder(strings.NewReader(strings.Replace(review, `"into"`, `"intoo"`, 1)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(new(api.ReviewMetadata)); err == nil || !strings.Contains(err.Error(), "intoo") {
+		t.Fatalf("unknown sibling accepted: %v", err)
+	}
+	raw, err := json.Marshal(f.req(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shell map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &shell); err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]json.RawMessage
+	if err = json.Unmarshal(shell["envelope"], &env); err != nil {
+		t.Fatal(err)
+	}
+	env["review"] = json.RawMessage(review)
+	if shell["envelope"], err = json.Marshal(env); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(shell)
+	var req api.PostMessageRequest
+	if err = json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.PostMessage(f.ctx, f.task.ID, req, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if notes := foldNotes(t, f.s, target.ID); len(notes) != 1 || notes[0].namespace != "review-fold" {
+		t.Fatalf("wire post did not fold: %+v", notes)
+	}
+}
+
+// The file test matches whole paths only.
+func TestReviewFoldNamesFile(t *testing.T) {
+	for text, want := range map[string]bool{
+		foldFile:                        true,
+		"owns " + foldFile + ".":        true,
+		"`" + foldFile + "`, next":      true,
+		`"file":"` + foldFile + `"`:     true,
+		"(" + foldFile + ")":            true,
+		"hub/internal/store":            false,
+		foldFile + ".bak":               false,
+		"x/" + foldFile:                 false,
+		foldFile + "x":                  false,
+		"a " + foldFile + "/b":          false,
+		foldFile + "-x and " + foldFile: true,
+	} {
+		if got := namesFile(text, foldFile); got != want {
+			t.Errorf("namesFile(%q) = %v, want %v", text, got, want)
+		}
+	}
+}

@@ -34,6 +34,10 @@ type ReviewFinding struct {
 	Kind        string `json:"kind,omitempty"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	// Into names an open, held, unordered work item that names File. The hub
+	// saves the finding there as an evidence note instead of filing a new
+	// item, or refuses the result with the reason the target is ineligible.
+	Into string `json:"into,omitempty"`
 }
 
 type ReviewScope struct {
@@ -70,10 +74,14 @@ type ReviewRound struct {
 	Blockers             []ReviewFinding   `json:"blockers,omitempty"`
 }
 
+// ReviewFollowUp records where a finding went. When Folded is set, ItemID is
+// the existing item the finding was saved on as an evidence note, not a new
+// item.
 type ReviewFollowUp struct {
 	Finding    ReviewFinding `json:"finding"`
 	ItemID     string        `json:"itemId"`
 	MessageSeq int64         `json:"messageSeq"`
+	Folded     bool          `json:"folded,omitempty"`
 }
 
 // FocusedReview's ReceiptGeneration is the passing receipt for the exact

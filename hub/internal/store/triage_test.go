@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -117,5 +120,160 @@ func TestWorkItemTriageSuggestsAndChangesNothing(t *testing.T) {
 	}
 	if _, err := f.s.WorkItemTriage(ctx, f.task.ID, 7, worker.ID, worker.RunID); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only the owner or a database handler") {
 		t.Fatalf("worker triage: %v", err)
+	}
+}
+
+// triageRows counts every table triage must leave alone, narrative tables
+// included.
+func triageRows(t *testing.T, s *Store) [7]int {
+	t.Helper()
+	var n [7]int
+	for i, table := range []string{"work_items", "work_item_revisions", "messages", "team_queue_entries", "narrative_artifacts", "narrative_artifact_versions", "narrative_timeline"} {
+		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return n
+}
+
+func triageIDs(items []api.TriageItem) []string {
+	out := []string{}
+	for _, item := range items {
+		out = append(out, item.ID)
+	}
+	return out
+}
+
+// a4: each held follow-up carries its finding's file and exactly the open,
+// held, unordered items that name that file; one with no file has none.
+func TestTriageHeldListsFileAndFoldCandidates(t *testing.T) {
+	f := newConvergenceFixture(t)
+	targets := foldTargets(t, f.s, f.task)
+	r := f.review(t, candidateA)
+	findings := []api.ReviewFinding{
+		{ID: "f1", Title: "Held finding with a file", File: foldFile, Line: 3},
+		{ID: "f2", Title: "Held finding with no file", Command: "go test ./x", Output: "FAIL"},
+	}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: findings}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	before := triageRows(t, f.s)
+	got, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 7, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after := triageRows(t, f.s); after != before {
+		t.Fatalf("triage changed records: %v -> %v", before, after)
+	}
+	held := map[string]api.TriageHeld{}
+	for _, h := range got.HeldForTriage {
+		held[h.Item.ID] = h
+	}
+	withFile, noFile := held[st.FollowUps[0].ItemID], held[st.FollowUps[1].ItemID]
+	if len(held) != 2 || withFile.File != foldFile || noFile.File != "" {
+		t.Fatalf("held %+v", got.HeldForTriage)
+	}
+	if want := []string{targets["eligible"].ID, targets["second"].ID}; !reflect.DeepEqual(triageIDs(withFile.Candidates), want) {
+		t.Fatalf("candidates %+v, want eligible and second only", withFile.Candidates)
+	}
+	if noFile.Candidates == nil || len(noFile.Candidates) != 0 {
+		t.Fatalf("no-file candidates %#v", noFile.Candidates)
+	}
+}
+
+// a5: reviewFolds lists every fold in the window whatever its target's status
+// is now, and drops a fold older than staleDays.
+func TestTriageFoldListsEveryFoldInWindow(t *testing.T) {
+	f := newConvergenceFixture(t)
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	f.s.SetClockForTest(func() time.Time { return now })
+	targets := foldTargets(t, f.s, f.task)
+	empty, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 7, "", "")
+	if err != nil || empty.ReviewFolds == nil || len(empty.ReviewFolds) != 0 {
+		t.Fatalf("no folds: %#v %v", empty.ReviewFolds, err)
+	}
+	r := f.review(t, candidateA)
+	findings := []api.ReviewFinding{
+		{ID: "f1", Title: "First folded finding", File: foldFile, Line: 3, Into: targets["eligible"].ID},
+		{ID: "f2", Title: "Second folded finding", File: foldFile, Line: 4, Into: targets["second"].ID},
+	}
+	m, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: findings}), "", r.Seq, f.reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foldedAt := ts(now)
+	now = now.Add(time.Hour)
+	for key, status := range map[string]string{"eligible": "done", "second": "dismissed"} {
+		item, err := f.s.GetWorkItem(f.ctx, f.task.ID, targets[key].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: ptr(status), RequestID: "close-" + key}, f.by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 7, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []api.TriageFold{
+		{Item: api.TriageItem{ID: targets["eligible"].ID, Title: targets["eligible"].Title, Status: "done"}, ReviewParent: f.item.ID, MessageSeq: m.Seq, FindingID: "f1", Title: "First folded finding", FoldedAt: foldedAt},
+		{Item: api.TriageItem{ID: targets["second"].ID, Title: targets["second"].Title, Status: "dismissed"}, ReviewParent: f.item.ID, MessageSeq: m.Seq, FindingID: "f2", Title: "Second folded finding", FoldedAt: foldedAt},
+	}
+	if !reflect.DeepEqual(got.ReviewFolds, want) {
+		t.Fatalf("folds %+v, want %+v", got.ReviewFolds, want)
+	}
+	now = now.Add(8 * 24 * time.Hour)
+	if old, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 7, "", ""); err != nil || old.ReviewFolds == nil || len(old.ReviewFolds) != 0 {
+		t.Fatalf("fold older than staleDays listed: %+v %v", old.ReviewFolds, err)
+	}
+	if wider, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 9, "", ""); err != nil || !reflect.DeepEqual(wider.ReviewFolds, want) {
+		t.Fatalf("wider window %+v %v", wider.ReviewFolds, err)
+	}
+}
+
+// a12 (iv): the triage JSON carries candidates and reviewFolds as arrays even
+// when empty, omits an empty file, and names each fold field.
+func TestTriageHeldJSONShape(t *testing.T) {
+	shape := func(v api.WorkItemTriage) map[string]any {
+		t.Helper()
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err = json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	empty := shape(api.WorkItemTriage{HeldForTriage: []api.TriageHeld{{Candidates: []api.TriageItem{}}}, ReviewFolds: []api.TriageFold{}})
+	held := empty["heldForTriage"].([]any)[0].(map[string]any)
+	if c, ok := held["candidates"].([]any); !ok || len(c) != 0 {
+		t.Fatalf("empty candidates %#v", held)
+	}
+	if _, ok := held["file"]; ok {
+		t.Fatalf("empty file present %#v", held)
+	}
+	if folds, ok := empty["reviewFolds"].([]any); !ok || len(folds) != 0 {
+		t.Fatalf("empty reviewFolds %#v", empty)
+	}
+	full := shape(api.WorkItemTriage{
+		HeldForTriage: []api.TriageHeld{{File: foldFile, Candidates: []api.TriageItem{{ID: "wi_aaaaaaaaaaaaaaaa"}}}},
+		ReviewFolds:   []api.TriageFold{{Item: api.TriageItem{ID: "wi_aaaaaaaaaaaaaaaa"}, ReviewParent: "wi_bbbbbbbbbbbbbbbb", MessageSeq: 7, FindingID: "f1", Title: "t", FoldedAt: "now"}},
+	})
+	held = full["heldForTriage"].([]any)[0].(map[string]any)
+	if held["file"] != foldFile || len(held["candidates"].([]any)) != 1 {
+		t.Fatalf("held %#v", held)
+	}
+	fold := full["reviewFolds"].([]any)[0].(map[string]any)
+	keys := []string{}
+	for k := range fold {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if want := []string{"findingId", "foldedAt", "item", "messageSeq", "reviewParent", "title"}; !reflect.DeepEqual(keys, want) {
+		t.Fatalf("fold keys %v, want %v", keys, want)
 	}
 }

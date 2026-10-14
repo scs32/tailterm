@@ -18,6 +18,9 @@ type WorkItemTriage struct {
 	// HeldForTriage lists review follow-ups the hub filed and held that no
 	// one has refined yet (still at revision 1).
 	HeldForTriage []TriageHeld `json:"heldForTriage"`
+	// ReviewFolds lists every review finding folded into an existing item in
+	// the last StaleDays days, whatever that item's status is now.
+	ReviewFolds []TriageFold `json:"reviewFolds"`
 }
 
 type TriageItem struct {
@@ -46,9 +49,24 @@ type TriageAlreadyDone struct {
 
 // TriageHeld is an open review follow-up, filed by the hub and held for
 // triage, that has not been refined.
+// File is the finding's file; Candidates are the open, held, unordered items
+// that name it, which could take the finding as a fold.
 type TriageHeld struct {
-	Item             TriageItem `json:"item"`
-	SourceMessageSeq int64      `json:"sourceMessageSeq"`
+	Item             TriageItem   `json:"item"`
+	SourceMessageSeq int64        `json:"sourceMessageSeq"`
+	File             string       `json:"file,omitempty"`
+	Candidates       []TriageItem `json:"candidates"`
+}
+
+// TriageFold is a review finding saved on Item as an evidence note. Item's
+// status is the item's current one.
+type TriageFold struct {
+	Item         TriageItem `json:"item"`
+	ReviewParent string     `json:"reviewParent"`
+	MessageSeq   int64      `json:"messageSeq"`
+	FindingID    string     `json:"findingId"`
+	Title        string     `json:"title"`
+	FoldedAt     string     `json:"foldedAt"`
 }
 
 // TriageStale is an open item with no activity for the stale period.

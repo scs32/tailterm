@@ -143,6 +143,78 @@ evidence.
 owner and database handlers. A retired or stale steward run, a pending successor
 and ordinary agents are refused.
 
+### Folded review findings
+
+A reviewer may fold a finding into an existing item instead of filing a new
+one (`wi_3d3364ecdb9831fa`). The reviewer template carries this rule:
+
+> Fold a finding into an existing item only for the same file and the same cause, and only into an item ID you already have from your review context or from lead: set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. File it new, without into, for a new cause or a product defect.
+
+The finding's `into` field names the target. The hub accepts it only when the
+finding names a repository-relative `file`, the target is in the same project,
+is not the reviewed item, and names that file as a whole path in its current
+description (a directory prefix, a longer path or `file.bak` does not count).
+The target must also pass these checks, in this order; the first that fails is
+the refusal:
+
+| Target state | Refusal reason |
+|---|---|
+| status is not `open` | `item is <status>` |
+| its latest accepted queue entry has no release job, or the job is neither released nor superseded | `item is accepted and awaits release` |
+| a queue entry holds a team (launching, running, or failed and unreleased) | `item is running` |
+| a queue entry is queued | `item is queued` |
+| a work-order scope confirmation or bookkeeping row exists | `item is ordered` |
+
+A refusal names the finding, as in
+`review.findings[f1].into: item is ordered`, and refuses the whole RESULT;
+nothing is saved and the reviewer sends it again with the target fixed or
+without `into`. Shape problems (`finding names no file`, `finding file is not a
+repository-relative path`, `must be a work item ID`, and `only a finding can be
+folded` for a blocker that stays a blocker) are 400s; the target's state, a
+target outside the project, the reviewed item and `item does not name the
+finding's file` are 409s. There is no fallback to a new item. An order the
+handler has not booked yet is not seen, so a fold can still land on an item
+about to start; it is only evidence there.
+
+A fold is evidence, not scope. The hub saves the finding on the target as a
+narrative note (namespace and provenance `review-fold`, kind `note`, the
+review message and finding ID in its first line, the finding JSON after it).
+The target's revision, scope revision, description and review state do not
+change, and no new item is filed. A finding ID keeps its target: the same ID
+with a different `into` in a later round is refused `follow-up ID changed
+meaning`.
+
+How the steward treats folds:
+
+- When it drafts a refinement or order for an item listed in `reviewFolds`, it
+  carries each folded finding into the draft criteria through the handler.
+  Only the handler changes scope.
+- `heldForTriage` gives each held follow-up its finding's `file` and
+  `candidates`: the open, held, unordered items naming that file (another held
+  follow-up for the same file included). For a follow-up with candidates the
+  steward proposes a merge into one of them through the handler, under the
+  usual rule that a MERGED dismissal carries the merged item's criteria.
+- Read the new fields with `tt work-items triage --json`; the text output is
+  unchanged. `reviewFolds` lists every fold whose note was saved in the last
+  `--stale-days` days (default 7), with the target and its current status, the
+  reviewed item (`reviewParent`), `messageSeq`, `findingId`, `title` and
+  `foldedAt`, whatever the target's status is now: closing or dismissing a
+  target never removes its folds.
+
+**Measurement (r6).** For seven days after the release, once a day the steward
+runs `tt work-items triage --json` (7-day window) and records three figures in
+the Held follow-ups section of the backlog summary:
+
+1. folds: `reviewFolds` entries with `foldedAt` in the last day, whatever the
+   target's status;
+2. new follow-ups: items created in the window whose description starts
+   `Review follow-up from`;
+3. review-follow-up share: (2) divided by all items created in the window.
+
+At the end of the week it reports to the owner folded against filed new, and
+the share against the pre-release baseline of 29 of 46 new items (10-12 21:00
+to 10-13 21:17).
+
 ## Proposals
 
 Batches of related small items, queue order, ownership scopes and triage
@@ -177,7 +249,12 @@ tt usage --calibration --project PROJECT_ID --json
 ```
 
 Each line is one done item with its lane, owned-path count, team shape,
-lifetime actual tokens, saved estimate and ratio. The steward only proposes:
+lifetime actual tokens, saved estimate and ratio. A Small item is never
+estimated under 15M, the team start-up cost (calibration median 19.3M,
+`wi_e2d272ee9b4b3013`, merged into `wi_3d3364ecdb9831fa`); when the team shape
+changes, the steward re-derives that floor from the p25 of the Small items in
+the same calibration. A Planned estimate starts from the Planned items there and
+never falls below the Small floor. The steward only proposes:
 the handler records the estimate with `tt work-items update --estimate-tokens N
 --estimate-basis TEXT`, which leaves the item revision unchanged. An item
 without one shows "no estimate" and nothing else changes; see
@@ -352,7 +429,10 @@ steward from the owner there; the prompt forbids it.
 | `GET /v1/tasks/{id}/steward-rotations/{rid}` | One rotation with handoff and receipt |
 | `GET /v1/steward-rotations/due?host=H&templateDigest=D` | Runner's due list |
 
-Work-item triage gains `heldForTriage`; the existing fields are unchanged.
+Work-item triage gains `heldForTriage`, each entry with `file` (omitted when
+the finding has none) and `candidates` (always an array), and a top-level
+`reviewFolds` array; the existing fields are unchanged. A review finding
+(`api.ReviewFinding`) gains `into`, and a review follow-up gains `folded`.
 
 ## Storage
 
@@ -377,7 +457,7 @@ an older hub is an unknown role there; close it (`DELETE
 
 ```sh
 cd hub
-go test ./internal/store -run 'Steward|BacklogSummary|TriageSteward|TriageHeldForTriage'
+go test ./internal/store -run 'Steward|BacklogSummary|TriageSteward|TriageHeldForTriage|ReviewFold|TriageFold|TriageHeld'
 go test ./internal/server -run 'Steward|BacklogSummary|TriageSteward'
 go test ./cmd/tt -run 'Steward|TriageHeldForTriage'
 cd ..

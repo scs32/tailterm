@@ -164,15 +164,37 @@ test("documented team prompts exactly include every generated template", () => {
 test("the steward proposes a token estimate with every filing and ranking", () => {
   const steward = PROJECT_ROLE_TEMPLATES.backlog_steward.prompt;
   const rule =
-    'Estimate: every filing and ranking REQUEST proposes a token estimate for the item with a one-line basis, such as "Small, 2 paths, median of 8 Small items", taken from the lane, the owned-path count and comparable done items in tt usage --calibration; the handler records it.';
+    'Estimate: every filing and ranking REQUEST proposes a token estimate for the item with a one-line basis, such as "Small, 2 paths, median of 8 Small items", taken from the lane, the owned-path count and comparable done items in tt usage --calibration --project PROJECT_ID; the handler records it. A Small item is never estimated under 15M, the team start-up cost; that calibration is the figure\'s source, and when the team shape changes re-derive the floor from the p25 of its Small items. A Planned estimate starts from the Planned items in the same calibration and never falls below the Small floor.';
   assert.equal(steward.split(rule).length - 1, 1);
   assert.equal(steward.split("token estimate").length - 1, 1);
   assert.equal(steward.split("tt usage --calibration").length - 1, 1);
+  assert.equal(steward.split("tt usage --calibration; the handler records it.").length - 1, 0);
+  for (const path of ["../docs/team-examples.md", "../hub/internal/teamplan/plan.mjs"]) {
+    const text = readFileSync(new URL(path, import.meta.url), "utf8");
+    assert.equal(text.split(rule).length - 1, 1, path);
+  }
   // The spawn command caps the prompt at 8192 characters.
   assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
   assert.ok(Buffer.byteLength(steward) < 8192);
   // The steward proposes; only the handler saves it.
   assert.doesNotMatch(steward, /--estimate-tokens/);
+});
+
+// wi_3d3364ecdb9831fa: the reviewer folds a same-file, same-cause finding into
+// an item ID it already has, and never reads work items itself.
+test("the reviewer folds a same-file finding into an existing held item", () => {
+  const rule =
+    "Fold a finding into an existing item only for the same file and the same cause, and only into an item ID you already have from your review context or from lead: set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. File it new, without into, for a new cause or a product defect.";
+  for (const id of ["planned", "small"]) {
+    const reviewer = exampleTeam(id).members.find((member) => member.name === "reviewer").prompt;
+    assert.equal(reviewer.split(rule).length - 1, 1, id);
+    assert.doesNotMatch(reviewer, /tt work-items/, id);
+    assert.ok(Buffer.byteLength(reviewer) < 8192, `${id} reviewer prompt is ${Buffer.byteLength(reviewer)} bytes`);
+  }
+  for (const path of ["../docs/team-examples.md", "../hub/internal/teamplan/plan.mjs"]) {
+    const text = readFileSync(new URL(path, import.meta.url), "utf8");
+    assert.equal(text.split(rule).length - 1, 1, path);
+  }
 });
 
 // wi_85148428c4ab9c9b: the steward asks the handler for an evidence note and

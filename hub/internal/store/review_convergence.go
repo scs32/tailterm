@@ -1076,6 +1076,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				continue
 			}
 		}
+		if b.Into != "" {
+			return fmt.Errorf("%w: review.blockers[%s].into: only a finding can be folded", api.ErrInvalid, reviewFindingIDEcho(b.ID))
+		}
 		if seen[b.ID] {
 			return reviewConflict("duplicate finding ID")
 		}
@@ -1134,7 +1137,12 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if demoted[f.ID] {
 				field = "review.blockers"
 			}
-			follow, err := s.fileReviewFollowUpFrom(ctx, tx, item, field, f, m, by)
+			var follow api.ReviewFollowUp
+			if f.Into != "" {
+				follow, err = s.foldReviewFinding(ctx, tx, item, field, f, m, req, by)
+			} else {
+				follow, err = s.fileReviewFollowUpFrom(ctx, tx, item, field, f, m, by)
+			}
 			if err != nil {
 				return err
 			}
@@ -1234,6 +1242,227 @@ func (s *Store) fileReviewFollowUpFrom(ctx context.Context, tx *sql.Tx, parent a
 		return out, err
 	}
 	out.ItemID = item.ID
+	return out, nil
+}
+
+// reviewFoldNamespace is the narrative namespace of a folded review finding.
+const reviewFoldNamespace = "review-fold"
+
+// foldIneligible returns, for each of ids that cannot take a folded finding,
+// the reason: the item is not open, its accepted candidate awaits release, it
+// is running, it is queued, or it is ordered. The first match wins, in that
+// order. It reads the whole project once per rule, never once per item, so
+// triage can ask about every open item.
+func foldIneligible(ctx context.Context, q queryRower, task string, ids []string) (map[string]string, error) {
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	out := map[string]string{}
+	mark := func(id, reason string) {
+		if want[id] && out[id] == "" {
+			out[id] = reason
+		}
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id,status FROM work_items WHERE task_id=?`, task)
+	if err != nil {
+		return nil, err
+	}
+	statuses := map[string]string{}
+	for rows.Next() {
+		var id, status string
+		if err = rows.Scan(&id, &status); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		statuses[id] = status
+	}
+	if err = closeRows(rows); err != nil {
+		return nil, err
+	}
+	for id := range want {
+		if status, ok := statuses[id]; ok && status != "open" {
+			mark(id, "item is "+status)
+		}
+	}
+	// The no-append rule of refuseScopeEditBeforeRelease: the item's latest
+	// accepted entry has no release job yet, or its latest job is neither
+	// released nor superseded.
+	accepted := map[string]string{}
+	rows, err = q.QueryContext(ctx, `SELECT item_id,id FROM team_queue_entries WHERE task_id=? AND acceptance_json<>'' ORDER BY position`, task)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var item, entry string
+		if err = rows.Scan(&item, &entry); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		accepted[item] = entry
+	}
+	if err = closeRows(rows); err != nil {
+		return nil, err
+	}
+	jobs := map[string]string{}
+	rows, err = q.QueryContext(ctx, `SELECT entry_id,state FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var entry, state string
+		if err = rows.Scan(&entry, &state); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		jobs[entry] = state
+	}
+	if err = closeRows(rows); err != nil {
+		return nil, err
+	}
+	for item, entry := range accepted {
+		if state := jobs[entry]; state != "released" && state != "superseded" {
+			mark(item, "item is accepted and awaits release")
+		}
+	}
+	for _, rule := range []struct{ where, reason string }{
+		{queueHoldsSQL, "item is running"},
+		{`state='queued'`, "item is queued"},
+	} {
+		if err = markItems(ctx, q, `SELECT DISTINCT item_id FROM team_queue_entries WHERE task_id=? AND `+rule.where, []any{task}, rule.reason, mark); err != nil {
+			return nil, err
+		}
+	}
+	if err = markItems(ctx, q, `SELECT item_id FROM work_order_scope_confirmations WHERE task_id=? UNION SELECT item_id FROM work_order_bookkeeping WHERE task_id=?`, []any{task, task}, "item is ordered", mark); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// markItems marks each item ID the query returns with reason.
+func markItems(ctx context.Context, q queryRower, query string, args []any, reason string, mark func(id, reason string)) error {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		mark(id, reason)
+	}
+	return closeRows(rows)
+}
+
+func closeRows(rows *sql.Rows) error {
+	err := rows.Err()
+	if cerr := rows.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// pathByte reports whether b can be part of a repository path.
+func pathByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '.' || b == '/' || b == '-'
+}
+
+// namesFile reports whether text names file as a whole path: the bytes on
+// either side are not path bytes, so a directory prefix, a longer path that
+// ends with file, or file.bak do not count. A full stop after the path that
+// ends a sentence is not part of it.
+func namesFile(text, file string) bool {
+	if file == "" {
+		return false
+	}
+	for from := 0; ; {
+		i := strings.Index(text[from:], file)
+		if i < 0 {
+			return false
+		}
+		start, end := from+i, from+i+len(file)
+		before := start == 0 || !pathByte(text[start-1])
+		after := end == len(text) || !pathByte(text[end]) || (text[end] == '.' && (end+1 == len(text) || !pathByte(text[end+1])))
+		if before && after {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+// foldReviewFinding saves a finding the client sent under field on the item
+// it names in Into, as an immutable evidence note, instead of filing a new
+// item. The target's work item row, revisions and review state are not
+// touched. Any reason the target cannot take it refuses the whole result.
+func (s *Store) foldReviewFinding(ctx context.Context, tx *sql.Tx, parent api.WorkItem, field string, f api.ReviewFinding, m api.Message, req api.PostMessageRequest, by api.Caller) (api.ReviewFollowUp, error) {
+	out := api.ReviewFollowUp{Finding: f, MessageSeq: m.Seq, Folded: true}
+	name := field + "[" + reviewFindingIDEcho(f.ID) + "].into: "
+	invalid := func(reason string) error { return fmt.Errorf("%w: %s%s", api.ErrInvalid, name, reason) }
+	conflict := func(reason string) error { return fmt.Errorf("%w: %s%s", api.ErrConflict, name, reason) }
+	if f.File == "" {
+		return out, invalid("finding names no file")
+	}
+	if _, err := canonicalQueueOwnership([]string{f.File}); err != nil {
+		return out, invalid("finding file is not a repository-relative path")
+	}
+	if !api.ValidID(f.Into, "wi") {
+		return out, invalid("must be a work item ID")
+	}
+	target, err := getWorkItem(tx, ctx, parent.TaskID, f.Into)
+	if errors.Is(err, api.ErrNotFound) {
+		return out, conflict("item is not in this project")
+	}
+	if err != nil {
+		return out, err
+	}
+	if target.ID == parent.ID {
+		return out, conflict("item is the reviewed item")
+	}
+	reasons, err := foldIneligible(ctx, tx, parent.TaskID, []string{target.ID})
+	if err != nil {
+		return out, err
+	}
+	if reason := reasons[target.ID]; reason != "" {
+		return out, conflict(reason)
+	}
+	if !namesFile(target.Description, f.File) {
+		return out, conflict("item does not name the finding's file")
+	}
+	if !validWorkItemTitle(f.Title) {
+		return out, reviewFindingTitleRefusal(field, f)
+	}
+	// The source ID is the message and finding ID; an ID that is not narrative
+	// text is replaced by its digest.
+	source := fmt.Sprintf("%d:%s", m.Seq, f.ID)
+	if !validNarrativeText(source, 512, true) {
+		source = fmt.Sprintf("%d:sha256:%s", m.Seq, contentDigest(f.ID))
+	}
+	raw, _ := json.Marshal(f)
+	sender := api.Sender{AgentID: m.From.AgentID, Node: by.Node, User: by.User}
+	note := api.PutNarrativeArtifactRequest{
+		RequestID: "review-fold:" + strconv.FormatInt(m.Seq, 10) + ":" + contentDigest(f.ID)[:16], Namespace: reviewFoldNamespace, SourceID: source, SourceVersion: "1", Kind: "note", Title: f.Title,
+		OriginalAuthor: sender, AgentID: req.AgentID, RunID: req.RunID, Provenance: reviewFoldNamespace, CaptureState: "stored-content", Availability: "available",
+		Content: fmt.Sprintf("Review finding %s from %s, message #%d, folded as evidence.\n%s", f.ID, parent.ID, m.Seq, raw),
+	}
+	if !m.CreatedAt.IsZero() {
+		at := m.CreatedAt
+		note.SourceTime = &at
+	}
+	if validateArtifactRequest(note) != nil {
+		return out, invalid("finding cannot be saved as an evidence note")
+	}
+	if err = validateNarrativeActor(tx, ctx, parent.TaskID, note.AgentID, note.RunID); err != nil {
+		return out, err
+	}
+	if _, err = insertNarrativeArtifactVersion(ctx, tx, parent.TaskID, target.ID, api.NewID("nart"), 0, note, by, s.now()); err != nil {
+		return out, err
+	}
+	if _, err = s.insertEvent(ctx, tx, parent.TaskID, "review_finding_folded", sender.AgentID, f.Title, map[string]any{"itemId": target.ID, "reviewParent": parent.ID, "messageSeq": m.Seq, "findingId": f.ID}, by); err != nil {
+		return out, err
+	}
+	out.ItemID = target.ID
 	return out, nil
 }
 
