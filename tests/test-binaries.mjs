@@ -7,8 +7,14 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
-const buildEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-  !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key)));
+// The build environment is read per call, never at import: the matrix runner
+// passes the verifier's own environment, so its builds see the run's HOME, Go
+// caches and toolchain and never the user's.
+export const buildEnvironment = (source = process.env) => Object.fromEntries(
+  Object.entries(source).filter(([key]) => !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key)));
+// Recorded with each build; a fixed list, so no secret reaches the log.
+export const GO_ENV_KEYS = ["GOVERSION", "GOROOT", "GOPATH", "GOMODCACHE", "GOCACHE", "GOFLAGS",
+  "GOPROXY", "GOTOOLCHAIN", "GOOS", "GOARCH"];
 
 async function sourceFiles(dir, prefix = "") {
   const files = [];
@@ -35,7 +41,7 @@ export async function fileHash(file) {
   return sha256(await readFile(file));
 }
 
-export async function prepareTestBinary({ root = process.cwd(), target, output, historicalCommit, manifestPath = process.env.TAILTERM_TEST_BINARIES, onBuild }) {
+export async function prepareTestBinary({ root = process.cwd(), target, output, historicalCommit, manifestPath = process.env.TAILTERM_TEST_BINARIES, onBuild, env = buildEnvironment() }) {
   if (!(["hub", "tt"].includes(target))) throw new Error("Unknown test binary target");
   const source = await sourceIdentity(root);
   if (manifestPath) {
@@ -53,20 +59,28 @@ export async function prepareTestBinary({ root = process.cwd(), target, output, 
   await mkdir(path.dirname(output), { recursive: true });
   const args = ["build", ...(target === "hub" ? ["-ldflags=-s -w"] : []), "-o", output,
     target === "hub" ? "./cmd/tailterm-hub" : "./cmd/tt"];
-  const result = await exec("go", args, { cwd: path.join(source.root, "hub"),
-    env: buildEnv, maxBuffer: 8 * 1024 * 1024 });
-  onBuild?.({ argv: ["go", ...args], stdout: result.stdout, stderr: result.stderr });
+  const cwd = path.join(source.root, "hub");
+  let goEnv;
+  try {
+    const found = await exec("go", ["env", "-json", ...GO_ENV_KEYS], { cwd, env, maxBuffer: 1024 * 1024 });
+    goEnv = JSON.parse(found.stdout);
+  } catch (error) {
+    const detail = String(error.stderr || error.message).trim().split("\n")[0];
+    throw new Error(`go env failed for ${target} build: ${detail}`);
+  }
+  const result = await exec("go", args, { cwd, env, maxBuffer: 8 * 1024 * 1024 });
+  onBuild?.({ argv: ["go", ...args], goEnv, stdout: result.stdout, stderr: result.stderr });
   return output;
 }
 
-export async function buildMatrixBinaries(root, output) {
+export async function buildMatrixBinaries(root, output, { env = buildEnvironment() } = {}) {
   const source = await sourceIdentity(root);
   const binaries = [];
   for (const target of ["hub", "tt"]) {
     const file = path.join(output, `tailterm-${target}-test`);
     const startedAt = new Date().toISOString();
     let buildLog;
-    const binary = await prepareTestBinary({ root, target, output: file, manifestPath: null,
+    const binary = await prepareTestBinary({ root, target, output: file, manifestPath: null, env,
       onBuild: (log) => { buildLog = log; } });
     binaries.push({ target, historicalCommit: null, source, path: binary,
       sha256: await fileHash(binary), buildLog,
@@ -75,21 +89,21 @@ export async function buildMatrixBinaries(root, output) {
   return binaries;
 }
 
-export async function buildHistoricalHub(root, output, commit) {
+export async function buildHistoricalHub(root, output, commit, { env = buildEnvironment() } = {}) {
   const temporary = await mkdtemp(path.join(tmpdir(), "tailterm-historical-hub-"));
   try {
     const archive = path.join(temporary, "source.tar");
     const sourceRoot = path.join(temporary, "source");
     const { mkdir, writeFile } = await import("node:fs/promises");
     const { stdout } = await exec("git", ["archive", "--format=tar", commit], { cwd: root,
-      env: buildEnv, encoding: "buffer", maxBuffer: 128 * 1024 * 1024 });
+      env, encoding: "buffer", maxBuffer: 128 * 1024 * 1024 });
     await writeFile(archive, stdout);
     await mkdir(sourceRoot);
     await exec("tar", ["-xf", archive, "-C", sourceRoot]);
     const source = await sourceIdentity(sourceRoot);
     const startedAt = new Date().toISOString();
     let buildLog;
-    const binary = await prepareTestBinary({ root: sourceRoot, target: "hub", output, manifestPath: null,
+    const binary = await prepareTestBinary({ root: sourceRoot, target: "hub", output, manifestPath: null, env,
       onBuild: (log) => { buildLog = log; } });
     return { target: "hub", historicalCommit: commit, source: { ...source, root: null }, path: binary,
       sha256: await fileHash(binary), buildLog: { archive: ["git", "archive", "--format=tar", commit], ...buildLog },

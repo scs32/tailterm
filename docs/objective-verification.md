@@ -107,8 +107,14 @@ home path for manual recovery.
 come from the shared verification caches described next when the plan can run
 Go, and otherwise resolve inside the home as before. The prepared test binaries
 are built by a child process whose whole environment is the verifier's (its
-home, Go caches and toolchain); a signal stops that child, before any check or
-eligible receipt.
+home, Go caches and toolchain); `tests/test-binaries.mjs` reads the build
+environment per call, never at import. The child leads its own process group,
+recorded like a check's: a signal sends SIGTERM to the group, then SIGKILL after
+250 ms, so `go build` and the compilers it started stop with it, before any
+check or eligible receipt. Each build's `go env -json` for `GOVERSION`,
+`GOROOT`, `GOPATH`, `GOMODCACHE`, `GOCACHE`, `GOFLAGS`, `GOPROXY`,
+`GOTOOLCHAIN`, `GOOS` and `GOARCH` is recorded as `buildLog.goEnv` in
+`<output>/test-binary-builds.json`.
 
 ## Shared verification caches
 
@@ -147,6 +153,7 @@ test binaries (lead answer #33960). A synthetic plan in a checkout with no
 <root>/mod/gen-<16 hex>.stamps/<sha256>.json   one stamp per go.sum seeded into it
 <root>/build/<goversion>-<os>-<arch>/          GOCACHE for that toolchain, with its own marker
 <root>/speech-model/<revision>/<model>/<file>  the static build's speech model
+<root>/downloads/<sha256>.tar.gz               scripts/build-wasm.sh's Tailscale release tarball
 ```
 
 Markers, pointer and stamps carry the marker item's fields
@@ -167,7 +174,17 @@ it: its `tailscale-<version>` must be the version `hub/go.mod` requires, and its
 Go refuses an overlay of files beneath `GOMODCACHE`, so the module is copied
 once per generation to `mod/gen-<hex>.wasm-src/` (an APFS clone on macOS,
 about 27 MB) and listed there for `GOOS=js GOARCH=wasm`, with and without
-`-tags=tailserve_test`. Every
+`-tags=tailserve_test`. Before any go command runs in the copy, its `go.mod`
+must name `module tailscale.com` and its tree digest (sorted path, size,
+sha256) must equal that of the generation's `tailscale.com@v<version>`, which
+the hub source's `go mod verify` covers first. A copy that differs or cannot be
+read is moved aside, removed and copied again; one that still differs leaves the
+check on per-home modules. `cache-report.json` records the copy as `made`,
+`verified` or `replaced`, with `copyCause`. A script line that looks like a copy
+into the wasm package (a `cp` naming `wasm/`, or any line naming
+`cmd/tsconnect/wasm/<file>`) but is not of that exact shape is never skipped:
+the cause is `build-wasm.sh line <n> is a copy line the runner cannot read:
+<line>`. Comment lines are ignored. Every
 run validates the generation `current.json` names, with `GOPROXY=off`:
 `go list -deps -test ./...` for completeness and `go mod verify` for integrity,
 per source. All pass: the run is `warm` and has written nothing. A missing
@@ -202,8 +219,22 @@ are unchanged. `HOME`, `TMPDIR`, `TMUX_TMPDIR` and `GOPATH` stay in the home.
 script cannot be read that way (no version or copy lines, or a version
 `hub/go.mod` does not require) or the wasm seed fails without corruption does
 that check alone keep a per-home module cache with the network (about 0.5 GB,
-18,000 files), and the line names the cause. The Tailscale source tarball the
-script downloads into each checkout is outside this cache.
+18,000 files), and the line names the cause.
+
+**Tailscale tarball.** When `TAILTERM_VERIFICATION_CACHE` is absolute and
+`GOCACHE` and `GOMODCACHE` are both set, as the runner sets them,
+`scripts/build-wasm.sh` uses those Go caches, not the checkout's `.build/go` and
+`.build/cache`, and keeps the release tarball at
+`<root>/downloads/<sha256>.tar.gz`, so a warm run downloads nothing. It
+extracts only a private copy that passes the sha256 check: a wrong or partial
+cached file is removed and downloaded again. A download goes to a temporary
+name, is checked and is renamed into place; one that fails the check exits
+non-zero and leaves nothing. Extraction goes to a temporary directory that
+becomes `.build/tailscale-<version>` only when complete. A plain local build
+(neither variable set that way, as in the Docker static build) keeps
+`.build/go`, `.build/cache` and `.build/tailscale.tar.gz`. The script prints
+`build-wasm: GOCACHE=<dir> GOMODCACHE=<dir> tarball=<path> (cached|downloaded|extracted-present)`
+to stderr.
 
 **No test result from the cache.** `GOFLAGS=-count=1` makes every go test the
 checks start execute, including the go-race command's plain and sharded
@@ -879,8 +910,7 @@ cap, keeps the deadline it wrote in the lock file and stops itself then.
 
 At its run timeout the holder aborts through the normal interruption path: checks are stopped, the home is removed, no receipt is
 written, the lock is released and `run-timeout-abort` is journaled. A
-preparatory test-binary build blocks the runner, so the stop happens when that
-build returns.
+preparatory test-binary build is stopped with its process group, as a check is.
 
 Normal two-holder admission records overlap=0. Exceptional overdue takeover
 can exceed the physical concurrency limit: If a holder is still alive 120 seconds
@@ -1063,9 +1093,8 @@ end that release attempt with exit 75. The wait bound is unchanged. Builders' ad
 and are not counted by the memory rule. A process or group id
 reused by an unrelated process makes a dead run look alive; that only delays
 the next run, up to the run timeout plus grace. There is a short window
-between a check starting and its group reaching the file, and the children of
-a preparatory test-binary build are not recorded, so a runner killed during
-that build is recovered while a build child may still be running.
+between a check or a preparatory test-binary build starting and its group
+reaching the file.
 
 ## Delivery lifecycle test
 

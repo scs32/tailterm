@@ -1131,7 +1131,8 @@ const BUILD_OUTPUT = /^[0-9a-f]{64}-d$/;
 const BUILD_INDEX = /^[0-9a-f]{64}-a$/;
 const BUILD_INDEX_LINE = /^v1 [0-9a-f]{64} [0-9a-f]{64} [ 0-9]{19}[0-9] [ 0-9]{19}[0-9]\n$/;
 const BUILD_FILES = new Set(["README", "trim.txt", "testexpire.txt", "tailterm-cache.json"]);
-const ROOT_ENTRIES = new Set(["mod", "build", "speech-model", "tailterm-cache.json"]);
+// downloads/ holds scripts/build-wasm.sh's Tailscale tarball by its sha256.
+const ROOT_ENTRIES = new Set(["mod", "build", "speech-model", "downloads", "tailterm-cache.json"]);
 const DEFAULT_GOPROXY = "https://proxy.golang.org,direct";
 // A cold seed (toolchain, hub, historical and wasm module sets) took under a
 // minute on the Mini; ten minutes bounds a stalled proxy.
@@ -1280,7 +1281,7 @@ function ensureCacheRoot(root, context) {
     if (foreign.length)
       throw new CacheRefusal(`cache root ${root} has no tailterm marker and holds ${foreign.slice(0, 3).join(", ")}`);
   }
-  writeJsonAtomically(markerPath, cacheMarker("root", context, ["mod", "build", "speech-model"]));
+  writeJsonAtomically(markerPath, cacheMarker("root", context, ["mod", "build", "speech-model", "downloads"]));
 }
 
 // Go version strings compare by their numeric release parts.
@@ -1354,7 +1355,12 @@ function moduleSources(cwd, home, plan) {
 // scripts/build-wasm.sh builds Tailscale's cmd/tsconnect/wasm with the
 // checkout's wasm/*.go copied in. Read-only: its Tailscale version must be the
 // one hub/go.mod requires, and its cp lines become a go list -overlay. Returns
-// the seed plan, or the cause the wasm check keeps per-home modules.
+// the seed plan, or the cause the wasm check keeps per-home modules. A line
+// that looks like a copy into the wasm package but is not of the one shape
+// read here is named in the cause, never skipped.
+const WASM_COPY = /^cp wasm\/([A-Za-z0-9_.-]+\.go) "\$source\/cmd\/tsconnect\/wasm\/([A-Za-z0-9_.-]+\.go)"$/;
+const wasmCopyCandidate = (line) =>
+  (/^\s*cp\s/.test(line) && line.includes("wasm/")) || /cmd\/tsconnect\/wasm\/\S/.test(line);
 export function wasmSeedSpec(cwd) {
   let script, goMod;
   try {
@@ -1364,8 +1370,14 @@ export function wasmSeedSpec(cwd) {
     return { cause: "build-wasm.sh or hub/go.mod unreadable: " + error.code };
   }
   const version = /^source="\$root\/\.build\/tailscale-(\d+\.\d+\.\d+)"$/m.exec(script)?.[1];
-  const copies = [...script.matchAll(/^cp wasm\/([A-Za-z0-9_.-]+\.go) "\$source\/cmd\/tsconnect\/wasm\/([A-Za-z0-9_.-]+\.go)"$/gm)]
-    .map((found) => ({ from: found[1], to: found[2] }));
+  const copies = [];
+  for (const [index, line] of script.split("\n").entries()) {
+    if (/^\s*#/.test(line) || !wasmCopyCandidate(line)) continue;
+    const found = WASM_COPY.exec(line);
+    if (!found)
+      return { cause: `build-wasm.sh line ${index + 1} is a copy line the runner cannot read: ${line.trim().slice(0, 160)}` };
+    copies.push({ from: found[1], to: found[2] });
+  }
   if (!version || !copies.length) return { cause: "build-wasm.sh has no Tailscale version or copy lines" };
   const required = /^\s*(?:require\s+)?tailscale\.com\s+v(\S+)/m.exec(goMod)?.[1];
   if (required !== version)
@@ -1374,7 +1386,10 @@ export function wasmSeedSpec(cwd) {
 }
 // The wasm source: a copy of the Tailscale module beside the generation (Go
 // refuses an overlay of files beneath GOMODCACHE), made once per generation,
-// with the checkout's files overlaid as the script copies them.
+// with the checkout's files overlaid as the script copies them. Before any go
+// command runs in it, the copy must name module tailscale.com and hold the
+// same tree as the generation's module directory (which the hub source's go
+// mod verify covers first); a copy that does not is replaced, never used.
 function wasmSource(spec, cwd, home) {
   const module = `tailscale.com@v${spec.version}`;
   const overlayPath = join(home, ".verifier-sources", "wasm-overlay.json");
@@ -1382,11 +1397,12 @@ function wasmSource(spec, cwd, home) {
     name: "wasm " + module,
     wasm: true,
     env: { GOOS: "js", GOARCH: "wasm" },
-    resolve(generation) {
+    async resolve(generation) {
       const copy = join(`${generation}.wasm-src`, module);
-      if (!existsSync(copy)) {
-        const cached = join(generation, module);
-        if (!existsSync(join(cached, "go.mod"))) throw new CacheRefusal(`${module} is not in ${basename(generation)}`);
+      if (this.verified === generation && existsSync(copy)) return copy;
+      const cached = join(generation, module);
+      if (!existsSync(join(cached, "go.mod"))) throw new CacheRefusal(`${module} is not in ${basename(generation)}`);
+      const makeCopy = () => {
         mkdirSync(dirname(copy), { recursive: true, mode: 0o755 });
         const temporary = `${copy}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
         execFileSync("cp", [process.platform === "darwin" ? "-cR" : "-R", cached, temporary]);
@@ -1396,13 +1412,52 @@ function wasmSource(spec, cwd, home) {
           removeVerifierHome(temporary);
           if (!["EEXIST", "ENOTEMPTY"].includes(error.code)) throw error;
         }
+      };
+      const want = await treeDigest(cached);
+      const mismatch = async () => {
+        try {
+          const named = /^module\s+(\S+)\s*$/m.exec(readFileSync(join(copy, "go.mod"), "utf8"))?.[1];
+          if (named !== "tailscale.com") return `go.mod names module ${named || "none"}`;
+          return (await treeDigest(copy)) === want ? "" : `its tree differs from ${module}`;
+        } catch (error) {
+          return "unreadable: " + (error.code || error.message);
+        }
+      };
+      let state = "verified", cause = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!existsSync(copy)) {
+          makeCopy();
+          if (state === "verified") state = "made";
+        }
+        const inode = lstatSync(copy, { throwIfNoEntry: false })?.ino;
+        const found = await mismatch();
+        if (!found) {
+          this.dir = copy;
+          this.copy = state;
+          this.copyCause = cause;
+          this.verified = generation;
+          break;
+        }
+        cause ||= found;
+        state = "replaced";
+        // A peer that replaced the copy meanwhile is re-verified, not removed.
+        if (lstatSync(copy, { throwIfNoEntry: false })?.ino !== inode) continue;
+        const aside = `${copy}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+        try {
+          renameSync(copy, aside);
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          continue;
+        }
+        removeVerifierHome(aside);
       }
+      if (this.verified !== generation)
+        throw new CacheRefusal(`the ${module} copy beside ${basename(generation)} does not match it: ${cause}`);
       mkdirSync(dirname(overlayPath), { recursive: true, mode: 0o700 });
       writeFileSync(overlayPath, JSON.stringify({
         Replace: Object.fromEntries(spec.copies.map(({ from, to }) =>
           [join(copy, "cmd", "tsconnect", "wasm", to), join(cwd, "wasm", from)])),
       }));
-      this.dir = copy;
       this.goSumSha256 = createHash("sha256").update(readFileSync(join(copy, "go.sum"))).digest("hex");
       return copy;
     },
@@ -1414,9 +1469,9 @@ function wasmSource(spec, cwd, home) {
   return source;
 }
 const sourceLists = (source) => source.lists || [["list", "-deps", "-test", "./..."]];
-const sourceDir = (source, generation) => {
+const sourceDir = async (source, generation) => {
   try {
-    return source.resolve ? source.resolve(generation) : source.dir;
+    return source.resolve ? await source.resolve(generation) : source.dir;
   } catch (error) {
     throw Object.assign(error, { source });
   }
@@ -1427,7 +1482,7 @@ const sourceDir = (source, generation) => {
 async function validateGeneration(generation, sources, environment, go, abortSignal) {
   const env = { ...environment, GOMODCACHE: generation, GOPROXY: "off" };
   for (const source of sources) {
-    const cwd = sourceDir(source, generation);
+    const cwd = await sourceDir(source, generation);
     for (const args of sourceLists(source)) {
       const listed = await go(args, { cwd, env: { ...env, ...source.env }, abortSignal });
       if (listed.code !== 0)
@@ -1445,7 +1500,7 @@ async function validateGeneration(generation, sources, environment, go, abortSig
 async function seedGeneration(generation, sources, environment, goProxy, go, abortSignal) {
   const env = { ...environment, GOMODCACHE: generation, GOPROXY: goProxy };
   for (const source of sources) {
-    const cwd = sourceDir(source, generation);
+    const cwd = await sourceDir(source, generation);
     for (const args of [["list", "-m", "all"], ...sourceLists(source)]) {
       const run = await go(args, { cwd, env: { ...env, ...source.env }, abortSignal });
       if (run.code !== 0)
@@ -1753,7 +1808,10 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
     report.modules = modules.report;
     report.toolchain = { version: toolchain.version, source: toolchain.source, host, required, treeSha256: toolchain.treeSha256 || null };
     report.build = { dir: build.dir, skipped: build.skipped, ...scan };
-    report.wasm = wasm && (wasm.cause ? { modules: "per-home", cause: wasm.cause } : { modules: "shared", source: wasm.source.name });
+    report.wasm = wasm && (wasm.cause
+      ? { modules: "per-home", cause: wasm.cause }
+      : { modules: "shared", source: wasm.source.name, copy: wasm.source.copy,
+          ...(wasm.source.copyCause ? { copyCause: wasm.source.copyCause } : {}) });
     report.downloads = { toolchains: modules.report.toolchainDownloads, modules: modules.report.modulesAdded };
     const state = modules.report.state === "rebuilt"
       ? `rebuilt: ${modules.report.cause}`
@@ -2458,10 +2516,11 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   }
 }
 
-// tests/test-binaries.mjs captures its build environment when it is imported,
-// so the binaries are built by a child whose whole environment is the
-// verifier's: its HOME, Go caches and toolchain, never the user's.
-function buildBinariesInVerifierEnvironment(cwd, output, environment, { historical, abortSignal }) {
+// The binaries are built by a child whose whole environment is the
+// verifier's: its HOME, Go caches and toolchain, never the user's. The child
+// leads its own process group, reported through onGroup like a check's, so an
+// abort stops go build and the compilers it started, not only the child.
+function buildBinariesInVerifierEnvironment(cwd, output, environment, { historical, abortSignal, onGroup }) {
   const helper = new URL("../tests/test-binaries.mjs", import.meta.url).href;
   const source =
     `const [cwd, output, commit] = process.argv.slice(1);` +
@@ -2473,27 +2532,76 @@ function buildBinariesInVerifierEnvironment(cwd, output, environment, { historic
     if (abortSignal?.aborted) return fail(new Error("Verification interrupted by " + abortSignal.reason));
     const child = spawn(process.execPath,
       ["--input-type=module", "-e", source, cwd, output, ...(historical ? [historicalHubCommit] : [])],
-      { cwd, env: environment, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    const stop = () => child.kill("SIGTERM");
+      { cwd, env: environment, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", closed = false, killed = false, settled = false, grouped = false;
+    let killTimer, giveUpTimer;
+    const signalGroup = (kind) => {
+      try {
+        process.kill(-child.pid, kind);
+      } catch (error) {
+        if (error.code !== "ESRCH") stderr += "\nGroup signal: " + error.message;
+      }
+    };
+    const groupGone = () => {
+      try {
+        process.kill(-child.pid, 0);
+        return false;
+      } catch (error) {
+        return error.code === "ESRCH";
+      }
+    };
+    const ungroup = () => {
+      if (grouped) onGroup?.(child.pid, false);
+      grouped = false;
+    };
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      clearTimeout(giveUpTimer);
+      abortSignal?.removeEventListener("abort", stop);
+      ungroup();
+      error ? fail(error) : done(value);
+    };
+    // Rejected once the child has closed and its group is gone or has been
+    // sent SIGKILL; a child that never closes is given up on after a second.
+    const interrupted = () => {
+      if (closed && (killed || groupGone()))
+        settle(new Error("Verification interrupted by " + abortSignal.reason));
+    };
+    function stop() {
+      if (killTimer) return;
+      signalGroup("SIGTERM");
+      killTimer = setTimeout(() => {
+        signalGroup("SIGKILL");
+        killed = true;
+        interrupted();
+        giveUpTimer = setTimeout(() => {
+          closed = true;
+          interrupted();
+        }, 750);
+      }, 250);
+    }
+    if (child.pid) {
+      grouped = true;
+      onGroup?.(child.pid, true);
+    }
     abortSignal?.addEventListener("abort", stop, { once: true });
     child.stdout.setEncoding("utf8").on("data", (data) => (stdout += data));
     child.stderr.setEncoding("utf8").on("data", (data) => (stderr += data));
-    child.on("error", (error) => {
-      abortSignal?.removeEventListener("abort", stop);
-      fail(error);
-    });
+    child.on("error", (error) => settle(error));
     child.on("close", (code, signal) => {
-      abortSignal?.removeEventListener("abort", stop);
-      if (abortSignal?.aborted) return fail(new Error("Verification interrupted by " + abortSignal.reason));
+      closed = true;
+      if (abortSignal?.aborted) return interrupted();
       if (code !== 0)
-        return fail(new Error(`Test binary preparation failed (${signal || "exit " + code}): ${stderr.trim()}`));
+        return settle(new Error(`Test binary preparation failed (${signal || "exit " + code}): ${stderr.trim()}`));
       try {
-        done(JSON.parse(stdout));
+        settle(null, JSON.parse(stdout));
       } catch (error) {
-        fail(new Error("Test binary preparation printed no binary list: " + error.message));
+        settle(new Error("Test binary preparation printed no binary list: " + error.message));
       }
     });
+    if (abortSignal?.aborted) stop();
   });
 }
 
@@ -2565,6 +2673,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
       const binaries = await buildBinariesInVerifierEnvironment(cwd, output, environment, {
         historical: plan.checks.some((check) => check.id.startsWith("tests/board-audit-old-hub-browser.mjs")),
         abortSignal,
+        onGroup,
       });
       if (abortSignal?.aborted)
         throw new Error("Verification interrupted by " + abortSignal.reason);
