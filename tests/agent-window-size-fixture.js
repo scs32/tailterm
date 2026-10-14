@@ -16,9 +16,10 @@ const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 // not established. So the wait ends on the clock instead, at the 30 s the work
 // order sets as the least. A met condition returns at once, as before. A
 // timeout states the elapsed time and the last probe, which tells a late
-// resize from a wrong or missing one.
+// resize from a wrong or missing one. It also states tmux's pane size and the
+// client's last sizing commands, which tell a stale probe from a third resize.
 const WAIT_DEADLINE_MS = 30000;
-async function waitUntil(fn, label, probe) {
+async function waitUntil(fn, label, probe, sizing) {
   const started = Date.now();
   do {
     if (await fn()) return;
@@ -28,8 +29,14 @@ async function waitUntil(fn, label, probe) {
     seen = ["cols", "rows", "winch"].every((k) => Number.isInteger(last[k]))
       ? `cols=${last.cols} rows=${last.rows} winch=${last.winch}`
       : "unreadable";
+  let more = "";
+  try {
+    more = sizing ? `; ${sizing()}` : "";
+  } catch (e) {
+    more = `; sizing unreadable: ${e.message}`;
+  }
   throw Error(
-    `Agent sizing fixture timed out: ${label} after ${Date.now() - started} ms; last probe ${seen}`,
+    `Agent sizing fixture timed out: ${label} after ${Date.now() - started} ms; last probe ${seen}${more}`,
   );
 }
 
@@ -276,12 +283,24 @@ export function setupAgentWindowFixture() {
     `import os,sys,signal,termios,tty,json
 tty.setraw(0)
 count=0
+# A SIGWINCH that lands inside this handler used to run a nested handler whose
+# write the outer one then overwrote with the older size, for good. SIGWINCH
+# is blocked while the handler runs (one that arrives meanwhile runs it again
+# afterwards), the file is replaced whole, and the size is read again after
+# the write until it holds. winch counts handler runs.
 def draw(*args):
  global count
  if args: count+=1
- size=os.get_terminal_size(0)
- with open(sys.argv[1],'w') as f: json.dump(dict(cols=size.columns,rows=size.lines,winch=count),f)
- os.write(1, ('\\033[2J\\033[H'+'SIZE %dx%d WINCH %d'%(size.columns,size.lines,count)+'\\r\\n'+('R'*(size.columns-1))+'E'+'\\r\\n\\r\\nINPUT>').encode())
+ mask=signal.pthread_sigmask(signal.SIG_BLOCK,[signal.SIGWINCH])
+ try:
+  while True:
+   size=os.get_terminal_size(0)
+   with open(sys.argv[1]+'.tmp','w') as f: json.dump(dict(cols=size.columns,rows=size.lines,winch=count),f)
+   os.replace(sys.argv[1]+'.tmp',sys.argv[1])
+   if os.get_terminal_size(0)==size: break
+  os.write(1, ('\\033[2J\\033[H'+'SIZE %dx%d WINCH %d'%(size.columns,size.lines,count)+'\\r\\n'+('R'*(size.columns-1))+'E'+'\\r\\n\\r\\nINPUT>').encode())
+ finally:
+  signal.pthread_sigmask(signal.SIG_SETMASK,mask)
 signal.signal(signal.SIGWINCH,draw)
 draw()
 while True:
@@ -364,7 +383,12 @@ sys.exit(p.returncode if p.returncode>=0 else 0)
     handleExec(session, accept, info, pty) {
       if (!info.command.includes(wrapper)) return false;
       const channel = accept();
-      const entry = { command: info.command, pty, output: "" };
+      const entry = {
+        command: info.command,
+        pty,
+        output: "",
+        startedAt: Date.now(),
+      };
       commands.push(entry);
       const deliver = () => {
         const child = pty
@@ -555,7 +579,117 @@ export async function exerciseAgentWindowSizing({
       return {};
     }
   };
-  const wait = (fn, label) => waitUntil(fn, label, probe);
+  // The client's sizing commands (inspect, claim, resize, release, restore
+  // all name a @tailterm_size_ option), and the size each claim or resize sent.
+  const sizingCommands = () =>
+    f.commands.filter((c) => !c.pty && c.command.includes("@tailterm_size_"));
+  const sent = (c) => {
+    const xy = /resize-window -t \S+ -x (\d+) -y (\d+)/.exec(c.command);
+    return xy ? `${xy[1]}x${xy[2]}` : "";
+  };
+  const lastSent = () =>
+    sizingCommands()
+      .filter((c) => ["claim", "resize"].includes(sizingAction(c.command)))
+      .map(sent)
+      .at(-1);
+  const sizingReport = () =>
+    `tmux ${size()}; last sizing ${
+      sizingCommands()
+        .slice(-4)
+        .map(
+          (c) =>
+            `${sizingAction(c.command)}${sent(c) ? " " + sent(c) : ""}${c.exited ? "" : " (running)"}`,
+        )
+        .join(", ") || "none"
+    }`;
+  const wait = (fn, label) => waitUntil(fn, label, probe, sizingReport);
+  const probed = () => `${probe().cols}x${probe().rows}`;
+  // The probe is checked only once the client has stopped sizing: every
+  // sizing command has exited, none started for 500 ms, and tmux holds the
+  // expected size. A probe wait that began earlier could read a size the
+  // client was about to replace.
+  const SIZING_QUIET_MS = 500;
+  const sizingSettled = (expected) =>
+    wait(() => {
+      const all = sizingCommands(),
+        latest = Math.max(0, ...all.map((c) => c.startedAt));
+      return (
+        all.every((c) => c.exited) &&
+        Date.now() - latest >= SIZING_QUIET_MS &&
+        size() === expected
+      );
+    }, `sizing settled at ${expected}`);
+  // One settled size after a fit: the size the client last sent, tmux's pane
+  // and the program's own terminal agree, and all three hold for 1 s with no
+  // new sizing command.
+  async function oneSettledSize(cols, rows) {
+    const program = `${cols}x${rows - 1}`,
+      commands = sizingCommands().length,
+      read = () => ({ sent: lastSent(), tmux: size(), program: probed() });
+    const first = read();
+    assert.deepEqual(
+      first,
+      { sent: `${cols}x${rows}`, tmux: program, program },
+      `one settled size after fit ${cols}x${rows}`,
+    );
+    await pause(1000);
+    assert.equal(
+      sizingCommands().length,
+      commands,
+      `no sizing command in the 1 s after fit ${cols}x${rows}: ${sizingReport()}`,
+    );
+    assert.deepEqual(
+      read(),
+      first,
+      `size held for 1 s after fit ${cols}x${rows}`,
+    );
+    console.log(
+      `${engine} agent-sizing s3: after fit ${cols}x${rows} client, tmux and program settle at one size (${program}) and hold for 1 s`,
+    );
+  }
+  // The probe itself: SIGWINCHes back to back from private tmux, ending at the
+  // window's starting size (tmux then sends its last two resizes 10 ms apart),
+  // must leave probe.json at the pane's final size with winch raised.
+  {
+    await wait(() => Number.isInteger(probe().winch), "probe started");
+    const before = probe().winch;
+    const chain = [];
+    for (let i = 0; i < 20; i++)
+      chain.push(
+        "resize-window",
+        "-t",
+        agent.session + ":",
+        "-x",
+        String(201 + (i % 3)),
+        "-y",
+        String(51 + (i % 2)),
+        ";",
+      );
+    f.tmux(
+      ...chain,
+      "resize-window",
+      "-t",
+      agent.session + ":",
+      "-x",
+      "200",
+      "-y",
+      "50",
+    );
+    await wait(
+      () =>
+        size() === "200x50" && probed() === "200x50" && probe().winch > before,
+      "probe self-check",
+    );
+    await pause(500);
+    assert.equal(
+      probed(),
+      size(),
+      "probe holds the pane size after its self-check",
+    );
+    console.log(
+      `${engine} agent-sizing s2: probe follows back-to-back SIGWINCHes to the pane's final size`,
+    );
+  }
   const record = await source.evaluate(
     () =>
       new Promise((resolve, reject) => {
@@ -771,19 +905,26 @@ export async function exerciseAgentWindowSizing({
     localStorage.setItem("fixture-agent-shown", "true");
     document.documentElement.classList.remove("fixture-agent-hidden");
   });
+  // The self-check above raised winch, so the grow needs one more than this.
+  const shownWinch = probe().winch;
   await A.locator(".terminal-instance:not([hidden])").click();
   await fit(A, 240, 60);
+  await sizingSettled("240x59");
   await wait(
-    () => probe().cols === 240 && probe().rows === 59 && probe().winch > 0,
+    () =>
+      probe().cols === 240 && probe().rows === 59 && probe().winch > shownWinch,
     "SIGWINCH grow",
   );
+  await oneSettledSize(240, 60);
   const firstWinch = probe().winch;
   await fit(A, 120, 35);
+  await sizingSettled("120x34");
   await wait(
     () =>
       probe().cols === 120 && probe().rows === 34 && probe().winch > firstWinch,
     "SIGWINCH shrink",
   );
+  await oneSettledSize(120, 35);
   await A.locator(
     ".terminal-instance:not([hidden]) .terminal-viewport .xterm-helper-textarea",
   ).focus();
