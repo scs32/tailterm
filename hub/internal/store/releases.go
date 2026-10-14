@@ -11,6 +11,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -53,7 +54,11 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  CREATE TABLE IF NOT EXISTS release_deployer_liveness (
  task_id TEXT NOT NULL PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,state TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',
  opened_at TEXT NOT NULL DEFAULT '',handler_seq INTEGER NOT NULL DEFAULT 0,helper_seq INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE IF NOT EXISTS release_liveness_sweeps (task_id TEXT NOT NULL PRIMARY KEY,swept_at TEXT NOT NULL);`
+ CREATE TABLE IF NOT EXISTS release_liveness_sweeps (task_id TEXT NOT NULL PRIMARY KEY,swept_at TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS release_deployer_progress (
+ task_id TEXT NOT NULL PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,
+ reported_at TEXT NOT NULL DEFAULT '',record_json TEXT NOT NULL DEFAULT '',
+ scan_seq INTEGER NOT NULL DEFAULT 0,code_seq INTEGER NOT NULL DEFAULT 0);`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -1876,10 +1881,12 @@ const (
 
 	deployerSilentNoticeSubject  = "Deployer has gone silent while release jobs wait"
 	deployerRestartNoticeSubject = "Deployer announced a restart and did not come back"
+	deployerHungNoticeSubject    = "Deployer runner has made no progress while release jobs wait"
 
 	deployerAlive   = "alive"
 	deployerSilent  = "silent"
 	deployerRestart = "restart"
+	deployerHung    = "hung"
 
 	deployerLivenessArmed = "armed"
 	deployerLivenessOpen  = "open"
@@ -1895,12 +1902,23 @@ func deployerLivenessBound() time.Duration {
 	return time.Duration(v) * time.Minute
 }
 
+// deployerProgressBound is how old the release runner's own last progress
+// report may be, with a fresh wrapper heartbeat and a release job standing,
+// before the runner is reported as hung.
+func deployerProgressBound() time.Duration {
+	v, err := strconv.Atoi(os.Getenv("TAILTERM_DEPLOYER_PROGRESS_MINUTES"))
+	if err != nil || v < 1 || v > 1440 {
+		v = 10
+	}
+	return time.Duration(v) * time.Minute
+}
+
 // deployerLiveness judges a deployer at now: silent when it was last heard
 // from (heartbeat or message) a bound or more ago, restart when it announced
 // a restart a bound or more ago and has not reported back (restartAt is zero
 // with no such restart), otherwise alive. A runner that hangs while its
-// wrapper still heartbeats, and that announced no restart, is alive here: the
-// hub cannot tell it from a long verification run.
+// wrapper still heartbeats, and that announced no restart, is alive here; the
+// sweep then judges it by its own progress reports (deployerProgressHung).
 func deployerLiveness(now, lastHeard, restartAt time.Time, bound time.Duration) string {
 	switch {
 	case now.Sub(lastHeard) >= bound:
@@ -1909,6 +1927,169 @@ func deployerLiveness(now, lastHeard, restartAt time.Time, bound time.Duration) 
 		return deployerRestart
 	}
 	return deployerAlive
+}
+
+// deployerProgressHung judges a deployer that deployerLiveness found alive:
+// hung when this run's progress report is on record, is not earlier than the
+// run's newest code notice (codeAt, zero with none) and is a bound or more
+// old. A run with no report on record (an older runner, or one that withdrew)
+// and a report from before a restart or "now runs" notice (the scripts that
+// sent it may no longer run) are never hung by this rule. The wait a report
+// names does not enter it.
+func deployerProgressHung(now time.Time, row deployerProgressRow, codeAt time.Time, bound time.Duration) bool {
+	if row.reportedAt == "" {
+		return false
+	}
+	reported := parseTS(row.reportedAt)
+	return !reported.IsZero() && !reported.Before(codeAt) && now.Sub(reported) >= bound
+}
+
+// deployerProgressRow is a project's release_deployer_progress row as one
+// deployer run sees it: a row of another agent or run counts as no row.
+type deployerProgressRow struct {
+	agent, run, reportedAt, record string
+	scanSeq, codeSeq               int64
+	// foreign is set when a row of another agent or run stands; the next
+	// write replaces it.
+	foreign bool
+}
+
+func loadDeployerProgress(ctx context.Context, q queryRower, task, agent, run string) (deployerProgressRow, error) {
+	var r deployerProgressRow
+	err := q.QueryRowContext(ctx, `SELECT agent_id,run_id,reported_at,record_json,scan_seq,code_seq FROM release_deployer_progress WHERE task_id=?`, task).Scan(&r.agent, &r.run, &r.reportedAt, &r.record, &r.scanSeq, &r.codeSeq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return deployerProgressRow{}, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	if r.agent != agent || r.run != run {
+		return deployerProgressRow{foreign: true}, nil
+	}
+	return r, nil
+}
+
+// view is the stored report as the API returns it.
+func (r deployerProgressRow) view() api.ReleaseProgress {
+	out := api.ReleaseProgress{AgentID: r.agent, RunID: r.run, ReportedAt: r.reportedAt}
+	if r.record != "" {
+		var p api.ReleaseProgress
+		if json.Unmarshal([]byte(r.record), &p) == nil {
+			out.JobID, out.Phase, out.Step, out.Wait = p.JobID, p.Phase, p.Step, p.Wait
+		}
+	}
+	return out
+}
+
+var (
+	deployerProgressName  = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,47}$`)
+	deployerProgressJob   = regexp.MustCompile(`^rel_[0-9a-f]{16}$`)
+	deployerProgressWaits = []string{"", "matrix", "inputs", "host_lock", "fence", "owner_hold", "transport"}
+)
+
+// validDeployerProgress checks a report as the runner sends it: the hub sets
+// the agent, the run and the time, so a report naming one is refused.
+func validDeployerProgress(p api.ReleaseProgress) bool {
+	return p.AgentID == "" && p.RunID == "" && p.ReportedAt == "" &&
+		(p.JobID == "" || deployerProgressJob.MatchString(p.JobID)) &&
+		deployerProgressName.MatchString(p.Phase) && (p.Step == "" || deployerProgressName.MatchString(p.Step)) &&
+		slices.Contains(deployerProgressWaits, p.Wait.Kind) && p.Wait.PID >= 0 && p.Wait.PID <= 1<<31-1
+}
+
+// RecordDeployerProgress stores the release runner's progress report for the
+// exact current deployer run, at the hub clock. It is not a release action:
+// it writes no receipt, reads and changes no job and wakes nobody. The
+// wrapper heartbeat never writes it.
+func (s *Store) RecordDeployerProgress(ctx context.Context, task, agent, run string, p api.ReleaseProgress) (api.ReleaseProgress, error) {
+	if !api.ValidID(task, "tsk") || !validDeployerProgress(p) {
+		return api.ReleaseProgress{}, api.ErrInvalid
+	}
+	raw, err := json.Marshal(struct {
+		JobID string                  `json:"jobId"`
+		Phase string                  `json:"phase"`
+		Step  string                  `json:"step"`
+		Wait  api.ReleaseProgressWait `json:"wait"`
+	}{p.JobID, p.Phase, p.Step, p.Wait})
+	if err != nil {
+		return api.ReleaseProgress{}, err
+	}
+	return s.setDeployerProgress(ctx, task, agent, run, string(raw), true)
+}
+
+// WithdrawDeployerProgress clears the exact current deployer run's report, so
+// the run is judged as one that never reported; the scan cursors are kept.
+// A runner sends it when it can no longer report (its tt was rolled back).
+func (s *Store) WithdrawDeployerProgress(ctx context.Context, task, agent, run string) (api.ReleaseProgress, error) {
+	if !api.ValidID(task, "tsk") {
+		return api.ReleaseProgress{}, api.ErrInvalid
+	}
+	return s.setDeployerProgress(ctx, task, agent, run, "", false)
+}
+
+func (s *Store) setDeployerProgress(ctx context.Context, task, agent, run, record string, report bool) (api.ReleaseProgress, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	zero := api.ReleaseProgress{}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	var state, pause string
+	err = tx.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, task).Scan(&state, &pause)
+	if errors.Is(err, sql.ErrNoRows) {
+		return zero, api.ErrNotFound
+	}
+	if err != nil {
+		return zero, err
+	}
+	if state != api.TaskOpen || pause != api.ProjectPauseActive {
+		return zero, releaseConflict("active project required")
+	}
+	now := s.now()
+	if err = releaseDeployer(ctx, tx, task, agent, run, now); err != nil {
+		return zero, err
+	}
+	reported := ""
+	if report {
+		reported = ts(now)
+	}
+	// A row of another agent or run is replaced and its cursors start again.
+	const same = `agent_id=excluded.agent_id AND run_id=excluded.run_id`
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_deployer_progress(task_id,agent_id,run_id,reported_at,record_json) VALUES(?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET scan_seq=CASE WHEN `+same+` THEN scan_seq ELSE 0 END,code_seq=CASE WHEN `+same+` THEN code_seq ELSE 0 END,
+ agent_id=excluded.agent_id,run_id=excluded.run_id,reported_at=excluded.reported_at,record_json=excluded.record_json`, task, agent, run, reported, record); err != nil {
+		return zero, err
+	}
+	row, err := loadDeployerProgress(ctx, tx, task, agent, run)
+	if err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	return row.view(), nil
+}
+
+// DeployerProgress reads the project's stored progress report with the agent
+// and run that sent it; every field is empty with none. It writes nothing.
+func (s *Store) DeployerProgress(ctx context.Context, task string) (api.ReleaseProgress, error) {
+	if !api.ValidID(task, "tsk") {
+		return api.ReleaseProgress{}, api.ErrInvalid
+	}
+	var id string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM tasks WHERE id=?`, task).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.ReleaseProgress{}, api.ErrNotFound
+		}
+		return api.ReleaseProgress{}, err
+	}
+	var r deployerProgressRow
+	err := s.db.QueryRowContext(ctx, `SELECT agent_id,run_id,reported_at,record_json FROM release_deployer_progress WHERE task_id=?`, task).Scan(&r.agent, &r.run, &r.reportedAt, &r.record)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return api.ReleaseProgress{}, err
+	}
+	return r.view(), nil
 }
 
 // deployerLivenessSweepGap is how long a project may go without a sweep of
@@ -1928,7 +2109,8 @@ type DeployerNotice struct {
 
 // DeployerLivenessSweep posts, once per episode and recipient, a directed
 // notice to the primary database handler and the owner helper of every open,
-// active project whose deployer is silent or stuck in a restart while a
+// active project whose deployer is silent, stuck in a restart, or heartbeating
+// with no progress report from its runner for the progress bound, while a
 // release job has stood in verified or claimed for the bound. It reads only
 // durable rows and never restarts, signals or changes the deployer or a job.
 func (s *Store) DeployerLivenessSweep(ctx context.Context, now time.Time) ([]DeployerNotice, error) {
@@ -1964,6 +2146,30 @@ func (s *Store) DeployerLivenessSweep(ctx context.Context, now time.Time) ([]Dep
 		}
 	}
 	return posted, firstErr
+}
+
+// deployerProgressSeen is the hung notice's sentence about the last report.
+func deployerProgressSeen(row deployerProgressRow) string {
+	p := row.view()
+	if p.ReportedAt == "" {
+		return ""
+	}
+	seen := fmt.Sprintf(" Last progress: %s, phase %s", p.ReportedAt, p.Phase)
+	if p.Step != "" {
+		seen += ", step " + p.Step
+	}
+	if p.JobID != "" {
+		seen += ", job " + p.JobID
+	}
+	switch {
+	case p.Wait.Kind == "":
+		seen += ", no recorded wait"
+	case p.Wait.PID != 0:
+		seen += fmt.Sprintf(", waiting on %s (pid %d)", p.Wait.Kind, p.Wait.PID)
+	default:
+		seen += ", waiting on " + p.Wait.Kind
+	}
+	return seen + "."
 }
 
 func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now time.Time, bound time.Duration) ([]int64, error) {
@@ -2105,20 +2311,56 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	}
 	// A restart is pending while its notice is the newest of the run's
 	// restart, "now runs" and "not claiming" notices: a refused restart is a
-	// live deployer and already wakes.
-	var codeSubject, codeAt string
-	var codeSeq int64
-	const subject = `CASE WHEN json_valid(envelope) THEN coalesce(json_extract(envelope,'$.subject'),'') ELSE '' END`
-	err = tx.QueryRowContext(ctx, `SELECT seq,created_at,`+subject+` FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? AND envelope<>''
- AND (`+subject+`=? OR substr(`+subject+`,1,?)=? OR substr(`+subject+`,1,?)=?) ORDER BY seq DESC LIMIT 1`,
-		taskID, d.id, d.run, deployerRestartedSubject, len(deployerRestartSubject), deployerRestartSubject, len(deployerNotClaimingSubject), deployerNotClaimingSubject).Scan(&codeSeq, &codeAt, &codeSubject)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	// live deployer and already wakes. The lookup reads only the run's
+	// messages newer than the last sweep's (scan_seq) and keeps the newest
+	// code notice it has found (code_seq), so its cost does not grow with the
+	// run's message count.
+	progress, err := loadDeployerProgress(ctx, tx, taskID, d.id, d.run)
+	if err != nil {
 		return nil, err
+	}
+	var codeSubject, codeAt string
+	codeSeq := progress.codeSeq
+	const subject = `CASE WHEN json_valid(envelope) THEN coalesce(json_extract(envelope,'$.subject'),'') ELSE '' END`
+	if last.seq > progress.scanSeq {
+		var found int64
+		err = tx.QueryRowContext(ctx, `SELECT seq FROM messages WHERE task_id=? AND seq>? AND from_agent=? AND from_run_id=? AND envelope<>''
+ AND (`+subject+`=? OR substr(`+subject+`,1,?)=? OR substr(`+subject+`,1,?)=?) ORDER BY seq DESC LIMIT 1`,
+			taskID, progress.scanSeq, d.id, d.run, deployerRestartedSubject, len(deployerRestartSubject), deployerRestartSubject, len(deployerNotClaimingSubject), deployerNotClaimingSubject).Scan(&found)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if err == nil {
+			codeSeq = found
+		}
+	}
+	if progress.foreign || last.seq > progress.scanSeq || codeSeq != progress.codeSeq {
+		// The cursors move in this transaction, with the verdict they serve.
+		if progress.foreign {
+			_, err = tx.ExecContext(ctx, `INSERT INTO release_deployer_progress(task_id,agent_id,run_id,scan_seq,code_seq) VALUES(?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET agent_id=excluded.agent_id,run_id=excluded.run_id,reported_at='',record_json='',scan_seq=excluded.scan_seq,code_seq=excluded.code_seq`, taskID, d.id, d.run, last.seq, codeSeq)
+		} else {
+			_, err = tx.ExecContext(ctx, `INSERT INTO release_deployer_progress(task_id,agent_id,run_id,scan_seq,code_seq) VALUES(?,?,?,?,?)
+ ON CONFLICT(task_id) DO UPDATE SET scan_seq=excluded.scan_seq,code_seq=excluded.code_seq`, taskID, d.id, d.run, last.seq, codeSeq)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if codeSeq != 0 {
+		err = tx.QueryRowContext(ctx, `SELECT created_at,`+subject+` FROM messages WHERE task_id=? AND seq=?`, taskID, codeSeq).Scan(&codeAt, &codeSubject)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
 	}
 	if strings.HasPrefix(codeSubject, deployerRestartSubject) {
 		last.restartAt, last.restartNotice = parseTS(codeAt), codeSeq
 	}
 	verdict := deployerLiveness(now, last.lastHeard, last.restartAt, bound)
+	progressBound := deployerProgressBound()
+	if verdict == deployerAlive && deployerProgressHung(now, progress, parseTS(codeAt), progressBound) {
+		verdict = deployerHung
+	}
 
 	save := func() error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO release_deployer_liveness(task_id,agent_id,run_id,state,reason,opened_at,handler_seq,helper_seq) VALUES(?,?,?,?,?,?,?,?)
@@ -2168,6 +2410,10 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		if last.restartNotice != 0 {
 			lead += fmt.Sprintf(" Restart notice: #%d.", last.restartNotice)
 		}
+	}
+	if ep.reason == deployerHung {
+		noticeSubject = deployerHungNoticeSubject
+		lead = fmt.Sprintf("Deployer %s (agent %s, run %s, status %s) still heartbeats, but its release runner has reported no progress for %s or more while release jobs wait.%s", d.name, d.id, d.run, d.status, progressBound, deployerProgressSeen(progress))
 	}
 	heartbeat, lastNotice := "none", "none"
 	if d.seen != "" {

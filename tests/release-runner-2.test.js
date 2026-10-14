@@ -11,13 +11,18 @@ import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
 import {releaseReply,releaseReplySource,readHostState,git,bufferTT,fixture,change,job,fake,config,miniFixture,hash,stamped,importInputs,hostFixture,manifestFile,reclaimed,otherGeneration,HUB_SERVICE,rehearsalFixture,REPO,composePlan,recorded,schemaRelease,journalFixture,copyOf,sweep,C,DIST,SWEEP_AT,tailosJob,fiveReleased,addDist,distFixture,sweepAt,distRecord,addAttempt,EVIDENCE,BULK,YOUNG,attemptRecord,bulkRecords,remoteHead,goWorktreeFixture,PAIRED,pairedRelease,pairedHost,RUNNER,ignorePrerequisites,placePrerequisites,workedPlan,exitedPid,attemptDir,matrixHost,provisionFixture,until,ended,idle,lockHost,holderEntry,otherHolder,reasonIs,releaseHost,tailosAdapter,MATRIX_A,MATRIX_B,uncoveredReason,changedMatrixHost,matrixChangeRelease,heldRun,three,race,covers,stale,claimed} from "./release-runner-fixtures.mjs";
+// The real entry point reports progress for --once too: one report before the
+// first read and one after the last call. This fake tt rejects the command
+// (exit 99), so the first report is followed by the one withdraw.
+const START=["deployment progress --phase start","deployment progress --request-id progress-withdraw-RUN"],POLL="deployment progress --phase poll";
+const callLog=path=>readFileSync(path,"utf8").replace(/progress-withdraw-\S+/g,"progress-withdraw-RUN");
 test("buf1 a valid fake tt deployment list above eight MiB parses and polls",t=>{
  const f=bufferTT(t,`fs.writeSync(1,JSON.stringify(releaseReply([{id:'rel_fixture',state:'refused',padding:'x'.repeat(9*1024*1024)}],args)));`);
  const adapter=new HostAdapter({cwd:f.cwd,tt:f.tt},{}),raw=adapter.command([f.tt,"deployment","list","--view","settled"]);
  assert.ok(Buffer.byteLength(raw)>8*1024*1024);const jobs=JSON.parse(raw);
  assert.equal(jobs.version,1);assert.equal(jobs.jobs.length,1);assert.equal(jobs.jobs[0].padding.length,9*1024*1024);
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");assert.equal(poll.stderr,"");
- assert.equal(readFileSync(f.log,"utf8"),"deployment list --view settled\ndeployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
+ assert.equal(callLog(f.log),["deployment list --view settled",...START,"deployment list --view active --limit 200","deployment list --view settled --limit 200 --snapshot "+"a".repeat(64),"deployment list --view active --limit 200 --snapshot "+"a".repeat(64),POLL,""].join("\n"));
 });
 test("buf2 real fake tt command overflow names ENOBUFS without payloads or claims",t=>{
  const f=bufferTT(t,`fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');const chunk=Buffer.alloc(1024*1024,120);for(let i=0;i<257;i++)fs.writeSync(2,chunk);`);
@@ -25,16 +30,16 @@ test("buf2 real fake tt command overflow names ENOBUFS without payloads or claim
  assert.throws(()=>adapter.command([f.tt,"deployment","list"]),e=>e.message==="Host operation failed" && failureReason(e)==="tt ENOBUFS (command buffer overflow)");
  const poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");const diagnostic=poll.stderr;
  assert.match(diagnostic,/Deployment poll held.*ENOBUFS.*command buffer overflow/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
- const calls=readFileSync(f.log,"utf8").split("\n");assert.deepEqual(calls.slice(0,2),["deployment list","deployment list --view active --limit 200"]);
- assert.match(calls[2],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list ENOBUFS \(command buffer overflow\)\. /);assert.ok(!calls[2].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(3),[""]);
+ const calls=callLog(f.log).split("\n");assert.deepEqual(calls.slice(0,4),["deployment list",...START,"deployment list --view active --limit 200"]);
+ assert.match(calls[4],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list ENOBUFS \(command buffer overflow\)\. /);assert.ok(!calls[4].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(5),[POLL,""]);
 });
 test("buf3 fake tt errors and invalid JSON keep bounded non-secret poll diagnostics",t=>{
  for(const body of [`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');fs.writeSync(2,'SYNTHETIC_PRIVATE_TOKEN');process.exit(2);`,`fs.writeSync(1,'SYNTHETIC_PRIVATE_TOKEN');`]){
   const f=bufferTT(t,body),poll=f.poll();assert.equal(poll.status,0);assert.equal(poll.stdout,"");
   const diagnostic=poll.stderr;assert.match(diagnostic,/Deployment poll held/);assert.ok(diagnostic.length<256);assert.ok(!diagnostic.includes("SYNTHETIC_PRIVATE_TOKEN"));
-  assert.match(diagnostic,body.includes("process.exit")?/tt deployment list exit 2/:/unclassified/);const calls=readFileSync(f.log,"utf8").split("\n");assert.equal(calls[0],"deployment list --view active --limit 200");
-  if(body.includes("process.exit")){assert.match(calls[1],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list exit 2\. /);assert.ok(!calls[1].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(2),[""]);}
-  else assert.deepEqual(calls.slice(1),[""]);
+  assert.match(diagnostic,body.includes("process.exit")?/tt deployment list exit 2/:/unclassified/);const calls=callLog(f.log).split("\n");assert.deepEqual(calls.slice(0,3),[...START,"deployment list --view active --limit 200"]);
+  if(body.includes("process.exit")){assert.match(calls[3],/^send --kind notice --subject A deployer CLI call failed --text Deployer CLI call failed: tt deployment list exit 2\. /);assert.ok(!calls[3].includes("SYNTHETIC_PRIVATE_TOKEN"));assert.deepEqual(calls.slice(4),[POLL,""]);}
+  else assert.deepEqual(calls.slice(3),[POLL,""]);
  }
 });
 test("fast forward pins exact candidate and ref CAS refuses a race",()=>{const f=fixture();const commit=change(f,"client/a.js","a");const out=integrateCandidate(f.cwd,job(f,commit));assert.equal(out.integrated,commit);git(f.cwd,"update-ref","refs/heads/tasks-hub",commit,f.base);assert.throws(()=>publishIntegration(f.cwd,commit,f.base),/race/);});

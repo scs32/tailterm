@@ -268,7 +268,7 @@ test("bounded poll refuses incomplete history before claims, receipt writes or p
   const f=bufferTT(t,`const view=args[args.indexOf('--view')+1];let p=releaseReply([{id:'rel_active',state:'verified',generation:1}],args);if(view==='settled'){if(${JSON.stringify(fault)}==='legacy')p=[];else if(${JSON.stringify(fault)}==='view')p.page.view='active';else if(${JSON.stringify(fault)}==='snapshot')p.page.snapshot='b'.repeat(64);else if(${JSON.stringify(fault)}==='duplicate')p.jobs=[{id:'rel_active',summary:true,rowId:1,state:'released'}];else if(${JSON.stringify(fault)}==='date')p.jobs=[{id:'rel_history',summary:true,rowId:2,state:'released',generation:1,settledAt:'invalid',receipt:{outcome:'released',commit:'c'.repeat(40),targets:[]}}];else {p.page.nextAfter='same';if(${JSON.stringify(fault)}==='repeat')p.jobs=[{id:'rel_history',summary:true,rowId:2,state:'released'}];}}console.log(JSON.stringify(p));`);
   const copy=join(f.cwd,"rel_history-truenas-backup.sqlite"),pending=join(f.cwd,"rel_history.json");writeFileSync(copy,"keep");writeFileSync(pending,JSON.stringify({jobId:"rel_history",phase:"receipt_pending",receipt:{pin:"keep"}}));
   const before=readFileSync(pending,"utf8"),poll=f.poll();assert.equal(poll.status,0);assert.match(poll.stderr,/poll held/);
-  const commands=readFileSync(f.log,"utf8").trim().split("\n");assert.ok(commands.every(x=>x.startsWith("deployment list ")));
+  const commands=readFileSync(f.log,"utf8").trim().split("\n");assert.ok(commands.every(x=>x.startsWith("deployment list ") || x.startsWith("deployment progress ")));
   assert.equal(readFileSync(copy,"utf8"),"keep");assert.equal(readFileSync(pending,"utf8"),before);assert.ok(!existsSync(join(f.cwd,"retention.jsonl")));
  }
 });
@@ -1021,4 +1021,138 @@ test("wait r3 a poll that cannot read the job list at all continues the open wai
  j.advance(4);await j.poll();assert.equal(j.attention().length,1);assert.ok(j.attention()[0].text.startsWith("Release rel_wait has waited"));assert.ok(j.attention()[0].text.includes("Cause: tt deployment list connection refused, 3 tries."));
  // An unreadable wait file is no wait: nothing is escalated from it.
  writeFileSync(j.file,"{");j.fail([]);assert.equal(await j.poll(),"");assert.equal(j.attention().length,1);
+});
+
+// The runner's progress reports for the hub's hung-runner check
+// (wi_95b575f0454c7052). The fake hub accepts the command unless a test says
+// otherwise; argv is every call as words.
+const PROGRESS_OK=`if(a[1]==='progress'){console.log('{}');process.exit(0);}`,REFUSED='tt: Post "http://hub.invalid/x": dial tcp: connect: connection refused';
+const argvOf=h=>h.calls().map(c=>c.argv.join(" ")),reports=h=>argvOf(h).filter(x=>x.startsWith("deployment progress"));
+const reporting=(h,release)=>h.poll(null,release,{once:true,progress:true});
+// Several polls of one daemon with reports on; every poll ends in one release call.
+async function progressRun(t,h,polls,release){
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="",polled=0;
+ process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
+ try{
+  const serving=serveDeployment(h.config,{signal:controller.signal,progress:true,release:async(c,adapter)=>{const out=await release(c,adapter);polled++;return out;}});
+  for(let n=1;n<=polls;n++){while(polled<n)await settle();await settle();if(n===polls)controller.abort();t.mock.timers.tick(30000);}
+  await serving;
+ }finally{t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+ return err;
+}
+test("progress a13 a reporting poll sends a start report before its first read and a poll report after its last call, naming the wait it ended in",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-progress-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const host=extra=>codeHost(t,cwd,PROGRESS_OK+(extra||""));
+ // Nothing to do: the two reports bracket the poll's reads.
+ const idleHost=host();assert.equal(await reporting(idleHost),"");let calls=argvOf(idleHost);
+ assert.equal(calls[0],"deployment progress --phase start");assert.equal(calls.at(-1),"deployment progress --phase poll");assert.ok(calls.length>2);assert.deepEqual(reports(idleHost),[calls[0],calls.at(-1)]);
+ assert.ok(calls.slice(1,-1).every(x=>x.startsWith("deployment list ")));
+ // A poll held by an unreadable job list still ends in its poll report.
+ const heldHost=host(`if(a[1]==='list'){fs.writeSync(1,'not json');process.exit(0);}`);assert.match(await reporting(heldHost),/^Deployment poll held/);
+ assert.deepEqual(reports(heldHost),["deployment progress --phase start","deployment progress --phase poll"]);assert.equal(argvOf(heldHost).at(-1),"deployment progress --phase poll");
+ // A release that waits on its matrix run: the report names the job, the wait and the run's pid; the job's adapter reports too.
+ const matrix=host();matrix.setJobs([verifiedJob("rel_matrix")]);let on=null;
+ await reporting(matrix,async(c,adapter)=>{on=adapter.progressOn;adapter.matrixPid=4242;return {jobId:c.job.id,outcome:"waiting_matrix"};});
+ assert.equal(on,true);assert.equal(argvOf(matrix).at(-1),"deployment progress --phase poll --job rel_matrix --wait matrix --pid 4242");
+ const adopted=host();adopted.setJobs([verifiedJob("rel_matrix")]);await reporting(adopted,async c=>({jobId:c.job.id,outcome:"waiting_matrix"}));
+ assert.equal(argvOf(adopted).at(-1),"deployment progress --phase poll --job rel_matrix --wait matrix");
+ // The other waits a poll ends in, and a release that ended.
+ const inputs=host();inputs.setJobs([verifiedJob("rel_inputs")]);await reporting(inputs,async c=>({jobId:c.job.id,outcome:"waiting_inputs"}));
+ assert.equal(argvOf(inputs).at(-1),"deployment progress --phase poll --job rel_inputs --wait inputs");
+ const done=host();done.setJobs([verifiedJob("rel_done")]);await reporting(done,async c=>({jobId:c.job.id,outcome:"released"}));
+ assert.equal(argvOf(done).at(-1),"deployment progress --phase poll --job rel_done");
+ const fence=host();fence.setJobs([{...verifiedJob("rel_holder"),state:"claimed",generation:2,agentId:"agt_0ther",runId:"run_0ther"},verifiedJob("rel_behind")]);await reporting(fence);
+ assert.equal(argvOf(fence).at(-1),"deployment progress --phase poll --job rel_holder --wait fence");assert.equal(fence.claims().length,0);
+ const hold=host();hold.setJobs([{...verifiedJob("rel_onhold"),state:"held"}]);await reporting(hold);
+ assert.equal(argvOf(hold).at(-1),"deployment progress --phase poll --job rel_onhold --wait owner_hold");
+ // Opt-in: a programmatic poll without the option and a bare adapter send nothing.
+ const silent=host();silent.setJobs([verifiedJob("rel_quiet")]);let off=null;await silent.poll(null,async(c,adapter)=>{off=adapter.progressOn;adapter.progress({jobId:c.job.id,phase:"merged"});return {jobId:c.job.id,outcome:"waiting_matrix"};});
+ assert.equal(off,false);assert.deepEqual(reports(silent),[]);
+ new HostAdapter(silent.config,{}).progress({phase:"poll"});assert.deepEqual(reports(silent),[]);
+});
+test("progress a13 a release reports each phase and each step once, in order, with its job",async()=>{
+ const f=fixture(),commit=change(f,"client/a.js","a"),seen=[],adapter={...fake(),progress:r=>{seen.push(r);}};
+ const out=await runRelease(config(f,job(f,commit)),adapter);assert.equal(out.outcome,"released");
+ assert.deepEqual(seen.map(r=>r.phase+(r.step?" "+r.step:"")),["prepared","prepared integrate","integrated","integrated select","merged","merged prepare","merged deploy","merged live-check","pushing","finishing","complete"]);
+ assert.ok(seen.every(r=>r.jobId==="rel_fixture"));
+ // A report that throws or rejects changes nothing, and an adapter without one is not told.
+ for(const progress of [()=>{throw new Error("report failed");},()=>Promise.reject(new Error("report failed")),undefined]){
+  const g=fixture(),c=change(g,"client/a.js","a"),quiet={...fake(),...(progress?{progress}:{})};
+  assert.equal((await runRelease(config(g,job(g,c)),quiet)).outcome,"released");assert.deepEqual(quiet.calls,adapter.calls);
+ }
+ // The real adapter sends the report as one CLI call with the record's words.
+ const cwd=mkdtempSync(join(tmpdir(),"release-progress-")),h=codeHost({after:fn=>fn},cwd,PROGRESS_OK);
+ try{
+  const real=Object.assign(new HostAdapter(h.config,{}),{progressOn:true});
+  real.progress({jobId:"rel_fixture",phase:"merged",step:"live-check"});real.progress({phase:"poll",jobId:"rel_fixture",wait:{kind:"matrix",pid:7}});real.progress({phase:"poll",wait:{kind:"fence",pid:0}});real.progress({});
+  assert.deepEqual(argvOf(h),["deployment progress --phase merged --job rel_fixture --step live-check","deployment progress --phase poll --job rel_fixture --wait matrix --pid 7","deployment progress --phase poll --wait fence"]);
+ }finally{rmSync(cwd,{recursive:true,force:true});rmSync(h.home,{recursive:true,force:true});}
+});
+test("progress a14 a failed report is silent: a transport failure is one call, a rejection is followed by one withdraw, and nothing is recorded or posted",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-progress-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const waits=async c=>({jobId:c.job.id,outcome:"waiting_inputs"}),quiet=h=>{
+  assert.equal(existsSync(join(h.home,"cli-failures.json")),false);assert.equal(existsSync(join(h.home,"transport-wait.json")),false);
+  assert.deepEqual(h.calls().filter(c=>c.argv[0]==="send"&&!/waiting for its immutable inputs|Import immutable inputs/.test(c.argv.join(" "))).map(c=>c.argv.join(" ")),[]);
+ };
+ // What the same polls print with reports that succeed.
+ const ok=codeHost(t,cwd,PROGRESS_OK);ok.setJobs([verifiedJob("rel_p")]);const plain=await progressRun(t,ok,2,waits),sends=ok.calls().filter(c=>c.argv[0]==="send").length;
+ assert.equal(reports(ok).length,3);
+ // The hub is unreached: every report is tried once and nothing is withdrawn.
+ const down=codeHost(t,cwd,`if(a[1]==='progress'){fs.writeSync(2,${JSON.stringify(REFUSED)}+'\\n');process.exit(1);}`);down.setJobs([verifiedJob("rel_p")]);
+ const slept=[],sleep=cliRetry.sleep;cliRetry.sleep=ms=>{slept.push(ms);};t.after(()=>{cliRetry.sleep=sleep;});
+ assert.equal(await progressRun(t,down,2,waits),plain);
+ assert.deepEqual(reports(down),["deployment progress --phase start","deployment progress --phase poll --job rel_p --wait inputs","deployment progress --phase poll --job rel_p --wait inputs"]);assert.deepEqual(slept,[]);quiet(down);
+ assert.equal(down.calls().filter(c=>c.argv[0]==="send").length,sends);
+ // This tt does not know the command (exit 2): one withdraw, in the form an older tt forwards, once across the polls.
+ const old=codeHost(t,cwd);old.setJobs([verifiedJob("rel_p")]);assert.equal(await progressRun(t,old,2,waits),plain);
+ assert.deepEqual(reports(old),["deployment progress --phase start","deployment progress --request-id progress-withdraw-"+CODE_RUN,"deployment progress --phase poll --job rel_p --wait inputs","deployment progress --phase poll --job rel_p --wait inputs"]);quiet(old);
+ assert.equal(old.calls().filter(c=>c.argv[0]==="send").length,sends);
+ // Reports resume by themselves, and a rejection after a success is withdrawn again.
+ const flaky=join(cwd,"reject"),turns=codeHost(t,cwd,`if(a[1]==='progress'){if(fs.existsSync(${JSON.stringify(flaky)})&&a.includes('--phase'))process.exit(2);console.log('{}');process.exit(0);}`);
+ const adapter=Object.assign(new HostAdapter(turns.config,{}),{progressOn:true}),say=()=>adapter.progress({phase:"poll"});
+ writeFileSync(flaky,"");say();say();rmSync(flaky);say();writeFileSync(flaky,"");say();say();
+ assert.deepEqual(reports(turns).map(x=>x.includes("--request-id")?"withdraw":"report"),["report","withdraw","report","report","report","withdraw","report"]);quiet(turns);
+});
+test("claim a15 a claim that fails only in transport is quiet and opens the transport wait; a refused claim keeps the held-claim notice",async t=>{
+ const w=waitHost(t),HELD_LINE="Release claim held; handler reconciliation required.\n",reason="tt deployment claim connection refused, 3 tries";
+ w.h.setJobs([verifiedJob("rel_first"),verifiedJob("rel_second")]);const released=[],release=async c=>{released.push(c.job.id);return {jobId:c.job.id,outcome:"waiting_inputs"};};
+ const claimsOf=()=>w.h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),held=()=>w.h.calls().filter(c=>c.argv[0]==="send").map(sendOf).filter(x=>/skipped/.test(x.subject));
+ // Every try of the first job's claim fails in transport.
+ w.fail(["claim"]);const began=w.at(),err=await w.h.poll(null,release,{once:true,progress:true});
+ assert.equal(err,"");assert.ok(!err.includes("reconciliation required"));assert.deepEqual(held(),[]);
+ // The second job is not claimed in that poll, and nothing is released.
+ assert.deepEqual(claimsOf(),["rel_first","rel_first","rel_first"]);assert.deepEqual(released,[]);
+ // The transport wait opens with that job, as the transport fix built it.
+ assert.deepEqual(w.wait(),{version:1,jobId:"rel_first",since:began,cause:reason,polls:1,routine:true,escalated:false,latest:reason,lastAt:began});assert.equal(w.routine().length,1);
+ assert.deepEqual(w.routine()[0].refs,["release-job=rel_first","wake=routine"]);
+ assert.equal(w.h.calls().at(-1).argv.join(" "),"deployment progress --phase poll --job rel_first --wait transport");
+ // Past the bound the wait escalates by itself; still no held claim.
+ w.advance(10);assert.equal(await w.poll(),ESCALATED_LINE);assert.equal(w.attention().length,1);assert.deepEqual(held(),[]);assert.deepEqual(released,[]);
+ // The fault clears: the next poll claims the first job and the wait ends.
+ w.fail([]);assert.equal(await w.h.poll(null,release),"");assert.deepEqual(claimsOf().slice(-1),["rel_first"]);assert.deepEqual(released,["rel_first"]);assert.equal(existsSync(w.file),false);assert.deepEqual(held(),[]);
+ // A claim the hub refuses is a held claim as before: the line, the notice, and the later job goes on.
+ const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job')==='rel_first'){fs.writeSync(2,'tt: hub: 409 conflict: release: candidate changed since enqueue\\n');process.exit(1);}`+heldRoster);
+ h.setJobs([verifiedJob("rel_first"),verifiedJob("rel_second")]);const went=[];
+ assert.equal(await h.poll(null,async c=>{went.push(c.job.id);}),HELD_LINE);assert.deepEqual(went,["rel_second"]);
+ const notices=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.deepEqual(notices.map(n=>n.to),[HELD_HANDLER,HELD_HELPER]);
+ assert.ok(notices.every(n=>n.subject==="A release job is skipped because the hub refused its claim"));assert.equal(existsSync(join(h.home,"transport-wait.json")),false);
+});
+test("claim a16 a claim whose answer was lost is not sent again: the next poll runs the job as its own",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-lost-claim-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const sleep=cliRetry.sleep;cliRetry.sleep=()=>{};t.after(()=>{cliRetry.sleep=sleep;});
+ // The fake hub records the claim, then fails the call in transport on every try.
+ const jobs=join(cwd,"claimed.json");
+ const h=codeHost(t,cwd,`if(a[1]==='claim'){fs.writeFileSync(${JSON.stringify(jobs)},JSON.stringify(jobs.map(j=>j.id===flag('--job')?{...j,state:'claimed',generation:j.generation+1,agentId:process.env.TAILTERM_AGENT,runId:process.env.TAILTERM_RUN}:j)));fs.writeSync(2,${JSON.stringify(REFUSED)}+'\\n');process.exit(1);}`);
+ h.setJobs([verifiedJob("rel_lost"),verifiedJob("rel_later")]);const released=[],release=async c=>{released.push([c.job.id,c.job.state,c.job.generation,c.job.runId]);return {jobId:c.job.id,outcome:"released"};};
+ assert.equal(await h.poll(null,release),"");assert.deepEqual(released,[]);
+ assert.deepEqual(h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),["rel_lost","rel_lost","rel_lost"]);
+ assert.deepEqual(h.calls().filter(c=>c.argv[0]==="send").map(sendOf).filter(x=>/skipped/.test(x.subject)),[]);
+ assert.equal(JSON.parse(readFileSync(join(h.home,"transport-wait.json"),"utf8")).jobId,"rel_lost");
+ // The hub's list now shows the job claimed by this run.
+ h.setJobs(JSON.parse(readFileSync(jobs,"utf8")));const before=h.claims().length;
+ assert.equal(await h.poll(null,release),"");
+ assert.equal(h.claims().length,before);assert.deepEqual(released,[["rel_lost","claimed",2,CODE_RUN]]);assert.equal(existsSync(join(h.home,"transport-wait.json")),false);
 });

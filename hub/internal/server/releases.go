@@ -86,6 +86,26 @@ func (s *Server) releaseAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, handler)
 		return
 	}
+	if req.Operation == "progress" {
+		// The runner's progress: a report, a withdraw (a request id and no
+		// report, which is what an older tt sends) or a read. No receipt.
+		var out api.ReleaseProgress
+		var err error
+		switch {
+		case req.Progress != nil:
+			out, err = s.store.RecordDeployerProgress(r.Context(), r.PathValue("id"), req.AgentID, req.RunID, *req.Progress)
+		case req.RequestID != "":
+			out, err = s.store.WithdrawDeployerProgress(r.Context(), r.PathValue("id"), req.AgentID, req.RunID)
+		default:
+			out, err = s.store.DeployerProgress(r.Context(), r.PathValue("id"))
+		}
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	out, err := s.store.ReleaseAction(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		fail(w, err)

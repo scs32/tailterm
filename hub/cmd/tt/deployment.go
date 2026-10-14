@@ -65,6 +65,11 @@ func cmdDeployment(e env, args []string) error {
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
 	reason := fs.String("reason", "", "why a new job is expected to pass (retry), or why the job is held or its hold released (hold, unhold)")
 	untilItems := fs.String("until-items", "", "comma-separated work items whose release lifts the hold (hold)")
+	phase := fs.String("phase", "", "runner phase to report (progress)")
+	step := fs.String("step", "", "runner step within the phase (progress)")
+	wait := fs.String("wait", "", "the wait the poll ended in: matrix, inputs, host_lock, fence, owner_hold or transport (progress)")
+	pid := fs.Int64("pid", 0, "process the wait names, such as the matrix run (progress)")
+	withdraw := fs.Bool("withdraw", false, "withdraw this run's progress report (progress)")
 	var restored stringListFlag
 	fs.Var(&restored, "restored", "TARGET=RELEASE the refused job's target runs again; one per target in its receipt (retry, repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -159,6 +164,33 @@ func cmdDeployment(e env, args []string) error {
 		out, err := c.ReleaseHandler(ctx, e.task, e.agent, e.runID)
 		if err == nil {
 			printJSON(map[string]string{"id": out.ID, "name": out.Name})
+		}
+		return err
+	}
+	if args[0] == "progress" {
+		// The release runner's own progress, which the hub's hung-runner check
+		// reads: --phase reports, --withdraw (or a bare --request-id, the form
+		// a tt from before this command sends) withdraws, neither reads.
+		req := api.ReleaseRequest{AgentID: e.agent, RunID: e.runID}
+		switch {
+		case *phase != "":
+			if *withdraw {
+				return errors.New("progress takes --phase or --withdraw, not both")
+			}
+			req.Progress = &api.ReleaseProgress{JobID: *job, Phase: *phase, Step: *step, Wait: api.ReleaseProgressWait{Kind: *wait, PID: *pid}}
+		case *withdraw || *key != "":
+			if req.RequestID = *key; req.RequestID == "" {
+				req.RequestID = "progress-withdraw-" + e.runID
+			}
+		case *job != "" || *step != "" || *wait != "" || *pid != 0:
+			return errors.New("progress needs --phase to report")
+		}
+		if (req.Progress != nil || req.RequestID != "") && (e.agent == "" || e.runID == "") {
+			return errors.New("exact agent/run required")
+		}
+		out, err := c.ReleaseProgress(ctx, e.task, req)
+		if err == nil {
+			printJSON(out)
 		}
 		return err
 	}

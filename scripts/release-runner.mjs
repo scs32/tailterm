@@ -642,7 +642,18 @@ export async function runRelease(config, adapter) {
   }
   // The runner code that last ran this job; never part of a resume decision.
   if(config.code)state.code={loaded:config.code.loaded??null,current:config.code.current??null};
-  const checkpoint=()=>save(journalPath,state);let step=null;
+  // Progress for the hub's hung-runner check: each new phase at its
+  // checkpoint and each step as it begins, once. Best effort; an adapter
+  // without progress is not told.
+  let step=null,toldPhase=null,toldStep=null;
+  const tell=()=>{
+    const at=step?`${step.step} ${step.target??""}`:null;
+    if(typeof state.phase!=="string" || (state.phase===toldPhase && (at===null || at===toldStep)))return;
+    toldPhase=state.phase;if(at!==null)toldStep=at;
+    try{const sent=adapter.progress?.({jobId:job.id,phase:state.phase,...(step?{step:step.step}:{})});sent?.catch?.(()=>{});}catch{}
+  };
+  const checkpoint=()=>{save(journalPath,state);tell();};
+  const begin=next=>{step=next;tell();};
   // How often this job went on at a generation the hub advanced under it.
   const noteAdopted=()=>{if(adopted){state.generationAdoptions=(state.generationAdoptions||0)+adopted;adopted=0;}};
   noteAdopted();
@@ -795,7 +806,7 @@ export async function runRelease(config, adapter) {
       if(refusal){
         const fell=await fallback("batch-selection-refused",failureReason(refusal));
         if(fell)return fell===true?null:waiting;
-        step={step:"select"};throw refusal;
+        begin({step:"select"});throw refusal;
       }
       state.batchSelected=state.integrated;checkpoint();
     }
@@ -848,8 +859,8 @@ export async function runRelease(config, adapter) {
     let integration;
     if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
     else if(state.phase==="batching")integration=await resumeBatch();
-    else if(config.batch?.max>1 && config.batch.candidates?.length){step={step:"integrate"};integration=await openBatch();step=null;}
-    else{step={step:"integrate"};integration=integrateCandidate(cwd,job);step=null;}
+    else if(config.batch?.max>1 && config.batch.candidates?.length){begin({step:"integrate"});integration=await openBatch();step=null;}
+    else{begin({step:"integrate"});integration=integrateCandidate(cwd,job);step=null;}
     state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
     if(state.batch){
       const waiting=await verifyBatch();if(waiting)return waiting;
@@ -861,7 +872,7 @@ export async function runRelease(config, adapter) {
     // (verifyBatch) and is selected here again for its targets; a batch that
     // fell back there is selected here as the lead alone. A resumed wait
     // selects again; the answer depends only on the commits.
-    step={step:"select"};const selected=selectReleaseTargets(cwd,baselines,integration.integrated);step=null;
+    begin({step:"select"});const selected=selectReleaseTargets(cwd,baselines,integration.integrated);step=null;
     if(!state.batch && integration.integrated!==job.commit){
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
@@ -886,28 +897,28 @@ export async function runRelease(config, adapter) {
     };
     for(const target of selected){
       if(done.has(target))continue;
-      step={step:"prepare",target};
+      begin({step:"prepare",target});
       await fence();const artifact=await adapter.prepare(target,integration.integrated);pinned(target,artifact);
       const group=[[target,artifact]];
       for(const partner of (artifact.planTargets||[target]).filter(t=>t!==target)){
         if(!selected.includes(partner))throw releaseError("Paired plan partner is not selected");
-        step={step:"prepare",target:partner};
+        begin({step:"prepare",target:partner});
         await fence();const other=await adapter.prepare(partner,integration.integrated);pinned(partner,other);
         if(["planPath","release","backup","backupSHA256","preflightReceiptSHA256"].some(k=>other[k]!==artifact[k]) || !same(other.planTargets,artifact.planTargets))throw releaseError("Paired plan members disagree");
         group.push([partner,other]);
       }
       // A shared backup copy is rehearsed once; the last build pinned the migration binary.
-      if(group.some(([,a])=>a.schemaChanged)){step={step:"rehearse",target};await fence();if(await adapter.rehearse(group.at(-1)[1])!==true)throw releaseError("Backup-copy migration rehearsal failed");}
+      if(group.some(([,a])=>a.schemaChanged)){begin({step:"rehearse",target});await fence();if(await adapter.rehearse(group.at(-1)[1])!==true)throw releaseError("Backup-copy migration rehearsal failed");}
       const records=group.map(([t,a])=>{
         const record={target:t,release:a.release,artifactSHA256:a.artifactSHA256,...(a.backup?{backup:a.backup,backupSHA256:a.backupSHA256,preflightReceiptSHA256:a.preflightReceiptSHA256}:{}),...(a.version?{version:a.version}:{}),...(a.deployment?{deployment:a.deployment}:{}),outcome:"failed"};
         receipt.targets.push(record);state.effects.push({target:t,release:a.release,state:"attempting"});return record;
       });
       checkpoint();
-      step={step:"deploy",target};
+      begin({step:"deploy",target});
       await fence();await adapter.deploy(target,artifact);
       group.forEach(([t,a],i)=>{if(a.deployment)records[i].deployment=a.deployment;if(a.version)records[i].version=a.version;state.effects.find(e=>e.target===t).state="deployed";});checkpoint();
       for(const [i,[t,a]] of group.entries()){
-        step={step:"live-check",target:t};
+        begin({step:"live-check",target:t});
         const live=await liveCheck(adapter,t,policy,config.sleep,config.now),wait=adapter.probeWait?.(t,"live");
         if(wait){state.effects.find(e=>e.target===t).liveCheck=wait;checkpoint();}
         if(!live)throw releaseError("live verification failed");
@@ -1092,7 +1103,33 @@ export class HostAdapter {
     // What the last poll saw: a wait on the host list, or a held run.
     this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;
     // Failed calls of the configured CLI this adapter recorded privately.
-    this.cliFailures=[];}
+    this.cliFailures=[];
+    // Progress reports are opt-in (the deployment daemon turns them on) and
+    // share one withdraw state across the adapters of a daemon.
+    this.progressOn=false;this.progressState={withdrawn:false};this.matrixPid=null;}
+  // The runner's own progress, for the hub's hung-runner check: sent between
+  // steps and at the end of every poll, never from a timer, so a runner that
+  // stops also stops reporting. One try of ten seconds, outside command():
+  // no retry, no private failure record, no notice, no transport wait and no
+  // terminal line. A report the CLI or the hub rejects (not a transport
+  // error: this tt or hub is older than the runner) is followed by one
+  // withdraw, in the form a tt from before the command forwards, so the hub
+  // judges this run as one that never reported. It is withdrawn again only
+  // after a later report succeeded.
+  progress(record){
+    if(this.progressOn!==true || typeof record?.phase!=="string")return;
+    const cli=this.config.tt||"tt",call=argv=>execFileSync(cli,argv,{cwd:this.config.cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:10000});
+    try{
+      call(["deployment","progress","--phase",record.phase,...(record.jobId?["--job",record.jobId]:[]),...(record.step?["--step",record.step]:[]),...(record.wait?.kind?["--wait",record.wait.kind]:[]),...(Number.isSafeInteger(record.wait?.pid) && record.wait.pid>0?["--pid",String(record.wait.pid)]:[])]);
+      this.progressState.withdrawn=false;
+    }catch(error){
+      try{
+        if(transportCause(error) || this.progressState.withdrawn)return;
+        this.progressState.withdrawn=true;
+        call(["deployment","progress","--request-id",`progress-withdraw-${process.env.TAILTERM_RUN||"run"}`]);
+      }catch{}
+    }
+  }
   command(argv,cwd=this.config.cwd,{timeout=600000,retry=true}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
     // Only an idempotent call of the configured CLI is made again, and only
@@ -1183,6 +1220,7 @@ export class HostAdapter {
     const contextPath=join(dir,"context.json"),planPath=join(dir,"plan.json"),receiptPath=join(dir,"receipt.json");
     this.matrixWait=null;this.matrixHeld=null;
     let run=this.readRun(dir);
+    this.matrixPid=run && run.state!=="ended" && Number.isSafeInteger(run.pid)?run.pid:null;
     if(!run && !existsSync(receiptPath))return this.launchMatrixRun(job,current,dir,{contextPath,planPath});
     if(run && run.state!=="ended"){
       if(this.resolveMatrixRun(dir,run)!=="ended")return false;
@@ -1244,6 +1282,7 @@ export class HostAdapter {
     }
     // A run now exists, so a failed save must not refuse: the job keeps the
     // fence and the next poll adopts the run from the lock file.
+    this.matrixPid=pid;
     try{this.saveRun(dir,{...run,state:"started",pid,processStartedAt:this.processStartTime(pid),groups:[]});}catch{}
     return false;
   }
@@ -2012,7 +2051,7 @@ export function readBaselines(configPath){
   if(!targets.every(t=>sha(b?.[t])))throw releaseError("Four last-successful baselines required");
   return Object.fromEntries(targets.map(t=>[t,b[t]]));
 }
-export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease,code}={}) {
+export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease,code,progress=false}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw releaseError("Explicit private activation config required");
   tailosWindow(config);readyWindow(config,"hub");readyWindow(config,"bridge");
   retentionPolicy(config);
@@ -2146,8 +2185,15 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     wait.lastAt=at;waitOpen=true;
     try{save(path,wait);}catch{}
   };
+  // Progress reports (HostAdapter.progress), only when the caller asks: one
+  // before the first poll and one at the end of every poll, a held one
+  // included, naming the job and the wait the poll ended in. The wait is
+  // information for the hub's notice; the hub decides nothing by it.
+  const progressState={withdrawn:false};
+  const reporter=progress===true?Object.assign(new HostAdapter(config,{}),{progressOn:true,progressState}):null;
+  reporter?.progress({phase:"start"});
   while(!signal?.aborted){
-    let reader=null;const ran=[];
+    let reader=null;const ran=[];let ended={};
     waitOpen=readTransportWait(config.journalDirectory)!==null;
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
@@ -2213,8 +2259,10 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
       const job=summary?(details.get(summary.id)||readReleaseDetail(read,summary)):null;
       if(!job){
-        const holder=jobs.find(j=>["claimed","merged","blocked"].includes(j.state));
+        const holder=jobs.find(j=>["claimed","merged","blocked"].includes(j.state)),onHold=jobs.find(j=>j.state==="held");
         if(holder)notify(reader,jobs,details.get(holder.id),holder.state);
+        if(holder)ended={jobId:holder.id,wait:{kind:existsSync(lock)?"host_lock":"fence"}};
+        else if(onHold)ended={jobId:onHold.id,wait:{kind:"owner_hold"}};
         break;
       }
       // Stale code never archives a journal or claims.
@@ -2226,8 +2274,17 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         if(journal==="held"){skipped.add(job.id);process.stderr.write("Set-aside release journal held; handler reconciliation required.\n");heldNotify(reader,job,"journal","the journal is unreadable, shows effects or is not of exactly the set-aside claim");continue;}
       }
       const adapter=new HostAdapter(config,job);ran.push(adapter);
+      if(reporter){adapter.progressOn=true;adapter.progressState=progressState;}
       try{if(job.state==="verified")adapter.native("claim");}
-      catch(error){skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");const call=failureReason(error),said=error?.refusal?`${error.refusal} (${call})`:call;heldNotify(reader,job,"claim",said.length<=160?said:call);continue;}
+      catch(error){
+        // A claim that failed only in transport is not a held claim: the hub
+        // gave no answer, so there is nothing to reconcile. The poll ends
+        // quietly here, before any later job spends its own tries or is
+        // claimed out of order, and the transport wait below names the
+        // failure and escalates it. If the hub did record the claim, the next
+        // poll finds the job claimed by this run and runs it as its own.
+        if(error?.transport===true){ended={jobId:job.id,wait:{kind:"transport"}};break;}
+        skipped.add(job.id);process.stderr.write("Release claim held; handler reconciliation required.\n");const call=failureReason(error),said=error?.refusal?`${error.refusal} (${call})`:call;heldNotify(reader,job,"claim",said.length<=160?said:call);continue;}
       const current=adapter.job;adapter.baselines=baselines;
       const {testPolicy,sleep,now,...activation}=config;
       const batch=batchPolicy.max>1?batchFor(read,jobs,current):null;
@@ -2243,10 +2300,13 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       // (waiting_transport); transportTurn below names it once per wait.
       if(unreached && ["waiting_matrix","waiting_inputs","waiting_transport"].includes(result?.outcome))process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");
       matrixNotify(reader,adapter.job||current,adapter);
+      const waits={waiting_matrix:"matrix",waiting_inputs:"inputs",waiting_transport:"transport"};
+      ended={jobId:current.id,...(waits[result?.outcome]?{wait:{kind:waits[result.outcome],...(result.outcome==="waiting_matrix" && adapter.matrixPid?{pid:adapter.matrixPid}:{})}}:{})};
       break;
     }
     } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);if(reader)cliNotify(reader,reader.cliFailures);}
     if(reader)try{transportTurn(reader,[...reader.cliFailures,...ran.flatMap(a=>a.cliFailures)].filter(f=>f.transport===true));}catch{process.stderr.write("Transport wait not recorded; the next poll retries.\n");}
+    reporter?.progress({phase:"poll",...ended});
     if(once)return;
     await new Promise(r=>setTimeout(r,30000));
   }
@@ -2268,6 +2328,6 @@ if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) 
     if(index<0)throw releaseError("Private config required");
     const config=JSON.parse(readFileSync(process.argv[index+1],"utf8"));
     const controller=new AbortController();process.on("SIGTERM",()=>controller.abort());process.on("SIGINT",()=>controller.abort());
-    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1],code:runnerCodeGate()});
+    await serveDeployment(config,{once:process.argv.includes("--once"),signal:controller.signal,configPath:process.argv[index+1],code:runnerCodeGate(),progress:true});
   }catch{process.stderr.write("Deployment blocked; inspect private host journal and handler release gate.\n");process.exitCode=1;}
 }

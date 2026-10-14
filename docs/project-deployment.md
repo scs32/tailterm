@@ -129,7 +129,9 @@ fence; post-publication failures still retain the existing rollback/recovery gat
 The daemon skips an unclaimable verified job and continues to later jobs rather
 than exiting; it never skips a real claimed/merged/blocked project fence. It
 posts one notice for the skipped job (**Held claim**, below) and names a real
-fence in a notice when a later job waits behind it. Besides
+fence in a notice when a later job waits behind it. A claim that fails only in
+transport is not a held claim: the poll ends there and the transport wait
+covers it. Besides
 reconcile, a claimed fence is freed only by its own run's refusal before
 publication or by the handler's set-aside.
 
@@ -744,6 +746,13 @@ release that has passed verification (incident of 2026-10-13).
   before any job is read continues the open wait, or opens one with no job. A
   failure of another job begins a new wait. The wait ends, and the file is
   removed, at the first poll in which no call ends in a transport error.
+  - A claim that spends its tries on a transport error is part of the wait
+    and nothing else: it is not a held claim, so no "skipped" notice is sent
+    and no "reconciliation required" line is printed. The poll ends at that
+    job without claiming a later one, and the next poll claims it again. If
+    the hub did record the claim and only its answer was lost, the next
+    poll's list shows the job claimed by this run and the runner goes on
+    with it as its own, with no second claim.
   - One "A deployer CLI call failed" notice (`wake=routine`) per wait, for its
     first failure. Its request id is built from when the wait began.
   - **Bound: 10 minutes.** Once the wait has lasted that long, one "The
@@ -868,18 +877,21 @@ both hold:
     ago and has posted neither "Deployer now runs the published scripts" nor
     "Deployer is not claiming releases: ..." since. The wrapper keeps its
     heartbeat through such a restart, so the heartbeat does not hide it.
+  - *Hung.* It is heard from, but its release runner has reported no progress
+    for the progress bound (A hung runner, below).
 
 The deployer is the project's newest deployment agent that is neither retired
 nor closed. Retiring or closing it is deliberate and is not reported. A deployer
-on a long verification run keeps its heartbeat and is not reported, however
-long its claimed job stands.
+on a long verification run keeps its heartbeat, and its runner keeps reporting
+at every poll, so it is not reported, however long its claimed job stands.
 
 **Notice.** One directed notice per recipient: the primary database handler,
 unless it is retired, and the owner helper. A directed notice wakes its
 recipient once. The subject is "Deployer has gone silent while release jobs
-wait" or "Deployer announced a restart and did not come back", with refs
-`activity=deployer_liveness`, `reason=silent` or `reason=restart`,
-`deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
+wait", "Deployer announced a restart and did not come back" or "Deployer
+runner has made no progress while release jobs wait", with refs
+`activity=deployer_liveness`, `reason=silent`, `reason=restart` or
+`reason=hung`, `deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
 run and status, its last heartbeat, its last message (number, time and
 subject), how many jobs are `verified` and `claimed`, the oldest of them, the
 bound and the recovery.
@@ -892,8 +904,8 @@ episode is open and a job still waits; the other recipient is not sent a
 second one. A handler rotation inside an episode does not send a second
 handler copy. The episode ends, and the check re-arms, at the first tick that
 finds the deployer alive: a fresh heartbeat or message for a silent deployer,
-"Deployer now runs the published scripts" for a restart. A new deployer run
-also ends it.
+"Deployer now runs the published scripts" for a restart, a new progress report
+for a hung runner. A new deployer run also ends it.
 
 **Recovery.** The hub detects and wakes only. It never restarts, signals,
 replaces or messages the deployer, and it changes no release job. Whoever is
@@ -915,12 +927,84 @@ is too short by itself to make a deployer silent.
 other fenced calls, when the deployer's heartbeat is more than 90 seconds old
 ("deployment heartbeat stale"). Both rules read the hub's own clock.
 
-#### Not detected
+#### A hung runner
 
-A runner that hangs while its wrapper still heartbeats, and that announced no restart, is not detected.
-The hub has no signal that separates it from a long verification run: both
-show a fresh heartbeat and a job that stands still. Look at the release line
-when a job has stood longer than its matrix should take.
+A release runner can stop while its `tt wrap` wrapper goes on sending the
+heartbeat, with no restart announced. The heartbeat alone cannot show that, so
+the runner reports its own progress and the check above reads it
+(wi_95b575f0454c7052).
+
+**Signal.** The runner (`scripts/release-runner.mjs`, when started by
+`tt deployment serve`, for `--once` too) calls `tt deployment progress` once
+when it starts, at each new phase and step of a release, and at the end of
+every poll, a held poll included. The calls are made between steps and never
+from a timer, so a runner that stops also stops reporting. The hub keeps the
+last report of the deployer's current run, with its own clock as the time, in
+`release_deployer_progress` (one row per project). The wrapper heartbeat
+never writes it, and a report is not a release action: it writes no receipt,
+changes no job and wakes nobody.
+
+**Bound.** A deployer that is otherwise alive is *hung* when the last report of
+its current run is 10 minutes old or older. `TAILTERM_DEPLOYER_PROGRESS_MINUTES`
+in the hub's environment sets that bound, a whole number of minutes from 1 to
+1440; any other value, or none, gives 10. Everything else is the check above:
+a job must have stood in `verified` or `claimed` for N, there is one notice
+per recipient and episode, silence and an unfinished restart come first so one
+cause opens one episode, and nothing is restarted, signalled or changed. The
+notice adds the time, phase, step, job and wait of the last report.
+
+**A wait is information only.** Each poll's report names the wait the poll
+ended in: `matrix` (with the pid of the run when the runner knows it),
+`inputs`, `host_lock`, `fence`, `owner_hold` or `transport`. The hub decides
+nothing by it. A matrix run is a detached process and the runner goes on
+polling every 30 seconds beside it, reporting each time, so a long matrix run
+is never reported. A runner that stops reporting during a matrix run is
+reported at the bound like any other, and the notice names the matrix wait and
+its pid.
+
+**A runner that sends no reports.** With no report of the deployer's current
+run on record, only the silent and restart rules apply: a deployer from before
+this change is never reported as hung, and its hang is not detected. The same
+holds for a row left by an earlier run.
+
+**Rollback inside one deployer run.** A re-exec keeps the run, so a run can
+report and later lose the ability. Neither case is read as a hang, and neither
+needs a step by hand:
+
+- *The runner is rolled back.* A report older than the run's newest
+  "Deployer is restarting itself onto the published scripts" or "Deployer now
+  runs the published scripts" notice does not count: the scripts that sent it
+  may no longer run. A runner that reports again after such a notice counts
+  again within one poll.
+- *`tt` on the deployer's host is rolled back under a runner that still
+  reports.* The older `tt` rejects the report; the runner then sends one
+  withdraw (`tt deployment progress --request-id KEY`, a form the older `tt`
+  forwards), which clears the report and keeps the run judged as one that
+  never reported. Reports are still tried at every point and resume by
+  themselves.
+
+A hub rolled back to before this change leaves the table unused and refuses
+the calls; the runner ignores a failed report: it is tried once for at most ten
+seconds and is never recorded, retried or posted.
+
+**Limit.** A single step that runs longer than the bound without the runner
+getting back to a poll (one command may run ten minutes, the prerequisite
+provisioning fifteen) gives one notice for a healthy runner. Raise the bound
+if that recurs. A hang of the hub's own tick is not covered.
+
+**Command.** `tt deployment progress` prints the stored record: `agentId`,
+`runId`, `reportedAt`, `jobId`, `phase`, `step` and `wait`, all empty with
+nothing on record. A read needs no deployer identity, so the handler and the
+owner helper can read it. The deployer's run alone may write: `--phase P [--job J] [--step S] [--wait KIND] [--pid N]`
+reports and `--withdraw` withdraws. The hub refuses a write from any other
+agent or run, or with a heartbeat older than 90 seconds.
+
+**The manual check.** Until this check has passed its live check after
+release, the owner helper's sweep keeps flagging a release claimed for more
+than 50 minutes. Once the live check passes (a read shows the deployer's run
+with a `reportedAt` under a minute old, a later read shows a later time, and a
+normal release posts no hung notice), that manual 50-minute check can retire;
+the owner helper decides when.
 
 ### Handler requests and gating
 
@@ -1298,7 +1382,9 @@ released"). If that post fails the hold or release still stands; the command
 prints the notice text to post by hand. A hold the hub lifts by itself writes
 the history and the list but posts no notice. A hold saved between the runner's
 list read and its claim makes that one claim fail: the runner posts its usual
-"the hub refused its claim" notice once and goes on to the next job.
+"the hub refused its claim" notice once and goes on to the next job. That is
+for a claim the hub refuses; a claim that fails only in transport is not a
+held claim (A lasting transport wait, above).
 
 Which of the three to use:
 
@@ -1944,8 +2030,11 @@ deployer was not heard from, or after a restart it did not finish (A silent
 deployer, above). Nothing was restarted. Check the deployer's host and
 terminal, then run `tt deployment setup` for the deployer with the run named
 in the notice as predecessor. There is one notice per recipient until the
-deployer is seen alive again. A runner that hangs while its wrapper still
-heartbeats, with no restart announced, sends no such notice.
+deployer is seen alive again. A third notice, "Deployer runner has made no
+progress while release jobs wait", means the wrapper still heartbeats but the
+runner has sent no progress report for its bound (A hung runner, above); the
+recovery is the same. A runner from before that change sends no reports and
+gets no such notice.
 
 **Held claim.** A notice "A release job is skipped because the hub refused its
 claim" or "A release job is skipped because its set-aside journal is held"
@@ -1953,7 +2042,9 @@ means a `verified` job is not being released and will not be until someone
 acts: the deployer skips it at every poll, prints `Release claim held; handler
 reconciliation required.` (or `Set-aside release journal held; ...`) in its own
 terminal and goes on to later jobs. Nothing of that job was integrated,
-published or deployed, and it holds no project fence.
+published or deployed, and it holds no project fence. A claim that fails only
+in transport (the hub gave no answer) is not a held claim: it sends no such
+notice and belongs to the transport wait.
 
 - The text names the job, its item, the first 12 characters of its commit and a
   `Reason:`; the refs carry `release-job`, `item` and the full `commit`. For a

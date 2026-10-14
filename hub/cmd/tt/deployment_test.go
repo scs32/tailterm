@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -818,5 +819,103 @@ func TestDeploymentUnholdSendsRequestThenNotice(t *testing.T) {
 	h.failPost = true
 	if _, err = unhold("--job", h.job.ID, "--generation", "4", "--request-id", "unhold-2", "--reason", "Owner go again"); err == nil || !strings.Contains(err.Error(), "is released from its hold at generation 5") || !strings.Contains(err.Error(), "NOTICE: A release job hold was released") {
 		t.Fatal("failed unhold notice", err)
+	}
+}
+
+// wi_95b575f0454c7052 a3: tt deployment progress reports, withdraws and reads
+// through operation progress, with the caller's exact agent and run.
+func TestDeploymentProgress(t *testing.T) {
+	task, job := "tsk_0123456789abcdef", "rel_0123456789abcdef"
+	stored := api.ReleaseProgress{AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", ReportedAt: "2026-10-13T18:00:00Z", JobID: job, Phase: "merged", Wait: api.ReleaseProgressWait{Kind: "matrix", PID: 7}}
+	var requests []api.ReleaseRequest
+	var bodies []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || !strings.HasSuffix(r.URL.Path, "/v1/tasks/"+task+"/releases/actions") {
+			t.Error("unexpected request", r.Method, r.URL.String())
+		}
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(raw))
+		var req api.ReleaseRequest
+		_ = json.Unmarshal(raw, &req)
+		requests = append(requests, req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(stored)
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, agent: stored.AgentID, runID: stored.RunID}
+	run := func(args ...string) (string, error) {
+		return captureCLIOutput(t, func() error { return cmdDeployment(e, append([]string{"progress"}, args...)) })
+	}
+	last := func() api.ReleaseRequest { return requests[len(requests)-1] }
+	identified := func(at string) {
+		t.Helper()
+		if r := last(); r.Operation != "progress" || r.AgentID != e.agent || r.RunID != e.runID {
+			t.Fatalf("%s: %+v", at, r)
+		}
+	}
+
+	if _, err := run("--phase", "merged", "--job", job, "--wait", "matrix", "--pid", "7"); err != nil {
+		t.Fatal(err)
+	}
+	identified("report")
+	if r := last(); r.RequestID != "" || r.Progress == nil || *r.Progress != (api.ReleaseProgress{JobID: job, Phase: "merged", Wait: api.ReleaseProgressWait{Kind: "matrix", PID: 7}}) {
+		t.Fatalf("report: %+v %+v", r, r.Progress)
+	}
+	if _, err := run("--phase", "claimed", "--step", "prerequisites"); err != nil {
+		t.Fatal(err)
+	}
+	if r := last(); r.Progress == nil || *r.Progress != (api.ReleaseProgress{Phase: "claimed", Step: "prerequisites"}) {
+		t.Fatalf("report with a step: %+v", r.Progress)
+	}
+
+	if _, err := run("--withdraw"); err != nil {
+		t.Fatal(err)
+	}
+	identified("withdraw")
+	if r := last(); r.Progress != nil || r.RequestID != "progress-withdraw-"+e.runID || strings.Contains(bodies[len(bodies)-1], `"progress":`) {
+		t.Fatalf("withdraw: %+v %s", r, bodies[len(bodies)-1])
+	}
+	// The form a tt from before this command sends: its generic path forwards
+	// the operation, agent, run and request id. It withdraws here too.
+	if _, err := run("--request-id", "progress-withdraw-old"); err != nil {
+		t.Fatal(err)
+	}
+	identified("old form")
+	if r := last(); r.Progress != nil || r.RequestID != "progress-withdraw-old" {
+		t.Fatalf("old form: %+v", r)
+	}
+
+	output, err := run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identified("read")
+	if r := last(); r.Progress != nil || r.RequestID != "" {
+		t.Fatalf("read: %+v", r)
+	}
+	for _, part := range []string{`"agentId": "` + stored.AgentID + `"`, `"runId": "` + stored.RunID + `"`, `"reportedAt": "2026-10-13T18:00:00Z"`, `"phase": "merged"`, `"kind": "matrix"`, `"pid": 7`} {
+		if !strings.Contains(output, part) {
+			t.Fatalf("read output lacks %s: %s", part, output)
+		}
+	}
+
+	sent := len(requests)
+	for name, args := range map[string][]string{"both forms": {"--phase", "poll", "--withdraw"}, "wait without a phase": {"--wait", "matrix"}, "job without a phase": {"--job", job}} {
+		if _, err := run(args...); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+	anonymous := env{hub: hub.URL, task: task}
+	for name, args := range map[string][]string{"report": {"--phase", "poll"}, "withdraw": {"--withdraw"}} {
+		if _, err := captureCLIOutput(t, func() error { return cmdDeployment(anonymous, append([]string{"progress"}, args...)) }); err == nil || !strings.Contains(err.Error(), "agent/run") {
+			t.Fatalf("%s without an agent run: %v", name, err)
+		}
+	}
+	if len(requests) != sent {
+		t.Fatalf("refused calls reached the hub: %d", len(requests)-sent)
+	}
+	// A read needs no agent identity: the handler and the owner helper read it.
+	if _, err := captureCLIOutput(t, func() error { return cmdDeployment(anonymous, []string{"progress"}) }); err != nil || last().AgentID != "" {
+		t.Fatal(err, last())
 	}
 }

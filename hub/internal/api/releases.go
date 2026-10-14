@@ -407,6 +407,27 @@ type ReleaseRequest struct {
 	HandRelease        *HandRelease           `json:"handRelease,omitempty"`
 	Retry              *ReleaseRetry          `json:"retry,omitempty"`
 	Hold               *ReleaseHold           `json:"hold,omitempty"`
+	Progress           *ReleaseProgress       `json:"progress,omitempty"`
+}
+
+// ReleaseProgressWait is the wait a release runner's poll ended in. It is
+// information for the hung notice and for people; the hub decides nothing by it.
+type ReleaseProgressWait struct {
+	Kind string `json:"kind,omitempty"`
+	PID  int64  `json:"pid,omitempty"`
+}
+
+// ReleaseProgress is the release runner's own progress report for one
+// deployer run. A report carries the job, phase, step and wait; the hub sets
+// the agent, the run and the time. All fields are empty with nothing on record.
+type ReleaseProgress struct {
+	AgentID    string              `json:"agentId"`
+	RunID      string              `json:"runId"`
+	ReportedAt string              `json:"reportedAt"`
+	JobID      string              `json:"jobId"`
+	Phase      string              `json:"phase"`
+	Step       string              `json:"step"`
+	Wait       ReleaseProgressWait `json:"wait"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {
@@ -419,6 +440,16 @@ func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequ
 func (c *Client) ReleaseHandler(ctx context.Context, task, agent, run string) (Agent, error) {
 	var out Agent
 	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", ReleaseRequest{Operation: "handler", AgentID: agent, RunID: run}, &out)
+	return out, err
+}
+
+// ReleaseProgress is operation progress: with req.Progress it reports the
+// deployer run's progress, with only a request id it withdraws the run's
+// report, and with neither it reads the stored record.
+func (c *Client) ReleaseProgress(ctx context.Context, task string, req ReleaseRequest) (ReleaseProgress, error) {
+	var out ReleaseProgress
+	req.Operation = "progress"
+	err := c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/releases/actions", req, &out)
 	return out, err
 }
 
