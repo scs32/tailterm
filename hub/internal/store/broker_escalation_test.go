@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -338,4 +339,178 @@ func TestEscalationSaysTimeSinceProgress(t *testing.T) {
 			t.Fatalf("stall line: %q", stall[0].Envelope.Body.Text)
 		}
 	})
+}
+
+// report records the holder's activity at +d: a matrix wait when w is set,
+// or no wait at all.
+func (f *escalationFixture) report(t *testing.T, a api.Agent, state string, w *api.MatrixWait, d time.Duration) {
+	t.Helper()
+	f.at(d)
+	activity := api.AgentActivity{State: state, ObservedAt: f.c.Add(d), MatrixWait: w}
+	if _, err := f.st.ReportActivity(f.ctx, f.task.ID, a.ID, api.ActivityReport{RequestID: fmt.Sprintf("matrix-%s-%s", a.RunID, d), RunID: a.RunID, Activity: activity}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// silentRun ticks once a minute from +from to +limit and appends o's steps,
+// stamped with their time, to steps. Nothing happens before the +32m nudge,
+// so callers start near it; each tick sweeps every project in the store.
+// The project stall notice follows an owner escalation by 15 minutes, as it
+// does today.
+func (f *escalationFixture) silentRun(t *testing.T, o api.Obligation, from, limit time.Duration, steps []string) []string {
+	t.Helper()
+	for d := from; d <= limit; d += time.Minute {
+		for _, s := range f.tick(t, o, d) {
+			steps = append(steps, s+"@"+d.String())
+		}
+	}
+	return steps
+}
+
+// wi_c7e55118ae8e7780 (o1-o3): a holder whose current run waits for or
+// holds the host's matrix lock has a known reason and resume condition, so
+// the owner escalation waits; the lead still hears on time. Once the wait
+// ends, the owner hears a full lead window (15 minutes) after its end. An
+// acknowledged obligation due at +45m with no progress is nudged at +32m,
+// goes to the lead at +46m and, without a wait, to the owner at +61m.
+func TestMatrixWaitHoldsOwnerEscalation(t *testing.T) {
+	waiting := func(f *escalationFixture, since time.Duration) *api.MatrixWait {
+		return &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 2, Since: f.c.Add(since)}
+	}
+	cases := []struct {
+		name string
+		// mid runs after the +40m tick; ticks resume at +41m.
+		mid   func(t *testing.T, f *escalationFixture)
+		steps []string
+		owner int
+	}{
+		{name: "waiting for the host", mid: func(t *testing.T, f *escalationFixture) {
+			f.report(t, f.builder, "idle", waiting(f, 0), 40*time.Minute)
+		}, steps: []string{"nudge@32m0s", "escalate-lead@46m0s"}},
+		{name: "holding the host", mid: func(t *testing.T, f *escalationFixture) {
+			f.report(t, f.builder, "working", &api.MatrixWait{Role: api.MatrixWaitRunning, Since: f.c.Add(40 * time.Minute)}, 40*time.Minute)
+		}, steps: []string{"nudge@32m0s", "escalate-lead@46m0s"}},
+		{name: "wait ends while overdue", mid: func(t *testing.T, f *escalationFixture) {
+			f.report(t, f.builder, "idle", waiting(f, 0), 40*time.Minute)
+			f.report(t, f.builder, "idle", nil, 70*time.Minute+30*time.Second)
+		}, steps: []string{"nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h26m0s", "project-stalled@1h41m0s"}, owner: 1},
+		{name: "no wait", mid: func(t *testing.T, f *escalationFixture) {
+			f.report(t, f.builder, "working", nil, 40*time.Minute)
+		}, steps: []string{"nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s"}, owner: 1},
+		{name: "wait on an earlier run", mid: func(t *testing.T, f *escalationFixture) {
+			f.report(t, f.builder, "idle", waiting(f, 0), 40*time.Minute)
+			exited := api.AgentExited
+			if _, err := f.st.UpdateAgent(f.ctx, f.builder.ID, api.UpdateAgentRequest{Status: &exited}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			next, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "builder", Host: "h", Session: "builder", Runtime: "codex"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next.ID != f.builder.ID || next.RunID == f.builder.RunID {
+				t.Fatalf("restart: agent %s run %s, was %s run %s", next.ID, next.RunID, f.builder.ID, f.builder.RunID)
+			}
+		}, steps: []string{"nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s"}, owner: 1},
+	}
+	shared := newEscalationFixture(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := shared.fresh(t)
+			o := f.assign(t, f.builder, "45m")
+			f.act(t, o, f.builder, "ack", time.Minute)
+			steps := f.silentRun(t, o, 30*time.Minute, 40*time.Minute, nil)
+			tc.mid(t, f)
+			steps = f.silentRun(t, o, 41*time.Minute, 2*time.Hour, steps)
+			wantSteps(t, tc.name, steps, tc.steps...)
+			if lead, owner := len(f.notices(t, o, "lead")), len(f.notices(t, o, "owner")); lead != 1 || owner != tc.owner {
+				t.Fatalf("lead %d owner %d, want 1 and %d", lead, owner, tc.owner)
+			}
+		})
+	}
+	// A wait that ended more than a lead window before the owner escalation
+	// is due does not delay it.
+	t.Run("wait ended long before", func(t *testing.T) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.act(t, o, f.builder, "ack", time.Minute)
+		f.report(t, f.builder, "idle", waiting(f, 0), 5*time.Minute)
+		f.report(t, f.builder, "idle", nil, 10*time.Minute)
+		steps := f.silentRun(t, o, 30*time.Minute, 90*time.Minute, nil)
+		wantSteps(t, "ended early", steps, "nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s")
+	})
+	// The lead holds the obligation, so its escalation would go straight to
+	// the owner: it waits out the matrix wait and its window too.
+	t.Run("lead holds", func(t *testing.T) {
+		f := shared.fresh(t)
+		m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, Envelope: &api.Envelope{
+			Kind: api.EnvelopeKindRequest, To: f.lead.Name, Subject: "Decide how the release proceeds", Due: "45m", Body: api.EnvelopeBody{Ask: "Decide the release."}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := f.obligation(t, m.Seq, f.lead)
+		f.act(t, o, f.lead, "ack", time.Minute)
+		steps := f.silentRun(t, o, 30*time.Minute, 40*time.Minute, nil)
+		f.report(t, f.lead, "idle", waiting(f, 0), 40*time.Minute)
+		steps = f.silentRun(t, o, 41*time.Minute, 2*time.Hour, steps)
+		f.report(t, f.lead, "idle", nil, 2*time.Hour)
+		steps = f.silentRun(t, o, 2*time.Hour+time.Minute, 2*time.Hour+40*time.Minute, steps)
+		wantSteps(t, "lead holds", steps, "nudge@32m0s", "escalate-lead@2h15m0s", "project-stalled@2h30m0s")
+		if lead, owner := len(f.notices(t, o, "lead")), len(f.notices(t, o, "owner")); lead != 0 || owner != 1 {
+			t.Fatalf("lead %d owner %d, want 0 and 1", lead, owner)
+		}
+	})
+}
+
+// wi_c7e55118ae8e7780 (o3): a block on a queued fix behaves as before the
+// matrix-wait rule: no owner escalation while the entry is queued, and the
+// next pass after it leaves the queue escalates to the owner.
+func TestQueuedFixBlockUnchangedByMatrixWaitRule(t *testing.T) {
+	f := newEscalationFixture(t)
+	handler, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Role: api.AgentRoleDatabaseHandler, Host: "h", Session: "db-handler", Runtime: "codex"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.PostEvent(f.ctx, f.task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	item, err := f.st.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "The fix the block waits on", RequestID: "queued-fix"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "bounded fix order", RequestID: "queued-fix-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "queued-fix-scope", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "queued-fix-add", Operation: "add", ItemID: item.ID, OrderMessageSeq: order.Seq, Host: "h", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := f.assign(t, f.builder, "45m")
+	f.act(t, o, f.builder, "ack", time.Minute)
+	f.at(2 * time.Minute)
+	if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.builder.ID, RunID: f.builder.RunID, To: f.lead.ID, ReplyTo: o.MessageSeq,
+		AuditKind: api.MessageAuditWork, RequestID: "block-" + o.ID, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}},
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindBlock, To: f.lead.Name, Subject: "Blocked until the queued fix lands", Body: api.EnvelopeBody{Reason: "the fix is queued", Needs: "the queued fix", ResumeWhen: "the fix is released"}}}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	for d := 10 * time.Minute; d <= 4*time.Hour; d += 10 * time.Minute {
+		for _, s := range f.tick(t, o, d) {
+			if s == "escalate-owner" {
+				t.Fatalf("owner escalation at +%s for a block on a queued fix", d)
+			}
+		}
+	}
+	if n := len(f.notices(t, o, "owner")); n != 0 {
+		t.Fatalf("%d owner notices", n)
+	}
+	if _, err := f.st.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "remove-fix", Operation: "remove", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	wantSteps(t, "after the entry left the queue", f.tick(t, o, 4*time.Hour+time.Minute), "escalate-owner")
+	if n := len(f.notices(t, o, "owner")); n != 1 {
+		t.Fatalf("%d owner notices", n)
+	}
 }

@@ -126,6 +126,30 @@ func blockedOnQueuedFix(ctx context.Context, q queryRower, o BrokerObligation) (
 	return queued > 0, err
 }
 
+// ErrBrokerMatrixWait means an owner escalation was held back because the
+// holder is in a matrix wait. It wraps ErrBrokerQueuedFix, so the scheduler
+// skips it the same way: the owner escalation is decided afresh next tick.
+var ErrBrokerMatrixWait = fmt.Errorf("obligation holder is in a matrix wait: %w", ErrBrokerQueuedFix)
+
+// inMatrixWait reports whether the holder's current run is waiting for or
+// holding the host's matrix lock, or ended that wait less than
+// ObligationOwnerAfterLead ago, as the activity report recorded it in
+// stall_watch_progress. The holder has a known reason and a known resume
+// condition, so the owner hears only after a full lead window from the
+// wait's end. A wait recorded on an earlier run does not count.
+func inMatrixWait(ctx context.Context, q queryRower, o BrokerObligation, now time.Time) (bool, error) {
+	var waiting bool
+	var ended string
+	err := q.QueryRowContext(ctx, `SELECT p.matrix_wait,p.wait_ended_at FROM agents a JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id WHERE a.id=?`, o.AgentID).Scan(&waiting, &ended)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return waiting || (ended != "" && now.Sub(parseTS(ended)) < api.ObligationOwnerAfterLead), nil
+}
+
 // brokerAct runs fn only if the obligation is exactly as the scheduler saw it
 // and its project is still open and not paused.
 func (s *Store) brokerAct(ctx context.Context, o BrokerObligation, fn func(*sql.Tx, api.Task) error) error {
@@ -273,6 +297,12 @@ func (s *Store) BrokerEscalate(ctx context.Context, o BrokerObligation, level in
 			}
 			if held {
 				return ErrBrokerQueuedFix
+			}
+			if held, err = inMatrixWait(ctx, tx, o, now); err != nil {
+				return err
+			}
+			if held {
+				return ErrBrokerMatrixWait
 			}
 		}
 		who := o.AgentName

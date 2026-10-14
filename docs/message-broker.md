@@ -193,7 +193,7 @@ One obligation per (message, recipient). States:
 | ack deadline | 10 min after `delivered` | `overdue_ack`, re-wake once, then escalate to lead |
 | progress silence | 30 min in `acknowledged`/`working` without progress | nudge recipient; after 2 nudges escalate to lead |
 | outcome due | `due`, or 2 h for assign/review, 30 min for question | escalate to lead |
-| lead escalation unanswered | 15 min | escalate to owner (Discord) |
+| lead escalation unanswered | 15 min | escalate to owner (Discord); held while the holder is in a matrix wait, then 15 min after the wait ends |
 | helper watch ([stall-watch.md](stall-watch.md)) | 20 min with no post and no `working` report while the owner helper owes the owner | one owner ping per episode; from 22:00 to 07:00 Pacific a channel line, then one ping at 07:00 if still open |
 | team watch ([stall-watch.md](stall-watch.md)) | 30 min with no post, no `working` report and no matrix wait from a running queue entry's team | one notice per episode to the owner helper, or to the owner when the helper is quiet, offline or absent |
 
@@ -207,6 +207,17 @@ One obligation per (message, recipient). States:
   that entry finishes, is removed, fails or is released, the next pass escalates
   normally. The obligation a BLOCK reply creates on its own recipient is a
   separate obligation and is not covered by this rule.
+
+- **A holder in a matrix wait does not page the owner.** While the holder's
+  current run reports that it is waiting for or holding the host's matrix lock
+  (`stall_watch_progress.matrix_wait`, written by the activity report), the
+  broker posts no owner escalation for its obligations: the wait is a known
+  reason with a known resume condition. The lead escalation still happens on
+  time; an obligation the lead holds, which would otherwise go straight to the
+  owner, waits too. Once the wait ends (`wait_ended_at`), an obligation that is
+  still overdue reaches the owner only after a full lead window (15 min)
+  counted from the wait's end. A wait recorded on an earlier run of the agent
+  does not count.
 
 - **Turn-end enforcement.** The existing `tt hook stop` already blocks a Claude turn
   from ending while unread messages exist. It changes to "while this run holds
