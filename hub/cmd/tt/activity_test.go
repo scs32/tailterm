@@ -128,8 +128,10 @@ func TestActivityStates(t *testing.T) {
 	check("planned wait", c, 0, true, true, nil, "working")
 	waiting := a
 	waiting.Status = api.AgentNeedsInput
-	if got := activityState(&c, waiting, 1, true, true, nil, now, threshold); got.State != "unknown" || got.Reason != "planned wait or input required" {
-		t.Fatalf("planned dependency classified as failure: %+v", got)
+	// A needs_input agent whose turn is still open runs the pending call: it
+	// works, and its age is no hung tool (wi_5da56e4bb0fd877e).
+	if got := activityState(&c, waiting, 1, true, true, nil, now, threshold); got.State != "working" || got.Reason != "" || got.PendingTool != "sleep" {
+		t.Fatalf("needs_input with an open turn and a pending call: %+v", got)
 	}
 	c = base
 	c.TurnComplete = true
@@ -152,6 +154,123 @@ func TestActivityStates(t *testing.T) {
 	check("worktree breaks loop", c, 0, true, true, nil, "working")
 	c.Worktree = ""
 	check("unknown worktree cannot prove loop", c, 0, true, true, nil, "working")
+}
+
+// Synthetic Claude records for a needs_input agent's long Bash call: the
+// call starts 40 minutes before the check, then returns and the turn ends.
+const (
+	needsInputPrompt  = `{"type":"user","timestamp":"2026-09-25T19:19:50.000Z","message":{"role":"user","content":"Synthetic fixture prompt."}}`
+	needsInputBash    = `{"type":"assistant","timestamp":"2026-09-25T19:20:00.000Z","message":{"id":"msg_fixture_needs_input_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_fixture_needs_input","name":"Bash","input":{"command":"synthetic"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}}`
+	needsInputResult  = `{"type":"user","timestamp":"2026-09-25T19:59:30.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fixture_needs_input"}]}}`
+	needsInputEndTurn = `{"type":"assistant","timestamp":"2026-09-25T19:59:40.000Z","message":{"id":"msg_fixture_needs_input_2","role":"assistant","content":[{"type":"text","text":"Synthetic reply."}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+)
+
+// q1 (wi_5da56e4bb0fd877e): a needs_input agent whose turn is still open
+// reports working on a pending call of any age or recent evidence; a completed,
+// unseen or unreadable turn is the planned wait it was before.
+func TestActivityNeedsInputOpenTurn(t *testing.T) {
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	threshold := activityThresholds{Working: 120 * time.Second, Hung: 10 * time.Minute, Loop: 5 * time.Minute, LoopCalls: 5, CrashProbe: 15 * time.Second}
+	waiting := api.Agent{Status: api.AgentNeedsInput}
+	stale := now.Add(-40 * time.Minute)
+	open := activityCursor{SeenTurn: true, LastEventAt: stale}
+	pending := open
+	pending.Pending = map[string]pendingActivityCall{"t": {Name: "Bash", Since: stale}}
+	recent := open
+	recent.LastEventAt = now.Add(-30 * time.Second)
+	edited := open
+	edited.WorktreeChangedAt = now.Add(-10 * time.Second)
+	looping := recent
+	looping.Worktree = "same"
+	for i := 0; i < 5; i++ {
+		looping.Completed = append(looping.Completed, completedActivityCall{Signature: "tool:abc", At: now.Add(-time.Duration(5-i) * time.Minute), Tokens: int64(i + 1), Worktree: "same"})
+	}
+	complete := pending
+	complete.TurnComplete = true
+	unknown := pending
+	unknown.Unknown = true
+	unseen := pending
+	unseen.SeenTurn = false
+	for _, tc := range []struct {
+		name         string
+		c            activityCursor
+		state        string
+		reason, tool string
+	}{
+		{"pending call 40 minutes old", pending, "working", "", "Bash"},
+		{"recent transcript record", recent, "working", "", ""},
+		{"recent worktree change", edited, "working", "", ""},
+		{"repeated calls are not looping", looping, "working", "", ""},
+		{"open turn with no evidence", open, "unknown", "no recent execution evidence", ""},
+		{"completed turn", complete, "unknown", "planned wait or input required", ""},
+		{"unrecognized transcript", unknown, "unknown", "planned wait or input required", ""},
+		{"no turn seen", unseen, "unknown", "planned wait or input required", ""},
+	} {
+		c := tc.c
+		got := activityState(&c, waiting, 1, true, true, nil, now, threshold)
+		if got.State != tc.state || got.Reason != tc.reason || got.PendingTool != tc.tool {
+			t.Errorf("%s: %+v, want %s %q tool %q", tc.name, got, tc.state, tc.reason, tc.tool)
+		}
+	}
+
+	// q3: the same rule over records read by the real Claude parser.
+	var c activityCursor
+	for _, record := range []string{needsInputPrompt, needsInputBash} {
+		if err := parseClaudeActivity([]byte(record), &c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := activityState(&c, waiting, 0, true, true, nil, now, threshold); got.State != "working" || got.PendingTool != "Bash" || !got.PendingSince.Equal(stale) {
+		t.Fatalf("needs_input with Bash pending 40 minutes: %+v", got)
+	}
+	// The running rules are unchanged: the same call is a hung tool there.
+	if got := activityState(&c, api.Agent{Status: api.AgentRunning}, 0, true, true, nil, now, threshold); got.State != "hung_tool" {
+		t.Fatalf("running with Bash pending 40 minutes: %+v", got)
+	}
+	for _, record := range []string{needsInputResult, needsInputEndTurn} {
+		if err := parseClaudeActivity([]byte(record), &c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := activityState(&c, waiting, 1, true, true, nil, now, threshold); got.State != "unknown" || got.Reason != "planned wait or input required" {
+		t.Fatalf("needs_input after the turn ended: %+v", got)
+	}
+}
+
+// q2 (wi_5da56e4bb0fd877e): the relay reports working to the hub for a
+// needs_input member whose Bash call has run 40 minutes, which the team watch
+// counts as never quiet (internal/store/stall_watch.go, stallTeam.neverQuiet), and a non-working
+// state once that turn has ended.
+func TestActivityNeedsInputTickReportsOpenTurn(t *testing.T) {
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "claude")
+	h.agent.Status = api.AgentNeedsInput
+	path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+	if err := os.WriteFile(path, []byte(needsInputPrompt+"\n"+needsInputBash+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 25, 20, 0, 0, 0, time.UTC)
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].State != "working" || h.reports[0].PendingTool != "Bash" {
+		t.Fatalf("open turn reports %+v", h.reports)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(needsInputResult + "\n" + needsInputEndTurn + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := tick(now.Add(16 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 || h.reports[1].State != "unknown" || h.reports[1].Reason != "planned wait or input required" {
+		t.Fatalf("ended turn reports %+v", h.reports)
+	}
 }
 
 func TestActivityToolCallPairing(t *testing.T) {

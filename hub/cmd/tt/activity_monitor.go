@@ -122,8 +122,18 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		}
 	}
 	if a.Status == api.AgentNeedsInput {
-		result.Reason = "planned wait or input required"
-		return result
+		// The roster status may predate a turn that is still running. Only a
+		// completed, unseen or unreadable turn is a planned wait; an open turn
+		// is judged on its transcript below, without the hung or looping rules.
+		if c.Unknown || !c.SeenTurn || c.TurnComplete {
+			result.Reason = "planned wait or input required"
+			return result
+		}
+		// A pending tool call is working however long it runs.
+		if pending := oldestPending(c); !pending.Since.IsZero() {
+			result.State, result.PendingTool, result.PendingSince = "working", pending.Name, pending.Since
+			return result
+		}
 	}
 	if c.Unknown {
 		result.Reason = "unrecognized transcript format"
