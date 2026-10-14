@@ -217,7 +217,7 @@ func TestHubReachOpensAfterThreeMinutesWithOneAlert(t *testing.T) {
 		t.Fatalf("sends %q", f.kinds())
 	}
 	alert := f.sends[0]
-	if alert.Nonce != fmt.Sprintf("hra-%d", start.Unix()) || alert.Ref != "ref hub-reach alert testhost-"+fmt.Sprint(start.Unix()) || !strings.HasSuffix(alert.Text, "\n"+alert.Ref) {
+	if alert.Nonce != fmt.Sprintf("hra-%s-%d", hubReachHostHash("testhost"), start.Unix()) || alert.Ref != "ref hub-reach alert testhost-"+fmt.Sprint(start.Unix()) || !strings.HasSuffix(alert.Text, "\n"+alert.Ref) {
 		t.Fatalf("alert identity %+v", alert)
 	}
 	for _, part := range []string{"testhost", "100.116.238.37", hubReachNoRoute, "route=not-tunnel dns=present", "changed no network setting and recovered nothing", "record why it stopped", filepath.Join(f.dir, hubReachMarkerFile)} {
@@ -321,7 +321,7 @@ func TestHubReachRecoveryLine(t *testing.T) {
 		t.Fatalf("sends %q", f.kinds())
 	}
 	alert, rec := f.sends[0], f.sends[1]
-	if rec.Nonce != fmt.Sprintf("hrr-%d", start.Unix()) || rec.Nonce == alert.Nonce || rec.Ref == alert.Ref || !strings.HasPrefix(rec.Ref, "ref hub-reach recovery ") || !strings.HasSuffix(rec.Text, "\n"+rec.Ref) {
+	if rec.Nonce != fmt.Sprintf("hrr-%s-%d", hubReachHostHash("testhost"), start.Unix()) || rec.Nonce == alert.Nonce || rec.Ref == alert.Ref || !strings.HasPrefix(rec.Ref, "ref hub-reach recovery ") || !strings.HasSuffix(rec.Text, "\n"+rec.Ref) {
 		t.Fatalf("recovery identity %+v", rec)
 	}
 	for _, part := range []string{"outage began at " + hubReachStamp(start), "reachable again at " + hubReachStamp(end), "duration 5m30s", hubReachNoRoute} {
@@ -329,8 +329,8 @@ func TestHubReachRecoveryLine(t *testing.T) {
 			t.Fatalf("recovery text lacks %q:\n%s", part, rec.Text)
 		}
 	}
-	if strings.Contains(rec.Text, "No alert was delivered") {
-		t.Fatalf("recovery text denies a delivered alert:\n%s", rec.Text)
+	if strings.Contains(rec.Text, "No alert was delivered") || strings.Contains(rec.Text, "may not have been delivered") {
+		t.Fatalf("recovery text doubts a delivered alert:\n%s", rec.Text)
 	}
 	if len(f.boards) != 1 || f.boards[0].Task != "tsk_one" || !f.boards[0].At.Equal(end) || f.boards[0].Episode.ClosedAt.Sub(f.boards[0].Episode.FailingSince) != 5*time.Minute+30*time.Second {
 		t.Fatalf("board posts %+v", f.boards)
@@ -1229,7 +1229,7 @@ func TestHubReachTwoClosedEpisodesKeepTheirDeliveries(t *testing.T) {
 	if f.kinds() != "recovery,recovery" || len(f.boards) != 2 || len(f.w.state.Closed) != 0 {
 		t.Fatalf("sends %q, %d board posts, %d still closed", f.kinds(), len(f.boards), len(f.w.state.Closed))
 	}
-	if f.sends[0].Nonce != fmt.Sprintf("hrr-%d", first.Unix()) || f.sends[1].Nonce != fmt.Sprintf("hrr-%d", second.Unix()) || f.sends[0].Ref == f.sends[1].Ref {
+	if f.sends[0].Nonce != fmt.Sprintf("hrr-%s-%d", hubReachHostHash("testhost"), first.Unix()) || f.sends[1].Nonce != fmt.Sprintf("hrr-%s-%d", hubReachHostHash("testhost"), second.Unix()) || f.sends[0].Ref == f.sends[1].Ref {
 		t.Fatalf("recovery identities %q %q", f.sends[0].Nonce, f.sends[1].Nonce)
 	}
 	if f.boards[0].RequestID == f.boards[1].RequestID || !strings.Contains(f.boards[0].RequestID, fmt.Sprint(first.Unix())) || !strings.Contains(f.boards[1].RequestID, fmt.Sprint(second.Unix())) {
@@ -1380,7 +1380,7 @@ func TestHubReachRecoveryLineWithoutADeliveredAlert(t *testing.T) {
 		t.Fatalf("after recovery: sends %q", f.kinds())
 	}
 	text := f.sends[0].Text
-	if !strings.Contains(text, "outage began at "+hubReachStamp(start)) || !strings.Contains(text, "No alert was delivered for this outage.") || !strings.Contains(text, "duration 33m30s") {
+	if !strings.Contains(text, "outage began at "+hubReachStamp(start)) || !strings.Contains(text, "No alert was delivered for this outage.") || strings.Contains(text, "may not have been delivered") || !strings.Contains(text, "duration 33m30s") {
 		t.Fatalf("recovery text:\n%s", text)
 	}
 }
@@ -1545,5 +1545,169 @@ func TestHubReachStartAndStop(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, hubReachMarkerFile)); err == nil {
 		t.Fatal("a marker was written")
+	}
+}
+
+// An alert whose answer was lost and never settled by a read is unconfirmed
+// at recovery, not dropped: the recovery line says it may not have been
+// delivered, and the alert is neither sent nor read after the close.
+func TestHubReachUnconfirmedAlertAtRecovery(t *testing.T) {
+	f := newHubReachFake(t, hubReachAt(0, 10, 0))
+	f.sendDoes = func(m hubReachMessage) hubReachOutcome {
+		if m.Kind == "alert" {
+			return hubReachNoAnswer
+		}
+		return hubReachSent
+	}
+	f.findDoes = func(hubReachMessage) (bool, error) { return false, errors.New("read: 503") }
+	f.outage(hubReachNotTunnel)
+	f.ticks(3)
+	if got := f.w.state.Open.Alert.State; got != hubReachUnknown || len(f.finds) != 3 {
+		t.Fatalf("alert %s, %d reads", got, len(f.finds))
+	}
+	sends, finds := len(f.sends), len(f.finds)
+	f.up()
+	f.ticks(1)
+	if f.kinds() != strings.Repeat("alert,", sends)+"recovery" || len(f.finds) != finds {
+		t.Fatalf("at recovery: sends %q, %d reads (was %d)", f.kinds(), len(f.finds), finds)
+	}
+	rec := f.sends[len(f.sends)-1].Text
+	if !strings.Contains(rec, "may not have been delivered") || strings.Contains(rec, "No alert was delivered") {
+		t.Fatalf("recovery text:\n%s", rec)
+	}
+	if len(f.w.state.Closed) != 0 {
+		t.Fatalf("an unconfirmed alert kept the episode owed: %+v", f.w.state.Closed)
+	}
+	f.ticks(30)
+	if len(f.sends) != sends+1 || len(f.finds) != finds {
+		t.Fatalf("after the close: sends %q, %d reads", f.kinds(), len(f.finds))
+	}
+
+	// The recovery line is owed but not yet sent: the closed episode keeps
+	// the alert unconfirmed, and only the recovery line is sent or read.
+	g := newHubReachFake(t, hubReachAt(0, 10, 0))
+	g.sendDoes = func(hubReachMessage) hubReachOutcome { return hubReachRejected }
+	g.outage(hubReachNotTunnel)
+	g.w.state.Open.Alert.State = hubReachAttempting // a relay stopped mid-send
+	g.w.save()
+	g.reload()
+	g.findDoes = func(hubReachMessage) (bool, error) { return false, errors.New("read: 503") }
+	g.up()
+	g.ticks(1)
+	if len(g.w.state.Closed) != 1 || g.w.state.Closed[0].Alert.State != hubReachUnconfirmed || g.w.state.Closed[0].Alert.pending() {
+		t.Fatalf("closed episodes %+v", g.w.state.Closed)
+	}
+	g.reload()
+	g.sends, g.finds = nil, nil
+	g.sendDoes = nil
+	g.ticks(12)
+	if g.kinds() != "recovery" || len(g.finds) != 0 || len(g.w.state.Closed) != 0 {
+		t.Fatalf("after the close: sends %q, %d reads, %d closed", g.kinds(), len(g.finds), len(g.w.state.Closed))
+	}
+	if !strings.Contains(g.sends[0].Text, "may not have been delivered") {
+		t.Fatalf("recovery text:\n%s", g.sends[0].Text)
+	}
+}
+
+// The recovery line has one wording per state of the alert at the close.
+func TestHubReachRecoveryWordingByAlertState(t *testing.T) {
+	base := hubReachEpisode{ID: "testhost-1", Host: "testhost", Hub: "hub", FailingSince: hubReachAt(0, 10, 0), ClosedAt: hubReachAt(0, 10, 10), Class: hubReachNoRoute}
+	for _, c := range []struct{ state, want, not string }{
+		{hubReachDelivered, "", "alert"},
+		{hubReachUnconfirmed, "The alert for this outage got no answer from Discord and may not have been delivered.", "No alert was delivered"},
+		{hubReachDropped, "No alert was delivered for this outage.", "may not have been delivered"},
+	} {
+		e := base
+		e.Alert.State = c.state
+		text := hubReachMessageFor(e, "recovery", "marker").Text
+		body := strings.TrimSuffix(text, "ref hub-reach recovery testhost-1")
+		if (c.want != "" && !strings.Contains(text, c.want)) || strings.Contains(body, c.not) {
+			t.Fatalf("alert %s: recovery text:\n%s", c.state, text)
+		}
+	}
+	// What each state at the open episode becomes at the close.
+	for from, to := range map[string]string{
+		hubReachOwed: hubReachDropped, hubReachUnknown: hubReachUnconfirmed, hubReachAttempting: hubReachUnconfirmed,
+		hubReachDelivered: hubReachDelivered, hubReachNotOwed: hubReachNotOwed,
+	} {
+		f := newHubReachFake(t, hubReachAt(0, 10, 0))
+		f.settings.Owner = ""
+		f.outage(hubReachNotTunnel)
+		f.w.state.Open.Alert.State = from
+		f.w.closeEpisode(f.now)
+		if got := f.w.state.Closed[0].Alert.State; got != to {
+			t.Fatalf("alert %s closed as %s, want %s", from, got, to)
+		}
+	}
+}
+
+// With no owner configured, the no-owner line is logged once per episode,
+// with two episodes owing a Discord line at once, and the set of logged
+// episodes holds only episodes still kept.
+func TestHubReachNoOwnerLoggedOncePerEpisode(t *testing.T) {
+	const line = "no owner is configured"
+	f := newHubReachFake(t, hubReachAt(0, 10, 0))
+	f.settings.Owner = ""
+	f.outage(hubReachNotTunnel)
+	f.up()
+	f.ticks(1)
+	f.ticks(1)
+	f.outage(hubReachNotTunnel) // one closed, one open
+	f.ticks(10)
+	if f.w.state.Open == nil || len(f.w.state.Closed) != 1 || f.logCount(line) != 2 {
+		t.Fatalf("one closed and one open: %d closed, %d no-owner lines:\n%s", len(f.w.state.Closed), f.logCount(line), f.log.String())
+	}
+	f.up()
+	f.ticks(1)
+	f.ticks(10) // two closed
+	if len(f.w.state.Closed) != 2 || f.logCount(line) != 2 || len(f.w.noOwnerLogged) != 2 {
+		t.Fatalf("two closed: %d closed, %d no-owner lines, %d logged", len(f.w.state.Closed), f.logCount(line), len(f.w.noOwnerLogged))
+	}
+	if len(f.sends) != 0 {
+		t.Fatalf("sent with no owner: %q", f.kinds())
+	}
+	// Both recovery lines give up after 24 hours; their IDs leave the set.
+	f.at(f.now.Add(hubReachRetryFor + time.Minute))
+	if len(f.w.state.Closed) != 0 || len(f.w.noOwnerLogged) != 0 || f.logCount(line) != 2 {
+		t.Fatalf("after expiry: %d closed, %d logged, %d no-owner lines", len(f.w.state.Closed), len(f.w.noOwnerLogged), f.logCount(line))
+	}
+}
+
+// The Discord nonces carry a short host hash: at most 25 characters, the
+// same for one host and start across a restart, and different for two hosts
+// whose outages start in the same second.
+func TestHubReachNonceCarriesTheHost(t *testing.T) {
+	start := hubReachAt(0, 10, 0)
+	long := strings.Repeat("a-very-long-host-name.", 10) + "ts.net"
+	for _, kind := range []string{"alert", "recovery"} {
+		var nonces []string
+		for _, host := range []string{"testhost", "otherhost", long} {
+			e := hubReachEpisode{ID: fmt.Sprintf("%s-%d", host, start.Unix()), Host: host, FailingSince: start, ClosedAt: start.Add(time.Hour)}
+			n := hubReachMessageFor(e, kind, "marker").Nonce
+			if len(n) > 25 || n != hubReachMessageFor(e, kind, "marker").Nonce || !strings.HasSuffix(n, fmt.Sprintf("-%d", start.Unix())) {
+				t.Fatalf("%s nonce %q (%d characters) for %s", kind, n, len(n), host)
+			}
+			nonces = append(nonces, n)
+		}
+		if nonces[0] == nonces[1] || nonces[0] == nonces[2] || nonces[1] == nonces[2] {
+			t.Fatalf("two hosts share a %s nonce: %q", kind, nonces)
+		}
+	}
+
+	// A send repeated after a restart keeps its nonce.
+	f := newHubReachFake(t, start)
+	rejected := true
+	f.sendDoes = func(hubReachMessage) hubReachOutcome {
+		if rejected {
+			return hubReachRejected
+		}
+		return hubReachSent
+	}
+	f.outage(hubReachNotTunnel)
+	rejected = false
+	f.reload()
+	f.ticks(1)
+	if f.kinds() != "alert,alert" || f.sends[0].Nonce != f.sends[1].Nonce || f.w.state.Open.Alert.State != hubReachDelivered {
+		t.Fatalf("sends %q, nonces %q %q", f.kinds(), f.sends[0].Nonce, f.sends[1].Nonce)
 	}
 }

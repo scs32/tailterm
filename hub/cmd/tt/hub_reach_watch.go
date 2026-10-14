@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -77,6 +78,10 @@ const (
 	hubReachDelivered  = "delivered"
 	hubReachDropped    = "dropped"
 	hubReachExpired    = "expired"
+	// hubReachUnconfirmed: the alert's send got no answer and the episode
+	// closed before a read settled it, so Discord may have it. Like dropped,
+	// it is never sent or read again.
+	hubReachUnconfirmed = "unconfirmed"
 )
 
 // hubReachOutcome is what one Discord send came to.
@@ -215,9 +220,11 @@ type hubReachWatch struct {
 	d     hubReachDeps
 	state hubReachState
 
-	marker        string // the marker text last written
-	idleLogged    bool
-	noOwnerLogged string // the episode the missing owner was logged for
+	marker     string // the marker text last written
+	idleLogged bool
+	// noOwnerLogged holds the episodes the missing owner was logged for,
+	// only those still kept in the state.
+	noOwnerLogged map[string]bool
 }
 
 var hubReachPacific = func() *time.Location {
@@ -243,7 +250,7 @@ func hubReachStamp(t time.Time) string {
 // newHubReachWatch reads the saved state. A delivery found in attempting was
 // cut off by a relay stop, so whether Discord has it is unknown.
 func newHubReachWatch(d hubReachDeps) *hubReachWatch {
-	w := &hubReachWatch{d: d}
+	w := &hubReachWatch{d: d, noOwnerLogged: map[string]bool{}}
 	if data, err := os.ReadFile(filepath.Join(d.dir, hubReachStateFile)); err == nil {
 		if json.Unmarshal(data, &w.state) != nil {
 			w.state = hubReachState{}
@@ -390,7 +397,25 @@ func (w *hubReachWatch) step(ctx context.Context) {
 		}
 	}
 	w.state.Closed = kept
+	for id := range w.noOwnerLogged {
+		if !w.keeps(id) {
+			delete(w.noOwnerLogged, id)
+		}
+	}
 	w.save()
+}
+
+// keeps reports whether the episode is still in the state, open or closed.
+func (w *hubReachWatch) keeps(id string) bool {
+	if w.state.Open != nil && w.state.Open.ID == id {
+		return true
+	}
+	for _, e := range w.state.Closed {
+		if e.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *hubReachWatch) failed(ctx context.Context, now time.Time, hubURL string, call hubReachCall) {
@@ -438,8 +463,13 @@ func (w *hubReachWatch) closeEpisode(now time.Time) {
 		now.UTC().Format(time.RFC3339), e.FailingSince.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339),
 		hubReachDuration(e), e.Class)
 	// Only the recovery line is sent after recovery; it says when the outage
-	// began, so it stands without the alert.
-	if e.Alert.State != hubReachDelivered && e.Alert.State != hubReachNotOwed {
+	// began, so it stands without the alert. An alert whose answer was lost
+	// may be in the DM, and the recovery line says so.
+	switch e.Alert.State {
+	case hubReachDelivered, hubReachNotOwed:
+	case hubReachUnknown, hubReachAttempting:
+		e.Alert.State = hubReachUnconfirmed
+	default:
 		e.Alert.State = hubReachDropped
 	}
 	if e.OwnerVisible {
@@ -489,8 +519,8 @@ func (w *hubReachWatch) discord(ctx context.Context, settings hubReachSettings, 
 		return
 	}
 	if settings.Owner == "" {
-		if w.noOwnerLogged != e.ID {
-			w.noOwnerLogged = e.ID
+		if !w.noOwnerLogged[e.ID] {
+			w.noOwnerLogged[e.ID] = true
 			w.logf("no owner is configured (relay.json hubReachDiscordOwner); nothing is sent to Discord")
 		}
 		return
@@ -558,14 +588,24 @@ func (w *hubReachWatch) boardPosts(ctx context.Context, e *hubReachEpisode, hubA
 	}
 }
 
+// hubReachHostHash is a short hash of the host name for the nonce, so two
+// hosts whose outages start in the same second do not share one.
+func hubReachHostHash(host string) string {
+	h := fnv.New32a()
+	h.Write([]byte(host))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
 // hubReachMessageFor builds one of the two Discord messages of an episode.
-// The alert and the recovery line never share a nonce or a reference.
+// The alert and the recovery line never share a nonce or a reference. A
+// nonce is at most 23 characters, within Discord's 25.
 func hubReachMessageFor(e hubReachEpisode, kind, marker string) hubReachMessage {
 	start := e.FailingSince.Unix()
+	hostHash := hubReachHostHash(e.Host)
 	m := hubReachMessage{Kind: kind, After: e.OpenedAt.Add(-time.Minute)}
 	var b strings.Builder
 	if kind == "alert" {
-		m.Nonce = fmt.Sprintf("hra-%d", start)
+		m.Nonce = fmt.Sprintf("hra-%s-%d", hostHash, start)
 		m.Ref = "ref hub-reach alert " + e.ID
 		fmt.Fprintf(&b, "Host %s has not reached the Tailterm hub at %s since %s. Cause class: %s (%s); route=%s dns=%s.\n",
 			e.Host, e.Hub, hubReachStamp(e.FailingSince), e.Class, e.Detail, e.Route, e.DNS)
@@ -573,7 +613,7 @@ func hubReachMessageFor(e hubReachEpisode, kind, marker string) hubReachMessage 
 		b.WriteString("Before recovering, record why it stopped (the recovery prime directive).\n")
 		fmt.Fprintf(&b, "Marker file on the host: %s\n", marker)
 	} else {
-		m.Nonce = fmt.Sprintf("hrr-%d", start)
+		m.Nonce = fmt.Sprintf("hrr-%s-%d", hostHash, start)
 		m.Ref = "ref hub-reach recovery " + e.ID
 		fmt.Fprintf(&b, "Host %s reaches the Tailterm hub at %s again. The outage began at %s; reachable again at %s; duration %s. Cause class at opening: %s (%s)",
 			e.Host, e.Hub, hubReachStamp(e.FailingSince), hubReachStamp(e.ClosedAt), hubReachDuration(e), e.Class, e.Detail)
@@ -581,7 +621,11 @@ func hubReachMessageFor(e hubReachEpisode, kind, marker string) hubReachMessage 
 			fmt.Fprintf(&b, "; at the last failed probe: %s (%s)", e.LatestClass, e.LatestDetail)
 		}
 		b.WriteString(".\n")
-		if e.Alert.State != hubReachDelivered {
+		switch e.Alert.State {
+		case hubReachDelivered:
+		case hubReachUnconfirmed:
+			b.WriteString("The alert for this outage got no answer from Discord and may not have been delivered.\n")
+		default:
 			b.WriteString("No alert was delivered for this outage.\n")
 		}
 	}
