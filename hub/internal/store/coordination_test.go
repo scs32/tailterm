@@ -225,4 +225,16 @@ func TestProjectGoalWorkItemIDs(t *testing.T) {
 			t.Fatalf("unrelated update %+v: %+v %v", req, got, err)
 		}
 	}
+	// The settings dialog resends the goal with every save; an unchanged goal is not re-checked.
+	renamed := "renamed again"
+	got, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Name: &renamed, Goal: &legacy, Swarm: &swarm}, caller)
+	if err != nil || got.Goal != legacy || got.Name != renamed {
+		t.Fatalf("settings save with the unchanged goal: %+v %v", got, err)
+	}
+	changed := legacy + " soon"
+	_, err = s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Name: &name, Goal: &changed}, caller)
+	refused(err, foreign.ID)
+	if got, err := s.GetTask(ctx, task.ID); err != nil || got.Goal != legacy || got.Name != renamed {
+		t.Fatalf("refused change altered the project: %+v %v", got, err)
+	}
 }

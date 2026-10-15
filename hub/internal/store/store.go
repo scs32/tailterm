@@ -282,8 +282,11 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 		if !api.ValidText(*req.Goal, api.MaxTextLen) {
 			return t, api.ErrInvalid
 		}
-		if err := s.checkGoalItems(ctx, id, *req.Goal); err != nil {
-			return t, err
+		// Settings saves resend the goal unchanged; only a new goal is checked.
+		if *req.Goal != t.Goal {
+			if err := s.checkGoalItems(ctx, id, *req.Goal); err != nil {
+				return t, err
+			}
 		}
 		t.Goal = *req.Goal
 	}
