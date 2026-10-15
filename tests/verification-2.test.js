@@ -120,9 +120,13 @@ test("prepared binary reuse rejects source changes, tampering and a different ch
   writeFileSync(join(other, "hub", "go.mod"), "module fixture\n");
   await assert.rejects(prepareTestBinary({ ...options, root: other }), /No prepared/);
 });
-test("profile startup failure emits child exit, stderr and phase diagnostics", async () => {
+test("profile startup failure emits child exit, stderr and phase diagnostics", async (t) => {
   const root = new URL("..", import.meta.url).pathname;
   const dir = mkdtempSync(join(tmpdir(), "profile-startup-failure-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // The spawned check starts Vite before its readiness wait fails, so give it a
+  // cache of its own instead of the real check's .build/vite-cache directory.
+  const viteCacheRoot = join(dir, "vite-cache");
   const binary = join(dir, "hub");
   writeFileSync(binary, "#!/bin/sh\necho synthetic-startup-boom >&2\nexit 7\n");
   chmodSync(binary, 0o755);
@@ -132,7 +136,7 @@ test("profile startup failure emits child exit, stderr and phase diagnostics", a
   const result = spawnSync(process.execPath, ["tests/profile-sync-browser.mjs"], {
     cwd: root, encoding: "utf8", timeout: 120000,
     env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR,
-      TAILTERM_TEST_BINARIES: manifest },
+      TAILTERM_TEST_BINARIES: manifest, TAILTERM_VITE_CACHE_ROOT: viteCacheRoot },
   });
   assert.equal(result.error, undefined);
   assert.equal(result.signal, null);
