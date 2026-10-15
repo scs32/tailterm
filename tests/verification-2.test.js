@@ -920,6 +920,82 @@ console.log(JSON.stringify({
   ]);
 });
 
+test("the runner marks its home before the first go command", { timeout: 120000 }, async (t) => {
+  // wi_60dbbbe5b36bf66b m1: a stand-in go first on PATH logs, at every call,
+  // the provenance marker it finds in its HOME (the verifier home), then
+  // answers go env and builds a small executable, as above.
+  const tools = tempDir(t, "verification-home-marker-"),
+    goCalls = join(tools, "go-calls.log"),
+    output = tempDir(t, "verification-home-marker-logs-");
+  writeFileSync(
+    join(tools, "go"),
+    `#!/bin/sh\nif [ -f "$HOME/tailterm-cache.json" ]; then printf 'marker %s\\n' "$(tr -d '\\n' < "$HOME/tailterm-cache.json")" >> '${goCalls}'; ` +
+      `else printf 'no marker\\n' >> '${goCalls}'; fi\n${goEnvStandIn}[ "$1" = build ] || exit 1\nout=\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n` +
+      `[ -n "$out" ] || exit 1\nprintf '#!/bin/sh\\nexit 0\\n' > "$out" && chmod +x "$out"\n`,
+    { mode: 0o755 },
+  );
+  const f = browserFixture(t, { "profile-sync-browser.mjs": "import './test-binaries.mjs';" });
+  writeFileSync(join(f.cwd, "tests/test-binaries.mjs"), "export {};\n");
+  mkdirSync(join(f.cwd, "hub"));
+  writeFileSync(join(f.cwd, "hub/go.mod"), "module fixture\n\ngo 1.22\n");
+  const commit = commitChange(f, "hub/cmd/tt/main.go", "package main\n\nfunc main() {}\n", "hub tree");
+  const plan = makePlan({ baseCommit: commit, commit, owned: ["client/"] }, f.cwd);
+  writeFileSync(join(tools, "plan.json"), JSON.stringify(plan));
+  writeFileSync(
+    join(tools, "run.mjs"),
+    `import { mkdtempSync, existsSync, readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+const [runner, planFile, cwd, output] = process.argv.slice(2);
+const { runPlan } = await import(runner);
+let home = "", error = "";
+try {
+  await runPlan(JSON.parse(readFileSync(planFile, "utf8")), cwd, output, {
+    minFreeBytes: 0,
+    jobs: 1,
+    createHome: () => (home = mkdtempSync(join(realpathSync("/tmp"), "tv-"))),
+  });
+} catch (failure) {
+  error = failure.message;
+}
+console.log(JSON.stringify({ error, home, exists: existsSync(home), pid: process.pid }));
+`,
+  );
+  const child = spawn(
+    process.execPath,
+    [join(tools, "run.mjs"), new URL("../scripts/verify-matrix.mjs", import.meta.url).href, join(tools, "plan.json"), f.cwd, output],
+    {
+      cwd: f.cwd,
+      env: { ...process.env, PATH: tools + ":" + process.env.PATH, TAILTERM_MATRIX_HOST_LOCK: join(tools, "host.json") },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+  let stdout = "",
+    stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, stderr);
+  const result = JSON.parse(stdout.trim().split("\n").at(-1));
+  t.after(() => result.home && rmSync(result.home, { recursive: true, force: true }));
+  assert.equal(result.error, "");
+  const calls = readFileSync(goCalls, "utf8").split("\n").filter(Boolean);
+  assert(calls.length > 0, "the run made no go call");
+  for (const call of calls) assert.match(call, /^marker /, "a go command ran before the home was marked");
+  const marker = JSON.parse(calls[0].slice("marker ".length));
+  assert.equal(marker.version, 1);
+  assert.equal(marker.kind, "home");
+  assert.equal(marker.producer, "scripts/verify-matrix.mjs@" + commit);
+  assert.equal(marker.item, "unknown");
+  assert.equal(marker.run, output);
+  assert(!Number.isNaN(Date.parse(marker.createdAt)), marker.createdAt);
+  assert.deepEqual(marker.owns, ["go-build", "go/pkg/mod"]);
+  assert.equal(marker.keepHome, false);
+  assert.equal(marker.pid, result.pid);
+  assert.equal(marker.output, output);
+  assert(!result.exists, "the run removed its marked home");
+});
+
 test("candidate matrix weakening cannot replace the independently approved digest", (t) => {
   const f = fixture(t);
   const approved = digest(

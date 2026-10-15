@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -28,6 +31,18 @@ import (
 
 // Every fixture is a real Git repository in t.TempDir(); nothing here reads
 // the live repository, hub or relay state.
+
+// No test reads the host's /tmp verifier homes or probes its processes: the
+// /tmp pass is off unless a test names a fake root, and a test that reaches
+// the process probe without fakeHomeProbes fails at once.
+func init() {
+	verifyHomeTempRoot = func() string { return "" }
+	verifyHomeProbes = strayHomeProbes
+}
+
+func strayHomeProbes() homeProbes {
+	panic("a test reached the verifier home process probe without fakeHomeProbes or nativeHomeProbes")
+}
 
 type cleanupRepo struct {
 	root   string // canonical temp root
@@ -66,6 +81,9 @@ func resetCleanupProcessState(t *testing.T) {
 		closeoutHistoryReads.Clear()
 		keptWorktreeReceipts.Clear()
 		artifactAcceptedAfterWarning = sync.Once{}
+		verifyHomeTempPass.Lock()
+		verifyHomeTempPass.at, verifyHomeTempPass.claimed = time.Time{}, false
+		verifyHomeTempPass.Unlock()
 	}
 	reset()
 	t.Cleanup(reset)
@@ -3783,4 +3801,1015 @@ func TestWorktreeCleanupCloseoutSkipsQuietlyWhileASweepHoldsTheLock(t *testing.T
 		t.Fatalf("closeout with the lock free: %v, said %q", err, said)
 	}
 	requireExists(t, cwd, false)
+}
+
+// Verifier homes (wi_60dbbbe5b36bf66b). Every home is a fixture under the
+// test's own temporary root: the /tmp pass reads a fake root, and the process
+// probe answers from fake ps and lsof output, except in the one test that
+// runs it against its own child process.
+
+const (
+	homeFixtureCommit = "0123456789abcdef0123456789abcdef01234567"
+	// deadRunPID is a marker's run pid that the fake probes report gone.
+	deadRunPID = 4242
+	// The fake process table: the sweep is pid 100, started by pid 90.
+	homeSweepPID = 100
+	homeUID      = 501
+)
+
+// fakeHomeProcs answers the probe's commands. fail names the command that
+// fails: "ps", "env", "starts" or "lsof".
+type fakeHomeProcs struct {
+	platform   string
+	ps         string
+	env        string
+	starts     string
+	lsof       string
+	environ    map[int]string
+	environErr map[int]error
+	fail       string
+	alive      map[int]bool
+	now        time.Time
+	calls      []string
+}
+
+func (p *fakeHomeProcs) probes() homeProbes {
+	return homeProbes{
+		platform: p.platform,
+		run: func(name string, args ...string) (string, error) {
+			call := name + " " + strings.Join(args, " ")
+			p.calls = append(p.calls, call)
+			key := ""
+			switch {
+			case name == "lsof":
+				key = "lsof"
+			case slicesContains(args, "-E"):
+				key = "env"
+			case slicesContains(args, "pid=,etimes="):
+				key = "starts"
+			default:
+				key = "ps"
+			}
+			if p.fail == key {
+				return "", errors.New(key + " failed in the fixture")
+			}
+			return map[string]string{"lsof": p.lsof, "env": p.env, "starts": p.starts, "ps": p.ps}[key], nil
+		},
+		readEnviron: func(pid int) (string, error) {
+			if err := p.environErr[pid]; err != nil {
+				return "", err
+			}
+			return p.environ[pid], nil
+		},
+		alive: func(pid int) bool { return p.alive[pid] },
+		uid:   homeUID,
+		self:  homeSweepPID,
+		now:   func() time.Time { return p.now },
+	}
+}
+
+func fakeHomeProbes(t *testing.T, p *fakeHomeProcs) {
+	t.Helper()
+	old := verifyHomeProbes
+	verifyHomeProbes = p.probes
+	t.Cleanup(func() { verifyHomeProbes = old })
+}
+
+func defaultHomeProcs(now time.Time) *fakeHomeProcs {
+	return &fakeHomeProcs{
+		platform: "darwin",
+		ps:       "   90     1   501 /bin/zsh\n  100    90   501 tt relay\n",
+		lsof:     "p100\nn/\n",
+		alive:    map[int]bool{},
+		now:      now,
+	}
+}
+
+// homeFixture is a trim fixture with a fake /tmp root for verifier homes.
+type homeFixture struct {
+	trimFixture
+	tmp   string
+	procs *fakeHomeProcs
+}
+
+func newHomeFixture(t *testing.T) homeFixture {
+	t.Helper()
+	f := newTrimFixture(t)
+	tmp := filepath.Join(f.root, "private-tmp")
+	if err := os.MkdirAll(tmp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := verifyHomeTempRoot
+	verifyHomeTempRoot = func() string { return tmp }
+	t.Cleanup(func() { verifyHomeTempRoot = old })
+	procs := defaultHomeProcs(f.now)
+	fakeHomeProbes(t, procs)
+	return homeFixture{trimFixture: f, tmp: tmp, procs: procs}
+}
+
+// sweepAt runs the sweep's own pass at now, with an optional matrix lock.
+func (f homeFixture) sweepAt(t *testing.T, state sweepHubState, apply bool, now time.Time, matrix *matrixExclusion) map[string]worktreeDecision {
+	t.Helper()
+	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: now, Matrix: matrix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]worktreeDecision{}
+	for _, d := range decisions {
+		if _, twice := out[d.Path]; twice {
+			t.Fatalf("two decisions for %s: %+v", d.Path, decisions)
+		}
+		out[d.Path] = d
+	}
+	return out
+}
+
+func (f homeFixture) sweep(t *testing.T, state sweepHubState, apply bool) map[string]worktreeDecision {
+	t.Helper()
+	return f.sweepAt(t, state, apply, f.now, nil)
+}
+
+// runMarker is verify-matrix's marker for a run of item.
+func runMarker(item string, keep bool, output string, created time.Time) map[string]any {
+	return map[string]any{"version": 1, "kind": "home", "producer": "scripts/verify-matrix.mjs@" + homeFixtureCommit,
+		"item": item, "run": "run_fixture", "createdAt": created.UTC().Format(time.RFC3339Nano),
+		"owns": []string{"go-build", "go/pkg/mod"}, "keepHome": keep, "pid": deadRunPID, "output": output}
+}
+
+// manualMarker is an agent's hand-made marker for an ad hoc home.
+func manualMarker(item string, created time.Time) map[string]any {
+	return map[string]any{"version": 1, "kind": "home", "producer": "manual:builder-fixture", "item": item, "run": "adhoc-1",
+		"createdAt": created.UTC().Format(time.RFC3339Nano), "owns": []string{"go-build", "go/pkg/mod"}}
+}
+
+// writeHome makes a home with a Go build cache, a read-only module cache
+// and a work file; marker is a map, raw bytes, or nil for none.
+func writeHome(t *testing.T, dir string, marker any) string {
+	t.Helper()
+	switch m := marker.(type) {
+	case nil:
+	case []byte:
+		writeFixtureFile(t, filepath.Join(dir, homeMarkerName), string(m))
+	default:
+		data, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, filepath.Join(dir, homeMarkerName), string(data)+"\n")
+	}
+	writeFixtureFile(t, filepath.Join(dir, "go-build", "README"), goCacheReadmeLine+"\n")
+	writeFixtureFile(t, filepath.Join(dir, "go-build", "trim.txt"), "1759000000\n")
+	writeFixtureFile(t, filepath.Join(dir, "go-build", "aa", "aa11-a"), "object file\n")
+	writeFixtureFile(t, filepath.Join(dir, "go", "pkg", "mod", "cache", "download", "example.com", "m", "@v", "v1.0.0.zip"), "zip bytes\n")
+	writeFixtureFile(t, filepath.Join(dir, "go", "pkg", "mod", "example.com", "m@v1.0.0", "m.go"), "package m\n")
+	writeFixtureFile(t, filepath.Join(dir, "w", "notes.txt"), "work in the home\n")
+	readOnlyTree(t, filepath.Join(dir, "go", "pkg", "mod"))
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(dir) })
+	return dir
+}
+
+// readOnlyTree makes files 0444 and directories 0555 below root, as Go's
+// module cache is.
+func readOnlyTree(t *testing.T, root string) {
+	t.Helper()
+	var dirs []string
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		return os.Chmod(p, 0444)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chmod(dirs[i], 0555); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func homeReceipt(t *testing.T, path, action string) worktreeCleanupReceipt {
+	t.Helper()
+	for _, r := range readCleanupReceipts(t) {
+		if r.Path == path && r.Action == action {
+			return r
+		}
+	}
+	t.Fatalf("no %s receipt for %s: %+v", action, path, readCleanupReceipts(t))
+	return worktreeCleanupReceipt{}
+}
+
+func requireHomeDecision(t *testing.T, got map[string]worktreeDecision, path, action, reason, kind, detail string) worktreeDecision {
+	t.Helper()
+	d := requireDecision(t, got, path, action, reason)
+	if d.Kind != kind || !strings.Contains(d.Detail, detail) {
+		t.Fatalf("%s: %+v, want kind %s and detail with %q", path, d, kind, detail)
+	}
+	return d
+}
+
+// m7: a marked, idle, process-free verify-matrix home whose run is gone is
+// removed whole, read-only module directories included, with a receipt.
+func TestVerifyHomeRemovesMarkedIdleOrphan(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Ab12Cd"), runMarker(trimItemAcc, false, filepath.Join(f.artifacts(), trimItemAcc, "run-1"), f.now.Add(-48*time.Hour)))
+	got := f.sweep(t, sweepHubState{}, true)
+	if d := requireHomeDecision(t, got, home, "removed", "", kindVerifyHome, "orphaned home of run run_fixture"); d.Bytes <= 0 {
+		t.Fatalf("removal decision %+v", d)
+	}
+	requireExists(t, home, false)
+	requireNoTombstones(t, f.tmp)
+	if r := homeReceipt(t, home, "removed"); r.Kind != kindVerifyHome || r.Bytes <= 0 || r.Source != "sweep" {
+		t.Fatalf("receipt %+v", r)
+	}
+	// The probe ran once, with ps and lsof.
+	if n := len(f.procs.calls); n != 3 {
+		t.Fatalf("probe calls %v", f.procs.calls)
+	}
+}
+
+// m7: the dry run names the home and changes nothing.
+func TestVerifyHomeDryRunChangesNothing(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Ab12Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	kept := writeHome(t, filepath.Join(f.tmp, "tv-Kp12Cd"), runMarker(trimItemAcc, true, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	before := fixtureTree(t, f.tmp)
+	got := f.sweep(t, sweepHubState{}, false)
+	requireHomeDecision(t, got, home, "would-remove", "", kindVerifyHome, "orphaned home")
+	requireHomeDecision(t, got, filepath.Join(kept, "go-build"), "would-trim", "", kindHomeCache, "owned by the marker")
+	requireHomeDecision(t, got, filepath.Join(kept, "go", "pkg", "mod"), "would-trim", "", kindHomeCache, "owned by the marker")
+	if fixtureTree(t, f.tmp) != before {
+		t.Fatal("the dry run changed the fixture")
+	}
+	if len(readCleanupReceipts(t)) != 0 {
+		t.Fatal("the dry run wrote receipts")
+	}
+}
+
+// m7 (lead #35210): a home kept on purpose loses only its owned caches.
+func TestVerifyHomeTrimsOnlyCachesOfKeptTempHome(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Kp12Cd"), runMarker(trimItemAcc, true, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	got := f.sweep(t, sweepHubState{}, true)
+	for _, owned := range []string{"go-build", "go/pkg/mod"} {
+		path := filepath.Join(home, owned)
+		if d := requireHomeDecision(t, got, path, "trimmed", "", kindHomeCache, home); d.Bytes <= 0 {
+			t.Fatalf("trim %+v", d)
+		}
+		requireExists(t, path, false)
+		if r := homeReceipt(t, path, "trimmed"); r.Kind != kindHomeCache || r.Bytes <= 0 {
+			t.Fatalf("receipt %+v", r)
+		}
+	}
+	if _, ok := got[home]; ok {
+		t.Fatal("a kept home got a whole-home decision")
+	}
+	for _, p := range []string{homeMarkerName, "w/notes.txt", "go/pkg"} {
+		requireExists(t, filepath.Join(home, p), true)
+	}
+	requireNoTombstones(t, home, filepath.Join(home, "go", "pkg"))
+}
+
+// m2: a marked home under a finished item's artifact folder loses its owned
+// caches; the marker and the home's other files stay.
+func TestVerifyHomeTrimsCachesOfFinishedItemUnderArtifacts(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "adhoc", "home"), manualMarker(trimItemAcc, f.now.Add(-48*time.Hour)))
+	state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}
+	before := fixtureTree(t, f.artifacts())
+	dry := f.sweep(t, state, false)
+	requireHomeDecision(t, dry, filepath.Join(home, "go-build"), "would-trim", "", kindHomeCache, trimItemAcc)
+	if fixtureTree(t, f.artifacts()) != before {
+		t.Fatal("the dry run changed the fixture")
+	}
+	got := f.sweepAt(t, state, true, f.now.Add(time.Minute), nil)
+	for _, owned := range []string{"go-build", "go/pkg/mod"} {
+		if d := requireHomeDecision(t, got, filepath.Join(home, owned), "trimmed", "", kindHomeCache, trimItemAcc); d.Bytes <= 0 {
+			t.Fatalf("trim %+v", d)
+		}
+		requireExists(t, filepath.Join(home, owned), false)
+		homeReceipt(t, filepath.Join(home, owned), "trimmed")
+	}
+	requireExists(t, filepath.Join(home, homeMarkerName), true)
+	requireExists(t, filepath.Join(home, "w", "notes.txt"), true)
+	requireNoTombstones(t, home, filepath.Join(home, "go", "pkg"))
+}
+
+// m2: a marked home in a finished item's kept checkout, ignored by Git and
+// holding no tracked file, loses its owned caches.
+func TestVerifyHomeTrimsCachesInFinishedCheckout(t *testing.T) {
+	f := newHomeFixture(t)
+	checkout := f.verifierCheckout(t, trimItemAcc, "verifier-abc1234")
+	home := writeHome(t, filepath.Join(checkout, ".build", "home"), manualMarker(trimItemAcc, f.now.Add(-48*time.Hour)))
+	state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}
+	got := f.sweep(t, state, true)
+	requireDecision(t, got, checkout, "kept", keepRetention)
+	for _, owned := range []string{"go-build", "go/pkg/mod"} {
+		requireHomeDecision(t, got, filepath.Join(home, owned), "trimmed", "", kindHomeCache, trimItemAcc)
+		requireExists(t, filepath.Join(home, owned), false)
+	}
+	requireExists(t, filepath.Join(home, "w", "notes.txt"), true)
+	requireExists(t, filepath.Join(checkout, "app.txt"), true)
+}
+
+// m2: a home in use, of a live run, of an unfinished item or changed within
+// min-idle keeps its caches, each with its reason.
+func TestVerifyHomeKeepsInUseUnfinishedOrRecent(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	used := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "used", "home"), manualMarker(trimItemAcc, old))
+	liveMarker := runMarker(trimItemAcc, false, "/elsewhere/out", old)
+	liveMarker["pid"] = 4343
+	live := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "live", "home"), liveMarker)
+	f.procs.alive[4343] = true
+	unfinished := writeHome(t, filepath.Join(f.artifacts(), trimItemLive, "adhoc", "home"), manualMarker(trimItemLive, old))
+	unknown := writeHome(t, filepath.Join(f.artifacts(), "scratch", "home"), manualMarker(trimItemRel, old))
+	recent := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "recent", "home"), manualMarker(trimItemAcc, old))
+	soon := f.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(recent, "w", "notes.txt"), soon, soon); err != nil {
+		t.Fatal(err)
+	}
+	state := sweepHubState{
+		entries: []api.TeamQueueEntry{f.accepted(trimItemAcc), {ID: "tqe_live", ItemID: trimItemLive, State: "running", Host: trimHost, Position: 1}},
+		agents:  []api.Agent{{ID: "agt_00000000000000d1", Name: "adhoc", Host: trimHost, Status: api.AgentRunning, Cwd: filepath.Join(used, "w")}},
+	}
+	before := fixtureTree(t, f.artifacts())
+	got := f.sweep(t, state, true)
+	requireHomeDecision(t, got, used, "kept", keepInUse, kindHomeCache, "in use at "+filepath.Join(used, "w"))
+	requireHomeDecision(t, got, live, "kept", keepInUse, kindHomeCache, "process 4343 is alive")
+	requireHomeDecision(t, got, unfinished, "kept", keepItemActive, kindHomeCache, trimItemLive+" is not finished")
+	requireHomeDecision(t, got, unknown, "kept", keepItemActive, kindHomeCache, trimItemRel+" is not finished")
+	requireHomeDecision(t, got, recent, "kept", keepRecent, kindHomeCache, "changed 1h0m0s ago")
+	if fixtureTree(t, f.artifacts()) != before {
+		t.Fatal("a kept home changed")
+	}
+	if len(f.procs.calls) != 0 {
+		t.Fatalf("the probe ran with nothing left to remove: %v", f.procs.calls)
+	}
+}
+
+// writeBuildCache makes an unmarked Go build cache of about size bytes.
+func writeBuildCache(t *testing.T, dir string, size int) string {
+	t.Helper()
+	writeFixtureFile(t, filepath.Join(dir, "README"), goCacheReadmeLine+"\n")
+	writeFixtureFile(t, filepath.Join(dir, "trim.txt"), "1759000000\n")
+	writeFixtureFile(t, filepath.Join(dir, "aa", "aa11-a"), strings.Repeat("x", size))
+	return dir
+}
+
+// m3: unmarked Go caches under the artifacts root and in eligible checkouts,
+// and an unmarked /tmp home, are reported with their size and left alone;
+// only the ten largest caches are listed, and the walks are bounded.
+func TestVerifyHomeReportsUnmarkedGoCaches(t *testing.T) {
+	f := newHomeFixture(t)
+	build := writeBuildCache(t, filepath.Join(f.artifacts(), "scratch-a", "gocache"), 5000)
+	module := filepath.Join(f.artifacts(), "scratch-b", "gomod")
+	writeFixtureFile(t, filepath.Join(module, "cache", "download", "example.com", "m", "@v", "v1.0.0.zip"), strings.Repeat("z", 4000))
+	readOnlyTree(t, module)
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(module) })
+	tv := writeHome(t, filepath.Join(f.tmp, "tv-Un12Cd"), nil)
+	// An eligible checkout's cache is listed; its node_modules trim is unchanged.
+	eligible := f.verifierCheckout(t, trimItemAcc, "verifier-eligible")
+	installModules(t, eligible)
+	inEligible := writeBuildCache(t, filepath.Join(eligible, ".build", "cache"), 3000)
+	// Not listed: a cache in a checkout of an item still running, one in a
+	// repository reached only by the artifacts walk, and one too deep.
+	running := f.verifierCheckout(t, trimItemLive, "verifier-running")
+	inRunning := writeBuildCache(t, filepath.Join(running, ".build", "cache"), 9000)
+	nestedRepo := filepath.Join(f.artifacts(), "scratch-c", "repo")
+	cleanupGit(t, f.root, "init", "-q", nestedRepo)
+	inNested := writeBuildCache(t, filepath.Join(nestedRepo, ".build", "cache"), 9000)
+	deep := writeBuildCache(t, filepath.Join(f.artifacts(), "d1", "d2", "d3", "d4", "gocache"), 9000)
+	state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc), {ID: "tqe_live", ItemID: trimItemLive, State: "running", Host: trimHost, Position: 1}}}
+	before := fixtureTree(t, build, module, tv, inEligible, inRunning, inNested, deep)
+	got := f.sweep(t, state, true)
+	for path, want := range map[string]string{build: "Go build cache", module: "Go module cache", inEligible: "Go build cache"} {
+		if d := requireHomeDecision(t, got, path, "kept", keepUnproven, kindCache, "no provenance marker; "+want); d.Bytes <= 0 {
+			t.Fatalf("report %+v", d)
+		}
+	}
+	if d := requireHomeDecision(t, got, tv, "kept", keepUnproven, kindVerifyHome, "no provenance marker; "); d.Bytes <= 0 || !strings.Contains(d.Detail, humanBytes(d.Bytes)) {
+		t.Fatalf("unmarked home %+v", d)
+	}
+	if r := homeReceipt(t, tv, "kept"); r.Reason != keepUnproven || r.Bytes <= 0 {
+		t.Fatalf("unmarked home receipt %+v", r)
+	}
+	for _, p := range []string{inRunning, inNested, deep} {
+		if d, ok := got[p]; ok {
+			t.Fatalf("a cache outside the bounded walks was listed: %+v", d)
+		}
+	}
+	requireDecision(t, got, filepath.Join(eligible, "node_modules"), "trimmed", "")
+	if fixtureTree(t, build, module, tv, inEligible, inRunning, inNested, deep) != before {
+		t.Fatal("an unmarked cache or home changed")
+	}
+
+	t.Run("only the ten largest", func(t *testing.T) {
+		f := newHomeFixture(t)
+		var caches []string
+		for i := 0; i < 12; i++ {
+			caches = append(caches, writeBuildCache(t, filepath.Join(f.artifacts(), fmt.Sprintf("scratch-%02d", i), "gocache"), 1000+100*i))
+		}
+		got := f.sweep(t, sweepHubState{}, true)
+		for i, p := range caches {
+			_, listed := got[p]
+			if listed != (i >= 2) {
+				t.Fatalf("cache %d (%s) listed=%v; want only the ten largest", i, p, listed)
+			}
+			requireExists(t, filepath.Join(p, "aa", "aa11-a"), true)
+		}
+	})
+}
+
+// m4: a marked home whose owned path is, contains or lies in a never-touch
+// path, or that lies in the shared caches itself, is kept protected and
+// unchanged, and the shared caches stay byte-identical.
+func TestVerifyHomeNeverTouchesSharedCaches(t *testing.T) {
+	cases := []struct {
+		name string
+		keep bool
+		// set names the never-touch path for the home; inCaches makes the
+		// /tmp root a folder of the fake user's Library/Caches instead.
+		set      func(t *testing.T, home string)
+		inCaches bool
+	}{
+		{"owned path is GOCACHE", true, func(t *testing.T, home string) { t.Setenv("GOCACHE", filepath.Join(home, "go-build")) }, false},
+		{"owned path lies in TAILTERM_VERIFICATION_CACHE", true, func(t *testing.T, home string) {
+			t.Setenv("TAILTERM_VERIFICATION_CACHE", filepath.Join(home, "go", "pkg"))
+		}, false},
+		{"owned path contains GOMODCACHE", true, func(t *testing.T, home string) {
+			t.Setenv("GOMODCACHE", filepath.Join(home, "go", "pkg", "mod", "cache"))
+		}, false},
+		{"orphan contains GOCACHE", false, func(t *testing.T, home string) { t.Setenv("GOCACHE", filepath.Join(home, "go-build")) }, false},
+		{"orphan lies in Library/Caches", false, func(t *testing.T, home string) {}, true},
+		{"kept home lies in Library/Caches", true, func(t *testing.T, home string) {}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newHomeFixture(t)
+			tmp := f.tmp
+			if c.inCaches {
+				tmp = filepath.Join(f.home, "Library", "Caches", "tmp")
+				verifyHomeTempRoot = func() string { return tmp }
+			}
+			home := writeHome(t, filepath.Join(tmp, "tv-Sh12Cd"), runMarker(trimItemAcc, c.keep, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+			c.set(t, home)
+			before, shared := fixtureTree(t, home), f.sharedCaches(t)
+			kind := kindVerifyHome
+			if c.keep {
+				kind = kindHomeCache
+			}
+			got := f.sweep(t, sweepHubState{}, true)
+			requireHomeDecision(t, got, home, "kept", keepProtected, kind, "touches the never-touch path")
+			for path, d := range got {
+				if pathWithin(path, home) && path != home {
+					t.Fatalf("a decision inside a protected home: %+v", d)
+				}
+			}
+			if fixtureTree(t, home) != before {
+				t.Fatal("a protected home changed")
+			}
+			if f.sharedCaches(t) != shared {
+				t.Fatal("the shared caches changed")
+			}
+		})
+	}
+}
+
+// m5: the marker validator refuses every malformed field and names it.
+func TestVerifyHomeMarkerValidation(t *testing.T) {
+	created := "2026-10-15T15:00:00.000Z"
+	base := func() map[string]any {
+		return map[string]any{"version": 1, "kind": "home", "producer": "manual:fixture", "item": "wi_0123456789abcdef", "run": "r1", "createdAt": created, "owns": []any{"cache/go-build"}}
+	}
+	run := func() map[string]any {
+		m := runMarker("wi_0123456789abcdef", false, "/out/run", time.Now())
+		m["createdAt"] = created
+		return m
+	}
+	with := func(m map[string]any, key string, value any) map[string]any {
+		if value == nil {
+			delete(m, key)
+		} else {
+			m[key] = value
+		}
+		return m
+	}
+	parse := func(t *testing.T, m map[string]any) (homeMarker, string) {
+		t.Helper()
+		data, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parseHomeMarker(data)
+	}
+	if m, fault := parse(t, base()); fault != "" || m.notVerifyMatrix == "" || m.Item != "wi_0123456789abcdef" {
+		t.Fatalf("valid base marker: %+v %q", m, fault)
+	}
+	if m, fault := parse(t, run()); fault != "" || m.notVerifyMatrix != "" || m.PID != deadRunPID || m.KeepHome || m.Output != "/out/run" {
+		t.Fatalf("valid verify-matrix marker: %+v %q", m, fault)
+	}
+	refused := []struct {
+		name, field string
+		marker      map[string]any
+	}{
+		{"wrong kind", "kind", with(base(), "kind", "root")},
+		{"wrong version", "version", with(base(), "version", 2)},
+		{"version as text", "version", with(base(), "version", "1")},
+		{"item missing", "item", with(base(), "item", nil)},
+		{"item empty", "item", with(base(), "item", "")},
+		{"item a number", "item", with(base(), "item", 7)},
+		{"run missing", "run", with(base(), "run", nil)},
+		{"run empty", "run", with(base(), "run", "")},
+		{"run a number", "run", with(base(), "run", 7)},
+		{"producer missing", "producer", with(base(), "producer", nil)},
+		{"producer empty", "producer", with(base(), "producer", "")},
+		{"createdAt missing", "createdAt", with(base(), "createdAt", nil)},
+		{"createdAt not RFC 3339", "createdAt", with(base(), "createdAt", "yesterday")},
+		{"owns absolute", "owns", with(base(), "owns", []any{"/etc"})},
+		{"owns leaves", "owns", with(base(), "owns", []any{"../victim"})},
+		{"owns leaves later", "owns", with(base(), "owns", []any{"go/../../victim"})},
+		{"owns dot", "owns", with(base(), "owns", []any{"."})},
+		{"owns unclean", "owns", with(base(), "owns", []any{"go//pkg"})},
+		{"owns duplicate", "owns", with(base(), "owns", []any{"go-build", "go-build"})},
+		{"owns empty", "owns", with(base(), "owns", []any{})},
+		{"owns a non-string", "owns", with(base(), "owns", []any{3})},
+		{"owns the marker", "owns", with(base(), "owns", []any{homeMarkerName})},
+	}
+	for _, c := range refused {
+		if _, fault := parse(t, c.marker); !strings.HasPrefix(fault, c.field+":") {
+			t.Errorf("%s: fault %q, want the field %s named", c.name, fault, c.field)
+		}
+	}
+	// verify-matrix's identity: a base-valid marker without it proves no /tmp home.
+	identity := []struct {
+		name, field string
+		marker      map[string]any
+	}{
+		{"keepHome a string", "keepHome", with(run(), "keepHome", "yes")},
+		{"keepHome missing", "keepHome", with(run(), "keepHome", nil)},
+		{"pid zero", "pid", with(run(), "pid", 0)},
+		{"pid negative", "pid", with(run(), "pid", -1)},
+		{"pid fractional", "pid", with(run(), "pid", 1.5)},
+		{"pid as text", "pid", with(run(), "pid", "123")},
+		{"pid missing", "pid", with(run(), "pid", nil)},
+		{"output relative", "output", with(run(), "output", "out/run")},
+		{"output missing", "output", with(run(), "output", nil)},
+		{"owns other", "owns", with(run(), "owns", []any{"go-build"})},
+	}
+	for _, c := range identity {
+		if m, fault := parse(t, c.marker); fault != "" || !strings.HasPrefix(m.notVerifyMatrix, c.field+":") {
+			t.Errorf("%s: fault %q identity %q, want the field %s named", c.name, fault, m.notVerifyMatrix, c.field)
+		}
+	}
+	if _, fault := parseHomeMarker([]byte("not json")); fault != "not a JSON object" {
+		t.Errorf("not JSON: %q", fault)
+	}
+	// Read through the pinned home: a link or an oversized file is refused.
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.json")
+	data, _ := json.Marshal(base())
+	writeFixtureFile(t, real, string(data))
+	linked := filepath.Join(dir, "linked")
+	big := filepath.Join(dir, "big")
+	writeFixtureFile(t, filepath.Join(big, homeMarkerName), `{"pad":"`+strings.Repeat("x", homeMarkerMaxBytes)+`"}`)
+	if err := os.MkdirAll(linked, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linked, homeMarkerName)); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{linked: "marker: not a regular file", big: "marker: larger than 64 KiB"} {
+		root, err := os.OpenRoot(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, found, fault := readHomeMarker(root); !found || fault != want {
+			t.Errorf("%s: found %v fault %q, want %q", path, found, fault, want)
+		}
+		root.Close()
+	}
+}
+
+// m5: a /tmp home is acted on only with verify-matrix's exact producer, and
+// a checkout's home only with the checkout's own item.
+func TestVerifyHomeRefusesLookalikeProducer(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	homes := map[string]string{}
+	for i, producer := range []string{"scripts/verify-matrix.mjs", "scripts/verify-matrix.mjs@abc", "scripts/verify-matrix.mjsx@" + homeFixtureCommit, "./scripts/verify-matrix.mjs@" + homeFixtureCommit, "manual:builder"} {
+		m := runMarker(trimItemAcc, false, "/elsewhere/out", old)
+		m["producer"] = producer
+		homes[writeHome(t, filepath.Join(f.tmp, fmt.Sprintf("tv-Lk%02dCd", i)), m)] = producer
+	}
+	checkout := f.verifierCheckout(t, trimItemAcc, "verifier-abc1234")
+	other := writeHome(t, filepath.Join(checkout, ".build", "home"), manualMarker(trimItemRel, old))
+	state := sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}
+	before := fixtureTree(t, f.tmp, other)
+	got := f.sweep(t, state, true)
+	for home, producer := range homes {
+		requireHomeDecision(t, got, home, "kept", keepUnproven, kindVerifyHome, "not a verify-matrix home: producer "+strconv.Quote(producer))
+	}
+	requireHomeDecision(t, got, other, "kept", keepUnproven, kindHomeCache, "marker names "+trimItemRel+", checkout belongs to "+trimItemAcc)
+	if fixtureTree(t, f.tmp, other) != before {
+		t.Fatal("a refused home changed")
+	}
+}
+
+// m5: a marker naming a path outside its home is refused whole; the sibling
+// it names survives.
+func TestVerifyHomeRefusesOwnsOutsideHome(t *testing.T) {
+	f := newHomeFixture(t)
+	scratch := filepath.Join(f.artifacts(), trimItemAcc, "scratch")
+	victim := filepath.Join(scratch, "victim")
+	writeFixtureFile(t, filepath.Join(victim, "keep.txt"), "not the home's\n")
+	m := manualMarker(trimItemAcc, f.now.Add(-48*time.Hour))
+	m["owns"] = []string{"go-build", "../victim"}
+	home := writeHome(t, filepath.Join(scratch, "home"), m)
+	before := fixtureTree(t, scratch)
+	got := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}, true)
+	requireHomeDecision(t, got, home, "kept", keepUnproven, kindHomeCache, "provenance marker refused: owns: ../victim leaves the home")
+	if fixtureTree(t, scratch) != before {
+		t.Fatal("the home or its sibling changed")
+	}
+}
+
+// m5: an owned path that is a link, or runs through one, is refused with
+// nothing followed; a link inside a trimmed cache goes with it, its target
+// intact.
+func TestVerifyHomeNeverFollowsLinks(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	outside := filepath.Join(f.root, "outside")
+	writeFixtureFile(t, filepath.Join(outside, "go-build", "keep.txt"), "outside\n")
+	writeFixtureFile(t, filepath.Join(outside, "pkg", "mod", "keep.txt"), "outside\n")
+	base := filepath.Join(f.artifacts(), trimItemAcc)
+	link := func(t *testing.T, target, at string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(at), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The owned go-build is a link.
+	owned := filepath.Join(base, "owned-link")
+	writeFixtureFile(t, filepath.Join(owned, homeMarkerName), string(mustJSON(t, manualMarker(trimItemAcc, old))))
+	link(t, filepath.Join(outside, "go-build"), filepath.Join(owned, "go-build"))
+	// go/pkg on the way to go/pkg/mod is a link.
+	middle := filepath.Join(base, "middle-link")
+	writeFixtureFile(t, filepath.Join(middle, homeMarkerName), string(mustJSON(t, manualMarker(trimItemAcc, old))))
+	link(t, filepath.Join(outside, "pkg"), filepath.Join(middle, "go", "pkg"))
+	// A link inside a trimmed cache points outside.
+	inside := writeHome(t, filepath.Join(base, "inside-link", "home"), manualMarker(trimItemAcc, old))
+	if err := os.Chmod(filepath.Join(inside, "go", "pkg", "mod"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	link(t, outside, filepath.Join(inside, "go", "pkg", "mod", "escape"))
+	if err := os.Chmod(filepath.Join(inside, "go", "pkg", "mod"), 0555); err != nil {
+		t.Fatal(err)
+	}
+	link(t, filepath.Join(outside, "go-build"), filepath.Join(inside, "go-build", "escape"))
+	// Everything here is two days old by the fixture's clock, links included.
+	for _, p := range []string{filepath.Join(owned, "go-build"), filepath.Join(middle, "go", "pkg"), filepath.Join(inside, "go", "pkg", "mod", "escape"), filepath.Join(inside, "go-build", "escape")} {
+		if err := exec.Command("touch", "-h", "-t", "202001010000", p).Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outsideBefore := fixtureTree(t, outside)
+	got := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}, true)
+	requireHomeDecision(t, got, owned, "kept", keepUnproven, kindHomeCache, "owned path go-build: go-build is a link; nothing followed")
+	requireHomeDecision(t, got, middle, "kept", keepUnproven, kindHomeCache, "owned path go/pkg/mod: go/pkg is a link; nothing followed")
+	requireHomeDecision(t, got, filepath.Join(inside, "go-build"), "trimmed", "", kindHomeCache, trimItemAcc)
+	requireHomeDecision(t, got, filepath.Join(inside, "go", "pkg", "mod"), "trimmed", "", kindHomeCache, trimItemAcc)
+	requireExists(t, filepath.Join(owned, "go-build"), true)
+	requireExists(t, filepath.Join(middle, "go", "pkg"), true)
+	if fixtureTree(t, outside) != outsideBefore {
+		t.Fatal("a link was followed out of a home")
+	}
+}
+
+// m7: a run still alive, by its marker's pid or by a matrix lock entry
+// holding its output, keeps its home.
+func TestVerifyHomeKeepsHomeOfLiveRun(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	byPID := runMarker(trimItemAcc, false, "/elsewhere/out-1", old)
+	byPID["pid"] = 4343
+	f.procs.alive[4343] = true
+	alive := writeHome(t, filepath.Join(f.tmp, "tv-Lv01Cd"), byPID)
+	output := filepath.Join(f.artifacts(), trimItemAcc, "run-2")
+	held := writeHome(t, filepath.Join(f.tmp, "tv-Lv02Cd"), runMarker(trimItemAcc, false, output, old))
+	matrix := &matrixExclusion{entries: []matrixSweepEntry{{ID: "mtx_fixture", Output: output}}}
+	got := f.sweepAt(t, sweepHubState{}, false, f.now, matrix)
+	requireHomeDecision(t, got, alive, "kept", keepInUse, kindVerifyHome, "its run's process 4343 is alive")
+	requireHomeDecision(t, got, held, "kept", keepInUse, kindVerifyHome, "its run's output "+output+" is in use")
+	got = f.sweepAt(t, sweepHubState{}, true, f.now.Add(time.Minute), nil)
+	requireHomeDecision(t, got, alive, "kept", keepInUse, kindVerifyHome, "process 4343 is alive")
+	requireExists(t, alive, true)
+}
+
+// m7: a failing ps or lsof keeps every candidate.
+func TestVerifyHomeFailsClosedWhenProbeFails(t *testing.T) {
+	for _, step := range []string{"ps", "env", "lsof"} {
+		t.Run(step, func(t *testing.T) {
+			f := newHomeFixture(t)
+			f.procs.fail = step
+			old := f.now.Add(-48 * time.Hour)
+			orphan := writeHome(t, filepath.Join(f.tmp, "tv-Pf01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", old))
+			kept := writeHome(t, filepath.Join(f.tmp, "tv-Pf02Cd"), runMarker(trimItemAcc, true, "/elsewhere/out", old))
+			before := fixtureTree(t, f.tmp)
+			got := f.sweep(t, sweepHubState{}, true)
+			requireHomeDecision(t, got, orphan, "kept", keepFailed, kindVerifyHome, "process probe: "+step+" failed")
+			requireHomeDecision(t, got, kept, "kept", keepFailed, kindHomeCache, "process probe: "+step+" failed")
+			if fixtureTree(t, f.tmp) != before {
+				t.Fatal("a home changed after a failed probe")
+			}
+		})
+	}
+}
+
+// m7: on Linux an environment that cannot be read is proven unrelated only
+// by a start more than five seconds before the home was made, as the
+// runner's own sweep proves it; otherwise that home is kept.
+func TestVerifyHomeProbeUnreadableProcesses(t *testing.T) {
+	const blind = 300
+	denied := &fs.PathError{Op: "open", Path: "/proc/300/environ", Err: syscall.EACCES}
+	seconds := func(d time.Duration) string { return strconv.FormatInt(int64(d/time.Second), 10) }
+	cases := []struct {
+		name   string
+		starts func(now time.Time) string
+		keep   string
+	}{
+		{"older", func(time.Time) string { return " 100 3\n 300 " + seconds(72*time.Hour) + "\n" }, ""},
+		{"gone", func(time.Time) string { return " 100 3\n" }, ""},
+		{"young", func(time.Time) string { return " 100 3\n 300 10\n" }, "unreadable process 300 not proven older than the home"},
+		{"unknown", func(time.Time) string { return " 100 3\n 300 2-03:04:05\n" }, "unreadable process 300 not proven older than the home"},
+		{"unparsable", func(time.Time) string { return " 100 3\nnot a row at all\n" }, "ps printed a line that could not be read"},
+		{"self missing", func(time.Time) string { return " 300 " + seconds(72*time.Hour) + "\n" }, "ps did not list the sweep itself"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newHomeFixture(t)
+			f.procs.platform = "linux"
+			f.procs.ps += "  300     1   501 /usr/bin/ssh-agent\n"
+			f.procs.environErr = map[int]error{blind: denied}
+			f.procs.starts = c.starts(f.now)
+			home := writeHome(t, filepath.Join(f.tmp, "tv-Ur01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-60*time.Hour)))
+			got := f.sweep(t, sweepHubState{}, true)
+			if c.keep == "" {
+				requireHomeDecision(t, got, home, "removed", "", kindVerifyHome, "orphaned home")
+				requireExists(t, home, false)
+				return
+			}
+			requireHomeDecision(t, got, home, "kept", keepInUse, kindVerifyHome, c.keep)
+			requireExists(t, home, true)
+		})
+	}
+	t.Run("each home has its own proof", func(t *testing.T) {
+		f := newHomeFixture(t)
+		f.procs.platform = "linux"
+		f.procs.ps += "  300     1   501 /usr/bin/ssh-agent\n"
+		f.procs.environErr = map[int]error{blind: denied}
+		// The process started 72 hours before the clock: before the newer
+		// home was made (60 hours), after the older one (84 hours).
+		f.procs.starts = " 100 3\n 300 " + seconds(72*time.Hour) + "\n"
+		newer := writeHome(t, filepath.Join(f.tmp, "tv-Ur02Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-60*time.Hour)))
+		older := writeHome(t, filepath.Join(f.tmp, "tv-Ur03Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-84*time.Hour)))
+		got := f.sweep(t, sweepHubState{}, true)
+		requireHomeDecision(t, got, newer, "removed", "", kindVerifyHome, "skipped unreadable process(es) 300, started before the home")
+		requireHomeDecision(t, got, older, "kept", keepInUse, kindVerifyHome, "unreadable process 300 not proven older")
+		if n := strings.Count(strings.Join(f.procs.calls, "\n"), "pid=,etimes="); n != 1 {
+			t.Fatalf("start times read %d times: %v", n, f.procs.calls)
+		}
+	})
+}
+
+// m7: the probe keeps a home for exactly the runner's reasons: a HOME,
+// TMPDIR or PWD under either spelling, an argv[0] under it, or a cwd or open
+// file under it; another user's processes and the sweep and its ancestors
+// never count.
+func TestVerifyHomeProbeMatchesRunnerRules(t *testing.T) {
+	const (
+		home = "/private/tmp/tv-Rr01Cd"
+		alt  = "/tmp/tv-Rr01Cd"
+	)
+	table := "   90     1   501 /bin/zsh\n  100    90   501 tt relay\n  200     1   501 /usr/bin/make check\n  250     1   777 /usr/bin/other-user\n"
+	h := &verifierHome{path: home, spellings: []string{home, alt}, marker: homeMarker{CreatedAt: time.Now().Add(-time.Hour)}}
+	other := &verifierHome{path: "/private/tmp/tv-Rr02Cd", spellings: []string{"/private/tmp/tv-Rr02Cd"}, marker: homeMarker{CreatedAt: time.Now().Add(-time.Hour)}}
+	cases := []struct {
+		name     string
+		platform string
+		env      string
+		environ  map[int]string
+		ps       string
+		lsof     string
+		hit      string
+	}{
+		{"darwin HOME", "darwin", "  200 /usr/bin/make check HOME=" + home + " PATH=/bin\n", nil, table, "p200\nn/\n", "process 200 (env)"},
+		{"darwin TMPDIR alt spelling", "darwin", "  200 make TMPDIR=" + alt + "/t\n", nil, table, "", "process 200 (env)"},
+		{"darwin PWD", "darwin", "  200 make PWD=" + home + "/w\n", nil, table, "", "process 200 (env)"},
+		{"linux HOME", "linux", "", map[int]string{200: "PATH=/bin\x00HOME=" + home + "\x00"}, table, "", "process 200 (env)"},
+		{"linux PWD alt spelling", "linux", "", map[int]string{200: "PWD=" + alt + "\x00"}, table, "", "process 200 (env)"},
+		{"argv", "darwin", "", nil, table + "  210     1   501 " + home + "/bin/daemon --serve\n", "", "process 210 (argv)"},
+		{"lsof cwd", "darwin", "", nil, table, "p200\nn" + home + "\n", "process 200 (file)"},
+		{"lsof open file", "darwin", "", nil, table, "p200\nn" + alt + "/w/log.txt\n", "process 200 (file)"},
+		{"another user", "darwin", "  250 other HOME=" + home + "\n", nil, table, "p250\nn" + home + "\n", ""},
+		{"the sweep and its ancestors", "darwin", "  100 tt HOME=" + home + "\n   90 zsh PWD=" + home + "\n", nil, table, "p100\nn" + home + "\np90\nn" + home + "\n", ""},
+		{"a sibling home", "darwin", "  200 make HOME=" + home + "x\n", nil, table, "p200\nn" + home + "x/f\n", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := defaultHomeProcs(time.Now())
+			p.platform, p.env, p.environ, p.ps, p.lsof = c.platform, c.env, c.environ, c.ps, c.lsof
+			hits, _, err := probeVerifierHomes(p.probes(), []*verifierHome{h, other})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hits[home]; (c.hit == "") != (got == "") || !strings.Contains(got, c.hit) {
+				t.Fatalf("hit %q, want %q", got, c.hit)
+			}
+			if hits[other.path] != "" {
+				t.Fatalf("the other home was hit: %q", hits[other.path])
+			}
+		})
+	}
+	p := defaultHomeProcs(time.Now())
+	p.platform = "windows"
+	if _, _, err := probeVerifierHomes(p.probes(), []*verifierHome{h}); err == nil {
+		t.Fatal("an unsupported platform did not fail the probe")
+	}
+}
+
+// m7: a removal interrupted after the rename is finished by the next
+// applying sweep, read-only module directories included.
+func TestVerifyHomeFinishesInterruptedRemoval(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Ir01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	detachCrashAt = func(stage string) bool { return stage == "renamed" }
+	t.Cleanup(func() { detachCrashAt = nil })
+	got := f.sweep(t, sweepHubState{}, true)
+	requireHomeDecision(t, got, home, "kept", keepFailed, kindVerifyHome, "interrupted after the rename")
+	requireExists(t, home, false)
+	left, _ := filepath.Glob(filepath.Join(f.tmp, tombstonePrefix+"*"))
+	if len(left) != 1 {
+		t.Fatalf("tombstones %v", left)
+	}
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(left[0]) })
+	detachCrashAt = nil
+	got = f.sweepAt(t, sweepHubState{}, true, f.now.Add(time.Minute), nil)
+	requireHomeDecision(t, got, home, "removed", "", kindVerifyHome, "finished an interrupted sweep")
+	requireNoTombstones(t, f.tmp)
+}
+
+// m7: closeout, which trims nothing, never examines verifier homes.
+func TestVerifyHomeCloseoutNeverTouchesTempHomes(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Co01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	before := fixtureTree(t, f.tmp)
+	decisions, err := cleanupWorktrees(context.Background(), worktreeCleanupInputs{Repo: f.main, Now: f.now, Apply: true, Items: map[string]artifactItemState{},
+		Receipt: worktreeCleanupReceipt{Source: "closeout"}, TempHomes: func() bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range decisions {
+		if d.Kind == kindVerifyHome || d.Kind == kindHomeCache {
+			t.Fatalf("closeout decided a verifier home: %+v", d)
+		}
+	}
+	requireExists(t, home, true)
+	if fixtureTree(t, f.tmp) != before || len(f.procs.calls) != 0 {
+		t.Fatalf("closeout touched /tmp or probed processes: %v", f.procs.calls)
+	}
+}
+
+// m7: a sweep over several repositories examines /tmp once.
+func TestVerifyHomeRunsTempPassOncePerSweep(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-On01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	first := f.sweep(t, sweepHubState{}, false)
+	requireHomeDecision(t, first, home, "would-remove", "", kindVerifyHome, "orphaned home")
+	second := f.sweep(t, sweepHubState{}, false)
+	if d, ok := second[home]; ok {
+		t.Fatalf("the same sweep examined /tmp twice: %+v", d)
+	}
+	if n := strings.Count(strings.Join(f.procs.calls, "\n"), "lsof"); n != 1 {
+		t.Fatalf("lsof ran %d times", n)
+	}
+	next := f.sweepAt(t, sweepHubState{}, false, f.now.Add(time.Hour), nil)
+	requireHomeDecision(t, next, home, "would-remove", "", kindVerifyHome, "orphaned home")
+}
+
+// m8: the real probe keeps a home a live process works in.
+func TestVerifyHomeKeepsOrphanWithLiveProcess(t *testing.T) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skip("lsof is not installed")
+	}
+	f := newHomeFixture(t)
+	verifyHomeProbes = nativeHomeProbes
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	m := runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour))
+	m["pid"] = gone.Process.Pid
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Lp01Cd"), m)
+	child := exec.Command("sleep", "60")
+	child.Dir = filepath.Join(home, "w")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	got := f.sweep(t, sweepHubState{}, true)
+	requireHomeDecision(t, got, home, "kept", keepInUse, kindVerifyHome, fmt.Sprintf("process %d (", child.Process.Pid))
+	requireExists(t, filepath.Join(home, "w", "notes.txt"), true)
+}
+
+// m8: a home changed within min-idle is kept and stays on disk.
+func TestVerifyHomeKeepsOrphanChangedWithinMinIdle(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Rc01Cd"), runMarker(trimItemAcc, false, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	soon := f.now.Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(home, "w", "notes.txt"), soon, soon); err != nil {
+		t.Fatal(err)
+	}
+	got := f.sweep(t, sweepHubState{}, true)
+	requireHomeDecision(t, got, home, "kept", keepRecent, kindVerifyHome, "changed 1h0m0s ago")
+	requireExists(t, filepath.Join(home, "w", "notes.txt"), true)
+}
+
+// m8: an unmarked tv- home is kept, reported by size, and stays on disk.
+func TestVerifyHomeKeepsAndReportsUnmarkedTempHome(t *testing.T) {
+	f := newHomeFixture(t)
+	home := writeHome(t, filepath.Join(f.tmp, "tv-Um01Cd"), nil)
+	writeFixtureFile(t, filepath.Join(f.tmp, "tv-not-a-home", "x"), "other name\n")
+	before := fixtureTree(t, f.tmp)
+	got := f.sweep(t, sweepHubState{}, true)
+	if d := requireHomeDecision(t, got, home, "kept", keepUnproven, kindVerifyHome, "no provenance marker; "); d.Bytes <= 0 {
+		t.Fatalf("report %+v", d)
+	}
+	if _, ok := got[filepath.Join(f.tmp, "tv-not-a-home")]; ok {
+		t.Fatal("a folder not named like a home was examined")
+	}
+	if fixtureTree(t, f.tmp) != before {
+		t.Fatal("an unmarked home changed")
+	}
+}
+
+// m9 (wi_9dba982b10640b09): closeout examines a released entry's worktree
+// within one interval of the history read that follows its release, on the
+// runner's own clock.
+func TestWorktreeCleanupRunnerExaminesReleaseWithinOneInterval(t *testing.T) {
+	r := newCleanupRepo(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea13"
+	w := r.branchWorktree(t, r.queuePath("queue-bbbb0013"), "bug/clock")
+	commit := cleanupGit(t, w, "rev-parse", "HEAD")
+	finished := api.TeamQueueEntry{ID: "tqe_clock_case13", TaskID: task, ItemID: "wi_a7a7a7a7a7a7a7a7", State: "finished", Host: host, Cwd: w, Repository: r.common,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: w, Branch: "bug/clock", Commit: commit, Evidence: "verification receipt vr_13"}}
+	hub, c, e := closeoutRunnerHub(t, r, task, host, finished)
+	now := time.Now()
+	runner := teamRunner{worktrees: closeoutWorktrees, now: func() time.Time { return now }}
+	ctx := context.Background()
+
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	if rec, ok := receiptFor(readCleanupReceipts(t), w); !ok || rec.Action != "kept" || rec.Reason != keepUnpushed {
+		t.Fatalf("first tick receipt %+v %v, want an unpushed keep", rec, ok)
+	}
+	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/clock")
+
+	// A second short of the interval: no history read, nothing decided.
+	t0 := now
+	now = t0.Add(closeoutWorktreeInterval - time.Second)
+	before := len(hub.queryLog())
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	if n := historyReads(hub.queryLog()[before:], task); n != 0 {
+		t.Fatalf("history read %d times within the interval", n)
+	}
+	requireExists(t, w, true)
+
+	// One interval after the first read, the history is read again and the
+	// entry examined at once: the worktree goes.
+	now = t0.Add(closeoutWorktreeInterval)
+	before = len(hub.queryLog())
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	if n := historyReads(hub.queryLog()[before:], task); n != 1 {
+		t.Fatalf("history read %d times at the interval, want once", n)
+	}
+	requireExists(t, w, false)
+	if rec := homeReceipt(t, w, "removed"); rec.Source != "closeout" || rec.EntryID != finished.ID {
+		t.Fatalf("removal receipt %+v", rec)
+	}
 }

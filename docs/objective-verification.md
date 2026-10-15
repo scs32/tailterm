@@ -103,6 +103,19 @@ eligible receipt. If home removal fails, the runner removes `receipt.json`, writ
 `cleanup-error.json` beside the logs, exits nonzero, and reports the retained
 home path for manual recovery.
 
+Before its first Go command the runner writes a provenance marker,
+`tailterm-cache.json`, at the home's root: producer
+`scripts/verify-matrix.mjs@<commit>`, item, run, creation time, the cache
+directories it owns (`go-build`, `go/pkg/mod`), `keepHome`, its pid and the
+output directory. A run that is killed leaves its home behind; the worktree
+sweep removes a marked home whose run is gone, and a home kept with
+`--keep-home` is never removed whole but loses its owned caches. An agent
+that makes its own Go home for ad hoc verification writes the same marker
+with its own producer and item, under the item's artifact folder or an
+ignored folder of its checkout, so the sweep can trim its caches once the item
+is finished (`docs/project-queue.md`, "Verifier homes"). Unmarked homes and
+Go caches are only reported, never deleted.
+
 `GOPATH` always resolves inside the disposable home. `GOMODCACHE` and `GOCACHE`
 come from the shared verification caches described next when the plan can run
 Go, and otherwise resolve inside the home as before. The prepared test binaries

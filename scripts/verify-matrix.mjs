@@ -1253,7 +1253,9 @@ function writeJsonAtomically(path, value) {
   renameSync(temporary, path);
 }
 // Fields carried from the marker item (wi_60dbbbe5b36bf66b): producer, item,
-// run, creation time and the owned directories, relative to the root.
+// run, creation time and the owned directories, relative to the root. The
+// shared cache root and every verifier home carry one; the sweep trims only
+// what a valid marker owns and reports the rest.
 function cacheMarker(kind, context, owns, extra = {}) {
   return {
     version: 1,
@@ -1271,6 +1273,33 @@ export const validCacheMarker = (marker, kind) =>
   marker.kind === kind && Array.isArray(marker.owns) &&
   marker.owns.every((path) => typeof path === "string" && path && !isAbsolute(path) &&
     !path.split("/").includes(".."));
+
+// The provenance a run's markers carry: its item, run and candidate commit.
+function homeMarkerContext(plan, output) {
+  return {
+    item: plan.itemId || (plan.orderMessageSeq ? `order ${plan.orderMessageSeq}` : "unknown"),
+    run: plan.verifierRunId || output,
+    commit: plan.commit,
+  };
+}
+// The private Go caches of a verifier home, relative to it. Listed even when
+// the shared cache root leaves them unused, so an absent one is skipped.
+export const HOME_MARKER_OWNS = ["go-build", "go/pkg/mod"];
+// Marks a verifier home before its first Go command: the sweep removes a
+// marked home whose run is gone, or trims a kept one's owned caches, and
+// only reports an unmarked one. keepHome, pid and output identify the run.
+export function writeHomeMarker(home, context, { keepHome, output }) {
+  if (!/^[0-9a-f]{40}$/.test(String(context.commit)))
+    throw new Error("Verifier home marker needs the candidate's 40-hex commit");
+  if (typeof context.item !== "string" || !context.item || typeof context.run !== "string" || !context.run)
+    throw new Error("Verifier home marker needs an item and a run");
+  if (typeof output !== "string" || !isAbsolute(output))
+    throw new Error("Verifier home marker needs an absolute output directory");
+  writeJsonAtomically(
+    join(home, "tailterm-cache.json"),
+    cacheMarker("home", context, HOME_MARKER_OWNS, { keepHome: keepHome === true, pid: process.pid, output }),
+  );
+}
 
 function ensureCacheRoot(root, context) {
   const markerPath = join(root, "tailterm-cache.json");
@@ -1761,11 +1790,7 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
     clearTimeout(timer);
     return { environment: privateEnvironment };
   }
-  const context = {
-    item: plan.itemId || (plan.orderMessageSeq ? `order ${plan.orderMessageSeq}` : "unknown"),
-    run: plan.verifierRunId || output,
-    commit: plan.commit,
-  };
+  const context = homeMarkerContext(plan, output);
   const report = { version: 1, root: cacheRoot, mode: "shared", createdAt: new Date().toISOString() };
   let line;
   try {
@@ -2630,6 +2655,8 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
   const receiptPath = join(output, receiptName);
   let receiptWritten = false;
   try {
+    // Before anything runs in the home, so a killed run leaves it marked.
+    writeHomeMarker(home, homeMarkerContext(plan, output), { keepHome, output });
     mkdirSync(output, { recursive: true });
     // macOS sun_path has 104 bytes including NUL. Budget the complete canonical
     // path for the longest participating name (menu prefix19 + UUID36), plus

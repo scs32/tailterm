@@ -6,12 +6,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,6 +63,11 @@ const (
 	// A regenerable cache inside a kept checkout; its actions are
 	// would-trim and trimmed.
 	kindCache = "cache"
+	// A verifier home under /tmp, removed whole once its run is gone, and a
+	// cache directory a home's provenance marker owns, trimmed (see
+	// "Verifier homes" below).
+	kindVerifyHome = "verify-home"
+	kindHomeCache  = "home-cache"
 )
 
 // defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
@@ -155,6 +164,10 @@ type worktreeCleanupInputs struct {
 	// rename before deleting them, and finish or drop what an interrupted
 	// pass left behind (sweep only).
 	Tombstones bool
+	// TempHomes, with Trim, claims the pass over /tmp verifier homes; it
+	// returns false when this sweep already ran it for another repository.
+	// Nil skips /tmp.
+	TempHomes func() bool
 }
 
 // exclusive runs act under in.Exclusive, or directly without one. inUse is
@@ -943,8 +956,14 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	if in.Apply && in.Tombstones {
 		decisions = append(decisions, recoverDetachIntents(in, main, art)...)
 	}
-	decisions = append(decisions, trimCaches(ctx, in, common, main, candidates, decisions, linked, art, now)...)
+	trims, eligible := trimCaches(ctx, in, common, main, candidates, decisions, linked, art, now)
+	decisions = append(decisions, trims...)
 	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, art, now)...)
+	homes, err := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
+	if err != nil {
+		return nil, err
+	}
+	decisions = append(decisions, homes...)
 	if in.Apply {
 		for i := range decisions {
 			recorded, err := recordWorktreeDecision(in.Receipt, decisions[i], now)
@@ -2004,10 +2023,19 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		return nil
 	}
 	now := time.Now()
-	if last, ok := closeoutWorktreeChecks.Load(q.ID); ok && now.Sub(last.(time.Time)) < closeoutWorktreeInterval {
+	// The entry is gated on the clock its history read was stamped with, so
+	// a history read an interval after the last one examines the entry
+	// again, instead of finding it a moment short of the interval on another
+	// clock and waiting for the next read (wi_9dba982b10640b09). Direct
+	// callers, with no history read, use the time now.
+	gateAt := now
+	if read, ok := closeoutHistoryReads.Load(c.Base + "\x00" + q.TaskID); ok {
+		gateAt = read.(time.Time)
+	}
+	if last, ok := closeoutWorktreeChecks.Load(q.ID); ok && gateAt.Sub(last.(time.Time)) < closeoutWorktreeInterval {
 		return nil
 	}
-	closeoutWorktreeChecks.Store(q.ID, now)
+	closeoutWorktreeChecks.Store(q.ID, gateAt)
 	if q.Summary {
 		full, err := c.GetTeamQueueEntry(ctx, q.TaskID, q.ID)
 		if err != nil {
@@ -2255,6 +2283,7 @@ func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o s
 		Items: artifactItemStates(state.entries, state.agents), Artifacts: o.Artifacts, AcceptedAfter: o.AcceptedAfter,
 		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
 		Trim: finishedTrimSet(host, state.entries, state.agents), Tombstones: o.Apply,
+		TempHomes: func() bool { return claimVerifyHomeTempPass(o.Now) },
 	}
 	if o.Matrix != nil {
 		// A matrix run keeps the checkout, output and record folders it holds.
@@ -2281,7 +2310,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	fs := flag.NewFlagSet("team queue sweep-worktrees", flag.ContinueOnError)
 	hub := fs.String("hub", e.hub, "hub URL")
 	cwd := fs.String("cwd", "", "any worktree of the repository (default: current directory)")
-	apply := fs.Bool("apply", false, "remove the would-remove worktrees and session temp folders, trim the would-trim caches and prune missing worktrees")
+	apply := fs.Bool("apply", false, "remove the would-remove worktrees, session temp folders and verifier homes, trim the would-trim caches and prune missing worktrees")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
 	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old")
@@ -2355,7 +2384,11 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		if d.Action == "kept" {
 			report.Totals.Kept[d.Reason]++
 		}
-		report.Totals.Bytes += d.Bytes
+		// A kept decision's bytes are a size report (an unmarked cache), not
+		// reclaimable space.
+		if d.Action != "kept" {
+			report.Totals.Bytes += d.Bytes
+		}
 		if d.strayRoot != "" {
 			strays, strayRoot = strays+1, d.strayRoot
 		}
@@ -2395,7 +2428,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	sort.Strings(reasons)
 	fmt.Printf("totals: %s; kept by reason: %s; %s %s\n", strings.Join(parts, " "), strings.Join(reasons, " "), map[bool]string{true: "removed", false: "reclaimable"}[*apply], humanBytes(report.Totals.Bytes))
 	if !*apply {
-		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees and session temp folders and trim the would-trim caches")
+		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees, session temp folders and verifier homes and trim the would-trim caches")
 	}
 	return err
 }
@@ -2408,6 +2441,10 @@ func worktreeLabel(d worktreeDecision) string {
 		return "session temp"
 	case kindCache:
 		return "cache; " + d.Detail
+	case kindVerifyHome:
+		return "verifier home; " + d.Detail
+	case kindHomeCache:
+		return "verifier home cache; " + d.Detail
 	}
 	label := "detached " + shortSHA(d.Head)
 	if d.Branch != "" {
@@ -2534,7 +2571,7 @@ func neverTouchPaths() []string {
 	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
 		out = append(out, filepath.Join(home, "Library", "Caches"), filepath.Join(home, "go"), filepath.Join(home, ".npm"))
 	}
-	for _, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "npm_config_cache"} {
+	for _, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "npm_config_cache", "TAILTERM_VERIFICATION_CACHE"} {
 		for _, p := range filepath.SplitList(os.Getenv(name)) {
 			if filepath.IsAbs(p) {
 				out = append(out, p)
@@ -2570,9 +2607,9 @@ func neverTouch(path string, infos ...os.FileInfo) string {
 // applying, trims it. candidates and decisions are the worktree pass's, in
 // the same order. A checkout with no cache, or one that is not attributable
 // to a finished item, gets no decision.
-func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main string, candidates []gitWorktree, decisions []worktreeDecision, linked []string, art *artifactPass, now time.Time) []worktreeDecision {
+func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main string, candidates []gitWorktree, decisions []worktreeDecision, linked []string, art *artifactPass, now time.Time) ([]worktreeDecision, []trimCheckout) {
 	if in.Trim == nil {
-		return nil
+		return nil, nil
 	}
 	var roots []string
 	if main != "" {
@@ -2582,6 +2619,7 @@ func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main stri
 		roots = append(roots, art.root)
 	}
 	var out []worktreeDecision
+	var eligible []trimCheckout
 	for i, w := range candidates {
 		if i >= len(decisions) || decisions[i].Path != w.Path || decisions[i].Action != "kept" || !trimKeptReasons[decisions[i].Reason] {
 			continue
@@ -2600,9 +2638,13 @@ func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main stri
 				allowed = root
 			}
 		}
+		if allowed == "" {
+			continue
+		}
+		eligible = append(eligible, trimCheckout{w: w, item: item, allowed: allowed})
 		cache := filepath.Join(w.Path, trimCacheName)
 		cacheInfo, err := os.Lstat(cache)
-		if allowed == "" || err != nil {
+		if err != nil {
 			continue
 		}
 		d := worktreeDecision{Path: cache, Branch: strings.TrimPrefix(w.Branch, "refs/heads/"), Head: w.Head, Kind: kindCache}
@@ -2626,7 +2668,15 @@ func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main stri
 		}
 		out = append(out, d)
 	}
-	return out
+	return out, eligible
+}
+
+// trimCheckout is a kept checkout of a finished item that the trim may
+// reach: its item and the worktrees or artifacts root it lies under.
+type trimCheckout struct {
+	w       gitWorktree
+	item    string
+	allowed string
 }
 
 // classifyCache returns the checkout's identity and the first reason its
@@ -2769,7 +2819,8 @@ func trimCheckoutCache(in worktreeCleanupInputs, w gitWorktree, admin string, ch
 // tombstone in the same directory, and nothing else.
 type detachIntent struct {
 	At string `json:"at"`
-	// Kind is the decision kind: cache or session-temp.
+	// Kind is the decision kind: cache, session-temp, verify-home or
+	// home-cache.
 	Kind string `json:"kind"`
 	// Parent is the pinned directory's canonical path and Root the worktrees,
 	// artifacts or session temp root it was recorded under.
@@ -2792,6 +2843,13 @@ func directoryIdentity(info os.FileInfo) (uint64, uint64, bool) {
 	return uint64(st.Dev), uint64(st.Ino), true
 }
 
+// detachedAtRoot says whether a kind is detached directly in its root (a
+// session temp folder, a /tmp verifier home) rather than in a directory
+// below it (a cache).
+func detachedAtRoot(kind string) bool {
+	return kind == kindSessionTemp || kind == kindVerifyHome
+}
+
 func validTombstone(name string) bool {
 	suffix, ok := strings.CutPrefix(name, tombstonePrefix)
 	return ok && suffix != "" && !strings.ContainsAny(name, "/\\")
@@ -2799,7 +2857,8 @@ func validTombstone(name string) bool {
 
 // rootMakeWritable adds owner rwx to the directories under name that lack
 // it, through the root, so a read-only module cache in a session temp folder
-// can be deleted. It never leaves the root.
+// or a verifier home can be deleted. It never leaves the root. node_modules
+// is never made writable.
 func rootMakeWritable(root *os.Root, name string) {
 	_ = fs.WalkDir(root.FS(), name, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
@@ -2860,7 +2919,7 @@ func detachAndDelete(in worktreeCleanupInputs, root *os.Root, parent os.FileInfo
 	if detachCrashAt != nil && detachCrashAt("renamed") {
 		return keepFailed, "interrupted after the rename"
 	}
-	if kind == kindSessionTemp {
+	if kind != kindCache {
 		rootMakeWritable(root, intent.Tombstone)
 	}
 	if err := root.RemoveAll(intent.Tombstone); err != nil {
@@ -2936,6 +2995,11 @@ func recoverDetachIntents(in worktreeCleanupInputs, main string, art *artifactPa
 	if in.TempRoot != "" {
 		roots[canonicalPath(in.TempRoot)] = true
 	}
+	if in.Trim != nil {
+		if root := verifyHomeTempRoot(); root != "" {
+			roots[canonicalPath(root)] = true
+		}
+	}
 	intents, err := loadDetachIntents()
 	if err != nil {
 		return nil
@@ -2950,7 +3014,7 @@ func recoverDetachIntents(in worktreeCleanupInputs, main string, art *artifactPa
 		switch {
 		case cause == "":
 			d.Action, d.Detail = "removed", "finished an interrupted sweep: deleted "+intent.Tombstone
-			if intent.Kind == kindCache {
+			if intent.Kind == kindCache || intent.Kind == kindHomeCache {
 				d.Action = "trimmed"
 			}
 		case retry:
@@ -2975,7 +3039,9 @@ func finishDetach(intent detachIntent) (string, bool) {
 	if !validTombstone(intent.Tombstone) || intent.Source == "" || strings.ContainsAny(intent.Source, "/\\") || !filepath.IsAbs(intent.Parent) || !filepath.IsAbs(intent.Root) {
 		return "the intent is malformed", false
 	}
-	if intent.Kind != kindCache && intent.Kind != kindSessionTemp {
+	switch intent.Kind {
+	case kindCache, kindSessionTemp, kindVerifyHome, kindHomeCache:
+	default:
 		return "the intent has an unknown kind", false
 	}
 	root, err := os.OpenRoot(intent.Parent)
@@ -2991,7 +3057,7 @@ func finishDetach(intent detachIntent) (string, bool) {
 		return "the parent is not the directory the intent recorded", false
 	}
 	parent := canonicalPath(intent.Parent)
-	if parent != intent.Parent || !pathWithin(parent, intent.Root) || (parent == intent.Root) != (intent.Kind == kindSessionTemp) {
+	if parent != intent.Parent || !pathWithin(parent, intent.Root) || (parent == intent.Root) != detachedAtRoot(intent.Kind) {
 		return "the parent no longer lies under " + intent.Root, false
 	}
 	tombstone, err := root.Lstat(intent.Tombstone)
@@ -3007,11 +3073,1055 @@ func finishDetach(intent detachIntent) (string, bool) {
 	if deny := neverTouch(filepath.Join(parent, intent.Tombstone), pinned, tombstone); deny != "" {
 		return "it touches the never-touch path " + deny, false
 	}
-	if intent.Kind == kindSessionTemp {
+	if intent.Kind != kindCache {
 		rootMakeWritable(root, intent.Tombstone)
 	}
 	if err := root.RemoveAll(intent.Tombstone); err != nil {
 		return "detached as " + intent.Tombstone + " but not deleted: " + err.Error(), true
 	}
 	return "", false
+}
+
+// Verifier homes.
+//
+// verify-matrix runs every check in a private home, /tmp/tv-XXXXXX, and
+// writes a provenance marker at its root before its first Go command. A run
+// that is killed never reaches its own cleanup, so its home stays. The sweep
+// (never closeout) acts only on what a valid marker proves:
+//   - a marked /tmp home whose run is gone is removed whole, unless its
+//     marker says the run kept it on purpose (--keep-home);
+//   - a kept /tmp home, and a marked home under the artifacts root or inside
+//     a finished checkout, loses only the cache directories its marker owns;
+//   - an unmarked home or Go cache is reported with its size, never deleted.
+// A cache the harness cannot prove it created is not deleted on a guess.
+
+const (
+	// homeMarkerName is the marker file at a home's root, the same name the
+	// shared verification cache root uses.
+	homeMarkerName     = "tailterm-cache.json"
+	homeMarkerMaxBytes = 64 << 10
+	// The walks for marked homes and unmarked Go caches go at most this many
+	// levels below the artifacts root and below an eligible checkout.
+	artifactHomeDepth = 4
+	checkoutHomeDepth = 3
+	// unmarkedCacheReport is how many unmarked Go caches a pass lists.
+	unmarkedCacheReport = 10
+	// homeUnreadableMargin is how much older than a home an unreadable
+	// process must be to count as started before it.
+	homeUnreadableMargin = 5 * time.Second
+)
+
+var (
+	verifyHomeNamePattern = regexp.MustCompile(`^tv-[A-Za-z0-9]{6}$`)
+	verifyMatrixProducer  = regexp.MustCompile(`^scripts/verify-matrix\.mjs@[0-9a-f]{40}$`)
+	// verifyMatrixOwns is what verify-matrix's marker owns: its private Go
+	// build and module caches.
+	verifyMatrixOwns = []string{"go-build", "go/pkg/mod"}
+	homeEnvVariable  = regexp.MustCompile(`(?:^|\s)(?:HOME|TMPDIR|PWD)=(\S+)`)
+	allDigits        = regexp.MustCompile(`^\d+$`)
+)
+
+// verifyHomeTempRoot is where verify-matrix makes its homes; only its direct
+// tv-* children are examined. "" skips /tmp. Tests replace it.
+var verifyHomeTempRoot = func() string { return "/tmp" }
+
+// verifyHomeTempPass remembers the sweep time whose /tmp pass already ran,
+// so a sweep over several repositories examines /tmp once.
+var verifyHomeTempPass struct {
+	sync.Mutex
+	at      time.Time
+	claimed bool
+}
+
+func claimVerifyHomeTempPass(now time.Time) bool {
+	verifyHomeTempPass.Lock()
+	defer verifyHomeTempPass.Unlock()
+	if verifyHomeTempPass.claimed && verifyHomeTempPass.at.Equal(now) {
+		return false
+	}
+	verifyHomeTempPass.at, verifyHomeTempPass.claimed = now, true
+	return true
+}
+
+// homeMarker is a validated provenance marker.
+type homeMarker struct {
+	Producer  string
+	Item      string
+	Run       string
+	CreatedAt time.Time
+	Owns      []string
+	// verify-matrix's identity: set only when notVerifyMatrix is "".
+	KeepHome bool
+	PID      int
+	Output   string
+	// notVerifyMatrix says why the marker lacks verify-matrix's identity.
+	notVerifyMatrix string
+}
+
+// parseHomeMarker validates a marker's bytes. Any base fault refuses the
+// whole marker and names the field; a marker without verify-matrix's exact
+// identity is still valid, for homes an agent made by hand, but proves no
+// /tmp home.
+func parseHomeMarker(data []byte) (homeMarker, string) {
+	var m homeMarker
+	object, ok := jsonObject(data)
+	if !ok {
+		return m, "not a JSON object"
+	}
+	if v, ok := jsonInteger(object["version"]); !ok || v != 1 {
+		return m, "version: not the number 1"
+	}
+	if kind, ok := jsonText(object["kind"]); !ok || kind != "home" {
+		return m, `kind: not "home"`
+	}
+	for _, field := range []struct {
+		name string
+		to   *string
+	}{{"producer", &m.Producer}, {"item", &m.Item}, {"run", &m.Run}} {
+		text, ok := jsonText(object[field.name])
+		if !ok || text == "" {
+			return m, field.name + ": not a non-empty string"
+		}
+		*field.to = text
+	}
+	created, ok := jsonText(object["createdAt"])
+	if !ok {
+		return m, "createdAt: not a string"
+	}
+	at, err := time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return m, "createdAt: not an RFC 3339 time"
+	}
+	m.CreatedAt = at
+	owns, ok := jsonArray(object["owns"])
+	if !ok || len(owns) == 0 {
+		return m, "owns: not a non-empty array"
+	}
+	seen := map[string]bool{}
+	for _, raw := range owns {
+		p, ok := jsonText(raw)
+		switch {
+		case !ok || p == "":
+			return m, "owns: an entry is not a non-empty string"
+		case filepath.IsAbs(p):
+			return m, "owns: " + p + " is absolute"
+		case filepath.Clean(p) != p || p == ".":
+			return m, "owns: " + p + " is not a clean relative path"
+		case slicesContains(strings.Split(p, "/"), ".."):
+			return m, "owns: " + p + " leaves the home"
+		case p == homeMarkerName:
+			return m, "owns: names the marker itself"
+		case seen[p]:
+			return m, "owns: " + p + " is listed twice"
+		}
+		seen[p] = true
+		m.Owns = append(m.Owns, p)
+	}
+	m.notVerifyMatrix = verifyMatrixIdentity(object, &m)
+	return m, ""
+}
+
+func slicesContains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyMatrixIdentity fills keepHome, pid and output and returns "" when
+// the marker is exactly verify-matrix's, else why not.
+func verifyMatrixIdentity(object map[string]json.RawMessage, m *homeMarker) string {
+	if !verifyMatrixProducer.MatchString(m.Producer) {
+		return "producer " + strconv.Quote(m.Producer) + " is not scripts/verify-matrix.mjs@<commit>"
+	}
+	switch strings.TrimSpace(string(object["keepHome"])) {
+	case "true":
+		m.KeepHome = true
+	case "false":
+	default:
+		return "keepHome: not a boolean"
+	}
+	pid, ok := jsonInteger(object["pid"])
+	if !ok || pid <= 0 || pid > 1<<31-1 {
+		return "pid: not a positive whole number"
+	}
+	m.PID = int(pid)
+	output, ok := jsonText(object["output"])
+	if !ok || !filepath.IsAbs(output) {
+		return "output: not an absolute path"
+	}
+	m.Output = filepath.Clean(output)
+	if strings.Join(m.Owns, "\x00") != strings.Join(verifyMatrixOwns, "\x00") {
+		return "owns: not exactly " + strings.Join(verifyMatrixOwns, ", ")
+	}
+	return ""
+}
+
+// readHomeMarker reads the marker through the pinned home. found is false
+// when there is none; a fault refuses it.
+func readHomeMarker(home *os.Root) (m homeMarker, found bool, fault string) {
+	info, err := home.Lstat(homeMarkerName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return m, false, ""
+	}
+	if err != nil {
+		return m, true, "marker: " + err.Error()
+	}
+	if !info.Mode().IsRegular() {
+		return m, true, "marker: not a regular file"
+	}
+	if info.Size() > homeMarkerMaxBytes {
+		return m, true, "marker: larger than 64 KiB"
+	}
+	file, err := home.Open(homeMarkerName)
+	if err != nil {
+		return m, true, "marker: " + err.Error()
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return m, true, "marker: replaced while it was read"
+	}
+	data, err := io.ReadAll(io.LimitReader(file, homeMarkerMaxBytes+1))
+	if err != nil {
+		return m, true, "marker: " + err.Error()
+	}
+	if len(data) > homeMarkerMaxBytes {
+		return m, true, "marker: larger than 64 KiB"
+	}
+	m, fault = parseHomeMarker(data)
+	return m, true, fault
+}
+
+// ownedPath checks one owned path through the pinned home, component by
+// component, never following a link. It returns the owned directory's
+// info, or nil when it is absent, or the reason it is refused.
+func ownedPath(home *os.Root, owned string) (os.FileInfo, string) {
+	parts := strings.Split(owned, "/")
+	var info os.FileInfo
+	for i := range parts {
+		rel := strings.Join(parts[:i+1], "/")
+		var err error
+		info, err = home.Lstat(rel)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, ""
+		}
+		if err != nil {
+			return nil, "owned path " + owned + ": " + err.Error()
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, "owned path " + owned + ": " + rel + " is a link; nothing followed"
+		}
+		if !info.IsDir() {
+			return nil, "owned path " + owned + ": " + rel + " is not a directory"
+		}
+	}
+	return info, ""
+}
+
+// Home scopes.
+const (
+	homeScopeTemp      = "tmp"
+	homeScopeArtifacts = "artifacts"
+	homeScopeCheckout  = "checkout"
+)
+
+// verifierHome is one marked home a pass may act on.
+type verifierHome struct {
+	path  string
+	scope string
+	// root is the worktrees, artifacts or /tmp root the home lies under.
+	root   string
+	info   os.FileInfo
+	marker homeMarker
+	// whole removes the home; otherwise its present owned caches go.
+	whole bool
+	owned []string
+	// checkout is the eligible checkout holding a checkout-scope home.
+	checkout *trimCheckout
+	// spellings are the paths a process may use for the home.
+	spellings []string
+}
+
+func (h *verifierHome) kind() string {
+	if h.whole {
+		return kindVerifyHome
+	}
+	return kindHomeCache
+}
+
+// inUseAt says how a path in use keeps the home, or "": the worktree rule,
+// and the home's run writing to an output at or under that path.
+func (h *verifierHome) inUseAt(p string, linked []string) string {
+	if why := worktreeInUseAt(h.path, p, linked); why != "" {
+		return why
+	}
+	if h.marker.Output != "" && pathWithin(canonicalPath(h.marker.Output), p) {
+		return "its run's output " + h.marker.Output + " is in use at " + p
+	}
+	return ""
+}
+
+// unmarkedGoCache is a Go cache found with no marker, reported only.
+type unmarkedGoCache struct {
+	path  string
+	what  string
+	bytes int64
+}
+
+// goCacheKind names a Go build or module cache at dir, or "".
+func goCacheKind(dir string) string {
+	if info, err := os.Lstat(filepath.Join(dir, "cache", "download")); err == nil && info.IsDir() {
+		return "Go module cache"
+	}
+	if info, err := os.Lstat(filepath.Join(dir, "trim.txt")); err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	file, err := os.Open(filepath.Join(dir, "README"))
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	head := make([]byte, len(goCacheReadmeLine)+1)
+	n, _ := io.ReadFull(file, head)
+	if line := string(head[:n]); line == goCacheReadmeLine || line == goCacheReadmeLine+"\n" {
+		return "Go build cache"
+	}
+	return ""
+}
+
+// walkForHomes finds marked homes and unmarked Go caches below root, at most
+// depth levels down. It never follows a link and never enters .git,
+// node_modules, a checkout, a tombstone, or a home or cache it found.
+func walkForHomes(root string, depth int, home func(dir string), cache func(dir, what string)) {
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() && p != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if p == root || !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == ".git" || name == trimCacheName || strings.HasPrefix(name, tombstonePrefix) {
+			return filepath.SkipDir
+		}
+		if _, err := os.Lstat(filepath.Join(p, ".git")); err == nil {
+			return filepath.SkipDir
+		}
+		if _, err := os.Lstat(filepath.Join(p, homeMarkerName)); err == nil {
+			home(p)
+			return filepath.SkipDir
+		}
+		if what := goCacheKind(p); what != "" {
+			cache(p, what)
+			return filepath.SkipDir
+		}
+		if rel, err := filepath.Rel(root, p); err == nil && strings.Count(rel, "/")+1 >= depth {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+}
+
+// openHome pins a home directory and reads its marker. It returns the
+// home, or a keep reason and detail.
+func openHome(path string, info os.FileInfo, scope, root string) (*verifierHome, string, string) {
+	pinned, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, keepFailed, err.Error()
+	}
+	defer pinned.Close()
+	if got, err := pinned.Stat("."); err != nil || !os.SameFile(info, got) {
+		return nil, keepMoved, "the home was replaced while it was read"
+	}
+	m, found, fault := readHomeMarker(pinned)
+	if !found {
+		return nil, keepUnproven, "no provenance marker"
+	}
+	if fault != "" {
+		return nil, keepUnproven, "provenance marker refused: " + fault
+	}
+	h := &verifierHome{path: path, scope: scope, root: root, info: info, marker: m, spellings: []string{path}}
+	if scope == homeScopeTemp {
+		if m.notVerifyMatrix != "" {
+			return nil, keepUnproven, "not a verify-matrix home: " + m.notVerifyMatrix
+		}
+		h.whole = !m.KeepHome
+	}
+	if !h.whole {
+		for _, owned := range m.Owns {
+			info, why := ownedPath(pinned, owned)
+			if why != "" {
+				return nil, keepUnproven, why
+			}
+			if info != nil {
+				h.owned = append(h.owned, owned)
+			}
+		}
+	}
+	return h, "", ""
+}
+
+// cleanupVerifierHomes is the sweep's pass over verifier homes: /tmp once per
+// sweep, the artifacts root, and the eligible checkouts the cache trim found.
+func cleanupVerifierHomes(ctx context.Context, in worktreeCleanupInputs, common, main string, eligible []trimCheckout, inUse, linked []string, art *artifactPass, now time.Time) ([]worktreeDecision, error) {
+	if in.Trim == nil {
+		return nil, nil
+	}
+	var out []worktreeDecision
+	var homes []*verifierHome
+	var unmarked []unmarkedGoCache
+	kept := func(path, kind, reason, detail string, bytes int64) {
+		out = append(out, worktreeDecision{Path: path, Kind: kind, Action: "kept", Reason: reason, Detail: detail, Bytes: bytes})
+	}
+	found := func(path, scope, root string, checkout *trimCheckout) {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() {
+			return
+		}
+		h, reason, detail := openHome(path, info, scope, root)
+		kind := kindHomeCache
+		if scope == homeScopeTemp {
+			kind = kindVerifyHome
+		}
+		switch {
+		case reason == keepUnproven && detail == "no provenance marker":
+			bytes := worktreeBytes(path, nil)
+			kept(path, kind, reason, "no provenance marker; "+humanBytes(bytes), bytes)
+		case reason != "":
+			kept(path, kind, reason, detail, 0)
+		case h.whole || len(h.owned) > 0:
+			h.checkout = checkout
+			homes = append(homes, h)
+		}
+	}
+	cacheFound := func(dir, what string) {
+		unmarked = append(unmarked, unmarkedGoCache{path: dir, what: what, bytes: worktreeBytes(dir, nil)})
+	}
+	// /tmp: its direct tv-* children, real directories only.
+	if in.TempHomes != nil {
+		if raw := verifyHomeTempRoot(); raw != "" && in.TempHomes() {
+			root := canonicalPath(raw)
+			entries, _ := os.ReadDir(root)
+			for _, e := range entries {
+				if !verifyHomeNamePattern.MatchString(e.Name()) || e.Type()&os.ModeSymlink != 0 || !e.IsDir() {
+					continue
+				}
+				found(filepath.Join(root, e.Name()), homeScopeTemp, root, nil)
+			}
+			for _, h := range homes {
+				if h.scope == homeScopeTemp {
+					if alt := filepath.Join(filepath.Clean(raw), filepath.Base(h.path)); alt != h.path {
+						h.spellings = append(h.spellings, alt)
+					}
+				}
+			}
+		}
+	}
+	if art != nil {
+		walkForHomes(art.root, artifactHomeDepth, func(dir string) { found(dir, homeScopeArtifacts, art.root, nil) }, cacheFound)
+	}
+	for i := range eligible {
+		c := &eligible[i]
+		walkForHomes(c.w.Path, checkoutHomeDepth, func(dir string) { found(dir, homeScopeCheckout, c.allowed, c) }, cacheFound)
+	}
+	// Every gate but the process probe, cheapest first.
+	var paths []string
+	for _, h := range homes {
+		paths = append(paths, h.path)
+	}
+	cited, err := docsCitations(ctx, common, main, paths, nil)
+	if err != nil {
+		return nil, fmt.Errorf("evidence lookup: %w", err)
+	}
+	var pending []*verifierHome
+	for _, h := range homes {
+		if reason, detail := classifyVerifierHome(ctx, in, main, h, inUse, linked, cited, art, now); reason != "" {
+			kept(h.path, h.kind(), reason, detail, 0)
+			continue
+		}
+		pending = append(pending, h)
+	}
+	// One process probe for every home still removable.
+	if len(pending) > 0 {
+		hits, notes, err := probeVerifierHomes(verifyHomeProbes(), pending)
+		var rest []*verifierHome
+		for _, h := range pending {
+			switch {
+			case err != nil:
+				kept(h.path, h.kind(), keepFailed, "process probe: "+err.Error(), 0)
+			case hits[h.path] != "":
+				kept(h.path, h.kind(), keepInUse, hits[h.path], 0)
+			default:
+				rest = append(rest, h)
+			}
+		}
+		for _, h := range rest {
+			out = append(out, actOnVerifierHome(in, h, linked, notes[h.path])...)
+		}
+	}
+	// The largest unmarked Go caches, reported and never touched.
+	sort.SliceStable(unmarked, func(i, j int) bool {
+		if unmarked[i].bytes != unmarked[j].bytes {
+			return unmarked[i].bytes > unmarked[j].bytes
+		}
+		return unmarked[i].path < unmarked[j].path
+	})
+	for i, c := range unmarked {
+		if i == unmarkedCacheReport {
+			break
+		}
+		kept(c.path, kindCache, keepUnproven, "no provenance marker; "+c.what+", "+humanBytes(c.bytes), c.bytes)
+	}
+	return out, nil
+}
+
+// classifyVerifierHome returns the first reason a marked home is kept, or ""
+// when only the process probe remains.
+func classifyVerifierHome(ctx context.Context, in worktreeCleanupInputs, main string, h *verifierHome, inUse, linked []string, cited map[string]string, art *artifactPass, now time.Time) (string, string) {
+	item := h.marker.Item
+	switch h.scope {
+	case homeScopeArtifacts:
+		rel := strings.TrimPrefix(h.path, strings.TrimSuffix(h.root, "/")+"/")
+		if folder, _, _ := strings.Cut(rel, "/"); artifactItemIDPattern.MatchString(folder) && folder != item {
+			return keepUnproven, "marker names " + item + ", folder belongs to " + folder
+		}
+		if !artifactItemIDPattern.MatchString(item) {
+			return keepUnproven, "marker item " + strconv.Quote(item) + " is not a work item"
+		}
+		if !in.Trim.Items[item] {
+			detail := item + " is not finished"
+			if st, ok := art.items[item]; ok && st.Detail != "" {
+				detail += ": " + st.Detail
+			}
+			return keepItemActive, detail
+		}
+	case homeScopeCheckout:
+		if item != h.checkout.item {
+			return keepUnproven, "marker names " + item + ", checkout belongs to " + h.checkout.item
+		}
+		admin := worktreeAdminDir(h.checkout.w.Path)
+		if admin == "" {
+			return keepFailed, "the checkout has no readable .git link"
+		}
+		if _, err := os.Lstat(filepath.Join(admin, "locked")); h.checkout.w.Locked || err == nil {
+			return keepLocked, "git worktree is locked"
+		}
+		if op := worktreeOperation(admin); op != "" {
+			return keepOperation, op + " in progress"
+		}
+		if in.MinIdle > 0 {
+			if idle := worktreeIdle(admin, now); idle < in.MinIdle {
+				return keepRecent, fmt.Sprintf("Git state changed %s ago", idle.Round(time.Minute))
+			}
+		}
+		rel, err := filepath.Rel(h.checkout.w.Path, h.path)
+		if err != nil {
+			return keepFailed, err.Error()
+		}
+		tracked, err := worktreeGit(ctx, h.checkout.w.Path, "ls-files", "-z", "--", rel)
+		if err != nil {
+			return keepFailed, err.Error()
+		}
+		if tracked != "" {
+			return keepUnproven, rel + " holds tracked files"
+		}
+		if _, err := worktreeGit(ctx, h.checkout.w.Path, "check-ignore", "-q", rel); err != nil {
+			if gitExitCode(err) == 1 {
+				return keepUnproven, rel + " is not ignored by Git"
+			}
+			return keepFailed, err.Error()
+		}
+	}
+	for _, p := range append(append([]string(nil), inUse...), in.InUse...) {
+		if p == "" || !filepath.IsAbs(p) {
+			continue
+		}
+		if detail := h.inUseAt(canonicalPath(p), linked); detail != "" {
+			return keepInUse, detail
+		}
+	}
+	if h.marker.PID > 0 && verifyHomeProbes().alive(h.marker.PID) {
+		return keepInUse, fmt.Sprintf("its run's process %d is alive", h.marker.PID)
+	}
+	if in.MinIdle > 0 {
+		if idle := sessionTempIdle(h.path, now); idle < in.MinIdle {
+			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
+		}
+	}
+	targets := []string{h.path}
+	for _, owned := range h.owned {
+		targets = append(targets, filepath.Join(h.path, owned))
+	}
+	for _, target := range targets {
+		info, _ := os.Lstat(target)
+		if deny := neverTouch(target, info); deny != "" {
+			return keepProtected, target + " touches the never-touch path " + deny
+		}
+	}
+	if file := cited[h.path]; file != "" {
+		return keepEvidence, "cited by " + file
+	}
+	evidence := append([]worktreeEvidence(nil), in.Evidence...)
+	texts, fault := art.itemTexts(item)
+	if fault != "" {
+		return keepFailed, "receipt scan: " + fault
+	}
+	for _, ev := range append(evidence, texts...) {
+		for _, pattern := range worktreeEvidencePatterns(h.path, main) {
+			if strings.Contains(ev.Text, pattern) {
+				return keepEvidence, "cited by " + ev.Source
+			}
+		}
+	}
+	return "", ""
+}
+
+// actOnVerifierHome decides a home that passed every gate: would-remove or
+// removed whole, or one would-trim or trimmed decision per owned cache.
+func actOnVerifierHome(in worktreeCleanupInputs, h *verifierHome, linked []string, note string) []worktreeDecision {
+	if h.whole {
+		d := worktreeDecision{Path: h.path, Kind: kindVerifyHome, Bytes: worktreeBytes(h.path, nil)}
+		d.Action, d.Detail = "would-remove", "orphaned home of run "+h.marker.Run+" for "+h.marker.Item
+		if note != "" {
+			d.Detail += "; " + note
+		}
+		if in.Apply {
+			if reason, why := detachVerifierHome(in, h, linked); reason != "" {
+				d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
+			} else {
+				d.Action = "removed"
+			}
+		}
+		return []worktreeDecision{d}
+	}
+	var out []worktreeDecision
+	for _, owned := range h.owned {
+		path := filepath.Join(h.path, owned)
+		d := worktreeDecision{Path: path, Kind: kindHomeCache, Bytes: worktreeBytes(path, nil)}
+		d.Action, d.Detail = "would-trim", "owned by the marker of "+h.marker.Item+" in "+h.path
+		if in.Apply {
+			if reason, why := trimHomeCache(in, h, owned, linked); reason != "" {
+				d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
+			} else {
+				d.Action = "trimmed"
+			}
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// recheckHome re-reads the pinned home's marker before a delete: the same
+// item, run and identity, and the run's process still gone.
+func recheckHome(home *os.Root, h *verifierHome) (string, string) {
+	m, found, fault := readHomeMarker(home)
+	switch {
+	case !found:
+		return keepMoved, "the provenance marker is gone"
+	case fault != "":
+		return keepUnproven, "provenance marker refused: " + fault
+	case m.Producer != h.marker.Producer || m.Item != h.marker.Item || m.Run != h.marker.Run || m.PID != h.marker.PID || m.Output != h.marker.Output || m.KeepHome != h.marker.KeepHome || m.notVerifyMatrix != h.marker.notVerifyMatrix:
+		return keepMoved, "the provenance marker changed since classification"
+	case m.PID > 0 && verifyHomeProbes().alive(m.PID):
+		return keepInUse, fmt.Sprintf("its run's process %d is alive", m.PID)
+	}
+	return "", ""
+}
+
+// detachVerifierHome removes a whole /tmp home through the pinned /tmp root.
+func detachVerifierHome(in worktreeCleanupInputs, h *verifierHome, linked []string) (string, string) {
+	rootInfo, err := os.Lstat(h.root)
+	if err != nil || !rootInfo.IsDir() {
+		return keepFailed, "the temp root is not a directory"
+	}
+	pinnedRoot, err := os.OpenRoot(h.root)
+	if err != nil {
+		return keepFailed, err.Error()
+	}
+	defer pinnedRoot.Close()
+	pinned, err := pinnedRoot.Stat(".")
+	if err != nil || !os.SameFile(rootInfo, pinned) {
+		return keepMoved, "the temp root was replaced"
+	}
+	name := filepath.Base(h.path)
+	check := func() (string, string) {
+		entry, err := pinnedRoot.Lstat(name)
+		if err != nil || !entry.IsDir() || !os.SameFile(entry, h.info) {
+			return keepMoved, "the home was replaced since it was classified"
+		}
+		home, err := pinnedRoot.OpenRoot(name)
+		if err != nil {
+			return keepMoved, err.Error()
+		}
+		defer home.Close()
+		if got, err := home.Stat("."); err != nil || !os.SameFile(got, h.info) {
+			return keepMoved, "the home was replaced since it was classified"
+		}
+		return recheckHome(home, h)
+	}
+	if reason, detail := check(); reason != "" {
+		return reason, detail
+	}
+	if deny := neverTouch(h.path, pinned, h.info); deny != "" {
+		return keepProtected, h.path + " touches the never-touch path " + deny
+	}
+	inUse := func(p string) string { return h.inUseAt(p, linked) }
+	return detachAndDelete(in, pinnedRoot, pinned, h.root, h.root, name, kindVerifyHome, inUse, check)
+}
+
+// trimHomeCache removes one owned cache directory of a marked home: every
+// component is checked through the pinned home, the parent is pinned too,
+// and the cache is detached from it.
+func trimHomeCache(in worktreeCleanupInputs, h *verifierHome, owned string, linked []string) (string, string) {
+	home, err := os.OpenRoot(h.path)
+	if err != nil {
+		return keepMoved, "the home cannot be opened: " + err.Error()
+	}
+	defer home.Close()
+	if got, err := home.Stat("."); err != nil || !os.SameFile(got, h.info) {
+		return keepMoved, "the home was replaced since it was classified"
+	}
+	check := func() (string, string) {
+		info, why := ownedPath(home, owned)
+		if why != "" {
+			return keepUnproven, why
+		}
+		if info == nil {
+			return keepMoved, "owned path " + owned + " is gone"
+		}
+		return recheckHome(home, h)
+	}
+	if reason, detail := check(); reason != "" {
+		return reason, detail
+	}
+	parentRel, name := filepath.Dir(owned), filepath.Base(owned)
+	parent, parentInfo := home, os.FileInfo(nil)
+	if parentRel == "." {
+		parentInfo, _ = home.Stat(".")
+	} else {
+		want, err := home.Lstat(parentRel)
+		if err != nil {
+			return keepMoved, err.Error()
+		}
+		if parent, err = home.OpenRoot(parentRel); err != nil {
+			return keepMoved, err.Error()
+		}
+		defer parent.Close()
+		if parentInfo, err = parent.Stat("."); err != nil || !os.SameFile(want, parentInfo) {
+			return keepMoved, "the owned path's parent was replaced"
+		}
+	}
+	path := filepath.Join(h.path, owned)
+	cache, err := parent.Lstat(name)
+	if err != nil {
+		return keepMoved, err.Error()
+	}
+	for _, target := range []struct {
+		path string
+		info os.FileInfo
+	}{{h.path, h.info}, {path, cache}} {
+		if deny := neverTouch(target.path, target.info); deny != "" {
+			return keepProtected, target.path + " touches the never-touch path " + deny
+		}
+	}
+	inUse := func(p string) string { return h.inUseAt(p, linked) }
+	return detachAndDelete(in, parent, parentInfo, filepath.Join(h.path, parentRel), h.root, name, kindHomeCache, inUse, check)
+}
+
+// homeProbes are the process probe's platform, commands, environ read, user,
+// own pid, clock and liveness check. Tests replace them.
+type homeProbes struct {
+	platform    string
+	run         func(name string, args ...string) (string, error)
+	readEnviron func(pid int) (string, error)
+	alive       func(pid int) bool
+	uid         int
+	self        int
+	now         func() time.Time
+}
+
+func nativeHomeProbes() homeProbes {
+	return homeProbes{
+		platform: runtime.GOOS,
+		run: func(name string, args ...string) (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, name, args...)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			if err != nil {
+				return "", fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+			}
+			return string(out), nil
+		},
+		readEnviron: func(pid int) (string, error) {
+			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+			return string(data), err
+		},
+		alive: func(pid int) bool { return !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) },
+		uid:   os.Getuid(),
+		self:  os.Getpid(),
+		now:   time.Now,
+	}
+}
+
+// verifyHomeProbes returns the probes a pass uses. Tests replace it.
+var verifyHomeProbes = nativeHomeProbes
+
+// homeCreated is when a home was made: the earlier of its marker's time and
+// the directory's birth time where the platform records one.
+func homeCreated(h *verifierHome) time.Time {
+	created := h.marker.CreatedAt
+	if birth, ok := birthTime(h.info); ok && birth.Before(created) {
+		created = birth
+	}
+	return created
+}
+
+// birthTime reads a file's creation time where the platform's stat has one
+// (Birthtimespec on macOS and the BSDs).
+func birthTime(info os.FileInfo) (time.Time, bool) {
+	v := reflect.ValueOf(info.Sys())
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return time.Time{}, false
+	}
+	ts := v.FieldByName("Birthtimespec")
+	if !ts.IsValid() {
+		return time.Time{}, false
+	}
+	sec, nsec := ts.FieldByName("Sec"), ts.FieldByName("Nsec")
+	if !sec.IsValid() || !nsec.IsValid() || sec.Int() == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(sec.Int(), nsec.Int()), true
+}
+
+// probeVerifierHomes is verify-matrix's verifierHomeProcesses for many homes
+// at once, rule for rule: this user's processes, minus pids 0 and 1 and the
+// sweep and its ancestors, found by a HOME, TMPDIR or PWD under a home, an
+// argv[0] under it, or a cwd or open file under it (lsof). On Linux an
+// environment that cannot be read is proven unrelated only by a start more
+// than five seconds before the home was made; otherwise it keeps that home.
+// hits names the first process keeping each home, notes the unreadable
+// processes proven older, and err is a probe failure, which keeps every
+// home.
+func probeVerifierHomes(p homeProbes, homes []*verifierHome) (hits, notes map[string]string, err error) {
+	hits, notes = map[string]string{}, map[string]string{}
+	under := func(value string) []*verifierHome {
+		var in []*verifierHome
+		for _, h := range homes {
+			for _, root := range h.spellings {
+				if pathWithin(value, root) {
+					in = append(in, h)
+					break
+				}
+			}
+		}
+		return in
+	}
+	listing, err := p.run("ps", "-axww", "-o", "pid=,ppid=,uid=,command=")
+	if err != nil {
+		return nil, nil, err
+	}
+	type process struct {
+		ppid, uid int
+		command   string
+	}
+	all := map[int]process{}
+	row := regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s(.*)$`)
+	for _, line := range strings.Split(listing, "\n") {
+		if m := row.FindStringSubmatch(line); m != nil {
+			pid, _ := strconv.Atoi(m[1])
+			ppid, _ := strconv.Atoi(m[2])
+			uid, _ := strconv.Atoi(m[3])
+			all[pid] = process{ppid: ppid, uid: uid, command: strings.TrimSpace(m[4])}
+		}
+	}
+	excluded := map[int]bool{0: true, 1: true}
+	for pid := p.self; pid > 1 && !excluded[pid]; pid = all[pid].ppid {
+		excluded[pid] = true
+	}
+	table := map[int]process{}
+	for pid, proc := range all {
+		if proc.uid == p.uid && !excluded[pid] {
+			table[pid] = proc
+		}
+	}
+	type hit struct {
+		pid     int
+		reasons []string
+	}
+	found := map[string]map[int]*hit{}
+	add := func(pid int, reason string, in []*verifierHome) {
+		if _, ok := table[pid]; !ok {
+			return
+		}
+		for _, h := range in {
+			if found[h.path] == nil {
+				found[h.path] = map[int]*hit{}
+			}
+			e := found[h.path][pid]
+			if e == nil {
+				e = &hit{pid: pid}
+				found[h.path][pid] = e
+			}
+			if !slicesContains(e.reasons, reason) {
+				e.reasons = append(e.reasons, reason)
+			}
+		}
+	}
+	switch p.platform {
+	case "darwin":
+		env, err := p.run("ps", "-axww", "-E", "-o", "pid=,command=")
+		if err != nil {
+			return nil, nil, err
+		}
+		line := regexp.MustCompile(`^\s*(\d+)\s(.*)$`)
+		for _, l := range strings.Split(env, "\n") {
+			m := line.FindStringSubmatch(l)
+			if m == nil {
+				continue
+			}
+			pid, _ := strconv.Atoi(m[1])
+			if _, ok := table[pid]; !ok {
+				continue
+			}
+			for _, v := range homeEnvVariable.FindAllStringSubmatch(m[2], -1) {
+				add(pid, "env", under(v[1]))
+			}
+		}
+	case "linux":
+		type unreadable struct {
+			pid  int
+			code string
+		}
+		var blind []unreadable
+		pids := make([]int, 0, len(table))
+		for pid := range table {
+			pids = append(pids, pid)
+		}
+		sort.Ints(pids)
+		for _, pid := range pids {
+			environ, err := p.readEnviron(pid)
+			if err != nil {
+				switch {
+				case errors.Is(err, syscall.ENOENT), errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ESRCH):
+				case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+					blind = append(blind, unreadable{pid: pid, code: err.Error()})
+				default:
+					return nil, nil, fmt.Errorf("environment of process %d: %w", pid, err)
+				}
+				continue
+			}
+			for _, entry := range strings.Split(environ, "\x00") {
+				name, value, ok := strings.Cut(entry, "=")
+				if ok && (name == "HOME" || name == "TMPDIR" || name == "PWD") {
+					add(pid, "env", under(value))
+				}
+			}
+		}
+		if len(blind) > 0 {
+			args := make([]string, 0, len(blind)+1)
+			for _, b := range blind {
+				args = append(args, strconv.Itoa(b.pid))
+			}
+			args = append(args, strconv.Itoa(p.self))
+			starts, err := p.run("ps", "-o", "pid=,etimes=", "-p", strings.Join(args, ","))
+			at := p.now()
+			fault := ""
+			elapsed := map[int]string{}
+			if err != nil {
+				fault = "ps could not report start times: " + err.Error()
+			} else {
+				pair := regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s*$`)
+				for _, l := range strings.Split(starts, "\n") {
+					if strings.TrimSpace(l) == "" {
+						continue
+					}
+					m := pair.FindStringSubmatch(l)
+					if m == nil {
+						fault = "ps printed a line that could not be read"
+						break
+					}
+					pid, _ := strconv.Atoi(m[1])
+					elapsed[pid] = m[2]
+				}
+				if _, ok := elapsed[p.self]; fault == "" && !ok {
+					fault = "ps did not list the sweep itself"
+				}
+			}
+			for _, h := range homes {
+				if fault != "" {
+					hits[h.path] = fmt.Sprintf("cannot read the environment of %d process(es) or prove them unrelated to the home: %s", len(blind), fault)
+					continue
+				}
+				created := homeCreated(h)
+				var older []string
+				for _, b := range blind {
+					seconds, listed := elapsed[b.pid]
+					if !listed {
+						continue
+					}
+					if n, err := strconv.ParseInt(seconds, 10, 64); err == nil && allDigits.MatchString(seconds) &&
+						at.Add(-time.Duration(n)*time.Second).Before(created.Add(-homeUnreadableMargin)) {
+						older = append(older, strconv.Itoa(b.pid))
+						continue
+					}
+					if hits[h.path] == "" {
+						hits[h.path] = fmt.Sprintf("unreadable process %d not proven older than the home", b.pid)
+					}
+				}
+				if len(older) > 0 {
+					notes[h.path] = "skipped unreadable process(es) " + strings.Join(older, ", ") + ", started before the home"
+				}
+			}
+		}
+	default:
+		return nil, nil, fmt.Errorf("unsupported platform %s for the verifier home probe", p.platform)
+	}
+	for pid, proc := range table {
+		add(pid, "argv", under(strings.Split(proc.command, " ")[0]))
+	}
+	files, err := p.run("lsof", "-nP", "-w", "-u", strconv.Itoa(p.uid), "-F", "pn")
+	if err != nil {
+		return nil, nil, err
+	}
+	pid := 0
+	for _, l := range strings.Split(files, "\n") {
+		switch {
+		case strings.HasPrefix(l, "p"):
+			pid, _ = strconv.Atoi(l[1:])
+		case strings.HasPrefix(l, "n"):
+			add(pid, "file", under(l[1:]))
+		}
+	}
+	for _, h := range homes {
+		if hits[h.path] != "" {
+			continue
+		}
+		var first *hit
+		for _, e := range found[h.path] {
+			if first == nil || e.pid < first.pid {
+				first = e
+			}
+		}
+		if first != nil {
+			command := table[first.pid].command
+			if len(command) > 120 {
+				command = command[:120]
+			}
+			hits[h.path] = fmt.Sprintf("process %d (%s) is in the home: %s", first.pid, strings.Join(first.reasons, ", "), command)
+		}
+	}
+	return hits, notes, nil
 }

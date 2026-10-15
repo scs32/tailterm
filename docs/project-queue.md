@@ -1572,7 +1572,9 @@ Closeout and `tt team queue sweep-worktrees` (described in
 its worktree: the verifier's clean checkouts under the artifacts tree, and
 Claude Code's per-directory session temp folders. Receipts, logs and plan
 files are never removed. The sweep, and only the sweep, also trims one
-regenerable cache out of the checkouts it keeps (see "Cache trim").
+regenerable cache out of the checkouts it keeps (see "Cache trim"), trims the
+Go caches a verifier home's provenance marker owns, and removes marked
+verifier homes whose run is gone (see "Verifier homes").
 
 ```sh
 tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR]
@@ -1711,17 +1713,18 @@ held for its receipts or its branch stops holding hundreds of megabytes of
 installed packages. The dry run reports it as `would-trim`, `--apply` and the
 scheduled sweep as `trimmed`. Closeout never trims.
 
-**Allowlist.** Exactly one path: `<checkout>/node_modules`. Nothing else is
-trimmed anywhere: no Go build or module cache, no `home` directory a
-verification run made, no `.build`, no `dist`.
+**Allowlist.** In a checkout, exactly one path: `<checkout>/node_modules`. A
+Go build or module cache is trimmed only when a verifier home's provenance
+marker owns it (see "Verifier homes"); no unmarked Go cache, `.build` or
+`dist` is trimmed.
 
 **Never touched.** The sweep never deletes, and never deletes inside, the
 shared user caches: `~/Library/Caches` (so `~/Library/Caches/go-build`),
 `~/go` (so `~/go/pkg`), `~/.npm`, or the relay's own `GOCACHE`, `GOMODCACHE`,
-`GOPATH` and `npm_config_cache`. Clearing the shared Go caches is a standing
-owner rule: never. Nothing outside the worktrees root
-(`<main checkout>/.build/worktrees`), the artifacts root and the session temp
-root is ever a candidate. A checkout or cache that lies in, contains or is the
+`GOPATH`, `npm_config_cache` and `TAILTERM_VERIFICATION_CACHE`. Clearing the
+shared Go caches is a standing owner rule: never. Nothing outside the
+worktrees root (`<main checkout>/.build/worktrees`), the artifacts root, the
+session temp root and `/tmp`'s `tv-*` verifier homes is ever a candidate. A checkout or cache that lies in, contains or is the
 same file as one of those paths is kept `protected`.
 
 **Finished.** A checkout qualifies only when all of these hold:
@@ -1783,13 +1786,105 @@ A manual session that is not on the roster can lose `node_modules` in a
 finished checkout it works in; `npm ci` restores it, and `--min-idle` and the
 matrix lock protect a checkout in use.
 
+### Verifier homes
+
+Feature `wi_60dbbbe5b36bf66b`. `scripts/verify-matrix.mjs` runs each plan in a
+private home, `/tmp/tv-XXXXXX` (`/private/tmp` on macOS), and removes it when
+the run ends. A run that is killed, or whose host stops, never reaches that
+cleanup and leaves its home, often hundreds of megabytes of Go caches. A cache
+the harness cannot prove it made is not deleted on a guess, so the runner
+marks every home before its first Go command, and the sweep acts only on what
+a valid marker proves. Closeout never touches homes.
+
+**The marker.** `tailterm-cache.json` at the home's root:
+
+```json
+{"version": 1, "kind": "home", "producer": "scripts/verify-matrix.mjs@<40-hex commit>",
+ "item": "wi_0123456789abcdef", "run": "<verifier run id or output directory>",
+ "createdAt": "2026-10-15T15:00:00.000Z", "owns": ["go-build", "go/pkg/mod"],
+ "keepHome": false, "pid": 12345, "output": "/absolute/log/directory"}
+```
+
+A marker is valid only as a regular file of at most 64 KiB holding this
+object: `version` the number 1, `kind` `"home"`, non-empty strings `producer`,
+`item` and `run`, an RFC 3339 `createdAt`, and `owns` a non-empty list of
+distinct, clean relative paths that stay inside the home and do not name the
+marker. Unknown fields are ignored. Anything else refuses the whole marker:
+the home is kept `unproven` ("provenance marker refused: FIELD: why") and
+nothing in it is touched.
+
+**A marked home made by hand.** An agent that sets up its own Go home for ad
+hoc verification writes the same file at the home's root before its first Go
+command, with its own producer (for example `manual:<agent name>`), its item
+ID, any run name, and `owns` listing its cache directories relative to the
+home, such as `["gocache", "gopath/pkg/mod"]`. `keepHome`, `pid` and `output`
+belong to verify-matrix and are left out. Put the home under the item's
+artifact folder, `<artifacts>/<item id>/...`, or inside the item's checkout
+under an ignored folder such as `.build/`. Its owned caches are trimmed once
+the item is finished. A home anywhere else, or without a marker, is only
+reported.
+
+**Where the sweep looks.**
+
+- `/tmp`: its direct children named `tv-` and six letters or digits, real
+  directories only, once per sweep however many repositories it covers.
+  Never `$TMPDIR`, never deeper.
+- The artifacts root, at most four levels down, never following a link and
+  never entering `.git`, `node_modules`, a checkout (a folder holding a `.git`
+  entry), a tombstone, or a home or cache already found.
+- Each checkout the cache trim finds eligible (above), at most three levels
+  down, with the same exclusions. A home there must be ignored by Git with no
+  tracked file, and its marker's item must be the checkout's; the checkout's
+  lock, operation and `--min-idle` rules apply as for `node_modules`.
+
+**What it does.**
+
+- A `/tmp` home with verify-matrix's exact identity (producer
+  `scripts/verify-matrix.mjs@<commit>`, a boolean `keepHome`, a positive whole
+  `pid`, an absolute `output`, and `owns` exactly `["go-build", "go/pkg/mod"]`)
+  and `keepHome` false is an orphan once its run is gone: it is removed whole
+  (`would-remove`, then `removed`, kind `verify-home`). Item state is not
+  consulted.
+- A `/tmp` home whose marker says `keepHome` true was kept on purpose
+  (`--keep-home`). It is never removed whole; it loses only its owned caches.
+- A marked home under the artifacts root whose item, a `wi_` ID matching its
+  item folder, is finished, or a marked home in a finished checkout, loses only
+  its owned caches (`would-trim`, then `trimmed`, kind `home-cache`, one row
+  per owned directory). An unfinished item keeps it `item-active`.
+- A `/tmp` home without that identity, a lookalike producer included, is kept
+  `unproven`.
+
+Before any delete every one of these must hold, or the home is kept with the
+reason in brackets: no agent or team works in it and no matrix run holds its
+`output` (`in-use`); the marker's `pid` is gone (`in-use`); no process of this
+user has a `HOME`, `TMPDIR` or `PWD` in it, an `argv[0]` in it, or a working
+directory or open file in it (`in-use`), found with `ps` and `lsof` by the
+rules the runner uses on its own home, including its rule for Linux processes
+whose environment cannot be read, and a failing `ps` or `lsof` keeps every
+candidate (`remove-failed`); nothing in the home changed within `--min-idle`
+(`recent`); it is not in, does not contain and is not a never-touch path
+(`protected`); and no receipt text names a path in it (`evidence`). An owned
+path is checked one component at a time and is never reached through a link
+(`unproven`). The delete takes the tombstone route above; the read-only module
+directories are made writable inside the tombstone only, and an interrupted
+delete is finished by the next applying sweep.
+
+**Unmarked.** Every unmarked `tv-` home under `/tmp`, and the ten largest
+unmarked Go build caches (a `README` Go wrote, and a `trim.txt`) and module
+caches (a folder holding `cache/download`) the walks find, are listed as kept
+`unproven` with "no provenance marker" and their size, so a person can decide.
+They are never deleted, made writable or otherwise changed.
+
 ### Receipts and report
 
 All three kinds are recorded in `worktree-cleanup.jsonl` with the ordinary
 worktree receipts, one line per decision, and kept outcomes once. Their lines
-add `kind` (`artifact-checkout`, `session-temp` or `cache`), `bytes`, and for a
-removed checkout `manifest`. A cache's `path` is the `node_modules` directory
-and its action `trimmed`. `--json` rows add the same `kind`; existing keys and
+add `kind` (`artifact-checkout`, `session-temp`, `cache`, `verify-home` or
+`home-cache`), `bytes`, and for a removed checkout `manifest`. A cache's `path`
+is the `node_modules` directory and its action `trimmed`; a home cache's is the
+owned directory. On a kept `unproven` "no provenance marker" row, `bytes` is
+the size reported, not space freed, and the report's reclaimable total counts
+only removals and trims. `--json` rows add the same `kind`; existing keys and
 totals keep their meaning, and `totals.actions` gains `would-trim` or
 `trimmed`. The text report prints
 `would-remove PATH (artifact checkout; item wi_x released; 1.7 GiB)`,
@@ -1822,9 +1917,16 @@ applies only to ordinary worktrees and branch checkouts.
   checkouts are kept as `retention`.
 - The main checkout's session temp folder, artifact folders not named for an
   item, and build output that is not inside a checkout are out of scope.
-- The cache trim does not reach Go build or module caches in a verification
-  run's private home, `.build/go`, or any cache under a folder not named for
-  an item: nothing on disk proves the harness made them.
+- Go build and module caches are trimmed only where a valid provenance marker
+  owns them. Caches in unmarked homes, `.build/go`, or folders not named for
+  an item are reported (the ten largest), never deleted: nothing on disk
+  proves the harness made them. Homes made before verify-matrix wrote markers
+  are unmarked.
+- A home kept with `--keep-home` is never removed whole; remove it yourself
+  when you are done with it.
+- Closeout examines a released entry's worktree within one 15-minute interval
+  of the history read that finds the release: it gates the entry on that
+  read's clock stamp, not a later reading of the clock.
 
 ## Team queue token budget
 
