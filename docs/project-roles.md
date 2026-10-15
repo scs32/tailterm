@@ -75,7 +75,11 @@ queue once cleanup receipts exist, and in a serial queue the owner runs
 
 A later order on the same item is `tt team queue requeue --entry tqe_ID`. It
 adds a new entry, attempt 2, and launches a fresh team with new identities;
-the closed entry stays as history.
+the closed entry stays as history. The bare form works only on the entry's
+launch host while its checkout still exists with HEAD at the entry's base.
+Once the team committed, or the worktree was removed or moved on, pass a fresh
+worktree at the current tasks-hub tip as `--cwd DIR`; see
+[Requeue a failed entry](project-queue.md#requeue-a-failed-entry).
 
 ## Questions
 
