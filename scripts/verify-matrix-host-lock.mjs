@@ -16,7 +16,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { join, dirname, isAbsolute, resolve, basename } from "node:path";
-import { homedir, hostname, loadavg, availableParallelism } from "node:os";
+import { hostname, loadavg, availableParallelism, userInfo } from "node:os";
 import { randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -50,15 +50,52 @@ export class HostLockError extends Error {
   }
 }
 
-// Resolved when a lock is requested, never at import.
-export function lockPath(environment = process.env) {
+// The account's own home from the user database, not HOME
+// (wi_28a18cbc08d3d598). Tests inject another.
+export function accountHome() {
+  return userInfo().homedir;
+}
+const sameDirectory = (a, b) => {
+  const real = (path) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  return real(a) === real(b);
+};
+// Resolved when a lock is requested, never at import. Without the override the
+// lock is the account home's shared file. A HOME that is not the account's
+// home (an isolated test or matrix check home) is refused rather than given a
+// private lock beside the real holders, or sent to the shared lock its own
+// matrix run may hold; the caller names the lock it means with the override.
+export function lockPath(environment = process.env, home = accountHome) {
   const override = environment.TAILTERM_MATRIX_HOST_LOCK;
   if (override) {
     if (!isAbsolute(override))
       throw new Error("TAILTERM_MATRIX_HOST_LOCK must be an absolute path");
     return override;
   }
-  return join(environment.HOME || homedir(), ".local/state/tailterm-matrix/host.json");
+  let account;
+  try {
+    account = home();
+  } catch (error) {
+    throw new HostLockError(
+      "private-home",
+      `matrix host: cannot read this account's home (${error.message}); set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path`,
+      EXIT_LOCK_UNUSABLE,
+    );
+  }
+  if (environment.HOME && !sameDirectory(environment.HOME, account))
+    throw new HostLockError(
+      "private-home",
+      `matrix host: HOME (${environment.HOME}) is not this account's home (${account}), so the default lock would be private; ` +
+        "set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path (the shared one is " +
+        join(account, ".local/state/tailterm-matrix/host.json") + ")",
+      EXIT_LOCK_UNUSABLE,
+    );
+  return join(account, ".local/state/tailterm-matrix/host.json");
 }
 export function lockPaths(file = lockPath()) {
   if (!isAbsolute(file)) throw new Error("Host lock path must be absolute");
@@ -1045,6 +1082,16 @@ export function receiptKeys(record) {
   };
 }
 
+// Environment values that change what an exec run means, kept in its record
+// when set so an order's GOMAXPROCS=2 can be checked there
+// (wi_28a18cbc08d3d598). Only these names: nothing else, never a secret.
+export const RECORDED_ENVIRONMENT = ["GOMAXPROCS", "GOFLAGS", "GOGC", "GOMEMLIMIT", "GODEBUG", "GOEXPERIMENT", "CGO_ENABLED"];
+export function recordedEnvironment(environment = process.env) {
+  const kept = {};
+  for (const name of RECORDED_ENVIRONMENT) if (environment[name] !== undefined) kept[name] = environment[name];
+  return kept;
+}
+
 // Runs one supplemental command (a race suite, say) while holding the lock.
 // The command gets its own process group, recorded as the holder's group, and
 // is stopped at the run timeout. Resolves with the exit code to pass through.
@@ -1065,7 +1112,7 @@ export async function execWithHostLock(argv, options = {}) {
       worktree: options.worktree || process.cwd(),
       kind: "exec",
       signal: interrupted.signal,
-      extra: { checkSet: "supplemental", argv },
+      extra: { checkSet: "supplemental", argv, environment: recordedEnvironment(process.env) },
     });
     const code = await new Promise((done, fail) => {
       const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: options.stdio || "inherit" });

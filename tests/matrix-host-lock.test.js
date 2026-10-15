@@ -42,6 +42,8 @@ import {
   readMemoryPressure,
   releaseRun,
   receiptKeys,
+  recordedEnvironment,
+  RECORDED_ENVIRONMENT,
   DEFAULT_MEMORY_PRESSURE_MAX,
   MEMORY_PROBE_MS,
 } from "../scripts/verify-matrix-host-lock.mjs";
@@ -184,15 +186,95 @@ async function heldByChild(t, path, { request: extra, ...options } = {}) {
 const exited = (child) => (child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : once(child, "close"));
 
 test("a1 a11 the lock path is the documented home path unless the override names another", (t) => {
-  assert.equal(lockPath({ HOME: "/home/someone" }), "/home/someone/.local/state/tailterm-matrix/host.json");
-  assert.equal(lockPath({ HOME: "/home/someone", TAILTERM_MATRIX_HOST_LOCK: "/x/host.json" }), "/x/host.json");
+  const someone = () => "/home/someone";
+  assert.equal(lockPath({ HOME: "/home/someone" }, someone), "/home/someone/.local/state/tailterm-matrix/host.json");
+  assert.equal(lockPath({ HOME: "/home/someone/" }, someone), "/home/someone/.local/state/tailterm-matrix/host.json");
+  assert.equal(lockPath({}, someone), "/home/someone/.local/state/tailterm-matrix/host.json", "no HOME: the account's home");
+  assert.equal(lockPath({ HOME: "/home/someone", TAILTERM_MATRIX_HOST_LOCK: "/x/host.json" }, someone), "/x/host.json");
   assert.throws(() => lockPath({ TAILTERM_MATRIX_HOST_LOCK: "relative/host.json" }), /absolute/);
   assert(lockPath().startsWith(isolated + "/"), "this test file resolves a path under its temp directory");
-  const home = tempDir(t, "matrix-host-lock-home-");
-  const { TAILTERM_MATRIX_HOST_LOCK, ...environment } = process.env;
-  const text = execFileSync(process.execPath, [moduleFile, "status"], { env: { ...environment, HOME: home }, encoding: "utf8" });
-  assert.match(text, new RegExp("^matrix host lock: " + home + "/\\.local/state/tailterm-matrix/host\\.json\\nholder: none\\nwaiters: none"));
-  assert(!existsSync(join(home, ".local")), "status creates nothing");
+  // The override names a temp lock, so status under an isolated HOME reads it.
+  const home = tempDir(t, "matrix-host-lock-home-"),
+    path = join(tempDir(t), "host.json");
+  const text = execFileSync(process.execPath, [moduleFile, "status"], { env: { ...process.env, HOME: home, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" });
+  assert.match(text, new RegExp("^matrix host lock: " + path + "\\nholder: none\\nwaiters: none"));
+  assert(!existsSync(path) && !existsSync(join(home, ".local")), "status creates nothing");
+});
+
+// wi_28a18cbc08d3d598: an isolated HOME never resolves a private default lock.
+test("e1 an isolated HOME without the override is refused naming TAILTERM_MATRIX_HOST_LOCK, and nothing is locked or run", async (t) => {
+  const refused = (fn) =>
+    assert.throws(fn, (error) => error.code === "private-home" && error.exitCode === EXIT_LOCK_UNUSABLE && /TAILTERM_MATRIX_HOST_LOCK/.test(error.message));
+  refused(() => lockPath({ HOME: "/tmp/tv-isolated" }, () => "/home/someone"));
+  refused(() => lockPath({ HOME: "/tmp/tv-isolated" }, () => { throw new Error("no passwd entry"); }));
+  assert.match(
+    (() => { try { lockPath({ HOME: "/tmp/tv-isolated" }, () => "/home/someone"); } catch (error) { return error.message; } })(),
+    /HOME \(\/tmp\/tv-isolated\) is not this account's home \(\/home\/someone\).*\/home\/someone\/\.local\/state\/tailterm-matrix\/host\.json/,
+  );
+  // The children below resolve against the real account home: refuse a temp
+  // HOME in process first, so a regression stops here before any child could
+  // reach the shared lock.
+  const home = tempDir(t, "matrix-host-lock-home-"),
+    record = tempDir(t),
+    marker = join(home, "ran");
+  refused(() => lockPath({ HOME: home }));
+  const { TAILTERM_MATRIX_HOST_LOCK, ...stripped } = process.env;
+  const env = { ...stripped, HOME: home };
+  const status = spawnSync(process.execPath, [moduleFile, "status"], { env, encoding: "utf8" });
+  assert.equal(status.status, EXIT_LOCK_UNUSABLE, status.stderr);
+  assert.match(status.stderr, /TAILTERM_MATRIX_HOST_LOCK/);
+  const exec = spawnSync(
+    process.execPath,
+    [moduleFile, "exec", "--item", "wi_home", "--timeout-minutes", "1", "--record", record, "--", process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "x")`],
+    { env, encoding: "utf8" },
+  );
+  assert.equal(exec.status, EXIT_LOCK_UNUSABLE, exec.stderr);
+  assert.match(exec.stderr, /HOME \(.*\) is not this account's home .*TAILTERM_MATRIX_HOST_LOCK/s);
+  // A matrix run's acquire (verify-matrix run and targeted) refuses the same way.
+  const run = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", `const { acquireHostLock } = await import(${JSON.stringify(moduleURL)});
+try { await acquireHostLock({ runTimeoutMs: 60000, item: "wi_home" }); console.log("acquired"); }
+catch (error) { console.log(error.code + " " + error.exitCode); }`],
+    { env, encoding: "utf8" },
+  );
+  assert.equal(run.stdout.trim(), "private-home " + EXIT_LOCK_UNUSABLE, run.stderr);
+  assert(!existsSync(marker), "the command never ran");
+  assert(!existsSync(join(home, ".local")), "no private lock under the isolated HOME");
+  assert.deepEqual(readdirSync(record), [], "no sidecar for a refused exec");
+});
+
+test("e1 an explicit override still gives a private lock under an isolated HOME", (t) => {
+  const home = tempDir(t, "matrix-host-lock-home-"),
+    record = tempDir(t),
+    path = join(tempDir(t), "host.json");
+  const exec = spawnSync(
+    process.execPath,
+    [moduleFile, "exec", "--item", "wi_override", "--timeout-minutes", "1", "--record", record, "--", process.execPath, "-e", ""],
+    { env: { ...process.env, HOME: home, TAILTERM_MATRIX_HOST_LOCK: path, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "off" }, encoding: "utf8" },
+  );
+  assert.equal(exec.status, 0, exec.stderr);
+  assert.equal(JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8")).lockPath, path);
+  assert.deepEqual(readJournal(path).map((e) => e.event), ["request", "acquire", "release"]);
+  assert(!existsSync(join(home, ".local")), "the override, not HOME, names the lock");
+});
+
+test("e3 the exec record keeps only allowlisted run environment values that are set", (t) => {
+  assert.deepEqual(recordedEnvironment({ GOMAXPROCS: "2", GOFLAGS: "-count=1", TAILTERM_TOKEN: "secret", PATH: "/bin" }), { GOMAXPROCS: "2", GOFLAGS: "-count=1" });
+  assert.deepEqual(recordedEnvironment({}), {});
+  assert(RECORDED_ENVIRONMENT.includes("GOMAXPROCS") && RECORDED_ENVIRONMENT.includes("GOFLAGS"));
+  const env = { ...process.env, TAILTERM_MATRIX_MEMORY_PRESSURE_MAX: "off", TAILTERM_MATRIX_HOST_LOCK: join(tempDir(t), "host.json") };
+  for (const name of RECORDED_ENVIRONMENT) delete env[name];
+  const sidecar = (extra) => {
+    const record = tempDir(t);
+    const exec = spawnSync(process.execPath, [moduleFile, "exec", "--item", "wi_env", "--timeout-minutes", "1", "--record", record, "--", process.execPath, "-e", ""], { env: { ...env, ...extra }, encoding: "utf8" });
+    assert.equal(exec.status, 0, exec.stderr);
+    return readFileSync(join(record, "host-lock.json"), "utf8");
+  };
+  const set = sidecar({ GOMAXPROCS: "2", MATRIX_TEST_SECRET: "hunter2-not-recorded" });
+  assert.deepEqual(JSON.parse(set).environment, { GOMAXPROCS: "2" });
+  assert(!set.includes("hunter2-not-recorded") && !set.includes("MATRIX_TEST_SECRET"), "a non-allowlisted variable is not recorded");
+  assert.deepEqual(JSON.parse(sidecar({})).environment, {}, "nothing set, nothing recorded");
 });
 
 test("a1 the lock file is version 2 JSON with the holder, its groups and the waitlist, and status prints the same", async (t) => {

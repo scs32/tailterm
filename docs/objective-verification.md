@@ -832,6 +832,19 @@ files 0600. Beside it are `host.journal.jsonl` (append-only history),
 `host.json.lock` (a short-lived mutex for updates) and
 `host.json.lock.reclaim` (a guard used while recovering a dead owner's mutex).
 
+**An isolated HOME.** Bug `wi_28a18cbc08d3d598`, order #35681. Without
+`TAILTERM_MATRIX_HOST_LOCK` the default path is under the account's own home
+from the user database (`os.userInfo().homedir`), not `HOME`. When `HOME` is
+set and is not that directory (an `env -i HOME=/tmp/…` run, or a matrix check,
+whose home is private and whose environment drops the override), `exec`,
+`status`, `run` and `targeted` refuse before joining the list, with a message
+naming `TAILTERM_MATRIX_HOST_LOCK` and the shared path; `exec` and `status`
+exit 78 and `exec` writes no sidecar. They neither take a private lock beside
+the real holders nor fall back to the shared one: a run nested in a matrix
+check would then wait on the lock its own matrix holds. A run that means the
+shared lock sets the override to that path; a test sets it to a temporary one.
+An explicit absolute override works as before, whatever `HOME` is.
+
 `TAILTERM_MATRIX_MAX_HOLDERS` is a decimal integer from 1 through 16;
 unset or empty means 2. Invalid configuration refuses before enqueue or sidecar
 creation. A v2 cohort freezes `holderLimit` while any holder or waiter remains;
@@ -1082,7 +1095,12 @@ It prints the same waiting lines, runs the command in its own process group
 (recorded in `groups`), forwards SIGINT and SIGTERM to that group, stops the
 command at `--timeout-minutes` or the holder cap, whichever is sooner (exit 124), and otherwise exits with the
 command's own code. It writes `host-lock.json` (check set `supplemental`, plus
-the argv and exit code) and `host-lock.log` to the record directory.
+the argv and exit code) and `host-lock.log` to the record directory. The
+sidecar's `environment` object keeps the values that change what the run means,
+for the names that are set: `GOMAXPROCS`, `GOFLAGS`, `GOGC`, `GOMEMLIMIT`,
+`GODEBUG`, `GOEXPERIMENT` and `CGO_ENABLED` (`{}` when none is), so an order's
+`GOMAXPROCS=2` can be checked from the record. No other variable is recorded,
+so neither are secrets (bug `wi_28a18cbc08d3d598`).
 
 **The deployer.** The release runner's integrated run is a member of the same
 list. The runner starts it detached with `--priority`, `--item` and
