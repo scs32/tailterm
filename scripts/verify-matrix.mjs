@@ -200,8 +200,9 @@ export function selectChecks(
       ),
     ].sort();
     // With approved shards every go-race has one argv prefix, whatever its
-    // packages: the hub and the release runner cover an approved go-race by an
-    // integrated one only when the argv before the first package is equal.
+    // packages: one -shards flag per approved package, in package order. The
+    // hub and the release runner cover an approved go-race by an integrated
+    // one only when the argv before the first package is equal.
     add(
       "go-race",
       [
@@ -211,7 +212,7 @@ export function selectChecks(
               "../scripts/verify-matrix.mjs",
               "go-race",
               ...goTestFlags,
-              `-shards=${goRaceShards.package}=${goRaceShards.k}`,
+              ...goRaceShards.map((s) => `-shards=${s.package}=${s.k}`),
             ]
           : ["go", "test", "-race", ...goTestFlags]),
         ...(packages.length ? packages : ["./..."]),
@@ -365,9 +366,10 @@ function goRacePackages(argv) {
     return null;
   return { flags: argv.slice(0, first), packages: argv.slice(first) };
 }
-// Store race shards (wi_d6b6387726c1f846). The matrix names one package and
-// K; a go-race that tests that package runs it as K concurrent shards after
-// its other packages. A test's shard is a pure function of its name, so a test
+// Race shards (wi_d6b6387726c1f846, several packages wi_af64945097c67c68).
+// The matrix names one or more packages, each with its own K; a go-race that
+// tests such a package runs it as K shards, in one pool with the job for its
+// other packages. A test's shard is a pure function of its name, so a test
 // keeps its shard when others are added or removed, and the partition follows
 // from the commit and K alone. The last shard is the catch-all: it skips the
 // other shards' names instead of listing its own, so a test nobody listed
@@ -377,7 +379,8 @@ export const JOB_SLOT_BYTES = 3 * 1024 ** 3;
 const GO_RACE_SHARDS_FLAG = /^-shards=(\.\/[\w./-]+)=([2-8])$/;
 const GO_RACE_TIMEOUT_FLAG = /^-timeout=[1-9][0-9]*m$/;
 const GO_RACE_USAGE =
-  "node ../scripts/verify-matrix.mjs go-race [-timeout=Nm] [-shards=./PACKAGE=K] ./PACKAGE... (from hub; K 2 to 8)";
+  "node ../scripts/verify-matrix.mjs go-race [-timeout=Nm] [-shards=./PACKAGE=K]... ./PACKAGE... (from hub; K 2 to 8, one flag per package)";
+// The approved shard packages, sorted by package, or null without the key.
 function matrixGoRaceShards(matrix) {
   if (matrix.goRaceShards === undefined) return null;
   const entries =
@@ -386,30 +389,33 @@ function matrixGoRaceShards(matrix) {
     !Array.isArray(matrix.goRaceShards)
       ? Object.entries(matrix.goRaceShards)
       : [];
-  const [name, k] = entries[0] ?? [];
   if (
-    entries.length !== 1 ||
-    !Number.isInteger(k) ||
-    !GO_RACE_SHARDS_FLAG.test(`-shards=${name}=${k}`) ||
-    name.slice(2).split("/").some((part) => !part || /^\.+$/.test(part))
+    !entries.length ||
+    entries.some(
+      ([name, k]) =>
+        !Number.isInteger(k) ||
+        !GO_RACE_SHARDS_FLAG.test(`-shards=${name}=${k}`) ||
+        name.slice(2).split("/").some((part) => !part || /^\.+$/.test(part)),
+    )
   )
     throw new Error("Invalid matrix goRaceShards");
-  return { package: name, k };
+  return entries
+    .map(([name, k]) => ({ package: name, k }))
+    .sort((a, b) => (a.package < b.package ? -1 : a.package > b.package ? 1 : 0));
 }
-// The shards of a go-race check that will shard: its argv carries the flag and
-// its packages include that package or ./... . Null for every other check.
+// The shards of a go-race check that will shard: the specs of its -shards
+// flags whose package it tests, all of them for ./... . Null for every other
+// check.
 export function goRaceShardSpec(check) {
   if (check.id !== "go-race" || !Array.isArray(check.argv)) return null;
   const split = goRacePackages(check.argv);
-  const found = split?.flags
+  if (!split) return null;
+  const all = split.packages.includes("./...");
+  const specs = split.flags
     .map((flag) => GO_RACE_SHARDS_FLAG.exec(flag))
-    .find(Boolean);
-  if (
-    !found ||
-    !(split.packages.includes(found[1]) || split.packages.includes("./..."))
-  )
-    return null;
-  return { package: found[1], k: Number(found[2]) };
+    .filter((found) => found && (all || split.packages.includes(found[1])))
+    .map((found) => ({ package: found[1], k: Number(found[2]) }));
+  return specs.length ? specs : null;
 }
 export const goRaceShardOf = (name, k) =>
   parseInt(createHash("sha256").update(name).digest("hex").slice(0, 8), 16) % k;
@@ -508,43 +514,48 @@ export function assertRanExactlyOnce(names, counts) {
 }
 const goRaceShardsLine = (shards, tests, partitionDigest) =>
   `go-race shards: ${shards.package} K=${shards.k} tests=${tests} partition sha256:${partitionDigest}`;
-// Plan-time check: when the plan's go-race will shard, every test of the
-// package at the commit lands in exactly one shard. Returns the line plan mode
-// prints, or null when nothing shards or the commit has no such package.
+// Plan-time check: when the plan's go-race will shard, every test of each
+// shard package at the commit lands in exactly one of its shards. Returns one
+// entry per package, with the line plan mode prints, skipping a package the
+// commit does not have; null when nothing shards or none is at the commit.
 function planGoRaceShards(checks, cwd, commit, partition) {
   const race = checks.find((check) => check.id === "go-race"),
-    shards = race && goRaceShardSpec(race);
-  if (!shards) return null;
+    specs = race && goRaceShardSpec(race);
+  if (!specs) return null;
   const read = (...args) =>
     execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
     });
-  const files = read(
-    "ls-tree",
-    "-z",
-    "--full-tree",
-    commit,
-    "hub/" + shards.package.slice(2) + "/",
-  )
-    .split("\0")
-    .map((entry) => /^\d+ blob ([a-f0-9]+)\t(.*)$/.exec(entry))
-    .filter((entry) => entry?.[2].endsWith(".go"));
-  if (!files.length) return null;
-  const names = goRaceTestNames(
-    files
-      .filter((entry) => entry[2].endsWith("_test.go"))
-      .map((entry) => read("cat-file", "blob", entry[1])),
-  );
-  const { parts, digest: partitionDigest } = partition(names, shards.k);
-  assertGoRacePartition(names, parts);
-  return {
-    ...shards,
-    tests: names.length,
-    digest: partitionDigest,
-    line: goRaceShardsLine(shards, names.length, partitionDigest),
-  };
+  const planned = [];
+  for (const shards of specs) {
+    const files = read(
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      commit,
+      "hub/" + shards.package.slice(2) + "/",
+    )
+      .split("\0")
+      .map((entry) => /^\d+ blob ([a-f0-9]+)\t(.*)$/.exec(entry))
+      .filter((entry) => entry?.[2].endsWith(".go"));
+    if (!files.length) continue;
+    const names = goRaceTestNames(
+      files
+        .filter((entry) => entry[2].endsWith("_test.go"))
+        .map((entry) => read("cat-file", "blob", entry[1])),
+    );
+    const { parts, digest: partitionDigest } = partition(names, shards.k);
+    assertGoRacePartition(names, parts);
+    planned.push({
+      ...shards,
+      tests: names.length,
+      digest: partitionDigest,
+      line: goRaceShardsLine(shards, names.length, partitionDigest),
+    });
+  }
+  return planned.length ? planned : null;
 }
 // A plan built from a context that carries an accepted plan's checks never
 // runs less than that plan. The release runner builds the integrated plan from
@@ -2120,17 +2131,23 @@ export const isGoCheck = (check) => check.cwd === "hub";
 export const GO_LANE_EXEMPT = new Set(["go-vet"]);
 export const CHECK_WEIGHTS = new Map([["go-race", 2]]);
 export const NON_GO_NICE = 10;
-// A go-race that will shard runs K race test processes at once, each budgeted
-// at GO_RACE_PROCESS_BYTES against the JOB_SLOT_BYTES defaultJobs assumes per
-// slot: 2 slots up to K=6, 3 for K=7 or 8 (measured: 0.63 GB largest store
-// race test process, 0.9 GB largest process of the go test tree).
+// A go-race that will shard runs a pool of race test processes: the job for
+// its other packages (go test -p=1, one process) and every shard, at most the
+// job count at once. Each process is budgeted at GO_RACE_PROCESS_BYTES against
+// the JOB_SLOT_BYTES defaultJobs assumes per slot: 2 slots up to 6 processes,
+// 3 for 7 or 8 (measured: 0.63 GB largest store race test process, 0.9 GB
+// largest process of the go test tree).
 export const goRaceShardWeight = (k) =>
   Math.max(2, Math.ceil((k * GO_RACE_PROCESS_BYTES) / JOB_SLOT_BYTES));
 export const checkWeight = (check, jobs) => {
   const shards = goRaceShardSpec(check);
   return Math.min(
     jobs,
-    shards ? goRaceShardWeight(shards.k) : (CHECK_WEIGHTS.get(check.id) ?? 1),
+    shards
+      ? goRaceShardWeight(
+          Math.min(1 + shards.reduce((sum, s) => sum + s.k, 0), jobs),
+        )
+      : (CHECK_WEIGHTS.get(check.id) ?? 1),
   );
 };
 
@@ -3173,25 +3190,34 @@ function reportWithdrawal({ output, signal, item, commit }, environment = proces
 }
 
 // The go-race check's command when the matrix approves shards. A package list
-// without the shard package (and without ./...) is one plain go test -race, as
-// before. Otherwise the other packages run first as that same single command,
-// and only when they pass do the shards of the shard package start: the two
-// never overlap, so the check never runs more race test processes at once than
-// its job slots are weighted for. Exit 0 needs every command to pass, go test
-// -list to agree with the source rule, and every listed test to have started
-// exactly once across the shards.
+// without any shard package (and without ./...) is one plain go test -race, as
+// before. Otherwise, before any test runs, every shard package the list tests
+// is listed and partitioned (the preflight). Then one pool runs the jobs in
+// queue order, at most the job count at once: the other packages as one
+// go test -race -p=1 (one race test process at a time), then every shard of
+// each shard package in flag order. After a job fails no further job starts;
+// running jobs finish. Two serial phases, the other packages and then the
+// shards, put both slow packages on the critical path and timed out twice on
+// 2026-10-15. Exit 0 needs every job to pass, go test -list to agree with the
+// source rule, and every listed test to have started exactly once across its
+// package's shards.
 export function parseGoRaceArgs(args) {
   const usage = () =>
     Object.assign(new Error("Usage: " + GO_RACE_USAGE), { exitCode: 2 });
-  let timeout, shards;
+  let timeout;
+  const shards = [];
   const first = args.findIndex((arg) => arg.startsWith("./"));
   if (first < 0 || args.slice(first).some((arg) => !arg.startsWith("./")))
     throw usage();
   for (const flag of args.slice(0, first)) {
     const found = GO_RACE_SHARDS_FLAG.exec(flag);
     if (GO_RACE_TIMEOUT_FLAG.test(flag) && !timeout) timeout = flag;
-    else if (found && !shards && found[1] !== "./...")
-      shards = { package: found[1], k: Number(found[2]) };
+    else if (
+      found &&
+      found[1] !== "./..." &&
+      !shards.some((s) => s.package === found[1])
+    )
+      shards.push({ package: found[1], k: Number(found[2]) });
     else throw usage();
   }
   return { timeout, shards, packages: args.slice(first) };
@@ -3218,7 +3244,8 @@ export async function runGoRace(
   // onLine receives each stdout line and stderr is returned.
   const go = (goArgs, onLine) =>
     new Promise((done) => {
-      if (abortSignal?.aborted) return done({ code: interrupted(), stderr: "" });
+      if (abortSignal?.aborted)
+        return done({ code: interrupted(), stderr: "", seconds: 0 });
       const started = Date.now();
       const child = spawn("go", goArgs, {
         cwd,
@@ -3248,7 +3275,8 @@ export async function runGoRace(
   const failed = (code) => interrupted() || (code > 0 ? code : 1);
   try {
     const all = packages.includes("./...");
-    if (!shards || !(all || packages.includes(shards.package))) {
+    const sharded = shards.filter((s) => all || packages.includes(s.package));
+    if (!sharded.length) {
       const { code } = await go(["test", "-race", ...flags, ...packages]);
       return code === 0 ? interrupted() : failed(code);
     }
@@ -3271,85 +3299,109 @@ export async function runGoRace(
         ]),
       ];
     }
-    const others = tested.filter((name) => name !== shards.package);
-    if (others.length) {
-      const { code, seconds } = await go(["test", "-race", ...flags, ...others]);
-      write(
-        `go-race other packages: ${others.length} packages, ${seconds.toFixed(1)} s, exit ${code}\n`,
-      );
-      if (code !== 0 || interrupted()) return failed(code);
-    }
-    if (!tested.includes(shards.package)) return interrupted();
-
-    const directory = join(cwd, shards.package);
-    const source = goRaceTestNames(
-      readdirSync(directory)
-        .filter((name) => name.endsWith("_test.go"))
-        .sort()
-        .map((name) => readFileSync(join(directory, name), "utf8")),
+    const others = tested.filter(
+      (name) => !sharded.some((s) => s.package === name),
     );
-    const names = [];
-    let listOutput = "";
-    const list = await go(
-      ["test", "-race", "-list", ".", shards.package],
-      (line) => {
-        listOutput += line + "\n";
-        if (/^(Test|Fuzz|Example)\w*$/.test(line)) names.push(line);
-      },
-    );
-    if (list.code !== 0) {
-      write(listOutput + list.stderr);
-      return failed(list.code);
-    }
-    const only = (from, other) =>
-      [...new Set(from)].filter((name) => !other.includes(name)).sort();
-    const sourceOnly = only(source, names),
-      listOnly = only(names, source);
-    if (sourceOnly.length || listOnly.length)
-      throw new Error(
-        `go-race: the test source of ${shards.package} and go test -list disagree` +
-          (sourceOnly.length ? `; only in the source: ${sourceOnly.join(", ")}` : "") +
-          (listOnly.length ? `; only in go test -list: ${listOnly.join(", ")}` : ""),
-      );
-    const { parts, digest: partitionDigest } = goRacePartition(source, shards.k);
-    assertGoRacePartition(names, parts);
-    const line = goRaceShardsLine(shards, names.length, partitionDigest);
-    write(line + "\n");
+    const active = sharded.filter((s) => tested.includes(s.package));
 
+    // The preflight: every shard package is listed and partitioned before any
+    // test runs, so a disagreement stops the check with nothing started.
+    const prepared = [];
+    for (const spec of active) {
+      const directory = join(cwd, spec.package);
+      const source = goRaceTestNames(
+        readdirSync(directory)
+          .filter((name) => name.endsWith("_test.go"))
+          .sort()
+          .map((name) => readFileSync(join(directory, name), "utf8")),
+      );
+      const names = [];
+      let listOutput = "";
+      const list = await go(
+        ["test", "-race", "-list", ".", spec.package],
+        (line) => {
+          listOutput += line + "\n";
+          if (/^(Test|Fuzz|Example)\w*$/.test(line)) names.push(line);
+        },
+      );
+      if (list.code !== 0) {
+        write(listOutput + list.stderr);
+        return failed(list.code);
+      }
+      const only = (from, other) =>
+        [...new Set(from)].filter((name) => !other.includes(name)).sort();
+      const sourceOnly = only(source, names),
+        listOnly = only(names, source);
+      if (sourceOnly.length || listOnly.length)
+        throw new Error(
+          `go-race: the test source of ${spec.package} and go test -list disagree` +
+            (sourceOnly.length ? `; only in the source: ${sourceOnly.join(", ")}` : "") +
+            (listOnly.length ? `; only in go test -list: ${listOnly.join(", ")}` : ""),
+        );
+      const { parts, digest: partitionDigest } = goRacePartition(source, spec.k);
+      assertGoRacePartition(names, parts);
+      const line = goRaceShardsLine(spec, names.length, partitionDigest);
+      write(line + "\n");
+      prepared.push({
+        spec,
+        names,
+        parts,
+        line,
+        selectors: goRaceShardSelectors(parts),
+        counts: new Map(),
+      });
+    }
+    if (interrupted()) return interrupted();
+
+    // The queue: the other packages' job first, then each package's shards.
+    const queue = [
+      ...(others.length ? [{ others: true }] : []),
+      ...prepared.flatMap((p) =>
+        p.selectors.map((selector, i) => ({ p, i, selector })),
+      ),
+    ];
     const jobs = Number(env.VERIFICATION_JOBS);
     const limit = Math.min(
-      shards.k,
+      queue.filter((job) => job.others || job.selector).length,
       Number.isSafeInteger(jobs) && jobs > 0 ? jobs : defaultJobs(),
     );
-    const selectors = goRaceShardSelectors(parts);
-    const results = new Array(shards.k),
-      counts = new Map();
+    const shardLabel = (job) => `shard ${job.p.spec.package} ${job.i + 1}/${job.p.spec.k}`;
     let running = 0,
       peak = 0,
       next = 0,
-      printed = 0;
-    // Each shard's output is printed whole, in shard order, as soon as every
-    // earlier shard has ended.
+      printed = 0,
+      stopped = false;
+    // Each job's output is printed whole, in queue order, as soon as it and
+    // every earlier job have ended. The other packages' job prints straight
+    // through and is first, so no shard output is printed while it runs.
     const print = () => {
-      for (; printed < shards.k && results[printed]; printed++) {
-        const r = results[printed];
+      for (; printed < queue.length && queue[printed].result; printed++) {
+        const job = queue[printed],
+          r = job.result;
         write(
-          r.text +
-            `go-race shard ${printed + 1}/${shards.k}: ${r.tests} tests, ${r.seconds.toFixed(1)} s, exit ${r.code}` +
-            (r.started ? "\n" : " (not started: no test hashes to it)\n"),
+          job.others
+            ? `go-race other packages: ${others.length} packages, ${r.seconds.toFixed(1)} s, exit ${r.code}\n`
+            : r.text +
+                `go-race ${shardLabel(job)}: ${r.tests} tests, ${r.seconds.toFixed(1)} s, exit ${r.code}` +
+                (r.started ? "\n" : " (not started: no test hashes to it)\n"),
         );
       }
     };
-    const runShard = async (i) => {
-      if (!selectors[i]) {
-        results[i] = { text: "", tests: 0, seconds: 0, code: 0, started: false };
+    const runJob = async (job) => {
+      if (job.others) {
+        const { code, seconds } = await go(["test", "-race", "-p=1", ...flags, ...others]);
+        job.result = { code, seconds };
+        return;
+      }
+      if (!job.selector) {
+        job.result = { text: "", tests: 0, seconds: 0, code: 0, started: false };
         return;
       }
       peak = Math.max(peak, ++running);
       const text = [],
         own = new Map();
       const { code, stderr, seconds } = await go(
-        ["test", "-race", "-json", "-count=1", ...flags, ...selectors[i], shards.package],
+        ["test", "-race", "-json", "-count=1", ...flags, ...job.selector, job.p.spec.package],
         (jsonLine) => {
           let event;
           try {
@@ -3364,8 +3416,8 @@ export async function runGoRace(
       );
       running--;
       for (const [name, count] of own)
-        counts.set(name, (counts.get(name) ?? 0) + count);
-      results[i] = {
+        job.p.counts.set(name, (job.p.counts.get(name) ?? 0) + count);
+      job.result = {
         text: text.join("") + stderr,
         tests: own.size,
         seconds,
@@ -3375,40 +3427,73 @@ export async function runGoRace(
     };
     await Promise.all(
       Array.from({ length: limit }, async () => {
-        while (next < shards.k && !interrupted()) {
-          await runShard(next++);
+        while (next < queue.length && !stopped && !interrupted()) {
+          const job = queue[next++];
+          await runJob(job);
+          if (job.result.code !== 0) stopped = true;
           print();
         }
       }),
     );
     if (interrupted()) return interrupted();
-    const ranOnce = names.filter((name) => counts.get(name) === 1).length;
-    write(`${line.replace(" partition ", ` ran-once=${ranOnce} partition `)} peak-shard-processes=${peak}\n`);
+    // A package whose shards all ran gets its end line; after a failure the
+    // shards the queue never reached are not run, not missing.
+    const complete = prepared.filter((p) =>
+      queue.every((job) => job.p !== p || job.result),
+    );
+    for (const p of complete) {
+      const ranOnce = p.names.filter((name) => p.counts.get(name) === 1).length;
+      write(
+        `${p.line.replace(" partition ", ` ran-once=${ranOnce} partition `)} peak-shard-processes=${peak}\n`,
+      );
+    }
+    const unstarted = queue.filter((job) => !job.result).length;
+    if (unstarted) write(`go-race: ${unstarted} jobs not started after a failure\n`);
+    const othersJob = queue.find((job) => job.others);
+    if (othersJob && othersJob.result.code !== 0)
+      return failed(othersJob.result.code);
     // A shard that exited before running its own tests is the failure to
     // report: its identity and exit first, then a bounded sample of what it
     // left unrun, instead of every missing name.
-    const early = results
-      .map((r, i) => ({ r, i, unrun: parts[i].filter((name) => !counts.has(name)) }))
-      .filter(({ r, unrun }) => r.code !== 0 && unrun.length);
+    const early = queue
+      .filter((job) => job.p && job.result?.started && job.result.code !== 0)
+      .map((job) => ({
+        job,
+        unrun: job.p.parts[job.i].filter((name) => !job.p.counts.has(name)),
+      }))
+      .filter(({ unrun }) => unrun.length);
     if (early.length) {
-      const label = (i) => `shard ${i + 1}/${shards.k}`,
-        theirs = new Set(early.flatMap(({ i }) => parts[i]));
+      // The tests of a reported shard, or of one the queue never reached,
+      // are not counted as not run in other shards.
+      const theirs = (p) =>
+        new Set(
+          queue
+            .filter((job) => job.p === p && (!job.result || early.some((e) => e.job === job)))
+            .flatMap((job) => p.parts[job.i]),
+        );
+      const sum = (count) => prepared.reduce((total, p) => total + count(p), 0);
       const other = [
-        [names.filter((name) => !theirs.has(name) && !counts.has(name)).length, "not run in other shards"],
-        [[...counts.values()].filter((count) => count > 1).length, "run more than once"],
-        [[...counts.keys()].filter((name) => !names.includes(name)).length, "unlisted"],
+        [
+          sum((p) => {
+            const excused = theirs(p);
+            return p.names.filter((name) => !excused.has(name) && !p.counts.has(name)).length;
+          }),
+          "not run in other shards",
+        ],
+        [sum((p) => [...p.counts.values()].filter((count) => count > 1).length), "run more than once"],
+        [sum((p) => [...p.counts.keys()].filter((name) => !p.names.includes(name)).length), "unlisted"],
       ].filter(([count]) => count);
       throw Object.assign(
         new Error(
           [
             ...early.map(
-              ({ r, i, unrun }) =>
-                `go-race: ${label(i)} ${r.code < 0 ? "ended without an exit code" : `exited ${r.code}`}` +
-                ` before running ${unrun.length} of its ${parts[i].length} tests`,
+              ({ job, unrun }) =>
+                `go-race: ${shardLabel(job)} ${job.result.code < 0 ? "ended without an exit code" : `exited ${job.result.code}`}` +
+                ` before running ${unrun.length} of its ${job.p.parts[job.i].length} tests`,
             ),
             ...early.map(
-              ({ i, unrun }) =>
-                `${label(i)} not run (first ${Math.min(10, unrun.length)} of ${unrun.length}): ` +
+              ({ job, unrun }) =>
+                `${shardLabel(job)} not run (first ${Math.min(10, unrun.length)} of ${unrun.length}): ` +
                 unrun.slice(0, 10).join(", "),
             ),
             ...(other.length
@@ -3416,12 +3501,12 @@ export async function runGoRace(
               : []),
           ].join("\n"),
         ),
-        { exitCode: failed(early[0].r.code) },
+        { exitCode: failed(early[0].job.result.code) },
       );
     }
-    assertRanExactlyOnce(names, counts);
-    const bad = results.find((r) => r.code !== 0);
-    return bad ? failed(bad.code) : 0;
+    for (const p of complete) assertRanExactlyOnce(p.names, p.counts);
+    const bad = queue.find((job) => job.result && job.result.code !== 0);
+    return bad ? failed(bad.result.code) : 0;
   } finally {
     abortSignal?.removeEventListener("abort", forward);
   }
@@ -3527,7 +3612,7 @@ if (invokedDirectly && process.argv[2] === "go-race") {
           preservationPath(output),
           JSON.stringify(record, null, 2) + "\n",
         );
-      if (goRaceShards) console.error(goRaceShards.line);
+      for (const shards of goRaceShards ?? []) console.error(shards.line);
       if (preserved) {
         console.error(
           `Kept ${preserved.kept.length + preserved.widened.length} accepted checks (accepted checksDigest ${preserved.acceptedChecksDigest})` +

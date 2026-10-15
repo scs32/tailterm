@@ -639,17 +639,25 @@ cost is flat: the slowest 20 tests are 29% of the time and the median test is
 therefore runs as shards: several race processes that each run part of the
 tests, inside the one `go-race` check.
 
+`hub/cmd/tt` followed (bug `wi_af64945097c67c68`, order #35357): unsharded it
+took 1559 to 1828 s under race inside the other-packages command, and with the
+store shards after it go-race passed at 2901 s of its 3000 s timeout on
+2026-10-15 and timed out twice that day. It has 940 top-level tests, none
+parallel, and a running `tt.test` uses about one core.
+
 **The key.** `verification/matrix.json` carries
-`"goRaceShards": { "./internal/store": 4 }`: one package (a `./` path, not
-`./...`) and K, an integer from 2 to 8. Anything else is refused as
-`Invalid matrix goRaceShards`. Changing K, or the package, changes the matrix
-bytes and needs a new owner approval of the digest, like any matrix change.
+`"goRaceShards": { "./cmd/tt": 5, "./internal/store": 4 }`: one or more
+packages, each a `./` path (not `./...`) with its own K, an integer from 2 to
+8. An empty object, a non-object, or any bad entry is refused as
+`Invalid matrix goRaceShards`. Changing any K, or adding or removing a
+package, changes the matrix bytes and needs a new owner approval of the
+digest, like any matrix change.
 
 **The argv.** With the key, every go-race check has the same prefix, whatever
-its packages:
+its packages: one `-shards=PKG=K` flag per package, in package order.
 
 ```
-node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 PACKAGE...
+node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./cmd/tt=5 -shards=./internal/store=4 PACKAGE...
 ```
 
 The cwd stays `hub`, the check ID stays `go-race`, and the packages are
@@ -660,30 +668,47 @@ equal. Without the key the argv is `go test -race …` as before. `go-test` and
 every other check are unchanged.
 
 **Locally.** To run the store race yourself, from `hub/`:
-`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store`.
+`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store`,
+and the tt race:
+`node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./cmd/tt=5 ./cmd/tt`.
 The unsharded `go test -race -timeout 30m ./internal/store` no longer fits 30 minutes.
 
-**What the command does.** It accepts only `-timeout=Nm`, `-shards=PKG=K` and
-`./` packages.
+**What the command does.** It accepts only one `-timeout=Nm`, at most one
+`-shards=PKG=K` per package (a second flag for a package is a usage error
+whatever its K), and `./` packages.
 
-- A list with neither the shard package nor `./...` runs one
-  `go test -race -timeout=Nm PACKAGE...`. A Go change outside the store behaves
-  as before.
-- Otherwise `./...` is expanded with `go list`, the shard package is taken out,
-  and two phases run one after the other, never together:
-  1. The other packages, when there are any: one
-     `go test -race -timeout=Nm OTHER...`, then the line
-     `go-race other packages: N packages, S s, exit C`. If it fails, no shard
-     starts and the check fails.
-  2. The shards: `go test -race -json -count=1 -timeout=Nm (-run|-skip) REGEX
-     ./internal/store`, at most `min(K, VERIFICATION_JOBS)` at once, so a
+- A list with no shard package and no `./...` runs one
+  `go test -race -timeout=Nm PACKAGE...`. A Go change outside the shard
+  packages behaves as before.
+- Otherwise `./...` is expanded with `go list` and the shard packages are
+  taken out. Then:
+  1. The preflight, before any test runs: each shard package the list tests,
+     in flag order, is listed and partitioned (the three checks below) and
+     prints its start line. Any failure stops the check with nothing started.
+  2. One pool runs the jobs in queue order, at most
+     `min(jobs in the queue, VERIFICATION_JOBS)` at once: first the other
+     packages, when there are any, as one
+     `go test -race -p=1 -timeout=Nm OTHER...` (one race test process at a
+     time), then each shard package's shards in flag order, each
+     `go test -race -json -count=1 -timeout=Nm (-run|-skip) REGEX PKG`. A
      one-job run takes them in turn. `-count=1` keeps a cached result from
-     standing in for a run.
+     standing in for a run. After any job fails no further job starts; the
+     running ones finish, and the line `go-race: N jobs not started after a
+     failure` says how many were left.
 
-Each shard's whole test output is printed as plain text in shard order,
-followed by `go-race shard I/K: N tests, S s, exit C`, so the log keeps every
-`=== RUN` line and each shard's seconds. A failed shard fails the check, and a
-retry reruns the whole check.
+Two serial phases, the other packages and then the shards, put the slow
+packages end to end: on 2026-10-15 cmd/tt took 1822 to 1826 s in the
+other-packages command and the store shards were then cut at 1148 to 1149 s,
+twice (#35433). In the pool the other packages run beside the shards.
+
+Each job's whole output is printed in queue order once it and every earlier
+job have ended: the other packages' job prints through, then
+`go-race other packages: N packages, S s, exit C`; a shard prints its test
+output as plain text followed by `go-race shard PKG I/K: N tests, S s, exit C`,
+so the log keeps every `=== RUN` line and each shard's seconds. A failed job
+fails the check (a failed other-packages job gives its own exit code, and the
+shards it left unstarted are not reported missing), and a retry reruns the
+whole check.
 
 **The shard rule.** A test's shard is
 `parseInt(sha256(name).slice(0, 8), 16) % K`: the first 8 hex digits of the
@@ -698,24 +723,28 @@ drift.
 test that no list named still runs once, there. A shard other than the
 catch-all with no names is not started.
 
-**The three checks.** K and the package are frozen in the plan's argv; the
-partition is not, because its digest changes whenever any item adds, removes or
-renames a store test, and an approved plan and its integrated plan must keep
-the same argv prefix. The partition follows from the test names at the plan's
-commit and K, and the run refuses a worktree that is not at that commit. Three
-checks hold it:
+**The three checks.** Each package and its K are frozen in the plan's argv;
+the partition is not, because its digest changes whenever any item adds,
+removes or renames a test there, and an approved plan and its integrated plan
+must keep the same argv prefix. The partition follows from the test names at
+the plan's commit and K, and the run refuses a worktree that is not at that
+commit. Three checks hold it, per shard package:
 
 1. Plan creation reads the package's `_test.go` files from the commit with
    git, partitions the names and fails unless every name is in exactly one
-   shard. It prints, on stderr,
+   shard. It prints, on stderr, one line per package the plan's go-race
+   tests, such as
    `go-race shards: ./internal/store K=4 tests=N partition sha256:DIGEST`.
-2. The run lists the tests with `go test -race -list .` and fails, naming the
-   difference, unless that list equals the names in the worktree's source. It
-   prints the same line, with the same digest for the same commit.
-3. After the shards end, the run fails unless every listed test started
-   exactly once across all shards (top-level `run` events of `go test -json`)
-   and no unlisted top-level test ran. Its last line is
-   `go-race shards: ./internal/store K=4 tests=N ran-once=N partition sha256:DIGEST peak-shard-processes=P`.
+2. The preflight lists the tests with `go test -race -list .` and fails,
+   naming the difference, unless that list equals the names in the worktree's
+   source. It prints the same line, with the same digest for the same commit.
+3. After the pool ends, the run fails unless every listed test started
+   exactly once across the package's shards (top-level `run` events of
+   `go test -json`) and no unlisted top-level test ran. It prints, per
+   package whose shards all ran,
+   `go-race shards: ./internal/store K=4 tests=N ran-once=N partition sha256:DIGEST peak-shard-processes=P`,
+   where P is the pool's peak count of shard processes (the other packages'
+   job is not counted).
 
 `DIGEST` is the SHA-256 of the canonical JSON of the K sorted name lists. The
 names are every top-level function in the package directory's `_test.go` files
@@ -725,34 +754,46 @@ matching `^func ((?:Test|Fuzz|Example)[A-Z_0-9]\w*|Test|Example)\(`, except
 check 2 stop the run; fix the test file or the rule, never rely on the
 catch-all.
 
-**Slot weight.** A go-race that will shard (its packages include the shard
-package or `./...`) holds `max(2, ceil(K × 1 GiB / 3 GiB))` job slots, capped at
-the job count: 2 for K up to 6, 3 for K 7 or 8. 1 GiB per race process is the
+**Slot weight.** A go-race that will shard (its packages include a shard
+package or `./...`) holds `max(2, ceil(min(1 + sum of K, jobs) × 1 GiB / 3 GiB))`
+job slots, capped at the job count: the pool is the other packages' job plus
+every shard, at most the job count at once, so on the Mini's 5 jobs it is 2
+and at 8 jobs with cmd/tt and the store it is 3. 1 GiB per race process is the
 admission budget, above the 0.63 GB largest store race test process and the
 0.9 GB largest process of the `go test` tree that were measured; 3 GiB is what
 the default job count assumes per slot. A go-race that will not shard keeps
-weight 2. Because the phases never overlap, the tree during the shard phase is
-the K shard commands only, and a `./...` run never has more race test processes
-at once than `go test -race ./...` had. The Go lane lock is unchanged.
+weight 2. The tree never holds more race test processes than the pool size:
+the other packages' job is one, because of `-p=1`. The Go lane lock is
+unchanged.
 
 **Timing.** A four-shard prototype of the same rule beside another matrix took
-577 s (shards 378, 468, 577 and 528 s), each test run exactly once. A `./...`
-or mixed run adds the other packages' time before the shards, about one
-minute; a store-only change pays nothing.
+577 s (shards 378, 468, 577 and 528 s), each test run exactly once; loaded full
+matrices on 2026-10-15 put the slowest store shard at 1025 to 1149 s. cmd/tt at
+K=5 splits its 940 tests 188, 183, 191, 184 and 194 (commit `ca69981`); at the
+worst measured loaded rate (1826 s unsharded) the largest shard is about 377 s
+of test time. The other packages' job (about 525 s of `internal/server` and
+100 s of small packages, one at a time) runs beside the shards, so it is not
+on the critical path. A store-only or tt-only change pays only its own shards.
 
-**Changing K.** Edit the one number in `goRaceShards`, get the owner's approval
-of the new matrix digest, and release it like any matrix change. A go-race
-approved under the previous matrix is then covered by the integrated one only
-as an approved matrix change, while it still tests every approved package (see
-"Integrated plans keep accepted checks"); another K under one matrix is another
-argv prefix and is refused. If a receipt's go-race passes 12 minutes as the
-suite grows, K=5 is the next step: its longest shard is 385 s of the measured
-test time against 518 s for K=4.
+**Changing K.** Edit any package's number in `goRaceShards`, or add or remove
+a package; each changes the matrix bytes, so get the owner's approval of the
+new matrix digest and release it like any matrix change. A go-race approved
+under the previous matrix is then covered by the integrated one only as an
+approved matrix change, while it still tests every approved package (see
+"Integrated plans keep accepted checks"); another K or another package set
+under one matrix is another argv prefix and is refused. If a receipt's store
+shards pass 12 minutes as the suite grows, store K=5 is the next step: its
+longest shard is 385 s of the measured test time against 518 s for K=4. Keep
+the sum of K in mind: the pool runs at most the job count at once, so on a
+5-job host more shards queue rather than run together.
 
 The hub's coverage rule (`goRaceCovers`, `matrixChangeCovers`) and the release
 runner's copies read "prefix, then only `./` packages" and needed no change.
 Tests: `tests/verification.test.js` (the shard rule, plan creation, argv, slot
-weight, and the command on a real Go module) and
+weight, and the command on a real Go module), `tests/verification-2.test.js`
+("goRaceShards accepts several packages, each with its own K", "go-race
+command shards two packages in one pool after listing both" and "plan
+creation partitions each shard package and prints one line per package") and
 `TestReleaseImportCoversShardedGoRaceBySuperset` and
 `TestReleaseImportCoversGoTestRaceByShardsOnlyAsMatrixChange` in
 `hub/internal/store/releases_test.go`.
