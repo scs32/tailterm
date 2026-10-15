@@ -597,6 +597,10 @@ func compatibilitySummary(j ReleaseJob, row int64) ReleaseSummary {
 	if j.Supersession != nil {
 		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
+	if j.Hold != nil {
+		hold := *j.Hold
+		s.Hold = &hold
+	}
 	return s
 }
 

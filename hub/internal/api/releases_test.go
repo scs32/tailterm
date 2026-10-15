@@ -234,6 +234,107 @@ func TestReleaseDeploymentCompatibilityModernDetailBookend(t *testing.T) {
 	}
 }
 
+// heldLedgerHub lists jobs as the store's releaseSummary does, which carries
+// an owner hold; detail serves the job a detail read sees, which may differ.
+func heldLedgerHub(t *testing.T, listed []ReleaseJob, detail func(ReleaseJob) ReleaseJob) *Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if id := q.Get("job"); id != "" {
+			for _, j := range listed {
+				if j.ID == id {
+					json.NewEncoder(w).Encode(detail(j))
+					return
+				}
+			}
+			w.WriteHeader(404)
+			return
+		}
+		page := ReleasePage{Version: 1, Jobs: []ReleaseSummary{}, Page: ReleasePageInfo{View: q.Get("view"), Limit: 200, Snapshot: strings.Repeat("a", 64)}}
+		if q.Get("view") == "active" {
+			for i, j := range listed {
+				s := compatibilitySummary(j, int64(i+1))
+				s.Hold = nil
+				if j.Hold != nil {
+					hold := *j.Hold
+					s.Hold = &hold
+				}
+				page.Jobs = append(page.Jobs, s)
+			}
+		}
+		json.NewEncoder(w).Encode(page)
+	}))
+	t.Cleanup(server.Close)
+	return &Client{Base: server.URL, HTTP: server.Client()}
+}
+
+func heldReleaseJobs(task string) []ReleaseJob {
+	return []ReleaseJob{
+		{ID: "rel_000000000000000a", TaskID: task, State: "held", Generation: 3, Plan: VerificationPlan{Commit: "full-plan"}, Hold: &ReleaseHold{Reason: "matrix wait", UntilItems: []string{"wi_0123456789abcdef"}, AgentID: "agt_handler", RunID: "run_handler", HeldAt: "2026-10-14T01:02:03Z"}},
+		{ID: "rel_000000000000000b", TaskID: task, State: "verified", Generation: 1, Plan: VerificationPlan{Commit: "full-plan"}},
+	}
+}
+
+func TestReleaseDeploymentCompatibilityListsHeldJob(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	jobs := heldReleaseJobs(task)
+	c := heldLedgerHub(t, jobs, func(j ReleaseJob) ReleaseJob { return j })
+	out, err := c.CompatibilityReleases(context.Background(), task)
+	if err != nil || !reflect.DeepEqual(out, jobs) {
+		t.Fatal("compat-list with a held job:", out, err)
+	}
+	got, err := c.CompatibilityRelease(context.Background(), task, jobs[0].ID)
+	if err != nil || !reflect.DeepEqual(got, jobs[0]) {
+		t.Fatal("compat-get of a held job:", got, err)
+	}
+	for _, j := range jobs {
+		if s := compatibilitySummary(j, 1); !reflect.DeepEqual(s.Hold, j.Hold) || (s.Hold != nil && s.Hold == j.Hold) {
+			t.Fatal("summary hold is not a copy of the job's", j.ID, s.Hold)
+		}
+	}
+}
+
+func TestReleaseDeploymentCompatibilityRefusesChangedHold(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	for _, change := range []string{"reason", "until", "held-at", "lifted", "added"} {
+		t.Run(change, func(t *testing.T) {
+			jobs := heldReleaseJobs(task)
+			target := jobs[0]
+			if change == "added" {
+				target = jobs[1]
+			}
+			c := heldLedgerHub(t, jobs, func(j ReleaseJob) ReleaseJob {
+				if j.ID != target.ID {
+					return j
+				}
+				if j.Hold != nil {
+					hold := *j.Hold
+					j.Hold = &hold
+				}
+				switch change {
+				case "reason":
+					j.Hold.Reason = "planned release"
+				case "until":
+					j.Hold.UntilItems = []string{"wi_fedcba9876543210"}
+				case "held-at":
+					j.Hold.HeldAt = "2026-10-14T09:09:09Z"
+				case "lifted":
+					j.Hold = nil
+				case "added":
+					j.Hold = &ReleaseHold{Reason: "matrix wait"}
+				}
+				return j
+			})
+			if out, err := c.CompatibilityReleases(context.Background(), task); err == nil || out != nil || err.Error() != "release detail changed or compact" {
+				t.Fatal("compat-list accepted a changed hold:", out, err)
+			}
+			if got, err := c.CompatibilityRelease(context.Background(), task, target.ID); err == nil || got.ID != "" || err.Error() != "release detail changed or compact" {
+				t.Fatal("compat-get accepted a changed hold:", got, err)
+			}
+		})
+	}
+}
+
 // staleLedgerHub is a modern-protocol hub whose snapshot token follows the
 // ledger, as the store's does: a read carrying an outdated token is refused
 // with the store's own 409 body. mutate runs before each request is served.
