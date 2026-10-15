@@ -81,6 +81,37 @@ func oldestPending(c *activityCursor) pendingActivityCall {
 	return oldest
 }
 
+// backgroundReasonPrefix starts every reason a running background task gives.
+const backgroundReasonPrefix = "background "
+
+// backgroundActivity is the state of a completed Claude turn whose session
+// still runs a background task: working until the oldest task passes the
+// bound, unknown after it. The reason names the tool, the task id and the
+// launch time, never the command. ok is false when no task is running.
+func backgroundActivity(c *activityCursor, now time.Time, threshold activityThresholds) (state, reason string, ok bool) {
+	if len(c.Background) == 0 {
+		return "", "", false
+	}
+	oldest := c.Background[0]
+	for _, task := range c.Background[1:] {
+		if task.Since.Before(oldest.Since) {
+			oldest = task
+		}
+	}
+	bound := threshold.Background
+	if bound <= 0 {
+		bound = activityBackgroundDefault * time.Second
+	}
+	reason = fmt.Sprintf("%s%s task %s running since %s", backgroundReasonPrefix, oldest.Tool, oldest.ID, oldest.Since.UTC().Format(time.RFC3339))
+	if now.Sub(oldest.Since) > bound {
+		return "unknown", fmt.Sprintf("%s, past the %dm bound", reason, int(bound/time.Minute)), true
+	}
+	if n := len(c.Background); n > 1 {
+		reason += fmt.Sprintf(" (%d background tasks)", n)
+	}
+	return "working", reason, true
+}
+
 func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAlive, processAlive bool, probeErr error, now time.Time, threshold activityThresholds) api.AgentActivity {
 	result := api.AgentActivity{State: "unknown", ObservedAt: now, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 	if a.Role == api.AgentRoleOwnerHelper && (probeErr != nil || !tmuxAlive || !processAlive) {
@@ -93,6 +124,10 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		c.MissingSince = time.Time{}
 		result.Reason = "process probe unavailable"
 		return result
+	}
+	if !tmuxAlive || !processAlive {
+		// Background shells end with their runtime.
+		c.Background = nil
 	}
 	if a.Status == api.AgentRunning {
 		if !tmuxAlive || !processAlive {
@@ -126,6 +161,12 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		// completed, unseen or unreadable turn is a planned wait; an open turn
 		// is judged on its transcript below, without the hung or looping rules.
 		if c.Unknown || !c.SeenTurn || c.TurnComplete {
+			// A completed turn whose background task still runs is decided
+			// as rule 10 decides it.
+			if state, reason, ok := backgroundActivity(c, now, threshold); ok && !c.Unknown && c.SeenTurn {
+				result.State, result.Reason = state, reason
+				return result
+			}
 			result.Reason = "planned wait or input required"
 			return result
 		}
@@ -176,6 +217,10 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		}
 	}
 	if c.TurnComplete {
+		if state, reason, ok := backgroundActivity(c, now, threshold); ok {
+			result.State, result.Reason = state, reason
+			return result
+		}
 		if openObligations > 0 {
 			result.State = "finished_silent"
 		} else {
@@ -613,7 +658,10 @@ func providerFallback(c *activityCursor, err error) bool {
 // older relay saved, which had no reason.
 func activityReportKey(a api.AgentActivity) string {
 	key := activityKeyVersion + legacyActivityKey(a)
-	if a.State == "idle" || a.State == "finished_silent" {
+	// A background task's reason makes a new report too: a turn that closes
+	// with a task running, or a new oldest task. Other working reports carry
+	// no reason, so keys an older relay saved are unchanged.
+	if a.State == "idle" || a.State == "finished_silent" || strings.HasPrefix(a.Reason, backgroundReasonPrefix) {
 		key += "\x00reason=" + a.Reason
 	}
 	// A class change is a new report; a steady block is not.

@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -2076,4 +2078,471 @@ func TestOwnerHelperCodexDiscoveryHeartbeatAndOffline(t *testing.T) {
 	if got.State != "unknown" || got.Reason != "owner session offline" {
 		t.Fatalf("Codex helper absence %+v", got)
 	}
+}
+
+// Synthetic Claude records around background tasks (bug wi_a7895b5aaceb4986),
+// in the shape Claude Code 2.1.x writes: a Bash launch whose tool result
+// carries toolUseResult.backgroundTaskId, and a <task-notification> notice
+// with a final status in a queue-operation or an idle-session user record.
+// Ids, paths and text are invented.
+var bgFixtureStart = time.Date(2026, 10, 14, 23, 46, 0, 0, time.UTC)
+
+func bgFixtureTime(offset time.Duration) string {
+	return bgFixtureStart.Add(offset).Format(time.RFC3339Nano)
+}
+
+func bgFixturePrompt(at time.Duration) string {
+	return `{"type":"user","timestamp":"` + bgFixtureTime(at) + `","message":{"role":"user","content":"Synthetic fixture prompt."}}`
+}
+
+func bgFixtureToolUse(at time.Duration, callID, tool, input string) string {
+	return `{"type":"assistant","timestamp":"` + bgFixtureTime(at) + `","message":{"id":"msg_` + callID + `","role":"assistant","content":[{"type":"tool_use","id":"` + callID + `","name":"` + tool + `","input":` + input + `}],"stop_reason":"tool_use"}}`
+}
+
+// bgFixtureLaunch is a Bash call and its result moving it to the background.
+// A timed-out foreground call carries timedOutAfterMs as well.
+func bgFixtureLaunch(at time.Duration, callID, taskID string, timedOut bool) []string {
+	input := `{"command":"synthetic","run_in_background":true}`
+	extra := ""
+	if timedOut {
+		input = `{"command":"synthetic","timeout":120000}`
+		extra = `,"timedOutAfterMs":120000`
+	}
+	return []string{
+		bgFixtureToolUse(at, callID, "Bash", input),
+		`{"type":"user","timestamp":"` + bgFixtureTime(at+time.Second) + `","toolUseResult":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"` + taskID + `"` + extra + `},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + callID + `","content":"Synthetic background result."}]}}`,
+	}
+}
+
+func bgFixtureEndTurn(at time.Duration) []string {
+	return []string{
+		`{"type":"assistant","timestamp":"` + bgFixtureTime(at) + `","message":{"id":"msg_bg_end_` + strconv.Itoa(int(at/time.Second)) + `","role":"assistant","content":[{"type":"text","text":"Synthetic reply."}],"stop_reason":"end_turn"}}`,
+		`{"type":"system","timestamp":"` + bgFixtureTime(at+100*time.Millisecond) + `","subtype":"turn_duration","durationMs":100}`,
+	}
+}
+
+func bgFixtureNotice(taskID, status string) string {
+	text := "<task-notification>\n<task-id>" + taskID + "</task-id>\n<tool-use-id>toolu_bg_synthetic</tool-use-id>\n<output-file>/synthetic/tasks/" + taskID + ".output</output-file>\n"
+	if status != "" {
+		text += "<status>" + status + "</status>\n"
+	} else {
+		text += "<event>synthetic</event>\n"
+	}
+	return text + "<summary>Synthetic summary.</summary>\n</task-notification>"
+}
+
+func bgFixtureQueued(at time.Duration, operation, taskID, status string) string {
+	content, _ := json.Marshal(bgFixtureNotice(taskID, status))
+	return `{"type":"queue-operation","operation":"` + operation + `","timestamp":"` + bgFixtureTime(at) + `","sessionId":"synthetic","content":` + string(content) + `}`
+}
+
+func bgFixtureIdleNotice(at time.Duration, taskID, status string) string {
+	content, _ := json.Marshal(bgFixtureNotice(taskID, status))
+	return `{"type":"user","timestamp":"` + bgFixtureTime(at) + `","origin":{"kind":"task-notification","producer":"session-task"},"message":{"role":"user","content":` + string(content) + `}}`
+}
+
+// bgFixtureTaskStop is a TaskStop call and its result; a failed stop is an
+// is_error result whose toolUseResult is a string.
+func bgFixtureTaskStop(at time.Duration, callID, taskID string, failed bool) []string {
+	result := `{"type":"user","timestamp":"` + bgFixtureTime(at+time.Second) + `","toolUseResult":{"message":"Synthetic stop.","task_id":"` + taskID + `","task_type":"local_bash","command":"synthetic"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + callID + `","content":"Synthetic stop."}]}}`
+	if failed {
+		result = `{"type":"user","timestamp":"` + bgFixtureTime(at+time.Second) + `","toolUseResult":"Error: synthetic","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + callID + `","is_error":true,"content":"Error: synthetic"}]}}`
+	}
+	return []string{bgFixtureToolUse(at, callID, "TaskStop", `{"task_id":"`+taskID+`"}`), result}
+}
+
+func parseBgFixture(t *testing.T, c *activityCursor, records ...string) {
+	t.Helper()
+	for _, record := range records {
+		if err := parseClaudeActivity([]byte(record), c); err != nil {
+			t.Fatalf("parse %s: %v", record, err)
+		}
+	}
+}
+
+func bgFixtureIDs(c *activityCursor) []string {
+	var ids []string
+	for _, task := range c.Background {
+		ids = append(ids, task.ID)
+	}
+	return ids
+}
+
+// b1: launches add tasks; a completed, failed or killed notice or a successful
+// TaskStop removes them; nothing else does.
+func TestActivityClaudeBackgroundTaskSet(t *testing.T) {
+	var c activityCursor
+	parseBgFixture(t, &c, bgFixturePrompt(0))
+	parseBgFixture(t, &c, bgFixtureLaunch(time.Second, "toolu_bg_a", "b0fixture", false)...)
+	parseBgFixture(t, &c, bgFixtureLaunch(10*time.Second, "toolu_bg_b", "b1fixture", true)...)
+	parseBgFixture(t, &c, bgFixtureLaunch(20*time.Second, "toolu_bg_c", "b2fixture", false)...)
+	parseBgFixture(t, &c, bgFixtureLaunch(30*time.Second, "toolu_bg_d", "b3fixture", false)...)
+	parseBgFixture(t, &c, bgFixtureLaunch(40*time.Second, "toolu_bg_e", "b4fixture", false)...)
+	want := []backgroundActivityTask{
+		{ID: "b0fixture", Tool: "Bash", Since: bgFixtureStart.Add(2 * time.Second)},
+		{ID: "b1fixture", Tool: "Bash", Since: bgFixtureStart.Add(11 * time.Second)},
+	}
+	if len(c.Background) != 5 || !slices.Equal(c.Background[:2], want) || len(c.Pending) != 0 {
+		t.Fatalf("launches: %+v pending %+v", c.Background, c.Pending)
+	}
+	snapshot := c.Background
+
+	// Turn ends of every kind keep the set: they end a turn, not a shell.
+	parseBgFixture(t, &c, bgFixtureEndTurn(50*time.Second)...)
+	parseBgFixture(t, &c, bgFixturePrompt(60*time.Second), `{"type":"user","timestamp":"`+bgFixtureTime(61*time.Second)+`","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`)
+	parseBgFixture(t, &c, bgFixturePrompt(70*time.Second), claudeAPIErrorRecord, claudeAPIErrorTurnDuration)
+	if len(c.Background) != 5 {
+		t.Fatalf("turn ends changed the set: %v", bgFixtureIDs(&c))
+	}
+
+	// None of these end a task.
+	parseBgFixture(t, &c, bgFixtureTaskStop(80*time.Second, "toolu_stop_fail", "b0fixture", true)...)
+	parseBgFixture(t, &c,
+		bgFixtureQueued(90*time.Second, "enqueue", "b0fixture", "running"),
+		bgFixtureQueued(91*time.Second, "dequeue", "b0fixture", ""),
+		bgFixtureIdleNotice(92*time.Second, "b0fixture", ""),
+		// A notice quoted inside a tool result.
+		bgFixtureToolUse(93*time.Second, "toolu_read", "Read", `{"file_path":"/synthetic/notice"}`),
+		`{"type":"user","timestamp":"`+bgFixtureTime(94*time.Second)+`","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":`+strconv.Quote(bgFixtureNotice("b0fixture", "completed"))+`}]}}`,
+		// A typed prompt that mentions the tag mid-text.
+		`{"type":"user","timestamp":"`+bgFixtureTime(95*time.Second)+`","message":{"role":"user","content":`+strconv.Quote("Synthetic question about "+bgFixtureNotice("b0fixture", "completed"))+`}}`,
+	)
+	if len(c.Background) != 5 {
+		t.Fatalf("non-final records changed the set: %v", bgFixtureIDs(&c))
+	}
+
+	// Each end form removes its own task.
+	parseBgFixture(t, &c, bgFixtureQueued(100*time.Second, "enqueue", "b0fixture", "completed"))
+	parseBgFixture(t, &c, bgFixtureIdleNotice(110*time.Second, "b1fixture", "failed"))
+	parseBgFixture(t, &c, bgFixtureQueued(120*time.Second, "remove", "b2fixture", "killed"))
+	parseBgFixture(t, &c, bgFixtureTaskStop(130*time.Second, "toolu_stop_ok", "b3fixture", false)...)
+	if ids := bgFixtureIDs(&c); !slices.Equal(ids, []string{"b4fixture"}) {
+		t.Fatalf("after the four end forms: %v", ids)
+	}
+	// A notice for an unknown task, or a repeated one, changes nothing.
+	parseBgFixture(t, &c, bgFixtureQueued(140*time.Second, "enqueue", "b0fixture", "completed"), bgFixtureQueued(141*time.Second, "enqueue", "zzfixture", "completed"))
+	parseBgFixture(t, &c, bgFixtureQueued(150*time.Second, "enqueue", "b4fixture", "completed"))
+	if c.Background != nil {
+		t.Fatalf("last end left %+v", c.Background)
+	}
+	// Copy-on-write: the slice taken before the later records is unchanged.
+	if len(snapshot) != 5 || snapshot[0].ID != "b0fixture" || snapshot[4].ID != "b4fixture" {
+		t.Fatalf("earlier slice changed: %+v", snapshot)
+	}
+	// An unknown queue operation still fails as before, after any notice.
+	if err := parseClaudeActivity([]byte(bgFixtureQueued(160*time.Second, "future", "b4fixture", "completed")), &c); !errors.As(err, new(unknownClaudeRecordError)) {
+		t.Fatalf("unknown operation: %v", err)
+	}
+
+	// An invalid id is not added; a 65th launch is ignored.
+	var bad activityCursor
+	parseBgFixture(t, &bad, bgFixtureLaunch(0, "toolu_bad", "bad id/../x", false)...)
+	parseBgFixture(t, &bad, bgFixtureLaunch(0, "toolu_long", strings.Repeat("b", 65), false)...)
+	if bad.Background != nil {
+		t.Fatalf("invalid ids added: %+v", bad.Background)
+	}
+	var full activityCursor
+	for i := 0; i <= maxBackgroundTasks; i++ {
+		parseBgFixture(t, &full, bgFixtureLaunch(time.Duration(i)*time.Second, fmt.Sprintf("toolu_full_%d", i), fmt.Sprintf("bf%07d", i), false)...)
+	}
+	if len(full.Background) != maxBackgroundTasks || full.Background[0].ID != "bf0000000" || full.Background[maxBackgroundTasks-1].ID != fmt.Sprintf("bf%07d", maxBackgroundTasks-1) {
+		t.Fatalf("cap kept %d tasks, first %+v", len(full.Background), full.Background[0])
+	}
+	// A launch whose call was never seen still counts, with no tool name.
+	var orphan activityCursor
+	parseBgFixture(t, &orphan, bgFixtureLaunch(0, "toolu_orphan", "b5fixture", false)[1])
+	if len(orphan.Background) != 1 || orphan.Background[0].Tool != "unknown_tool" {
+		t.Fatalf("orphan launch %+v", orphan.Background)
+	}
+}
+
+// bgFixtureTranscript is a session that launches two tasks, ends its turn,
+// and ends one task through a queued notice.
+func bgFixtureTranscript() []string {
+	records := []string{bgFixturePrompt(0)}
+	records = append(records, bgFixtureLaunch(time.Second, "toolu_bg_a", "b0fixture", false)...)
+	records = append(records, bgFixtureLaunch(5*time.Second, "toolu_bg_b", "b1fixture", true)...)
+	records = append(records, bgFixtureEndTurn(10*time.Second)...)
+	records = append(records, bgFixtureQueued(20*time.Second, "enqueue", "b1fixture", "completed"), bgFixtureQueued(20*time.Second, "dequeue", "", ""), bgFixtureIdleNotice(21*time.Second, "b1fixture", "completed"))
+	records = append(records, bgFixtureEndTurn(30*time.Second)...)
+	return append(records, bgFixtureLaunch(40*time.Second, "toolu_bg_c", "b2fixture", false)...)
+}
+
+// b4: a relay that restarts and reads the transcript from zero rebuilds the
+// same set as one that read it in saved, appended chunks.
+func TestActivityBackgroundTaskRebuildFromZero(t *testing.T) {
+	records := bgFixtureTranscript()
+	path := filepath.Join(t.TempDir(), "synthetic.jsonl")
+	half := len(records) / 2
+	if err := os.WriteFile(path, []byte(strings.Join(records[:half], "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var chunked activityCursor
+	if err := readActivityAppend(path, &chunked, parseClaudeActivity); err != nil {
+		t.Fatal(err)
+	}
+	// The relay saves its cursor between passes.
+	data, err := json.Marshal(chunked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunked = activityCursor{}
+	if err := json.Unmarshal(data, &chunked); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Join(records[half:], "\n") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := readActivityAppend(path, &chunked, parseClaudeActivity); err != nil {
+		t.Fatal(err)
+	}
+	var fresh activityCursor
+	if err := readActivityAppend(path, &fresh, parseClaudeActivity); err != nil {
+		t.Fatal(err)
+	}
+	// A cursor whose file identity no longer matches reads from zero.
+	stale := chunked
+	stale.FileID++
+	stale.Background = append([]backgroundActivityTask(nil), backgroundActivityTask{ID: "zzfixture", Tool: "Bash", Since: bgFixtureStart})
+	if err := readActivityAppend(path, &stale, parseClaudeActivity); err != nil {
+		t.Fatal(err)
+	}
+	want := []backgroundActivityTask{
+		{ID: "b0fixture", Tool: "Bash", Since: bgFixtureStart.Add(2 * time.Second)},
+		{ID: "b2fixture", Tool: "Bash", Since: bgFixtureStart.Add(41 * time.Second)},
+	}
+	for name, c := range map[string]activityCursor{"chunked": chunked, "fresh": fresh, "reset": stale} {
+		if !reflect.DeepEqual(c.Background, want) || !c.Ready {
+			t.Errorf("%s: %+v ready %v, want %+v", name, c.Background, c.Ready, want)
+		}
+	}
+	// A replacement transcript with no launch empties the set.
+	replacement := path + ".new"
+	if err := os.WriteFile(replacement, []byte(bgFixturePrompt(0)+"\n"+strings.Join(bgFixtureEndTurn(time.Second), "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := readActivityAppend(path, &fresh, parseClaudeActivity); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Background != nil || !fresh.TurnComplete {
+		t.Fatalf("replaced transcript kept %+v", fresh.Background)
+	}
+}
+
+func bgFixtureCursor(open bool, since ...time.Time) activityCursor {
+	c := activityCursor{SeenTurn: true, TurnComplete: !open, LastEventAt: bgFixtureStart}
+	for i, at := range since {
+		c.Background = append(c.Background, backgroundActivityTask{ID: fmt.Sprintf("b%dfixture", i), Tool: "Bash", Since: at})
+	}
+	return c
+}
+
+// b2: a completed turn with a running background task is working, with a
+// reason naming the oldest task's tool, id and launch time.
+func TestActivityBackgroundTaskWorking(t *testing.T) {
+	now := bgFixtureStart.Add(30 * time.Minute)
+	threshold := activityThresholds{Working: 120 * time.Second, Hung: 10 * time.Minute, Loop: 5 * time.Minute, LoopCalls: 5, CrashProbe: 15 * time.Second}
+	running := api.Agent{Status: api.AgentRunning}
+	waiting := api.Agent{Status: api.AgentNeedsInput}
+	done := api.Agent{Status: api.AgentDone}
+	one := "background Bash task b0fixture running since 2026-10-14T23:46:00Z"
+	for _, tc := range []struct {
+		name          string
+		c             activityCursor
+		a             api.Agent
+		open          int
+		state, reason string
+	}{
+		{"running, no obligations", bgFixtureCursor(false, bgFixtureStart), running, 0, "working", one},
+		{"running, open obligation", bgFixtureCursor(false, bgFixtureStart), running, 1, "working", one},
+		{"needs_input", bgFixtureCursor(false, bgFixtureStart), waiting, 0, "working", one},
+		{"done", bgFixtureCursor(false, bgFixtureStart), done, 0, "working", one},
+		{"three tasks name the oldest", bgFixtureCursor(false, bgFixtureStart.Add(time.Minute), bgFixtureStart.Add(2*time.Minute), bgFixtureStart), running, 0, "working", "background Bash task b2fixture running since 2026-10-14T23:46:00Z (3 background tasks)"},
+		{"no task, running", bgFixtureCursor(false), running, 0, "idle", ""},
+		{"no task, open obligation", bgFixtureCursor(false), running, 1, "finished_silent", ""},
+		{"no task, needs_input", bgFixtureCursor(false), waiting, 0, "unknown", "planned wait or input required"},
+		// An open turn is decided as before: rule 11 here, not the task.
+		{"open turn, running", bgFixtureCursor(true, bgFixtureStart), running, 0, "unknown", "no recent execution evidence"},
+		{"open turn, needs_input", bgFixtureCursor(true, bgFixtureStart), waiting, 0, "unknown", "no recent execution evidence"},
+	} {
+		c := tc.c
+		got := activityState(&c, tc.a, tc.open, true, true, nil, now, threshold)
+		if got.State != tc.state || got.Reason != tc.reason || got.PendingTool != "" {
+			t.Errorf("%s: %+v, want %s %q", tc.name, got, tc.state, tc.reason)
+		}
+	}
+	// An open turn with a pending call keeps its pending-call result.
+	c := bgFixtureCursor(true, bgFixtureStart)
+	c.Pending = map[string]pendingActivityCall{"t": {Name: "Bash", Since: now.Add(-time.Minute)}}
+	if got := activityState(&c, waiting, 0, true, true, nil, now, threshold); got.State != "working" || got.Reason != "" || got.PendingTool != "Bash" {
+		t.Fatalf("open turn with a pending call: %+v", got)
+	}
+	// An unreadable transcript is still the planned wait.
+	c = bgFixtureCursor(false, bgFixtureStart)
+	c.Unknown = true
+	if got := activityState(&c, waiting, 0, true, true, nil, now, threshold); got.State != "unknown" || got.Reason != "planned wait or input required" {
+		t.Fatalf("unrecognized transcript with a task: %+v", got)
+	}
+}
+
+// b3: past the bound the oldest task makes the agent unknown; the bound has a
+// bounded override; a runtime seen absent empties the set.
+func TestActivityBackgroundTaskBound(t *testing.T) {
+	threshold := activityThresholds{Working: 120 * time.Second, Hung: 10 * time.Minute, Loop: 5 * time.Minute, LoopCalls: 5, CrashProbe: 15 * time.Second}
+	running := api.Agent{Status: api.AgentRunning}
+	at := func(now time.Time, threshold activityThresholds) api.AgentActivity {
+		c := bgFixtureCursor(false, bgFixtureStart, bgFixtureStart.Add(time.Hour))
+		return activityState(&c, running, 0, true, true, nil, now, threshold)
+	}
+	if got := at(bgFixtureStart.Add(time.Hour), threshold); got.State != "working" || got.Reason != "background Bash task b0fixture running since 2026-10-14T23:46:00Z (2 background tasks)" {
+		t.Fatalf("at the bound: %+v", got)
+	}
+	past := "background Bash task b0fixture running since 2026-10-14T23:46:00Z, past the 60m bound"
+	if got := at(bgFixtureStart.Add(time.Hour+time.Second), threshold); got.State != "unknown" || got.Reason != past {
+		t.Fatalf("past the bound: %+v", got)
+	}
+	t.Setenv("TAILTERM_ACTIVITY_BACKGROUND_SECONDS", "5400")
+	if bound := activityDefaults().Background; bound != 90*time.Minute {
+		t.Fatalf("override %s", bound)
+	}
+	if got := at(bgFixtureStart.Add(90*time.Minute), activityDefaults()); got.State != "working" {
+		t.Fatalf("at the 90m bound: %+v", got)
+	}
+	if got := at(bgFixtureStart.Add(90*time.Minute+time.Second), activityDefaults()); got.State != "unknown" || !strings.HasSuffix(got.Reason, ", past the 90m bound") {
+		t.Fatalf("past the 90m bound: %+v", got)
+	}
+	for _, value := range []string{"60", "999999", "abc", ""} {
+		t.Setenv("TAILTERM_ACTIVITY_BACKGROUND_SECONDS", value)
+		if bound := activityDefaults().Background; bound != time.Hour {
+			t.Fatalf("override %q gave %s", value, bound)
+		}
+	}
+	// A runtime or tmux seen absent empties the set, whatever the status.
+	now := bgFixtureStart.Add(10 * time.Minute)
+	c := bgFixtureCursor(false, bgFixtureStart)
+	if got := activityState(&c, api.Agent{Status: api.AgentNeedsInput}, 0, false, true, nil, now, threshold); got.State != "unknown" || got.Reason != "planned wait or input required" || c.Background != nil {
+		t.Fatalf("needs_input with tmux absent: %+v %+v", got, c.Background)
+	}
+	c = bgFixtureCursor(false, bgFixtureStart)
+	if got := activityState(&c, running, 0, true, false, nil, now, threshold); got.State != "unknown" || got.Reason != "" || c.Background != nil {
+		t.Fatalf("running with the runtime absent, first probe: %+v %+v", got, c.Background)
+	}
+	if got := activityState(&c, running, 0, true, false, nil, now.Add(15*time.Second), threshold); got.State != "crashed" {
+		t.Fatalf("running with the runtime absent, second probe: %+v", got)
+	}
+	// A probe error proves nothing and keeps the set.
+	c = bgFixtureCursor(false, bgFixtureStart)
+	if got := activityState(&c, running, 0, false, false, errors.New("synthetic"), now, threshold); got.Reason != "process probe unavailable" || len(c.Background) != 1 {
+		t.Fatalf("probe error: %+v %+v", got, c.Background)
+	}
+}
+
+func appendBgFixture(t *testing.T, path string, records ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(strings.Join(records, "\n") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// b2/b3 through the relay: a needs_input member whose turn ended with a
+// background task running reports working, then the planned wait once the
+// task ends, or unknown past the bound; a running member gets a new report
+// when its turn closes with a task running and when the task ends.
+func TestActivityBackgroundTaskTick(t *testing.T) {
+	launched := append([]string{bgFixturePrompt(0)}, bgFixtureLaunch(time.Second, "toolu_bg_a", "b0fixture", false)...)
+	closed := append(slices.Clone(launched), bgFixtureEndTurn(3*time.Second)...)
+	working := "background Bash task b0fixture running since 2026-10-14T23:46:02Z"
+	t.Run("needs_input", func(t *testing.T) {
+		cols, rows := 200, 50
+		stubPaneSize(t, &cols, &rows)
+		b, h, _, tick := stuckFixture(t, "claude")
+		h.agent.Status = api.AgentNeedsInput
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(closed, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		now := bgFixtureStart.Add(30 * time.Minute)
+		if err := tick(now); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "working" || h.reports[0].Reason != working {
+			t.Fatalf("closed turn with a task: %+v", h.reports)
+		}
+		if err := tick(now.Add(16 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 {
+			t.Fatalf("steady task sent a report: %+v", h.reports)
+		}
+		appendBgFixture(t, path, bgFixtureQueued(31*time.Minute, "enqueue", "b0fixture", "completed"))
+		if err := tick(now.Add(32 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "unknown" || h.reports[1].Reason != "planned wait or input required" {
+			t.Fatalf("after the task ended: %+v", h.reports)
+		}
+	})
+	t.Run("past the bound", func(t *testing.T) {
+		cols, rows := 200, 50
+		stubPaneSize(t, &cols, &rows)
+		b, h, _, tick := stuckFixture(t, "claude")
+		h.agent.Status = api.AgentNeedsInput
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(closed, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := tick(bgFixtureStart.Add(59 * time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tick(bgFixtureStart.Add(61 * time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[0].State != "working" || h.reports[1].State != "unknown" || h.reports[1].Reason != working+", past the 60m bound" {
+			t.Fatalf("past the bound: %+v", h.reports)
+		}
+	})
+	t.Run("running", func(t *testing.T) {
+		cols, rows := 200, 50
+		stubPaneSize(t, &cols, &rows)
+		b, h, _, tick := stuckFixture(t, "claude")
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(launched, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		now := bgFixtureStart.Add(time.Minute)
+		if err := tick(now); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "working" || h.reports[0].Reason != "" {
+			t.Fatalf("open turn: %+v", h.reports)
+		}
+		appendBgFixture(t, path, bgFixtureEndTurn(70*time.Second)...)
+		if err := tick(now.Add(16 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "working" || h.reports[1].Reason != working {
+			t.Fatalf("turn closed with a task: %+v", h.reports)
+		}
+		appendBgFixture(t, path, bgFixtureIdleNotice(5*time.Minute, "b0fixture", "completed"))
+		appendBgFixture(t, path, bgFixtureEndTurn(5*time.Minute+time.Second)...)
+		if err := tick(now.Add(5 * time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 3 || h.reports[2].State != "idle" || h.reports[2].Reason != "" {
+			t.Fatalf("after the task ended: %+v", h.reports)
+		}
+	})
 }

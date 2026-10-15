@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,6 +37,15 @@ type pendingActivityCall struct {
 	Since     time.Time `json:"since"`
 	Signature string    `json:"signature"`
 	WaitUntil time.Time `json:"waitUntil,omitempty"`
+}
+
+// backgroundActivityTask is a background task the session launched that has
+// not ended yet. It holds the launching tool's bounded name and the launch
+// time, never the command.
+type backgroundActivityTask struct {
+	ID    string    `json:"id"`
+	Tool  string    `json:"tool"`
+	Since time.Time `json:"since"`
 }
 type completedActivityCall struct {
 	Signature   string    `json:"signature"`
@@ -91,6 +101,12 @@ type activityCursor struct {
 	// StuckUnsupported records that this hub rejected the stuck state; later
 	// stuck observations are reported as unknown with a "stuck:" reason.
 	StuckUnsupported bool `json:"stuckUnsupported,omitempty"`
+	// Background holds the Claude session's running background tasks, sorted
+	// by Since (bug wi_a7895b5aaceb4986). It is copy-on-write: the parser never
+	// changes it in place and always assigns a new slice, so the wake snapshot
+	// (claude_wake.go), which copies only the maps and Completed, shares
+	// nothing a later check changes.
+	Background []backgroundActivityTask `json:"background,omitempty"`
 	// ClaudeQueued counts input Claude Code queued while busy (queue-operation
 	// enqueue) that no dequeue or remove has taken yet. ClaudeQueuedAt is the
 	// latest enqueue. A real user prompt resets both, which bounds drift from
@@ -136,6 +152,10 @@ type activityThresholds struct {
 	// without a transcript record or a worktree change before it is a stalled
 	// turn (claude_stall.go). Zero means the default.
 	Stalled time.Duration
+	// Background is how long a completed Claude turn's oldest running
+	// background task keeps the agent working before it is unknown. Zero means
+	// the default.
+	Background time.Duration
 }
 
 // Bounds and default of TAILTERM_ACTIVITY_STALLED_SECONDS. The floor keeps the
@@ -144,6 +164,14 @@ const (
 	activityStalledDefault = 900
 	activityStalledMin     = 300
 	activityStalledMax     = 86400
+)
+
+// Bounds and default of TAILTERM_ACTIVITY_BACKGROUND_SECONDS. The floor covers
+// a 45-minute test timeout run in the background.
+const (
+	activityBackgroundDefault = 3600
+	activityBackgroundMin     = 3600
+	activityBackgroundMax     = 86400
 )
 
 func activityDefaults() activityThresholds {
@@ -166,7 +194,11 @@ func activityDefaults() activityThresholds {
 	if err != nil || stalled < activityStalledMin || stalled > activityStalledMax {
 		stalled = activityStalledDefault
 	}
-	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180), repeat, time.Duration(stalled) * time.Second}
+	background, err := strconv.Atoi(os.Getenv("TAILTERM_ACTIVITY_BACKGROUND_SECONDS"))
+	if err != nil || background < activityBackgroundMin || background > activityBackgroundMax {
+		background = activityBackgroundDefault
+	}
+	return activityThresholds{seconds("TAILTERM_ACTIVITY_WORKING_SECONDS", 120), seconds("TAILTERM_ACTIVITY_HUNG_SECONDS", 600), seconds("TAILTERM_ACTIVITY_LOOP_SECONDS", 300), calls, seconds("TAILTERM_ACTIVITY_CRASH_PROBE_SECONDS", 15), seconds("TAILTERM_ACTIVITY_WAKE_STUCK_SECONDS", 180), repeat, time.Duration(stalled) * time.Second, time.Duration(background) * time.Second}
 }
 
 func activityTranscript(b runtimeBinding) (string, error) {
@@ -234,6 +266,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 		c.TokensVerified = c.Tokens == (api.TokenTotals{}) && len(c.ClaudeUsage) == 0
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
+		c.Background = nil
 		c.SeenTurn, c.TurnComplete, c.TurnEndReason = false, false, ""
 		c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		c.Model, c.ProviderBlock = "", nil
@@ -630,6 +663,88 @@ func claudeTurnEnd(line []byte) (ended bool, reason string) {
 	return false, ""
 }
 
+// maxBackgroundTasks bounds the background task set. A launch past it is
+// ignored, so the oldest tasks, which decide the bound, are kept.
+const maxBackgroundTasks = 64
+
+var claudeBackgroundTaskID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// claudeBackgroundEnded holds the task-notification statuses that end a
+// background task. Claude Code 2.1.281-2.1.300 writes only these three final
+// values; any other status leaves the task to the bound.
+var claudeBackgroundEnded = map[string]bool{"completed": true, "failed": true, "killed": true}
+
+type claudeTaskNotification struct{ ID, Status string }
+
+// claudeTaskNotifications reads the task id and status of each
+// <task-notification> block in a text that starts with one. Text that does not
+// start with the tag, such as a prompt that quotes it, yields nothing.
+func claudeTaskNotifications(text string) []claudeTaskNotification {
+	const startTag, endTag = "<task-notification>", "</task-notification>"
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, startTag) {
+		return nil
+	}
+	field := func(block, name string) string {
+		_, rest, ok := strings.Cut(block, "<"+name+">")
+		if !ok {
+			return ""
+		}
+		value, _, ok := strings.Cut(rest, "</"+name+">")
+		if !ok {
+			return ""
+		}
+		return strings.TrimSpace(value)
+	}
+	var notices []claudeTaskNotification
+	for {
+		_, rest, ok := strings.Cut(text, startTag)
+		if !ok {
+			return notices
+		}
+		block, after, _ := strings.Cut(rest, endTag)
+		notices = append(notices, claudeTaskNotification{ID: field(block, "task-id"), Status: field(block, "status")})
+		text = after
+	}
+}
+
+// addBackgroundTask records a launched background task. The set stays sorted
+// by launch time, and a new slice is always assigned.
+func addBackgroundTask(c *activityCursor, task backgroundActivityTask) {
+	if !claudeBackgroundTaskID.MatchString(task.ID) || len(c.Background) >= maxBackgroundTasks {
+		return
+	}
+	if slices.ContainsFunc(c.Background, func(t backgroundActivityTask) bool { return t.ID == task.ID }) {
+		return
+	}
+	i := len(c.Background)
+	for i > 0 && c.Background[i-1].Since.After(task.Since) {
+		i--
+	}
+	c.Background = slices.Insert(slices.Clip(c.Background), i, task)
+}
+
+// endBackgroundTask removes an ended background task without changing the old
+// slice in place.
+func endBackgroundTask(c *activityCursor, id string) {
+	if !slices.ContainsFunc(c.Background, func(t backgroundActivityTask) bool { return t.ID == id }) {
+		return
+	}
+	c.Background = slices.DeleteFunc(slices.Clone(c.Background), func(t backgroundActivityTask) bool { return t.ID == id })
+	if len(c.Background) == 0 {
+		c.Background = nil
+	}
+}
+
+// noteClaudeTaskNotifications ends each task a notice gives a final status.
+func noteClaudeTaskNotifications(c *activityCursor, text string) {
+	for _, n := range claudeTaskNotifications(text) {
+		if claudeBackgroundEnded[n.Status] {
+			endBackgroundTask(c, n.ID)
+		}
+	}
+}
+
 func parseClaudeActivity(line []byte, c *activityCursor) error {
 	if len(line) == 0 {
 		return nil
@@ -651,6 +766,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 			Text      string          `json:"text"`
 			Input     json.RawMessage `json:"input"`
 			ToolUseID string          `json:"tool_use_id"`
+			IsError   bool            `json:"is_error"`
 		} `json:"content"`
 		Usage json.RawMessage `json:"usage"`
 	}
@@ -728,8 +844,42 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, false, ""
 			c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		}
+		// A task-notification prompt the session read while idle ends the
+		// tasks it names. Tool results are never read for notices.
+		var content struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+			ToolUseResult json.RawMessage `json:"toolUseResult"`
+		}
+		_ = json.Unmarshal(line, &content)
+		var direct string
+		if json.Unmarshal(content.Message.Content, &direct) == nil {
+			noteClaudeTaskNotifications(c, direct)
+		}
+		var result struct {
+			BackgroundTaskID string `json:"backgroundTaskId"`
+			TaskID           string `json:"task_id"`
+		}
+		// A string toolUseResult (a failed call) carries no task.
+		_ = json.Unmarshal(content.ToolUseResult, &result)
 		for _, part := range msg.Content {
-			if part.Type == "tool_result" {
+			switch part.Type {
+			case "text":
+				noteClaudeTaskNotifications(c, part.Text)
+			case "tool_result":
+				// Read the launching call before finishActivityCall drops it.
+				call, ok := c.Pending[part.ToolUseID]
+				tool := call.Name
+				if !ok {
+					tool = "unknown_tool"
+				}
+				if result.BackgroundTaskID != "" {
+					addBackgroundTask(c, backgroundActivityTask{ID: result.BackgroundTaskID, Tool: tool, Since: now})
+				}
+				if tool == "TaskStop" && !part.IsError && claudeBackgroundTaskID.MatchString(result.TaskID) {
+					endBackgroundTask(c, result.TaskID)
+				}
 				finishActivityCall(c, part.ToolUseID, now)
 			}
 		}
@@ -741,9 +891,16 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 		// user record, and a removed one was absorbed into the running turn or
 		// discarded.
 		var q struct {
-			Operation string `json:"operation"`
+			Operation string          `json:"operation"`
+			Content   json.RawMessage `json:"content"`
 		}
 		_ = json.Unmarshal(line, &q)
+		// A task notification queued while the session was busy ends its task
+		// here, whether a later turn reads it or a running turn absorbs it.
+		var queued string
+		if json.Unmarshal(q.Content, &queued) == nil {
+			noteClaudeTaskNotifications(c, queued)
+		}
 		switch q.Operation {
 		case "enqueue":
 			c.ClaudeQueued++
