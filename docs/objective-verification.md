@@ -364,8 +364,9 @@ acceptance cannot stand over a failed or superseded receipt:
   recorded again on the new receipt: a lead `accept`, or a lead
   `owner-decision` followed by the owner's `owner-accept`. Until then, wherever
   verification is required, the done saves report that a passing receipt for
-  the exact accepted candidate is required; a non-enrolled item has no receipt
-  gate, and its completion keeps the previous review/narrative requirements.
+  the exact accepted candidate is required; a non-enrolled item whose scope
+  names no verification criteria has no receipt gate, and its completion keeps
+  the previous review/narrative requirements.
   `owner-decision` and `follow-ups` are not acceptances and stay;
   the `owner-accept` that resolves them reads the new receipt. A same-commit
   re-verification after acceptance, such as a retried matrix, therefore needs
