@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,11 +148,38 @@ func validRunID(id string) bool {
 
 // Tasks
 
+// goalItemRE matches a work-item id in a project goal, with its project when
+// written in the qualified form tsk_X/wi_Y.
+var goalItemRE = regexp.MustCompile(`\b(?:(tsk_[0-9a-f]{16})/)?(wi_[0-9a-f]{16})\b`)
+
+// checkGoalItems refuses a goal that names another project's work item
+// without its project, so no briefing sends an agent to a 404. A qualified
+// tsk_X/wi_Y is accepted as written: X may live on another hub, and an item's
+// existence can change after the goal is saved.
+func (s *Store) checkGoalItems(ctx context.Context, taskID, goal string) error {
+	for _, m := range goalItemRE.FindAllStringSubmatch(goal, -1) {
+		if m[1] != "" {
+			continue
+		}
+		var local int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM work_items WHERE id=? AND task_id=?`, m[2], taskID).Scan(&local); err != nil {
+			return err
+		}
+		if local == 0 {
+			return fmt.Errorf("%w: goal names work item %s, which is not an item of this project; write it with its project as tsk_X/%s", api.ErrInvalid, m[2], m[2])
+		}
+	}
+	return nil
+}
+
 func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest, by api.Caller) (api.Task, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if !api.ValidTaskName(req.Name) || !api.ValidText(req.Goal, api.MaxTextLen) {
 		return api.Task{}, api.ErrInvalid
+	}
+	if err := s.checkGoalItems(ctx, "", req.Goal); err != nil {
+		return api.Task{}, err
 	}
 	var count int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE status='open'`).Scan(&count); err != nil {
@@ -253,6 +281,9 @@ func (s *Store) UpdateTask(ctx context.Context, id string, req api.UpdateTaskReq
 	if req.Goal != nil {
 		if !api.ValidText(*req.Goal, api.MaxTextLen) {
 			return t, api.ErrInvalid
+		}
+		if err := s.checkGoalItems(ctx, id, *req.Goal); err != nil {
+			return t, err
 		}
 		t.Goal = *req.Goal
 	}

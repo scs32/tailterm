@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -163,5 +164,65 @@ func TestTaskHelperPolicyPersistsAndIsEnforced(t *testing.T) {
 	agents, err := s.ListAgents(ctx, task.ID)
 	if err != nil || len(agents) != 3 {
 		t.Fatalf("existing agents affected: %v %v", agents, err)
+	}
+}
+
+func TestProjectGoalWorkItemIDs(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	caller := api.Caller{Node: "host", User: "owner"}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "other", Goal: "own work"}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := s.CreateWorkItem(ctx, other.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Foreign item", Priority: "normal", RequestID: "goal-foreign"}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := func(err error, id string) {
+		t.Helper()
+		if !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "tsk_X/"+id) {
+			t.Fatalf("unqualified foreign %s not refused with the qualified form: %v", id, err)
+		}
+	}
+	_, err = s.CreateTask(ctx, api.CreateTaskRequest{Name: "unqualified", Goal: "Feature " + foreign.ID + "."}, caller)
+	refused(err, foreign.ID)
+	qualified := "Feature " + other.ID + "/" + foreign.ID + ", and tsk_0123456789abcdef/wi_0123456789abcdef elsewhere."
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "qualified", Goal: qualified}, caller)
+	if err != nil || task.Goal != qualified {
+		t.Fatalf("qualified goal at create: %+v %v", task, err)
+	}
+	local, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Local item", Priority: "normal", RequestID: "goal-local"}, caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, goal := range []string{"Fix " + foreign.ID, "Fix " + local.ID + " then wi_0123456789abcdef"} {
+		_, err = s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Goal: &goal}, caller)
+		refused(err, strings.Fields(goal)[len(strings.Fields(goal))-1])
+	}
+	if got, err := s.GetTask(ctx, task.ID); err != nil || got.Goal != qualified {
+		t.Fatalf("refused update changed the goal: %q %v", got.Goal, err)
+	}
+	for _, goal := range []string{"Fix " + local.ID + ".", "Fix tsk_0123456789abcdef/wi_0123456789abcdef", "No ids, or wi_ shaped noise like wi_0123 and xwi_0123456789abcdef."} {
+		got, err := s.UpdateTask(ctx, task.ID, api.UpdateTaskRequest{Goal: &goal}, caller)
+		if err != nil || got.Goal != goal {
+			t.Fatalf("goal %q: %+v %v", goal, got, err)
+		}
+	}
+	// A goal saved before this check, holding a foreign id, survives every update that leaves the goal alone.
+	legacy := "Feature " + foreign.ID
+	if _, err := s.db.ExecContext(ctx, `UPDATE tasks SET goal=? WHERE id=?`, legacy, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	name, lead, open, spawn, agents, swarm := "renamed", "lead", api.TaskOpen, true, 3, true
+	for _, req := range []api.UpdateTaskRequest{{Name: &name}, {Orchestrator: &lead}, {Status: &open}, {AllowAgentSpawn: &spawn}, {MaxNewAgents: &agents}, {Swarm: &swarm}} {
+		got, err := s.UpdateTask(ctx, task.ID, req, caller)
+		if err != nil || got.Goal != legacy {
+			t.Fatalf("unrelated update %+v: %+v %v", req, got, err)
+		}
 	}
 }
