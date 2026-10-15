@@ -1878,12 +1878,62 @@ caches (a folder holding `cache/download`) the walks find, are listed as kept
 `unproven` with "no provenance marker" and their size, so a person can decide.
 They are never deleted, made writable or otherwise changed.
 
+### Matrix output binaries
+
+A verify-matrix run builds its test binaries (`tailterm-hub-test`,
+`tailterm-historical-hub-test`, `tailterm-tt-test`, about 66 MB a run) into its
+output folder and lists each one in `test-binaries.json` there, with its
+sha256, source and build argv. The receipt names them as prerequisites, and
+the database handler's receipt import and audit re-hash them, so they stay
+while that can still happen. Once the item is released, the sweep (not
+closeout) removes them. It walks the artifacts root, at most five levels
+down, for folders holding a regular `receipt.json` and `test-binaries.json`;
+it never enters `.git`, `node_modules`, a checkout, a verifier home (a folder
+with `tailterm-cache.json`, kept or not), a Go cache or a tombstone. A
+folder is decided by these gates, in order, and the first that fails keeps
+it, with one row for the folder:
+
+1. Both files are regular JSON objects under 4 MiB, and `test-binaries.json`
+   is version 1 with an absolute `path` and a 64-digit `sha256` per binary
+   (else `unproven`). A folder none of whose listed binaries is still on disk
+   gets no row.
+2. The run is proven to be one item's: the receipt's `commit` is the commit
+   the queue listing records for exactly one item, in an entry's
+   verification summary (its saved verification plan) or its release job.
+   Integration, owner integration, acceptance and integrated release commits
+   prove nothing. A commit two items name, a receipt `verifierAgentId` that
+   the hub binds to another item, or a folder under another item's artifact
+   folder is `unproven`. The sweep cannot read the plan digest: it is only in
+   the full verification record, which a sweep is not bound to read.
+3. The item is released, by the same rule as verifier checkouts. Running is
+   `item-active`; accepted but unreleased is `retention`, however old; an
+   item with no queue record is `retention`.
+4. No path in use (an active entry's or live agent's directory, or a matrix
+   lock entry's checkout, output or record folder) lies in the folder or
+   holds it from below the artifacts root (`in-use`), and the folder is not
+   on the never-touch list (`protected`).
+
+Then each listed binary still present is decided on its own: it must be a
+regular file directly in the folder, not a link, and not named like a
+receipt, manifest, log or record (`.json`, `.jsonl`, `.log`, `.md`, `.txt`,
+or a dot file), else `unproven`. Its sha256 must equal the one listed, else
+`hash-mismatch`, with both digests in the detail. A file that passes is
+`would-remove` (`removed` with `--apply`, reason `released`). The removal
+re-opens the folder as a pinned root, checks that the folder and the file are
+the ones classified and the hash still matches, and removes that one file
+under the matrix lock's mutex. It never removes a directory or any other
+file: the receipt, both manifests, the logs and the runner and host-lock
+records stay.
+
 ### Receipts and report
 
 All three kinds are recorded in `worktree-cleanup.jsonl` with the ordinary
 worktree receipts, one line per decision, and kept outcomes once. Their lines
-add `kind` (`artifact-checkout`, `session-temp`, `cache`, `verify-home` or
-`home-cache`), `bytes`, and for a removed checkout `manifest`. A cache's `path`
+add `kind` (`artifact-checkout`, `session-temp`, `cache`, `verify-home`,
+`home-cache` or `matrix-binary`), `bytes`, and for a removed checkout
+`manifest`. A `matrix-binary` row's `path` is the binary, or the output folder
+when a folder gate keeps it; it adds `sha256` (the file's, on a binary row)
+and `itemId` (the proven item), and `reason` is `released` on a removal. A cache's `path`
 is the `node_modules` directory and its action `trimmed`; a home cache's is the
 owned directory. On a kept `unproven` "no provenance marker" row, `bytes` is
 the size reported, not space freed, and the report's reclaimable total counts
@@ -1892,7 +1942,8 @@ totals keep their meaning, and `totals.actions` gains `would-trim` or
 `trimmed`. The text report prints
 `would-remove PATH (artifact checkout; item wi_x released; 1.7 GiB)`,
 `would-remove PATH (session temp; 78.0 MiB)` and
-`would-trim PATH (cache; regenerable cache in a finished checkout of wi_x; 412.0 MiB)`.
+`would-trim PATH (cache; regenerable cache in a finished checkout of wi_x; 412.0 MiB)`
+and `would-remove PATH (matrix test binary; item wi_x released; receipt commit 0123456789ab matches its verification record; sha256 matches test-binaries.json; 27.6 MiB)`.
 A folder that holds only empty directories reports `0 B`.
 
 Keep reasons, in the order checked for a verifier checkout: `locked`,
@@ -1902,7 +1953,8 @@ closed), `retention` (accepted less than N ago, the item has no queue
 record: unknown is never treated as released, or the checkout is outside the
 artifacts root in use), `nested`, `recent` (sweep
 only), `evidence`, `operation`, `dirty`, and `remove-failed`. `unpushed`
-applies only to ordinary worktrees and branch checkouts.
+applies only to ordinary worktrees and branch checkouts. A matrix binary is
+also kept as `hash-mismatch` (see "Matrix output binaries").
 
 ### Limits
 
@@ -1919,7 +1971,16 @@ applies only to ordinary worktrees and branch checkouts.
   keeps its record. An item whose entries were never queued has none and its
   checkouts are kept as `retention`.
 - The main checkout's session temp folder, artifact folders not named for an
-  item, and build output that is not inside a checkout are out of scope.
+  item, and build output that is not inside a checkout are out of scope,
+  with one exception: matrix output test binaries of released items are now
+  in scope (see "Matrix output binaries"). That is safe because
+  `test-binaries.json` keeps each binary's sha256, source and build argv, so
+  the evidence stays; by release the handler's receipt import and audit have
+  re-hashed them; only files the manifest lists, with a matching hash, go;
+  and the deployer's integrated release runs keep their state outside the
+  artifacts tree. Older runs whose receipt names a commit no saved
+  verification or release records (an earlier plan's commit, say), and runs
+  with no `test-binaries.json` or no `receipt.json`, keep their binaries.
 - Go build and module caches are trimmed only where a valid provenance marker
   owns them. Caches in unmarked homes, `.build/go`, or folders not named for
   an item are reported (the ten largest), never deleted: nothing on disk

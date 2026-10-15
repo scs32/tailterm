@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4909,4 +4911,419 @@ func TestVerifyHomeEvidenceErrorKeepsEarlierReceipts(t *testing.T) {
 		t.Fatalf("trim receipt %+v", r)
 	}
 	requireExists(t, filepath.Join(home, "go-build", "aa", "aa11-a"), true)
+}
+
+// Matrix output binaries.
+
+var (
+	matrixCommitRel   = strings.Repeat("1a", 20)
+	matrixCommitOther = strings.Repeat("2b", 20)
+)
+
+// matrixRun is a fixture matrix output folder: its listed binaries and the
+// evidence files that must survive every sweep, with their contents.
+type matrixRun struct {
+	dir      string
+	binaries []string
+	evidence map[string]string
+}
+
+// writeMatrixRun writes a matrix output folder as verify-matrix leaves it:
+// the binaries, test-binaries.json and test-binary-builds.json listing their
+// sha256, a receipt naming commit and verifier, a check log and a host-lock
+// record.
+func writeMatrixRun(t *testing.T, dir, commit, verifier string, names ...string) matrixRun {
+	t.Helper()
+	run := matrixRun{dir: dir, evidence: map[string]string{}}
+	var listed []map[string]any
+	var prerequisites []map[string]any
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		content := "built test binary " + name + " of " + commit + "\n"
+		writeFixtureFile(t, path, content)
+		if err := os.Chmod(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(content))
+		listed = append(listed, map[string]any{"target": name, "historicalCommit": nil, "path": path, "sha256": hex.EncodeToString(sum[:]),
+			"source":   map[string]any{"root": filepath.Join(filepath.Dir(dir), "wt"), "sha256": strings.Repeat("5", 64)},
+			"buildLog": map[string]any{"argv": []string{"go", "build", "-o", path, "./cmd/" + name}}})
+		prerequisites = append(prerequisites, map[string]any{"path": path, "sha256": hex.EncodeToString(sum[:])})
+		run.binaries = append(run.binaries, path)
+	}
+	write := func(name string, value any) {
+		data, err := json.MarshalIndent(value, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, filepath.Join(dir, name), string(data)+"\n")
+		run.evidence[filepath.Join(dir, name)] = string(data) + "\n"
+	}
+	write("test-binaries.json", map[string]any{"version": 1, "binaries": listed})
+	write("test-binary-builds.json", listed)
+	write("receipt.json", map[string]any{"version": 1, "planDigest": "sha256:" + strings.Repeat("d", 64), "commit": commit,
+		"verifierAgentId": verifier, "prerequisites": prerequisites})
+	write("host-lock-record.json", map[string]any{"id": "mtx_fixture", "output": dir})
+	log := strings.Repeat("0", 64) + ".attempt-1.log"
+	writeFixtureFile(t, filepath.Join(dir, log), "ok\n")
+	run.evidence[filepath.Join(dir, log)] = "ok\n"
+	return run
+}
+
+// requireEvidenceKept checks every evidence file is byte-identical.
+func (r matrixRun) requireEvidenceKept(t *testing.T) {
+	t.Helper()
+	for path, want := range r.evidence {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("evidence %s changed: %q %v", path, got, err)
+		}
+	}
+}
+
+func matrixFileSHA(t *testing.T, path string) string {
+	t.Helper()
+	sum, err := fileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sum
+}
+
+// releasedMatrixEntry is a released item whose verification record names
+// commit.
+func releasedMatrixEntry(item, commit string) api.TeamQueueEntry {
+	q := releasedArtifactEntry(item)
+	q.ID = "tqe_rel_" + item[len(item)-4:]
+	q.Verification = &api.VerificationSummary{State: "passed", Commit: commit}
+	return q
+}
+
+func boundAgent(id, item, status string) api.Agent {
+	return api.Agent{ID: id, Name: id, Status: status, WorkItem: &api.AgentWorkItemBinding{AgentID: id, ItemID: item}}
+}
+
+func matrixDecisions(got map[string]worktreeDecision) []worktreeDecision {
+	var out []worktreeDecision
+	for _, d := range got {
+		if d.Kind == kindMatrixBinary {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// a1/a3/a4: a released item's listed binaries are removed, with a receipt
+// row each, and the receipt, manifests, log and host-lock record stay. The
+// dry run shows the same rows and changes nothing; a later sweep is quiet.
+func TestMatrixBinaryRemovesReleasedItemsBinaries(t *testing.T) {
+	f := newHomeFixture(t)
+	run := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemRel, "verifier", "matrix-1a1a1a1"), matrixCommitRel, "agt_verifier_rel", "tailterm-hub-test", "tailterm-tt-test")
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedMatrixEntry(trimItemRel, matrixCommitRel)},
+		agents: []api.Agent{boundAgent("agt_verifier_rel", trimItemRel, api.AgentClosed)}}
+	before := fixtureTree(t, f.artifacts())
+	dry := f.sweep(t, state, false)
+	if n := len(matrixDecisions(dry)); n != 2 {
+		t.Fatalf("matrix decisions %+v", matrixDecisions(dry))
+	}
+	for _, bin := range run.binaries {
+		d := requireHomeDecision(t, dry, bin, "would-remove", artifactItemReleased, kindMatrixBinary, "item "+trimItemRel+" released; receipt commit "+shortSHA(matrixCommitRel)+" matches its verification record; sha256 matches test-binaries.json")
+		if d.Item != trimItemRel || d.SHA256 != matrixFileSHA(t, bin) || d.Bytes <= 0 {
+			t.Fatalf("dry decision %+v", d)
+		}
+	}
+	if fixtureTree(t, f.artifacts()) != before {
+		t.Fatal("the dry run changed the artifacts tree")
+	}
+	if len(readCleanupReceipts(t)) != 0 {
+		t.Fatal("the dry run wrote receipts")
+	}
+	sums := map[string]string{}
+	for _, bin := range run.binaries {
+		sums[bin] = matrixFileSHA(t, bin)
+	}
+	got := f.sweep(t, state, true)
+	for _, bin := range run.binaries {
+		d := requireHomeDecision(t, got, bin, "removed", artifactItemReleased, kindMatrixBinary, "item "+trimItemRel+" released")
+		requireExists(t, bin, false)
+		r := homeReceipt(t, bin, "removed")
+		if r.Kind != kindMatrixBinary || r.SHA256 != sums[bin] || r.Bytes != d.Bytes || r.Bytes <= 0 || r.ItemID != trimItemRel || r.Reason != artifactItemReleased || r.Source != "sweep" {
+			t.Fatalf("receipt %+v for decision %+v", r, d)
+		}
+	}
+	run.requireEvidenceKept(t)
+	requireExists(t, run.dir, true)
+	// Nothing listed is left, so a later sweep has no row for the folder.
+	again := f.sweepAt(t, state, true, f.now.Add(time.Minute), nil)
+	if left := matrixDecisions(again); len(left) != 0 {
+		t.Fatalf("second sweep decisions %+v", left)
+	}
+	run.requireEvidenceKept(t)
+}
+
+// a2/a4: a running item and an accepted, unreleased one keep their
+// binaries, even past the acceptance age that frees verifier checkouts.
+func TestMatrixBinaryKeepsUnreleasedItems(t *testing.T) {
+	f := newHomeFixture(t)
+	live := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemLive, "verifier", "matrix-live"), matrixCommitRel, "", "tailterm-hub-test")
+	accepted := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemAcc, "verifier", "matrix-acc"), matrixCommitOther, "", "tailterm-hub-test")
+	running := api.TeamQueueEntry{ID: "tqe_live", ItemID: trimItemLive, State: "running", Verification: &api.VerificationSummary{Commit: matrixCommitRel}}
+	old := acceptedArtifactEntry(trimItemAcc, f.now.Add(-48*time.Hour))
+	old.Verification = &api.VerificationSummary{Commit: matrixCommitOther}
+	state := sweepHubState{entries: []api.TeamQueueEntry{running, old}}
+	before := treeContents(t, f.artifacts())
+	got := f.sweep(t, state, true)
+	if d := requireHomeDecision(t, got, live.dir, "kept", keepItemActive, kindMatrixBinary, "queue entry tqe_live is running"); d.Item != trimItemLive || d.Bytes <= 0 {
+		t.Fatalf("running decision %+v", d)
+	}
+	requireHomeDecision(t, got, accepted.dir, "kept", keepRetention, kindMatrixBinary, trimItemAcc+" is accepted but not released")
+	if treeContents(t, f.artifacts()) != before {
+		t.Fatal("an unreleased item's folder changed")
+	}
+	if r := homeReceipt(t, live.dir, "kept"); r.Kind != kindMatrixBinary || r.ItemID != trimItemLive || r.Reason != keepItemActive {
+		t.Fatalf("kept receipt %+v", r)
+	}
+}
+
+// a2/a3/a4: a binary whose hash differs is kept and reported with both
+// digests; its sibling with a good hash goes.
+func TestMatrixBinaryKeepsAndReportsHashMismatch(t *testing.T) {
+	f := newHomeFixture(t)
+	run := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemRel, "verifier", "matrix-1a1a1a1"), matrixCommitRel, "", "tailterm-hub-test", "tailterm-tt-test")
+	changed, good := run.binaries[0], run.binaries[1]
+	listed := matrixFileSHA(t, changed)
+	writeFixtureFile(t, changed, "rebuilt by hand\n")
+	onDisk := matrixFileSHA(t, changed)
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedMatrixEntry(trimItemRel, matrixCommitRel)}}
+	dry := f.sweep(t, state, false)
+	requireHomeDecision(t, dry, changed, "kept", keepHashMismatch, kindMatrixBinary, "sha256 "+onDisk+" differs from "+listed)
+	requireHomeDecision(t, dry, good, "would-remove", artifactItemReleased, kindMatrixBinary, "sha256 matches")
+	got := f.sweep(t, state, true)
+	d := requireHomeDecision(t, got, changed, "kept", keepHashMismatch, kindMatrixBinary, "sha256 "+onDisk+" differs from "+listed)
+	if d.SHA256 != onDisk || d.Item != trimItemRel {
+		t.Fatalf("mismatch decision %+v", d)
+	}
+	requireHomeDecision(t, got, good, "removed", artifactItemReleased, kindMatrixBinary, "sha256 matches")
+	requireExists(t, changed, true)
+	requireExists(t, good, false)
+	if data, _ := os.ReadFile(changed); string(data) != "rebuilt by hand\n" {
+		t.Fatalf("mismatched binary changed: %q", data)
+	}
+	if r := homeReceipt(t, changed, "kept"); r.Reason != keepHashMismatch || r.SHA256 != onDisk || r.ItemID != trimItemRel || !strings.Contains(r.Detail, listed) {
+		t.Fatalf("mismatch receipt %+v", r)
+	}
+	run.requireEvidenceKept(t)
+}
+
+// a2/a4: a folder whose run is not proven to be a released item's is
+// untouched: no matching commit, a commit two items name, a verifier bound
+// to another item, a folder under another item's folder, a malformed
+// manifest, and listed paths outside the folder or through a link.
+func TestMatrixBinaryLeavesUnprovenFoldersUntouched(t *testing.T) {
+	f := newHomeFixture(t)
+	art := f.artifacts()
+	nomatch := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-nomatch"), matrixCommitOther, "", "tailterm-hub-test")
+	shared := strings.Repeat("3c", 20)
+	twice := writeMatrixRun(t, filepath.Join(art, "lead-00000001", "matrix-twice"), shared, "", "tailterm-hub-test")
+	otherVerifier := writeMatrixRun(t, filepath.Join(art, "lead-00000002", "matrix-verifier"), matrixCommitRel, "agt_verifier_acc", "tailterm-hub-test")
+	otherFolder := writeMatrixRun(t, filepath.Join(art, trimItemAcc, "verifier", "matrix-folder"), matrixCommitRel, "", "tailterm-hub-test")
+	malformed := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-malformed"), matrixCommitRel, "", "tailterm-hub-test")
+	writeFixtureFile(t, filepath.Join(malformed.dir, "test-binaries.json"), `{"version":2,"binaries":[]}`+"\n")
+	// A listed path outside its folder, with the right hash.
+	outside := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-outside"), matrixCommitRel, "", "tailterm-hub-test")
+	elsewhere := filepath.Join(art, trimItemRel, "verifier", "elsewhere", "tailterm-hub-test")
+	writeFixtureFile(t, elsewhere, "built test binary tailterm-hub-test of "+matrixCommitRel+"\n")
+	manifest := strings.ReplaceAll(outside.evidence[filepath.Join(outside.dir, "test-binaries.json")], outside.binaries[0], elsewhere)
+	writeFixtureFile(t, filepath.Join(outside.dir, "test-binaries.json"), manifest)
+	// A listed name that is a link to a file with the listed hash.
+	linked := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-link"), matrixCommitRel, "", "tailterm-hub-test")
+	target := filepath.Join(art, trimItemRel, "verifier", "link-target")
+	writeFixtureFile(t, target, "built test binary tailterm-hub-test of "+matrixCommitRel+"\n")
+	if err := os.Remove(linked.binaries[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, linked.binaries[0]); err != nil {
+		t.Fatal(err)
+	}
+	both := releasedMatrixEntry(trimItemAcc, shared)
+	state := sweepHubState{
+		entries: []api.TeamQueueEntry{releasedMatrixEntry(trimItemRel, matrixCommitRel), releasedMatrixEntry(trimItemFar, shared), both},
+		agents:  []api.Agent{boundAgent("agt_verifier_acc", trimItemAcc, api.AgentClosed)},
+	}
+	before := treeContents(t, art)
+	for _, apply := range []bool{false, true} {
+		got := f.sweepAt(t, state, apply, f.now.Add(time.Duration(len(readCleanupReceipts(t)))*time.Second), nil)
+		requireHomeDecision(t, got, nomatch.dir, "kept", keepUnproven, kindMatrixBinary, "receipt commit "+shortSHA(matrixCommitOther)+" matches no item's verification record or release")
+		requireHomeDecision(t, got, twice.dir, "kept", keepUnproven, kindMatrixBinary, "matches items "+trimItemAcc+" and "+trimItemFar)
+		requireHomeDecision(t, got, otherVerifier.dir, "kept", keepUnproven, kindMatrixBinary, "receipt verifier agt_verifier_acc is bound to "+trimItemAcc+", not "+trimItemRel)
+		requireHomeDecision(t, got, otherFolder.dir, "kept", keepUnproven, kindMatrixBinary, "the folder is under "+trimItemAcc+"'s artifact folder")
+		requireHomeDecision(t, got, malformed.dir, "kept", keepUnproven, kindMatrixBinary, "test-binaries.json: version is not the number 1")
+		requireHomeDecision(t, got, elsewhere, "kept", keepUnproven, kindMatrixBinary, "not a file directly in the output folder")
+		requireHomeDecision(t, got, linked.binaries[0], "kept", keepUnproven, kindMatrixBinary, "not a regular file")
+		for _, d := range matrixDecisions(got) {
+			if d.Action != "kept" {
+				t.Fatalf("unproven folder decision %+v", d)
+			}
+		}
+		if treeContents(t, art) != before {
+			t.Fatalf("apply=%v changed an unproven folder", apply)
+		}
+	}
+}
+
+// a2: a folder in a verifier home (kept or not), one outside the artifacts
+// root (the deployer's integrated-run state), one a live matrix run holds,
+// and closeout (no trim set) are never touched.
+func TestMatrixBinaryNeverTouchesHomesOutsideRootOrHeldFolders(t *testing.T) {
+	f := newHomeFixture(t)
+	art := f.artifacts()
+	home := writeHome(t, filepath.Join(art, trimItemRel, "kept-home"), runMarker(trimItemRel, true, "/elsewhere/out", f.now.Add(-48*time.Hour)))
+	inHome := writeMatrixRun(t, filepath.Join(home, "matrix-in-home"), matrixCommitRel, "", "tailterm-hub-test")
+	deployer := writeMatrixRun(t, filepath.Join(f.root, "deployer-state", "integrated", "matrix-integrated"), matrixCommitRel, "", "tailterm-hub-test")
+	held := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-held"), matrixCommitRel, "", "tailterm-hub-test")
+	recorded := writeMatrixRun(t, filepath.Join(art, trimItemRel, "recorded", "matrix-recorded"), matrixCommitRel, "", "tailterm-hub-test")
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedMatrixEntry(trimItemRel, matrixCommitRel)}}
+	matrix := &matrixExclusion{entries: []matrixSweepEntry{{ID: "mtx_fixture", Output: held.dir, RecordDirectory: filepath.Join(art, trimItemRel, "recorded")}}}
+	got := f.sweepAt(t, state, false, f.now, matrix)
+	requireHomeDecision(t, got, held.dir, "kept", keepInUse, kindMatrixBinary, "in use at "+held.dir)
+	requireHomeDecision(t, got, recorded.dir, "kept", keepInUse, kindMatrixBinary, "inside "+filepath.Join(art, trimItemRel, "recorded")+", which is in use")
+	for _, d := range matrixDecisions(got) {
+		if pathWithin(d.Path, home) || pathWithin(d.Path, deployer.dir) {
+			t.Fatalf("decision for a home or outside folder: %+v", d)
+		}
+	}
+	homeBefore := treeContents(t, inHome.dir)
+	deployerBefore := treeContents(t, deployer.dir)
+	// Closeout never runs the pass, even with the commits supplied.
+	r := f.cleanupRepo
+	decisions, err := cleanupWorktrees(context.Background(), worktreeCleanupInputs{Repo: r.main, Now: f.now, Apply: true, Receipt: worktreeCleanupReceipt{Source: "closeout"},
+		Items: artifactItemStates(state.entries, nil), MatrixCommits: matrixCommitItems(state.entries)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range decisions {
+		if d.Kind == kindMatrixBinary {
+			t.Fatalf("closeout decided a matrix binary: %+v", d)
+		}
+	}
+	requireExists(t, held.binaries[0], true)
+	// Applying with no run holding them removes only the artifacts-tree
+	// folders' binaries.
+	got = f.sweepAt(t, state, true, f.now.Add(time.Minute), nil)
+	requireHomeDecision(t, got, held.binaries[0], "removed", artifactItemReleased, kindMatrixBinary, "released")
+	requireHomeDecision(t, got, recorded.binaries[0], "removed", artifactItemReleased, kindMatrixBinary, "released")
+	if treeContents(t, inHome.dir) != homeBefore || treeContents(t, deployer.dir) != deployerBefore {
+		t.Fatal("a home or outside folder changed")
+	}
+}
+
+// a1: the run is proven by the commit of the item's verification record or
+// of its release job; an integrated release commit, an integration commit
+// and an acceptance commit prove nothing.
+func TestMatrixBinaryProofSources(t *testing.T) {
+	rel := releasedArtifactEntry(trimItemRel)
+	rel.Release.Commit = matrixCommitRel
+	ver := releasedArtifactEntry(trimItemAcc)
+	ver.Verification = &api.VerificationSummary{Commit: matrixCommitOther}
+	other := strings.Repeat("4d", 20)
+	integrated := releasedArtifactEntry(trimItemFar)
+	integrated.Release.IntegratedCommit = other
+	integrated.Release.InputsCommit = other
+	integrated.Acceptance.Commit = other
+	integrated.Integration = &api.TeamIntegrationReady{Commit: other}
+	bad := releasedArtifactEntry(trimItemOut)
+	bad.Verification = &api.VerificationSummary{Commit: "ABC"}
+	got := matrixCommitItems([]api.TeamQueueEntry{rel, ver, integrated, bad, rel})
+	want := map[string][]string{matrixCommitRel: {trimItemRel}, matrixCommitOther: {trimItemAcc}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("commit items %v, want %v", got, want)
+	}
+
+	f := newHomeFixture(t)
+	byRelease := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemRel, "verifier", "matrix-release"), matrixCommitRel, "", "tailterm-hub-test")
+	byIntegrated := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemFar, "verifier", "matrix-integrated"), other, "", "tailterm-hub-test")
+	decisions := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{rel, integrated}}, false)
+	requireHomeDecision(t, decisions, byRelease.binaries[0], "would-remove", artifactItemReleased, kindMatrixBinary, "item "+trimItemRel+" released")
+	requireHomeDecision(t, decisions, byIntegrated.dir, "kept", keepUnproven, kindMatrixBinary, "matches no item's verification record or release")
+}
+
+// a3: the command prints the rows in text and JSON, the dry run and the
+// applying run alike.
+func TestMatrixBinarySweepCommandReportsRows(t *testing.T) {
+	f := newHomeFixture(t)
+	run := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemRel, "verifier", "matrix-1a1a1a1"), matrixCommitRel, "", "tailterm-hub-test")
+	mismatch := writeMatrixRun(t, filepath.Join(f.artifacts(), trimItemRel, "verifier", "matrix-mismatch"), matrixCommitRel, "", "tailterm-tt-test")
+	writeFixtureFile(t, mismatch.binaries[0], "rebuilt\n")
+	bin, sum := run.binaries[0], matrixFileSHA(t, run.binaries[0])
+	task := "tsk_c1ea0c1ea0c1ea10"
+	entry := releasedMatrixEntry(trimItemRel, matrixCommitRel)
+	entry.TaskID = task
+	hub := &cleanupHub{
+		tasks:   []api.Task{{ID: task, Status: api.TaskOpen}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}},
+		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{entry}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	e := env{hub: server.URL}
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", f.main, "--min-idle", "0s", "--json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows struct {
+		Worktrees []map[string]any `json:"worktrees"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("json %q: %v", out, err)
+	}
+	found := 0
+	for _, row := range rows.Worktrees {
+		switch row["path"] {
+		case bin:
+			found++
+			if row["kind"] != kindMatrixBinary || row["action"] != "would-remove" || row["item"] != trimItemRel || row["sha256"] != sum || row["reason"] != artifactItemReleased || row["bytes"].(float64) <= 0 {
+				t.Fatalf("json row %v", row)
+			}
+		case mismatch.binaries[0]:
+			found++
+			if row["action"] != "kept" || row["reason"] != keepHashMismatch {
+				t.Fatalf("json mismatch row %v", row)
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("json lacks the matrix rows: %s", out)
+	}
+	dry, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", f.main, "--min-idle", "0s"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", f.main, "--min-idle", "0s", "--apply"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"would-remove " + bin + " (matrix test binary; item " + trimItemRel + " released", "kept hash-mismatch " + mismatch.binaries[0] + ": sha256 "} {
+		if !strings.Contains(dry, want) {
+			t.Fatalf("dry output lacks %q:\n%s", want, dry)
+		}
+	}
+	for _, want := range []string{"removed " + bin + " (matrix test binary; item " + trimItemRel + " released", "kept hash-mismatch " + mismatch.binaries[0] + ": sha256 "} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("apply output lacks %q:\n%s", want, text)
+		}
+	}
+	requireExists(t, bin, false)
+	requireExists(t, mismatch.binaries[0], true)
+	run.requireEvidenceKept(t)
+	mismatch.requireEvidenceKept(t)
+	if len(hub.writes) != 0 {
+		t.Fatalf("the sweep wrote to the hub: %v", hub.writes)
+	}
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -54,6 +56,9 @@ const (
 	// harness may delete, or it touches a path on the never-touch list.
 	keepUnproven  = "unproven"
 	keepProtected = "protected"
+	// Matrix binaries only: the file's sha256 is not the one its
+	// test-binaries.json records.
+	keepHashMismatch = "hash-mismatch"
 )
 
 // Decision and receipt kinds; an ordinary worktree has none.
@@ -68,6 +73,9 @@ const (
 	// "Verifier homes" below).
 	kindVerifyHome = "verify-home"
 	kindHomeCache  = "home-cache"
+	// A built test binary a matrix run's test-binaries.json lists, removed
+	// once its item is released (see "Matrix output binaries" below).
+	kindMatrixBinary = "matrix-binary"
 )
 
 // defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
@@ -104,6 +112,10 @@ type worktreeDecision struct {
 	// worktree has none.
 	Kind     string `json:"kind,omitempty"`
 	Manifest string `json:"manifest,omitempty"`
+	// Item and SHA256 are set for matrix binaries: the item the run proved
+	// to belong to and the file's sha256.
+	Item   string `json:"item,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
 	// recorded marks a decision whose receipt this call wrote.
 	recorded bool
 	// strayRoot is set on a checkout kept for lying outside the artifacts
@@ -168,6 +180,12 @@ type worktreeCleanupInputs struct {
 	// returns false when this sweep already ran it for another repository.
 	// Nil skips /tmp.
 	TempHomes func() bool
+	// MatrixCommits, with Trim, turns on the matrix binary pass: each commit
+	// an item's verification record or release job names, with the items
+	// that name it. VerifierItems is the item each listed agent is bound
+	// to, by agent ID. Nil skips the pass.
+	MatrixCommits map[string][]string
+	VerifierItems map[string]string
 }
 
 // exclusive runs act under in.Exclusive, or directly without one. inUse is
@@ -255,6 +273,8 @@ type worktreeCleanupReceipt struct {
 	Kind     string `json:"kind,omitempty"`
 	Bytes    int64  `json:"bytes,omitempty"`
 	Manifest string `json:"manifest,omitempty"`
+	// SHA256 is set for matrix binaries.
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // worktreeGit runs one Git command; tests wrap it to count calls. Optional
@@ -367,6 +387,10 @@ func recordWorktreeDecision(base worktreeCleanupReceipt, d worktreeDecision, now
 	if d.Kind != "" {
 		r.Kind, r.Bytes, r.Manifest = d.Kind, d.Bytes, d.Manifest
 	}
+	if d.Item != "" {
+		r.ItemID = d.Item
+	}
+	r.SHA256 = d.SHA256
 	return true, appendWorktreeReceipt(r)
 }
 
@@ -963,6 +987,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	// its failure still records their receipts before it is returned.
 	homes, homeErr := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
 	decisions = append(decisions, homes...)
+	decisions = append(decisions, cleanupMatrixBinaries(in, art, inUse)...)
 	if in.Apply {
 		for i := range decisions {
 			recorded, err := recordWorktreeDecision(in.Receipt, decisions[i], now)
@@ -2282,7 +2307,8 @@ func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o s
 		Items: artifactItemStates(state.entries, state.agents), Artifacts: o.Artifacts, AcceptedAfter: o.AcceptedAfter,
 		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
 		Trim: finishedTrimSet(host, state.entries, state.agents), Tombstones: o.Apply,
-		TempHomes: func() bool { return claimVerifyHomeTempPass(o.Now) },
+		TempHomes:     func() bool { return claimVerifyHomeTempPass(o.Now) },
+		MatrixCommits: matrixCommitItems(state.entries), VerifierItems: agentItems(state.agents),
 	}
 	if o.Matrix != nil {
 		// A matrix run keeps the checkout, output and record folders it holds.
@@ -2444,6 +2470,8 @@ func worktreeLabel(d worktreeDecision) string {
 		return "verifier home; " + d.Detail
 	case kindHomeCache:
 		return "verifier home cache; " + d.Detail
+	case kindMatrixBinary:
+		return "matrix test binary; " + d.Detail
 	}
 	label := "detached " + shortSHA(d.Head)
 	if d.Branch != "" {
@@ -4154,4 +4182,451 @@ func probeVerifierHomes(p homeProbes, homes []*verifierHome) (hits, notes map[st
 		}
 	}
 	return hits, notes, nil
+}
+
+// Matrix output binaries.
+//
+// A verify-matrix run builds its test binaries into its output folder and
+// lists each one in test-binaries.json there, with its sha256, source and
+// build argv; its receipt names them as prerequisites. The handler's receipt
+// import and audit re-hash them, so they stay until the item is released.
+// Then the sweep removes the binaries the manifest lists whose sha256 still
+// matches, and keeps everything else in the folder: the receipt, the
+// manifests, the logs and the runner's records. A folder's run belongs to an
+// item when its receipt's commit is the commit that item's verification
+// record or release job names, and no other item's. The sweep reads only the
+// queue listing, which carries those commits; the plan digest is in the full
+// verification record, which the sweep cannot read.
+
+const (
+	matrixReceiptName  = "receipt.json"
+	matrixBinariesName = "test-binaries.json"
+	// matrixOutputDepth bounds the walk for output folders below the
+	// artifacts root; real ones sit two to four levels down.
+	matrixOutputDepth = 5
+)
+
+var (
+	matrixCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	matrixSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+// matrixEvidenceName reports a file name no manifest entry may remove: the
+// receipts, the manifests, logs and records.
+func matrixEvidenceName(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	for _, ext := range []string{".json", ".jsonl", ".log", ".md", ".txt"} {
+		if strings.HasSuffix(name, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+// matrixCommitItems maps each commit a queue entry's verification record or
+// release job names to the items naming it, sorted. Integration, owner
+// integration and integrated release commits are not an item's own
+// verification and never prove a run.
+func matrixCommitItems(entries []api.TeamQueueEntry) map[string][]string {
+	out := map[string][]string{}
+	add := func(commit, item string) {
+		if !matrixCommitPattern.MatchString(commit) || slicesContains(out[commit], item) {
+			return
+		}
+		out[commit] = append(out[commit], item)
+		sort.Strings(out[commit])
+	}
+	for _, q := range entries {
+		if q.ItemID == "" {
+			continue
+		}
+		if q.Verification != nil {
+			add(q.Verification.Commit, q.ItemID)
+		}
+		if q.Release != nil {
+			add(q.Release.Commit, q.ItemID)
+		}
+	}
+	return out
+}
+
+// agentItems is the item each item-bound agent is bound to, closed agents
+// included, by agent ID.
+func agentItems(agents []api.Agent) map[string]string {
+	out := map[string]string{}
+	for _, a := range agents {
+		if a.WorkItem != nil && a.WorkItem.ItemID != "" {
+			out[a.ID] = a.WorkItem.ItemID
+		}
+	}
+	return out
+}
+
+// findMatrixOutputs lists the folders below root holding a regular
+// receipt.json and test-binaries.json. It never follows a link and never
+// enters .git, node_modules, a tombstone, a checkout, a verifier home (kept
+// or not) or a Go cache, nor an output folder it found.
+func findMatrixOutputs(root string) []string {
+	var out []string
+	regular := func(dir, name string) bool {
+		info, err := os.Lstat(filepath.Join(dir, name))
+		return err == nil && info.Mode().IsRegular()
+	}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if d != nil && d.IsDir() && p != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if p == root || !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == ".git" || name == trimCacheName || strings.HasPrefix(name, tombstonePrefix) {
+			return filepath.SkipDir
+		}
+		for _, inside := range []string{".git", homeMarkerName} {
+			if _, err := os.Lstat(filepath.Join(p, inside)); err == nil {
+				return filepath.SkipDir
+			}
+		}
+		if goCacheKind(p) != "" {
+			return filepath.SkipDir
+		}
+		if regular(p, matrixReceiptName) && regular(p, matrixBinariesName) {
+			out = append(out, p)
+			return filepath.SkipDir
+		}
+		if rel, err := filepath.Rel(root, p); err == nil && strings.Count(rel, "/")+1 >= matrixOutputDepth {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return out
+}
+
+// readMatrixJSON reads one JSON object file of the pinned output folder,
+// never following a link. It returns the object, or why it is refused.
+func readMatrixJSON(folder *os.Root, name string) (map[string]json.RawMessage, string) {
+	info, err := folder.Lstat(name)
+	if err != nil {
+		return nil, name + ": " + err.Error()
+	}
+	if !info.Mode().IsRegular() {
+		return nil, name + ": not a regular file"
+	}
+	if info.Size() > maxArtifactTextBytes {
+		return nil, name + ": larger than 4 MiB"
+	}
+	file, err := folder.Open(name)
+	if err != nil {
+		return nil, name + ": " + err.Error()
+	}
+	defer file.Close()
+	if opened, err := file.Stat(); err != nil || !os.SameFile(info, opened) {
+		return nil, name + ": replaced while it was read"
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxArtifactTextBytes+1))
+	if err != nil {
+		return nil, name + ": " + err.Error()
+	}
+	object, ok := jsonObject(data)
+	if !ok {
+		return nil, name + ": not a JSON object"
+	}
+	return object, ""
+}
+
+// matrixListed is one binary a manifest lists.
+type matrixListed struct {
+	path   string
+	sha256 string
+}
+
+// parseMatrixBinaries validates test-binaries.json: version 1 and a
+// binaries array whose every entry has an absolute path and a sha256. Any
+// fault refuses the whole manifest.
+func parseMatrixBinaries(object map[string]json.RawMessage) ([]matrixListed, string) {
+	const name = matrixBinariesName
+	if v, ok := jsonInteger(object["version"]); !ok || v != 1 {
+		return nil, name + ": version is not the number 1"
+	}
+	entries, ok := jsonArray(object["binaries"])
+	if !ok {
+		return nil, name + ": binaries is not an array"
+	}
+	var out []matrixListed
+	for i, raw := range entries {
+		entry, ok := jsonObject(raw)
+		if !ok {
+			return nil, fmt.Sprintf("%s: binary %d is not an object", name, i)
+		}
+		path, ok := jsonText(entry["path"])
+		if !ok || !filepath.IsAbs(path) {
+			return nil, fmt.Sprintf("%s: binary %d path is not an absolute path", name, i)
+		}
+		sum, ok := jsonText(entry["sha256"])
+		if !ok || !matrixSHA256Pattern.MatchString(sum) {
+			return nil, fmt.Sprintf("%s: binary %d sha256 is not 64 lowercase hex digits", name, i)
+		}
+		out = append(out, matrixListed{path: path, sha256: sum})
+	}
+	return out, ""
+}
+
+// proveMatrixItem returns the item the folder's run belongs to, or why it is
+// unproven: the receipt's commit names exactly one item's verification
+// record or release job, the receipt's verifier is not bound to another
+// item, and the folder is not under another item's artifact folder.
+func proveMatrixItem(in worktreeCleanupInputs, art *artifactPass, folder string, receipt map[string]json.RawMessage) (string, string) {
+	commit, ok := jsonText(receipt["commit"])
+	if !ok || !matrixCommitPattern.MatchString(commit) {
+		return "", matrixReceiptName + " has no 40-digit lowercase hex commit"
+	}
+	items := in.MatrixCommits[commit]
+	switch len(items) {
+	case 0:
+		return "", "receipt commit " + shortSHA(commit) + " matches no item's verification record or release"
+	case 1:
+	default:
+		return "", "receipt commit " + shortSHA(commit) + " matches items " + strings.Join(items, " and ")
+	}
+	item := items[0]
+	if agent, ok := jsonText(receipt["verifierAgentId"]); ok && agent != "" {
+		if bound := in.VerifierItems[agent]; bound != "" && bound != item {
+			return "", "receipt verifier " + agent + " is bound to " + bound + ", not " + item
+		}
+	}
+	rel := strings.TrimPrefix(folder, strings.TrimSuffix(art.root, "/")+"/")
+	if under, _, _ := strings.Cut(rel, "/"); artifactItemIDPattern.MatchString(under) && under != item {
+		return "", "receipt commit " + shortSHA(commit) + " names " + item + ", but the folder is under " + under + "'s artifact folder"
+	}
+	return item, ""
+}
+
+// matrixFolderInUse says how a path in use keeps the output folder, or "":
+// the path is in the folder, or holds it from below the artifacts root (a
+// live run's record folder, say).
+func matrixFolderInUse(art *artifactPass, folder, p string) string {
+	if p == "" || !filepath.IsAbs(p) {
+		return ""
+	}
+	p = canonicalPath(p)
+	if pathWithin(p, folder) {
+		return "in use at " + p
+	}
+	if pathWithin(folder, p) && pathWithin(p, art.root) && p != art.root {
+		return "inside " + p + ", which is in use"
+	}
+	return ""
+}
+
+// hashMatrixFile hashes one regular file of the pinned folder, which must
+// still be the file classified.
+func hashMatrixFile(folder *os.Root, name string, want os.FileInfo) (string, error) {
+	file, err := folder.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if got, err := file.Stat(); err != nil || !os.SameFile(want, got) {
+		return "", errors.New("the file was replaced while it was hashed")
+	}
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// cleanupMatrixBinaries is the sweep's pass over matrix output folders under
+// the artifacts root. A folder gets one kept decision when a folder gate
+// keeps it, else one decision per listed binary still present; a folder
+// whose listed binaries are all gone gets none.
+func cleanupMatrixBinaries(in worktreeCleanupInputs, art *artifactPass, inUse []string) []worktreeDecision {
+	if in.Trim == nil || in.MatrixCommits == nil || art == nil {
+		return nil
+	}
+	var out []worktreeDecision
+	for _, folder := range findMatrixOutputs(art.root) {
+		out = append(out, matrixOutputDecisions(in, art, folder, inUse)...)
+	}
+	return out
+}
+
+// matrixOutputDecisions applies the folder gates, cheapest first, then
+// decides each listed binary. Nothing is hashed before every folder gate
+// passes.
+func matrixOutputDecisions(in worktreeCleanupInputs, art *artifactPass, path string, inUse []string) []worktreeDecision {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	folder := worktreeDecision{Path: path, Kind: kindMatrixBinary, Action: "kept"}
+	keep := func(reason, detail string) []worktreeDecision {
+		folder.Reason, folder.Detail = reason, detail
+		return []worktreeDecision{folder}
+	}
+	pinned, err := os.OpenRoot(path)
+	if err != nil {
+		return keep(keepFailed, err.Error())
+	}
+	defer pinned.Close()
+	if got, err := pinned.Stat("."); err != nil || !os.SameFile(info, got) {
+		return keep(keepMoved, "the output folder was replaced while it was read")
+	}
+	receipt, fault := readMatrixJSON(pinned, matrixReceiptName)
+	if fault != "" {
+		return keep(keepUnproven, fault)
+	}
+	manifest, fault := readMatrixJSON(pinned, matrixBinariesName)
+	if fault != "" {
+		return keep(keepUnproven, fault)
+	}
+	listed, fault := parseMatrixBinaries(manifest)
+	if fault != "" {
+		return keep(keepUnproven, fault)
+	}
+	var present []matrixListed
+	for _, b := range listed {
+		st, err := os.Lstat(b.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		present = append(present, b)
+		if err == nil && st.Mode().IsRegular() {
+			folder.Bytes += st.Size()
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	item, why := proveMatrixItem(in, art, path, receipt)
+	if why != "" {
+		return keep(keepUnproven, why)
+	}
+	folder.Item = item
+	st, ok := art.items[item]
+	switch {
+	case !ok:
+		return keep(keepRetention, "no queue record for "+item)
+	case st.State == artifactItemRunning:
+		return keep(keepItemActive, st.Detail)
+	case st.State != artifactItemReleased:
+		return keep(keepRetention, item+" is accepted but not released")
+	}
+	for _, p := range inUse {
+		if detail := matrixFolderInUse(art, path, p); detail != "" {
+			return keep(keepInUse, detail)
+		}
+	}
+	if deny := neverTouch(path, info); deny != "" {
+		return keep(keepProtected, path+" touches the never-touch path "+deny)
+	}
+	commit, _ := jsonText(receipt["commit"])
+	var out []worktreeDecision
+	for _, b := range present {
+		out = append(out, matrixBinaryDecision(in, art, path, info, pinned, item, commit, b))
+	}
+	return out
+}
+
+// matrixBinaryDecision decides one listed binary of a released item's
+// folder and, when applying, removes it.
+func matrixBinaryDecision(in worktreeCleanupInputs, art *artifactPass, folder string, folderInfo os.FileInfo, pinned *os.Root, item, commit string, b matrixListed) worktreeDecision {
+	d := worktreeDecision{Path: b.path, Kind: kindMatrixBinary, Item: item}
+	kept := func(reason, detail string) worktreeDecision {
+		d.Action, d.Reason, d.Detail = "kept", reason, detail
+		return d
+	}
+	name := filepath.Base(b.path)
+	if filepath.Clean(b.path) != b.path || canonicalPath(filepath.Dir(b.path)) != folder {
+		return kept(keepUnproven, "listed in "+matrixBinariesName+" but not a file directly in the output folder "+folder)
+	}
+	if matrixEvidenceName(name) {
+		return kept(keepUnproven, "listed in "+matrixBinariesName+", but the name is a receipt, manifest, log or record")
+	}
+	file, err := pinned.Lstat(name)
+	if err != nil {
+		return kept(keepMoved, err.Error())
+	}
+	if !file.Mode().IsRegular() {
+		return kept(keepUnproven, "not a regular file; nothing followed")
+	}
+	d.Bytes = file.Size()
+	sum, err := hashMatrixFile(pinned, name, file)
+	if err != nil {
+		return kept(keepFailed, err.Error())
+	}
+	d.SHA256 = sum
+	if sum != b.sha256 {
+		return kept(keepHashMismatch, "sha256 "+sum+" differs from "+b.sha256+" in "+matrixBinariesName)
+	}
+	d.Action, d.Reason = "would-remove", artifactItemReleased
+	d.Detail = "item " + item + " released; receipt commit " + shortSHA(commit) + " matches its verification record; sha256 matches " + matrixBinariesName
+	if !in.Apply {
+		return d
+	}
+	reason, why, note := removeMatrixBinary(in, art, folder, folderInfo, name, file, b.sha256)
+	if reason != "" {
+		d.Bytes = 0
+		return kept(reason, why)
+	}
+	d.Action = "removed"
+	if note != "" {
+		d.Detail += "; " + note
+	}
+	return d
+}
+
+// removeMatrixBinary removes one file through the pinned folder after
+// checking again that the folder and the file are the ones classified and
+// the hash still matches. It never removes a directory or any other file. It
+// returns the keep reason and detail, or the exclusion's note.
+func removeMatrixBinary(in worktreeCleanupInputs, art *artifactPass, folder string, folderInfo os.FileInfo, name string, file os.FileInfo, sum string) (string, string, string) {
+	pinned, err := os.OpenRoot(folder)
+	if err != nil {
+		return keepMoved, "the output folder cannot be opened: " + err.Error(), ""
+	}
+	defer pinned.Close()
+	if got, err := pinned.Stat("."); err != nil || !os.SameFile(got, folderInfo) {
+		return keepMoved, "the output folder was replaced since it was classified", ""
+	}
+	path := filepath.Join(folder, name)
+	check := func() (string, string) {
+		got, err := pinned.Lstat(name)
+		if err != nil || !got.Mode().IsRegular() || !os.SameFile(got, file) {
+			return keepMoved, "the binary was replaced since it was classified"
+		}
+		now, err := hashMatrixFile(pinned, name, got)
+		if err != nil {
+			return keepFailed, err.Error()
+		}
+		if now != sum {
+			return keepHashMismatch, "sha256 " + now + " differs from " + sum + " in " + matrixBinariesName
+		}
+		if deny := neverTouch(path, folderInfo, got); deny != "" {
+			return keepProtected, path + " touches the never-touch path " + deny
+		}
+		return "", ""
+	}
+	var reason, why string
+	held, note := in.exclusive(func(p string) string { return matrixFolderInUse(art, folder, p) }, func() {
+		if reason, why = check(); reason != "" {
+			return
+		}
+		if err := pinned.Remove(name); err != nil {
+			reason, why = keepFailed, err.Error()
+		}
+	})
+	if held != "" {
+		return held, note, ""
+	}
+	if reason != "" {
+		return reason, why, ""
+	}
+	return "", "", note
 }
