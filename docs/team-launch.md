@@ -214,8 +214,9 @@ and a clean tree; a later HEAD cannot replace the accepted SHA. Then the item
 becomes **Ready to integrate**. The saved tuple and evidence appear in the
 queue and Projects Delivery panel. The
 owner performs any merge, push or deployment separately. Dismissed items have
-no integration record. Once the release lands, the runner removes the finished
-entry's worktrees ([worktree cleanup](#worktree-cleanup)).
+no integration record. Once the release lands, a later runner tick, within
+about 15 minutes, removes the finished entry's worktrees
+([worktree cleanup](#worktree-cleanup)).
 
 Both primary and auxiliary handler briefings include the done save with its
 acceptance tuple and the recovery command. A done repository-backed entry without its receipt remains running and
@@ -310,9 +311,11 @@ matching reason is reported:
   accepted worktree, or the cwd of a non-closed agent on this host; or it lies
   in a Claude scratchpad (`<temp>/claude-<uid>/<cwd key>/<session>/scratchpad`)
   of a session started in one of those paths. The sweep reads every
-  project's roster and queue. Closeout reads less: its own project's roster
-  and queue, plus the host queue list, which holds other projects' queued,
-  launching and running entries but not their failed ones or agents.
+  project's roster and queue. Closeout reads less: its own project's roster,
+  active entries and newest page of history (50 finished or released
+  entries, as summaries), the finished entry itself in full, plus the host
+  queue list, which holds other projects' queued, launching and running
+  entries but not their failed ones or agents.
 - `nested`: it contains a linked worktree, or any other Git repository (a
   `.git` entry below its root, such as a separate clone), that is not removed
   earlier in the same pass. `git worktree remove` would delete such a
@@ -343,19 +346,27 @@ branch and commit still resolve after their worktree is gone. Closeout and sweep
 the relay state directory. While a sweep holds it, closeout skips its look
 without a message and returns to the entry within 15 minutes.
 
-**Closeout timing.** On each tick the runner looks at the project's finished
-entries on its host that have a saved acceptance. If none of the entry's cwd,
-accepted worktree or integration worktree exists, that costs only `os.Stat`.
-Otherwise it reads the project's roster, at most once per 15 minutes per entry,
-and considers the entry's recorded worktrees plus, when a recorded worktree or
+**Closeout timing.** A finished entry is queue history, which the active
+listing and the host queue list never name. So at most once per 15 minutes per
+project, on a tick whose listings answered, the runner reads the project's
+default queue listing: its active entries, then the newest page of history (50
+entries) as summaries. A tick served from the last good listing in a slow
+episode reads none. A failed read logs
+`[tt relay] worktree cleanup project <task>: ...` and is retried after the same
+15 minutes. The runner looks at that page's finished entries on its host that
+have a saved acceptance. If none of the entry's cwd, accepted worktree or
+integration worktree exists, that costs only `os.Stat`. Otherwise, at most once
+per 15 minutes per entry, it reads the entry in full (a summary's evidence is
+clipped) and the project's roster, and considers the entry's recorded worktrees plus, when a recorded worktree or
 a team cwd is a linked worktree, the worktrees nested in it and in scratchpads
 of sessions started there. A shared main-checkout cwd attributes nothing
 further; a worktree nested in a considered one still keeps it `nested`. The cleanup makes
 no hub write. Because integration happens after the entry finishes, a worktree
 is usually kept `unpushed` at first and removed on a later tick once its
 release lands on `tasks-hub`. A finished entry is examined only while its
-project still has an active entry on the host; dismissed items, owner-integrated
-failed entries and anything left over go to the sweep.
+project still has an active entry on the host and the entry is among the
+project's 50 newest history entries; dismissed items, owner-integrated failed
+entries and anything left over go to the sweep.
 
 **Receipts.** Every outcome is appended as one JSON line to
 `worktree-cleanup.jsonl` in the relay state directory

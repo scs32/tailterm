@@ -668,14 +668,19 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			continue
 		}
 		if r.worktrees != nil {
-			// Finished teams' worktrees go once their release lands. The
-			// cleanup is local: it logs and never fails the tick or entry.
-			for _, q := range queue.Entries {
-				if q.Host != host || q.State != "finished" || q.Acceptance == nil {
-					continue
-				}
-				if err := r.worktrees(ctx, c, host, list, queue, q); err != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] worktree cleanup %s: %v\n", q.ID, err)
+			// Finished teams' worktrees go once their release lands. A
+			// finished entry is history, which the active listing never
+			// names, so closeout reads the project's recent history page,
+			// at most once per closeoutWorktreeInterval. The cleanup is
+			// local: it logs and never fails the tick or entry.
+			if recent, ok := closeoutHistory(ctx, c, taskID, now); ok {
+				for _, q := range recent.Entries {
+					if q.Host != host || q.State != "finished" || q.Acceptance == nil {
+						continue
+					}
+					if err := r.worktrees(ctx, c, host, list, recent, q); err != nil {
+						fmt.Fprintf(os.Stderr, "[tt relay] worktree cleanup %s: %v\n", q.ID, err)
+					}
 				}
 			}
 		}

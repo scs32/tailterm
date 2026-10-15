@@ -2811,3 +2811,75 @@ func TestTeamRunnerSerialPassesBudgetHeldHead(t *testing.T) {
 		t.Fatalf("one tick: %d claims of the second entry, %d spawns, second %s, head %s; want the second entry claimed and running past a queued head", claims, spawns, state(later.ID), state(head.ID))
 	}
 }
+
+// wi_577abce4b40df47b a3: the real hub lists a finished entry only as
+// history. The active view and the host listing never name it, so closeout
+// reads the default view, whose history page carries it as a summary. The
+// cleanup fixture hub (fixtureQueueView) mirrors this contract.
+func TestTeamRunnerCloseoutListingShape(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "closeout-shape-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := queueCorrectionRunner(t, f, 1)
+	entry := func() api.TeamQueueEntry {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for i := 0; i < 2; i++ {
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := entry(); got.State != "running" {
+		t.Fatalf("entry %s, want running", got.State)
+	}
+	terminal := "dismissed"
+	if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3 && entry().State != "finished"; i++ {
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := entry(); got.State != "finished" || got.Host != "fixture" {
+		t.Fatalf("entry %s on %q, want finished on fixture", got.State, got.Host)
+	}
+	names := func(list api.TeamQueueList) (bool, api.TeamQueueEntry) {
+		for _, e := range list.Entries {
+			if e.ID == q.ID {
+				return true, e
+			}
+		}
+		return false, api.TeamQueueEntry{}
+	}
+	active, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := names(active); ok {
+		t.Fatal("the active view lists a finished entry")
+	}
+	host, err := f.c.TeamQueueByHost(ctx, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := names(host); ok {
+		t.Fatal("the host listing lists a finished entry")
+	}
+	recent, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, got := names(recent)
+	if !ok || !got.Summary || got.State != "finished" || got.Host != "fixture" || recent.History == nil || recent.History.Total != 1 || recent.History.Limit != api.DefaultTeamQueueHistoryLimit {
+		t.Fatalf("default view %+v: want the finished entry as a history summary", recent)
+	}
+}
