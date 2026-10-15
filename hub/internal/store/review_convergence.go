@@ -94,10 +94,36 @@ func firstReviewStage(state api.ReviewConvergence) []api.ReviewStage {
 	return []api.ReviewStage{{Number: 1, ScopeRevision: state.Scopes[0].ScopeRevision, AssignmentSeq: state.Scopes[0].AssignmentSeq}}
 }
 
+// ownerWrittenOrder reports whether the order message is one the owner wrote:
+// no agent identity, not a system message, and not a notice. A notice stored
+// without an agent identity is written by the hub or a command on its behalf,
+// such as the queue lane notice the owner's tt queue posts, so it is no order.
+func ownerWrittenOrder(ctx context.Context, q queryRower, task string, order int64) (bool, error) {
+	var agent, node, systemNotice, envelope string
+	err := q.QueryRowContext(ctx, `SELECT from_agent,from_node,COALESCE(system_notice_kind,''),COALESCE(envelope,'') FROM messages WHERE task_id=? AND seq=?`, task, order).Scan(&agent, &node, &systemNotice, &envelope)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || agent != "" || node == "system" || systemNotice != "" {
+		return false, err
+	}
+	if envelope == "" {
+		return true, nil
+	}
+	var typed struct {
+		Kind string `json:"kind"`
+	}
+	if err = json.Unmarshal([]byte(envelope), &typed); err != nil {
+		return false, err
+	}
+	return typed.Kind != api.EnvelopeKindNotice, nil
+}
+
 // openReviewStage decides the stage of a later scope's first ASSIGN (assign is
 // its sequence) and records a new stage when that scope's saved confirmation
-// names a different order that the owner wrote. A scope with no saved
-// confirmation, the same order, or an order an agent wrote stays in its stage.
+// names an order the owner wrote that no recorded stage names. A scope with no
+// saved confirmation, an order of the current or an earlier stage, or an order
+// the owner did not write stays in its stage.
 func openReviewStage(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence, scope, assign int64) error {
 	if len(state.Stages) == 0 {
 		state.Stages = firstReviewStage(*state)
@@ -113,13 +139,15 @@ func openReviewStage(ctx context.Context, q queryRower, task string, state *api.
 	if stage.OrderSeq == 0 {
 		stage.OrderSeq = order // the first known order names the first stage
 	}
-	if stage.OrderSeq == order {
-		return nil
+	// Returning to an earlier stage's order is no new owner order, so it grants
+	// no fresh reviews.
+	for _, st := range state.Stages {
+		if st.OrderSeq == order {
+			return nil
+		}
 	}
-	// Only an owner order opens a stage: the same authorship rule as an owner
-	// matrix approval.
-	var owner int
-	if err = q.QueryRowContext(ctx, `SELECT count(*) FROM messages WHERE task_id=? AND seq=? AND from_agent='' AND from_node<>'system'`, task, order).Scan(&owner); err != nil || owner == 0 {
+	// Only an owner order opens a stage.
+	if owner, err := ownerWrittenOrder(ctx, q, task, order); err != nil || !owner {
 		return err
 	}
 	state.Stages = append(state.Stages, api.ReviewStage{Number: stage.Number + 1, OrderSeq: order, ScopeRevision: scope, AssignmentSeq: assign})
@@ -192,12 +220,10 @@ func currentReviewStage(ctx context.Context, q queryRower, task string, state *a
 	if len(state.Stages) < 2 {
 		return earlier, nil
 	}
-	start := state.Stages[len(state.Stages)-1].AssignmentSeq
-	n := 0
-	for n < len(state.Rounds) && state.Rounds[n].RequestSeq < start {
-		n++
-	}
+	// The round split is the shared one every reader uses.
+	_, _, n := state.CurrentStage()
 	earlier.rounds, state.Rounds = state.Rounds[:n:n], state.Rounds[n:]
+	start := state.Stages[len(state.Stages)-1].AssignmentSeq
 	n = 0
 	for n < len(state.Focused) && state.Focused[n].RequestSeq < start {
 		n++

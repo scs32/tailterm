@@ -3324,6 +3324,89 @@ func TestReviewStageOnlyOwnerWrittenOrderOpensStage(t *testing.T) {
 	})
 }
 
+// s1 (wi_c4b7284e2cb46691): a typed notice primary-linked to the item and
+// stored with no agent identity, such as the queue lane notice the owner's
+// command posts or a notice the hub writes itself, is not an owner order. A
+// scope confirmed under one stays in its stage; a real owner order still opens
+// one.
+func TestReviewStageHubWrittenNoticeIsNotOwnerOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		by   api.Caller
+	}{
+		{"queue lane notice under the owner credential", api.Caller{Node: "workspace", User: "owner"}},
+		{"notice the hub writes", api.Caller{Node: "team_queue", User: "rebind"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, handler := findingsStage(t)
+			f.rescope(t, "Build order one")
+			notice := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A bug was queued on Planned delivery with a recorded reason", Body: api.EnvelopeBody{Text: "Queue entry fixture puts the bug on template planned."}}
+			order, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Envelope: &notice, RequestID: "lane-notice", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}}, tc.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if order.From.AgentID != "" || order.From.Node == "system" {
+				t.Fatal("fixture notice is not stored without an agent identity", order.From)
+			}
+			f.confirmScope(t, handler, order, "notice-scope")
+			if err := f.assign(f.criteria, nil); err != nil {
+				t.Fatal(err)
+			}
+			refusedWith(t, "third review under a notice", f.reviewErr(candidateB), "third general review refused")
+			if st := f.state(t); len(st.Stages) != 1 || len(st.Rounds) != 2 {
+				t.Fatal("a notice opened a stage", st.Stages)
+			}
+			f.rescope(t, "Build order one, owner order")
+			owner := f.ownerOrder(t, "owner-build-order")
+			f.confirmScope(t, handler, owner, "owner-build-scope")
+			if err := f.assign(f.criteria, nil); err != nil {
+				t.Fatal(err)
+			}
+			f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+			if st := f.state(t); len(st.Stages) != 2 || st.Stages[1].OrderSeq != owner.Seq || st.Stages[1].ScopeRevision != 3 {
+				t.Fatal("owner order after a notice", st.Stages)
+			}
+		})
+	}
+}
+
+// s2 (wi_c4b7284e2cb46691): a scope confirmed again under an order an earlier
+// stage already names opens no stage. Stage two keeps its count, and the
+// next new owner order still opens stage three.
+func TestReviewStageReturningEarlierOrderOpensNoStage(t *testing.T) {
+	f, handler := findingsStage(t)
+	f.rescope(t, "Build order one")
+	build := f.ownerOrder(t, "build-order")
+	f.confirmScope(t, handler, build, "build-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	two := f.state(t).Stages
+	findings := two[0].OrderSeq
+	if len(two) != 2 || findings == 0 || findings == build.Seq {
+		t.Fatal("stage one is not named by the findings order", two)
+	}
+
+	f.rescope(t, "Back to the findings order")
+	f.confirmScope(t, handler, api.Message{Seq: findings}, "returning-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	wantStages(t, "returning to the stage one order", f.state(t).Stages, two...)
+	refusedWith(t, "third review of stage two after the return", f.reviewErr(candidateC), "third general review refused")
+
+	f.rescope(t, "Build order two")
+	third := f.ownerOrder(t, "third-order")
+	f.confirmScope(t, handler, third, "third-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	wantStages(t, "new order after the return", st.Stages, append(two, api.ReviewStage{Number: 3, OrderSeq: third.Seq, ScopeRevision: 4, AssignmentSeq: st.Scopes[3].AssignmentSeq})...)
+}
+
 // foldFile is the finding file the fold fixtures name.
 const foldFile = "hub/internal/store/fold.go"
 

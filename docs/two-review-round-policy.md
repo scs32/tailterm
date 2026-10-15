@@ -94,10 +94,12 @@ build with no review and no way to reuse a1..aN.
 
 A review stage is the run of scope revisions worked under one owner order. A
 scope revision opens a new stage when the database handler's saved scope
-confirmation for it names a different owner order message than the stage before
-it. A scope revision with no saved confirmation, or one confirmed under the same
-order, stays in the current stage. The first saved confirmation of an item names
-its first stage, so it opens no new one. The stage opens at that scope
+confirmation for it names an owner order message that no recorded stage names. A
+scope revision with no saved confirmation, or one confirmed under the current
+stage's order or an earlier stage's order, stays in the current stage. Returning
+to an earlier order is not a new owner order, so it grants no fresh reviews (bug
+`wi_c4b7284e2cb46691`, order #35484). The first saved confirmation of an item
+names its first stage, so it opens no new one. The stage opens at that scope
 revision's first ASSIGN: until then an open review of the current stage still
 takes its result, and afterwards the earlier stage takes no further result.
 
@@ -111,12 +113,16 @@ the boundary from that entry. A refused ASSIGN stores nothing.
 The order must be owner-written. The check is made at that first ASSIGN, the one
 place a stage is created (`openReviewStage` in
 `hub/internal/store/review_convergence.go`): the order message must carry no
-agent identity and must not be a system message, the same rule as an owner matrix
-approval. A scope confirmed under a linked message that an agent wrote stays in
-its stage, and the build meets the usual "third general review refused". To
-recover, the owner posts the order and the handler confirms a new scope revision
-under it. The check is on the order's authorship because a stage grants two more
-general reviews; the handler's confirmation alone is not the control.
+agent identity, must not be a system message and must not be a notice. That is
+the owner matrix approval rule plus the notice exclusion: a notice stored with
+no agent identity is written by the hub or by a command on the owner's behalf,
+such as the queue lane notice `tt queue` posts with the owner credential, and is
+no order (bug `wi_c4b7284e2cb46691`). A scope confirmed under a linked message
+that an agent wrote, or under such a notice, stays in its stage, and the build
+meets the usual "third general review refused". To recover, the owner posts the
+order and the handler confirms a new scope revision under it. The check is on
+the order's authorship because a stage grants two more general reviews; the
+handler's confirmation alone is not the control.
 
 A first stage whose scope had no confirmation at its ASSIGN is recorded without
 an order. It is named once, at the next scope revision's first ASSIGN, from the
