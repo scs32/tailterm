@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3736,5 +3737,427 @@ func TestReviewFoldNamesFile(t *testing.T) {
 		if got := namesFile(text, foldFile); got != want {
 			t.Errorf("namesFile(%q) = %v, want %v", text, got, want)
 		}
+	}
+}
+
+// confirmOwned saves the handler's confirmation of the current scope under
+// order with the given owned paths.
+func (f *convergenceFixture) confirmOwned(t *testing.T, handler api.Agent, order api.Message, key string, owned []string) {
+	t.Helper()
+	req := api.ConfirmWorkOrderScopeRequest{RequestID: key, AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: f.item.Revision, ScopeRevision: f.item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true, Ownership: owned}
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, req); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// queueOwned adds the fixture item to the queue under order with owned paths.
+func (f *convergenceFixture) queueOwned(t *testing.T, order api.Message, key string, owned []string) {
+	t.Helper()
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: f.item.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: "/fold/" + key, Ownership: owned}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fileFoldItem files an open, held item with the given title and description.
+func fileFoldItem(t *testing.T, f *convergenceFixture, key, title, description string) api.WorkItem {
+	t.Helper()
+	item, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: title, Description: description, Priority: "normal", RequestID: "fold-candidate-" + key}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
+}
+
+// foldCandidateNotices returns the fold-candidates notices after the REVIEW.
+func foldCandidateNotices(t *testing.T, f *convergenceFixture, review int64) []api.Message {
+	t.Helper()
+	rows, err := f.s.db.Query(`SELECT seq FROM messages WHERE task_id=? AND seq>? AND json_valid(envelope) AND json_extract(envelope,'$.subject')=? ORDER BY seq`, f.task.ID, review, foldCandidatesSubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []int64
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
+	}
+	if err := closeRows(rows); err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, seq := range seqs {
+		m, err := loadMessage(f.s.db, f.ctx, f.task.ID, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// foldCandidateLines checks the shape every notice shares and returns its
+// candidate lines in order.
+func foldCandidateLines(t *testing.T, f *convergenceFixture, review api.Message, notices []api.Message) []string {
+	t.Helper()
+	var lines []string
+	for _, n := range notices {
+		e := n.Envelope
+		if e == nil || e.Kind != api.EnvelopeKindNotice || n.To != f.reviewer.ID || e.To != f.reviewer.Name || n.From.AgentID != "" || n.ReplyTo != 0 || len(e.Refs) != 1 || e.Refs["review"] != fmt.Sprint(review.Seq) {
+			t.Fatalf("notice shape %+v %+v", n, e)
+		}
+		if len(n.WorkItems) != 1 || n.WorkItems[0].ItemID != f.item.ID || n.WorkItems[0].Relationship != "primary" || !reflect.DeepEqual(n.WorkOrderMessage, review.WorkOrderMessage) {
+			t.Fatalf("notice links %+v %+v", n.WorkItems, n.WorkOrderMessage)
+		}
+		if body, err := json.Marshal(e.Body); err != nil || len(body) > api.MaxEnvelopeBodyBytes {
+			t.Fatalf("notice body %d bytes %v", len(body), err)
+		}
+		parts := strings.Split(e.Body.Text, "\n")
+		if parts[0] != foldCandidatesHeader || len(parts) < 2 {
+			t.Fatalf("notice text %q", e.Body.Text)
+		}
+		lines = append(lines, parts[1:]...)
+	}
+	return lines
+}
+
+func foldCandidateLine(item api.WorkItem, path string) string {
+	return "- " + item.ID + " names " + path + ": " + item.Title
+}
+
+func messageCount(t *testing.T, f *convergenceFixture) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func foldSkipEvents(t *testing.T, f *convergenceFixture) []map[string]any {
+	t.Helper()
+	rows, err := f.s.db.Query(`SELECT data FROM events WHERE task_id=? AND kind='fold_candidates_skipped' ORDER BY seq`, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []map[string]any
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var data map[string]any
+		if err := json.Unmarshal([]byte(raw), &data); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, data)
+	}
+	if err := closeRows(rows); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// heldFoldReview owns foldFile under an owner order, files the fold targets
+// and posts a REVIEW.
+func heldFoldReview(t *testing.T) (*convergenceFixture, map[string]api.WorkItem, api.Message) {
+	t.Helper()
+	f := newConvergenceFixture(t)
+	targets := foldTargets(t, f.s, f.task)
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
+	return f, targets, f.review(t, candidateA)
+}
+
+// c1, c5 (wi_a2f2865ae9b190ec): a REVIEW sends its reviewer one linked
+// notice listing the held items that name an owned path, newest first, and
+// none that is running, queued, accepted, ordered, done or names another file.
+func TestReviewFoldCandidatesHeldVersusRunning(t *testing.T) {
+	f, targets, r := heldFoldReview(t)
+	notices := foldCandidateNotices(t, f, r.Seq)
+	if len(notices) != 1 || notices[0].Seq != r.Seq+1 {
+		t.Fatalf("want one notice right after the REVIEW, got %d", len(notices))
+	}
+	got := foldCandidateLines(t, f, r, notices)
+	want := []string{foldCandidateLine(targets["second"], foldFile), foldCandidateLine(targets["eligible"], foldFile)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates\n got %q\nwant %q", got, want)
+	}
+	if events := foldSkipEvents(t, f); len(events) != 0 {
+		t.Fatalf("skip events %v", events)
+	}
+}
+
+// c1, c5: at most ten candidates, the newest.
+func TestReviewFoldCandidatesCap(t *testing.T) {
+	f := newConvergenceFixture(t)
+	var items []api.WorkItem
+	for i := 1; i <= 12; i++ {
+		items = append(items, fileFoldItem(t, f, fmt.Sprint(i), fmt.Sprintf("Cap candidate %d", i), "Owned paths: "+foldFile+"."))
+	}
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
+	r := f.review(t, candidateA)
+	var want []string
+	for i := 11; i >= 2; i-- {
+		want = append(want, foldCandidateLine(items[i], foldFile))
+	}
+	if got := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates\n got %q\nwant %q", got, want)
+	}
+}
+
+// c1, c5: no owned paths, or owned paths no eligible item names, send no
+// notice and record nothing.
+func TestReviewFoldCandidatesNone(t *testing.T) {
+	for name, owned := range map[string][]string{
+		"no ownership":           nil,
+		"no item names the path": {"hub/internal/store/nothing.go"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			foldTargets(t, f.s, f.task)
+			f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", owned)
+			before := messageCount(t, f)
+			r := f.review(t, candidateA)
+			if after := messageCount(t, f); after != before+1 || len(foldCandidateNotices(t, f, r.Seq)) != 0 || len(foldSkipEvents(t, f)) != 0 {
+				t.Fatalf("messages %d -> %d", before, after)
+			}
+		})
+	}
+}
+
+// c2, c5: the reviewer folds into an offered candidate through the existing
+// path, without acknowledging the notice; a fold into the running target is
+// still refused with its reason.
+func TestReviewFoldCandidatesFoldIntoOffered(t *testing.T) {
+	f, targets, r := heldFoldReview(t)
+	lines := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq))
+	offered := strings.Fields(lines[0])[1]
+	if offered != targets["second"].ID {
+		t.Fatalf("offered %q", offered)
+	}
+	fold := func(into string) error {
+		finding := api.ReviewFinding{ID: "f1", Title: "Fold fixture finding", File: foldFile, Line: 3, Into: into}
+		_, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{finding}}), "", r.Seq, f.reviewer)
+		return err
+	}
+	refusedWith(t, "fold into the running target", fold(targets["running"].ID), "review.findings[f1].into: item is running")
+	if err := fold(offered); err != nil {
+		t.Fatal("fold into an offered candidate:", err)
+	}
+	if notes := foldNotes(t, f.s, offered); len(notes) != 1 || notes[0].namespace != "review-fold" {
+		t.Fatalf("notes %+v", notes)
+	}
+	if st := f.state(t); len(st.FollowUps) != 1 || st.FollowUps[0].ItemID != offered || !st.FollowUps[0].Folded {
+		t.Fatalf("follow-ups %+v", st.FollowUps)
+	}
+}
+
+// c5: a replayed REVIEW sends no second notice.
+func TestReviewFoldCandidatesReplay(t *testing.T) {
+	f := newConvergenceFixture(t)
+	foldTargets(t, f.s, f.task)
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
+	req := f.req(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "Fixture", Acceptance: f.criteria}}, f.reviewer.ID, 0, api.Agent{})
+	r, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := messageCount(t, f)
+	again, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by)
+	if err != nil || again.Seq != r.Seq {
+		t.Fatalf("replay %d %v", again.Seq, err)
+	}
+	if after := messageCount(t, f); after != before || len(foldCandidateNotices(t, f, r.Seq)) != 1 {
+		t.Fatalf("replay wrote a notice: %d -> %d", before, after)
+	}
+}
+
+// c1, c5: ownership comes from the order the review stage is confirmed
+// under, never from a later confirmation or queue entry under another order;
+// a new owner-order stage takes its own order's paths.
+func TestReviewFoldCandidatesTwoOrders(t *testing.T) {
+	const pathA, pathB = "hub/internal/store/fold_a.go", "hub/internal/store/fold_b.go"
+	f := newConvergenceFixture(t)
+	a := fileFoldItem(t, f, "a", "Names path A", "Owned paths: "+pathA+".")
+	b := fileFoldItem(t, f, "b", "Names path B", "Owned paths: "+pathB+".")
+	handler := f.stageHandler(t)
+	f.rescope(t, "Order one")
+	one := f.ownerOrder(t, "order-one")
+	f.confirmOwned(t, handler, one, "scope-one", []string{pathA})
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.state(t); st.Stages[len(st.Stages)-1].OrderSeq != one.Seq {
+		t.Fatalf("stage order %+v", st.Stages)
+	}
+	two := f.ownerOrder(t, "order-two")
+	f.confirmOwned(t, handler, two, "scope-two", []string{pathB})
+	f.queueOwned(t, two, "queue-two", []string{pathB})
+	r := f.review(t, candidateA)
+	if got, want := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)), []string{foldCandidateLine(a, pathA)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stage one candidates\n got %q\nwant %q", got, want)
+	}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	// A new scope revision confirmed under a new owner order opens stage two.
+	f.rescope(t, "Order three")
+	three := f.ownerOrder(t, "order-three")
+	f.confirmOwned(t, handler, three, "scope-three", []string{pathB})
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.state(t); len(st.Stages) < 2 || st.Stages[len(st.Stages)-1].OrderSeq != three.Seq {
+		t.Fatalf("stage two %+v", st.Stages)
+	}
+	r = f.review(t, candidateB)
+	if got, want := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)), []string{foldCandidateLine(b, pathB)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stage two candidates\n got %q\nwant %q", got, want)
+	}
+}
+
+// c1, c5: with no queue entry the stage order's confirmation gives the
+// paths, and a queue entry under that order at an older item revision is
+// never read.
+func TestReviewFoldCandidatesScopeFallback(t *testing.T) {
+	const pathA, pathB = "hub/internal/store/fold_a.go", "hub/internal/store/fold_b.go"
+	t.Run("no queue entry", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		a := fileFoldItem(t, f, "a", "Names path A", "Owned paths: "+pathA+".")
+		f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "order"), "scope", []string{pathA})
+		r := f.review(t, candidateA)
+		if got, want := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)), []string{foldCandidateLine(a, pathA)}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("candidates\n got %q\nwant %q", got, want)
+		}
+	})
+	t.Run("queue entry at an older item revision", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		a := fileFoldItem(t, f, "a", "Names path A", "Owned paths: "+pathA+".")
+		fileFoldItem(t, f, "b", "Names path B", "Owned paths: "+pathB+".")
+		order := f.ownerOrder(t, "order")
+		f.confirmOwned(t, f.stageHandler(t), order, "scope", []string{pathA})
+		f.queueOwned(t, order, "queue", []string{pathB})
+		high := "high"
+		var err error
+		if f.item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Priority: &high}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		var entryRevision int64
+		if err = f.s.db.QueryRow(`SELECT item_revision FROM team_queue_entries WHERE item_id=?`, f.item.ID).Scan(&entryRevision); err != nil || entryRevision >= f.item.Revision {
+			t.Fatalf("entry revision %d item revision %d %v", entryRevision, f.item.Revision, err)
+		}
+		r := f.review(t, candidateA)
+		if got, want := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)), []string{foldCandidateLine(a, pathA)}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("candidates\n got %q\nwant %q", got, want)
+		}
+	})
+}
+
+// c1, c5: with no confirmed order there are no owned paths: the REVIEW is
+// accepted with no notice and no skip event.
+func TestReviewFoldCandidatesMissingOrder(t *testing.T) {
+	f := newConvergenceFixture(t)
+	foldTargets(t, f.s, f.task)
+	before := messageCount(t, f)
+	r := f.review(t, candidateA)
+	if after := messageCount(t, f); after != before+1 || len(foldCandidateNotices(t, f, r.Seq)) != 0 || len(foldSkipEvents(t, f)) != 0 {
+		t.Fatalf("messages %d -> %d", before, after)
+	}
+	if st := f.state(t); len(st.Rounds) != 1 || st.Rounds[0].RequestSeq != r.Seq {
+		t.Fatalf("rounds %+v", st.Rounds)
+	}
+}
+
+// longTitleFoldReview files ten held items naming foldFile, each with a
+// 120-character title of '<' (six bytes each in JSON), and posts a REVIEW.
+func longTitleFoldReview(t *testing.T) (*convergenceFixture, []api.WorkItem, func() api.Message) {
+	t.Helper()
+	f := newConvergenceFixture(t)
+	var items []api.WorkItem
+	for i := 1; i <= 10; i++ {
+		items = append(items, fileFoldItem(t, f, fmt.Sprint(i), strings.Repeat("<", 119)+fmt.Sprint(i%10), "Owned paths: "+foldFile+"."))
+	}
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
+	return f, items, func() api.Message { return f.review(t, candidateA) }
+}
+
+// c1, c5 (lead disposition of p2): lines are never cut; candidates that do
+// not fit one notice are split across notices in order.
+func TestReviewFoldCandidatesSplitAcrossNotices(t *testing.T) {
+	f, items, review := longTitleFoldReview(t)
+	r := review()
+	notices := foldCandidateNotices(t, f, r.Seq)
+	if len(notices) < 2 {
+		t.Fatalf("want the candidates split across notices, got %d", len(notices))
+	}
+	var want []string
+	for i := len(items) - 1; i >= 0; i-- {
+		want = append(want, foldCandidateLine(items[i], foldFile))
+	}
+	got := foldCandidateLines(t, f, r, notices)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates\n got %q\nwant %q", got, want)
+	}
+	for _, n := range notices {
+		if strings.Contains(n.Envelope.Body.Text, "…") {
+			t.Fatalf("notice cut a line: %q", n.Envelope.Body.Text)
+		}
+	}
+	if events := foldSkipEvents(t, f); len(events) != 0 {
+		t.Fatalf("skip events %v", events)
+	}
+}
+
+// c1, c5 (lead disposition of p2): a candidate whose line cannot fit a
+// notice even alone is left out and recorded, never cut; others are listed.
+func TestReviewFoldCandidatesOversizedLineOmitted(t *testing.T) {
+	segment := strings.Repeat("&", 200)
+	big := strings.Join([]string{segment, segment, segment, segment, segment}, "/")
+	if len(big) != 1004 {
+		t.Fatal(len(big))
+	}
+	f := newConvergenceFixture(t)
+	first := fileFoldItem(t, f, "big-1", "Names the big path", "Owned paths: "+big+".")
+	normal := fileFoldItem(t, f, "normal", "Names the fold file", "Owned paths: "+foldFile+".")
+	second := fileFoldItem(t, f, "big-2", "Also names the big path", "Owned paths: "+big+".")
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{big, foldFile})
+	r := f.review(t, candidateA)
+	if got, want := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)), []string{foldCandidateLine(normal, foldFile)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates\n got %q\nwant %q", got, want)
+	}
+	events := foldSkipEvents(t, f)
+	if len(events) != 1 || events[0]["reason"] != "candidate too large to list" || events[0]["itemId"] != f.item.ID || events[0]["messageSeq"] != float64(r.Seq) || !reflect.DeepEqual(events[0]["omitted"], []any{second.ID, first.ID}) {
+		t.Fatalf("skip events %v", events)
+	}
+}
+
+// c1, c5 (r2 p2): a failure while posting the notices undoes every notice,
+// keeps the REVIEW and its round, and records the reason.
+func TestReviewFoldCandidatesFailureKeepsReview(t *testing.T) {
+	f, _, review := longTitleFoldReview(t)
+	posts := 0
+	foldCandidatePost = func(s *Store, ctx context.Context, tx *sql.Tx, task api.Task, to api.Agent, subject, text string, refs map[string]string, source api.Message, requestID string) error {
+		posts++
+		if posts == 2 {
+			return errors.New("forced fold notice failure")
+		}
+		return s.postLinkedBrokerNotice(ctx, tx, task, to, subject, text, refs, source, requestID)
+	}
+	t.Cleanup(func() { foldCandidatePost = (*Store).postLinkedBrokerNotice })
+	before := messageCount(t, f)
+	r := review()
+	if posts != 2 {
+		t.Fatalf("posts %d", posts)
+	}
+	if after := messageCount(t, f); after != before+1 || len(foldCandidateNotices(t, f, r.Seq)) != 0 {
+		t.Fatalf("messages %d -> %d", before, after)
+	}
+	if st := f.state(t); len(st.Rounds) != 1 || st.Rounds[0].RequestSeq != r.Seq {
+		t.Fatalf("rounds %+v", st.Rounds)
+	}
+	events := foldSkipEvents(t, f)
+	if len(events) != 1 || events[0]["reason"] != "forced fold notice failure" || events[0]["messageSeq"] != float64(r.Seq) {
+		t.Fatalf("skip events %v", events)
 	}
 }

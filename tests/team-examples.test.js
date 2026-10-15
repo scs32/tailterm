@@ -180,11 +180,12 @@ test("the steward proposes a token estimate with every filing and ranking", () =
   assert.doesNotMatch(steward, /--estimate-tokens/);
 });
 
-// wi_3d3364ecdb9831fa: the reviewer folds a same-file, same-cause finding into
-// an item ID it already has, and never reads work items itself.
+// wi_3d3364ecdb9831fa, wi_a2f2865ae9b190ec: the reviewer folds a same-file,
+// same-cause finding into an item ID from the hub's candidate notice, its
+// review context or lead, and never reads work items itself.
 test("the reviewer folds a same-file finding into an existing held item", () => {
   const rule =
-    "Fold a finding into an existing item only for the same file and the same cause, and only into an item ID you already have from your review context or from lead: set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. File it new, without into, for a new cause or a product defect.";
+    "Fold a finding into an existing item when it has the same file and the same cause, and only into an item ID from the hub's fold-candidates NOTICE for this REVIEW, your review context or lead: prefer a listed candidate; set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. Otherwise file it new, without into, and always for a new cause or a product defect.";
   for (const id of ["planned", "small"]) {
     const reviewer = exampleTeam(id).members.find((member) => member.name === "reviewer").prompt;
     assert.equal(reviewer.split(rule).length - 1, 1, id);

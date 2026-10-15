@@ -148,7 +148,7 @@ and ordinary agents are refused.
 A reviewer may fold a finding into an existing item instead of filing a new
 one (`wi_3d3364ecdb9831fa`). The reviewer template carries this rule:
 
-> Fold a finding into an existing item only for the same file and the same cause, and only into an item ID you already have from your review context or from lead: set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. File it new, without into, for a new cause or a product defect.
+> Fold a finding into an existing item when it has the same file and the same cause, and only into an item ID from the hub's fold-candidates NOTICE for this REVIEW, your review context or lead: prefer a listed candidate; set its into to that ID when the item is open, held, unordered and names that file; the hub saves it there as an evidence note, or refuses the RESULT with the reason. Otherwise file it new, without into, and always for a new cause or a product defect.
 
 The finding's `into` field names the target. The hub accepts it only when the
 finding names a repository-relative `file`, the target is in the same project,
@@ -175,6 +175,16 @@ target outside the project, the reviewed item and `item does not name the
 finding's file` are 409s. There is no fallback to a new item. An order the
 handler has not booked yet is not seen, so a fold can still land on an item
 about to start; it is only evidence there.
+
+At REVIEW the hub sends the reviewer the fold candidates in a NOTICE linked to
+the REVIEW (`refs.review`): up to 10 open items, newest first, that pass the
+target checks above and name one of the owned paths of the order the review
+stage is confirmed under (that order's queue entry at the current item
+revision, else its scope confirmation). Each line gives the full item ID, the
+owned path it names and its title. Lines that do not fit one notice continue in
+another; a line too large for any notice is left out and recorded in a
+`fold_candidates_skipped` event. No notice is sent when none qualify, and the
+notice never refuses or rolls back a REVIEW.
 
 A fold is evidence, not scope. The hub saves the finding on the target as a
 narrative note (namespace and provenance `review-fold`, kind `note`, the

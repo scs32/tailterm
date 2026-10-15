@@ -789,7 +789,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		state.Rounds = append(state.Rounds, api.ReviewRound{Number: len(state.Rounds) + 1, ScopeRevision: item.ScopeRevision, Criteria: sc.Criteria, VerificationCriteria: normalizedVerificationCriteria(sc.VerificationCriteria), RequestSeq: m.Seq, Candidate: e.Body.Candidate, ReviewerID: target.ID, ReviewerRun: target.RunID, StartedAt: ts(s.now())})
 		state.Disposition = nil
-		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
+		if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
+			return err
+		}
+		return s.offerFoldCandidates(ctx, tx, m, item, state, target)
 	}
 	if meta == nil {
 		if e.Kind == "result" {
@@ -1492,6 +1495,195 @@ func (s *Store) foldReviewFinding(ctx context.Context, tx *sql.Tx, parent api.Wo
 	}
 	out.ItemID = target.ID
 	return out, nil
+}
+
+// foldCandidateLimit caps the fold candidates one REVIEW offers.
+const foldCandidateLimit = 10
+
+const (
+	foldCandidatesSubject = "Fold candidates for your review"
+	foldCandidatesHeader  = "Open, held, unordered items that name a file this item owns. To fold a finding into one, set the finding's into to its ID when the file and the cause match; otherwise file the finding new."
+)
+
+// foldCandidate is an item a reviewer may fold a finding into, with the
+// owned path its description names.
+type foldCandidate struct{ ID, Title, Path string }
+
+// foldCandidatePost posts one fold-candidates notice. Tests replace it to
+// force a failure after an earlier notice was written.
+var foldCandidatePost = (*Store).postLinkedBrokerNotice
+
+// offerFoldCandidates sends the reviewer of the REVIEW m the item's fold
+// candidates in hub notices. It never refuses or rolls back the REVIEW: any
+// failure undoes only the notices and is kept as a fold_candidates_skipped
+// event, as is a candidate whose line cannot fit in a notice.
+func (s *Store) offerFoldCandidates(ctx context.Context, tx *sql.Tx, m api.Message, item api.WorkItem, state api.ReviewConvergence, reviewer api.Agent) error {
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT fold_candidates`); err != nil {
+		return err
+	}
+	omitted, err := s.postFoldCandidates(ctx, tx, m, item, state, reviewer)
+	reason := ""
+	if err != nil {
+		if _, rerr := tx.ExecContext(ctx, `ROLLBACK TO fold_candidates`); rerr != nil {
+			return rerr
+		}
+		reason = clip(err.Error(), 200)
+	} else if len(omitted) > 0 {
+		reason = "candidate too large to list"
+	}
+	if _, err = tx.ExecContext(ctx, `RELEASE fold_candidates`); err != nil {
+		return err
+	}
+	if reason == "" {
+		return nil
+	}
+	data := map[string]any{"itemId": item.ID, "messageSeq": m.Seq, "reason": reason}
+	if len(omitted) > 0 {
+		data["omitted"] = omitted
+	}
+	_, err = s.insertEvent(ctx, tx, m.TaskID, "fold_candidates_skipped", "", reason, data, BrokerCaller)
+	return err
+}
+
+// postFoldCandidates posts the notices and returns the IDs left out because
+// their line cannot fit in a notice even alone.
+func (s *Store) postFoldCandidates(ctx context.Context, tx *sql.Tx, m api.Message, item api.WorkItem, state api.ReviewConvergence, reviewer api.Agent) ([]string, error) {
+	owned, err := reviewOwnedPaths(ctx, tx, m.TaskID, item, state)
+	if err != nil || len(owned) == 0 {
+		return nil, err
+	}
+	cands, err := foldCandidates(ctx, tx, m.TaskID, item.ID, owned)
+	if err != nil || len(cands) == 0 {
+		return nil, err
+	}
+	review := strconv.FormatInt(m.Seq, 10)
+	texts, omitted := packFoldCandidates(reviewer.Name, review, cands)
+	if len(texts) == 0 {
+		return omitted, nil
+	}
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, m.TaskID))
+	if err != nil {
+		return omitted, err
+	}
+	for i, text := range texts {
+		if err = foldCandidatePost(s, ctx, tx, task, reviewer, foldCandidatesSubject, text, map[string]string{"review": review}, m, fmt.Sprintf("fold-candidates-%d-%d", m.Seq, i+1)); err != nil {
+			return omitted, err
+		}
+	}
+	return omitted, nil
+}
+
+// reviewOwnedPaths returns the owned paths of the order the review stage is
+// confirmed under: the stage's recorded order, else the scope's earliest
+// confirmation. That order's queue entry at the current item revision wins
+// when it lists paths; else its scope confirmation. Rows under another order
+// or an older item revision are never read, and no order means no paths.
+func reviewOwnedPaths(ctx context.Context, q queryRower, task string, item api.WorkItem, state api.ReviewConvergence) ([]string, error) {
+	var order int64
+	if n := len(state.Stages); n > 0 {
+		order = state.Stages[n-1].OrderSeq
+	}
+	if order == 0 {
+		var err error
+		if order, err = scopeOrder(ctx, q, task, item.ID, item.ScopeRevision); err != nil || order == 0 {
+			return nil, err
+		}
+	}
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT ownership_json FROM team_queue_entries WHERE task_id=? AND item_id=? AND order_seq=? AND item_revision=? ORDER BY attempt DESC LIMIT 1`, task, item.ID, order, item.Revision).Scan(&raw)
+	if err == nil {
+		owned, err := scopeOwnership(raw)
+		if err != nil || len(owned) > 0 {
+			return owned, err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	err = q.QueryRowContext(ctx, `SELECT ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND order_seq=? AND scope_revision<=? ORDER BY scope_revision DESC, item_revision DESC LIMIT 1`, task, item.ID, order, item.ScopeRevision).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return scopeOwnership(raw)
+}
+
+// foldCandidates lists, newest first and at most foldCandidateLimit, the open
+// items other than reviewed that can take a fold (foldIneligible) and whose
+// description names one of owned, each with the first such path. It is the
+// triage and fold rule, not a copy of it.
+func foldCandidates(ctx context.Context, q queryRower, task, reviewed string, owned []string) ([]foldCandidate, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id,title,description FROM work_items WHERE task_id=? AND status='open' AND id<>? ORDER BY seq DESC`, task, reviewed)
+	if err != nil {
+		return nil, err
+	}
+	type open struct{ id, title, description string }
+	var items []open
+	var ids []string
+	for rows.Next() {
+		var o open
+		if err = rows.Scan(&o.id, &o.title, &o.description); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, o)
+		ids = append(ids, o.id)
+	}
+	if err = closeRows(rows); err != nil {
+		return nil, err
+	}
+	ineligible, err := foldIneligible(ctx, q, task, ids)
+	if err != nil {
+		return nil, err
+	}
+	var out []foldCandidate
+	for _, o := range items {
+		if ineligible[o.id] != "" {
+			continue
+		}
+		for _, p := range owned {
+			if namesFile(o.description, p) {
+				out = append(out, foldCandidate{ID: o.id, Title: o.title, Path: p})
+				break
+			}
+		}
+		if len(out) == foldCandidateLimit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// packFoldCandidates packs one full line per candidate, in order, into as
+// few notice texts as pass the envelope rules, each opening with the header.
+// A line is never cut: one that cannot fit even alone is left out and its ID
+// returned.
+func packFoldCandidates(to, review string, cands []foldCandidate) (texts, omitted []string) {
+	fits := func(text string) bool {
+		return api.ValidateEnvelope(api.Envelope{Kind: api.EnvelopeKindNotice, To: to, Subject: foldCandidatesSubject, Refs: map[string]string{"review": review}, Body: api.EnvelopeBody{Text: text}}) == nil
+	}
+	text := ""
+	for _, c := range cands {
+		line := "- " + c.ID + " names " + c.Path + ": " + c.Title
+		if text != "" && fits(text+"\n"+line) {
+			text += "\n" + line
+			continue
+		}
+		alone := foldCandidatesHeader + "\n" + line
+		if !fits(alone) {
+			omitted = append(omitted, c.ID)
+			continue
+		}
+		if text != "" {
+			texts = append(texts, text)
+		}
+		text = alone
+	}
+	if text != "" {
+		texts = append(texts, text)
+	}
+	return texts, omitted
 }
 
 func reviewRequestSeq(original, active int64) int64 {
