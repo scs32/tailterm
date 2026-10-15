@@ -50,6 +50,47 @@ export function failureDetail(error) {
   }
   return detail;
 }
+// The failure diagnostics a rolled_back or blocked hub receipt carries
+// (wi_d4e96831ab3a0038): receipt.failure {step, target, reason}, the failed
+// target's reason, and each target's liveCheck/rollbackCheck {lastCommit,
+// waitedMs}. The reason is the stable failure tag; the hub refuses one that
+// names a credential word, so such a reason is sent as "unclassified". A
+// probe's polls and capture stay in the private journal.
+const SECRET_WORDS = ["token", "secret", "password", "passwd", "bearer", "authorization", "api key", "apikey", "private key"];
+const STEP = /^[a-z][a-z-]{0,23}$/, TARGETS = ["hub", "bridge", "mini", "tailos"], PROBE_WAIT_MAX_MS = 3600000;
+export function receiptReason(reason) {
+  return typeof reason === "string" && REASON.test(reason) && !SECRET_WORDS.some(w => reason.toLowerCase().includes(w)) ? reason : "unclassified";
+}
+export function probeDiagnostics(wait) {
+  const out = {};
+  if (typeof wait?.lastCommit === "string" && /^[a-f0-9]{40}$/.test(wait.lastCommit)) out.lastCommit = wait.lastCommit;
+  if (Number.isSafeInteger(wait?.waitedMs) && wait.waitedMs >= 0 && wait.waitedMs <= PROBE_WAIT_MAX_MS) out.waitedMs = wait.waitedMs;
+  return Object.keys(out).length ? out : undefined;
+}
+// Adds the diagnostics to a failed receipt from the journal's first failure
+// and effects. It reads only journal state, so a resumed run builds the same.
+function addDiagnostics(receipt, failure, effects) {
+  const named = failure && STEP.test(failure.step || "") ? {step: failure.step, ...(TARGETS.includes(failure.target) ? {target: failure.target} : {}), reason: receiptReason(failure.reason)} : undefined;
+  if (named) receipt.failure = named;
+  for (const target of receipt.targets) {
+    const effect = effects.find(e => e.target === target.target), live = probeDiagnostics(effect?.liveCheck), rollback = probeDiagnostics(effect?.rollbackCheck);
+    if (named?.target === target.target) target.reason = named.reason;
+    if (live) target.liveCheck = live;
+    if (rollback) target.rollbackCheck = rollback;
+  }
+}
+export function withoutDiagnostics(receipt) {
+  if (!receipt || typeof receipt !== "object") return receipt;
+  const {failure, ...rest} = receipt;
+  return {...rest, ...(Array.isArray(receipt.targets) ? {targets: receipt.targets.map(t => { if (!t || typeof t !== "object") return t; const {reason, liveCheck, rollbackCheck, ...kept} = t; return kept; })} : {})};
+}
+// The hub's saved receipt matches the one sent, or, from a hub or tt older
+// than the diagnostics that dropped them, matches it without them. A saved
+// receipt holding any diagnostic must match exactly.
+export function sameReceipt(sent, saved) {
+  if (digest(sent) === digest(saved)) return true;
+  return digest(withoutDiagnostics(saved)) === digest(saved) && digest(withoutDiagnostics(sent)) === digest(saved);
+}
 // For the configured CLI only (cli), the reason also names the subcommand:
 // its first one or two argv words when they are plain lowercase words. No
 // flag, value or path of the call is ever part of it.
@@ -1004,6 +1045,7 @@ export async function runRelease(config, adapter) {
       state.receipt.outcome=state.outcome;
       for(const target of state.receipt.targets){const effect=state.effects.find(e=>e.target===target.target);if(effect?.rollback){target.rollback=effect.rollback;target.outcome=effect.rollback==="restored"?"rolled_back":"failed";}}
       if(state.revert)state.receipt.revert={...(state.revert.commit?{commit:state.revert.commit}:{}),outcome:state.revert.outcome,...(state.revert.bugRequestId?{bugRequestId:state.revert.bugRequestId}:{})};
+      addDiagnostics(state.receipt,state.failure,state.effects);
       // Retryable like the success receipt: a lost response resumes this
       // exact receipt and generation, with no second rollback or escalation.
       state.finishGeneration=adapter.job?.generation??job.generation;state.phase="receipt_pending";checkpoint();
@@ -1052,7 +1094,7 @@ export function validateNativeRelease(prior, next, operation, expectedGeneration
   const integrated = operation === "merged" ? flag("--commit") : operation === "batch-drop" ? undefined : prior.integratedCommit;
   if (next.integratedCommit !== integrated || (operation === "merged" && !sha(integrated))) throw releaseError("Native integrated commit mismatch");
   if (operation === "finish") {
-    if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || digest(next.receipt) !== digest(receipt)) throw releaseError("Native full receipt mismatch");
+    if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || !sameReceipt(receipt, next.receipt)) throw releaseError("Native full receipt mismatch");
   } else if (!same(prior.receipt, next.receipt)) throw releaseError("Native receipt changed unexpectedly");
   return next;
 }
@@ -1889,7 +1931,7 @@ export function reconcileReceipts(config,jobs){
     const path=join(config.journalDirectory,job.id+".json");if(!existsSync(path))continue;
     const journal=JSON.parse(readFileSync(path,"utf8"));
     if(["finishing","receipt_pending"].includes(journal.phase) && journal.jobId===job.id){
-      if(!fullReleaseReceipt(job.receipt,job) || journal.commit!==job.commit || journal.agentId!==job.agentId || journal.runId!==job.runId || (journal.taskId!==undefined && journal.taskId!==job.taskId) || (journal.pauseGeneration!==undefined && journal.pauseGeneration!==job.pauseGeneration) || job.receipt.commit!==(job.integratedCommit||job.commit) || job.receipt.verificationDigest!==job.verificationDigest || job.generation!==journal.finishGeneration+1 || digest(journal.receipt)!==digest(job.receipt))throw releaseError("Saved release receipt does not match pending journal");
+      if(!fullReleaseReceipt(job.receipt,job) || journal.commit!==job.commit || journal.agentId!==job.agentId || journal.runId!==job.runId || (journal.taskId!==undefined && journal.taskId!==job.taskId) || (journal.pauseGeneration!==undefined && journal.pauseGeneration!==job.pauseGeneration) || job.receipt.commit!==(job.integratedCommit||job.commit) || job.receipt.verificationDigest!==job.verificationDigest || job.generation!==journal.finishGeneration+1 || !sameReceipt(journal.receipt,job.receipt))throw releaseError("Saved release receipt does not match pending journal");
       journal.phase="complete";updates.push([path,journal]);
     }
   }

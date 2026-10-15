@@ -1465,9 +1465,9 @@ reaches output, the journal or a message. An invalid `switchWindowMs` stops the
 deployer at start, before any `tt deployment list` or claim. The last commit
 seen and the wait go into the journal effect for TailOS (`liveCheck`,
 `rollbackCheck`: `{lastCommit, waitedMs}`) and into the failure escalation text
-(for example "TailOS live check last saw COMMIT after 90 s."). The hub receipt
-does not carry them: `tt deployment finish` keeps only the known receipt fields,
-and the pending-receipt recovery compares the journal's receipt with the hub's.
+(for example "TailOS live check last saw COMMIT after 90 s."). A rolled_back or
+blocked hub receipt carries them too, per target, with a null left out (see
+"Failure diagnostics in the receipt" below).
 The pinned rollback probe argv from `release-inputs.mjs` has no `--config`, so
 the automated TailOS rollback uses the default 90 s window.
 
@@ -1501,7 +1501,9 @@ a rollback probe run by hand waits the same window.
   `restored: false`, so a hub that comes up late is `restored`, not `blocked`.
   A wrong release, hash, build or state mount is not waited on: it is read once.
 - Journal: the effect's `liveCheck` and `rollbackCheck` hold `{waitedMs, polls}`
-  for hub and bridge, plus `capture` when the probe ended not ready. If the
+  for hub and bridge, plus `capture` when the probe ended not ready. A failed
+  receipt gets only `waitedMs` from them; `polls` and `capture` stay in the
+  private journal. If the
   rollback program itself fails, the target is not restored, and the rollback
   probe still runs once so `rollbackCheck` records what the app looked like.
 
@@ -1557,6 +1559,44 @@ redeploys that directory with Wrangler. A hand release of TailOS
 retains the same directory through `tt deployment hand-release --dist` (see
 "Superseding jobs released by hand"). `prepare(tailos)` runs `npm ci` first when
 `package-lock.json` changed since the TailOS baseline.
+
+**Failure diagnostics in the receipt** (wi_d4e96831ab3a0038). A rolled_back or
+blocked receipt that `tt deployment finish` saves carries, beside its outcomes:
+
+- `failure: {step, target, reason}`: the journal's first failed step. `reason`
+  is the runner's stable failure tag, the same text the journal keeps, so a
+  receipt names the cause without the private journal. `target` is left out when
+  the step had none.
+- On each target: `reason` (only on the target `failure` names, equal to its
+  reason), and `liveCheck` / `rollbackCheck` `{lastCommit, waitedMs}` from the
+  effect's probe waits. Only a 40-hex `lastCommit` and a `waitedMs` from 0 to
+  3600000 are sent; a null or anything else is left out, and so is a wait with
+  nothing left. A probe's `polls` and `capture` never leave the private journal.
+
+The hub refuses (400, the job stays merged and unreceipted) a `failure` on a
+released receipt, a step that is not a lowercase token, an unknown target, a
+target `reason` that does not match `failure`, a probe wait out of range, and a
+reason outside the 160-character tag set above or containing, in any case,
+`token`, `secret`, `password`, `passwd`, `bearer`, `authorization`, `api key`,
+`apikey` or `private key`. The runner sends such a reason as `unclassified`, so
+the hub never refuses a real receipt; no fixed tag contains those words. A
+released receipt keeps its earlier shape, with none of these fields. `tt
+deployment list` (the settled summaries) and `tt deployment get` show them.
+
+All of these fields are optional, so a receipt without them, from an older
+runner or saved before them, keeps its request JSON, request hash and digest
+byte for byte, and finishes, replays and reconciles as before. The runner
+accepts the hub's saved receipt (on finish and in the pending-receipt
+recovery) when it equals the one sent, or, only when the saved receipt has none
+of these fields, when it equals the one sent without them: what a hub or `tt`
+older than them saves. Every other field is still compared exactly.
+
+Rollout: the hub (with the bridge and the Mini `tt`) before the runner. An
+older hub refuses a receipt with these fields (unknown field) and an older `tt`
+drops them, so do not deploy the runner alone. A release of this change does
+it in order by itself: the old runner deploys the hub, bridge and Mini and
+finishes with an old-shape receipt, and the deployer re-execs onto the new
+runner afterwards, with no other release in flight.
 
 ### Private host configuration (keys only)
 

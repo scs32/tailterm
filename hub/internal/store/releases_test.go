@@ -9,6 +9,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1031,6 +1032,148 @@ func TestReleaseReceiptRevertAndPushValidation(t *testing.T) {
 	final, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: &good})
 	if err != nil || final.State != "rolled_back" || final.Receipt.Revert.Commit != sha {
 		t.Fatal(final, err)
+	}
+}
+
+// wi_d4e96831ab3a0038 r1-r4: a failed receipt keeps its failure, the target
+// reason and the probe waits (0 kept); a summary shows them; secret-looking or
+// malformed diagnostics are refused; an old-shape receipt keeps its exact
+// request JSON and replays; changed diagnostics under one request id are a
+// changed retry.
+func TestReleaseReceiptFailureDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	ms := func(v int64) *int64 { return &v }
+	merged := func(t *testing.T) (*Store, string, api.Agent, api.ReleaseJob, func(string, *api.ReleaseReceipt) (api.ReleaseJob, error)) {
+		s, task, h, d, entry := releaseFixture(t)
+		j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range []string{"claim", "merged"} {
+			if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+				t.Fatal(op, err)
+			}
+		}
+		generation := j.Generation
+		finish := func(id string, r *api.ReleaseReceipt) (api.ReleaseJob, error) {
+			return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: id, Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: generation, Receipt: r})
+		}
+		return s, task.ID, d, j, finish
+	}
+	s, task, _, j, finish := merged(t)
+	tailos := func() api.ReleaseTargetReceipt {
+		return api.ReleaseTargetReceipt{Target: "tailos", Release: "tailos-" + j.Commit[:12], ArtifactSHA256: strings.Repeat("a", 64), Outcome: "rolled_back", Rollback: "restored"}
+	}
+	valid := func() *api.ReleaseReceipt {
+		target := tailos()
+		target.Reason = "live verification failed"
+		target.LiveCheck = &api.ReleaseProbeWait{LastCommit: strings.Repeat("c", 40), WaitedMs: ms(90000)}
+		target.RollbackCheck = &api.ReleaseProbeWait{WaitedMs: ms(0)}
+		return &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "rolled_back", Targets: []api.ReleaseTargetReceipt{target},
+			Revert: &api.ReleaseRevert{Outcome: "failed"}, Failure: &api.ReleaseFailure{Step: "live-check", Target: "tailos", Reason: "live verification failed"}}
+	}
+	// a3: each is refused and leaves the job merged and unreceipted. Fake values only.
+	bad := map[string]func(*api.ReleaseReceipt){
+		"token word": func(r *api.ReleaseReceipt) {
+			r.Failure.Reason, r.Targets[0].Reason = "SYNTHETIC_PRIVATE_TOKEN", "SYNTHETIC_PRIVATE_TOKEN"
+		},
+		"bearer": func(r *api.ReleaseReceipt) {
+			r.Failure.Reason, r.Targets[0].Reason = "Bearer SYNTHETIC_PRIVATE_VALUE", ""
+		},
+		"password": func(r *api.ReleaseReceipt) {
+			r.Failure.Reason, r.Targets[0].Reason = "password: SYNTHETIC_PRIVATE_VALUE", ""
+		},
+		"equals sign":             func(r *api.ReleaseReceipt) { r.Failure.Reason, r.Targets[0].Reason = "key=SYNTHETIC_PRIVATE_VALUE", "" },
+		"newline":                 func(r *api.ReleaseReceipt) { r.Failure.Reason, r.Targets[0].Reason = "live\nverification failed", "" },
+		"161 characters":          func(r *api.ReleaseReceipt) { r.Failure.Reason, r.Targets[0].Reason = strings.Repeat("a", 161), "" },
+		"target reason only":      func(r *api.ReleaseReceipt) { r.Failure = nil },
+		"target reason differs":   func(r *api.ReleaseReceipt) { r.Targets[0].Reason = "live probe failed" },
+		"target reason elsewhere": func(r *api.ReleaseReceipt) { r.Failure.Target = "" },
+		"failure on release": func(r *api.ReleaseReceipt) {
+			r.Outcome, r.Revert, r.Targets[0].Outcome, r.Targets[0].Rollback, r.Targets[0].Reason = "released", nil, "released", "", ""
+		},
+		"step Deploy!":             func(r *api.ReleaseReceipt) { r.Failure.Step = "Deploy!" },
+		"target other":             func(r *api.ReleaseReceipt) { r.Failure.Target, r.Targets[0].Reason = "other", "" },
+		"lastCommit secret":        func(r *api.ReleaseReceipt) { r.Targets[0].LiveCheck.LastCommit = "SYNTHETIC_PRIVATE_TOKEN" },
+		"waitedMs -1":              func(r *api.ReleaseReceipt) { r.Targets[0].LiveCheck.WaitedMs = ms(-1) },
+		"waitedMs 3600001":         func(r *api.ReleaseReceipt) { r.Targets[0].RollbackCheck.WaitedMs = ms(3600001) },
+		"lastCommit uppercase hex": func(r *api.ReleaseReceipt) { r.Targets[0].LiveCheck.LastCommit = strings.Repeat("C", 40) },
+	}
+	for name, mutate := range bad {
+		r := valid()
+		mutate(r)
+		if _, err := finish("finish-bad-"+strings.ReplaceAll(name, " ", "-"), r); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if now, err := s.Release(ctx, task, j.ID); err != nil || now.State != "merged" || now.Receipt != nil || now.Generation != j.Generation {
+			t.Fatalf("%s left %s receipt=%v generation=%d: %v", name, now.State, now.Receipt, now.Generation, err)
+		}
+	}
+	// a1: the valid receipt is saved exactly, 0 included, and replays.
+	sent := valid()
+	final, err := finish("finish", sent)
+	if err != nil || final.State != "rolled_back" {
+		t.Fatal(final.State, err)
+	}
+	saved, err := s.Release(ctx, task, j.ID)
+	if err != nil || !reflect.DeepEqual(saved.Receipt, valid()) || saved.Receipt.Targets[0].RollbackCheck.WaitedMs == nil || *saved.Receipt.Targets[0].RollbackCheck.WaitedMs != 0 {
+		t.Fatalf("saved receipt %+v: %v", saved.Receipt, err)
+	}
+	if again, err := finish("finish", valid()); err != nil || again.Generation != final.Generation || !reflect.DeepEqual(again.Receipt, valid()) {
+		t.Fatal("replay", again.Generation, err)
+	}
+	// a7: the same request id with changed diagnostics is a changed retry.
+	changed := valid()
+	changed.Targets[0].LiveCheck.WaitedMs = ms(90001)
+	if _, err := finish("finish", changed); err == nil || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed diagnostics replay", err)
+	}
+	// a2: the settled summary, what tt deployment list prints, carries them.
+	summary := func(s *Store, task, id string) (api.ReleaseSummary, []byte) {
+		page, err := s.ReleasesPage(ctx, task, api.ReleaseListOptions{View: "settled", Limit: 200})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, job := range page.Jobs {
+			if job.ID == id {
+				b, err := json.Marshal(job)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return job, b
+			}
+		}
+		t.Fatal("no settled summary for", id)
+		return api.ReleaseSummary{}, nil
+	}
+	got, _ := summary(s, task, j.ID)
+	want := valid()
+	if got.Receipt == nil || !reflect.DeepEqual(got.Receipt.Failure, want.Failure) || len(got.Receipt.Targets) != 1 || got.Receipt.Targets[0].Reason != want.Targets[0].Reason || !reflect.DeepEqual(got.Receipt.Targets[0].LiveCheck, want.Targets[0].LiveCheck) || !reflect.DeepEqual(got.Receipt.Targets[0].RollbackCheck, want.Targets[0].RollbackCheck) {
+		t.Fatalf("settled summary %+v", got.Receipt)
+	}
+	// a5: an old-shape receipt (no new keys) finishes with unchanged request
+	// JSON, so its request hash is the one an older hub stored, and replays.
+	s2, task2, d2, j2, finish2 := merged(t)
+	old := &api.ReleaseReceipt{Version: 1, JobID: j2.ID, Commit: j2.Commit, VerificationDigest: j2.VerificationDigest, Outcome: "rolled_back", Revert: &api.ReleaseRevert{Outcome: "failed"},
+		Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "tailos-" + j2.Commit[:12], ArtifactSHA256: strings.Repeat("a", 64), Outcome: "rolled_back", Rollback: "restored"}}}
+	req, err := json.Marshal(api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d2.ID, RunID: d2.RunID, JobID: j2.ID, ExpectedGeneration: j2.Generation, Receipt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"failure"`, `"reason"`, `"liveCheck"`, `"rollbackCheck"`, `"waitedMs"`, `"lastCommit"`} {
+		if strings.Contains(string(req), key) {
+			t.Fatalf("old-shape request carries %s: %s", key, req)
+		}
+	}
+	first, err := finish2("finish", old)
+	if err != nil || first.State != "rolled_back" {
+		t.Fatal(first.State, err)
+	}
+	if again, err := finish2("finish", old); err != nil || again.Generation != first.Generation || !reflect.DeepEqual(again.Receipt, old) {
+		t.Fatal("old-shape replay", err)
+	}
+	if _, b := summary(s2, task2, j2.ID); strings.Contains(string(b), `"failure"`) || strings.Contains(string(b), `"reason"`) || strings.Contains(string(b), `"liveCheck"`) || strings.Contains(string(b), `"rollbackCheck"`) {
+		t.Fatalf("old-shape summary carries new keys: %s", b)
 	}
 }
 

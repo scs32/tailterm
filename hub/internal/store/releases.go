@@ -184,12 +184,7 @@ type releaseCursor struct {
 
 func releaseSummary(j api.ReleaseJob, row int64) api.ReleaseSummary {
 	out := api.ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
-	if j.Receipt != nil {
-		out.Receipt = &api.ReleaseSummaryReceipt{Outcome: j.Receipt.Outcome, Commit: j.Receipt.Commit, Targets: []api.ReleaseSummaryTarget{}}
-		for _, t := range j.Receipt.Targets {
-			out.Receipt.Targets = append(out.Receipt.Targets, api.ReleaseSummaryTarget{Target: t.Target, Outcome: t.Outcome})
-		}
-	}
+	out.Receipt = api.ReleaseSummaryOfReceipt(j.Receipt)
 	if j.Supersession != nil {
 		out.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
@@ -1065,6 +1060,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if err = validateReleaseRefEffects(r); err != nil {
 					return zero, err
 				}
+				if err = validateReleaseDiagnostics(r); err != nil {
+					return zero, err
+				}
 				j.Receipt = r
 				j.State = r.Outcome
 				j.SettledAt = ts(s.now())
@@ -1181,6 +1179,60 @@ func validateReleaseRefEffects(r *api.ReleaseReceipt) error {
 	}
 	if p := r.Push; p != nil {
 		if r.Outcome != "released" || p.Commit != r.Commit || (p.Outcome != "pushed" && p.Outcome != "failed") || p.Remote == "" || len(p.Remote) > 128 || strings.ContainsAny(p.Remote, "\x00\n\r /:@") {
+			return api.ErrInvalid
+		}
+	}
+	return nil
+}
+
+// The failure diagnostics a receipt may carry. A reason is the runner's
+// stable failure tag in its own character set, and never a word that names a
+// credential; a step is a lowercase token, so a later runner step is not
+// refused; a probe wait holds only a commit and a bounded time.
+var (
+	releaseReasonPattern     = regexp.MustCompile(`^[A-Za-z0-9 ,.:;()_/-]{1,160}$`)
+	releaseStepPattern       = regexp.MustCompile(`^[a-z][a-z-]{0,23}$`)
+	releaseLastCommitPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
+	releaseSecretWords       = []string{"token", "secret", "password", "passwd", "bearer", "authorization", "api key", "apikey", "private key"}
+)
+
+const releaseProbeWaitMaxMs = 3600000
+
+func validReleaseReason(reason string) bool {
+	if !releaseReasonPattern.MatchString(reason) {
+		return false
+	}
+	lower := strings.ToLower(reason)
+	for _, word := range releaseSecretWords {
+		if strings.Contains(lower, word) {
+			return false
+		}
+	}
+	return true
+}
+
+func validReleaseProbeWait(w *api.ReleaseProbeWait) bool {
+	return w == nil || ((w.LastCommit == "" || releaseLastCommitPattern.MatchString(w.LastCommit)) && (w.WaitedMs == nil || (*w.WaitedMs >= 0 && *w.WaitedMs <= releaseProbeWaitMaxMs)))
+}
+
+// validateReleaseDiagnostics checks the optional failure diagnostics: only on
+// a rolled_back or blocked receipt, a target reason only on the target the
+// failure names and equal to its reason, and nothing secret-looking.
+func validateReleaseDiagnostics(r *api.ReleaseReceipt) error {
+	f := r.Failure
+	if f != nil {
+		if r.Outcome == "released" || !releaseStepPattern.MatchString(f.Step) || !validReleaseReason(f.Reason) {
+			return api.ErrInvalid
+		}
+		if f.Target != "" && f.Target != "hub" && f.Target != "bridge" && f.Target != "mini" && f.Target != "tailos" {
+			return api.ErrInvalid
+		}
+	}
+	for _, t := range r.Targets {
+		if t.Reason != "" && (f == nil || f.Target != t.Target || t.Reason != f.Reason) {
+			return api.ErrInvalid
+		}
+		if !validReleaseProbeWait(t.LiveCheck) || !validReleaseProbeWait(t.RollbackCheck) {
 			return api.ErrInvalid
 		}
 	}

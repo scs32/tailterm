@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -1283,16 +1283,74 @@ test("R3 the TailOS rollback records the probe's last commit and wait, dropping 
  const junk=tailosAdapter([]);junk.artifacts.set("tailos",{rollbackSafe:true,rollbackProgram:[process.execPath,"-e","0"],rollbackProbe:probe({restored:true,databaseWritesPreserved:true,lastCommit:"<b>SYNTHETIC_PRIVATE_TOKEN</b>",waitedMs:-3})});
  assert.equal(await junk.rollback("tailos"),true);assert.deepEqual(junk.probeWait("tailos","rollback"),{lastCommit:null,waitedMs:null});
 });
-test("R4 a failed TailOS release journals both waits and escalates them without changing the receipt",async()=>{
+test("R4 a failed TailOS release journals both waits, escalates them and sends them in the receipt without nulls",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let receipt,escalation;
  const live={lastCommit:"c".repeat(40),waitedMs:90000},back={lastCommit:null,waitedMs:90000};
  a.check=async()=>"identity";a.probeWait=(t,kind)=>t==="tailos"?(kind==="live"?live:back):undefined;a.finish=async r=>{receipt=r;a.calls.push("finish");};a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
  await assert.rejects(runRelease(c,a),/inspect saved journal/);
- const effect=JSON.parse(readFileSync(c.journalPath,"utf8")).effects.find(e=>e.target==="tailos");
+ const journal=JSON.parse(readFileSync(c.journalPath,"utf8")),effect=journal.effects.find(e=>e.target==="tailos");
  assert.deepEqual(effect.liveCheck,live);assert.deepEqual(effect.rollbackCheck,back);
  assert.deepEqual(escalation.probeWaits,[{target:"tailos",probe:"live",...live},{target:"tailos",probe:"rollback",...back}]);
- assert.deepEqual(Object.keys(receipt).sort(),["commit","jobId","outcome","revert","targets","verificationDigest","version"]);
- assert.deepEqual(receipt.targets.map(t=>Object.keys(t).sort()),[["artifactSHA256","outcome","release","rollback","target"]]);
+ assert.deepEqual(Object.keys(receipt).sort(),["commit","failure","jobId","outcome","revert","targets","verificationDigest","version"]);
+ assert.deepEqual(receipt.failure,{step:"live-check",target:"tailos",reason:"live verification failed"});
+ assert.deepEqual(receipt.targets.map(t=>Object.keys(t).sort()),[["artifactSHA256","liveCheck","outcome","reason","release","rollback","rollbackCheck","target"]]);
+ assert.equal(receipt.targets[0].reason,"live verification failed");
+ assert.deepEqual(receipt.targets[0].liveCheck,{lastCommit:"c".repeat(40),waitedMs:90000});assert.deepEqual(receipt.targets[0].rollbackCheck,{waitedMs:90000});
+ assert.ok(!JSON.stringify(receipt).includes("null"));assert.deepEqual(journal.receipt,receipt,"the journal keeps the receipt a retried finish resends");
+});
+// wi_d4e96831ab3a0038: what a failed receipt carries, and what never reaches it.
+test("D1 a hub failure's receipt carries only the probe wait's time, never its polls or capture",async()=>{
+ const p=pairedRelease(),SECRET="SYNTHETIC_PRIVATE_TOKEN",wait={waitedMs:240000,polls:49,capture:{app:{state:SECRET},logs:[{service:"hub",lines:[SECRET]}]}};
+ p.a.check=async t=>t==="hub"?"identity":true;p.a.probeWait=t=>t==="hub"?wait:undefined;
+ await assert.rejects(runRelease(p.c,p.a),/failed/);
+ const r=p.receipt(),hub=r.targets.find(t=>t.target==="hub"),bridge=r.targets.find(t=>t.target==="bridge");
+ assert.deepEqual(r.failure,{step:"live-check",target:"hub",reason:"live verification failed"});
+ assert.equal(hub.reason,"live verification failed");assert.deepEqual(hub.liveCheck,{waitedMs:240000});assert.deepEqual(hub.rollbackCheck,{waitedMs:240000});
+ assert.equal(bridge.reason,undefined);assert.equal(bridge.liveCheck,undefined);
+ const text=JSON.stringify(r);for(const word of [SECRET,"polls","capture"])assert.ok(!text.includes(word),word);
+ assert.deepEqual(p.journal().effects.find(e=>e.target==="hub").liveCheck,wait,"the private journal keeps the capture");
+});
+test("D2 a secret-looking failure tag is sent as unclassified and never reaches the receipt",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let receipt;
+ a.deploy=async()=>{throw releaseError("SYNTHETIC_PRIVATE_TOKEN");};a.finish=async r=>{receipt=r;a.calls.push("finish");};
+ await assert.rejects(runRelease(c,a),/inspect saved journal/);
+ assert.deepEqual(receipt.failure,{step:"deploy",target:"tailos",reason:"unclassified"});assert.equal(receipt.targets[0].reason,"unclassified");
+ assert.ok(!JSON.stringify(receipt).includes("SYNTHETIC_PRIVATE_TOKEN"));
+ for(const bad of ["Bearer SYNTHETIC_PRIVATE_VALUE","password: x","an API key","key=value","a\nb","x".repeat(161),"",null,7])assert.equal(receiptReason(bad),"unclassified",String(bad));
+ assert.deepEqual(probeDiagnostics({lastCommit:null,waitedMs:null,polls:3}),undefined);assert.deepEqual(probeDiagnostics({lastCommit:"C".repeat(40),waitedMs:-1}),undefined);
+ assert.deepEqual(probeDiagnostics({lastCommit:"c".repeat(40),waitedMs:0,capture:{}}),{lastCommit:"c".repeat(40),waitedMs:0});assert.deepEqual(probeDiagnostics({waitedMs:3600001}),undefined);
+});
+test("D3 a released receipt keeps exactly today's keys, whatever its probes waited",async()=>{
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let receipt;
+ a.probeWait=()=>({lastCommit:"c".repeat(40),waitedMs:9000});a.finish=async r=>{receipt=r;a.calls.push("finish");};
+ await runRelease(c,a);
+ assert.equal(receipt.outcome,"released");assert.deepEqual(Object.keys(receipt).sort(),["commit","jobId","outcome","push","targets","verificationDigest","version"]);
+ assert.deepEqual(receipt.targets.map(t=>Object.keys(t).sort()),[["artifactSHA256","outcome","release","target"]]);
+});
+test("D4 every fixed release tag passes the receipt's reason rule unchanged, so the hub never refuses one",()=>{
+ const scripts=readdirSync(join(REPO,"scripts")).filter(n=>/^release-.*\.mjs$/.test(n)),tags=new Set();
+ for(const name of scripts)for(const m of readFileSync(join(REPO,"scripts",name),"utf8").matchAll(/releaseError\(("(?:[^"\\]|\\.)*"|`[^`$]*`)/g))tags.add(m[1].startsWith("`")?m[1].slice(1,-1):JSON.parse(m[1]));
+ tags.add(uncoveredReason);
+ assert.ok(tags.size>50,String(tags.size));
+ for(const tag of tags)assert.equal(receiptReason(tag),tag,tag);
+});
+test("D5 native finish and reconcile compare the receipt sent, or it without diagnostics when the hub saved none",()=>{
+ const commit="e".repeat(40),old={version:1,jobId:"rel_fixture",commit,verificationDigest:"f".repeat(64),outcome:"rolled_back",revert:{outcome:"failed"},targets:[{target:"tailos",release:"tailos-x",artifactSHA256:"a".repeat(64),outcome:"rolled_back",rollback:"restored"}]};
+ const diagnosed={...old,failure:{step:"live-check",target:"tailos",reason:"live verification failed"},targets:[{...old.targets[0],reason:"live verification failed",liveCheck:{lastCommit:"c".repeat(40),waitedMs:90000},rollbackCheck:{waitedMs:0}}]};
+ const other={...diagnosed,targets:[{...diagnosed.targets[0],rollbackCheck:{waitedMs:1}}]},otherIdentity={...old,targets:[{...old.targets[0],artifactSHA256:"b".repeat(64)}]};
+ assert.deepEqual(withoutDiagnostics(diagnosed),old);
+ const prior={id:"rel_fixture",taskId:"tsk_fixture",entryId:"tqe_fixture",itemId:"wi_fixture",itemRevision:1,scopeRevision:1,orderMessageSeq:1,repository:"r",baseCommit:"b".repeat(40),commit:"c".repeat(40),verificationDigest:"f".repeat(64),pauseGeneration:1,state:"merged",generation:2,agentId:"agt_fixture",runId:"run_fixture",integratedCommit:commit,published:true};
+ const finish=(sent,saved)=>validateNativeRelease(prior,{...prior,state:"rolled_back",generation:3,receipt:saved},"finish",2,[],sent);
+ const home=mkdtempSync(join(tmpdir(),"receipt-compare-")),reconcile=(sent,saved)=>{
+  writeFileSync(join(home,"rel_fixture.json"),JSON.stringify({jobId:"rel_fixture",commit:prior.commit,agentId:prior.agentId,runId:prior.runId,phase:"receipt_pending",finishGeneration:2,receipt:sent}));
+  reconcileReceipts({journalDirectory:home},[{...prior,state:"rolled_back",generation:3,receipt:saved}]);
+  return JSON.parse(readFileSync(join(home,"rel_fixture.json"),"utf8")).phase;
+ };
+ for(const [sent,saved] of [[old,old],[diagnosed,diagnosed],[diagnosed,old]]){assert.equal(finish(sent,saved).receipt,saved);assert.equal(reconcile(sent,saved),"complete");}
+ assert.ok(sameReceipt(diagnosed,structuredClone(diagnosed)));assert.ok(!sameReceipt(old,diagnosed),"a saved diagnostic never matches a receipt sent without it");
+ for(const [sent,saved] of [[diagnosed,other],[old,diagnosed],[diagnosed,otherIdentity],[old,otherIdentity]]){
+  assert.throws(()=>finish(sent,saved),/Native full receipt mismatch/);assert.throws(()=>reconcile(sent,saved),/Saved release receipt does not match pending journal/);
+ }
 });
 test("R5 the escalation names the TailOS waits and never echoes release.json content",async()=>{
  const cwd=mkdtempSync(join(tmpdir(),"escalate-tailos-")),calls=[];const adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};

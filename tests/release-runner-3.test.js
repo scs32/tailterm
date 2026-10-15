@@ -186,7 +186,7 @@ test("g2 the four named adapter refusals carry their tag and a prepare refusal j
   const host=new HostAdapter({cwd:g.cwd,journalDirectory:dirname(c.journalPath),baselines:c.baselines,targets:{tailos:{}}},{...j});importInputs(host,j.commit,{});a.prepare=(t,commit)=>host.prepare(t,commit);
  },/Release failed/);
  assert.deepEqual(r.journal.failure,{step:"prepare",target:"tailos",reason:"Exact job target input required"});assert.deepEqual(r.journal.failureDetail,{text:"Exact job target input required"});
- assert.deepEqual(Object.keys(r.journal.receipt).sort(),["commit","jobId","outcome","revert","targets","verificationDigest","version"]);
+ assert.deepEqual(Object.keys(r.journal.receipt).sort(),["commit","failure","jobId","outcome","revert","targets","verificationDigest","version"]);assert.deepEqual(r.journal.receipt.failure,r.journal.failure);
 });
 test("g7 the journal keeps a failure's validated text and nothing that was not validated",async()=>{
  const start=()=>{const f=fixture();return [f,job(f,change(f,"client/a.js","a"))];},absent=(text,...words)=>{for(const w of words)assert.ok(!text.includes(w),w);};

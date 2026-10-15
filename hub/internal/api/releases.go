@@ -98,12 +98,30 @@ type ReleaseSummary struct {
 type ReleaseSummaryReceipt struct {
 	Outcome string                 `json:"outcome"`
 	Commit  string                 `json:"commit"`
+	Failure *ReleaseFailure        `json:"failure,omitempty"`
 	Targets []ReleaseSummaryTarget `json:"targets"`
 }
 type ReleaseSummaryTarget struct {
-	Target  string `json:"target"`
-	Outcome string `json:"outcome"`
+	Target        string            `json:"target"`
+	Outcome       string            `json:"outcome"`
+	Reason        string            `json:"reason,omitempty"`
+	LiveCheck     *ReleaseProbeWait `json:"liveCheck,omitempty"`
+	RollbackCheck *ReleaseProbeWait `json:"rollbackCheck,omitempty"`
 }
+
+// ReleaseSummaryOfReceipt is the compact projection of a receipt that a
+// summary carries: outcomes plus the optional failure diagnostics.
+func ReleaseSummaryOfReceipt(r *ReleaseReceipt) *ReleaseSummaryReceipt {
+	if r == nil {
+		return nil
+	}
+	out := &ReleaseSummaryReceipt{Outcome: r.Outcome, Commit: r.Commit, Failure: r.Failure, Targets: []ReleaseSummaryTarget{}}
+	for _, t := range r.Targets {
+		out.Targets = append(out.Targets, ReleaseSummaryTarget{Target: t.Target, Outcome: t.Outcome, Reason: t.Reason, LiveCheck: t.LiveCheck, RollbackCheck: t.RollbackCheck})
+	}
+	return out
+}
+
 type ReleaseSummarySupersession struct {
 	ReleasedCommit string   `json:"releasedCommit"`
 	Targets        []string `json:"targets"`
@@ -330,6 +348,13 @@ type ReleaseTargetReceipt struct {
 	Deployment             string `json:"deployment,omitempty"`
 	Outcome                string `json:"outcome"`
 	Rollback               string `json:"rollback,omitempty"`
+	// Optional failure diagnostics, only on a rolled_back or blocked receipt
+	// and never captured output: the failure reason when this target is the
+	// one that failed, and the last commit seen and time waited by its live
+	// and rollback probes. Absent, the receipt keeps its older shape and hash.
+	Reason        string            `json:"reason,omitempty"`
+	LiveCheck     *ReleaseProbeWait `json:"liveCheck,omitempty"`
+	RollbackCheck *ReleaseProbeWait `json:"rollbackCheck,omitempty"`
 }
 type ReleaseReceipt struct {
 	Version            int                    `json:"version"`
@@ -341,6 +366,24 @@ type ReleaseReceipt struct {
 	EscalationSeq      int64                  `json:"escalationSeq,omitempty"`
 	Revert             *ReleaseRevert         `json:"revert,omitempty"`
 	Push               *ReleasePush           `json:"push,omitempty"`
+	// Failure is the first failed step of a rolled_back or blocked release.
+	Failure *ReleaseFailure `json:"failure,omitempty"`
+}
+
+// ReleaseFailure is the first failed step of a release. Reason is the
+// runner's stable failure tag: a fixed, non-secret text, never output.
+type ReleaseFailure struct {
+	Step   string `json:"step"`
+	Target string `json:"target,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// ReleaseProbeWait is what a live or rollback probe saw: the last commit it
+// read and the time it waited. Never its capture or poll count. WaitedMs is a
+// pointer so that 0 survives the round trip.
+type ReleaseProbeWait struct {
+	LastCommit string `json:"lastCommit,omitempty"`
+	WaitedMs   *int64 `json:"waitedMs,omitempty"`
 }
 
 // ReleaseRevert records the compare-and-swap revert of a rolled-back release
@@ -531,12 +574,7 @@ func releaseSettled(state string) bool {
 // this projection detects changes to every pin, not just state/generation.
 func compatibilitySummary(j ReleaseJob, row int64) ReleaseSummary {
 	s := ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
-	if j.Receipt != nil {
-		s.Receipt = &ReleaseSummaryReceipt{Outcome: j.Receipt.Outcome, Commit: j.Receipt.Commit, Targets: []ReleaseSummaryTarget{}}
-		for _, t := range j.Receipt.Targets {
-			s.Receipt.Targets = append(s.Receipt.Targets, ReleaseSummaryTarget{Target: t.Target, Outcome: t.Outcome})
-		}
-	}
+	s.Receipt = ReleaseSummaryOfReceipt(j.Receipt)
 	if j.Supersession != nil {
 		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
