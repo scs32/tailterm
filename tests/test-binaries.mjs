@@ -43,6 +43,8 @@ export async function fileHash(file) {
 
 export async function prepareTestBinary({ root = process.cwd(), target, output, historicalCommit, manifestPath = process.env.TAILTERM_TEST_BINARIES, onBuild, env = buildEnvironment() }) {
   if (!(["hub", "tt"].includes(target))) throw new Error("Unknown test binary target");
+  // A passed environment gets the same filter as the inherited one.
+  env = buildEnvironment(env);
   const source = await sourceIdentity(root);
   if (manifestPath) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
