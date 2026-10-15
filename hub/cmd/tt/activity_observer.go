@@ -107,6 +107,11 @@ type activityCursor struct {
 	// (claude_wake.go), which copies only the maps and Completed, shares
 	// nothing a later check changes.
 	Background []backgroundActivityTask `json:"background,omitempty"`
+	// BackgroundEnded holds the ids of tasks whose end was recorded while they
+	// were not in Background, oldest first, so a launch result recorded after
+	// its own end is not added (bug wi_b314c7da2ba04afc). It is bounded by
+	// maxBackgroundTasks, copy-on-write like Background, and reset with it.
+	BackgroundEnded []string `json:"backgroundEnded,omitempty"`
 	// ClaudeQueued counts input Claude Code queued while busy (queue-operation
 	// enqueue) that no dequeue or remove has taken yet. ClaudeQueuedAt is the
 	// latest enqueue. A real user prompt resets both, which bounds drift from
@@ -266,7 +271,7 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 		c.TokensVerified = c.Tokens == (api.TokenTotals{}) && len(c.ClaudeUsage) == 0
 		c.Pending = map[string]pendingActivityCall{}
 		c.Completed = nil
-		c.Background = nil
+		c.Background, c.BackgroundEnded = nil, nil
 		c.SeenTurn, c.TurnComplete, c.TurnEndReason = false, false, ""
 		c.ClaudeQueued, c.ClaudeQueuedAt = 0, time.Time{}
 		c.Model, c.ProviderBlock = "", nil
@@ -709,12 +714,13 @@ func claudeTaskNotifications(text string) []claudeTaskNotification {
 }
 
 // addBackgroundTask records a launched background task. The set stays sorted
-// by launch time, and a new slice is always assigned.
+// by launch time, and a new slice is always assigned. A task whose end was
+// already recorded is not added.
 func addBackgroundTask(c *activityCursor, task backgroundActivityTask) {
 	if !claudeBackgroundTaskID.MatchString(task.ID) || len(c.Background) >= maxBackgroundTasks {
 		return
 	}
-	if slices.ContainsFunc(c.Background, func(t backgroundActivityTask) bool { return t.ID == task.ID }) {
+	if slices.ContainsFunc(c.Background, func(t backgroundActivityTask) bool { return t.ID == task.ID }) || slices.Contains(c.BackgroundEnded, task.ID) {
 		return
 	}
 	i := len(c.Background)
@@ -725,9 +731,15 @@ func addBackgroundTask(c *activityCursor, task backgroundActivityTask) {
 }
 
 // endBackgroundTask removes an ended background task without changing the old
-// slice in place.
+// slice in place. The end of a task not in the set, such as a notice recorded
+// before its launch result, is remembered instead, dropping the oldest id past
+// maxBackgroundTasks.
 func endBackgroundTask(c *activityCursor, id string) {
 	if !slices.ContainsFunc(c.Background, func(t backgroundActivityTask) bool { return t.ID == id }) {
+		if claudeBackgroundTaskID.MatchString(id) && !slices.Contains(c.BackgroundEnded, id) {
+			drop := max(len(c.BackgroundEnded)-maxBackgroundTasks+1, 0)
+			c.BackgroundEnded = append(slices.Clone(c.BackgroundEnded[drop:]), id)
+		}
 		return
 	}
 	c.Background = slices.DeleteFunc(slices.Clone(c.Background), func(t backgroundActivityTask) bool { return t.ID == id })

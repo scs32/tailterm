@@ -2337,6 +2337,101 @@ func TestActivityBackgroundTaskRebuildFromZero(t *testing.T) {
 	}
 }
 
+// t1/t2 (bug wi_b314c7da2ba04afc): a final notice recorded before its task's
+// launch result keeps the task out of the running set, also across a saved
+// cursor; the remembered ends are bounded and reset with the transcript.
+func TestActivityBackgroundTaskEndBeforeLaunch(t *testing.T) {
+	threshold := activityThresholds{Working: 120 * time.Second, Hung: 10 * time.Minute, Loop: 5 * time.Minute, LoopCalls: 5, CrashProbe: 15 * time.Second, Background: time.Hour}
+	running := api.Agent{Status: api.AgentRunning}
+	for name, notice := range map[string]string{
+		"queued notice": bgFixtureQueued(2*time.Second, "enqueue", "b0fixture", "completed"),
+		"idle notice":   bgFixtureIdleNotice(2*time.Second, "b0fixture", "failed"),
+	} {
+		launch := bgFixtureLaunch(time.Second, "toolu_bg_a", "b0fixture", false)
+		records := append([]string{bgFixturePrompt(0), launch[0], notice, launch[1]}, bgFixtureEndTurn(5*time.Second)...)
+		path := filepath.Join(t.TempDir(), "synthetic.jsonl")
+		// The relay saves its cursor between the notice and the launch result.
+		if err := os.WriteFile(path, []byte(strings.Join(records[:3], "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var c activityCursor
+		if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c = activityCursor{}
+		if err := json.Unmarshal(data, &c); err != nil {
+			t.Fatal(err)
+		}
+		appendBgFixture(t, path, records[3:]...)
+		if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil {
+			t.Fatal(err)
+		}
+		if c.Background != nil || !slices.Equal(c.BackgroundEnded, []string{"b0fixture"}) || !c.TurnComplete {
+			t.Fatalf("%s: running %+v ended %v turn complete %v", name, c.Background, c.BackgroundEnded, c.TurnComplete)
+		}
+		if got := activityState(&c, running, 0, true, true, nil, bgFixtureStart.Add(time.Minute), threshold); got.State != "idle" || got.Reason != "" {
+			t.Fatalf("%s: %+v, want idle", name, got)
+		}
+		// Another task launched later still runs.
+		parseBgFixture(t, &c, bgFixtureLaunch(10*time.Second, "toolu_bg_b", "b1fixture", false)...)
+		if ids := bgFixtureIDs(&c); !slices.Equal(ids, []string{"b1fixture"}) {
+			t.Fatalf("%s: later launch %v", name, ids)
+		}
+		// A replacement transcript forgets the remembered ends.
+		if err := os.WriteFile(path+".new", []byte(bgFixturePrompt(0)+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(path+".new", path); err != nil {
+			t.Fatal(err)
+		}
+		if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil {
+			t.Fatal(err)
+		}
+		if c.Background != nil || c.BackgroundEnded != nil {
+			t.Fatalf("%s: replaced transcript kept %+v %v", name, c.Background, c.BackgroundEnded)
+		}
+	}
+
+	// A TaskStop before the launch result counts as an end too.
+	var stopped activityCursor
+	launch := bgFixtureLaunch(time.Second, "toolu_bg_a", "b0fixture", false)
+	parseBgFixture(t, &stopped, bgFixturePrompt(0), launch[0])
+	parseBgFixture(t, &stopped, bgFixtureTaskStop(2*time.Second, "toolu_stop", "b0fixture", false)...)
+	parseBgFixture(t, &stopped, launch[1])
+	if stopped.Background != nil {
+		t.Fatalf("stop before launch: %+v", stopped.Background)
+	}
+
+	// The remembered ends hold at most maxBackgroundTasks ids, oldest dropped,
+	// with no repeats or invalid ids, and are never changed in place.
+	var full activityCursor
+	for i := 0; i < maxBackgroundTasks; i++ {
+		parseBgFixture(t, &full, bgFixtureQueued(time.Duration(i)*time.Second, "enqueue", fmt.Sprintf("be%07d", i), "killed"))
+	}
+	parseBgFixture(t, &full, bgFixtureQueued(time.Minute, "enqueue", "be0000000", "completed"), bgFixtureQueued(time.Minute, "enqueue", "bad id/../x", "completed"))
+	snapshot := full.BackgroundEnded
+	if len(snapshot) != maxBackgroundTasks || snapshot[0] != "be0000000" {
+		t.Fatalf("ends kept %d ids, first %v", len(snapshot), snapshot[:1])
+	}
+	parseBgFixture(t, &full, bgFixtureQueued(2*time.Minute, "enqueue", fmt.Sprintf("be%07d", maxBackgroundTasks), "completed"))
+	if n := len(full.BackgroundEnded); n != maxBackgroundTasks || full.BackgroundEnded[0] != "be0000001" || full.BackgroundEnded[n-1] != fmt.Sprintf("be%07d", maxBackgroundTasks) {
+		t.Fatalf("past the cap: %d ids, first %s last %s", n, full.BackgroundEnded[0], full.BackgroundEnded[n-1])
+	}
+	if snapshot[0] != "be0000000" || snapshot[maxBackgroundTasks-1] != fmt.Sprintf("be%07d", maxBackgroundTasks-1) {
+		t.Fatalf("earlier slice changed: %v ... %v", snapshot[0], snapshot[maxBackgroundTasks-1])
+	}
+	// The dropped id launches again; a remembered one does not.
+	parseBgFixture(t, &full, bgFixtureLaunch(3*time.Minute, "toolu_dropped", "be0000000", false)...)
+	parseBgFixture(t, &full, bgFixtureLaunch(4*time.Minute, "toolu_kept", "be0000001", false)...)
+	if ids := bgFixtureIDs(&full); !slices.Equal(ids, []string{"be0000000"}) {
+		t.Fatalf("launches after the cap: %v", ids)
+	}
+}
+
 func bgFixtureCursor(open bool, since ...time.Time) activityCursor {
 	c := activityCursor{SeenTurn: true, TurnComplete: !open, LastEventAt: bgFixtureStart}
 	for i, at := range since {
