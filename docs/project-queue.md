@@ -1365,7 +1365,7 @@ queue scope` for ownership; a different order needs a new entry.
 ### Requeue a failed entry
 
 `tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small]
-[--owns PATH...] [--cwd DIR]` retries an item whose entry failed. It adds a
+[--owns PATH...] [--cwd DIR [--unmerged-head]]` retries an item whose entry failed. It adds a
 new entry for the same item: a new entry ID at the end of the queue, `attempt`
 one higher than the failed entry's, `retryOf` naming it, bound to the item's
 current revision. The failed entry is not modified and stays as history with
@@ -1387,7 +1387,22 @@ Preconditions, each refused with a 409 naming the entry:
 The attempt copies the failed entry's order, template, host, checkout,
 repository, ownership and base commit unless a flag overrides them. `--cwd DIR`
 names another checkout of the same repository on the launch host and takes its
-HEAD as the base.
+HEAD as the base. The usual fix for any refusal below is a fresh worktree at
+the current tasks-hub tip, `git worktree add --detach DIR tasks-hub`, passed as
+`--cwd DIR`.
+
+A HEAD with commits that are not on `refs/heads/tasks-hub` may be the failed
+attempt's own unreviewed work. Taken as the base, those commits would sit below
+the new attempt's acceptance range and escape review, so for an entry with a
+repository `--cwd DIR` refuses such a HEAD before the hub call and queues
+nothing: `entry tqe_ID: HEAD SHA of DIR has commits not on tasks-hub, which may
+be a failed attempt's unreviewed work; create a fresh worktree at the current
+tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR, or
+pass --unmerged-head to take that HEAD as the base`. `--unmerged-head` is the
+explicit opt-in: with it the requeue takes that HEAD as the base. A HEAD at the
+tasks-hub tip or behind it proceeds without the flag. A repository with no
+local `tasks-hub` branch is not checked. `--unmerged-head` is refused without
+`--cwd`.
 
 Without `--cwd`, an entry with a repository keeps its checkout and base, so
 the CLI checks both before it asks the hub, and a refusal queues nothing:
@@ -1403,12 +1418,21 @@ the CLI checks both before it asks the hub, and a refusal queues nothing:
   worktree`.
 - When the checkout exists but its HEAD is not the copied base (the worktree
   was recreated or moved on since the failed attempt), it refuses and names
-  both commits: `entry tqe_ID's base BASE is not the HEAD HEAD of its
-  checkout; pass --cwd DIR to take that HEAD as the base`. A running entry's
-  base cannot be changed, so a stale one is stopped here. When HEAD equals the
-  base, the requeue proceeds and keeps both.
+  both commits: `entry tqe_ID's base BASE is not the HEAD HEAD of its checkout
+  DIR, which may hold the failed attempt's unreviewed commits; create a fresh
+  worktree at the current tasks-hub tip (git worktree add --detach DIR
+  tasks-hub) and pass --cwd DIR`. It does not offer the copied checkout as
+  `--cwd`, since its HEAD may carry the failed team's commits. A running
+  entry's base cannot be changed, so a stale one is stopped here. When HEAD
+  equals the base, the requeue proceeds and keeps both.
 
-An entry with no repository is not checked. The attempt passes the same checks
+An entry with no repository has no base, but it still copies its working
+directory. Without `--cwd`, run on the launch host, a directory that no longer
+exists is refused: `entry tqe_ID's working directory DIR is not a directory;
+pass --cwd DIR to name an existing one`. Run from another host it is refused as
+for an entry with a repository. An existing directory proceeds and is kept.
+
+The attempt passes the same checks
 as `add`: a `small` attempt needs a bug and at most three owned paths, and
 `--template planned` retries a failed small entry as Planned delivery. The
 owner's unbound CLI or any available database handler may requeue.

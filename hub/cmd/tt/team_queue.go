@@ -90,6 +90,24 @@ func addQueueWorktree(checkout, item, commit string) (string, error) {
 	return path, nil
 }
 
+// requeueHeadOnTasksHub refuses a requeue checkout whose HEAD has commits not
+// on refs/heads/tasks-hub. A repository with no tasks-hub branch is not
+// checked.
+func requeueHeadOnTasksHub(dir, head string) error {
+	const ref = "refs/heads/tasks-hub"
+	if exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() != nil {
+		return nil
+	}
+	err := exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", head, ref).Run()
+	if err == nil {
+		return nil
+	}
+	if gitExitCode(err) != 1 {
+		return fmt.Errorf("check HEAD %s of %s against tasks-hub: %w", head, dir, err)
+	}
+	return fmt.Errorf("HEAD %s of %s has commits not on tasks-hub, which may be a failed attempt's unreviewed work; create a fresh worktree at the current tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR, or pass --unmerged-head to take that HEAD as the base", head, dir)
+}
+
 // repairQueueWorktree recreates an entry's missing queue worktree, detached at
 // its frozen base, when the entry's cwd is exactly that worktree's path.
 func repairQueueWorktree(q api.TeamQueueEntry, ownership []string) (string, error) {
@@ -160,6 +178,7 @@ func cmdTeamQueue(e env, args []string) error {
 	newWorktree := fs.Bool("new-worktree", false, "add, scope: create the entry's own detached worktree under .build/worktrees (scope: at its frozen base)")
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
 	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
+	unmergedHead := fs.Bool("unmerged-head", false, "requeue --cwd: take a HEAD with commits not on tasks-hub as the base")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry; wait clear: why the wait is cleared")
 	waitOn := fs.String("on", "", "wait: the predecessor queue entry ID")
 	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released")
@@ -197,6 +216,9 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	if sub != "add" && *plannedReason != "" {
 		return errors.New("--planned-reason applies only to tt team queue add")
+	}
+	if *unmergedHead && (sub != "requeue" || *cwd == "") {
+		return errors.New("--unmerged-head applies only to tt team queue requeue --cwd DIR")
 	}
 	e.task, e.hub = *task, *hub
 	c, err := e.client(20 * time.Second)
@@ -664,12 +686,12 @@ func cmdTeamQueue(e env, args []string) error {
 			fs.Visit(func(f *flag.Flag) { templateGiven = templateGiven || f.Name == "template" })
 			if templateGiven {
 				if *template != "planned" && *template != "small" {
-					return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR]")
+					return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR [--unmerged-head]]")
 				}
 				req.Template = *template
 			}
 			if *order < 0 {
-				return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR]")
+				return errors.New("usage: tt team queue requeue --entry tqe_ID [--order SEQ] [--template planned|small] [--owns PATH...] [--cwd DIR [--unmerged-head]]")
 			}
 			req.OrderMessageSeq, req.Ownership = *order, ownership
 			if *cwd != "" {
@@ -700,28 +722,44 @@ func cmdTeamQueue(e env, args []string) error {
 					if req.BaseCommit, err = queueGitCommit(abs); err != nil {
 						return err
 					}
+					// A HEAD with commits not on tasks-hub may be a failed
+					// attempt's unreviewed work, which would become part of
+					// the base and escape review; the caller must say so.
+					if !*unmergedHead {
+						if err := requeueHeadOnTasksHub(abs, req.BaseCommit); err != nil {
+							return fmt.Errorf("entry %s: %w", q.ID, err)
+						}
+					}
 				}
-			} else if q.Repository != "" && q.Cwd != "" {
-				// The attempt would copy the failed entry's checkout and base.
-				// A checkout that was cleaned fails the launch, and a base
-				// behind the checkout's HEAD cannot be changed once the team
-				// is admitted, so both are refused before the hub call.
+			} else if q.Cwd != "" {
+				// The attempt would copy the failed entry's checkout (and, with
+				// a repository, its base). A checkout that was cleaned fails
+				// the launch, and a base behind the checkout's HEAD cannot be
+				// changed once the team is admitted, so both are refused
+				// before the hub call.
 				if q.Host != spawn.Host() {
 					return fmt.Errorf("entry %s launches on %s, so its checkout %s cannot be checked from this host; requeue it from %s, or pass --cwd DIR there to name a fresh worktree", q.ID, q.Host, q.Cwd, q.Host)
 				}
 				if info, statErr := os.Stat(q.Cwd); statErr != nil || !info.IsDir() {
+					if q.Repository == "" {
+						return fmt.Errorf("entry %s's working directory %s is not a directory; pass --cwd DIR to name an existing one", q.ID, q.Cwd)
+					}
 					return fmt.Errorf("entry %s's checkout %s is not a directory; create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd)
 				}
-				head, headErr := queueGitCommit(q.Cwd)
-				if headErr != nil {
-					return fmt.Errorf("entry %s's checkout %s has no readable HEAD (%v); create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd, headErr)
-				}
-				if head != q.BaseCommit {
-					return fmt.Errorf("entry %s's base %s is not the HEAD %s of its checkout; pass --cwd %s to take that HEAD as the base", q.ID, q.BaseCommit, head, q.Cwd)
-				}
-				if len(ownership) > 0 {
-					if _, scopeErr := queueRepositoryScope(q.Cwd, ownership); scopeErr != nil {
-						return scopeErr
+				if q.Repository != "" {
+					head, headErr := queueGitCommit(q.Cwd)
+					if headErr != nil {
+						return fmt.Errorf("entry %s's checkout %s has no readable HEAD (%v); create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd, headErr)
+					}
+					if head != q.BaseCommit {
+						// That HEAD may hold the failed attempt's own commits,
+						// so it is not offered as the new base.
+						return fmt.Errorf("entry %s's base %s is not the HEAD %s of its checkout %s, which may hold the failed attempt's unreviewed commits; create a fresh worktree at the current tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR", q.ID, q.BaseCommit, head, q.Cwd)
+					}
+					if len(ownership) > 0 {
+						if _, scopeErr := queueRepositoryScope(q.Cwd, ownership); scopeErr != nil {
+							return scopeErr
+						}
 					}
 				}
 			}

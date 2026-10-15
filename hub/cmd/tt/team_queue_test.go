@@ -1944,7 +1944,10 @@ func TestTeamQueueCLIRequeueChecksCopiedCheckoutAndBase(t *testing.T) {
 	git(q.Cwd, "commit", "-q", "--allow-empty", "-m", "moved")
 	moved := git(q.Cwd, "rev-parse", "HEAD")
 	_, err = requeue(q)
-	refused("HEAD differs from the base", q, err, "base "+base, "HEAD "+moved, "pass --cwd "+q.Cwd)
+	refused("HEAD differs from the base", q, err, "base "+base, "HEAD "+moved, "may hold the failed attempt's unreviewed commits", "fresh worktree at the current tasks-hub tip", "pass --cwd DIR")
+	if strings.Contains(err.Error(), "pass --cwd "+q.Cwd) {
+		t.Fatalf("the stale base refusal offers the copied checkout's HEAD as the base: %v", err)
+	}
 
 	// The copied checkout was cleaned.
 	git(repo, "worktree", "remove", "--force", q.Cwd)
@@ -2000,5 +2003,143 @@ func TestTeamQueueCLIRequeueChecksCopiedCheckoutAndBase(t *testing.T) {
 	}
 	if got := attempts(cleaned.ItemID); len(got) != 2 {
 		t.Fatalf("attempts after --cwd: %+v", got)
+	}
+
+	// With a tasks-hub branch, --cwd refuses a HEAD with commits not on it
+	// unless --unmerged-head says so; a HEAD on tasks-hub proceeds.
+	git(repo, "branch", "tasks-hub", base)
+	unmergedItem, unmergedOrder := queueFixtureItem(t, f, "requeue-unmerged")
+	unmerged := failedEntry("queue-unmerged", unmergedItem.ID, unmergedOrder, spawn.Host())
+	git(unmerged.Cwd, "commit", "-q", "--allow-empty", "-m", "failed attempt's work")
+	unreviewed := git(unmerged.Cwd, "rev-parse", "HEAD")
+	_, err = requeue(unmerged, "--cwd", unmerged.Cwd)
+	refused("HEAD not on tasks-hub", unmerged, err, "HEAD "+unreviewed, "has commits not on tasks-hub", "fresh worktree at the current tasks-hub tip", "pass --cwd DIR", "--unmerged-head")
+	_, err = requeue(unmerged, "--unmerged-head")
+	refused("--unmerged-head without --cwd", unmerged, err, "--unmerged-head applies only to tt team queue requeue --cwd DIR")
+	if out, err = requeue(unmerged, "--cwd", unmerged.Cwd, "--unmerged-head"); err != nil {
+		t.Fatalf("requeue with --unmerged-head: %q %v", out, err)
+	}
+	if got := attempts(unmerged.ItemID); len(got) != 2 {
+		t.Fatalf("attempts after --unmerged-head: %+v", got)
+	}
+	for _, e := range attempts(unmerged.ItemID) {
+		if e.ID != unmerged.ID && (e.RetryOf != unmerged.ID || e.Cwd != unmerged.Cwd || e.BaseCommit != unreviewed) {
+			t.Fatalf("attempt requeued with --unmerged-head %+v", e)
+		}
+	}
+	// A HEAD at the tasks-hub tip, and one behind it, proceed unflagged.
+	git(repo, "branch", "-f", "tasks-hub", moved)
+	for _, c := range []struct{ key, at string }{{"tip", moved}, {"behind", base}} {
+		item, order := queueFixtureItem(t, f, "requeue-on-hub-"+c.key)
+		failed := failedEntry("queue-on-hub-"+c.key, item.ID, order, spawn.Host())
+		dir := filepath.Join(repo, ".build", "worktrees", "queue-on-hub-"+c.key+"-fresh")
+		git(repo, "worktree", "add", "-q", "--detach", dir, c.at)
+		if out, err = requeue(failed, "--cwd", dir); err != nil {
+			t.Fatalf("requeue --cwd at tasks-hub %s: %q %v", c.key, out, err)
+		}
+		for _, e := range attempts(item.ID) {
+			if e.ID != failed.ID && (e.Cwd != dir || e.BaseCommit != c.at) {
+				t.Fatalf("attempt requeued at tasks-hub %s %+v", c.key, e)
+			}
+		}
+		if got := attempts(item.ID); len(got) != 2 {
+			t.Fatalf("attempts after --cwd at tasks-hub %s: %+v", c.key, got)
+		}
+	}
+}
+
+func TestTeamQueueCLIRequeueChecksCopiedDirectoryWithoutRepository(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	// A serial project (the default) admits an entry with no repository.
+	// failedEntry queues a serial item with no repository in dir on host,
+	// then fails and releases the entry.
+	failedEntry := func(key, item string, order int64, host, dir string) api.TeamQueueEntry {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key + "-add", Operation: "add", ItemID: item, OrderMessageSeq: order, Host: host, Cwd: dir, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.Repository != "" {
+			t.Fatalf("fixture entry has a repository: %+v", q)
+		}
+		if q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key + "-fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+			t.Fatal(err)
+		}
+		if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	requeue := func(q api.TeamQueueEntry) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"requeue", "--entry", q.ID}) })
+	}
+	attempts := func(item string) int {
+		t.Helper()
+		list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range list.Entries {
+			if e.ItemID == item {
+				n++
+			}
+		}
+		return n
+	}
+	root := t.TempDir()
+
+	// Another host cannot check the directory.
+	elsewhereItem, elsewhereOrder := queueFixtureItem(t, f, "requeue-plain-elsewhere")
+	elsewhere := failedEntry("plain-elsewhere", elsewhereItem.ID, elsewhereOrder, "another-host", filepath.Join(root, "elsewhere"))
+	_, err := requeue(elsewhere)
+	if err == nil || !strings.Contains(err.Error(), "launches on another-host") || !strings.Contains(err.Error(), "or pass --cwd DIR there") {
+		t.Fatalf("requeue from another host: %v", err)
+	}
+	if n := attempts(elsewhereItem.ID); n != 1 {
+		t.Fatalf("the refused requeue from another host queued an attempt: %d", n)
+	}
+
+	// The copied directory was removed: refused, nothing queued.
+	dir := filepath.Join(root, "plain")
+	q := failedEntry("plain", f.item.ID, f.order, spawn.Host(), dir)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	_, err = requeue(q)
+	if err == nil || !strings.Contains(err.Error(), "working directory "+dir+" is not a directory") || !strings.Contains(err.Error(), "pass --cwd DIR") {
+		t.Fatalf("requeue with the directory removed: %v", err)
+	}
+	if n := attempts(q.ItemID); n != 1 {
+		t.Fatalf("the refused requeue queued an attempt: %d", n)
+	}
+
+	// Present again, the requeue proceeds and keeps it.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := requeue(q)
+	if err != nil || !strings.HasPrefix(out, "requeue ") {
+		t.Fatalf("requeue with the directory present: %q %v", out, err)
+	}
+	list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list.Entries {
+		if e.ItemID == q.ItemID && e.ID != q.ID && (e.RetryOf != q.ID || e.Cwd != dir || e.Repository != "") {
+			t.Fatalf("requeued attempt %+v", e)
+		}
+	}
+	if n := attempts(q.ItemID); n != 2 {
+		t.Fatalf("attempts after the requeue: %d", n)
 	}
 }
