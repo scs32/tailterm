@@ -536,10 +536,8 @@ func (l *lifecycleRun) dispositionBeforeVerification(t *testing.T) {
 	ownerAccept := l.file(t, "owner-accept.json", l.disposition("owner-accept", l.c2))
 	_, err = notice(lead, "Accept the candidate in the name of the owner", ownerAccept)
 	l.refused(t, "an agent-authored owner-accept", "owner-accept requires an owner-authored notice", err)
-	if l.opts.disposition == "follow-ups" {
-		_, err = notice(l.owner, "Owner accepts the candidate before verification", ownerAccept)
-		l.refused(t, "the owner's owner-accept before verification", "passing receipt for current scope and exact accepted candidate required", err)
-	}
+	_, err = notice(l.owner, "Owner accepts the candidate before verification", ownerAccept)
+	l.refused(t, "the owner's owner-accept before verification", "passing receipt for current scope and exact accepted candidate required", err)
 	if got := l.reviews(t).Disposition; got == nil || got.Kind != l.opts.disposition {
 		t.Fatalf("a refused notice changed the disposition: %+v", got)
 	}
