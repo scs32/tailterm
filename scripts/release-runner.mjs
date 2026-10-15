@@ -167,6 +167,12 @@ const CLI_FAILURES = 20, CLI_STDERR_BYTES = 16384;
 // yes or no is taken from the child's stderr; none of its text is kept.
 const GENERATION_CHANGED = /\bhub: 409 [^\n]*\brelease: generation changed\s*$/;
 const generationChanged = error => GENERATION_CHANGED.test((typeof error?.stderr === "string" ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : "").slice(-CLI_STDERR_BYTES));
+// A refuse carrying a refusal answered as by a hub or tt from before refusals
+// were kept (wi_9b18784bb4bffb14): the hub refused the request's shape (400:
+// the unknown refusal field, or a refusal it holds invalid), tt does not know
+// the flag, or the hub saved a bare refuse under this request ID before.
+const REFUSAL_REFUSED = [/\bhub: 400 [^\n]*\s*$/, /\bhub: 409 [^\n]*\brelease: retry changed\s*$/, /\bflag provided but not defined: -(?:reason|step|target)\b/];
+const refusalRefused = error => {const text = (typeof error?.stderr === "string" ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : "").slice(-CLI_STDERR_BYTES);return REFUSAL_REFUSED.some(p => p.test(text));};
 function recordCliFailure(config, job, argv, cwd, error, reason, now) {
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
   let tail = Buffer.from(text.slice(-CLI_STDERR_BYTES));
@@ -719,12 +725,18 @@ export async function runRelease(config, adapter) {
   // answers with "generation changed" is sent once more at the re-read
   // generation. A failed call leaves the journal in refusing with
   // refuseFailure beside the cause, and the next poll resumes here.
+  // The refuse carries the refusal the hub keeps on the job (wi_9b18784bb4bffb14):
+  // the stable tag, sent as receipt reasons are, and the failed step and target
+  // when a step was running. Built from the journal alone, so a resumed
+  // refusal sends the same.
   let refusing=false;
   const refuseUnpublished=async()=>{
     refusing=true;
+    const failed=state.failure && STEP.test(state.failure.step||"") ? {step:state.failure.step,...(TARGETS.includes(state.failure.target)?{target:state.failure.target}:{})} : {};
+    const refusal={...failed,reason:receiptReason(state.refusalReason)};
     try{
-      try{await adapter.refuse();}
-      catch(error){if(error?.generationChanged!==true || !await adopt(state))throw error;noteAdopted();await adapter.refuse();}
+      try{await adapter.refuse(refusal);}
+      catch(error){if(error?.generationChanged!==true || !await adopt(state))throw error;noteAdopted();await adapter.refuse(refusal);}
     }catch(refuseError){noteAdopted();state.refuseFailure=failureReason(refuseError);checkpoint();throw refuseError;}
     if(state.refuseFailure!==undefined){state.refuseRecovered=state.refuseFailure;delete state.refuseFailure;}
     state.phase="refused";checkpoint();await adapter.escalate({jobId:job.id,outcome:"refused",reason:state.refusalReason});throw releaseError("Release refused before publication");
@@ -1202,6 +1214,7 @@ export class HostAdapter {
         if(cause)failed.transport=true;
         if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
+        if(argv[0]===cli && argv[1]==="deployment" && argv[2]==="refuse" && argv.includes("--reason") && refusalRefused(error))failed.refusalRefused=true;
         if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
         throw failed;
       }
@@ -1711,7 +1724,16 @@ export class HostAdapter {
   }
   async finish(receipt,expectedGeneration){const path=join(this.config.journalDirectory || dirname(this.config.journalPath),this.job.id+"-receipt.json");save(path,receipt);this.native("finish",["--file",path],expectedGeneration);}
   async block(){this.native("block");}
-  async refuse(){this.native("refuse");}
+  // A refuse whose refusal an older hub or tt refused (refusalRefused) is
+  // sent once more bare, the exact call of a runner before refusals were kept:
+  // same job, generation and request ID. Both accept the bare form, and a hub
+  // that saved it under this request ID replays it; the job is then refused
+  // without a reason. Any other failure is thrown as before.
+  async refuse(refusal){
+    if(!refusal)return this.native("refuse");
+    try{return this.native("refuse",["--reason",refusal.reason,...(refusal.step?["--step",refusal.step]:[]),...(refusal.target?["--target",refusal.target]:[])]);}
+    catch(error){if(error?.refusalRefused!==true)throw error;return this.native("refuse");}
+  }
   async escalate(details={}){
     // Only a re-validated 40-hex commit and whole seconds reach the text.
     const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");

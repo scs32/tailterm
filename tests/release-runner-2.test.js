@@ -4,13 +4,13 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
-import {releaseReply,releaseReplySource,readHostState,git,bufferTT,fixture,change,job,fake,config,miniFixture,hash,stamped,importInputs,hostFixture,manifestFile,reclaimed,otherGeneration,HUB_SERVICE,rehearsalFixture,REPO,composePlan,recorded,schemaRelease,journalFixture,copyOf,sweep,C,DIST,SWEEP_AT,tailosJob,fiveReleased,addDist,distFixture,sweepAt,distRecord,addAttempt,EVIDENCE,BULK,YOUNG,attemptRecord,bulkRecords,remoteHead,goWorktreeFixture,PAIRED,pairedRelease,pairedHost,RUNNER,ignorePrerequisites,placePrerequisites,workedPlan,exitedPid,attemptDir,matrixHost,provisionFixture,until,ended,idle,lockHost,holderEntry,otherHolder,reasonIs,releaseHost,tailosAdapter,MATRIX_A,MATRIX_B,uncoveredReason,changedMatrixHost,matrixChangeRelease,heldRun,three,race,covers,stale,claimed} from "./release-runner-fixtures.mjs";
+import {releaseReply,releaseReplySource,readHostState,git,bufferTT,fixture,change,job,fake,config,miniFixture,hash,stamped,importInputs,hostFixture,manifestFile,reclaimed,otherGeneration,HUB_SERVICE,rehearsalFixture,REPO,composePlan,recorded,schemaRelease,journalFixture,copyOf,sweep,C,DIST,SWEEP_AT,tailosJob,fiveReleased,addDist,distFixture,sweepAt,distRecord,addAttempt,EVIDENCE,BULK,YOUNG,attemptRecord,bulkRecords,remoteHead,goWorktreeFixture,PAIRED,pairedRelease,pairedHost,RUNNER,ignorePrerequisites,placePrerequisites,workedPlan,exitedPid,attemptDir,matrixHost,provisionFixture,until,ended,idle,lockHost,holderEntry,otherHolder,reasonIs,releaseHost,tailosAdapter,MATRIX_A,MATRIX_B,uncoveredReason,changedMatrixHost,matrixChangeRelease,heldRun,three,race,covers,stale,claimed,hubJob,journalAt} from "./release-runner-fixtures.mjs";
 // The real entry point reports progress for --once too: one report before the
 // first read and one after the last call. This fake tt rejects the command
 // (exit 99), so the first report is followed by the one withdraw.
@@ -1457,4 +1457,87 @@ test("r4 targets are selected before the integrated matrix run, the inputs reque
  assert.equal((await runRelease(n.c,n.a)).outcome,"released");
  assert.deepEqual(n.a.calls,["verifyIntegrated","verifyInputs","merged","deploy:hub","deploy:mini","deploy:tailos","finish"]);
  assert.notEqual(n.journal().integrated,n.j.commit);assert.equal(remoteHead(n.f),n.journal().integrated);
+});
+
+// Refusal reason on the job (wi_9b18784bb4bffb14). The refuse carries the
+// stable tag, sent as receipt reasons are, and the failed step and target.
+test("f2 an unknown-path refusal sends its select step and tag with the refuse",async()=>{
+ const n=newFolder(false),sent=[];n.a.refuse=async r=>{sent.push(r);n.a.calls.push("refuse");};
+ await assert.rejects(runRelease(n.c,n.a),/refused/);
+ assert.deepEqual(sent,[{step:"select",reason:NEW_REASON}]);assert.deepEqual(n.said,[{jobId:"rel_fixture",outcome:"refused",reason:NEW_REASON}],"the notice is unchanged");
+ assert.equal(n.journal().refusalReason,NEW_REASON);
+});
+test("f2 a secret-looking tag is sent unclassified while the journal and notice keep it; a failure outside a step sends the tag alone",async()=>{
+ // A new folder whose name holds a secret word (fake): its select tag is not a receipt reason.
+ const TAG="Unknown release path: tools/tokenizer/a.js",f=fixture();mkdirSync(join(f.cwd,"tools/tokenizer"),{recursive:true});
+ const j=job(f,change(f,"tools/tokenizer/a.js","a")),a=fake(),c=config(f,j),sent=[];let said;
+ a.refuse=async r=>{sent.push(r);a.calls.push("refuse");};a.escalate=async d=>{said=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(c,a),/refused/);
+ assert.deepEqual(sent,[{step:"select",reason:"unclassified"}]);assert.deepEqual(a.calls,["refuse","escalate"]);
+ const journal=journalAt(c);assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,TAG);assert.deepEqual(journal.failure,{step:"select",reason:TAG});assert.equal(said.reason,TAG);
+ const g=fixture(),k=job(g,change(g,"client/a.js","a")),b=fake(),d=config(g,k),alone=[];
+ b.verifyInputs=async()=>{throw releaseError("Release inputs request failed");};b.refuse=async r=>{alone.push(r);b.calls.push("refuse");};
+ await assert.rejects(runRelease(d,b),/refused/);
+ assert.deepEqual(alone,[{reason:"Release inputs request failed"}]);assert.equal(journalAt(d).failure,undefined);
+});
+// A CLI that answers refuse like this hub, or like an older hub or tt, a
+// failing transport or a moved generation when the refuse carries a refusal.
+function refuseTT(mode,hub=hubJob(2)){
+ const home=mkdtempSync(join(tmpdir(),"release-refusal-")),tt=join(home,"tt"),log=join(home,"calls"),state=join(home,"job.json");
+ writeFileSync(state,JSON.stringify(hub));
+ writeFileSync(tt,"#!"+process.execPath+`
+const fs=require('fs'),a=process.argv.slice(2),job=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')),mode=${JSON.stringify(mode)};
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');
+const refusal=a[1]==='refuse'&&a.includes('--reason');
+if(mode==='old-hub'&&refusal){process.stderr.write('tt: hub: 400 invalid scope metadata request: unknown field "refusal"\\n');process.exit(1);}
+if(mode==='invalid'&&refusal){process.stderr.write('tt: hub: 400 invalid\\n');process.exit(1);}
+if(mode==='saved-bare'&&refusal){process.stderr.write('tt: hub: 409 conflict: release: retry changed\\n');process.exit(1);}
+if(mode==='old-tt'&&a.includes('--target')){process.stderr.write('flag provided but not defined: -target\\nUsage of deployment refuse:\\n  -target string\\ntt: flag provided but not defined: -target\\n');process.exit(1);}
+if(mode==='conflict'&&a[1]==='refuse'){process.stderr.write('tt: hub: 409 conflict: release: only an unpublished claim may refuse\\n');process.exit(1);}
+if(mode==='other'&&a[1]==='refuse'){process.stderr.write('SYNTHETIC_PRIVATE_STDERR refuse failed\\n');process.exit(3);}
+if(mode==='transport'&&refusal){process.stderr.write('tt: hub: 503 service unavailable\\n');process.exit(1);}
+if(mode==='generation'&&refusal){process.stderr.write('tt: hub: 409 conflict: release: generation changed\\n');process.exit(1);}
+if(a[1]==='refuse'){job.state='refused';job.generation++;fs.writeFileSync(${JSON.stringify(state)},JSON.stringify(job));}
+console.log(JSON.stringify(job));`);chmodSync(tt,0o755);
+ return {home,config:{cwd:home,journalDirectory:home,tt},calls:()=>readFileSync(log,"utf8").trim().split("\n").map(l=>JSON.parse(l))};
+}
+const BARE=["deployment","refuse","--job","rel_fixture","--generation","2","--request-id","rel_fixture-refuse-2"];
+test("f2 the host adapter's refuse sends the refusal as flags, and the bare call without one",async()=>{
+ for(const [refusal,extra] of [[{step:"prepare",target:"hub",reason:"python3 exit 1"},["--reason","python3 exit 1","--step","prepare","--target","hub"]],[{reason:"integration-conflict: 2 paths"},["--reason","integration-conflict: 2 paths"]],[undefined,[]]]){
+  const t=refuseTT("new"),adapter=new HostAdapter(t.config,hubJob(2));
+  await adapter.refuse(refusal);
+  assert.deepEqual(t.calls(),[[...BARE,...extra]]);assert.equal(adapter.job.state,"refused");assert.equal(adapter.job.generation,3);
+ }
+});
+test("f2 an older hub or tt still refuses: one bare refuse follows with the same job, generation and request ID",async()=>{
+ const refusal={step:"prepare",target:"hub",reason:"python3 exit 1"};
+ // An older hub, a refusal this hub holds invalid, an older tt, and a bare refuse saved under this request ID before.
+ for(const mode of ["old-hub","invalid","old-tt","saved-bare"]){
+  const t=refuseTT(mode),adapter=new HostAdapter(t.config,hubJob(2));
+  await adapter.refuse(refusal);
+  assert.deepEqual(t.calls(),[[...BARE,"--reason","python3 exit 1","--step","prepare","--target","hub"],BARE],mode);assert.equal(adapter.job.state,"refused",mode);
+ }
+ // Through a whole run: the integrate refusal of an older hub ends refused.
+ const f=fixture(),mine={baseCommit:f.base,commit:change(f,"client/a.js","a"),plan:{commit:f.base}},t=refuseTT("old-hub",hubJob(2,mine)),adapter=new HostAdapter({...t.config,cwd:f.cwd},hubJob(2,mine));let said;adapter.escalate=async d=>{said=d;};
+ const c={...config(f,adapter.job),journalPath:join(t.home,"rel_fixture.json")};
+ await assert.rejects(runRelease(c,adapter),/Release refused before publication/);
+ const refuses=t.calls().filter(a=>a[1]==="refuse");
+ assert.deepEqual(refuses,[[...BARE,"--reason","Release binding mismatch","--step","integrate"],BARE]);
+ assert.equal(adapter.job.state,"refused");const journal=journalAt(c);assert.equal(journal.phase,"refused");assert.equal(journal.refuseFailure,undefined);assert.equal(journal.refusalReason,"Release binding mismatch");assert.equal(said.reason,"Release binding mismatch");
+});
+test("f2 a transport failure, a moved generation or any other refuse failure sends no bare refuse",async t=>{
+ const sleep=cliRetry.sleep;cliRetry.sleep=()=>{};t.after(()=>{cliRetry.sleep=sleep;});
+ const refusal={step:"select",reason:NEW_REASON},sent=[...BARE,"--reason",NEW_REASON,"--step","select"];
+ const transport=refuseTT("transport"),a=new HostAdapter(transport.config,hubJob(2));
+ await assert.rejects(a.refuse(refusal),e=>e.transport===true);
+ assert.deepEqual(transport.calls(),[sent,sent,sent],"the transport tries, never the bare form");assert.equal(a.job.state,"claimed");
+ const moved=refuseTT("generation"),b=new HostAdapter(moved.config,hubJob(2));
+ await assert.rejects(b.refuse(refusal),e=>e.generationChanged===true);
+ assert.deepEqual(moved.calls(),[sent]);assert.equal(b.job.state,"claimed");
+ // The hub's state refusal and a failure it does not name are thrown as they were.
+ for(const mode of ["conflict","other"]){
+  const other=refuseTT(mode),c=new HostAdapter(other.config,hubJob(2));
+  await assert.rejects(c.refuse(refusal),e=>e.refusalRefused===undefined && e.transport===undefined,mode);
+  assert.deepEqual(other.calls(),[sent],mode);assert.equal(c.job.state,"claimed",mode);
+ }
 });

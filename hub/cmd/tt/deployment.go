@@ -63,10 +63,11 @@ func cmdDeployment(e env, args []string) error {
 	releaseName := fs.String("release", "", "optional release name; must equal the hand release record's (supersede)")
 	handRelease := fs.String("hand-release", "", "recorded hand release ID from tt deployment hand-release (supersede)")
 	repo := fs.String("repo", ".", "repository whose tasks-hub must contain the hand release (supersede)")
-	reason := fs.String("reason", "", "why a new job is expected to pass (retry), or why the job is held or its hold released (hold, unhold)")
+	reason := fs.String("reason", "", "why a new job is expected to pass (retry), why the job is held or its hold released (hold, unhold), or the runner's stable failure tag (refuse)")
 	untilItems := fs.String("until-items", "", "comma-separated work items whose release lifts the hold (hold)")
 	phase := fs.String("phase", "", "runner phase to report (progress)")
-	step := fs.String("step", "", "runner step within the phase (progress)")
+	step := fs.String("step", "", "runner step within the phase (progress), or the step that failed (refuse)")
+	target := fs.String("target", "", "the target of the step that failed (refuse)")
 	wait := fs.String("wait", "", "the wait the poll ended in: matrix, inputs, host_lock, fence, owner_hold or transport (progress)")
 	pid := fs.Int64("pid", 0, "process the wait names, such as the matrix run (progress)")
 	withdraw := fs.Bool("withdraw", false, "withdraw this run's progress report (progress)")
@@ -198,6 +199,11 @@ func cmdDeployment(e env, args []string) error {
 		return errors.New("exact agent/run and request-id required")
 	}
 	req := api.ReleaseRequest{RequestID: *key, Operation: args[0], AgentID: e.agent, RunID: e.runID, EntryID: *entry, JobID: *job, ExpectedGeneration: *generation, IntegratedCommit: *commit, Retry: retry, Hold: hold}
+	if args[0] == "refuse" && (*reason != "" || *step != "" || *target != "") {
+		// The hub checks the refusal; without these flags the refuse is the
+		// bare one an older runner sends.
+		req.Refusal = &api.ReleaseRefusal{Step: *step, Target: *target, Reason: *reason}
+	}
 	if args[0] == "supersede" {
 		j, err := c.Release(ctx, e.task, *job)
 		if err != nil {

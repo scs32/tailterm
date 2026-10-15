@@ -567,7 +567,7 @@ test("code a9 a failed CLI call keeps its exact argv, exit code and stderr priva
  assert.equal(state.phase,"refusing");assert.equal(state.refusalReason,"Release binding mismatch");assert.equal(state.refuseFailure,"tt deployment refuse exit 3");assert.deepEqual(state.effects,[]);
  assert.equal(statSync(join(h.home,"cli-failures.json")).mode&0o777,0o600);
  let kept=failures();assert.equal(kept.version,1);assert.equal(kept.failures.length,1);const entry=kept.failures[0];
- assert.deepEqual(entry.argv,[h.tt,"deployment","refuse","--job","rel_cli","--generation","2","--request-id","rel_cli-refuse-2"]);
+ assert.deepEqual(entry.argv,[h.tt,"deployment","refuse","--job","rel_cli","--generation","2","--request-id","rel_cli-refuse-2","--reason","Release binding mismatch","--step","integrate"]);
  assert.equal(entry.exitCode,3);assert.equal(entry.signal,null);assert.equal(entry.stderr,marker+" refuse failed\n");assert.equal(entry.stderrBytes,Buffer.byteLength(entry.stderr));assert.equal(entry.stderrTruncated,false);
  assert.equal(entry.jobId,"rel_cli");assert.equal(entry.agentId,CODE_AGENT);assert.equal(entry.runId,CODE_RUN);assert.equal(entry.cwd,cwd);assert.equal(entry.count,1);
  // Three identical failures are one entry counted three times, under one request id.

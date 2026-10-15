@@ -185,6 +185,10 @@ type releaseCursor struct {
 func releaseSummary(j api.ReleaseJob, row int64) api.ReleaseSummary {
 	out := api.ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
 	out.Receipt = api.ReleaseSummaryOfReceipt(j.Receipt)
+	if j.Refusal != nil {
+		refusal := *j.Refusal
+		out.Refusal = &refusal
+	}
 	if j.Supersession != nil {
 		out.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
@@ -720,6 +724,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if !api.ValidID(task, "tsk") || !validRequestID(req.RequestID) {
 		return zero, api.ErrInvalid
 	}
+	// A refusal belongs to a refuse only; on any other operation it is
+	// refused rather than silently dropped.
+	if req.Refusal != nil && req.Operation != "refuse" {
+		return zero, api.ErrInvalid
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, err
@@ -1086,6 +1095,14 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if j.State != "claimed" || j.Receipt != nil {
 					return zero, releaseConflict("only an unpublished claim may refuse")
 				}
+				// A bare refuse, from an older runner, keeps the job's old shape.
+				if req.Refusal != nil {
+					if err = validateReleaseRefusal(req.Refusal); err != nil {
+						return zero, err
+					}
+					refusal := *req.Refusal
+					j.Refusal = &refusal
+				}
 				j.State = "refused"
 				if batch != nil {
 					batchState = "dissolved"
@@ -1235,6 +1252,19 @@ func validateReleaseDiagnostics(r *api.ReleaseReceipt) error {
 		if !validReleaseProbeWait(t.LiveCheck) || !validReleaseProbeWait(t.RollbackCheck) {
 			return api.ErrInvalid
 		}
+	}
+	return nil
+}
+
+// validateReleaseRefusal checks a refusal by the receipt failure rules: the
+// stable tag with no secret word, a lowercase step, and a known target only
+// beside the step it failed in.
+func validateReleaseRefusal(r *api.ReleaseRefusal) error {
+	if !validReleaseReason(r.Reason) || (r.Step != "" && !releaseStepPattern.MatchString(r.Step)) {
+		return api.ErrInvalid
+	}
+	if r.Target != "" && (r.Step == "" || !slices.Contains(releaseTargetNames, r.Target)) {
+		return api.ErrInvalid
 	}
 	return nil
 }

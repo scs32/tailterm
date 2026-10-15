@@ -1565,8 +1565,10 @@ blocked receipt that `tt deployment finish` saves carries, beside its outcomes:
 
 - `failure: {step, target, reason}`: the journal's first failed step. `reason`
   is the runner's stable failure tag, the same text the journal keeps, so a
-  receipt names the cause without the private journal. `target` is left out when
-  the step had none.
+  receipt names the cause without the private journal; the one exception is a
+  tag containing a secret word (below), which the receipt carries as
+  `unclassified` while the journal keeps the tag. `target` is left out when the
+  step had none.
 - On each target: `reason` (only on the target `failure` names, equal to its
   reason), and `liveCheck` / `rollbackCheck` `{lastCommit, waitedMs}` from the
   effect's probe waits. Only a 40-hex `lastCommit` and a `waitedMs` from 0 to
@@ -1594,9 +1596,36 @@ older than them saves. Every other field is still compared exactly.
 Rollout: the hub (with the bridge and the Mini `tt`) before the runner. An
 older hub refuses a receipt with these fields (unknown field) and an older `tt`
 drops them, so do not deploy the runner alone. A release of this change does
-it in order by itself: the old runner deploys the hub, bridge and Mini and
-finishes with an old-shape receipt, and the deployer re-execs onto the new
+it in order by itself: the old runner deploys the hub, bridge, Mini and TailOS
+and finishes with an old-shape receipt, and the deployer re-execs onto the new
 runner afterwards, with no other release in flight.
+
+**Refusal reason on the job** (wi_9b18784bb4bffb14). A job the runner refuses
+before publication has no receipt, so its reason is kept on the hub job
+itself: `refusal: {step, target, reason}`, shown by `tt deployment get` and in
+the settled `tt deployment list` summaries. The runner sends it with `tt
+deployment refuse --reason TAG [--step STEP] [--target TARGET]`, built from the
+journal: `reason` is the journal's `refusalReason`, and `step` (with its
+`target`, if any) is the first failed step when one was running, such as
+`integrate` or `select`; a failure outside a step sends the reason alone. The
+hub checks it with the receipt `failure` rules above: a reason outside the
+tag set or containing a secret word, a step that is not a lowercase token, an
+unknown target, or a target without a step is refused (400, the job stays
+claimed), and so is a refusal on any operation but refuse. The runner sends a
+reason with a secret word as `unclassified`, as it does for a receipt. The
+private journal still keeps `refusalReason` and `failureDetail`, and the
+refusal notice still names the journal's reason.
+
+The refusal is optional. A job refused before this change, by an older runner,
+or by the handler's reconcile has none, and its saved row and a bare refuse's
+request hash are unchanged. When the hub refuses the refusal (400: an older
+hub's unknown field, or a refusal it holds invalid), an older `tt` does not
+know `--target`, or the hub already saved a bare
+refuse under the same request ID, the runner sends that refuse once more bare,
+with the same job, generation and request ID, and the job is refused without a
+reason. The first, failed call is recorded as a deployer CLI failure. So this
+runner may run beside an older hub or `tt`; deploy the hub before the runner
+as usual to keep the reason.
 
 ### Private host configuration (keys only)
 

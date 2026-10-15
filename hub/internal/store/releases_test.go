@@ -5522,3 +5522,211 @@ func TestReleaseStaysClaimableAfterEvidenceNote(t *testing.T) {
 		t.Fatalf("claim after evidence notes: state=%q err=%v", claimed.State, err)
 	}
 }
+
+// claimedRelease enqueues the entry's job and has the deployer claim it.
+func claimedRelease(t *testing.T, s *Store, task api.Task, h, d api.Agent, entry string) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+// settledSummary is the job's summary in the settled list.
+func settledSummary(t *testing.T, s *Store, task api.Task, id string) api.ReleaseSummary {
+	t.Helper()
+	page, err := s.ReleasesPage(context.Background(), task.ID, api.ReleaseListOptions{View: "settled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range page.Jobs {
+		if j.ID == id {
+			return j
+		}
+	}
+	t.Fatalf("job %s is not in the settled list: %+v", id, page.Jobs)
+	return api.ReleaseSummary{}
+}
+
+// a1 (f1): a refuse carrying a refusal keeps it on the job, in its detail and
+// in its settled summary; the same request replays the same job, and the same
+// request ID with another refusal is a conflict.
+func TestReleaseRefuseKeepsRefusal(t *testing.T) {
+	ctx := context.Background()
+	for _, refusal := range []api.ReleaseRefusal{
+		{Step: "select", Reason: "Unknown release path: tools/newthing/a.js"},
+		{Step: "prepare", Target: "hub", Reason: "python3 exit 1"},
+		{Reason: "integration-conflict: 2 paths"},
+	} {
+		t.Run(refusal.Reason, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			j := claimedRelease(t, s, task, h, d, entry)
+			want := refusal
+			req := api.ReleaseRequest{RequestID: "refuse", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Refusal: &want}
+			refused, err := s.ReleaseAction(ctx, task.ID, req)
+			if err != nil || refused.State != "refused" || refused.Receipt != nil || refused.Refusal == nil || *refused.Refusal != refusal {
+				t.Fatalf("%+v %v", refused, err)
+			}
+			detail, err := s.Release(ctx, task.ID, j.ID)
+			if err != nil || detail.State != "refused" || detail.Refusal == nil || *detail.Refusal != refusal {
+				t.Fatalf("detail %+v %v", detail, err)
+			}
+			if summary := settledSummary(t, s, task, j.ID); summary.State != "refused" || summary.Refusal == nil || *summary.Refusal != refusal {
+				t.Fatalf("summary %+v", summary)
+			}
+			row := releaseRow(t, s, task, j.ID)
+			again, err := s.ReleaseAction(ctx, task.ID, req)
+			if err != nil || again.ID != j.ID || again.Generation != refused.Generation || again.Refusal == nil || *again.Refusal != refusal {
+				t.Fatalf("replay %+v %v", again, err)
+			}
+			changed := refusal
+			changed.Reason = "a different tag"
+			req.Refusal = &changed
+			if _, err = s.ReleaseAction(ctx, task.ID, req); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+				t.Fatal("a changed refusal under the same request ID", err)
+			}
+			if releaseRow(t, s, task, j.ID) != row {
+				t.Fatal("a replay or a refused change rewrote the job")
+			}
+		})
+	}
+}
+
+// a2 (f1): a refusal that breaks the receipt failure rules is invalid and
+// leaves the job claimed at its generation, with no refusal. Fake values only.
+func TestReleaseRefuseRefusesBadRefusal(t *testing.T) {
+	ctx := context.Background()
+	s, task, h, d, entry := releaseFixture(t)
+	j := claimedRelease(t, s, task, h, d, entry)
+	row := releaseRow(t, s, task, j.ID)
+	cases := map[string]struct {
+		op      string
+		refusal api.ReleaseRefusal
+	}{
+		"token":               {"refuse", api.ReleaseRefusal{Reason: "SYNTHETIC_PRIVATE_TOKEN missing"}},
+		"bearer":              {"refuse", api.ReleaseRefusal{Reason: "Bearer SYNTHETIC_VALUE"}},
+		"password":            {"refuse", api.ReleaseRefusal{Reason: "password SYNTHETIC"}},
+		"api key":             {"refuse", api.ReleaseRefusal{Reason: "an API key SYNTHETIC"}},
+		"private key":         {"refuse", api.ReleaseRefusal{Step: "prepare", Target: "hub", Reason: "PRIVATE KEY synthetic"}},
+		"empty":               {"refuse", api.ReleaseRefusal{Step: "select"}},
+		"long":                {"refuse", api.ReleaseRefusal{Reason: strings.Repeat("a", 161)}},
+		"newline":             {"refuse", api.ReleaseRefusal{Reason: "python3 exit 1\nsecond line"}},
+		"character":           {"refuse", api.ReleaseRefusal{Reason: "key=value"}},
+		"step":                {"refuse", api.ReleaseRefusal{Step: "Bad Step", Reason: "python3 exit 1"}},
+		"target":              {"refuse", api.ReleaseRefusal{Step: "prepare", Target: "nas", Reason: "python3 exit 1"}},
+		"target without step": {"refuse", api.ReleaseRefusal{Target: "hub", Reason: "python3 exit 1"}},
+		"on block":            {"block", api.ReleaseRefusal{Reason: "python3 exit 1"}},
+		"on claim":            {"claim", api.ReleaseRefusal{Reason: "python3 exit 1"}},
+	}
+	for name, c := range cases {
+		refusal := c.refusal
+		_, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "bad-" + strings.ReplaceAll(name, " ", "-"), Operation: c.op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Refusal: &refusal})
+		if !errors.Is(err, api.ErrInvalid) {
+			t.Fatal(name, err)
+		}
+	}
+	after, err := s.Release(ctx, task.ID, j.ID)
+	if err != nil || after.State != "claimed" || after.Generation != j.Generation || after.Refusal != nil || releaseRow(t, s, task, j.ID) != row {
+		t.Fatalf("%+v %v", after, err)
+	}
+}
+
+// a7 (f2, f3): an older runner's bare refuse still refuses, and neither the
+// request nor the saved job carries a refusal key, so a saved bare refuse
+// replays under its old request hash.
+func TestReleaseBareRefuseKeepsOldShape(t *testing.T) {
+	ctx := context.Background()
+	s, task, h, d, entry := releaseFixture(t)
+	j := claimedRelease(t, s, task, h, d, entry)
+	req := api.ReleaseRequest{RequestID: "refuse", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+	body, err := json.Marshal(req)
+	if err != nil || strings.Contains(string(body), "refusal") {
+		t.Fatalf("%s %v", body, err)
+	}
+	refused, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || refused.State != "refused" || refused.Refusal != nil {
+		t.Fatalf("%+v %v", refused, err)
+	}
+	if row := releaseRow(t, s, task, j.ID); strings.Contains(row, "refusal") {
+		t.Fatal(row)
+	}
+	if summary := settledSummary(t, s, task, j.ID); summary.State != "refused" || summary.Refusal != nil {
+		t.Fatalf("%+v", summary)
+	}
+	if again, err := s.ReleaseAction(ctx, task.ID, req); err != nil || again.ID != j.ID || again.Generation != refused.Generation {
+		t.Fatalf("replay %+v %v", again, err)
+	}
+}
+
+// a8 (f3): a database with the release_jobs table from before retries and a
+// job refused before refusals were kept opens with that row byte-identical;
+// the job reads as refused with no refusal in its detail and in the settled
+// list, and a second open changes nothing.
+func TestRefusedJobsSurviveMigrationWithoutRefusal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "old refusals"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`DROP TABLE release_jobs;` + releaseJobsSchemaBeforeRetry); err != nil {
+		t.Fatal(err)
+	}
+	refusedID, claimedID := api.NewID("rel"), api.NewID("rel")
+	// Jobs saved before this change: a refused one and one still claimed,
+	// neither with a refusal key.
+	for i, j := range []api.ReleaseJob{
+		{ID: refusedID, TaskID: task.ID, EntryID: api.NewID("tqe"), ItemID: api.NewID("wi"), Repository: "fixture", BaseCommit: candidateA, Commit: candidateB, State: "refused", Generation: 4, AgentID: api.NewID("agt"), RunID: api.NewID("run"), PauseGeneration: 1},
+		{ID: claimedID, TaskID: task.ID, EntryID: api.NewID("tqe"), Commit: candidateB, State: "claimed", Generation: 2, PauseGeneration: 1},
+	} {
+		raw, err := json.Marshal(j)
+		if err != nil || strings.Contains(string(raw), "refusal") {
+			t.Fatalf("%s %v", raw, err)
+		}
+		if _, err = s.db.Exec(`INSERT INTO release_jobs(rowid,task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,?,?,?,?)`, i+3, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := releaseRow(t, s, task, refusedID) + "\n" + releaseRow(t, s, task, claimedID)
+	check := func(s *Store) {
+		t.Helper()
+		if after := releaseRow(t, s, task, refusedID) + "\n" + releaseRow(t, s, task, claimedID); after != before {
+			t.Fatalf("rows changed\nbefore\n%s\nafter\n%s", before, after)
+		}
+		var shape string
+		if err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='release_jobs'`).Scan(&shape); err != nil || strings.Contains(shape, "UNIQUE(task_id,entry_id)") {
+			t.Fatal("the table was not migrated", shape, err)
+		}
+		detail, err := s.Release(ctx, task.ID, refusedID)
+		if err != nil || detail.State != "refused" || detail.Refusal != nil || detail.Generation != 4 {
+			t.Fatalf("detail %+v %v", detail, err)
+		}
+		if summary := settledSummary(t, s, task, refusedID); summary.State != "refused" || summary.Refusal != nil {
+			t.Fatalf("summary %+v", summary)
+		}
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	check(s)
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	check(s)
+}

@@ -48,6 +48,9 @@ type ReleaseJob struct {
 	InputsDigest           string                  `json:"inputsDigest,omitempty"`
 	Reconciliations        []ReleaseReconciliation `json:"reconciliations,omitempty"`
 	Receipt                *ReleaseReceipt         `json:"receipt,omitempty"`
+	// Refusal is the failure tag of a job refused before publication, which
+	// has no receipt. Absent on a refusal saved earlier or sent without one.
+	Refusal *ReleaseRefusal `json:"refusal,omitempty"`
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
@@ -92,6 +95,7 @@ type ReleaseSummary struct {
 	Published          bool                        `json:"published,omitempty"`
 	SettledAt          string                      `json:"settledAt,omitempty"`
 	Receipt            *ReleaseSummaryReceipt      `json:"receipt,omitempty"`
+	Refusal            *ReleaseRefusal             `json:"refusal,omitempty"`
 	Supersession       *ReleaseSummarySupersession `json:"supersession,omitempty"`
 	Hold               *ReleaseHold                `json:"hold,omitempty"`
 }
@@ -378,6 +382,15 @@ type ReleaseFailure struct {
 	Reason string `json:"reason"`
 }
 
+// ReleaseRefusal is why the runner refused a job before publication: the
+// runner's stable failure tag and, when a step was running, that step and its
+// target. The same rules as ReleaseFailure apply; never output.
+type ReleaseRefusal struct {
+	Step   string `json:"step,omitempty"`
+	Target string `json:"target,omitempty"`
+	Reason string `json:"reason"`
+}
+
 // ReleaseProbeWait is what a live or rollback probe saw: the last commit it
 // read and the time it waited. Never its capture or poll count. WaitedMs is a
 // pointer so that 0 survives the round trip.
@@ -451,6 +464,8 @@ type ReleaseRequest struct {
 	Retry              *ReleaseRetry          `json:"retry,omitempty"`
 	Hold               *ReleaseHold           `json:"hold,omitempty"`
 	Progress           *ReleaseProgress       `json:"progress,omitempty"`
+	// Refusal is accepted on a refuse only; a bare refuse leaves it out.
+	Refusal *ReleaseRefusal `json:"refusal,omitempty"`
 }
 
 // ReleaseProgressWait is the wait a release runner's poll ended in. It is
@@ -575,6 +590,10 @@ func releaseSettled(state string) bool {
 func compatibilitySummary(j ReleaseJob, row int64) ReleaseSummary {
 	s := ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
 	s.Receipt = ReleaseSummaryOfReceipt(j.Receipt)
+	if j.Refusal != nil {
+		refusal := *j.Refusal
+		s.Refusal = &refusal
+	}
 	if j.Supersession != nil {
 		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
 	}
