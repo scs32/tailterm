@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
@@ -54,13 +56,14 @@ func writeFixtureFile(t *testing.T, path, content string) {
 }
 
 // resetCleanupProcessState clears what closeout remembers for the life of the
-// process, now and when the test ends: which entries it examined recently and
-// that it already warned about a bad TAILTERM_ARTIFACT_ACCEPTED_AFTER. Without
+// process, now and when the test ends: which entries and project histories it
+// examined recently and that it already warned about a bad TAILTERM_ARTIFACT_ACCEPTED_AFTER. Without
 // it a repeat run (go test -count) starts where the last one stopped.
 func resetCleanupProcessState(t *testing.T) {
 	t.Helper()
 	reset := func() {
 		closeoutWorktreeChecks.Clear()
+		closeoutHistoryReads.Clear()
 		keptWorktreeReceipts.Clear()
 		artifactAcceptedAfterWarning = sync.Once{}
 	}
@@ -459,17 +462,20 @@ func TestWorktreeCleanupSweepKeepsRecentWorktrees(t *testing.T) {
 type cleanupHub struct {
 	mu       sync.Mutex
 	requests []string
-	writes   []string
-	tasks    []api.Task
-	details  map[string]api.TaskDetail
-	queues   map[string]api.TeamQueueList
-	byHost   api.TeamQueueList
+	// queries is each request with its query, such as a listing's view.
+	queries []string
+	writes  []string
+	tasks   []api.Task
+	details map[string]api.TaskDetail
+	queues  map[string]api.TeamQueueList
+	byHost  api.TeamQueueList
 }
 
 func (h *cleanupHub) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.requests = append(h.requests, req.Method+" "+req.URL.Path)
+	h.queries = append(h.queries, req.Method+" "+req.URL.RequestURI())
 	if req.Method != http.MethodGet {
 		h.writes = append(h.writes, req.Method+" "+req.URL.Path)
 		http.Error(w, `{"error":"fixture hub is read-only"}`, http.StatusConflict)
@@ -482,7 +488,19 @@ func (h *cleanupHub) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case path == "/v1/tasks":
 		body = api.TaskList{Tasks: h.tasks}
 	case strings.HasSuffix(path, "/team-queue"):
-		body = h.queues[strings.TrimSuffix(strings.TrimPrefix(path, "/v1/tasks/"), "/team-queue")]
+		body = fixtureQueueView(h.queues[strings.TrimSuffix(strings.TrimPrefix(path, "/v1/tasks/"), "/team-queue")], req.URL.Query())
+	case strings.Contains(path, "/team-queue/"):
+		task, id, _ := strings.Cut(strings.TrimPrefix(path, "/v1/tasks/"), "/team-queue/")
+		found := false
+		for _, e := range h.queues[task].Entries {
+			if e.ID == id {
+				body, found = e, true
+			}
+		}
+		if !found {
+			http.NotFound(w, req)
+			return
+		}
 	case strings.HasPrefix(path, "/v1/tasks/"):
 		detail, ok := h.details[strings.TrimPrefix(path, "/v1/tasks/")]
 		if !ok {
@@ -498,10 +516,79 @@ func (h *cleanupHub) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// fixtureQueueHistory mirrors the hub's history rule, queueHistorySQL in
+// internal/store/team_queue.go: finished, or failed and released without an
+// owner integration.
+func fixtureQueueHistory(e api.TeamQueueEntry) bool {
+	return e.State == "finished" || (e.State == "failed" && e.ReleasedAt != "" && e.OwnerIntegration == nil)
+}
+
+// fixtureQueueView serves a project's team queue the way the hub's
+// ListTeamQueue does: view=active is the non-history entries only; the
+// default is those in full, then one page of history entries as summaries
+// with clipped evidence.
+func fixtureQueueView(all api.TeamQueueList, query url.Values) api.TeamQueueList {
+	out := all
+	out.Entries = nil
+	var history []api.TeamQueueEntry
+	for _, e := range all.Entries {
+		if fixtureQueueHistory(e) {
+			history = append(history, e)
+		} else {
+			out.Entries = append(out.Entries, e)
+		}
+	}
+	if query.Get("view") == api.TeamQueueViewActive {
+		return out
+	}
+	limit := api.DefaultTeamQueueHistoryLimit
+	if n, err := strconv.Atoi(query.Get("limit")); err == nil && n > 0 {
+		limit = n
+	}
+	out.History = &api.TeamQueueHistoryPage{Total: len(history), Limit: limit}
+	for i, e := range history {
+		if i == limit {
+			break
+		}
+		e.Summary = true
+		if e.Acceptance != nil {
+			a := *e.Acceptance
+			a.Evidence = fixtureClip(a.Evidence)
+			e.Acceptance = &a
+		}
+		if e.Integration != nil {
+			in := *e.Integration
+			in.Evidence = fixtureClip(in.Evidence)
+			e.Integration = &in
+		}
+		out.Entries = append(out.Entries, e)
+	}
+	return out
+}
+
+// fixtureClip clips summary evidence as the hub does (500 bytes).
+func fixtureClip(text string) string {
+	const max = 500
+	if len(text) <= max {
+		return text
+	}
+	cut := max - len("…")
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + "…"
+}
+
 func (h *cleanupHub) snapshot() ([]string, []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.requests...), append([]string(nil), h.writes...)
+}
+
+func (h *cleanupHub) queryLog() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.queries...)
 }
 
 // countWorktreeGit counts Git calls made by the cleanup for the test.
@@ -591,8 +678,18 @@ func TestWorktreeCleanupRunnerRemovesFinishedEntryWorktrees(t *testing.T) {
 		t.Fatalf("cleanup wrote to the hub: %v", writes)
 	}
 
+	// The finished entry is history: the tick finds it in the project's
+	// default listing, a summary, and reads it in full before deciding.
+	queue := "GET /v1/tasks/" + task + "/team-queue"
+	firstWant := []string{"GET /v1/team-queues?host=" + host + "&limit=" + strconv.Itoa(api.MaxLimit), queue + "?view=active", "GET /v1/tasks/" + task,
+		queue, queue + "/" + finished.ID, "GET /v1/tasks/" + task}
+	if got := hub.queryLog(); strings.Join(got, ",") != strings.Join(firstWant, ",") {
+		t.Fatalf("first tick requests %v, want %v", got, firstWant)
+	}
+
 	// Later ticks, even past the re-check interval, only stat the gone paths.
 	closeoutWorktreeChecks.Delete(finished.ID)
+	closeoutHistoryReads.Clear()
 	calls.Store(0)
 	if err := runner.tick(ctx, e, c, host); err != nil {
 		t.Fatal(err)
@@ -602,12 +699,193 @@ func TestWorktreeCleanupRunnerRemovesFinishedEntryWorktrees(t *testing.T) {
 	}
 	all, writes := hub.snapshot()
 	second := all[len(first):]
-	baseline := []string{"GET /v1/team-queues", "GET /v1/tasks/" + task + "/team-queue", "GET /v1/tasks/" + task}
-	if len(writes) != 0 || strings.Join(second, ",") != strings.Join(baseline, ",") {
-		t.Fatalf("second tick requests %v writes %v, want only the tick's own reads %v", second, writes, baseline)
+	baseline := []string{"GET /v1/team-queues", queue, "GET /v1/tasks/" + task}
+	if len(writes) != 0 || strings.Join(second, ",") != strings.Join(append(baseline, queue), ",") {
+		t.Fatalf("second tick requests %v writes %v, want the tick's own reads %v and one history read", second, writes, baseline)
 	}
-	if n := len(first) - len(baseline); n != 1 || first[len(first)-1] != "GET /v1/tasks/"+task {
-		t.Fatalf("first tick requests %v: cleanup should add one project read", first)
+	// Within the interval the history is not read again.
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	all, _ = hub.snapshot()
+	if third := all[len(first)+len(second):]; strings.Join(third, ",") != strings.Join(baseline, ",") {
+		t.Fatalf("third tick requests %v, want only the tick's own reads %v", third, baseline)
+	}
+}
+
+// closeoutRunnerHub serves one project whose host listing names a running
+// entry, so the tick visits it, and whose queue also holds finished, a
+// history entry the active view never lists. The project is paused, so the
+// running entry does not advance.
+func closeoutRunnerHub(t *testing.T, r cleanupRepo, task, host string, finished api.TeamQueueEntry) (*cleanupHub, *api.Client, env) {
+	t.Helper()
+	runningCwd := r.queuePath("queue-" + task[len(task)-8:])
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", runningCwd, "tasks-hub")
+	running := api.TeamQueueEntry{ID: "tqe_running_" + task[len(task)-8:], TaskID: task, ItemID: "wi_e2e2e2e2e2e2e2e2", State: "running", Host: host, Cwd: runningCwd}
+	hub := &cleanupHub{
+		byHost: api.TeamQueueList{Entries: []api.TeamQueueEntry{running}},
+		queues: map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{finished, running}}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen, PauseState: api.ProjectPausePaused}, Agents: []api.Agent{
+			{ID: "agt_running", Host: host, Status: "running", Cwd: runningCwd, WorkItem: &api.AgentWorkItemBinding{ItemTaskID: task, ItemID: running.ItemID}},
+		}}},
+	}
+	server := httptest.NewServer(hub)
+	t.Cleanup(server.Close)
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hub, c, env{hub: server.URL}
+}
+
+// historyReads counts the default-view listings of a project in the log: the
+// closeout's history reads.
+func historyReads(log []string, task string) int {
+	n := 0
+	for _, l := range log {
+		if l == "GET /v1/tasks/"+task+"/team-queue" {
+			n++
+		}
+	}
+	return n
+}
+
+// wi_577abce4b40df47b k2: a finished entry whose release lands after it
+// finished is kept unpushed by the first tick, left alone within the
+// interval, and removed by the next look after the release, with no
+// min-idle wait: its worktree changed seconds ago.
+func TestWorktreeCleanupRunnerRemovesAfterReleaseLands(t *testing.T) {
+	r := newCleanupRepo(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea10"
+	w := r.branchWorktree(t, r.queuePath("queue-bbbb0010"), "bug/later")
+	commit := cleanupGit(t, w, "rev-parse", "HEAD")
+	finished := api.TeamQueueEntry{ID: "tqe_later_case10", TaskID: task, ItemID: "wi_a4a4a4a4a4a4a4a4", State: "finished", Host: host, Cwd: w, Repository: r.common,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: w, Branch: "bug/later", Commit: commit, Evidence: "verification receipt vr_10"}}
+	hub, c, e := closeoutRunnerHub(t, r, task, host, finished)
+	runner := teamRunner{worktrees: closeoutWorktrees}
+	ctx := context.Background()
+
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, w, true)
+	rec, ok := receiptFor(readCleanupReceipts(t), w)
+	if !ok || rec.Action != "kept" || rec.Reason != keepUnpushed || rec.Source != "closeout" || rec.EntryID != finished.ID || rec.ItemID != finished.ItemID || rec.TaskID != task {
+		t.Fatalf("first tick receipt %+v %v, want a closeout unpushed keep", rec, ok)
+	}
+
+	// The release lands; within the interval nothing is read or decided.
+	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/later")
+	before := len(hub.queryLog())
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, w, true)
+	if n := historyReads(hub.queryLog()[before:], task); n != 0 {
+		t.Fatalf("a tick within the interval read the history %d times", n)
+	}
+
+	// Fifteen minutes on, the next tick removes it.
+	closeoutWorktreeChecks.Clear()
+	closeoutHistoryReads.Clear()
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, w, false)
+	var removed bool
+	for _, rec := range readCleanupReceipts(t) {
+		if rec.Path == w && rec.Action == "removed" {
+			removed = rec.Source == "closeout" && rec.EntryID == finished.ID && rec.ItemID == finished.ItemID && rec.TaskID == task
+		}
+	}
+	if !removed {
+		t.Fatalf("no closeout removal receipt for %s: %+v", w, readCleanupReceipts(t))
+	}
+	if sha := cleanupGit(t, r.main, "rev-parse", "refs/heads/bug/later"); sha != commit {
+		t.Fatalf("accepted branch lost: %s", sha)
+	}
+	if _, writes := hub.snapshot(); len(writes) != 0 {
+		t.Fatalf("closeout wrote to the hub: %v", writes)
+	}
+}
+
+// wi_577abce4b40df47b: the history page clips evidence, so closeout reads the
+// finished entry in full. A citation of its worktree past the clip keeps it,
+// where a summary-only read would remove a released worktree.
+func TestWorktreeCleanupRunnerKeepsWorktreeCitedPastTheSummary(t *testing.T) {
+	r := newCleanupRepo(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea11"
+	w := r.branchWorktree(t, r.queuePath("queue-bbbb0011"), "bug/cited")
+	commit := cleanupGit(t, w, "rev-parse", "HEAD")
+	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/cited")
+	evidence := strings.Repeat("x", 520) + " logs kept in " + w
+	finished := api.TeamQueueEntry{ID: "tqe_cited_case11", TaskID: task, ItemID: "wi_a5a5a5a5a5a5a5a5", State: "finished", Host: host, Cwd: w, Repository: r.common,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: w, Branch: "bug/cited", Commit: commit, Evidence: evidence}}
+	hub, c, e := closeoutRunnerHub(t, r, task, host, finished)
+	if summary := fixtureQueueView(hub.queues[task], url.Values{}).Entries; len(summary) != 2 || !summary[1].Summary || strings.Contains(summary[1].Acceptance.Evidence, w) {
+		t.Fatal("fixture summary still cites the worktree; the test needs it clipped")
+	}
+	runner := teamRunner{worktrees: closeoutWorktrees}
+	if err := runner.tick(context.Background(), e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, w, true)
+	rec, ok := receiptFor(readCleanupReceipts(t), w)
+	if !ok || rec.Action != "kept" || rec.Reason != keepEvidence || rec.Source != "closeout" || rec.EntryID != finished.ID {
+		t.Fatalf("receipt %+v %v, want a closeout evidence keep", rec, ok)
+	}
+	if n := strings.Count(strings.Join(hub.queryLog(), ","), "/team-queue/"+finished.ID); n != 1 {
+		t.Fatalf("finished entry read %d times, want once in full", n)
+	}
+}
+
+// wi_577abce4b40df47b: a tick served from the last good listing in a slow
+// episode reads no history and decides nothing; the next live tick does.
+func TestWorktreeCleanupRunnerStaleTickReadsNoHistory(t *testing.T) {
+	r := newCleanupRepo(t)
+	resetQueueListings()
+	t.Cleanup(resetQueueListings)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea12"
+	w := r.branchWorktree(t, r.queuePath("queue-bbbb0012"), "bug/stale")
+	commit := cleanupGit(t, w, "rev-parse", "HEAD")
+	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/stale")
+	finished := api.TeamQueueEntry{ID: "tqe_stale_case12", TaskID: task, ItemID: "wi_a6a6a6a6a6a6a6a6", State: "finished", Host: host, Cwd: w, Repository: r.common,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: w, Branch: "bug/stale", Commit: commit, Evidence: "verification receipt vr_12"}}
+	hub, c, e := closeoutRunnerHub(t, r, task, host, finished)
+	now := time.Now()
+	ctx := context.Background()
+	// A live tick without closeout saves the last good listings.
+	if err := (teamRunner{now: func() time.Time { return now }}).tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	queueListingsFor(e.hub).timedOut(now, context.DeadlineExceeded)
+	runner := teamRunner{worktrees: closeoutWorktrees, now: func() time.Time { return now }}
+
+	now = now.Add(time.Second)
+	before := len(hub.queryLog())
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	stale := hub.queryLog()[before:]
+	if n := historyReads(stale, task); n != 0 || strings.Contains(strings.Join(stale, ","), "/team-queue/"+finished.ID) {
+		t.Fatalf("stale tick requests %v: want no history or finished entry read", stale)
+	}
+	requireExists(t, w, true)
+	if _, ok := receiptFor(readCleanupReceipts(t), w); ok {
+		t.Fatal("a stale tick made a closeout decision")
+	}
+
+	now = now.Add(queueListingRetryMax)
+	if err := runner.tick(ctx, e, c, host); err != nil {
+		t.Fatal(err)
+	}
+	requireExists(t, w, false)
+	// The episode's one write is the runner's slow-listing notice.
+	if _, writes := hub.snapshot(); len(writes) != 1 || writes[0] != "POST /v1/tasks/"+task+"/messages" {
+		t.Fatalf("hub writes %v, want only the slow-listing notice", writes)
 	}
 }
 

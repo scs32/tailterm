@@ -275,6 +275,30 @@ var keptWorktreeReceipts sync.Map
 // closeoutWorktreeChecks remembers when closeout last examined each entry.
 var closeoutWorktreeChecks sync.Map
 
+// closeoutHistoryReads remembers when closeout last read each project's
+// history page, keyed by hub and project.
+var closeoutHistoryReads sync.Map
+
+// closeoutHistory reads a project's default team queue listing for closeout:
+// its active entries in full, then one page of the newest history entries as
+// summaries. Finished entries are history only (the active view and the host
+// listing never name them), and older ones are left to the sweep. It reads at
+// most once per closeoutWorktreeInterval per project, failed reads included,
+// so a failure logs one line per interval; ok is false when it did not read.
+func closeoutHistory(ctx context.Context, c *api.Client, task string, now time.Time) (api.TeamQueueList, bool) {
+	key := c.Base + "\x00" + task
+	if last, ok := closeoutHistoryReads.Load(key); ok && now.Sub(last.(time.Time)) < closeoutWorktreeInterval {
+		return api.TeamQueueList{}, false
+	}
+	closeoutHistoryReads.Store(key, now)
+	recent, err := c.ListTeamQueuePage(ctx, task, api.TeamQueueListOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] worktree cleanup project %s: %v\n", task, err)
+		return api.TeamQueueList{}, false
+	}
+	return recent, true
+}
+
 // errWorktreeCleanupActive is the cleanup lock held by another closeout or
 // sweep on this host.
 var errWorktreeCleanupActive = errors.New("worktree cleanup is active on this host")
@@ -1948,24 +1972,11 @@ func worktreeProtection(host string, entries []api.TeamQueueEntry, agents []api.
 // tree once the item is released or accepted long enough, and its closed
 // team's session temp folders. It reads the hub only when one of the entry's
 // worktrees, temp folders or verifier checkouts still exists, at most once
-// per closeoutWorktreeInterval, and never writes to the hub.
+// per closeoutWorktreeInterval, and never writes to the hub. A history
+// summary is read again in full before anything is decided, because its
+// evidence is clipped.
 func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry) error {
-	direct := []string{q.Cwd, q.Acceptance.Worktree}
-	if q.Integration != nil {
-		direct = append(direct, q.Integration.Worktree)
-	}
-	repo := q.Repository
-	if repo == "" {
-		repo = q.Acceptance.Repository
-	}
-	if repo == "" {
-		for _, p := range direct {
-			if _, err := os.Stat(p); p != "" && err == nil {
-				repo = p
-				break
-			}
-		}
-	}
+	direct, repo := closeoutPaths(q)
 	if repo == "" {
 		return nil
 	}
@@ -1997,11 +2008,32 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		return nil
 	}
 	closeoutWorktreeChecks.Store(q.ID, now)
+	if q.Summary {
+		full, err := c.GetTeamQueueEntry(ctx, q.TaskID, q.ID)
+		if err != nil {
+			return err
+		}
+		if full.Host != host || full.State != "finished" || full.Acceptance == nil {
+			return nil
+		}
+		q = full
+		if direct, repo = closeoutPaths(q); repo == "" {
+			return nil
+		}
+	}
 	detail, err := c.GetTask(ctx, q.TaskID)
 	if err != nil {
 		return err
 	}
-	entries := append(append([]api.TeamQueueEntry(nil), active.Entries...), project.Entries...)
+	// The full entry stands in for its summary, so its whole evidence
+	// protects what it cites.
+	entries := append([]api.TeamQueueEntry(nil), active.Entries...)
+	for _, e := range project.Entries {
+		if e.ID == q.ID {
+			e = q
+		}
+		entries = append(entries, e)
+	}
 	inUse, evidence := worktreeProtection(host, entries, detail.Agents)
 	roots := append([]string(nil), direct...)
 	for _, a := range detail.Agents {
@@ -2090,6 +2122,28 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 		}
 	}
 	return err
+}
+
+// closeoutPaths returns a finished entry's recorded worktrees and the
+// repository they belong to; repo is "" when none is known or on disk.
+func closeoutPaths(q api.TeamQueueEntry) (direct []string, repo string) {
+	direct = []string{q.Cwd, q.Acceptance.Worktree}
+	if q.Integration != nil {
+		direct = append(direct, q.Integration.Worktree)
+	}
+	repo = q.Repository
+	if repo == "" {
+		repo = q.Acceptance.Repository
+	}
+	if repo == "" {
+		for _, p := range direct {
+			if _, err := os.Stat(p); p != "" && err == nil {
+				repo = p
+				break
+			}
+		}
+	}
+	return direct, repo
 }
 
 type worktreeSweepTotals struct {
