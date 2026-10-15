@@ -959,10 +959,9 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	trims, eligible := trimCaches(ctx, in, common, main, candidates, decisions, linked, art, now)
 	decisions = append(decisions, trims...)
 	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, art, now)...)
-	homes, err := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
-	if err != nil {
-		return nil, err
-	}
+	// The verifier home pass runs after the trims and removals above, so
+	// its failure still records their receipts before it is returned.
+	homes, homeErr := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
 	decisions = append(decisions, homes...)
 	if in.Apply {
 		for i := range decisions {
@@ -973,7 +972,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			decisions[i].recorded = recorded
 		}
 	}
-	return decisions, nil
+	return decisions, homeErr
 }
 
 func worktreeGone(w gitWorktree) bool {
@@ -3317,6 +3316,32 @@ func ownedPath(home *os.Root, owned string) (os.FileInfo, string) {
 		if !info.IsDir() {
 			return nil, "owned path " + owned + ": " + rel + " is not a directory"
 		}
+		if parts[i] == ".git" {
+			return nil, "owned path " + owned + ": " + rel + " is a Git directory"
+		}
+	}
+	// A cache holds no repository: a .git entry anywhere in the owned
+	// directory, its own included, refuses it, so no checkout's work goes
+	// with a trim.
+	if _, err := home.Lstat(owned + "/.git"); err == nil {
+		return nil, "owned path " + owned + " is a Git repository"
+	}
+	nested := ""
+	walkErr := fs.WalkDir(home.FS(), owned, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Name() == ".git" {
+			nested = filepath.Dir(p)
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, "owned path " + owned + ": scan for repositories: " + walkErr.Error()
+	}
+	if nested != "" {
+		return nil, "owned path " + owned + " holds Git repository " + nested
 	}
 	return info, ""
 }
@@ -3537,7 +3562,9 @@ func cleanupVerifierHomes(ctx context.Context, in worktreeCleanupInputs, common,
 	}
 	cited, err := docsCitations(ctx, common, main, paths, nil)
 	if err != nil {
-		return nil, fmt.Errorf("evidence lookup: %w", err)
+		// Nothing is deleted without the citation check; the reports so far
+		// are returned with the error.
+		return out, fmt.Errorf("verifier home evidence lookup: %w", err)
 	}
 	var pending []*verifierHome
 	for _, h := range homes {
@@ -3587,12 +3614,15 @@ func classifyVerifierHome(ctx context.Context, in worktreeCleanupInputs, main st
 	item := h.marker.Item
 	switch h.scope {
 	case homeScopeArtifacts:
+		// Only a home under its own item's folder, <artifacts>/<item>/...,
+		// is the item's; any other marked home is reported.
 		rel := strings.TrimPrefix(h.path, strings.TrimSuffix(h.root, "/")+"/")
-		if folder, _, _ := strings.Cut(rel, "/"); artifactItemIDPattern.MatchString(folder) && folder != item {
-			return keepUnproven, "marker names " + item + ", folder belongs to " + folder
-		}
+		folder, _, _ := strings.Cut(rel, "/")
 		if !artifactItemIDPattern.MatchString(item) {
 			return keepUnproven, "marker item " + strconv.Quote(item) + " is not a work item"
+		}
+		if folder != item {
+			return keepUnproven, "marker names " + item + ", but the home is under " + folder + ", not its item's artifact folder"
 		}
 		if !in.Trim.Items[item] {
 			detail := item + " is not finished"

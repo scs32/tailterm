@@ -1847,10 +1847,12 @@ reported.
   consulted.
 - A `/tmp` home whose marker says `keepHome` true was kept on purpose
   (`--keep-home`). It is never removed whole; it loses only its owned caches.
-- A marked home under the artifacts root whose item, a `wi_` ID matching its
-  item folder, is finished, or a marked home in a finished checkout, loses only
+- A marked home under its own item's folder, `<artifacts>/<item id>/...`,
+  whose item is finished, or a marked home in a finished checkout, loses only
   its owned caches (`would-trim`, then `trimmed`, kind `home-cache`, one row
-  per owned directory). An unfinished item keeps it `item-active`.
+  per owned directory). An unfinished item keeps it `item-active`. A marked
+  home anywhere else under the artifacts root, or under another item's folder,
+  is kept `unproven` and reported.
 - A `/tmp` home without that identity, a lookalike producer included, is kept
   `unproven`.
 
@@ -1864,8 +1866,9 @@ whose environment cannot be read, and a failing `ps` or `lsof` keeps every
 candidate (`remove-failed`); nothing in the home changed within `--min-idle`
 (`recent`); it is not in, does not contain and is not a never-touch path
 (`protected`); and no receipt text names a path in it (`evidence`). An owned
-path is checked one component at a time and is never reached through a link
-(`unproven`). The delete takes the tombstone route above; the read-only module
+path is checked one component at a time and is never reached through a link,
+and one that is, or holds, a Git repository or `.git` entry is refused
+(`unproven`), so a trim never takes a checkout's work. The delete takes the tombstone route above; the read-only module
 directories are made writable inside the tombstone only, and an interrupted
 delete is finished by the next applying sweep.
 

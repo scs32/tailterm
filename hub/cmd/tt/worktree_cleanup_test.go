@@ -4143,7 +4143,7 @@ func TestVerifyHomeKeepsInUseUnfinishedOrRecent(t *testing.T) {
 	requireHomeDecision(t, got, used, "kept", keepInUse, kindHomeCache, "in use at "+filepath.Join(used, "w"))
 	requireHomeDecision(t, got, live, "kept", keepInUse, kindHomeCache, "process 4343 is alive")
 	requireHomeDecision(t, got, unfinished, "kept", keepItemActive, kindHomeCache, trimItemLive+" is not finished")
-	requireHomeDecision(t, got, unknown, "kept", keepItemActive, kindHomeCache, trimItemRel+" is not finished")
+	requireHomeDecision(t, got, unknown, "kept", keepUnproven, kindHomeCache, "the home is under scratch, not its item's artifact folder")
 	requireHomeDecision(t, got, recent, "kept", keepRecent, kindHomeCache, "changed 1h0m0s ago")
 	if fixtureTree(t, f.artifacts()) != before {
 		t.Fatal("a kept home changed")
@@ -4812,4 +4812,101 @@ func TestWorktreeCleanupRunnerExaminesReleaseWithinOneInterval(t *testing.T) {
 	if rec := homeReceipt(t, w, "removed"); rec.Source != "closeout" || rec.EntryID != finished.ID {
 		t.Fatalf("removal receipt %+v", rec)
 	}
+}
+
+// Review #35288 f3: a marked home under the artifacts root is its item's only
+// under <artifacts>/<item>/; under another folder it is reported, even when
+// its item is finished.
+func TestVerifyHomeOnlyTrimsUnderItsItemFolder(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	stray := writeHome(t, filepath.Join(f.artifacts(), "builder-x", "home"), manualMarker(trimItemAcc, old))
+	other := writeHome(t, filepath.Join(f.artifacts(), trimItemRel, "home"), manualMarker(trimItemAcc, old))
+	own := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "home"), manualMarker(trimItemAcc, old))
+	before := fixtureTree(t, stray, other)
+	got := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc), f.accepted(trimItemRel)}}, true)
+	requireHomeDecision(t, got, stray, "kept", keepUnproven, kindHomeCache, "the home is under builder-x, not its item's artifact folder")
+	requireHomeDecision(t, got, other, "kept", keepUnproven, kindHomeCache, "the home is under "+trimItemRel+", not its item's artifact folder")
+	requireHomeDecision(t, got, filepath.Join(own, "go-build"), "trimmed", "", kindHomeCache, trimItemAcc)
+	if fixtureTree(t, stray, other) != before {
+		t.Fatal("a home outside its item's folder changed")
+	}
+}
+
+// Review #35288 f1: an owned path that is, or holds, a Git repository is
+// refused, so a trim never deletes a checkout's work.
+func TestVerifyHomeRefusesOwnedRepository(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-48 * time.Hour)
+	marker := func() map[string]any {
+		m := manualMarker(trimItemAcc, old)
+		m["owns"] = []string{"go-build", "w"}
+		return m
+	}
+	holds := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "holds", "home"), marker())
+	cleanupGit(t, f.root, "init", "-q", filepath.Join(holds, "w", "checkout"))
+	is := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "is", "home"), marker())
+	cleanupGit(t, f.root, "init", "-q", filepath.Join(is, "w"))
+	gitDir := manualMarker(trimItemAcc, old)
+	gitDir["owns"] = []string{"w/.git"}
+	named := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "named", "home"), gitDir)
+	cleanupGit(t, f.root, "init", "-q", filepath.Join(named, "w"))
+	// Two days old by the fixture's clock, like everything else here.
+	idle := f.now.Add(-48 * time.Hour)
+	for _, root := range []string{holds, is, named} {
+		_ = filepath.WalkDir(filepath.Join(root, "w"), func(p string, d os.DirEntry, err error) error {
+			if err == nil {
+				_ = os.Chtimes(p, idle, idle)
+			}
+			return nil
+		})
+	}
+	before := fixtureTree(t, holds, is, named)
+	got := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}, true)
+	requireHomeDecision(t, got, holds, "kept", keepUnproven, kindHomeCache, "owned path w holds Git repository w/checkout")
+	requireHomeDecision(t, got, is, "kept", keepUnproven, kindHomeCache, "owned path w is a Git repository")
+	requireHomeDecision(t, got, named, "kept", keepUnproven, kindHomeCache, "owned path w/.git: w/.git is a Git directory")
+	if fixtureTree(t, holds, is, named) != before {
+		t.Fatal("a home owning a repository changed")
+	}
+}
+
+// Review #35288 f2: an evidence lookup that fails in the verifier home pass
+// returns its error only after the trims and removals the same pass already
+// applied are recorded.
+func TestVerifyHomeEvidenceErrorKeepsEarlierReceipts(t *testing.T) {
+	f := newHomeFixture(t)
+	checkout := f.verifierCheckout(t, trimItemAcc, "verifier-abc1234")
+	cache := installModules(t, checkout)
+	home := writeHome(t, filepath.Join(f.artifacts(), trimItemAcc, "adhoc", "home"), manualMarker(trimItemAcc, f.now.Add(-48*time.Hour)))
+	original := worktreeGit
+	worktreeGit = func(ctx context.Context, dir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "grep" && strings.Contains(strings.Join(args, " "), home) {
+			return "", errors.New("git grep failed in the fixture")
+		}
+		return original(ctx, dir, args...)
+	}
+	t.Cleanup(func() { worktreeGit = original })
+	decisions, err := runWorktreeSweep(context.Background(), sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}, trimHost,
+		sweepOptions{Repo: f.main, Apply: true, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: f.now})
+	if err == nil || !strings.Contains(err.Error(), "verifier home evidence lookup") {
+		t.Fatalf("error %v, want the verifier home lookup failure", err)
+	}
+	trimmed := false
+	for _, d := range decisions {
+		if d.Path == cache && d.Action == "trimmed" {
+			trimmed = d.recorded
+		}
+		if pathWithin(d.Path, home) {
+			t.Fatalf("a home was decided without its evidence check: %+v", d)
+		}
+	}
+	if !trimmed {
+		t.Fatalf("the applied node_modules trim is not among the recorded decisions: %+v", decisions)
+	}
+	requireExists(t, cache, false)
+	if r := homeReceipt(t, cache, "trimmed"); r.Kind != kindCache {
+		t.Fatalf("trim receipt %+v", r)
+	}
+	requireExists(t, filepath.Join(home, "go-build", "aa", "aa11-a"), true)
 }
