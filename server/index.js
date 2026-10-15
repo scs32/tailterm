@@ -202,6 +202,19 @@ app.get("/api/keys/:id/public-key", (req, res) => {
     publicKey: `${parsed.type} ${parsed.getPublicSSH().toString("base64")}`,
   });
 });
+// ssh2 trims leading zero bytes from the fixed 32-byte ed25519 public key, so
+// about 1 in 256 generated keys is malformed. Generate again; eight misses in a
+// row (about 1 in 2^64) is a named server failure, not a bad-key 400.
+const keyGenerationAttempts = 8;
+function generateKey() {
+  for (let attempt = 0; attempt < keyGenerationAttempts; attempt++) {
+    const privateKey = utils.generateKeyPairSync("ed25519").private;
+    const parsed = utils.parseKey(privateKey);
+    if (!(parsed instanceof Error) && !Array.isArray(parsed))
+      return { privateKey, parsed };
+  }
+  return null;
+}
 app.post(["/api/keys", "/api/keys/generate"], (req, res) => {
   const { name, passphrase } = req.body;
   let privateKey = req.body.privateKey;
@@ -215,11 +228,13 @@ app.post(["/api/keys", "/api/keys/generate"], (req, res) => {
     return res
       .status(400)
       .json({ error: "Name and private key are required." });
-  if (generating) privateKey = utils.generateKeyPairSync("ed25519").private;
-  const parsed = utils.parseKey(
-    privateKey,
-    generating ? undefined : passphrase || undefined,
-  );
+  let parsed;
+  if (generating) {
+    const generated = generateKey();
+    if (!generated)
+      return res.status(500).json({ error: "SSH key generation failed." });
+    ({ privateKey, parsed } = generated);
+  } else parsed = utils.parseKey(privateKey, passphrase || undefined);
   if (
     parsed instanceof Error ||
     Array.isArray(parsed) ||

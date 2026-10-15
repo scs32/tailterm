@@ -14,6 +14,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { generateKeyPairSync, createHash, randomUUID } from "node:crypto";
 import { connect, createServer as createNetServer } from "node:net";
+import { pathToFileURL } from "node:url";
 import ssh2 from "ssh2";
 const { Server, utils } = ssh2;
 import WebSocket from "ws";
@@ -485,6 +486,118 @@ test("teardown returns when the server already exited", async () => {
     const started = Date.now();
     await stopAppServer(proc);
     assert.ok(Date.now() - started < 1000);
+  } finally {
+    if (proc) await stopAppServer(proc);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("key generation retries a malformed ssh2 key, never a 400", async () => {
+  // server/index.js keyGenerationAttempts.
+  const attempts = 8;
+  const dir = mkdtempSync(path.join(os.tmpdir(), "tailterm-keygen-"));
+  // A preload wraps the server's own ssh2 generator: its first attempts + 1
+  // calls return a key ssh2 itself emitted malformed, later calls pass through.
+  // It logs counts only; keys never leave the server process.
+  const preload = path.join(dir, "malformed-first.mjs");
+  writeFileSync(
+    preload,
+    `import { createRequire } from "node:module";
+const { utils } = createRequire(${JSON.stringify(path.resolve("server/index.js"))})("ssh2");
+const generate = utils.generateKeyPairSync;
+const malformed = (key) => utils.parseKey(key.private) instanceof Error;
+let calls = 0;
+utils.generateKeyPairSync = (...args) => {
+  calls++;
+  let key = generate(...args);
+  if (calls <= ${attempts + 1}) {
+    while (!malformed(key)) key = generate(...args);
+    console.error(\`keygen-probe call=\${calls} malformed=forced\`);
+  } else if (malformed(key))
+    console.error(\`keygen-probe call=\${calls} malformed=natural\`);
+  return key;
+};
+`,
+  );
+  const nodeOptions = process.env.NODE_OPTIONS;
+  let proc, origin, log;
+  try {
+    const flag = `--import=${pathToFileURL(preload)}`;
+    process.env.NODE_OPTIONS = `${nodeOptions ?? ""} ${flag}`;
+    try {
+      ({ proc, origin, log } = await startAppServer({
+        dir,
+        onSpawn: (child) => (proc = child),
+      }));
+    } finally {
+      if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = nodeOptions;
+    }
+    let cookie = "";
+    const request = async (url, method = "GET", body) => {
+      const r = await fetch(origin + "/api" + url, {
+        method,
+        headers: { origin, "content-type": "application/json", cookie },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: r.status, body: await r.json(), r };
+    };
+    const login = await request("/unlock", "POST", {
+      password: "keygen test passphrase",
+    });
+    assert.equal(login.status, 200);
+    cookie = login.r.headers.get("set-cookie").split(";")[0];
+    // Probe lines cross a pipe, so they can trail the response they belong to.
+    const probes = async (kind, count) => {
+      const deadline = Date.now() + 5000;
+      const line = new RegExp(`keygen-probe .* malformed=${kind}`, "g");
+      const seen = () => log().match(line) ?? [];
+      while (seen().length < count && Date.now() < deadline)
+        await new Promise((r) => setTimeout(r, 20));
+      return seen();
+    };
+    // Every attempt malformed: a named server failure, nothing saved.
+    const exhausted = await request("/keys/generate", "POST", { name: "k0" });
+    assert.equal(exhausted.status, 500);
+    assert.equal(exhausted.body.error, "SSH key generation failed.");
+    assert.equal((await probes("forced", attempts)).length, attempts);
+    assert.equal((await request("/data")).body.keys.length, 0);
+    // The next call is also malformed, so generation 1 must retry to succeed.
+    const loops = 1000;
+    for (let i = 0; i < loops; i++) {
+      const generated = await request("/keys/generate", "POST", {
+        name: `k${i + 1}`,
+      });
+      assert.equal(generated.status, 200, `generation ${i + 1}`);
+      assert.doesNotMatch(
+        JSON.stringify(generated.body),
+        /PRIVATE KEY|privateKey|passphrase/,
+      );
+      const [{ id, fingerprint }] = generated.body.keys;
+      const exported = await request(`/keys/${id}/public-key`);
+      assert.equal(exported.status, 200);
+      const [type, base64] = exported.body.publicKey.split(" ");
+      assert.equal(type, "ssh-ed25519");
+      const blob = Buffer.from(base64, "base64");
+      // string "ssh-ed25519" + string of the full 32-byte key.
+      assert.equal(blob.length, 4 + 11 + 4 + 32);
+      assert.equal(blob.readUInt32BE(15), 32);
+      assert.equal(
+        fingerprint,
+        "SHA256:" +
+          createHash("sha256").update(blob).digest("base64").replace(/=+$/, ""),
+      );
+      assert.equal((await request(`/keys/${id}`, "DELETE")).status, 200);
+    }
+    assert.equal(
+      (await probes("forced", attempts + 1)).at(-1),
+      `keygen-probe call=${attempts + 1} malformed=forced`,
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    const natural = (await probes("natural", 0)).length;
+    console.log(
+      `keygen: ${loops} generations, 0 failures, ` +
+        `${natural} natural malformed keys retried`,
+    );
   } finally {
     if (proc) await stopAppServer(proc);
     rmSync(dir, { recursive: true, force: true });
