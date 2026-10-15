@@ -425,10 +425,20 @@ test("foreground group SIGINT stops detached check descendants before cleanup", 
   );
   let descendantInfo;
   try {
-    for (let i = 0; !existsSync(info) && i < 250; i++)
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    assert(existsSync(info), "descendant listener started");
-    descendantInfo = JSON.parse(readFileSync(info));
+    // The descendant creates descendant.json before it finishes writing it, so
+    // wait until the content parses: an existing file can still be empty.
+    for (const deadline = Date.now() + 10_000; !descendantInfo; ) {
+      try {
+        descendantInfo = JSON.parse(readFileSync(info, "utf8"));
+      } catch (error) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+        assert(
+          runner.exitCode === null && runner.signalCode === null && Date.now() < deadline,
+          "descendant listener started and wrote complete descendant.json",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
     process.kill(-runner.pid, "SIGINT");
     const [code] = await once(runner, "close");
     assert.equal(code, 130);
@@ -446,8 +456,25 @@ test("foreground group SIGINT stops detached check descendants before cleanup", 
     assert(!existsSync(join(output, "receipt.json")));
     assert(existsSync(join(output, digest("npm-unit") + ".attempt-1.log")));
   } finally {
-    if (runner.exitCode === null && runner.signalCode === null)
-      runner.kill("SIGKILL");
+    // The runner starts the check in a process group of its own, which only
+    // the runner's interruption path stops. A failure before that path ran
+    // interrupts the runner first, then kills the runner's whole group.
+    if (runner.exitCode === null && runner.signalCode === null) {
+      try {
+        process.kill(-runner.pid, "SIGINT");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+      await Promise.race([
+        once(runner, "close"),
+        new Promise((resolve) => setTimeout(resolve, 10_000).unref()),
+      ]);
+    }
+    try {
+      process.kill(-runner.pid, "SIGKILL");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
     if (descendantInfo) {
       try {
         process.kill(descendantInfo.pid, "SIGKILL");
