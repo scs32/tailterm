@@ -94,7 +94,7 @@ func TestReviewConvergenceNativeCLISummaryAndProjection(t *testing.T) {
 	if len(queue.Entries) != 2 || queue.Entries[0].Reviews == nil || len(queue.Entries[0].Reviews.Rounds) != 2 || len(queue.Entries[0].Reviews.FollowUps) != 1 {
 		t.Fatal("native projection", queue)
 	}
-	if !strings.Contains(summary, primary.ID+" reviews: 2/2; follow-ups: 1") || !strings.Contains(summary, "reviews: unknown; follow-ups: unknown") {
+	if !strings.Contains(summary, primary.ID+" reviews: 2/2; follow-ups: 1 new, 0 folded\n") || !strings.Contains(summary, "reviews: unknown; follow-ups: unknown") {
 		t.Fatal(summary)
 	}
 	if queue.Entries[1].Reviews.History != "unknown" {
@@ -125,19 +125,22 @@ func TestReviewConvergenceNativeCLISummaryAndProjection(t *testing.T) {
 // wi_44b17e10c6450225 v4: the summary counts the current review stage against
 // the limit. The numbers match the Board fixture in
 // tests/team-delivery-view.test.js.
+// wi_9ef06213a36c65c3: follow-ups split into new and folded with the Delivery
+// view's rule, on the stage line and the single-stage line.
 func TestSummarizeReviewsCountsCurrentStage(t *testing.T) {
 	rounds := []api.ReviewRound{{Number: 1, RequestSeq: 10}, {Number: 2, RequestSeq: 20}, {Number: 1, RequestSeq: 40}}
 	followUps := make([]api.ReviewFollowUp, 3)
+	followUps[0].Folded = true
 	stages := []api.ReviewStage{{Number: 1, OrderSeq: 3, ScopeRevision: 1, AssignmentSeq: 5}, {Number: 2, OrderSeq: 25, ScopeRevision: 2, AssignmentSeq: 30}}
 	got := summarizeReviews([]api.ReviewConvergence{
 		{ItemID: "wi_two", History: "recorded", Stages: stages, Rounds: rounds, FollowUps: followUps},
-		{ItemID: "wi_one", History: "recorded", Stages: stages[:1], Rounds: rounds[:2], FollowUps: followUps[:1]},
-		{ItemID: "wi_none", History: "recorded", Rounds: rounds[:2], FollowUps: followUps[:1]},
+		{ItemID: "wi_one", History: "recorded", Stages: stages[:1], Rounds: rounds[:2], FollowUps: followUps[:2]},
+		{ItemID: "wi_none", History: "recorded", Rounds: rounds[:2], FollowUps: followUps[1:2]},
 		{ItemID: "wi_unknown", History: "unknown"},
 	})
-	want := "wi_two stage 2: reviews 1/2 (earlier stages: 2); follow-ups: 3\n" +
-		"wi_one reviews: 2/2; follow-ups: 1\n" +
-		"wi_none reviews: 2/2; follow-ups: 1\n" +
+	want := "wi_two stage 2: reviews 1/2 (earlier stages: 2); follow-ups: 2 new, 1 folded\n" +
+		"wi_one reviews: 2/2; follow-ups: 1 new, 1 folded\n" +
+		"wi_none reviews: 2/2; follow-ups: 1 new, 0 folded\n" +
 		"wi_unknown reviews: unknown; follow-ups: unknown\n"
 	if got != want {
 		t.Fatalf("summary\n got %q\nwant %q", got, want)

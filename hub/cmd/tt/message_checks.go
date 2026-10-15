@@ -353,10 +353,22 @@ func summarizeReviews(list []api.ReviewConvergence) string {
 			fmt.Fprintf(&out, "%s reviews: unknown; follow-ups: unknown\n", item.ItemID)
 		} else if stage, rounds, earlier := item.CurrentStage(); stage > 1 {
 			// Only the current stage counts against the limit; follow-ups are a total.
-			fmt.Fprintf(&out, "%s stage %d: reviews %d/2 (earlier stages: %d); follow-ups: %d\n", item.ItemID, stage, len(rounds), earlier, len(item.FollowUps))
+			fmt.Fprintf(&out, "%s stage %d: reviews %d/2 (earlier stages: %d); follow-ups: %s\n", item.ItemID, stage, len(rounds), earlier, followUpCounts(item.FollowUps))
 		} else {
-			fmt.Fprintf(&out, "%s reviews: %d/2; follow-ups: %d\n", item.ItemID, len(item.Rounds), len(item.FollowUps))
+			fmt.Fprintf(&out, "%s reviews: %d/2; follow-ups: %s\n", item.ItemID, len(item.Rounds), followUpCounts(item.FollowUps))
 		}
 	}
 	return out.String()
+}
+
+// followUpCounts splits follow-ups the way the Board's Delivery view does: a
+// folded finding was saved on an existing item, so it is not a new one.
+func followUpCounts(list []api.ReviewFollowUp) string {
+	folded := 0
+	for _, f := range list {
+		if f.Folded {
+			folded++
+		}
+	}
+	return fmt.Sprintf("%d new, %d folded", len(list)-folded, folded)
 }

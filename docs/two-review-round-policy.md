@@ -164,10 +164,12 @@ named but not summed: `stage 2: reviews 1/2 (earlier stages: 2)` and
 `Stage 2 · Reviews 1/2 · Earlier stages 2`. The queue summary carries the
 recorded stages so the Board can make that split. An item with one
 stage reads as before, `reviews: 2/2`. Follow-ups stay a total across stages:
-they are open work items whichever stage filed them. The usage report labels an
-ASSIGN "corrections" only when a completed round of its own stage left
-blockers. The helper's round label and the usage report's "review round N" key
-are not stage-aware yet.
+they are open work items whichever stage filed them. The total splits into new
+and folded, `follow-ups: 1 new, 1 folded` and `Follow-ups 1 new, 1 folded`: a
+folded finding was saved on an existing item, not filed as a new one. The usage
+report labels an ASSIGN "corrections" only when a completed round of its own
+stage left blockers. The helper's round label and the usage report's "review
+round N" key are not stage-aware yet.
 
 ### Scope and legacy reconciliation
 
