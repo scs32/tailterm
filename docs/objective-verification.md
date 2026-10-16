@@ -47,7 +47,12 @@ plan. Rehearsal creates the fixture database with that exact base implementation
 opens it with the candidate, reopens the base, reopens the candidate and checks
 retained evidence plus integrity/foreign keys. The required check never uses an
 item-specific hard-coded base. A direct unit invocation defaults to its checkout
-HEAD; matrix execution always supplies the governing base. WASM changes build the test asset.
+HEAD; matrix execution always supplies the governing base. WASM changes build the test asset:
+a `wasm/` path or `scripts/build-wasm.sh` (an exact-path rule; other `scripts/`
+files select only unit and browser) selects `wasm-test-build`. `hub/go.mod` is not
+mapped to it: the build compiles the pinned Tailscale tarball's own module, and the
+runner reads `hub/go.mod` only to check the script's Tailscale version, a mismatch
+falling back to per-home modules rather than changing the build.
 
 The normalized ownership manifest is handler-approved scope evidence, linked to
 the raw assignment and its canonical ownership digest. The runner never parses

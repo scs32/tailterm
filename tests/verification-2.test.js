@@ -188,6 +188,17 @@ test("ownership union diff selects all engines, migration and touched race packa
     ),
   );
 });
+test("wasm build script diff selects the wasm build alongside unit and browser checks", () => {
+  const ids = (paths) => selectChecks(matrix, paths, paths).map((c) => c.id);
+  const script = ids(["scripts/build-wasm.sh"]);
+  assert(script.includes("wasm-test-build"));
+  assert(script.includes("npm-unit"));
+  for (const suite of matrix.browserSuites)
+    assert(script.some((id) => id === suite.file || id.startsWith(suite.file + ":")));
+  const other = ids(["scripts/verify-matrix.mjs"]);
+  assert(other.includes("npm-unit"));
+  assert(!other.includes("wasm-test-build"));
+});
 test("unknown and traversal paths fail closed", () => {
   for (const p of ["unknown/thing", "../client/x", "/client/x", "client/../x"])
     assert.throws(() => selectChecks(matrix, [p], []));

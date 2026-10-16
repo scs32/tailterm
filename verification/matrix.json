@@ -272,6 +272,10 @@
       "groups": ["wasm", "unit", "browser"]
     },
     {
+      "prefixes": ["scripts/build-wasm.sh"],
+      "groups": ["wasm"]
+    },
+    {
       "prefixes": [
         "docs/",
         "AGENTS.md",
