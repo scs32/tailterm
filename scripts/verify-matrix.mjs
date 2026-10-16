@@ -1958,9 +1958,12 @@ function skipUnreadableOlderThanHome(unreadable, table, { run, self, now, homeCr
 }
 
 // HOME, TMPDIR or PWD values of each listed process. Raw environments hold
-// other processes' credentials, so they are matched here and never kept.
+// other processes' credentials, so they are matched here and never kept. An
+// unreadable process that cannot be proven unrelated is returned as unproven
+// beside the matches, so the readable leftovers are still found.
 function environmentMatches(table, roots, probes) {
   const { platform, run, readEnviron } = probes;
+  let unproven;
   const matches = new Set(),
     variable = /(?:^|\s)(?:HOME|TMPDIR|PWD)=(\S+)/g;
   if (platform === "darwin") {
@@ -1987,14 +1990,21 @@ function environmentMatches(table, roots, probes) {
         if (found && underRoots(roots, found[1])) matches.add(pid);
       }
     }
-    if (unreadable.length) skipUnreadableOlderThanHome(unreadable, table, probes);
+    if (unreadable.length)
+      try {
+        skipUnreadableOlderThanHome(unreadable, table, probes);
+      } catch (error) {
+        unproven = error;
+      }
   } else throw new Error("Unsupported platform for the verifier home sweep");
-  return matches;
+  return { matches, unproven };
 }
 
 // Processes of this user that still live in or hold files under the verifier
 // home, found by environment, argv[0], cwd or any open file. The caller and
 // its ancestors are never listed. ps or lsof failure throws (fail closed).
+// An unproven unreadable process throws only after the sweep, with what it
+// found as error.found, so the stop signals those first.
 // probes replaces the platform, the commands, the environ read, the user, the
 // runner's pid and the clock for tests, and carries homeCreatedMs and
 // onUnreadable for the unreadable-environment rule above.
@@ -2040,7 +2050,7 @@ export function verifierHomeProcesses(home, probes = {}) {
     if (!hit.reasons.includes(reason)) hit.reasons.push(reason);
     found.set(pid, hit);
   };
-  for (const pid of environmentMatches(table, roots, {
+  const { matches, unproven } = environmentMatches(table, roots, {
     platform,
     run,
     readEnviron,
@@ -2048,8 +2058,8 @@ export function verifierHomeProcesses(home, probes = {}) {
     now,
     homeCreatedMs,
     onUnreadable,
-  }))
-    add(pid, "env");
+  });
+  for (const pid of matches) add(pid, "env");
   for (const [pid, entry] of table)
     if (underRoots(roots, entry.command.split(" ")[0])) add(pid, "argv");
   let pid = 0;
@@ -2057,7 +2067,9 @@ export function verifierHomeProcesses(home, probes = {}) {
     if (line[0] === "p") pid = Number(line.slice(1));
     else if (line[0] === "n" && underRoots(roots, line.slice(1))) add(pid, "file");
   }
-  return [...found.values()].sort((a, b) => a.pid - b.pid);
+  const result = [...found.values()].sort((a, b) => a.pid - b.pid);
+  if (unproven) throw Object.assign(unproven, { found: result });
+  return result;
 }
 
 const processAlive = (pid) => {
@@ -2071,9 +2083,22 @@ const processAlive = (pid) => {
 
 // Stops every process verifierHomeProcesses finds: SIGTERM, then SIGKILL for
 // survivors, rescanning for children that appear later. Throws if any
-// remains, so the home is kept and no receipt stands.
+// remains, so the home is kept and no receipt stands. A sweep that names an
+// unproven process still stops what it found, then throws that diagnostic
+// (wi_b42cbccf0bd90795).
 export async function stopVerifierHomeProcesses(home, find = verifierHomeProcesses, probes) {
   const stopped = new Map();
+  let unproven;
+  const sweep = () => {
+    unproven = undefined;
+    try {
+      return find(home, probes);
+    } catch (error) {
+      if (!Array.isArray(error.found)) throw error;
+      unproven = error;
+      return error.found;
+    }
+  };
   const signal = (pids, kind) => {
     for (const pid of pids)
       try {
@@ -2087,8 +2112,11 @@ export async function stopVerifierHomeProcesses(home, find = verifierHomeProcess
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   };
   for (let round = 0; round < 3; round++) {
-    const found = find(home, probes);
-    if (!found.length) return [...stopped.values()];
+    const found = sweep();
+    if (!found.length) {
+      if (unproven) throw unproven;
+      return [...stopped.values()];
+    }
     for (const hit of found) stopped.set(hit.pid, hit);
     const pids = found.map((hit) => hit.pid);
     signal(pids, "SIGTERM");
@@ -2097,11 +2125,12 @@ export async function stopVerifierHomeProcesses(home, find = verifierHomeProcess
     signal(survivors, "SIGKILL");
     await settle(survivors);
   }
-  const remaining = find(home, probes);
+  const remaining = sweep();
   if (remaining.length)
     throw new Error(
       "processes survived SIGKILL: " + remaining.map((hit) => hit.pid).join(", "),
     );
+  if (unproven) throw unproven;
   return [...stopped.values()];
 }
 

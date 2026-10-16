@@ -10,6 +10,8 @@ import {
   appendFileSync,
   mkdirSync,
   linkSync,
+  openSync,
+  closeSync,
   unlinkSync,
   renameSync,
   rmSync,
@@ -353,18 +355,42 @@ export function readJournal(file = lockPath()) {
 // The mutex and the reclaim guard are taken the same way: the owner record is
 // written to a private file first and linked into place. The link is atomic
 // and fails when the name exists, so neither is ever visible without its owner.
+// A filesystem without hard links (exFAT, some network mounts) refuses the
+// link with EPERM or ENOTSUP; there the name is created with O_EXCL instead,
+// which is as exclusive. Until its record is written it reads as an owner we
+// cannot identify, so others see it busy and never reclaim it; a create whose
+// write fails is removed, and one left by a crash in between stays for the
+// operator, like any unidentifiable owner (wi_b42cbccf0bd90795).
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP"]);
 function linkOwner(target, owner) {
+  const record = JSON.stringify(owner) + "\n";
   const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temp, JSON.stringify(owner) + "\n", { mode: 0o600, flag: "wx" });
+  writeFileSync(temp, record, { mode: 0o600, flag: "wx" });
   try {
     linkSync(temp, target);
     return true;
   } catch (error) {
     if (error.code === "EEXIST") return false;
-    throw error;
+    if (!NO_HARD_LINKS.has(error.code)) throw error;
   } finally {
     rmSync(temp, { force: true });
   }
+  let fd;
+  try {
+    fd = openSync(target, "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, record);
+  } catch (error) {
+    rmSync(target, { force: true });
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+  return true;
 }
 function readOwner(target) {
   let raw;

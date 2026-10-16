@@ -1,14 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import fs, {
   mkdirSync,
   writeFileSync,
   readFileSync,
   rmSync,
   existsSync,
   readdirSync,
+  statSync,
   symlinkSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { prepareTestBinary } from "./test-binaries.mjs";
@@ -27,7 +29,7 @@ import {
 } from "../scripts/verify-matrix.mjs";
 // Named separately so the red tests load on a runner that lacks these exports.
 import * as matrixRunner from "../scripts/verify-matrix.mjs";
-import { readJournal } from "../scripts/verify-matrix-host-lock.mjs";
+import { readJournal, lockPaths, takeMutex, releaseMutex } from "../scripts/verify-matrix-host-lock.mjs";
 import {
   readHostState,
   fakeTTCalls,
@@ -1298,7 +1300,7 @@ test("bundle v7 an unreadable environ is skipped only for a process that started
   // Without the home's creation time nothing is proven.
   sweep = linuxSweep(t, { 700: { startedAfterHomeMs: hourBefore } });
   assert.throws(() => sweep.find({ homeCreatedMs: undefined }), /the home's creation time is not known$/);
-  assert.equal(sweep.calls.length, 1, "no start-time ps without it");
+  assert(!sweep.calls.some((call) => call.includes("etimes")), "no start-time ps without it");
   // Any other read error still throws as it is, and many pids are bounded.
   sweep = linuxSweep(t, { 700: { code: "EIO" } });
   assert.throws(() => sweep.find(), { message: "environ EIO" });
@@ -1364,4 +1366,134 @@ test("bundle v7 a run records the unreadable processes it skipped once each, and
   const plain = tempDir(t, "bundle-v7-logs-");
   await runPlan(plan, f.cwd, plain);
   assert(!existsSync(join(plain, "home-sweep-unreadable.json")));
+});
+
+// link(2) refused as a filesystem without hard links refuses it. The host-lock
+// module imports linkSync by name, so the builtin's live binding is replaced
+// too, only for the synchronous body.
+function withoutHardLinks(code, body) {
+  const original = fs.linkSync;
+  let links = 0;
+  fs.linkSync = () => {
+    links++;
+    throw Object.assign(new Error(`${code}: operation not supported, link`), { code });
+  };
+  syncBuiltinESMExports();
+  try {
+    return body(() => links);
+  } finally {
+    fs.linkSync = original;
+    syncBuiltinESMExports();
+  }
+}
+
+test("the launch mutex is taken without hard links by an exclusive create with the same owner and stale-holder rules", (t) => {
+  for (const code of ["EPERM", "ENOTSUP"]) {
+    const output = tempDir(t, "launch-mutex-no-links-");
+    const paths = lockPaths(join(output, "runner.json"));
+    const owner = () => JSON.parse(readFileSync(paths.mutex, "utf8"));
+    withoutHardLinks(code, (links) => {
+      // Taken: the owner record is in place, private, and no temp file stays.
+      const busy = {};
+      const token = takeMutex(paths, {}, busy);
+      assert.equal(typeof token, "string", code);
+      assert(links() > 0, code + ": the link was tried first");
+      assert.deepEqual(Object.keys(owner()).sort(), ["at", "pid", "token"], code);
+      assert.equal(owner().pid, process.pid, code);
+      assert.equal(owner().token, token, code);
+      assert.equal(statSync(paths.mutex).mode & 0o777, 0o600, code);
+      assert.deepEqual(readdirSync(output), ["runner.json.lock"], code);
+      // Busy while held by a live owner, then released by its token only.
+      const second = {};
+      assert.equal(takeMutex(paths, {}, second), null, code);
+      assert.equal(second.owner.token, token, code);
+      assert.equal(releaseMutex(paths, "someone-else"), false, code);
+      assert.equal(releaseMutex(paths, token), true, code);
+      assert.deepEqual(readdirSync(output), [], code);
+
+      // A dead owner is reclaimed under the guard, which is taken the same way.
+      const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+      assert(!pidAlive(dead));
+      writeFileSync(paths.mutex, JSON.stringify({ pid: dead, token: "dead", at: new Date().toISOString() }) + "\n");
+      const reclaimed = takeMutex(paths, {}, {});
+      assert.equal(typeof reclaimed, "string", code);
+      assert.equal(owner().token, reclaimed, code);
+      assert.deepEqual(
+        readJournal(paths.file).map((entry) => [entry.event, entry.deadPid, entry.token]),
+        [["mutex-recovered", dead, "dead"]],
+        code,
+      );
+      assert.deepEqual(readdirSync(output).sort(), ["host.journal.jsonl", "runner.json.lock"], code + ": guard removed");
+      releaseMutex(paths, reclaimed);
+
+      // A name created but not yet written (or left so by a crash) is an
+      // owner nobody can identify: busy, and never reclaimed.
+      writeFileSync(paths.mutex, "");
+      const unknown = {};
+      assert.equal(takeMutex(paths, {}, unknown), null, code);
+      assert.deepEqual(unknown.owner, { pid: null, token: null }, code);
+      assert.equal(readFileSync(paths.mutex, "utf8"), "", code);
+    });
+  }
+  // Any other link error still fails as it is and leaves nothing behind.
+  const output = tempDir(t, "launch-mutex-no-links-");
+  const paths = lockPaths(join(output, "runner.json"));
+  withoutHardLinks("EIO", () => assert.throws(() => takeMutex(paths), { code: "EIO" }));
+  assert.deepEqual(readdirSync(output), []);
+});
+
+test("the home sweep stops the readable leftovers it found before failing closed on an unproven unreadable process", async (t) => {
+  const processes = {
+    700: { command: "young daemon", startedAfterHomeMs: 1000 },
+    710: { command: "leftover", environ: (home) => `PATH=/bin\0HOME=${home}\0` },
+    711: { command: "unrelated", environ: () => "HOME=/somewhere/else\0" },
+  };
+  const sweep = linuxSweep(t, processes);
+  // Found by its executable path under the home rather than its environment.
+  processes[712] = { command: `${sweep.home}/bin/daemon --serve`, environ: () => "HOME=/somewhere/else\0" };
+  const message =
+    "Cannot read the environment of 1 same-user process (pid 700) or prove it unrelated to the verifier home: " +
+    "not started before the home was created, or start time unknown";
+  // The sweep alone still throws its diagnostic, carrying what it did find.
+  assert.throws(
+    () => sweep.find(),
+    (error) => {
+      assert.equal(error.message, message);
+      assert.deepEqual(error.found.map((hit) => [hit.pid, hit.reasons]), [[710, ["env"]], [712, ["argv"]]]);
+      return true;
+    },
+  );
+  // No live process is signalled: kill is replaced, and a stopped pid leaves
+  // the canned process table.
+  const stopped = new Set(),
+    signalled = [],
+    unexpected = [];
+  t.mock.method(process, "kill", (pid, signal) => {
+    if (!processes[pid]) {
+      unexpected.push(pid);
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    }
+    if (signal === 0) {
+      if (stopped.has(pid)) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      return true;
+    }
+    signalled.push([pid, signal]);
+    stopped.add(pid);
+    return true;
+  });
+  const probes = {
+    ...sweep.probes,
+    run: (command, args) => {
+      const out = sweep.probes.run(command, args);
+      if (!args.includes("-axww")) return out;
+      return out
+        .split("\n")
+        .filter((line) => !stopped.has(Number(line.trim().split(/\s+/)[0])))
+        .join("\n");
+    },
+  };
+  await assert.rejects(() => matrixRunner.stopVerifierHomeProcesses(sweep.home, undefined, probes), { message });
+  t.mock.restoreAll();
+  assert.deepEqual(signalled, [[710, "SIGTERM"], [712, "SIGTERM"]]);
+  assert.deepEqual(unexpected, []);
 });
