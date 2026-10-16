@@ -21,7 +21,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_activity_request ON agent_activity(task_
 CREATE TABLE IF NOT EXISTS agent_activity_receipts (
  task_id TEXT NOT NULL, request_id TEXT NOT NULL, agent_id TEXT NOT NULL,
  run_id TEXT NOT NULL, payload TEXT NOT NULL, request_payload TEXT NOT NULL,
- PRIMARY KEY(task_id,request_id));`)
+ PRIMARY KEY(task_id,request_id));
+CREATE INDEX IF NOT EXISTS agent_activity_receipts_run ON agent_activity_receipts(agent_id,run_id);`)
 	if err != nil {
 		return err
 	}

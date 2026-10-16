@@ -299,3 +299,61 @@ func TestActivitySameStateReasonIsStored(t *testing.T) {
 		t.Fatalf("receipts %d", n)
 	}
 }
+
+// The receipt reads of one run search the run index instead of walking every
+// receipt of the project: the reply baseline (copied from provider_block.go)
+// and the matrix run-end previous-report read.
+func TestActivityReceiptQueriesUseRunIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if n := countRows(t, s, `SELECT count(*) FROM sqlite_master WHERE type='index' AND name='agent_activity_receipts_run'`); n != 1 {
+		t.Fatalf("run index count %d", n)
+	}
+	baseline := `SELECT payload FROM agent_activity_receipts WHERE task_id=? AND agent_id=? AND run_id=? AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.state') END='provider_blocked'`
+	for _, q := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"reply baseline", baseline, []any{"tsk_x", "agt_x", "run_x"}},
+		{"matrix run-end previous report", matrixRunEndedPrevious, []any{"agt_x", "run_x"}},
+	} {
+		t.Run(q.name, func(t *testing.T) {
+			rows, err := s.db.Query("EXPLAIN QUERY PLAN "+q.query, q.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			indexed := false
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				t.Log(detail)
+				if strings.Contains(detail, "TEMP B-TREE") {
+					t.Fatalf("the read sorts: %s", detail)
+				}
+				indexed = indexed || strings.Contains(detail, "USING INDEX agent_activity_receipts_run (agent_id=? AND run_id=?)")
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !indexed {
+				t.Fatal("the read does not search the run index")
+			}
+		})
+	}
+}
