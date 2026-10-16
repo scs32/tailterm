@@ -706,13 +706,15 @@ it with `git worktree remove PATH` once its candidate is integrated.
 parallel project) under the same rule. Until the hub confirms the entry, any
 failure removes the worktree, so the add can be rerun. When the add's response
 is lost, the CLI reads back the item's entry before removing anything: if the
-hub saved one naming the new worktree at the same base, order and ownership,
-it keeps the worktree and reports the entry as added. A failed read-back
-counts as nothing saved, so the worktree is removed and the saved entry names
-a missing directory. Rerunning the same add repairs that while the checkout's
-`HEAD` is still the entry's base: it recreates the worktree, the hub refuses
-the duplicate item, and the read-back keeps the worktree. Otherwise remove the
-entry and add it again.
+hub saved a queued first attempt naming the new worktree at the same base,
+order and ownership, it keeps the worktree and reports the entry as added. Any
+other entry for the item, such as a failed one, keeps the hub's refusal (with
+its requeue guidance) and the worktree is removed. A failed read-back counts
+as nothing saved, so the worktree is removed and the saved entry names a
+missing directory. Rerunning the same add repairs that while the entry is
+still queued and the checkout's `HEAD` is still its base: it recreates the
+worktree, the hub refuses the duplicate item, and the read-back keeps the
+worktree. Otherwise remove the entry and add it again.
 
 Release the hub before the CLI: a CLI that sends the move to an older hub
 refuses when the saved entry lacks the new `cwd` and removes the worktree. The

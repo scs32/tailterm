@@ -1080,8 +1080,10 @@ func unacknowledgedSeqs(err error) []string {
 }
 
 // savedQueueAdd reads back the entry an add whose response failed may have
-// saved. It is this add's entry only when it names the new worktree at the
-// same base, order and ownership. The lookup has its own deadline, since the add may
+// saved. It is this add's entry only when it is a queued first attempt (an
+// add saves nothing else; attempt 0 is a hub that predates attempts) naming
+// the new worktree at the same base, order and ownership. Any other entry
+// keeps the hub's error, such as its requeue guidance for a failed entry. The lookup has its own deadline, since the add may
 // have spent the command's.
 func savedQueueAdd(c *api.Client, task string, req api.TeamQueueRequest) (api.TeamQueueEntry, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1091,7 +1093,7 @@ func savedQueueAdd(c *api.Client, task string, req api.TeamQueueRequest) (api.Te
 		return api.TeamQueueEntry{}, false
 	}
 	for _, q := range list.Entries {
-		if q.ItemID == req.ItemID && q.Cwd == req.Cwd && q.BaseCommit == req.BaseCommit && q.OrderMessageSeq == req.OrderMessageSeq && slices.Equal(q.Ownership, req.Ownership) {
+		if q.ItemID == req.ItemID && q.State == "queued" && q.Attempt <= 1 && q.Cwd == req.Cwd && q.BaseCommit == req.BaseCommit && q.OrderMessageSeq == req.OrderMessageSeq && slices.Equal(q.Ownership, req.Ownership) {
 			return q, true
 		}
 	}

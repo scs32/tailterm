@@ -1773,6 +1773,50 @@ func TestTeamQueueCLIAddFromAgentSessionRefusedBeforeWrites(t *testing.T) {
 	}
 }
 
+// q1 (review b1): rerunning add for an item whose earlier entry failed, its
+// worktree since removed and the checkout's HEAD unchanged, keeps the hub's
+// refusal and removes the new worktree: only a queued first attempt is an
+// entry this add could have saved.
+func TestTeamQueueCLIRerunAddOverFailedEntryKeepsRefusal(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	item, order := queueFixtureItem(t, f, "rerun-failed")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--owns", "client"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{Item: item.ID})
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Attempt > 1 {
+		t.Fatalf("first add %+v %v", list, err)
+	}
+	q := list.Entries[0]
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rerun-fail", Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", repo, "worktree", "remove", "--force", q.Cwd).Run(); err != nil {
+		t.Fatal(err)
+	}
+	refusal, wantErr := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "add", ItemID: item.ID, OrderMessageSeq: order, Host: q.Host, Cwd: q.Cwd, Repository: q.Repository, BaseCommit: q.BaseCommit, Ownership: q.Ownership})
+	if wantErr == nil {
+		t.Fatalf("hub accepted a second add %+v", refusal)
+	}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--owns", "client"})
+	})
+	if err == nil || err.Error() != wantErr.Error() || !strings.Contains(out, "worktree "+q.Cwd) {
+		t.Fatalf("rerun over a failed entry: out=%q err=%v, want the hub's %v", out, err, wantErr)
+	}
+	requireNoQueueWorktree(t, repo, q.Cwd, "rerun over a failed entry")
+	after, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || after.State != "failed" {
+		t.Fatalf("failed entry changed %+v %v", after, err)
+	}
+}
+
 // queueAddProxy fronts the fixture hub; add handles each add request, with
 // the real hub as forward, and lookup each read of one item's entry.
 func queueAddProxy(t *testing.T, hub string, add, lookup func(w http.ResponseWriter, r *http.Request, forward http.Handler)) env {
