@@ -30,6 +30,11 @@ export const HELD_REASONS = ["slots", "memory"];
 export const DEFAULT_HOST_WAIT_MS = 240 * 60000;
 export const DEFAULT_POLL_MS = 2000;
 export const DEFAULT_OVERTAKE_LIMIT = 2;
+// A waiter whose poll count has not changed for this long, as another waiter
+// watched it, has stopped polling (suspended, or its pid now belongs to some
+// other process) and is dropped from the list (wi_ad0818fa3ea0287d). About
+// 150 missed polls at the default interval.
+export const WAITER_STALE_MS = 5 * 60000;
 // No holder keeps the host longer than this, whatever its plan asks for
 // (wi_c5cb667695c3614c). A plan's serial sum is far above what parallel lanes
 // take, so the cap is what bounds a hung run.
@@ -349,6 +354,21 @@ function journal(paths, event, entry = {}, extra = {}) {
     { mode: 0o600 },
   );
 }
+// Closes an exclusive head's idle-slot period: the head itself when the period
+// ends, or the run that drops the head.
+function closeIdle(paths, entry, since, slots, endMs, reason) {
+  journal(paths, "idle-slots", entry, { start: since, end: iso(endMs), ms: Math.max(0, endMs - Date.parse(since)), slots, reason });
+}
+// The journal lines that parse, skipping any that do not.
+function journalLines(paths) {
+  return readFileSync(paths.journal, "utf8").split("\n").filter(Boolean).flatMap((line) => {
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  });
+}
 export function readJournal(file = lockPath()) {
   let raw;
   try {
@@ -533,6 +553,14 @@ function parseState(raw) {
       (e.release !== undefined && typeof e.release !== "boolean") ||
       (e.heldReason !== undefined && !HELD_REASONS.includes(e.heldReason))))
       return "invalid entry";
+    // A waiter's poll count and idle-slot period, checked wherever they
+    // appear. The grant removes them, but a holder carrying them is accepted.
+    if (entries.some(e =>
+      (e.polls !== undefined && (!Number.isSafeInteger(e.polls) || e.polls < 0)) ||
+      (e.polledAt !== undefined && (typeof e.polledAt !== "string" || !Number.isFinite(Date.parse(e.polledAt)))) ||
+      (e.idleSlotsSince !== undefined && (typeof e.idleSlotsSince !== "string" || !Number.isFinite(Date.parse(e.idleSlotsSince)))) ||
+      (e.idleSlots !== undefined && (!Number.isSafeInteger(e.idleSlots) || e.idleSlots < 1 || e.idleSlots > 16))))
+      return "invalid waiter fields";
     if (entries.some(e =>
       (e.exclusive !== undefined && typeof e.exclusive !== "boolean") ||
       (e.exclusiveCapMs !== undefined && (!Number.isSafeInteger(e.exclusiveCapMs) || e.exclusiveCapMs <= 0)) ||
@@ -702,8 +730,9 @@ function hookExit() {
 // host-lock.json sidecar), runTimeoutMs, maxWaitMs, pollMs, graceMs, signal,
 // print, now, extra (copied into the sidecar), environment (holder, fairness
 // and memory-pressure limits), release (the deployer's run, granted first),
-// memoryPressure (a function returning the reading; tests inject one)
-// and exclusive (hold the host alone; see exclusiveCapMs).
+// memoryPressure (a function returning the reading; tests inject one),
+// exclusive (hold the host alone; see exclusiveCapMs) and staleWaiterMs
+// (WAITER_STALE_MS unless a test sets a shorter bound).
 // The requester clamps its own run timeout to the holder cap, so the deadline
 // it records in the file is the one it stops itself at. A waiter never
 // shortens the deadline another holder recorded.
@@ -722,6 +751,7 @@ export async function acquireHostLock(options = {}) {
     now = Date.now,
     recordDirectory,
     memoryPressure = readMemoryPressure,
+    staleWaiterMs = WAITER_STALE_MS,
   } = options;
   const { priority, prioritySource } =
     options.priority && options.prioritySource
@@ -732,6 +762,8 @@ export async function acquireHostLock(options = {}) {
   const runTimeoutMs = Math.min(requestedRunTimeoutMs, holderCapMs(options.environment ?? process.env));
   if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs <= 0)
     throw new Error("Invalid host wait bound");
+  if (!Number.isSafeInteger(staleWaiterMs) || staleWaiterMs <= 0)
+    throw new Error("Invalid stale waiter bound");
   const limit = holderLimit(options.environment ?? process.env);
   const overtakeBudget = overtakeLimit(options.environment ?? process.env);
   const pressureMax = memoryPressureMax(options.environment ?? process.env);
@@ -822,7 +854,19 @@ export async function acquireHostLock(options = {}) {
     busyAt = 0,
     pressure = null,
     unreadableNoted = false,
-    memoryHeldSince = null;
+    memoryHeldSince = null,
+    polls = 0,
+    observedAt = null,
+    idle = null;
+  // Each other waiter's poll count as this waiter last saw it change, and when.
+  const seen = new Map();
+  // This request's own open idle-slot period while it waits as an exclusive
+  // head: { since, slots }. Closed into an idle-slots journal line.
+  const closeMine = (reason, endMs = now()) => {
+    if (!idle) return;
+    closeIdle(paths, entry, idle.since, idle.slots, endMs, reason);
+    idle = null;
+  };
   const probe = () => {
     let reading, reason;
     try {
@@ -848,6 +892,7 @@ export async function acquireHostLock(options = {}) {
   const step = (state, first) => {
     const taken = pressure;
     pressure = null;
+    const at = now();
     // Confirm ownership once under the mutex before checking resource roots.
     // A dead pid with a surviving group still owns its lease and its output.
     // Slot fillers are not holders of their own (see fill).
@@ -857,7 +902,23 @@ export async function acquireHostLock(options = {}) {
       else live.push(holder);
     }
     const dead = state.waiters.filter(w => w.id !== entry.id && pidGone(w.pid));
-    const waiters = state.waiters.filter(w => !dead.includes(w));
+    // A waiter whose poll count has not changed for staleWaiterMs of this
+    // waiter's continuous watching has stopped polling. A gap in this waiter's
+    // own steps (it was paused, or the host slept) restarts the watch, so a
+    // pause never makes others look stale. An entry with no count comes from
+    // an older client and is never judged.
+    if (observedAt !== null && at - observedAt > staleWaiterMs / 2) seen.clear();
+    observedAt = at;
+    const stale = new Map();
+    for (const w of state.waiters) {
+      if (w.id === entry.id || dead.includes(w) || w.polls === undefined) continue;
+      const prior = seen.get(w.id);
+      if (!prior || prior.polls !== w.polls) seen.set(w.id, { polls: w.polls, since: at });
+      else if (at - prior.since >= staleWaiterMs) stale.set(w, at - prior.since);
+    }
+    for (const id of [...seen.keys()])
+      if (!state.waiters.some(w => w.id === id && !stale.has(w))) seen.delete(id);
+    const waiters = state.waiters.filter(w => !dead.includes(w) && !stale.has(w));
     if (first) {
       if (!live.length && !waiters.length) {
         state.version = 2; state.holderLimit = limit; state.holders = []; delete state.holder;
@@ -873,13 +934,27 @@ export async function acquireHostLock(options = {}) {
       waiters.push({ ...entry });
       journal(paths, "request", entry, { seq: entry.seq, priority, prioritySource, kind, ...(exclusive ? { exclusive: true } : {}) });
     }
-    for (const waiter of dead) journal(paths, "waiter-dropped", waiter, { by: entry.id });
+    const dropped = (waiter, extra) => {
+      journal(paths, "waiter-dropped", waiter, { by: entry.id, ...extra });
+      if (waiter.idleSlotsSince !== undefined) closeIdle(paths, waiter, waiter.idleSlotsSince, waiter.idleSlots, at, "dropped");
+    };
+    for (const waiter of dead) dropped(waiter, { reason: "pid-gone" });
+    for (const [waiter, observedMs] of stale)
+      dropped(waiter, { reason: "stale", polls: waiter.polls, polledAt: waiter.polledAt ?? null, observedMs });
     state.waiters = ordered(waiters);
     setHolders(state, live);
     for (const holder of deadHolders)
       journal(paths, "stale-recovered", entry, { reason: "pid-gone", holder: holder.id, holderPid: holder.pid, holderItem: holder.item, holderAgent: holder.agent });
     const mine = state.waiters.findIndex((w) => w.id === entry.id);
-    if (mine < 0) throw new HostLockError("lost-request", `Host lock request ${entry.id} is no longer in ${paths.file}`);
+    if (mine < 0)
+      throw new HostLockError(
+        "lost-request",
+        `Host lock request ${entry.id} is no longer in ${paths.file}: another run dropped it ` +
+          `(see waiter-dropped in ${paths.journal}), as it does a waiter that stops polling`,
+      );
+    const me = state.waiters[mine];
+    me.polls = ++polls;
+    me.polledAt = iso(at);
     const position = mine + 1, length = state.waiters.length;
     if (first) Object.assign(record, { seq: entry.seq, queuePosition: position, queueLength: length });
     const recovered = deadHolders.at(-1) || null;
@@ -907,13 +982,27 @@ export async function acquireHostLock(options = {}) {
           taken.push(h);
         }
         if (used(live.filter(l => !taken.includes(l)), slots) < slots)
-          overlaps = taken.map(h => ({ reason: "run-timeout", holder: h.id, item: h.item, agent: h.agent, pid: pidGone(h.pid) ? null : h.pid, groups: liveGroups(h) }));
+          overlaps = taken.map(h => ({ reason: "run-timeout", holder: h.id, item: h.item, agent: h.agent, pid: pidGone(h.pid) ? null : h.pid, groups: liveGroups(h),
+            // Kept for the exclusive holder's own record: its entry is gone at its release.
+            ...(h.exclusive === true ? { overlapsAfterCap: h.overlapsAfterCap ?? [] } : {}) }));
       }
       const remaining = live.filter(h => !overlaps.some(o => o.holder === h.id));
       const resourceBlocked = entry.worktree && remaining.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
       return { overlaps, remaining, resourceBlocked, free: mine === 0 && used(remaining, slots) < slots && !resourceBlocked };
     };
-    let admission = admit(capacity), memoryHeld = false;
+    // Behind an exclusive head the next waiter may take a free slot, only when
+    // its own run timeout ends no later than the latest live holder's. Every
+    // holder stops itself at its run timeout and an exclusive head takes
+    // nobody over, so that deadline is the latest the head starts either way.
+    const behindExclusive = mine === 1 && state.waiters[0].exclusive === true && !exclusive;
+    const backfill = (slots) => {
+      const holdersEndBy = live.length ? Math.max(...live.map(h => Date.parse(h.startedAt) + h.runTimeoutMs)) : null;
+      const resourceBlocked = !!entry.worktree && live.some(h => h.worktree && canonicalResource(h.worktree) === entry.worktree);
+      const fits = holdersEndBy !== null && at + runTimeoutMs <= holdersEndBy;
+      return { overlaps: [], remaining: live, resourceBlocked, fits, holdersEndBy, free: fits && used(live, slots) < slots && !resourceBlocked };
+    };
+    const decide = (slots) => behindExclusive ? backfill(slots) : admit(slots);
+    let admission = decide(capacity), memoryHeld = false;
     // The reading decides only a grant the slot count allows beside a live
     // holder. With no holder the head is always admitted, and a full host, a
     // later waiter and a one-slot cohort take no reading.
@@ -923,7 +1012,7 @@ export async function acquireHostLock(options = {}) {
         return { granted: false, needsReading: true };
       }
       if (taken.reading > pressureMax) {
-        admission = admit(1);
+        admission = decide(1);
         memoryHeld = !admission.free;
       }
     }
@@ -942,7 +1031,23 @@ export async function acquireHostLock(options = {}) {
     if (mine === 0 && exclusive && !admission.free) line += "; exclusive, waiting for every holder to leave";
     else if (mine === 0 && exclusiveHolder && !admission.free)
       line += "; holder is exclusive" + (releaseMarked && !joinable(exclusiveHolder) ? " until " + iso(capAt(exclusiveHolder)) : "");
+    if (behindExclusive && admission.holdersEndBy !== null && !admission.fits)
+      line += `; behind an exclusive request, no backfill: run timeout ${runTimeoutMs} ms ends after the holders' ${iso(admission.holdersEndBy)}`;
     if (protectedWaiter(state.waiters[mine])) line += "; " + protectionText(state.waiters[mine]);
+    // An exclusive head keeps its idle-slot period: the slots free by count
+    // while it waits for every holder to leave.
+    if (exclusive) {
+      const free = mine === 0 && !admission.free ? capacity - used(live, capacity) : 0;
+      if (mine !== 0) closeMine("not-head", at);
+      else if (admission.free) closeMine("granted", at);
+      else if (idle && idle.slots !== free) closeMine(free > 0 ? "slots-changed" : "backfill-or-holder", at);
+      if (mine === 0 && free > 0 && !idle) idle = { since: iso(at), slots: free };
+    }
+    if (idle) Object.assign(me, { idleSlotsSince: idle.since, idleSlots: idle.slots });
+    else {
+      delete me.idleSlotsSince;
+      delete me.idleSlots;
+    }
     if (admission.free) {
       for (const each of overlaps) journal(paths, "overlap", entry, each);
       // A release run joining an exclusive holder after its cap: the holder's
@@ -950,20 +1055,24 @@ export async function acquireHostLock(options = {}) {
       for (const held of remaining.filter(h => h.exclusive === true)) {
         const at = iso(now()), cap = iso(capAt(held));
         (held.overlapsAfterCap ||= []).push({ at, id: entry.id, item, agent, pid: process.pid, kind });
-        journal(paths, "exclusive-overlap", entry, { holder: held.id, holderItem: held.item, holderAgent: held.agent, holderPid: held.pid, capAt: cap });
+        journal(paths, "exclusive-overlap", entry, { kind, holder: held.id, holderItem: held.item, holderAgent: held.agent, holderPid: held.pid, capAt: cap });
         record.joinedExclusive = { holder: held.id, item: held.item, agent: held.agent, pid: held.pid, capAt: cap };
       }
-      const queued = state.waiters.shift();
+      const head = state.waiters[0], queued = state.waiters.splice(mine, 1)[0];
       for (const waiter of state.waiters) if (waiter.seq < queued.seq) {
         const count = fairnessCount(waiter);
         waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
-        // A release grant, like an urgent one, spends nobody's fairness budget.
-        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" || queued.release === true ? 0 : 1);
+        // A release grant, like an urgent one, spends nobody's fairness budget;
+        // nor does a backfill, which leaves the exclusive head's bound alone.
+        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" || queued.release === true || behindExclusive ? 0 : 1);
       }
       // Persist the new grant order immediately, including between polls when
       // another slot is free and the next grant could happen at once.
       state.waiters = ordered(state.waiters);
-      const acquiredMs = now();
+      const acquiredMs = behindExclusive ? at : now();
+      const backfilled = behindExclusive
+        ? { behind: head.id, endsBy: iso(acquiredMs + runTimeoutMs), holdersEndBy: iso(admission.holdersEndBy) }
+        : null;
       Object.assign(record, {
         acquiredAt: iso(acquiredMs),
         outcome: "holding",
@@ -975,16 +1084,17 @@ export async function acquireHostLock(options = {}) {
         overlap: overlap ? 1 : 0,
         ...(overlap ? { overlapDetails: overlap, overlaps } : {}),
         ...(recovered ? { recovered: { reason: "pid-gone", holder: recovered.id, pid: recovered.pid } } : {}),
+        ...(backfilled ? { backfill: backfilled } : {}),
       });
       if (first && !live.length) Object.assign(record, { queuePosition: 0, queueLength: 0 });
       state.grantSeq += 1;
-      const { grantSeqAtRequest, overtakenBy, heldReason, ...held } = queued;
+      const { grantSeqAtRequest, overtakenBy, heldReason, polls: _, polledAt, idleSlotsSince, idleSlots, ...held } = queued;
       setHolders(state, [...remaining, { ...held, startedAt: record.acquiredAt, groups: [] }]);
-      journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap, memoryHeldMs: record.memoryHeldMs, ...(exclusive ? { exclusive: true } : {}) });
+      journal(paths, "acquire", entry, { seq: entry.seq, waitMs: record.waitMs, overlap: record.overlap, memoryHeldMs: record.memoryHeldMs, ...(exclusive ? { exclusive: true } : {}), ...(backfilled ? { backfill: backfilled } : {}) });
       return { granted: true, overlaps };
     }
     // A later waiter is held by whatever holds the head.
-    const heldReason = mine === 0 ? (memoryHeld ? "memory" : "slots") : state.waiters[0].heldReason ?? "slots";
+    const heldReason = mine === 0 || behindExclusive ? (memoryHeld ? "memory" : "slots") : state.waiters[0].heldReason ?? "slots";
     state.waiters[mine].heldReason = heldReason;
     if (heldReason === "memory") line += "; memory pressure over the limit, one holder admitted";
     return { granted: false, line, position, length, holder };
@@ -1006,6 +1116,7 @@ export async function acquireHostLock(options = {}) {
     } catch {}
     if (removed) active.delete(entry.id);
     memoryHoldEnds();
+    closeMine(event);
     Object.assign(record, { outcome: event, releasedAt: iso(now()), waitMs: Math.max(0, now() - requestedMs) });
     journal(paths, event, entry, { waitMs: record.waitMs, removed, ...extra });
     saveRecord();
@@ -1171,6 +1282,14 @@ export async function acquireHostLock(options = {}) {
         { withinMs: busyAbortMs },
       );
       if (exclusive && !result.done) record.alone = null;
+      // Taken over: the overlap line that removed this holder kept its list.
+      if (exclusive && result.done && !held)
+        try {
+          const line = journalLines(paths).findLast(l => l.event === "overlap" && l.holder === entry.id && Array.isArray(l.overlapsAfterCap));
+          if (line) record.overlapsAfterCap = line.overlapsAfterCap;
+        } catch (error) {
+          say(`matrix host: WARNING could not read ${paths.journal} for this hold's overlaps after its cap (${error.message})`);
+        }
       for (const o of exclusive ? record.overlapsAfterCap : [])
         say(`matrix host: WARNING exclusive hold shared after its cap with ${o.item}/${o.agent}/pid ${o.pid} from ${o.at}`);
       journal(paths, "release", entry, { held, updated: result.done, waitMs: record.waitMs, durationMs: record.durationMs });
@@ -1323,7 +1442,10 @@ export function statusText(file = lockPath()) {
   const waiters = state?.waiters || [];
   lines.push(waiters.length ? "waiters:" : "waiters: none");
   waiters.forEach((w, i) =>
-    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}; ${protectionText(w)}${w.heldReason ? "; held: " + w.heldReason : ""}`),
+    lines.push(`  ${i + 1} of ${waiters.length}: ${describe(w)} (${tags(w)}), requested ${w.requestedAt}, overtaken by ${w.overtakenBy || 0}; ${protectionText(w)}` +
+      (w.polledAt ? `; polled ${w.polledAt}` : "") +
+      (w.idleSlots ? `; idle slots ${w.idleSlots} since ${w.idleSlotsSince}` : "") +
+      (w.heldReason ? "; held: " + w.heldReason : "")),
   );
   return lines.join("\n");
 }

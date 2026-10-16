@@ -877,8 +877,8 @@ host:
   reading is at or below the limit or the holder ends. Later waiters stay behind
   it; nobody is skipped.
 - With no holder the head is always admitted and no reading is taken, so a
-  high reading can never leave the host idle. A full host, a later waiter and
-  a one-slot (`TAILTERM_MATRIX_MAX_HOLDERS=1` or v1) cohort take no reading
+  high reading can never leave the host idle. A full host, a later waiter
+  (except a backfill behind an exclusive head) and a one-slot (`TAILTERM_MATRIX_MAX_HOLDERS=1` or v1) cohort take no reading
   either.
 - A reading that cannot be taken (the command is missing, fails, times out or
   prints something else, or the platform is not macOS) falls back to the slot
@@ -892,7 +892,9 @@ host:
 Each waiter's entry carries `heldReason`, rewritten at every poll: `memory`
 when the head was refused a free slot by the reading, `slots` when no slot is
 free (or its worktree is in use), and for a later waiter whatever holds the
-head. Holders carry none. `status` appends `; held: memory` or `; held: slots`
+head. The waiter directly behind an exclusive head is judged as a head would
+be, since it may backfill a free slot (see "Exclusive holds"). Holders carry
+none. `status` appends `; held: memory` or `; held: slots`
 to each waiter line and `status --json` shows the field, so a sweep can tell a
 full host from a memory hold. A held head also says so in its waiting line.
 When a hold starts the journal gets `memory-hold` with the `reading` and the
@@ -917,16 +919,20 @@ are the data for tuning it.
     "requestedAt": "2026-10-03T22:59:00.000Z",
     "startedAt": "2026-10-03T23:00:00.000Z", "runTimeoutMs": 7200000,
     "groups": [4250], "commit": "exact-sha",
+    "polls": 12, "polledAt": "2026-10-03T22:59:58.000Z",
     "worktree": "/abs/worktree-a", "output": "/abs/logs-a"
   }],
   "waiters": [{
-    "id": "lease-b", "seq": 41, "pid": 4300, "kind": "run",
-    "item": "wi_release", "agent": "deployer",
-    "priority": "high", "prioritySource": "flag", "release": true,
-    "requestedAt": "2026-10-03T23:00:30.000Z", "runTimeoutMs": 7200000,
+    "id": "lease-b", "seq": 41, "pid": 4300, "kind": "exec",
+    "item": "wi_measure", "agent": "builder",
+    "priority": "normal", "prioritySource": "default",
+    "exclusive": true, "exclusiveCapMs": 900000,
+    "requestedAt": "2026-10-03T23:00:30.000Z", "runTimeoutMs": 900000,
     "grantSeqAtRequest": 37, "overtakenBy": 0,
     "nonUrgentOvertakes": 0, "overtakeLimit": 2,
-    "heldReason": "memory",
+    "heldReason": "slots",
+    "polls": 15, "polledAt": "2026-10-03T23:01:00.000Z",
+    "idleSlotsSince": "2026-10-03T23:00:30.000Z", "idleSlots": 1,
     "worktree": "/abs/worktree-b", "output": "/abs/logs-b"
   }]
 }
@@ -934,7 +940,16 @@ are the data for tuning it.
 
 `release` (only ever `true` on the deployer's run) and `heldReason` (`slots` or
 `memory`, waiters only) are optional: files and clients without them stay
-valid, and any other value fails closed like other malformed state.
+valid, and any other value fails closed like other malformed state. So are the
+waiter keys of bug `wi_ad0818fa3ea0287d` (order #36413): `polls`, a count each
+waiter raises on every poll, `polledAt`, the time of that poll, and an
+exclusive head's open idle-slot period, `idleSlotsSince` and `idleSlots` (see
+"Exclusive holds"). They are optional keys with no new value for `version`,
+`kind`, `priority` or `heldReason`, so a client older than them reads the file
+as before and keeps them on entries it rewrites. A count or slot number that is
+not a whole number in range, or a time that does not parse, fails closed. The
+grant removes all four from the new holder entry; a reader still accepts them on
+a holder, as on `lease-a` above.
 
 `holders` is empty when free; v2 has no singleton `holder` alias. Readers must
 inspect all holders. The lease ID, PID and canonical output identify the run.
@@ -952,7 +967,8 @@ live lock to force capacity changes.
 **Worktree and output isolation.** The runner records canonical real worktree
 and output paths, resolving existing symlink ancestors even for new output
 leaves. Only one holder may use a worktree. A blocked head is never skipped to
-fill a spare slot with a later waiter. Duplicate output/record roots are refused
+fill a spare slot with a later waiter; the one exception is the backfill behind
+an exclusive head (see "Exclusive holds"), and never into a worktree in use. Duplicate output/record roots are refused
 before writing sidecars. `exec` uses its canonical current directory. Separate
 worktrees are required for concurrent build/browser runs, as they write local
 `.build`, generated binaries and previews.
@@ -981,8 +997,9 @@ exits 75. SIGINT or SIGTERM while waiting also leaves the list, with the usual
 exit 130 or 143.
 
 **When the lock moves on.** A waiter is granted the lock when it is first in
-the list, a slot is free, no holder uses its canonical worktree and, beside a
-running holder, the memory reading is not over the limit. A dead
+the list (or second, behind an exclusive head, under the backfill rule in
+"Exclusive holds"), a slot is free, no holder uses its canonical worktree and,
+beside a running holder, the memory reading is not over the limit. A dead
 holder frees only its own slot when its process and every recorded check group
 are gone. The second case is journaled as
 `stale-recovered` with reason `pid-gone`. A killed runner whose checks are
@@ -1038,12 +1055,35 @@ After a double takeover three runs can be alive at once (two hung, one new) on
 a host that is already over the limit; that is the price of not waiting for
 hung runs.
 
-A waiter whose process is gone is dropped (`waiter-dropped`). The journal
-events are `request`, `acquire`, `release`, `withdrawn`, `wait-expired`,
-`run-timeout-abort`, `stale-recovered`, `overlap` (one per holder taken over), `waiter-dropped`,
-`mutex-recovered`, `guard-stale`, `corrupt-file`, `holder-update-failed`,
-`memory-hold`, `memory-unreadable` and `exclusive-overlap` (see "Exclusive
-holds" below).
+**A waiter that is gone or stops polling.** A waiter whose process is gone is
+dropped at once (`waiter-dropped` with `reason: "pid-gone"`). Bug
+`wi_ad0818fa3ea0287d`, order #36413: a waiter whose process is alive but no
+longer polls (it was suspended, or it was killed and its pid now belongs to
+another process) is dropped too, after five minutes (`WAITER_STALE_MS`),
+about 150 missed polls at the 2-second interval. Every waiter raises its own
+`polls` count on each poll, and each waiter watches the others' counts. One
+whose count has not changed for five minutes of another waiter's continuous
+watching is dropped, journaled as `waiter-dropped` with `reason: "stale"`,
+`polls`, `polledAt` and `observedMs` (how long it was watched unchanged), and
+`by` naming the run that dropped it. A watcher whose own polls stopped for
+more than half the bound (it was paused itself, or the whole host slept)
+starts its watch again, so a pause never makes the others look stale. A live
+waiter polls every two seconds, so it is never dropped. An entry without
+`polls` comes from a client older than this rule; it is never judged stale and
+blocks the list as before until that client is gone. The rule reads the file
+only, like the rest of the lock: it does not compare process start times. A
+dropped waiter that resumes finds its request gone and fails with `Host lock
+request ID is no longer in FILE: another run dropped it (see
+waiter-dropped in JOURNAL), as it does a waiter that stops polling`, with no
+receipt. A drop removes the entry rather
+than skipping it, so a reused pid never stays in the list or counts in other
+runs' queue position and length.
+
+The journal events are `request`, `acquire`, `release`, `withdrawn`,
+`wait-expired`, `run-timeout-abort`, `stale-recovered`, `overlap` (one per
+holder taken over), `waiter-dropped`, `mutex-recovered`, `guard-stale`,
+`corrupt-file`, `holder-update-failed`, `memory-hold`, `memory-unreadable`,
+`exclusive-overlap` and `idle-slots` (see "Exclusive holds" below).
 Each line has the time, the request id, pid, item and agent. The journal is
 not rotated yet.
 
@@ -1081,8 +1121,8 @@ They are added to the receipt only; checks do not see them.
 | `VERIFICATION_HOST_PRIORITY` | `urgent`, `high` or `normal` |
 | `VERIFICATION_HOST_PRIORITY_SOURCE` | `flag`, `environment` or `default` |
 | `VERIFICATION_HOST_WAIT_MS` | request to acquire |
-| `VERIFICATION_HOST_QUEUE_POSITION` | position when queued; `0` when acquired at once |
-| `VERIFICATION_HOST_QUEUE_LENGTH` | waitlist length when queued, this run included; `0` when acquired at once |
+| `VERIFICATION_HOST_QUEUE_POSITION` | position when queued; `0` only when acquired at once on an empty host; a run acquired at once beside a live holder records `1` |
+| `VERIFICATION_HOST_QUEUE_LENGTH` | waitlist length when queued, this run included; `0` only when acquired at once on an empty host |
 | `VERIFICATION_HOST_GRANTS_BEFORE_START` | runs granted between queueing and this run's start |
 | `VERIFICATION_HOST_OVERTAKEN_BY` | of those, runs that queued later |
 | `VERIFICATION_HOST_OVERLAP` | `1` when the lock was taken by the timeout exception, else `0` |
@@ -1094,8 +1134,10 @@ They are added to the receipt only; checks do not see them.
 with the request id, sequence, pid, item, agent, request, acquire and release
 times, the run timeout (`runTimeoutMs`, clamped, and `requestedRunTimeoutMs`), CPU count, timestamped 1- and 5-minute load samples and any recovery or
 overlap details. It is written on every release, including failed, interrupted
-and withdrawn runs, so the output directory always contains `host-lock.json`
-and `host-lock.log`. The hub does not import these keys or the sidecar in this
+and withdrawn runs, so a run that joined the list leaves `host-lock.json` and
+`host-lock.log` in its output directory. A request refused before it joins (an
+invalid setting, an isolated `HOME`, an output directory already in use)
+writes neither. The hub does not import these keys or the sidecar in this
 phase; they are data for deciding later whether small runs can share the host.
 
 **Supplemental runs.** Run a race suite or any other "run alone" command
@@ -1142,13 +1184,46 @@ team run and the deployer wait while it holds, and give it a short
   `--timeout-minutes`, clamped by the holder cap, and an overdue exclusive
   holder is taken over (with every slot it fills) as a recorded `overlap`, like
   any holder.
-- *Waiting.* No new rule holds back later requests: as for any head, nobody
-  behind an exclusive head is granted, so the holders drain and it is granted
-  when the last one leaves. A free slot can stay idle meanwhile; that is the
-  cost of the mode. Only the requests the order above puts ahead of it are
-  granted first: a waiting release run, an urgent run, and a high run until its
+- *Waiting.* The holders drain and the exclusive head is granted when the last
+  one leaves. Only the requests the order above puts ahead of it are granted
+  first: a waiting release run, an urgent run, and a high run until its
   fairness budget is spent. It keeps its place and its `heldReason` is `slots`,
   as is that of anyone blocked by an exclusive holder.
+- *Backfill.* Bug `wi_ad0818fa3ea0287d`, order #36413. While an exclusive
+  request waits at the head, the waiter directly behind it (position 2 only)
+  may take a free slot, but only when its own run timeout ends no later than
+  the latest run timeout of the live holders. Every holder stops itself at its
+  run timeout and an exclusive head takes nobody over, so that deadline is the
+  latest the exclusive request can start, with or without the backfill: the
+  backfill never moves it. Its actual start can still come later than it
+  would have, when the holders finish early and the backfill is still running.
+  There is no allowance for the 120 seconds of grace, which would let a backfill
+  run past holders that stopped on time. The backfill must not be exclusive
+  itself, needs at least one live holder, a free slot, a worktree no holder
+  uses, and, beside a holder, a memory reading within the limit. The exclusive
+  request keeps first place; the grant counts in its `overtakenBy` but, like a
+  release grant, spends none of its fairness budget. A waiting release run is
+  always ordered ahead of an exclusive head, so no backfill happens while one
+  waits, and one that arrives later is granted at the next free slot as
+  before. Because every matrix run is clamped to the same holder cap, a later
+  matrix run almost never ends before a running one, so a backfill is mostly a
+  short `exec` run. The `acquire` journal line and the sidecar carry `backfill`
+  (`behind`, the exclusive request's id; `endsBy`, the backfill's own deadline;
+  `holdersEndBy`, the live holders' latest one). A waiter refused only by the
+  deadline adds `; behind an exclusive request, no backfill: run timeout N ms
+  ends after the holders' TIME` to its waiting line, and its `heldReason` stays
+  `slots`.
+- *Idle slots.* While it waits at the head, an exclusive request records the
+  slots free by count (the memory reading aside) on its own entry as
+  `idleSlots` since `idleSlotsSince`. When the count changes, when it is
+  granted, leaves, or is no longer the head, it journals `idle-slots` with
+  `start`, `end`, `ms`, `slots` and `reason`: `backfill-or-holder` (a backfill
+  or another holder took the free slots), `slots-changed` (a different number
+  of slots is free, and a new period starts), `granted`, `withdrawn`,
+  `wait-expired` or `not-head`. A run that drops it (gone or no longer polling)
+  journals its open period with `reason: "dropped"`. Times are the head's own
+  polls, so within one poll. These lines measure how much slot time an
+  exclusive request leaves idle.
 - *Slot fillers.* While an exclusive holder holds, `holders` also lists one
   filler per slot no other holder uses: a copy of the holder (pid, groups,
   worktree, start and run timeout) with the id `ID:slot-N`, without its
@@ -1162,9 +1237,13 @@ team run and the deployer wait while it holds, and give it a short
 - *Records.* The entry carries `exclusive: true` and `exclusiveCapMs`; `request`
   and `acquire` journal lines carry `exclusive: true`. A release run that joins
   after the cap appends `{ at, id, item, agent, pid, kind }` to the holder's
-  `overlapsAfterCap`, journals `exclusive-overlap` (`holder`, `holderItem`,
-  `holderAgent`, `holderPid`, `capAt`), and records `joinedExclusive` in its own
-  sidecar. The exclusive run's sidecar has `exclusive`, `exclusiveCapMs`,
+  `overlapsAfterCap`, journals `exclusive-overlap` (`kind`, `holder`,
+  `holderItem`, `holderAgent`, `holderPid`, `capAt`), and records
+  `joinedExclusive` in its own sidecar. When an exclusive holder is taken over,
+  the `overlap` line that names it carries its `overlapsAfterCap`, and at its
+  release the holder reads that line from the journal (skipping any line that
+  does not parse), so its sidecar keeps the release runs that joined it; if the
+  journal cannot be read it prints a warning and records `[]`. The exclusive run's sidecar has `exclusive`, `exclusiveCapMs`,
   `overlapsAfterCap` and `alone`: `true` only when at release its entry was
   still on file, nobody had joined and no other holder was present; `false`
   otherwise (a takeover included); `null` when the release could not update the
@@ -1175,8 +1254,10 @@ team run and the deployer wait while it holds, and give it a short
 - *Status.* `status` prints the exclusive holder once, tagged `exclusive, fills
   N of M slots, release runs may join after TIME`, then `; shared after cap
   with ITEM/AGENT/pid N at TIME` for each release that joined; an exclusive
-  waiter is tagged `exclusive`. `status --json` is the file as written, fillers
-  included. An exclusive head's waiting line ends `; exclusive, waiting for
+  waiter is tagged `exclusive`, and an exclusive head with free slots adds `;
+  idle slots N since TIME`. A waiter line shows `; polled TIME` once that waiter
+  has polled.
+  `status --json` is the file as written, fillers included. An exclusive head's waiting line ends `; exclusive, waiting for
   every holder to leave`; a head blocked by an exclusive holder adds `; holder
   is exclusive`, and a release head before the cap ` until TIME`.
 

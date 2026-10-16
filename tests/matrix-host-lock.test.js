@@ -10,6 +10,7 @@ import {
   statSync,
   symlinkSync,
   readdirSync,
+  appendFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -631,12 +632,13 @@ test("L4 a matrix run past its run timeout stops its check, writes no receipt an
 test("L5 past the run timeout plus grace a waiter takes the lock as a recorded overlap and signals nothing", async (t) => {
   const path = lockFile(t);
   const held = await heldByChild(t, path, { group: true, request: { runTimeoutMs: 300 } });
+  // The holder's own start on file, not the journal line written after it.
+  const heldSince = Date.parse(readHostState(path).holder.startedAt);
   held.child.kill("SIGKILL");
   await exited(held.child);
   const lines = [];
   const lease = await acquireHostLock(request(path, { item: "wi_next", graceMs: 300, print: (line) => lines.push(line) }));
-  const heldSince = Date.parse(readJournal(path).find((line) => line.event === "acquire").at);
-  assert(Date.parse(lease.record.acquiredAt) >= heldSince + 300 + 300 - 5, "not before the run timeout plus grace");
+  assert(Date.parse(lease.record.acquiredAt) > heldSince + 300 + 300, "only after the run timeout plus grace");
   assert.equal(lease.record.overlap, 1);
   assert.deepEqual(lease.record.overlapDetails.groups, [held.group]);
   const overlap = readJournal(path).find((line) => line.event === "overlap");
@@ -1814,7 +1816,7 @@ test("M13 under a memory hold a single holder past its run timeout plus grace is
   const path = lockFile(t), gauge = meter(90), lines = [];
   const overdue = await asks(path, gauge, { item: "overdue", runTimeoutMs: 200 });
   const lease = await asks(path, gauge, { item: "next", graceMs: 200, print: line => lines.push(line) });
-  assert(Date.parse(lease.record.acquiredAt) >= Date.parse(overdue.record.acquiredAt) + 400 - 5, "not before the run timeout plus grace");
+  assert(Date.parse(lease.record.acquiredAt) > Date.parse(overdue.record.acquiredAt) + 400, "only after the run timeout plus grace");
   assert.equal(lease.record.overlap, 1); assert.equal(lease.record.overlapDetails.holder, overdue.id);
   assert.deepEqual(items(allHeld(path)), ["next"]);
   assert.equal(journaled(path, "overlap", lease.id).length, 1); assert.equal(journaled(path, "memory-hold", lease.id).length, 1);
@@ -2228,6 +2230,341 @@ test("X9 malformed exclusive fields refuse byte-for-byte, an orphan filler is dr
   const after = rawReadHostState(plain);
   assert.deepEqual(after.holders, before.holders, "a holder without the new fields is written back as it was");
   assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort());
+});
+// Host lock waitlist follow-ups (wi_ad0818fa3ea0287d, order #36413).
+// Journal lines read past a malformed one, as the release of a taken-over
+// exclusive holder does.
+const lenient = (path) => readFileSync(lockPaths(path).journal, "utf8").split("\n").filter(Boolean)
+  .flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
+const lenientOf = (path, event) => lenient(path).filter(line => line.event === event);
+test("T1 an exclusive holder taken over after a release run joined it keeps overlapsAfterCap in its sidecar", async (t) => {
+  const path = lockFile(t), record = join(tempDir(t), "record"), joinClock = skewed(), takeClock = skewed();
+  const e = await acquireHostLock(request(path, wide("2", { item: "E", exclusive: true, runTimeoutMs: LONG_MS, recordDirectory: record })));
+  joinClock.aheadMs = 15 * 60000 + 1000;
+  const r = await acquireHostLock(request(path, wide("2", { item: "R", release: true, runTimeoutMs: 4 * LONG_MS, now: joinClock.now, maxWaitMs: DAY_MS })));
+  takeClock.aheadMs = LONG_MS + RUN_TIMEOUT_GRACE_MS + 1000;
+  const w = await acquireHostLock(request(path, wide("2", { item: "W", now: takeClock.now, maxWaitMs: DAY_MS })));
+  assert.deepEqual(realOf(path).map(h => h.id), [r.id, w.id], "W took E over and R stays");
+  assert.equal(w.record.overlap, 1);
+  const joined = lenientOf(path, "exclusive-overlap");
+  assert.equal(joined.length, 1);
+  // A malformed journal line does not stop the release from finding the overlaps.
+  appendFileSync(lockPaths(path).journal, "{not json\n");
+  await e.release();
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.equal(sidecar.alone, false);
+  const fields = (o) => [o.id, o.item, o.agent, o.pid, o.kind];
+  assert.deepEqual(sidecar.overlapsAfterCap.map(fields), [[r.id, "R", "tester", process.pid, "run"]]);
+  assert.deepEqual(sidecar.overlapsAfterCap.map(fields), joined.map(fields), "the sidecar matches the exclusive-overlap line");
+  const overlap = lenientOf(path, "overlap").filter(line => line.holder === e.id);
+  assert.equal(overlap.length, 1);
+  assert.deepEqual(overlap[0].overlapsAfterCap, sidecar.overlapsAfterCap, "the overlap line carries the same array");
+  await w.release(); await r.release();
+});
+// A child process waiting in the list (hold mode, never granted while the test holds).
+async function waitingChild(t, path, extra = {}) {
+  const marker = join(tempDir(t), "marker");
+  const child = startChild(t, childScript(t), { mode: "hold", marker, request: request(path, { item: "wi_child", maxWaitMs: 60000, ...extra }) });
+  await until(() => waitersOf(path).some(w => w.pid === child.pid && w.polls >= 2), "the child to wait and poll");
+  return child;
+}
+// SIGSTOP a waiting child outside the file mutex, so the others can still update.
+async function stopOutsideMutex(child, path) {
+  for (let attempt = 0; ; attempt++) {
+    kill(child.pid, "SIGSTOP");
+    await nap(30);
+    let owner = null;
+    try { owner = JSON.parse(readFileSync(lockPaths(path).mutex, "utf8")).pid; } catch {}
+    if (owner !== child.pid) return;
+    assert(attempt < 50, "the child kept the mutex");
+    kill(child.pid, "SIGCONT");
+    await nap(7);
+  }
+}
+// A waiter entry no process polls for: a live unrelated pid stands for a reused one.
+function plantWaiter(path, pid, extra = {}) {
+  assert(updateHostState(path, state => {
+    const seq = ++state.requestSeq, requestedAt = new Date().toISOString();
+    state.waiters.push({ id: "planted-" + seq, seq, pid, kind: "run", item: "wi_planted", agent: "ghost", priority: "normal", prioritySource: "default",
+      requestedAt, grantSeqAtRequest: state.grantSeq, overtakenBy: 0, nonUrgentOvertakes: 0, overtakeLimit: 2, runTimeoutMs: 60000, ...extra });
+  }).done);
+  return waitersOf(path).at(-1).id;
+}
+test("W1 a stopped head waiter is dropped within the bound and fails with lost-request when it resumes", async (t) => {
+  const path = lockFile(t);
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const child = await waitingChild(t, path);
+  await stopOutsideMutex(child, path);
+  t.after(() => kill(child.pid, "SIGCONT"));
+  const stoppedPolls = waitersOf(path).find(w => w.pid === child.pid).polls;
+  const lines = [];
+  const next = acquireHostLock(request(path, { item: "wi_next", staleWaiterMs: 300, print: line => lines.push(line) }));
+  const drop = await until(() => readJournal(path).find(line => line.event === "waiter-dropped"), "the stopped head to be dropped");
+  assert.deepEqual([drop.reason, drop.pid, drop.item, drop.polls], ["stale", child.pid, "wi_child", stoppedPolls]);
+  assert(drop.observedMs >= 300, String(drop.observedMs));
+  assert(Number.isFinite(Date.parse(drop.polledAt)), drop.polledAt);
+  assert.deepEqual(items(waitersOf(path)), ["wi_next"]);
+  await holder.release();
+  const lease = await next;
+  assert.equal(lease.record.overlap, 0);
+  kill(child.pid, "SIGCONT");
+  await exited(child);
+  assert.notEqual(child.exitCode, 0);
+  assert.match(child.output(), /no longer in .*another run dropped it \(see waiter-dropped in .*host\.journal\.jsonl\)/);
+  await lease.release();
+});
+test("W2 a waiter whose pid now belongs to another process is dropped as stale, and waiters show their polls", async (t) => {
+  const path = lockFile(t), other = await sleeper(t);
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const planted = plantWaiter(path, other, { polls: 7, polledAt: new Date().toISOString() });
+  const next = acquireHostLock(request(path, { item: "wi_next", staleWaiterMs: 300 }));
+  await until(() => waitersOf(path).some(w => w.item === "wi_next" && w.polls >= 2), "the next waiter to poll");
+  const mine = waitersOf(path).find(w => w.item === "wi_next");
+  assert(Number.isSafeInteger(mine.polls) && Number.isFinite(Date.parse(mine.polledAt)));
+  assert.match(statusText(path), new RegExp(`2 of 2: wi_next/tester/pid ${process.pid} .*; polled \\d{4}-\\d\\d-\\d\\dT[^;]*Z; held: slots$`, "m"));
+  const drop = await until(() => readJournal(path).find(line => line.event === "waiter-dropped"), "the planted waiter to be dropped");
+  assert.deepEqual([drop.id, drop.reason, drop.pid, drop.polls], [planted, "stale", other, 7]);
+  assert(drop.observedMs >= 300);
+  assert(!pidGone(other), "its pid was alive throughout");
+  await holder.release();
+  const lease = await next;
+  for (const entry of allHeld(path))
+    for (const key of ["polls", "polledAt", "idleSlotsSince", "idleSlots", "heldReason"]) assert(!Object.hasOwn(entry, key), key);
+  await lease.release();
+});
+test("W3 live polling waiters and legacy entries are never dropped; a gone pid is dropped at once as pid-gone", async (t) => {
+  const path = lockFile(t), legacyPid = await sleeper(t), bound = 150;
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const legacy = plantWaiter(path, legacyPid);
+  assert(!Object.hasOwn(waitersOf(path)[0], "polls"));
+  const waiting = ["a", "b", "c"].map(item => acquireHostLock(request(path, { item, staleWaiterMs: bound, pollMs: bound / 3 })));
+  await until(() => waitersOf(path).length === 4, "three polling waiters");
+  const started = Date.now();
+  await nap(10 * bound + 200);
+  assert(Date.now() - started >= 10 * bound);
+  assert(!events(path).includes("waiter-dropped"), JSON.stringify(readJournal(path).filter(line => line.event === "waiter-dropped")));
+  assert.deepEqual(waitersOf(path).map(w => w.id === legacy ? "legacy" : w.item), ["legacy", "a", "b", "c"]);
+  const gone = plantWaiter(path, exitedPid(), { polls: 1, polledAt: new Date().toISOString() });
+  const drop = await until(() => readJournal(path).find(line => line.event === "waiter-dropped"), "the gone pid to be dropped");
+  assert.deepEqual([drop.id, drop.reason], [gone, "pid-gone"]);
+  assert.equal(drop.observedMs, undefined);
+  assert.equal(readJournal(path).filter(line => line.event === "waiter-dropped").length, 1);
+  assert(updateHostState(path, state => { state.waiters = state.waiters.filter(w => w.id !== legacy); }).done);
+  await holder.release();
+  for (const lease of waiting) await (await lease).release();
+});
+test("W4 a host-wide pause seen as a clock jump drops nobody, and the new waiter fields are strict but accepted on holders", async (t) => {
+  const path = lockFile(t), clock = skewed();
+  const holder = await acquireHostLock(request(path, { item: "wi_holder" }));
+  const child = await waitingChild(t, path);
+  const next = acquireHostLock(request(path, { item: "wi_next", staleWaiterMs: 300, now: clock.now, maxWaitMs: DAY_MS }));
+  await until(() => waitersOf(path).some(w => w.item === "wi_next" && w.polls >= 3), "the observer to watch");
+  await stopOutsideMutex(child, path);
+  t.after(() => kill(child.pid, "SIGCONT"));
+  clock.aheadMs = 11 * 300;
+  await nap(100);
+  kill(child.pid, "SIGCONT");
+  await nap(900);
+  assert(!events(path).includes("waiter-dropped"), "nobody was dropped across the pause");
+  assert.deepEqual(items(waitersOf(path)), ["wi_child", "wi_next"]);
+  child.kill("SIGKILL"); await exited(child);
+  await holder.release();
+  await (await next).release();
+
+  const startedAt = new Date().toISOString();
+  const entry = (extra = {}) => ({ id: "e", seq: 1, pid: process.pid, kind: "exec", item: "wi_e", agent: "a", priority: "normal", prioritySource: "default",
+    requestedAt: startedAt, runTimeoutMs: LONG_MS, ...extra });
+  const waiterOf = (extra) => entry({ grantSeqAtRequest: 0, overtakenBy: 0, ...extra });
+  const file = (holders, waiters) => ({ version: 2, host: "h", updatedAt: startedAt, requestSeq: 1, grantSeq: 1, holderLimit: 2, holders, waiters });
+  for (const bad of [{ polls: -1 }, { polls: 1.5 }, { polls: "3" }, { polledAt: "soon" }, { polledAt: 5 }, { idleSlotsSince: "x" }, { idleSlots: 0 }, { idleSlots: 17 }, { idleSlots: "1" }]) {
+    const raw = JSON.stringify(file([], [waiterOf(bad)])), bad1 = lockFile(t);
+    writeFileSync(bad1, raw);
+    await assert.rejects(acquireHostLock(request(bad1, wide())), (error) => (assert.equal(error.exitCode, 78), assert.match(error.message, /invalid waiter fields/), true));
+    assert.equal(readFileSync(bad1, "utf8"), raw, JSON.stringify(bad));
+  }
+  const carried = lockFile(t);
+  writeFileSync(carried, JSON.stringify(file([entry({ startedAt, groups: [], polls: 4, polledAt: startedAt, idleSlotsSince: startedAt, idleSlots: 1 })], [])));
+  const lease = await acquireHostLock(request(carried, wide()));
+  assert.equal(allHeld(carried).length, 2, "a holder carrying the waiter keys is accepted");
+  await lease.release();
+});
+const isoOf = (ms) => new Date(ms).toISOString();
+const plantExclusive = (path) => plantWaiter(path, process.pid, { item: "X", exclusive: true, exclusiveCapMs: 15 * 60000 });
+const acquireLine = (path, id) => readJournal(path).find(line => line.event === "acquire" && line.id === id);
+test("B1 behind an exclusive head the next waiter takes a free slot only when its run timeout ends by the holders' deadline", async (t) => {
+  const path = lockFile(t), record = join(tempDir(t), "record");
+  const h = await acquireHostLock(request(path, wide("2", { item: "H" })));
+  const deadline = Date.parse(h.record.acquiredAt) + 60000;
+  const x = acquireHostLock(request(path, wide("2", { item: "X", exclusive: true })));
+  await until(() => waitersOf(path).some(w => w.item === "X" && w.idleSlots === 1), "X to wait");
+  const xId = waitersOf(path)[0].id;
+  const stop = new AbortController(), lines = [];
+  const late = acquireHostLock(request(path, wide("2", { item: "late", now: () => deadline - 60000 + 1, maxWaitMs: DAY_MS, signal: stop.signal, print: line => lines.push(line) })));
+  await until(() => lines.some(line => line.endsWith(`; behind an exclusive request, no backfill: run timeout 60000 ms ends after the holders' ${isoOf(deadline)}`)), "the refusal line");
+  assert.deepEqual(waitersOf(path).map(w => [w.item, w.heldReason]), [["X", "slots"], ["late", "slots"]]);
+  stop.abort("test");
+  await assert.rejects(late, (error) => error.code === "withdrawn");
+  const fit = await acquireHostLock(request(path, wide("2", { item: "fit", now: () => deadline - 60000, maxWaitMs: DAY_MS, recordDirectory: record })));
+  const expected = { behind: xId, endsBy: isoOf(deadline), holdersEndBy: isoOf(deadline) };
+  assert.deepEqual(acquireLine(path, fit.id).backfill, expected);
+  assert.deepEqual(fit.record.backfill, expected);
+  assert.deepEqual(JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8")).backfill, expected);
+  assert.deepEqual(items(realOf(path)), ["H", "fit"]);
+  assert.deepEqual(waitersOf(path).map(w => w.id), [xId], "X keeps first place");
+  await fit.release(); await h.release();
+  await (await x).release();
+  assert(!events(path).includes("overlap"));
+});
+test("B2 no backfill with no live holder, for an exclusive or third waiter, into a worktree in use, or while a release run waits", async (t) => {
+  const granted = [], stops = [], cases = [];
+  const ask = (path, item, extra) => {
+    const stop = new AbortController(); stops.push(stop);
+    const lines = [];
+    const lease = acquireHostLock(request(path, wide("2", { item, runTimeoutMs: 1000, signal: stop.signal, print: line => lines.push(line), ...extra })))
+      .then(l => (granted.push(item), l), error => (assert.equal(error.code, "withdrawn"), null));
+    cases.push(lease);
+    return lines;
+  };
+  const joined = (path, count) => until(() => waitersOf(path).length === count, `${count} waiters`);
+  const empty = lockFile(t);
+  assert(updateHostState(empty, state => { state.holderLimit = 2; }).done);
+  plantExclusive(empty); ask(empty, "no-holder"); await joined(empty, 2);
+  const holders = [];
+  const held = async (extra) => { const path = lockFile(t); holders.push(await acquireHostLock(request(path, wide("2", { item: "H", ...extra })))); return path; };
+  const both = await held(); plantExclusive(both); ask(both, "exclusive", { exclusive: true }); await joined(both, 2);
+  const third = await held(); plantExclusive(third); ask(third, "second", { runTimeoutMs: 120000 }); await joined(third, 2); ask(third, "third"); await joined(third, 3);
+  const worktree = tempDir(t);
+  const busy = await held({ worktree }); plantExclusive(busy); const busyLines = ask(busy, "worktree", { worktree }); await joined(busy, 2);
+  const shared = tempDir(t);
+  const release = await held({ worktree: shared }); plantExclusive(release); ask(release, "release", { release: true, worktree: shared, runTimeoutMs: 60000 }); await joined(release, 2);
+  ask(release, "behind-release"); await joined(release, 3);
+  assert.deepEqual(items(waitersOf(release)), ["release", "X", "behind-release"]);
+  await nap(300);
+  assert.deepEqual(granted, []);
+  assert(busyLines.some(line => line.includes("; worktree in use")), busyLines.join(" | "));
+  for (const path of [empty, both, third, busy, release]) assert(!readJournal(path).some(line => line.backfill), path);
+  for (const stop of stops) stop.abort("test");
+  await Promise.all(cases);
+  for (const lease of holders) await lease.release();
+});
+test("B3 after a backfill the exclusive request keeps first place and starts when the holders leave, with no overlap", async (t) => {
+  const path = lockFile(t);
+  const h = await acquireHostLock(request(path, wide("2", { item: "H" })));
+  let granted = false;
+  const x = acquireHostLock(request(path, wide("2", { item: "X", exclusive: true }))).then(lease => ((granted = true), lease));
+  await until(() => waitersOf(path).some(w => w.item === "X"), "X to wait");
+  const c = await acquireHostLock(request(path, wide("2", { item: "C", runTimeoutMs: 30000 })));
+  assert(c.record.backfill);
+  const ends = (e) => Date.parse(e.startedAt) + e.runTimeoutMs;
+  const [hEntry, cEntry] = realOf(path);
+  assert.deepEqual([hEntry.item, cEntry.item], ["H", "C"]);
+  assert(ends(cEntry) <= ends(hEntry), "the backfill ends no later than the live holder");
+  assert.deepEqual(waitersOf(path).map(w => [w.item, w.overtakenBy, w.nonUrgentOvertakes]), [["X", 1, 0]]);
+  await h.release(); await nap(200);
+  assert(!granted, "X still waits for the backfill to leave");
+  assert.deepEqual(items(waitersOf(path)), ["X"]);
+  await c.release();
+  const alone = await x;
+  assert.deepEqual(realOf(path).map(e => e.id), [alone.id]);
+  await alone.release();
+  assert(!events(path).includes("overlap"));
+});
+test("B4 a release run arriving while a backfill holds is ordered ahead of the exclusive head and spends no fairness budget", async (t) => {
+  for (const slots of ["2", "3"]) {
+    const path = lockFile(t), order = [];
+    const joins = (item, extra) => acquireHostLock(request(path, wide(slots, { item, ...extra }))).then(lease => (order.push(item), lease));
+    const h = await joins("H");
+    const x = joins("X", { exclusive: true });
+    await until(() => waitersOf(path).length === 1, "X");
+    const c = await joins("C", { runTimeoutMs: 30000 });
+    assert(c.record.backfill, slots);
+    const r = joins("R", { release: true });
+    if (slots === "2") {
+      await until(() => waitersOf(path).length === 2, "R");
+      assert.deepEqual(items(waitersOf(path)), ["R", "X"]);
+      await nap(100); assert.deepEqual(order, ["H", "C"]);
+      await h.release();
+    }
+    const released = await r;
+    assert.deepEqual(order, ["H", "C", "R"], slots);
+    assert.deepEqual(waitersOf(path).map(w => [w.item, w.overtakenBy, w.nonUrgentOvertakes]), [["X", 2, 0]], slots);
+    await released.release(); await c.release();
+    if (slots === "3") await h.release();
+    await (await x).release();
+    assert.deepEqual(order, ["H", "C", "R", "X"]);
+  }
+});
+test("B5 an exclusive head reports its idle slots in status and journals each idle period when it ends", async (t) => {
+  const idleLines = (path) => readJournal(path).filter(line => line.event === "idle-slots");
+  const check = (line, id, reason, slots = 1) => {
+    assert.deepEqual([line.id, line.reason, line.slots], [id, reason, slots]);
+    assert.equal(line.ms, Date.parse(line.end) - Date.parse(line.start));
+    assert(line.ms >= 0);
+  };
+  const path = lockFile(t);
+  const h = await acquireHostLock(request(path, wide("2", { item: "H" })));
+  const x = acquireHostLock(request(path, wide("2", { item: "X", exclusive: true })));
+  const head = await until(() => waitersOf(path).find(w => w.item === "X" && w.idleSlots === 1), "X's idle period");
+  assert.match(statusText(path), new RegExp(` 1 of 1: X/tester/pid \\d+ .*; idle slots 1 since ${head.idleSlotsSince}; held: slots$`, "m"));
+  const json = statusJson(path).state.waiters[0];
+  assert.deepEqual([json.idleSlots, json.idleSlotsSince], [1, head.idleSlotsSince]);
+  assert.deepEqual(idleLines(path), []);
+  const c = await acquireHostLock(request(path, wide("2", { item: "C", runTimeoutMs: 30000 })));
+  await until(() => idleLines(path).length === 1, "the period to close");
+  check(idleLines(path)[0], head.id, "backfill-or-holder");
+  assert.equal(idleLines(path)[0].start, head.idleSlotsSince);
+  await until(() => !Object.hasOwn(waitersOf(path)[0], "idleSlots"), "the fields to go");
+  assert(!Object.hasOwn(waitersOf(path)[0], "idleSlotsSince"));
+  await c.release();
+  await until(() => waitersOf(path)[0]?.idleSlots === 1, "a new idle period");
+  await h.release();
+  const alone = await x;
+  assert.deepEqual(idleLines(path).map(line => line.reason), ["backfill-or-holder", "granted"]);
+  check(idleLines(path)[1], head.id, "granted");
+  assert(!Object.hasOwn(allHeld(path).find(e => e.id === alone.id), "idleSlots"));
+  await alone.release();
+
+  const withdrawn = lockFile(t), stop = new AbortController();
+  const w = await acquireHostLock(request(withdrawn, wide("2", { item: "H" })));
+  const leaving = acquireHostLock(request(withdrawn, wide("2", { item: "X", exclusive: true, signal: stop.signal })));
+  const before = await until(() => waitersOf(withdrawn).find(w => w.idleSlots === 1), "X's idle period");
+  stop.abort("test");
+  await assert.rejects(leaving, (error) => error.code === "withdrawn");
+  assert.equal(idleLines(withdrawn).length, 1);
+  check(idleLines(withdrawn)[0], before.id, "withdrawn");
+  await w.release();
+
+  const dropped = lockFile(t);
+  const d = await acquireHostLock(request(dropped, wide("2", { item: "H" })));
+  const child = await waitingChild(t, dropped, wide("2", { item: "X", exclusive: true }));
+  const open = await until(() => waitersOf(dropped).find(w => w.pid === child.pid && w.idleSlots === 1), "the child's idle period");
+  const observer = acquireHostLock(request(dropped, wide("2", { item: "observer", runTimeoutMs: 120000 })));
+  await until(() => waitersOf(dropped).length === 2, "the observer");
+  child.kill("SIGKILL"); await exited(child);
+  await until(() => idleLines(dropped).length === 1, "the dropped head's period to close");
+  check(idleLines(dropped)[0], open.id, "dropped");
+  assert.equal(readJournal(dropped).find(line => line.event === "waiter-dropped").reason, "pid-gone");
+  await d.release();
+  await (await observer).release();
+});
+test("H1 a holder that cannot update its groups within busyAbortMs journals holder-update-failed and stops its run", async (t) => {
+  const path = lockFile(t), lines = [];
+  const lease = await acquireHostLock(request(path, { busyAbortMs: 300, print: line => lines.push(line) }));
+  const marker = join(tempDir(t), "marker"), go = join(tempDir(t), "go");
+  const writer = startChild(t, childScript(t), { mode: "pause", marker, go, request: { path } });
+  await until(() => existsSync(marker), "the writer to hold the mutex");
+  const group = await sleeper(t);
+  lease.addGroup(group);
+  await until(() => lease.signal.aborted, "the run to be stopped", 5000);
+  assert.equal(lease.signal.reason, "host-lock-busy");
+  assert.deepEqual(readJournal(path).filter(line => line.event === "holder-update-failed").map(line => line.mutexPid), [writer.pid]);
+  assert(lines.includes(`matrix host: lock file busy for 300 ms (mutex owner pid ${writer.pid}), stopping this run`), lines.join(" | "));
+  writeFileSync(go, "");
+  await exited(writer);
+  assert.equal(writer.exitCode, 0);
+  await lease.release();
+  assert.deepEqual(allHeld(path), []);
+  assert.equal(readJournal(path).at(-1).event, "release");
 });
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");
