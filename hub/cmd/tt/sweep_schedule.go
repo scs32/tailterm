@@ -569,11 +569,16 @@ type matrixExclusion struct {
 
 // loadMatrixExclusion reads and validates this host's matrix lock file. An
 // absent file is a free host. Any other failure returns nil and the reason:
-// the caller skips its run.
+// the caller skips its run. A refused default lock gives matrixLockDefault's
+// reason, not the empty path's shape.
 func loadMatrixExclusion() (*matrixExclusion, string) {
 	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
 	if path == "" {
-		path = matrixWaitDefaultPath()
+		if path = matrixWaitDefaultPath(); path == "" {
+			if _, refused := matrixLockDefault(); refused != "" {
+				return nil, refused
+			}
+		}
 	}
 	if !filepath.IsAbs(path) {
 		return nil, "the lock path is not absolute"

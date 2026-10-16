@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -542,6 +543,43 @@ func TestSweepScheduleSkipsAndMatrixProtection(t *testing.T) {
 	if _, err := os.Stat(os.Getenv("TAILTERM_MATRIX_HOST_LOCK")); !os.IsNotExist(err) {
 		t.Fatalf("the sweep wrote the matrix lock file: %v", err)
 	}
+}
+
+// With no override and a refused default lock, the sweep skips its run and
+// its journal line names the refusal as matrixLockDefault states it, not the
+// empty path's shape (wi_b52092ee3adcf6be). A relative override still reads
+// as not absolute.
+func TestSweepScheduleMatrixLockDefaultRefused(t *testing.T) {
+	f := newSweepFixture(t)
+	kept := f.stale(t, "queue-5eeb00f1")
+	account := filepath.Join(f.r.root, "account")
+	oldDefault, oldAccount := matrixWaitDefaultPath, matrixAccountHome
+	t.Cleanup(func() { matrixWaitDefaultPath, matrixAccountHome = oldDefault, oldAccount })
+	matrixWaitDefaultPath = nativeMatrixWaitDefaultPath
+	matrixAccountHome = func() (string, error) { return account, nil }
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "")
+	skips := func(what, want string) {
+		t.Helper()
+		if m, why := loadMatrixExclusion(); m != nil || why != want {
+			t.Fatalf("%s: sweep %+v %q, want %q", what, m, why, want)
+		}
+		f.now = f.now.Add(time.Hour)
+		if !f.attempt() || f.sweeps != 0 {
+			t.Fatalf("%s: attempted with %d sweeps", what, f.sweeps)
+		}
+		if line := lastSweepLine(t); line.Outcome != "skipped" || line.Reason != sweepSkipMatrix || line.Detail != want {
+			t.Fatalf("%s: line %+v, want detail %q", what, line, want)
+		}
+	}
+
+	// The fixture's HOME is not the account home.
+	skips("isolated HOME", "HOME ("+f.home+") is not this account's home ("+account+"), so the default lock would be private; set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path (the shared one is "+filepath.Join(account, ".local/state/tailterm-matrix/host.json")+")")
+	matrixAccountHome = func() (string, error) { return "", errors.New("no such user") }
+	skips("unreadable account home", "cannot read this account's home (no such user); set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path")
+	matrixAccountHome = func() (string, error) { return account, nil }
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "host.json")
+	skips("relative override", "the lock path is not absolute")
+	requireExists(t, kept, true)
 }
 
 // t5: a lock file that is unreadable, not JSON, or valid JSON that fails the
