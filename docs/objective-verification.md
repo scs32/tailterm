@@ -850,6 +850,18 @@ check would then wait on the lock its own matrix holds. A run that means the
 shared lock sets the override to that path; a test sets it to a temporary one.
 An explicit absolute override works as before, whatever `HOME` is.
 
+The Go readers of the file resolve the default the same way since 954f41a
+(bug `wi_ee29358d0c7791ab`): the relay's matrix wait
+([agent-activity.md](agent-activity.md)), the scheduled sweep and the
+`tt team queue list` waitlist. Under another `HOME`, or when the account home
+cannot be read or is not absolute, there is no path, only a reason that names
+`TAILTERM_MATRIX_HOST_LOCK`; none of them reads the file under `HOME`. The
+sweep skips its run as `matrix-lock` with that reason on its journal line
+(7d7e7e7, bug `wi_b52092ee3adcf6be`), so a private, absent file is never taken
+for a free host. The relay's matrix wait is an unknown read. The waitlist
+prints the reason ("The queue list" below). An absolute override still wins in
+all three. A relative one is refused, and the default is not read instead.
+
 `TAILTERM_MATRIX_MAX_HOLDERS` is a decimal integer from 1 through 16;
 unset or empty means 2. Invalid configuration refuses before enqueue or sidecar
 creation. A v2 cohort freezes `holderLimit` while any holder or waiter remains;
@@ -1304,14 +1316,17 @@ this machine (the entry's host and the file's `host` compared by first DNS
 label, ignoring case, so `Stephens-Mini` and `Stephens-Mini.local` match) that
 has not failed. An entry on another host gets no line. The file is read from
 `TAILTERM_MATRIX_HOST_LOCK`, else the default path. The list always prints and
-exits 0, and `--json` is unchanged. Four cases show no waitlist:
+exits 0, and `--json` is unchanged. Five cases show no waitlist:
 
 - No file: nothing extra is printed (a free host).
 - `TAILTERM_MATRIX_HOST_LOCK` is set but relative: `matrix host:
   TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown`. The
   default path is not read instead.
-- The file is unreadable, not JSON or not version 1: `matrix host: lock file
-  PATH unusable (REASON); waitlist not shown`.
+- The override is unset and the default is refused ("An isolated HOME"
+  above): `matrix host: REASON; waitlist not shown`, where the reason names
+  `HOME` and the account home, or says the account home cannot be read.
+- The file is unreadable, not JSON or not version 1 or 2: `matrix host: lock
+  file PATH unusable (REASON); waitlist not shown`.
 - The file's `host` is another machine: `matrix host: lock file PATH belongs to
   host X; waitlist not shown`.
 
