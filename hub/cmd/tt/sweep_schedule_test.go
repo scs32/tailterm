@@ -1795,8 +1795,6 @@ func TestSweepScheduleFailingRepository(t *testing.T) {
 	})
 }
 
-// a3 (k2): a state file that cannot be read, or cannot be saved, is
-// journalled once per episode and tried every five minutes, not every check.
 // j1, j3: a run that removes one worktree and three matrix test binaries
 // journals treesRemoved=1 and binariesRemoved=3, and frees the bytes of all
 // four; a journal line written before binariesRemoved existed still decodes
@@ -1863,6 +1861,8 @@ func TestSweepScheduleCountsBinariesApartFromTrees(t *testing.T) {
 	})
 }
 
+// a3 (k2): a state file that cannot be read, or cannot be saved, is
+// journalled once per episode and tried every five minutes, not every check.
 func TestSweepScheduleStateFaultSpacing(t *testing.T) {
 	failedState := func(t *testing.T) int {
 		n := 0
