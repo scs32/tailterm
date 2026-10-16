@@ -22,7 +22,14 @@ const record = (page) =>
       }),
   );
 
-export async function exerciseVaultReset(page, context, origin) {
+// A page whose workspace talks to a hub passes the hub's hold
+// (navigateWithHubHeld in fixture-hub.mjs) so each Lock waits for its answers.
+export async function exerciseVaultReset(
+  page,
+  context,
+  origin,
+  navigateWithHubHeld = (_page, navigate) => navigate(),
+) {
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.waitForTimeout(700);
   const before = await record(page);
@@ -42,7 +49,7 @@ export async function exerciseVaultReset(page, context, origin) {
     "An active vault must not be reset by another tab",
   );
   await locked.close();
-  await page.locator("#lock").click();
+  await navigateWithHubHeld(page, () => page.locator("#lock").click());
   await page.locator("#reset-vault").waitFor();
   await page.locator("#password").fill("a forgotten incorrect passphrase");
   await page.locator("#unlock-button").click();
@@ -73,7 +80,7 @@ export async function exerciseVaultReset(page, context, origin) {
   await page.locator("#workspace").waitFor();
   assert.equal(await page.locator("[data-launch-server]").count(), 0);
   assert.equal(await page.locator("#key-count").textContent(), "0");
-  await page.locator("#lock").click();
+  await navigateWithHubHeld(page, () => page.locator("#lock").click());
   await page.locator("#password").fill("a completely new vault passphrase");
   await page.locator("#unlock-button").click();
   await page.locator("#workspace").waitFor();

@@ -1100,36 +1100,7 @@ try {
     "Lock saves the workspace as pressed and drops later changes without a page error.",
   );
   assert.equal(await page.locator("[data-launch-server]").count(), 6);
-  // The server-filter and vault-reset checks reload and lock from their own
-  // modules, which do not take the hub's hold yet (a recorded follow-up).
-  // Until they do, hand them a page that differs in two calls only: its Lock
-  // click and its reload hold the hub first. The hold has to precede the
-  // click because WebKit cancels the page's requests the moment the reload
-  // starts. Nothing is caught or filtered; every other call goes to the real
-  // page.
-  const heldLock = (locator) =>
-    new Proxy(locator, {
-      get: (target, key) =>
-        key === "click"
-          ? (...args) => navigateWithHubHeld(page, () => target.click(...args))
-          : typeof target[key] === "function"
-            ? target[key].bind(target)
-            : target[key],
-    });
-  const heldPage = new Proxy(page, {
-    get: (target, key) =>
-      key === "reload"
-        ? (...args) => navigateWithHubHeld(page, () => target.reload(...args))
-        : key === "locator"
-          ? (selector, ...rest) =>
-              selector === "#lock"
-                ? heldLock(target.locator(selector, ...rest))
-                : target.locator(selector, ...rest)
-          : typeof target[key] === "function"
-            ? target[key].bind(target)
-            : target[key],
-  });
-  await exerciseServerFilters(heldPage);
+  await exerciseServerFilters(page, navigateWithHubHeld);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(
     await page.evaluate(
@@ -1143,7 +1114,7 @@ try {
   assert.deepEqual(errors, []);
   const productionContext = await browser.newContext();
   await useDomRenderer(productionContext);
-  await exerciseVaultReset(heldPage, context, origin);
+  await exerciseVaultReset(page, context, origin, navigateWithHubHeld);
   await exerciseForgetDevice(page);
   const productionPage = await productionContext.newPage();
   productionPage.on("pageerror", (e) => errors.push(e.message));

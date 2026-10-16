@@ -54,7 +54,12 @@ async function visibleTerminals(page, expected, timeout = 10000) {
   );
 }
 
-export async function exerciseServerFilters(page) {
+// A page whose workspace talks to a hub passes the hub's hold
+// (navigateWithHubHeld in fixture-hub.mjs) so the reload waits for its answers.
+export async function exerciseServerFilters(
+  page,
+  navigateWithHubHeld = (_page, navigate) => navigate(),
+) {
   await page.locator("#all-servers").click();
   const production = page
     .locator(".server-item")
@@ -181,7 +186,7 @@ export async function exerciseServerFilters(page) {
   assert.match(await page.locator("#terminal-status").innerText(), /Connected/);
   await development.click();
   await page.waitForTimeout(700);
-  await page.reload();
+  await navigateWithHubHeld(page, () => page.reload());
   await page.locator("#password").fill("static browser vault passphrase");
   await page.locator("#unlock-button").click();
   await finishRestoration(page);
