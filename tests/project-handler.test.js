@@ -6,6 +6,7 @@ import {
   normalizeHandlerPlan,
   normalizeHandlerPlans,
 } from "../client/project-handler.js";
+import { MAX_AGENT_PROMPT_BYTES } from "../shared/tmux-command.js";
 
 const server = { id: "host", password: "fixture-only-secret" };
 const lead = {
@@ -145,7 +146,7 @@ test("saved plan validation rejects malformed scopes, roles, IDs and unbounded f
       },
     },
     { fields: { ...stored().fields, cwd: "relative" } },
-    { fields: { ...stored().fields, prompt: "a".repeat(8193) } },
+    { fields: { ...stored().fields, prompt: "a".repeat(MAX_AGENT_PROMPT_BYTES + 1) } },
     { fields: { ...stored().fields, run: "a".repeat(1025) } },
     { fields: { ...stored().fields, model: 123 } },
     { fields: { ...stored().fields, allowedTools: Array(31).fill("rule") } },
@@ -192,7 +193,7 @@ test("previous handler settings survive normalization with one bounded recovery 
     { ...input.previous, fields: { ...input.fields, agentRole: "lead" } },
     {
       ...input.previous,
-      fields: { ...input.fields, prompt: "x".repeat(8193) },
+      fields: { ...input.fields, prompt: "x".repeat(MAX_AGENT_PROMPT_BYTES + 1) },
     },
     { ...input.previous, previous: input.previous },
   ])
