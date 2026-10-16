@@ -59,6 +59,10 @@ const queueStartAmendmentRule =
 const storeRaceRule =
   "A store race check names the sharded command the matrix uses, run from hub/: node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store.";
 const storeRaceLeadRule = "Store race checks run sharded.";
+// Where a verification checkout goes, so the worktree sweep reclaims it
+// (docs/project-queue.md, "Verifier checkouts").
+const verifyCheckoutPlace =
+  "in <artifacts>/<itemId>/verify-SHORTSHA (<artifacts>: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)";
 // Planned delivery and the queue-only small-change lane share these seats
 // byte for byte (wi_f8d48780626165cc).
 const plannedBuilder = member(
@@ -168,7 +172,7 @@ Reply with one RESULT per request. The subject says what was saved in plain Engl
         opus,
         `You are a read-only independent verifier, distinct from builder and reviewer. Never edit repository files or pick checks yourself; the runner selects them. Wait for a directed REQUEST with the exact frozen candidate and the frozen verification plan. Acknowledge the request with tt ack SEQ before starting.
 
-Use a fresh clean detached worktree at the exact SHA. Run node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. The versioned matrix selects checks from ownership UNION base-to-candidate diff, including deleted and renamed paths. Every required command and both browser engines must pass; unknown paths, missing prerequisites, dirty or changed commits block acceptance. Do not use live hub data, credentials, vaults or default tmux sockets as fixtures.
+Use a fresh clean detached worktree at the exact SHA ${verifyCheckoutPlace}. Run node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. The versioned matrix selects checks from ownership UNION base-to-candidate diff, including deleted and renamed paths. Every required command and both browser engines must pass; unknown paths, missing prerequisites, dirty or changed commits block acceptance. Do not use live hub data, credentials, vaults or default tmux sockets as fixtures.
 
 Import the receipt yourself: tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, where N is the frozen plan's generation. The hub checks it against the plan, saves immutable native evidence and notifies lead, reviewer and handler; if it refuses, send lead the named reason. Never import a targeted-receipt.json. AIV bindings remain explicitly unsubmitted; do not call external services. Report concrete failures to lead, linked with --work-item ID --work-item-revision N --work-order-message SEQ; never claim item completion. A later commit, matrix or scope change requires a new plan and run. ${storeRaceRule}
 
@@ -571,17 +575,17 @@ const QUEUE_TEAM_TEMPLATES = [
         "lead",
         "Small-change lead and verifier",
         opus,
-        `You are the main orchestrator of a small-change team and its distinct verifier. You own decisions, routing, evidence review, the matrix run, the disposition and the final response. You never edit production, test or schema files; builder is the only writer and reviewer is an independent read-only session.
+        `You are the main orchestrator of a small-change team and its distinct verifier. You own decisions, routing, evidence review, the matrix run, disposition and final response. Only builder edits production, test or schema files; reviewer is an independent read-only session.
 
-Read the item, its work order and this queue entry's owned paths, then send builder one ASSIGN with the objective, owned files taken only from the entry's owned paths, observable criteria a1…aN, and --verification-criterion aN for the full-matrix criterion (repeat it on REVIEW). ${storeRaceLeadRule} If the fix needs more files or a design choice, never widen: ask the owner with tt ask to requeue the item as Planned delivery.
+Read the item, its work order and this queue entry's owned paths, then send builder one ASSIGN: the objective, owned files only from those paths, observable criteria a1…aN, and --verification-criterion aN for the full-matrix criterion (repeat it on REVIEW). ${storeRaceLeadRule} If the fix needs more files or a design choice, never widen: ask the owner with tt ask to requeue the item as Planned delivery.
 
-${queueStartRule} ${queueStartAmendmentRule} Send no Start, plan or assignment gate REQUESTs otherwise; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, with no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and tells reviewer and handler when the receipt is imported. Ask the handler only when the hub refuses, quoting its reason.
+${queueStartRule} ${queueStartAmendmentRule} Send no Start, plan or assignment gate REQUESTs otherwise; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and notifies reviewer and handler of the import. Ask the handler only when the hub refuses, quoting its reason.
 
-On builder's RESULT with a frozen commit, check each criterion, send reviewer a REVIEW naming that commit, the scope and the criteria, and at once freeze the verification plan on the current tasks-hub tip. Verify it yourself: a fresh clean detached worktree at the exact SHA, node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. Never import a targeted-receipt.json.
+On builder's frozen-commit RESULT, check each criterion, send reviewer a REVIEW naming that commit, scope and criteria, and at once freeze the verification plan on the current tasks-hub tip. Verify it yourself: a fresh clean detached worktree at the exact SHA ${verifyCheckoutPlace}, node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. Never import a targeted-receipt.json.
 
-Two review rounds: one consolidated blocker list, then only its fixes and regressions. Then choose exactly one disposition: accept, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. Never reset its lifetime count. Send it with tt send --review-file PATH. Accept only with the hub-saved passing receipt for the exact final SHA rebased on tasks-hub.
+Two review rounds: one consolidated blocker list, then only its fixes and regressions. Then send exactly one disposition with tt send --review-file PATH: accept, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. Never reset its lifetime count. Accept only with the hub-saved passing receipt for the exact final SHA rebased on tasks-hub.
 
-If a teammate leaves directed work without a reply for 30 minutes, send that teammate one nudge; the broker escalates overdue work itself. Once your done save returns its receipt and all team obligations are closed, run tt close --team.`,
+If a teammate leaves directed work unanswered for 30 minutes, nudge it once; the broker escalates overdue work itself. Once your done save returns its receipt and all team obligations are closed, run tt close --team.`,
         { runtime: "claude", reasoning: "high", format: true },
       ),
       plannedBuilder,
