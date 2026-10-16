@@ -48,6 +48,7 @@ import {
   MEMORY_PROBE_MS,
 } from "../scripts/verify-matrix-host-lock.mjs";
 import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
+import { utimesSync } from "node:fs";
 
 // No test here may fall back to the host's own lock file.
 const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
@@ -1885,6 +1886,47 @@ test("M15 under a one-slot hold an in-time holder is never taken over, and one o
   assert.equal(high.calls, 0); assert(!events(calm).includes("overlap"));
   await x.release(); await heldAs(calm, "third", "memory"); await y.release();
   const last = await third; assert.equal(last.record.overlap, 0); assert(!Object.hasOwn(last.record, "overlaps")); await last.release();
+});
+// wi_6be7e47bd2358699 / order 36061 / ASSIGN 36078: a reclaim guard with no
+// readable owner (x7) and the exclusive host-lock mode.
+const deadMutexWithGuard = (t, guardText, ageMs) => {
+  const path = lockFile(t), paths = lockPaths(path);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(paths.mutex, JSON.stringify({ pid: exitedPid(), token: "left-behind", at: new Date().toISOString() }));
+  writeFileSync(paths.guard, guardText);
+  const then = new Date(Date.now() - ageMs);
+  utimesSync(paths.guard, then, then);
+  return { path, paths };
+};
+test("G1 a reclaim guard with no readable owner, older than the bound, fails closed and names the file", async (t) => {
+  for (const guardText of ["", "{"]) {
+    const { path, paths } = deadMutexWithGuard(t, guardText, 120000);
+    await assert.rejects(
+      () => acquireHostLock(request(path, { maxWaitMs: 1500 })),
+      (error) => {
+        assert.equal(error.code, "guard-stale", `${JSON.stringify(guardText)}: ${error.code} ${error.message}`);
+        assert.equal(error.exitCode, 78);
+        assert(error.message.includes(paths.guard), error.message);
+        return true;
+      },
+    );
+    assert(existsSync(paths.mutex) && existsSync(paths.guard), "neither file was removed");
+    assert.equal(readFileSync(paths.guard, "utf8"), guardText, "the guard is left as it was");
+    assert(!existsSync(path), "no lock was granted");
+    const stale = readJournal(path).at(-1);
+    assert.equal(stale.event, "guard-stale");
+    assert.equal(stale.file, paths.guard);
+    assert.equal(stale.guardPid, null);
+    assert.equal(stale.reason, "unreadable-owner");
+    assert(stale.ageMs >= 120000 - 5000, String(stale.ageMs));
+  }
+});
+test("G2 a fresh reclaim guard with no readable owner is treated as busy, not stale", (t) => {
+  const { path, paths } = deadMutexWithGuard(t, "", 0);
+  const result = updateHostState(path, () => assert.fail("no update may run while the mutex is held"));
+  assert.equal(result.done, false);
+  assert(existsSync(paths.mutex) && existsSync(paths.guard), "neither file was removed");
+  assert(!readJournal(path).some((line) => line.event === "guard-stale"), "nothing journaled as guard-stale");
 });
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");
