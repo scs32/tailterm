@@ -49,6 +49,7 @@ import {
 } from "../scripts/verify-matrix-host-lock.mjs";
 import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
 import { utimesSync } from "node:fs";
+import { exclusiveCapMs, DEFAULT_EXCLUSIVE_CAP_MS } from "../scripts/verify-matrix-host-lock.mjs";
 
 // No test here may fall back to the host's own lock file.
 const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
@@ -1927,6 +1928,306 @@ test("G2 a fresh reclaim guard with no readable owner is treated as busy, not st
   assert.equal(result.done, false);
   assert(existsSync(paths.mutex) && existsSync(paths.guard), "neither file was removed");
   assert(!readJournal(path).some((line) => line.event === "guard-stale"), "nothing journaled as guard-stale");
+});
+// Exclusive holds: two- and three-slot cohorts, the memory rule off unless a
+// test injects a reading, and time past the cap by an injected clock.
+const wide = (slots = "2", extra = {}) => ({ ...two, maxWaitMs: 30000, ...extra, environment: { ...two.environment, TAILTERM_MATRIX_MAX_HOLDERS: slots, ...extra.environment } });
+const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const realOf = (path) => allHeld(path).filter(h => h.fillerOf === undefined);
+const fillersOf = (path) => allHeld(path).filter(h => h.fillerOf !== undefined);
+const LONG_MS = 3600000;
+function sleeper(t) {
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+  child.unref();
+  t.after(() => kill(-child.pid));
+  return once(child, "spawn").then(() => child.pid);
+}
+const statusJson = (path) => JSON.parse(execFileSync(process.execPath, [moduleFile, "status", "--json"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" }));
+test("X1 an exclusive request waits for an empty host, holds back later requests, and fills every slot while it holds", async (t) => {
+  const path = lockFile(t), worktree = tempDir(t), lines = [], granted = [];
+  const a = await acquireHostLock(request(path, wide("2", { item: "A" })));
+  const e = acquireHostLock(request(path, wide("2", { item: "E", exclusive: true, worktree, print: line => lines.push(line) }))).then(lease => (granted.push("E"), lease));
+  await until(() => waitersOf(path).some(w => w.item === "E" && w.heldReason === "slots"), "E to wait");
+  const n = acquireHostLock(request(path, wide("2", { item: "N" }))).then(lease => (granted.push("N"), lease));
+  await until(() => waitersOf(path).length === 2, "N to join");
+  await nap(300);
+  assert.deepEqual(granted, [], "nobody joins A while the exclusive request is the head");
+  assert.deepEqual(items(allHeld(path)), ["A"]);
+  assert.deepEqual(waitersOf(path).map(w => [w.item, w.exclusive, w.exclusiveCapMs, w.heldReason]), [["E", true, 15 * 60000, "slots"], ["N", undefined, undefined, "slots"]]);
+  assert(lines.some(line => line.endsWith("; exclusive, waiting for every holder to leave")), lines.join(" | "));
+  assert.match(statusText(path), / 1 of 2: E\/tester\/pid \d+ \(run, normal\/default, exclusive\)/);
+  await a.release();
+  const held = await e;
+  const group = await sleeper(t);
+  held.addGroup(group);
+  await until(() => fillersOf(path)[0]?.groups?.includes(group), "the filler to carry E's group");
+  const state = statusJson(path).state;
+  assert.equal(state.holders.length, state.holderLimit);
+  assert.equal(new Set(state.holders.map(h => h.id)).size, state.holders.length, "unique ids");
+  const [real, filler] = state.holders;
+  assert.deepEqual([real.id, real.exclusive, real.exclusiveCapMs], [held.id, true, 15 * 60000]);
+  assert.deepEqual([filler.id, filler.fillerOf, filler.pid, filler.worktree, filler.groups, filler.startedAt, filler.runTimeoutMs],
+    [held.id + ":slot-1", held.id, real.pid, real.worktree, [group], real.startedAt, real.runTimeoutMs]);
+  assert(!Object.hasOwn(filler, "exclusive") && !Object.hasOwn(filler, "exclusiveCapMs"), "a filler is not exclusive itself");
+  await nap(300);
+  assert.deepEqual(granted, ["E"], "a normal request never joins an exclusive holder");
+  assert.equal(waitersOf(path)[0].heldReason, "slots");
+  held.removeGroup(group);
+  await held.release();
+  const next = await n;
+  assert.deepEqual(allHeld(path).map(h => h.id), [next.id], "the fillers left with E");
+  await next.release();
+  assert(!events(path).includes("overlap"));
+});
+test("X2 while an exclusive holder holds no normal, high or urgent request is admitted, even past its cap", async (t) => {
+  for (const slots of ["2", "3"]) {
+    const path = lockFile(t), clock = skewed(), granted = [];
+    const e = await acquireHostLock(request(path, wide(slots, { item: "E", exclusive: true, runTimeoutMs: LONG_MS })));
+    assert.equal(allHeld(path).length, Number(slots)); assert.equal(fillersOf(path).length, Number(slots) - 1);
+    const waiting = ["normal", "high", "urgent"].map(priority =>
+      acquireHostLock(request(path, wide(slots, { item: priority, priority, now: clock.now, maxWaitMs: DAY_MS }))).then(lease => (granted.push(priority), lease.release())));
+    await until(() => waitersOf(path).length === 3, "three waiters");
+    await nap(200);
+    clock.aheadMs = 15 * 60000 + 60000;
+    await nap(300);
+    assert.deepEqual(granted, [], slots);
+    assert.equal(journaled(path, "acquire").length, 1, "only E was granted");
+    assert(!events(path).includes("overlap") && !events(path).includes("exclusive-overlap"));
+    await e.release();
+    await Promise.all(waiting);
+    assert.deepEqual(granted, ["urgent", "high", "normal"]);
+    assert(!events(path).includes("overlap"), slots);
+    assert.deepEqual(allHeld(path), []);
+  }
+});
+test("X3 a release run waits behind an exclusive holder until its cap, then joins with the overlap recorded", async (t) => {
+  const path = lockFile(t), record = join(tempDir(t), "record"), clock = skewed(), eLines = [], rLines = [], granted = [];
+  const e = await acquireHostLock(request(path, wide("2", { item: "E", exclusive: true, runTimeoutMs: LONG_MS, recordDirectory: record, print: line => eLines.push(line) })));
+  const capAt = new Date(Date.parse(e.record.acquiredAt) + 15 * 60000).toISOString();
+  const r = acquireHostLock(request(path, wide("2", { item: "R", release: true, now: clock.now, maxWaitMs: DAY_MS, print: line => rLines.push(line) }))).then(lease => (granted.push("R"), lease));
+  await until(() => rLines.some(line => line.includes("; holder is exclusive until " + capAt)), "R to wait for the cap");
+  const n = acquireHostLock(request(path, wide("2", { item: "N", now: clock.now, maxWaitMs: DAY_MS }))).then(lease => (granted.push("N"), lease));
+  await until(() => waitersOf(path).length === 2, "N to join");
+  await nap(200);
+  assert.deepEqual(granted, []); assert.deepEqual(items(waitersOf(path)), ["R", "N"]);
+  clock.aheadMs = 15 * 60000 + 1000;
+  const joined = await r;
+  assert.deepEqual(realOf(path).map(h => h.id), [e.id, joined.id]); assert.deepEqual(fillersOf(path), []);
+  const entry = realOf(path)[0];
+  assert.deepEqual(entry.overlapsAfterCap.map(o => [o.id, o.item, o.agent, o.pid, o.kind]), [[joined.id, "R", "tester", process.pid, "run"]]);
+  assert(Date.parse(entry.overlapsAfterCap[0].at) >= Date.parse(capAt));
+  const overlap = journaled(path, "exclusive-overlap");
+  assert.deepEqual(overlap.map(line => [line.id, line.holder, line.holderItem, line.holderAgent, line.holderPid, line.capAt]), [[joined.id, e.id, "E", "tester", process.pid, capAt]]);
+  assert.deepEqual(joined.record.joinedExclusive, { holder: e.id, item: "E", agent: "tester", pid: process.pid, capAt });
+  assert(rLines.includes(`matrix host: joined exclusive holder E/tester/pid ${process.pid} after its cap (${capAt})`), rLines.join(" | "));
+  assert.match(statusText(path), new RegExp(`holder: E/tester/pid \\d+ \\(run, normal/default, exclusive, fills 1 of 2 slots, release runs may join after ${capAt}\\).*; shared after cap with R/tester/pid ${process.pid} at `));
+  await nap(200);
+  assert.deepEqual(granted, ["R"], "a normal request still waits behind the shared hold");
+  await joined.release();
+  assert.equal(fillersOf(path).length, 1, "E fills the freed slot again");
+  await nap(200);
+  assert.deepEqual(granted, ["R"]);
+  await e.release();
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.deepEqual([sidecar.exclusive, sidecar.exclusiveCapMs, sidecar.alone], [true, 15 * 60000, false]);
+  assert.deepEqual(sidecar.overlapsAfterCap.map(o => o.id), [joined.id]);
+  assert(eLines.some(line => line.startsWith(`matrix host: WARNING exclusive hold shared after its cap with R/tester/pid ${process.pid} from `)), eLines.join(" | "));
+  await (await n).release();
+  assert(!events(path).includes("overlap"));
+
+  // Under memory pressure the release run past the cap is held for memory, as beside any holder.
+  const calm = lockFile(t), gauge = meter(90), later = skewed();
+  const x = await acquireHostLock(request(calm, { ...gated, item: "E", exclusive: true, runTimeoutMs: LONG_MS, memoryPressure: gauge.memoryPressure }));
+  assert.equal(gauge.calls, 0, "an exclusive request on an empty host takes no reading");
+  later.aheadMs = 15 * 60000 + 1000;
+  const held = asks(calm, gauge, { item: "R", release: true, now: later.now, maxWaitMs: DAY_MS });
+  await heldAs(calm, "R", "memory");
+  assert.deepEqual(realOf(calm).map(h => h.id), [x.id]);
+  gauge.reading = 50;
+  const y = await held;
+  assert.equal(journaled(calm, "exclusive-overlap").length, 1);
+  await y.release(); await x.release();
+});
+test("X4 an exclusive hold nobody joined records alone, and exec --exclusive passes the exit code through", async (t) => {
+  const path = lockFile(t), record = join(tempDir(t), "record");
+  const e = await acquireHostLock(request(path, wide("2", { item: "E", exclusive: true, recordDirectory: record })));
+  await e.release();
+  const sidecar = JSON.parse(readFileSync(join(record, "host-lock.json"), "utf8"));
+  assert.deepEqual([sidecar.exclusive, sidecar.exclusiveCapMs, sidecar.overlapsAfterCap, sidecar.alone], [true, 15 * 60000, [], true]);
+  assert.equal(Object.keys(receiptKeys(e.finish({ checkSet: "unit" }))).length, 12, "the receipt keys are unchanged");
+
+  const cli = lockFile(t), records = join(tempDir(t), "exec"), go = join(tempDir(t), "go");
+  const child = spawn(process.execPath,
+    [moduleFile, "exec", "--item", "wi_x", "--exclusive", "--timeout-minutes", "1", "--record", records, "--",
+      process.execPath, "-e", `const fs=require('fs');setInterval(()=>{if(fs.existsSync(${JSON.stringify(go)}))process.exit(3)},20)`],
+    { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: cli, TAILTERM_MATRIX_MAX_HOLDERS: "2" }, stdio: ["ignore", "pipe", "pipe"] });
+  let output = ""; child.stdout.on("data", d => (output += d)); child.stderr.on("data", d => (output += d));
+  t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+  await until(() => realOf(cli)[0]?.groups?.length, "the exec command to hold");
+  assert.equal(allHeld(cli).length, 2);
+  assert.match(statusText(cli), /holder: wi_x\/[^ ]+\/pid \d+ \(exec, normal\/default, exclusive, fills 2 of 2 slots, release runs may join after \S+\)/);
+  assert.equal(statusText(cli).split("\n").filter(line => line.startsWith("holder: ")).length, 1, "fillers are not listed as holders");
+  writeFileSync(go, "");
+  const [code] = await once(child, "close");
+  assert.equal(code, 3, output);
+  const execRecord = JSON.parse(readFileSync(join(records, "host-lock.json"), "utf8"));
+  assert.deepEqual([execRecord.checkSet, execRecord.exitCode, execRecord.exclusive, execRecord.alone], ["supplemental", 3, true, true]);
+  assert.deepEqual(allHeld(cli), []);
+  assert.deepEqual(journaled(cli, "request").map(line => line.exclusive), [true]);
+  assert.deepEqual(journaled(cli, "acquire").map(line => line.exclusive), [true]);
+});
+test("X5 a dead exclusive holder is recovered once with its fillers, and its live group keeps them", async (t) => {
+  const path = lockFile(t);
+  const held = await heldByChild(t, path, { request: wide("2", { exclusive: true }) });
+  assert.equal(allHeld(path).length, 2);
+  held.child.kill("SIGKILL"); await exited(held.child);
+  const next = await acquireHostLock(request(path, wide("2", { item: "next" })));
+  assert.deepEqual(allHeld(path).map(h => h.id), [next.id], "no filler survives");
+  assert.equal(journaled(path, "stale-recovered").length, 1);
+  assert.equal(journaled(path, "stale-recovered")[0].holder, held.id);
+  await next.release();
+
+  for (const after of ["exit", "throw"]) {
+    const quick = lockFile(t);
+    const gone = await heldByChild(t, quick, { after, request: wide("2", { exclusive: true }) });
+    await exited(gone.child);
+    assert.deepEqual(allHeld(quick), [], after);
+    assert.equal(readJournal(quick).at(-1).fallback, true);
+  }
+  const signalled = lockFile(t), record = tempDir(t);
+  const child = spawn(process.execPath,
+    [moduleFile, "exec", "--item", "wi_signal", "--exclusive", "--timeout-minutes", "5", "--record", record, "--", process.execPath, "-e", "setInterval(()=>{},1000)"],
+    { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: signalled, TAILTERM_MATRIX_MAX_HOLDERS: "2" }, stdio: "ignore" });
+  t.after(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"));
+  const group = await until(() => realOf(signalled)[0]?.groups?.[0], "the exec command's group");
+  t.after(() => kill(-group));
+  assert.equal(allHeld(signalled).length, 2);
+  child.kill("SIGTERM");
+  assert.equal((await once(child, "close"))[0], 143);
+  assert.deepEqual(allHeld(signalled), []);
+
+  const grouped = lockFile(t);
+  const kept = await heldByChild(t, grouped, { group: true, request: wide("2", { exclusive: true }) });
+  await until(() => fillersOf(grouped)[0]?.groups?.includes(kept.group), "the filler to carry the group");
+  kept.child.kill("SIGKILL"); await exited(kept.child);
+  let granted = false;
+  const waiting = acquireHostLock(request(grouped, wide("2", { item: "after" }))).then(lease => ((granted = true), lease));
+  await until(() => waitersOf(grouped).length === 1, "a waiter");
+  await nap(300);
+  assert(!granted, "a live group keeps the exclusive hold");
+  assert.deepEqual(allHeld(grouped).map(h => h.fillerOf ?? h.id), [kept.id, kept.id]);
+  kill(-kept.group);
+  const lease = await waiting;
+  assert.deepEqual(allHeld(grouped).map(h => h.id), [lease.id]);
+  await lease.release();
+});
+test("X6 an overdue exclusive holder is taken over with all its slots, and an exclusive head takes over nobody", async (t) => {
+  const path = lockFile(t), lines = [];
+  const e = await acquireHostLock(request(path, wide("2", { item: "E", exclusive: true, runTimeoutMs: 200 })));
+  const taker = await acquireHostLock(request(path, wide("2", { item: "N", graceMs: 0, print: line => lines.push(line) })));
+  assert.deepEqual(allHeld(path).map(h => h.id), [taker.id], "E and its filler are gone");
+  assert.deepEqual(journaled(path, "overlap").map(line => [line.holder, line.reason]), [[e.id, "run-timeout"]]);
+  assert.equal(taker.record.overlap, 1);
+  await e.release();
+  assert.deepEqual(allHeld(path).map(h => h.id), [taker.id]);
+  assert.equal(e.record.alone, false, "a hold taken over was not alone");
+  await taker.release();
+
+  const other = lockFile(t);
+  const a = await acquireHostLock(request(other, wide("2", { item: "A", runTimeoutMs: 200 })));
+  let granted = false;
+  const x = acquireHostLock(request(other, wide("2", { item: "X", exclusive: true, graceMs: 0 }))).then(lease => ((granted = true), lease));
+  await until(() => waitersOf(other).length === 1, "X to wait");
+  await nap(600);
+  assert(!granted, "the exclusive head waits for the overdue holder"); assert(!events(other).includes("overlap"));
+  await a.release();
+  await (await x).release();
+});
+test("X7 a waiting exclusive request keeps its place: release and urgent go first, and later high runs stop at its budget", async (t) => {
+  const path = lockFile(t), order = [];
+  const joins = (item, extra) => acquireHostLock(request(path, wide("2", { item, ...extra }))).then(lease => (order.push(item), lease));
+  const h = await joins("H");
+  const e = joins("E", { exclusive: true });
+  await until(() => waitersOf(path).length === 1, "E");
+  const r = await joins("R", { release: true });
+  assert.deepEqual(order, ["H", "R"], "the release run is granted ahead of the exclusive head");
+  assert.deepEqual(waitersOf(path).map(w => [w.item, w.overtakenBy, w.nonUrgentOvertakes]), [["E", 1, 0]]);
+  const u = joins("U", { priority: "urgent" }); await until(() => waitersOf(path).length === 2, "U");
+  assert.deepEqual(items(waitersOf(path)), ["U", "E"]);
+  assert(updateHostState(path, state => { state.waiters.find(w => w.item === "E").nonUrgentOvertakes = 2; }).done);
+  const x = joins("X", { priority: "high" }); await until(() => waitersOf(path).length === 3, "X");
+  assert.deepEqual(items(waitersOf(path)), ["U", "E", "X"], "a protected exclusive waiter bars the later high run");
+  await h.release(); const urgent = await u;
+  await r.release(); await nap(200);
+  assert.deepEqual(order, ["H", "R", "U"], "a free slot stays idle while the exclusive request is the head");
+  await urgent.release(); const alone = await e;
+  await nap(200); assert.deepEqual(order, ["H", "R", "U", "E"]);
+  await alone.release(); await (await x).release();
+  assert.deepEqual(order, ["H", "R", "U", "E", "X"]);
+});
+test("X8 the exclusive cap defaults to 15 minutes, its variable is strict, and bad requests refuse before joining", async (t) => {
+  assert.equal(DEFAULT_EXCLUSIVE_CAP_MS, 15 * 60000);
+  for (const value of [undefined, ""]) assert.equal(exclusiveCapMs({ TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: value }), 15 * 60000);
+  assert.equal(exclusiveCapMs({}), 15 * 60000);
+  assert.equal(exclusiveCapMs({ TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: "1" }), 60000);
+  assert.equal(exclusiveCapMs({ TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: "1440" }), 1440 * 60000);
+  for (const value of ["0", "x", "1441", "01", " 5", "5 ", "2.5"]) {
+    assert.throws(() => exclusiveCapMs({ TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: value }), /TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES requires a whole number of minutes from 1 to 1440/);
+    const path = lockFile(t), record = join(tempDir(t), "record");
+    await assert.rejects(acquireHostLock(request(path, wide("2", { exclusive: true, recordDirectory: record, environment: { TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: value } }))), /EXCLUSIVE_CAP_MINUTES/);
+    assert(!existsSync(path) && !existsSync(record), value);
+  }
+  const set = lockFile(t);
+  const e = await acquireHostLock(request(set, wide("2", { exclusive: true, environment: { TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: "7" } })));
+  assert.equal(allHeld(set)[0].exclusiveCapMs, 7 * 60000, "the cap is frozen on the entry");
+  await e.release();
+  const both = lockFile(t);
+  await assert.rejects(acquireHostLock(request(both, wide("2", { exclusive: true, release: true }))), /A release run cannot be exclusive/);
+  assert(!existsSync(both));
+
+  const path = lockFile(t), record = tempDir(t);
+  const run = (args, env = {}) => spawnSync(process.execPath, [moduleFile, "exec", ...args], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path, ...env }, encoding: "utf8" });
+  const ok = ["--item", "wi_x", "--timeout-minutes", "1", "--record", record];
+  for (const [args, env, message] of [
+    [[...ok, "--exclusive", "yes", "--", "true"], {}, /Unknown or incomplete exec option: yes/],
+    [[...ok, "--exclusive=1", "--", "true"], {}, /Unknown or incomplete exec option: --exclusive=1/],
+    [[...ok, "--exclusive", "--", "true"], { TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES: "0" }, /TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES requires a whole number/],
+  ]) {
+    const result = run(args, env);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, message);
+  }
+  assert(!existsSync(path), "no request reached the lock file");
+  assert.deepEqual(readdirSync(record), [], "no sidecar was written");
+  assert.match(run(["--help"]).stderr, /\[--exclusive\]/);
+});
+test("X9 malformed exclusive fields refuse byte-for-byte, an orphan filler is dropped, and plain files gain no keys", async (t) => {
+  const startedAt = new Date().toISOString();
+  const holder = (extra = {}) => ({ id: "h", seq: 1, pid: process.pid, kind: "exec", item: "wi_h", agent: "a", priority: "normal", prioritySource: "default",
+    requestedAt: startedAt, startedAt, runTimeoutMs: LONG_MS, groups: [], ...extra });
+  const file = (holders) => ({ version: 2, host: "h", updatedAt: startedAt, requestSeq: 1, grantSeq: 1, holderLimit: 2, holders, waiters: [] });
+  for (const holders of [[holder({ exclusive: "yes", exclusiveCapMs: 60000 })], [holder({ exclusive: true, exclusiveCapMs: 0 })], [holder({ exclusive: true })],
+    [holder(), holder({ id: "f", fillerOf: 5 })], [holder(), holder({ id: "f", fillerOf: "" })], [holder({ exclusive: true, exclusiveCapMs: 60000, overlapsAfterCap: "x" })],
+    [holder({ exclusive: true, exclusiveCapMs: 60000, release: true })]]) {
+    const path = lockFile(t), raw = JSON.stringify(file(holders));
+    writeFileSync(path, raw);
+    await assert.rejects(acquireHostLock(request(path, wide())), (error) => (assert.equal(error.exitCode, 78), assert.match(error.message, /unusable/), true));
+    assert.equal(readFileSync(path, "utf8"), raw);
+    const status = spawnSync(process.execPath, [moduleFile, "status"], { env: { ...process.env, TAILTERM_MATRIX_HOST_LOCK: path }, encoding: "utf8" });
+    assert.equal(status.status, 78, status.stderr);
+  }
+  const orphan = lockFile(t);
+  writeFileSync(orphan, JSON.stringify(file([holder({ id: "gone:slot-1", fillerOf: "gone" })])));
+  const lease = await acquireHostLock(request(orphan, wide()));
+  assert.deepEqual(allHeld(orphan).map(h => h.id), [lease.id], "the orphan filler was dropped");
+  await lease.release();
+
+  const plain = lockFile(t), before = file([holder()]);
+  writeFileSync(plain, JSON.stringify(before));
+  assert(updateHostState(plain, state => { state.requestSeq += 1; }).done);
+  const after = rawReadHostState(plain);
+  assert.deepEqual(after.holders, before.holders, "a holder without the new fields is written back as it was");
+  assert.deepEqual(Object.keys(after).sort(), Object.keys(before).sort());
 });
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");

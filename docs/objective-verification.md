@@ -1037,7 +1037,8 @@ A waiter whose process is gone is dropped (`waiter-dropped`). The journal
 events are `request`, `acquire`, `release`, `withdrawn`, `wait-expired`,
 `run-timeout-abort`, `stale-recovered`, `overlap` (one per holder taken over), `waiter-dropped`,
 `mutex-recovered`, `guard-stale`, `corrupt-file`, `holder-update-failed`,
-`memory-hold` and `memory-unreadable`.
+`memory-hold`, `memory-unreadable` and `exclusive-overlap` (see "Exclusive
+holds" below).
 Each line has the time, the request id, pid, item and agent. The journal is
 not rotated yet.
 
@@ -1051,6 +1052,15 @@ not rotated yet.
 - `host.json.lock.reclaim` was left by a process that died while recovering a
   mutex: requests refuse with that file named (exit 78, `guard-stale`).
   Confirm no verification is running, then remove that file.
+- The same guard with no readable owner (empty or not JSON, as a crash between
+  creating it and writing its owner leaves it on a filesystem without hard
+  links) that is more than 60 seconds old: requests refuse with that file named
+  and its age (exit 78, `guard-stale` with `guardPid: null`, reason
+  `unreadable-owner` and `ageMs`). Bug `wi_6be7e47bd2358699` (x7, merged from
+  `wi_5d6e865ee7638fc2`); before it the guard silently blocked every recovery.
+  A younger one is treated as a create in progress. It is never removed
+  automatically, because two processes that both judged it stale could each
+  replace it. Confirm no verification is running, then remove that file.
 - A mutex whose owner is alive is never taken away, however long it is held.
   Waiters print `matrix host: lock file busy, mutex owner pid N` once a minute
   inside their wait bound. A holder that cannot update the file for 30 seconds
@@ -1088,7 +1098,7 @@ through the wrapper so it joins the same list:
 
 ```sh
 node scripts/verify-matrix-host-lock.mjs exec --item ITEM --timeout-minutes N --record /absolute/dir \
-  [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] -- COMMAND [ARGS…]
+  [--priority urgent|high|normal] [--agent NAME] [--host-wait-minutes N] [--exclusive] -- COMMAND [ARGS…]
 ```
 
 It prints the same waiting lines, runs the command in its own process group
@@ -1101,6 +1111,69 @@ for the names that are set: `GOMAXPROCS`, `GOFLAGS`, `GOGC`, `GOMEMLIMIT`,
 `GODEBUG`, `GOEXPERIMENT` and `CGO_ENABLED` (`{}` when none is), so an order's
 `GOMAXPROCS=2` can be checked from the record. No other variable is recorded,
 so neither are secrets (bug `wi_28a18cbc08d3d598`).
+
+**Exclusive holds.** Bug `wi_6be7e47bd2358699`, order #36061. A normal holder
+shares the host: a second run, a release run included, can start beside it at
+any time. `exec --exclusive` holds the host alone. Use it only for checks whose
+result depends on a quiet host: a live-session check, or a timing-sensitive
+test. Keep the command short with a small `--timeout-minutes`, because every
+team run and the deployer wait while it holds, and give it a short
+`--host-wait-minutes`, because it waits for every holder to leave. `run` and
+`targeted` have no exclusive mode.
+
+- *Admission.* An exclusive request is granted only when no holder is live. It
+  never takes over an overdue holder, which may still be running; it waits until
+  that holder ends or its own wait bound. While it holds, it fills every slot,
+  and no other request is granted beside it, at any priority.
+- *The cap.* After `TAILTERM_MATRIX_EXCLUSIVE_CAP_MINUTES` (whole minutes, 1 to
+  1440; unset or empty means 15) from its start, a waiting release run may join
+  it, under the slot count and the memory rule as beside any holder (so with two
+  slots, exactly one release run). Nothing else joins, before or after the cap.
+  Each exclusive request freezes its cap on its entry (`exclusiveCapMs`), so a
+  waiting release reads the holder's cap, not its own environment. Only
+  exclusive requests read the variable; an invalid value refuses before the run
+  joins the list or writes a sidecar, as does an exclusive request marked as
+  a release run. The cap is not the hold's bound: the hold still ends at its own
+  `--timeout-minutes`, clamped by the holder cap, and an overdue exclusive
+  holder is taken over (with every slot it fills) as a recorded `overlap`, like
+  any holder.
+- *Waiting.* No new rule holds back later requests: as for any head, nobody
+  behind an exclusive head is granted, so the holders drain and it is granted
+  when the last one leaves. A free slot can stay idle meanwhile; that is the
+  cost of the mode. Only the requests the order above puts ahead of it are
+  granted first: a waiting release run, an urgent run, and a high run until its
+  fairness budget is spent. It keeps its place and its `heldReason` is `slots`,
+  as is that of anyone blocked by an exclusive holder.
+- *Slot fillers.* While an exclusive holder holds, `holders` also lists one
+  filler per slot no other holder uses: a copy of the holder (pid, groups,
+  worktree, start and run timeout) with the id `ID:slot-N`, without its
+  exclusive fields, and with `fillerOf` naming it. They make the host look full
+  to a client older than this mode, such as a team branch's matrix run. They are
+  rebuilt on every write, follow the holder's check groups and leave with it; a
+  filler naming no current holder is dropped. A dead exclusive holder is one
+  `stale-recovered`. A reader counting runs counts entries without `fillerOf`.
+  With one slot (`TAILTERM_MATRIX_MAX_HOLDERS=1` or a v1 file) the exclusive
+  holder is simply the holder, and no release can join it.
+- *Records.* The entry carries `exclusive: true` and `exclusiveCapMs`; `request`
+  and `acquire` journal lines carry `exclusive: true`. A release run that joins
+  after the cap appends `{ at, id, item, agent, pid, kind }` to the holder's
+  `overlapsAfterCap`, journals `exclusive-overlap` (`holder`, `holderItem`,
+  `holderAgent`, `holderPid`, `capAt`), and records `joinedExclusive` in its own
+  sidecar. The exclusive run's sidecar has `exclusive`, `exclusiveCapMs`,
+  `overlapsAfterCap` and `alone`: `true` only when at release its entry was
+  still on file, nobody had joined and no other holder was present; `false`
+  otherwise (a takeover included); `null` when the release could not update the
+  file. A shared hold prints `matrix host: WARNING exclusive hold shared after
+  its cap with ITEM/AGENT/pid N from TIME`. The receipt keys do not change.
+  Never claim a run was alone because it started on an empty lock; read
+  `alone`.
+- *Status.* `status` prints the exclusive holder once, tagged `exclusive, fills
+  N of M slots, release runs may join after TIME`, then `; shared after cap
+  with ITEM/AGENT/pid N at TIME` for each release that joined; an exclusive
+  waiter is tagged `exclusive`. `status --json` is the file as written, fillers
+  included. An exclusive head's waiting line ends `; exclusive, waiting for
+  every holder to leave`; a head blocked by an exclusive holder adds `; holder
+  is exclusive`, and a release head before the cap ` until TIME`.
 
 **The deployer.** The release runner's integrated run is a member of the same
 list. The runner starts it detached with `--priority`, `--item` and
