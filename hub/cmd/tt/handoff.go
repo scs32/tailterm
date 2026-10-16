@@ -1233,10 +1233,13 @@ func (p handoffProcess) codexLauncher() bool {
 	return base == "codex" || base == "codex.js"
 }
 
-// codexExec reports whether the arguments start codex exec, or its alias e:
-// the first word that is neither an option nor the value of one of the
-// options listed in handoffCodexValues.
-func (p handoffProcess) codexExec() bool {
+// codexCommand reports whether the arguments start a Codex command other
+// than an interactive session. The word read is the first that is neither an
+// option nor the value of one of the options listed in handoffCodexValues. A
+// session is interactive with no such word, with resume or fork, or with a
+// prompt: Codex reads a word that is not the name of one of its commands as
+// the prompt. Every other name in handoffCodexCommands is a command.
+func (p handoffProcess) codexCommand() bool {
 	args := p.args[min(1, len(p.args)):]
 	if p.codexLauncher() {
 		args = p.args[2:]
@@ -1247,11 +1250,18 @@ func (p handoffProcess) codexExec() bool {
 			i++
 		case strings.HasPrefix(arg, "-"):
 		default:
-			return arg == "exec" || arg == "e"
+			return handoffCodexCommands[arg]
 		}
 	}
 	return false
 }
+
+// handoffCodexCommands are Codex's commands and their aliases (codex-cli
+// 0.160.0), except resume and fork, which start an interactive session.
+var handoffCodexCommands = map[string]bool{"agents": true, "exec": true, "e": true, "review": true, "login": true, "logout": true, "mcp": true,
+	"plugin": true, "app-server": true, "remote-control": true, "app": true, "completion": true, "update": true, "doctor": true, "sandbox": true,
+	"debug": true, "apply": true, "a": true, "queue": true, "archive": true, "delete": true, "migrate-rollouts": true, "unarchive": true,
+	"cloud": true, "exec-server": true, "features": true, "help": true}
 
 // handoffCodexValues are Codex's options that take their value as the next
 // argument (codex-cli 0.160.0).
@@ -1262,17 +1272,18 @@ var handoffCodexValues = map[string]bool{"-c": true, "--config": true, "--enable
 // handoffCodexOneShot says why the Codex process this command runs under is
 // not a pane's interactive session, by a short name from handoffReasons; ""
 // means it is one. It is the nearest Codex process above the command, and it
-// must not have been started by codex exec, or by another Codex process: the
-// launcher straight above the native binary is the same runtime. A `codex
-// exec` run by the helper's shell tool fails both; typed at the pane's own
+// must not have been started by a Codex command other than an interactive
+// session (codexCommand), or by another Codex process: the launcher straight
+// above the native binary is the same runtime. A `codex exec` or `codex
+// review` run by the helper's shell tool fails both; typed at the pane's own
 // prompt, the first.
 func handoffCodexOneShot(chain []handoffProcess) string {
 	for i, p := range chain {
 		if i == 0 || !p.codex() {
 			continue
 		}
-		if p.codexExec() {
-			return "exec-mode"
+		if p.codexCommand() {
+			return "codex-command"
 		}
 		above := chain[i+1:]
 		if len(above) > 0 && !p.codexLauncher() && above[0].codexLauncher() {
@@ -2575,7 +2586,7 @@ var handoffReasons = map[string]string{
 	"nested-claude":           "this Claude Code process was started by another Claude Code process",
 	"no-terminal":             "this Claude Code process is not the foreground job of a terminal",
 	"no-codex-process":        "no Codex process is above this command in the process table",
-	"exec-mode":               "this Codex process was started by codex exec: it is a one-shot run",
+	"codex-command":           "this Codex process was started by a Codex command other than an interactive session (exec, review and the rest): it is a one-shot run",
 	"nested-codex":            "this Codex process was started by another Codex process",
 	"hub-refused":             "the hub refused the registration",
 	"register-failed":         "the registration did not complete",

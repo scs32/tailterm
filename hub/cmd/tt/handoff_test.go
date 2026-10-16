@@ -457,6 +457,28 @@ const (
 4002 4001 4002 4002 ttys009 T node /opt/bin/codex -m gpt-6.1-sol --sandbox read-only exec Reply
 4001 4000 4001 4002 ttys009 T -zsh
 4000 1 4000 0 ?? T tmux new -s owner`
+	// codex review, which also runs without a session, typed at the pane's
+	// own shell prompt.
+	handoffPSCodexReviewAtPrompt = `SELF 4003 SELF 4002 ttys009 T /bin/zsh -c tt handoff
+4003 4002 4002 4002 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex -m gpt-6.1-sol review --uncommitted
+4002 4001 4002 4002 ttys009 T node /opt/bin/codex -m gpt-6.1-sol review --uncommitted
+4001 4000 4001 4002 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// codex review run by the interactive session's shell tool, through the
+	// launcher.
+	handoffPSCodexReview = `SELF 4006 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4006 4005 4004 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex review --uncommitted
+4005 4004 4004 4001 ttys009 T node /opt/bin/codex review --uncommitted
+4004 4003 4004 4001 ttys009 T /bin/zsh -c codex review --uncommitted
+4003 4002 4001 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --model gpt-6.1-sol
+4002 4001 4001 4001 ttys009 T node /opt/bin/codex --model gpt-6.1-sol
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
+	// The native binary alone, a fork of the latest session.
+	handoffPSCodexForkInteractive = `SELF 4002 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4002 4001 4001 4001 ttys009 T /usr/local/bin/codex -m gpt-6.1-sol fork --last
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
 	// An interactive codex started by the interactive session's shell tool.
 	handoffPSCodexNested = `SELF 4006 SELF 4001 ttys009 T /bin/zsh -c tt handoff
 4006 4005 4004 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex resume --last
@@ -4103,13 +4125,14 @@ func TestHandoffRestoreOneShot(t *testing.T) {
 	}
 }
 
-// How a codex exec, or a Codex started by another, is told from a pane's
-// interactive Codex session, in the launcher's and the native binary's
+// How a codex exec or review, or a Codex started by another, is told from a
+// pane's interactive Codex session, in the launcher's and the native binary's
 // shapes.
 func TestHandoffCodexOneShotProcess(t *testing.T) {
 	chainOf := func(table string) []handoffProcess { return handoffTestChain(t, table) }
-	for table, want := range map[string]string{handoffPSCodexInteractive: "", handoffPSCodexNativeInteractive: "", handoffPSCodexExec: "exec-mode",
-		handoffPSCodexExecAlias: "exec-mode", handoffPSCodexExecAtPrompt: "exec-mode", handoffPSCodexNested: "nested-codex",
+	for table, want := range map[string]string{handoffPSCodexInteractive: "", handoffPSCodexNativeInteractive: "", handoffPSCodexForkInteractive: "",
+		handoffPSCodexExec: "codex-command", handoffPSCodexExecAlias: "codex-command", handoffPSCodexExecAtPrompt: "codex-command",
+		handoffPSCodexReview: "codex-command", handoffPSCodexReviewAtPrompt: "codex-command", handoffPSCodexNested: "nested-codex",
 		handoffPSShell: "no-codex-process", handoffPSInteractive: "no-codex-process", handoffPSOneShot: "no-codex-process"} {
 		if got := handoffCodexOneShot(chainOf(table)); got != want {
 			t.Errorf("handoffCodexOneShot = %q, want %q, for\n%s", got, want, table)
@@ -4126,11 +4149,13 @@ func TestHandoffCodexOneShotProcess(t *testing.T) {
 		}
 	}
 	for args, want := range map[string]bool{"codex": false, "codex exec x": true, "codex e x": true, "codex -m o3 exec x": true, "codex --model=o3 exec x": true,
-		"codex -c k=v --sandbox read-only e": true, "codex -p work tt is a prompt": false, "codex resume --last": false, "codex a prompt about exec": false,
-		"codex --oss exec": true, "codex --search a prompt": false, "codex review": false, "node /opt/bin/codex exec x": true, "node /opt/bin/codex.js -m o3 x exec": false,
-		"node /opt/bin/codex": false, "codex -m": false, "codex exec-server": false} {
-		if got := (handoffProcess{args: strings.Fields(args)}).codexExec(); got != want {
-			t.Errorf("codexExec(%q) = %v, want %v", args, got, want)
+		"codex -c k=v --sandbox read-only e": true, "codex -p work tt is a prompt": false, "codex resume --last": false, "codex fork --last": false,
+		"codex -m o3 resume 00000000-0000-4000-8000-000000000001": false, "codex a prompt about exec": true, "codex --oss exec": true,
+		"codex --search a prompt": true, "codex --search find the bug": false, "codex review": true, "codex -c k=v review --uncommitted": true, "codex mcp list": true, "codex help": true,
+		"node /opt/bin/codex exec x": true, "node /opt/bin/codex review": true, "node /opt/bin/codex.js -m o3 x exec": false, "node /opt/bin/codex": false,
+		"node /opt/bin/codex fork": false, "codex -m": false, "codex exec-server": true, "codex fix the review comments": false} {
+		if got := (handoffProcess{args: strings.Fields(args)}).codexCommand(); got != want {
+			t.Errorf("codexCommand(%q) = %v, want %v", args, got, want)
 		}
 	}
 	for program, want := range map[string]bool{"codex": true, "/usr/local/bin/codex": true, "node /opt/homebrew/bin/codex": true, "/opt/homebrew/Cellar/node/26.5.1/bin/node /opt/lib/node_modules/@openai/codex/bin/codex.js": true,
@@ -4148,7 +4173,8 @@ func TestHandoffCodexOneShotProcess(t *testing.T) {
 // session in the same pane then restores.
 func TestHandoffRestoreCodexOneShot(t *testing.T) {
 	for name, table := range map[string]string{"codex exec from the pane": handoffPSCodexExec, "codex e, native": handoffPSCodexExecAlias,
-		"codex exec at the prompt": handoffPSCodexExecAtPrompt, "a nested codex": handoffPSCodexNested, "no codex process": handoffPSShell,
+		"codex exec at the prompt": handoffPSCodexExecAtPrompt, "codex review from the pane": handoffPSCodexReview,
+		"codex review at the prompt": handoffPSCodexReviewAtPrompt, "a nested codex": handoffPSCodexNested, "no codex process": handoffPSShell,
 		"a claude table": handoffPSInteractive, "ps failed": ""} {
 		t.Run(name, func(t *testing.T) {
 			f := newHandoffHubFixture(t)
