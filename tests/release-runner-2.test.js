@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,symlinkSync,renameSync,utimesSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,lstatSync,readdirSync,rmSync,symlinkSync,renameSync,utimesSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
@@ -344,22 +344,44 @@ test("a6 a job that is not terminal keeps its backup and rehearsal copies under 
  assert.deepEqual(removed.map(r=>[r.file,r.kind,r.reason]),[[leftover,"rehearsal","terminal"],[leftover+"-shm","rehearsal","terminal"],[copyOf("rel_done"),"backup","count"]]);
  assert.deepEqual(j.names(),[...live.map(x=>copyOf(x.id)),blocked,blocked+"-wal",blocked+".json",leftover+".json"].sort());
 });
-test("a7 every removal is recorded once and nothing but listed backup and rehearsal copies is touched",()=>{
+test("a7 every removal is recorded once and nothing but listed backup, rehearsal and migration files is touched",()=>{
  const jobs=[{id:"rel_old",state:"released",settledAt:"2026-09-29T12:00:00Z"},{id:"rel_new",state:"released",settledAt:"2026-09-30T12:00:00Z"},{id:"rel_refused",state:"refused"},{id:"../rel_escape",state:"refused"}];
- const others=["rel_old.json","rel_old-inputs.json","rel_old-receipt.json","rel_old-truenas-plan.json","rel_old-migration","rel_old-mini-before","rel_old-truenas-backup.sqlite.rehearsal-rel_old.json","rel_old-truenas-backup.sqlite.tmp","rel_unlisted-truenas-backup.sqlite","rel_unlisted-truenas-backup.sqlite.rehearsal-rel_unlisted","mini-relay-offset.json"];
- const j=journalFixture({[copyOf("rel_old")]:30,"rel_old-hub-backup.sqlite":20,[copyOf("rel_old")+".rehearsal-rel_old"]:7,[copyOf("rel_new")]:30,"rel_refused-bridge-backup.sqlite":11,...Object.fromEntries(others.map(n=>[n,3]))});
+ const others=["rel_old.json","rel_old-inputs.json","rel_old-receipt.json","rel_old-truenas-plan.json","rel_old-migration.tmp","rel_old-mini-before","rel_old-truenas-backup.sqlite.rehearsal-rel_old.json","rel_old-truenas-backup.sqlite.tmp","rel_unlisted-truenas-backup.sqlite","rel_unlisted-truenas-backup.sqlite.rehearsal-rel_unlisted","mini-relay-offset.json"];
+ const j=journalFixture({[copyOf("rel_old")]:30,"rel_old-hub-backup.sqlite":20,[copyOf("rel_old")+".rehearsal-rel_old"]:7,"rel_old-migration":13,[copyOf("rel_new")]:30,"rel_refused-bridge-backup.sqlite":11,...Object.fromEntries(others.map(n=>[n,3]))});
  // Only a regular file directly in the journal directory is a copy: a directory or link of that name stays.
  mkdirSync(join(j.dir,"tailos-dist-fixture"));mkdirSync(join(j.dir,"rel_refused-hub-backup.sqlite"));symlinkSync(join(j.dir,"rel_old.json"),join(j.dir,copyOf("rel_refused")));
  const escape=join(dirname(j.dir),"rel_escape-truenas-backup.sqlite");writeFileSync(escape,"outside");
  try{
   const removed=sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),expected=[
-   {jobId:"rel_old",file:copyOf("rel_old")+".rehearsal-rel_old",kind:"rehearsal",bytes:7,reason:"terminal"},{jobId:"rel_refused",file:"rel_refused-bridge-backup.sqlite",kind:"backup",bytes:11,reason:"not-released"},
+   {jobId:"rel_old",file:copyOf("rel_old")+".rehearsal-rel_old",kind:"rehearsal",bytes:7,reason:"terminal"},{jobId:"rel_old",file:"rel_old-migration",kind:"migration",bytes:13,reason:"terminal"},{jobId:"rel_refused",file:"rel_refused-bridge-backup.sqlite",kind:"backup",bytes:11,reason:"not-released"},
    {jobId:"rel_old",file:copyOf("rel_old"),kind:"backup",bytes:30,reason:"count"},{jobId:"rel_old",file:"rel_old-hub-backup.sqlite",kind:"backup",bytes:20,reason:"count"}].map(r=>({version:1,at:"2026-10-01T09:30:00.000Z",...r}));
   assert.deepEqual(removed,expected);assert.deepEqual(j.lines(),expected);assert.equal(statSync(join(j.dir,"retention.jsonl")).mode&0o777,0o600);
   assert.deepEqual(j.names(),[...others,copyOf("rel_new"),copyOf("rel_refused"),"rel_refused-hub-backup.sqlite","tailos-dist-fixture"].sort());
   assert.equal(readFileSync(escape,"utf8"),"outside");
   assert.deepEqual(sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),[],"a second sweep removes nothing");assert.deepEqual(j.lines(),expected);
  }finally{rmSync(escape,{force:true});}
+});
+test("m3 a terminal job loses its migration binary whatever its state and the backup policy, and a job that is not terminal keeps it",()=>{
+ // rel_new is inside releasedBackups and keeps its backup copy, but not its binary: no rollback reads it.
+ const jobs=[{id:"rel_new",state:"released",settledAt:"2026-09-30T12:00:00Z"},{id:"rel_old",state:"released",settledAt:"2026-09-29T12:00:00Z"},{id:"rel_refused",state:"refused"},{id:"rel_back",state:"rolled_back"},{id:"rel_super",state:"superseded"},{id:"rel_live",state:"claimed"},{id:"rel_future",state:"some_future_state"},{id:"rel_link",state:"refused"},{id:"rel_dir",state:"released",settledAt:"2026-09-28T12:00:00Z"}];
+ const bin=id=>id+"-migration",j=journalFixture({[copyOf("rel_new")]:30,[copyOf("rel_old")]:30,...Object.fromEntries(["rel_new","rel_old","rel_refused","rel_back","rel_super","rel_live","rel_future"].map((id,i)=>[bin(id),41+i])),"rel_unlisted-migration":5,"target.bin":9});
+ // A link or directory of that name is neither followed nor removed.
+ const elsewhere=mkdtempSync(join(tmpdir(),"release-retention-elsewhere-"));writeFileSync(join(elsewhere,"binary"),"elsewhere");
+ symlinkSync(join(elsewhere,"binary"),join(j.dir,bin("rel_link")));mkdirSync(join(j.dir,bin("rel_dir")));writeFileSync(join(j.dir,bin("rel_dir"),"inside"),"inside");
+ try{
+  const removed=sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),expected=[
+   {jobId:"rel_new",file:bin("rel_new"),kind:"migration",bytes:41,reason:"terminal"},{jobId:"rel_old",file:bin("rel_old"),kind:"migration",bytes:42,reason:"terminal"},
+   {jobId:"rel_refused",file:bin("rel_refused"),kind:"migration",bytes:43,reason:"terminal"},{jobId:"rel_back",file:bin("rel_back"),kind:"migration",bytes:44,reason:"terminal"},
+   {jobId:"rel_super",file:bin("rel_super"),kind:"migration",bytes:45,reason:"terminal"},{jobId:"rel_old",file:copyOf("rel_old"),kind:"backup",bytes:30,reason:"count"}].map(r=>({version:1,at:"2026-10-01T09:30:00.000Z",...r}));
+  assert.deepEqual(removed,expected);assert.deepEqual(j.lines(),expected);
+  assert.deepEqual(j.names(),[copyOf("rel_new"),bin("rel_dir"),bin("rel_future"),bin("rel_link"),bin("rel_live"),"rel_unlisted-migration","target.bin"].sort());
+  assert.ok(lstatSync(join(j.dir,bin("rel_link"))).isSymbolicLink());assert.equal(readFileSync(join(elsewhere,"binary"),"utf8"),"elsewhere");
+  assert.equal(readFileSync(join(j.dir,bin("rel_dir"),"inside"),"utf8"),"inside");
+  assert.deepEqual(sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:0}),[],"a second sweep removes nothing");
+  // The record comes first: when it cannot be written the binary stays.
+  const k=journalFixture({[bin("rel_refused")]:43});mkdirSync(join(k.dir,"retention.jsonl"));
+  assert.throws(()=>sweep(k,jobs,{releasedBackups:1,backupBudgetBytes:0}));assert.ok(existsSync(join(k.dir,bin("rel_refused"))));
+ }finally{rmSync(elsewhere,{recursive:true,force:true});}
 });
 test("retention removes a terminal job's backup copies of every generation and nothing else that carries one",()=>{
  const jobs=[{id:"rel_old",state:"released",settledAt:"2026-09-30T10:00:00Z"},{id:"rel_new",state:"released",settledAt:"2026-09-30T11:00:00Z"},{id:"rel_ref",state:"refused"},{id:"rel_live",state:"claimed"}];

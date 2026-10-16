@@ -1971,13 +1971,14 @@ export function retentionPolicy(config){
   const value=(key,fallback)=>{const v=retention[key]===undefined?fallback:retention[key];if(!Number.isSafeInteger(v) || v<0)throw releaseError("Invalid journal retention "+key);return v;};
   return {releasedBackups:value("releasedBackups",3),backupBudgetBytes:value("backupBudgetBytes",4294967296),releasedDists:value("releasedDists",3),attemptDays:value("attemptDays",3)};
 }
-// Removes only the exact backup and rehearsal copy names of jobs in the
-// deployment list, each a regular file directly in the journal directory or
-// directly in the job's rehearsal state directory. A job in any state not
-// known to be terminal keeps everything; a terminal job loses its leftover
-// rehearsal copy, and its backup copy unless it is one of the newest released
-// jobs within the size budget. In a state directory only regular files go,
-// then the directory once empty; a link is never followed or removed.
+// Removes only the exact backup copy, rehearsal copy and migration binary
+// names of jobs in the deployment list, each a regular file directly in the
+// journal directory or directly in the job's rehearsal state directory. A job
+// in any state not known to be terminal keeps everything; a terminal job loses
+// its leftover rehearsal copy, its migration binary ID-migration, and its
+// backup copy unless it is one of the newest released jobs within the size
+// budget. In a state directory only regular files go, then the directory once
+// empty; a link is never followed or removed.
 //
 // Then the TailOS copies tailos-dist-COMMIT (wi_d203eb94ef27d8f8). The newest
 // released TailOS commit, each of keepDists, the newest releasedDists released
@@ -2031,6 +2032,9 @@ export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
       for(const name of names)remove(job.id,`${state}/${name}`,"rehearsal","terminal");
       try{rmdirSync(join(dir,state));}catch{}
     }
+    // The migration binary is read only by its own job's rehearsal, which the
+    // marker allows once, and no rollback reads it, so no released job keeps it.
+    remove(job.id,`${job.id}-migration`,"migration","terminal");
     if(job.state!=="released"){for(const file of backups)remove(job.id,file,"backup","not-released");return;}
     // settledAt is RFC3339Nano with trimmed zeros, so it is compared as time;
     // a job without a usable one is the oldest, in list order.

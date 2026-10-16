@@ -1713,8 +1713,9 @@ aside or requeued, the length of its `reconciliations`).
   renamed or moved by hand. The earlier attempt's files and its TrueNAS backup
   are never opened for writing, renamed or removed; they stay as evidence.
   No retention removes earlier attempts' manifests, plans, receipts or TrueNAS
-  backups. The local backup copies of every generation, the TailOS copies and
-  the matrix attempt directories follow "Journal retention" below.
+  backups. The local backup copies of every generation, the migration binary,
+  the TailOS copies and the matrix attempt directories follow "Journal
+  retention" below.
 - **Running the inputs command again at the same generation is safe.** When the
   manifest exists it returns the same path, digest, targets and import command
   and makes no probe, backup or backup copy, and changes no file; a manifest whose binding differs
@@ -1945,7 +1946,7 @@ export of one database differs between any two starts in that column alone.
 The digest's export hash leaves out that one column and nothing else (owner
 clarification #31372).
 
-### Journal retention (wi_e83171b4c215f626, wi_d203eb94ef27d8f8)
+### Journal retention (wi_e83171b4c215f626, wi_d203eb94ef27d8f8, wi_c7c79e078554a2ad)
 
 **Where backups live.** The authoritative pre-release backup is on TrueNAS at
 `/mnt/deepfreeze/tailterm-hub/backups/before-ID-gN-NAME.sqlite` (N is the job
@@ -1995,13 +1996,20 @@ rehearsal state directory:
    sidecars left by an earlier runner are removed the same way. A refused job is
    terminal for that job ID even when the handler retries its entry: the retry
    is a new job with its own journal files.
-3. A terminal job that is not `released` loses its backup copy (reason
+3. A terminal job loses its migration binary `ID-migration`, the Linux hub
+   build its rehearsal runs (kind `migration`, reason `terminal`), only as a
+   regular file directly in `journalDirectory`; a link or directory of that
+   name is neither followed nor removed. No released job keeps it, whatever
+   `retention.releasedBackups`: only its own job's rehearsal reads it, the
+   marker allows that rehearsal once, and no rollback reads it (rollback uses
+   the retained prior release and the inputs manifest's rollback program).
+4. A terminal job that is not `released` loses its backup copy (reason
    `not-released`).
-4. Released jobs are ordered newest first by `settledAt` compared as time; a job
+5. Released jobs are ordered newest first by `settledAt` compared as time; a job
    without one is the oldest, in list order. The newest
    `retention.releasedBackups` (default 3) keep their copies; older ones are
    removed (reason `count`).
-5. While the bytes of all remaining listed backup copies, non-terminal jobs
+6. While the bytes of all remaining listed backup copies, non-terminal jobs
    included, exceed `retention.backupBudgetBytes` (default 4294967296, 4 GiB;
    0 means no budget), the oldest kept released copy is removed (reason
    `budget`). A non-terminal job's copy is never removed, even over budget.
@@ -2063,7 +2071,7 @@ itself a link, a name that is not `COMMIT-rN`, and files directly in the parent
 (the layout from before attempts) are neither followed nor removed.
 
 Files of a job not in the list, markers, journals, manifests, receipts, plans,
-`ID-migration`, `ID-mini-before` and, outside a TailOS copy, anything that is
+`ID-mini-before` and, outside a TailOS copy, anything that is
 not a regular file are never touched. All four keys are optional; a value that
 is not a non-negative integer stops the daemon at startup.
 
@@ -2071,15 +2079,17 @@ is not a non-negative integer stops the daemon at startup.
 to `journalDirectory/retention.jsonl` (0600):
 
 ```
-{version: 1, at, jobId, file, kind: "backup" | "rehearsal" | "dist" | "attempt", bytes, reason: "terminal" | "not-released" | "count" | "budget" | "age"}
+{version: 1, at, jobId, file, kind: "backup" | "rehearsal" | "migration" | "dist" | "attempt", bytes, reason: "terminal" | "not-released" | "count" | "budget" | "age"}
 ```
 
 `file` is the name inside the journal directory; a file of a rehearsal state
 directory is `DIRECTORY/NAME`, a TailOS copy is `tailos-dist-COMMIT` and an
-attempt file is `ID-integrated-verification/COMMIT-rN/NAME`. Kind `dist` has
-reason `count` or `not-released`; kind `attempt` has reason `age`. A sweep
-with nothing to remove writes nothing. A sweep removes backups first, then
-TailOS copies, then attempt files. A sweep that fails (for example the record
+attempt file is `ID-integrated-verification/COMMIT-rN/NAME`. Kind `migration` has
+reason `terminal`; kind `dist` has reason `count` or `not-released`; kind
+`attempt` has reason `age`. A sweep
+with nothing to remove writes nothing. A sweep removes backup, rehearsal and
+migration files first, job by job in list order, then TailOS copies, then
+attempt files. A sweep that fails (for example the record
 cannot be written) removes nothing further, prints "Journal retention sweep
 failed; remaining backup copies kept." and the poll continues. The first poll
 after a change to this rule is deployed removes the existing backlog under it;
