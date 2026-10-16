@@ -182,23 +182,6 @@ type releaseCursor struct {
 	RowID    int64  `json:"rowId"`
 }
 
-func releaseSummary(j api.ReleaseJob, row int64) api.ReleaseSummary {
-	out := api.ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
-	out.Receipt = api.ReleaseSummaryOfReceipt(j.Receipt)
-	if j.Refusal != nil {
-		refusal := *j.Refusal
-		out.Refusal = &refusal
-	}
-	if j.Supersession != nil {
-		out.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
-	}
-	if j.Hold != nil {
-		hold := *j.Hold
-		out.Hold = &hold
-	}
-	return out
-}
-
 // ReleasesPage observes metadata and one bounded record page in the same transaction.
 // Any ledger change invalidates continuation, including settlement of an old row.
 func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseListOptions) (api.ReleasePage, error) {
@@ -279,7 +262,7 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 			rows.Close()
 			return out, err
 		}
-		out.Jobs = append(out.Jobs, releaseSummary(j, row))
+		out.Jobs = append(out.Jobs, api.ReleaseSummaryOf(j, row))
 	}
 	err = rows.Err()
 	rows.Close()

@@ -126,6 +126,27 @@ func ReleaseSummaryOfReceipt(r *ReleaseReceipt) *ReleaseSummaryReceipt {
 	return out
 }
 
+// ReleaseSummaryOf projects full details onto exactly the native compact
+// contract. It is the only projection: the store builds its pages with it and
+// the compatibility read compares each stored summary against it, which
+// detects changes to every pin, not just state/generation.
+func ReleaseSummaryOf(j ReleaseJob, row int64) ReleaseSummary {
+	s := ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
+	s.Receipt = ReleaseSummaryOfReceipt(j.Receipt)
+	if j.Refusal != nil {
+		refusal := *j.Refusal
+		s.Refusal = &refusal
+	}
+	if j.Supersession != nil {
+		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
+	}
+	if j.Hold != nil {
+		hold := *j.Hold
+		s.Hold = &hold
+	}
+	return s
+}
+
 type ReleaseSummarySupersession struct {
 	ReleasedCommit string   `json:"releasedCommit"`
 	Targets        []string `json:"targets"`
@@ -585,25 +606,6 @@ func releaseSettled(state string) bool {
 	return state == "released" || state == "rolled_back" || state == "refused" || state == "superseded"
 }
 
-// Project full details onto exactly the native compact contract. Comparing
-// this projection detects changes to every pin, not just state/generation.
-func compatibilitySummary(j ReleaseJob, row int64) ReleaseSummary {
-	s := ReleaseSummary{Summary: true, RowID: row, ID: j.ID, TaskID: j.TaskID, EntryID: j.EntryID, ItemID: j.ItemID, ItemRevision: j.ItemRevision, ScopeRevision: j.ScopeRevision, OrderMessageSeq: j.OrderMessageSeq, BaseCommit: j.BaseCommit, Commit: j.Commit, VerificationDigest: j.VerificationDigest, State: j.State, Generation: j.Generation, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, IntegratedCommit: j.IntegratedCommit, InputsCommit: j.InputsCommit, InputsDigest: j.InputsDigest, Published: j.Published, SettledAt: j.SettledAt}
-	s.Receipt = ReleaseSummaryOfReceipt(j.Receipt)
-	if j.Refusal != nil {
-		refusal := *j.Refusal
-		s.Refusal = &refusal
-	}
-	if j.Supersession != nil {
-		s.Supersession = &ReleaseSummarySupersession{ReleasedCommit: j.Supersession.ReleasedCommit, Targets: j.Supersession.Targets}
-	}
-	if j.Hold != nil {
-		hold := *j.Hold
-		s.Hold = &hold
-	}
-	return s
-}
-
 func compatibilityLegacy(raw json.RawMessage, task string) ([]ReleaseJob, string, error) {
 	var records []json.RawMessage
 	if err := json.Unmarshal(raw, &records); err != nil || records == nil {
@@ -704,7 +706,7 @@ func (c *Client) compatibilityPage(ctx context.Context, task string, opts Releas
 			page.Page.NextAfter = base64.RawURLEncoding.EncodeToString(b)
 			break
 		}
-		page.Jobs = append(page.Jobs, compatibilitySummary(j, row))
+		page.Jobs = append(page.Jobs, ReleaseSummaryOf(j, row))
 	}
 	return page, jobs, nil
 }
@@ -812,7 +814,7 @@ func (c *Client) compatibilityLedgerOnce(ctx context.Context, task, onlyID strin
 				return nil, err
 			}
 		}
-		if !reflect.DeepEqual(compatibilitySummary(j, s.RowID), s) {
+		if !reflect.DeepEqual(ReleaseSummaryOf(j, s.RowID), s) {
 			return nil, fmt.Errorf("release detail changed or compact")
 		}
 		out = append(out, j)

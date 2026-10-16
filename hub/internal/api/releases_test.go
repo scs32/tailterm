@@ -110,7 +110,7 @@ func TestReleaseDeploymentCompatibilityFullHistoryAndDetail(t *testing.T) {
 						page.Page.NextAfter = strconv.FormatInt(page.Jobs[len(page.Jobs)-1].RowID, 10)
 						break
 					}
-					page.Jobs = append(page.Jobs, compatibilitySummary(j, int64(row)))
+					page.Jobs = append(page.Jobs, ReleaseSummaryOf(j, int64(row)))
 				}
 				json.NewEncoder(w).Encode(page)
 			}))
@@ -205,7 +205,7 @@ func TestReleaseDeploymentCompatibilityModernDetailBookend(t *testing.T) {
 						copy.TaskID = "tsk_other"
 					}
 					if fault == "compact" {
-						json.NewEncoder(w).Encode(compatibilitySummary(copy, 1))
+						json.NewEncoder(w).Encode(ReleaseSummaryOf(copy, 1))
 					} else {
 						json.NewEncoder(w).Encode(copy)
 					}
@@ -217,7 +217,7 @@ func TestReleaseDeploymentCompatibilityModernDetailBookend(t *testing.T) {
 				}
 				page := ReleasePage{Version: 1, Jobs: []ReleaseSummary{}, Page: ReleasePageInfo{View: q.Get("view"), Limit: 200, Snapshot: token}}
 				if q.Get("view") == "active" {
-					page.Jobs = append(page.Jobs, compatibilitySummary(job, 1))
+					page.Jobs = append(page.Jobs, ReleaseSummaryOf(job, 1))
 					if fault == "repeat" {
 						page.Page.NextAfter = "same"
 					}
@@ -253,7 +253,7 @@ func heldLedgerHub(t *testing.T, listed []ReleaseJob, detail func(ReleaseJob) Re
 		page := ReleasePage{Version: 1, Jobs: []ReleaseSummary{}, Page: ReleasePageInfo{View: q.Get("view"), Limit: 200, Snapshot: strings.Repeat("a", 64)}}
 		if q.Get("view") == "active" {
 			for i, j := range listed {
-				s := compatibilitySummary(j, int64(i+1))
+				s := ReleaseSummaryOf(j, int64(i+1))
 				s.Hold = nil
 				if j.Hold != nil {
 					hold := *j.Hold
@@ -288,7 +288,7 @@ func TestReleaseDeploymentCompatibilityListsHeldJob(t *testing.T) {
 		t.Fatal("compat-get of a held job:", got, err)
 	}
 	for _, j := range jobs {
-		if s := compatibilitySummary(j, 1); !reflect.DeepEqual(s.Hold, j.Hold) || (s.Hold != nil && s.Hold == j.Hold) {
+		if s := ReleaseSummaryOf(j, 1); !reflect.DeepEqual(s.Hold, j.Hold) || (s.Hold != nil && s.Hold == j.Hold) {
 			t.Fatal("summary hold is not a copy of the job's", j.ID, s.Hold)
 		}
 	}
@@ -392,7 +392,7 @@ func (h *staleLedgerHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			page.Page.NextAfter = strconv.FormatInt(page.Jobs[len(page.Jobs)-1].RowID, 10)
 			break
 		}
-		page.Jobs = append(page.Jobs, compatibilitySummary(j, int64(row)))
+		page.Jobs = append(page.Jobs, ReleaseSummaryOf(j, int64(row)))
 	}
 	json.NewEncoder(w).Encode(page)
 }
@@ -528,10 +528,10 @@ func TestReleaseDeploymentCompatibilityRetriesOnlyStaleSnapshot(t *testing.T) {
 					json.NewEncoder(w).Encode(ReleasePage{Version: 1, Jobs: []ReleaseSummary{}, Page: ReleasePageInfo{View: q.Get("view"), Limit: 200, Snapshot: strings.Repeat("b", 64)}})
 				case fault == "repeat" && q.Get("job") == "" && q.Get("view") == "settled":
 					h.lists++
-					json.NewEncoder(w).Encode(ReleasePage{Version: 1, Jobs: []ReleaseSummary{compatibilitySummary(h.jobs[3+h.lists-2], int64(3+h.lists-1))}, Page: ReleasePageInfo{View: "settled", Limit: 200, Snapshot: h.token(), NextAfter: "same" + strconv.Itoa(h.lists%2)}})
+					json.NewEncoder(w).Encode(ReleasePage{Version: 1, Jobs: []ReleaseSummary{ReleaseSummaryOf(h.jobs[3+h.lists-2], int64(3+h.lists-1))}, Page: ReleasePageInfo{View: "settled", Limit: 200, Snapshot: h.token(), NextAfter: "same" + strconv.Itoa(h.lists%2)}})
 				case fault == "continuation" && q.Get("job") == "" && q.Get("view") == "settled":
 					h.lists++
-					json.NewEncoder(w).Encode(ReleasePage{Version: 1, Jobs: []ReleaseSummary{compatibilitySummary(h.jobs[3], 4)}, Page: ReleasePageInfo{View: "settled", Limit: 200, Snapshot: h.token(), NextAfter: "next" + strconv.Itoa(h.lists)}})
+					json.NewEncoder(w).Encode(ReleasePage{Version: 1, Jobs: []ReleaseSummary{ReleaseSummaryOf(h.jobs[3], 4)}, Page: ReleasePageInfo{View: "settled", Limit: 200, Snapshot: h.token(), NextAfter: "next" + strconv.Itoa(h.lists)}})
 				case fault == "detail" && q.Get("job") != "":
 					h.details++
 					copy := h.jobs[0]
@@ -581,4 +581,90 @@ func TestReleaseDeploymentCompatibilityRetriesOnlyStaleSnapshot(t *testing.T) {
 			t.Fatal(err, h.lists, h.stale)
 		}
 	})
+}
+
+// fillNonZero sets every settable field reachable from v to a non-zero value:
+// one element per slice and map, a fresh value behind each pointer.
+func fillNonZero(v reflect.Value, depth int) {
+	if depth > 8 {
+		return
+	}
+	switch v.Kind() {
+	case reflect.String:
+		v.SetString("x")
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v.SetInt(1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		v.SetUint(1)
+	case reflect.Float32, reflect.Float64:
+		v.SetFloat(1)
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+		fillNonZero(v.Elem(), depth+1)
+	case reflect.Slice:
+		v.Set(reflect.MakeSlice(v.Type(), 1, 1))
+		fillNonZero(v.Index(0), depth+1)
+	case reflect.Map:
+		v.Set(reflect.MakeMap(v.Type()))
+		k, e := reflect.New(v.Type().Key()).Elem(), reflect.New(v.Type().Elem()).Elem()
+		fillNonZero(k, depth+1)
+		fillNonZero(e, depth+1)
+		v.SetMapIndex(k, e)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if v.Field(i).CanSet() {
+				fillNonZero(v.Field(i), depth+1)
+			}
+		}
+	case reflect.Interface:
+		v.Set(reflect.ValueOf("x"))
+	}
+}
+
+// zeroFields names every exported field reachable from v that is still zero.
+func zeroFields(v reflect.Value, path string) []string {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return []string{path}
+		}
+		return zeroFields(v.Elem(), path)
+	case reflect.Slice:
+		if v.Len() == 0 {
+			return []string{path}
+		}
+		return zeroFields(v.Index(0), path+"[0]")
+	case reflect.Struct:
+		var out []string
+		for i := 0; i < v.NumField(); i++ {
+			if f := v.Type().Field(i); f.IsExported() {
+				out = append(out, zeroFields(v.Field(i), path+"."+f.Name)...)
+			}
+		}
+		return out
+	}
+	if v.IsZero() {
+		return []string{path}
+	}
+	return nil
+}
+
+// A summary field the shared projection leaves unset would make the store
+// page and the compatibility read disagree once one of them starts setting
+// it, so every field, nested receipt fields included, must come from the job.
+func TestReleaseSummaryOfProjectsEveryField(t *testing.T) {
+	var j ReleaseJob
+	fillNonZero(reflect.ValueOf(&j).Elem(), 0)
+	s := ReleaseSummaryOf(j, 1)
+	if missing := zeroFields(reflect.ValueOf(s), "ReleaseSummary"); len(missing) > 0 {
+		t.Fatal("ReleaseSummaryOf leaves these fields zero for a fully set job:", missing)
+	}
+	if s.Hold == j.Hold || s.Refusal == j.Refusal || !reflect.DeepEqual(*s.Hold, *j.Hold) || !reflect.DeepEqual(*s.Refusal, *j.Refusal) {
+		t.Fatal("summary hold and refusal must be equal copies of the job's, not aliases")
+	}
+	if !reflect.DeepEqual(ReleaseSummaryOf(j, 1), s) {
+		t.Fatal("projection is not deterministic")
+	}
 }
