@@ -702,6 +702,18 @@ path). A missing cwd that is not the entry's queue worktree is refused. Like one
 queue add --new-worktree`, the worktree stays after the entry finishes; remove
 it with `git worktree remove PATH` once its candidate is integrated.
 
+`tt team queue add` makes its new worktree (`--new-worktree`, the default on a
+parallel project) under the same rule. Until the hub confirms the entry, any
+failure removes the worktree, so the add can be rerun. When the add's response
+is lost, the CLI reads back the item's entry before removing anything: if the
+hub saved one naming the new worktree at the same base, order and ownership,
+it keeps the worktree and reports the entry as added. A failed read-back
+counts as nothing saved, so the worktree is removed and the saved entry names
+a missing directory. Rerunning the same add repairs that while the checkout's
+`HEAD` is still the entry's base: it recreates the worktree, the hub refuses
+the duplicate item, and the read-back keeps the worktree. Otherwise remove the
+entry and add it again.
+
 Release the hub before the CLI: a CLI that sends the move to an older hub
 refuses when the saved entry lacks the new `cwd` and removes the worktree. The
 older hub has still saved any `--owns` change and incremented the revision.
@@ -1028,9 +1040,21 @@ delivery it posts one typed NOTICE after the hub confirms the entry, linked to
 the item at its current revision and to the order message, naming the entry,
 the template and the reason (`reason=paths (more than three owned paths)`).
 Small entries and features get no notice. If that post fails, the entry stays
-queued and `add` exits non-zero with the entry ID and the exact notice text to
-post by hand. With `--json`, stdout is only the entry JSON and the `template
-...` line goes to stderr.
+queued and `add` prints one ready `tt send --kind notice` command that posts
+the same notice: the request ID `queue-lane-ENTRY`, `--work-item`,
+`--work-item-revision` and `--work-order-message` as the original, and the
+subject, text and refs, shell-quoted. Run from the same session, it is the
+request `add` sent, so the hub stores the notice once however often it is
+repeated, as a typed NOTICE rather than plain text. When the hub refused the
+notice only because the caller holds unacknowledged directed work, `add` prints
+a warning on stderr naming those messages (`#SEQ`), asks for `tt ack SEQ` and
+then the command, prints the entry as usual, and exits 0. Any other failure
+exits non-zero with the entry ID, the error and the command. `add` runs only
+from the owner's unbound CLI: an agent session is refused before any worktree
+or hub write, and the notice carries no agent, so today the hub never refuses it
+that way (the case filed as `wi_ec0bd3696e66b9fe` cannot occur). The warning
+keeps the entry's outcome honest if that changes. With `--json`, stdout is
+only the entry JSON and the `template ...` line goes to stderr.
 
 The steward's proposals follow the same rule
 ([backlog-steward.md](backlog-steward.md#proposals)). The database handler's

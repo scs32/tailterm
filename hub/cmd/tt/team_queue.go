@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -869,6 +870,13 @@ func cmdTeamQueue(e env, args []string) error {
 			result, err = saved, nil
 		}
 	}
+	if err != nil && sub == "add" && createdWorktree != "" {
+		// A lost response may follow a saved add: keep the worktree the
+		// saved entry names. A failed lookup counts as nothing saved.
+		if saved, ok := savedQueueAdd(c, *task, req); ok {
+			result, err = saved, nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -878,12 +886,21 @@ func cmdTeamQueue(e env, args []string) error {
 	createdWorktree = "" // The saved entry now names it.
 	if laneNotice != nil {
 		env := laneNotice.envelope(result.ID)
-		post := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: "queue-lane-" + result.ID,
+		// The post is the one laneNotice.sendCommand repeats, so the hub
+		// returns a stored notice to a repost instead of a second one.
+		post := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: queueLaneRequestID(result.ID), AuditKind: api.MessageAuditWork,
 			WorkItems:        []api.MessageWorkItem{{ItemTaskID: *task, ItemID: laneNotice.item.ID, ItemRevision: laneNotice.item.Revision, Relationship: "primary"}},
 			WorkOrderMessage: &api.MessageReference{TaskID: *task, Seq: laneNotice.order}}
 		if _, postErr := c.PostMessage(ctx, *task, post); postErr != nil {
 			// The entry stays queued; only its reason record is missing.
-			return fmt.Errorf("entry %s was added at %d for %s, but its Planned reason was not recorded: %v; post this notice linked to the item and order #%d:\n%s", result.ID, result.Position, result.ItemID, postErr, laneNotice.order, api.RenderText(env))
+			command := laneNotice.sendCommand(*task, result.ID)
+			if seqs := unacknowledgedSeqs(postErr); len(seqs) > 0 {
+				// The hub refused only the notice, for work this session
+				// has not acknowledged; the entry itself is queued.
+				fmt.Fprintf(os.Stderr, "warning: entry %s is queued at %d for %s, but its Planned reason was not recorded: the hub refused the notice because this session has unacknowledged work %s. Acknowledge it with tt ack SEQ, then post the reason with:\n%s\n", result.ID, result.Position, result.ItemID, strings.Join(seqs, ", "), command)
+			} else {
+				return fmt.Errorf("entry %s was added at %d for %s, but its Planned reason was not recorded: %v; post it, linked to the item and order #%d, with:\n%s", result.ID, result.Position, result.ItemID, postErr, laneNotice.order, command)
+			}
 		}
 	}
 	if *jsonOut {
@@ -1022,6 +1039,63 @@ func (n queueLaneNotice) envelope(entry string) api.Envelope {
 	return api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A bug was queued on Planned delivery with a recorded reason",
 		Refs: map[string]string{"entry": entry, "item": n.item.ID, "order": strconv.FormatInt(n.order, 10)},
 		Body: api.EnvelopeBody{Text: fmt.Sprintf("Queue entry %s puts bug %s on template %s instead of the small-change lane. reason=%s (%s).", entry, n.item.ID, n.template, n.reason, meaning)}}
+}
+
+// queueLaneRequestID is the retry identity of an entry's lane notice.
+func queueLaneRequestID(entry string) string { return "queue-lane-" + entry }
+
+// sendCommand is the tt send command that posts the notice exactly as add
+// does, with the same request id and links. Run from the same session, it
+// stores the notice once, however often it is repeated.
+func (n queueLaneNotice) sendCommand(task, entry string) string {
+	env := n.envelope(entry)
+	args := []string{"--task", task, "--kind", env.Kind, "--subject", env.Subject, "--text", env.Body.Text}
+	for _, key := range []string{"entry", "item", "order"} {
+		args = append(args, "--ref", key+"="+env.Refs[key])
+	}
+	args = append(args, "--request-id", queueLaneRequestID(entry), "--work-item", n.item.ID,
+		"--work-item-revision", strconv.FormatInt(n.item.Revision, 10), "--work-order-message", strconv.FormatInt(n.order, 10))
+	for i, arg := range args {
+		if !strings.HasPrefix(arg, "--") {
+			args[i] = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+		}
+	}
+	return "tt send " + strings.Join(args, " ")
+}
+
+// unacknowledgedSeqs lists the messages named by the hub's refusal of a write
+// from an agent holding unacknowledged work, or nil for any other error.
+func unacknowledgedSeqs(err error) []string {
+	var refused *api.HTTPError
+	if !errors.As(err, &refused) || refused.Code != "unacknowledged" {
+		return nil
+	}
+	var seqs []string
+	for _, part := range strings.Split(refused.Msg, "#")[1:] {
+		if digits := strings.TrimRightFunc(part, func(r rune) bool { return r < '0' || r > '9' }); digits != "" && strings.HasPrefix(part, digits+" from ") {
+			seqs = append(seqs, "#"+digits)
+		}
+	}
+	return seqs
+}
+
+// savedQueueAdd reads back the entry an add whose response failed may have
+// saved. It is this add's entry only when it names the new worktree at the
+// same base, order and ownership. The lookup has its own deadline, since the add may
+// have spent the command's.
+func savedQueueAdd(c *api.Client, task string, req api.TeamQueueRequest) (api.TeamQueueEntry, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	list, err := c.ListTeamQueuePage(ctx, task, api.TeamQueueListOptions{Item: req.ItemID})
+	if err != nil {
+		return api.TeamQueueEntry{}, false
+	}
+	for _, q := range list.Entries {
+		if q.ItemID == req.ItemID && q.Cwd == req.Cwd && q.BaseCommit == req.BaseCommit && q.OrderMessageSeq == req.OrderMessageSeq && slices.Equal(q.Ownership, req.Ownership) {
+			return q, true
+		}
+	}
+	return api.TeamQueueEntry{}, false
 }
 
 // intakeOwnership reads the ownership the database handler recorded at scope

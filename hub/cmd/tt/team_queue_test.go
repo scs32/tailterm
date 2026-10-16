@@ -1597,27 +1597,67 @@ func TestTeamQueueCLIDefaultLaneExplicitTemplate(t *testing.T) {
 	}
 }
 
-// a6: when the hub refuses the notice the entry stays queued and add fails
-// naming the entry and the exact notice to post.
-func TestTeamQueueCLIDefaultLaneNoticeFailureKeepsEntry(t *testing.T) {
-	f := newTeamFixtureKind(t, true, "bug")
-	repo, _ := queueGitRepo(t)
-	target, err := url.Parse(f.e.hub)
+// laneNoticeProxy fronts the fixture hub and answers every message post with
+// status and body, recording each refused request.
+func laneNoticeProxy(t *testing.T, hub string, status int, body string) (env, *[]api.PostMessageRequest) {
+	t.Helper()
+	target, err := url.Parse(hub)
 	if err != nil {
 		t.Fatal(err)
 	}
 	forward := httputil.NewSingleHostReverseProxy(target)
+	var refused []api.PostMessageRequest
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages") {
-			http.Error(w, `{"error":"board unavailable"}`, http.StatusServiceUnavailable)
+			var req api.PostMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("notice body: %v", err)
+			}
+			refused = append(refused, req)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
 			return
 		}
 		forward.ServeHTTP(w, r)
 	}))
 	t.Cleanup(proxy.Close)
-	broken := f.e
-	broken.hub = proxy.URL
-	_, _, err = laneAdd(t, broken, f.item, f.order, repo, "--owns", "a", "--owns", "b", "--owns", "c", "--owns", "d")
+	return env{hub: proxy.URL}, &refused
+}
+
+// laneSendArgs finds the one tt send command in text and splits it as the
+// shell does, returning the arguments after "tt send".
+func laneSendArgs(t *testing.T, text string) []string {
+	t.Helper()
+	var command string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "tt send ") {
+			if command != "" {
+				t.Fatalf("more than one tt send command:\n%s", text)
+			}
+			command = line
+		}
+	}
+	if command == "" {
+		t.Fatalf("no tt send command:\n%s", text)
+	}
+	out, err := exec.Command("sh", "-c", `eval "set -- $1"; shift 2; printf '%s\0' "$@"`, "sh", command).Output()
+	if err != nil {
+		t.Fatalf("shell cannot parse %q: %v", command, err)
+	}
+	return strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+}
+
+// q2 (a2): when the hub refuses the notice the entry stays queued and add
+// fails, naming the entry and one typed command. That command, parsed by the
+// shell and tt send's own flags, posts the request add sent, so the hub
+// stores the notice once however often it is run.
+func TestTeamQueueCLIDefaultLaneNoticeFailureKeepsEntry(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	broken, refused := laneNoticeProxy(t, f.e.hub, http.StatusServiceUnavailable, `{"error":"board unavailable"}`)
+	broken.task = f.e.task
+	_, _, err := laneAdd(t, broken, f.item, f.order, repo, "--owns", "a", "--owns", "b", "--owns", "c", "--owns", "d")
 	q := laneEntry(t, f, f.item.ID)
 	if q.Template != "planned" || q.State != "queued" {
 		t.Fatalf("entry after a refused notice %+v", q)
@@ -1625,13 +1665,209 @@ func TestTeamQueueCLIDefaultLaneNoticeFailureKeepsEntry(t *testing.T) {
 	if err == nil {
 		t.Fatal("add succeeded without its reason record")
 	}
-	for _, want := range []string{"entry " + q.ID + " was added", "its Planned reason was not recorded", "NOTICE: A bug was queued on Planned delivery with a recorded reason", "Queue entry " + q.ID + " puts bug " + f.item.ID + " on template planned", "reason=paths (more than three owned paths)", fmt.Sprintf("order #%d", f.order)} {
+	for _, want := range []string{"entry " + q.ID + " was added", "its Planned reason was not recorded", "board unavailable", fmt.Sprintf("order #%d", f.order)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error lacks %q:\n%v", want, err)
 		}
 	}
+	if strings.Contains(err.Error(), "NOTICE:") {
+		t.Fatalf("error still asks for the rendered text by hand:\n%v", err)
+	}
 	if notices := laneNotices(t, f, f.item.ID); len(notices) != 0 {
 		t.Fatalf("refused notice was stored: %+v", notices)
+	}
+	if len(*refused) != 1 {
+		t.Fatalf("add posted %d notices", len(*refused))
+	}
+	original := (*refused)[0]
+	args := laneSendArgs(t, err.Error())
+	for flag, want := range map[string]string{"--kind": "notice", "--request-id": "queue-lane-" + q.ID, "--work-item": f.item.ID, "--work-item-revision": fmt.Sprint(f.item.Revision), "--work-order-message": fmt.Sprint(f.order), "--task": f.task.ID} {
+		if i := indexOf(args, flag); i < 0 || i+1 >= len(args) || args[i+1] != want {
+			t.Fatalf("command %q: %s is not %q", args, flag, want)
+		}
+	}
+	// The same request byte for byte: the hub keys a repost by request id
+	// and refuses one whose data differs.
+	repost, reposted := laneNoticeProxy(t, f.e.hub, http.StatusCreated, `{"seq":1}`)
+	if _, err := captureCLIOutput(t, func() error { return cmdSend(repost, args) }); err != nil {
+		t.Fatalf("tt send %q: %v", args, err)
+	}
+	want, _ := json.Marshal(original)
+	got, _ := json.Marshal((*reposted)[0])
+	if original.Envelope == nil || original.Envelope.Kind != api.EnvelopeKindNotice || original.AuditKind != api.MessageAuditWork || !bytes.Equal(got, want) {
+		t.Fatalf("repost differs from add's post:\n got %s\nwant %s", got, want)
+	}
+	for range 2 {
+		if out, err := captureCLIOutput(t, func() error { return cmdSend(f.e, args) }); err != nil || !strings.HasPrefix(out, "posted #") {
+			t.Fatalf("tt send to the hub %q %v", out, err)
+		}
+	}
+	notices := laneNotices(t, f, f.item.ID)
+	if len(notices) != 1 {
+		t.Fatalf("reposts stored %d notices: %+v", len(notices), notices)
+	}
+	n := notices[0]
+	if n.Envelope.Kind != api.EnvelopeKindNotice || n.Envelope.Refs["entry"] != q.ID || len(n.WorkItems) != 1 || n.WorkItems[0].ItemRevision != f.item.Revision || n.WorkOrderMessage == nil || n.WorkOrderMessage.Seq != f.order {
+		t.Fatalf("stored notice %+v", n)
+	}
+}
+
+func indexOf(values []string, want string) int {
+	for i, v := range values {
+		if v == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// q3 (a3): when the hub refuses only the notice, for work the caller has not
+// acknowledged, the entry is queued: add warns on stderr naming the refused
+// messages and the a2 command, prints the entry and succeeds.
+func TestTeamQueueCLILaneNoticeUnacknowledgedRefusalWarns(t *testing.T) {
+	f := newTeamFixtureKind(t, true, "bug")
+	repo, _ := queueGitRepo(t)
+	refusal := &api.UnacknowledgedError{Items: []api.UnacknowledgedItem{{Seq: 41, From: "lead", Subject: "Fix the add path"}, {Seq: 43, From: "the owner", Subject: "Answer #7 first"}}}
+	body, _ := json.Marshal(api.ErrorResponse{Error: refusal.Error(), Code: "unacknowledged"})
+	gated, _ := laneNoticeProxy(t, f.e.hub, http.StatusConflict, string(body))
+	gated.task = f.e.task
+	out, stderr, err := laneAdd(t, gated, f.item, f.order, repo, "--owns", "a", "--owns", "b", "--owns", "c", "--owns", "d")
+	if err != nil {
+		t.Fatalf("add failed although the entry is queued: %v", err)
+	}
+	q := laneEntry(t, f, f.item.ID)
+	if q.State != "queued" || !strings.Contains(out, "add "+q.ID+" "+f.item.ID+" at ") {
+		t.Fatalf("entry %+v, stdout %q", q, out)
+	}
+	for _, want := range []string{"warning: entry " + q.ID + " is queued", "its Planned reason was not recorded", "unacknowledged work #41, #43", "tt ack SEQ"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	if args := laneSendArgs(t, stderr); args[indexOf(args, "--request-id")+1] != "queue-lane-"+q.ID {
+		t.Fatalf("warning command %q", args)
+	}
+	if got := unacknowledgedSeqs(errors.New("hub: 409 unacknowledged")); got != nil {
+		t.Fatalf("a plain error names seqs %q", got)
+	}
+}
+
+// q3: an agent session cannot add an entry at all; it is refused before any
+// worktree or hub write, so the hub's unacknowledged-work refusal never
+// meets a saved entry.
+func TestTeamQueueCLIAddFromAgentSessionRefusedBeforeWrites(t *testing.T) {
+	f := newTeamFixture(t, true)
+	repo, _ := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	agent := f.e
+	agent.agent, agent.runID = f.handler.ID, f.handler.RunID
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(agent, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client", "--new-worktree"})
+	}); err == nil || !strings.Contains(err.Error(), "require an unbound CLI session") {
+		t.Fatalf("agent add: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, f.item.ID), "agent add")
+	if list, err := f.c.ListTeamQueue(context.Background(), f.task.ID); err != nil || len(list.Entries) != 0 {
+		t.Fatalf("agent add saved %+v %v", list, err)
+	}
+}
+
+// queueAddProxy fronts the fixture hub; add handles each add request, with
+// the real hub as forward, and lookup each read of one item's entry.
+func queueAddProxy(t *testing.T, hub string, add, lookup func(w http.ResponseWriter, r *http.Request, forward http.Handler)) env {
+	t.Helper()
+	target, err := url.Parse(hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions") {
+			body, _ := io.ReadAll(r.Body)
+			r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+			var req api.TeamQueueRequest
+			if json.Unmarshal(body, &req) == nil && req.Operation == "add" {
+				add(w, r, forward)
+				return
+			}
+		}
+		if r.Method == "GET" && r.URL.Query().Get("item") != "" && lookup != nil {
+			lookup(w, r, forward)
+			return
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return env{hub: srv.URL}
+}
+
+// q1 (a1): an add the hub saved but whose response was lost keeps the new
+// worktree the saved entry names and reports the entry; with nothing saved,
+// or when the read-back fails too, the worktree is removed for a retry.
+func TestTeamQueueCLIAddKeepsWorktreeAfterLostSavedResponse(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	t.Chdir(repo)
+	saveThenDrop := func(w http.ResponseWriter, r *http.Request, forward http.Handler) {
+		forward.ServeHTTP(httptest.NewRecorder(), r)
+		dropQueueResponse(w)
+	}
+	for _, attempt := range []struct {
+		name, key   string
+		add, lookup func(http.ResponseWriter, *http.Request, http.Handler)
+	}{
+		{"response dropped before the hub", "dropped", func(w http.ResponseWriter, _ *http.Request, _ http.Handler) { dropQueueResponse(w) }, nil},
+		{"saved, but the response and the read-back lost", "lookup-lost", saveThenDrop, func(w http.ResponseWriter, _ *http.Request, _ http.Handler) { dropQueueResponse(w) }},
+	} {
+		item, order := queueFixtureItem(t, f, attempt.key)
+		lost := queueAddProxy(t, f.e.hub, attempt.add, attempt.lookup)
+		lost.task = f.e.task
+		out, err := captureCLIOutput(t, func() error {
+			return cmdTeamQueue(lost, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--owns", "client"})
+		})
+		path := queueWorktreeFor(repo, item.ID)
+		if err == nil || !strings.Contains(out, "worktree "+path) {
+			t.Fatalf("%s: add %q %v", attempt.name, out, err)
+		}
+		requireNoQueueWorktree(t, repo, path, attempt.name)
+		if attempt.lookup == nil {
+			continue
+		}
+		// The saved entry names the removed worktree. Rerunning the add
+		// recreates it, the hub refuses the duplicate, and the read-back
+		// keeps it.
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdTeamQueue(f.e, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--owns", "client"})
+		}); err != nil {
+			t.Fatalf("%s: rerun: %v", attempt.name, err)
+		}
+		if sha, err := queueGitCommit(path); err != nil || sha != head {
+			t.Fatalf("%s: rerun worktree HEAD %s %v", attempt.name, sha, err)
+		}
+	}
+	item, order := queueFixtureItem(t, f, "saved-lost")
+	lost := queueAddProxy(t, f.e.hub, saveThenDrop, nil)
+	lost.task = f.e.task
+	want := queueWorktreeFor(repo, item.ID)
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(lost, []string{"add", "--item", item.ID, "--order", fmt.Sprint(order), "--owns", "client"})
+	})
+	if err != nil {
+		t.Fatalf("saved add with a lost response failed: %v", err)
+	}
+	list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{Item: item.ID})
+	if err != nil || len(list.Entries) != 1 {
+		t.Fatalf("saved entries %+v %v", list, err)
+	}
+	q := list.Entries[0]
+	if real, _ := filepath.EvalSymlinks(q.Cwd); real != want || !strings.Contains(out, "worktree "+want) || !strings.Contains(out, "add "+q.ID+" "+item.ID+" at ") {
+		t.Fatalf("entry %+v, output %q", q, out)
+	}
+	if sha, err := queueGitCommit(want); err != nil || sha != head {
+		t.Fatalf("kept worktree HEAD %s %v", sha, err)
 	}
 }
 
