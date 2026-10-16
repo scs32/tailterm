@@ -418,17 +418,45 @@ func liveItemRuns(ctx context.Context, q queryRower, task, item string) (int, er
 	return live, err
 }
 
-// failQueueEntryForOpenClose ends the running entry of an item whose team was
-// closed with the item open. The entry fails with the close reason and keeps
-// its reservation, so the ordinary release frees it once cleanup receipts
-// exist and a requeue starts the later order's team. Nothing went wrong, so
-// no owner escalation is posted. A team without a queue entry matches no row.
+// failQueueEntryForOpenClose ends the launching or running entry of an item
+// whose team was closed with the item open. The entry fails with the close
+// reason and keeps its reservation, so the ordinary release frees it once
+// cleanup receipts exist and a requeue starts the later order's team. Nothing
+// went wrong, so no owner escalation is posted. A team without a queue entry
+// matches no row. An accepted entry whose release job is still live is owned
+// by the deployment path, so the close is refused rather than freeing it.
 func failQueueEntryForOpenClose(ctx context.Context, tx *sql.Tx, task, item, reason, now string) error {
+	var entry string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('launching','running') AND released_at=''`, task, item).Scan(&entry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return stopItemBudgetHolds(ctx, tx, task, item, now)
+	}
+	if err != nil {
+		return err
+	}
+	if err := refuseLiveReleaseJob(ctx, tx, task, entry); err != nil {
+		return err
+	}
 	if err := stopItemBudgetHolds(ctx, tx, task, item, now); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE team_queue_entries SET state='failed',failure=?,revision=revision+1,updated_at=? WHERE task_id=? AND item_id=? AND state='running' AND released_at=''`,
-		"Team closed with the item open: "+reason, now, task, item)
+	_, err = tx.ExecContext(ctx, `UPDATE team_queue_entries SET state='failed',failure=?,revision=revision+1,updated_at=? WHERE id=?`,
+		"Team closed with the item open: "+reason, now, entry)
+	return err
+}
+
+// refuseLiveReleaseJob refuses a change while a release job still in the
+// deployment path owns the entry's candidate. Released, rolled back, refused
+// and superseded jobs are finished.
+func refuseLiveReleaseJob(ctx context.Context, tx *sql.Tx, task, entry string) error {
+	var jobID, jobState string
+	err := tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? AND state IN ('verified','held','claimed','merged','blocked')`, task, entry).Scan(&jobID, &jobState)
+	if err == nil {
+		return fmt.Errorf("%w: release job %s is %s; the deployment path owns this candidate", api.ErrConflict, jobID, jobState)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	return err
 }
 
@@ -1753,15 +1781,8 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 					}
 				}
 			}
-			// A job still in the deployment path owns the candidate. Released,
-			// rolled back, refused and superseded jobs are finished.
-			var jobID, jobState string
-			jobErr := tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? AND state IN ('verified','held','claimed','merged','blocked')`, task, e.ID).Scan(&jobID, &jobState)
-			if jobErr == nil {
-				return zero, fmt.Errorf("%w: release job %s is %s; the deployment path owns this candidate", api.ErrConflict, jobID, jobState)
-			}
-			if !errors.Is(jobErr, sql.ErrNoRows) {
-				return zero, jobErr
+			if err := refuseLiveReleaseJob(ctx, tx, task, e.ID); err != nil {
+				return zero, err
 			}
 			changed := make([]string, 0, len(req.ChangedFiles))
 			for _, file := range req.ChangedFiles {

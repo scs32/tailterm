@@ -909,3 +909,104 @@ func TestOpenItemTeamCloseThenRequeueStartsFreshTeam(t *testing.T) {
 		t.Fatalf("closed team's entry %+v %v", history, err)
 	}
 }
+
+// e1 (wi_9120f4cecee03e7d): a reasoned close while the entry is still
+// launching ends it as failed with the reason. Without that the entry stayed
+// launching with a closed team, and the runner's next running step put the
+// closed lead row back to running.
+func TestOpenItemTeamCloseWhileLaunchingEndsEntry(t *testing.T) {
+	f := newRebindFixture(t, false)
+	f.entry = f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Host: "mini"})
+	f.lead, f.worker = f.member(t, "lead"), f.member(t, "worker")
+	plan, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": f.item.ID, "revision": f.item.Revision, "order": f.order.Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": f.lead.RunID, "fields": map[string]any{"agentId": f.lead.ID, "name": f.lead.Name, "cwd": "/worktrees/rebind"}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: plan}, {Operation: "attempt"}, {Operation: "started", MemberRunID: f.lead.RunID}} {
+		step.EntryID, step.ExpectedRevision = f.entry.ID, f.entry.Revision
+		f.entry = f.action(t, step)
+	}
+	if f.entry.State != "launching" {
+		t.Fatalf("fixture entry is %s", f.entry.State)
+	}
+
+	failed := closeOpenQueueTeam(t, f, api.TeamCloseReasonOwnerHold)
+	if failed.State != "failed" || failed.Failure != "Team closed with the item open: "+api.TeamCloseReasonOwnerHold || failed.Revision != f.entry.Revision+1 || failed.ReleasedAt != "" || failed.EscalationSeq != 0 {
+		t.Fatalf("launching entry after a reasoned close %+v", failed)
+	}
+	// The runner's next launch step is refused; the lead row stays closed.
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "running", EntryID: failed.ID, ExpectedRevision: failed.Revision}); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("running after the close: %v", err)
+	}
+	var leadState string
+	if err := f.s.db.QueryRow(`SELECT state FROM item_team_leads WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID).Scan(&leadState); err != nil || leadState != "closed" {
+		t.Fatalf("lead row %s %v", leadState, err)
+	}
+	// It releases like any failed entry once cleanup receipts exist.
+	if _, err := f.s.db.Exec(`UPDATE agents SET cleanup_done=1 WHERE id IN (?,?) AND status='closed'`, f.lead.ID, f.worker.ID); err != nil {
+		t.Fatal(err)
+	}
+	released := f.action(t, api.TeamQueueRequest{Operation: "release", EntryID: failed.ID, ExpectedRevision: failed.Revision})
+	if released.State != "failed" || released.ReleasedAt == "" || queueEntryHoldsResources(released) {
+		t.Fatalf("released entry %+v", released)
+	}
+}
+
+// e2 (wi_9120f4cecee03e7d): after the entry's acceptance was saved and the
+// item reopened, a reasoned close is refused while the entry's release job is
+// live, so the entry cannot fail and be released under the deployment path.
+// Once the job is finished the close goes through.
+func TestOpenItemTeamCloseRefusedWhileReleaseJobLive(t *testing.T) {
+	f := newRebindFixture(t, true)
+	seedPassingVerificationAt(t, f.s, f.item, candidateB, autoWorktree)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(f.item, "accepted-report", 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, open := "done", "open"
+	saved, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: f.item.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "accept-save",
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision},
+		QueueAcceptance:  &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by)
+	if err != nil {
+		t.Fatal("done save with acceptance", err)
+	}
+	accepted, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil || accepted.State != "running" || accepted.Acceptance == nil || accepted.Release == nil || accepted.Release.State != "verified" {
+		t.Fatalf("accepted entry %+v %v", accepted, err)
+	}
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: saved.Revision.Revision, Status: &open, RequestID: "reopen"}, f.by); err != nil {
+		t.Fatal("reopen", err)
+	}
+	item := readOpenItemState(t, f.s, f.task.ID, f.item.ID)
+	if item.status != "open" {
+		t.Fatalf("item is %s", item.status)
+	}
+
+	for _, live := range []string{"verified", "held", "claimed", "merged", "blocked"} {
+		if _, err := f.s.db.Exec(`UPDATE release_jobs SET state=? WHERE task_id=? AND entry_id=?`, live, f.task.ID, f.entry.ID); err != nil {
+			t.Fatal(err)
+		}
+		_, err := f.s.CloseItemTeam(f.ctx, f.task.ID, queueTeamCloseRequest(t, f, "close-"+live, api.TeamCloseReasonFindingsOnly), f.by)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), accepted.Release.ID) {
+			t.Fatalf("reasoned close with a %s release job: %v", live, err)
+		}
+		entry, _ := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+		if entry.State != "running" || entry.Revision != accepted.Revision || entry.ReleasedAt != "" || entry.Acceptance == nil {
+			t.Fatalf("refused close changed the entry: %+v", entry)
+		}
+		for _, a := range []api.Agent{f.lead, f.worker} {
+			if current, _ := f.s.GetAgent(f.ctx, a.ID); current.Status != api.AgentRunning {
+				t.Fatalf("refused close closed %s: %s", a.Name, current.Status)
+			}
+		}
+		if _, err := f.s.GetTeamCloseReceipt(f.ctx, f.task.ID, "close-"+live); !errors.Is(err, api.ErrNotFound) {
+			t.Fatalf("refused close left a receipt: %v", err)
+		}
+	}
+
+	// A finished job no longer owns the candidate.
+	if _, err := f.s.db.Exec(`UPDATE release_jobs SET state='refused' WHERE task_id=? AND entry_id=?`, f.task.ID, f.entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	failed := closeOpenQueueTeam(t, f, api.TeamCloseReasonFindingsOnly)
+	if failed.State != "failed" || failed.Failure != "Team closed with the item open: "+api.TeamCloseReasonFindingsOnly || failed.Acceptance == nil {
+		t.Fatalf("entry after the close %+v", failed)
+	}
+}

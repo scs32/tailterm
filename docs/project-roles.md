@@ -66,16 +66,20 @@ refused too.
 
 The close does not change the item: its status and revision stay as they were.
 It records the same close receipt, with the reason, and the same per-member
-cleanup receipts. The team's queue entry ends as `failed` with
-`Team closed with the item open: REASON`, never `finished`, and no owner
-escalation is posted. It is then released like any failed entry, which frees
-its slot, handler lease and owned paths: the runner does it in a parallel
-queue once cleanup receipts exist, and in a serial queue the owner runs
-`tt team queue release --entry tqe_ID`.
+cleanup receipts. The team's queue entry, launching or running, ends as
+`failed` with `Team closed with the item open: REASON`, never `finished`, and
+no owner escalation is posted. It is then released like any failed entry,
+which frees its slot, handler lease and owned paths: the runner does it in a
+parallel queue once cleanup receipts exist, and in a serial queue the owner
+runs `tt team queue release --entry tqe_ID`. If the entry was accepted and its item
+reopened, the close is refused while the entry's release job is still in the
+deployment path (verified, held, claimed, merged or blocked); the error names
+the job.
 
-A later order on the same item is `tt team queue requeue --entry tqe_ID`. It
-adds a new entry, attempt 2, and launches a fresh team with new identities;
-the closed entry stays as history. The bare form works only on the entry's
+A later order on the same item is `tt team queue requeue --entry tqe_ID`. Only
+the owner or a database handler may requeue. It adds a new entry with the next
+attempt number and launches a fresh team with new identities; the closed entry
+stays as history. The bare form works only on the entry's
 launch host while its checkout still exists with HEAD at the entry's base.
 Once the team committed, or the worktree was removed or moved on, pass a fresh
 worktree at the current tasks-hub tip as `--cwd DIR`; see
