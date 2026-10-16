@@ -19,6 +19,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -416,6 +417,55 @@ const (
 	handoffPSShell = `SELF 4001 SELF SELF ttys009 T tt handoff
 4001 4000 4001 SELF ttys009 T -zsh
 4000 1 4000 0 ?? T tmux new -s owner`
+
+	// Codex, in the shapes ps showed on this host on 2026-10-16 (codex-cli
+	// 0.160.0, from npm): node runs the launcher, which starts the native
+	// binary as its child with the same arguments, in its process group. The
+	// interactive session is its terminal's foreground job; a command its
+	// shell tool runs has a group of its own on that terminal.
+	handoffPSCodexInteractive = `SELF 4003 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4003 4002 4001 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --model gpt-6.1-sol -c model_reasoning_effort="high" -p work tt is a real local command
+4002 4001 4001 4001 ttys009 T node /opt/bin/codex --model gpt-6.1-sol -c model_reasoning_effort="high" -p work tt is a real local command
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
+	// The native binary alone, as a standalone install runs it, resumed.
+	handoffPSCodexNativeInteractive = `SELF 4002 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4002 4001 4001 4001 ttys009 T /usr/local/bin/codex resume --last
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// codex exec run by the interactive session's shell tool, through the
+	// launcher.
+	handoffPSCodexExec = `SELF 4006 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4006 4005 4004 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex exec --model gpt-6.1-sol Reply with one word.
+4005 4004 4004 4001 ttys009 T node /opt/bin/codex exec --model gpt-6.1-sol Reply with one word.
+4004 4003 4004 4001 ttys009 T /bin/zsh -c codex exec --model gpt-6.1-sol Reply with one word.
+4003 4002 4001 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --model gpt-6.1-sol
+4002 4001 4001 4001 ttys009 T node /opt/bin/codex --model gpt-6.1-sol
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
+	// Its alias e, as the native binary, under a native interactive session.
+	handoffPSCodexExecAlias = `SELF 4004 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4004 4003 4003 4001 ttys009 T /usr/local/bin/codex -c model="o3" e Reply
+4003 4002 4003 4001 ttys009 T /bin/zsh -c codex -c model="o3" e Reply
+4002 4001 4001 4001 ttys009 T /usr/local/bin/codex
+4001 4000 4001 4001 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// codex exec typed at the pane's own shell prompt, with options before
+	// exec: the terminal's foreground job, no Codex process above it.
+	handoffPSCodexExecAtPrompt = `SELF 4003 SELF 4002 ttys009 T /bin/zsh -c tt handoff
+4003 4002 4002 4002 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex -m gpt-6.1-sol --sandbox read-only exec Reply
+4002 4001 4002 4002 ttys009 T node /opt/bin/codex -m gpt-6.1-sol --sandbox read-only exec Reply
+4001 4000 4001 4002 ttys009 T -zsh
+4000 1 4000 0 ?? T tmux new -s owner`
+	// An interactive codex started by the interactive session's shell tool.
+	handoffPSCodexNested = `SELF 4006 SELF 4001 ttys009 T /bin/zsh -c tt handoff
+4006 4005 4004 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex resume --last
+4005 4004 4004 4001 ttys009 T node /opt/bin/codex resume --last
+4004 4003 4004 4001 ttys009 T /bin/zsh -c codex resume --last
+4003 4002 4001 4001 ttys009 T /opt/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --model gpt-6.1-sol
+4002 4001 4001 4001 ttys009 T node /opt/bin/codex --model gpt-6.1-sol
+4001 4000 4001 4001 ttys009 T /bin/zsh /tmp/runtime-command
+4000 1 4000 0 ?? T tmux new -s owner`
 )
 
 // handoffHostProcessTable is the host's own ps. Every test in this package,
@@ -451,10 +501,11 @@ func (b *handoffBox) ps(table string, started time.Time) {
 
 // handoffPSClaudePID is what the runtime that started the command says of
 // itself in CLAUDE_PID under one of the tables: the Claude Code process
-// straight above the command's shell, and nothing in a plain shell.
+// straight above the command's shell, and nothing in a plain shell or under
+// Codex.
 func handoffPSClaudePID(table string) string {
 	switch {
-	case table == "" || table == handoffPSShell:
+	case table == "" || table == handoffPSShell || strings.Contains(table, "codex"):
 		return ""
 	case strings.Contains(table, "\n4004 "):
 		return "4004"
@@ -2968,6 +3019,7 @@ func TestHandoffRestoreCodex(t *testing.T) {
 	if err != nil || registered.Agent.Runtime != "codex" {
 		t.Fatalf("codex register %+v %v", registered.Agent, err)
 	}
+	b.ps(handoffPSCodexInteractive, b.now)
 	before := f.state(t)
 	f.seen()
 	out, err := f.restore()
@@ -4049,6 +4101,123 @@ func TestHandoffRestoreOneShot(t *testing.T) {
 			}
 		})
 	}
+}
+
+// How a codex exec, or a Codex started by another, is told from a pane's
+// interactive Codex session, in the launcher's and the native binary's
+// shapes.
+func TestHandoffCodexOneShotProcess(t *testing.T) {
+	chainOf := func(table string) []handoffProcess { return handoffTestChain(t, table) }
+	for table, want := range map[string]string{handoffPSCodexInteractive: "", handoffPSCodexNativeInteractive: "", handoffPSCodexExec: "exec-mode",
+		handoffPSCodexExecAlias: "exec-mode", handoffPSCodexExecAtPrompt: "exec-mode", handoffPSCodexNested: "nested-codex",
+		handoffPSShell: "no-codex-process", handoffPSInteractive: "no-codex-process", handoffPSOneShot: "no-codex-process"} {
+		if got := handoffCodexOneShot(chainOf(table)); got != want {
+			t.Errorf("handoffCodexOneShot = %q, want %q, for\n%s", got, want, table)
+		}
+		if _, ok := handoffReasons[want]; want != "" && !ok {
+			t.Errorf("%q is not a named reason", want)
+		}
+	}
+	// The Claude Code check is not changed by a Codex table: no Claude Code
+	// process is above the command.
+	for _, table := range []string{handoffPSCodexInteractive, handoffPSCodexExec} {
+		if got := handoffOneShot(chainOf(table), 0); got != "no-claude-process" {
+			t.Errorf("handoffOneShot = %q for\n%s", got, table)
+		}
+	}
+	for args, want := range map[string]bool{"codex": false, "codex exec x": true, "codex e x": true, "codex -m o3 exec x": true, "codex --model=o3 exec x": true,
+		"codex -c k=v --sandbox read-only e": true, "codex -p work tt is a prompt": false, "codex resume --last": false, "codex a prompt about exec": false,
+		"codex --oss exec": true, "codex --search a prompt": false, "codex review": false, "node /opt/bin/codex exec x": true, "node /opt/bin/codex.js -m o3 x exec": false,
+		"node /opt/bin/codex": false, "codex -m": false, "codex exec-server": false} {
+		if got := (handoffProcess{args: strings.Fields(args)}).codexExec(); got != want {
+			t.Errorf("codexExec(%q) = %v, want %v", args, got, want)
+		}
+	}
+	for program, want := range map[string]bool{"codex": true, "/usr/local/bin/codex": true, "node /opt/homebrew/bin/codex": true, "/opt/homebrew/Cellar/node/26.5.1/bin/node /opt/lib/node_modules/@openai/codex/bin/codex.js": true,
+		"/opt/vendor/aarch64-apple-darwin/bin/codex": true, "/opt/vendor/aarch64-apple-darwin/bin/codex-code-mode-host": false, "node /work/server.js": false,
+		"/bin/zsh -c codex exec": false, "tmux new -s codex": false, "claude": false} {
+		if got := (handoffProcess{args: strings.Fields(program)}).codex(); got != want {
+			t.Errorf("codex(%q) = %v, want %v", program, got, want)
+		}
+	}
+}
+
+// Restore run by a Codex one-shot in the helper's pane, with its own thread
+// id, is refused by guard g7 before anything is written, on the hub and on
+// the host; so is one under the helper's own thread. The interactive Codex
+// session in the same pane then restores.
+func TestHandoffRestoreCodexOneShot(t *testing.T) {
+	for name, table := range map[string]string{"codex exec from the pane": handoffPSCodexExec, "codex e, native": handoffPSCodexExecAlias,
+		"codex exec at the prompt": handoffPSCodexExecAtPrompt, "a nested codex": handoffPSCodexNested, "no codex process": handoffPSShell,
+		"a claude table": handoffPSInteractive, "ps failed": ""} {
+		t.Run(name, func(t *testing.T) {
+			f := newHandoffHubFixture(t)
+			b := f.b
+			thread := "00000000-0000-4000-8000-" + strings.TrimPrefix(api.NewID("agt"), "agt_")[:12]
+			helperTestRuntime(t, f.helperFixture, "codex", thread)
+			defer t.Setenv("CODEX_THREAD_ID", "")
+			b.ps(table, b.now)
+			state, record := f.state(t), b.bytes("record.json")
+			f.seen()
+			out, err := f.restore()
+			if err == nil || out != "" || !strings.Contains(err.Error(), "restore refused by guard g7 interactive session: ") || !strings.Contains(err.Error(), "Nothing was registered, written or changed.") {
+				t.Fatalf("restore from %s = %v\n%s", name, err, out)
+			}
+			reason := "the process table could not be read, so this command could not be placed under an interactive Codex session"
+			if table != "" {
+				reason = handoffReasons[handoffCodexOneShot(handoffTestChain(t, table))]
+			}
+			if !strings.Contains(err.Error(), reason) {
+				t.Fatalf("the refusal does not name its reason %q: %v", reason, err)
+			}
+			if sent := f.seen(); len(sent) != 0 {
+				t.Fatalf("a refused restore asked the hub: %v", sent)
+			}
+			if f.state(t) != state || !bytes.Equal(record, b.bytes("record.json")) {
+				t.Fatal("a refused restore changed the hub, the helper file, a binding, a tag or the record")
+			}
+			if _, err := os.Stat(b.file("restore.json")); !os.IsNotExist(err) {
+				t.Fatalf("a refused restore wrote restore.json: %v", err)
+			}
+			// The registered helper's thread, as Codex, likewise.
+			helperTestRuntime(t, f.helperFixture, "codex", f.thread)
+			f.seen()
+			if out, err := f.restore(); err == nil || out != "" || !strings.Contains(err.Error(), "g7 interactive session") || len(f.seen()) != 0 || f.state(t) != state {
+				t.Fatalf("restore under the helper's own thread from %s = %v\n%s", name, err, out)
+			}
+			// The interactive Codex session in that pane restores.
+			helperTestRuntime(t, f.helperFixture, "codex", thread)
+			b.ps(handoffPSCodexInteractive, b.now)
+			f.seen()
+			out, err = f.restore()
+			if !strings.Contains(out, "registration: restored") {
+				t.Fatalf("the interactive Codex session's restore = %v\n%s", err, out)
+			}
+			if sent := f.writes(); len(sent) != 1 || sent[0] != "POST /v1/tasks/"+f.task.ID+"/owner-helper" {
+				t.Fatalf("the interactive restore sent %v", sent)
+			}
+		})
+	}
+}
+
+// handoffTestChain is this process and its ancestors under one of the tables.
+func handoffTestChain(t *testing.T, table string) []handoffProcess {
+	t.Helper()
+	chain, err := handoffFixedProcessTable(table, time.Now())(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := map[int]handoffProcess{}
+	for _, line := range strings.Split(string(chain), "\n") {
+		if p, ok := handoffProcessRow(line); ok {
+			rows[p.pid] = p
+		}
+	}
+	var out []handoffProcess
+	for pid := os.Getpid(); pid > 1 && rows[pid].pid == pid; pid = rows[pid].ppid {
+		out = append(out, rows[pid])
+	}
+	return out
 }
 
 // h4: the injected note and tt handoff status say how old the record's two
@@ -5828,20 +5997,52 @@ func (r *handoffLiveRun) compacted() bool {
 	return false
 }
 
-// hookLines is what the pane shows of failed hooks: the text after each
-// "failed:", with the pane's line wrapping and spacing removed.
-func (r *handoffLiveRun) hookLines() []string {
+// hookLines is what the pane shows of failed hooks.
+func (r *handoffLiveRun) hookLines() []string { return handoffHookLines(r.screen()) }
+
+// handoffHookLines reads each failed hook's line from pane text, "PreCompact
+// [command] failed: Hook cancelled", as "PreCompact failed:Hookcancelled": the
+// event and the text after "failed:", with the pane's line wrapping and
+// spacing removed. A line ends where the next hook's line starts, so that two
+// lines in one block are read apart, or at the next prompt, reply, status or
+// rule mark. The event is the name the line starts with, or for a line that
+// does not start with a known one, the command's last word.
+func handoffHookLines(screen string) []string {
+	const failed = "]failed:"
+	text := strings.Join(strings.Fields(screen), "")
+	starts := handoffHookLineStart.FindAllStringSubmatchIndex(text, -1)
 	var out []string
-	parts := strings.Split(strings.Join(strings.Fields(r.screen()), ""), "]failed:")
-	for i, part := range parts[1:] {
-		event := parts[i][strings.LastIndex(parts[i], "'")+1:]
-		if end := strings.IndexAny(part, "❯⏺✻─"); end >= 0 {
-			part = part[:end]
+	for from := 0; ; {
+		at := strings.Index(text[from:], failed)
+		if at < 0 {
+			return out
 		}
-		out = append(out, event+" failed:"+part)
+		at += from
+		head, rest := text[from:at], text[at+len(failed):]
+		event := head[strings.LastIndex(head, "'")+1:]
+		end := len(rest)
+		if cut := strings.IndexAny(rest, "❯⏺✻─"); cut >= 0 {
+			end = cut
+		}
+		if next := strings.Index(rest, failed); next >= 0 && next < end {
+			end = next
+		}
+		for _, m := range starts {
+			if m[0] >= from && m[0] < at {
+				event = text[m[2]:m[3]]
+			}
+			if next := m[0] - (at + len(failed)); next >= 0 && next < end {
+				end = next
+			}
+		}
+		out = append(out, event+" failed:"+rest[:end])
+		from = at + len(failed)
 	}
-	return out
 }
+
+// handoffHookLineStart is the start of a hook's line once spacing is removed:
+// a Claude Code hook event, with any matcher, and the command's bracket.
+var handoffHookLineStart = regexp.MustCompile(`(SessionStart|SessionEnd|PreCompact|PostCompact|PreToolUse|PostToolUseFailure|PostToolUse|UserPromptSubmit|Notification|SubagentStop|Stop)(?::\w+)?\[`)
 
 const handoffLiveOK = "Reply with OK only."
 
@@ -5916,6 +6117,79 @@ func (r *handoffLiveRun) isolated(events map[string]int) {
 func (r *handoffLiveRun) left() string {
 	out, _ := exec.Command("pgrep", "-fl", filepath.Join(r.dir, "bin")).Output()
 	return strings.TrimSpace(string(out))
+}
+
+// The live check's hook-line reader, on made-up panes. The frame is the one
+// Claude Code 2.1.301 drew for H2 on 2026-10-15, after /compact, with the
+// path made up: each line of a block after the first starts under a
+// five-space indent, and a line too long for the pane goes on at that indent.
+func TestHandoffHookLines(t *testing.T) {
+	const width = 110
+	dir := "/Users/someone/projects/tailterm/.build/worktrees/queue-0123abcd/.build/handoff-live-875028022/H2"
+	line := func(event, script string) string {
+		return event + " ['" + dir + "/bin/" + script + "' " + event + "] failed: Hook cancelled"
+	}
+	hung := line("PreCompact", "hung.sh")
+	if len(hung) <= width-5 {
+		t.Fatalf("the line is %d bytes; the fixture needs one too long for a %d-column pane", len(hung), width)
+	}
+	// rows wraps s after each of the given byte offsets, at the
+	// continuation indent. A wrap at a space drops the space.
+	rows := func(s string, at ...int) []string {
+		var out []string
+		from := 0
+		for _, i := range append(at, len(s)) {
+			out = append(out, "     "+strings.TrimPrefix(s[from:i], " "))
+			from = i
+		}
+		return out
+	}
+	rule := strings.Repeat("─", width)
+	pane := func(block ...string) string {
+		return strings.Join(append(append([]string{"❯ /compact", "  ⎿  Compacted (ctrl+o to see full summary)"}, block...),
+			"", "❯ Reply with one word only: DIRTY if your context contains any hook error, hook failure or hook cancellation",
+			"  message; otherwise CLEAN.", "", "✢ Envisioning…", "", rule, "❯ ", rule, "  ⏵⏵ auto mode on (shift+tab to cycle)"), "\n")
+	}
+	at := func(s, sub string, plus int) int {
+		t.Helper()
+		i := strings.Index(s, sub)
+		if i < 0 {
+			t.Fatalf("%q is not in %q", sub, s)
+		}
+		return i + plus
+	}
+	inPath := at(hung, "handoff-live-", 5)
+	beforeFailed := at(hung, "] failed:", 1)
+	inHook := at(hung, "Hook cancelled", 4)
+	midWord := at(hung, "cancelled", 3)
+	want := []string{"PreCompact failed:Hookcancelled"}
+	for name, block := range map[string][]string{
+		"at the pane's width":       rows(hung, width-5),
+		"inside the path":           rows(hung, inPath),
+		"between ] and failed:":     rows(hung, beforeFailed),
+		"inside Hook cancelled":     rows(hung, inHook),
+		"inside cancelled":          rows(hung, midWord),
+		"at all three":              rows(hung, inPath, beforeFailed, inHook),
+		"in the path and the word":  rows(hung, width-5, midWord),
+		"on one row (a wide pane)":  rows(hung),
+		"after the indent's spaces": {"     " + hung[:inPath], "       " + hung[inPath:]},
+	} {
+		if got := handoffHookLines(pane(block...)); !slices.Equal(got, want) {
+			t.Errorf("wrapped %s: read %q; want %q\n%s", name, got, want, pane(block...))
+		}
+	}
+	// Two hooks' lines in one block, each wrapped, are read apart.
+	other := line("SessionStart", "slow.sh")
+	two := pane(append(rows(hung, inPath, inHook), rows(other, at(other, "/bin/", 2), at(other, "] failed:", 1))...)...)
+	if got := handoffHookLines(two); !slices.Equal(got, []string{"PreCompact failed:Hookcancelled", "SessionStart failed:Hookcancelled"}) {
+		t.Errorf("two hooks' lines: read %q\n%s", got, two)
+	}
+	// A frame drawn before the result, and a working run's, read none.
+	for _, frame := range []string{"❯ /compact\n\n✻ Compacting conversation…\n" + rule + "\n❯ \n" + rule, pane()} {
+		if got := handoffHookLines(frame); len(got) != 0 {
+			t.Errorf("a pane with no hook line: read %q\n%s", got, frame)
+		}
+	}
 }
 
 // TestHandoffLivePrivateSession is a16. Run it by hand:

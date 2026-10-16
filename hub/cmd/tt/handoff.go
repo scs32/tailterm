@@ -1216,6 +1216,78 @@ func handoffOneShot(chain []handoffProcess, claudePID int) string {
 	return ""
 }
 
+// codex reports whether the process is a Codex runtime: the native binary,
+// named codex wherever it is installed, or the npm launcher.
+func (p handoffProcess) codex() bool {
+	return len(p.args) > 0 && filepath.Base(p.args[0]) == "codex" || p.codexLauncher()
+}
+
+// codexLauncher reports whether the process is node running the npm package's
+// launcher (bin/codex, a link to bin/codex.js). It starts the native binary as
+// its own child, with the same arguments.
+func (p handoffProcess) codexLauncher() bool {
+	if len(p.args) < 2 || filepath.Base(p.args[0]) != "node" {
+		return false
+	}
+	base := filepath.Base(p.args[1])
+	return base == "codex" || base == "codex.js"
+}
+
+// codexExec reports whether the arguments start codex exec, or its alias e:
+// the first word that is neither an option nor the value of one of the
+// options listed in handoffCodexValues.
+func (p handoffProcess) codexExec() bool {
+	args := p.args[min(1, len(p.args)):]
+	if p.codexLauncher() {
+		args = p.args[2:]
+	}
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case handoffCodexValues[arg]:
+			i++
+		case strings.HasPrefix(arg, "-"):
+		default:
+			return arg == "exec" || arg == "e"
+		}
+	}
+	return false
+}
+
+// handoffCodexValues are Codex's options that take their value as the next
+// argument (codex-cli 0.160.0).
+var handoffCodexValues = map[string]bool{"-c": true, "--config": true, "--enable": true, "--disable": true, "--remote": true, "--remote-auth-token-env": true,
+	"-i": true, "--image": true, "-m": true, "--model": true, "--local-provider": true, "-p": true, "--profile": true, "-s": true, "--sandbox": true,
+	"-C": true, "--cd": true, "--add-dir": true, "-a": true, "--ask-for-approval": true}
+
+// handoffCodexOneShot says why the Codex process this command runs under is
+// not a pane's interactive session, by a short name from handoffReasons; ""
+// means it is one. It is the nearest Codex process above the command, and it
+// must not have been started by codex exec, or by another Codex process: the
+// launcher straight above the native binary is the same runtime. A `codex
+// exec` run by the helper's shell tool fails both; typed at the pane's own
+// prompt, the first.
+func handoffCodexOneShot(chain []handoffProcess) string {
+	for i, p := range chain {
+		if i == 0 || !p.codex() {
+			continue
+		}
+		if p.codexExec() {
+			return "exec-mode"
+		}
+		above := chain[i+1:]
+		if len(above) > 0 && !p.codexLauncher() && above[0].codexLauncher() {
+			above = above[1:]
+		}
+		for _, parent := range above {
+			if parent.codex() {
+				return "nested-codex"
+			}
+		}
+		return ""
+	}
+	return "no-codex-process"
+}
+
 // ---- when the running session last started ----
 
 // handoffTranscriptStart is the time of the latest start a Claude Code
@@ -2502,6 +2574,9 @@ var handoffReasons = map[string]string{
 	"unrecognised-runtime":    "this command was started by a Claude Code runtime other than the one found above it in the process table",
 	"nested-claude":           "this Claude Code process was started by another Claude Code process",
 	"no-terminal":             "this Claude Code process is not the foreground job of a terminal",
+	"no-codex-process":        "no Codex process is above this command in the process table",
+	"exec-mode":               "this Codex process was started by codex exec: it is a one-shot run",
+	"nested-codex":            "this Codex process was started by another Codex process",
 	"hub-refused":             "the hub refused the registration",
 	"register-failed":         "the registration did not complete",
 	"no-binding":              "no wake binding names this helper on this host",
@@ -3299,16 +3374,19 @@ func handoffRestoreCommand(e env, args []string) error {
 		return handoffRefusal("g1 in tmux, one pane", fmt.Sprintf("tmux session %s has %d panes; wake-ups need exactly one", session.Name, session.Panes), "close the other panes")
 	}
 
-	// g7: under the pane's interactive Claude Code session, by the process
-	// table. A one-shot run started in the helper's pane passes g1 and g2.
-	if runtime == "claude" {
-		chain, err := handoffProcessChain(ctx, nil)
-		if err != nil {
-			return handoffRefusal("g7 interactive session", "the process table could not be read, so this command could not be placed under an interactive Claude Code session", "run it in the helper's interactive session")
-		}
-		if reason := handoffOneShot(chain, handoffClaudePID()); reason != "" {
-			return handoffRefusal("g7 interactive session", handoffReasons[reason], "run it in the helper's interactive session, at its own prompt")
-		}
+	// g7: under the pane's interactive Claude Code or Codex session, by the
+	// process table. A one-shot run started in the helper's pane passes g1
+	// and g2.
+	oneShot, name := func(chain []handoffProcess) string { return handoffOneShot(chain, handoffClaudePID()) }, "Claude Code"
+	if runtime == "codex" {
+		oneShot, name = handoffCodexOneShot, "Codex"
+	}
+	chain, err := handoffProcessChain(ctx, nil)
+	if err != nil {
+		return handoffRefusal("g7 interactive session", "the process table could not be read, so this command could not be placed under an interactive "+name+" session", "run it in the helper's interactive session")
+	}
+	if reason := oneShot(chain); reason != "" {
+		return handoffRefusal("g7 interactive session", handoffReasons[reason], "run it in the helper's interactive session, at its own prompt")
 	}
 
 	// g2, second half, and g5's pending check.
