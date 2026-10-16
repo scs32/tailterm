@@ -1442,6 +1442,24 @@ func TestToolRedactBenchmark(t *testing.T) {
 	measure("many small strings", many(100<<10), many(toolRedactMaxBytes-1024))
 	plain := p95(fill(string(source), 100<<10), toolRedactReport, 200)
 	t.Logf("p95: 100 KiB of source text, report mode, %s; slowest 100 KiB output %s (%s); slowest output of the %d KiB cap %s (%s)", plain, small, smallName, toolRedactMaxBytes>>10, capped, cappedName)
+	// The sweep the cap is chosen from (docs/claude-wake.md, "Report week"):
+	// the slowest output at each candidate cap, in both modes. It only logs.
+	for _, size := range []int{128 << 10, 256 << 10, 512 << 10, 1 << 20} {
+		var slowest time.Duration
+		var slowestName string
+		sweep := func(name string, response any) {
+			for _, mode := range []string{toolRedactReport, toolRedactRedact} {
+				if d := p95(response, mode, 40); d > slowest {
+					slowest, slowestName = d, name+", "+mode
+				}
+			}
+		}
+		for name, unit := range texts {
+			sweep(name, fill(unit, size-1024))
+		}
+		sweep("many small strings", many(size-1024))
+		t.Logf("sweep p95: slowest output of %d KiB %s (%s)", size>>10, slowest, slowestName)
+	}
 	if small >= 20*time.Millisecond {
 		t.Errorf("a 100 KiB output adds %s at the 95th percentile (%s), want under 20 ms", small, smallName)
 	}
