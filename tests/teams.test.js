@@ -7,7 +7,7 @@ import {
   teamLaunches,
 } from "../client/teams.js";
 import { migrateAgentData, resolveTeamMember } from "../client/agents.js";
-import { MAX_AGENT_PROMPT_CHARS } from "../shared/tmux-command.js";
+import { MAX_AGENT_PROMPT_BYTES } from "../shared/tmux-command.js";
 const member = {
   name: "planner",
   serverId: "host",
@@ -48,7 +48,12 @@ test("team validation rejects duplicate names, unsupported models and oversized 
     /model/i,
   );
   assert.throws(
-    () => make([{ ...member, prompt: "a".repeat(MAX_AGENT_PROMPT_CHARS) }]),
+    () => make([{ ...member, prompt: "a".repeat(MAX_AGENT_PROMPT_BYTES) }]),
+    /prompt/,
+  );
+  // The cap counts UTF-8 bytes: this prompt is under it in characters.
+  assert.throws(
+    () => make([{ ...member, prompt: "é".repeat(MAX_AGENT_PROMPT_BYTES / 2) }]),
     /prompt/,
   );
   const team = make([member]);

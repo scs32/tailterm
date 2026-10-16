@@ -17,8 +17,10 @@ export function validateTmuxPath(path = "") {
     throw new Error("The tmux executable must be an absolute path.");
 }
 export const shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
-// A launch prompt is "Role: ROLE\n\n" plus the member prompt (client/teams.js).
-export const MAX_AGENT_PROMPT_CHARS = 16384;
+// A launch prompt is "Role: ROLE\n\n" plus the member prompt (client/teams.js),
+// counted in UTF-8 bytes. tt spawn writes it into the agent's private command
+// file, not a tmux argument (hub/cmd/tt/main.go drops it from the session env).
+export const MAX_AGENT_PROMPT_BYTES = 12288;
 function resolver(path) {
   validateTmuxPath(path);
   if (path)
@@ -421,7 +423,7 @@ export function agentSpawnCommand({
     throw new Error("Working directory must be absolute.");
   if (
     typeof prompt !== "string" ||
-    prompt.length > MAX_AGENT_PROMPT_CHARS ||
+    new TextEncoder().encode(prompt).byteLength > MAX_AGENT_PROMPT_BYTES ||
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(prompt)
   )
     throw new Error("Invalid prompt.");

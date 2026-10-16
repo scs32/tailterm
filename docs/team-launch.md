@@ -279,9 +279,11 @@ copy of the same planner used by TailOS. `npm run build:team-plan` regenerates
 the embedded module; `npm run check:team-plan` rejects stale generated code.
 
 Each member launches as `Role: ROLE`, a blank line and its prompt, at most
-16,384 characters (`MAX_AGENT_PROMPT_CHARS` in `shared/tmux-command.js`); a
-longer prompt is refused with "Invalid prompt.". `tests/team-examples.test.js`
-lists every member's launched length and fails below 512 characters of headroom.
+12,288 UTF-8 bytes (`MAX_AGENT_PROMPT_BYTES` in `shared/tmux-command.js`); a
+longer prompt is refused with "Invalid prompt.". `tt spawn` writes the prompt
+into the agent's private command file, never a `tmux new-session` argument.
+`tests/team-examples.test.js` lists every member's launched bytes and fails
+below 512 bytes of headroom.
 
 For execution, the CLI freezes identities, full prompts and the prepared item
 context in a private journal under `~/.local/state/tt/team-launch`. It sets the
