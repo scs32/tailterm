@@ -1102,7 +1102,7 @@ func TestSweepScheduleJournal(t *testing.T) {
 	}
 	// The tt read path: text, JSON, a limit, and no hub.
 	out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
-	if err != nil || !strings.Contains(out, swept.At+" swept repositories=1 trees=1 folders=1 caches=0 pruned=0 freed=") || !strings.Contains(out, "free=100.0 GiB min-idle=6h0m0s") || !strings.Contains(out, lines[1].At+" skipped cleanup-active") {
+	if err != nil || !strings.Contains(out, swept.At+" swept repositories=1 trees=1 folders=1 binaries=0 caches=0 pruned=0 freed=") || !strings.Contains(out, "free=100.0 GiB min-idle=6h0m0s") || !strings.Contains(out, lines[1].At+" skipped cleanup-active") {
 		t.Fatalf("--journal: %v\n%s", err, out)
 	}
 	out, err = captureSweepStdout(t, func() error {
@@ -1155,7 +1155,7 @@ func TestSweepScheduleLowSpaceEpisode(t *testing.T) {
 		t.Fatalf("notice post %+v", post)
 	}
 	text := post.Envelope.Body.Text
-	for _, want := range []string{"Host " + sweepHost + " has 5.0 GiB free", "below the 8.0 GiB threshold", "This run freed ", "1 worktrees, 0 session temp folders, 0 caches trimmed",
+	for _, want := range []string{"Host " + sweepHost + " has 5.0 GiB free", "below the 8.0 GiB threshold", "This run freed ", "1 worktrees, 0 session temp folders, 0 matrix test binaries, 0 caches trimmed",
 		"Largest kept: " + big + " (", ", " + keepUnpushed + "); " + small + " (", "once per low-space episode", "tt team queue sweep-worktrees --journal"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("notice lacks %q:\n%s", want, text)
@@ -1797,6 +1797,72 @@ func TestSweepScheduleFailingRepository(t *testing.T) {
 
 // a3 (k2): a state file that cannot be read, or cannot be saved, is
 // journalled once per episode and tried every five minutes, not every check.
+// j1, j3: a run that removes one worktree and three matrix test binaries
+// journals treesRemoved=1 and binariesRemoved=3, and frees the bytes of all
+// four; a journal line written before binariesRemoved existed still decodes
+// and prints binaries=0.
+func TestSweepScheduleCountsBinariesApartFromTrees(t *testing.T) {
+	t.Run("one tree and three binaries", func(t *testing.T) {
+		f := newSweepFixture(t)
+		f.setAgents(sweepTask, f.helper("agt_5eeb5eeb5eeb5e0b", "owner-helper", sweepTask, time.Now().Add(-time.Hour)))
+		gone := f.stale(t, "queue-b1a2b3c4")
+		var treeBytes int64
+		f.deps.sweep = func(ctx context.Context, state sweepHubState, host string, o sweepOptions) ([]worktreeDecision, error) {
+			decisions, err := runWorktreeSweep(ctx, state, host, o)
+			for _, d := range decisions {
+				if d.Action == "removed" {
+					treeBytes += d.Bytes
+				}
+			}
+			for i := 1; i <= 3; i++ {
+				decisions = append(decisions, worktreeDecision{Path: filepath.Join(f.r.root, fmt.Sprintf("tt.test-%d", i)), Kind: kindMatrixBinary, Action: "removed", Reason: artifactItemReleased, Bytes: 1000})
+			}
+			return decisions, err
+		}
+		f.free = 5 << 30
+		if !f.attempt() {
+			t.Fatal("no attempt")
+		}
+		requireExists(t, gone, false)
+		line := lastSweepLine(t)
+		if line.Outcome != "swept" || line.TreesRemoved != 1 || line.BinariesRemoved != 3 || line.FoldersRemoved != 0 || treeBytes <= 0 || line.BytesFreed != treeBytes+3000 {
+			t.Fatalf("line %+v; tree bytes %d", line, treeBytes)
+		}
+		data, err := os.ReadFile(sweepJournalPath())
+		if err != nil || !strings.Contains(string(data), `"treesRemoved":1,`) || !strings.Contains(string(data), `"binariesRemoved":3,`) {
+			t.Fatalf("raw journal: %v\n%s", err, data)
+		}
+		out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
+		if err != nil || !strings.Contains(out, line.At+" swept repositories=1 trees=1 folders=0 binaries=3 caches=0 pruned=0 freed=") {
+			t.Fatalf("--journal: %v\n%s", err, out)
+		}
+		_, attempts, _, _ := f.hub.messages()
+		if len(attempts) != 1 || !strings.Contains(attempts[0].Envelope.Body.Text, "1 worktrees, 0 session temp folders, 3 matrix test binaries, 0 caches trimmed") {
+			t.Fatalf("notice: %+v", attempts)
+		}
+	})
+	t.Run("lines without binariesRemoved", func(t *testing.T) {
+		newSweepFixture(t)
+		old := `{"at":"2026-10-01T00:00:00Z","source":"schedule","outcome":"swept","reason":"","repositories":1,"treesRemoved":4,"foldersRemoved":1,"cachesTrimmed":0,"pruned":0,"bytesFreed":4096,"freeBytesAfter":-1,"kept":{},"minIdle":"6h0m0s","durationMs":10,"exclusionExceeded":0,"lowSpace":false,"noticeSeq":0,"noticePending":""}`
+		cut := `{"at":"2026-10-01T01:00:00Z","source":"schedule","outcome":"skipped","reason":"matrix-lock","repositories":1,"treesRemoved":1,"foldersRemoved":0,"binariesRemoved":2,"cachesTrimmed":0,"pruned":0,"bytesFreed":2048,"freeBytesAfter":-1,"kept":{},"minIdle":"6h0m0s","durationMs":10,"exclusionExceeded":0,"lowSpace":false,"noticeSeq":0,"noticePending":""}`
+		if err := os.MkdirAll(filepath.Dir(sweepJournalPath()), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sweepJournalPath(), []byte(old+"\n"+cut+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		lines := sweepJournalLines(t)
+		if len(lines) != 2 || lines[0].TreesRemoved != 4 || lines[0].BinariesRemoved != 0 || lines[1].TreesRemoved != 1 || lines[1].BinariesRemoved != 2 {
+			t.Fatalf("decoded %+v", lines)
+		}
+		out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
+		if err != nil || !strings.Contains(out, "2026-10-01T00:00:00Z swept repositories=1 trees=4 folders=1 binaries=0 caches=0 pruned=0 freed=") ||
+			!strings.Contains(out, "2026-10-01T01:00:00Z skipped matrix-lock; trees=1 folders=0 binaries=2 caches=0 pruned=0 freed=") {
+			t.Fatalf("--journal: %v\n%s", err, out)
+		}
+	})
+}
+
 func TestSweepScheduleStateFaultSpacing(t *testing.T) {
 	failedState := func(t *testing.T) int {
 		n := 0

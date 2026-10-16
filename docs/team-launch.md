@@ -493,16 +493,18 @@ the relay state directory (mode 0600), read with `tt team queue sweep-worktrees
 
 ```json
 {"at":"…","source":"schedule","outcome":"swept","reason":"","repositories":1,
- "treesRemoved":3,"foldersRemoved":2,"cachesTrimmed":4,"pruned":0,
+ "treesRemoved":3,"foldersRemoved":2,"binariesRemoved":3,"cachesTrimmed":4,"pruned":0,
  "bytesFreed":123,"freeBytesAfter":456,"kept":{"unpushed":7},
  "minIdle":"6h0m0s","durationMs":8123,"exclusionExceeded":0,
  "lowSpace":false,"noticeSeq":0,"noticePending":""}
 ```
 
 `outcome` is `swept`, `skipped` or `failed`, with the cause in `reason` and
-`detail`. `treesRemoved` counts worktrees and verifier checkouts and
-`foldersRemoved` session temp folders. `at` is the `at` of that run's lines in
-`worktree-cleanup.jsonl`. `freeBytesAfter` is the least free space over each
+`detail`. `treesRemoved` counts worktrees, verifier checkouts and verifier
+homes, `foldersRemoved` session temp folders, and `binariesRemoved` matrix test
+binaries; lines written before `binariesRemoved` existed lack it and counted
+those binaries in `treesRemoved`. `bytesFreed` covers all of them. `at` is the
+`at` of that run's lines in `worktree-cleanup.jsonl`. `freeBytesAfter` is the least free space over each
 repository's main checkout and artifacts root after the run, or `-1` when it
 could not be read. `exclusionExceeded` counts removals that outran the matrix
 hold limit. `noticesDropped` appears when a full pending list dropped a notice.

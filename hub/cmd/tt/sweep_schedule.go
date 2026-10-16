@@ -901,13 +901,16 @@ type sweepJournalLine struct {
 	Repositories int    `json:"repositories"`
 	// RepositoriesFailed counts the repositories whose sweep returned an
 	// error; Detail names them.
-	RepositoriesFailed int   `json:"repositoriesFailed,omitempty"`
-	TreesRemoved       int   `json:"treesRemoved"`
-	FoldersRemoved     int   `json:"foldersRemoved"`
-	CachesTrimmed      int   `json:"cachesTrimmed"`
-	Pruned             int   `json:"pruned"`
-	BytesFreed         int64 `json:"bytesFreed"`
-	FreeBytesAfter     int64 `json:"freeBytesAfter"`
+	RepositoriesFailed int `json:"repositoriesFailed,omitempty"`
+	TreesRemoved       int `json:"treesRemoved"`
+	FoldersRemoved     int `json:"foldersRemoved"`
+	// BinariesRemoved counts matrix test binaries; absent from lines written
+	// before it was counted apart from trees.
+	BinariesRemoved int   `json:"binariesRemoved,omitempty"`
+	CachesTrimmed   int   `json:"cachesTrimmed"`
+	Pruned          int   `json:"pruned"`
+	BytesFreed      int64 `json:"bytesFreed"`
+	FreeBytesAfter  int64 `json:"freeBytesAfter"`
 	// LowestVolume is the path whose volume gave FreeBytesAfter.
 	LowestVolume      string         `json:"lowestVolume,omitempty"`
 	Kept              map[string]int `json:"kept"`
@@ -1117,8 +1120,8 @@ func printSweepJournal(limit int, jsonOut bool) error {
 			if l.Detail != "" {
 				text += ": " + l.Detail
 			}
-			if l.TreesRemoved+l.FoldersRemoved+l.CachesTrimmed+l.Pruned > 0 {
-				text += fmt.Sprintf("; trees=%d folders=%d caches=%d pruned=%d freed=%s", l.TreesRemoved, l.FoldersRemoved, l.CachesTrimmed, l.Pruned, humanBytes(l.BytesFreed))
+			if l.TreesRemoved+l.FoldersRemoved+l.BinariesRemoved+l.CachesTrimmed+l.Pruned > 0 {
+				text += fmt.Sprintf("; trees=%d folders=%d binaries=%d caches=%d pruned=%d freed=%s", l.TreesRemoved, l.FoldersRemoved, l.BinariesRemoved, l.CachesTrimmed, l.Pruned, humanBytes(l.BytesFreed))
 			}
 			fmt.Println(text)
 			continue
@@ -1132,7 +1135,7 @@ func printSweepJournal(limit int, jsonOut bool) error {
 		if l.FreeBytesAfter >= 0 {
 			free = humanBytes(l.FreeBytesAfter)
 		}
-		text := fmt.Sprintf("%s swept repositories=%d trees=%d folders=%d caches=%d pruned=%d freed=%s free=%s min-idle=%s", l.At, l.Repositories, l.TreesRemoved, l.FoldersRemoved, l.CachesTrimmed, l.Pruned, humanBytes(l.BytesFreed), free, l.MinIdle)
+		text := fmt.Sprintf("%s swept repositories=%d trees=%d folders=%d binaries=%d caches=%d pruned=%d freed=%s free=%s min-idle=%s", l.At, l.Repositories, l.TreesRemoved, l.FoldersRemoved, l.BinariesRemoved, l.CachesTrimmed, l.Pruned, humanBytes(l.BytesFreed), free, l.MinIdle)
 		if l.Detail != "" {
 			text += "; " + l.Detail
 		}
@@ -1306,8 +1309,8 @@ func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, th
 	if line.LowestVolume != "" {
 		volume = " on the volume holding " + line.LowestVolume
 	}
-	text := fmt.Sprintf("Host %s has %s free%s after the scheduled worktree sweep, below the %s threshold. This run freed %s: %d worktrees, %d session temp folders, %d caches trimmed.",
-		host, humanBytes(line.FreeBytesAfter), volume, humanBytes(threshold), humanBytes(line.BytesFreed), line.TreesRemoved, line.FoldersRemoved, line.CachesTrimmed)
+	text := fmt.Sprintf("Host %s has %s free%s after the scheduled worktree sweep, below the %s threshold. This run freed %s: %d worktrees, %d session temp folders, %d matrix test binaries, %d caches trimmed.",
+		host, humanBytes(line.FreeBytesAfter), volume, humanBytes(threshold), humanBytes(line.BytesFreed), line.TreesRemoved, line.FoldersRemoved, line.BinariesRemoved, line.CachesTrimmed)
 	if line.RepositoriesFailed > 0 {
 		text += fmt.Sprintf(" %d of %d repositories could not be swept and were skipped.", line.RepositoriesFailed, line.Repositories)
 	}
@@ -1501,9 +1504,12 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	for _, dec := range all {
 		switch dec.Action {
 		case "removed":
-			if dec.Kind == kindSessionTemp {
+			switch dec.Kind {
+			case kindSessionTemp:
 				line.FoldersRemoved++
-			} else {
+			case kindMatrixBinary:
+				line.BinariesRemoved++
+			default:
 				line.TreesRemoved++
 			}
 			line.BytesFreed += dec.Bytes
