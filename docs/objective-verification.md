@@ -1202,7 +1202,8 @@ team run and the deployer wait while it holds, and give it a short
   itself, needs at least one live holder, a free slot, a worktree no holder
   uses, and, beside a holder, a memory reading within the limit. The exclusive
   request keeps first place; the grant counts in its `overtakenBy` but, like a
-  release grant, spends none of its fairness budget. A waiting release run is
+  release grant, spends none of its fairness budget. Any other older waiter is
+  charged for it as for any later grant. A waiting release run is
   always ordered ahead of an exclusive head, so no backfill happens while one
   waits, and one that arrives later is granted at the next free slot as
   before. Because every matrix run is clamped to the same holder cap, a later

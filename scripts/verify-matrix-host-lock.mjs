@@ -1062,9 +1062,10 @@ export async function acquireHostLock(options = {}) {
       for (const waiter of state.waiters) if (waiter.seq < queued.seq) {
         const count = fairnessCount(waiter);
         waiter.overtakenBy = (waiter.overtakenBy || 0) + 1;
-        // A release grant, like an urgent one, spends nobody's fairness budget;
-        // nor does a backfill, which leaves the exclusive head's bound alone.
-        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" || queued.release === true || behindExclusive ? 0 : 1);
+        // A release grant, like an urgent one, spends nobody's fairness budget.
+        // A backfill spares only the exclusive head it passed, whose bound it
+        // leaves alone; it charges any other older waiter as usual.
+        waiter.nonUrgentOvertakes = count + (queued.priority === "urgent" || queued.release === true || (behindExclusive && waiter.id === head.id) ? 0 : 1);
       }
       // Persist the new grant order immediately, including between polls when
       // another slot is free and the next grant could happen at once.

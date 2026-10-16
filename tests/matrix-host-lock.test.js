@@ -2468,6 +2468,22 @@ test("B3 after a backfill the exclusive request keeps first place and starts whe
   assert.deepEqual(realOf(path).map(e => e.id), [alone.id]);
   await alone.release();
   assert(!events(path).includes("overlap"));
+
+  // Only the exclusive head is spared: an older waiter behind it is charged
+  // for the backfill as for any later grant (review b1, #36510).
+  const older = lockFile(t), order = [];
+  const joins = (item, extra) => acquireHostLock(request(older, wide("3", { item, ...extra }))).then(lease => (order.push(item), lease));
+  const held = await joins("H");
+  const head = joins("X", { exclusive: true, priority: "high" });
+  await until(() => waitersOf(older).length === 1, "X");
+  const waiting = joins("W", { runTimeoutMs: 120000 });
+  await until(() => waitersOf(older).length === 2, "W");
+  const filled = await joins("C", { priority: "high", runTimeoutMs: 30000 });
+  assert(filled.record.backfill);
+  assert.deepEqual(waitersOf(older).map(w => [w.item, w.overtakenBy, w.nonUrgentOvertakes]), [["X", 1, 0], ["W", 1, 1]]);
+  await filled.release(); await held.release();
+  await (await head).release(); await (await waiting).release();
+  assert.deepEqual(order, ["H", "C", "X", "W"]);
 });
 test("B4 a release run arriving while a backfill holds is ordered ahead of the exclusive head and spends no fairness budget", async (t) => {
   for (const slots of ["2", "3"]) {
