@@ -809,6 +809,8 @@ function validateSession(name) {
     );
 }
 const shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
+// A launch prompt is "Role: ROLE\n\n" plus the member prompt (client/teams.js).
+const MAX_AGENT_PROMPT_CHARS = 16384;
 
 const TT_CANDIDATES = [
   "/usr/local/bin/tt",
@@ -877,7 +879,7 @@ function agentSpawnCommand({
     throw new Error("Working directory must be absolute.");
   if (
     typeof prompt !== "string" ||
-    prompt.length > 8192 ||
+    prompt.length > MAX_AGENT_PROMPT_CHARS ||
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(prompt)
   )
     throw new Error("Invalid prompt.");

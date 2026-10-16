@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { exampleTeam } from "../client/team-examples.js";
 import { teamLaunchPlan } from "../client/team-launch-plan.js";
+import { MAX_AGENT_PROMPT_CHARS } from "../shared/tmux-command.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const task = "tsk_1111111111111111",
@@ -168,7 +169,7 @@ test("a small-change launch has three members, lead first, in TailOS and the CLI
   );
   const lead = ui[0].fields.prompt;
   assert.ok(lead.startsWith("Role: Small-change lead and verifier\n\n"));
-  assert.ok(lead.length <= 8192, `small lead prompt is ${lead.length} characters`);
+  assert.ok(lead.length <= MAX_AGENT_PROMPT_CHARS, `small lead prompt is ${lead.length} characters`);
   for (const sentence of [
     "run tt ack SEQ before you start",
     "run tt withdraw SEQ --reason TEXT",

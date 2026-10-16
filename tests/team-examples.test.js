@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { PROJECT_ROLE_TEMPLATES, QUEUE_TEAM_TEMPLATES, TEAM_EXAMPLES, exampleTeam } from "../client/team-examples.js";
 import { normalizeTeam, teamLaunches } from "../client/teams.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
+import { MAX_AGENT_PROMPT_CHARS } from "../shared/tmux-command.js";
 test("ten complete examples are portable, launchable, bounded and independently editable", () => {
   assert.equal(TEAM_EXAMPLES.length, 10);
   for (const e of TEAM_EXAMPLES) {
@@ -13,7 +14,7 @@ test("ten complete examples are portable, launchable, bounded and independently 
     for (const m of team.members) {
       assert.equal(m.serverId, "");
       assert.ok(m.prompt.length > 2500);
-      assert.ok(Buffer.byteLength(m.prompt) < 8192);
+      assert.ok(Buffer.byteLength(m.prompt) < MAX_AGENT_PROMPT_CHARS);
       assert.ok(MODEL_OPTIONS[m.runtime].some(([id]) => id === m.model));
       assert.match(m.prompt, /inventory useful long-lived services/);
     }
@@ -98,7 +99,7 @@ test("Planned delivery members post typed messages with tt send", () => {
   for (const member of exampleTeam("planned").members) {
     assert.match(member.prompt, /Post with tt send/);
     assert.match(member.prompt, /has no send command, post the same fields as text/);
-    assert.ok(Buffer.byteLength(member.prompt) < 8192);
+    assert.ok(Buffer.byteLength(member.prompt) < MAX_AGENT_PROMPT_CHARS);
   }
 });
 
@@ -173,9 +174,9 @@ test("the steward proposes a token estimate with every filing and ranking", () =
     const text = readFileSync(new URL(path, import.meta.url), "utf8");
     assert.equal(text.split(rule).length - 1, 1, path);
   }
-  // The spawn command caps the prompt at 8192 characters.
-  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
-  assert.ok(Buffer.byteLength(steward) < 8192);
+  // The spawn command caps the prompt at MAX_AGENT_PROMPT_CHARS characters.
+  assert.ok(steward.length <= MAX_AGENT_PROMPT_CHARS, `steward prompt is ${steward.length} characters`);
+  assert.ok(Buffer.byteLength(steward) < MAX_AGENT_PROMPT_CHARS);
   // The steward proposes; only the handler saves it.
   assert.doesNotMatch(steward, /--estimate-tokens/);
 });
@@ -190,7 +191,7 @@ test("the reviewer folds a same-file finding into an existing held item", () => 
     const reviewer = exampleTeam(id).members.find((member) => member.name === "reviewer").prompt;
     assert.equal(reviewer.split(rule).length - 1, 1, id);
     assert.doesNotMatch(reviewer, /tt work-items/, id);
-    assert.ok(Buffer.byteLength(reviewer) < 8192, `${id} reviewer prompt is ${Buffer.byteLength(reviewer)} bytes`);
+    assert.ok(Buffer.byteLength(reviewer) < MAX_AGENT_PROMPT_CHARS, `${id} reviewer prompt is ${Buffer.byteLength(reviewer)} bytes`);
   }
   for (const path of ["../docs/team-examples.md", "../hub/internal/teamplan/plan.mjs"]) {
     const text = readFileSync(new URL(path, import.meta.url), "utf8");
@@ -206,8 +207,8 @@ test("the steward records recurrences through an evidence note", () => {
     "To record a recurrence or new evidence on an existing item, ask the database handler for an evidence note (tt work-items note). Never ask for a description append on an accepted or released item: it advances the scope revision and blocks the release.";
   assert.equal(steward.split(rule).length - 1, 1);
   assert.equal(steward.split("tt work-items note").length - 1, 1);
-  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
-  assert.ok(Buffer.byteLength(steward) < 8192);
+  assert.ok(steward.length <= MAX_AGENT_PROMPT_CHARS, `steward prompt is ${steward.length} characters`);
+  assert.ok(Buffer.byteLength(steward) < MAX_AGENT_PROMPT_CHARS);
   const guide = readFileSync(new URL("../docs/backlog-steward.md", import.meta.url), "utf8");
   assert.equal(guide.split(rule).length - 1, 1);
 });
@@ -225,7 +226,7 @@ test("documented project role prompts exactly include every generated template",
 });
 
 // wi_2c46d9d964b335da: nobody reads an agent's terminal, so every template
-// routes questions to the Board and still fits the 8192-character prompt cap.
+// routes questions to the Board and still fits the MAX_AGENT_PROMPT_CHARS prompt cap.
 test("every template asks through the Board, never an interactive terminal prompt", () => {
   const sentence =
     "Never ask through an interactive terminal prompt: ask the owner with tt ask, a teammate with tt send --kind question.";
@@ -235,7 +236,7 @@ test("every template asks through the Board, never an interactive terminal promp
   ];
   for (const [name, prompt] of prompts) {
     assert.ok(prompt.includes(sentence), `${name} lacks the Board question rule`);
-    assert.ok(prompt.length <= 8192, `${name} prompt is ${prompt.length} characters`);
+    assert.ok(prompt.length <= MAX_AGENT_PROMPT_CHARS, `${name} prompt is ${prompt.length} characters`);
   }
   const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
   assert.ok(bundle.split(sentence).length - 1 >= 2, "generated plan.mjs lacks the Board question rule");
@@ -322,7 +323,7 @@ test("Planned delivery verifies alongside review and verifies exactly what merge
   assert.match(builder, /rebase the candidate onto the current local tasks-hub/);
   assert.match(planned.workflow, /reviewer and distinct verifier start together on each frozen candidate/);
   for (const member of planned.members)
-    assert.ok(Buffer.byteLength(member.prompt) < 8192, member.name);
+    assert.ok(Buffer.byteLength(member.prompt) < MAX_AGENT_PROMPT_CHARS, member.name);
 });
 
 test("Planned delivery lead narrows the queue entry once the plan freezes", () => {
@@ -360,9 +361,9 @@ test("Planned delivery reviews a feature plan once before the builder and skips 
   assert.match(reviewer, /There is no second general plan review/);
   assert.match(planned.fit, /Features add a plan reviewer before the builder; bugs go plan → builder/);
   assert.match(planned.workflow, /for a feature, plan reviewer passes the plan or lists blockers/);
-  // The spawn command caps "Role: ROLE\n\nPROMPT" at 8192 characters.
+  // The spawn command caps "Role: ROLE\n\nPROMPT" at MAX_AGENT_PROMPT_CHARS characters.
   for (const member of members)
-    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, member.name);
+    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= MAX_AGENT_PROMPT_CHARS, member.name);
 });
 
 // wi_f8d48780626165cc: the small-change lane is queue-only, reuses the
@@ -387,7 +388,7 @@ test("queue-only small change reuses Planned seats and stays out of the gallery"
   assert.match(lead.prompt, /Post with tt send/);
   assert.match(lead.prompt, /run tt ack SEQ before you start/);
   assert.match(lead.prompt, /inventory useful long-lived services/);
-  assert.ok(`Role: ${lead.role}\n\n${lead.prompt}`.length <= 8192);
+  assert.ok(`Role: ${lead.role}\n\n${lead.prompt}`.length <= MAX_AGENT_PROMPT_CHARS);
   const copy = exampleTeam("small");
   copy.members[1].prompt = "changed";
   assert.equal(exampleTeam("planned").members.find((member) => member.name === "builder").prompt, planned.members.find((member) => member.name === "builder").prompt);
@@ -504,7 +505,7 @@ test("lead and verifier run the validated hub operations without a handler turn"
   assert.match(handler, /Do one of them only when lead asks after the hub refused it, quoting the reason, or for a team with no queue entry/);
 
   for (const member of [...planned, ...exampleTeam("small").members])
-    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= 8192, `${member.name} is ${member.prompt.length} characters`);
+    assert.ok(`Role: ${member.role}\n\n${member.prompt}`.length <= MAX_AGENT_PROMPT_CHARS, `${member.name} is ${member.prompt.length} characters`);
   const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
   assert.ok(bundle.includes("Import the receipt yourself: tt verification receipt"), "generated plan.mjs lacks the verifier's import");
 });
@@ -533,7 +534,7 @@ test("the steward proposes the small lane for small bugs and names a reason for 
   assert.ok(steward.includes(rule), "steward prompt lacks the lane rule");
   for (const reason of [/more than three owned paths \(paths\)/, /a schema or migration change \(schema\)/, /a cross-cutting risk you name \(risk:TEXT\)/])
     assert.match(steward, reason);
-  assert.ok(steward.length <= 8192, `steward prompt is ${steward.length} characters`);
+  assert.ok(steward.length <= MAX_AGENT_PROMPT_CHARS, `steward prompt is ${steward.length} characters`);
   const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
   assert.equal(bundle.split(rule).length - 1, 1, "generated plan.mjs lacks the steward lane rule");
 });
@@ -653,4 +654,19 @@ test("store race checks name the sharded matrix command", () => {
     ["plan.mjs", readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8")],
   ];
   for (const [name, text] of texts) assert.deepEqual(unsafe(text), [], name);
+});
+
+// wi_25fb57606bc36f66: every member launches as "Role: ROLE\n\nPROMPT" with
+// 512 characters to spare, so the next prompt edit sees its budget here first.
+test("every team member launches with 512 characters of prompt headroom", (t) => {
+  for (const { id } of [...TEAM_EXAMPLES, ...QUEUE_TEAM_TEMPLATES])
+    for (const { name, role, prompt } of exampleTeam(id).members) {
+      const launched = `Role: ${role}\n\n${prompt}`.length,
+        headroom = MAX_AGENT_PROMPT_CHARS - launched;
+      t.diagnostic(`${id}/${name}: ${launched} launched, ${headroom} left`);
+      assert.ok(
+        headroom >= 512,
+        `${id}/${name} launches at ${launched} of ${MAX_AGENT_PROMPT_CHARS}, ${headroom} left; trim it or raise the cap`,
+      );
+    }
 });

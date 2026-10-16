@@ -7,6 +7,7 @@ import {
   teamLaunches,
 } from "../client/teams.js";
 import { migrateAgentData, resolveTeamMember } from "../client/agents.js";
+import { MAX_AGENT_PROMPT_CHARS } from "../shared/tmux-command.js";
 const member = {
   name: "planner",
   serverId: "host",
@@ -47,7 +48,7 @@ test("team validation rejects duplicate names, unsupported models and oversized 
     /model/i,
   );
   assert.throws(
-    () => make([{ ...member, prompt: "a".repeat(8192) }]),
+    () => make([{ ...member, prompt: "a".repeat(MAX_AGENT_PROMPT_CHARS) }]),
     /prompt/,
   );
   const team = make([member]);
