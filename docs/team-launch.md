@@ -403,7 +403,14 @@ tt team queue sweep-worktrees --journal [--limit 20] [--json]
 - `--accepted-after` (default 24h) removes an accepted, unreleased item's
   verifier checkouts once its acceptance is this old.
 - `--artifacts` names the artifacts root, an absolute path that defaults to
-  `TAILTERM_ARTIFACTS`, else `<main checkout>-artifacts`.
+  `TAILTERM_ARTIFACTS`, else `<main checkout>-artifacts`. `tt spawn` exports
+  the same root to every agent session as `TAILTERM_ARTIFACTS`, so an agent in
+  a linked worktree never takes its own checkout for the main one: an absolute
+  value the launch or the host already has is kept; otherwise the main
+  checkout is the first entry of `git worktree list` for the session's
+  directory. A relative value is not exported and nothing replaces it, and a
+  directory outside a repository, a bare main or a Git failure exports nothing
+  without failing the launch.
 - `--cwd` names any worktree of the repository, in place of the current
   directory.
 - `--hub` names the hub URL to read, in place of the configured hub.

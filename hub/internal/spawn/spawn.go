@@ -3,6 +3,7 @@ package spawn
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ const (
 	EnvAgentName = "TAILTERM_AGENT_NAME"
 	EnvSession   = "TAILTERM_SESSION"
 	EnvGoFlags   = "GOFLAGS"
+	EnvArtifacts = "TAILTERM_ARTIFACTS"
 	AgentWindow  = "agent"
 	WatchWindow  = "tt-watch"
 )
@@ -141,7 +143,7 @@ func Create(o Options) error {
 		args = append(args, "-c", o.Cwd)
 	}
 	for k, val := range o.Env {
-		if k == EnvGoFlags {
+		if k == EnvGoFlags || k == EnvArtifacts {
 			continue
 		}
 		// The full briefing is already present in the private one-shot command
@@ -156,6 +158,11 @@ func Create(o Options) error {
 	// package's cache entries on its directory, so every path fills the shared
 	// build cache again (docs/go-build-cache.md).
 	args = append(args, "-e", EnvGoFlags+"="+sessionGoFlags(o.Env))
+	// An agent working in a linked worktree cannot tell its own checkout from
+	// the main one, so it is told the artifacts root the sweep will use.
+	if root := sessionArtifactsRoot(o.Env, o.Cwd); root != "" {
+		args = append(args, "-e", EnvArtifacts+"="+root)
+	}
 	launch, err := os.CreateTemp("", ".tailterm-agent-command-*")
 	if err != nil {
 		return fmt.Errorf("create private agent command: %w", err)
@@ -212,6 +219,70 @@ func sessionGoFlags(env map[string]string) string {
 		}
 	}
 	return strings.TrimSpace(base + " -trimpath")
+}
+
+// sessionArtifactsRoot returns the session's TAILTERM_ARTIFACTS: the caller's
+// value, else the host's, else <main checkout>-artifacts for the repository
+// at cwd (the launcher's directory when cwd is empty), the rule the worktree
+// sweep uses. A relative value names no tree to the sweep, so it is not
+// exported and nothing replaces it. "" when there is nothing to export: no
+// repository, a bare main, or a Git failure, which never fails the launch.
+func sessionArtifactsRoot(env map[string]string, cwd string) string {
+	dir, ok := env[EnvArtifacts]
+	if !ok || dir == "" {
+		dir = os.Getenv(EnvArtifacts)
+	}
+	if dir != "" {
+		if filepath.IsAbs(dir) {
+			return dir
+		}
+		return ""
+	}
+	if main := mainCheckout(cwd); main != "" {
+		return main + "-artifacts"
+	}
+	return ""
+}
+
+// mainCheckout names the main checkout of the repository at dir: the first
+// entry of git worktree list, symlinks resolved, or "" when dir is in no
+// repository, the main is bare, or Git fails or takes too long.
+func mainCheckout(dir string) string {
+	if dir == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return ""
+		}
+		dir = wd
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain", "-z").Output()
+	if err != nil {
+		return ""
+	}
+	main := ""
+	for i, field := range strings.Split(string(out), "\x00") {
+		if field == "" {
+			break
+		}
+		key, value, _ := strings.Cut(field, " ")
+		if i == 0 {
+			if key != "worktree" || !filepath.IsAbs(value) {
+				return ""
+			}
+			main = value
+		} else if key == "bare" {
+			return ""
+		}
+	}
+	if main == "" {
+		return ""
+	}
+	if real, err := filepath.EvalSymlinks(main); err == nil {
+		main = real
+	}
+	return filepath.Clean(main)
 }
 
 func forwardSessionEnv(command, key, value string) bool {

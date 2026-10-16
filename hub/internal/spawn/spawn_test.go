@@ -386,3 +386,99 @@ func TestSpawnCreateSetsTrimpathGoFlags(t *testing.T) {
 		t.Fatalf("session GOFLAGS = %q, want GOFLAGS=-trimpath", got)
 	}
 }
+
+// gitFixture runs git in dir with no user or system configuration.
+func gitFixture(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// sessionEnv reads one variable of a session's own environment; ok is false
+// when the session has none.
+func sessionEnv(t *testing.T, session, key string) (string, bool) {
+	t.Helper()
+	out, err := tmux("show-environment", "-t", "="+session, key).CombinedOutput()
+	got := strings.TrimSpace(string(out))
+	if err != nil {
+		if strings.Contains(got, "unknown variable") {
+			return "", false
+		}
+		t.Fatalf("tmux show-environment %s: %v: %s", key, err, got)
+	}
+	value, ok := strings.CutPrefix(got, key+"=")
+	if !ok {
+		return "", false
+	}
+	return value, true
+}
+
+func TestSpawnCreateExportsArtifactsRoot(t *testing.T) {
+	privateTmux(t)
+	t.Setenv(EnvArtifacts, "")
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(root, "repo")
+	if err := os.Mkdir(main, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitFixture(t, main, "init", "-q")
+	gitFixture(t, main, "commit", "-q", "--allow-empty", "-m", "base")
+	queue := filepath.Join(main, ".build", "worktrees", "queue-1")
+	gitFixture(t, main, "worktree", "add", "-q", "--detach", queue)
+	bare := filepath.Join(root, "bare.git")
+	gitFixture(t, root, "clone", "-q", "--bare", main, bare)
+	bareLinked := filepath.Join(root, "bare-linked")
+	gitFixture(t, bare, "worktree", "add", "-q", "--detach", bareLinked)
+	outside := t.TempDir()
+	self := sleeperSelf(t)
+	create := func(session, cwd string, env map[string]string) {
+		t.Helper()
+		if err := Create(Options{Session: session, Cwd: cwd, Env: env, Command: "true", Self: self}); err != nil {
+			t.Fatalf("%s: %v", session, err)
+		}
+	}
+	want := func(session, value string) {
+		t.Helper()
+		got, ok := sessionEnv(t, session, EnvArtifacts)
+		if value == "" && ok {
+			t.Fatalf("%s: %s = %q, want none", session, EnvArtifacts, got)
+		}
+		if value != "" && (!ok || got != value) {
+			t.Fatalf("%s: %s = %q (set %v), want %q", session, EnvArtifacts, got, ok, value)
+		}
+	}
+
+	// A queue worktree's agent gets its main checkout's sibling, not its own.
+	create("queue", queue, nil)
+	want("queue", main+"-artifacts")
+	create("main", main, nil)
+	want("main", main+"-artifacts")
+	// Outside a repository, or with a bare main, there is nothing to name.
+	create("outside", outside, nil)
+	want("outside", "")
+	create("bare", bareLinked, nil)
+	want("bare", "")
+
+	// An absolute value from the caller, else from the host, is kept.
+	create("caller", queue, map[string]string{EnvArtifacts: "/srv/artifacts"})
+	want("caller", "/srv/artifacts")
+	t.Setenv(EnvArtifacts, "/host/artifacts")
+	create("host", queue, nil)
+	want("host", "/host/artifacts")
+	create("caller-over-host", queue, map[string]string{EnvArtifacts: "/srv/artifacts"})
+	want("caller-over-host", "/srv/artifacts")
+
+	// A relative value names no tree: it is not exported and no computed root
+	// replaces it.
+	create("caller-relative", queue, map[string]string{EnvArtifacts: "relative/dir"})
+	want("caller-relative", "")
+	t.Setenv(EnvArtifacts, "relative/dir")
+	create("host-relative", queue, nil)
+	want("host-relative", "")
+}
