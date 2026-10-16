@@ -5235,7 +5235,7 @@ func TestMatrixBinaryProofSources(t *testing.T) {
 	bad := releasedArtifactEntry(trimItemOut)
 	bad.Verification = &api.VerificationSummary{Commit: "ABC"}
 	got := matrixCommitItems([]api.TeamQueueEntry{rel, ver, integrated, bad, rel})
-	want := map[string][]string{matrixCommitRel: {trimItemRel}, matrixCommitOther: {trimItemAcc}}
+	want := map[string][]matrixCommitItem{matrixCommitRel: {{Item: trimItemRel}}, matrixCommitOther: {{Item: trimItemAcc}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("commit items %v, want %v", got, want)
 	}
@@ -5246,6 +5246,51 @@ func TestMatrixBinaryProofSources(t *testing.T) {
 	decisions := f.sweep(t, sweepHubState{entries: []api.TeamQueueEntry{rel, integrated}}, false)
 	requireHomeDecision(t, decisions, byRelease.binaries[0], "would-remove", artifactItemReleased, kindMatrixBinary, "item "+trimItemRel+" released")
 	requireHomeDecision(t, decisions, byIntegrated.dir, "kept", keepUnproven, kindMatrixBinary, "matches no item's verification record or release")
+}
+
+// r1/r2: an item released by an older entry, with a newer finished entry
+// that is neither released nor accepted. The newer entry's commit proves
+// nothing, so its run's binaries stay; the older run's go. Its commit still
+// makes another item's commit ambiguous.
+func TestMatrixBinaryNewerUnacceptedEntryProvesNothing(t *testing.T) {
+	f := newHomeFixture(t)
+	art := f.artifacts()
+	older := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-older"), matrixCommitRel, "", "tailterm-hub-test")
+	newer := writeMatrixRun(t, filepath.Join(art, trimItemRel, "verifier", "matrix-newer"), matrixCommitOther, "", "tailterm-hub-test")
+	released := releasedMatrixEntry(trimItemRel, matrixCommitRel)
+	unaccepted := api.TeamQueueEntry{ID: "tqe_new_00a2", ItemID: trimItemRel, State: "finished", Position: 2,
+		Verification: &api.VerificationSummary{State: "passed", Commit: matrixCommitOther}}
+	state := sweepHubState{entries: []api.TeamQueueEntry{unaccepted, released}}
+	if st := artifactItemStates(state.entries, nil)[trimItemRel]; st.State != artifactItemReleased || st.EntryID != released.ID {
+		t.Fatalf("item state %+v, want released by %s", st, released.ID)
+	}
+	before := treeContents(t, newer.dir)
+	for _, apply := range []bool{false, true} {
+		got := f.sweepAt(t, state, apply, f.now.Add(time.Duration(len(readCleanupReceipts(t)))*time.Second), nil)
+		d := requireHomeDecision(t, got, newer.dir, "kept", keepUnproven, kindMatrixBinary,
+			"receipt commit "+shortSHA(matrixCommitOther)+" names only "+trimItemRel+" entries newer than "+released.ID+", which decides its state")
+		if d.Item != "" {
+			t.Fatalf("unproven decision names an item: %+v", d)
+		}
+		action := "would-remove"
+		if apply {
+			action = "removed"
+		}
+		requireHomeDecision(t, got, older.binaries[0], action, artifactItemReleased, kindMatrixBinary, "item "+trimItemRel+" released")
+		if treeContents(t, newer.dir) != before {
+			t.Fatalf("apply=%v changed the newer run's folder", apply)
+		}
+	}
+	requireExists(t, older.binaries[0], false)
+	requireExists(t, newer.binaries[0], true)
+	older.requireEvidenceKept(t)
+
+	// The newer entry's commit, named by another item's released entry, is
+	// still ambiguous.
+	shared := writeMatrixRun(t, filepath.Join(art, "lead-00000003", "matrix-shared"), matrixCommitOther, "", "tailterm-hub-test")
+	state.entries = append(state.entries, releasedMatrixEntry(trimItemFar, matrixCommitOther))
+	got := f.sweepAt(t, state, false, f.now.Add(time.Hour), nil)
+	requireHomeDecision(t, got, shared.dir, "kept", keepUnproven, kindMatrixBinary, "matches items "+trimItemRel+" and "+trimItemFar)
 }
 
 // a3: the command prints the rows in text and JSON, the dry run and the

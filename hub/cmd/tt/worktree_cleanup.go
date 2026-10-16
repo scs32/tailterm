@@ -182,9 +182,9 @@ type worktreeCleanupInputs struct {
 	TempHomes func() bool
 	// MatrixCommits, with Trim, turns on the matrix binary pass: each commit
 	// an item's verification record or release job names, with the items
-	// that name it. VerifierItems is the item each listed agent is bound
-	// to, by agent ID. Nil skips the pass.
-	MatrixCommits map[string][]string
+	// that name it (matrixCommitItems). VerifierItems is the item each
+	// listed agent is bound to, by agent ID. Nil skips the pass.
+	MatrixCommits map[string][]matrixCommitItem
 	VerifierItems map[string]string
 }
 
@@ -1251,6 +1251,36 @@ func releasedQueueEntry(q api.TeamQueueEntry) bool {
 	return q.OwnerIntegration != nil || (q.Release != nil && (q.Release.State == "released" || q.Release.Published))
 }
 
+// finishedEntryState is what one finished entry says about its item:
+// released or accepted, or nothing.
+func finishedEntryState(q api.TeamQueueEntry) (artifactItemState, bool) {
+	if q.State != "finished" {
+		return artifactItemState{}, false
+	}
+	switch {
+	case releasedQueueEntry(q):
+		next := artifactItemState{State: artifactItemReleased, BasisAt: q.UpdatedAt, EntryID: q.ID, position: q.Position}
+		if q.OwnerIntegration != nil && q.OwnerIntegration.At != "" {
+			next.BasisAt = q.OwnerIntegration.At
+		}
+		return next, true
+	case q.Acceptance != nil:
+		at, err := time.Parse(time.RFC3339Nano, q.Acceptance.AcceptedAt)
+		if err != nil {
+			return artifactItemState{}, false
+		}
+		return artifactItemState{State: artifactItemAccepted, At: at, BasisAt: q.Acceptance.AcceptedAt, EntryID: q.ID, position: q.Position}, true
+	}
+	return artifactItemState{}, false
+}
+
+// decidesOver says whether s, a finished entry's state, replaces cur: the
+// newest finished entry decides; on a tie the accepted one, which waits
+// longer.
+func (s artifactItemState) decidesOver(cur artifactItemState) bool {
+	return s.position > cur.position || (s.position == cur.position && s.State == artifactItemAccepted)
+}
+
 // artifactItemStates derives each item's state from every queue entry and
 // agent, on any host: running while an entry is active or a bound agent is
 // not closed; otherwise what its newest finished entry says, released or
@@ -1266,28 +1296,10 @@ func artifactItemStates(entries []api.TeamQueueEntry, agents []api.Agent) map[st
 			out[q.ItemID] = artifactItemState{State: artifactItemRunning, EntryID: q.ID, Detail: "queue entry " + q.ID + " is " + q.State}
 			continue
 		}
-		if cur.State == artifactItemRunning || q.State != "finished" {
+		if cur.State == artifactItemRunning {
 			continue
 		}
-		var next artifactItemState
-		switch {
-		case releasedQueueEntry(q):
-			next = artifactItemState{State: artifactItemReleased, BasisAt: q.UpdatedAt, EntryID: q.ID, position: q.Position}
-			if q.OwnerIntegration != nil && q.OwnerIntegration.At != "" {
-				next.BasisAt = q.OwnerIntegration.At
-			}
-		case q.Acceptance != nil:
-			at, err := time.Parse(time.RFC3339Nano, q.Acceptance.AcceptedAt)
-			if err != nil {
-				continue
-			}
-			next = artifactItemState{State: artifactItemAccepted, At: at, BasisAt: q.Acceptance.AcceptedAt, EntryID: q.ID, position: q.Position}
-		default:
-			continue
-		}
-		// The newest finished entry decides; on a tie the accepted one, which
-		// waits longer.
-		if !known || next.position > cur.position || (next.position == cur.position && next.State == artifactItemAccepted) {
+		if next, ok := finishedEntryState(q); ok && (!known || next.decidesOver(cur)) {
 			out[q.ItemID] = next
 		}
 	}
@@ -4194,7 +4206,8 @@ func probeVerifierHomes(p homeProbes, homes []*verifierHome) (hits, notes map[st
 // matches, and keeps everything else in the folder: the receipt, the
 // manifests, the logs and the runner's records. A folder's run belongs to an
 // item when its receipt's commit is the commit that item's verification
-// record or release job names, and no other item's. The sweep reads only the
+// record or release job names, on the entry deciding its state or an older
+// one, and no other item's. The sweep reads only the
 // queue listing, which carries those commits; the plan digest is in the full
 // verification record, which the sweep cannot read.
 
@@ -4225,28 +4238,59 @@ func matrixEvidenceName(name string) bool {
 	return false
 }
 
+// matrixCommitItem is one item naming a commit. NewerThan is the entry that
+// decides the item's state when only the item's entries newer than it name
+// the commit; such a commit proves nothing, though it still makes another
+// item's naming it ambiguous.
+type matrixCommitItem struct {
+	Item      string
+	NewerThan string
+}
+
 // matrixCommitItems maps each commit a queue entry's verification record or
-// release job names to the items naming it, sorted. Integration, owner
-// integration and integrated release commits are not an item's own
-// verification and never prove a run.
-func matrixCommitItems(entries []api.TeamQueueEntry) map[string][]string {
-	out := map[string][]string{}
-	add := func(commit, item string) {
-		if !matrixCommitPattern.MatchString(commit) || slicesContains(out[commit], item) {
+// release job names to the items naming it, sorted by item. Integration,
+// owner integration and integrated release commits are not an item's own
+// verification and never prove a run. Only the entry deciding the item's
+// state (artifactItemStates' newest finished one) and older entries prove
+// its runs; an item with no deciding entry is never released, and every
+// entry of it counts.
+func matrixCommitItems(entries []api.TeamQueueEntry) map[string][]matrixCommitItem {
+	deciding := map[string]artifactItemState{}
+	for _, q := range entries {
+		cur, known := deciding[q.ItemID]
+		if next, ok := finishedEntryState(q); ok && q.ItemID != "" && (!known || next.decidesOver(cur)) {
+			deciding[q.ItemID] = next
+		}
+	}
+	out := map[string][]matrixCommitItem{}
+	add := func(commit, item, newerThan string) {
+		if !matrixCommitPattern.MatchString(commit) {
 			return
 		}
-		out[commit] = append(out[commit], item)
-		sort.Strings(out[commit])
+		for i, named := range out[commit] {
+			if named.Item == item {
+				if newerThan == "" {
+					out[commit][i].NewerThan = ""
+				}
+				return
+			}
+		}
+		out[commit] = append(out[commit], matrixCommitItem{Item: item, NewerThan: newerThan})
+		sort.Slice(out[commit], func(i, j int) bool { return out[commit][i].Item < out[commit][j].Item })
 	}
 	for _, q := range entries {
 		if q.ItemID == "" {
 			continue
 		}
+		newerThan := ""
+		if d, ok := deciding[q.ItemID]; ok && q.ID != d.EntryID && q.Position >= d.position {
+			newerThan = d.EntryID
+		}
 		if q.Verification != nil {
-			add(q.Verification.Commit, q.ItemID)
+			add(q.Verification.Commit, q.ItemID, newerThan)
 		}
 		if q.Release != nil {
-			add(q.Release.Commit, q.ItemID)
+			add(q.Release.Commit, q.ItemID, newerThan)
 		}
 	}
 	return out
@@ -4386,15 +4430,22 @@ func proveMatrixItem(in worktreeCleanupInputs, art *artifactPass, folder string,
 	if !ok || !matrixCommitPattern.MatchString(commit) {
 		return "", matrixReceiptName + " has no 40-digit lowercase hex commit"
 	}
-	items := in.MatrixCommits[commit]
-	switch len(items) {
+	named := in.MatrixCommits[commit]
+	switch len(named) {
 	case 0:
 		return "", "receipt commit " + shortSHA(commit) + " matches no item's verification record or release"
 	case 1:
 	default:
+		items := make([]string, len(named))
+		for i, n := range named {
+			items[i] = n.Item
+		}
 		return "", "receipt commit " + shortSHA(commit) + " matches items " + strings.Join(items, " and ")
 	}
-	item := items[0]
+	item := named[0].Item
+	if named[0].NewerThan != "" {
+		return "", "receipt commit " + shortSHA(commit) + " names only " + item + " entries newer than " + named[0].NewerThan + ", which decides its state"
+	}
 	if agent, ok := jsonText(receipt["verifierAgentId"]); ok && agent != "" {
 		if bound := in.VerifierItems[agent]; bound != "" && bound != item {
 			return "", "receipt verifier " + agent + " is bound to " + bound + ", not " + item
