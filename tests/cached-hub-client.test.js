@@ -55,6 +55,18 @@ function fixture() {
   };
 }
 
+const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Views hear about changes on a coalesced zero-delay timer, and a recovery
+// read refreshes in the background, so a fixed sleep can end before either
+// lands under load. Poll for the expected state within a bound, then keep the
+// 10 ms quiet window so the exact counts still catch an extra notification.
+async function settle(ready = () => true, boundMs = 2000) {
+  const deadline = Date.now() + boundMs;
+  while (!ready() && Date.now() < deadline) await tick(1);
+  await tick(10);
+}
+
 for (const dirty of [false, true]) {
   test(`warm owner requests stay stale through bounded retries${dirty ? " after invalidation" : ""}`, async () => {
     let clock = 0;
@@ -171,29 +183,31 @@ test("ordinary success preserves optional stale status and unchanged recovery no
     },
     { now: () => clock, refreshMs: 1000 },
   );
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const label = () => view.cacheStatus().label;
   const original = { obligations: [{ id: "saved-request" }] };
   try {
     f.response(original);
     await view.listOwnerObligations("one");
-    await settle();
+    await settle(() => label() === "Saved data");
     let notifications = 0;
     view.subscribe("", () => notifications++);
     f.status(503);
     f.response({ error: "Transient optional failure" });
     await view.refreshConnection();
-    await settle();
+    await settle(() => notifications >= 1 && label() === "Saved data · stale");
     assert.equal(notifications, 1, "stale transition notifies once");
     f.status(200);
     f.response({ tasks: [{ id: "ordinary" }] });
     await view.listTasks();
     assert.equal(view.cacheStatus().label, "Saved data · stale");
-    await settle();
+    await settle(() => notifications >= 2);
     const beforeRecovery = notifications;
     clock = 1000;
     f.response(original);
     await view.listOwnerObligations("one");
-    await settle();
+    await settle(
+      () => notifications >= beforeRecovery + 1 && label() === "Saved data",
+    );
     assert.equal(view.cacheStatus().label, "Saved data");
     assert.equal(notifications, beforeRecovery + 1);
   } finally {
@@ -235,10 +249,9 @@ test("routine saved-status transitions do not notify views, but data and errors 
     ...f.live,
     subscribe: () => ({ stop() {}, cursor: 0 }),
   });
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
   try {
     await view.listTasks();
-    await settle();
+    await settle(() => view.cacheStatus().label === "Saved data");
     let notifications = 0;
     view.subscribe("", () => notifications++);
     await view.refreshConnection();
@@ -251,12 +264,12 @@ test("routine saved-status transitions do not notify views, but data and errors 
 
     f.response({ tasks: [{ id: "one", name: "Updated project" }] });
     await view.refreshConnection();
-    await settle();
+    await settle(() => notifications >= 1);
     assert.equal(notifications, 1, "changed content still notifies views");
 
     f.offline();
     await view.refreshConnection();
-    await settle();
+    await settle(() => notifications >= 2);
     assert.equal(
       notifications,
       2,
