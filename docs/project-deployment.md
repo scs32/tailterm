@@ -2086,12 +2086,13 @@ to `journalDirectory/retention.jsonl` (0600):
 directory is `DIRECTORY/NAME`, a TailOS copy is `tailos-dist-COMMIT` and an
 attempt file is `ID-integrated-verification/COMMIT-rN/NAME`. Kind `migration` has
 reason `terminal`; kind `dist` has reason `count` or `not-released`; kind
-`attempt` has reason `age`. A sweep
-with nothing to remove writes nothing. A sweep removes backup, rehearsal and
-migration files first, job by job in list order, then TailOS copies, then
-attempt files. A sweep that fails (for example the record
-cannot be written) removes nothing further, prints "Journal retention sweep
-failed; remaining backup copies kept." and the poll continues. The first poll
+`attempt` has reason `age`. A sweep with nothing to remove writes nothing. A
+sweep first removes each terminal job's rehearsal files, migration binary and
+`not-released` backup copies, job by job in list order; then released jobs'
+backup copies by `count` and then by `budget`; then TailOS copies; then attempt
+files. A sweep that fails (for example the record cannot be written) removes
+nothing further, prints "Journal retention sweep failed; remaining backup
+copies kept." and the poll continues. The first poll
 after a change to this rule is deployed removes the existing backlog under it;
 a TailOS copy whose removal was interrupted is recorded and removed again at
 the next sweep.
