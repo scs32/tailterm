@@ -118,3 +118,14 @@ Hub first (TrueNAS, verified backup), then `tt` on the Mini with a relay restart
 then TailOS if any UI changes. Exit: during the shadow week, every overdue obligation
 is surfaced by an escalation within its timer, and no incident-class stall goes
 unnoticed.
+
+## Later tick steps
+
+The same broker tick also evaluates team queue shared-path waits
+(`wi_44cabd7e6233bc1b`). It takes three steps: `wait-met` tells the waiting
+entry's lead that the path is free, `wait-overdue` reports a team still idle
+after that notice, and `wait-orphaned` asks the handler to decide on a wait
+whose predecessor can no longer meet the condition.
+[What the broker tick does](project-queue.md#what-the-broker-tick-does), under
+[Team queue shared-path waits](project-queue.md#team-queue-shared-path-waits),
+describes each one.
