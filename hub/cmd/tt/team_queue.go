@@ -1153,11 +1153,10 @@ func readMatrixWaitlist() (*matrixWaitlist, string) {
 		return nil, "matrix host: TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown"
 	}
 	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, ""
+		var refused string
+		if path, refused = matrixLockDefault(); refused != "" {
+			return nil, "matrix host: " + refused + "; waitlist not shown"
 		}
-		path = filepath.Join(home, ".local/state/tailterm-matrix/host.json")
 	}
 	unusable := func(reason string) (*matrixWaitlist, string) {
 		return nil, fmt.Sprintf("matrix host: lock file %s unusable (%s); waitlist not shown", path, reason)

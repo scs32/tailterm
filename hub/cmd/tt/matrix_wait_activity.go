@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -62,15 +64,62 @@ func parseMatrixLock(raw []byte) (*matrixLockFile, string) {
 	return lock, ""
 }
 
+// matrixLockDefault is the lock path when TAILTERM_MATRIX_HOST_LOCK is not
+// set, resolved as scripts/verify-matrix-host-lock.mjs lockPath resolves it:
+// the account home's shared file, taken from the user database, not HOME
+// (wi_ee29358d0c7791ab). A HOME that is not the account's home (an isolated
+// test or matrix check home), or an account home that cannot be read, gets no
+// path and the reason instead. Such a process would otherwise read a private,
+// usually absent file, which the sweep takes for a free host, or the shared
+// lock its own matrix run may hold; it names the lock it means with the
+// override.
+func matrixLockDefault() (path, refused string) {
+	account, err := matrixAccountHome()
+	if err == nil && !filepath.IsAbs(account) {
+		err = fmt.Errorf("%q is not an absolute path", account)
+	}
+	if err != nil {
+		return "", fmt.Sprintf("cannot read this account's home (%v); set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path", err)
+	}
+	shared := filepath.Join(account, ".local/state/tailterm-matrix/host.json")
+	if home := os.Getenv("HOME"); home != "" && !sameMatrixHome(home, account) {
+		return "", fmt.Sprintf("HOME (%s) is not this account's home (%s), so the default lock would be private; set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path (the shared one is %s)", home, account, shared)
+	}
+	return shared, ""
+}
+
+// sameMatrixHome compares two homes after resolving symbolic links, or, for
+// a path that cannot be resolved, as an absolute clean path.
+func sameMatrixHome(a, b string) bool {
+	resolve := func(path string) string {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			path = resolved
+		}
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs
+		}
+		return filepath.Clean(path)
+	}
+	return resolve(a) == resolve(b)
+}
+
 // Tests replace these, so none reads the host's live lock file or signals a
 // real process.
 var (
-	matrixWaitDefaultPath = func() string {
-		home, err := os.UserHomeDir()
+	// matrixAccountHome is this account's home from the user database:
+	// os/user does not read HOME for the current user on macOS.
+	matrixAccountHome = func() (string, error) {
+		u, err := user.Current()
 		if err != nil {
-			return ""
+			return "", err
 		}
-		return filepath.Join(home, ".local/state/tailterm-matrix/host.json")
+		return u.HomeDir, nil
+	}
+	// matrixWaitDefaultPath is matrixLockDefault's path, empty when it
+	// refuses one: the readers then take the lock as unusable.
+	matrixWaitDefaultPath = func() string {
+		path, _ := matrixLockDefault()
+		return path
 	}
 	matrixWaitHostname = os.Hostname
 	// Only "no such process" is gone; a pid we may not signal is alive.

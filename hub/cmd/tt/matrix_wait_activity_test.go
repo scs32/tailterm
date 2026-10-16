@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +20,14 @@ import (
 // explicit TAILTERM_MATRIX_HOST_LOCK (TestMain clears it) there is no file.
 func init() {
 	matrixWaitDefaultPath = func() string { return "" }
+	// readMatrixWaitlist resolves matrixLockDefault itself. Its account home
+	// here is this process's HOME, which TestMain makes private.
+	matrixAccountHome = func() (string, error) { return os.Getenv("HOME"), nil }
 }
+
+// The readers' own default path and account home, kept before init replaces
+// them.
+var nativeMatrixWaitDefaultPath, nativeMatrixAccountHome = matrixWaitDefaultPath, matrixAccountHome
 
 const matrixTestItem = "wi_0123456789abcdef"
 
@@ -584,4 +592,143 @@ func TestMatrixWaitUnknownLockReadTick(t *testing.T) {
 		t.Fatalf("report after the second run: %+v", reports[3])
 	}
 	tick("steady", 4)
+}
+
+// wi_ee29358d0c7791ab: without TAILTERM_MATRIX_HOST_LOCK every reader takes
+// the default lock from the account home, as the lock script does. Under
+// another HOME none falls back to HOME's file: the activity has an unknown
+// read, the sweep skips its run and the waitlist names the override.
+func TestMatrixLockDefaultAccountHome(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	lead := api.Agent{Name: "lead-a", WorkItem: &api.AgentWorkItemBinding{ItemID: matrixTestItem}}
+	content := matrixLockJSON("test-mini", "", matrixEntry("22", matrixTestItem, "lead-a", "2026-10-02T11:40:00.000Z"))
+	matrixLockFixture(t, 22)
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "")
+	oldDefault, oldAccount, oldLocal := matrixWaitDefaultPath, matrixAccountHome, matrixLocalHost
+	t.Cleanup(func() { matrixWaitDefaultPath, matrixAccountHome, matrixLocalHost = oldDefault, oldAccount, oldLocal })
+	matrixWaitDefaultPath = nativeMatrixWaitDefaultPath
+	matrixLocalHost = func() (string, error) { return "Test-Mini.local", nil }
+
+	root := t.TempDir()
+	account, private := filepath.Join(root, "account"), filepath.Join(root, "private")
+	matrixAccountHome = func() (string, error) { return account, nil }
+	lockIn := func(dir string) string { return filepath.Join(dir, ".local/state/tailterm-matrix/host.json") }
+	write := func(path string) {
+		t.Helper()
+		if os.MkdirAll(filepath.Dir(path), 0o700) != nil || os.WriteFile(path, []byte(content), 0o600) != nil {
+			t.Fatal("write lock file")
+		}
+	}
+	// The same live waiter in both homes, so a reader of HOME's file shows it.
+	write(lockIn(account))
+	write(lockIn(private))
+	// reads is what each reader made of the lock at path: a confirmed wait,
+	// a waitlist with one waiter, and the sweep's file. The fixture lacks the
+	// sweep's sequence fields, so the sweep refuses the file it read.
+	reads := func(what, path string) {
+		t.Helper()
+		if w := matrixWaitFor(lead, now); w == nil || w.Role != api.MatrixWaitWaiting || w.Item != matrixTestItem {
+			t.Fatalf("%s: matrix wait %+v", what, w)
+		}
+		if list, line := readMatrixWaitlist(); list == nil || line != "" || len(list.Waiters) != 1 {
+			t.Fatalf("%s: waitlist %+v %q", what, list, line)
+		}
+		if m, why := loadMatrixExclusion(); m != nil || why != "invalid requestSeq" {
+			t.Fatalf("%s: sweep %+v %q", what, m, why)
+		}
+		if os.Rename(path, path+".moved") != nil {
+			t.Fatal("move lock file")
+		}
+		defer os.Rename(path+".moved", path)
+		if m, why := loadMatrixExclusion(); m == nil || why != "" || m.file != path {
+			t.Fatalf("%s: sweep with the file absent %+v %q, want a free host at %s", what, m, why, path)
+		}
+	}
+	// refuses is every reader failing closed for the reason given.
+	refuses := func(what, reason string) {
+		t.Helper()
+		path, refused := matrixLockDefault()
+		if path != "" || !strings.Contains(refused, reason) || !strings.Contains(refused, "set TAILTERM_MATRIX_HOST_LOCK to an absolute lock path") {
+			t.Fatalf("%s: default %q %q, want a refusal naming %q and the override", what, path, refused, reason)
+		}
+		if got := matrixWaitDefaultPath(); got != "" {
+			t.Fatalf("%s: matrixWaitDefaultPath %q", what, got)
+		}
+		if w := matrixWaitFor(lead, now); w != nil {
+			t.Fatalf("%s: matrix wait %+v", what, w)
+		}
+		if list, line := readMatrixWaitlist(); list != nil || line != "matrix host: "+refused+"; waitlist not shown" {
+			t.Fatalf("%s: waitlist %+v %q", what, list, line)
+		}
+		// Never a free host, with HOME's file present or absent.
+		if m, why := loadMatrixExclusion(); m != nil || why == "" {
+			t.Fatalf("%s: sweep %+v %q", what, m, why)
+		}
+		if os.Rename(lockIn(private), lockIn(private)+".moved") != nil {
+			t.Fatal("move lock file")
+		}
+		defer os.Rename(lockIn(private)+".moved", lockIn(private))
+		if m, why := loadMatrixExclusion(); m != nil || why == "" {
+			t.Fatalf("%s: sweep with HOME's file absent %+v %q", what, m, why)
+		}
+	}
+
+	// Another HOME, with no override: no reader uses its file.
+	t.Setenv("HOME", private)
+	refuses("isolated HOME", "HOME ("+private+") is not this account's home ("+account+")")
+
+	// HOME is the account home, the same directory through a link, or unset:
+	// the account's shared file.
+	t.Setenv("HOME", account)
+	if path, refused := matrixLockDefault(); path != lockIn(account) || refused != "" {
+		t.Fatalf("account HOME: %q %q", path, refused)
+	}
+	reads("account HOME", lockIn(account))
+	link := filepath.Join(root, "link")
+	if os.Symlink(account, link) != nil {
+		t.Fatal("symlink")
+	}
+	t.Setenv("HOME", link)
+	reads("linked HOME", lockIn(account))
+	os.Unsetenv("HOME")
+	reads("no HOME", lockIn(account))
+
+	// An account home that cannot be read, or is not absolute, gives no path
+	// either, even with HOME unset.
+	for name, home := range map[string]func() (string, error){
+		"unreadable account home": func() (string, error) { return "", errors.New("no such user") },
+		"relative account home":   func() (string, error) { return "account", nil },
+		"empty account home":      func() (string, error) { return "", nil },
+	} {
+		matrixAccountHome = home
+		t.Setenv("HOME", account)
+		refuses(name, "cannot read this account's home")
+		os.Unsetenv("HOME")
+		refuses(name+" without HOME", "cannot read this account's home")
+	}
+	matrixAccountHome = func() (string, error) { return account, nil }
+
+	// An absolute override still wins under another HOME, and a relative one
+	// is refused as before, not replaced by a default.
+	t.Setenv("HOME", private)
+	override := filepath.Join(root, "override", "host.json")
+	write(override)
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", override)
+	reads("override under isolated HOME", override)
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "host.json")
+	t.Chdir(filepath.Dir(override))
+	if w := matrixWaitFor(lead, now); w != nil {
+		t.Fatalf("relative override: matrix wait %+v", w)
+	}
+	if list, line := readMatrixWaitlist(); list != nil || line != "matrix host: TAILTERM_MATRIX_HOST_LOCK must be an absolute path; waitlist not shown" {
+		t.Fatalf("relative override: waitlist %+v %q", list, line)
+	}
+	if m, why := loadMatrixExclusion(); m != nil || why != "the lock path is not absolute" {
+		t.Fatalf("relative override: sweep %+v %q", m, why)
+	}
+
+	// The native account home comes from the user database, not HOME.
+	if home, err := nativeMatrixAccountHome(); err != nil || !filepath.IsAbs(home) || sameMatrixHome(home, private) {
+		t.Fatalf("native account home %q %v under HOME %s", home, err, private)
+	}
 }
