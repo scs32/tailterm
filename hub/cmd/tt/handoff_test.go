@@ -5798,6 +5798,36 @@ func (r *handoffLiveRun) dirty() bool {
 	return !strings.HasSuffix(answer, "CLEAN")
 }
 
+// settle polls until ok or the limit, and reports which, without failing:
+// it is for a read that only needs the pane to catch up.
+func (r *handoffLiveRun) settle(limit time.Duration, ok func() bool) bool {
+	for start := time.Now(); time.Since(start) < limit; time.Sleep(100 * time.Millisecond) {
+		if ok() {
+			return true
+		}
+	}
+	return ok()
+}
+
+// compacted reports that the pane shows the result of the latest /compact:
+// the next line after the command starts with ⎿, where a compaction still
+// in progress shows its spinner.
+func (r *handoffLiveRun) compacted() bool {
+	lines := strings.Split(r.screen(), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if rest, found := strings.CutPrefix(strings.TrimSpace(lines[i]), "❯"); !found || strings.TrimSpace(rest) != "/compact" {
+			continue
+		}
+		for _, next := range lines[i+1:] {
+			if next = strings.TrimSpace(next); next != "" {
+				return strings.HasPrefix(next, "⎿")
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // hookLines is what the pane shows of failed hooks: the text after each
 // "failed:", with the pane's line wrapping and spacing removed.
 func (r *handoffLiveRun) hookLines() []string {
@@ -6014,6 +6044,18 @@ func TestHandoffLivePrivateSession(t *testing.T) {
 		// is recorded, not judged: tt hook handoff never exits non-zero.
 		shown := "the session was over, so there was no turn to show it in"
 		if a.event != "SessionEnd" {
+			// The capture waited for is written by the compaction's SessionStart
+			// hook, and Claude Code draws the /compact result about 100 ms after
+			// that hook ends, so the pane is read only once the result is on it;
+			// with no /compact, once the prompt is idle. On timeout it is read
+			// anyway and judged as before.
+			drawn, what := r.ready, "an idle prompt"
+			if a.event == "PreCompact" {
+				drawn, what = r.compacted, "the /compact result"
+			}
+			if !r.settle(30*time.Second, drawn) {
+				t.Logf("%s: the pane did not show %s within 30s; it is read anyway", a.name, what)
+			}
 			lines, dirty := r.hookLines(), r.dirty()
 			shown = fmt.Sprintf("the pane shows of the entry: %q; asked, the model reported a hook error: %v", lines, dirty)
 			if a.mode == handoffLiveHang {
