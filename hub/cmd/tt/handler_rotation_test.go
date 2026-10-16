@@ -50,6 +50,11 @@ type rotationCLI struct {
 	// agentPolls counts single-agent reads, which a resume's online wait makes.
 	agentPolls atomic.Int32
 	actions    atomic.Int32
+	// posts counts message posts and taskReads task detail reads; failPosts
+	// refuses that many message posts with a 503 before any reaches the hub.
+	posts     atomic.Int32
+	taskReads atomic.Int32
+	failPosts atomic.Int32
 	// auth is the owner's authorization passed to rotate; zero for an ordinary rotation.
 	auth rotationAuthorization
 }
@@ -79,6 +84,16 @@ func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
 		}
 		if r.Method == "GET" && strings.Contains(r.URL.Path, "/agents/") {
 			f.agentPolls.Add(1)
+		}
+		if id, ok := strings.CutPrefix(r.URL.Path, "/v1/tasks/"); ok && r.Method == "GET" && !strings.Contains(id, "/") {
+			f.taskReads.Add(1)
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/messages") {
+			f.posts.Add(1)
+			if n := f.failPosts.Load(); n > 0 && f.failPosts.CompareAndSwap(n, n-1) {
+				http.Error(w, "fixture hub is unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		handler.ServeHTTP(w, r)
 	}))
@@ -2568,6 +2583,82 @@ func TestHandlerRotationRunnerStuckNoticeAfterRestartWithChangedRecipients(t *te
 		if to := f.noticesTo(t); len(after) != 2 || to[f.helper.ID] != 1 || to[f.old.ID] != 1 || after[0].Seq != before[0].Seq || after[1].Seq != before[1].Seq {
 			t.Fatalf("notices after the phase changed: %v", to)
 		}
+	})
+}
+
+// wi_538193c74bc46bd3: the runner remembered a stuck notice per rotation, so
+// an owner helper who registered after the Board copy was told only when the
+// relay restarted. It now remembers each recipient: the same runner tells a
+// late helper at its next tick, once, and posts nothing on ticks that find no
+// one new.
+func TestHandlerRotationRunnerStuckNoticeReachesLateRecipientsWithoutRestart(t *testing.T) {
+	// quiet runs ticks with unchanged recipients: no post, at most one task read each.
+	quiet := func(t *testing.T, f *stuckRotation, r *rotationRunner) {
+		t.Helper()
+		posts, reads := f.posts.Load(), f.taskReads.Load()
+		for i := 0; i < 4; i++ {
+			if err := f.try(r); err != nil {
+				t.Fatalf("quiet tick %d: %v", i+1, err)
+			}
+		}
+		if n := f.posts.Load() - posts; n != 0 {
+			t.Fatalf("quiet ticks posted %d messages", n)
+		}
+		if n := f.taskReads.Load() - reads; n > 4 {
+			t.Fatalf("quiet ticks read the task %d times in 4 ticks", n)
+		}
+	}
+	t.Run("an owner helper registers after the Board copy", func(t *testing.T) {
+		f := newStuckRotationWithoutHelper(t)
+		r := f.runner()
+		f.toCeiling(t, r)
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.old.ID: 1}) {
+			t.Fatalf("notices with no owner helper: %v", to)
+		}
+		quiet(t, f, r)
+		f.registerHelper(t)
+		// The helper's post fails once and is tried again on the next tick.
+		f.failPosts.Store(1)
+		posts := f.posts.Load()
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "handler rotation notice") {
+			t.Fatalf("tick with a failed post: %v", err)
+		}
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick after the helper registered: %v", err)
+		}
+		if n := f.posts.Load() - posts; n != 2 {
+			t.Fatalf("posts after the helper registered: %d, want the failed one and its retry", n)
+		}
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.old.ID: 1, f.helper.ID: 1}) {
+			t.Fatalf("notices after the helper registered: %v", to)
+		}
+		quiet(t, f, r)
+		f.restarts(t, 2)
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.old.ID: 1, f.helper.ID: 1}) {
+			t.Fatalf("notices after restarts: %v", to)
+		}
+		f.assertHeld(t)
+	})
+	t.Run("the owner helper leaves", func(t *testing.T) {
+		f := newStuckRotation(t)
+		r := f.runner()
+		f.toCeiling(t, r)
+		quiet(t, f, r)
+		if _, err := f.c.CloseAgent(context.Background(), f.task.ID, f.helper.ID, f.helper.RunID); err != nil {
+			t.Fatal(err)
+		}
+		posts := f.posts.Load()
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick after the helper left: %v", err)
+		}
+		if n := f.posts.Load() - posts; n != 1 {
+			t.Fatalf("posts after the helper left: %d, want the Board copy", n)
+		}
+		quiet(t, f, r)
+		if to := f.noticesTo(t); !reflect.DeepEqual(to, map[string]int{"": 1, f.helper.ID: 1, f.old.ID: 1}) {
+			t.Fatalf("notices after the helper left: %v", to)
+		}
+		f.assertHeld(t)
 	})
 }
 

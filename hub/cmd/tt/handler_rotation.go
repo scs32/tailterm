@@ -1467,14 +1467,13 @@ func (r *rotationRunner) notifyMissingSpec(ctx context.Context, c *api.Client, h
 
 // notifyStuckRotation tells the project's owner helper and the handler being
 // replaced, once each per rotation, that the runner stopped resuming it. Each
-// request identity names the rotation and its recipient, so a restarted relay
-// posts no second copy to anyone and tells a recipient who was not there
-// before. A failed post is tried again on a later tick.
+// request identity names the rotation and its recipient, and the runner
+// remembers each identity it has settled, so every tick reads the roster but
+// posts only to a recipient who was not there before, such as an owner helper
+// that registered after the Board copy. A restarted relay posts no second copy
+// to anyone. A failed post is tried again on a later tick.
 func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client, host string, d api.HandlerRotationDue, j *handlerRotationJournal) error {
 	key := "handler-rotation-stuck-" + strings.TrimPrefix(j.PrepareRequestID, "rotation-prepare-")
-	if r.notified[key] {
-		return nil
-	}
 	detail, err := c.GetTask(ctx, d.TaskID)
 	if err != nil {
 		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
@@ -1496,12 +1495,15 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s",
 		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), stuckRotationRecovery(j.Phase, d.TaskID))
 	for _, to := range recipients {
-		env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: rotationStuckSubject,
-			Refs: map[string]string{"host": host, "project": d.TaskID, "successor": j.SuccessorAgentID}, Body: api.EnvelopeBody{Text: text}}
 		requestID := key + "-board"
 		if to.ID != "" {
 			requestID = key + "-" + strings.TrimPrefix(to.ID, "agt_")
 		}
+		if r.notified[requestID] {
+			continue
+		}
+		env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: rotationStuckSubject,
+			Refs: map[string]string{"host": host, "project": d.TaskID, "successor": j.SuccessorAgentID}, Body: api.EnvelopeBody{Text: text}}
 		_, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: requestID})
 		// The identity is this rotation's notice to this recipient, so a
 		// conflict means an earlier run already sent it with other words (the
@@ -1510,8 +1512,8 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 		if err != nil && !requestIdentityConflict(err) {
 			return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
 		}
+		r.notified[requestID] = true
 	}
-	r.notified[key] = true
 	return nil
 }
 

@@ -589,15 +589,18 @@ After 3 failed resumes of one rotation the runner stops resuming it:
   handler, the successor, the host, the number of failed resumes and the last
   error, with the recovery advice for the rotation's state (below).
 - Each notice's request identity names the rotation and its recipient: the
-  owner helper's agent, the handler's agent, or the Board. A restarted relay
-  therefore posts no second copy to anyone. If the recipients changed while
-  it was down, it tells the ones not told before: an owner helper that
-  registered after the Board copy gets its own notice, and when the helper
-  has left, one copy goes to the Board. If the notice would now read
-  differently for a recipient already told (the rotation moved to another
-  state, or the project was renamed), the hub refuses the reused identity
-  and the runner treats that recipient as told; it does not retry. Any other
-  failed post is tried again on a later tick.
+  owner helper's agent, the handler's agent, or the Board. While the
+  rotation stays stuck, every tick reads the project's agents and tells only
+  recipients not told before, with no restart needed: an owner helper that
+  registers after the Board copy gets its own notice at the next tick, once,
+  and when the helper has left, one copy goes to the Board. A tick that finds
+  no new recipient posts nothing. A restarted relay posts no second copy to
+  anyone, and tells the recipients that changed while it was down in the
+  same way. If the notice would now read differently for a recipient
+  already told (the rotation moved to another state, or the project was
+  renamed), the hub refuses the reused identity and the runner treats that
+  recipient as told; it does not retry. Any other failed post is tried again
+  on a later tick.
 
 The run that prepares the rotation is not a resume, so the successor gets
 four chances in all. A busy refusal and a dead primary refusal are waits and
