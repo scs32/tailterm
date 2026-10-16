@@ -16,6 +16,7 @@ import {
   renameSync,
   rmSync,
   realpathSync,
+  statSync,
 } from "node:fs";
 import { join, dirname, isAbsolute, resolve, basename } from "node:path";
 import { hostname, loadavg, availableParallelism, userInfo } from "node:os";
@@ -359,8 +360,12 @@ export function readJournal(file = lockPath()) {
 // link with EPERM or ENOTSUP; there the name is created with O_EXCL instead,
 // which is as exclusive. Until its record is written it reads as an owner we
 // cannot identify, so others see it busy and never reclaim it; a create whose
-// write fails is removed, and one left by a crash in between stays for the
-// operator, like any unidentifiable owner (wi_b42cbccf0bd90795).
+// write fails is removed (wi_b42cbccf0bd90795). A reclaim guard left with no
+// readable owner by a crash in between is refused loudly once it is older than
+// GUARD_UNREADABLE_STALE_MS, and never removed automatically: two reclaimers
+// that both judged it stale could each replace it and both win
+// (wi_6be7e47bd2358699, x7).
+export const GUARD_UNREADABLE_STALE_MS = 60000;
 const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP"]);
 function linkOwner(target, owner) {
   const record = JSON.stringify(owner) + "\n";
@@ -417,12 +422,30 @@ function unlinkOwned(target, token) {
 // Removes a mutex whose owner pid is gone. Only the guard holder removes it,
 // and only after re-reading the same token under the guard, so two reclaimers
 // cannot both win and a mutex taken meanwhile is never removed. A guard whose
-// own owner is gone is left for the operator (fail closed).
+// own owner is gone, or that has had no readable owner for longer than an
+// O_EXCL create takes to write one, is left for the operator (fail closed).
 function reclaimMutex(paths, dead, entry) {
   const token = randomUUID();
   if (!linkOwner(paths.guard, { pid: process.pid, token, at: new Date().toISOString() })) {
     const holder = readOwner(paths.guard);
-    if (holder && holder.pid !== null && pidGone(holder.pid)) {
+    if (holder && holder.pid === null) {
+      let ageMs;
+      try {
+        ageMs = Date.now() - statSync(paths.guard).mtimeMs;
+      } catch (error) {
+        if (error.code === "ENOENT") return;
+        throw error;
+      }
+      if (ageMs <= GUARD_UNREADABLE_STALE_MS) return;
+      journal(paths, "guard-stale", entry, { file: paths.guard, guardPid: null, reason: "unreadable-owner", ageMs: Math.round(ageMs) });
+      throw new HostLockError(
+        "guard-stale",
+        `Host lock reclaim guard ${paths.guard} has no readable owner and is ${Math.round(ageMs / 1000)} s old; ` +
+          "confirm no run is alive, then remove that file",
+        EXIT_LOCK_UNUSABLE,
+      );
+    }
+    if (holder && pidGone(holder.pid)) {
       journal(paths, "guard-stale", entry, { file: paths.guard, guardPid: holder.pid });
       throw new HostLockError(
         "guard-stale",
