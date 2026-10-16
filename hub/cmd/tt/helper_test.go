@@ -1056,6 +1056,95 @@ func TestHelperRegisterIgnoresUnrelatedSessionName(t *testing.T) {
 	}
 }
 
+// Owner helper tags with an empty hub or project still fail closed, and the
+// refusal and the --take-session warning say which one the tags do not name.
+func TestHelperRegisterUnnamedOtherProject(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	other := api.NewID("tsk")
+	registerTagged := func(tags map[string]string, args ...string) (string, error) {
+		t.Helper()
+		for _, name := range []string{spawn.EnvHub, spawn.EnvTask, spawn.EnvAgent, "TAILTERM_RUN", "TAILTERM_ROLE"} {
+			f.tmux(t, "set-environment", "-u", "-t", "owner", name)
+		}
+		for name, value := range tags {
+			f.tmux(t, "set-environment", "-t", "owner", name, value)
+		}
+		old := os.Stderr
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stderr = w
+		_, runErr := captureCLIOutput(t, func() error {
+			return cmdHelper(f.owner, append([]string{"register", "--task", f.task.ID}, args...))
+		})
+		_ = w.Close()
+		os.Stderr = old
+		warning, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(warning), runErr
+	}
+	helpers := func() int {
+		t.Helper()
+		agents, err := f.c.ListAgents(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, agent := range agents {
+			if agent.Role == api.AgentRoleOwnerHelper && agent.Status != api.AgentClosed && agent.Status != api.AgentExited {
+				n++
+			}
+		}
+		return n
+	}
+	role := api.AgentRoleOwnerHelper
+	for _, tc := range []struct {
+		what string
+		tags map[string]string
+		want []string
+		bare string
+	}{
+		{"empty hub", map[string]string{"TAILTERM_ROLE": role, spawn.EnvTask: other}, []string{"project " + other + " on a hub its tags do not name"}, " on ;"},
+		{"empty project", map[string]string{"TAILTERM_ROLE": role, spawn.EnvHub: f.owner.hub}, []string{"of a project its tags do not name;"}, "project ;"},
+		{"empty hub and project", map[string]string{"TAILTERM_ROLE": role}, []string{"of a project its tags do not name on a hub its tags do not name;"}, " on ;"},
+	} {
+		before := helpers()
+		_, err := registerTagged(tc.tags)
+		if err == nil || !strings.Contains(err.Error(), "one project per tmux session") || !strings.Contains(err.Error(), "--take-session") {
+			t.Fatalf("%s: register was not refused: %v", tc.what, err)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("%s: refusal %q does not contain %q", tc.what, err, want)
+			}
+		}
+		if strings.Contains(err.Error(), tc.bare) {
+			t.Fatalf("%s: refusal %q contains %q", tc.what, err, tc.bare)
+		}
+		if after := helpers(); after != before {
+			t.Fatalf("%s: refused registration reached the hub: %d -> %d helpers", tc.what, before, after)
+		}
+
+		warning, err := registerTagged(tc.tags, "--take-session")
+		if err != nil || !strings.Contains(warning, "wake-ups stop") {
+			t.Fatalf("%s: take-session: %v %q", tc.what, err, warning)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(warning, want) {
+				t.Fatalf("%s: warning %q does not contain %q", tc.what, warning, want)
+			}
+		}
+		if strings.Contains(warning, tc.bare) {
+			t.Fatalf("%s: warning %q contains %q", tc.what, warning, tc.bare)
+		}
+		if tags := f.tags(t, "owner"); tags[spawn.EnvHub] != f.owner.hub || tags[spawn.EnvTask] != f.task.ID {
+			t.Fatalf("%s: tags after take-session: %v", tc.what, tags)
+		}
+	}
+}
+
 // A genuine Codex thread supplies no Claude identity.
 func TestHelperCodexRegister(t *testing.T) {
 	f := newHelperFixture(t)

@@ -630,8 +630,14 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 			return api.OwnerActionResult{}, err
 		}
 		if live {
+			// An empty tag still fails closed; the message says it is unnamed.
 			where := "project " + other.Task
-			if other.Hub != e.hub {
+			if other.Task == "" {
+				where = "a project its tags do not name"
+			}
+			if other.Hub == "" {
+				where += " on a hub its tags do not name"
+			} else if other.Hub != e.hub {
 				where += " on " + other.Hub
 			}
 			if !*takeSession {
