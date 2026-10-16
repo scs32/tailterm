@@ -1257,11 +1257,13 @@ func (p handoffProcess) codexCommand() bool {
 }
 
 // handoffCodexCommands are Codex's commands and their aliases (codex-cli
-// 0.160.0), except resume and fork, which start an interactive session.
+// 0.160.0), except resume and fork, which start an interactive session. It
+// includes the hidden commands responses-api-proxy, stdio-to-uds and
+// execpolicy, which codex --help does not list.
 var handoffCodexCommands = map[string]bool{"agents": true, "exec": true, "e": true, "review": true, "login": true, "logout": true, "mcp": true,
 	"plugin": true, "app-server": true, "remote-control": true, "app": true, "completion": true, "update": true, "doctor": true, "sandbox": true,
 	"debug": true, "apply": true, "a": true, "queue": true, "archive": true, "delete": true, "migrate-rollouts": true, "unarchive": true,
-	"cloud": true, "exec-server": true, "features": true, "help": true}
+	"cloud": true, "exec-server": true, "features": true, "help": true, "responses-api-proxy": true, "stdio-to-uds": true, "execpolicy": true}
 
 // handoffCodexValues are Codex's options that take their value as the next
 // argument (codex-cli 0.160.0).
