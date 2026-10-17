@@ -387,7 +387,7 @@ and closeout also logs new outcomes to the relay's stderr as
 **Sweep.** For worktrees closeout does not reach:
 
 ```sh
-tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL]
+tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 0] [--artifacts DIR] [--cwd DIR] [--hub URL]
 tt team queue sweep-worktrees --journal [--limit 20] [--json]
 ```
 
@@ -400,8 +400,9 @@ tt team queue sweep-worktrees --journal [--limit 20] [--json]
 - `--json` prints the result as JSON instead of lines.
 - `--min-idle` (default 24h) keeps worktrees whose Git state changed more
   recently, and session temp folders changed more recently.
-- `--accepted-after` (default 24h) removes an accepted, unreleased item's
-  verifier checkouts once its acceptance is this old.
+- `--accepted-after` (default 0, no wait) removes an accepted, unreleased
+  item's verifier checkouts once its acceptance is this old: by default as
+  soon as it is accepted. A duration sets a wait instead.
 - `--artifacts` names the artifacts root, an absolute path that defaults to
   `TAILTERM_ARTIFACTS`, else `<main checkout>-artifacts`. `tt spawn` exports
   the same root to every agent session as `TAILTERM_ARTIFACTS`, so an agent in
@@ -471,8 +472,11 @@ A missing file means the defaults. A file that exists but cannot be read, is
 over 64 KiB or is not a JSON object, or a `worktreeSweep` value other than
 `"on"` or `"off"`, skips the run: the switch could not be read. A bad
 interval, min-idle or threshold uses its default and says so once on the
-relay's stderr. The accepted-after wait is closeout's
-(`TAILTERM_ARTIFACT_ACCEPTED_AFTER`, default 24 hours).
+relay's stderr. The accepted-after wait is closeout's:
+`TAILTERM_ARTIFACT_ACCEPTED_AFTER` (a Go duration such as `12h`) sets it for
+closeout and the scheduled sweep, and its default is no wait, so closeout
+removes a closed, cleaned team's clean verifier checkouts as soon as the entry
+is accepted.
 
 A run is due one interval after the last swept run. A skipped or failed
 attempt is tried again 5 minutes later. The whole run is skipped, with the
