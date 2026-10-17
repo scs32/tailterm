@@ -913,6 +913,51 @@ try {
     1,
     "Selecting a server checks its sessions once",
   );
+  // A redraw keeps an open tooltip's description on the same card node, and
+  // hiding the tooltip still removes it.
+  const production = page
+    .locator("[data-launch-server]")
+    .filter({ hasText: "Production" });
+  const describedBy = () =>
+    production.evaluate((el) => ({
+      same: el.tooltipProbe === true,
+      ids: el.getAttribute("aria-describedby"),
+      open: document
+        .querySelector("#workspace-tooltip")
+        .matches(":popover-open"),
+    }));
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.locator("#launcher-note").hover();
+  await production.hover();
+  await page.locator("#workspace-tooltip:popover-open").waitFor();
+  await production.evaluate((el) => (el.tooltipProbe = true));
+  assert.deepEqual(await describedBy(), {
+    same: true,
+    ids: "workspace-tooltip",
+    open: true,
+  });
+  assert.match(
+    await page.evaluate(() => {
+      document.querySelector("#launcher-refresh").click();
+      return document.querySelector("#launcher-note").textContent;
+    }),
+    /^Checking/,
+  );
+  await launcherSettled(page);
+  assert.deepEqual(
+    await describedBy(),
+    { same: true, ids: "workspace-tooltip", open: true },
+    "A launcher redraw keeps the open tooltip's aria-describedby",
+  );
+  await page.locator("#launcher-note").hover();
+  await page.locator("#workspace-tooltip:popover-open").waitFor({
+    state: "detached",
+  });
+  assert.deepEqual(await describedBy(), {
+    same: true,
+    ids: null,
+    open: false,
+  });
   await clickAcrossLauncherRedraw(
     page,
     page

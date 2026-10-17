@@ -1652,6 +1652,24 @@ function syncChildren(el, next) {
         if (!node.hasAttribute("aria-label") && have.hasAttribute("aria-label"))
           node.setAttribute("aria-label", have.getAttribute("aria-label"));
       }
+      // An open tooltip links itself through aria-describedby; keep that link
+      // beside the new markup's own value until the tooltip hides.
+      const tips = (have.getAttribute("aria-describedby") || "")
+        .split(/\s+/)
+        .filter(
+          (id) =>
+            id &&
+            document.getElementById(id)?.getAttribute("role") === "tooltip",
+        );
+      if (tips.length) {
+        const ids = (node.getAttribute("aria-describedby") || "")
+          .split(/\s+/)
+          .filter(Boolean);
+        node.setAttribute(
+          "aria-describedby",
+          [...new Set([...ids, ...tips])].join(" "),
+        );
+      }
       for (const { name } of [...have.attributes])
         if (!node.hasAttribute(name)) have.removeAttribute(name);
       for (const { name, value } of node.attributes)
