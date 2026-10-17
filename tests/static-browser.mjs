@@ -408,6 +408,42 @@ const wait = async (fn) => {
   }
   throw new Error("Condition timed out.");
 };
+const launcherSettled = (page) =>
+  page.waitForFunction(
+    () =>
+      !document
+        .querySelector("#launcher-note")
+        .textContent.startsWith("Checking"),
+  );
+// Press a launcher control, redraw the launcher through its own session check
+// (as a check that finishes mid-click does), then release over the same spot.
+async function clickAcrossLauncherRedraw(page, control) {
+  await launcherSettled(page);
+  const box = await control.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  assert.match(
+    await page.evaluate(() => {
+      document.querySelector("#launcher-refresh").click();
+      return document.querySelector("#launcher-note").textContent;
+    }),
+    /^Checking/,
+    "The launcher redraws between mouse down and mouse up",
+  );
+  await launcherSettled(page);
+  const checks = discoveries;
+  await page.mouse.up();
+  return checks;
+}
+const launcherCards = (page) =>
+  page.evaluate(() =>
+    [...document.querySelectorAll("[data-launch-server]")].map((n) => ({
+      name: n.querySelector("strong").textContent,
+      chosen: n.classList.contains("chosen"),
+      pressed: n.getAttribute("aria-pressed"),
+      open: n.querySelector(".live-pill")?.textContent ?? "",
+    })),
+  );
 try {
   agentSizeFixture = setupAgentWindowFixture();
   browser = await selectedBrowser.launch({
@@ -733,8 +769,26 @@ try {
   );
   const autoName = [...sessions].find((s) => s.startsWith("tt-"));
   assert.match(autoName, /^tt-[a-f0-9]{16}$/);
+  // A redraw updates the open count on the same card node.
+  const productionCount = () =>
+    page.evaluate(() => {
+      const card = [...document.querySelectorAll("[data-launch-server]")].find(
+        (n) => n.querySelector("strong").textContent === "Production",
+      );
+      const same = card.launcherProbe === true;
+      card.launcherProbe = true;
+      return {
+        same,
+        open: card.querySelector(".live-pill")?.textContent ?? "",
+      };
+    });
+  const openBefore = Number.parseInt((await productionCount()).open);
   await page.locator(".tab.active [data-close]").click();
   await page.locator("#new-tab").click();
+  assert.deepEqual(await productionCount(), {
+    same: true,
+    open: openBefore > 1 ? `${openBefore - 1} open` : "",
+  });
   await page.locator("[data-resume]").filter({ hasText: autoName }).click();
   await page.waitForFunction(() =>
     document
@@ -742,6 +796,10 @@ try {
       .textContent.includes("Connected"),
   );
   await page.locator("#new-tab").click();
+  assert.deepEqual(await productionCount(), {
+    same: true,
+    open: `${openBefore} open`,
+  });
   await page.locator("#launcher-name").fill("named-static");
   await page.locator("#start-session").click();
   await wait(() => sessions.has("named-static"));
@@ -791,9 +849,12 @@ try {
   await page.keyboard.type("after-rename-probe");
   await wait(() => input.includes("after-rename-probe"));
   await page.locator("#new-tab").click();
-  await page
-    .getByRole("button", { name: "Rename session renamed-static", exact: true })
-    .click();
+  const renameButton = page.getByRole("button", {
+    name: "Rename session renamed-static",
+    exact: true,
+  });
+  await renameButton.evaluate((el) => (el.launcherProbe = true));
+  await renameButton.click();
   await page.locator("#rename-session-name").fill("renamed-static-launcher");
   await page.locator("#rename-session-submit").click();
   await page.locator("#dialog").waitFor({ state: "hidden" });
@@ -801,6 +862,68 @@ try {
     .locator("[data-resume]")
     .filter({ hasText: "renamed-static-launcher" })
     .waitFor();
+  // A row whose session changed is a new node, so a click never moves to it.
+  assert.equal(
+    await page.evaluate(() =>
+      [...document.querySelectorAll("[data-rename-session]")].some(
+        (el) => el.launcherProbe,
+      ),
+    ),
+    false,
+  );
+  // Launcher clicks split by a redraw still act: Rename, a server card, Resume.
+  await clickAcrossLauncherRedraw(
+    page,
+    page.getByRole("button", {
+      name: "Rename session renamed-static-launcher",
+      exact: true,
+    }),
+  );
+  assert.equal(
+    await page.locator("#rename-session-name").inputValue(),
+    "renamed-static-launcher",
+  );
+  await page.locator("#rename-session-cancel").click();
+  await page.locator("#dialog").waitFor({ state: "hidden" });
+  const productionOpen = (await launcherCards(page)).find(
+    (c) => c.name === "Production",
+  ).open;
+  assert.match(productionOpen, /^[1-9]\d* open$/);
+  await launcherSettled(page);
+  await page
+    .locator("[data-launch-server]")
+    .filter({ hasText: "Development" })
+    .click();
+  const checksBefore = await clickAcrossLauncherRedraw(
+    page,
+    page.locator("[data-launch-server]").filter({ hasText: "Production" }),
+  );
+  await launcherSettled(page);
+  const cards = await launcherCards(page);
+  assert.deepEqual(
+    cards.filter((c) => c.chosen || c.pressed === "true").map((c) => c.name),
+    ["Production"],
+    `Production is chosen after a click split by a redraw: ${JSON.stringify(cards)}`,
+  );
+  assert.ok(cards.every((c) => c.pressed === String(c.chosen)));
+  assert.equal(cards.find((c) => c.name === "Production").open, productionOpen);
+  assert.ok(cards.filter((c) => c.name !== "Production").every((c) => !c.open));
+  assert.equal(
+    discoveries - checksBefore,
+    1,
+    "Selecting a server checks its sessions once",
+  );
+  await clickAcrossLauncherRedraw(
+    page,
+    page
+      .locator("[data-resume]")
+      .filter({ hasText: "renamed-static-launcher" }),
+  );
+  await page.waitForFunction(
+    (id) =>
+      document.querySelector(".tab.active [data-tab]")?.dataset.tab === id,
+    renamedTabId,
+  );
   await page.locator(`[data-tab="${renamedTabId}"]`).click();
   assert.match(
     await page

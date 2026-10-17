@@ -1619,6 +1619,48 @@ function renameSession(server, name, target) {
     },
   });
 }
+// Rewrites a container's children from HTML but keeps every node whose tag
+// and data-key still match, so a click whose mouse down and mouse up straddle
+// a redraw still lands on the button it started on, and never on another one.
+function patchChildren(container, html) {
+  const next = document.createElement("template");
+  next.innerHTML = html;
+  syncChildren(container, next.content);
+}
+function syncChildren(el, next) {
+  const wanted = [...next.childNodes];
+  wanted.forEach((node, i) => {
+    const have = el.childNodes[i];
+    if (!have) el.append(node);
+    else if (
+      have.nodeName !== node.nodeName ||
+      (node.nodeType === Node.ELEMENT_NODE &&
+        have.getAttribute("data-key") !== node.getAttribute("data-key"))
+    )
+      have.replaceWith(node);
+    else if (node.nodeType !== Node.ELEMENT_NODE) {
+      if (have.nodeValue !== node.nodeValue) have.nodeValue = node.nodeValue;
+    } else {
+      // Tooltips move a title into data-tooltip and label the button; keep
+      // that conversion while the title is unchanged.
+      if (
+        have.dataset.tooltip !== undefined &&
+        node.getAttribute("title") === have.dataset.tooltip
+      ) {
+        node.removeAttribute("title");
+        node.dataset.tooltip = have.dataset.tooltip;
+        if (!node.hasAttribute("aria-label") && have.hasAttribute("aria-label"))
+          node.setAttribute("aria-label", have.getAttribute("aria-label"));
+      }
+      for (const { name } of [...have.attributes])
+        if (!node.hasAttribute(name)) have.removeAttribute(name);
+      for (const { name, value } of node.attributes)
+        if (have.getAttribute(name) !== value) have.setAttribute(name, value);
+      syncChildren(have, node);
+    }
+  });
+  while (el.childNodes.length > wanted.length) el.lastChild.remove();
+}
 function renderLauncher() {
   if (!$("#launcher-server")) return;
   const selector = $("#launcher-server");
@@ -1628,16 +1670,18 @@ function renderLauncher() {
     serverFilter?.size === 0
       ? "No servers selected. Select servers in the sidebar or choose All."
       : "No open sessions match these server filters. Start a session below or choose All.";
-  selector.innerHTML =
+  patchChildren(
+    selector,
     data.servers
       .map((s) => {
         const count = tabs.filter(
           (t) => t.server.id === s.id && t.status === "Connected",
         ).length;
-        return `<button class="server-card ${s.id === selected ? "chosen" : ""}" data-launch-server="${esc(s.id)}" aria-pressed="${s.id === selected}" title="${esc(s.username)}@${esc(s.host)}:${s.port}\nSelect to check this server’s tmux sessions"><span class="server-card-top"><span class="server-monogram">${esc(s.name.slice(0, 2).toUpperCase())}</span>${count ? `<span class="live-pill">${count} open</span>` : '<span class="server-check">↗</span>'}</span><strong>${esc(s.name)}</strong><small>${esc(s.username)}@${esc(s.host)}</small></button>`;
+        return `<button class="server-card ${s.id === selected ? "chosen" : ""}" data-launch-server="${esc(s.id)}" data-key="${esc(s.id)}" aria-pressed="${s.id === selected}" title="${esc(s.username)}@${esc(s.host)}:${s.port}\nSelect to check this server’s tmux sessions"><span class="server-card-top"><span class="server-monogram">${esc(s.name.slice(0, 2).toUpperCase())}</span>${count ? `<span class="live-pill">${count} open</span>` : '<span class="server-check">↗</span>'}</span><strong>${esc(s.name)}</strong><small>${esc(s.username)}@${esc(s.host)}</small></button>`;
       })
       .join("") ||
-    '<p class="fine">Discover a device to create a workspace.</p>';
+      '<p class="fine">Discover a device to create a workspace.</p>',
+  );
   $$("[data-launch-server]").forEach(
     (b) => (b.onclick = () => selectServer(b.dataset.launchServer, true)),
   );
@@ -1658,16 +1702,18 @@ function renderLauncher() {
         : snapshot?.sessions
           ? `Checked ${snapshot.checked.toLocaleTimeString()} · ${snapshot.sessions.length} sessions`
           : "Choose a server to check its sessions, or start a new workspace above.";
-  $("#launcher-sessions").innerHTML =
+  patchChildren(
+    $("#launcher-sessions"),
     (snapshot?.sessions || [])
       .map(
         (s, i) =>
-          `<div class="session-card"><button class="session-result" data-resume="${i}"><strong>${esc(s.name)}</strong><span>${s.windows} windows · ${s.attached} attached clients</span><span class="resume-action">Resume →</span></button>${staticMode ? `<button class="session-rename" data-rename-session="${i}" aria-label="Rename session ${esc(s.name)}">Rename</button>` : ""}</div>`,
+          `<div class="session-card" data-key="${esc(s.name)}"><button class="session-result" data-resume="${i}"><strong>${esc(s.name)}</strong><span>${s.windows} windows · ${s.attached} attached clients</span><span class="resume-action">Resume →</span></button>${staticMode ? `<button class="session-rename" data-rename-session="${i}" aria-label="Rename session ${esc(s.name)}">Rename</button>` : ""}</div>`,
       )
       .join("") ||
-    (!remoteRequests.has(selected) && !snapshot?.error
-      ? '<p class="fine">No sessions found yet. Start one with the button above.</p>'
-      : "");
+      (!remoteRequests.has(selected) && !snapshot?.error
+        ? '<p class="fine">No sessions found yet. Start one with the button above.</p>'
+        : ""),
+  );
   $$("[data-resume]").forEach(
     (b) =>
       (b.onclick = guard(() =>
