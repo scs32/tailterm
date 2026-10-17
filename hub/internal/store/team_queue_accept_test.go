@@ -262,6 +262,36 @@ func TestHandlerDoneSaveWithoutAcceptanceIsRefused(t *testing.T) {
 	}
 }
 
+// wi_b50585944897afdd g1, g2: while an entry waits, a done save without
+// acceptance is refused for every agent of the project, not only the handler
+// and the lead, on either update path. An owner save is unchanged.
+func TestNonLeadDoneSaveWithoutAcceptanceIsRefused(t *testing.T) {
+	f := newAutoAcceptFixture(t, false)
+	builder, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "builder", Host: "fixture", Session: "builder"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: f.item.Revision, Status: &done, AgentID: builder.ID, RunID: builder.RunID, RequestID: "builder-done"}, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "team queue entry "+f.entry+" waits on acceptance") {
+		t.Fatal("builder done save without acceptance was not refused", err)
+	}
+	f.assertUntouched(t)
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &done, AgentID: builder.ID}, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.entry) {
+		t.Fatal("legacy PATCH builder done save without acceptance was not refused", err)
+	}
+	f.assertUntouched(t)
+
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: f.item.Revision, Status: &done, RequestID: "owner-done"}, f.by); err != nil {
+		t.Fatal("owner done save", err)
+	}
+	if item := f.current(t); item.Status != "done" {
+		t.Fatalf("owner save left the item %s", item.Status)
+	}
+	if q := f.queueEntry(t); q.Acceptance != nil {
+		t.Fatal("owner save recorded acceptance")
+	}
+}
+
 // a2 parity: each input refused by tt team queue accept is refused by the done
 // save with the same refusal, and the save leaves item and entry unchanged.
 // The save takes repository and base from the entry, so a caller cannot submit

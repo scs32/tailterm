@@ -3018,10 +3018,10 @@ func pendingTeamQueueAcceptance(ctx context.Context, tx *sql.Tx, task, item stri
 
 // doneSaveQueueGate checks a done save against the item's team queue before
 // any write. A save that carries an acceptance must name the entry waiting on
-// it. A database handler's or the item lead's save without one is refused
-// while an entry waits, so the queue can no longer stall on a separate
-// remembered accept. Owner and UI saves are unchanged; tt team queue accept
-// stays their recovery path.
+// it. A save without one from any agent of the project is refused while an
+// entry waits, so the queue can no longer stall on a separate remembered
+// accept. Owner and UI saves are unchanged; tt team queue accept stays their
+// recovery path.
 //
 // An acceptance from an agent that is not a database handler is validated
 // here, while the item is still at the revision the caller expects: the entry
@@ -3083,20 +3083,14 @@ func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID stri
 	if pending == nil || agentID == "" {
 		return nil, nil
 	}
-	var role, run string
-	if err = tx.QueryRowContext(ctx, `SELECT role,run_id FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&role, &run); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var registered int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE task_id=? AND id=?`, task, agentID).Scan(&registered); err != nil {
 		return nil, err
 	}
-	lead := false
-	if role != api.AgentRoleDatabaseHandler && run != "" {
-		if lead, err = itemLeadRun(ctx, tx, task, item, agentID, run); err != nil {
-			return nil, err
-		}
+	if registered == 0 {
+		return nil, nil
 	}
-	if role == api.AgentRoleDatabaseHandler || lead {
-		return nil, fmt.Errorf("%w: team queue entry %s waits on acceptance; save done with the accepted --worktree, --branch and --commit", api.ErrConflict, pending.ID)
-	}
-	return nil, nil
+	return nil, fmt.Errorf("%w: team queue entry %s waits on acceptance; save done with the accepted --worktree, --branch and --commit", api.ErrConflict, pending.ID)
 }
 
 // acceptTeamQueueOnDoneSave records the queue acceptance inside the handler's

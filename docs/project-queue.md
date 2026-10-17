@@ -1219,8 +1219,9 @@ then recorded in the same transaction as the item save, with every check the
 handler's save gets (review disposition, the passing receipt for the exact
 candidate, the verified repository and base), and any refusal rolls the whole
 save back. The entry stays at its revision and the acceptance names the
-item's new one. A lead's done save without `--worktree`, `--branch` and
-`--commit` is refused while its entry waits. `tt team queue accept` stays
+item's new one. A done save without `--worktree`, `--branch` and `--commit`
+from any agent of the project, not only the lead or the handler, is refused
+while its entry waits; an owner or UI save is not. `tt team queue accept` stays
 handler-only as the recovery path, and a handler's save is unchanged.
 
 **Order of release.** A new `tt` against an older hub gets the older hub's
