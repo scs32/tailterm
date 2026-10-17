@@ -74,29 +74,25 @@ export async function exerciseServerFilters(
     .locator("[data-tab]")
     .getAttribute("data-tab");
   await page.locator("#new-tab").click();
-  // The launcher redraws its server cards when a background session check
-  // ends, and a click split by that redraw reaches no card. Click until
-  // Development is the chosen card, or the shell opens on Production.
+  // The launcher redraws its server cards in place (wi_2be8be9bd414fa27), so
+  // one click chooses Development even when a session check ends mid-click.
   const card = page
     .locator("[data-launch-server]")
     .filter({ hasText: "Development" });
-  const chosen = Date.now() + 10000;
-  for (let tries = 1; ; tries++) {
-    await card.click();
-    if ((await card.getAttribute("aria-pressed")) === "true") break;
-    assert.ok(
-      tries < 5 && Date.now() < chosen,
-      `Development is chosen in the launcher after ${tries} clicks: ${JSON.stringify(
-        await page.evaluate(() => ({
-          cards: [...document.querySelectorAll("[data-launch-server]")].map(
-            (n) =>
-              `${n.querySelector("strong")?.textContent ?? n.dataset.launchServer}${n.getAttribute("aria-pressed") === "true" ? " (chosen)" : ""}`,
-          ),
-          note: document.querySelector("#launcher-note")?.textContent,
-        })),
-      )}`,
-    );
-  }
+  await card.click();
+  assert.equal(
+    await card.getAttribute("aria-pressed"),
+    "true",
+    `Development is chosen in the launcher after one click: ${JSON.stringify(
+      await page.evaluate(() => ({
+        cards: [...document.querySelectorAll("[data-launch-server]")].map(
+          (n) =>
+            `${n.querySelector("strong")?.textContent ?? n.dataset.launchServer}${n.getAttribute("aria-pressed") === "true" ? " (chosen)" : ""}`,
+        ),
+        note: document.querySelector("#launcher-note")?.textContent,
+      })),
+    )}`,
+  );
   await page.locator("#launcher-shell").click();
   const deadline = Date.now() + 30000;
   while (
