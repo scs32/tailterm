@@ -175,6 +175,12 @@ func replayDelegationOpen(ctx context.Context, c *api.Client, task string, req a
 		}
 		req.EndsAt = w.EndsAt
 		out, err := c.OpenDelegationWindow(ctx, task, req)
+		if requestIDReused(err) {
+			// The request ID holds another window. Only one window is open per
+			// project and w is open, so the request's own window has ended.
+			return api.OwnerActionResult{}, fmt.Errorf("this request's window has ended (closed or expired), so the repeated open was not replayed; the open delegation window is %s to %s until %s",
+				w.ID, w.DelegateName, w.EndsAt.Local().Format("Jan 2 15:04"))
+		}
 		if err == nil && out.Window != nil && out.Window.ID != w.ID {
 			// Another window with the same end time was stored under the request ID.
 			err = listedWindowOpen(out.Window.ID, windows)

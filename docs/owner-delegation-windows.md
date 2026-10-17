@@ -152,10 +152,17 @@ and never prints a closed or expired window as open:
   A `--for` that differs by less than that cannot be told apart without a hub
   change (review #28131 f2). The hub stamps the start when it saves the open, so
   a first call that reached it more than about 3 s late stores a shorter window:
-  a retry with the same explicit request ID and `--for` is then refused this way
-  although its window may be open. Check `tt owner delegation list`. A derived
-  key already holds `--for`, so it allows 15 s either way for latency and the two
-  hosts' clocks differing.
+  a retry with the same explicit request ID and `--for` after such a slow first
+  call can be refused this way, as a different duration. The window the refusal
+  names is the one that call stored, and it is open: check it with
+  `tt owner delegation list` instead of opening again. The exact fix (the hub
+  storing the requested duration) is declined because the refusal fails safe. A
+  derived key already holds `--for`, so it allows 15 s either way for latency and
+  the two hosts' clocks differing.
+- **Own window ended, a newer matching window open**: when the newest matching
+  window was opened under another request ID, the resend is refused. Only one
+  window is open per project, so this request's own window has ended; `tt` says
+  so, names the open window with its delegate and end time, and exits non-zero.
 
 **Discord** (allowlisted owner in the project's channel): `/delegate agent until scope
 [reason]` (`until` is a duration such as `3h` or an RFC3339 time) and

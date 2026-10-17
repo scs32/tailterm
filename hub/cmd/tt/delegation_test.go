@@ -411,18 +411,23 @@ func TestOwnerDelegationOpenReplayMatchesDelegateOnce(t *testing.T) {
 			// A closed and an open database window: a repeat of the older
 			// request ID resends once, to the newest. With the same end time
 			// the hub replays the closed window, which is reported closed;
-			// with a later one it refuses. The newer window opens 2 s after the
-			// older and 2 s (or 1 s) shorter, inside the explicit tolerance.
+			// with a later one it refuses, naming the open window. The newer
+			// window opens 2 s after the older and 2 s (or 1 s) shorter, inside
+			// the explicit tolerance.
 			closeWindow(other)
 			h.clock.Advance(time.Second)
 			newer := open("database", "database-2", 2*time.Hour-2*time.Second+later)
-			openNew(newer)
+			newest := openNew(newer)
 			h.clock.Advance(time.Second)
 			out, err, sent = h.send(t, open("database", "database-1", 2*time.Hour)...)
 			if err == nil || strings.Contains(out, "open  →") || sent != 2 {
 				t.Fatalf("older database repeat: %q %v, %d opens, want the refused one and one replay", out, err, sent)
 			}
-			if want := "window " + other + " to database closed"; later == 0 && !strings.Contains(err.Error(), want) || later != 0 && !strings.Contains(err.Error(), "409") {
+			want := "window " + other + " to database closed"
+			if later != 0 {
+				want = "this request's window has ended (closed or expired), so the repeated open was not replayed; the open delegation window is " + newest + " to database until "
+			}
+			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("older database repeat: %v", err)
 			}
 			h.clock.Advance(time.Second)
@@ -430,6 +435,42 @@ func TestOwnerDelegationOpenReplayMatchesDelegateOnce(t *testing.T) {
 				t.Fatalf("newest database repeat: %q %v, %d opens, want the refused one and one replay", out, err, sent)
 			}
 		})
+	}
+}
+
+// A repeat whose own window was closed, while a newer matching window opened
+// under another request ID is open, resends once to the newer window's end
+// time. The hub refuses that request ID for it, and tt says the request's
+// window has ended and names the open one, printing nothing as open.
+func TestOwnerDelegationOpenReplayOwnWindowEnded(t *testing.T) {
+	h := newDelegationHub(t, 0)
+	open := func(id string) []string {
+		return []string{"open", "--delegate", "lead", "--for", "2h", "--reason", "at the dentist", "--request-id", id}
+	}
+	if out, err := h.run(t, open("lead-1")...); err != nil {
+		t.Fatalf("open %q %v", out, err)
+	}
+	first := h.windows(t)[0].ID
+	if _, err := h.run(t, "close", first); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(2 * time.Second)
+	if out, err := h.run(t, open("lead-2")...); err != nil {
+		t.Fatalf("second open %q %v", out, err)
+	}
+	second := h.windows(t)[0]
+	h.clock.Advance(2 * time.Second)
+	out, err, sent := h.send(t, open("lead-1")...)
+	want := "this request's window has ended (closed or expired), so the repeated open was not replayed; the open delegation window is " +
+		second.ID + " to lead until " + second.EndsAt.Local().Format("Jan 2 15:04")
+	if err == nil || out != "" || err.Error() != want {
+		t.Fatalf("repeat of the closed window's request: %q %v, want %q", out, err, want)
+	}
+	if sent != 2 {
+		t.Fatalf("repeat sent %d opens, want the refused one and one replay", sent)
+	}
+	if w := h.windows(t); len(w) != 2 || w[0].ID != second.ID || w[0].State != "open" || w[1].ID != first || w[1].State != "closed" {
+		t.Fatalf("windows %+v", w)
 	}
 }
 
