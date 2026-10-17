@@ -15,6 +15,9 @@ import { prepareTestBinary } from "./test-binaries.mjs";
 const exec = promisify(execFile);
 const root = process.cwd();
 const state = await mkdtemp(path.join(tmpdir(), "tailterm-board-compose-"));
+const state2 = await mkdtemp(
+  path.join(tmpdir(), "tailterm-board-compose-hub2-"),
+);
 let binary = path.join(state, "tailterm-hub");
 const fixtureEnv = Object.fromEntries(
   Object.entries(process.env).filter(
@@ -22,6 +25,7 @@ const fixtureEnv = Object.fromEntries(
   ),
 );
 let backend;
+let backend2;
 let web;
 let origin = "";
 let hold = null;
@@ -142,7 +146,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8">
 import {createBoardView} from '/client/board-view.js';
 import {createHubClient} from '/client/hub-client.js';
 const task=new URLSearchParams(location.search).get('task');
-const client=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>fetch(url,init)});
+let client=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>fetch(url,init)});
 const notice=text=>document.querySelector('#notice').textContent=text;
 const noop=()=>{};
 const intentPersistence={
@@ -154,7 +158,9 @@ const board=createBoardView({client:()=>client,getTabs:()=>[],activate:noop,noti
   settings:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop,intentPersistence});
 board.mount(document.querySelector('#mode-view'));
 await board.show(task);
-window.qa={board};
+// A second hub behind /hub2 can hold a project whose message seqs match this one's.
+const useHub=prefix=>client=createHubClient({baseURL:location.origin+prefix,fetchImpl:(url,init)=>fetch(url,init)});
+window.qa={board,useHub};
 </script></body></html>`;
 
 try {
@@ -177,9 +183,27 @@ try {
         .catch(() => false),
     "isolated hub",
   );
+  const hub2Port = await freePort();
+  const hub2 = `http://127.0.0.1:${hub2Port}`;
+  backend2 = spawn(binary, {
+    env: {
+      ...fixtureEnv,
+      TAILTERM_STATE: state2,
+      TAILTERM_DEV_LISTEN: `127.0.0.1:${hub2Port}`,
+      TAILTERM_TCP_LISTEN: "",
+    },
+    stdio: "ignore",
+  });
+  await waitFor(
+    async () =>
+      fetch(`${hub2}/v1/tasks`)
+        .then((response) => response.ok)
+        .catch(() => false),
+    "second isolated hub",
+  );
 
-  async function api(method, route, body, expected = 200) {
-    const response = await fetch(hub + route, {
+  async function api(method, route, body, expected = 200, base = hub) {
+    const response = await fetch(base + route, {
       method,
       headers:
         body === undefined ? undefined : { "content-type": "application/json" },
@@ -189,12 +213,13 @@ try {
     assert.equal(response.status, expected, `${method} ${route}: ${text}`);
     return text ? JSON.parse(text) : null;
   }
-  async function project(label) {
+  async function project(label, base = hub) {
     const task = await api(
       "POST",
       "/v1/tasks",
       { name: `${label} Board composer` },
       201,
+      base,
     );
     const agent = await api(
       "POST",
@@ -207,12 +232,14 @@ try {
         cwd: state,
       },
       201,
+      base,
     );
     const source = await api(
       "POST",
       `/v1/tasks/${task.id}/messages`,
       { agentId: agent.id, text: "Synthetic worker source" },
       201,
+      base,
     );
     const primary = await api(
       "POST",
@@ -226,6 +253,7 @@ try {
         requestId: `${label}-primary`,
       },
       201,
+      base,
     );
     const related = await api(
       "POST",
@@ -239,6 +267,7 @@ try {
         requestId: `${label}-related`,
       },
       201,
+      base,
     );
     return { task, agent, source, primary, related };
   }
@@ -253,6 +282,24 @@ try {
       if (url.pathname === "/") {
         res.writeHead(200, { "content-type": "text/html" });
         res.end(html);
+        return;
+      }
+      // The second hub is passed straight through, outside the instrumented
+      // and fault-injected first hub path below.
+      if (url.pathname.startsWith("/hub2/v1/")) {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const raw = Buffer.concat(chunks);
+        const response = await fetch(hub2 + req.url.slice("/hub2".length), {
+          method: req.method,
+          headers: raw.length
+            ? { "content-type": "application/json" }
+            : undefined,
+          body: ["GET", "HEAD"].includes(req.method) ? undefined : raw,
+          signal: AbortSignal.timeout(35000),
+        });
+        res.writeHead(response.status, { "content-type": "application/json" });
+        res.end(await response.text());
         return;
       }
       if (url.pathname.startsWith("/v1/")) {
@@ -1020,6 +1067,133 @@ try {
         retried[0].postReceipt.requestId,
         failureAttempts[0].body.requestId,
       );
+      // Per-message focus keys carry the rendered project
+      // (wi_a019a932e0a96aa3). Read focus in one evaluation: background
+      // renders replace the nodes.
+      const activeControl = () =>
+        page.evaluate(() => {
+          const element = document.activeElement;
+          if (!element?.closest("#mode-view") || !element.isConnected)
+            return null;
+          return {
+            reply: element.dataset.reply || "",
+            boardTask: element.dataset.boardTask || "",
+            viewControl: element.dataset.viewControl || "",
+            inMessage: !!element.closest(".board-message"),
+          };
+        });
+      const focusControl = (selector) =>
+        page.evaluate((selector) => {
+          const element = document.querySelector(selector);
+          element.focus();
+          return element === document.activeElement;
+        }, selector);
+      const forceRender = async () => {
+        const focused = await page.evaluateHandle(() => document.activeElement);
+        await page.evaluate(() => window.qa.board.reload());
+        await page.waitForFunction((element) => !element.isConnected, focused);
+      };
+      // A same-project render keeps a focused Reply.
+      const sourceReply = `[data-reply="${fixture.source.seq}"]`;
+      await page.locator(sourceReply).waitFor();
+      assert.ok(await focusControl(sourceReply), `${name}: Reply took no focus`);
+      await forceRender();
+      assert.equal(
+        (await activeControl())?.reply,
+        String(fixture.source.seq),
+        `${name}: a same-project render dropped Reply focus`,
+      );
+      // A project switch started from the rail keeps focus on the rail.
+      const railProject = await api(
+        "POST",
+        "/v1/tasks",
+        { name: `${name} rail Board composer` },
+        201,
+      );
+      await page.evaluate(() => window.qa.board.reload());
+      const railButton = (id) => `[data-board-task="${id}"]`;
+      await page.locator(railButton(railProject.id)).waitFor();
+      for (const target of [railProject, fixture.task]) {
+        assert.ok(
+          await focusControl(railButton(target.id)),
+          `${name}: rail button took no focus`,
+        );
+        await page.keyboard.press("Enter");
+        await page.waitForFunction(
+          ({ selector, title }) =>
+            document.querySelector(selector)?.getAttribute("aria-pressed") ===
+              "true" &&
+            document.querySelector(".board-head h2")?.textContent === title,
+          { selector: railButton(target.id), title: target.name },
+        );
+        assert.equal(
+          (await activeControl())?.boardTask,
+          target.id,
+          `${name}: a keyboard project switch dropped rail focus`,
+        );
+        await forceRender();
+        assert.equal(
+          (await activeControl())?.boardTask,
+          target.id,
+          `${name}: a render after the switch dropped rail focus`,
+        );
+      }
+      await api("DELETE", `/v1/tasks/${railProject.id}`);
+      // A project on another hub can hold a message with the same seq; a
+      // focused Reply must not pull focus onto that project's Reply.
+      const other = await project(`${name}-hub2`, hub2);
+      const latestSeq = async (target, base) =>
+        Math.max(
+          ...(
+            await api(
+              "GET",
+              `/v1/tasks/${target.task.id}/messages?limit=200&latest=1`,
+              undefined,
+              200,
+              base,
+            )
+          ).messages.map((message) => message.seq),
+        );
+      let seqA = await latestSeq(fixture, hub);
+      let seqB = await latestSeq(other, hub2);
+      for (let post = 0; seqA !== seqB; post++) {
+        if (post >= 500)
+          throw new Error(
+            `${name}: no shared message seq across hubs (${seqA}, ${seqB})`,
+          );
+        const [target, base] = seqA < seqB ? [fixture, hub] : [other, hub2];
+        const { seq } = await api(
+          "POST",
+          `/v1/tasks/${target.task.id}/messages`,
+          { agentId: target.agent.id, text: "Synthetic seq alignment" },
+          201,
+          base,
+        );
+        if (target === fixture) seqA = seq;
+        else seqB = seq;
+      }
+      const sharedReply = `[data-reply="${seqA}"]`;
+      await page.locator(sharedReply).waitFor();
+      assert.ok(await focusControl(sharedReply), `${name}: Reply took no focus`);
+      await page.evaluate(async (taskId) => {
+        window.qa.useHub("/hub2");
+        await window.qa.board.show(taskId);
+      }, other.task.id);
+      await page.waitForFunction(
+        ({ selector, title }) =>
+          document.querySelector(".board-head h2")?.textContent === title &&
+          !!document.querySelector(selector),
+        { selector: sharedReply, title: other.task.name },
+      );
+      const crossed = await activeControl();
+      assert.ok(
+        !crossed?.inMessage,
+        `${name}: focus moved onto reply:${seqA} in another project (${crossed?.viewControl})`,
+      );
+      assert.equal(
+        await page.locator(sharedReply).getAttribute("data-view-control"),
+        `reply:${other.task.id}:${seqA}`,
+      );
       await api("DELETE", `/v1/tasks/${fixture.task.id}`);
       await page.evaluate(() => qa.board.hide());
       await page.reload();
@@ -1046,9 +1220,11 @@ try {
   );
 } finally {
   if (web) await new Promise((resolve) => web.close(resolve));
-  if (backend) {
-    backend.kill("SIGTERM");
-    await Promise.race([once(backend, "exit"), pause(3000)]);
+  for (const child of [backend, backend2]) {
+    if (!child) continue;
+    child.kill("SIGTERM");
+    await Promise.race([once(child, "exit"), pause(3000)]);
   }
   await rm(state, { recursive: true, force: true });
+  await rm(state2, { recursive: true, force: true });
 }
