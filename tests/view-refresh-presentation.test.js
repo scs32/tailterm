@@ -623,30 +623,75 @@ test("a scroll set from script with no user input does not hold a repaint", (t) 
   assert.equal(view.renders, 0);
 });
 
-test("a scrollbar drag holds a repaint until the scroll is idle", (t) => {
+test("a scrollbar drag holds a repaint until release and the scroll is idle", (t) => {
   const view = scrolledView(t);
   const { advance, listeners, root, detail, presentation } = view;
   // A pointer on the container itself is on its scrollbar.
   root.dispatch("pointerdown", { target: detail, button: 0, pointerId: 4 });
-  assert.equal(presentation.beforeRender("project-a"), true);
-  presentation.afterRender("project-a");
   view.scroll();
   assert.equal(presentation.beforeRender("project-a"), false);
   // The drag pauses past the idle time with the button still down.
   advance(SCROLL_IDLE_MS);
-  assert.equal(view.renders, 1);
+  assert.equal(view.renders, 0);
+  // A scroll just before release keeps holding until it is idle.
   view.scroll();
-  assert.equal(presentation.beforeRender("project-a"), false);
   listeners.get("pointerup")({ type: "pointerup", pointerId: 4 });
   advance(SCROLL_IDLE_MS - 1);
   view.scroll();
   advance(SCROLL_IDLE_MS - 1);
-  assert.equal(view.renders, 1);
+  assert.equal(view.renders, 0);
   advance(1);
-  assert.equal(view.renders, 2);
+  assert.equal(view.renders, 1);
   // After release and idle, a script-set scroll no longer holds.
   advance(SCROLL_IDLE_MS);
   view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
+});
+
+test("a paused scrollbar press holds a repaint until its pointer is released", (t) => {
+  const view = scrolledView(t);
+  const { advance, listeners, root, detail, presentation } = view;
+  const press = (target, pointerId, button = 0) =>
+    root.dispatch("pointerdown", { target, button, pointerId });
+
+  press(detail, 5);
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS * 4);
+  // Another pointer's release does not end this press.
+  listeners.get("pointerup")({ type: "pointerup", pointerId: 6 });
+  advance(SCROLL_IDLE_MS);
+  assert.equal(view.renders, 0);
+  listeners.get("pointerup")({ type: "pointerup", pointerId: 5 });
+  advance();
+  assert.equal(view.renders, 1);
+  advance(SCROLL_IDLE_MS * 4);
+  assert.equal(view.renders, 1);
+
+  // pointercancel and window blur release the press the same way.
+  for (const release of [
+    () =>
+      listeners.get("pointercancel")({ type: "pointercancel", pointerId: 7 }),
+    () => listeners.get("blur")({ type: "blur" }),
+  ]) {
+    press(detail, 7);
+    assert.equal(presentation.beforeRender("project-a"), false);
+    advance(SCROLL_IDLE_MS * 2);
+    release();
+    advance();
+    assert.equal(presentation.beforeRender("project-a"), true);
+    presentation.afterRender("project-a");
+  }
+  assert.equal(view.renders, 3);
+
+  // A press inside the content, or with another button, does not hold.
+  const content = {
+    closest: (s) => (s === "[data-view-scroll]" ? detail : null),
+    matches: () => false,
+  };
+  press(content, 8);
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+  press(detail, 9, 2);
   assert.equal(presentation.beforeRender("project-a"), true);
 });
 
@@ -720,6 +765,7 @@ test("the scroll that restoring an offset causes does not hold a repaint", (t) =
   // A later scroll of the same container by the user still holds.
   root.dispatch("pointerdown", { target: node, button: 0, pointerId: 2 });
   node.scrollTop = 300;
+  listeners.get("pointerup")({ type: "pointerup", pointerId: 2 });
   assert.equal(presentation.beforeRender("project-a"), false);
   advance(SCROLL_IDLE_MS);
   assert.equal(view.renders, 1);

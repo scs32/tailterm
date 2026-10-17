@@ -45,7 +45,8 @@ export const disclosureStateKey = (context, name) =>
 // keys the offset without the context, so a list such as the Projects rail
 // keeps its place when the selection changes. Any user scroll of a marked
 // container (wheel, touch, momentum, scrollbar drag or keyboard) holds the
-// repaint until the scroll is idle; a scroll with no user input behind it,
+// repaint until the scroll is idle, and a press on a container's scrollbar
+// holds it until release; a scroll with no user input behind it,
 // such as one set from script, does not. Unmarked views are left exactly as
 // they were.
 export function createViewRefreshPresentation({ render }) {
@@ -89,6 +90,7 @@ export function createViewRefreshPresentation({ render }) {
       textEntry !== null ||
       composingTextEntry !== null ||
       scrollGestureTimer !== null ||
+      scrollIntentPointer !== null ||
       Boolean(openPopover())
     );
   }
@@ -146,8 +148,10 @@ export function createViewRefreshPresentation({ render }) {
     scrollIntentPointer = null;
   }
 
-  // A pointer on the container itself (its scrollbar) keeps the intent until
-  // release; a key keeps it until the scroll it starts has had time to begin.
+  // A pointer on the container itself (its scrollbar) keeps the intent and
+  // holds the repaint until release, so a drag that pauses with the button
+  // down is not repainted under; a key keeps the intent until the scroll it
+  // starts has had time to begin.
   function noteScrollIntent(node, pointerId = null) {
     clearScrollIntent();
     scrollIntent = node;
@@ -160,6 +164,7 @@ export function createViewRefreshPresentation({ render }) {
     if (!shouldReleaseViewPointer(scrollIntentPointer, event)) return;
     scrollIntentPointer = null;
     scrollIntentTimer = setTimeout(clearScrollIntent, SCROLL_GESTURE_IDLE_MS);
+    scheduleFlush();
   }
 
   function onDocumentKeyDown(event) {
