@@ -4154,7 +4154,8 @@ func TestHandoffCodexOneShotProcess(t *testing.T) {
 		"codex --search a prompt": true, "codex --search find the bug": false, "codex review": true, "codex -c k=v review --uncommitted": true, "codex mcp list": true, "codex help": true,
 		"node /opt/bin/codex exec x": true, "node /opt/bin/codex review": true, "node /opt/bin/codex.js -m o3 x exec": false, "node /opt/bin/codex": false,
 		"node /opt/bin/codex fork": false, "codex -m": false, "codex exec-server": true, "codex fix the review comments": false,
-		"codex responses-api-proxy": true, "codex stdio-to-uds /tmp/s.sock": true, "codex -c k=v execpolicy check": true} {
+		"codex responses-api-proxy": true, "codex stdio-to-uds /tmp/s.sock": true, "codex -c k=v execpolicy check": true,
+		"codex cloud-tasks": true, "codex -c k=v cloud-tasks list": true, "codex tcp-tunnel --target 127.0.0.1:1": true} {
 		if got := (handoffProcess{args: strings.Fields(args)}).codexCommand(); got != want {
 			t.Errorf("codexCommand(%q) = %v, want %v", args, got, want)
 		}
