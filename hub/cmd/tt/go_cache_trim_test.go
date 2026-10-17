@@ -25,6 +25,13 @@ func init() {
 	nativeGoCacheDir = func(context.Context) (string, string, error) {
 		return "", "", errors.New("tests never resolve the real Go build cache")
 	}
+	// Nor the host's verification cache root, nor go's answer for it.
+	nativeVerificationCacheRoot = func() (string, error) {
+		return "", errors.New("tests never resolve the real verification cache")
+	}
+	nativeVerificationGoEnv = func(context.Context) (verificationGoEnv, error) {
+		return verificationGoEnv{}, errors.New("tests never ask go for the verification cache")
+	}
 }
 
 // nativeRelaySweepSchedule is the relay's real schedule function, captured
@@ -172,18 +179,31 @@ func trimJournalRaw(t *testing.T) []string {
 	}
 	var out []string
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if strings.Contains(line, `"source":"`+goCacheTrimSource+`"`) {
+		if strings.Contains(line, `"source":"`+goCacheTrimSource+`"`) && !strings.Contains(line, `"lowestVolume":`) {
 			out = append(out, line)
 		}
 	}
 	return out
 }
 
+// trimLines are the user trim's lines; verificationLines the verification
+// cache trim's.
 func trimLines(t *testing.T) []sweepJournalLine {
 	t.Helper()
 	var out []sweepJournalLine
 	for _, l := range sweepJournalLines(t) {
-		if l.Source == goCacheTrimSource {
+		if l.Source == goCacheTrimSource && !isVerificationTrimLine(l) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func verificationLines(t *testing.T) []sweepJournalLine {
+	t.Helper()
+	var out []sweepJournalLine
+	for _, l := range sweepJournalLines(t) {
+		if isVerificationTrimLine(l) {
 			out = append(out, l)
 		}
 	}
@@ -928,6 +948,8 @@ func TestGoCacheTrimReceipt(t *testing.T) {
 	}
 }
 
+const noVerificationTrim = "The verification cache trim is off or has not trimmed on this host."
+
 // a6: the trim never posts; its receipt says when the cache's volume is low;
 // the sweep's one notice per episode carries the trim's last numbers.
 func TestGoCacheTrimLowSpaceNotice(t *testing.T) {
@@ -958,7 +980,7 @@ func TestGoCacheTrimLowSpaceNotice(t *testing.T) {
 		t.Fatalf("first low sweep: %d posts", posts())
 	}
 	_, attempts, _, _ := f.hub.messages()
-	if text := attempts[0].Envelope.Body.Text; !strings.HasSuffix(text, "tt team queue sweep-worktrees --journal. The Go build cache trim is off or has not run on this host.") || len(text) > api.MaxEnvelopeBodyBytes {
+	if text := attempts[0].Envelope.Body.Text; !strings.HasSuffix(text, "tt team queue sweep-worktrees --journal. The Go build cache trim is off or has not run on this host. "+noVerificationTrim) || len(text) > api.MaxEnvelopeBodyBytes {
 		t.Fatalf("first notice:\n%s", text)
 	}
 	// The episode ends.
@@ -1003,8 +1025,8 @@ func TestGoCacheTrimLowSpaceNotice(t *testing.T) {
 	if err != nil || state.GoCacheTrim == nil {
 		t.Fatalf("state: %v", err)
 	}
-	sentence := fmt.Sprintf("Go build cache trim: last run %s removed 0 entries older than 24h0m0s and freed 0 B; the cache now holds %s.",
-		f.now.UTC().Format(time.RFC3339), humanBytes(state.GoCacheTrim.CacheBytesAfter))
+	sentence := fmt.Sprintf("Go build cache trim: last run %s removed 0 entries older than 24h0m0s and freed 0 B; the cache now holds %s. %s",
+		f.now.UTC().Format(time.RFC3339), humanBytes(state.GoCacheTrim.CacheBytesAfter), noVerificationTrim)
 	if !trimAt.Before(f.now) || goCacheTrimNoticeSentence(state.GoCacheTrim) != sentence {
 		t.Fatalf("sentence %q, want %q", goCacheTrimNoticeSentence(state.GoCacheTrim), sentence)
 	}
@@ -1037,7 +1059,7 @@ func TestGoCacheTrimLowSpaceNotice(t *testing.T) {
 	}
 	// A removal's numbers reach the sentence too.
 	if got := goCacheTrimNoticeSentence(&goCacheTrimState{LastRunAt: trimAt, FilesRemoved: 1, BytesFreed: 100, CacheBytesAfter: 2048, MaxAge: "24h0m0s"}); got !=
-		"Go build cache trim: last run "+trimAt.UTC().Format(time.RFC3339)+" removed 1 entries older than 24h0m0s and freed 100 B; the cache now holds 2.0 KiB." {
+		"Go build cache trim: last run "+trimAt.UTC().Format(time.RFC3339)+" removed 1 entries older than 24h0m0s and freed 100 B; the cache now holds 2.0 KiB. "+noVerificationTrim {
 		t.Fatalf("sentence %q", got)
 	}
 }
@@ -1064,6 +1086,11 @@ func TestGoCacheTrimRelayWiring(t *testing.T) {
 	requireExists(t, old, true)
 	if len(trimJournalRaw(t)) != 0 {
 		t.Fatal("the schedule trimmed with the switch off")
+	}
+	// The verification trim ran on the same pass, on by default, and the
+	// test binary's resolver named no root.
+	if lines := verificationLines(t); len(lines) != 1 || lines[0].Outcome != "skipped" || lines[0].Reason != goCacheTrimSkipNoRoot {
+		t.Fatalf("verification lines %+v", lines)
 	}
 	writeRelaySettings(t, f.home, `{"goBuildCacheTrim":"on"}`)
 	nativeRelaySweepSchedule(context.Background())
@@ -1176,4 +1203,451 @@ func TestGoCacheTrimStateFaultSpacing(t *testing.T) {
 			t.Fatalf("lines %+v: %v", lines, err)
 		}
 	})
+}
+
+// The verification cache trim (wi_dad4e23eb9f43ae1).
+
+// verificationFixture is a fake home with the user's Go caches, a
+// verification cache root outside them with a marked build directory and
+// module, speech-model and download entries, a temporary host lock and a
+// relay state directory. The user trim is off, so every line is the
+// verification trim's.
+type verificationFixture struct {
+	*goTrimFixture
+	vroot     string
+	build     string
+	vsettings goCacheTrimSettings
+	vfault    string
+	env       verificationGoEnv
+	lock      string
+}
+
+const verificationMarkers = `{"version":1,"kind":"%s","producer":"scripts/verify-matrix.mjs@0123","item":"wi_5eeb5eeb5eeb5e01","run":"run_1","createdAt":"2026-10-14T00:00:00.000Z","owns":[%s]}`
+
+func newVerificationFixture(t *testing.T) *verificationFixture {
+	t.Helper()
+	g := newGoTrimFixture(t)
+	g.settings.On = false
+	reset := func() {
+		verificationTrimStateFaults.mu.Lock()
+		verificationTrimStateFaults.kind, verificationTrimStateFaults.lastTry = "", time.Time{}
+		verificationTrimStateFaults.mu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+	oldHost := matrixWaitHostname
+	matrixWaitHostname = func() (string, error) { return sweepHost, nil }
+	t.Cleanup(func() { matrixWaitHostname = oldHost })
+	f := &verificationFixture{goTrimFixture: g, vroot: filepath.Join(g.root, "vcache"),
+		vsettings: goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: defaultSweepInterval, LowSpaceBytes: defaultSweepLowSpaceGiB << 30},
+		env:       verificationGoEnv{GOPATH: filepath.Join(g.home, "go"), GOMODCACHE: g.mod, GOCACHE: g.cache},
+		lock:      filepath.Join(g.root, "matrix", "host.json")}
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", f.lock)
+	writeFixtureFile(t, filepath.Join(f.vroot, verificationMarkerName), fmt.Sprintf(verificationMarkers, "root", `"mod","build","speech-model","downloads"`))
+	f.build = f.buildDir("go1.26.6-darwin-arm64")
+	// What the trim never touches, all old by the fixture's clock.
+	for _, rel := range []string{"mod/current.json", "mod/gen-0123456789abcdef/cache/download/x/@v/v1.0.0.zip", "mod/gen-0123456789abcdef/aa/old-a",
+		"mod/gen-0123456789abcdef.stamps/" + strings.Repeat("a", 64) + ".json", "speech-model/r1/m/model.bin", "downloads/" + strings.Repeat("b", 64) + ".tar.gz"} {
+		f.file(filepath.Join(f.vroot, rel), 10, 30*24*time.Hour)
+	}
+	f.deps.verificationSettings = func() (goCacheTrimSettings, string) { return f.vsettings, f.vfault }
+	f.deps.verificationRoot = func() (string, error) { return f.vroot, nil }
+	f.deps.goEnv = func(context.Context) (verificationGoEnv, error) { return f.env, nil }
+	f.deps.matrixBusy = verificationTrimMatrixBusy
+	return f
+}
+
+// buildDir makes a marked build directory as the runner does, with go's
+// README and trim files, all old.
+func (f *verificationFixture) buildDir(name string) string {
+	f.t.Helper()
+	dir := filepath.Join(f.vroot, "build", name)
+	writeFixtureFile(f.t, filepath.Join(dir, verificationMarkerName), fmt.Sprintf(verificationMarkers, "build", `"build/`+name+`"`))
+	writeGoCacheReadme(f.t, dir)
+	for _, name := range []string{"README", verificationMarkerName} {
+		at := f.now.Add(-30 * 24 * time.Hour)
+		if err := os.Chtimes(filepath.Join(dir, name), at, at); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	f.file(filepath.Join(dir, "trim.txt"), 10, 30*24*time.Hour)
+	f.file(filepath.Join(dir, "testexpire.txt"), 10, 30*24*time.Hour)
+	return dir
+}
+
+func (f *verificationFixture) ventry(rel string, size int, age time.Duration) string {
+	f.t.Helper()
+	return f.file(filepath.Join(f.build, rel), size, age)
+}
+
+// kept is the digest of everything but the build directory's two-hex
+// directories: markers, README, trim files, mod/, speech-model/ and
+// downloads/.
+func (f *verificationFixture) kept() string {
+	f.t.Helper()
+	var skip []string
+	names, _ := os.ReadDir(f.build)
+	for _, n := range names {
+		if isTwoHex(n.Name()) {
+			skip = append(skip, filepath.Join(f.build, n.Name()))
+		}
+	}
+	return trimTreeDigest(f.t, f.vroot, skip...)
+}
+
+func lastVerificationLine(t *testing.T) sweepJournalLine {
+	t.Helper()
+	lines := verificationLines(t)
+	if len(lines) == 0 {
+		t.Fatal("no verification trim line in the journal")
+	}
+	return lines[len(lines)-1]
+}
+
+// a1, a5: old entries go and young ones stay, with the user trim off; the
+// README, trim.txt, testexpire.txt, the markers, mod/, speech-model/ and
+// downloads/ stay; one line names the root; runs are spaced by the sweep's
+// interval; the state record feeds the notice.
+func TestGoCacheTrimVerificationAgeAndKept(t *testing.T) {
+	f := newVerificationFixture(t)
+	old1 := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 100, 25*time.Hour)
+	old2 := f.ventry("ab/"+strings.Repeat("2", 64)+"-d", 250, 30*24*time.Hour)
+	young := f.ventry("aa/"+strings.Repeat("3", 64)+"-d", 40, 23*time.Hour)
+	other := f.ventry("ab/notanentry", 7, 30*24*time.Hour)
+	kept := f.kept()
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, old1, false)
+	requireExists(t, old2, false)
+	requireExists(t, young, true)
+	requireExists(t, other, true)
+	if got := f.kept(); got != kept {
+		t.Fatalf("the trim changed what it keeps:\n%s\nwant\n%s", got, kept)
+	}
+	if len(trimLines(t)) != 0 || f.resolves != 0 {
+		t.Fatalf("the user trim ran: %d lines, %d resolves", len(trimLines(t)), f.resolves)
+	}
+	line := lastVerificationLine(t)
+	if line.Outcome != "trimmed" || *line.FilesRemoved != 2 || line.BytesFreed != 350 || *line.CacheBytesAfter != 47 || line.LowestVolume != f.vroot ||
+		line.MaxAge != "24h0m0s" || line.FreeBytesAfter != 100<<30 || line.LowSpace || line.Detail != "" {
+		t.Fatalf("line %+v", line)
+	}
+	if text := goCacheTrimJournalText(line); !strings.Contains(text, " verification-cache-trim root="+f.vroot+" trimmed files=2 freed=350 B cache=47 B") {
+		t.Fatalf("--journal text %q", text)
+	}
+	state, err := loadSweepState()
+	if err != nil || state.GoCacheTrim == nil || state.GoCacheTrim.Verification == nil || state.GoCacheTrim.Verification.CacheDir != f.vroot || !state.GoCacheTrim.LastRunAt.IsZero() {
+		t.Fatalf("state %+v %v", state.GoCacheTrim, err)
+	}
+	if got := goCacheTrimNoticeSentence(state.GoCacheTrim); got != "The Go build cache trim is off or has not run on this host. Verification cache trim: last run "+
+		f.now.UTC().Format(time.RFC3339)+" removed 2 entries older than 24h0m0s and freed 350 B; its build directories now hold 47 B." {
+		t.Fatalf("sentence %q", got)
+	}
+	// Not due again within the sweep's interval.
+	again := f.ventry("ac/"+strings.Repeat("4", 64)+"-a", 10, 48*time.Hour)
+	f.now = f.now.Add(30 * time.Minute)
+	if f.attempt() || len(verificationLines(t)) != 1 {
+		t.Fatal("ran again inside the interval")
+	}
+	requireExists(t, again, true)
+	f.now = f.now.Add(31 * time.Minute)
+	if !f.attempt() || len(verificationLines(t)) != 2 {
+		t.Fatal("not run after the interval")
+	}
+	requireExists(t, again, false)
+	// The user trim's own run keeps the verification record.
+	f.settings.On = true
+	f.entry("aa/user-a", 10, 48*time.Hour)
+	f.now = f.now.Add(2 * time.Hour)
+	if !f.attempt() || len(trimLines(t)) != 1 {
+		t.Fatal("the user trim did not run")
+	}
+	if state, _ := loadSweepState(); state.GoCacheTrim.Verification == nil || state.GoCacheTrim.Verification.LastRunAt != f.now.UTC() || state.GoCacheTrim.LastRunAt != f.now.UTC() {
+		t.Fatalf("state after both %+v", state.GoCacheTrim)
+	}
+}
+
+// a3, a5: a holder or a waiter skips the pass with the reason, and so does a
+// lock file that cannot be trusted or a refused lock path; a free lock file
+// or an absent one at a set path trims.
+func TestGoCacheTrimVerificationHostLock(t *testing.T) {
+	f := newVerificationFixture(t)
+	old := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 48*time.Hour)
+	worktree := filepath.Join(f.root, "wt")
+	cases := []struct {
+		name  string
+		setup func()
+		want  string
+	}{
+		{"holder", func() {
+			writeMatrixLock(t, sweepHost, []map[string]any{sweepMatrixEntry("h1", worktree, true)}, nil)
+		}, "1 matrix run(s) hold or wait for the host lock"},
+		{"waiter", func() {
+			writeMatrixLock(t, sweepHost, nil, []map[string]any{sweepMatrixEntry("w1", worktree, false)})
+		}, "1 matrix run(s) hold or wait for the host lock"},
+		{"invalid", func() { writeFixtureFile(t, f.lock, "not json") }, "the matrix host lock cannot be read: not a JSON object"},
+		{"another host", func() { writeMatrixLock(t, "other-host", nil, nil) }, "the matrix host lock cannot be read: written by another host"},
+		{"refused default", func() { t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "") }, "the matrix host lock cannot be read: "},
+	}
+	for _, c := range cases {
+		c.setup()
+		f.now = f.now.Add(2 * time.Hour)
+		if !f.attempt() {
+			t.Fatalf("%s: no attempt", c.name)
+		}
+		line := lastVerificationLine(t)
+		if line.Outcome != "skipped" || line.Reason != sweepSkipMatrix || !strings.HasPrefix(line.Detail, c.want) || line.LowestVolume != f.vroot {
+			t.Fatalf("%s: line %+v", c.name, line)
+		}
+		requireExists(t, old, true)
+		// A skip is retried after five minutes, not a full interval.
+		f.now = f.now.Add(4 * time.Minute)
+		if f.attempt() {
+			t.Fatalf("%s: retried within five minutes", c.name)
+		}
+		t.Setenv("TAILTERM_MATRIX_HOST_LOCK", f.lock)
+	}
+	writeMatrixLock(t, sweepHost, nil, nil)
+	f.now = f.now.Add(10 * time.Minute)
+	if !f.attempt() || lastVerificationLine(t).Outcome != "trimmed" {
+		t.Fatalf("free lock: %+v", lastVerificationLine(t))
+	}
+	requireExists(t, old, false)
+	if err := os.Remove(f.lock); err != nil {
+		t.Fatal(err)
+	}
+	again := f.ventry("aa/"+strings.Repeat("2", 64)+"-a", 10, 48*time.Hour)
+	f.now = f.now.Add(2 * time.Hour)
+	if !f.attempt() || lastVerificationLine(t).Outcome != "trimmed" {
+		t.Fatalf("absent lock: %+v", lastVerificationLine(t))
+	}
+	requireExists(t, again, false)
+}
+
+// a3: a run that registers mid-pass stops the walk before the next two-hex
+// directory.
+func TestGoCacheTrimVerificationStopsForANewRun(t *testing.T) {
+	f := newVerificationFixture(t)
+	first := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 48*time.Hour)
+	second := f.ventry("ab/"+strings.Repeat("2", 64)+"-a", 10, 48*time.Hour)
+	setTrimHooks(t, func(name string) {
+		if name == "aa" {
+			writeMatrixLock(t, sweepHost, nil, []map[string]any{sweepMatrixEntry("w1", filepath.Join(f.root, "wt"), false)})
+		}
+	}, nil)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, first, false)
+	requireExists(t, second, true)
+	if line := lastVerificationLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 1 || line.Detail != "stopped early: 1 matrix run(s) hold or wait for the host lock" {
+		t.Fatalf("line %+v", line)
+	}
+}
+
+// a1, a2, a5: an unmarked or wrongly marked root, a root that overlaps a user
+// Go cache either way, and an absent root are left alone with a skip; an
+// unmarked, foreign or symlinked build directory is left alone beside a good
+// one.
+func TestGoCacheTrimVerificationRefusals(t *testing.T) {
+	f := newVerificationFixture(t)
+	old := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 48*time.Hour)
+	marker := filepath.Join(f.vroot, verificationMarkerName)
+	good, _ := os.ReadFile(marker)
+	skipped := func(label, reason, detail string) {
+		t.Helper()
+		f.now = f.now.Add(2 * time.Hour)
+		before := trimTreeDigest(t, f.root, f.relayState())
+		if !f.attempt() {
+			t.Fatalf("%s: no attempt", label)
+		}
+		if line := lastVerificationLine(t); line.Outcome != "skipped" || line.Reason != reason || !strings.Contains(line.Detail, detail) {
+			t.Fatalf("%s: line %+v", label, line)
+		}
+		if after := trimTreeDigest(t, f.root, f.relayState()); after != before {
+			t.Fatalf("%s: the tree changed", label)
+		}
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	skipped("no marker", goCacheTrimSkipNotCache, "no tailterm-cache.json")
+	writeFixtureFile(t, marker, fmt.Sprintf(verificationMarkers, "build", `"build"`))
+	skipped("build marker on the root", goCacheTrimSkipNotCache, "not a valid root marker")
+	writeFixtureFile(t, marker, fmt.Sprintf(verificationMarkers, "root", `"../build"`))
+	skipped("owns outside", goCacheTrimSkipNotCache, "not a valid root marker")
+	writeFixtureFile(t, marker, `{"version":2,"kind":"root","owns":[]}`)
+	skipped("version 2", goCacheTrimSkipNotCache, "not a valid root marker")
+	writeFixtureFile(t, marker, string(good))
+
+	// Overlaps, both ways, compared by real path.
+	inside := filepath.Join(f.home, "go", "verify")
+	writeFixtureFile(t, filepath.Join(inside, verificationMarkerName), string(good))
+	f.vroot = inside
+	skipped("inside GOPATH", goCacheTrimSkipRefused, "overlaps the user's Go cache "+filepath.Join(f.home, "go"))
+	f.vroot = filepath.Join(f.home, "Library")
+	writeFixtureFile(t, filepath.Join(f.vroot, verificationMarkerName), string(good))
+	skipped("holds GOCACHE", goCacheTrimSkipRefused, "overlaps the user's Go cache")
+	elsewhere := filepath.Join(f.root, "elsewhere", "cache")
+	writeFixtureFile(t, filepath.Join(elsewhere, "x"), "x")
+	f.env.GOCACHE = elsewhere
+	f.vroot = filepath.Join(f.root, "elsewhere")
+	writeFixtureFile(t, filepath.Join(f.vroot, verificationMarkerName), string(good))
+	skipped("holds go env GOCACHE", goCacheTrimSkipRefused, "overlaps the user's Go cache "+elsewhere)
+	link := filepath.Join(f.root, "link-to-home-go")
+	if err := os.Symlink(filepath.Join(f.home, "go"), link); err != nil {
+		t.Fatal(err)
+	}
+	f.vroot = filepath.Join(link, "verify")
+	skipped("through a symlink into GOPATH", goCacheTrimSkipRefused, "overlaps the user's Go cache")
+	f.vroot = filepath.Join(f.root, "absent")
+	skipped("absent", goCacheTrimSkipNotCache, "the root does not exist")
+	f.vroot = "relative/root"
+	skipped("relative", goCacheTrimSkipNotCache, "not an absolute path")
+	f.vroot = filepath.Join(f.root, "vcache")
+	f.env.GOCACHE = f.cache
+	requireExists(t, old, true)
+
+	// Build directories: unmarked, foreign content, no README, symlinked.
+	unmarked := filepath.Join(f.vroot, "build", "go1.25.0-darwin-arm64")
+	writeGoCacheReadme(t, unmarked)
+	u := f.file(filepath.Join(unmarked, "aa", strings.Repeat("5", 64)+"-a"), 10, 48*time.Hour)
+	foreign := f.buildDir("go1.24.0-darwin-arm64")
+	fo := f.file(filepath.Join(foreign, "aa", strings.Repeat("6", 64)+"-a"), 10, 48*time.Hour)
+	writeFixtureFile(t, filepath.Join(foreign, "notes.txt"), "mine")
+	noReadme := f.buildDir("go1.23.0-darwin-arm64")
+	nr := f.file(filepath.Join(noReadme, "aa", strings.Repeat("7", 64)+"-a"), 10, 48*time.Hour)
+	if err := os.Remove(filepath.Join(noReadme, "README")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(f.root, "outside-build")
+	writeFixtureFile(t, filepath.Join(target, verificationMarkerName), fmt.Sprintf(verificationMarkers, "build", `"build/go1.22.0-darwin-arm64"`))
+	writeGoCacheReadme(t, target)
+	tg := f.file(filepath.Join(target, "aa", strings.Repeat("8", 64)+"-a"), 10, 48*time.Hour)
+	if err := os.Symlink(target, filepath.Join(f.vroot, "build", "go1.22.0-darwin-arm64")); err != nil {
+		t.Fatal(err)
+	}
+	f.now = f.now.Add(2 * time.Hour)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, old, false)
+	for _, path := range []string{u, fo, nr, tg} {
+		requireExists(t, path, true)
+	}
+	line := lastVerificationLine(t)
+	for _, want := range []string{"go1.25.0-darwin-arm64 (no tailterm-cache.json)", "go1.24.0-darwin-arm64 (holds notes.txt)", "go1.23.0-darwin-arm64 (no README)", "go1.22.0-darwin-arm64 (not a real directory)"} {
+		if line.Outcome != "trimmed" || *line.FilesRemoved != 1 || !strings.Contains(line.Detail, want) {
+			t.Fatalf("line %+v lacks %q", line, want)
+		}
+	}
+}
+
+// a1, a5: the switch and the age come from relay.json at every attempt: on by
+// default, off stops it with no line, a bad switch is a fault, and the age
+// has a 2h floor.
+func TestGoCacheTrimVerificationSettings(t *testing.T) {
+	f := newVerificationFixture(t)
+	f.deps.verificationSettings = readVerificationTrimSettings
+	old := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 3*time.Hour)
+	writeRelaySettings(t, f.home, `{"verificationCacheTrim":"off","verificationCacheTrimMaxAge":"1h"}`)
+	if f.attempt() || len(verificationLines(t)) != 0 {
+		t.Fatal("ran with the switch off")
+	}
+	writeRelaySettings(t, f.home, `{"verificationCacheTrim":"yes"}`)
+	if !f.attempt() {
+		t.Fatal("bad switch: no attempt")
+	}
+	if line := lastVerificationLine(t); line.Outcome != "skipped" || line.Reason != sweepSkipSettings || !strings.Contains(line.Detail, "verificationCacheTrim") {
+		t.Fatalf("bad switch: %+v", line)
+	}
+	writeRelaySettings(t, f.home, `not json`)
+	f.now = f.now.Add(2 * time.Hour)
+	if !f.attempt() || lastVerificationLine(t).Reason != sweepSkipSettings {
+		t.Fatalf("unreadable relay.json: %+v", lastVerificationLine(t))
+	}
+	requireExists(t, old, true)
+	// Default on, at 24h: a 3h entry stays.
+	writeRelaySettings(t, f.home, `{}`)
+	f.now = f.now.Add(2 * time.Hour)
+	old = f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 3*time.Hour)
+	if !f.attempt() || lastVerificationLine(t).MaxAge != "24h0m0s" {
+		t.Fatalf("default: %+v", lastVerificationLine(t))
+	}
+	requireExists(t, old, true)
+	// 1h is raised to the 2h floor, so the 3h entry goes.
+	writeRelaySettings(t, f.home, `{"verificationCacheTrim":"on","verificationCacheTrimMaxAge":"1h"}`)
+	f.now = f.now.Add(2 * time.Hour)
+	old = f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 3*time.Hour)
+	if !f.attempt() || lastVerificationLine(t).MaxAge != "2h0m0s" {
+		t.Fatalf("floor: %+v", lastVerificationLine(t))
+	}
+	requireExists(t, old, false)
+	if settings, fault := readVerificationTrimSettings(); fault != "" || !settings.On || settings.Interval != defaultSweepInterval {
+		t.Fatalf("settings %+v %q", settings, fault)
+	}
+}
+
+// a2: the root is resolved as the runner resolves it; the test binary never
+// resolves the live one.
+func TestGoCacheTrimVerificationRoot(t *testing.T) {
+	env := func(vars map[string]string) func(string) string { return func(k string) string { return vars[k] } }
+	cases := []struct {
+		vars map[string]string
+		goos string
+		want string
+	}{
+		{map[string]string{"TAILTERM_VERIFICATION_CACHE": "/v/root", "HOME": "/h"}, "darwin", "/v/root"},
+		{map[string]string{"TAILTERM_VERIFICATION_CACHE": "relative", "HOME": "/h"}, "darwin", "/h/Library/Caches/tailterm-verification"},
+		{map[string]string{"HOME": "/h", "XDG_CACHE_HOME": "/x"}, "darwin", "/h/Library/Caches/tailterm-verification"},
+		{map[string]string{"HOME": "/h", "XDG_CACHE_HOME": "/x"}, "linux", "/x/tailterm-verification"},
+		{map[string]string{"HOME": "/h", "XDG_CACHE_HOME": "x"}, "linux", "/h/.cache/tailterm-verification"},
+		{map[string]string{"HOME": "/h"}, "linux", "/h/.cache/tailterm-verification"},
+	}
+	for _, c := range cases {
+		if got, err := verificationCacheRoot(env(c.vars), c.goos); err != nil || got != c.want {
+			t.Fatalf("%v on %s: %q %v, want %q", c.vars, c.goos, got, err, c.want)
+		}
+	}
+	if root, err := nativeVerificationCacheRoot(); err == nil || root != "" {
+		t.Fatalf("the test binary resolved a verification root: %q", root)
+	}
+	if _, err := nativeVerificationGoEnv(context.Background()); err == nil {
+		t.Fatal("the test binary asked go for the verification cache")
+	}
+}
+
+// a1, a4: the relay's schedule runs the verification trim on every pass,
+// with goBuildCacheTrim off, and --journal prints its line.
+func TestGoCacheTrimVerificationRelayWiring(t *testing.T) {
+	f := newVerificationFixture(t)
+	old := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 0)
+	at := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(old, at, at); err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.ventry("aa/"+strings.Repeat("2", 64)+"-a", 10, 0)
+	now := time.Now()
+	if err := os.Chtimes(fresh, now, now); err != nil {
+		t.Fatal(err)
+	}
+	oldRoot, oldEnv := nativeVerificationCacheRoot, nativeVerificationGoEnv
+	t.Cleanup(func() { nativeVerificationCacheRoot, nativeVerificationGoEnv = oldRoot, oldEnv })
+	nativeVerificationCacheRoot = func() (string, error) { return f.vroot, nil }
+	nativeVerificationGoEnv = func(context.Context) (verificationGoEnv, error) { return f.env, nil }
+	writeRelaySettings(t, f.home, `{"goBuildCacheTrim":"off"}`)
+	nativeRelaySweepSchedule(context.Background())
+	requireExists(t, old, false)
+	requireExists(t, fresh, true)
+	if line := lastVerificationLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 1 || line.FreeBytesAfter <= 0 || len(trimLines(t)) != 0 {
+		t.Fatalf("line %+v", line)
+	}
+	out, err := captureStdout(t, func() error { return printSweepJournal(10, false) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "verification-cache-trim root="+f.vroot+" trimmed files=1 freed=10 B") {
+		t.Fatalf("--journal printed:\n%s", out)
+	}
 }

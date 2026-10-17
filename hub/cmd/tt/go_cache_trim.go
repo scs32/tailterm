@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,9 +26,23 @@ import (
 // the README, trim.txt and the module cache stay. Each run adds one line to the
 // sweep's journal and posts nothing; the sweep's low-space notice carries the
 // last run's numbers.
+//
+// The verification cache trim. The same pass trims the build directories of
+// the harness-owned verification cache root (scripts/verify-matrix.mjs,
+// docs/objective-verification.md) with the same entry rules. It is on unless
+// the owner turns it off, since that root belongs to the harness, not the
+// user, and Go's own five-day trim let it reach 51 GB (wi_dad4e23eb9f43ae1).
+// It trims only while no matrix run holds or waits for the host lock, and
+// only a root and build directories the runner itself would use.
 
 const (
 	defaultGoCacheTrimMaxAge = 24 * time.Hour
+	// defaultVerificationTrimMaxAge keeps every entry a matrix run used in
+	// the last day: go refreshes a used entry's mtime once it is an hour old,
+	// and the host runs the matrix many times a day on few toolchains. The
+	// owner's one-day cleanup on 10-17 freed 17 GiB of the 51 GB that Go's
+	// five-day trim had kept.
+	defaultVerificationTrimMaxAge = 24 * time.Hour
 	// minGoCacheTrimMaxAge is the least age: go refreshes an entry's mtime
 	// only when it is more than an hour old.
 	minGoCacheTrimMaxAge = 2 * time.Hour
@@ -41,6 +57,11 @@ const (
 	goCacheTrimSkipNoGo     = "no-go"
 	goCacheTrimSkipNotCache = "not-a-cache"
 	goCacheTrimFailWalk     = "walk"
+	// goCacheTrimSkipRefused is a verification root the runner would refuse:
+	// it overlaps one of the user's Go caches.
+	goCacheTrimSkipRefused = "refused"
+	// goCacheTrimSkipNoRoot is a verification root that cannot be named.
+	goCacheTrimSkipNoRoot = "no-root"
 )
 
 type goCacheTrimSettings struct {
@@ -75,30 +96,58 @@ func readGoCacheTrimSettings() (goCacheTrimSettings, string) {
 		return settings, ""
 	}
 	settings.On = true
-	duration := func(key string, into *time.Duration, least time.Duration) {
-		raw, ok := config[key]
-		if !ok {
-			return
-		}
-		var value string
-		d, err := time.Duration(0), error(nil)
-		if json.Unmarshal(raw, &value) == nil {
-			d, err = time.ParseDuration(value)
-		}
-		if value == "" || err != nil || d <= 0 {
-			sweepSettingsWarn(key, string(raw), into.String())
-			return
-		}
-		if d < least {
-			sweepSettingsWarn(key, string(raw), least.String())
-			d = least
-		}
-		*into = d
-	}
-	duration("goBuildCacheTrimMaxAge", &settings.MaxAge, minGoCacheTrimMaxAge)
-	duration("goBuildCacheTrimInterval", &settings.Interval, minSweepInterval)
+	relayDuration(config, "goBuildCacheTrimMaxAge", &settings.MaxAge, minGoCacheTrimMaxAge)
+	relayDuration(config, "goBuildCacheTrimInterval", &settings.Interval, minSweepInterval)
 	sweep, _ := readSweepSettings()
 	settings.LowSpaceBytes = sweep.LowSpaceBytes
+	return settings, ""
+}
+
+// relayDuration reads one duration key of relay.json into into: a bad value
+// keeps into, one under least uses least, and each says so once on stderr.
+func relayDuration(config map[string]json.RawMessage, key string, into *time.Duration, least time.Duration) {
+	raw, ok := config[key]
+	if !ok {
+		return
+	}
+	var value string
+	d, err := time.Duration(0), error(nil)
+	if json.Unmarshal(raw, &value) == nil {
+		d, err = time.ParseDuration(value)
+	}
+	if value == "" || err != nil || d <= 0 {
+		sweepSettingsWarn(key, string(raw), into.String())
+		return
+	}
+	if d < least {
+		sweepSettingsWarn(key, string(raw), least.String())
+		d = least
+	}
+	*into = d
+}
+
+// readVerificationTrimSettings reads the two verificationCacheTrim keys from
+// relay.json. The trim is on unless verificationCacheTrim is "off". A file
+// that exists but cannot be read or parsed, or a switch that is neither "on"
+// nor "off", is a fault and the run is skipped, since an owner's "off" cannot
+// be read from it. A bad age uses the default and one under 2h uses 2h, as
+// for goBuildCacheTrimMaxAge. The interval and the low-space threshold are
+// the sweep's, so the trim runs once per scheduled sweep pass.
+func readVerificationTrimSettings() (goCacheTrimSettings, string) {
+	sweep, _ := readSweepSettings()
+	settings := goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: sweep.Interval, LowSpaceBytes: sweep.LowSpaceBytes}
+	config, fault := readRelayConfig()
+	if fault != "" {
+		return settings, fault
+	}
+	if raw, ok := config["verificationCacheTrim"]; ok {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || (value != "on" && value != "off") {
+			return settings, `verificationCacheTrim is neither "on" nor "off"`
+		}
+		settings.On = value == "on"
+	}
+	relayDuration(config, "verificationCacheTrimMaxAge", &settings.MaxAge, minGoCacheTrimMaxAge)
 	return settings, ""
 }
 
@@ -114,8 +163,13 @@ type goCacheTrimState struct {
 	CacheBytesAfter int64     `json:"cacheBytesAfter"`
 	MaxAge          string    `json:"maxAge,omitempty"`
 	// CacheDir is the build cache the last trimmed run validated; the sweep
-	// reads its volume for the low-space notice.
+	// reads its volume for the low-space notice. On Verification it is the
+	// verification cache root.
 	CacheDir string `json:"cacheDir,omitempty"`
+	// Verification is the verification cache trim's own schedule and last
+	// trimmed run, kept on the user trim's record so the sweep's low-space
+	// notice carries both.
+	Verification *goCacheTrimState `json:"verification,omitempty"`
 }
 
 // goCacheTrimDue is sweepDue for the trim's own times.
@@ -126,20 +180,45 @@ func goCacheTrimDue(state *goCacheTrimState, interval time.Duration, now time.Ti
 	return sweepDue(sweepState{LastRunAt: state.LastRunAt, LastAttemptAt: state.LastAttemptAt}, interval, now)
 }
 
-// goCacheTrimNoticeSentence is the trim's sentence in the sweep's low-space
-// notice.
+// goCacheTrimNoticeSentence is the two trims' sentences in the sweep's
+// low-space notice: the user's Go build cache, then the verification cache.
 func goCacheTrimNoticeSentence(state *goCacheTrimState) string {
+	var user string
 	if state == nil || state.LastRunAt.IsZero() {
-		return "The Go build cache trim is off or has not run on this host."
+		user = "The Go build cache trim is off or has not run on this host."
+	} else {
+		user = fmt.Sprintf("Go build cache trim: last run %s removed %d entries older than %s and freed %s; the cache now holds %s.",
+			state.LastRunAt.UTC().Format(time.RFC3339), state.FilesRemoved, state.MaxAge, humanBytes(state.BytesFreed), humanBytes(state.CacheBytesAfter))
 	}
-	return fmt.Sprintf("Go build cache trim: last run %s removed %d entries older than %s and freed %s; the cache now holds %s.",
-		state.LastRunAt.UTC().Format(time.RFC3339), state.FilesRemoved, state.MaxAge, humanBytes(state.BytesFreed), humanBytes(state.CacheBytesAfter))
+	var v *goCacheTrimState
+	if state != nil {
+		v = state.Verification
+	}
+	if v == nil || v.LastRunAt.IsZero() {
+		return user + " The verification cache trim is off or has not trimmed on this host."
+	}
+	return user + fmt.Sprintf(" Verification cache trim: last run %s removed %d entries older than %s and freed %s; its build directories now hold %s.",
+		v.LastRunAt.UTC().Format(time.RFC3339), v.FilesRemoved, v.MaxAge, humanBytes(v.BytesFreed), humanBytes(v.CacheBytesAfter))
+}
+
+// verificationTrimLabel names a verification cache trim line in `--journal`.
+// The line's source is goCacheTrimSource, so the sweep's printer hands it to
+// goCacheTrimJournalText; lowestVolume names the root, which no user trim
+// line sets.
+const verificationTrimLabel = "verification-cache-trim"
+
+func isVerificationTrimLine(l sweepJournalLine) bool {
+	return l.Source == goCacheTrimSource && l.LowestVolume != ""
 }
 
 // goCacheTrimJournalText is one trim line as `--journal` prints it.
 func goCacheTrimJournalText(l sweepJournalLine) string {
+	label := goCacheTrimSource
+	if isVerificationTrimLine(l) {
+		label = verificationTrimLabel + " root=" + l.LowestVolume
+	}
 	if l.Outcome != "trimmed" {
-		text := fmt.Sprintf("%s %s %s %s", l.At, goCacheTrimSource, l.Outcome, l.Reason)
+		text := fmt.Sprintf("%s %s %s %s", l.At, label, l.Outcome, l.Reason)
 		if l.Detail != "" {
 			text += ": " + l.Detail
 		}
@@ -156,7 +235,7 @@ func goCacheTrimJournalText(l sweepJournalLine) string {
 	if l.FreeBytesAfter >= 0 {
 		free = humanBytes(l.FreeBytesAfter)
 	}
-	text := fmt.Sprintf("%s %s trimmed files=%d freed=%s cache=%s free=%s max-age=%s", l.At, goCacheTrimSource, files, humanBytes(l.BytesFreed), humanBytes(cache), free, l.MaxAge)
+	text := fmt.Sprintf("%s %s trimmed files=%d freed=%s cache=%s free=%s max-age=%s", l.At, label, files, humanBytes(l.BytesFreed), humanBytes(cache), free, l.MaxAge)
 	if l.Detail != "" {
 		text += "; " + l.Detail
 	}
@@ -335,6 +414,8 @@ type goCacheTrimResult struct {
 	// WalkError is set when the cache itself could not be listed.
 	WalkError    string
 	StoppedEarly bool
+	// StopReason is stop's answer when it ended the walk.
+	StopReason string
 }
 
 func (r *goCacheTrimResult) fail(what string, err error) {
@@ -355,6 +436,12 @@ func (r *goCacheTrimResult) fail(what string, err error) {
 // one swapped for an empty directory loses that empty directory. No regular
 // file other than an old entry and no directory with anything in it can go.
 func trimGoBuildCache(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time) goCacheTrimResult {
+	return trimGoBuildCacheUntil(ctx, cache, maxAge, now, nil)
+}
+
+// trimGoBuildCacheUntil is trimGoBuildCache that also asks stop, when set,
+// before each two-hex directory: a reason ends the walk there.
+func trimGoBuildCacheUntil(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time, stop func() string) goCacheTrimResult {
 	var res goCacheTrimResult
 	names, err := rootNames(cache.root)
 	if err != nil {
@@ -368,6 +455,12 @@ func trimGoBuildCache(ctx context.Context, cache *goCacheHandle, maxAge time.Dur
 		if ctx.Err() != nil {
 			res.StoppedEarly = true
 			break
+		}
+		if stop != nil {
+			if why := stop(); why != "" {
+				res.StoppedEarly, res.StopReason = true, why
+				break
+			}
 		}
 		if hook := goCacheTrimAfterList; hook != nil {
 			hook(name)
@@ -454,6 +547,16 @@ type goCacheTrimDeps struct {
 	freeBytes func(path string) (int64, error)
 	// cacheDir names the build cache and the module cache.
 	cacheDir func(ctx context.Context) (dir, modCache string, err error)
+
+	// The verification cache trim's inputs. With verificationRoot nil it
+	// does not run, as in the user trim's own tests.
+	verificationSettings func() (goCacheTrimSettings, string)
+	verificationRoot     func() (string, error)
+	// goEnv is go env's GOPATH, GOMODCACHE and GOCACHE, which the root must
+	// not overlap.
+	goEnv func(ctx context.Context) (verificationGoEnv, error)
+	// matrixBusy is why the host lock forbids a trim now, or "".
+	matrixBusy func() string
 }
 
 // nativeGoCacheDir asks go for the build cache and the module cache. There is
@@ -479,18 +582,34 @@ var nativeGoCacheDir = func(ctx context.Context) (string, string, error) {
 
 func nativeGoCacheTrimDeps() goCacheTrimDeps {
 	return goCacheTrimDeps{
-		now:       time.Now,
-		settings:  readGoCacheTrimSettings,
-		freeBytes: volumeFreeBytes,
-		cacheDir:  func(ctx context.Context) (string, string, error) { return nativeGoCacheDir(ctx) },
+		now:                  time.Now,
+		settings:             readGoCacheTrimSettings,
+		freeBytes:            volumeFreeBytes,
+		cacheDir:             func(ctx context.Context) (string, string, error) { return nativeGoCacheDir(ctx) },
+		verificationSettings: readVerificationTrimSettings,
+		verificationRoot:     func() (string, error) { return nativeVerificationCacheRoot() },
+		goEnv:                func(ctx context.Context) (verificationGoEnv, error) { return nativeVerificationGoEnv(ctx) },
+		matrixBusy:           verificationTrimMatrixBusy,
 	}
 }
 
-// goCacheTrimAttempt runs one trim when the host's switch is on and a run is
-// due. It reports whether it made an attempt, which is exactly when it wrote
-// a journal line. One trim runs at a time on a host: the lock is taken first,
-// and the state is read and the due check made only under it.
+// goCacheTrimAttempt is the scheduled pass's two trims: the user's Go build
+// cache when its switch is on, then the verification cache root unless its
+// switch is off. It reports whether either made an attempt, which is exactly
+// when a journal line was written.
 func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
+	user := goBuildCacheTrimAttempt(ctx, d)
+	if d.verificationRoot == nil {
+		return user
+	}
+	return verificationTrimAttempt(ctx, d) || user
+}
+
+// goBuildCacheTrimAttempt runs one trim when the host's switch is on and a
+// run is due. It reports whether it made an attempt, which is exactly when it
+// wrote a journal line. One trim runs at a time on a host: the lock is taken
+// first, and the state is read and the due check made only under it.
+func goBuildCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	now := d.now()
 	started := time.Now()
 	settings, fault := d.settings()
@@ -598,10 +717,441 @@ func goCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	detail := strings.Join(notes, "; ")
 	err = updateSweepState(func(s *sweepState) error {
-		s.GoCacheTrim = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(), CacheDir: dir}
+		var verification *goCacheTrimState
+		if s.GoCacheTrim != nil {
+			verification = s.GoCacheTrim.Verification
+		}
+		s.GoCacheTrim = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(), CacheDir: dir, Verification: verification}
 		return nil
 	})
 	// The entries are gone, so the line it writes keeps its counts.
+	if ok, wrote := stateFault(stateFaultSave, err, detail); !ok {
+		return wrote
+	}
+	write("trimmed", "", detail)
+	return true
+}
+
+// The verification cache trim.
+
+// verificationTrimStateFaults is goCacheTrimStateFaults for this trim.
+var verificationTrimStateFaults stateFaultGate
+
+// verificationBuildFiles are the names a build directory may hold beside its
+// two-hex directories and temporary files, as BUILD_FILES in
+// scripts/verify-matrix.mjs.
+var verificationBuildFiles = map[string]bool{"README": true, "trim.txt": true, "testexpire.txt": true, verificationMarkerName: true}
+
+const verificationMarkerName = "tailterm-cache.json"
+
+// verificationCacheRoot is scripts/verify-matrix.mjs verificationCacheRoot: an
+// absolute TAILTERM_VERIFICATION_CACHE, else under HOME (or the account's
+// home without one) Library/Caches on macOS and an absolute XDG_CACHE_HOME or
+// .cache elsewhere.
+func verificationCacheRoot(getenv func(string) string, goos string) (string, error) {
+	if named := getenv("TAILTERM_VERIFICATION_CACHE"); named != "" && filepath.IsAbs(named) {
+		return named, nil
+	}
+	home := getenv("HOME")
+	if home == "" {
+		u, err := user.Current()
+		if err != nil {
+			return "", err
+		}
+		home = u.HomeDir
+	}
+	if home == "" {
+		return "", errors.New("no home directory")
+	}
+	if goos == "darwin" {
+		return filepath.Join(home, "Library", "Caches", "tailterm-verification"), nil
+	}
+	if xdg := getenv("XDG_CACHE_HOME"); xdg != "" && filepath.IsAbs(xdg) {
+		return filepath.Join(xdg, "tailterm-verification"), nil
+	}
+	return filepath.Join(home, ".cache", "tailterm-verification"), nil
+}
+
+type verificationGoEnv struct {
+	GOPATH     string
+	GOMODCACHE string
+	GOCACHE    string
+}
+
+// The live root and go's answer. The test binary replaces both, so no test
+// can name the host's verification cache.
+var (
+	nativeVerificationCacheRoot = func() (string, error) { return verificationCacheRoot(os.Getenv, runtime.GOOS) }
+	// nativeVerificationGoEnv asks go as the runner's userGoPaths does, with
+	// GOTOOLCHAIN=local from the temporary directory.
+	nativeVerificationGoEnv = func(ctx context.Context) (verificationGoEnv, error) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "go", "env", "-json", "GOPATH", "GOMODCACHE", "GOCACHE")
+		cmd.Dir = os.TempDir()
+		cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
+		out, err := cmd.Output()
+		if err != nil {
+			return verificationGoEnv{}, err
+		}
+		var env verificationGoEnv
+		if err := json.Unmarshal(out, &env); err != nil {
+			return verificationGoEnv{}, errors.New("go env printed an unexpected answer")
+		}
+		return env, nil
+	}
+)
+
+// verificationTrimMatrixBusy reads this host's matrix lock as the sweep does
+// (loadMatrixExclusion): any holder or waiter forbids a trim, and so does a
+// lock path that is refused or a file that cannot be read or trusted. Only a
+// valid file with neither, or an absent file at a resolved path, is a free
+// host.
+func verificationTrimMatrixBusy() string {
+	m, why := loadMatrixExclusion()
+	if m == nil {
+		return "the matrix host lock cannot be read: " + why
+	}
+	return matrixEntriesBusy(len(m.entries))
+}
+
+func matrixEntriesBusy(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d matrix run(s) hold or wait for the host lock", n)
+}
+
+// validVerificationMarker is the script's validCacheMarker: a version 1
+// object of the kind, whose owns are relative paths without "..".
+func validVerificationMarker(raw []byte, kind string) bool {
+	marker, ok := jsonObject(raw)
+	if !ok {
+		return false
+	}
+	var version float64
+	if json.Unmarshal(marker["version"], &version) != nil || version != 1 {
+		return false
+	}
+	if g, ok := jsonText(marker["kind"]); !ok || g != kind {
+		return false
+	}
+	owns, ok := jsonArray(marker["owns"])
+	if !ok {
+		return false
+	}
+	for _, raw := range owns {
+		path, ok := jsonText(raw)
+		if !ok || path == "" || strings.HasPrefix(path, "/") {
+			return false
+		}
+		for _, part := range strings.Split(path, "/") {
+			if part == ".." {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// readRootFile reads a regular file directly inside an opened directory, no
+// larger than 64 KiB, without following a symlink.
+func readRootFile(root *os.Root, name string) ([]byte, string) {
+	seen, err := root.Lstat(name)
+	if err != nil {
+		return nil, "no " + name
+	}
+	if !seen.Mode().IsRegular() {
+		return nil, name + " is not a regular file"
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, name + " cannot be read"
+	}
+	defer file.Close()
+	if opened, err := file.Stat(); err != nil || !os.SameFile(seen, opened) {
+		return nil, name + " is not a regular file"
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 64<<10+1))
+	if err != nil || len(data) > 64<<10 {
+		return nil, name + " cannot be read"
+	}
+	return data, ""
+}
+
+// openVerificationRoot applies the runner's refusal rules to the root and
+// opens it, or returns the skip reason and why. The root must not be inside,
+// equal to or contain ~/go, ~/Library/Caches/go-build or go env's GOPATH
+// entries, GOMODCACHE or GOCACHE (validateCacheRoot), compared by real path;
+// and it must carry a valid root marker. The runner also refuses a root
+// inside its checkout; the relay has no checkout, so that rule has nothing to
+// compare. A root without a marker is left alone even where the runner would
+// adopt it, since the relay only trims what a run marked.
+func openVerificationRoot(root string, env verificationGoEnv) (*goCacheHandle, string, string) {
+	if !filepath.IsAbs(root) {
+		return nil, goCacheTrimSkipNotCache, "the root is not an absolute path"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil, goCacheTrimSkipRefused, "no home directory"
+	}
+	others := []string{filepath.Join(home, "go"), filepath.Join(home, "Library", "Caches", "go-build")}
+	others = append(others, filepath.SplitList(env.GOPATH)...)
+	others = append(others, env.GOMODCACHE, env.GOCACHE)
+	real := canonicalPath(root)
+	for _, other := range others {
+		if other == "" || !filepath.IsAbs(other) {
+			continue
+		}
+		if o := canonicalPath(other); pathHolds(real, o) || pathHolds(o, real) {
+			return nil, goCacheTrimSkipRefused, "the root overlaps the user's Go cache " + other
+		}
+	}
+	handle, err := openGoBuildCache(real)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, goCacheTrimSkipNotCache, "the root does not exist"
+		}
+		return nil, goCacheTrimSkipNotCache, "the root is not a directory that can be opened without following a symlink"
+	}
+	data, why := readRootFile(handle.root, verificationMarkerName)
+	if why == "" && !validVerificationMarker(data, "root") {
+		why = verificationMarkerName + " is not a valid root marker"
+	}
+	if why != "" {
+		handle.close()
+		return nil, goCacheTrimSkipNotCache, why
+	}
+	return handle, "", ""
+}
+
+// openVerificationBuildDir opens one name in <root>/build as a build cache
+// the runner would use (validBuildDir and selectBuildDir): a real directory
+// directly in build, not a symlink, with a valid build marker, holding only
+// what go and the runner write there, and passing validateGoBuildCache. It
+// returns nil and why otherwise.
+func openVerificationBuildDir(build *os.Root, path, name, modCache string) (*goCacheHandle, string) {
+	sub, err := openGoCacheDirectory(build, name)
+	if err != nil {
+		return nil, err.Error()
+	}
+	if sub == nil {
+		return nil, "not a real directory"
+	}
+	cache := &goCacheHandle{root: sub}
+	data, why := readRootFile(sub, verificationMarkerName)
+	if why == "" && !validVerificationMarker(data, "build") {
+		why = "not a valid build marker"
+	}
+	if why == "" {
+		names, err := rootNames(sub)
+		if err != nil {
+			why = "cannot be listed"
+		}
+		for _, n := range names {
+			if !verificationBuildFiles[n] && !isTwoHex(n) && !strings.HasSuffix(n, ".tmp") {
+				why = "holds " + n
+				break
+			}
+		}
+	}
+	if why == "" {
+		why = validateGoBuildCache(cache, path, modCache)
+	}
+	if why != "" {
+		cache.close()
+		return nil, why
+	}
+	return cache, ""
+}
+
+// trimVerificationBuildDirs trims every build directory the runner would use
+// under the opened root. Before each two-hex directory it reads the host lock
+// again and stops at a holder or waiter.
+//
+// A run that registers after that read finds at most one two-hex directory
+// still being trimmed: only entries untouched for the age go, and go takes an
+// entry that has gone as a miss and rebuilds it, so the run's checks are slower
+// at worst and never wrong.
+func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoot, modCache string, maxAge time.Duration, now time.Time, busy func() string) (goCacheTrimResult, []string) {
+	var res goCacheTrimResult
+	build, err := openGoCacheDirectory(root.root, "build")
+	if err != nil {
+		res.WalkError = "build: " + err.Error()
+		return res, nil
+	}
+	if build == nil {
+		return res, []string{"no build directory"}
+	}
+	defer build.Close()
+	names, err := rootNames(build)
+	if err != nil {
+		res.WalkError = "build: " + err.Error()
+		return res, nil
+	}
+	var skipped []string
+	for _, name := range names {
+		// A peer's directory under construction.
+		if strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		if ctx.Err() != nil {
+			res.StoppedEarly = true
+			break
+		}
+		path := filepath.Join(realRoot, "build", name)
+		cache, why := openVerificationBuildDir(build, path, name, modCache)
+		if cache == nil {
+			skipped = append(skipped, name+" ("+why+")")
+			continue
+		}
+		r := trimGoBuildCacheUntil(ctx, cache, maxAge, now, busy)
+		cache.close()
+		res.FilesRemoved += r.FilesRemoved
+		res.BytesFreed += r.BytesFreed
+		res.CacheBytesAfter += r.CacheBytesAfter
+		res.Errors += r.Errors
+		if res.FirstError == "" && r.FirstError != "" {
+			res.FirstError = name + "/" + r.FirstError
+		}
+		if r.WalkError != "" {
+			res.fail(name, errors.New(r.WalkError))
+		}
+		if r.StoppedEarly {
+			res.StoppedEarly, res.StopReason = true, r.StopReason
+			break
+		}
+	}
+	var notes []string
+	if len(skipped) > 0 {
+		notes = append(notes, "left alone: "+strings.Join(skipped, ", "))
+	}
+	return res, notes
+}
+
+// verificationTrimAttempt runs one verification cache trim when its switch
+// is not off and a run is due, as goBuildCacheTrimAttempt does for the user's
+// cache, with its own lock file, state record and fault gate. Every line it
+// writes has source goCacheTrimSource and names the root in lowestVolume.
+func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
+	now := d.now()
+	started := time.Now()
+	settings, fault := d.verificationSettings()
+	if fault == "" && !settings.On {
+		return false
+	}
+	if verificationTrimStateFaults.blocked(now) {
+		return false
+	}
+	if err := os.MkdirAll(relayDir(), 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] verification cache trim: %v\n", err)
+		return false
+	}
+	lock, err := os.OpenFile(filepath.Join(relayDir(), "verification-cache-trim.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] verification cache trim lock: %v\n", err)
+		return false
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return false
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	var zero, removed, cacheBytes int64
+	line := sweepJournalLine{At: now.UTC().Format(time.RFC3339Nano), Source: goCacheTrimSource, Kept: map[string]int{}, FreeBytesAfter: -1,
+		FilesRemoved: &zero, CacheBytesAfter: &zero, MaxAge: settings.MaxAge.String(), LowestVolume: "(unresolved)"}
+	write := func(outcome, reason, detail string) {
+		line.Outcome, line.Reason, line.Detail = outcome, reason, detail
+		line.DurationMs = time.Since(started).Milliseconds()
+		if err := appendSweepJournal(line); err != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] verification cache trim journal: %v\n", err)
+		}
+	}
+	stateFault := func(kind string, err error, detail string) (ok, wrote bool) {
+		ok, journal := verificationTrimStateFaults.check(kind, err, now)
+		if journal {
+			write("failed", "state", strings.TrimPrefix(detail+"; "+err.Error(), "; "))
+		}
+		return ok, journal
+	}
+	state, err := loadSweepState()
+	if ok, wrote := stateFault(stateFaultRead, err, ""); !ok {
+		return wrote
+	}
+	var last *goCacheTrimState
+	if state.GoCacheTrim != nil {
+		last = state.GoCacheTrim.Verification
+	}
+	if !goCacheTrimDue(last, settings.Interval, now) {
+		return false
+	}
+	err = updateSweepState(func(s *sweepState) error {
+		if s.GoCacheTrim == nil {
+			s.GoCacheTrim = &goCacheTrimState{}
+		}
+		if s.GoCacheTrim.Verification == nil {
+			s.GoCacheTrim.Verification = &goCacheTrimState{}
+		}
+		s.GoCacheTrim.Verification.LastAttemptAt = now.UTC()
+		return nil
+	})
+	if ok, wrote := stateFault(stateFaultSave, err, ""); !ok {
+		return wrote
+	}
+	skip := func(reason, detail string) bool {
+		write("skipped", reason, detail)
+		return true
+	}
+	if fault != "" {
+		return skip(sweepSkipSettings, fault)
+	}
+	root, err := d.verificationRoot()
+	if err != nil {
+		return skip(goCacheTrimSkipNoRoot, err.Error())
+	}
+	line.LowestVolume = root
+	if why := d.matrixBusy(); why != "" {
+		return skip(sweepSkipMatrix, why)
+	}
+	env, err := d.goEnv(ctx)
+	if err != nil {
+		return skip(goCacheTrimSkipNoGo, err.Error())
+	}
+	handle, reason, why := openVerificationRoot(root, env)
+	if handle == nil {
+		return skip(reason, why)
+	}
+	defer handle.close()
+	realRoot := canonicalPath(root)
+	res, notes := trimVerificationBuildDirs(ctx, handle, realRoot, env.GOMODCACHE, settings.MaxAge, now, d.matrixBusy)
+	if res.WalkError != "" {
+		write("failed", goCacheTrimFailWalk, res.WalkError)
+		return true
+	}
+	removed, cacheBytes = res.FilesRemoved, res.CacheBytesAfter
+	line.FilesRemoved, line.CacheBytesAfter, line.BytesFreed = &removed, &cacheBytes, res.BytesFreed
+	if free, err := d.freeBytes(realRoot); err == nil {
+		line.FreeBytesAfter = free
+	}
+	line.LowSpace = line.FreeBytesAfter >= 0 && line.FreeBytesAfter < settings.LowSpaceBytes
+	switch {
+	case res.StopReason != "":
+		notes = append(notes, "stopped early: "+res.StopReason)
+	case res.StoppedEarly:
+		notes = append(notes, "stopped early")
+	}
+	if res.Errors > 0 {
+		notes = append(notes, fmt.Sprintf("%d removal error(s), first %s", res.Errors, res.FirstError))
+	}
+	detail := strings.Join(notes, "; ")
+	err = updateSweepState(func(s *sweepState) error {
+		if s.GoCacheTrim == nil {
+			s.GoCacheTrim = &goCacheTrimState{}
+		}
+		s.GoCacheTrim.Verification = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(), CacheDir: root}
+		return nil
+	})
 	if ok, wrote := stateFault(stateFaultSave, err, detail); !ok {
 		return wrote
 	}

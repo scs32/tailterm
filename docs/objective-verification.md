@@ -278,14 +278,50 @@ are not caught; no test verdict is read from the cache either way.
 empty root may each seed a generation; the last rename wins and both are
 complete. A run reads `current.json` once and keeps that generation to its end.
 
-**No pruning.** The runner never removes or renames a generation or a build
-directory, so nothing a live run uses can disappear. A generation holds the
-union of module versions ever seeded (about 0.5 GB for the hubs, 0.29 GB per
-toolchain); a new one appears only after detected corruption; Go trims build
-entries unused for five days. The line names the count when there is more than
-one generation. Manual cleanup, with no matrix run live: `chmod -R u+w` and
+**No pruning by the runner.** The runner never removes or renames a
+generation or a build directory, so nothing a live run uses can disappear. A
+generation holds the union of module versions ever seeded (about 0.5 GB for the
+hubs, 0.29 GB per toolchain); a new one appears only after detected
+corruption. The line names the count when there is more than one generation.
+Manual cleanup of generations, with no matrix run live: `chmod -R u+w` and
 remove any `gen-*` (and its `.stamps`) that `current.json` does not name, or
 the whole root.
+
+**Build cache trim by the relay** (wi_dad4e23eb9f43ae1). Go's own five-day
+trim let `build/go1.26.6-darwin-arm64` reach 50 GB by 10-17 and the free-disk
+floor refused every queue launch. On each scheduled sweep pass (the
+`worktreeSweepInterval`, default 1h), the relay unlinks build entries untouched
+for longer than `verificationCacheTrimMaxAge` (default `24h`, floor `2h`).
+Go refreshes a used entry's mtime once it is an hour old, so anything a run used
+in the last day stays. The trim is on by default because the root is the
+harness's own. Set `"verificationCacheTrim": "off"` in
+`~/.config/tailterm/relay.json` to stop it; a value other than `on` or `off`,
+or a relay.json that cannot be read, skips the pass. It is separate from
+`goBuildCacheTrim`, which covers the user's own `GOCACHE`.
+
+- **Root.** Resolved as the runner resolves it, with the same overlap
+  refusals. It must carry a valid root marker; the relay has no checkout, so
+  the inside-the-checkout rule does not apply. A refused, unmarked or absent
+  root is left alone.
+- **Build directories.** Only directories directly in `<root>/build` that are
+  not symlinks, carry a valid `build` marker, hold only what Go and the runner
+  write there, and have Go's README. Others are left alone and named in the
+  line.
+- **Entries.** The rules of the user trim apply: only old regular `-a` and
+  `-d` files directly inside the two-hex directories. The README, `trim.txt`,
+  `testexpire.txt`, the markers, `mod/`, `speech-model/` and `downloads/` are
+  never touched.
+- **Lock rule.** Any holder or waiter in the matrix host lock skips the pass
+  (reason `matrix-lock`), and so does a refused lock path or a lock file that
+  cannot be read or trusted. The lock is read again before each two-hex
+  directory, so a run that registers mid-pass stops the walk at the next
+  one. In the directory already being trimmed, only entries untouched for a
+  day go, and Go takes a missing entry as a miss and rebuilds it.
+- **Receipt.** Each attempt writes one line to the sweep journal (`tt team
+  queue sweep-worktrees --journal`) with source `go-cache-trim`, the root in
+  `lowestVolume`, and either the entries removed and bytes freed or the skip
+  reason. The text form prints it as `verification-cache-trim root=<root>`.
+  The low-space notice carries the last trimmed run.
 
 **Speech model.** `scripts/package-speech-model.mjs` reads each file from
 `<root>/speech-model/`, then from the checkout's own `.build/speech-source/`
