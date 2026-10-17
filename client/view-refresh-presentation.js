@@ -5,6 +5,8 @@ const TEXT_ENTRY_TARGET =
 const TEXT_INTERACTION_IDLE_MS = 120;
 const SCROLL_CONTAINER = "[data-view-scroll]";
 const SCROLL_GESTURE_IDLE_MS = 150;
+// Stands in for the context of containers marked data-view-scroll-shared.
+const SHARED_SCROLL_CONTEXT = "\u0001shared";
 
 export const shouldReleaseViewPointer = (activePointer, event) =>
   activePointer !== null &&
@@ -24,8 +26,12 @@ export const disclosureStateKey = (context, name) =>
 // while a native select/popover or pointer gesture is active and remembers the
 // manual state of explicitly keyed disclosures across ordinary refreshes.
 // Containers a view marks with data-view-scroll keep their scroll offsets
-// across one repaint, and a wheel or touch scroll over one holds the repaint
-// until the gesture is idle. Unmarked views are left exactly as they were.
+// across one repaint, keyed by the view context; adding data-view-scroll-shared
+// keys the offset without the context, so a list such as the Projects rail
+// keeps its place when the selection changes. Any user scroll of a marked
+// container (wheel, touch, momentum, scrollbar drag or keyboard) holds the
+// repaint until the scroll is idle. Unmarked views are left exactly as they
+// were.
 export function createViewRefreshPresentation({ render }) {
   let root = null;
   let pointer = null;
@@ -37,12 +43,14 @@ export function createViewRefreshPresentation({ render }) {
   let composingTextEntry = null;
   let textEntryTimer = null;
   let scrollGestureTimer = null;
+  let restoringScroll = false;
   let queued = false;
   let scheduled = false;
   let renderedContext = "";
   let focusKey = "";
   const disclosure = new Map();
   const scrollOffsets = new Map();
+  const restoredScroll = new WeakMap();
 
   function openPopover() {
     try {
@@ -97,10 +105,7 @@ export function createViewRefreshPresentation({ render }) {
     scrollGestureTimer = null;
   }
 
-  // Only the user's own wheel and touch events extend the hold, so hub
-  // traffic cannot starve a refresh.
-  function onScrollGesture(event) {
-    if (!event.target?.closest?.(SCROLL_CONTAINER)) return;
+  function holdScrollGesture() {
     clearTimeout(scrollGestureTimer);
     scrollGestureTimer = setTimeout(
       releaseScrollGesture,
@@ -108,27 +113,67 @@ export function createViewRefreshPresentation({ render }) {
     );
   }
 
+  // Only the user's own scrolling extends the hold, so hub traffic cannot
+  // starve a refresh.
+  function onScrollGesture(event) {
+    if (!event.target?.closest?.(SCROLL_CONTAINER)) return;
+    holdScrollGesture();
+  }
+
+  // scroll does not bubble, so the root listens in the capture phase. It
+  // covers scrolls that send no wheel or touchmove: momentum after the finger
+  // lifts, a scrollbar drag and keyboard scrolling.
+  function onScroll(event) {
+    const node = event.target;
+    if (!node?.matches?.(SCROLL_CONTAINER) || restoringScroll) return;
+    // Browsers deliver the scroll that restoreScroll causes after it returns,
+    // so a container still sitting exactly at its restored offset is skipped.
+    const restored = restoredScroll.get(node);
+    restoredScroll.delete(node);
+    if (
+      restored &&
+      node.scrollTop === restored.top &&
+      node.scrollLeft === restored.left
+    )
+      return;
+    holdScrollGesture();
+  }
+
+  function scrollStateKey(node) {
+    return "viewScrollShared" in node.dataset
+      ? disclosureStateKey(SHARED_SCROLL_CONTEXT, node.dataset.viewScroll)
+      : disclosureStateKey(renderedContext, node.dataset.viewScroll);
+  }
+
   function captureScroll() {
     scrollOffsets.clear();
     root?.querySelectorAll?.(SCROLL_CONTAINER).forEach((node) => {
       if (!node.scrollTop && !node.scrollLeft) return;
-      scrollOffsets.set(
-        disclosureStateKey(renderedContext, node.dataset.viewScroll),
-        { top: node.scrollTop, left: node.scrollLeft },
-      );
+      scrollOffsets.set(scrollStateKey(node), {
+        top: node.scrollTop,
+        left: node.scrollLeft,
+      });
     });
   }
 
   function restoreScroll() {
     if (!scrollOffsets.size) return;
-    root?.querySelectorAll?.(SCROLL_CONTAINER).forEach((node) => {
-      const saved = scrollOffsets.get(
-        disclosureStateKey(renderedContext, node.dataset.viewScroll),
-      );
-      if (!saved) return;
-      node.scrollTop = saved.top;
-      node.scrollLeft = saved.left;
-    });
+    restoringScroll = true;
+    try {
+      root?.querySelectorAll?.(SCROLL_CONTAINER).forEach((node) => {
+        const saved = scrollOffsets.get(scrollStateKey(node));
+        if (!saved) return;
+        node.scrollTop = saved.top;
+        node.scrollLeft = saved.left;
+        // The browser may clamp the offset, so remember what it kept.
+        restoredScroll.set(node, {
+          top: node.scrollTop,
+          left: node.scrollLeft,
+        });
+      });
+    } finally {
+      restoringScroll = false;
+    }
     scrollOffsets.clear();
   }
 
@@ -291,6 +336,7 @@ export function createViewRefreshPresentation({ render }) {
     root?.removeEventListener?.("compositionend", onCompositionEnd);
     root?.removeEventListener?.("wheel", onScrollGesture);
     root?.removeEventListener?.("touchmove", onScrollGesture);
+    root?.removeEventListener?.("scroll", onScroll, { capture: true });
     clearTextEntry();
     clearScrollGesture();
     scrollOffsets.clear();
@@ -305,6 +351,10 @@ export function createViewRefreshPresentation({ render }) {
     root?.addEventListener?.("compositionend", onCompositionEnd);
     root?.addEventListener?.("wheel", onScrollGesture, { passive: true });
     root?.addEventListener?.("touchmove", onScrollGesture, { passive: true });
+    root?.addEventListener?.("scroll", onScroll, {
+      capture: true,
+      passive: true,
+    });
   }
 
   function beforeRender(context) {

@@ -425,6 +425,9 @@ function fakeScroller(name, top = 0, left = 0, onWrite = () => {}) {
     closest(selector) {
       return selector === "[data-view-scroll]" ? this : null;
     },
+    matches(selector) {
+      return selector === "[data-view-scroll]" && "viewScroll" in this.dataset;
+    },
   };
   for (const [key, value] of [
     ["scrollTop", top],
@@ -555,6 +558,140 @@ test("a wheel or touch scroll over a marked container holds a repaint until idle
   assert.equal(presentation.beforeRender("project-a"), true);
   advance(SCROLL_IDLE_MS * 10);
   assert.equal(renders, 1);
+});
+
+test("a scroll of a marked container with no wheel or touch holds a repaint until idle", (t) => {
+  const advance = fakeTimers(t);
+  let renders = 0;
+  const detail = fakeScroller("detail", 240);
+  const root = fakeRoot([], [detail]);
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  presentation.mount(root);
+  presentation.afterRender("project-a");
+
+  // Momentum, a scrollbar drag and keyboard scrolling send only scroll events.
+  root.dispatch("scroll", { target: detail });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS - 1);
+  root.dispatch("scroll", { target: detail });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS - 1);
+  assert.equal(renders, 0);
+  advance(1);
+  assert.equal(renders, 1);
+  advance(SCROLL_IDLE_MS * 10);
+  assert.equal(renders, 1);
+  assert.equal(presentation.beforeRender("project-a"), true);
+});
+
+test("the scroll that restoring an offset causes does not hold a repaint", (t) => {
+  const advance = fakeTimers(t);
+  let renders = 0;
+  const root = fakeRoot([], [fakeScroller("detail", 240)]);
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  presentation.mount(root);
+  presentation.afterRender("project-a");
+
+  // Back-to-back refreshes each restore the offset. The scroll that restore
+  // causes may arrive during the write or after afterRender returns.
+  let node = null;
+  for (let refresh = 0; refresh < 3; refresh++) {
+    assert.equal(presentation.beforeRender("project-a"), true);
+    node = fakeScroller("detail", 0, 0, () =>
+      root.dispatch("scroll", { target: node }),
+    );
+    root.scrollers = [node];
+    presentation.afterRender("project-a");
+    assert.deepEqual(node.writes, [
+      ["scrollTop", 240],
+      ["scrollLeft", 0],
+    ]);
+    root.dispatch("scroll", { target: node });
+  }
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+
+  // A later scroll of the same container by the user still holds.
+  node.scrollTop = 300;
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS);
+  assert.equal(renders, 1);
+});
+
+test("a scroll of an unmarked container does not hold a repaint", (t) => {
+  const advance = fakeTimers(t);
+  let renders = 0;
+  const unmarked = fakeScroller("", 480);
+  delete unmarked.dataset.viewScroll;
+  const root = fakeRoot([], [fakeScroller("detail")]);
+  const presentation = createViewRefreshPresentation({
+    render() {
+      renders++;
+    },
+  });
+  presentation.mount(root);
+  presentation.afterRender("project-a");
+  root.dispatch("scroll", { target: unmarked });
+  root.dispatch("scroll", { target: { closest: () => null } });
+  assert.equal(presentation.beforeRender("project-a"), true);
+  advance(SCROLL_IDLE_MS * 10);
+  assert.equal(renders, 0);
+});
+
+test("the scroll listener is added and removed in the capture phase", () => {
+  const calls = [];
+  const record = (root) => {
+    const add = root.addEventListener;
+    const remove = root.removeEventListener;
+    root.addEventListener = function (type, listener, options) {
+      if (type === "scroll") calls.push(["add", options?.capture]);
+      return add.call(this, type, listener, options);
+    };
+    root.removeEventListener = function (type, listener, options) {
+      if (type === "scroll") calls.push(["remove", options?.capture]);
+      return remove.call(this, type, listener, options);
+    };
+    return root;
+  };
+  const presentation = createViewRefreshPresentation({ render() {} });
+  presentation.mount(record(fakeRoot()));
+  presentation.mount(record(fakeRoot()));
+  assert.deepEqual(calls, [
+    ["add", true],
+    ["remove", true],
+    ["add", true],
+  ]);
+});
+
+test("a shared scroll container keeps its offset when the context changes", () => {
+  const sharedRail = (top = 0) => {
+    const node = fakeScroller("rail", top);
+    node.dataset.viewScrollShared = "";
+    return node;
+  };
+  const root = fakeRoot([], [sharedRail(150), fakeScroller("detail", 240)]);
+  const presentation = createViewRefreshPresentation({ render() {} });
+  presentation.mount(root);
+  presentation.afterRender("project-a");
+
+  assert.equal(presentation.beforeRender("project-b"), true);
+  const rail = sharedRail();
+  const detail = fakeScroller("detail");
+  root.scrollers = [rail, detail];
+  presentation.afterRender("project-b");
+  assert.deepEqual(rail.writes, [
+    ["scrollTop", 150],
+    ["scrollLeft", 0],
+  ]);
+  assert.deepEqual(detail.writes, []);
 });
 
 // Board and work-items mark no container: they keep their own scroll handling,
