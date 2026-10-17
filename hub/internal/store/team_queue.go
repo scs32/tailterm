@@ -1120,7 +1120,7 @@ func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 	if r := e.Release; r != nil {
 		sum := *r
 		sum.Plan = api.VerificationPlan{}
-		sum.IntegratedPlan, sum.IntegratedVerification, sum.Reconciliations = nil, nil, nil
+		sum.IntegratedPlan, sum.IntegratedCoverage, sum.IntegratedVerification, sum.Reconciliations = nil, nil, nil, nil
 		e.Release = &sum
 	}
 	if a := e.Acceptance; a != nil {
@@ -1154,13 +1154,13 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 		return e, api.ErrNotFound
 	}
 	if err == nil {
+		// Like a listing, attach the review state even with no recorded
+		// history: the Delivery view reads its history field.
 		summary, summaryErr := reviewState(ctx, s.db, task, e.ItemID)
 		if summaryErr != nil {
 			return e, summaryErr
 		}
-		if summary.History == "recorded" {
-			e.Reviews = &summary
-		}
+		e.Reviews = &summary
 	}
 	if err == nil {
 		err = s.loadTeamVerification(ctx, &e)
@@ -1192,15 +1192,18 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 }
 
 // TeamQueueAction runs one queue operation and returns its entry with the
-// item's budget, like an entry read. The budget is read after the action
-// committed and is not part of the saved retry result, so a retry returns the
-// same entry with the budget as it is then.
+// item's reviews and budget, like an entry read. Both are read after the
+// action committed and are not part of the saved retry result, so a retry
+// returns the same entry with them as they are then.
 func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQueueRequest) (api.TeamQueueEntry, error) {
 	e, err := s.teamQueueAction(ctx, task, req)
 	if err != nil || e.ID == "" {
 		return e, err
 	}
-	// The action is committed: a failed budget read must not report it failed.
+	// The action is committed: a failed read must not report it failed.
+	if reviews, reviewsErr := reviewState(ctx, s.db, e.TaskID, e.ItemID); reviewsErr == nil {
+		e.Reviews = &reviews
+	}
 	if budget, budgetErr := loadTokenBudget(ctx, s.db, e.TaskID, e.ItemID); budgetErr == nil {
 		e.Budget = budget
 	}

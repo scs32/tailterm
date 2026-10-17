@@ -851,9 +851,9 @@ and verdicts, without findings, blockers or criteria; `scopes` and `focused`
 are empty; follow-ups keep their item, message and finding ID and a title of
 at most 200 bytes. `verification` keeps its state, commit and only the checks
 that did not pass, are known failures or now pass. `release` keeps its ID,
-state, commits, digest, receipt, supersession, `published` and
-`integratedCoverage`, and drops `integratedPlan`, `integratedVerification`
-and `reconciliations`; `plan` is
+state, commits, digest, receipt, supersession and `published`, and drops
+`integratedPlan`, `integratedCoverage`, `integratedVerification` and
+`reconciliations`; `plan` is
 emitted as a zero object because the release type always carries it (read the
 full job from `GET /v1/tasks/{id}/releases`). Acceptance, integration and
 owner-integration evidence is cut to 500 bytes, owner-integration
@@ -875,8 +875,11 @@ entries that have left `queued` never change, so the cursor is stable while
 entries finish between pages.
 
 `GET /v1/tasks/{id}/team-queue/{entry}` returns one entry in full, now with
-its release and member activities too, as does `item=`. The runner and
-`tt team queue add` read `view=active`; the done-save acceptance check and
+its release and member activities too, as does `item=`. Like every listing
+and a queue action's result, it always carries `reviews`, with `history:
+"unknown"` and empty rounds when the item has no recorded review history.
+The runner and `tt team queue add` read `view=active`; the done-save
+acceptance check and
 the briefing's handler lookup read `item=`. `tt team queue list` takes
 `--active`, `--limit N`, `--after P` and `--item wi_ID`, and after the entries
 prints `history: showing N of TOTAL` and, when older entries remain, the

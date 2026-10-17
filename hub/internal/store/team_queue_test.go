@@ -869,6 +869,92 @@ func TestTeamQueueListingStaysWithinBudget(t *testing.T) {
 	}
 }
 
+// coverageRows returns n integrated coverage rows with full digests.
+func coverageRows(n int) []api.ReleaseCheckCoverage {
+	out := make([]api.ReleaseCheckCoverage, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, api.ReleaseCheckCoverage{CheckID: fmt.Sprint("check-", i), ApprovedDigest: strings.Repeat("a", 64), IntegratedDigest: strings.Repeat("b", 64), Relation: "same"})
+	}
+	return out
+}
+
+// A history summary leaves the release's integrated coverage out while the
+// full entry and the release detail keep it, and the single-entry read and
+// every listing attach the same reviews, recorded or not.
+func TestTeamQueueEntryProjectionsAgree(t *testing.T) {
+	s, task, _, _ := queueFixture(t)
+	ctx := context.Background()
+	history := insertHistoryEntries(t, s, task, 1, 2, []byte(`{}`), []byte(`{}`))
+	released, unreviewed := history[0], history[1]
+	job := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task.ID, EntryID: released.ID, ItemID: released.ItemID, State: "released", Commit: "abc", IntegratedCommit: "def", IntegratedCoverage: coverageRows(200)}
+	raw, err := json.Marshal(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'released',1,?)`, task.ID, job.ID, job.EntryID, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	recorded := api.ReviewConvergence{ItemID: released.ItemID, History: "recorded", Scopes: []api.ReviewScope{}, Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 7, Candidate: "abc", ReviewerID: "agt_r"}}, FollowUps: []api.ReviewFollowUp{}, Focused: []api.FocusedReview{}}
+	if raw, err = json.Marshal(recorded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO review_convergence(task_id,item_id,state_json) VALUES(?,?,?)`, task.ID, released.ItemID, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := map[string]api.TeamQueueEntry{}
+	for _, e := range page.Entries {
+		summaries[e.ID] = e
+	}
+	all, err := s.ListTeamQueue(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unpaged := map[string]api.TeamQueueEntry{}
+	for _, e := range all.Entries {
+		unpaged[e.ID] = e
+	}
+	for _, c := range []struct {
+		entry   api.TeamQueueEntry
+		history string
+	}{{released, "recorded"}, {unreviewed, "unknown"}} {
+		full, err := s.GetTeamQueueEntry(ctx, task.ID, c.entry.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if full.Reviews == nil || full.Reviews.History != c.history {
+			t.Fatalf("%s: entry reviews %+v, want history %s", c.history, full.Reviews, c.history)
+		}
+		one, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{Item: c.entry.ItemID})
+		if err != nil || len(one.Entries) != 1 {
+			t.Fatalf("%s: item listing %+v %v", c.history, one, err)
+		}
+		if !reflect.DeepEqual(full.Reviews, one.Entries[0].Reviews) || !reflect.DeepEqual(full.Reviews, unpaged[c.entry.ID].Reviews) {
+			t.Fatalf("%s: entry reviews %+v, item listing %+v, unpaged listing %+v", c.history, full.Reviews, one.Entries[0].Reviews, unpaged[c.entry.ID].Reviews)
+		}
+		if sum := summaries[c.entry.ID]; !sum.Summary || sum.Reviews == nil || sum.Reviews.History != c.history {
+			t.Fatalf("%s: history summary reviews %+v", c.history, sum.Reviews)
+		}
+	}
+
+	sum := summaries[released.ID]
+	if sum.Release == nil || sum.Release.ID != job.ID || sum.Release.IntegratedCommit != "def" || sum.Release.IntegratedCoverage != nil {
+		t.Fatalf("history summary release %+v", sum.Release)
+	}
+	full, err := s.GetTeamQueueEntry(ctx, task.ID, released.ID)
+	if err != nil || full.Release == nil || !reflect.DeepEqual(full.Release.IntegratedCoverage, job.IntegratedCoverage) {
+		t.Fatalf("full entry release %+v %v", full.Release, err)
+	}
+	detail, err := s.Release(ctx, task.ID, job.ID)
+	if err != nil || !reflect.DeepEqual(detail.IntegratedCoverage, job.IntegratedCoverage) {
+		t.Fatalf("release detail coverage %d checks %v", len(detail.IntegratedCoverage), err)
+	}
+}
+
 // q1: one history entry with every heavy field summarizes to a bounded size
 // that keeps what the Delivery view and tt read.
 func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
@@ -911,7 +997,8 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		receipt.Checks = append(receipt.Checks, api.VerificationResult{Status: "pass", VerificationCheck: plan.Checks[i]})
 	}
-	e.Release = &api.ReleaseJob{ID: "rel_heavy", State: "released", Commit: "abc", VerificationDigest: "d", Plan: plan, IntegratedPlan: &plan, IntegratedVerification: &receipt, Reconciliations: []api.ReleaseReconciliation{{CausalEvidence: big(4096)}}, Receipt: &api.ReleaseReceipt{JobID: "rel_heavy", Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "hub", Outcome: "deployed", Release: "r1"}}}}
+	coverage := coverageRows(256)
+	e.Release = &api.ReleaseJob{ID: "rel_heavy", State: "released", Commit: "abc", VerificationDigest: "d", Plan: plan, IntegratedPlan: &plan, IntegratedCoverage: coverage, IntegratedVerification: &receipt, Reconciliations: []api.ReleaseReconciliation{{CausalEvidence: big(4096)}}, Receipt: &api.ReleaseReceipt{JobID: "rel_heavy", Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "hub", Outcome: "deployed", Release: "r1"}}}}
 	e.Acceptance = &api.TeamIntegrationAcceptance{Branch: "b", Commit: "abc", Evidence: big(2000)}
 	e.Integration = &api.TeamIntegrationReady{Branch: "b", Commit: "abc", Evidence: big(2000)}
 	e.OwnerIntegration = &api.TeamQueueOwnerIntegration{Commit: "abc", Evidence: big(2000)}
@@ -936,8 +1023,11 @@ func TestTeamQueueSummaryBoundsHeavyFields(t *testing.T) {
 	if len(sum.LaunchJSON) != 0 || len(sum.CloseJSON) != 0 || sum.Activities != nil {
 		t.Fatal("launch, close or activities kept")
 	}
-	if r := sum.Release; r == nil || r.ID != "rel_heavy" || r.State != "released" || r.Receipt == nil || r.Receipt.Targets[0].Release != "r1" || len(r.Plan.Checks) != 0 || r.IntegratedPlan != nil || r.IntegratedVerification != nil || r.Reconciliations != nil {
+	if r := sum.Release; r == nil || r.ID != "rel_heavy" || r.State != "released" || r.Receipt == nil || r.Receipt.Targets[0].Release != "r1" || len(r.Plan.Checks) != 0 || r.IntegratedPlan != nil || r.IntegratedCoverage != nil || r.IntegratedVerification != nil || r.Reconciliations != nil {
 		t.Fatalf("release summary %+v", sum.Release)
+	}
+	if len(e.Release.IntegratedCoverage) != len(coverage) {
+		t.Fatalf("summarizing changed the full entry's coverage: %d checks", len(e.Release.IntegratedCoverage))
 	}
 	rv := sum.Reviews
 	if rv == nil || rv.History != "recorded" || rv.Disposition == nil || rv.Disposition.Kind != "accepted" || len(rv.Rounds) != 5 || len(rv.Scopes) != 0 || len(rv.Focused) != 0 || len(rv.FollowUps) != 10 {
