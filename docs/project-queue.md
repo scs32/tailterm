@@ -2068,8 +2068,13 @@ something is reserved the reason carries
 source, naming the reserving queue entries in queue order.
 
 **The reason.** A budget-held entry shows its reason as `blockReason` when no
-earlier reason (slots, host capacity, the agent cap, a handler, ownership)
-already explains the wait:
+earlier reason (slots, host capacity, the agent cap, a handler, ownership, or
+the shared-checkout hint `Shares checkout DIR with active entry tqe_A; move it:
+tt team queue scope --task ID --entry tqe_B --new-worktree`, which an entry
+gets when it shares its `cwd` with a holding entry, overlaps no holding entry's
+paths and has no reason yet; see
+[Team queue shared checkouts](#team-queue-shared-checkouts)) already explains
+the wait:
 
 ```
 Token budget (claude five_hour): needs about 44.00M tokens (default, planned); 31.20M remain before the reset at 2026-10-08T22:00:00Z, reserve 10% (source: provider reading)
