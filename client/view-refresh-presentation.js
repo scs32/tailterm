@@ -7,6 +7,21 @@ const SCROLL_CONTAINER = "[data-view-scroll]";
 const SCROLL_GESTURE_IDLE_MS = 150;
 // Stands in for the context of containers marked data-view-scroll-shared.
 const SHARED_SCROLL_CONTEXT = "\u0001shared";
+// Keys that scroll the page or the last scrolled container when focus is on
+// the document body rather than inside the view.
+const SCROLL_KEYS = new Set([
+  " ",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
+// Scroll intent for any marked container, after a scroll key on the body.
+const ANY_SCROLL_CONTAINER = {};
 
 export const shouldReleaseViewPointer = (activePointer, event) =>
   activePointer !== null &&
@@ -30,8 +45,9 @@ export const disclosureStateKey = (context, name) =>
 // keys the offset without the context, so a list such as the Projects rail
 // keeps its place when the selection changes. Any user scroll of a marked
 // container (wheel, touch, momentum, scrollbar drag or keyboard) holds the
-// repaint until the scroll is idle. Unmarked views are left exactly as they
-// were.
+// repaint until the scroll is idle; a scroll with no user input behind it,
+// such as one set from script, does not. Unmarked views are left exactly as
+// they were.
 export function createViewRefreshPresentation({ render }) {
   let root = null;
   let pointer = null;
@@ -44,6 +60,9 @@ export function createViewRefreshPresentation({ render }) {
   let textEntryTimer = null;
   let scrollGestureTimer = null;
   let restoringScroll = false;
+  let scrollIntent = null;
+  let scrollIntentPointer = null;
+  let scrollIntentTimer = null;
   let queued = false;
   let scheduled = false;
   let renderedContext = "";
@@ -120,9 +139,39 @@ export function createViewRefreshPresentation({ render }) {
     holdScrollGesture();
   }
 
+  function clearScrollIntent() {
+    clearTimeout(scrollIntentTimer);
+    scrollIntentTimer = null;
+    scrollIntent = null;
+    scrollIntentPointer = null;
+  }
+
+  // A pointer on the container itself (its scrollbar) keeps the intent until
+  // release; a key keeps it until the scroll it starts has had time to begin.
+  function noteScrollIntent(node, pointerId = null) {
+    clearScrollIntent();
+    scrollIntent = node;
+    scrollIntentPointer = pointerId;
+    if (pointerId === null)
+      scrollIntentTimer = setTimeout(clearScrollIntent, SCROLL_GESTURE_IDLE_MS);
+  }
+
+  function releaseScrollIntent(event) {
+    if (!shouldReleaseViewPointer(scrollIntentPointer, event)) return;
+    scrollIntentPointer = null;
+    scrollIntentTimer = setTimeout(clearScrollIntent, SCROLL_GESTURE_IDLE_MS);
+  }
+
+  function onDocumentKeyDown(event) {
+    if (root?.contains?.(event.target) || !SCROLL_KEYS.has(event.key)) return;
+    noteScrollIntent(ANY_SCROLL_CONTAINER);
+  }
+
   // scroll does not bubble, so the root listens in the capture phase. It
   // covers scrolls that send no wheel or touchmove: momentum after the finger
-  // lifts, a scrollbar drag and keyboard scrolling.
+  // lifts, a scrollbar drag and keyboard scrolling. A scroll extends the hold
+  // only during a user scroll or just after user input on that container, so
+  // an offset set from script does not hold a repaint.
   function onScroll(event) {
     const node = event.target;
     if (!node?.matches?.(SCROLL_CONTAINER) || restoringScroll) return;
@@ -134,6 +183,12 @@ export function createViewRefreshPresentation({ render }) {
       restored &&
       node.scrollTop === restored.top &&
       node.scrollLeft === restored.left
+    )
+      return;
+    if (
+      scrollGestureTimer === null &&
+      scrollIntent !== node &&
+      scrollIntent !== ANY_SCROLL_CONTAINER
     )
       return;
     holdScrollGesture();
@@ -210,6 +265,8 @@ export function createViewRefreshPresentation({ render }) {
   }
 
   function onPointerDown(event) {
+    if (event.button === 0 && event.target?.matches?.(SCROLL_CONTAINER))
+      noteScrollIntent(event.target, event.pointerId);
     const target = event.target?.closest?.(INTERACTIVE_POINTER_TARGET);
     if (event.button !== 0 || !target) return;
     pointer = event.pointerId;
@@ -218,6 +275,8 @@ export function createViewRefreshPresentation({ render }) {
   }
 
   function onKeyDown(event) {
+    const container = event.target?.closest?.(SCROLL_CONTAINER);
+    if (container) noteScrollIntent(container);
     const target = event.target?.closest?.("select");
     if (target && !target.disabled) {
       if (isNativeSelectActivation(event)) activateNativeSelect(target);
@@ -339,6 +398,7 @@ export function createViewRefreshPresentation({ render }) {
     root?.removeEventListener?.("scroll", onScroll, { capture: true });
     clearTextEntry();
     clearScrollGesture();
+    clearScrollIntent();
     scrollOffsets.clear();
     root = container;
     root?.addEventListener?.("pointerdown", onPointerDown);
@@ -423,16 +483,23 @@ export function createViewRefreshPresentation({ render }) {
     nativeSelectWatch++;
     clearTextEntry();
     clearScrollGesture();
+    clearScrollIntent();
     scrollOffsets.clear();
     queued = false;
     scheduled = false;
     focusKey = "";
   }
 
-  globalThis.addEventListener?.("pointerup", releasePointer);
-  globalThis.addEventListener?.("pointercancel", releasePointer);
+  const onPointerRelease = (event) => {
+    releasePointer(event);
+    releaseScrollIntent(event);
+  };
+  globalThis.addEventListener?.("pointerup", onPointerRelease);
+  globalThis.addEventListener?.("pointercancel", onPointerRelease);
+  globalThis.addEventListener?.("keydown", onDocumentKeyDown);
   globalThis.addEventListener?.("blur", (event) => {
     releasePointer(event);
+    releaseScrollIntent(event);
     keyboardTarget = null;
     if (nativeSelect) commit(nativeSelect);
     scheduleFlush();

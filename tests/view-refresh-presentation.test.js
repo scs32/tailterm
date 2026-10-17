@@ -173,7 +173,8 @@ test("a matching pointerup and commit release an ordinary select gesture", (t) =
   const advance = fakeTimers(t);
   const previousAddEventListener = globalThis.addEventListener;
   const listeners = new Map();
-  globalThis.addEventListener = (type, listener) => listeners.set(type, listener);
+  globalThis.addEventListener = (type, listener) =>
+    listeners.set(type, listener);
   try {
     let renders = 0;
     const root = fakeRoot();
@@ -560,50 +561,147 @@ test("a wheel or touch scroll over a marked container holds a repaint until idle
   assert.equal(renders, 1);
 });
 
-test("a scroll of a marked container with no wheel or touch holds a repaint until idle", (t) => {
+// Replaces the window listeners the presentation registers for this test.
+function windowListeners(t) {
+  const previous = globalThis.addEventListener;
+  const listeners = new Map();
+  globalThis.addEventListener = (type, listener) =>
+    listeners.set(type, listener);
+  t.after(() => {
+    if (previous) globalThis.addEventListener = previous;
+    else delete globalThis.addEventListener;
+  });
+  return listeners;
+}
+
+// A view with one marked container, already rendered once.
+function scrolledView(t) {
   const advance = fakeTimers(t);
-  let renders = 0;
-  const detail = fakeScroller("detail", 240);
-  const root = fakeRoot([], [detail]);
-  const presentation = createViewRefreshPresentation({
+  const listeners = windowListeners(t);
+  const view = { advance, listeners, renders: 0 };
+  view.detail = fakeScroller("detail", 240);
+  view.root = fakeRoot([], [view.detail]);
+  view.presentation = createViewRefreshPresentation({
     render() {
-      renders++;
+      view.renders++;
     },
   });
-  presentation.mount(root);
-  presentation.afterRender("project-a");
+  view.presentation.mount(view.root);
+  view.presentation.afterRender("project-a");
+  // A real scroll event follows a change of offset.
+  view.scroll = () => {
+    view.detail.scrollTop += 10;
+    view.root.dispatch("scroll", { target: view.detail });
+  };
+  return view;
+}
 
-  // Momentum, a scrollbar drag and keyboard scrolling send only scroll events.
-  root.dispatch("scroll", { target: detail });
-  assert.equal(presentation.beforeRender("project-a"), false);
-  advance(SCROLL_IDLE_MS - 1);
-  root.dispatch("scroll", { target: detail });
-  assert.equal(presentation.beforeRender("project-a"), false);
-  advance(SCROLL_IDLE_MS - 1);
-  assert.equal(renders, 0);
-  advance(1);
-  assert.equal(renders, 1);
+test("a scroll set from script with no user input does not hold a repaint", (t) => {
+  const view = scrolledView(t);
+  const { advance, root, detail, presentation } = view;
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+  // Input elsewhere in the view is not input on the container.
+  root.dispatch("pointerdown", {
+    target: { closest: () => null },
+    button: 0,
+    pointerId: 1,
+  });
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+  // A scroll after a key's intent has lapsed does not hold either.
+  root.dispatch("keydown", {
+    target: { closest: (s) => (s === "[data-view-scroll]" ? detail : null) },
+    key: "PageDown",
+  });
+  advance(SCROLL_IDLE_MS);
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
   advance(SCROLL_IDLE_MS * 10);
-  assert.equal(renders, 1);
+  assert.equal(view.renders, 0);
+});
+
+test("a scrollbar drag holds a repaint until the scroll is idle", (t) => {
+  const view = scrolledView(t);
+  const { advance, listeners, root, detail, presentation } = view;
+  // A pointer on the container itself is on its scrollbar.
+  root.dispatch("pointerdown", { target: detail, button: 0, pointerId: 4 });
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), false);
+  // The drag pauses past the idle time with the button still down.
+  advance(SCROLL_IDLE_MS);
+  assert.equal(view.renders, 1);
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), false);
+  listeners.get("pointerup")({ type: "pointerup", pointerId: 4 });
+  advance(SCROLL_IDLE_MS - 1);
+  view.scroll();
+  advance(SCROLL_IDLE_MS - 1);
+  assert.equal(view.renders, 1);
+  advance(1);
+  assert.equal(view.renders, 2);
+  // After release and idle, a script-set scroll no longer holds.
+  advance(SCROLL_IDLE_MS);
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
+});
+
+test("a keyboard scroll holds a repaint until the scroll is idle", (t) => {
+  const view = scrolledView(t);
+  const { advance, listeners, root, detail, presentation } = view;
+  // Focus inside the container.
+  root.dispatch("keydown", {
+    target: { closest: (s) => (s === "[data-view-scroll]" ? detail : null) },
+    key: "ArrowDown",
+  });
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS);
+  assert.equal(view.renders, 1);
+
+  // Focus on the document body: a scroll key, not any key, scrolls.
+  listeners.get("keydown")({ target: {}, key: "a" });
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), true);
+  presentation.afterRender("project-a");
+  listeners.get("keydown")({ target: {}, key: "PageDown" });
+  view.scroll();
+  assert.equal(presentation.beforeRender("project-a"), false);
+  advance(SCROLL_IDLE_MS);
+  assert.equal(view.renders, 2);
+});
+
+test("momentum scrolls after a touch keep holding a repaint", (t) => {
+  const view = scrolledView(t);
+  const { advance, root, detail, presentation } = view;
+  root.dispatch("touchmove", { target: detail });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  // The finger lifts; only scroll events follow, each inside the idle time.
+  for (let frame = 0; frame < 20; frame++) {
+    advance(SCROLL_IDLE_MS - 1);
+    view.scroll();
+  }
+  assert.equal(view.renders, 0);
+  advance(SCROLL_IDLE_MS);
+  assert.equal(view.renders, 1);
+  view.scroll();
   assert.equal(presentation.beforeRender("project-a"), true);
 });
 
 test("the scroll that restoring an offset causes does not hold a repaint", (t) => {
-  const advance = fakeTimers(t);
-  let renders = 0;
-  const root = fakeRoot([], [fakeScroller("detail", 240)]);
-  const presentation = createViewRefreshPresentation({
-    render() {
-      renders++;
-    },
-  });
-  presentation.mount(root);
-  presentation.afterRender("project-a");
+  const view = scrolledView(t);
+  const { advance, listeners, root, presentation } = view;
 
-  // Back-to-back refreshes each restore the offset. The scroll that restore
-  // causes may arrive during the write or after afterRender returns.
+  // Back-to-back refreshes each restore the offset, each just after a scroll
+  // key, so only the guard keeps the restore's scroll from holding. It may
+  // arrive during the write or after afterRender returns.
   let node = null;
   for (let refresh = 0; refresh < 3; refresh++) {
+    listeners.get("keydown")({ target: {}, key: "PageDown" });
     assert.equal(presentation.beforeRender("project-a"), true);
     node = fakeScroller("detail", 0, 0, () =>
       root.dispatch("scroll", { target: node }),
@@ -620,10 +718,11 @@ test("the scroll that restoring an offset causes does not hold a repaint", (t) =
   presentation.afterRender("project-a");
 
   // A later scroll of the same container by the user still holds.
+  root.dispatch("pointerdown", { target: node, button: 0, pointerId: 2 });
   node.scrollTop = 300;
   assert.equal(presentation.beforeRender("project-a"), false);
   advance(SCROLL_IDLE_MS);
-  assert.equal(renders, 1);
+  assert.equal(view.renders, 1);
 });
 
 test("a scroll of an unmarked container does not hold a repaint", (t) => {
