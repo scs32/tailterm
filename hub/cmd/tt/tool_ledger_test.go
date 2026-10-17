@@ -896,6 +896,151 @@ func TestToolLedgerEvictionStopLosesNothing(t *testing.T) {
 	}
 }
 
+// toolLedgerPendingIDs returns the tool-use ids of the eviction claims and
+// of the other pending entries, each sorted.
+func toolLedgerPendingIDs(t *testing.T, root, agent string) (claims, others []string) {
+	t.Helper()
+	for _, entry := range toolPendingFiles(t, root, agent) {
+		data, err := os.ReadFile(filepath.Join(root, agent, "pending", entry.Name()))
+		var p toolLedgerPending
+		if err != nil || json.Unmarshal(data, &p) != nil {
+			t.Fatalf("pending %s: %v %q", entry.Name(), err, data)
+		}
+		if strings.HasPrefix(entry.Name(), "e-") {
+			claims = append(claims, p.ToolUseID)
+		} else {
+			others = append(others, p.ToolUseID)
+		}
+	}
+	sort.Strings(claims)
+	sort.Strings(others)
+	return claims, others
+}
+
+// toolLedgerUnknownIDs returns the tool-use ids of the unknown rows, in
+// ledger order, and fails on one without what the pre recorded.
+func toolLedgerUnknownIDs(t *testing.T, root, agent string) []string {
+	t.Helper()
+	ids := []string{}
+	for _, row := range toolLedgerRows(t, root, agent) {
+		if row["outcome"] != "unknown" {
+			continue
+		}
+		if row["tool"] != "Bash" || row["session"] != "s1" {
+			t.Fatalf("row = %v; want an unknown row with what the pre recorded", row)
+		}
+		ids = append(ids, row["toolUseId"].(string))
+	}
+	return ids
+}
+
+// Bug wi_db8904db7194e877: while the rows' writes fail no entry is removed,
+// so pres stop recording starts once a batch beyond the bound has built up,
+// and the directory stays within the bound plus one batch. Once the writes
+// work again every claim is written within one claim grace, once.
+func TestToolLedgerBoundHoldsWhileWritesFail(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the bound is the subject here, not timing
+	setToolLedger(t, &toolLedgerMaxPending, 5)
+	clock := setToolLedgerClock(t, time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC))
+	const bound = 5 + toolLedgerEvictBatch
+	pre := func(id string) {
+		t.Helper()
+		clock.advance(10 * time.Second) // so claims pass the grace and are taken again
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash"})
+	}
+
+	write := toolLedgerWrite
+	setToolLedger(t, &toolLedgerWrite, func(*os.File, []byte) error { return errors.New("disk full") })
+	for i := 0; i < 40; i++ {
+		pre(fmt.Sprintf("u%02d", i))
+		if n := len(toolPendingFiles(t, root, e.agent)); n > bound {
+			t.Fatalf("after %d pres with failing writes: %d pending files; want at most %d", i+1, n, bound)
+		}
+	}
+	claimed, _ := toolLedgerPendingIDs(t, root, e.agent)
+	if len(claimed) == 0 || len(toolLedgerRows(t, root, e.agent)) != 0 {
+		t.Fatalf("after failing writes: claims %v, rows %v", claimed, toolLedgerRows(t, root, e.agent))
+	}
+
+	toolLedgerWrite = write
+	recovered := clock.now()
+	for i := 0; clock.now().Sub(recovered) < toolLedgerClaimGrace; i++ {
+		pre(fmt.Sprintf("v%02d", i))
+	}
+	claims, others := toolLedgerPendingIDs(t, root, e.agent)
+	if len(claims) != 0 || len(others) > 5 {
+		t.Fatalf("one grace after the writes recovered: claims %v, others %v", claims, others)
+	}
+	written := map[string]int{}
+	for _, id := range toolLedgerUnknownIDs(t, root, e.agent) {
+		if written[id]++; written[id] > 1 {
+			t.Fatalf("two unknown rows for %s", id)
+		}
+	}
+	for _, id := range claimed {
+		if written[id] != 1 {
+			t.Fatalf("claim %s has no unknown row after the writes recovered; rows %v", id, written)
+		}
+	}
+}
+
+// Bug wi_db8904db7194e877: a claim left by a failed write or a cut-off pre
+// is written by the first pre past the claim grace, though the posts have
+// brought the directory below the count bound and the entry is not 24 hours
+// old.
+func TestToolLedgerLeftClaimWrittenAfterGrace(t *testing.T) {
+	for _, stop := range []struct {
+		name  string
+		write func(*os.File, []byte) error
+	}{
+		{"failed write", func(*os.File, []byte) error { return errors.New("disk full") }},
+		{"cut off", func(*os.File, []byte) error { panic("cut off") }},
+	} {
+		t.Run(stop.name, func(t *testing.T) {
+			e, root := toolLedgerSandbox(t)
+			setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the claim is the subject here, not timing
+			setToolLedger(t, &toolLedgerMaxPending, 5)
+			clock := setToolLedgerClock(t, time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC))
+			hook := func(event, id string) {
+				t.Helper()
+				clock.advance(time.Millisecond)
+				toolHook(t, e, event, map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash"})
+			}
+			for i := 0; i < 5; i++ {
+				hook("PreToolUse", fmt.Sprintf("u%d", i))
+			}
+			write := toolLedgerWrite
+			toolLedgerWrite = stop.write
+			hook("PreToolUse", "u5") // claims u0, the oldest beyond the bound, and writes no row
+			toolLedgerWrite = write
+			for i := 1; i <= 5; i++ {
+				hook("PostToolUse", fmt.Sprintf("u%d", i))
+			}
+			if claims, others := toolLedgerPendingIDs(t, root, e.agent); fmt.Sprint(claims) != "[u0]" || len(others) != 0 {
+				t.Fatalf("after the posts: claims %v, others %v; want only the claim of u0", claims, others)
+			}
+
+			// Inside the grace the claim may belong to a live hook.
+			clock.advance(30 * time.Second)
+			hook("PreToolUse", "w1")
+			if got := toolLedgerUnknownIDs(t, root, e.agent); len(got) != 0 {
+				t.Fatalf("inside the grace: unknown rows %v", got)
+			}
+
+			// Past it the next pre writes the claim's row, below the count bound.
+			clock.advance(time.Minute)
+			hook("PreToolUse", "w2")
+			if got := toolLedgerUnknownIDs(t, root, e.agent); fmt.Sprint(got) != "[u0]" {
+				t.Fatalf("past the grace: unknown rows %v; want [u0]", got)
+			}
+			if claims, others := toolLedgerPendingIDs(t, root, e.agent); len(claims) != 0 || fmt.Sprint(others) != "[w1 w2]" {
+				t.Fatalf("past the grace: claims %v, others %v", claims, others)
+			}
+		})
+	}
+}
+
 // a12: the hook makes no hub request, so a closed or silent hub cannot slow it.
 func TestToolLedgerIgnoresHub(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

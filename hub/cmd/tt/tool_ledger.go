@@ -348,12 +348,16 @@ func toolPendingQueuePrefix(session string) string {
 	return fmt.Sprintf("q-%x-", sum[:8])
 }
 
-// pre evicts what the bound requires, then records the call's start.
+// pre evicts what the bound requires, then records the call's start. While
+// the rows' writes fail nothing is removed, so once a batch of entries beyond
+// the bound has built up it records no start; its post still writes the row.
 func (l toolLedger) pre(row toolLedgerRow, session string) {
 	if err := os.MkdirAll(l.pendingDir(), 0700); err != nil {
 		return
 	}
-	l.evict()
+	if l.evict() >= l.maxPending+toolLedgerEvictBatch {
+		return
+	}
 	start := l.now()
 	data, err := json.Marshal(toolLedgerPending{Start: start.UnixNano(), Session: row.Session, ToolUseID: row.ToolUseID, Tool: row.Tool, Digest: row.ArgsDigest})
 	if err != nil || len(data) > toolLedgerPendingBytes {
@@ -396,17 +400,19 @@ func toolPendingFile(name string) bool {
 }
 
 // evict writes an unknown row for each pending entry older than the age
-// bound, and for the oldest ones beyond the count bound less one, so the
-// pre that follows stays inside the bound. At most a batch per call.
+// bound, for the oldest ones beyond the count bound less one, so the pre
+// that follows stays inside the bound, and for each claim older than the
+// grace whatever the bounds. At most a batch per call. It returns the number
+// of pending files it leaves.
 //
 // Each entry is claimed by a rename first, then the rows are appended in
 // one write, then the claims are removed, so a pre cut off at any point
 // loses no entry. A claim left before the write is evicted again by a later
 // pre; one left after it gives a second unknown row for the same call.
-func (l toolLedger) evict() {
+func (l toolLedger) evict() int {
 	entries, err := os.ReadDir(l.pendingDir())
 	if err != nil {
-		return
+		return 0
 	}
 	type pendingFile struct {
 		name string
@@ -434,8 +440,12 @@ func (l toolLedger) evict() {
 	var rows []toolLedgerRow
 	var claims []string
 	for i, file := range files {
-		if len(rows) >= toolLedgerEvictBatch || (i >= over && now.Sub(file.mod) <= l.pendingAge) {
+		if len(rows) >= toolLedgerEvictBatch {
 			break
+		}
+		// claimPending leaves a claim inside the grace alone.
+		if i >= over && now.Sub(file.mod) <= l.pendingAge && !strings.HasPrefix(file.name, "e-") {
+			continue
 		}
 		claim, ok := l.claimPending(file.name, now)
 		if !ok {
@@ -446,11 +456,12 @@ func (l toolLedger) evict() {
 		claims = append(claims, claim)
 	}
 	if !l.append(rows...) {
-		return // the claims stay for a later pre
+		return len(files) // the claims stay for a later pre
 	}
 	for _, claim := range claims {
 		_ = l.remove(filepath.Join(l.pendingDir(), claim))
 	}
+	return len(files) - len(claims)
 }
 
 // claimPending renames a pending entry to an eviction claim that names the
