@@ -169,8 +169,9 @@ test("individual cleanup retries one closed agent while its project stays open",
 });
 
 // A fake hub for startup discovery: one open project whose agent runs on
-// agentHost. listing(n) decides the nth /v1/tasks response.
-function discoveryHub({ agentHost, listing = () => true, onFetch } = {}) {
+// agentHost. listing(n) decides the nth /v1/tasks response; hold(n), when
+// given, delays it until the returned promise settles.
+function discoveryHub({ agentHost, listing = () => true, hold, onFetch } = {}) {
   const taskId = "tsk_0123456789abcdef";
   const task = { id: taskId, name: "Discovered", status: "open" };
   const calls = { listings: 0, tokens: [] };
@@ -180,7 +181,9 @@ function discoveryHub({ agentHost, listing = () => true, onFetch } = {}) {
     if (url.endsWith("/v1/tasks")) {
       calls.listings++;
       calls.tokens.push(init?.headers?.Authorization || "");
-      if (!listing(calls.listings))
+      const n = calls.listings;
+      await hold?.(n);
+      if (!listing(n))
         return { status: 503, text: async () => '{"error":"unavailable"}' };
       return {
         status: 200,
@@ -330,5 +333,82 @@ test("startup discovery probes hostnames only on servers that sign in without as
     ["key", "hostname -s"],
     ["password", "hostname -s"],
   ]);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+});
+
+test("a stop during a failing startup listing cancels its retry, a client change reruns", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const stop of ["dispose", "stopAll"]) {
+    let release;
+    const fake = discoveryHub({
+      agentHost: "Mini",
+      listing: () => false,
+      hold: () => new Promise((r) => (release = r)),
+    });
+    const hub = createTaskHub(discoveryHost(fake));
+    hub.refresh();
+    void hub.discover();
+    await flush();
+    assert.equal(fake.calls.listings, 1);
+    hub[stop]();
+    release();
+    await flush();
+    t.mock.timers.tick(120000);
+    await flush();
+    assert.equal(fake.calls.listings, 1, stop);
+  }
+
+  const data = { hub: { url: "http://hub", token: "first" } };
+  let release;
+  const fake = discoveryHub({
+    agentHost: "Mini",
+    listing: (n) => n > 1,
+    hold: (n) => n === 1 && new Promise((r) => (release = r)),
+  });
+  const hub = createTaskHub(
+    discoveryHost(fake, {
+      getData: () => data,
+      getServers: () => [{ id: "mini", host: "Mini" }],
+    }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush();
+  data.hub.token = "second";
+  hub.refresh();
+  release();
+  await flush(40);
+  hub.stopAll();
+  assert.deepEqual(fake.calls.tokens, ["Bearer first", "Bearer second"]);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+});
+
+test("startup discovery probes a tailnet server that signs in with Tailscale SSH", async () => {
+  const probes = [];
+  const fake = discoveryHub({ agentHost: "Stephens-Mini" });
+  const hub = createTaskHub(
+    discoveryHost(fake, {
+      getServers: () => [
+        {
+          id: "mini",
+          host: "stephens-mac-mini.tail123.ts.net",
+          port: 22,
+          mode: "wasm",
+        },
+        { id: "sshmode", host: "x.tail123.ts.net", port: 22, mode: "ssh" },
+        { id: "altport", host: "y.tail123.ts.net", port: 2222 },
+        { id: "lan", host: "192.168.1.5", port: 22 },
+      ],
+      browserCommand: async (server, command) => {
+        probes.push([server.id, command]);
+        return "Stephens-Mini\n";
+      },
+    }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush(40);
+  hub.stopAll();
+  assert.deepEqual(probes, [["mini", "hostname -s"]]);
   assert.deepEqual(hub.bound(), [fake.taskId]);
 });

@@ -24,6 +24,7 @@ import {
 // the project dialogs reachable from the command palette.
 import { createHubClient, normalizeHubURL } from "./hub-client.js";
 import { createCachedHubClient } from "./cached-hub-client.js";
+import { isTailnetHost } from "./connection-help.js";
 import { normalizeTaskId, AGENT_NAME_RE } from "./task-ref.js";
 import {
   assertPauseEvidence,
@@ -105,6 +106,7 @@ export function createTaskHub(host) {
     done: false,
     retryTimer: null,
     retryDelay: 0,
+    stops: 0,
   };
   let tasksList = [];
   let launchEpoch = 0;
@@ -272,11 +274,13 @@ export function createTaskHub(host) {
       agentHosts: [...(serverHosts.get(serverKey(s)) || [])],
     }));
   // Discovery runs unattended at login, so it only probes servers that can
-  // sign in without asking: a verified host key plus a stored key or password
-  // (the vault's fingerprint, keyId and hasPassword fields), the check
-  // browserSSH applies to standard background sign-ins.
+  // sign in without asking: a tailnet server on port 22 outside SSH mode,
+  // which browserSSH signs in with Tailscale SSH, or a verified host key plus
+  // a stored key or password (the vault's fingerprint, keyId and hasPassword
+  // fields), the check browserSSH applies to standard background sign-ins.
   const signedIn = (server) =>
-    !!server.fingerprint && (!!server.keyId || !!server.hasPassword);
+    (server.mode !== "ssh" && server.port === 22 && isTailnetHost(server)) ||
+    (!!server.fingerprint && (!!server.keyId || !!server.hasPassword));
   async function resolveAgentHosts(eligible = () => true) {
     await Promise.allSettled(
       host.getServers().map(async (server) => {
@@ -350,6 +354,7 @@ export function createTaskHub(host) {
     clearTimeout(discovery.retryTimer);
     discovery.retryTimer = null;
     discovery.retryDelay = 0;
+    discovery.stops++;
   }
 
   // Ensure one feed per bound task; drop feeds whose task is no longer bound.
@@ -640,6 +645,7 @@ export function createTaskHub(host) {
     clearTimeout(discovery.retryTimer);
     discovery.retryTimer = null;
     const current = client;
+    const stops = discovery.stops;
     let failed = false;
     discovery.running = (async () => {
       const tasks = await current.listTasks();
@@ -689,7 +695,9 @@ export function createTaskHub(host) {
           void runDiscovery();
           return;
         }
-        if (!failed) return;
+        // A stop during the run (dispose, or stopAll with the same client)
+        // cancels the retry it would have scheduled.
+        if (!failed || stops !== discovery.stops) return;
         discovery.retryDelay = Math.min(
           60000,
           discovery.retryDelay ? discovery.retryDelay * 2 : 5000,
