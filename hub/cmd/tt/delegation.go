@@ -26,7 +26,7 @@ var delegationNow = time.Now
 
 // derivedKey is a stable per-minute retry key, like the other owner commands.
 func derivedKey(prefix string, parts ...string) string {
-	scope := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
+	scope := delegationNow().UTC().Truncate(time.Minute).Format(time.RFC3339)
 	digest := sha256.Sum256([]byte(strings.Join(append(parts, scope), "\x00")))
 	return fmt.Sprintf("%s-%x", prefix, digest[:12])
 }
@@ -94,14 +94,17 @@ func cmdOwnerDelegation(e env, args []string) error {
 		if !api.ValidDelegationScope(normalized) {
 			return errors.New("--scope must be decisions or decisions-merges-deploys")
 		}
-		if *requestID == "" {
+		explicit := *requestID != ""
+		if !explicit {
 			*requestID = derivedKey("owner-delegation-open", *delegate, forFlag.String(), *until, normalized, *reason)
 		}
 		req := api.OpenDelegationWindowRequest{Delegate: *delegate, EndsAt: ends.UTC().Truncate(time.Second), Scope: normalized, Reason: *reason,
 			Source: &api.DelegationSource{Kind: api.DelegationSourceTT}, RequestID: *requestID}
 		out, err := c.OpenDelegationWindow(ctx, *task, req)
 		if *forFlag != 0 && requestIDReused(err) {
-			out, err = replayDelegationOpen(ctx, c, *task, req, *forFlag, err)
+			out, err = replayDelegationOpen(ctx, c, *task, req, *forFlag, explicit, err)
+		} else if err == nil && out.Replay && out.Window != nil {
+			err = replayedWindowOpen(ctx, c, *task, out.Window.ID)
 		}
 		return printDelegationResult(out, err, *asJSON)
 	case "close":
@@ -115,11 +118,21 @@ func cmdOwnerDelegation(e env, args []string) error {
 }
 
 // delegationReplaySlack is how far a window's stored length may differ from
-// --for and still be the window an earlier call with the same request ID
-// opened. The hub stamps the start up to the 10 second request timeout after
+// --for and still be the window an earlier call with the same derived key
+// opened. The derived key already holds --for, so the slack only absorbs the
+// clocks: the hub stamps the start up to the 10 second request timeout after
 // the CLI read its clock, the end time loses up to a second to truncation,
 // and the rest allows for the two hosts' clocks differing.
 const delegationReplaySlack = 15 * time.Second
+
+// An explicit --request-id does not hold --for, so its window may be at most
+// explicitReplayShorter shorter (a second of end-time truncation plus request
+// latency) or explicitReplayLonger longer (clock jitter) than --for. A smaller
+// difference in --for cannot be told apart without the hub storing it.
+const (
+	explicitReplayShorter = 3 * time.Second
+	explicitReplayLonger  = time.Second
+)
 
 // requestIDReused reports the hub's refusal of a request ID that is already
 // stored with a different payload.
@@ -130,30 +143,92 @@ func requestIDReused(err error) bool {
 
 // replayDelegationOpen retries a refused --for open. A repeated call measures
 // --for from a later moment, so its end time differs from the one stored
-// under the request ID. This resends the request with the end time of each
-// window of the same length, scope and reason, newest first. The request ID
+// under the request ID. Windows carry no request ID, so this picks the newest
+// window of the same delegate, scope, reason and length and, only while that
+// window is open, resends the request once with its end time. The request ID
 // is already taken, so the hub can only replay the stored result or refuse
-// again: nothing new is opened, and a different delegate, scope, reason or
-// length still gets the hub's refusal.
-func replayDelegationOpen(ctx context.Context, c *api.Client, task string, req api.OpenDelegationWindowRequest, length time.Duration, refused error) (api.OwnerActionResult, error) {
+// again: nothing new is opened.
+func replayDelegationOpen(ctx context.Context, c *api.Client, task string, req api.OpenDelegationWindowRequest, length time.Duration, explicit bool, refused error) (api.OwnerActionResult, error) {
 	list, err := c.ListDelegationWindows(ctx, task)
 	if err != nil {
 		return api.OwnerActionResult{}, refused
 	}
+	shorter, longer := delegationReplaySlack, delegationReplaySlack
+	if explicit {
+		shorter, longer = explicitReplayShorter, explicitReplayLonger
+	}
 	windows := list.Windows
 	sort.SliceStable(windows, func(i, j int) bool { return windows[i].CreatedAt.After(windows[j].CreatedAt) })
-	for _, w := range windows {
-		off := w.EndsAt.Sub(w.CreatedAt) - length
-		if w.Scope != req.Scope || w.Reason != req.Reason || off < -delegationReplaySlack || off > delegationReplaySlack || w.EndsAt.Equal(req.EndsAt) {
+	var newest *api.DelegationWindow
+	for i, w := range windows {
+		if (w.DelegateName != req.Delegate && w.DelegateAgentID != req.Delegate) || w.Scope != req.Scope || w.Reason != req.Reason || w.EndsAt.Equal(req.EndsAt) {
 			continue
+		}
+		if newest == nil {
+			newest = &windows[i]
+		}
+		if off := w.EndsAt.Sub(w.CreatedAt) - length; off < -shorter || off > longer {
+			continue
+		}
+		if err := windowStillOpen(w, windows); err != nil {
+			return api.OwnerActionResult{}, err
 		}
 		req.EndsAt = w.EndsAt
 		out, err := c.OpenDelegationWindow(ctx, task, req)
-		if !requestIDReused(err) {
-			return out, err
+		if err == nil && out.Window != nil && out.Window.ID != w.ID {
+			// Another window with the same end time was stored under the request ID.
+			err = listedWindowOpen(out.Window.ID, windows)
 		}
+		return out, err
+	}
+	if newest != nil {
+		return api.OwnerActionResult{}, fmt.Errorf("%w; window %s to %s lasts %s, not --for %s, so it was not replayed",
+			refused, newest.ID, newest.DelegateName, newest.EndsAt.Sub(newest.CreatedAt).Round(time.Second), length)
 	}
 	return api.OwnerActionResult{}, refused
+}
+
+// replayedWindowOpen checks the current state of a window the hub replayed:
+// the replay is the open-time snapshot, which still says open.
+func replayedWindowOpen(ctx context.Context, c *api.Client, task, id string) error {
+	list, err := c.ListDelegationWindows(ctx, task)
+	if err != nil {
+		return fmt.Errorf("the hub replayed window %s but its current state could not be read: %w", id, err)
+	}
+	return listedWindowOpen(id, list.Windows)
+}
+
+func listedWindowOpen(id string, windows []api.DelegationWindow) error {
+	for _, w := range windows {
+		if w.ID == id {
+			return windowStillOpen(w, windows)
+		}
+	}
+	return fmt.Errorf("the hub replayed window %s but it is not listed", id)
+}
+
+// windowStillOpen refuses a closed or expired window, or one past its end
+// that the broker has not expired yet, and names the project's open window.
+func windowStillOpen(w api.DelegationWindow, windows []api.DelegationWindow) error {
+	now := delegationNow()
+	if w.Active(now) {
+		return nil
+	}
+	open := "no delegation window is open"
+	for _, o := range windows {
+		if o.Active(now) {
+			open = fmt.Sprintf("the open delegation window is %s to %s", o.ID, o.DelegateName)
+		}
+	}
+	state, at := w.State, w.EndsAt
+	if w.EndedAt != nil {
+		at = *w.EndedAt
+	}
+	if state == api.DelegationOpen {
+		state = api.DelegationExpired
+	}
+	return fmt.Errorf("window %s to %s %s at %s, so the repeated open was not replayed; %s",
+		w.ID, w.DelegateName, state, at.Local().Format("Jan 2 15:04"), open)
 }
 
 func printDelegationResult(out api.OwnerActionResult, err error, asJSON bool) error {

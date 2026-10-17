@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,7 +143,23 @@ func TestOwnerDelegationCLI(t *testing.T) {
 // function that advances it. The test must not run in parallel.
 func moveDelegationClock(t *testing.T) func(time.Duration) {
 	t.Helper()
-	now := time.Now()
+	return pinDelegationClock(t, time.Now())
+}
+
+// moveDelegationClockSkewed pins the CLI clock skew away from the hub's, on
+// whichever side leaves ten seconds before the next minute, so a derived
+// per-minute key stays the same while the test advances the clock.
+func moveDelegationClockSkewed(t *testing.T, skew time.Duration) func(time.Duration) {
+	t.Helper()
+	start := time.Now().Add(-skew)
+	if start.Second() >= 50 {
+		start = start.Add(2 * skew)
+	}
+	return pinDelegationClock(t, start)
+}
+
+func pinDelegationClock(t *testing.T, now time.Time) func(time.Duration) {
+	t.Helper()
 	old := delegationNow
 	delegationNow = func() time.Time { return now }
 	t.Cleanup(func() { delegationNow = old })
@@ -181,11 +202,23 @@ func TestOwnerDelegationOpenForReplaysAcrossSeconds(t *testing.T) {
 		"reason":          with("--reason", "at lunch"),
 		"shorter":         with("--for", "1h"),
 		"a minute longer": with("--for", "2h1m"),
+		"5s longer":       with("--for", "2h5s"),
+		"5s shorter":      with("--for", "1h59m55s"),
 	} {
 		advance(time.Second)
 		if out, err := run(args...); err == nil || !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "request ID was already used") {
 			t.Fatalf("different %s: %q %v", name, out, err)
 		}
+	}
+	// A changed duration names the stored window and its length.
+	listed, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "list", "--json"}) })
+	var windows api.DelegationWindowList
+	if err != nil || json.Unmarshal([]byte(listed), &windows) != nil || len(windows.Windows) != 1 {
+		t.Fatalf("list %q %v", listed, err)
+	}
+	w := windows.Windows[0]
+	if _, err := run(with("--for", "2h5s")...); err == nil || !strings.Contains(err.Error(), "window "+w.ID+" to lead lasts "+w.EndsAt.Sub(w.CreatedAt).Round(time.Second).String()+", not --for 2h0m5s") {
+		t.Fatalf("changed duration: %v", err)
 	}
 	list, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "list"}) })
 	if err != nil || list != out {
@@ -215,5 +248,175 @@ func TestOwnerDelegationOpenUntilReplayUnchanged(t *testing.T) {
 	}
 	if out, err := run(until.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "request ID was already used") {
 		t.Fatalf("different end time: %q %v", out, err)
+	}
+}
+
+// countDelegationOpens proxies the fixture hub and counts open requests.
+func countDelegationOpens(t *testing.T, owner env) (env, func() int) {
+	t.Helper()
+	target, err := url.Parse(owner.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var opens atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/delegation-windows") {
+			opens.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	owner.hub = srv.URL
+	return owner, func() int { return int(opens.Load()) }
+}
+
+func delegationWindows(t *testing.T, owner env) []api.DelegationWindow {
+	t.Helper()
+	listed, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "list", "--json"}) })
+	var list api.DelegationWindowList
+	if err != nil || json.Unmarshal([]byte(listed), &list) != nil {
+		t.Fatalf("list %q %v", listed, err)
+	}
+	return list.Windows
+}
+
+// A repeat after the window was closed reports it closed, never open, for an
+// explicit and a derived key, whether the hub replays it itself (same second)
+// or the CLI looks it up (later second).
+func TestOwnerDelegationOpenReplayClosedWindow(t *testing.T) {
+	for _, key := range []string{"explicit", "derived"} {
+		t.Run(key, func(t *testing.T) {
+			e, _, _, _ := cliWorkItemFixture(t)
+			owner, opens := countDelegationOpens(t, env{hub: e.hub, task: e.task})
+			open := []string{"delegation", "open", "--delegate", "lead", "--for", "2h", "--reason", "at the dentist"}
+			var advance func(time.Duration)
+			if key == "explicit" {
+				open = append(open, "--request-id", "open-1")
+				advance = moveDelegationClock(t)
+			} else {
+				advance = moveDelegationClockSkewed(t, 5*time.Second)
+			}
+			out, err := captureCLIOutput(t, func() error { return cmdOwner(owner, open) })
+			if err != nil || !strings.Contains(out, "open  → lead") {
+				t.Fatalf("open %q %v", out, err)
+			}
+			id := delegationWindows(t, owner)[0].ID
+			if _, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "close", id}) }); err != nil {
+				t.Fatal(err)
+			}
+			for _, later := range []time.Duration{0, 2 * time.Second} {
+				advance(later)
+				before := opens()
+				again, err := captureCLIOutput(t, func() error { return cmdOwner(owner, open) })
+				if err == nil || strings.Contains(again, "open  →") || !strings.Contains(err.Error(), "window "+id+" to lead closed at ") || !strings.Contains(err.Error(), "no delegation window is open") {
+					t.Fatalf("repeat %s later after close: %q %v", later, again, err)
+				}
+				if sent := opens() - before; sent != 1 {
+					t.Fatalf("repeat %s later sent %d opens, want only the refused one", later, sent)
+				}
+			}
+			if w := delegationWindows(t, owner); len(w) != 1 || w[0].State != "closed" {
+				t.Fatalf("windows %+v", w)
+			}
+		})
+	}
+}
+
+// Another delegate's open window is not replayed, and the replay sends at
+// most one open even with older matching windows. Each open pins the clock
+// so stored lengths match --for; each repeat advances it a second.
+func TestOwnerDelegationOpenReplayMatchesDelegateOnce(t *testing.T) {
+	for _, later := range []time.Duration{0, time.Second} {
+		t.Run(fmt.Sprintf("second database window ends %s later", later), func(t *testing.T) {
+			e, _, _, _ := cliWorkItemFixture(t)
+			owner, opens := countDelegationOpens(t, env{hub: e.hub, task: e.task})
+			open := func(delegate, id string) (string, error) {
+				return captureCLIOutput(t, func() error {
+					return cmdOwner(owner, []string{"delegation", "open", "--delegate", delegate, "--for", "2h", "--request-id", id})
+				})
+			}
+			openAt := func(at time.Time, delegate, id string) string {
+				pinDelegationClock(t, at)
+				if out, err := open(delegate, id); err != nil {
+					t.Fatalf("open %s %q %v", id, out, err)
+				}
+				return delegationWindows(t, owner)[0].ID
+			}
+			closeWindow := func(id string) {
+				if _, err := captureCLIOutput(t, func() error { return cmdOwner(owner, []string{"delegation", "close", id}) }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			repeat := func(delegate, id string) (string, error, int) {
+				advance := moveDelegationClock(t)
+				advance(2 * time.Second)
+				before := opens()
+				out, err := open(delegate, id)
+				return out, err, opens() - before
+			}
+			first := openAt(time.Now(), "lead", "lead-1")
+			closeWindow(first)
+			at := time.Now()
+			other := openAt(at, "database", "database-1")
+			out, err, sent := repeat("lead", "lead-1")
+			if err == nil || strings.Contains(out, "open  →") || !strings.Contains(err.Error(), "window "+first+" to lead closed") || !strings.Contains(err.Error(), "the open delegation window is "+other+" to database") {
+				t.Fatalf("lead repeat with the database window open: %q %v", out, err)
+			}
+			if sent != 1 {
+				t.Fatalf("lead repeat sent %d opens, want 1", sent)
+			}
+
+			// A closed and an open database window: a repeat of the older
+			// request ID resends once, to the newest. With the same end time
+			// the hub replays the closed window, which is reported closed;
+			// with a later one it refuses.
+			closeWindow(other)
+			openAt(at.Add(later), "database", "database-2")
+			out, err, sent = repeat("database", "database-1")
+			if err == nil || strings.Contains(out, "open  →") || sent != 2 {
+				t.Fatalf("older database repeat: %q %v, %d opens, want the refused one and one replay", out, err, sent)
+			}
+			if want := "window " + other + " to database closed"; later == 0 && !strings.Contains(err.Error(), want) || later != 0 && !strings.Contains(err.Error(), "409") {
+				t.Fatalf("older database repeat: %v", err)
+			}
+			if out, err, sent := repeat("database", "database-2"); err != nil || !strings.Contains(out, "open  → database") || sent != 2 {
+				t.Fatalf("newest database repeat: %q %v, %d opens, want the refused one and one replay", out, err, sent)
+			}
+		})
+	}
+}
+
+// The 15 second slack is for a derived key, whose request ID already holds
+// --for: with the CLI clock 8 s behind the hub it replays, while an explicit
+// request ID with the same skew is refused as a different duration.
+func TestOwnerDelegationOpenDerivedKeySlack(t *testing.T) {
+	for _, key := range []string{"derived", "explicit"} {
+		t.Run(key, func(t *testing.T) {
+			e, _, _, _ := cliWorkItemFixture(t)
+			owner, opens := countDelegationOpens(t, env{hub: e.hub, task: e.task})
+			advance := moveDelegationClockSkewed(t, 8*time.Second)
+			open := []string{"delegation", "open", "--delegate", "lead", "--for", "2h", "--scope", "decisions-merges-deploys"}
+			if key == "explicit" {
+				open = append(open, "--request-id", "skewed-1")
+			}
+			out, err := captureCLIOutput(t, func() error { return cmdOwner(owner, open) })
+			if err != nil || !strings.Contains(out, "open  → lead") {
+				t.Fatalf("open %q %v", out, err)
+			}
+			w := delegationWindows(t, owner)[0]
+			if off := (w.EndsAt.Sub(w.CreatedAt) - 2*time.Hour).Abs(); off < 6*time.Second || off > 11*time.Second {
+				t.Fatalf("window length %s, want about 8 s off 2h", w.EndsAt.Sub(w.CreatedAt))
+			}
+			advance(2 * time.Second)
+			before := opens()
+			again, err := captureCLIOutput(t, func() error { return cmdOwner(owner, open) })
+			if key == "derived" && (err != nil || again != out || opens()-before != 2) {
+				t.Fatalf("derived repeat %q %v, %d opens", again, err, opens()-before)
+			}
+			if key == "explicit" && (err == nil || !strings.Contains(err.Error(), "window "+w.ID+" to lead lasts ") || opens()-before != 1) {
+				t.Fatalf("explicit repeat %q %v, %d opens", again, err, opens()-before)
+			}
+		})
 	}
 }

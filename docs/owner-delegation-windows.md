@@ -133,6 +133,26 @@ tt owner delegation close dlw_... [--reason T]
 tt owner delegation list [--json]
 ```
 
+A repeated `open` reuses its request ID: the one given with `--request-id`, or one
+derived per minute from the delegate, `--for`/`--until`, scope and reason. The
+hub's replay is the open-time snapshot, so `tt` checks the window's current state
+and never prints a closed or expired window as open:
+
+- **Matching open window**: printed as the first call printed it; nothing new
+  opens. A repeated `--for` measures from a later moment, so its end time differs;
+  `tt` then picks the newest window with the same delegate (name or agent ID),
+  scope, reason and length and resends once with that window's end time.
+- **Closed or expired window**: `tt` prints when it was closed or expired (or its
+  end time, if the broker has not expired it yet), names the open window or says
+  none is open, and exits non-zero. Open a new window with a new request ID.
+- **Explicit `--request-id` with a different `--for`**: refused with the stored
+  window's ID and length, not replayed. The hub stores no duration, so `tt`
+  compares `--for` with the window's end minus its start: the stored length may
+  be up to 3 s shorter (end-time truncation and request latency) or 1 s longer.
+  A `--for` that differs by less than that cannot be told apart without a hub
+  change (review #28131 f2). A derived key already holds `--for`, so it allows
+  15 s either way for the two hosts' clocks differing.
+
 **Discord** (allowlisted owner in the project's channel): `/delegate agent until scope
 [reason]` (`until` is a duration such as `3h` or an RFC3339 time) and
 `/delegate-end [reason]`. The interaction and user IDs are recorded as the source;
