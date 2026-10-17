@@ -79,8 +79,9 @@ const (
 )
 
 // defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
-// its verifier checkouts.
-const defaultArtifactAcceptedAfter = 24 * time.Hour
+// its verifier checkouts: no wait. Nothing reads a lead's verify checkout once
+// its entry is accepted, and a deep release line of them held gigabytes.
+const defaultArtifactAcceptedAfter time.Duration = 0
 
 // maxArtifactTextBytes bounds one receipt or plan file read for citations.
 const maxArtifactTextBytes = 4 << 20
@@ -1192,14 +1193,14 @@ var artifactAcceptedAfterWarning sync.Once
 func artifactAcceptedAfter() time.Duration {
 	raw := os.Getenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER")
 	if raw == "" {
-		return defaultArtifactAcceptedAfter
+		return acceptedAfterInput(defaultArtifactAcceptedAfter)
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d < 0 {
 		artifactAcceptedAfterWarning.Do(func() {
-			fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACT_ACCEPTED_AFTER=%q is not a non-negative duration; using %s\n", raw, shortDuration(defaultArtifactAcceptedAfter))
+			fmt.Fprintf(os.Stderr, "[tt relay] TAILTERM_ARTIFACT_ACCEPTED_AFTER=%q is not a non-negative duration; using %s\n", raw, acceptedAfterText(defaultArtifactAcceptedAfter))
 		})
-		return defaultArtifactAcceptedAfter
+		return acceptedAfterInput(defaultArtifactAcceptedAfter)
 	}
 	return acceptedAfterInput(d)
 }
@@ -1212,6 +1213,14 @@ func acceptedAfterInput(d time.Duration) time.Duration {
 		return time.Nanosecond
 	}
 	return d
+}
+
+// acceptedAfterText prints an acceptance wait, "no wait" for zero.
+func acceptedAfterText(d time.Duration) string {
+	if d <= 0 {
+		return "no wait"
+	}
+	return shortDuration(d)
 }
 
 // shortDuration prints whole minutes without trailing zero units: 24h, 1h30m.
@@ -1344,7 +1353,7 @@ func newArtifactPass(in worktreeCleanupInputs, main string, linked []string) *ar
 	}
 	a := &artifactPass{root: canonicalPath(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
 	if a.acceptedAfter <= 0 {
-		a.acceptedAfter = defaultArtifactAcceptedAfter
+		a.acceptedAfter = acceptedAfterInput(defaultArtifactAcceptedAfter)
 	}
 	if a.now.IsZero() {
 		a.now = time.Now()
@@ -2335,7 +2344,7 @@ func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o s
 // sweepNow is the command's clock; tests replace it.
 var sweepNow = time.Now
 
-const sweepUsage = "usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR] [--hub URL] | --journal [--limit 20] [--json]"
+const sweepUsage = "usage: tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 0] [--artifacts DIR] [--cwd DIR] [--hub URL] | --journal [--limit 20] [--json]"
 
 // cmdTeamQueueSweepWorktrees applies the closeout rules to every existing
 // linked worktree of the repository, verifier checkouts under the artifacts
@@ -2350,7 +2359,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	apply := fs.Bool("apply", false, "remove the would-remove worktrees, session temp folders and verifier homes, trim the would-trim caches and prune missing worktrees")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
-	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old")
+	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old (default: no wait)")
 	artifacts := fs.String("artifacts", "", "artifacts root, an absolute path (default: TAILTERM_ARTIFACTS, else <main checkout>-artifacts)")
 	journal := fs.Bool("journal", false, "print this host's scheduled sweep journal, newest last")
 	limit := fs.Int("limit", 20, "with --journal: how many lines to print")

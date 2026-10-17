@@ -1604,7 +1604,7 @@ Go caches a verifier home's provenance marker owns, and removes marked
 verifier homes whose run is gone (see "Verifier homes").
 
 ```sh
-tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 24h] [--artifacts DIR] [--cwd DIR]
+tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 0] [--artifacts DIR] [--cwd DIR]
 tt team queue sweep-worktrees --journal [--limit 20] [--json]
 ```
 
@@ -1647,11 +1647,16 @@ as a check; it deletes.
   N old. Released means its newest finished queue entry has a release job in
   state `released`, a published release, or an owner integration. Accepted
   means that entry has a saved acceptance; its `acceptedAt` starts the wait.
-  N defaults to 24 hours: `--accepted-after` on the sweep, and
+  N defaults to zero, no wait: nothing reads a verifier checkout once its
+  entry is accepted, and a deep release line of them held gigabytes.
+  Closeout therefore removes an accepted item's clean checkouts as soon as the
+  entry's team is closed and cleaned (until then an agent bound to the item
+  that is not closed keeps them as `item-active`), and the scheduled sweep
+  uses the same default. `--accepted-after` on the sweep, and
   `TAILTERM_ARTIFACT_ACCEPTED_AFTER` (a Go duration such as `12h`) for
-  closeout. Zero means no wait. A negative `--accepted-after` is a usage
-  error; a negative or unreadable environment value prints one line to stderr
-  and uses 24 hours.
+  closeout and the scheduled sweep, set a wait instead. A negative
+  `--accepted-after` is a usage error; a negative or unreadable environment
+  value prints one line to stderr and uses no wait.
 - The checkout directory is the unit. Everything inside an eligible, clean
   checkout is deleted: tracked sources, `node_modules` and build output.
   Everything beside it in the item folder stays as it is: receipts, logs,

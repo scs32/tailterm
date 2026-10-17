@@ -2062,6 +2062,8 @@ func TestWorktreeCleanupSessionTemp(t *testing.T) {
 func TestWorktreeCleanupRunnerPrunesArtifactsAndTemp(t *testing.T) {
 	r := newCleanupRepo(t)
 	r.ignoreBuildOutput(t)
+	// A 24h wait, so the accepted entry's checkout is kept for retention.
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "24h")
 	const host = "fixture"
 	const task = "tsk_c1ea0c1ea0c1ea0a"
 	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
@@ -2119,7 +2121,8 @@ func TestWorktreeCleanupRunnerPrunesArtifactsAndTemp(t *testing.T) {
 	if m := readArtifactManifest(t, manifest); m.Source != "closeout" || m.ItemID != artifactItemA || m.EntryID != released.ID || m.Basis != artifactItemReleased || m.Bytes <= 0 {
 		t.Fatalf("closeout manifest %+v", m)
 	}
-	// Accepted an hour ago: the checkout waits; the closed team's temp goes.
+	// Accepted an hour ago: under the 24h override the checkout waits; the
+	// closed team's temp goes.
 	requireExists(t, acceptedCheckout, true)
 	requireExists(t, acceptedTemp, false)
 	// A bound agent is not closed: the item is active and its temp in use.
@@ -2174,6 +2177,93 @@ func TestWorktreeCleanupRunnerPrunesArtifactsAndTemp(t *testing.T) {
 	}
 }
 
+// With the default wait, closeout removes an accepted, unreleased item's clean
+// verifier checkout as soon as its team is closed: no 24h retention. A
+// checkout a receipt names is kept as evidence, and one whose team still has
+// an agent open is kept as item-active.
+func TestWorktreeCleanupCloseoutRemovesAcceptedCheckoutWithoutWait(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea11"
+	head := cleanupGit(t, r.main, "rev-parse", "HEAD")
+	acceptedAt := time.Now().Add(-time.Minute)
+	entry := func(id, item, name string) (api.TeamQueueEntry, string) {
+		cwd := r.queuePath(name)
+		q := api.TeamQueueEntry{ID: id, TaskID: task, ItemID: item, State: "finished", Host: host, Cwd: cwd, Repository: r.common, Position: 1,
+			Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd, Commit: head, AcceptedAt: acceptedAt.UTC().Format(time.RFC3339Nano)}}
+		return q, r.verifierCheckout(t, item, "verifier-abc1234")
+	}
+	closed, closedCheckout := entry("tqe_nowait_closed", artifactItemA, "queue-eeee0001")
+	cited, citedCheckout := entry("tqe_nowait_cited", artifactItemB, "queue-eeee0002")
+	writeFixtureFile(t, filepath.Join(r.artifacts(), artifactItemB, "verifier-abc1234-logs", "receipt.json"), `{"output":"`+citedCheckout+`/dist/app.js"}`)
+	open, openCheckout := entry("tqe_nowait_open", artifactItemC, "queue-eeee0003")
+	runningCwd := r.queuePath("queue-eeee0004")
+	cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", runningCwd, "tasks-hub")
+	running := api.TeamQueueEntry{ID: "tqe_nowait_running", TaskID: task, ItemID: "wi_d4d4d4d4d4d4d4d5", State: "running", Host: host, Cwd: runningCwd}
+	bound := func(id string, q api.TeamQueueEntry, status string) api.Agent {
+		return api.Agent{ID: id, Name: id, Host: host, Status: status, Cwd: q.Cwd, WorkItem: &api.AgentWorkItemBinding{ItemTaskID: task, ItemID: q.ItemID}}
+	}
+	hub := &cleanupHub{
+		byHost: api.TeamQueueList{Entries: []api.TeamQueueEntry{running}},
+		queues: map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{closed, cited, open, running}}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen, PauseState: api.ProjectPausePaused}, Agents: []api.Agent{
+			bound("agt_nowait_closed", closed, api.AgentClosed),
+			bound("agt_nowait_cited", cited, api.AgentClosed),
+			bound("agt_nowait_open", open, "done"),
+			bound("agt_nowait_running", running, "running"),
+		}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	runner := teamRunner{worktrees: closeoutWorktrees}
+	err = runner.tick(context.Background(), env{hub: server.URL}, c, host)
+	restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Accepted a minute ago with its team closed: the checkout goes now, and
+	// the receipt beside it stays.
+	requireExists(t, closedCheckout, false)
+	manifest := closedCheckout + ".removed.json"
+	if m := readArtifactManifest(t, manifest); m.Source != "closeout" || m.ItemID != artifactItemA || m.EntryID != closed.ID || m.Basis != artifactItemAccepted || m.BasisAt == "" || m.Bytes <= 0 {
+		t.Fatalf("closeout manifest %+v", m)
+	}
+	requireExists(t, citedCheckout, true)
+	requireExists(t, filepath.Join(r.artifacts(), artifactItemB, "verifier-abc1234-logs", "receipt.json"), true)
+	requireExists(t, openCheckout, true)
+	receipts := readCleanupReceipts(t)
+	for _, w := range []struct {
+		path, entry, action, reason string
+	}{
+		{closedCheckout, closed.ID, "removed", ""},
+		{citedCheckout, cited.ID, "kept", keepEvidence},
+		{openCheckout, open.ID, "kept", keepItemActive},
+	} {
+		rec, ok := receiptFor(receipts, w.path)
+		if !ok || rec.Source != "closeout" || rec.EntryID != w.entry || rec.Kind != kindArtifactCheckout || rec.Action != w.action || rec.Reason != w.reason {
+			t.Fatalf("closeout receipt for %s: %+v %v", w.path, rec, ok)
+		}
+	}
+	if rec, _ := receiptFor(receipts, closedCheckout); rec.Manifest != manifest || !strings.Contains(rec.Detail, "accepted") {
+		t.Fatalf("removal receipt %+v", rec)
+	}
+	for _, line := range []string{"removed " + closedCheckout, "kept evidence " + citedCheckout, "kept item-active " + openCheckout} {
+		if !strings.Contains(stderr.String(), line) {
+			t.Fatalf("stderr lacks %q: %q", line, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "kept retention") {
+		t.Fatalf("closeout kept a checkout for retention: %q", stderr.String())
+	}
+}
+
 // T12: the sweep command reports artifact checkouts and session temp with
 // sizes and changes nothing in a dry run; --apply removes exactly the dry
 // run's would-remove set; --json rows carry kind; a negative
@@ -2225,7 +2315,7 @@ func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
 	}
 
 	text, err := captureSweepStdout(t, func() error {
-		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s"})
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "24h"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2245,7 +2335,7 @@ func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
 	}
 	var dry worktreeSweepReport
 	out, err := captureSweepStdout(t, func() error {
-		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--json", "--artifacts", r.artifacts()})
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "24h", "--json", "--artifacts", r.artifacts()})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2289,12 +2379,18 @@ func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
 	if err != nil || !strings.Contains(out, "would-remove "+acceptedCheckout+" (artifact checkout; item "+artifactItemB+" accepted 2h ago; ") {
 		t.Fatalf("--accepted-after 1h output %v:\n%s", err, out)
 	}
-	// An explicit zero means no wait, not the default.
+	// An explicit zero means no wait, and so does the default.
 	out, err = captureSweepStdout(t, func() error {
 		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "0s"})
 	})
 	if err != nil || !strings.Contains(out, "would-remove "+acceptedCheckout+" (artifact checkout; ") {
 		t.Fatalf("--accepted-after 0s output %v:\n%s", err, out)
+	}
+	out, err = captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s"})
+	})
+	if err != nil || !strings.Contains(out, "would-remove "+acceptedCheckout+" (artifact checkout; item "+artifactItemB+" accepted 2h ago; ") {
+		t.Fatalf("default --accepted-after output %v:\n%s", err, out)
 	}
 	// An artifacts root elsewhere frees none of these checkouts: outside the
 	// root in use they are kept, the running item's as item-active.
@@ -2315,7 +2411,7 @@ func TestWorktreeCleanupSweepCommandArtifactsAndTemp(t *testing.T) {
 	}
 
 	text, err = captureSweepStdout(t, func() error {
-		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--apply"})
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", r.main, "--min-idle", "0s", "--accepted-after", "24h", "--apply"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2422,6 +2518,9 @@ func TestWorktreeCleanupArtifactHelpers(t *testing.T) {
 	if got := artifactsRootFor(r.main); got != filepath.Join(r.root, "elsewhere") {
 		t.Fatalf("overridden artifacts root %q", got)
 	}
+	if got := artifactAcceptedAfter(); got != time.Nanosecond {
+		t.Fatalf("accepted-after default %v, want no wait", got)
+	}
 	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "90m")
 	if got := artifactAcceptedAfter(); got != 90*time.Minute {
 		t.Fatalf("accepted-after override %v", got)
@@ -2437,7 +2536,7 @@ func TestWorktreeCleanupArtifactHelpers(t *testing.T) {
 	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "soon")
 	unparseable := artifactAcceptedAfter()
 	restore()
-	if negative != defaultArtifactAcceptedAfter || unparseable != defaultArtifactAcceptedAfter || strings.Count(stderr.String(), "TAILTERM_ARTIFACT_ACCEPTED_AFTER") != 1 {
+	if negative != time.Nanosecond || unparseable != time.Nanosecond || strings.Count(stderr.String(), "TAILTERM_ARTIFACT_ACCEPTED_AFTER") != 1 || !strings.Contains(stderr.String(), "; using no wait") {
 		t.Fatalf("bad accepted-after values gave %v %v, stderr %q", negative, unparseable, stderr.String())
 	}
 	if !holdsDetachedCheckout(filepath.Dir(linked)) || holdsDetachedCheckout(filepath.Join(r.artifacts(), artifactItemA)) {
@@ -2960,17 +3059,18 @@ func newTrimFixture(t *testing.T) trimFixture {
 }
 
 // accepted is a finished entry of item on this host, accepted two hours
-// before the fixture's clock: its verifier checkouts are kept for retention.
+// before the fixture's clock: under the 24h wait pass uses, its verifier
+// checkouts are kept for retention.
 func (f trimFixture) accepted(item string) api.TeamQueueEntry {
 	q := acceptedArtifactEntry(item, f.now.Add(-2*time.Hour))
 	q.Host, q.TaskID = trimHost, "tsk_c1ea0c1ea0c1ea10"
 	return q
 }
 
-// pass runs the sweep's own pass over the fixture.
+// pass runs the sweep's own pass over the fixture, with a 24h acceptance wait.
 func (f trimFixture) pass(t *testing.T, state sweepHubState, apply bool) map[string]worktreeDecision {
 	t.Helper()
-	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: f.now})
+	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: 24 * time.Hour, Now: f.now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3002,6 +3102,8 @@ func requireNoTombstones(t *testing.T, dirs ...string) {
 func TestWorktreeCleanupManualAndScheduledSweepsAgree(t *testing.T) {
 	f := newSweepFixture(t)
 	r := f.r
+	// Both sweeps wait 24h, so the accepted checkout is kept and trimmed.
+	t.Setenv("TAILTERM_ARTIFACT_ACCEPTED_AFTER", "24h")
 	f.host = spawn.Host()
 	at := f.now
 	oldNow := sweepNow
@@ -3071,7 +3173,7 @@ func TestWorktreeCleanupManualAndScheduledSweepsAgree(t *testing.T) {
 	}
 
 	out, err := captureSweepStdout(t, func() error {
-		return cmdTeamQueueSweepWorktrees(env{hub: f.hubURL}, []string{"--cwd", r.main, "--min-idle", "6h", "--apply", "--json"})
+		return cmdTeamQueueSweepWorktrees(env{hub: f.hubURL}, []string{"--cwd", r.main, "--min-idle", "6h", "--accepted-after", "24h", "--apply", "--json"})
 	})
 	if err != nil {
 		t.Fatalf("manual sweep: %v\n%s", err, out)
@@ -3240,9 +3342,9 @@ func TestWorktreeCleanupCacheTrimFinishedItems(t *testing.T) {
 	if caches != len(trimmed) {
 		t.Fatalf("%d cache receipts for %d trims", caches, len(trimmed))
 	}
-	// Closeout, which sets no trim, never trims.
+	// Closeout, which sets no trim, never trims, even in a kept checkout.
 	again := installModules(t, acc)
-	decisions, err := cleanupWorktrees(context.Background(), worktreeCleanupInputs{Repo: f.main, Now: f.now, Apply: true, Items: artifactItemStates(entries, agents), Receipt: worktreeCleanupReceipt{Source: "closeout"}})
+	decisions, err := cleanupWorktrees(context.Background(), worktreeCleanupInputs{Repo: f.main, Now: f.now, Apply: true, Items: artifactItemStates(entries, agents), AcceptedAfter: 24 * time.Hour, Receipt: worktreeCleanupReceipt{Source: "closeout"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3909,10 +4011,11 @@ func newHomeFixture(t *testing.T) homeFixture {
 	return homeFixture{trimFixture: f, tmp: tmp, procs: procs}
 }
 
-// sweepAt runs the sweep's own pass at now, with an optional matrix lock.
+// sweepAt runs the sweep's own pass at now, with a 24h acceptance wait and an
+// optional matrix lock.
 func (f homeFixture) sweepAt(t *testing.T, state sweepHubState, apply bool, now time.Time, matrix *matrixExclusion) map[string]worktreeDecision {
 	t.Helper()
-	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: now, Matrix: matrix})
+	decisions, err := runWorktreeSweep(context.Background(), state, trimHost, sweepOptions{Repo: f.main, Apply: apply, MinIdle: 6 * time.Hour, AcceptedAfter: 24 * time.Hour, Now: now, Matrix: matrix})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4890,7 +4993,7 @@ func TestVerifyHomeEvidenceErrorKeepsEarlierReceipts(t *testing.T) {
 	}
 	t.Cleanup(func() { worktreeGit = original })
 	decisions, err := runWorktreeSweep(context.Background(), sweepHubState{entries: []api.TeamQueueEntry{f.accepted(trimItemAcc)}}, trimHost,
-		sweepOptions{Repo: f.main, Apply: true, MinIdle: 6 * time.Hour, AcceptedAfter: defaultArtifactAcceptedAfter, Now: f.now})
+		sweepOptions{Repo: f.main, Apply: true, MinIdle: 6 * time.Hour, AcceptedAfter: 24 * time.Hour, Now: f.now})
 	if err == nil || !strings.Contains(err.Error(), "verifier home evidence lookup") {
 		t.Fatalf("error %v, want the verifier home lookup failure", err)
 	}
