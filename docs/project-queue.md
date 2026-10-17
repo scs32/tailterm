@@ -1120,8 +1120,10 @@ refuses an item with a live team. Then queue it as Planned with its reason:
 paths goes Planned by default with `reason=paths`. A new or revised
 order goes through the usual scope confirmation first. An item whose small
 entry failed and was released keeps its entry as history: retry it as Planned
-with `tt team queue requeue --entry ENTRY --template planned [--owns PATH...]`
-(see [Team queue amendments and retries](#team-queue-amendments-and-retries)).
+with `tt team queue requeue --entry ENTRY --template planned [--owns PATH...]`.
+Without `--owns` the retry takes the paths of the confirmed scope for the
+item's current revision and the order, not the failed entry's (see
+[Requeue a failed entry](#requeue-a-failed-entry)).
 
 ## Validated team operations
 
@@ -1412,9 +1414,19 @@ Preconditions, each refused with a 409 naming the entry:
   current revision.
 
 The attempt copies the failed entry's order, template, host, checkout,
-repository, ownership and base commit unless a flag overrides them. `--cwd DIR`
-names another checkout of the same repository on the launch host and takes its
-HEAD as the base. The usual fix for any refusal below is a fresh worktree at
+repository and base commit unless a flag overrides them. Its ownership is
+`--owns` when given. Without it, the attempt takes the paths recorded by the
+scope confirmation for the item's current revision and the order, so an
+amendment that replaced the owned paths is not undone by the retry. When that
+confirmation names no paths, the failed entry's ownership is kept only if the
+item is still at the failed entry's revision; otherwise the requeue is refused
+before any write: `entry tqe_ID cannot be requeued without --owns: its
+ownership was saved at item revision N, the item is now at revision M and its
+confirmed scope for order #SEQ names no paths; requeue with --owns PATH for each
+path the current scope owns`.
+
+`--cwd DIR` names another checkout of the same repository on the launch host
+and takes its HEAD as the base. The usual fix for any refusal below is a fresh worktree at
 the current tasks-hub tip, `git worktree add --detach DIR tasks-hub`, passed as
 `--cwd DIR`.
 

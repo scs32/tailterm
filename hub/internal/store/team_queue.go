@@ -2544,12 +2544,27 @@ func requeueTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, failed 
 	if template != "planned" && template != "small" {
 		return zero, fmt.Errorf("%w: entry %s: unknown queue template %q; use planned or small", api.ErrInvalid, failed.ID, template)
 	}
+	// Without --owns the retry takes the paths confirmed for the item's
+	// current revision and this order: an amendment may have replaced the
+	// failed entry's. Those are kept only at an unchanged revision. With no
+	// confirmation at all the scope check below refuses.
 	ownership, serial := failed.Ownership, failed.Serial
 	if len(req.Ownership) > 0 {
 		if ownership, err = canonicalQueueOwnership(req.Ownership); err != nil {
 			return zero, err
 		}
 		serial = false
+	} else {
+		confirmed, found, err := confirmedScopeOwnership(ctx, tx, task, failed.ItemID, item.Revision, order)
+		if err != nil {
+			return zero, err
+		}
+		switch {
+		case len(confirmed) > 0:
+			ownership, serial = confirmed, false
+		case found && item.Revision != failed.ItemRevision:
+			return refuse("cannot be requeued without --owns: its ownership was saved at item revision %d, the item is now at revision %d and its confirmed scope for order #%d names no paths; requeue with --owns PATH for each path the current scope owns", failed.ItemRevision, item.Revision, order)
+		}
 	}
 	limit, err := queueConcurrencyLimit(ctx, tx, task)
 	if err != nil {
@@ -2608,6 +2623,21 @@ func requeueTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, failed 
 		return refuse("cannot be requeued: its item already has a live entry: %v", err)
 	}
 	return e, nil
+}
+
+// confirmedScopeOwnership reads the paths the scope confirmation for an item
+// revision and order records; found reports whether that confirmation exists.
+func confirmedScopeOwnership(ctx context.Context, tx *sql.Tx, task, item string, revision, order int64) ([]string, bool, error) {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	owned, err := scopeOwnership(raw)
+	return owned, true, err
 }
 
 // queueRebindAuthority checks who may rebind an entry: the owner's unbound

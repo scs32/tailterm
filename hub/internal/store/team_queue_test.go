@@ -1707,7 +1707,13 @@ func (f *rebindFixture) amend(t *testing.T, key string) (api.WorkItem, api.Messa
 // item's amended revision, which a rebind requires.
 func (f *rebindFixture) confirm(t *testing.T, item api.WorkItem) {
 	t.Helper()
-	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: f.order.Seq, Complete: true}); err != nil {
+	f.confirmOwning(t, item)
+}
+
+// confirmOwning is confirm with the owned paths the handler records.
+func (f *rebindFixture) confirmOwning(t *testing.T, item api.WorkItem, owns ...string) {
+	t.Helper()
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: f.order.Seq, Complete: true, Ownership: owns}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2121,9 +2127,10 @@ func (f *rebindFixture) requeue() api.TeamQueueRequest {
 func TestTeamQueueRequeueFailedEntryAsNewAttempt(t *testing.T) {
 	f := newRebindFixture(t, true)
 	f.failAndRelease(t)
-	// The owner corrects the scope after the failure; the retry picks it up.
+	// The owner corrects the scope after the failure; the retry picks it up,
+	// with the paths confirmed for it rather than the failed entry's.
 	updated, _ := f.amend(t, "after-failure")
-	f.confirm(t, updated)
+	f.confirmOwning(t, updated, "client/board-view.js", "hub/internal/store")
 	failed, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
 	if err != nil || failed.State != "failed" || failed.ReleasedAt == "" || failed.Attempt != 1 {
 		t.Fatalf("failed entry %+v %v", failed, err)
@@ -2135,7 +2142,7 @@ func TestTeamQueueRequeueFailedEntryAsNewAttempt(t *testing.T) {
 	}
 	if retry.ID == failed.ID || !validTeamQueueID(retry.ID) || retry.ItemID != f.item.ID || retry.Attempt != 2 || retry.RetryOf != failed.ID || retry.State != "queued" || retry.Revision != 1 ||
 		retry.ItemRevision != updated.Revision || retry.OrderMessageSeq != failed.OrderMessageSeq || retry.Template != failed.Template || retry.Host != failed.Host || retry.Cwd != failed.Cwd || retry.Repository != failed.Repository ||
-		retry.BaseCommit != failed.BaseCommit || !reflect.DeepEqual(retry.Ownership, failed.Ownership) || retry.Position <= failed.Position || len(retry.LaunchJSON) != 0 || retry.HandlerID != "" || retry.Failure != "" {
+		retry.BaseCommit != failed.BaseCommit || !reflect.DeepEqual(retry.Ownership, []string{"client/board-view.js", "hub/internal/store"}) || retry.Serial || retry.Position <= failed.Position || len(retry.LaunchJSON) != 0 || retry.HandlerID != "" || retry.Failure != "" {
 		t.Fatalf("retry %+v\nof    %+v", retry, failed)
 	}
 	if replay, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req); err != nil || replay.ID != retry.ID {
@@ -2180,6 +2187,17 @@ func TestTeamQueueRequeueFailedEntryAsNewAttempt(t *testing.T) {
 	var items int
 	if err := f.s.db.QueryRow(`SELECT count(DISTINCT item_id) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&items); err != nil || items != 1 {
 		t.Fatalf("items with entries %d %v: the retry kept the item identity", items, err)
+	}
+}
+
+// An unamended retry without --owns keeps the failed entry's ownership: its
+// order's confirmation names no paths and the item revision is unchanged.
+func TestTeamQueueRequeueKeepsOwnershipAtUnchangedRevision(t *testing.T) {
+	f := newRebindFixture(t, false)
+	f.failAndRelease(t)
+	retry := f.action(t, f.requeue())
+	if retry.ItemRevision != f.entry.ItemRevision || !reflect.DeepEqual(retry.Ownership, f.entry.Ownership) || retry.Serial != f.entry.Serial || retry.Attempt != 2 {
+		t.Fatalf("unamended retry %+v\nof %+v", retry, f.entry)
 	}
 }
 
@@ -2242,6 +2260,19 @@ func TestTeamQueueRequeueRefusals(t *testing.T) {
 		f.failAndRelease(t)
 		f.amend(t, "x")
 		refused(t, f, f.requeue(), f.entry.ID, "scope is not confirmed", "tt team queue requeue")
+	})
+	t.Run("amended item whose confirmed scope names no paths", func(t *testing.T) {
+		f := newRebindFixture(t, false)
+		f.failAndRelease(t)
+		updated, _ := f.amend(t, "no-paths")
+		f.confirm(t, updated)
+		refused(t, f, f.requeue(), f.entry.ID, fmt.Sprintf("item revision %d", f.entry.ItemRevision), fmt.Sprintf("now at revision %d", updated.Revision), "--owns PATH")
+		// The paths the amended scope owns, given with --owns, are taken.
+		req := f.requeue()
+		req.Ownership = []string{"client/board-view.js"}
+		if retry := f.action(t, req); !reflect.DeepEqual(retry.Ownership, req.Ownership) || retry.ItemRevision != updated.Revision {
+			t.Fatalf("requeue with --owns %+v", retry)
+		}
 	})
 	t.Run("lead as caller", func(t *testing.T) {
 		f := newRebindFixture(t, true)
