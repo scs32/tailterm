@@ -537,24 +537,33 @@ The first scheduled run on a host deletes whatever a manual
 first, then read `--journal` after the run.
 
 **Go build cache trim.** The sweep leaves the shared Go build cache alone.
-A separate trim, in the same relay pass and before the sweep, removes build
-cache entries that no build has used for a set time. It is off by default and
-is turned on per host, by the owner, in that host's
-`~/.config/tailterm/relay.json`, read at each check:
+Two separate trims, in the same relay pass and before the sweep, remove build
+cache entries that no build has used for a set time. The trim of the user's
+own Go build cache (`go env GOCACHE`), `goBuildCacheTrim`, is off by default
+and is turned on per host, by the owner. The trim of the harness-owned
+verification cache's build directories, `verificationCacheTrim`, is on by
+default and is turned off per host, by the owner; its root and lock rules are
+in `docs/objective-verification.md`. Both read that host's
+`~/.config/tailterm/relay.json` at each check:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `goBuildCacheTrim` | absent, which is off | `"on"` turns the trim on for this host; `"off"` or no key is off. |
+| `goBuildCacheTrim` | absent, which is off | `"on"` turns the user cache trim on for this host; `"off"` or no key is off. |
 | `goBuildCacheTrimMaxAge` | `"24h"` | Entries whose modification time is older than this go. A Go duration; at least `2h`. |
 | `goBuildCacheTrimInterval` | `"1h"` | Time between trims, a Go duration; at least `5m`. |
+| `verificationCacheTrim` | absent, which is on | `"off"` turns the verification cache trim off for this host; `"on"` or no key is on. It runs once per sweep pass (`worktreeSweepInterval`). |
+| `verificationCacheTrimMaxAge` | `"24h"` | Verification build entries whose modification time is older than this go. A Go duration; at least `2h`. |
 
 `go` refreshes an entry's modification time when it uses the entry and the
 time is more than an hour old, which is why the age cannot be set under 2
 hours. A value under its floor uses the floor and a bad value uses the
-default; each says so once on the relay's stderr. A `goBuildCacheTrim` value
-other than `"on"` or `"off"` skips the run (`settings`). A missing or
-unreadable file is off. The sweep's own switch, `worktreeSweep`, does not
-affect the trim.
+default; each says so once on the relay's stderr. A `goBuildCacheTrim` or
+`verificationCacheTrim` value other than `"on"` or `"off"` skips that trim's
+run (`settings`). A missing file is off for the user cache trim and on for the
+verification cache trim. A file that cannot be read or is not a JSON object is
+off for the user cache trim and skips the verification cache trim's run
+(`settings`), since an owner's `"off"` cannot be read from it. The sweep's own
+switch, `worktreeSweep`, does not affect either trim.
 
 The never-clear rule still holds (`docs/go-build-cache.md`): nothing may clear
 the Go build cache, and this trim is not a clear. It never runs `go clean`,
