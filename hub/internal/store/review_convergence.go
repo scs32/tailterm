@@ -10,8 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -1193,27 +1191,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
 }
 
-// maxReviewFindingIDEcho caps the bytes of a finding ID a refusal repeats.
-const maxReviewFindingIDEcho = 64
-
-// reviewFindingIDEcho makes a finding ID safe to return to the client: control
-// characters become spaces, and an ID over the cap is cut on a character
-// boundary and ends with an ellipsis.
+// reviewFindingIDEcho makes a finding ID safe to return to the client through
+// api.ReviewFindingIDEcho, the rule the envelope check uses.
 func reviewFindingIDEcho(id string) string {
-	id = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, strings.ToValidUTF8(id, " "))
-	if len(id) <= maxReviewFindingIDEcho {
-		return id
-	}
-	cut := maxReviewFindingIDEcho
-	for cut > 0 && !utf8.RuneStart(id[cut]) {
-		cut--
-	}
-	return id[:cut] + "\u2026"
+	return api.ReviewFindingIDEcho(id)
 }
 
 // reviewFindingTitleRefusal names the finding whose title cannot become a work

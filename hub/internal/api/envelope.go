@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -193,9 +194,33 @@ func ReviewFindingTitleProblems(r *ReviewMetadata) []Problem {
 		case strings.TrimSpace(f.Title) != f.Title:
 			reason = "must not start or end with a space" + rule
 		}
-		out = append(out, Problem{Field: "review.findings[" + id + "].title", Reason: reason})
+		out = append(out, Problem{Field: "review.findings[" + ReviewFindingIDEcho(id) + "].title", Reason: reason})
 	}
 	return out
+}
+
+// maxReviewFindingIDEcho caps the bytes of a finding ID a refusal repeats.
+const maxReviewFindingIDEcho = 64
+
+// ReviewFindingIDEcho makes a finding ID safe to return to the client: control
+// characters and invalid UTF-8 become spaces, and an ID over the cap is cut on
+// a character boundary and ends with an ellipsis. The envelope check and the
+// store's refusals both echo IDs through it, so the two cannot drift.
+func ReviewFindingIDEcho(id string) string {
+	id = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(id, " "))
+	if len(id) <= maxReviewFindingIDEcho {
+		return id
+	}
+	cut := maxReviewFindingIDEcho
+	for cut > 0 && !utf8.RuneStart(id[cut]) {
+		cut--
+	}
+	return id[:cut] + "\u2026"
 }
 
 // ValidateEnvelope is pure and deterministic. It returns every problem found,

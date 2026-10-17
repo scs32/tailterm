@@ -491,3 +491,26 @@ func TestReviewConvergenceReconciliationEnvelope(t *testing.T) {
 		t.Fatal("reconcile requires NOTICE")
 	}
 }
+
+// The envelope title refusal repeats a finding ID through ReviewFindingIDEcho,
+// the same cap and replacement the store's refusals use.
+func TestEnvelopeReviewFindingTitleEchoesCappedID(t *testing.T) {
+	exact := strings.Repeat("a", 64)
+	for name, tc := range map[string]struct{ id, want string }{
+		"normal":       {"f1", "f1"},
+		"no ID":        {"", "0"},
+		"at the cap":   {exact, exact},
+		"over the cap": {exact + strings.Repeat("b", 40), exact + "\u2026"},
+		"control":      {"f\x1b1\n\t2", "f 1  2"},
+		"invalid utf8": {"f\xff1", "f 1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := validEnvelopes()[EnvelopeKindResult]
+			e.Review = &ReviewMetadata{Mode: "general", Findings: []ReviewFinding{{ID: tc.id, Title: ""}}}
+			want := []Problem{{Field: "review.findings[" + tc.want + "].title", Reason: "must not be empty; a title is 1 to 120 characters"}}
+			if got := ValidateEnvelope(e); !reflect.DeepEqual(got, want) {
+				t.Fatalf("problems %q, want %q", got, want)
+			}
+		})
+	}
+}
