@@ -792,6 +792,110 @@ func TestToolLedgerPendingIsBounded(t *testing.T) {
 	}
 }
 
+// Bug wi_9ac41217818e6dbc: a pre stopped part way through eviction loses no
+// entry. A failed write keeps every claim; a stop between the write and the
+// removes leaves the rest pending, and a later pre writes them again.
+func TestToolLedgerEvictionStopLosesNothing(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stop is the subject here, not timing
+	clock := setToolLedgerClock(t, time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC))
+	const n, k = 10, 4
+	for i := 0; i < n; i++ {
+		clock.advance(time.Millisecond)
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": fmt.Sprintf("u%d", i), "tool_name": "Bash", "tool_input": map[string]any{"n": i}})
+	}
+	pre := func(id string) {
+		t.Helper()
+		toolHook(t, e, "PreToolUse", map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash"})
+	}
+	// pending returns the tool-use ids of the eviction claims and of the
+	// other pending entries, each sorted.
+	pending := func() (claims, others []string) {
+		t.Helper()
+		for _, entry := range toolPendingFiles(t, root, e.agent) {
+			data, err := os.ReadFile(filepath.Join(root, e.agent, "pending", entry.Name()))
+			var p toolLedgerPending
+			if err != nil || json.Unmarshal(data, &p) != nil {
+				t.Fatalf("pending %s: %v %q", entry.Name(), err, data)
+			}
+			if strings.HasPrefix(entry.Name(), "e-") {
+				claims = append(claims, p.ToolUseID)
+			} else {
+				others = append(others, p.ToolUseID)
+			}
+		}
+		sort.Strings(claims)
+		sort.Strings(others)
+		return claims, others
+	}
+	unknownIDs := func() []string {
+		t.Helper()
+		var ids []string
+		for _, row := range toolLedgerRows(t, root, e.agent) {
+			if row["outcome"] != "unknown" || row["tool"] != "Bash" || row["session"] != "s1" || !toolDigestRE.MatchString(fmt.Sprint(row["argsDigest"])) {
+				t.Fatalf("row = %v; want an unknown row with what the pre recorded", row)
+			}
+			ids = append(ids, row["toolUseId"].(string))
+		}
+		return ids
+	}
+	ids := func(from, to int) []string {
+		var out []string
+		for i := from; i < to; i++ {
+			out = append(out, fmt.Sprintf("u%d", i))
+		}
+		sort.Strings(out)
+		return out
+	}
+	clock.advance(25 * time.Hour) // every entry is now past the age bound
+
+	// The rows' write fails: every entry stays claimed and nothing is written.
+	write := toolLedgerWrite
+	toolLedgerWrite = func(*os.File, []byte) error { return errors.New("disk full") }
+	pre("a")
+	toolLedgerWrite = write
+	if claims, others := pending(); fmt.Sprint(claims) != fmt.Sprint(ids(0, n)) || fmt.Sprint(others) != "[a]" || len(unknownIDs()) != 0 {
+		t.Fatalf("after a failed write: claims %v, others %v, rows %v", claims, others, unknownIDs())
+	}
+
+	// Past the claim grace a pre claims them again, writes all n rows, and
+	// is stopped at the remove of entry k, as a cut-off would stop it.
+	clock.advance(2 * time.Minute)
+	removes := 0
+	setToolLedger(t, &toolLedgerRemove, func(path string) error {
+		if removes++; removes == k {
+			panic("cut off")
+		}
+		return os.Remove(path)
+	})
+	pre("b") // stopped before it records its own call
+	toolLedgerRemove = os.Remove
+	if got := unknownIDs(); fmt.Sprint(got) != fmt.Sprint(ids(0, n)) {
+		t.Fatalf("rows after the stop = %v; want one unknown row for each of %v", got, ids(0, n))
+	}
+	if claims, others := pending(); fmt.Sprint(claims) != fmt.Sprint(ids(k-1, n)) || fmt.Sprint(others) != "[a]" {
+		t.Fatalf("after the stop: claims %v, others %v; want claims %v still pending", claims, others, ids(k-1, n))
+	}
+
+	// A claim inside the grace may belong to a live hook, so it is left alone.
+	pre("c")
+	if claims, _ := pending(); len(unknownIDs()) != n || len(claims) != n-k+1 {
+		t.Fatalf("inside the grace: %d rows, claims %v", len(unknownIDs()), claims)
+	}
+
+	// Past the grace the claims left after the write are written again: a
+	// second unknown row for the same call, as docs/claude-wake.md says.
+	clock.advance(2 * time.Minute)
+	pre("d")
+	got := unknownIDs()
+	if want := append(ids(0, n), ids(k-1, n)...); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("rows after recovery = %v; want %v", got, want)
+	}
+	if claims, others := pending(); len(claims) != 0 || fmt.Sprint(others) != "[a c d]" {
+		t.Fatalf("after recovery: claims %v, others %v", claims, others)
+	}
+}
+
 // a12: the hook makes no hub request, so a closed or silent hub cannot slow it.
 func TestToolLedgerIgnoresHub(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

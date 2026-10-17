@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -60,6 +61,7 @@ var (
 	toolLedgerLockWait         = 50 * time.Millisecond
 	toolLedgerNow              = time.Now
 	toolLedgerWrite            = func(f *os.File, b []byte) error { _, err := f.Write(b); return err }
+	toolLedgerRemove           = os.Remove
 )
 
 const (
@@ -67,6 +69,7 @@ const (
 	toolLedgerPendingBytes = 512 // largest pending file
 	toolLedgerFieldBytes   = 128 // largest stored name or id
 	toolLedgerLockRetry    = 2 * time.Millisecond
+	toolLedgerClaimGrace   = time.Minute // an eviction claim older than this has no live hook
 )
 
 // toolLedger is one hook call's copy of the settings and its agent directory.
@@ -83,6 +86,7 @@ type toolLedger struct {
 	lockWait   time.Duration
 	now        func() time.Time
 	write      func(*os.File, []byte) error
+	remove     func(string) error
 	// Secret redaction (tool_redact.go). The token is compared against tool
 	// output in memory and never written.
 	token        string
@@ -206,7 +210,7 @@ func toolLedgerHook(e env, _ []string) {
 	l := toolLedger{
 		started: time.Now(), deadline: toolLedgerDeadline,
 		maxInput: toolLedgerMaxInput, maxBytes: toolLedgerMaxBytes, maxPending: toolLedgerMaxPending,
-		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite,
+		pendingAge: toolLedgerPendingAge, lockWait: toolLedgerLockWait, now: toolLedgerNow, write: toolLedgerWrite, remove: toolLedgerRemove,
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
 		deny: toolDenyCheck, denyMax: toolDenyMaxCommand, scope: toolScopeCheck,
 		gate: toolGateOn, name: e.agentName, hub: os.Getenv("TAILTERM_HUB"),
@@ -386,13 +390,19 @@ func (l toolLedger) createPending(name string, data []byte, start time.Time) boo
 	return true
 }
 
+// toolPendingFile also matches an eviction claim, "e-" before the name.
 func toolPendingFile(name string) bool {
-	return (strings.HasPrefix(name, "i-") || strings.HasPrefix(name, "q-")) && strings.HasSuffix(name, ".json")
+	return (strings.HasPrefix(name, "i-") || strings.HasPrefix(name, "q-") || strings.HasPrefix(name, "e-")) && strings.HasSuffix(name, ".json")
 }
 
 // evict writes an unknown row for each pending entry older than the age
 // bound, and for the oldest ones beyond the count bound less one, so the
 // pre that follows stays inside the bound. At most a batch per call.
+//
+// Each entry is claimed by a rename first, then the rows are appended in
+// one write, then the claims are removed, so a pre cut off at any point
+// loses no entry. A claim left before the write is evicted again by a later
+// pre; one left after it gives a second unknown row for the same call.
 func (l toolLedger) evict() {
 	entries, err := os.ReadDir(l.pendingDir())
 	if err != nil {
@@ -422,17 +432,47 @@ func (l toolLedger) evict() {
 	now := l.now()
 	over := len(files) - (l.maxPending - 1)
 	var rows []toolLedgerRow
+	var claims []string
 	for i, file := range files {
 		if len(rows) >= toolLedgerEvictBatch || (i >= over && now.Sub(file.mod) <= l.pendingAge) {
 			break
 		}
-		entry, ok := l.take(file.name)
+		claim, ok := l.claimPending(file.name, now)
 		if !ok {
 			continue
 		}
+		entry, _ := l.readPending(claim) // an unreadable entry is still owned
 		rows = append(rows, toolLedgerRow{Session: entry.Session, Tool: entry.Tool, ToolUseID: entry.ToolUseID, ArgsDigest: entry.Digest, Outcome: "unknown"})
+		claims = append(claims, claim)
 	}
-	l.append(rows...)
+	if !l.append(rows...) {
+		return // the claims stay for a later pre
+	}
+	for _, claim := range claims {
+		_ = l.remove(filepath.Join(l.pendingDir(), claim))
+	}
+}
+
+// claimPending renames a pending entry to an eviction claim that names the
+// claim time, this process and the entry. Only the process whose rename
+// succeeds owns the entry, as a remove does for take. A claim younger than
+// the grace may belong to a hook still writing its row, so it is left alone.
+func (l toolLedger) claimPending(name string, now time.Time) (string, bool) {
+	entryName := name
+	if strings.HasPrefix(name, "e-") {
+		parts := strings.SplitN(name, "-", 4) // e, claim time, pid, entry name
+		if len(parts) == 4 {
+			if nanos, err := strconv.ParseInt(parts[1], 10, 64); err == nil && now.Sub(time.Unix(0, nanos)) < toolLedgerClaimGrace {
+				return "", false
+			}
+			entryName = parts[3]
+		}
+	}
+	claim := fmt.Sprintf("e-%020d-%d-%s", now.UnixNano(), os.Getpid(), entryName)
+	if os.Rename(filepath.Join(l.pendingDir(), name), filepath.Join(l.pendingDir(), claim)) != nil {
+		return "", false
+	}
+	return claim, true
 }
 
 // take reads a pending entry and removes it. Only the process whose remove
@@ -490,10 +530,11 @@ func (l toolLedger) claim(session string, row toolLedgerRow) (toolLedgerPending,
 // append writes rows to ledger.jsonl in one write, under the ledger lock
 // when it can be had within the lock wait. Rotation happens only under the
 // lock, after the size is read again, so two processes cannot both rotate
-// and lose the backup. Without the lock the rows are still appended.
-func (l toolLedger) append(rows ...toolLedgerRow) {
+// and lose the backup. Without the lock the rows are still appended. It
+// reports whether the rows were written.
+func (l toolLedger) append(rows ...toolLedgerRow) bool {
 	if len(rows) == 0 {
-		return
+		return true
 	}
 	stamp := l.now().UTC().Format(time.RFC3339Nano)
 	var buf bytes.Buffer
@@ -507,7 +548,7 @@ func (l toolLedger) append(rows ...toolLedgerRow) {
 		buf.WriteByte('\n')
 	}
 	if err := os.MkdirAll(l.dir, 0700); err != nil {
-		return
+		return false
 	}
 	path := filepath.Join(l.dir, "ledger.jsonl")
 	if unlock := l.lock(); unlock != nil {
@@ -518,10 +559,11 @@ func (l toolLedger) append(rows ...toolLedgerRow) {
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		return
+		return false
 	}
-	_ = l.write(f, buf.Bytes())
+	err = l.write(f, buf.Bytes())
 	_ = f.Close()
+	return err == nil
 }
 
 // lock returns the unlock function, or nil when the lock was not obtained.
