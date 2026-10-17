@@ -550,11 +550,17 @@ files are already selected by the `tests/` rule and the `npm test` glob.
 the suite, 315 s alone) is now that file plus `tests/release-runner-2.test.js`,
 `tests/release-runner-3.test.js` and `tests/release-runner-4.test.js`, with
 shared helpers in `tests/release-runner-fixtures.mjs`.
-`tests/verification.test.js` (319 s in that attempt, 282 s alone) is now that
+`tests/verification.test.js` (319 s in that attempt, 282 s alone) became that
 file plus `tests/verification-2.test.js` and `tests/verification-3.test.js`,
-with helpers in `tests/verification-fixtures.mjs`. After the split a full run
-under the host lock took 159 s and its slowest file 143 s. Tests that Go
-comments name (`wake a1`, the batch id vector) stay in
+with helpers in `tests/verification-fixtures.mjs`. On 2026-10-16
+`wi_2b82df2dbac73bc0` split `tests/verification-2.test.js` again, moving its
+shared cache and wasm build tests to `tests/verification-4.test.js` and its
+preflight, host lock and budget warning tests to
+`tests/verification-5.test.js`, so the verification tests are now those five
+files. In that item's imported verification receipt at ab1fab4 (integrated
+as 5f7edb5; generation 2, request `lead-bac73bc0-receipt-ab1fab4-r2`)
+npm-unit passed in 209 s, run beside the matrix's browser checks. Tests that
+Go comments name (`wake a1`, the batch id vector) stay in
 `tests/release-runner.test.js`. A fixtures module is a `.mjs` file under
 `tests/`, so the browser inventory reads it: it must not contain the text
 `.launch(` or a `verify-matrix:` marker line. One test, `held s1`, takes about
@@ -1332,7 +1338,10 @@ exits 0, and `--json` is unchanged. Five cases show no waitlist:
 
 The lock file lives on the machine that runs the matrix, so the list shows the
 waitlist only when it is run there. The hub's idle-entry stall check does not
-read it (`wi_772e88d71e5cd0e5`).
+read the file; it reads each member's reported activity, and a member whose
+`matrixWait` holds or waits for the host lock is not idle until 4 hours 30
+minutes after that wait's `since` (`wi_772e88d71e5cd0e5`;
+[agent-activity.md](agent-activity.md)).
 
 **When your run ends.** Feature `wi_a598ffa55a326699`, orders #33442 and
 #33457. The agent that started a run is told when it ends: within about a

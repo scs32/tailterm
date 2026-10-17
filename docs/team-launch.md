@@ -657,13 +657,13 @@ blocking entry, the supported fix command and since when it has held (a
 durable time from saved records, so a hub restart does not reset it), and its
 reason starts with `Stalled:`. Causes:
 
-| Cause             | Blocker                                                                                                                                     |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `failed-entry`    | a failed entry that still holds its slot; in a parallel project only while its item still has live runs (with none, the runner releases it) |
-| `nothing-running` | a launching or running entry with no live item-bound run for the 5-minute grace                                                             |
-| `idle-entry`      | a running entry whose live members are all idle, silent-finished or done, with no open work held or sent by them, for 30 minutes            |
-| `no-handler`      | no online, non-retired database handler exists                                                                                              |
-| `serial-halted`   | a failed entry halts a serial queue                                                                                                         |
+| Cause             | Blocker                                                                                                                                                                                                                                                              |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `failed-entry`    | a failed entry that still holds its slot; in a parallel project only while its item still has live runs (with none, the runner releases it)                                                                                                                          |
+| `nothing-running` | a launching or running entry with no live item-bound run for the 5-minute grace                                                                                                                                                                                      |
+| `idle-entry`      | a running entry whose live members are all idle, silent-finished or done, with no open work held or sent by them, for 30 minutes; a member whose reported matrix wait holds or waits for the matrix host lock, within 4 hours 30 minutes of its `since`, is not idle |
+| `no-handler`      | no online, non-retired database handler exists                                                                                                                                                                                                                       |
+| `serial-halted`   | a failed entry halts a serial queue                                                                                                                                                                                                                                  |
 
 A stall also covers slots or handler leases that are full only because stall
 blockers hold them. Waiting on a working team (an ownership overlap, full slots
