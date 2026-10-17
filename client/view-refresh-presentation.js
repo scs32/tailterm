@@ -151,8 +151,10 @@ export function createViewRefreshPresentation({ render }) {
   // A pointer on the container itself (its scrollbar) keeps the intent and
   // holds the repaint until release, so a drag that pauses with the button
   // down is not repainted under; a key keeps the intent until the scroll it
-  // starts has had time to begin.
+  // starts has had time to begin. A key during a held press leaves the press
+  // in place, so its matching release still ends the hold.
   function noteScrollIntent(node, pointerId = null) {
+    if (pointerId === null && scrollIntentPointer !== null) return;
     clearScrollIntent();
     scrollIntent = node;
     scrollIntentPointer = pointerId;

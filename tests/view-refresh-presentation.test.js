@@ -695,6 +695,26 @@ test("a paused scrollbar press holds a repaint until its pointer is released", (
   assert.equal(presentation.beforeRender("project-a"), true);
 });
 
+test("a key during a held scrollbar press does not end the hold", (t) => {
+  const view = scrolledView(t);
+  const { advance, listeners, root, detail, presentation } = view;
+  root.dispatch("pointerdown", { target: detail, button: 0, pointerId: 3 });
+  assert.equal(presentation.beforeRender("project-a"), false);
+  // Focus inside the container, then a scroll key on the body.
+  root.dispatch("keydown", {
+    target: { closest: (s) => (s === "[data-view-scroll]" ? detail : null) },
+    key: "a",
+  });
+  listeners.get("keydown")({ target: {}, key: "PageDown" });
+  advance(SCROLL_IDLE_MS * 2);
+  assert.equal(view.renders, 0);
+  listeners.get("pointerup")({ type: "pointerup", pointerId: 3 });
+  advance();
+  assert.equal(view.renders, 1);
+  advance(SCROLL_IDLE_MS * 4);
+  assert.equal(view.renders, 1);
+});
+
 test("a keyboard scroll holds a repaint until the scroll is idle", (t) => {
   const view = scrolledView(t);
   const { advance, listeners, root, detail, presentation } = view;
