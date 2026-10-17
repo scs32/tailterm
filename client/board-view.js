@@ -1019,6 +1019,8 @@ export function createBoardView({
         selector = `[data-decision-option="${active.dataset.decisionOption}"]`;
       if (selector)
         decisionFocus = {
+          // Request seqs repeat across hubs: restore only in this project.
+          task: renderedTask,
           requestSeq: activeDecision.dataset.decisionRequest,
           selector,
           selection:
@@ -2380,7 +2382,7 @@ export function createBoardView({
       input?.focus();
       if (selection) input?.setSelectionRange(...selection);
     }
-    if (decisionFocus) {
+    if (decisionFocus?.task === selected) {
       const input = root.querySelector(
         `[data-decision-request="${decisionFocus.requestSeq}"] ${decisionFocus.selector}`,
       );

@@ -14,13 +14,14 @@ import { prepareTestBinary } from "./test-binaries.mjs";
 
 const exec = promisify(execFile), root = process.cwd();
 const state = await mkdtemp(path.join(tmpdir(), "tailterm-board-decisions-"));
+const state2 = await mkdtemp(path.join(tmpdir(), "tailterm-board-decisions-hub2-"));
 const artifacts = path.join(root, ".build/board-decisions");
 await mkdir(artifacts, { recursive: true });
 // Omit HOME as well: the CLI must not read the host's hub credential file.
 const fixtureEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   !/^(TAILTERM_|CODEX_|TT_|TMUX)/.test(key) && key !== "HOME"));
 let hubBinary = path.join(state, "tailterm-hub"), ttBinary = path.join(state, "tt");
-let backend, web, browser, diagnosticPage;
+let backend, backend2, web, browser, diagnosticPage;
 const results = [], failures = [], screenshots = [], requests = [], frozenReads = new Map();
 // Holds one project's message-audit reads so a Board reload can be hidden mid-flight.
 let auditHold = null;
@@ -37,7 +38,7 @@ async function freePort() {
   await new Promise(resolve => server.close(resolve));
   return port;
 }
-let hub, origin;
+let hub, hub2, origin;
 function frozenResponse(url, freeze) {
   if (!freeze) return null;
   if (url.pathname.endsWith("/decisions")) {
@@ -52,11 +53,11 @@ function frozenResponse(url, freeze) {
   }
   return null;
 }
-async function api(method, route, body, expected = 200) {
+async function api(method, route, body, expected = 200, base = hub) {
   // Synthetic history setup respects the real server's 20 writes/sec bucket.
   // Do not retry mutations implicitly: retry behavior is itself under test.
   if (method !== "GET") await pause(60);
-  const response = await fetch(hub + route, {
+  const response = await fetch(base + route, {
     method, signal: AbortSignal.timeout(10000),
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -65,12 +66,12 @@ async function api(method, route, body, expected = 200) {
   assert.equal(response.status, expected, `${method} ${route}: ${text}`);
   return data;
 }
-async function project(name) {
-  const task = await api("POST", "/v1/tasks", { name, orchestrator: "fixture-worker" }, 201);
+async function project(name, base = hub) {
+  const task = await api("POST", "/v1/tasks", { name, orchestrator: "fixture-worker" }, 201, base);
   const agent = await api("POST", `/v1/tasks/${task.id}/agents`, {
     name: "fixture-worker", host: "synthetic.invalid", session: "unused-fixture-session",
     runtime: "codex", cwd: state,
-  }, 201);
+  }, 201, base);
   return { task, agent };
 }
 const question = label => ({
@@ -112,6 +113,22 @@ async function records(p, limit = 100) {
   }
 }
 async function record(p, seq) { return (await records(p)).find(d => d.request.seq === seq); }
+const post = (p, base) => api("POST", `/v1/tasks/${p.task.id}/messages`, { text: "Synthetic seq alignment" }, 201, base).then(m => m.seq);
+// Request seqs are hub-wide, so a same-seq decision needs a project on another hub.
+async function sameSeqQuestions(near, far, name) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let seqA = await post(near, hub), seqB = await post(far, hub2);
+    for (let posts = 0; seqA !== seqB; posts++) {
+      assert.ok(posts < 2000, `no shared seq across hubs (${seqA}, ${seqB})`);
+      if (seqA < seqB) seqA = await post(near, hub);
+      else seqB = await post(far, hub2);
+    }
+    const a = await ask(near, `${name}:focus-near.v${attempt}`, question(`${name} focus near`));
+    const b = await ask(far, `${name}:focus-far.v${attempt}`, question(`${name} focus far`), { base: hub2 });
+    if (a.seq === b.seq) return a.seq;
+  }
+  assert.fail("the two hubs' decision requests must share a seq");
+}
 async function messages(p) {
   const all = []; let after = 0;
   for (;;) {
@@ -163,7 +180,7 @@ const live=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>{
   work=fetch(url,init).then(async response=>{const text=await response.text();if(new URL(url).pathname.endsWith('/messages')){state.messageReads.push({url,text});if(state.messageReads.length>30)state.messageReads.shift()}return {status:response.status,statusText:response.statusText,headers:response.headers,text:async()=>text}}).finally(()=>pendingReads.delete(work));
   pendingReads.add(work);return work;
 }});
-const client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:1000});
+let client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:1000});
 const noop=()=>{}, board=createBoardView({client:()=>client,getTabs:()=>[],activate:noop,notice:text=>{state.notices.push(text);document.querySelector('#notice').textContent=text},addAgent:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop});
 const modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main'),onChange:(mode,view)=>{board.hide();view.replaceChildren();if(mode==='board'){board.mount(view);void board.show(params.get('task'))}}});
 modes.set('board');
@@ -173,6 +190,9 @@ window.qa={board,client,live,vault,state,modes,
   async show(id){modes.set('board');await board.show(id)},
   async beforeReload(){board.hide();client.dispose();await Promise.allSettled([...pendingReads])},
 };
+// A second hub behind /hub2 can hold a project whose request seqs match this one's.
+const cached=client;
+qa.useHub=prefix=>{client=prefix?createHubClient({baseURL:location.origin+prefix,fetchImpl:(url,init)=>fetch(url,init)}):cached};
 </script></body></html>`;
 
 async function serve(req, res) {
@@ -180,6 +200,18 @@ async function serve(req, res) {
     const url = new URL(req.url, origin || "http://127.0.0.1");
     if (url.pathname === "/") {
       res.writeHead(200, { "content-type": "text/html" }); res.end(html); return;
+    }
+    // The second hub is passed straight through, outside the instrumented path below.
+    if (url.pathname.startsWith("/hub2/v1/")) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = Buffer.concat(chunks);
+      const response = await fetch(hub2 + req.url.slice("/hub2".length), {
+        method: req.method, signal: AbortSignal.timeout(35000),
+        headers: body.length ? { "content-type": "application/json" } : undefined,
+        body: ["GET", "HEAD"].includes(req.method) ? undefined : body,
+      });
+      res.writeHead(response.status, { "content-type": "application/json" }); res.end(await response.text()); return;
     }
     if (url.pathname.startsWith("/v1/")) {
       const chunks = [];
@@ -366,12 +398,16 @@ try {
   ]);
   hub = `http://127.0.0.1:${await freePort()}`;
   backend = spawn(hubBinary, { env: { ...fixtureEnv, TAILTERM_STATE: state, TAILTERM_DEV_LISTEN: new URL(hub).host, TAILTERM_TCP_LISTEN: "" }, stdio: "ignore" });
-  let ready = false;
-  for (let i = 0; i < 100; i++) {
-    try { await api("GET", "/v1/tasks"); ready = true; break; }
-    catch { await pause(100); }
+  hub2 = `http://127.0.0.1:${await freePort()}`;
+  backend2 = spawn(hubBinary, { env: { ...fixtureEnv, TAILTERM_STATE: state2, TAILTERM_DEV_LISTEN: new URL(hub2).host, TAILTERM_TCP_LISTEN: "" }, stdio: "ignore" });
+  for (const base of [hub, hub2]) {
+    let ready = false;
+    for (let i = 0; i < 100; i++) {
+      try { await api("GET", "/v1/tasks", undefined, 200, base); ready = true; break; }
+      catch { await pause(100); }
+    }
+    assert.ok(ready, `isolated hub ${base} failed to start`);
   }
-  assert.ok(ready, "isolated hub failed to start");
   web = createServer(serve); web.listen(0, "127.0.0.1"); await once(web, "listening");
   origin = `http://127.0.0.1:${web.address().port}`;
 
@@ -393,9 +429,18 @@ try {
       assert.deepEqual(recovered, lost.committed);
       assert.equal((await records(other)).length, 1);
     });
-    // Decision discovery must be independent of the Board's latest-200 preview.
-    for (let i = 0; i < 205; i++) await api("POST", `/v1/tasks/${p.task.id}/messages`, { text: `Legacy ordinary message ${i}` }, 201);
-    await api("POST", `/v1/tasks/${p.task.id}/messages`, { text: "An ordinary reply is not a decision answer", replyTo: questions.selected.seq }, 201);
+    // The far hub catches up on seqs alongside the 206 seeding writes below.
+    const far = await project(`${name} Far hub project`, hub2);
+    const seedFrom = await post(p, hub), farFrom = await post(far, hub2);
+    await Promise.all([
+      (async () => { for (let seq = farFrom; seq < seedFrom + 206;) seq = await post(far, hub2); })(),
+      (async () => {
+        // Decision discovery must be independent of the Board's latest-200 preview.
+        for (let i = 0; i < 205; i++) await api("POST", `/v1/tasks/${p.task.id}/messages`, { text: `Legacy ordinary message ${i}` }, 201);
+        await api("POST", `/v1/tasks/${p.task.id}/messages`, { text: "An ordinary reply is not a decision answer", replyTo: questions.selected.seq }, 201);
+      })(),
+    ]);
+    const sharedSeq = await sameSeqQuestions(p, far, name);
     console.log(`${name}: synthetic history seeded; launching browser`);
     browser = await engine.launch();
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, acceptDownloads: true });
@@ -657,6 +702,40 @@ try {
         await page.evaluate(id => qa.show(id), p.task.id);
       }
     });
+    await check(`${name}: decision focus stays in the project it was rendered in`, async () => {
+      const seq = sharedSeq;
+      const focused = () => page.evaluate(seq => {
+        const active = document.activeElement;
+        return { inCard: !!active?.closest?.(`[data-decision-request="${seq}"]`), custom: active?.matches?.("[data-decision-custom]") || false,
+          selection: typeof active?.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null,
+          title: document.querySelector(".board-head h2")?.textContent };
+      }, seq);
+      await page.evaluate(id => qa.show(id), p.task.id);
+      await writeCustom(page, seq, "Synthetic focused draft");
+      await custom(page, seq).focus();
+      await page.evaluate(seq => document.querySelector(`[data-decision-request="${seq}"] [data-decision-custom]`).setSelectionRange(3, 9), seq);
+      // A same-project render keeps the focused control and its text selection.
+      const before = await page.evaluateHandle(seq => document.querySelector(`[data-decision-request="${seq}"] [data-decision-custom]`), seq);
+      await page.evaluate(() => qa.board.reload());
+      await page.waitForFunction(element => !element.isConnected, before);
+      assert.deepEqual(await focused(), { inCard: true, custom: true, selection: [3, 9], title: p.task.name },
+        "a same-project render dropped decision focus or its selection");
+      // A switch to the far project that the decision control did not start.
+      // An option is visible on both cards, so a restore there would take focus.
+      await option(page, seq, "staged").focus();
+      assert.equal((await focused()).inCard, true, "the option took no focus");
+      try {
+        await page.evaluate(async id => { qa.useHub("/hub2"); await qa.board.show(id); }, far.task.id);
+        await page.waitForFunction(({ seq, title }) => document.querySelector(".board-head h2")?.textContent === title &&
+          !!document.querySelector(`[data-decision-request="${seq}"] [data-decision-option="staged"]`), { seq, title: far.task.name });
+        const crossed = await focused();
+        assert.equal(crossed.title, far.task.name);
+        assert.equal(crossed.inCard, false, `focus moved onto decision ${seq} in another project`);
+      } finally {
+        await page.evaluate(async id => { qa.useHub(""); await qa.show(id); }, p.task.id);
+      }
+      await expect(page.locator(".board-head h2")).toHaveText(p.task.name);
+    });
     await check(`${name}: closed decisions/history remain readable with no enabled answer controls`, async () => {
       await page.setViewportSize({ width: 1440, height: 1000 });
       await page.evaluate(id => qa.show(id), p.task.id);
@@ -693,8 +772,10 @@ try {
 } finally {
   await browser?.close();
   if (web) { web.closeAllConnections(); await new Promise(resolve => web.close(resolve)); }
-  if (backend && backend.exitCode === null && backend.signalCode === null) { const stopped = once(backend, "exit"); backend.kill("SIGTERM"); await stopped; }
+  for (const child of [backend, backend2])
+    if (child && child.exitCode === null && child.signalCode === null) { const stopped = once(child, "exit"); child.kill("SIGTERM"); await stopped; }
   await rm(state, { recursive: true, force: true });
+  await rm(state2, { recursive: true, force: true });
   await writeFile(path.join(artifacts, "results.json"), JSON.stringify({ engines: [...engineNames], results, failures, screenshots }, null, 2));
   const escape = text => String(text).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
   await writeFile(path.join(artifacts, "index.html"), `<!doctype html><meta charset="utf-8"><title>Board decision acceptance</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:16px}li{margin:8px 0}img{max-width:100%;border:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>Board decision acceptance</h1><p>wi_65e8fd62e46a4eb8 · build #500 · independent QA #504. Real isolated hub and CLI; engines: ${escape([...engineNames].join(", "))}.</p><ul>${results.map(r => `<li>${r.pass ? "PASS" : "FAIL"} ${escape(r.name)}${r.error ? `<pre>${escape(r.error)}</pre>` : ""}</li>`).join("")}</ul>${screenshots.map(file => `<h2>${escape(file)}</h2><a href="${escape(file)}"><img src="${escape(file)}"></a>`).join("")}`);
