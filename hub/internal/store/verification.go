@@ -82,13 +82,30 @@ func (s *Store) VerificationHistory(ctx context.Context, task, item, agent, run 
 	}
 	return verificationRecords(ctx, s.db, task, item)
 }
-func availableVerificationAgent(ctx context.Context, q queryRower, task, id, run string) error {
+
+// availableVerificationAgent requires role's exact identity on its current,
+// available run.
+func availableVerificationAgent(ctx context.Context, q queryRower, task, role, id, run string) error {
 	var actual, status string
 	if err := q.QueryRowContext(ctx, `SELECT run_id,status FROM agents WHERE task_id=? AND id=?`, task, id).Scan(&actual, &status); err != nil {
-		return verificationConflict("exact verifier identity required")
+		return verificationConflict("exact " + role + " identity required")
 	}
 	if run == "" || actual != run || status == api.AgentRetired || status == api.AgentClosed || status == api.AgentExited {
-		return verificationConflict("current available verifier run required")
+		return verificationConflict("current available " + role + " run required")
+	}
+	return nil
+}
+
+// recordedVerificationBuilder requires the plan's exact builder identity and
+// run at receipt import. The builder adds nothing to the frozen commit by then
+// and routinely retires, closes or exits first, so its status is not checked.
+func recordedVerificationBuilder(ctx context.Context, q queryRower, task, id, run string) error {
+	var actual string
+	if err := q.QueryRowContext(ctx, `SELECT run_id FROM agents WHERE task_id=? AND id=?`, task, id).Scan(&actual); err != nil {
+		return verificationConflict("exact builder identity required")
+	}
+	if run == "" || actual != run {
+		return verificationConflict("current builder run required")
 	}
 	return nil
 }
@@ -122,10 +139,10 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 	if json.Unmarshal([]byte(envelope), &e) != nil || e.Kind != "assign" || target != p.BuilderAgentID || (p.AssignmentOwnershipDigest != verificationDigest(e.Body.Owns)) {
 		return verificationConflict("ownership and builder must match assignment")
 	}
-	if err = availableVerificationAgent(ctx, tx, item.TaskID, p.BuilderAgentID, p.BuilderRunID); err != nil {
+	if err = availableVerificationAgent(ctx, tx, item.TaskID, "builder", p.BuilderAgentID, p.BuilderRunID); err != nil {
 		return err
 	}
-	if err = availableVerificationAgent(ctx, tx, item.TaskID, p.VerifierAgentID, p.VerifierRunID); err != nil {
+	if err = availableVerificationAgent(ctx, tx, item.TaskID, "verifier", p.VerifierAgentID, p.VerifierRunID); err != nil {
 		return err
 	}
 	if p.BuilderAgentID == p.VerifierAgentID {
@@ -555,10 +572,10 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		if item.ScopeRevision != p.ScopeRevision {
 			return zero, verificationConflict("scope changed")
 		}
-		if err = availableVerificationAgent(ctx, tx, task, p.BuilderAgentID, p.BuilderRunID); err != nil {
+		if err = recordedVerificationBuilder(ctx, tx, task, p.BuilderAgentID, p.BuilderRunID); err != nil {
 			return zero, err
 		}
-		if err = availableVerificationAgent(ctx, tx, task, p.VerifierAgentID, p.VerifierRunID); err != nil {
+		if err = availableVerificationAgent(ctx, tx, task, "verifier", p.VerifierAgentID, p.VerifierRunID); err != nil {
 			return zero, err
 		}
 		state, e := reviewState(ctx, tx, task, itemID)

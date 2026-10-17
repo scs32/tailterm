@@ -495,6 +495,68 @@ func TestVerificationScopeInvalidationAndStaleVerifier(t *testing.T) {
 		t.Fatal("stale identity accepted", err)
 	}
 }
+
+// Bug wi_cbf709d0d4a70f80: a receipt imports once the plan's exact builder
+// run has retired, closed or exited, while an unknown builder, a changed
+// builder run and an unavailable verifier are still refused, each naming its
+// role.
+func TestVerificationReceiptAfterBuilderRunEnds(t *testing.T) {
+	setStatus := func(t *testing.T, f *convergenceFixture, id, status string) {
+		t.Helper()
+		if _, err := f.s.UpdateAgent(f.ctx, id, api.UpdateAgentRequest{Status: &status}, f.by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	importReceipt := func(f *convergenceFixture, h api.Agent, p api.VerificationPlan) error {
+		r := passingVerification(p)
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r})
+		return err
+	}
+	for _, status := range []string{api.AgentRetired, api.AgentClosed, api.AgentExited} {
+		t.Run(status+" builder imports", func(t *testing.T) {
+			f, h, p := verificationFixture(t)
+			saveFixturePlan(t, f, h, p, 0)
+			setStatus(t, f, p.BuilderAgentID, status)
+			if err := importReceipt(f, h, p); err != nil {
+				t.Fatal("receipt refused", err)
+			}
+			if history, _ := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID); len(history) != 2 || history[1].Kind != "receipt" {
+				t.Fatal("receipt not recorded", history)
+			}
+		})
+	}
+	t.Run("unknown builder refused", func(t *testing.T) {
+		f, h, p := verificationFixture(t)
+		saveFixturePlan(t, f, h, p, 0)
+		unknown := api.NewID("agt")
+		if _, err := f.s.db.Exec(`UPDATE verification_records SET record_json=replace(record_json,?,?) WHERE task_id=? AND item_id=?`, p.BuilderAgentID, unknown, f.task.ID, f.item.ID); err != nil {
+			t.Fatal(err)
+		}
+		p.BuilderAgentID = unknown
+		refusedFor(t, "unknown builder", "exact builder identity required", importReceipt(f, h, p))
+	})
+	t.Run("wrong builder run refused", func(t *testing.T) {
+		f, h, p := verificationFixture(t)
+		saveFixturePlan(t, f, h, p, 0)
+		if _, err := f.s.db.Exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), p.BuilderAgentID); err != nil {
+			t.Fatal(err)
+		}
+		setStatus(t, f, p.BuilderAgentID, api.AgentClosed)
+		refusedFor(t, "wrong builder run", "current builder run required", importReceipt(f, h, p))
+	})
+	t.Run("closed verifier refused", func(t *testing.T) {
+		f, h, p := verificationFixture(t)
+		saveFixturePlan(t, f, h, p, 0)
+		setStatus(t, f, p.VerifierAgentID, api.AgentClosed)
+		refusedFor(t, "closed verifier", "current available verifier run required", importReceipt(f, h, p))
+	})
+	t.Run("closed builder still refused at plan", func(t *testing.T) {
+		f, h, p := verificationFixture(t)
+		setStatus(t, f, p.BuilderAgentID, api.AgentClosed)
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "closed-builder-plan", AgentID: h.ID, RunID: h.RunID, Plan: &p})
+		refusedFor(t, "closed builder plan", "current available builder run required", err)
+	})
+}
 func TestVerificationDistinctReviewerCannotProduceReceipt(t *testing.T) {
 	f, h, p := verificationFixture(t)
 	_, err := f.post(api.Envelope{Kind: "review", Subject: "Review exact fixture candidate", Body: api.EnvelopeBody{Candidate: candidateA, Scope: "fixture", Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}, p.VerifierAgentID, 0, api.Agent{})
