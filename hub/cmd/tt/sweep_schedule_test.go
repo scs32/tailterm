@@ -1923,9 +1923,19 @@ func TestSweepScheduleStateFaultSpacing(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(relayDir(), 0700) })
 		f.now = f.now.Add(time.Hour)
-		if got := checks(f); got != 1 || failedState(t) != 1 || len(sweepJournalLines(t)) != 2 {
-			t.Fatalf("unsaveable state: %d attempts, lines %+v", got, sweepJournalLines(t))
+		// The first failure ran its pass before the save failed, and is
+		// journalled.
+		if !f.attempt() || failedState(t) != 1 || len(sweepJournalLines(t)) != 2 || f.sweeps != 2 {
+			t.Fatalf("first save failure: %d sweeps, lines %+v", f.sweeps, sweepJournalLines(t))
 		}
+		f.now = f.now.Add(sweepCheckInterval)
+		// j1/j2: each later try retries the save first and, while it still
+		// fails, applies no pass and writes no line.
+		gone := f.stale(t, "queue-5a7e0001")
+		if got := checks(f); got != 0 || len(sweepJournalLines(t)) != 2 || f.sweeps != 2 {
+			t.Fatalf("unsaveable state: %d attempts, %d sweeps, lines %+v", got, f.sweeps, sweepJournalLines(t))
+		}
+		requireExists(t, gone, true)
 		// The off switch cannot be recorded either: still the same episode.
 		off := defaultSweepSettings()
 		off.Off = true
@@ -1939,11 +1949,22 @@ func TestSweepScheduleStateFaultSpacing(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.now = f.now.Add(sweepRetryAfter)
-		if !f.attempt() || lastSweepLine(t).Outcome != "swept" {
-			t.Fatalf("after the repair: %+v", lastSweepLine(t))
+		// The save recovers: the same attempt sweeps and writes its one line.
+		if !f.attempt() || lastSweepLine(t).Outcome != "swept" || len(sweepJournalLines(t)) != 3 || f.sweeps != 3 {
+			t.Fatalf("after the repair: %d sweeps, lines %+v", f.sweeps, sweepJournalLines(t))
 		}
+		requireExists(t, gone, false)
 		if state, err := loadSweepState(); err != nil || !state.LastRunAt.Equal(f.now) {
 			t.Fatalf("state %+v: %v", state, err)
+		}
+		// The episode is over and the hourly interval is back.
+		ran := f.now
+		if got := checks(f); got != 0 || len(sweepJournalLines(t)) != 3 {
+			t.Fatalf("after the repair: %d attempts, lines %+v", got, sweepJournalLines(t))
+		}
+		f.now = ran.Add(defaultSweepSettings().Interval)
+		if !f.attempt() || lastSweepLine(t).Outcome != "swept" || len(sweepJournalLines(t)) != 4 {
+			t.Fatalf("an interval later: lines %+v", sweepJournalLines(t))
 		}
 	})
 }

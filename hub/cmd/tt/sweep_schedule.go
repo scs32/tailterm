@@ -301,6 +301,13 @@ func (g *stateFaultGate) blocked(now time.Time) bool {
 	return g.kind != "" && !now.Before(g.lastTry) && now.Sub(g.lastTry) < sweepRetryAfter
 }
 
+// saveFault reports whether the open fault is a save fault.
+func (g *stateFaultGate) saveFault() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.kind == stateFaultSave
+}
+
 // check notes the result of one state read or save. A failure opens or
 // extends the episode, and journal is true only for the episode's first. A
 // good save ends any episode; a good read ends only a read fault, since a
@@ -1439,6 +1446,19 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 	}
 	if !sweepDue(state, settings.Interval, now) {
 		return false
+	}
+	// While a save fault is open, the attempt time is saved before any
+	// applying work, so no pass is applied, unjournalled, from a state that
+	// still cannot record it. A save that works ends the episode, and this
+	// attempt goes on from the state it read.
+	if sweepStateFaults.saveFault() {
+		err := updateSweepState(func(s *sweepState) error {
+			s.LastAttemptAt = now.UTC()
+			return nil
+		})
+		if ok, wrote := stateFault(stateFaultSave, err, "the attempt time was not recorded"); !ok {
+			return wrote
+		}
 	}
 	// attempted saves the attempt time and writes the line; a save that fails
 	// is journalled in its place, once per episode.

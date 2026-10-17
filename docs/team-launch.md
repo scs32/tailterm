@@ -489,7 +489,11 @@ A matrix run does not skip the run: it keeps what it holds, and other trees go.
 
 *Journal.* Each attempt appends exactly one line to `worktree-sweep.jsonl` in
 the relay state directory (mode 0600), read with `tt team queue sweep-worktrees
---journal [--limit 20] [--json]`, newest last:
+--journal [--limit 20] [--json]`, newest last. A state file that cannot be
+read or saved is the exception: only the first failure of the episode is
+journalled, and the state is tried again every five minutes. During a save
+fault each try saves the state first and applies no pass until it saves; the
+first try that saves sweeps and writes its line.
 
 ```json
 {"at":"…","source":"schedule","outcome":"swept","reason":"","repositories":1,
