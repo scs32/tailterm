@@ -202,9 +202,8 @@ func TestUsageBoundedAppendPartialAndNoTranscriptText(t *testing.T) {
 	os.WriteFile(path, []byte(many), 0600)
 	cursor = activityCursor{}
 	count := 0
-	readActivityAppend(path, &cursor, func([]byte, *activityCursor) error { count++; return nil })
-	if count > 256 || cursor.Ready {
-		t.Fatal("unbounded pass", count, cursor)
+	if err := readActivityAppend(path, &cursor, func([]byte, *activityCursor) error { count++; return nil }); err != nil || count != 1000 || !cursor.Ready || cursor.Offset != int64(len(many)) {
+		t.Fatal("pass did not read to the end", err, count, cursor.Offset, cursor.Ready)
 	}
 }
 

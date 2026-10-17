@@ -1737,7 +1737,7 @@ func TestClaudeTranscriptReadBound(t *testing.T) {
 		old := claudeTranscriptReadMax
 		claudeTranscriptReadMax = 1 << 20
 		t.Cleanup(func() { claudeTranscriptReadMax = old })
-		appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", (3<<19)/33), "\n"))
+		appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", (6<<20)/33), "\n"))
 		var sent []string
 		t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 		prompt := "Tailterm messages #1. Run tt inbox --unread --mark-read."
@@ -1747,7 +1747,7 @@ func TestClaudeTranscriptReadBound(t *testing.T) {
 		}
 		info, _ := os.Stat(transcript)
 		snap, err := claudeTranscriptSnapshot(b, now)
-		if err != nil || snap.Offset != info.Size() || snap.ReadBytes <= 0 || snap.ReadBytes >= info.Size()-(1<<20)+(64<<10) {
+		if err != nil || snap.Offset != info.Size() || snap.ReadBytes != info.Size()-maxActivityPass {
 			t.Fatalf("second check did not continue from the first: read=%d size=%d err=%v", snap.ReadBytes, info.Size(), err)
 		}
 	})
@@ -1856,13 +1856,14 @@ func TestClaudeTranscriptCachedCursor(t *testing.T) {
 	}
 
 	// An ended context stops a long read between passes and keeps its place.
-	appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", 600), "\n"))
+	n := int(maxActivityPass/33) + 600
+	appendClaudeRecords(t, transcript, strings.TrimSuffix(strings.Repeat(`{"type":"mode","mode":"default"}`+"\n", n), "\n"))
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := claudeTranscriptSnapshotContext(ended, b, now); err == nil || !strings.HasSuffix(err.Error(), ": transcript read interrupted; continues on the next check") {
 		t.Fatalf("ended context: %v", err)
 	}
-	check("continues after the interruption", "", 344*33)
+	check("continues after the interruption", "", int64(n*33)-maxActivityPass)
 
 	// The caller's copy does not alias the cached state.
 	snap := check("copy", "", 0)

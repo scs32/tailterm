@@ -290,11 +290,10 @@ func readActivityAppend(path string, c *activityCursor, parse func([]byte, *acti
 	// Readiness is relative to this pass's observed EOF. An incomplete final
 	// record (including an oversized one being skipped) delays publication.
 	defer func() { c.Ready = c.Offset == info.Size() && c.Partial == "" && !c.Skipping }()
+	// The byte budget alone bounds a pass: it reads to the observed EOF
+	// however many records that spans.
 	reader := bufio.NewReaderSize(io.LimitReader(f, remaining), 64<<10)
-	for records := 0; ; records++ {
-		if records >= 256 {
-			return nil
-		}
+	for {
 		line, readErr := reader.ReadBytes('\n')
 		c.Offset += int64(len(line))
 		if c.Skipping {
@@ -933,7 +932,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 			c.SeenTurn, c.TurnComplete = true, true
 			clear(c.Pending)
 		}
-	case "summary", "progress", "file-history-snapshot", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
+	case "summary", "progress", "file-history-snapshot", "file-history-delta", "mode", "permission-mode", "ai-title", "atis-latch", "cost-state", "last-prompt", "attachment":
 	default:
 		return unknownClaudeRecordError{Type: rec.Type}
 	}

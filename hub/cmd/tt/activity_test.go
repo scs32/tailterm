@@ -761,6 +761,68 @@ func TestActivityLargeTranscriptFirstReport(t *testing.T) {
 	}
 }
 
+func TestActivityReaderReadsToEndRegardlessOfRecordCount(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, records int, padding int) (string, int64) {
+		t.Helper()
+		var data strings.Builder
+		for i := 0; i < records; i++ {
+			fmt.Fprintf(&data, "{\"type\":\"assistant\",\"timestamp\":\"2026-09-25T20:00:00Z\",\"padding\":%q,\"message\":{\"id\":\"m%d\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n", strings.Repeat("x", padding), i)
+		}
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(data.String()), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path, int64(data.Len())
+	}
+	// A burst of small records within the byte budget is read in one call.
+	path, size := write("small.jsonl", 1000, 0)
+	var c activityCursor
+	if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil || c.Offset != size || !c.Ready || c.Unknown || c.Tokens.Total != 2000 {
+		t.Fatalf("small burst not read to end in one call: size=%d offset=%d ready=%v unknown=%v tokens=%d %v", size, c.Offset, c.Ready, c.Unknown, c.Tokens.Total, err)
+	}
+	// Many records over the byte budget still stop at the budget, not Ready.
+	path, size = write("large.jsonl", 1000, 5<<10)
+	if size <= maxActivityPass {
+		t.Fatal("fixture too small")
+	}
+	c = activityCursor{}
+	if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil || c.Offset != maxActivityPass || c.Ready {
+		t.Fatalf("budget not enforced: size=%d offset=%d ready=%v %v", size, c.Offset, c.Ready, err)
+	}
+	if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil || c.Offset != size || !c.Ready || c.Tokens.Total != 2000 {
+		t.Fatalf("second call did not reach end: size=%d offset=%d ready=%v tokens=%d %v", size, c.Offset, c.Ready, c.Tokens.Total, err)
+	}
+}
+
+func TestActivityClaudeFileHistoryDeltaIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	read := func(name string, records ...string) activityCursor {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(strings.Join(records, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var c activityCursor
+		if err := readActivityAppend(path, &c, parseClaudeActivity); err != nil || !c.Ready {
+			t.Fatalf("%s not ready: offset=%d partial=%q %v", name, c.Offset, c.Partial, err)
+		}
+		return c
+	}
+	snapshot := `{"type":"file-history-snapshot","messageId":"m1","snapshot":{"trackedFileBackups":{}}}`
+	delta := `{"type":"file-history-delta","messageId":"m1","delta":{"trackedFileBackups":{}}}`
+	if c := read("delta.jsonl", snapshot, delta); c.Unknown {
+		t.Fatal("file-history-delta classified unknown")
+	}
+	if c := read("turn.jsonl", delta, `{"type":"user","timestamp":"2026-09-25T20:00:00Z","message":{"content":"synthetic prompt"}}`, delta, `{"type":"assistant","timestamp":"2026-09-25T20:00:01Z","message":{"id":"m1","stop_reason":"end_turn"}}`, delta); c.Unknown || !c.TurnComplete {
+		t.Fatalf("file-history-delta disturbed turn state: unknown=%v complete=%v", c.Unknown, c.TurnComplete)
+	}
+	// Every other unknown record type stays strict.
+	if c := read("future.jsonl", snapshot, `{"type":"file-history-future","messageId":"m1"}`); !c.Unknown {
+		t.Fatal("other unknown record type silently classified")
+	}
+}
+
 func TestActivityReaderReadinessResetsAtObservedEnd(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "synthetic.jsonl")
 	// More than two passes, including an oversized skipped record at the end.
