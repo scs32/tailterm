@@ -167,3 +167,168 @@ test("individual cleanup retries one closed agent while its project stays open",
   assert.match(commands[0][1], new RegExp(agentId));
   assert.equal(detail().task.status, "open");
 });
+
+// A fake hub for startup discovery: one open project whose agent runs on
+// agentHost. listing(n) decides the nth /v1/tasks response.
+function discoveryHub({ agentHost, listing = () => true, onFetch } = {}) {
+  const taskId = "tsk_0123456789abcdef";
+  const task = { id: taskId, name: "Discovered", status: "open" };
+  const calls = { listings: 0, tokens: [] };
+  const fetch = async (url, init) => {
+    onFetch?.(url, init);
+    if (url.includes("/events")) return new Promise(() => {});
+    if (url.endsWith("/v1/tasks")) {
+      calls.listings++;
+      calls.tokens.push(init?.headers?.Authorization || "");
+      if (!listing(calls.listings))
+        return { status: 503, text: async () => '{"error":"unavailable"}' };
+      return {
+        status: 200,
+        text: async () => JSON.stringify({ tasks: [task] }),
+      };
+    }
+    return {
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          task,
+          agents: [
+            {
+              id: "agt_0123456789abcdef",
+              name: "orchestrator",
+              host: agentHost,
+              session: "orchestrator",
+              status: "running",
+            },
+          ],
+          latestSeq: 0,
+        }),
+    };
+  };
+  return { taskId, calls, fetch };
+}
+const discoveryHost = (fake, overrides = {}) => ({
+  getData: () => ({ hub: { url: "http://hub" } }),
+  getIPN: () => ({ fetch: fake.fetch }),
+  getServers: () => [],
+  getTabs: () => [],
+  paneGroups: () => ({ model: { groups: [] }, sync() {} }),
+  render() {},
+  scheduleWorkspaceSave() {},
+  bookmark() {},
+  ...overrides,
+});
+const flush = async (n = 20) => {
+  for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+};
+
+test("a failed startup listing retries with backoff and binds without a refresh", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fake = discoveryHub({ agentHost: "Mini", listing: (n) => n >= 3 });
+  const hub = createTaskHub(
+    discoveryHost(fake, { getServers: () => [{ id: "mini", host: "Mini" }] }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush();
+  assert.equal(fake.calls.listings, 1);
+  assert.deepEqual(hub.bound(), []);
+  t.mock.timers.tick(4999);
+  await flush();
+  assert.equal(fake.calls.listings, 1);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(fake.calls.listings, 2);
+  t.mock.timers.tick(9999);
+  await flush();
+  assert.equal(fake.calls.listings, 2);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(fake.calls.listings, 3);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+  t.mock.timers.tick(120000);
+  await flush();
+  assert.equal(fake.calls.listings, 3);
+  hub.stopAll();
+
+  // Clearing the hub stops the retry.
+  const data = { hub: { url: "http://hub" } };
+  const failing = discoveryHub({ agentHost: "Mini", listing: () => false });
+  const cleared = createTaskHub(
+    discoveryHost(failing, { getData: () => data }),
+  );
+  cleared.refresh();
+  void cleared.discover();
+  await flush();
+  data.hub.url = "";
+  cleared.refresh();
+  t.mock.timers.tick(120000);
+  await flush();
+  assert.equal(failing.calls.listings, 1);
+});
+
+test("a client change during startup discovery binds on the next run", async () => {
+  const data = { hub: { url: "http://hub", token: "first" } };
+  const probes = [];
+  let hub;
+  const fake = discoveryHub({ agentHost: "Stephens-Mini" });
+  hub = createTaskHub(
+    discoveryHost(fake, {
+      getData: () => data,
+      getServers: () => [
+        {
+          id: "mini",
+          host: "stephens-mac-mini.tail123.ts.net",
+          fingerprint: "SHA256:fake",
+          keyId: "key1",
+        },
+      ],
+      browserCommand: async (server, command) => {
+        probes.push([server.id, command]);
+        data.hub.token = "second";
+        hub.refresh();
+        return "Stephens-Mini\n";
+      },
+    }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush(40);
+  hub.stopAll();
+  assert.deepEqual(probes, [["mini", "hostname -s"]]);
+  assert.deepEqual(fake.calls.tokens, ["Bearer first", "Bearer second"]);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+});
+
+test("startup discovery probes hostnames only on servers that sign in without asking", async () => {
+  const probes = [];
+  const fake = discoveryHub({ agentHost: "Stephens-Mini" });
+  const hub = createTaskHub(
+    discoveryHost(fake, {
+      getServers: () => [
+        { id: "key", host: "a.ts.net", fingerprint: "SHA256:a", keyId: "k" },
+        { id: "nocreds", host: "b.ts.net", fingerprint: "SHA256:b" },
+        { id: "unverified", host: "c.ts.net", keyId: "k" },
+        {
+          id: "password",
+          host: "d.ts.net",
+          fingerprint: "SHA256:d",
+          hasPassword: true,
+        },
+      ],
+      browserCommand: async (server, command) => {
+        probes.push([server.id, command]);
+        return server.id === "password" ? "Stephens-Mini\n" : "other\n";
+      },
+    }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush(40);
+  hub.stopAll();
+  assert.deepEqual(probes, [
+    ["key", "hostname -s"],
+    ["password", "hostname -s"],
+  ]);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+});

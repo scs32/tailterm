@@ -99,7 +99,13 @@ export function createTaskHub(host) {
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   // Startup binding of live projects; see discover().
-  const discovery = { pending: false, running: null, done: false };
+  const discovery = {
+    pending: false,
+    running: null,
+    done: false,
+    retryTimer: null,
+    retryDelay: 0,
+  };
   let tasksList = [];
   let launchEpoch = 0;
   const serverHosts = new Map();
@@ -265,9 +271,16 @@ export function createTaskHub(host) {
       ...s,
       agentHosts: [...(serverHosts.get(serverKey(s)) || [])],
     }));
-  async function resolveAgentHosts() {
+  // Discovery runs unattended at login, so it only probes servers that can
+  // sign in without asking: a verified host key plus a stored key or password
+  // (the vault's fingerprint, keyId and hasPassword fields), the check
+  // browserSSH applies to standard background sign-ins.
+  const signedIn = (server) =>
+    !!server.fingerprint && (!!server.keyId || !!server.hasPassword);
+  async function resolveAgentHosts(eligible = () => true) {
     await Promise.allSettled(
       host.getServers().map(async (server) => {
+        if (!eligible(server)) return;
         const key = serverKey(server);
         if (probedServers.has(key)) return;
         probedServers.add(key);
@@ -334,6 +347,9 @@ export function createTaskHub(host) {
   function stopAll() {
     for (const feed of feeds.values()) feed.stop();
     feeds.clear();
+    clearTimeout(discovery.retryTimer);
+    discovery.retryTimer = null;
+    discovery.retryDelay = 0;
   }
 
   // Ensure one feed per bound task; drop feeds whose task is no longer bound.
@@ -611,7 +627,8 @@ export function createTaskHub(host) {
   // Once per page load, after the workspace restore: bind every open,
   // non-paused project with an agent on a saved server, and drop bound
   // projects the hub reports closed, paused or missing. Waits for the hub to
-  // become reachable; a failed listing retries on the next refresh.
+  // become reachable; a failed listing retries after 5 s, doubling to 60 s,
+  // and a client change mid-run leaves discovery pending for the next client.
   function discover() {
     if (discovery.done) return discovery.running || Promise.resolve();
     discovery.pending = true;
@@ -620,12 +637,14 @@ export function createTaskHub(host) {
   function runDiscovery() {
     if (discovery.running) return discovery.running;
     if (!discovery.pending || !ready()) return Promise.resolve();
+    clearTimeout(discovery.retryTimer);
+    discovery.retryTimer = null;
+    const current = client;
+    let failed = false;
     discovery.running = (async () => {
-      const current = client;
       const tasks = await current.listTasks();
       if (current !== client) return;
-      discovery.pending = false;
-      discovery.done = true;
+      discovery.retryDelay = 0;
       const byId = new Map(tasks.map((task) => [task.id, task]));
       for (const id of [...bound])
         if (!liveProject(byId.get(id))) forgetTask(id);
@@ -648,19 +667,37 @@ export function createTaskHub(host) {
         );
       let unmatched = candidates.filter((detail) => !onSavedServer(detail));
       if (unmatched.length) {
-        await resolveAgentHosts();
+        await resolveAgentHosts(signedIn);
         unmatched = unmatched.filter((detail) => !onSavedServer(detail));
       }
       if (current !== client) return;
+      discovery.pending = false;
+      discovery.done = true;
       for (const detail of candidates)
         if (!unmatched.includes(detail)) bound.add(detail.task.id);
       sync();
       host.scheduleWorkspaceSave();
       host.render();
     })()
-      .catch(() => {})
+      .catch(() => {
+        failed = true;
+      })
       .finally(() => {
         discovery.running = null;
+        if (!discovery.pending || !ready()) return;
+        if (current !== client) {
+          void runDiscovery();
+          return;
+        }
+        if (!failed) return;
+        discovery.retryDelay = Math.min(
+          60000,
+          discovery.retryDelay ? discovery.retryDelay * 2 : 5000,
+        );
+        discovery.retryTimer = setTimeout(() => {
+          discovery.retryTimer = null;
+          void runDiscovery();
+        }, discovery.retryDelay);
       });
     return discovery.running;
   }
