@@ -150,8 +150,12 @@ and never prints a closed or expired window as open:
   compares `--for` with the window's end minus its start: the stored length may
   be up to 3 s shorter (end-time truncation and request latency) or 1 s longer.
   A `--for` that differs by less than that cannot be told apart without a hub
-  change (review #28131 f2). A derived key already holds `--for`, so it allows
-  15 s either way for the two hosts' clocks differing.
+  change (review #28131 f2). The hub stamps the start when it saves the open, so
+  a first call that reached it more than about 3 s late stores a shorter window:
+  a retry with the same explicit request ID and `--for` is then refused this way
+  although its window may be open. Check `tt owner delegation list`. A derived
+  key already holds `--for`, so it allows 15 s either way for latency and the two
+  hosts' clocks differing.
 
 **Discord** (allowlisted owner in the project's channel): `/delegate agent until scope
 [reason]` (`until` is a duration such as `3h` or an RFC3339 time) and
