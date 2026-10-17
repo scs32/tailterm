@@ -321,6 +321,67 @@ func TestLeadCopySkipsLeadAndRetries(t *testing.T) {
 	}
 }
 
+// wi_956f8d460d344f09 h1, h2: a person's board-wide reply on the item already
+// reaches and wakes the lead, so the lead gets no copy of it; an agent's
+// recipient-less reply and a directed reply are still copied.
+func TestLeadCopySkipsPersonBoardReply(t *testing.T) {
+	for _, kind := range []string{api.EnvelopeKindResult, api.EnvelopeKindBlock, api.EnvelopeKindDecline} {
+		t.Run("person board-wide "+kind, func(t *testing.T) {
+			f := newLeadCopyFixture(t)
+			request := f.send(t, f.verifier, f.handler, 0, true, leadCopyEnvelope(api.EnvelopeKindRequest))
+			before, err := f.s.Unread(f.ctx, f.task.ID, f.lead.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply := f.send(t, api.Agent{}, api.Agent{}, request.Seq, true, leadCopyEnvelope(kind))
+			if reply.To != "" || reply.From.AgentID != "" || reply.Broadcast || len(reply.WorkItems) != 1 {
+				t.Fatalf("fixture reply: %+v", reply)
+			}
+			if o, w := f.owed(t, f.lead); f.allCopies(t) != 0 || o != 0 || w != 0 {
+				t.Fatalf("a person's board-wide %s produced %d hub messages, %d lead obligations, %d lead wake jobs, want none", kind, f.allCopies(t), o, w)
+			}
+			// The lead is told once, by the reply itself.
+			after, err := f.s.Unread(f.ctx, f.task.ID, f.lead.ID)
+			if err != nil || after-before != 1 {
+				t.Fatalf("lead unread grew by %d (%v), want 1", after-before, err)
+			}
+		})
+	}
+	t.Run("agent recipient-less", func(t *testing.T) {
+		f := newLeadCopyFixture(t)
+		request := f.send(t, f.verifier, f.handler, 0, true, leadCopyEnvelope(api.EnvelopeKindRequest))
+		// A closed requester has no inbox, so the handler's reply stays board-wide.
+		if _, err := f.s.db.ExecContext(f.ctx, `UPDATE agents SET status='closed' WHERE id=?`, f.verifier.ID); err != nil {
+			t.Fatal(err)
+		}
+		reply := f.send(t, f.handler, api.Agent{}, request.Seq, true, leadCopyEnvelope(api.EnvelopeKindResult))
+		if reply.To != "" || reply.From.AgentID != f.handler.ID {
+			t.Fatalf("fixture reply: %+v", reply)
+		}
+		copies := f.copies(t, f.lead)
+		if len(copies) != 1 || f.allCopies(t) != 1 || copies[0].Envelope.Refs["message"] != fmt.Sprint(reply.Seq) {
+			t.Fatalf("lead copies = %+v (%d hub messages), want exactly one", copies, f.allCopies(t))
+		}
+		if c := copies[0]; c.Envelope.Subject != "A teammate received a reply on your item" || !strings.Contains(c.Envelope.Body.Text, f.handler.Name+" sent the board a RESULT") {
+			t.Fatalf("lead copy: %q %q", c.Envelope.Subject, c.Envelope.Body.Text)
+		}
+		if o, w := f.owed(t, f.lead); o != 1 || w != 1 {
+			t.Fatalf("lead has %d obligations and %d wake jobs, want 1 and 1", o, w)
+		}
+	})
+	t.Run("directed", func(t *testing.T) {
+		f := newLeadCopyFixture(t)
+		_, reply := f.exchange(t, api.EnvelopeKindResult, true)
+		copies := f.copies(t, f.lead)
+		if len(copies) != 1 || f.allCopies(t) != 1 || copies[0].Envelope.Refs["message"] != fmt.Sprint(reply.Seq) {
+			t.Fatalf("lead copies = %+v (%d hub messages), want exactly one", copies, f.allCopies(t))
+		}
+		if o, w := f.owed(t, f.lead); o != 1 || w != 1 {
+			t.Fatalf("lead has %d obligations and %d wake jobs, want 1 and 1", o, w)
+		}
+	})
+}
+
 // g2, g3: the idle lead is woken once, for the copy, and the requester gets no
 // wake job at all.
 func TestLeadCopyWakesOnce(t *testing.T) {

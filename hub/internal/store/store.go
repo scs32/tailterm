@@ -1496,11 +1496,14 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 // reply's transaction and posts one hub notice to the lead with a
 // delivery-only obligation, whose wake job wakes the lead once. The reply's
 // own recipient gets nothing more, and a retried post returns before this
-// point, so neither is told twice.
+// point, so neither is told twice. A person's reply with no recipient gets no
+// copy: it is already on the lead's page and the relay wakes every agent for
+// it (wakeEligible), so a copy would tell the lead twice (wi_956f8d460d344f09).
 func (s *Store) copyReplyToItemLead(ctx context.Context, tx *sql.Tx, task api.Task, m api.Message, req api.PostMessageRequest, target api.Agent) error {
 	e := req.Envelope
-	// On a swarm task the reply is broadcast and already reaches the lead.
-	if e == nil || req.ReplyTo <= 0 || m.Broadcast {
+	// On a swarm task the reply is broadcast and already reaches the lead, as
+	// does a person's board-wide reply.
+	if e == nil || req.ReplyTo <= 0 || m.Broadcast || (m.To == "" && m.From.AgentID == "" && m.From.Node != api.BrokerNode) {
 		return nil
 	}
 	if e.Kind != api.EnvelopeKindResult && e.Kind != api.EnvelopeKindBlock && e.Kind != api.EnvelopeKindDecline {
