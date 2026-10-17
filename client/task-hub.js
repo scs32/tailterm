@@ -106,7 +106,7 @@ export function createTaskHub(host) {
     done: false,
     retryTimer: null,
     retryDelay: 0,
-    stops: 0,
+    disposed: false,
   };
   let tasksList = [];
   let launchEpoch = 0;
@@ -354,7 +354,6 @@ export function createTaskHub(host) {
     clearTimeout(discovery.retryTimer);
     discovery.retryTimer = null;
     discovery.retryDelay = 0;
-    discovery.stops++;
   }
 
   // Ensure one feed per bound task; drop feeds whose task is no longer bound.
@@ -641,11 +640,11 @@ export function createTaskHub(host) {
   }
   function runDiscovery() {
     if (discovery.running) return discovery.running;
-    if (!discovery.pending || !ready()) return Promise.resolve();
+    if (discovery.disposed || !discovery.pending || !ready())
+      return Promise.resolve();
     clearTimeout(discovery.retryTimer);
     discovery.retryTimer = null;
     const current = client;
-    const stops = discovery.stops;
     let failed = false;
     discovery.running = (async () => {
       const tasks = await current.listTasks();
@@ -690,14 +689,14 @@ export function createTaskHub(host) {
       })
       .finally(() => {
         discovery.running = null;
-        if (!discovery.pending || !ready()) return;
+        // A dispose during the run cancels its rerun and retry. Routine stops
+        // (offline, client change) leave them to the connection state.
+        if (discovery.disposed || !discovery.pending || !ready()) return;
         if (current !== client) {
           void runDiscovery();
           return;
         }
-        // A stop during the run (dispose, or stopAll with the same client)
-        // cancels the retry it would have scheduled.
-        if (!failed || stops !== discovery.stops) return;
+        if (!failed) return;
         discovery.retryDelay = Math.min(
           60000,
           discovery.retryDelay ? discovery.retryDelay * 2 : 5000,
@@ -3571,6 +3570,7 @@ export function createTaskHub(host) {
     client: () => client,
     viewClient: () => viewClient,
     dispose() {
+      discovery.disposed = true;
       stopAll();
       viewClient?.dispose?.();
     },

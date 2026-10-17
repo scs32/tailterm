@@ -336,9 +336,9 @@ test("startup discovery probes hostnames only on servers that sign in without as
   assert.deepEqual(hub.bound(), [fake.taskId]);
 });
 
-test("a stop during a failing startup listing cancels its retry, a client change reruns", async (t) => {
+test("a dispose during a failing startup listing cancels its retry, a client change reruns", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  for (const stop of ["dispose", "stopAll"]) {
+  {
     let release;
     const fake = discoveryHub({
       agentHost: "Mini",
@@ -350,12 +350,12 @@ test("a stop during a failing startup listing cancels its retry, a client change
     void hub.discover();
     await flush();
     assert.equal(fake.calls.listings, 1);
-    hub[stop]();
+    hub.dispose();
     release();
     await flush();
     t.mock.timers.tick(120000);
     await flush();
-    assert.equal(fake.calls.listings, 1, stop);
+    assert.equal(fake.calls.listings, 1);
   }
 
   const data = { hub: { url: "http://hub", token: "first" } };
@@ -410,5 +410,39 @@ test("startup discovery probes a tailnet server that signs in with Tailscale SSH
   await flush(40);
   hub.stopAll();
   assert.deepEqual(probes, [["mini", "hostname -s"]]);
+  assert.deepEqual(hub.bound(), [fake.taskId]);
+});
+
+test("going offline and back during a failing startup listing still retries it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let release,
+    online = true;
+  const fake = discoveryHub({
+    agentHost: "Mini",
+    listing: (n) => n > 1,
+    hold: (n) => n === 1 && new Promise((r) => (release = r)),
+  });
+  const hub = createTaskHub(
+    discoveryHost(fake, {
+      getIPN: () => (online ? { fetch: fake.fetch } : null),
+      getServers: () => [{ id: "mini", host: "Mini" }],
+    }),
+  );
+  hub.refresh();
+  void hub.discover();
+  await flush();
+  const first = hub.client();
+  online = false;
+  hub.refresh();
+  online = true;
+  hub.refresh();
+  assert.equal(hub.client(), first);
+  release();
+  await flush();
+  assert.equal(fake.calls.listings, 1);
+  t.mock.timers.tick(5000);
+  await flush();
+  hub.stopAll();
+  assert.equal(fake.calls.listings, 2);
   assert.deepEqual(hub.bound(), [fake.taskId]);
 });
