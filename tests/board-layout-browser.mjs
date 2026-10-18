@@ -504,6 +504,7 @@ try {
         await expect.poll(() => page.evaluate(() => dragProbe.renderedAt), {timeout:3000, message:`${label}: refresh never painted after release`}).toBeGreaterThan(0);
         const probe = await page.evaluate(() => dragProbe);
         assert.ok(probe.releasedAt > 0, `${label}: no window pointerup after the scrollbar drag`);
+        assert.ok(probe.renderedAt >= probe.releasedAt, `${label}: refresh painted at ${probe.renderedAt.toFixed(0)} ms, before the release at ${probe.releasedAt.toFixed(0)} ms`);
         const delay = probe.renderedAt - probe.releasedAt;
         assert.ok(delay <= idle + margin, `${label}: refresh painted ${delay.toFixed(0)} ms after release, over ${idle} ms idle + ${margin} ms margin`);
         const kept = await page.locator('#mode-view [data-view-scroll="rail"]').evaluate(el => el.scrollTop);
