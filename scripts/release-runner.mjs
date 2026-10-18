@@ -343,14 +343,23 @@ export function matrixHeldNotice(job, held) {
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
 const ancestor = (cwd,a,b) => {try{git(cwd,"merge-base","--is-ancestor",a,b);return true;}catch{return false;}};
+// Whether tip already carries the candidate: its commit is its base, or it
+// is an ancestor of tip and every path it changes has its content at tip.
+// Ancestry alone is not enough: a rolled-back release's revert keeps the
+// commit an ancestor of tip without its content, and a retry must ship it.
+function carried(cwd,job,tip){
+  if(job.commit===job.baseCommit)return true;
+  if(!ancestor(cwd,job.commit,tip))return false;
+  const paths=execFileSync("git",["diff","--name-only","--no-renames","-z",job.baseCommit,job.commit],{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).split("\0").filter(Boolean);
+  if(!paths.length)return true;
+  try{execFileSync("git",["--literal-pathspecs","diff","--quiet",job.commit,tip,"--",...paths],{cwd,stdio:["ignore","ignore","ignore"]});return true;}catch{return false;}
+}
 // What a candidate that cannot fast-forward adds on top of tip: nothing when
-// its commit is already on tip (an accepted no-change result, or a change
-// tip already carries), else its linear series from base. An empty series
-// that tip does not contain and a merge commit are refused apart.
+// tip carries it (an accepted no-change result), else its linear series from
+// base. A merge commit in the series is refused.
 function candidateSeries(cwd,job,tip){
-  if(ancestor(cwd,job.commit,tip))return [];
+  if(carried(cwd,job,tip))return [];
   const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
-  if(!commits.length)throw releaseError("Empty candidate series");
   if(commits.some(c=>git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2))throw releaseError("Nonlinear candidate series");
   return commits;
 }
@@ -477,7 +486,7 @@ export function batchPlanCovers(plan,jobs){
   return null;
 }
 // One member's commits cherry-picked onto head, or head itself for a member
-// already on head; a failure leaves the checkout on head and throws the
+// head already carries; a failure leaves the checkout on head and throws the
 // refusal integrateCandidate would.
 function pickCandidate(cwd,job,head){
   if(!sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit!==job.commit)throw releaseError("Release binding mismatch");
@@ -500,8 +509,8 @@ function pickCandidate(cwd,job,head){
 // first. A hook that throws (an unconfirmed hub call) is passed on with the
 // checkout untouched. Returns today's integration, the jobs dropped, and
 // batch only when a member joined. The hub refuses a range that adds no
-// commit, so a lead with no change opens no batch, and a member already on
-// the batch's head is dropped as batch-no-change; each releases alone.
+// commit, so a lead with no change opens no batch, and a member the batch's
+// head already carries is dropped as batch-no-change; each releases alone.
 export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
   const first=integrateCandidate(cwd,lead),jobs=[],dropped=[];
   await hooks.integrated?.(first);
@@ -653,7 +662,7 @@ export async function runRelease(config, adapter) {
   // fence (wi_f2e585b63f57b6f8): while nothing is published and no effect is
   // journaled the job waits for the next poll, claimed and unrefused, with its
   // journal as the last poll left it. Here nothing was touched yet.
-  const unpublished=journal=>journal?.published!==true && !journal?.effects?.length;
+  const unpublished=journal=>journal?.published!==true && journal?.mergedSent!==true && !journal?.effects?.length;
   if(!finishOnly){
     let ok;
     try{ok=await held(pending);}catch(error){if(error?.transport===true && unpublished(pending))return {jobId:job.id,outcome:"waiting_transport"};throw error;}
@@ -917,8 +926,11 @@ export async function runRelease(config, adapter) {
     // records it merged at its own commit, which needs no integrated matrix
     // receipt, and it settles released with no targets; the journal keeps
     // noChange as the reason. The checkout stays on the tip it found.
+    // mergedSent is saved before the call: the hub may hold the job as
+    // published even when its reply is lost, so a failed call ends blocked
+    // for handler reconciliation, as after publication, and never refuses.
     if(state.noChange){
-      await fence();await adapter.merged(job.commit);state.phase="merged";checkpoint();
+      await fence();state.mergedSent=true;checkpoint();await adapter.merged(job.commit);state.phase="merged";checkpoint();
       state.receipt={version:1,jobId:job.id,commit:job.commit,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
       state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();
       await adapter.finish(state.receipt,state.finishGeneration);state.phase="complete";checkpoint();return state.receipt;
@@ -1015,7 +1027,7 @@ export async function runRelease(config, adapter) {
     }
     // An uncertain side effect cannot be replayed. Rollback uses only retained
     // target artifacts; the adapter must never restore an old live database.
-    if(!state.published && state.effects.length===0){
+    if(!state.published && !state.mergedSent && state.effects.length===0){
       state.phase="refusing";state.refusalReason=failureReason(error);checkpoint();
       // refusalReason stays the cause; a refuse call that itself fails is named beside it.
       await refuseUnpublished();

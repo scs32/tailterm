@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
@@ -192,10 +192,44 @@ test("n1 a no-change job settles released with nothing verified, published, depl
  assert.equal((await runRelease(lc,la)).commit,b.base);assert.deepEqual(la.calls,["merged:"+b.base,"finish"]);
  const lj=JSON.parse(readFileSync(lc.journalPath,"utf8"));assert.equal(lj.noChange,NO_CHANGE);assert.ok(!lj.batch);assert.deepEqual(checkoutState(b.cwd),{status:"",head:btip,ref:btip});
 });
-test("n2 an empty series and a merge commit are refused apart, alone and as batch members",async()=>{
- // A commit equal to its base that tasks-hub does not carry: nothing to pick.
- const x=fixture();git(x.cwd,"checkout","-b","side",x.base);const side=change(x,"client/s.js","s");advanced(x);
- assert.equal(refusesUnchanged(x.cwd,{...job(x,side),baseCommit:side},"Empty candidate series").status,"");
+test("n1 a retry after a rolled-back fast-forward release is cherry-picked again, not settled as no change",async()=>{
+ // The release fast-forwards to c; the rollback's revert r keeps c an ancestor
+ // of tasks-hub without its content.
+ const rolledBack=()=>{
+  const f=fixture(),c=change(f,"client/a.js","a"),j=job(f,c),first=integrateCandidate(f.cwd,j);assert.equal(first.integrated,c);
+  publishIntegration(f.cwd,c,f.base);const r=revertCommit(f.cwd,j,c,f.base);assert.equal(moveReleaseRef(f.cwd,r,c),true);git(f.cwd,"checkout","--detach",r);
+  assert.ok(!existsSync(join(f.cwd,"client/a.js")));return {f,c,j,r};
+ };
+ const s=rolledBack(),retry=integrateCandidate(s.f.cwd,s.j);
+ assert.equal(retry.noChange,undefined);assert.equal(retry.expected,s.r);assert.deepEqual(retry.changed,["client/a.js"]);
+ assert.equal(git(s.f.cwd,"rev-parse","HEAD^"),s.r);assert.equal(readFileSync(join(s.f.cwd,"client/a.js"),"utf8"),"a");
+ // As a batch member behind another lead it is picked and joins the batch.
+ const b=rolledBack();git(b.f.cwd,"checkout","-b","lead",b.f.base);const lc=change(b.f,"client/l.js","l");
+ const lead={...job(b.f,lc),id:"rel_lead",entryId:"tqe_lead"},member={...b.j,id:"rel_retry",entryId:"tqe_retry"};
+ const picked=await integrateBatch(b.f.cwd,lead,[member],3,{open:async()=>"bat_0000000000000000",add:async()=>true});
+ assert.deepEqual(picked.dropped,[]);assert.deepEqual(picked.batch.jobs.map(j=>j.jobId),["rel_lead","rel_retry"]);
+ assert.equal(picked.expected,b.r);assert.deepEqual(picked.changed,["client/a.js","client/l.js"]);
+ // A path the tip holds with other content is not carried either: the pick
+ // runs and meets the tip's later change.
+ const o=fixture(),oc=change(o,"client/a.js","a");git(o.cwd,"checkout","tasks-hub");git(o.cwd,"merge","--ff-only","candidate");change(o,"client/a.js","later");
+ refusesUnchanged(o.cwd,job(o,oc),"integration-conflict: client/a.js");
+});
+test("n1 a no-change job whose merged call fails ends blocked for reconciliation and is never refused",async()=>{
+ const f=fixture(),tip=advanced(f),j=job(f,f.base),a=fake(),c=config(f,j);
+ a.merged=async()=>{a.calls.push("merged");throw releaseError("Native release command failed");};a.escalate=async d=>a.calls.push("escalate:"+d.outcome);
+ await assert.rejects(runRelease(c,a),/Release failed; inspect saved journal/);
+ assert.deepEqual(a.calls,["merged","escalate:blocked","block"]);
+ const journal=JSON.parse(readFileSync(c.journalPath,"utf8"));
+ assert.equal(journal.phase,"blocked");assert.equal(journal.outcome,"blocked");assert.equal(journal.mergedSent,true);assert.equal(journal.noChange,NO_CHANGE);
+ assert.notEqual(journal.published,true);assert.equal(journal.revert,undefined);assert.equal(journal.refusalReason,undefined);assert.deepEqual(journal.effects,[]);
+ assert.deepEqual(checkoutState(f.cwd),{status:"",head:tip,ref:tip});
+ // The next claim does not run it again: the journal waits for the handler.
+ const again=fake();await assert.rejects(runRelease(c,again),e=>failureReason(e)==="Ambiguous journal requires handler reconciliation");assert.deepEqual(again.calls,[]);
+});
+test("n2 an empty series is a no-op and a merge commit is refused, alone and as batch members",async()=>{
+ // A commit equal to its base that is not on tasks-hub still changes nothing.
+ const x=fixture();git(x.cwd,"checkout","-b","side",x.base);const side=change(x,"client/s.js","s"),xtip=advanced(x);
+ assert.deepEqual(integrateCandidate(x.cwd,{...job(x,side),baseCommit:side}),{expected:xtip,integrated:xtip,changed:[],noChange:NO_CHANGE});
  // A merge commit in the series is still nonlinear.
  const n=fixture();change(n,"client/a.js","a");git(n.cwd,"checkout","-b","merged-side",n.base);change(n,"client/s.js","s");git(n.cwd,"checkout","candidate");git(n.cwd,"merge","--no-ff","-m","merge","merged-side");
  const merged=git(n.cwd,"rev-parse","HEAD");advanced(n);refusesUnchanged(n.cwd,job(n,merged),"Nonlinear candidate series");
@@ -207,7 +241,7 @@ test("n2 an empty series and a merge commit are refused apart, alone and as batc
  const fmerge=git(f.cwd,"rev-parse","HEAD"),tip=advanced(f),calls=[];
  const lead=job(f,lc),members=[{...job(f,f.base),id:"rel_same"},{...job(f,fside),baseCommit:fside,id:"rel_empty"},{...job(f,fmerge),id:"rel_merge"}];
  const r=await integrateBatch(f.cwd,lead,members,8,{open:async()=>{calls.push("open");return "bat_0000000000000000";},add:async()=>{calls.push("add");return true;}});
- assert.deepEqual(r.dropped,[{jobId:"rel_same",reason:"batch-no-change"},{jobId:"rel_empty",reason:"Empty candidate series"},{jobId:"rel_merge",reason:"Nonlinear candidate series"}]);
+ assert.deepEqual(r.dropped,[{jobId:"rel_same",reason:"batch-no-change"},{jobId:"rel_empty",reason:"batch-no-change"},{jobId:"rel_merge",reason:"Nonlinear candidate series"}]);
  assert.deepEqual(calls,[]);assert.equal(r.batch,undefined);assert.equal(r.expected,tip);assert.deepEqual(r.changed,["client/a.js"]);
  assert.equal(git(f.cwd,"rev-parse","HEAD"),r.integrated);assert.equal(git(f.cwd,"rev-parse","HEAD^"),tip);assert.equal(git(f.cwd,"status","--porcelain"),"");
  // A lead with no change stops before any member, with no batch call.
@@ -276,7 +310,7 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
 });
 test("g1 the runner throws no untagged fixed error",()=>{
  const source=readFileSync(RUNNER,"utf8");assert.ok(!source.includes("throw new Error("));assert.equal(source.split("new Error(").length-1,2,"releaseError and the command wrapper");
- for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Empty candidate series","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
+ for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
   assert.ok(source.includes(`releaseError("${tag}")`),tag);assert.equal(failureReason(releaseError(tag)),tag);
  }
 });
