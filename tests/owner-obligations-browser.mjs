@@ -643,6 +643,28 @@ try {
     await page.evaluate(() => window.qa.show("tasks"));
     await page.locator('[data-task-select="' + task.id + '"]').click();
     await expect(page.locator("[data-owner-wait]")).toHaveCount(0);
+    // wi_1357abd021cc816d / order #38321: the strip's controls share one
+    // height, 44px touch targets at phone width and 28px on the desktop.
+    const stripControls = async (selector, width, height) => {
+      await page.setViewportSize({ width, height: 844 });
+      const font = width <= 720 ? "16px" : "11px";
+      await expect
+        .poll(() =>
+          page.locator(selector).evaluateAll(
+            (els, [height, font]) =>
+              els.flatMap((e) => {
+                const h = Math.round(e.getBoundingClientRect().height),
+                  f = getComputedStyle(e).fontSize;
+                return h === height &&
+                  f === (e.tagName === "BUTTON" ? "11px" : font)
+                  ? []
+                  : [`${e.name || e.textContent} ${h}px ${f}`];
+              }),
+            [height, font],
+          ),
+        )
+        .toEqual([]);
+    };
     // wi_2f6f24bc62b24a7a / order #13877: owner delegation windows in TailOS.
     // A reload is a fresh page after the old one stops its reads, so a
     // cancelled in-flight fetch is not mistaken for a page error.
@@ -736,6 +758,8 @@ try {
     await page.screenshot({
       path: ".build/owner-delegation-" + name + "-open.png",
     });
+    await stripControls("[data-delegation-end]", 1280, 28);
+    await stripControls("[data-delegation-end]", 390, 44);
     await page.locator("[data-delegation-end]").click();
     await expect(page.locator("[data-delegation-window]")).toHaveCount(0);
     await expect(page.locator("[data-delegation-toggle]")).toHaveCount(1);
@@ -743,6 +767,10 @@ try {
     await page.screenshot({
       path: ".build/owner-delegation-" + name + "-form.png",
     });
+    const form = "[data-delegation-open] :is(select, input, button)";
+    assert.equal(await page.locator(form).count(), 4);
+    await stripControls(form, 1280, 28);
+    await stripControls(form, 390, 44);
     const windows = await api("GET", base + "/delegation-windows");
     assert.equal(windows.windows[0].state, "closed");
     assert.equal(windows.windows[0].openedSource.kind, "tailos");

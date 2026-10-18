@@ -6049,6 +6049,18 @@ body:is(
   max-width: 240px;
   min-width: 125px;
 }
+/* Phone buttons are 44px touch targets, so the fields match them. */
+@media (max-width: 720px) {
+  .delegation-strip select,
+  .delegation-strip input,
+  .delegation-strip button {
+    height: 44px;
+  }
+  .delegation-strip select,
+  .delegation-strip input {
+    font-size: 16px;
+  }
+}
 .delegation-open summary,
 .delegated-answers summary {
   width: fit-content;
