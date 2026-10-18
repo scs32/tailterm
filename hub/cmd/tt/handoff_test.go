@@ -3079,6 +3079,10 @@ func TestHandoffRestoreCodex(t *testing.T) {
 // one that is refused, the delegation window, the helper's obligations and
 // the queue are as they were, and a retired helper is still retired.
 func TestHandoffRestoreScope(t *testing.T) {
+	// The test is of what restore leaves alone, not of the hook's deadline:
+	// arrange's successor start is matched by a tmux query, which under load
+	// can pass the real deadline and print the late line instead.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	type hubView struct {
 		windows, obligations, queue string
 	}
