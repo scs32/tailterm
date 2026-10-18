@@ -933,3 +933,77 @@ func TestProviderBlockOutageIgnoresEarlierReply(t *testing.T) {
 		t.Fatalf("a reply inside the outage left it open (posted %d)", n)
 	}
 }
+
+// A provider-blocked handler makes no progress and holds no tool call, so the
+// runner may rotate it as it rotates an idle one; a pending tool call and a
+// live team lease still refuse first.
+func TestProviderBlockedHandlerRotation(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	runtime := f.old.Runtime
+	if runtime != "codex" {
+		runtime = "claude"
+	}
+	blocked := func(tool string) {
+		t.Helper()
+		now := time.Now().UTC()
+		activity := api.AgentActivity{State: "provider_blocked", ObservedAt: now, LastEventAt: now, Provider: providerBlock(runtime, api.ProviderBlockUsageLimit, now.Add(-time.Minute))}
+		if tool != "" {
+			activity.PendingTool, activity.PendingSince = tool, now
+		}
+		if _, err := f.s.ReportActivity(ctx, f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := func(key string) (api.HandlerRotation, error) {
+		task, err := f.s.GetTask(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: key, ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: f.old.ID, OldRunID: f.old.RunID,
+			SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.old.Name, task.HandlerRevision), Reason: api.HandlerRotationReasonTokens, Trigger: api.HandlerRotationTriggerRunner}, f.by)
+	}
+	blocked("Bash")
+	if _, err := runner("blocked-pending-tool"); refusalCode(err) != api.HandlerRotationRefusedPendingTool {
+		t.Fatalf("blocked with a pending tool: %v", err)
+	}
+	q, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "blocked-lease-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/lease"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.db.Exec(`UPDATE team_queue_entries SET state='running',released_at='',handler_id=?,handler_run_id=?,handler_lease_generation=1 WHERE id=?`, f.old.ID, f.old.RunID, q.ID); err != nil {
+		t.Fatal(err)
+	}
+	blocked("")
+	if _, err = runner("blocked-live-lease"); refusalCode(err) != api.HandlerRotationRefusedLiveLease {
+		t.Fatalf("blocked with a live lease: %v", err)
+	}
+	if _, err = f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, ts(f.s.now()), q.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, err := runner("blocked-idle")
+	if err != nil || r.State != api.HandlerRotationPrepared {
+		t.Fatalf("runner prepare for a provider-blocked handler: %+v %v", r, err)
+	}
+}
+
+// A provider-blocked member makes no progress, so with every other member
+// idle past the threshold the entry behind it stalls as idle-entry.
+func TestProviderBlockedQueueStallIdleEntry(t *testing.T) {
+	f, advance, a, b, _, worker := idleTeam(t)
+	report := func(activity api.AgentActivity) {
+		t.Helper()
+		activity.ObservedAt = f.s.now()
+		if _, err := f.s.ReportActivity(context.Background(), f.task.ID, worker.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: worker.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(api.AgentActivity{State: "working"})
+	advance(40 * time.Minute)
+	assertNoStall(t, f, b.ID, "a member is working")
+	report(api.AgentActivity{State: "provider_blocked", Provider: providerBlock("claude", api.ProviderBlockUsageLimit, f.s.now())})
+	advance(10 * time.Minute)
+	assertNoStall(t, f, b.ID, "blocked below the threshold")
+	advance(25 * time.Minute)
+	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue integrated", "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+}

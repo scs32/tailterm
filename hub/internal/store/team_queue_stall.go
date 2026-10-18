@@ -110,7 +110,8 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 		return nil, nil
 	}
 	// idle-entry: every live member idle or done, no open work between them
-	// and anyone, for at least the idle threshold.
+	// and anyone, for at least the idle threshold. A provider-blocked member
+	// makes no progress, so it counts as idle.
 	rows, err := q.QueryContext(ctx, `SELECT a.status,COALESCE(x.state,''),COALESCE(x.observed_at,''),COALESCE(x.payload,'') FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  LEFT JOIN agent_activity x ON x.agent_id=b.agent_id AND x.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, e.TaskID, e.ItemID)
@@ -125,7 +126,7 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 			rows.Close()
 			return nil, err
 		}
-		if status != api.AgentDone && state != "idle" && state != "finished_silent" {
+		if status != api.AgentDone && state != "idle" && state != "finished_silent" && state != "provider_blocked" {
 			idle = false
 		}
 		// A member's verification run waiting for or holding the matrix

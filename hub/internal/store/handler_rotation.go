@@ -455,7 +455,9 @@ func (b handlerBusy) refusal(trigger string) *api.HandlerRotationRefusal {
 	switch b.state {
 	case "working", "hung_tool", "looping":
 		return &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedWorking, Detail: "the handler run's activity is " + b.state}
-	case "idle", "finished_silent":
+	case "idle", "finished_silent", "provider_blocked":
+		// A provider-blocked handler makes no progress and holds no tool
+		// call, so it is as safe to rotate as an idle one.
 		return nil
 	}
 	if trigger == api.HandlerRotationTriggerRunner {

@@ -142,9 +142,14 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		}
 	}
 	c.MissingSince = time.Time{}
-	// A provider block ranks below crashed and above everything else: the
-	// agent's turns fail whatever its lifecycle status says.
-	if block := reportableProviderBlock(c, threshold); block != nil {
+	// A provider block ranks below crashed and above everything else while
+	// the session can still make calls: its turns fail whatever its status
+	// says. A done agent or a gone runtime makes no calls, so its stale block
+	// is not reported; the cursor keeps it, and a resumed agent reports it
+	// again. A running session's block has no time bound: only provider
+	// evidence clears it, because the episode carries the owner ping and the
+	// login wake while the cause remains (docs/provider-blocked.md).
+	if block := reportableProviderBlock(c, threshold); block != nil && a.Status != api.AgentDone && tmuxAlive && processAlive {
 		if !c.ProviderUnsupported {
 			result.State, result.Provider = "provider_blocked", block
 			return result
@@ -664,9 +669,10 @@ func activityReportKey(a api.AgentActivity) string {
 	if a.State == "idle" || a.State == "finished_silent" || strings.HasPrefix(a.Reason, backgroundReasonPrefix) {
 		key += "\x00reason=" + a.Reason
 	}
-	// A class change is a new report; a steady block is not.
+	// A class, model, code or status change is a new report; a steady block
+	// is not.
 	if p := a.Provider; a.State == "provider_blocked" && p != nil {
-		key += "\x00provider=" + p.Class + "\x00" + p.Since.UTC().Format(time.RFC3339Nano)
+		key += "\x00provider=" + p.Class + "\x00" + p.Model + "\x00" + p.Code + "\x00" + strconv.Itoa(p.Status) + "\x00" + p.Since.UTC().Format(time.RFC3339Nano)
 	}
 	return key + matrixWaitKey(a.MatrixWait)
 }

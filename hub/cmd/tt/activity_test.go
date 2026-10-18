@@ -2063,6 +2063,221 @@ func TestActivityProviderBlockedTick(t *testing.T) {
 	}
 }
 
+// A block is reported only while the session can still make calls: not for a
+// done agent and not once its runtime is gone. Closed and exited agents are
+// not observed at all. A running session's block has no time bound.
+func TestActivityProviderBlockedSessionEnd(t *testing.T) {
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	claude := providerFixture(t, "claude-fable-limit")
+	now := time.Date(2026, 9, 26, 19, 0, 0, 0, time.UTC)
+	setup := func(t *testing.T, runtime string) (runtimeBinding, *stuckHub, *api.Client, func(time.Time) error) {
+		t.Helper()
+		b, h, client, tick := stuckFixture(t, runtime)
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		data := claude
+		if runtime == "codex" {
+			path = filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+			data = providerFixture(t, "codex-401")
+		}
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return b, h, client, tick
+	}
+	blocked := func(h *stuckHub) bool {
+		for _, r := range h.reports {
+			if r.State == "provider_blocked" || r.Provider != nil || strings.HasPrefix(r.Reason, "provider_blocked") {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("done agent holding a stale block", func(t *testing.T) {
+		_, h, _, tick := setup(t, "claude")
+		if err := tick(now); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "provider_blocked" {
+			t.Fatalf("running %+v", h.reports)
+		}
+		first := *h.reports[0].Provider
+		h.agent.Status = api.AgentDone
+		if err := tick(now.Add(16 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "idle" || h.reports[1].Provider != nil || h.reports[1].Reason != "turn ended by API error (rate_limit)" {
+			t.Fatalf("done %+v", h.reports)
+		}
+		for i := 2; i <= 5; i++ {
+			if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(h.reports) != 2 {
+			t.Fatalf("done agent reported again %+v", h.reports)
+		}
+		// Resumed with the block unresolved: the same block is reported again.
+		h.agent.Status = api.AgentRunning
+		if err := tick(now.Add(2 * time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 3 || h.reports[2].State != "provider_blocked" || !api.SameProviderBlock(h.reports[2].Provider, &first) {
+			t.Fatalf("resumed %+v", h.reports)
+		}
+	})
+
+	t.Run("done from the start", func(t *testing.T) {
+		for _, runtime := range []string{"claude", "codex"} {
+			_, h, _, tick := setup(t, runtime)
+			h.agent.Status = api.AgentDone
+			for i := 0; i < 4; i++ {
+				if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := "turn ended by API error (rate_limit)"
+			if runtime == "codex" {
+				want = "turn ended by provider error (auth)"
+			}
+			if blocked(h) || len(h.reports) != 1 || h.reports[0].State != "idle" || h.reports[0].Reason != want {
+				t.Fatalf("%s done agent %+v", runtime, h.reports)
+			}
+		}
+	})
+
+	t.Run("runtime absent", func(t *testing.T) {
+		for _, status := range []string{api.AgentDone, api.AgentNeedsInput} {
+			for _, alive := range [][2]bool{{false, false}, {true, false}, {false, true}} {
+				b, h, client, _ := setup(t, "claude")
+				h.agent.Status = status
+				probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return alive[0], alive[1], nil }
+				for i := 0; i < 3; i++ {
+					if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(i)*16*time.Second), probe); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if blocked(h) || len(h.reports) != 1 {
+					t.Fatalf("%s tmux=%v process=%v %+v", status, alive[0], alive[1], h.reports)
+				}
+			}
+		}
+	})
+
+	t.Run("closed and exited send no report", func(t *testing.T) {
+		for _, status := range []string{api.AgentClosed, api.AgentExited} {
+			_, h, _, tick := setup(t, "claude")
+			if err := tick(now); err != nil || len(h.reports) != 1 || h.reports[0].State != "provider_blocked" {
+				t.Fatalf("%s running %v %+v", status, err, h.reports)
+			}
+			h.agent.Status = status
+			for i := 1; i <= 3; i++ {
+				if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(h.reports) != 1 {
+				t.Fatalf("%s reported %+v", status, h.reports)
+			}
+		}
+	})
+
+	t.Run("running block has no time bound", func(t *testing.T) {
+		_, h, _, tick := setup(t, "claude")
+		for at := now; !at.After(now.Add(6 * time.Hour)); at = at.Add(15 * time.Minute) {
+			if err := tick(at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "provider_blocked" {
+			t.Fatalf("six quiet hours %+v", h.reports)
+		}
+	})
+}
+
+// The report key carries the block's model, code and status, so a change of
+// any of them reaches the hub; a steady block makes no new report.
+func TestActivityProviderBlockedReportKey(t *testing.T) {
+	since := time.Date(2026, 9, 26, 18, 53, 10, 0, time.UTC)
+	block := api.ProviderBlock{Provider: "anthropic", Runtime: "claude", Model: "claude-fable-5-1", Class: "usage_limit", Code: "rate_limit", Status: 429, Since: since}
+	key := func(p api.ProviderBlock) string {
+		return activityReportKey(api.AgentActivity{State: "provider_blocked", Provider: &p})
+	}
+	same := block
+	if key(block) != key(same) {
+		t.Fatal("an identical block must keep its key")
+	}
+	for name, change := range map[string]func(*api.ProviderBlock){
+		"model":  func(p *api.ProviderBlock) { p.Model = "claude-opus-5-5" },
+		"code":   func(p *api.ProviderBlock) { p.Code = "overloaded" },
+		"status": func(p *api.ProviderBlock) { p.Status = 0 },
+	} {
+		changed := block
+		change(&changed)
+		if key(changed) == key(block) {
+			t.Fatalf("a %s change must be a new report", name)
+		}
+	}
+
+	// A Codex agent switches model while blocked, then gets a 403: each is
+	// one new report with the same since; repeats of either are not.
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "codex")
+	path := filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+	fixture := providerFixture(t, "codex-401")
+	if err := os.WriteFile(path, []byte(fixture), 0600); err != nil {
+		t.Fatal(err)
+	}
+	failure := func(at, status string) string {
+		return `{"type":"event_msg","timestamp":"` + at + `.000Z","payload":{"type":"task_started"}}` + "\n" +
+			`{"type":"response_item","timestamp":"` + at + `.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}` + "\n" +
+			`{"type":"event_msg","timestamp":"` + at + `.200Z","payload":{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":"other","message":"unexpected status ` + status + `"}}}` + "\n"
+	}
+	appendRecords := func(records string) {
+		t.Helper()
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(records); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 9, 25, 22, 45, 0, 0, time.UTC)
+	since = providerTime(t, "2026-09-25T22:40:03Z")
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 1 || h.reports[0].Provider == nil || h.reports[0].Provider.Model != "gpt-6-astra" {
+		t.Fatalf("entering %+v", h.reports)
+	}
+	appendRecords(`{"type":"turn_context","timestamp":"2026-09-25T22:46:00.000Z","payload":{"model":"gpt-6-nova","approval_policy":"never"}}` + "\n" + failure("2026-09-25T22:46:01", "401 Unauthorized"))
+	if err := tick(now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 2 || h.reports[1].State != "provider_blocked" || h.reports[1].Provider.Model != "gpt-6-nova" || h.reports[1].Provider.Status != 401 || !h.reports[1].Provider.Since.Equal(since) {
+		t.Fatalf("model switch %+v", h.reports)
+	}
+	appendRecords(failure("2026-09-25T22:47:01", "401 Unauthorized"))
+	if err := tick(now.Add(2 * time.Minute)); err != nil || len(h.reports) != 2 {
+		t.Fatalf("steady block after the switch %v %+v", err, h.reports)
+	}
+	appendRecords(failure("2026-09-25T22:48:01", "403 Forbidden"))
+	if err := tick(now.Add(3 * time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.reports) != 3 || h.reports[2].Provider.Status != 403 || h.reports[2].Provider.Class != "auth" || !h.reports[2].Provider.Since.Equal(since) {
+		t.Fatalf("status change %+v", h.reports)
+	}
+	appendRecords(failure("2026-09-25T22:49:01", "403 Forbidden"))
+	if err := tick(now.Add(4 * time.Minute)); err != nil || len(h.reports) != 3 {
+		t.Fatalf("steady block after the status change %v %+v", err, h.reports)
+	}
+}
+
 func TestActivityCLIShowsProviderBlocked(t *testing.T) {
 	task := "tsk_0123456789abcdef"
 	blocked := &api.AgentActivity{State: "provider_blocked", ObservedAt: time.Date(2026, 9, 26, 19, 0, 0, 0, time.UTC),
