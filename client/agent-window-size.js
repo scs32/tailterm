@@ -50,7 +50,10 @@ export function eligibleAgentViewport(s) {
 // immediate retry, then error() and another round when the pane's state next
 // changes, three rounds at most. A refusal is an answer: the identity the
 // command was conditional on is gone. Every command is conditional on the
-// token, so none of this can overwrite a newer viewer.
+// token, so none of this can overwrite a newer viewer. A focus ask while the
+// drain started by the pane becoming eligible is still in flight joins that
+// show: it neither starts another teardown round nor retires the show's claim;
+// a focus ask after it settles does both.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -63,6 +66,7 @@ export function createAgentWindowSizer({
     owedMark = null,
     pending = false,
     running = false,
+    showing = false,
     disposed = false;
   let focusVersion = 0,
     focusAsked = 0,
@@ -77,7 +81,7 @@ export function createAgentWindowSizer({
   };
   function refresh({ focus = false } = {}) {
     if (disposed) return;
-    if (focus) {
+    if (focus && !(running && showing)) {
       focusVersion++;
       focusAsked++;
       failed = false;
@@ -94,6 +98,8 @@ export function createAgentWindowSizer({
         const s = snapshot(),
           eligible = !disposed && eligibleAgentViewport(s);
         const key = identity(s);
+        if (!eligible) showing = false;
+        else if (!wasEligible) showing = true;
         if (
           claim &&
           (claim.undo ||
@@ -208,6 +214,7 @@ export function createAgentWindowSizer({
       }
     } finally {
       running = false;
+      showing = false;
     }
   }
   // Undo what landed after the pane went stale, then drop authority. False

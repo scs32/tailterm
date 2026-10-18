@@ -1705,6 +1705,167 @@ test(
 );
 
 test(
+  "a focus ask while a show's drain is in flight joins that show; a focus ask after it settles retries the kept teardown",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async (t) => {
+    const kind = (command) =>
+      command.includes("ready:")
+        ? "inspect"
+        : command.includes("@tailterm_size_revision},")
+          ? "claim"
+          : command.includes("restored")
+            ? "restore"
+            : command.includes("released")
+              ? "release"
+              : "resize";
+    // S4a-S4d ask for focus while the show's nth host command is held.
+    const held = { S4a: 0, S4b: 1, S4c: 2, S4d: 3 };
+    for (const name of ["S1", "S2", "S3", "S4a", "S4b", "S4c", "S4d", "P3"])
+      await t.test(name, async () => {
+        let s = valid(),
+          sequence = 0,
+          hideOnClaim = true,
+          gate = false,
+          wake = null;
+        const log = [],
+          errors = [],
+          waiting = [];
+        const answer = (k) => {
+          // The host is gone for the kept restore; everything else answers.
+          if (k === "restore") return Promise.reject(Error("transport lost"));
+          if (k === "claim" && hideOnClaim) {
+            hideOnClaim = false;
+            s = { ...s, visible: false };
+          }
+          return Promise.resolve(
+            k === "inspect"
+              ? "ready::200x50"
+              : k === "release"
+                ? "released"
+                : "sized",
+          );
+        };
+        const c = createAgentWindowSizer({
+          snapshot: () => s,
+          token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
+          error: (e) => errors.push(e.message),
+          execute: (command) => {
+            const k = kind(command);
+            log.push(
+              k === "restore"
+                ? "restore LOST"
+                : k === "inspect"
+                  ? "inspect"
+                  : `${k} ${/viewer_\d{16}/.exec(command)[0]}`,
+            );
+            if (!gate) return answer(k);
+            return new Promise((resolve) => {
+              waiting.push(() => resolve(answer(k)));
+              wake?.();
+            });
+          },
+        });
+        const nextHeld = async () => {
+          while (!waiting.length) await new Promise((r) => (wake = r));
+          wake = null;
+          return waiting.shift();
+        };
+        try {
+          // The first claim lands after the pane hid and both restore tries are
+          // lost: a kept teardown and one error before the pane is shown again.
+          c.refresh({ focus: true });
+          await step(`${name}: the sizer settles after the hide`, c.settled());
+          assert.deepEqual(
+            [...log],
+            [
+              "inspect",
+              "claim viewer_0000000000000001",
+              "restore LOST",
+              "restore LOST",
+            ],
+            name,
+          );
+          assert.equal(errors.length, 1, name);
+          log.length = 0;
+          errors.length = 0;
+          s = { ...s, visible: true };
+          if (name === "S1") c.refresh({ focus: true });
+          else if (name === "S3") {
+            c.refresh();
+            c.refresh({ focus: true });
+          } else if (name in held) {
+            gate = true;
+            c.refresh();
+            for (let i = 0; i <= held[name]; i++) {
+              const open = await step(
+                `${name}: show command ${i} is held`,
+                nextHeld(),
+              );
+              if (i === held[name]) {
+                c.refresh({ focus: true });
+                gate = false;
+              }
+              open();
+            }
+          } else c.refresh();
+          await step(`${name}: the sizer settles after the show`, c.settled());
+          assert.deepEqual(
+            [...log],
+            [
+              "restore LOST",
+              "restore LOST",
+              "inspect",
+              "claim viewer_0000000000000002",
+            ],
+            name + ": one teardown round and one claim for the show",
+          );
+          assert.equal(errors.length, 1, name);
+          assert.equal(sequence, 2, name + ": the show made one new token");
+          if (name === "P3") {
+            // A focus ask after the show settled is a new trigger, as today: the
+            // kept teardown is retried and the claim is made again.
+            log.length = 0;
+            c.refresh({ focus: true });
+            await step(`${name}: the sizer settles after focus`, c.settled());
+            assert.deepEqual(
+              [...log],
+              [
+                "restore LOST",
+                "restore LOST",
+                "release viewer_0000000000000002",
+                "inspect",
+                "claim viewer_0000000000000003",
+              ],
+              name,
+            );
+            assert.equal(errors.length, 2, name);
+          } else {
+            // The show's claim is still held: a layout change resizes with it.
+            log.length = 0;
+            s = { ...s, cols: 100 };
+            c.refresh();
+            await step(
+              `${name}: the sizer settles after a resize`,
+              c.settled(),
+            );
+            assert.deepEqual(
+              [...log],
+              ["resize viewer_0000000000000002"],
+              name,
+            );
+            assert.equal(errors.length, 1, name);
+          }
+        } finally {
+          gate = false;
+          for (const open of waiting.splice(0)) open();
+          c.dispose();
+          await step(`${name}: the sizer settles after dispose`, c.settled());
+        }
+      });
+  },
+);
+
+test(
   "tmux format read returns a complete reading after a cut one",
   { timeout: UNIT_TEST_TIMEOUT_MS },
   () => {
