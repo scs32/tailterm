@@ -7,6 +7,7 @@ import (
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/discord"
+	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/store"
 )
 
@@ -72,6 +73,35 @@ func TestSystemSendersRenderByName(t *testing.T) {
 	m := api.Message{From: api.Sender{Node: "system", User: "schedule-monitor"}}
 	if got := r.sender(m); got != "schedule-monitor" {
 		t.Fatalf("sender = %q", got)
+	}
+}
+
+// A relay-authored notice the bridge mirrors as a line names the relay, not
+// the owner whose token the relay posts with.
+func TestRelaySenderRendersAsRelay(t *testing.T) {
+	if relayNode != server.RelayNode {
+		t.Fatalf("relay node %q differs from the server's %q", relayNode, server.RelayNode)
+	}
+	h := newHarness(t)
+	note := &api.Envelope{Kind: api.EnvelopeKindNotice, To: h.lead.Name, Subject: "A relay notice for the lead", Refs: map[string]string{"escalation": "lead"}, Body: api.EnvelopeBody{Text: "fyi"}}
+	m, err := h.st.PostMessage(h.ctx, h.task.ID, api.PostMessageRequest{To: h.lead.ID, Envelope: note, Text: api.RenderText(*note)}, api.Caller{Node: server.RelayNode, User: server.RelayUser})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.From != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+		t.Fatalf("stored author = %+v", m.From)
+	}
+	h.cycle()
+	lines := h.lines()
+	if len(lines) != 1 {
+		t.Fatalf("want one mirrored line, got %d", len(lines))
+	}
+	if got := lines[0].Content; !strings.HasPrefix(got, "**relay** → **"+h.lead.Name+"**") || strings.Contains(got, "**owner") {
+		t.Fatalf("relay line header = %q", got)
+	}
+	// Any other agentless node is still the owner.
+	if got := (roster{}).sender(api.Message{From: api.Sender{Node: "workspace", User: "owner"}}); got != "owner" {
+		t.Fatalf("owner sender = %q", got)
 	}
 }
 

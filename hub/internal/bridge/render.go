@@ -37,6 +37,10 @@ var kindColors = map[string]int{
 	api.EnvelopeKindNotice: 0x95A5A6,
 }
 
+// relayNode is the server's RelayNode: the hub records a relay-marked notice
+// under it, in place of the owner whose token the relay uses.
+const relayNode = "host-relay"
+
 // roster names agents for display.
 type roster map[string]api.Agent
 
@@ -55,6 +59,8 @@ func (r roster) sender(m api.Message) string {
 		return r.name(m.From.AgentID)
 	case m.From.Node == api.BridgeNode:
 		return "owner (Discord)"
+	case m.From.Node == relayNode:
+		return "relay"
 	case m.From.Node == "system" && m.From.User != "":
 		return m.From.User // hub services such as schedule-monitor or queue
 	}

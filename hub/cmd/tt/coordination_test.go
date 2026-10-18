@@ -163,6 +163,81 @@ func TestInboxDistinguishesHumanFromAgentNamedOwner(t *testing.T) {
 	}
 }
 
+// A notice the relay posts under its request budget reads as the relay, not
+// as a human the reader should answer on the board.
+func TestInboxNamesRelayNoticeAsRelay(t *testing.T) {
+	if relayNode != server.RelayNode {
+		t.Fatalf("relay node %q differs from the server's %q", relayNode, server.RelayNode)
+	}
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "p", Orchestrator: "lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("t", 40)
+	identity, err := server.TokenIdentity(token, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, identity))
+	t.Cleanup(srv.Close)
+	domain, err := canonicalLimiterDomain(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget, now := new(relayRateBudget), time.Now().UTC()
+	policy := api.TeamHostPolicy{LimiterDomain: domain, Version: 1, ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), MaxRequestsPerMinute: 120, MaxBurst: 40, HeadroomPercent: 50}
+	if err := budget.configure(&policy, now); err != nil {
+		t.Fatal(err)
+	}
+	relay, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.Token = token
+	relay.HTTP.Transport = relayAuthorTransport{}
+	attachRelayBudget(relay, budget)
+	if tr, ok := relay.HTTP.Transport.(relayBudgetTransport); !ok || tr.budget != budget {
+		t.Fatalf("relay client transport = %T, want the relay budget", relay.HTTP.Transport)
+	}
+	note := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A relay notice", Body: api.EnvelopeBody{Text: "text"}}
+	m, err := relay.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &note, Text: api.RenderText(note)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.From != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+		t.Fatalf("stored author = %+v, want the relay", m.From)
+	}
+	line := formatMessage(m, nil)
+	if !strings.HasPrefix(line, fmt.Sprintf("#%d %s relay: ", m.Seq, m.CreatedAt.Local().Format("15:04"))) {
+		t.Fatalf("relay line does not name the relay: %s", line)
+	}
+	for _, bad := range []string{"(human)", "Reply on the shared board", "omit --to"} {
+		if strings.Contains(line, bad) {
+			t.Fatalf("relay line has %q: %s", bad, line)
+		}
+	}
+	// An unmarked agentless post with the same token is still the owner's.
+	owner, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.Token = token
+	plain, err := owner.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "owner note"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line := formatMessage(plain, nil); !strings.Contains(line, "owner (human)") || !strings.Contains(line, fmt.Sprintf("tt post --reply-to %d", plain.Seq)) {
+		t.Fatalf("owner line changed: %s", line)
+	}
+}
+
 func TestPostTrailingFlagsAndLiteralSeparator(t *testing.T) {
 	for _, args := range [][]string{{"hello", "--to", "reviewer", "--reply-to", "17"}, {"--to=reviewer", "hello", "--reply-to=17"}} {
 		fs := flag.NewFlagSet("post", flag.ContinueOnError)

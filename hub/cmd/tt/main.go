@@ -871,10 +871,17 @@ func readCursor(ctx context.Context, c *api.Client, task, agent string) (int64, 
 	return a.ReadUpTo, nil
 }
 
+// relayNode is the server's RelayNode: the hub records a relay-marked notice
+// under it, in place of the owner whose token the relay uses.
+const relayNode = "host-relay"
+
 func formatMessage(m api.Message, names map[string]string) string {
 	from := "human"
+	relay := m.From.AgentID == "" && m.From.Node == relayNode
 	if m.From.AgentID != "" {
 		from = or(names[m.From.AgentID], m.From.AgentID)
+	} else if relay {
+		from = "relay"
 	} else if m.From.User != "" {
 		from = m.From.User + " (human)"
 	}
@@ -886,7 +893,7 @@ func formatMessage(m api.Message, names map[string]string) string {
 		to += " [swarm: everyone]"
 	}
 	line := fmt.Sprintf("#%d %s %s%s: %s", m.Seq, m.CreatedAt.Local().Format("15:04"), from, to, m.Text)
-	if m.From.AgentID == "" {
+	if m.From.AgentID == "" && !relay {
 		line += fmt.Sprintf("\n  Reply on the shared board: tt post --reply-to %d \"your reply\" (omit --to; sender is human).", m.Seq)
 	}
 	return line
