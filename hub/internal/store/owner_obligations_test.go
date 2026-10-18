@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"strings"
 	"testing"
 	"time"
 )
@@ -385,5 +386,109 @@ func TestOwnerLegacyStaleRunWithExplicitLinks(t *testing.T) {
 	}
 	if o := ownerFor(t, f, m.Seq); o.Request.WorkItems[0] != req.WorkItems[0] || *o.Request.WorkOrderMessage != *req.WorkOrderMessage {
 		t.Fatalf("current control changed links: %+v", o)
+	}
+}
+
+// cancelNotice returns the broker notice a cancel posted for obligation id.
+func cancelNotice(t *testing.T, f deliveryFixture, id string) api.Message {
+	t.Helper()
+	msgs, err := f.s.ListMessages(context.Background(), f.task.ID, 0, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []api.Message
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Kind == api.EnvelopeKindNotice && m.Envelope.Refs["obligation"] == id {
+			found = append(found, m)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("cancel of %s posted %d notices; want one", id, len(found))
+	}
+	return found[0]
+}
+
+func TestOwnerCancelTellsRequester(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	m := ownerFixtureRequest(t, f, "owner", "cancel-requester", "", "")
+	o := ownerFor(t, f, m.Seq)
+	got, err := f.s.CancelObligation(ctx, f.task.ID, o.ID, api.ObligationCancelRequest{Reason: "superseded by a new plan", RequestID: "cancel-owner"}, f.by)
+	if err != nil || got.Obligation == nil || got.Obligation.State != api.ObligationClosed || got.Obligation.Outcome != api.OutcomeCancelled {
+		t.Fatalf("cancel = %+v %v", got, err)
+	}
+	n := cancelNotice(t, f, o.ID)
+	want := fmt.Sprintf("Your request #%d (%s) to the owner was cancelled. Reason: superseded by a new plan", m.Seq, o.Subject)
+	if n.To != f.worker.ID || n.Envelope.Body.Text != want || strings.Contains(n.Text, "Stop work on it") {
+		t.Fatalf("notice to %q: %q", n.To, n.Text)
+	}
+	inbox, err := f.s.ListMessages(ctx, f.task.ID, 0, f.worker.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, im := range inbox {
+		seen = seen || im.Seq == n.Seq
+	}
+	if !seen {
+		t.Fatal("the requester's inbox does not show the cancellation")
+	}
+}
+
+func TestOwnerCancelUnreachableRequesterUsesBoard(t *testing.T) {
+	for _, gone := range []string{api.AgentClosed, api.AgentExited, "missing"} {
+		t.Run(gone, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			ctx := context.Background()
+			m := ownerFixtureRequest(t, f, "owner", "cancel-"+gone, "", "")
+			o := ownerFor(t, f, m.Seq)
+			if gone == "missing" {
+				if _, err := f.s.db.Exec(`UPDATE messages SET from_agent='agt_missing' WHERE seq=?`, m.Seq); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := f.s.UpdateAgent(ctx, f.worker.ID, api.UpdateAgentRequest{Status: &gone}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			got, err := f.s.CancelObligation(ctx, f.task.ID, o.ID, api.ObligationCancelRequest{Reason: "owner decision", RequestID: "cancel-" + gone}, f.by)
+			if err != nil || got.Obligation == nil || got.Obligation.Outcome != api.OutcomeCancelled {
+				t.Fatalf("cancel = %+v %v", got, err)
+			}
+			n := cancelNotice(t, f, o.ID)
+			if n.To != "" || !strings.Contains(n.Text, fmt.Sprintf("Your request #%d", m.Seq)) || !strings.Contains(n.Text, "owner decision") || strings.Contains(n.Text, "Stop work on it") {
+				t.Fatalf("notice to %q: %q", n.To, n.Text)
+			}
+		})
+	}
+}
+
+func TestCancelAgentObligationKeepsRecipientNotice(t *testing.T) {
+	for _, state := range []string{"", api.AgentClosed, api.AgentExited} {
+		t.Run("recipient "+state, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			ctx := context.Background()
+			m := ownerFixtureRequest(t, f, f.lead.ID, "agent-cancel", "", "")
+			list, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{AgentID: f.lead.ID, OpenOnly: true}, f.s.now())
+			if err != nil || len(list) != 1 || list[0].MessageSeq != m.Seq || list[0].RecipientKind == api.ObligationRecipientOwner {
+				t.Fatalf("agent obligation %+v %v", list, err)
+			}
+			o := list[0]
+			if state != "" {
+				if _, err := f.s.UpdateAgent(ctx, f.lead.ID, api.UpdateAgentRequest{Status: &state}, f.by); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.s.CancelObligation(ctx, f.task.ID, o.ID, api.ObligationCancelRequest{Reason: "no longer needed", RequestID: "agent-cancel"}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			n := cancelNotice(t, f, o.ID)
+			want := fmt.Sprintf("The owner cancelled message #%d (%s). Stop work on it. Reason: no longer needed", m.Seq, o.Subject)
+			wantTo := f.lead.ID
+			if state != "" {
+				wantTo = "" // the board hears it instead
+			}
+			if n.To != wantTo || n.Envelope.Body.Text != want {
+				t.Fatalf("notice to %q: %q", n.To, n.Text)
+			}
+		})
 	}
 }

@@ -605,7 +605,8 @@ func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID strin
 }
 
 // CancelObligation closes an open obligation as cancelled, and tells its
-// recipient so it stops working on it.
+// recipient so it stops working on it, or for an owner obligation tells the
+// agent that asked.
 func (s *Store) CancelObligation(ctx context.Context, taskID, obligationID string, req api.ObligationCancelRequest, by api.Caller) (api.OwnerActionResult, error) {
 	reason := strings.TrimSpace(req.Reason)
 	if reason == "" || !api.ValidText(reason, 500) {
@@ -620,16 +621,23 @@ func (s *Store) CancelObligation(ctx context.Context, taskID, obligationID strin
 			api.ObligationClosed, api.OutcomeCancelled, "cancelled by the owner: "+reason, ts(now), ts(now), o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
-		recipient, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, o.AgentID))
-		if err != nil || recipient.Status == api.AgentClosed || recipient.Status == api.AgentExited {
-			recipient = api.Agent{} // tell the board instead
-		}
-		text := fmt.Sprintf("The owner cancelled message #%d (%s). Stop work on it. Reason: %s", o.MessageSeq, o.Subject, reason)
 		source, err := originalMessage(ctx, tx, taskID, o.MessageSeq)
 		if err != nil {
 			return api.OwnerActionResult{}, err
 		}
-		if err := s.postLinkedBrokerNotice(ctx, tx, task, recipient, "The owner cancelled an obligation", text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}, source, "owner-cancel-"+o.ID); err != nil {
+		// An agent obligation's recipient stops work; an owner obligation
+		// has no recipient agent, so its requester hears the cancellation.
+		notify, subject := o.AgentID, "The owner cancelled an obligation"
+		text := fmt.Sprintf("The owner cancelled message #%d (%s). Stop work on it. Reason: %s", o.MessageSeq, o.Subject, reason)
+		if o.RecipientKind == api.ObligationRecipientOwner {
+			notify, subject = source.From.AgentID, "Your request to the owner was cancelled"
+			text = fmt.Sprintf("Your request #%d (%s) to the owner was cancelled. Reason: %s", o.MessageSeq, o.Subject, reason)
+		}
+		recipient, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, notify))
+		if err != nil || recipient.Status == api.AgentClosed || recipient.Status == api.AgentExited {
+			recipient = api.Agent{} // tell the board instead
+		}
+		if err := s.postLinkedBrokerNotice(ctx, tx, task, recipient, subject, text, map[string]string{"obligation": o.ID, "message": fmt.Sprint(o.MessageSeq)}, source, "owner-cancel-"+o.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
 		o, err = scanObligation(tx.QueryRowContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE id=?`, o.ID))
