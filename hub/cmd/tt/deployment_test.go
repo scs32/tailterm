@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,8 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestDeploymentSetupUsesExactRetryJournal(t *testing.T) {
@@ -917,5 +921,123 @@ func TestDeploymentProgress(t *testing.T) {
 	// A read needs no agent identity: the handler and the owner helper read it.
 	if _, err := captureCLIOutput(t, func() error { return cmdDeployment(anonymous, []string{"progress"}) }); err != nil || last().AgentID != "" {
 		t.Fatal(err, last())
+	}
+}
+
+// TestDeploymentServeHelperProcess is the disposable tt process the serve
+// test signals: re-exec'd with TT_SERVE_HELPER_DIR set, it serves the fake
+// runner in that checkout and exits as die would. Otherwise it does nothing.
+func TestDeploymentServeHelperProcess(t *testing.T) {
+	checkout := os.Getenv("TT_SERVE_HELPER_DIR")
+	if checkout == "" {
+		return
+	}
+	if err := serveRunner(checkout, "cfg.json"); err != nil {
+		die(err)
+	}
+	os.Exit(0)
+}
+
+// A SIGTERM or SIGINT to tt deployment serve reaches the runner, and serve
+// exits with the runner's status (wi_3e40f1e689ecf44f). Only the re-exec'd
+// helper and its fake runner child are signalled, never this test process.
+func TestDeploymentServeForwardsStopSignals(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node unavailable")
+	}
+	// The fake runner writes its pid once both handlers are installed. SIGTERM
+	// exits 43; SIGINT re-raises itself, so the runner dies by the signal.
+	runner := `import {writeFileSync} from "node:fs";
+if (process.argv.at(-2) !== "--config" || process.argv.at(-1) !== "cfg.json") process.exit(9);
+process.on("SIGTERM", () => { writeFileSync("marker", "TERM"); process.exit(43); });
+process.on("SIGINT", () => { writeFileSync("marker", "INT"); process.removeAllListeners("SIGINT"); process.kill(process.pid, "SIGINT"); });
+writeFileSync("ready", String(process.pid));
+if (process.env.FAKE_RUNNER_CLEAN) process.exit(0);
+setTimeout(() => process.exit(7), 10000);
+`
+	for _, c := range []struct {
+		name   string
+		sig    os.Signal
+		marker string
+		code   int
+	}{{"term", syscall.SIGTERM, "TERM", 43}, {"int", syscall.SIGINT, "INT", 130}, {"clean", nil, "", 0}} {
+		t.Run(c.name, func(t *testing.T) {
+			checkout, home := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(filepath.Join(checkout, "scripts"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(checkout, "scripts", "release-runner.mjs"), []byte(runner), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			helper := exec.Command(os.Args[0], "-test.run=^TestDeploymentServeHelperProcess$", "-test.count=1")
+			helper.Env = append(os.Environ(), "TT_SERVE_HELPER_DIR="+checkout, "HOME="+home)
+			if c.sig == nil {
+				helper.Env = append(helper.Env, "FAKE_RUNNER_CLEAN=1")
+			}
+			var out bytes.Buffer
+			helper.Stdout, helper.Stderr = &out, &out
+			if err := helper.Start(); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- helper.Wait() }()
+			childPID, reaped := 0, false
+			t.Cleanup(func() {
+				if reaped {
+					return
+				}
+				_ = helper.Process.Kill()
+				if childPID > 0 {
+					_ = syscall.Kill(childPID, syscall.SIGKILL)
+				}
+				<-result
+			})
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if b, err := os.ReadFile(filepath.Join(checkout, "ready")); err == nil && len(b) > 0 {
+					if childPID, err = strconv.Atoi(string(b)); err != nil {
+						t.Fatalf("ready %q", b)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the fake runner never became ready; helper output:\n%s", out.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if c.sig != nil {
+				if err := helper.Process.Signal(c.sig); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var err error
+			select {
+			case err = <-result:
+				reaped = true
+			case <-time.After(15 * time.Second):
+				t.Fatalf("serve did not exit; helper output:\n%s", out.String())
+			}
+			code := 0
+			var exit *exec.ExitError
+			if errors.As(err, &exit) {
+				code = exit.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			marker, _ := os.ReadFile(filepath.Join(checkout, "marker"))
+			if code != c.code || string(marker) != c.marker {
+				t.Fatalf("serve exited %d with runner marker %q, want %d and %q; helper output:\n%s", code, marker, c.code, c.marker, out.String())
+			}
+		})
+	}
+}
+
+// The usage line lists every operation the release runner calls.
+func TestDeploymentUsageListsRunnerOperations(t *testing.T) {
+	err := cmdDeployment(env{}, nil)
+	for _, op := range []string{"|unclaim|", "|progress|", "|batch-open|batch-add|batch-drop|"} {
+		if err == nil || !strings.Contains(err.Error(), op) {
+			t.Fatalf("usage does not list %s: %v", op, err)
+		}
 	}
 }

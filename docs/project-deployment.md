@@ -2152,10 +2152,11 @@ deployer with the rest of the project; resuming then needs provisioning again.
 A deployer that holds a `claimed` job with no effects (waiting for its inputs
 binding or for an integrated matrix import; not published, no receipt, no inputs
 bound) is stopped cleanly instead: send SIGTERM to the runner's `pid` in
-`journalDirectory/runner-code.json`. SIGTERM to the `tt deployment serve`
-parent alone does not reach the runner, which it starts as a child without
-forwarding signals. The runner treats SIGINT the same way, but Ctrl-C in its
-pane also signals the pane's wrapper and that parent; if the hub has recorded
+`journalDirectory/runner-code.json`. SIGTERM or SIGINT to the
+`tt deployment serve` process reaches the runner too: serve passes both on to
+it and exits with the runner's status. A signal to the pane's `tt wrap`
+wrapper does not reach the runner. The runner treats SIGINT the same way, but
+Ctrl-C in its pane also signals the pane's wrapper; if the hub has recorded
 the run's exit before the unclaim arrives, the unclaim is refused and the job
 stays held, so prefer SIGTERM to the runner's pid. The runner ends its
 wait at once, gives the claim back with `tt deployment unclaim` (an exact-run

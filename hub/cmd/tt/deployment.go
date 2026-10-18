@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -25,7 +27,7 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|enqueue|claim|check|verification|merged|finish|block|inputs|reconcile|set-aside|hold|unhold|refuse|supersede|retry|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|progress|enqueue|claim|unclaim|check|verification|merged|batch-open|batch-add|batch-drop|finish|block|inputs|reconcile|set-aside|hold|unhold|refuse|supersede|retry|hand-release|hand-releases")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
@@ -34,11 +36,7 @@ func cmdDeployment(e env, args []string) error {
 		if len(args) != 3 || args[1] != "--config" {
 			return errors.New("usage: tt deployment serve --config PRIVATE_PATH")
 		}
-		cmd := exec.Command("node", "scripts/release-runner.mjs", "--config", args[2])
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
+		return serveRunner("", args[2])
 	}
 	if args[0] == "template" {
 		printJSON(map[string]any{"role": api.AgentRoleDeployment, "runtime": "generic", "name": "deployer", "command": "tt deployment serve --config /private/deployment.json", "instructions": deploymentBriefing()})
@@ -431,6 +429,44 @@ func deploymentSetup(e env, args []string) error {
 		return err
 	}
 	return spawnDeploymentAgent(e, append([]string{"--role", api.AgentRoleDeployment}, rest...))
+}
+
+// serveRunner runs the checkout's release runner and passes SIGTERM and
+// SIGINT on to it, so a stop through tt runs the runner's clean-stop unclaim.
+// It exits with the runner's status: its exit code, or 128 plus the signal
+// that killed it.
+func serveRunner(checkout, config string) error {
+	cmd := exec.Command("node", "scripts/release-runner.mjs", "--config", config)
+	cmd.Dir = checkout
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	// Registered before Start, so no signal arrives while tt would still die of it.
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	for {
+		select {
+		case sig := <-signals:
+			// The runner may have just exited; its Wait result follows.
+			_ = cmd.Process.Signal(sig)
+		case err := <-done:
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				return err
+			}
+			code := exit.ExitCode()
+			if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				code = 128 + int(status.Signal())
+			}
+			return &exitError{code: code, err: err}
+		}
+	}
 }
 
 // provisionPrerequisites runs the checkout's release runner, which prints the
