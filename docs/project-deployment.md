@@ -231,6 +231,20 @@ and the first release are separate operational steps.
   integrated commit with `scripts/` and `tests/` unmodified. When it cannot be
   evaluated (no map in the commit, another checkout state, a failed child or
   output of another shape), the path stays unknown.
+- **No-change result (wi_d46b5de7ad79c8c3).** An accepted result whose
+  commit is already on `tasks-hub`, such as a commit equal to its base after
+  the tip has moved on, integrates as nothing: no cherry-pick, no changed
+  paths, and the checkout stays on the tip it found. Nothing is selected,
+  verified, published, deployed or pushed, and `tasks-hub` does not move. The
+  hub records the job `merged` at the job's own commit, which needs no
+  integrated matrix receipt, and it settles `released` with a receipt naming
+  that commit, no targets and no push. The journal keeps the reason as
+  `noChange: "candidate-already-on-tasks-hub"`; the hub's receipt has no field
+  for it. Whatever the tip carries that is not yet deployed ships with the
+  next release that has a change. A commit that only fast-forwards the tip
+  (including one equal to it) integrates as before. A series that is empty
+  but not on the tip is refused as `Empty candidate series`; a merge commit in
+  the series is refused as `Nonlinear candidate series`.
 - **Push (D2).** After every selected target is live-verified, the journal moves
   to `pushing` and the runner runs `git push origin INTEGRATED:refs/heads/tasks-hub`
   with terminal prompts disabled and credentials from the host's git helper. It
@@ -566,7 +580,10 @@ batch forms, its receipt `journalDirectory/bat_ID-receipt.json` carries the same
 | `over-limit` | queued past the `2*(maxJobs-1)` candidates that are read |
 
 The same list also keeps the jobs dropped while the batch was built: a
-cherry-pick failure by its reason, `batch-open-refused` and `batch-add-refused`.
+cherry-pick failure by its reason, `batch-no-change` (its commit is already on
+the batch's head, a range the hub refuses because it adds no commit; the job
+releases alone later as a no-change result), `batch-open-refused` and
+`batch-add-refused`. A lead with no change opens no batch and releases alone.
 To see why a job did not ride with the one before it:
 
 ```sh

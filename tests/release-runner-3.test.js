@@ -5,10 +5,10 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
-import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
+import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
 test("m5 end to end: a matrix change no owner approval covers refuses the job by name and leaves tasks-hub alone",async()=>{
  const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11}]);
  await assert.rejects(runRelease(r.c,r.a),/Release refused before publication/);
@@ -161,6 +161,60 @@ test("g3 every integrateCandidate refusal has its own tag and leaves the checkou
  const e=fixture(),ec=change(e,"client/a.js","a");git(e.cwd,"checkout","tasks-hub");change(e,"client/c.js","c");change(e,"client/a.js","a");
  assert.equal(refusesUnchanged(e.cwd,job(e,ec),"Candidate integration refused").status,"");
 });
+// An accepted no-change result (wi_d46b5de7ad79c8c3): a commit already on an
+// advanced tasks-hub integrates as nothing, and only a merge commit is nonlinear.
+const advanced=f=>{git(f.cwd,"checkout","tasks-hub");const tip=change(f,"client/c.js","c");return tip;};
+const noPick=(cwd,tip,label)=>{assert.deepEqual(checkoutState(cwd),{status:"",head:tip,ref:tip},label);assert.equal(git(cwd,"rev-list","--count","HEAD"),"2",label);};
+test("n1 a commit equal to its base, or already on tasks-hub, integrates with no cherry-pick and no changed paths",()=>{
+ const e=fixture(),tip=advanced(e);
+ assert.deepEqual(integrateCandidate(e.cwd,job(e,e.base)),{expected:tip,integrated:tip,changed:[],noChange:NO_CHANGE});noPick(e.cwd,tip,"commit equals base");
+ // The candidate's own commit is already an ancestor of the advanced tip.
+ const a=fixture(),ac=change(a,"client/a.js","a");git(a.cwd,"checkout","tasks-hub");git(a.cwd,"merge","--ff-only","candidate");const atip=change(a,"client/c.js","c");
+ assert.deepEqual(integrateCandidate(a.cwd,job(a,ac)),{expected:atip,integrated:atip,changed:[],noChange:NO_CHANGE});
+ assert.deepEqual(checkoutState(a.cwd),{status:"",head:atip,ref:atip});assert.equal(git(a.cwd,"rev-list","--count","HEAD"),"3");
+ // A tip that has not moved still fast-forwards as before, with no reason.
+ const s=fixture();git(s.cwd,"checkout","tasks-hub");assert.deepEqual(integrateCandidate(s.cwd,job(s,s.base)),{expected:s.base,integrated:s.base,changed:[]});
+});
+test("n1 a no-change job settles released with nothing verified, published, deployed or pushed, and its journal says why",async()=>{
+ const f=fixture(),tip=advanced(f),origin=remoteHead(f),j=job(f,f.base),a=fake(),c=config(f,j);
+ a.merged=async commit=>a.calls.push("merged:"+commit);a.verifyIntegrated=async()=>{a.calls.push("verify");return true;};a.verifyInputs=async()=>{a.calls.push("inputs");return true;};
+ a.finish=async(r,generation)=>a.calls.push("finish:"+JSON.stringify(r));
+ const receipt=await runRelease(c,a),expected={version:1,jobId:"rel_fixture",commit:f.base,verificationDigest:"a".repeat(64),targets:[],outcome:"released"};
+ assert.deepEqual(receipt,expected);assert.deepEqual(a.calls,["merged:"+f.base,"finish:"+JSON.stringify(expected)]);
+ const journal=JSON.parse(readFileSync(c.journalPath,"utf8"));
+ assert.equal(journal.phase,"complete");assert.equal(journal.noChange,NO_CHANGE);assert.notEqual(journal.published,true);assert.deepEqual(journal.effects,[]);
+ assert.equal(journal.expected,tip);assert.equal(journal.integrated,tip);assert.deepEqual(journal.receipt,expected);
+ assert.deepEqual(checkoutState(f.cwd),{status:"",head:tip,ref:tip});assert.equal(remoteHead(f),origin);
+ // A batch lead with no change opens no batch and settles the same way.
+ const b=fixture(),btip=advanced(b);git(b.cwd,"checkout","candidate");const mc=change(b,"client/m.js","m");
+ const lead=job(b,b.base),member={...job(b,mc),id:"rel_m",entryId:"tqe_m",state:"verified"},la=fake(),lc=config(b,lead);lc.batch={max:3,candidates:[member]};
+ la.batch=async op=>{la.calls.push(op);return true;};la.merged=async commit=>la.calls.push("merged:"+commit);
+ assert.equal((await runRelease(lc,la)).commit,b.base);assert.deepEqual(la.calls,["merged:"+b.base,"finish"]);
+ const lj=JSON.parse(readFileSync(lc.journalPath,"utf8"));assert.equal(lj.noChange,NO_CHANGE);assert.ok(!lj.batch);assert.deepEqual(checkoutState(b.cwd),{status:"",head:btip,ref:btip});
+});
+test("n2 an empty series and a merge commit are refused apart, alone and as batch members",async()=>{
+ // A commit equal to its base that tasks-hub does not carry: nothing to pick.
+ const x=fixture();git(x.cwd,"checkout","-b","side",x.base);const side=change(x,"client/s.js","s");advanced(x);
+ assert.equal(refusesUnchanged(x.cwd,{...job(x,side),baseCommit:side},"Empty candidate series").status,"");
+ // A merge commit in the series is still nonlinear.
+ const n=fixture();change(n,"client/a.js","a");git(n.cwd,"checkout","-b","merged-side",n.base);change(n,"client/s.js","s");git(n.cwd,"checkout","candidate");git(n.cwd,"merge","--no-ff","-m","merge","merged-side");
+ const merged=git(n.cwd,"rev-parse","HEAD");advanced(n);refusesUnchanged(n.cwd,job(n,merged),"Nonlinear candidate series");
+ // As batch members behind a lead with a real change: the member equal to the
+ // shared base joins nothing (the hub refuses a range that adds no commit),
+ // and each refusal keeps its own reason.
+ const f=fixture(),lc=change(f,"client/a.js","a");git(f.cwd,"checkout","-b","side",f.base);const fside=change(f,"client/s.js","s");
+ git(f.cwd,"checkout","-b","merged-side",f.base);change(f,"client/t.js","t");git(f.cwd,"checkout","side");git(f.cwd,"merge","--no-ff","-m","merge","merged-side");
+ const fmerge=git(f.cwd,"rev-parse","HEAD"),tip=advanced(f),calls=[];
+ const lead=job(f,lc),members=[{...job(f,f.base),id:"rel_same"},{...job(f,fside),baseCommit:fside,id:"rel_empty"},{...job(f,fmerge),id:"rel_merge"}];
+ const r=await integrateBatch(f.cwd,lead,members,8,{open:async()=>{calls.push("open");return "bat_0000000000000000";},add:async()=>{calls.push("add");return true;}});
+ assert.deepEqual(r.dropped,[{jobId:"rel_same",reason:"batch-no-change"},{jobId:"rel_empty",reason:"Empty candidate series"},{jobId:"rel_merge",reason:"Nonlinear candidate series"}]);
+ assert.deepEqual(calls,[]);assert.equal(r.batch,undefined);assert.equal(r.expected,tip);assert.deepEqual(r.changed,["client/a.js"]);
+ assert.equal(git(f.cwd,"rev-parse","HEAD"),r.integrated);assert.equal(git(f.cwd,"rev-parse","HEAD^"),tip);assert.equal(git(f.cwd,"status","--porcelain"),"");
+ // A lead with no change stops before any member, with no batch call.
+ const g=fixture(),gtip=advanced(g);git(g.cwd,"checkout","candidate");const gc=change(g,"client/m.js","m");
+ const none=await integrateBatch(g.cwd,job(g,g.base),[{...job(g,gc),id:"rel_m"}],8,{open:async()=>{calls.push("open");return "bat_0000000000000000";},add:async()=>{calls.push("add");return true;}});
+ assert.deepEqual(none,{expected:gtip,integrated:gtip,changed:[],noChange:NO_CHANGE,dropped:[]});assert.deepEqual(calls,[]);assert.deepEqual(checkoutState(g.cwd),{status:"",head:gtip,ref:gtip});
+});
 test("g3 the pre-step runner refusals are tagged and leave the journal alone",async()=>{
  const tagged=tag=>e=>failureReason(e)===tag;
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let entered,release;
@@ -222,7 +276,7 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
 });
 test("g1 the runner throws no untagged fixed error",()=>{
  const source=readFileSync(RUNNER,"utf8");assert.ok(!source.includes("throw new Error("));assert.equal(source.split("new Error(").length-1,2,"releaseError and the command wrapper");
- for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
+ for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Empty candidate series","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
   assert.ok(source.includes(`releaseError("${tag}")`),tag);assert.equal(failureReason(releaseError(tag)),tag);
  }
 });

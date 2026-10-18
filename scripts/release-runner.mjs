@@ -342,6 +342,20 @@ export function matrixHeldNotice(job, held) {
 }
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+const ancestor = (cwd,a,b) => {try{git(cwd,"merge-base","--is-ancestor",a,b);return true;}catch{return false;}};
+// What a candidate that cannot fast-forward adds on top of tip: nothing when
+// its commit is already on tip (an accepted no-change result, or a change
+// tip already carries), else its linear series from base. An empty series
+// that tip does not contain and a merge commit are refused apart.
+function candidateSeries(cwd,job,tip){
+  if(ancestor(cwd,job.commit,tip))return [];
+  const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
+  if(!commits.length)throw releaseError("Empty candidate series");
+  if(commits.some(c=>git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2))throw releaseError("Nonlinear candidate series");
+  return commits;
+}
+// The reason a single job settles with nothing integrated, published or deployed.
+export const NO_CHANGE="candidate-already-on-tasks-hub";
 export function integrateCandidate(cwd, job, branch="tasks-hub") {
   if (branch !== "tasks-hub" || !sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit !== job.commit) throw releaseError("Release binding mismatch");
   if (git(cwd,"status","--porcelain")) throw releaseError("Dirty deployment checkout");
@@ -352,14 +366,12 @@ export function integrateCandidate(cwd, job, branch="tasks-hub") {
   if (!known) throw releaseError("Unknown commit identity");
   try { git(cwd,"merge-base","--is-ancestor",job.baseCommit,job.commit); } catch { throw releaseError("Unknown candidate base"); }
   git(cwd,"checkout","--detach",expected);
+  let commits=null;
   try {
-    try {git(cwd,"merge-base","--is-ancestor",expected,job.commit);git(cwd,"checkout","--detach",job.commit);}
-    catch {
-      const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
-      if (!commits.length || commits.some(c => git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2)) throw releaseError("Nonlinear candidate series");
-      git(cwd,"cherry-pick",...commits);
-    }
+    if (ancestor(cwd,expected,job.commit)) git(cwd,"checkout","--detach",job.commit);
+    else if ((commits=candidateSeries(cwd,job,expected)).length) git(cwd,"cherry-pick",...commits);
   } catch (error) {abortIntegration(cwd,expected,error);}
+  if (commits && !commits.length) return {expected,integrated:expected,changed:[],noChange:NO_CHANGE};
   const integrated=git(cwd,"rev-parse","HEAD");
   return {expected,integrated,changed:diffPaths(cwd,expected,integrated)};
 }
@@ -464,8 +476,9 @@ export function batchPlanCovers(plan,jobs){
   }
   return null;
 }
-// One member's commits cherry-picked onto head; a failure leaves the checkout
-// on head and throws the refusal integrateCandidate would.
+// One member's commits cherry-picked onto head, or head itself for a member
+// already on head; a failure leaves the checkout on head and throws the
+// refusal integrateCandidate would.
 function pickCandidate(cwd,job,head){
   if(!sha(job.commit) || !sha(job.baseCommit) || job.plan?.commit!==job.commit)throw releaseError("Release binding mismatch");
   let known;
@@ -473,9 +486,8 @@ function pickCandidate(cwd,job,head){
   if(!known)throw releaseError("Unknown commit identity");
   try{git(cwd,"merge-base","--is-ancestor",job.baseCommit,job.commit);}catch{throw releaseError("Unknown candidate base");}
   try{
-    const commits=git(cwd,"rev-list","--reverse",`${job.baseCommit}..${job.commit}`).split("\n").filter(Boolean);
-    if(!commits.length || commits.some(c=>git(cwd,"rev-list","--parents","-n","1",c).split(" ").length!==2))throw releaseError("Nonlinear candidate series");
-    git(cwd,"cherry-pick",...commits);
+    const commits=candidateSeries(cwd,job,head);
+    if(commits.length)git(cwd,"cherry-pick",...commits);
   }catch(error){abortIntegration(cwd,head,error);}
   return git(cwd,"rev-parse","HEAD");
 }
@@ -487,10 +499,13 @@ function pickCandidate(cwd,job,head){
 // false, and hooks.add(job, from, to) declares each job's range, the lead's
 // first. A hook that throws (an unconfirmed hub call) is passed on with the
 // checkout untouched. Returns today's integration, the jobs dropped, and
-// batch only when a member joined.
+// batch only when a member joined. The hub refuses a range that adds no
+// commit, so a lead with no change opens no batch, and a member already on
+// the batch's head is dropped as batch-no-change; each releases alone.
 export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
   const first=integrateCandidate(cwd,lead),jobs=[],dropped=[];
   await hooks.integrated?.(first);
+  if(first.noChange)return {...first,dropped};
   const range=(job,from,to)=>({jobId:job.id,entryId:job.entryId,generation:job.generation,commit:job.commit,verificationDigest:job.verificationDigest,from,to});
   let head=first.integrated,id=null,closed=false;
   for(const member of candidates){
@@ -498,6 +513,7 @@ export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
     let to;
     try{to=pickCandidate(cwd,member,head);}
     catch(error){dropped.push({jobId:member.id,reason:failureReason(error)});continue;}
+    if(to===head){dropped.push({jobId:member.id,reason:"batch-no-change"});continue;}
     if(!id){
       id=await hooks.open(first.expected);
       if(id && await hooks.add(lead,first.expected,first.integrated)===true)jobs.push(range(lead,first.expected,first.integrated));
@@ -762,7 +778,7 @@ export async function runRelease(config, adapter) {
   const openBatch=async()=>{
     const members=config.batch.candidates.filter(c=>{const reason=batchMismatch(job,c);if(reason)noteDropped([{jobId:c.id,reason}]);return !reason;});
     const result=await integrateBatch(cwd,job,members,config.batch.max,{
-      integrated:first=>{state.expected=first.expected;state.integrated=first.integrated;state.batchLead=first.integrated;state.phase="batching";checkpoint();},
+      integrated:first=>{state.expected=first.expected;state.integrated=first.integrated;state.batchLead=first.integrated;if(first.noChange)state.noChange=first.noChange;state.phase="batching";checkpoint();},
       open:async base=>await declare("batch-open",{commit:base})?state.batch.id:false,
       add:(member,from,to)=>{const goRace=member.id===job.id?undefined:mergedGoRace(member);return declare("batch-add",{entryId:member.entryId,commit:to,from,...(goRace?{goRace}:{}),member:{jobId:member.id,entryId:member.entryId,generation:member.generation,commit:member.commit,verificationDigest:member.verificationDigest}});},
     });
@@ -894,8 +910,19 @@ export async function runRelease(config, adapter) {
     if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
     else if(state.phase==="batching")integration=await resumeBatch();
     else if(config.batch?.max>1 && config.batch.candidates?.length){begin({step:"integrate"});integration=await openBatch();step=null;}
-    else{begin({step:"integrate"});integration=integrateCandidate(cwd,job);step=null;}
+    else{begin({step:"integrate"});integration=integrateCandidate(cwd,job);step=null;if(integration.noChange)state.noChange=integration.noChange;}
     state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
+    // An accepted no-change result: its commit is already on tasks-hub, so
+    // nothing is selected, verified, published, deployed or pushed. The hub
+    // records it merged at its own commit, which needs no integrated matrix
+    // receipt, and it settles released with no targets; the journal keeps
+    // noChange as the reason. The checkout stays on the tip it found.
+    if(state.noChange){
+      await fence();await adapter.merged(job.commit);state.phase="merged";checkpoint();
+      state.receipt={version:1,jobId:job.id,commit:job.commit,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
+      state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();
+      await adapter.finish(state.receipt,state.finishGeneration);state.phase="complete";checkpoint();return state.receipt;
+    }
     if(state.batch){
       const waiting=await verifyBatch();if(waiting)return waiting;
       integration={expected:state.expected,integrated:state.integrated};
