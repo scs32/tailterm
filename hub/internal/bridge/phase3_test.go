@@ -127,3 +127,58 @@ func TestResumeAmbiguityAndOutages(t *testing.T) {
 		t.Fatalf("a hub outage was reported as handled: %q", got)
 	}
 }
+
+// wi_6c053438bd76c7bd: only a request the hub holds an owner obligation for
+// is drawn as the Request to owner card. A board-wide request without exact
+// context has none and mirrors as an ordinary typed line.
+func TestOwnerCardNeedsOwnerObligation(t *testing.T) {
+	h := newHarness(t)
+	item, err := h.st.CreateWorkItem(h.ctx, h.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Owner card fixture", RequestID: "owner-card-item"}, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(id, subject string, links []api.MessageWorkItem) api.Message {
+		env := &api.Envelope{Kind: api.EnvelopeKindRequest, Subject: subject, ExpectedAnswer: "yes", Body: api.EnvelopeBody{Ask: "Please approve"}}
+		return h.post(api.PostMessageRequest{AgentID: h.builder.ID, RunID: h.builder.RunID, RequestID: id, Envelope: env, Text: api.RenderText(*env), WorkItems: links})
+	}
+	linked := request("owner-card-linked", "Approve the linked fixture", []api.MessageWorkItem{{ItemTaskID: h.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}})
+	unlinked := request("owner-card-unlinked", "Approve the unlinked fixture", nil)
+	h.obligationID(linked.Seq)
+	h.cycle()
+	byMarker := map[int64]*fakeMessage{}
+	for _, line := range h.lines() {
+		for _, seq := range []int64{linked.Seq, unlinked.Seq} {
+			if strings.Contains(line.Content, "-# #"+itoa(seq)) {
+				byMarker[seq] = line
+			}
+		}
+	}
+	approve := func(line *fakeMessage) int {
+		n := 0
+		for _, row := range line.Components {
+			for _, button := range row.Components {
+				if button.Label == "Approve" {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	card := byMarker[linked.Seq]
+	if card == nil || !strings.HasPrefix(card.Content, "**Request to owner**") || !strings.Contains(card.Content, "owner-request") || approve(card) != 1 {
+		t.Fatalf("the obligated request lost its owner card: %+v", card)
+	}
+	line := byMarker[unlinked.Seq]
+	header := "**" + h.builder.Name + "** → **everyone** · REQUEST · Approve the unlinked fixture"
+	if line == nil || !strings.HasPrefix(line.Content, header) || strings.Contains(line.Content, "owner-request") || strings.Contains(line.Content, "Request to owner") || approve(line) != 0 || len(line.Embeds) != 1 {
+		t.Fatalf("the unobligated request is not an ordinary line: %+v", line)
+	}
+
+	// A failed obligation lookup keeps the card rather than hide a real one.
+	h.hubDown.Store(true)
+	rows := h.b.renderMessage(h.task, roster{h.builder.ID: h.builder}, unlinked)
+	h.hubDown.Store(false)
+	if len(rows) == 0 || !strings.HasPrefix(rows[0].Key, "owner-request:") {
+		t.Fatalf("a failed lookup dropped the owner card: %+v", rows)
+	}
+}

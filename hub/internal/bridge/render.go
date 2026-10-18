@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -122,7 +123,7 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 			return nil // bookkeeping: shown on the status card, not as a line
 		}
 	}
-	if env != nil && env.Kind == api.EnvelopeKindRequest && m.From.AgentID != "" && (env.To == "owner" || (env.To == "" && m.To == "")) {
+	if b.ownerCard(m) {
 		parts := ownerRequestParts(m)
 		rows := []OutboxRow{}
 		for i, text := range parts {
@@ -163,6 +164,36 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 		rows = append(rows, row("msg", kindLine, i+1, outboxPayload{Message: discord.MessageSend{Content: content}, Marker: mk}))
 	}
 	return rows
+}
+
+// ownerCard reports whether an agent's request is drawn as a Request to owner
+// card: only when the hub holds an owner obligation for it. An explicit owner
+// request is stored only with one. A board-wide request without exact context
+// is stored without one, so ask the hub; a failed lookup keeps the card, since
+// dropping it would hide a real obligation.
+func (b *Bridge) ownerCard(m api.Message) bool {
+	env := m.Envelope
+	if env == nil || env.Kind != api.EnvelopeKindRequest || m.From.AgentID == "" {
+		return false
+	}
+	if env.To == "owner" {
+		return true
+	}
+	if env.To != "" || m.To != "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(b.runCtx, 30*time.Second)
+	defer cancel()
+	list, err := b.cfg.Hub.ListObligationsFrom(ctx, m.TaskID, "", m.Seq, m.Seq)
+	if err != nil {
+		return true
+	}
+	for _, o := range list {
+		if o.MessageSeq == m.Seq && o.RecipientKind == api.ObligationRecipientOwner {
+			return true
+		}
+	}
+	return false
 }
 
 // Keep the exact answer in separate embeds so request markdown (including an
