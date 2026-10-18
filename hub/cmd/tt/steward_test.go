@@ -1058,6 +1058,42 @@ func TestStewardRotationTickNeedsLocalStewardSessionAndSpacesRequests(t *testing
 	}
 }
 
+// A due steward with no saved summary is never prepared: the hub would refuse
+// summary_missing and the runner would retry it every interval. Once a
+// summary is saved, the runner rotates it on its due reason.
+func TestStewardRotationTickSkipsSummaryLessSteward(t *testing.T) {
+	f := newStewardCLI(t)
+	cleanups := 0
+	clock := time.Now()
+	runner := &stewardRotationRunner{deps: f.rotationDeps(t, false, &cleanups), now: func() time.Time { return clock }, interval: time.Minute}
+	client := func() (*api.Client, error) { return f.c, nil }
+	ctx := context.Background()
+	host := spawn.Host()
+	steward, _ := f.rotationSetup(t, false)
+	// A template change makes the idle, summary-less steward due.
+	runner.digest = strings.Repeat("e", 64)
+	for i := 1; i <= 4; i++ {
+		if err := runner.hostTick(ctx, f.e, client, host); err != nil || f.calls.due.Load() != int32(i) {
+			t.Fatalf("tick %d: %v due=%d", i, err, f.calls.due.Load())
+		}
+		clock = clock.Add(time.Minute)
+	}
+	if n := f.calls.actions.Load(); n != 0 {
+		t.Fatalf("the runner sent %d rotation action(s) for a summary-less steward", n)
+	}
+	if rotations, err := f.c.ListStewardRotations(ctx, f.task.ID); err != nil || len(rotations) != 0 {
+		t.Fatalf("rotations without a summary: %+v %v", rotations, err)
+	}
+	f.saveSummary(t, steward, 0, "## Themes\nsynthetic backlog", "summary-r1")
+	if err := runner.hostTick(ctx, f.e, client, host); err != nil {
+		t.Fatalf("tick after the summary: %v", err)
+	}
+	rotations, err := f.c.ListStewardRotations(ctx, f.task.ID)
+	if err != nil || len(rotations) != 1 || rotations[0].State != api.StewardRotationCommitted || rotations[0].Trigger != api.StewardRotationTriggerRunner || rotations[0].Reason != api.StewardRotationReasonTemplate {
+		t.Fatalf("runner rotation after the summary: %+v %v", rotations, err)
+	}
+}
+
 // Review round 1, b2: prepare, spawn failure, pause, resume, rerun rotate.
 // The rerun admits no successor and aborts the stale rotation; setup then
 // admits exactly one steward.

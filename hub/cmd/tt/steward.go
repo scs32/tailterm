@@ -1036,7 +1036,9 @@ func (r *stewardRotationRunner) tick(ctx context.Context, e env, c *api.Client, 
 			}
 			continue
 		}
-		if d.OpenRotation != nil || len(d.DueReasons) == 0 || !d.Idle {
+		// A steward with no saved summary has nothing to hand over: the hub
+		// refuses its prepare summary_missing, so wait for the first save.
+		if d.OpenRotation != nil || len(d.DueReasons) == 0 || !d.Idle || d.SummaryRevision == 0 {
 			continue
 		}
 		if _, err := rotateSteward(ctx, r.deps, e, c, d.TaskID, d.DueReasons[0], api.StewardRotationTriggerRunner); err != nil && !stewardRotationBusy(err) {
