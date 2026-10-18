@@ -107,6 +107,13 @@ const selectors = {
   bugs: "[data-items-scope]", features: "[data-items-scope]",
 };
 const results = [], offlineResults = [], rosterResults = [], failures = [], skips = [];
+// BOARD_LAYOUT_ENGINE=chromium|webkit runs one engine and
+// BOARD_LAYOUT_CASE=scrollbar-drag runs only the rail scrollbar drag, for
+// repeating that case alone.
+const engines = [chromium, webkit].filter(engine => !process.env.BOARD_LAYOUT_ENGINE || engine.name() === process.env.BOARD_LAYOUT_ENGINE);
+const scrollbarOnly = process.env.BOARD_LAYOUT_CASE === "scrollbar-drag";
+if (!engines.length) throw Error(`Unknown BOARD_LAYOUT_ENGINE ${process.env.BOARD_LAYOUT_ENGINE}`);
+if (process.env.BOARD_LAYOUT_CASE && !scrollbarOnly) throw Error(`Unknown BOARD_LAYOUT_CASE ${process.env.BOARD_LAYOUT_CASE}`);
 function check(label, operation) {
   try { operation(); }
   catch (error) { failures.push(`${label}: ${error.message}`); console.error(failures.at(-1)); }
@@ -318,10 +325,10 @@ async function actions(page) {
 }
 
 try {
-  for (const engine of [chromium, webkit]) {
+  for (const engine of engines) {
     const browser = await engine.launch();
     try {
-      for (const width of [1440, 1024, 390]) for (const scenario of ["populated", "empty", "long"]) {
+      for (const width of scrollbarOnly ? [] : [1440, 1024, 390]) for (const scenario of ["populated", "empty", "long"]) {
         const context = await browser.newContext({ viewport: {width,height:900} });
         const page = await context.newPage(), errors=[];
         page.on("pageerror",error=>errors.push(error.message));
@@ -358,7 +365,7 @@ try {
       // Exercise the actual expanded Projects roster, including absent activity
       // and every typed state. Long unbroken labels catch bounded controls whose
       // text still paints outside them.
-      {
+      if (!scrollbarOnly) {
         const context = await browser.newContext({ viewport: {width:390,height:900} });
         const page = await context.newPage();
         const label = `${engine.name()}-390-expanded-activity-roster`;
@@ -410,7 +417,7 @@ try {
         } catch(error) {failures.push(`${label}: ${error.stack||error.message}`);console.error(failures.at(-1))}
         finally {await context.close()}
       }
-      for (const width of [1000, 1024, 1050, 1051, 1100]) {
+      for (const width of scrollbarOnly ? [] : [1000, 1024, 1050, 1051, 1100]) {
         const context = await browser.newContext({ viewport: {width,height:900} });
         const page = await context.newPage(), errors=[];
         page.on("pageerror",error=>errors.push(error.message));
@@ -438,6 +445,74 @@ try {
         } finally {await context.close()}
       }
     } finally {await browser.close()}
+    // A real drag on the Projects rail's scrollbar holds a refresh that
+    // arrives while the button is down and paints it once the scroll is idle
+    // after release. Playwright hides Chromium's scrollbars and headless
+    // WebKit's overlay scrollbars take no presses, so this browser shows
+    // Chromium's own and the rail gets a classic WebKit scrollbar.
+    {
+      const scrollBrowser = await engine.launch(engine === chromium ? {ignoreDefaultArgs:["--hide-scrollbars"]} : {});
+      const context = await scrollBrowser.newContext({ viewport: {width:1024,height:600} });
+      const page = await context.newPage(), errors=[];
+      page.on("pageerror",error=>errors.push(error.message));
+      await context.route("**/*",route=>new URL(route.request().url()).origin===origin?route.continue():route.abort());
+      const label = `${engine.name()}-1024-rail-scrollbar-drag`, idle = 150, margin = 250;
+      try {
+        await page.goto(`${origin}/board-layout-test?scenario=populated`);
+        await page.waitForFunction(()=>!!window.qa);
+        await page.evaluate(webkit => {
+          for (let i = 0; i < 30; i++) qa.tasks.splice(2, 0, {id:'tsk_'+String(i).padStart(16,'4'),name:'Scroll project '+(i+1),goal:'Synthetic goal',status:'open',cleanupPending:0,orchestrator:'fixture-lead',createdAt:'2026-09-08T11:00:00Z'});
+          if (webkit) document.head.insertAdjacentHTML('beforeend','<style>.board-rail::-webkit-scrollbar{width:14px}.board-rail::-webkit-scrollbar-thumb{background:#888;min-height:40px}</style>');
+          qa.client.invalidate();
+        }, engine === webkit);
+        await show(page,'tasks');
+        const rail = page.locator('#mode-view [data-view-scroll="rail"]');
+        await expect(rail).toContainText('Scroll project 30');
+        const box = await rail.evaluate(el => {
+          const r=el.getBoundingClientRect(), border=parseFloat(getComputedStyle(el).borderRightWidth);
+          return {x:r.x+el.clientLeft+el.clientWidth,y:r.y+el.clientTop,bar:el.offsetWidth-el.clientLeft-el.clientWidth-border,overflow:el.scrollHeight-el.clientHeight};
+        });
+        assert.ok(box.bar >= 8 && box.overflow > 200, `${label}: rail has no draggable scrollbar ${JSON.stringify(box)}`);
+        await page.evaluate(() => {
+          const list = qa.client.listTasks;
+          window.dragProbe = {delivered:false};
+          qa.client.listTasks = async (...args) => {
+            const tasks = await list.apply(qa.client, args);
+            if (tasks.some(t => t.name === 'Refreshed during drag')) dragProbe.delivered = true;
+            return tasks;
+          };
+          addEventListener('pointerup', () => dragProbe.releasedAt ??= performance.now(), true);
+          const rail = () => document.querySelector('#mode-view [data-view-scroll="rail"]');
+          new MutationObserver(() => {
+            if (rail()?.textContent.includes('Refreshed during drag')) dragProbe.renderedAt ??= performance.now();
+          }).observe(document.querySelector('#mode-view'), {childList:true, subtree:true});
+        });
+        const x = box.x + box.bar / 2, y = box.y + 30;
+        await page.mouse.move(x, y);
+        await page.mouse.down();
+        await page.mouse.move(x, y + 80, {steps:8});
+        // The refresh reaches the view while the button stays down and the
+        // scroll itself has gone idle, so only the press holds it.
+        await page.evaluate(() => {qa.tasks[0].name = 'Refreshed during drag'; qa.client.invalidate()});
+        await expect.poll(() => page.evaluate(() => dragProbe.delivered)).toBe(true);
+        await page.waitForTimeout(idle + margin);
+        assert.equal(await page.evaluate(() => dragProbe.renderedAt), undefined, `${label}: refresh painted mid-drag`);
+        await expect(rail.locator('[data-task-select]').first()).toHaveText(/Alpha project/);
+        const scrolled = await rail.evaluate(el => el.scrollTop);
+        assert.ok(scrolled > 0, `${label}: scrollbar drag did not scroll the rail`);
+        await page.mouse.up();
+        await expect.poll(() => page.evaluate(() => dragProbe.renderedAt), {timeout:3000, message:`${label}: refresh never painted after release`}).toBeGreaterThan(0);
+        const probe = await page.evaluate(() => dragProbe);
+        assert.ok(probe.releasedAt > 0, `${label}: no window pointerup after the scrollbar drag`);
+        const delay = probe.renderedAt - probe.releasedAt;
+        assert.ok(delay <= idle + margin, `${label}: refresh painted ${delay.toFixed(0)} ms after release, over ${idle} ms idle + ${margin} ms margin`);
+        const kept = await page.locator('#mode-view [data-view-scroll="rail"]').evaluate(el => el.scrollTop);
+        assert.ok(Math.abs(kept - scrolled) <= 1, `${label}: refresh moved the rail from ${scrolled} to ${kept}`);
+        assert.deepEqual(errors,[],`${label}: browser errors`);
+        console.log(`${label}: refresh held mid-drag, painted ${delay.toFixed(0)} ms after release`);
+      } catch(error) {failures.push(`${label}: ${error.stack||error.message}`);console.error(failures.at(-1))}
+      finally {await context.close();await scrollBrowser.close()}
+    }
   }
 } finally {
   await server.close();
@@ -445,4 +520,4 @@ try {
   await writeFile('.build/board-layout-report.html','<!doctype html><meta charset="utf-8"><title>Board layout comparison</title><style>body{font:14px system-ui;background:#151916;color:#ddd}section{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}img{width:100%}h2{grid-column:1/-1}figure{margin:0}figcaption{padding:5px}</style>'+[...new Set(results.map(r=>r.engine+' '+r.width+' '+r.scenario))].map(group=>'<section><h2>'+group+'</h2>'+results.filter(r=>r.engine+' '+r.width+' '+r.scenario===group).map(r=>'<figure><figcaption>'+r.mode+'</figcaption><a href="'+r.screenshot+'"><img src="'+r.screenshot+'"></a></figure>').join('')+'</section>').join(''));
 }
 if(failures.length)throw Error(`Board layout acceptance: ${failures.length} failures; see .build/board-layout-results.json`);
-console.log(`PASS: Chromium/WebKit Board layout comparison at 1440, 1024, and 390px; ${skips.length} linked heading checks skipped`);
+console.log(scrollbarOnly ? `PASS: ${engines.map(engine => engine.name()).join("/")} rail scrollbar drag` : `PASS: ${engines.map(engine => engine.name()).join("/")} Board layout comparison at 1440, 1024, and 390px and rail scrollbar drag; ${skips.length} linked heading checks skipped`);
