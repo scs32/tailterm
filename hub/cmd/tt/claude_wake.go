@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/spawn"
 )
 
 // A wake is uncertain from the moment its intent is durable. A crash between
@@ -66,8 +67,10 @@ type claudeWakeIntent struct {
 	// Safe records why the checks let this wake type: the turn state and how
 	// much of the transcript was read to reach it.
 	Safe string `json:"safe,omitempty"`
-	// Cleared describes the stray input removed before this attempt typed, and
-	// Clears counts such removals since FirstAt (see claudeWakeEmpty).
+	// Cleared describes the stray input the latest pass over this intent
+	// removed, and is empty when that pass removed none, so an earlier
+	// attempt's clear is never reported again; Clears counts such removals
+	// since FirstAt (see claudeWakeEmpty).
 	Cleared string `json:"cleared,omitempty"`
 	Clears  int    `json:"clears,omitempty"`
 }
@@ -81,7 +84,10 @@ type claudeWakeSnapshot struct {
 	FileID    uint64
 	Offset    int64
 	Screen    string
-	Cursor    activityCursor
+	// CaretX and CaretY are the tmux cursor when the pane was read. A guarded
+	// clear sends its Backspaces only while the cursor is still there.
+	CaretX, CaretY int
+	Cursor         activityCursor
 	// UnknownTypes lists transcript record types the idle check ignored.
 	UnknownTypes []string
 	// Safe says why the transcript allows input (see claudeWakeIntent.Safe).
@@ -93,9 +99,11 @@ type claudeWakeSnapshot struct {
 type claudeWakeOps struct {
 	inspect func(context.Context, runtimeBinding, string) (claudeWakeSnapshot, error)
 	send    func(context.Context, string, string, bool) error
-	// clear deletes n characters before the cursor of a pane's input. Nil
-	// disables clearing: stray input is then only reported.
-	clear func(context.Context, string, int) error
+	// clear deletes n characters before the cursor of the snapshot's pane,
+	// only while the pane still matches the snapshot; otherwise it deletes
+	// nothing and returns errClaudeClearMoved. Nil disables clearing: stray
+	// input is then only reported.
+	clear func(context.Context, claudeWakeSnapshot, int) error
 	sleep func(time.Duration)
 	now   func() time.Time
 	// escalate reports a wake skipped past claudeWakeSkipBound. Nil disables
@@ -104,6 +112,10 @@ type claudeWakeOps struct {
 }
 
 var errClaudeWakeUnsafe = errors.New("Claude is not safely idle")
+
+// errClaudeClearMoved is a guarded clear that tmux refused: the pane's cursor
+// or identity no longer matched the proof, so nothing was deleted.
+var errClaudeClearMoved = errors.New("the input changed before the clear")
 
 func claudeWakePath(b runtimeBinding) string {
 	return filepath.Join(relayDir(), bindingKey(b)+"-"+b.Run+".claude-wake.json")
@@ -726,6 +738,7 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 		return claudeWakeSnapshot{}, err
 	}
 	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = pane.Pane, pane.SessionID, pane.Created, pane.PanePID, visible
+	transcript.CaretX, transcript.CaretY = pane.CursorX, pane.CursorY
 	return transcript, nil
 }
 
@@ -921,18 +934,34 @@ func nativeClaudeSend(ctx context.Context, pane, value string, literal bool) err
 	return err
 }
 
-// nativeClaudeClear presses Backspace n times in one tmux command. Backspace
-// in an empty Claude input does nothing, so a count above the text is safe.
-func nativeClaudeClear(ctx context.Context, pane string, n int) error {
+// nativeClaudeClear presses Backspace n times in at's pane, guarded inside
+// tmux's command queue: the keys are sent only while the pane ID, pane PID,
+// mode and cursor still match the proof capture at, so a key that Claude Code
+// has drawn since (typing, a paste, refilled replies) moves the cursor and the
+// clear refuses with errClaudeClearMoved, deleting nothing. A key tmux has
+// passed on but Claude Code has not drawn yet has not moved the cursor, so it
+// can still be deleted; the empty check after the clear still refuses to type
+// after anything left. A comparison cut at tmux's 100 ms format limit reads
+// false through the trailing literal, so a cut guard refuses.
+func nativeClaudeClear(ctx context.Context, at claudeWakeSnapshot, n int) error {
 	if n < 1 || n > claudeStrayClearRunes {
 		return fmt.Errorf("Claude input clear of %d characters is out of bounds", n)
 	}
-	args := []string{"send-keys", "-t", pane}
-	for range n {
-		args = append(args, "BSpace")
+	pane := spawn.ShellQuote(at.Pane)
+	keys := "send-keys -t " + pane + strings.Repeat(" BSpace", n)
+	cond := fmt.Sprintf("#{&&:#{&&:#{==:#{pane_id},%s},#{&&:#{==:#{pane_pid},%d},#{&&:#{==:#{pane_in_mode},0},#{&&:#{==:#{cursor_x},%d},#{==:#{cursor_y},%d}}}}},1}", at.Pane, at.PanePID, at.CaretX, at.CaretY)
+	out, err := startupTmux(ctx, "if-shell", "-F", "-t", at.Pane, cond, keys+" ; display-message -p cleared", "display-message -p changed")
+	if err != nil {
+		return err
 	}
-	_, err := startupTmux(ctx, args...)
-	return err
+	switch reply := strings.TrimSpace(string(out)); reply {
+	case "cleared":
+		return nil
+	case "changed":
+		return errClaudeClearMoved
+	default:
+		return fmt.Errorf("tmux gave no clear outcome (%q)", reply)
+	}
 }
 
 func claudeUserText(line []byte) string {
@@ -1317,19 +1346,23 @@ func claudeWakeNoteClears(intent *claudeWakeIntent, cleared []string) {
 // holds), alone or with such replies beside it. With keep set, own text alone
 // is left for the Enter retry and not cleared here. Before a clear it proves,
 // with the usual identity and transcript checks, that the pane is idle and
-// holds exactly the text it read; after it, the empty check runs again, so the
-// caller never types after leftover text.
-// Any other text is left untouched and the refusal names it. pane, when set,
-// is the only pane that may be cleared. cleared lists what each clear removed:
-// a count and a clipped sample of the replies, never other input text. Each
-// clear is logged in one line, and an error after a clear names it, so a skip
-// record keeps it. At most claudeStrayClearMax clears run in one call.
+// holds exactly the text it read. The clear itself is guarded by that proof
+// (ops.clear): a pane whose cursor moved since is not cleared and the pass
+// skips. After a clear the empty check runs again, so the caller never types
+// after leftover text.
+// Any other text is left untouched and the refusal names its kind. pane, when
+// set, is the only pane that may be cleared. cleared lists what each clear
+// removed: a count and a clipped sample of the replies, never other input
+// text. Each clear is logged in one line once ops.clear reports it ran. An
+// error after a clear names the kinds cleared without counts or samples, so a
+// skip record keeps them and a changing input does not change the skip
+// reason. At most claudeStrayClearMax clears run in one call.
 func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, own string, keep bool, pane string) (claudeWakeSnapshot, []string, error) {
-	var cleared []string
+	var cleared, kinds []string
 	var before claudeWakeSnapshot
 	fail := func(err error) (claudeWakeSnapshot, []string, error) {
-		if len(cleared) > 0 {
-			err = fmt.Errorf("%v (after it %s)", err, strings.Join(cleared, "; "))
+		if len(kinds) > 0 {
+			err = fmt.Errorf("%v (after it cleared %s)", err, strings.Join(kinds, "; "))
 		}
 		return claudeWakeSnapshot{}, cleared, err
 	}
@@ -1360,11 +1393,11 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 		case alone && keep:
 			return fail(err) // the saved wake's own text alone: the Enter retry's case
 		case !alone && stray == "":
-			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is not a terminal reply; left untouched", err, n))
+			return fail(fmt.Errorf("%v: stray input in the input line is not a terminal reply; left untouched", err))
 		case ops.clear == nil:
-			return fail(fmt.Errorf("%v: stray input in the input line (%d characters of %s); no clear available", err, n, what))
+			return fail(fmt.Errorf("%v: stray input in the input line (%s); no clear available", err, what))
 		case n > claudeStrayClearRunes:
-			return fail(fmt.Errorf("%v: stray input in the input line (%d characters) is too long to clear", err, n))
+			return fail(fmt.Errorf("%v: stray input in the input line (%s) is too long to clear", err, what))
 		case len(cleared) >= claudeStrayClearMax:
 			return fail(fmt.Errorf("%v: stray input in the input line returned after %d clears in one pass", err, len(cleared)))
 		}
@@ -1385,11 +1418,16 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 		if alone {
 			note = fmt.Sprintf("cleared %d characters of stray input (%s)", n, what)
 		}
-		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s before typing\n", ops.now().UTC().Format(time.RFC3339), b.Agent, note)
-		if err := ops.clear(ctx, held.Pane, n); err != nil {
+		if err := ops.clear(ctx, held, n); errors.Is(err, errClaudeClearMoved) {
+			return fail(errors.New("stray input in the input line not cleared: its input changed before the clear"))
+		} else if err != nil {
 			return fail(fmt.Errorf("stray input in the input line not cleared: %v", err))
 		}
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s before typing\n", ops.now().UTC().Format(time.RFC3339), b.Agent, note)
 		cleared = append(cleared, note)
+		if !slices.Contains(kinds, what) {
+			kinds = append(kinds, what)
+		}
 		ops.sleep(100 * time.Millisecond)
 	}
 }
@@ -1459,6 +1497,7 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 			return true, errors.New("Claude transcript changed before retry; did not confirm")
 		}
 		previous.Attempts++
+		previous.Cleared = "" // this attempt cleared nothing
 		claudeWakeSaveReason(previous, fmt.Sprintf("retry %d/%d: Enter on own unsubmitted text", previous.Attempts, claudeWakeMaxRetries))
 		previous.RetryAt = now.Add(claudeWakeBackoffAfter(previous.Attempts))
 		if err := writePrivateJSON(path, previous); err != nil {
@@ -1480,9 +1519,7 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 	// text was never submitted, so the wake is still undelivered. The saved
 	// prompt alone is the Enter retry's and stays.
 	empty, cleared, emptyErr := claudeWakeEmpty(ctx, b, ops, previous.Prompt, true, previous.Pane)
-	if len(cleared) > 0 {
-		claudeWakeNoteClears(previous, cleared)
-	}
+	claudeWakeNoteClears(previous, cleared)
 	if emptyErr == nil && empty.Pane == previous.Pane && emptyClaudeInput(empty.Screen) && claudeWakeIdle(empty, ops.now()) {
 		if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
 			return true, errors.New("Claude transcript changed before retry; did not confirm")
