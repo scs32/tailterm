@@ -288,6 +288,9 @@ The hub posts the copy only when all of these hold:
 5. That item has a lead: a running item-team lead mapping whose agent and run
    are live (not closed, exited or retired).
 6. The lead is neither the reply's recipient nor its sender.
+7. It is not a person's board-wide reply: one with no recipient whose author
+   is a person, not an agent or the broker node. That reply is already on the
+   lead's page and wakes every agent, so a copy would tell the lead twice.
 
 The copy keeps the reply's item links and has refs `message` (the reply),
 `replyTo` (what it answers) and `copy=lead`. Its text names the sender, the
