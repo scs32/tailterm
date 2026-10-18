@@ -461,39 +461,62 @@ func wakingNotice(m api.Message) bool {
 	return recipientlessNotice(m) && m.Envelope.Refs[noticeWakeRef] != noticeWakeRoutine
 }
 
+// relayDeployerReadRetry is how often a failed author-role or task-list read
+// of the deployer notice wake is made again per hub, task (and author), across
+// all bindings; under a minute so a recovered read is seen on the next minute.
+const relayDeployerReadRetry = 30 * time.Second
+
 // relayAuthorRoles remembers each agent's role for the relay process, so the
 // deployer notice wake reads an author once, not once per poll.
 var relayAuthorRoles = &authorRoles{}
 
 type authorRoles struct {
-	mu    sync.Mutex
-	roles map[string]string
+	mu     sync.Mutex
+	roles  map[string]string
+	failed map[string]roleFailure
+}
+
+// roleFailure is a failed author read, returned again for
+// relayDeployerReadRetry after it was made.
+type roleFailure struct {
+	err error
+	at  time.Time
 }
 
 func (r *authorRoles) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.roles = nil
+	r.failed = nil
 }
 
-func (r *authorRoles) role(ctx context.Context, c *api.Client, b runtimeBinding, agent string) (string, error) {
+func (r *authorRoles) role(ctx context.Context, c *api.Client, b runtimeBinding, agent string, now time.Time) (string, error) {
 	key := b.Hub + "\x00" + b.Task + "\x00" + agent
 	r.mu.Lock()
 	role, ok := r.roles[key]
+	failure, failed := r.failed[key]
 	r.mu.Unlock()
 	if ok {
 		return role, nil
+	}
+	if failed && now.Sub(failure.at) < relayDeployerReadRetry && !now.Before(failure.at) {
+		return "", failure.err
 	}
 	a, err := c.GetAgent(ctx, b.Task, agent)
 	var httpErr *api.HTTPError
 	if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
 		err = nil // no such agent: not a deployer
 	}
-	if err != nil {
-		return "", err
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err != nil {
+		if r.failed == nil || len(r.failed) >= 4096 {
+			r.failed = map[string]roleFailure{}
+		}
+		r.failed[key] = roleFailure{err: err, at: now}
+		return "", err
+	}
+	delete(r.failed, key)
 	if r.roles == nil || len(r.roles) >= 4096 {
 		r.roles = map[string]string{}
 	}
@@ -512,8 +535,10 @@ type primaryHandlers struct {
 }
 
 type primaryHandler struct {
-	agent string
-	at    time.Time
+	agent   string
+	at      time.Time
+	through int64 // the highest waking notice the read was made for
+	err     error // a failed read, returned again for relayDeployerReadRetry
 }
 
 func (r *primaryHandlers) reset() {
@@ -523,20 +548,32 @@ func (r *primaryHandlers) reset() {
 }
 
 // primary returns the project's explicit primary handler, or "" when none is
-// set. The task list carries it without the project's roster.
-func (r *primaryHandlers) primary(ctx context.Context, c *api.Client, b runtimeBinding, now time.Time) (string, error) {
+// set. The task list carries it without the project's roster. through is the
+// highest waking notice on the caller's page, read before this call: a read
+// made for a lower one is made again, so a rotation committed before the
+// notice is seen however young the cached read is.
+func (r *primaryHandlers) primary(ctx context.Context, c *api.Client, b runtimeBinding, now time.Time, through int64) (string, error) {
 	key := b.Hub + "\x00" + b.Task
 	r.mu.Lock()
 	got, ok := r.seen[key]
 	r.mu.Unlock()
-	if ok && now.Sub(got.at) < time.Minute && !now.Before(got.at) {
+	if ok && got.err != nil && now.Sub(got.at) < relayDeployerReadRetry && !now.Before(got.at) {
+		return "", got.err
+	}
+	if ok && got.err == nil && now.Sub(got.at) < time.Minute && !now.Before(got.at) && got.through >= through {
 		return got.agent, nil
 	}
 	tasks, err := c.ListTasks(ctx)
 	if err != nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.seen == nil {
+			r.seen = map[string]primaryHandler{}
+		}
+		r.seen[key] = primaryHandler{at: now, err: err}
 		return "", err
 	}
-	got = primaryHandler{at: now}
+	got = primaryHandler{at: now, through: through}
 	for _, t := range tasks {
 		if t.ID == b.Task {
 			got.agent = t.PrimaryHandlerID
@@ -563,10 +600,16 @@ func (r *primaryHandlers) primary(ctx context.Context, c *api.Client, b runtimeB
 // a prepared successor) cannot be made from the relay's reads. The caller has
 // already found this binding live. The added hub requests are cached reads of
 // the primary handler and of an author's role, made only when the page holds
-// such a notice; a failed read is returned, so the page is read again rather
-// than passed over.
+// such a notice; a notice newer than the cached primary read forces a fresh
+// one. A failed read is returned and kept for relayDeployerReadRetry; relayOne
+// still wakes for the page's other messages, and with none it holds the page
+// below the notice so a later pass decides it (wi_e58d6364a2789f9f).
 func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding, a api.Agent, msgs []api.Message, now time.Time) (map[string]bool, error) {
 	if a.Role != api.AgentRoleDatabaseHandler && a.Role != api.AgentRoleOwnerHelper {
+		return nil, nil
+	}
+	seqs := deployerNoticeSeqs(msgs, b.Agent)
+	if len(seqs) == 0 {
 		return nil, nil
 	}
 	var deployers map[string]bool
@@ -576,13 +619,13 @@ func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding,
 			continue
 		}
 		if a.Role == api.AgentRoleDatabaseHandler && len(checked) == 0 {
-			primary, err := relayPrimaryHandlers.primary(ctx, c, b, now)
+			primary, err := relayPrimaryHandlers.primary(ctx, c, b, now, seqs[len(seqs)-1])
 			if err != nil || primary != b.Agent {
 				return nil, err
 			}
 		}
 		checked[m.From.AgentID] = true
-		role, err := relayAuthorRoles.role(ctx, c, b, m.From.AgentID)
+		role, err := relayAuthorRoles.role(ctx, c, b, m.From.AgentID, now)
 		if err != nil {
 			return nil, err
 		}
@@ -594,6 +637,24 @@ func deployerNoticeAuthors(ctx context.Context, c *api.Client, b runtimeBinding,
 		}
 	}
 	return deployers, nil
+}
+
+// deployerNoticeSeqs lists the sequences of the page's waking notices another
+// agent posted (at most eight, keeping the last), in page order: the notices
+// deployerNoticeAuthors decides.
+func deployerNoticeSeqs(messages []api.Message, agent string) []int64 {
+	var seqs []int64
+	for _, m := range messages {
+		if !wakingNotice(m) || m.From.AgentID == agent {
+			continue
+		}
+		if len(seqs) == 8 {
+			seqs[7] = m.Seq
+		} else {
+			seqs = append(seqs, m.Seq)
+		}
+	}
+	return seqs
 }
 
 func wakeThrough(messages []api.Message, agent string) (through int64, eligible bool) {
@@ -1040,11 +1101,15 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 			}
 		}
 	}
-	deployers, err := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs, now)
-	if err != nil {
-		return err
-	}
+	// A failed deployer read never holds the page's other wakes. With nothing
+	// else to wake for, the page is held below the undecided notice, so the
+	// next pass decides it once the cached failure expires.
+	deployers, deployerErr := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs, now)
 	_, eligible := wakeThroughFor(eligibleMsgs, b.Agent, deployers)
+	if !eligible && deployerErr != nil {
+		recordRelaySkip(p, b.Agent, "deployer notice check failed: "+deployerErr.Error(), deployerNoticeSeqs(eligibleMsgs, b.Agent), 0, 0, now)
+		return deployerErr
+	}
 	if !eligible {
 		// Nothing is held back here. The page holds input already delivered,
 		// messages that broker wake jobs deliver, or messages that never wake

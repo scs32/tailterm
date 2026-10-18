@@ -1919,6 +1919,195 @@ func TestRelayDeployerNoticeRoleReadFailureRetries(t *testing.T) {
 	}
 }
 
+// A failed deployer read never holds the page's other wakes: the primary
+// handler and the owner helper are still woken for a directed, broadcast or
+// person's message beside the notice, and the cursor moves past both
+// (wi_e58d6364a2789f9f).
+func TestRelayDeployerNoticeFailedReadKeepsOtherWakes(t *testing.T) {
+	owner := api.Sender{Node: "workspace", User: "owner"}
+	others := []struct {
+		name    string
+		message func(agent string) api.Message
+	}{
+		{"directed", func(agent string) api.Message {
+			return api.Message{Seq: 32, To: agent, From: owner, Text: "please look at the release"}
+		}},
+		{"broadcast", func(string) api.Message {
+			return api.Message{Seq: 32, Broadcast: true, From: api.Sender{AgentID: noticeWorker, Node: "workspace", User: "owner"}, Text: "to everyone"}
+		}},
+		{"human", func(string) api.Message {
+			return api.Message{Seq: 32, From: owner, Text: "a note from the owner"}
+		}},
+	}
+	failures := []struct {
+		name   string
+		read   string
+		status int
+		agents []string
+	}{
+		{"author-500", noticeDeployer, http.StatusInternalServerError, noticeRecipients},
+		{"author-429", noticeDeployer, http.StatusTooManyRequests, noticeRecipients},
+		{"author-403", noticeDeployer, http.StatusForbidden, noticeRecipients},
+		{"tasks-503", "tasks", http.StatusServiceUnavailable, []string{noticeHandler}},
+	}
+	for _, f := range failures {
+		for _, agent := range f.agents {
+			for _, other := range others {
+				t.Run(f.name+"-"+agent+"-"+other.name, func(t *testing.T) {
+					h, c, binding := newNoticeHub(t)
+					h.messages = []api.Message{deployerNotice(31, noticeDeployer), other.message(agent)}
+					h.fail[f.read] = f.status
+					p := relayProgress{}
+					wakes := 0
+					queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+					if err := relayOne(context.Background(), binding(agent), &p, c, time.Now(), queue); err != nil || wakes != 1 || p.Through != 32 {
+						t.Fatalf("err=%v wakes=%d progress=%+v", err, wakes, p)
+					}
+					if n := h.reads(f.read, false); n != 1 {
+						t.Fatalf("the failing read was made %d times", n)
+					}
+				})
+			}
+		}
+	}
+}
+
+// With only the notice on the page, a failed read is made again at most every
+// 30 seconds, logs one skip for the episode, keeps the cursor below the notice
+// and returns its error; the first pass after it recovers wakes once.
+func TestRelayDeployerNoticeFailedReadSpacedAndLoggedOnce(t *testing.T) {
+	for _, f := range []struct {
+		read   string
+		status int
+	}{{noticeDeployer, http.StatusInternalServerError}, {"tasks", http.StatusServiceUnavailable}} {
+		t.Run(f.read, func(t *testing.T) {
+			h, c, binding := newNoticeHub(t)
+			h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+			h.fail[f.read] = f.status
+			p := relayProgress{}
+			wakes := 0
+			queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+			start := time.Now()
+			pass := func(at time.Duration) error {
+				return relayOne(context.Background(), binding(noticeHandler), &p, c, start.Add(at), queue)
+			}
+			out, _ := captureRelayOutput(t, true, func() error {
+				for at := 0; at < 30; at += 3 {
+					if err := pass(time.Duration(at) * time.Second); err == nil || wakes != 0 || p.Through != 0 {
+						t.Errorf("pass at %ds: err=%v wakes=%d progress=%+v", at, err, wakes, p)
+					}
+				}
+				if n := h.reads(f.read, false); n != 1 {
+					t.Errorf("the failing read was made %d times in 30 seconds", n)
+				}
+				if p.Skip == nil || fmt.Sprint(p.Skip.MessageSeqs) != "[31]" {
+					t.Errorf("skip: %+v", p.Skip)
+				}
+				if err := pass(31 * time.Second); err == nil || wakes != 0 || p.Through != 0 {
+					t.Errorf("pass at 31s: err=%v wakes=%d progress=%+v", err, wakes, p)
+				}
+				if n := h.reads(f.read, false); n != 2 {
+					t.Errorf("the failing read was made %d times after its retry delay", n)
+				}
+				return nil
+			})
+			if n := strings.Count(out, "wake skipped: deployer notice check failed"); n != 1 {
+				t.Fatalf("%d skip lines for one episode:\n%s", n, out)
+			}
+			h.mu.Lock()
+			delete(h.fail, f.read)
+			h.mu.Unlock()
+			if err := pass(62 * time.Second); err != nil || wakes != 1 || p.Through != 31 || p.Skip != nil {
+				t.Fatalf("recovered read: err=%v wakes=%d progress=%+v", err, wakes, p)
+			}
+		})
+	}
+}
+
+// A failing task list read is made once per 30 seconds for all of a project's
+// handler bindings, and each handler is still woken for its own message.
+func TestRelayDeployerNoticeTaskListFailureSpacedAcrossHandlers(t *testing.T) {
+	h, c, binding := newNoticeHub(t)
+	handlers := []string{noticeHandler, noticeHandlerB, "agt_00000000000000e1", "agt_00000000000000e2", "agt_00000000000000e3", "agt_00000000000000e4"}
+	for _, id := range handlers[2:] {
+		h.agents[id] = api.Agent{ID: id, RunID: noticeRun, Role: api.AgentRoleDatabaseHandler, Runtime: "codex", Status: api.AgentDone, Online: true, Unread: 1}
+	}
+	h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+	for i, id := range handlers {
+		h.messages = append(h.messages, api.Message{Seq: int64(32 + i), To: id, From: api.Sender{Node: "workspace", User: "owner"}, Text: "a request for this handler"})
+	}
+	h.fail["tasks"] = http.StatusServiceUnavailable
+	woken := map[string]int{}
+	queue := func(_ context.Context, b runtimeBinding, _ string) error {
+		woken[b.Agent]++
+		return nil
+	}
+	progress := map[string]*relayProgress{}
+	for _, id := range handlers {
+		progress[id] = &relayProgress{}
+	}
+	start := time.Now()
+	for at := 0; at < 30; at += 3 {
+		for _, id := range handlers {
+			if err := relayOne(context.Background(), binding(id), progress[id], c, start.Add(time.Duration(at)*time.Second), queue); err != nil {
+				t.Fatalf("%s at %ds: %v", id, at, err)
+			}
+		}
+	}
+	if n := h.reads("tasks", false); n != 1 {
+		t.Fatalf("six handler bindings read the failing task list %d times in 30 seconds", n)
+	}
+	for _, id := range handlers {
+		if woken[id] != 1 || progress[id].Through != 37 {
+			t.Fatalf("%s: woken=%v progress=%+v", id, woken, progress[id])
+		}
+	}
+	if n := h.reads(noticeDeployer, false); n != 0 {
+		t.Fatalf("the deployer was read %d times with no primary known", n)
+	}
+}
+
+// A deployer notice posted after a committed handler rotation wakes the new
+// primary on its first pass, even while the old primary's read is still
+// cached, and does not wake the old primary.
+func TestRelayDeployerNoticeAfterRotationWithinCacheMinute(t *testing.T) {
+	h, c, binding := newNoticeHub(t)
+	h.messages = []api.Message{deployerNotice(31, noticeDeployer)}
+	woken := map[string]int{}
+	queue := func(_ context.Context, b runtimeBinding, _ string) error {
+		woken[b.Agent]++
+		return nil
+	}
+	progress := map[string]*relayProgress{noticeHandler: {}, noticeHandlerB: {}}
+	start := time.Now()
+	for _, agent := range []string{noticeHandler, noticeHandlerB} {
+		if err := relayOne(context.Background(), binding(agent), progress[agent], c, start, queue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if woken[noticeHandler] != 1 || len(woken) != 1 {
+		t.Fatalf("before the rotation: woken=%v", woken)
+	}
+	h.mu.Lock()
+	h.primary = noticeHandlerB
+	h.messages = append(h.messages, deployerNotice(32, noticeDeployer))
+	h.mu.Unlock()
+	for _, agent := range []string{noticeHandlerB, noticeHandler} {
+		if err := relayOne(context.Background(), binding(agent), progress[agent], c, start.Add(20*time.Second), queue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if woken[noticeHandlerB] != 1 || woken[noticeHandler] != 1 {
+		t.Fatalf("after the rotation: woken=%v", woken)
+	}
+	if progress[noticeHandler].Through != 32 || progress[noticeHandlerB].Through != 32 {
+		t.Fatalf("progress: %+v %+v", progress[noticeHandler], progress[noticeHandlerB])
+	}
+	if n := h.reads("tasks", false); n != 2 {
+		t.Fatalf("the task list was read %d times for two notices", n)
+	}
+}
+
 // taggedNotice is a recipient-less deployer notice with the runner's wake ref
 // (wi_991125f66a787459); an empty wake is the untagged notice of an older
 // runner.
