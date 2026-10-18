@@ -1504,6 +1504,21 @@ func TestSupersedeSetAsideJob(t *testing.T) {
 			t.Fatalf("set-aside history changed %+v", done.Reconciliations)
 		}
 	})
+	t.Run("unclaimed only", func(t *testing.T) {
+		f := setup(t)
+		again, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "reclaim", Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.aside.ID, ExpectedGeneration: f.aside.Generation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		freed, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "unclaim", Operation: "unclaim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: again.ID, ExpectedGeneration: again.Generation})
+		if err != nil || freed.State != "verified" || len(freed.Reconciliations) != 2 || freed.Reconciliations[1].Disposition != "unclaimed" {
+			t.Fatalf("%+v %v", freed, err)
+		}
+		done, err := supersede(t, f, freed)
+		if err != nil || done.State != "superseded" {
+			t.Fatalf("%+v %v", done, err)
+		}
+	})
 	t.Run("claimed again", func(t *testing.T) {
 		f := setup(t)
 		again, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "reclaim", Operation: "claim", AgentID: f.d.ID, RunID: f.d.RunID, JobID: f.aside.ID, ExpectedGeneration: f.aside.Generation})
@@ -1797,6 +1812,187 @@ func TestReleaseSetAsideKeepsFenceForJobsWithEffects(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := setup(t, false)
 			refused(t, f, f.a, change)
+		})
+	}
+}
+
+// A clean stop gives back the exact run's own claim when it has no effects:
+// the job is verified again in its queue place, with an unclaimed record and
+// no incident or prevention item, and is claimed again first.
+func TestReleaseUnclaimReturnsNoEffectClaimToVerified(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	a := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	b, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "b-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "queued behind", "b")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := api.ReleaseRequest{RequestID: a.ID + "-unclaim-" + fmt.Sprint(a.Generation), Operation: "unclaim", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: a.Generation}
+	freed, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freed.State != "verified" || freed.Generation != a.Generation+1 || freed.AgentID != "" || freed.RunID != "" || freed.IntegratedCommit != "" || freed.IntegratedPlan != nil || freed.IntegratedCoverage != nil || freed.IntegratedMatrix != nil || freed.IntegratedVerification != nil || freed.InputsCommit != "" || freed.InputsDigest != "" || freed.Commit != a.Commit || freed.VerificationDigest != a.VerificationDigest {
+		t.Fatalf("unclaimed %+v", freed)
+	}
+	if n := len(freed.Reconciliations); n != 1 {
+		t.Fatalf("history %+v", freed.Reconciliations)
+	}
+	r := freed.Reconciliations[0]
+	if r.Disposition != "unclaimed" || r.JobID != a.ID || r.AgentID != d.ID || r.RunID != d.RunID || r.PauseGeneration != a.PauseGeneration || r.JournalState != "no_effects" || !r.NoPublication || r.StopReason == "" || r.ObservedAt == "" || r.StoppedAt == "" {
+		t.Fatalf("record %+v", r)
+	}
+	if r.IncidentBugID != "" || r.IncidentDigest != "" || r.PreventionItemID != "" || r.PreventionOrderMessage != 0 || r.PreventionOwner != "" || r.PreventionCriterion != "" || r.JournalDigest != "" || r.LockDigest != "" {
+		t.Fatalf("unclaim carries incident or prevention fields %+v", r)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 2 || jobs[0].ID != a.ID || jobs[1].ID != b.ID {
+		t.Fatal("queue place", jobs, err)
+	}
+	again, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || again.Generation != freed.Generation || again.State != "verified" || len(again.Reconciliations) != 1 {
+		t.Fatal("replay", again.Generation, err)
+	}
+	mutated := req
+	mutated.ExpectedGeneration = freed.Generation
+	if _, err = s.ReleaseAction(ctx, task.ID, mutated); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("changed retry replayed", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, a.ID); err != nil || saved.Generation != freed.Generation || saved.State != "verified" {
+		t.Fatal("changed retry wrote the job", saved.State, err)
+	}
+	reclaim, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reclaim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: freed.Generation})
+	if err != nil || reclaim.State != "claimed" || reclaim.RunID != d.RunID || len(reclaim.Reconciliations) != 1 {
+		t.Fatalf("reclaim %+v %v", reclaim, err)
+	}
+}
+
+// Only the exact run's claimed job with no effects, outside a batch and on a
+// bare request, is unclaimed; every refusal leaves the job as it was.
+func TestReleaseUnclaimKeepsFenceForJobsWithEffects(t *testing.T) {
+	ctx := context.Background()
+	type fixture struct {
+		s    *Store
+		task api.Task
+		h, d api.Agent
+		a, b api.ReleaseJob
+	}
+	setup := func(t *testing.T) fixture {
+		s, task, h, d, entry := releaseFixture(t)
+		a, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "a-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "a-claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: a.ID, ExpectedGeneration: a.Generation}); err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "b-enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, s, task, "queued behind", "b")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fixture{s, task, h, d, a, b}
+	}
+	deployer := func(t *testing.T, f fixture, op string, j api.ReleaseJob, change func(*api.ReleaseRequest)) api.ReleaseJob {
+		t.Helper()
+		req := api.ReleaseRequest{RequestID: "a-" + op, Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+		if change != nil {
+			change(&req)
+		}
+		out, err := f.s.ReleaseAction(ctx, f.task.ID, req)
+		if err != nil {
+			t.Fatal(op, err)
+		}
+		return out
+	}
+	// refused asserts the unclaim is refused and the job's row is unchanged.
+	refused := func(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob, change func(*api.ReleaseRequest), want error) {
+		t.Helper()
+		req := api.ReleaseRequest{RequestID: "unclaim", Operation: "unclaim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+		if change != nil {
+			change(&req)
+		}
+		row := releaseRow(t, s, task, j.ID)
+		if _, err := s.ReleaseAction(ctx, task.ID, req); !errors.Is(err, want) {
+			t.Fatalf("unclaim: want %v, got %v", want, err)
+		}
+		if got := releaseRow(t, s, task, j.ID); got != row {
+			t.Fatalf("refused unclaim changed the job:\n%s\n%s", row, got)
+		}
+	}
+	t.Run("inputs bound", func(t *testing.T) {
+		f := setup(t)
+		bound, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "a-inputs", Operation: "inputs", AgentID: f.h.ID, RunID: f.h.RunID, JobID: f.a.ID, ExpectedGeneration: f.a.Generation, IntegratedCommit: f.a.Commit, InputsDigest: strings.Repeat("e", 64)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f.s, f.task, f.d, bound, nil, api.ErrConflict)
+	})
+	t.Run("merged", func(t *testing.T) {
+		f := setup(t)
+		refused(t, f.s, f.task, f.d, deployer(t, f, "merged", f.a, func(r *api.ReleaseRequest) { r.IntegratedCommit = f.a.Commit }), nil, api.ErrConflict)
+	})
+	t.Run("blocked", func(t *testing.T) {
+		f := setup(t)
+		refused(t, f.s, f.task, f.d, deployer(t, f, "block", f.a, nil), nil, api.ErrConflict)
+	})
+	t.Run("verified", func(t *testing.T) {
+		f := setup(t)
+		refused(t, f.s, f.task, f.d, f.b, nil, api.ErrConflict)
+	})
+	t.Run("batch lead", func(t *testing.T) {
+		bf := newBatchFixture(t, 1)
+		bf.declare(t)
+		lead := bf.load(t, bf.lead.ID)
+		row := releaseRow(t, bf.s, bf.task, lead.ID)
+		_, err := bf.s.ReleaseAction(ctx, bf.task.ID, api.ReleaseRequest{RequestID: "unclaim", Operation: "unclaim", AgentID: bf.d.ID, RunID: bf.d.RunID, JobID: lead.ID, ExpectedGeneration: lead.Generation})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "leads release batch") {
+			t.Fatal("batch lead unclaimed", err)
+		}
+		if got := releaseRow(t, bf.s, bf.task, lead.ID); got != row {
+			t.Fatalf("refused unclaim changed the lead:\n%s\n%s", row, got)
+		}
+		if b := bf.batch(t, lead.ID); b.State != "open" {
+			t.Fatal("batch state", b.State)
+		}
+	})
+	t.Run("another deployer run", func(t *testing.T) {
+		f := setup(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), f.d.ID); err != nil {
+			t.Fatal(err)
+		}
+		other := f.d
+		if err := f.s.db.QueryRow(`SELECT run_id FROM agents WHERE id=?`, f.d.ID).Scan(&other.RunID); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f.s, f.task, other, f.a, nil, api.ErrConflict)
+	})
+	t.Run("exited run", func(t *testing.T) {
+		f := setup(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, f.d.ID); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f.s, f.task, f.d, f.a, nil, api.ErrConflict)
+	})
+	t.Run("stale pause generation", func(t *testing.T) {
+		f := setup(t)
+		if _, err := f.s.db.Exec(`UPDATE tasks SET pause_generation=pause_generation+1 WHERE id=?`, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f.s, f.task, f.d, f.a, nil, api.ErrConflict)
+	})
+	for name, c := range map[string]struct {
+		change func(fixture, *api.ReleaseRequest)
+		want   error
+	}{
+		"handler caller":   {func(f fixture, r *api.ReleaseRequest) { r.AgentID, r.RunID = f.h.ID, f.h.RunID }, api.ErrConflict},
+		"wrong generation": {func(_ fixture, r *api.ReleaseRequest) { r.ExpectedGeneration++ }, api.ErrConflict},
+		"with reconciliation": {func(_ fixture, r *api.ReleaseRequest) {
+			r.Reconciliation = &api.ReleaseReconciliation{JobID: r.JobID, Disposition: "unclaimed"}
+		}, api.ErrInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t)
+			refused(t, f.s, f.task, f.d, f.a, func(r *api.ReleaseRequest) { c.change(f, r) }, c.want)
 		})
 	}
 }

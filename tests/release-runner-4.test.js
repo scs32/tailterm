@@ -373,3 +373,108 @@ test("a sparse backup over 2 GiB hashes through the input producer and the rehea
  assert.deepEqual(readdirSync(home).filter(n=>n.includes(".rehearsal-")),[]);
  assert.deepEqual(out.targets,["hub","bridge","mini"]);
 });
+
+// Clean-stop unclaim (wi_27745813129a396b, order #38456). A runner stopped
+// with SIGTERM or SIGINT gives back its own claimed job when it has no
+// effects; anything else stays held for handler reconciliation.
+import {setAsideJournal,unclaimableJob} from "../scripts/release-runner.mjs";
+// The fake hub's unclaim, as the hub answers it: verified, no run, one more
+// unclaimed record, saved in place. refuse makes it a refusal instead.
+const unclaimHook=(refuse=false)=>`if(a[1]==='unclaim'){${refuse?"process.stderr.write('tt: conflict: only a claimed job with no effects can be unclaimed\\n');process.exit(1);":""}
+const path=require('path').join(require('path').dirname(process.argv[1]),'jobs.json'),{agentId,runId,integratedCommit,...rest}=job;
+const next={...rest,state:'verified',generation:+flag('--generation')+1,reconciliations:[...(job.reconciliations||[]),{disposition:'unclaimed',jobId:job.id,agentId,runId,journalState:'no_effects',noPublication:true}]};
+jobs.splice(jobs.indexOf(job),1,next);fs.writeFileSync(path,JSON.stringify(jobs));console.log(JSON.stringify(next));process.exit(0);}`;
+const waitingJournal=(h,job,over={})=>heldJournal(h,job,{phase:"waiting_inputs",refusalReason:undefined,refuseFailure:undefined,integrated:"d".repeat(40),...over});
+const stopAttempt=(h,run)=>{const dir=join(h.home,"rel_held-integrated-verification","d".repeat(40)+"-r0");mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),run);};
+const unclaims=h=>h.calls().filter(c=>c.argv[1]==="unclaim").map(c=>c.argv);
+const ledger=h=>JSON.parse(readFileSync(join(h.home,"jobs.json"),"utf8"));
+// One poll whose stop signal is already set: the loop is skipped and only the stop runs.
+const stopped=h=>{const stop=new AbortController();stop.abort();return h.poll(undefined,async()=>assert.fail("a stopping runner releases nothing"),{once:true,signal:stop.signal});};
+const HELD_LINE="Stopped while holding release rel_held; handler reconciliation required.\n";
+test("stop1 a clean stop in waiting_inputs with no effects returns the job to verified, archives its journal and the next poll claims it",async t=>{
+ for(const [phase,arrange] of [["waiting_inputs",()=>{}],["waiting_matrix",h=>stopAttempt(h,JSON.stringify({state:"ended"}))]]){
+  const r=codeRepo(t),h=codeHost(t,r.cwd,unclaimHook()),own=heldOwn();waitingJournal(h,own,{phase});arrange(h);h.setJobs([own,verifiedJob("rel_next")]);
+  const before=readFileSync(join(h.home,"rel_held.json"),"utf8");
+  assert.equal(await stopped(h),"Release rel_held returned to verified at stop; journal archived.\n",phase);
+  assert.deepEqual(unclaims(h),[["deployment","unclaim","--job","rel_held","--generation","2","--request-id","rel_held-unclaim-2"]],phase);
+  assert.equal(existsSync(join(h.home,"rel_held.json")),false,phase);assert.equal(readFileSync(join(h.home,"rel_held.json.unclaimed-g3"),"utf8"),before,phase);
+  const [freed,next]=ledger(h);
+  assert.deepEqual([freed.id,freed.state,freed.generation,freed.agentId,freed.runId,next.id],["rel_held","verified",3,undefined,undefined,"rel_next"],phase);
+  assert.deepEqual(freed.reconciliations.map(x=>[x.disposition,x.agentId,x.runId]),[["unclaimed",CODE_AGENT,CODE_RUN]],phase);
+  assert.equal(h.claims().length,0,phase);assert.deepEqual(h.sends(),[],phase);
+  // The next run claims it first, as a fresh attempt: one more record than before.
+  const released=[];await h.poll(undefined,async c=>{released.push([c.job.id,c.job.state,c.job.reconciliations.length,existsSync(c.journalPath)]);});
+  assert.deepEqual(h.claims().map(c=>c.argv.slice(1,7)),[["claim","--job","rel_held","--generation","3","--request-id"]],phase);
+  assert.deepEqual(released,[["rel_held","claimed",1,false]],phase);
+ }
+});
+test("stop2 a stop after any effect, or on any doubt, keeps the claim and journal for handler reconciliation",async t=>{
+ const lockOf=cwd=>join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0fixture")+".lock");
+ const other={id:"rel_other",generation:3,commit:"d".repeat(40)};
+ // [name, arrange(h,r,own) returning the job list or an undo, the stderr, the unclaim calls]
+ const cases=[
+  ["the journal has an effect",(h,r,own)=>{waitingJournal(h,own,{effects:[{target:"hub"}]});}],
+  ["the journal has no effects list",(h,r,own)=>{waitingJournal(h,own,{effects:undefined});}],
+  ["the journal is published",(h,r,own)=>{waitingJournal(h,own,{published:true});}],
+  ["the journal's published flag is not a boolean",(h,r,own)=>{waitingJournal(h,own,{published:"no"});}],
+  ["the merged call was sent",(h,r,own)=>{waitingJournal(h,own,{mergedSent:true});}],
+  ["the journal is of a batch",(h,r,own)=>{waitingJournal(h,own,{batch:{jobs:[]}});}],
+  ...["prepared","integrated","batching","refusing","pushing","receipt_pending","finishing","complete","blocked",undefined].map(phase=>[`the journal phase is ${phase}`,(h,r,own)=>{waitingJournal(h,own,{phase});}]),
+  ["the journal is missing",h=>{rmSync(join(h.home,"rel_held.json"));}],
+  ["the journal is unreadable",h=>{writeFileSync(join(h.home,"rel_held.json"),"{not json");}],
+  ["the journal is of another job",(h,r,own)=>{waitingJournal(h,own,{jobId:"rel_other"});}],
+  ["the journal is of another commit",(h,r,own)=>{waitingJournal(h,own,{commit:"d".repeat(40)});}],
+  ["the journal is of another agent",(h,r,own)=>{waitingJournal(h,own,{agentId:"agt_other"});}],
+  ["the journal is of another run",(h,r,own)=>{waitingJournal(h,own,{runId:"run_other"});}],
+  ["the journal is of another task",(h,r,own)=>{waitingJournal(h,own,{taskId:"tsk_other"});}],
+  ["the journal is of another pause generation",(h,r,own)=>{waitingJournal(h,own,{pauseGeneration:4});}],
+  ["the hub shows the job published",()=>[heldOwn({published:true})]],
+  ["the hub shows a receipt",()=>[heldOwn({receipt:{commit:"c".repeat(40),outcome:"blocked",targets:[]}})]],
+  ["the hub shows bound release inputs",()=>[heldOwn({inputsCommit:"c".repeat(40),inputsDigest:"f".repeat(64)})]],
+  ["the job is merged",()=>[heldOwn({state:"merged",published:true,integratedCommit:"c".repeat(40)})]],
+  ["the job is blocked",()=>[heldOwn({state:"blocked"})]],
+  ["another job is claimed",(h,r,own)=>[own,{...other,state:"claimed",agentId:"agt_other",runId:"run_other"}]],
+  ["a matrix run of the job is started",h=>{stopAttempt(h,JSON.stringify({state:"started"}));}],
+  ["a matrix run of the job is starting",h=>{stopAttempt(h,JSON.stringify({state:"starting"}));}],
+  ["a matrix run record of the job is unreadable",h=>{stopAttempt(h,"{not json");}],
+  ["this process has a live matrix child",()=>{const children=new HostAdapter({},{}).matrixChildren,key="stop2-fixture";children.set(key,{});return ()=>children.delete(key);}],
+  ["a host release lock exists",(h,r)=>{const lock=lockOf(r.cwd);mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,JSON.stringify({jobId:"rel_held",agentId:CODE_AGENT,runId:CODE_RUN}));return ()=>rmSync(lock,{force:true});}],
+  ["the hub refuses the unclaim",()=>{},HELD_LINE,1,true],
+  ["the job is claimed by another run",()=>[heldOwn({runId:"run_other"})],""],
+ ];
+ for(const [name,arrange,err=HELD_LINE,calls=0,refuse=false] of cases){
+  const r=codeRepo(t),h=codeHost(t,r.cwd,unclaimHook(refuse)),own=heldOwn();waitingJournal(h,own);
+  const arranged=arrange(h,r,own),undo=typeof arranged==="function"?arranged:()=>{};t.after(undo);h.setJobs(Array.isArray(arranged)?arranged:[own]);
+  const journal=existsSync(join(h.home,"rel_held.json"))?readFileSync(join(h.home,"rel_held.json"),"utf8"):null,jobs=ledger(h);
+  let said;try{said=await stopped(h);}finally{undo();}
+  assert.equal(said,err,name);assert.equal(unclaims(h).length,calls,name);assert.deepEqual(ledger(h),jobs,name);
+  assert.equal(existsSync(join(h.home,"rel_held.json"))?readFileSync(join(h.home,"rel_held.json"),"utf8"):null,journal,name);
+  assert.deepEqual(readdirSync(h.home).filter(n=>n.includes(".unclaimed-")),[],name);assert.equal(h.claims().length,0,name);
+ }
+ // A ledger that cannot be read says so, and nothing is unclaimed.
+ const r=codeRepo(t),h=codeHost(t,r.cwd,"if(a[1]==='list')process.exit(3);"),own=heldOwn();waitingJournal(h,own);h.setJobs([own]);
+ assert.equal(await stopped(h),"Stopped without reading the release ledger; any claim of this run waits for handler reconciliation.\n");assert.equal(unclaims(h).length,0);
+ // The predicate alone: null on any doubt about its inputs.
+ const base={jobs:[own],details:new Map([[own.id,own]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock:lockOf(r.cwd),matrixChildren:0};
+ assert.equal(unclaimableJob(base),"rel_held");
+ for(const over of [{jobs:[]},{details:new Map()},{agent:undefined},{run:""},{matrixChildren:1},{matrixChildren:undefined},{journalDirectory:join(h.home,"absent")},{details:new Map([[own.id,{...own,commit:"short"}]])},{details:new Map([[own.id,{...own,batch:{id:"rbt_x"}}]])},{details:null}])assert.equal(unclaimableJob({...base,...over}),null,JSON.stringify(Object.keys(over)));
+});
+test("stop3 setAsideJournal archives an unclaimed job's exact no-effect journal and holds any other",t=>{
+ const home=mkdtempSync(join(tmpdir(),"release-unclaimed-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const path=join(home,"rel_held.json"),record=(disposition,over={})=>({id:"rel_held",state:"verified",generation:3,commit:"c".repeat(40),reconciliations:[{disposition,jobId:"rel_held",agentId:CODE_AGENT,runId:CODE_RUN}],...over});
+ const write=(over={})=>{writeFileSync(path,JSON.stringify({version:1,jobId:"rel_held",commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN,phase:"waiting_inputs",effects:[],...over}));return readFileSync(path,"utf8");};
+ let bytes=write();assert.equal(setAsideJournal(path,record("unclaimed")),"archived");assert.equal(existsSync(path),false);assert.equal(readFileSync(path+".unclaimed-g3","utf8"),bytes);
+ bytes=write();assert.equal(setAsideJournal(path,record("set_aside",{generation:4})),"archived");assert.equal(readFileSync(path+".set-aside-g4","utf8"),bytes);
+ for(const [name,over,job] of [["an effect",{effects:[{target:"hub"}]}],["published",{published:true}],["another run",{runId:"run_other"}],["another agent",{agentId:"agt_other"}],["another commit",{commit:"d".repeat(40)}],["another job",{jobId:"rel_other"}]]){
+  bytes=write(over);assert.equal(setAsideJournal(path,job||record("unclaimed",{generation:5})),"held",name);assert.equal(readFileSync(path,"utf8"),bytes,name);assert.equal(existsSync(path+".unclaimed-g5"),false,name);
+ }
+ bytes=write();
+ for(const job of [record("requeue"),record("unclaimed",{state:"claimed"}),{...record("unclaimed"),reconciliations:[]}])assert.equal(setAsideJournal(path,job),"none");
+ assert.equal(readFileSync(path,"utf8"),bytes);
+});
+test("stop4 a stop signal during the 30 s wait ends the daemon without waiting it out",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),stop=new AbortController();h.setJobs([]);
+ const began=Date.now(),timer=setTimeout(()=>stop.abort(),300);t.after(()=>clearTimeout(timer));
+ assert.equal(await h.poll(undefined,undefined,{signal:stop.signal}),"");
+ assert.ok(Date.now()-began<10000,`ended after ${Date.now()-began} ms`);assert.ok(h.calls().every(c=>c.argv[1]==="list"));
+});

@@ -112,6 +112,25 @@ func TestDeployerGuardRefusesRetireAndCloseWhileHoldingJob(t *testing.T) {
 	}
 }
 
+// The refusal names the clean stop that unclaims a no-effect job and, for a
+// run already dead, the exit record and the handler's reconcile.
+func TestDeployerGuardRefusalNamesCleanStopAndExit(t *testing.T) {
+	for _, state := range []string{"claimed", "merged"} {
+		f := newGuardFixture(t, state)
+		for name, move := range f.moves() {
+			err := move()
+			if !errors.Is(err, api.ErrConflict) {
+				t.Fatalf("%s %s: %v", state, name, err)
+			}
+			for _, want := range []string{"stop the deployer's runner cleanly (SIGTERM or SIGINT)", "returns the job to verified", "unclaim", "record its exit", "reconcile the job"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s %s: refusal lacks %q: %v", state, name, want, err)
+				}
+			}
+		}
+	}
+}
+
 // With no claimed or merged job of its own the deployer retires and closes as
 // before: a verified job, terminal jobs, and a fence held by another agent.
 func TestDeployerGuardAllowsRetireAndCloseWithoutHeldJob(t *testing.T) {

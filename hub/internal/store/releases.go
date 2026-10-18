@@ -570,7 +570,7 @@ func releaseEffects(j api.ReleaseJob) (kind, detail string) {
 
 // releaseSupersedable names why a covering hand release cannot supersede j,
 // or returns "". Supersedable: a verified job no deployer holds, whose only
-// history is being set aside; and a refused or rolled-back job with no
+// history is being set aside or unclaimed; and a refused or rolled-back job with no
 // effects left live, whose receipt and reconciliations stay in its record. A
 // held job still needs reconcile, and a requeued job carries host history.
 func releaseSupersedable(j api.ReleaseJob) string {
@@ -586,7 +586,7 @@ func releaseSupersedable(j api.ReleaseJob) string {
 			detail = "published"
 		}
 		for _, r := range j.Reconciliations {
-			if detail == "" && r.Disposition != "set_aside" {
+			if detail == "" && r.Disposition != "set_aside" && r.Disposition != "unclaimed" {
 				detail = r.Disposition + " reconciliation"
 			}
 		}
@@ -1090,6 +1090,25 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if batch != nil {
 					batchState = "dissolved"
 				}
+			case "unclaim":
+				// The exact run gives back its own claim as it stops cleanly
+				// with nothing done: the one exact-run, no-effect path that
+				// needs no incident or prevention item. Anything with an
+				// effect, or a batch lead, keeps the fence for reconcile.
+				if req.Reconciliation != nil {
+					return zero, api.ErrInvalid
+				}
+				if j.State != "claimed" || j.Published || j.Receipt != nil || j.InputsDigest != "" {
+					return zero, releaseConflict("only a claimed job with no effects can be unclaimed")
+				}
+				if batch != nil {
+					return zero, releaseConflict("job " + j.ID + " leads release batch " + batch.ID + "; it keeps the fence for handler reconciliation")
+				}
+				now := ts(s.now())
+				r := api.ReleaseReconciliation{JobID: j.ID, AgentID: j.AgentID, RunID: j.RunID, PauseGeneration: j.PauseGeneration, Disposition: "unclaimed", JournalState: "no_effects", NoPublication: true, ObservedAt: now, StoppedAt: now, StopReason: "the exact deployer run stopped cleanly while its claim had no effects"}
+				// It keeps its place in the queue and is claimed first again.
+				clearReleaseClaim(&j, generation)
+				j.Reconciliations = append(j.Reconciliations, r)
 			case "block":
 				if j.State != "claimed" && j.State != "merged" {
 					return zero, releaseConflict("owned execution required")
@@ -1451,6 +1470,14 @@ func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Releas
 	if err := releaseIncident(ctx, tx, task, r); err != nil {
 		return err
 	}
+	clearReleaseClaim(j, generation)
+	j.Reconciliations = append(j.Reconciliations, *r)
+	return nil
+}
+
+// clearReleaseClaim returns a claimed job with no effects to verified, with
+// no run and no integrated or input binding, at the project generation.
+func clearReleaseClaim(j *api.ReleaseJob, generation int64) {
 	j.State = "verified"
 	j.AgentID = ""
 	j.RunID = ""
@@ -1462,8 +1489,6 @@ func setAsideRelease(ctx context.Context, tx *sql.Tx, task string, j *api.Releas
 	j.InputsCommit = ""
 	j.InputsDigest = ""
 	j.PauseGeneration = generation
-	j.Reconciliations = append(j.Reconciliations, *r)
-	return nil
 }
 
 // holdRelease puts an owner hold on a verified job no deployer holds: the job

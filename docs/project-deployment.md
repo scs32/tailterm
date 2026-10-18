@@ -114,6 +114,14 @@ A claimed run must be exited/closed or have completed exact-run rotation; host
 inspection must additionally prove no active execution, known journal state and
 resolved release ref. Unknown outcomes or live predecessor processes refuse.
 
+One stop needs none of this: a clean stop (SIGTERM or SIGINT to the runner)
+while the run's own claim has no effects. The runner then gives the claim back
+with `tt deployment unclaim`, an exact-run record the hub builds itself
+(disposition `unclaimed`, no incident or prevention item), and exits; the job is
+`verified` again in its queue place ("Pause", in the operator runbook below).
+An unclean exit (a crash, SIGKILL or host loss), a stop after any effect, and
+every other held claim still need the typed reconcile above.
+
 An inspected unpublished no-effect job may requeue against the unchanged eligible
 candidate and current pause generation. A held job may instead be refused
 terminally after effects/ref are resolved, releasing the project fence without
@@ -1314,7 +1322,10 @@ release, above).
 
 A claimed job that cannot progress (for example its integrated import was
 refused and the fix is the next queued job) would hold the project fence
-forever, because the runner resumes its own claim first. `tt deployment
+forever, because the runner resumes its own claim first. If the deployer is to
+stop anyway, a clean stop of its runner frees such a claim by itself and keeps
+the job's queue place ("Pause", below); set-aside is for a runner that keeps
+running. `tt deployment
 set-aside --job ID --generation N --file RECORD --request-id KEY` is
 handler-only and moves it aside:
 
@@ -1355,7 +1366,9 @@ runs a fresh integrated matrix. It may wait behind every job queued before the
 move. Before that claim the runner archives its old journal as
 `ID.json.set-aside-gN` (N is the set-aside job's generation) when the journal
 belongs to exactly that claim and shows no effects and no publication; any other
-journal is held and the job skipped for handler reconciliation.
+journal is held and the job skipped for handler reconciliation. The same check
+archives the journal of an unclaimed job as `ID.json.unclaimed-gN` when the
+stopping runner could not rename it itself.
 
 When a job holds the fence and a later job is `verified`, the deployer posts one
 notice per holder, waiting job and reason: it names the holding job, why it holds
@@ -2136,9 +2149,40 @@ its next fence fails, the fenced rollback cannot run, and the job is left blocke
 with a pending receipt for reconciliation. `tt project-pause pause` closes the
 deployer with the rest of the project; resuming then needs provisioning again.
 
+A deployer that holds a `claimed` job with no effects (waiting for its inputs
+binding or for an integrated matrix import; not published, no receipt, no inputs
+bound) is stopped cleanly instead: send SIGTERM to the runner's `pid` in
+`journalDirectory/runner-code.json`. SIGTERM to the `tt deployment serve`
+parent alone does not reach the runner, which it starts as a child without
+forwarding signals. The runner treats SIGINT the same way, but Ctrl-C in its
+pane also signals the pane's wrapper and that parent; if the hub has recorded
+the run's exit before the unclaim arrives, the unclaim is refused and the job
+stays held, so prefer SIGTERM to the runner's pid. The runner ends its
+wait at once, gives the claim back with `tt deployment unclaim` (an exact-run
+record, disposition `unclaimed`, with no incident or prevention item), archives
+the claim's journal as `ID.json.unclaimed-gN` and exits with the line "Release
+ID returned to verified at stop; journal archived." The job is `verified` again
+in its queue place and is claimed first by the next run: close the deployer, or
+provision a new run with `tt deployment setup`. The runner unclaims only when
+the ledger's one active job is that claim of its own exact run, its journal is
+of exactly that claim in `waiting_inputs` or `waiting_matrix` with no effects,
+never published, sent as merged or part of a batch, no integrated matrix run is
+unsettled, the process has no matrix child and no host release lock exists, and
+the hub accepts the unclaim. Otherwise it prints "Stopped while holding release
+ID; handler reconciliation required." and the job stays held: a merged, blocked,
+published, inputs-bound or batch job, a stop in any other phase, an unclean exit
+(crash, SIGKILL, host loss) and a refused or unreachable unclaim all need
+`reconcile` (below). Retiring or closing a deployer that holds a `claimed` or
+`merged` job is refused, and the refusal names this stop; a run that is already
+dead has its exit recorded (the hub never refuses an exit) and the job
+reconciled. A self-restart onto new code keeps the same agent and run and
+resumes its claim, as before.
+
 **Reconcile.** A `blocked` job, an ambiguous journal or a stale host lock needs
-`tt deployment reconcile` with a typed inspection (above). The journal's
-`failure` field says which step failed and why. Never delete the
+`tt deployment reconcile` with a typed inspection (above). A claimed no-effect
+job of a deployer that is to stop needs none: stop its runner cleanly
+("Pause"). The journal's `failure` field says which step failed and why. Never
+delete the
 journal or lock by hand. The inspection's "no active execution" covers the
 integrated matrix run as well: read `run.json` in each attempt directory of the
 job and confirm the pid it names is gone (above, "Requeue").

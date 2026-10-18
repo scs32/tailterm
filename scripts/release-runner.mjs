@@ -1103,17 +1103,19 @@ export function validateNativeRelease(prior, next, operation, expectedGeneration
   const immutable = ["id", "taskId", "entryId", "itemId", "itemRevision", "scopeRevision", "orderMessageSeq", "repository", "baseCommit", "commit", "verificationDigest", "pauseGeneration"];
   const samePin = k => next?.[k] === prior[k];
   const flag = n => extra[extra.indexOf(n)+1];
-  const expectedState = {claim:"claimed", check:prior.state, merged:"merged", finish:receipt?.outcome, block:"blocked", refuse:"refused", "batch-open":"claimed", "batch-add":"claimed", "batch-drop":"claimed"}[operation];
+  const expectedState = {claim:"claimed", check:prior.state, merged:"merged", finish:receipt?.outcome, block:"blocked", refuse:"refused", "batch-open":"claimed", "batch-add":"claimed", "batch-drop":"claimed", unclaim:"verified"}[operation];
   const advance = operation === "check" ? 0 : 1;
-  const allowed = {claim:["verified"],check:["claimed","merged"],merged:["claimed"],finish:["merged"],block:["claimed","merged"],refuse:["claimed"],"batch-open":["claimed"],"batch-add":["claimed"],"batch-drop":["claimed"]};
+  const allowed = {claim:["verified"],check:["claimed","merged"],merged:["claimed"],finish:["merged"],block:["claimed","merged"],refuse:["claimed"],"batch-open":["claimed"],"batch-add":["claimed"],"batch-drop":["claimed"],unclaim:["claimed"]};
   if (!allowed[operation]?.includes(prior.state)) throw releaseError("Invalid native release transition");
   if (!next || Array.isArray(next) || next.summary === true || !immutable.every(samePin) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || next.generation !== expectedGeneration + advance || !expectedState || next.state !== expectedState) throw releaseError("Invalid native release response");
-  const agent = operation === "claim" ? process.env.TAILTERM_AGENT : prior.agentId, run = operation === "claim" ? process.env.TAILTERM_RUN : prior.runId;
+  // An unclaim gives the claim back: the job names no run afterwards.
+  const agent = operation === "claim" ? process.env.TAILTERM_AGENT : operation === "unclaim" ? undefined : prior.agentId, run = operation === "claim" ? process.env.TAILTERM_RUN : operation === "unclaim" ? undefined : prior.runId;
   if (next.agentId !== agent || next.runId !== run) throw releaseError("Native release run binding mismatch");
   for (const k of ["inputsCommit", "inputsDigest"]) if (!samePin(k)) throw releaseError("Native release input binding mismatch");
   // A batch-add's --commit is the job's range end, never the lead's integrated
-  // commit; batch-drop is the one place a cleared integrated commit is expected.
-  const integrated = operation === "merged" ? flag("--commit") : operation === "batch-drop" ? undefined : prior.integratedCommit;
+  // commit; batch-drop and unclaim are the places a cleared integrated commit
+  // is expected.
+  const integrated = operation === "merged" ? flag("--commit") : ["batch-drop", "unclaim"].includes(operation) ? undefined : prior.integratedCommit;
   if (next.integratedCommit !== integrated || (operation === "merged" && !sha(integrated))) throw releaseError("Native integrated commit mismatch");
   if (operation === "finish") {
     if (!receipt || receipt.version !== 1 || receipt.jobId !== prior.id || receipt.commit !== prior.integratedCommit || receipt.verificationDigest !== prior.verificationDigest || !Array.isArray(receipt.targets) || !next.receipt || !sameReceipt(receipt, next.receipt)) throw releaseError("Native full receipt mismatch");
@@ -1826,6 +1828,31 @@ export function heldRestartJob({jobs,details,agent,run,journalDirectory,lock,mat
     return job.id;
   }catch{return null;}
 }
+// Journal phases a clean stop may unclaim: the claim waits for the handler's
+// own step (the inputs binding or the integrated matrix import) and has done
+// nothing to the checkout's remote, targets or hub record.
+const UNCLAIM_PHASES=["waiting_inputs","waiting_matrix"];
+// The one job a cleanly stopping runner may give back with tt deployment
+// unclaim (wi_27745813129a396b), or null. As heldRestartJob, the ledger's only
+// claimed, merged or blocked job is claimed by this agent and run with no
+// publication, receipt or inputs binding, and no matrix run, matrix child or
+// host release lock is live; its journal is of exactly this claim, waits for
+// inputs or a matrix import with no effects, and was never published, sent as
+// merged or part of a batch. Null on any doubt.
+export function unclaimableJob({jobs,details,agent,run,journalDirectory,lock,matrixChildren}){
+  try{
+    const active=jobs.filter(j=>["claimed","merged","blocked"].includes(j.state));
+    if(active.length!==1 || !agent || !run)return null;
+    const job=details.get(active[0].id);
+    if(!job || job.id!==active[0].id || active[0].state!=="claimed" || job.state!=="claimed" || job.agentId!==agent || job.runId!==run || !sha(job.commit))return null;
+    if(job.published===true || job.receipt || job.inputsDigest || job.batch)return null;
+    if(matrixChildren!==0 || existsSync(lock) || matrixRunUnsettled(journalDirectory,job))return null;
+    const prior=JSON.parse(readFileSync(join(journalDirectory,job.id+".json"),"utf8"));
+    if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==agent || prior.runId!==run || (prior.taskId!==undefined && prior.taskId!==job.taskId) || (prior.pauseGeneration!==undefined && prior.pauseGeneration!==job.pauseGeneration))return null;
+    if(!UNCLAIM_PHASES.includes(prior.phase) || !Array.isArray(prior.effects) || prior.effects.length || prior.published!==undefined && prior.published!==false || prior.mergedSent===true || prior.batch!==undefined)return null;
+    return job.id;
+  }catch{return null;}
+}
 // Brings the idle checkout to the published commit before a re-exec, under
 // integrateCandidate's cleanliness rule (ignored build outputs do not count),
 // and proves the watched files on disk are the published bytes.
@@ -1896,17 +1923,19 @@ export function runnableJob(jobs,agent,run,skipped=new Set()){
   if(jobs.some(j=>["claimed","merged","blocked"].includes(j.state)))return null;
   return jobs.find(j=>j.state==="verified" && !skipped.has(j.id))||null;
 }
-// A job the handler set aside (tt deployment set-aside) left the fence with
-// its claim's journal still on the host. Before the job is claimed again, a
-// journal of exactly that claim with no effects is archived so the re-planned
-// run starts fresh on the current tasks-hub; any other journal is held for
-// handler reconciliation. "none" leaves the journal to runRelease.
+// A job the handler set aside (tt deployment set-aside), or one a stopping
+// runner unclaimed but could not archive, left the fence with its claim's
+// journal still on the host. Before the job is claimed again, a journal of
+// exactly that claim with no effects is archived (ID.json.set-aside-gN or
+// ID.json.unclaimed-gN) so the re-planned run starts fresh on the current
+// tasks-hub; any other journal is held for handler reconciliation. "none"
+// leaves the journal to runRelease.
 export function setAsideJournal(journalPath,job){
   const r=job?.reconciliations?.at(-1);
-  if(job?.state!=="verified" || r?.disposition!=="set_aside" || !existsSync(journalPath))return "none";
+  if(job?.state!=="verified" || !["set_aside","unclaimed"].includes(r?.disposition) || !existsSync(journalPath))return "none";
   let prior;try{prior=JSON.parse(readFileSync(journalPath,"utf8"));}catch{return "held";}
   if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==r.agentId || prior.runId!==r.runId || !Array.isArray(prior.effects) || prior.effects.length || prior.published===true)return "held";
-  renameSync(journalPath,`${journalPath}.set-aside-g${job.generation}`);return "archived";
+  renameSync(journalPath,`${journalPath}.${r.disposition==="unclaimed"?"unclaimed":"set-aside"}-g${job.generation}`);return "archived";
 }
 const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integrated verification",waiting_inputs:"is waiting for the handler to bind release inputs",blocked:"is blocked",merged:"is merged and not yet finished",claimed:"is claimed by another deployer run"};
 // The notice for a job that holds the project fence while a later job waits:
@@ -2402,9 +2431,38 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     } catch(error) {process.stderr.write(`Deployment poll held (${failureReason(error)}); inspect native input or recovery evidence.\n`);if(reader)cliNotify(reader,reader.cliFailures);}
     if(reader)try{transportTurn(reader,[...reader.cliFailures,...ran.flatMap(a=>a.cliFailures)].filter(f=>f.transport===true));}catch{process.stderr.write("Transport wait not recorded; the next poll retries.\n");}
     reporter?.progress({phase:"poll",...ended});
-    if(once)return;
-    await new Promise(r=>setTimeout(r,30000));
+    if(once)break;
+    // A stop signal ends the wait, so the stop below runs well inside the
+    // hub's 90 s deployer heartbeat bound.
+    await new Promise(r=>{if(signal?.aborted)return r();const done=()=>{clearTimeout(timer);signal?.removeEventListener("abort",done);r();},timer=setTimeout(done,30000);signal?.addEventListener("abort",done,{once:true});});
   }
+  if(signal?.aborted)stopRelease(config);
+}
+// A clean stop (SIGTERM or SIGINT) of a run that holds a claimed job with no
+// effects gives the claim back with tt deployment unclaim, an exact-run record
+// that needs no incident or prevention item, and archives the claim's journal
+// as ID.json.unclaimed-gN; the job is verified again in its queue place. Any
+// other claim of this run, or any failure here, is left as it is for handler
+// reconciliation (docs/project-deployment.md, "Pause").
+function stopRelease(config){
+  const agent=process.env.TAILTERM_AGENT,run=process.env.TAILTERM_RUN,safe=id=>/^rel_[A-Za-z0-9_-]{1,64}$/.test(id||"")?id:"unknown";
+  let owned=null;
+  try{
+    const reader=new HostAdapter(config,{}),read=argv=>reader.command([config.tt||"tt",...argv]);
+    const jobs=readReleaseSummaries(read);
+    owned=jobs.find(j=>["claimed","merged","blocked"].includes(j.state) && j.agentId===agent && j.runId===run)||null;
+    if(!owned)return;
+    const details=new Map([[owned.id,readReleaseDetail(read,owned)]]),job=details.get(owned.id);
+    const id=unclaimableJob({jobs,details,agent,run,journalDirectory:config.journalDirectory,lock:hostLockPath(config.cwd,job),matrixChildren:MATRIX_CHILDREN.size});
+    if(id){
+      const next=new HostAdapter(config,job).native("unclaim"),path=join(config.journalDirectory,id+".json");
+      // setAsideJournal archives it before the next claim if this rename fails.
+      let archived="journal archived";try{renameSync(path,`${path}.unclaimed-g${next.generation}`);}catch{archived="its journal is archived before the next claim";}
+      process.stderr.write(`Release ${safe(id)} returned to verified at stop; ${archived}.\n`);return;
+    }
+  }catch{}
+  if(owned)process.stderr.write(`Stopped while holding release ${safe(owned.id)}; handler reconciliation required.\n`);
+  else process.stderr.write("Stopped without reading the release ledger; any claim of this run waits for handler reconciliation.\n");
 }
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv[2]==="--compat-cli"){
   try {
