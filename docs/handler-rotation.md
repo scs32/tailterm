@@ -293,11 +293,13 @@ is met. The steps run in order and the first that decides wins:
 
 So gone confirms two facts read on the handler's own host: its named session
 is absent from a readable listing, and its runtime process is absent by PID
-and start identity. The receipt the handler's wrapper saves records no pane
-process, so step 5 does not run for it and the pane is not a third fact: with
-the session absent, the pane that lived in it is not checked separately. Step
-5 applies only to a receipt that does record a pane process. The probe signals
-and stops nothing. Only gone produces
+and start identity. The wrapper records its session's pane process in the
+receipt when it starts the runtime: the PID of the session's single pane and
+that process's start identity, read once after the session identity. So for a
+handler started by this release the pane is a third fact. A receipt with no
+pane process skips step 5: one saved by a wrapper from before this release,
+or one whose pane read failed, found no pane or more than one. The probe
+signals and stops nothing. Only gone produces
 evidence; alive and unknown send the hub nothing. An unreachable host sends
 nothing at all, because only that host's runner probes.
 
@@ -438,16 +440,28 @@ above run first, then:
    records: **unknown**.
 6. The session's panes cannot be read, or it has no pane or more than one:
    **unknown**.
-7. The process table (`ps`, process ID and parent ID only) cannot be read, has
-   a row that does not parse, or lacks the pane's process: **unknown**.
-8. The pane's process must have exactly one child, and that child none. A
+7. The receipt records no pane process, no pane start identity or no login
+   shell, or the session's one pane is not the recorded pane process:
+   **unknown**.
+8. The process table (`ps`: process ID, parent ID, start time and executable)
+   cannot be read, has a row that does not parse, lacks the pane's process, or
+   gives it another start time than the receipt records: **unknown**.
+9. The pane's process must have exactly one child, and that child none. A
    process below that child is **alive**
-   (`process N runs under the pane's shell`). Any other shape is **unknown**.
-9. Otherwise **gone**, with `sessionState: idle_shell` and `paneRootPid`.
+   (`process N runs under the pane's shell`). A child running another
+   executable than the login shell the receipt records is **alive**
+   (`process N in the pane is not the wrapper's login shell`). A child that
+   started before the recorded exit, to the second, or whose start cannot be
+   read, and any other shape, is **unknown**.
+10. Otherwise **gone**, with `sessionState: idle_shell` and `paneRootPid`.
 
-Step 8 matches no executable name. Anything running under the leftover shell
-blocks the replacement, which covers a runtime someone started again by hand
-in that shell.
+The wrapper records the login shell it leaves in the pane: `$SHELL`, or
+`/bin/sh` when that is unset, the same choice it makes when it starts the
+shell. Step 9 compares executable names, ignoring the directory and a login
+shell's leading dash. Anything running under the leftover shell blocks the
+replacement, which covers a runtime someone started again by hand in that
+shell. So does a runtime started with `exec` in the shell: it keeps the
+shell's process ID and start time, but not its executable.
 
 **A restart cancels it.** Starting an exited handler again gives it a new run
 and a status other than `exited`. A prepare for the old run is then refused
@@ -481,7 +495,7 @@ absent, and says the tmux session `is absent` or
 
 **Not proven on a live host.** The strict pane rule is covered only by tests
 with injected process tables. A login shell that keeps a helper process
-running under it would make step 8 answer alive on every probe, and that
+running under it would make step 9 answer alive on every probe, and that
 handler would wait for the owner, as before this change. What a real exited
 handler pane on this project's host holds has not been observed yet.
 
@@ -684,19 +698,22 @@ directory are inert without the new CLI.
   no saved launch spec, lost the run's process receipt, or finds the PID in
   use by another process, the probe is unknown and the handler waits for the
   owner.
-- The probe checks the handler's session and its runtime process, not the
-  pane process (the saved receipt records none) and not every descendant. An
+- The probe checks the handler's session, its runtime process and its pane
+  process, not every descendant. A run started before the wrapper recorded the
+  pane process has none in its receipt, and its pane is not checked. An
   orphaned child that still writes counts as activity and delays or aborts the
   replacement.
 - An [exited primary](#a-primary-whose-wrapper-reported-exited) waits for the
   owner when the wrapper's exit event was pruned or posted by hand, when the
   host's receipt records no exit, or when anything runs under the pane's
   leftover shell. The strict pane rule is not yet proven on a live host.
-- The pane rule cannot tell the wrapper's login shell from a runtime that
-  replaced it. A runtime started again with `exec` in the leftover shell takes
-  the shell's place, and while it has no child process the pane looks like an
-  idle shell. The hub refuses that run's events, so after the silence such a
-  live handler could be replaced. Follow-up filed.
+- An exited primary whose run started before the wrapper recorded the pane
+  process and login shell has neither in its receipt. Its probe is unknown
+  and it waits for the owner.
+- The pane rule tells the wrapper's login shell from a runtime that replaced
+  it with `exec` by executable name only. A runtime that is itself the
+  recorded shell, such as `exec zsh` in a zsh pane, still looks like the idle
+  shell.
 - An obligation the broker closed is re-issued at commit, ten or more minutes
   later. A sender who re-sent the request in between reaches the successor
   twice. Follow-up filed.

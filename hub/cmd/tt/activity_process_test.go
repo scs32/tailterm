@@ -165,6 +165,79 @@ func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 	}
 }
 
+// p1: the wrapper's receipt records its session's single pane process, that
+// process's start identity and the login shell spawn.Wrap leaves in the pane,
+// and the exit keeps them. Any other pane answer records no pane and leaves
+// the session identity as read.
+func TestWrapperRecordsPaneProcess(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+	t.Setenv(spawn.EnvSession, "tt-handler-0123456789abcdef")
+	t.Setenv("TT_TMUX_SOCKET", "synthetic-activity-pane")
+	t.Setenv("SHELL", "/bin/synthetic-shell")
+	// ps -o lstart= -p PID prints a start identity naming the PID.
+	if err := os.WriteFile(filepath.Join(home, "ps"), []byte("#!/bin/sh\nprintf 'start-%s\\n' \"$4\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(home, "panes.log")
+	line := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
+	fake := "#!/bin/sh\ncase \" $* \" in *\" list-panes \"*)\n  printf '%s\\n' \"$*\" >> '" + log + "'\n  if [ \"$FAKE_PANES\" = fail ]; then exit 1; fi\n  for p in $FAKE_PANES; do printf '%s\\n' \"$p\"; done\n  exit 0;;\nesac\nprintf '%s\\n' '" + line + "'\n"
+	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte(fake), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	e := env{hub: "https://synthetic.invalid", task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	path := runtimeProcessPath(e.hub, e.agent, e.runID)
+	read := func() runtimeProcessReceipt {
+		t.Helper()
+		var receipt runtimeProcessReceipt
+		data, err := os.ReadFile(path)
+		if err != nil || json.Unmarshal(data, &receipt) != nil {
+			t.Fatalf("receipt unreadable: %v", err)
+		}
+		return receipt
+	}
+	record := func(panes string) runtimeProcessReceipt {
+		t.Helper()
+		t.Setenv("FAKE_PANES", panes)
+		if err := os.RemoveAll(path); err != nil {
+			t.Fatal(err)
+		}
+		recordRuntimeProcess(e, 4321)
+		return read()
+	}
+	want := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: "tt-handler-0123456789abcdef", Socket: "synthetic-activity-pane", PID: 4321, Started: "start-4321",
+		PanePID: 4200, PaneStarted: "start-4200", Shell: "/bin/synthetic-shell", SessionID: "$1", SessionCreated: "123"}
+	if got := record("4200"); got != want {
+		t.Fatalf("one pane:\n got %+v\nwant %+v", got, want)
+	}
+	if logged, err := os.ReadFile(log); err != nil || string(logged) != "-L synthetic-activity-pane list-panes -s -t $1 -F #{pane_pid}\n" {
+		t.Fatalf("pane read: %q %v", logged, err)
+	}
+	recordRuntimeExit(e)
+	exited := read()
+	if exited.ExitedAt.IsZero() {
+		t.Fatalf("exit receipt: %+v", exited)
+	}
+	exited.ExitedAt = time.Time{}
+	if exited != want {
+		t.Fatalf("the exit changed the receipt:\n got %+v\nwant %+v", exited, want)
+	}
+
+	noPane := want
+	noPane.PanePID, noPane.PaneStarted = 0, ""
+	for name, panes := range map[string]string{"two panes": "4200 4201", "no pane": "", "failing pane read": "fail", "unreadable pane": "pane"} {
+		if got := record(panes); got != noPane {
+			t.Fatalf("%s:\n got %+v\nwant %+v", name, got, noPane)
+		}
+	}
+	t.Setenv("SHELL", "")
+	want.Shell = "/bin/sh"
+	if got := record("4200"); got != want {
+		t.Fatalf("no SHELL:\n got %+v\nwant %+v", got, want)
+	}
+}
+
 // A failed read of the tmux session identity is retried once; only two failed
 // reads save a receipt without it, and that receipt says so.
 func TestWrapperRetriesSessionIdentityReadOnce(t *testing.T) {
@@ -178,7 +251,8 @@ func TestWrapperRetriesSessionIdentityReadOnce(t *testing.T) {
 	calls := filepath.Join(home, "calls")
 	line := `["$1","123","tt-handler-0123456789abcdef","https://synthetic.invalid","tsk_0123456789abcdef","agt_0123456789abcdef","run_0123456789abcdef"]`
 	// The fake tmux fails its first FAILS calls, then prints the session.
-	fake := "#!/bin/sh\nprintf x >> '" + calls + "'\nif [ \"$(wc -c < '" + calls + "')\" -le \"$FAKE_TMUX_FAILS\" ]; then echo 'synthetic tmux failure' >&2; exit 1; fi\nprintf '%s\\n' '" + line + "'\n"
+	// A pane read is not a session read: it fails and is not counted.
+	fake := "#!/bin/sh\ncase \" $* \" in *\" list-panes \"*) exit 1;; esac\nprintf x >> '" + calls + "'\nif [ \"$(wc -c < '" + calls + "')\" -le \"$FAKE_TMUX_FAILS\" ]; then echo 'synthetic tmux failure' >&2; exit 1; fi\nprintf '%s\\n' '" + line + "'\n"
 	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte(fake), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -223,6 +297,7 @@ func TestWrapperSessionReadDeadlines(t *testing.T) {
 	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
 	t.Setenv(spawn.EnvSession, "tt-handler-0123456789abcdef")
 	t.Setenv("TT_TMUX_SOCKET", "synthetic-activity-deadline")
+	t.Setenv("SHELL", "/bin/synthetic-shell")
 	if err := os.WriteFile(filepath.Join(home, "ps"), []byte("#!/bin/sh\nprintf 'synthetic-start\\n'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +305,7 @@ func TestWrapperSessionReadDeadlines(t *testing.T) {
 	// The slow fake cannot answer before half a second, however fast the host
 	// is, so a shorter deadline is always missed; the other mode fails at once.
 	// The sleep keeps no pipe open, so a killed read returns at its deadline.
-	fake := "#!/bin/sh\nif [ \"$FAKE_TMUX_MODE\" = fail ]; then exit 1; fi\nsleep 0.5 >/dev/null 2>&1\nprintf '%s\\n' '" + line + "'\n"
+	fake := "#!/bin/sh\ncase \" $* \" in *\" list-panes \"*) exit 1;; esac\nif [ \"$FAKE_TMUX_MODE\" = fail ]; then exit 1; fi\nsleep 0.5 >/dev/null 2>&1\nprintf '%s\\n' '" + line + "'\n"
 	if err := os.WriteFile(filepath.Join(home, "tmux"), []byte(fake), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +315,10 @@ func TestWrapperSessionReadDeadlines(t *testing.T) {
 	e := env{hub: "https://synthetic.invalid", task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
 	path := runtimeProcessPath(e.hub, e.agent, e.runID)
 	// What the wrapper saves with nothing to keep, but for SessionError.
-	bare := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: "tt-handler-0123456789abcdef", Socket: "synthetic-activity-deadline", PID: 4321, Started: "synthetic-start"}
+	bare := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: "tt-handler-0123456789abcdef", Socket: "synthetic-activity-deadline", PID: 4321, Started: "synthetic-start",
+		Shell: "/bin/synthetic-shell"}
 	adopted := bare
+	adopted.Shell = ""
 	adopted.PID, adopted.Started, adopted.PanePID, adopted.PaneStarted = 99, "adopted-start", 98, "adopted-pane-start"
 	adopted.SessionID, adopted.SessionCreated = "$7", "777"
 	record := func(name, mode string, first, second time.Duration, existing any) runtimeProcessReceipt {
@@ -323,6 +400,7 @@ func TestWrapperSessionReadDeadlines(t *testing.T) {
 		"no session id":      change(func(r *runtimeProcessReceipt) { r.SessionID = "" }),
 		"no session created": change(func(r *runtimeProcessReceipt) { r.SessionCreated = "" }),
 		"wrapper's own":      change(func(r *runtimeProcessReceipt) { r.PanePID, r.PaneStarted = 0, "" }),
+		"wrapper's own pane": change(func(r *runtimeProcessReceipt) { r.Shell = "/bin/synthetic-shell" }),
 		"no pane pid":        change(func(r *runtimeProcessReceipt) { r.PanePID = 0 }),
 		"no pane started":    change(func(r *runtimeProcessReceipt) { r.PaneStarted = "" }),
 	} {

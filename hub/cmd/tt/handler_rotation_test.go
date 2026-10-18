@@ -1600,6 +1600,10 @@ func TestHandlerDeathProbe(t *testing.T) {
 		{"runtime PID check error", func(s *setup) { s.pids[4242] = errors.New("runtime pid reused or creation identity changed") }, handlerProbeUnknown},
 		{"pane PID check error", func(s *setup) { s.pids[4200] = errors.New("operation not permitted") }, handlerProbeUnknown},
 		{"pane PID without identity", func(s *setup) { s.receipt.PaneStarted = "" }, handlerProbeUnknown},
+		// The wrapper's own receipt records the pane and its login shell, so
+		// the pane is checked for it too.
+		{"wrapper receipt, all absent", func(s *setup) { s.receipt.Shell = "/bin/zsh" }, handlerProbeGone},
+		{"wrapper receipt, pane PID alive", func(s *setup) { s.receipt.Shell, s.pids[4200] = "/bin/zsh", true }, handlerProbeAlive},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1751,9 +1755,15 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 	a := api.Agent{ID: "agt_00000000000000aa", TaskID: "tsk_00000000000000aa", RunID: "run_00000000000000aa", Session: "tt-handler-aa", Name: "db-handler", Status: api.AgentExited}
 	exited := time.Date(2026, 10, 7, 13, 0, 0, 0, time.UTC)
 	observed := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	// ps prints start identities in local time to the second.
+	lstart := func(t time.Time) string { return t.In(time.Local).Format("Mon Jan _2 15:04:05 2006") }
+	paneStarted, shellStarted := lstart(exited.Add(-time.Hour)), lstart(exited.Add(time.Second))
 	base := runtimeProcessReceipt{Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID, Session: a.Session, Socket: "tt-socket", PID: 4242, Started: "start-4242",
-		SessionID: "$7", SessionCreated: "1700000000", ExitedAt: exited}
+		PanePID: 4200, PaneStarted: paneStarted, Shell: "/bin/zsh", SessionID: "$7", SessionCreated: "1700000000", ExitedAt: exited}
 	own := ownedSession{ID: "$7", Created: "1700000000", Name: a.Session, Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID}
+	proc := func(pid, parent int, started, executable string) discoveredProcess {
+		return discoveredProcess{pid: pid, parent: parent, started: started, executable: executable}
+	}
 	type setup struct {
 		agent      api.Agent
 		receipt    runtimeProcessReceipt
@@ -1763,9 +1773,9 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 		pids       map[int]any // true: alive; error: check failed; absent: gone
 		panes      []int
 		panesErr   error
-		// parents is the process table: pane 4200 is the wrapper, 4300 its shell.
-		parents    map[int]int
-		parentsErr error
+		// table is the process table: pane 4200 is the wrapper, 4300 its shell.
+		table    map[int]discoveredProcess
+		tableErr error
 	}
 	cases := []struct {
 		name   string
@@ -1777,7 +1787,24 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 		{"idle shell", func(*setup) {}, handlerProbeGone, api.HandlerDeathStateIdleShell},
 		{"receipt records no session identity", func(s *setup) { s.receipt.SessionID, s.receipt.SessionCreated = "", "" }, handlerProbeGone, api.HandlerDeathStateIdleShell},
 		{"session absent", func(s *setup) { s.sessions = nil }, handlerProbeGone, api.HandlerDeathStateGone},
-		{"process under the shell", func(s *setup) { s.parents[4400] = 4300 }, handlerProbeAlive, ""},
+		{"process under the shell", func(s *setup) { s.table[4400] = proc(4400, 4300, shellStarted, "sleep") }, handlerProbeAlive, ""},
+		{"shell printed as a login shell", func(s *setup) { s.table[4300] = proc(4300, 4200, shellStarted, "-zsh") }, handlerProbeGone, api.HandlerDeathStateIdleShell},
+		{"shell printed by name", func(s *setup) { s.table[4300] = proc(4300, 4200, shellStarted, "zsh") }, handlerProbeGone, api.HandlerDeathStateIdleShell},
+		{"shell started in the second of the exit", func(s *setup) { s.table[4300] = proc(4300, 4200, lstart(exited), "/bin/zsh") }, handlerProbeGone, api.HandlerDeathStateIdleShell},
+		// exec keeps the shell's PID and start identity; only the executable changes.
+		{"runtime exec'd in the shell", func(s *setup) { s.table[4300] = proc(4300, 4200, shellStarted, "codex") }, handlerProbeAlive, ""},
+		{"runtime exec'd in the shell, by path", func(s *setup) { s.table[4300] = proc(4300, 4200, shellStarted, "/opt/homebrew/bin/node") }, handlerProbeAlive, ""},
+		{"another shell than the recorded one", func(s *setup) { s.receipt.Shell = "/bin/bash" }, handlerProbeAlive, ""},
+		{"receipt records no pane process", func(s *setup) { s.receipt.PanePID = 0 }, handlerProbeUnknown, ""},
+		{"receipt records no pane start identity", func(s *setup) { s.receipt.PaneStarted = "" }, handlerProbeUnknown, ""},
+		{"receipt records no login shell", func(s *setup) { s.receipt.Shell = "" }, handlerProbeUnknown, ""},
+		{"pane process other than the recorded one", func(s *setup) {
+			s.panes = []int{4201}
+			s.table[4201], s.table[4301] = proc(4201, 1, paneStarted, "tt"), proc(4301, 4201, shellStarted, "/bin/zsh")
+		}, handlerProbeUnknown, ""},
+		{"pane process started at another time", func(s *setup) { s.table[4200] = proc(4200, 1, lstart(exited.Add(-2*time.Hour)), "tt") }, handlerProbeUnknown, ""},
+		{"shell started before the recorded exit", func(s *setup) { s.table[4300] = proc(4300, 4200, lstart(exited.Add(-time.Second)), "/bin/zsh") }, handlerProbeUnknown, ""},
+		{"shell start unreadable", func(s *setup) { s.table[4300] = proc(4300, 4200, "unreadable", "/bin/zsh") }, handlerProbeUnknown, ""},
 		{"runtime PID running", func(s *setup) { s.pids[4242] = true }, handlerProbeAlive, ""},
 		{"runtime PID running, session absent", func(s *setup) { s.sessions, s.pids[4242] = nil, true }, handlerProbeAlive, ""},
 		{"unreadable receipt", func(s *setup) { s.receiptErr = os.ErrNotExist }, handlerProbeUnknown, ""},
@@ -1785,7 +1812,7 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 		{"receipt records no exit, session absent", func(s *setup) { s.receipt.ExitedAt, s.sessions = time.Time{}, nil }, handlerProbeUnknown, ""},
 		{"unreadable sessions", func(s *setup) { s.listErr = errors.New("cannot verify tmux session identities") }, handlerProbeUnknown, ""},
 		{"unreadable panes", func(s *setup) { s.panesErr = errors.New("tmux failed") }, handlerProbeUnknown, ""},
-		{"unreadable process table", func(s *setup) { s.parentsErr = errors.New("unreadable process table row") }, handlerProbeUnknown, ""},
+		{"unreadable process table", func(s *setup) { s.tableErr = errors.New("unreadable process table row") }, handlerProbeUnknown, ""},
 		{"PID check error", func(s *setup) { s.pids[4242] = errors.New("runtime pid reused or creation identity changed") }, handlerProbeUnknown, ""},
 		{"two panes", func(s *setup) { s.panes = []int{4200, 4201} }, handlerProbeUnknown, ""},
 		{"no pane", func(s *setup) { s.panes = nil }, handlerProbeUnknown, ""},
@@ -1799,23 +1826,27 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 		{"two sessions name the handler", func(s *setup) {
 			s.sessions = append(s.sessions, ownedSession{ID: "$9", Created: "2", Name: "copy", Hub: hub, Task: a.TaskID, Agent: a.ID, Run: a.RunID})
 		}, handlerProbeUnknown, ""},
-		{"pane process not in the table", func(s *setup) { delete(s.parents, 4200) }, handlerProbeUnknown, ""},
-		{"wrapper without a shell", func(s *setup) { delete(s.parents, 4300) }, handlerProbeUnknown, ""},
-		{"wrapper with two children", func(s *setup) { s.parents[4301] = 4200 }, handlerProbeUnknown, ""},
+		{"pane process not in the table", func(s *setup) { delete(s.table, 4200) }, handlerProbeUnknown, ""},
+		{"wrapper without a shell", func(s *setup) { delete(s.table, 4300) }, handlerProbeUnknown, ""},
+		{"wrapper with two children", func(s *setup) { s.table[4301] = proc(4301, 4200, shellStarted, "/bin/zsh") }, handlerProbeUnknown, ""},
 		// The roster status decides the branch: a handler that is not exited
 		// is alive whenever its session is present, whatever the pane holds.
 		{"not exited, session present", func(s *setup) { s.agent.Status = api.AgentRunning }, handlerProbeAlive, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s := setup{agent: a, receipt: base, sessions: []ownedSession{own}, pids: map[int]any{}, panes: []int{4200}, parents: map[int]int{1: 0, 4200: 1, 4300: 4200, 9000: 1, 9001: 9000, 9002: 9001}}
+			other := lstart(exited.Add(-24 * time.Hour))
+			s := setup{agent: a, receipt: base, sessions: []ownedSession{own}, pids: map[int]any{}, panes: []int{4200}, table: map[int]discoveredProcess{
+				1: proc(1, 0, other, "/sbin/launchd"), 4200: proc(4200, 1, paneStarted, "tt"), 4300: proc(4300, 4200, shellStarted, "/bin/zsh"),
+				9000: proc(9000, 1, other, "tmux"), 9001: proc(9001, 9000, other, "-zsh"), 9002: proc(9002, 9001, other, "vim")}}
 			c.change(&s)
 			readPanes, readTable := 0, 0
 			p := deathProbe{
 				receipt:  func(string, string, string) (runtimeProcessReceipt, error) { return s.receipt, s.receiptErr },
 				sessions: func(context.Context) ([]ownedSession, error) { return s.sessions, s.listErr },
 				pid: func(pid int, started string) (bool, error) {
-					if pid != 4242 || started != "start-4242" {
+					// The pane process is checked by PID only once the session is absent.
+					if want := map[int]string{4242: "start-4242", 4200: paneStarted}[pid]; started != want || (pid == 4200 && len(s.sessions) > 0) {
 						t.Fatalf("pid %d checked with identity %q", pid, started)
 					}
 					switch v := s.pids[pid].(type) {
@@ -1833,7 +1864,7 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 					}
 					return s.panes, s.panesErr
 				},
-				processes: func(context.Context) (map[int]int, error) { readTable++; return s.parents, s.parentsErr },
+				processes: func(context.Context) (map[int]discoveredProcess, error) { readTable++; return s.table, s.tableErr },
 				socket:    func() string { return "tt-socket" }, host: func() string { return "mini" }, now: func() time.Time { return observed },
 			}
 			state, detail, ev := p.probe(context.Background(), hub+"/", s.agent)
@@ -1850,6 +1881,8 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 				SessionState: c.session, PID: 4242, ProcessStarted: "start-4242", ProcessState: api.HandlerDeathStateGone}
 			if c.session == api.HandlerDeathStateIdleShell {
 				want.PaneRootPID = 4200
+			} else {
+				want.PanePID = 4200
 			}
 			if ev.ExitedAt == nil || !ev.ExitedAt.Equal(exited) {
 				t.Fatalf("exit record: %+v", ev.ExitedAt)
@@ -1872,14 +1905,25 @@ func TestHandlerDeathProbeExited(t *testing.T) {
 
 // a5: the process table is read whole or not at all.
 func TestHandlerDeathProcessTableParse(t *testing.T) {
-	got, err := parseProcessParents("    1     0\n 4200     1\n 4300  4200\n")
-	if err != nil || len(got) != 3 || got[4300] != 4200 || got[1] != 0 {
-		t.Fatalf("table: %v %v", got, err)
+	got, err := parseProcessTable("    1     0 Sat Aug 22 19:33:24 2026     /sbin/launchd\n 4200     1 Wed Oct  7 06:00:00 2026     tt\n" +
+		" 4300  4200 Wed Oct  7 13:00:01 2026     -zsh\n 4400     1 Wed Oct  7 13:00:02 2026     /Applications/Some App.app/Contents/MacOS/Some App\n")
+	if err != nil || len(got) != 4 || got[1].parent != 0 || got[4300] != (discoveredProcess{4300, 4200, "Wed Oct  7 13:00:01 2026", "-zsh"}) ||
+		got[4200].started != "Wed Oct  7 06:00:00 2026" || got[4400].executable != "/Applications/Some App.app/Contents/MacOS/Some App" {
+		t.Fatalf("table: %+v %v", got, err)
 	}
-	for _, raw := range []string{"", "1 0\nzsh 1\n", "1 0\n4200\n", "1 0\n4200 1 extra\n", "1 0\n1 0\n", "0 0\n", "7 -1\n"} {
-		if got, err := parseProcessParents(raw); err == nil {
+	row := func(pid, parent string) string { return pid + " " + parent + " Wed Oct  7 06:00:00 2026 tt\n" }
+	for _, raw := range []string{"", row("1", "0") + "zsh 1 Wed Oct  7 06:00:00 2026 tt\n", row("1", "0") + "4200 1\n", row("1", "0") + "4200 1 Wed Oct  7 06:00:00 2026\n",
+		row("1", "0") + "4200 1 yesterday tt\n", row("1", "0") + row("1", "0"), row("0", "0"), row("7", "-1")} {
+		if got, err := parseProcessTable(raw); err == nil {
 			t.Fatalf("table %q read as %v", raw, got)
 		}
+	}
+	var oversize strings.Builder
+	for pid := 1; pid <= maxProcessTable+1; pid++ {
+		oversize.WriteString(row(fmt.Sprint(pid), "1"))
+	}
+	if got, err := parseProcessTable(oversize.String()); err == nil {
+		t.Fatalf("oversize table read with %d processes", len(got))
 	}
 }
 

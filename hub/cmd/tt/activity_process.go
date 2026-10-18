@@ -25,7 +25,9 @@ import (
 // SessionError is set only when both reads of the tmux session identity
 // failed. The receipt then has no SessionID and SessionCreated unless a
 // complete adopted receipt already saved for the same run supplied them and
-// its pane fields.
+// its pane fields. PanePID and PaneStarted identify the session's single pane
+// process; Shell is the login shell the wrapper leaves in that pane after the
+// runtime exits. Only the wrapper records Shell; adoption never does.
 type runtimeProcessReceipt struct {
 	Hub            string    `json:"hub"`
 	Task           string    `json:"task"`
@@ -36,6 +38,7 @@ type runtimeProcessReceipt struct {
 	PID            int       `json:"pid"`
 	PanePID        int       `json:"panePid,omitempty"`
 	PaneStarted    string    `json:"paneStarted,omitempty"`
+	Shell          string    `json:"shell,omitempty"`
 	Started        string    `json:"started,omitempty"`
 	SessionID      string    `json:"sessionId,omitempty"`
 	SessionCreated string    `json:"sessionCreated,omitempty"`
@@ -75,7 +78,13 @@ func recordRuntimeProcess(e env, pid int) {
 		return
 	}
 	identity, _ := runtimeProcessIdentity(pid)
-	receipt := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: os.Getenv(spawn.EnvSession), Socket: os.Getenv("TT_TMUX_SOCKET"), PID: pid, Started: identity}
+	// The same choice spawn.Wrap makes for the login shell it starts after the
+	// runtime exits; the exited-primary probe matches that shell by it.
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	receipt := runtimeProcessReceipt{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Session: os.Getenv(spawn.EnvSession), Socket: os.Getenv("TT_TMUX_SOCKET"), PID: pid, Started: identity, Shell: shell}
 	for attempt, timeout := range runtimeSessionReadTimeouts {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		sessions, err := localSessions(ctx)
@@ -91,23 +100,44 @@ func recordRuntimeProcess(e env, pid int) {
 				break
 			}
 		}
+		if receipt.SessionID != "" {
+			receipt.PanePID, receipt.PaneStarted = wrapperPane(receipt.SessionID)
+		}
 		break
 	}
 	path := runtimeProcessPath(e.hub, e.agent, e.runID)
 	if receipt.SessionError != "" {
 		// Runtime adoption may have saved a complete receipt for this run while
-		// the reads were failing. The pane fields mark it: discovery always
-		// records the pane it started from and the wrapper never does, so a
-		// receipt the wrapper wrote earlier is not a source. The session
-		// identity and the pane of that session are kept; PID and Started stay
-		// the wrapper's own exact child.
+		// the reads were failing. Its pane fields with no Shell mark it:
+		// discovery always records the pane it started from and never the
+		// shell, and the wrapper always records the shell, so a receipt the
+		// wrapper wrote earlier is not a source. The session identity and the
+		// pane of that session are kept; PID and Started stay the wrapper's own
+		// exact child.
 		var saved runtimeProcessReceipt
-		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &saved) == nil && saved.Hub == receipt.Hub && saved.Task == receipt.Task && saved.Agent == receipt.Agent && saved.Run == receipt.Run && saved.Session == receipt.Session && saved.Socket == receipt.Socket && saved.SessionID != "" && saved.SessionCreated != "" && saved.PanePID > 0 && saved.PaneStarted != "" {
+		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &saved) == nil && saved.Hub == receipt.Hub && saved.Task == receipt.Task && saved.Agent == receipt.Agent && saved.Run == receipt.Run && saved.Session == receipt.Session && saved.Socket == receipt.Socket && saved.SessionID != "" && saved.SessionCreated != "" && saved.PanePID > 0 && saved.PaneStarted != "" && saved.Shell == "" {
 			receipt.SessionID, receipt.SessionCreated = saved.SessionID, saved.SessionCreated
 			receipt.PanePID, receipt.PaneStarted = saved.PanePID, saved.PaneStarted
 		}
 	}
 	_ = writePrivateJSON(path, receipt)
+}
+
+// wrapperPane reads the wrapper's session's single pane process and its start
+// identity. Anything else, or any failed read, records no pane: the probes
+// then treat the pane as unrecorded, and the session identity stays valid.
+func wrapperPane(sessionID string) (int, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeSessionReadTimeouts[0])
+	defer cancel()
+	panes, err := sessionPanePIDs(ctx, sessionID)
+	if err != nil || len(panes) != 1 {
+		return 0, ""
+	}
+	started, err := runtimeProcessIdentity(panes[0])
+	if err != nil {
+		return 0, ""
+	}
+	return panes[0], started
 }
 
 func recordRuntimeExit(e env) {

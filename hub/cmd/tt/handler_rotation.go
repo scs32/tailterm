@@ -227,8 +227,8 @@ type handlerDeathProbe func(ctx context.Context, hub string, a api.Agent) (state
 // deathProbe confirms a handler gone from two facts read on its own host: its
 // recorded tmux session is absent from a readable listing, and its runtime
 // process is absent by PID and start identity. When the receipt also records
-// a pane process, that must be absent too. Any fact it cannot read is
-// unknown, never gone. It signals nothing.
+// a pane process, as the wrapper does, that must be absent too. Any fact it
+// cannot read is unknown, never gone. It signals nothing.
 //
 // A handler whose wrapper reported exited (wi_1d987e7f296b6a2e) keeps its
 // session, because the wrapper leaves a login shell in the pane. For that
@@ -238,10 +238,11 @@ type deathProbe struct {
 	sessions func(context.Context) ([]ownedSession, error)
 	pid      runtimePIDProbe
 	// panes lists the pane process IDs of one session by its tmux ID, and
-	// processes maps every process ID on the host to its parent's. Only the
-	// exited case reads them; a nil reader confirms nothing.
+	// processes maps every process ID on the host to its parent's, start
+	// identity and executable. Only the exited case reads them; a nil reader
+	// confirms nothing.
 	panes     func(ctx context.Context, sessionID string) ([]int, error)
-	processes func(context.Context) (map[int]int, error)
+	processes func(context.Context) (map[int]discoveredProcess, error)
 	socket    func() string
 	host      func() string
 	now       func() time.Time
@@ -257,7 +258,7 @@ func productionDeathProbe() deathProbe {
 			}
 			return r, json.Unmarshal(data, &r)
 		},
-		sessions: localSessions, pid: nativeRuntimePIDProbe, panes: sessionPanePIDs, processes: processParents,
+		sessions: localSessions, pid: nativeRuntimePIDProbe, panes: sessionPanePIDs, processes: processTable,
 		socket: func() string { return os.Getenv("TT_TMUX_SOCKET") }, host: spawn.Host, now: time.Now,
 	}
 }
@@ -335,11 +336,14 @@ func (p deathProbe) probe(ctx context.Context, hub string, a api.Agent) (string,
 
 // idleShell reads the session an exited handler left behind. It answers gone
 // only when the runtime process is absent, the one session is this exact
-// run's, it has one pane, and that pane's process has exactly one child with
-// no children of its own: the wrapper and its idle login shell. Anything
-// running under that shell answers alive, whatever its name, so a runtime
-// rerun by hand is never replaced. Every unreadable or unexpected fact is
-// unknown.
+// run's, it has one pane, that pane's process is the one the receipt records,
+// and it has exactly one child with no children of its own: the wrapper's
+// login shell, started after the recorded exit and running the shell the
+// receipt names. Anything running under that shell answers alive, whatever
+// its name, and so does a child running another executable, such as a
+// runtime started with exec in the shell: exec keeps the shell's PID and
+// start identity but not its executable. So a runtime rerun by hand is never
+// replaced. Every unreadable, unrecorded or unexpected fact is unknown.
 func (p deathProbe) idleShell(ctx context.Context, hub string, a api.Agent, receipt runtimeProcessReceipt, session string, present []ownedSession) (string, string, *api.HandlerDeathEvidence) {
 	if alive, err := p.pid(receipt.PID, receipt.Started); err != nil {
 		return handlerProbeUnknown, "the runtime process could not be checked: " + err.Error(), nil
@@ -354,6 +358,11 @@ func (p deathProbe) idleShell(ctx context.Context, hub string, a api.Agent, rece
 		(receipt.SessionID != "" && s.ID != receipt.SessionID) || (receipt.SessionCreated != "" && s.Created != receipt.SessionCreated) {
 		return handlerProbeUnknown, "tmux session " + s.Name + " is not identified as the exited run's own session", nil
 	}
+	// A run started before the wrapper recorded these has none, and its pane
+	// cannot be told from a runtime that replaced the shell.
+	if receipt.PanePID < 1 || receipt.PaneStarted == "" || receipt.Shell == "" {
+		return handlerProbeUnknown, "the process receipt records no pane process or login shell", nil
+	}
 	if p.panes == nil || p.processes == nil {
 		return handlerProbeUnknown, "this host cannot read the session's pane and process table", nil
 	}
@@ -364,11 +373,14 @@ func (p deathProbe) idleShell(ctx context.Context, hub string, a api.Agent, rece
 	if len(panes) != 1 || panes[0] < 1 {
 		return handlerProbeUnknown, fmt.Sprintf("the session has %d panes, not one", len(panes)), nil
 	}
-	parents, err := p.processes(ctx)
+	if panes[0] != receipt.PanePID {
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d is not the recorded pane process %d", panes[0], receipt.PanePID), nil
+	}
+	processes, err := p.processes(ctx)
 	if err != nil {
 		return handlerProbeUnknown, "the process table is unreadable", nil
 	}
-	if state, detail := idleShellTree(parents, panes[0]); state != handlerProbeGone {
+	if state, detail := idleShellTree(processes, receipt); state != handlerProbeGone {
 		return state, detail, nil
 	}
 	exitedAt := receipt.ExitedAt.UTC()
@@ -377,29 +389,46 @@ func (p deathProbe) idleShell(ctx context.Context, hub string, a api.Agent, rece
 		ProcessStarted: receipt.Started, ProcessState: api.HandlerDeathStateGone, ExitedAt: &exitedAt, PaneRootPID: panes[0]}
 }
 
-// idleShellTree checks the shape below a pane's process in a table of process
-// ID to parent ID: exactly one child, and that child childless. It matches no
-// executable name.
-func idleShellTree(parents map[int]int, root int) (string, string) {
-	if _, ok := parents[root]; !ok {
-		return handlerProbeUnknown, fmt.Sprintf("pane process %d is not in the process table", root)
+// idleShellTree checks the tree below the receipt's pane process in a table
+// of processes: the pane process with the recorded start identity, exactly
+// one child, that child childless, running the recorded shell (ps may print
+// it as a path or with a login shell's leading dash) and started no earlier
+// than the recorded exit, to the second ps reports.
+func idleShellTree(processes map[int]discoveredProcess, receipt runtimeProcessReceipt) (string, string) {
+	root, ok := processes[receipt.PanePID]
+	if !ok {
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d is not in the process table", receipt.PanePID)
+	}
+	if root.started != receipt.PaneStarted {
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d is not the recorded pane process: its start identity differs", root.pid)
 	}
 	children := func(of int) []int {
 		var out []int
-		for pid, parent := range parents {
-			if parent == of && pid != of {
+		for pid, p := range processes {
+			if p.parent == of && pid != of {
 				out = append(out, pid)
 			}
 		}
 		sort.Ints(out)
 		return out
 	}
-	shells := children(root)
+	shells := children(root.pid)
 	if len(shells) != 1 {
-		return handlerProbeUnknown, fmt.Sprintf("pane process %d has %d child processes, not one shell", root, len(shells))
+		return handlerProbeUnknown, fmt.Sprintf("pane process %d has %d child processes, not one shell", root.pid, len(shells))
 	}
 	if below := children(shells[0]); len(below) > 0 {
 		return handlerProbeAlive, fmt.Sprintf("process %d runs under the pane's shell", below[0])
+	}
+	shell := processes[shells[0]]
+	if filepath.Base(strings.TrimPrefix(shell.executable, "-")) != filepath.Base(receipt.Shell) {
+		return handlerProbeAlive, fmt.Sprintf("process %d in the pane is not the wrapper's login shell", shell.pid)
+	}
+	started, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", shell.started, time.Local)
+	if err != nil {
+		return handlerProbeUnknown, fmt.Sprintf("the start of process %d in the pane is unreadable", shell.pid)
+	}
+	if started.Before(receipt.ExitedAt.Truncate(time.Second)) {
+		return handlerProbeUnknown, fmt.Sprintf("process %d in the pane started before the recorded exit", shell.pid)
 	}
 	return handlerProbeGone, ""
 }
@@ -426,34 +455,34 @@ func sessionPanePIDs(ctx context.Context, sessionID string) ([]int, error) {
 
 const maxProcessTable = 65536
 
-// processParents reads every process ID and its parent's. One unparsable or
-// repeated row makes the whole table unreadable.
-func processParents(ctx context.Context) (map[int]int, error) {
-	raw, err := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=").Output()
+// processTable reads every process ID with its parent's, start identity and
+// executable. One unparsable or repeated row makes the whole table unreadable.
+func processTable(ctx context.Context) (map[int]discoveredProcess, error) {
+	raw, err := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=").Output()
 	if err != nil {
 		return nil, err
 	}
-	return parseProcessParents(string(raw))
+	return parseProcessTable(string(raw))
 }
 
-func parseProcessParents(raw string) (map[int]int, error) {
-	parents := map[int]int{}
+func parseProcessTable(raw string) (map[int]discoveredProcess, error) {
+	processes := map[int]discoveredProcess{}
 	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
+		row := runtimeProcessRow.FindStringSubmatch(line)
+		if row == nil {
 			return nil, errors.New("unreadable process table row")
 		}
-		pid, err1 := strconv.Atoi(fields[0])
-		parent, err2 := strconv.Atoi(fields[1])
+		pid, err1 := strconv.Atoi(row[1])
+		parent, err2 := strconv.Atoi(row[2])
 		if err1 != nil || err2 != nil || pid < 1 || parent < 0 {
 			return nil, errors.New("unreadable process table row")
 		}
-		if _, repeated := parents[pid]; repeated || len(parents) >= maxProcessTable {
+		if _, repeated := processes[pid]; repeated || len(processes) >= maxProcessTable {
 			return nil, errors.New("the process table repeats a process or is too large")
 		}
-		parents[pid] = parent
+		processes[pid] = discoveredProcess{pid, parent, strings.TrimSpace(row[3]), row[4]}
 	}
-	return parents, nil
+	return processes, nil
 }
 
 // rotationRefusal reports a hub refusal that changed nothing.
