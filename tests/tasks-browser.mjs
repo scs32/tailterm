@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { openVault } from "../client/vault-crypto.js";
+import { leaves } from "../client/pane-layout.js";
 import { checkGroupAlone, checkHelperWindow } from "./pane-groups-browser.mjs";
 
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
@@ -921,6 +922,86 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     assert.ok(!bookmark(name)?.task, `${name} bookmark is unbound`);
   for (const name of ["n1", "n3"])
     assert.equal(bookmark(name)?.task?.taskId, N.task.id, `${name} bound`);
+
+  // A lower Panes per group re-splits a project, is saved and survives a refresh.
+  const splitNames = ["s1", "s2", "s3", "s4", "s5", "s6"];
+  const S = project(
+    "restore-split",
+    splitNames.map((name) => [name]),
+  );
+  await palette("Project: open terminals…");
+  await page.locator(`[data-open-task="${S.task.id}"]`).click();
+  // The project's tabs in strip order, each with its panes' sessions.
+  const splitTabs = (tabs) =>
+    tabs
+      .filter((t) => t.project && t.name.startsWith("restore-split"))
+      .map((t) => ({ name: t.name, sessions: t.panes.map((p) => p.session) }));
+  await waitFor(async () => {
+    tabs = await inventory();
+    return (
+      sessionsOf(tabs, "restore-split")?.join() === splitNames.join() &&
+      tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+    );
+  }, "split project panes");
+  assert.equal(splitTabs(tabs).length, 1, "six panes fit the default limit");
+  await page.locator("#appearance").click();
+  await page.locator("#pane-group-limit").selectOption("4");
+  await page.locator("#dialog-close").click();
+  // The stored workspace holds the project in two groups, none over four panes.
+  const storedSplit = async () => {
+    const { workspace } = await readVault();
+    const session = Object.fromEntries(
+      workspace.tabs.map((t) => [t.id, t.session]),
+    );
+    return workspace.groups
+      .filter((g) => g.taskId === S.task.id)
+      .map((g) => leaves(g.tree).map((id) => session[id]));
+  };
+  let split;
+  await waitFor(async () => {
+    split = await storedSplit();
+    return (
+      split.length === 2 &&
+      split.every((ids) => ids.length <= 4) &&
+      split.flat().sort().join() === splitNames.join()
+    );
+  }, "the re-split project in the stored workspace");
+  tabs = await inventory();
+  const resplit = splitTabs(tabs);
+  assert.deepEqual(
+    resplit.map((t) => t.name),
+    ["restore-split", "restore-split (continued)"],
+    "the project continues in a second group",
+  );
+  assert.deepEqual(
+    resplit.map((t) => [...t.sessions].sort()),
+    split.map((ids) => [...ids].sort()),
+    "the tabs show the stored groups",
+  );
+  await hub.navigateWithHubHeld(page, () => page.reload());
+  await page.locator("#lockscreen").waitFor();
+  await unlock();
+  await waitFor(restored, "restore of the re-split project", 90000);
+  await waitFor(async () => {
+    tabs = await inventory();
+    return (
+      splitTabs(tabs).length === 2 &&
+      tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+    );
+  }, "re-split project after a refresh");
+  assert.deepEqual(
+    splitTabs(tabs).map((t) => ({ ...t, sessions: [...t.sessions].sort() })),
+    resplit.map((t) => ({ ...t, sessions: [...t.sessions].sort() })),
+    "the refresh restores the re-split groups",
+  );
+  // Later checks expect the default limit and no split project.
+  await page.locator("#appearance").click();
+  await page.locator("#pane-group-limit").selectOption("8");
+  await page.locator("#dialog-close").click();
+  hub.api.closeTask(S.task.id);
+  console.log(
+    `Panes per group 4 re-split restore-split into ${resplit.map((t) => t.sessions.length).join(" + ")} panes; the stored groups came back after a refresh.`,
+  );
 
   // Leave the hub and tabs as the later checks expect them.
   for (const { task } of [L, N, X]) hub.api.closeTask(task.id);
