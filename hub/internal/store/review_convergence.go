@@ -235,6 +235,33 @@ func currentReviewStage(ctx context.Context, q queryRower, task string, state *a
 	return earlier, nil
 }
 
+// reviewWithdrawn reports whether the sender withdrew the REVIEW message seq
+// (tt withdraw closes its obligation with outcome withdrawn).
+func reviewWithdrawn(ctx context.Context, q queryRower, task string, seq int64) (bool, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND state=? AND outcome=?`, task, seq, api.ObligationClosed, api.OutcomeWithdrawn).Scan(&n)
+	return n > 0, err
+}
+
+// dropWithdrawnRound removes the current stage's last round when it has no
+// RESULT and its active request was withdrawn. A withdrawn round leaves no
+// lifetime count, so the next REVIEW takes its number. A round with a RESULT
+// is never removed.
+func dropWithdrawnRound(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence) error {
+	if len(state.Rounds) == 0 {
+		return nil
+	}
+	last := state.Rounds[len(state.Rounds)-1]
+	if last.ResultSeq != 0 {
+		return nil
+	}
+	withdrawn, err := reviewWithdrawn(ctx, q, task, reviewRequestSeq(last.RequestSeq, last.ActiveRequestSeq))
+	if err == nil && withdrawn {
+		state.Rounds = state.Rounds[:len(state.Rounds)-1]
+	}
+	return err
+}
+
 // saveReviewStage saves the current stage after the unchanged earlier stages.
 func saveReviewStage(ctx context.Context, tx *sql.Tx, task string, earlier earlierReviewStages, state api.ReviewConvergence) error {
 	if len(earlier.rounds) > 0 {
@@ -711,6 +738,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	if err != nil {
 		return err
 	}
+	if err = dropWithdrawnRound(ctx, tx, m.TaskID, &state); err != nil {
+		return err
+	}
 	meta := e.Review
 	if meta != nil && req.AgentID != "" {
 		var current, status string
@@ -1052,6 +1082,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	}
 	if meta.Mode != "general" || e.Kind != "result" {
 		return reviewConflict("invalid review transition")
+	}
+	if withdrawn, err := reviewWithdrawn(ctx, tx, m.TaskID, req.ReplyTo); err != nil {
+		return err
+	} else if withdrawn {
+		return reviewConflict("review request was withdrawn; its round is closed without a count")
 	}
 	var round *api.ReviewRound
 	for i := range state.Rounds {

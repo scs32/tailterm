@@ -4161,3 +4161,149 @@ func TestReviewFoldCandidatesFailureKeepsReview(t *testing.T) {
 		t.Fatalf("skip events %v", events)
 	}
 }
+
+// withdrawLeadFixture is a convergence fixture whose REVIEWs come from an
+// agent lead, which tt withdraw needs: only the sending run may withdraw.
+func withdrawLeadFixture(t *testing.T) *convergenceFixture {
+	t.Helper()
+	f := newConvergenceFixture(t)
+	var err error
+	f.lead, err = f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.lead.Name
+	if _, err = f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+func (f *convergenceFixture) leadReview(candidate string) (api.Message, error) {
+	return f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: candidate, Scope: "Fixture", Acceptance: f.criteria}}, f.reviewer.ID, 0, f.lead)
+}
+func (f *convergenceFixture) obligationFor(t *testing.T, seq int64) string {
+	t.Helper()
+	obligations, err := f.s.ListObligations(f.ctx, f.task.ID, ObligationFilter{}, f.s.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range obligations {
+		if o.MessageSeq == seq {
+			return o.ID
+		}
+	}
+	t.Fatal("no obligation for message", seq)
+	return ""
+}
+func (f *convergenceFixture) withdraw(t *testing.T, seq int64) error {
+	t.Helper()
+	_, err := f.s.WithdrawObligation(f.ctx, f.task.ID, f.obligationFor(t, seq), api.ObligationWithdrawRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Reason: "Candidate rebased"})
+	return err
+}
+
+// wi_042fe7cb76b34bf0: a withdrawn REVIEW with no RESULT closes its round
+// without a lifetime count; a RESULT on it is refused.
+func TestReviewConvergenceWithdrawnReviewLeavesNoCount(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	first, err := f.leadReview(candidateA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not withdrawn: an unanswered round still refuses a new REVIEW.
+	if _, err = f.leadReview(candidateB); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "previous general review is incomplete") {
+		t.Fatal("unanswered round accepted a new review", err)
+	}
+	if err = f.withdraw(t, first.Seq); err != nil {
+		t.Fatal(err)
+	}
+	// The withdrawn request takes no RESULT, before or after the fresh REVIEW.
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", first.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "withdrawn") {
+		t.Fatal("result on withdrawn review accepted", err)
+	}
+	fresh, err := f.leadReview(candidateB)
+	if err != nil {
+		t.Fatal("fresh review after withdrawal refused", err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 1 || st.Rounds[0].Number != 1 || st.Rounds[0].RequestSeq != fresh.Seq || st.Rounds[0].Candidate != candidateB {
+		t.Fatal("fresh review did not take the withdrawn round's number", st.Rounds)
+	}
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", first.Seq, f.reviewer); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("late result on withdrawn review accepted", err)
+	}
+	if _, err = f.post(f.resultEnv(candidateB, passConvergence, api.ReviewMetadata{Mode: "general"}), "", fresh.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	// Round two withdrawn as well: it leaves no count either.
+	second, err := f.leadReview(candidateC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.withdraw(t, second.Seq); err != nil {
+		t.Fatal(err)
+	}
+	again, err := f.leadReview(candidateC)
+	if err != nil {
+		t.Fatal("fresh round two after withdrawal refused", err)
+	}
+	st = f.state(t)
+	if len(st.Rounds) != 2 || st.Rounds[0].ResultSeq == 0 || st.Rounds[1].Number != 2 || st.Rounds[1].RequestSeq != again.Seq {
+		t.Fatal(st.Rounds)
+	}
+	if _, err = f.post(f.resultEnv(candidateC, passConvergence, api.ReviewMetadata{Mode: "general"}), "", again.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	f.thirdReviewRefused(t, candidateC)
+}
+
+func TestReviewConvergenceWithdrawAfterResultChangesNothing(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	for _, candidate := range []string{candidateA, candidateB} {
+		r, err := f.leadReview(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.post(f.resultEnv(candidate, passConvergence, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+		before := f.state(t)
+		// The RESULT closed the obligation, so withdrawal is refused and the
+		// answered round stays as it was.
+		if err = f.withdraw(t, r.Seq); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("withdraw after result", err)
+		}
+		if after := f.state(t); !reflect.DeepEqual(before.Rounds, after.Rounds) {
+			t.Fatal("answered round changed", before.Rounds, after.Rounds)
+		}
+	}
+	f.thirdReviewRefused(t, candidateC)
+}
+
+// A reassigned review is judged by its active request's obligation.
+func TestReviewConvergenceWithdrawnReassignedReview(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	r, err := f.leadReview(candidateA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "reviewer-next", Host: "fixture", Session: "reviewer-next"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := f.s.ReassignObligation(f.ctx, f.task.ID, f.obligationFor(t, r.Seq), api.ObligationReassignRequest{ToAgentID: replacement.ID, Reason: "Exact fixture replacement"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.withdraw(t, moved.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", moved.Seq, replacement); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("result on withdrawn reassigned review accepted", err)
+	}
+	if _, err = f.leadReview(candidateB); err != nil {
+		t.Fatal("fresh review after withdrawn reassignment refused", err)
+	}
+	if st := f.state(t); len(st.Rounds) != 1 || st.Rounds[0].Candidate != candidateB {
+		t.Fatal(st.Rounds)
+	}
+}

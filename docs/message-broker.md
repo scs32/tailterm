@@ -495,6 +495,11 @@ Source feature `wi_3d6a4e3d1bf99a08`, order #11569, assignment #11656.
 The first item-linked ASSIGN freezes contiguous a1..aN for that scope. Linked
 REVIEW messages reserve at most two lifetime rounds, serially, with the exact
 40/64-character candidate commit, target agent/run and identical acceptance map.
+A REVIEW that the lead withdraws (`tt withdraw`) before any RESULT closes its
+round without a lifetime count: the next REVIEW takes that round's number, and a
+RESULT replying to the withdrawn request is refused. A round with a RESULT is
+never removed, and an unanswered round that was not withdrawn still refuses a
+new REVIEW (bug `wi_042fe7cb76b34bf0`).
 An ASSIGN may also freeze `body.verificationCriteria` (CLI:
 `--verification-criterion aN`) for IDs designated by the order or plan as
 independently verified. REVIEW repeats those exact IDs. Each general RESULT must
