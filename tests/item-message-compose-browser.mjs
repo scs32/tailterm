@@ -152,7 +152,9 @@ const task=new URLSearchParams(location.search).get('task');
 const client=createHubClient({baseURL:location.origin,fetchImpl:(url,init)=>fetch(url,init)});
 // Refresh is explicit in this fixture; subscription/scroll races have separate browser suites.
 client.subscribe=()=>({stop(){}});
-const notice=text=>document.querySelector('#notice').textContent=text;
+// Like the app's notice() without its 8 s timer; the count lets each send
+// prove it raised a fresh notice rather than reading an earlier one.
+const notice=text=>{const el=document.querySelector('#notice');el.textContent=text;el.dataset.count=Number(el.dataset.count||0)+1};
 const noop=()=>{};
 const intentPersistence={
   async list(scope){return JSON.parse(sessionStorage.getItem('intents:'+scope)||'[]')},
@@ -377,12 +379,43 @@ try {
         await page.waitForFunction(() => !!window.qa);
       }
       await loaded();
-      // The fixture notice never auto-hides (the app hides it after 8s): clear
-      // the previous attempt's notice so it cannot cover Send or satisfy the
-      // next attempt's assertion.
+      // The fixture notice never auto-hides (the app hides it after 8s), so an
+      // earlier failure's notice is still showing when the next send clicks:
+      // it must not cover Send. Each text check reads only a notice raised
+      // since this send.
+      const noticeCount = () =>
+        page.locator("#notice").evaluate((el) => Number(el.dataset.count || 0));
+      let noticesBefore = 0;
       async function submit() {
-        await page.locator("#notice").evaluate((el) => (el.textContent = ""));
+        noticesBefore = await noticeCount();
         await send.click();
+      }
+      async function freshNotice() {
+        assert.ok(
+          (await noticeCount()) > noticesBefore,
+          name + " send raised no new notice",
+        );
+        return page.locator("#notice").textContent();
+      }
+      // Right after a failed post the retry must stay reachable: the element
+      // at Send's centre is Send, at desktop width and at 390 px.
+      async function sendUncovered(label) {
+        const size = page.viewportSize();
+        for (const width of [1100, 390]) {
+          await page.setViewportSize({ width, height: size.height });
+          const hit = await send.evaluate((button) => {
+            const box = button.getBoundingClientRect();
+            const top = document.elementFromPoint(
+              box.left + box.width / 2,
+              box.top + box.height / 2,
+            );
+            return top === button || button.contains(top)
+              ? "send"
+              : top?.id || top?.tagName || "nothing";
+          });
+          assert.equal(hit, "send", `${name} ${label} at ${width} px`);
+        }
+        await page.setViewportSize(size);
       }
       async function idle() {
         await waitFor(async () => await send.isEnabled(), name + " idle");
@@ -668,7 +701,8 @@ try {
           const beforeCount = (await messages(fixture)).length;
           await submit();
           await idle();
-          assert.match(await page.locator("#notice").textContent(), /stale/);
+          assert.match(await freshNotice(), /stale/);
+          await sendUncovered(`stale ${kind} ${gesture}`);
           assert.equal(attempts.length, beforeAttempt);
           assert.equal((await messages(fixture)).length, beforeCount);
           assert.equal(await input.inputValue(), text);
@@ -730,7 +764,8 @@ try {
       await submit();
       await idle();
       assert.equal(attempts.length, before);
-      assert.match(await page.locator("#notice").textContent(), /Choose a bug/);
+      assert.match(await freshNotice(), /Choose a bug/);
+      await sendUncovered("empty item");
       await choose(active);
       assert.equal(
         await page.evaluate(() => document.activeElement?.id),
@@ -825,7 +860,8 @@ try {
       active = await update(active, { title: "Changed feature title" });
       await submit();
       await idle();
-      assert.match(await page.locator("#notice").textContent(), /stale/);
+      assert.match(await freshNotice(), /stale/);
+      await sendUncovered("stale direct item");
       assert.equal(await input.inputValue(), "Stale text retained");
       assert.equal(
         (await draftValue()).primaryRevision,
@@ -929,7 +965,8 @@ try {
       await submit();
       await idle();
       assert.equal(attempts.length, workBefore);
-      assert.match(await page.locator("#notice").textContent(), /exact order/);
+      assert.match(await freshNotice(), /exact order/);
+      await sendUncovered("work without order");
       await page.evaluate((id) => qa.board.show(id), fixture.task.id);
       await page.locator("#board-message-item-mode").click();
       await choose(active);

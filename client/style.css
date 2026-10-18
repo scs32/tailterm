@@ -3307,6 +3307,22 @@ dialog .primary:hover {
   font: 12px/1.5 var(--terminal-font);
   box-shadow: none;
 }
+/* The Board composer and its Send button fill the bottom of the viewport, so
+   a failed post's notice shows at the top instead of covering the retry. */
+body[data-mode="board"] #notice {
+  top: 24px;
+  bottom: auto;
+}
+@media (max-width: 640px) {
+  #notice {
+    right: 16px;
+    left: 16px;
+    max-width: none;
+  }
+  body[data-mode="board"] #notice {
+    top: 16px;
+  }
+}
 #vault-reset-error,
 #rename-session-error {
   color: light-dark(#a13f4e, #edada1);
