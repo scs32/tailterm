@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   selectChecks,
@@ -58,16 +59,21 @@ test("preflight refuses missing or unreadable selected inputs and invalid space 
     const f = preflightFixture(t, browser);
     for (const mode of ["run", "targeted"]) {
       let acquisitions = 0, homes = 0;
+      const printed = [];
       const options = {
         getAvailableBytes: () => 2147483648,
         acquireHostLock: () => { acquisitions++; throw new Error("unexpected acquisition"); },
         removeHome: (home) => { homes++; removeVerifierHome(home); },
+        // The fixture is a main worktree, so nothing is provisioned.
+        installPrerequisites: () => assert.fail("non-worktree checkout provisioned"),
+        hostLock: { print: (line) => printed.push(line) },
       };
       const refuse = async (overrides, expected) => {
         const output = tempDir(t, "verification-preflight-logs-");
         const directoriesBefore = readdirSync(homeRoot);
         await assert.rejects(preflightRun(mode, f, output, { ...options, ...overrides }), expected);
         assert.equal(acquisitions, 0, "no host acquisition call");
+        assert.deepEqual(printed, [], "no provisioning output");
         assert.deepEqual(readdirSync(output), [], "no commands, sidecars or receipts");
         assert.equal(homes, 0, "no verifier home cleanup needed");
         assert.deepEqual(readdirSync(homeRoot), directoriesBefore, "no verifier home allocated");
@@ -193,6 +199,126 @@ test("preflight rechecks inputs and space after admission and hashes the held by
       assert.deepEqual(readHostState(hostLockFile()).waiters, []);
     }
   }
+});
+
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const provisionLine = (line) => /^matrix run: (provisioned prerequisites from |prerequisite )/.test(line);
+// A detached linked worktree of the fixture at its candidate, which has none of
+// the ignored prerequisites.
+function linkedWorktree(t, f) {
+  const wt = join(tempDir(t, "verification-linked-"), "wt");
+  f.git("worktree", "add", "-q", "--detach", wt, f.context.commit);
+  return wt;
+}
+// Stands in for npm ci: writes the install marker in the worktree.
+function fakeInstall(calls) {
+  return (argv, dir) => {
+    calls.push([argv, dir]);
+    mkdirSync(join(dir, "node_modules"), { recursive: true });
+    writeFileSync(join(dir, "node_modules/.package-lock.json"), "{}");
+  };
+}
+
+test("a linked worktree provisions missing prerequisites from the main worktree before admission", async (t) => {
+  const f = preflightFixture(t, true);
+  const main = f.git("rev-parse", "--show-toplevel");
+  const wt = linkedWorktree(t, f);
+  for (const path of prerequisitePaths) assert(!existsSync(join(wt, path)), path + " starts missing");
+  const calls = [], events = [];
+  const options = {
+    getAvailableBytes: () => 2147483648,
+    installPrerequisites: fakeInstall(calls),
+    hostLock: { print: (line) => events.push(line) },
+    acquireHostLock: (args) => { events.push("acquire"); return acquireHostLock(args); },
+  };
+  const receipt = await runPlan(f.plan, wt, tempDir(t, "verification-linked-logs-"), options);
+  assert(receipt.checks.every((c) => c.exitCode === 0));
+  assert.deepEqual(calls, [[["npm", "ci"], wt]]);
+  const acquired = events.indexOf("acquire");
+  assert(acquired > 0, "admission happened after provisioning");
+  const lines = events.filter((line) => line !== "acquire" && provisionLine(line));
+  assert.deepEqual(events.slice(0, lines.length), lines, "provisioning output precedes admission");
+  assert.equal(lines[0], "matrix run: provisioned prerequisites from " + main);
+  const printed = lines.slice(1).map((line) => line.split(" ").slice(3));
+  assert.deepEqual(printed.map(([path, action]) => [path, action]),
+    prerequisitePaths.map((path, i) => [path, i === 0 ? "installed" : "copied"]));
+  // The receipt keeps its {path, sha256} form; the copies carry main's bytes.
+  assert.deepEqual(receipt.prerequisites.map((p) => Object.keys(p).sort()), prerequisitePaths.map(() => ["path", "sha256"]));
+  assert.deepEqual(receipt.prerequisites.map((p) => p.path), prerequisitePaths);
+  for (const [i, [path, , hash]] of printed.entries()) {
+    assert.equal(hash, receipt.prerequisites[i].sha256, path);
+    assert.equal(hash, sha256(readFileSync(join(wt, path))), path);
+    if (i > 0) assert.equal(hash, sha256(readFileSync(join(main, path))), path + " matches main");
+  }
+  assert.equal(f.git("-C", wt, "status", "--porcelain"), "");
+
+  events.length = 0;
+  const again = await runPlan(f.plan, wt, tempDir(t, "verification-linked-logs-"), options);
+  assert(again.checks.every((c) => c.exitCode === 0));
+  assert.equal(calls.length, 1, "no second install");
+  assert.deepEqual(events.filter(provisionLine), [], "nothing provisioned twice");
+  assert.deepEqual(again.prerequisites, receipt.prerequisites);
+});
+
+test("linked worktree provisioning never overwrites an existing prerequisite", async (t) => {
+  const f = preflightFixture(t, true);
+  const wt = linkedWorktree(t, f);
+  mkdirSync(join(wt, ".build"));
+  writeFileSync(join(wt, ".build/test.wasm"), "local build");
+  const calls = [], printed = [];
+  const receipt = await runPlan(f.plan, wt, tempDir(t, "verification-linked-logs-"), {
+    getAvailableBytes: () => 2147483648,
+    installPrerequisites: fakeInstall(calls),
+    hostLock: { print: (line) => printed.push(line) },
+  });
+  assert.equal(readFileSync(join(wt, ".build/test.wasm"), "utf8"), "local build");
+  assert(printed.includes(`matrix run: prerequisite .build/test.wasm present ${digest("local build")}`));
+  assert.equal(receipt.prerequisites.find((p) => p.path === ".build/test.wasm").sha256, digest("local build"));
+  assert.equal(calls.length, 1);
+});
+
+test("linked worktree provisioning refuses before admission when the main worktree lacks a file or the worktree is dirty", async (t) => {
+  for (const mode of ["run", "targeted"]) {
+    const f = preflightFixture(t, true);
+    const main = f.git("rev-parse", "--show-toplevel");
+    rmSync(join(main, ".build/speech-fixture.wav"));
+    const wt = linkedWorktree(t, f);
+    let acquisitions = 0;
+    const calls = [], printed = [], output = tempDir(t, "verification-linked-logs-");
+    const options = {
+      getAvailableBytes: () => 2147483648,
+      installPrerequisites: fakeInstall(calls),
+      hostLock: { print: (line) => printed.push(line) },
+      acquireHostLock: () => { acquisitions++; throw new Error("unexpected acquisition"); },
+    };
+    await assert.rejects(preflightRun(mode, { ...f, cwd: wt }, output, options),
+      (error) => error.message === "Missing matrix prerequisites: .build/speech-fixture.wav");
+    assert.equal(acquisitions, 0);
+    assert.deepEqual(printed, []);
+    assert.deepEqual(readdirSync(output), [], "no receipt");
+    assert(!existsSync(join(wt, ".build/speech-fixture.wav")));
+  }
+
+  // runPlan refuses a dirty checkout before this step; the step itself also
+  // leaves a dirty linked worktree alone, so the gate names the missing file.
+  const f = preflightFixture(t, true);
+  const wt = linkedWorktree(t, f);
+  writeFileSync(join(wt, "stray.txt"), "untracked\n");
+  let acquisitions = 0;
+  const calls = [], printed = [];
+  const options = {
+    getAvailableBytes: () => 2147483648,
+    installPrerequisites: fakeInstall(calls),
+    hostLock: { print: (line) => printed.push(line) },
+    acquireHostLock: () => { acquisitions++; throw new Error("unexpected acquisition"); },
+  };
+  await assert.rejects(runPlan(f.plan, wt, tempDir(t, "verification-linked-logs-"), options), /Clean detached worktree required/);
+  matrixRunner.provisionWorktreePrerequisites(f.plan.checks, wt, options);
+  assert.throws(() => matrixRunner.readPrerequisites(f.plan.checks, wt), /Missing prerequisite: node_modules\/\.package-lock\.json/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(printed, []);
+  assert.equal(acquisitions, 0);
+  for (const path of prerequisitePaths) assert(!existsSync(join(wt, path)), path + " not provisioned");
 });
 
 test("preflight CLI missing npm dependencies never joins or disturbs a private holder", async (t) => {

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, rmdirSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
-import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS } from "./verify-matrix.mjs";
+import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS, MATRIX_PREREQUISITES, missingPrerequisites, provisionPrerequisites } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
@@ -265,37 +265,8 @@ export function heldClaimNotice(job, kind, reason, run) {
     subject: journal ? "A release job is skipped because its set-aside journal is held" : "A release job is skipped because the hub refused its claim",
     text: `Release ${job.id} (item ${item || "unknown"}, commit ${commit ? commit.slice(0, 12) : "unknown"}) is verified but not claimed: ${journal ? "the journal of its set-aside claim is held" : "the hub refused the claim"}. Reason: ${why}. Nothing was integrated, published or deployed. The deployer skips this job at every poll and goes on to later jobs; this notice is sent once per job per deployer run to the database handler and to the owner helper. Database handler: reconcile the job (Held claim in docs/project-deployment.md). Owner helper: for information.`};
 }
-// The files verify-matrix.mjs requires before a browser check runs, in its
-// order (a drift test pins the list). All are gitignored, so provisioning
-// them never dirties the deployer's checkout.
-export const MATRIX_PREREQUISITES = ["node_modules/.package-lock.json", "wasm/tailserve.wasm", ".build/test.wasm", ".build/speech-fixture.wav", ".build/go-modules.txt"];
-export const missingPrerequisites = cwd => MATRIX_PREREQUISITES.filter(p => !existsSync(join(cwd, p)));
 const prerequisiteError = names => releaseError("Missing matrix prerequisites: " + names.join(", "));
-// Provisioning (tt deployment setup): npm ci when the install marker is
-// missing, then every other missing file is copied from the source checkout.
-// An existing file is never overwritten.
-export function provisionPrerequisites(cwd, {from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), {cwd: dir, stdio: "ignore", timeout: 900000})} = {}) {
-  let source;
-  try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
-  if (!source || source === realpathSync(cwd)) throw releaseError("Prerequisite source must be another absolute checkout");
-  const [marker] = MATRIX_PREREQUISITES, actions = new Map(), missing = [];
-  if (!existsSync(join(cwd, marker))) {
-    try { run(["npm", "ci"], cwd); } catch { throw releaseError("Prerequisite install failed: npm ci"); }
-    if (existsSync(join(cwd, marker))) actions.set(marker, "installed");
-  }
-  for (const p of MATRIX_PREREQUISITES) {
-    if (actions.has(p)) continue;
-    const target = join(cwd, p);
-    if (existsSync(target)) { actions.set(p, "present"); continue; }
-    if (p === marker || !existsSync(join(source, p))) { missing.push(p); continue; }
-    mkdirSync(dirname(target), {recursive: true});
-    copyFileSync(join(source, p), target, constants.COPYFILE_EXCL);
-    actions.set(p, "copied");
-  }
-  if (missing.length) throw prerequisiteError(missing);
-  if (git(cwd, "status", "--porcelain")) throw releaseError("Prerequisite provisioning changed the checkout");
-  return {version: 1, prerequisites: MATRIX_PREREQUISITES.map(p => ({path: p, sha256: fileDigest(join(cwd, p)), action: actions.get(p)}))};
-}
+export { MATRIX_PREREQUISITES, missingPrerequisites, provisionPrerequisites };
 // The in-release run is bounded like every other holder of the verification
 // host: every check's timeout times its attempts plus the test-binary build
 // allowance (the serial sum, an upper bound under every scheduler rule),

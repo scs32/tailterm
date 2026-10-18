@@ -22,6 +22,13 @@ both rename sides and deletions. `verification/matrix.json` inventories every
 standalone local browser entrypoint; imported helpers are covered by those parents.
 Only the two explicit deployed-site entrypoints are excluded. Unknown paths,
 changed inventory, omitted commands and missing prerequisites refuse execution.
+Before that check, a run or targeted run in a clean linked git worktree first
+provisions any missing prerequisite from the repository's main worktree through
+the step `release-runner.mjs --provision-prerequisites` uses: npm ci when
+`node_modules/.package-lock.json` is missing, otherwise a copy that never
+overwrites. This happens before the host lock and prints each path's action and
+sha256. It refuses when the main worktree lacks a file or the copy dirties the
+checkout. A dirty or non-worktree checkout is not provisioned.
 Six formerly Chromium-only entrypoints accept `TEST_BROWSER=chromium|webkit`.
 The WebKit microphone fixtures return a real oscillator-backed MediaStream;
 application recording and AudioWorklet processing remain real. Their prototype

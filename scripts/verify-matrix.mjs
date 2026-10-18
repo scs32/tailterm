@@ -16,6 +16,8 @@ import {
   readSync,
   renameSync,
   readlinkSync,
+  copyFileSync,
+  constants,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute, dirname, basename } from "node:path";
 import {
@@ -1052,9 +1054,8 @@ export function requireFreeSpace(reserve, getAvailableBytes = availableBytes) {
 const isBrowserCheck = (check) =>
   check.id.includes("browser") || check.environment?.TEST_BROWSER;
 
-// Readability is checked by reading the bytes, not just testing existence.
-// Call again after admission: these hashes must describe the held run's inputs.
-export function readPrerequisites(checks, cwd, read = readFileSync) {
+// The prerequisites a plan's checks need, in MATRIX_PREREQUISITES order.
+function selectedPrerequisites(checks) {
   const browser = checks.some(isBrowserCheck);
   const paths = new Set();
   if (browser || checks.some((check) => check.argv[0] === "npm"))
@@ -1066,7 +1067,13 @@ export function readPrerequisites(checks, cwd, read = readFileSync) {
       ".build/speech-fixture.wav",
       ".build/go-modules.txt",
     ]) paths.add(path);
-  return [...paths].map((path) => {
+  return [...paths];
+}
+
+// Readability is checked by reading the bytes, not just testing existence.
+// Call again after admission: these hashes must describe the held run's inputs.
+export function readPrerequisites(checks, cwd, read = readFileSync) {
+  return selectedPrerequisites(checks).map((path) => {
     let bytes;
     try {
       bytes = read(join(cwd, path));
@@ -1079,6 +1086,70 @@ export function readPrerequisites(checks, cwd, read = readFileSync) {
     }
     return { path, sha256: createHash("sha256").update(bytes).digest("hex") };
   });
+}
+
+// The files verify-matrix.mjs requires before a browser check runs, in its
+// order (a drift test pins the list). All are gitignored, so provisioning
+// them never dirties the deployer's checkout. release-runner.mjs re-exports
+// these three names for tt deployment setup.
+export const MATRIX_PREREQUISITES = ["node_modules/.package-lock.json", "wasm/tailserve.wasm", ".build/test.wasm", ".build/speech-fixture.wav", ".build/go-modules.txt"];
+export const missingPrerequisites = (cwd) => MATRIX_PREREQUISITES.filter((p) => !existsSync(join(cwd, p)));
+// Tagged like release-runner.mjs's releaseError, so its failureReason reads
+// the same reasons.
+const reasonError = (reason) => Object.assign(new Error(reason), { releaseReason: reason });
+const prerequisiteError = (names) => reasonError("Missing matrix prerequisites: " + names.join(", "));
+// Provisioning (tt deployment setup): npm ci when the install marker is
+// missing, then every other missing file is copied from the source checkout.
+// An existing file is never overwritten.
+export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), { cwd: dir, stdio: "ignore", timeout: 900000 }) } = {}) {
+  let source;
+  try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
+  if (!source || source === realpathSync(cwd)) throw reasonError("Prerequisite source must be another absolute checkout");
+  const [marker] = MATRIX_PREREQUISITES, actions = new Map(), missing = [];
+  if (!existsSync(join(cwd, marker))) {
+    try { run(["npm", "ci"], cwd); } catch { throw reasonError("Prerequisite install failed: npm ci"); }
+    if (existsSync(join(cwd, marker))) actions.set(marker, "installed");
+  }
+  for (const p of MATRIX_PREREQUISITES) {
+    if (actions.has(p)) continue;
+    const target = join(cwd, p);
+    if (existsSync(target)) { actions.set(p, "present"); continue; }
+    if (p === marker || !existsSync(join(source, p))) { missing.push(p); continue; }
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(join(source, p), target, constants.COPYFILE_EXCL);
+    actions.set(p, "copied");
+  }
+  if (missing.length) throw prerequisiteError(missing);
+  if (git(cwd, "status", "--porcelain")) throw reasonError("Prerequisite provisioning changed the checkout");
+  return { version: 1, prerequisites: MATRIX_PREREQUISITES.map((p) => ({ path: p, sha256: createHash("sha256").update(readFileSync(join(cwd, p))).digest("hex"), action: actions.get(p) })) };
+}
+
+// A run in a clean linked worktree first provisions any missing prerequisite
+// from the repository's main worktree, before admission, so it holds no host
+// slot. Any other checkout is left as it is and readPrerequisites refuses as
+// before. options.installPrerequisites replaces npm ci in tests.
+export function provisionWorktreePrerequisites(checks, cwd, options = {}) {
+  if (!selectedPrerequisites(checks).some((path) => !existsSync(join(cwd, path)))) return;
+  const [gitDir, commonDir] = git(cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n");
+  if (gitDir === commonDir) return;
+  const main = git(cwd, "worktree", "list", "--porcelain").split("\n\n")[0].split("\n");
+  if (!main[0].startsWith("worktree ") || main.includes("bare")) return;
+  const from = main[0].slice("worktree ".length);
+  if (from === realpathSync(cwd)) return;
+  if (git(cwd, "status", "--porcelain", "--untracked-files=normal")) return;
+  let provisioned;
+  try {
+    provisioned = provisionPrerequisites(cwd, {
+      from,
+      ...(options.installPrerequisites ? { run: options.installPrerequisites } : {}),
+    });
+  } catch (error) {
+    throw new Error(error.message);
+  }
+  const print = options.hostLock?.print ?? console.log;
+  print("matrix run: provisioned prerequisites from " + from);
+  for (const entry of provisioned.prerequisites)
+    print(`matrix run: prerequisite ${entry.path} ${entry.action} ${entry.sha256}`);
 }
 
 // Go makes module-cache directories read-only. Only walk the exact home this
@@ -2543,6 +2614,7 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   mkdirSync(output, { recursive: true });
   const { minFreeBytes = DEFAULT_MIN_FREE_BYTES } = options;
   requireFreeSpace(minFreeBytes, options.getAvailableBytes);
+  provisionWorktreePrerequisites(plan.checks, cwd, options);
   readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   const hostLock = options.hostLock || {};
   const lease = await (options.acquireHostLock || acquireHostLock)({
