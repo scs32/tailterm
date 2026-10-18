@@ -2883,3 +2883,114 @@ func TestTeamRunnerCloseoutListingShape(t *testing.T) {
 		t.Fatalf("default view %+v: want the finished entry as a history summary", recent)
 	}
 }
+
+// wi_014682840daf2d94: a queued entry whose item was amended after it was
+// queued waits for tt team queue rebind. The runner leaves it queued, sends
+// no claim for it and, in a serial project as in a parallel one, claims the
+// next entry in the same tick.
+func TestTeamRunnerPassesHeadAwaitingRebind(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		name := "serial"
+		if parallel {
+			name = "parallel"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			add := func(id string, item api.WorkItem, order int64, owns string) api.TeamQueueEntry {
+				t.Helper()
+				req := api.TeamQueueRequest{RequestID: "rebind-add-" + id, Operation: "add", ItemID: item.ID, OrderMessageSeq: order, Host: "fixture", Cwd: t.TempDir()}
+				if parallel {
+					req.Repository, req.BaseCommit, req.Ownership = "fixture-repo", strings.Repeat("a", 40), []string{owns}
+				}
+				q, err := f.c.TeamQueueAction(ctx, f.task.ID, req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return q
+			}
+			if parallel {
+				domain, err := canonicalLimiterDomain(f.c.Base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rebind-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: domain, HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rebind-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rebind-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The head is a second item, amended once queued; the fixture's
+			// own item, which the runner's plan launches, is queued behind it.
+			amended, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "amended", RequestID: "rebind-amended"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "amended bounded order", RequestID: "rebind-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: amended.ID, ItemRevision: amended.Revision, Relationship: "primary"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.confirmOrder(t, amended, order.Seq)
+			head := add("head", amended, order.Seq, "src/amended")
+			later := add("later", f.item, f.order, "src/later")
+			desc := "amended after it was queued"
+			bumped, err := f.st.UpdateWorkItem(ctx, f.task.ID, amended.ID, api.UpdateWorkItemRequest{Revision: amended.Revision, Description: &desc}, api.Caller{Node: "fixture", User: "owner"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bumped.Revision <= head.ItemRevision {
+				t.Fatalf("the amendment left the item at revision %d, entry at %d", bumped.Revision, head.ItemRevision)
+			}
+			list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+			if err != nil || len(list.Entries) != 2 || list.Entries[0].ID != head.ID || list.Entries[1].ID != later.ID || queueParallel(list.ConcurrencyLimit) != parallel {
+				t.Fatalf("active listing %+v limit %d %v", list.Entries, list.ConcurrencyLimit, err)
+			}
+
+			log := &requestLog{}
+			counted := *f.c
+			transport := *f.c.HTTP
+			transport.Transport = log
+			counted.HTTP = &transport
+			spawns := 0
+			r := queueCorrectionRunner(t, f, 1)
+			r.census = func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
+				return nil
+			}
+			spawn := r.spawn
+			r.spawn = func(e env, args []string) error {
+				spawns++
+				return spawn(e, args)
+			}
+			if err := r.tick(ctx, f.e, &counted, "fixture"); err != nil {
+				t.Fatalf("tick = %v; an entry awaiting a rebind is not a failure", err)
+			}
+			claims := 0
+			for _, line := range log.take() {
+				if strings.Contains(line, `"queue-claim-`+head.ID+`"`) {
+					t.Fatalf("the tick sent a claim for the entry awaiting a rebind: %s", line)
+				}
+				if strings.Contains(line, `"queue-claim-`+later.ID+`"`) {
+					claims++
+				}
+			}
+			gotHead, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, head.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotHead.State != "queued" || gotHead.EscalationSeq != 0 || gotHead.ItemRevision != head.ItemRevision {
+				t.Fatalf("the entry awaiting a rebind is %s (escalation %d, item revision %d); want it left queued at %d", gotHead.State, gotHead.EscalationSeq, gotHead.ItemRevision, head.ItemRevision)
+			}
+			gotLater, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, later.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claims != 1 || spawns != 1 || gotLater.State != "running" {
+				t.Fatalf("one tick: %d claims of the next entry, %d spawns, next %s; want it claimed and running past the entry awaiting a rebind", claims, spawns, gotLater.State)
+			}
+		})
+	}
+}
