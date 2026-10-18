@@ -3307,20 +3307,29 @@ dialog .primary:hover {
   font: 12px/1.5 var(--terminal-font);
   box-shadow: none;
 }
-/* The Board composer and its Send button fill the bottom of the viewport, so
-   a failed post's notice shows at the top instead of covering the retry. */
+/* The Board composer and its Send button fill the bottom of the viewport and
+   the header holds the mode tabs, so a failed post's notice sits just above
+   the composer, over the message list, clear of both. */
+#mode-view #board-compose {
+  anchor-name: --board-compose;
+}
 body[data-mode="board"] #notice {
-  top: 24px;
-  bottom: auto;
+  position-anchor: --board-compose;
+  position-visibility: always;
+  bottom: calc(anchor(top, 16px) + 8px);
+}
+/* Without anchor positioning, keep the retry reachable from the top. */
+@supports not (anchor-name: --board-compose) {
+  body[data-mode="board"] #notice {
+    top: 24px;
+    bottom: auto;
+  }
 }
 @media (max-width: 640px) {
-  #notice {
+  body[data-mode="board"] #notice {
     right: 16px;
     left: 16px;
     max-width: none;
-  }
-  body[data-mode="board"] #notice {
-    top: 16px;
   }
 }
 #vault-reset-error,

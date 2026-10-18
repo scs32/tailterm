@@ -143,9 +143,11 @@ async function selectAuditKind(page, value) {
 
 const html = `<!doctype html><html><head><meta charset="utf-8">
 <link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"><style>#notice:empty{display:none}</style></head><body data-mode="board"><div id="workspace"><aside></aside>
-<main><header></header><div id="mode-view"></div></main></div><p id="notice" role="status"></p>
+<main><header><div class="header-right"><button id="tailscale-login"><span class="status-dot" id="tail-dot" aria-hidden="true"></span><span id="tail-status">Connect Tailscale ↗</span></button><button id="fullscreen" title="Fullscreen">⛶</button></div></header></main></div><div id="notice" role="status"></div>
 <script type="module">
 import {createBoardView} from '/client/board-view.js';
+import {setupModes} from '/client/modes.js';
+import {setupTerminalView} from '/client/terminal-view.js';
 import {createWorkItemsView} from '/client/work-items-view.js';
 import {createHubClient} from '/client/hub-client.js';
 const task=new URLSearchParams(location.search).get('task');
@@ -165,7 +167,13 @@ const intentPersistence={
 let boardClient={...client,listWorkItems:()=>{throw new Error('saved item list must not supply eligibility')},getWorkItem:()=>{throw new Error('saved item revision must not supply validation')}};
 const board=createBoardView({client:()=>boardClient,getTabs:()=>[],activate:noop,notice,addAgent:noop,
   settings:noop,revealAgent:noop,attachTask:noop,newTask:noop,configure:noop,intentPersistence});
-board.mount(document.querySelector('#mode-view'));
+// The app's real header: mode tabs from setupModes and the right-hand controls
+// main.js and setupTerminalView put there, so notice placement is checked
+// against them.
+const modes=setupModes({header:document.querySelector('header'),main:document.querySelector('main')});
+setupTerminalView();
+modes.set('board',{silent:true});
+board.mount(modes.view);
 await board.show(task);
 const itemsRoot=document.querySelector('#mode-view');
 let itemView;
@@ -398,22 +406,54 @@ try {
         return page.locator("#notice").textContent();
       }
       // Right after a failed post the retry must stay reachable: the element
-      // at Send's centre is Send, at desktop width and at 390 px.
+      // at Send's centre is Send, and the notice covers no header control
+      // (mode tabs, right-hand buttons) or composer control, at desktop width
+      // and at 390 px.
       async function sendUncovered(label) {
         const size = page.viewportSize();
         for (const width of [1100, 390]) {
           await page.setViewportSize({ width, height: size.height });
-          const hit = await send.evaluate((button) => {
-            const box = button.getBoundingClientRect();
-            const top = document.elementFromPoint(
-              box.left + box.width / 2,
-              box.top + box.height / 2,
-            );
-            return top === button || button.contains(top)
-              ? "send"
-              : top?.id || top?.tagName || "nothing";
+          const found = await send.evaluate((button) => {
+            const notice = document.querySelector("#notice");
+            const n = notice.getBoundingClientRect();
+            const centre = (node) => {
+              const box = node.getBoundingClientRect();
+              const top = document.elementFromPoint(
+                box.left + box.width / 2,
+                box.top + box.height / 2,
+              );
+              return top === node || node.contains(top)
+                ? "self"
+                : top?.id || top?.tagName || "nothing";
+            };
+            const controls = [
+              ...document.querySelectorAll(
+                "main > header :is(button, select, input), #board-compose :is(button, select, input, textarea)",
+              ),
+            ].filter((node) => node.getClientRects().length);
+            return {
+              shown:
+                getComputedStyle(notice).display !== "none" && n.height > 0,
+              send: centre(button),
+              covered: controls
+                .filter((node) => {
+                  const box = node.getBoundingClientRect();
+                  return (
+                    box.left < n.right &&
+                    n.left < box.right &&
+                    box.top < n.bottom &&
+                    n.top < box.bottom
+                  );
+                })
+                .map((node) => node.id || node.textContent.trim()),
+              checked: controls.length,
+            };
           });
-          assert.equal(hit, "send", `${name} ${label} at ${width} px`);
+          const where = `${name} ${label} at ${width} px`;
+          assert.ok(found.shown, where + ": notice is showing");
+          assert.ok(found.checked > 10, where + ": header and composer found");
+          assert.equal(found.send, "self", where + ": hit at Send's centre");
+          assert.deepEqual(found.covered, [], where + ": controls covered");
         }
         await page.setViewportSize(size);
       }
@@ -967,6 +1007,18 @@ try {
       assert.equal(attempts.length, workBefore);
       assert.match(await freshNotice(), /exact order/);
       await sendUncovered("work without order");
+      // The tallest composer: a reply row and the textarea at its 200 px cap.
+      await page.locator("[data-reply]").first().click();
+      await page.locator("#board-cancel-reply").waitFor();
+      await input.evaluate((el) => (el.style.height = "400px"));
+      assert.equal(
+        await input.evaluate((el) => el.getBoundingClientRect().height),
+        200,
+      );
+      await sendUncovered("work without order, reply and tall text");
+      await input.evaluate((el) => (el.style.height = ""));
+      await page.locator("#board-cancel-reply").click();
+      await page.locator("#board-cancel-reply").waitFor({ state: "detached" });
       await page.evaluate((id) => qa.board.show(id), fixture.task.id);
       await page.locator("#board-message-item-mode").click();
       await choose(active);
