@@ -163,6 +163,35 @@ func TestInboxDistinguishesHumanFromAgentNamedOwner(t *testing.T) {
 	}
 }
 
+// Agentless senders read as Discord names them; only a person's message
+// carries the shared-board reply hint.
+func TestInboxNamesAgentlessSendersAsDiscordDoes(t *testing.T) {
+	const hint = "Reply on the shared board: tt post --reply-to 7"
+	for _, c := range []struct {
+		from   api.Sender
+		label  string
+		person bool
+	}{
+		{api.Sender{Node: api.BrokerNode, User: "broker"}, "broker", false},
+		{api.Sender{Node: "system", User: "schedule-monitor"}, "schedule-monitor", false},
+		{api.Sender{Node: "system", User: "queue"}, "queue", false},
+		{api.Sender{Node: api.BridgeNode, User: "owner"}, "owner (Discord)", true},
+		{api.Sender{Node: relayNode, User: server.RelayUser}, "relay", false},
+		{api.Sender{Node: "workspace", User: "owner"}, "owner (human)", true},
+	} {
+		line := formatMessage(api.Message{Seq: 7, From: c.from, Text: "text"}, nil)
+		if !strings.HasPrefix(line, fmt.Sprintf("#7 %s %s: text", time.Time{}.Local().Format("15:04"), c.label)) {
+			t.Errorf("%+v: line = %q, want sender %q", c.from, line, c.label)
+		}
+		if strings.Contains(line, hint) != c.person {
+			t.Errorf("%+v: reply hint present = %v, want %v: %q", c.from, !c.person, c.person, line)
+		}
+		if !c.person && strings.Contains(line, "(human)") {
+			t.Errorf("%+v: a non-person line says (human): %q", c.from, line)
+		}
+	}
+}
+
 // A notice the relay posts under its request budget reads as the relay, not
 // as a human the reader should answer on the board.
 func TestInboxNamesRelayNoticeAsRelay(t *testing.T) {

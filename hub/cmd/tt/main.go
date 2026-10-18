@@ -875,15 +875,26 @@ func readCursor(ctx context.Context, c *api.Client, task, agent string) (int64, 
 // under it, in place of the owner whose token the relay uses.
 const relayNode = "host-relay"
 
+// formatMessage names senders as the Discord bridge's roster.sender does.
+// Only a person's message (agentless, or the owner on Discord) gets the
+// shared-board reply hint; broker, relay and hub-service notices need none.
 func formatMessage(m api.Message, names map[string]string) string {
-	from := "human"
-	relay := m.From.AgentID == "" && m.From.Node == relayNode
-	if m.From.AgentID != "" {
+	from, person := "human", false
+	switch {
+	case m.From.Node == api.BrokerNode:
+		from = "broker"
+	case m.From.AgentID != "":
 		from = or(names[m.From.AgentID], m.From.AgentID)
-	} else if relay {
+	case m.From.Node == api.BridgeNode:
+		from, person = "owner (Discord)", true
+	case m.From.Node == relayNode:
 		from = "relay"
-	} else if m.From.User != "" {
-		from = m.From.User + " (human)"
+	case m.From.Node == "system" && m.From.User != "":
+		from = m.From.User // hub services such as schedule-monitor or queue
+	case m.From.User != "":
+		from, person = m.From.User+" (human)", true
+	default:
+		person = true
 	}
 	to := ""
 	if m.To != "" {
@@ -893,7 +904,7 @@ func formatMessage(m api.Message, names map[string]string) string {
 		to += " [swarm: everyone]"
 	}
 	line := fmt.Sprintf("#%d %s %s%s: %s", m.Seq, m.CreatedAt.Local().Format("15:04"), from, to, m.Text)
-	if m.From.AgentID == "" && !relay {
+	if person {
 		line += fmt.Sprintf("\n  Reply on the shared board: tt post --reply-to %d \"your reply\" (omit --to; sender is human).", m.Seq)
 	}
 	return line
