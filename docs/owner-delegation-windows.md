@@ -75,7 +75,10 @@ owner.
 **The owner's own session as delegate.** Register it as the project's owner helper
 (`tt helper register --task T`, see [owner helper](owner-helper.md)) and open a window
 with `--delegate owner-helper`. It answers through `eval "$(tt helper env --task T)"`
-followed by the commands below; matrix approvals still stay with the owner.
+followed by the commands below; matrix approvals still stay with the owner. The window
+names that exact helper agent. After a pause or a close, registering again creates a
+new helper that the old window does not reach: end the old window and open a new one
+(see [owner helper](owner-helper.md#opening-a-window-for-the-helper)).
 
 ## Answering as the delegate
 

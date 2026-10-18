@@ -68,7 +68,9 @@ It checks, before writing anything:
 - the tmux session is not already another project's live owner helper (see
   [One project per tmux session](#one-project-per-tmux-session));
 - the project is active: registration is refused (409) while the project is paused,
-  cleaning up for a pause or resuming. Register again after resume.
+  cleaning up for a pause or resuming. Register again after resume. A pause closes
+  the helper, so that registration creates a fresh one: open a new delegation window
+  naming it (see [Opening a window for the helper](#opening-a-window-for-the-helper)).
 
 The hub (`POST /v1/tasks/{id}/owner-helper`, owner only) then, in one transaction:
 
@@ -218,6 +220,18 @@ eval "$(tt helper env --task tsk_...)" && tt ask answer SEQ --option ID --ration
 The window follows the agent, not the run: re-registering keeps the window and the
 inbox, and the replaced run is refused (403) like any stale run.
 
+**After a close, open a new window.** Closing the helper is different. A pause or an
+owner close (`tt close owner-helper` or TailOS) closes it, and the next
+`tt helper register` creates a fresh helper with a new agent ID. A window names the
+agent it was opened for and a closed delegate is skipped, so the old window routes
+nothing more and nothing reaches the new helper. Closing the helper does not end the
+window. After registering again, end the old window if it is still open
+(`tt owner delegation list`, then `tt owner delegation close dlw_...`, TailOS _End now_
+or Discord `/delegate-end`), which returns its unanswered requests to the owner, then
+open a new one with `--delegate owner-helper`. Opening it routes every covered request
+still waiting on the owner to the new helper. While the old window is open and before
+its end, `open` is refused (409, _already open ... close it first_).
+
 **Matrix approvals stay with the owner.** Any request mentioning
 `verification-matrix-approval:` is never routed to the helper, and a helper answer
 or rationale containing the token is refused. A delegated answer is agent-authored,
@@ -354,7 +368,8 @@ not make it.
 - A project pause includes the helper as a pause target with a service disposition,
   like every open agent. It owes no host cleanup (`cleanup_done=1`), so it never
   holds a pause in cleanup. Pause closes it; register again after resume, which
-  creates a fresh helper.
+  creates a fresh helper, and open a new delegation window naming it (see
+  [Opening a window for the helper](#opening-a-window-for-the-helper)).
 - Closing it (`tt close owner-helper` or TailOS) stops nothing on the host.
 - Routing to the helper still depends on the requester's declared category, exactly
   as for any delegate.
