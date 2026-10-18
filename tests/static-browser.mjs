@@ -435,6 +435,94 @@ async function clickAcrossLauncherRedraw(page, control) {
   await page.mouse.up();
   return checks;
 }
+// At 800 px and the 720 px narrow breakpoint the footer fits inside the
+// terminal shell, and a reconnect never scrolls the shell sideways.
+async function exerciseFooterFit(page) {
+  const fit = () =>
+    page.evaluate(() => {
+      const shell = document.querySelector(".terminal-shell");
+      const footer = shell
+        .querySelector(".terminal-footer")
+        .getBoundingClientRect();
+      const dims = document.querySelector("#dimensions");
+      const readout = dims.getBoundingClientRect();
+      return {
+        scrollWidth: shell.scrollWidth,
+        clientWidth: shell.clientWidth,
+        scrollLeft: shell.scrollLeft,
+        dimensionsInside:
+          getComputedStyle(dims).display === "none" ||
+          (readout.left >= footer.left - 0.5 &&
+            readout.right <= footer.right + 0.5),
+      };
+    });
+  const measured = [];
+  for (const width of [800, 720]) {
+    await page.setViewportSize({ width, height: 1100 });
+    await page.waitForFunction(
+      (w) =>
+        innerWidth === w &&
+        document.querySelector("#dimensions").textContent !== "— × —",
+      width,
+    );
+    const before = await fit();
+    // Record every sideways scroll of the shell while the reconnect runs.
+    await page.evaluate(() => {
+      const shell = document.querySelector(".terminal-shell");
+      globalThis.__shellScrolls = [];
+      globalThis.__recordShellScroll = () =>
+        globalThis.__shellScrolls.push(shell.scrollLeft);
+      shell.addEventListener("scroll", globalThis.__recordShellScroll);
+    });
+    await page.locator("#reconnect").click();
+    await page.waitForFunction(() =>
+      document
+        .querySelector("#terminal-status")
+        .textContent.includes("Connected"),
+    );
+    await page.waitForTimeout(200);
+    const after = await fit();
+    const scrolls = await page.evaluate(() => {
+      document
+        .querySelector(".terminal-shell")
+        .removeEventListener("scroll", globalThis.__recordShellScroll);
+      return globalThis.__shellScrolls;
+    });
+    console.log(
+      `Footer at ${width} px: ${JSON.stringify({ before, after, scrolls })}`,
+    );
+    measured.push({ width, before, after, scrolls });
+  }
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  for (const { width, before, after, scrolls } of measured) {
+    for (const state of [before, after]) {
+      assert.equal(
+        state.scrollWidth,
+        state.clientWidth,
+        `The terminal shell does not overflow at ${width} px`,
+      );
+      assert.ok(
+        state.dimensionsInside,
+        `The dimensions readout stays inside the footer at ${width} px`,
+      );
+    }
+    assert.equal(
+      before.scrollLeft,
+      0,
+      `The shell is not scrolled at ${width} px`,
+    );
+    assert.equal(
+      after.scrollLeft,
+      0,
+      `A reconnect does not scroll the shell at ${width} px`,
+    );
+    assert.deepEqual(
+      scrolls.filter((left) => left !== 0),
+      [],
+      `The shell never scrolls sideways during a reconnect at ${width} px`,
+    );
+  }
+}
 const launcherCards = (page) =>
   page.evaluate(() =>
     [...document.querySelectorAll("[data-launch-server]")].map((n) => ({
@@ -716,6 +804,7 @@ try {
     await last.hover();
     await last.locator("[data-close]").click();
   }
+  await exerciseFooterFit(page);
   // Themes/fonts/cursor affect existing terminals and persist on reload.
   await page.locator("#appearance").click();
   await page.locator("[data-theme-choice=tokyo]").click();

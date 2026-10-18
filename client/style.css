@@ -1602,8 +1602,11 @@ dialog:modal {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
 }
+/* Capped at the footer's width so the controls wrap instead of overflowing
+   the terminal shell, which a reconnect would then scroll sideways. */
 .terminal-footer > div {
   flex-wrap: wrap;
+  max-width: 100%;
 }
 #tabs .tab {
   position: relative;
