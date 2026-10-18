@@ -1413,9 +1413,10 @@ func (h *noticeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(api.ObligationList{})
 	case strings.HasSuffix(r.URL.Path, "/messages"):
 		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		var page []api.Message
 		for _, m := range h.messages {
-			if m.Seq > after {
+			if m.Seq > after && (limit <= 0 || len(page) < limit) {
 				page = append(page, m)
 			}
 		}
@@ -2022,6 +2023,122 @@ func TestRelayDeployerNoticeFailedReadSpacedAndLoggedOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A notice held by a lasting read failure behind a full page of the agent's
+// own posts does not hide a later directed, broadcast or person's message: the
+// first pass wakes for it, and over two minutes of 3-second passes the failing
+// read is made once, as its 30-second spacing allows with the wake ending the
+// hold (wi_b436f1129d2bb8cb).
+func TestRelayDeployerNoticeHeldFullPageKeepsLaterWakes(t *testing.T) {
+	owner := api.Sender{Node: "workspace", User: "owner"}
+	others := []struct {
+		name    string
+		message func(agent string) api.Message
+	}{
+		{"directed", func(agent string) api.Message {
+			return api.Message{Seq: 232, To: agent, From: owner, Text: "please look at the release"}
+		}},
+		{"broadcast", func(string) api.Message {
+			return api.Message{Seq: 232, Broadcast: true, From: api.Sender{AgentID: noticeWorker, Node: "workspace", User: "owner"}, Text: "to everyone"}
+		}},
+		{"human", func(string) api.Message {
+			return api.Message{Seq: 232, From: owner, Text: "a note from the owner"}
+		}},
+	}
+	failures := []struct {
+		name   string
+		read   string
+		status int
+		agents []string
+	}{
+		{"author-403", noticeDeployer, http.StatusForbidden, noticeRecipients},
+		{"tasks-503", "tasks", http.StatusServiceUnavailable, []string{noticeHandler}},
+	}
+	for _, f := range failures {
+		for _, agent := range f.agents {
+			for _, other := range others {
+				t.Run(f.name+"-"+agent+"-"+other.name, func(t *testing.T) {
+					h, c, binding := newNoticeHub(t)
+					h.messages = append(heldNoticePage(agent, 31, 231), other.message(agent))
+					h.fail[f.read] = f.status
+					p := relayProgress{}
+					var prompts []string
+					queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+						prompts = append(prompts, prompt)
+						return nil
+					}
+					start := time.Now()
+					for at := 0; at < 120; at += 3 {
+						if err := relayOne(context.Background(), binding(agent), &p, c, start.Add(time.Duration(at)*time.Second), queue); err != nil {
+							t.Fatalf("pass at %ds: %v", at, err)
+						}
+						if len(prompts) != 1 || p.Through != 232 || !strings.Contains(prompts[0], "through message #232") {
+							t.Fatalf("pass at %ds: prompts=%q progress=%+v", at, prompts, p)
+						}
+					}
+					if n := h.reads(f.read, false); n != 1 {
+						t.Fatalf("the failing read was made %d times in two minutes", n)
+					}
+				})
+			}
+		}
+	}
+}
+
+// With nothing to wake for past a full held page, each pass looks one page
+// further and the notice stays held, its failing read spaced as before; a
+// message posted later still wakes, and once the read recovers the notice
+// itself is decided and wakes (wi_b436f1129d2bb8cb).
+func TestRelayDeployerNoticeHeldFullPageDecidedOnRecovery(t *testing.T) {
+	h, c, binding := newNoticeHub(t)
+	h.messages = heldNoticePage(noticeHandler, 31, 481)
+	h.fail[noticeDeployer] = http.StatusForbidden
+	p := relayProgress{}
+	wakes := 0
+	queue := func(context.Context, runtimeBinding, string) error { wakes++; return nil }
+	start := time.Now()
+	pass := func(p *relayProgress, at int) error {
+		return relayOne(context.Background(), binding(noticeHandler), p, c, start.Add(time.Duration(at)*time.Second), queue)
+	}
+	for at := 0; at < 30; at += 3 {
+		if err := pass(&p, at); err == nil || wakes != 0 || p.Through != 0 {
+			t.Fatalf("pass at %ds: err=%v wakes=%d progress=%+v", at, err, wakes, p)
+		}
+	}
+	if n := h.reads(noticeDeployer, false); n != 1 {
+		t.Fatalf("the failing read was made %d times in 30 seconds", n)
+	}
+	if p.HeldPast != 481 || p.Skip == nil || fmt.Sprint(p.Skip.MessageSeqs) != "[31]" {
+		t.Fatalf("the held page was not looked past to the end: progress=%+v skip=%+v", p, p.Skip)
+	}
+	// A message posted after the look reached the end still wakes.
+	later := p
+	h.mu.Lock()
+	h.messages = append(h.messages, api.Message{Seq: 482, To: noticeHandler, From: api.Sender{Node: "workspace", User: "owner"}, Text: "please look"})
+	h.mu.Unlock()
+	if err := pass(&later, 30); err != nil || wakes != 1 || later.Through != 482 {
+		t.Fatalf("later message: err=%v wakes=%d progress=%+v", err, wakes, later)
+	}
+	h.mu.Lock()
+	h.messages = h.messages[:len(h.messages)-1]
+	delete(h.fail, noticeDeployer)
+	h.mu.Unlock()
+	// Without it, the first pass after the read recovers wakes for the notice.
+	wakes = 0
+	if err := pass(&p, 61); err != nil || wakes != 1 || p.Through != 230 || p.HeldPast != 0 {
+		t.Fatalf("recovered read: err=%v wakes=%d progress=%+v", err, wakes, p)
+	}
+}
+
+// heldNoticePage is a deployer notice at seq followed by the agent's own
+// posts through last, which never wake it.
+func heldNoticePage(agent string, seq, last int64) []api.Message {
+	page := []api.Message{deployerNotice(seq, noticeDeployer)}
+	for s := seq + 1; s <= last; s++ {
+		page = append(page, api.Message{Seq: s, From: api.Sender{AgentID: agent, Node: "workspace", User: "owner"}, Text: "own post"})
+	}
+	return page
 }
 
 // A failing task list read is made once per 30 seconds for all of a project's

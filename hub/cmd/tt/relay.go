@@ -70,6 +70,12 @@ type relayProgress struct {
 	// hold: the hold ends only by an owner decision, so asking again every
 	// 15 seconds would only load the hub.
 	NextHeldAttempt time.Time `json:"nextHeldAttempt,omitempty"`
+	// HeldPast is how far past a full page held below an undecided deployer
+	// notice the relay has looked without finding a wake, and HeldFrom the
+	// cursor that page was listed from. It is used only while the page still
+	// starts there, so each pass lists one page past it, not the same one.
+	HeldFrom int64 `json:"heldFrom,omitempty"`
+	HeldPast int64 `json:"heldPast,omitempty"`
 	// Skip is host-local diagnostics for tt relay --status and the relay log.
 	// It never flows into Wake, the activity snapshot or any hub write.
 	Skip *relaySkip `json:"lastSkip,omitempty"`
@@ -1000,6 +1006,8 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 			// message and advanced Through. Revisit it after the busy skip;
 			// the agent-owned ReadUpTo cursor is never changed here.
 			p.Through = min(p.Through, max(0, job.MessageSeq-1))
+			// It may also lie past a held page's scan; look there again.
+			p.HeldPast = 0
 			p.LastAttempt = now // inbox retry keeps the normal 15-second spacing
 		}
 	}
@@ -1030,6 +1038,32 @@ func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
 		return fmt.Errorf("Codex did not confirm a queued message: %.500s", out)
 	}
 	return nil
+}
+
+// relayPageLimit is how many inbox messages one relay read lists.
+const relayPageLimit = 200
+
+// relayInboxEligible drops the page's messages that broker wake jobs deliver
+// to this binding, leaving those the inbox path may wake for.
+func relayInboxEligible(ctx context.Context, c *api.Client, b runtimeBinding, p *relayProgress, msgs []api.Message) ([]api.Message, error) {
+	if !p.BrokerWakes || p.ClaudePendingInbox {
+		return msgs, nil
+	}
+	// Only typed kinds that create an obligation for this agent are woken
+	// by broker wake jobs; replies, free text, decision answers, lead
+	// notices and dispatches still wake through the inbox.
+	obliged, err := obligedSeqs(ctx, c, b, msgs)
+	if err != nil {
+		return nil, err
+	}
+	var eligible []api.Message
+	for _, m := range msgs {
+		covered := m.To == b.Agent && (obliged[m.Seq] || (m.Envelope != nil && brokerCoveredKind[m.Envelope.Kind]))
+		if !covered {
+			eligible = append(eligible, m)
+		}
+	}
+	return eligible, nil
 }
 
 // Testable without model calls. The hub's read cursor remains agent-owned.
@@ -1078,38 +1112,54 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		recordRelaySkip(p, b.Agent, err.Error(), nil, a.ReadUpTo, a.Unread, now)
 		return err
 	}
-	msgs, err := c.ListMessages(ctx, b.Task, max(a.ReadUpTo, p.Through), b.Agent, 200)
+	from := max(a.ReadUpTo, p.Through)
+	msgs, err := c.ListMessages(ctx, b.Task, from, b.Agent, relayPageLimit)
 	if err != nil {
 		return err
 	}
 	// Progress covers the whole page, even messages the broker wakes for.
 	through, _ := wakeThrough(msgs, b.Agent)
-	eligibleMsgs := msgs
-	if p.BrokerWakes && !p.ClaudePendingInbox {
-		// Only typed kinds that create an obligation for this agent are woken
-		// by broker wake jobs; replies, free text, decision answers, lead
-		// notices and dispatches still wake through the inbox.
-		obliged, err := obligedSeqs(ctx, c, b, msgs)
-		if err != nil {
-			return err
-		}
-		eligibleMsgs = nil
-		for _, m := range msgs {
-			covered := m.To == b.Agent && (obliged[m.Seq] || (m.Envelope != nil && brokerCoveredKind[m.Envelope.Kind]))
-			if !covered {
-				eligibleMsgs = append(eligibleMsgs, m)
-			}
-		}
+	eligibleMsgs, err := relayInboxEligible(ctx, c, b, p, msgs)
+	if err != nil {
+		return err
 	}
 	// A failed deployer read never holds the page's other wakes. With nothing
 	// else to wake for, the page is held below the undecided notice, so the
 	// next pass decides it once the cached failure expires.
 	deployers, deployerErr := deployerNoticeAuthors(ctx, c, b, a, eligibleMsgs, now)
 	_, eligible := wakeThroughFor(eligibleMsgs, b.Agent, deployers)
+	if !eligible && deployerErr != nil && len(msgs) >= relayPageLimit {
+		// A full held page would hide every later message, so each pass also
+		// lists the next page past what it has looked at. A wake for a later
+		// message delivers the held notice with the rest of the inbox, as a
+		// wake beside it on its own page does; with none, the notice stays
+		// held and is decided once the read recovers (wi_b436f1129d2bb8cb).
+		if p.HeldFrom != from {
+			p.HeldFrom, p.HeldPast = from, 0
+		}
+		later, err := c.ListMessages(ctx, b.Task, max(through, p.HeldPast), b.Agent, relayPageLimit)
+		if err != nil {
+			return err
+		}
+		laterEligible, err := relayInboxEligible(ctx, c, b, p, later)
+		if err != nil {
+			return err
+		}
+		// The read just failed, so a later page's deployer notices stay
+		// undecided too; they are delivered with a wake, held without one.
+		laterThrough, _ := wakeThrough(later, b.Agent)
+		if _, wake := wakeThrough(laterEligible, b.Agent); wake {
+			eligibleMsgs = append(eligibleMsgs, laterEligible...)
+			through, eligible = max(through, laterThrough), true
+		} else {
+			p.HeldPast = max(p.HeldPast, laterThrough)
+		}
+	}
 	if !eligible && deployerErr != nil {
 		recordRelaySkip(p, b.Agent, "deployer notice check failed: "+deployerErr.Error(), deployerNoticeSeqs(eligibleMsgs, b.Agent), 0, 0, now)
 		return deployerErr
 	}
+	p.HeldFrom, p.HeldPast = 0, 0
 	if !eligible {
 		// Nothing is held back here. The page holds input already delivered,
 		// messages that broker wake jobs deliver, or messages that never wake
