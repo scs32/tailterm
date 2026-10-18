@@ -1685,20 +1685,42 @@ func TestToolScopeNoHubNoProcess(t *testing.T) {
 			defer conn.Close() // accepted and never answered
 		}
 	}()
-	e, root := toolLedgerSandbox(t)
-	e.hub = "http://" + ln.Addr().String()
-	repo := scopeRepo(t)
-	toolScopeRemember(e, []api.Message{scopeAssign(e, 5, "owned.go", "web/*.css")})
-	for i, file := range []string{"outside.go", "owned.go", "web/site.css", "../elsewhere.go"} {
-		call := scopePre("Edit", fmt.Sprintf("u%d", i), repo, filepath.Join(repo, file))
-		for _, event := range []string{"PreToolUse", "PostToolUse"} {
-			if r := runToolHook(t, e, "tool", toolPayload(event, call), nil); r.err != nil || r.out != "" || r.elapsed >= toolLedgerBound {
-				t.Fatalf("%s %s = %v, output %q, in %v", event, file, r.err, r.out, r.elapsed)
+	// Every attempt must return nil and silent and leave its rows. A call
+	// over the 200 ms bound on a loaded host is a timing miss, not a hub
+	// wait: the connection count shows that. Such an attempt is run again in
+	// a new sandbox, at most three times, as TestToolScopeBeforeAssignNoHub
+	// does; a stalled host is usually still stalled a moment later, so a retry
+	// waits first: one bound, then two.
+	var slow string
+	for attempt := 0; attempt < 3; attempt++ {
+		time.Sleep(time.Duration(attempt) * toolLedgerBound)
+		e, root := toolLedgerSandbox(t)
+		e.hub = "http://" + ln.Addr().String()
+		repo := scopeRepo(t)
+		toolScopeRemember(e, []api.Message{scopeAssign(e, 5, "owned.go", "web/*.css")})
+		slow = ""
+		for i, file := range []string{"outside.go", "owned.go", "web/site.css", "../elsewhere.go"} {
+			call := scopePre("Edit", fmt.Sprintf("u%d", i), repo, filepath.Join(repo, file))
+			for _, event := range []string{"PreToolUse", "PostToolUse"} {
+				r := runToolHook(t, e, "tool", toolPayload(event, call), nil)
+				if r.err != nil || r.out != "" {
+					t.Fatalf("%s %s = %v, output %q, in %v", event, file, r.err, r.out, r.elapsed)
+				}
+				if r.elapsed >= toolLedgerBound && slow == "" {
+					slow = fmt.Sprintf("%s %s took %v", event, file, r.elapsed)
+				}
 			}
 		}
+		if rows := toolLedgerRows(t, root, e.agent); len(rows) != 5 || len(wouldReportRows(rows)) != 1 {
+			t.Fatalf("rows = %v; want four calls and one report", rows)
+		}
+		if slow == "" {
+			break
+		}
+		t.Logf("attempt %d: %s, over the %v bound; running it again in a new sandbox", attempt, slow, toolLedgerBound)
 	}
-	if rows := toolLedgerRows(t, root, e.agent); len(rows) != 5 || len(wouldReportRows(rows)) != 1 {
-		t.Fatalf("rows = %v; want four calls and one report", rows)
+	if slow != "" {
+		t.Fatalf("a call went over the %v bound in all three attempts; the last: %s", toolLedgerBound, slow)
 	}
 	if n := connections.Load(); n != 0 {
 		t.Fatalf("the hook opened %d hub connection(s)", n)

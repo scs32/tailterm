@@ -1533,28 +1533,68 @@ var redactWorstCases = []string{
 
 // Review b1: every loop of the scan is linear and honours the deadline. Each
 // worst case, up to the size cap, is scanned well inside the 100 ms budget,
-// and a scan whose deadline has passed returns at once.
+// and a scan whose deadline has passed returns false and stops early.
+//
+// A scan past its deadline must take less time than the budgeted scan of the
+// same text, which finishes it: a relative bound, so a loaded host slows both
+// alike. Unloaded under -race on the Mini the quickest of three takes under
+// 30% of the full scan for every unit but xoxb-, whose full scan is among the
+// cheapest, at about 75%. The budgeted scan keeps 30 ms over its budget for
+// the last check; the slowest full scan under -race is 50 to 60 ms, well
+// inside the budget. A case that misses either check is a timing
+// miss, not a scan that ignores its deadline: a matrix run beside nine race
+// shards once saw an expired scan take 32 ms. It is scanned again after a
+// wait, at most three times, as TestToolScopeBeforeAssignNoHub does; every
+// attempt's expired scan must return false.
 func TestToolRedactScanIsBounded(t *testing.T) {
 	exact := []string{strings.Repeat("ab", 10), "token=token=token=token="}
 	slowest, slowestUnit := time.Duration(0), ""
 	for _, unit := range redactWorstCases {
 		for _, size := range []int{64 << 10, 256 << 10, toolRedactMaxBytes} {
 			text := strings.Repeat(unit, size/len(unit))
-			start := time.Now()
-			_, _, ok := redactScan(text, exact, start.Add(100*time.Millisecond))
-			elapsed := time.Since(start)
-			if elapsed > slowest {
-				slowest, slowestUnit = elapsed, fmt.Sprintf("%q at %d KiB", unit, size>>10)
-			}
-			if size == toolRedactMaxBytes && testing.Verbose() {
-				t.Logf("%q at the cap: %s", unit, elapsed.Round(100*time.Microsecond))
-			}
-			if elapsed > 130*time.Millisecond {
-				t.Errorf("unit %q, %d KiB: the scan returned after %s, ok=%v; its budget is 100 ms", unit, size>>10, elapsed.Round(time.Millisecond), ok)
-			}
-			start = time.Now()
-			if _, _, ok := redactScan(text, exact, start.Add(-time.Second)); ok || time.Since(start) > 30*time.Millisecond {
-				t.Errorf("unit %q, %d KiB: a scan already past its deadline returned ok=%v after %s", unit, size>>10, ok, time.Since(start).Round(time.Millisecond))
+			label := fmt.Sprintf("unit %q, %d KiB", unit, size>>10)
+			const attempts = 3
+			for attempt := 0; attempt < attempts; attempt++ {
+				// A stalled host is usually still stalled a moment later, so
+				// a retry waits first: one bound, then two.
+				time.Sleep(time.Duration(attempt) * toolLedgerBound)
+				start := time.Now()
+				_, _, ok := redactScan(text, exact, start.Add(100*time.Millisecond))
+				elapsed := time.Since(start)
+				// The quickest of three: delay on a loaded host only adds.
+				expired, finished := time.Duration(0), false
+				for k := 0; k < 3 && !finished; k++ {
+					start = time.Now()
+					_, _, finished = redactScan(text, exact, start.Add(-time.Second))
+					if d := time.Since(start); k == 0 || d < expired {
+						expired = d
+					}
+				}
+				if finished {
+					t.Errorf("%s: a scan already past its deadline returned ok=true", label)
+					break
+				}
+				var miss string
+				switch {
+				case elapsed > 130*time.Millisecond:
+					miss = fmt.Sprintf("the scan returned after %s, ok=%v; its budget is 100 ms", elapsed.Round(time.Millisecond), ok)
+				case expired >= elapsed:
+					miss = fmt.Sprintf("a scan already past its deadline took %s, no less than the budgeted scan's %s", expired.Round(10*time.Microsecond), elapsed.Round(10*time.Microsecond))
+				}
+				if miss == "" {
+					if elapsed > slowest {
+						slowest, slowestUnit = elapsed, fmt.Sprintf("%q at %d KiB", unit, size>>10)
+					}
+					if size == toolRedactMaxBytes && testing.Verbose() {
+						t.Logf("%q at the cap: %s, past its deadline %s", unit, elapsed.Round(100*time.Microsecond), expired.Round(10*time.Microsecond))
+					}
+					break
+				}
+				if attempt == attempts-1 {
+					t.Errorf("%s: missed on all %d attempts; on the last, %s", label, attempts, miss)
+					break
+				}
+				t.Logf("%s: attempt %d: %s; scanning it again", label, attempt, miss)
 			}
 		}
 	}
