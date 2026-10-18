@@ -42,6 +42,10 @@ var kindColors = map[string]int{
 // under it, in place of the owner whose token the relay uses.
 const relayNode = "host-relay"
 
+// hubServiceNodes are the store's handlerABSystemNodes: the caller nodes
+// hub-internal writers post under. A notice from one is named by its user.
+var hubServiceNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true}
+
 // roster names agents for display.
 type roster map[string]api.Agent
 
@@ -62,8 +66,8 @@ func (r roster) sender(m api.Message) string {
 		return "owner (Discord)"
 	case m.From.Node == relayNode:
 		return "relay"
-	case m.From.Node == "system" && m.From.User != "":
-		return m.From.User // hub services such as schedule-monitor or queue
+	case hubServiceNodes[m.From.Node] && m.From.User != "":
+		return m.From.User // hub services such as schedule-monitor, queue, runner or hub
 	}
 	return "owner"
 }

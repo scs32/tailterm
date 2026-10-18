@@ -175,6 +175,9 @@ func TestInboxNamesAgentlessSendersAsDiscordDoes(t *testing.T) {
 		{api.Sender{Node: api.BrokerNode, User: "broker"}, "broker", false},
 		{api.Sender{Node: "system", User: "schedule-monitor"}, "schedule-monitor", false},
 		{api.Sender{Node: "system", User: "queue"}, "queue", false},
+		{api.Sender{Node: "team_queue", User: "runner"}, "runner", false},
+		{api.Sender{Node: "team_queue", User: "rebind"}, "rebind", false},
+		{api.Sender{Node: "handler_arms", User: "hub"}, "hub", false},
 		{api.Sender{Node: api.BridgeNode, User: "owner"}, "owner (Discord)", true},
 		{api.Sender{Node: relayNode, User: server.RelayUser}, "relay", false},
 		{api.Sender{Node: "workspace", User: "owner"}, "owner (human)", true},
@@ -188,6 +191,40 @@ func TestInboxNamesAgentlessSendersAsDiscordDoes(t *testing.T) {
 		}
 		if !c.person && strings.Contains(line, "(human)") {
 			t.Errorf("%+v: a non-person line says (human): %q", c.from, line)
+		}
+	}
+}
+
+// Notices the queue runner and the handler arms post read as those services,
+// not as a human the reader should answer on the board.
+func TestInboxNamesQueueAndHandlerArmsNoticesAsServices(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "p", Orchestrator: "lead"}, api.Caller{Node: "cli-test", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, by := range []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}} {
+		note := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A hub service notice", Body: api.EnvelopeBody{Text: "text"}}
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &note, Text: api.RenderText(note)}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.From != (api.Sender{Node: by.Node, User: by.User}) {
+			t.Fatalf("stored author = %+v, want %+v", m.From, by)
+		}
+		line := formatMessage(m, nil)
+		if !strings.HasPrefix(line, fmt.Sprintf("#%d %s %s: ", m.Seq, m.CreatedAt.Local().Format("15:04"), by.User)) {
+			t.Fatalf("%s notice does not name %s: %s", by.Node, by.User, line)
+		}
+		for _, bad := range []string{"(human)", "Reply on the shared board", "omit --to"} {
+			if strings.Contains(line, bad) {
+				t.Fatalf("%s line has %q: %s", by.Node, bad, line)
+			}
 		}
 	}
 }

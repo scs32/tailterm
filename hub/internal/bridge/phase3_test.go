@@ -70,9 +70,42 @@ func (h *harness) obligationID(seq int64) string {
 // c11: hub services render by name, never as the owner.
 func TestSystemSendersRenderByName(t *testing.T) {
 	r := roster{}
-	m := api.Message{From: api.Sender{Node: "system", User: "schedule-monitor"}}
-	if got := r.sender(m); got != "schedule-monitor" {
-		t.Fatalf("sender = %q", got)
+	for _, from := range []api.Sender{
+		{Node: "system", User: "schedule-monitor"},
+		{Node: "team_queue", User: "runner"},
+		{Node: "team_queue", User: "rebind"},
+		{Node: "handler_arms", User: "hub"},
+	} {
+		if got := r.sender(api.Message{From: from}); got != from.User {
+			t.Fatalf("%+v: sender = %q, want %q", from, got, from.User)
+		}
+	}
+}
+
+// A queue-runner or handler-arms notice the bridge mirrors as a line names
+// that service, not the owner.
+func TestQueueAndHandlerArmsSendersRenderByName(t *testing.T) {
+	h := newHarness(t)
+	callers := []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}}
+	for _, by := range callers {
+		note := &api.Envelope{Kind: api.EnvelopeKindNotice, To: h.lead.Name, Subject: "A hub service notice for the lead", Refs: map[string]string{"escalation": "lead"}, Body: api.EnvelopeBody{Text: "fyi"}}
+		m, err := h.st.PostMessage(h.ctx, h.task.ID, api.PostMessageRequest{To: h.lead.ID, Envelope: note, Text: api.RenderText(*note)}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.From != (api.Sender{Node: by.Node, User: by.User}) {
+			t.Fatalf("stored author = %+v, want %+v", m.From, by)
+		}
+	}
+	h.cycle()
+	lines := h.lines()
+	if len(lines) != len(callers) {
+		t.Fatalf("want %d mirrored lines, got %d", len(callers), len(lines))
+	}
+	for i, by := range callers {
+		if got := lines[i].Content; !strings.HasPrefix(got, "**"+by.User+"** → **"+h.lead.Name+"**") || strings.Contains(got, "**owner") {
+			t.Fatalf("%s line header = %q", by.Node, got)
+		}
 	}
 }
 
