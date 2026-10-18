@@ -1316,3 +1316,230 @@ func TestBrokerTickRunsStallWatchSweep(t *testing.T) {
 		}
 	})
 }
+
+// ownerPingRun drives one or more assignments (due 45m, acknowledged at +1m)
+// through the real Tick every 30 s for 4 h. progress maps a holder index to
+// the times it records progress: a NOTICE reply to its assignment, or `tt
+// progress` when tt is set. extendAt, if set, extends holder 0's obligation
+// by 30 minutes as the owner. It returns, per holder, the times of owner
+// escalations for its obligation and of stall notices that list it: every
+// broker notice the bridge pings the owner for (wi_052f25d52d8b8f56).
+func ownerPingRun(t *testing.T, holders int, tt bool, progress map[int][]time.Duration, extendAt time.Duration) (owner, stall [][]time.Duration) {
+	t.Helper()
+	f := newFixture(t)
+	c := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
+	clock := c
+	f.st.SetClockForTest(func() time.Time { return clock })
+	agents := []api.Agent{f.builder}
+	for i := 1; i < holders; i++ {
+		a, err := f.st.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: fmt.Sprintf("builder%d", i+1), Host: "h", Session: fmt.Sprintf("builder%d", i+1), Runtime: "codex"}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agents = append(agents, a)
+	}
+	msgs := make([]api.Message, holders)
+	for i, a := range agents {
+		m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, To: a.ID, Envelope: &api.Envelope{
+			Kind: "assign", To: a.Name, Subject: "Report progress on the owner notices", Due: "45m",
+			Body: api.EnvelopeBody{Objective: "x", Owns: []string{"a.go"}, Acceptance: map[string]string{"a1": "x"}}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msgs[i] = m
+	}
+	clock = c.Add(time.Minute)
+	for i, a := range agents {
+		if _, err := f.st.ObligationAction(f.ctx, f.task.ID, msgs[i].Seq, "ack", api.ObligationActionRequest{AgentID: a.ID, RunID: a.RunID}, clock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Broker{Store: f.st}
+	for d := 2 * time.Minute; d <= 4*time.Hour; d += 30 * time.Second {
+		clock = c.Add(d)
+		for i, a := range agents {
+			for _, at := range progress[i] {
+				if at != d {
+					continue
+				}
+				if tt {
+					if _, err := f.st.ObligationAction(f.ctx, f.task.ID, msgs[i].Seq, "progress", api.ObligationActionRequest{AgentID: a.ID, RunID: a.RunID}, clock); err != nil {
+						t.Fatal(err)
+					}
+				} else if _, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: a.ID, RunID: a.RunID, ReplyTo: msgs[i].Seq, Envelope: &api.Envelope{
+					Kind: api.EnvelopeKindNotice, Subject: "Progress on the assigned work", Body: api.EnvelopeBody{Text: "still going"}}}, f.by); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if extendAt != 0 && d == extendAt {
+			obls, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{OpenOnly: true}, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, o := range obls {
+				if o.MessageSeq == msgs[0].Seq {
+					if _, err := f.st.ExtendObligation(f.ctx, f.task.ID, o.ID, api.ObligationExtendRequest{For: "30m", Reason: "more time", RequestID: "extend-1"}, f.by); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+		}
+		if _, err := b.Tick(f.ctx, clock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, stall = make([][]time.Duration, holders), make([][]time.Duration, holders)
+	for i := range msgs {
+		owner[i], stall[i] = []time.Duration{}, []time.Duration{}
+	}
+	for _, x := range all {
+		if x.From.Node != api.BrokerNode || x.Envelope == nil {
+			continue
+		}
+		for i := range msgs {
+			switch x.Envelope.Refs["escalation"] {
+			case "owner":
+				if x.Envelope.Refs["message"] == fmt.Sprint(msgs[i].Seq) && x.Envelope.Refs["obligation"] != "" {
+					owner[i] = append(owner[i], x.CreatedAt.Sub(c))
+				}
+			case "stall":
+				if strings.Contains(x.Envelope.Body.Text, fmt.Sprintf("#%d ", msgs[i].Seq)) {
+					stall[i] = append(stall[i], x.CreatedAt.Sub(c))
+				}
+			}
+		}
+	}
+	return owner, stall
+}
+
+func every(from, to, step time.Duration) []time.Duration {
+	var out []time.Duration
+	for d := from; d <= to; d += step {
+		out = append(out, d)
+	}
+	return out
+}
+
+func durs(s ...string) []time.Duration {
+	out := []time.Duration{}
+	for _, v := range s {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// p1, p4 and p5 (wi_052f25d52d8b8f56): once an obligation reached the owner,
+// progress from its holder, a message or `tt progress`, brings no further
+// owner ping for it, counting owner escalations and the stall notices that
+// list it. The assignment is due at 45m; the lead hears at 45m30s, the owner
+// at 1h0m30s, and the cap ends at 2h45m. A holder that goes silent after its
+// last progress is listed in a stall once, 2 h later. The base column is what
+// d4bb545 (before the fix) sent for the same run; no row exceeds it.
+func TestProgressAfterOwnerEscalationPingsTheOwnerOnce(t *testing.T) {
+	m := time.Minute
+	capEnd := 45*m + store.ObligationProgressCap
+	cases := []struct {
+		name         string
+		tt           bool
+		at           []time.Duration
+		owner, stall []time.Duration
+		base         int
+	}{
+		{"message every 30m", false, []time.Duration{65 * m, 95 * m, 125 * m, 155 * m}, durs("1h0m30s"), durs(), 3},
+		{"message after each miss", false, []time.Duration{62 * m, 109 * m, 156 * m}, durs("1h0m30s"), durs(), 5},
+		{"tt progress after each miss", true, []time.Duration{62 * m, 108 * m, 154 * m, 200 * m}, durs("1h0m30s"), durs(), 4},
+		{"message every 20m", false, every(62*m, 162*m, 20*m), durs("1h0m30s"), durs(), 3},
+		{"tt progress every 16m", true, every(62*m, 240*m, 16*m), durs("1h0m30s"), durs(), 1},
+		{"message every 16m", false, every(62*m, 240*m, 16*m), durs("1h0m30s"), durs(), 5},
+		{"tt progress every 30m", true, every(62*m, 240*m, 30*m), durs("1h0m30s"), durs(), 1},
+		{"tt progress once", true, []time.Duration{62 * m}, durs("1h0m30s"), durs("3h2m"), 3},
+		{"message once", false, []time.Duration{62 * m}, durs("1h0m30s"), durs("3h2m"), 3},
+		{"no progress", false, nil, durs("1h0m30s"), durs("1h15m30s"), 2},
+	}
+	for _, k := range cases {
+		t.Run(k.name, func(t *testing.T) {
+			owner, stall := ownerPingRun(t, 1, k.tt, map[int][]time.Duration{0: k.at}, 0)
+			t.Logf("%s: total=%d owner=%v stall=%v", k.name, len(owner[0])+len(stall[0]), owner[0], stall[0])
+			if !reflect.DeepEqual(owner[0], k.owner) || !reflect.DeepEqual(stall[0], k.stall) {
+				t.Errorf("owner %v stall %v, want owner %v stall %v", owner[0], stall[0], k.owner, k.stall)
+			}
+			if total := len(owner[0]) + len(stall[0]); total > k.base {
+				t.Errorf("%d owner pings, more than the base's %d", total, k.base)
+			}
+			if len(k.at) == 0 {
+				return
+			}
+			inCap := 0
+			for _, d := range append(append([]time.Duration{}, owner[0]...), stall[0]...) {
+				if d <= capEnd {
+					inCap++
+				}
+			}
+			if inCap != 1 {
+				t.Errorf("%d owner pings inside the cap, want 1", inCap)
+			}
+			// A stall listing it comes only once the holder has been
+			// silent for the cap.
+			last := k.at[len(k.at)-1]
+			for _, d := range stall[0] {
+				if d-last < store.ObligationProgressCap {
+					t.Errorf("stall at %v, %v after the last progress at %v", d, d-last, last)
+				}
+			}
+		})
+	}
+}
+
+// Progress before the owner escalation still clears the lead step, and an
+// owner extension still re-bases an owner-level obligation: both send the
+// owner exactly what d4bb545 did (wi_052f25d52d8b8f56 p1, p4).
+func TestProgressBeforeOwnerAndExtensionKeepTheirPings(t *testing.T) {
+	m := time.Minute
+	for _, k := range []struct {
+		tt           bool
+		owner, stall string
+	}{{false, "1h35m30s", "1h50m30s"}, {true, "1h35m", "1h50m"}} {
+		t.Run(fmt.Sprintf("progress at 50m, tt=%v", k.tt), func(t *testing.T) {
+			owner, stall := ownerPingRun(t, 1, k.tt, map[int][]time.Duration{0: {50 * m}}, 0)
+			t.Logf("progress at 50m, tt=%v: owner=%v stall=%v", k.tt, owner[0], stall[0])
+			if want := durs(k.owner); !reflect.DeepEqual(owner[0], want) {
+				t.Errorf("owner escalations %v, want %v (none at 1h0m30s)", owner[0], want)
+			}
+			if want := durs(k.stall); !reflect.DeepEqual(stall[0], want) {
+				t.Errorf("stalls %v, want %v", stall[0], want)
+			}
+		})
+	}
+	t.Run("owner extension at 2h6m, then silence", func(t *testing.T) {
+		owner, stall := ownerPingRun(t, 1, false, map[int][]time.Duration{0: {65 * m, 95 * m, 125 * m}}, 126*m)
+		t.Logf("owner extension: owner=%v stall=%v", owner[0], stall[0])
+		if want := durs("1h0m30s", "2h51m30s"); !reflect.DeepEqual(owner[0], want) {
+			t.Errorf("owner escalations %v, want %v", owner[0], want)
+		}
+		if want := durs("3h6m30s"); !reflect.DeepEqual(stall[0], want) {
+			t.Errorf("stalls %v, want %v", stall[0], want)
+		}
+	})
+}
+
+// A stall still lists a silent owner-level obligation while it leaves out
+// one in the same project whose holder keeps reporting (wi_052f25d52d8b8f56).
+func TestStallListsTheSilentObligationOnly(t *testing.T) {
+	owner, stall := ownerPingRun(t, 2, false, map[int][]time.Duration{0: every(65*time.Minute, 4*time.Hour, 30*time.Minute)}, 0)
+	t.Logf("two holders: reporting owner=%v stall=%v; silent owner=%v stall=%v", owner[0], stall[0], owner[1], stall[1])
+	if want := durs("1h0m30s"); !reflect.DeepEqual(owner[0], want) || len(stall[0]) != 0 {
+		t.Errorf("reporting holder: owner %v stall %v, want owner %v and no stall", owner[0], stall[0], want)
+	}
+	if len(owner[1]) != 1 || len(stall[1]) == 0 {
+		t.Errorf("silent holder: owner %v stall %v, want one owner escalation and a stall", owner[1], stall[1])
+	}
+}

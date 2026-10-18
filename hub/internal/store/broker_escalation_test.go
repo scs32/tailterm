@@ -711,3 +711,71 @@ func TestReleaseHoldHoldsOwnerEscalation(t *testing.T) {
 		wantSteps(t, "after the late hold lifts", f.tick(t, o, 3*time.Hour+time.Minute), "project-stalled")
 	})
 }
+
+// wi_052f25d52d8b8f56 (plan step 4): BrokerProjectStall leaves out an
+// owner-level obligation whose holder recorded progress after the owner
+// escalation until that progress is ObligationProgressCap old; progress
+// recorded only before the owner escalation does not leave it out.
+func TestStallSkipsProgressSinceOwnerUntilTheCap(t *testing.T) {
+	shared := newEscalationFixture(t)
+	ownerLevel := func(t *testing.T, f *escalationFixture, progress time.Duration) store.BrokerObligation {
+		t.Helper()
+		o := f.assign(t, f.builder, "45m")
+		f.act(t, o, f.builder, "ack", time.Minute)
+		wantSteps(t, "+46m", f.tick(t, o, 46*time.Minute), "escalate-lead")
+		wantSteps(t, "+61m", f.tick(t, o, 61*time.Minute), "escalate-owner")
+		if progress != 0 {
+			f.act(t, o, f.builder, "progress", progress)
+		}
+		open, err := f.st.BrokerOpenObligations(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range open {
+			if b.ID == o.ID {
+				if b.Escalation != 2 {
+					t.Fatalf("escalation %d, want 2", b.Escalation)
+				}
+				return b
+			}
+		}
+		t.Fatal("no open obligation")
+		return store.BrokerObligation{}
+	}
+	stall := func(t *testing.T, f *escalationFixture, b store.BrokerObligation, quietFrom time.Time, now time.Duration) bool {
+		t.Helper()
+		f.at(now)
+		notified, err := f.st.BrokerProjectStall(f.ctx, f.task.ID, quietFrom, quietFrom, []store.BrokerObligation{b}, f.c.Add(now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return notified
+	}
+	t.Run("progress after the owner escalation", func(t *testing.T) {
+		f := shared.fresh(t)
+		b := ownerLevel(t, f, 62*time.Minute)
+		p := *b.LastProgressAt
+		if !p.After(b.EscalatedAt) {
+			t.Fatalf("progress %s is not after the owner escalation %s", p.Sub(f.c), b.EscalatedAt.Sub(f.c))
+		}
+		if stall(t, f, b, p, 62*time.Minute+store.ObligationProgressCap-time.Second) {
+			t.Fatal("listed with progress under the cap old")
+		}
+		if !stall(t, f, b, p, 62*time.Minute+store.ObligationProgressCap) {
+			t.Fatal("not listed once its progress is the cap old")
+		}
+		if n := f.notices(t, api.Obligation{}, "stall"); len(n) != 1 || !strings.Contains(n[0].Envelope.Body.Text, fmt.Sprintf("#%d ", b.MessageSeq)) {
+			t.Fatalf("stall notices %d, want one listing #%d", len(n), b.MessageSeq)
+		}
+	})
+	t.Run("progress only before the owner escalation", func(t *testing.T) {
+		f := shared.fresh(t)
+		b := ownerLevel(t, f, 0)
+		if b.LastProgressAt == nil || b.LastProgressAt.After(b.EscalatedAt) {
+			t.Fatalf("progress %v, want the acknowledgement before the owner escalation", b.LastProgressAt)
+		}
+		if !stall(t, f, b, b.EscalatedAt, b.EscalatedAt.Sub(f.c)+api.ObligationProjectStallQuiet) {
+			t.Fatal("not listed after the quiet window")
+		}
+	})
+}

@@ -88,7 +88,12 @@ CREATE TABLE IF NOT EXISTS obligation_postponements (
   last_message_seq INTEGER NOT NULL,
   count INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
-);`
+);
+-- A postponement goes with its obligation's close, by any close path
+-- (wi_052f25d52d8b8f56); rows left by closes before this trigger are pruned.
+CREATE TRIGGER IF NOT EXISTS obligation_postponements_close AFTER UPDATE OF state ON obligations WHEN NEW.state='closed'
+BEGIN DELETE FROM obligation_postponements WHERE obligation_id=NEW.id; END;
+DELETE FROM obligation_postponements WHERE EXISTS (SELECT 1 FROM obligations o WHERE o.id=obligation_postponements.obligation_id AND o.state='closed');`
 
 // A progress message (wi_e76872a6abc6d78e) moves its obligation's due time to
 // at most ObligationProgressGrace from the message, and never more than
@@ -339,10 +344,12 @@ ON CONFLICT(obligation_id) DO UPDATE SET base_due_at=excluded.base_due_at,postpo
 		}
 		// Progress restarts the escalation ladder only while the obligation
 		// is inside its (postponed) due time; past the cap it would only
-		// re-notify the lead.
+		// re-notify the lead. Once the owner has heard, progress no longer
+		// restarts it, so the owner hears once per obligation until an owner
+		// extension re-bases the cap (wi_052f25d52d8b8f56).
 		inTime := !now.After(due)
 		if _, err := tx.ExecContext(ctx, `UPDATE obligations SET due_at=?,state=CASE WHEN state=? THEN ? ELSE state END,last_progress_at=?,nudges=0,nudged_at='',
-escalation=CASE WHEN ? THEN 0 ELSE escalation END,escalated_at=CASE WHEN ? THEN '' ELSE escalated_at END,changed_at=? WHERE id=?`,
+escalation=CASE WHEN ? AND escalation<2 THEN 0 ELSE escalation END,escalated_at=CASE WHEN ? AND escalation<2 THEN '' ELSE escalated_at END,changed_at=? WHERE id=?`,
 			ts(due), api.ObligationAcknowledged, api.ObligationWorking, ts(now), inTime, inTime, ts(now), t.id); err != nil {
 			return err
 		}
@@ -653,7 +660,10 @@ func (s *Store) ObligationAction(ctx context.Context, taskID string, messageSeq 
 		if o.Needs == api.ObligationNeedsDelivery || o.State == api.ObligationQueued || o.State == api.ObligationDelivered || o.State == api.ObligationBlocked {
 			return o, fmt.Errorf("%w: acknowledge the obligation before recording progress", api.ErrConflict)
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,last_progress_at=?,nudges=0,nudged_at='',escalation=0,escalated_at='',changed_at=? WHERE id=?`, api.ObligationWorking, t, t, o.ID)
+		// Progress clears a lead escalation; once the owner has heard, it no
+		// longer re-arms the owner step until an owner extension re-bases it
+		// (wi_052f25d52d8b8f56).
+		_, err = tx.ExecContext(ctx, `UPDATE obligations SET state=?,last_progress_at=?,nudges=0,nudged_at='',escalation=CASE WHEN escalation<2 THEN 0 ELSE escalation END,escalated_at=CASE WHEN escalation<2 THEN '' ELSE escalated_at END,changed_at=? WHERE id=?`, api.ObligationWorking, t, t, o.ID)
 	default:
 		return o, api.ErrInvalid
 	}

@@ -238,14 +238,22 @@ One obligation per (message, recipient). States:
 
 - **Progress past the due time re-arms the lead once per episode.** Recording
   progress (`tt progress`, or an acknowledgement that resumes a block) clears
-  the escalation but keeps the due time. Progress recorded after the due time
-  therefore extends the outcome window to 30 min (the silence window) after
-  the latest such progress: the lead hears once when the outcome first goes
-  overdue, a holder that keeps recording progress causes no further lead
+  a lead escalation but keeps the due time. Progress recorded after the due
+  time therefore extends the outcome window to 30 min (the silence window)
+  after the latest such progress: the lead hears once when the outcome first
+  goes overdue, a holder that keeps recording progress causes no further lead
   notice, and once its progress stops for 30 min the lead hears again (and the
   owner a lead window after that). A progress message past its postponement
   cap keeps an escalation already made, so the owner still hears on time
-  (bug `wi_d1e42f0739e47139`, order #34523).
+  (bug `wi_d1e42f0739e47139`, order #34523). Once the obligation has reached
+  the owner, neither `tt progress` nor a progress message clears the
+  escalation (an acknowledgement that resumes a block still does), so neither
+  the lead nor the owner is escalated to again, and the project stall notice
+  leaves the obligation out while its latest progress is under 2 h old. The
+  owner is pinged once for it however the holder reports: a holder silent for
+  2 h is listed in the next stall notice, a holder that keeps reporting past
+  the postponement cap is not re-notified at the cap's end, and an owner
+  extension re-bases it to the lead step (bug `wi_052f25d52d8b8f56`).
 
 - **Notices name a holder that is not bound to the relay.** The hub has no
   per-agent relay binding record; the host relay reports activity only for a
@@ -268,7 +276,10 @@ One obligation per (message, recipient). States:
   checking against the installed CLI.
 - **Project-level stall.** If the project has overdue obligations and no obligation
   or agent event has changed for 15 minutes, the broker raises one
-  `project_stalled` alert. It fires once per stall, not once per timer.
+  `project_stalled` alert. It fires once per stall, not once per timer. An
+  obligation that reached the owner and whose holder has recorded progress
+  since, less than 2 h ago, is not listed and alone raises no stall (bug
+  `wi_052f25d52d8b8f56`).
 
 ### Item lead copies
 

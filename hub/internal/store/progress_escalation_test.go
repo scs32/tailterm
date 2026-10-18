@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -370,5 +371,303 @@ func TestPostponement(t *testing.T) {
 		f.at(40 * time.Minute)
 		f.post(t, f.builder, api.Agent{}, o.MessageSeq, nil, progressNotice("halfway"))
 		wantDue(t, "migrated", f.obligation(t, o.MessageSeq, f.builder), f.c.Add(70*time.Minute))
+	})
+}
+
+// ladder runs one escalation pass at the current clock for o, through the
+// same store calls and order as the broker's lead and owner steps (package
+// broker imports store, so its Tick cannot run here). It returns the step.
+// It counts owner escalations only; the Tick tests in internal/broker also
+// count the stall notices that list the obligation.
+func (f *progressFixture) ladder(t *testing.T, o api.Obligation) string {
+	t.Helper()
+	open, err := f.s.BrokerOpenObligations(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range open {
+		if b.ID != o.ID {
+			continue
+		}
+		overdue := ObligationOverdue(b.Obligation, f.clock)
+		if overdue == "" || overdue == "silence" {
+			return ""
+		}
+		level, step := 0, ""
+		switch {
+		case b.Escalation == 0:
+			level, step = 1, "escalate-lead"
+		case b.Escalation == 1 && f.clock.Sub(b.EscalatedAt) >= api.ObligationOwnerAfterLead:
+			level, step = 2, "escalate-owner"
+		default:
+			return ""
+		}
+		err := f.s.BrokerEscalate(f.ctx, b, level, "past its due time", f.clock)
+		if errors.Is(err, ErrBrokerProgressFresh) || errors.Is(err, ErrBrokerStale) {
+			return ""
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return step
+	}
+	return ""
+}
+
+// escalationNotices counts the broker's notices about o at a level ("lead"
+// or "owner").
+func (f *progressFixture) escalationNotices(t *testing.T, o api.Obligation, level string) int {
+	t.Helper()
+	msgs, err := f.s.ListMessages(f.ctx, f.task.ID, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.From.Node == api.BrokerNode && m.Envelope != nil && m.Envelope.Refs["escalation"] == level && m.Envelope.Refs["obligation"] == o.ID {
+			n++
+		}
+	}
+	return n
+}
+
+// run ticks the ladder every minute from +from to +to, posting holder
+// progress replies at the given offsets.
+func (f *progressFixture) run(t *testing.T, o api.Obligation, from, to time.Duration, progressAt ...time.Duration) {
+	t.Helper()
+	f.tick(t, o, from, to, func() { f.post(t, f.builder, api.Agent{}, o.MessageSeq, nil, progressNotice("still going")) }, progressAt)
+}
+
+// runTT is run with tt progress (ObligationAction progress) in place of
+// progress messages.
+func (f *progressFixture) runTT(t *testing.T, o api.Obligation, from, to time.Duration, progressAt ...time.Duration) {
+	t.Helper()
+	f.tick(t, o, from, to, func() {
+		if _, err := f.s.ObligationAction(f.ctx, f.task.ID, o.MessageSeq, "progress", api.ObligationActionRequest{AgentID: f.builder.ID, RunID: f.builder.RunID}, f.clock); err != nil {
+			t.Fatal(err)
+		}
+	}, progressAt)
+}
+
+func (f *progressFixture) tick(t *testing.T, o api.Obligation, from, to time.Duration, progress func(), progressAt []time.Duration) {
+	t.Helper()
+	at := map[time.Duration]bool{}
+	for _, d := range progressAt {
+		at[d] = true
+	}
+	for d := from; d <= to; d += time.Minute {
+		f.at(d)
+		if at[d] {
+			progress()
+		}
+		f.ladder(t, o)
+	}
+}
+
+// p1 (wi_052f25d52d8b8f56): once an obligation's escalation reached the
+// owner, progress inside the 2 h cap no longer re-arms the owner step.
+func TestProgressAfterOwnerEscalation(t *testing.T) {
+	shared := newProgressFixture(t)
+	// Due at +45m: the lead hears at +46m, the owner at +61m.
+	start := func(t *testing.T) (*progressFixture, api.Obligation) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.ack(t, o, f.builder, time.Minute)
+		f.run(t, o, 2*time.Minute, 61*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 1 {
+			t.Fatalf("owner notices at +61m: %d, want 1", n)
+		}
+		return f, o
+	}
+	t.Run("progress every 30 minutes", func(t *testing.T) {
+		f, o := start(t)
+		f.run(t, o, 62*time.Minute, 4*time.Hour, 65*time.Minute, 95*time.Minute, 125*time.Minute, 155*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 1 {
+			t.Fatalf("owner notices: %d, want 1", n)
+		}
+		got := f.obligation(t, o.MessageSeq, f.builder)
+		wantDue(t, "capped", got, f.c.Add(165*time.Minute))
+		if got.Escalation != 2 {
+			t.Fatalf("escalation %d, want 2", got.Escalation)
+		}
+	})
+	t.Run("progress after each later miss", func(t *testing.T) {
+		f, o := start(t)
+		// Before the fix each of these restarted the ladder, so the owner heard
+		// again at +108m, +155m and +181m.
+		f.run(t, o, 62*time.Minute, 4*time.Hour, 62*time.Minute, 109*time.Minute, 156*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 1 {
+			t.Fatalf("owner notices: %d, want 1", n)
+		}
+		if n := f.escalationNotices(t, o, "lead"); n != 1 {
+			t.Fatalf("lead notices: %d, want 1", n)
+		}
+	})
+	t.Run("progress still clears the lead step", func(t *testing.T) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.ack(t, o, f.builder, time.Minute)
+		f.run(t, o, 2*time.Minute, 50*time.Minute, 50*time.Minute)
+		got := f.obligation(t, o.MessageSeq, f.builder)
+		if got.Escalation != 0 || f.escalationNotices(t, o, "lead") != 1 {
+			t.Fatalf("after lead step and progress: escalation %d, lead notices %d", got.Escalation, f.escalationNotices(t, o, "lead"))
+		}
+		// The next miss (due +80m) starts again with the lead.
+		f.run(t, o, 51*time.Minute, 81*time.Minute)
+		if n := f.escalationNotices(t, o, "lead"); n != 2 {
+			t.Fatalf("lead notices after the next miss: %d, want 2", n)
+		}
+		if n := f.escalationNotices(t, o, "owner"); n != 0 {
+			t.Fatalf("owner notices: %d, want 0", n)
+		}
+	})
+	t.Run("an owner extension re-bases it", func(t *testing.T) {
+		f, o := start(t)
+		f.run(t, o, 62*time.Minute, 70*time.Minute, 65*time.Minute)
+		if _, err := f.s.ExtendObligation(f.ctx, f.task.ID, o.ID, api.ObligationExtendRequest{For: "1h", Reason: "more time", RequestID: "extend-owner"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		// Extended to +130m; progress inside it re-arms the ladder again.
+		f.run(t, o, 71*time.Minute, 4*time.Hour, 100*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 2 {
+			t.Fatalf("owner notices after the extension: %d, want 2", n)
+		}
+	})
+}
+
+// p4 (wi_052f25d52d8b8f56): tt progress, which never moves the due time,
+// no longer re-arms the owner step after an owner escalation either.
+func TestTTProgressAfterOwnerEscalation(t *testing.T) {
+	shared := newProgressFixture(t)
+	start := func(t *testing.T) (*progressFixture, api.Obligation) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.ack(t, o, f.builder, time.Minute)
+		f.runTT(t, o, 2*time.Minute, 61*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 1 {
+			t.Fatalf("owner notices at +61m: %d, want 1", n)
+		}
+		return f, o
+	}
+	t.Run("across later misses", func(t *testing.T) {
+		f, o := start(t)
+		// Before the fix each of these restarted the ladder, so the owner heard
+		// again at +107m, +153m and +199m.
+		f.runTT(t, o, 62*time.Minute, 4*time.Hour, 62*time.Minute, 108*time.Minute, 154*time.Minute, 200*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 1 {
+			t.Fatalf("owner notices: %d, want 1", n)
+		}
+		if got := f.obligation(t, o.MessageSeq, f.builder); got.Escalation != 2 || got.State != api.ObligationWorking {
+			t.Fatalf("escalation %d state %s, want 2 working", got.Escalation, got.State)
+		}
+	})
+	t.Run("before the owner step it clears the lead step", func(t *testing.T) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.ack(t, o, f.builder, time.Minute)
+		f.runTT(t, o, 2*time.Minute, 50*time.Minute, 50*time.Minute)
+		if got := f.obligation(t, o.MessageSeq, f.builder); got.Escalation != 0 {
+			t.Fatalf("escalation %d, want 0", got.Escalation)
+		}
+		// Still past due: the lead hears again once the progress is 30m old.
+		f.runTT(t, o, 51*time.Minute, 81*time.Minute)
+		if n := f.escalationNotices(t, o, "lead"); n != 2 {
+			t.Fatalf("lead notices: %d, want 2", n)
+		}
+		if n := f.escalationNotices(t, o, "owner"); n != 0 {
+			t.Fatalf("owner notices: %d, want 0", n)
+		}
+	})
+	t.Run("an owner extension re-bases it", func(t *testing.T) {
+		f, o := start(t)
+		f.at(62 * time.Minute)
+		if _, err := f.s.ExtendObligation(f.ctx, f.task.ID, o.ID, api.ObligationExtendRequest{For: "1h", Reason: "more time", RequestID: "extend-tt"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		f.runTT(t, o, 63*time.Minute, 4*time.Hour, 70*time.Minute)
+		if n := f.escalationNotices(t, o, "owner"); n != 2 {
+			t.Fatalf("owner notices after the extension: %d, want 2", n)
+		}
+	})
+}
+
+// p2 (wi_052f25d52d8b8f56): postponement rows go when their obligation
+// closes, by any close path, and rows left by earlier closes are pruned.
+func TestPostponementRowsGoOnClose(t *testing.T) {
+	shared := newProgressFixture(t)
+	postponed := func(t *testing.T) (*progressFixture, api.Obligation) {
+		f := shared.fresh(t)
+		o := f.assign(t, f.builder, "45m")
+		f.ack(t, o, f.builder, time.Minute)
+		f.at(40 * time.Minute)
+		f.post(t, f.builder, api.Agent{}, o.MessageSeq, nil, progressNotice("halfway"))
+		if _, ok := f.postponement(t, o); !ok {
+			t.Fatal("no postponement row")
+		}
+		return f, o
+	}
+	wantGone := func(t *testing.T, f *progressFixture, o api.Obligation) {
+		t.Helper()
+		if got := f.obligation(t, o.MessageSeq, f.builder); got.State != api.ObligationClosed {
+			t.Fatalf("state %s, want closed", got.State)
+		}
+		if p, ok := f.postponement(t, o); ok {
+			t.Fatalf("postponement row remains: %+v", p)
+		}
+	}
+	t.Run("reply outcome", func(t *testing.T) {
+		f, o := postponed(t)
+		f.at(50 * time.Minute)
+		f.post(t, f.builder, f.lead, o.MessageSeq, nil, progressResult())
+		wantGone(t, f, o)
+	})
+	t.Run("withdraw", func(t *testing.T) {
+		f, o := postponed(t)
+		f.at(50 * time.Minute)
+		if _, err := f.s.WithdrawObligation(f.ctx, f.task.ID, o.ID, api.ObligationWithdrawRequest{AgentID: f.lead.ID, RunID: f.lead.RunID, Reason: "superseded by a new plan"}); err != nil {
+			t.Fatal(err)
+		}
+		wantGone(t, f, o)
+	})
+	t.Run("recipient gone", func(t *testing.T) {
+		f, o := postponed(t)
+		f.at(50 * time.Minute)
+		open, err := f.s.BrokerOpenObligations(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closed := false
+		for _, b := range open {
+			if b.ID == o.ID {
+				b.AgentStatus = api.AgentClosed
+				if err := f.s.BrokerCloseRecipientGone(f.ctx, b, f.clock); err != nil {
+					t.Fatal(err)
+				}
+				closed = true
+			}
+		}
+		if !closed {
+			t.Fatal("obligation not open")
+		}
+		wantGone(t, f, o)
+	})
+	t.Run("rows from earlier closes are pruned on open", func(t *testing.T) {
+		f, o := postponed(t)
+		// A database from before the trigger: the close leaves the row behind.
+		if _, err := f.s.db.Exec(`DROP TRIGGER obligation_postponements_close`); err != nil {
+			t.Fatal(err)
+		}
+		f.at(50 * time.Minute)
+		f.post(t, f.builder, f.lead, o.MessageSeq, nil, progressResult())
+		if _, ok := f.postponement(t, o); !ok {
+			t.Fatal("row already gone without the trigger")
+		}
+		f.s.Close()
+		f.open(t)
+		wantGone(t, f, o)
+		var n int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='obligation_postponements_close'`).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("trigger after reopen: %d %v", n, err)
+		}
 	})
 }

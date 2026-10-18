@@ -181,6 +181,18 @@ func progressPastDue(o BrokerObligation, now time.Time) bool {
 	return p != nil && p.After(o.DueAt) && now.Sub(*p) < api.ObligationSilenceNudge
 }
 
+// progressSinceOwner reports whether an obligation that reached the owner
+// has progress recorded after that escalation, less than
+// ObligationProgressCap old (wi_052f25d52d8b8f56). Progress no longer clears
+// an owner escalation, so the obligation stays overdue at the owner level;
+// a stall listing it would repeat the owner ping for work that is still
+// reporting. The bound keeps the stall as a safety net: once the holder
+// has been silent for the cap, the owner hears again.
+func progressSinceOwner(o BrokerObligation, now time.Time) bool {
+	p := o.LastProgressAt
+	return o.Escalation >= 2 && p != nil && p.After(o.EscalatedAt) && now.Sub(*p) < ObligationProgressCap
+}
+
 // ErrBrokerMatrixWait means an owner escalation was held back because the
 // holder is in a matrix wait. It wraps ErrBrokerQueuedFix, so the scheduler
 // skips it the same way: the owner escalation is decided afresh next tick.
@@ -463,14 +475,19 @@ const (
 // only real activity re-arms it; it also counts recent progress by any
 // running agent in the project, including results that closed their
 // obligations. quietFrom is when the quiet period starts, and moves with
-// that progress. A pass with nothing to record takes no write lock and
-// wakes no waiters.
+// that progress. overdue holds the owner-level obligations; one whose
+// holder has reported since the owner heard is left out. A pass with
+// nothing to record takes no write lock and wakes no waiters.
 func (s *Store) BrokerProjectStall(ctx context.Context, taskID string, lastChange, quietFrom time.Time, overdue []BrokerObligation, now time.Time) (bool, error) {
 	// An obligation blocked on a held release job is a planned wait, even
 	// one that reached the owner before its hold began: it is not listed,
-	// and alone raises no stall.
+	// and alone raises no stall. Neither is one whose holder has reported
+	// since the owner heard (progressSinceOwner).
 	var listed []BrokerObligation
 	for _, o := range overdue {
+		if progressSinceOwner(o, now) {
+			continue
+		}
 		held, err := blockedOnReleaseHold(ctx, s.db, o)
 		if err != nil {
 			return false, err
