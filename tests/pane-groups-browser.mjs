@@ -496,49 +496,76 @@ export async function exercisePaneGroups(
       Math.abs(restored.y - beforeSwap.y) < 1,
   );
   await checkParent();
-  // Per-session colors need the static session menu's decoration.
-  for (const [id, name, color] of staticControls
-    ? [
-        [ids[0], "🍎 Air A", "blue"],
-        [ids[1], "🚀 Air B", "rose"],
-      ]
-    : []) {
+  // Every mode activates a session from its pane label. Per-session colors
+  // need the static session menu's decoration.
+  for (const [id, name, color] of [
+    [ids[0], "🍎 Air A", "blue"],
+    [ids[1], "🚀 Air B", "rose"],
+  ]) {
     await pane(id).locator(".pane-label").click();
     await checkParent();
-    assert.equal(await pane(id).getAttribute("data-tab-color"), color);
-    assert.ok(
-      (await pane(id).locator(".pane-label").innerText()).startsWith(
-        name + " ·",
-      ),
+    const other = id === ids[0] ? ids[1] : ids[0];
+    await page.waitForFunction(
+      ([id, other]) =>
+        document
+          .querySelector(`.pane-header[data-pane="${id}"]`)
+          ?.classList.contains("active") &&
+        !document
+          .querySelector(`.pane-header[data-pane="${other}"]`)
+          ?.classList.contains("active"),
+      [id, other],
     );
+    if (staticControls) {
+      assert.equal(await pane(id).getAttribute("data-tab-color"), color);
+      assert.ok(
+        (await pane(id).locator(".pane-label").innerText()).startsWith(
+          name + " ·",
+        ),
+      );
+    }
     const frame = await pane(id).evaluate(
       (el) => getComputedStyle(el).borderBottomColor,
     );
-    const colors = await page
+    const outline = await page
       .locator(".focused-pane, .pane-header.active")
       .evaluateAll((nodes) =>
-        nodes.flatMap((el) => {
+        nodes.map((el) => {
           const s = getComputedStyle(el);
-          return [
-            s.borderTopColor,
-            s.borderRightColor,
-            s.borderBottomColor,
-            s.borderLeftColor,
-          ];
+          return {
+            header: el.classList.contains("pane-header"),
+            colors: [
+              s.borderTopColor,
+              s.borderRightColor,
+              s.borderBottomColor,
+              s.borderLeftColor,
+            ],
+          };
         }),
       );
+    // The header's bottom border is the session's identity stripe, a separate
+    // line from the focus frame (style.css), so the frame leaves it out.
+    const focusFrame = outline.flatMap(({ header, colors }) =>
+      header ? colors.filter((_, side) => side !== 2) : colors,
+    );
     assert.ok(
-      colors.every((c) => c === frame),
-      "active session uses its own color for the entire outline",
+      outline.some(({ header }) => header) &&
+        outline.some(({ header }) => !header) &&
+        focusFrame.every((c) => c === focusFrame[0]),
+      "active session has a single-color focus frame",
     );
-    const other = id === ids[0] ? ids[1] : ids[0];
-    assert.notEqual(
-      await pane(other).evaluate(
-        (el) => getComputedStyle(el).borderBottomColor,
-      ),
-      frame,
-      "inactive session keeps its own colored underline",
-    );
+    if (staticControls)
+      assert.ok(
+        outline.flatMap(({ colors }) => colors).every((c) => c === frame),
+        "active session uses its own color for the entire outline",
+      );
+    if (staticControls)
+      assert.notEqual(
+        await pane(other).evaluate(
+          (el) => getComputedStyle(el).borderBottomColor,
+        ),
+        frame,
+        "inactive session keeps its own colored underline",
+      );
   }
   await page.screenshot({ path: ".build/independent-group-appearance.png" });
   await tab(ids[2]).dragTo(page.locator(".group-tab"));

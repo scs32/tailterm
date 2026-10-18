@@ -66,7 +66,13 @@ async function seed(name) {
     recommendedOptionId: "one", recommendationReason: "It keeps this fixture small.",
   }, 201);
   await api("POST", `/v1/tasks/${alpha.task.id}/decisions/${decision.seq}/answer`, { requestId: `${name}-answer`, optionId: "one" }, 201);
-  return { alpha, beta, closed, items, decision };
+  // A closed agent never turns offline, so the Projects clock must not start
+  // from it. Kept out of alpha.agents so later checks keep their indexes.
+  const alphaClosed = await api("POST", `/v1/tasks/${alpha.task.id}/agents`, {
+    name: "runner-old", host: "synthetic.invalid", session: "unused-fixture", runtime: "codex", cwd: stateDir,
+  }, 201);
+  await api("DELETE", `/v1/tasks/${alpha.task.id}/agents/${alphaClosed.id}?runId=${alphaClosed.runId}`);
+  return { alpha, alphaClosed, beta, closed, items, decision };
 }
 
 function html() { return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -314,9 +320,24 @@ try {
     });
     await check(`${name} Projects30s status clock keeps Closed expanded`, async () => {
       // Agents turn offline 90s after they were last seen. Start 70s after the
-      // oldest one, so only the 30s clock tick can reveal "offline".
+      // oldest one that can turn offline, so only the 30s clock tick can reveal
+      // "offline". Exited, closed and retired agents never do (tasks-view.js).
+      const seen = a => Date.parse(a.lastSeenAt) > 0 ? Date.parse(a.lastSeenAt) : Date.parse(a.createdAt);
+      const closedAge = Date.parse(data.alphaClosed.createdAt);
+      assert.ok(closedAge > 0, "closed fixture agent has no creation time");
+      // Report the live runners in at least 15s after the closed agent was made,
+      // so a clock started from the closed agent starts too early to ever show
+      // "offline" after the tick.
+      await pause(Math.max(0, closedAge + 15000 - Date.now()));
+      for (const agent of data.alpha.agents) await api("POST", `/v1/tasks/${data.alpha.task.id}/events`, {
+        agentId: agent.id, runId: agent.runId, kind: "started",
+      }, 201);
       const { agents } = await api("GET", `/v1/tasks/${data.alpha.task.id}`);
-      const oldest = Math.min(...agents.filter(a => a.runId).map(a => Date.parse(a.lastSeenAt) > 0 ? Date.parse(a.lastSeenAt) : Date.parse(a.createdAt)));
+      assert.equal(agents.find(a => a.id === data.alphaClosed.id)?.status, "closed");
+      const live = agents.filter(a => a.runId && !["exited", "closed", "retired"].includes(a.status));
+      assert.deepEqual(live.map(a => a.id).sort(), data.alpha.agents.map(a => a.id).sort());
+      const oldest = Math.min(...live.map(seen));
+      assert.ok(oldest - closedAge >= 15000, `oldest live agent is only ${oldest - closedAge}ms newer than the closed one`);
       await open("tasks", 1440, new Date(oldest + 70000)); await page.locator(".board-closed summary").click();
       await expect(page.locator(".task-detail-card")).not.toContainText("offline");
       await page.clock.fastForward(30001);

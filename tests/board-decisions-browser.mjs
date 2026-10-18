@@ -533,7 +533,12 @@ try {
         el.scrollTop = Math.min(180, el.scrollHeight - el.clientHeight); return el.scrollTop;
       }))).toBeGreaterThan(0);
       assert.ok(scroll > 0, "fixture must exercise a scrollable decision panel");
+      // reload() returns at once while another reload is pending, so read the
+      // restored scroll only from the panel that replaced this one.
+      const scrolledPanel = await page.evaluateHandle(() => document.querySelector("#board-decisions"));
       await page.evaluate(() => qa.board.reload());
+      await page.waitForFunction(element => !element.isConnected, scrolledPanel);
+      await scrolledPanel.dispose();
       await expect.poll(() => historyOpen(page)).toBe(true);
       await expect.poll(() => page.evaluate(() => document.querySelector("#board-decisions")?.scrollTop)).toBe(scroll);
       await page.evaluate(id => qa.show(id), other.task.id);

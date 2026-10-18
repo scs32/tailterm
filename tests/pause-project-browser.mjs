@@ -32,6 +32,7 @@ let cleanupRound=0;
 let lostResumeResponse=true;
 let failedLeadConfirmation=false;
 let failedWorkerLaunch=false;
+let failedHandlerLaunch=false;
 let resumeRequest=null;
 const requests=[];
 const commands=[];
@@ -93,6 +94,7 @@ const host={
      const member=journal?.members.find(candidate=>candidate.state==='uncertain');
      if(!member) throw Error('Synthetic spawn has no uncertain frozen member');
      const fields=member.fields;
+     if(fields.agentRole==='database_handler'&&!failedHandlerLaunch){failedHandlerLaunch=true;throw Error('Synthetic handler launch failed before registration')}
      if(fields.name==='worker'&&!failedWorkerLaunch){failedWorkerLaunch=true;throw Object.assign(Error('Synthetic worker launch failed before admission'),{verifiedUnstarted:true})}
      let fresh=agents.find(agent=>agent.id===fields.agentId);
      if(!fresh){
@@ -362,11 +364,60 @@ try {
         "the synthetic unconfirmed lead registration was not retained exactly",
       );
 
+      // The handler spawn fails before it registers; the same open dialog
+      // retries it with its frozen command.
+      const handlerID = await page.evaluate(
+        () =>
+          window.fixture.data.teamLaunchPlans[0].members.find(
+            (candidate) => candidate.fields.agentRole === "database_handler",
+          ).fields.agentId,
+      );
+      await page.getByTestId("resume-project-confirm").click();
+      await page.waitForFunction(() =>
+        document
+          .querySelector("#project-resume-status")
+          ?.textContent.includes("handler launch failed"),
+      );
+      const failedHandler = await page.evaluate(
+        (handlerID) => ({
+          running: window.fixture.agents.filter(
+            (agent) =>
+              agent.taskId === window.fixture.taskA.id &&
+              agent.status === "running",
+          ).length,
+          registered: window.fixture.agents.some(
+            (agent) => agent.id === handlerID,
+          ),
+          state: window.fixture.data.teamLaunchPlans[0].members.find(
+            (candidate) => candidate.fields.agentId === handlerID,
+          ).state,
+        }),
+        handlerID,
+      );
+      assert.deepEqual(
+        failedHandler,
+        { running: 1, registered: false, state: "uncertain" },
+        "the failed handler launch did not leave only the lead running",
+      );
+
       await page.getByTestId("resume-project-confirm").click();
       await page.waitForFunction(() =>
         document
           .querySelector("#project-resume-status")
           ?.textContent.includes("worker launch failed"),
+      );
+      const retriedHandlerCommands = await page.evaluate(
+        (handlerID) =>
+          window.fixture.commands.filter((command) =>
+            command.includes(handlerID),
+          ),
+        handlerID,
+      );
+      assert.equal(retriedHandlerCommands.length, 2);
+      assert.equal(
+        retriedHandlerCommands[0],
+        retriedHandlerCommands[1],
+        "handler retry in the same dialog changed its frozen command",
       );
       assert.equal(
         await page.evaluate(() => window.fixture.taskA.pauseState),
@@ -469,10 +520,9 @@ try {
           ),
         missingHandler.id,
       );
-      assert.equal(handlerCommands.length, 2);
-      assert.equal(
-        handlerCommands[0],
-        handlerCommands[1],
+      assert.equal(handlerCommands.length, 3);
+      assert.ok(
+        handlerCommands.every((command) => command === handlerCommands[0]),
         "missing handler retry changed its frozen command",
       );
       const workerCommand = await page.evaluate(() =>
