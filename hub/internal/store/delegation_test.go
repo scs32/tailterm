@@ -514,13 +514,22 @@ func TestDelegatedAnswerIsNeverAMatrixApproval(t *testing.T) {
 	if err := f.s.db.QueryRow(`SELECT id FROM obligations WHERE message_seq=?`, req.Seq).Scan(&obligation); err != nil {
 		t.Fatal(err)
 	}
-	out, err := f.s.AnswerObligation(f.ctx, f.task.ID, obligation, api.ObligationAnswerRequest{AgentID: delegate.ID, RunID: delegate.RunID, Text: "Option A", Rationale: "Safer.", RequestID: "delegate"}, f.by)
+	token := matrixApprovalPrefix + p.MatrixDigest
+	if _, err := f.s.AnswerObligation(f.ctx, f.task.ID, obligation, api.ObligationAnswerRequest{AgentID: delegate.ID, RunID: delegate.RunID, Text: token, Rationale: "Safer.", RequestID: "delegate"}, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "a delegate cannot give one") {
+		t.Fatal("a delegate answered with the matrix approval token", err)
+	}
+	// The token can still reach the board on the delegate's own post, whose
+	// text matches exactly, so only the owner-author rule refuses it.
+	post, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: delegate.ID, RunID: delegate.RunID, Text: token, RequestID: "delegate-token"}, f.by)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.MatrixApprovalMessageSeq = out.Message.Seq
-	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "delegated-approval", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) {
-		t.Fatal("a delegated answer served as the owner's matrix approval", err)
+	if post.From.AgentID != delegate.ID || strings.TrimSpace(post.Text) != token {
+		t.Fatalf("delegate token post %+v", post)
+	}
+	p.MatrixApprovalMessageSeq = post.Seq
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "delegated-approval", AgentID: h.ID, RunID: h.RunID, Plan: &p}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "owner matrix approval source does not bind exact digest") {
+		t.Fatal("a delegate's token served as the owner's matrix approval", err)
 	}
 }
 
