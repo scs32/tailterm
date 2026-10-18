@@ -413,42 +413,59 @@ try {
         const size = page.viewportSize();
         for (const width of [1100, 390]) {
           await page.setViewportSize({ width, height: size.height });
-          const found = await send.evaluate((button) => {
-            const notice = document.querySelector("#notice");
-            const n = notice.getBoundingClientRect();
-            const centre = (node) => {
-              const box = node.getBoundingClientRect();
-              const top = document.elementFromPoint(
-                box.left + box.width / 2,
-                box.top + box.height / 2,
+          // The Board can still be laying out at the old width just after the
+          // resize, so read again until the layout settles. The fixture
+          // notice never hides, so a notice that really covers Send or a
+          // control keeps failing here.
+          const read = () =>
+            send.evaluate(async (button) => {
+              await new Promise((resolve) =>
+                requestAnimationFrame(() => requestAnimationFrame(resolve)),
               );
-              return top === node || node.contains(top)
-                ? "self"
-                : top?.id || top?.tagName || "nothing";
-            };
-            const controls = [
-              ...document.querySelectorAll(
-                "main > header :is(button, select, input), #board-compose :is(button, select, input, textarea)",
-              ),
-            ].filter((node) => node.getClientRects().length);
-            return {
-              shown:
-                getComputedStyle(notice).display !== "none" && n.height > 0,
-              send: centre(button),
-              covered: controls
-                .filter((node) => {
-                  const box = node.getBoundingClientRect();
-                  return (
-                    box.left < n.right &&
-                    n.left < box.right &&
-                    box.top < n.bottom &&
-                    n.top < box.bottom
-                  );
-                })
-                .map((node) => node.id || node.textContent.trim()),
-              checked: controls.length,
-            };
-          });
+              const notice = document.querySelector("#notice");
+              const n = notice.getBoundingClientRect();
+              const centre = (node) => {
+                const box = node.getBoundingClientRect();
+                const top = document.elementFromPoint(
+                  box.left + box.width / 2,
+                  box.top + box.height / 2,
+                );
+                return top === node || node.contains(top)
+                  ? "self"
+                  : top?.id || top?.tagName || "nothing";
+              };
+              const controls = [
+                ...document.querySelectorAll(
+                  "main > header :is(button, select, input), #board-compose :is(button, select, input, textarea)",
+                ),
+              ].filter((node) => node.getClientRects().length);
+              return {
+                shown:
+                  getComputedStyle(notice).display !== "none" && n.height > 0,
+                send: centre(button),
+                covered: controls
+                  .filter((node) => {
+                    const box = node.getBoundingClientRect();
+                    return (
+                      box.left < n.right &&
+                      n.left < box.right &&
+                      box.top < n.bottom &&
+                      n.top < box.bottom
+                    );
+                  })
+                  .map((node) => node.id || node.textContent.trim()),
+                checked: controls.length,
+              };
+            });
+          let found = await read();
+          for (
+            let tries = 0;
+            tries < 40 && (found.send !== "self" || found.covered.length);
+            tries++
+          ) {
+            await pause(50);
+            found = await read();
+          }
           const where = `${name} ${label} at ${width} px`;
           assert.ok(found.shown, where + ": notice is showing");
           assert.ok(found.checked > 10, where + ": header and composer found");
