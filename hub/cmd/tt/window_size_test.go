@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -67,7 +68,7 @@ func TestRelayReconcileRestoresShrunkAgentWindowOnly(t *testing.T) {
 	var writes []string
 	var logs []string
 	counting := func(ctx context.Context, args ...string) ([]byte, error) {
-		if args[0] != "list-windows" {
+		if !slices.Contains(args, "list-windows") {
 			writes = append(writes, strings.Join(args, " "))
 		}
 		return startupTmux(ctx, args...)
@@ -229,6 +230,42 @@ func TestWindowSizeSkipsOwnerHelper(t *testing.T) {
 	}
 }
 
+// TestWindowSizeWithoutUTF8Locale is the relay LaunchAgent's environment: no
+// LC_ALL, LC_CTYPE or LANG and not inside tmux, so a tmux client prints the
+// list-windows tabs as "_" unless it is marked UTF-8 capable.
+func TestWindowSizeWithoutUTF8Locale(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	for _, name := range []string{"LC_ALL", "LC_CTYPE", "LANG", "TMUX"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
+	sock := fmt.Sprintf("tt-c-locale-size-%d-%d", os.Getpid(), time.Now().UnixNano())
+	t.Setenv("TT_TMUX_SOCKET", sock)
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
+	run := func(args ...string) string {
+		out, err := exec.Command("tmux", append([]string{"-L", sock, "-f", "/dev/null"}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("new-session", "-d", "-s", "agent", "-x", "100", "-y", "30", "-e", "TAILTERM_HUB=http://hub.test", "-e", "TAILTERM_TASK=tsk_0000000000000001",
+		"-e", "TAILTERM_AGENT=agt_0000000000000001", "-e", "TAILTERM_RUN=run_0000000000000001", "sleep 60")
+	run("set-option", "-w", "-t", "agent:", "window-size", "latest")
+	if got := run("display-message", "-p", "#{session_id}\t#{window_id}"); strings.Contains(got, "\t") {
+		t.Fatalf("fixture did not reproduce the C locale: %q", got)
+	}
+	changed, err := reconcileAgentWindowSizes(context.Background(), startupTmux, func(string, ...any) {})
+	if err != nil || changed != 1 {
+		t.Fatalf("changed=%d err=%v", changed, err)
+	}
+	if got := run("display-message", "-p", "-t", "agent:", "#{window_width}x#{window_height} #{window-size}"); got != "200x50 manual" {
+		t.Fatalf("agent window not reconciled: %q", got)
+	}
+}
+
 // slowTmuxFormat expands to nothing but takes tmux longer than its 100 ms
 // format limit on a server with four sessions, so every field after it in the
 // same format is cut: expanded to nothing, exit status 0.
@@ -269,7 +306,7 @@ func TestWindowSizeKeepsManualWindowWhenListIsCut(t *testing.T) {
 			lists := 0
 			var writes []string
 			cutting := func(ctx context.Context, args ...string) ([]byte, error) {
-				if args[0] != "list-windows" {
+				if !slices.Contains(args, "list-windows") {
 					writes = append(writes, strings.Join(args, " "))
 					return startupTmux(ctx, args...)
 				}

@@ -68,9 +68,14 @@ func reconcileAgentWindowSizes(ctx context.Context, run func(context.Context, ..
 // exiting 0, so a cut row can keep its six fields with the last one empty: a
 // manual window would then read as not manual and be resized. When any row is
 // not whole the list is read once more; rows still cut are left out.
+//
+// -u marks the client as UTF-8 capable. Without it a client whose LC_ALL,
+// LC_CTYPE or LANG names no UTF-8 locale, and that is not inside tmux, gets
+// every byte outside printable ASCII printed as "_", tabs included, so no row
+// would split: the relay LaunchAgent sets only PATH.
 func listAgentWindows(ctx context.Context, run func(context.Context, ...string) ([]byte, error)) ([][]string, error) {
 	for read := 0; ; read++ {
-		raw, err := run(ctx, "list-windows", "-a", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window-size}")
+		raw, err := run(ctx, "-u", "list-windows", "-a", "-F", "#{session_id}\t#{session_name}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window-size}")
 		if err != nil {
 			return nil, fmt.Errorf("list agent windows: %w", err)
 		}
