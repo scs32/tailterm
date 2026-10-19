@@ -187,11 +187,12 @@ Notes:
   `!negation`. As in OpenSSH, a `HostName` before the first `Host` or `Match`
   applies to every host, an included file starts in the including block's
   state, and that state is restored when the `Include` returns. A file
-  included from an inactive block (a non-matching `Host` or a `Match`) is read
-  as never-match, as OpenSSH does: no `Host` in it or its nested `Include`s
-  applies. `Match` blocks are never evaluated: with an alias present they make
-  the line `warn` ("Match rules not evaluated"), except in a never-match file,
-  where they cannot apply; confirm with `ssh -G truenas` yourself.
+  included from a non-matching `Host` block is read as never-match, as OpenSSH
+  does: no `Host` in it or its nested `Include`s applies. `Match` blocks are
+  never evaluated, so a file included under one keeps the caller's state and
+  its `Host` lines can still apply; with an alias present a `Match` makes the
+  line `warn` ("Match rules not evaluated"), except in a never-match file,
+  where it cannot apply. Confirm with `ssh -G truenas` yourself.
 - The container runtime runs the migration rehearsal of a release whose store
   schema changed, under the production hub container's constraints
   ([project deployment](project-deployment.md), "Migration rehearsal

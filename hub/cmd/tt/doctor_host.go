@@ -1094,14 +1094,16 @@ func sshRouteCheck(d *doctorRun) doctorResult {
 	return checkOK("Host truenas -> HostName set")
 }
 
-// sshScan walks a config and its Includes. neverMatch marks a file included
-// from an inactive block: as with OpenSSH's SSHCONF_NEVERMATCH, no Host or
-// Match in it can activate.
+// sshScan walks a config and its Includes. hostMiss marks a block opened by a
+// non-matching Host. neverMatch marks a file included from such a block: as
+// with OpenSSH's SSHCONF_NEVERMATCH, no Host or Match in it can activate. A
+// Match is not evaluated, so a file included under one keeps the caller's
+// state instead.
 type sshScan struct {
 	d                                *doctorRun
 	alias                            string
 	seen                             map[string]bool
-	inBlock, neverMatch              bool
+	inBlock, hostMiss, neverMatch    bool
 	aliasBlock, aliasHostName, match bool
 }
 
@@ -1129,12 +1131,13 @@ func (s *sshScan) file(path string, depth int) {
 		switch keyword {
 		case "host":
 			s.inBlock = !s.neverMatch && sshHostMatches(strings.Fields(args), s.alias)
+			s.hostMiss = !s.inBlock
 			if s.inBlock {
 				s.aliasBlock = true
 			}
 		case "match":
 			// A Match in a never-match file cannot apply, so it needs no note.
-			s.match, s.inBlock = s.match || !s.neverMatch, false
+			s.match, s.inBlock, s.hostMiss = s.match || !s.neverMatch, false, false
 		case "hostname":
 			if s.inBlock && args != "" {
 				s.aliasHostName = true
@@ -1151,12 +1154,12 @@ func (s *sshScan) file(path string, depth int) {
 				sort.Strings(matches)
 				// As in OpenSSH, an included file starts in the caller's
 				// state and a Host or Match in it ends with the file. A file
-				// included from an inactive block is never-match.
-				active, never := s.inBlock, s.neverMatch
+				// included from a non-matching Host is never-match.
+				active, miss, never := s.inBlock, s.hostMiss, s.neverMatch
 				for _, m := range matches {
-					s.neverMatch = !active
+					s.neverMatch = never || miss
 					s.file(m, depth+1)
-					s.inBlock, s.neverMatch = active, never
+					s.inBlock, s.hostMiss, s.neverMatch = active, miss, never
 				}
 			}
 		}
