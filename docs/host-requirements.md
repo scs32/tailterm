@@ -55,7 +55,7 @@ Client, plus:
 | Codex CLI | on PATH | `brew install codex` | npm or release binary | `codex` |
 | Codex login | `codex login status` exits 0 | `codex login` | same | `codex login` |
 | Codex Stop hook | `~/.codex/hooks.json` (or `$CODEX_HOME`) has `tt hook stop` | `tt hooks codex --install` | same | `codex Stop hook` |
-| Claude hooks (optional) | the `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PreToolUse` and `PostToolUse` `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
+| Claude hooks (optional) | the `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PreToolUse`, `PostToolUse` and `PostToolUseFailure` `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
 | Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist`, or a LaunchDaemon at `/Library/LaunchDaemons/com.tailterm.inbox-relay.plist` | `tt host setup` (`--service daemon` for the LaunchDaemon; [host setup](host-setup.md)) | none yet (to fix) | `relay service installed` |
 | Relay running | `launchctl print gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `system/com.tailterm.inbox-relay`) shows `state = running` | `launchctl kickstart -k gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `sudo launchctl kickstart -k system/com.tailterm.inbox-relay`) | none yet (to fix) | `relay running` |
 
@@ -69,8 +69,8 @@ Mapping notes:
 - `claude hooks` covers `adapters.ClaudeHooks` (`hub/internal/adapters/adapters.go`):
   `SessionStart`, `UserPromptSubmit`, `Stop` and `Notification` each need a
   command ending in `hook session-start`, `hook prompt`, `hook stop` and `hook
-  notification`, and the tool ledger hooks `PreToolUse` and `PostToolUse` each
-  need one ending in `hook tool`. The Claude hooks are optional
+  notification`, and the tool ledger hooks `PreToolUse`, `PostToolUse` and
+  `PostToolUseFailure` each need one ending in `hook tool`. The Claude hooks are optional
   ([tasks.md](tasks.md): "remain optional"), and the Mini has none, so a
   missing hook is `warn`. The Codex Stop hook is required: broker phase 3.1
   relies on it to hold a Codex turn open while work is unacknowledged.
@@ -186,9 +186,12 @@ Notes:
   globs, cycles skipped, depth 16), and `Host` patterns with `*`, `?` and
   `!negation`. As in OpenSSH, a `HostName` before the first `Host` or `Match`
   applies to every host, an included file starts in the including block's
-  state, and that state is restored when the `Include` returns. `Match`
-  blocks are never evaluated: with an alias present they make the line `warn`
-  ("Match rules not evaluated"); confirm with `ssh -G truenas` yourself.
+  state, and that state is restored when the `Include` returns. A file
+  included from an inactive block (a non-matching `Host` or a `Match`) is read
+  as never-match, as OpenSSH does: no `Host` in it or its nested `Include`s
+  applies. `Match` blocks are never evaluated: with an alias present they make
+  the line `warn` ("Match rules not evaluated"), except in a never-match file,
+  where they cannot apply; confirm with `ssh -G truenas` yourself.
 - The container runtime runs the migration rehearsal of a release whose store
   schema changed, under the production hub container's constraints
   ([project deployment](project-deployment.md), "Migration rehearsal

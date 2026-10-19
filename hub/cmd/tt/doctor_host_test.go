@@ -458,17 +458,20 @@ printf 'system/com.tailterm.inbox-relay = {\n\tactive count = 1\n\tstate = runni
 "Notification":[{"hooks":[{"type":"command","command":"tt hook notification"}]}],
 "PreToolUse":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook tool"}]}]}}`, 0o644)
 		h.file(".claude/settings.local.json", `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tt hook stop"}]}],
-"PostToolUse":[{"hooks":[{"type":"command","command":"tt hook tool"}]}]}}`, 0o644)
-		expectLine(t, h.run("agent"), "claude hooks", "ok", "SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse and PostToolUse", 0)
+"PostToolUse":[{"hooks":[{"type":"command","command":"tt hook tool"}]}],
+"PostToolUseFailure":[{"hooks":[{"type":"command","command":"tt hook tool"}]}]}}`, 0o644)
+		expectLine(t, h.run("agent"), "claude hooks", "ok", "SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure", 0)
 	})
 	t.Run("claude hooks without the tool ledger hooks", func(t *testing.T) {
 		session := `"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
 "Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}]`
 		for _, c := range []struct{ extra, detail string }{
-			{"", "no PreToolUse, PostToolUse; optional"},
-			{`,"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PostToolUse; optional"},
-			{`,"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PreToolUse; optional"},
-			{`,"PreToolUse":[{"hooks":[{"command":"tt hook stop"}]}],"PostToolUse":[{"hooks":[{"command":"other tool"}]}]`, "no PreToolUse, PostToolUse; optional"},
+			{"", "no PreToolUse, PostToolUse, PostToolUseFailure; optional"},
+			{`,"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PostToolUse, PostToolUseFailure; optional"},
+			{`,"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PreToolUse, PostToolUseFailure; optional"},
+			{`,"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PostToolUseFailure; optional"},
+			{`,"PostToolUseFailure":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PreToolUse, PostToolUse; optional"},
+			{`,"PreToolUse":[{"hooks":[{"command":"tt hook stop"}]}],"PostToolUse":[{"hooks":[{"command":"other tool"}]}]`, "no PreToolUse, PostToolUse, PostToolUseFailure; optional"},
 		} {
 			h := newDoctorHost(t)
 			h.file(".claude/settings.json", `{"hooks":{`+session+c.extra+`}}`, 0o644)
@@ -481,7 +484,8 @@ printf 'system/com.tailterm.inbox-relay = {\n\tactive count = 1\n\tstate = runni
 		h.file("alt/settings.json", `{"hooks":{
 "SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
 "Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}],
-"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]}}`, 0o644)
+"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}],
+"PostToolUseFailure":[{"hooks":[{"command":"tt hook tool"}]}]}}`, 0o644)
 		expectLine(t, h.run("agent"), "claude hooks", "ok", "", 0)
 	})
 	t.Run("claude hooks absent", func(t *testing.T) {
@@ -900,7 +904,17 @@ func TestDoctorRoleRelease(t *testing.T) {
 		{name: "ssh top-level hostname", config: "HostName SECRET-SSH-654\nHost truenas\n  User root\n", status: "ok", detail: "HostName set"},
 		{name: "ssh top-level hostname in include", config: "Include extra\n", include: map[string]string{".ssh/extra": "HostName SECRET-SSH-654\n"}, status: "ok"},
 		{name: "ssh include keeps other block", config: "Host other\n  Include extra\n  HostName SECRET-SSH-654\n",
-			include: map[string]string{".ssh/extra": "Host truenas\n  User root\n"}, status: "missing", detail: "has no HostName"},
+			include: map[string]string{".ssh/extra": "Host truenas\n  User root\n"}, status: "missing", detail: "no Host truenas"},
+		{name: "ssh include from other block is never-match", config: "Host other\n  Include b.conf\n",
+			include: map[string]string{".ssh/b.conf": "Host truenas\n  HostName SECRET-SSH-654\n"}, status: "missing", detail: "no Host truenas"},
+		{name: "ssh include from match is never-match", config: "Match exec \"false\"\n  Include b.conf\n",
+			include: map[string]string{".ssh/b.conf": "Host truenas\n  HostName SECRET-SSH-654\n"}, status: "missing", detail: "no Host truenas"},
+		{name: "ssh nested include from other block is never-match", config: "Host other\n  Include b.conf\n",
+			include: map[string]string{".ssh/b.conf": "Include c.conf\n", ".ssh/c.conf": "Host truenas\n  HostName SECRET-SSH-654\n"}, status: "missing", detail: "no Host truenas"},
+		{name: "ssh never-match ends with the include", config: "Host other\n  Include b.conf\nHost truenas\n  HostName SECRET-SSH-654\n",
+			include: map[string]string{".ssh/b.conf": "Host truenas\n  User root\nMatch all\n  User root\n"}, status: "ok", detail: "HostName set"},
+		{name: "ssh include from alias block can switch", config: "Host truenas\n  Include b.conf\n",
+			include: map[string]string{".ssh/b.conf": "Host other\n  User root\nHost truenas\n  HostName SECRET-SSH-654\n"}, status: "ok", detail: "HostName set"},
 		{name: "ssh include keeps alias block", config: "Host truenas\n  Include extra\n  HostName SECRET-SSH-654\n",
 			include: map[string]string{".ssh/extra": "Host other\n  User root\n"}, status: "ok", detail: "HostName set"},
 		{name: "ssh include keeps alias block after match", config: "Host truenas\n  Include extra\n  HostName SECRET-SSH-654\n",

@@ -487,14 +487,15 @@ func loginCheck(name, tool string, args []string, fix string) doctorCheck {
 
 // claudeHooksCheck looks for the hooks tt hooks claude prints
 // (internal/adapters ClaudeHooks) in Claude's user settings files: the four
-// session hooks and the PreToolUse and PostToolUse tool ledger hooks.
+// session hooks and the PreToolUse, PostToolUse and PostToolUseFailure tool
+// ledger hooks.
 func claudeHooksCheck(d *doctorRun) doctorResult {
 	dir := d.p.env("CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		dir = d.home(".claude")
 	}
-	events := map[string]string{"SessionStart": "hook session-start", "UserPromptSubmit": "hook prompt", "Stop": "hook stop", "Notification": "hook notification",
-		"PreToolUse": "hook tool", "PostToolUse": "hook tool"}
+	events := []struct{ event, suffix string }{{"SessionStart", "hook session-start"}, {"UserPromptSubmit", "hook prompt"}, {"Stop", "hook stop"},
+		{"Notification", "hook notification"}, {"PreToolUse", "hook tool"}, {"PostToolUse", "hook tool"}, {"PostToolUseFailure", "hook tool"}}
 	found := map[string]bool{}
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		b, err := d.p.readFile(filepath.Join(dir, name))
@@ -511,25 +512,25 @@ func claudeHooksCheck(d *doctorRun) doctorResult {
 		if json.Unmarshal(b, &doc) != nil {
 			continue
 		}
-		for event, suffix := range events {
-			for _, entry := range doc.Hooks[event] {
+		for _, e := range events {
+			for _, entry := range doc.Hooks[e.event] {
 				for _, h := range entry.Hooks {
-					if strings.HasSuffix(strings.TrimSpace(h.Command), suffix) {
-						found[event] = true
+					if strings.HasSuffix(strings.TrimSpace(h.Command), e.suffix) {
+						found[e.event] = true
 					}
 				}
 			}
 		}
 	}
 	if len(found) == len(events) {
-		return checkOK("SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse and PostToolUse")
+		return checkOK("SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure")
 	}
 	detail := "not installed; optional (docs/tasks.md)"
 	if len(found) > 0 {
 		var missing []string
-		for _, event := range []string{"SessionStart", "UserPromptSubmit", "Stop", "Notification", "PreToolUse", "PostToolUse"} {
-			if !found[event] {
-				missing = append(missing, event)
+		for _, e := range events {
+			if !found[e.event] {
+				missing = append(missing, e.event)
 			}
 		}
 		detail = "no " + strings.Join(missing, ", ") + "; optional (docs/tasks.md)"
@@ -1093,11 +1094,14 @@ func sshRouteCheck(d *doctorRun) doctorResult {
 	return checkOK("Host truenas -> HostName set")
 }
 
+// sshScan walks a config and its Includes. neverMatch marks a file included
+// from an inactive block: as with OpenSSH's SSHCONF_NEVERMATCH, no Host or
+// Match in it can activate.
 type sshScan struct {
 	d                                *doctorRun
 	alias                            string
 	seen                             map[string]bool
-	inBlock                          bool
+	inBlock, neverMatch              bool
 	aliasBlock, aliasHostName, match bool
 }
 
@@ -1124,12 +1128,13 @@ func (s *sshScan) file(path string, depth int) {
 		args := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line[i:]), "="))
 		switch keyword {
 		case "host":
-			s.inBlock = sshHostMatches(strings.Fields(args), s.alias)
+			s.inBlock = !s.neverMatch && sshHostMatches(strings.Fields(args), s.alias)
 			if s.inBlock {
 				s.aliasBlock = true
 			}
 		case "match":
-			s.match, s.inBlock = true, false
+			// A Match in a never-match file cannot apply, so it needs no note.
+			s.match, s.inBlock = s.match || !s.neverMatch, false
 		case "hostname":
 			if s.inBlock && args != "" {
 				s.aliasHostName = true
@@ -1145,11 +1150,13 @@ func (s *sshScan) file(path string, depth int) {
 				matches, _ := s.d.p.glob(arg)
 				sort.Strings(matches)
 				// As in OpenSSH, an included file starts in the caller's
-				// state and a Host or Match in it ends with the file.
-				active := s.inBlock
+				// state and a Host or Match in it ends with the file. A file
+				// included from an inactive block is never-match.
+				active, never := s.inBlock, s.neverMatch
 				for _, m := range matches {
+					s.neverMatch = !active
 					s.file(m, depth+1)
-					s.inBlock = active
+					s.inBlock, s.neverMatch = active, never
 				}
 			}
 		}
