@@ -479,8 +479,12 @@ good listing, whatever its age, for the teams it already lists as launching or
 running, and reads each of those entries again by itself before acting. It starts
 no queued entry from an old listing, and on a tick whose host listing did not
 answer it takes no host census, so a parallel team that is launching waits for a
-live host listing. It tries a live listing again after 6 seconds doubling to a
-minute, and posts one `Queue listing slow` notice per episode to the owner helper.
+live host listing. A launching team, serial or parallel, also makes its own live
+listing of its project's queue before each spawn, so while that listing times out
+it waits and spawns nothing, and it continues once a listing answers. Running
+teams need no such listing. The tick tries a live listing again after 6 seconds
+doubling to a minute, and posts one `Queue listing slow` notice per episode to the
+owner helper.
 An episode ends only after three ticks in a row whose listings all answered, so a
 hub that alternates between slow and answering stays in one episode with one
 notice. A relay that has never had a host listing knows no project from the hub:
