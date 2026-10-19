@@ -1127,6 +1127,8 @@ type stuckHub struct {
 	// rejectState answers 400 to one more state; rejected counts those.
 	rejectState string
 	rejected    int
+	// obligations is how many open obligations /obligations answers.
+	obligations int
 	reports     []api.AgentActivity
 	seen        map[string]bool
 }
@@ -1138,7 +1140,7 @@ func (h *stuckHub) serve() *httptest.Server {
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents/"+h.agent.ID):
 			_ = json.NewEncoder(w).Encode(h.agent)
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/obligations"):
-			_ = json.NewEncoder(w).Encode(api.ObligationList{})
+			_ = json.NewEncoder(w).Encode(api.ObligationList{Obligations: make([]api.Obligation, h.obligations)})
 		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activity"):
 			var req api.ActivityReport
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -2226,6 +2228,148 @@ func TestActivityProviderBlockedSessionEnd(t *testing.T) {
 		}
 		if len(h.reports) != 1 || h.reports[0].State != "provider_blocked" {
 			t.Fatalf("six quiet hours %+v", h.reports)
+		}
+	})
+}
+
+// wi_67f6c4fd414fac63 g2: a done agent woken into a provider block is
+// reported. It counts as woken while input waits for it (unread messages or
+// open obligations) and this check read a new failure, or the relay last
+// reported it blocked; with no input waiting it reports its ordinary state.
+func TestActivityProviderBlockedWokenDoneAgent(t *testing.T) {
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	now := time.Date(2026, 9, 26, 19, 0, 0, 0, time.UTC)
+	fixtures := map[string]string{"claude": "claude-fable-limit", "codex": "codex-401"}
+	classes := map[string]string{"claude": "usage_limit", "codex": "auth"}
+	reasons := map[string]string{"claude": "turn ended by API error (rate_limit)", "codex": "turn ended by provider error (auth)"}
+	// setup starts a done agent whose transcript holds one failed turn (a
+	// stale block) and returns a writer for the first n fixture records.
+	setup := func(t *testing.T, runtime string) (runtimeBinding, *stuckHub, *api.Client, func(time.Time) error, func(n int, extra ...string)) {
+		t.Helper()
+		b, h, client, tick := stuckFixture(t, runtime)
+		h.agent.Status = api.AgentDone
+		lines := strings.Split(strings.TrimSpace(providerFixture(t, fixtures[runtime])), "\n")
+		path := filepath.Join(os.Getenv("HOME"), ".claude", "projects", "p", b.Thread+".jsonl")
+		if runtime == "codex" {
+			path = filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+		}
+		write := func(n int, extra ...string) {
+			t.Helper()
+			records := append(append([]string{}, lines[:n]...), extra...)
+			if err := os.WriteFile(path, []byte(strings.Join(records, "\n")+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write(5)
+		if err := tick(now); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 1 || h.reports[0].State != "idle" || h.reports[0].Provider != nil || h.reports[0].Reason != reasons[runtime] {
+			t.Fatalf("%s done agent with a stale block %+v", runtime, h.reports)
+		}
+		return b, h, client, tick, write
+	}
+	blocked := func(h *stuckHub) int {
+		n := 0
+		for _, r := range h.reports {
+			if r.State == "provider_blocked" || r.Provider != nil {
+				n++
+			}
+		}
+		return n
+	}
+
+	for _, runtime := range []string{"codex", "claude"} {
+		t.Run(runtime+" woken", func(t *testing.T) {
+			_, h, _, tick, write := setup(t, runtime)
+			h.agent.Unread = 1
+			write(8)
+			if err := tick(now.Add(16 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 2 || h.reports[1].State != "provider_blocked" || h.reports[1].Provider == nil || h.reports[1].Provider.Class != classes[runtime] {
+				t.Fatalf("woken into the block %+v", h.reports)
+			}
+			// Kept while the input waits, with no new report.
+			for i := 2; i <= 5; i++ {
+				if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(h.reports) != 2 {
+				t.Fatalf("steady woken block reported again %+v", h.reports)
+			}
+			// Nothing waits: the ordinary state again, as for any done agent.
+			h.agent.Unread = 0
+			if err := tick(now.Add(2 * time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.reports) != 3 || h.reports[2].State != "idle" || h.reports[2].Provider != nil || h.reports[2].Reason != reasons[runtime] {
+				t.Fatalf("no input waiting %+v", h.reports)
+			}
+		})
+	}
+
+	t.Run("message before the wake", func(t *testing.T) {
+		_, h, _, tick, _ := setup(t, "codex")
+		h.agent.Unread = 1
+		for i := 1; i <= 4; i++ {
+			if err := tick(now.Add(time.Duration(i) * 16 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if blocked(h) != 0 || len(h.reports) != 1 {
+			t.Fatalf("a stale block was reported for an unread message %+v", h.reports)
+		}
+	})
+
+	t.Run("open obligation", func(t *testing.T) {
+		_, h, _, tick, write := setup(t, "codex")
+		h.obligations = 1
+		write(8)
+		if err := tick(now.Add(16 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "provider_blocked" || h.reports[1].Provider == nil {
+			t.Fatalf("woken by an obligation %+v", h.reports)
+		}
+	})
+
+	t.Run("runtime absent", func(t *testing.T) {
+		for _, alive := range [][2]bool{{false, false}, {true, false}, {false, true}} {
+			b, h, client, _, write := setup(t, "codex")
+			h.agent.Unread = 1
+			write(8)
+			probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return alive[0], alive[1], nil }
+			for i := 1; i <= 3; i++ {
+				if err := relayActivityTick(context.Background(), b, client, now.Add(time.Duration(i)*16*time.Second), probe); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if blocked(h) != 0 {
+				t.Fatalf("tmux=%v process=%v %+v", alive[0], alive[1], h.reports)
+			}
+		}
+	})
+
+	t.Run("recovers", func(t *testing.T) {
+		_, h, _, tick, write := setup(t, "claude")
+		h.agent.Unread = 1
+		write(8)
+		if err := tick(now.Add(16 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 2 || h.reports[1].State != "provider_blocked" {
+			t.Fatalf("woken into the block %+v", h.reports)
+		}
+		recovery := `{"type":"assistant","timestamp":"2026-09-26T20:21:00.000Z","message":{"model":"claude-opus-5-5","id":"msg_fixture_recovered","role":"assistant","content":[{"type":"text","text":"Synthetic fixture reply."}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+		write(8, recovery)
+		if err := tick(now.Add(32 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.reports) != 3 || h.reports[2].State != "idle" || h.reports[2].Provider != nil || h.reports[2].Tokens.Output <= h.reports[1].Tokens.Output {
+			t.Fatalf("recovered %+v", h.reports)
 		}
 	})
 }

@@ -146,18 +146,13 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 	// the session can still make calls: its turns fail whatever its status
 	// says. A done agent or a gone runtime makes no calls, so its stale block
 	// is not reported; the cursor keeps it, and a resumed agent reports it
-	// again. A running session's block has no time bound: only provider
-	// evidence clears it, because the episode carries the owner ping and the
-	// login wake while the cause remains (docs/provider-blocked.md).
+	// again. The exception is a done agent woken into the block, which
+	// relayActivityTick reports (wokenDoneProviderBlock). A running session's
+	// block has no time bound: only provider evidence clears it, because the
+	// episode carries the owner ping and the login wake while the cause
+	// remains (docs/provider-blocked.md).
 	if block := reportableProviderBlock(c, threshold); block != nil && a.Status != api.AgentDone && tmuxAlive && processAlive {
-		if !c.ProviderUnsupported {
-			result.State, result.Provider = "provider_blocked", block
-			return result
-		}
-		// An older hub: Claude keeps its idle or finished_silent turn-end
-		// reason below; Codex has no such form.
-		if block.Runtime != "claude" {
-			result.Reason = "provider_blocked: " + block.Class
+		if applyProviderBlock(c, &result, block) {
 			return result
 		}
 	}
@@ -240,6 +235,45 @@ func activityState(c *activityCursor, a api.Agent, openObligations int, tmuxAliv
 		result.Reason = "no recent execution evidence"
 	}
 	return result
+}
+
+// applyProviderBlock sets result to the block's report and reports true when
+// the state is decided. An older hub (ProviderUnsupported) gets the legacy
+// form: Claude keeps its idle or finished_silent turn-end reason, decided by
+// the caller, and Codex has unknown with a "provider_blocked:" reason.
+func applyProviderBlock(c *activityCursor, result *api.AgentActivity, block *api.ProviderBlock) bool {
+	if !c.ProviderUnsupported {
+		result.State, result.Reason, result.Provider = "provider_blocked", "", block
+		return true
+	}
+	if block.Runtime != "claude" {
+		result.State, result.Reason = "unknown", "provider_blocked: "+block.Class
+		return true
+	}
+	return false
+}
+
+// wokenDoneProviderBlock reports the block of a done agent that was woken into
+// it. Codex agents are done between turns (only a Stop hook sets their status),
+// so a wake whose turn fails would otherwise stay silent. The agent counts as
+// woken while input waits for it (unread messages or open obligations) and
+// either this check read a new failure of the block or the relay last reported
+// it blocked. A message that arrived before the wake ran is not a failure, so a
+// stale block is not reported for it. With no input waiting the agent reports
+// its ordinary state again (docs/provider-blocked.md).
+func wokenDoneProviderBlock(c *activityCursor, a api.Agent, state *api.AgentActivity, openObligations int, failed, tmuxAlive, processAlive bool, probeErr error, threshold activityThresholds) {
+	if state.State == "provider_blocked" || a.Status != api.AgentDone || probeErr != nil || !tmuxAlive || !processAlive {
+		return
+	}
+	if a.Unread == 0 && openObligations == 0 {
+		return
+	}
+	if !failed && c.LastState != "provider_blocked" {
+		return
+	}
+	if block := reportableProviderBlock(c, threshold); block != nil {
+		applyProviderBlock(c, state, block)
+	}
 }
 
 // queueMemberActivity is a team member's activity as `tt team queue list`
@@ -375,6 +409,13 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		c.MissingTranscript = true
 	}
 	var transcriptReadErr error
+	// The block before this read, by value: noteProviderFailure changes it in
+	// place. A new class, since or count is a failure this check read.
+	hadBlock := c.ProviderBlock != nil
+	var blockBefore providerBlockCursor
+	if hadBlock {
+		blockBefore = *c.ProviderBlock
+	}
 	if transcript != "" {
 		if c.MissingTranscript {
 			c.Unknown = false
@@ -462,6 +503,8 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			c.Verified = &verifiedActivitySnapshot{Path: c.Path, FileID: c.FileID, Offset: c.Offset, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 		}
 		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+		failed := c.ProviderBlock != nil && (!hadBlock || c.ProviderBlock.Class != blockBefore.Class || !c.ProviderBlock.Since.Equal(blockBefore.Since) || c.ProviderBlock.Count > blockBefore.Count)
+		wokenDoneProviderBlock(&c, a, &state, open, failed, tmuxAlive, processAlive, probeErr, activityDefaults())
 		observed = true
 	}
 	// A live runtime quiet on its own modal prompt is not idle at its input.

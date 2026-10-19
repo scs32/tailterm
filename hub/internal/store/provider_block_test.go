@@ -853,6 +853,81 @@ func TestProviderBlockClearsOnModelReply(t *testing.T) {
 	}
 }
 
+// wi_67f6c4fd414fac63 g1: a done agent's turn report proves nothing about its
+// login (the relay drops a done agent's stale block and reports its turn
+// state), so it closes the episode with no recovery wake or "login restored"
+// notice. A model reply since the block is still recovery, done or not, and a
+// running agent's turn still is.
+func TestProviderBlockDoneAgentRecovery(t *testing.T) {
+	const baseline = 100
+	setup := func(t *testing.T, done bool) (*providerFixture, api.Agent, api.Agent) {
+		t.Helper()
+		f := newProviderFixture(t)
+		a, b := f.agent("codex-0", "codex", 0), f.agent("codex-1", "codex", 0)
+		for _, x := range []api.Agent{a, b} {
+			blocked := api.AgentActivity{State: "provider_blocked", Provider: providerBlock("codex", "auth", f.clock), Tokens: api.TokenTotals{Output: baseline, Total: baseline}}
+			if err := f.report(x, "blocked-"+x.Name, blocked); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if done {
+			if _, err := f.s.db.Exec(`UPDATE agents SET status='done' WHERE id=?`, a.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.advance(10 * time.Minute)
+		f.seen(b, true)
+		return f, a, b
+	}
+	open := func(f *providerFixture, a api.Agent) int {
+		return countRows(f.t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, a.ID)
+	}
+	wakes := func(f *providerFixture, a api.Agent) int {
+		return countRows(f.t, f.s, `SELECT count(*) FROM wake_jobs w JOIN obligations o ON o.id=w.obligation_id WHERE w.agent_id=? AND o.subject=?`, a.ID, providerRecoveryWakeSubject)
+	}
+	cases := []struct {
+		name      string
+		done      bool
+		state     string
+		output    int64
+		open      int // the reporting agent's open episodes afterwards
+		recovered bool
+	}{
+		{name: "dropped/idle", done: true, state: "idle"},
+		{name: "dropped/finished_silent", done: true, state: "finished_silent"},
+		{name: "dropped/working", done: true, state: "working", output: baseline},
+		{name: "done with a model reply", done: true, state: "idle", output: baseline + 50, recovered: true},
+		{name: "running turn still recovers", state: "idle", recovered: true},
+		{name: "done non-turn without a reply", done: true, state: "unknown", output: baseline, open: 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f, a, b := setup(t, c.done)
+			before := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID)
+			if err := f.report(a, "after", api.AgentActivity{State: c.state, Tokens: api.TokenTotals{Output: c.output, Total: c.output}}); err != nil {
+				t.Fatal(err)
+			}
+			if n := open(f, a); n != c.open {
+				t.Fatalf("reporting agent's open episodes %d, want %d", n, c.open)
+			}
+			want := 0
+			if c.recovered {
+				want = 1
+			}
+			notices, owner, jobs := f.notices(providerRecoveryWakeSubject, b.ID), f.notices(providerRecoveryOwnerSubject, ""), wakes(f, b)
+			if notices != want || owner != want || jobs != want {
+				t.Fatalf("peer wake notices=%d owner restored notices=%d peer wake jobs=%d, want %d each", notices, owner, jobs, want)
+			}
+			if n := countRows(t, f.s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID); n != before+2*want {
+				t.Fatalf("report posted %d messages, want %d", n-before, 2*want)
+			}
+			if n := open(f, b); n != 1 {
+				t.Fatalf("peer's open episodes %d, want 1", n)
+			}
+		})
+	}
+}
+
 // A block that returns with a new since is judged against its own blocked
 // report, not the earlier block's lower total.
 func TestProviderBlockReplyBaselineIsPerBlock(t *testing.T) {

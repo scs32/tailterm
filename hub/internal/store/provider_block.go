@@ -105,13 +105,16 @@ func providerBlockText(p api.ProviderBlock) string {
 // providerBlockHook runs in the activity report transaction. A provider_blocked
 // report opens an episode and tells the item lead once; replays, flaps back to
 // the same class and since, and relay restarts find the row and post nothing.
-// A completed or running turn (working, idle, finished_silent) clears the
-// run's open episodes. A report in any other state (an unknown probe, a crash,
-// a stall, a runtime prompt) says nothing about the provider by its state, so
-// it clears an episode only when it shows a model reply since the block: its
-// cumulative output tokens are above those of the episode's own blocked
-// reports (providerBlockOutputBaselines). Without that evidence the episode
-// stays open.
+// A completed or running turn (working, idle, finished_silent) of an agent that
+// is not done is recovery and clears the run's open episodes. A done agent
+// reports a turn state while its stale block is dropped (activity_monitor.go),
+// so its turn proves nothing: that report closes the episodes with no recovery
+// wake or notice, unless it shows a model reply. A report in any other state
+// (an unknown probe, a crash, a stall, a runtime prompt) says nothing about the
+// provider by its state, so it clears an episode only when it shows a model
+// reply since the block: its cumulative output tokens are above those of the
+// episode's own blocked reports (providerBlockOutputBaselines). Without that
+// evidence the episode stays open. A model reply is recovery from any agent.
 func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	now := ts(s.now())
 	p := activity.Provider
@@ -138,29 +141,39 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 		if err := rows.Close(); err != nil {
 			return err
 		}
-		if len(open) > 0 && !turn {
-			baselines, err := providerBlockOutputBaselines(ctx, tx, task, agent, run)
-			if err != nil {
+		if len(open) == 0 {
+			return nil
+		}
+		// No row for this run counts as done: it makes no calls.
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM agents WHERE id=? AND run_id=?`, agent, run).Scan(&status); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		done := status == "" || status == api.AgentDone
+		var baselines map[string]int64
+		if !turn || done {
+			if baselines, err = providerBlockOutputBaselines(ctx, tx, task, agent, run); err != nil {
 				return err
 			}
-			replied := open[:0]
-			for _, e := range open {
-				if base, ok := baselines[providerBlockKey(e.class, e.since)]; ok && activity.Tokens.Output > base {
-					replied = append(replied, e)
-				}
-			}
-			open = replied
 		}
 		var runtime string
 		for _, e := range open {
+			base, ok := baselines[providerBlockKey(e.class, e.since)]
+			replied := ok && activity.Tokens.Output > base
+			recovered := (turn && !done) || replied
+			if !recovered && !turn {
+				continue
+			}
+			// A done agent's turn without a reply drops the block quietly.
 			if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE id=?`, now, e.id); err != nil {
 				return err
 			}
-			if e.class == api.ProviderBlockAuth && runtime == "" {
+			if recovered && e.class == api.ProviderBlockAuth && runtime == "" {
 				runtime = e.runtime
 			}
 		}
-		// A turn or a model reply after an auth block means the login works again.
+		// A recovered auth block (a turn of an agent that is not done, or a
+		// model reply) means the login works again.
 		if runtime != "" {
 			return s.providerRecoveryWake(ctx, tx, task, agent, runtime)
 		}
