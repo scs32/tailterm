@@ -197,6 +197,93 @@ func TestMatrixWaitFor(t *testing.T) {
 	}
 }
 
+// A run started without TAILTERM_AGENT_NAME names no agent (empty, or
+// "unknown" as verify-matrix writes it) or names the verifier's agent ID. It
+// is the wait of the agents bound to its item, and of nobody else
+// (wi_6128966a8025aaad).
+func TestMatrixWaitForAgentless(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	requested := "2026-10-02T11:40:00.000Z"
+	since := time.Date(2026, 10, 2, 11, 40, 0, 0, time.UTC)
+	bound := api.Agent{ID: "agt_0123456789abcdef", Name: "lead-a", WorkItem: &api.AgentWorkItemBinding{ItemID: matrixTestItem}}
+	elsewhere := api.Agent{ID: "agt_fedcba9876543210", Name: "lead-b", WorkItem: &api.AgentWorkItemBinding{ItemID: "wi_fedcba9876543210"}}
+	unbound := api.Agent{ID: "agt_00000000000000aa", Name: "helper"}
+	other := matrixEntry("11", "wi_fedcba9876543210", "lead-b", requested)
+	write := matrixLockFixture(t, 11, 22)
+
+	for _, agent := range []string{"", "unknown"} {
+		entry := matrixEntry("22", matrixTestItem, agent, requested)
+		write(matrixLockJSON("test-mini", entry, other))
+		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}) || !w.Valid() {
+			t.Fatalf("agent %q holder: %+v", agent, w)
+		}
+		write(matrixLockV2JSON("test-mini", []string{other}, other, entry))
+		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 2, Length: 2, Since: since}) || !w.Valid() {
+			t.Fatalf("agent %q waiter: %+v", agent, w)
+		}
+		write(matrixLockV2JSON("test-mini", []string{other, entry}))
+		if w := matrixWaitFor(bound, now); w == nil || w.Role != api.MatrixWaitRunning || w.Item != matrixTestItem {
+			t.Fatalf("agent %q version 2 holder: %+v", agent, w)
+		}
+		cases := map[string]struct {
+			agent   api.Agent
+			content string
+		}{
+			"another item, holder":    {elsewhere, matrixLockJSON("test-mini", entry)},
+			"another item, waiter":    {elsewhere, matrixLockV2JSON("test-mini", nil, entry)},
+			"unbound agent, holder":   {unbound, matrixLockJSON("test-mini", entry)},
+			"unbound agent, waiter":   {unbound, matrixLockV2JSON("test-mini", nil, entry)},
+			"dead pid":                {bound, matrixLockJSON("test-mini", matrixEntry("44", matrixTestItem, agent, requested))},
+			"unparsable time":         {bound, matrixLockJSON("test-mini", "", matrixEntry("22", matrixTestItem, agent, "soon"))},
+			"item unknown, bound":     {bound, matrixLockJSON("test-mini", matrixEntry("22", "unknown", agent, requested))},
+			"item unknown, unbound":   {unbound, matrixLockJSON("test-mini", matrixEntry("22", "unknown", agent, requested))},
+			"no item, bound waiter":   {bound, matrixLockV2JSON("test-mini", nil, matrixEntry("22", "", agent, requested))},
+			"no item, unbound waiter": {unbound, matrixLockV2JSON("test-mini", nil, matrixEntry("22", "", agent, requested))},
+			"order item, bound":       {bound, matrixLockJSON("test-mini", matrixEntry("22", "order 39719", agent, requested))},
+		}
+		for name, c := range cases {
+			write(c.content)
+			if w := matrixWaitFor(c.agent, now); w != nil {
+				t.Fatalf("agent %q, %s: %+v", agent, name, w)
+			}
+		}
+	}
+
+	// The verifier's agent ID names the agent as its name does, with the same
+	// item check, bound or not.
+	byID := matrixEntry("22", matrixTestItem, bound.ID, requested)
+	write(matrixLockJSON("test-mini", byID, other))
+	if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}) {
+		t.Fatalf("agent ID holder: %+v", w)
+	}
+	write(matrixLockV2JSON("test-mini", nil, other, byID))
+	if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 2, Length: 2, Since: since}) {
+		t.Fatalf("agent ID waiter: %+v", w)
+	}
+	write(matrixLockJSON("test-mini", matrixEntry("22", "unknown", unbound.ID, requested)))
+	if w := matrixWaitFor(unbound, now); w == nil || w.Item != "" {
+		t.Fatalf("unbound agent ID without an item: %+v", w)
+	}
+	for name, c := range map[string]struct {
+		agent   api.Agent
+		content string
+	}{
+		"another agent's ID": {elsewhere, matrixLockJSON("test-mini", byID)},
+		"ID, another item":   {bound, matrixLockJSON("test-mini", matrixEntry("22", "wi_fedcba9876543210", bound.ID, requested))},
+	} {
+		write(c.content)
+		if w := matrixWaitFor(c.agent, now); w != nil {
+			t.Fatalf("%s: %+v", name, w)
+		}
+	}
+	// Named entries keep their place: another agent's named entry is still
+	// not the bound agent's, even on its item.
+	write(matrixLockJSON("test-mini", matrixEntry("22", matrixTestItem, "lead-b", requested)))
+	if w := matrixWaitFor(bound, now); w != nil {
+		t.Fatalf("another agent's name on the bound item: %+v", w)
+	}
+}
+
 // The one parse both readers share: holders and ordered waiters for either
 // version, and the reason for a file it refuses.
 func TestParseMatrixLock(t *testing.T) {

@@ -165,8 +165,12 @@ func readMatrixLock() *matrixLockFile {
 
 // matrixWaitFor is the agent's live verification run in this host's matrix
 // lock: one of the host's holders, else its first place in the waitlist, else
-// nil. An entry is the agent's when it names the agent, its process is alive
-// and its item, when both are known, is the agent's bound item.
+// nil. An entry is the agent's when it names the agent (by name or ID), its
+// process is alive and its item, when both are known, is the agent's bound
+// item. An entry that names no agent (empty or "unknown", as a run started
+// without TAILTERM_AGENT_NAME writes it) is the wait of every agent bound to
+// its item, so the team that owns the item is not taken for idle; without a
+// valid item it is nobody's (wi_6128966a8025aaad).
 //
 // Only a confirmed read ends a wait. On an unknown read the result is the
 // last confirmed wait the hub holds for the agent's current run, so the relay
@@ -180,7 +184,9 @@ func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 		return lastConfirmedMatrixWait(a, now)
 	}
 	match := func(e matrixLockEntry, at string) *api.MatrixWait {
-		if e.Agent != a.Name || !matrixWaitPIDAlive(e.PID) {
+		agentless := e.Agent == "" || e.Agent == "unknown"
+		named := e.Agent == a.Name || (a.ID != "" && e.Agent == a.ID)
+		if (!named && !agentless) || !matrixWaitPIDAlive(e.PID) {
 			return nil
 		}
 		item := ""
@@ -188,6 +194,9 @@ func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 			item = e.Item
 		}
 		if item != "" && a.WorkItem != nil && a.WorkItem.ItemID != item {
+			return nil
+		}
+		if !named && (item == "" || a.WorkItem == nil) {
 			return nil
 		}
 		since, err := time.Parse(time.RFC3339Nano, at)
