@@ -53,7 +53,9 @@ export function eligibleAgentViewport(s) {
 // token, so none of this can overwrite a newer viewer. A focus ask while the
 // drain started by the pane becoming eligible is still in flight joins that
 // show: it neither starts another teardown round nor retires the show's claim;
-// a focus ask after it settles does both.
+// a focus ask after it settles does both. If that show's claim was superseded
+// on both attempts, the joined ask is replayed once as the drain settles, so
+// the superseded token is released and a fresh one claimed.
 export function createAgentWindowSizer({
   snapshot,
   execute,
@@ -67,6 +69,7 @@ export function createAgentWindowSizer({
     pending = false,
     running = false,
     showing = false,
+    joined = false,
     disposed = false;
   let focusVersion = 0,
     focusAsked = 0,
@@ -81,19 +84,28 @@ export function createAgentWindowSizer({
   };
   function refresh({ focus = false } = {}) {
     if (disposed) return;
-    if (focus && !(running && showing)) {
-      focusVersion++;
-      focusAsked++;
-      failed = false;
-    }
+    if (focus && running && showing) joined = true;
+    else if (focus) asked();
     pending = true;
     schedule(drain);
+  }
+  function asked() {
+    focusVersion++;
+    focusAsked++;
+    failed = false;
+  }
+  // The focus ask the show joined, replayed once if its claim was superseded.
+  function replayJoined() {
+    if (!joined || !showing || !claim?.superseded) return false;
+    joined = false;
+    asked();
+    return true;
   }
   async function drain() {
     if (running || !pending) return;
     running = true;
     try {
-      while (pending) {
+      while (pending || replayJoined()) {
         pending = false;
         const s = snapshot(),
           eligible = !disposed && eligibleAgentViewport(s);
@@ -185,7 +197,10 @@ export function createAgentWindowSizer({
                 prior: ready[2] && { cols: +ready[2], rows: +ready[3] },
               };
               const outcome = await command(claim, "claim");
-              if (outcome === "superseded") continue;
+              if (outcome === "superseded") {
+                claim.superseded = true;
+                continue;
+              }
               // A lost reply (no outcome) may be a claim that landed.
               if (!stale(key))
                 claim.sized = { cols: claim.cols, rows: claim.rows };
@@ -215,6 +230,7 @@ export function createAgentWindowSizer({
     } finally {
       running = false;
       showing = false;
+      joined = false;
     }
   }
   // Undo what landed after the pane went stale, then drop authority. False

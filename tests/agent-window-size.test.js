@@ -1866,6 +1866,104 @@ test(
 );
 
 test(
+  "a focus ask that joined a show whose claim was superseded is replayed once with a fresh token",
+  { timeout: UNIT_TEST_TIMEOUT_MS },
+  async (t) => {
+    const kind = (command) =>
+      command.includes("ready:")
+        ? "inspect"
+        : command.includes("@tailterm_size_revision},")
+          ? "claim"
+          : command.includes("released")
+            ? "release"
+            : "resize";
+    // A: another viewer wins every claim; the focus ask comes during the
+    // show's second claim. B: the show's inspect reply is cut and the focus
+    // ask comes during it. C: a normal show, the focus ask during its claim.
+    const cases = {
+      A: {
+        focusAt: 3,
+        answer: { inspect: "ready::200x50", claim: "superseded" },
+        show: [
+          "inspect",
+          "claim viewer_0000000000000001",
+          "inspect",
+          "claim viewer_0000000000000001",
+          "release viewer_0000000000000001",
+          "inspect",
+          "claim viewer_0000000000000002",
+          "inspect",
+          "claim viewer_0000000000000002",
+        ],
+        resize: ["resize viewer_0000000000000002"],
+        errors: 0,
+        tokens: 2,
+      },
+      B: {
+        focusAt: 0,
+        answer: { inspect: "read" },
+        show: ["inspect"],
+        resize: [],
+        errors: 1,
+        tokens: 1,
+      },
+      C: {
+        focusAt: 1,
+        answer: { inspect: "ready::200x50" },
+        show: ["inspect", "claim viewer_0000000000000001"],
+        resize: ["resize viewer_0000000000000001"],
+        errors: 0,
+        tokens: 1,
+      },
+    };
+    for (const [name, want] of Object.entries(cases))
+      await t.test(name, async () => {
+        let s = { ...valid(), visible: false },
+          sequence = 0,
+          sent = 0;
+        const log = [],
+          errors = [];
+        const c = createAgentWindowSizer({
+          snapshot: () => s,
+          token: () => `viewer_${String(++sequence).padStart(16, "0")}`,
+          error: (e) => errors.push(e.message),
+          execute: async (command) => {
+            const k = kind(command);
+            log.push(
+              k === "inspect"
+                ? "inspect"
+                : `${k} ${/viewer_\d{16}/.exec(command)[0]}`,
+            );
+            if (sent++ === want.focusAt) c.refresh({ focus: true });
+            return want.answer[k] ?? (k === "release" ? "released" : "sized");
+          },
+        });
+        try {
+          c.refresh();
+          await step(`${name}: the sizer settles while hidden`, c.settled());
+          s = { ...s, visible: true };
+          c.refresh();
+          await step(`${name}: the sizer settles after the show`, c.settled());
+          assert.deepEqual([...log], want.show, name);
+          assert.equal(errors.length, want.errors, name);
+          assert.equal(sequence, want.tokens, name + ": tokens made");
+          // A layout change resizes with the pane's current token, and the one
+          // focus ask makes no further claim.
+          log.length = 0;
+          s = { ...s, cols: 100 };
+          c.refresh();
+          await step(`${name}: the sizer settles after a resize`, c.settled());
+          assert.deepEqual([...log], want.resize, name);
+          assert.equal(sequence, want.tokens, name + ": no further token");
+        } finally {
+          c.dispose();
+          await step(`${name}: the sizer settles after dispose`, c.settled());
+        }
+      });
+  },
+);
+
+test(
   "tmux format read returns a complete reading after a cut one",
   { timeout: UNIT_TEST_TIMEOUT_MS },
   () => {
