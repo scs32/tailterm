@@ -238,7 +238,11 @@ export function selectChecks(
     );
   if (groups.has("wasm"))
     add("wasm-test-build", ["bash", "scripts/build-wasm.sh", "--test"]);
-  return checks.sort((a, b) => a.id.localeCompare(b.id, "en"));
+  // wasm-test-build rewrites wasm/tailserve.wasm and .build/test.wasm, which
+  // 00-static-build packs and the browser suites load. It leads the plan, and
+  // being exclusive, no other non-Go check starts until it ends.
+  const rank = (c) => (c.id === "wasm-test-build" ? 0 : 1);
+  return checks.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id, "en"));
 }
 // The ./name.mjs modules a tests file imports, statically or dynamically.
 const importedTestModules = (text) =>
@@ -2223,6 +2227,18 @@ export const EXCLUSIVE_CHECKS = new Set([
   "01-static-release-verify",
   "wasm-test-build",
 ]);
+// The files scripts/build-wasm.sh --test writes, in MATRIX_PREREQUISITES
+// order, and the checks that read them: 00-static-build packs
+// wasm/tailserve.wasm into dist-static and the browser suites load both.
+const WASM_FILES = ["wasm/tailserve.wasm", ".build/test.wasm"];
+const isWasmReader = (check) => isBrowserCheck(check) || check.id === "00-static-build";
+// Why a plan would let a WASM reader start before wasm-test-build rewrote
+// its input, or "" when the plan has no such reader or no wasm-test-build.
+export function wasmOrderCause(checks) {
+  const build = checks.findIndex((check) => check.id === "wasm-test-build");
+  const early = build < 0 ? undefined : checks.slice(0, build).find(isWasmReader);
+  return early ? early.id + " runs before wasm-test-build" : "";
+}
 // Browser suites that share a resource the lock rules below cannot see. All
 // members hold one lock, so no two of them overlap. Each entry names the
 // shared resource that was found by running the suite in parallel.
@@ -2624,6 +2640,8 @@ async function executePlan(plan, cwd, output, options, receiptName, makeReceipt)
   requireFreeSpace(minFreeBytes, options.getAvailableBytes);
   provisionWorktreePrerequisites(plan.checks, cwd, options);
   readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
+  const wasmOrder = wasmOrderCause(plan.checks);
+  if (wasmOrder) throw new Error("WASM check order: " + wasmOrder);
   const hostLock = options.hostLock || {};
   const lease = await (options.acquireHostLock || acquireHostLock)({
     runTimeoutMs: planRunTimeout(plan),
@@ -2841,16 +2859,62 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
           buildCommand: binary.buildLog.argv,
           startedAt: binary.startedAt, endedAt: binary.endedAt });
     }
+    // Each WASM reader records in its result the WASM it loads, hashed just
+    // before it runs. With wasm-test-build in the plan that must be what the
+    // build wrote; without it, the prerequisites read before the run.
+    const buildsWasm = plan.checks.some((check) => check.id === "wasm-test-build");
+    const readsWasm = plan.checks.some(isWasmReader);
+    const wasmPaths = buildsWasm
+      ? WASM_FILES
+      : prerequisites.filter((p) => WASM_FILES.includes(p.path)).map((p) => p.path);
+    const hashWasm = (fail) =>
+      Promise.all(wasmPaths.map(async (path) => {
+        try {
+          return { path, sha256: await fileHash(join(cwd, path)) };
+        } catch (error) {
+          throw new Error(fail(path) + ": " + error.message, { cause: error });
+        }
+      }));
+    const wasmChanged = buildsWasm
+      ? "WASM changed after wasm-test-build: "
+      : "WASM prerequisite changed during verification: ";
+    // Undefined until wasm-test-build passes; a failed build leaves the
+    // readers recording what they load with nothing to compare it to.
+    let builtWasm, wasmBuildEnded = false;
+    const expectedWasm = () =>
+      buildsWasm ? builtWasm : prerequisites.filter((p) => WASM_FILES.includes(p.path));
+    const checkWasm = (loaded) => {
+      const expected = expectedWasm();
+      for (const entry of expected ? loaded : [])
+        if (expected.find((e) => e.path === entry.path)?.sha256 !== entry.sha256)
+          throw new Error(wasmChanged + entry.path);
+    };
     const results = await runScheduled(
       plan.checks,
       { jobs, abortSignal },
-      (check, _index, signal) =>
-        runCheckWithAttempts(check, plan, cwd, output, { ...environment, ...caches.checkEnvironment?.[check.id] }, {
+      async (check, _index, signal) => {
+        let wasm;
+        if (isWasmReader(check) && wasmPaths.length) {
+          if (buildsWasm && !wasmBuildEnded)
+            throw new Error("WASM check order: " + check.id + " runs before wasm-test-build");
+          wasm = await hashWasm((path) => `Unreadable WASM before ${check.id}: ${path}`);
+          checkWasm(wasm);
+        }
+        const result = await runCheckWithAttempts(check, plan, cwd, output, { ...environment, ...caches.checkEnvironment?.[check.id] }, {
           abortSignal: signal,
           minFreeBytes,
           getAvailableBytes,
           onGroup,
-        }),
+        });
+        if (check.id === "wasm-test-build") {
+          // Hashed after the final attempt, so a retried build records the
+          // files its passing attempt wrote.
+          if (readsWasm && result.exitCode === 0)
+            builtWasm = await hashWasm((path) => "wasm-test-build passed without writing " + path);
+          wasmBuildEnded = true;
+        }
+        return wasm ? { ...result, wasm } : result;
+      },
     );
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
@@ -2860,6 +2924,16 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
         if ((await fileHash(binary.path)) !== binary.sha256)
           throw new Error("Prepared test binary changed during verification: " + binary.path);
     }
+    if (readsWasm && wasmPaths.length && expectedWasm())
+      checkWasm(await hashWasm((path) => wasmChanged + path));
+    // The hub keeps a prerequisite's sha256, so a built WASM entry names the
+    // file the checks used and keeps the pre-run digest as priorSha256.
+    if (builtWasm)
+      for (const [i, p] of prerequisites.entries()) {
+        const built = builtWasm.find((b) => b.path === p.path);
+        if (built)
+          prerequisites[i] = { path: p.path, sha256: built.sha256, priorSha256: p.sha256, source: "wasm-test-build" };
+      }
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
     checkClean(cwd, plan.commit);

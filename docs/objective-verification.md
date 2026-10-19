@@ -60,6 +60,11 @@ files select only unit and browser) selects `wasm-test-build`. `hub/go.mod` is n
 mapped to it: the build compiles the pinned Tailscale tarball's own module, and the
 runner reads `hub/go.mod` only to check the script's Tailscale version, a mismatch
 falling back to per-home modules rather than changing the build.
+`wasm-test-build` leads the plan and is exclusive, so it finishes before
+`00-static-build` packs `wasm/tailserve.wasm` and before any browser suite loads
+`.build/test.wasm` (`wi_bc1e7d15925ee533`). A plan in which one of these WASM
+readers precedes it is refused before admission with
+`WASM check order: <id> runs before wasm-test-build`.
 
 The normalized ownership manifest is handler-approved scope evidence, linked to
 the raw assignment and its canonical ownership digest. The runner never parses
@@ -423,10 +428,23 @@ The runner strips inherited environment, hub/task credentials, runtime settings,
 vaults and tmux identity, and assigns a disposable HOME/TMPDIR. Commands run with
 argv arrays and repository-relative cwd. The receipt retains the absolute worktree,
 allowlisted environment, prerequisite digests, command start/end/duration, exit,
-external log path and exact SHA-256. It runs every selected check and retains
-failures. The approved matrix records a default ten-minute per-check timeout,
-with explicit overrides in `checkTimeoutMs` (go-race: fifty minutes; go-test:
-twenty minutes; npm-unit: eight minutes; the two static checks: two minutes).
+external log path and exact SHA-256. When the plan builds WASM and has a WASM
+reader, the `wasm/tailserve.wasm` and `.build/test.wasm` prerequisite entries
+record the built digest as `sha256`, the pre-run digest as `priorSha256`, and
+`source: "wasm-test-build"`; a build that passes without writing one of them fails
+with `wasm-test-build passed without writing <path>`. Each browser check and
+`00-static-build` records in `wasm` the `{ path, sha256 }` of the two WASM files,
+hashed just before it ran; a file it cannot read fails the run with
+`Unreadable WASM before <id>: <path>`. Those digests must equal the build's
+output, or, in a plan without the build, the prerequisite digests. The files are
+hashed before each such reader and once more after all checks have finished. A
+mismatch fails the run with no receipt:
+`WASM changed after wasm-test-build: <path>`, or without the build
+`WASM prerequisite changed during verification: <path>`. It runs every selected
+check and retains failures. The approved matrix records a default ten-minute
+per-check timeout, with explicit overrides in `checkTimeoutMs` (go-race: fifty
+minutes; go-test: twenty minutes; npm-unit: eight minutes; the two static
+checks: two minutes).
 Each planned check carries `VERIFICATION_TIMEOUT_MS` in its recorded environment.
 A timeout sends SIGTERM, then SIGKILL after 250 ms, only to that check's newly
 spawned POSIX process group; its receipt records exit 124 and
@@ -589,7 +607,9 @@ overlap:
 that later non-Go checks read. Each runs alone among non-Go checks, only after
 every earlier non-Go check has finished, and no later non-Go check starts until
 it ends. Go checks read only the `hub/` module, so they neither wait for nor
-block these barriers.
+block these barriers. `wasm-test-build` is the first check in plan order, ahead of
+the id-sorted rest: it rewrites the WASM that `00-static-build` packs and the
+browser suites load, so as a barrier it holds every WASM reader until it ends.
 
 The Go rules come from receipt data. When they were set, go-race was the
 longest check: 625 s alone, while no other single attempt exceeded 171 s. Its

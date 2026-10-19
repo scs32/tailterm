@@ -1593,7 +1593,7 @@ test("exclusive checks run alone and hold back every later check", async () => {
     fakeCheck("00-static-build"),
     fakeCheck("late-1"),
     fakeCheck("late-2"),
-    fakeCheck("wasm-test-build"),
+    fakeCheck("01-static-release-verify"),
   ];
   const { results, starts } = await simulate(checks, 6, (c) =>
     c.id === "early-2" ? 40 : 10,
@@ -1601,13 +1601,148 @@ test("exclusive checks run alone and hold back every later check", async () => {
   assert.deepEqual(overlapViolations(results), []);
   assert.deepEqual(starts.slice(0, 2), ["early-1", "early-2"]);
   assert.equal(starts[2], "00-static-build", "later checks wait for the barrier");
-  assert.equal(starts.at(-1), "wasm-test-build");
+  assert.equal(starts.at(-1), "01-static-release-verify");
   const forged = results.map((r) => ({ ...r }));
   forged[3].startedAt = forged[0].startedAt;
   assert(
     overlapViolations(forged).some((v) => v.reason === "barrier"),
     "scanner detects a later check started past an exclusive barrier",
   );
+});
+// wi_bc1e7d15925ee533 / order #40151: wasm-test-build rewrites the WASM that
+// 00-static-build packs and the browser suites load, so it runs before them.
+const isWasmReader = (check) =>
+  check.id === "00-static-build" || Boolean(check.environment?.TEST_BROWSER);
+test("wasm-test-build leads the plan and finishes before the static build and every browser check", async () => {
+  const checks = selectChecks(matrix, ["wasm/"], []);
+  assert.equal(checks[0].id, "wasm-test-build");
+  assert.equal(matrixRunner.wasmOrderCause(checks), "");
+  const rest = checks.slice(1).map((c) => c.id);
+  assert.deepEqual(rest, [...rest].sort((a, b) => a.localeCompare(b, "en")));
+  const { results } = await simulate(checks, 5, () => 1 + Math.random() * 3);
+  assert.deepEqual(overlapViolations(results), []);
+  const build = results.find((r) => r.id === "wasm-test-build");
+  const readers = results.filter(isWasmReader);
+  assert(readers.some((r) => r.id === "00-static-build") && readers.length > 2);
+  for (const reader of readers)
+    assert(reader.startedAt >= build.endedAt, reader.id + " started before wasm-test-build ended");
+  const late = [...checks.slice(1), checks[0]];
+  assert.equal(matrixRunner.wasmOrderCause(late), "00-static-build runs before wasm-test-build");
+  assert.equal(matrixRunner.wasmOrderCause(checks.slice(1)), "");
+  // A plan accepted under the old order (wasm-test-build last) is rebuilt in
+  // the new order with every check kept.
+  const { checks: rebuilt, preserved } = matrixRunner.keepAcceptedChecks(checks, late);
+  assert.deepEqual(rebuilt.map((c) => c.id), checks.map((c) => c.id));
+  assert.equal(preserved.kept.length, checks.length);
+});
+// A browser fixture with wasm/tailserve.wasm ignored, as in a real checkout,
+// and a wasm/ rule that selects wasm-test-build. The build stub writes
+// "built" to both WASM files; scripts and suites replace the fixture's stubs.
+function wasmFixture(t, { suite, scripts = {} }) {
+  const f = browserFixture(t, { "wasm-browser.mjs": suite });
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\nwasm/tailserve.wasm\n");
+  f.git("rm", "-q", "--cached", "wasm/tailserve.wasm");
+  const m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json"), "utf8"));
+  m.rules.push({ prefixes: ["wasm/"], groups: ["wasm", "unit", "browser"] });
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+  const pkg = JSON.parse(readFileSync(join(f.cwd, "package.json"), "utf8"));
+  Object.assign(pkg.scripts, scripts);
+  writeFileSync(join(f.cwd, "package.json"), JSON.stringify(pkg));
+  mkdirSync(join(f.cwd, "scripts"));
+  writeFileSync(join(f.cwd, "scripts/build-wasm.sh"),
+    "printf built > wasm/tailserve.wasm\nprintf built > .build/test.wasm\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "wasm fixture");
+  return { ...f, baseCommit: f.git("rev-parse", "HEAD") };
+}
+const readsBuilt = (path) =>
+  `import { readFileSync } from "node:fs";\n` +
+  `if (readFileSync(${JSON.stringify(path)}, "utf8") !== "built") process.exit(1);\n`;
+const builtStatic = `node -e "process.exit(require('fs').readFileSync('wasm/tailserve.wasm','utf8')==='built'?0:1)"`;
+const wasmEntries = (sha256) => [
+  { path: "wasm/tailserve.wasm", sha256 },
+  { path: ".build/test.wasm", sha256 },
+];
+test("browser checks and the static build use this run's WASM and the receipt records it", async (t) => {
+  const f = wasmFixture(t, { suite: readsBuilt(".build/test.wasm"), scripts: { "build:static": builtStatic } });
+  const commit = commitChange(f, "wasm/x.go", "package wasm\n", "wasm candidate");
+  const plan = makePlan({ baseCommit: f.baseCommit, commit, owned: ["wasm/"] }, f.cwd);
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-wasm-"), { minFreeBytes: 0, jobs: 4 });
+  assert.equal(receipt.checks[0].id, "wasm-test-build");
+  assert(receipt.checks.every((c) => c.status === "pass"), "every check passed");
+  assert.deepEqual(overlapViolations(receipt.checks), []);
+  const build = receipt.checks[0];
+  for (const reader of receipt.checks.filter(isWasmReader)) {
+    assert(reader.startedAt >= build.endedAt, reader.id + " started before wasm-test-build ended");
+    assert.deepEqual(reader.wasm, wasmEntries(digest("built")), reader.id);
+  }
+  assert.deepEqual(receipt.checks.filter(isWasmReader).map((c) => c.id),
+    ["00-static-build", "tests/wasm-browser.mjs"]);
+  for (const check of receipt.checks.filter((c) => !isWasmReader(c)))
+    assert(!("wasm" in check), check.id + " records no WASM");
+  for (const entry of receipt.prerequisites)
+    assert.deepEqual(entry, entry.path.endsWith(".wasm")
+      ? { path: entry.path, sha256: digest("built"), priorSha256: digest("fixture"), source: "wasm-test-build" }
+      : { path: entry.path, sha256: entry.sha256 });
+  assert.equal(receipt.prerequisites.filter((p) => p.source).length, 2);
+
+  // A suite that rewrites the built WASM fails the run with no receipt.
+  const g = wasmFixture(t, {
+    suite: `import { writeFileSync } from "node:fs";\nwriteFileSync(".build/test.wasm", "rewritten");\n`,
+  });
+  const changed = commitChange(g, "wasm/x.go", "package wasm\n", "wasm candidate");
+  const output = tempDir(t, "verification-wasm-changed-");
+  await assert.rejects(
+    runPlan(makePlan({ baseCommit: g.baseCommit, commit: changed, owned: ["wasm/"] }, g.cwd), g.cwd, output,
+      { minFreeBytes: 0, jobs: 4 }),
+    /WASM changed after wasm-test-build: \.build\/test\.wasm/,
+  );
+  assert(!existsSync(join(output, "receipt.json")));
+
+  // A passing build that leaves no test.wasm fails before any reader runs.
+  const h = wasmFixture(t, { suite: readsBuilt(".build/test.wasm") });
+  writeFileSync(join(h.cwd, "scripts/build-wasm.sh"), "printf built > wasm/tailserve.wasm\nrm .build/test.wasm\n");
+  h.git("commit", "-qam", "build writes no test.wasm");
+  const missing = commitChange(h, "wasm/x.go", "package wasm\n", "wasm candidate");
+  const missingOutput = tempDir(t, "verification-wasm-missing-");
+  await assert.rejects(
+    runPlan(makePlan({ baseCommit: h.git("rev-parse", "HEAD~1"), commit: missing, owned: ["wasm/"] }, h.cwd), h.cwd,
+      missingOutput, { minFreeBytes: 0, jobs: 4 }),
+    /wasm-test-build passed without writing \.build\/test\.wasm/,
+  );
+  assert(!existsSync(join(missingOutput, "receipt.json")));
+});
+test("a plan without wasm-test-build keeps id order and records the prerequisite WASM each reader loaded", async (t) => {
+  const f = wasmFixture(t, { suite: "console.log('browser ran');\n" });
+  const commit = commitChange(f, "client/app.js", "export {}\n", "client candidate");
+  const plan = makePlan({ baseCommit: f.baseCommit, commit, owned: ["client/"] }, f.cwd);
+  const ids = plan.checks.map((c) => c.id);
+  assert(!ids.includes("wasm-test-build"));
+  assert.deepEqual(ids, [...ids].sort((a, b) => a.localeCompare(b, "en")));
+  const prerequisites = matrixRunner.readPrerequisites(plan.checks, f.cwd);
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-no-wasm-"), { minFreeBytes: 0, jobs: 4 });
+  assert(receipt.checks.every((c) => c.status === "pass"), "every check passed");
+  assert.deepEqual(receipt.prerequisites, prerequisites);
+  assert.deepEqual(prerequisites.filter((p) => p.path.endsWith(".wasm")), wasmEntries(digest("fixture")));
+  for (const reader of receipt.checks.filter(isWasmReader))
+    assert.deepEqual(reader.wasm, wasmEntries(digest("fixture")), reader.id);
+  assert.equal(receipt.checks.filter(isWasmReader).length, 2);
+  for (const path of ["wasm/tailserve.wasm", ".build/test.wasm"])
+    assert.equal(readFileSync(join(f.cwd, path), "utf8"), "fixture");
+
+  // A static build that rewrites a prerequisite refuses the next reader.
+  const g = wasmFixture(t, {
+    suite: "console.log('browser ran');\n",
+    scripts: { "build:static": `node -e "require('fs').writeFileSync('.build/test.wasm','rewritten')"` },
+  });
+  const changed = commitChange(g, "client/app.js", "export {}\n", "client candidate");
+  const output = tempDir(t, "verification-no-wasm-changed-");
+  await assert.rejects(
+    runPlan(makePlan({ baseCommit: g.baseCommit, commit: changed, owned: ["client/"] }, g.cwd), g.cwd, output,
+      { minFreeBytes: 0, jobs: 4 }),
+    /WASM prerequisite changed during verification: \.build\/test\.wasm/,
+  );
+  assert(!existsSync(join(output, "receipt.json")));
 });
 test("full diagnostic selection schedules with no lock or barrier violation", async () => {
   const checks = selectChecks(
