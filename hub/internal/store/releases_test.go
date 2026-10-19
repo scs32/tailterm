@@ -1258,8 +1258,14 @@ func secondTask(t *testing.T, s *Store) api.Task {
 // cites a fresh release intervention.
 func recordHandRelease(t *testing.T, s *Store, task api.Task, key, released string, commits []string) api.HandRelease {
 	t.Helper()
+	return recordHandReleaseOf(t, s, task, key, released, commits, "hub")
+}
+
+// recordHandReleaseOf is recordHandRelease naming these targets.
+func recordHandReleaseOf(t *testing.T, s *Store, task api.Task, key, released string, commits []string, targets ...string) api.HandRelease {
+	t.Helper()
 	seq := releaseIntervention(t, s, task, key, "release")
-	h, err := s.RecordHandRelease(context.Background(), task.ID, api.ReleaseRequest{RequestID: "hand-release-" + key, HandRelease: &api.HandRelease{InterventionSeq: seq, ReleasedCommit: released, Release: "20260930-" + key, Targets: []string{"hub"}, Commits: commits}}, api.Caller{Node: "fixture", User: "owner"})
+	h, err := s.RecordHandRelease(context.Background(), task.ID, api.ReleaseRequest{RequestID: "hand-release-" + key, HandRelease: &api.HandRelease{InterventionSeq: seq, ReleasedCommit: released, Release: "20260930-" + key, Targets: targets, Commits: commits}}, api.Caller{Node: "fixture", User: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3759,6 +3765,13 @@ func claimRequest(key string, d api.Agent, j api.ReleaseJob) api.ReleaseRequest 
 // finish as the deployer.
 func releaseThrough(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob) api.ReleaseJob {
 	t.Helper()
+	return releaseThroughPush(t, s, task, d, j, nil)
+}
+
+// releaseThroughPush is releaseThrough whose released receipt carries push,
+// as the runner's finish after it selected and deployed targets does.
+func releaseThroughPush(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob, push *api.ReleasePush) api.ReleaseJob {
+	t.Helper()
 	ctx := context.Background()
 	var err error
 	if j, err = s.ReleaseAction(ctx, task.ID, claimRequest(j.ID+"-claim", d, j)); err != nil {
@@ -3768,7 +3781,7 @@ func releaseThrough(t *testing.T, s *Store, task api.Task, d api.Agent, j api.Re
 		t.Fatal(err)
 	}
 	finish := api.ReleaseRequest{RequestID: j.ID + "-finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
-	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}, Push: push}
 	if j, err = s.ReleaseAction(ctx, task.ID, finish); err != nil || j.State != "released" {
 		t.Fatal(j.State, err)
 	}
@@ -5971,7 +5984,27 @@ func setNightWindow(t *testing.T, s *Store, task api.Task, targets ...string) {
 // changed paths, with the receipt rebound to the changed plan.
 func releaseEntryChanged(t *testing.T, s *Store, task api.Task, title, requestID string, changed ...string) string {
 	t.Helper()
+	return releaseEntryOn(t, s, task, title, requestID, candidateA, changed...)
+}
+
+// releaseEntryOn is releaseEntryChanged whose plan, acceptance and queue entry
+// name base as the base commit.
+func releaseEntryOn(t *testing.T, s *Store, task api.Task, title, requestID, base string, changed ...string) string {
+	t.Helper()
 	entry := releaseEntry(t, s, task, title, requestID)
+	var raw string
+	if err := s.db.QueryRow(`SELECT acceptance_json FROM team_queue_entries WHERE id=?`, entry).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var a api.TeamIntegrationAcceptance
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		t.Fatal(err)
+	}
+	a.BaseCommit = base
+	b, _ := json.Marshal(a)
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET base_commit=?,acceptance_json=? WHERE id=?`, base, string(b), entry); err != nil {
+		t.Fatal(err)
+	}
 	var item string
 	if err := s.db.QueryRow(`SELECT item_id FROM team_queue_entries WHERE id=?`, entry).Scan(&item); err != nil {
 		t.Fatal(err)
@@ -5989,9 +6022,11 @@ func releaseEntryChanged(t *testing.T, s *Store, task api.Task, title, requestID
 		}
 		if kind == "plan" {
 			record.Plan.Changed = changed
+			record.Plan.BaseCommit = base
 			plan = record.Plan
 		} else {
 			record.Receipt.PlanDigest = verificationDigest(*plan)
+			record.Receipt.BaseCommit = base
 		}
 		b, _ := json.Marshal(record)
 		if _, err := s.db.Exec(`UPDATE verification_records SET record_json=? WHERE task_id=? AND item_id=? AND generation=?`, string(b), task.ID, item, gen); err != nil {
@@ -6318,12 +6353,14 @@ func TestReleaseWindowRefusesClaimOfJobVerifiedBefore(t *testing.T) {
 	}
 }
 
-// a4: a job with no covered target passes the window.
+// a4: a job with no covered target passes the window. Its base is a sync
+// commit (wi_d87f594a6ae13ec9): a hand release names every covered target.
 func TestReleaseWindowPassesUncoveredJobs(t *testing.T) {
 	s, task, h, d, _ := releaseFixture(t)
 	ctx := context.Background()
 	setNightWindow(t, s, task)
 	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	recordHandReleaseOf(t, s, task, "sync", candidateA, []string{candidateA}, "hub", "bridge", "mini")
 	docs := windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryChanged(t, s, task, "docs change", "docs-change", "docs/a.md", "hub/internal/store/a_test.go"))
 	client := windowEnqueue(t, s, task, h, "enqueue-client", releaseEntryChanged(t, s, task, "client change", "client-change", "client/a.js"))
 	for _, j := range []api.ReleaseJob{docs, client} {
@@ -6343,10 +6380,226 @@ func TestReleaseWindowPassesUncoveredJobs(t *testing.T) {
 	s, task, h, d, _ = releaseFixture(t)
 	setNightWindow(t, s, task, "hub", "bridge", "mini", "tailos")
 	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	recordHandReleaseOf(t, s, task, "sync", candidateA, []string{candidateA}, "hub", "bridge", "mini", "tailos")
 	docs = windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryChanged(t, s, task, "docs change", "docs-change", "docs/a.md"))
 	client = windowEnqueue(t, s, task, h, "enqueue-client", releaseEntryChanged(t, s, task, "client change", "client-change", "client/a.js"))
 	if docs.State != "verified" || client.State != "held" || !slices.Equal(client.Hold.Window.Targets, []string{"hub", "bridge", "mini", "tailos"}) {
 		t.Fatalf("docs %s client %s", docs.State, client.State)
+	}
+}
+
+// wi_d87f594a6ae13ec9 a1 (q1, example a): a published job refused while it
+// waits for a hand release holds a docs-only job at night, at enqueue (W1),
+// list (W2) and claim (W3), naming that job; its supersession clears it.
+func TestReleaseWindowHoldsDocsJobBehindPublishedRefusal(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	recordHandReleaseOf(t, s, task, "sync", candidateA, []string{candidateA}, "hub", "bridge", "mini")
+	p := windowEnqueue(t, s, task, h, "enqueue-store", releaseEntryChanged(t, s, task, "store change", "store-change", "hub/internal/store/x.go"))
+	var err error
+	for _, op := range []string{"claim", "merged", "block"} {
+		if p, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: p.ID, ExpectedGeneration: p.Generation, IntegratedCommit: p.Commit}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	evidence := recoveryEvidence(t, s, task, h, p)
+	evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+	if _, err = s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if p, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: p.ID, ExpectedGeneration: p.Generation, Reconciliation: &evidence}); err != nil || p.State != "refused" || !p.Published {
+		t.Fatal("published refusal", p.State, err)
+	}
+	if _, err = s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	early := windowEnqueue(t, s, task, h, "enqueue-early", releaseEntryChanged(t, s, task, "early docs", "early-docs", "docs/a.md"))
+	if early.State != "verified" {
+		t.Fatalf("docs job outside the window %+v", early)
+	}
+	cause := "job " + p.ID + " was published and is not released"
+
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	if _, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-early", d, early)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window 22:00-07:00") || !strings.HasSuffix(err.Error(), "; "+cause) {
+		t.Fatal("W3 claim of the docs job", err)
+	}
+	listed := pageJob(t, windowPage(t, s, task), early.ID)
+	if listed.State != "held" || listed.Generation != early.Generation+1 || listed.Hold == nil || listed.Hold.Window == nil || !strings.HasSuffix(listed.Hold.Reason, "; "+cause) {
+		t.Fatalf("W2 swept docs job %+v", listed)
+	}
+	late := windowEnqueue(t, s, task, h, "enqueue-late", releaseEntryChanged(t, s, task, "late tests", "late-tests", "tests/a.mjs", "hub/internal/store/a_test.go"))
+	if late.State != "held" || late.Hold == nil || late.Hold.Reason != "release quiet window 22:00-07:00 America/Los_Angeles covers hub, bridge, mini; held until an explicit unhold after 2026-10-19T07:00:00-07:00; "+cause || late.HoldHistory[0].Cause != "window" {
+		t.Fatalf("W1 docs job %+v", late.Hold)
+	}
+	if err = s.ValidateReleaseDatabase(ctx); err != nil {
+		t.Fatal("database with a ledger hold", err)
+	}
+
+	// The owner's hand release names hub, bridge and mini and supersedes it.
+	hand := recordHandReleaseOf(t, s, task, "settle", candidateC, []string{candidateB}, "hub", "bridge", "mini")
+	if p, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: p.ID, ExpectedGeneration: p.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateC, HandReleaseID: hand.ID}}); err != nil || p.State != "superseded" {
+		t.Fatal("supersede", err)
+	}
+	next := windowEnqueue(t, s, task, h, "enqueue-next", releaseEntryOn(t, s, task, "next docs", "next-docs", candidateC, "docs/b.md"))
+	if next.State != "verified" || next.Hold != nil {
+		t.Fatalf("docs job after the supersession %+v", next)
+	}
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-next", d, next)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim inside the window", err)
+	}
+}
+
+// wi_d87f594a6ae13ec9 a2 (q1, example b): a docs-only job whose base is an
+// owner commit with no hand-release record is held and its claim refused; the
+// owner's record of that commit lets the next one release. The window hold is
+// lifted by the usual unhold after the window ends.
+func TestReleaseWindowHoldsDocsJobOnUnrecordedBase(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	early := windowEnqueue(t, s, task, h, "enqueue-early", releaseEntryOn(t, s, task, "early docs", "early-docs", candidateC, "docs/a.md"))
+	if early.State != "verified" || pageJob(t, windowPage(t, s, task), early.ID).State != "verified" {
+		t.Fatalf("docs job outside the window %+v", early)
+	}
+	cause := "base cccccccccccc is not a recorded release commit"
+
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	_, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-early", d, early))
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "until 2026-10-19T07:00:00-07:00") || !strings.HasSuffix(err.Error(), "; "+cause) {
+		t.Fatal("W3 claim of the docs job", err)
+	}
+	late := windowEnqueue(t, s, task, h, "enqueue-late", releaseEntryOn(t, s, task, "late docs", "late-docs", candidateC, "docs/b.md"))
+	if late.State != "held" || late.Hold == nil || late.Hold.Window == nil || !strings.HasSuffix(late.Hold.Reason, "; "+cause) {
+		t.Fatalf("W1 docs job %+v", late.Hold)
+	}
+	if listed := pageJob(t, windowPage(t, s, task), early.ID); listed.State != "held" || !strings.HasSuffix(listed.Hold.Reason, "; "+cause) {
+		t.Fatalf("W2 swept docs job %+v", listed)
+	}
+
+	recordHandReleaseOf(t, s, task, "owner", candidateC, []string{candidateC}, "hub", "bridge", "mini")
+	next := windowEnqueue(t, s, task, h, "enqueue-next", releaseEntryOn(t, s, task, "next docs", "next-docs", candidateC, "docs/c.md"))
+	if next.State != "verified" {
+		t.Fatalf("docs job on a recorded base %+v", next)
+	}
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-next", d, next)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim inside the window", err)
+	}
+
+	setWindowClock(t, s, d, windowAt("2026-10-19T07:00:00-07:00"))
+	free, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold", h, late, "Morning"))
+	if err != nil || free.State != "verified" || free.Hold != nil || free.HoldHistory[len(free.HoldHistory)-1].Cause != "handler" {
+		t.Fatal("unhold after the end", free, err)
+	}
+}
+
+// wi_d87f594a6ae13ec9 a3 (U2): a hand release naming only hub, recorded after
+// the newest sync record, holds a docs-only job; the next pushed release
+// clears it. Times compare as times: 04:00:00.1Z sorts before 04:00:00Z as
+// text.
+func TestReleaseWindowHoldsDocsJobAfterPartialHandRelease(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	push := func(j api.ReleaseJob) *api.ReleasePush {
+		return &api.ReleasePush{Remote: "origin", Commit: j.Commit, Outcome: "pushed"}
+	}
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	first := windowEnqueue(t, s, task, h, "enqueue-first", releaseEntryChanged(t, s, task, "first store", "first-store", "hub/internal/store/x.go"))
+	if first = releaseThroughPush(t, s, task, d, first, push(first)); first.SettledAt != "2026-10-19T04:00:00Z" {
+		t.Fatal("settledAt", first.SettledAt)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00.1-07:00"))
+	hand := recordHandRelease(t, s, task, "hub-only", candidateC, []string{candidateC})
+	if hand.CreatedAt != "2026-10-19T04:00:00.1Z" || hand.CreatedAt > first.SettledAt {
+		t.Fatal("fixture times", hand.CreatedAt, first.SettledAt)
+	}
+
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	docs := windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryOn(t, s, task, "docs", "docs", candidateB, "docs/a.md"))
+	if docs.State != "held" || !strings.HasSuffix(docs.Hold.Reason, "; hand release "+hand.ID+" names only hub") {
+		t.Fatalf("docs job after a partial hand release %+v", docs.Hold)
+	}
+
+	setWindowClock(t, s, d, windowAt("2026-10-19T07:30:00-07:00"))
+	second := windowEnqueue(t, s, task, h, "enqueue-second", releaseEntryChanged(t, s, task, "second store", "second-store", "hub/internal/store/y.go"))
+	releaseThroughPush(t, s, task, d, second, push(second))
+	setWindowClock(t, s, d, windowAt("2026-10-19T23:30:00-07:00"))
+	next := windowEnqueue(t, s, task, h, "enqueue-next", releaseEntryOn(t, s, task, "next docs", "next-docs", candidateB, "docs/b.md"))
+	if next.State != "verified" {
+		t.Fatalf("docs job after a pushed release %+v", next)
+	}
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-next", d, next)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim inside the window", err)
+	}
+}
+
+// wi_d87f594a6ae13ec9 a4 (q2): a docs- or tests-only job based on a pushed
+// release, or on a hand release naming every covered target, releases at
+// night. A no-change finish has no push and makes no sync commit.
+func TestReleaseWindowPassesDocsJobOnSyncCommit(t *testing.T) {
+	for _, c := range []string{"pushed", "hand", "no-push"} {
+		s, task, h, d, _ := releaseFixture(t)
+		ctx := context.Background()
+		setNightWindow(t, s, task)
+		setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+		base := candidateB
+		switch c {
+		case "pushed", "no-push":
+			j := windowEnqueue(t, s, task, h, "enqueue-store", releaseEntryChanged(t, s, task, "store change", "store-change", "hub/internal/store/x.go"))
+			var push *api.ReleasePush
+			if c == "pushed" {
+				push = &api.ReleasePush{Remote: "origin", Commit: j.Commit, Outcome: "pushed"}
+			}
+			releaseThroughPush(t, s, task, d, j, push)
+		case "hand":
+			base = candidateC
+			recordHandReleaseOf(t, s, task, "full", candidateC, []string{candidateC}, "hub", "bridge", "mini")
+		}
+		setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+		docs := windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryOn(t, s, task, "docs", "docs", base, "docs/a.md", "hub/internal/store/a_test.go"))
+		if c == "no-push" {
+			if docs.State != "held" || !strings.HasSuffix(docs.Hold.Reason, "; base bbbbbbbbbbbb is not a recorded release commit") {
+				t.Fatalf("%s: docs job %+v", c, docs.Hold)
+			}
+			continue
+		}
+		if docs.State != "verified" || docs.Hold != nil {
+			t.Fatalf("%s: docs job held %+v", c, docs.Hold)
+		}
+		if listed := pageJob(t, windowPage(t, s, task), docs.ID); listed.State != "verified" || listed.Generation != docs.Generation {
+			t.Fatalf("%s: docs job swept %+v", c, listed)
+		}
+		if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-docs", d, docs)); err != nil || claimed.State != "claimed" {
+			t.Fatal(c, "claim inside the window", err)
+		}
+	}
+}
+
+// wi_d87f594a6ae13ec9 a5: outside the window, and for a job whose own diff is
+// covered, the ledger is never read; an unreadable record fails only the
+// check that needs it.
+func TestReleaseWindowReadsLedgerOnlyForUncoveredJobsInside(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	if _, err := s.db.Exec(`INSERT INTO release_hand_releases VALUES(?,?,?,?,?)`, task.ID, "hrl_unreadable", 999999, candidateC, "{"); err != nil {
+		t.Fatal(err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	docs := windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryChanged(t, s, task, "docs", "docs", "docs/a.md"))
+	if docs.State != "verified" || pageJob(t, windowPage(t, s, task), docs.ID).State != "verified" {
+		t.Fatalf("docs job outside the window %+v", docs)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	store := windowEnqueue(t, s, task, h, "enqueue-store", releaseEntryChanged(t, s, task, "store change", "store-change", "hub/internal/store/x.go"))
+	if store.State != "held" || strings.Contains(store.Hold.Reason, "; base") {
+		t.Fatalf("covered job %+v", store.Hold)
+	}
+	if _, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{}); err == nil {
+		t.Fatal("a list inside the window did not read the ledger for the docs job")
 	}
 }
 

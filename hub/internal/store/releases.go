@@ -1612,7 +1612,8 @@ func liftReleaseHold(j *api.ReleaseJob, event api.ReleaseHoldEvent) {
 // no covered job is claimed. The hub enforces it itself: a handler write that
 // leaves a covered job verified holds it (W1), a ledger list holds every
 // covered verified job (W2), and claim and batch-add refuse one (W3). A hold
-// it places stays until an explicit unhold after the window ends.
+// it places stays until an explicit unhold after the window ends. A job whose
+// own diff is uncovered is covered too unless the ledger check passes it.
 
 // releaseWindowTargetSets are the target sets a window may cover, in target
 // order. Before its checkout the hub cannot tell hub, bridge and mini apart
@@ -1796,22 +1797,164 @@ func releaseWindowOpen(ctx context.Context, q queryRower, task string, now time.
 	return w, nil
 }
 
-// releaseWindowHoldable reports whether the window may hold j: a covered
-// verified job no deployer holds, outside any active batch, and not requeued
-// with a host release lock, which holdRelease refuses for the same reason.
-func releaseWindowHoldable(w releaseWindow, j api.ReleaseJob) bool {
-	if j.State != "verified" || j.AgentID != "" || !releaseWindowCovers(w, j.Plan.Changed) {
-		return false
+// The window's ledger check (wi_d87f594a6ae13ec9, docs/project-deployment.md
+// "Release quiet window"): the runner deploys each target from its last
+// release through the integrated tasks-hub commit, so a job whose own diff is
+// uncovered still ships whatever tasks-hub holds unreleased. The hub has no
+// git and does not know the runner's config baselines. It passes such a job
+// only when its own records show every covered target current at the job's
+// base and nothing it knows of on tasks-hub still unreleased.
+
+// releaseWindowLedger is what the hub's records say about tasks-hub: its sync
+// commits, at which every covered target is current, and the first cause, if
+// any, that covers every job whose own diff is uncovered.
+type releaseWindowLedger struct {
+	sync  map[string]bool
+	cause string
+}
+
+// releaseWindowLedgerLoad reads the task's release jobs and hand releases. A
+// sync commit is (S1) the commit of a released receipt that has push: the
+// runner selected every target from its own baseline through it, unlike the
+// no-change finish, which has no push and never selects; or (S2) the commit of
+// a hand release naming every covered target. The causes, first match wins:
+// (U1) a published job whose own diff is covered, not reverted, and no job of
+// its entry released or superseded; (U2) a hand release that omits a covered
+// target, recorded after the newest sync record.
+func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w releaseWindow) (releaseWindowLedger, error) {
+	out := releaseWindowLedger{sync: map[string]bool{}}
+	var newest time.Time
+	settled := map[string]bool{}
+	var unreleased []api.ReleaseJob
+	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
+	if err != nil {
+		return out, err
 	}
-	n := len(j.Reconciliations)
-	return n == 0 || j.Reconciliations[n-1].LockDigest == ""
+	for rows.Next() {
+		var raw string
+		var j api.ReleaseJob
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &j)
+		}
+		if err != nil {
+			rows.Close()
+			return out, err
+		}
+		if j.State == "released" || j.State == "superseded" {
+			settled[j.EntryID] = true
+		}
+		if r := j.Receipt; r != nil && r.Outcome == "released" && r.Push != nil {
+			out.sync[r.Commit] = true
+			if at := parseTS(j.SettledAt); at.After(newest) {
+				newest = at
+			}
+		}
+		reverted := j.Receipt != nil && j.Receipt.Revert != nil && j.Receipt.Revert.Outcome == "committed"
+		if j.Published && j.State != "released" && j.State != "superseded" && !reverted && releaseWindowCovers(w, j.Plan.Changed) {
+			unreleased = append(unreleased, j)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	var partial []api.HandRelease
+	if rows, err = q.QueryContext(ctx, `SELECT record_json FROM release_hand_releases WHERE task_id=? ORDER BY rowid`, task); err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var raw string
+		var h api.HandRelease
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &h)
+		}
+		if err != nil {
+			rows.Close()
+			return out, err
+		}
+		if !slices.ContainsFunc(w.Targets, func(t string) bool { return !slices.Contains(h.Targets, t) }) {
+			out.sync[h.ReleasedCommit] = true
+			if at := parseTS(h.CreatedAt); at.After(newest) {
+				newest = at
+			}
+		} else {
+			partial = append(partial, h)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return out, err
+	}
+	for _, j := range unreleased {
+		if !settled[j.EntryID] {
+			out.cause = "job " + j.ID + " was published and is not released"
+			return out, nil
+		}
+	}
+	for _, h := range partial {
+		if parseTS(h.CreatedAt).After(newest) {
+			out.cause = "hand release " + h.ID + " names only " + strings.Join(h.Targets, ", ")
+			return out, nil
+		}
+	}
+	return out, nil
+}
+
+// releaseWindowCheck decides coverage inside an open window. It reads the
+// ledger at most once, and only for a job whose own diff is uncovered.
+type releaseWindowCheck struct {
+	w      releaseWindow
+	ledger *releaseWindowLedger
+}
+
+// covers reports whether the window covers j and, when only the ledger does,
+// why: the cause is empty when the job's own diff is covered.
+func (c *releaseWindowCheck) covers(ctx context.Context, q queryRower, task string, j api.ReleaseJob) (bool, string, error) {
+	if releaseWindowCovers(c.w, j.Plan.Changed) {
+		return true, "", nil
+	}
+	if c.ledger == nil {
+		l, err := releaseWindowLedgerLoad(ctx, q, task, c.w)
+		if err != nil {
+			return false, "", err
+		}
+		c.ledger = &l
+	}
+	if c.ledger.cause != "" {
+		return true, c.ledger.cause, nil
+	}
+	if !c.ledger.sync[j.BaseCommit] {
+		base := j.BaseCommit
+		if len(base) > 12 {
+			base = base[:12]
+		} else if base == "" {
+			base = "(none)"
+		}
+		return true, "base " + base + " is not a recorded release commit", nil
+	}
+	return false, "", nil
+}
+
+// holdable reports whether the window may hold j: a covered verified job no
+// deployer holds, outside any active batch, and not requeued with a host
+// release lock, which holdRelease refuses for the same reason.
+func (c *releaseWindowCheck) holdable(ctx context.Context, q queryRower, task string, j api.ReleaseJob) (bool, string, error) {
+	if n := len(j.Reconciliations); j.State != "verified" || j.AgentID != "" || (n > 0 && j.Reconciliations[n-1].LockDigest != "") {
+		return false, "", nil
+	}
+	return c.covers(ctx, q, task, j)
 }
 
 // releaseWindowHold saves the window's hold on j at the generation the job
-// has after the event.
-func releaseWindowHold(w releaseWindow, j *api.ReleaseJob, generation int64, now time.Time) {
+// has after the event. A ledger cause is appended to the reason.
+func releaseWindowHold(w releaseWindow, j *api.ReleaseJob, generation int64, now time.Time, cause string) {
 	until := releaseWindowUntil(w, now).Format(time.RFC3339)
 	reason := releaseWindowText(w) + "; held until an explicit unhold after " + until
+	if cause != "" {
+		reason += "; " + cause
+	}
 	at := ts(now)
 	j.State = "held"
 	j.Hold = &api.ReleaseHold{Reason: reason, HeldAt: at, Window: &api.ReleaseHoldWindow{Zone: w.Zone, Start: w.Start, End: w.End, Targets: slices.Clone(w.Targets), Until: until}}
@@ -1825,10 +1968,15 @@ func releaseWindowHoldOnWrite(ctx context.Context, tx *sql.Tx, task string, j *a
 		return nil
 	}
 	w, err := releaseWindowOpen(ctx, tx, task, now)
-	if err != nil || w == nil || !releaseWindowHoldable(*w, *j) {
+	if err != nil || w == nil {
 		return err
 	}
-	releaseWindowHold(*w, j, j.Generation, now)
+	c := releaseWindowCheck{w: *w}
+	held, cause, err := c.holdable(ctx, tx, task, *j)
+	if err != nil || !held {
+		return err
+	}
+	releaseWindowHold(*w, j, j.Generation, now, cause)
 	return nil
 }
 
@@ -1836,10 +1984,19 @@ func releaseWindowHoldOnWrite(ctx context.Context, tx *sql.Tx, task string, j *a
 // claimed or added to a batch.
 func releaseWindowClaimGate(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, now time.Time) error {
 	w, err := releaseWindowOpen(ctx, tx, task, now)
-	if err != nil || w == nil || !releaseWindowCovers(*w, j.Plan.Changed) {
+	if err != nil || w == nil {
 		return err
 	}
-	return releaseConflict("job " + j.ID + " is inside the " + releaseWindowText(*w) + " until " + releaseWindowUntil(*w, now).Format(time.RFC3339) + "; the hub holds it at the next list, and it needs an explicit unhold after the window ends")
+	c := releaseWindowCheck{w: *w}
+	covered, cause, err := c.covers(ctx, tx, task, j)
+	if err != nil || !covered {
+		return err
+	}
+	text := "job " + j.ID + " is inside the " + releaseWindowText(*w) + " until " + releaseWindowUntil(*w, now).Format(time.RFC3339) + "; the hub holds it at the next list, and it needs an explicit unhold after the window ends"
+	if cause != "" {
+		text += "; " + cause
+	}
+	return releaseConflict(text)
 }
 
 // releaseWindowUnholdGate refuses the unhold of a window hold while a window
@@ -1891,7 +2048,7 @@ func (s *Store) sweepReleaseWindow(ctx context.Context, task string) error {
 	if err != nil {
 		return err
 	}
-	var held []api.ReleaseJob
+	var verified []api.ReleaseJob
 	for rows.Next() {
 		var raw string
 		var j api.ReleaseJob
@@ -1902,19 +2059,36 @@ func (s *Store) sweepReleaseWindow(ctx context.Context, task string) error {
 			rows.Close()
 			return err
 		}
-		if !slices.Contains(batched, j.ID) && releaseWindowHoldable(*w, j) {
-			held = append(held, j)
+		if !slices.Contains(batched, j.ID) {
+			verified = append(verified, j)
 		}
 	}
 	err = rows.Err()
 	rows.Close()
-	if err != nil || len(held) == 0 {
+	if err != nil {
 		return err
+	}
+	// The ledger is read after the list closes, once per sweep.
+	c := releaseWindowCheck{w: *w}
+	var held []api.ReleaseJob
+	var causes []string
+	for _, j := range verified {
+		ok, cause, err := c.holdable(ctx, tx, task, j)
+		if err != nil {
+			return err
+		}
+		if ok {
+			held = append(held, j)
+			causes = append(causes, cause)
+		}
+	}
+	if len(held) == 0 {
+		return nil
 	}
 	for i := range held {
 		j := &held[i]
 		j.Generation++
-		releaseWindowHold(*w, j, j.Generation, now)
+		releaseWindowHold(*w, j, j.Generation, now, causes[i])
 		raw, err := json.Marshal(j)
 		if err != nil {
 			return err

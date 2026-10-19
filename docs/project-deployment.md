@@ -1459,7 +1459,7 @@ Which of the four to use:
 | | Applies to | Effect | Ends when |
 |---|---|---|---|
 | Owner hold (`hold`) | a `verified`, unclaimed job | state `held`; never claimed or batched; queue position kept | `unhold`, or its named items release |
-| Release quiet window (`tt deployment window set`, owner) | every covered `verified`, unclaimed job while the window is open | the hub saves a window hold (state `held`); claim and batch-add of a covered job are refused | `unhold` after the window ends, or after the owner clears it |
+| Release quiet window (`tt deployment window set`, owner) | every covered `verified`, unclaimed job while the window is open, including one the ledger check covers | the hub saves a window hold (state `held`); claim and batch-add of a covered job are refused | `unhold` after the window ends, or after the owner clears it |
 | Set-aside (`set-aside`) | a `claimed` job with no effects while a later verified job waits | back to `verified` behind every queued job; claimed again when its turn comes | it is not a hold: nothing stops the next claim |
 | Refuse (`refuse`, or `reconcile` with `refuse`) | a claimed job that must not release as it is | terminal state `refused` | never; a new job needs `tt deployment retry` |
 
@@ -1525,7 +1525,52 @@ only stay a subset, so a missing rule holds a job and never releases one:
 A job is covered when any of its paths is covered, or when it has no changed
 paths at all (unknown counts as covered). A window of `tailos` alone still
 holds a job that changes hub code, because service paths are held by every
-window. A docs- or tests-only job is never held and releases at night.
+window.
+
+**Ledger check (wi_d87f594a6ae13ec9).** A job whose own paths are all uncovered
+(docs or tests only, or TailOS only under a window without `tailos`) can still
+deploy covered targets: the runner selects each target from its last released
+commit through the integrated tasks-hub commit, so whatever tasks-hub holds
+unreleased ships with it. The hub has no git, so such a job is covered too
+unless the hub's own records show that every covered target is current at the
+job's `baseCommit` and nothing the hub knows of on tasks-hub is unreleased.
+
+A *sync commit* is a commit at which every covered target is current:
+
+- S1: the commit of a `released` receipt that carries `push`. The runner
+  selected every target from its own baseline through that commit. The
+  no-change finish has no `push` and never selects, so it is not one.
+- S2: the `releasedCommit` of a hand release whose targets include every target
+  the window covers.
+
+The first of these that applies covers the job:
+
+- U1: a job of the project is `published`, not `released` or `superseded`, not
+  rolled back by a committed revert, its own paths are covered, and no job of
+  its queue entry is `released` or `superseded`. Example: a job refused or
+  blocked after publishing that waits for a hand release.
+- U2: a hand release that omits a covered target was recorded after the newest
+  sync record (the receipt's `settledAt` or the hand release's `createdAt`,
+  compared as times).
+- U3: the job's `baseCommit` is empty or is not a sync commit. Example: an owner
+  commit pushed to tasks-hub before its hand release is recorded.
+
+So a docs- or tests-only job based on a pushed release, or on a full hand
+release, still releases at night. The hub reads these records only while the
+window is open and only for a job whose own paths are uncovered. Its limits:
+
+- The hub does not know the runner's config baselines. A hand release recorded
+  only by a config edit is unknown to it, so a job based on that commit is held,
+  never passed.
+- A commit pushed to tasks-hub after the job's base that no job or hand release
+  records is not visible to the hub, and the job ships it. Only a runner re-check
+  after its target selection could catch that; it is not built.
+- A published job whose entry never settles holds every such job each night
+  until the handler settles it: a supersession citing the hand release, or a
+  released retry of the same entry.
+- Equality with recorded commits holds too many jobs, never too few: a job on a
+  revert commit, a no-change finish, or a legacy receipt without `push` is held
+  and waits for the morning unhold.
 
 **What the window does while it is open:**
 
@@ -1548,7 +1593,11 @@ window. A docs- or tests-only job is never held and releases at night.
 A window hold is an owner hold that names the window: `hold.window` carries the
 zone, start, end, targets and `until`, its reason reads `release quiet window
 22:00-07:00 America/Los_Angeles covers hub, bridge, mini; held until an explicit
-unhold after UNTIL`, and its `holdHistory` event has `cause` `window`. It has no
+unhold after UNTIL`, and its `holdHistory` event has `cause` `window`. When only
+the ledger check covers the job, the reason and the W3 refusal end with `; `
+and the cause: `job ID was published and is not released` (U1), `hand release
+ID names only TARGETS` (U2) or `base SHA12 is not a recorded release commit`
+(U3). It has no
 agent, run or named items. The runner treats it like any hold: it passes the
 job over and its poll ends with the wait `owner_hold`, not a failure.
 
