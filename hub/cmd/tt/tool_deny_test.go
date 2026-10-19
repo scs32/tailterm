@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -1247,6 +1248,9 @@ func TestToolGateRedaction(t *testing.T) {
 	// deadline instead of the real one.
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
 	setToolLedger(t, &toolRedactScanBudget, 30*time.Second) // nor is the scan budget: a hook that passes it writes its rows with no summary
+	// Each row's time is scanned with the rest, so it is one that holds no
+	// secret: the real clock's fraction digits can hold 8443.
+	setToolLedgerClock(t, time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC))
 	dir := t.TempDir()
 	// A FIFO with no writer blocks whoever opens it for reading. The hook
 	// returning with its rows written shows neither was opened: the file a
@@ -1296,10 +1300,78 @@ func TestToolGateRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	secrets := append([]string{"sentinel", bearer, e.token, "Bearer", "Authorization", "gatehub", "8443", "18999", "18765\"", "truenas", "/mnt/", "deepfreeze", fifo, dir, "@", "://"}, commands...)
-	for _, secret := range secrets {
-		if strings.Contains(string(ledger), secret) {
-			t.Errorf("the ledger holds %q:\n%s", secret, ledger)
+	hits, err := ledgerSecretHits(ledger, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range hits {
+		t.Errorf("the ledger holds %q:\n%s", secret, ledger)
+	}
+}
+
+// ledgerSecretHits returns the secrets that the ledger holds anywhere but in
+// a row's argsDigest. That digest is a SHA-256 over the command, which names
+// a per-run temporary path, so its hex can hold a short secret such as 8443
+// by chance. It must be exactly that, lowercase hex of SHA-256 length, so
+// nothing else can pass unscanned in its place.
+func ledgerSecretHits(ledger []byte, secrets []string) ([]string, error) {
+	var scanned strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(string(ledger), "\n"), "\n") {
+		var row struct {
+			ArgsDigest *string `json:"argsDigest"`
 		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return nil, fmt.Errorf("ledger line %q: %v", line, err)
+		}
+		if row.ArgsDigest == nil || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(*row.ArgsDigest) {
+			return nil, fmt.Errorf("ledger line %q: argsDigest is not lowercase SHA-256 hex", line)
+		}
+		field := `"argsDigest":"` + *row.ArgsDigest + `"`
+		if strings.Count(line, field) != 1 {
+			return nil, fmt.Errorf("ledger line %q: holds %s %d times; want once", line, field, strings.Count(line, field))
+		}
+		scanned.WriteString(strings.Replace(line, field, `"argsDigest":""`, 1) + "\n")
+	}
+	var hits []string
+	for _, secret := range secrets {
+		if strings.Contains(scanned.String(), secret) {
+			hits = append(hits, secret)
+		}
+	}
+	return hits, nil
+}
+
+// The redaction check skips a digest that holds a secret by chance, and still
+// finds that secret in any other field or in a value that is no digest.
+func TestLedgerSecretHitsSkipsOnlyDigest(t *testing.T) {
+	digest := "1c7f3cc3" + strings.Repeat("0", 44) + "9e808443f4ab"
+	row := func(fields string) string {
+		return `{"v":1,"time":"2026-10-06T12:00:00Z","task":"tsk_ledger","agent":"agt_ledger","run":"run_ledger","session":"s1","tool":"Bash","toolUseId":"u0","argsDigest":"` + digest + `","outcome":"would_report"` + fields + "}\n"
+	}
+	secrets := []string{"8443", "@"}
+	for _, c := range []struct {
+		name, ledger string
+		want         []string
+	}{
+		{"digest", row(""), nil},
+		{"summary", row(`,"reportSummary":"curl gatehub 8443"`), []string{"8443"}},
+		{"tool use ID", row("") + strings.Replace(row(""), `"u0"`, `"u8443"`, 1), []string{"8443"}},
+		{"time", strings.Replace(row(""), "12:00:00Z", "12:00:00.18443Z", 1), []string{"8443"}},
+		{"other secret", row(`,"reportPath":"@"`), []string{"@"}},
+	} {
+		hits, err := ledgerSecretHits([]byte(c.ledger), secrets)
+		if err != nil || strings.Join(hits, ",") != strings.Join(c.want, ",") {
+			t.Errorf("%s: hits = %q, %v; want %q", c.name, hits, err, c.want)
+		}
+	}
+	for _, bad := range []string{"8443", strings.ToUpper(digest), digest + "8443"} {
+		ledger := strings.Replace(row(""), digest, bad, 1)
+		if hits, err := ledgerSecretHits([]byte(ledger), secrets); err == nil {
+			t.Errorf("argsDigest %q: hits = %q with no error; want it refused unscanned", bad, hits)
+		}
+	}
+	if _, err := ledgerSecretHits([]byte(strings.Replace(row(""), `,"argsDigest":"`+digest+`"`, "", 1)), secrets); err == nil {
+		t.Error("a row with no argsDigest: no error; want it refused")
 	}
 }
 
