@@ -4307,3 +4307,89 @@ func TestReviewConvergenceWithdrawnReassignedReview(t *testing.T) {
 		t.Fatal(st.Rounds)
 	}
 }
+
+// wi_9948c5e178a4ca71: the status read drops a withdrawn, unanswered last
+// round at once, as the next transition would, while an answered round and an
+// unwithdrawn one stay listed.
+func TestReviewConvergenceStatusOmitsWithdrawnRoundAtOnce(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	answered, err := f.leadReview(candidateA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", answered.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	// Withdrawal after the RESULT is refused and changes nothing.
+	if err = f.withdraw(t, answered.Seq); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("withdraw after result", err)
+	}
+	open, err := f.leadReview(candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.state(t)
+	if len(before.Rounds) != 2 || before.Rounds[1].RequestSeq != open.Seq || before.Rounds[1].ResultSeq != 0 {
+		t.Fatal("unwithdrawn unanswered round not listed", before.Rounds)
+	}
+	if err = f.withdraw(t, open.Seq); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 1 || st.Rounds[0].RequestSeq != answered.Seq || st.Rounds[0].ResultSeq == 0 {
+		t.Fatal("status still lists the withdrawn round", st.Rounds)
+	}
+	// The read is read-only: stored state keeps the round until a transition.
+	var raw string
+	if err = f.s.db.QueryRowContext(f.ctx, `SELECT state_json FROM review_convergence WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, fmt.Sprintf(`"requestSeq":%d`, open.Seq)) {
+		t.Fatal("status read rewrote stored state", raw)
+	}
+	// The read matches enforcement: the fresh REVIEW takes the dropped number.
+	fresh, err := f.leadReview(candidateC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st = f.state(t); len(st.Rounds) != 2 || st.Rounds[1].Number != 2 || st.Rounds[1].RequestSeq != fresh.Seq {
+		t.Fatal(st.Rounds)
+	}
+}
+
+// Only the current stage's last round leaves the read: a withdrawn round of an
+// earlier stage stays listed, as the transition path leaves it stored.
+func TestReviewConvergenceStatusKeepsEarlierStageWithdrawnRound(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	handler := f.stageHandler(t)
+	f.confirmScope(t, handler, f.ownerOrder(t, "findings-order"), "findings-scope")
+	earlier, err := f.leadReview(candidateA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+	if err = f.assign(f.criteria, nil); err != nil {
+		t.Fatal("build ASSIGN", err)
+	}
+	if err = f.withdraw(t, earlier.Seq); err != nil {
+		t.Fatal(err)
+	}
+	st := f.state(t)
+	if len(st.Stages) != 2 || len(st.Rounds) != 1 || st.Rounds[0].RequestSeq != earlier.Seq {
+		t.Fatal("earlier stage's withdrawn round left the read", st.Stages, st.Rounds)
+	}
+	current, err := f.leadReview(candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st = f.state(t); len(st.Rounds) != 2 || st.Rounds[0].RequestSeq != earlier.Seq || st.Rounds[1].RequestSeq != current.Seq || st.Rounds[1].Number != 1 {
+		t.Fatal(st.Rounds)
+	}
+	if err = f.withdraw(t, current.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if st = f.state(t); len(st.Rounds) != 1 || st.Rounds[0].RequestSeq != earlier.Seq {
+		t.Fatal("current stage's withdrawn round still listed", st.Rounds)
+	}
+}

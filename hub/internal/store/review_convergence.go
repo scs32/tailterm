@@ -262,6 +262,24 @@ func dropWithdrawnRound(ctx context.Context, q queryRower, task string, state *a
 	return err
 }
 
+// dropListedWithdrawnRound applies dropWithdrawnRound to a status read, so a
+// withdrawn round leaves the listing at once rather than at the next saved
+// transition. It splits the stage as the transition path does and changes
+// nothing stored.
+func dropListedWithdrawnRound(ctx context.Context, q queryRower, task string, state *api.ReviewConvergence) error {
+	current := *state
+	if _, err := currentReviewStage(ctx, q, task, &current, 0, 0); err != nil {
+		return err
+	}
+	n := len(current.Rounds)
+	if err := dropWithdrawnRound(ctx, q, task, &current); err != nil || len(current.Rounds) == n {
+		return err
+	}
+	// The current stage's last round is the ledger's last round.
+	state.Rounds = state.Rounds[:len(state.Rounds)-1]
+	return nil
+}
+
 // saveReviewStage saves the current stage after the unchanged earlier stages.
 func saveReviewStage(ctx context.Context, tx *sql.Tx, task string, earlier earlierReviewStages, state api.ReviewConvergence) error {
 	if len(earlier.rounds) > 0 {
@@ -305,6 +323,9 @@ func (s *Store) ListReviewConvergence(ctx context.Context, task string) ([]api.R
 	out := []api.ReviewConvergence{}
 	for _, id := range ids {
 		v, e := reviewState(ctx, tx, task, id)
+		if e == nil {
+			e = dropListedWithdrawnRound(ctx, tx, task, &v)
+		}
 		if e != nil {
 			return nil, e
 		}
