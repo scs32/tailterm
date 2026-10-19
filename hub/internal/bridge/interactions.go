@@ -628,9 +628,11 @@ func (b *Bridge) fileItem(ctx context.Context, taskID string, in discord.Interac
 
 // announceFiled posts a filing in the interaction's channel, once: a
 // replayed or resumed interaction finds its earlier post by the marker, and
-// the nonce covers a send whose answer was lost.
+// the nonce covers a send whose answer was lost. A failed send is looked for
+// again, since it may have landed; a failed look keeps the send's error.
 func (b *Bridge) announceFiled(ctx context.Context, in discord.Interaction, mk, content string) error {
-	found, err := b.findOwn(ctx, in.ChannelID, mk, time.Now().Add(-InteractionLifetime))
+	since := time.Now().Add(-InteractionLifetime)
+	found, err := b.findOwn(ctx, in.ChannelID, mk, since)
 	if err != nil || found != "" {
 		return err
 	}
@@ -638,6 +640,12 @@ func (b *Bridge) announceFiled(ctx context.Context, in discord.Interaction, mk, 
 		Content: content, AllowedMentions: discord.AllowedMentions{Parse: []string{}},
 		Nonce: "tf" + in.ID, EnforceNonce: true,
 	})
+	if err == nil {
+		return nil
+	}
+	if found, ferr := b.findOwn(ctx, in.ChannelID, mk, since); ferr == nil && found != "" {
+		return nil
+	}
 	return err
 }
 

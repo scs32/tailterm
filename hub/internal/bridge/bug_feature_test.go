@@ -495,3 +495,22 @@ func TestBugAnnounceFailureIsReported(t *testing.T) {
 		t.Errorf("%d announcements after a failed post, want 0", len(posts))
 	}
 }
+
+// wi_bce6fceb4865c5b7: an announcement whose answer was lost is found in the
+// channel, so the owner is not told it failed.
+func TestBugAnnounceLostAnswerIsNotReported(t *testing.T) {
+	h := newHarness(t)
+	h.fake.loseCreateMessage = 1
+	in := fileCommand("950000000000000801", "bug", "Channel answer lost. Post still lands.")
+	got := editContent(h.interact(in))
+	items := h.items()
+	if len(items) != 1 {
+		t.Fatalf("filed %d items, want 1; reply %q", len(items), got)
+	}
+	if !strings.Contains(got, "Filed bug **"+items[0].ID+"**") || strings.Contains(got, "posting it in the channel failed") {
+		t.Errorf("reply = %q", got)
+	}
+	if posts := h.filedPosts(); len(posts) != 1 {
+		t.Errorf("%d announcements after a lost answer, want 1", len(posts))
+	}
+}
