@@ -623,8 +623,9 @@ func (s *Store) queueWaitOrphaned(ctx context.Context, w queueWaitRow, reason st
 
 // queueWaitTeamIdle reports whether the waiting team has done nothing since
 // its wait notice: no message from a live member after it, and every live
-// member done, idle or finished silent and none waiting for or holding the
-// matrix host (the stall check's member rule, team_queue_stall.go).
+// member done, idle, finished silent or provider-blocked and none waiting for
+// or holding the matrix host (the stall check's member rule,
+// team_queue_stall.go). A provider-blocked member makes no progress.
 func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.Time) (bool, error) {
 	const members = `SELECT b.agent_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN ('closed','exited')`
@@ -646,7 +647,7 @@ func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.
 		if err := rows.Scan(&status, &state, &payload); err != nil {
 			return false, err
 		}
-		if status != api.AgentDone && state != "idle" && state != "finished_silent" {
+		if status != api.AgentDone && state != "idle" && state != "finished_silent" && state != "provider_blocked" {
 			idle = false
 		}
 		// A member's verification run waiting for or holding the matrix

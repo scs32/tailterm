@@ -925,6 +925,48 @@ func TestStewardRotationBusyCommitStaysPrepared(t *testing.T) {
 	}
 }
 
+// A provider-blocked steward makes no progress and holds no tool call, so the
+// runner may rotate it as it rotates an idle one; a pending tool call still
+// refuses first.
+func TestStewardRotationProviderBlockedIsIdle(t *testing.T) {
+	f := newStewardRotationFixture(t, true)
+	ctx := context.Background()
+	blocked := func(tool string) {
+		t.Helper()
+		now := time.Now().UTC()
+		activity := api.AgentActivity{State: "provider_blocked", ObservedAt: now, LastEventAt: now, Provider: providerBlock(f.old.Runtime, api.ProviderBlockUsageLimit, now.Add(-time.Minute))}
+		if tool != "" {
+			activity.PendingTool, activity.PendingSince = tool, now
+		}
+		if _, err := f.s.ReportActivity(ctx, f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := func(key string) (api.StewardRotation, error) {
+		return f.s.StewardRotationAction(ctx, f.task.ID, api.StewardRotationRequest{Operation: api.StewardRotationPrepare, RequestID: key, OldAgentID: f.old.ID, OldRunID: f.old.RunID,
+			SuccessorAgentID: api.NewID("agt"), SuccessorName: api.StewardSuccessorName(f.old.Name), Reason: api.StewardRotationReasonTokens, Trigger: api.StewardRotationTriggerRunner}, stewardBy)
+	}
+	blocked("Bash")
+	if _, err := runner("blocked-pending-tool"); stewardCode(err) != api.StewardRefusedPendingTool {
+		t.Fatalf("blocked with a pending tool: %v", err)
+	}
+	// Activity reports only change on a new state.
+	f.activity(t, f.old, "working", "", 0)
+	blocked("")
+	list, err := f.s.StewardRotationsDue(ctx, "mini", strings.Repeat("c", 64))
+	if err != nil || len(list.Entries) != 1 || !list.Entries[0].Idle || list.Entries[0].ActivityState != "provider_blocked" {
+		t.Fatalf("due list for a provider-blocked steward: %+v %v", list.Entries, err)
+	}
+	r, err := runner("blocked-idle")
+	if err != nil || r.State != api.StewardRotationPrepared {
+		t.Fatalf("runner prepare for a provider-blocked steward: %+v %v", r, err)
+	}
+	f.admit(t, r.SuccessorAgentID, true)
+	if done, err := f.act(api.StewardRotationCommit, "commit-blocked", r.ID); err != nil || done.State != api.StewardRotationCommitted {
+		t.Fatalf("commit for a provider-blocked steward: %+v %v", done, err)
+	}
+}
+
 // A pause closes the old steward mid-rotation; the prepared record then holds
 // nothing open, and the next steward and rotation proceed.
 func TestStewardRotationStaleAfterOldStewardCloses(t *testing.T) {

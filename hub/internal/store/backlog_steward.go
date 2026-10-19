@@ -511,7 +511,8 @@ func (s *Store) ListStewardRotations(ctx context.Context, task string) ([]api.St
 }
 
 // stewardBusy applies the handler idle rules to the steward: the owner may
-// treat an unobserved run as idle; the runner needs an observed idle state.
+// treat an unobserved run as idle; the runner needs an observed idle,
+// finished-silent or provider-blocked state.
 func stewardBusy(ctx context.Context, q queryRower, task string, a api.Agent, trigger string) (handlerBusy, *api.StewardRefusal, error) {
 	b, err := loadHandlerBusy(ctx, q, task, a)
 	if err != nil {
@@ -523,7 +524,9 @@ func stewardBusy(ctx context.Context, q queryRower, task string, a api.Agent, tr
 	switch b.state {
 	case "working", "hung_tool", "looping":
 		return b, &api.StewardRefusal{Code: api.StewardRefusedWorking, Detail: "the steward run's activity is " + b.state}, nil
-	case "idle", "finished_silent":
+	case "idle", "finished_silent", "provider_blocked":
+		// A provider-blocked steward makes no progress and holds no tool
+		// call, so it is as safe to rotate as an idle one.
 		return b, nil, nil
 	}
 	if trigger == api.StewardRotationTriggerRunner {

@@ -975,6 +975,49 @@ func TestQueueWaitMatrixWaitIsNotIdle(t *testing.T) {
 	}
 }
 
+// A provider-blocked member makes no progress, so it counts as idle, as in
+// the stall check's member rule; its matrix run still keeps the team open.
+func TestQueueWaitProviderBlockedMemberIsIdle(t *testing.T) {
+	for name, c := range map[string]struct {
+		wait  func(now time.Time) *api.MatrixWait
+		state string
+		steps int
+	}{
+		"blocked": {func(time.Time) *api.MatrixWait { return nil }, api.TeamQueueWaitOverdue, 1},
+		"blocked holding the matrix host": {func(now time.Time) *api.MatrixWait {
+			return &api.MatrixWait{Role: api.MatrixWaitRunning, Since: now}
+		}, api.TeamQueueWaitResumed, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			helper := f.helper(t)
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.meet(t, api.TeamQueueWaitAccepted)
+			f.sweep(t)
+			runtime := f.member.Runtime
+			if runtime != "codex" {
+				runtime = "claude"
+			}
+			// A done member is idle already, so the blocked member is running.
+			activity := api.AgentActivity{State: "provider_blocked", ObservedAt: f.clock, Provider: providerBlock(runtime, api.ProviderBlockUsageLimit, f.clock), MatrixWait: c.wait(f.clock)}
+			if _, err := f.s.ReportActivity(f.ctx, f.task.ID, f.member.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: f.member.RunID, Activity: activity}); err != nil {
+				t.Fatal(err)
+			}
+			f.exec(t, `UPDATE agents SET status='running' WHERE id=?`, f.member.ID)
+			f.clock = f.clock.Add(15 * time.Minute)
+			if steps := f.sweep(t); len(steps) != c.steps || f.state(t) != c.state {
+				t.Fatalf("steps %v, state %s, want %d and %s", steps, f.state(t), c.steps, c.state)
+			}
+			for _, to := range []api.Agent{helper, f.handler} {
+				if n := len(f.notices(t, to, queueWaitOverdueSubject)); n != c.steps {
+					t.Fatalf("%d overdue notices to %s", n, to.Name)
+				}
+			}
+		})
+	}
+}
+
 // Review f3: a tick where a wait cannot step takes no write lock. The test
 // holds the store's write lock, so a sweep that needed it would not return.
 func TestQueueWaitSweepTakesNoWriteLockWhenNoOneCanBeTold(t *testing.T) {

@@ -321,10 +321,11 @@ tt steward policy get|set --task tsk_ID [--revision N --enabled=BOOL --max-total
 1. **Prepare** (owner or host runner; an agent identity gets 409
    `agent_caller`). The named run must be the active steward (`not_steward`),
    idle under the handler rules (the owner treats an unobserved run as idle; the
-   runner needs an observed `idle` or `finished_silent`, and no pending tool:
-   `working`, `pending_tool`), with a saved summary (`summary_missing`) and no
-   other open rotation (`rotation_open`). Prepare snapshots the latest summary
-   revision and digest and preallocates the successor `<base>-r<N>`.
+   runner needs an observed `idle`, `finished_silent` or `provider_blocked`, and
+   no pending tool: `working`, `pending_tool`), with a saved summary
+   (`summary_missing`) and no other open rotation (`rotation_open`). Prepare
+   snapshots the latest summary revision and digest and preallocates the
+   successor `<base>-r<N>`.
 2. **Launch.** The host runs `tt spawn --role backlog_steward
    --steward-successor --agent-id <successor>` with the current template and the
    old steward's host, runtime, directory and permission mode. The hub admits

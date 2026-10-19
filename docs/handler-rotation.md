@@ -204,7 +204,7 @@ The rotation row, successor and obligations stay as they were.
 | Code | Meaning |
 | --- | --- |
 | `live_lease` | A team queue entry leased to the old handler's exact run is `launching`, `running`, or `failed` and not released. |
-| `working` | The old run's activity is `working`, `hung_tool` or `looping`. For the runner, also any state other than `idle` or `finished_silent`. |
+| `working` | The old run's activity is `working`, `hung_tool` or `looping`. For the runner, also any state other than `idle`, `finished_silent` or `provider_blocked`. |
 | `pending_tool` | The old run has a pending tool call. |
 | `rotation_open` | Another rotation of this project is still prepared. |
 | `project_paused` | The project is paused. |
@@ -230,8 +230,8 @@ pending tool or is recorded as working.
 signal is the activity monitor's exact-run state and pending tool. Activity
 snapshots are transitions, so a handler that just started a turn can look idle
 for up to the monitor's working window. The owner command treats an unobserved
-(`unknown`) run as idle. The runner requires an observed `idle` or
-`finished_silent` state.
+(`unknown`) run as idle. The runner requires an observed `idle`,
+`finished_silent` or `provider_blocked` state.
 
 ## A dead primary
 
