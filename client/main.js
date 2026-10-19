@@ -101,6 +101,7 @@ import {
 import { setupImageDrops } from "./image-upload.js";
 import { resolveSessionName } from "./session-name.js";
 import {
+  readTmuxSessions,
   tmuxCommand as remoteTmuxCommand,
   tmuxListCommand,
   validateSession,
@@ -2980,6 +2981,15 @@ document.addEventListener("visibilitychange", () => {
 function discoverTmux(server) {
   if (netState !== "Running")
     throw new Error("Connect Tailscale before checking remote sessions.");
+  return readTmuxSessions(() => discoverTmuxOnce(server)).then((sessions) => ({
+    sessions: sessions.map(({ name, windows, attached }) => ({
+      name,
+      windows,
+      attached,
+    })),
+  }));
+}
+function discoverTmuxOnce(server) {
   return new Promise((resolve, reject) => {
     let ssh,
       read,
@@ -3036,19 +3046,7 @@ function discoverTmux(server) {
               );
               return;
             }
-            finish(null, {
-              sessions: body
-                .split(/[\r\n]+/)
-                .filter(Boolean)
-                .map((line) => {
-                  const [name, windows, attached] = line.split("|");
-                  return {
-                    name,
-                    windows: Number(windows) || 0,
-                    attached: Number(attached) || 0,
-                  };
-                }),
-            });
+            finish(null, body);
           }
         },
         onDone: () => {

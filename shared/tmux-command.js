@@ -187,6 +187,9 @@ function clipboardFeatures() {
   // Do not overwrite an existing 'on' clipboard policy or modify .tmux.conf.
   return `tailterm_tmux_features='-T clipboard'; case "$("$tailterm_tmux_bin" -V 2>/dev/null)" in 'tmux 0.'*|'tmux 1.'*|'tmux 2.'*|'tmux 3.0'*|'tmux 3.1'|'tmux 3.1a'|'tmux 3.1b'|'tmux 3.1c') tailterm_tmux_features='' ;; esac; `;
 }
+// #{session_created} is each row's end field: a row cut by the 100 ms limit
+// (see the note above identityHolds) loses it, so only a row whose every field
+// has its strict shape is whole. Read the output with readTmuxSessions.
 export function tmuxListCommand(path = "") {
   return (
     "/bin/sh -c " +
@@ -195,6 +198,39 @@ export function tmuxListCommand(path = "") {
         `exec "$tailterm_tmux_bin" list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}|#{session_id}|#{session_created}'`,
     )
   );
+}
+// The name is matched greedily, so a name containing "|" stays whole.
+const SESSION_ROW = /^(.+)\|(\d+)\|(\d+)\|(\$\d+)\|(\d+)$/;
+export function parseTmuxSessions(output) {
+  const sessions = [];
+  let cut = 0;
+  for (const line of String(output).split(/[\r\n]+/)) {
+    if (!line) continue;
+    const row = SESSION_ROW.exec(line);
+    if (!row) {
+      cut++;
+      continue;
+    }
+    const [, name, windows, attached, id, created] = row;
+    sessions.push({
+      name,
+      windows: Number(windows),
+      attached: Number(attached),
+      target: { id, created },
+    });
+  }
+  return { sessions, cut };
+}
+// A cut listing is read once more. A row that stays cut rejects the whole
+// listing: a dropped row would make a live session look gone.
+const SESSION_LIST_READS = 2;
+export async function readTmuxSessions(readOnce) {
+  for (let reads = 1; ; reads++) {
+    const { sessions, cut } = parseTmuxSessions(await readOnce());
+    if (!cut) return sessions;
+    if (reads >= SESSION_LIST_READS)
+      throw new Error("tmux did not finish listing the sessions. Try again.");
+  }
 }
 
 export function tmuxRenameCommand(name, nextName, path = "", target) {

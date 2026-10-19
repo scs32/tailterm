@@ -14,6 +14,8 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   tmuxCommand,
   tmuxListCommand,
+  parseTmuxSessions,
+  readTmuxSessions,
   validateTmuxPath,
   tmuxRenameCommand,
   tmuxHistoryCommand,
@@ -902,6 +904,135 @@ test(
       [split.reply, split.status, f.size()],
       ["refused", 0, "160x38"],
     );
+  },
+);
+
+test("a session row is whole only when its end field and every field before it has its shape", () => {
+  const lab = {
+    name: "lab",
+    windows: 4,
+    attached: 0,
+    target: { id: "$3", created: "1700000000" },
+  };
+  const whole = "lab|4|0|$3|1700000000";
+  assert.deepEqual(parseTmuxSessions(""), { sessions: [], cut: 0 });
+  assert.deepEqual(
+    parseTmuxSessions(`${whole}\r\nodd|name|1|2|$4|1700000001\r\n`),
+    {
+      sessions: [
+        lab,
+        {
+          name: "odd|name",
+          windows: 1,
+          attached: 2,
+          target: { id: "$4", created: "1700000001" },
+        },
+      ],
+      cut: 0,
+    },
+  );
+  // Every prefix of a row that a cut leaves behind is cut, never a session.
+  for (const row of [
+    "lab|4|0|$3|",
+    "lab|4|0|$3",
+    "lab|4|0|",
+    "lab|4|0",
+    "lab|4|",
+    "lab|4",
+    "lab|",
+    "lab",
+  ])
+    assert.deepEqual(parseTmuxSessions(row), { sessions: [], cut: 1 }, row);
+  // A whole row next to a cut one is parsed, but the listing is still cut.
+  assert.deepEqual(parseTmuxSessions(`${whole}\nwork|1|0|`), {
+    sessions: [lab],
+    cut: 1,
+  });
+});
+
+test("a cut session listing is read once more, and a lasting cut rejects the listing", async () => {
+  const whole = "lab|4|0|$3|1700000000\n",
+    cut = "lab|4|0|$3|\n",
+    unread = /^Error: tmux did not finish listing the sessions\. Try again\.$/;
+  const reader = (...readings) => {
+    const read = async () => {
+      const next = readings[read.reads++];
+      if (next instanceof Error) throw next;
+      return next;
+    };
+    read.reads = 0;
+    return read;
+  };
+  const first = reader(whole);
+  assert.equal((await readTmuxSessions(first))[0].name, "lab");
+  assert.equal(first.reads, 1);
+  const again = reader(cut, whole);
+  assert.deepEqual(
+    await readTmuxSessions(again),
+    parseTmuxSessions(whole).sessions,
+  );
+  assert.equal(again.reads, 2);
+  const lasting = reader(cut, cut, whole);
+  await assert.rejects(readTmuxSessions(lasting), unread);
+  assert.equal(lasting.reads, 2);
+  // A failed reading is not a cut one, so it is not read again.
+  const failed = reader(new Error("Could not list tmux sessions."), whole);
+  await assert.rejects(readTmuxSessions(failed), /^Error: Could not list/);
+  assert.equal(failed.reads, 1);
+});
+
+test(
+  "a session row that tmux cuts at any field is read again, never listed short",
+  { timeout: CUT_TEST_TIMEOUT_MS },
+  async (t) => {
+    const f = cutFixture(t);
+    // One window keeps this row too quick to be cut; lab walks four.
+    f.run("new-session", "-d", "-s", "odd|name", "sleep 60");
+    const list = tmuxListCommand(f.binary);
+    const reading = (find, count) => {
+      const r = f.under(find, count, list);
+      assert.equal(r.status, 0, r.stderr);
+      return r.stdout;
+    };
+    const named = (sessions) => new Map(sessions.map((s) => [s.name, s]));
+    const whole = parseTmuxSessions(reading("", 0));
+    assert.equal(whole.cut, 0);
+    assert.deepEqual(named(whole.sessions).get("lab"), {
+      name: "lab",
+      windows: 4,
+      attached: 0,
+      target: f.target,
+    });
+    assert.ok(named(whole.sessions).has("odd|name"));
+    for (const find of [
+      "|#{session_windows}",
+      "|#{session_attached}",
+      "|#{session_id}",
+      "|#{session_created}",
+    ]) {
+      const once = parseTmuxSessions(reading(find, 1));
+      assert.ok(once.cut >= 1, find + " was cut");
+      assert.ok(!named(once.sessions).has("lab"), find + " lists no cut lab");
+      assert.ok(named(once.sessions).has("odd|name"), find);
+      // Each reading runs tmux again: the first is cut, the re-read is whole.
+      let reads = 0;
+      const recovered = await readTmuxSessions(() =>
+        reading(find, reads++ ? 0 : 1),
+      );
+      assert.equal(reads, 2, find);
+      assert.deepEqual(
+        named(recovered).get("lab"),
+        named(whole.sessions).get("lab"),
+        find,
+      );
+      reads = 0;
+      await assert.rejects(
+        readTmuxSessions(() => (reads++, reading(find, 1))),
+        /tmux did not finish listing the sessions/,
+        find,
+      );
+      assert.equal(reads, 2, find);
+    }
   },
 );
 

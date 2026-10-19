@@ -6,7 +6,11 @@ import {
   rememberCredential,
 } from "./local-vault.js";
 import { findPeer, isAuthenticationFailure } from "./connection-help.js";
-import { tmuxListCommand, tmuxRenameCommand } from "../shared/tmux-command.js";
+import {
+  readTmuxSessions,
+  tmuxListCommand,
+  tmuxRenameCommand,
+} from "../shared/tmux-command.js";
 import { credentialCache } from "./credential-cache.js";
 
 export function browserSSH(ipn, server, peers, options = {}) {
@@ -256,7 +260,7 @@ export function browserSSH(ipn, server, peers, options = {}) {
     },
   };
 }
-export async function browserTmux(ipn, server, peers) {
+async function browserTmuxOnce(ipn, server, peers) {
   let output = "",
     stderr = "";
   const decoder = new TextDecoder(),
@@ -289,27 +293,19 @@ export async function browserTmux(ipn, server, peers) {
           stderr,
         )
       )
-        return { sessions: [] };
+        return "";
       throw new Error(stderr.trim() || "Could not list tmux sessions.");
     }
-    return {
-      sessions: output
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .map((line) => {
-          const [name, windows, attached, id, created] = line.split("|");
-          return {
-            name,
-            windows: Number(windows) || 0,
-            attached: Number(attached) || 0,
-            ...(id && created ? { target: { id, created } } : {}),
-          };
-        }),
-    };
+    return output;
   } finally {
     clearTimeout(timer);
     session.close();
   }
+}
+export async function browserTmux(ipn, server, peers) {
+  return {
+    sessions: await readTmuxSessions(() => browserTmuxOnce(ipn, server, peers)),
+  };
 }
 
 export async function browserRenameTmux(
