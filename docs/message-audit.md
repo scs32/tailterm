@@ -103,9 +103,12 @@ list an item's messages from three sources:
   correction moves or removes the link;
 - same-task messages that have neither but are linked to the item by the
   current message-audit projection. These rows carry `auditLinked: true` and
-  `auditRevision`, the message's current audit revision. Revision 1 is a related
-  link given at posting; revision 2 or later comes from a correction. The row's
+  `auditRevision`, the message's current audit revision. The row's
   `relationship` and `itemRevision` come from the audit link.
+
+`auditRevision` is not the revision that added the link, so it does not show
+how the link was added: a related link given at posting, a correction or an
+intake resolution. Read that with `tt message-audit history --seq N`.
 
 The message envelope keeps its original creation context, so an audit-linked
 row still shows the primary item it was posted to. Creation-time rows have no
