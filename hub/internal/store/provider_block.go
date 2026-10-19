@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS provider_outages (
 CREATE UNIQUE INDEX IF NOT EXISTS provider_outages_open ON provider_outages(task_id,runtime) WHERE closed_at='';
 CREATE TABLE IF NOT EXISTS provider_block_recoveries (
  episode_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);`)
+	if err != nil {
+		return err
+	}
+	// dropped marks an episode a done agent's turn closed with no model reply:
+	// it is not recovery, so it does not end an outage.
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('provider_block_episodes') WHERE name='dropped'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err = db.Exec(`ALTER TABLE provider_block_episodes ADD COLUMN dropped INTEGER NOT NULL DEFAULT 0`)
+	}
 	return err
 }
 
@@ -109,12 +121,14 @@ func providerBlockText(p api.ProviderBlock) string {
 // is not done is recovery and clears the run's open episodes. A done agent
 // reports a turn state while its stale block is dropped (activity_monitor.go),
 // so its turn proves nothing: that report closes the episodes with no recovery
-// wake or notice, unless it shows a model reply. A report in any other state
-// (an unknown probe, a crash, a stall, a runtime prompt) says nothing about the
-// provider by its state, so it clears an episode only when it shows a model
-// reply since the block: its cumulative output tokens are above those of the
-// episode's own blocked reports (providerBlockOutputBaselines). Without that
-// evidence the episode stays open. A model reply is recovery from any agent.
+// wake or notice, unless it shows a model reply, and marks them dropped so they
+// do not end an outage until a later turn of the agent when it is not done. A
+// report in any other state (an unknown probe, a crash, a stall, a runtime
+// prompt) says nothing about the provider by its state, so it clears an
+// episode only when it shows a model reply since the block: its cumulative
+// output tokens are above those of the episode's own blocked reports
+// (providerBlockOutputBaselines). Without that evidence the episode stays
+// open. A model reply is recovery from any agent.
 func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	now := ts(s.now())
 	p := activity.Provider
@@ -142,7 +156,14 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 			return err
 		}
 		if len(open) == 0 {
-			return nil
+			if !turn {
+				return nil
+			}
+			// A later turn of an agent that is no longer done is recovery
+			// after all, so its quietly dropped episodes count again.
+			_, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET dropped=0 WHERE agent_id=? AND run_id=? AND dropped=1
+ AND EXISTS (SELECT 1 FROM agents WHERE id=? AND run_id=? AND status<>?)`, agent, run, agent, run, api.AgentDone)
+			return err
 		}
 		// No row for this run counts as done: it makes no calls.
 		var status string
@@ -164,8 +185,13 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 			if !recovered && !turn {
 				continue
 			}
-			// A done agent's turn without a reply drops the block quietly.
-			if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=? WHERE id=?`, now, e.id); err != nil {
+			// A done agent's turn without a reply drops the block quietly and
+			// marks it dropped, so it does not end an outage either.
+			dropped := 0
+			if !recovered {
+				dropped = 1
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=?,dropped=? WHERE id=?`, now, dropped, e.id); err != nil {
 				return err
 			}
 			if recovered && e.class == api.ProviderBlockAuth && runtime == "" {
@@ -200,7 +226,7 @@ func (s *Store) providerBlockHook(ctx context.Context, tx *sql.Tx, task, agent, 
 			return err
 		}
 		// The same block again after a flap: open, with no second notice.
-		_, err = tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at='' WHERE agent_id=? AND run_id=? AND class=? AND since=?`, agent, run, p.Class, since)
+		_, err = tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at='',dropped=0 WHERE agent_id=? AND run_id=? AND class=? AND since=?`, agent, run, p.Class, since)
 		return err
 	}
 	var item, leadID, leadRun string
@@ -383,16 +409,19 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		// outage says nothing about the agents blocked in it. A
 		// runtime prompt, an unknown probe or a crash without that is not
 		// recovery, and a block replaced by a new class or since is still a
-		// block. Blocks that open afterwards are judged afresh below, so a
-		// stale outage never swallows a later owner notice.
+		// block. A done agent's block dropped without a model reply is not
+		// recovery either (decision #39975), on both counts below, until a
+		// later turn of that agent when it is not done. Blocks that open
+		// afterwards are judged afresh below, so a stale outage never swallows
+		// a later owner notice.
 		var recovered int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
  JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
- WHERE e.outage_id=? AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
+ WHERE e.outage_id=? AND e.dropped=0 AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
 			return 0, err
 		}
 		cleared, err := tx.QueryContext(ctx, `SELECT e.cleared_at FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
- WHERE e.outage_id=? AND e.cleared_at<>'' AND NOT EXISTS (SELECT 1 FROM provider_block_episodes o WHERE o.agent_id=e.agent_id AND o.run_id=e.run_id AND o.cleared_at='') AND `+liveAgentFilter, outage)
+ WHERE e.outage_id=? AND e.cleared_at<>'' AND e.dropped=0 AND NOT EXISTS (SELECT 1 FROM provider_block_episodes o WHERE o.agent_id=e.agent_id AND o.run_id=e.run_id AND o.cleared_at='') AND `+liveAgentFilter, outage)
 		if err != nil {
 			return 0, err
 		}

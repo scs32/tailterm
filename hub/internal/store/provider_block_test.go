@@ -928,6 +928,88 @@ func TestProviderBlockDoneAgentRecovery(t *testing.T) {
 	}
 }
 
+// wi_9a62b8ab3a580cfe (decision #39975): a done agent's block dropped quietly
+// is not recovery, so it does not end the outage it joined while a live agent
+// stays blocked, and a later block joins that outage with no second notice. A
+// done agent's model reply, or a later turn of the dropped agent once it is
+// not done, still ends it.
+func TestProviderBlockOutageIgnoresDroppedDoneBlock(t *testing.T) {
+	const baseline = 100
+	cases := []struct {
+		name   string
+		output int64 // the done agent's output tokens in its turn report
+		after  func(f *providerFixture, a api.Agent)
+		ends   bool
+	}{
+		{name: "dropped", output: baseline},
+		{name: "done with a model reply", output: baseline + 50, ends: true},
+		{name: "woken after the drop", output: baseline, ends: true, after: func(f *providerFixture, a api.Agent) {
+			if _, err := f.s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, a.ID); err != nil {
+				f.t.Fatal(err)
+			}
+			// It works and idles again between broker ticks.
+			f.state(a, "working")
+			f.state(a, "idle")
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newProviderFixture(t)
+			a, b, later := f.agent("codex-0", "codex", 0), f.agent("codex-1", "codex", 0), f.agent("codex-2", "codex", 1)
+			for _, x := range []api.Agent{a, b} {
+				blocked := api.AgentActivity{State: "provider_blocked", Provider: providerBlock("codex", "auth", f.clock), Tokens: api.TokenTotals{Output: baseline, Total: baseline}}
+				if err := f.report(x, "blocked-"+x.Name, blocked); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.advance(91 * time.Second)
+			if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 {
+				t.Fatalf("outage sweep posted %d", n)
+			}
+			// The done agent's turn report closes its block after the outage
+			// opened: dropped without a model reply, recovered with one.
+			f.advance(time.Minute)
+			if _, err := f.s.db.Exec(`UPDATE agents SET status='done' WHERE id=?`, a.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.report(a, "turn", api.AgentActivity{State: "idle", Tokens: api.TokenTotals{Output: c.output, Total: c.output}}); err != nil {
+				t.Fatal(err)
+			}
+			if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, a.ID); n != 0 {
+				t.Fatalf("done agent's episodes still open: %d", n)
+			}
+			if c.after != nil {
+				f.advance(time.Minute)
+				c.after(f, a)
+			}
+			f.advance(30 * time.Second)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("sweep after the drop posted %d", n)
+			}
+			open := countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`)
+			if c.ends {
+				if open != 0 {
+					t.Fatalf("outage still open after a recovery: %d", open)
+				}
+				return
+			}
+			if open != 1 {
+				t.Fatalf("a dropped done block ended the outage while %s is blocked: %d open", b.Name, open)
+			}
+			// A later block joins the outage with no second notice.
+			f.advance(time.Minute)
+			f.block(later, "codex", "auth")
+			f.advance(91 * time.Second)
+			if n := f.sweep(); n != 0 || f.notices(providerBlockOutageSubject, "") != 1 || f.notices(providerBlockOwnerSubject, "") != 0 {
+				t.Fatalf("later block: posted %d outage=%d per-agent=%d", n, f.notices(providerBlockOutageSubject, ""), f.notices(providerBlockOwnerSubject, ""))
+			}
+			if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes e JOIN provider_outages o ON o.id=e.outage_id WHERE e.agent_id=? AND e.owner_state='outage' AND o.closed_at=''`, later.ID); n != 1 {
+				t.Fatalf("later block not attached to the open outage: %d", n)
+			}
+		})
+	}
+}
+
 // A block that returns with a new since is judged against its own blocked
 // report, not the earlier block's lower total.
 func TestProviderBlockReplyBaselineIsPerBlock(t *testing.T) {
