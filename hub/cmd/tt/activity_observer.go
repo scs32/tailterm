@@ -630,13 +630,16 @@ func claudeInterruptRecord(content json.RawMessage) bool {
 // turn_duration and API-error records left the turn "in progress" and every
 // wake was skipped; before bug wi_03ce50892a559767 the interrupt record did,
 // because it read as a new prompt. The reason carries only a fixed phrase and
-// a short error code, never transcript text.
+// a short error code, never transcript text. The optional subtype,
+// isApiErrorMessage and error fields are decoded one by one, so a value of an
+// unexpected JSON type reads as its zero value instead of losing the
+// completion the other fields decide (bug wi_408b516fabd5e22b).
 func claudeTurnEnd(line []byte) (ended bool, reason string) {
 	var rec struct {
-		Type       string `json:"type"`
-		Subtype    string `json:"subtype"`
-		IsAPIError bool   `json:"isApiErrorMessage"`
-		Error      string `json:"error"`
+		Type       string          `json:"type"`
+		Subtype    json.RawMessage `json:"subtype"`
+		IsAPIError json.RawMessage `json:"isApiErrorMessage"`
+		Error      json.RawMessage `json:"error"`
 		Message    struct {
 			StopReason string          `json:"stop_reason"`
 			Content    json.RawMessage `json:"content"`
@@ -645,12 +648,17 @@ func claudeTurnEnd(line []byte) (ended bool, reason string) {
 	if json.Unmarshal(line, &rec) != nil {
 		return false, ""
 	}
+	var subtype, apiError string
+	var isAPIError bool
+	_ = json.Unmarshal(rec.Subtype, &subtype)
+	_ = json.Unmarshal(rec.IsAPIError, &isAPIError)
+	_ = json.Unmarshal(rec.Error, &apiError)
 	switch rec.Type {
 	case "assistant":
-		if rec.IsAPIError {
+		if isAPIError {
 			reason = "turn ended by API error"
-			if claudeAPIErrorCode.MatchString(rec.Error) {
-				reason += " (" + rec.Error + ")"
+			if claudeAPIErrorCode.MatchString(apiError) {
+				reason += " (" + apiError + ")"
 			}
 			return true, reason
 		}
@@ -662,7 +670,7 @@ func claudeTurnEnd(line []byte) (ended bool, reason string) {
 	case "result":
 		return true, ""
 	case "system":
-		return rec.Subtype == "turn_duration", ""
+		return subtype == "turn_duration", ""
 	}
 	return false, ""
 }

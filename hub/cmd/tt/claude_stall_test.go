@@ -890,6 +890,94 @@ func TestClaudeInterruptedTurnEnds(t *testing.T) {
 	}
 }
 
+// Bug wi_408b516fabd5e22b (order #39741): an optional top-level field of an
+// unexpected JSON type reads as its zero value, so the fields that parse still
+// decide the turn end. Synthetic records only.
+func TestClaudeTurnEndMistypedOptionalField(t *testing.T) {
+	endTurn := map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]string{{"type": "text", "text": "Synthetic reply."}}, "stop_reason": "end_turn"}}
+	apiError := map[string]any{"type": "assistant", "isApiErrorMessage": true, "error": "server_error", "message": map[string]any{"role": "assistant", "content": []map[string]string{{"type": "text", "text": "API Error: synthetic."}}, "stop_reason": "stop_sequence"}}
+	turnDuration := map[string]any{"type": "system", "subtype": "turn_duration", "durationMs": 1000}
+	toolUse := map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": map[string]string{}}}, "stop_reason": "tool_use"}}
+	with := func(rec map[string]any, field string, value any) []byte {
+		out := map[string]any{field: value}
+		for k, v := range rec {
+			if k != field {
+				out[k] = v
+			}
+		}
+		line, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return line
+	}
+	mistyped := []any{map[string]any{"type": "overloaded_error", "message": "Synthetic error text."}, 42, []string{"x"}}
+	for _, value := range mistyped {
+		for _, field := range []string{"subtype", "isApiErrorMessage", "error"} {
+			line := with(endTurn, field, value)
+			if ended, reason := claudeTurnEnd(line); !ended || reason != "" {
+				t.Fatalf("end_turn with %s=%v: ended=%v reason=%q", field, value, ended, reason)
+			}
+			c := activityCursor{SeenTurn: true}
+			if err := parseClaudeActivity(line, &c); err != nil || !c.TurnComplete || c.TurnEndReason != "" {
+				t.Fatalf("end_turn with %s=%v: cursor %+v err %v", field, value, c, err)
+			}
+			if ended, _ := claudeTurnEnd(with(toolUse, field, value)); ended {
+				t.Fatalf("tool_use with %s=%v ends a turn", field, value)
+			}
+		}
+		// A mistyped error leaves the fixed phrase, without the error text.
+		for field, want := range map[string]string{"subtype": "turn ended by API error (server_error)", "error": "turn ended by API error"} {
+			line := with(apiError, field, value)
+			if ended, reason := claudeTurnEnd(line); !ended || reason != want {
+				t.Fatalf("API error with %s=%v: ended=%v reason=%q", field, value, ended, reason)
+			}
+			c := activityCursor{SeenTurn: true, Pending: map[string]pendingActivityCall{"toolu_1": {Name: "Bash"}}}
+			if err := parseClaudeActivity(line, &c); err != nil || !c.TurnComplete || len(c.Pending) != 0 || c.TurnEndReason != want {
+				t.Fatalf("API error with %s=%v: cursor %+v err %v", field, value, c, err)
+			}
+		}
+		// A mistyped isApiErrorMessage reads as false: the stop_sequence
+		// record alone does not end the turn, as without the field.
+		if ended, _ := claudeTurnEnd(with(apiError, "isApiErrorMessage", value)); ended {
+			t.Fatalf("API error with isApiErrorMessage=%v ends a turn", value)
+		}
+		for _, field := range []string{"isApiErrorMessage", "error"} {
+			if ended, reason := claudeTurnEnd(with(turnDuration, field, value)); !ended || reason != "" {
+				t.Fatalf("turn_duration with %s=%v: ended=%v reason=%q", field, value, ended, reason)
+			}
+		}
+		if ended, _ := claudeTurnEnd(with(turnDuration, "subtype", value)); ended {
+			t.Fatalf("system record with subtype=%v ends a turn", value)
+		}
+		if ended, _ := claudeTurnEnd(with(map[string]any{"type": "result"}, "error", value)); !ended {
+			t.Fatalf("result with error=%v does not end a turn", value)
+		}
+	}
+	// Well-formed records keep their decision and reason.
+	for name, want := range map[string]struct {
+		line   []byte
+		ended  bool
+		reason string
+	}{
+		"end_turn":       {with(endTurn, "uuid", "u1"), true, ""},
+		"API error":      {with(apiError, "uuid", "u1"), true, "turn ended by API error (server_error)"},
+		"API error text": {with(apiError, "error", "Synthetic error text."), true, "turn ended by API error"},
+		"turn_duration":  {with(turnDuration, "uuid", "u1"), true, ""},
+		"tool_use":       {with(toolUse, "uuid", "u1"), false, ""},
+	} {
+		if ended, reason := claudeTurnEnd(want.line); ended != want.ended || reason != want.reason {
+			t.Fatalf("%s: ended=%v reason=%q", name, ended, reason)
+		}
+	}
+	// A line that is not a JSON object, or whose type is mistyped, ends nothing.
+	for _, line := range []string{`[{"type":"result"}]`, `"result"`, `42`, `{"type":"result"`, ``, `{"type":{"name":"result"}}`} {
+		if ended, reason := claudeTurnEnd([]byte(line)); ended || reason != "" {
+			t.Fatalf("%q: ended=%v reason=%q", line, ended, reason)
+		}
+	}
+}
+
 // h10 (s1, owner answer #27465): the default is detect and report. With no
 // relay.json, a malformed one, one without the key and one with any other
 // value, a stall is recorded, shown as stuck and notified once, and the pane
