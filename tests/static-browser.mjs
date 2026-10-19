@@ -493,7 +493,44 @@ async function exerciseFooterFit(page) {
     );
     measured.push({ width, before, after, scrolls });
   }
+  // Above the breakpoint the connection status keeps room for its mark and
+  // status word, truncating the rest, rather than shrinking to nothing.
+  const statuses = [];
+  for (const width of [730, 760, 800, 840]) {
+    await page.setViewportSize({ width, height: 1100 });
+    await page.waitForFunction((w) => innerWidth === w, width);
+    const status = await page.evaluate(() => {
+      const shell = document.querySelector(".terminal-shell");
+      const status = document.querySelector("#terminal-status");
+      // The mark and status word, measured unclipped in the status's font.
+      const probe = status.cloneNode();
+      probe.removeAttribute("id");
+      probe.style.cssText = "position:absolute;visibility:hidden;width:auto";
+      probe.textContent = status.textContent.split(" ·")[0];
+      status.after(probe);
+      const word = probe.getBoundingClientRect().width;
+      probe.remove();
+      return {
+        status: status.getBoundingClientRect().width,
+        word,
+        overflowing: shell.scrollWidth !== shell.clientWidth,
+      };
+    });
+    console.log(`Footer status at ${width} px: ${JSON.stringify(status)}`);
+    statuses.push({ width, ...status });
+  }
   await page.setViewportSize({ width: 1440, height: 1100 });
+  for (const { width, status, word, overflowing } of statuses) {
+    assert.ok(status > 0, `The status is visible at ${width} px`);
+    assert.ok(
+      status >= word,
+      `The status shows its mark and word at ${width} px`,
+    );
+    assert.ok(
+      !overflowing,
+      `The terminal shell does not overflow at ${width} px`,
+    );
+  }
   for (const { width, before, after, scrolls } of measured) {
     for (const state of [before, after]) {
       assert.equal(

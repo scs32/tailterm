@@ -1608,6 +1608,16 @@ dialog:modal {
   flex-wrap: wrap;
   max-width: 100%;
 }
+/* Above the narrow breakpoint the wrapped controls leave the connection
+   status room for its mark and status word; the rest of it truncates. */
+@media (min-width: 721px) {
+  .terminal-footer #terminal-status {
+    min-width: 15ch;
+  }
+  .terminal-footer > div {
+    max-width: calc(100% - 16ch);
+  }
+}
 #tabs .tab {
   position: relative;
 }
