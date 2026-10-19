@@ -14,19 +14,19 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 )
 
-// doctorHost is a synthetic machine: a temp HOME and repo, and a bin dir of
-// fake tools that is the only PATH the probe sees.
+// doctorHost is a synthetic machine: a temp HOME, repo and system root, and
+// a bin dir of fake tools that is the only PATH the probe sees.
 type doctorHost struct {
-	t                *testing.T
-	home, repo, bin  string
-	log              string
-	env              map[string]string
-	goos             string
-	whoamiErr        error
-	codexHook        bool
-	freeMiB          int64
-	timeout          time.Duration
-	deployConfigPath string
+	t                     *testing.T
+	home, repo, bin, root string
+	log                   string
+	env                   map[string]string
+	goos                  string
+	whoamiErr             error
+	codexHook             bool
+	freeMiB               int64
+	timeout               time.Duration
+	deployConfigPath      string
 }
 
 const doctorNow = "2026-09-30T19:00:00Z"
@@ -34,9 +34,9 @@ const doctorNow = "2026-09-30T19:00:00Z"
 func newDoctorHost(t *testing.T) *doctorHost {
 	t.Helper()
 	root := t.TempDir()
-	h := &doctorHost{t: t, home: filepath.Join(root, "home"), repo: filepath.Join(root, "repo"), bin: filepath.Join(root, "bin"),
+	h := &doctorHost{t: t, home: filepath.Join(root, "home"), repo: filepath.Join(root, "repo"), bin: filepath.Join(root, "bin"), root: filepath.Join(root, "sys"),
 		log: filepath.Join(root, "calls.log"), env: map[string]string{}, goos: "darwin", codexHook: true, freeMiB: 20000, timeout: 5 * time.Second}
-	for _, dir := range []string{h.home, h.repo, h.bin} {
+	for _, dir := range []string{h.home, h.repo, h.bin, h.root} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -86,8 +86,23 @@ scopes = [ "account:read" ]
 
 func (h *doctorHost) fake(name, body string) {
 	h.t.Helper()
+	h.fakeAt(filepath.Join(h.bin, name), name, body)
+}
+
+// fakeSystem writes a fake tool at an absolute system path under the root,
+// off PATH, that logs the path it was called by.
+func (h *doctorHost) fakeSystem(path, body string) {
+	h.t.Helper()
+	if err := os.MkdirAll(filepath.Join(h.root, filepath.Dir(path)), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	h.fakeAt(filepath.Join(h.root, path), path, body)
+}
+
+func (h *doctorHost) fakeAt(path, name, body string) {
+	h.t.Helper()
 	script := "#!/bin/sh\nprintf '%s GOTOOLCHAIN=%s %s\\n' " + shellWord(name) + " \"${GOTOOLCHAIN-}\" \"$*\" >> " + shellWord(h.log) + "\n" + body + "\n"
-	if err := os.WriteFile(filepath.Join(h.bin, name), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -111,11 +126,11 @@ func (h *doctorHost) fakeGo(version string) {
 esac`)
 }
 
-// fakeMac answers uname -r with a Darwin kernel release and sysctl with a
-// CPU brand string; together they select Playwright's platform key.
+// fakeMac answers uname -r with a Darwin kernel release and /usr/sbin/sysctl
+// with a CPU brand string; together they select Playwright's platform key.
 func (h *doctorHost) fakeMac(release, cpu string) {
 	h.fake("uname", "echo "+shellWord(release))
-	h.fake("sysctl", "echo "+shellWord(cpu))
+	h.fakeSystem("/usr/sbin/sysctl", "echo "+shellWord(cpu))
 }
 
 func shellWord(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
@@ -136,6 +151,18 @@ func (h *doctorHost) file(rel, content string, mode os.FileMode) {
 
 func (h *doctorHost) dir(rel string) {
 	if err := os.MkdirAll(filepath.Join(h.home, filepath.FromSlash(rel)), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// systemFile writes a file at an absolute system path under the root.
+func (h *doctorHost) systemFile(path, content string) {
+	h.t.Helper()
+	full := filepath.Join(h.root, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -171,7 +198,16 @@ func (h *doctorHost) writeDeployConfig(overrides map[string]any) {
 
 func (h *doctorHost) probe() hostProbe {
 	lookPath := func(name string) (string, error) {
+		// Like exec.LookPath, a name with a slash is used as is; it is
+		// always under the root here.
 		path := filepath.Join(h.bin, name)
+		if strings.Contains(name, "/") {
+			if !strings.HasPrefix(name, h.root+string(filepath.Separator)) {
+				h.t.Errorf("doctor looked up %s outside the injected root", name)
+				return "", exec.ErrNotFound
+			}
+			path = name
+		}
 		if info, err := os.Stat(path); err == nil && info.Mode()&0o111 != 0 {
 			return path, nil
 		}
@@ -179,7 +215,7 @@ func (h *doctorHost) probe() hostProbe {
 	}
 	now, _ := time.Parse(time.RFC3339, doctorNow)
 	return hostProbe{
-		goos: h.goos, home: h.home, repo: h.repo, deployConfig: h.deployConfigPath, uid: 501,
+		goos: h.goos, home: h.home, repo: h.repo, deployConfig: h.deployConfigPath, root: h.root, uid: 501,
 		env:       func(k string) string { return h.env[k] },
 		lookPath:  lookPath,
 		run:       execDoctorCommand([]string{"PATH=" + h.bin, "HOME=" + h.home}, lookPath, 100*time.Millisecond),
@@ -355,7 +391,37 @@ func TestDoctorRoleAgent(t *testing.T) {
 	t.Run("no relay plist", func(t *testing.T) {
 		h := newDoctorHost(t)
 		os.Remove(filepath.Join(h.home, "Library", "LaunchAgents", "com.tailterm.inbox-relay.plist"))
-		expectLine(t, h.run("agent"), "relay service installed", "missing", "com.tailterm.inbox-relay.plist", 1)
+		o := h.run("agent")
+		expectLine(t, o, "relay service installed", "missing", "/Library/LaunchDaemons/com.tailterm.inbox-relay.plist", 1)
+		expectLine(t, o, "relay running", "ok", "", 1)
+	})
+	t.Run("relay LaunchDaemon", func(t *testing.T) {
+		h := newDoctorHost(t)
+		os.Remove(filepath.Join(h.home, "Library", "LaunchAgents", "com.tailterm.inbox-relay.plist"))
+		h.systemFile("/Library/LaunchDaemons/com.tailterm.inbox-relay.plist", "<plist/>")
+		h.fake("launchctl", `[ "$2" = system/com.tailterm.inbox-relay ] || exit 113
+printf 'system/com.tailterm.inbox-relay = {\n\tactive count = 1\n\tstate = running\n}\n'`)
+		o := h.run("agent")
+		expectLine(t, o, "relay service installed", "ok", "LaunchDaemon com.tailterm.inbox-relay", 0)
+		expectLine(t, o, "relay running", "ok", "running", 0)
+		if log, _ := os.ReadFile(h.log); !strings.Contains(string(log), "launchctl GOTOOLCHAIN= print system/com.tailterm.inbox-relay") || strings.Contains(string(log), "print gui/") {
+			t.Fatalf("launchctl call:\n%s", log)
+		}
+		h.fake("launchctl", `printf 'system/com.tailterm.inbox-relay = {\n\tstate = not running\n}\n'`)
+		o = h.run("agent")
+		expectLine(t, o, "relay running", "missing", "state not running", 1)
+		if !strings.Contains(o.text, "fix: sudo launchctl kickstart -k system/com.tailterm.inbox-relay") {
+			t.Fatalf("fix hint:\n%s", o.text)
+		}
+	})
+	t.Run("relay LaunchAgent beside a LaunchDaemon", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.systemFile("/Library/LaunchDaemons/com.tailterm.inbox-relay.plist", "<plist/>")
+		o := h.run("agent")
+		expectLine(t, o, "relay service installed", "ok", "LaunchAgent com.tailterm.inbox-relay", 0)
+		if log, _ := os.ReadFile(h.log); !strings.Contains(string(log), "launchctl GOTOOLCHAIN= print gui/501/com.tailterm.inbox-relay") {
+			t.Fatalf("launchctl call:\n%s", log)
+		}
 	})
 	t.Run("relay not loaded", func(t *testing.T) {
 		h := newDoctorHost(t)
@@ -389,16 +455,33 @@ func TestDoctorRoleAgent(t *testing.T) {
 		h.file(".claude/settings.json", `{"hooks":{
 "SessionStart":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook session-start"}]}],
 "UserPromptSubmit":[{"hooks":[{"type":"command","command":"tt hook prompt"}]}],
-"Notification":[{"hooks":[{"type":"command","command":"tt hook notification"}]}]}}`, 0o644)
-		h.file(".claude/settings.local.json", `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tt hook stop"}]}]}}`, 0o644)
-		expectLine(t, h.run("agent"), "claude hooks", "ok", "SessionStart", 0)
+"Notification":[{"hooks":[{"type":"command","command":"tt hook notification"}]}],
+"PreToolUse":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook tool"}]}]}}`, 0o644)
+		h.file(".claude/settings.local.json", `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tt hook stop"}]}],
+"PostToolUse":[{"hooks":[{"type":"command","command":"tt hook tool"}]}]}}`, 0o644)
+		expectLine(t, h.run("agent"), "claude hooks", "ok", "SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse and PostToolUse", 0)
+	})
+	t.Run("claude hooks without the tool ledger hooks", func(t *testing.T) {
+		session := `"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
+"Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}]`
+		for _, c := range []struct{ extra, detail string }{
+			{"", "no PreToolUse, PostToolUse; optional"},
+			{`,"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PostToolUse; optional"},
+			{`,"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PreToolUse; optional"},
+			{`,"PreToolUse":[{"hooks":[{"command":"tt hook stop"}]}],"PostToolUse":[{"hooks":[{"command":"other tool"}]}]`, "no PreToolUse, PostToolUse; optional"},
+		} {
+			h := newDoctorHost(t)
+			h.file(".claude/settings.json", `{"hooks":{`+session+c.extra+`}}`, 0o644)
+			expectLine(t, h.run("agent"), "claude hooks", "warn", c.detail, 0)
+		}
 	})
 	t.Run("claude hooks under CLAUDE_CONFIG_DIR", func(t *testing.T) {
 		h := newDoctorHost(t)
 		h.env["CLAUDE_CONFIG_DIR"] = filepath.Join(h.home, "alt")
 		h.file("alt/settings.json", `{"hooks":{
 "SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
-"Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}]}}`, 0o644)
+"Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}],
+"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}]}}`, 0o644)
 		expectLine(t, h.run("agent"), "claude hooks", "ok", "", 0)
 	})
 	t.Run("claude hooks absent", func(t *testing.T) {
@@ -618,6 +701,44 @@ func TestDoctorRoleTest(t *testing.T) {
 			t.Fatalf("linux platform key %q", got)
 		}
 	})
+	t.Run("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE", func(t *testing.T) {
+		// macOS 26 on Apple silicon would need the default 2359; the
+		// override names the mac14 key, as Playwright itself would use.
+		for _, goos := range []string{"darwin", "linux"} {
+			h := newDoctorHost(t)
+			h.goos = goos
+			for _, b := range []string{"chromium-1243", "chromium_headless_shell-1243", "webkit-2359"} {
+				h.dir(".cache/ms-playwright/" + b)
+			}
+			h.env["PLAYWRIGHT_HOST_PLATFORM_OVERRIDE"] = "mac14-arm64"
+			expectLine(t, h.run("test"), "playwright webkit", "wrong version", "found webkit-2359; need webkit-2251", 1)
+			h.env["PLAYWRIGHT_HOST_PLATFORM_OVERRIDE"] = "ubuntu24.04-x64"
+			expectLine(t, h.run("test"), "playwright webkit", "ok", "webkit-2359", 0)
+		}
+	})
+	t.Run("Apple silicon without sysctl on PATH", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.fakeMac("23.6.0", "Apple M1")
+		if _, err := os.Stat(filepath.Join(h.bin, "sysctl")); !os.IsNotExist(err) {
+			t.Fatalf("sysctl is on the fake PATH: %v", err)
+		}
+		d := &doctorRun{p: h.probe(), memo: map[string]any{}}
+		if got := d.playwrightPlatform(); got != "mac14-arm64" {
+			t.Fatalf("platform key %q, want mac14-arm64", got)
+		}
+		// A sysctl on PATH is not the one doctor runs.
+		h.fake("sysctl", `echo "Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz"`)
+		d = &doctorRun{p: h.probe(), memo: map[string]any{}}
+		if got := d.playwrightPlatform(); got != "mac14-arm64" {
+			t.Fatalf("platform key with sysctl on PATH %q, want mac14-arm64", got)
+		}
+		if log, _ := os.ReadFile(h.log); !strings.Contains(string(log), "/usr/sbin/sysctl GOTOOLCHAIN= -n machdep.cpu.brand_string") || strings.Contains(string(log), "\nsysctl ") {
+			t.Fatalf("sysctl calls:\n%s", log)
+		}
+		if root := newHostProbe(env{}).root; root != "/" {
+			t.Fatalf("host probe root %q, want / so doctor runs /usr/sbin/sysctl", root)
+		}
+	})
 	t.Run("chromium other revision", func(t *testing.T) {
 		h := newDoctorHost(t)
 		os.RemoveAll(filepath.Join(h.home, "Library", "Caches", "ms-playwright", "chromium-1243"))
@@ -776,6 +897,17 @@ func TestDoctorRoleRelease(t *testing.T) {
 		{name: "ssh match", config: "Match exec \"false\"\n  User x\nHost truenas\n  HostName SECRET-SSH-654\n", status: "warn", detail: "Match rules not evaluated"},
 		{name: "ssh negation", config: "Host * !truenas\n  HostName SECRET-SSH-654\n", status: "missing", detail: "no Host truenas"},
 		{name: "ssh match without alias", config: "Match host truenas\n  HostName SECRET-SSH-654\n", status: "missing", detail: "no Host truenas"},
+		{name: "ssh top-level hostname", config: "HostName SECRET-SSH-654\nHost truenas\n  User root\n", status: "ok", detail: "HostName set"},
+		{name: "ssh top-level hostname in include", config: "Include extra\n", include: map[string]string{".ssh/extra": "HostName SECRET-SSH-654\n"}, status: "ok"},
+		{name: "ssh include keeps other block", config: "Host other\n  Include extra\n  HostName SECRET-SSH-654\n",
+			include: map[string]string{".ssh/extra": "Host truenas\n  User root\n"}, status: "missing", detail: "has no HostName"},
+		{name: "ssh include keeps alias block", config: "Host truenas\n  Include extra\n  HostName SECRET-SSH-654\n",
+			include: map[string]string{".ssh/extra": "Host other\n  User root\n"}, status: "ok", detail: "HostName set"},
+		{name: "ssh include keeps alias block after match", config: "Host truenas\n  Include extra\n  HostName SECRET-SSH-654\n",
+			include: map[string]string{".ssh/extra": "Match exec \"false\"\n  User root\n"}, status: "warn", detail: "HostName set"},
+		{name: "ssh include starts in caller block", config: "Host other\n  Include extra\n",
+			include: map[string]string{".ssh/extra": "HostName SECRET-SSH-654\n"}, status: "missing", detail: "no Host truenas"},
+		{name: "ssh match after top-level", config: "Match all\n  HostName SECRET-SSH-654\n", status: "missing", detail: "no Host truenas"},
 	}
 	for _, c := range sshCases {
 		t.Run(c.name, func(t *testing.T) {

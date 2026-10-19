@@ -55,9 +55,9 @@ Client, plus:
 | Codex CLI | on PATH | `brew install codex` | npm or release binary | `codex` |
 | Codex login | `codex login status` exits 0 | `codex login` | same | `codex login` |
 | Codex Stop hook | `~/.codex/hooks.json` (or `$CODEX_HOME`) has `tt hook stop` | `tt hooks codex --install` | same | `codex Stop hook` |
-| Claude hooks (optional) | the four `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
-| Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist` | `tt host setup` ([host setup](host-setup.md)) | none yet (to fix) | `relay service installed` |
-| Relay running | `launchctl print gui/UID/com.tailterm.inbox-relay` shows `state = running` | `launchctl kickstart -k gui/UID/com.tailterm.inbox-relay` | none yet (to fix) | `relay running` |
+| Claude hooks (optional) | the `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PreToolUse` and `PostToolUse` `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
+| Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist`, or a LaunchDaemon at `/Library/LaunchDaemons/com.tailterm.inbox-relay.plist` | `tt host setup` (`--service daemon` for the LaunchDaemon; [host setup](host-setup.md)) | none yet (to fix) | `relay service installed` |
+| Relay running | `launchctl print gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `system/com.tailterm.inbox-relay`) shows `state = running` | `launchctl kickstart -k gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `sudo launchctl kickstart -k system/com.tailterm.inbox-relay`) | none yet (to fix) | `relay running` |
 
 Mapping notes:
 
@@ -66,15 +66,18 @@ Mapping notes:
   and TailOS attaches with `-f ignore-size`. All three need tmux 3.2. That
   section says no global tmux option is required or changed, so doctor reads
   no tmux configuration; the line is derived from the tmux version.
-- `claude hooks` covers `adapters.ClaudeHooks` (`hub/internal/adapters/adapters.go`,
-  lines 9-19): `SessionStart`, `UserPromptSubmit`, `Stop` and `Notification`
-  each need a command ending in `hook session-start`, `hook prompt`, `hook
-  stop` and `hook notification`. The Claude hooks are optional
+- `claude hooks` covers `adapters.ClaudeHooks` (`hub/internal/adapters/adapters.go`):
+  `SessionStart`, `UserPromptSubmit`, `Stop` and `Notification` each need a
+  command ending in `hook session-start`, `hook prompt`, `hook stop` and `hook
+  notification`, and the tool ledger hooks `PreToolUse` and `PostToolUse` each
+  need one ending in `hook tool`. The Claude hooks are optional
   ([tasks.md](tasks.md): "remain optional"), and the Mini has none, so a
   missing hook is `warn`. The Codex Stop hook is required: broker phase 3.1
   relies on it to hold a Codex turn open while work is unacknowledged.
 - The relay LaunchAgent runs only while the user is logged in, and its
-  environment is only `PATH` (`wi_ec4c3154f55bf5db`).
+  environment is only `PATH` (`wi_ec4c3154f55bf5db`). A LaunchDaemon relay
+  (`tt host setup --service daemon`) runs at boot as the agent user and is
+  accepted too. When both plists are present, doctor checks the LaunchAgent.
 
 ### Login detection
 
@@ -120,6 +123,12 @@ Playwright's browser cache is `PLAYWRIGHT_BROWSERS_PATH` when set (`0` means
 `~/Library/Caches/ms-playwright` on macOS, else `$XDG_CACHE_HOME/ms-playwright`
 or `~/.cache/ms-playwright` on Linux. Browser directories are named
 `chromium-REV`, `chromium_headless_shell-REV` and `webkit-REV`.
+
+The `revisionOverrides` key for webkit is `PLAYWRIGHT_HOST_PLATFORM_OVERRIDE`
+when set, as in Playwright. Otherwise on macOS it is `macN` from `uname -r`,
+with `-arm64` when `/usr/sbin/sysctl -n machdep.cpu.brand_string` names an
+Apple CPU; doctor runs sysctl by that path because `/usr/sbin` may be missing
+from `PATH`. Linux has no key, so the default revision applies.
 
 ### GOTOOLCHAIN
 
@@ -175,9 +184,11 @@ Notes:
 - The SSH check reads the config text only. It supports `Keyword args` and
   `Keyword=args`, case-insensitive keywords, `Include` (relative to `~/.ssh`,
   globs, cycles skipped, depth 16), and `Host` patterns with `*`, `?` and
-  `!negation`. `Match` blocks are never evaluated: with an alias present they
-  make the line `warn` ("Match rules not evaluated"); confirm with `ssh -G
-  truenas` yourself.
+  `!negation`. As in OpenSSH, a `HostName` before the first `Host` or `Match`
+  applies to every host, an included file starts in the including block's
+  state, and that state is restored when the `Include` returns. `Match`
+  blocks are never evaluated: with an alias present they make the line `warn`
+  ("Match rules not evaluated"); confirm with `ssh -G truenas` yourself.
 - The container runtime runs the migration rehearsal of a release whose store
   schema changed, under the production hub container's constraints
   ([project deployment](project-deployment.md), "Migration rehearsal
@@ -196,7 +207,7 @@ Notes:
 
 | Topic | macOS (Mini, Air) | Linux (TrueNAS or another host) |
 |---|---|---|
-| Relay service | per-user LaunchAgent `com.tailterm.inbox-relay`, runs only while the user is logged in | none yet: run `tt relay` under the host's supervisor (systemd user unit to be written) |
+| Relay service | per-user LaunchAgent `com.tailterm.inbox-relay`, runs only while the user is logged in, or a LaunchDaemon of the same label (`tt host setup --service daemon`) that runs at boot | none yet: run `tt relay` under the host's supervisor (systemd user unit to be written) |
 | Relay check | `launchctl print` plus the plist | reports `missing` (to fix) |
 | Playwright cache | `~/Library/Caches/ms-playwright` | `~/.cache/ms-playwright`; browsers may need `--with-deps` system libraries |
 | wrangler login file | `~/Library/Preferences/.wrangler/config/default.toml` | `~/.config/.wrangler/config/default.toml` |

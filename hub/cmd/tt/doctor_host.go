@@ -81,10 +81,11 @@ type doctorCheck struct {
 
 // hostProbe is everything doctor reads from the machine. Tests replace it.
 type hostProbe struct {
-	goos, home, repo, deployConfig string
-	uid                            int
-	env                            func(string) string
-	lookPath                       func(string) (string, error)
+	// root prefixes system paths such as /Library and /usr/sbin.
+	goos, home, repo, deployConfig, root string
+	uid                                  int
+	env                                  func(string) string
+	lookPath                             func(string) (string, error)
 	// run executes a command with extra environment and returns its exit
 	// status and combined output. The output is parsed, never printed.
 	run       func(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (int, []byte, error)
@@ -154,6 +155,7 @@ func newHostProbe(e env) hostProbe {
 	return hostProbe{
 		goos:      runtime.GOOS,
 		home:      home,
+		root:      "/",
 		uid:       os.Getuid(),
 		env:       os.Getenv,
 		lookPath:  exec.LookPath,
@@ -259,6 +261,10 @@ func (d *doctorRun) home(parts ...string) string {
 
 func (d *doctorRun) inRepo(parts ...string) string {
 	return filepath.Join(append([]string{d.p.repo}, parts...)...)
+}
+
+func (d *doctorRun) system(parts ...string) string {
+	return filepath.Join(append([]string{d.p.root}, parts...)...)
 }
 
 func runDoctorRole(w io.Writer, role string, p hostProbe) error {
@@ -450,10 +456,13 @@ func agentChecks() []doctorCheck {
 			if d.p.goos != "darwin" {
 				return checkMissing("no "+d.p.goos+" relay service yet (to fix, see docs/host-requirements.md)", "run tt relay under the host's process supervisor")
 			}
-			if _, err := d.p.stat(d.home("Library", "LaunchAgents", doctorRelayLabel+".plist")); err != nil {
-				return checkMissing("no ~/Library/LaunchAgents/"+doctorRelayLabel+".plist", "tt host setup (docs/host-setup.md)")
+			switch d.relayDomain() {
+			case "gui":
+				return checkOK("LaunchAgent " + doctorRelayLabel)
+			case "system":
+				return checkOK("LaunchDaemon " + doctorRelayLabel)
 			}
-			return checkOK("LaunchAgent " + doctorRelayLabel)
+			return checkMissing("no ~/Library/LaunchAgents/"+doctorRelayLabel+".plist or /Library/LaunchDaemons/"+doctorRelayLabel+".plist", "tt host setup (docs/host-setup.md)")
 		}},
 		{name: "relay running", required: true, run: relayRunningCheck},
 	}
@@ -476,14 +485,16 @@ func loginCheck(name, tool string, args []string, fix string) doctorCheck {
 	}}
 }
 
-// claudeHooksCheck looks for the four hooks tt hooks claude prints
-// (internal/adapters ClaudeHooks) in Claude's user settings files.
+// claudeHooksCheck looks for the hooks tt hooks claude prints
+// (internal/adapters ClaudeHooks) in Claude's user settings files: the four
+// session hooks and the PreToolUse and PostToolUse tool ledger hooks.
 func claudeHooksCheck(d *doctorRun) doctorResult {
 	dir := d.p.env("CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		dir = d.home(".claude")
 	}
-	events := map[string]string{"SessionStart": "hook session-start", "UserPromptSubmit": "hook prompt", "Stop": "hook stop", "Notification": "hook notification"}
+	events := map[string]string{"SessionStart": "hook session-start", "UserPromptSubmit": "hook prompt", "Stop": "hook stop", "Notification": "hook notification",
+		"PreToolUse": "hook tool", "PostToolUse": "hook tool"}
 	found := map[string]bool{}
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		b, err := d.p.readFile(filepath.Join(dir, name))
@@ -511,14 +522,37 @@ func claudeHooksCheck(d *doctorRun) doctorResult {
 		}
 	}
 	if len(found) == len(events) {
-		return checkOK("SessionStart, UserPromptSubmit, Stop and Notification")
+		return checkOK("SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse and PostToolUse")
 	}
-	return doctorResult{status: doctorWarn, detail: "not installed; optional (docs/tasks.md)", fix: "tt hooks claude (add the printed hooks to ~/.claude/settings.json)"}
+	detail := "not installed; optional (docs/tasks.md)"
+	if len(found) > 0 {
+		var missing []string
+		for _, event := range []string{"SessionStart", "UserPromptSubmit", "Stop", "Notification", "PreToolUse", "PostToolUse"} {
+			if !found[event] {
+				missing = append(missing, event)
+			}
+		}
+		detail = "no " + strings.Join(missing, ", ") + "; optional (docs/tasks.md)"
+	}
+	return doctorResult{status: doctorWarn, detail: detail, fix: "tt hooks claude (add the printed hooks to ~/.claude/settings.json)"}
 }
 
 var launchdStateRE = regexp.MustCompile(`(?m)^\tstate = (.+)$`)
 
 var launchdStates = map[string]bool{"not running": true, "waiting": true, "spawn scheduled": true, "spawning": true, "exited": true, "killed": true}
+
+// relayDomain is the launchd domain of the installed relay: "gui" for the
+// user's LaunchAgent, which wins when both are present, "system" for a
+// LaunchDaemon (tt host setup --service daemon), or "" when neither is.
+func (d *doctorRun) relayDomain() string {
+	if _, err := d.p.stat(d.home("Library", "LaunchAgents", doctorRelayLabel+".plist")); err == nil {
+		return "gui"
+	}
+	if _, err := d.p.stat(d.system("Library", "LaunchDaemons", doctorRelayLabel+".plist")); err == nil {
+		return "system"
+	}
+	return ""
+}
 
 func relayRunningCheck(d *doctorRun) doctorResult {
 	if d.p.goos != "darwin" {
@@ -526,6 +560,10 @@ func relayRunningCheck(d *doctorRun) doctorResult {
 	}
 	target := fmt.Sprintf("gui/%d/%s", d.p.uid, doctorRelayLabel)
 	fix := "launchctl kickstart -k " + target + " (or tt host setup)"
+	if d.relayDomain() == "system" {
+		target = "system/" + doctorRelayLabel
+		fix = "sudo launchctl kickstart -k " + target + " (or tt host setup --service daemon)"
+	}
 	r := d.command("", nil, "launchctl", "print", target)
 	switch {
 	case !r.found:
@@ -871,9 +909,14 @@ func playwrightCheck(d *doctorRun, browser string) doctorResult {
 }
 
 // playwrightPlatform is the key Playwright looks up in revisionOverrides on
-// this host, or "" when it is not a Mac or the kernel version cannot be read;
-// the default revision then applies.
+// this host: PLAYWRIGHT_HOST_PLATFORM_OVERRIDE when set, as playwright-core
+// does, otherwise derived from the Mac's kernel and CPU, or "" when it is not
+// a Mac or the kernel version cannot be read; the default revision then
+// applies.
 func (d *doctorRun) playwrightPlatform() string {
+	if v := d.p.env("PLAYWRIGHT_HOST_PLATFORM_OVERRIDE"); v != "" {
+		return v
+	}
 	if d.p.goos != "darwin" {
 		return ""
 	}
@@ -881,7 +924,8 @@ func (d *doctorRun) playwrightPlatform() string {
 	if !r.found || r.code != 0 || r.err != nil {
 		return ""
 	}
-	cpu := d.command("", nil, "sysctl", "-n", "machdep.cpu.brand_string")
+	// By absolute path, so a PATH without /usr/sbin keeps the -arm64 key.
+	cpu := d.command("", nil, d.system("usr", "sbin", "sysctl"), "-n", "machdep.cpu.brand_string")
 	return playwrightMacPlatform(string(r.out), cpu.found && cpu.code == 0 && cpu.err == nil && strings.Contains(string(cpu.out), "Apple"))
 }
 
@@ -1035,7 +1079,8 @@ func sshRouteCheck(d *doctorRun) doctorResult {
 	if _, err := d.p.readFile(path); err != nil {
 		return checkMissing("no ~/.ssh/config", fix)
 	}
-	s := &sshScan{d: d, alias: alias, seen: map[string]bool{}}
+	// Lines before the first Host or Match apply to every host.
+	s := &sshScan{d: d, alias: alias, seen: map[string]bool{}, inBlock: true}
 	s.file(path, 0)
 	switch {
 	case !s.aliasHostName && s.aliasBlock:
@@ -1099,8 +1144,12 @@ func (s *sshScan) file(path string, depth int) {
 				}
 				matches, _ := s.d.p.glob(arg)
 				sort.Strings(matches)
+				// As in OpenSSH, an included file starts in the caller's
+				// state and a Host or Match in it ends with the file.
+				active := s.inBlock
 				for _, m := range matches {
 					s.file(m, depth+1)
+					s.inBlock = active
 				}
 			}
 		}
