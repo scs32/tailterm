@@ -2540,6 +2540,10 @@ func TestHandoffRestoreAlreadyRegistered(t *testing.T) {
 // a2 (b2): restore from a new session in the helper's tmux session registers
 // it, conditionally on the run the helper file named.
 func TestHandoffRestoreSuccessor(t *testing.T) {
+	// The test is of restore, not of the hook's deadline: the successor's
+	// start is matched by a tmux query, which under load can pass the real
+	// deadline and print the late line instead.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	f := newHandoffHubFixture(t)
 	b, ctx := f.b, context.Background()
 	old := b.helper
@@ -2631,6 +2635,10 @@ func TestHandoffRestoreSuccessor(t *testing.T) {
 // receipts, the helper file, the wake bindings and the tmux tags are the same
 // before and after, nothing is printed, and no restore.json is written.
 func TestHandoffRestoreGuards(t *testing.T) {
+	// The test is of restore's guards, not of the hook's deadline: the
+	// successor's start is matched by a tmux query, which under load can pass
+	// the real deadline and print the late line instead.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	type guard struct {
 		name  string
 		guard string
@@ -3812,6 +3820,9 @@ func TestHandoffWakes(t *testing.T) {
 	// With a real temporary hub: what restore prints for each wake, and that
 	// an asserted wake still leaves restore's exit non-zero.
 	t.Run("restore offers and reports", func(t *testing.T) {
+		// The successor's start is matched by a tmux query, which under load
+		// can pass the real hook deadline; this subtest is of restore.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		f := newHandoffHubFixture(t)
 		b := f.b
 		setToolLedger(t, &handoffLedgerMatching, true)
@@ -4480,6 +4491,10 @@ func TestHandoffRetiredLine(t *testing.T) {
 // r2: the real interactive session restores when ps shows its program as the
 // versioned binary the claude link points to, as on the Mini.
 func TestHandoffRestoreVersionedBinary(t *testing.T) {
+	// The test is of restore, not of the hook's deadline: the successor's
+	// start is matched by a tmux query, which under load can pass the real
+	// deadline and print the late line instead.
+	setToolLedger(t, &handoffDeadline, 30*time.Second)
 	f := newHandoffHubFixture(t)
 	f.b.ps(handoffPSVersionedInteractive, f.b.now.Add(-time.Hour))
 	f.successor(t)
@@ -4906,6 +4921,9 @@ func TestHandoffWakeFloor(t *testing.T) {
 		}
 	})
 	t.Run("restore after a registration keeps the session's start", func(t *testing.T) {
+		// The successor's start is matched by a tmux query, which under load
+		// can pass the real hook deadline; this subtest is of restore.
+		setToolLedger(t, &handoffDeadline, 30*time.Second)
 		f := newHandoffHubFixture(t)
 		thread := f.successor(t)
 		if out, err := f.restore(); err != nil || !strings.Contains(out, "registration: restored") {
