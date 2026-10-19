@@ -21,6 +21,12 @@ const reviewConvergenceSchema = `CREATE TABLE IF NOT EXISTS review_convergence (
 func reviewConflict(reason string) error {
 	return fmt.Errorf("%w: review convergence: %s", api.ErrConflict, reason)
 }
+
+// reviewConflictReason recovers the reason a reviewConflict error carries, so
+// a refusal that adds guidance keeps the underlying cause without a doubled prefix.
+func reviewConflictReason(err error) string {
+	return strings.TrimPrefix(err.Error(), api.ErrConflict.Error()+": review convergence: ")
+}
 func reviewState(ctx context.Context, q queryRower, task, item string) (api.ReviewConvergence, error) {
 	out := api.ReviewConvergence{ItemID: item, History: "unknown", Scopes: []api.ReviewScope{}, Rounds: []api.ReviewRound{}, FollowUps: []api.ReviewFollowUp{}, Focused: []api.FocusedReview{}}
 	var raw string
@@ -998,7 +1004,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 					return reviewConflict(route + " fix must name the exact reviewed candidate")
 				}
 				if err = reviewReadySettling(state, item.ScopeRevision, reviewed, meta.CriterionIDs); err != nil {
-					return reviewConflict(route + " needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds")
+					return reviewConflict(route + " needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: " + reviewConflictReason(err) + ")")
 				}
 				if len(open) != 0 {
 					return reviewConflict("unresolved blockers on rebased candidate; name them for focused verification")

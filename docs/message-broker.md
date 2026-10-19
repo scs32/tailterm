@@ -549,7 +549,11 @@ commit as `candidate`, and a `fix` that contains the full round-two candidate:
 
 The hub refuses it unless the round-two candidate itself could be accepted
 (every criterion passed, no unresolved blocker) and no blocker is unresolved on
-the rebased commit; a real finding still uses named `blockerIds`. The same
+the rebased commit; a real finding still uses named `blockerIds`. A review that
+converged through a named fix on a later commit must re-verify each blocker by
+name after a rebase: the fix covers only its exact commit, and the empty-blocker
+path covers only zero open blockers. A refusal ends with its cause, for example
+`(cause: latest general review is incomplete or stale)`. The same
 verifiers are eligible. The RESULT repeats the metadata, reports exactly
 `equivalence=pass` or `equivalence=fail` in Status, and includes at least one
 `command` evidence entry naming both full commits: tree identity

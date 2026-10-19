@@ -1823,6 +1823,67 @@ func TestReviewConvergenceRebaseCannotBypassBlocker(t *testing.T) {
 	})
 }
 
+// A round-one blocker resolved by a clean round two leaves nothing to name, so
+// a tree-identical rebase of round two is accepted through the empty-blocker path.
+func TestReviewConvergenceCleanRoundTwoRebaseAcceptance(t *testing.T) {
+	f := newConvergenceFixture(t)
+	lead, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "lead"
+	if _, err = f.s.UpdateTask(f.ctx, f.task.ID, api.UpdateTaskRequest{Orchestrator: &name}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+	f.generalRound(t, candidateA, map[string]string{"a1": "fail", "a2": "pass"}, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1"}})
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	if err = f.acceptCandidate(candidateC, lead); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("rebased candidate accepted without equivalence verification", err)
+	}
+	fix := rebaseFix(candidateB)
+	request, err := f.rebaseRequest(candidateC, fix, lead)
+	if err != nil {
+		t.Fatal("empty-blocker rebase request refused", err)
+	}
+	if err = f.rebaseResult(request.Seq, candidateC, fix, "pass", rebaseProof(candidateB, candidateC)); err != nil {
+		t.Fatal("equivalence result refused", err)
+	}
+	if err = f.acceptCandidate(candidateC, lead); err != nil {
+		t.Fatal("clean round-two rebase not accepted", err)
+	}
+	// Round two's resolution of b1 is its own record on B; the rebase names none.
+	st := f.state(t)
+	if len(st.Rounds) != 2 || len(st.Rounds[0].Blockers) != 1 || len(st.Rounds[1].Blockers) != 0 || len(st.Focused) != 2 || st.Focused[0].Candidate != candidateB || !reflect.DeepEqual(st.Focused[0].BlockerIDs, []string{"b1"}) {
+		t.Fatal("round-two resolution", st)
+	}
+	if rebase := st.Focused[1]; rebase.Candidate != candidateC || !rebase.Passed || len(rebase.BlockerIDs) != 0 || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateC {
+		t.Fatal("accepted state", st)
+	}
+}
+
+// A refusal on the empty-blocker path names why the reviewed candidate is not
+// converged, here a scope amended after round two.
+func TestReviewConvergenceRebaseRefusalNamesCause(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	f.rescope(t, "Fixture, amended")
+	if err := f.assign(map[string]string{"a1": "works", "a2": "retries", "a3": "reports"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.rebaseRequest(candidateC, rebaseFix(candidateB), api.Agent{})
+	refusedWith(t, "rebase after a scope amendment", err, "rebase verification needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: latest general review is incomplete or stale)")
+	if strings.Count(err.Error(), "review convergence:") != 1 {
+		t.Fatal("doubled prefix", err)
+	}
+	if len(f.state(t).Focused) != 0 {
+		t.Fatal("refused request was stored", f.state(t))
+	}
+}
+
 func TestReviewConvergenceRebaseLifecycle(t *testing.T) {
 	f := newConvergenceFixture(t)
 	lead, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: "lead", Host: "fixture", Session: "lead"}, f.by)
