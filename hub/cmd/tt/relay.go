@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,6 +56,12 @@ type relayProgress struct {
 	NextRetirementCheck time.Time        `json:"nextRetirementCheck,omitempty"`
 	Wake                *api.WakeOutcome `json:"wake,omitempty"`
 	ClaudePendingInbox  bool             `json:"claudePendingInbox,omitempty"`
+	// ClaudePendingSeqs are the messages of the broker jobs whose unsafe
+	// skip set ClaudePendingInbox: only these broker-covered messages return
+	// to the inbox path. A later obligation keeps its own broker job, so a
+	// stuck fallback never wakes it twice. A record saved before this field
+	// existed has none, and its fallback passes every message, as it did.
+	ClaudePendingSeqs []int64 `json:"claudePendingSeqs,omitempty"`
 	// LastHeartbeat spaces the owner helper's relay heartbeats.
 	LastHeartbeat time.Time `json:"lastHeartbeat,omitempty"`
 	// TeamHeld records that this run's last inbox attempt was withheld by a
@@ -780,6 +787,16 @@ func claudeBrokerPrompt(prompt string, jobSeq int64, jobID string) string {
 	return "Tailterm obligations " + strings.Join(seqs, ",") + ". Run tt inbox --unread --mark-read. Wake " + jobID + "."
 }
 
+// claudeBrokerFullText names the command that prints the job's message in a
+// Claude broker prompt. It is added only when the agent has already read that
+// message: tt inbox --unread prints unread messages in full, but not one a
+// re-wake (1, 3 and 7 minutes after an unacknowledged obligation) names after
+// the agent read it. The owner helper is never given it, because tt helper
+// inbox has no --seq form. An empty prompt stays empty.
+func claudeBrokerFullText(prompt string, seq int64) string {
+	return strings.Replace(prompt, " Wake ", fmt.Sprintf(" Full text: tt inbox --seq %d. Wake ", seq), 1)
+}
+
 func recordClaudeWake(p *relayProgress, prompt string, err error, now time.Time) {
 	status, reason := "confirmed", ""
 	if err != nil {
@@ -948,9 +965,11 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 	if active, err := relayProjectActive(ctx, c, b); err != nil || !active {
 		return false, err
 	}
-	if a, err := c.GetAgent(ctx, b.Task, b.Agent); err != nil {
+	a, err := c.GetAgent(ctx, b.Task, b.Agent)
+	if err != nil {
 		return false, err
-	} else if relayAgentSkipReason(a, b) != "" {
+	}
+	if relayAgentSkipReason(a, b) != "" {
 		return false, nil
 	}
 	job, err := c.LeaseWakeJob(ctx, b.Task, b.Agent, b.Run)
@@ -983,6 +1002,9 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 	prompt := job.Prompt
 	if b.Runtime == "claude" {
 		prompt = claudeWakeFor(b, claudeBrokerPrompt(prompt, job.MessageSeq, job.ID))
+		if b.Role != api.AgentRoleOwnerHelper && job.MessageSeq > 0 && a.ReadUpTo >= job.MessageSeq {
+			prompt = claudeBrokerFullText(prompt, job.MessageSeq)
+		}
 	} else if b.Role == api.AgentRoleOwnerHelper {
 		// The broker's generic prompt names commands requiring an agent env.
 		prompt = claudeWakeFor(b, claudeBrokerPrompt(prompt, job.MessageSeq, job.ID))
@@ -1002,6 +1024,7 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 			// still-unread obligation eligible for the inbox path on the first
 			// later idle pass, even though BrokerWakes is enabled.
 			p.ClaudePendingInbox = true
+			p.ClaudePendingSeqs = addClaudePendingSeq(p.ClaudePendingSeqs, job.MessageSeq)
 			// An earlier inbox pass may have skipped this broker-covered
 			// message and advanced Through. Revisit it after the busy skip;
 			// the agent-owned ReadUpTo cursor is never changed here.
@@ -1018,10 +1041,27 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 		return b.Runtime == "claude" && p.ClaudePendingInbox, fmt.Errorf("broker wake %s: %s", report.Status, report.Detail)
 	}
 	if reportErr == nil {
-		p.ClaudePendingInbox = false
+		p.ClaudePendingInbox, p.ClaudePendingSeqs = false, nil
 	}
 	p.Skip = nil
 	return true, reportErr
+}
+
+// claudePendingSeqMax bounds ClaudePendingSeqs. Each entry is a distinct
+// obligation whose broker job was skipped as unsafe while an earlier one still
+// waited, so the bound is rarely reached; one inbox wake delivers every unread
+// message anyway.
+const claudePendingSeqMax = 32
+
+func addClaudePendingSeq(seqs []int64, seq int64) []int64 {
+	if seq <= 0 || slices.Contains(seqs, seq) {
+		return seqs
+	}
+	seqs = append(seqs, seq)
+	if len(seqs) > claudePendingSeqMax {
+		seqs = seqs[len(seqs)-claudePendingSeqMax:]
+	}
+	return seqs
 }
 
 func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
@@ -1046,8 +1086,14 @@ const relayPageLimit = 200
 // relayInboxEligible drops the page's messages that broker wake jobs deliver
 // to this binding, leaving those the inbox path may wake for.
 func relayInboxEligible(ctx context.Context, c *api.Client, b runtimeBinding, p *relayProgress, msgs []api.Message) ([]api.Message, error) {
-	if !p.BrokerWakes || p.ClaudePendingInbox {
+	if !p.BrokerWakes || (p.ClaudePendingInbox && len(p.ClaudePendingSeqs) == 0) {
 		return msgs, nil
+	}
+	pending := map[int64]bool{}
+	if p.ClaudePendingInbox {
+		for _, seq := range p.ClaudePendingSeqs {
+			pending[seq] = true
+		}
 	}
 	// Only typed kinds that create an obligation for this agent are woken
 	// by broker wake jobs; replies, free text, decision answers, lead
@@ -1059,7 +1105,7 @@ func relayInboxEligible(ctx context.Context, c *api.Client, b runtimeBinding, p 
 	var eligible []api.Message
 	for _, m := range msgs {
 		covered := m.To == b.Agent && (obliged[m.Seq] || (m.Envelope != nil && brokerCoveredKind[m.Envelope.Kind]))
-		if !covered {
+		if !covered || pending[m.Seq] {
 			eligible = append(eligible, m)
 		}
 	}
@@ -1222,7 +1268,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 		recordClaudeWake(p, prompt, nil, now)
 	}
 	p.Through = through
-	p.ClaudePendingInbox = false
+	p.ClaudePendingInbox, p.ClaudePendingSeqs = false, nil
 	p.Error = ""
 	p.Skip = nil
 	return nil

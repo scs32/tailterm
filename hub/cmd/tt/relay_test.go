@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -3316,5 +3317,229 @@ func TestRelayPendingBindingRefusals(t *testing.T) {
 	}
 	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
 		t.Fatalf("pending record kept beside a helper registration: %v", err)
+	}
+}
+
+// Review #13301 f7 (wi_35b27816cdfeda15): an unsafe broker skip returns its
+// own obligation to the inbox path. While that fallback keeps failing, a later
+// obligation keeps its own broker job, so it is woken once, not also by the
+// inbox. The relay loop reaches the inbox before the later job's lease when
+// the broker check is spaced or backed off.
+func TestRelayClaudeStuckInboxFallbackWakesLaterObligationOnce(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Stuck fallback"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	review := func(subject string) api.Message {
+		t.Helper()
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "review", To: "worker", Subject: subject, Body: api.EnvelopeBody{Candidate: "abc1234", Scope: "fixture", Acceptance: map[string]string{"a1": "check"}}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	first := review("Review the first fixture")
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: b.Run, Thread: b.Thread}
+	var prompts []string
+	stuck := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return fmt.Errorf("%w: turn in progress", errClaudeWakeUnsafe)
+	}
+	idle := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	wakesFor := func(seq int64) int {
+		n := 0
+		for _, prompt := range prompts {
+			for _, match := range brokerPromptSeq.FindAllString(prompt, -1) {
+				if match == fmt.Sprintf("#%d", seq) {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	t0 := time.Now().Add(time.Second)
+	if handled, err := relayWakeJob(ctx, b, &p, client, t0, stuck); !handled || err == nil || !p.ClaudePendingInbox || !slices.Equal(p.ClaudePendingSeqs, []int64{first.Seq}) {
+		t.Fatalf("unsafe broker skip: handled=%v err=%v progress=%+v", handled, err, p)
+	}
+	// The fallback keeps failing on later idle-spaced passes.
+	for i, at := range []time.Time{t0.Add(20 * time.Second), t0.Add(40 * time.Second)} {
+		if err := relayOne(ctx, b, &p, client, at, stuck); err == nil || !p.ClaudePendingInbox {
+			t.Fatalf("stuck fallback %d: err=%v progress=%+v", i, err, p)
+		}
+	}
+	if wakesFor(first.Seq) != 3 {
+		t.Fatalf("fallback attempts for the skipped obligation = %d, want 3: %q", wakesFor(first.Seq), prompts)
+	}
+	data, err := json.Marshal(p)
+	if err != nil || json.Unmarshal(data, &p) != nil || !slices.Equal(p.ClaudePendingSeqs, []int64{first.Seq}) {
+		t.Fatalf("pending sequences lost on reload: %v %s", err, data)
+	}
+	later := review("Review the later fixture")
+	prompts = nil
+	// The pane goes idle. The inbox pass runs before the later job's lease.
+	tIdle := t0.Add(60 * time.Second)
+	if err := relayOne(ctx, b, &p, client, tIdle, idle); err != nil || len(prompts) != 1 || wakesFor(first.Seq) != 1 || p.ClaudePendingInbox || p.ClaudePendingSeqs != nil {
+		t.Fatalf("inbox fallback: prompts=%q progress=%+v err=%v", prompts, p, err)
+	}
+	if handled, err := relayWakeJob(ctx, b, &p, client, tIdle, idle); !handled || err != nil {
+		t.Fatalf("later broker job: handled=%v err=%v prompts=%q", handled, err, prompts)
+	}
+	if err := relayOne(ctx, b, &p, client, tIdle.Add(20*time.Second), idle); err != nil {
+		t.Fatal(err)
+	}
+	if n := wakesFor(later.Seq); n != 1 || len(prompts) != 2 || !strings.Contains(prompts[1], " Wake wake_") {
+		t.Fatalf("later obligation woken %d times, want once by its broker job: %q", n, prompts)
+	}
+}
+
+// A progress record saved before ClaudePendingSeqs existed has a pending
+// fallback and no sequences; its fallback still passes every message, so the
+// relay upgrade cannot lose the skipped obligation's wake.
+func TestRelayClaudeLegacyPendingFallbackPassesEveryMessage(t *testing.T) {
+	msgs := []api.Message{{Seq: 7, To: "agt_self", Envelope: &api.Envelope{Kind: api.EnvelopeKindReview}}}
+	p := relayProgress{BrokerWakes: true, ClaudePendingInbox: true}
+	got, err := relayInboxEligible(context.Background(), nil, runtimeBinding{Agent: "agt_self"}, &p, msgs)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("legacy fallback = %+v, %v", got, err)
+	}
+	p.ClaudePendingSeqs = []int64{6}
+	if got, err = relayInboxEligible(context.Background(), nil, runtimeBinding{Agent: "agt_self"}, &p, msgs); err != nil || len(got) != 0 {
+		t.Fatalf("narrowed fallback passed another obligation: %+v, %v", got, err)
+	}
+	seqs := []int64(nil)
+	for seq := int64(1); seq <= claudePendingSeqMax+3; seq++ {
+		seqs = addClaudePendingSeq(addClaudePendingSeq(seqs, seq), seq)
+	}
+	if len(seqs) != claudePendingSeqMax || seqs[0] != 4 || seqs[len(seqs)-1] != claudePendingSeqMax+3 {
+		t.Fatalf("bounded pending sequences = %v", seqs)
+	}
+}
+
+// wi_a10e9d0a1c435daf (k3 of wi_35b27816cdfeda15): a Claude broker prompt for
+// a message the agent has already read names tt inbox --seq, because tt inbox
+// --unread no longer prints it. An unread message and the owner helper, whose
+// tt helper inbox has no --seq form, keep the short prompt.
+func TestClaudeBrokerPromptFullTextPointerOnlyForReadMessages(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Broker pointer"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "test", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "test", Session: "claude", Runtime: "claude"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: worker.ID, RunID: worker.RunID}, by); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	defer srv.Close()
+	client, err := api.NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := runtimeBinding{Hub: srv.URL, Task: task.ID, Agent: worker.ID, Run: worker.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "claude", Session: "claude"}
+	p := relayProgress{Run: b.Run, Thread: b.Thread}
+	var prompts []string
+	idle := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	wake := func(b runtimeBinding, at time.Time, read bool) (api.Message, string) {
+		t.Helper()
+		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, To: worker.ID, Envelope: &api.Envelope{Kind: "review", To: "worker", Subject: "Review the pointer fixture", Body: api.EnvelopeBody{Candidate: "abc1234", Scope: "fixture", Acceptance: map[string]string{"a1": "check"}}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if read {
+			if err := st.MarkRead(ctx, task.ID, api.MarkReadRequest{AgentID: worker.ID, UpTo: m.Seq}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		prompts = nil
+		if handled, err := relayWakeJob(ctx, b, &p, client, at, idle); !handled || err != nil || len(prompts) != 1 {
+			t.Fatalf("broker wake for #%d: handled=%v err=%v prompts=%q", m.Seq, handled, err, prompts)
+		}
+		return m, prompts[0]
+	}
+	t0 := time.Now().Add(time.Second)
+	if _, prompt := wake(b, t0, false); strings.Contains(prompt, "--seq") || !strings.Contains(prompt, "Run tt inbox --unread --mark-read. Wake wake_") {
+		t.Fatalf("unread message prompt %q", prompt)
+	}
+	m, prompt := wake(b, t0.Add(20*time.Second), true)
+	if want := fmt.Sprintf("Run tt inbox --unread --mark-read. Full text: tt inbox --seq %d. Wake wake_", m.Seq); !strings.Contains(prompt, want) || strings.Count(prompt, "--seq") != 1 {
+		t.Fatalf("read message prompt %q lacks %q", prompt, want)
+	}
+	// The check before Enter still recognizes the longer prompt as the
+	// editor wraps it, including the padded rows of a real 80-column pane.
+	for _, width := range []int{80, 40} {
+		for _, pad := range []bool{false, true} {
+			var lines []string
+			line := "❯ "
+			for _, word := range strings.Fields(prompt) {
+				if len([]rune(line))+len([]rune(word))+1 > width && line != "❯ " {
+					if pad {
+						line += strings.Repeat(" ", width-len([]rune(line)))
+					}
+					lines = append(lines, line)
+					line = "  " + word
+				} else {
+					if line != "❯ " && line != "  " {
+						line += " "
+					}
+					line += word
+				}
+			}
+			lines = append(lines, line, strings.Repeat("─", width), "  ⏵⏵ bypass permissions on (shift+tab to cycle)")
+			if len(lines) < 4 || !exactClaudeInput(strings.Join(lines, "\n"), prompt) {
+				t.Fatalf("wrapped %d-column input (padded %v) not recognized: %q", width, pad, lines)
+			}
+		}
+	}
+	helper := b
+	helper.Role = api.AgentRoleOwnerHelper
+	if _, prompt := wake(helper, t0.Add(40*time.Second), true); strings.Contains(prompt, "--seq") || strings.Contains(prompt, "tt inbox") || !strings.Contains(prompt, "Run tt helper inbox --task "+task.ID+". Wake wake_") {
+		t.Fatalf("helper prompt %q", prompt)
+	}
+	if got := claudeBrokerFullText("", 7); got != "" {
+		t.Fatalf("empty prompt became %q", got)
 	}
 }
