@@ -3143,9 +3143,12 @@ dialog .font-choice small {
   color: var(--muted);
   white-space: normal;
 }
+/* A fixed line height, not normal, so a sample is as tall in its fallback
+   font as once its bundled face arrives (fonts.css swaps them in). */
 dialog .font-choice span {
   white-space: normal;
   overflow-wrap: anywhere;
+  line-height: 20px;
 }
 dialog :is(input, textarea)::placeholder {
   color: var(--placeholder);

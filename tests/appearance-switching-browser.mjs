@@ -31,6 +31,43 @@ try {
       page.setDefaultTimeout(10000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
+      // Hold the Nerd Font responses until the dialog has been laid out, as
+      // on a slow connection, so its first layout uses the fallback font.
+      let releaseNerdFonts;
+      const nerdFontsHeld = new Promise((r) => (releaseNerdFonts = r));
+      await page.route(/-nerd-[^/]*\.woff2$/, async (route) => {
+        await nerdFontsHeld;
+        await route.continue();
+      });
+      // Waits, at most 5 s, until every font the page asked for has loaded
+      // and that layout has been painted, and fails naming any face still
+      // pending.
+      const settleFonts = async (label) => {
+        const pending = await page.evaluate(async () => {
+          const deadline = performance.now() + 5000;
+          do {
+            await Promise.race([
+              document.fonts.ready,
+              new Promise((r) => setTimeout(r, deadline - performance.now())),
+            ]);
+            for (let frame = 0; frame < 2; frame++)
+              await new Promise(requestAnimationFrame);
+          } while (
+            document.fonts.status !== "loaded" &&
+            performance.now() < deadline
+          );
+          if (document.fonts.status === "loaded") return [];
+          const faces = [...document.fonts]
+            .filter((f) => f.status !== "loaded" && f.status !== "unloaded")
+            .map((f) => `${f.family} ${f.weight} ${f.status}`);
+          return faces.length ? faces : ["no face reports its status"];
+        });
+        assert.deepEqual(
+          pending,
+          [],
+          `${engine.name()} ${label}: fonts still loading after 5 s: ${pending.join("; ")}`,
+        );
+      };
       const response = await page.goto(`${origin}/`);
       assert.equal(
         response.headers()["x-tailterm-preview-token"],
@@ -42,6 +79,31 @@ try {
         .fill("temporary appearance test password");
       await page.locator("#unlock-button").click();
       await page.locator("#appearance").click();
+      // The typeface samples must not change the dialog's size when their
+      // Nerd Font faces arrive after it opens.
+      const size = () =>
+        page.locator("#dialog").evaluate(async (d) => {
+          for (let frame = 0; frame < 2; frame++)
+            await new Promise(requestAnimationFrame);
+          return {
+            fonts: document.fonts.status,
+            height: d.scrollHeight,
+            card: d.querySelector(".font-grid").getBoundingClientRect().height,
+          };
+        });
+      const early = await size();
+      assert.equal(
+        early.fonts,
+        "loading",
+        `${engine.name()}: the Nerd Font faces were held while the dialog opened`,
+      );
+      releaseNerdFonts();
+      await settleFonts("after the held Nerd Font faces arrive");
+      assert.deepEqual(
+        await size(),
+        { ...early, fonts: "loaded" },
+        `${engine.name()}: the appearance dialog keeps its size when the Nerd Font faces arrive after it opens`,
+      );
       for (const width of [1100, 390]) {
         await page.setViewportSize({ width, height: 800 });
         for (const attr of ["theme", "font"])
@@ -54,31 +116,24 @@ try {
             )) {
             const button = page.locator(`[data-${attr}-choice="${id}"]`);
             await button.scrollIntoViewIfNeeded();
-            // The typeface cards use bundled web fonts with font-display:
-            // swap. A card measured in its fallback font is 2 px shorter than
-            // once its font arrives, so read only after every font the page
-            // asked for has loaded and that layout has been painted.
-            const metrics = () =>
-              page.locator("#dialog").evaluate(async (d) => {
-                do {
-                  await document.fonts.ready;
-                  for (let frame = 0; frame < 2; frame++)
-                    await new Promise(requestAnimationFrame);
-                } while (document.fonts.status !== "loaded");
-                return {
-                  scroll: d.scrollTop,
-                  width: d.clientWidth,
-                  scrollWidth: d.scrollWidth,
-                  height: d.scrollHeight,
-                  head: d.querySelector(".dialog-head").getBoundingClientRect()
-                    .top,
-                  preview: d
-                    .querySelector("#appearance-preview")
-                    .getBoundingClientRect().height,
-                  card: d.querySelector(".font-grid").getBoundingClientRect()
-                    .height,
-                };
-              });
+            // Choosing a font can start loading its faces, so read only after
+            // they have settled.
+            const metrics = async () => {
+              await settleFonts(`${width} ${attr} ${id}`);
+              return page.locator("#dialog").evaluate((d) => ({
+                scroll: d.scrollTop,
+                width: d.clientWidth,
+                scrollWidth: d.scrollWidth,
+                height: d.scrollHeight,
+                head: d.querySelector(".dialog-head").getBoundingClientRect()
+                  .top,
+                preview: d
+                  .querySelector("#appearance-preview")
+                  .getBoundingClientRect().height,
+                card: d.querySelector(".font-grid").getBoundingClientRect()
+                  .height,
+              }));
+            };
             const before = await metrics();
             await button.click();
             await page.waitForTimeout(200);
