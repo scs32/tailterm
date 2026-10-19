@@ -23,6 +23,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"github.com/scs32/tailterm/hub/internal/testverification"
 )
 
 func TestTeamRunnerBookkeepingLaunchesFourFakeMembersOnce(t *testing.T) {
@@ -3169,5 +3170,287 @@ func TestTeamRunnerPassesHeadAwaitingRebind(t *testing.T) {
 				t.Fatalf("one tick: %d claims of the next entry, %d spawns, next %s; want it claimed and running past the entry awaiting a rebind", claims, spawns, gotLater.State)
 			}
 		})
+	}
+}
+
+// pendingCleanup is a scripted member cleanup: while pending holds, it
+// returns err without a receipt; afterwards it saves the exact run's receipt.
+type pendingCleanup struct {
+	pending atomic.Bool
+	err     error
+	calls   atomic.Int32
+}
+
+func (p *pendingCleanup) cleanup(f teamFixture) func(context.Context, env, string, string) error {
+	return func(ctx context.Context, _ env, task, id string) error {
+		p.calls.Add(1)
+		if p.pending.Load() {
+			return p.err
+		}
+		a, err := f.c.GetAgent(ctx, task, id)
+		if err != nil {
+			return err
+		}
+		_, err = f.c.ReportCleanup(ctx, task, id, api.CleanupRequest{RunID: a.RunID})
+		return err
+	}
+}
+
+// runningDismissedEntry launches one fake lead for the fixture item, then
+// dismisses the item so the next tick closes the team and cleans it up.
+func runningDismissedEntry(t *testing.T, f teamFixture, r teamRunner) api.TeamQueueEntry {
+	t.Helper()
+	ctx := context.Background()
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "pending-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	terminal := "dismissed"
+	if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Status: &terminal}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+func TestCloseoutCleanupRetryableErrors(t *testing.T) {
+	for _, err := range []error{
+		errors.New(cleanupReceiptPending),
+		errors.New(cleanupSessionPresent),
+		errors.Join(errors.New(cleanupReceiptPending), errors.New(cleanupSessionPresent)),
+	} {
+		if !cleanupRetryable(err) {
+			t.Errorf("%q not retryable", err)
+		}
+	}
+	for _, err := range []error{
+		nil,
+		errors.Join(),
+		errors.New("Agent is not closed"),
+		errors.New("Hub unavailable; local session retained"),
+		errors.New("Unverified session left open"),
+		errors.New("tmux could not stop the session"),
+		fmt.Errorf("wrapped: %w", errors.New(cleanupReceiptPending)),
+		errors.Join(errors.New(cleanupReceiptPending), errors.New("Agent is not closed")),
+	} {
+		if cleanupRetryable(err) {
+			t.Errorf("%v retryable", err)
+		}
+	}
+}
+
+// A non-retryable member cleanup error still fails the entry, alone or among
+// pending ones.
+func TestTeamRunnerCloseoutNonRetryableCleanupFails(t *testing.T) {
+	for name, cause := range map[string]error{
+		"not-closed": errors.New("Agent is not closed"),
+		"mixed":      errors.Join(errors.New(cleanupReceiptPending), errors.New("Agent is not closed")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			cleanup := &pendingCleanup{err: cause}
+			cleanup.pending.Store(true)
+			r := queueCorrectionRunner(t, f, 1)
+			r.cleanup = cleanup.cleanup(f)
+			r.cleanupPending = &cleanupPendingBook{}
+			q := runningDismissedEntry(t, f, r)
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), "Agent is not closed") {
+				t.Fatalf("tick error %v", err)
+			}
+			got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || got.State != "failed" || !strings.Contains(got.Failure, "cleanup: ") || !strings.Contains(got.Failure, "Agent is not closed") {
+				t.Fatalf("entry %+v %v", got, err)
+			}
+		})
+	}
+}
+
+// Incident I-39544: a member cleanup receipt that is still pending leaves the
+// accepted entry running under its frozen close request, and the entry
+// finishes with its saved acceptance once the exact run reads cleaned up.
+func TestTeamRunnerCloseoutPendingCleanupThenReceiptFinishes(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	base, commit := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "pending-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: base, Ownership: []string{"src/a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup := &pendingCleanup{err: errors.New(cleanupReceiptPending)}
+	cleanup.pending.Store(true)
+	r := queueCorrectionRunner(t, f, 1)
+	r.cleanup = cleanup.cleanup(f)
+	r.cleanupPending = &cleanupPendingBook{}
+	r.integration = func(_ context.Context, q api.TeamQueueEntry, _ api.WorkItem, _ api.TeamCloseRequest) (*api.TeamIntegrationReady, error) {
+		a := q.Acceptance
+		return &api.TeamIntegrationReady{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: a.Worktree, Branch: a.Branch, Commit: a.Commit, Evidence: a.Evidence}, nil
+	}
+	if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.State != "running" {
+		t.Fatalf("launch %+v %v", q, err)
+	}
+	// The item is done and the handler saves exact Git acceptance.
+	by := api.Caller{Node: "fixture", User: "owner"}
+	current, err := f.st.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testverification.Prepare(f.c, f.task.ID, current, commit, q.Repository, q.BaseCommit); err != nil {
+		t.Fatal(err)
+	}
+	report, _, err := f.st.PutNarrativeReport(ctx, f.task.ID, current.ID, api.PutNarrativeReportRequest{RequestID: "pending-report", ScopeRevision: current.ScopeRevision,
+		Sections:   api.NarrativeReportSections{RequestedOutcome: "Deliver it.", DeliveredWork: "Synthetic delivery complete.", Verification: "Isolated runner fixture.", Limitations: "Fixture only.", RemainingWork: "Owner integration."},
+		References: []api.NarrativeReference{{Kind: "work-item-revision", TaskID: f.task.ID, ItemID: current.ID, Revision: current.Revision, Label: "bounded scope"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := "done"
+	if _, _, err := f.st.CreateWorkItemUpdate(ctx, f.task.ID, current.ID, api.CreateWorkItemUpdate{ExpectedRevision: current.Revision, RequestID: "pending-done", Status: &terminal, CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}, by); err != nil {
+		t.Fatal(err)
+	}
+	if current, err = f.c.GetWorkItem(ctx, f.task.ID, current.ID); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "pending-accept", Operation: "accept", EntryID: q.ID, ExpectedRevision: q.Revision, HandlerAgentID: q.HandlerID, HandlerRunID: q.HandlerRunID, Acceptance: &api.TeamIntegrationAcceptance{Repository: q.Repository, BaseCommit: q.BaseCommit, Worktree: q.Cwd, Branch: "fix/pending", Commit: commit, ItemRevision: current.Revision, CompletionReport: current.CompletionReport, Evidence: "saved fixture acceptance"}})
+	if err != nil || accepted.Acceptance == nil {
+		t.Fatalf("accept %+v %v", accepted, err)
+	}
+	time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
+	// Two ticks with the receipt still pending: the team closes, the entry
+	// stays running with no failure write, and cleanup is tried each tick.
+	var frozen string
+	for i := 1; i <= 2; i++ {
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("pending tick %d: %v", i, err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != "running" || got.Failure != "" || got.EscalationSeq != 0 || len(got.CloseJSON) == 0 {
+			t.Fatalf("pending tick %d entry %+v %v", i, got, err)
+		}
+		if i == 1 {
+			frozen = string(got.CloseJSON)
+		} else if string(got.CloseJSON) != frozen {
+			t.Fatalf("close request changed: %s then %s", frozen, got.CloseJSON)
+		}
+		if n := cleanup.calls.Load(); n != int32(i) {
+			t.Fatalf("pending tick %d made %d cleanup calls", i, n)
+		}
+	}
+	var closeReq api.TeamCloseRequest
+	if err := json.Unmarshal([]byte(frozen), &closeReq); err != nil || closeReq.RequestID == "" {
+		t.Fatalf("frozen close %s %v", frozen, err)
+	}
+	receipt, err := f.c.GetTeamCloseReceipt(ctx, f.task.ID, closeReq.RequestID)
+	if err != nil || len(receipt.Members) != 1 {
+		t.Fatalf("close receipt %+v %v", receipt, err)
+	}
+	member := receipt.Members[0]
+	if a, err := f.c.GetAgent(ctx, f.task.ID, member.AgentID); err != nil || a.RunID != member.RunID || a.Status != api.AgentClosed || a.CleanupDone {
+		t.Fatalf("member before receipt %+v %v", a, err)
+	}
+	// The receipt arrives: the next tick cleans up and finishes.
+	cleanup.pending.Store(false)
+	if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if a, err := f.c.GetAgent(ctx, f.task.ID, member.AgentID); err != nil || a.RunID != member.RunID || !a.CleanupDone {
+		t.Fatalf("member after receipt %+v %v", a, err)
+	}
+	got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "finished" || got.Failure != "" || got.EscalationSeq != 0 || string(got.CloseJSON) != frozen {
+		t.Fatalf("finished entry %+v %v", got, err)
+	}
+	if got.Acceptance == nil || got.Acceptance.Commit != commit || got.Acceptance.AcceptedAt != accepted.Acceptance.AcceptedAt || got.Integration == nil || got.Integration.Commit != commit || got.Integration.Branch != "fix/pending" {
+		t.Fatalf("acceptance or integration lost: %+v %+v", got.Acceptance, got.Integration)
+	}
+	if len(r.cleanupPending.entries) != 0 {
+		t.Fatalf("pending state kept after finish: %v", r.cleanupPending.entries)
+	}
+}
+
+// A pending cleanup that persists is bounded: one owner-helper notice after
+// cleanupPendingNoticeAfter on the runner clock, naming the member and run,
+// and never a failure. The notice's request identity dedupes a relay restart.
+func TestTeamRunnerCloseoutPersistentPendingCleanupNoticesOnce(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "pending-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := &pendingCleanup{err: errors.New(cleanupSessionPresent)}
+	cleanup.pending.Store(true)
+	start := time.Now()
+	now := start
+	r := queueCorrectionRunner(t, f, 1)
+	r.cleanup = cleanup.cleanup(f)
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	notices := func() []api.Message {
+		t.Helper()
+		messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []api.Message
+		for _, m := range messages {
+			if m.Envelope != nil && m.Envelope.Subject == cleanupPendingTitle {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	tick := func(at time.Duration, wantNotices int) {
+		t.Helper()
+		now = start.Add(at)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != "running" || got.Failure != "" || got.EscalationSeq != 0 {
+			t.Fatalf("tick at %s entry %+v %v", at, got, err)
+		}
+		if n := len(notices()); n != wantNotices {
+			t.Fatalf("tick at %s: %d notices, want %d", at, n, wantNotices)
+		}
+	}
+	tick(0, 0)
+	tick(29*time.Minute, 0)
+	tick(30*time.Minute, 1)
+	tick(45*time.Minute, 1)
+	// A relay restart forgets the start and times a fresh interval; its
+	// notice replays the saved one.
+	r.cleanupPending = &cleanupPendingBook{}
+	tick(50*time.Minute, 1)
+	tick(80*time.Minute, 1)
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lead, helper api.Agent
+	for _, a := range detail.Agents {
+		switch {
+		case a.Name == "correction-lead-0":
+			lead = a
+		case a.Role == api.AgentRoleOwnerHelper:
+			helper = a
+		}
+	}
+	notice := notices()[0]
+	if notice.To != helper.ID || notice.Envelope.Kind != api.EnvelopeKindNotice || notice.Envelope.Refs["member"] != lead.ID || notice.Envelope.Refs["run"] != lead.RunID || notice.Envelope.Refs["entry"] != q.ID ||
+		!strings.Contains(notice.Text, lead.ID) || !strings.Contains(notice.Text, lead.RunID) || !strings.Contains(notice.Text, "30m0s") {
+		t.Fatalf("notice %+v to %s, lead %s/%s", notice.Envelope, notice.To, lead.ID, lead.RunID)
+	}
+	if lead.CleanupDone {
+		t.Fatal("pending cleanup reads done")
+	}
+	if n := cleanup.calls.Load(); n != 6 {
+		t.Fatalf("%d cleanup calls, want one per tick", n)
 	}
 }
