@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1203,6 +1204,39 @@ func stubPaneSize(t *testing.T, cols, rows *int) {
 		return *cols, *rows, nil
 	}
 	t.Cleanup(func() { activityPaneSize = previous })
+}
+
+// TestActivityPaneSizeWithoutUTF8Locale is the relay LaunchAgent's environment:
+// no LC_ALL, LC_CTYPE or LANG and not inside tmux, so a tmux client prints the
+// list-panes tabs as "_" unless it is marked UTF-8 capable.
+func TestActivityPaneSizeWithoutUTF8Locale(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	for _, name := range []string{"LC_ALL", "LC_CTYPE", "LANG", "TMUX"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
+	sock := fmt.Sprintf("tt-c-locale-pane-%d-%d", os.Getpid(), time.Now().UnixNano())
+	t.Setenv("TT_TMUX_SOCKET", sock)
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", sock, "kill-server").Run() })
+	run := func(args ...string) string {
+		out, err := exec.Command("tmux", append([]string{"-L", sock, "-f", "/dev/null"}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("new-session", "-d", "-s", "pane-agent", "-n", "shell", "-x", "100", "-y", "30", "sleep 60")
+	run("new-window", "-d", "-t", "pane-agent:", "-n", "agent", "sleep 60")
+	run("resize-window", "-t", "pane-agent:agent", "-x", "120", "-y", "40")
+	if got := run("display-message", "-p", "#{session_id}\t#{window_id}"); strings.Contains(got, "\t") {
+		t.Fatalf("fixture did not reproduce the C locale: %q", got)
+	}
+	cols, rows, err := nativeActivityPaneSize(context.Background(), "pane-agent")
+	if err != nil || cols != 120 || rows != 40 {
+		t.Fatalf("agent pane size = %dx%d, %v; want 120x40", cols, rows, err)
+	}
 }
 
 func TestActivityStuckOnTinyPane(t *testing.T) {

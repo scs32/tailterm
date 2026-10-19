@@ -547,8 +547,13 @@ var activityPaneSize = nativeActivityPaneSize
 
 // nativeActivityPaneSize returns the size of the session's agent-window pane,
 // or its first pane when no window is named for the agent.
+//
+// -u marks the client as UTF-8 capable. Without it a client whose LC_ALL,
+// LC_CTYPE or LANG names no UTF-8 locale, and that is not inside tmux, gets
+// every byte outside printable ASCII printed as "_", tabs included, so no row
+// would split: the relay LaunchAgent sets only PATH.
 func nativeActivityPaneSize(ctx context.Context, session string) (int, int, error) {
-	raw, err := startupTmux(ctx, "list-panes", "-s", "-t", session, "-F", "#{window_name}\t#{pane_width}\t#{pane_height}")
+	raw, err := startupTmux(ctx, "-u", "list-panes", "-s", "-t", session, "-F", "#{window_name}\t#{pane_width}\t#{pane_height}")
 	if err != nil {
 		return 0, 0, err
 	}
