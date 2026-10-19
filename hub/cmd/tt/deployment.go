@@ -27,10 +27,13 @@ func deploymentBriefing() string {
 }
 func cmdDeployment(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|progress|enqueue|claim|unclaim|check|verification|merged|batch-open|batch-add|batch-drop|finish|block|inputs|reconcile|set-aside|hold|unhold|refuse|supersede|retry|hand-release|hand-releases")
+		return errors.New("usage: tt deployment setup|list|get|compat-list|compat-get|handler|progress|enqueue|claim|unclaim|check|verification|merged|batch-open|batch-add|batch-drop|finish|block|inputs|reconcile|set-aside|hold|unhold|refuse|supersede|retry|hand-release|hand-releases|window")
 	}
 	if args[0] == "hand-release" || args[0] == "hand-releases" {
 		return cmdHandRelease(e, args)
+	}
+	if args[0] == "window" {
+		return cmdReleaseWindow(e, args[1:])
 	}
 	if args[0] == "serve" {
 		if len(args) != 3 || args[1] != "--config" {
@@ -552,6 +555,88 @@ func cmdHandRelease(e env, args []string) error {
 	} else if e.agent != "" || e.runID != "" {
 		// The identity is still sent so the hub, not the CLI, decides.
 		err = fmt.Errorf("%w; this shell carries an agent identity: record the hand release as the owner from a shell without it, e.g. env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...", err)
+	}
+	return err
+}
+
+const releaseWindowUsage = "usage: tt deployment window [set --zone IANA_ZONE --start HH:MM --end HH:MM --targets hub,bridge,mini|hub,bridge,mini,tailos|tailos --reason TEXT --request-id KEY | clear --reason TEXT --request-id KEY]"
+
+// cmdReleaseWindow reads, sets or clears the project's release quiet window
+// (docs/project-deployment.md "Release quiet window"). With no operation it
+// prints the window, or null. Set and clear are the owner's: the flags are
+// checked before any hub call, and the identity is still sent so the hub, not
+// the CLI, decides. Both print the window read back.
+func cmdReleaseWindow(e env, args []string) error {
+	op := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		op, args = args[0], args[1:]
+	}
+	if op != "" && op != "set" && op != "clear" {
+		return errors.New(releaseWindowUsage)
+	}
+	fs := flag.NewFlagSet("deployment window "+op, flag.ContinueOnError)
+	zone := fs.String("zone", "", "IANA time zone of the window's bounds, such as America/Los_Angeles (set)")
+	start := fs.String("start", "", "24-hour HH:MM the window opens, inside it (set)")
+	end := fs.String("end", "", "24-hour HH:MM the window ends, outside it; before start crosses midnight (set)")
+	targets := fs.String("targets", "", "covered targets: hub,bridge,mini, hub,bridge,mini,tailos or tailos (set)")
+	reason := fs.String("reason", "", "why the window is set or cleared, one line (set, clear)")
+	key := fs.String("request-id", "", "stable retry identity (set, clear)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return errors.New(releaseWindowUsage)
+	}
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	var w *api.ReleaseWindow
+	switch op {
+	case "set":
+		var missing []string
+		for _, name := range []string{"zone", "start", "end", "targets", "reason", "request-id"} {
+			if fs.Lookup(name).Value.String() == "" {
+				missing = append(missing, "--"+name)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("window set needs %s", strings.Join(missing, ", "))
+		}
+		w = &api.ReleaseWindow{Zone: *zone, Start: *start, End: *end, Reason: *reason}
+		for _, t := range strings.Split(*targets, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				w.Targets = append(w.Targets, t)
+			}
+		}
+	case "clear":
+		if *reason == "" || *key == "" {
+			return errors.New("window clear needs --reason and --request-id")
+		}
+		if given["zone"] || given["start"] || given["end"] || given["targets"] {
+			return errors.New("window clear takes only --reason and --request-id")
+		}
+		w = &api.ReleaseWindow{Reason: *reason}
+	default:
+		if len(given) > 0 {
+			return errors.New("tt deployment window reads the window and takes no flags; use window set or window clear")
+		}
+	}
+	c, err := e.client(20 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(20 * time.Second)
+	defer cancel()
+	if w != nil {
+		if _, err = c.ReleaseAction(ctx, e.task, api.ReleaseRequest{RequestID: *key, Operation: "window-" + op, AgentID: e.agent, RunID: e.runID, Window: w}); err != nil {
+			if e.agent != "" || e.runID != "" {
+				err = fmt.Errorf("%w; this shell carries an agent identity: set the window as the owner from a shell without it, e.g. env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment window %s ...", err, op)
+			}
+			return err
+		}
+	}
+	page, err := c.ReleasesPage(ctx, e.task, api.ReleaseListOptions{Limit: 1})
+	if err == nil {
+		printJSON(page.Window)
 	}
 	return err
 }

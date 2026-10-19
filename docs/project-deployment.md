@@ -164,7 +164,9 @@ credential provisioning and any live release remain separately ordered work.
 Terminal states (`released`, `rolled_back`, `refused`, `superseded`) belong to
 explicit settled history; `blocked` remains active. The HTTP endpoint is
 `GET /v1/tasks/{id}/releases`. Its response is
-`{version:1,jobs:[...],page:{view,limit,snapshot,nextAfter}}`. The default limit
+`{version:1,jobs:[...],page:{view,limit,snapshot,nextAfter},window}`, where
+`window` is the project's release quiet window with `open` and `until`, absent
+when none is set (see "Release quiet window"). The default limit
 is 50; `--limit` / `?limit=` accepts 1–200. Summaries identify their job,
 row order (`rowId`), exact commits, state, generation, claim/run, input pins,
 publication and settlement time. Compact terminal receipt and supersession
@@ -178,6 +180,10 @@ records, reconciliations, retries, paths and full receipts require detail.
 - `tt deployment get --job ID` (HTTP `?job=ID`) returns the full saved record,
   including claimed-job matrix approval hints. It is read-only and takes no
   mutation request key.
+
+While the quiet window is open, a list first holds every covered verified job
+(W2 in "Release quiet window"). That write is a ledger change like any other: a
+traversal that crosses the window's start fails as stale and restarts.
 
 A token covers metadata for the complete task ledger, shared across both views.
 Each page observes its token and bounded rows in one SQLite transaction. Any
@@ -1448,11 +1454,12 @@ list read and its claim makes that one claim fail: the runner posts its usual
 for a claim the hub refuses; a claim that fails only in transport is not a
 held claim (A lasting transport wait, above).
 
-Which of the three to use:
+Which of the four to use:
 
 | | Applies to | Effect | Ends when |
 |---|---|---|---|
 | Owner hold (`hold`) | a `verified`, unclaimed job | state `held`; never claimed or batched; queue position kept | `unhold`, or its named items release |
+| Release quiet window (`tt deployment window set`, owner) | every covered `verified`, unclaimed job while the window is open | the hub saves a window hold (state `held`); claim and batch-add of a covered job are refused | `unhold` after the window ends, or after the owner clears it |
 | Set-aside (`set-aside`) | a `claimed` job with no effects while a later verified job waits | back to `verified` behind every queued job; claimed again when its turn comes | it is not a hold: nothing stops the next claim |
 | Refuse (`refuse`, or `reconcile` with `refuse`) | a claimed job that must not release as it is | terminal state `refused` | never; a new job needs `tt deployment retry` |
 
@@ -1461,6 +1468,110 @@ release batch in state `held` (published or blocked, outcome not restored), the
 runner's notice for a job it skips because the hub refused its claim or its
 set-aside journal is held, and reconcile's "job is not held" for a job that is
 already terminal.
+
+### Release quiet window (wi_03dc6f7d365d6528)
+
+The release quiet window is an owner-set daily span of local time, such as
+22:00-07:00, in which the deployer releases no covered job. The hub saves it
+and enforces it itself, so it does not depend on a handler's turn coming
+before the runner's next poll, and a board message is not a window.
+
+```
+tt deployment window
+env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment window set --zone America/Los_Angeles \
+  --start 22:00 --end 07:00 --targets hub,bridge,mini --reason TEXT --request-id KEY
+env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment window clear --reason TEXT --request-id KEY
+```
+
+With no operation the command prints the window, or `null`. `set` replaces any
+window already set. `set` and `clear` belong to the owner: like a hand release,
+they are refused from a shell that carries an agent identity, so run them with
+the identity removed as shown. They replay by request ID, and a changed payload
+under the same ID is refused. Both print the window read back. The flags are
+checked before any hub call.
+
+What the hub checks:
+
+- `--zone` is an IANA name such as `America/Los_Angeles`, never empty and never
+  `Local`.
+- `--start` and `--end` are 24-hour `HH:MM` from 00:00 to 23:59 and differ. A
+  start later than the end crosses midnight.
+- `--targets` is exactly one of `hub,bridge,mini`, `hub,bridge,mini,tailos` or
+  `tailos`, each named once. The hub cannot tell hub, bridge and mini apart
+  before the runner's checkout, so they are covered together or not at all.
+  The deployer's own code counts as a service path, so it is covered with them.
+- `--reason` is one line of at most 512 characters.
+
+**Time.** Membership uses wall-clock time in the window's zone. The start
+minute is inside the window and the end minute is outside it. On the fall-back
+night 22:00-07:00 lasts ten real hours, and both repeated 01:00 hours are
+inside it. On the spring-forward night it lasts eight. A bound in a skipped
+hour still divides the clock: a window that starts at 02:30 is open at 03:00 on
+that night. `until` is the next end time after now, on the next calendar day
+when today's end has passed, RFC 3339 with its offset (for example
+`2026-11-01T07:00:00-08:00`).
+
+**Coverage.** The hub has no target list for a job before the runner's claim.
+It sorts the changed paths in the job's verification plan (`plan.changed`) into
+three classes. The lists are a subset of `scripts/release-targets.mjs` and may
+only stay a subset, so a missing rule holds a job and never releases one:
+
+| Class | Paths | Covered by |
+|---|---|---|
+| none | `docs/`, `tests/`, `verification/`, any `*_test.go`, any `AGENTS.md`, root `LICENSE`, root `README.md`, `hub/README.md` | no window |
+| tailos | `client/`, `wasm/`, `public/`, `shared/`, root `package.json`, `package-lock.json`, `index.html` and `vite*.js` | a window that names `tailos` |
+| service | every other path, including unknown and invalid ones | every window |
+
+A job is covered when any of its paths is covered, or when it has no changed
+paths at all (unknown counts as covered). A window of `tailos` alone still
+holds a job that changes hub code, because service paths are held by every
+window. A docs- or tests-only job is never held and releases at night.
+
+**What the window does while it is open:**
+
+- **W1, on write.** A handler operation that leaves its job `verified` and
+  unclaimed (`enqueue`, `retry`, `unhold` of a hold that is not the window's,
+  a requeue `reconcile` and `set-aside`) saves a covered job as `held`
+  instead, in the same request.
+- **W2, on list.** `tt deployment list` (the runner's read before every claim)
+  first holds every covered `verified` job that no deployer holds and that is
+  not in an active batch. That covers a job verified before the window opened,
+  and jobs that an unclaim, a dissolved batch or a lifted hold return to
+  `verified` at night. `tt deployment get` does not write.
+- **W3, at claim.** A claim of a covered `verified` job is refused with
+  `job ID is inside the release quiet window START-END ZONE covers TARGETS
+  until UNTIL ...`, and so is adding one to a batch. This matters only between
+  a list and a claim at the moment the window opens: the runner posts its one
+  "the hub refused its claim" notice (no reconcile is needed), and its next list
+  holds the job.
+
+A window hold is an owner hold that names the window: `hold.window` carries the
+zone, start, end, targets and `until`, its reason reads `release quiet window
+22:00-07:00 America/Los_Angeles covers hub, bridge, mini; held until an explicit
+unhold after UNTIL`, and its `holdHistory` event has `cause` `window`. It has no
+agent, run or named items. The runner treats it like any hold: it passes the
+job over and its poll ends with the wait `owner_hold`, not a failure.
+
+**At the end.** Nothing is released by itself. Window holds stay until the
+handler runs `tt deployment unhold` for each job, which returns it to
+`verified` in its original queue order. While a window is open, `unhold` of a
+window hold is refused (`job ID is on a release quiet window hold until UNTIL;
+unhold it after the window ends, or the owner clears the window first`), and
+`unhold` of any other hold releases it and holds it again by the window in the
+same request. Both events stay in the history.
+
+**Releasing at night.** The owner clears the window (`tt deployment window
+clear`), then the handler unholds the jobs. Clearing releases no hold already
+saved.
+
+**Exceptions.**
+
+- A job claimed before the window opened keeps running, with its batch and its
+  later deployer operations: the window gates claims only, as a hold does.
+- A job whose latest reconcile record carries a host lock digest (a requeue)
+  is never held, because the runner frees that lock only while the job is
+  `verified`. Its claim is still refused while the window is open, and it
+  becomes claimable at the end without an unhold.
 
 ### Probes and rollback programs
 

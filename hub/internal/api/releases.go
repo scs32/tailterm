@@ -161,6 +161,8 @@ type ReleasePage struct {
 	Version int              `json:"version"`
 	Jobs    []ReleaseSummary `json:"jobs"`
 	Page    ReleasePageInfo  `json:"page"`
+	// Window is the project's release quiet window, absent when none is set.
+	Window *ReleaseWindowStatus `json:"window,omitempty"`
 }
 type ReleasePageInfo struct {
 	View      string `json:"view"`
@@ -201,6 +203,7 @@ func decodeReleasePage(raw json.RawMessage, task string, opts ReleaseListOptions
 			Snapshot  string  `json:"snapshot"`
 			NextAfter *string `json:"nextAfter"`
 		} `json:"page"`
+		Window *ReleaseWindowStatus `json:"window"`
 	}
 	err := json.Unmarshal(raw, &wire)
 	if err != nil {
@@ -209,7 +212,7 @@ func decodeReleasePage(raw json.RawMessage, task string, opts ReleaseListOptions
 	if wire.Page == nil || wire.Page.NextAfter == nil {
 		return out, fmt.Errorf("invalid release page metadata")
 	}
-	out = ReleasePage{Version: wire.Version, Jobs: wire.Jobs, Page: ReleasePageInfo{View: wire.Page.View, Limit: wire.Page.Limit, Snapshot: wire.Page.Snapshot, NextAfter: *wire.Page.NextAfter}}
+	out = ReleasePage{Version: wire.Version, Jobs: wire.Jobs, Page: ReleasePageInfo{View: wire.Page.View, Limit: wire.Page.Limit, Snapshot: wire.Page.Snapshot, NextAfter: *wire.Page.NextAfter}, Window: wire.Window}
 	view := opts.View
 	if view == "" {
 		view = "active"
@@ -320,17 +323,57 @@ type ReleaseRetry struct {
 // place in the queue. A request supplies Reason and UntilItems; the hub fills
 // the rest. UntilItems is the release condition: the hub lifts the hold once
 // every named item has a released or superseded job. Empty means until unhold.
+//
+// The hub itself holds a covered job inside the release quiet window: such a
+// hold has Window set and no agent, run or named items. Only unhold lifts it,
+// and only once the window has ended or is cleared.
 type ReleaseHold struct {
-	Reason     string   `json:"reason"`
-	UntilItems []string `json:"untilItems,omitempty"`
-	AgentID    string   `json:"agentId,omitempty"`
-	RunID      string   `json:"runId,omitempty"`
-	HeldAt     string   `json:"heldAt,omitempty"`
+	Reason     string             `json:"reason"`
+	UntilItems []string           `json:"untilItems,omitempty"`
+	AgentID    string             `json:"agentId,omitempty"`
+	RunID      string             `json:"runId,omitempty"`
+	HeldAt     string             `json:"heldAt,omitempty"`
+	Window     *ReleaseHoldWindow `json:"window,omitempty"`
+}
+
+// ReleaseWindow is the project's release quiet window, set only by the owner
+// (operations window-set and window-clear). From Start up to End, in Zone's
+// wall-clock time, a deployer cannot claim or batch a covered job, and the hub
+// holds a covered verified job. Start and End are "HH:MM"; Start after End
+// crosses midnight. A window-set supplies Zone, Start, End, Targets and
+// Reason, a window-clear Reason only; the hub fills SetAt and RequestID.
+type ReleaseWindow struct {
+	Zone      string   `json:"zone,omitempty"`
+	Start     string   `json:"start,omitempty"`
+	End       string   `json:"end,omitempty"`
+	Targets   []string `json:"targets,omitempty"`
+	Reason    string   `json:"reason"`
+	SetAt     string   `json:"setAt,omitempty"`
+	RequestID string   `json:"requestId,omitempty"`
+}
+
+// ReleaseWindowStatus is the saved window as a release page shows it: Open
+// while the hub's clock is inside it, and then Until, the end it runs to.
+type ReleaseWindowStatus struct {
+	ReleaseWindow
+	Open  bool   `json:"open"`
+	Until string `json:"until,omitempty"`
+}
+
+// ReleaseHoldWindow is the window that held a job and the end, RFC 3339 with
+// its offset, of the window then open.
+type ReleaseHoldWindow struct {
+	Zone    string   `json:"zone"`
+	Start   string   `json:"start"`
+	End     string   `json:"end"`
+	Targets []string `json:"targets"`
+	Until   string   `json:"until"`
 }
 
 // ReleaseHoldEvent is one hold or release in a job's hold history. Cause is
-// set on a release: "handler" for an unhold, "items_released" when the hub
-// lifted the hold because TriggerJobID settled the last named item.
+// "window" on a hold the release quiet window placed, and set on every
+// release: "handler" for an unhold, "items_released" when the hub lifted the
+// hold because TriggerJobID settled the last named item.
 // Generation is the job's generation after the event.
 type ReleaseHoldEvent struct {
 	Action       string   `json:"action"`
@@ -484,6 +527,7 @@ type ReleaseRequest struct {
 	HandRelease        *HandRelease           `json:"handRelease,omitempty"`
 	Retry              *ReleaseRetry          `json:"retry,omitempty"`
 	Hold               *ReleaseHold           `json:"hold,omitempty"`
+	Window             *ReleaseWindow         `json:"window,omitempty"`
 	Progress           *ReleaseProgress       `json:"progress,omitempty"`
 	// Refusal is accepted on a refuse only; a bare refuse leaves it out.
 	Refusal *ReleaseRefusal `json:"refusal,omitempty"`

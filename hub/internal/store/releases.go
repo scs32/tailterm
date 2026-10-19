@@ -58,7 +58,9 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  CREATE TABLE IF NOT EXISTS release_deployer_progress (
  task_id TEXT NOT NULL PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,
  reported_at TEXT NOT NULL DEFAULT '',record_json TEXT NOT NULL DEFAULT '',
- scan_seq INTEGER NOT NULL DEFAULT 0,code_seq INTEGER NOT NULL DEFAULT 0);`
+ scan_seq INTEGER NOT NULL DEFAULT 0,code_seq INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS release_windows (
+ task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),record_json TEXT NOT NULL);`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -202,11 +204,21 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 			return out, api.ErrInvalid
 		}
 	}
+	if err := s.sweepReleaseWindow(ctx, task); err != nil {
+		return out, err
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return out, err
 	}
 	defer tx.Rollback()
+	window, err := releaseWindowLoad(ctx, tx, task)
+	if err != nil {
+		return out, err
+	}
+	if window != nil {
+		out.Window = releaseWindowView(*window, s.now())
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT rowid,id,generation,state FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
 	if err != nil {
 		return out, err
@@ -712,6 +724,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if req.Refusal != nil && req.Operation != "refuse" {
 		return zero, api.ErrInvalid
 	}
+	// The owner's window setting has its own record and receipt; it is never
+	// rebuilt as a job.
+	if req.Operation == "window-set" || req.Operation == "window-clear" {
+		return zero, s.releaseWindowAction(ctx, task, req)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, err
@@ -838,7 +855,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 			if req.Operation == "hold" {
 				err = holdRelease(ctx, tx, task, &j, req, s.now())
-			} else {
+			} else if err = releaseWindowUnholdGate(ctx, tx, task, j, s.now()); err == nil {
 				err = unholdRelease(&j, req, s.now())
 			}
 			if err != nil {
@@ -986,6 +1003,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if j.State != "verified" {
 					return zero, releaseConflict("job cannot be taken over")
 				}
+				if err = releaseWindowClaimGate(ctx, tx, task, j, s.now()); err != nil {
+					return zero, err
+				}
 				e, p, r, eerr := releaseCandidate(ctx, tx, task, j.EntryID)
 				if eerr != nil {
 					return zero, eerr
@@ -1126,6 +1146,14 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 		}
 		j.Generation++
+	}
+	// W1: a handler operation that leaves its job verified and unclaimed
+	// inside the release quiet window saves it held instead.
+	switch req.Operation {
+	case "enqueue", "retry", "unhold", "reconcile", "set-aside":
+		if err = releaseWindowHoldOnWrite(ctx, tx, task, &j, s.now()); err != nil {
+			return zero, err
+		}
 	}
 	b, err := json.Marshal(j)
 	if err != nil {
@@ -1579,6 +1607,402 @@ func liftReleaseHold(j *api.ReleaseJob, event api.ReleaseHoldEvent) {
 	j.HoldHistory = append(j.HoldHistory, event)
 }
 
+// The release quiet window (wi_03dc6f7d365d6528, docs/project-deployment.md
+// "Release quiet window"): an owner-set daily span of wall-clock time in which
+// no covered job is claimed. The hub enforces it itself: a handler write that
+// leaves a covered job verified holds it (W1), a ledger list holds every
+// covered verified job (W2), and claim and batch-add refuse one (W3). A hold
+// it places stays until an explicit unhold after the window ends.
+
+// releaseWindowTargetSets are the target sets a window may cover, in target
+// order. Before its checkout the hub cannot tell hub, bridge and mini apart
+// (see releasePathClass), so they are covered together or not at all.
+var releaseWindowTargetSets = [][]string{{"hub", "bridge", "mini"}, {"hub", "bridge", "mini", "tailos"}, {"tailos"}}
+
+var releaseWindowClockText = regexp.MustCompile(`^([01][0-9]|2[0-3]):([0-5][0-9])$`)
+
+// releaseWindow is a saved window with its zone loaded and its bounds in
+// minutes since local midnight.
+type releaseWindow struct {
+	api.ReleaseWindow
+	loc        *time.Location
+	start, end int
+}
+
+func releaseWindowClock(s string) (int, bool) {
+	m := releaseWindowClockText.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	h, _ := strconv.Atoi(m[1])
+	mm, _ := strconv.Atoi(m[2])
+	return h*60 + mm, true
+}
+
+// parseReleaseWindow checks a window's zone, bounds and targets and returns it
+// with its targets in target order. The zone is a named IANA zone, never UTC
+// by default or the hub's Local.
+func parseReleaseWindow(in api.ReleaseWindow) (releaseWindow, error) {
+	invalid := func(why string) (releaseWindow, error) {
+		return releaseWindow{}, fmt.Errorf("%w: release quiet window: %s", api.ErrInvalid, why)
+	}
+	if in.Zone == "" {
+		return invalid("zone required, an IANA name such as America/Los_Angeles")
+	}
+	loc, err := interventionLocation(in.Zone)
+	if err != nil {
+		return invalid("unknown zone " + strconv.Quote(in.Zone) + "; use an IANA name such as America/Los_Angeles")
+	}
+	start, ok := releaseWindowClock(in.Start)
+	end, ok2 := releaseWindowClock(in.End)
+	if !ok || !ok2 {
+		return invalid("start and end are 24-hour HH:MM, 00:00 to 23:59")
+	}
+	if start == end {
+		return invalid("start and end must differ")
+	}
+	seen := map[string]bool{}
+	for _, t := range in.Targets {
+		if !slices.Contains(releaseTargetNames, t) || seen[t] {
+			return invalid("targets must be hub,bridge,mini or hub,bridge,mini,tailos or tailos, each named once")
+		}
+		seen[t] = true
+	}
+	targets := []string{}
+	for _, name := range releaseTargetNames {
+		if seen[name] {
+			targets = append(targets, name)
+		}
+	}
+	if !slices.ContainsFunc(releaseWindowTargetSets, func(set []string) bool { return slices.Equal(set, targets) }) {
+		return invalid("targets must be hub,bridge,mini or hub,bridge,mini,tailos or tailos, each named once")
+	}
+	w := in
+	w.Targets = targets
+	return releaseWindow{ReleaseWindow: w, loc: loc, start: start, end: end}, nil
+}
+
+// releaseWindowLoad returns the project's saved window, or nil.
+func releaseWindowLoad(ctx context.Context, q queryRower, task string) (*releaseWindow, error) {
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT record_json FROM release_windows WHERE task_id=?`, task).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var saved api.ReleaseWindow
+	if err = json.Unmarshal([]byte(raw), &saved); err != nil {
+		return nil, err
+	}
+	w, err := parseReleaseWindow(saved)
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+// releaseWindowInside reports whether now is inside the window by wall-clock
+// time in its zone: the start minute is inside, the end minute outside. A
+// window whose start is after its end crosses midnight. On a fall-back night
+// both repeated hours are inside a window that covers them; a bound in a
+// skipped hour still divides the clock, so the next existing minute counts.
+func releaseWindowInside(w releaseWindow, now time.Time) bool {
+	l := now.In(w.loc)
+	m := l.Hour()*60 + l.Minute()
+	if w.start < w.end {
+		return w.start <= m && m < w.end
+	}
+	return m >= w.start || m < w.end
+}
+
+// releaseWindowUntil is the first end wall-clock time after now, on the local
+// date of now or the next one (a calendar day, not 24 hours, across DST).
+func releaseWindowUntil(w releaseWindow, now time.Time) time.Time {
+	l := now.In(w.loc)
+	end := time.Date(l.Year(), l.Month(), l.Day(), w.end/60, w.end%60, 0, 0, w.loc)
+	if !end.After(now) {
+		end = time.Date(l.Year(), l.Month(), l.Day()+1, w.end/60, w.end%60, 0, 0, w.loc)
+	}
+	return end
+}
+
+// releasePathClass sorts a changed path by what the release runner would
+// deploy for it: "none" (no target), "tailos" (TailOS only) or "service"
+// (hub, bridge, mini or the deployer itself). The runner's real map is
+// targetsForPaths in scripts/release-targets.mjs, which the hub cannot run.
+// Drift rule: the none and tailos lists here may only be subsets of that
+// file's no-target and TailOS-only rules. Any other path, an unknown or
+// invalid one included, is service, so a missing rule holds a job and never
+// releases one.
+func releasePathClass(p string) string {
+	if p == "" || strings.HasPrefix(p, "/") || slices.Contains(strings.Split(p, "/"), "..") || strings.ContainsAny(p, "\x00\r\n") {
+		return "service"
+	}
+	base := p[strings.LastIndex(p, "/")+1:]
+	root := !strings.Contains(p, "/")
+	switch {
+	case strings.HasPrefix(p, "docs/"), strings.HasPrefix(p, "tests/"), strings.HasPrefix(p, "verification/"), strings.HasSuffix(p, "_test.go"), base == "AGENTS.md", p == "LICENSE", p == "README.md", p == "hub/README.md":
+		return "none"
+	case strings.HasPrefix(p, "client/"), strings.HasPrefix(p, "wasm/"), strings.HasPrefix(p, "public/"), strings.HasPrefix(p, "shared/"), p == "package.json", p == "package-lock.json", p == "index.html", root && strings.HasPrefix(p, "vite") && strings.HasSuffix(p, ".js"):
+		return "tailos"
+	}
+	return "service"
+}
+
+// releaseWindowCovers reports whether the window covers a job that changed
+// these paths: the verifier's diff saved in its plan. An empty list is unknown
+// and covered; a service path is covered by every window, a TailOS path only
+// when the window names tailos.
+func releaseWindowCovers(w releaseWindow, changed []string) bool {
+	if len(changed) == 0 {
+		return true
+	}
+	tailos := slices.Contains(w.Targets, "tailos")
+	for _, p := range changed {
+		switch releasePathClass(p) {
+		case "service":
+			return true
+		case "tailos":
+			if tailos {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// releaseWindowText names the window as its refusals and holds do.
+func releaseWindowText(w releaseWindow) string {
+	return "release quiet window " + w.Start + "-" + w.End + " " + w.Zone + " covers " + strings.Join(w.Targets, ", ")
+}
+
+func releaseWindowView(w releaseWindow, now time.Time) *api.ReleaseWindowStatus {
+	out := &api.ReleaseWindowStatus{ReleaseWindow: w.ReleaseWindow, Open: releaseWindowInside(w, now)}
+	if out.Open {
+		out.Until = releaseWindowUntil(w, now).Format(time.RFC3339)
+	}
+	return out
+}
+
+// releaseWindowOpen returns the project's window when one is set and now is
+// inside it, else nil.
+func releaseWindowOpen(ctx context.Context, q queryRower, task string, now time.Time) (*releaseWindow, error) {
+	w, err := releaseWindowLoad(ctx, q, task)
+	if err != nil || w == nil || !releaseWindowInside(*w, now) {
+		return nil, err
+	}
+	return w, nil
+}
+
+// releaseWindowHoldable reports whether the window may hold j: a covered
+// verified job no deployer holds, outside any active batch, and not requeued
+// with a host release lock, which holdRelease refuses for the same reason.
+func releaseWindowHoldable(w releaseWindow, j api.ReleaseJob) bool {
+	if j.State != "verified" || j.AgentID != "" || !releaseWindowCovers(w, j.Plan.Changed) {
+		return false
+	}
+	n := len(j.Reconciliations)
+	return n == 0 || j.Reconciliations[n-1].LockDigest == ""
+}
+
+// releaseWindowHold saves the window's hold on j at the generation the job
+// has after the event.
+func releaseWindowHold(w releaseWindow, j *api.ReleaseJob, generation int64, now time.Time) {
+	until := releaseWindowUntil(w, now).Format(time.RFC3339)
+	reason := releaseWindowText(w) + "; held until an explicit unhold after " + until
+	at := ts(now)
+	j.State = "held"
+	j.Hold = &api.ReleaseHold{Reason: reason, HeldAt: at, Window: &api.ReleaseHoldWindow{Zone: w.Zone, Start: w.Start, End: w.End, Targets: slices.Clone(w.Targets), Until: until}}
+	j.HoldHistory = append(j.HoldHistory, api.ReleaseHoldEvent{Action: "hold", Cause: "window", Reason: reason, Generation: generation, At: at})
+}
+
+// releaseWindowHoldOnWrite is W1: j, about to be saved at its generation,
+// is held when the window is open and may hold it.
+func releaseWindowHoldOnWrite(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, now time.Time) error {
+	if j.State != "verified" {
+		return nil
+	}
+	w, err := releaseWindowOpen(ctx, tx, task, now)
+	if err != nil || w == nil || !releaseWindowHoldable(*w, *j) {
+		return err
+	}
+	releaseWindowHold(*w, j, j.Generation, now)
+	return nil
+}
+
+// releaseWindowClaimGate is W3: inside the window a covered job cannot be
+// claimed or added to a batch.
+func releaseWindowClaimGate(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, now time.Time) error {
+	w, err := releaseWindowOpen(ctx, tx, task, now)
+	if err != nil || w == nil || !releaseWindowCovers(*w, j.Plan.Changed) {
+		return err
+	}
+	return releaseConflict("job " + j.ID + " is inside the " + releaseWindowText(*w) + " until " + releaseWindowUntil(*w, now).Format(time.RFC3339) + "; the hub holds it at the next list, and it needs an explicit unhold after the window ends")
+}
+
+// releaseWindowUnholdGate refuses the unhold of a window hold while a window
+// is open: the hold names when the window ends, and only then is it lifted.
+func releaseWindowUnholdGate(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, now time.Time) error {
+	if j.State != "held" || j.Hold == nil || j.Hold.Window == nil {
+		return nil
+	}
+	w, err := releaseWindowOpen(ctx, tx, task, now)
+	if err != nil || w == nil {
+		return err
+	}
+	return releaseConflict("job " + j.ID + " is on a release quiet window hold until " + releaseWindowUntil(*w, now).Format(time.RFC3339) + "; unhold it after the window ends, or the owner clears the window first")
+}
+
+// sweepReleaseWindow is W2, run before a ledger list: while the window is
+// open it holds every job the window may hold that is not in an active batch.
+// A job verified before the window opened, or returned to verified at night
+// by unclaim, a batch dissolve or a lifted hold, is held before the runner
+// reads the list it claims from. It writes nothing outside the window.
+func (s *Store) sweepReleaseWindow(ctx context.Context, task string) error {
+	if w, err := releaseWindowOpen(ctx, s.db, task, s.now()); err != nil || w == nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := s.now()
+	w, err := releaseWindowOpen(ctx, tx, task, now)
+	if err != nil || w == nil {
+		return err
+	}
+	var batched []string
+	b, err := scanReleaseBatch(ctx, tx, task, tx.QueryRowContext(ctx, `SELECT `+releaseBatchCols+` FROM release_batches WHERE task_id=? AND state IN ('open','published','held')`, task))
+	if err != nil {
+		return err
+	}
+	if b != nil {
+		batched = append(batched, b.LeadJobID)
+		for _, row := range b.Jobs {
+			batched = append(batched, row.JobID)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? AND state='verified' ORDER BY rowid`, task)
+	if err != nil {
+		return err
+	}
+	var held []api.ReleaseJob
+	for rows.Next() {
+		var raw string
+		var j api.ReleaseJob
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &j)
+		}
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if !slices.Contains(batched, j.ID) && releaseWindowHoldable(*w, j) {
+			held = append(held, j)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || len(held) == 0 {
+		return err
+	}
+	for i := range held {
+		j := &held[i]
+		j.Generation++
+		releaseWindowHold(*w, j, j.Generation, now)
+		raw, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, j.State, j.Generation, string(raw), task, j.ID); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.notify(task)
+	return nil
+}
+
+// releaseWindowAction saves or clears the owner's window. Owner-only means a
+// request without an agent identity, the rule of RecordHandRelease. A clear
+// releases no hold already saved.
+func (s *Store) releaseWindowAction(ctx context.Context, task string, req api.ReleaseRequest) error {
+	if req.AgentID != "" || req.RunID != "" {
+		return releaseConflict("only the owner sets the release quiet window")
+	}
+	in := req.Window
+	if in == nil || !releaseText(in.Reason) || in.SetAt != "" || in.RequestID != "" {
+		return api.ErrInvalid
+	}
+	var w releaseWindow
+	if req.Operation == "window-set" {
+		var err error
+		if w, err = parseReleaseWindow(*in); err != nil {
+			return err
+		}
+	} else if in.Zone != "" || in.Start != "" || in.End != "" || len(in.Targets) > 0 {
+		return fmt.Errorf("%w: release quiet window: a clear takes only a reason", api.ErrInvalid)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	hash := verificationDigest(req)
+	var prior string
+	err = tx.QueryRowContext(ctx, `SELECT payload_hash FROM release_action_receipts WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior)
+	if err == nil {
+		if hash != prior {
+			return releaseConflict("retry changed")
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var state string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, task).Scan(&state); errors.Is(err, sql.ErrNoRows) {
+		return api.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if state != api.TaskOpen {
+		return api.ErrClosed
+	}
+	var record []byte
+	if req.Operation == "window-set" {
+		w.SetAt = ts(s.now())
+		w.RequestID = req.RequestID
+		if record, err = json.Marshal(w.ReleaseWindow); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO release_windows(task_id,record_json) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET record_json=excluded.record_json`, task, string(record))
+	} else {
+		if record, err = json.Marshal(map[string]any{"cleared": true, "reason": in.Reason}); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM release_windows WHERE task_id=?`, task)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(record)); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.notify(task)
+	return nil
+}
+
 // releaseItemsSettled reports whether every item has a released or
 // superseded release job in the project.
 func releaseItemsSettled(ctx context.Context, q queryRower, task string, items []string) (bool, error) {
@@ -1875,6 +2299,9 @@ func releaseBatchAction(ctx context.Context, tx *sql.Tx, task string, req api.Re
 		}
 		if member.State != "verified" || member.AgentID != "" || member.IntegratedCommit != "" || member.InputsDigest != "" || member.Published || member.Receipt != nil {
 			return "", releaseConflict("job " + id + " is not an unclaimed verified job")
+		}
+		if err = releaseWindowClaimGate(ctx, tx, task, member, now); err != nil {
+			return "", err
 		}
 		if member.PauseGeneration != generation {
 			return "", releaseConflict("project generation changed for job " + id)

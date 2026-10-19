@@ -5926,3 +5926,534 @@ func TestRefusedJobsSurviveMigrationWithoutRefusal(t *testing.T) {
 	defer s.Close()
 	check(s)
 }
+
+// Release quiet window (wi_03dc6f7d365d6528). Times are America/Los_Angeles.
+var windowZone = func() *time.Location {
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		panic(err)
+	}
+	return loc
+}()
+
+func windowAt(s string) time.Time {
+	at, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return at
+}
+
+// setWindowClock moves the store clock and the deployer's heartbeat to at.
+func setWindowClock(t *testing.T, s *Store, d api.Agent, at time.Time) {
+	t.Helper()
+	s.now = func() time.Time { return at }
+	if _, err := s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(at), d.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func windowSet(key, start, end string, targets ...string) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: "window-set", Window: &api.ReleaseWindow{Zone: "America/Los_Angeles", Start: start, End: end, Targets: targets, Reason: "No releases overnight"}}
+}
+
+func setNightWindow(t *testing.T, s *Store, task api.Task, targets ...string) {
+	t.Helper()
+	if len(targets) == 0 {
+		targets = []string{"hub", "bridge", "mini"}
+	}
+	if _, err := s.ReleaseAction(context.Background(), task.ID, windowSet("night-window", "22:00", "07:00", targets...)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// releaseEntryChanged is releaseEntry whose verification plan records these
+// changed paths, with the receipt rebound to the changed plan.
+func releaseEntryChanged(t *testing.T, s *Store, task api.Task, title, requestID string, changed ...string) string {
+	t.Helper()
+	entry := releaseEntry(t, s, task, title, requestID)
+	var item string
+	if err := s.db.QueryRow(`SELECT item_id FROM team_queue_entries WHERE id=?`, entry).Scan(&item); err != nil {
+		t.Fatal(err)
+	}
+	var plan *api.VerificationPlan
+	for _, kind := range []string{"plan", "receipt"} {
+		var gen int64
+		var raw string
+		if err := s.db.QueryRow(`SELECT generation,record_json FROM verification_records WHERE task_id=? AND item_id=? AND kind=? ORDER BY generation DESC LIMIT 1`, task.ID, item, kind).Scan(&gen, &raw); err != nil {
+			t.Fatal(err)
+		}
+		var record api.VerificationRecord
+		if err := json.Unmarshal([]byte(raw), &record); err != nil {
+			t.Fatal(err)
+		}
+		if kind == "plan" {
+			record.Plan.Changed = changed
+			plan = record.Plan
+		} else {
+			record.Receipt.PlanDigest = verificationDigest(*plan)
+		}
+		b, _ := json.Marshal(record)
+		if _, err := s.db.Exec(`UPDATE verification_records SET record_json=? WHERE task_id=? AND item_id=? AND generation=?`, string(b), task.ID, item, gen); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return entry
+}
+
+func windowEnqueue(t *testing.T, s *Store, task api.Task, h api.Agent, key, entry string) api.ReleaseJob {
+	t.Helper()
+	j, err := s.ReleaseAction(context.Background(), task.ID, api.ReleaseRequest{RequestID: key, Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+func windowPage(t *testing.T, s *Store, task api.Task) api.ReleasePage {
+	t.Helper()
+	page, err := s.ReleasesPage(context.Background(), task.ID, api.ReleaseListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return page
+}
+
+func pageJob(t *testing.T, page api.ReleasePage, id string) api.ReleaseSummary {
+	t.Helper()
+	for _, j := range page.Jobs {
+		if j.ID == id {
+			return j
+		}
+	}
+	t.Fatalf("job %s not on the page", id)
+	return api.ReleaseSummary{}
+}
+
+// a5, a6: wall-clock membership, the end time across DST, and the fail-closed
+// path classes (a4).
+func TestReleaseWindowClockAndCoverage(t *testing.T) {
+	night, err := parseReleaseWindow(api.ReleaseWindow{Zone: "America/Los_Angeles", Start: "22:00", End: "07:00", Targets: []string{"hub", "bridge", "mini"}, Reason: "night"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	day, err := parseReleaseWindow(api.ReleaseWindow{Zone: "America/Los_Angeles", Start: "09:00", End: "17:00", Targets: []string{"tailos"}, Reason: "day"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spring, err := parseReleaseWindow(api.ReleaseWindow{Zone: "America/Los_Angeles", Start: "02:30", End: "04:00", Targets: []string{"tailos"}, Reason: "spring"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		w    releaseWindow
+		at   string
+		want bool
+	}{
+		{night, "2026-10-18T21:59:00-07:00", false},
+		{night, "2026-10-18T22:00:00-07:00", true},
+		{night, "2026-10-18T23:30:00-07:00", true},
+		{night, "2026-10-19T06:59:00-07:00", true},
+		{night, "2026-10-19T07:00:00-07:00", false},
+		// Fall back: both 01:30s are inside.
+		{night, "2026-11-01T01:30:00-07:00", true},
+		{night, "2026-11-01T01:30:00-08:00", true},
+		{night, "2026-11-01T07:00:00-08:00", false},
+		{day, "2026-10-19T08:59:00-07:00", false},
+		{day, "2026-10-19T09:00:00-07:00", true},
+		{day, "2026-10-19T16:59:00-07:00", true},
+		{day, "2026-10-19T17:00:00-07:00", false},
+		// Spring forward: 02:30 never happens; 03:15 PDT is inside.
+		{spring, "2027-03-14T03:15:00-07:00", true},
+		{spring, "2027-03-14T01:59:00-08:00", false},
+		{spring, "2027-03-14T04:00:00-07:00", false},
+	} {
+		if got := releaseWindowInside(c.w, windowAt(c.at)); got != c.want {
+			t.Errorf("%s-%s at %s: inside %v, want %v", c.w.Start, c.w.End, c.at, got, c.want)
+		}
+	}
+	for _, c := range []struct{ at, until string }{
+		{"2026-10-18T23:30:00-07:00", "2026-10-19T07:00:00-07:00"},
+		{"2026-10-19T06:59:00-07:00", "2026-10-19T07:00:00-07:00"},
+		{"2026-10-31T23:00:00-07:00", "2026-11-01T07:00:00-08:00"},
+		{"2026-11-01T01:30:00-07:00", "2026-11-01T07:00:00-08:00"},
+		{"2026-11-01T01:30:00-08:00", "2026-11-01T07:00:00-08:00"},
+		{"2027-03-13T23:00:00-08:00", "2027-03-14T07:00:00-07:00"},
+	} {
+		if got := releaseWindowUntil(night, windowAt(c.at)).Format(time.RFC3339); got != c.until {
+			t.Errorf("until at %s: %s, want %s", c.at, got, c.until)
+		}
+	}
+	// The fall-back night is 10 real hours long, the spring-forward night 8.
+	if d := releaseWindowUntil(night, windowAt("2026-10-31T22:00:00-07:00")).Sub(windowAt("2026-10-31T22:00:00-07:00")); d != 10*time.Hour {
+		t.Errorf("fall-back night %v", d)
+	}
+	if d := releaseWindowUntil(night, windowAt("2027-03-13T22:00:00-08:00")).Sub(windowAt("2027-03-13T22:00:00-08:00")); d != 8*time.Hour {
+		t.Errorf("spring-forward night %v", d)
+	}
+	withTailOS := night
+	withTailOS.Targets = []string{"hub", "bridge", "mini", "tailos"}
+	tailosOnly := day
+	for _, c := range []struct {
+		name                     string
+		changed                  []string
+		service, all, tailosOnly bool
+	}{
+		{"empty is unknown", nil, true, true, true},
+		{"new folder", []string{"newdir/x"}, true, true, true},
+		{"runner", []string{"scripts/release-runner.mjs"}, true, true, true},
+		{"store", []string{"hub/internal/store/x.go"}, true, true, true},
+		{"tt", []string{"hub/cmd/tt/deployment.go"}, true, true, true},
+		{"invalid path", []string{"../x"}, true, true, true},
+		{"docs and tests", []string{"docs/a.md", "hub/internal/store/a_test.go", "tests/a.mjs", "verification/x.json", "client/AGENTS.md", "LICENSE", "README.md", "hub/README.md"}, false, false, false},
+		{"client", []string{"client/a.js"}, false, true, true},
+		{"tailos files", []string{"wasm/a", "public/a", "shared/a.js", "package.json", "package-lock.json", "index.html", "vite.config.js"}, false, true, true},
+		{"nested readme", []string{"client/README.md"}, false, true, true},
+		{"nested vite", []string{"tools/vite.config.js"}, true, true, true},
+		{"docs then service", []string{"docs/a.md", "hub/go.mod"}, true, true, true},
+	} {
+		if got := releaseWindowCovers(night, c.changed); got != c.service {
+			t.Errorf("%s: hub,bridge,mini covers %v, want %v", c.name, got, c.service)
+		}
+		if got := releaseWindowCovers(withTailOS, c.changed); got != c.all {
+			t.Errorf("%s: all targets covers %v, want %v", c.name, got, c.all)
+		}
+		if got := releaseWindowCovers(tailosOnly, c.changed); got != c.tailosOnly {
+			t.Errorf("%s: tailos covers %v, want %v", c.name, got, c.tailosOnly)
+		}
+	}
+}
+
+// a1: only the owner saves the window; a request ID replays; bad values are
+// refused; a clear removes it.
+func TestReleaseWindowSetReplayClearAndRefusals(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setWindowClock(t, s, d, windowAt("2026-10-18T12:00:00-07:00"))
+	if page := windowPage(t, s, task); page.Window != nil {
+		t.Fatalf("window before any set %+v", page.Window)
+	}
+	set := windowSet("window", "22:00", "07:00", "mini", "hub", "bridge")
+	if _, err := s.ReleaseAction(ctx, task.ID, set); err != nil {
+		t.Fatal(err)
+	}
+	w := windowPage(t, s, task).Window
+	if w == nil || w.Zone != "America/Los_Angeles" || w.Start != "22:00" || w.End != "07:00" || !slices.Equal(w.Targets, []string{"hub", "bridge", "mini"}) || w.Reason != "No releases overnight" || w.SetAt != ts(s.now()) || w.RequestID != "window" || w.Open || w.Until != "" {
+		t.Fatalf("saved window %+v", w)
+	}
+	if _, err := s.ReleaseAction(ctx, task.ID, set); err != nil {
+		t.Fatal("replay", err)
+	}
+	changed := windowSet("window", "23:00", "07:00", "hub", "bridge", "mini")
+	if _, err := s.ReleaseAction(ctx, task.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed retry", err)
+	}
+	for name, who := range map[string]api.Agent{"handler": h, "deployer": d} {
+		req := windowSet("window-"+name, "21:00", "07:00", "hub", "bridge", "mini")
+		req.AgentID, req.RunID = who.ID, who.RunID
+		if _, err := s.ReleaseAction(ctx, task.ID, req); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only the owner sets the release quiet window") {
+			t.Fatal(name, err)
+		}
+	}
+	for name, edit := range map[string]func(*api.ReleaseWindow){
+		"no zone":           func(w *api.ReleaseWindow) { w.Zone = "" },
+		"Local":             func(w *api.ReleaseWindow) { w.Zone = "Local" },
+		"unknown zone":      func(w *api.ReleaseWindow) { w.Zone = "Mars/Olympus" },
+		"24:00":             func(w *api.ReleaseWindow) { w.End = "24:00" },
+		"7:00":              func(w *api.ReleaseWindow) { w.End = "7:00" },
+		"start equals end":  func(w *api.ReleaseWindow) { w.End = "22:00" },
+		"hub alone":         func(w *api.ReleaseWindow) { w.Targets = []string{"hub"} },
+		"duplicate target":  func(w *api.ReleaseWindow) { w.Targets = []string{"mini", "hub", "bridge", "hub"} },
+		"unknown target":    func(w *api.ReleaseWindow) { w.Targets = []string{"hub", "bridge", "mini", "deployer"} },
+		"no targets":        func(w *api.ReleaseWindow) { w.Targets = nil },
+		"bridge and tailos": func(w *api.ReleaseWindow) { w.Targets = []string{"bridge", "tailos"} },
+		"no reason":         func(w *api.ReleaseWindow) { w.Reason = "" },
+		"hub fields":        func(w *api.ReleaseWindow) { w.SetAt = "2026-10-18T00:00:00Z" },
+	} {
+		req := windowSet("bad-"+strings.ReplaceAll(name, " ", "-"), "22:00", "07:00", "hub", "bridge", "mini")
+		edit(req.Window)
+		if _, err := s.ReleaseAction(ctx, task.ID, req); !errors.Is(err, api.ErrInvalid) {
+			t.Error(name, err)
+		}
+	}
+	if w = windowPage(t, s, task).Window; w == nil || w.RequestID != "window" {
+		t.Fatalf("a refused request changed the window %+v", w)
+	}
+	clear := api.ReleaseRequest{RequestID: "clear", Operation: "window-clear", Window: &api.ReleaseWindow{Reason: "Owner releases tonight"}}
+	bad := clear
+	bad.RequestID = "clear-bad"
+	bad.Window = &api.ReleaseWindow{Reason: "x", Start: "22:00"}
+	if _, err := s.ReleaseAction(ctx, task.ID, bad); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("clear with bounds", err)
+	}
+	if _, err := s.ReleaseAction(ctx, task.ID, clear); err != nil {
+		t.Fatal(err)
+	}
+	if w = windowPage(t, s, task).Window; w != nil {
+		t.Fatalf("window after clear %+v", w)
+	}
+	if _, err := s.ReleaseAction(ctx, task.ID, clear); err != nil {
+		t.Fatal("clear replay", err)
+	}
+}
+
+// a2, a7: a covered job verified inside the window is saved held with the
+// window and its end; claim is refused; list and detail show both.
+func TestReleaseWindowHoldsJobVerifiedInside(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	store := releaseEntryChanged(t, s, task, "store change", "store-change", "hub/internal/store/x.go")
+	for _, c := range []struct{ name, entry string }{{"no-changed-paths", entry}, {"store-path", store}} {
+		j := windowEnqueue(t, s, task, h, "enqueue-"+c.name, c.entry)
+		hold := j.Hold
+		if j.State != "held" || j.Generation != 1 || hold == nil || hold.Window == nil || hold.AgentID != "" || hold.RunID != "" || len(hold.UntilItems) > 0 || hold.HeldAt != ts(s.now()) {
+			t.Fatalf("%s: job %+v hold %+v", c.name, j, hold)
+		}
+		if w := hold.Window; w.Zone != "America/Los_Angeles" || w.Start != "22:00" || w.End != "07:00" || !slices.Equal(w.Targets, []string{"hub", "bridge", "mini"}) || w.Until != "2026-10-19T07:00:00-07:00" {
+			t.Fatalf("%s: hold window %+v", c.name, w)
+		}
+		for _, part := range []string{"22:00-07:00", "America/Los_Angeles", "2026-10-19T07:00:00-07:00", "explicit unhold"} {
+			if !strings.Contains(hold.Reason, part) {
+				t.Fatalf("%s: reason %q lacks %q", c.name, hold.Reason, part)
+			}
+		}
+		if n := len(j.HoldHistory); n != 1 || j.HoldHistory[0].Action != "hold" || j.HoldHistory[0].Cause != "window" || j.HoldHistory[0].Reason != hold.Reason || j.HoldHistory[0].Generation != 1 {
+			t.Fatalf("%s: history %+v", c.name, j.HoldHistory)
+		}
+		if _, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-"+c.name, d, j)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "owner hold (release quiet window 22:00-07:00") {
+			t.Fatal(c.name, "claim", err)
+		}
+		page := windowPage(t, s, task)
+		if page.Window == nil || !page.Window.Open || page.Window.Until != "2026-10-19T07:00:00-07:00" {
+			t.Fatalf("page window %+v", page.Window)
+		}
+		if listed := pageJob(t, page, j.ID); listed.State != "held" || listed.Hold == nil || listed.Hold.Window == nil || listed.Hold.Window.Until != hold.Window.Until {
+			t.Fatalf("%s: listed %+v", c.name, listed)
+		}
+		detail, err := s.Release(ctx, task.ID, j.ID)
+		if err != nil || detail.Hold == nil || detail.Hold.Window == nil || detail.HoldHistory[len(detail.HoldHistory)-1].Cause != "window" {
+			t.Fatal(c.name, "detail", detail.Hold, err)
+		}
+		// The JSON tt deployment list and get print carry the window.
+		raw, _ := json.Marshal(page)
+		for _, field := range []string{`"window":{"zone":"America/Los_Angeles","start":"22:00","end":"07:00","targets":["hub","bridge","mini"],"reason":"No releases overnight","setAt":`, `"open":true,"until":"2026-10-19T07:00:00-07:00"}`, `"hold":{"reason":"release quiet window`} {
+			if !strings.Contains(string(raw), field) {
+				t.Fatalf("page JSON lacks %s: %s", field, raw)
+			}
+		}
+		raw, _ = json.Marshal(detail)
+		if !strings.Contains(string(raw), `"window":{"zone":"America/Los_Angeles","start":"22:00","end":"07:00","targets":["hub","bridge","mini"],"until":"2026-10-19T07:00:00-07:00"}`) || !strings.Contains(string(raw), `"cause":"window"`) {
+			t.Fatalf("detail JSON %s", raw)
+		}
+	}
+}
+
+// a3: a job verified before the window is refused at claim inside it and
+// held by the next list; a batch cannot take a covered member inside it.
+func TestReleaseWindowRefusesClaimOfJobVerifiedBefore(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	j := windowEnqueue(t, s, task, h, "enqueue", entry)
+	if j.State != "verified" || j.Hold != nil {
+		t.Fatalf("job verified outside the window %+v", j)
+	}
+	if page := windowPage(t, s, task); page.Window == nil || page.Window.Open || pageJob(t, page, j.ID).State != "verified" {
+		t.Fatalf("list outside the window %+v", page)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T22:30:00-07:00"))
+	_, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim", d, j))
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window 22:00-07:00 America/Los_Angeles") || !strings.Contains(err.Error(), "until 2026-10-19T07:00:00-07:00") {
+		t.Fatal("claim inside the window", err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, j.ID); err != nil || saved.State != "verified" || saved.Generation != j.Generation || saved.AgentID != "" {
+		t.Fatal("refused claim changed the job", saved, err)
+	}
+	listed := pageJob(t, windowPage(t, s, task), j.ID)
+	if listed.State != "held" || listed.Generation != j.Generation+1 || listed.Hold == nil || listed.Hold.Window == nil || listed.Hold.Window.Until != "2026-10-19T07:00:00-07:00" {
+		t.Fatalf("swept job %+v", listed)
+	}
+	saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+	if err != nil || len(saved.HoldHistory) != 1 || saved.HoldHistory[0].Cause != "window" || saved.HoldHistory[0].Generation != j.Generation+1 {
+		t.Fatal("swept history", saved.HoldHistory, err)
+	}
+	if again := pageJob(t, windowPage(t, s, task), j.ID); again.Generation != listed.Generation {
+		t.Fatal("a second list wrote the held job again", again.Generation)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-held", d, saved)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is on an owner hold") {
+		t.Fatal("claim of the swept job", err)
+	}
+
+	// The lead was claimed and its batch opened at 21:50, with one member;
+	// inside the window another covered member is refused.
+	f := newBatchFixture(t, 2)
+	setNightWindow(t, f.s, f.task)
+	setWindowClock(t, f.s, f.d, windowAt("2026-10-18T21:50:00-07:00"))
+	if _, err = f.deployer("batch-open", "", batchBase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", f.lead.EntryID, batchTo(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", f.members[0].EntryID, batchTo(2)); err != nil {
+		t.Fatal(err)
+	}
+	setWindowClock(t, f.s, f.d, windowAt("2026-10-18T22:30:00-07:00"))
+	if _, err = f.deployer("batch-add", f.members[1].EntryID, candidateA); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window 22:00-07:00") || !strings.Contains(err.Error(), "until 2026-10-19T07:00:00-07:00") {
+		t.Fatal("batch-add of a covered member", err)
+	}
+	// The open batch keeps its member out of the sweep; the refused one is held.
+	page := windowPage(t, f.s, f.task)
+	if m := pageJob(t, page, f.members[0].ID); m.State != "verified" {
+		t.Fatalf("batch member %+v", m)
+	}
+	if m := pageJob(t, page, f.members[1].ID); m.State != "held" {
+		t.Fatalf("refused member %+v", m)
+	}
+	if lead := pageJob(t, page, f.lead.ID); lead.State != "claimed" {
+		t.Fatalf("lead %+v", lead)
+	}
+}
+
+// a4: a job with no covered target passes the window.
+func TestReleaseWindowPassesUncoveredJobs(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	docs := windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryChanged(t, s, task, "docs change", "docs-change", "docs/a.md", "hub/internal/store/a_test.go"))
+	client := windowEnqueue(t, s, task, h, "enqueue-client", releaseEntryChanged(t, s, task, "client change", "client-change", "client/a.js"))
+	for _, j := range []api.ReleaseJob{docs, client} {
+		if j.State != "verified" || j.Hold != nil {
+			t.Fatalf("uncovered job held %+v", j)
+		}
+		if listed := pageJob(t, windowPage(t, s, task), j.ID); listed.State != "verified" || listed.Generation != j.Generation {
+			t.Fatalf("uncovered job swept %+v", listed)
+		}
+	}
+	claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-docs", d, docs))
+	if err != nil || claimed.State != "claimed" {
+		t.Fatal("claim of a docs job", err)
+	}
+
+	// Under a window that names tailos, the client job is held.
+	s, task, h, d, _ = releaseFixture(t)
+	setNightWindow(t, s, task, "hub", "bridge", "mini", "tailos")
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	docs = windowEnqueue(t, s, task, h, "enqueue-docs", releaseEntryChanged(t, s, task, "docs change", "docs-change", "docs/a.md"))
+	client = windowEnqueue(t, s, task, h, "enqueue-client", releaseEntryChanged(t, s, task, "client change", "client-change", "client/a.js"))
+	if docs.State != "verified" || client.State != "held" || !slices.Equal(client.Hold.Window.Targets, []string{"hub", "bridge", "mini", "tailos"}) {
+		t.Fatalf("docs %s client %s", docs.State, client.State)
+	}
+}
+
+// a5: the window's end lifts nothing; unhold waits for it and then returns
+// the job in its queue order; a non-window hold unheld inside is held again.
+func TestReleaseWindowEndNeedsExplicitUnhold(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 2)
+	ctx := context.Background()
+	a, b := jobs[0], jobs[1]
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	page := windowPage(t, s, task)
+	a, err := releaseLoad(ctx, s.db, task.ID, a.ID)
+	if err != nil || a.State != "held" || pageJob(t, page, b.ID).State != "held" {
+		t.Fatal("sweep", a.State, err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-19T06:59:00-07:00"))
+	if _, err = s.ReleaseAction(ctx, task.ID, unholdRequest("unhold-early", h, a, "Morning")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window hold until 2026-10-19T07:00:00-07:00") {
+		t.Fatal("unhold inside the window", err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-19T07:00:00-07:00"))
+	page = windowPage(t, s, task)
+	if page.Window == nil || page.Window.Open || page.Window.Until != "" || pageJob(t, page, a.ID).State != "held" {
+		t.Fatalf("after the end %+v", page)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-held", d, a)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is on an owner hold") {
+		t.Fatal("claim after the end without unhold", err)
+	}
+	free, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold", h, a, "Morning"))
+	if err != nil || free.State != "verified" || free.Hold != nil || len(free.HoldHistory) != 2 || free.HoldHistory[1].Cause != "handler" {
+		t.Fatal("unhold after the end", free, err)
+	}
+	line, err := s.Releases(ctx, task.ID)
+	if err != nil || len(line) != 2 || line[0].ID != a.ID || line[1].ID != b.ID {
+		t.Fatal("queue order", err)
+	}
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim", d, free)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim after unhold", err)
+	}
+
+	// A handler hold unheld inside the window ends held by the window.
+	s, task, h, d, jobs = holdFixture(t, 1)
+	setNightWindow(t, s, task)
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, jobs[0], "Owner reads it first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	again, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold", h, held, "Owner read it"))
+	if err != nil || again.State != "held" || again.Hold == nil || again.Hold.Window == nil || again.Generation != held.Generation+1 {
+		t.Fatal("unhold inside the window", again, err)
+	}
+	if hist := again.HoldHistory; len(hist) != 3 || hist[1].Action != "release" || hist[1].Cause != "handler" || hist[2].Action != "hold" || hist[2].Cause != "window" || hist[2].Generation != again.Generation {
+		t.Fatalf("history %+v", hist)
+	}
+
+	// A clear releases nothing; the held job is unheld at night after it.
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "clear", Operation: "window-clear", Window: &api.ReleaseWindow{Reason: "Owner releases tonight"}}); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, again.ID); err != nil || saved.State != "held" {
+		t.Fatal("clear lifted a hold", saved.State, err)
+	}
+	if free, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold-cleared", h, again, "Owner go")); err != nil || free.State != "verified" {
+		t.Fatal("unhold after a clear", err)
+	}
+}
+
+// A requeue that left the host release lock is never held: the deployer frees
+// the lock only while the job is verified. Claim still waits for the end.
+func TestReleaseWindowLeavesLockedRequeueVerified(t *testing.T) {
+	s, task, _, d, jobs := holdFixture(t, 1)
+	ctx := context.Background()
+	locked := rewriteJob(t, s, jobs[0], func(j *api.ReleaseJob) {
+		j.Reconciliations = append(j.Reconciliations, api.ReleaseReconciliation{Disposition: "requeue", LockDigest: strings.Repeat("e", 64)})
+	})
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	if listed := pageJob(t, windowPage(t, s, task), locked.ID); listed.State != "verified" {
+		t.Fatalf("locked requeue %+v", listed)
+	}
+	if _, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-night", d, locked)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window") {
+		t.Fatal("claim inside the window", err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-19T07:00:00-07:00"))
+	if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-morning", d, locked)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim after the end", err)
+	}
+}
+
+// A sweep is a ledger change: a list paged across the window's start is
+// refused as stale, and a fresh first page shows the holds.
+func TestReleaseWindowSweepStalesPagedList(t *testing.T) {
+	s, task, _, d, jobs := holdFixture(t, 2)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:59:00-07:00"))
+	first, err := s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{Limit: 1})
+	if err != nil || first.Page.NextAfter == "" || first.Jobs[0].State != "verified" {
+		t.Fatal(first, err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T22:00:00-07:00"))
+	if _, err = s.ReleasesPage(ctx, task.ID, api.ReleaseListOptions{Limit: 1, After: first.Page.NextAfter, Snapshot: first.Page.Snapshot}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "stale list snapshot") {
+		t.Fatal("continuation across the sweep", err)
+	}
+	page := windowPage(t, s, task)
+	if pageJob(t, page, jobs[0].ID).State != "held" || pageJob(t, page, jobs[1].ID).State != "held" {
+		t.Fatalf("fresh list %+v", page.Jobs)
+	}
+}
