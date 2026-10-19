@@ -19,9 +19,9 @@ import (
 )
 
 // Time accounting (docs/usage-accounting.md, Time). The relay uploads each
-// completed turn as immutable chunks; the hub projects every segment piece
+// completed turn as immutable chunks; the hub attributes every segment piece
 // with the token ledger's own rule at ingest and assembles the report, with
-// what each wait was for, at read time.
+// each request's phase and what each wait was for, at read time.
 const usageSpansSchema = `CREATE TABLE IF NOT EXISTS usage_spans(
  task_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,span_id TEXT NOT NULL,
  start_at TEXT NOT NULL,end_at TEXT NOT NULL,payload TEXT NOT NULL,projection TEXT NOT NULL,
@@ -43,6 +43,10 @@ type usageSpanProjection struct {
 	AgentID string           `json:"agentId"`
 	RunID   string           `json:"runId"`
 	Pieces  []usageSpanPiece `json:"pieces"`
+	// Evidence is what the chunk's handled messages resolved to, which the
+	// phase rule reads. It is never null from ingest; a span stored before
+	// it was kept has none.
+	Evidence []api.MessageReference `json:"evidence"`
 }
 
 func validUsageSpan(s api.UsageSpan) bool {
@@ -129,11 +133,12 @@ func storeUsageSpans(ctx context.Context, tx *sql.Tx, task, agent, run string, s
 
 // projectUsageSpan resolves every segment piece at the timestamp of the
 // request that owns it, exactly as that request's tokens are resolved, so a
-// request and the time in its segment always get the same item, phase and
-// role. Each piece names its own request, so the result does not depend on
-// where the turn was cut into chunks.
+// request and the time in its segment always get the same item and role. Each
+// piece names its own request, so the result does not depend on where the turn
+// was cut into chunks. The stored phase is the ingest-time snapshot; reports
+// classify each request again (spanPhases).
 func projectUsageSpan(ctx context.Context, tx *sql.Tx, task, agent, run string, span api.UsageSpan, provenance usageRunProvenance) (usageSpanProjection, error) {
-	out := usageSpanProjection{AgentID: agent, RunID: run, Pieces: []usageSpanPiece{}}
+	out := usageSpanProjection{AgentID: agent, RunID: run, Pieces: []usageSpanPiece{}, Evidence: []api.MessageReference{}}
 	resolved := map[time.Time]api.UsageProjection{}
 	for _, segment := range span.Segments {
 		key := segment.At.UTC()
@@ -145,6 +150,9 @@ func projectUsageSpan(ctx context.Context, tx *sql.Tx, task, agent, run string, 
 				return out, err
 			}
 			resolved[key] = p
+			// Evidence comes from the chunk's handled messages alone, so every
+			// request in it resolves the same.
+			out.Evidence = append(out.Evidence[:0], p.Evidence...)
 		}
 		piece := usageSpanPiece{From: segment.From, To: segment.To, Shares: p.Shares, Phase: p.Phase, ReviewRound: p.ReviewRound, Role: p.Role}
 		if n := len(out.Pieces); n > 0 {
@@ -157,6 +165,73 @@ func projectUsageSpan(ctx context.Context, tx *sql.Tx, task, agent, run string, 
 		out.Pieces = append(out.Pieces, piece)
 	}
 	return out, nil
+}
+
+// spanPhases splits a span's stored pieces at its requests and names each
+// stretch's phase and review round with classifyUsagePhase, the rule the token
+// report applies on read to the same requests, so a request's time and tokens
+// fall in the same phase whatever rule applied at ingest. Adjacent requests of
+// one piece that classify alike stay one stretch.
+func spanPhases(ctx context.Context, q queryRower, agent, run string, span api.UsageSpan, projection usageSpanProjection, evidence []api.MessageReference, cache *usagePhaseCache) ([]usageSpanPiece, error) {
+	type phase struct {
+		name  string
+		round int
+	}
+	classified := map[time.Time]phase{}
+	out := []usageSpanPiece{}
+	for _, p := range projection.Pieces {
+		first := len(out)
+		for _, segment := range span.Segments {
+			if segment.From.Before(p.From) || segment.To.After(p.To) {
+				continue
+			}
+			key := segment.At.UTC()
+			c, ok := classified[key]
+			if !ok {
+				name, _, round, err := classifyUsagePhase(ctx, q, api.UsageProjection{Turn: api.UsageTurn{At: segment.At}, AgentID: agent, RunID: run, Role: p.Role, Shares: p.Shares, Evidence: evidence}, cache)
+				if err != nil {
+					return nil, err
+				}
+				c = phase{name, round}
+				classified[key] = c
+			}
+			if n := len(out); n > first && out[n-1].To.Equal(segment.From) && out[n-1].Phase == c.name && out[n-1].ReviewRound == c.round {
+				out[n-1].To = segment.To
+				continue
+			}
+			piece := p
+			piece.From, piece.To, piece.Phase, piece.ReviewRound = segment.From, segment.To, c.name, c.round
+			out = append(out, piece)
+		}
+	}
+	return out, nil
+}
+
+// legacySpanEvidence recovers the evidence of a span stored before projections
+// kept it, by resolving its handled messages with the run's frozen provenance
+// as ingest did. Reads only; one resolution per run and handled list.
+func legacySpanEvidence(ctx context.Context, tx *sql.Tx, task, agent, run string, span api.UsageSpan, memo map[string][]api.MessageReference) ([]api.MessageReference, error) {
+	handled, _ := json.Marshal(span.Handled)
+	key := agent + "/" + run + "/" + string(handled)
+	if evidence, ok := memo[key]; ok {
+		return evidence, nil
+	}
+	var frozen string
+	var provenance usageRunProvenance
+	err := tx.QueryRowContext(ctx, `SELECT provenance FROM usage_runs WHERE task_id=? AND agent_id=? AND run_id=?`, task, agent, run).Scan(&frozen)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	var evidence []api.MessageReference
+	if err == nil && json.Unmarshal([]byte(frozen), &provenance) == nil {
+		p, err := resolveUsage(ctx, tx, task, agent, run, api.UsageTurn{At: span.Start, Handled: span.Handled}, provenance)
+		if err != nil {
+			return nil, err
+		}
+		evidence = p.Evidence
+	}
+	memo[key] = evidence
+	return evidence, nil
 }
 
 // Interval arithmetic over half-open [from,to) stretches.
@@ -430,6 +505,7 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		}
 		return items[item][agent]
 	}
+	cache, legacy := newUsagePhaseCache(), map[string][]api.MessageReference{}
 	// Only this project's spans, by the (task_id,start_at) index.
 	rows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, task)
 	if err != nil {
@@ -448,8 +524,18 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		if err = json.Unmarshal([]byte(encoded), &projection); err != nil {
 			break
 		}
+		evidence := projection.Evidence
+		if evidence == nil {
+			if evidence, err = legacySpanEvidence(ctx, tx, task, agent, run, span, legacy); err != nil {
+				break
+			}
+		}
+		var pieces []usageSpanPiece
+		if pieces, err = spanPhases(ctx, tx, agent, run, span, projection, evidence, cache); err != nil {
+			break
+		}
 		busy := spanUnion(append(append(append([][2]time.Time(nil), span.Tool...), span.Wait...), span.Mixed...))
-		for _, p := range projection.Pieces {
+		for _, p := range pieces {
 			from, to, ok := clip(p.From, p.To)
 			for _, share := range p.Shares {
 				if share.TaskID != task || (q.Item != "" && share.ItemID != q.Item) || share.Denominator < 1 {

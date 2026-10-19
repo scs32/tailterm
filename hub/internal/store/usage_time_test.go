@@ -778,3 +778,66 @@ func TestUsageTimeWaitCauses(t *testing.T) {
 		t.Fatalf("other project's own report: %+v %v", elsewhere.Overhead.Time, err)
 	}
 }
+
+// A span stored under an older phase rule is classified again on read, request
+// by request, with the rule the token report applies to the same requests:
+// each request's time and tokens fall in the same phase (wi_16371b3c5aa35b19).
+func TestUsageTimePhasesReclassifiedOnRead(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m = time.Minute
+	builder := f.agents["builder"]
+	// One turn with two requests: at +1m nothing is open (hand-offs); at +3m
+	// the ASSIGN posted at +2m is (build).
+	f.requests("builder", 1*m, 1)
+	f.send(2*m, "lead", "builder", 0, usagePhaseAssign())
+	f.requests("builder", 3*m, 1)
+	start, mid, end := f.base.Add(1*m), f.base.Add(3*m), f.base.Add(4*m)
+	whole := api.UsageSpan{ID: "turn-phases#0", Turn: "turn-phases", Last: true, Start: start, End: end, Segments: []api.UsageSpanSegment{{From: start, To: mid, At: start}, {From: mid, To: end, At: mid}}, SourceDigest: strings.Repeat("c", 64)}
+	b := usageBatch(builder, "phase-spans")
+	b.Spans = []api.UsageSpan{whole}
+	if _, err := f.s.ReportUsage(f.ctx, f.task.ID, builder.ID, b); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite the stored projection the way an older rule recorded it: one
+	// merged hand-offs piece over both requests, and no kept evidence.
+	var raw string
+	if err := f.s.db.QueryRow(`SELECT projection FROM usage_spans WHERE task_id=?`, f.task.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatal(err)
+	}
+	_, kept := stored["evidence"]
+	delete(stored, "evidence")
+	pieces := stored["pieces"].([]any)
+	first, last := pieces[0].(map[string]any), pieces[len(pieces)-1].(map[string]any)
+	first["to"], first["phase"] = last["to"], "hand-offs"
+	stored["pieces"] = []any{first}
+	old, _ := json.Marshal(stored)
+	if _, err := f.s.db.Exec(`UPDATE usage_spans SET projection=? WHERE task_id=?`, string(old), f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err := f.s.Usage(f.ctx, f.task.ID, api.UsageQuery{Item: f.item.ID})
+	if err != nil || len(report.Items) != 1 || report.Items[0].Time == nil {
+		t.Fatal(report, err)
+	}
+	item := report.Items[0]
+	tokens := map[string]int{}
+	for _, g := range item.Phases {
+		tokens[g.Key] = g.Summary.Requests
+	}
+	if tokens["hand-offs"] != 1 || tokens["build"] != 1 || len(tokens) != 2 {
+		t.Fatalf("token phases: %v", tokens)
+	}
+	checkSplits(t, "time phases", item.Time.Phases, map[string]wantSplit{"hand-offs": {model: 2 * minute}, "build": {model: minute}})
+	checkSplits(t, "time phase roles", item.Time.PhaseRoles, map[string]wantSplit{"hand-offs / builder": {model: 2 * minute}, "build / builder": {model: minute}})
+	var after string
+	if err = f.s.db.QueryRow(`SELECT projection FROM usage_spans WHERE task_id=?`, f.task.ID).Scan(&after); err != nil || after != string(old) {
+		t.Fatal("a report read rewrote the stored span", err)
+	}
+	// New spans keep their evidence, so the read needs no resolution.
+	if !kept {
+		t.Fatalf("ingest did not keep the span's evidence: %s", raw)
+	}
+}
