@@ -415,9 +415,23 @@ func (s *Store) sweepProviderScope(ctx context.Context, task, runtime string, no
 		// afterwards are judged afresh below, so a stale outage never swallows
 		// a later owner notice.
 		var recovered int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+		turns, err := tx.QueryContext(ctx, `SELECT e.cleared_at FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
  JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
- WHERE e.outage_id=? AND e.dropped=0 AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage).Scan(&recovered); err != nil {
+ WHERE e.outage_id=? AND e.dropped=0 AND x.state IN ('working','idle','finished_silent') AND `+liveAgentFilter, outage)
+		if err != nil {
+			return 0, err
+		}
+		for turns.Next() {
+			var at string
+			if err := turns.Scan(&at); err != nil {
+				turns.Close()
+				return 0, err
+			}
+			if at == "" || parseTS(at).After(parseTS(outageOpened)) {
+				recovered++
+			}
+		}
+		if err := turns.Close(); err != nil {
 			return 0, err
 		}
 		cleared, err := tx.QueryContext(ctx, `SELECT e.cleared_at FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id

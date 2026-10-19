@@ -1091,6 +1091,49 @@ func TestProviderBlockOutageIgnoresEarlierReply(t *testing.T) {
 	}
 }
 
+// An episode that cleared before the outage opened joins it at creation, but
+// its agent's later turn state is no recovery of the agents blocked in it.
+func TestProviderBlockOutageIgnoresPreClearedTurnState(t *testing.T) {
+	for _, state := range []string{"idle", "finished_silent"} {
+		t.Run(state, func(t *testing.T) {
+			f := newProviderFixture(t)
+			a, b, early := f.agent("codex-0", "codex", 0), f.agent("codex-1", "codex", 0), f.agent("codex-2", "codex", 1)
+			f.block(a, "codex", "auth")
+			f.block(b, "codex", "auth")
+			f.block(early, "codex", "auth")
+			f.advance(30 * time.Second)
+			f.state(early, state)
+			f.advance(61 * time.Second)
+			if n := f.sweep(); n != 1 || f.notices(providerBlockOutageSubject, "") != 1 {
+				t.Fatalf("outage sweep posted %d", n)
+			}
+			if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND outage_id<>'' AND cleared_at<>''`, early.ID); n != 1 {
+				t.Fatalf("the cleared episode did not join the outage: %d", n)
+			}
+			f.advance(30 * time.Second)
+			if n := f.sweep(); n != 0 || countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`) != 1 {
+				t.Fatalf("an episode cleared before the outage opened ended it (posted %d)", n)
+			}
+			// A later block joins the outage without a second notice.
+			f.advance(time.Minute)
+			late := f.agent("codex-3", "codex", 1)
+			f.block(late, "codex", "auth")
+			f.advance(91 * time.Second)
+			f.sweep()
+			if n := f.notices(providerBlockOutageSubject, ""); n != 1 {
+				t.Fatalf("a later block posted another outage notice: %d", n)
+			}
+			// A blocked agent's own recovery still ends it.
+			f.advance(time.Minute)
+			f.state(b, state)
+			f.advance(30 * time.Second)
+			if n := f.sweep(); n != 0 || countRows(t, f.s, `SELECT count(*) FROM provider_outages WHERE closed_at=''`) != 0 {
+				t.Fatalf("a recovery inside the outage left it open (posted %d)", n)
+			}
+		})
+	}
+}
+
 // A provider-blocked handler makes no progress and holds no tool call, so the
 // runner may rotate it as it rotates an idle one; a pending tool call and a
 // live team lease still refuse first.
