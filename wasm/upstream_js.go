@@ -503,10 +503,19 @@ func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 					var readErr error
 					readOnce.Do(func() {
 						defer cancel()
-						defer res.Body.Close()
 						buf := new(bytes.Buffer)
 						_, readErr = buf.ReadFrom(io.LimitReader(res.Body, 8<<20))
 						out = buf.String()
+						// Without a dialer the body is the browser's response
+						// stream, and closing it calls the stream reader's
+						// cancel() without handling the promise it returns.
+						// After a read error the stream has failed (a reload
+						// or a dropped connection cut it off), so that promise
+						// rejects unhandled. A failed stream holds nothing to
+						// release; leave it. readErr still reaches the caller.
+						if readErr == nil || i.dialer != nil {
+							res.Body.Close()
+						}
 					})
 					return out, readErr
 				})

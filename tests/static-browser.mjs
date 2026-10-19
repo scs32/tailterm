@@ -81,6 +81,7 @@ const identities = new Map(),
   uploadedFiles = new Map();
 const uploadControl = {};
 class FocusedActivityComplete extends Error {}
+class FocusedFetchUnloadComplete extends Error {}
 let nextSessionId = 0;
 function identity(name) {
   if (!identities.has(name))
@@ -365,6 +366,8 @@ const http = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname.startsWith("/fixture-hub/"))
       return fixtureHub.handle(req, res, url);
+    if (url.pathname.startsWith("/fixture-fetch/"))
+      return serveFetchFixture(res, url);
     const name = url.pathname === "/" ? "/index.html" : url.pathname;
     const root = path.resolve("dist-static");
     const file = path.resolve(root, "." + name);
@@ -560,6 +563,118 @@ async function exerciseFooterFit(page) {
     );
   }
 }
+// A bare page that loads the test WASM and calls its fetch, which uses the
+// browser's fetch because the fixture has no tailnet dialer. /held sends its
+// headers and part of its body and then waits; /cut drops the connection
+// after part of its body.
+const heldFetchBodies = new Set();
+let fetchFixtureWasm;
+function serveFetchFixture(res, url) {
+  const body = "partial body ";
+  const partial = { "Content-Type": "text/plain", "Content-Length": "4096" };
+  switch (url.pathname) {
+    case "/fixture-fetch/":
+      res.writeHead(200, { "Content-Type": "text/html" });
+      return res.end(`<!doctype html>
+<script src="/fixture-fetch/wasm_exec.js"></script>
+<script>
+  const go = new Go();
+  WebAssembly.instantiateStreaming(fetch("/fixture-fetch/test.wasm"), go.importObject).then((r) => {
+    go.run(r.instance);
+    globalThis.ipn = newIPN({});
+  });
+  globalThis.read = (url) =>
+    ipn.fetch(url).then(async (r) => {
+      globalThis.fetchStatus = r.status;
+      return "body: " + (await r.text());
+    }).catch((e) => "rejected: " + e);
+</script>`);
+    case "/fixture-fetch/wasm_exec.js":
+      res.writeHead(200, { "Content-Type": "text/javascript" });
+      return res.end(readFileSync("wasm/wasm_exec.js"));
+    case "/fixture-fetch/test.wasm":
+      fetchFixtureWasm ||= readFileSync(".build/test.wasm");
+      res.writeHead(200, { "Content-Type": "application/wasm" });
+      return res.end(fetchFixtureWasm);
+    case "/fixture-fetch/held":
+      res.writeHead(200, partial);
+      res.write(body);
+      heldFetchBodies.add(res);
+      res.on("close", () => heldFetchBodies.delete(res));
+      return;
+    case "/fixture-fetch/cut":
+      res.writeHead(200, partial);
+      return res.write(body, () => setTimeout(() => res.destroy(), 100));
+  }
+  res.writeHead(404);
+  res.end("Not found");
+}
+// A reload that cuts off a response the WASM fetch is reading must not leave
+// an unhandled rejection, while genuine load and CORS failures still reach
+// the caller and an unhandled one is still a page error.
+async function exerciseFetchUnload(browser) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  const ready = () => page.waitForFunction(() => globalThis.ipn);
+  await page.goto(origin + "/fixture-fetch/");
+  await ready();
+  for (let i = 0; i < 4; i++) {
+    await page.evaluate(() => {
+      globalThis.pending = read("/fixture-fetch/held");
+    });
+    await page.waitForFunction(() => globalThis.fetchStatus === 200);
+    await wait(() => heldFetchBodies.size === 1);
+    await page.reload();
+    await ready();
+    await wait(() => heldFetchBodies.size === 0);
+    await page.waitForTimeout(250);
+    assert.deepEqual(errors, [], `Reload ${i + 1} cut off a held body`);
+  }
+  // The WASM fetch rejects with the Go error's text.
+  const cut = await page.evaluate(() => read("/fixture-fetch/cut"));
+  assert.match(cut, /^rejected: \S/, "A body cut off mid-read rejects");
+  assert.deepEqual(
+    errors,
+    [],
+    "A caller that handles a cut-off body sees no page error",
+  );
+  const other = createServer((_, res) => res.end("no CORS headers"));
+  other.listen(0, "127.0.0.1");
+  await once(other, "listening");
+  const otherURL = `http://127.0.0.1:${other.address().port}/`;
+  assert.match(
+    await page.evaluate((u) => read(u), otherURL),
+    /^rejected: .*fetch\(\) failed/,
+    "A CORS failure rejects to the caller",
+  );
+  // WebKit logs the CORS refusal to the console, which Playwright reports as
+  // a page error; that console line is the only error allowed here.
+  assert.ok(
+    errors.every((e) => e.endsWith(" due to access control checks.")),
+    String(errors),
+  );
+  errors.length = 0;
+  other.close();
+  await once(other, "close");
+  // Negative control: a genuine load failure nobody handles is still an
+  // unhandled rejection, so no filter hides it.
+  await page.evaluate((u) => {
+    void ipn.fetch(u);
+  }, otherURL);
+  await wait(() => errors.length > 0);
+  await page.waitForTimeout(250);
+  assert.equal(errors.length, 1, String(errors));
+  assert.match(errors[0], /fetch\(\) failed/);
+  console.log(
+    "WASM fetch unload: cut-off reads leave no page error;",
+    cut,
+    "| unhandled load failure:",
+    errors[0],
+  );
+  await context.close();
+}
 const launcherCards = (page) =>
   page.evaluate(() =>
     [...document.querySelectorAll("[data-launch-server]")].map((n) => ({
@@ -577,6 +692,9 @@ try {
       "--use-fake-ui-for-media-stream",
     ],
   });
+  await exerciseFetchUnload(browser);
+  if (process.env.TAILTERM_FETCH_UNLOAD_ONLY)
+    throw new FocusedFetchUnloadComplete();
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
     permissions:
@@ -1436,6 +1554,8 @@ try {
 } catch (error) {
   if (error instanceof FocusedActivityComplete)
     console.log("Focused terminal activity browser checks passed.");
+  else if (error instanceof FocusedFetchUnloadComplete)
+    console.log("Focused WASM fetch unload browser checks passed.");
   else {
     console.error(browserLog.slice(-45).join("\n"));
     console.error(
