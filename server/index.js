@@ -1,4 +1,8 @@
-import { tmuxListCommand, validateTmuxPath } from "../shared/tmux-command.js";
+import {
+  readTmuxSessions,
+  tmuxListCommand,
+  validateTmuxPath,
+} from "../shared/tmux-command.js";
 import express from "express";
 import { WebSocketServer } from "ws";
 import ssh2 from "ssh2";
@@ -371,40 +375,33 @@ app.get("/api/servers/:id/tmux", (req, res) => {
   conn
     .on("error", (e) => finish(e))
     .on("ready", () =>
-      conn.exec(tmuxListCommand(s.tmuxPath), (err, stream) => {
-        if (err) return finish(err);
-        let out = "",
-          stderr = "";
-        stream.stderr.on(
-          "data",
-          (d) => (stderr = (stderr + d.toString()).slice(-8192)),
-        );
-        stream.on("data", (d) => {
-          out += d;
-          if (out.length > 65536) finish(new Error("Too many sessions"));
-        });
-        stream.on("close", (code) =>
-          code !== 0
-            ? finish(
-                new Error(stderr.trim() || "Remote tmux discovery failed."),
-              )
-            : finish(
-                null,
-                out
-                  .trim()
-                  .split("\n")
-                  .filter(Boolean)
-                  .map((line) => {
-                    const [name, windows, attached] = line.split("|");
-                    return {
-                      name,
-                      windows: Number(windows),
-                      attached: Number(attached),
-                    };
-                  }),
-              ),
-        );
-      }),
+      readTmuxSessions(
+        () =>
+          new Promise((resolve, reject) =>
+            conn.exec(tmuxListCommand(s.tmuxPath), (err, stream) => {
+              if (err) return reject(err);
+              let out = "",
+                stderr = "";
+              stream.stderr.on(
+                "data",
+                (d) => (stderr = (stderr + d.toString()).slice(-8192)),
+              );
+              stream.on("data", (d) => {
+                out += d;
+                if (out.length > 65536) reject(new Error("Too many sessions"));
+              });
+              stream.on("close", (code) =>
+                code !== 0
+                  ? reject(
+                      new Error(
+                        stderr.trim() || "Remote tmux discovery failed.",
+                      ),
+                    )
+                  : resolve(out),
+              );
+            }),
+          ),
+      ).then((sessions) => finish(null, sessions), finish),
     );
   try {
     conn.connect(sshConfig(s));
@@ -480,7 +477,14 @@ wss.on("connection", (ws, req) => {
         if (!s) throw new Error("Unknown SSH server");
         connectedProfile = { ...s };
         const command = m.tmux
-          ? tmuxCommand(m.session, s.tmuxPath, m.resumeOnly === true, undefined, "", { ignoreSize: m.ignoreSize === true })
+          ? tmuxCommand(
+              m.session,
+              s.tmuxPath,
+              m.resumeOnly === true,
+              undefined,
+              "",
+              { ignoreSize: m.ignoreSize === true },
+            )
           : null;
         const auth = interactiveSSHConfig(
           { ...s },
@@ -563,49 +567,41 @@ wss.on("connection", (ws, req) => {
         conn.connect({ ...auth.config, sock: socket });
       } else if (m.type === "tmux-list" && stream) {
         const id = String(m.id).slice(0, 80);
-        conn.exec(tmuxListCommand(connectedProfile.tmuxPath), (err, ch) => {
-          if (err) {
-            send("tmux-result", { id, error: err.message });
-            return;
-          }
-          let output = "",
-            stderr = "";
-          ch.stderr.on(
-            "data",
-            (d) => (stderr = (stderr + d.toString()).slice(-8192)),
-          );
-          const timer = setTimeout(() => ch.close(), 15000);
-          ch.on("data", (d) => {
-            output += d;
-            if (output.length > 65536) ch.close();
-          });
-          ch.on("close", (code) => {
-            clearTimeout(timer);
-            send(
-              "tmux-result",
-              code !== 0
-                ? {
-                    id,
-                    error: stderr.trim() || "Remote tmux discovery failed.",
-                  }
-                : {
-                    id,
-                    sessions: output
-                      .trim()
-                      .split("\n")
-                      .filter(Boolean)
-                      .map((line) => {
-                        const [name, windows, attached] = line.split("|");
-                        return {
-                          name,
-                          windows: Number(windows),
-                          attached: Number(attached),
-                        };
-                      }),
-                  },
-            );
-          });
-        });
+        readTmuxSessions(
+          () =>
+            new Promise((resolve, reject) =>
+              conn.exec(
+                tmuxListCommand(connectedProfile.tmuxPath),
+                (err, ch) => {
+                  if (err) return reject(err);
+                  let output = "",
+                    stderr = "";
+                  ch.stderr.on(
+                    "data",
+                    (d) => (stderr = (stderr + d.toString()).slice(-8192)),
+                  );
+                  const timer = setTimeout(() => ch.close(), 15000);
+                  ch.on("data", (d) => {
+                    output += d;
+                    if (output.length > 65536) ch.close();
+                  });
+                  ch.on("close", (code) => {
+                    clearTimeout(timer);
+                    code !== 0
+                      ? reject(
+                          new Error(
+                            stderr.trim() || "Remote tmux discovery failed.",
+                          ),
+                        )
+                      : resolve(output);
+                  });
+                },
+              ),
+            ),
+        ).then(
+          (sessions) => send("tmux-result", { id, sessions }),
+          (err) => send("tmux-result", { id, error: err.message }),
+        );
       } else if (m.type === "input" && stream && typeof m.data === "string") {
         stream.write(m.data);
       } else if (m.type === "resize" && stream)

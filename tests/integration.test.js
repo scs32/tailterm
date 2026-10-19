@@ -108,6 +108,11 @@ test("authenticated API and real SSH transport enforce vault, origin, host key a
   let proc, port, origin;
   let command = "",
     size;
+  // Each list-sessions exec answers with the next queued listing.
+  const wholeRow = "main|2|1|$1|1700000000\n";
+  const cutRow = "main|2|1\n";
+  const listings = [];
+  let listReads = 0;
   const ssh = new Server({ hostKeys: [pair.privateKey] }, (client) => {
     client.on("error", () => {});
     client
@@ -149,7 +154,8 @@ test("authenticated API and real SSH transport enforce vault, origin, host key a
             command = info.command;
             const stream = accept();
             if (command.includes(" list-sessions -F ")) {
-              stream.write("main|2|1\n");
+              listReads++;
+              stream.write(listings.shift() ?? wholeRow);
               stream.exit(0);
               stream.end();
             } else stream.write("tmux attached\r\n");
@@ -286,10 +292,32 @@ test("authenticated API and real SSH transport enforce vault, origin, host key a
     assert.match(command, /new-session -A -s .*work/);
     b.ws.close();
     await once(b.ws, "close");
-    const remote = await request(`/servers/${server.id}/tmux`);
-    assert.deepEqual(remote.body.sessions, [
-      { name: "main", windows: 2, attached: 1 },
-    ]);
+    const main = {
+      name: "main",
+      windows: 2,
+      attached: 1,
+      target: { id: "$1", created: "1700000000" },
+    };
+    // Each reader returns a whole row, reads a cut listing once more, and
+    // refuses a listing that stays cut.
+    async function routeListing(...queued) {
+      listings.splice(0, listings.length, ...queued);
+      listReads = 0;
+      return request(`/servers/${server.id}/tmux`);
+    }
+    let remote = await routeListing(wholeRow);
+    assert.equal(remote.status, 200);
+    assert.deepEqual(remote.body.sessions, [main]);
+    assert.equal(listReads, 1);
+    remote = await routeListing(cutRow, wholeRow);
+    assert.equal(remote.status, 200);
+    assert.deepEqual(remote.body.sessions, [main]);
+    assert.equal(listReads, 2);
+    remote = await routeListing(cutRow, cutRow);
+    assert.equal(remote.status, 400);
+    assert.match(remote.body.error, /did not finish listing the sessions/);
+    assert.equal(remote.body.sessions, undefined);
+    assert.equal(listReads, 2);
     const bad = await terminal(false, "SHA256:" + "A".repeat(43));
     await waitFor(() => bad.messages.some((x) => x.type === "error"));
     assert.ok(!bad.messages.some((x) => x.type === "ready"));
@@ -336,15 +364,26 @@ test("authenticated API and real SSH transport enforce vault, origin, host key a
       },
     );
     assert.deepEqual(kinds, ["host-key", "credentials", "credentials"]);
-    password.ws.send(JSON.stringify({ type: "tmux-list", id: "discovery" }));
-    await waitFor(() =>
-      password.messages.some((m) => m.type === "tmux-result"),
-    );
-    assert.equal(
-      password.messages.find((m) => m.type === "tmux-result").data.sessions[0]
-        .name,
-      "main",
-    );
+    async function socketListing(id, ...queued) {
+      listings.splice(0, listings.length, ...queued);
+      listReads = 0;
+      password.ws.send(JSON.stringify({ type: "tmux-list", id }));
+      const result = (m) => m.type === "tmux-result" && m.data.id === id;
+      await waitFor(() => password.messages.some(result));
+      return password.messages.find(result).data;
+    }
+    let listed = await socketListing("whole", wholeRow);
+    assert.deepEqual(listed, { id: "whole", sessions: [main] });
+    assert.equal(listReads, 1);
+    listed = await socketListing("reread", cutRow, wholeRow);
+    assert.deepEqual(listed, { id: "reread", sessions: [main] });
+    assert.equal(listReads, 2);
+    listed = await socketListing("cut", cutRow, cutRow);
+    assert.deepEqual(listed, {
+      id: "cut",
+      error: "tmux did not finish listing the sessions. Try again.",
+    });
+    assert.equal(listReads, 2);
     password.ws.close();
     await once(password.ws, "close");
     const publicView = (await request("/data")).body;
@@ -605,7 +644,10 @@ utils.generateKeyPairSync = (...args) => {
 });
 test("static preview binds port 0 and carries the run token", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "tailterm-preview-"));
-  writeFileSync(path.join(root, "index.html"), "<!doctype html><title>t</title>");
+  writeFileSync(
+    path.join(root, "index.html"),
+    "<!doctype html><title>t</title>",
+  );
   const cli = spawn(
     process.execPath,
     ["scripts/preview-static.mjs", root, "127.0.0.1", "0"],
@@ -674,7 +716,8 @@ test(
         const [code] = await run.exit;
         assert.equal(code, 0, `${run.cwd} failed:\n${run.log}`);
         assert.match(run.log, /Browser checks passed/);
-        const line = /Browser suite server: http:\/\/127\.0\.0\.1:(\d+) pid (\d+)/;
+        const line =
+          /Browser suite server: http:\/\/127\.0\.0\.1:(\d+) pid (\d+)/;
         assert.match(run.log, line);
         const [, port, pid] = line.exec(run.log);
         servers.push({ port: Number(port), pid: Number(pid) });
