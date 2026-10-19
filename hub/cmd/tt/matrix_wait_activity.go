@@ -170,7 +170,9 @@ func readMatrixLock() *matrixLockFile {
 // item. An entry that names no agent (empty or "unknown", as a run started
 // without TAILTERM_AGENT_NAME writes it) is the wait of every agent bound to
 // its item, so the team that owns the item is not taken for idle; without a
-// valid item it is nobody's (wi_6128966a8025aaad).
+// valid item it is nobody's (wi_6128966a8025aaad). Such a wait is marked
+// Agentless, so the hub tells its end to one member, not to each
+// (wi_ab6db76678163f2b).
 //
 // Only a confirmed read ends a wait. On an unknown read the result is the
 // last confirmed wait the hub holds for the agent's current run, so the relay
@@ -203,7 +205,7 @@ func matrixWaitFor(a api.Agent, now time.Time) *api.MatrixWait {
 		if err != nil || since.IsZero() {
 			return nil
 		}
-		return &api.MatrixWait{Item: item, Since: since.UTC()}
+		return &api.MatrixWait{Item: item, Since: since.UTC(), Agentless: !named}
 	}
 	for _, h := range lock.Holders {
 		if w := match(h, h.StartedAt); w != nil {
@@ -236,10 +238,15 @@ func lastConfirmedMatrixWait(a api.Agent, now time.Time) *api.MatrixWait {
 }
 
 // matrixWaitKey is the part of a matrix wait that makes a new activity
-// report. The position is left out, so a moving waitlist sends none.
+// report. The position is left out, so a moving waitlist sends none. Only an
+// agentless wait adds a marker, so a named wait's key is as before.
 func matrixWaitKey(w *api.MatrixWait) string {
 	if w == nil {
 		return ""
 	}
-	return "\x00matrix=" + w.Role + "\x00" + w.Item + "\x00" + w.Since.UTC().Format(time.RFC3339Nano)
+	key := "\x00matrix=" + w.Role + "\x00" + w.Item + "\x00" + w.Since.UTC().Format(time.RFC3339Nano)
+	if w.Agentless {
+		key += "\x00agentless"
+	}
+	return key
 }

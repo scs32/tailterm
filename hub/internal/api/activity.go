@@ -52,11 +52,14 @@ type MatrixWait struct {
 	Position int       `json:"position,omitempty"` // 1-based place among the waiters
 	Length   int       `json:"length,omitempty"`   // waiters in the lock
 	Since    time.Time `json:"since"`              // waiting: requested; running: started
+	// Agentless is set when the lock entry names no agent, so the wait is
+	// that of every agent bound to the item. It always carries an item.
+	Agentless bool `json:"agentless,omitempty"`
 }
 
 // Valid reports whether every field is an allowed enum or range.
 func (w *MatrixWait) Valid() bool {
-	if w == nil || w.Since.IsZero() || (w.Item != "" && !ValidID(w.Item, "wi")) {
+	if w == nil || w.Since.IsZero() || (w.Item != "" && !ValidID(w.Item, "wi")) || (w.Agentless && w.Item == "") {
 		return false
 	}
 	switch w.Role {
@@ -74,7 +77,7 @@ func SameMatrixWait(a, b *MatrixWait) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Role == b.Role && a.Item == b.Item && a.Since.Equal(b.Since)
+	return a.Role == b.Role && a.Item == b.Item && a.Since.Equal(b.Since) && a.Agentless == b.Agentless
 }
 
 // Provider block classes. Class, code and status together are the exact error

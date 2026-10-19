@@ -202,14 +202,14 @@ On 2026-10-13 a lead that was its own verifier sat beside a finished receipt for
 
 **What triggers it.** The relay on the agent's host reads the host's matrix lock every 15 seconds ([agent-activity.md](agent-activity.md)). When the agent's run is no longer there, because it finished, failed, was withdrawn or was killed and left a dead process behind, the relay's next activity report carries no `matrixWait`. That report posts the notice, in its own transaction. Nothing depends on the shell that started the run, on a child of the agent, or on the agent's turn. The sweep is not involved.
 
-**Who gets it.** The agent whose report lost the wait, whatever its role: a team member, a lead acting as verifier, or the owner helper. A retired agent gets none.
+**Who gets it.** For a lock entry that names the agent, the agent whose report lost the wait, whatever its role: a team member, a lead acting as verifier, or the owner helper. A lock entry that names no agent (`agent` empty or `unknown`, as a run started without `TAILTERM_AGENT_NAME` writes it) is the wait of every agent bound to its item, and the relay marks that wait `agentless` (`wi_ab6db76678163f2b`). Its end goes to one member only: the item lead (its open `item_team_leads` row, at that run, not closed or exited), else the earliest-bound live agent on the item. It is posted only from that member's own report; every other member's report posts nothing and wakes no one. A retired agent gets none, and when the recipient is retired nobody gets it in its place.
 
-**The notice.** A directed hub notice with the subject `Your matrix run has ended`, delivered like any directed notice: unread for the agent, with a delivery-only obligation and a wake job due at once. The hub types, restarts and resumes nothing.
+**The notice.** A directed hub notice with the subject `Your matrix run has ended`, delivered like any directed notice: unread for the agent, with a delivery-only obligation and a wake job due at once. The hub types, restarts and resumes nothing. The text begins `Your verification run`, or `Your team's verification run` for an agentless run, since the receipt may be in another member's log directory.
 
 - It names the run by its item, its role (`running`, or `waiting` for a run that left the waitlist without being seen running) and its start time, and gives the time the report saw it gone.
 - **It carries no path and no result.** The hub is told only that the run left the lock ([agent-activity.md](agent-activity.md): no pid, commit, path or output of a run leaves the host). The text says where to look: `receipt.json` (`targeted-receipt.json` for a targeted run) in the log directory the agent gave the run, whose checks are the outcome; with no receipt, `runner.json` there for an exit code and `host-lock.log` for the reason, and the recovery rule's record of why it stopped comes first.
 - **It never authorises another run.** The text says so, and suggests none.
-- Refs: `action=matrix-run-ended`, `agent`, `run`, `item` when known, `matrixRole`, `matrixSince`, `endedAt`. When the earlier report cannot be read, the notice names the agent's bound item and no role or start time.
+- Refs: `action=matrix-run-ended`, `agent`, `run`, `item` when known, `matrixRole`, `matrixSince`, `endedAt`, and `matrixAgentless=true` for an agentless run only. When the earlier report cannot be read, the notice names the agent's bound item and no role or start time.
 
 **Once per run.** The notice is posted by the one stored report that ends the wait. A repeated report, a retried request, a later state change and a moved waitlist position post nothing. A second run gets its own notice.
 
@@ -221,7 +221,8 @@ On 2026-10-13 a lead that was its own verifier sat beside a finished receipt for
 
 **Limits.**
 
-- The lock entry must name the agent (`TAILTERM_AGENT_NAME`), and the relay on that host must be running. With the relay down the notice is posted when it next reports.
+- The lock entry must name the agent (`TAILTERM_AGENT_NAME`) or be agentless with a valid item, and the relay on that host must be running. With the relay down the notice is posted when it next reports.
+- An agentless run's notice arrives only when the recipient's own relay sees the run end. A recipient whose relay does not report it, for example one on another host, gets none, and no other member is told instead.
 - A run that joins the lock, runs and ends wholly inside one 15-second check is never reported and gets no notice. This is recorded, not fixed. A run seen waiting that then runs and ends inside one check gets the waitlist text.
 - Only a confirmed lock read ends a wait. On an unknown read (an absent, unreadable or malformed lock, or one of another version or host) the relay repeats the last confirmed wait the hub holds for that run, so no notice is posted. A wait the relay can no longer confirm ends at the 4 h 30 min bound, for the watch only: no notice is posted then.
 - Two relays with different state directories that report for one agent are not coordinated by this feature.

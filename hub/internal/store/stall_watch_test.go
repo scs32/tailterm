@@ -2240,3 +2240,170 @@ func TestMatrixRunEndNotice(t *testing.T) {
 		}
 	})
 }
+
+// stallAgentlessRun is a wait whose lock entry names no agent.
+func stallAgentlessRun(role string, since time.Time, item string) api.AgentActivity {
+	a := stallMatrixRun(role, since, item)
+	a.MatrixWait.Agentless = true
+	return a
+}
+
+// wi_ab6db76678163f2b: an agentless run is the wait of every member bound to
+// its item, so its end is told once, to the item lead (else the earliest-bound
+// live member), as the team's run. A named run is unchanged.
+func TestMatrixRunEndNoticeAgentless(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	stamp := func(at time.Time) string { return at.UTC().Format(time.RFC3339) }
+	// team is a running entry with three members bound to its item, bound a
+	// second apart in this order, all idle; with lead set, the first is the
+	// item lead.
+	team := func(t *testing.T, lead bool, names ...string) (*stallFixture, []api.Agent, string) {
+		f := root.project(t, stallNoon)
+		f.entry(0)
+		var members []api.Agent
+		for _, name := range names {
+			a := f.member(name, 0)
+			f.state(a, "idle")
+			members = append(members, a)
+			f.advance(time.Second)
+		}
+		if lead {
+			f.exec(`INSERT INTO item_team_leads(task_id,item_id,agent_id,run_id,revision,state) VALUES(?,?,?,?,1,'running')`, f.task.ID, f.items[0].ID, members[0].ID, members[0].RunID)
+		}
+		return f, members, f.items[0].ID
+	}
+	// notices checks each member's count of run-end notices, and that the
+	// members hold one wake job per notice.
+	notices := func(t *testing.T, f *stallFixture, members []api.Agent, counts ...int) []api.Message {
+		t.Helper()
+		var all []api.Message
+		total := 0
+		for i, a := range members {
+			got := f.matrixEnded(a)
+			if len(got) != counts[i] {
+				t.Fatalf("%s: %d run-end notice(s), want %d: %+v", a.Name, len(got), counts[i], got)
+			}
+			all = append(all, got...)
+			total += counts[i]
+		}
+		var jobs int
+		for _, a := range members {
+			jobs += f.count(`SELECT count(*) FROM wake_jobs WHERE agent_id=?`, a.ID)
+		}
+		if jobs != total {
+			t.Fatalf("%d wake job(s) for %d notice(s)", jobs, total)
+		}
+		return all
+	}
+	checkTeam := func(t *testing.T, m api.Message, to api.Agent, item string, since time.Time) {
+		t.Helper()
+		text := m.Envelope.Body.Text
+		if want := "Your team's verification run for " + item + ", on the host since " + stamp(since) + ", was no longer in the host's matrix lock"; !strings.HasPrefix(text, want) {
+			t.Fatalf("text %q, want prefix %q", text, want)
+		}
+		if !strings.Contains(text, "This notice does not authorise another run.") || m.Envelope.Subject != matrixRunEndedSubject {
+			t.Fatalf("notice %+v", m.Envelope)
+		}
+		for key, value := range map[string]string{"action": "matrix-run-ended", "agent": to.ID, "run": to.RunID, "item": item, "matrixRole": "running", "matrixSince": stamp(since), "matrixAgentless": "true"} {
+			if m.Envelope.Refs[key] != value {
+				t.Fatalf("ref %s = %q, want %q (%+v)", key, m.Envelope.Refs[key], value, m.Envelope.Refs)
+			}
+		}
+		if len(m.Envelope.Refs) != 8 || m.Envelope.To != to.Name {
+			t.Fatalf("to %q refs %+v", m.Envelope.To, m.Envelope.Refs)
+		}
+	}
+	// run reports one agentless running wait for every member, then ends it
+	// in the given member order.
+	run := func(f *stallFixture, members []api.Agent, item string, order ...int) time.Time {
+		started := f.now()
+		for _, a := range members {
+			f.report(a, stallAgentlessRun(api.MatrixWaitRunning, started, item))
+		}
+		f.advance(10 * time.Minute)
+		for _, i := range order {
+			f.state(members[i], "idle")
+		}
+		return started
+	}
+
+	t.Run("three members with a lead", func(t *testing.T) {
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		started := run(f, m, item, 0, 1, 2)
+		checkTeam(t, notices(t, f, m, 1, 0, 0)[0], m[0], item, started)
+	})
+	t.Run("the lead ends the wait last", func(t *testing.T) {
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		started := run(f, m, item, 2, 1, 0)
+		checkTeam(t, notices(t, f, m, 1, 0, 0)[0], m[0], item, started)
+	})
+	t.Run("no lead", func(t *testing.T) {
+		// The earliest-bound member gets it, whatever its name.
+		f, m, item := team(t, false, "builder-a", "lead-a", "verifier-a")
+		started := run(f, m, item, 2, 1, 0)
+		checkTeam(t, notices(t, f, m, 1, 0, 0)[0], m[0], item, started)
+	})
+	t.Run("a closed lead", func(t *testing.T) {
+		// A lead that has left is passed over for the earliest-bound live member.
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentClosed, m[0].ID)
+		started := run(f, m[1:], item, 1, 0)
+		checkTeam(t, notices(t, f, m, 0, 1, 0)[0], m[1], item, started)
+	})
+	t.Run("a retired lead", func(t *testing.T) {
+		// The lead is kept, not woken, and nobody is woken in its place.
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentRetired, m[0].ID)
+		run(f, m, item, 0, 1, 2)
+		notices(t, f, m, 0, 0, 0)
+		if n := f.count(`SELECT count(*) FROM stall_watch_progress WHERE agent_id IN (?,?,?) AND matrix_wait=0 AND wait_ended_at=?`, m[0].ID, m[1].ID, m[2].ID, ts(f.now())); n != 3 {
+			t.Fatalf("%d member(s) stored the end of the wait, want 3", n)
+		}
+	})
+	t.Run("replaced", func(t *testing.T) {
+		// Another agentless run takes the host: the lead alone is told the
+		// first ended, and later the second.
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		first := f.now()
+		for _, a := range m {
+			f.report(a, stallAgentlessRun(api.MatrixWaitRunning, first, item))
+		}
+		f.advance(time.Minute)
+		second := f.now()
+		for _, i := range []int{2, 1, 0} {
+			next := stallAgentlessRun(api.MatrixWaitRunning, second, item)
+			next.State = "working"
+			f.report(m[i], next)
+		}
+		checkTeam(t, notices(t, f, m, 1, 0, 0)[0], m[0], item, first)
+		f.advance(time.Minute)
+		for _, a := range m {
+			f.state(a, "idle")
+		}
+		got := notices(t, f, m, 2, 0, 0)
+		checkTeam(t, got[1], m[0], item, second)
+	})
+	t.Run("a named run among three members", func(t *testing.T) {
+		// The builder's own run is told to the builder alone, as before.
+		f, m, item := team(t, true, "lead-a", "builder-a", "verifier-a")
+		started := f.now()
+		f.report(m[1], stallMatrixRun(api.MatrixWaitRunning, started, item))
+		f.advance(time.Minute)
+		f.state(m[1], "idle")
+		got := notices(t, f, m, 0, 1, 0)[0]
+		if want := "Your verification run for " + item + ", on the host since " + stamp(started) + ","; !strings.HasPrefix(got.Envelope.Body.Text, want) {
+			t.Fatalf("text %q, want prefix %q", got.Envelope.Body.Text, want)
+		}
+		if _, marked := got.Envelope.Refs["matrixAgentless"]; marked || len(got.Envelope.Refs) != 7 || got.Envelope.To != m[1].Name {
+			t.Fatalf("named notice to %q refs %+v", got.Envelope.To, got.Envelope.Refs)
+		}
+	})
+	t.Run("agentless without an item", func(t *testing.T) {
+		f, m, _ := team(t, true, "lead-a")
+		report := api.ActivityReport{RequestID: "agentless-no-item", RunID: m[0].RunID, Activity: stallAgentlessRun(api.MatrixWaitRunning, f.now(), "")}
+		report.Activity.ObservedAt = f.now()
+		if _, err := f.s.ReportActivity(context.Background(), f.task.ID, m[0].ID, report); err == nil {
+			t.Fatal("an agentless wait without an item was stored")
+		}
+	})
+}

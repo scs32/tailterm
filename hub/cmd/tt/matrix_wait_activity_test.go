@@ -200,7 +200,8 @@ func TestMatrixWaitFor(t *testing.T) {
 // A run started without TAILTERM_AGENT_NAME names no agent (empty, or
 // "unknown" as verify-matrix writes it) or names the verifier's agent ID. It
 // is the wait of the agents bound to its item, and of nobody else
-// (wi_6128966a8025aaad).
+// (wi_6128966a8025aaad). Only an entry that names no agent is marked
+// Agentless (wi_ab6db76678163f2b).
 func TestMatrixWaitForAgentless(t *testing.T) {
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	requested := "2026-10-02T11:40:00.000Z"
@@ -214,15 +215,15 @@ func TestMatrixWaitForAgentless(t *testing.T) {
 	for _, agent := range []string{"", "unknown"} {
 		entry := matrixEntry("22", matrixTestItem, agent, requested)
 		write(matrixLockJSON("test-mini", entry, other))
-		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}) || !w.Valid() {
+		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since, Agentless: true}) || !w.Valid() {
 			t.Fatalf("agent %q holder: %+v", agent, w)
 		}
 		write(matrixLockV2JSON("test-mini", []string{other}, other, entry))
-		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 2, Length: 2, Since: since}) || !w.Valid() {
+		if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitWaiting, Item: matrixTestItem, Position: 2, Length: 2, Since: since, Agentless: true}) || !w.Valid() {
 			t.Fatalf("agent %q waiter: %+v", agent, w)
 		}
 		write(matrixLockV2JSON("test-mini", []string{other, entry}))
-		if w := matrixWaitFor(bound, now); w == nil || w.Role != api.MatrixWaitRunning || w.Item != matrixTestItem {
+		if w := matrixWaitFor(bound, now); w == nil || w.Role != api.MatrixWaitRunning || w.Item != matrixTestItem || !w.Agentless {
 			t.Fatalf("agent %q version 2 holder: %+v", agent, w)
 		}
 		cases := map[string]struct {
@@ -261,7 +262,7 @@ func TestMatrixWaitForAgentless(t *testing.T) {
 		t.Fatalf("agent ID waiter: %+v", w)
 	}
 	write(matrixLockJSON("test-mini", matrixEntry("22", "unknown", unbound.ID, requested)))
-	if w := matrixWaitFor(unbound, now); w == nil || w.Item != "" {
+	if w := matrixWaitFor(unbound, now); w == nil || w.Item != "" || w.Agentless {
 		t.Fatalf("unbound agent ID without an item: %+v", w)
 	}
 	for name, c := range map[string]struct {
@@ -275,6 +276,11 @@ func TestMatrixWaitForAgentless(t *testing.T) {
 		if w := matrixWaitFor(c.agent, now); w != nil {
 			t.Fatalf("%s: %+v", name, w)
 		}
+	}
+	// The agent's name is a named wait too.
+	write(matrixLockJSON("test-mini", matrixEntry("22", matrixTestItem, bound.Name, requested), other))
+	if w := matrixWaitFor(bound, now); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: matrixTestItem, Since: since}) {
+		t.Fatalf("agent name holder: %+v", w)
 	}
 	// Named entries keep their place: another agent's named entry is still
 	// not the bound agent's, even on its item.
@@ -357,6 +363,21 @@ func TestMatrixWaitReportKey(t *testing.T) {
 	}
 	if !sameActivityKey(waiting, wait(api.MatrixWaitWaiting, 2, since)) || sameActivityKey(waiting, idle) {
 		t.Fatal("saved key comparison")
+	}
+	// A named wait's key is the one built before the agentless mark existed,
+	// so an upgraded relay sends no report for a steady named wait; an
+	// agentless wait is a new report (wi_ab6db76678163f2b).
+	running := wait(api.MatrixWaitRunning, 0, since)
+	running.MatrixWait.Length = 0
+	if got, want := matrixWaitKey(running.MatrixWait), "\x00matrix=running\x00"+matrixTestItem+"\x00"+since.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("named wait key changed: %q, want %q", got, want)
+	}
+	agentless := running
+	mark := *running.MatrixWait
+	mark.Agentless = true
+	agentless.MatrixWait = &mark
+	if activityReportKey(agentless) == activityReportKey(running) || sameActivityKey(activityReportKey(running), agentless) {
+		t.Fatal("an agentless wait must be a new report")
 	}
 }
 

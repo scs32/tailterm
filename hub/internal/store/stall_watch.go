@@ -136,7 +136,8 @@ func stallWatchNight(now time.Time) bool {
 // that leaves it) and when its matrix wait last ended (the first report
 // without the wait). Any other report changes no row. The report that ends a
 // matrix wait, or replaces it with another run's, also posts that run's one
-// notice to the reporting agent.
+// notice to the reporting agent; for an agentless run only the recipient's
+// own report posts it.
 func (s *Store) stallWatchActivityHook(ctx context.Context, tx *sql.Tx, task, agent, run, oldState string, activity api.AgentActivity) error {
 	observed := ts(activity.ObservedAt)
 	waiting := activity.MatrixWait.Valid()
@@ -203,7 +204,9 @@ func matrixRunReplaced(previous, current *api.MatrixWait) bool {
 // postMatrixRunEnded posts the run-end notice for the wait in the run's
 // previous report, when the current report ends it or carries another run's.
 // It is reached once per stored report whose run was in a wait, and a report
-// is stored once, so a run gets one notice.
+// is stored once, so a run gets one notice. An agentless run is the wait of
+// every member bound to its item, so only its one recipient's report posts
+// the notice, which names it the team's run (wi_ab6db76678163f2b).
 func (s *Store) postMatrixRunEnded(ctx context.Context, tx *sql.Tx, task, agent, run string, activity api.AgentActivity) error {
 	var ended *api.MatrixWait
 	var payload string
@@ -215,6 +218,16 @@ func (s *Store) postMatrixRunEnded(ctx context.Context, tx *sql.Tx, task, agent,
 	}
 	if activity.MatrixWait.Valid() && (ended == nil || !matrixRunReplaced(ended, activity.MatrixWait)) {
 		return nil
+	}
+	agentless := ended != nil && ended.Agentless && ended.Item != ""
+	if agentless {
+		id, runID, err := agentlessRunRecipient(ctx, tx, task, ended.Item)
+		if err != nil {
+			return err
+		}
+		if id != agent || runID != run {
+			return nil
+		}
 	}
 	to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=? AND run_id=?`, agent, run))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -251,12 +264,33 @@ func (s *Store) postMatrixRunEnded(ctx context.Context, tx *sql.Tx, task, agent,
 		}
 	}
 	text := "Your verification run"
+	if agentless {
+		refs["matrixAgentless"] = "true"
+		text = "Your team's verification run"
+	}
 	if item != "" {
 		refs["item"] = item
 		text += " for " + item
 	}
 	text += place + " " + fmt.Sprintf(body, endedAt) + matrixRunEndedClose
 	return s.postBrokerNotice(ctx, tx, project, to, to.Name, matrixRunEndedSubject, matrixRunEndedSubject, text, refs)
+}
+
+// agentlessRunRecipient is the one member told that an agentless run on the
+// item ended: the item lead's current run, else the earliest-bound live run
+// on the item, else none.
+func agentlessRunRecipient(ctx context.Context, tx *sql.Tx, task, item string) (string, string, error) {
+	var id, run string
+	err := tx.QueryRowContext(ctx, `SELECT a.id,a.run_id FROM item_team_leads l JOIN agents a ON a.id=l.agent_id AND a.run_id=l.run_id
+WHERE l.task_id=? AND l.item_id=? AND l.state<>'closed' AND a.status NOT IN (?,?)`, task, item, api.AgentClosed, api.AgentExited).Scan(&id, &run)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx, `SELECT a.id,a.run_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
+WHERE a.task_id=? AND b.item_id=? AND a.status NOT IN (?,?) ORDER BY b.created_at,b.agent_id LIMIT 1`, task, item, api.AgentClosed, api.AgentExited).Scan(&id, &run)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	return id, run, err
 }
 
 // stallAgent is one watched run: the helper, or a team member.
