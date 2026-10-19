@@ -1841,7 +1841,36 @@ function setDefaultFont(delta) {
   const output = $("#font-size-value");
   if (output) output.textContent = appearance.fontSize + " px";
 }
+// The dialog's own text uses the chosen terminal face, pinned when it opens.
+// A face still downloading would rewrap it on arrival, so wait briefly for
+// it; past the bound, open in the generic fallback, which needs no download.
+const APPEARANCE_FONT_WAIT_MS = 300;
+let appearanceOpening = false;
 function appearanceDialog() {
+  if (appearanceOpening) return;
+  const family = fonts[appearance.font].family;
+  // Reads each face's own status: WebKit's document.fonts.check reports a
+  // face still downloading as available.
+  const name = family.split(",")[0].replace(/["']/g, "").trim();
+  const faces = [...document.fonts].filter(
+    (face) => face.family.replace(/["']/g, "") === name,
+  );
+  const ready = () => faces.every((face) => face.status === "loaded");
+  if (ready()) return openAppearanceDialog(family);
+  const button = $("#appearance"),
+    sequence = dialogSequence;
+  appearanceOpening = true;
+  void Promise.race([
+    Promise.all(faces.map((face) => face.load())).catch(() => {}),
+    new Promise((r) => setTimeout(r, APPEARANCE_FONT_WAIT_MS)),
+  ]).then(() => {
+    appearanceOpening = false;
+    // Another dialog or a lock during the wait supersedes this open.
+    if (!button?.isConnected || dialogSequence !== sequence) return;
+    openAppearanceDialog(ready() ? family : "monospace");
+  });
+}
+function openAppearanceDialog(family) {
   dialog(
     "Make it yours",
     `<p class="fine">Changes apply immediately and are saved on this browser.</p>
@@ -1886,10 +1915,7 @@ function appearanceDialog() {
     if (!(await attentionSound.preview()))
       notice("Audio is unavailable. Check your browser’s sound settings.");
   };
-  $("#dialog").style.setProperty(
-    "--appearance-ui-font",
-    fonts[appearance.font].family,
-  );
+  $("#dialog").style.setProperty("--appearance-ui-font", family);
   appearancePreview = createAppearancePreview(
     $("#appearance-preview"),
     appearance,

@@ -42,8 +42,8 @@ try {
       // Waits, at most 5 s, until every font the page asked for has loaded
       // and that layout has been painted, and fails naming any face still
       // pending.
-      const settleFonts = async (label) => {
-        const pending = await page.evaluate(async () => {
+      const settleFonts = async (label, target = page) => {
+        const pending = await target.evaluate(async () => {
           const deadline = performance.now() + 5000;
           do {
             await Promise.race([
@@ -145,8 +145,177 @@ try {
           }
       }
       assert.deepEqual(errors, []);
+      // With a Nerd Font chosen as the terminal font, the dialog text uses
+      // that face. Each case starts a fresh context so the face is not cached.
+      const delayMs = Number(process.env.APPEARANCE_FONT_DELAY_MS || 150);
+      const waits = [];
+      for (const font of ["cascadia", "fira"])
+        for (const arrival of ["held", "delayed", "stale"]) {
+          const label = `${engine.name()} ${font} ${arrival}`;
+          const context = await browser.newContext({
+            viewport: { width: 1100, height: 800 },
+          });
+          try {
+            await context.addInitScript((font) => {
+              if (!localStorage.getItem("tailserve.appearance"))
+                localStorage.setItem(
+                  "tailserve.appearance",
+                  JSON.stringify({ font }),
+                );
+              // Records when each dialog opens, and whether the click that
+              // asked for it had already opened it when its handlers ran.
+              window.showModals = [];
+              const showModal = HTMLDialogElement.prototype.showModal;
+              HTMLDialogElement.prototype.showModal = function () {
+                window.showModals.push(performance.now());
+                return showModal.call(this);
+              };
+              document.addEventListener(
+                "click",
+                (e) => {
+                  if (e.target.closest?.("#appearance"))
+                    window.clickedAt ??= performance.now();
+                },
+                true,
+              );
+              document.addEventListener("click", (e) => {
+                if (e.target.closest?.("#appearance"))
+                  window.openInClick = document.querySelector("#dialog").open;
+              });
+            }, font);
+            const page = await context.newPage();
+            page.setDefaultTimeout(10000);
+            const caseErrors = [];
+            page.on("pageerror", (e) => caseErrors.push(e.message));
+            let releaseFaces;
+            const facesHeld = new Promise((r) => (releaseFaces = r));
+            await page.route(/-nerd-[^/]*\.woff2$/, async (route) => {
+              await facesHeld;
+              await route.continue();
+            });
+            await page.goto(`${origin}/`);
+            await page
+              .locator("#password")
+              .fill("temporary appearance test password");
+            await page.locator("#unlock-button").click();
+            await page.locator("#appearance").waitFor();
+            const metrics = () =>
+              page.locator("#dialog").evaluate(async (d) => {
+                for (let frame = 0; frame < 2; frame++)
+                  await new Promise(requestAnimationFrame);
+                const strong = d.querySelector(".font-choice strong");
+                return {
+                  height: d.scrollHeight,
+                  card: d.querySelector(".font-grid").getBoundingClientRect()
+                    .height,
+                  uiFont: d.style.getPropertyValue("--appearance-ui-font"),
+                  textFont: getComputedStyle(strong).fontFamily,
+                  textWidth: strong.getBoundingClientRect().width,
+                };
+              });
+            const family = await page.evaluate(
+              (font) =>
+                [...document.fonts].find((f) =>
+                  f.family.toLowerCase().includes(font),
+                ).family,
+              font === "cascadia" ? "caskaydia" : "firacode",
+            );
+            if (arrival === "delayed") setTimeout(releaseFaces, delayMs);
+            await page.locator("#appearance").click();
+            // A repeated click during the wait must not open a second time.
+            if (arrival === "held")
+              await page.evaluate(() =>
+                document.querySelector("#appearance").click(),
+              );
+            if (arrival === "stale") {
+              // Another dialog opened during the wait keeps the screen.
+              await page.locator("#keys").click();
+              await page.waitForTimeout(500);
+              assert.equal(
+                await page.locator("#dialog .theme-grid").count(),
+                0,
+                `${label}: a stale wait does not open over another dialog`,
+              );
+              assert.equal(
+                await page.evaluate(() => window.showModals.length),
+                1,
+                `${label}: only the other dialog opened`,
+              );
+              releaseFaces();
+              assert.deepEqual(caseErrors, []);
+              continue;
+            }
+            await page.locator("#dialog .theme-grid").waitFor();
+            const opened = await page.evaluate(() => ({
+              wait: Math.round(window.showModals[0] - window.clickedAt),
+              count: window.showModals.length,
+              inClick: window.openInClick,
+              fonts: document.fonts.status,
+            }));
+            const early = await metrics();
+            releaseFaces();
+            await settleFonts(
+              `${font} ${arrival} after the face arrives`,
+              page,
+            );
+            assert.deepEqual(
+              await metrics(),
+              early,
+              `${label}: the dialog keeps its size and wrapping when the chosen face arrives`,
+            );
+            assert.ok(early.textWidth > 0, `${label}: dialog text is visible`);
+            assert.equal(opened.inClick, false, `${label}: the open waited`);
+            assert.ok(
+              opened.wait < 450,
+              `${label}: the open waited at most the 300 ms bound, took ${opened.wait} ms`,
+            );
+            assert.equal(opened.count, 1, `${label}: the dialog opened once`);
+            if (arrival === "held") {
+              assert.equal(
+                opened.fonts,
+                "loading",
+                `${label}: the chosen face was held while the dialog opened`,
+              );
+              assert.ok(
+                opened.wait >= 290,
+                `${label}: the open waited for the bound, took ${opened.wait} ms`,
+              );
+              assert.equal(
+                early.uiFont,
+                "monospace",
+                `${label}: the dialog opened in the fallback, which needs no download`,
+              );
+            } else
+              assert.equal(
+                early.uiFont.split(",")[0].replace(/"/g, ""),
+                family.replace(/"/g, ""),
+                `${label}: a face arriving within the bound is used`,
+              );
+            waits.push(`${font} ${arrival} ${opened.wait} ms`);
+            // The face is loaded now, so the next open is not delayed.
+            await page.locator("#dialog-close").click();
+            await page.locator("#appearance").click();
+            const reopened = await page.evaluate(() => window.openInClick);
+            assert.equal(
+              reopened,
+              true,
+              `${label}: with the face loaded, the dialog opens within the click`,
+            );
+            assert.equal(
+              (await metrics()).uiFont.split(",")[0].replace(/"/g, ""),
+              family.replace(/"/g, ""),
+              `${label}: the reopened dialog uses the chosen face`,
+            );
+            assert.deepEqual(caseErrors, []);
+          } finally {
+            await context.close();
+          }
+        }
       console.log(
         `${engine.name()}: theme/font switching preserves dialog layout on desktop and mobile.`,
+      );
+      console.log(
+        `${engine.name()}: a chosen Nerd Font arriving late keeps the dialog layout; opens waited ${waits.join(", ")} (face delay ${delayMs} ms).`,
       );
     } finally {
       await browser.close();
