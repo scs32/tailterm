@@ -1818,8 +1818,9 @@ type releaseWindowLedger struct {
 // runner selected every target from its own baseline through it, unlike the
 // no-change finish, which has no push and never selects; or (S2) the commit of
 // a hand release naming every covered target. The causes, first match wins:
-// (U1) a published job whose own diff is covered, not reverted, and no job of
-// its entry released or superseded; (U2) a hand release that omits a covered
+// (U1) a published job whose own or integrated diff is covered, with no
+// committed revert in its receipt, and no job of its entry released or
+// superseded; (U2) a hand release that omits a covered
 // target, recorded after the newest sync record.
 func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w releaseWindow) (releaseWindowLedger, error) {
 	out := releaseWindowLedger{sync: map[string]bool{}}
@@ -1849,8 +1850,11 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 				newest = at
 			}
 		}
+		// A batch publishes its members' changes with its lead, which only
+		// the lead's integrated plan records.
 		reverted := j.Receipt != nil && j.Receipt.Revert != nil && j.Receipt.Revert.Outcome == "committed"
-		if j.Published && j.State != "released" && j.State != "superseded" && !reverted && releaseWindowCovers(w, j.Plan.Changed) {
+		covered := releaseWindowCovers(w, j.Plan.Changed) || (j.IntegratedPlan != nil && releaseWindowCovers(w, j.IntegratedPlan.Changed))
+		if j.Published && j.State != "released" && j.State != "superseded" && !reverted && covered {
 			unreleased = append(unreleased, j)
 		}
 	}

@@ -1545,10 +1545,14 @@ A *sync commit* is a commit at which every covered target is current:
 
 The first of these that applies covers the job:
 
-- U1: a job of the project is `published`, not `released` or `superseded`, not
-  rolled back by a committed revert, its own paths are covered, and no job of
-  its queue entry is `released` or `superseded`. Example: a job refused or
-  blocked after publishing that waits for a hand release.
+- U1: a job of the project is `published`, not `released` or `superseded`, its
+  receipt records no committed revert (whatever its outcome), its own paths or
+  its integrated plan's paths are covered, and no job of its queue entry is
+  `released` or `superseded`. The integrated plan counts because a batch
+  publishes its members' changes with its lead, while the members stay
+  unpublished until they release. Example: a job refused or blocked after
+  publishing that waits for a hand release, or a docs-only lead blocked with a
+  hub member in its batch.
 - U2: a hand release that omits a covered target was recorded after the newest
   sync record (the receipt's `settledAt` or the hand release's `createdAt`,
   compared as times).

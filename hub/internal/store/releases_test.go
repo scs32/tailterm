@@ -6451,6 +6451,79 @@ func TestReleaseWindowHoldsDocsJobBehindPublishedRefusal(t *testing.T) {
 	}
 }
 
+// wi_d87f594a6ae13ec9 a1 (review #40218 b1): a batch publishes its members'
+// changes with its lead. A docs-only lead blocked with a hub member holds a
+// docs-only job on the same sync base, naming the lead.
+func TestReleaseWindowHoldsDocsJobBehindBlockedBatch(t *testing.T) {
+	s, task, h, d, _ := releaseFixture(t)
+	ctx := context.Background()
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+	recordHandReleaseOf(t, s, task, "sync", candidateC, []string{candidateC}, "hub", "bridge", "mini")
+	lead := windowEnqueue(t, s, task, h, "enqueue-lead", releaseEntryOn(t, s, task, "lead docs", "lead-docs", candidateC, "docs/lead.md"))
+	member := windowEnqueue(t, s, task, h, "enqueue-member", releaseEntryOn(t, s, task, "member store", "member-store", candidateC, "hub/internal/store/m.go"))
+	early := windowEnqueue(t, s, task, h, "enqueue-early", releaseEntryOn(t, s, task, "early docs", "early-docs", candidateC, "docs/a.md"))
+	if early.State != "verified" {
+		t.Fatalf("docs job outside the window %+v", early)
+	}
+	act := func(key, op string, j api.ReleaseJob, entry, commit string) api.ReleaseJob {
+		t.Helper()
+		out, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, EntryID: entry, IntegratedCommit: commit})
+		if err != nil {
+			t.Fatal(key, err)
+		}
+		return out
+	}
+	lead = act("claim", "claim", lead, "", "")
+	lead = act("batch-open", "batch-open", lead, "", batchBase)
+	lead = act("batch-add-lead", "batch-add", lead, lead.EntryID, batchTo(1))
+	lead = act("batch-add-member", "batch-add", lead, member.EntryID, candidateA)
+	imported := integratedImport(lead, h, d, "import", lead.Plan.Checks)
+	imported.Plan.Changed = []string{"docs/lead.md", "hub/internal/store/m.go"}
+	r := passingVerification(*imported.Plan)
+	imported.Verification = &r
+	var err error
+	if lead, err = s.ReleaseAction(ctx, task.ID, imported); err != nil {
+		t.Fatal("import", err)
+	}
+	lead = act("merged", "merged", lead, "", candidateA)
+	finish := api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: lead.ID, ExpectedGeneration: lead.Generation}
+	finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: lead.ID, Commit: candidateA, VerificationDigest: lead.VerificationDigest, Outcome: "blocked", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture-batch", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "failed"}}}
+	if lead, err = s.ReleaseAction(ctx, task.ID, finish); err != nil || lead.State != "blocked" || !lead.Published {
+		t.Fatal("blocked lead", lead.State, err)
+	}
+	if m, err := releaseLoad(ctx, s.db, task.ID, member.ID); err != nil || m.Published {
+		t.Fatal("member published", err)
+	}
+	cause := "job " + lead.ID + " was published and is not released"
+
+	// The blocked batch fences claims until the handler refuses its lead with
+	// restoration evidence; the lead stays published and unreleased.
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	if _, err = s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	evidence := recoveryEvidence(t, s, task, h, lead)
+	evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+	if lead, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: lead.ID, ExpectedGeneration: lead.Generation, Reconciliation: &evidence}); err != nil || lead.State != "refused" || !lead.Published {
+		t.Fatal("refused lead", lead.State, err)
+	}
+	if _, err = s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+	if _, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-early", d, early)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "release quiet window 22:00-07:00") || !strings.HasSuffix(err.Error(), "; "+cause) {
+		t.Fatal("W3 claim of the docs job", err)
+	}
+	late := windowEnqueue(t, s, task, h, "enqueue-late", releaseEntryOn(t, s, task, "late docs", "late-docs", candidateC, "docs/b.md"))
+	if late.State != "held" || late.Hold == nil || !strings.HasSuffix(late.Hold.Reason, "; "+cause) {
+		t.Fatalf("W1 docs job %+v", late.Hold)
+	}
+	if listed := pageJob(t, windowPage(t, s, task), early.ID); listed.State != "held" || !strings.HasSuffix(listed.Hold.Reason, "; "+cause) {
+		t.Fatalf("W2 swept docs job %+v", listed)
+	}
+}
+
 // wi_d87f594a6ae13ec9 a2 (q1, example b): a docs-only job whose base is an
 // owner commit with no hand-release record is held and its claim refused; the
 // owner's record of that commit lets the next one release. The window hold is
