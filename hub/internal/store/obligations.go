@@ -874,7 +874,7 @@ func reassignedEnvelope(original api.Message, toName string, seq int64) *api.Env
 		Refs: map[string]string{"reassignedFrom": fmt.Sprint(seq)}, Body: api.EnvelopeBody{Ask: ask}}
 }
 
-var reassignedScopedName = regexp.MustCompile(`(?i)\b[a-z][a-z0-9_-]*-[0-9a-f]{7,}\b`)
+var reassignedScopedName = regexp.MustCompile(`(?i)\b[a-z0-9][a-z0-9_-]*-[0-9a-f]{7,}\b`)
 
 func reassignedSubject(toName, original string) string {
 	prefix := "Reassigned to " + toName + ": "

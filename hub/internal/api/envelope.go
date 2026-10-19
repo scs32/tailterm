@@ -150,7 +150,7 @@ var (
 	refKey            = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
 	subjectID         = regexp.MustCompile(`(?i)\b[a-z]{2,5}_([0-9a-f]{6,})\b`)
 	subjectHex        = regexp.MustCompile(`(?i)\b[0-9a-f]{7,}\b`)
-	brokerAgentSuffix = regexp.MustCompile(`(?i)^[a-z][a-z0-9_-]*-[0-9a-f]{7,}$`)
+	brokerAgentSuffix = regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]*-[0-9a-f]{7,}$`)
 	subjectDigit      = regexp.MustCompile(`[0-9]`)
 	subjectLetter     = regexp.MustCompile(`(?i)[a-f]`)
 	// Filesystem paths only: home-relative, well-known roots, or a nested path
