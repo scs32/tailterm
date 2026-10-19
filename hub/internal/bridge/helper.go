@@ -960,6 +960,8 @@ func entryStage(e api.TeamQueueEntry) string {
 		return "releasing"
 	case e.Release != nil && e.Release.State == "blocked":
 		return "release blocked"
+	case e.Release != nil && e.Release.State == "held":
+		return "release on hold"
 	case e.Integration != nil:
 		return "ready to integrate"
 	case e.Verification != nil && e.Verification.State != "":

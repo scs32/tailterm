@@ -1099,3 +1099,29 @@ func TestHelperRateLimitUsesMessageTime(t *testing.T) {
 		}
 	}
 }
+
+// A release job on owner hold has its own stage, ahead of the integration,
+// verification and review stages it would otherwise fall through to.
+func TestHelperEntryStage(t *testing.T) {
+	ready := &api.TeamIntegrationReady{}
+	for _, c := range []struct {
+		entry api.TeamQueueEntry
+		want  string
+	}{
+		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "held"}, Integration: ready}, "release on hold"},
+		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "verified"}}, "releasing"},
+		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "claimed"}}, "releasing"},
+		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "merged"}}, "releasing"},
+		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "blocked"}}, "release blocked"},
+		{api.TeamQueueEntry{State: "running", Integration: ready}, "ready to integrate"},
+		{api.TeamQueueEntry{State: "running"}, "running"},
+	} {
+		release := "none"
+		if c.entry.Release != nil {
+			release = c.entry.Release.State
+		}
+		if got := entryStage(c.entry); got != c.want {
+			t.Errorf("entryStage with release %s = %q, want %q", release, got, c.want)
+		}
+	}
+}
