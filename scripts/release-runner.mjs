@@ -2441,8 +2441,13 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
 // A clean stop (SIGTERM or SIGINT) of a run that holds a claimed job with no
 // effects gives the claim back with tt deployment unclaim, an exact-run record
 // that needs no incident or prevention item, and archives the claim's journal
-// as ID.json.unclaimed-gN; the job is verified again in its queue place. Any
-// other claim of this run, or any failure here, is left as it is for handler
+// as ID.json.unclaimed-gN; the job is verified again in its queue place. An
+// unclaim call that throws (a lost reply, or one that fails validation) is
+// followed by one read of that job, a single ten-second try with no retry:
+// only a job the hub shows verified at a later generation, naming no run,
+// with the same pins and an unclaimed record of this agent and run last, is
+// reported returned and its journal archived as on success. Any other claim
+// of this run, or any failure here, is left as it is for handler
 // reconciliation (docs/project-deployment.md, "Pause").
 function stopRelease(config){
   const agent=process.env.TAILTERM_AGENT,run=process.env.TAILTERM_RUN,safe=id=>/^rel_[A-Za-z0-9_-]{1,64}$/.test(id||"")?id:"unknown";
@@ -2455,7 +2460,15 @@ function stopRelease(config){
     const details=new Map([[owned.id,readReleaseDetail(read,owned)]]),job=details.get(owned.id);
     const id=unclaimableJob({jobs,details,agent,run,journalDirectory:config.journalDirectory,lock:hostLockPath(config.cwd,job),matrixChildren:MATRIX_CHILDREN.size});
     if(id){
-      const next=new HostAdapter(config,job).native("unclaim"),path=join(config.journalDirectory,id+".json");
+      let next;
+      try{next=new HostAdapter(config,job).native("unclaim");}
+      catch{
+        const current=JSON.parse(reader.command([config.tt||"tt","deployment","get","--job",id],config.cwd,{timeout:10000,retry:false})),last=current?.reconciliations?.at?.(-1);
+        const pins=["id","taskId","entryId","itemId","itemRevision","scopeRevision","orderMessageSeq","commit","verificationDigest","pauseGeneration"];
+        if(current?.summary===true || current?.state!=="verified" || current.agentId!==undefined || current.runId!==undefined || !Number.isSafeInteger(current.generation) || current.generation<=job.generation || !pins.every(k=>current[k]===job[k]) || last?.disposition!=="unclaimed" || last.jobId!==id || last.agentId!==agent || last.runId!==run)throw releaseError("Unclaim not confirmed");
+        next=current;
+      }
+      const path=join(config.journalDirectory,id+".json");
       // setAsideJournal archives it before the next claim if this rename fails.
       let archived="journal archived";try{renameSync(path,`${path}.unclaimed-g${next.generation}`);}catch{archived="its journal is archived before the next claim";}
       process.stderr.write(`Release ${safe(id)} returned to verified at stop; ${archived}.\n`);return;

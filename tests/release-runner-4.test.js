@@ -380,10 +380,11 @@ test("a sparse backup over 2 GiB hashes through the input producer and the rehea
 import {setAsideJournal,unclaimableJob} from "../scripts/release-runner.mjs";
 // The fake hub's unclaim, as the hub answers it: verified, no run, one more
 // unclaimed record, saved in place. refuse makes it a refusal instead.
-const unclaimHook=(refuse=false)=>`if(a[1]==='unclaim'){${refuse?"process.stderr.write('tt: conflict: only a claimed job with no effects can be unclaimed\\n');process.exit(1);":""}
-const path=require('path').join(require('path').dirname(process.argv[1]),'jobs.json'),{agentId,runId,integratedCommit,...rest}=job;
+const unclaimSave=`const path=require('path').join(require('path').dirname(process.argv[1]),'jobs.json'),{agentId,runId,integratedCommit,...rest}=job;
 const next={...rest,state:'verified',generation:+flag('--generation')+1,reconciliations:[...(job.reconciliations||[]),{disposition:'unclaimed',jobId:job.id,agentId,runId,journalState:'no_effects',noPublication:true}]};
-jobs.splice(jobs.indexOf(job),1,next);fs.writeFileSync(path,JSON.stringify(jobs));console.log(JSON.stringify(next));process.exit(0);}`;
+jobs.splice(jobs.indexOf(job),1,next);fs.writeFileSync(path,JSON.stringify(jobs));`;
+const unclaimHook=(refuse=false)=>`if(a[1]==='unclaim'){${refuse?"process.stderr.write('tt: conflict: only a claimed job with no effects can be unclaimed\\n');process.exit(1);":""}
+${unclaimSave}console.log(JSON.stringify(next));process.exit(0);}`;
 const waitingJournal=(h,job,over={})=>heldJournal(h,job,{phase:"waiting_inputs",refusalReason:undefined,refuseFailure:undefined,integrated:"d".repeat(40),...over});
 const stopAttempt=(h,run)=>{const dir=join(h.home,"rel_held-integrated-verification","d".repeat(40)+"-r0");mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),run);};
 const unclaims=h=>h.calls().filter(c=>c.argv[1]==="unclaim").map(c=>c.argv);
@@ -471,6 +472,57 @@ test("stop3 setAsideJournal archives an unclaimed job's exact no-effect journal 
  bytes=write();
  for(const job of [record("requeue"),record("unclaimed",{state:"claimed"}),{...record("unclaimed"),reconciliations:[]}])assert.equal(setAsideJournal(path,job),"none");
  assert.equal(readFileSync(path,"utf8"),bytes);
+});
+// An unclaim the hub saved whose reply was lost or failed validation
+// (wi_9a8037eb1a0d543e, order #39143): reply is the fake hub's answer after
+// saving it, and reread, when set, answers the one get that follows.
+const savedUnclaimHook=(reply,reread="")=>`if(a[1]==='get'&&fs.existsSync(require('path').join(require('path').dirname(process.argv[1]),'unclaimed'))){${reread}}
+if(a[1]==='unclaim'){${unclaimSave}fs.writeFileSync(require('path').join(require('path').dirname(process.argv[1]),'unclaimed'),'');${reply}}`;
+const rereadAs=over=>`console.log(JSON.stringify({...jobs.find(j=>j.id==='rel_held'),...${over}}));process.exit(0);`;
+// The gets made after the unclaim call: the stop's one re-read, or none.
+const rereads=h=>{const argvs=h.calls().map(c=>c.argv),i=argvs.findIndex(a=>a[1]==="unclaim");return argvs.slice(i+1).filter(a=>a[1]==="get");};
+test("stop5 an unclaim that throws is followed by one re-read: returned only when the hub shows this run's unclaim saved",async t=>{
+ const LOST="process.exit(1);",RETURNED="Release rel_held returned to verified at stop; journal archived.\n",REREAD=[["deployment","get","--job","rel_held"]];
+ const returned=[
+  ["the unclaim reply is lost",LOST],
+  ["the unclaim reply is not JSON","console.log('{');process.exit(0);"],
+  ["the unclaim reply fails validation","console.log(JSON.stringify({...next,generation:next.generation+5}));process.exit(0);"],
+ ];
+ for(const [name,reply] of returned){
+  const r=codeRepo(t),h=codeHost(t,r.cwd,savedUnclaimHook(reply)),own=heldOwn();waitingJournal(h,own);h.setJobs([own]);
+  const before=readFileSync(join(h.home,"rel_held.json"),"utf8");
+  assert.equal(await stopped(h),RETURNED,name);
+  assert.equal(unclaims(h).length,1,name);assert.deepEqual(rereads(h),REREAD,name);
+  assert.equal(existsSync(join(h.home,"rel_held.json")),false,name);assert.equal(readFileSync(join(h.home,"rel_held.json.unclaimed-g3"),"utf8"),before,name);
+  const [freed]=ledger(h);assert.deepEqual([freed.state,freed.generation,freed.agentId,freed.runId],["verified",3,undefined,undefined],name);
+ }
+ // [name, hook, the gets after the unclaim]: the job stays held and its journal untouched.
+ const held=[
+  ["the hub refuses the unclaim, so the re-read shows it still claimed by this run",unclaimHook(true)],
+  ["the re-read fails",savedUnclaimHook(LOST,"process.exit(1);")],
+  ["the re-read fails in transport and is not retried",savedUnclaimHook(LOST,"process.stderr.write('tt: hub: 503\\n');process.exit(1);")],
+  ["the re-read is not JSON",savedUnclaimHook(LOST,"console.log('{');process.exit(0);")],
+  ["the re-read shows the job claimed again",savedUnclaimHook(LOST,rereadAs(`{state:'claimed',generation:4,agentId:'agt_other',runId:'run_other'}`))],
+  ["the re-read shows it verified naming a run",savedUnclaimHook(LOST,rereadAs(`{agentId:${JSON.stringify(CODE_AGENT)},runId:${JSON.stringify(CODE_RUN)}}`))],
+  ["the re-read shows it at the claim's generation",savedUnclaimHook(LOST,rereadAs("{generation:2}"))],
+  ["the re-read shows another commit",savedUnclaimHook(LOST,rereadAs(`{commit:'${"d".repeat(40)}'}`))],
+  ["the re-read is a summary",savedUnclaimHook(LOST,rereadAs("{summary:true}"))],
+  ["the re-read's last record is another run's unclaim",savedUnclaimHook(LOST,rereadAs("{reconciliations:[{disposition:'unclaimed',jobId:'rel_held',agentId:'agt_other',runId:'run_other'}]}"))],
+  ["the re-read's last record is a set-aside",savedUnclaimHook(LOST,rereadAs(`{reconciliations:[{disposition:'set_aside',jobId:'rel_held',agentId:${JSON.stringify(CODE_AGENT)},runId:${JSON.stringify(CODE_RUN)}}]}`))],
+  ["the re-read has no records",savedUnclaimHook(LOST,rereadAs("{reconciliations:[]}"))],
+ ];
+ for(const [name,hook] of held){
+  const r=codeRepo(t),h=codeHost(t,r.cwd,hook),own=heldOwn();waitingJournal(h,own);h.setJobs([own]);
+  const journal=readFileSync(join(h.home,"rel_held.json"),"utf8");
+  assert.equal(await stopped(h),HELD_LINE,name);
+  assert.equal(unclaims(h).length,1,name);assert.deepEqual(rereads(h),REREAD,name);
+  assert.equal(readFileSync(join(h.home,"rel_held.json"),"utf8"),journal,name);
+  assert.deepEqual(readdirSync(h.home).filter(n=>n.includes(".unclaimed-")),[],name);assert.equal(h.claims().length,0,name);
+ }
+ // A successful unclaim is not re-read.
+ const r=codeRepo(t),h=codeHost(t,r.cwd,unclaimHook()),own=heldOwn();waitingJournal(h,own);h.setJobs([own]);
+ assert.equal(await stopped(h),RETURNED);assert.equal(unclaims(h).length,1);assert.deepEqual(rereads(h),[]);
+ assert.equal(existsSync(join(h.home,"rel_held.json.unclaimed-g3")),true);
 });
 test("stop4 a stop signal during the 30 s wait ends the daemon without waiting it out",async t=>{
  const r=codeRepo(t),h=codeHost(t,r.cwd),stop=new AbortController();h.setJobs([]);
