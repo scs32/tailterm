@@ -683,13 +683,24 @@ func (s *Store) teamQueueRelease(ctx context.Context, e *api.TeamQueueEntry) err
 	return nil
 }
 
+// teamQueueReviews reads the item's review state as the convergence listing
+// shows it: a withdrawn, unanswered last round leaves at once. Enforcement
+// still reads the stored state.
+func teamQueueReviews(ctx context.Context, q queryRower, task, item string) (api.ReviewConvergence, error) {
+	v, err := reviewState(ctx, q, task, item)
+	if err == nil {
+		err = dropListedWithdrawnRound(ctx, q, task, &v)
+	}
+	return v, err
+}
+
 // enrichTeamQueueEntry attaches what a listing shows beside the row: its
 // release, reviews, verification, member activity and tokens, handler arm.
 func (s *Store) enrichTeamQueueEntry(ctx context.Context, e *api.TeamQueueEntry) error {
 	if err := s.teamQueueRelease(ctx, e); err != nil {
 		return err
 	}
-	summary, err := reviewState(ctx, s.db, e.TaskID, e.ItemID)
+	summary, err := teamQueueReviews(ctx, s.db, e.TaskID, e.ItemID)
 	if err != nil {
 		return err
 	}
@@ -929,7 +940,7 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 		return out, err
 	}
 	for i := range out.Entries {
-		summary, summaryErr := reviewState(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
+		summary, summaryErr := teamQueueReviews(ctx, s.db, out.Entries[i].TaskID, out.Entries[i].ItemID)
 		if summaryErr != nil {
 			return out, summaryErr
 		}
@@ -1156,7 +1167,7 @@ func (s *Store) GetTeamQueueEntry(ctx context.Context, task, id string) (api.Tea
 	if err == nil {
 		// Like a listing, attach the review state even with no recorded
 		// history: the Delivery view reads its history field.
-		summary, summaryErr := reviewState(ctx, s.db, task, e.ItemID)
+		summary, summaryErr := teamQueueReviews(ctx, s.db, task, e.ItemID)
 		if summaryErr != nil {
 			return e, summaryErr
 		}
@@ -1201,7 +1212,7 @@ func (s *Store) TeamQueueAction(ctx context.Context, task string, req api.TeamQu
 		return e, err
 	}
 	// The action is committed: a failed read must not report it failed.
-	if reviews, reviewsErr := reviewState(ctx, s.db, e.TaskID, e.ItemID); reviewsErr == nil {
+	if reviews, reviewsErr := teamQueueReviews(ctx, s.db, e.TaskID, e.ItemID); reviewsErr == nil {
 		e.Reviews = &reviews
 	}
 	if budget, budgetErr := loadTokenBudget(ctx, s.db, e.TaskID, e.ItemID); budgetErr == nil {

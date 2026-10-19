@@ -2995,3 +2995,95 @@ func TestTeamQueueListingAppendsWaitAndEvaluatesNothing(t *testing.T) {
 		t.Fatalf("listing changed the wait to %s %v", state, err)
 	}
 }
+
+// wi_35cdca209d9ff9f3: every queue read of the item's reviews drops a
+// withdrawn, unanswered last round at once, as ListReviewConvergence does,
+// while an answered round still counts and stored state is unchanged.
+func TestTeamQueueReviewsOmitWithdrawnRound(t *testing.T) {
+	f := withdrawLeadFixture(t)
+	handler := f.stageHandler(t)
+	order := f.ownerOrder(t, "queue-order")
+	f.confirmOwned(t, handler, order, "queue-scope", []string{"fixture.go"})
+	add := api.TeamQueueRequest{RequestID: "queue-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: "/queue/withdrawn", Ownership: []string{"fixture.go"}}
+	entry, err := f.s.TeamQueueAction(f.ctx, f.task.ID, add)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// rounds returns each read path's listed round requests.
+	rounds := func() map[string][]int64 {
+		t.Helper()
+		reads := map[string]*api.ReviewConvergence{}
+		list, err := f.s.ListTeamQueue(f.ctx, f.task.ID)
+		if err != nil || len(list.Entries) != 1 {
+			t.Fatal(list, err)
+		}
+		reads["list"] = list.Entries[0].Reviews
+		host, err := f.s.TeamQueuesByHost(f.ctx, "mini")
+		if err != nil || len(host.Entries) != 1 {
+			t.Fatal(host, err)
+		}
+		reads["host"] = host.Entries[0].Reviews
+		got, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, entry.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reads["get"] = got.Reviews
+		// A retry returns the saved entry with its reviews read now.
+		again, err := f.s.TeamQueueAction(f.ctx, f.task.ID, add)
+		if err != nil || again.ID != entry.ID {
+			t.Fatal(again, err)
+		}
+		reads["action"] = again.Reviews
+		listed, err := f.s.ListReviewConvergence(f.ctx, f.task.ID)
+		if err != nil || len(listed) != 1 {
+			t.Fatal(listed, err)
+		}
+		reads["convergence"] = &listed[0]
+		out := map[string][]int64{}
+		for path, v := range reads {
+			if v == nil {
+				t.Fatal(path, "has no reviews")
+			}
+			out[path] = []int64{}
+			for _, r := range v.Rounds {
+				out[path] = append(out[path], r.RequestSeq)
+			}
+		}
+		return out
+	}
+	want := func(seqs ...int64) map[string][]int64 {
+		out := map[string][]int64{}
+		for _, path := range []string{"list", "host", "get", "action", "convergence"} {
+			out[path] = seqs
+		}
+		return out
+	}
+	answered, err := f.leadReview(candidateA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general"}), "", answered.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	open, err := f.leadReview(candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rounds(); !reflect.DeepEqual(got, want(answered.Seq, open.Seq)) {
+		t.Fatal("unwithdrawn round not listed", got)
+	}
+	if err = f.withdraw(t, open.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if got := rounds(); !reflect.DeepEqual(got, want(answered.Seq)) {
+		t.Fatal("queue reads still count the withdrawn round", got)
+	}
+	// The reads are read-only: stored state keeps the round until a transition.
+	var raw string
+	if err = f.s.db.QueryRowContext(f.ctx, `SELECT state_json FROM review_convergence WHERE task_id=? AND item_id=?`, f.task.ID, f.item.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, fmt.Sprintf(`"requestSeq":%d`, open.Seq)) {
+		t.Fatal("queue read rewrote stored state", raw)
+	}
+}
