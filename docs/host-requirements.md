@@ -55,7 +55,7 @@ Client, plus:
 | Codex CLI | on PATH | `brew install codex` | npm or release binary | `codex` |
 | Codex login | `codex login status` exits 0 | `codex login` | same | `codex login` |
 | Codex Stop hook | `~/.codex/hooks.json` (or `$CODEX_HOME`) has `tt hook stop` | `tt hooks codex --install` | same | `codex Stop hook` |
-| Claude hooks (optional) | the `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PreToolUse`, `PostToolUse` and `PostToolUseFailure` `tt hook ...` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
+| Claude hooks (optional) | the `SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PreToolUse`, `PostToolUse` and `PostToolUseFailure` `tt hook ...` commands and the `SessionStart`, `PreCompact` and `SessionEnd` `tt hook handoff` commands in `~/.claude/settings.json` or `settings.local.json` | `tt hooks claude` | same | `claude hooks` (warn) |
 | Relay service installed | `~/Library/LaunchAgents/com.tailterm.inbox-relay.plist`, or a LaunchDaemon at `/Library/LaunchDaemons/com.tailterm.inbox-relay.plist` | `tt host setup` (`--service daemon` for the LaunchDaemon; [host setup](host-setup.md)) | none yet (to fix) | `relay service installed` |
 | Relay running | `launchctl print gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `system/com.tailterm.inbox-relay`) shows `state = running` | `launchctl kickstart -k gui/UID/com.tailterm.inbox-relay` (a LaunchDaemon: `sudo launchctl kickstart -k system/com.tailterm.inbox-relay`) | none yet (to fix) | `relay running` |
 
@@ -70,7 +70,15 @@ Mapping notes:
   `SessionStart`, `UserPromptSubmit`, `Stop` and `Notification` each need a
   command ending in `hook session-start`, `hook prompt`, `hook stop` and `hook
   notification`, and the tool ledger hooks `PreToolUse`, `PostToolUse` and
-  `PostToolUseFailure` each need one ending in `hook tool`. The Claude hooks are optional
+  `PostToolUseFailure` each need one ending in `hook tool`. The handoff hooks
+  `SessionStart`, `PreCompact` and `SessionEnd` each need one ending in `hook
+  handoff`; `SessionStart` needs both its entries, and one does not stand in
+  for the other. tt host setup installs the handoff hooks whatever the
+  `sessionHandoff` setting says, and they do nothing while it is off, so doctor
+  checks that they are present and does not read the setting
+  ([session-handoff.md](session-handoff.md)). A missing handoff hook is listed
+  as `SessionStart handoff`, `PreCompact handoff` or `SessionEnd handoff`. That
+  makes ten hooks in all. The Claude hooks are optional
   ([tasks.md](tasks.md): "remain optional"), and the Mini has none, so a
   missing hook is `warn`. The Codex Stop hook is required: broker phase 3.1
   relies on it to hold a Codex turn open while work is unacknowledged.

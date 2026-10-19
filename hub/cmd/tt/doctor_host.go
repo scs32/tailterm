@@ -487,15 +487,21 @@ func loginCheck(name, tool string, args []string, fix string) doctorCheck {
 
 // claudeHooksCheck looks for the hooks tt hooks claude prints
 // (internal/adapters ClaudeHooks) in Claude's user settings files: the four
-// session hooks and the PreToolUse, PostToolUse and PostToolUseFailure tool
-// ledger hooks.
+// session hooks, the PreToolUse, PostToolUse and PostToolUseFailure tool
+// ledger hooks, and the SessionStart, PreCompact and SessionEnd handoff hooks.
+// The handoff hooks are installed whatever the host's sessionHandoff setting
+// says and do nothing while it is off, so the check reads presence only, not
+// the setting. A hook is found by its event and command suffix, since
+// SessionStart carries both session-start and handoff.
 func claudeHooksCheck(d *doctorRun) doctorResult {
 	dir := d.p.env("CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		dir = d.home(".claude")
 	}
-	events := []struct{ event, suffix string }{{"SessionStart", "hook session-start"}, {"UserPromptSubmit", "hook prompt"}, {"Stop", "hook stop"},
-		{"Notification", "hook notification"}, {"PreToolUse", "hook tool"}, {"PostToolUse", "hook tool"}, {"PostToolUseFailure", "hook tool"}}
+	events := []struct{ event, suffix, label string }{{"SessionStart", "hook session-start", "SessionStart"}, {"UserPromptSubmit", "hook prompt", "UserPromptSubmit"},
+		{"Stop", "hook stop", "Stop"}, {"Notification", "hook notification", "Notification"}, {"PreToolUse", "hook tool", "PreToolUse"},
+		{"PostToolUse", "hook tool", "PostToolUse"}, {"PostToolUseFailure", "hook tool", "PostToolUseFailure"},
+		{"SessionStart", "hook handoff", "SessionStart handoff"}, {"PreCompact", "hook handoff", "PreCompact handoff"}, {"SessionEnd", "hook handoff", "SessionEnd handoff"}}
 	found := map[string]bool{}
 	for _, name := range []string{"settings.json", "settings.local.json"} {
 		b, err := d.p.readFile(filepath.Join(dir, name))
@@ -516,21 +522,21 @@ func claudeHooksCheck(d *doctorRun) doctorResult {
 			for _, entry := range doc.Hooks[e.event] {
 				for _, h := range entry.Hooks {
 					if strings.HasSuffix(strings.TrimSpace(h.Command), e.suffix) {
-						found[e.event] = true
+						found[e.label] = true
 					}
 				}
 			}
 		}
 	}
 	if len(found) == len(events) {
-		return checkOK("SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure")
+		return checkOK("SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure, and the SessionStart, PreCompact and SessionEnd handoff hooks")
 	}
 	detail := "not installed; optional (docs/tasks.md)"
 	if len(found) > 0 {
 		var missing []string
 		for _, e := range events {
-			if !found[e.event] {
-				missing = append(missing, e.event)
+			if !found[e.label] {
+				missing = append(missing, e.label)
 			}
 		}
 		detail = "no " + strings.Join(missing, ", ") + "; optional (docs/tasks.md)"

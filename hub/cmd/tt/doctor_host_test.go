@@ -453,18 +453,23 @@ printf 'system/com.tailterm.inbox-relay = {\n\tactive count = 1\n\tstate = runni
 	t.Run("claude hooks present", func(t *testing.T) {
 		h := newDoctorHost(t)
 		h.file(".claude/settings.json", `{"hooks":{
-"SessionStart":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook session-start"}]}],
+"SessionStart":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook session-start"}]},
+{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook handoff","timeout":1}]}],
 "UserPromptSubmit":[{"hooks":[{"type":"command","command":"tt hook prompt"}]}],
 "Notification":[{"hooks":[{"type":"command","command":"tt hook notification"}]}],
 "PreToolUse":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/tt hook tool"}]}]}}`, 0o644)
 		h.file(".claude/settings.local.json", `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"tt hook stop"}]}],
 "PostToolUse":[{"hooks":[{"type":"command","command":"tt hook tool"}]}],
-"PostToolUseFailure":[{"hooks":[{"type":"command","command":"tt hook tool"}]}]}}`, 0o644)
-		expectLine(t, h.run("agent"), "claude hooks", "ok", "SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure", 0)
+"PostToolUseFailure":[{"hooks":[{"type":"command","command":"tt hook tool"}]}],
+"PreCompact":[{"hooks":[{"type":"command","command":"tt hook handoff"}]}],
+"SessionEnd":[{"hooks":[{"type":"command","command":"tt hook handoff"}]}]}}`, 0o644)
+		expectLine(t, h.run("agent"), "claude hooks", "ok",
+			"SessionStart, UserPromptSubmit, Stop, Notification, PreToolUse, PostToolUse and PostToolUseFailure, and the SessionStart, PreCompact and SessionEnd handoff hooks", 0)
 	})
 	t.Run("claude hooks without the tool ledger hooks", func(t *testing.T) {
-		session := `"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
-"Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}]`
+		session := `"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]},{"hooks":[{"command":"tt hook handoff"}]}],
+"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],"Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}],
+"PreCompact":[{"hooks":[{"command":"tt hook handoff"}]}],"SessionEnd":[{"hooks":[{"command":"tt hook handoff"}]}]`
 		for _, c := range []struct{ extra, detail string }{
 			{"", "no PreToolUse, PostToolUse, PostToolUseFailure; optional"},
 			{`,"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}]`, "no PostToolUse, PostToolUseFailure; optional"},
@@ -485,8 +490,37 @@ printf 'system/com.tailterm.inbox-relay = {\n\tactive count = 1\n\tstate = runni
 "SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}],"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],
 "Stop":[{"hooks":[{"command":"tt hook stop"}]}],"Notification":[{"hooks":[{"command":"tt hook notification"}]}],
 "PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}],
-"PostToolUseFailure":[{"hooks":[{"command":"tt hook tool"}]}]}}`, 0o644)
-		expectLine(t, h.run("agent"), "claude hooks", "ok", "", 0)
+"PostToolUseFailure":[{"hooks":[{"command":"tt hook tool"}]}],
+"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]},{"hooks":[{"command":"tt hook handoff"}]}],
+"PreCompact":[{"hooks":[{"command":"tt hook handoff"}]}],"SessionEnd":[{"hooks":[{"command":"tt hook handoff"}]}]}}`, 0o644)
+		expectLine(t, h.run("agent"), "claude hooks", "ok", "handoff hooks", 0)
+	})
+	t.Run("claude hooks without a handoff hook", func(t *testing.T) {
+		tools := `"UserPromptSubmit":[{"hooks":[{"command":"tt hook prompt"}]}],"Stop":[{"hooks":[{"command":"tt hook stop"}]}],
+"Notification":[{"hooks":[{"command":"tt hook notification"}]}],"PreToolUse":[{"hooks":[{"command":"tt hook tool"}]}],
+"PostToolUse":[{"hooks":[{"command":"tt hook tool"}]}],"PostToolUseFailure":[{"hooks":[{"command":"tt hook tool"}]}]`
+		start := `,"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]}]`
+		startHandoff := `,"SessionStart":[{"hooks":[{"command":"tt hook session-start"}]},{"hooks":[{"command":"tt hook handoff"}]}]`
+		compact := `,"PreCompact":[{"hooks":[{"command":"tt hook handoff"}]}]`
+		end := `,"SessionEnd":[{"hooks":[{"command":"tt hook handoff"}]}]`
+		for _, c := range []struct{ extra, detail string }{
+			{start + compact + end, "no SessionStart handoff; optional"},
+			{startHandoff + end, "no PreCompact handoff; optional"},
+			{startHandoff + compact, "no SessionEnd handoff; optional"},
+			{start, "no SessionStart handoff, PreCompact handoff, SessionEnd handoff; optional"},
+			// The handoff entry alone does not stand in for tt hook session-start.
+			{`,"SessionStart":[{"hooks":[{"command":"tt hook handoff"}]}]` + compact + end, "no SessionStart; optional"},
+			// A handoff command under another event counts for none of the three.
+			{start + `,"SubagentStop":[{"hooks":[{"command":"tt hook handoff"}]}]` + end, "no SessionStart handoff, PreCompact handoff; optional"},
+		} {
+			h := newDoctorHost(t)
+			h.file(".claude/settings.json", `{"hooks":{`+tools+c.extra+`}}`, 0o644)
+			o := h.run("agent")
+			expectLine(t, o, "claude hooks", "warn", c.detail, 0)
+			if !strings.HasSuffix(o.text, "role agent: ok\n") {
+				t.Fatalf("an optional warning failed the role:\n%s", o.text)
+			}
+		}
 	})
 	t.Run("claude hooks absent", func(t *testing.T) {
 		h := newDoctorHost(t)
