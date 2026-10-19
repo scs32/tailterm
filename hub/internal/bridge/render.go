@@ -42,9 +42,11 @@ var kindColors = map[string]int{
 // under it, in place of the owner whose token the relay uses.
 const relayNode = "host-relay"
 
-// hubServiceNodes are the store's handlerABSystemNodes: the caller nodes
-// hub-internal writers post under. A notice from one is named by its user.
-var hubServiceNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true}
+// hubServiceNodes are the caller nodes hub-internal writers post under: the
+// store's handlerABSystemNodes plus verification, which posts only receipt
+// notices and writes no work-item revisions, so the store's owner-write
+// accounting has no need of it. A notice from one is named by its user.
+var hubServiceNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true, "verification": true}
 
 // roster names agents for display.
 type roster map[string]api.Agent

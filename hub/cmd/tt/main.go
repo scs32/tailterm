@@ -875,9 +875,11 @@ func readCursor(ctx context.Context, c *api.Client, task, agent string) (int64, 
 // under it, in place of the owner whose token the relay uses.
 const relayNode = "host-relay"
 
-// hubServiceNodes are the store's handlerABSystemNodes: the caller nodes
-// hub-internal writers post under. A notice from one is named by its user.
-var hubServiceNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true}
+// hubServiceNodes are the caller nodes hub-internal writers post under: the
+// store's handlerABSystemNodes plus verification, which posts only receipt
+// notices and writes no work-item revisions, so the store's owner-write
+// accounting has no need of it. A notice from one is named by its user.
+var hubServiceNodes = map[string]bool{"system": true, "team_queue": true, "handler_arms": true, "verification": true}
 
 // formatMessage names senders as the Discord bridge's roster.sender does.
 // Only a person's message (agentless, or the owner on Discord) gets the

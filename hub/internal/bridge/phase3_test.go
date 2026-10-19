@@ -75,6 +75,7 @@ func TestSystemSendersRenderByName(t *testing.T) {
 		{Node: "team_queue", User: "runner"},
 		{Node: "team_queue", User: "rebind"},
 		{Node: "handler_arms", User: "hub"},
+		{Node: "verification", User: "hub"},
 	} {
 		if got := r.sender(api.Message{From: from}); got != from.User {
 			t.Fatalf("%+v: sender = %q, want %q", from, got, from.User)
@@ -82,11 +83,11 @@ func TestSystemSendersRenderByName(t *testing.T) {
 	}
 }
 
-// A queue-runner or handler-arms notice the bridge mirrors as a line names
-// that service, not the owner.
+// A queue-runner, handler-arms or verification notice the bridge mirrors as a
+// line names that service, not the owner.
 func TestQueueAndHandlerArmsSendersRenderByName(t *testing.T) {
 	h := newHarness(t)
-	callers := []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}}
+	callers := []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}, {Node: "verification", User: "hub"}}
 	for _, by := range callers {
 		note := &api.Envelope{Kind: api.EnvelopeKindNotice, To: h.lead.Name, Subject: "A hub service notice for the lead", Refs: map[string]string{"escalation": "lead"}, Body: api.EnvelopeBody{Text: "fyi"}}
 		m, err := h.st.PostMessage(h.ctx, h.task.ID, api.PostMessageRequest{To: h.lead.ID, Envelope: note, Text: api.RenderText(*note)}, by)

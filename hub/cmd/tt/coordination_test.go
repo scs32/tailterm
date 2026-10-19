@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -178,6 +181,7 @@ func TestInboxNamesAgentlessSendersAsDiscordDoes(t *testing.T) {
 		{api.Sender{Node: "team_queue", User: "runner"}, "runner", false},
 		{api.Sender{Node: "team_queue", User: "rebind"}, "rebind", false},
 		{api.Sender{Node: "handler_arms", User: "hub"}, "hub", false},
+		{api.Sender{Node: "verification", User: "hub"}, "hub", false},
 		{api.Sender{Node: api.BridgeNode, User: "owner"}, "owner (Discord)", true},
 		{api.Sender{Node: relayNode, User: server.RelayUser}, "relay", false},
 		{api.Sender{Node: "workspace", User: "owner"}, "owner (human)", true},
@@ -195,8 +199,8 @@ func TestInboxNamesAgentlessSendersAsDiscordDoes(t *testing.T) {
 	}
 }
 
-// Notices the queue runner and the handler arms post read as those services,
-// not as a human the reader should answer on the board.
+// Notices the queue runner, the handler arms and verification receipts post
+// read as those services, not as a human the reader should answer on the board.
 func TestInboxNamesQueueAndHandlerArmsNoticesAsServices(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
@@ -208,7 +212,7 @@ func TestInboxNamesQueueAndHandlerArmsNoticesAsServices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, by := range []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}} {
+	for _, by := range []api.Caller{{Node: "team_queue", User: "runner"}, {Node: "handler_arms", User: "hub"}, {Node: "verification", User: "hub"}} {
 		note := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A hub service notice", Body: api.EnvelopeBody{Text: "text"}}
 		m, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Envelope: &note, Text: api.RenderText(note)}, by)
 		if err != nil {
@@ -225,6 +229,118 @@ func TestInboxNamesQueueAndHandlerArmsNoticesAsServices(t *testing.T) {
 			if strings.Contains(line, bad) {
 				t.Fatalf("%s line has %q: %s", by.Node, bad, line)
 			}
+		}
+	}
+}
+
+// Every agentless caller node a hub-internal writer posts under reads as a
+// named service, never as a person to answer on the board, and the Discord
+// bridge names the same service nodes. Only string-literal api.Caller nodes are
+// found: nodes passed as identifiers (RelayNode, api.BrokerNode,
+// api.BridgeNode) are rows in TestInboxNamesAgentlessSendersAsDiscordDoes.
+func TestEveryHubCallerNodeRendersAsAService(t *testing.T) {
+	type caller struct{ node, user, at string }
+	var found []caller
+	fset := token.NewFileSet()
+	err := filepath.WalkDir("../../internal", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return err
+		}
+		parsed, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(parsed, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			sel, ok := lit.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Caller" {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "api" {
+				return true
+			}
+			fields := map[string]string{}
+			for _, elt := range lit.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := kv.Key.(*ast.Ident)
+				value, isLit := kv.Value.(*ast.BasicLit)
+				if !ok || !isLit || value.Kind != token.STRING {
+					continue
+				}
+				if s, err := strconv.Unquote(value.Value); err == nil {
+					fields[key.Name] = s
+				}
+			}
+			node, hasNode := fields["Node"]
+			user, hasUser := fields["User"]
+			if hasNode && hasUser {
+				found = append(found, caller{node, user, fset.Position(lit.Pos()).String()})
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, c := range found {
+		seen[c.node+"/"+c.user] = true
+		if c.node == "workspace" {
+			continue // the owner's own UI, correctly a person
+		}
+		line := formatMessage(api.Message{Seq: 7, From: api.Sender{Node: c.node, User: c.user}, Text: "text"}, nil)
+		if !strings.HasPrefix(line, fmt.Sprintf("#7 %s %s: ", time.Time{}.Local().Format("15:04"), c.user)) || strings.Contains(line, "(human)") || strings.Contains(line, "Reply on the shared board") {
+			t.Errorf("%s: hub caller %s/%s does not read as a named service: %q", c.at, c.node, c.user, line)
+		}
+	}
+	for _, want := range []string{"verification/hub", "team_queue/runner", "system/schedule-monitor"} {
+		if !seen[want] {
+			t.Fatalf("walk of ../../internal did not find the %s caller; found %d callers", want, len(found))
+		}
+	}
+
+	parsed, err := parser.ParseFile(fset, "../../internal/bridge/render.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bridge map[string]bool
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok || len(spec.Names) != 1 || spec.Names[0].Name != "hubServiceNodes" || len(spec.Values) != 1 {
+			return true
+		}
+		lit, ok := spec.Values[0].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		bridge = map[string]bool{}
+		for _, elt := range lit.Elts {
+			if kv, ok := elt.(*ast.KeyValueExpr); ok {
+				if key, ok := kv.Key.(*ast.BasicLit); ok {
+					if s, err := strconv.Unquote(key.Value); err == nil {
+						bridge[s] = true
+					}
+				}
+			}
+		}
+		return false
+	})
+	if bridge == nil {
+		t.Fatal("internal/bridge/render.go has no hubServiceNodes map literal")
+	}
+	if len(bridge) != len(hubServiceNodes) {
+		t.Fatalf("internal/bridge/render.go hubServiceNodes keys %v differ from tt's %v", bridge, hubServiceNodes)
+	}
+	for node := range hubServiceNodes {
+		if !bridge[node] {
+			t.Fatalf("internal/bridge/render.go hubServiceNodes keys %v differ from tt's %v", bridge, hubServiceNodes)
 		}
 	}
 }
