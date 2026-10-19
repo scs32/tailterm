@@ -29,11 +29,14 @@ import (
 const helperUsage = "usage: tt helper register --task T [--name N] [--request-id K] [--take-session] [--json]\n" +
 	"       tt helper env --task T\n" +
 	"       tt helper inbox --task T\n" +
-	"       tt helper reply --task T SEQ --text TEXT [--interim] [--request-id K]"
+	"       tt helper reply --task T SEQ --text TEXT [--interim] [--request-id K]\n" +
+	"       tt helper close --task T"
 
 // ownerHelperFile is private host state for one project's helper: the exact
 // registered identity and tmux session, and a pending request ID that makes a
-// rerun after an uncertain outcome replay instead of registering twice. It
+// rerun after an uncertain outcome replay instead of registering twice.
+// ClosedRun is set to Run once this host learns the hub closed or exited that
+// run. It
 // holds no token.
 type ownerHelperFile struct {
 	Hub            string `json:"hub"`
@@ -51,6 +54,7 @@ type ownerHelperFile struct {
 	PendingHash    string `json:"pendingHash,omitempty"`
 	RequestID      string `json:"requestId,omitempty"`
 	RequestHash    string `json:"requestHash,omitempty"`
+	ClosedRun      string `json:"closedRun,omitempty"`
 }
 
 func ownerHelperPath(hub, task string) string {
@@ -119,8 +123,9 @@ func sessionHelperThread() (runtime, thread string, ok bool) {
 // runtime session, found without the hub: the one helper file in the relay
 // directory whose runtime and thread are this session's. It trusts a file
 // only under the name its own hub and task give it, and returns false for no
-// match, for more than one, and past the read bounds. The hub is not asked,
-// so a helper closed there still matches until it is registered again.
+// match, for more than one, and past the read bounds. The hub is not asked:
+// a file whose run this host has marked closed (markOwnerHelperClosed) does
+// not match, and a closed run not yet marked still does.
 func offlineOwnerHelper() (ownerHelperFile, bool) {
 	runtime, thread, ok := sessionHelperThread()
 	if !ok || !threadIDPattern.MatchString(thread) {
@@ -159,7 +164,7 @@ func offlineOwnerHelper() (ownerHelperFile, bool) {
 			continue
 		}
 		if name != filepath.Base(ownerHelperPath(f.Hub, f.Task)) || f.Runtime != runtime || f.Thread != thread ||
-			!api.ValidID(f.Agent, "agt") || !toolLedgerAgentOK(f.Agent) || !api.ValidID(f.Task, "tsk") || f.Run == "" {
+			!api.ValidID(f.Agent, "agt") || !toolLedgerAgentOK(f.Agent) || !api.ValidID(f.Task, "tsk") || f.Run == "" || f.ClosedRun == f.Run {
 			continue
 		}
 		found = f
@@ -181,6 +186,8 @@ func cmdHelper(e env, args []string) error {
 		return helperInbox(e, args[1:])
 	case "reply":
 		return helperReply(e, args[1:])
+	case "close":
+		return helperClose(e, args[1:])
 	}
 	return errors.New(helperUsage)
 }
@@ -583,8 +590,9 @@ func (e *helperExpectedRunRefused) Error() string { return e.reason }
 
 // registerHelperSession registers this runtime session as the project's owner
 // helper and writes the helper file, the wake binding and the tmux tags. It is
-// the one writer of the helper file on this host, and holds its lock from
-// before the file is loaded until it returns.
+// the one writer of the helper file's identity on this host (markOwnerHelperClosed
+// only marks its run closed), and holds its lock from before the file is
+// loaded until it returns.
 func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, error) {
 	task, name, requestID, takeSession, asJSON := &o.task, &o.name, &o.requestID, &o.takeSession, &o.asJSON
 	conditional := o.expectedRun != ""
@@ -848,6 +856,11 @@ func verifiedHelper(e env, task string) (env, api.Agent, error) {
 	case a.Role != api.AgentRoleOwnerHelper:
 		return env{}, api.Agent{}, errors.New("the registered agent is not an owner helper")
 	case a.Status == api.AgentClosed || a.Status == api.AgentExited:
+		if a.RunID == state.Run {
+			if err := markOwnerHelperClosed(ctx, e.hub, task, a.ID, a.RunID); err != nil {
+				fmt.Fprintln(os.Stderr, "[tt] could not mark the closed helper in its host file:", err)
+			}
+		}
 		return env{}, api.Agent{}, fmt.Errorf("the owner helper is %s; run tt helper register", a.Status)
 	case a.RunID != state.Run:
 		return env{}, api.Agent{}, errors.New("the owner helper was registered again elsewhere; run tt helper register here to take it back")
@@ -866,6 +879,70 @@ func verifiedHelper(e env, task string) (env, api.Agent, error) {
 	helper := e
 	helper.task, helper.agent, helper.agentName, helper.runID, helper.session = task, a.ID, a.Name, a.RunID, a.Session
 	return helper, a, nil
+}
+
+// markOwnerHelperClosed records in this host's helper file that the hub has
+// closed or exited run of agent, so the offline lookup stops matching it and the tool
+// hook writes no more rows for the session. It changes nothing when the file
+// names another agent or run: a later registration is never marked. A new
+// registration rewrites the file without the mark.
+func markOwnerHelperClosed(ctx context.Context, hub, task, agent, run string) error {
+	unlock, err := lockOwnerHelperFile(ctx, hub, task)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	state, err := loadOwnerHelperFile(hub, task)
+	if err != nil {
+		return err
+	}
+	if state.Agent != agent || state.Run != run || state.ClosedRun == run {
+		return nil
+	}
+	state.ClosedRun = run
+	return writePrivateJSON(ownerHelperPath(hub, task), state)
+}
+
+// helperClose closes this host's registered helper run on the hub and marks
+// the helper file, so its session is no longer ledgered. The wake binding and
+// tmux tags stay until the next registration replaces them.
+func helperClose(e env, args []string) error {
+	fs := flag.NewFlagSet("helper close", flag.ContinueOnError)
+	task := fs.String("task", e.task, "project id")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !api.ValidID(*task, "tsk") || fs.NArg() != 0 {
+		return errors.New(helperUsage)
+	}
+	state, err := loadOwnerHelperFile(e.hub, *task)
+	if err != nil {
+		return err
+	}
+	if state.Agent == "" || state.Run == "" {
+		return errors.New("no owner helper is registered on this host for this project")
+	}
+	if e.agent != "" && (e.agent != state.Agent || e.runID != "" && e.runID != state.Run) {
+		return errors.New("tt helper close runs in the owner's own session or as the registered helper run, not as another agent")
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(10 * time.Second)
+	defer cancel()
+	a, err := c.CloseAgent(ctx, *task, state.Agent, state.Run)
+	if err != nil {
+		return err
+	}
+	if a.Status != api.AgentClosed || a.RunID != state.Run {
+		return fmt.Errorf("the hub did not close run %s; the owner helper is %s", state.Run, a.Status)
+	}
+	if err := markOwnerHelperClosed(ctx, e.hub, *task, a.ID, a.RunID); err != nil {
+		return fmt.Errorf("closed %s on the hub, but could not mark this host's helper file: %w", a.RunID, err)
+	}
+	fmt.Printf("closed owner helper %s (%s), run %s; this session is no longer ledgered\n", a.Name, a.ID, a.RunID)
+	return nil
 }
 
 func helperEnv(e env, args []string) error {

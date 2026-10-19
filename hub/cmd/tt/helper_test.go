@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -355,6 +356,122 @@ func TestHelperRegisterAfterExit(t *testing.T) {
 	third := f.mustRegister(t)
 	if third.Agent.ID != first.ID || third.Agent.RunID == second.Agent.RunID || third.Registration.Mode != api.OwnerHelperReplaced || third.Replay {
 		t.Fatalf("re-register %+v", third)
+	}
+}
+
+// helperLedgerCall runs one Bash call through the tool hook as this
+// session, with no agent identity in the environment, and returns the rows
+// now in agent's ledger.
+func (f helperFixture) helperLedgerCall(t *testing.T, root, agent, id string) []map[string]any {
+	t.Helper()
+	call := map[string]any{"session_id": f.thread, "tool_use_id": id, "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}, "duration_ms": 1}
+	toolHook(t, env{hub: f.owner.hub}, "PreToolUse", call)
+	toolHook(t, env{hub: f.owner.hub}, "PostToolUse", call)
+	return toolLedgerRows(t, root, agent)
+}
+
+// k1, k2: once this host learns the helper's run is closed or exited, by tt
+// helper close or by a helper command that finds it so on the hub, the helper
+// file is marked and a hook call from the session writes nothing. A helper
+// registered again from the session is ledgered again.
+func TestHelperClosedStopsLedger(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // identity is the subject here, not timing
+	for name, closeRun := range map[string]func(t *testing.T, f helperFixture, a api.Agent){
+		"helper close": func(t *testing.T, f helperFixture, a api.Agent) {
+			out, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"close", "--task", f.task.ID}) })
+			if err != nil || !strings.Contains(out, "closed owner helper") || !strings.Contains(out, a.RunID) {
+				t.Fatalf("helper close %q %v", out, err)
+			}
+			if got, err := f.c.GetAgent(context.Background(), f.task.ID, a.ID); err != nil || got.Status != api.AgentClosed {
+				t.Fatalf("hub agent after helper close %+v %v", got, err)
+			}
+		},
+		"owner close": func(t *testing.T, f helperFixture, a api.Agent) {
+			if _, err := f.c.CloseAgent(context.Background(), f.task.ID, a.ID, a.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"inbox", "--task", f.task.ID}) }); err == nil || !strings.Contains(err.Error(), "closed") {
+				t.Fatalf("inbox of a closed helper: %v", err)
+			}
+		},
+		"exited": func(t *testing.T, f helperFixture, a api.Agent) {
+			if _, err := f.c.PostEvent(context.Background(), f.task.ID, api.PostEventRequest{Kind: api.EventExited, AgentID: a.ID, RunID: a.RunID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"env", "--task", f.task.ID}) }); err == nil || !strings.Contains(err.Error(), "exited") {
+				t.Fatalf("env of an exited helper: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newHelperFixture(t)
+			root := filepath.Join(t.TempDir(), "tool-ledger")
+			t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+			first := *f.mustRegister(t).Agent
+			if rows := f.helperLedgerCall(t, root, first.ID, "u1"); len(rows) != 1 || rows[0]["run"] != first.RunID {
+				t.Fatalf("rows before close %v", rows)
+			}
+			closeRun(t, f, first)
+			if state, err := loadOwnerHelperFile(f.owner.hub, f.task.ID); err != nil || state.ClosedRun != first.RunID || state.Agent != first.ID || state.Run != first.RunID {
+				t.Fatalf("helper file after close %+v %v", state, err)
+			}
+			if _, ok := offlineOwnerHelper(); ok {
+				t.Fatal("the offline lookup still matches the closed helper")
+			}
+			if rows := f.helperLedgerCall(t, root, first.ID, "u2"); len(rows) != 1 {
+				t.Fatalf("a closed helper's call was ledgered: %v", rows)
+			}
+			second := *f.mustRegister(t).Agent
+			if second.RunID == first.RunID {
+				t.Fatalf("re-registered after close as %+v", second)
+			}
+			if state, _ := loadOwnerHelperFile(f.owner.hub, f.task.ID); state.ClosedRun != "" || state.Run != second.RunID {
+				t.Fatalf("helper file after re-registration %+v", state)
+			}
+			rows := f.helperLedgerCall(t, root, second.ID, "u3")
+			if len(rows) == 0 {
+				t.Fatal("the re-registered helper's call was not ledgered")
+			}
+			if last := rows[len(rows)-1]; last["agent"] != second.ID || last["run"] != second.RunID || last["toolUseId"] != "u3" {
+				t.Fatalf("re-registered helper rows %v", rows)
+			}
+			// An exited helper registers again as the same agent; a closed one as
+			// a new agent. Count each ledger directory once.
+			count := map[any]int{}
+			for _, id := range slices.Compact([]string{first.ID, second.ID}) {
+				for _, row := range toolLedgerRows(t, root, id) {
+					count[row["run"]]++
+				}
+			}
+			if count[first.RunID] != 1 || count[second.RunID] != 1 {
+				t.Fatalf("rows per run %v; want one under the ended run and one under the new run", count)
+			}
+		})
+	}
+}
+
+// The mark is for one exact run: a file naming another agent or run is left
+// as it is, so a registration that won meanwhile keeps being ledgered.
+func TestMarkOwnerHelperClosedExactRun(t *testing.T) {
+	helperLedgerSandbox(t)
+	file := helperLedgerFile()
+	writeHelperLedgerFile(t, file)
+	ctx := context.Background()
+	for _, other := range [][2]string{{file.Agent, "run_helper_other"}, {"agt_00000000000000ff", file.Run}} {
+		if err := markOwnerHelperClosed(ctx, file.Hub, file.Task, other[0], other[1]); err != nil {
+			t.Fatal(err)
+		}
+		if state, err := loadOwnerHelperFile(file.Hub, file.Task); err != nil || state != file {
+			t.Fatalf("marking %v changed the file: %+v %v", other, state, err)
+		}
+	}
+	if err := markOwnerHelperClosed(ctx, file.Hub, file.Task, file.Agent, file.Run); err != nil {
+		t.Fatal(err)
+	}
+	want := file
+	want.ClosedRun = file.Run
+	if state, err := loadOwnerHelperFile(file.Hub, file.Task); err != nil || state != want {
+		t.Fatalf("marked file %+v %v", state, err)
 	}
 }
 
