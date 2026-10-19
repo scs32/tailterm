@@ -1865,8 +1865,14 @@ function appearanceDialog() {
     new Promise((r) => setTimeout(r, APPEARANCE_FONT_WAIT_MS)),
   ]).then(() => {
     appearanceOpening = false;
-    // Another dialog or a lock during the wait supersedes this open.
-    if (!button?.isConnected || dialogSequence !== sequence) return;
+    // Another dialog, including a module's own modal such as a sign-in
+    // prompt, or a lock during the wait supersedes this open.
+    if (
+      !button?.isConnected ||
+      dialogSequence !== sequence ||
+      document.querySelector("dialog[open]")
+    )
+      return;
     openAppearanceDialog(ready() ? family : "monospace");
   });
 }

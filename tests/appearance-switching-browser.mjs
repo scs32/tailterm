@@ -150,7 +150,7 @@ try {
       const delayMs = Number(process.env.APPEARANCE_FONT_DELAY_MS || 150);
       const waits = [];
       for (const font of ["cascadia", "fira"])
-        for (const arrival of ["held", "delayed", "stale"]) {
+        for (const arrival of ["held", "delayed", "stale", "modal"]) {
           const label = `${engine.name()} ${font} ${arrival}`;
           const context = await browser.newContext({
             viewport: { width: 1100, height: 800 },
@@ -168,6 +168,10 @@ try {
               const showModal = HTMLDialogElement.prototype.showModal;
               HTMLDialogElement.prototype.showModal = function () {
                 window.showModals.push(performance.now());
+                // The faces still downloading when the dialog shows.
+                window.loadingAtOpen ??= [...document.fonts]
+                  .filter((f) => f.status === "loading")
+                  .map((f) => f.family.replace(/"/g, ""));
                 return showModal.call(this);
               };
               document.addEventListener(
@@ -227,9 +231,16 @@ try {
               await page.evaluate(() =>
                 document.querySelector("#appearance").click(),
               );
-            if (arrival === "stale") {
-              // Another dialog opened during the wait keeps the screen.
-              await page.locator("#keys").click();
+            if (arrival === "stale" || arrival === "modal") {
+              // Another dialog opened during the wait keeps the screen: one
+              // from the app's dialog(), or a module's own modal.
+              if (arrival === "stale") await page.locator("#keys").click();
+              else
+                await page.evaluate(() =>
+                  document.body
+                    .appendChild(document.createElement("dialog"))
+                    .showModal(),
+                );
               await page.waitForTimeout(500);
               assert.equal(
                 await page.locator("#dialog .theme-grid").count(),
@@ -251,6 +262,7 @@ try {
               count: window.showModals.length,
               inClick: window.openInClick,
               fonts: document.fonts.status,
+              loading: window.loadingAtOpen,
             }));
             const early = await metrics();
             releaseFaces();
@@ -263,7 +275,14 @@ try {
               early,
               `${label}: the dialog keeps its size and wrapping when the chosen face arrives`,
             );
+            // Text is visible: it renders in a face that had loaded when the
+            // dialog showed, or in the generic fallback, which needs none.
             assert.ok(early.textWidth > 0, `${label}: dialog text is visible`);
+            assert.ok(
+              early.textFont === "monospace" ||
+                !opened.loading.includes(family.replace(/"/g, "")),
+              `${label}: the dialog text face was not downloading when it showed`,
+            );
             assert.equal(opened.inClick, false, `${label}: the open waited`);
             assert.ok(
               opened.wait < 450,
@@ -284,6 +303,11 @@ try {
                 early.uiFont,
                 "monospace",
                 `${label}: the dialog opened in the fallback, which needs no download`,
+              );
+              assert.equal(
+                early.textFont,
+                "monospace",
+                `${label}: the dialog text renders in the fallback`,
               );
             } else
               assert.equal(
