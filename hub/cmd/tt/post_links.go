@@ -53,6 +53,19 @@ func (l *linkFlags) apply(ctx context.Context, c *api.Client, e env, task, targe
 		}
 	}
 	linked := *workItemID != "" || *workItemTask != "" || *workItemRevision != 0 || *workOrderTask != "" || *workOrderMessage != 0 || len(related) > 0
+	// An unbound sender's typed reply takes its parent's exact item link, or
+	// it never reaches tt work-items messages (incident #14080).
+	if !linked && !intake && reply > 0 && req.Envelope != nil {
+		item, order, err := parentLink(ctx, c, task, reply)
+		if err != nil {
+			return err
+		}
+		if item != nil {
+			*workItemTask, *workItemID, *workItemRevision = item.ItemTaskID, item.ItemID, item.ItemRevision
+			*workOrderTask, *workOrderMessage = order.TaskID, order.Seq
+			linked = true
+		}
+	}
 	if intake {
 		if linked || requestID == "" {
 			return errors.New("--intake requires --request-id and forbids work-item, related, and work-order flags")
@@ -99,4 +112,37 @@ func (l *linkFlags) apply(ctx context.Context, c *api.Client, e env, task, targe
 		req.RequestID = requestID
 	}
 	return nil
+}
+
+// parentLink returns the primary item link and work order of message reply,
+// or nil when it has no primary link. A link it cannot copy exactly (no work
+// order, or an item revised since) is refused with the flags to pass instead.
+func parentLink(ctx context.Context, c *api.Client, task string, reply int64) (*api.MessageWorkItem, *api.MessageReference, error) {
+	const fix = "pass --work-item, --work-item-revision and --work-order-message"
+	msgs, err := c.ListMessagesPage(ctx, task, api.MessagePageQuery{After: reply - 1, Limit: 1})
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading reply-to #%d for its item link: %w; retry, or %s", reply, err, fix)
+	}
+	if len(msgs) == 0 || msgs[0].Seq != reply {
+		return nil, nil, fmt.Errorf("no message #%d in this task to reply to", reply)
+	}
+	for _, link := range msgs[0].WorkItems {
+		if link.Relationship != "primary" {
+			continue
+		}
+		order := msgs[0].WorkOrderMessage
+		if order == nil {
+			return nil, nil, fmt.Errorf("reply-to #%d is linked to %s revision %d but names no work order; %s", reply, link.ItemID, link.ItemRevision, fix)
+		}
+		current, err := c.GetWorkItem(ctx, link.ItemTaskID, link.ItemID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("checking %s for reply-to #%d: %w; retry, or %s", link.ItemID, reply, err, fix)
+		}
+		if current.Revision != link.ItemRevision {
+			return nil, nil, fmt.Errorf("reply-to #%d is linked to %s revision %d, but the item is now at revision %d; pass --work-item %s --work-item-revision %d and the --work-order-message for that revision",
+				reply, link.ItemID, link.ItemRevision, current.Revision, link.ItemID, current.Revision)
+		}
+		return &link, order, nil
+	}
+	return nil, nil, nil
 }

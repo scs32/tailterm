@@ -352,3 +352,110 @@ func TestSendPostsReviewFindingTitleAtLimit(t *testing.T) {
 		t.Fatalf("follow-up not filed under the at-limit title: %+v", items.Items)
 	}
 }
+
+// Incident #14080: an unbound sender's typed reply to an item-linked parent
+// takes the parent's exact link, keeps an explicit one, refuses a parent whose
+// item has moved on, and links nothing when the parent is unlinked.
+func TestSendReplyInheritsParentItemLink(t *testing.T) {
+	e, c, task, lead := cliWorkItemFixture(t)
+	ctx := context.Background()
+	newItem := func(title string) api.WorkItem {
+		t.Helper()
+		item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: title, RequestID: strings.ReplaceAll(title, " ", "-")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	post := func(req api.PostMessageRequest) api.Message {
+		t.Helper()
+		m, err := c.PostMessage(ctx, task.ID, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	linkedParent := func(item api.WorkItem, key string) (api.Message, api.Message) {
+		t.Helper()
+		links := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+		order := post(api.PostMessageRequest{Text: "WORK ORDER " + key, WorkItems: links, RequestID: key + "-order"})
+		ask := api.Envelope{Kind: "request", Subject: "Record the start gate for this item", Body: api.EnvelopeBody{Ask: "Save the gate"}}
+		parent := post(api.PostMessageRequest{Envelope: &ask, Text: api.RenderText(ask), AgentID: lead.ID, To: e.agent, WorkItems: links,
+			WorkOrderMessage: &api.MessageReference{TaskID: task.ID, Seq: order.Seq}, RequestID: key + "-request"})
+		return order, parent
+	}
+	reply := func(parent int64, extra ...string) error {
+		args := append([]string{"--kind", "result", "--to", "lead", "--reply-to", fmt.Sprint(parent), "--subject", "Saved the start gate and read it back",
+			"--outcome", "done", "--status", "a1=pass", "--evidence", "e1: readback -> saved"}, extra...)
+		_, err := captureCLIOutput(t, func() error { return cmdSend(e, args) })
+		return err
+	}
+	last := func() api.Message {
+		t.Helper()
+		msgs, err := c.LatestMessages(ctx, task.ID, 1)
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("latest: %v %+v", err, msgs)
+		}
+		return msgs[0]
+	}
+
+	// Exact parent link: the reply carries the parent's task, item, revision
+	// and work order, and tt work-items messages lists it with its reply-to.
+	item := newItem("Reply link fixture")
+	order, parent := linkedParent(item, "exact")
+	if err := reply(parent.Seq); err != nil {
+		t.Fatal(err)
+	}
+	got := last()
+	if got.ReplyTo != parent.Seq || len(got.WorkItems) != 1 || got.WorkItems[0] != parent.WorkItems[0] ||
+		got.WorkOrderMessage == nil || *got.WorkOrderMessage != (api.MessageReference{TaskID: task.ID, Seq: order.Seq}) {
+		t.Fatalf("reply lost the parent link: %+v", got)
+	}
+	list, err := c.ListWorkItemMessages(ctx, task.ID, item.ID, 0, 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := false
+	for _, l := range list.Links {
+		listed = listed || (l.Message.Seq == got.Seq && l.Message.ReplyTo == parent.Seq && l.ItemRevision == item.Revision && l.Relationship == "primary")
+	}
+	if !listed {
+		t.Fatalf("reply #%d missing from the item's messages: %+v", got.Seq, list.Links)
+	}
+
+	// Stale parent revision: refused before posting, never re-pointed.
+	description := "revised"
+	revised, err := c.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &description})
+	if err != nil || revised.Revision != item.Revision+1 {
+		t.Fatalf("revise: %v %+v", err, revised)
+	}
+	before := last().Seq
+	err = reply(parent.Seq)
+	if err == nil || !strings.Contains(err.Error(), "now at revision 2") || !strings.Contains(err.Error(), "--work-item-revision 2") {
+		t.Fatalf("stale parent: %v", err)
+	}
+	if last().Seq != before {
+		t.Fatal("stale parent reply was posted")
+	}
+
+	// An explicit link to a different item is kept as given.
+	other := newItem("Other reply link fixture")
+	otherOrder := post(api.PostMessageRequest{Text: "WORK ORDER other",
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: other.ID, ItemRevision: other.Revision, Relationship: "primary"}}, RequestID: "other-order"})
+	_, fresh := linkedParent(revised, "explicit")
+	if err := reply(fresh.Seq, "--work-item", other.ID, "--work-item-revision", fmt.Sprint(other.Revision), "--work-order-message", fmt.Sprint(otherOrder.Seq)); err != nil {
+		t.Fatal(err)
+	}
+	if got := last(); len(got.WorkItems) != 1 || got.WorkItems[0].ItemID != other.ID || got.WorkOrderMessage == nil || got.WorkOrderMessage.Seq != otherOrder.Seq {
+		t.Fatalf("explicit link replaced: %+v", got)
+	}
+
+	// An unlinked parent gives nothing to inherit and posts as before.
+	plain := post(api.PostMessageRequest{AgentID: lead.ID, To: e.agent, Text: "Is the gate saved?"})
+	if err := reply(plain.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if got := last(); got.ReplyTo != plain.Seq || len(got.WorkItems) != 0 || got.WorkOrderMessage != nil {
+		t.Fatalf("unlinked parent inherited a link: %+v", got)
+	}
+}
