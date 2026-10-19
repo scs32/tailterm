@@ -46,5 +46,11 @@ export default defineConfig(({ mode }) => ({
       ],
     },
   },
-  optimizeDeps: { exclude: ["@tailscale/connect"] },
+  optimizeDeps: {
+    exclude: ["@tailscale/connect"],
+    // Only the speech worker imports @huggingface/transformers, and Vite's
+    // dependency scan does not follow workers. Without this, a cold or
+    // invalidated optimizer cache finds it later and reloads the page.
+    include: ["@huggingface/transformers"],
+  },
 }));
