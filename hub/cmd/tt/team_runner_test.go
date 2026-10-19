@@ -3454,3 +3454,169 @@ func TestTeamRunnerCloseoutPersistentPendingCleanupNoticesOnce(t *testing.T) {
 		t.Fatalf("%d cleanup calls, want one per tick", n)
 	}
 }
+
+// refusingNoticeTransport answers the relay's cleanup pending notice with
+// status while it is set, and passes every other request to the fake hub.
+type refusingNoticeTransport struct {
+	status atomic.Int32
+	posts  atomic.Int32
+}
+
+func (t *refusingNoticeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/messages") && req.Header.Get(relayAuthorHeader) != "" && req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		if strings.Contains(string(body), cleanupPendingTitle) {
+			t.posts.Add(1)
+			if status := int(t.status.Load()); status != 0 {
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":"fixture refusal"}`)), Request: req}, nil
+			}
+		}
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// wi_46e8a874f780be0c: a notice the hub refuses with a non-409 error backs
+// off on the runner clock, doubling from cleanupNoticeRetryFirst, and logs
+// once per try instead of every tick; a 409 counts as posted.
+func TestTeamRunnerCloseoutRefusedPendingNoticeBacksOff(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "refused-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	refuse := &refusingNoticeTransport{}
+	f.c.HTTP.Transport = refuse
+	cleanup := &pendingCleanup{err: errors.New(cleanupSessionPresent)}
+	cleanup.pending.Store(true)
+	start := time.Now()
+	now := start
+	r := queueCorrectionRunner(t, f, 1)
+	r.cleanup = cleanup.cleanup(f)
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	refuse.status.Store(http.StatusServiceUnavailable)
+	var log strings.Builder
+	tick := func(at time.Duration, wantPosts int32) {
+		t.Helper()
+		now = start.Add(at)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != "running" || got.Failure != "" {
+			t.Fatalf("tick at %s entry %+v %v", at, got, err)
+		}
+		if n := refuse.posts.Load(); n != wantPosts {
+			t.Fatalf("tick at %s: %d notice posts, want %d", at, n, wantPosts)
+		}
+	}
+	restore := captureStderr(t, &log)
+	tick(0, 0)
+	tick(30*time.Minute, 1)
+	tick(30*time.Minute+30*time.Second, 1)
+	tick(31*time.Minute, 2)
+	tick(32*time.Minute, 2)
+	tick(33*time.Minute, 3)
+	tick(36*time.Minute, 3)
+	tick(37*time.Minute, 4)
+	restore()
+	if n := strings.Count(log.String(), "cleanup pending notice: "); n != 4 {
+		t.Fatalf("%d notice log lines, want one per refused post:\n%s", n, log.String())
+	}
+	for _, next := range []string{"next try in 1m0s", "next try in 2m0s", "next try in 4m0s", "next try in 8m0s"} {
+		if !strings.Contains(log.String(), next) {
+			t.Fatalf("log lacks %q:\n%s", next, log.String())
+		}
+	}
+	// The delay stops doubling at cleanupNoticeRetryMax.
+	if len(r.cleanupPending.entries) != 1 {
+		t.Fatalf("book %v", r.cleanupPending.entries)
+	}
+	var key string
+	for key = range r.cleanupPending.entries {
+	}
+	for i := 0; i < 10; i++ {
+		r.cleanupPending.refused(key, now)
+	}
+	if got := r.cleanupPending.entries[key].next.Sub(now); got != cleanupNoticeRetryMax {
+		t.Fatalf("capped delay %s, want %s", got, cleanupNoticeRetryMax)
+	}
+	r.cleanupPending.entries[key].next = start.Add(45 * time.Minute)
+	// A 409 is the hub's answer to a replayed identity: posted, never tried again.
+	refuse.status.Store(http.StatusConflict)
+	tick(45*time.Minute, 5)
+	tick(80*time.Minute, 5)
+	if s := r.cleanupPending.entries[key]; s == nil || !s.noticed {
+		t.Fatalf("409 not counted as posted: %+v", s)
+	}
+}
+
+// wi_46e8a874f780be0c: a pending cleanup key goes as soon as its entry leaves
+// closeout by any path, so the relay's book cannot grow until a restart.
+func TestTeamRunnerCloseoutPendingKeysLeaveWithTheirEntry(t *testing.T) {
+	ctx := context.Background()
+	t.Run("failed-on-a-later-member", func(t *testing.T) {
+		f := newTeamFixture(t, true)
+		r := queueCorrectionRunner(t, f, 2)
+		r.cleanupPending = &cleanupPendingBook{}
+		var calls atomic.Int32
+		var waiting int
+		r.cleanup = func(context.Context, env, string, string) error {
+			if calls.Add(1) == 1 {
+				return errors.New(cleanupReceiptPending)
+			}
+			waiting = len(r.cleanupPending.entries)
+			return errors.New("Agent is not closed")
+		}
+		q := runningDismissedEntry(t, f, r)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), "Agent is not closed") {
+			t.Fatalf("tick error %v", err)
+		}
+		if got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || got.State != "failed" {
+			t.Fatalf("entry %+v %v", got, err)
+		}
+		if waiting != 1 || len(r.cleanupPending.entries) != 0 {
+			t.Fatalf("first member key %d before the failure, %v after", waiting, r.cleanupPending.entries)
+		}
+	})
+	t.Run("failed-elsewhere-or-unlisted", func(t *testing.T) {
+		f := newTeamFixture(t, true)
+		cleanup := &pendingCleanup{err: errors.New(cleanupSessionPresent)}
+		cleanup.pending.Store(true)
+		r := queueCorrectionRunner(t, f, 1)
+		r.cleanup = cleanup.cleanup(f)
+		r.cleanupPending = &cleanupPendingBook{}
+		q := runningDismissedEntry(t, f, r)
+		// An entry no listing names, another hub's entry and the live one.
+		gone := cleanupPendingKey(f.c.Base, "tqe_gone", "agt_gone", "run_gone")
+		otherHub := cleanupPendingKey("http://other-hub", q.ID, "agt_other", "run_other")
+		r.cleanupPending.wait(gone, time.Now())
+		r.cleanupPending.wait(otherHub, time.Now())
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != "running" {
+			t.Fatalf("pending entry %+v %v", got, err)
+		}
+		if _, ok := r.cleanupPending.entries[gone]; ok || len(r.cleanupPending.entries) != 2 || r.cleanupPending.entries[otherHub] == nil {
+			t.Fatalf("after pending tick %v", r.cleanupPending.entries)
+		}
+		// Failed by the owner or another relay: the next tick sees it failed.
+		if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "elsewhere-fail", Operation: "fail", EntryID: got.ID, ExpectedRevision: got.Revision, Failure: "failed elsewhere"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+		if len(r.cleanupPending.entries) != 1 || r.cleanupPending.entries[otherHub] == nil {
+			t.Fatalf("after failed tick %v", r.cleanupPending.entries)
+		}
+	})
+}

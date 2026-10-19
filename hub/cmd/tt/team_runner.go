@@ -291,6 +291,10 @@ const (
 	cleanupSessionPresent     = "tmux session is still present; cleanup will retry"
 	cleanupPendingNoticeAfter = 30 * time.Minute
 	cleanupPendingTitle       = "Member cleanup still pending"
+	// A notice the hub refuses with anything but a 409 is tried again after
+	// a doubling delay, so it is posted and logged once per window.
+	cleanupNoticeRetryFirst = time.Minute
+	cleanupNoticeRetryMax   = cleanupPendingNoticeAfter
 )
 
 // cleanupRetryable reports a cleanup error made only of retryable texts. One
@@ -314,6 +318,8 @@ func cleanupRetryable(err error) bool {
 // cleanupPendingBook holds when each entry's member run first waited on a
 // retryable cleanup error, in relay memory only: a restart starts the
 // interval again, and the notice's request identity keeps it to one post.
+// The tick drops an entry's keys once it leaves closeout or the listings
+// stop naming it, so the book holds only entries still closing.
 type cleanupPendingBook struct {
 	mu      sync.Mutex
 	entries map[string]*cleanupPendingState
@@ -322,6 +328,10 @@ type cleanupPendingBook struct {
 type cleanupPendingState struct {
 	since   time.Time
 	noticed bool
+	// refusals counts the notice posts the hub refused; next is when the
+	// notice may be tried again.
+	refusals int
+	next     time.Time
 }
 
 var productionCleanupPending = &cleanupPendingBook{}
@@ -345,7 +355,29 @@ func (b *cleanupPendingBook) wait(key string, now time.Time) bool {
 		s = &cleanupPendingState{since: now}
 		b.entries[key] = s
 	}
-	return !s.noticed && now.Sub(s.since) >= cleanupPendingNoticeAfter
+	return !s.noticed && now.Sub(s.since) >= cleanupPendingNoticeAfter && !now.Before(s.next)
+}
+
+// refused records a refused notice post and returns the wait before the
+// next try.
+func (b *cleanupPendingBook) refused(key string, now time.Time) time.Duration {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.entries[key]
+	if s == nil {
+		return 0
+	}
+	s.refusals++
+	delay := cleanupNoticeRetryFirst
+	for i := 1; i < s.refusals && delay < cleanupNoticeRetryMax; i++ {
+		delay *= 2
+	}
+	delay = min(delay, cleanupNoticeRetryMax)
+	s.next = now.Add(delay)
+	return delay
 }
 
 func (b *cleanupPendingBook) noticed(key string) {
@@ -368,16 +400,38 @@ func (b *cleanupPendingBook) drop(key string) {
 	delete(b.entries, key)
 }
 
+// dropEntry forgets every member run of one entry.
+func (b *cleanupPendingBook) dropEntry(hub, entry string) {
+	b.retain(hub, func(id string) bool { return id != entry })
+}
+
+// retain keeps this hub's keys whose entry keep reports and drops the rest.
+// Other hubs' keys are untouched.
+func (b *cleanupPendingBook) retain(hub string, keep func(entry string) bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for key := range b.entries {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) == 3 && parts[0] == hub && !keep(parts[1]) {
+			delete(b.entries, key)
+		}
+	}
+}
+
 // noticeCleanupPending tells the project's owner helper once that a member
 // cleanup has waited past cleanupPendingNoticeAfter. The entry is not failed.
-// A failed post is tried again on a later tick under the same request identity.
-func (r teamRunner) noticeCleanupPending(ctx context.Context, c *api.Client, q api.TeamQueueEntry, m api.TeamCloseMember, key string, cause error) {
+// A failed post is tried again after a growing delay under the same request
+// identity.
+func (r teamRunner) noticeCleanupPending(ctx context.Context, c *api.Client, q api.TeamQueueEntry, m api.TeamCloseMember, key string, cause error, now time.Time) {
 	notice := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: cleanupPendingTitle,
 		Refs: map[string]string{"entry": q.ID, "item": q.ItemID, "member": m.AgentID, "run": m.RunID},
 		Body: api.EnvelopeBody{Text: fmt.Sprintf("Queue entry %s has waited more than %s for member %s run %s to clean up (%v). The entry is not failed: the relay keeps its close request and retries cleanup each tick, and the entry finishes once that run reads cleaned up. Check that run's tmux session and cleanup receipt on host %s.",
 			q.ID, cleanupPendingNoticeAfter, m.AgentID, m.RunID, strings.ReplaceAll(cause.Error(), "\n", "; "), m.Host)}}
 	if err := postOwnerHelperNotice(ctx, c, q.TaskID, notice, "queue-cleanup-pending-"+q.ID+"-"+m.RunID); err != nil {
-		fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: cleanup pending notice: %v\n", q.ID, err)
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: cleanup pending notice: %v; next try in %s\n", q.ID, err, r.cleanupPending.refused(key, now))
 		return
 	}
 	r.cleanupPending.noticed(key)
@@ -675,6 +729,10 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		projects = rotateQueueProjects(projects, start)
 	}
 	var projectErrors []error
+	// listed names this host's entries in the projects' listings. When every
+	// project was listed, a pending cleanup key whose entry none of them
+	// names is dropped after the pass.
+	listed, allListed := map[string]bool{}, true
 	for _, taskID := range projects {
 		var queue api.TeamQueueList
 		if live {
@@ -683,6 +741,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				listings.save(listings.active, taskID, queue, now)
 			} else if !queueListingTimedOut(err) {
 				projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, err))
+				allListed = false
 				continue
 			} else {
 				listings.timedOut(now, err)
@@ -696,10 +755,16 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			if !ok {
 				r.noticeSlowListing(ctx, c, listings, taskID, host, nil, now)
 				projectErrors = append(projectErrors, fmt.Errorf("team queue project %s: %w", taskID, listings.slowErr()))
+				allListed = false
 				continue
 			}
 			r.noticeSlowListing(ctx, c, listings, taskID, host, &saved, now)
 			queue = saved.list
+		}
+		for _, q := range queue.Entries {
+			if q.Host == host {
+				listed[q.ID] = true
+			}
 		}
 		parallel := queueParallel(queue.ConcurrencyLimit)
 		for _, q := range queue.Entries {
@@ -725,6 +790,11 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			}
 			if q.State != "launching" {
 				r.retries.drop(launchRetryKey(c.Base, q.TaskID, q.ID))
+			}
+			if q.State != "running" && (q.State != "failed" || q.OwnerIntegration == nil) {
+				// Only finish cleans members up: an entry that finished,
+				// failed or went back to the queue is no longer closing.
+				r.cleanupPending.dropEntry(c.Base, q.ID)
 			}
 			// An unsafe host observation cannot start or continue a parallel
 			// launch, and a cached host listing is no observation: it took
@@ -811,6 +881,9 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		// it would activate the relay's global queue backoff and delay serial
 		// projects even though their own progress was safe.
 		reportTeamHostBudget(hostBudgetErr, time.Now())
+	}
+	if allListed {
+		r.cleanupPending.retain(c.Base, func(entry string) bool { return listed[entry] })
 	}
 	if live {
 		listings.recovered(now)
@@ -1477,6 +1550,7 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 	}
 	for _, m := range result.Members {
 		if m.Host != host {
+			r.cleanupPending.dropEntry(c.Base, q.ID)
 			return r.fail(ctx, c, q, fmt.Errorf("member %s cleanup is on another host", m.AgentID))
 		}
 		key := cleanupPendingKey(c.Base, q.ID, m.AgentID, m.RunID)
@@ -1486,12 +1560,15 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 			continue
 		}
 		if !cleanupRetryable(err) {
+			// An earlier member may be waiting: the failed entry leaves
+			// closeout, so none of its keys stay.
+			r.cleanupPending.dropEntry(c.Base, q.ID)
 			return r.fail(ctx, c, q, fmt.Errorf("member %s cleanup: %w", m.AgentID, err))
 		}
 		// The receipt may still land or may already have: keep the frozen
 		// close request and let the CleanupDone poll below decide.
-		if r.cleanupPending.wait(key, r.clock()) {
-			r.noticeCleanupPending(ctx, c, q, m, key, err)
+		if now := r.clock(); r.cleanupPending.wait(key, now) {
+			r.noticeCleanupPending(ctx, c, q, m, key, err, now)
 		}
 	}
 	detail, err := c.GetTask(ctx, q.TaskID)
