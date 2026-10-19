@@ -1497,3 +1497,46 @@ test("the home sweep stops the readable leftovers it found before failing closed
   assert.deepEqual(signalled, [[710, "SIGTERM"], [712, "SIGTERM"]]);
   assert.deepEqual(unexpected, []);
 });
+test("the verifier stubs every agent CLI the product can launch", () => {
+  const spawnSource = readFileSync(new URL("../hub/internal/spawn/spawn.go", import.meta.url), "utf8"),
+    known = spawnSource.match(/known := \[\]string\{([^}]*)\}/);
+  assert(known, "spawn.Runtimes keeps its known list");
+  assert.deepEqual(matrixRunner.AGENT_CLIS, [...known[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+});
+test("every agent CLI stub shadows a real binary on the check PATH, fails fast and logs", async (t) => {
+  const f = fixture(t),
+    names = matrixRunner.AGENT_CLIS,
+    decoys = tempDir(t, "verification-agent-cli-decoys-"),
+    marker = join(tempDir(t, "verification-agent-cli-marker-"), "ran");
+  for (const name of names)
+    writeFileSync(join(decoys, name), `#!/bin/sh\necho "$0" >> '${marker}'\nexit 0\n`, { mode: 0o755 });
+  const plan = commandPlan(
+    f,
+    `import {spawnSync} from 'node:child_process';for(const name of ${JSON.stringify(names)}){const started=Date.now(),r=spawnSync('sh',['-c',\`command -v \${name}; \${name} --version; echo status=$?\`],{encoding:'utf8'});process.stdout.write(r.stdout+r.stderr+\`\${name} ms=\${Date.now()-started}\\n\`)}`,
+  );
+  const output = tempDir(t, "verification-agent-cli-stub-logs-");
+  const savedPath = process.env.PATH;
+  process.env.PATH = decoys + ":" + savedPath;
+  let receipt;
+  try {
+    receipt = await runPlan(plan, f.cwd, output);
+  } finally {
+    process.env.PATH = savedPath;
+  }
+  const home = receipt.environment.HOME,
+    lines = readFileSync(receipt.checks[0].logURI, "utf8").split("\n");
+  assert(receiptEligible(receipt));
+  for (const name of names) {
+    assert(lines.includes(`${home}/.verifier-bin/${name}`), name);
+    assert(lines.includes(`tailterm verifier: ${name} is disabled during matrix checks`), name);
+    const ms = lines.find((line) => line.startsWith(`${name} ms=`));
+    assert(ms && Number(ms.slice(name.length + 4)) < 2000, `${name} failed fast: ${ms}`);
+    const calls = readFileSync(join(output, `${name}-stub-calls.log`), "utf8").split("\n").filter(Boolean);
+    assert.equal(calls.length, 1, name);
+    assert.match(calls[0], /\t--version$/, name);
+  }
+  assert.equal(lines.filter((line) => line === "status=1").length, names.length, "a real binary would exit 0");
+  assert(!existsSync(marker), "no decoy ran");
+  assert.deepEqual(matrixRunner.verifierHomeProcesses(home), []);
+  assert(!existsSync(home));
+});

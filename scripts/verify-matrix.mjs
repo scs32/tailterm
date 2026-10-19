@@ -1169,24 +1169,32 @@ export function removeVerifierHome(home) {
   rmSync(home, { recursive: true, force: true });
 }
 
-// A check that reaches codex through PATH gets this failing stub instead: the
-// real CLI starts a setsid'd managed daemon under the verifier home that no
-// process-group signal reaches (wi_39bd40d33a4d8acc). Each call is logged to
-// the output directory as audit evidence of which check reached codex.
-export function installCodexStub(home, output) {
-  const bin = join(home, ".verifier-bin"),
-    log = "'" + join(output, "codex-stub-calls.log").replaceAll("'", "'\\''") + "'";
+// Every agent CLI the product can launch: the known list of spawn.Runtimes in
+// hub/internal/spawn/spawn.go, which a test keeps equal. No check may start a
+// real one: codex starts a setsid'd managed daemon under the verifier home
+// that no process-group signal reaches (wi_39bd40d33a4d8acc), and a real
+// claude session spends tokens (wi_1c5e64268e8f77b9).
+export const AGENT_CLIS = ["claude", "codex", "aider", "gemini", "opencode", "goose", "cursor-agent", "amp", "copilot"];
+
+// A check that reaches an agent CLI through PATH gets this failing stub
+// instead. Each call is logged to <output>/<name>-stub-calls.log as audit
+// evidence of which check reached which CLI.
+export function installAgentCliStubs(home, output) {
+  const bin = join(home, ".verifier-bin");
   mkdirSync(bin, { mode: 0o700 });
-  writeFileSync(
-    join(bin, "codex"),
-    `#!/bin/sh
+  for (const name of AGENT_CLIS) {
+    const log = "'" + join(output, `${name}-stub-calls.log`).replaceAll("'", "'\\''") + "'";
+    writeFileSync(
+      join(bin, name),
+      `#!/bin/sh
 args=$(printf '%s ' "$@" | tr '\\n\\t' '  ' | cut -c1-500)
 printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$PPID" "$PWD" "\${args% }" >> ${log}
-echo 'tailterm verifier: codex is disabled during matrix checks' >&2
+echo 'tailterm verifier: ${name} is disabled during matrix checks' >&2
 exit 1
 `,
-    { mode: 0o700 },
-  );
+      { mode: 0o700 },
+    );
+  }
   return bin;
 }
 
@@ -2785,7 +2793,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     if (socketBytes > 103)
       throw new Error(`Private verifier tmux socket budget exceeds 103 bytes: ${socketBytes}`);
     const environment = {
-      PATH: installCodexStub(home, output) + ":" + process.env.PATH,
+      PATH: installAgentCliStubs(home, output) + ":" + process.env.PATH,
       HOME: home,
       TMPDIR: home,
       TMUX_TMPDIR: join(home, "tmux"),

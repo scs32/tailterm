@@ -22,10 +22,13 @@ const hubBinary = await prepareTestBinary({ root, target: "hub", output: path.jo
 const ttBinary = await prepareTestBinary({ root, target: "tt", output: path.join(state, "tt") });
 if (ttBinary !== path.join(state, "tt")) await symlink(ttBinary, path.join(state, "tt"));
 // Each project's database handler launches with run `codex`
-// (client/project-handler.js). This stub, first on the /exec PATH, keeps that
-// run alive like the catalog's sleep command without reaching a real CLI.
-await writeFile(path.join(state, "codex"), "#!/bin/sh\nexec sleep 300\n");
-await chmod(path.join(state, "codex"), 0o755);
+// (client/project-handler.js) and the form's default first agent on the
+// local server launches `claude`. These stubs, first on the /exec PATH, keep
+// those runs alive like the catalog's sleep command without reaching a real CLI.
+for (const cli of ["codex", "claude"]) {
+  await writeFile(path.join(state, cli), "#!/bin/sh\nexec sleep 300\n");
+  await chmod(path.join(state, cli), 0o755);
+}
 const tmuxSocket = `tf-${process.pid}-${randomUUID().slice(0, 8)}`;
 // Setup and teardown operate only on this invocation's private socket.
 await exec("tmux", ["-L", tmuxSocket, "kill-server"]).catch(

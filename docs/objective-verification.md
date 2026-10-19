@@ -141,6 +141,55 @@ check or eligible receipt. Each build's `go env -json` for `GOVERSION`,
 `GOTOOLCHAIN`, `GOOS` and `GOARCH` is recorded as `buildLog.goEnv` in
 `<output>/test-binary-builds.json`.
 
+### Agent CLI stubs and the home process sweep
+
+No test run or matrix check starts a real agent CLI. The live checks gated by
+`TT_LIVE_CLAUDE=1` or `TT_LIVE_RUNTIME_PROMPT=1` start one only when an
+operator sets that variable by hand, and never under the matrix: a check's
+environment is the runner's own (`PATH`, the disposable home and the cache
+settings above) plus the check's own settings from the plan, not the caller's,
+so those variables are never set there.
+
+**Verifier stubs.** Before the first check, the runner writes a failing stub
+into `<home>/.verifier-bin` for each name in `AGENT_CLIS`: `claude`, `codex`,
+`aider`, `gemini`, `opencode`, `goose`, `cursor-agent`, `amp` and `copilot`,
+the same list `spawn.Runtimes` in `hub/internal/spawn/spawn.go` looks up (a
+test in `tests/verification.test.js` keeps the two equal). That directory is
+first on every check's `PATH`, so a check that reaches an agent CLI gets the
+stub, never the host's binary. A real `codex` starts a setsid'd managed daemon
+under the home that no process-group signal reaches (bug
+`wi_39bd40d33a4d8acc`), and a real `claude` session spends tokens (bug
+`wi_1c5e64268e8f77b9`). A stub prints `tailterm verifier: <name> is disabled
+during matrix checks` to stderr and exits 1 at once. Each call appends one
+tab-separated line to `<output>/<name>-stub-calls.log`: UTC time, pid, parent
+pid, working directory and the arguments (newlines and tabs as spaces, at
+most 500 characters). The file exists only when some check reached that CLI,
+so it is the audit record of which check did.
+
+**The task form browser test's own stubs.** `tests/task-form-browser.mjs`
+launches agents through its `/exec` fixture: the project database handler
+runs `codex` and the form's default first agent runs `claude`. It writes its
+own `codex` and `claude` stubs into its state directory, each `exec sleep
+300`, and puts that directory first on the `/exec` `PATH`. They shadow the
+verifier's failing stubs too, so its launched panes stay alive like the
+catalog's sleep command, in a matrix run and in a direct run where a real
+`claude` is installed.
+
+**Home process sweep.** After the checks, kept home or not, the runner stops
+every process of this user that still lives in or holds files under the home:
+found by `HOME`, `TMPDIR` or `PWD` in its environment, by an `argv[0]` under
+the home, or by any open file there (`ps` and `lsof`). The runner and its
+ancestors are never listed. It sends SIGTERM, then SIGKILL to survivors, and
+rescans for children that appear later. A failing `ps` or `lsof`, a process
+that survives SIGKILL, or a process whose environment cannot be read and
+cannot be proven older than the home fails the cleanup: the home is kept, no
+receipt stands, and the error names the processes. Artifacts beside the logs:
+`home-processes.json` lists each stopped process (pid, the reasons it matched
+and its command, cut to 300 characters), and `home-sweep-unreadable.json`
+lists the processes whose environment could not be read but which started
+before the home, so the sweep left them alone (pid, error code, start time and
+command, at most 200).
+
 ## Shared verification caches
 
 Until wi_3c81378998da5acd (order #33917) every run downloaded the Go toolchain
