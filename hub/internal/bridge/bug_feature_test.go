@@ -69,6 +69,28 @@ func (h *harness) intakeFor(interactionID string) []api.Message {
 	return out
 }
 
+// filedPosts are the bot's public announcements of a filed item.
+func (h *harness) filedPosts() []*fakeMessage {
+	var out []*fakeMessage
+	for _, m := range h.fake.botMessages(h.channel) {
+		if strings.Contains(m.Content, "Filed bug **") || strings.Contains(m.Content, "Filed feature **") {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// filedPostsFor are the announcements naming one item.
+func (h *harness) filedPostsFor(itemID string) []*fakeMessage {
+	var out []*fakeMessage
+	for _, m := range h.filedPosts() {
+		if strings.Contains(m.Content, "**"+itemID+"**") {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func deferFlags(t *testing.T, f *fakeDiscord, interactionID string) int {
 	t.Helper()
 	for _, c := range f.callbacks {
@@ -147,8 +169,14 @@ func TestBugFilesAnItem(t *testing.T) {
 	if !strings.Contains(got, "Filed bug **"+it.ID+"**") || !strings.Contains(got, "https://tailos.example/#feature-history/"+h.task.ID+"/"+it.ID) {
 		t.Errorf("reply = %q", got)
 	}
-	if flags := deferFlags(t, h.fake, in.ID); flags != 0 {
-		t.Errorf("defer flags = %d, want a public reply", flags)
+	if flags := deferFlags(t, h.fake, in.ID); flags != discord.FlagEphemeral {
+		t.Errorf("defer flags = %d, want an ephemeral reply", flags)
+	}
+	posts := h.filedPosts()
+	if len(posts) != 1 || !strings.Contains(posts[0].Content, "Filed bug **"+it.ID+"**") ||
+		!strings.Contains(posts[0].Content, "https://tailos.example/#feature-history/"+h.task.ID+"/"+it.ID) ||
+		posts[0].AllowedMentions == nil || posts[0].AllowedMentions.Parse == nil || len(posts[0].AllowedMentions.Parse) != 0 {
+		t.Errorf("channel posts = %+v, want one public announcement of %s without mentions", posts, it.ID)
 	}
 	if n := h.queueEntries(); n != queued {
 		t.Errorf("filing queued the item: %d queue entries, was %d", n, queued)
@@ -177,6 +205,55 @@ func TestFeatureFilesAnItem(t *testing.T) {
 	}
 	if !strings.Contains(got, "Filed feature **"+it.ID+"**") || !strings.Contains(got, "/#feature-history/"+h.task.ID+"/"+it.ID) {
 		t.Errorf("reply = %q", got)
+	}
+	if flags := deferFlags(t, h.fake, in.ID); flags != discord.FlagEphemeral {
+		t.Errorf("defer flags = %d, want an ephemeral reply", flags)
+	}
+	if posts := h.filedPostsFor(it.ID); len(posts) != 1 || len(h.filedPosts()) != 1 {
+		t.Errorf("%d announcements of %s, %d in all; want one", len(posts), it.ID, len(h.filedPosts()))
+	}
+}
+
+// wi_747cfb98118d284f f1a, f1b: control characters the hub refuses become
+// spaces, so the text files normally; newlines and tabs are kept.
+func TestBugFeatureFileControlCharacters(t *testing.T) {
+	h := newHarness(t)
+	text := "Login\x1b[31m button\x00 is dead.\x07 Clicking\r it does\tnothing.\x7f\x0b\nSecond line\x0c here.\n\tThird\x1f line."
+	for i, kind := range []string{"bug", "feature"} {
+		in := fileCommand("95000000000000050"+itoa(int64(i+1)), kind, text)
+		got := editContent(h.interact(in))
+		var filed []api.WorkItem
+		for _, it := range h.items() {
+			if it.Kind == kind {
+				filed = append(filed, it)
+			}
+		}
+		if len(filed) != 1 {
+			t.Fatalf("/%s filed %d items, want 1; reply %q", kind, len(filed), got)
+		}
+		it := filed[0]
+		intake := h.intakeFor(in.ID)
+		if len(intake) != 1 || it.SourceMessageSeq != intake[0].Seq {
+			t.Fatalf("/%s: %d intake messages, item source #%d", kind, len(intake), it.SourceMessageSeq)
+		}
+		for field, s := range map[string]string{"intake": intake[0].Text, "title": it.Title, "description": it.Description} {
+			if !api.ValidText(s, api.MaxTextLen) || strings.ContainsAny(s, "\x00\x07\x0b\x0c\x1b\x7f\r") {
+				t.Errorf("/%s %s %q still carries control characters", kind, field, s)
+			}
+		}
+		if it.Title != "Login [31m button is dead. Clicking it does nothing." {
+			t.Errorf("/%s title = %q", kind, it.Title)
+		}
+		if it.Description != "Second line  here.\n\tThird  line." || !strings.Contains(intake[0].Text, "it does\tnothing.") {
+			t.Errorf("/%s description lost a newline or tab: %q", kind, it.Description)
+		}
+		name := "Filed " + kind + " **" + it.ID + "**"
+		if !strings.Contains(got, name) || strings.Contains(got, "Nothing was filed") {
+			t.Errorf("/%s reply = %q, want it to name %s", kind, got, it.ID)
+		}
+		if posts := h.filedPostsFor(it.ID); len(posts) != 1 || !strings.Contains(posts[0].Content, name) {
+			t.Errorf("/%s: %d channel announcements of %s, want 1", kind, len(posts), it.ID)
+		}
 	}
 }
 
@@ -235,6 +312,14 @@ func TestBugFeatureRefuseNonOwners(t *testing.T) {
 		if last.ID != in.ID || last.Response.Type != discord.ResponseMessage || last.Response.Data.Flags != discord.FlagEphemeral || !strings.Contains(last.Response.Data.Content, "Only the project owner") {
 			t.Errorf("/%s by %s in %s answered %+v", c.name, c.user, c.guild, last)
 		}
+		for _, cb := range h.fake.callbacks {
+			if cb.ID == in.ID && cb.Response.Type == discord.ResponseDeferredMessage {
+				t.Errorf("/%s by %s in %s was deferred", c.name, c.user, c.guild)
+			}
+		}
+	}
+	if posts := h.filedPosts(); len(posts) != 0 {
+		t.Errorf("refused commands posted %d announcements", len(posts))
 	}
 	if len(h.boardMessages()) != messages || len(h.items()) != items || len(h.filingPosts()) != 0 {
 		t.Fatalf("refused commands changed the hub: messages %d→%d, items %d→%d, posts %v", messages, len(h.boardMessages()), items, len(h.items()), h.filingPosts())
@@ -247,13 +332,20 @@ func TestBugFeatureRefuseEmptyText(t *testing.T) {
 	messages := len(h.boardMessages())
 	i := 0
 	for _, name := range []string{"bug", "feature"} {
-		for _, text := range []string{"   \n\t ", "\x01\x02"} {
+		for _, text := range []string{"   \n\t ", "\x01\x02", "\x00\x1b\x7f", "\r\x0b\x0c\x1f"} {
 			i++
-			got := editContent(h.interact(fileCommand("95000000000000020"+itoa(int64(i)), name, text)))
+			in := fileCommand("95000000000000020"+itoa(int64(i)), name, text)
+			got := editContent(h.interact(in))
 			if !strings.Contains(got, "Nothing was filed") || !strings.Contains(got, "/"+name+" <title>") {
 				t.Errorf("/%s %q = %q", name, text, got)
 			}
+			if flags := deferFlags(t, h.fake, in.ID); flags != discord.FlagEphemeral {
+				t.Errorf("/%s %q defer flags = %d, want ephemeral", name, text, flags)
+			}
 		}
+	}
+	if posts := h.filedPosts(); len(posts) != 0 {
+		t.Errorf("empty commands posted %d announcements", len(posts))
 	}
 	if len(h.boardMessages()) != messages || len(h.items()) != 0 || len(h.filingPosts()) != 0 {
 		t.Fatalf("empty commands changed the hub: messages %d→%d, items %d, posts %v", messages, len(h.boardMessages()), len(h.items()), h.filingPosts())
@@ -307,6 +399,14 @@ func TestBugRetryIsIdempotent(t *testing.T) {
 	if again := h.b.act(h.ctx, h.task.ID, in); !strings.Contains(again.Content, items[0].ID) || len(h.items()) != 1 || len(h.intakeFor(in.ID)) != 1 {
 		t.Fatalf("a second replay filed again: reply %q, %d items", again.Content, len(h.items()))
 	}
+	// Without the nonce, the earlier announcement is still found by its marker.
+	h.fake.clearNonces()
+	if again := h.b.act(h.ctx, h.task.ID, in); !strings.Contains(again.Content, items[0].ID) {
+		t.Fatalf("a replay after a nonce reset: reply %q", again.Content)
+	}
+	if posts := h.filedPostsFor(items[0].ID); len(posts) != 1 {
+		t.Fatalf("%d announcements of %s after replays, want 1", len(posts), items[0].ID)
+	}
 
 	// (ii) a claim left by a crash is resumed by the retry loop, twice.
 	crashed := fileCommand("950000000000000402", "feature", "Filed before the crash. Resumed after it.")
@@ -331,5 +431,67 @@ func TestBugRetryIsIdempotent(t *testing.T) {
 	}
 	if got := editContent(h.fake.lastEdit("tok-402")); !strings.Contains(got, filed[0].ID) {
 		t.Fatalf("resumed reply = %q, want it to name %s", got, filed[0].ID)
+	}
+	if posts := h.filedPostsFor(filed[0].ID); len(posts) != 1 {
+		t.Fatalf("%d announcements of resumed %s, want 1", len(posts), filed[0].ID)
+	}
+}
+
+// wi_747cfb98118d284f f2a, f2b: every /bug and /feature reply is ephemeral,
+// and only a success is announced in the channel.
+func TestBugFeatureRepliesPerOutcome(t *testing.T) {
+	h := newHarness(t)
+	for i, c := range []struct {
+		name, kind, text string
+		setup            func()
+		prefix           string
+		posts            int
+	}{
+		{"success", "bug", "Works fine. Files.", nil, "🐞 Filed bug **", 1},
+		{"usage", "feature", "  ", nil, "Describe the feature", 0},
+		{"intake refused", "bug", "Refused intake. Body.", func() { h.hubFail.Store(&hubFault{Route: "POST /messages"}) }, "⛔ Tailterm refused this bug", 0},
+		{"hub down", "feature", "Hub down. Body.", func() { h.hubDown.Store(true) }, "⛔ Tailterm refused this feature", 0},
+		{"item refused", "bug", "Refused item. Body.", func() { h.hubFail.Store(&hubFault{Route: "POST /work-items"}) }, "⚠️ Your text was saved", 0},
+	} {
+		before := len(h.fake.botMessages(h.channel))
+		if c.setup != nil {
+			c.setup()
+		}
+		in := fileCommand("95000000000000060"+itoa(int64(i+1)), c.kind, c.text)
+		got := editContent(h.interact(in))
+		h.hubFail.Store(nil)
+		h.hubDown.Store(false)
+		if !strings.HasPrefix(got, c.prefix) {
+			t.Errorf("%s: reply = %q, want prefix %q", c.name, got, c.prefix)
+		}
+		if flags := deferFlags(t, h.fake, in.ID); flags != discord.FlagEphemeral {
+			t.Errorf("%s: defer flags = %d, want ephemeral", c.name, flags)
+		}
+		if n := len(h.fake.botMessages(h.channel)) - before; n != c.posts {
+			t.Errorf("%s: %d channel posts, want %d", c.name, n, c.posts)
+		}
+	}
+	posts := h.filedPosts()
+	if len(posts) != 1 || posts[0].AllowedMentions == nil || posts[0].AllowedMentions.Parse == nil || len(posts[0].AllowedMentions.Parse) != 0 {
+		t.Errorf("announcements = %+v, want one without mentions", posts)
+	}
+}
+
+// wi_747cfb98118d284f: a failed announcement still files once and tells the
+// owner in the ephemeral reply.
+func TestBugAnnounceFailureIsReported(t *testing.T) {
+	h := newHarness(t)
+	h.fake.failMessages = 1
+	in := fileCommand("950000000000000701", "bug", "Channel post fails. Item still files.")
+	got := editContent(h.interact(in))
+	items := h.items()
+	if len(items) != 1 {
+		t.Fatalf("filed %d items, want 1; reply %q", len(items), got)
+	}
+	if !strings.Contains(got, "Filed bug **"+items[0].ID+"**") || !strings.Contains(got, "⚠️ Filed, but posting it in the channel failed") {
+		t.Errorf("reply = %q", got)
+	}
+	if posts := h.filedPosts(); len(posts) != 0 {
+		t.Errorf("%d announcements after a failed post, want 0", len(posts))
 	}
 }

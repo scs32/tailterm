@@ -79,8 +79,11 @@ func (b *Bridge) runInteraction(ctx context.Context, m Mapping, in discord.Inter
 		_ = b.cfg.State.FinishInbound(ctx, source, "rejected: project closed")
 		return
 	}
+	// Only /say answers publicly. /bug and /feature defer ephemerally, so
+	// their usage and error replies reach only the owner; fileItem announces
+	// a success in the channel itself.
 	flags := discord.FlagEphemeral
-	if in.Type == discord.InteractionCommand && (in.Data.Name == "say" || in.Data.Name == "bug" || in.Data.Name == "feature") {
+	if in.Type == discord.InteractionCommand && in.Data.Name == "say" {
 		flags = 0
 	}
 	// Defer first: hub calls can take longer than Discord's 3-second limit.
@@ -580,8 +583,10 @@ const maxTitleRunes = 120
 // item of kind "bug" or "feature" sourced from it. Both calls use the
 // interaction ID as their request ID, so a retried interaction returns the
 // same message and item. The item is only filed, never dispatched or queued.
+// Control characters the hub refuses become spaces first. Every reply is
+// ephemeral; a success is also posted once in the channel.
 func (b *Bridge) fileItem(ctx context.Context, taskID string, in discord.Interaction, kind, text string) reply {
-	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	text = intakeText(strings.ReplaceAll(text, "\r\n", "\n"))
 	title, description := splitTitle(text)
 	if title == "" || !api.ValidTaskName(title) {
 		return ephemeral("Describe the %s: /%s <title>. <details>. Nothing was filed.", kind, kind)
@@ -611,8 +616,29 @@ func (b *Bridge) fileItem(ctx context.Context, taskID string, in discord.Interac
 	if link := b.itemLink(taskID, item.ID); link != "" {
 		lines = append(lines, link)
 	}
-	lines = append(lines, marker(m.Seq, 1, 1, ""))
-	return reply{Public: true, Content: strings.Join(lines, "\n")}
+	mk := marker(m.Seq, 1, 1, "")
+	lines = append(lines, mk)
+	content := strings.Join(lines, "\n")
+	if err := b.announceFiled(ctx, in, mk, content); err != nil {
+		b.logf("discord bridge: /%s announce %s for interaction %s: %v", kind, item.ID, in.ID, err)
+		content += fmt.Sprintf("\n⚠️ Filed, but posting it in the channel failed: %v.", err)
+	}
+	return reply{Content: content}
+}
+
+// announceFiled posts a filing in the interaction's channel, once: a
+// replayed or resumed interaction finds its earlier post by the marker, and
+// the nonce covers a send whose answer was lost.
+func (b *Bridge) announceFiled(ctx context.Context, in discord.Interaction, mk, content string) error {
+	found, err := b.findOwn(ctx, in.ChannelID, mk, time.Now().Add(-InteractionLifetime))
+	if err != nil || found != "" {
+		return err
+	}
+	_, err = b.cfg.Discord.CreateMessage(ctx, in.ChannelID, discord.MessageSend{
+		Content: content, AllowedMentions: discord.AllowedMentions{Parse: []string{}},
+		Nonce: "tf" + in.ID, EnforceNonce: true,
+	})
+	return err
 }
 
 // splitTitle takes the title from the first line, or else the first
@@ -663,6 +689,17 @@ func splitTitle(text string) (title, description string) {
 		title, description = string(runes[:cut])+"…", text
 	}
 	return title, description
+}
+
+// intakeText turns control characters other than newline and tab into
+// spaces, as api.ValidText requires, and trims the result.
+func intakeText(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s))
 }
 
 // titleText turns control characters into spaces and collapses whitespace.
