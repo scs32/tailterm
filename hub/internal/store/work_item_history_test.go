@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -104,6 +105,155 @@ func TestWorkItemHistoryNativeKeyedReceiptsAndExplicitMessages(t *testing.T) {
 	receipt, err := s.GetWorkItemUpdateReceipt(ctx, project.ID, item.ID, req.RequestID, handler.ID, by)
 	if err != nil || !reflect.DeepEqual(receipt, result) {
 		t.Fatalf("receipt: %+v %v", receipt, err)
+	}
+}
+
+func TestWorkItemMessagesIncludeAuditLinkedMessages(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	task, _ := workItemProject(t, s, ctx, by, "Audit evidence", "lead")
+	evidence := a2Source(t, s, ctx, by, task, "Correction evidence")
+	owner := a2Item(t, s, ctx, by, task, "audit-owner")
+	target := a2Item(t, s, ctx, by, task, "audit-target")
+	targetTitle := "Audit target revision two"
+	target, err := s.UpdateWorkItem(ctx, task.ID, target.ID, api.UpdateWorkItemRequest{Revision: target.Revision, Title: &targetTitle}, by)
+	if err != nil || target.Revision != 2 {
+		t.Fatalf("target update: %+v err=%v", target, err)
+	}
+	ownerPrimary := api.MessageWorkItem{ItemTaskID: task.ID, ItemID: owner.ID, ItemRevision: owner.Revision, Relationship: "primary"}
+	post := func(key string, links ...api.MessageWorkItem) api.Message {
+		t.Helper()
+		message, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Message " + key, AuditKind: api.MessageAuditWork, RequestID: key, WorkItems: links}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return message
+	}
+	correct := func(message api.Message, key string, links ...api.MessageWorkItem) {
+		t.Helper()
+		request := api.CorrectMessageAuditRequest{RequestID: key, ExpectedRevision: 1, Reason: "Evidence links this message to another item.",
+			Sources: []api.MessageReference{{TaskID: task.ID, Seq: evidence.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork, WorkItems: links}}
+		if result, _, err := s.CorrectMessageAudit(ctx, task.ID, message.Seq, request, by); err != nil || result.State.Current.Revision != 2 {
+			t.Fatalf("correct %s: %+v err=%v", key, result, err)
+		}
+	}
+	list := func(item api.WorkItem, revision int64) api.WorkItemMessageList {
+		t.Helper()
+		out, err := s.ListWorkItemMessages(ctx, task.ID, item.ID, revision, 0, 65)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	review := post("audit-review", ownerPrimary)
+	moved := post("audit-moved", ownerPrimary)
+	targetRelated := api.MessageWorkItem{ItemTaskID: task.ID, ItemID: target.ID, ItemRevision: target.Revision, Relationship: "related"}
+	postedRelated := post("audit-posted-related", ownerPrimary, targetRelated)
+	sourceMessage, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "Item source", AuditKind: api.MessageAuditIntake, RequestID: "audit-source"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourced, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Sourced", SourceMessageSeq: sourceMessage.Seq, RequestID: "audit-sourced"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerBefore, targetBefore := list(owner, 0), list(target, 0)
+	if len(ownerBefore.Links) != 3 || len(targetBefore.Links) != 1 || targetBefore.Links[0].Message.Seq != postedRelated.Seq ||
+		!targetBefore.Links[0].AuditLinked || targetBefore.Links[0].AuditRevision != 1 || targetBefore.Links[0].Relationship != "related" {
+		t.Fatalf("before corrections: owner=%+v target=%+v", ownerBefore.Links, targetBefore.Links)
+	}
+
+	// The observed case: a correction adds a related link and keeps the original primary.
+	correct(review, "audit-correct-related", ownerPrimary, targetRelated)
+	targetPrimary := targetRelated
+	targetPrimary.Relationship = "primary"
+	correct(moved, "audit-correct-moved", targetPrimary)
+	correct(sourceMessage, "audit-correct-source", api.MessageWorkItem{ItemTaskID: task.ID, ItemID: sourced.ID, ItemRevision: sourced.Revision, Relationship: "primary"})
+
+	if ownerAfter := list(owner, 0); !reflect.DeepEqual(ownerAfter, ownerBefore) {
+		t.Fatalf("creation-time links changed:\nbefore=%+v\nafter=%+v", ownerBefore, ownerAfter)
+	}
+	targetAfter := list(target, 0)
+	if len(targetAfter.Links) != 3 || !reflect.DeepEqual(targetAfter.Coverage, targetBefore.Coverage) {
+		t.Fatalf("audit-linked target: %+v", targetAfter)
+	}
+	want := []struct {
+		seq           int64
+		relationship  string
+		auditRevision int64
+	}{{review.Seq, "related", 2}, {moved.Seq, "primary", 2}, {postedRelated.Seq, "related", 1}}
+	for i, link := range targetAfter.Links {
+		if link.Message.Seq != want[i].seq || link.Message.TaskID != task.ID || link.Relationship != want[i].relationship || !link.AuditLinked ||
+			link.AuditRevision != want[i].auditRevision || link.ItemRevision != target.Revision || link.Source || link.RevisionCoverage != "verified" {
+			t.Fatalf("target link %d: %+v", i, link)
+		}
+	}
+	if original := targetAfter.Links[0].Message.WorkItems; !reflect.DeepEqual(original, []api.MessageWorkItem{ownerPrimary}) {
+		t.Fatalf("original primary provenance: %+v", original)
+	}
+	if got := list(target, 1); len(got.Links) != 0 {
+		t.Fatalf("revision one filter: %+v", got.Links)
+	}
+	if got := list(target, target.Revision); !reflect.DeepEqual(got.Links, targetAfter.Links) {
+		t.Fatalf("revision two filter: %+v", got.Links)
+	}
+	if page, err := s.ListWorkItemMessages(ctx, task.ID, target.ID, 0, review.Seq, 65); err != nil || len(page.Links) != 2 || page.Links[0].Message.Seq != moved.Seq {
+		t.Fatalf("after page: %+v err=%v", page, err)
+	}
+	sourcedList := list(sourced, 0)
+	if len(sourcedList.Links) != 1 || !sourcedList.Links[0].Source || sourcedList.Links[0].AuditLinked || sourcedList.Links[0].AuditRevision != 0 || sourcedList.Links[0].Message.Seq != sourceMessage.Seq {
+		t.Fatalf("source dedupe: %+v", sourcedList.Links)
+	}
+
+	creation, err := json.Marshal(ownerBefore.Links[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	audited, err := json.Marshal(targetAfter.Links[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var creationKeys, auditedKeys map[string]any
+	if err := json.Unmarshal(creation, &creationKeys); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(audited, &auditedKeys); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := creationKeys["auditLinked"]; ok {
+		t.Fatalf("creation link JSON: %s", creation)
+	}
+	if _, ok := creationKeys["auditRevision"]; ok {
+		t.Fatalf("creation link JSON: %s", creation)
+	}
+	if auditedKeys["auditLinked"] != true || auditedKeys["auditRevision"] != float64(2) {
+		t.Fatalf("audit link JSON: %s", audited)
+	}
+
+	// Foreign-task audit links stay out of item evidence; the dispatch row stays.
+	destination, _ := workItemProject(t, s, ctx, by, "Audit destination", "destlead")
+	dispatch, err := s.DispatchWorkItem(ctx, task.ID, owner.ID, api.DispatchWorkItemRequest{Revision: owner.Revision, TargetTaskID: destination.ID, RequestID: "audit-dispatch"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignSource := a2Source(t, s, ctx, by, destination, "Foreign correction evidence")
+	foreignIntake, err := s.PostMessage(ctx, destination.ID, api.PostMessageRequest{Text: "Foreign follow-up", AuditKind: api.MessageAuditIntake, RequestID: "audit-foreign-intake"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignCorrection := api.CorrectMessageAuditRequest{RequestID: "audit-foreign-correction", ExpectedRevision: 1, Reason: "The dispatch proves the project relationship.",
+		Sources: []api.MessageReference{{TaskID: destination.ID, Seq: foreignSource.Seq}}, Desired: api.MessageAuditDesiredState{Classification: api.MessageAuditWork, WorkItems: []api.MessageWorkItem{ownerPrimary}}}
+	if result, _, err := s.CorrectMessageAudit(ctx, destination.ID, foreignIntake.Seq, foreignCorrection, by); err != nil || result.State.Current.WorkItems[0].ItemID != owner.ID {
+		t.Fatalf("foreign correction: %+v err=%v", result, err)
+	}
+	ownerFinal := list(owner, 0)
+	if len(ownerFinal.Links) != len(ownerBefore.Links)+1 {
+		t.Fatalf("foreign audit link: %+v", ownerFinal.Links)
+	}
+	for _, link := range ownerFinal.Links {
+		if link.AuditLinked || (link.Message.TaskID == destination.ID && link.Message.Seq != dispatch.Dispatch.MessageSeq) {
+			t.Fatalf("foreign audit link included: %+v", link)
+		}
 	}
 }
 

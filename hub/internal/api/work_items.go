@@ -499,11 +499,16 @@ type HistoryGapList struct {
 }
 
 type WorkItemMessageLink struct {
-	ItemRevision     int64   `json:"itemRevision"`
-	RevisionCoverage string  `json:"revisionCoverage"`
-	Source           bool    `json:"source,omitempty"`
-	Relationship     string  `json:"relationship,omitempty"`
-	Message          Message `json:"message"`
+	ItemRevision     int64  `json:"itemRevision"`
+	RevisionCoverage string `json:"revisionCoverage"`
+	Source           bool   `json:"source,omitempty"`
+	Relationship     string `json:"relationship,omitempty"`
+	// AuditLinked and AuditRevision are set only for a row that comes from the
+	// current message-audit projection, not a creation-time link; AuditRevision
+	// is message_audit_states.revision.
+	AuditLinked   bool    `json:"auditLinked,omitempty"`
+	AuditRevision int64   `json:"auditRevision,omitempty"`
+	Message       Message `json:"message"`
 }
 
 type WorkItemMessageList struct {

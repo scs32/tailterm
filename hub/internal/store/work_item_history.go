@@ -668,11 +668,12 @@ func (s *Store) ListWorkItemHistoryGaps(ctx context.Context, taskID, itemID stri
 }
 
 type messageLinkKey struct {
-	seq          int64
-	task         string
-	revision     int64
-	source       bool
-	relationship string
+	seq           int64
+	task          string
+	revision      int64
+	source        bool
+	relationship  string
+	auditRevision int64
 }
 
 func (s *Store) ListWorkItemMessages(ctx context.Context, taskID, itemID string, revision, after int64, limit int) (api.WorkItemMessageList, error) {
@@ -691,15 +692,23 @@ func (s *Store) ListWorkItemMessages(ctx context.Context, taskID, itemID string,
 	if err != nil {
 		return api.WorkItemMessageList{}, err
 	}
+	// Source and creation-time links come first and never change. A same-task
+	// message linked to the item only by the current message-audit projection
+	// is added once, marked with its audit revision.
 	query := `WITH candidates(message_seq,message_task_id,item_revision,is_source,relationship) AS (
 SELECT source_message_seq,task_id,1,1,'' FROM work_items WHERE task_id=? AND id=? AND source_message_seq>0
 UNION ALL
 SELECT message_seq,message_task_id,item_revision,0,relationship FROM message_work_item_links WHERE item_task_id=? AND item_id=?
-), combined(message_seq,message_task_id,item_revision,is_source,relationship) AS (
-SELECT message_seq,message_task_id,CASE WHEN max(CASE WHEN relationship<>'' THEN item_revision ELSE 0 END)>0 THEN max(CASE WHEN relationship<>'' THEN item_revision ELSE 0 END) ELSE 1 END item_revision,max(is_source),max(relationship)
-FROM candidates GROUP BY message_seq,message_task_id)
-SELECT message_seq,message_task_id,item_revision,is_source,relationship FROM combined WHERE message_seq>?`
-	args := []any{taskID, itemID, taskID, itemID, after}
+), combined(message_seq,message_task_id,item_revision,is_source,relationship,audit_revision) AS (
+SELECT message_seq,message_task_id,CASE WHEN max(CASE WHEN relationship<>'' THEN item_revision ELSE 0 END)>0 THEN max(CASE WHEN relationship<>'' THEN item_revision ELSE 0 END) ELSE 1 END item_revision,max(is_source),max(relationship),0
+FROM candidates GROUP BY message_seq,message_task_id
+UNION ALL
+SELECT l.message_seq,l.message_task_id,l.item_revision,0,l.relationship,s.revision
+FROM message_audit_links l JOIN message_audit_states s ON s.message_task_id=l.message_task_id AND s.message_seq=l.message_seq
+WHERE l.item_task_id=? AND l.item_id=? AND l.message_task_id=l.item_task_id
+AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.message_seq=l.message_seq AND c.message_task_id=l.message_task_id))
+SELECT message_seq,message_task_id,item_revision,is_source,relationship,audit_revision FROM combined WHERE message_seq>?`
+	args := []any{taskID, itemID, taskID, itemID, taskID, itemID, after}
 	if revision > 0 {
 		query += ` AND item_revision=?`
 		args = append(args, revision)
@@ -714,7 +723,7 @@ SELECT message_seq,message_task_id,item_revision,is_source,relationship FROM com
 	for rows.Next() {
 		var k messageLinkKey
 		var source int
-		if err := rows.Scan(&k.seq, &k.task, &k.revision, &source, &k.relationship); err != nil {
+		if err := rows.Scan(&k.seq, &k.task, &k.revision, &source, &k.relationship, &k.auditRevision); err != nil {
 			rows.Close()
 			return api.WorkItemMessageList{}, err
 		}
@@ -744,7 +753,7 @@ SELECT message_seq,message_task_id,item_revision,is_source,relationship FROM com
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return out, err
 		}
-		out.Links = append(out.Links, api.WorkItemMessageLink{ItemRevision: k.revision, RevisionCoverage: coverage, Source: k.source, Relationship: k.relationship, Message: message})
+		out.Links = append(out.Links, api.WorkItemMessageLink{ItemRevision: k.revision, RevisionCoverage: coverage, Source: k.source, Relationship: k.relationship, AuditLinked: k.auditRevision > 0, AuditRevision: k.auditRevision, Message: message})
 	}
 	out.Coverage, err = historyCoverage(ctx, tx, item)
 	if err != nil {

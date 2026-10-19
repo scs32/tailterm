@@ -92,3 +92,29 @@ integrity and foreign keys valid. The initial check script assumed a bare messag
 array; correcting it to use the existing `messages` response envelope passed.
 Application rollback retains the additive audit tables. Older clients/binaries
 can still write unlinked messages; A1 does not claim strict enforcement.
+
+## Work-item message evidence (wi_6617, order #39280)
+
+`GET /v1/tasks/{id}/work-items/{wid}/messages` and `tt work-items evidence`
+list an item's messages from three sources:
+
+- the item's source message (`source: true`);
+- creation-time primary links. These rows are unchanged, even when a later
+  correction moves or removes the link;
+- same-task messages that have neither but are linked to the item by the
+  current message-audit projection. These rows carry `auditLinked: true` and
+  `auditRevision`, the message's current audit revision. Revision 1 is a related
+  link given at posting; revision 2 or later comes from a correction. The row's
+  `relationship` and `itemRevision` come from the audit link.
+
+The message envelope keeps its original creation context, so an audit-linked
+row still shows the primary item it was posted to. Creation-time rows have no
+audit fields in their JSON.
+
+Foreign-task audit links are not item evidence, because the CLI accepts a
+foreign-task message only with creation-time primary dispatch provenance.
+`CreateMessageAuditAssociation` grants authority for a later foreign-item
+correction and adds no link by itself. Read a message's current audit links,
+foreign ones included, with `tt message-audit get --seq N`; read an association
+with `tt message-audit receipt --operation associate`.
+`explicitMessageCount` in the coverage still counts creation-time links only.
