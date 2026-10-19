@@ -111,7 +111,9 @@ const ssh = new ssh2.Server({ hostKeys: [hostKey] }, (client) => {
         ) {
           discoveryCount++;
           stream.write(
-            [...remoteNames].map((name) => `${name}|1|1\n`).join(""),
+            [...remoteNames]
+              .map((name, i) => `${name}|1|1|$${i + 1}|1700000000\n`)
+              .join(""),
           );
           stream.exit(0);
           stream.end();
