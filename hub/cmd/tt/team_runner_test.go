@@ -2665,6 +2665,110 @@ func TestTeamRunnerCachedHostListingHoldsParallelLaunch(t *testing.T) {
 	}
 }
 
+// wi_38d72bebdaa36497 q2 (wi_c055a34662f66fb6 f3): a serial launching team
+// needs no host census, so it continues its spawns on a cached listing of any
+// age. A timed-out host listing serves the tick both listings from cache; the
+// tick reads the entry again by itself and the launch continues from that
+// read. The launch's own project listing still has to answer.
+func TestTeamRunnerSerialLaunchContinuesOnOldCachedListing(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	hub := newSlowListingHub(t, f)
+	if limit, err := f.c.ListTeamQueue(ctx, f.task.ID); err != nil || queueParallel(limit.ConcurrencyLimit) {
+		t.Fatalf("the fixture project is not serial: limit %d, %v", limit.ConcurrencyLimit, err)
+	}
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "serial-cached-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryPath := "/v1/tasks/" + f.task.ID + "/team-queue/" + q.ID
+	var mu sync.Mutex
+	entryReads := 0
+	counted := *hub.c
+	transport := *hub.c.HTTP
+	transport.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == entryPath {
+			mu.Lock()
+			entryReads++
+			mu.Unlock()
+		}
+		return hub.RoundTrip(req)
+	})
+	counted.HTTP = &transport
+	reads := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := entryReads
+		entryReads = 0
+		return n
+	}
+	now := time.Now()
+	var events []string
+	failSpawn := true
+	r := queueCorrectionRunner(t, f, 1)
+	r.now = func() time.Time { return now }
+	r.census = func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
+		events = append(events, "census")
+		return nil
+	}
+	spawn := r.spawn
+	r.spawn = func(e env, args []string) error {
+		events = append(events, "spawn")
+		if failSpawn {
+			return fmt.Errorf("register agent: %w", &api.HTTPError{Status: 409, Msg: api.ErrLimit.Error()})
+		}
+		return spawn(e, args)
+	}
+	state := func() string {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.State
+	}
+	// A live tick claims the entry and its first spawn is refused at the
+	// agent cap, so it is left launching. A second live tick lists it
+	// launching, which both saved listings then name. Live ticks act on the
+	// listing and do not read the entry by itself.
+	for _, what := range []string{"first live tick", "second live tick"} {
+		events = nil
+		if err := r.tick(ctx, hub.e, &counted, "fixture"); err == nil || !strings.Contains(err.Error(), projectAgentCapPrefix) {
+			t.Fatalf("%s = %v, want the agent cap refusal", what, err)
+		}
+		if got := strings.Join(events, ","); got != "spawn" || state() != "launching" {
+			t.Fatalf("%s: events %s, entry %s; want spawn and a launching entry", what, got, state())
+		}
+	}
+	if n := reads(); n != 0 {
+		t.Fatalf("live ticks read the entry by itself %d times, want none", n)
+	}
+
+	// Thirty minutes later the host listing stops answering, so the tick
+	// works from both listings saved then, older than the ten minutes base
+	// allowed. Its one project listing request is the launch's own, which
+	// answers.
+	events, failSpawn = nil, false
+	hub.slowHost.Store(true)
+	activeBefore, hostBefore := hub.listings()
+	now = now.Add(30 * time.Minute)
+	if err := r.tick(ctx, hub.e, &counted, "fixture"); err != nil {
+		t.Fatalf("tick on a 30 minute old cached listing: %v", err)
+	}
+	if active, host := hub.listings(); active-activeBefore != 1 || host-hostBefore != 1 {
+		t.Fatalf("the tick made %d project and %d host listing calls, want the launch's own and one slow host attempt", active-activeBefore, host-hostBefore)
+	}
+	if n := reads(); n != 1 {
+		t.Fatalf("the tick read the launching entry by itself %d times, want once", n)
+	}
+	if got := strings.Join(events, ","); got != "spawn" || state() != "running" {
+		t.Fatalf("tick on a 30 minute old cached listing: events %q, entry %s; want no census, one spawn and a running entry", got, state())
+	}
+	if n := len(slowListingNotices(t, f)); n > 1 {
+		t.Fatalf("%d slow listing notices, want at most one", n)
+	}
+}
+
 // requestLog records the requests a client sends, as "METHOD path" with the
 // body of a POST appended.
 type requestLog struct {
@@ -2809,6 +2913,79 @@ func TestTeamRunnerSerialPassesBudgetHeldHead(t *testing.T) {
 	}
 	if claims != 1 || spawns != 1 || state(later.ID) != "running" || state(head.ID) != "queued" {
 		t.Fatalf("one tick: %d claims of the second entry, %d spawns, second %s, head %s; want the second entry claimed and running past a queued head", claims, spawns, state(later.ID), state(head.ID))
+	}
+}
+
+// wi_38d72bebdaa36497 q1: in a serial project a queue head the token budget
+// holds is still failed once its item is done or dismissed, as on base, where
+// advance read the head's item every tick. The pass still gives it no turn.
+func TestTeamRunnerSerialFailsBudgetHeldHeadOfEndedItem(t *testing.T) {
+	for _, status := range []string{"done", "dismissed"} {
+		t.Run(status, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			relayState := os.Getenv("TAILTERM_RELAY_STATE")
+			capture := captureHome(t)
+			t.Setenv("TAILTERM_RELAY_STATE", relayState)
+			ctx := context.Background()
+			by := api.Caller{Node: "team-fixture", User: "owner"}
+			big, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "large", RequestID: "ended-budget-large"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			order, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "large bounded order", RequestID: "ended-budget-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: big.ID, ItemRevision: big.Revision, Relationship: "primary"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.confirmOrder(t, big, order.Seq)
+			head, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "ended-budget-head", Operation: "add", ItemID: big.ID, OrderMessageSeq: order.Seq, Host: "fixture", Cwd: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tokens, basis := int64(600_000), "synthetic"
+			if _, _, err := f.st.CreateWorkItemUpdate(ctx, f.task.ID, big.ID, api.CreateWorkItemUpdate{ExpectedRevision: big.Revision, RequestID: "ended-budget-estimate", EstimateTokens: &tokens, EstimateBasis: &basis}, by); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.c.SetUsageBudget(ctx, f.task.ID, api.UsageBudgetRequest{Runtime: "claude", Window: api.UsageWindowFiveHour, AllowanceTokens: 1_000_000}); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().UTC()
+			writeCapture(t, capture, captureJSON(at.Unix(), 50, at.Add(2*time.Hour).Unix()))
+			var reading providerUsageState
+			if err := providerUsageTick(ctx, f.c, "fixture", at, &reading); err != nil {
+				t.Fatal(err)
+			}
+			listed := func() string {
+				t.Helper()
+				list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+				if err != nil || len(list.Entries) != 1 || list.Entries[0].ID != head.ID {
+					t.Fatalf("active listing %+v %v", list.Entries, err)
+				}
+				return list.Entries[0].BlockReason
+			}
+			if reason := listed(); !strings.HasPrefix(reason, tokenBudgetPrefix) {
+				t.Fatalf("the open head's listed reason %q does not start with the runner's prefix %q", reason, tokenBudgetPrefix)
+			}
+			current, err := f.c.GetWorkItem(ctx, f.task.ID, big.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.st.UpdateWorkItem(ctx, f.task.ID, big.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Status: &status}, by); err != nil {
+				t.Fatal(err)
+			}
+			// The status change is a new item revision, and a terminal item is
+			// never rebound, so the hub lists the head as awaiting a rebind
+			// instead of by the budget: the pass's budget skip does not apply.
+			if reason := listed(); strings.HasPrefix(reason, tokenBudgetPrefix) || !strings.Contains(reason, "tt team queue rebind") {
+				t.Fatalf("the %s head's listed reason is %q, want the rebind reason", status, reason)
+			}
+			if err := (teamRunner{}).tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), "queued item changed before launch") {
+				t.Fatalf("tick = %v, want the head failed as a changed item", err)
+			}
+			got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, head.ID)
+			if err != nil || got.State != "failed" || got.Failure != "queued item changed before launch" {
+				t.Fatalf("budget-held head of a %s item: %+v %v", status, got, err)
+			}
+		})
 	}
 }
 
