@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -288,8 +289,26 @@ func queueMemberActivity(a *api.AgentActivity) string {
 	return "activity=" + a.State
 }
 
-func activityRequestID(b runtimeBinding, n int64) string {
-	digest := sha256.Sum256([]byte(b.Agent + "\x00" + b.Run + "\x00" + fmt.Sprint(n)))
+// relayActivityState is the cursor file the relay saves. RequestNonce is
+// random and made with each fresh cursor, so a cursor that restarts its
+// transition count after the state directory is lost never reuses an earlier
+// receipt's request ID for the same run (bug wi_15f305ae3eb57268). The stall
+// watch reads the same file as a plain activityCursor.
+type relayActivityState struct {
+	activityCursor
+	RequestNonce string `json:"requestNonce,omitempty"`
+}
+
+func activityRequestNonce() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func activityRequestID(b runtimeBinding, nonce string, n int64) string {
+	digest := sha256.Sum256([]byte(b.Agent + "\x00" + b.Run + "\x00" + nonce + "\x00" + fmt.Sprint(n)))
 	return "activity-" + hex.EncodeToString(digest[:12])
 }
 
@@ -298,12 +317,22 @@ func activityRequestID(b runtimeBinding, n int64) string {
 // replay the same request ID. No transcript text is sent over HTTP.
 func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client, now time.Time, probe activityProbe) error {
 	path := filepath.Join(relayDir(), bindingKey(b)+".activity.json")
-	var c activityCursor
+	var saved relayActivityState
+	fresh := true
 	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &c)
+		fresh = json.Unmarshal(data, &saved) != nil
 	}
+	c, nonce := saved.activityCursor, saved.RequestNonce
 	if c.Run != b.Run || c.Thread != b.Thread {
-		c = activityCursor{Run: b.Run, Thread: b.Thread}
+		c, fresh = activityCursor{Run: b.Run, Thread: b.Thread}, true
+	}
+	// A cursor an older relay saved has no nonce; it gets one, and a pending
+	// report keeps the request ID it was saved with.
+	if fresh || nonce == "" {
+		var err error
+		if nonce, err = activityRequestNonce(); err != nil {
+			return err
+		}
 	}
 	var u *usageCursor
 	if enabled, _ := ctx.Value(usageEnabledContextKey{}).(bool); enabled {
@@ -319,7 +348,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return err
 			}
 		}
-		return writePrivateJSON(path, c)
+		return writePrivateJSON(path, relayActivityState{activityCursor: c, RequestNonce: nonce})
 	}
 	// Metering failures never suppress activity transitions or alerts.
 	if u != nil && u.hasPendingWork() {
@@ -339,7 +368,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			return err
 		}
 		_, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
-		if retry, downgraded := stuckFallback(b, &c, err); downgraded {
+		if retry, downgraded := stuckFallback(b, nonce, &c, err); downgraded {
 			if err := save(); err != nil {
 				return err
 			}
@@ -553,13 +582,13 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	}
 	c.RejectedState, c.RejectedWakeKey = "", ""
 	c.Transition++
-	c.PendingReport = &api.ActivityReport{RequestID: activityRequestID(b, c.Transition), RunID: b.Run, Activity: state}
+	c.PendingReport = &api.ActivityReport{RequestID: activityRequestID(b, nonce, c.Transition), RunID: b.Run, Activity: state}
 	c.LastReportAttempt = now
 	if err := save(); err != nil {
 		return err
 	}
 	_, err = client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
-	if retry, downgraded := stuckFallback(b, &c, err); downgraded {
+	if retry, downgraded := stuckFallback(b, nonce, &c, err); downgraded {
 		if err := save(); err != nil {
 			return err
 		}
@@ -674,7 +703,7 @@ func downgradeStuck(state *api.AgentActivity) {
 // stuckFallback handles a hub that rejects the stuck state (HTTP 400): it
 // remembers the downgrade and replaces the pending report with an unknown one
 // under a new request ID, so later transitions are never blocked.
-func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.ActivityReport, bool) {
+func stuckFallback(b runtimeBinding, nonce string, c *activityCursor, err error) (*api.ActivityReport, bool) {
 	var httpErr *api.HTTPError
 	if c.PendingReport == nil || c.PendingReport.Activity.State != "stuck" || !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
 		return nil, false
@@ -683,7 +712,7 @@ func stuckFallback(b runtimeBinding, c *activityCursor, err error) (*api.Activit
 	report := *c.PendingReport
 	downgradeStuck(&report.Activity)
 	c.Transition++
-	report.RequestID = activityRequestID(b, c.Transition)
+	report.RequestID = activityRequestID(b, nonce, c.Transition)
 	c.PendingReport = &report
 	return c.PendingReport, true
 }

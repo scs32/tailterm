@@ -398,6 +398,230 @@ func TestActivityTickPostsOnlyTransitionsAndRetriesLostReply(t *testing.T) {
 	}
 }
 
+// receiptHub is a fake hub that keeps activity receipts like the store: a
+// reused request ID with a different payload is a 409, the same payload
+// replays without a new commit. dropReply commits one report, then answers
+// 503, a lost reply.
+type receiptHub struct {
+	agent     api.Agent
+	receipts  map[string]string
+	committed []api.ActivityReport
+	posted    []string
+	conflicts int
+	dropReply bool
+}
+
+func (h *receiptHub) serve(t *testing.T) *httptest.Server {
+	h.receipts = map[string]string{}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents/"+h.agent.ID):
+			_ = json.NewEncoder(w).Encode(h.agent)
+		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/obligations"):
+			_ = json.NewEncoder(w).Encode(api.ObligationList{})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activity"):
+			var req api.ActivityReport
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error("invalid report")
+			}
+			h.posted = append(h.posted, req.RequestID)
+			payload, _ := json.Marshal(req)
+			if prior, ok := h.receipts[req.RequestID]; ok {
+				if prior != string(payload) {
+					h.conflicts++
+					http.Error(w, "conflict", http.StatusConflict)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(req.Activity)
+				return
+			}
+			if req.RunID != h.agent.RunID {
+				http.Error(w, "conflict", http.StatusConflict)
+				return
+			}
+			h.receipts[req.RequestID] = string(payload)
+			h.committed = append(h.committed, req)
+			if h.dropReply {
+				h.dropReply = false
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(req.Activity)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// savedActivityState reads the relay's saved cursor file as JSON fields.
+func savedActivityState(t *testing.T, b runtimeBinding) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".activity.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	// The stall watch reads the same file into a plain cursor.
+	var cursor activityCursor
+	if err := json.Unmarshal(data, &cursor); err != nil || cursor.Run != b.Run {
+		t.Fatalf("cursor unreadable as activityCursor: %+v %v", cursor, err)
+	}
+	return fields
+}
+
+// Bug wi_15f305ae3eb57268: after the relay loses its state directory mid-run,
+// the transition count restarts, but new reports must not reuse an earlier
+// receipt's request ID; a lost reply still replays the same stored ID.
+func TestActivityRequestIDsSurviveLostRelayState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
+	thread := "12345678-1234-1234-1234-123456789abc"
+	path := filepath.Join(home, ".codex", "sessions", "2026", "10", "19", "rollout-test-"+thread+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"task_started","timestamp":"2026-10-19T17:00:00Z"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	appendLine := func(line string) {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &receiptHub{agent: api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Status: api.AgentRunning, Online: true, Session: "reset-agent", Runtime: "codex"}}
+	server := h.serve(t)
+	defer server.Close()
+	client, _ := api.NewClient(server.URL, 5*time.Second)
+	b := runtimeBinding{Hub: server.URL, Task: "tsk_0123456789abcdef", Agent: h.agent.ID, Run: h.agent.RunID, Thread: thread, Runtime: "codex", Codex: filepath.Join(home, "codex")}
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	now := time.Date(2026, 10, 19, 17, 0, 0, 0, time.UTC)
+	tick := func(at time.Duration) error {
+		return relayActivityTick(context.Background(), b, client, now.Add(at), probe)
+	}
+	states := func() []string {
+		var out []string
+		for _, r := range h.committed {
+			out = append(out, r.Activity.State)
+		}
+		return out
+	}
+
+	if err := tick(0); err != nil {
+		t.Fatal(err)
+	}
+	appendLine(`{"type":"task_complete","timestamp":"2026-10-19T17:00:10Z"}`)
+	if err := tick(16 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := states(); !slices.Equal(got, []string{"working", "idle"}) {
+		t.Fatalf("before reset: %v", got)
+	}
+	nonce, _ := savedActivityState(t, b)["requestNonce"].(string)
+	if nonce == "" {
+		t.Fatal("cursor saved without a request nonce")
+	}
+
+	// The state directory is lost while the run continues.
+	if err := os.RemoveAll(relayDir()); err != nil {
+		t.Fatal(err)
+	}
+	appendLine(`{"type":"task_started","timestamp":"2026-10-19T17:00:40Z"}`)
+	if err := tick(48 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := states(); !slices.Equal(got, []string{"working", "idle", "working"}) || h.conflicts != 0 {
+		t.Fatalf("after reset: states=%v conflicts=%d posted=%v", got, h.conflicts, h.posted)
+	}
+	if fresh, _ := savedActivityState(t, b)["requestNonce"].(string); fresh == "" || fresh == nonce {
+		t.Fatalf("fresh cursor nonce %q, earlier %q", fresh, nonce)
+	}
+	seen := map[string]bool{}
+	for _, r := range h.committed {
+		if seen[r.RequestID] {
+			t.Fatalf("request ID reused: %s", r.RequestID)
+		}
+		seen[r.RequestID] = true
+	}
+
+	// A lost reply leaves the report pending; every tick reloads the saved
+	// cursor, and the retry sends the same stored ID without a new receipt.
+	h.dropReply = true
+	appendLine(`{"type":"task_complete","timestamp":"2026-10-19T17:01:00Z"}`)
+	if err := tick(64 * time.Second); err == nil {
+		t.Fatal("expected lost reply")
+	}
+	pending := h.committed[len(h.committed)-1].RequestID
+	saved, _ := savedActivityState(t, b)["pendingReport"].(map[string]any)
+	if saved["requestId"] != pending {
+		t.Fatalf("saved pending report %v, posted %s", saved, pending)
+	}
+	if err := tick(65 * time.Second); err != nil || len(h.posted) != 4 {
+		t.Fatalf("retry ignored the 15s spacing: posted=%v err=%v", h.posted, err)
+	}
+	if err := tick(80 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.posted) != 5 || h.posted[4] != pending || len(h.committed) != 4 || h.conflicts != 0 {
+		t.Fatalf("duplicate delivery not idempotent: posted=%v committed=%d conflicts=%d", h.posted, len(h.committed), h.conflicts)
+	}
+	if _, ok := savedActivityState(t, b)["pendingReport"]; ok {
+		t.Fatal("replayed report still pending")
+	}
+	if err := tick(96 * time.Second); err != nil || len(h.posted) != 5 {
+		t.Fatalf("steady state posted again: posted=%v err=%v", h.posted, err)
+	}
+}
+
+// A cursor an older relay saved has no nonce: it gets one, and its pending
+// report keeps the stored request ID. A thread change still resets the cursor.
+func TestActivityLegacyCursorKeepsPendingIDAndThreadResets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
+	h := &receiptHub{agent: api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Status: api.AgentRunning, Online: true, Session: "legacy-agent", Runtime: "codex"}}
+	server := h.serve(t)
+	defer server.Close()
+	client, _ := api.NewClient(server.URL, 5*time.Second)
+	b := runtimeBinding{Hub: server.URL, Task: "tsk_0123456789abcdef", Agent: h.agent.ID, Run: h.agent.RunID, Thread: "12345678-1234-1234-1234-123456789abc", Runtime: "codex", Codex: filepath.Join(home, "codex")}
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	now := time.Date(2026, 10, 19, 17, 0, 0, 0, time.UTC)
+	legacy := activityCursor{Run: b.Run, Thread: b.Thread, Transition: 3, PendingReport: &api.ActivityReport{RequestID: "activity-legacy0123456789", RunID: b.Run, Activity: api.AgentActivity{State: "working", ObservedAt: now}}}
+	if err := os.MkdirAll(relayDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(filepath.Join(relayDir(), bindingKey(b)+".activity.json"), legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := relayActivityTick(context.Background(), b, client, now, probe); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.posted) != 1 || h.posted[0] != "activity-legacy0123456789" {
+		t.Fatalf("legacy pending report not replayed as stored: %v", h.posted)
+	}
+	fields := savedActivityState(t, b)
+	nonce, _ := fields["requestNonce"].(string)
+	if nonce == "" || fields["transition"] != float64(3) {
+		t.Fatalf("legacy cursor upgrade: %v", fields)
+	}
+	b.Thread = "87654321-4321-4321-4321-cba987654321"
+	if err := relayActivityTick(context.Background(), b, client, now.Add(16*time.Second), probe); err != nil {
+		t.Fatal(err)
+	}
+	fields = savedActivityState(t, b)
+	if fields["thread"] != b.Thread || fields["transition"] != nil || fields["requestNonce"] == nonce || fields["requestNonce"] == nil {
+		t.Fatalf("thread change did not reset the cursor: %v", fields)
+	}
+}
+
 func TestActivityCLIShowsAgentAndTeamSnapshots(t *testing.T) {
 	task := "tsk_0123456789abcdef"
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
