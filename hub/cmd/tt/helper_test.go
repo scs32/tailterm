@@ -757,6 +757,10 @@ func TestOwnerHelperTeamCountAndOfflineLabel(t *testing.T) {
 	if got := ordinaryTeamMemberCount(agents, "lead"); got != 2 {
 		t.Fatalf("team members %d", got)
 	}
+	persistent := []api.Agent{{Name: "lead"}, {Name: "builder"}, {Name: "db", Role: api.AgentRoleDatabaseHandler}, {Name: "deployer", Role: api.AgentRoleDeployment}, {Name: api.DefaultOwnerHelperName, Role: api.AgentRoleOwnerHelper}, {Name: "backlog-steward", Role: api.AgentRoleBacklogSteward}}
+	if got := ordinaryTeamMemberCount(persistent, "lead"); got != 2 {
+		t.Fatalf("team members with every persistent role %d", got)
+	}
 	helper := api.Agent{ID: api.NewID("agt"), Name: api.DefaultOwnerHelperName, Role: api.AgentRoleOwnerHelper, Status: api.AgentRunning, Activity: &api.AgentActivity{State: "unknown"}}
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(api.AgentList{Agents: []api.Agent{helper}})

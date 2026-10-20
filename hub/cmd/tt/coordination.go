@@ -55,10 +55,20 @@ func postArgs(args []string) []string {
 	return append(append(flags, "--"), text...)
 }
 
+// teamPersistentRoles are the project roles that serve every team rather than
+// belonging to one, so they never count as ordinary team members. It matches
+// the TailOS client's list.
+var teamPersistentRoles = map[string]bool{
+	api.AgentRoleDatabaseHandler: true,
+	api.AgentRoleDeployment:      true,
+	api.AgentRoleOwnerHelper:     true,
+	api.AgentRoleBacklogSteward:  true,
+}
+
 func ordinaryTeamMemberCount(agents []api.Agent, currentName string) int {
 	members := map[string]struct{}{}
 	for _, agent := range agents {
-		if agent.Role == api.AgentRoleDatabaseHandler || agent.Role == api.AgentRoleOwnerHelper || agent.Role == api.AgentRoleBacklogSteward || agent.Name == "" {
+		if teamPersistentRoles[agent.Role] || agent.Name == "" {
 			continue
 		}
 		members[strings.ToLower(agent.Name)] = struct{}{}
