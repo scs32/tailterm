@@ -208,11 +208,11 @@ a fresh helper with a new agent ID and is ledgered again; open a new delegation
 window for it (see [After a close, open a new window](#opening-a-window-for-the-helper)).
 
 An owner close (`tt close owner-helper` or TailOS) also closes the helper on the
-hub, but this host does not learn of it until the helper session next runs
-`tt helper env`, `tt helper inbox` or `tt helper reply`, which mark the file before
-refusing. Until then the session is still ledgered under the closed run. The relay
-heartbeat does not mark the file yet; bug `wi_b134e2c694f51b54` adds that, and it
-is not on `tasks-hub` yet.
+hub. Within about 30 seconds the relay's helper heartbeat finds that exact run
+closed and marks this host's helper file, so the session writes no further tool
+ledger rows (see [Claude wake](claude-wake.md#a-closed-helper)). If the helper
+session runs `tt helper env`, `tt helper inbox` or `tt helper reply` first, that
+command marks the file before refusing.
 
 ## Talking from Discord
 
