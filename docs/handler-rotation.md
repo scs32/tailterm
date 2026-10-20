@@ -751,13 +751,19 @@ directory are inert without the new CLI.
   twice. Follow-up filed.
 - A [lost exit report](#a-lost-exit-report) is recovered only by the
   wrapper's retry. Until it reaches the hub, the handler is not exited, its
-  session is present and the probe answers alive. These still wait for the
-  owner: a wrapper killed (SIGKILL, `tmux kill-session`, a host restart)
-  before any post succeeded; a receipt that could not record the exit, or that
-  does not name the wrapper as the pane process or names no login shell
-  (`exitReportStopped`); a hub that refuses the report for good, recorded in
-  `exitReportStopped`; and anything that keeps running under the leftover
-  shell, during which the retry waits.
+  session is present and the probe answers alive. A wrapper that dies before
+  any post succeeded usually takes its session with it: `tmux kill-session`, a
+  host restart, or a SIGKILL of the wrapper, which closes the session's only
+  pane. The session is then absent, and the handler is replaced as a
+  [dead primary](#a-dead-primary) once the silence passes, unless its probe is
+  unknown for a reason in the limit above. These still wait for the owner: a
+  wrapper that dies while its session stays present, such as a session with a
+  second pane or window, or a tmux configuration with `remain-on-exit`; a
+  receipt that could not record the exit, or that does not name the wrapper
+  as the pane process or names no login shell (`exitReportStopped`); a hub
+  that refuses the report for good, recorded in `exitReportStopped`; and
+  anything that keeps running under the leftover shell, during which the
+  retry waits.
 - An exited primary that is not busy is not replaced by this rule; see the
   handler floor and follow-up `wi_42be87739d7bbfc9`.
 - The queue's waiting reason for a project whose primary exited is unchanged.
