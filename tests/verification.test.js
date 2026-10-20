@@ -20,6 +20,8 @@ import {
   selectChecks,
   runPlan,
   digest,
+  canonical,
+  CANONICAL_DIGEST_FIXTURE,
   assertInventory,
   receiptEligible,
   removeVerifierHome,
@@ -1539,4 +1541,72 @@ test("every agent CLI stub shadows a real binary on the check PATH, fails fast a
   assert(!existsSync(marker), "no decoy ran");
   assert.deepEqual(matrixRunner.verifierHomeProcesses(home), []);
   assert(!existsSync(home));
+});
+
+// Pinned with the hub's verificationDigest at e01c4026; the Go
+// TestVerificationCanonicalDigestFixture asserts the same two values.
+const canonicalFixtureDigests = {
+  special: "f0df73da371fb59414fdb9bd6f58b4fd808ba060aea6218e5f1652ea9cfd9ec3",
+  ordinary: "75aa0a1b9b9c0528ea7e9df8681f8525a4e6796c489093d26a2c35831fd75e4a",
+};
+// canonical() as it was at e01c4026, before it matched the hub on U+2028,
+// U+2029 and astral keys.
+function baseCanonical(value) {
+  if (Array.isArray(value)) return "[" + value.map(baseCanonical).join(",") + "]";
+  if (value && typeof value === "object")
+    return (
+      "{" +
+      Object.keys(value)
+        .sort()
+        .map((k) => JSON.stringify(k) + ":" + baseCanonical(value[k]))
+        .join(",") +
+      "}"
+    );
+  return JSON.stringify(value);
+}
+
+test("canonical digest fixture hashes to the digests the hub pins", () => {
+  const { special, ordinary } = CANONICAL_DIGEST_FIXTURE;
+  assert.equal(digest(special), canonicalFixtureDigests.special);
+  assert.equal(digest(ordinary), canonicalFixtureDigests.ordinary);
+  const text = canonical(special);
+  assert.match(text, /\\u2028/);
+  assert.match(text, /\\u2029/);
+  assert.doesNotMatch(text, /[\u2028\u2029]/);
+  assert(text.includes(String.raw`"literal \\u2028 and \\u2029 text"`), "a literal backslash-u is not re-escaped");
+  // JSON.parse keeps the written order for these non-integer keys.
+  assert.deepEqual(
+    Object.keys(JSON.parse(text)),
+    ["a", "x\u2028", "x\u2029", "\uE000", "\uFF21", "\u{10000}", "\u{1F600}", "\u{10FFFF}"],
+    "keys sort by UTF-8 bytes",
+  );
+  assert.equal(canonical({ "\u{1F600}": 1, "\uFF21": 2 }), '{"\uFF21":2,"\u{1F600}":1}');
+  assert.equal(canonical(ordinary), baseCanonical(ordinary));
+});
+
+test("canonical digest fixture: ordinary inputs keep the canonical form they had before", () => {
+  let seed = 0x165a5457;
+  const next = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+  const alphabet = ["a", "b", "Z", "0", "9", " ", "<", ">", "&", '"', "\\", "'", "\b", "\f", "\n", "\r", "\t", "\u0000", "\u001f", "\u007f", "\u03bb", "\uE000", "\uFFFD", "\uFF21"];
+  const text = () => Array.from({ length: Math.floor(next() * 6) }, () => alphabet[Math.floor(next() * alphabet.length)]).join("");
+  const value = (depth) => {
+    const pick = Math.floor(next() * (depth < 3 ? 8 : 6));
+    if (pick === 0) return null;
+    if (pick === 1) return next() < 0.5;
+    if (pick === 2) return Math.floor(next() * 2001) - 1000;
+    if (pick === 3) return Math.floor(next() * 1000) / 8;
+    if (pick < 6) return text();
+    if (pick === 6) return Array.from({ length: Math.floor(next() * 4) }, () => value(depth + 1));
+    return Object.fromEntries(Array.from({ length: Math.floor(next() * 5) }, () => [text(), value(depth + 1)]));
+  };
+  for (let i = 0; i < 500; i++) {
+    const input = Object.fromEntries(Array.from({ length: 1 + Math.floor(next() * 5) }, () => [text(), value(1)]));
+    assert.equal(canonical(input), baseCanonical(input), `generated input ${i}`);
+  }
+  assert.equal(canonical(CANONICAL_DIGEST_FIXTURE.ordinary), baseCanonical(CANONICAL_DIGEST_FIXTURE.ordinary));
 });

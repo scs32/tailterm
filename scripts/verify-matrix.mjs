@@ -53,18 +53,54 @@ const binarySuites = new Set([
 ]);
 const historicalHubCommit = "58f9185981625b148b30ad4b5070a1a658e17f77";
 
+// One fixture for both runtimes: tests/verification.test.js and the hub's
+// TestVerificationCanonicalDigestFixture pin the same digests. `special` holds
+// the characters where JSON.stringify and Go's encoder disagree (U+2028,
+// U+2029, astral-plane keys); `ordinary` holds none of them.
+export const CANONICAL_DIGEST_FIXTURE = {
+  special: {
+    a: "line\u2028separator",
+    "\uE000": "paragraph\u2029separator",
+    "\uFF21": "both\u2028\u2029",
+    "\u{10000}": "literal \\u2028 and \\u2029 text",
+    "\u{1F600}": "astral \u{1F600} value",
+    "\u{10FFFF}": ["\u2029", { "\u{1F600}": 1, "\uFF21": 2, "\uE000": 3 }],
+    "x\u2028": { "\u{10000}": null, "\uE000": true },
+    "x\u2029": [{ "\uFF21": "a", "\u{1F600}": "b" }, { "\u{10FFFF}": "c", z: "d" }],
+  },
+  ordinary: {
+    "": "empty key",
+    1: "one",
+    10: "ten",
+    9: "nine",
+    A: "<tag> & 'quote' \"double\"",
+    b: "\b\f\n\r\t\u0000\u001f\u007f",
+    "\u03bb": "lambda \u03bb",
+    "\uE000": "private use",
+    "\uFFFD": "replacement \uFFFD",
+    nested: { list: [0, -1, 1.5, null, true, false], empty: {}, none: [] },
+    records: [{ id: "c1", argv: ["node", "fixture.js"] }, { id: "c2", environment: { HOME: "/tmp/isolated" } }],
+  },
+};
+
+// Mirrors the hub's verificationDigest (Go encoding/json): keys in UTF-8 byte
+// order and U+2028/U+2029 escaped. Input without astral keys or those two
+// characters encodes exactly as JSON.stringify with sorted keys.
+const canonicalString = (s) =>
+  JSON.stringify(s).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
+const utf8Order = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
 export function canonical(value) {
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
   if (value && typeof value === "object")
     return (
       "{" +
       Object.keys(value)
-        .sort()
-        .map((k) => JSON.stringify(k) + ":" + canonical(value[k]))
+        .sort(utf8Order)
+        .map((k) => canonicalString(k) + ":" + canonical(value[k]))
         .join(",") +
       "}"
     );
-  return JSON.stringify(value);
+  return typeof value === "string" ? canonicalString(value) : JSON.stringify(value);
 }
 export const digest = (value) =>
   createHash("sha256")

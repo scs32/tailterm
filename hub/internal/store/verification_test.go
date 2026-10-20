@@ -469,6 +469,55 @@ func TestVerificationCrossRuntimeDigest(t *testing.T) {
 
 	_ = f
 }
+
+// The fixture is defined once, in scripts/verify-matrix.mjs; the pins match
+// tests/verification.test.js.
+func TestVerificationCanonicalDigestFixture(t *testing.T) {
+	pinned := map[string]string{
+		"special":  "f0df73da371fb59414fdb9bd6f58b4fd808ba060aea6218e5f1652ea9cfd9ec3",
+		"ordinary": "75aa0a1b9b9c0528ea7e9df8681f8525a4e6796c489093d26a2c35831fd75e4a",
+	}
+	script := `import {CANONICAL_DIGEST_FIXTURE as f,canonical,digest} from './scripts/verify-matrix.mjs';const part=(v)=>({canonical:canonical(v),digest:digest(v)});process.stdout.write(JSON.stringify({fixture:f,special:part(f.special),ordinary:part(f.ordinary)}))`
+	cmd := exec.Command("node", "--input-type=module", "-e", script)
+	cmd.Dir = "../../.."
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type host struct{ Canonical, Digest string }
+	var got struct {
+		Fixture  map[string]json.RawMessage
+		Special  host
+		Ordinary host
+	}
+	if err = json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	// JSON.stringify leaves these characters raw, so the bytes show them.
+	for _, r := range []string{"\u2028", "\u2029", "\U00010000", "\U0001F600"} {
+		if !strings.Contains(string(got.Fixture["special"]), r) {
+			t.Fatalf("special part lacks %+q: %s", r, got.Fixture["special"])
+		}
+	}
+	for name, h := range map[string]host{"special": got.Special, "ordinary": got.Ordinary} {
+		var value any
+		if err = json.Unmarshal(got.Fixture[name], &value); err != nil {
+			t.Fatal(err)
+		}
+		var encoded bytes.Buffer
+		encoder := json.NewEncoder(&encoded)
+		encoder.SetEscapeHTML(false)
+		if err = encoder.Encode(value); err != nil {
+			t.Fatal(err)
+		}
+		if want := strings.TrimSuffix(encoded.String(), "\n"); h.Canonical != want {
+			t.Errorf("%s canonical form differs\nnode: %s\ngo:   %s", name, h.Canonical, want)
+		}
+		if d := verificationDigest(value); h.Digest != d || d != pinned[name] {
+			t.Errorf("%s digest node=%s go=%s pinned=%s", name, h.Digest, d, pinned[name])
+		}
+	}
+}
 func TestVerificationScopeInvalidationAndStaleVerifier(t *testing.T) {
 	f, h, p := verificationFixture(t)
 	saveFixtureVerification(t, f, h, p, 0)
