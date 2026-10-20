@@ -241,8 +241,8 @@ func currentReviewStage(ctx context.Context, q queryRower, task string, state *a
 	return earlier, nil
 }
 
-// reviewWithdrawn reports whether the sender withdrew the REVIEW message seq
-// (tt withdraw closes its obligation with outcome withdrawn).
+// reviewWithdrawn reports whether the sender withdrew the REVIEW or ASSIGN
+// message seq (tt withdraw closes its obligation with outcome withdrawn).
 func reviewWithdrawn(ctx context.Context, q queryRower, task string, seq int64) (bool, error) {
 	var n int
 	err := q.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE task_id=? AND message_seq=? AND state=? AND outcome=?`, task, seq, api.ObligationClosed, api.OutcomeWithdrawn).Scan(&n)
@@ -446,8 +446,12 @@ func evidenceFinding(f api.ReviewFinding, candidate string, criteria map[string]
 	}
 	return nil
 }
+
+// scopeFor returns the scope revision's current assignment: its last entry.
+// Earlier entries for the same revision are assignments a lead withdrew and
+// replaced with the same criteria, kept as history.
 func scopeFor(state *api.ReviewConvergence, scope int64) *api.ReviewScope {
-	for i := range state.Scopes {
+	for i := len(state.Scopes) - 1; i >= 0; i-- {
 		if state.Scopes[i].ScopeRevision == scope {
 			return &state.Scopes[i]
 		}
@@ -793,7 +797,16 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if sc != nil && (!reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), owned)) {
 			return reviewConflict("criteria frozen; revision-checked scope update required")
 		}
-		if sc == nil {
+		superseded := false
+		if sc != nil {
+			// An ASSIGN with the same criteria after the scope's assignment was
+			// withdrawn replaces it, so verification binds the assignment that
+			// governs the builder. The withdrawn entry stays before it.
+			if superseded, err = reviewWithdrawn(ctx, tx, m.TaskID, sc.AssignmentSeq); err != nil {
+				return err
+			}
+		}
+		if sc == nil || superseded {
 			state.Scopes = append(state.Scopes, api.ReviewScope{ScopeRevision: item.ScopeRevision, ItemRevision: item.Revision, AssignmentSeq: m.Seq, Criteria: e.Body.Acceptance, VerificationCriteria: owned})
 		}
 		if len(state.Scopes) == 1 && state.Scopes[0].AssignmentSeq == m.Seq {
