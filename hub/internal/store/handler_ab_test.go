@@ -2340,31 +2340,51 @@ func TestHandlerNeedUnreadableActivityOfOfflinePrimary(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.offline(t, idle)
-	if _, err := f.s.db.Exec(`INSERT INTO agent_activity(task_id,agent_id,run_id,state,observed_at,payload,request_id) VALUES(?,?,?,'idle',?,'{not json','malformed')`,
-		f.task.ID, idle.ID, idle.RunID, ts(time.Now())); err != nil {
-		t.Fatal(err)
-	}
-	list, err := f.s.ListTeamQueue(ctx, f.task.ID)
-	if err != nil || len(list.Entries) != len(f.entries) {
-		t.Fatalf("listing with a malformed snapshot: %d entries, %v", len(list.Entries), err)
-	}
-	rotate := "tt handler rotate --task " + f.task.ID
-	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
-	want := idle.Name + " is offline. The hub does not restart a handler; " + idle.Name + " is the primary, and its activity is unknown: its activity snapshot could not be read " +
-		"(activity snapshot: invalid character 'n' looking for beginning of object key string). Its rotation (" + rotate + ") and the host runner's automatic replacement read the same snapshot and fail with that error."
-	if n := got.HandlerNeed; n == nil || n.Provision || n.Fix != "" || strings.Contains(got.BlockReason, "Fix: ") || !strings.HasSuffix(got.BlockReason, want) {
-		t.Fatalf("unreadable primary need %+v\nreason %q\n  want %q", n, got.BlockReason, want)
-	}
-	// The rotation itself is unchanged: it reads the snapshot and fails.
 	task, err := f.s.GetTask(ctx, f.task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: "rotate-malformed",
-		ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: idle.ID, OldRunID: idle.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(idle.Name, task.HandlerRevision),
-		Reason: api.HandlerRotationReasonManual, Trigger: api.HandlerRotationTriggerOwner}, f.by)
-	if err == nil || !strings.HasPrefix(err.Error(), "activity snapshot: ") {
-		t.Fatalf("rotation with a malformed snapshot: %v", err)
+	rotate := "tt handler rotate --task " + f.task.ID
+	// Any parse failure counts: bad JSON, and a time field that does not
+	// parse as a string or is not one.
+	for i, payload := range []string{`{not json`, `{"observedAt":"garbage"}`, `{"observedAt":5}`} {
+		if _, err := f.s.db.Exec(`DELETE FROM agent_activity WHERE agent_id=?`, idle.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.s.db.Exec(`INSERT INTO agent_activity(task_id,agent_id,run_id,state,observed_at,payload,request_id) VALUES(?,?,?,'idle',?,?,'malformed')`,
+			f.task.ID, idle.ID, idle.RunID, ts(time.Now()), payload); err != nil {
+			t.Fatal(err)
+		}
+		list, err := f.s.ListTeamQueue(ctx, f.task.ID)
+		if err != nil || len(list.Entries) != len(f.entries) {
+			t.Fatalf("listing with payload %s: %d entries, %v", payload, len(list.Entries), err)
+		}
+		got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+		head := idle.Name + " is offline. The hub does not restart a handler; " + idle.Name + " is the primary, and its activity is unknown: its activity snapshot could not be read (activity snapshot: "
+		tail := "). Its rotation (" + rotate + ") and the host runner's automatic replacement read the same snapshot and fail with that error."
+		if i == 0 {
+			head += "invalid character 'n' looking for beginning of object key string"
+		}
+		if n := got.HandlerNeed; n == nil || n.Provision || n.Fix != "" || strings.Contains(got.BlockReason, "Fix: ") || !strings.Contains(got.BlockReason, head) || !strings.HasSuffix(got.BlockReason, tail) {
+			t.Fatalf("payload %s: unreadable primary need %+v\nreason %q", payload, n, got.BlockReason)
+		}
+		// The rotation itself is unchanged: it reads the snapshot and fails.
+		_, err = f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: fmt.Sprintf("rotate-malformed-%d", i),
+			ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: idle.ID, OldRunID: idle.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(idle.Name, task.HandlerRevision),
+			Reason: api.HandlerRotationReasonManual, Trigger: api.HandlerRotationTriggerOwner}, f.by)
+		if err == nil || !strings.HasPrefix(err.Error(), "activity snapshot: ") {
+			t.Fatalf("rotation with payload %s: %v", payload, err)
+		}
+	}
+	// Any other error reading the activity still fails the need.
+	c := &handlerNeedContext{primaryID: idle.ID, now: f.s.now(), handlers: make([]api.HandlerArmHandler, 2)}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := c.offlineHandlerFix(canceled, f.s.db, f.task.ID, api.HandlerArmHandler{AgentID: idle.ID, RunID: idle.RunID, Name: idle.Name}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a database error was swallowed: %v", err)
+	}
+	if unreadableActivity(nil) || unreadableActivity(sql.ErrConnDone) || unreadableActivity(fmt.Errorf("load: %w", errors.New("activity snapshot: x"))) {
+		t.Fatal("a non-snapshot error read as an unreadable snapshot")
 	}
 }
 

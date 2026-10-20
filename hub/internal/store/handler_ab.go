@@ -2093,11 +2093,11 @@ func (c *handlerNeedContext) offlineHandlerFix(ctx context.Context, q queryRower
 }
 
 // unreadableActivity reports whether loadHandlerBusy failed only because the
-// run's activity snapshot does not parse.
+// run's activity snapshot does not parse, whatever the parse error: that is
+// the one error it wraps as "activity snapshot: " (handler_rotation.go). A
+// database error is not one and still fails the caller.
 func unreadableActivity(err error) bool {
-	var syntax *json.SyntaxError
-	var typed *json.UnmarshalTypeError
-	return errors.As(err, &syntax) || errors.As(err, &typed)
+	return err != nil && strings.HasPrefix(err.Error(), "activity snapshot: ")
 }
 
 // deadPrimaryText says what the product does about an offline, busy primary:
