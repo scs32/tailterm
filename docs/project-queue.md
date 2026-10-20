@@ -1736,17 +1736,30 @@ when all of these hold:
 - Sweep only: nothing anywhere below the folder, at any depth, changed within
   `--min-idle` (`recent`). A folder the sweep cannot read through counts as
   changed. This covers a session that is not on the roster.
-- Its items' receipt and plan files can be read (`retention` otherwise). With
-  no artifacts root (a relative or unset one), or a root that is not the
-  default `<main checkout>-artifacts` and is not a directory or has no folder
-  for one of its items, every session temp folder is kept, at closeout and in
-  the sweep, and the reason names the root. The default root is trusted: an
-  item with no folder there has no receipt or plan file, so nothing can cite
-  the folder.
 - No receipt text names it (`evidence`): queue evidence, tracked docs, and the
   receipt and plan files of the items it belongs to.
 - No Git repository or kept worktree remains inside it (`nested`). Scratchpad
   worktrees removed earlier in the same pass do not count.
+- Its items' receipt and plan files can be read (`retention` otherwise). The
+  folder is kept, at closeout and in the sweep, with a reason that names the
+  root, in exactly these cases: `TAILTERM_ARTIFACTS` is a relative path, so
+  there is no root (closeout keeps every folder; the sweep refuses a relative
+  `TAILTERM_ARTIFACTS` or `--artifacts` before it reads the hub); or the root
+  in use is not the default `<main checkout>-artifacts` and is not a
+  directory, or has no folder for one of the folder's items. An unset or empty
+  `TAILTERM_ARTIFACTS` with no `--artifacts` uses the default root, and the
+  default root is trusted, even when it or an item's folder is absent: an item
+  with no folder there has no receipt or plan file, so nothing can cite the
+  folder. This rule is checked last, so a folder it keeps is kept for nothing
+  else. The sweep reports how many such folders it kept and their total size
+  (see "Receipts and report"); nothing is removed on their account.
+
+The recent rule ignores the pass's own removals. An applying sweep that has
+removed a scratchpad worktree inside a folder does not count that removal as
+a change: the directory it was removed from counts with the time it had
+before, unless something else changed it since. A worktree the pass removes,
+or in a dry run would remove, is not read for the rule, so the dry run and
+`--apply` agree.
 
 When the sweep applies, it removes a folder in two steps: it renames the
 folder to a tombstone beside it in the temp root, then deletes the tombstone
@@ -1992,6 +2005,15 @@ totals keep their meaning, and `totals.actions` gains `would-trim` or
 `would-trim PATH (cache; regenerable cache in a finished checkout of wi_x; 412.0 MiB)`
 and `would-remove PATH (matrix test binary; item wi_x released; receipt commit 0123456789ab matches its verification record; sha256 matches test-binaries.json; 27.6 MiB)`.
 A folder that holds only empty directories reports `0 B`.
+
+Session temp folders kept only because the artifacts root cannot cite them
+(the last `retention` rule under "Session temp folders") are counted, in the
+dry run and with `--apply`. Each such kept row's `bytes` is the folder's size,
+and `--json` adds `totals.uncitableTemp`: `{"folders": N, "bytes": B}`, zero
+when there are none. They are not in `totals.bytes` or the reclaimable total.
+When N is not zero the text report prints, after the totals line,
+`session temp kept only because the artifacts root cannot cite it: 2 folders, 16.0 MiB; check --artifacts or TAILTERM_ARTIFACTS`.
+Closeout records them as before, with no total.
 
 Keep reasons, in the order checked for a verifier checkout: `locked`,
 `missing`, `in-use`, `item-active` (an entry of the item is queued, launching,

@@ -122,6 +122,9 @@ type worktreeDecision struct {
 	// strayRoot is set on a checkout kept for lying outside the artifacts
 	// root: the root in use, or "none".
 	strayRoot string
+	// uncitable marks a session temp folder kept only because the artifacts
+	// root cannot cite it; its Bytes is a size report.
+	uncitable bool
 }
 
 type worktreeEvidence struct {
@@ -904,6 +907,9 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	// cleared holds worktrees removed or pruned (or, in a dry run, that
 	// would be) earlier in this pass; only they may sit inside a removal.
 	cleared := map[string]bool{}
+	// touched holds the mtimes this pass's removals changed, so they do not
+	// make an enclosing session temp folder count as recent.
+	touched := dirTouches{}
 	prune := false
 	blockerChecked, blocker := false, ""
 	for _, w := range candidates {
@@ -944,12 +950,17 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 				var reason, why, manifest string
 				bytes := d.Bytes
 				held, heldWhy := in.exclusive(func(p string) string { return worktreeInUseAt(w.Path, p, linked) }, func() {
+					parent := filepath.Dir(w.Path)
+					before := dirModTime(parent)
 					if item != "" {
 						// A verifier checkout leaves a manifest beside its receipts.
 						reason, why, manifest, bytes = removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.items[item], in.Receipt, now)
-						return
+					} else {
+						reason, why = removeWorktree(ctx, common, w, admin, cleared)
 					}
-					reason, why = removeWorktree(ctx, common, w, admin, cleared)
+					if reason == "" {
+						touched.record(parent, before)
+					}
 				})
 				if held != "" {
 					reason, why = held, heldWhy
@@ -983,7 +994,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	}
 	trims, eligible := trimCaches(ctx, in, common, main, candidates, decisions, linked, art, now)
 	decisions = append(decisions, trims...)
-	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, art, now)...)
+	decisions = append(decisions, cleanupSessionTemp(in, main, temp, inUse, linked, cited, cleared, touched, art, now)...)
 	// The verifier home pass runs after the trims and removals above, so
 	// its failure still records their receipts before it is returned.
 	homes, homeErr := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
@@ -1856,20 +1867,65 @@ func sessionTempCandidates(in worktreeCleanupInputs, main string, linked []strin
 	return out
 }
 
+// dirTouch is a directory's mtime before this pass first removed an entry
+// from it, and the mtime the pass's latest removal there left.
+type dirTouch struct{ before, after time.Time }
+
+// dirTouches records the directories this pass removed entries from.
+type dirTouches map[string]dirTouch
+
+// dirModTime is dir's mtime, or zero when it cannot be read.
+func dirModTime(dir string) time.Time {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+// record notes a removal from dir that found it at mtime before. When dir
+// is still as the pass's previous removal there left it, the earlier before
+// stands; any other change in between starts from the new one.
+func (t dirTouches) record(dir string, before time.Time) {
+	after := dirModTime(dir)
+	if before.IsZero() || after.IsZero() {
+		return
+	}
+	if prev, ok := t[dir]; ok && prev.after.Equal(before) {
+		before = prev.before
+	}
+	t[dir] = dirTouch{before: before, after: after}
+}
+
+// modTime is p's mtime with this pass's own removals taken back: while p is
+// exactly as the pass's latest removal left it, the mtime it had before.
+func (t dirTouches) modTime(p string, info fs.FileInfo) time.Time {
+	if prev, ok := t[p]; ok && info.ModTime().Equal(prev.after) {
+		return prev.before
+	}
+	return info.ModTime()
+}
+
 // sessionTempIdle is the time since anything in the folder, at any depth,
 // last changed. A folder that cannot be read through counts as changed now.
-func sessionTempIdle(folder string, now time.Time) time.Duration {
+// The pass's own work does not count: worktrees in cleared are skipped, as
+// they are or will be gone, and a directory a removal changed counts with the
+// mtime it had before (touched).
+func sessionTempIdle(folder string, now time.Time, cleared map[string]bool, touched dirTouches) time.Duration {
 	newest := time.Time{}
-	err := filepath.WalkDir(folder, func(_ string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(folder, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if p != folder && d.IsDir() && cleared[p] {
+			return filepath.SkipDir
 		}
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
-		if info.ModTime().After(newest) {
-			newest = info.ModTime()
+		if mtime := touched.modTime(p, info); mtime.After(newest) {
+			newest = mtime
 		}
 		return nil
 	})
@@ -1879,52 +1935,58 @@ func sessionTempIdle(folder string, now time.Time) time.Duration {
 	return now.Sub(newest)
 }
 
-// classifySessionTemp returns the first keep reason for a temp folder, or "".
-func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) (string, string) {
+// classifySessionTemp returns the first keep reason for a temp folder, or "",
+// and whether the folder is kept only because the artifacts root cannot cite
+// it.
+func classifySessionTemp(in worktreeCleanupInputs, main string, t sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, touched dirTouches, art *artifactPass, now time.Time) (string, string, bool) {
 	for _, p := range append(append([]string(nil), inUse...), in.InUse...) {
 		if p == "" {
 			continue
 		}
 		if detail := sessionTempInUseAt(t.Folder, p, linked); detail != "" {
-			return keepInUse, detail
+			return keepInUse, detail, false
 		}
 	}
 	if in.MinIdle > 0 {
-		if idle := sessionTempIdle(t.Folder, now); idle < in.MinIdle {
-			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
+		if idle := sessionTempIdle(t.Folder, now, cleared, touched); idle < in.MinIdle {
+			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute)), false
 		}
 	}
 	if file := cited[t.Folder]; file != "" {
-		return keepEvidence, "cited by " + file
+		return keepEvidence, "cited by " + file, false
 	}
 	// Without its items' receipt and plan files a folder they cite would
-	// look uncited, so an unusable artifacts root keeps every folder.
-	if why := art.unreadable(t.Items); why != "" {
-		return keepRetention, why
-	}
+	// look uncited, so an unusable artifacts root keeps every folder. That
+	// keep comes last, so a folder it reports is kept for nothing else.
+	unreadable := art.unreadable(t.Items)
 	evidence := append([]worktreeEvidence(nil), in.Evidence...)
-	for _, item := range t.Items {
-		texts, fault := art.itemTexts(item)
-		if fault != "" {
-			return keepFailed, "receipt scan: " + fault
+	if unreadable == "" {
+		for _, item := range t.Items {
+			texts, fault := art.itemTexts(item)
+			if fault != "" {
+				return keepFailed, "receipt scan: " + fault, false
+			}
+			evidence = append(evidence, texts...)
 		}
-		evidence = append(evidence, texts...)
 	}
 	for _, ev := range evidence {
 		for _, pattern := range worktreeEvidencePatterns(t.Folder, main) {
 			if strings.Contains(ev.Text, pattern) {
-				return keepEvidence, "cited by " + ev.Source
+				return keepEvidence, "cited by " + ev.Source, false
 			}
 		}
 	}
 	nested, err := nestedRepository(t.Folder, cleared)
 	if err != nil {
-		return keepFailed, "scan for nested repositories: " + err.Error()
+		return keepFailed, "scan for nested repositories: " + err.Error(), false
 	}
 	if nested != "" {
-		return keepNested, "contains Git repository " + nested
+		return keepNested, "contains Git repository " + nested, false
 	}
-	return "", ""
+	if unreadable != "" {
+		return keepRetention, unreadable, true
+	}
+	return "", "", false
 }
 
 // removeSessionTemp deletes one folder directly under the temp root. It
@@ -1956,7 +2018,7 @@ func removeSessionTemp(root, folder string) error {
 // cleanupSessionTemp decides each candidate temp folder and, when applying,
 // removes the removable ones. It runs after the worktree pass, so worktrees
 // that pass removed from a scratchpad no longer hold their folder.
-func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, art *artifactPass, now time.Time) []worktreeDecision {
+func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTempCandidate, inUse, linked []string, cited map[string]string, cleared map[string]bool, touched dirTouches, art *artifactPass, now time.Time) []worktreeDecision {
 	if len(temp) == 0 {
 		return nil
 	}
@@ -1964,9 +2026,13 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 	decisions := make([]worktreeDecision, 0, len(temp))
 	for _, t := range temp {
 		d := worktreeDecision{Path: t.Folder, Kind: kindSessionTemp}
-		reason, detail := classifySessionTemp(in, main, t, inUse, linked, cited, cleared, art, now)
+		reason, detail, uncitable := classifySessionTemp(in, main, t, inUse, linked, cited, cleared, touched, art, now)
 		if reason != "" {
-			d.Action, d.Reason, d.Detail = "kept", reason, detail
+			d.Action, d.Reason, d.Detail, d.uncitable = "kept", reason, detail, uncitable
+			if uncitable && in.MeasureBytes {
+				// The sweep reports their size, so they cannot grow unseen.
+				d.Bytes = worktreeBytes(t.Folder, nil)
+			}
 			decisions = append(decisions, d)
 			continue
 		}
@@ -2223,6 +2289,15 @@ type worktreeSweepTotals struct {
 	Actions map[string]int `json:"actions"`
 	Kept    map[string]int `json:"kept"`
 	Bytes   int64          `json:"bytes"`
+	// UncitableTemp counts the session temp folders kept only because the
+	// artifacts root cannot cite them, and their size. It is not in Bytes:
+	// nothing is removed on their account.
+	UncitableTemp worktreeSweepFolders `json:"uncitableTemp"`
+}
+
+type worktreeSweepFolders struct {
+	Folders int   `json:"folders"`
+	Bytes   int64 `json:"bytes"`
 }
 
 type worktreeSweepReport struct {
@@ -2435,6 +2510,10 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		if d.Action != "kept" {
 			report.Totals.Bytes += d.Bytes
 		}
+		if d.uncitable {
+			report.Totals.UncitableTemp.Folders++
+			report.Totals.UncitableTemp.Bytes += d.Bytes
+		}
 		if d.strayRoot != "" {
 			strays, strayRoot = strays+1, d.strayRoot
 		}
@@ -2473,6 +2552,10 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	}
 	sort.Strings(reasons)
 	fmt.Printf("totals: %s; kept by reason: %s; %s %s\n", strings.Join(parts, " "), strings.Join(reasons, " "), map[bool]string{true: "removed", false: "reclaimable"}[*apply], humanBytes(report.Totals.Bytes))
+	if u := report.Totals.UncitableTemp; u.Folders > 0 {
+		noun := map[bool]string{true: "folder", false: "folders"}[u.Folders == 1]
+		fmt.Printf("session temp kept only because the artifacts root cannot cite it: %d %s, %s; check --artifacts or TAILTERM_ARTIFACTS\n", u.Folders, noun, humanBytes(u.Bytes))
+	}
 	if !*apply {
 		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees, session temp folders and verifier homes and trim the would-trim caches")
 	}
@@ -3729,7 +3812,7 @@ func classifyVerifierHome(ctx context.Context, in worktreeCleanupInputs, main st
 		return keepInUse, fmt.Sprintf("its run's process %d is alive", h.marker.PID)
 	}
 	if in.MinIdle > 0 {
-		if idle := sessionTempIdle(h.path, now); idle < in.MinIdle {
+		if idle := sessionTempIdle(h.path, now, nil, nil); idle < in.MinIdle {
 			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
 		}
 	}

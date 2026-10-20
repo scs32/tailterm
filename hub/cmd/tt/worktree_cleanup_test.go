@@ -2684,6 +2684,67 @@ func TestWorktreeCleanupSessionTempRecentBelowTopLevel(t *testing.T) {
 	}
 }
 
+// t3: an applying pass that removes a scratchpad worktree inside a session
+// temp folder does not count that removal as a change to the folder. A folder
+// whose only recent change is the removal goes in the same pass; one with a
+// genuine recent change beside the removal is still kept as recent.
+func TestWorktreeCleanupSessionTempIgnoresOwnRemovals(t *testing.T) {
+	r := newCleanupRepo(t)
+	root := r.tempRoot()
+	old := time.Now().Add(-48 * time.Hour)
+	age := func(dir string) {
+		t.Helper()
+		err := filepath.WalkDir(dir, func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(p, old, old)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	session := func(name string) (string, string, sessionTempCwd) {
+		cwd := r.queuePath(name)
+		folder := filepath.Join(root, claudeScratchKey(cwd))
+		tree := filepath.Join(folder, "5e55-session", "scratchpad", "wt-"+name)
+		if err := os.MkdirAll(filepath.Dir(tree), 0755); err != nil {
+			t.Fatal(err)
+		}
+		cleanupGit(t, r.main, "worktree", "add", "-q", "--detach", tree, "tasks-hub")
+		return folder, tree, sessionTempCwd{Path: cwd, ItemID: artifactItemA}
+	}
+	quiet, quietTree, quietCwd := session("queue-eeee0021")
+	busy, busyTree, busyCwd := session("queue-eeee0022")
+	busyNotes := filepath.Join(busy, "5e55-session", "tasks", "b1.output")
+	writeFixtureFile(t, busyNotes, "output\n")
+	// Everything is two days old: both folders, their worktrees and the
+	// worktrees' Git state. Only busy's output file is then written again.
+	for _, dir := range []string{quiet, busy, filepath.Join(r.common, "worktrees")} {
+		age(dir)
+	}
+	if err := os.Chtimes(busyNotes, time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	in := worktreeCleanupInputs{TempRoot: root, TempCwds: []sessionTempCwd{quietCwd, busyCwd}, MinIdle: 24 * time.Hour}
+	got := r.artifactSweep(t, in)
+	requireDecision(t, got, quietTree, "would-remove", "")
+	requireDecision(t, got, quiet, "would-remove", "")
+	requireDecision(t, got, busy, "kept", keepRecent)
+
+	in.Apply = true
+	got = r.artifactSweep(t, in)
+	requireDecision(t, got, quietTree, "removed", "")
+	requireDecision(t, got, busyTree, "removed", "")
+	requireDecision(t, got, quiet, "removed", "")
+	if d := requireDecision(t, got, busy, "kept", keepRecent); d.Detail != "changed 0s ago" {
+		t.Fatalf("busy folder %+v", d)
+	}
+	requireExists(t, quiet, false)
+	requireExists(t, busyTree, false)
+	requireExists(t, busyNotes, true)
+}
+
 // closeoutTick runs one runner tick over a finished, released entry of item
 // with the given cwd, beside a running entry of runningItem in a paused
 // project, and returns the entry and the tick's stderr.
@@ -2944,10 +3005,50 @@ func TestWorktreeCleanupSessionTempKeptWithUnusableArtifactsRoot(t *testing.T) {
 				t.Fatalf("sweep output lacks the kept row for %s:\n%s", p, out)
 			}
 		}
+		// k2: the dry run and apply, in text and JSON, report how many folders
+		// the root alone keeps and their size, outside the reclaimable total,
+		// and nothing is removed on their account.
+		size := worktreeBytes(cited, nil) + worktreeBytes(plain, nil)
+		if size <= 0 {
+			t.Fatalf("fixture folders have no size")
+		}
+		report := "session temp kept only because the artifacts root cannot cite it: 2 folders, " + humanBytes(size) + "; check --artifacts or TAILTERM_ARTIFACTS"
+		if !strings.Contains(out, report) || !strings.Contains(out, "reclaimable 0 B") {
+			t.Fatalf("dry run lacks the uncitable report %q:\n%s", report, out)
+		}
+		for _, apply := range []bool{false, true} {
+			args := []string{"--cwd", r.main, "--min-idle", "0s", "--artifacts", wrong}
+			if apply {
+				args = append(args, "--apply")
+				text, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, args) })
+				if err != nil || !strings.Contains(text, report) || !strings.Contains(text, "totals: kept=2;") || !strings.Contains(text, "removed 0 B") {
+					t.Fatalf("apply with a wrong root: %v\n%s", err, text)
+				}
+			}
+			out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, append(args, "--json")) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rep worktreeSweepReport
+			if err := json.Unmarshal([]byte(out), &rep); err != nil {
+				t.Fatalf("json %q: %v", out, err)
+			}
+			if rep.Totals.UncitableTemp != (worktreeSweepFolders{Folders: 2, Bytes: size}) || rep.Totals.Bytes != 0 || rep.Totals.Kept[keepRetention] != 2 {
+				t.Fatalf("apply=%v totals %+v", apply, rep.Totals)
+			}
+			for _, d := range rep.Worktrees {
+				if d.Kind == kindSessionTemp && (d.Action != "kept" || d.Reason != keepRetention || d.Bytes != worktreeBytes(d.Path, nil)) {
+					t.Fatalf("apply=%v row %+v", apply, d)
+				}
+			}
+			for _, p := range []string{cited, plain} {
+				requireExists(t, filepath.Join(p, "5e55-session", "scratchpad", "notes.md"), true)
+			}
+		}
 		out, err = captureSweepStdout(t, func() error {
 			return cmdTeamQueueSweepWorktrees(env{hub: server.URL}, []string{"--cwd", r.main, "--min-idle", "0s"})
 		})
-		if err != nil || !strings.Contains(out, "kept evidence "+cited) || !strings.Contains(out, "would-remove "+plain+" (session temp; ") {
+		if err != nil || !strings.Contains(out, "kept evidence "+cited) || !strings.Contains(out, "would-remove "+plain+" (session temp; ") || strings.Contains(out, "cannot cite it") {
 			t.Fatalf("sweep with the default root: %v\n%s", err, out)
 		}
 	})
