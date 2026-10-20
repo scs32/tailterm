@@ -866,6 +866,7 @@ const rule=faults.rules.find(r=>r.op===op&&n>=r.from&&(r.to===null||n<=r.to));if
 const job=JSON.parse(fs.readFileSync(${JSON.stringify(jobPath)},'utf8')),save=()=>{fs.writeFileSync(${JSON.stringify(jobPath)},JSON.stringify(job));console.log(JSON.stringify(job));};
 if(a[0]==='send')process.exit(0);
 if(a[1]==='handler')console.log(JSON.stringify({id:'agt_0123abcd'}));
+else if(a[1]==='window')console.log('null');
 else if(['get','check'].includes(a[1]))console.log(JSON.stringify(job));
 else if(a[1]==='merged'){job.state='merged';job.generation++;job.integratedCommit=flag('--commit');save();}
 else if(a[1]==='refuse'){job.state='refused';job.generation++;save();}

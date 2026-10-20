@@ -515,6 +515,7 @@ S.log.push({argv:a.join(' '),head});
 const end=(value,code)=>{fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(S));if(value===undefined)process.exit(code||2);console.log(JSON.stringify(value));process.exit(0);};
 if(a[0]!=='deployment')end({});
 if(a[1]==='get')end(S.job);
+if(a[1]==='window')end(null);
 if(a[1]==='check')end(+flag('--generation')===S.job.generation?S.job:undefined);
 if(a[1].startsWith('batch-')){
  const id=flag('--request-id'),name=a[1]+(flag('--entry')?':'+flag('--entry'):'');
@@ -552,6 +553,7 @@ S.log.push(a.join(' '));
 const end=value=>{fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(S));if(value===undefined)process.exit(2);console.log(JSON.stringify(value));process.exit(0);};
 if(a[0]!=='deployment')end({});
 if(a[1]==='handler')end({id:'agt_0123abcd'});
+if(a[1]==='window')end(null);
 if(a[1]==='get'&&${JSON.stringify(unreadable)}.includes(flag('--job')))end({id:flag('--job')});
 if(['list','get'].includes(a[1]))end(releaseReply(S.jobs,a));
 const at=S.jobs.findIndex(j=>j.id===flag('--job')),job=S.jobs[at];
