@@ -2355,3 +2355,108 @@ func TestSweepScheduleLowSpaceCacheVolume(t *testing.T) {
 		t.Fatalf("%d notices for two episodes", len(stored))
 	}
 }
+
+// u1-u3: the journal line and the low-space notice carry the session temp
+// kept only because the artifacts root cannot cite it, as the manual report's
+// totals.uncitableTemp does; nothing is removed on its account. A usable root
+// writes a zero and adds nothing to the notice, and a run skipped before the
+// sweep has no field.
+func TestSweepScheduleUncitableTemp(t *testing.T) {
+	// fixture gives two gone cwds a session temp folder each, under a low
+	// free reading with an owner helper to notice.
+	fixture := func(t *testing.T) (*sweepFixture, []string) {
+		t.Helper()
+		f := newSweepFixture(t)
+		f.setAgents(sweepTask, f.helper("agt_5eeb5eeb5eeb5e0c", "owner-helper", sweepTask, time.Now().Add(-time.Hour)))
+		var entries []api.TeamQueueEntry
+		var folders []string
+		for i, item := range []string{sweepItem, artifactItemB} {
+			cwd := f.r.queuePath(fmt.Sprintf("queue-5eeb00a%d", i))
+			folder := filepath.Join(f.r.tempRoot(), claudeScratchKey(cwd))
+			writeFixtureFile(t, filepath.Join(folder, "session", "scratchpad", "notes.md"), strings.Repeat("scratch\n", 64))
+			q := releasedArtifactEntry(item)
+			q.ID, q.TaskID, q.Host, q.Repository, q.Cwd, q.Position = fmt.Sprintf("tqe_sweep_temp%d", i), sweepTask, sweepHost, f.r.main, cwd, int64(i+1)
+			entries, folders = append(entries, q), append(folders, folder)
+		}
+		f.setEntries(entries...)
+		f.free = 5 << 30
+		return f, folders
+	}
+	const why = "Session temp kept only because the artifacts root cannot cite it"
+	t.Run("unusable root", func(t *testing.T) {
+		f, folders := fixture(t)
+		t.Setenv("TAILTERM_ARTIFACTS", filepath.Join(f.r.root, "elsewhere"))
+		size := worktreeBytes(folders[0], nil) + worktreeBytes(folders[1], nil)
+		if size <= 0 {
+			t.Fatal("fixture folders have no size")
+		}
+		if !f.attempt() {
+			t.Fatal("no attempt")
+		}
+		line := lastSweepLine(t)
+		if line.Outcome != "swept" || line.UncitableTemp == nil || *line.UncitableTemp != (worktreeSweepFolders{Folders: 2, Bytes: size}) || line.Kept[keepRetention] != 2 || line.FoldersRemoved != 0 || line.BytesFreed != 0 {
+			t.Fatalf("unusable root line %+v uncitable %+v", line, line.UncitableTemp)
+		}
+		for _, folder := range folders {
+			requireExists(t, filepath.Join(folder, "session", "scratchpad", "notes.md"), true)
+		}
+		for _, d := range f.last {
+			if d.Kind == kindSessionTemp && (d.Action != "kept" || d.Reason != keepRetention || !d.uncitable) {
+				t.Fatalf("session temp decision %+v", d)
+			}
+		}
+		_, attempts, _, _ := f.hub.messages()
+		if len(attempts) != 1 || attempts[0].Envelope == nil {
+			t.Fatalf("low run posted %+v", attempts)
+		}
+		text := attempts[0].Envelope.Body.Text
+		want := why + ": 2 folders, " + humanBytes(size) + "; nothing is removed on their account. Check TAILTERM_ARTIFACTS."
+		if !strings.Contains(text, want) || !strings.Contains(text, "0 session temp folders") || !strings.Contains(text, "The relay sends this once per low-space episode.") {
+			t.Fatalf("notice lacks %q:\n%s", want, text)
+		}
+		out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
+		if err != nil || !strings.Contains(out, "; 2 session temp folder(s), "+humanBytes(size)+", kept only because the artifacts root cannot cite them") {
+			t.Fatalf("--journal: %v\n%s", err, out)
+		}
+	})
+	t.Run("usable root", func(t *testing.T) {
+		f, folders := fixture(t)
+		if !f.attempt() {
+			t.Fatal("no attempt")
+		}
+		line := lastSweepLine(t)
+		if line.Outcome != "swept" || line.UncitableTemp == nil || *line.UncitableTemp != (worktreeSweepFolders{}) || line.FoldersRemoved != 2 {
+			t.Fatalf("usable root line %+v uncitable %+v", line, line.UncitableTemp)
+		}
+		for _, folder := range folders {
+			requireExists(t, folder, false)
+		}
+		_, attempts, _, _ := f.hub.messages()
+		if len(attempts) != 1 || attempts[0].Envelope == nil || strings.Contains(attempts[0].Envelope.Body.Text, why) {
+			t.Fatalf("usable root notice %+v", attempts)
+		}
+		// A run skipped before the sweep writes no field; the swept line
+		// writes its zero.
+		lock, err := worktreeCleanupLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.now = f.now.Add(time.Hour)
+		if !f.attempt() {
+			t.Fatal("no skipped attempt")
+		}
+		unlockQueueLaunch(lock)
+		data, err := os.ReadFile(sweepJournalPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(raw) != 2 || !strings.Contains(raw[0], `"uncitableTemp":{"folders":0,"bytes":0}`) || strings.Contains(raw[1], "uncitableTemp") || !strings.Contains(raw[1], sweepSkipCleanup) {
+			t.Fatalf("journal lines:\n%s", data)
+		}
+		out, err := captureSweepStdout(t, func() error { return cmdTeamQueueSweepWorktrees(env{}, []string{"--journal"}) })
+		if err != nil || strings.Contains(out, "cannot cite") {
+			t.Fatalf("--journal: %v\n%s", err, out)
+		}
+	})
+}

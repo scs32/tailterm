@@ -504,7 +504,8 @@ first try that saves sweeps and writes its line.
  "treesRemoved":3,"foldersRemoved":2,"binariesRemoved":3,"cachesTrimmed":4,"pruned":0,
  "bytesFreed":123,"freeBytesAfter":456,"kept":{"unpushed":7},
  "minIdle":"6h0m0s","durationMs":8123,"exclusionExceeded":0,
- "lowSpace":false,"noticeSeq":0,"noticePending":""}
+ "lowSpace":false,"noticeSeq":0,"noticePending":"",
+ "uncitableTemp":{"folders":0,"bytes":0}}
 ```
 
 `outcome` is `swept`, `skipped` or `failed`, with the cause in `reason` and
@@ -516,6 +517,12 @@ those binaries in `treesRemoved`. `bytesFreed` covers all of them. `at` is the
 repository's main checkout and artifacts root after the run, or `-1` when it
 could not be read. `exclusionExceeded` counts removals that outran the matrix
 hold limit. `noticesDropped` appears when a full pending list dropped a notice.
+`uncitableTemp` is the manual report's `totals.uncitableTemp`: the session
+temp folders kept only because the artifacts root cannot cite them, and their
+size, outside `bytesFreed` because nothing is removed on their account. Every
+line of a run that reached the sweep writes it, a zero included; a run skipped
+before the sweep, a Go build cache trim line and a line written before the
+field existed lack it. `--journal` names it when the count is above zero.
 
 *Low-space notice.* A run posts nothing while space is fine. An episode
 begins at the first swept run that ends below the threshold and ends at the
@@ -523,8 +530,9 @@ first swept run at or above it; skipped and failed runs do neither. When an
 episode begins, the relay sends one NOTICE to the newest live owner helper on
 the hub, in that helper's project, or to the Board of the project of this
 host's newest queue entry when there is none. It names the free space, what
-the run freed, and the five largest kept trees with their keep reason. The
-notice is saved in `worktree-sweep-state.json` before it is posted and
+the run freed, and the five largest kept trees with their keep reason, and,
+when `uncitableTemp` counts any folder, that count and size and why they are
+kept. The notice is saved in `worktree-sweep-state.json` before it is posted and
 replayed unchanged, with the same project, recipient, text and request
 identity (`worktree-sweep-low-<host>-<episode start>`), at every later swept
 run until the hub returns a post receipt for that identity. The journal shows

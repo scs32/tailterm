@@ -929,6 +929,11 @@ type sweepJournalLine struct {
 	NoticePending     string         `json:"noticePending"`
 	// NoticesDropped counts pending notices dropped because the list was full.
 	NoticesDropped int `json:"noticesDropped,omitempty"`
+	// UncitableTemp is the manual report's totals.uncitableTemp: the session
+	// temp folders kept only because the artifacts root cannot cite them, and
+	// their size. Set, zero included, on every line of a run that reached the
+	// sweep; absent from runs skipped before it and from trim lines.
+	UncitableTemp *worktreeSweepFolders `json:"uncitableTemp,omitempty"`
 	// Set on every Go build cache trim line (source go-cache-trim), so a zero
 	// is written; absent from sweep lines.
 	FilesRemoved    *int64 `json:"filesRemoved,omitempty"`
@@ -1149,6 +1154,9 @@ func printSweepJournal(limit int, jsonOut bool) error {
 		if len(reasons) > 0 {
 			text += "; kept " + strings.Join(reasons, " ")
 		}
+		if u := l.UncitableTemp; u != nil && u.Folders > 0 {
+			text += fmt.Sprintf("; %d session temp folder(s), %s, kept only because the artifacts root cannot cite them", u.Folders, humanBytes(u.Bytes))
+		}
 		if l.ExclusionExceeded > 0 {
 			text += fmt.Sprintf("; %d removal(s) outran the matrix hold limit", l.ExclusionExceeded)
 		}
@@ -1333,6 +1341,10 @@ func freezeSweepNotice(host string, hub sweepHubState, line sweepJournalLine, th
 	} else {
 		text += " Nothing it kept holds any data."
 	}
+	if u := line.UncitableTemp; u != nil && u.Folders > 0 {
+		noun := map[bool]string{true: "folder", false: "folders"}[u.Folders == 1]
+		text += fmt.Sprintf(" Session temp kept only because the artifacts root cannot cite it: %d %s, %s; nothing is removed on their account. Check TAILTERM_ARTIFACTS.", u.Folders, noun, humanBytes(u.Bytes))
+	}
 	text += " The relay sends this once per low-space episode. Read the runs with tt team queue sweep-worktrees --journal."
 	text += " " + goCacheTrimNoticeSentence(trim)
 	envelope := api.Envelope{Kind: api.EnvelopeKindNotice, To: helper.Name, Subject: sweepNoticeSubject, Refs: map[string]string{"host": host}, Body: api.EnvelopeBody{Text: text}}
@@ -1514,6 +1526,7 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 		all = append(all, decisions...)
 	}
 	line.RepositoriesFailed = len(failed)
+	line.UncitableTemp = &worktreeSweepFolders{}
 	// The volumes read for low space: each repository and its artifacts root,
 	// every cache the sweep decided on, and the Go build cache the trim last
 	// validated. The lowest reading is the run's.
@@ -1540,6 +1553,10 @@ func sweepScheduleAttempt(ctx context.Context, d sweepScheduleDeps) bool {
 			line.Pruned++
 		case "kept":
 			line.Kept[dec.Reason]++
+		}
+		if dec.uncitable {
+			line.UncitableTemp.Folders++
+			line.UncitableTemp.Bytes += dec.Bytes
 		}
 		if dec.Kind == kindCache {
 			volumes = append(volumes, dec.Path)
