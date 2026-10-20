@@ -3187,7 +3187,7 @@ func TestReviewStageRecordedAtAssign(t *testing.T) {
 	}
 	f.generalRound(t, candidateC, passConvergence, api.ReviewMetadata{})
 	st := f.state(t)
-	wantStages(t, "third-stage ASSIGN", st.Stages, one, two, api.ReviewStage{Number: 3, OrderSeq: third.Seq, ScopeRevision: 4, AssignmentSeq: st.Scopes[3].AssignmentSeq})
+	wantStages(t, "third-stage ASSIGN", st.Stages, one, two, api.ReviewStage{Number: 3, OrderSeq: third.Seq, ScopeRevision: 4, AssignmentSeq: scopeFor(&st, 4).AssignmentSeq})
 	if n, rounds, earlier := st.CurrentStage(); n != 3 || len(rounds) != 1 || earlier != 4 || rounds[0].Number != 1 {
 		t.Fatal("current stage of three", n, len(rounds), earlier)
 	}
@@ -4455,71 +4455,70 @@ func TestReviewConvergenceStatusKeepsEarlierStageWithdrawnRound(t *testing.T) {
 	}
 }
 
-// wi_18fec625e6133919: an amended ASSIGN with the same criteria, after the
-// lead withdrew the scope's assignment, becomes the scope's saved assignment,
-// so the plan binds it and the digest of its Owns. The withdrawn entry stays
-// before it as history; criteria still freeze.
+// wi_18fec625e6133919: the latest ASSIGN with the same criteria becomes the
+// scope's saved assignment, whether the lead withdraws the earlier one before
+// or after posting it, so the plan binds it and the digest of its Owns. The
+// earlier entry stays before it as history; criteria still freeze.
 func TestReviewConvergenceAmendedAssignmentRebindsScope(t *testing.T) {
-	f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
-	f.rescope(t, "Amend the owned files")
-	order := f.ownerOrder(t, "amend-order")
-	f.confirmScope(t, h, order, "amend-scope")
-	assign := func(owns []string, criteria map[string]string) (api.Message, error) {
-		return f.post(api.Envelope{Kind: "assign", Subject: "Implement the amended fixture scope", Body: api.EnvelopeBody{Objective: "Fixture", Owns: owns, Acceptance: criteria, VerificationCriteria: f.verificationCriteria}}, f.builder.ID, 0, f.lead)
-	}
-	current := func() api.ReviewScope {
-		t.Helper()
-		st := f.state(t)
-		return *scopeFor(&st, f.item.ScopeRevision)
-	}
-	first, err := assign([]string{"fixture"}, f.criteria)
-	if err != nil {
-		t.Fatal(err)
-	}
-	differ := map[string]string{"a1": "code", "a2": "matrix", "a3": "extra"}
-	// Not withdrawn: a same-criteria ASSIGN leaves the first assignment saved.
-	if _, err = assign([]string{"fixture"}, f.criteria); err != nil {
-		t.Fatal(err)
-	}
-	if sc := current(); sc.AssignmentSeq != first.Seq {
-		t.Fatal("unwithdrawn assignment replaced", sc)
-	}
-	refusedWith(t, "changed criteria", func() error { _, err := assign([]string{"fixture"}, differ); return err }(), "criteria frozen")
-	if err = f.withdraw(t, first.Seq); err != nil {
-		t.Fatal(err)
-	}
-	before := f.state(t)
-	refusedWith(t, "changed criteria after withdrawal", func() error { _, err := assign([]string{"fixture", "plan.mjs"}, differ); return err }(), "criteria frozen")
-	if st := f.state(t); !reflect.DeepEqual(st.Scopes, before.Scopes) {
-		t.Fatal("refused ASSIGN changed scopes", st.Scopes)
-	}
-	amended, err := assign([]string{"fixture", "plan.mjs"}, f.criteria)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := f.state(t)
-	var history []int64
-	for _, sc := range st.Scopes {
-		if sc.ScopeRevision == f.item.ScopeRevision {
-			history = append(history, sc.AssignmentSeq)
-		}
-	}
-	if !reflect.DeepEqual(history, []int64{first.Seq, amended.Seq}) || current().ItemRevision != f.item.Revision {
-		t.Fatal("amended assignment not saved after the withdrawn one", st.Scopes)
-	}
-	if !reflect.DeepEqual(st.Stages, before.Stages) {
-		t.Fatal("amendment moved a stage", before.Stages, st.Stages)
-	}
-	plan := func(key string, assignment int64, owns []string) error {
-		q := p
-		q.OperationKey, q.ItemRevision, q.ScopeRevision, q.OrderMessageSeq = key, f.item.Revision, f.item.ScopeRevision, order.Seq
-		q.AssignmentSeq, q.AssignmentOwnershipDigest, q.Owned = assignment, verificationDigest(owns), []string{"fixture", "plan.mjs"}
-		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: key, AgentID: h.ID, RunID: h.RunID, Plan: &q})
-		return err
-	}
-	refusedWith(t, "withdrawn assignment plan", plan("withdrawn-plan", first.Seq, []string{"fixture"}), "saved exact assignment required")
-	refusedWith(t, "withdrawn ownership digest", plan("stale-digest-plan", amended.Seq, []string{"fixture"}), "ownership and builder must match assignment")
-	if err = plan("amended-plan", amended.Seq, []string{"fixture", "plan.mjs"}); err != nil {
-		t.Fatal("amended assignment plan refused", err)
+	for _, withdrawFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "withdraw-then-post", false: "post-then-withdraw"}[withdrawFirst], func(t *testing.T) {
+			f, h, p := verificationFixture(t, verificationOwnershipFixture{map[string]string{"a1": "code", "a2": "matrix"}, []string{"a2"}})
+			f.rescope(t, "Amend the owned files")
+			order := f.ownerOrder(t, "amend-order")
+			f.confirmScope(t, h, order, "amend-scope")
+			assign := func(owns []string, criteria map[string]string) (api.Message, error) {
+				return f.post(api.Envelope{Kind: "assign", Subject: "Implement the amended fixture scope", Body: api.EnvelopeBody{Objective: "Fixture", Owns: owns, Acceptance: criteria, VerificationCriteria: f.verificationCriteria}}, f.builder.ID, 0, f.lead)
+			}
+			first, err := assign([]string{"fixture"}, f.criteria)
+			if err != nil {
+				t.Fatal(err)
+			}
+			differ := map[string]string{"a1": "code", "a2": "matrix", "a3": "extra"}
+			before := f.state(t)
+			refusedWith(t, "changed criteria", func() error { _, err := assign([]string{"fixture"}, differ); return err }(), "criteria frozen")
+			if withdrawFirst {
+				if err = f.withdraw(t, first.Seq); err != nil {
+					t.Fatal(err)
+				}
+				refusedWith(t, "changed criteria after withdrawal", func() error { _, err := assign([]string{"fixture", "plan.mjs"}, differ); return err }(), "criteria frozen")
+			}
+			if st := f.state(t); !reflect.DeepEqual(st.Scopes, before.Scopes) {
+				t.Fatal("refused ASSIGN changed scopes", st.Scopes)
+			}
+			amended, err := assign([]string{"fixture", "plan.mjs"}, f.criteria)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !withdrawFirst {
+				if err = f.withdraw(t, first.Seq); err != nil {
+					t.Fatal(err)
+				}
+			}
+			st := f.state(t)
+			var history []int64
+			for _, sc := range st.Scopes {
+				if sc.ScopeRevision == f.item.ScopeRevision {
+					history = append(history, sc.AssignmentSeq)
+				}
+			}
+			if !reflect.DeepEqual(history, []int64{first.Seq, amended.Seq}) || scopeFor(&st, f.item.ScopeRevision).AssignmentSeq != amended.Seq {
+				t.Fatal("amended assignment not saved after the first one", st.Scopes)
+			}
+			if !reflect.DeepEqual(st.Stages, before.Stages) {
+				t.Fatal("amendment moved a stage", before.Stages, st.Stages)
+			}
+			plan := func(key string, assignment int64, owns []string) error {
+				q := p
+				q.OperationKey, q.ItemRevision, q.ScopeRevision, q.OrderMessageSeq = key, f.item.Revision, f.item.ScopeRevision, order.Seq
+				q.AssignmentSeq, q.AssignmentOwnershipDigest, q.Owned = assignment, verificationDigest(owns), []string{"fixture", "plan.mjs"}
+				_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: key, AgentID: h.ID, RunID: h.RunID, Plan: &q})
+				return err
+			}
+			refusedWith(t, "withdrawn assignment plan", plan("withdrawn-plan", first.Seq, []string{"fixture"}), "saved exact assignment required")
+			refusedWith(t, "withdrawn ownership digest", plan("stale-digest-plan", amended.Seq, []string{"fixture"}), "ownership and builder must match assignment")
+			if err = plan("amended-plan", amended.Seq, []string{"fixture", "plan.mjs"}); err != nil {
+				t.Fatal("amended assignment plan refused", err)
+			}
+		})
 	}
 }
