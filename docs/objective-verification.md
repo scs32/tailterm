@@ -1432,9 +1432,28 @@ The position is the run's place in the file's order, as `status` prints it, and
 `holder=none` means the host is free. A line is printed only for an entry on
 this machine (the entry's host and the file's `host` compared by first DNS
 label, ignoring case, so `Stephens-Mini` and `Stephens-Mini.local` match) that
-has not failed. An entry on another host gets no line. The file is read from
-`TAILTERM_MATRIX_HOST_LOCK`, else the default path. The list always prints and
-exits 0, and `--json` is unchanged. Five cases show no waitlist:
+has not failed. An entry on another host gets no line.
+
+A run that names no agent (empty or `unknown`) and no valid `wi_` item, such
+as a bare `exec` without `--item`, belongs to no entry. After the entries, the
+list prints one unattributed line for each such holder and waiter whose
+process is alive, holders first, then waiters in the file's order:
+
+```text
+matrix unattributed holder pid=4250 kind=exec priority=normal since=2026-10-01T14:02:00.000Z
+matrix unattributed waiter position=1 of 3 pid=4251 kind=exec priority=high since=2026-10-01T14:06:00.000Z
+```
+
+`since` is the holder's `startedAt` or the waiter's `requestedAt`. A run with a
+valid item, even with no agent, keeps only its entry's `waiting-for-matrix`
+line, so no run is printed twice. This is the relay's rule for agentless runs
+(wi_6128966a8025aaad): such a run is not counted as any member's activity, so
+this line is where it shows. The unattributed lines appear only when the
+file's host is this machine and the queue has entries.
+
+The file is read from `TAILTERM_MATRIX_HOST_LOCK`, else the default path. The
+list always prints and exits 0, and `--json` is unchanged. Five cases show no
+waitlist:
 
 - No file: nothing extra is printed (a free host).
 - `TAILTERM_MATRIX_HOST_LOCK` is set but relative: `matrix host:

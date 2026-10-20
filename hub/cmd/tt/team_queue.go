@@ -306,6 +306,9 @@ func cmdTeamQueue(e env, args []string) error {
 				fmt.Println(line)
 			}
 		}
+		for _, line := range matrix.unattributedLines() {
+			fmt.Println(line)
+		}
 		if h := list.History; h != nil {
 			shown := 0
 			for _, q := range list.Entries {
@@ -1273,6 +1276,32 @@ func (m *matrixWaitlist) waitLines(q api.TeamQueueEntry) []string {
 	for i, w := range m.Waiters {
 		if w.Item == q.ItemID {
 			lines = append(lines, fmt.Sprintf("  waiting-for-matrix position=%d of %d holder=%s priority=%s kind=%s agent=%s since=%s", i+1, len(m.Waiters), holder, matrixName(w.Priority), matrixName(w.Kind), matrixName(w.Agent), matrixName(w.RequestedAt)))
+		}
+	}
+	return lines
+}
+
+// unattributedLines is one line per live holder and waiter in the file that
+// names no agent (empty or "unknown") and no valid item, as a bare lock exec
+// without --item writes it. By the relay's rule (matrixWaitFor) such a run is
+// nobody's, so no entry's line shows it. An entry with a valid item is left to
+// its entry's lines.
+func (m *matrixWaitlist) unattributedLines() []string {
+	if m == nil {
+		return nil
+	}
+	unattributed := func(e matrixHostEntry) bool {
+		return (e.Agent == "" || e.Agent == "unknown") && !api.ValidID(e.Item, "wi") && matrixWaitPIDAlive(e.PID)
+	}
+	var lines []string
+	for _, h := range m.Holders {
+		if unattributed(h) {
+			lines = append(lines, fmt.Sprintf("matrix unattributed holder pid=%d kind=%s priority=%s since=%s", h.PID, matrixName(h.Kind), matrixName(h.Priority), matrixName(h.StartedAt)))
+		}
+	}
+	for i, w := range m.Waiters {
+		if unattributed(w) {
+			lines = append(lines, fmt.Sprintf("matrix unattributed waiter position=%d of %d pid=%d kind=%s priority=%s since=%s", i+1, len(m.Waiters), w.PID, matrixName(w.Kind), matrixName(w.Priority), matrixName(w.RequestedAt)))
 		}
 	}
 	return lines

@@ -1191,6 +1191,66 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 		t.Fatalf("version 2 with no waiter must add nothing:\n%s", out)
 	}
 
+	// u1, u2 (wi_d6d7da393cea9c08): a live holder or waiter that names no
+	// agent and no valid item is printed once after the entries, marked
+	// unattributed. An agentless run with a valid item keeps its entry's line
+	// only, and a named, dead or item-bearing run gets no unattributed line.
+	oldAlive := matrixWaitPIDAlive
+	matrixWaitPIDAlive = func(pid int) bool { return pid != 9999 }
+	t.Cleanup(func() { matrixWaitPIDAlive = oldAlive })
+	bare := func(pid int, agent, item, kind, priority string) map[string]any {
+		return map[string]any{"id": fmt.Sprintf("u%d", pid), "pid": pid, "kind": kind, "item": item, "agent": agent, "priority": priority, "requestedAt": "2026-10-01T14:06:00.000Z"}
+	}
+	bareHolder := map[string]any{"id": "hb", "pid": 501, "kind": "exec", "item": "", "agent": "", "priority": "normal", "startedAt": "2026-10-01T14:02:00.000Z", "groups": []int{}}
+	itemHolder := map[string]any{"id": "hi", "pid": 505, "kind": "run", "item": remote.ID, "agent": "unknown", "priority": "high", "startedAt": "2026-10-01T14:03:00.000Z", "groups": []int{}}
+	writeV2([]map[string]any{bareHolder, holder, itemHolder},
+		bare(502, "unknown", "", "exec", "high"),
+		bare(4242, "", waitingItem.ID, "run", "high"),
+		bare(9999, "", "", "exec", "normal"),
+		bare(503, "verifier-5", "", "exec", "normal"),
+		bare(504, "", "wi_not-an-item", "targeted", "low"))
+	out = list()
+	wantUnattributed := []string{
+		"matrix unattributed holder pid=501 kind=exec priority=normal since=2026-10-01T14:02:00.000Z",
+		"matrix unattributed waiter position=1 of 5 pid=502 kind=exec priority=high since=2026-10-01T14:06:00.000Z",
+		"matrix unattributed waiter position=5 of 5 pid=504 kind=targeted priority=low since=2026-10-01T14:06:00.000Z",
+	}
+	var gotUnattributed []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "unattributed") {
+			gotUnattributed = append(gotUnattributed, line)
+		}
+	}
+	if strings.Join(gotUnattributed, "\n") != strings.Join(wantUnattributed, "\n") {
+		t.Fatalf("unattributed lines %q, want %q:\n%s", gotUnattributed, wantUnattributed, out)
+	}
+	block := strings.Join(wantUnattributed, "\n") + "\n"
+	if strings.Count(out, block) != 1 || strings.Index(out, block) < strings.Index(out, remote.ID) || !strings.HasPrefix(out[strings.Index(out, block)+len(block):], "history:") {
+		t.Fatalf("the unattributed lines must follow every entry, once:\n%s", out)
+	}
+	bareHolders := "holder=unknown/unknown/pid 501,wi_holder/verifier-1/pid 777," + remote.ID + "/unknown/pid 505"
+	itemLine := "  waiting-for-matrix position=2 of 5 " + bareHolders + " priority=high kind=run agent=unknown since=2026-10-01T14:06:00.000Z"
+	if got := lines(out); len(got) != 1 || got[0] != itemLine {
+		t.Fatalf("the item's waiter must keep only its entry's line %q, got %q:\n%s", itemLine, got, out)
+	}
+	if at := strings.Index(out, itemLine); at < strings.Index(out, waitingItem.ID) || at > strings.Index(out, remote.ID) {
+		t.Fatalf("the item's line must follow its entry:\n%s", out)
+	}
+	if got := listJSON(); got != plainJSON {
+		t.Fatalf("--json must be unchanged with unattributed runs:\n%s", got)
+	}
+	// Only dead, named or item-bearing runs: nothing unattributed.
+	writeV2([]map[string]any{holder, itemHolder}, bare(9999, "", "", "exec", "normal"), bare(503, "verifier-5", "", "exec", "normal"))
+	if out := list(); strings.Contains(out, "unattributed") {
+		t.Fatalf("no unattributed run must add no unattributed line:\n%s", out)
+	}
+	// A version 1 holder with no agent and no item is unattributed too.
+	write("Stephens-Mini.local", 1, bareHolder)
+	if out := list(); !strings.Contains(out, "\n"+wantUnattributed[0]+"\nhistory:") || strings.Replace(out, wantUnattributed[0]+"\n", "", 1) != plain {
+		t.Fatalf("version 1 bare holder:\n%s", out)
+	}
+	matrixWaitPIDAlive = oldAlive
+
 	// a7: each no-waitlist case is one named line, exit 0, entries intact.
 	oneLine := func(what, want string) {
 		t.Helper()
