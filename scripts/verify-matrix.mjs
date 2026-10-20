@@ -2617,12 +2617,14 @@ export function budgetWarnings(checks) {
 }
 // Writes budget-warnings.json beside the receipt (an empty list when nothing
 // warns) and prints one line per warned check. It is advisory: it is not part
-// of the receipt, and a failure to write it is printed, never thrown.
+// of the receipt, and a failure to write it is printed, never thrown. Whatever
+// removes the receipt removes the list with it.
+const BUDGET_WARNINGS_FILE = "budget-warnings.json";
 export function reportBudgetWarnings(checks, output, print = () => {}) {
   const warnings = budgetWarnings(checks);
   try {
     writeFileSync(
-      join(output, "budget-warnings.json"),
+      join(output, BUDGET_WARNINGS_FILE),
       JSON.stringify(warnings, null, 2) + "\n",
       { mode: 0o600 },
     );
@@ -2961,7 +2963,9 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     return receipt;
   } finally {
     const cleanupFailed = (what, error) => {
-      if (receiptWritten) rmSync(receiptPath, { force: true });
+      if (receiptWritten)
+        for (const path of [receiptPath, join(output, BUDGET_WARNINGS_FILE)])
+          rmSync(path, { force: true });
       try {
         writeFileSync(
           join(output, "cleanup-error.json"),
@@ -3851,13 +3855,11 @@ if (invokedDirectly && process.argv[2] === "go-race") {
       );
       await new Promise((resolve) => setImmediate(resolve));
       if (interruptedBy)
-        rmSync(
-          join(
-            resolve(output),
-            mode === "run" ? "receipt.json" : "targeted-receipt.json",
-          ),
-          { force: true },
-        );
+        for (const name of [
+          mode === "run" ? "receipt.json" : "targeted-receipt.json",
+          BUDGET_WARNINGS_FILE,
+        ])
+          rmSync(join(resolve(output), name), { force: true });
       process.exitCode = interruptedBy
         ? interruptedBy === "SIGINT"
           ? 130

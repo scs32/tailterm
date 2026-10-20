@@ -45,6 +45,10 @@ import {
   preflightFixture,
   preflightRun,
   within,
+  fixturePids,
+  leakingCheck,
+  pidOf,
+  alive,
 } from "./verification-fixtures.mjs";
 
 test("preflight refuses missing or unreadable selected inputs and invalid space in both run modes before acquisition", async (t) => {
@@ -923,4 +927,103 @@ for (const code of [0, 1])
     for (const key of Object.keys(receipt)) assert(key in schema.properties, "top-level " + key);
     for (const key of Object.keys(receipt.checks[0]))
       assert(key in schema.properties.checks.items.properties, "check " + key);
+  });
+
+// wi_88e34f3c5b654745 / order #40884: a real run that warns, and the removed
+// receipt taking the list with it. The fixture repo carries its own matrix
+// with a short npm-unit timeout; the check sleeps past 70 percent of it.
+const BUDGET_TIMEOUT_MS = 6000,
+  BUDGET_SLEEP_MS = 4300;
+function budgetFixture(t, source = sleepingCheck(BUDGET_SLEEP_MS)) {
+  const f = fixture(t);
+  const m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json"), "utf8"));
+  writeFileSync(
+    join(f.cwd, "verification/matrix.json"),
+    JSON.stringify({ ...m, checkTimeoutMs: { "npm-unit": BUDGET_TIMEOUT_MS } }),
+  );
+  return { f, plan: commandPlan(f, source) };
+}
+
+test("budget warning: a real run whose check passes above 70 percent of its timeout prints the line and writes the list", async (t) => {
+  const { f, plan } = budgetFixture(t),
+    output = tempDir(t, "verification-budget-warn-"),
+    lines = [];
+  assert.equal(plan.checks[0].environment.VERIFICATION_TIMEOUT_MS, String(BUDGET_TIMEOUT_MS));
+  const receipt = await runPlan(plan, f.cwd, output, {
+    minFreeBytes: 0,
+    hostLock: { print: (line) => lines.push(line) },
+  });
+  assert(receiptEligible(receipt));
+  const durationMs = Math.max(
+    ...(receipt.checks[0].attempts ?? [receipt.checks[0]])
+      .filter((a) => a.exitCode === 0)
+      .map((a) => a.durationMs),
+  );
+  assert(durationMs > BUDGET_SLEEP_MS && durationMs < BUDGET_TIMEOUT_MS, "duration " + durationMs);
+  const percent = Math.round((durationMs / BUDGET_TIMEOUT_MS) * 10000) / 100;
+  assert(percent > 70);
+  assert.deepEqual(lines.filter((line) => /budget warning/.test(line)), [
+    `matrix run: budget warning: npm-unit passed in ${durationMs} ms, ${percent}% of its ${BUDGET_TIMEOUT_MS} ms timeout`,
+  ]);
+  const expected = [{ check: "npm-unit", durationMs, timeoutMs: BUDGET_TIMEOUT_MS, percent }];
+  assert.equal(
+    readFileSync(join(output, "budget-warnings.json"), "utf8"),
+    JSON.stringify(expected, null, 2) + "\n",
+  );
+  const raw = readFileSync(join(output, "receipt.json"), "utf8");
+  assert.equal(raw, JSON.stringify(receipt, null, 2) + "\n");
+  assert(!/budget/i.test(raw.replaceAll(output, "")), "nothing about budgets is in the receipt");
+});
+
+test("budget warning: a cleanup failure that removes the receipt of a warned run removes its list too", async (t) => {
+  const { f, plan } = budgetFixture(t),
+    output = tempDir(t, "verification-budget-cleanup-"),
+    lines = [];
+  let home;
+  await assert.rejects(
+    runPlan(plan, f.cwd, output, {
+      minFreeBytes: 0,
+      hostLock: { print: (line) => lines.push(line) },
+      removeHome: (path) => {
+        home = path;
+        removeVerifierHome(path);
+        throw new Error("fixture removal failure");
+      },
+    }),
+    /Failed to remove verifier home .*fixture removal failure/,
+  );
+  assert(home && !existsSync(home));
+  assert.equal(lines.filter((line) => /budget warning: npm-unit /.test(line)).length, 1, "the run warned");
+  assert(existsSync(join(output, "cleanup-error.json")));
+  assert(!existsSync(join(output, "receipt.json")), "no receipt survives the cleanup failure");
+  assert(!existsSync(join(output, "budget-warnings.json")), "no list survives without its receipt");
+});
+
+for (const signal of ["SIGINT", "SIGTERM"])
+  test(`budget warning: a CLI ${signal} after the receipt is written removes the receipt and its list`, async (t) => {
+    // A TERM-ignoring child under the home holds cleanup in its SIGTERM grace
+    // period, so the signal lands after the receipt and list are written.
+    const pids = fixturePids(t);
+    const { f, plan } = budgetFixture(
+      t,
+      leakingCheck(
+        pids,
+        ["held"],
+        `start('held',{cwd:fs.realpathSync(home),env:{...elsewhere,IGNORE_TERM:'1'}});`,
+      ),
+    );
+    const root = tempDir(t, "verification-budget-signal-"),
+      planFile = join(root, "plan.json"),
+      output = tempDir(t, "verification-budget-signal-logs-");
+    writeFileSync(planFile, JSON.stringify(plan));
+    const child = matrixCLI(t, f, ["run", planFile, output, "--min-free-bytes", "0"], { TMPDIR: root });
+    await untilHost(() => existsSync(join(output, "budget-warnings.json")), "the budget warning list");
+    assert(existsSync(join(output, "receipt.json")), "the receipt is written before the list");
+    assert(alive(pidOf(pids, "held")), "cleanup is still waiting on the held child");
+    child.kill(signal);
+    const [code] = await once(child, "close");
+    assert.equal(code, signal === "SIGINT" ? 130 : 143, child.text);
+    assert(!alive(pidOf(pids, "held")), "cleanup still stopped the held child");
+    assert(!existsSync(join(output, "receipt.json")), "no receipt survives the interruption");
+    assert(!existsSync(join(output, "budget-warnings.json")), "no list survives without its receipt");
   });
