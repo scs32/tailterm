@@ -274,8 +274,11 @@ func toolDenyShellArgs(args []string) (inline string, stdin bool) {
 // count as the first argument, where kill and pkill take their signal: later
 // they are a pattern, an operand or a usage error. killall reads options up
 // to its first operand, so its -0, -l, -s and -d count anywhere before it,
-// the values of -u, -t and -c stepped over. A -s whose next word is a signal
-// is Linux killall's "-s SIGNAL", which sends it.
+// the values of -u, -t and -c stepped over. A -s whose value is a signal
+// is Linux killall's "-s SIGNAL", which sends it. The value is the rest of
+// the word, or the next word when nothing follows the s, and a group such
+// as -vs reads as its letters given separately: an -l or -d before the s
+// still only lists or shows.
 func toolDenySendsNothing(name string, args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -297,8 +300,12 @@ func toolDenySendsNothing(name string, args []string) bool {
 		if _, signal := toolDenySignal(a[1:]); signal {
 			continue
 		}
-		if a == "-s" && i+1 < len(args) {
-			if _, signal := toolDenySignal(args[i+1]); signal {
+		if j := strings.IndexByte(a, 's'); j > 0 && !strings.ContainsAny(a[1:j], "ld") {
+			value := a[j+1:]
+			if value == "" && i+1 < len(args) {
+				value = args[i+1]
+			}
+			if _, signal := toolDenySignal(value); signal {
 				return false
 			}
 		}

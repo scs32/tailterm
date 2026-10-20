@@ -227,6 +227,9 @@ func TestToolDenySilencingWords(t *testing.T) {
 		{"deployer-signal", `kill -TERM tt-deployer --help`},
 		{"deployer-signal", `killall -s 9 tt-deployer`},
 		{"deployer-signal", `ssh air 'killall -s TERM tt-deployer-compact'`},
+		{"deployer-signal", `killall -sKILL tt-deployer-compact`},
+		{"deployer-signal", `killall -vs KILL tt-deployer-compact`},
+		{"deployer-signal", `killall -vsKILL tt-deployer-compact`},
 	} {
 		if got := denyRuleNames(toolDenyClassify(c.command)); got != c.rules {
 			t.Errorf("%s: rules = %q; want %q", c.command, got, c.rules)
@@ -239,6 +242,9 @@ func TestToolDenySilencingWords(t *testing.T) {
 		`killall -d node`, `killall -v -d tt-deployer`, `killall -KILL -d node`, `killall -l`, `killall -q -l`,
 		`killall -s node`, `killall -s tt-deployer-compact`, `killall -v -s tt-deployer-compact`, `killall -s 0 tt-deployer`,
 		`killall -u stephen -d tt-deployer`, `killall -c tt -s tt-deployer`,
+		`killall -s KILL node`, `killall -sKILL node`, `killall -vs KILL node`,
+		`killall -ls KILL tt-deployer`, `killall -dsKILL tt-deployer`, `killall -vl -s KILL tt-deployer`,
+		`killall -vs tt-deployer-compact`, `killall -s0 tt-deployer`, `killall -vsnode tt-deployer`,
 	} {
 		if got := toolDenyClassify(command); len(got) != 0 {
 			t.Errorf("%s: rules = %q; want none", command, denyRuleNames(got))
@@ -398,6 +404,10 @@ func TestToolDenySummary(t *testing.T) {
 		{`yarn deploy:static --token ` + github, []string{"old-site-deploy: yarn deploy:static (+2 args)"}},
 		{`tmux new -d -s ab12cd34 \; kill-session -t tt-deployer-compact`, []string{"deployer-signal: tmux kill-session -t tt-deployer-compact (+5 args)"}},
 		{"(( n << 2 ))\npkill -f ab12cd34", []string{"host-pkill: pkill -f (+1 args)"}},
+		{`killall -s KILL tt-deployer-compact`, []string{"deployer-signal: killall tt-deployer-compact (+2 args)"}},
+		{`killall -sKILL tt-deployer-compact`, []string{"deployer-signal: killall tt-deployer-compact (+1 args)"}},
+		{`killall -vs KILL tt-deployer-compact`, []string{"deployer-signal: killall tt-deployer-compact (+2 args)"}},
+		{`killall -vsKILL tt-deployer-` + e.token, []string{"deployer-signal: killall tt-deployer (+2 args)"}},
 		{`files=(scripts/deploy-static.mjs ab12cd34); case $x in pkill|killall) tmux send-keys -t tt-builder-1 'tt-deployer-compact' ;; esac; [[ $x =~ (pkill|killall) ]]; pkill --help; pkill -0 -f vite; killall -d node`, nil},
 	}
 	for i, c := range cases {
