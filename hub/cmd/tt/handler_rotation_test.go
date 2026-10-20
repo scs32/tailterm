@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2786,4 +2788,240 @@ func TestHandlerRotationStuckNoticeAdviceMatchesThePhase(t *testing.T) {
 			t.Fatalf("manual resume: %v launches=%d", err, launches)
 		}
 	})
+}
+
+// lostExitRunner is a hub with one busy primary whose runtime exited while
+// its wrapper survived, and whose exit report the hub never received: the
+// fixture refuses the wrapper's exited post with a 503 before it reaches the
+// hub (wi_b01a7afa10979dd0). The wrapper's receipt on this host records the
+// exit. The runner's probe is the real deathProbe over that receipt, with a
+// synthetic tmux listing and process table in which the session is present
+// and its one pane holds only the wrapper and its idle login shell.
+type lostExitRunner struct {
+	*rotationCLI
+	// wrapper is the old handler's own tt wrap identity.
+	wrapper env
+	// refuse is how many exited posts the fixture answers with a 503;
+	// exitPosts counts every exited post, refused or not.
+	refuse    atomic.Int32
+	exitPosts atomic.Int32
+	// paneStarted is the wrapper's (the pane process's) start identity.
+	paneStarted string
+	// tableReads counts process table reads by the probe.
+	tableReads int
+	probes     []string
+	cleaned    []string
+	held       api.Message
+}
+
+// Synthetic values: nothing in these tests starts, lists or reads a tmux
+// server or a real process.
+const (
+	lostExitSocket  = "tt-lost-exit-fixture-socket"
+	lostExitSession = "tt-handler-lost-exit-fixture"
+)
+
+func lostExitStart(t time.Time) string { return t.In(time.Local).Format("Mon Jan _2 15:04:05 2006") }
+
+func newLostExitRunner(t *testing.T) *lostExitRunner {
+	t.Helper()
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TT_TMUX_SOCKET", lostExitSocket)
+	t.Setenv(spawn.EnvSession, lostExitSession)
+	x := &lostExitRunner{rotationCLI: &rotationCLI{dbPath: filepath.Join(t.TempDir(), "hub.sqlite")}, paneStarted: lostExitStart(time.Now().Add(-time.Hour))}
+	f := x.rotationCLI
+	var err error
+	if f.st, err = store.Open(f.dbPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.st.Close() })
+	handler := server.New(f.st, func(r *http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "owner"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/handler-rotations") {
+			f.actions.Add(1)
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/events") {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "unreadable fixture request", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var req api.PostEventRequest
+			if json.Unmarshal(body, &req) == nil && req.Kind == api.EventExited {
+				x.exitPosts.Add(1)
+				if n := x.refuse.Load(); n > 0 && x.refuse.CompareAndSwap(n, n-1) {
+					http.Error(w, "fixture hub is unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	if f.c, err = api.NewClient(srv.URL, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	f.e = env{hub: f.c.Base}
+	ctx := context.Background()
+	if f.task, err = f.c.CreateTask(ctx, api.CreateTaskRequest{Name: "isolated lost exit report test"}); err != nil {
+		t.Fatal(err)
+	}
+	f.dir = t.TempDir()
+	if f.old, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "db-handler", Runtime: "generic", Host: "fixture",
+		Session: lostExitSession, Cwd: f.dir, TemplateDigest: handlerTemplateDigest("handler assignment")}); err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, f.old)
+	if f.worker, err = f.c.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "builder", Host: "fixture", Session: "builder", Runtime: "generic"}); err != nil {
+		t.Fatal(err)
+	}
+	f.live(t, f.worker)
+	x.held = f.request(t, f.old.Name, "Fixture request held by the handler whose exit report was lost")
+	f.activity(t, f.old, "working", "Bash", 0)
+	x.wrapper = env{hub: f.c.Base, task: f.task.ID, agent: f.old.ID, agentName: f.old.Name, session: lostExitSession, runID: f.old.RunID}
+	// The receipt tt wrap saved when it started the runtime.
+	receipt := runtimeProcessReceipt{Hub: f.c.Base, Task: f.task.ID, Agent: f.old.ID, Run: f.old.RunID, Session: lostExitSession, Socket: lostExitSocket, PID: 4242, Started: "start-4242",
+		PanePID: 4200, PaneStarted: x.paneStarted, Shell: "/bin/zsh", SessionID: "$7", SessionCreated: "1700000000"}
+	if err = writePrivateJSON(runtimeProcessPath(f.c.Base, f.old.ID, f.old.RunID), receipt); err != nil {
+		t.Fatal(err)
+	}
+	if f.spec, err = newHandlerSpec(f.c.Base, f.task.ID, []string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "handler assignment"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	probe := x.deathProbe()
+	f.deps = rotationDeps{host: func() string { return "fixture" }, online: 3 * time.Second, poll: 20 * time.Millisecond,
+		// spawn registers the successor as tt spawn would; it starts nothing.
+		spawn: func(_ env, args []string) error {
+			f.spawns++
+			flags := map[string]string{}
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "--handler-successor" {
+					continue
+				}
+				flags[args[i]] = args[i+1]
+				i++
+			}
+			a, err := f.c.AddAgent(ctx, flags["--task"], api.AddAgentRequest{AgentID: flags["--agent-id"], Role: flags["--role"], Name: flags["--name"], Host: "fixture", Session: "tt-handler-successor-fixture",
+				Runtime: flags["--runtime"], Cwd: flags["--cwd"], TemplateDigest: handlerTemplateDigest(flags["--prompt"])})
+			if err != nil {
+				return err
+			}
+			_, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted})
+			return err
+		},
+		cleanup: func(_ context.Context, _ env, _, agent string) error {
+			x.cleaned = append(x.cleaned, agent)
+			return nil
+		},
+		probe: func(ctx context.Context, hub string, a api.Agent) (string, string, *api.HandlerDeathEvidence) {
+			state, detail, ev := probe.probe(ctx, hub, a)
+			x.probes = append(x.probes, state+": "+detail)
+			return state, detail, ev
+		}}
+	return x
+}
+
+// deathProbe is the real probe over the wrapper's receipt file. The runtime
+// process is gone, the session is present, and its one pane holds the
+// wrapper with only its login shell, started a second after the recorded exit.
+func (x *lostExitRunner) deathProbe() deathProbe {
+	p := productionDeathProbe()
+	f := x.rotationCLI
+	p.sessions = func(context.Context) ([]ownedSession, error) {
+		return []ownedSession{{ID: "$7", Created: "1700000000", Name: lostExitSession, Hub: f.c.Base, Task: f.task.ID, Agent: f.old.ID, Run: f.old.RunID}}, nil
+	}
+	p.pid = func(int, string) (bool, error) { return false, nil }
+	p.panes = func(context.Context, string) ([]int, error) { return []int{4200}, nil }
+	p.processes = func(context.Context) (map[int]discoveredProcess, error) {
+		x.tableReads++
+		return x.table(), nil
+	}
+	p.socket = func() string { return lostExitSocket }
+	p.host = func() string { return "fixture" }
+	return p
+}
+
+// table is the host's process table: the pane process 4200 is the wrapper
+// and 4300 its idle login shell.
+func (x *lostExitRunner) table() map[int]discoveredProcess {
+	exited := time.Now()
+	var r runtimeProcessReceipt
+	if data, err := os.ReadFile(runtimeProcessPath(x.c.Base, x.old.ID, x.old.RunID)); err == nil && json.Unmarshal(data, &r) == nil && !r.ExitedAt.IsZero() {
+		exited = r.ExitedAt
+	}
+	other := lostExitStart(exited.Add(-24 * time.Hour))
+	return map[int]discoveredProcess{1: {1, 0, other, "/sbin/launchd"}, 4200: {4200, 1, x.paneStarted, "tt"}, 4300: {4300, 4200, lostExitStart(exited.Add(time.Second)), "-zsh"}}
+}
+
+// wrapperExit does what tt wrap did before the retry when its runtime exited:
+// record the exit in its receipt, then post exited once. The fixture refuses
+// that post.
+func (x *lostExitRunner) wrapperExit(t *testing.T) {
+	t.Helper()
+	x.refuse.Store(1)
+	recordRuntimeExit(x.wrapper)
+	if err := postEvent(x.wrapper, api.EventExited, "Process exited (1)", nil); err == nil {
+		t.Fatal("the fixture accepted the exit report it should refuse")
+	}
+	if n := x.exitPosts.Load(); n != 1 {
+		t.Fatalf("exit posts: %d", n)
+	}
+	var r runtimeProcessReceipt
+	if data, err := os.ReadFile(runtimeProcessPath(x.c.Base, x.old.ID, x.old.RunID)); err != nil || json.Unmarshal(data, &r) != nil || r.ExitedAt.IsZero() {
+		t.Fatalf("the wrapper's receipt records no exit: %+v %v", r, err)
+	}
+}
+
+// e1: with the exit report lost and the wrapper's session still present, the
+// host's probe answers alive: the roster does not say exited, so the pane is
+// never read.
+func TestHandlerDeathProbeLostExitReport(t *testing.T) {
+	x := newLostExitRunner(t)
+	x.wrapperExit(t)
+	ctx := context.Background()
+	a, err := x.c.GetAgent(ctx, x.task.ID, x.old.ID)
+	if err != nil || a.Status == api.AgentExited || a.RunID != x.old.RunID {
+		t.Fatalf("roster: %s %s %v", a.Status, a.RunID, err)
+	}
+	state, detail, ev := x.deathProbe().probe(ctx, x.c.Base, a)
+	if state != handlerProbeAlive || detail != "tmux session "+lostExitSession+" is present" || ev != nil || x.tableReads != 0 {
+		t.Fatalf("probe %s (%s) evidence %+v table reads %d", state, detail, ev, x.tableReads)
+	}
+}
+
+// e1: with the exit report lost, the busy primary that has been silent past
+// the dead silence is listed as a dead candidate, but no rule fires: every
+// tick probes it alive and asks the hub for nothing.
+func TestHandlerRotationLostExitReportNeverFires(t *testing.T) {
+	x := newLostExitRunner(t)
+	f := x.rotationCLI
+	x.wrapperExit(t)
+	f.lastHeard(t, 11*time.Minute)
+	ctx := context.Background()
+	list, err := f.c.HandlerRotationsDue(ctx, "fixture", "")
+	if err != nil || len(list.Entries) != 1 || list.Entries[0].Agent.ID != f.old.ID || list.Entries[0].Agent.Status == api.AgentExited || !list.Entries[0].DeadCandidate || !list.Entries[0].SilenceMet {
+		t.Fatalf("due: %+v %v", list, err)
+	}
+	for i := 0; i < 3; i++ {
+		f.tick(t, f.runner())
+	}
+	if len(x.probes) != 3 {
+		t.Fatalf("probes: %v", x.probes)
+	}
+	for _, p := range x.probes {
+		if !strings.HasPrefix(p, handlerProbeAlive+": tmux session "+lostExitSession+" is present") {
+			t.Fatalf("probe: %s", p)
+		}
+	}
+	old, err := f.c.GetAgent(ctx, f.task.ID, f.old.ID)
+	detail, derr := f.c.GetTask(ctx, f.task.ID)
+	if f.actions.Load() != 0 || f.spawns != 0 || len(f.rotations(t)) != 0 || f.journalExists() || len(x.cleaned) != 0 || err != nil || old.Status == api.AgentExited || old.Status == api.AgentClosed ||
+		derr != nil || detail.Task.HandlerRevision != 1 || (detail.Task.PrimaryHandlerID != "" && detail.Task.PrimaryHandlerID != f.old.ID) || x.exitPosts.Load() != 1 {
+		t.Fatalf("actions=%d spawns=%d rotations=%d cleaned=%v old=%s %v task=%+v %v exit posts=%d", f.actions.Load(), f.spawns, len(f.rotations(t)), x.cleaned, old.Status, err, detail.Task, derr, x.exitPosts.Load())
+	}
 }
