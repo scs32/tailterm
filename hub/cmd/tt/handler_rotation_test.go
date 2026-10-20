@@ -3025,3 +3025,93 @@ func TestHandlerRotationLostExitReportNeverFires(t *testing.T) {
 		t.Fatalf("actions=%d spawns=%d rotations=%d cleaned=%v old=%s %v task=%+v %v exit posts=%d", f.actions.Load(), f.spawns, len(f.rotations(t)), x.cleaned, old.Status, err, detail.Task, derr, x.exitPosts.Load())
 	}
 }
+
+// e2: the wrapper's first exit report and its first retry are lost; the
+// second retry reaches the hub, and the unchanged exited-primary rule then
+// replaces the busy primary with that report once the silence has passed.
+func TestHandlerRotationRetriedExitReportReplacesPrimary(t *testing.T) {
+	x := newLostExitRunner(t)
+	f := x.rotationCLI
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	x.refuse.Store(2)
+	r := productionExitReporter(x.wrapper)
+	r.table = func(context.Context) (map[int]discoveredProcess, error) { return x.table(), nil }
+	r.self = func() int { return 4200 }
+	r.after = func(time.Duration) <-chan time.Time {
+		fired := make(chan time.Time, 1)
+		fired <- time.Now()
+		return fired
+	}
+	if !wrapperExited(ctx, x.wrapper, 1, r) {
+		t.Fatal("no retry started after the lost exit report")
+	}
+	path := runtimeProcessPath(f.c.Base, f.old.ID, f.old.RunID)
+	var receipt runtimeProcessReceipt
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &receipt) == nil && !receipt.ExitReportedAt.IsZero() {
+			break
+		}
+	}
+	if receipt.ExitReportedAt.IsZero() || receipt.ExitedAt.IsZero() || x.exitPosts.Load() != 3 {
+		t.Fatalf("receipt %+v exit posts %d", receipt, x.exitPosts.Load())
+	}
+	events, err := f.c.Events(ctx, f.task.ID, 0, 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exit api.Event
+	for _, ev := range events.Events {
+		if ev.AgentID == f.old.ID && ev.Kind == api.EventExited {
+			if exit.Seq != 0 {
+				t.Fatalf("two exit reports: %d and %d", exit.Seq, ev.Seq)
+			}
+			exit = ev
+		}
+	}
+	if exit.Seq == 0 || exit.Text != "Process exited (1)" {
+		t.Fatalf("exit report: %+v", exit)
+	}
+	// The retried report and everything else the hub recorded from the run
+	// was 11 minutes ago.
+	at := time.Now().UTC().Add(-11 * time.Minute)
+	db := f.db(t)
+	for _, q := range []struct {
+		query string
+		args  []any
+	}{{`UPDATE agents SET last_seen_at=? WHERE id=?`, []any{at.Format(time.RFC3339Nano), f.old.ID}},
+		{`UPDATE agent_activity SET observed_at=? WHERE agent_id=? AND run_id=?`, []any{at.Format(time.RFC3339Nano), f.old.ID, f.old.RunID}},
+		{`UPDATE events SET created_at=? WHERE seq=?`, []any{at.Format(time.RFC3339Nano), exit.Seq}}} {
+		if _, err := db.Exec(q.query, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The broker's tick after the exit closed the request the handler held.
+	open, err := f.st.BrokerOpenObligations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range open {
+		if o.AgentID == f.old.ID {
+			if err := f.st.BrokerCloseRecipientGone(ctx, o, at.Add(30*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	f.tick(t, f.runner())
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || len(x.probes) != 2 || f.spawns != 1 {
+		t.Fatalf("rotations=%d probes=%v spawns=%d", len(rotations), x.probes, f.spawns)
+	}
+	rot := rotations[0]
+	if rot.State != api.HandlerRotationCommitted || rot.Reason != api.HandlerRotationReasonDeadPrimary || rot.OldAgentID != f.old.ID || rot.OldRunID != f.old.RunID || rot.Exit == nil ||
+		rot.Exit.Code != 1 || rot.Exit.EventSeq != exit.Seq || rot.DeathEvidence == nil || rot.DeathEvidence.SessionState != api.HandlerDeathStateIdleShell || rot.DeathEvidence.PaneRootPID != 4200 ||
+		rot.DeathEvidence.ExitedAt == nil || !rot.DeathEvidence.ExitedAt.Equal(receipt.ExitedAt) || rot.CommitDeathEvidence == nil {
+		t.Fatalf("rotation: %+v exit %+v evidence %+v", rot, rot.Exit, rot.DeathEvidence)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	old, _ := f.c.GetAgent(ctx, f.task.ID, f.old.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != rot.SuccessorAgentID || old.Status != api.AgentClosed || len(x.cleaned) != 1 || x.cleaned[0] != f.old.ID {
+		t.Fatalf("primary: %+v old %s cleaned %v %v", detail.Task, old.Status, x.cleaned, err)
+	}
+}
