@@ -1656,3 +1656,140 @@ test("f2 a transport failure, a moved generation or any other refuse failure sen
   assert.deepEqual(other.calls(),[sent],mode);assert.equal(c.job.state,"claimed",mode);
  }
 });
+
+// The runner check of the release quiet window (wi_3427bf81094d2225): on every
+// pass, after selection and the integrated matrix and before the inputs are
+// bound, a window that is open over a selected target, or unreadable while any
+// target is selected, holds the claim in waiting_window with no effect.
+import {releaseWindowStatus,parseReleaseWindow,windowWaitNotice,unclaimableJob,WAKE} from "../scripts/release-runner.mjs";
+import {codeHost,verifiedJob} from "./release-runner-fixtures.mjs";
+const UNTIL="2026-10-21T07:00:00-07:00",NIGHT={zone:"America/Los_Angeles",start:"22:00",end:"07:00",targets:["hub","bridge","mini"],reason:"night"};
+const OPEN={...NIGHT,open:true,until:UNTIL},CLOSED={...NIGHT,open:false};
+// A fake adapter whose window reads, inputs requests and matrix imports are counted.
+function windowed(window){
+ const a=fake();a.reads=0;a.inputs=0;a.matrix=0;a.window=window;
+ a.releaseWindow=async()=>{a.reads++;if(a.window instanceof Error)throw a.window;return typeof a.window==="function"?a.window():a.window;};
+ a.verifyInputs=async()=>{a.inputs++;return a.inputsReady!==false;};
+ a.verifyIntegrated=async()=>{a.matrix++;return a.matrixReady!==false;};
+ return a;
+}
+// A docs-only job; then an owner commit no job records lands on tasks-hub after its base.
+function nightFixture(paths=["hub/cmd/tt/x.go"]){
+ const f=fixture();mkdirSync(join(f.cwd,"docs"));const j=job(f,change(f,"docs/note.md","note"));
+ git(f.cwd,"checkout","tasks-hub");for(const p of paths){mkdirSync(join(f.cwd,dirname(p)),{recursive:true});writeFileSync(join(f.cwd,p),p);}
+ const owner=change(f,paths[0],"owner");return {f,j,owner};
+}
+const journalOfWindow=c=>JSON.parse(readFileSync(c.journalPath,"utf8"));
+const noEffect=a=>assert.deepEqual(a.calls,[]);
+test("window a1 a docs-only job carrying an unrecorded hub commit waits inside the window with nothing bound, published or deployed",async()=>{
+ const {f,j,owner}=nightFixture(),a=windowed(OPEN),c=config(f,j);
+ const r=await runRelease(c,a);
+ assert.deepEqual(r,{jobId:j.id,outcome:"waiting_window",window:{covered:["mini"],until:UNTIL,zone:"America/Los_Angeles",start:"22:00",end:"07:00"}});
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),owner);assert.equal(remoteHead(f),f.base);
+ noEffect(a);assert.equal(a.inputs,0);assert.equal(a.reads,1);
+ const journal=journalOfWindow(c);assert.equal(journal.phase,"waiting_window");assert.deepEqual(journal.effects,[]);assert.notEqual(journal.published,true);
+ assert.deepEqual(journal.windowWait.covered,["mini"]);assert.equal(journal.windowWait.until,UNTIL);assert.equal(journal.integrated,git(f.cwd,"rev-parse","HEAD"));
+ // Only the selected targets the window names are covered.
+ const mixed=nightFixture(["hub/cmd/tt/x.go","client/x.js"]),m=windowed(OPEN);
+ assert.deepEqual((await runRelease(config(mixed.f,mixed.j),m)).window.covered,["mini"]);noEffect(m);
+});
+test("window a2 a selection with no covered target releases in the window, and an empty one never reads it",async()=>{
+ const f=fixture();mkdirSync(join(f.cwd,"docs"));const j=job(f,change(f,"docs/note.md","note")),a=windowed(OPEN);
+ const r=await runRelease(config(f,j),a);assert.equal(r.outcome,"released");assert.deepEqual(r.targets,[]);assert.equal(a.reads,0);assert.deepEqual(a.calls,["merged","finish"]);
+ const g=fixture(),k=job(g,change(g,"client/a.js","a")),b=windowed(OPEN);
+ const s=await runRelease(config(g,k),b);assert.equal(s.outcome,"released");assert.deepEqual(b.calls,["merged","deploy:tailos","finish"]);assert.equal(b.reads,1);
+ // A window of tailos alone does not cover a selected mini.
+ const {f:h,j:l}=nightFixture(),d=windowed({...OPEN,targets:["tailos"]});
+ assert.equal((await runRelease(config(h,l),d)).outcome,"released");assert.deepEqual(d.calls,["merged","deploy:mini","finish"]);
+});
+test("window a3 an unreadable window covers every selected target with its named cause and refuses nothing",async()=>{
+ const cases=[
+  [Object.assign(releaseError("tt deployment window connection refused, 3 tries"),{transport:true}),"tt deployment window connection refused, 3 tries"],
+  [releaseError("tt deployment window exit 2"),"tt deployment window exit 2"],
+  [new Error("SYNTHETIC_PRIVATE_TOKEN"),"unclassified"],
+  [{open:"yes"},"Release window unreadable"],
+  [{...OPEN,until:"tomorrow"},"Release window unreadable"],
+  [{...OPEN,targets:["hub","nas"]},"Release window unreadable"],
+ ];
+ for(const [window,cause] of cases){
+  const {f,j}=nightFixture(["hub/cmd/tt/x.go","client/x.js"]),a=windowed(window),c=config(f,j);
+  const r=await runRelease(c,a);
+  assert.equal(r.outcome,"waiting_window",cause);assert.deepEqual(r.window,{covered:["mini","tailos"],cause},cause);
+  noEffect(a);assert.equal(a.inputs,0,cause);assert.ok(!readFileSync(c.journalPath,"utf8").includes("SYNTHETIC_PRIVATE_TOKEN"));
+ }
+ // The same unreadable window with a docs-only selection releases, unread.
+ const f=fixture();mkdirSync(join(f.cwd,"docs"));const j=job(f,change(f,"docs/note.md","note")),a=windowed(releaseError("tt deployment window exit 2"));
+ assert.equal((await runRelease(config(f,j),a)).outcome,"released");assert.equal(a.reads,0);
+});
+test("window a4 outside the window the job releases, and a waiting job goes on at the same integrated commit once it closes",async()=>{
+ for(const window of [CLOSED,null]){
+  const {f,j}=nightFixture(),a=windowed(window),r=await runRelease(config(f,j),a);
+  assert.equal(r.outcome,"released",JSON.stringify(window));assert.deepEqual(a.calls,["merged","deploy:mini","finish"]);assert.equal(a.inputs,1);
+ }
+ const {f,j}=nightFixture(),a=windowed(OPEN),c=config(f,j);
+ assert.equal((await runRelease(c,a)).outcome,"waiting_window");const integrated=git(f.cwd,"rev-parse","HEAD");assert.equal(a.inputs,0);
+ a.window=CLOSED;const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.equal(r.commit,integrated);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),integrated);
+ assert.equal(a.inputs,1);assert.deepEqual(a.calls,["merged","deploy:mini","finish"]);assert.equal(journalOfWindow(c).windowWait,undefined);
+});
+test("window a5 a claim from before the window waits at every pass without a second inputs request, keeping its integrated run",async()=>{
+ const {f,j}=nightFixture(),a=windowed(CLOSED),c=config(f,j);a.inputsReady=false;
+ assert.equal((await runRelease(c,a)).outcome,"waiting_inputs");assert.equal(a.inputs,1);const integrated=journalOfWindow(c).integrated;
+ a.window=OPEN;
+ for(let pass=0;pass<2;pass++){
+  assert.equal((await runRelease(c,a)).outcome,"waiting_window");assert.equal(a.inputs,1);noEffect(a);
+  assert.equal(journalOfWindow(c).integrated,integrated);assert.equal(git(f.cwd,"rev-parse","HEAD"),integrated);
+ }
+ assert.equal(a.reads,3);
+ a.window=CLOSED;a.inputsReady=true;const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.equal(r.commit,integrated);assert.equal(a.inputs,2);assert.deepEqual(a.calls,["merged","deploy:mini","finish"]);
+ // A job waiting for its integrated matrix when the window opens still has it imported, then waits.
+ const m=nightFixture(),b=windowed(CLOSED),d=config(m.f,m.j);b.matrixReady=false;
+ assert.equal((await runRelease(d,b)).outcome,"waiting_matrix");assert.equal(b.reads,0);
+ b.window=OPEN;b.matrixReady=true;assert.equal((await runRelease(d,b)).outcome,"waiting_window");assert.equal(b.matrix,2);assert.equal(b.inputs,0);noEffect(b);
+});
+test("window a6 effects that began before the window opened finish without another read",async()=>{
+ const {f,j}=nightFixture(),a=windowed(CLOSED),deploy=a.deploy;a.deploy=async t=>{a.window=OPEN;return deploy(t);};
+ const r=await runRelease(config(f,j),a);assert.equal(r.outcome,"released");assert.equal(a.reads,1);assert.deepEqual(a.calls,["merged","deploy:mini","finish"]);
+ // A journal resumed in pushing finishes with the window open and never reads it.
+ const g=nightFixture(),b=windowed(CLOSED),c=config(g.f,g.j);let finishes=0;b.finish=async()=>{if(++finishes===1)throw new Error("lost");b.calls.push("finish");};
+ assert.equal((await runRelease(c,b)).outcome,"receipt_pending");const journal=JSON.parse(readFileSync(c.journalPath,"utf8"));
+ journal.phase="pushing";delete journal.receipt.push;writeFileSync(c.journalPath,JSON.stringify(journal));git(g.f.origin,"update-ref","refs/heads/tasks-hub",g.f.base);
+ b.window=OPEN;b.reads=0;const s=await runRelease(c,b);assert.equal(s.outcome,"released");assert.equal(s.push.outcome,"pushed");assert.equal(b.reads,0);
+ assert.equal(b.calls.filter(x=>x==="deploy:mini").length,1);
+});
+test("window a7 the host read, its notice, the clean-stop and fence lists, and the daemon's report",async t=>{
+ // HostAdapter.releaseWindow reads tt deployment window and checks its shape.
+ const seen=[],host=out=>Object.assign(new HostAdapter({tt:"tt",cwd:"/"},{}),{command:argv=>{seen.push(argv);return out;}});
+ assert.equal(await host("null\n").releaseWindow(),null);assert.deepEqual(seen[0],["tt","deployment","window"]);
+ assert.deepEqual(await host(JSON.stringify({...CLOSED,setAt:"x",requestId:"k"})).releaseWindow(),{open:false,zone:"America/Los_Angeles",start:"22:00",end:"07:00",targets:["hub","bridge","mini"]});
+ assert.deepEqual(await host(JSON.stringify(OPEN)).releaseWindow(),{open:true,until:UNTIL,zone:"America/Los_Angeles",start:"22:00",end:"07:00",targets:["hub","bridge","mini"]});
+ for(const bad of ["not json","[]","{}",JSON.stringify({...OPEN,until:undefined}),JSON.stringify({...OPEN,targets:[]}),JSON.stringify({...OPEN,targets:["mini","mini"]}),JSON.stringify({...OPEN,zone:"a b"}),JSON.stringify({...OPEN,start:"2200"})])
+  await assert.rejects(host(bad).releaseWindow(),e=>failureReason(e)==="Release window unreadable",bad);
+ assert.equal(parseReleaseWindow("null"),null);assert.equal(releaseWindowStatus(null),null);
+ // The notice: covered targets and until; one request id per window end; attention when unreadable.
+ const w={covered:["mini"],until:UNTIL,zone:"America/Los_Angeles",start:"22:00",end:"07:00"},n=windowWaitNotice({id:"rel_night"},w);
+ assert.equal(n.wake,WAKE.routine);assert.equal(n.subject,"A release job waits for the release quiet window");
+ assert.match(n.text,/^Release rel_night waits for the release quiet window 22:00-07:00 America\/Los_Angeles, which covers its selected targets mini until 2026-10-21T07:00:00-07:00\. /);
+ assert.equal(windowWaitNotice({id:"rel_night"},{...w}).requestId,n.requestId);assert.notEqual(windowWaitNotice({id:"rel_night"},{...w,until:"2026-10-22T07:00:00-07:00"}).requestId,n.requestId);
+ assert.ok(n.requestId.startsWith("rel_night-window-wait-"));
+ const u=windowWaitNotice({id:"rel_night"},{covered:["mini","tailos"],cause:"tt deployment window exit 2"});
+ assert.equal(u.wake,WAKE.attention);assert.match(u.text,/could not be read \(tt deployment window exit 2\), so every selected target counts as covered: mini, tailos\./);
+ assert.equal(windowWaitNotice({id:"rel_night"},{covered:[]}),null);assert.equal(windowWaitNotice({id:"rel_night"},{covered:["nas"],until:UNTIL}),null);
+ // A clean stop may give back a waiting_window claim with no effects.
+ const home=mkdtempSync(join(tmpdir(),"release-window-stop-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const own={id:"rel_night",state:"claimed",agentId:"agt_night",runId:"run_night",commit:"c".repeat(40),generation:3},journal=extra=>writeFileSync(join(home,"rel_night.json"),JSON.stringify({version:1,jobId:own.id,commit:own.commit,agentId:own.agentId,runId:own.runId,phase:"waiting_window",effects:[],...extra}));
+ const base={jobs:[own],details:new Map([[own.id,own]]),agent:own.agentId,run:own.runId,journalDirectory:home,lock:join(home,"absent.lock"),matrixChildren:0};
+ journal();assert.equal(unclaimableJob(base),"rel_night");journal({effects:[{target:"mini"}]});assert.equal(unclaimableJob(base),null);journal({published:true});assert.equal(unclaimableJob(base),null);
+ // The fence notice for a job queued behind it is routine.
+ const fenceNotice=fenceWaitNotice([own,{id:"rel_next",state:"verified"}],own,"waiting_window",false,false);
+ assert.equal(fenceNotice.wake,WAKE.routine);assert.match(fenceNotice.text,/is waiting for the release quiet window to end/);
+ // One daemon poll that ends waiting for the window: one window notice and the owner_hold report.
+ const cwd=mkdtempSync(join(tmpdir(),"release-window-daemon-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const h=codeHost(t,cwd,`if(a[1]==='progress'){console.log('{}');process.exit(0);}`);h.setJobs([verifiedJob("rel_night")]);
+ const err=await h.poll(null,async c=>({jobId:c.job.id,outcome:"waiting_window",window:w}),{once:true,progress:true});
+ assert.equal(err,"Release waits for the release quiet window; nothing is bound or published until it ends.\n");
+ const sends=h.sends().filter(s=>s.subject==="A release job waits for the release quiet window");assert.equal(sends.length,1);assert.equal(sends[0].requestId,windowWaitNotice({id:"rel_night"},w).requestId);
+ const sent=h.calls().find(c=>c.argv[0]==="send").argv;assert.ok(sent.includes("release-job=rel_night"));assert.ok(sent.includes("wake=routine"));
+ assert.equal(h.calls().map(c=>c.argv.join(" ")).at(-1),"deployment progress --phase poll --job rel_night --wait owner_hold");
+});

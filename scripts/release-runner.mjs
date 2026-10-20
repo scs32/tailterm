@@ -147,7 +147,7 @@ function transportCause(error) {
 function cliIdempotent(argv) {
   const id = argv.indexOf("--request-id");
   if (["send", "deployment"].includes(argv[1]) && id > 1 && argv[id + 1]) return true;
-  return (argv[1] === "deployment" && ["get", "list", "handler"].includes(argv[2])) || argv[1] === "agents";
+  return (argv[1] === "deployment" && (["get", "list", "handler"].includes(argv[2]) || (argv[2] === "window" && argv.length === 3))) || argv[1] === "agents";
 }
 // The bound of that retry: at most tries calls, delaysMs before the second and
 // the third, and no retry that would start later than windowMs after the first
@@ -341,6 +341,40 @@ export function matrixHeldNotice(job, held) {
   const groups = (held.groups || []).filter(Number.isSafeInteger);
   return {requestId: `${job.id}-matrix-held-${held.attempt}`, wake: WAKE.attention, subject: "A release job is held until its matrix run is confirmed stopped",
     text: `Release ${job.id} is held: its matrix run could not be confirmed stopped (pid ${Number.isSafeInteger(held.pid) ? held.pid : "unknown"}; check groups still alive: ${groups.join(",") || "none"}; ${REASON.test(held.reason || "") ? held.reason : "unclassified"}). It keeps the project release fence and no other job integrates. Confirm nothing of that run is alive, then follow the held matrix run step in docs/project-deployment.md.`};
+}
+// The release quiet window (docs/project-deployment.md, "Release quiet
+// window") as tt deployment window prints it: null when none is set, else the
+// window with the hub's open and, while open, until. Only the fields the
+// runner check and its notice use are kept, each checked for its shape;
+// anything else is unreadable, and an unreadable window covers every target.
+const WINDOW_TIME = /^\d\d:\d\d$/, WINDOW_ZONE = /^[A-Za-z0-9_+\/-]{1,64}$/, WINDOW_UNTIL = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/;
+export function releaseWindowStatus(w) {
+  if (w === null) return null;
+  const unreadable = () => releaseError("Release window unreadable");
+  if (!w || typeof w !== "object" || Array.isArray(w) || typeof w.open !== "boolean" || !WINDOW_ZONE.test(w.zone || "") || !WINDOW_TIME.test(w.start || "") || !WINDOW_TIME.test(w.end || "")) throw unreadable();
+  if (!Array.isArray(w.targets) || !w.targets.length || w.targets.some((t, i) => !TARGETS.includes(t) || w.targets.indexOf(t) !== i)) throw unreadable();
+  if (w.open && (!WINDOW_UNTIL.test(w.until || "") || !Number.isFinite(Date.parse(w.until)))) throw unreadable();
+  return {open: w.open, ...(w.open ? {until: w.until} : {}), zone: w.zone, start: w.start, end: w.end, targets: [...w.targets]};
+}
+export function parseReleaseWindow(raw) {
+  let w;try{w=JSON.parse(raw);}catch{throw releaseError("Release window unreadable");}
+  return releaseWindowStatus(w);
+}
+// The notice for a claimed job the runner check holds (runRelease's
+// windowWait): the covered targets and the window end, or the read failure.
+// One per job and window end (or cause) and covered targets, so a restart
+// resends the same notice and the next night's wait is a new one. A window
+// that could not be read needs attention; an open one is routine.
+export function windowWaitNotice(job, wait) {
+  if (!/^rel_[A-Za-z0-9_-]{1,64}$/.test(job?.id || "") || !Array.isArray(wait?.covered) || !wait.covered.length || wait.covered.some(t => !TARGETS.includes(t))) return null;
+  const unread = wait.until === undefined, cause = REASON.test(wait.cause || "") ? wait.cause : "unclassified";
+  if (!unread && !WINDOW_UNTIL.test(wait.until)) return null;
+  const id = createHash("sha256").update(JSON.stringify([unread ? cause : wait.until, wait.covered])).digest("hex").slice(0, 12);
+  const span = WINDOW_TIME.test(wait.start || "") && WINDOW_TIME.test(wait.end || "") && WINDOW_ZONE.test(wait.zone || "") ? ` ${wait.start}-${wait.end} ${wait.zone}` : "";
+  const kept = "It keeps its claim and integrated run; nothing was bound, published or deployed.";
+  return {requestId: `${job.id}-window-wait-${id}`, jobId: job.id, wake: unread ? WAKE.attention : WAKE.routine, subject: "A release job waits for the release quiet window",
+    text: unread ? `Release ${job.id} waits: the release quiet window could not be read (${cause}), so every selected target counts as covered: ${wait.covered.join(", ")}. ${kept} It goes on at the first poll that reads the window and finds none of these targets covered; check that tt deployment window answers on the host of the deployer.`
+      : `Release ${job.id} waits for the release quiet window${span}, which covers its selected targets ${wait.covered.join(", ")} until ${wait.until}. ${kept} It goes on at the first poll after the window ends; no unhold is needed.`};
 }
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
 const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
@@ -731,7 +765,7 @@ export async function runRelease(config, adapter) {
     // the unconfirmed hub call and only then moves the checkout.
     if(prior.phase==="batching" && prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && prior.taskId===job.taskId && prior.pauseGeneration===job.pauseGeneration && Array.isArray(prior.effects) && !prior.effects.length && prior.published!==true && sha(prior.expected) && sha(prior.batchLead)) {state=prior;}
     else
-    if(prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && (["waiting_matrix","waiting_inputs","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
+    if(prior.jobId===job.id && prior.commit===job.commit && prior.agentId===job.agentId && prior.runId===job.runId && (prior.taskId===undefined || prior.taskId===job.taskId) && (prior.pauseGeneration===undefined || prior.pauseGeneration===job.pauseGeneration) && (["waiting_matrix","waiting_inputs","waiting_window","pushing","receipt_pending","finishing"].includes(prior.phase)) && (!["waiting_matrix","waiting_inputs","waiting_window"].includes(prior.phase) || !prior.effects.length) && git(cwd,"rev-parse","HEAD")===prior.integrated && !git(cwd,"status","--porcelain")) {state=prior;}
     else
     // A refusal whose refuse call failed, with nothing published and no
     // effects: this exact claim completes it below instead of holding the job.
@@ -938,6 +972,29 @@ export async function runRelease(config, adapter) {
       // batch stands and is read once more.
     }
   };
+  // The runner check of the release quiet window (wi_3427bf81094d2225): on
+  // every pass, after the targets are selected and the integrated matrix is
+  // imported, and before the inputs are bound or anything is published. The
+  // hub holds only jobs it can see; this sees what the integrated commit
+  // actually deploys, a commit no job or hand release records included. While
+  // the window is open and covers a selected target, or cannot be read while
+  // any target is selected, the job waits in waiting_window with its claim
+  // and integrated run, and the next poll checks again. Nothing is refused,
+  // fenced, bound or published here, and a read error never reaches the
+  // refusal below. An empty selection is never read; neither is a pass whose
+  // effects began (a resumed published journal), since those finish. An
+  // adapter without releaseWindow (the test fakes) has no window.
+  const quietWindow=async selected=>{
+    if(!selected.length || state.published===true || state.mergedSent===true || state.effects.length || typeof adapter.releaseWindow!=="function")return null;
+    let wait;
+    try{
+      const w=releaseWindowStatus(await adapter.releaseWindow()),covered=w?.open?selected.filter(t=>w.targets.includes(t)):[];
+      if(covered.length)wait={covered,until:w.until,zone:w.zone,start:w.start,end:w.end};
+    }catch(error){wait={covered:[...selected],cause:failureReason(error)};}
+    if(!wait){delete state.windowWait;return null;}
+    state.phase="waiting_window";state.windowWait=wait;checkpoint();
+    return {jobId:job.id,outcome:"waiting_window",window:wait};
+  };
   // Every selected target is live-verified before this runs, so nothing here
   // rolls back: a failed push reads the remote once and, unless the commit
   // landed there, is escalated once; the release stands. config.push (git,
@@ -974,7 +1031,7 @@ export async function runRelease(config, adapter) {
     // find ambiguous; a resumed one keeps the journal it has.
     if(state.phase==="prepared"){await fence();checkpoint();}else{checkpoint();await fence();}
     let integration;
-    if(["waiting_matrix","waiting_inputs"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
+    if(["waiting_matrix","waiting_inputs","waiting_window"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
     else if(state.phase==="batching")integration=await resumeBatch();
     else if(config.batch?.max>1 && config.batch.candidates?.length){begin({step:"integrate"});integration=await openBatch();step=null;}
     else{begin({step:"integrate"});integration=integrateCandidate(cwd,job);step=null;if(integration.noChange)state.noChange=integration.noChange;}
@@ -1011,6 +1068,7 @@ export async function runRelease(config, adapter) {
       await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated,...selection([job.plan])})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
       state.phase="integrated";checkpoint();
     }
+    const windowWait=await quietWindow(selected);if(windowWait)return windowWait;
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
     await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
@@ -1344,6 +1402,11 @@ export class HostAdapter {
   // The project handler by the project rule (hub operation "handler"): a
   // finished entry holds no item lease, so role addressing is refused there.
   handler(){const h=JSON.parse(this.command([this.config.tt||"tt","deployment","handler"]));if(!/^agt_[a-f0-9]+$/.test(h?.id||""))throw releaseError("Project database handler required");return h.id;}
+  // The project's release quiet window as the hub reads it now (tt deployment
+  // window): null when none is set, else {open,until,zone,start,end,targets}.
+  // Output of any other shape is unreadable; a failed call throws its own
+  // reason (a transport error after its tries).
+  async releaseWindow(){return parseReleaseWindow(this.command([this.config.tt||"tt","deployment","window"]));}
   async requestBug({commit,outcome}){
     const id=`${this.job.id}-rollback-bug`;
     this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","File a bug for a release that was rolled back","--ask",`Release job ${this.job.id} was rolled back after publication. File a bug linked to item ${this.job.itemId} so the change is fixed before it ships again. The tasks-hub revert ${commit||"was not created"} is ${outcome}; the private host journal has the rest.`,"--request-id",id,"--work-item",this.job.itemId,"--work-item-revision",String(this.job.itemRevision),"--work-order-message",String(this.job.orderMessageSeq),"--ref",`release-job=${this.job.id}`,...(commit?["--ref",`revert-commit=${commit}`]:[])]);
@@ -1903,9 +1966,10 @@ export function heldRestartJob({jobs,details,agent,run,journalDirectory,lock,mat
   }catch{return null;}
 }
 // Journal phases a clean stop may unclaim: the claim waits for the handler's
-// own step (the inputs binding or the integrated matrix import) and has done
-// nothing to the checkout's remote, targets or hub record.
-const UNCLAIM_PHASES=["waiting_inputs","waiting_matrix"];
+// own step (the inputs binding or the integrated matrix import) or for the
+// release quiet window to end, and has done nothing to the checkout's remote,
+// targets or hub record.
+const UNCLAIM_PHASES=["waiting_inputs","waiting_matrix","waiting_window"];
 // The one job a cleanly stopping runner may give back with tt deployment
 // unclaim (wi_27745813129a396b), or null. As heldRestartJob, the ledger's only
 // claimed, merged or blocked job is claimed by this agent and run with no
@@ -2011,7 +2075,7 @@ export function setAsideJournal(journalPath,job){
   if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==r.agentId || prior.runId!==r.runId || !Array.isArray(prior.effects) || prior.effects.length || prior.published===true)return "held";
   renameSync(journalPath,`${journalPath}.${r.disposition==="unclaimed"?"unclaimed":"set-aside"}-g${job.generation}`);return "archived";
 }
-const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integrated verification",waiting_inputs:"is waiting for the handler to bind release inputs",blocked:"is blocked",merged:"is merged and not yet finished",claimed:"is claimed by another deployer run"};
+const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integrated verification",waiting_inputs:"is waiting for the handler to bind release inputs",waiting_window:"is waiting for the release quiet window to end",blocked:"is blocked",merged:"is merged and not yet finished",claimed:"is claimed by another deployer run"};
 // The notice for a job that holds the project fence while a later job waits:
 // null when nothing waits. Only a claim with no effects (unpublished, no
 // receipt, no inputs binding) can be set aside; any other holder keeps the
@@ -2024,14 +2088,15 @@ const FENCE_REASONS={waiting_matrix:"is waiting for the handler to import integr
 // job waiting for its matrix is taken to have such a run. The request id
 // omits generations, which move on each handler import. A holder waiting for the
 // handler's own step (the matrix import or the inputs binding) is routine,
-// since the handler already holds the directed request for it; a blocked or
+// since the handler already holds the directed request for it, and so is one
+// waiting for the release quiet window, which ends by itself; a blocked or
 // merged holder, or one another deployer run claimed, needs attention.
 export function fenceWaitNotice(jobs,holder,reason,locked=false,matrixRun=reason==="waiting_matrix"){
   const waiting=jobs.find(j=>j.id!==holder?.id && j.state==="verified");
   if(!holder || !waiting || !FENCE_REASONS[reason])return null;
   const noEffects=holder.state==="claimed" && holder.published!==true && !holder.receipt && !holder.inputsDigest;
   const advice=!noEffects?"It keeps the fence until handler reconciliation.":matrixRun?"It keeps the fence: its integrated matrix run has not ended and may be using the checkout, so it is not set aside until the run.json of each of its attempts says ended.":locked?"It keeps the fence: the host release lock names its run, so the handler reconciles it with the lock digest after that run stops.":"It has no release effects; the handler can move it aside with tt deployment set-aside so the waiting job claims the fence.";
-  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}${noEffects&&matrixRun?"-matrix":noEffects&&locked?"-locked":""}`,waitingJobId:waiting.id,wake:["waiting_matrix","waiting_inputs"].includes(reason)?WAKE.routine:WAKE.attention,subject:"A release job is waiting behind a held project fence",
+  return {requestId:`${holder.id}-fence-wait-${waiting.id}-${reason}${noEffects&&matrixRun?"-matrix":noEffects&&locked?"-locked":""}`,waitingJobId:waiting.id,wake:["waiting_matrix","waiting_inputs","waiting_window"].includes(reason)?WAKE.routine:WAKE.attention,subject:"A release job is waiting behind a held project fence",
     text:`Release ${holder.id} holds the project release fence and ${FENCE_REASONS[reason]}; release ${waiting.id} is queued behind it. ${advice}`};
 }
 // Whether the host release lock names this job's exact claim. An unreadable
@@ -2301,6 +2366,16 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       catch{process.stderr.write("Matrix host notice not posted; the next poll retries.\n");}
     }
   };
+  // One notice and one terminal line per job the release quiet window holds,
+  // per window end (or read failure) and covered targets, sent in the form of
+  // a CLI failure notice (failureSend, below).
+  const windowNotify=(reader,job,wait)=>{
+    const notice=windowWaitNotice(job,wait);
+    if(!notice || posted.has(notice.requestId))return;
+    if(!posted.has(`said ${notice.requestId}`)){posted.add(`said ${notice.requestId}`);process.stderr.write(wait.until===undefined?"Release waits: the release quiet window could not be read; nothing is bound or published.\n":"Release waits for the release quiet window; nothing is bound or published until it ends.\n");}
+    try{failureSend(say,reader,notice);posted.add(notice.requestId);}
+    catch{process.stderr.write("Release window notice not posted; the next poll retries.\n");}
+  };
   // One notice and one terminal line per code state, loaded and published
   // digest for this process; a failed post is retried by the next poll.
   const codeNotify=(reader,record,kind=record.state)=>{
@@ -2493,12 +2568,14 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       let waiting=jobs;
       if(batch){try{const members=new Set(JSON.parse(readFileSync(join(config.journalDirectory,current.id+".json"),"utf8")).batch?.jobs?.map(j=>j.jobId));waiting=jobs.filter(j=>!members.has(j.id));}catch{}}
       const unreached=adapter.cliFailures.some(f=>f.transport===true);if(unreached)waitOpen=true;
-      if(["waiting_matrix","waiting_inputs"].includes(result?.outcome))notify(reader,waiting,adapter.job||current,result.outcome);
+      if(["waiting_matrix","waiting_inputs","waiting_window"].includes(result?.outcome))notify(reader,waiting,adapter.job||current,result.outcome);
+      if(result?.outcome==="waiting_window")windowNotify(reader,adapter.job||current,result.window);
       // A wait that follows a transport failure, the fence check's included
-      // (waiting_transport); transportTurn below names it once per wait.
-      if(unreached && ["waiting_matrix","waiting_inputs","waiting_transport"].includes(result?.outcome))process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");
+      // (waiting_transport); transportTurn below names it once per wait. The
+      // hub knows no window wait, so the window's is reported as owner_hold.
+      if(unreached && ["waiting_matrix","waiting_inputs","waiting_window","waiting_transport"].includes(result?.outcome))process.stderr.write("Release waits: a hub call failed in transport; the next poll retries.\n");
       matrixNotify(reader,adapter.job||current,adapter);
-      const waits={waiting_matrix:"matrix",waiting_inputs:"inputs",waiting_transport:"transport"};
+      const waits={waiting_matrix:"matrix",waiting_inputs:"inputs",waiting_window:"owner_hold",waiting_transport:"transport"};
       ended={jobId:current.id,...(waits[result?.outcome]?{wait:{kind:waits[result.outcome],...(result.outcome==="waiting_matrix" && adapter.matrixPid?{pid:adapter.matrixPid}:{})}}:{})};
       break;
     }

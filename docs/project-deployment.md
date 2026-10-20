@@ -1029,7 +1029,9 @@ notice adds the time, phase, step, job and wait of the last report.
 
 **A wait is information only.** Each poll's report names the wait the poll
 ended in: `matrix` (with the pid of the run when the runner knows it),
-`inputs`, `host_lock`, `fence`, `owner_hold` or `transport`. The hub decides
+`inputs`, `host_lock`, `fence`, `owner_hold` or `transport`. A job the
+runner check of the release quiet window holds (`waiting_window`) is reported
+as `owner_hold`, since the hub knows no window wait. The hub decides
 nothing by it. A matrix run is a detached process and the runner goes on
 polling every 30 seconds beside it, reporting each time, so a long matrix run
 is never reported. A runner that stops reporting during a matrix run is
@@ -1495,6 +1497,12 @@ The release quiet window is an owner-set daily span of local time, such as
 and enforces it itself, so it does not depend on a handler's turn coming
 before the runner's next poll, and a board message is not a window.
 
+Two checks enforce it, in this order. The hub holds first: it holds and
+refuses to claim the covered jobs it can see (W1-W3 below, with the ledger
+check). The runner checks second, after its target selection, against the
+targets the integrated commit actually deploys (Runner check below), so a
+change the hub cannot see still waits.
+
 ```
 tt deployment window
 env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment window set --zone America/Los_Angeles \
@@ -1586,8 +1594,9 @@ window is open and only for a job whose own paths are uncovered. Its limits:
   only by a config edit is unknown to it, so a job based on that commit is held,
   never passed.
 - A commit pushed to tasks-hub after the job's base that no job or hand release
-  records is not visible to the hub, and the job ships it. Only a runner re-check
-  after its target selection could catch that; it is not built.
+  records is not visible to the hub, so the hub lets the job be claimed. The
+  runner check (below) catches it: the job's selection then includes that
+  commit's targets, and it waits.
 - A published job whose entry never settles holds every such job each night
   until the handler settles it: a supersession citing the hand release, or a
   released retry of the same entry.
@@ -1624,6 +1633,29 @@ ID names only TARGETS` (U2) or `base SHA12 is not a recorded release commit`
 agent, run or named items. The runner treats it like any hold: it passes the
 job over and its poll ends with the wait `owner_hold`, not a failure.
 
+**Runner check (wi_3427bf81094d2225).** On every pass of a claimed job, after
+it selects the job's targets (from each target's last released commit through
+the integrated commit) and after its integrated matrix is imported, and before
+the inputs request binds anything or anything is published, the runner reads
+the window with `tt deployment window`. A target is covered when the window is
+open and names it: exactly the selected targets in the window's `targets`,
+with no service-path rule, so a Mini-only selection under a `tailos` window
+goes on. While any selected target is covered, the job does not go on: its
+journal phase is `waiting_window` with the covered targets and `until`, the
+pass ends, and the next poll checks again. The job keeps its claim and its
+integrated run; nothing is bound, refused, published or deployed. The runner
+posts one notice per job and window end, "A release job waits for the release
+quiet window", naming the covered targets and `until`, and its progress
+report names the wait `owner_hold`. No unhold is needed: the first pass after
+the window ends goes on. A job whose selection is empty (docs or tests only, on
+current baselines) never reads the window and still releases at night. A
+window that cannot be read (a failed call, such as from a `tt` without the
+command, or output of another shape) counts every selected target as covered:
+the job waits as above with the read failure named instead of `until`, and the
+notice needs attention. A pass that read the window closed goes straight on to
+its inputs and publication, seconds later; the window is not read again once
+publication began.
+
 **At the end.** Nothing is released by itself. Window holds stay until the
 handler runs `tt deployment unhold` for each job, which returns it to
 `verified` in its original queue order. While a window is open, `unhold` of a
@@ -1638,8 +1670,11 @@ saved.
 
 **Exceptions.**
 
-- A job claimed before the window opened keeps running, with its batch and its
-  later deployer operations: the window gates claims only, as a hold does.
+- A job claimed before the window opened keeps its claim, its batch and its
+  integrated matrix run, but while the window is open and covers a selected
+  target it waits before its inputs are bound (Runner check above), at every
+  pass, until the window ends. Effects that already began (publication,
+  deploys, live checks, the push and the finish) finish.
 - A job whose latest reconcile record carries a host lock digest (a requeue)
   is never held, because the runner frees that lock only while the job is
   `verified`. Its claim is still refused while the window is open, and it
@@ -2349,7 +2384,8 @@ ID returned to verified at stop; journal archived." The job is `verified` again
 in its queue place and is claimed first by the next run: close the deployer, or
 provision a new run with `tt deployment setup`. The runner unclaims only when
 the ledger's one active job is that claim of its own exact run, its journal is
-of exactly that claim in `waiting_inputs` or `waiting_matrix` with no effects,
+of exactly that claim in `waiting_inputs`, `waiting_matrix` or `waiting_window`
+with no effects,
 never published, sent as merged or part of a batch, no integrated matrix run is
 unsettled, the process has no matrix child and no host release lock exists, and
 the hub accepts the unclaim. Otherwise it prints "Stopped while holding release
