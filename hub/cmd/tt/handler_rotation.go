@@ -232,7 +232,10 @@ type handlerDeathProbe func(ctx context.Context, hub string, a api.Agent) (state
 //
 // A handler whose wrapper reported exited (wi_1d987e7f296b6a2e) keeps its
 // session, because the wrapper leaves a login shell in the pane. For that
-// roster status only, a present session is read further: see idleShell.
+// roster status only, a present session is read further: see idleShell. A
+// lost exit report leaves the roster status unchanged and the session
+// present, so the probe answers alive until the wrapper's retry of that
+// report (exitReporter) reaches the hub (wi_b01a7afa10979dd0).
 type deathProbe struct {
 	receipt  func(hub, agent, run string) (runtimeProcessReceipt, error)
 	sessions func(context.Context) ([]ownedSession, error)

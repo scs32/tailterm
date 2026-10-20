@@ -247,6 +247,12 @@ replaces such a handler automatically, and only when **both** hold:
 2. **The hub has recorded no activity from that exact run for the project's
    silence**, 10 minutes by default.
 
+A busy primary whose runtime exited while its wrapper survived keeps its
+session, so this rule never fires for it. It is covered by
+[a primary whose wrapper reported exited](#a-primary-whose-wrapper-reported-exited)
+once its wrapper's exit report reaches the hub, including through the
+wrapper's [retry of a lost exit report](#a-lost-exit-report).
+
 A busy primary whose process is alive, or whose state cannot be confirmed, is
 never rotated automatically. `tt handler rotate` by hand is unchanged and is
 still refused for a busy primary: the exception exists only for the runner,
@@ -499,6 +505,29 @@ running under it would make step 9 answer alive on every probe, and that
 handler would wait for the owner, as before this change. What a real exited
 handler pane on this project's host holds has not been observed yet.
 
+#### A lost exit report
+
+Bug `wi_b01a7afa10979dd0`, owner order #41362.
+
+The wrapper's first `exited` post can fail, for example while the hub is
+unreachable. When it fails and the wrapper's receipt records the exit, the
+wrapper retries the same `Process exited (N)` post in the background after
+15 seconds, 30 seconds, 1, 2 and 4 minutes, then every 5 minutes, for as long
+as its login shell runs. It posts only while the receipt names this wrapper
+as the pane process and the pane holds just the wrapper and its idle login
+shell, the probe's step 9 rule above (the wrapper's own `ps` is left out of
+the table it reads). So a runtime started again in that shell is never
+reported exited; the retry waits and posts once the shell is idle again. The
+receipt records the outcome: `exitReportedAt` when the hub accepted the
+report, or showed with a 409 that it already holds this run's exit (an
+earlier response was lost), or `exitReportStopped` with the reason when the
+hub refused it for good (a 409 for a closed agent or another run, or any
+other 4xx except 429). A 429, a 5xx, a lost connection or an unreadable
+process table waits for the next attempt. The retry never posts without the
+receipt's `exitedAt`, and the hub is unchanged: the accepted report is an
+ordinary wrapper exit report, so the silence starts at its acceptance, not at
+the exit.
+
 ## Handoff contents
 
 `tt handler rotation get` shows the snapshot saved at commit:
@@ -693,7 +722,10 @@ directory are inert without the new CLI.
 - The handler floor learns of a crash only from an `exited` report. A handler
   that dies without one still counts as available, and no notice is posted. A
   primary that died busy is the exception: it is replaced as a
-  [dead primary](#a-dead-primary).
+  [dead primary](#a-dead-primary) when its session is gone, or as an
+  [exited primary](#a-primary-whose-wrapper-reported-exited) once its
+  wrapper's exit report reaches the hub, if need be through the
+  [retry](#a-lost-exit-report).
 - A dead primary is replaced only from its own host. If that host is down, has
   no saved launch spec, lost the run's process receipt, or finds the PID in
   use by another process, the probe is unknown and the handler waits for the
@@ -717,9 +749,15 @@ directory are inert without the new CLI.
 - An obligation the broker closed is re-issued at commit, ten or more minutes
   later. A sender who re-sent the request in between reaches the successor
   twice. Follow-up filed.
-- An exit report that was lost while the wrapper survived is recovered by
-  neither rule: the hub never marks the handler exited, and its session is
-  present, so the probe answers alive.
+- A [lost exit report](#a-lost-exit-report) is recovered only by the
+  wrapper's retry. Until it reaches the hub, the handler is not exited, its
+  session is present and the probe answers alive. These still wait for the
+  owner: a wrapper killed (SIGKILL, `tmux kill-session`, a host restart)
+  before any post succeeded; a receipt that could not record the exit, or that
+  does not name the wrapper as the pane process or names no login shell
+  (`exitReportStopped`); a hub that refuses the report for good, recorded in
+  `exitReportStopped`; and anything that keeps running under the leftover
+  shell, during which the retry waits.
 - An exited primary that is not busy is not replaced by this rule; see the
   handler floor and follow-up `wi_42be87739d7bbfc9`.
 - The queue's waiting reason for a project whose primary exited is unchanged.
