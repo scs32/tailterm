@@ -1239,7 +1239,7 @@ func newVerificationFixture(t *testing.T) *verificationFixture {
 	matrixWaitHostname = func() (string, error) { return sweepHost, nil }
 	t.Cleanup(func() { matrixWaitHostname = oldHost })
 	f := &verificationFixture{goTrimFixture: g, vroot: filepath.Join(g.root, "vcache"),
-		vsettings: goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: defaultSweepInterval, LowSpaceBytes: defaultSweepLowSpaceGiB << 30},
+		vsettings: goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: defaultSweepInterval, LowSpaceBytes: defaultSweepLowSpaceGiB << 30, MaxBytes: defaultVerificationTrimMaxBytes},
 		env:       verificationGoEnv{GOPATH: filepath.Join(g.home, "go"), GOMODCACHE: g.mod, GOCACHE: g.cache},
 		lock:      filepath.Join(g.root, "matrix", "host.json")}
 	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", f.lock)
@@ -1253,7 +1253,7 @@ func newVerificationFixture(t *testing.T) *verificationFixture {
 	f.deps.verificationSettings = func() (goCacheTrimSettings, string) { return f.vsettings, f.vfault }
 	f.deps.verificationRoot = func() (string, error) { return f.vroot, nil }
 	f.deps.goEnv = func(context.Context) (verificationGoEnv, error) { return f.env, nil }
-	f.deps.matrixBusy = verificationTrimMatrixBusy
+	f.deps.matrixLock = verificationTrimMatrixLock
 	return f
 }
 
@@ -1368,24 +1368,18 @@ func TestGoCacheTrimVerificationAgeAndKept(t *testing.T) {
 	}
 }
 
-// a3, a5: a holder or a waiter skips the pass with the reason, and so does a
-// lock file that cannot be trusted or a refused lock path; a free lock file
-// or an absent one at a set path trims.
+// a3, a5: a lock file that cannot be trusted or a refused lock path skips
+// the pass with the reason and removes nothing; a free lock file or an absent
+// one at a set path trims by the age bound. A holder or waiter no longer
+// skips (TestGoCacheTrimVerificationUnderHeldLock).
 func TestGoCacheTrimVerificationHostLock(t *testing.T) {
 	f := newVerificationFixture(t)
 	old := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 48*time.Hour)
-	worktree := filepath.Join(f.root, "wt")
 	cases := []struct {
 		name  string
 		setup func()
 		want  string
 	}{
-		{"holder", func() {
-			writeMatrixLock(t, sweepHost, []map[string]any{sweepMatrixEntry("h1", worktree, true)}, nil)
-		}, "1 matrix run(s) hold or wait for the host lock"},
-		{"waiter", func() {
-			writeMatrixLock(t, sweepHost, nil, []map[string]any{sweepMatrixEntry("w1", worktree, false)})
-		}, "1 matrix run(s) hold or wait for the host lock"},
 		{"invalid", func() { writeFixtureFile(t, f.lock, "not json") }, "the matrix host lock cannot be read: not a JSON object"},
 		{"another host", func() { writeMatrixLock(t, "other-host", nil, nil) }, "the matrix host lock cannot be read: written by another host"},
 		{"refused default", func() { t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "") }, "the matrix host lock cannot be read: "},
@@ -1393,6 +1387,7 @@ func TestGoCacheTrimVerificationHostLock(t *testing.T) {
 	for _, c := range cases {
 		c.setup()
 		f.now = f.now.Add(2 * time.Hour)
+		before := trimTreeDigest(t, f.vroot)
 		if !f.attempt() {
 			t.Fatalf("%s: no attempt", c.name)
 		}
@@ -1401,6 +1396,9 @@ func TestGoCacheTrimVerificationHostLock(t *testing.T) {
 			t.Fatalf("%s: line %+v", c.name, line)
 		}
 		requireExists(t, old, true)
+		if after := trimTreeDigest(t, f.vroot); after != before {
+			t.Fatalf("%s: the tree changed", c.name)
+		}
 		// A skip is retried after five minutes, not a full interval.
 		f.now = f.now.Add(4 * time.Minute)
 		if f.attempt() {
@@ -1410,8 +1408,12 @@ func TestGoCacheTrimVerificationHostLock(t *testing.T) {
 	}
 	writeMatrixLock(t, sweepHost, nil, nil)
 	f.now = f.now.Add(10 * time.Minute)
-	if !f.attempt() || lastVerificationLine(t).Outcome != "trimmed" {
-		t.Fatalf("free lock: %+v", lastVerificationLine(t))
+	if !f.attempt() {
+		t.Fatal("free lock: no attempt")
+	}
+	if line := lastVerificationLine(t); line.Outcome != "trimmed" || line.Reason != verificationRuleAge || line.Detail != "" ||
+		!strings.Contains(goCacheTrimJournalText(line), " max-age=24h0m0s rule=age-bound") {
+		t.Fatalf("free lock: %+v", line)
 	}
 	requireExists(t, old, false)
 	if err := os.Remove(f.lock); err != nil {
@@ -1419,14 +1421,15 @@ func TestGoCacheTrimVerificationHostLock(t *testing.T) {
 	}
 	again := f.ventry("aa/"+strings.Repeat("2", 64)+"-a", 10, 48*time.Hour)
 	f.now = f.now.Add(2 * time.Hour)
-	if !f.attempt() || lastVerificationLine(t).Outcome != "trimmed" {
+	if !f.attempt() || lastVerificationLine(t).Outcome != "trimmed" || lastVerificationLine(t).Reason != verificationRuleAge {
 		t.Fatalf("absent lock: %+v", lastVerificationLine(t))
 	}
 	requireExists(t, again, false)
 }
 
-// a3: a run that registers mid-pass stops the walk before the next two-hex
-// directory.
+// a1, a5: a run that registers mid-pass no longer stops the walk, and the
+// line names the lock-time rule; a lock that turns unreadable mid-pass stops
+// it before the next two-hex directory.
 func TestGoCacheTrimVerificationStopsForANewRun(t *testing.T) {
 	f := newVerificationFixture(t)
 	first := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 10, 48*time.Hour)
@@ -1440,8 +1443,27 @@ func TestGoCacheTrimVerificationStopsForANewRun(t *testing.T) {
 		t.Fatal("no attempt")
 	}
 	requireExists(t, first, false)
-	requireExists(t, second, true)
-	if line := lastVerificationLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 1 || line.Detail != "stopped early: 1 matrix run(s) hold or wait for the host lock" {
+	requireExists(t, second, false)
+	if line := lastVerificationLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 2 || line.Reason != verificationRuleLockAge || line.Detail != "" {
+		t.Fatalf("line %+v", line)
+	}
+	// A lock that cannot be read mid-pass stops the walk.
+	third := f.ventry("aa/"+strings.Repeat("3", 64)+"-a", 10, 48*time.Hour)
+	fourth := f.ventry("ab/"+strings.Repeat("4", 64)+"-a", 10, 48*time.Hour)
+	writeMatrixLock(t, sweepHost, nil, nil)
+	setTrimHooks(t, func(name string) {
+		if name == "aa" {
+			writeFixtureFile(t, f.lock, "not json")
+		}
+	}, nil)
+	f.now = f.now.Add(2 * time.Hour)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, third, false)
+	requireExists(t, fourth, true)
+	if line := lastVerificationLine(t); line.Outcome != "trimmed" || *line.FilesRemoved != 1 || line.Reason != verificationRuleAge ||
+		line.Detail != "stopped early: the matrix host lock cannot be read: not a JSON object" {
 		t.Fatalf("line %+v", line)
 	}
 }
@@ -1544,9 +1566,9 @@ func TestGoCacheTrimVerificationRefusals(t *testing.T) {
 	}
 }
 
-// a1, a5: the switch and the age come from relay.json at every attempt: on by
-// default, off stops it with no line, a bad switch is a fault, and the age
-// has a 2h floor.
+// a1, a5: the switch, the age and the cap come from relay.json at every
+// attempt: on by default, off stops it with no line, a bad switch is a fault,
+// the age has a 2h floor and the cap defaults to 20 GiB.
 func TestGoCacheTrimVerificationSettings(t *testing.T) {
 	f := newVerificationFixture(t)
 	f.deps.verificationSettings = readVerificationTrimSettings
@@ -1586,6 +1608,43 @@ func TestGoCacheTrimVerificationSettings(t *testing.T) {
 	requireExists(t, old, false)
 	if settings, fault := readVerificationTrimSettings(); fault != "" || !settings.On || settings.Interval != defaultSweepInterval {
 		t.Fatalf("settings %+v %q", settings, fault)
+	}
+	// The cap is 20 GiB unless verificationCacheTrimMaxGiB says otherwise; a
+	// bad value says so once and uses 20 GiB.
+	sweepSettingsWarned.Clear()
+	t.Cleanup(sweepSettingsWarned.Clear)
+	read := func(content string) goCacheTrimSettings {
+		t.Helper()
+		writeRelaySettings(t, f.home, content)
+		settings, fault := readVerificationTrimSettings()
+		if fault != "" {
+			t.Fatalf("%s: fault %q", content, fault)
+		}
+		return settings
+	}
+	if got := read(`{}`).MaxBytes; got != 20<<30 {
+		t.Fatalf("default cap %d", got)
+	}
+	if got := read(`{"verificationCacheTrimMaxGiB":15}`).MaxBytes; got != 15<<30 {
+		t.Fatalf("15 GiB cap %d", got)
+	}
+	if got := read(`{"verificationCacheTrimMaxGiB":2.5}`).MaxBytes; got != 5<<29 {
+		t.Fatalf("2.5 GiB cap %d", got)
+	}
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	var bad []int64
+	for _, content := range []string{`{"verificationCacheTrimMaxGiB":"20"}`, `{"verificationCacheTrimMaxGiB":0}`, `{"verificationCacheTrimMaxGiB":-1}`, `{"verificationCacheTrimMaxGiB":2000000}`, `{"verificationCacheTrimMaxGiB":0}`} {
+		bad = append(bad, read(content).MaxBytes)
+	}
+	restore()
+	for _, got := range bad {
+		if got != 20<<30 {
+			t.Fatalf("bad values gave caps %v", bad)
+		}
+	}
+	if strings.Count(stderr.String(), "verificationCacheTrimMaxGiB=0 is not usable; using 20.0 GiB") != 1 || strings.Count(stderr.String(), "verificationCacheTrimMaxGiB=") != 4 {
+		t.Fatalf("bad values said %q", stderr.String())
 	}
 }
 
@@ -1649,5 +1708,220 @@ func TestGoCacheTrimVerificationRelayWiring(t *testing.T) {
 	}
 	if !strings.Contains(out, "verification-cache-trim root="+f.vroot+" trimmed files=1 freed=10 B") {
 		t.Fatalf("--journal printed:\n%s", out)
+	}
+}
+
+// a1, a5 (t1, t4): with a holder, and with a waiter, entries past the age
+// bound go and the line names lock-time-age; a younger entry, a build
+// directory under construction and everything outside the two-hex
+// directories stay; at the 2h floor a 1h entry stays and a 3h one goes.
+func TestGoCacheTrimVerificationUnderHeldLock(t *testing.T) {
+	for _, holder := range []bool{true, false} {
+		f := newVerificationFixture(t)
+		entry := sweepMatrixEntry("r1", filepath.Join(f.root, "wt"), holder)
+		if holder {
+			writeMatrixLock(t, sweepHost, []map[string]any{entry}, nil)
+		} else {
+			writeMatrixLock(t, sweepHost, nil, []map[string]any{entry})
+		}
+		old1 := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 100, 25*time.Hour)
+		old2 := f.ventry("ab/"+strings.Repeat("2", 64)+"-d", 250, 30*24*time.Hour)
+		young := f.ventry("aa/"+strings.Repeat("3", 64)+"-d", 40, 23*time.Hour)
+		// A peer's build directory under construction, old by the clock.
+		building := filepath.Join(f.vroot, "build", "go1.27.0-darwin-arm64.tmp")
+		writeGoCacheReadme(t, building)
+		inBuilding := f.file(filepath.Join(building, "aa", strings.Repeat("5", 64)+"-a"), 10, 30*24*time.Hour)
+		kept := f.kept()
+		if !f.attempt() {
+			t.Fatalf("holder=%v: no attempt", holder)
+		}
+		requireExists(t, old1, false)
+		requireExists(t, old2, false)
+		requireExists(t, young, true)
+		requireExists(t, inBuilding, true)
+		if got := f.kept(); got != kept {
+			t.Fatalf("holder=%v: the trim changed what it keeps:\n%s\nwant\n%s", holder, got, kept)
+		}
+		line := lastVerificationLine(t)
+		if line.Outcome != "trimmed" || line.Reason != verificationRuleLockAge || *line.FilesRemoved != 2 || line.BytesFreed != 350 || *line.CacheBytesAfter != 40 ||
+			line.Detail != "trimmed while 1 matrix run(s) hold or wait for the host lock" {
+			t.Fatalf("holder=%v: line %+v", holder, line)
+		}
+		if text := goCacheTrimJournalText(line); !strings.Contains(text, " trimmed files=2 freed=350 B cache=40 B free=100.0 GiB max-age=24h0m0s rule=lock-time-age; trimmed while 1 matrix run(s)") {
+			t.Fatalf("holder=%v: --journal text %q", holder, text)
+		}
+		// An age-only run keeps the notice's wording.
+		state, _ := loadSweepState()
+		if got := goCacheTrimNoticeSentence(state.GoCacheTrim); !strings.HasSuffix(got, " Verification cache trim: last run "+
+			f.now.UTC().Format(time.RFC3339)+" removed 2 entries older than 24h0m0s and freed 350 B; its build directories now hold 40 B.") {
+			t.Fatalf("holder=%v: sentence %q", holder, got)
+		}
+		// The 2h floor holds under the lock.
+		f.vsettings.MaxAge = minGoCacheTrimMaxAge
+		f.now = f.now.Add(2 * time.Hour)
+		hour := f.ventry("ac/"+strings.Repeat("6", 64)+"-a", 10, time.Hour)
+		three := f.ventry("ac/"+strings.Repeat("7", 64)+"-d", 10, 3*time.Hour)
+		if !f.attempt() {
+			t.Fatalf("holder=%v: no attempt at the floor", holder)
+		}
+		requireExists(t, hour, true)
+		requireExists(t, three, false)
+		requireExists(t, inBuilding, true)
+		if line := lastVerificationLine(t); line.Outcome != "trimmed" || line.Reason != verificationRuleLockAge || line.MaxAge != "2h0m0s" {
+			t.Fatalf("holder=%v: floor line %+v", holder, line)
+		}
+	}
+}
+
+// a2, a5 (t2, t4): above the cap the oldest entries go first until the build
+// directories fit; entries under 2h are never removed, so the cap may stay
+// unreached; an entry a build refreshed since the walk is kept; with a holder
+// the age and cap rules combine.
+func TestGoCacheTrimVerificationSizeCap(t *testing.T) {
+	f := newVerificationFixture(t)
+	f.vsettings.MaxBytes = 1000
+	e1 := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 300, 20*time.Hour)
+	e2 := f.ventry("ab/"+strings.Repeat("2", 64)+"-a", 300, 18*time.Hour)
+	e3 := f.ventry("ac/"+strings.Repeat("3", 64)+"-d", 300, 10*time.Hour)
+	e4 := f.ventry("ad/"+strings.Repeat("4", 64)+"-a", 300, 3*time.Hour)
+	e5 := f.ventry("ae/"+strings.Repeat("5", 64)+"-a", 300, time.Hour)
+	other := f.ventry("aa/notanentry", 7, 30*24*time.Hour)
+	kept := f.kept()
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, e1, false)
+	requireExists(t, e2, false)
+	for _, path := range []string{e3, e4, e5, other} {
+		requireExists(t, path, true)
+	}
+	if got := f.kept(); got != kept {
+		t.Fatalf("the cap changed what it keeps:\n%s\nwant\n%s", got, kept)
+	}
+	line := lastVerificationLine(t)
+	if line.Outcome != "trimmed" || line.Reason != verificationRuleSizeCap || *line.FilesRemoved != 2 || line.BytesFreed != 600 || *line.CacheBytesAfter != 907 ||
+		line.Detail != "size cap 1000 B: removed 2 entries, freed 600 B" || line.LowSpace {
+		t.Fatalf("line %+v", line)
+	}
+	if text := goCacheTrimJournalText(line); !strings.Contains(text, " rule=size-cap; size cap 1000 B: removed 2 entries") {
+		t.Fatalf("--journal text %q", text)
+	}
+	state, _ := loadSweepState()
+	if got := goCacheTrimNoticeSentence(state.GoCacheTrim); !strings.HasSuffix(got, " Verification cache trim: last run "+
+		f.now.UTC().Format(time.RFC3339)+" removed 2 entries (size-cap; age bound 24h0m0s, size cap 1000 B) and freed 600 B; its build directories now hold 907 B.") {
+		t.Fatalf("sentence %q", got)
+	}
+
+	// Only entries under 2h are left above the cap: it stops there.
+	f.vsettings.MaxBytes = 500
+	f.now = f.now.Add(2 * time.Hour)
+	y1 := f.ventry("ba/"+strings.Repeat("6", 64)+"-a", 300, 90*time.Minute)
+	y2 := f.ventry("bb/"+strings.Repeat("7", 64)+"-a", 300, time.Hour)
+	y3 := f.ventry("bc/"+strings.Repeat("8", 64)+"-a", 300, 30*time.Minute)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	for _, path := range []string{e3, e4, e5} {
+		requireExists(t, path, false)
+	}
+	for _, path := range []string{y1, y2, y3} {
+		requireExists(t, path, true)
+	}
+	if line := lastVerificationLine(t); line.Reason != verificationRuleSizeCap || *line.FilesRemoved != 3 || *line.CacheBytesAfter != 907 ||
+		line.Detail != "size cap 500 B: removed 3 entries, freed 900 B; size cap 500 B not reached: the rest is under 2h" {
+		t.Fatalf("not reached: %+v", line)
+	}
+
+	// A build refreshes y2 while the cap removes y1: y2 is kept and y3 goes.
+	f.vsettings.MaxBytes = 307
+	f.now = f.now.Add(2 * time.Hour)
+	setTrimHooks(t, nil, func(dir, name string) {
+		if name == filepath.Base(y1) {
+			if err := os.Chtimes(y2, f.now, f.now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	setTrimHooks(t, nil, nil)
+	requireExists(t, y1, false)
+	requireExists(t, y2, true)
+	requireExists(t, y3, false)
+	if line := lastVerificationLine(t); line.Reason != verificationRuleSizeCap || *line.FilesRemoved != 2 || *line.CacheBytesAfter != 307 || strings.Contains(line.Detail, "not reached") {
+		t.Fatalf("refreshed: %+v", line)
+	}
+
+	// With a holder in the lock: an entry past the age bound goes by age,
+	// then the cap removes the oldest of the rest.
+	writeMatrixLock(t, sweepHost, []map[string]any{sweepMatrixEntry("h1", filepath.Join(f.root, "wt"), true)}, nil)
+	f.vsettings.MaxBytes = 500
+	f.now = f.now.Add(2 * time.Hour)
+	aged := f.ventry("ca/"+strings.Repeat("9", 64)+"-a", 100, 30*time.Hour)
+	c1 := f.ventry("cb/"+strings.Repeat("a", 64)+"-a", 300, 5*time.Hour)
+	c2 := f.ventry("cc/"+strings.Repeat("b", 64)+"-a", 300, 4*time.Hour)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, aged, false)
+	requireExists(t, c1, false)
+	requireExists(t, c2, false)
+	requireExists(t, y2, true)
+	line = lastVerificationLine(t)
+	if line.Reason != verificationRuleLockAge+"+"+verificationRuleSizeCap || *line.FilesRemoved != 3 || *line.CacheBytesAfter != 307 ||
+		line.Detail != "size cap 500 B: removed 2 entries, freed 600 B; trimmed while 1 matrix run(s) hold or wait for the host lock" {
+		t.Fatalf("held: %+v", line)
+	}
+	if text := goCacheTrimJournalText(line); !strings.Contains(text, " rule=lock-time-age+size-cap; ") {
+		t.Fatalf("--journal text %q", text)
+	}
+	state, _ = loadSweepState()
+	if got := goCacheTrimNoticeSentence(state.GoCacheTrim); !strings.Contains(got, " removed 3 entries (lock-time-age+size-cap; age bound 24h0m0s, size cap 500 B) and freed 700 B;") {
+		t.Fatalf("sentence %q", got)
+	}
+}
+
+// a3, a5 (t2, t3, t4): with free space under the sweep's threshold the cap
+// removes oldest first to the cap under the low-space rule, never an entry
+// under 2h; with free space above it the same cap is size-cap.
+func TestGoCacheTrimVerificationLowSpace(t *testing.T) {
+	f := newVerificationFixture(t)
+	f.free = 1 << 30
+	f.vsettings.MaxBytes = 200
+	e1 := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 300, 20*time.Hour)
+	e2 := f.ventry("ab/"+strings.Repeat("2", 64)+"-a", 300, 10*time.Hour)
+	e3 := f.ventry("ac/"+strings.Repeat("3", 64)+"-a", 300, 3*time.Hour)
+	young := f.ventry("ad/"+strings.Repeat("4", 64)+"-a", 300, time.Hour)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, e1, false)
+	requireExists(t, e2, false)
+	requireExists(t, e3, false)
+	requireExists(t, young, true)
+	line := lastVerificationLine(t)
+	if line.Reason != verificationRuleLowSpace || *line.FilesRemoved != 3 || *line.CacheBytesAfter != 300 || !line.LowSpace ||
+		line.Detail != "size cap 200 B: removed 3 entries, freed 900 B; size cap 200 B not reached: the rest is under 2h" {
+		t.Fatalf("low space: %+v", line)
+	}
+	if text := goCacheTrimJournalText(line); !strings.Contains(text, " rule=low-space; ") || !strings.HasSuffix(text, "; low space") {
+		t.Fatalf("--journal text %q", text)
+	}
+	state, _ := loadSweepState()
+	if got := goCacheTrimNoticeSentence(state.GoCacheTrim); !strings.Contains(got, " removed 3 entries (low-space; age bound 24h0m0s, size cap 200 B) and freed 900 B;") {
+		t.Fatalf("sentence %q", got)
+	}
+	// Free space above the threshold: the same cap is size-cap.
+	f.free = 100 << 30
+	f.now = f.now.Add(2 * time.Hour)
+	z := f.ventry("ae/"+strings.Repeat("5", 64)+"-a", 300, 10*time.Hour)
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, z, false)
+	requireExists(t, young, false)
+	if line := lastVerificationLine(t); line.Reason != verificationRuleSizeCap || *line.FilesRemoved != 2 || *line.CacheBytesAfter != 0 || line.LowSpace {
+		t.Fatalf("enough space: %+v", line)
 	}
 }

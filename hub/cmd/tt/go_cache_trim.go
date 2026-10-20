@@ -32,8 +32,13 @@ import (
 // docs/objective-verification.md) with the same entry rules. It is on unless
 // the owner turns it off, since that root belongs to the harness, not the
 // user, and Go's own five-day trim let it reach 51 GB (wi_dad4e23eb9f43ae1).
-// It trims only while no matrix run holds or waits for the host lock, and
-// only a root and build directories the runner itself would use.
+// It trims while matrix runs hold or wait for the host lock, since it removes
+// only entries no build has used for at least two hours (see
+// trimVerificationBuildDirs), but not while the lock cannot be read or
+// trusted; and only a root and build directories the runner itself would use.
+// Above a size cap it also removes the oldest entries older than two hours
+// until the build directories fit, and the journal line's reason names the
+// rules that removed entries.
 
 const (
 	defaultGoCacheTrimMaxAge = 24 * time.Hour
@@ -43,6 +48,13 @@ const (
 	// owner's one-day cleanup on 10-17 freed 17 GiB of the 51 GB that Go's
 	// five-day trim had kept.
 	defaultVerificationTrimMaxAge = 24 * time.Hour
+	// defaultVerificationTrimMaxBytes caps the verification build
+	// directories. On 10-18, a quiet day, they held 15.2-15.4 GiB after each
+	// age trim; on 10-19, a busy one, 22.2-23.5 GiB, and they reached 29 GiB in
+	// three hours of skipped passes. 20 GiB leaves a quiet day alone and keeps
+	// about the newest 20 hours of a busy one, everything under 12 hours with
+	// room to spare.
+	defaultVerificationTrimMaxBytes = 20 << 30
 	// minGoCacheTrimMaxAge is the least age: go refreshes an entry's mtime
 	// only when it is more than an hour old.
 	minGoCacheTrimMaxAge = 2 * time.Hour
@@ -64,11 +76,26 @@ const (
 	goCacheTrimSkipNoRoot = "no-root"
 )
 
+// The rules that remove verification cache entries, as a trimmed line's
+// reason names them, joined by "+" in this order. The age walk is age-bound,
+// or lock-time-age when a read of the host lock before or during it showed a
+// holder or waiter; the cap is size-cap, or low-space when the volume's free
+// space was under the sweep's threshold as the cap began.
+const (
+	verificationRuleAge      = "age-bound"
+	verificationRuleLockAge  = "lock-time-age"
+	verificationRuleSizeCap  = "size-cap"
+	verificationRuleLowSpace = "low-space"
+)
+
 type goCacheTrimSettings struct {
 	On            bool
 	MaxAge        time.Duration
 	Interval      time.Duration
 	LowSpaceBytes int64
+	// MaxBytes is the verification trim's size cap; 0 is none. The user
+	// trim has none.
+	MaxBytes int64
 }
 
 // readGoCacheTrimSettings reads the three goBuildCacheTrim keys from
@@ -126,16 +153,18 @@ func relayDuration(config map[string]json.RawMessage, key string, into *time.Dur
 	*into = d
 }
 
-// readVerificationTrimSettings reads the two verificationCacheTrim keys from
+// readVerificationTrimSettings reads the three verificationCacheTrim keys from
 // relay.json. The trim is on unless verificationCacheTrim is "off". A file
 // that exists but cannot be read or parsed, or a switch that is neither "on"
 // nor "off", is a fault and the run is skipped, since an owner's "off" cannot
 // be read from it. A bad age uses the default and one under 2h uses 2h, as
-// for goBuildCacheTrimMaxAge. The interval and the low-space threshold are
-// the sweep's, so the trim runs once per scheduled sweep pass.
+// for goBuildCacheTrimMaxAge. verificationCacheTrimMaxGiB is a number of GiB
+// read as worktreeSweepLowSpaceGiB is: a bad one uses 20 GiB and says so once
+// on stderr. The interval and the low-space threshold are the sweep's, so the
+// trim runs once per scheduled sweep pass.
 func readVerificationTrimSettings() (goCacheTrimSettings, string) {
 	sweep, _ := readSweepSettings()
-	settings := goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: sweep.Interval, LowSpaceBytes: sweep.LowSpaceBytes}
+	settings := goCacheTrimSettings{On: true, MaxAge: defaultVerificationTrimMaxAge, Interval: sweep.Interval, LowSpaceBytes: sweep.LowSpaceBytes, MaxBytes: defaultVerificationTrimMaxBytes}
 	config, fault := readRelayConfig()
 	if fault != "" {
 		return settings, fault
@@ -148,6 +177,14 @@ func readVerificationTrimSettings() (goCacheTrimSettings, string) {
 		settings.On = value == "on"
 	}
 	relayDuration(config, "verificationCacheTrimMaxAge", &settings.MaxAge, minGoCacheTrimMaxAge)
+	if raw, ok := config["verificationCacheTrimMaxGiB"]; ok {
+		var value float64
+		if json.Unmarshal(raw, &value) != nil || !(value > 0) || value > 1<<20 {
+			sweepSettingsWarn("verificationCacheTrimMaxGiB", string(raw), humanBytes(defaultVerificationTrimMaxBytes))
+		} else {
+			settings.MaxBytes = int64(value * (1 << 30))
+		}
+	}
 	return settings, ""
 }
 
@@ -162,6 +199,10 @@ type goCacheTrimState struct {
 	BytesFreed      int64     `json:"bytesFreed"`
 	CacheBytesAfter int64     `json:"cacheBytesAfter"`
 	MaxAge          string    `json:"maxAge,omitempty"`
+	// Rule is the verification trim's journal reason, and MaxBytes its cap,
+	// for the notice.
+	Rule     string `json:"rule,omitempty"`
+	MaxBytes int64  `json:"maxBytes,omitempty"`
 	// CacheDir is the build cache the last trimmed run validated; the sweep
 	// reads its volume for the low-space notice. On Verification it is the
 	// verification cache root.
@@ -197,8 +238,12 @@ func goCacheTrimNoticeSentence(state *goCacheTrimState) string {
 	if v == nil || v.LastRunAt.IsZero() {
 		return user + " The verification cache trim is off or has not trimmed on this host."
 	}
-	return user + fmt.Sprintf(" Verification cache trim: last run %s removed %d entries older than %s and freed %s; its build directories now hold %s.",
-		v.LastRunAt.UTC().Format(time.RFC3339), v.FilesRemoved, v.MaxAge, humanBytes(v.BytesFreed), humanBytes(v.CacheBytesAfter))
+	removed := "older than " + v.MaxAge
+	if strings.Contains(v.Rule, verificationRuleSizeCap) || strings.Contains(v.Rule, verificationRuleLowSpace) {
+		removed = fmt.Sprintf("(%s; age bound %s, size cap %s)", v.Rule, v.MaxAge, humanBytes(v.MaxBytes))
+	}
+	return user + fmt.Sprintf(" Verification cache trim: last run %s removed %d entries %s and freed %s; its build directories now hold %s.",
+		v.LastRunAt.UTC().Format(time.RFC3339), v.FilesRemoved, removed, humanBytes(v.BytesFreed), humanBytes(v.CacheBytesAfter))
 }
 
 // verificationTrimLabel names a verification cache trim line in `--journal`.
@@ -236,6 +281,9 @@ func goCacheTrimJournalText(l sweepJournalLine) string {
 		free = humanBytes(l.FreeBytesAfter)
 	}
 	text := fmt.Sprintf("%s %s trimmed files=%d freed=%s cache=%s free=%s max-age=%s", l.At, label, files, humanBytes(l.BytesFreed), humanBytes(cache), free, l.MaxAge)
+	if l.Reason != "" {
+		text += " rule=" + l.Reason
+	}
 	if l.Detail != "" {
 		text += "; " + l.Detail
 	}
@@ -436,12 +484,22 @@ func (r *goCacheTrimResult) fail(what string, err error) {
 // one swapped for an empty directory loses that empty directory. No regular
 // file other than an old entry and no directory with anything in it can go.
 func trimGoBuildCache(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time) goCacheTrimResult {
-	return trimGoBuildCacheUntil(ctx, cache, maxAge, now, nil)
+	return trimGoBuildCacheUntil(ctx, cache, maxAge, now, nil, nil)
+}
+
+// goCacheKeptEntry is an entry the age walk kept that the size cap may
+// remove: its two-hex directory, name, size and mtime at the walk's look.
+type goCacheKeptEntry struct {
+	dir, name string
+	size      int64
+	mtime     time.Time
 }
 
 // trimGoBuildCacheUntil is trimGoBuildCache that also asks stop, when set,
-// before each two-hex directory: a reason ends the walk there.
-func trimGoBuildCacheUntil(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time, stop func() string) goCacheTrimResult {
+// before each two-hex directory: a reason ends the walk there. keep, when set,
+// is given every entry the walk keeps that is older than
+// minGoCacheTrimMaxAge.
+func trimGoBuildCacheUntil(ctx context.Context, cache *goCacheHandle, maxAge time.Duration, now time.Time, stop func() string, keep func(goCacheKeptEntry)) goCacheTrimResult {
 	var res goCacheTrimResult
 	names, err := rootNames(cache.root)
 	if err != nil {
@@ -474,13 +532,13 @@ func trimGoBuildCacheUntil(ctx context.Context, cache *goCacheHandle, maxAge tim
 			// A symlink, a file, or a name that has gone is not a cache directory.
 			continue
 		}
-		trimGoCacheDirectory(sub, name, maxAge, now, &res)
+		trimGoCacheDirectory(sub, name, maxAge, now, &res, keep)
 		_ = sub.Close()
 	}
 	return res
 }
 
-func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now time.Time, res *goCacheTrimResult) {
+func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now time.Time, res *goCacheTrimResult, keep func(goCacheKeptEntry)) {
 	names, err := rootNames(sub)
 	if err != nil {
 		res.fail(dir, err)
@@ -502,11 +560,20 @@ func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now ti
 			return info.Mode().IsRegular()
 		}
 		old := func() bool { return now.Sub(mtime) > maxAge }
+		kept := func() {
+			if keep != nil && now.Sub(mtime) > minGoCacheTrimMaxAge {
+				keep(goCacheKeptEntry{dir: dir, name: name, size: size, mtime: mtime})
+			}
+		}
 		if !look() {
 			continue
 		}
-		if !(strings.HasSuffix(name, "-a") || strings.HasSuffix(name, "-d")) || !old() {
+		entry := strings.HasSuffix(name, "-a") || strings.HasSuffix(name, "-d")
+		if !entry || !old() {
 			res.CacheBytesAfter += size
+			if entry {
+				kept()
+			}
 			continue
 		}
 		// A second look just before the removal: a build may have used the
@@ -516,6 +583,7 @@ func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now ti
 		}
 		if !old() {
 			res.CacheBytesAfter += size
+			kept()
 			continue
 		}
 		if hook := goCacheTrimBeforeUnlink; hook != nil {
@@ -555,8 +623,9 @@ type goCacheTrimDeps struct {
 	// goEnv is go env's GOPATH, GOMODCACHE and GOCACHE, which the root must
 	// not overlap.
 	goEnv func(ctx context.Context) (verificationGoEnv, error)
-	// matrixBusy is why the host lock forbids a trim now, or "".
-	matrixBusy func() string
+	// matrixLock reads the host lock: the matrix runs that hold or wait for
+	// it, or why it cannot be read or trusted, which forbids a trim.
+	matrixLock func() (runs int, unreadable string)
 }
 
 // nativeGoCacheDir asks go for the build cache and the module cache. There is
@@ -589,7 +658,7 @@ func nativeGoCacheTrimDeps() goCacheTrimDeps {
 		verificationSettings: readVerificationTrimSettings,
 		verificationRoot:     func() (string, error) { return nativeVerificationCacheRoot() },
 		goEnv:                func(ctx context.Context) (verificationGoEnv, error) { return nativeVerificationGoEnv(ctx) },
-		matrixBusy:           verificationTrimMatrixBusy,
+		matrixLock:           verificationTrimMatrixLock,
 	}
 }
 
@@ -802,17 +871,17 @@ var (
 	}
 )
 
-// verificationTrimMatrixBusy reads this host's matrix lock as the sweep does
-// (loadMatrixExclusion): any holder or waiter forbids a trim, and so does a
-// lock path that is refused or a file that cannot be read or trusted. Only a
-// valid file with neither, or an absent file at a resolved path, is a free
-// host.
-func verificationTrimMatrixBusy() string {
+// verificationTrimMatrixLock reads this host's matrix lock as the sweep does
+// (loadMatrixExclusion) and returns its holders and waiters. A lock path that
+// is refused or a file that cannot be read or trusted forbids a trim, since
+// the runs it would name are unknown. Only a valid file, or an absent file at
+// a resolved path, gives a count; holders and waiters do not stop the trim.
+func verificationTrimMatrixLock() (int, string) {
 	m, why := loadMatrixExclusion()
 	if m == nil {
-		return "the matrix host lock cannot be read: " + why
+		return 0, "the matrix host lock cannot be read: " + why
 	}
-	return matrixEntriesBusy(len(m.entries))
+	return len(m.entries), ""
 }
 
 func matrixEntriesBusy(n int) string {
@@ -965,15 +1034,81 @@ func openVerificationBuildDir(build *os.Root, path, name, modCache string) (*goC
 	return cache, ""
 }
 
+// verificationTrimPass is one attempt's trim of the build directories: its
+// settings, clock and lock and free-space readings, and what it saw and did.
+type verificationTrimPass struct {
+	settings goCacheTrimSettings
+	now      time.Time
+	lock     func() (int, string)
+	free     func() (int64, error)
+	// lockHeld is set by any read of the lock that showed a holder or waiter;
+	// ageLockHeld is its value when the age walk ended.
+	lockHeld, ageLockHeld bool
+	ageRemoved            int64
+	capRemoved, capFreed  int64
+	// lowSpace is set when the volume was under the sweep's threshold as the
+	// cap began.
+	lowSpace bool
+}
+
+// stop reads the lock again: only a lock that cannot be read or trusted ends
+// the walk.
+func (p *verificationTrimPass) stop() string {
+	runs, unreadable := p.lock()
+	if unreadable != "" {
+		return unreadable
+	}
+	if runs > 0 {
+		p.lockHeld = true
+	}
+	return ""
+}
+
+// rules is the trimmed line's reason: the rules that removed at least one
+// entry, or "".
+func (p *verificationTrimPass) rules() string {
+	var rules []string
+	if p.ageRemoved > 0 {
+		if p.ageLockHeld {
+			rules = append(rules, verificationRuleLockAge)
+		} else {
+			rules = append(rules, verificationRuleAge)
+		}
+	}
+	if p.capRemoved > 0 {
+		if p.lowSpace {
+			rules = append(rules, verificationRuleLowSpace)
+		} else {
+			rules = append(rules, verificationRuleSizeCap)
+		}
+	}
+	return strings.Join(rules, "+")
+}
+
+// verificationCapCandidate is an entry the age walk kept in one build
+// directory that the size cap may remove.
+type verificationCapCandidate struct {
+	build string
+	goCacheKeptEntry
+}
+
 // trimVerificationBuildDirs trims every build directory the runner would use
-// under the opened root. Before each two-hex directory it reads the host lock
-// again and stops at a holder or waiter.
+// under the opened root by age, then, while the build directories hold more
+// than the cap, removes the oldest entries older than minGoCacheTrimMaxAge.
+// Before each two-hex directory, and every 256 removals by the cap, it reads
+// the host lock again and stops at a lock that cannot be read or trusted.
 //
-// A run that registers after that read finds at most one two-hex directory
-// still being trimmed: only entries untouched for the age go, and go takes an
-// entry that has gone as a miss and rebuilds it, so the run's checks are slower
-// at worst and never wrong.
-func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoot, modCache string, maxAge time.Duration, now time.Time, busy func() string) (goCacheTrimResult, []string) {
+// It runs while matrix runs hold or wait for the lock. An entry goes only when
+// two no-follow looks, the second just before the removal, see a regular -a or
+// -d file older than the age bound or, for the cap, than minGoCacheTrimMaxAge:
+// at least two hours either way. go writes a new entry with mtime now and
+// refreshes a used entry's mtime once it is an hour old, so such an entry has
+// not been used by any build for at least an hour. go takes an entry that has
+// gone, or an action entry whose output has gone, as a miss and rebuilds it,
+// so a concurrent run's checks are slower at worst and never wrong; and
+// unlinking a file a build has open does not disturb that read. A build
+// directory under construction (a name ending .tmp) is never opened.
+func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoot, modCache string, p *verificationTrimPass) (goCacheTrimResult, []string) {
 	var res goCacheTrimResult
 	build, err := openGoCacheDirectory(root.root, "build")
 	if err != nil {
@@ -989,6 +1124,14 @@ func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoo
 		res.WalkError = "build: " + err.Error()
 		return res, nil
 	}
+	// The trimmed build directories stay open for the cap.
+	opened := map[string]*goCacheHandle{}
+	defer func() {
+		for _, cache := range opened {
+			cache.close()
+		}
+	}()
+	var candidates []verificationCapCandidate
 	var skipped []string
 	for _, name := range names {
 		// A peer's directory under construction.
@@ -1005,8 +1148,10 @@ func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoo
 			skipped = append(skipped, name+" ("+why+")")
 			continue
 		}
-		r := trimGoBuildCacheUntil(ctx, cache, maxAge, now, busy)
-		cache.close()
+		opened[name] = cache
+		r := trimGoBuildCacheUntil(ctx, cache, p.settings.MaxAge, p.now, p.stop, func(e goCacheKeptEntry) {
+			candidates = append(candidates, verificationCapCandidate{build: name, goCacheKeptEntry: e})
+		})
 		res.FilesRemoved += r.FilesRemoved
 		res.BytesFreed += r.BytesFreed
 		res.CacheBytesAfter += r.CacheBytesAfter
@@ -1022,11 +1167,111 @@ func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoo
 			break
 		}
 	}
+	p.ageRemoved, p.ageLockHeld = res.FilesRemoved, p.lockHeld
 	var notes []string
 	if len(skipped) > 0 {
 		notes = append(notes, "left alone: "+strings.Join(skipped, ", "))
 	}
+	if !res.StoppedEarly {
+		notes = append(notes, p.capBuildDirs(ctx, &res, opened, candidates)...)
+	}
 	return res, notes
+}
+
+// capBuildDirs removes the oldest candidates, oldest mtime first, until the
+// build directories hold no more than the cap, and returns its notes.
+func (p *verificationTrimPass) capBuildDirs(ctx context.Context, res *goCacheTrimResult, opened map[string]*goCacheHandle, candidates []verificationCapCandidate) []string {
+	limit := p.settings.MaxBytes
+	if limit <= 0 || res.CacheBytesAfter <= limit {
+		return nil
+	}
+	if free, err := p.free(); err == nil && free < p.settings.LowSpaceBytes {
+		p.lowSpace = true
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if !a.mtime.Equal(b.mtime) {
+			return a.mtime.Before(b.mtime)
+		}
+		if a.build != b.build {
+			return a.build < b.build
+		}
+		if a.dir != b.dir {
+			return a.dir < b.dir
+		}
+		return a.name < b.name
+	})
+	for i, c := range candidates {
+		if res.CacheBytesAfter <= limit {
+			break
+		}
+		if ctx.Err() != nil {
+			res.StoppedEarly = true
+			break
+		}
+		if i%256 == 0 {
+			if why := p.stop(); why != "" {
+				res.StoppedEarly, res.StopReason = true, why
+				break
+			}
+		}
+		p.removeCandidate(opened[c.build], c, res)
+	}
+	var notes []string
+	if p.capRemoved > 0 {
+		notes = append(notes, fmt.Sprintf("size cap %s: removed %d entries, freed %s", humanBytes(limit), p.capRemoved, humanBytes(p.capFreed)))
+	}
+	if !res.StoppedEarly && res.CacheBytesAfter > limit {
+		notes = append(notes, "size cap "+humanBytes(limit)+" not reached: the rest is under 2h")
+	}
+	return notes
+}
+
+// removeCandidate removes one entry for the cap after a second no-follow look,
+// in its two-hex directory opened again under the build directory's root. An
+// entry a build has used since the walk is kept; one that has gone, or is no
+// longer a regular file, no longer counts.
+func (p *verificationTrimPass) removeCandidate(cache *goCacheHandle, c verificationCapCandidate, res *goCacheTrimResult) {
+	where := c.build + "/" + c.dir + "/" + c.name
+	sub, err := openGoCacheDirectory(cache.root, c.dir)
+	if err != nil {
+		res.fail(where, err)
+		return
+	}
+	if sub == nil {
+		res.CacheBytesAfter -= c.size
+		return
+	}
+	defer sub.Close()
+	info, err := sub.Lstat(c.name)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		res.CacheBytesAfter -= c.size
+		return
+	case err != nil:
+		res.fail(where, err)
+		return
+	case !info.Mode().IsRegular():
+		res.CacheBytesAfter -= c.size
+		return
+	case p.now.Sub(info.ModTime()) <= minGoCacheTrimMaxAge:
+		return
+	}
+	if hook := goCacheTrimBeforeUnlink; hook != nil {
+		hook(c.dir, c.name)
+	}
+	switch err := sub.Remove(c.name); {
+	case err == nil:
+		res.FilesRemoved++
+		res.BytesFreed += info.Size()
+		res.CacheBytesAfter -= c.size
+		p.capRemoved++
+		p.capFreed += info.Size()
+	case errors.Is(err, fs.ErrNotExist):
+		res.CacheBytesAfter -= c.size
+	default:
+		res.fail(where, err)
+	}
 }
 
 // verificationTrimAttempt runs one verification cache trim when its switch
@@ -1111,8 +1356,9 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		return skip(goCacheTrimSkipNoRoot, err.Error())
 	}
 	line.LowestVolume = root
-	if why := d.matrixBusy(); why != "" {
-		return skip(sweepSkipMatrix, why)
+	runs, unreadable := d.matrixLock()
+	if unreadable != "" {
+		return skip(sweepSkipMatrix, unreadable)
 	}
 	env, err := d.goEnv(ctx)
 	if err != nil {
@@ -1124,7 +1370,8 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	defer handle.close()
 	realRoot := canonicalPath(root)
-	res, notes := trimVerificationBuildDirs(ctx, handle, realRoot, env.GOMODCACHE, settings.MaxAge, now, d.matrixBusy)
+	pass := &verificationTrimPass{settings: settings, now: now, lock: d.matrixLock, free: func() (int64, error) { return d.freeBytes(realRoot) }, lockHeld: runs > 0}
+	res, notes := trimVerificationBuildDirs(ctx, handle, realRoot, env.GOMODCACHE, pass)
 	if res.WalkError != "" {
 		write("failed", goCacheTrimFailWalk, res.WalkError)
 		return true
@@ -1144,17 +1391,22 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	if res.Errors > 0 {
 		notes = append(notes, fmt.Sprintf("%d removal error(s), first %s", res.Errors, res.FirstError))
 	}
+	if runs > 0 {
+		notes = append(notes, "trimmed while "+matrixEntriesBusy(runs))
+	}
 	detail := strings.Join(notes, "; ")
+	rules := pass.rules()
 	err = updateSweepState(func(s *sweepState) error {
 		if s.GoCacheTrim == nil {
 			s.GoCacheTrim = &goCacheTrimState{}
 		}
-		s.GoCacheTrim.Verification = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(), CacheDir: root}
+		s.GoCacheTrim.Verification = &goCacheTrimState{LastRunAt: now.UTC(), LastAttemptAt: now.UTC(), FilesRemoved: removed, BytesFreed: res.BytesFreed, CacheBytesAfter: cacheBytes, MaxAge: settings.MaxAge.String(),
+			Rule: rules, MaxBytes: settings.MaxBytes, CacheDir: root}
 		return nil
 	})
 	if ok, wrote := stateFault(stateFaultSave, err, detail); !ok {
 		return wrote
 	}
-	write("trimmed", "", detail)
+	write("trimmed", rules, detail)
 	return true
 }
