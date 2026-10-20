@@ -1255,6 +1255,7 @@ func TestRedactFieldNeverRevealsMoreThanTheFlattenedForm(t *testing.T) {
 		{"config\npassword: \"alpha SECRETPART\nomega\"\nrest", "SECRETPART"},
 		{"line one\n- bullet\nGITHUB_TOKEN=abcDEF123456789xyzQWE", "abcDEF123456789xyzQWE"},
 		{"token:\n'split\nvalue'", "split"},
+		{"api_key:-----BEGIN RSA\nPRIVATE KEY-----Q0ZABCDEFGHIJKLMNOPQRSTUV", "Q0ZABCDEFGHIJKLMNOPQRSTUV"},
 	} {
 		if strings.Contains(redactSecrets(clean(tc.value)), tc.secret) {
 			t.Fatalf("fixture %q is not redacted in its one-line form", tc.value)
@@ -1265,5 +1266,46 @@ func TestRedactFieldNeverRevealsMoreThanTheFlattenedForm(t *testing.T) {
 	}
 	if got := redactField("plain\n- text only\n"); got != "plain\n- text only\n" {
 		t.Errorf("a value without secrets changed: %q", got)
+	}
+}
+
+// wi_0bfe2fbbd9165f10 review round 2 f2: a private key whose header line is
+// split after a secret key word shows no key body in a helper DM or the
+// project mirror, for a RESULT and an ANSWER.
+func TestHelperSplitPrivateKeyHeader(t *testing.T) {
+	h := newHelperHarness(t)
+	helper := h.register()
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "what key is configured?"))
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "and as an answer?"))
+	posts := h.helperPosts()
+	value := "api_key:-----BEGIN RSA\nPRIVATE KEY-----Q0ZABCDEFGHIJKLMNOPQRSTUV"
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: posts[0].Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindResult, Subject: "The key configuration was read back", Body: api.EnvelopeBody{
+			Outcome: "done", Status: map[string]string{"a1": "pass"}, Summary: value},
+			Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "config file"}}}})
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: posts[1].Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "The configuration holds a private key", Body: api.EnvelopeBody{Answer: value}}})
+	h.flush()
+	h.cycle()
+	dm := h.botIn(h.dm)
+	if len(dm) != 2 {
+		t.Fatalf("DM = %+v", dm)
+	}
+	all := dm[0].Content + "\n" + dm[1].Content
+	for _, l := range h.lines() {
+		all += "\n" + l.Content
+		for _, e := range l.Embeds {
+			all += "\n" + e.Description
+		}
+	}
+	for _, leaked := range []string{"Q0ZABCDEFGHIJKLMNOPQRSTUV", "PRIVATE KEY", "RSA"} {
+		if strings.Contains(all, leaked) {
+			t.Errorf("%q reached Discord:\n%s", leaked, all)
+		}
+	}
+	for i := range dm {
+		if !strings.Contains(dm[i].Content, "api_key:"+redacted) {
+			t.Errorf("DM %d lacks the redacted key: %q", i, dm[i].Content)
+		}
 	}
 }

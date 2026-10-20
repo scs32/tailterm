@@ -1370,14 +1370,18 @@ func redactEnvelopeMessage(m api.Message) api.Message {
 	return m
 }
 
-// redactField redacts a body field shown with its line breaks. If the
-// multi-line value redacts differently from its one-line form, a line break
-// interrupted a pattern: the one-line form is redacted again and shown, so a
-// break never reveals what the flattened text would hide.
+// redactField redacts a body field shown with its line breaks. The
+// multi-line form is shown only when it equals the redacted one-line form up
+// to whitespace; otherwise a line break changed what a pattern matched, and
+// the redacted one-line form itself is shown. A break therefore never reveals
+// what the flattened text would hide.
 func redactField(s string) string {
 	r := redactSecrets(s)
-	if !strings.Contains(s, "\n") || clean(r) == redactSecrets(clean(s)) {
+	if !strings.Contains(s, "\n") {
 		return r
 	}
-	return redactSecrets(clean(r))
+	if flat := redactSecrets(clean(s)); clean(r) != flat {
+		return flat
+	}
+	return r
 }
