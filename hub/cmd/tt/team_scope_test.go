@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"io"
 	"os"
@@ -117,4 +118,115 @@ func TestOwnershipFlagRefusesCommaJoinedPaths(t *testing.T) {
 	if !reflect.DeepEqual([]string(owns), []string{"hub/a.go"}) {
 		t.Fatalf("refused value was stored: %q", owns)
 	}
+}
+
+// unenrol models a legacy item admitted before mandatory verification
+// enrolment: this isolated database keeps the item's bindings but records each
+// as the rollout migration does, a required=0 legacy enrolment.
+func (a *acceptanceBaseFixture) unenrol(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("sqlite", a.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`DROP TRIGGER verification_enrollment_no_delete`, nil},
+		{`DELETE FROM verification_enrollments WHERE task_id=? AND item_id=?`, []any{a.task.ID, a.item.ID}},
+		{`INSERT INTO verification_enrollments SELECT item_task_id,item_id,agent_id,run_id,0,'legacy-pre-rollout',created_at FROM agent_work_item_bindings WHERE item_task_id=? AND item_id=?`, []any{a.task.ID, a.item.ID}},
+		{`CREATE TRIGGER verification_enrollment_no_delete BEFORE DELETE ON verification_enrollments BEGIN SELECT RAISE(ABORT,'verification enrollment is immutable'); END`, nil},
+	} {
+		if _, err := db.Exec(statement.query, statement.args...); err != nil {
+			t.Fatalf("%s: %v", statement.query, err)
+		}
+	}
+	enrolments, err := a.c.VerificationEnrollment(a.ctx, a.task.ID, a.item.ID, a.handler.ID, a.handler.RunID)
+	if err != nil || len(enrolments) == 0 {
+		t.Fatalf("legacy enrolment: %+v %v", enrolments, err)
+	}
+	for _, enrolment := range enrolments {
+		if enrolment.Required {
+			t.Fatalf("item is still enrolled: %+v", enrolments)
+		}
+	}
+}
+
+// accepted checks that the entry's acceptance and its release job are bound to
+// the plan base and the exact candidate.
+func (a *acceptanceBaseFixture) accepted(t *testing.T, commit string) {
+	t.Helper()
+	entry, err := a.c.GetTeamQueueEntry(a.ctx, a.task.ID, a.queued.ID)
+	if err != nil || entry.Acceptance == nil || entry.Acceptance.Commit != commit || entry.Acceptance.BaseCommit != a.tip || entry.BaseCommit != a.tip {
+		t.Fatalf("acceptance is not bound to the plan base %s: %+v %v", a.tip, entry.Acceptance, err)
+	}
+	if entry.Release == nil || entry.Release.BaseCommit != a.tip || entry.Release.Commit != commit {
+		t.Fatalf("release job is not bound to the plan base %s and commit %s: %+v", a.tip, commit, entry.Release)
+	}
+}
+
+// Enrolment decides only whether a plan is required: with a plan, the base is
+// the plan's for enrolled and non-enrolled items alike, and the plan pins the
+// commit, as the store's queue gate and release gate require
+// (wi_e5b42a927a0455a7).
+func TestAcceptanceBaseIgnoresEnrolmentForItemsWithAPlan(t *testing.T) {
+	a := newAcceptanceBaseFixture(t)
+	base := func(commit string) (string, error) {
+		return acceptanceBase(a.ctx, a.c, a.task.ID, a.item.ID, a.handler.ID, a.handler.RunID, a.queueBase, commit)
+	}
+	if got, err := base(a.oldCommit); err != nil || got != a.queueBase {
+		t.Fatalf("item without a plan: base %q, %v; want the entry base %s", got, err, a.queueBase)
+	}
+	rebased := a.rebase(t)
+	a.freeze(t, rebased)
+	for _, when := range []string{"enrolled", "non-enrolled"} {
+		if when == "non-enrolled" {
+			a.unenrol(t)
+		}
+		if got, err := base(rebased); err != nil || got != a.tip {
+			t.Fatalf("%s item with a plan: base %q, %v; want the plan base %s", when, got, err, a.tip)
+		}
+		if _, err := base(a.oldCommit); err == nil || !strings.Contains(err.Error(), "is not the verification plan commit "+rebased) {
+			t.Fatalf("%s item with a plan accepted another commit: %v", when, err)
+		}
+	}
+}
+
+// A non-enrolled item with a receipted plan on a later base than its queue
+// entry is accepted on the plan base, which its release job requires.
+func TestQueueAcceptOfNonEnrolledItemWithReceiptedPlan(t *testing.T) {
+	a := newAcceptanceBaseFixture(t)
+	rebased := a.rebase(t)
+	a.freeze(t, rebased)
+	a.unenrol(t)
+	a.ownerDone(t)
+	if out, err := a.queueAccept(t, rebased); err != nil {
+		t.Fatalf("queue accept of a non-enrolled item with a receipted plan: %v\n%s", err, out)
+	}
+	a.accepted(t, rebased)
+}
+
+func TestDoneSaveOfNonEnrolledItemWithReceiptedPlan(t *testing.T) {
+	a := newAcceptanceBaseFixture(t)
+	rebased := a.rebase(t)
+	a.freeze(t, rebased)
+	a.unenrol(t)
+	if out, err := a.doneSave(t, rebased); err != nil {
+		t.Fatalf("done save of a non-enrolled item with a receipted plan: %v\n%s", err, out)
+	}
+	a.accepted(t, rebased)
+}
+
+// A non-enrolled candidate built on the queue-time base does not descend from
+// the plan base, so it is refused as an enrolled one is.
+func TestAcceptanceRefusesNonEnrolledCandidateOutsideThePlanBase(t *testing.T) {
+	a := newAcceptanceBaseFixture(t)
+	a.freeze(t, a.oldCommit)
+	a.unenrol(t)
+	if _, err := a.doneSave(t, a.oldCommit); err == nil || !strings.Contains(err.Error(), "not a fast-forward of the recorded base") {
+		t.Fatalf("done save of a non-enrolled candidate outside the plan base: %v", err)
+	}
+	a.unaccepted(t, "refused non-enrolled done save")
 }

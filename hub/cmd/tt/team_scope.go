@@ -187,7 +187,10 @@ func verifyAcceptedGit(ctx context.Context, repository, base, worktree, branch, 
 // When the item has a current verification plan, that plan's base is the
 // recorded base the store saves with the acceptance, and the plan pins the
 // exact commit; otherwise the queue entry's base applies, as for legacy
-// items. Both callers are the item's handler, which may read the history.
+// items. Enrolment does not change the base: the store's queue gate
+// (acceptTeamQueueEntry) and release gate (releaseCandidate) follow the same
+// rule for enrolled and non-enrolled items (wi_e5b42a927a0455a7). Both
+// callers are the item's handler, which may read the history.
 func acceptanceBase(ctx context.Context, c *api.Client, task, item, handlerAgent, handlerRun, entryBase, commit string) (string, error) {
 	records, err := c.VerificationHistory(ctx, task, item, handlerAgent, handlerRun)
 	if err != nil {

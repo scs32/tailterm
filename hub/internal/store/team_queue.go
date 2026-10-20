@@ -2932,6 +2932,8 @@ func itemLeadRun(ctx context.Context, q queryRower, task, item, agent, run strin
 // exact running lead, which the pre-save gate already checked against the
 // entry's revision. The entry's revision is not compared with the item's
 // here: a done save has just moved the item one revision past the entry.
+// With a current verification plan the acceptance base is the plan's base,
+// enrolled or not, as tt and the release gate use (wi_e5b42a927a0455a7).
 func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun string, allowLead bool, now string) error {
 	// The owner's integration record replaces handler acceptance: accepting
 	// the released entry would record a second candidate and could enqueue a
@@ -2980,16 +2982,23 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
 	if err != nil {
 		return err
 	}
-	// A verified team is accepted on its verified base, which is the
-	// tasks-hub tip at launch rather than the queue-time base. Its plan
-	// may name the repository (its .git directory or its root) or the
-	// exact candidate worktree, which tt has already resolved to this
-	// entry's repository.
-	if required && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
+	// An item with a current plan is accepted on its verified base, which
+	// is the tasks-hub tip at launch rather than the queue-time base, so the
+	// release job its receipt enqueues gets the same base. Enrolment only
+	// makes the plan required. The plan may name the repository (its .git
+	// directory or its root) or the exact candidate worktree, which tt has
+	// already resolved to this entry's repository. The plan also pins the
+	// commit: here for a non-enrolled item, and for an enrolled one in the
+	// completion check below.
+	planned := required || verificationPlan != nil
+	if planned && (verificationPlan == nil || !verifiedRepository(verificationPlan.Repository, candidate) || (candidate.BaseCommit != e.BaseCommit && candidate.BaseCommit != verificationPlan.BaseCommit)) {
 		return verificationConflict("acceptance repository/base mismatch")
 	}
+	if !required && verificationPlan != nil && verificationPlan.Commit != candidate.Commit {
+		return verificationConflict("acceptance commit is not the verification plan commit")
+	}
 	base := e.BaseCommit
-	if required {
+	if planned {
 		base = verificationPlan.BaseCommit
 		candidate.BaseCommit = base
 	}

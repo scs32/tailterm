@@ -922,6 +922,159 @@ func verifiedAcceptance(t *testing.T, planRepository string) {
 	}
 }
 
+// planAcceptance is a running entry queued on base C for a done item whose
+// candidate is B. With plan, the item has a passing plan for B on base A;
+// enrolment is "required" (enrolled), "legacy" (a required=0 rollout row) or
+// "" (no enrolment row).
+type planAcceptance struct {
+	s     *Store
+	task  api.Task
+	entry string
+}
+
+func newPlanAcceptance(t *testing.T, enrolment string, plan bool) planAcceptance {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "plan acceptance"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "handler", Host: "fixture", Session: "handler", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "plan item", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan {
+		seedPassingVerificationAt(t, s, item, candidateB, "/fixture/repo/.git")
+	}
+	now := ts(time.Now())
+	if _, err = s.db.Exec(`UPDATE work_items SET status='done' WHERE id=?`, item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if enrolment != "" {
+		required := map[string]int{"required": 1, "legacy": 0}[enrolment]
+		if _, err = s.db.Exec(`INSERT INTO verification_enrollments(task_id,item_id,agent_id,run_id,required,provenance,created_at) VALUES(?,?,?,?,?,?,?)`, task.ID, item.ID, api.NewID("agt"), api.NewID("run"), required, enrolment, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := api.NewID("tqe")
+	if _, err = s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,created_at,updated_at,repository,base_commit,handler_id,handler_run_id) VALUES(?,?,?,?,1,'planned',1,'running',1,?,?,?,?,?,?)`, entry, task.ID, item.ID, item.Revision, now, now, "/fixture/repo/.git", candidateC, h.ID, h.RunID); err != nil {
+		t.Fatal(err)
+	}
+	return planAcceptance{s: s, task: task, entry: entry}
+}
+
+func (p planAcceptance) accept(t *testing.T, key, base, commit string) (api.TeamQueueEntry, error) {
+	t.Helper()
+	ctx := context.Background()
+	current, err := p.s.GetTeamQueueEntry(ctx, p.task.ID, p.entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := p.s.GetWorkItem(ctx, p.task.ID, current.ItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.s.TeamQueueAction(ctx, p.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "accept", EntryID: p.entry, ExpectedRevision: current.Revision, HandlerAgentID: current.HandlerID, HandlerRunID: current.HandlerRunID,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: "/fixture/repo/.git", BaseCommit: base, Worktree: "/fixture/worktrees/builder", Branch: "feature/fixture", Commit: commit, ItemRevision: item.Revision, Evidence: "handler terminal save"}})
+}
+
+func (p planAcceptance) unaccepted(t *testing.T, when string) {
+	t.Helper()
+	got, err := p.s.GetTeamQueueEntry(context.Background(), p.task.ID, p.entry)
+	if err != nil || got.Acceptance != nil || got.BaseCommit != candidateC {
+		t.Fatalf("%s changed the entry: %+v %v", when, got, err)
+	}
+}
+
+// A non-enrolled item with a passing plan is accepted on the plan base, the
+// base its release job needs, as an enrolled one is (wi_e5b42a927a0455a7).
+func TestQueueAcceptanceOfNonEnrolledItemUsesPlanBaseAndEnqueuesRelease(t *testing.T) {
+	for _, enrolment := range []string{"", "legacy"} {
+		t.Run("enrolment="+enrolment, func(t *testing.T) {
+			p := newPlanAcceptance(t, enrolment, true)
+			got, err := p.accept(t, "queued-base", candidateC, candidateB)
+			if err != nil {
+				t.Fatal("acceptance of a non-enrolled item with a plan", err)
+			}
+			if got.BaseCommit != candidateA || got.Acceptance == nil || got.Acceptance.BaseCommit != candidateA || got.Acceptance.Commit != candidateB {
+				t.Fatalf("acceptance did not bind the plan base: %+v", got)
+			}
+			if got.Release == nil || got.Release.BaseCommit != candidateA || got.Release.Commit != candidateB {
+				t.Fatalf("release job not bound to the plan base and commit: %+v", got.Release)
+			}
+			reread, err := p.s.GetTeamQueueEntry(context.Background(), p.task.ID, p.entry)
+			if err != nil || reread.BaseCommit != candidateA || reread.Acceptance == nil || reread.Acceptance.BaseCommit != candidateA {
+				t.Fatal("plan base not persisted", reread.BaseCommit, err)
+			}
+			refused := newPlanAcceptance(t, enrolment, true)
+			if _, err := refused.accept(t, "wrong-base", strings.Repeat("d", 40), candidateB); !errors.Is(err, api.ErrConflict) {
+				t.Fatal("an unrelated base was accepted", err)
+			}
+			refused.unaccepted(t, "an unrelated base")
+		})
+	}
+}
+
+// The plan pins the exact commit for a non-enrolled item, as tt does.
+func TestQueueAcceptanceOfNonEnrolledItemRefusesOtherCommitThanPlan(t *testing.T) {
+	p := newPlanAcceptance(t, "", true)
+	if _, err := p.accept(t, "other-commit", candidateC, candidateC); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not the verification plan commit") {
+		t.Fatal("a commit other than the plan's was accepted", err)
+	}
+	p.unaccepted(t, "another commit")
+}
+
+// A current plan without a receipt still sets the base; no release job is
+// enqueued without a receipt.
+func TestQueueAcceptanceOfNonEnrolledItemWithUnreceiptedPlanUsesPlanBase(t *testing.T) {
+	p := newPlanAcceptance(t, "", true)
+	ctx := context.Background()
+	current, err := p.s.GetTeamQueueEntry(ctx, p.task.ID, p.entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := verificationRecords(ctx, p.s.db, p.task.ID, current.ItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := currentVerification(records)
+	next := *plan
+	next.OperationKey = api.NewID("req")
+	b, _ := json.Marshal(api.VerificationRecord{Generation: int64(len(records)) + 1, Kind: "plan", Plan: &next})
+	if _, err = p.s.db.Exec(`INSERT INTO verification_records VALUES(?,?,?,?,?,?,?)`, p.task.ID, current.ItemID, len(records)+1, "plan", api.NewID("req"), "synthetic-fixture", string(b)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.accept(t, "unreceipted", candidateC, candidateB)
+	if err != nil {
+		t.Fatal("acceptance on an unreceipted plan", err)
+	}
+	if got.BaseCommit != candidateA || got.Acceptance == nil || got.Acceptance.BaseCommit != candidateA || got.Release != nil {
+		t.Fatalf("unreceipted plan acceptance: base %s, %+v, release %+v", got.BaseCommit, got.Acceptance, got.Release)
+	}
+}
+
+// With no plan, a legacy item keeps its queue entry's base and no release.
+func TestQueueAcceptanceOfLegacyItemWithoutPlanKeepsEntryBase(t *testing.T) {
+	p := newPlanAcceptance(t, "", false)
+	got, err := p.accept(t, "legacy", candidateC, candidateB)
+	if err != nil {
+		t.Fatal("legacy acceptance", err)
+	}
+	if got.BaseCommit != candidateC || got.Acceptance == nil || got.Acceptance.BaseCommit != candidateC || got.Release != nil {
+		t.Fatalf("legacy acceptance: base %s, %+v, release %+v", got.BaseCommit, got.Acceptance, got.Release)
+	}
+}
+
 // f7: publication survives a later block so Delivery keeps showing merged.
 func TestReleasePublishedMarkerSurvivesBlock(t *testing.T) {
 	s, task, h, d, entry := releaseFixture(t)
