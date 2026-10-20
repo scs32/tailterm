@@ -1205,3 +1205,65 @@ func TestHelperMultiLineRedaction(t *testing.T) {
 		}
 	}
 }
+
+// wi_0bfe2fbbd9165f10 review f1: a quoted secret value that spans a line
+// break is redacted in a helper DM, for a RESULT (all fields with their
+// breaks) and an ANSWER, while the other lines and breaks remain.
+func TestHelperQuotedSecretAcrossLineBreak(t *testing.T) {
+	h := newHelperHarness(t)
+	helper := h.register()
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "what is in the config?"))
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "and the answer?"))
+	posts := h.helperPosts()
+	value := "config\npassword: \"alpha SECRETPART\nomega PARTTWO\"\nrest line"
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: posts[0].Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindResult, Subject: "The configuration was read back", Body: api.EnvelopeBody{
+			Outcome: "done", Status: map[string]string{"a1": "pass"}, Summary: value},
+			Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "config file"}}}})
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: posts[1].Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "The configuration holds a password", Body: api.EnvelopeBody{Answer: value}}})
+	h.flush()
+	h.cycle()
+	dm := h.botIn(h.dm)
+	if len(dm) != 2 {
+		t.Fatalf("DM = %+v", dm)
+	}
+	want := "config\npassword: " + redacted + "\nrest line"
+	for i, prefix := range []string{"Summary:\n", ""} {
+		if !strings.Contains(dm[i].Content, prefix+want) {
+			t.Errorf("DM %d = %q, want %q", i, dm[i].Content, prefix+want)
+		}
+	}
+	all := dm[0].Content + "\n" + dm[1].Content
+	for _, l := range h.lines() {
+		all += "\n" + l.Content
+		for _, e := range l.Embeds {
+			all += "\n" + e.Description
+		}
+	}
+	for _, leaked := range []string{"SECRETPART", "PARTTWO"} {
+		if strings.Contains(all, leaked) {
+			t.Errorf("%q reached Discord:\n%s", leaked, all)
+		}
+	}
+}
+
+// redactField never shows a secret that the redacted one-line form hides,
+// and keeps a value without secrets exactly as written.
+func TestRedactFieldNeverRevealsMoreThanTheFlattenedForm(t *testing.T) {
+	for _, tc := range []struct{ value, secret string }{
+		{"config\npassword: \"alpha SECRETPART\nomega\"\nrest", "SECRETPART"},
+		{"line one\n- bullet\nGITHUB_TOKEN=abcDEF123456789xyzQWE", "abcDEF123456789xyzQWE"},
+		{"token:\n'split\nvalue'", "split"},
+	} {
+		if strings.Contains(redactSecrets(clean(tc.value)), tc.secret) {
+			t.Fatalf("fixture %q is not redacted in its one-line form", tc.value)
+		}
+		if got := redactField(tc.value); strings.Contains(got, tc.secret) || !strings.Contains(got, redacted) {
+			t.Errorf("redactField(%q) = %q reveals %q", tc.value, got, tc.secret)
+		}
+	}
+	if got := redactField("plain\n- text only\n"); got != "plain\n- text only\n" {
+		t.Errorf("a value without secrets changed: %q", got)
+	}
+}

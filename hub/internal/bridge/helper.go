@@ -771,6 +771,10 @@ func (b *Bridge) routeHelperReply(ctx context.Context, names *roster, msg api.Me
 func renderHelperReply(name string, c conversation, msg api.Message) []OutboxRow {
 	header := fmt.Sprintf("🤖 **%s** · owner helper", clean(name))
 	body := msg.Text
+	if msg.Envelope != nil {
+		// Redact each field before it is shown with its line breaks.
+		msg = redactEnvelopeMessage(msg)
+	}
 	if env := msg.Envelope; env != nil {
 		header += fmt.Sprintf(" · %s · %s", strings.ToUpper(env.Kind), clean(redactSecrets(env.Subject)))
 		body = typedBody(displayText(msg))
@@ -809,7 +813,7 @@ var (
 	// A key ending in a secret word (GITHUB_TOKEN, DB_PASSWORD,
 	// OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, a JSON "token"), then = or :
 	// and a value. The word must end the key, so tokens=N is not a secret.
-	keyValue   = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:token|passw(?:or)?d|secret|api[_-]?key|access[_-]?key)["']?)(\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"',;}]+)`)
+	keyValue   = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:token|passw(?:or)?d|secret|api[_-]?key|access[_-]?key)["']?)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"',;}]+)`)
 	secretLike = []*regexp.Regexp{
 		regexp.MustCompile(`\b[A-Za-z0-9_-]{24,28}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,40}\b`), // Discord bot token
 		regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{10,}`),
@@ -1347,16 +1351,33 @@ func redactHelperMessage(r roster, m api.Message) api.Message {
 	if a, ok := r[m.From.AgentID]; !ok || m.From.AgentID == "" || a.Role != api.AgentRoleOwnerHelper {
 		return m
 	}
+	return redactEnvelopeMessage(m)
+}
+
+// redactEnvelopeMessage redacts a message's text, subject and every body
+// field that may be shown from the envelope. The expected answer keeps its
+// exact approval bytes.
+func redactEnvelopeMessage(m api.Message) api.Message {
 	m.Text = redactSecrets(m.Text)
 	if m.Envelope != nil {
 		env := *m.Envelope
 		env.Subject = redactSecrets(env.Subject)
-		// Every body field the mirror may show from the envelope. The
-		// expected answer keeps its exact approval bytes.
 		for _, f := range envelopeBodyFields(&env.Body) {
-			*f.value = redactSecrets(*f.value)
+			*f.value = redactField(*f.value)
 		}
 		m.Envelope = &env
 	}
 	return m
+}
+
+// redactField redacts a body field shown with its line breaks. If the
+// multi-line value redacts differently from its one-line form, a line break
+// interrupted a pattern: the one-line form is redacted again and shown, so a
+// break never reveals what the flattened text would hide.
+func redactField(s string) string {
+	r := redactSecrets(s)
+	if !strings.Contains(s, "\n") || clean(r) == redactSecrets(clean(s)) {
+		return r
+	}
+	return redactSecrets(clean(r))
 }
