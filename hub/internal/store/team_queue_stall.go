@@ -130,11 +130,20 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 			idle = false
 		}
 		// A member's verification run waiting for or holding the matrix
-		// host is the team's open work, whatever the member's own state.
-		if strings.Contains(payload, `"matrixWait"`) {
+		// host is the team's open work, whatever the member's own state. A
+		// retired member's saved wait is not: no relay keeps it current. The
+		// bound runs from the earlier of since and the report's observedAt,
+		// so a since saved in the future cannot outlive it.
+		if status != api.AgentRetired && strings.Contains(payload, `"matrixWait"`) {
 			var activity api.AgentActivity
-			if json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && s.now().Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound {
-				idle = false
+			if json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() {
+				start := activity.MatrixWait.Since
+				if at := parseStallTime(observed); !at.IsZero() && at.Before(start) {
+					start = at
+				}
+				if s.now().Sub(start) < defaultQueueMatrixWaitBound {
+					idle = false
+				}
 			}
 		}
 		if at := parseStallTime(observed); at.After(since) {

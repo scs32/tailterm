@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -1084,5 +1085,93 @@ func TestQueueWaitSweepTakesNoWriteLockWhenNoOneCanBeTold(t *testing.T) {
 	f.exec(t, `UPDATE agents SET status='running' WHERE id=?`, f.handler.ID)
 	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-orphaned" {
 		t.Fatalf("handler back: %v", steps)
+	}
+}
+
+// w1: a retired member's saved matrix wait is not open work, so its idle team
+// stalls as idle-entry once the idle threshold passes, well inside the
+// wait's bound. A live member's wait still keeps the team open.
+func TestQueueStallRetiredMemberMatrixWait(t *testing.T) {
+	for status, stalls := range map[string]bool{api.AgentRetired: true, api.AgentRunning: false, api.AgentDone: false} {
+		t.Run(status, func(t *testing.T) {
+			f, advance, a, b, lead, _ := idleTeam(t)
+			if _, err := f.report(t, lead, &api.MatrixWait{Role: api.MatrixWaitWaiting, Item: f.items[0].ID, Position: 1, Length: 1, Since: f.s.now()}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, status, lead.ID); err != nil {
+				t.Fatal(err)
+			}
+			advance(40 * time.Minute)
+			if !stalls {
+				assertNoStall(t, f, b.ID, "a live member waits for the matrix host")
+				advance(defaultQueueMatrixWaitBound - 41*time.Minute)
+				assertNoStall(t, f, b.ID, "a live member's wait inside its bound")
+				return
+			}
+			assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+		})
+	}
+}
+
+// w2: a matrix wait since more than a minute after the report's observedAt
+// is saved as observedAt, and a repeat of the request returns that saved
+// receipt; a since within the minute is saved as sent.
+func TestActivityMatrixWaitFutureSinceClamped(t *testing.T) {
+	f, _, _, _, lead, _ := idleTeam(t)
+	now := f.s.now()
+	report := func(key string, since time.Time) api.AgentActivity {
+		t.Helper()
+		saved, err := f.s.ReportActivity(context.Background(), f.task.ID, lead.ID, api.ActivityReport{RequestID: key, RunID: lead.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: now, MatrixWait: &api.MatrixWait{Role: api.MatrixWaitRunning, Since: since}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload string
+		if err := f.s.db.QueryRow(`SELECT payload FROM agent_activity WHERE agent_id=? AND run_id=?`, lead.ID, lead.RunID).Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var stored api.AgentActivity
+		if err := json.Unmarshal([]byte(payload), &stored); err != nil {
+			t.Fatal(err)
+		}
+		if !api.SameMatrixWait(saved.MatrixWait, stored.MatrixWait) {
+			t.Fatalf("returned %+v, stored %+v", saved.MatrixWait, stored.MatrixWait)
+		}
+		return saved
+	}
+	if got := report("future-since", now.Add(2*time.Hour)); !got.MatrixWait.Since.Equal(now) {
+		t.Fatalf("future since saved as %s, want %s", got.MatrixWait.Since, now)
+	}
+	if got := report("future-since", now.Add(2*time.Hour)); !got.MatrixWait.Since.Equal(now) {
+		t.Fatalf("repeat returned since %s, want the saved %s", got.MatrixWait.Since, now)
+	}
+	if got := report("skewed-since", now.Add(time.Minute)); !got.MatrixWait.Since.Equal(now.Add(time.Minute)) {
+		t.Fatalf("since within the skew saved as %s", got.MatrixWait.Since)
+	}
+}
+
+// w2: a future since cannot outlive the bound: one clamped on save, and one
+// saved before the clamp, both stop counting the bound after observedAt.
+func TestQueueStallFutureMatrixWaitSinceBounded(t *testing.T) {
+	for name, save := range map[string]func(*choresQueue, api.Agent) error{
+		"clamped on save": func(f *choresQueue, lead api.Agent) error {
+			_, err := f.report(t, lead, &api.MatrixWait{Role: api.MatrixWaitRunning, Since: f.s.now().Add(2 * time.Hour)})
+			return err
+		},
+		"saved before the clamp": func(f *choresQueue, lead api.Agent) error {
+			payload := fmt.Sprintf(`{"state":"idle","observedAt":%q,"matrixWait":{"role":"running","since":%q}}`, ts(f.s.now()), ts(f.s.now().Add(10*time.Hour)))
+			_, err := f.s.db.Exec(`UPDATE agent_activity SET observed_at=?,payload=? WHERE agent_id=? AND run_id=?`, ts(f.s.now()), payload, lead.ID, lead.RunID)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, advance, a, b, lead, _ := idleTeam(t)
+			if err := save(f, lead); err != nil {
+				t.Fatal(err)
+			}
+			advance(defaultQueueMatrixWaitBound - time.Minute)
+			assertNoStall(t, f, b.ID, "a wait inside the bound from its report")
+			advance(2 * time.Minute)
+			assertStall(t, f, b.ID, api.StallIdleEntry, a.ID)
+		})
 	}
 }

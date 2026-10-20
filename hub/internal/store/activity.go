@@ -37,6 +37,11 @@ CREATE INDEX IF NOT EXISTS agent_activity_receipts_run ON agent_activity_receipt
 	return migrateStallWatch(db)
 }
 
+// matrixWaitSinceSkew is how far a reported matrix wait's since may lie after
+// the report's observedAt before it is clamped: clock skew between the lock
+// file's writer and the relay.
+const matrixWaitSinceSkew = time.Minute
+
 func validActivity(a api.AgentActivity) bool {
 	switch a.State {
 	case "working", "hung_tool", "finished_silent", "crashed", "looping", "idle", "unknown", "runtime_prompt", "stuck", "provider_blocked":
@@ -91,6 +96,14 @@ func (s *Store) ReportActivity(ctx context.Context, task, agent string, report a
 	}
 	defer tx.Rollback()
 	requestBytes, _ := json.Marshal(report)
+	// A matrix wait cannot start after it was observed: a since beyond the
+	// skew is saved as observedAt, so the wait cannot outlive its bound. The
+	// request payload keeps what was sent, so a repeat matches its receipt.
+	if w := report.Activity.MatrixWait; w != nil && w.Since.After(report.Activity.ObservedAt.Add(matrixWaitSinceSkew)) {
+		clamped := *w
+		clamped.Since = report.Activity.ObservedAt
+		report.Activity.MatrixWait = &clamped
+	}
 	var previous string
 	var priorRequest, priorAgent, priorRun string
 	err = tx.QueryRowContext(ctx, `SELECT payload,request_payload,agent_id,run_id FROM agent_activity_receipts WHERE task_id=? AND request_id=?`, task, report.RequestID).Scan(&previous, &priorRequest, &priorAgent, &priorRun)
