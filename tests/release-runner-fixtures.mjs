@@ -582,7 +582,7 @@ end(undefined);
 }
 // What the published runner (aff59de) sends for one verified job, three more
 // queued behind it and a diverged tasks-hub: recorded from that runner.
-export const SINGLE_JOB_TRACE=["list --view active","list --view settled","get --job rel_b1","list --view active","list --view active","claim --job rel_b1 --generation 1","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","merged --job rel_b1 --generation 2","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","finish --job rel_b1 --generation 3"];
+export const SINGLE_JOB_TRACE=["list --view active","list --view settled","get --job rel_b1","list --view active","list --view active","claim --job rel_b1 --generation 1","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","check --job rel_b1 --generation 2","window","check --job rel_b1 --generation 2","merged --job rel_b1 --generation 2","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","check --job rel_b1 --generation 3","finish --job rel_b1 --generation 3"];
 export const traceOf=log=>log.filter(l=>l.startsWith("deployment ")).map(l=>l.split(" ").slice(1).filter((w,i,all)=>!["--limit","--snapshot","--request-id","--commit","--file"].includes(w)&&!["--limit","--snapshot","--request-id","--commit","--file"].includes(all[i-1])).join(" "));
 // The batching exclusion record (wi_a72bba736a8c1daf): every queued candidate
 // the daemon leaves out at claim is in the lead's journal with its reason.
