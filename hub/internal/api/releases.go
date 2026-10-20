@@ -476,6 +476,19 @@ type ReleasePush struct {
 	Remote  string `json:"remote"`
 	Commit  string `json:"commit"`
 	Outcome string `json:"outcome"`
+	// Optional diagnostics of a failed push, never captured output: whether
+	// the runner's limit stopped it, its exit code or lowercase signal, the
+	// time it took, the runner's stable reason tag, what one read of the
+	// remote found (landed, absent or unknown) and the sha256 of the
+	// sanitized stderr kept in the private journal. Absent, the receipt
+	// keeps its older shape and hash.
+	TimedOut     bool   `json:"timedOut,omitempty"`
+	ExitCode     *int   `json:"exitCode,omitempty"`
+	Signal       string `json:"signal,omitempty"`
+	ElapsedMs    *int64 `json:"elapsedMs,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	RemoteCheck  string `json:"remoteCheck,omitempty"`
+	StderrSHA256 string `json:"stderrSHA256,omitempty"`
 }
 
 // Recovery is a handler inspection record, never a timeout-based takeover.

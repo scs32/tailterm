@@ -1217,7 +1217,8 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 
 // validateReleaseRefEffects checks the tasks-hub effects a receipt reports: a
 // revert only after a rollback or block, and a push only for a live release
-// of the receipt's own commit. Neither carries captured output.
+// of the receipt's own commit. Neither carries captured output: a failed
+// push may add only typed, bounded diagnostics (see validReleasePushDiagnostics).
 func validateReleaseRefEffects(r *api.ReleaseReceipt) error {
 	if v := r.Revert; v != nil {
 		if r.Outcome == "released" || (v.Outcome != "committed" && v.Outcome != "failed") || (v.Outcome == "committed" && !validGitCommit(v.Commit)) || (v.Commit != "" && !validGitCommit(v.Commit)) || len(v.BugRequestID) > 128 || strings.ContainsAny(v.BugRequestID, "\x00\n\r ") {
@@ -1225,11 +1226,41 @@ func validateReleaseRefEffects(r *api.ReleaseReceipt) error {
 		}
 	}
 	if p := r.Push; p != nil {
-		if r.Outcome != "released" || p.Commit != r.Commit || (p.Outcome != "pushed" && p.Outcome != "failed") || p.Remote == "" || len(p.Remote) > 128 || strings.ContainsAny(p.Remote, "\x00\n\r /:@") {
+		if r.Outcome != "released" || p.Commit != r.Commit || (p.Outcome != "pushed" && p.Outcome != "failed") || p.Remote == "" || len(p.Remote) > 128 || strings.ContainsAny(p.Remote, "\x00\n\r /:@") || !validReleasePushDiagnostics(p) {
 			return api.ErrInvalid
 		}
 	}
 	return nil
+}
+
+// The diagnostics of a failed push: an exit code or a lowercase signal, never
+// both; a bounded elapsed time; the runner's stable reason tag; one of the
+// three remote check results; and the sha256 of the journal's stderr. A
+// successful push may carry its elapsed time only.
+var releasePushSignalPattern = regexp.MustCompile(`^sig[a-z0-9]{1,12}$`)
+
+func validReleasePushDiagnostics(p *api.ReleasePush) bool {
+	if p.ExitCode != nil && (*p.ExitCode < 1 || *p.ExitCode > 255) {
+		return false
+	}
+	if p.Signal != "" && (!releasePushSignalPattern.MatchString(p.Signal) || p.ExitCode != nil) {
+		return false
+	}
+	if p.ElapsedMs != nil && (*p.ElapsedMs < 0 || *p.ElapsedMs > releaseProbeWaitMaxMs) {
+		return false
+	}
+	if p.Reason != "" && !validReleaseReason(p.Reason) {
+		return false
+	}
+	switch p.RemoteCheck {
+	case "", "landed", "absent", "unknown":
+	default:
+		return false
+	}
+	if p.StderrSHA256 != "" && !validContextDigest(p.StderrSHA256) {
+		return false
+	}
+	return p.Outcome == "failed" || (!p.TimedOut && p.ExitCode == nil && p.Signal == "" && p.Reason == "" && p.RemoteCheck == "" && p.StderrSHA256 == "")
 }
 
 // The failure diagnostics a receipt may carry. A reason is the runner's

@@ -81,12 +81,14 @@ function addDiagnostics(receipt, failure, effects) {
 }
 export function withoutDiagnostics(receipt) {
   if (!receipt || typeof receipt !== "object") return receipt;
-  const {failure, ...rest} = receipt;
-  return {...rest, ...(Array.isArray(receipt.targets) ? {targets: receipt.targets.map(t => { if (!t || typeof t !== "object") return t; const {reason, liveCheck, rollbackCheck, ...kept} = t; return kept; })} : {})};
+  const {failure, ...rest} = receipt, push = receipt.push;
+  return {...rest, ...(Array.isArray(receipt.targets) ? {targets: receipt.targets.map(t => { if (!t || typeof t !== "object") return t; const {reason, liveCheck, rollbackCheck, ...kept} = t; return kept; })} : {}),
+    ...(push && typeof push === "object" ? {push: {remote: push.remote, commit: push.commit, outcome: push.outcome}} : {})};
 }
 // The hub's saved receipt matches the one sent, or, from a hub or tt older
 // than the diagnostics that dropped them, matches it without them. A saved
-// receipt holding any diagnostic must match exactly.
+// receipt holding any diagnostic, the push diagnostics (wi_8afe404c4867dafc)
+// included, must match exactly.
 export function sameReceipt(sent, saved) {
   if (digest(sent) === digest(saved)) return true;
   return digest(withoutDiagnostics(saved)) === digest(saved) && digest(withoutDiagnostics(sent)) === digest(saved);
@@ -595,10 +597,55 @@ export function moveReleaseRef(cwd, revert, integrated) {
 }
 // D2: fast-forward only. Credentials come from the host's git helper; a
 // prompt would hang the daemon, so terminal prompts are disabled.
-export function pushRelease(cwd, commit, remote="origin") {
-  if (!sha(commit)) return false;
-  try {execFileSync("git",["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,stdio:["ignore","pipe","pipe"],timeout:120000,env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});return true;}
-  catch {return false;}
+// The push limit (wi_8afe404c4867dafc p2): a hand push on 2026-10-19 took
+// more than 60 s against the old, unstated 120 s, so the limit is 5 min.
+// There is no retry: one read of the remote after a failure finds a push
+// that landed late, and any other failure goes to a human.
+export const PUSH_TIMEOUT_MS = 300000, REMOTE_CHECK_TIMEOUT_MS = 30000, PUSH_STDERR_BYTES = 2048;
+// The stable reason tags of a failed push, classified from its stderr,
+// which is never copied to the receipt or the Board.
+export const PUSH_REASONS = ["push-timed-out", "push-killed", "push-rejected", "push-auth-failed", "push-network-failed", "push-failed"];
+const PUSH_CLASSES = [
+  ["push-rejected", /\[rejected\]|non-fast-forward|fetch first/],
+  ["push-auth-failed", /Authentication failed|could not read Username|\b403\b|Permission denied/],
+  ["push-network-failed", /Could not resolve host|unable to access|RPC failed|early EOF|Connection (timed out|refused|reset)/],
+];
+// The push stderr the private journal keeps: control characters other than
+// newlines removed, URL userinfo replaced, each line redacted and bounded by
+// sanitizeCapture, and only the last PUSH_STDERR_BYTES bytes.
+export function pushStderr(raw) {
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : typeof raw === "string" ? raw : "";
+  const lines = text.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, "").replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+@/gi, "$1[redacted]@").split("\n").filter(l => l !== "");
+  const kept = sanitizeCapture({logs: [{service: "git", lines}]}).logs[0].lines.join("\n"), bytes = Buffer.from(kept, "utf8");
+  return bytes.length <= PUSH_STDERR_BYTES ? kept : bytes.subarray(bytes.length - PUSH_STDERR_BYTES).toString("utf8").replace(/^\uFFFD+/, "");
+}
+// One push: {outcome, elapsedMs} and, for a failed one, timedOut, exitCode
+// or signal, reason and the sanitized stderr. elapsedMs stays within the
+// hub's bound. git and timeoutMs are test seams.
+export function pushRelease(cwd, commit, {remote="origin", git="git", timeoutMs=PUSH_TIMEOUT_MS}={}) {
+  if (!sha(commit)) return {outcome:"failed", elapsedMs:0, reason:"push-failed"};
+  const start = Date.now(), elapsed = () => Math.min(PROBE_WAIT_MAX_MS, Math.max(0, Date.now() - start));
+  try {execFileSync(git,["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,stdio:["ignore","pipe","pipe"],timeout:timeoutMs,env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});return {outcome:"pushed", elapsedMs:elapsed()};}
+  catch (error) {
+    const result = {outcome:"failed", elapsedMs:elapsed()}, stderr = pushStderr(error?.stderr);
+    if (error?.code === "ETIMEDOUT") result.timedOut = true;
+    if (Number.isInteger(error?.status) && error.status >= 1 && error.status <= 255) result.exitCode = error.status;
+    else if (typeof error?.signal === "string" && /^SIG[A-Z0-9]{1,12}$/.test(error.signal)) result.signal = error.signal.toLowerCase();
+    result.reason = result.timedOut ? "push-timed-out" : result.signal ? "push-killed" : (PUSH_CLASSES.find(([, pattern]) => pattern.test(stderr)) || ["push-failed"])[0];
+    if (stderr) result.stderr = stderr;
+    return result;
+  }
+}
+// One bounded read of the remote's tasks-hub: {sha} (null when it has no
+// such ref) or {unknown:true} when the read failed or timed out.
+export function remoteTasksHub(cwd, {remote="origin", git="git", timeoutMs=REMOTE_CHECK_TIMEOUT_MS}={}) {
+  try {
+    const out = execFileSync(git,["ls-remote",remote,"refs/heads/tasks-hub"],{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:timeoutMs,env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});
+    const line = out.split("\n").find(l => l.endsWith("\trefs/heads/tasks-hub"));
+    if (!line) return out.trim() === "" ? {sha:null} : {unknown:true};
+    const head = line.split("\t")[0];
+    return sha(head) ? {sha:head} : {unknown:true};
+  } catch {return {unknown:true};}
 }
 // Go stamps vcs.revision only when .git is a directory, and the deployer's
 // checkout is a worktree whose .git is a file (a nested checkout would even
@@ -631,6 +678,8 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
 // Adapter operations receive nonsecret job/artifact references. Neither captured
 // subprocess output nor arbitrary error strings are put into journal/receipt;
 // a failed target step records only the tagged reason failureReason allows.
+// One exception, for the journal only: a failed push keeps its stderr,
+// sanitized and bounded by pushStderr. The receipt holds at most its sha256.
 // One host release lock per deployment checkout and project.
 const hostLockPath=(cwd,job)=>join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");
 export async function runRelease(config, adapter) {
@@ -890,11 +939,20 @@ export async function runRelease(config, adapter) {
     }
   };
   // Every selected target is live-verified before this runs, so nothing here
-  // rolls back: a failed push is escalated once and the release stands.
+  // rolls back: a failed push reads the remote once and, unless the commit
+  // landed there, is escalated once; the release stands. config.push (git,
+  // timeoutMs, checkTimeoutMs) is a test seam, never set in deploy.json.
   const pushAndFinish=async receipt=>{
     state.receipt=receipt;state.phase="pushing";checkpoint();
-    receipt.push={remote:"origin",commit:receipt.commit,outcome:pushRelease(cwd,receipt.commit)?"pushed":"failed"};checkpoint();
-    if(receipt.push.outcome==="failed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed"});}catch{}}
+    const seam=config.push||{},pushed=pushRelease(cwd,receipt.commit,{git:seam.git,timeoutMs:seam.timeoutMs});
+    let remoteCheck;
+    if(pushed.outcome==="failed"){const read=remoteTasksHub(cwd,{git:seam.git,timeoutMs:seam.checkTimeoutMs});remoteCheck=read.unknown?"unknown":read.sha===receipt.commit?"landed":"absent";}
+    const stderrSHA256=pushed.stderr?createHash("sha256").update(pushed.stderr).digest("hex"):undefined;
+    // The private journal keeps the last five attempts, stderr included.
+    state.pushAttempts=[...(state.pushAttempts||[]),{at:new Date().toISOString(),...pushed,...(stderrSHA256?{stderrSHA256}:{}),...(remoteCheck?{remoteCheck}:{})}].slice(-5);checkpoint();
+    const cause=pushed.outcome==="failed"?{...(pushed.timedOut?{timedOut:true}:{}),...(pushed.exitCode!==undefined?{exitCode:pushed.exitCode}:{}),...(pushed.signal?{signal:pushed.signal}:{}),elapsedMs:pushed.elapsedMs,reason:pushed.reason,remoteCheck,...(stderrSHA256?{stderrSHA256}:{})}:{};
+    receipt.push={remote:"origin",commit:receipt.commit,outcome:pushed.outcome,...cause};checkpoint();
+    if(receipt.push.outcome==="failed" && remoteCheck!=="landed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed",pushCause:cause});}catch{}}
     state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);materialize();state.phase="complete";checkpoint();return receipt;
   };
   try {
@@ -1170,6 +1228,22 @@ export function failureRehearsal(error){
   if(!r || typeof r!=="object" || ![r.runtime,r.image].every(v=>typeof v==="string" && REHEARSAL_NAME.test(v)) || typeof r.exit!=="string" || !REHEARSAL_HOW.test(r.exit)
     || !Array.isArray(r.lines) || r.lines.length>REHEARSAL_LINES || r.lines.some(l=>typeof l!=="string" || l.length>REHEARSAL_LINE_LENGTH))return null;
   return {runtime:r.runtime,image:r.image,exit:r.exit,lines:[...r.lines]};
+}
+// The cause a push-failure notice names, built only from re-validated typed
+// values; anything else in the cause is dropped, never echoed. The stderr
+// itself stays in the private journal and only its sha256 prefix is named.
+export function pushCauseText(cause){
+  if(!cause || typeof cause!=="object")return "";
+  const parts=[],seconds=Number.isSafeInteger(cause.elapsedMs)&&cause.elapsedMs>=0?Math.round(cause.elapsedMs/1000):null;
+  if(cause.timedOut===true)parts.push(seconds!==null?`timed out after ${seconds} s`:"timed out");
+  else if(Number.isInteger(cause.exitCode)&&cause.exitCode>=1&&cause.exitCode<=255)parts.push(`exit ${cause.exitCode}`);
+  else if(typeof cause.signal==="string"&&/^sig[a-z0-9]{1,12}$/.test(cause.signal))parts.push(`signal ${cause.signal}`);
+  if(cause.timedOut!==true&&seconds!==null)parts.push(`after ${seconds} s`);
+  if(PUSH_REASONS.includes(cause.reason))parts.push(`(${cause.reason})`);
+  const said=parts.length?` Cause: ${parts.join(" ")}.`:"";
+  const check=["absent","unknown"].includes(cause.remoteCheck)?` Remote check: ${cause.remoteCheck}.`:"";
+  const stderr=typeof cause.stderrSHA256==="string"&&/^[a-f0-9]{64}$/.test(cause.stderrSHA256)?` The sanitized stderr is in the private journal (sha256 ${cause.stderrSHA256.slice(0,12)}).`:"";
+  return said+check+stderr;
 }
 
 export class HostAdapter {
@@ -1753,7 +1827,7 @@ export class HostAdapter {
       const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
       return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}.${reason.startsWith("integration-conflict")?" Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.":""} Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
     }
-    if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed. Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
+    if(details.push==="failed")return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release is live but the tasks-hub push failed","--text",`Release ${this.job.id} is live and verified, but the fast-forward push of tasks-hub to origin failed.${pushCauseText(details.pushCause)} Live targets were not rolled back; inspect the remote and push tasks-hub by hand.`,"--request-id",`${this.job.id}-push-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
     return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release failed and requires recovery","--text",`Release failed for ${this.job.id}; inspect the private host journal. Automatic rollback attempted once; handler reconciliation required.${details.revert==="failed"?" The tasks-hub revert failed, so the rolled-back change is still on tasks-hub.":""}${details.rollbackBlocked===true&&details.revert==="committed"?" tasks-hub was reverted, but at least one target could not be rolled back and still runs the released code; roll it back by hand before the next release.":""}${waits}`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
   }
 }

@@ -268,11 +268,30 @@ and the first release are separate operational steps.
 - **Push (D2).** After every selected target is live-verified, the journal moves
   to `pushing` and the runner runs `git push origin INTEGRATED:refs/heads/tasks-hub`
   with terminal prompts disabled and credentials from the host's git helper. It
-  never forces. A zero-target release still pushes. The receipt records
-  `push: {remote, commit, outcome: pushed|failed}`. A failed push is escalated once
-  (request `JOB-push-failure`), the outcome stays `released`, and live targets are
-  not rolled back. A run stopped in `pushing` resumes the push, then finishes.
-  The rollback path never pushes.
+  never forces. A zero-target release still pushes. The push is limited to
+  5 minutes (`PUSH_TIMEOUT_MS`, 300000 ms; it was an unstated 120 s until a
+  hand push on 2026-10-19 took more than 60 s), and there is no retry. The
+  receipt records `push: {remote, commit, outcome: pushed|failed}`; a
+  successful push keeps exactly that shape. A failed push adds typed, bounded
+  fields, never captured output: `timedOut` (a push stopped by the limit is
+  `failed` with `timedOut: true`), `exitCode` (1-255) or `signal` (lowercase,
+  such as `sigterm`), `elapsedMs`, `reason` (one stable tag: `push-timed-out`,
+  `push-killed`, `push-rejected`, `push-auth-failed`, `push-network-failed` or
+  `push-failed`), `remoteCheck` and `stderrSHA256`. The hub refuses any other
+  value. The push's stderr, with URL credentials and credential-shaped text
+  redacted and cut to its last 2 KB, is kept only in the private job journal
+  (`pushAttempts`, the last five); the receipt holds at most its sha256. After a
+  failed push the runner reads origin's `tasks-hub` once (`git ls-remote`,
+  30 s): `landed` when it is the released commit, `absent` when it is any other
+  commit or missing, `unknown` when the read fails. A push that `landed` keeps
+  its failure fields and is not escalated. Otherwise it is escalated once
+  (request `JOB-push-failure`), and the notice names the cause from the typed
+  fields only, for example `timed out after 300 s (push-timed-out)` or
+  `exit 128 after 2 s (push-auth-failed)`, the remote check, and the first 12
+  characters of the stderr hash. The outcome stays `released`, and live targets
+  are not rolled back. A hub or `tt` older than these fields drops them; the
+  runner then accepts the saved receipt without them. A run stopped in
+  `pushing` resumes the push, then finishes. The rollback path never pushes.
 - **Revert (D1).** After a rollback of a published release (outcome
   `rolled_back` or `blocked`), the runner creates one commit whose tree is the
   pre-release `tasks-hub` tree and whose parent is the integrated commit, with

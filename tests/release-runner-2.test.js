@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,PUSH_REASONS,PUSH_TIMEOUT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -611,8 +611,87 @@ test("a6 a live-verified release fast-forward pushes tasks-hub, including a zero
 test("a6 a diverged remote fails the push with one escalation, keeps the release and never rolls back",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake();let escalation;a.escalate=async x=>{escalation=x;a.calls.push("escalate");};
  const other=mkdtempSync(join(tmpdir(),"release-other-"));git(other,"clone","--quiet","-b","tasks-hub",f.origin,".");git(other,"config","user.email","o@example.invalid");git(other,"config","user.name","O");writeFileSync(join(other,"x"),"x");git(other,"add",".");git(other,"commit","-m","remote");git(other,"push","--quiet","origin","tasks-hub");const diverged=remoteHead(f);
- const r=await runRelease(config(f,j),a);assert.equal(r.outcome,"released");assert.deepEqual(r.push,{remote:"origin",commit:j.commit,outcome:"failed"});assert.equal(remoteHead(f),diverged);
- assert.deepEqual(escalation,{jobId:"rel_fixture",outcome:"released",push:"failed"});assert.deepEqual(a.calls,["merged","deploy:tailos","escalate","finish"]);
+ const r=await runRelease(config(f,j),a);assert.equal(r.outcome,"released");assert.equal(remoteHead(f),diverged);
+ const {elapsedMs,stderrSHA256,...push}=r.push;assert.deepEqual(push,{remote:"origin",commit:j.commit,outcome:"failed",exitCode:1,reason:"push-rejected",remoteCheck:"absent"});
+ assert.ok(Number.isSafeInteger(elapsedMs)&&elapsedMs>=0);assert.match(stderrSHA256,/^[a-f0-9]{64}$/);
+ assert.deepEqual(escalation,{jobId:"rel_fixture",outcome:"released",push:"failed",pushCause:{exitCode:1,elapsedMs,reason:"push-rejected",remoteCheck:"absent",stderrSHA256}});assert.deepEqual(a.calls,["merged","deploy:tailos","escalate","finish"]);
+});
+// wi_8afe404c4867dafc p5/p5c: a fake git that runs the real git for every
+// call except the push (and, when given, ls-remote), against the fixture's
+// temp bare remote only.
+const REAL_GIT=execFileSync("sh",["-c","command -v git"],{encoding:"utf8"}).trim();
+function fakeGit(push,lsRemote){
+ const dir=mkdtempSync(join(tmpdir(),"release-fake-git-")),path=join(dir,"git");
+ writeFileSync(join(dir,"stderr.txt"),"fatal: unable to access 'https://x-access-token:ghs_0123456789abcdefABCDEF0123456789@github.com/o/r.git/': The requested URL returned error: 403\npassword=hunter2hunter2\n");
+ writeFileSync(path,`#!/bin/sh\nREAL='${REAL_GIT}'\nERR='${join(dir,"stderr.txt")}'\ncase "$1" in\n push) ${push} ;;\n ls-remote) ${lsRemote||":"} ;;\nesac\nexec "$REAL" "$@"\n`);chmodSync(path,0o755);return path;
+}
+const PUSH_MODES={slow:"sleep 5; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
+// A release through the fake git; finish writes the receipt file as the host
+// adapter does, so the file and the journal can be read separately.
+async function pushCase(push,lsRemote,{timeoutMs=60000,setup}={}){
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c={...config(f,j),push:{git:fakeGit(push,lsRemote),timeoutMs,checkTimeoutMs:10000}},escalations=[];
+ const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},j);host.native=()=>host.job;
+ a.escalate=async d=>{escalations.push(d);a.calls.push("escalate");};a.finish=async(r,g)=>{await host.finish(r,g);a.calls.push("finish");};
+ if(setup)setup(f,c);
+ const started=Date.now(),r=await runRelease(c,a),took=Date.now()-started;
+ return {f,j,a,c,r,took,escalations,file:readFileSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"),"utf8"),journal:JSON.parse(readFileSync(c.journalPath,"utf8"))};
+}
+const STDERR_TEXT=["unable to access","RPC failed","[redacted]","hunter2","ghs_","fatal","error:"];
+const noStderr=(text,what)=>{for(const s of STDERR_TEXT)assert.ok(!text.includes(s),`${what} holds ${s}`);};
+test("push p5 a slow push past its limit is recorded as timed out with its elapsed time, without hanging the runner",async()=>{
+ const t=await pushCase(PUSH_MODES.slow,undefined,{timeoutMs:500});
+ assert.equal(t.r.outcome,"released");assert.ok(t.took<4000,String(t.took));assert.equal(remoteHead(t.f),t.f.base);
+ const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"absent"});
+ assert.ok(elapsedMs>=500&&elapsedMs<4000,String(elapsedMs));assert.equal(t.escalations.length,1);assert.deepEqual(t.a.calls,["merged","deploy:tailos","escalate","finish"]);
+ const attempt=t.journal.pushAttempts.at(-1);assert.equal(attempt.timedOut,true);assert.equal(attempt.elapsedMs,elapsedMs);assert.equal(attempt.remoteCheck,"absent");
+ assert.deepEqual(JSON.parse(t.file).push,t.r.push);
+ const cwd=mkdtempSync(join(tmpdir(),"escalate-push-")),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
+ await adapter.escalate(t.escalations[0]);const text=calls[0][calls[0].indexOf("--text")+1];
+ assert.equal(calls[0][calls[0].indexOf("--request-id")+1],"rel_fixture-push-failure");assert.match(text,/Cause: timed out after \d+ s \(push-timed-out\)\. Remote check: absent\./);
+});
+test("push p5 a failing push keeps its exit code and its redacted stderr in the journal, never in the receipt",async()=>{
+ const t=await pushCase(PUSH_MODES.fail);
+ assert.equal(t.r.outcome,"released");assert.equal(remoteHead(t.f),t.f.base);
+ const {elapsedMs,stderrSHA256,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",exitCode:128,reason:"push-auth-failed",remoteCheck:"absent"});
+ const attempt=t.journal.pushAttempts.at(-1),stderr=attempt.stderr;
+ assert.equal(stderrSHA256,createHash("sha256").update(stderr).digest("hex"));assert.equal(attempt.stderrSHA256,stderrSHA256);assert.equal(attempt.exitCode,128);
+ assert.match(stderr,/unable to access/);assert.match(stderr,/\[redacted\]/);assert.match(stderr,/https:\/\/\[redacted\]@github\.com/);
+ const raw=readFileSync(t.c.journalPath,"utf8");for(const secret of ["ghs_","hunter2","x-access-token"])assert.ok(!raw.includes(secret),secret);
+ noStderr(JSON.stringify(t.r),"receipt");noStderr(t.file,"receipt file");noStderr(JSON.stringify(t.escalations),"escalation");
+ assert.equal(t.escalations.length,1);
+ const cwd=mkdtempSync(join(tmpdir(),"escalate-push-")),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
+ await adapter.escalate(t.escalations[0]);const text=calls[0][calls[0].indexOf("--text")+1];
+ assert.match(text,/Cause: exit 128 after \d+ s \(push-auth-failed\)\. Remote check: absent\. The sanitized stderr is in the private journal \(sha256 [a-f0-9]{12}\)\./);noStderr(text,"notice");
+});
+test("push p5 a push that landed but reported failure is found by the one re-check and not escalated",async()=>{
+ const t=await pushCase(PUSH_MODES.landed);
+ assert.equal(t.r.outcome,"released");assert.equal(remoteHead(t.f),t.j.commit);
+ const {elapsedMs,stderrSHA256,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",exitCode:1,reason:"push-network-failed",remoteCheck:"landed"});
+ assert.deepEqual(t.escalations,[]);assert.deepEqual(t.a.calls,["merged","deploy:tailos","finish"]);assert.equal(t.journal.pushEscalated,undefined);
+ assert.match(t.journal.pushAttempts.at(-1).stderr,/RPC failed/);noStderr(JSON.stringify(t.r),"receipt");noStderr(t.file,"receipt file");
+});
+test("push p5 a failed push whose remote cannot be read is unknown and escalated once",async()=>{
+ const t=await pushCase(PUSH_MODES.fail,"exit 2");
+ assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.outcome,"failed");assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
+});
+test("push p4 a run stopped in pushing after a failed attempt pushes once more and escalates at most once",async()=>{
+ const t=await pushCase(PUSH_MODES.fail);assert.equal(t.escalations.length,1);
+ const journal=JSON.parse(readFileSync(t.c.journalPath,"utf8"));journal.phase="pushing";delete journal.receipt.push;writeFileSync(t.c.journalPath,JSON.stringify(journal));
+ const r=await runRelease(t.c,t.a);assert.equal(r.outcome,"released");assert.equal(r.push.outcome,"failed");
+ assert.equal(t.escalations.length,1,"escalated at most once");assert.equal(t.a.calls.filter(x=>x==="deploy:tailos").length,1);
+ const after=JSON.parse(readFileSync(t.c.journalPath,"utf8"));assert.equal(after.pushAttempts.length,2);assert.equal(after.phase,"complete");
+ // A good push on the next resume keeps the old bare shape.
+ after.phase="pushing";delete after.receipt.push;writeFileSync(t.c.journalPath,JSON.stringify(after));
+ const good=await runRelease({...t.c,push:undefined},t.a);assert.deepEqual(good.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(remoteHead(t.f),t.j.commit);
+});
+test("push p2 the push limit is a named five-minute policy and an invalid commit never runs git",()=>{
+ assert.equal(PUSH_TIMEOUT_MS,300000);const src=readFileSync(new URL("../scripts/release-runner.mjs",import.meta.url),"utf8");assert.ok(!src.includes("timeout:120000"));
+ assert.deepEqual(pushRelease(mkdtempSync(join(tmpdir(),"push-none-")),"not-a-sha",{git:"/nonexistent/git"}),{outcome:"failed",elapsedMs:0,reason:"push-failed"});
+});
+test("push p1 every push reason tag passes the receipt's reason rule, and a notice drops a malformed cause",()=>{
+ for(const tag of PUSH_REASONS)assert.equal(receiptReason(tag),tag,tag);
+ const text=pushCauseText({timedOut:"yes",exitCode:"128; rm",signal:"SIGTERM\nfatal",elapsedMs:"9; rm",reason:"token=abc",remoteCheck:"landed\nx",stderrSHA256:"<b>SYNTHETIC_PRIVATE_TOKEN</b>"});
+ assert.equal(text,"");assert.equal(pushCauseText(undefined),"");assert.equal(pushCauseText({signal:"sigkill",elapsedMs:1500,reason:"push-killed",remoteCheck:"unknown"})," Cause: signal sigkill after 2 s (push-killed). Remote check: unknown.");
 });
 test("a6 a run stopped while pushing resumes the push and finishes without redeploying",async()=>{
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);let finishes=0;a.finish=async()=>{if(++finishes===1)throw new Error("lost");a.calls.push("finish");};
@@ -1372,6 +1451,20 @@ test("D5 native finish and reconcile compare the receipt sent, or it without dia
  assert.ok(sameReceipt(diagnosed,structuredClone(diagnosed)));assert.ok(!sameReceipt(old,diagnosed),"a saved diagnostic never matches a receipt sent without it");
  for(const [sent,saved] of [[diagnosed,other],[old,diagnosed],[diagnosed,otherIdentity],[old,otherIdentity]]){
   assert.throws(()=>finish(sent,saved),/Native full receipt mismatch/);assert.throws(()=>reconcile(sent,saved),/Saved release receipt does not match pending journal/);
+ }
+ // wi_8afe404c4867dafc: a hub or tt older than the push diagnostics drops them.
+ const bare={...old,outcome:"released",revert:undefined,targets:[],push:{remote:"origin",commit,outcome:"failed"}};delete bare.revert;
+ const pushed={...bare,push:{...bare.push,timedOut:true,signal:"sigterm",elapsedMs:300004,reason:"push-timed-out",remoteCheck:"absent",stderrSHA256:"e".repeat(64)}},otherPush={...pushed,push:{...pushed.push,elapsedMs:1}};
+ const released=(sent,saved)=>validateNativeRelease(prior,{...prior,state:"released",generation:3,receipt:saved},"finish",2,[],sent);
+ const reconcileReleased=(sent,saved)=>{
+  writeFileSync(join(home,"rel_fixture.json"),JSON.stringify({jobId:"rel_fixture",commit:prior.commit,agentId:prior.agentId,runId:prior.runId,phase:"receipt_pending",finishGeneration:2,receipt:sent}));
+  reconcileReceipts({journalDirectory:home},[{...prior,state:"released",generation:3,receipt:saved}]);
+  return JSON.parse(readFileSync(join(home,"rel_fixture.json"),"utf8")).phase;
+ };
+ assert.deepEqual(withoutDiagnostics(pushed),bare);assert.ok(sameReceipt(pushed,bare));assert.ok(!sameReceipt(bare,pushed));
+ for(const [sent,saved] of [[pushed,pushed],[pushed,bare],[bare,bare]]){assert.equal(released(sent,saved).receipt,saved);assert.equal(reconcileReleased(sent,saved),"complete");}
+ for(const [sent,saved] of [[pushed,otherPush],[bare,pushed]]){
+  assert.throws(()=>released(sent,saved),/Native full receipt mismatch/);assert.throws(()=>reconcileReleased(sent,saved),/Saved release receipt does not match pending journal/);
  }
 });
 test("R5 the escalation names the TailOS waits and never echoes release.json content",async()=>{

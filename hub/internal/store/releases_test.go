@@ -1035,6 +1035,113 @@ func TestReleaseReceiptRevertAndPushValidation(t *testing.T) {
 	}
 }
 
+// wi_8afe404c4867dafc p5a: a failed push may carry typed, bounded
+// diagnostics and nothing else; a pushed one only its elapsed time; a push
+// with only remote, commit and outcome keeps validating; a released finish
+// saves the diagnostics as sent.
+func TestReleasePushDiagnosticsValidation(t *testing.T) {
+	code, zero, big, signal := 128, int64(0), int64(releaseProbeWaitMaxMs), "sigterm"
+	full := func() *api.ReleasePush {
+		return &api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "failed", TimedOut: true, ExitCode: &code, ElapsedMs: &big, Reason: "push-timed-out", RemoteCheck: "absent", StderrSHA256: strings.Repeat("e", 64)}
+	}
+	cases := []struct {
+		name    string
+		outcome string
+		edit    func(p *api.ReleasePush)
+		ok      bool
+	}{
+		{"pushed bare", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed"}
+		}, true},
+		{"failed bare", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "failed"}
+		}, true},
+		{"all fields", "released", func(p *api.ReleasePush) {}, true},
+		{"timed out alone", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "failed", TimedOut: true}
+		}, true},
+		{"exit code alone", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "failed", ExitCode: &code}
+		}, true},
+		{"signal alone", "released", func(p *api.ReleasePush) { p.ExitCode = nil; p.Signal = signal }, true},
+		{"elapsed zero", "released", func(p *api.ReleasePush) { p.ElapsedMs = &zero }, true},
+		{"each remote check", "released", func(p *api.ReleasePush) { p.RemoteCheck = "landed" }, true},
+		{"remote check unknown", "released", func(p *api.ReleasePush) { p.RemoteCheck = "unknown" }, true},
+		{"pushed with elapsed", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed", ElapsedMs: &zero}
+		}, true},
+		{"on rollback", "rolled_back", func(p *api.ReleasePush) {}, false},
+		{"on block", "blocked", func(p *api.ReleasePush) {}, false},
+		{"outcome timed_out", "released", func(p *api.ReleasePush) { p.Outcome = "timed_out" }, false},
+		{"pushed with timeout", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed", TimedOut: true}
+		}, false},
+		{"pushed with reason", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed", Reason: "push-failed"}
+		}, false},
+		{"pushed with remote check", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed", RemoteCheck: "landed"}
+		}, false},
+		{"pushed with stderr hash", "released", func(p *api.ReleasePush) {
+			*p = api.ReleasePush{Remote: "origin", Commit: candidateB, Outcome: "pushed", StderrSHA256: strings.Repeat("e", 64)}
+		}, false},
+		{"exit code zero", "released", func(p *api.ReleasePush) { c := 0; p.ExitCode = &c }, false},
+		{"exit code 256", "released", func(p *api.ReleasePush) { c := 256; p.ExitCode = &c }, false},
+		{"exit code and signal", "released", func(p *api.ReleasePush) { p.Signal = signal }, false},
+		{"signal upper", "released", func(p *api.ReleasePush) { p.ExitCode = nil; p.Signal = "SIGTERM" }, false},
+		{"signal multi-line", "released", func(p *api.ReleasePush) { p.ExitCode = nil; p.Signal = "sigterm\nfatal" }, false},
+		{"elapsed negative", "released", func(p *api.ReleasePush) { v := int64(-1); p.ElapsedMs = &v }, false},
+		{"elapsed above bound", "released", func(p *api.ReleasePush) { v := big + 1; p.ElapsedMs = &v }, false},
+		{"reason secret word", "released", func(p *api.ReleasePush) { p.Reason = "push token=abc" }, false},
+		{"reason outside pattern", "released", func(p *api.ReleasePush) { p.Reason = "push@failed" }, false},
+		{"reason multi-line", "released", func(p *api.ReleasePush) { p.Reason = "push-failed\nfatal: unable to access" }, false},
+		{"reason too long", "released", func(p *api.ReleasePush) { p.Reason = strings.Repeat("a", 161) }, false},
+		{"remote check other", "released", func(p *api.ReleasePush) { p.RemoteCheck = "maybe" }, false},
+		{"remote check multi-line", "released", func(p *api.ReleasePush) { p.RemoteCheck = "landed\n" }, false},
+		{"stderr hash short", "released", func(p *api.ReleasePush) { p.StderrSHA256 = strings.Repeat("e", 63) }, false},
+		{"stderr hash text", "released", func(p *api.ReleasePush) { p.StderrSHA256 = "fatal: unable to access\n" + strings.Repeat("e", 40) }, false},
+	}
+	for _, c := range cases {
+		p := full()
+		c.edit(p)
+		r := &api.ReleaseReceipt{Version: 1, Commit: candidateB, Outcome: c.outcome, Push: p}
+		if err := validateReleaseRefEffects(r); (err == nil) != c.ok {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+	}
+	// Round trip through finish: a released receipt with every push field is
+	// saved and read back as sent; a malformed one is refused.
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"claim", "merged"} {
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	push := full()
+	push.Commit = j.Commit
+	receipt := &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}, Push: push}
+	bad := *receipt
+	badPush := *push
+	badPush.Reason = "push-failed\nBearer abc"
+	bad.Push = &badPush
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish-bad", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: &bad}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("malformed push", err)
+	}
+	final, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: receipt})
+	if err != nil || final.State != "released" || final.Receipt == nil || !reflect.DeepEqual(final.Receipt.Push, push) {
+		t.Fatal(final.Receipt, err)
+	}
+	got, err := s.Release(ctx, task.ID, j.ID)
+	if err != nil || !reflect.DeepEqual(got.Receipt.Push, push) {
+		t.Fatal(got.Receipt, err)
+	}
+}
+
 // wi_d4e96831ab3a0038 r1-r4: a failed receipt keeps its failure, the target
 // reason and the probe waits (0 kept); a summary shows them; secret-looking or
 // malformed diagnostics are refused; an old-shape receipt keeps its exact

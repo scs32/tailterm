@@ -402,6 +402,73 @@ func TestHandReleaseRequiresRetainedTailOSCopy(t *testing.T) {
 	}
 }
 
+// wi_8afe404c4867dafc p5b: tt deployment finish sends the runner's receipt
+// file to the hub with every push diagnostic as written (a zero is kept), and
+// a receipt without them reaches the hub with the same keys as the file.
+func TestDeploymentFinishPassesPushDiagnostics(t *testing.T) {
+	var posts []api.ReleaseRequest
+	var bodies [][]byte
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		var req api.ReleaseRequest
+		_ = json.Unmarshal(b, &req)
+		posts = append(posts, req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: "rel_fixture", State: "released", Generation: 4})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	commit := strings.Repeat("c", 40)
+	finish := func(name, push string) api.ReleaseRequest {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		receipt := `{"version":1,"jobId":"rel_fixture","commit":"` + commit + `","verificationDigest":"` + strings.Repeat("d", 64) + `","targets":[],"outcome":"released","push":` + push + `}`
+		if err := os.WriteFile(path, []byte(receipt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := len(posts)
+		if _, err := captureRelayOutput(t, false, func() error {
+			return cmdDeployment(e, []string{"finish", "--job", "rel_fixture", "--generation", "3", "--request-id", "finish-" + name, "--file", path})
+		}); err != nil || len(posts) != before+1 {
+			t.Fatalf("%s: %v %d", name, err, len(posts))
+		}
+		got := posts[len(posts)-1]
+		if got.Operation != "finish" || got.Receipt == nil || got.Receipt.Push == nil {
+			t.Fatalf("%s: %+v", name, got)
+		}
+		return got
+	}
+	full := `{"remote":"origin","commit":"` + commit + `","outcome":"failed","timedOut":true,"exitCode":128,"elapsedMs":0,"reason":"push-auth-failed","remoteCheck":"absent","stderrSHA256":"` + strings.Repeat("e", 64) + `"}`
+	p := finish("full.json", full).Receipt.Push
+	if p.Remote != "origin" || p.Commit != commit || p.Outcome != "failed" || !p.TimedOut || p.ExitCode == nil || *p.ExitCode != 128 || p.Signal != "" || p.ElapsedMs == nil || *p.ElapsedMs != 0 || p.Reason != "push-auth-failed" || p.RemoteCheck != "absent" || p.StderrSHA256 != strings.Repeat("e", 64) {
+		t.Fatalf("full push %+v", p)
+	}
+	signal := `{"remote":"origin","commit":"` + commit + `","outcome":"failed","signal":"sigterm","elapsedMs":300001,"remoteCheck":"unknown"}`
+	if p = finish("signal.json", signal).Receipt.Push; p.Signal != "sigterm" || p.ExitCode != nil || p.ElapsedMs == nil || *p.ElapsedMs != 300001 || p.RemoteCheck != "unknown" {
+		t.Fatalf("signal push %+v", p)
+	}
+	bare := `{"remote":"origin","commit":"` + commit + `","outcome":"pushed"}`
+	if p = finish("bare.json", bare).Receipt.Push; *p != (api.ReleasePush{Remote: "origin", Commit: commit, Outcome: "pushed"}) {
+		t.Fatalf("bare push %+v", p)
+	}
+	// The pushes as they went over the wire: each equals the file's object.
+	for i, want := range []string{full, signal, bare} {
+		var wire struct {
+			Receipt struct {
+				Push json.RawMessage `json:"push"`
+			} `json:"receipt"`
+		}
+		if err := json.Unmarshal(bodies[i], &wire); err != nil {
+			t.Fatal(err)
+		}
+		var got, file map[string]any
+		if json.Unmarshal(wire.Receipt.Push, &got) != nil || json.Unmarshal([]byte(want), &file) != nil || !reflect.DeepEqual(got, file) {
+			t.Fatalf("push %d on the wire %s, file %s", i, wire.Receipt.Push, want)
+		}
+	}
+}
+
 // a13: tt deployment retry refuses a missing reason, entry or job and a
 // malformed, unknown or repeated --restored before any hub call, then sends
 // the handler's retry with the reason and the restored releases. The usage
