@@ -184,12 +184,28 @@ Once the ten minutes have passed the listing reports the next `attempt` even
 before anything has saved the outcome, so the runner's next request has a new
 ID: it saves the old row as `abandoned`, reserves a new handler (a new agent
 ID) and posts a new notice. This repeats every ten minutes while the handler
-keeps failing to come online. A handler registers with the hub before its
-session starts, so an abandoned attempt either never registered, and nothing
-of it runs, or it is an open handler that counts toward `handlers`, and no
-further one is reserved once the limit is reached. The runner makes one
-provision attempt per project and pass. This work never closes a handler:
-surplus handlers stay until the owner closes them.
+keeps failing to come online, up to the ceiling below. The runner's spawn
+records the handler agent before its session starts, so an abandoned attempt
+either left an agent that is not an open handler, or it is an open handler
+that counts toward `handlers`, and no further one is reserved once the limit
+is reached. The runner makes one provision attempt per project and pass. This
+work never closes a handler: surplus handlers stay until the owner closes
+them.
+
+**Ceiling.** For one entry the hub makes at most 3 automatic provisions that
+end without leaving an open handler. An attempt counts once it has ended: a
+reservation `abandoned`, or expired and not yet saved so, and one saved
+`registered` whose handler then exited, was closed or was retired. A
+reservation whose agent is an open handler is left out, because the limit
+already counts that handler (offline it stops further provisions by itself,
+online it is leased); a counted handler that is resumed is open again and
+stops counting. An attempt *came online* when it was saved `registered` or
+the hub has heard from its handler's run at all, even after the reservation
+was abandoned (the agent's `last_seen_at` is set, by any event its run
+posted); every other attempt *never came online*. At the ceiling the hub adds
+no more for the entry, a provision request answers 409, and automatic
+attempts do not resume for it; the reason says which kind the attempts were
+and how to add a handler by hand. Each entry has its own ceiling.
 
 **Reasons.** The entry's reason starts with `Waiting for a free handler of arm
 S` (or `No free database handler` without a policy) and, when the limit has
@@ -202,11 +218,16 @@ room for another handler, continues with the counts and one of:
 | Agent cap | `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29. Fix: tt team queue limit --task TSK --limit 3` (with `+ R reserved` after the open count when seats are reserved) |
 | Spec differs | `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix: PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task TSK -- --run 'SAVED RUN' --cwd 'SAVED CWD' --runtime R --model M --reasoning E --prompt "$PROMPT" (PROMPT_FILE holds the handler prompt with that template digest), or: tt team queue limit --task TSK --limit 3` |
 | Spec is for another runtime, or no spec saved | the same, with `the saved launch spec on HOST is missing` when none is saved, a command without `--run`, and the note `(…; add --run with the R launch command and the host's other launch flags, tt refuses the spec without --run)` |
+| Ceiling, every attempt never came online | `; cannot add one: 3 automatic attempts for this entry reserved a handler on HOST that never came online (last AGENT) and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on HOST: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. To add a handler by hand, set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project TSK. The entry leases a handler of arm S as soon as one is free` |
+| Ceiling, every attempt came online and stopped | the same with `that came online and later exited, was closed or was retired (last AGENT)`, and in place of the launch diagnosis `An operator must find out why the handler on HOST stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it.` |
+| Ceiling, both kinds | `…reserved a handler on HOST, of which N never came online and M came online and later exited, was closed or was retired (last AGENT, which came online) and the ceiling is 3, …` (`which never came online` when the last did not); the sentence for the operator follows the last attempt |
 
-`TSK` is the real project ID and the numbers are the real counts. The limit
-command always names the current number of matching handlers, so it is an
-exact alternative: the queue then admits only as many teams as it has
-handlers.
+`TSK` is the real project ID and the numbers are the real counts. At the
+ceiling `HOST` and `AGENT` are the latest counted attempt's, the manual add is
+worded as the queue's no-handler stall, and the entry's handler need has no
+`fix`. The limit command always names the current number of matching handlers,
+so it is an exact alternative: the queue then admits only as many teams as it
+has handlers.
 
 The spec command is safe to paste as written. `tt handler spec` replaces the
 whole saved spec, so the runner sends the saved spec's other launch flags
@@ -234,6 +255,7 @@ those handlers is offline (the hub has not heard from it for 90 seconds).
 | The offline one is the primary | the same up to `…restart a handler;`, then ` an operator can rotate NAME, the primary, to a successor. Fix: tt handler rotate --task TSK` |
 | The offline primary cannot be rotated now | the same up to `…restart a handler;`, then ` NAME is the primary, and its rotation (tt handler rotate --task TSK) is refused until this clears: DETAIL. The host runner on HOST replaces it automatically once its process and session are confirmed gone there and it has been silent for N minutes (silent M so far).` with no `Fix:`. DETAIL is the refusal `tt handler rotate` would give, such as `the handler run holds 1 live team lease(s), first ENTRY`; N is the project's silence and M the whole minutes since the run's last recorded activity. A run with no recorded activity ends `(no activity recorded from it yet).` instead |
 | The same, with the automatic replacement off | the same up to `…until this clears: DETAIL.`, then ` Automatic replacement of a dead primary is off (tt handler policy set --task TSK --revision R --dead-silence-minutes N).` with no `Fix:`; R is the policy's current revision |
+| The offline primary's activity snapshot cannot be read | as for an offline primary up to `…restart a handler;`, then ` NAME is the primary, and its activity is unknown: its activity snapshot could not be read (activity snapshot: ERROR). Its rotation (tt handler rotate --task TSK) and the host runner's automatic replacement read the same snapshot and fail with that error.` with no `Fix:`. The queue listing still succeeds; `tt handler rotate` returns the error unchanged |
 | The offline one is the project's last available handler (and not the primary) | the same up to `…restart a handler;`, then ` an operator can add another handler; NAME is the project's last available one and cannot be retired until then. Fix: set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project TSK` |
 | Several are offline | `…, and NAME1 and NAME2 are offline. …` (`NAME1, NAME2 and NAME3` for more), in lease order; the recovery and the fix are for one of them: a handler no active team leases before a leased one, and the primary last |
 

@@ -2025,7 +2025,8 @@ func TestHandlerProvisionStopsAfterThreeNeverRegisteredAttempts(t *testing.T) {
 		t.Fatalf("need at the ceiling %+v", n)
 	}
 	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last " + offered[2] +
-		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. The entry leases a handler of arm S as soon as one is free"
+		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. " +
+		"To add a handler by hand, set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project " + f.task.ID + ". The entry leases a handler of arm S as soon as one is free"
 	if stopped.BlockReason != want {
 		t.Fatalf("reason at the ceiling:\n got %s\nwant %s", stopped.BlockReason, want)
 	}
@@ -2146,10 +2147,21 @@ func TestHandlerProvisionCeilingKeepsOtherRules(t *testing.T) {
 // b1: the runner's spawn records the handler's agent before its session
 // starts. A launch that then exits at once, or is closed, leaves an agent row
 // the limit does not count, so its reservation counts toward the ceiling like
-// one whose agent never appeared.
+// one whose agent never appeared. p2: one whose own run reported, even only
+// its exit, came online; one whose run the hub never heard from did not.
 func TestHandlerProvisionCeilingCountsExitedAndClosedLaunches(t *testing.T) {
-	for _, kind := range []string{api.EventExited, api.EventClosed} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		kind    string
+		fromRun bool
+		says    string
+	}{
+		{api.EventExited, true, "came online and later exited, was closed or was retired"},
+		{api.EventClosed, true, "came online and later exited, was closed or was retired"},
+		{api.EventExited, false, "never came online"},
+		{api.EventClosed, false, "never came online"},
+	} {
+		kind := tc.kind
+		t.Run(fmt.Sprintf("%s/fromRun=%v", kind, tc.fromRun), func(t *testing.T) {
 			f := newProvisionFixture(t, 4, 3, 3)
 			ctx := context.Background()
 			id := f.entries[3].ID
@@ -2167,7 +2179,11 @@ func TestHandlerProvisionCeilingCountsExitedAndClosedLaunches(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: kind}, f.by); err != nil {
+					runID := a.RunID
+					if !tc.fromRun {
+						runID = ""
+					}
+					if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: runID, Kind: kind}, f.by); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -2180,13 +2196,175 @@ func TestHandlerProvisionCeilingCountsExitedAndClosedLaunches(t *testing.T) {
 			got := listedEntry(t, f.s, f.task.ID, id)
 			n := got.HandlerNeed
 			if n == nil || n.Provision || n.Handlers != 3 || n.Leased != 3 ||
-				!strings.Contains(got.BlockReason, "cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last "+offered[2]+") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini") {
+				!strings.Contains(got.BlockReason, "cannot add one: 3 automatic attempts for this entry reserved a handler on mini that "+tc.says+" (last "+offered[2]+") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must ") {
 				t.Fatalf("need at the ceiling %+v %q", n, got.BlockReason)
 			}
 			if _, err := f.provision(got, "at-ceiling", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
 				t.Fatalf("provision at the ceiling: %v rows %d", err, f.allRows(t))
 			}
 		})
+	}
+}
+
+// ceilingTail is the end of every ceiling reason: the manual add and the wait.
+func ceilingTail(task string) string {
+	return " To add a handler by hand, set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project " + task +
+		". The entry leases a handler of arm S as soon as one is free"
+}
+
+// p1, p5 (wi_a3c581cb936faaaf): a provisioned handler that comes online and
+// then exits, is closed or is retired counts toward the ceiling, whether its
+// reservation was saved registered or abandoned, so the replacement loop
+// stops after three and the reason names the last one and its host.
+func TestHandlerProvisionCeilingStopsHandlersThatComeOnlineThenStop(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	ctx := context.Background()
+	id := f.entries[3].ID
+	var offered []string
+	for i := 0; i < 8; i++ {
+		q := listedEntry(t, f.s, f.task.ID, id)
+		if q.HandlerNeed != nil && q.HandlerNeed.Provision {
+			agentID := api.NewID("agt")
+			if _, err := f.provision(q, runnerKey(q), agentID, armS, digestP); err != nil {
+				t.Fatalf("period %d provision: %v", i+1, err)
+			}
+			offered = append(offered, agentID)
+			n := len(offered)
+			a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: fmt.Sprintf("handler-brief-%d", n), Role: api.AgentRoleDatabaseHandler, AgentID: agentID, Host: "mini", Session: fmt.Sprintf("handler-brief-%d", n),
+				Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.online(t, a)
+			// The first and third are saved registered while online; the
+			// second is left to be abandoned after its handler is gone.
+			if n != 2 {
+				if err := withTx(f.s, func(tx *sql.Tx) error { return settleHandlerProvisions(ctx, tx, f.task.ID, f.s.now()) }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch n {
+			case 1:
+				_, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventExited}, f.by)
+			case 2:
+				_, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventClosed}, f.by)
+			default:
+				retired := api.AgentRetired
+				_, err = f.s.UpdateAgent(ctx, a.ID, api.UpdateAgentRequest{Status: &retired}, f.by)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.clock = f.clock.Add(handlerProvisionAbandonAfter)
+		observeFixtureHost(t, f.s, f.task.ID, 0, freeDiskMiB(1<<20))
+	}
+	if len(offered) != 3 || f.notices(t, provisionNotice) != 3 || f.allRows(t) != 3 || f.rows(t, "registered") != 2 {
+		t.Fatalf("after eight periods: %d reservations, %d notices, %d rows, %d registered; want 3, 3, 3, 2", len(offered), f.notices(t, provisionNotice), f.allRows(t), f.rows(t, "registered"))
+	}
+	got := listedEntry(t, f.s, f.task.ID, id)
+	n := got.HandlerNeed
+	if n == nil || n.Provision || n.Refused || n.Fix != "" || n.Handlers != 3 || n.Leased != 3 {
+		t.Fatalf("need at the ceiling %+v", n)
+	}
+	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that came online and later exited, was closed or was retired (last " + offered[2] +
+		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must find out why the handler on mini stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it." +
+		ceilingTail(f.task.ID)
+	if got.BlockReason != want {
+		t.Fatalf("reason at the ceiling:\n got %s\nwant %s", got.BlockReason, want)
+	}
+	if _, err := f.provision(got, "at-ceiling", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("provision at the ceiling: %v rows %d", err, f.allRows(t))
+	}
+}
+
+// p2, p5 (wi_a3c581cb936faaaf): a reservation saved abandoned whose handler
+// registers late came online, so once that handler is closed it counts as
+// one that came online and stopped, never as one that never came online. The
+// reason tells it apart from the attempts that never did.
+func TestHandlerProvisionLateOnlineIsNotNeverCameOnline(t *testing.T) {
+	f := newProvisionFixture(t, 4, 3, 3)
+	ctx := context.Background()
+	id := f.entries[3].ID
+	offered := f.runProvisionPeriods(t, id, 3)
+	if len(offered) != 3 {
+		t.Fatalf("offered %d", len(offered))
+	}
+	never := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last " + offered[2] +
+		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it." +
+		ceilingTail(f.task.ID)
+	if got := listedEntry(t, f.s, f.task.ID, id); got.BlockReason != never {
+		t.Fatalf("before the late registration:\n got %s\nwant %s", got.BlockReason, never)
+	}
+	if err := withTx(f.s, func(tx *sql.Tx) error { return settleHandlerProvisions(ctx, tx, f.task.ID, f.s.now()) }); err != nil {
+		t.Fatal(err)
+	}
+	if f.rows(t, "abandoned") != 3 {
+		t.Fatalf("abandoned %d", f.rows(t, "abandoned"))
+	}
+	// The third handler registers late and comes online: an open handler is
+	// left out of the count, so the ceiling no longer applies.
+	late, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "handler-late", Role: api.AgentRoleDatabaseHandler, AgentID: offered[2], Host: "mini", Session: "handler-late",
+		Runtime: armS.Runtime, TemplateDigest: digestP, HandlerModel: armS.Model, HandlerReasoning: armS.Reasoning}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.online(t, late)
+	if got := listedEntry(t, f.s, f.task.ID, id); strings.Contains(got.BlockReason, "automatic attempts for this entry") {
+		t.Fatalf("an open late handler still counted: %q", got.BlockReason)
+	}
+	// Closed later, it counts again, as one that came online.
+	if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: late.ID, RunID: late.RunID, Kind: api.EventClosed}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	got := listedEntry(t, f.s, f.task.ID, id)
+	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini, of which 2 never came online and 1 came online and later exited, was closed or was retired (last " + offered[2] +
+		", which came online) and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must find out why the handler on mini stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it." +
+		ceilingTail(f.task.ID)
+	if got.BlockReason != want || got.HandlerNeed == nil || got.HandlerNeed.Provision {
+		t.Fatalf("after the late handler closed %+v:\n got %s\nwant %s", got.HandlerNeed, got.BlockReason, want)
+	}
+	if f.rows(t, "abandoned") != 3 || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
+		t.Fatalf("rows %d abandoned %d notices %d", f.allRows(t), f.rows(t, "abandoned"), f.notices(t, provisionNotice))
+	}
+}
+
+// p4, p5 (wi_a3c581cb936faaaf, wi_65b288379eb01cc9 k1-k3): an offline
+// primary whose activity snapshot does not parse is named with unknown
+// activity and the queue listing still succeeds; tt handler rotate still
+// returns the error.
+func TestHandlerNeedUnreadableActivityOfOfflinePrimary(t *testing.T) {
+	f, idle := offlineLimitFixture(t)
+	ctx := context.Background()
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, idle.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.offline(t, idle)
+	if _, err := f.s.db.Exec(`INSERT INTO agent_activity(task_id,agent_id,run_id,state,observed_at,payload,request_id) VALUES(?,?,?,'idle',?,'{not json','malformed')`,
+		f.task.ID, idle.ID, idle.RunID, ts(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.s.ListTeamQueue(ctx, f.task.ID)
+	if err != nil || len(list.Entries) != len(f.entries) {
+		t.Fatalf("listing with a malformed snapshot: %d entries, %v", len(list.Entries), err)
+	}
+	rotate := "tt handler rotate --task " + f.task.ID
+	got := listedEntry(t, f.s, f.task.ID, f.entries[1].ID)
+	want := idle.Name + " is offline. The hub does not restart a handler; " + idle.Name + " is the primary, and its activity is unknown: its activity snapshot could not be read " +
+		"(activity snapshot: invalid character 'n' looking for beginning of object key string). Its rotation (" + rotate + ") and the host runner's automatic replacement read the same snapshot and fail with that error."
+	if n := got.HandlerNeed; n == nil || n.Provision || n.Fix != "" || strings.Contains(got.BlockReason, "Fix: ") || !strings.HasSuffix(got.BlockReason, want) {
+		t.Fatalf("unreadable primary need %+v\nreason %q\n  want %q", n, got.BlockReason, want)
+	}
+	// The rotation itself is unchanged: it reads the snapshot and fails.
+	task, err := f.s.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: "rotate-malformed",
+		ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: idle.ID, OldRunID: idle.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(idle.Name, task.HandlerRevision),
+		Reason: api.HandlerRotationReasonManual, Trigger: api.HandlerRotationTriggerOwner}, f.by)
+	if err == nil || !strings.HasPrefix(err.Error(), "activity snapshot: ") {
+		t.Fatalf("rotation with a malformed snapshot: %v", err)
 	}
 }
 

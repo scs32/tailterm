@@ -1650,11 +1650,13 @@ const noFreeHandlerReason = "No free database handler"
 // register online before its reservation stops holding the next one.
 const handlerProvisionAbandonAfter = 10 * time.Minute
 
-// handlerProvisionMaxNeverRegistered is how many reservations for one queue
-// entry may expire with no handler coming online before the hub stops adding
-// one for it. Three ride out a transient launch failure; a launch that fails
-// every time needs a person, not a notice every ten minutes.
-const handlerProvisionMaxNeverRegistered = 3
+// handlerProvisionCeiling is how many automatic provisions for one queue
+// entry may end without leaving an open handler before the hub stops adding
+// one for it: handlers that never came online and handlers that came online
+// and then exited, were closed or were retired count alike. Three ride out a
+// transient failure; a handler that fails every time needs a person, not a
+// notice every ten minutes.
+const handlerProvisionCeiling = 3
 
 const handlerProvisionNoticeSubject = "Automatic handler provision"
 
@@ -1735,23 +1737,55 @@ func settleHandlerProvisions(ctx context.Context, tx *sql.Tx, task string, now t
 	return err
 }
 
-// neverRegisteredProvisions counts an entry's reservations that expired with
-// no handler coming online, and returns the latest one's agent and host. The
-// reserved row with the given ID counts once it is abandoned although not
-// saved as such. The runner's spawn records the agent before its session
-// starts, so a launch that exits at once or is closed leaves an agent row:
-// that reservation counts too. Only a reservation whose agent is an open
-// handler is left out, because the limit already counts that handler (offline
-// it stops further provisions by itself, online it is leased).
-func neverRegisteredProvisions(ctx context.Context, q queryRower, entryID, expiredID string) (count int, agentID, host string, err error) {
-	err = q.QueryRowContext(ctx, `SELECT count(*) OVER (),p.agent_id,p.host FROM handler_provisions p
- WHERE p.entry_id=? AND (p.state='abandoned' OR (p.state='reserved' AND p.id=?))
+// endedProvisions is what an entry's automatic provisions that left no open
+// handler came to, and the latest one's agent and host.
+type endedProvisions struct {
+	neverOnline, cameOnline int
+	lastAgent, lastHost     string
+	lastOnline              bool
+}
+
+func (p endedProvisions) count() int { return p.neverOnline + p.cameOnline }
+
+// entryEndedProvisions reads an entry's automatic provisions that ended
+// without leaving an open handler: abandoned ones, registered ones whose
+// handler later exited, was closed or was retired, and the reserved row with
+// the given ID, which counts once it is abandoned although not saved as such.
+// The runner's spawn records the agent before its session starts, so a launch
+// that never starts leaves an agent row too. A reservation whose agent is an
+// open handler is left out, because the limit already counts that handler
+// (offline it stops further provisions by itself, online it is leased).
+//
+// One came online when it was saved registered or the hub heard from its
+// agent's run at all, even after the reservation was abandoned; every other
+// one never came online.
+func entryEndedProvisions(ctx context.Context, q queryRower, entryID, expiredID string) (endedProvisions, error) {
+	var out endedProvisions
+	rows, err := q.QueryContext(ctx, `SELECT p.agent_id,p.host,p.state='registered' OR COALESCE((SELECT a.last_seen_at FROM agents a WHERE a.id=p.agent_id),'')<>''
+ FROM handler_provisions p
+ WHERE p.entry_id=? AND (p.state IN ('registered','abandoned') OR (p.state='reserved' AND p.id=?))
  AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id=p.agent_id AND a.role=? AND a.status NOT IN (?,?,?))
- ORDER BY p.created_at DESC,p.rowid DESC LIMIT 1`, entryID, expiredID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, api.AgentRetired).Scan(&count, &agentID, &host)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, "", "", nil
+ ORDER BY p.created_at DESC,p.rowid DESC`, entryID, expiredID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, api.AgentRetired)
+	if err != nil {
+		return out, err
 	}
-	return count, agentID, host, err
+	defer rows.Close()
+	for rows.Next() {
+		var agentID, host string
+		var online bool
+		if err := rows.Scan(&agentID, &host, &online); err != nil {
+			return out, err
+		}
+		if out.count() == 0 {
+			out.lastAgent, out.lastHost, out.lastOnline = agentID, host, online
+		}
+		if online {
+			out.cameOnline++
+		} else {
+			out.neverOnline++
+		}
+	}
+	return out, rows.Err()
 }
 
 // clearHandlerProvisionRefusal drops an entry's standing spec refusal, as
@@ -1906,7 +1940,7 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 	if c.over != nil {
 		expiredID = c.over.id
 	}
-	unregistered, lastAgent, lastHost, err := neverRegisteredProvisions(ctx, q, e.ID, expiredID)
+	ended, err := entryEndedProvisions(ctx, q, e.ID, expiredID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1919,17 +1953,11 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 			n.AgentID = c.pending.agentID
 		}
 		n.Reason = counts + "; the runner is adding one"
-	case unregistered >= handlerProvisionMaxNeverRegistered:
-		// A launch that fails the same way every time is not retried for
+	case ended.count() >= handlerProvisionCeiling:
+		// A handler that fails the same way every time is not replaced for
 		// ever. The hub runs and resets nothing: the entry waits for a
 		// handler like any other, and says what a person should look at.
-		wanted := "a handler"
-		if n.Arm != "" {
-			wanted = "a handler of arm " + n.Arm
-		}
-		on := provisionText(lastHost)
-		n.Reason = fmt.Sprintf("%s; cannot add one: %d automatic attempts for this entry reserved a handler on %s that never came online (last %s) and the ceiling is %d, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on %s: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. The entry leases %s as soon as one is free",
-			counts, unregistered, on, lastAgent, handlerProvisionMaxNeverRegistered, on, wanted)
+		n.Reason = counts + "; cannot add one: " + ceilingText(e.TaskID, n.Arm, ended)
 	case c.capOpen+c.capSeats+seats+1 > c.maxAgents:
 		// The new handler and the waiting team must both fit, so a provision
 		// is never what pushes the team over the cap.
@@ -1956,6 +1984,39 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		}
 	}
 	return n, ": " + n.Reason, nil
+}
+
+// ceilingText says why the ceiling stops automatic provisions for an entry:
+// whether its handlers never came online or came online and then stopped, the
+// latest one and its host, what an operator should look at there, and how to
+// add a handler by hand, worded as the queue's no-handler stall
+// (team_queue_stall.go).
+func ceilingText(task, arm string, p endedProvisions) string {
+	const never, stopped = "never came online", "came online and later exited, was closed or was retired"
+	on := provisionText(p.lastHost)
+	what, last := " that "+never, provisionText(p.lastAgent)
+	switch {
+	case p.neverOnline == 0:
+		what = " that " + stopped
+	case p.cameOnline > 0:
+		what = fmt.Sprintf(", of which %d %s and %d %s", p.neverOnline, never, p.cameOnline, stopped)
+		if p.lastOnline {
+			last += ", which came online"
+		} else {
+			last += ", which " + never
+		}
+	}
+	look := fmt.Sprintf("An operator must diagnose the handler launch on %s: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it.", on)
+	if p.lastOnline {
+		look = fmt.Sprintf("An operator must find out why the handler on %s stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it.", on)
+	}
+	wanted := "a handler"
+	if arm != "" {
+		wanted = "a handler of arm " + arm
+	}
+	return fmt.Sprintf("%d automatic attempts for this entry reserved a handler on %s%s (last %s) and the ceiling is %d, so the hub adds no more and automatic attempts do not resume for this entry. %s "+
+		"To add a handler by hand, set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project %s. The entry leases %s as soon as one is free",
+		p.count(), on, what, last, handlerProvisionCeiling, look, task, wanted)
 }
 
 // firstOffline picks the offline handler whose recovery is stated. Any one
@@ -1995,6 +2056,14 @@ func (c *handlerNeedContext) offlineHandlerFix(ctx context.Context, q queryRower
 	if h.AgentID == c.primaryID {
 		rotate := fmt.Sprintf("tt handler rotate --task %s", task)
 		busy, err := loadHandlerBusy(ctx, q, task, api.Agent{ID: h.AgentID, RunID: h.RunID})
+		if unreadableActivity(err) {
+			// One malformed snapshot must not fail the whole listing. The
+			// activity is unknown, and tt handler rotate and the host runner's
+			// replacement read the same snapshot and stop with this error, so
+			// neither is the fix.
+			return fmt.Sprintf("%s is the primary, and its activity is unknown: its activity snapshot could not be read (%s). Its rotation (%s) and the host runner's automatic replacement read the same snapshot and fail with that error.",
+				shown, provisionText(err.Error()), rotate), "", nil
+		}
 		if err != nil {
 			return "", "", err
 		}
@@ -2021,6 +2090,14 @@ func (c *handlerNeedContext) offlineHandlerFix(ctx context.Context, q queryRower
 		name = h.AgentID
 	}
 	return fmt.Sprintf("an operator can retire %s so that it stops counting and one can be added.", shown), fmt.Sprintf("tt retire --task %s %s", task, name), nil
+}
+
+// unreadableActivity reports whether loadHandlerBusy failed only because the
+// run's activity snapshot does not parse.
+func unreadableActivity(err error) bool {
+	var syntax *json.SyntaxError
+	var typed *json.UnmarshalTypeError
+	return errors.As(err, &syntax) || errors.As(err, &typed)
 }
 
 // deadPrimaryText says what the product does about an offline, busy primary:
