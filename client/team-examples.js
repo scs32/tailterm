@@ -58,6 +58,11 @@ const queueStartAmendmentRule =
 const storeRaceRule =
   "A store race check names the sharded command the matrix uses, run from hub/: node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store.";
 const storeRaceLeadRule = "Store race checks run sharded.";
+// After the verification plan freezes, a later same-criteria ASSIGN becomes
+// the scope's saved assignment (wi_18fec625e6133919), so corrections go as
+// REQUEST (docs/objective-verification.md, "Freeze, run and import").
+const postPlanRequestRule =
+  "After the verification plan freezes, send builder corrections, focused fixes and rebase asks as REQUEST, never a new ASSIGN: a same-criteria ASSIGN becomes the scope's saved assignment and stales the plan and receipt.";
 // Where a verification checkout goes, so the worktree sweep reclaims it
 // (docs/project-queue.md, "Verifier checkouts").
 const verifyCheckoutPlace =
@@ -116,7 +121,7 @@ ${queueStartRule} ${queueStartAmendmentRule} Else send no Start, plan or assignm
 
 On builder's RESULT with a frozen commit, check each criterion, send reviewer a REVIEW naming that commit, the scope and the criteria. Two review rounds: one consolidated blocker list, then only its fixes and regressions. Then choose exactly one disposition: release, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. No third general review, even after scope revisions. Never reset its lifetime count. Send focused verification and the disposition NOTICE with tt send --review-file PATH. Its kind is accept, owner-decision or follow-ups; accept needs passing frozen criteria and resolved blockers. Focused verification names the exact candidate, fix and blocker IDs, checked by the original reviewer or a linked-item verifier. Follow-ups are filed and held for triage.
 
-Verify alongside review, at once: freeze the plan on the current tasks-hub tip with tt verification plan and REQUEST the distinct verifier. Each later candidate gets a fresh run, targeted from the previous one for fixes; withdraw the superseded REQUEST. The final candidate, rebased onto the current tip, gets the full plan once. Accept only with the hub-saved passing receipt for the exact final SHA.
+Verify alongside review, at once: freeze the plan on the current tasks-hub tip with tt verification plan and REQUEST the distinct verifier. Each later candidate gets a fresh run, targeted from the previous one for fixes; withdraw the superseded REQUEST. ${postPlanRequestRule} The final candidate, rebased onto the current tip, gets the full plan once. Accept only with the hub-saved passing receipt for the exact final SHA.
 
 If a teammate leaves directed work without a reply for 30 minutes, send that teammate one nudge. The broker escalates overdue work itself; do not send a message to escalate a teammate's stall to the owner. Save done yourself with the accepted --worktree, --branch and --commit (tt work-items update --status done). Once it returns its receipt and all team obligations are closed, run tt close --team.`,
         { runtime: "claude", reasoning: "medium", format: true },
@@ -580,7 +585,7 @@ Read the item, its work order and this queue entry's owned paths, then send buil
 
 ${queueStartRule} ${queueStartAmendmentRule} Send no Start, plan or assignment gate REQUESTs otherwise; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and notifies reviewer and handler of the import. Ask the handler only when the hub refuses, quoting its reason.
 
-On builder's frozen-commit RESULT, check each criterion, send reviewer a REVIEW naming that commit, scope and criteria, and at once freeze the verification plan on the current tasks-hub tip. Verify it yourself: a fresh clean detached worktree at the exact SHA ${verifyCheckoutPlace}, node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. Never import a targeted-receipt.json.
+On builder's frozen-commit RESULT, check each criterion, send reviewer a REVIEW naming that commit, scope and criteria, and at once freeze the verification plan on the current tasks-hub tip. Verify it yourself: a fresh clean detached worktree at the exact SHA ${verifyCheckoutPlace}, node scripts/verify-matrix.mjs run PLAN_JSON EXTERNAL_LOG_DIRECTORY. Start it at once; it waits its turn in the host lock's ordered waitlist (position: tt team queue list). Never wait for an idle host by hand (no pgrep or sleep loops), and run no ad hoc tests while your run holds or waits for the host. Never import a targeted-receipt.json. ${postPlanRequestRule}
 
 Two review rounds: one consolidated blocker list, then only its fixes and regressions. Then send exactly one disposition with tt send --review-file PATH: accept, one focused fix with verification, an explicit scope reduction mapped to criteria, or a release block with owner, next action and resume condition. Never reset its lifetime count. Accept only with the hub-saved passing receipt for the exact final SHA rebased on tasks-hub.
 

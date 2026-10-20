@@ -91,6 +91,15 @@ This is declared shared-workspace
 provenance, under the same trust boundary as other owner messages. Canonical digests use recursively sorted JSON
 keys, UTF-8 bytes and SHA-256; matrixDigest hashes the exact matrix file bytes.
 
+The plan's `assignmentSeq` must be the scope's saved assignment: the latest
+ASSIGN of that scope revision. A later ASSIGN with the same criteria becomes
+the saved assignment (one with changed criteria is refused), and the earlier
+plan and its receipt then fail with `assignment changed` and show stale on
+the queue entry. After the verification plan freezes, the lead sends the
+builder corrections, focused fixes and rebase asks as REQUEST,
+never a new ASSIGN. If a new ASSIGN is unavoidable, freeze a new plan naming
+it before the next run.
+
 ```sh
 node scripts/verify-matrix.mjs plan context.json plan.json
 # Database handler only, on the candidate CLI:
