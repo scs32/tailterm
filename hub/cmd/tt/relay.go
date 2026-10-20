@@ -746,6 +746,10 @@ func claudeWakeFor(b runtimeBinding, prompt string) string {
 // runtime process are verified. The helper is not wrapped, so nothing else
 // heartbeats for it; with the session gone it goes offline within 90 seconds
 // and the relay's usual offline skip applies. It writes only for a live run.
+// When the hub shows the bound run closed or exited (an owner close from
+// TailOS or tt close), it marks this host's helper file for that exact run,
+// so the session is no longer ledgered; nothing else on the host sees an
+// owner close, since relay cleanup skips owner helpers.
 func relayHelperHeartbeat(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Client, now time.Time, probe activityProbe) error {
 	if b.Role != api.AgentRoleOwnerHelper || now.Sub(p.LastHeartbeat) < 30*time.Second {
 		return nil
@@ -754,6 +758,10 @@ func relayHelperHeartbeat(ctx context.Context, b runtimeBinding, p *relayProgres
 	a, err := c.GetAgent(ctx, b.Task, b.Agent)
 	if err != nil {
 		return err
+	}
+	if a.RunID == b.Run && a.Role == api.AgentRoleOwnerHelper && (a.Status == api.AgentClosed || a.Status == api.AgentExited) {
+		// A file naming another agent or run, or already marked, is unchanged.
+		return markOwnerHelperClosed(ctx, b.Hub, b.Task, b.Agent, b.Run)
 	}
 	if a.RunID != b.Run || a.Role != api.AgentRoleOwnerHelper || a.Status == api.AgentClosed || a.Status == api.AgentExited {
 		return nil

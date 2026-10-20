@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -3542,4 +3543,181 @@ func TestClaudeBrokerPromptFullTextPointerOnlyForReadMessages(t *testing.T) {
 	if got := claudeBrokerFullText("", 7); got != "" {
 		t.Fatalf("empty prompt became %q", got)
 	}
+}
+
+// An owner close (TailOS or tt close) is seen on this host only by the relay's
+// helper heartbeat (bug wi_b134e2c694f51b54): for the binding's exact run shown
+// closed or exited, it marks the helper file once and posts no heartbeat, so
+// the session's later calls are not ledgered. An open run and a file naming a
+// newer run are left as they are.
+func TestRelayHelperHeartbeatMarksOwnerClosedRun(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the identity is the subject here, not timing
+	var mu sync.Mutex
+	var current api.Agent
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/events") {
+			posts++
+			json.NewEncoder(w).Encode(api.Event{})
+			return
+		}
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/agents/"+helperLedgerAgent) {
+			t.Errorf("unexpected hub call %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(current)
+	}))
+	defer server.Close()
+	c, err := api.NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alive := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	setHub := func(run, status string) {
+		mu.Lock()
+		defer mu.Unlock()
+		current, posts = api.Agent{ID: helperLedgerAgent, RunID: run, Role: api.AgentRoleOwnerHelper, Status: status, Online: status == api.AgentRunning}, 0
+	}
+	hubPosts := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return posts
+	}
+	// setup gives an isolated host with the helper file and its relay binding
+	// for helperLedgerRun, and the helper's Claude session.
+	setup := func(t *testing.T) (root string, file ownerHelperFile, b runtimeBinding, e env) {
+		root, _ = helperLedgerSandbox(t)
+		file = helperLedgerFile()
+		file.Hub = server.URL
+		writeHelperLedgerFile(t, file)
+		t.Setenv("CLAUDE_CODE_SESSION_ID", file.Thread)
+		b = runtimeBinding{Hub: server.URL, Task: file.Task, Agent: file.Agent, Run: file.Run, Thread: file.Thread, Runtime: "claude", Role: api.AgentRoleOwnerHelper}
+		return root, file, b, helperLedgerEnv(t)
+	}
+	call := func(id string) map[string]any {
+		return map[string]any{"session_id": helperLedgerThread, "tool_use_id": id, "tool_name": "Bash", "tool_input": map[string]any{"command": "ls"}, "duration_ms": 1}
+	}
+	hookCall := func(t *testing.T, e env, id string) {
+		t.Helper()
+		toolHook(t, e, "PreToolUse", call(id))
+		toolHook(t, e, "PostToolUse", call(id))
+	}
+	now := time.Now()
+
+	for _, status := range []string{api.AgentClosed, api.AgentExited} {
+		t.Run(status, func(t *testing.T) {
+			root, file, b, e := setup(t)
+			hookCall(t, e, "u1")
+			if rows := toolLedgerRows(t, root, file.Agent); len(rows) != 1 {
+				t.Fatalf("open helper rows = %v", rows)
+			}
+			setHub(file.Run, status)
+			var p relayProgress
+			if err := relayHelperHeartbeat(context.Background(), b, &p, c, now, alive); err != nil {
+				t.Fatal(err)
+			}
+			want := file
+			want.ClosedRun = file.Run
+			if state, err := loadOwnerHelperFile(file.Hub, file.Task); err != nil || state != want {
+				t.Fatalf("helper file %+v %v; want %+v", state, err, want)
+			}
+			if n := hubPosts(); n != 0 {
+				t.Fatalf("%s run posted %d heartbeat(s)", status, n)
+			}
+			if _, ok := offlineOwnerHelper(); ok {
+				t.Fatal("the offline lookup still matches the closed run")
+			}
+			hookCall(t, e, "u2")
+			if rows := toolLedgerRows(t, root, file.Agent); len(rows) != 1 {
+				t.Fatalf("a call after the close was ledgered: %v", rows)
+			}
+			// A later pass leaves the marked file as it is.
+			path := ownerHelperPath(file.Hub, file.Task)
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := relayHelperHeartbeat(context.Background(), b, &p, c, now.Add(31*time.Second), alive); err != nil {
+				t.Fatal(err)
+			}
+			if after, err := os.Stat(path); err != nil || !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) {
+				t.Fatalf("a second pass rewrote the marked file: %v", err)
+			}
+			if n := hubPosts(); n != 0 {
+				t.Fatalf("second pass posted %d heartbeat(s)", n)
+			}
+		})
+	}
+
+	t.Run("mark error", func(t *testing.T) {
+		_, file, b, _ := setup(t)
+		dir := filepath.Dir(ownerHelperPath(file.Hub, file.Task))
+		if err := os.Chmod(dir, 0500); err != nil { // the host lock cannot be created
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(dir, 0700) })
+		setHub(file.Run, api.AgentClosed)
+		var p relayProgress
+		if err := relayHelperHeartbeat(context.Background(), b, &p, c, now, alive); err == nil {
+			t.Fatal("a failed mark returned no error")
+		}
+		if n := hubPosts(); n != 0 {
+			t.Fatalf("a failed mark posted %d heartbeat(s)", n)
+		}
+		if state, err := loadOwnerHelperFile(file.Hub, file.Task); err != nil || state != file {
+			t.Fatalf("helper file %+v %v", state, err)
+		}
+	})
+
+	t.Run("open", func(t *testing.T) {
+		root, file, b, e := setup(t)
+		path := ownerHelperPath(file.Hub, file.Task)
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setHub(file.Run, api.AgentRunning)
+		var p relayProgress
+		if err := relayHelperHeartbeat(context.Background(), b, &p, c, now, alive); err != nil {
+			t.Fatal(err)
+		}
+		if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("open run changed the helper file: %s %v", after, err)
+		}
+		if n := hubPosts(); n != 1 {
+			t.Fatalf("open run posted %d heartbeat(s); want 1", n)
+		}
+		hookCall(t, e, "u1")
+		if rows := toolLedgerRows(t, root, file.Agent); len(rows) != 1 || rows[0]["run"] != file.Run {
+			t.Fatalf("open helper rows = %v", rows)
+		}
+	})
+
+	t.Run("re-registered", func(t *testing.T) {
+		// The old run's binding is still read while the file already names
+		// the run a later registration returned.
+		root, file, b, e := setup(t)
+		newer := file
+		newer.Run = "run_helper_newer"
+		writeHelperLedgerFile(t, newer)
+		setHub(file.Run, api.AgentClosed)
+		var p relayProgress
+		if err := relayHelperHeartbeat(context.Background(), b, &p, c, now, alive); err != nil {
+			t.Fatal(err)
+		}
+		if state, err := loadOwnerHelperFile(newer.Hub, newer.Task); err != nil || state != newer {
+			t.Fatalf("the newer registration was marked: %+v %v", state, err)
+		}
+		if n := hubPosts(); n != 0 {
+			t.Fatalf("closed run posted %d heartbeat(s)", n)
+		}
+		hookCall(t, e, "u1")
+		if rows := toolLedgerRows(t, root, newer.Agent); len(rows) != 1 || rows[0]["run"] != newer.Run {
+			t.Fatalf("re-registered helper rows = %v; want one under %s", rows, newer.Run)
+		}
+	})
 }
