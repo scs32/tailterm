@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,11 @@ import (
 // its pane fields. PanePID and PaneStarted identify the session's single pane
 // process; Shell is the login shell the wrapper leaves in that pane after the
 // runtime exits. Only the wrapper records Shell; adoption never does.
+// ExitReportedAt is when the hub accepted the wrapper's exit report, or
+// showed on a refusal that it already holds this run's exit.
+// ExitReportStopped says why the wrapper stopped retrying a lost exit report
+// without that acceptance. Only the wrapper records either, and only after
+// ExitedAt.
 type runtimeProcessReceipt struct {
 	Hub            string    `json:"hub"`
 	Task           string    `json:"task"`
@@ -44,6 +50,9 @@ type runtimeProcessReceipt struct {
 	SessionCreated string    `json:"sessionCreated,omitempty"`
 	SessionError   string    `json:"sessionError,omitempty"`
 	ExitedAt       time.Time `json:"exitedAt,omitempty"`
+	// See the type comment.
+	ExitReportedAt    time.Time `json:"exitReportedAt,omitempty"`
+	ExitReportStopped string    `json:"exitReportStopped,omitempty"`
 }
 
 // A busy host can take longer than the first deadline just to start tmux, and
@@ -140,15 +149,176 @@ func wrapperPane(sessionID string) (int, string) {
 	return panes[0], started
 }
 
-func recordRuntimeExit(e env) {
+// ownRuntimeReceipt reads the wrapper's own receipt and its path. ok is false
+// unless it names this exact hub, project, agent, run, session and socket.
+func ownRuntimeReceipt(e env) (runtimeProcessReceipt, string, bool) {
 	path := runtimeProcessPath(e.hub, e.agent, e.runID)
 	var receipt runtimeProcessReceipt
 	data, err := os.ReadFile(path)
 	if err != nil || json.Unmarshal(data, &receipt) != nil || receipt.Hub != e.hub || receipt.Task != e.task || receipt.Agent != e.agent || receipt.Run != e.runID || receipt.Session != os.Getenv(spawn.EnvSession) || receipt.Socket != os.Getenv("TT_TMUX_SOCKET") {
-		return
+		return runtimeProcessReceipt{}, path, false
+	}
+	return receipt, path, true
+}
+
+// recordRuntimeExit writes the runtime's exit into the wrapper's own receipt.
+// It returns that receipt, and true only when the exit was saved.
+func recordRuntimeExit(e env) (runtimeProcessReceipt, bool) {
+	receipt, path, ok := ownRuntimeReceipt(e)
+	if !ok {
+		return receipt, false
 	}
 	receipt.ExitedAt = time.Now().UTC()
+	return receipt, writePrivateJSON(path, receipt) == nil
+}
+
+// recordRuntimeExitReport records in the wrapper's own receipt, after its
+// recorded exit, either when the hub accepted the exit report or why the
+// wrapper stopped retrying it.
+func recordRuntimeExitReport(e env, accepted time.Time, stopped string) {
+	receipt, path, ok := ownRuntimeReceipt(e)
+	if !ok || receipt.ExitedAt.IsZero() {
+		return
+	}
+	if accepted.IsZero() {
+		receipt.ExitReportStopped = stopped
+	} else {
+		receipt.ExitReportedAt = accepted.UTC()
+	}
 	_ = writePrivateJSON(path, receipt)
+}
+
+// exitReportText is the wrapper's exit report. The hub's exited-primary rule
+// accepts only this exact text, so a retry posts it unchanged.
+func exitReportText(code int) string { return fmt.Sprintf("Process exited (%d)", code) }
+
+// exitReportBackoff is the wait before each retry of a lost exit report; the
+// last wait repeats.
+var exitReportBackoff = []time.Duration{15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute}
+
+// exitReporter retries the wrapper's exit report after its first post
+// failed. post sends the exited event, agent reads this agent from the hub,
+// table reads the host's process table without the reader's own ps, self is
+// the wrapper's process ID and after waits.
+type exitReporter struct {
+	post  func(ctx context.Context, text string) error
+	agent func(ctx context.Context) (api.Agent, error)
+	table func(ctx context.Context) (map[int]discoveredProcess, error)
+	self  func() int
+	after func(time.Duration) <-chan time.Time
+}
+
+func productionExitReporter(e env) exitReporter {
+	return exitReporter{
+		post: func(_ context.Context, text string) error { return postEvent(e, api.EventExited, text, nil) },
+		agent: func(ctx context.Context) (api.Agent, error) {
+			c, err := e.client(5 * time.Second)
+			if err != nil {
+				return api.Agent{}, err
+			}
+			ctx, cancel := context.WithTimeout(ctx, max(5*time.Second, minCommandTimeout))
+			defer cancel()
+			return c.GetAgent(ctx, e.task, e.agent)
+		},
+		table: wrapperProcessTable, self: os.Getpid, after: time.After,
+	}
+}
+
+// deliver retries the exit report until the hub accepts it, refuses it for
+// good, or ctx ends with the pane's login shell. It posts only while the
+// wrapper's own receipt records the exit and no outcome, and only while the
+// pane holds just the wrapper and its idle login shell, the death probe's own
+// rule: a runtime started again in that shell is never reported exited. An
+// unreadable process table, a busy pane, a transport failure, a 429 or a 5xx
+// waits for the next attempt.
+func (r exitReporter) deliver(ctx context.Context, e env, code int) {
+	text := exitReportText(code)
+	for attempt := 0; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.after(exitReportBackoff[min(attempt, len(exitReportBackoff)-1)]):
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		receipt, _, ok := ownRuntimeReceipt(e)
+		if !ok || receipt.ExitedAt.IsZero() || !receipt.ExitReportedAt.IsZero() || receipt.ExitReportStopped != "" {
+			return
+		}
+		if receipt.PanePID < 1 || receipt.PanePID != r.self() || receipt.PaneStarted == "" || receipt.Shell == "" {
+			recordRuntimeExitReport(e, time.Time{}, "the receipt records no pane process of this wrapper, so its host cannot confirm the exit")
+			return
+		}
+		processes, err := r.table(ctx)
+		if err != nil {
+			continue
+		}
+		if state, _ := idleShellTree(processes, receipt); state != handlerProbeGone {
+			continue
+		}
+		err = r.post(ctx, text)
+		if err == nil {
+			recordRuntimeExitReport(e, time.Now(), "")
+			return
+		}
+		var refused *api.HTTPError
+		if !errors.As(err, &refused) || refused.Status < 400 || refused.Status == http.StatusTooManyRequests || refused.Status >= 500 {
+			continue
+		}
+		if refused.Status != http.StatusConflict {
+			recordRuntimeExitReport(e, time.Time{}, fmt.Sprintf("the hub refused the exit report: %d %s", refused.Status, refused.Msg))
+			return
+		}
+		// An earlier post may have reached the hub with its response lost:
+		// the hub then holds this run's exit and refuses another event.
+		a, err := r.agent(ctx)
+		if err != nil {
+			continue
+		}
+		if a.RunID == e.runID && a.Status == api.AgentExited {
+			recordRuntimeExitReport(e, time.Now(), "")
+		} else {
+			recordRuntimeExitReport(e, time.Time{}, fmt.Sprintf("the hub refused the exit report: %d %s; the agent is %s on %s", refused.Status, refused.Msg, a.Status, a.RunID))
+		}
+		return
+	}
+}
+
+// wrapperProcessTable reads the host's process table without the ps process
+// it starts. The wrapper is the pane's process, so its own ps would be a
+// second child beside the login shell while it reads.
+func wrapperProcessTable(ctx context.Context) (map[int]discoveredProcess, error) {
+	var out processTableOutput
+	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=")
+	cmd.Stdout = &out
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	ps := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+	return parseWrapperProcessTable(out.String(), ps)
+}
+
+func parseWrapperProcessTable(raw string, ps int) (map[int]discoveredProcess, error) {
+	processes, err := parseProcessTable(raw)
+	if err != nil {
+		return nil, err
+	}
+	delete(processes, ps)
+	return processes, nil
+}
+
+// processTableOutput bounds ps output to what maxProcessTable rows can need.
+type processTableOutput struct{ bytes.Buffer }
+
+func (w *processTableOutput) Write(p []byte) (int, error) {
+	if w.Len()+len(p) > maxProcessTable*256 {
+		return 0, errors.New("process table output too large")
+	}
+	return w.Buffer.Write(p)
 }
 
 type runtimePIDProbe func(pid int, created string) (alive bool, err error)

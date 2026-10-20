@@ -1685,6 +1685,9 @@ func cmdWrap(e env, args []string) error {
 			_ = postEvent(e, kind, text, nil)
 		}
 	}
+	// A lost exit report is retried until the pane's login shell ends.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	stopped := make(chan struct{})
 	return spawn.Wrap(command, func(pid int) {
 		recordRuntimeProcess(e, pid)
@@ -1703,9 +1706,30 @@ func cmdWrap(e env, args []string) error {
 		}()
 	}, func(code int) {
 		close(stopped)
-		recordRuntimeExit(e)
-		report(api.EventExited, fmt.Sprintf("Process exited (%d)", code))
+		wrapperExited(ctx, e, code, productionExitReporter(e))
 	})
+}
+
+// wrapperExited records the runtime's exit in the wrapper's receipt and
+// reports it to the hub. When that post fails and the receipt holds the
+// exit, the report is retried in the background until ctx ends; it reports
+// whether that retry started. Without a recorded exit nothing is retried.
+func wrapperExited(ctx context.Context, e env, code int, r exitReporter) bool {
+	_, recorded := recordRuntimeExit(e)
+	if e.task == "" || e.agent == "" || e.hub == "" {
+		return false
+	}
+	if err := postEvent(e, api.EventExited, exitReportText(code), nil); err == nil {
+		if recorded {
+			recordRuntimeExitReport(e, time.Now(), "")
+		}
+		return false
+	}
+	if !recorded {
+		return false
+	}
+	go r.deliver(ctx, e, code)
+	return true
 }
 
 func wrapCommand(args []string) (string, error) {

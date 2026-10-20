@@ -1,18 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 func TestExactRuntimeAbsenceWithSurvivingTmux(t *testing.T) {
@@ -155,13 +163,18 @@ func TestWrapperRecordsExactProcessAndExit(t *testing.T) {
 	if err := nativeRuntimeSessionProbe(reused); err == nil {
 		t.Fatal("accepted reused tmux session")
 	}
-	recordRuntimeExit(e)
+	other := e
+	other.runID = "run_00000000000000cc"
+	if _, ok := recordRuntimeExit(other); ok {
+		t.Fatal("recorded the exit of another run")
+	}
+	saved, ok := recordRuntimeExit(e)
 	data, err = os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = json.Unmarshal(data, &receipt); err != nil || receipt.ExitedAt.IsZero() {
-		t.Fatalf("exit receipt: %+v %v", receipt, err)
+	if err = json.Unmarshal(data, &receipt); err != nil || receipt.ExitedAt.IsZero() || !ok || saved != receipt {
+		t.Fatalf("exit receipt: %+v %v returned %+v %t", receipt, err, saved, ok)
 	}
 }
 
@@ -629,4 +642,455 @@ func TestActivityAdoptionNeverReplacesUncertainReceipts(t *testing.T) {
 	if saved.ExitedAt.IsZero() {
 		t.Fatal("lost wrapper exit receipt")
 	}
+}
+
+// exitReportHub is an isolated in-process hub with one running agent whose
+// wrapper's receipt records its runtime's exit (wi_b01a7afa10979dd0). answer
+// scripts the hub's reply to each exited post, counted from 0: 0 passes it
+// to the hub, -1 drops the connection, and any other value is that status.
+type exitReportHub struct {
+	c      *api.Client
+	e      env
+	agent  api.Agent
+	mu     sync.Mutex
+	posts  int
+	answer func(n int) int
+}
+
+func newExitReportHub(t *testing.T) *exitReportHub {
+	t.Helper()
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(spawn.EnvSession, "tt-handler-exit-report-fixture")
+	t.Setenv("TT_TMUX_SOCKET", "synthetic-exit-report")
+	x := &exitReportHub{answer: func(int) int { return 0 }}
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	handler := server.New(st, func(r *http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "owner"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/events") {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "unreadable fixture request", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var req api.PostEventRequest
+			if json.Unmarshal(body, &req) == nil && req.Kind == api.EventExited {
+				x.mu.Lock()
+				answer := x.answer(x.posts)
+				x.posts++
+				x.mu.Unlock()
+				switch {
+				case answer < 0:
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err == nil {
+						conn.Close()
+					}
+					return
+				case answer > 0:
+					http.Error(w, "fixture refusal", answer)
+					return
+				}
+			}
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	if x.c, err = api.NewClient(srv.URL, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task, err := x.c.CreateTask(ctx, api.CreateTaskRequest{Name: "isolated exit report test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x.agent, err = x.c.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "db-handler", Host: "fixture", Session: "tt-handler-exit-report-fixture", Runtime: "generic"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = x.c.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: x.agent.ID, RunID: x.agent.RunID, Kind: api.EventStarted}); err != nil {
+		t.Fatal(err)
+	}
+	x.e = env{hub: x.c.Base, task: task.ID, agent: x.agent.ID, runID: x.agent.RunID, session: "tt-handler-exit-report-fixture"}
+	x.writeReceipt(t, func(*runtimeProcessReceipt) {})
+	if _, ok := recordRuntimeExit(x.e); !ok {
+		t.Fatal("the fixture receipt did not record the exit")
+	}
+	return x
+}
+
+// writeReceipt saves the receipt tt wrap writes at start, with the pane
+// process 4200 (the wrapper) and its login shell, changed by change.
+func (x *exitReportHub) writeReceipt(t *testing.T, change func(*runtimeProcessReceipt)) {
+	t.Helper()
+	r := runtimeProcessReceipt{Hub: x.e.hub, Task: x.e.task, Agent: x.e.agent, Run: x.e.runID, Session: "tt-handler-exit-report-fixture", Socket: "synthetic-exit-report", PID: 4242,
+		Started: "start-4242", PanePID: 4200, PaneStarted: "Wed Oct  7 06:00:00 2026", Shell: "/bin/zsh", SessionID: "$7", SessionCreated: "1700000000"}
+	change(&r)
+	if err := writePrivateJSON(runtimeProcessPath(x.e.hub, x.e.agent, x.e.runID), r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (x *exitReportHub) receipt(t *testing.T) runtimeProcessReceipt {
+	t.Helper()
+	var r runtimeProcessReceipt
+	data, err := os.ReadFile(runtimeProcessPath(x.e.hub, x.e.agent, x.e.runID))
+	if err != nil || json.Unmarshal(data, &r) != nil {
+		t.Fatalf("receipt: %v", err)
+	}
+	return r
+}
+
+func (x *exitReportHub) exitPosts() int {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.posts
+}
+
+// newestExit is the text of the agent's newest started, heartbeat or exited event.
+func (x *exitReportHub) newest(t *testing.T) api.Event {
+	t.Helper()
+	list, err := x.c.Events(context.Background(), x.e.task, 0, 0, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var newest api.Event
+	for _, ev := range list.Events {
+		if ev.AgentID == x.e.agent && (ev.Kind == api.EventStarted || ev.Kind == api.EventHeartbeat || ev.Kind == api.EventExited) && ev.Seq > newest.Seq {
+			newest = ev
+		}
+	}
+	return newest
+}
+
+// idleShellTable is the host's process table with the wrapper 4200 as the
+// pane process and only its login shell under it, started after the exit.
+func idleShellTable(r runtimeProcessReceipt) map[int]discoveredProcess {
+	started := r.ExitedAt.Add(time.Second).In(time.Local).Format("Mon Jan _2 15:04:05 2006")
+	return map[int]discoveredProcess{1: {1, 0, "Sat Aug 22 19:33:24 2026", "/sbin/launchd"}, 4200: {4200, 1, "Wed Oct  7 06:00:00 2026", "tt"}, 4300: {4300, 4200, started, "-zsh"}}
+}
+
+// reporter is the production reporter with a synthetic process table and
+// pane, and waits that record their duration and fire at once. stopAfter
+// cancels ctx at that many waits (0 never).
+type recordedWaits struct {
+	mu    sync.Mutex
+	waits []time.Duration
+}
+
+func (w *recordedWaits) list() []time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]time.Duration(nil), w.waits...)
+}
+
+func (x *exitReportHub) reporter(t *testing.T, cancel context.CancelFunc, stopAfter int, waits *recordedWaits) exitReporter {
+	r := productionExitReporter(x.e)
+	r.table = func(context.Context) (map[int]discoveredProcess, error) { return idleShellTable(x.receipt(t)), nil }
+	r.self = func() int { return 4200 }
+	r.after = func(d time.Duration) <-chan time.Time {
+		waits.mu.Lock()
+		waits.waits = append(waits.waits, d)
+		n := len(waits.waits)
+		waits.mu.Unlock()
+		if stopAfter > 0 && n >= stopAfter {
+			cancel()
+		}
+		fired := make(chan time.Time, 1)
+		fired <- time.Now()
+		return fired
+	}
+	return r
+}
+
+// e2: the wrapper's failed exit report is retried in the background with
+// the identical text until the hub accepts it, and the receipt records it.
+func TestWrapperExitReportRetriesUntilAccepted(t *testing.T) {
+	x := newExitReportHub(t)
+	x.answer = func(n int) int {
+		if n < 2 {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits recordedWaits
+	// The exit was recorded by the fixture; wrapperExited records it again.
+	if !wrapperExited(ctx, x.e, 1, x.reporter(t, cancel, 0, &waits)) {
+		t.Fatal("no retry started after the failed exit report")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for x.receipt(t).ExitReportedAt.IsZero() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	r := x.receipt(t)
+	if r.ExitReportedAt.IsZero() || r.ExitReportStopped != "" || r.ExitReportedAt.Before(r.ExitedAt) || x.exitPosts() != 3 || !reflect.DeepEqual(waits.list(), []time.Duration{15 * time.Second, 30 * time.Second}) {
+		t.Fatalf("receipt %+v posts %d waits %v", r, x.exitPosts(), waits.list())
+	}
+	a, err := x.c.GetAgent(context.Background(), x.e.task, x.e.agent)
+	if newest := x.newest(t); err != nil || a.Status != api.AgentExited || a.RunID != x.e.runID || newest.Kind != api.EventExited || newest.Text != "Process exited (1)" {
+		t.Fatalf("agent %s %s %v newest %+v", a.Status, a.RunID, err, newest)
+	}
+}
+
+// e2: the retry waits 15s, 30s, 1m, 2m and 4m, then every 5 minutes, never longer.
+func TestWrapperExitReportBackoffIsBounded(t *testing.T) {
+	x := newExitReportHub(t)
+	x.answer = func(int) int { return http.StatusServiceUnavailable }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits recordedWaits
+	before := x.receipt(t)
+	x.reporter(t, cancel, 9, &waits).deliver(ctx, x.e, 1)
+	m := time.Minute
+	if want := []time.Duration{15 * time.Second, 30 * time.Second, m, 2 * m, 4 * m, 5 * m, 5 * m, 5 * m, 5 * m}; !reflect.DeepEqual(waits.list(), want) {
+		t.Fatalf("waits %v, want %v", waits.list(), want)
+	}
+	if after := x.receipt(t); after != before || x.exitPosts() != 8 {
+		t.Fatalf("receipt %+v posts %d", after, x.exitPosts())
+	}
+}
+
+// e2: the retry ends with the session: the context spawn.Wrap's return
+// cancels. Nothing is posted or recorded.
+func TestWrapperExitReportStopsWhenSessionEnds(t *testing.T) {
+	x := newExitReportHub(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	r := productionExitReporter(x.e)
+	waiting := make(chan struct{})
+	r.after = func(time.Duration) <-chan time.Time {
+		close(waiting)
+		return make(chan time.Time)
+	}
+	r.table = func(context.Context) (map[int]discoveredProcess, error) { return idleShellTable(x.receipt(t)), nil }
+	r.self = func() int { return 4200 }
+	before := x.receipt(t)
+	done := make(chan struct{})
+	go func() {
+		r.deliver(ctx, x.e, 1)
+		close(done)
+	}()
+	<-waiting
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the retry outlived its session")
+	}
+	if after := x.receipt(t); after != before || x.exitPosts() != 0 {
+		t.Fatalf("receipt %+v posts %d", after, x.exitPosts())
+	}
+}
+
+// e2: a refusal that shows the hub already holds this run's exit counts as
+// accepted; any other lasting refusal stops the retry and is recorded; a
+// rate limit, a server error or a lost connection is retried.
+func TestWrapperExitReportRefusals(t *testing.T) {
+	cases := []struct {
+		name string
+		// before changes the hub before the retry; answer scripts the first post.
+		before   func(t *testing.T, x *exitReportHub)
+		answer   int
+		posts    int
+		accepted bool
+		stopped  string
+	}{
+		{"already exited at this run", func(t *testing.T, x *exitReportHub) {
+			// An earlier post reached the hub; its response was lost.
+			if _, err := x.c.PostEvent(context.Background(), x.e.task, api.PostEventRequest{AgentID: x.e.agent, RunID: x.e.runID, Kind: api.EventExited, Text: "Process exited (1)"}); err != nil {
+				t.Fatal(err)
+			}
+		}, 0, 2, true, ""},
+		{"closed", func(t *testing.T, x *exitReportHub) {
+			if _, err := x.c.CloseAgent(context.Background(), x.e.task, x.e.agent, x.e.runID); err != nil {
+				t.Fatal(err)
+			}
+		}, 0, 1, false, "the hub refused the exit report: 409 "},
+		{"run mismatch", nil, http.StatusBadRequest, 1, false, "the hub refused the exit report: 400 fixture refusal"},
+		{"unauthorized", nil, http.StatusUnauthorized, 1, false, "the hub refused the exit report: 401 fixture refusal"},
+		{"rate limited", nil, http.StatusTooManyRequests, 2, true, ""},
+		{"server error", nil, http.StatusInternalServerError, 2, true, ""},
+		{"lost connection", nil, -1, 2, true, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			x := newExitReportHub(t)
+			if c.before != nil {
+				c.before(t, x)
+			}
+			x.answer = func(n int) int {
+				if n == 0 {
+					return c.answer
+				}
+				return 0
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var waits recordedWaits
+			// The retry must end by itself; ten waits mean it did not.
+			x.reporter(t, cancel, 10, &waits).deliver(ctx, x.e, 1)
+			r := x.receipt(t)
+			if x.exitPosts() != c.posts || r.ExitReportedAt.IsZero() != !c.accepted || !strings.HasPrefix(r.ExitReportStopped, c.stopped) || (c.stopped == "") != (r.ExitReportStopped == "") || len(waits.list()) >= 10 {
+				t.Fatalf("posts %d receipt %+v waits %v", x.exitPosts(), r, waits.list())
+			}
+			if c.name == "closed" && !strings.Contains(r.ExitReportStopped, "the agent is closed on "+x.e.runID) {
+				t.Fatalf("stopped: %s", r.ExitReportStopped)
+			}
+		})
+	}
+}
+
+// e2: an exit is never reported from a receipt without the recorded exit or
+// of another run, and no retry starts when the exit could not be recorded.
+func TestWrapperExitReportNeedsRecordedExit(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		change func(t *testing.T, x *exitReportHub)
+	}{
+		{"no recorded exit", func(t *testing.T, x *exitReportHub) { x.writeReceipt(t, func(*runtimeProcessReceipt) {}) }},
+		{"another run", func(t *testing.T, x *exitReportHub) {
+			x.writeReceipt(t, func(r *runtimeProcessReceipt) { r.Run, r.ExitedAt = "run_00000000000000cc", time.Now().UTC() })
+		}},
+		{"another session", func(t *testing.T, x *exitReportHub) {
+			x.writeReceipt(t, func(r *runtimeProcessReceipt) { r.Session, r.ExitedAt = "tt-handler-other", time.Now().UTC() })
+		}},
+		{"missing receipt", func(t *testing.T, x *exitReportHub) {
+			if err := os.Remove(runtimeProcessPath(x.e.hub, x.e.agent, x.e.runID)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newExitReportHub(t)
+			c.change(t, x)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var waits recordedWaits
+			x.reporter(t, cancel, 5, &waits).deliver(ctx, x.e, 1)
+			if x.exitPosts() != 0 || len(waits.list()) != 1 {
+				t.Fatalf("posts %d waits %v", x.exitPosts(), waits.list())
+			}
+		})
+	}
+	// The wrapper's exit could not be recorded: its post fails and no retry starts.
+	x := newExitReportHub(t)
+	if err := os.Remove(runtimeProcessPath(x.e.hub, x.e.agent, x.e.runID)); err != nil {
+		t.Fatal(err)
+	}
+	x.answer = func(int) int { return http.StatusServiceUnavailable }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits recordedWaits
+	if wrapperExited(ctx, x.e, 1, x.reporter(t, cancel, 0, &waits)) || x.exitPosts() != 1 || len(waits.list()) != 0 {
+		t.Fatalf("a retry started without a recorded exit: posts %d waits %v", x.exitPosts(), waits.list())
+	}
+	if _, err := os.Stat(runtimeProcessPath(x.e.hub, x.e.agent, x.e.runID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a receipt was synthesized: %v", err)
+	}
+}
+
+// e3: the retry posts only while the pane holds just the wrapper and its idle
+// login shell. Anything under the shell, a runtime exec'd in it or an
+// unreadable table waits; a receipt without this wrapper's pane stops it.
+func TestWrapperExitReportWaitsForIdleShell(t *testing.T) {
+	t.Run("busy then idle", func(t *testing.T) {
+		x := newExitReportHub(t)
+		reads := 0
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var waits recordedWaits
+		r := x.reporter(t, cancel, 10, &waits)
+		r.table = func(context.Context) (map[int]discoveredProcess, error) {
+			reads++
+			table := idleShellTable(x.receipt(t))
+			if reads == 1 {
+				table[4400] = discoveredProcess{4400, 4300, table[4300].started, "claude"}
+			}
+			return table, nil
+		}
+		r.deliver(ctx, x.e, 1)
+		if reads != 2 || x.exitPosts() != 1 || x.receipt(t).ExitReportedAt.IsZero() {
+			t.Fatalf("reads %d posts %d receipt %+v", reads, x.exitPosts(), x.receipt(t))
+		}
+	})
+	for _, c := range []struct {
+		name  string
+		table func(map[int]discoveredProcess) (map[int]discoveredProcess, error)
+	}{
+		{"runtime exec'd in the shell", func(m map[int]discoveredProcess) (map[int]discoveredProcess, error) {
+			m[4300] = discoveredProcess{4300, 4200, m[4300].started, "codex"}
+			return m, nil
+		}},
+		{"process under the shell", func(m map[int]discoveredProcess) (map[int]discoveredProcess, error) {
+			m[4400] = discoveredProcess{4400, 4300, m[4300].started, "sleep"}
+			return m, nil
+		}},
+		{"shell started before the exit", func(m map[int]discoveredProcess) (map[int]discoveredProcess, error) {
+			m[4300] = discoveredProcess{4300, 4200, "Wed Oct  7 06:00:01 2026", "-zsh"}
+			return m, nil
+		}},
+		{"unreadable table", func(map[int]discoveredProcess) (map[int]discoveredProcess, error) {
+			return nil, errors.New("unreadable process table row")
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newExitReportHub(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var waits recordedWaits
+			r := x.reporter(t, cancel, 3, &waits)
+			r.table = func(context.Context) (map[int]discoveredProcess, error) { return c.table(idleShellTable(x.receipt(t))) }
+			before := x.receipt(t)
+			r.deliver(ctx, x.e, 1)
+			if x.exitPosts() != 0 || x.receipt(t) != before || len(waits.list()) != 3 {
+				t.Fatalf("posts %d receipt %+v waits %v", x.exitPosts(), x.receipt(t), waits.list())
+			}
+		})
+	}
+	for _, c := range []struct {
+		name   string
+		change func(*runtimeProcessReceipt)
+	}{
+		{"pane process of another wrapper", func(r *runtimeProcessReceipt) { r.PanePID = 4201 }},
+		{"no pane process", func(r *runtimeProcessReceipt) { r.PanePID, r.PaneStarted = 0, "" }},
+		{"no login shell", func(r *runtimeProcessReceipt) { r.Shell = "" }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newExitReportHub(t)
+			x.writeReceipt(t, func(r *runtimeProcessReceipt) { c.change(r); r.ExitedAt = time.Now().UTC() })
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var waits recordedWaits
+			x.reporter(t, cancel, 3, &waits).deliver(ctx, x.e, 1)
+			if r := x.receipt(t); x.exitPosts() != 0 || r.ExitReportStopped == "" || !r.ExitReportedAt.IsZero() || len(waits.list()) != 1 {
+				t.Fatalf("posts %d receipt %+v waits %v", x.exitPosts(), r, waits.list())
+			}
+		})
+	}
+	t.Run("the wrapper's own ps is not a child of the pane", func(t *testing.T) {
+		receipt := runtimeProcessReceipt{PanePID: 4200, PaneStarted: "Wed Oct  7 06:00:00 2026", Shell: "/bin/zsh", ExitedAt: time.Date(2026, 10, 7, 13, 0, 0, 0, time.Local)}
+		raw := "    1     0 Sat Aug 22 19:33:24 2026     /sbin/launchd\n 4200     1 Wed Oct  7 06:00:00 2026     tt\n" +
+			" 4300  4200 Wed Oct  7 13:00:01 2026     -zsh\n 4500  4200 Wed Oct  7 13:00:05 2026     ps\n"
+		all, err := parseProcessTable(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, _ := idleShellTree(all, receipt); state != handlerProbeUnknown {
+			t.Fatalf("with its own ps the pane answers %s", state)
+		}
+		own, err := parseWrapperProcessTable(raw, 4500)
+		if _, present := own[4500]; err != nil || present || len(own) != 3 {
+			t.Fatalf("table %+v %v", own, err)
+		}
+		if state, detail := idleShellTree(own, receipt); state != handlerProbeGone {
+			t.Fatalf("without its own ps the pane answers %s (%s)", state, detail)
+		}
+		if _, err := parseWrapperProcessTable("not a table", 4500); err == nil {
+			t.Fatal("an unreadable table was read")
+		}
+	})
 }
