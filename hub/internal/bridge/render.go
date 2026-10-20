@@ -149,7 +149,7 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 	link := b.tailosLink(m)
 	if env != nil {
 		header += fmt.Sprintf(" · %s · %s", strings.ToUpper(env.Kind), clean(env.Subject))
-		embed := discord.Embed{Description: truncate(typedBody(m.Text), embedBudget), Color: kindColors[env.Kind], URL: link}
+		embed := discord.Embed{Description: truncate(typedBody(displayText(m)), embedBudget), Color: kindColors[env.Kind], URL: link}
 		if link != "" {
 			embed.Title = "Open in TailOS"
 		}
@@ -207,10 +207,11 @@ func (b *Bridge) ownerCard(m api.Message) bool {
 // copy; approval continues to use the stored envelope's original bytes.
 func ownerRequestParts(m api.Message) []string {
 	answer := m.Envelope.ExpectedAnswer
+	text := displayText(m)
 	if answer == "" {
-		return chunk(m.Text, embedBudget)
+		return chunk(text, embedBudget)
 	}
-	parts := chunk(strings.TrimSuffix(m.Text, "\nExpected answer:\n"+answer), embedBudget)
+	parts := chunk(strings.TrimSuffix(text, "\nExpected answer:\n"+answer), embedBudget)
 	// Invisible word joiners keep leading/trailing answer whitespace away from
 	// embed edges, where Discord would trim it. Reserve one rune at each edge.
 	const boundary = "\u2060"
@@ -292,19 +293,77 @@ func (b *Bridge) itemLink(taskID, itemID string) string {
 	return fmt.Sprintf("%s/#feature-history/%s/%s", base, taskID, itemID)
 }
 
-// typedBody drops the first line (it is the header) and the To line.
+// typedBody drops the first line (it is the header) and the To line that
+// RenderText writes right after it. A body line starting "To: " is kept.
 func typedBody(text string) string {
 	lines := strings.Split(text, "\n")
 	if len(lines) > 0 {
 		lines = lines[1:]
 	}
-	out := lines[:0]
-	for _, l := range lines {
-		if !strings.HasPrefix(l, "To: ") {
-			out = append(out, l)
+	if len(lines) > 0 && strings.HasPrefix(lines[0], "To: ") {
+		lines = lines[1:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// envelopeBodyFields returns the free-text body fields with the labels
+// RenderText writes for them. List and header fields are not included.
+func envelopeBodyFields(b *api.EnvelopeBody) []struct {
+	label string
+	value *string
+} {
+	return []struct {
+		label string
+		value *string
+	}{
+		{"Objective", &b.Objective}, {"Ask", &b.Ask}, {"Candidate", &b.Candidate}, {"Scope", &b.Scope},
+		{"Question", &b.Question}, {"Answer", &b.Answer}, {"Reason", &b.Reason}, {"Needs", &b.Needs},
+		{"Resume-when", &b.ResumeWhen}, {"Summary", &b.Summary}, {"Text", &b.Text},
+	}
+}
+
+// displayText is a message's text with its multi-line body fields shown with
+// their line breaks. The stored text writes every field on one line; a line
+// that is exactly a field's flattened value is replaced by "Label:" and the
+// envelope's value on the following lines. A line that does not match (an
+// older hub, redaction) keeps its stored form. The expected answer is never
+// rewritten.
+func displayText(m api.Message) string {
+	env := m.Envelope
+	if env == nil {
+		return m.Text
+	}
+	text, suffix := m.Text, ""
+	if env.ExpectedAnswer != "" {
+		if tail := "\nExpected answer:\n" + env.ExpectedAnswer; strings.HasSuffix(text, tail) {
+			text, suffix = strings.TrimSuffix(text, tail), tail
 		}
 	}
-	return strings.Join(out, "\n")
+	body := env.Body
+	lines := strings.Split(text, "\n")
+	for _, f := range envelopeBodyFields(&body) {
+		if !strings.Contains(*f.value, "\n") {
+			continue
+		}
+		flat := f.label + ": " + clean(*f.value)
+		for i, l := range lines {
+			if l == flat {
+				lines[i] = f.label + ":\n" + multiline(*f.value)
+				break
+			}
+		}
+	}
+	return strings.Join(lines, "\n") + suffix
+}
+
+// multiline normalizes line endings and trims blank edge lines and trailing
+// spaces, so a field reads as a block under its label.
+func multiline(s string) string {
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t\r")
+	}
+	return strings.Trim(strings.Join(lines, "\n"), "\n")
 }
 
 // clean keeps a header field on one line.

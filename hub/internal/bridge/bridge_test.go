@@ -959,3 +959,94 @@ func TestDeletedChannelIsRecreated(t *testing.T) {
 		t.Fatal("the pending message did not follow the recreated channel")
 	}
 }
+
+// wi_0bfe2fbbd9165f10 n1: multi-line typed body fields keep their line breaks
+// in the project channel line; the header stays one line and a body line
+// starting "To: " is kept, while the header To line is still dropped.
+func TestTypedLineKeepsBodyLineBreaks(t *testing.T) {
+	h := newHarness(t)
+	req := typed(h.builder, h.lead, api.EnvelopeKindResult, "Line breaks reach the project channel")
+	req.Envelope.Body = api.EnvelopeBody{
+		Outcome: "done",
+		Summary: "Summary first\n- point one\n- point two",
+		Text:    "line one\n- bullet a\n- bullet b\nTo: the reviewer, not a header",
+		Status:  map[string]string{"a1": "pass"},
+	}
+	req.Envelope.Evidence = map[string]api.Evidence{"e1": {Type: "command", Value: "go test -> ok"}}
+	m := h.post(req)
+	if !strings.Contains(m.Text, "\nText: line one - bullet a - bullet b To: the reviewer, not a header") {
+		t.Fatalf("stored text is no longer the flattened form: %q", m.Text)
+	}
+	h.cycle()
+	lines := h.lines()
+	if len(lines) != 1 || len(lines[0].Embeds) != 1 {
+		t.Fatalf("lines = %+v", lines)
+	}
+	content := strings.Split(lines[0].Content, "\n")
+	if len(content) != 2 || !strings.HasSuffix(content[0], "· RESULT · Line breaks reach the project channel") {
+		t.Fatalf("header = %q", lines[0].Content)
+	}
+	want := "Outcome: done\nSummary:\nSummary first\n- point one\n- point two\nText:\nline one\n- bullet a\n- bullet b\nTo: the reviewer, not a header\nStatus: a1 pass\nEvidence: e1 (command): go test -> ok"
+	if got := lines[0].Embeds[0].Description; got != want {
+		t.Fatalf("embed = %q, want %q", got, want)
+	}
+}
+
+// wi_0bfe2fbbd9165f10 n1: an owner request card shows a multi-line Ask with
+// its breaks, and the expected answer embeds keep their exact bytes.
+func TestOwnerCardKeepsBodyLineBreaks(t *testing.T) {
+	for _, answer := range []string{"", "*yes*"} {
+		env := &api.Envelope{Kind: "request", To: "owner", Subject: "Approve the multi-line ask fixture", ExpectedAnswer: answer,
+			Body: api.EnvelopeBody{Ask: "Please review:\n- item a\n- item b"}}
+		m := api.Message{TaskID: "tsk_fixture", Seq: 43, From: api.Sender{AgentID: "agt_fixture"}, Envelope: env, Text: api.RenderText(*env)}
+		b := &Bridge{cfg: Config{TailOSURL: "https://tailos.example"}}
+		rows := b.renderMessage(api.Task{}, nil, m)
+		var rendered strings.Builder
+		for _, row := range rows {
+			var p outboxPayload
+			if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
+				t.Fatal(err)
+			}
+			rendered.WriteString(ownerAnswerDisplayText(p.Message.Embeds[0].Description))
+		}
+		want := "REQUEST: Approve the multi-line ask fixture\nTo: owner\nAsk:\nPlease review:\n- item a\n- item b"
+		if answer != "" {
+			want += "\nExpected answer:\n\\*yes\\*"
+			if len(rows) != 2 {
+				t.Fatalf("got %d parts, want the card and the answer", len(rows))
+			}
+		}
+		if rendered.String() != want {
+			t.Fatalf("card = %q, want %q", rendered.String(), want)
+		}
+	}
+}
+
+// wi_0bfe2fbbd9165f10 n3: a typed message whose fields are all one line
+// renders byte-identically to its stored text.
+func TestSingleLineTypedMessagesRenderUnchanged(t *testing.T) {
+	envs := []api.Envelope{
+		{Kind: "assign", To: "builder", Subject: "Fix the stale smoke test", Refs: map[string]string{"item": "wi_1"},
+			Body: api.EnvelopeBody{Objective: "fix the smoke test", Owns: []string{"tests/tasks-browser.mjs"}, Acceptance: map[string]string{"a1": "passes"}}},
+		{Kind: "result", To: "lead", Subject: "Tests pass for the fixture", Body: api.EnvelopeBody{Outcome: "done", Text: "All good", Summary: "short", Status: map[string]string{"a1": "pass"}},
+			Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test ./... -> ok"}}},
+		{Kind: "request", To: "owner", Subject: "Approve the fixture", Body: api.EnvelopeBody{Ask: "Please approve"}, ExpectedAnswer: "yes\nreally"},
+		{Kind: "block", To: "lead", Subject: "Blocked on the fixture", Body: api.EnvelopeBody{Reason: "no key", Needs: "a key", ResumeWhen: "key arrives"}},
+	}
+	for _, env := range envs {
+		m := api.Message{TaskID: "tsk_fixture", Seq: 44, Envelope: &env, Text: api.RenderText(env)}
+		if got := displayText(m); got != m.Text {
+			t.Fatalf("%s: display text = %q, stored %q", env.Kind, got, m.Text)
+		}
+	}
+	env := envs[0]
+	m := api.Message{TaskID: "tsk_fixture", Seq: 45, From: api.Sender{AgentID: "agt_fixture"}, Envelope: &env, Text: api.RenderText(env)}
+	rows := (&Bridge{}).renderMessage(api.Task{}, nil, m)
+	var p outboxPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &p); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := p.Message.Embeds[0].Description, "Refs: item=wi_1\nObjective: fix the smoke test\nOwns: tests/tasks-browser.mjs\nAcceptance: a1: passes"; got != want {
+		t.Fatalf("embed = %q, want %q", got, want)
+	}
+}

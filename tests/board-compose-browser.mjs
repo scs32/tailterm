@@ -467,9 +467,14 @@ try {
           // (wi_a9a69169f732121d): force one on the first Board control the
           // walk reaches before the composer.
           renderChecked = true;
-          const focused = await page.evaluateHandle(() => document.activeElement);
+          const focused = await page.evaluateHandle(
+            () => document.activeElement,
+          );
           await page.evaluate(() => window.qa.board.reload());
-          await page.waitForFunction((element) => !element.isConnected, focused);
+          await page.waitForFunction(
+            (element) => !element.isConnected,
+            focused,
+          );
           assert.equal(
             await focusedControl(),
             control,
@@ -1093,10 +1098,71 @@ try {
         await page.evaluate(() => window.qa.board.reload());
         await page.waitForFunction((element) => !element.isConnected, focused);
       };
+      // Typed body fields keep their line breaks from the envelope, while the
+      // stored text stays the flattened one-line form (wi_0bfe2fbbd9165f10).
+      const typedPost = (subject, text) =>
+        api(
+          "POST",
+          `/v1/tasks/${fixture.task.id}/messages`,
+          {
+            agentId: fixture.agent.id,
+            envelope: { kind: "notice", subject, body: { text } },
+          },
+          201,
+        );
+      const multi = await typedPost(
+        "Multi-line typed body keeps its breaks",
+        "line one\n- bullet a\n- bullet b",
+      );
+      const single = await typedPost(
+        "Single-line typed body stays as stored",
+        "one line only",
+      );
+      const stored = (await messages(fixture)).filter((message) =>
+        [multi.seq, single.seq].includes(message.seq),
+      );
+      assert.deepEqual(
+        stored.map((message) => message.text),
+        [
+          "NOTICE: Multi-line typed body keeps its breaks\nText: line one - bullet a - bullet b",
+          "NOTICE: Single-line typed body stays as stored\nText: one line only",
+        ],
+        `${name}: the stored typed text changed form`,
+      );
+      await page.evaluate(() => window.qa.board.reload());
+      const boardText = (seq) =>
+        page
+          .locator(`.board-message[data-message="${seq}"] .board-text`)
+          .evaluate((element) => ({
+            text: element.textContent,
+            shown: element.innerText,
+          }));
+      await page
+        .locator(`.board-message[data-message="${single.seq}"]`)
+        .waitFor();
+      const multiShown = await boardText(multi.seq);
+      assert.equal(
+        multiShown.text,
+        "NOTICE: Multi-line typed body keeps its breaks\nText:\nline one\n- bullet a\n- bullet b",
+        `${name}: a multi-line typed body lost its line breaks`,
+      );
+      assert.match(
+        multiShown.shown,
+        /^NOTICE: Multi-line typed body keeps its breaks\nText:\nline one\n- bullet a\n- bullet b$/,
+        `${name}: the multi-line typed body is not shown on separate lines`,
+      );
+      assert.equal(
+        (await boardText(single.seq)).text,
+        stored[1].text,
+        `${name}: a single-line typed message changed on the Board`,
+      );
       // A same-project render keeps a focused Reply.
       const sourceReply = `[data-reply="${fixture.source.seq}"]`;
       await page.locator(sourceReply).waitFor();
-      assert.ok(await focusControl(sourceReply), `${name}: Reply took no focus`);
+      assert.ok(
+        await focusControl(sourceReply),
+        `${name}: Reply took no focus`,
+      );
       await forceRender();
       assert.equal(
         (await activeControl())?.reply,
@@ -1174,7 +1240,10 @@ try {
       }
       const sharedReply = `[data-reply="${seqA}"]`;
       await page.locator(sharedReply).waitFor();
-      assert.ok(await focusControl(sharedReply), `${name}: Reply took no focus`);
+      assert.ok(
+        await focusControl(sharedReply),
+        `${name}: Reply took no focus`,
+      );
       await page.evaluate(async (taskId) => {
         window.qa.useHub("/hub2");
         await window.qa.board.show(taskId);

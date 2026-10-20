@@ -31,6 +31,55 @@ const esc = (s) =>
         c
       ],
   );
+// Free-text envelope body fields with the labels the hub's RenderText writes.
+const envelopeBodyLabels = [
+  ["objective", "Objective"],
+  ["ask", "Ask"],
+  ["candidate", "Candidate"],
+  ["scope", "Scope"],
+  ["question", "Question"],
+  ["answer", "Answer"],
+  ["reason", "Reason"],
+  ["needs", "Needs"],
+  ["resumeWhen", "Resume-when"],
+  ["summary", "Summary"],
+  ["text", "Text"],
+];
+// A typed message's stored text writes every field on one line. Show a
+// multi-line body field from the envelope instead: a line that is exactly its
+// flattened value becomes "Label:" and the value below it. Lines that do not
+// match keep their stored form, and the expected answer is never rewritten.
+const displayText = (message) => {
+  const env = message.envelope;
+  let text = String(message.text ?? "");
+  if (!env || typeof env !== "object") return text;
+  let suffix = "";
+  const tail = env.expectedAnswer
+    ? "\nExpected answer:\n" + env.expectedAnswer
+    : "";
+  if (tail && text.endsWith(tail)) {
+    text = text.slice(0, -tail.length);
+    suffix = tail;
+  }
+  const lines = text.split("\n");
+  for (const [key, label] of envelopeBodyLabels) {
+    const value = env.body?.[key];
+    if (typeof value !== "string" || !value.includes("\n")) continue;
+    const flat = label + ": " + value.split(/\s+/).filter(Boolean).join(" ");
+    const i = lines.indexOf(flat);
+    if (i < 0) continue;
+    lines[i] =
+      label +
+      ":\n" +
+      value
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .map((line) => line.replace(/[ \t\r]+$/, ""))
+        .join("\n")
+        .replace(/^\n+|\n+$/g, "");
+  }
+  return lines.join("\n") + suffix;
+};
 const status = (a) => {
   const label =
     {
@@ -1102,7 +1151,7 @@ export function createBoardView({
           : !record?.original
             ? `<button data-audit-retry="${message.seq}" data-view-control="audit-retry:${esc(selected)}:${message.seq}">Retry audit</button>`
             : `<button data-audit-history="${message.seq}" data-view-control="audit-history:${esc(selected)}:${message.seq}">History</button>${archived ? "" : `<button data-audit-correct-open="${message.seq}" data-view-control="audit-correct:${esc(selected)}:${message.seq}">Correct</button>${currentKind === "intake" ? `<button data-audit-resolve-open="${message.seq}" data-view-control="audit-resolve:${esc(selected)}:${message.seq}">Resolve</button>` : ""}`}`;
-        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(message.text)}</div>${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}" data-view-control="reply:${esc(selected)}:${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
+        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(displayText(message))}</div>${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}" data-view-control="reply:${esc(selected)}:${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
       })
       .join("");
     const recoveryMarkup = (

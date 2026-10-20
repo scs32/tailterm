@@ -773,9 +773,9 @@ func renderHelperReply(name string, c conversation, msg api.Message) []OutboxRow
 	body := msg.Text
 	if env := msg.Envelope; env != nil {
 		header += fmt.Sprintf(" · %s · %s", strings.ToUpper(env.Kind), clean(redactSecrets(env.Subject)))
-		body = typedBody(msg.Text)
-		// Helper answers and progress retain their original Markdown. The
-		// normalized Board display text flattens envelope field line breaks.
+		body = typedBody(displayText(msg))
+		// Helper answers and progress retain their original Markdown. Other
+		// kinds show every field, with body line breaks from the envelope.
 		switch env.Kind {
 		case api.EnvelopeKindAnswer:
 			body = env.Body.Answer
@@ -1351,7 +1351,11 @@ func redactHelperMessage(r roster, m api.Message) api.Message {
 	if m.Envelope != nil {
 		env := *m.Envelope
 		env.Subject = redactSecrets(env.Subject)
-		env.Body.Text = redactSecrets(env.Body.Text)
+		// Every body field the mirror may show from the envelope. The
+		// expected answer keeps its exact approval bytes.
+		for _, f := range envelopeBodyFields(&env.Body) {
+			*f.value = redactSecrets(*f.value)
+		}
 		m.Envelope = &env
 	}
 	return m

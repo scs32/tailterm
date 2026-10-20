@@ -1125,3 +1125,83 @@ func TestHelperEntryStage(t *testing.T) {
 		}
 	}
 }
+
+// wi_0bfe2fbbd9165f10 n1: a typed helper reply of a kind shown with all its
+// fields keeps its body line breaks and bullets in the DM; the header is one
+// line.
+func TestHelperTypedReplyKeepsLineBreaks(t *testing.T) {
+	h := newHelperHarness(t)
+	helper := h.register()
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "how did the run go?"))
+	asked := h.helperPosts()[0]
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: asked.Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindResult, Subject: "The fixture run finished cleanly", Body: api.EnvelopeBody{
+			Outcome: "done", Status: map[string]string{"a1": "pass"},
+			Summary: "Two things changed:\n- the parser\n- the renderer",
+			Text:    "Next steps\n- release\n- watch the queue",
+		}, Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "go test -> ok"}}}})
+	h.flush()
+	bot := h.botIn(h.dm)
+	if len(bot) != 1 {
+		t.Fatalf("typed reply = %+v", bot)
+	}
+	if got := firstLine(bot[0].Content); got != "🤖 **"+helper.Name+"** · owner helper · RESULT · The fixture run finished cleanly" {
+		t.Fatalf("header = %q", got)
+	}
+	for _, want := range []string{"Summary:\nTwo things changed:\n- the parser\n- the renderer\n", "Text:\nNext steps\n- release\n- watch the queue\n"} {
+		if !strings.Contains(bot[0].Content, want) {
+			t.Fatalf("DM lost line breaks, want %q in %q", want, bot[0].Content)
+		}
+	}
+}
+
+// wi_0bfe2fbbd9165f10 n3: redaction still applies line by line when helper
+// body fields are shown with their breaks, in the DM and the project mirror.
+func TestHelperMultiLineRedaction(t *testing.T) {
+	h := newHelperHarness(t)
+	helper := h.register()
+	h.gateway(h.fake.dmMessage(h.dm, ownerID, "what is configured?"))
+	asked := h.helperPosts()[0]
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID, ReplyTo: asked.Seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "The configuration has two values", Body: api.EnvelopeBody{
+			Answer: "first line\nGITHUB_TOKEN=answerSecret123456\n- third line"}}})
+	h.post(api.PostMessageRequest{AgentID: helper.ID, RunID: helper.RunID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindFinding, Subject: "The configuration leaks a value", Body: api.EnvelopeBody{
+			Severity: "low", Summary: "summary one\npassword=summarySecret789\n- summary three"},
+			Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "config file"}}}})
+	h.post(api.PostMessageRequest{AgentID: h.builder.ID, RunID: h.builder.RunID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindFinding, Subject: "The builder sees its own value", Body: api.EnvelopeBody{
+			Severity: "low", Summary: "builder one\nGITHUB_TOKEN=builderVisible456"},
+			Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "config file"}}}})
+	h.flush()
+	h.cycle()
+	dm := h.botIn(h.dm)
+	if len(dm) != 1 {
+		t.Fatalf("DM = %+v", dm)
+	}
+	if !strings.Contains(dm[0].Content, "first line\nGITHUB_TOKEN="+redacted+"\n- third line") {
+		t.Fatalf("DM answer = %q", dm[0].Content)
+	}
+	var mirror strings.Builder
+	for _, l := range h.lines() {
+		mirror.WriteString(l.Content + "\n")
+		for _, e := range l.Embeds {
+			mirror.WriteString(e.Description + "\n")
+		}
+	}
+	all := dm[0].Content + "\n" + mirror.String()
+	for _, leaked := range []string{"answerSecret123456", "summarySecret789"} {
+		if strings.Contains(all, leaked) {
+			t.Errorf("%q reached Discord:\n%s", leaked, all)
+		}
+	}
+	for _, want := range []string{
+		"Answer:\nfirst line\nGITHUB_TOKEN=" + redacted + "\n- third line",
+		"Summary:\nsummary one\npassword=" + redacted + "\n- summary three",
+		"Summary:\nbuilder one\nGITHUB_TOKEN=builderVisible456",
+	} {
+		if !strings.Contains(mirror.String(), want) {
+			t.Errorf("mirror lacks %q:\n%s", want, mirror.String())
+		}
+	}
+}
