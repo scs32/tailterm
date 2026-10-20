@@ -305,6 +305,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	branch := fs.String("branch", "", "accepted branch")
 	commit := fs.String("commit", "", "accepted commit SHA")
 	acceptanceEvidence := fs.String("evidence", "", "queue acceptance evidence (default: the saved completion receipt)")
+	outsideReason := fs.String("outside-ownership-reason", "", "done save with queue acceptance: the leased handler's reason for accepting changed files outside the entry's ownership")
 	scopeChange := fs.Bool("scope-change", false, "mark a --title or --body-file change as a deliberate scope amendment (it invalidates an accepted candidate awaiting release)")
 	estimateTokens := fs.Int64("estimate-tokens", 0, "token estimate, saved without a new revision (database handler or owner; 0 clears it)")
 	estimateBasis := fs.String("estimate-basis", "", "one-line basis of the estimate, such as \"Small, 2 paths, median of 8 Small items\"")
@@ -402,7 +403,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	if *requestID == "" {
 		return errors.New("--request-id is required")
 	}
-	acceptFlags := *worktree != "" || *branch != "" || *commit != "" || *acceptanceEvidence != ""
+	acceptFlags := *worktree != "" || *branch != "" || *commit != "" || *acceptanceEvidence != "" || *outsideReason != ""
 	var entry *api.TeamQueueEntry
 	if req.Status != nil && *req.Status == "done" && e.agent != "" {
 		// The item lead's or leased handler's done save carries the queue
@@ -417,7 +418,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 		entry = nil // already accepted; nothing to carry
 	}
 	if entry == nil && acceptFlags {
-		return errors.New("--worktree, --branch, --commit and --evidence apply only to a done save, by the item lead or the leased handler, of an item whose running team waits on acceptance")
+		return errors.New("--worktree, --branch, --commit, --evidence and --outside-ownership-reason apply only to a done save, by the item lead or the leased handler, of an item whose running team waits on acceptance")
 	}
 	if entry != nil {
 		if *worktree == "" || *branch == "" || *commit == "" {
@@ -428,17 +429,27 @@ func cmdWorkItemUpdate(e env, args []string) error {
 			return err
 		}
 		// A retry after a lost response finds the entry already accepted: send
-		// the identical request so the hub replays the saved receipt.
+		// the identical request, its changed files listed against the saved
+		// base, so the hub replays the saved receipt.
+		var base string
 		if entry.Acceptance == nil {
-			base, err := acceptanceBase(ctx, c, project, entry.ItemID, e.agent, e.runID, entry.BaseCommit, *commit)
+			base, err = acceptanceBase(ctx, c, project, entry.ItemID, e.agent, e.runID, entry.BaseCommit, *commit)
 			if err != nil {
 				return err
 			}
 			if err = verifyAcceptedGit(ctx, entry.Repository, base, realWorktree, *branch, *commit); err != nil {
 				return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 			}
+		} else {
+			base = entry.Acceptance.BaseCommit
 		}
-		req.QueueAcceptance = &api.WorkItemQueueAcceptance{EntryID: entry.ID, Worktree: realWorktree, Branch: *branch, Commit: *commit, Evidence: *acceptanceEvidence}
+		// tt lists the changed files; the hub compares them with the entry's
+		// ownership (wi_3f48b6ccc57e95f2).
+		changed, err := queueChangedFiles(ctx, entry.Repository, base, *commit)
+		if err != nil {
+			return err
+		}
+		req.QueueAcceptance = &api.WorkItemQueueAcceptance{EntryID: entry.ID, Worktree: realWorktree, Branch: *branch, Commit: *commit, Evidence: *acceptanceEvidence, ChangedFiles: changed, OutsideOwnershipReason: *outsideReason}
 	}
 	result, err := c.CreateWorkItemUpdate(ctx, project, fs.Arg(0), req)
 	if err != nil {

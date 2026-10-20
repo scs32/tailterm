@@ -145,13 +145,18 @@ type CreateWorkItemUpdate struct {
 }
 
 // WorkItemQueueAcceptance is the Git tuple of the accepted builder result for
-// the item's running team queue entry.
+// the item's running team queue entry. ChangedFiles is the candidate's
+// changed files from the acceptance base to Commit, as tt computed them; the
+// hub compares them with the entry's ownership. OutsideOwnershipReason is the
+// leased handler's reason for accepting changed files outside it.
 type WorkItemQueueAcceptance struct {
-	EntryID  string `json:"entryId"`
-	Worktree string `json:"worktree"`
-	Branch   string `json:"branch"`
-	Commit   string `json:"commit"`
-	Evidence string `json:"evidence,omitempty"`
+	EntryID                string   `json:"entryId"`
+	Worktree               string   `json:"worktree"`
+	Branch                 string   `json:"branch"`
+	Commit                 string   `json:"commit"`
+	Evidence               string   `json:"evidence,omitempty"`
+	ChangedFiles           []string `json:"changedFiles,omitempty"`
+	OutsideOwnershipReason string   `json:"outsideOwnershipReason,omitempty"`
 }
 
 // NarrativeReportPin is verified atomically when a feature first transitions

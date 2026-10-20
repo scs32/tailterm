@@ -1150,7 +1150,9 @@ plan.json` and `receipt.json` from the matrix run, as in
 number of verification records the item already has: 0 for its first plan, and
 the plan's generation for its receipt. A feature's done save also carries its
 completion report pin (`--report-id`, `--report-version`, `--report-digest`,
-`--report-scope-revision`); the handler writes that report.
+`--report-scope-revision`); the handler writes that report. Only the leased
+handler may add `--outside-ownership-reason TEXT`, to accept changed files
+outside the entry's ownership (see Changed files against ownership below).
 
 **Authority.** One rule admits the caller of the plan freeze and the receipt
 import. The exact available database handler run passes as before, with no
@@ -1228,6 +1230,33 @@ item's new one. A done save without `--worktree`, `--branch` and `--commit`
 from any agent of the project, not only the lead or the handler, is refused
 while its entry waits; an owner or UI save is not. `tt team queue accept` stays
 handler-only as the recovery path, and a handler's save is unchanged.
+
+**Changed files against ownership.** Both acceptance paths, the done save with
+`--worktree`, `--branch` and `--commit` and `tt team queue accept`, compare
+the candidate's changed files, from the acceptance base to the accepted
+commit, with the entry's owned paths (`wi_3f48b6ccc57e95f2`). `tt` computes
+the list with `git diff --name-only` and sends it; the hub, which cannot read
+the Mini's repository, compares it with the ownership the entry saved, as the
+scheduler compares scopes (case-insensitive, the exact path or anything under
+an owned directory). A file outside is refused and the whole save rolls back:
+`candidate changes N file(s) outside the entry's owned paths: README.md;
+amend the scope with tt team queue scope, or the leased database handler may
+accept with --outside-ownership-reason TEXT`. The refusal names up to ten
+files and counts the rest. Only the entry's leased database handler may accept
+them, with `--outside-ownership-reason TEXT` on either command; the
+acceptance then saves the outside files as `outsideOwnership` and the text as
+`outsideOwnershipReason`. The item lead's save with a reason is refused (`only
+the leased database handler may record an outside-ownership reason`), and a
+reason sent with a candidate that stays inside is not saved. An entry with no
+ownership (serial or legacy) is not checked.
+
+An older `tt` sends no list, and its done save or accept is accepted
+unchecked. Releasing the hub first and then the Mini's `tt` bounds that gap.
+A done save first made by an older `tt` and retried by the new `tt` with the
+same request ID now carries a list, so the hub refuses it as a different
+request (`request ID was already used with different update data`); the
+refusal changes nothing, because the first save already recorded the
+acceptance.
 
 **Order of release.** A new `tt` against an older hub gets the older hub's
 handler-only refusal, so release the hub before the Mini's `tt` and the team

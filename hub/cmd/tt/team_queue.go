@@ -168,6 +168,7 @@ func cmdTeamQueue(e env, args []string) error {
 	branch := fs.String("branch", "", "accepted branch")
 	commit := fs.String("commit", "", "accepted commit SHA")
 	acceptanceEvidence := fs.String("evidence", "", "handler-saved terminal acceptance evidence reference")
+	outsideReason := fs.String("outside-ownership-reason", "", "accept: the handler's reason for accepting changed files outside the entry's ownership")
 	before := fs.String("before", "", "place before this queued entry; omit to move to end")
 	cwd := fs.String("cwd", "", "absolute project folder for launch host")
 	var ownership ownershipFlags
@@ -534,6 +535,12 @@ func cmdTeamQueue(e env, args []string) error {
 					return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 				}
 			}
+			// tt lists the changed files; the hub compares them with the
+			// entry's ownership (wi_3f48b6ccc57e95f2).
+			if req.ChangedFiles, err = queueChangedFiles(ctx, q.Repository, base, *commit); err != nil {
+				return err
+			}
+			req.Acceptance.OutsideOwnershipReason = *outsideReason
 		}
 		if sub == "replace-lead" {
 			if !api.ValidID(*leadAgent, "agt") {

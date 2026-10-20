@@ -460,7 +460,10 @@ type TeamQueueRequest struct {
 	Serial                   bool                       `json:"serial,omitempty"`
 	OwnerIntegrationCommit   string                     `json:"ownerIntegrationCommit,omitempty"`
 	OwnerIntegrationEvidence string                     `json:"ownerIntegrationEvidence,omitempty"`
-	ChangedFiles             []string                   `json:"changedFiles,omitempty"`
+	// ChangedFiles is the candidate's changed files as tt computed them:
+	// owner_integrated records them, and accept compares them, from the
+	// acceptance base to the accepted commit, with the entry's ownership.
+	ChangedFiles []string `json:"changedFiles,omitempty"`
 	// ItemRevision is the item revision a rebind moves the entry to; it must
 	// be the item's current one. SourceMessageSeq is the amendment's message.
 	ItemRevision     int64 `json:"itemRevision,omitempty"`
@@ -519,6 +522,11 @@ type TeamIntegrationAcceptance struct {
 	// that its current receipt shows now passing, recorded so a later matrix
 	// cleanup has an exact source. It is absent when nothing was resolved.
 	ResolvedKnownFailures *ResolvedKnownFailures `json:"resolvedKnownFailures,omitempty"`
+	// OutsideOwnership is server-derived: the changed files outside the
+	// entry's owned paths that the leased handler accepted with
+	// OutsideOwnershipReason. Both are absent when every file was inside.
+	OutsideOwnership       []string `json:"outsideOwnership,omitempty"`
+	OutsideOwnershipReason string   `json:"outsideOwnershipReason,omitempty"`
 }
 
 // ResolvedKnownFailures names the exact receipt that let a bug close with

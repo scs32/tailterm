@@ -209,7 +209,8 @@ func TestHandlerDoneSaveRecordsQueueAcceptanceAndRunnerFinishes(t *testing.T) {
 
 // leadDoneSave is a launched team queue entry in a temporary Git repository,
 // with a verified candidate commit and the feature's completion report, ready
-// for the item lead's done save (wi_26c0698de7d3eef2 a7).
+// for the item lead's done save (wi_26c0698de7d3eef2 a7). The entry owns src;
+// the candidate commit also adds any outside files given.
 type leadDoneSave struct {
 	teamFixture
 	runner                         teamRunner
@@ -220,7 +221,7 @@ type leadDoneSave struct {
 	worktree, commit, base, branch string
 }
 
-func newLeadDoneSave(t *testing.T) *leadDoneSave {
+func newLeadDoneSave(t *testing.T, outside ...string) *leadDoneSave {
 	t.Helper()
 	f := &leadDoneSave{teamFixture: newTeamFixture(t, true), branch: "feature/item"}
 	ctx := context.Background()
@@ -242,7 +243,13 @@ func newLeadDoneSave(t *testing.T) *leadDoneSave {
 	if err := os.WriteFile(filepath.Join(worktree, "src", "a.txt"), []byte("fixed\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	gitFixtureCommand(t, worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-am", "fix")
+	for _, name := range outside {
+		if err := os.WriteFile(filepath.Join(worktree, name), []byte("outside\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitFixtureCommand(t, worktree, "add", ".")
+	gitFixtureCommand(t, worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fix")
 	f.commit = gitFixtureCommand(t, worktree, "rev-parse", "HEAD")
 	var err error
 	if f.worktree, err = filepath.EvalSymlinks(worktree); err != nil {
@@ -443,5 +450,73 @@ func TestLeadDoneSaveReplay(t *testing.T) {
 	}
 	if n := f.releaseJobs(t); n != jobs {
 		t.Fatalf("retried save enqueued a second release job: %d -> %d", jobs, n)
+	}
+}
+
+// Changed files against ownership at queue acceptance (wi_3f48b6ccc57e95f2
+// a1, a2, a4): tt lists the candidate's changed files, the hub refuses the
+// one outside src until the leased handler gives a reason, and the saved
+// acceptance records it with that file.
+func TestDoneSaveRefusesChangedFilesOutsideOwnership(t *testing.T) {
+	f := newLeadDoneSave(t, "outside.txt")
+	ctx := context.Background()
+	reason := "outside.txt is the fixture's release note"
+	running, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		item, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+		if err != nil || item.Status == "done" || item.Revision != f.current.Revision {
+			t.Fatalf("%s changed the item: %+v %v", when, item, err)
+		}
+		entry, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+		if err != nil || entry.Acceptance != nil || entry.Revision != running.Revision {
+			t.Fatalf("%s changed the entry: acceptance %+v revision %d, want %d: %v", when, entry.Acceptance, entry.Revision, running.Revision, err)
+		}
+		if n := f.releaseJobs(t); n != 0 {
+			t.Fatalf("%s enqueued %d release jobs", when, n)
+		}
+	}
+
+	// a1: the leased handler's save without a reason is refused by the hub,
+	// naming the outside file.
+	if _, err := f.save(t, f.handler, f.tuple()...); err == nil || !strings.Contains(err.Error(), "outside the entry's owned paths: outside.txt") || !strings.Contains(err.Error(), "--outside-ownership-reason") || strings.Contains(err.Error(), "src/a.txt") {
+		t.Fatalf("handler save of an outside file: %v", err)
+	}
+	unchanged("refused handler save")
+	// a2: the lead may not give a reason.
+	if _, err := f.save(t, f.lead, append(f.tuple(), "--outside-ownership-reason", reason)...); err == nil || !strings.Contains(err.Error(), "only the leased database handler may record an outside-ownership reason") {
+		t.Fatalf("lead save with a reason: %v", err)
+	}
+	unchanged("refused lead save")
+
+	// a2: the leased handler's reason accepts it and is saved with the file.
+	withReason := append(f.tuple(), "--outside-ownership-reason", reason)
+	out, err := f.save(t, f.handler, withReason...)
+	if err != nil {
+		t.Fatalf("handler save with a reason: %v\n%s", err, out)
+	}
+	accepted, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || accepted.Acceptance == nil || len(accepted.Acceptance.OutsideOwnership) != 1 || accepted.Acceptance.OutsideOwnership[0] != "outside.txt" || accepted.Acceptance.OutsideOwnershipReason != reason {
+		t.Fatalf("acceptance after the handler's save: %+v %v", accepted.Acceptance, err)
+	}
+
+	// a4: the same command replays its receipt; the recovery accept of the
+	// saved tuple changes nothing.
+	again, err := f.save(t, f.handler, withReason...)
+	if err != nil || again != out {
+		t.Fatalf("retried save: %q vs %q: %v", again, out, err)
+	}
+	handler := f.e
+	handler.agent, handler.runID = f.handler.ID, f.handler.RunID
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(handler, append([]string{"accept", "--entry", f.queued.ID, "--evidence", "handler-saved acceptance receipt", "--outside-ownership-reason", reason}, f.tuple()...))
+	}); err != nil {
+		t.Fatal("recovery accept of the saved tuple", err)
+	}
+	if after, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID); err != nil || after.Revision != accepted.Revision || after.Acceptance.AcceptedAt != accepted.Acceptance.AcceptedAt || f.releaseJobs(t) != 1 {
+		t.Fatalf("retry or recovery changed the entry: %+v %v jobs %d", after, err, f.releaseJobs(t))
 	}
 }

@@ -3087,3 +3087,250 @@ func TestTeamQueueReviewsOmitWithdrawnRound(t *testing.T) {
 		t.Fatal("queue read rewrote stored state", raw)
 	}
 }
+
+// Changed files against ownership at queue acceptance (wi_3f48b6ccc57e95f2).
+// tt reports the candidate's changed files; both acceptance paths refuse
+// files outside the entry's owned paths unless the leased handler gives a
+// reason, which is saved with the outside files.
+
+// ownSrc declares src as the auto fixture entry's ownership.
+func ownSrc(t *testing.T, f *autoAcceptFixture) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET ownership_json='["src"]' WHERE id=?`, f.entry); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// saveChanged is the leased handler's done save reporting changed files.
+func saveChanged(f *autoAcceptFixture, key string, changed []string, reason string) (api.WorkItemUpdateResult, error) {
+	tuple := f.tuple(candidateB)
+	tuple.ChangedFiles, tuple.OutsideOwnershipReason = changed, reason
+	return f.save(key, tuple)
+}
+
+// acceptChanged is tt team queue accept of candidateB reporting changed
+// files, on an item already saved done.
+func acceptChanged(t *testing.T, f *autoAcceptFixture, key string, changed []string, reason string, outside []string) (api.TeamQueueEntry, error) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE work_items SET status='done' WHERE id=?`, f.item.ID); err != nil {
+		t.Fatal(err)
+	}
+	q := f.queueEntry(t)
+	item := f.current(t)
+	return f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "accept", EntryID: f.entry, ExpectedRevision: q.Revision, HandlerAgentID: f.handler.ID, HandlerRunID: f.handler.RunID, ChangedFiles: changed,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: autoRepository, BaseCommit: q.BaseCommit, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: "handler-saved acceptance receipt", OutsideOwnership: outside, OutsideOwnershipReason: reason}})
+}
+
+// assertUnaccepted checks that a refused accept left the entry unaccepted at
+// its revision with no release job.
+func assertUnaccepted(t *testing.T, f *autoAcceptFixture) {
+	t.Helper()
+	if q := f.queueEntry(t); q.Acceptance != nil || q.Revision != 1 {
+		t.Fatalf("refused accept changed the entry: %+v", q)
+	}
+	if n := f.releaseJobs(t); n != 0 {
+		t.Fatalf("refused accept enqueued %d release jobs", n)
+	}
+}
+
+// a1: a candidate changing README.md outside src is refused on both paths,
+// naming the file and the reason flag, and nothing is saved.
+func TestQueueAcceptanceRefusesFilesOutsideOwnership(t *testing.T) {
+	changed := []string{"src/a.go", "README.md"}
+	want := []string{"candidate changes 1 file(s) outside the entry's owned paths: README.md;", "--outside-ownership-reason"}
+
+	saved := newAutoAcceptFixture(t, true)
+	ownSrc(t, saved)
+	_, saveErr := saveChanged(saved, "outside-save", changed, "")
+	if !errors.Is(saveErr, api.ErrConflict) {
+		t.Fatal("save path: outside file was not refused", saveErr)
+	}
+	for _, text := range want {
+		if !strings.Contains(saveErr.Error(), text) {
+			t.Fatalf("save refusal %q lacks %q", saveErr, text)
+		}
+	}
+	saved.assertUntouched(t)
+	if _, err := saved.s.GetWorkItemUpdateReceipt(saved.ctx, saved.task.ID, saved.item.ID, "outside-save", saved.handler.ID, saved.by); !errors.Is(err, api.ErrNotFound) {
+		t.Fatal("refused save left an update receipt", err)
+	}
+
+	manual := newAutoAcceptFixture(t, true)
+	ownSrc(t, manual)
+	_, acceptErr := acceptChanged(t, manual, "outside-accept", changed, "", nil)
+	if !errors.Is(acceptErr, api.ErrConflict) {
+		t.Fatal("accept path: outside file was not refused", acceptErr)
+	}
+	if acceptErr.Error() != saveErr.Error() {
+		t.Errorf("refusals differ: save %q, accept %q", saveErr, acceptErr)
+	}
+	assertUnaccepted(t, manual)
+
+	// A long list names ten files and counts the rest.
+	many := newAutoAcceptFixture(t, true)
+	ownSrc(t, many)
+	var outside []string
+	for i := 0; i < 12; i++ {
+		outside = append(outside, fmt.Sprintf("docs/f%02d.md", i))
+	}
+	_, err := saveChanged(many, "many-save", outside, "")
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "candidate changes 12 file(s) outside the entry's owned paths: docs/f00.md, docs/f01.md, docs/f02.md, docs/f03.md, docs/f04.md, docs/f05.md, docs/f06.md, docs/f07.md, docs/f08.md, docs/f09.md (and 2 more);") {
+		t.Fatal("long outside list refusal", err)
+	}
+	many.assertUntouched(t)
+}
+
+// a2: the leased handler's reason accepts the same candidate on both paths
+// and is saved with exactly the outside files; the lead may not give one;
+// malformed lists and reasons are invalid.
+func TestQueueAcceptanceRecordsOutsideOwnershipReason(t *testing.T) {
+	changed := []string{"src/a.go", "README.md"}
+	reason := "README.md documents the new flag; owner approved #1"
+	check := func(t *testing.T, path string, q api.TeamQueueEntry, jobs int) {
+		t.Helper()
+		a := q.Acceptance
+		if a == nil || !reflect.DeepEqual(a.OutsideOwnership, []string{"README.md"}) || a.OutsideOwnershipReason != reason {
+			t.Fatalf("%s: acceptance %+v", path, a)
+		}
+		if jobs != 1 {
+			t.Fatalf("%s: release jobs = %d, want 1", path, jobs)
+		}
+	}
+
+	saved := newAutoAcceptFixture(t, true)
+	ownSrc(t, saved)
+	if _, err := saveChanged(saved, "reason-save", changed, reason); err != nil {
+		t.Fatal("handler save with a reason", err)
+	}
+	if item := saved.current(t); item.Status != "done" {
+		t.Fatalf("item not saved done: %+v", item)
+	}
+	check(t, "save", saved.queueEntry(t), saved.releaseJobs(t))
+
+	manual := newAutoAcceptFixture(t, true)
+	ownSrc(t, manual)
+	if _, err := acceptChanged(t, manual, "reason-accept", changed, reason, nil); err != nil {
+		t.Fatal("handler accept with a reason", err)
+	}
+	check(t, "accept", manual.queueEntry(t), manual.releaseJobs(t))
+
+	// The item lead's save may not record a reason, inside or outside.
+	for _, files := range [][]string{{"hub/internal/store/x.go", "README.md"}, {"hub/internal/store/x.go"}} {
+		lead := newLeadSaveFixture(t)
+		n := lead.item.Revision
+		req := lead.request(t, "lead-reason", lead.lead, candidateB)
+		req.QueueAcceptance.ChangedFiles, req.QueueAcceptance.OutsideOwnershipReason = files, reason
+		if _, err := lead.save(req); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "only the leased database handler may record an outside-ownership reason") {
+			t.Fatalf("lead save with a reason for %v: %v", files, err)
+		}
+		lead.assertOpen(t, n, "lead-reason", lead.lead)
+	}
+
+	long := make([]string, 4097)
+	for i := range long {
+		long[i] = fmt.Sprintf("src/f%d.go", i)
+	}
+	for _, row := range []struct {
+		name    string
+		changed []string
+		reason  string
+	}{
+		{"blank reason", changed, "   "},
+		{"over-2000-byte reason", changed, strings.Repeat("r", 2001)},
+		{"NUL reason", changed, "a\x00b"},
+		{"empty file", []string{"src/a.go", ""}, ""},
+		{"over-1024-byte file", []string{"src/" + strings.Repeat("f", 1021)}, ""},
+		{"NUL file", []string{"src/a\x00.go"}, ""},
+		{"over 4096 files", long, ""},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newAutoAcceptFixture(t, true)
+			ownSrc(t, f)
+			if _, err := saveChanged(f, "invalid", row.changed, row.reason); !errors.Is(err, api.ErrInvalid) {
+				t.Fatal("save path", err)
+			}
+			f.assertUntouched(t)
+		})
+	}
+	set := newAutoAcceptFixture(t, true)
+	ownSrc(t, set)
+	if _, err := acceptChanged(t, set, "client-outside", changed, reason, []string{"README.md"}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("client-set outsideOwnership was not invalid", err)
+	}
+	assertUnaccepted(t, set)
+}
+
+// a3: files inside the ownership (case-insensitive, under a directory) are
+// accepted with nothing outside recorded and any reason dropped; an entry
+// without ownership accepts any files unchecked.
+func TestQueueAcceptanceInsideOwnershipAndUnscoped(t *testing.T) {
+	inside := []string{"src/a.go", "SRC/b.go"}
+	empty := func(t *testing.T, path string, q api.TeamQueueEntry) {
+		t.Helper()
+		a := q.Acceptance
+		if a == nil || a.OutsideOwnership != nil || a.OutsideOwnershipReason != "" {
+			t.Fatalf("%s: acceptance %+v", path, a)
+		}
+		raw, _ := json.Marshal(a)
+		if strings.Contains(string(raw), "outsideOwnership") {
+			t.Fatalf("%s: acceptance JSON %s", path, raw)
+		}
+	}
+	saved := newAutoAcceptFixture(t, true)
+	ownSrc(t, saved)
+	if _, err := saveChanged(saved, "inside-save", inside, "not needed"); err != nil {
+		t.Fatal("inside save", err)
+	}
+	empty(t, "save", saved.queueEntry(t))
+
+	manual := newAutoAcceptFixture(t, true)
+	ownSrc(t, manual)
+	if _, err := acceptChanged(t, manual, "inside-accept", inside, "not needed", nil); err != nil {
+		t.Fatal("inside accept", err)
+	}
+	empty(t, "accept", manual.queueEntry(t))
+
+	unscoped := newAutoAcceptFixture(t, true)
+	if _, err := saveChanged(unscoped, "unscoped-save", []string{"README.md", "docs/x.md"}, ""); err != nil {
+		t.Fatal("unscoped save", err)
+	}
+	empty(t, "unscoped", unscoped.queueEntry(t))
+}
+
+// a4: a done save first made without changed files (an older tt) and retried
+// with them on the same request ID is refused as a different request and
+// changes nothing.
+func TestQueueAcceptanceLegacyRetryRefusedWithoutEffect(t *testing.T) {
+	f := newAutoAcceptFixture(t, true)
+	ownSrc(t, f)
+	if _, err := f.save("legacy-retry", f.tuple(candidateB)); err != nil {
+		t.Fatal("older tt save without changed files", err)
+	}
+	item, q, jobs := f.current(t), f.queueEntry(t), f.releaseJobs(t)
+	if item.Status != "done" || q.Acceptance == nil || jobs != 1 {
+		t.Fatalf("first save: item %s entry %+v jobs %d", item.Status, q.Acceptance, jobs)
+	}
+	if _, err := saveChanged(f, "legacy-retry", []string{"src/a.go"}, ""); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "request ID was already used with different update data") {
+		t.Fatal("new tt retry of an older save", err)
+	}
+	after, q2 := f.current(t), f.queueEntry(t)
+	if after.Status != "done" || after.Revision != item.Revision || q2.Revision != q.Revision || !reflect.DeepEqual(q2.Acceptance, q.Acceptance) || f.releaseJobs(t) != jobs {
+		t.Fatalf("refused retry changed state: item %+v entry %+v jobs %d", after, q2, f.releaseJobs(t))
+	}
+}
+
+// a5: a summarized history entry clips the reason and the outside files as
+// owner integration's evidence and changed files are clipped.
+func TestSummaryClipsOutsideOwnership(t *testing.T) {
+	e := api.TeamQueueEntry{ID: "tqe_outside", Acceptance: &api.TeamIntegrationAcceptance{Commit: "abc", Evidence: "e", OutsideOwnershipReason: strings.Repeat("y", 2000)}}
+	for i := 0; i < 4096; i++ {
+		e.Acceptance.OutsideOwnership = append(e.Acceptance.OutsideOwnership, fmt.Sprintf("docs/file_%04d.md", i))
+	}
+	sum := summarizeTeamQueueEntry(e)
+	if a := sum.Acceptance; len(a.OutsideOwnership) != summaryChangedFiles || len(a.OutsideOwnershipReason) > summaryEvidenceBytes || !strings.HasSuffix(a.OutsideOwnershipReason, "…") || a.OutsideOwnership[0] != "docs/file_0000.md" {
+		t.Fatalf("outside ownership not bounded: %d files, %d-byte reason", len(a.OutsideOwnership), len(a.OutsideOwnershipReason))
+	}
+	if len(e.Acceptance.OutsideOwnership) != 4096 || len(e.Acceptance.OutsideOwnershipReason) != 2000 {
+		t.Fatal("summarizing changed the source entry")
+	}
+}

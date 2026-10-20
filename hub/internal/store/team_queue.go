@@ -1138,6 +1138,10 @@ func summarizeTeamQueueEntry(e api.TeamQueueEntry) api.TeamQueueEntry {
 		sum := *a
 		sum.Evidence = clip(sum.Evidence, summaryEvidenceBytes)
 		sum.ResolvedKnownFailures = nil
+		sum.OutsideOwnershipReason = clip(sum.OutsideOwnershipReason, summaryEvidenceBytes)
+		if len(sum.OutsideOwnership) > summaryChangedFiles {
+			sum.OutsideOwnership = sum.OutsideOwnership[:summaryChangedFiles]
+		}
 		e.Acceptance = &sum
 	}
 	if i := e.Integration; i != nil {
@@ -2276,7 +2280,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				// new revision and no second release job.
 				return e, nil
 			}
-			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.HandlerAgentID, req.HandlerRunID, false, now); err != nil {
+			if err = acceptTeamQueueEntry(ctx, tx, task, &e, *req.Acceptance, req.ChangedFiles, req.HandlerAgentID, req.HandlerRunID, false, now); err != nil {
 				return zero, err
 			}
 		case "finish":
@@ -2934,7 +2938,11 @@ func itemLeadRun(ctx context.Context, q queryRower, task, item, agent, run strin
 // here: a done save has just moved the item one revision past the entry.
 // With a current verification plan the acceptance base is the plan's base,
 // enrolled or not, as tt and the release gate use (wi_e5b42a927a0455a7).
-func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, handlerAgent, handlerRun string, allowLead bool, now string) error {
+// changed is the candidate's changed files from that base to its commit, as
+// tt computed them; files outside the entry's ownership are refused unless
+// the leased handler gives a reason (wi_3f48b6ccc57e95f2). An older tt sends
+// no list, and its candidate is accepted unchecked.
+func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.TeamQueueEntry, candidate api.TeamIntegrationAcceptance, changed []string, handlerAgent, handlerRun string, allowLead bool, now string) error {
 	// The owner's integration record replaces handler acceptance: accepting
 	// the released entry would record a second candidate and could enqueue a
 	// second release job.
@@ -3009,9 +3017,17 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
 	if err != nil {
 		return err
 	}
-	if candidate.ResolvedKnownFailures != nil || item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
+	if candidate.ResolvedKnownFailures != nil || candidate.OutsideOwnership != nil || item.Status != "done" || candidate.ItemRevision != item.Revision || !reflect.DeepEqual(candidate.CompletionReport, item.CompletionReport) || candidate.Repository != e.Repository || candidate.BaseCommit != base || !filepath.IsAbs(candidate.Worktree) || filepath.Clean(candidate.Worktree) != candidate.Worktree || strings.ContainsRune(candidate.Worktree, '\x00') || !validGitCommit(candidate.Commit) || candidate.Branch == "" || len(candidate.Branch) > 200 || strings.ContainsAny(candidate.Branch, "\x00\n\r") || strings.TrimSpace(candidate.Evidence) == "" || candidate.AcceptedAt != "" {
 		return api.ErrInvalid
 	}
+	outside, err := acceptanceOutsideOwnership(changed, e.Ownership, candidate.OutsideOwnershipReason, leased)
+	if err != nil {
+		return err
+	}
+	if len(outside) == 0 {
+		candidate.OutsideOwnershipReason = "" // nothing to excuse
+	}
+	candidate.OutsideOwnership = outside
 	candidate.AcceptedAt = now
 	if completion != nil && len(completion.Resolved) > 0 {
 		candidate.ResolvedKnownFailures = &api.ResolvedKnownFailures{ReceiptGeneration: completion.ReceiptGeneration, ReceiptDigest: verificationDigest(completion.Receipt), MatrixDigest: completion.Plan.MatrixDigest, Entries: completion.Resolved}
@@ -3019,6 +3035,47 @@ func acceptTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, e *api.T
 	e.Acceptance = &candidate
 	e.BaseCommit = base
 	return nil
+}
+
+// outsideOwnershipRefusalFiles is how many outside files a refusal names.
+const outsideOwnershipRefusalFiles = 10
+
+// acceptanceOutsideOwnership returns the reported changed files that fall
+// outside ownership, as the scheduler compares scopes (case-insensitive, the
+// exact path or under a directory). An entry without ownership has nothing
+// outside. Outside files need a reason, and only the leased handler may give
+// one.
+func acceptanceOutsideOwnership(changed, ownership []string, reason string, leased bool) ([]string, error) {
+	if len(changed) > 4096 {
+		return nil, api.ErrInvalid
+	}
+	for _, file := range changed {
+		if file == "" || len(file) > 1024 || strings.ContainsRune(file, '\x00') {
+			return nil, api.ErrInvalid
+		}
+	}
+	if reason != "" && (strings.TrimSpace(reason) == "" || len(reason) > 2000 || strings.ContainsRune(reason, '\x00')) {
+		return nil, api.ErrInvalid
+	}
+	if reason != "" && !leased {
+		return nil, fmt.Errorf("%w: only the leased database handler may record an outside-ownership reason", api.ErrConflict)
+	}
+	var outside []string
+	for _, file := range changed {
+		if !queueNarrows([]string{file}, ownership) {
+			outside = append(outside, file)
+		}
+	}
+	if len(outside) > 0 && reason == "" {
+		named := outside
+		more := ""
+		if len(named) > outsideOwnershipRefusalFiles {
+			named = named[:outsideOwnershipRefusalFiles]
+			more = fmt.Sprintf(" (and %d more)", len(outside)-outsideOwnershipRefusalFiles)
+		}
+		return nil, fmt.Errorf("%w: candidate changes %d file(s) outside the entry's owned paths: %s%s; amend the scope with tt team queue scope, or the leased database handler may accept with --outside-ownership-reason TEXT", api.ErrConflict, len(outside), strings.Join(named, ", "), more)
+	}
+	return outside, nil
 }
 
 // enqueueAcceptedRelease durably enqueues delivery for an acceptance with a
@@ -3162,9 +3219,9 @@ func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *a
 		}
 		evidence = fmt.Sprintf("%s-saved completion receipt %s revision %d", author, receiptID, item.Revision)
 	}
-	candidate := api.TeamIntegrationAcceptance{Repository: e.Repository, BaseCommit: e.BaseCommit, Worktree: accept.Worktree, Branch: accept.Branch, Commit: accept.Commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: evidence}
+	candidate := api.TeamIntegrationAcceptance{Repository: e.Repository, BaseCommit: e.BaseCommit, Worktree: accept.Worktree, Branch: accept.Branch, Commit: accept.Commit, ItemRevision: item.Revision, CompletionReport: item.CompletionReport, Evidence: evidence, OutsideOwnershipReason: accept.OutsideOwnershipReason}
 	prior := e.Revision
-	if err = acceptTeamQueueEntry(ctx, tx, t.ID, e, candidate, agentID, runID, true, now); err != nil {
+	if err = acceptTeamQueueEntry(ctx, tx, t.ID, e, candidate, accept.ChangedFiles, agentID, runID, true, now); err != nil {
 		return err
 	}
 	e.Revision++
