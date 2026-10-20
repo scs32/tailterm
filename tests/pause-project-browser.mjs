@@ -66,6 +66,12 @@ const network={async fetch(raw,init={}){
  return json(404,{error:'Synthetic route not found'});
 }};
 const data={hub:{url:'http://synthetic.invalid',token:''},teamLaunchPlans:[],agentCatalog:null,teams:[{id:'team_previous',name:'Previous synthetic team',orchestrator:'lead',swarm:false,members:[{name:'lead',role:'Lead',serverId:'synthetic-server',runtime:'codex',model:'',permissionMode:'',allowedTools:[],run:'codex',cwd:'/synthetic/a',prompt:''},{name:'worker',role:'Builder',serverId:'synthetic-server',runtime:'codex',model:'',permissionMode:'',allowedTools:[],run:'codex',cwd:'/synthetic/a',prompt:''}]}]};
+if(new URLSearchParams(location.search).get('roster')==='persistent'){
+ const member=(digit,name,role)=>({id:'agt_'+digit.repeat(16),runId:'run_'+digit.repeat(16),taskId:taskA.id,name,...(role&&{role}),host:'synthetic-host',session:name,runtime:'codex',cwd:'/synthetic/a',status:'running',online:true,cleanupDone:false});
+ const team=['lead','planner','builder','reviewer','verifier'];
+ agents.splice(0,agents.length,...team.map((name,index)=>member(String(5+index),name)),member('a','db-handler','database_handler'),member('b','deployer','deployment_agent'),member('c','steward','backlog_steward'),member('d','owner-helper','owner_helper'),...agents.filter(agent=>agent.taskId===taskB.id));
+ data.teams.push({id:'team_persistent',name:'Persistent roles synthetic team',orchestrator:'lead',swarm:false,members:team.map(name=>({name,role:name==='lead'?'Lead':'Member',serverId:'synthetic-server',runtime:'codex',model:'',permissionMode:'',allowedTools:[],run:'codex',cwd:'/synthetic/a',prompt:''}))});
+}
 const dialog=document.querySelector('#dialog');
 const notice=document.querySelector('#notice');
 const host={
@@ -600,8 +606,66 @@ try {
       );
       assert.equal(await page.getByTestId("pause-project").count(), 0);
       assert.deepEqual(errors, []);
+
+      // Persistent roles beside a five-member team: a separate context and
+      // roster, so the main flow above keeps its own fixture state.
+      const persistentContext = await browser.newContext({
+        viewport: { width: 1100, height: 760 },
+      });
+      try {
+        const rolesPage = await persistentContext.newPage();
+        const rolesErrors = [];
+        rolesPage.on("pageerror", (error) => rolesErrors.push(error.message));
+        await rolesPage.goto(origin + "/pause-project?roster=persistent");
+        await rolesPage.waitForFunction(() => !!window.fixture);
+        await rolesPage.getByRole("button", { name: "More" }).click();
+        await rolesPage.getByTestId("pause-project").click();
+        await rolesPage.getByTestId("pause-project-confirmation").waitFor();
+        assert.deepEqual(
+          await rolesPage
+            .locator(".pause-target")
+            .evaluateAll((targets) =>
+              targets.map((target) => [
+                target.querySelector("strong").textContent,
+                target.querySelector(".fine").textContent.split(" · ")[0],
+              ]),
+            ),
+          [
+            ["lead", "Lead"],
+            ["planner", "Team member"],
+            ["builder", "Team member"],
+            ["reviewer", "Team member"],
+            ["verifier", "Team member"],
+            ["db-handler", "Database handler"],
+            ["deployer", "Team member"],
+            ["steward", "Team member"],
+            ["owner-helper", "Team member"],
+          ],
+          "persistent-role pause targets or labels changed",
+        );
+        for (const select of await rolesPage
+          .locator("[data-pause-disposition]")
+          .all())
+          await select.selectOption("none");
+        await rolesPage.getByTestId("pause-project-confirm").click();
+        await rolesPage.getByTestId("project-pause-cleanup-pending").waitFor();
+        assert.equal(
+          await rolesPage.evaluate(
+            () =>
+              window.fixture.requests.find(
+                (request) =>
+                  request.method === "POST" && request.path.endsWith("/pause"),
+              )?.body.previousTeamId,
+          ),
+          "team_persistent",
+          "persistent roles were counted as members of the previous team",
+        );
+        assert.deepEqual(rolesErrors, []);
+      } finally {
+        await persistentContext.close();
+      }
       console.log(
-        `${engine.name()}: Pause, pending cleanup, lost-response Resume, fresh partial-launch retry, legacy/unknown, keyboard and narrow layouts passed.`,
+        `${engine.name()}: Pause, pending cleanup, lost-response Resume, fresh partial-launch retry, legacy/unknown, keyboard, narrow layouts and persistent-roles previous team passed.`,
       );
     } finally {
       await browser.close();

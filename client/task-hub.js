@@ -78,6 +78,35 @@ export function addTeamOrchestrator(task, agents, plan) {
   return lead;
 }
 
+// Project roles that outlive item teams; they are never team members.
+export const PERSISTENT_AGENT_ROLES = Object.freeze([
+  "database_handler",
+  "deployment_agent",
+  "owner_helper",
+  "backlog_steward",
+]);
+
+export function isPersistentAgentRole(role) {
+  return PERSISTENT_AGENT_ROLES.includes(role);
+}
+
+// Counts the distinct team members a launch plans: open agents and plan
+// entries by lowercased name, persistent roles excluded.
+export function countPlannedTeamMembers(agents, plan) {
+  return new Set([
+    ...agents
+      .filter(
+        (agent) =>
+          !isPersistentAgentRole(agent.role) &&
+          !["closed", "exited"].includes(agent.status),
+      )
+      .map((agent) => agent.name.toLowerCase()),
+    ...plan
+      .filter(({ fields }) => !isPersistentAgentRole(fields.agentRole))
+      .map(({ fields }) => fields.name.toLowerCase()),
+  ]).size;
+}
+
 // Unbinds a project from every one of its groups, "(continued)" parts included.
 export function unbindGroups(groups, taskId) {
   for (const group of groups)
@@ -777,7 +806,7 @@ export function createTaskHub(host) {
     const currentNames = detail.agents
       .filter(
         (agent) =>
-          agent.role !== "database_handler" &&
+          !isPersistentAgentRole(agent.role) &&
           agent.runId &&
           (!["closed", "exited"].includes(agent.status) || !agent.cleanupDone),
       )
@@ -1930,19 +1959,7 @@ export function createTaskHub(host) {
     const detail = journal
       ? await guardedJournalEffect(journal, null, () => client.getTask(taskId))
       : await client.getTask(taskId);
-    const plannedNames = new Set([
-      ...detail.agents
-        .filter(
-          (agent) =>
-            agent.role !== "database_handler" &&
-            !["closed", "exited"].includes(agent.status),
-        )
-        .map((agent) => agent.name.toLowerCase()),
-      ...plan
-        .filter(({ fields }) => fields.agentRole !== "database_handler")
-        .map(({ fields }) => fields.name.toLowerCase()),
-    ]);
-    const plannedTeamMembers = plannedNames.size;
+    const plannedTeamMembers = countPlannedTeamMembers(detail.agents, plan);
     let reconciled = false;
     for (const entry of plan) {
       const { fields } = entry;
@@ -2686,7 +2703,7 @@ export function createTaskHub(host) {
         error.textContent = `Starting ${fields.name} on ${target.name}…`;
         const existingMembers = new Set(
           (info?.agents || [])
-            .filter((agent) => agent.role !== "database_handler")
+            .filter((agent) => !isPersistentAgentRole(agent.role))
             .map((agent) => agent.name.toLowerCase()),
         );
         existingMembers.add(fields.name.toLowerCase());

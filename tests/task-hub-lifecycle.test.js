@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createTaskHub } from "../client/task-hub.js";
+import {
+  countPlannedTeamMembers,
+  createTaskHub,
+  isPersistentAgentRole,
+  PERSISTENT_AGENT_ROLES,
+} from "../client/task-hub.js";
 
 test("deleted tasks are forgotten without closing terminals or retrying", async () => {
   const id = "tsk_0123456789abcdef";
@@ -445,4 +450,37 @@ test("going offline and back during a failing startup listing still retries it",
   hub.stopAll();
   assert.equal(fake.calls.listings, 2);
   assert.deepEqual(hub.bound(), [fake.taskId]);
+});
+
+test("persistent project roles are never team members", () => {
+  assert.deepEqual(PERSISTENT_AGENT_ROLES, [
+    "database_handler",
+    "deployment_agent",
+    "owner_helper",
+    "backlog_steward",
+  ]);
+  for (const role of PERSISTENT_AGENT_ROLES)
+    assert.equal(isPersistentAgentRole(role), true, role);
+  for (const role of ["", undefined, "lead", "builder"])
+    assert.equal(isPersistentAgentRole(role), false, String(role));
+});
+
+test("a five-member team beside every persistent role counts five", () => {
+  const team = ["lead", "planner", "builder", "reviewer", "verifier"];
+  const agents = [
+    ...team.map((name) => ({ name, role: "", status: "running" })),
+    { name: "db-handler", role: "database_handler", status: "running" },
+    { name: "deployer", role: "deployment_agent", status: "running" },
+    { name: "steward", role: "backlog_steward", status: "running" },
+    { name: "owner-helper", role: "owner_helper", status: "running" },
+    { name: "old-builder", role: "", status: "closed" },
+  ];
+  const plan = [
+    ...team.map((name, index) => ({
+      fields: { name: index === 2 ? "Builder" : name, agentRole: "" },
+    })),
+    { fields: { name: "db-handler-r2", agentRole: "database_handler" } },
+    { fields: { name: "steward-r2", agentRole: "backlog_steward" } },
+  ];
+  assert.equal(countPlannedTeamMembers(agents, plan), 5);
 });
