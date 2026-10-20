@@ -231,6 +231,55 @@ func validateVerificationReceipt(p api.VerificationPlan, r api.VerificationRecei
 			return verificationConflict("forged result status or known failure flags")
 		}
 	}
+	return validateVerificationProvenance(r)
+}
+
+// validateVerificationProvenance checks only the optional WASM and test-binary
+// fields, so a receipt without them is accepted exactly as before. It does not
+// compare a check's WASM digests with the prerequisites: a failed
+// wasm-test-build leaves readers with other digests and must still import.
+func validateVerificationProvenance(r api.VerificationReceipt) error {
+	invalid := verificationConflict("invalid WASM or prerequisite provenance")
+	for _, c := range r.Checks {
+		if len(c.Wasm) > 8 {
+			return invalid
+		}
+		seen := map[string]bool{}
+		for _, w := range c.Wasm {
+			if w.Path == "" || len(w.Path) > 512 || filepath.IsAbs(w.Path) || filepath.Clean(w.Path) != w.Path || w.Path == ".." || strings.HasPrefix(w.Path, "../") || seen[w.Path] || !validContextDigest(w.SHA256) {
+				return invalid
+			}
+			seen[w.Path] = true
+		}
+	}
+	for _, p := range r.Prerequisites {
+		built := p.Target != "" || p.HistoricalCommit != "" || p.BuildCommand != nil || p.StartedAt != "" || p.EndedAt != ""
+		switch {
+		case p.Source == nil:
+			if p.PriorSHA256 != "" || built {
+				return invalid
+			}
+		case p.Source.Step != "":
+			if p.Source.Step != "wasm-test-build" || p.Source.Root != "" || p.Source.SHA256 != "" || !validContextDigest(p.PriorSHA256) || built {
+				return invalid
+			}
+		default:
+			root := p.Source.Root
+			if p.PriorSHA256 != "" || !validContextDigest(p.Source.SHA256) || (root != "" && (!filepath.IsAbs(root) || filepath.Clean(root) != root || len(root) > 4096)) || !filepath.IsAbs(p.Path) || (p.Target != "hub" && p.Target != "tt") || (p.HistoricalCommit != "" && !validGitCommit(p.HistoricalCommit)) || len(p.BuildCommand) > 64 {
+				return invalid
+			}
+			for _, arg := range p.BuildCommand {
+				if arg == "" || len(arg) > 4096 {
+					return invalid
+				}
+			}
+			start, e1 := time.Parse(time.RFC3339Nano, p.StartedAt)
+			end, e2 := time.Parse(time.RFC3339Nano, p.EndedAt)
+			if e1 != nil || e2 != nil || end.Before(start) {
+				return invalid
+			}
+		}
+	}
 	return nil
 }
 func validateVerificationAttempt(a api.VerificationAttempt) error {

@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 )
@@ -67,11 +69,74 @@ type VerificationResult struct {
 	FailureReason string `json:"failureReason,omitempty"`
 	LogURI        string `json:"logURI"`
 	LogDigest     string `json:"logDigest"`
+	// Wasm lists the WASM files a reader check loaded, hashed before it ran.
+	Wasm []VerificationFileDigest `json:"wasm,omitempty"`
 }
-type VerificationPrerequisite struct {
+type VerificationFileDigest struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 }
+
+// VerificationPrerequisite fields after SHA256 are provenance: a WASM file
+// rebuilt by a check keeps its pre-run digest and names that check in Source;
+// a test binary names the hub tree it was built from and its build.
+type VerificationPrerequisite struct {
+	Path             string                          `json:"path"`
+	SHA256           string                          `json:"sha256"`
+	PriorSHA256      string                          `json:"priorSha256,omitempty"`
+	Source           *VerificationPrerequisiteSource `json:"source,omitempty"`
+	Target           string                          `json:"target,omitempty"`
+	HistoricalCommit string                          `json:"historicalCommit,omitempty"`
+	BuildCommand     []string                        `json:"buildCommand,omitempty"`
+	StartedAt        string                          `json:"startedAt,omitempty"`
+	EndedAt          string                          `json:"endedAt,omitempty"`
+}
+
+// VerificationPrerequisiteSource is a JSON string naming the step that wrote
+// the file (Step), or a JSON object {root, sha256} naming the source tree a
+// binary was built from; root is null for a tree outside any checkout.
+type VerificationPrerequisiteSource struct {
+	Step   string
+	Root   string
+	SHA256 string
+}
+
+func (s VerificationPrerequisiteSource) MarshalJSON() ([]byte, error) {
+	if s.Step != "" {
+		return json.Marshal(s.Step)
+	}
+	tree := struct {
+		Root   *string `json:"root"`
+		SHA256 string  `json:"sha256"`
+	}{SHA256: s.SHA256}
+	if s.Root != "" {
+		tree.Root = &s.Root
+	}
+	return json.Marshal(tree)
+}
+
+func (s *VerificationPrerequisiteSource) UnmarshalJSON(b []byte) error {
+	*s = VerificationPrerequisiteSource{}
+	if len(b) > 0 && b[0] == '"' {
+		return json.Unmarshal(b, &s.Step)
+	}
+	if len(b) == 0 || b[0] != '{' {
+		return errors.New("verification prerequisite source must be a string or an object")
+	}
+	var tree struct {
+		Root   *string `json:"root"`
+		SHA256 string  `json:"sha256"`
+	}
+	if err := json.Unmarshal(b, &tree); err != nil {
+		return err
+	}
+	if tree.Root != nil {
+		s.Root = *tree.Root
+	}
+	s.SHA256 = tree.SHA256
+	return nil
+}
+
 type AIVBinding struct {
 	State      string `json:"state"`
 	Service    string `json:"service,omitempty"`

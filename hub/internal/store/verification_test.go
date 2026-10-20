@@ -1781,3 +1781,186 @@ func TestHandlerReceiptImportNotifiesLeadAndReviewer(t *testing.T) {
 		t.Fatalf("handler receipt record %s", raw)
 	}
 }
+
+// provenanceReceiptJSON is passingVerification(p) with the WASM and test-binary
+// provenance the matrix runner writes, spliced in as raw JSON in the runner's
+// shapes: a rebuilt WASM file, a current and a historical test binary.
+func provenanceReceiptJSON(t *testing.T, p api.VerificationPlan) []byte {
+	t.Helper()
+	base, err := json.Marshal(passingVerification(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt map[string]any
+	if err = json.Unmarshal(base, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	receipt["prerequisites"] = json.RawMessage(`[
+		{"path":"node_modules/.package-lock.json","sha256":"` + strings.Repeat("1", 64) + `"},
+		{"path":"wasm/tailserve.wasm","sha256":"` + strings.Repeat("2", 64) + `","priorSha256":"` + strings.Repeat("3", 64) + `","source":"wasm-test-build"},
+		{"path":"/tmp/fixture-logs/tailterm-hub-test","sha256":"` + strings.Repeat("4", 64) + `","source":{"root":"/tmp/fixture-verify","sha256":"` + strings.Repeat("5", 64) + `"},"target":"hub","historicalCommit":null,"buildCommand":["go","build","-ldflags=-s -w","-o","/tmp/fixture-logs/tailterm-hub-test","./cmd/hub"],"startedAt":"2026-10-19T20:11:45.586Z","endedAt":"2026-10-19T20:11:54.976Z"},
+		{"path":"/tmp/fixture-logs/tailterm-historical-hub-test","sha256":"` + strings.Repeat("6", 64) + `","source":{"root":null,"sha256":"` + strings.Repeat("7", 64) + `"},"target":"hub","historicalCommit":"58f9185981625b148b30ad4b5070a1a658e17f77","buildCommand":["go","build","-o","/tmp/fixture-logs/tailterm-historical-hub-test","./cmd/hub"],"startedAt":"2026-10-19T20:11:57.214Z","endedAt":"2026-10-19T20:12:09.438Z"}]`)
+	checks := receipt["checks"].([]any)
+	checks[0].(map[string]any)["wasm"] = json.RawMessage(`[{"path":"wasm/tailserve.wasm","sha256":"` + strings.Repeat("2", 64) + `"},{"path":".build/test.wasm","sha256":"` + strings.Repeat("8", 64) + `"}]`)
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestVerificationReceiptKeepsProvenanceAcrossRestart(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	saveFixturePlan(t, f, h, p, 0)
+	var r api.VerificationReceipt
+	if err := json.Unmarshal(provenanceReceiptJSON(t, p), &r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "provenance-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Close()
+	var err error
+	if f.s, err = Open(f.path); err != nil {
+		t.Fatal(err)
+	}
+	history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+	if err != nil || len(history) != 2 || history[1].Receipt == nil {
+		t.Fatal(history, err)
+	}
+	got := history[1].Receipt
+	wantWasm := []api.VerificationFileDigest{{Path: "wasm/tailserve.wasm", SHA256: strings.Repeat("2", 64)}, {Path: ".build/test.wasm", SHA256: strings.Repeat("8", 64)}}
+	if !reflect.DeepEqual(got.Checks[0].Wasm, wantWasm) {
+		t.Fatalf("wasm %+v", got.Checks[0].Wasm)
+	}
+	want := []api.VerificationPrerequisite{
+		{Path: "node_modules/.package-lock.json", SHA256: strings.Repeat("1", 64)},
+		{Path: "wasm/tailserve.wasm", SHA256: strings.Repeat("2", 64), PriorSHA256: strings.Repeat("3", 64), Source: &api.VerificationPrerequisiteSource{Step: "wasm-test-build"}},
+		{Path: "/tmp/fixture-logs/tailterm-hub-test", SHA256: strings.Repeat("4", 64), Source: &api.VerificationPrerequisiteSource{Root: "/tmp/fixture-verify", SHA256: strings.Repeat("5", 64)}, Target: "hub", BuildCommand: []string{"go", "build", "-ldflags=-s -w", "-o", "/tmp/fixture-logs/tailterm-hub-test", "./cmd/hub"}, StartedAt: "2026-10-19T20:11:45.586Z", EndedAt: "2026-10-19T20:11:54.976Z"},
+		{Path: "/tmp/fixture-logs/tailterm-historical-hub-test", SHA256: strings.Repeat("6", 64), Source: &api.VerificationPrerequisiteSource{SHA256: strings.Repeat("7", 64)}, Target: "hub", HistoricalCommit: "58f9185981625b148b30ad4b5070a1a658e17f77", BuildCommand: []string{"go", "build", "-o", "/tmp/fixture-logs/tailterm-historical-hub-test", "./cmd/hub"}, StartedAt: "2026-10-19T20:11:57.214Z", EndedAt: "2026-10-19T20:12:09.438Z"},
+	}
+	if !reflect.DeepEqual(got.Prerequisites, want) || !reflect.DeepEqual(*got, r) {
+		t.Fatalf("prerequisites %+v", got.Prerequisites)
+	}
+	for i, wantJSON := range map[int]string{1: `"wasm-test-build"`, 2: `{"root":"/tmp/fixture-verify","sha256":"` + strings.Repeat("5", 64) + `"}`, 3: `{"root":null,"sha256":"` + strings.Repeat("7", 64) + `"}`} {
+		b, err := json.Marshal(got.Prerequisites[i].Source)
+		if err != nil || string(b) != wantJSON {
+			t.Fatalf("source %d re-marshalled as %s (%v)", i, b, err)
+		}
+	}
+	for _, bad := range []string{`1`, `["wasm-test-build"]`, `true`} {
+		var pre api.VerificationPrerequisite
+		if err := json.Unmarshal([]byte(`{"path":"x","sha256":"`+strings.Repeat("1", 64)+`","source":`+bad+`}`), &pre); err == nil {
+			t.Fatalf("source %s decoded", bad)
+		}
+	}
+}
+
+func TestVerificationRefusesMalformedProvenance(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	saveFixturePlan(t, f, h, p, 0)
+	valid := func() api.VerificationReceipt {
+		var r api.VerificationReceipt
+		if err := json.Unmarshal(provenanceReceiptJSON(t, p), &r); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	build := func(r *api.VerificationReceipt) *api.VerificationPrerequisite { return &r.Prerequisites[2] }
+	cases := map[string]func(r *api.VerificationReceipt){
+		"wasm sha256 not hex":         func(r *api.VerificationReceipt) { r.Checks[0].Wasm[0].SHA256 = strings.Repeat("g", 64) },
+		"priorSha256 not hex":         func(r *api.VerificationReceipt) { r.Prerequisites[1].PriorSHA256 = strings.Repeat("A", 64) },
+		"source sha256 not hex":       func(r *api.VerificationReceipt) { build(r).Source.SHA256 = "short" },
+		"absolute wasm path":          func(r *api.VerificationReceipt) { r.Checks[0].Wasm[0].Path = "/tmp/tailserve.wasm" },
+		"unclean wasm path":           func(r *api.VerificationReceipt) { r.Checks[0].Wasm[0].Path = "./wasm//tailserve.wasm" },
+		"parent wasm path":            func(r *api.VerificationReceipt) { r.Checks[0].Wasm[0].Path = "../wasm/tailserve.wasm" },
+		"empty wasm path":             func(r *api.VerificationReceipt) { r.Checks[0].Wasm[0].Path = "" },
+		"duplicate wasm path":         func(r *api.VerificationReceipt) { r.Checks[0].Wasm[1].Path = r.Checks[0].Wasm[0].Path },
+		"unknown source token":        func(r *api.VerificationReceipt) { r.Prerequisites[1].Source.Step = "npm-ci" },
+		"priorSha256 without token":   func(r *api.VerificationReceipt) { r.Prerequisites[0].PriorSHA256 = strings.Repeat("3", 64) },
+		"token without priorSha256":   func(r *api.VerificationReceipt) { r.Prerequisites[1].PriorSHA256 = "" },
+		"token with build fields":     func(r *api.VerificationReceipt) { r.Prerequisites[1].Target = "hub" },
+		"target other than hub or tt": func(r *api.VerificationReceipt) { build(r).Target = "bridge" },
+		"bad historicalCommit":        func(r *api.VerificationReceipt) { r.Prerequisites[3].HistoricalCommit = "58f9185" },
+		"unparsable startedAt":        func(r *api.VerificationReceipt) { build(r).StartedAt = "yesterday" },
+		"missing endedAt":             func(r *api.VerificationReceipt) { build(r).EndedAt = "" },
+		"reversed build times": func(r *api.VerificationReceipt) {
+			build(r).StartedAt, build(r).EndedAt = build(r).EndedAt, build(r).StartedAt
+		},
+		"empty buildCommand argument":  func(r *api.VerificationReceipt) { build(r).BuildCommand[1] = "" },
+		"relative source root":         func(r *api.VerificationReceipt) { build(r).Source.Root = "fixture-verify" },
+		"relative binary path":         func(r *api.VerificationReceipt) { build(r).Path = "tailterm-hub-test" },
+		"target without object source": func(r *api.VerificationReceipt) { r.Prerequisites[0].Target = "hub" },
+		"orphan buildCommand":          func(r *api.VerificationReceipt) { r.Prerequisites[0].BuildCommand = []string{"go"} },
+		"nine wasm entries": func(r *api.VerificationReceipt) {
+			r.Checks[0].Wasm = nil
+			for i := 0; i < 9; i++ {
+				r.Checks[0].Wasm = append(r.Checks[0].Wasm, api.VerificationFileDigest{Path: fmt.Sprintf("wasm/%d.wasm", i), SHA256: strings.Repeat("2", 64)})
+			}
+		},
+		"65-entry buildCommand": func(r *api.VerificationReceipt) {
+			build(r).BuildCommand = nil
+			for i := 0; i < 65; i++ {
+				build(r).BuildCommand = append(build(r).BuildCommand, "arg")
+			}
+		},
+	}
+	for name, mutate := range cases {
+		r := valid()
+		mutate(&r)
+		_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "bad-" + strings.ReplaceAll(name, " ", "-"), AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "provenance") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+	if err != nil || len(history) != 1 {
+		t.Fatal("a refused receipt advanced the generation", len(history), err)
+	}
+	r := valid()
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "good-provenance", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal("valid provenance refused", err)
+	}
+}
+
+func TestVerificationLegacyReceiptShapeAndDigestUnchanged(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	saveFixturePlan(t, f, h, p, 0)
+	r := passingVerification(p)
+	r.Prerequisites = []api.VerificationPrerequisite{{Path: "wasm/tailserve.wasm", SHA256: strings.Repeat("2", 64)}}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generic struct {
+		Prerequisites []map[string]any `json:"prerequisites"`
+		Checks        []map[string]any `json:"checks"`
+	}
+	if err = json.Unmarshal(b, &generic); err != nil {
+		t.Fatal(err)
+	}
+	for _, entries := range [][]map[string]any{generic.Prerequisites, generic.Checks} {
+		for _, entry := range entries {
+			for _, key := range []string{"wasm", "priorSha256", "source", "target", "historicalCommit", "buildCommand"} {
+				if _, ok := entry[key]; ok {
+					t.Fatalf("legacy receipt JSON gained %q: %s", key, b)
+				}
+			}
+		}
+	}
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "legacy-receipt", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r}); err != nil {
+		t.Fatal("legacy receipt refused", err)
+	}
+	raw := `{"worktree":"/tmp/fixture","version":1,"operationKey":"k","planDigest":"` + strings.Repeat("c", 64) + `","repository":"fixture","baseCommit":"` + candidateB + `","commit":"` + candidateA + `","matrixDigest":"` + strings.Repeat("a", 64) + `","checksDigest":"` + strings.Repeat("d", 64) + `","verifierAgentId":"agt_v","verifierRunId":"run_v","detached":true,"cleanBefore":true,"cleanAfter":true,"environment":{"HOME":"/tmp/isolated"},"prerequisites":[{"path":"wasm/tailserve.wasm","sha256":"` + strings.Repeat("2", 64) + `"},{"path":"/tmp/tailterm-hub-test","sha256":"` + strings.Repeat("4", 64) + `"}],"checks":[{"attempts":[{"attempt":1,"startedAt":"2026-09-26T00:00:00Z","endedAt":"2026-09-26T00:00:01Z","durationMs":1000,"exitCode":0,"logURI":"/tmp/fixture.log","logDigest":"` + strings.Repeat("b", 64) + `"}],"status":"pass","id":"fixture-check","argv":["node","fixture.js"],"cwd":".","environment":{},"startedAt":"2026-09-26T00:00:00Z","endedAt":"2026-09-26T00:00:01Z","durationMs":1000,"exitCode":0,"logURI":"/tmp/fixture.log","logDigest":"` + strings.Repeat("b", 64) + `"}],"aiv":{"state":"unsubmitted"}}`
+	var decoded api.VerificationReceipt
+	var literal any
+	if err = json.Unmarshal([]byte(raw), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal([]byte(raw), &literal); err != nil {
+		t.Fatal(err)
+	}
+	if verificationDigest(decoded) != verificationDigest(literal) {
+		t.Fatal("decoding a legacy receipt changed its digest")
+	}
+}
