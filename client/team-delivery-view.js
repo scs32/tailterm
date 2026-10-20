@@ -4,6 +4,15 @@ import { handlerArmText } from "./handler-ab-format.js";
 // Read-only project delivery panel with immutable release evidence.
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+// A failed push's diagnostics say whether the one re-check found it landed,
+// whether the runner's limit stopped it and what the remote read showed.
+// An older receipt has only remote, commit and outcome and reads as before.
+function pushText(push) {
+  if (push.outcome !== "failed") return `push ${esc(push.outcome)}`;
+  if (push.remoteCheck === "landed") return "push landed after a failed attempt";
+  return `push ${push.timedOut === true ? "timed out" : "failed"}${push.remoteCheck ? ` · remote ${esc(push.remoteCheck)}` : ""}`;
+}
+
 export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskId = "") {
   if (!queue || !Array.isArray(queue.entries) || queue.entries.length === 0) return "";
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
@@ -23,7 +32,7 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
     // published survives a later block: tasks-hub already carries the change.
     const merged = release && (release.published || ["merged","released","rolled_back"].includes(release.state) || release.receipt);
     const superseded = release?.state === "superseded" ? ` → superseded (released by hand)${release.supersession ? ` · ${esc(release.supersession.release)} @ ${esc(release.supersession.releasedCommit)}` : ""}` : "";
-    const refEffects = release?.receipt ? `${release.receipt.push ? ` · push ${esc(release.receipt.push.outcome)}` : ""}${release.receipt.revert ? ` · tasks-hub revert ${esc(release.receipt.revert.outcome)}${release.receipt.revert.commit ? " " + esc(release.receipt.revert.commit) : ""}` : ""}` : "";
+    const refEffects = release?.receipt ? `${release.receipt.push ? ` · ${pushText(release.receipt.push)}` : ""}${release.receipt.revert ? ` · tasks-hub revert ${esc(release.receipt.revert.outcome)}${release.receipt.revert.commit ? " " + esc(release.receipt.revert.commit) : ""}` : ""}` : "";
     const releaseText = release ? `<span class="fine" data-testid="release-summary" style="overflow-wrap:anywhere">Accepted → verified${merged ? " → merged" : ""}${release.state === "released" ? " → released" : ""}${superseded} · ${esc(release.state)} · job ${esc(release.id)} · verification ${esc(release.verificationDigest)}${release.integratedCommit ? " · commit " + esc(release.integratedCommit) : ""}${release.receipt?.targets?.map(t => " · " + esc(t.target) + ": " + esc(t.outcome) + (t.rollback ? " · rollback " + esc(t.rollback) : "") + " · " + esc(t.release) + (t.deployment ? " · " + esc(t.deployment) : "")).join("") || ""}${refEffects}</span>` : "";
     const review = entry.reviews;
     // Only the current review stage counts against the limit. A stage is

@@ -24,6 +24,27 @@ test("the receipt's push and tasks-hub revert are shown", () => {
   assert.match(summary({ state: "rolled_back", published: true, receipt: { commit, outcome: "rolled_back", targets: [], revert: { commit: "f".repeat(40), outcome: "committed" } } }), /tasks-hub revert committed f{40}/);
 });
 
+// wi_2ecd30082f47de50: a failed push's diagnostics tell its outcomes apart;
+// an older receipt with only remote, commit and outcome reads as before.
+test("the push text tells a landed, timed-out and failed push apart", () => {
+  const commit = "e".repeat(40);
+  const row = (fields) => summary({ state: "released", receipt: { commit, outcome: "released", targets: [], push: { remote: "origin", commit, ...fields } } });
+  const push = (fields) => row(fields).match(/ · (push [^<]*)<\/span>/)[1];
+  const landed = { outcome: "failed", timedOut: true, exitCode: 128, elapsedMs: 300000, reason: "push-timed-out", remoteCheck: "landed", stderrSHA256: "a".repeat(64) };
+  assert.equal(push(landed), "push landed after a failed attempt");
+  assert.ok(!row(landed).includes("push failed") && !row(landed).includes("push timed out"));
+  assert.equal(push({ outcome: "failed", remoteCheck: "landed", reason: "push-failed" }), "push landed after a failed attempt");
+  assert.equal(push({ outcome: "failed", timedOut: true, elapsedMs: 300000, reason: "push-timed-out", remoteCheck: "absent" }), "push timed out · remote absent");
+  assert.equal(push({ outcome: "failed", timedOut: true, reason: "push-timed-out" }), "push timed out");
+  assert.equal(push({ outcome: "failed", exitCode: 1, reason: "push-failed", remoteCheck: "absent" }), "push failed · remote absent");
+  assert.equal(push({ outcome: "failed", signal: "sigterm", reason: "push-killed", remoteCheck: "unknown" }), "push failed · remote unknown");
+  assert.equal(push({ outcome: "failed" }), "push failed");
+  assert.equal(push({ outcome: "pushed" }), "push pushed");
+  const odd = push({ outcome: "failed", remoteCheck: "<img src=x>" });
+  assert.equal(odd, "push failed · remote &lt;img src=x&gt;");
+  assert.equal(push({ outcome: "<b>" }), "push &lt;b&gt;");
+});
+
 // wi_ade4aa60c5d9b55e: the Delivery panel shows whether a team has a plan review.
 test("the frozen launch shows a plan review team or a plan-only team", () => {
   const member = (name, role) => ({ fields: { name, role } });
