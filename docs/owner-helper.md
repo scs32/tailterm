@@ -192,6 +192,28 @@ the owner's own configuration supplies it. Both commands refuse when the helper 
 registered again elsewhere, closed or exited, or when a caller supplies a
 stale run or a different runtime/thread.
 
+## Closing the helper
+
+```sh
+tt helper close --task tsk_...     # close this host's registered helper run
+```
+
+`tt helper close` closes the run registered on this host on the hub, then marks
+this host's helper file closed for that run, so the helper session writes no
+further tool ledger rows (see [Claude wake](claude-wake.md#a-closed-helper)). It
+runs in the owner's own session or as the registered helper run, and is refused
+as any other agent. It stops nothing on the host: the wake binding and tmux tags
+stay until the next `tt helper register` replaces them. That registration creates
+a fresh helper with a new agent ID and is ledgered again; open a new delegation
+window for it (see [After a close, open a new window](#opening-a-window-for-the-helper)).
+
+An owner close (`tt close owner-helper` or TailOS) also closes the helper on the
+hub, but this host does not learn of it until the helper session next runs
+`tt helper env`, `tt helper inbox` or `tt helper reply`, which mark the file before
+refusing. Until then the session is still ledgered under the closed run. The relay
+heartbeat does not mark the file yet; bug `wi_b134e2c694f51b54` adds that, and it
+is not on `tasks-hub` yet.
+
 ## Talking from Discord
 
 With the bridge's `DISCORD_HELPER_TASK` set to this project, the owner's plain
@@ -220,8 +242,9 @@ eval "$(tt helper env --task tsk_...)" && tt ask answer SEQ --option ID --ration
 The window follows the agent, not the run: re-registering keeps the window and the
 inbox, and the replaced run is refused (403) like any stale run.
 
-**After a close, open a new window.** Closing the helper is different. A pause or an
-owner close (`tt close owner-helper` or TailOS) closes it, and the next
+**After a close, open a new window.** Closing the helper is different. A pause,
+`tt helper close` or an owner close (`tt close owner-helper` or TailOS) closes it,
+and the next
 `tt helper register` creates a fresh helper with a new agent ID. A window names the
 agent it was opened for and a closed delegate is skipped, so the old window routes
 nothing more and nothing reaches the new helper. Closing the helper does not end the
@@ -370,7 +393,9 @@ not make it.
   holds a pause in cleanup. Pause closes it; register again after resume, which
   creates a fresh helper, and open a new delegation window naming it (see
   [Opening a window for the helper](#opening-a-window-for-the-helper)).
-- Closing it (`tt close owner-helper` or TailOS) stops nothing on the host.
+- Closing it (`tt helper close`, `tt close owner-helper` or TailOS) stops nothing
+  on the host. See [Closing the helper](#closing-the-helper) for when the session
+  stops writing tool ledger rows.
 - Routing to the helper still depends on the requester's declared category, exactly
   as for any delegate.
 
