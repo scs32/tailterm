@@ -1637,7 +1637,8 @@ test("wasm-test-build leads the plan and finishes before the static build and ev
 });
 // A browser fixture with wasm/tailserve.wasm ignored, as in a real checkout,
 // and a wasm/ rule that selects wasm-test-build. The build stub writes
-// "built" to both WASM files; scripts and suites replace the fixture's stubs.
+// "built" to both WASM files and the module list; scripts and suites replace
+// the fixture's stubs.
 function wasmFixture(t, { suite, scripts = {} }) {
   const f = browserFixture(t, { "wasm-browser.mjs": suite });
   writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\nwasm/tailserve.wasm\n");
@@ -1650,7 +1651,7 @@ function wasmFixture(t, { suite, scripts = {} }) {
   writeFileSync(join(f.cwd, "package.json"), JSON.stringify(pkg));
   mkdirSync(join(f.cwd, "scripts"));
   writeFileSync(join(f.cwd, "scripts/build-wasm.sh"),
-    "printf built > wasm/tailserve.wasm\nprintf built > .build/test.wasm\n");
+    "printf built > wasm/tailserve.wasm\nprintf built > .build/test.wasm\nprintf built > .build/go-modules.txt\n");
   f.git("add", ".");
   f.git("commit", "-qm", "wasm fixture");
   return { ...f, baseCommit: f.git("rev-parse", "HEAD") };
@@ -1680,11 +1681,14 @@ test("browser checks and the static build use this run's WASM and the receipt re
     ["00-static-build", "tests/wasm-browser.mjs"]);
   for (const check of receipt.checks.filter((c) => !isWasmReader(c)))
     assert(!("wasm" in check), check.id + " records no WASM");
+  // wi_fcc0892578a426b9 / order #40565: the module list the build rewrote
+  // is recorded like the WASM it wrote.
+  const rebuilt = ["wasm/tailserve.wasm", ".build/test.wasm", ".build/go-modules.txt"];
   for (const entry of receipt.prerequisites)
-    assert.deepEqual(entry, entry.path.endsWith(".wasm")
+    assert.deepEqual(entry, rebuilt.includes(entry.path)
       ? { path: entry.path, sha256: digest("built"), priorSha256: digest("fixture"), source: "wasm-test-build" }
       : { path: entry.path, sha256: entry.sha256 });
-  assert.equal(receipt.prerequisites.filter((p) => p.source).length, 2);
+  assert.equal(receipt.prerequisites.filter((p) => p.source).length, 3);
 
   // A suite that rewrites the built WASM fails the run with no receipt.
   const g = wasmFixture(t, {
@@ -1699,6 +1703,19 @@ test("browser checks and the static build use this run's WASM and the receipt re
   );
   assert(!existsSync(join(output, "receipt.json")));
 
+  // So does a suite that rewrites the module list after the build.
+  const m = wasmFixture(t, {
+    suite: `import { writeFileSync } from "node:fs";\nwriteFileSync(".build/go-modules.txt", "rewritten");\n`,
+  });
+  const modules = commitChange(m, "wasm/x.go", "package wasm\n", "wasm candidate");
+  const modulesOutput = tempDir(t, "verification-wasm-modules-");
+  await assert.rejects(
+    runPlan(makePlan({ baseCommit: m.baseCommit, commit: modules, owned: ["wasm/"] }, m.cwd), m.cwd, modulesOutput,
+      { minFreeBytes: 0, jobs: 4 }),
+    /WASM changed after wasm-test-build: \.build\/go-modules\.txt/,
+  );
+  assert(!existsSync(join(modulesOutput, "receipt.json")));
+
   // A passing build that leaves no test.wasm fails before any reader runs.
   const h = wasmFixture(t, { suite: readsBuilt(".build/test.wasm") });
   writeFileSync(join(h.cwd, "scripts/build-wasm.sh"), "printf built > wasm/tailserve.wasm\nrm .build/test.wasm\n");
@@ -1712,6 +1729,32 @@ test("browser checks and the static build use this run's WASM and the receipt re
   );
   assert(!existsSync(join(missingOutput, "receipt.json")));
 });
+// wi_fcc0892578a426b9 / order #40565: a failed build leaves the readers on
+// the previous WASM with nothing to compare, so it can never be excused.
+test("wasm-test-build cannot be a known failure and a failed build leaves no eligible receipt", async (t) => {
+  const bug = { bugTaskId: "tsk_aaaaaaaaaaaaaaaa", bugId: "wi_bbbbbbbbbbbbbbbb" };
+  const m = { ...matrix, maxAttempts: 3 };
+  assert.throws(
+    () => matrixPolicy({ ...m, knownFailures: [{ checkId: "wasm-test-build", ...bug }] }, []),
+    /^Error: wasm-test-build cannot be a known failure: browser readers would run on stale WASM$/,
+  );
+  const npmUnit = { checkId: "npm-unit", ...bug };
+  assert.deepEqual(matrixPolicy({ ...m, knownFailures: [npmUnit] }, [{ id: "npm-unit" }]),
+    { maxAttempts: 3, knownFailures: [npmUnit] });
+
+  const f = wasmFixture(t, { suite: "console.log('browser ran');\n" });
+  writeFileSync(join(f.cwd, "scripts/build-wasm.sh"), "exit 1\n");
+  f.git("commit", "-qam", "build fails");
+  const commit = commitChange(f, "wasm/x.go", "package wasm\n", "wasm candidate");
+  const plan = makePlan({ baseCommit: f.git("rev-parse", "HEAD~1"), commit, owned: ["wasm/"] }, f.cwd);
+  assert.equal(plan.knownFailures, undefined);
+  const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-wasm-failed-"), { minFreeBytes: 0, jobs: 4 });
+  const build = receipt.checks.find((c) => c.id === "wasm-test-build");
+  assert.equal(build.status, "fail");
+  assert(!("knownFailure" in build));
+  assert.equal(receiptEligible(receipt), false);
+  assert(receipt.prerequisites.every((p) => !p.source), "nothing is recorded as rebuilt");
+});
 test("a plan without wasm-test-build keeps id order and records the prerequisite WASM each reader loaded", async (t) => {
   const f = wasmFixture(t, { suite: "console.log('browser ran');\n" });
   const commit = commitChange(f, "client/app.js", "export {}\n", "client candidate");
@@ -1724,6 +1767,8 @@ test("a plan without wasm-test-build keeps id order and records the prerequisite
   assert(receipt.checks.every((c) => c.status === "pass"), "every check passed");
   assert.deepEqual(receipt.prerequisites, prerequisites);
   assert.deepEqual(prerequisites.filter((p) => p.path.endsWith(".wasm")), wasmEntries(digest("fixture")));
+  assert.deepEqual(receipt.prerequisites.find((p) => p.path === ".build/go-modules.txt"),
+    { path: ".build/go-modules.txt", sha256: digest("fixture") });
   for (const reader of receipt.checks.filter(isWasmReader))
     assert.deepEqual(reader.wasm, wasmEntries(digest("fixture")), reader.id);
   assert.equal(receipt.checks.filter(isWasmReader).length, 2);

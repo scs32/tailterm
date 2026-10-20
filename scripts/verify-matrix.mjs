@@ -332,6 +332,10 @@ export function matrixPolicy(matrix, checks) {
       ids.add(id);
   const seen = new Set();
   for (const entry of matrix.knownFailures) {
+    // A failed build leaves the WASM readers on the previous run's files with
+    // nothing to compare them to, so the build may never be excused.
+    if (entry?.checkId === "wasm-test-build")
+      throw new Error("wasm-test-build cannot be a known failure: browser readers would run on stale WASM");
     if (
       !ids.has(entry.checkId) ||
       seen.has(entry.checkId) ||
@@ -2231,6 +2235,9 @@ export const EXCLUSIVE_CHECKS = new Set([
 // order, and the checks that read them: 00-static-build packs
 // wasm/tailserve.wasm into dist-static and the browser suites load both.
 const WASM_FILES = ["wasm/tailserve.wasm", ".build/test.wasm"];
+// build-wasm.sh --test rewrites the module list last, and 00-static-build
+// reads it for the license notices.
+const GO_MODULES = ".build/go-modules.txt";
 const isWasmReader = (check) => isBrowserCheck(check) || check.id === "00-static-build";
 // Why a plan would let a WASM reader start before wasm-test-build rewrote
 // its input, or "" when the plan has no such reader or no wasm-test-build.
@@ -2867,20 +2874,23 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     const wasmPaths = buildsWasm
       ? WASM_FILES
       : prerequisites.filter((p) => WASM_FILES.includes(p.path)).map((p) => p.path);
-    const hashWasm = (fail) =>
-      Promise.all(wasmPaths.map(async (path) => {
+    const hashFiles = (paths, fail) =>
+      Promise.all(paths.map(async (path) => {
         try {
           return { path, sha256: await fileHash(join(cwd, path)) };
         } catch (error) {
           throw new Error(fail(path) + ": " + error.message, { cause: error });
         }
       }));
+    const hashWasm = (fail) => hashFiles(wasmPaths, fail);
+    // The module list the build rewrote, when the plan carries it.
+    const modulePaths = buildsWasm && prerequisites.some((p) => p.path === GO_MODULES) ? [GO_MODULES] : [];
     const wasmChanged = buildsWasm
       ? "WASM changed after wasm-test-build: "
       : "WASM prerequisite changed during verification: ";
     // Undefined until wasm-test-build passes; a failed build leaves the
     // readers recording what they load with nothing to compare it to.
-    let builtWasm, wasmBuildEnded = false;
+    let builtWasm, builtModules = [], wasmBuildEnded = false;
     const expectedWasm = () =>
       buildsWasm ? builtWasm : prerequisites.filter((p) => WASM_FILES.includes(p.path));
     const checkWasm = (loaded) => {
@@ -2909,8 +2919,11 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
         if (check.id === "wasm-test-build") {
           // Hashed after the final attempt, so a retried build records the
           // files its passing attempt wrote.
-          if (readsWasm && result.exitCode === 0)
-            builtWasm = await hashWasm((path) => "wasm-test-build passed without writing " + path);
+          if (readsWasm && result.exitCode === 0) {
+            const missing = (path) => "wasm-test-build passed without writing " + path;
+            builtWasm = await hashWasm(missing);
+            builtModules = await hashFiles(modulePaths, missing);
+          }
           wasmBuildEnded = true;
         }
         return wasm ? { ...result, wasm } : result;
@@ -2926,11 +2939,13 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     }
     if (readsWasm && wasmPaths.length && expectedWasm())
       checkWasm(await hashWasm((path) => wasmChanged + path));
-    // The hub keeps a prerequisite's sha256, so a built WASM entry names the
-    // file the checks used and keeps the pre-run digest as priorSha256.
+    for (const [i, entry] of (await hashFiles(builtModules.map((b) => b.path), (path) => wasmChanged + path)).entries())
+      if (entry.sha256 !== builtModules[i].sha256) throw new Error(wasmChanged + entry.path);
+    // The hub keeps a prerequisite's sha256, so a built entry names the file
+    // the checks used and keeps the pre-run digest as priorSha256.
     if (builtWasm)
       for (const [i, p] of prerequisites.entries()) {
-        const built = builtWasm.find((b) => b.path === p.path);
+        const built = [...builtWasm, ...builtModules].find((b) => b.path === p.path);
         if (built)
           prerequisites[i] = { path: p.path, sha256: built.sha256, priorSha256: p.sha256, source: "wasm-test-build" };
       }
