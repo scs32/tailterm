@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,PUSH_REASONS,PUSH_TIMEOUT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -618,23 +618,23 @@ test("a6 a diverged remote fails the push with one escalation, keeps the release
 });
 // wi_8afe404c4867dafc p5/p5c: a fake git that runs the real git for every
 // call except the push (and, when given, ls-remote), against the fixture's
-// temp bare remote only.
+// temp bare remote only. $D is the fake's own temp directory.
 const REAL_GIT=execFileSync("sh",["-c","command -v git"],{encoding:"utf8"}).trim();
 function fakeGit(push,lsRemote){
  const dir=mkdtempSync(join(tmpdir(),"release-fake-git-")),path=join(dir,"git");
  writeFileSync(join(dir,"stderr.txt"),"fatal: unable to access 'https://x-access-token:ghs_0123456789abcdefABCDEF0123456789@github.com/o/r.git/': The requested URL returned error: 403\npassword=hunter2hunter2\n");
- writeFileSync(path,`#!/bin/sh\nREAL='${REAL_GIT}'\nERR='${join(dir,"stderr.txt")}'\ncase "$1" in\n push) ${push} ;;\n ls-remote) ${lsRemote||":"} ;;\nesac\nexec "$REAL" "$@"\n`);chmodSync(path,0o755);return path;
+ writeFileSync(path,`#!/bin/sh\nREAL='${REAL_GIT}'\nERR='${join(dir,"stderr.txt")}'\nD='${dir}'\ncase "$1" in\n push) ${push} ;;\n ls-remote) ${lsRemote||":"} ;;\nesac\nexec "$REAL" "$@"\n`);chmodSync(path,0o755);return path;
 }
 const PUSH_MODES={slow:"sleep 5; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
 // A release through the fake git; finish writes the receipt file as the host
 // adapter does, so the file and the journal can be read separately.
-async function pushCase(push,lsRemote,{timeoutMs=60000,setup}={}){
- const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c={...config(f,j),push:{git:fakeGit(push,lsRemote),timeoutMs,checkTimeoutMs:10000}},escalations=[];
+async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={}){
+ const gitPath=fakeGit(push,lsRemote),f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c={...config(f,j),push:{git:gitPath,timeoutMs,graceMs,stopMs,checkTimeoutMs:10000}},escalations=[];
  const host=new HostAdapter({cwd:f.cwd,journalDirectory:dirname(c.journalPath)},j);host.native=()=>host.job;
  a.escalate=async d=>{escalations.push(d);a.calls.push("escalate");};a.finish=async(r,g)=>{await host.finish(r,g);a.calls.push("finish");};
  if(setup)setup(f,c);
  const started=Date.now(),r=await runRelease(c,a),took=Date.now()-started;
- return {f,j,a,c,r,took,escalations,file:readFileSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"),"utf8"),journal:JSON.parse(readFileSync(c.journalPath,"utf8"))};
+ return {f,j,a,c,r,took,escalations,dir:dirname(gitPath),file:readFileSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"),"utf8"),journal:JSON.parse(readFileSync(c.journalPath,"utf8"))};
 }
 const STDERR_TEXT=["unable to access","RPC failed","[redacted]","hunter2","ghs_","fatal","error:"];
 const noStderr=(text,what)=>{for(const s of STDERR_TEXT)assert.ok(!text.includes(s),`${what} holds ${s}`);};
@@ -674,6 +674,46 @@ test("push p5 a failed push whose remote cannot be read is unknown and escalated
  const t=await pushCase(PUSH_MODES.fail,"exit 2");
  assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.outcome,"failed");assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
 });
+// wi_01b550d20e610c85: the push runs as its own process-group leader. A
+// timed-out push whose child would land two seconds later is stopped with
+// its whole group, and the re-check (which fails as unknown if that child
+// still runs) reads the remote only after the group is gone. Limits leave
+// the fake shell time to start, so its traps are set before the stop.
+const LATE='( sleep 2.5; "$REAL" "$@" ) & echo $! > "$D/child.pid"; sleep 30',ALIVE='kill -0 "$(cat "$D/child.pid")" 2>/dev/null && exit 3';
+// A failed push that leaves a child ignoring SIGTERM: the child sets its trap
+// before the push exits, so the stop never races the shell's start-up.
+const STUBBORN='( trap "" TERM; touch "$D/ready"; sleep 30 ) & echo $! > "$D/child.pid"; while [ ! -f "$D/ready" ]; do sleep 0.05; done; exit 1';
+const stubbornGone=dir=>{const pid=Number(readFileSync(join(dir,"child.pid"),"utf8"));assert.ok(pid>0);try{process.kill(pid,0);return false;}catch(error){return error.code==="ESRCH";}};
+test("push t1 a timed-out push whose child would land later is stopped with its group, never lands, and is escalated as absent",async()=>{
+ const t=await pushCase(LATE,ALIVE,{timeoutMs:1500});
+ const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"absent"});
+ assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"absent");assert.equal(t.journal.pushAttempts.at(-1).stopped,true);
+ const child=Number(readFileSync(join(t.dir,"child.pid"),"utf8"));assert.throws(()=>process.kill(child,0),{code:"ESRCH"});
+ await new Promise(r=>setTimeout(r,Math.max(0,4000-t.took)));assert.equal(remoteHead(t.f),t.f.base,"no late landing after the child's landing time");
+});
+test("push t2 a timed-out push that landed before the re-check is recorded landed and not escalated",async()=>{
+ const t=await pushCase('"$REAL" "$@" || exit $?; sleep 30',ALIVE,{timeoutMs:1500});
+ const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"landed"});
+ assert.deepEqual(t.escalations,[]);assert.equal(t.journal.pushEscalated,undefined);assert.equal(remoteHead(t.f),t.j.commit);
+});
+test("push t2 a timed-out push whose remote cannot be read after the stop is unknown and escalated once",async()=>{
+ const t=await pushCase(LATE,"exit 2",{timeoutMs:1500});
+ assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.timedOut,true);assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
+ await new Promise(r=>setTimeout(r,Math.max(0,4000-t.took)));assert.equal(remoteHead(t.f),t.f.base);
+});
+test("push t2 a push group that outlives the stop bound is unknown without a read and escalated once",async()=>{
+ const t=await pushCase(STUBBORN,'touch "$D/read"',{graceMs:4000,stopMs:300});
+ try{
+  assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.exitCode,1);assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
+  assert.equal(t.journal.pushAttempts.at(-1).stopped,false);assert.ok(!existsSync(join(t.dir,"read")),"no re-check while the group runs");assert.equal(stubbornGone(t.dir),false);
+ }finally{try{process.kill(Number(readFileSync(join(t.dir,"child.pid"),"utf8")),"SIGKILL");}catch{}}
+});
+test("push t1 a failed push's child that ignores SIGTERM is killed after the grace, and the stop bounds are named",async()=>{
+ assert.equal(PUSH_STOP_GRACE_MS,5000);assert.equal(PUSH_STOP_WAIT_MS,15000);
+ const git=fakeGit(STUBBORN),r=await pushRelease(mkdtempSync(join(tmpdir(),"push-group-")),"a".repeat(40),{git,graceMs:300,stopMs:5000});
+ const {elapsedMs,...rest}=r;assert.deepEqual(rest,{outcome:"failed",exitCode:1,reason:"push-failed",stopped:true});assert.ok(elapsedMs>=300,"SIGKILL waited for the grace");
+ assert.equal(stubbornGone(dirname(git)),true);
+});
 test("push p4 a run stopped in pushing after a failed attempt pushes once more and escalates at most once",async()=>{
  const t=await pushCase(PUSH_MODES.fail);assert.equal(t.escalations.length,1);
  const journal=JSON.parse(readFileSync(t.c.journalPath,"utf8"));journal.phase="pushing";delete journal.receipt.push;writeFileSync(t.c.journalPath,JSON.stringify(journal));
@@ -684,9 +724,9 @@ test("push p4 a run stopped in pushing after a failed attempt pushes once more a
  after.phase="pushing";delete after.receipt.push;writeFileSync(t.c.journalPath,JSON.stringify(after));
  const good=await runRelease({...t.c,push:undefined},t.a);assert.deepEqual(good.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(remoteHead(t.f),t.j.commit);
 });
-test("push p2 the push limit is a named five-minute policy and an invalid commit never runs git",()=>{
+test("push p2 the push limit is a named five-minute policy and an invalid commit never runs git",async()=>{
  assert.equal(PUSH_TIMEOUT_MS,300000);const src=readFileSync(new URL("../scripts/release-runner.mjs",import.meta.url),"utf8");assert.ok(!src.includes("timeout:120000"));
- assert.deepEqual(pushRelease(mkdtempSync(join(tmpdir(),"push-none-")),"not-a-sha",{git:"/nonexistent/git"}),{outcome:"failed",elapsedMs:0,reason:"push-failed"});
+ assert.deepEqual(await pushRelease(mkdtempSync(join(tmpdir(),"push-none-")),"not-a-sha",{git:"/nonexistent/git"}),{outcome:"failed",elapsedMs:0,reason:"push-failed"});
 });
 test("push p1 every push reason tag passes the receipt's reason rule, and a notice drops a malformed cause",()=>{
  for(const tag of PUSH_REASONS)assert.equal(receiptReason(tag),tag,tag);

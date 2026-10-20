@@ -280,10 +280,17 @@ and the first release are separate operational steps.
   `push-failed`), `remoteCheck` and `stderrSHA256`. The hub refuses any other
   value. The push's stderr, with URL credentials and credential-shaped text
   redacted and cut to its last 2 KB, is kept only in the private job journal
-  (`pushAttempts`, the last five); the receipt holds at most its sha256. After a
-  failed push the runner reads origin's `tasks-hub` once (`git ls-remote`,
-  30 s): `landed` when it is the released commit, `absent` when it is any other
-  commit or missing, `unknown` when the read fails. A push that `landed` keeps
+  (`pushAttempts`, the last five); the receipt holds at most its sha256. git
+  runs as its own process-group leader. After any failed push, including one
+  stopped by the limit, the runner signals the whole group, so a transport
+  child (ssh or a remote helper) cannot land the push after the re-check:
+  SIGTERM, then SIGKILL after 5 s (`PUSH_STOP_GRACE_MS`), and it waits at most
+  15 s (`PUSH_STOP_WAIT_MS`) for no process to be left in the group. Only once
+  the group is gone does the runner read origin's `tasks-hub`, once
+  (`git ls-remote`, 30 s): `landed` when it is the released commit, `absent`
+  when it is any other commit or missing, `unknown` when the read fails. A
+  group still present after the wait is not read and counts as `unknown`; the
+  journal attempt records `stopped: false`. A push that `landed` keeps
   its failure fields and is not escalated. Otherwise it is escalated once
   (request `JOB-push-failure`), and the notice names the cause from the typed
   fields only, for example `timed out after 300 s (push-timed-out)` or
@@ -291,7 +298,9 @@ and the first release are separate operational steps.
   characters of the stderr hash. The outcome stays `released`, and live targets
   are not rolled back. A hub or `tt` older than these fields drops them; the
   runner then accepts the saved receipt without them. A run stopped in
-  `pushing` resumes the push, then finishes. The rollback path never pushes.
+  `pushing` resumes the push, then finishes; the resume does not stop a push
+  group left by the stopped run, and its own push and re-check proceed as
+  above. The rollback path never pushes.
 - **Revert (D1).** After a rollback of a published release (outcome
   `rolled_back` or `blocked`), the runner creates one commit whose tree is the
   pre-release `tasks-hub` tree and whose parent is the integrated commit, with

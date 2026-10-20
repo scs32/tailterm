@@ -635,7 +635,14 @@ export function moveReleaseRef(cwd, revert, integrated) {
 // more than 60 s against the old, unstated 120 s, so the limit is 5 min.
 // There is no retry: one read of the remote after a failure finds a push
 // that landed late, and any other failure goes to a human.
+// The stop (wi_01b550d20e610c85): git runs as its own process-group leader,
+// and a failed or timed-out push signals the whole group, SIGTERM and then
+// SIGKILL after PUSH_STOP_GRACE_MS, so a transport child (ssh, a remote
+// helper) cannot land the push after the re-check. The re-check runs only
+// once the group is gone; a group still present after PUSH_STOP_WAIT_MS is
+// not read and counts as unknown.
 export const PUSH_TIMEOUT_MS = 300000, REMOTE_CHECK_TIMEOUT_MS = 30000, PUSH_STDERR_BYTES = 2048;
+export const PUSH_STOP_GRACE_MS = 5000, PUSH_STOP_WAIT_MS = 15000;
 // The stable reason tags of a failed push, classified from its stderr,
 // which is never copied to the receipt or the Board.
 export const PUSH_REASONS = ["push-timed-out", "push-killed", "push-rejected", "push-auth-failed", "push-network-failed", "push-failed"];
@@ -653,22 +660,50 @@ export function pushStderr(raw) {
   const kept = sanitizeCapture({logs: [{service: "git", lines}]}).logs[0].lines.join("\n"), bytes = Buffer.from(kept, "utf8");
   return bytes.length <= PUSH_STDERR_BYTES ? kept : bytes.subarray(bytes.length - PUSH_STDERR_BYTES).toString("utf8").replace(/^\uFFFD+/, "");
 }
+// Signals the push's group, SIGKILL after graceMs, and resolves true once
+// no process is left in it, or false at stopMs.
+export async function stopPushGroup(pgid, {graceMs=PUSH_STOP_GRACE_MS, stopMs=PUSH_STOP_WAIT_MS}={}) {
+  const signal = name => {try {process.kill(-pgid, name);} catch {}}, start = Date.now();
+  let killed = false;
+  signal("SIGTERM");
+  while (!groupGone(pgid)) {
+    if (Date.now() - start >= stopMs) return false;
+    if (!killed && Date.now() - start >= graceMs) {signal("SIGKILL"); killed = true;}
+    await new Promise(r => setTimeout(r, 20));
+  }
+  return true;
+}
 // One push: {outcome, elapsedMs} and, for a failed one, timedOut, exitCode
-// or signal, reason and the sanitized stderr. elapsedMs stays within the
-// hub's bound. git and timeoutMs are test seams.
-export function pushRelease(cwd, commit, {remote="origin", git="git", timeoutMs=PUSH_TIMEOUT_MS}={}) {
+// or signal, reason, the sanitized stderr and stopped (whether the push's
+// process group is gone). elapsedMs stays within the hub's bound. git,
+// timeoutMs, graceMs and stopMs are test seams.
+export async function pushRelease(cwd, commit, {remote="origin", git="git", timeoutMs=PUSH_TIMEOUT_MS, graceMs=PUSH_STOP_GRACE_MS, stopMs=PUSH_STOP_WAIT_MS}={}) {
   if (!sha(commit)) return {outcome:"failed", elapsedMs:0, reason:"push-failed"};
   const start = Date.now(), elapsed = () => Math.min(PROBE_WAIT_MAX_MS, Math.max(0, Date.now() - start));
-  try {execFileSync(git,["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,stdio:["ignore","pipe","pipe"],timeout:timeoutMs,env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});return {outcome:"pushed", elapsedMs:elapsed()};}
-  catch (error) {
-    const result = {outcome:"failed", elapsedMs:elapsed()}, stderr = pushStderr(error?.stderr);
-    if (error?.code === "ETIMEDOUT") result.timedOut = true;
-    if (Number.isInteger(error?.status) && error.status >= 1 && error.status <= 255) result.exitCode = error.status;
-    else if (typeof error?.signal === "string" && /^SIG[A-Z0-9]{1,12}$/.test(error.signal)) result.signal = error.signal.toLowerCase();
-    result.reason = result.timedOut ? "push-timed-out" : result.signal ? "push-killed" : (PUSH_CLASSES.find(([, pattern]) => pattern.test(stderr)) || ["push-failed"])[0];
-    if (stderr) result.stderr = stderr;
-    return result;
-  }
+  let child;
+  try {child = spawn(git,["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,detached:true,stdio:["ignore","ignore","pipe"],env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});}
+  catch {return {outcome:"failed", elapsedMs:elapsed(), reason:"push-failed", stopped:true};}
+  // The last 64 KiB of stderr; pushStderr keeps at most its last 2 KB.
+  let raw = Buffer.alloc(0), exit = null;
+  child.stderr?.on("data", chunk => {raw = Buffer.concat([raw, chunk]); if (raw.length > 65536) raw = raw.subarray(raw.length - 65536);});
+  child.stderr?.on("error", () => {});
+  const ended = new Promise(r => {child.once("exit", (code, signal) => {exit = {code, signal}; r();}); child.once("error", () => {exit ??= {}; r();});});
+  const closed = new Promise(r => {child.once("close", r); child.once("error", r);});
+  let timer;
+  const timedOut = await Promise.race([ended.then(() => false), new Promise(r => {timer = setTimeout(() => r(true), timeoutMs);})]);
+  clearTimeout(timer);
+  if (!timedOut && exit.code === 0) return {outcome:"pushed", elapsedMs:elapsed()};
+  // Any failed push stops its whole group before anything reads the remote.
+  const stopped = Number.isSafeInteger(child.pid) ? await stopPushGroup(child.pid, {graceMs, stopMs}) : true;
+  if (stopped) await Promise.race([closed, new Promise(r => setTimeout(r, 1000))]);
+  const result = {outcome:"failed", elapsedMs:elapsed()}, stderr = pushStderr(raw);
+  if (timedOut) result.timedOut = true;
+  if (Number.isInteger(exit?.code) && exit.code >= 1 && exit.code <= 255) result.exitCode = exit.code;
+  else if (typeof exit?.signal === "string" && /^SIG[A-Z0-9]{1,12}$/.test(exit.signal)) result.signal = exit.signal.toLowerCase();
+  result.reason = result.timedOut ? "push-timed-out" : result.signal ? "push-killed" : (PUSH_CLASSES.find(([, pattern]) => pattern.test(stderr)) || ["push-failed"])[0];
+  if (stderr) result.stderr = stderr;
+  result.stopped = stopped;
+  return result;
 }
 // One bounded read of the remote's tasks-hub: {sha} (null when it has no
 // such ref) or {unknown:true} when the read failed or timed out.
@@ -996,14 +1031,17 @@ export async function runRelease(config, adapter) {
     return {jobId:job.id,outcome:"waiting_window",window:wait};
   };
   // Every selected target is live-verified before this runs, so nothing here
-  // rolls back: a failed push reads the remote once and, unless the commit
-  // landed there, is escalated once; the release stands. config.push (git,
-  // timeoutMs, checkTimeoutMs) is a test seam, never set in deploy.json.
+  // rolls back: a failed push, once its process group is gone, reads the
+  // remote once and, unless the commit landed there, is escalated once; the
+  // release stands. A group that outlived the stop bound is unknown, unread.
+  // config.push (git, timeoutMs, graceMs, stopMs, checkTimeoutMs) is a test
+  // seam, never set in deploy.json.
   const pushAndFinish=async receipt=>{
     state.receipt=receipt;state.phase="pushing";checkpoint();
-    const seam=config.push||{},pushed=pushRelease(cwd,receipt.commit,{git:seam.git,timeoutMs:seam.timeoutMs});
+    const seam=config.push||{},pushed=await pushRelease(cwd,receipt.commit,{git:seam.git,timeoutMs:seam.timeoutMs,graceMs:seam.graceMs,stopMs:seam.stopMs});
     let remoteCheck;
-    if(pushed.outcome==="failed"){const read=remoteTasksHub(cwd,{git:seam.git,timeoutMs:seam.checkTimeoutMs});remoteCheck=read.unknown?"unknown":read.sha===receipt.commit?"landed":"absent";}
+    if(pushed.outcome==="failed" && pushed.stopped===false)remoteCheck="unknown";
+    else if(pushed.outcome==="failed"){const read=remoteTasksHub(cwd,{git:seam.git,timeoutMs:seam.checkTimeoutMs});remoteCheck=read.unknown?"unknown":read.sha===receipt.commit?"landed":"absent";}
     const stderrSHA256=pushed.stderr?createHash("sha256").update(pushed.stderr).digest("hex"):undefined;
     // The private journal keeps the last five attempts, stderr included.
     state.pushAttempts=[...(state.pushAttempts||[]),{at:new Date().toISOString(),...pushed,...(stderrSHA256?{stderrSHA256}:{}),...(remoteCheck?{remoteCheck}:{})}].slice(-5);checkpoint();
