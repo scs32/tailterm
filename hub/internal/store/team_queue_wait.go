@@ -625,7 +625,8 @@ func (s *Store) queueWaitOrphaned(ctx context.Context, w queueWaitRow, reason st
 // its wait notice: no message from a live member after it, and every live
 // member done, idle, finished silent or provider-blocked and none waiting for
 // or holding the matrix host (the stall check's member rule,
-// team_queue_stall.go). A provider-blocked member makes no progress.
+// team_queue_stall.go, with its matrix wait rule in matrixWaitCounts). A
+// provider-blocked member makes no progress.
 func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.Time) (bool, error) {
 	const members = `SELECT b.agent_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN ('closed','exited')`
@@ -651,10 +652,12 @@ func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.
 			idle = false
 		}
 		// A member's verification run waiting for or holding the matrix
-		// host is the team's open work, whatever the member's own state.
+		// host is the team's open work, whatever the member's own state. A
+		// retired member's saved wait is not, and the bound runs from the
+		// earlier of since and the report's observedAt (matrixWaitCounts).
 		if strings.Contains(payload, `"matrixWait"`) {
 			var activity api.AgentActivity
-			if json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && now.Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound {
+			if json.Unmarshal([]byte(payload), &activity) == nil && matrixWaitCounts(status, &activity, now) {
 				idle = false
 			}
 		}

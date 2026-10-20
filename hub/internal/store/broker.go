@@ -205,13 +205,15 @@ var ErrBrokerMatrixWait = fmt.Errorf("obligation holder is in a matrix wait: %w"
 // condition, so the owner hears only after a full lead window from the
 // wait's end. A wait recorded on an earlier run does not count. A wait whose
 // ending report never arrives holds no longer than the stall watch counts
-// it (wi_d1e42f0739e47139 p5): defaultQueueMatrixWaitBound from the wait's
-// start in the run's latest activity report.
+// it (wi_d1e42f0739e47139 p5): defaultQueueMatrixWaitBound from the earlier
+// of the wait's since and the observedAt of the run's latest activity report.
+// A retired holder's saved wait does not hold the owner escalation
+// (matrixWaitCounts).
 func inMatrixWait(ctx context.Context, q queryRower, o BrokerObligation, now time.Time) (bool, error) {
 	var waiting bool
-	var ended, payload string
-	err := q.QueryRowContext(ctx, `SELECT p.matrix_wait,p.wait_ended_at,COALESCE(aa.payload,'') FROM agents a JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id
- LEFT JOIN agent_activity aa ON aa.agent_id=a.id AND aa.run_id=a.run_id WHERE a.id=?`, o.AgentID).Scan(&waiting, &ended, &payload)
+	var status, ended, payload string
+	err := q.QueryRowContext(ctx, `SELECT a.status,p.matrix_wait,p.wait_ended_at,COALESCE(aa.payload,'') FROM agents a JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id
+ LEFT JOIN agent_activity aa ON aa.agent_id=a.id AND aa.run_id=a.run_id WHERE a.id=?`, o.AgentID).Scan(&status, &waiting, &ended, &payload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -220,7 +222,7 @@ func inMatrixWait(ctx context.Context, q queryRower, o BrokerObligation, now tim
 	}
 	if waiting {
 		var activity api.AgentActivity
-		waiting = json.Unmarshal([]byte(payload), &activity) == nil && activity.MatrixWait.Valid() && now.Sub(activity.MatrixWait.Since) < defaultQueueMatrixWaitBound
+		waiting = json.Unmarshal([]byte(payload), &activity) == nil && matrixWaitCounts(status, &activity, now)
 	}
 	return waiting || (ended != "" && now.Sub(parseTS(ended)) < api.ObligationOwnerAfterLead), nil
 }

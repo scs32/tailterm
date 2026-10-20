@@ -1591,6 +1591,35 @@ func TestStallWatchQuietAfterWaitLifts(t *testing.T) {
 		f.advance(time.Second)
 		f.one(stallActionTeam)
 	})
+	// wi_fffe53255abf1817 r2: a since saved in the future before
+	// ReportActivity's clamp counts, and lifts, at the bound from the
+	// report's observedAt.
+	t.Run("team/matrix wait saved with a future since", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.report(lead, stallMatrixWait(f.now()))
+		payload := fmt.Sprintf(`{"state":"idle","observedAt":%q,"matrixWait":{"role":"waiting","position":1,"length":1,"since":%q}}`, ts(f.now()), ts(f.now().Add(10*time.Hour)))
+		f.exec(`UPDATE agent_activity SET observed_at=?,payload=? WHERE agent_id=? AND run_id=?`, ts(f.now()), payload, lead.ID, lead.RunID)
+		f.advance(defaultQueueMatrixWaitBound - time.Second)
+		f.none("inside the bound from observedAt")
+		f.advance(stallWatchTeamQuiet)
+		f.none("a second short of the threshold after the bound")
+		f.advance(time.Second)
+		f.one(stallActionTeam)
+	})
+	// wi_fffe53255abf1817 r1: a retired member's saved matrix wait does not
+	// keep its team from being quiet.
+	t.Run("team/retired member's matrix wait", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		f.entry(0)
+		f.member("lead-a", 0)
+		builder := f.member("builder-a", 0)
+		f.report(builder, stallMatrixWait(f.now()))
+		f.exec(`UPDATE agents SET status='retired' WHERE id=?`, builder.ID)
+		f.advance(30 * time.Minute)
+		f.one(stallActionTeam)
+	})
 }
 
 // stallOwnerTeamNotice asserts a team notice that went to the owner by day

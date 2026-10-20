@@ -976,6 +976,52 @@ func TestQueueWaitMatrixWaitIsNotIdle(t *testing.T) {
 	}
 }
 
+// wi_fffe53255abf1817 r1-r3: a met wait counts a member's matrix wait by the
+// stall check's rule. A retired member's saved wait is not open work, and a
+// since saved in the future before ReportActivity's clamp counts only to the
+// bound from the report's observedAt.
+func TestQueueWaitMatrixWaitRule(t *testing.T) {
+	for name, c := range map[string]struct {
+		status string
+		// observed and since rewrite the saved row as one stored before the
+		// clamp; a zero observed keeps the live report.
+		observed, since time.Duration
+		state           string
+		steps           int
+	}{
+		"retired member's wait":         {status: api.AgentRetired, state: api.TeamQueueWaitOverdue, steps: 1},
+		"live member's wait":            {status: api.AgentDone, state: api.TeamQueueWaitResumed},
+		"future since past the bound":   {status: api.AgentDone, observed: -defaultQueueMatrixWaitBound, since: 10 * time.Hour, state: api.TeamQueueWaitOverdue, steps: 1},
+		"future since inside the bound": {status: api.AgentDone, observed: -time.Minute, since: 10 * time.Hour, state: api.TeamQueueWaitResumed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			helper := f.helper(t)
+			f.set(t, api.TeamQueueWaitAccepted)
+			f.meet(t, api.TeamQueueWaitAccepted)
+			f.sweep(t)
+			if _, err := f.s.ReportActivity(f.ctx, f.task.ID, f.member.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: f.member.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: f.clock,
+				MatrixWait: &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 1, Since: f.clock}}}); err != nil {
+				t.Fatal(err)
+			}
+			if c.observed != 0 {
+				observed := f.clock.Add(c.observed)
+				payload := fmt.Sprintf(`{"state":"idle","observedAt":%q,"matrixWait":{"role":"waiting","position":1,"length":1,"since":%q}}`, ts(observed), ts(f.clock.Add(c.since)))
+				f.exec(t, `UPDATE agent_activity SET observed_at=?,payload=? WHERE agent_id=? AND run_id=?`, ts(observed), payload, f.member.ID, f.member.RunID)
+			}
+			f.exec(t, `UPDATE agents SET status=? WHERE id=?`, c.status, f.member.ID)
+			f.clock = f.clock.Add(15 * time.Minute)
+			if steps := f.sweep(t); len(steps) != c.steps || f.state(t) != c.state {
+				t.Fatalf("steps %v, state %s, want %d and %s", steps, f.state(t), c.steps, c.state)
+			}
+			if n := len(f.notices(t, helper, queueWaitOverdueSubject)) + len(f.notices(t, f.handler, queueWaitOverdueSubject)); n != 2*c.steps {
+				t.Fatalf("%d overdue notices", n)
+			}
+		})
+	}
+}
+
 // A provider-blocked member makes no progress, so it counts as idle, as in
 // the stall check's member rule; its matrix run still keeps the team open.
 func TestQueueWaitProviderBlockedMemberIsIdle(t *testing.T) {

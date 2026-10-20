@@ -340,15 +340,36 @@ func (a stallAgent) workedAt(now time.Time) time.Time {
 	return a.lastWorking
 }
 
+// matrixWaitStart is when a saved matrix wait's bound starts: the earlier of
+// its since and the report's observedAt (the row's observed_at, written from
+// the same value), so a since saved in the future before ReportActivity's
+// clamp cannot outlive the bound.
+func matrixWaitStart(a *api.AgentActivity) time.Time {
+	start := a.MatrixWait.Since
+	if !a.ObservedAt.IsZero() && a.ObservedAt.Before(start) {
+		start = a.ObservedAt
+	}
+	return start
+}
+
+// matrixWaitCounts reports whether a run's saved matrix wait is still open
+// work at now, by the stall check's rule (team_queue_stall.go): a retired
+// run's saved wait never counts, as no relay keeps it current, and the bound
+// runs from matrixWaitStart.
+func matrixWaitCounts(status string, a *api.AgentActivity, now time.Time) bool {
+	return status != api.AgentRetired && a != nil && a.MatrixWait.Valid() && now.Sub(matrixWaitStart(a)) < defaultQueueMatrixWaitBound
+}
+
 func (a stallAgent) matrixWait(now time.Time) bool {
-	return a.activity != nil && a.activity.MatrixWait.Valid() && now.Sub(a.activity.MatrixWait.Since) < defaultQueueMatrixWaitBound
+	return matrixWaitCounts(a.status, a.activity, now)
 }
 
 // liftedAt is when the run's last never-quiet case ended. A reported matrix
-// wait that outlived its bound ended at the bound.
+// wait that outlived its bound ended at the bound, which runs from
+// matrixWaitStart.
 func (a stallAgent) liftedAt(now time.Time) time.Time {
 	if a.activity != nil && a.activity.MatrixWait.Valid() && !a.matrixWait(now) {
-		return latest(a.lifted, a.activity.MatrixWait.Since.Add(defaultQueueMatrixWaitBound))
+		return latest(a.lifted, matrixWaitStart(a.activity).Add(defaultQueueMatrixWaitBound))
 	}
 	return a.lifted
 }

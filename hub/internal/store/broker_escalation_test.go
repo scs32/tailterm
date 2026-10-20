@@ -538,6 +538,53 @@ func TestMatrixWaitOwnerEscalationIsBounded(t *testing.T) {
 	}
 }
 
+// wi_fffe53255abf1817 r1-r3: a holder's matrix wait holds the owner
+// escalation by the stall check's rule. A retired holder's saved wait holds
+// nothing, and a since saved in the future before ReportActivity's clamp
+// holds only to the bound from the report's observedAt (+40m + 4h30m).
+func TestMatrixWaitOwnerEscalationRule(t *testing.T) {
+	shared := newEscalationFixture(t)
+	for _, tc := range []struct {
+		name  string
+		after func(t *testing.T, f *escalationFixture)
+		until time.Duration
+		steps []string
+	}{
+		{name: "retired holder", after: func(t *testing.T, f *escalationFixture) {
+			retired := api.AgentRetired
+			if _, err := f.st.UpdateAgent(f.ctx, f.builder.ID, api.UpdateAgentRequest{Status: &retired}, f.by); err != nil {
+				t.Fatal(err)
+			}
+		}, until: 90 * time.Minute, steps: []string{"nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@1h1m0s", "project-stalled@1h16m0s"}},
+		{name: "future since saved before the clamp", after: func(t *testing.T, f *escalationFixture) {
+			db, err := sql.Open("sqlite", f.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			observed := f.c.Add(40 * time.Minute).UTC().Format(time.RFC3339Nano)
+			payload := fmt.Sprintf(`{"state":"idle","observedAt":%q,"matrixWait":{"role":"waiting","position":1,"length":2,"since":%q}}`, observed, f.c.Add(40*time.Minute+10*time.Hour).UTC().Format(time.RFC3339Nano))
+			if _, err := db.ExecContext(f.ctx, `UPDATE agent_activity SET observed_at=?,payload=? WHERE agent_id=? AND run_id=?`, observed, payload, f.builder.ID, f.builder.RunID); err != nil {
+				t.Fatal(err)
+			}
+		}, until: 5*time.Hour + 30*time.Minute, steps: []string{"nudge@32m0s", "escalate-lead@46m0s", "escalate-owner@5h10m0s", "project-stalled@5h25m0s"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := shared.fresh(t)
+			o := f.assign(t, f.builder, "45m")
+			f.act(t, o, f.builder, "ack", time.Minute)
+			steps := f.silentRun(t, o, 30*time.Minute, 40*time.Minute, nil)
+			f.report(t, f.builder, "idle", &api.MatrixWait{Role: api.MatrixWaitWaiting, Position: 1, Length: 2, Since: f.c.Add(40 * time.Minute)}, 40*time.Minute)
+			tc.after(t, f)
+			steps = f.silentRun(t, o, 41*time.Minute, tc.until, steps)
+			wantSteps(t, tc.name, steps, tc.steps...)
+			if lead, owner := len(f.notices(t, o, "lead")), len(f.notices(t, o, "owner")); lead != 1 || owner != 1 {
+				t.Fatalf("lead %d owner %d, want 1 and 1", lead, owner)
+			}
+		})
+	}
+}
+
 // wi_d1e42f0739e47139 p6: progress recorded past the due time extends the
 // outcome window by the silence window. Four `tt progress` records after the
 // lead heard give no further lead notice; once progress stops for 30
