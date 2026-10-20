@@ -1480,7 +1480,9 @@ The lock file lives on the machine that runs the matrix, so the list shows the
 waitlist only when it is run there. The hub's idle-entry stall check does not
 read the file; it reads each member's reported activity, and a member whose
 `matrixWait` holds or waits for the host lock is not idle until 4 hours 30
-minutes after that wait's `since` (`wi_772e88d71e5cd0e5`;
+minutes after the earlier of that wait's `since` and the report's
+`observedAt`; a retired member's saved wait does not count
+(`wi_772e88d71e5cd0e5`, `wi_b4bdb09aa82c5264`;
 [agent-activity.md](agent-activity.md)).
 
 **When your run ends.** Feature `wi_a598ffa55a326699`, orders #33442 and
@@ -1497,8 +1499,18 @@ item and the run's start time and carries no path and no result: read
 `receipt.json` (`targeted-receipt.json` for a targeted run) in the log
 directory you gave the run, and with no receipt read `runner.json` and
 `host-lock.log` there and record why the run stopped before anything else. It
-never authorises another run. It needs the lock entry to name the agent
-(`TAILTERM_AGENT_NAME`) and the relay on the host to be running. A run that
+never authorises another run. It needs the relay on the host to be running
+and the lock entry to belong to the agent: an entry naming the agent
+(`TAILTERM_AGENT_NAME`) or the agent's ID is that agent's, and an entry whose
+agent is empty or `unknown` and whose item is a valid `wi_` item is the run of
+every agent bound to that item, never of an unbound agent or one on another
+item (wi_6128966a8025aaad); who is told when such a run ends is in
+[stall-watch.md](stall-watch.md), "Who gets it". A run that belongs to no
+agent gets no notice: for example one that names neither an agent nor a valid
+item, one that names an agent whose bound item is not the entry's item, or an
+agentless one whose valid item has no live bound agent. Of these, only a run
+with neither an agent nor a valid item is printed as an unattributed line by
+the queue list above (wi_d6d7da393cea9c08, landed as 1d9b2828). A run that
 joins, runs and ends wholly inside one 15-second check of the relay gets no
 notice, and an unknown read of the lock file ends no wait: the relay repeats
 the last confirmed wait the hub holds, up to the 4 hours 30 minutes bound.
