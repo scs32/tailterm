@@ -44,6 +44,7 @@ import {
   prerequisitePaths,
   preflightFixture,
   preflightRun,
+  browserFixture,
   within,
   fixturePids,
   leakingCheck,
@@ -1027,3 +1028,195 @@ for (const signal of ["SIGINT", "SIGTERM"])
     assert(!existsSync(join(output, "receipt.json")), "no receipt survives the interruption");
     assert(!existsSync(join(output, "budget-warnings.json")), "no list survives without its receipt");
   });
+
+// wi_37750145fc63b2f6 / order #41687: a plan without wasm-test-build never
+// runs a WASM reader on WASM that was not built from the candidate's sources.
+// The fixture's build stub writes all three files from the tracked
+// wasm/src.go and appends "rebuild" to .build/order; the browser suite
+// appends "reader", so the file shows which ran first. A wasm/ rule lets a
+// candidate select wasm-test-build.
+const WASM_REBUILD_STUB =
+  'mkdir -p .build\nsrc=$(cat wasm/src.go)\n' +
+  'printf "built %s" "$src" > wasm/tailserve.wasm\nprintf "test %s" "$src" > .build/test.wasm\n' +
+  'printf "modules %s" "$src" > .build/go-modules.txt\necho rebuild >> .build/order\n' +
+  'echo "$*" >> .build/rebuild-calls\nenv > .build/rebuild-env\n';
+const wasmBuilt = [".build/test.wasm", "wasm/tailserve.wasm", ".build/go-modules.txt"];
+function wasmSourceFixture(t, script = WASM_REBUILD_STUB) {
+  const f = browserFixture(t, {
+    "fixture-browser.mjs": 'import { appendFileSync } from "node:fs";\nappendFileSync(".build/order", "reader\\n");\n',
+  });
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\nwasm/*.wasm\n");
+  f.git("rm", "-q", "--cached", "wasm/tailserve.wasm");
+  const m = JSON.parse(readFileSync(join(f.cwd, "verification/matrix.json"), "utf8"));
+  m.rules.push({ prefixes: ["wasm/"], groups: ["wasm", "unit", "browser"] });
+  writeFileSync(join(f.cwd, "verification/matrix.json"), JSON.stringify(m));
+  mkdirSync(join(f.cwd, "scripts"));
+  writeFileSync(join(f.cwd, "scripts/build-wasm.sh"), script);
+  writeFileSync(join(f.cwd, "wasm/src.go"), "package wasm // one\n");
+  f.git("add", ".");
+  f.git("commit", "-qm", "wasm sources");
+  const candidate = (path = "client/candidate.txt", owned = ["client/"]) => {
+    const baseCommit = f.git("rev-parse", "HEAD");
+    const commit = commitChange(f, path, "change " + Date.now() + "\n", "candidate");
+    const context = { baseCommit, commit };
+    return { context, plan: makePlan({ ...context, owned }, f.cwd) };
+  };
+  return { ...f, candidate, ...candidate() };
+}
+const wasmLine = (line) => line.startsWith("matrix run: WASM prerequisite") || line.startsWith("matrix run: rebuilt WASM");
+const readLines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean) : [];
+const wasmOptions = (events) => ({
+  getAvailableBytes: () => 2147483648,
+  installPrerequisites: fakeInstall([]),
+  hostLock: { print: (line) => events.push(line) },
+  acquireHostLock: (args) => { events.push("acquire"); return acquireHostLock(args); },
+});
+// The receipt and every reader name the rebuilt bytes in their {path, sha256}
+// form; the printed lines name the cause and the same digests.
+function assertRebuilt(receipt, events, cwd, cause) {
+  assert(receipt.checks.every((c) => c.exitCode === 0), "every check passed");
+  const stale = events.indexOf(`matrix run: WASM prerequisites stale (${cause}); rebuilding with bash scripts/build-wasm.sh --test`);
+  assert(stale > events.indexOf("acquire") && events.includes("acquire"), "rebuilt after admission: " + events.join("\n"));
+  const src = readFileSync(join(cwd, "wasm/src.go"), "utf8").trimEnd();
+  const built = { "wasm/tailserve.wasm": "built " + src, ".build/test.wasm": "test " + src, ".build/go-modules.txt": "modules " + src };
+  for (const [path, bytes] of Object.entries(built)) {
+    assert.equal(readFileSync(join(cwd, path), "utf8"), bytes, path);
+    assert(events.includes(`matrix run: rebuilt WASM prerequisite ${path} ${digest(bytes)}`), path + " printed");
+    assert.deepEqual(receipt.prerequisites.find((p) => p.path === path), { path, sha256: digest(bytes) });
+  }
+  assert(events.some((line) => /^matrix run: WASM prerequisite rebuild took \d+ ms$/.test(line)));
+  const wasm = ["wasm/tailserve.wasm", ".build/test.wasm"].map((path) => ({ path, sha256: digest(built[path]) }));
+  const readers = receipt.checks.filter((c) => c.id === "00-static-build" || c.id.includes("browser"));
+  assert.equal(readers.length, 2);
+  for (const reader of readers) assert.deepEqual(reader.wasm, wasm, reader.id);
+  const record = JSON.parse(readFileSync(join(cwd, ".build/wasm-sources.json"), "utf8"));
+  assert.deepEqual(record.files.map((e) => e.path).sort(), Object.keys(built).sort());
+  assert.equal(record.sources, matrixRunner.wasmSourceDigest(cwd, receipt.commit));
+  assert.equal(spawnSync("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd, encoding: "utf8" }).stdout, "");
+}
+
+test("WASM prerequisite: a provisioned build with no source record is rebuilt once after admission, before any reader", async (t) => {
+  const sentinel = "TAILTERM_WASM_REBUILD_SENTINEL";
+  process.env[sentinel] = "inherited";
+  t.after(() => delete process.env[sentinel]);
+  for (const mode of ["run", "targeted"]) {
+    const f = wasmSourceFixture(t);
+    const wt = linkedWorktree(t, f);
+    const events = [], options = wasmOptions(events);
+    const receipt = await preflightRun(mode, { ...f, cwd: wt }, tempDir(t, "verification-wasm-rebuild-"), options);
+    assert(events.includes(`matrix run: prerequisite .build/test.wasm copied ${digest("fixture")}`), "main's stale build was copied");
+    assertRebuilt(receipt, events, wt, "no source record");
+    assert.deepEqual(readLines(join(wt, ".build/rebuild-calls")), ["--test"], mode + ": one rebuild");
+    assert.deepEqual(readLines(join(wt, ".build/order")), ["rebuild", "reader"], mode);
+    // The rebuild sees none of the runner's inherited TAILTERM_* variables.
+    const env = readLines(join(wt, ".build/rebuild-env"));
+    assert(env.some((line) => line.startsWith("PATH=")));
+    assert.deepEqual(env.filter((line) => line.startsWith("TAILTERM_")), [], mode);
+
+    // The next run in the same worktree trusts the record and rebuilds nothing.
+    events.length = 0;
+    const again = await preflightRun(mode, { ...f, cwd: wt }, tempDir(t, "verification-wasm-rebuild-"), options);
+    assert(again.checks.every((c) => c.exitCode === 0));
+    assert.deepEqual(readLines(join(wt, ".build/rebuild-calls")), ["--test"], mode + ": no second rebuild");
+    assert.deepEqual(events.filter(wasmLine),
+      ["matrix run: WASM prerequisites current for sources " + matrixRunner.wasmSourceDigest(wt, f.context.commit).slice(0, 12)]);
+    assert.deepEqual(again.prerequisites, receipt.prerequisites);
+  }
+});
+
+test("WASM prerequisite: a source record from other sources or edited WASM bytes is rebuilt before readers", async (t) => {
+  for (const change of ["wasm/src.go", "scripts/build-wasm.sh"]) {
+    const f = wasmSourceFixture(t);
+    matrixRunner.recordWasmSources(f.cwd, f.context.commit);
+    // The candidate's base already holds the source change, so it is not in
+    // the plan's diff and selects no wasm-test-build.
+    const content = change === "wasm/src.go" ? "package wasm // two\n" : WASM_REBUILD_STUB + "# changed\n";
+    commitChange(f, change, content, "source change");
+    const { context, plan } = f.candidate();
+    assert(!plan.checks.some((c) => c.id === "wasm-test-build"));
+    const events = [];
+    const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-wasm-rebuild-"), wasmOptions(events));
+    assert.equal(receipt.commit, context.commit);
+    assertRebuilt(receipt, events, f.cwd, "built from other sources");
+    assert.deepEqual(readLines(join(f.cwd, ".build/order")), ["rebuild", "reader"], change);
+  }
+  for (const path of wasmBuilt) {
+    const f = wasmSourceFixture(t);
+    matrixRunner.recordWasmSources(f.cwd, f.context.commit);
+    writeFileSync(join(f.cwd, path), "edited");
+    const events = [];
+    const receipt = await preflightRun("targeted", f, tempDir(t, "verification-wasm-rebuild-"), wasmOptions(events));
+    assertRebuilt(receipt, events, f.cwd, "changed since its source record: " + path);
+    assert.deepEqual(readLines(join(f.cwd, ".build/order")), ["rebuild", "reader"], path);
+  }
+});
+
+test("WASM prerequisite: a failed rebuild or one that changes the checkout refuses before any check starts", async (t) => {
+  const cases = [
+    [WASM_REBUILD_STUB + "exit 3\n", /^Stale WASM prerequisites \(no source record\): rebuild failed \(exit 3\), see .*wasm-prerequisite-rebuild\.log$/],
+    [WASM_REBUILD_STUB + "echo dirty >> wasm/src.go\n", /^Stale WASM prerequisites \(no source record\): rebuild changed the checkout$/],
+  ];
+  for (const mode of ["run", "targeted"])
+    for (const [script, expected] of cases) {
+      const f = wasmSourceFixture(t, script);
+      const events = [], output = tempDir(t, "verification-wasm-refused-");
+      await assert.rejects(preflightRun(mode, f, output, wasmOptions(events)), (error) => expected.test(error.message));
+      assert.deepEqual(readLines(join(f.cwd, ".build/rebuild-calls")), ["--test"]);
+      assert.deepEqual(readLines(join(f.cwd, ".build/order")), ["rebuild"], "no reader ran");
+      assert.deepEqual(readdirSync(output).filter((name) => name.endsWith("receipt.json")), [], "no receipt");
+      assert(!existsSync(join(f.cwd, ".build/wasm-sources.json")), "no source record");
+      assert(!events.some((line) => line.startsWith("matrix run: rebuilt WASM")));
+    }
+});
+
+test("WASM prerequisite: a build recorded from the candidate's sources is used as is", async (t) => {
+  const f = wasmSourceFixture(t);
+  const before = matrixRunner.recordWasmSources(f.cwd, f.context.commit);
+  assert.equal(matrixRunner.staleWasmCause(f.cwd, f.context.commit), "");
+  const prerequisites = matrixRunner.readPrerequisites(f.plan.checks, f.cwd);
+  for (const mode of ["run", "targeted"]) {
+    const events = [];
+    const receipt = await preflightRun(mode, f, tempDir(t, "verification-wasm-current-"), wasmOptions(events));
+    assert(receipt.checks.every((c) => c.exitCode === 0));
+    assert.deepEqual(events.filter(wasmLine), ["matrix run: WASM prerequisites current for sources " + before.sources.slice(0, 12)]);
+    assert(events.indexOf(events.find(wasmLine)) > events.indexOf("acquire"));
+    assert.deepEqual(receipt.prerequisites, prerequisites);
+    for (const path of wasmBuilt) assert.equal(readFileSync(join(f.cwd, path), "utf8"), "fixture", path);
+  }
+  assert(!existsSync(join(f.cwd, ".build/rebuild-calls")), "no rebuild");
+  assert.deepEqual(JSON.parse(readFileSync(join(f.cwd, ".build/wasm-sources.json"), "utf8")), before);
+});
+
+test("WASM prerequisite: plans with no WASM reader, no build script or their own wasm-test-build read no record", async (t) => {
+  // No WASM reader: a docs-only plan.
+  const f = wasmSourceFixture(t);
+  const docs = f.candidate("docs/candidate.md", ["docs/"]);
+  assert(!docs.plan.checks.some((c) => c.id.includes("browser") || c.id === "00-static-build"));
+  const events = [];
+  const receipt = await runPlan(docs.plan, f.cwd, tempDir(t, "verification-wasm-none-"), wasmOptions(events));
+  assert(receipt.checks.every((c) => c.exitCode === 0));
+  assert.deepEqual(events.filter(wasmLine), []);
+  assert(!existsSync(join(f.cwd, ".build/rebuild-calls")));
+  assert(!existsSync(join(f.cwd, ".build/wasm-sources.json")));
+
+  // No tracked scripts/build-wasm.sh: a browser plan uses the WASM as is.
+  const g = preflightFixture(t, true);
+  const browserEvents = [];
+  const browser = await runPlan(g.plan, g.cwd, tempDir(t, "verification-wasm-none-"), wasmOptions(browserEvents));
+  assert(browser.checks.every((c) => c.exitCode === 0));
+  assert.deepEqual(browserEvents.filter(wasmLine), []);
+  assert.equal(browser.prerequisites.find((p) => p.path === ".build/test.wasm").sha256, digest("fixture"));
+  assert(!existsSync(join(g.cwd, ".build/wasm-sources.json")));
+
+  // A plan with wasm-test-build runs the script only as that check.
+  const h = wasmSourceFixture(t);
+  const wasm = h.candidate("wasm/src.go", ["wasm/"]);
+  assert.equal(wasm.plan.checks[0].id, "wasm-test-build");
+  const wasmEvents = [];
+  const built = await runPlan(wasm.plan, h.cwd, tempDir(t, "verification-wasm-none-"), wasmOptions(wasmEvents));
+  assert(built.checks.every((c) => c.exitCode === 0));
+  assert.deepEqual(wasmEvents.filter(wasmLine), []);
+  assert.deepEqual(readLines(join(h.cwd, ".build/rebuild-calls")), ["--test"]);
+  assert.deepEqual(readLines(join(h.cwd, ".build/order")), ["rebuild", "reader"]);
+  assert(!existsSync(join(h.cwd, ".build/wasm-sources.json")));
+});

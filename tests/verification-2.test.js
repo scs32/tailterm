@@ -1762,6 +1762,7 @@ test("a plan without wasm-test-build keeps id order and records the prerequisite
   const ids = plan.checks.map((c) => c.id);
   assert(!ids.includes("wasm-test-build"));
   assert.deepEqual(ids, [...ids].sort((a, b) => a.localeCompare(b, "en")));
+  matrixRunner.recordWasmSources(f.cwd, commit);
   const prerequisites = matrixRunner.readPrerequisites(plan.checks, f.cwd);
   const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-no-wasm-"), { minFreeBytes: 0, jobs: 4 });
   assert(receipt.checks.every((c) => c.status === "pass"), "every check passed");
@@ -1781,6 +1782,7 @@ test("a plan without wasm-test-build keeps id order and records the prerequisite
     scripts: { "build:static": `node -e "require('fs').writeFileSync('.build/test.wasm','rewritten')"` },
   });
   const changed = commitChange(g, "client/app.js", "export {}\n", "client candidate");
+  matrixRunner.recordWasmSources(g.cwd, changed);
   const output = tempDir(t, "verification-no-wasm-changed-");
   await assert.rejects(
     runPlan(makePlan({ baseCommit: g.baseCommit, commit: changed, owned: ["client/"] }, g.cwd), g.cwd, output,

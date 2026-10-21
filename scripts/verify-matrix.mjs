@@ -2282,6 +2282,104 @@ export function wasmOrderCause(checks) {
   const early = build < 0 ? undefined : checks.slice(0, build).find(isWasmReader);
   return early ? early.id + " runs before wasm-test-build" : "";
 }
+
+// wi_37750145fc63b2f6 / order #41687: a plan without wasm-test-build reads
+// the checkout's WASM as it finds it, and provisioning copies the main
+// worktree's whatever its age. The runner records which sources it built them
+// from: the git tree of these paths at the candidate, never mtime.
+const WASM_SOURCES = ["scripts/build-wasm.sh", "wasm"];
+const WASM_SOURCE_RECORD = ".build/wasm-sources.json";
+const WASM_BUILT = [...WASM_FILES, GO_MODULES];
+const fileSha256 = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+export function wasmSourceDigest(cwd, commit) {
+  return createHash("sha256")
+    .update(git(cwd, "ls-tree", "-r", commit, "--", ...WASM_SOURCES))
+    .digest("hex");
+}
+// Written only after a build from the candidate's sources: the next run
+// trusts the files while their bytes and the sources still match.
+export function recordWasmSources(cwd, commit) {
+  const record = {
+    version: 1,
+    sources: wasmSourceDigest(cwd, commit),
+    commit,
+    files: WASM_BUILT.map((path) => ({ path, sha256: fileSha256(join(cwd, path)) })),
+  };
+  writeFileSync(join(cwd, WASM_SOURCE_RECORD), JSON.stringify(record, null, 2) + "\n");
+  return record;
+}
+// Why the checkout's WASM cannot be shown to come from the candidate's
+// sources, or "" when its record matches them and the files.
+export function staleWasmCause(cwd, commit) {
+  let record;
+  try {
+    record = JSON.parse(readFileSync(join(cwd, WASM_SOURCE_RECORD), "utf8"));
+  } catch {
+    return "no source record";
+  }
+  if (record?.version !== 1 || typeof record.sources !== "string" || !Array.isArray(record.files))
+    return "no source record";
+  if (record.sources !== wasmSourceDigest(cwd, commit)) return "built from other sources";
+  for (const path of WASM_BUILT) {
+    let sha256;
+    try {
+      sha256 = fileSha256(join(cwd, path));
+    } catch {}
+    if (record.files.find((entry) => entry?.path === path)?.sha256 !== sha256)
+      return "changed since its source record: " + path;
+  }
+  return "";
+}
+// Only a plan whose readers load the prerequisite WASM (a browser check),
+// that does not build it itself, in a repository that builds it with
+// scripts/build-wasm.sh. Every other plan reads no record.
+const checksWasmSources = (plan, cwd) =>
+  plan.checks.some(isBrowserCheck) &&
+  !plan.checks.some((check) => check.id === "wasm-test-build") &&
+  git(cwd, "ls-tree", "--name-only", plan.commit, "--", "scripts/build-wasm.sh") !== "";
+// Candidate code runs here, so it sees only what a build needs, never the
+// inherited task, hub or TAILTERM_* variables.
+const WASM_REBUILD_ENVIRONMENT = ["PATH", "HOME", "LANG", "TMPDIR", "GOMODCACHE", "GOPROXY", "GOTOOLCHAIN", "GOFLAGS"];
+// Held: after admission and before the prerequisites are read, so the
+// receipt and every reader see the rebuilt files. A failed rebuild, or one
+// that changes the checkout, refuses the run before any check starts.
+async function rebuildStaleWasm(plan, cwd, output, { abortSignal, onGroup, print }) {
+  if (!checksWasmSources(plan, cwd)) return;
+  const cause = staleWasmCause(cwd, plan.commit);
+  if (!cause) {
+    print("matrix run: WASM prerequisites current for sources " + wasmSourceDigest(cwd, plan.commit).slice(0, 12));
+    return;
+  }
+  print(`matrix run: WASM prerequisites stale (${cause}); rebuilding with bash scripts/build-wasm.sh --test`);
+  const matrix = JSON.parse(readFileSync(join(cwd, "verification/matrix.json"), "utf8"));
+  const timeout = matrix.checkTimeoutMs?.["wasm-test-build"] ?? matrix.defaultTimeoutMs ?? 600000;
+  const environment = Object.fromEntries(
+    WASM_REBUILD_ENVIRONMENT.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]),
+  );
+  const check = {
+    id: "wasm-prerequisite-rebuild",
+    argv: ["bash", "scripts/build-wasm.sh", "--test"],
+    cwd: ".",
+    environment: { VERIFICATION_TIMEOUT_MS: String(timeout) },
+  };
+  const started = Date.now();
+  const result = await runCheck(check, cwd, environment, abortSignal, onGroup);
+  const log = join(output, "wasm-prerequisite-rebuild.log");
+  writeFileSync(log, result.stdout + result.stderr, { mode: 0o600 });
+  if (abortSignal?.aborted)
+    throw new Error("Verification interrupted by " + abortSignal.reason);
+  const refuse = (why) => new Error(`Stale WASM prerequisites (${cause}): ${why}`);
+  if (result.status !== 0)
+    throw refuse(`rebuild failed (${result.failureReason} ${result.status}), see ${log}`);
+  if (git(cwd, "status", "--porcelain", "--untracked-files=normal"))
+    throw refuse("rebuild changed the checkout");
+  const record = recordWasmSources(cwd, plan.commit);
+  if (git(cwd, "status", "--porcelain", "--untracked-files=normal"))
+    throw refuse("source record changed the checkout");
+  for (const entry of record.files)
+    print(`matrix run: rebuilt WASM prerequisite ${entry.path} ${entry.sha256}`);
+  print(`matrix run: WASM prerequisite rebuild took ${Date.now() - started} ms`);
+}
 // Browser suites that share a resource the lock rules below cannot see. All
 // members hold one lock, so no two of them overlap. Each entry names the
 // shared resource that was found by running the suite in parallel.
@@ -2834,6 +2932,11 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     onGroup,
   } = options;
   requireFreeSpace(minFreeBytes, getAvailableBytes);
+  await rebuildStaleWasm(plan, cwd, output, {
+    abortSignal,
+    onGroup,
+    print: options.hostLock?.print ?? console.log,
+  });
   const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   // Keep the unique private home independent of arbitrarily deep inherited
   // TMPDIR. createHome is injectable like the cleanup hooks for failure tests.
