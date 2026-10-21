@@ -939,6 +939,10 @@ type sweepJournalLine struct {
 	FilesRemoved    *int64 `json:"filesRemoved,omitempty"`
 	CacheBytesAfter *int64 `json:"cacheBytesAfter,omitempty"`
 	MaxAge          string `json:"maxAge,omitempty"`
+	// CacheBytesBefore is the trim's counted cache size before it removed
+	// anything. Set on a trim line that walked the cache; absent from other
+	// lines and from lines written before it was counted.
+	CacheBytesBefore *int64 `json:"cacheBytesBefore,omitempty"`
 }
 
 func sweepJournalPath() string { return filepath.Join(relayDir(), "worktree-sweep.jsonl") }

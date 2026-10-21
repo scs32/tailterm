@@ -36,9 +36,11 @@ import (
 // only entries no build has used for at least two hours (see
 // trimVerificationBuildDirs), but not while the lock cannot be read or
 // trusted; and only a root and build directories the runner itself would use.
-// Above a size cap it also removes the oldest entries older than two hours
-// until the build directories fit, and the journal line's reason names the
-// rules that removed entries.
+// Above a margin under its size cap it also removes the oldest entries older
+// than two hours until the build directories fit the margin, and the journal
+// line's reason names the rules that removed entries. Between scheduled
+// passes, while the cache's volume is under the sweep's low-space threshold,
+// an extra pass runs at most every verificationLowSpaceTrimEvery.
 
 const (
 	defaultGoCacheTrimMaxAge = 24 * time.Hour
@@ -55,6 +57,21 @@ const (
 	// about the newest 20 hours of a busy one, everything under 12 hours with
 	// room to spare.
 	defaultVerificationTrimMaxBytes = 20 << 30
+	// verificationTrimMarginPercent is the share of the cap a pass trims the
+	// build directories to once they hold more than it. A pass applies the
+	// cap only once an hour, and builds add to the cache in between: on 10-21
+	// passes left 16.9-17.7 GiB, under the 20 GiB cap and so untouched by it,
+	// and the owner measured 23 GB 26 minutes after one, with three race
+	// matrix runs building. 75% of the default cap is 15 GiB, which leaves
+	// 5 GiB for an hour of builds: the journal's hours on 10-20 and 10-21
+	// added 0.6-1.8 GiB between passes, and that busy half hour about 4 GiB.
+	verificationTrimMarginPercent = 75
+	// verificationLowSpaceTrimEvery spaces the extra verification passes
+	// that run between scheduled ones while the cache's volume is under the
+	// sweep's low-space threshold. The relay checks every 30 seconds, and a
+	// pass walks the whole cache, so a volume that stays low gets one every
+	// 15 minutes, not one a check.
+	verificationLowSpaceTrimEvery = 15 * time.Minute
 	// minGoCacheTrimMaxAge is the least age: go refreshes an entry's mtime
 	// only when it is more than an hour old.
 	minGoCacheTrimMaxAge = 2 * time.Hour
@@ -280,7 +297,11 @@ func goCacheTrimJournalText(l sweepJournalLine) string {
 	if l.FreeBytesAfter >= 0 {
 		free = humanBytes(l.FreeBytesAfter)
 	}
-	text := fmt.Sprintf("%s %s trimmed files=%d freed=%s cache=%s free=%s max-age=%s", l.At, label, files, humanBytes(l.BytesFreed), humanBytes(cache), free, l.MaxAge)
+	sizes := "cache=" + humanBytes(cache)
+	if l.CacheBytesBefore != nil {
+		sizes = "cache-before=" + humanBytes(*l.CacheBytesBefore) + " " + sizes
+	}
+	text := fmt.Sprintf("%s %s trimmed files=%d freed=%s %s free=%s max-age=%s", l.At, label, files, humanBytes(l.BytesFreed), sizes, free, l.MaxAge)
 	if l.Reason != "" {
 		text += " rule=" + l.Reason
 	}
@@ -453,8 +474,10 @@ type goCacheTrimResult struct {
 	FilesRemoved int64
 	BytesFreed   int64
 	// CacheBytesAfter is the apparent size of the regular files left directly
-	// inside the two-hex directories that were opened.
-	CacheBytesAfter int64
+	// inside the two-hex directories that were opened; CacheBytesBefore is
+	// the same files' size at the walk's first look, removed ones included.
+	CacheBytesAfter  int64
+	CacheBytesBefore int64
 	// Errors counts entries and directories that could not be handled;
 	// FirstError names the first.
 	Errors     int
@@ -568,6 +591,7 @@ func trimGoCacheDirectory(sub *os.Root, dir string, maxAge time.Duration, now ti
 		if !look() {
 			continue
 		}
+		res.CacheBytesBefore += size
 		entry := strings.HasSuffix(name, "-a") || strings.HasSuffix(name, "-d")
 		if !entry || !old() {
 			res.CacheBytesAfter += size
@@ -704,7 +728,7 @@ func goBuildCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
-	var zero, removed, cacheBytes int64
+	var zero, removed, cacheBytes, cacheBefore int64
 	line := sweepJournalLine{At: now.UTC().Format(time.RFC3339Nano), Source: goCacheTrimSource, Kept: map[string]int{}, FreeBytesAfter: -1,
 		FilesRemoved: &zero, CacheBytesAfter: &zero, MaxAge: settings.MaxAge.String()}
 	write := func(outcome, reason, detail string) {
@@ -771,8 +795,8 @@ func goBuildCacheTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		write("failed", goCacheTrimFailWalk, res.WalkError)
 		return true
 	}
-	removed, cacheBytes = res.FilesRemoved, res.CacheBytesAfter
-	line.FilesRemoved, line.CacheBytesAfter, line.BytesFreed = &removed, &cacheBytes, res.BytesFreed
+	removed, cacheBytes, cacheBefore = res.FilesRemoved, res.CacheBytesAfter, res.CacheBytesBefore
+	line.FilesRemoved, line.CacheBytesAfter, line.CacheBytesBefore, line.BytesFreed = &removed, &cacheBytes, &cacheBefore, res.BytesFreed
 	if free, err := d.freeBytes(dir); err == nil {
 		line.FreeBytesAfter = free
 	}
@@ -1095,7 +1119,8 @@ type verificationCapCandidate struct {
 
 // trimVerificationBuildDirs trims every build directory the runner would use
 // under the opened root by age, then, while the build directories hold more
-// than the cap, removes the oldest entries older than minGoCacheTrimMaxAge.
+// than verificationTrimMarginPercent of the cap, removes the oldest entries
+// older than minGoCacheTrimMaxAge.
 // Before each two-hex directory, and every 256 removals by the cap, it reads
 // the host lock again and stops at a lock that cannot be read or trusted.
 //
@@ -1156,6 +1181,7 @@ func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoo
 		res.FilesRemoved += r.FilesRemoved
 		res.BytesFreed += r.BytesFreed
 		res.CacheBytesAfter += r.CacheBytesAfter
+		res.CacheBytesBefore += r.CacheBytesBefore
 		res.Errors += r.Errors
 		if res.FirstError == "" && r.FirstError != "" {
 			res.FirstError = name + "/" + r.FirstError
@@ -1180,9 +1206,10 @@ func trimVerificationBuildDirs(ctx context.Context, root *goCacheHandle, realRoo
 }
 
 // capBuildDirs removes the oldest candidates, oldest mtime first, until the
-// build directories hold no more than the cap, and returns its notes.
+// build directories hold no more than verificationTrimMarginPercent of the
+// cap, and returns its notes.
 func (p *verificationTrimPass) capBuildDirs(ctx context.Context, res *goCacheTrimResult, opened map[string]*goCacheHandle, candidates []verificationCapCandidate) []string {
-	limit := p.settings.MaxBytes
+	limit := p.settings.MaxBytes * verificationTrimMarginPercent / 100
 	if limit <= 0 || res.CacheBytesAfter <= limit {
 		return nil
 	}
@@ -1219,11 +1246,12 @@ func (p *verificationTrimPass) capBuildDirs(ctx context.Context, res *goCacheTri
 		p.removeCandidate(opened[c.build], c, res)
 	}
 	var notes []string
+	capText := fmt.Sprintf("size cap %s, margin %s", humanBytes(p.settings.MaxBytes), humanBytes(limit))
 	if p.capRemoved > 0 {
-		notes = append(notes, fmt.Sprintf("size cap %s: removed %d entries, freed %s", humanBytes(limit), p.capRemoved, humanBytes(p.capFreed)))
+		notes = append(notes, fmt.Sprintf("%s: removed %d entries, freed %s", capText, p.capRemoved, humanBytes(p.capFreed)))
 	}
 	if !res.StoppedEarly && res.CacheBytesAfter > limit {
-		notes = append(notes, "size cap "+humanBytes(limit)+" not reached: the rest is under 2h")
+		notes = append(notes, capText+" not reached: the rest is under 2h")
 	}
 	return notes
 }
@@ -1278,7 +1306,10 @@ func (p *verificationTrimPass) removeCandidate(cache *goCacheHandle, c verificat
 // verificationTrimAttempt runs one verification cache trim when its switch
 // is not off and a run is due, as goBuildCacheTrimAttempt does for the user's
 // cache, with its own lock file, state record and fault gate. Every line it
-// writes has source goCacheTrimSource and names the root in lowestVolume.
+// writes has source goCacheTrimSource and names the root in lowestVolume. A
+// run is due an interval after the last one, or sooner when
+// verificationLowSpaceDue says so; such an extra pass takes the same locks,
+// counts as a run and says why in its line's detail.
 func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	now := d.now()
 	started := time.Now()
@@ -1304,7 +1335,7 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
-	var zero, removed, cacheBytes int64
+	var zero, removed, cacheBytes, cacheBefore int64
 	line := sweepJournalLine{At: now.UTC().Format(time.RFC3339Nano), Source: goCacheTrimSource, Kept: map[string]int{}, FreeBytesAfter: -1,
 		FilesRemoved: &zero, CacheBytesAfter: &zero, MaxAge: settings.MaxAge.String(), LowestVolume: "(unresolved)"}
 	write := func(outcome, reason, detail string) {
@@ -1329,8 +1360,11 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	if state.GoCacheTrim != nil {
 		last = state.GoCacheTrim.Verification
 	}
+	var extra string
 	if !goCacheTrimDue(last, settings.Interval, now) {
-		return false
+		if extra = verificationLowSpaceDue(d, last, settings, fault, now); extra == "" {
+			return false
+		}
 	}
 	err = updateSweepState(func(s *sweepState) error {
 		if s.GoCacheTrim == nil {
@@ -1346,6 +1380,9 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		return wrote
 	}
 	skip := func(reason, detail string) bool {
+		if extra != "" {
+			detail = strings.TrimSuffix(extra+"; "+detail, "; ")
+		}
 		write("skipped", reason, detail)
 		return true
 	}
@@ -1377,8 +1414,8 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 		write("failed", goCacheTrimFailWalk, res.WalkError)
 		return true
 	}
-	removed, cacheBytes = res.FilesRemoved, res.CacheBytesAfter
-	line.FilesRemoved, line.CacheBytesAfter, line.BytesFreed = &removed, &cacheBytes, res.BytesFreed
+	removed, cacheBytes, cacheBefore = res.FilesRemoved, res.CacheBytesAfter, res.CacheBytesBefore
+	line.FilesRemoved, line.CacheBytesAfter, line.CacheBytesBefore, line.BytesFreed = &removed, &cacheBytes, &cacheBefore, res.BytesFreed
 	if free, err := d.freeBytes(realRoot); err == nil {
 		line.FreeBytesAfter = free
 	}
@@ -1395,6 +1432,9 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	if runs > 0 {
 		notes = append(notes, "trimmed while "+matrixEntriesBusy(runs))
 	}
+	if extra != "" {
+		notes = append([]string{extra}, notes...)
+	}
 	detail := strings.Join(notes, "; ")
 	rules := pass.rules()
 	err = updateSweepState(func(s *sweepState) error {
@@ -1410,4 +1450,25 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	write("trimmed", rules, detail)
 	return true
+}
+
+// verificationLowSpaceDue says why an extra verification pass is due before
+// the scheduled one, or "": the volume holding the root has less free space
+// than the sweep's low-space threshold, and no attempt, scheduled or extra,
+// began in the last verificationLowSpaceTrimEvery. A settings fault, or a root
+// or free space that cannot be read, is no reason: the scheduled pass journals
+// those.
+func verificationLowSpaceDue(d goCacheTrimDeps, last *goCacheTrimState, settings goCacheTrimSettings, fault string, now time.Time) string {
+	if fault != "" || last == nil || now.Sub(last.LastAttemptAt) < verificationLowSpaceTrimEvery {
+		return ""
+	}
+	root, err := d.verificationRoot()
+	if err != nil {
+		return ""
+	}
+	free, err := d.freeBytes(root)
+	if err != nil || free >= settings.LowSpaceBytes {
+		return ""
+	}
+	return fmt.Sprintf("extra pass: %s free, under the low-space threshold %s", humanBytes(free), humanBytes(settings.LowSpaceBytes))
 }
