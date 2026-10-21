@@ -48,6 +48,12 @@ type teamRunner struct {
 	// cleanupPending times each member cleanup that waits on a retryable
 	// error; nil retries without the owner-helper notice.
 	cleanupPending *cleanupPendingBook
+	// changedFiles caches narrowing's changed-file lists per acceptance;
+	// nil runs Git every tick, as before.
+	changedFiles *changedFilesBook
+	// releaseErrors reports a repeated local release error once per
+	// message; nil reports it every tick, as before.
+	releaseErrors *releaseErrorBook
 }
 
 func (r teamRunner) clock() time.Time {
@@ -188,6 +194,126 @@ func (b *launchRetryBook) drop(key string) {
 	delete(b.entries, key)
 }
 
+// retain keeps this hub's entries that keep reports and drops the rest.
+func (b *launchRetryBook) retain(hub string, keep func(task, entry string) bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	retainQueueKeys(b.entries, hub, keep)
+}
+
+// retainQueueKeys deletes this hub's launchRetryKey keys whose task and
+// entry keep rejects. Other hubs' keys are untouched.
+func retainQueueKeys[V any](entries map[string]V, hub string, keep func(task, entry string) bool) {
+	hub = strings.TrimRight(hub, "/")
+	for key := range entries {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) == 3 && parts[0] == hub && !keep(parts[1], parts[2]) {
+			delete(entries, key)
+		}
+	}
+}
+
+// changedFilesBook caches each accepted entry's changed-file list by its
+// acceptance base and commit, so narrowing runs Git once per acceptance, not
+// every tick. A Git error is cached too: narrowing is an optimization, and a
+// new acceptance commit tries again.
+type changedFilesBook struct {
+	mu      sync.Mutex
+	entries map[string]*changedFilesState
+}
+
+type changedFilesState struct {
+	base, commit string
+	files        []string
+	err          error
+}
+
+var productionChangedFiles = &changedFilesBook{}
+
+// lookup returns the cached result for this acceptance, if any.
+func (b *changedFilesBook) lookup(key, base, commit string) (*changedFilesState, bool) {
+	if b == nil {
+		return nil, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.entries[key]
+	if state == nil || state.base != base || state.commit != commit {
+		return nil, false
+	}
+	return state, true
+}
+
+func (b *changedFilesBook) save(key string, state *changedFilesState) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.entries == nil {
+		b.entries = map[string]*changedFilesState{}
+	}
+	b.entries[key] = state
+}
+
+func (b *changedFilesBook) retain(hub string, keep func(task, entry string) bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	retainQueueKeys(b.entries, hub, keep)
+}
+
+// releaseErrorBook holds the last local error that stopped each failed
+// entry's release, so a proof that keeps failing the same way is reported
+// once, and again only when its message changes.
+type releaseErrorBook struct {
+	mu      sync.Mutex
+	entries map[string]string
+}
+
+var productionReleaseErrors = &releaseErrorBook{}
+
+// changed records message and reports whether it differs from the last one
+// recorded for key.
+func (b *releaseErrorBook) changed(key, message string) bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.entries == nil {
+		b.entries = map[string]string{}
+	}
+	if last, ok := b.entries[key]; ok && last == message {
+		return false
+	}
+	b.entries[key] = message
+	return true
+}
+
+func (b *releaseErrorBook) drop(key string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.entries, key)
+}
+
+func (b *releaseErrorBook) retain(hub string, keep func(task, entry string) bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	retainQueueKeys(b.entries, hub, keep)
+}
+
 // postedStallNotices remembers the stall notices this relay process has
 // saved, so a persisting stall costs no hub write per tick. After a restart
 // the hub replays the saved notice instead of posting another.
@@ -279,6 +405,8 @@ func productionTeamRunner() teamRunner {
 		roundRobin:     true,
 		retries:        productionLaunchRetries,
 		cleanupPending: productionCleanupPending,
+		changedFiles:   productionChangedFiles,
+		releaseErrors:  productionReleaseErrors,
 	}
 }
 
@@ -733,6 +861,14 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	// project was listed, a pending cleanup key whose entry none of them
 	// names is dropped after the pass.
 	listed, allListed := map[string]bool{}, true
+	// liveStates holds, per project listed live on this tick, the state of
+	// each of this host's entries. After the pass, the launch retry book,
+	// changed-file cache and release errors keep only entries a live listing
+	// still names in their state, or that this pass advanced from it; a
+	// project without a live listing keeps its entries unless the live host
+	// listing no longer names it.
+	liveStates := map[string]map[string]string{}
+	advanced := map[string]bool{}
 	for _, taskID := range projects {
 		var queue api.TeamQueueList
 		if live {
@@ -761,10 +897,26 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			r.noticeSlowListing(ctx, c, listings, taskID, host, &saved, now)
 			queue = saved.list
 		}
+		states := map[string]string{}
 		for _, q := range queue.Entries {
 			if q.Host == host {
 				listed[q.ID] = true
+				states[q.ID] = q.State
 			}
+		}
+		if !stale {
+			liveStates[taskID] = states
+		}
+		// The failed-entry release check reads the project once per pass,
+		// however many of its failed entries it checks.
+		var failedTask *api.TaskDetail
+		var failedTaskErr error
+		readFailedTask := func() (api.TaskDetail, error) {
+			if failedTask == nil && failedTaskErr == nil {
+				detail, err := c.GetTask(ctx, taskID)
+				failedTask, failedTaskErr = &detail, err
+			}
+			return *failedTask, failedTaskErr
 		}
 		parallel := queueParallel(queue.ConcurrencyLimit)
 		for _, q := range queue.Entries {
@@ -819,7 +971,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				if !parallel {
 					break
 				}
-				if err := r.releaseFailed(ctx, e, c, q, host); err != nil {
+				if err := r.releaseFailed(ctx, e, c, q, host, readFailedTask); err != nil {
 					projectErrors = append(projectErrors, fmt.Errorf("team queue %s: %w", q.ID, err))
 				}
 				continue
@@ -834,6 +986,7 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 				// tried. The hub still decides that entry's claim.
 				continue
 			}
+			advanced[q.ID] = true
 			err := r.advance(ctx, e, c, q, host)
 			if errors.Is(err, errQueuedAwaitsRebind) {
 				// Nothing was done for this entry, so it does not take a
@@ -885,6 +1038,22 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 	if allListed {
 		r.cleanupPending.retain(c.Base, func(entry string) bool { return listed[entry] })
 	}
+	keepIn := func(state string) func(task, entry string) bool {
+		return func(task, entry string) bool {
+			states, ok := liveStates[task]
+			if !ok {
+				// Not listed live: keep it unless the live host listing
+				// no longer names the project on this host.
+				return !hostListed || seen[task]
+			}
+			// An entry this pass claimed is listed as queued, and keeps
+			// what its launch recorded.
+			return states[entry] == state || advanced[entry]
+		}
+	}
+	r.retries.retain(c.Base, keepIn("launching"))
+	r.changedFiles.retain(c.Base, keepIn("running"))
+	r.releaseErrors.retain(c.Base, keepIn("failed"))
 	if live {
 		listings.recovered(now)
 	}
@@ -1052,15 +1221,24 @@ func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEn
 	if q.Acceptance == nil || q.Repository == "" || q.ReleasedAt != "" {
 		return q
 	}
-	changed := r.changed
-	if changed == nil {
-		changed = queueChangedFiles
+	key := launchRetryKey(c.Base, q.TaskID, q.ID)
+	diff, cached := r.changedFiles.lookup(key, q.Acceptance.BaseCommit, q.Acceptance.Commit)
+	if !cached {
+		changed := r.changed
+		if changed == nil {
+			changed = queueChangedFiles
+		}
+		files, err := changed(ctx, q.Repository, q.Acceptance.BaseCommit, q.Acceptance.Commit)
+		diff = &changedFilesState{base: q.Acceptance.BaseCommit, commit: q.Acceptance.Commit, files: files, err: err}
+		r.changedFiles.save(key, diff)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: narrowing skipped: %v\n", q.ID, err)
+		}
 	}
-	files, err := changed(ctx, q.Repository, q.Acceptance.BaseCommit, q.Acceptance.Commit)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: narrowing skipped: %v\n", q.ID, err)
+	if diff.err != nil {
 		return q
 	}
+	files := diff.files
 	owned := ownedChanges(files, q.Ownership)
 	if len(owned) == 0 || len(owned) > 256 || sameOwnership(owned, q.Ownership) {
 		return q
@@ -1130,12 +1308,15 @@ func queueCwds(entries []api.TeamQueueEntry) []string {
 // releaseFailed frees a failed parallel entry's slot and handler lease once
 // every run bound to its item is closed and cleaned. It checks the roster
 // first, so an unreleasable entry costs no hub write per tick; the hub
-// repeats the exact release checks.
-func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
+// repeats the exact release checks. task reads the project's detail, which
+// the tick shares across the pass's failed entries. A local error building
+// the release is returned once per message while it repeats; a hub error is
+// always returned.
+func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string, task func() (api.TaskDetail, error)) error {
 	if q.Host != host {
 		return nil
 	}
-	detail, err := c.GetTask(ctx, q.TaskID)
+	detail, err := task()
 	if err != nil {
 		return err
 	}
@@ -1152,13 +1333,21 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 		return nil // The owner's release or a launch holds this entry.
 	}
 	defer unlockQueueLaunch(lock)
+	key := launchRetryKey(c.Base, q.TaskID, q.ID)
 	req, unlock, err := queueReleaseRequest(ctx, c, e.hub, q.TaskID, q, true)
+	var response *api.HTTPError
+	if err != nil && !errors.As(err, &response) {
+		if !r.releaseErrors.changed(key, err.Error()) {
+			return nil // Reported when it first appeared.
+		}
+		return err
+	}
+	r.releaseErrors.drop(key)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	_, err = c.TeamQueueAction(ctx, q.TaskID, req)
-	var response *api.HTTPError
 	if errors.As(err, &response) && response.Status == 409 {
 		return nil // The list names what still holds the entry.
 	}

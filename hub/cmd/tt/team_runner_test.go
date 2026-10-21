@@ -981,13 +981,17 @@ func TestTeamRunnerTickReadsActiveEntries(t *testing.T) {
 }
 
 // launchFaultHub serves a fixture's store through a hub that refuses chosen
-// team queue operations and counts every team queue action by operation.
+// team queue operations and counts every team queue action by operation. It
+// also counts task reads under "get_task", can refuse the project listing
+// with listFault, and can rewrite both team queue listings with listing.
 type launchFaultHub struct {
-	e      env
-	c      *api.Client
-	mu     sync.Mutex
-	faults map[string]*api.HTTPError
-	counts map[string]int
+	e         env
+	c         *api.Client
+	mu        sync.Mutex
+	faults    map[string]*api.HTTPError
+	counts    map[string]int
+	listFault *api.HTTPError
+	listing   func(*api.TeamQueueList)
 }
 
 func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
@@ -995,6 +999,36 @@ func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 	h := &launchFaultHub{faults: map[string]*api.HTTPError{}, counts: map[string]int{}}
 	inner := server.New(f.st, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "team-fixture", User: "owner"}, nil })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Count(r.URL.Path, "/") == 3 {
+			h.mu.Lock()
+			h.counts["get_task"]++
+			h.mu.Unlock()
+		}
+		if r.Method == "GET" && (strings.HasSuffix(r.URL.Path, "/team-queue") || r.URL.Path == "/v1/team-queues") {
+			h.mu.Lock()
+			fault, rewrite := h.listFault, h.listing
+			h.mu.Unlock()
+			if fault != nil && strings.HasSuffix(r.URL.Path, "/team-queue") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(fault.Status)
+				_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: fault.Msg})
+				return
+			}
+			if rewrite != nil {
+				rec := httptest.NewRecorder()
+				inner.ServeHTTP(rec, r)
+				var list api.TeamQueueList
+				if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &list) != nil {
+					w.WriteHeader(rec.Code)
+					_, _ = w.Write(rec.Body.Bytes())
+					return
+				}
+				rewrite(&list)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(list)
+				return
+			}
+		}
 		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions") {
 			body, _ := io.ReadAll(r.Body)
 			var req api.TeamQueueRequest
@@ -1030,6 +1064,12 @@ func (h *launchFaultHub) refuse(operation string, status int, msg string) {
 		return
 	}
 	h.faults[operation] = &api.HTTPError{Status: status, Msg: msg}
+}
+
+func (h *launchFaultHub) setListing(fault *api.HTTPError, rewrite func(*api.TeamQueueList)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.listFault, h.listing = fault, rewrite
 }
 
 func (h *launchFaultHub) count(operation string) int {
@@ -3619,4 +3659,265 @@ func TestTeamRunnerCloseoutPendingKeysLeaveWithTheirEntry(t *testing.T) {
 			t.Fatalf("after failed tick %v", r.cleanupPending.entries)
 		}
 	})
+}
+
+// retryFailures is the launch retry book's failure count for key, or -1 when
+// it holds no state for it.
+func retryFailures(b *launchRetryBook, key string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if state := b.entries[key]; state != nil {
+		return state.failures
+	}
+	return -1
+}
+
+// wi_96690c4ac2d62577 t1: after a pass whose listing of the project is
+// complete, the launch retry book holds no state for an entry absent from it
+// or listed in a non-launching state, even one the pass never reached. A
+// still-launching entry keeps its failures and backoff, and an entry whose
+// project listing failed is not dropped.
+func TestTeamRunnerLaunchRetryBookForgetsEntriesThatLeaveTheListing(t *testing.T) {
+	f, hub, q, runner, now, _ := launchRetryFixture(t)
+	ctx := context.Background()
+	hub.refuse("freeze", 503, "service unavailable")
+	tick := func() { _ = runner.tick(ctx, hub.e, hub.c, "fixture") }
+	tick()
+	key := launchRetryKey(hub.c.Base, f.task.ID, q.ID)
+	if retryFailures(runner.retries, key) != 1 || hub.count("freeze") != 1 {
+		t.Fatalf("first launch error not recorded: failures=%d freezes=%d", retryFailures(runner.retries, key), hub.count("freeze"))
+	}
+	// An entry this project's listing never names, and another hub's key.
+	absent := launchRetryKey(hub.c.Base, f.task.ID, "tqe_absent")
+	otherHub := launchRetryKey("http://other-hub.invalid", f.task.ID, q.ID)
+	runner.retries.record(absent, errors.New("absent"), *now)
+	runner.retries.record(otherHub, errors.New("other hub"), *now)
+
+	tick() // inside the backoff
+	if retryFailures(runner.retries, key) != 1 || !runner.retries.waiting(key, *now) || hub.count("freeze") != 1 {
+		t.Fatalf("still-launching entry lost its backoff: failures=%d waiting=%v freezes=%d", retryFailures(runner.retries, key), runner.retries.waiting(key, *now), hub.count("freeze"))
+	}
+	if retryFailures(runner.retries, absent) != -1 {
+		t.Fatal("an entry absent from a complete listing kept its retry state")
+	}
+
+	// A failed project listing observes nothing, so nothing is dropped.
+	runner.retries.record(absent, errors.New("absent"), *now)
+	hub.setListing(&api.HTTPError{Status: 500, Msg: "listing broke"}, nil)
+	tick()
+	if retryFailures(runner.retries, absent) != 1 || retryFailures(runner.retries, key) != 1 {
+		t.Fatalf("a failed listing dropped retry state: absent=%d launching=%d", retryFailures(runner.retries, absent), retryFailures(runner.retries, key))
+	}
+
+	// Listed as running behind a failed head of a serial queue, so the pass
+	// never reaches it: still forgotten.
+	hub.setListing(nil, func(list *api.TeamQueueList) {
+		list.ConcurrencyLimit = 1
+		head := api.TeamQueueEntry{ID: "tqe_failedhead", TaskID: f.task.ID, Host: "fixture", State: "failed"}
+		for i := range list.Entries {
+			if list.Entries[i].ID == q.ID {
+				list.Entries[i].State = "running"
+			}
+		}
+		list.Entries = append([]api.TeamQueueEntry{head}, list.Entries...)
+	})
+	tick()
+	if retryFailures(runner.retries, key) != -1 || retryFailures(runner.retries, absent) != -1 {
+		t.Fatalf("an entry listed as running kept retry state: entry=%d absent=%d", retryFailures(runner.retries, key), retryFailures(runner.retries, absent))
+	}
+
+	// Listed as launching again, the launch starts a fresh count at once.
+	hub.setListing(nil, nil)
+	tick()
+	if retryFailures(runner.retries, key) != 1 || hub.count("freeze") != 2 {
+		t.Fatalf("relisted launch did not record a fresh error: failures=%d freezes=%d", retryFailures(runner.retries, key), hub.count("freeze"))
+	}
+	// Absent from both listings: forgotten on the next pass.
+	hub.setListing(nil, func(list *api.TeamQueueList) {
+		kept := list.Entries[:0]
+		for _, entry := range list.Entries {
+			if entry.ID != q.ID {
+				kept = append(kept, entry)
+			}
+		}
+		list.Entries = kept
+	})
+	tick()
+	if retryFailures(runner.retries, key) != -1 {
+		t.Fatal("an entry absent from the listings kept its retry state")
+	}
+	if retryFailures(runner.retries, otherHub) != 1 {
+		t.Fatal("another hub's retry state was dropped")
+	}
+}
+
+// wi_96690c4ac2d62577 t2: narrowing runs the changed-file diff once per
+// acceptance base and commit across ticks and once more for a new commit,
+// and its cache forgets an entry that leaves the listing.
+func TestTeamRunnerNarrowDiffsOncePerAcceptanceCommit(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	base := strings.Repeat("a", 40)
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "narrow-cache-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: base, Ownership: []string{"src/a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = runQueueEntry(t, f, q.ID)
+	// The listing carries an acceptance; the item stays open, so finish
+	// waits and every tick narrows the running entry.
+	accept := func(commit string) {
+		hub.setListing(nil, func(list *api.TeamQueueList) {
+			for i := range list.Entries {
+				if list.Entries[i].ID == q.ID {
+					list.Entries[i].Acceptance = &api.TeamIntegrationAcceptance{BaseCommit: base, Commit: commit}
+				}
+			}
+		})
+	}
+	var diffs []string
+	runner := teamRunner{changedFiles: &changedFilesBook{}, changed: func(_ context.Context, repository, from, to string) ([]string, error) {
+		diffs = append(diffs, from+".."+to)
+		return []string{"src/a"}, nil
+	}}
+	tick := func() {
+		t.Helper()
+		if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := strings.Repeat("b", 40), strings.Repeat("c", 40)
+	accept(first)
+	for i := 0; i < 3; i++ {
+		tick()
+	}
+	if len(diffs) != 1 || diffs[0] != base+".."+first {
+		t.Fatalf("three ticks on one acceptance ran %d diffs: %v", len(diffs), diffs)
+	}
+	accept(second)
+	for i := 0; i < 3; i++ {
+		tick()
+	}
+	if len(diffs) != 2 || diffs[1] != base+".."+second {
+		t.Fatalf("a new acceptance commit ran %d diffs in total: %v", len(diffs), diffs)
+	}
+	if hub.count("scope") != 0 {
+		t.Fatalf("unchanged ownership sent %d scope writes", hub.count("scope"))
+	}
+	if got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || got.State != "running" || got.Revision != q.Revision {
+		t.Fatalf("narrowing changed the entry: %+v %v", got, err)
+	}
+	if len(runner.changedFiles.entries) != 1 {
+		t.Fatalf("cache holds %d entries", len(runner.changedFiles.entries))
+	}
+	hub.setListing(nil, func(list *api.TeamQueueList) { list.Entries = nil })
+	tick()
+	if len(runner.changedFiles.entries) != 0 {
+		t.Fatalf("cache kept %d entries after the entry left the listing", len(runner.changedFiles.entries))
+	}
+}
+
+// wi_96690c4ac2d62577 t3: one pass reads the project once for all its failed
+// unreleased parallel entries, and a local release error that repeats is
+// reported once per distinct message, then again when it changes.
+func TestTeamRunnerFailedReleaseReadsTaskOncePerPassAndReportsErrorsOnce(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	choresParallelProject(t, f, 0)
+	other, otherOrder := queueFixtureItem(t, f, "release-errors-other")
+	var failed []api.TeamQueueEntry
+	for i, item := range []struct {
+		id    string
+		order int64
+	}{{f.item.ID, f.order}, {other.ID, otherOrder}} {
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("release-errors-add-%d", i), Operation: "add", ItemID: item.id, OrderMessageSeq: item.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{fmt.Sprintf("src/%d", i)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		detail, err := f.c.GetTask(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("release-errors-claim-%d", i), Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "fixture", PauseGeneration: detail.Task.PauseGeneration})
+		if err != nil {
+			t.Fatal(err)
+		}
+		q, err = f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: fmt.Sprintf("release-errors-fail-%d", i), Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "fixture failure"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		failed = append(failed, q)
+	}
+	// The host listing names no failed entry, so a queued one brings the
+	// project into the pass. The fixture policy's limiter domain differs
+	// from the test hub, so it holds.
+	queued, queuedOrder := queueFixtureItem(t, f, "release-errors-queued")
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "release-errors-add-queued", Operation: "add", ItemID: queued.ID, OrderMessageSeq: queuedOrder, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/queued"}}); err != nil {
+		t.Fatal(err)
+	}
+	census := func(context.Context, *api.Client, string, string, api.TeamHostPolicy, *api.TeamHostUsage, []string) error {
+		t.Fatal("mismatched limiter domain reached census")
+		return nil
+	}
+	// The listed launch journal decides the local release error.
+	journal := func(raw string) {
+		hub.setListing(nil, func(list *api.TeamQueueList) {
+			for i := range list.Entries {
+				if list.Entries[i].State == "failed" {
+					list.Entries[i].LaunchJSON = json.RawMessage(raw)
+				}
+			}
+		})
+	}
+	const invalid = "failed queue launch journal is invalid"
+	const elsewhere = "uncertain queue release must run on the saved launch host"
+	runner := teamRunner{census: census, releaseErrors: &releaseErrorBook{}}
+	pass := func(r teamRunner) (string, int) {
+		t.Helper()
+		reads := hub.count("get_task")
+		err := r.tick(ctx, hub.e, hub.c, "fixture")
+		text := ""
+		if err != nil {
+			text = err.Error()
+		}
+		return text, hub.count("get_task") - reads
+	}
+	journal(`"not a journal"`)
+	for i, want := range []int{2, 0, 0} {
+		text, reads := pass(runner)
+		if reads != 1 {
+			t.Fatalf("pass %d read the task %d times for two failed entries", i, reads)
+		}
+		if got := strings.Count(text, invalid); got != want {
+			t.Fatalf("pass %d reported the repeated error %d times, want %d: %q", i, got, want, text)
+		}
+	}
+	journal(`{"members":[{"state":"uncertain","fields":{"agentId":"agt_0123456789abcdef","name":"uncertain-member"}}]}`)
+	for i, want := range []int{2, 0} {
+		text, reads := pass(runner)
+		if reads != 1 || strings.Count(text, elsewhere) != want || strings.Contains(text, invalid) {
+			t.Fatalf("changed error pass %d: reads=%d %q", i, reads, text)
+		}
+	}
+	// Without the book every pass reports it, as before.
+	for i := 0; i < 2; i++ {
+		if text, _ := pass(teamRunner{census: census}); strings.Count(text, elsewhere) != 2 {
+			t.Fatalf("unbooked pass %d: %q", i, text)
+		}
+	}
+	// A valid journal releases both; the book forgets them.
+	hub.setListing(nil, nil)
+	time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
+	if text, reads := pass(runner); text != "" || reads != 1 || hub.count("release") != 2 {
+		t.Fatalf("release pass: reads=%d releases=%d %q", reads, hub.count("release"), text)
+	}
+	for _, q := range failed {
+		if got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || got.ReleasedAt == "" {
+			t.Fatalf("entry %s not released: %+v %v", q.ID, got, err)
+		}
+	}
+	if len(runner.releaseErrors.entries) != 0 {
+		t.Fatalf("release errors kept %d entries", len(runner.releaseErrors.entries))
+	}
 }
