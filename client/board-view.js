@@ -1,4 +1,5 @@
 import {
+  displayText,
   renderDelegationStrip,
   renderOwnerRequests,
   startOwnerAgeClock,
@@ -31,55 +32,6 @@ const esc = (s) =>
         c
       ],
   );
-// Free-text envelope body fields with the labels the hub's RenderText writes.
-const envelopeBodyLabels = [
-  ["objective", "Objective"],
-  ["ask", "Ask"],
-  ["candidate", "Candidate"],
-  ["scope", "Scope"],
-  ["question", "Question"],
-  ["answer", "Answer"],
-  ["reason", "Reason"],
-  ["needs", "Needs"],
-  ["resumeWhen", "Resume-when"],
-  ["summary", "Summary"],
-  ["text", "Text"],
-];
-// A typed message's stored text writes every field on one line. Show a
-// multi-line body field from the envelope instead: a line that is exactly its
-// flattened value becomes "Label:" and the value below it. Lines that do not
-// match keep their stored form, and the expected answer is never rewritten.
-const displayText = (message) => {
-  const env = message.envelope;
-  let text = String(message.text ?? "");
-  if (!env || typeof env !== "object") return text;
-  let suffix = "";
-  const tail = env.expectedAnswer
-    ? "\nExpected answer:\n" + env.expectedAnswer
-    : "";
-  if (tail && text.endsWith(tail)) {
-    text = text.slice(0, -tail.length);
-    suffix = tail;
-  }
-  const lines = text.split("\n");
-  for (const [key, label] of envelopeBodyLabels) {
-    const value = env.body?.[key];
-    if (typeof value !== "string" || !value.includes("\n")) continue;
-    const flat = label + ": " + value.split(/\s+/).filter(Boolean).join(" ");
-    const i = lines.indexOf(flat);
-    if (i < 0) continue;
-    lines[i] =
-      label +
-      ":\n" +
-      value
-        .replace(/\r\n/g, "\n")
-        .split("\n")
-        .map((line) => line.replace(/[ \t\r]+$/, ""))
-        .join("\n")
-        .replace(/^\n+|\n+$/g, "");
-  }
-  return lines.join("\n") + suffix;
-};
 const status = (a) => {
   const label =
     {

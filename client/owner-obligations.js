@@ -6,6 +6,55 @@ const esc = (value) =>
         c
       ],
   );
+// Free-text envelope body fields with the labels the hub's RenderText writes.
+const envelopeBodyLabels = [
+  ["objective", "Objective"],
+  ["ask", "Ask"],
+  ["candidate", "Candidate"],
+  ["scope", "Scope"],
+  ["question", "Question"],
+  ["answer", "Answer"],
+  ["reason", "Reason"],
+  ["needs", "Needs"],
+  ["resumeWhen", "Resume-when"],
+  ["summary", "Summary"],
+  ["text", "Text"],
+];
+// A typed message's stored text writes every field on one line. Show a
+// multi-line body field from the envelope instead: a line that is exactly its
+// flattened value becomes "Label:" and the value below it. Lines that do not
+// match keep their stored form, and the expected answer is never rewritten.
+export const displayText = (message) => {
+  const env = message.envelope;
+  let text = String(message.text ?? "");
+  if (!env || typeof env !== "object") return text;
+  let suffix = "";
+  const tail = env.expectedAnswer
+    ? "\nExpected answer:\n" + env.expectedAnswer
+    : "";
+  if (tail && text.endsWith(tail)) {
+    text = text.slice(0, -tail.length);
+    suffix = tail;
+  }
+  const lines = text.split("\n");
+  for (const [key, label] of envelopeBodyLabels) {
+    const value = env.body?.[key];
+    if (typeof value !== "string" || !value.includes("\n")) continue;
+    const flat = label + ": " + value.split(/\s+/).filter(Boolean).join(" ");
+    const i = lines.indexOf(flat);
+    if (i < 0) continue;
+    lines[i] =
+      label +
+      ":\n" +
+      value
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .map((line) => line.replace(/[ \t\r]+$/, ""))
+        .join("\n")
+        .replace(/^\n+|\n+$/g, "");
+  }
+  return lines.join("\n") + suffix;
+};
 export function ownerWaitSummary(
   obligations = [],
   taskId,
@@ -70,7 +119,7 @@ export function renderOwnerRequests(
       ? ` · <span class="delegated-tag" data-delegated-to="${esc(w.delegateName)}">Delegated to ${esc(w.delegateName)}</span>`
       : "";
   };
-  return `<section class="decision-panel" data-owner-requests><h3>Owner requests <span class="count-badge">${open.length}</span></h3>${error ? `<p role="alert">${esc(error)}</p>` : ""}${open.map((o) => `<article class="decision-request" data-owner-request="${esc(o.id)}"><strong>${esc(o.subject)}</strong><p class="fine">#${o.messageSeq}${delegatedTo(o)} · Due ${esc(new Date(o.dueAt).toLocaleString())} · Waiting <span data-owner-age="${esc(o.createdAt)}">${ownerAge(o.createdAt)}</span>${o.escalation ? " · Overdue escalation sent" : ""}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(o.request?.text || "")}</pre>${archived ? "" : `<form data-owner-answer="${esc(o.id)}"><label>Answer<textarea name="answer" required maxlength="4000" placeholder="Answer this request…" ${sending.has(o.id) ? "disabled" : ""}></textarea></label><button type="submit" ${sending.has(o.id) ? "disabled" : ""}>Send answer</button>${o.request?.envelope?.expectedAnswer ? `<button type="button" data-owner-approve="${esc(o.id)}" ${sending.has(o.id) ? "disabled" : ""}>Approve</button>` : ""}</form>`}${errors.get(o.id) ? `<p role="alert">${esc(errors.get(o.id))}</p>` : ""}</article>`).join("")}</section>`;
+  return `<section class="decision-panel" data-owner-requests><h3>Owner requests <span class="count-badge">${open.length}</span></h3>${error ? `<p role="alert">${esc(error)}</p>` : ""}${open.map((o) => `<article class="decision-request" data-owner-request="${esc(o.id)}"><strong>${esc(o.subject)}</strong><p class="fine">#${o.messageSeq}${delegatedTo(o)} · Due ${esc(new Date(o.dueAt).toLocaleString())} · Waiting <span data-owner-age="${esc(o.createdAt)}">${ownerAge(o.createdAt)}</span>${o.escalation ? " · Overdue escalation sent" : ""}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(displayText(o.request || {}))}</pre>${archived ? "" : `<form data-owner-answer="${esc(o.id)}"><label>Answer<textarea name="answer" required maxlength="4000" placeholder="Answer this request…" ${sending.has(o.id) ? "disabled" : ""}></textarea></label><button type="submit" ${sending.has(o.id) ? "disabled" : ""}>Send answer</button>${o.request?.envelope?.expectedAnswer ? `<button type="button" data-owner-approve="${esc(o.id)}" ${sending.has(o.id) ? "disabled" : ""}>Approve</button>` : ""}</form>`}${errors.get(o.id) ? `<p role="alert">${esc(errors.get(o.id))}</p>` : ""}</article>`).join("")}</section>`;
 }
 
 // Owner delegation windows (docs/owner-delegation-windows.md).
