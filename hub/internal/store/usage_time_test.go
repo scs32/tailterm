@@ -504,7 +504,7 @@ func TestUsageTimeMidActivationOrderChange(t *testing.T) {
 				if rows.Scan(&raw) != nil || json.Unmarshal([]byte(raw), &p) != nil {
 					t.Fatal(raw)
 				}
-				tokenPhase[ts(p.Turn.At)] = usagePhaseKey(p.Phase, p.ReviewRound)
+				tokenPhase[ts(p.Turn.At)] = usagePhaseKey(p.Phase, p.ReviewStage, p.ReviewRound)
 			}
 			rows.Close()
 			var payload, encoded string
@@ -523,7 +523,7 @@ func TestUsageTimeMidActivationOrderChange(t *testing.T) {
 				timePhase := ""
 				for _, piece := range projection.Pieces {
 					if !segment.From.Before(piece.From) && !segment.To.After(piece.To) {
-						timePhase = usagePhaseKey(piece.Phase, piece.ReviewRound)
+						timePhase = usagePhaseKey(piece.Phase, piece.ReviewStage, piece.ReviewRound)
 					}
 				}
 				if timePhase == "" || timePhase != tokenPhase[ts(segment.At)] {
@@ -839,5 +839,67 @@ func TestUsageTimePhasesReclassifiedOnRead(t *testing.T) {
 	// New spans keep their evidence, so the read needs no resolution.
 	if !kept {
 		t.Fatalf("ingest did not keep the span's evidence: %s", raw)
+	}
+}
+
+// wi_63545fd1fe07806b s2: on an item with two review stages, review time in
+// round one of each stage keeps its own key, and adjacent stretches of
+// different stages are not merged at ingest or on read. "read" ingests while
+// the ledger has no stages yet, so one stored piece is split by the report.
+func TestUsageTimeReviewStagesStayApart(t *testing.T) {
+	for _, staged := range []string{"ingest", "read"} {
+		t.Run(staged, func(t *testing.T) {
+			f := newTimeFixture(t)
+			team := f.team("builder", "reviewer")
+			x := f.items[0].ID
+			first := f.message("", team["builder"].ID, "10:00:00", api.Envelope{Kind: "assign", Subject: "Build the findings stage"}, x)
+			review1 := f.message("", team["reviewer"].ID, "10:05:00", api.Envelope{Kind: "review", Subject: "Review the findings stage", Review: &api.ReviewMetadata{Mode: "general"}}, x)
+			second := f.message("", team["builder"].ID, "10:08:00", api.Envelope{Kind: "assign", Subject: "Build the second stage"}, x)
+			review2 := f.message("", team["reviewer"].ID, "10:15:00", api.Envelope{Kind: "review", Subject: "Review the second stage", Review: &api.ReviewMetadata{Mode: "general"}}, x)
+			ledger := api.ReviewConvergence{ItemID: x, History: "recorded",
+				Stages: []api.ReviewStage{{Number: 1, ScopeRevision: 1, AssignmentSeq: first}, {Number: 2, OrderSeq: 1, ScopeRevision: 2, AssignmentSeq: second}},
+				Rounds: []api.ReviewRound{{Number: 1, RequestSeq: review1, ResultSeq: review1}, {Number: 1, RequestSeq: review2}}}
+			atIngest := ledger
+			if staged == "read" {
+				atIngest.Stages = nil
+			}
+			state, _ := json.Marshal(atIngest)
+			if _, err := f.s.db.Exec(`INSERT INTO review_convergence VALUES(?,?,?)`, f.task.ID, x, string(state)); err != nil {
+				t.Fatal(err)
+			}
+			// One reviewer activation whose two adjacent requests fall under
+			// the two review requests.
+			reviewer := testSpan("turn-review", "10:10:00", "10:30:00")
+			reviewer.Segments = []api.UsageSpanSegment{{From: timeAt("10:10:00"), To: timeAt("10:20:00"), At: timeAt("10:10:00")}, {From: timeAt("10:20:00"), To: timeAt("10:30:00"), At: timeAt("10:20:00")}}
+			reviewer.Handled = []api.UsageEvidence{{TaskID: f.task.ID, Seq: review1, Operation: "ack", At: timeAt("10:05:30")}, {TaskID: f.task.ID, Seq: review2, Operation: "ack", At: timeAt("10:15:30")}}
+			f.report(team["reviewer"], reviewer)
+
+			var encoded string
+			if err := f.s.db.QueryRow(`SELECT projection FROM usage_spans WHERE agent_id=?`, team["reviewer"].ID).Scan(&encoded); err != nil {
+				t.Fatal(err)
+			}
+			var projection usageSpanProjection
+			if err := json.Unmarshal([]byte(encoded), &projection); err != nil {
+				t.Fatal(err)
+			}
+			pieces := []usageSpanPiece{}
+			for _, p := range projection.Pieces {
+				pieces = append(pieces, usageSpanPiece{Phase: p.Phase, ReviewStage: p.ReviewStage, ReviewRound: p.ReviewRound})
+			}
+			want := []usageSpanPiece{{Phase: "review", ReviewStage: 1, ReviewRound: 1}, {Phase: "review", ReviewStage: 2, ReviewRound: 1}}
+			if staged == "read" {
+				want = []usageSpanPiece{{Phase: "review", ReviewRound: 1}}
+				state, _ = json.Marshal(ledger)
+				if _, err := f.s.db.Exec(`UPDATE review_convergence SET state_json=? WHERE task_id=? AND item_id=?`, string(state), f.task.ID, x); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !reflect.DeepEqual(pieces, want) {
+				t.Fatalf("stored pieces %+v, want %+v", pieces, want)
+			}
+			got := f.time(x)
+			checkSplits(t, "phases", got.Phases, map[string]wantSplit{"review stage 1 round 1": {10 * minute, 0, 0}, "review stage 2 round 1": {10 * minute, 0, 0}})
+			checkSplits(t, "phaseRoles", got.PhaseRoles, map[string]wantSplit{"review stage 1 round 1 / reviewer": {10 * minute, 0, 0}, "review stage 2 round 1 / reviewer": {10 * minute, 0, 0}})
+		})
 	}
 }

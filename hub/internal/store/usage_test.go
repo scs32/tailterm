@@ -2715,7 +2715,7 @@ func TestUsagePhaseCorrectionsStayInsideReviewStage(t *testing.T) {
 	at := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
 	specs := []struct {
 		kind, want string
-	}{{"assign", "build"}, {"review", "review round 1"}, {"assign", "corrections"}, {"assign", "build"}, {"review", "review round 1"}, {"assign", "corrections"}}
+	}{{"assign", "build"}, {"review", "review stage 1 round 1"}, {"assign", "corrections"}, {"assign", "build"}, {"review", "review stage 2 round 1"}, {"assign", "corrections"}}
 	messages := []api.Message{}
 	for i, spec := range specs {
 		e := api.Envelope{Kind: spec.kind, Subject: "Synthetic phase request", Refs: map[string]string{"item": items[0].ID}}
@@ -2759,7 +2759,138 @@ func TestUsagePhaseCorrectionsStayInsideReviewStage(t *testing.T) {
 			}
 		}
 	}
-	if want := map[string]int{"build": 2, "corrections": 2, "review round 1": 2}; !reflect.DeepEqual(got, want) {
+	// wi_63545fd1fe07806b s2: round one of each stage keeps its own key.
+	if want := map[string]int{"build": 2, "corrections": 2, "review stage 1 round 1": 1, "review stage 2 round 1": 1}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("phases\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// wi_63545fd1fe07806b s2: the review key names the stage only when the ledger
+// has two or more stages; otherwise it is unchanged.
+func TestUsagePhaseKeyNamesReviewStage(t *testing.T) {
+	for _, c := range []struct {
+		phase        string
+		stage, round int
+		want         string
+	}{
+		{"build", 2, 0, "build"},
+		{"review", 0, 1, "review round 1"},
+		{"review", 0, 0, "review round unavailable"},
+		{"review", 2, 0, "review round unavailable"},
+		{"review", 1, 1, "review stage 1 round 1"},
+		{"review", 2, 1, "review stage 2 round 1"},
+	} {
+		if got := usagePhaseKey(c.phase, c.stage, c.round); got != c.want {
+			t.Errorf("usagePhaseKey(%q, %d, %d) = %q, want %q", c.phase, c.stage, c.round, got, c.want)
+		}
+	}
+	two := api.ReviewConvergence{Stages: []api.ReviewStage{{Number: 1, AssignmentSeq: 10}, {Number: 2, AssignmentSeq: 30}}}
+	for _, c := range []struct {
+		state   api.ReviewConvergence
+		request int64
+		want    int
+	}{
+		{api.ReviewConvergence{}, 20, 0},
+		{api.ReviewConvergence{Stages: two.Stages[:1]}, 20, 0},
+		{two, 20, 1},
+		{two, 29, 1},
+		{two, 30, 2},
+		{two, 40, 2},
+	} {
+		r := api.ReviewRound{Number: 1, RequestSeq: c.request}
+		if got := reviewRoundStage(c.state, r); got != c.want {
+			t.Errorf("reviewRoundStage(%d stages, request %d) = %d, want %d", len(c.state.Stages), c.request, got, c.want)
+		}
+		// The boundary is CurrentStage's.
+		if len(c.state.Stages) == 2 {
+			c.state.Rounds = []api.ReviewRound{r}
+			if n, rounds, _ := c.state.CurrentStage(); (len(rounds) == 1) != (c.want == n) {
+				t.Errorf("request %d: stage %d disagrees with CurrentStage %d %+v", c.request, c.want, n, rounds)
+			}
+		}
+	}
+}
+
+// wi_63545fd1fe07806b s3: a ledger saved before stages were recorded, with
+// two scopes under different orders and round numbering restarting at 1,
+// reads in the usage report as two stage keys; the report writes nothing. A
+// ledger of unknown history stays unstaged.
+func TestUsageLegacyTwoStageLedgerReadsApart(t *testing.T) {
+	for _, c := range []struct {
+		history string
+		want    map[string]int
+	}{
+		{"recorded", map[string]int{"build": 2, "review stage 1 round 1": 1, "review stage 2 round 1": 1}},
+		{"unknown", map[string]int{"build": 2, "review round 1": 2}},
+	} {
+		t.Run(c.history, func(t *testing.T) {
+			s, task, a, items, _ := usageFixture(t)
+			ctx := context.Background()
+			if _, err := s.db.Exec(`UPDATE agents SET role='' WHERE id=?`, a.ID); err != nil {
+				t.Fatal(err)
+			}
+			plan, _ := json.Marshal(map[string]any{"members": []any{map[string]any{"fields": map[string]any{"agentId": a.ID, "role": "builder"}, "runId": a.RunID}}})
+			if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,created_at,updated_at) VALUES(?,?,?,1,1,'planned',1,'running',1,'fixture','/tmp',0,?,?,?)`, api.NewID("tqe"), task.ID, items[0].ID, string(plan), ts(s.now()), ts(s.now())); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+			seqs := []int64{}
+			for i, kind := range []string{"assign", "review", "assign", "review"} {
+				e := api.Envelope{Kind: kind, Subject: "Synthetic phase request", Refs: map[string]string{"item": items[0].ID}}
+				if kind == "review" {
+					e.Review = &api.ReviewMetadata{Mode: "general"}
+				}
+				raw, _ := json.Marshal(e)
+				r, err := s.db.Exec(`INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,envelope) VALUES(?,'','fixture','owner',?,'synthetic',?,?)`, task.ID, a.ID, ts(at.Add(time.Duration(i)*time.Minute)), string(raw))
+				if err != nil {
+					t.Fatal(err)
+				}
+				seq, _ := r.LastInsertId()
+				seqs = append(seqs, seq)
+			}
+			// Scope two is confirmed under a different owner order.
+			for scope, order := range map[int64]int64{1: 9001, 2: 9002} {
+				if _, err := s.db.Exec(`INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,request_id,payload_hash,agent_id,run_id,created_at) VALUES(?,?,?,?,?,?,'synthetic',?,?,?)`, task.ID, items[0].ID, scope, scope, order, fmt.Sprintf("legacy-scope-%d", scope), a.ID, a.RunID, ts(at)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			state := api.ReviewConvergence{ItemID: items[0].ID, History: c.history,
+				Scopes: []api.ReviewScope{{ScopeRevision: 1, ItemRevision: 1, AssignmentSeq: seqs[0]}, {ScopeRevision: 2, ItemRevision: 2, AssignmentSeq: seqs[2]}},
+				Rounds: []api.ReviewRound{{Number: 1, ScopeRevision: 1, RequestSeq: seqs[1], ResultSeq: seqs[1]}, {Number: 1, ScopeRevision: 2, RequestSeq: seqs[3]}}}
+			raw, _ := json.Marshal(state)
+			if _, err := s.db.Exec(`INSERT INTO review_convergence VALUES(?,?,?)`, task.ID, items[0].ID, string(raw)); err != nil {
+				t.Fatal(err)
+			}
+			for i, seq := range seqs {
+				turn := syntheticUsageTurn(fmt.Sprintf("legacy-phase-%d", i))
+				turn.At = at.Add(time.Duration(i)*time.Minute + time.Second)
+				turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: seq, Operation: "ack", At: turn.At}}
+				if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, fmt.Sprintf("legacy-phase-batch-%d", i), turn)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			report, err := s.Usage(ctx, task.ID, api.UsageQuery{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]int{}
+			for _, x := range report.Items {
+				if x.ItemID == items[0].ID {
+					for _, g := range x.Phases {
+						got[g.Key] = g.Summary.Requests
+					}
+				}
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("phases\n got %+v\nwant %+v", got, c.want)
+			}
+			var after string
+			if err := s.db.QueryRow(`SELECT state_json FROM review_convergence WHERE task_id=? AND item_id=?`, task.ID, items[0].ID).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if after != string(raw) {
+				t.Fatalf("the report rewrote the ledger\nbefore %s\nafter  %s", raw, after)
+			}
+		})
 	}
 }

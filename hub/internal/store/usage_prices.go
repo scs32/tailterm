@@ -231,7 +231,7 @@ func newUsageItem(task, item, title string) *usageItemAccumulator {
 }
 func (a *usageItemAccumulator) add(key string, p api.UsageProjection, d int64, prices api.UsagePrices) {
 	a.all.add(key, p.Turn, d, prices)
-	phase := usagePhaseKey(p.Phase, p.ReviewRound)
+	phase := usagePhaseKey(p.Phase, p.ReviewStage, p.ReviewRound)
 	model := p.Turn.Runtime + "/" + p.Turn.Model
 	if p.Turn.Model == "" {
 		model = p.Turn.Runtime + "/unknown"
@@ -362,7 +362,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 		}
 		// The stored phase is the ingest-time snapshot. Reports apply the current
 		// rule to every recorded request; the stored row is never rewritten.
-		if p.Phase, p.PhaseReason, p.ReviewRound, err = classifyUsagePhase(ctx, tx, p, cache); err != nil {
+		if p.Phase, p.PhaseReason, p.ReviewRound, p.ReviewStage, err = classifyUsagePhase(ctx, tx, p, cache); err != nil {
 			break
 		}
 		for _, share := range p.Shares {

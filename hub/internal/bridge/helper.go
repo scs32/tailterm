@@ -971,6 +971,14 @@ func entryStage(e api.TeamQueueEntry) string {
 	case e.Verification != nil && e.Verification.State != "":
 		return "verification " + e.Verification.State
 	case e.Reviews != nil && len(e.Reviews.Rounds) > 0:
+		// Rounds restart at 1 in each review stage, so a later stage is named.
+		stage, rounds, _ := e.Reviews.CurrentStage()
+		switch {
+		case stage > 1 && len(rounds) > 0:
+			return fmt.Sprintf("stage %d, review round %d", stage, rounds[len(rounds)-1].Number)
+		case stage > 1:
+			return fmt.Sprintf("stage %d, before review", stage)
+		}
 		return fmt.Sprintf("review round %d", e.Reviews.Rounds[len(e.Reviews.Rounds)-1].Number)
 	}
 	return e.State

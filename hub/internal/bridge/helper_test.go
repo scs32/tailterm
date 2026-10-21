@@ -1115,10 +1115,17 @@ func TestHelperEntryStage(t *testing.T) {
 		{api.TeamQueueEntry{State: "running", Release: &api.ReleaseJob{State: "blocked"}}, "release blocked"},
 		{api.TeamQueueEntry{State: "running", Integration: ready}, "ready to integrate"},
 		{api.TeamQueueEntry{State: "running"}, "running"},
+		{api.TeamQueueEntry{State: "running", Reviews: &api.ReviewConvergence{Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 10}, {Number: 2, RequestSeq: 20}}}}, "review round 2"},
+		{api.TeamQueueEntry{State: "running", Reviews: &api.ReviewConvergence{Stages: []api.ReviewStage{{Number: 1, AssignmentSeq: 5}}, Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 10}}}}, "review round 1"},
+		{api.TeamQueueEntry{State: "running", Reviews: &api.ReviewConvergence{Stages: []api.ReviewStage{{Number: 1, AssignmentSeq: 5}, {Number: 2, AssignmentSeq: 30}}, Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 10}, {Number: 2, RequestSeq: 20}, {Number: 1, RequestSeq: 40}}}}, "stage 2, review round 1"},
+		{api.TeamQueueEntry{State: "running", Reviews: &api.ReviewConvergence{Stages: []api.ReviewStage{{Number: 1, AssignmentSeq: 5}, {Number: 2, AssignmentSeq: 30}}, Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 10}, {Number: 2, RequestSeq: 20}}}}, "stage 2, before review"},
 	} {
 		release := "none"
 		if c.entry.Release != nil {
 			release = c.entry.Release.State
+		}
+		if c.entry.Reviews != nil {
+			release += fmt.Sprintf(", %d stages", len(c.entry.Reviews.Stages))
 		}
 		if got := entryStage(c.entry); got != c.want {
 			t.Errorf("entryStage with release %s = %q, want %q", release, got, c.want)

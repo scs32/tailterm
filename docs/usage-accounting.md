@@ -46,11 +46,13 @@ Each projection has one phase: intake/planning, build, numbered review round (or
 | database handler | handler bookkeeping |
 | no open order | hand-offs |
 | focused review, or any order held by a verifier | verification |
-| review, or any order held by a reviewer | review round N from retained native review state, else round unavailable |
+| review, or any order held by a reviewer | review round N from retained native review state, else round unavailable; review stage S round N once the item has two or more review stages |
 | any order held by a planner, or refs `phase` of `planning` or `intake` | intake and planning |
 | assign after a review round whose result had blockers | corrections |
 | assign | build |
 | plain request (lead, builder, other roles) | hand-offs |
+
+Review rounds restart at 1 in each review stage, so an item with two or more stages keys review by stage and round (`review stage 2 round 1`) and round one of each stage stays apart; a round belongs to the last stage whose opening ASSIGN does not follow its review request. An item with no or one stage keeps `review round N`. A ledger saved before stages were recorded, with no later saved transition, gets its stages derived when a report reads it, by the rule the next saved transition stores; the report writes nothing, so no backfill is needed. A ledger of unknown history stays unstaged (bug `wi_63545fd1fe07806b`).
 
 When no obligation window covers the request, the handled order addressed to the agent is used instead: the opening request inherits the activation's first handled order, later requests the latest at or before the request. This covers orders older than obligations and a host clock slightly behind the hub, where the opening request precedes the order it acknowledged. An order whose window has already ended is not revived by handled evidence.
 

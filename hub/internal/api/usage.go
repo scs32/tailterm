@@ -101,6 +101,7 @@ type UsageProjection struct {
 	Phase       string             `json:"phase"`
 	PhaseReason string             `json:"phaseReason"`
 	ReviewRound int                `json:"reviewRound,omitempty"`
+	ReviewStage int                `json:"reviewStage,omitempty"` // only for two or more review stages
 	Shares      []UsageAttribution `json:"shares"`
 	Evidence    []MessageReference `json:"evidence,omitempty"`
 }

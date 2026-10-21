@@ -216,11 +216,11 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 			out.Shares = append(out.Shares, x)
 		}
 	}
-	phase, reason, round, err := classifyUsagePhase(ctx, tx, out, newUsagePhaseCache())
+	phase, reason, round, stage, err := classifyUsagePhase(ctx, tx, out, newUsagePhaseCache())
 	if err != nil {
 		return out, err
 	}
-	out.Phase, out.ReviewRound = phase, round
+	out.Phase, out.ReviewRound, out.ReviewStage = phase, round, stage
 	if !invalid || reason != usageNoOpenOrder {
 		out.PhaseReason = reason
 	}
@@ -299,12 +299,20 @@ func (c *usagePhaseCache) message(ctx context.Context, q queryRower, ref api.Mes
 	c.messages[key] = &m
 	return &m, nil
 }
+
+// review reads an item's ledger for phase rules. A ledger saved before
+// stages were recorded gets its stages derived on read with the rule
+// currentReviewStage stores at the next saved transition; nothing is written,
+// so no backfill is needed. Unknown history stays unstaged.
 func (c *usagePhaseCache) review(ctx context.Context, q queryRower, task, item string) (api.ReviewConvergence, error) {
 	key := task + "/" + item
 	if state, ok := c.reviews[key]; ok {
 		return state, nil
 	}
 	state, err := reviewState(ctx, q, task, item)
+	if err == nil && state.History != "unknown" && len(state.Stages) == 0 && len(state.Scopes) > 1 {
+		state.Stages, err = legacyReviewStages(ctx, q, task, state)
+	}
 	if err == nil {
 		c.reviews[key] = state
 	}
@@ -323,13 +331,13 @@ func usageOrderKind(m *api.Message) bool {
 // the moment it was posted until the agent's outcome closed it. Messages the
 // agent wrote never govern. It reads only fields a stored projection keeps, so
 // ingest and every report apply the same rule.
-func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection, c *usagePhaseCache) (string, string, int, error) {
+func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection, c *usagePhaseCache) (string, string, int, int, error) {
 	if p.Role == "database_handler" {
-		return "handler bookkeeping", "authoritative handler role", 0, nil
+		return "handler bookkeeping", "authoritative handler role", 0, 0, nil
 	}
 	orders, err := c.agentOrders(ctx, q, p.AgentID)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", 0, 0, err
 	}
 	at := p.Turn.At
 	strong := func(o *usageOrder) bool { return o.kind == "assign" || o.kind == "review" }
@@ -356,7 +364,7 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 	reason := usageNoOpenOrder
 	if open != nil {
 		if selected, err = c.message(ctx, q, open.ref); err != nil {
-			return "", "", 0, err
+			return "", "", 0, 0, err
 		}
 		if !usageOrderKind(selected) {
 			selected = nil
@@ -373,7 +381,7 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 		for _, ref := range p.Evidence {
 			m, err := c.message(ctx, q, ref)
 			if err != nil {
-				return "", "", 0, err
+				return "", "", 0, 0, err
 			}
 			if !usageOrderKind(m) || m.To != p.AgentID || windowed[ref.TaskID+"/"+stringID(ref.Seq)] {
 				continue
@@ -392,7 +400,7 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 			}
 		}
 		if selected == nil {
-			return "hand-offs", reason, 0, nil
+			return "hand-offs", reason, 0, 0, nil
 		}
 		reason = "handled request " + stringID(selected.Seq)
 	}
@@ -401,29 +409,29 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 	general := e.Review != nil && e.Review.Mode == "general"
 	switch {
 	case focused || p.Role == "verifier":
-		return "verification", reason, 0, nil
+		return "verification", reason, 0, 0, nil
 	case e.Kind == "review" || general || p.Role == "reviewer":
-		round := 0
+		round, stage := 0, 0
 		for _, share := range p.Shares {
 			if share.ItemID == "" {
 				continue
 			}
 			state, err := c.review(ctx, q, share.TaskID, share.ItemID)
 			if err != nil {
-				return "", "", 0, err
+				return "", "", 0, 0, err
 			}
 			for _, r := range state.Rounds {
 				if r.RequestSeq == selected.Seq || r.ActiveRequestSeq == selected.Seq {
-					round = r.Number
+					round, stage = r.Number, reviewRoundStage(state, r)
 				}
 			}
 		}
 		if round == 0 {
 			reason += "; review round unavailable"
 		}
-		return "review", reason, round, nil
+		return "review", reason, round, stage, nil
 	case p.Role == "planner" || e.Refs["phase"] == "planning" || e.Refs["phase"] == "intake":
-		return "intake and planning", reason, 0, nil
+		return "intake and planning", reason, 0, 0, nil
 	case e.Kind == "assign":
 		for _, share := range p.Shares {
 			if share.ItemID == "" {
@@ -431,7 +439,7 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 			}
 			state, err := c.review(ctx, q, share.TaskID, share.ItemID)
 			if err != nil {
-				return "", "", 0, err
+				return "", "", 0, 0, err
 			}
 			// Blockers count inside the review stage that holds this ASSIGN.
 			var stage int64
@@ -442,13 +450,29 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 			}
 			for _, r := range state.Rounds {
 				if r.RequestSeq >= stage && r.ResultSeq > 0 && r.ResultSeq < selected.Seq && len(r.Blockers) > 0 {
-					return "corrections", reason, 0, nil
+					return "corrections", reason, 0, 0, nil
 				}
 			}
 		}
-		return "build", reason, 0, nil
+		return "build", reason, 0, 0, nil
 	}
-	return "hand-offs", reason, 0, nil
+	return "hand-offs", reason, 0, 0, nil
+}
+
+// reviewRoundStage is the number of the stage that holds round r, or 0 when
+// the ledger has fewer than two stages. The boundary is CurrentStage's: a
+// round belongs to the last stage whose ASSIGN does not follow its request.
+func reviewRoundStage(state api.ReviewConvergence, r api.ReviewRound) int {
+	if len(state.Stages) < 2 {
+		return 0
+	}
+	stage := state.Stages[0].Number
+	for _, st := range state.Stages {
+		if st.AssignmentSeq <= r.RequestSeq {
+			stage = st.Number
+		}
+	}
+	return stage
 }
 
 // usageTurnPartial is the report's rule for a turn that makes its item's

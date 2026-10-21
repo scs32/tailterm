@@ -37,6 +37,7 @@ type usageSpanPiece struct {
 	Shares      []api.UsageAttribution `json:"shares"`
 	Phase       string                 `json:"phase"`
 	ReviewRound int                    `json:"reviewRound,omitempty"`
+	ReviewStage int                    `json:"reviewStage,omitempty"`
 	Role        string                 `json:"role"`
 }
 type usageSpanProjection struct {
@@ -154,10 +155,10 @@ func projectUsageSpan(ctx context.Context, tx *sql.Tx, task, agent, run string, 
 			// request in it resolves the same.
 			out.Evidence = append(out.Evidence[:0], p.Evidence...)
 		}
-		piece := usageSpanPiece{From: segment.From, To: segment.To, Shares: p.Shares, Phase: p.Phase, ReviewRound: p.ReviewRound, Role: p.Role}
+		piece := usageSpanPiece{From: segment.From, To: segment.To, Shares: p.Shares, Phase: p.Phase, ReviewRound: p.ReviewRound, ReviewStage: p.ReviewStage, Role: p.Role}
 		if n := len(out.Pieces); n > 0 {
 			last := &out.Pieces[n-1]
-			if last.To.Equal(piece.From) && last.Phase == piece.Phase && last.ReviewRound == piece.ReviewRound && last.Role == piece.Role && reflect.DeepEqual(last.Shares, piece.Shares) {
+			if last.To.Equal(piece.From) && last.Phase == piece.Phase && last.ReviewRound == piece.ReviewRound && last.ReviewStage == piece.ReviewStage && last.Role == piece.Role && reflect.DeepEqual(last.Shares, piece.Shares) {
 				last.To = piece.To
 				continue
 			}
@@ -174,8 +175,8 @@ func projectUsageSpan(ctx context.Context, tx *sql.Tx, task, agent, run string, 
 // one piece that classify alike stay one stretch.
 func spanPhases(ctx context.Context, q queryRower, agent, run string, span api.UsageSpan, projection usageSpanProjection, evidence []api.MessageReference, cache *usagePhaseCache) ([]usageSpanPiece, error) {
 	type phase struct {
-		name  string
-		round int
+		name         string
+		round, stage int
 	}
 	classified := map[time.Time]phase{}
 	out := []usageSpanPiece{}
@@ -188,19 +189,19 @@ func spanPhases(ctx context.Context, q queryRower, agent, run string, span api.U
 			key := segment.At.UTC()
 			c, ok := classified[key]
 			if !ok {
-				name, _, round, err := classifyUsagePhase(ctx, q, api.UsageProjection{Turn: api.UsageTurn{At: segment.At}, AgentID: agent, RunID: run, Role: p.Role, Shares: p.Shares, Evidence: evidence}, cache)
+				name, _, round, stage, err := classifyUsagePhase(ctx, q, api.UsageProjection{Turn: api.UsageTurn{At: segment.At}, AgentID: agent, RunID: run, Role: p.Role, Shares: p.Shares, Evidence: evidence}, cache)
 				if err != nil {
 					return nil, err
 				}
-				c = phase{name, round}
+				c = phase{name, round, stage}
 				classified[key] = c
 			}
-			if n := len(out); n > first && out[n-1].To.Equal(segment.From) && out[n-1].Phase == c.name && out[n-1].ReviewRound == c.round {
+			if n := len(out); n > first && out[n-1].To.Equal(segment.From) && out[n-1].Phase == c.name && out[n-1].ReviewRound == c.round && out[n-1].ReviewStage == c.stage {
 				out[n-1].To = segment.To
 				continue
 			}
 			piece := p
-			piece.From, piece.To, piece.Phase, piece.ReviewRound = segment.From, segment.To, c.name, c.round
+			piece.From, piece.To, piece.Phase, piece.ReviewRound, piece.ReviewStage = segment.From, segment.To, c.name, c.round, c.stage
 			out = append(out, piece)
 		}
 	}
@@ -304,10 +305,15 @@ func spanLength(in [][2]time.Time) (total time.Duration) {
 	return total
 }
 
-// usagePhaseKey is the phase label the token ledger groups by.
-func usagePhaseKey(phase string, round int) string {
+// usagePhaseKey is the phase label the token ledger groups by. Rounds restart
+// at 1 in each review stage, so an item with two or more stages (stage > 0)
+// keys review by stage and round.
+func usagePhaseKey(phase string, stage, round int) string {
 	if phase != "review" {
 		return phase
+	}
+	if round > 0 && stage > 0 {
+		return phase + " stage " + strconv.Itoa(stage) + " round " + strconv.Itoa(round)
 	}
 	if round > 0 {
 		return phase + " round " + strconv.Itoa(round)
@@ -543,7 +549,7 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 				}
 				a := agentOf(share.ItemID, agent)
 				if ok {
-					piece := timePiece{from: from, to: to, den: share.Denominator, phase: usagePhaseKey(p.Phase, p.ReviewRound), role: p.Role}
+					piece := timePiece{from: from, to: to, den: share.Denominator, phase: usagePhaseKey(p.Phase, p.ReviewStage, p.ReviewRound), role: p.Role}
 					if span.Unavailable {
 						piece.unmeasured = [][2]time.Time{{from, to}}
 					} else {
