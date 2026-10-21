@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -218,8 +221,10 @@ func retainQueueKeys[V any](entries map[string]V, hub string, keep func(task, en
 
 // changedFilesBook caches each accepted entry's changed-file list by its
 // acceptance base and commit, so narrowing runs Git once per acceptance, not
-// every tick. A Git error is cached too: narrowing is an optimization, and a
-// new acceptance commit tries again.
+// every tick. A deterministic Git error is cached too: narrowing is an
+// optimization, and a new acceptance base or commit tries again. A transient
+// error, such as a diff cut short by the tick's expired context, is not
+// cached, so the next pass runs the diff again.
 type changedFilesBook struct {
 	mu      sync.Mutex
 	entries map[string]*changedFilesState
@@ -1230,7 +1235,9 @@ func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEn
 		}
 		files, err := changed(ctx, q.Repository, q.Acceptance.BaseCommit, q.Acceptance.Commit)
 		diff = &changedFilesState{base: q.Acceptance.BaseCommit, commit: q.Acceptance.Commit, files: files, err: err}
-		r.changedFiles.save(key, diff)
+		if err == nil || gitFailed(ctx, err) {
+			r.changedFiles.save(key, diff)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[tt relay] team queue %s: narrowing skipped: %v\n", q.ID, err)
 		}
@@ -1249,6 +1256,14 @@ func (r teamRunner) narrow(ctx context.Context, c *api.Client, q api.TeamQueueEn
 		return q
 	}
 	return narrowed
+}
+
+// gitFailed reports a diff error Git decided itself: it exited non-zero while
+// the tick's context was still live. A cancelled or expired context, a signal
+// or a failure to start Git may pass on the next tick.
+func gitFailed(ctx context.Context, err error) bool {
+	var exit *exec.ExitError
+	return ctx.Err() == nil && errors.As(err, &exit) && exit.ExitCode() > 0
 }
 
 // noticeStalls posts one Board notice for each stall the hub explains on this
@@ -1310,8 +1325,9 @@ func queueCwds(entries []api.TeamQueueEntry) []string {
 // first, so an unreleasable entry costs no hub write per tick; the hub
 // repeats the exact release checks. task reads the project's detail, which
 // the tick shares across the pass's failed entries. A local error building
-// the release is returned once per message while it repeats; a hub error is
-// always returned.
+// the release is returned once per message while it repeats. A hub error,
+// including a transport fault or ended context on a hub call, is returned on
+// every pass.
 func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string, task func() (api.TaskDetail, error)) error {
 	if q.Host != host {
 		return nil
@@ -1335,15 +1351,18 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 	defer unlockQueueLaunch(lock)
 	key := launchRetryKey(c.Base, q.TaskID, q.ID)
 	req, unlock, err := queueReleaseRequest(ctx, c, e.hub, q.TaskID, q, true)
-	var response *api.HTTPError
-	if err != nil && !errors.As(err, &response) {
+	if err != nil && !hubFault(err) {
 		if !r.releaseErrors.changed(key, err.Error()) {
 			return nil // Reported when it first appeared.
 		}
 		return err
 	}
 	r.releaseErrors.drop(key)
+	var response *api.HTTPError
 	if err != nil {
+		if !errors.As(err, &response) {
+			err = fmt.Errorf("hub: %w", err) // A transport fault reads as the hub's.
+		}
 		return err
 	}
 	defer unlock()
@@ -1352,6 +1371,16 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 		return nil // The list names what still holds the entry.
 	}
 	return err
+}
+
+// hubFault reports an error from a hub call: the hub's response, or a
+// transport fault or ended context that kept one from arriving.
+func hubFault(err error) bool {
+	var response *api.HTTPError
+	var transport *url.Error
+	var network net.Error
+	return errors.As(err, &response) || errors.As(err, &transport) || errors.As(err, &network) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // projectAgentCapPrefix starts the hub's reason for holding a team that does

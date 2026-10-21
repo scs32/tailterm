@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -3920,4 +3922,149 @@ func TestTeamRunnerFailedReleaseReadsTaskOncePerPassAndReportsErrorsOnce(t *test
 	if len(runner.releaseErrors.entries) != 0 {
 		t.Fatalf("release errors kept %d entries", len(runner.releaseErrors.entries))
 	}
+}
+
+// wi_ec5791a8d911ca45 e1: narrowing caches only a deterministic Git failure,
+// one Git decided by exiting non-zero while the tick's context was live. A
+// diff cut short by a cancelled or expired context, or any other transient
+// error, is retried on the next pass, and a cached failure is retried when
+// the acceptance commit changes. The fake hub sees no call: ownership is
+// already narrow.
+func TestTeamRunnerNarrowRetriesTransientDiffErrors(t *testing.T) {
+	root, base := queueGitRepo(t)
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "a"), []byte("a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, root, "add", "src/a")
+	gitFixtureCommand(t, root, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "-m", "change")
+	good := gitFixtureCommand(t, root, "rev-parse", "HEAD")
+	missing := strings.Repeat("f", 40)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("narrowing called the hub: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diffs := 0
+	var fault error  // returned instead of running Git
+	var after func() // runs after Git, before narrow classifies its error
+	runner := teamRunner{changedFiles: &changedFilesBook{}, changed: func(ctx context.Context, repository, from, to string) ([]string, error) {
+		diffs++
+		if fault != nil {
+			return nil, fault
+		}
+		files, err := queueChangedFiles(ctx, repository, from, to)
+		if after != nil {
+			after()
+		}
+		return files, err
+	}}
+	q := api.TeamQueueEntry{ID: "tqe_narrow", TaskID: "tsk_narrow", Revision: 1, State: "running", Repository: filepath.Join(root, ".git"), Ownership: []string{"src/a"}}
+	key := launchRetryKey(c.Base, q.TaskID, q.ID)
+	pass := func(step string, ctx context.Context, commit string, wantDiffs int, wantCached bool) *changedFilesState {
+		t.Helper()
+		q.Acceptance = &api.TeamIntegrationAcceptance{BaseCommit: base, Commit: commit}
+		if got := runner.narrow(ctx, c, q); got.Revision != q.Revision || !sameOwnership(got.Ownership, q.Ownership) {
+			t.Fatalf("%s: narrowing changed the entry: %+v", step, got)
+		}
+		state, cached := runner.changedFiles.lookup(key, base, commit)
+		if diffs != wantDiffs || cached != wantCached {
+			t.Fatalf("%s: diffs=%d cached=%v, want diffs=%d cached=%v", step, diffs, cached, wantDiffs, wantCached)
+		}
+		return state
+	}
+	live := context.Background()
+	cancelled, cancel := context.WithCancel(live)
+	cancel()
+	expired, cancelExpired := context.WithDeadline(live, time.Now().Add(-time.Second))
+	defer cancelExpired()
+	pass("cancelled context", cancelled, good, 1, false)
+	pass("expired context", expired, good, 2, false)
+	if state := pass("live retry", live, good, 3, true); state.err != nil || !sameOwnership(state.files, []string{"src/a"}) {
+		t.Fatalf("live diff cached %+v", state)
+	}
+	pass("cached success", live, good, 3, true)
+	// Git exits non-zero, but the tick's context ended while it ran.
+	ending, end := context.WithCancel(live)
+	after = end
+	pass("context ended during a failing diff", ending, missing, 4, false)
+	after = nil
+	fault = errors.New("fork/exec git: resource temporarily unavailable")
+	pass("transient start failure", live, missing, 5, false)
+	fault = nil
+	state := pass("deterministic failure", live, missing, 6, true)
+	var exit *exec.ExitError
+	if !errors.As(state.err, &exit) || exit.ExitCode() <= 0 {
+		t.Fatalf("cached failure is not a Git exit: %v", state.err)
+	}
+	pass("cached deterministic failure", live, missing, 6, true)
+	pass("new acceptance commit", live, good, 7, true)
+}
+
+// wi_ec5791a8d911ca45 e2: a transport fault on a hub call inside a failed
+// entry's release is a hub fault. It is returned on every pass and never
+// muted, while a local error repeating with the same message is still
+// returned once per change. The fake hub drops the release's entry fetch.
+func TestTeamRunnerFailedReleaseReturnsHubTransportFaultEveryPass(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	var fetches atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/v1/tasks/tsk_release/team-queue/tqe_release" {
+			fetches.Add(1)
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
+		t.Errorf("unexpected hub call %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	host := spawn.Host()
+	const uncertain = `{"members":[{"state":"uncertain","fields":{"agentId":"agt_0123456789abcdef","name":"uncertain-member"}}]}`
+	q := api.TeamQueueEntry{ID: "tqe_release", TaskID: "tsk_release", ItemID: "wi_release", Host: host, State: "failed", Revision: 3, LaunchJSON: json.RawMessage(uncertain)}
+	task := func() (api.TaskDetail, error) {
+		return api.TaskDetail{Task: api.Task{ID: q.TaskID, Status: api.TaskOpen, PauseState: api.ProjectPauseActive}}, nil
+	}
+	runner := teamRunner{releaseErrors: &releaseErrorBook{}}
+	e := env{hub: srv.URL, task: q.TaskID}
+	wantHubFault := func(pass string) {
+		t.Helper()
+		before := fetches.Load()
+		err := runner.releaseFailed(ctx, e, c, q, host, task)
+		var transport *url.Error
+		if err == nil || !errors.As(err, &transport) || !strings.HasPrefix(err.Error(), "hub: ") {
+			t.Fatalf("%s: want a hub transport fault, got %v", pass, err)
+		}
+		if fetches.Load() == before {
+			t.Fatalf("%s: the release did not fetch the entry", pass)
+		}
+		if len(runner.releaseErrors.entries) != 0 {
+			t.Fatalf("%s: hub fault left %d release error entries", pass, len(runner.releaseErrors.entries))
+		}
+	}
+	wantHubFault("first pass")
+	wantHubFault("second pass")
+	q.LaunchJSON = json.RawMessage(`"not a journal"`)
+	for i, want := range []bool{true, false, false} {
+		err := runner.releaseFailed(ctx, e, c, q, host, task)
+		if (err != nil) != want || (err != nil && !strings.Contains(err.Error(), "failed queue launch journal is invalid")) {
+			t.Fatalf("local pass %d: %v, want returned=%v", i, err, want)
+		}
+	}
+	// The local error stopped repeating, so the book forgets it.
+	q.LaunchJSON = json.RawMessage(uncertain)
+	wantHubFault("hub fault after a local error")
 }
