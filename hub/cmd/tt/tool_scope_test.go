@@ -1552,16 +1552,27 @@ func TestToolScopeLateCheckRow(t *testing.T) {
 // p90 154 ms, max 228 ms). So the race branch gives the hook's deadline
 // 3 s (21 times that median) and the scan budget 2 s (14 times), and allows
 // 25 ms of added cost; the same rows are required.
+//
+// Each limit holds on a host as quick as the one that set it, and grows with
+// the case's measured baseline median on a slower one: see
+// toolScopeCostLimit. A loaded host slows the check with the hook, so a fixed
+// limit failed runs whose check was no costlier than usual. A release run
+// under -race measured a 443 ms baseline, 3.2 times the 137 ms above, and an
+// added 65 ms against the 25 ms limit; it passed when run again. The plain
+// limit's calibration is the 11.2 ms median of 200 per-count baseline medians
+// in tailterm-artifacts/builder-95dcc90b/a3-ff17f00/scope-plain/run.log,
+// GOMAXPROCS=2 on the Mini, where the added cost had p99 2.3 ms; under -race
+// it had p99 9.9 ms.
 func TestToolScopeCost(t *testing.T) {
 	const runs = 100
-	limit := 5 * time.Millisecond
+	limit, calibrated := 5*time.Millisecond, 11200*time.Microsecond
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
 			if setting.Key == "-race" && setting.Value == "true" {
-				limit = 25 * time.Millisecond
+				limit, calibrated = 25*time.Millisecond, 137*time.Millisecond
 				setToolLedger(t, &toolLedgerDeadline, 20*toolLedgerDeadline)     // 3 s, at least 10 times the 139 ms race median
 				setToolLedger(t, &toolRedactScanBudget, 20*toolRedactScanBudget) // 2 s
-				t.Logf("race detector on: the added-cost limit is %v, the hook deadline %v and the scan budget %v", limit, toolLedgerDeadline, toolRedactScanBudget)
+				t.Logf("race detector on: the added-cost limit is %v on a quick host, the hook deadline %v and the scan budget %v", limit, toolLedgerDeadline, toolRedactScanBudget)
 			}
 		}
 	}
@@ -1656,11 +1667,57 @@ func TestToolScopeCost(t *testing.T) {
 				t.Logf("%d attempt(s) with the check were put down to a stalled host and run again; the cap is %d", late, maxStalled)
 			}
 			base, checked := toolDenyMedian(without), toolDenyMedian(with)
-			t.Logf("%d-byte input: baseline median %v, with the check %v, added %v, worst run with the check %v", len(payload), base, checked, checked-base, worst)
-			if checked-base >= limit {
-				t.Fatalf("the check adds %v to the median hook; want under %v", checked-base, limit)
+			bound := toolScopeCostLimit(limit, calibrated, base)
+			t.Logf("%d-byte input: baseline median %v, with the check %v, added %v (limit %v), worst run with the check %v", len(payload), base, checked, checked-base, bound, worst)
+			if checked-base >= bound {
+				t.Fatalf("the check adds %v to the median hook, over a baseline median of %v; want under %v", checked-base, base, bound)
 			}
 		})
+	}
+}
+
+// toolScopeCostLimit is the added cost TestToolScopeCost allows over a
+// baseline median of base. On a host as quick as the calibration, whose
+// 1 MiB baseline median was calibrated, it is limit. On a slower one it is
+// the same fraction of base, limit/calibrated: 45% plain (5 ms of 11.2 ms)
+// and 18% under -race (25 ms of 137 ms). A check that adds more than that
+// fraction, or more than limit to a quick host's hook, still fails. The small
+// cases' baselines are well under a millisecond, so limit applies to them.
+func toolScopeCostLimit(limit, calibrated, base time.Duration) time.Duration {
+	return max(limit, time.Duration(int64(base)*int64(limit)/int64(calibrated)))
+}
+
+func TestToolScopeCostLimit(t *testing.T) {
+	const plain, race = 11200 * time.Microsecond, 137 * time.Millisecond
+	ms := func(f float64) time.Duration { return time.Duration(f * float64(time.Millisecond)) }
+	for _, c := range []struct {
+		name              string
+		limit, calibrated time.Duration
+		base, checked     time.Duration
+		want              time.Duration
+		pass              bool
+	}{
+		{"plain, small case", 5 * time.Millisecond, plain, ms(0.2), ms(1.6), 5 * time.Millisecond, true},
+		{"plain, quicker than the calibration", 5 * time.Millisecond, plain, ms(8), ms(12.9), 5 * time.Millisecond, true},
+		{"plain, calibrated host, real cost", 5 * time.Millisecond, plain, plain, plain + ms(5), 5 * time.Millisecond, false},
+		{"plain, twice as slow", 5 * time.Millisecond, plain, 2 * plain, 2*plain + ms(9.9), 10 * time.Millisecond, true},
+		{"plain, twice as slow, real cost", 5 * time.Millisecond, plain, 2 * plain, 2*plain + ms(10), 10 * time.Millisecond, false},
+		// A matrix run under memory pressure: 12.30 ms baseline, added 6.61 ms.
+		{"plain, first sighting", 5 * time.Millisecond, plain, ms(12.295333), ms(18.902042), ms(5.489), false},
+		{"race, small case", 25 * time.Millisecond, race, ms(0.3), ms(1.5), 25 * time.Millisecond, true},
+		{"race, calibrated host", 25 * time.Millisecond, race, race, race + ms(24.9), 25 * time.Millisecond, true},
+		{"race, calibrated host, real cost", 25 * time.Millisecond, race, race, race + ms(25), 25 * time.Millisecond, false},
+		// A release run: 443.24 ms baseline, 508.69 ms with the check.
+		{"race, second sighting", 25 * time.Millisecond, race, ms(443.24425), ms(508.686584), ms(80.884), true},
+		{"race, second sighting's host, real cost", 25 * time.Millisecond, race, ms(443.24425), ms(443.24425 + 81), ms(80.884), false},
+	} {
+		got := toolScopeCostLimit(c.limit, c.calibrated, c.base)
+		if got.Round(time.Microsecond) != c.want {
+			t.Errorf("%s: limit %v; want %v", c.name, got, c.want)
+		}
+		if pass := c.checked-c.base < got; pass != c.pass {
+			t.Errorf("%s: added %v against the limit %v passes = %v; want %v", c.name, c.checked-c.base, got, pass, c.pass)
+		}
 	}
 }
 
