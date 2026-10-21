@@ -1502,12 +1502,19 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if err != nil {
 			return out, err
 		}
+		// One primary's unreadable activity snapshot must not fail the list
+		// for every project on the host. That project is listed as busy, with
+		// the error as its activity, so the runner neither rotates nor
+		// replaces it; prepare and commit still fail on the same snapshot.
 		var busy handlerBusy
+		var unreadable error
 		if exited {
-			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); err != nil {
+			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); unreadableActivity(err) {
+				unreadable = err
+			} else if err != nil {
 				return out, err
 			}
-			exited = policy.DeadSilenceMinutes > 0 && !busy.idle()
+			exited = policy.DeadSilenceMinutes > 0 && (unreadable != nil || !busy.idle())
 		}
 		if !exited {
 			primary, err = primaryHandler(ctx, s.db, t)
@@ -1517,7 +1524,10 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 			if err != nil {
 				return out, err
 			}
-			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); err != nil {
+			unreadable = nil
+			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); unreadableActivity(err) {
+				unreadable = err
+			} else if err != nil {
 				return out, err
 			}
 		}
@@ -1528,11 +1538,11 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND handler_id=? AND handler_run_id=? AND state='finished'`, t.ID, primary.ID, primary.RunID).Scan(&d.FinishedItems); err != nil {
 			return out, err
 		}
-		d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), busy.idle()
+		d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), unreadable == nil && busy.idle()
 		now := s.now()
 		d.Online = handlerSeenWithin(primary, now)
-		d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle
-		if !policy.Enabled && !d.DeadCandidate {
+		d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle && unreadable == nil
+		if !policy.Enabled && !d.DeadCandidate && unreadable == nil {
 			continue
 		}
 		if !d.Online {
@@ -1554,7 +1564,11 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 				d.SilenceMet = d.DeadCandidate && now.Sub(last) >= time.Duration(policy.DeadSilenceMinutes)*time.Minute
 			}
 		}
-		if err = s.loadActivity(ctx, &d.Agent); err != nil {
+		if err = s.loadActivity(ctx, &d.Agent); unreadableActivity(err) {
+			if unreadable == nil {
+				unreadable = err
+			}
+		} else if err != nil {
 			return out, err
 		}
 		if d.Agent.Activity != nil {
@@ -1574,6 +1588,10 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		}
 		if policy.Enabled && policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
 			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTemplate)
+		}
+		if unreadable != nil {
+			d.ActivityState = "unreadable: " + unreadable.Error()
+			d.Idle, d.DeadCandidate, d.SilenceMet, d.DueReasons = false, false, false, []string{}
 		}
 		if d.OpenRotation, err = openHandlerRotation(ctx, s.db, t.ID); err != nil {
 			return out, err

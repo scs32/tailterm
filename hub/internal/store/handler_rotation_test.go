@@ -2528,3 +2528,123 @@ func TestHandlerRotationIdleExitedPrimaryLeavesActingHandlerToParentPath(t *test
 		t.Fatalf("busy exited primary: %+v %v", r, err)
 	}
 }
+
+// wi_c39902fd7463c26d (order #41851): one primary's unreadable activity
+// snapshot does not fail the due list for every project on the host. That
+// project is listed as busy and named; rotation prepare and commit still fail
+// on the same snapshot.
+func TestHandlerRotationDueListUnreadableActivityOfOnePrimary(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	s := f.s
+	healthy, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Healthy rotation fixture"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.AddAgent(ctx, healthy.ID, api.AddAgentRequest{Name: "healthy-database", Role: api.AgentRoleDatabaseHandler, AgentID: api.NewID("agt"), Host: "mini", Session: "healthy"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.PostEvent(ctx, healthy.ID, api.PostEventRequest{AgentID: h.ID, RunID: h.RunID, Kind: api.EventStarted}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err = s.ReportActivity(ctx, healthy.ID, h.ID, api.ActivityReport{RequestID: "healthy-idle", RunID: h.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: now, LastEventAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range []string{healthy.ID, f.task.ID} {
+		if _, err = s.SetHandlerRotationPolicy(ctx, task, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The stored state reads idle; only the payload does not parse.
+	if _, err = s.db.Exec(`UPDATE agent_activity SET state='idle',payload='{not json' WHERE agent_id=? AND run_id=?`, f.old.ID, f.old.RunID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.HandlerRotationsDue(ctx, "mini", "bbbb")
+	if err != nil || len(list.Entries) != 2 {
+		t.Fatalf("due with one unreadable primary: %+v %v", list, err)
+	}
+	byTask := map[string]api.HandlerRotationDue{}
+	for _, d := range list.Entries {
+		byTask[d.TaskID] = d
+	}
+	if d := byTask[healthy.ID]; d.Agent.ID != h.ID || !d.Idle || d.ActivityState != "idle" || !reflect.DeepEqual(d.DueReasons, []string{"template"}) {
+		t.Fatalf("healthy project: %+v", d)
+	}
+	d := byTask[f.task.ID]
+	if d.Agent.ID != f.old.ID || d.Idle || d.DeadCandidate || d.SilenceMet || d.DueReasons == nil || len(d.DueReasons) != 0 ||
+		!strings.HasPrefix(d.ActivityState, "unreadable: activity snapshot: invalid character 'n'") {
+		t.Fatalf("unreadable project: %+v", d)
+	}
+	// Prepare is unchanged: it reads the snapshot, fails and saves nothing.
+	if _, err = f.prepare(t, "unreadable-prepare", api.Agent{}, ""); err == nil || !strings.HasPrefix(err.Error(), "activity snapshot: ") {
+		t.Fatalf("prepare on an unreadable snapshot: %v", err)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM handler_rotations WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("an unreadable primary was rotated: %d rotations", n)
+	}
+	// Commit is unchanged: prepared while readable, it fails once the
+	// snapshot is not, and the rotation stays prepared.
+	if _, err = s.db.Exec(`UPDATE agent_activity SET payload='{}' WHERE agent_id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.prepare(t, "unreadable-commit-prepare", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`UPDATE agent_activity SET payload='{not json' WHERE agent_id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.commit(r, "unreadable-commit"); err == nil || !strings.HasPrefix(err.Error(), "activity snapshot: ") {
+		t.Fatalf("commit on an unreadable snapshot: %v", err)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM handler_rotations WHERE task_id=? AND state='prepared'`, f.task.ID); n != 1 {
+		t.Fatalf("commit on an unreadable snapshot changed the rotation: %d prepared", n)
+	}
+	// Any other error still fails the list.
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err = s.HandlerRotationsDue(canceled, "mini", "bbbb"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a database error was swallowed: %v", err)
+	}
+}
+
+// The same holds for an offline busy primary and an exited one: unreadable,
+// it is listed and named, never a dead primary candidate, even with the limit
+// policy off.
+func TestHandlerRotationDueListUnreadableDeadAndExitedPrimary(t *testing.T) {
+	for _, exited := range []bool{false, true} {
+		f := newDeadPrimaryFixture(t)
+		ctx := context.Background()
+		s := f.s
+		status := api.AgentRunning
+		if exited {
+			// The wrapper reports the exit while the run is still heard from.
+			f.advance(2 * time.Minute)
+			f.exit(t, 1)
+			status = api.AgentExited
+		}
+		if _, err := s.db.Exec(`UPDATE agent_activity SET payload='{"observedAt":5}' WHERE agent_id=?`, f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+		check := func(what string) {
+			t.Helper()
+			list, err := s.HandlerRotationsDue(ctx, "mini", "")
+			if err != nil || len(list.Entries) != 1 {
+				t.Fatalf("exited=%v %s: %+v %v", exited, what, list, err)
+			}
+			d := list.Entries[0]
+			if d.Agent.ID != f.old.ID || d.Agent.Status != status || d.Online || d.Idle || d.DeadCandidate || d.SilenceMet || len(d.DueReasons) != 0 ||
+				!strings.HasPrefix(d.ActivityState, "unreadable: activity snapshot: ") {
+				t.Fatalf("exited=%v %s: %+v", exited, what, d)
+			}
+		}
+		f.advance(11 * time.Minute)
+		check("silent for the policy's minutes")
+		if _, err := s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{Enabled: false}); err != nil {
+			t.Fatal(err)
+		}
+		check("limit policy off")
+	}
+}
