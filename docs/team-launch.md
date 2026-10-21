@@ -550,8 +550,8 @@ cache entries that no build has used for a set time. The trim of the user's
 own Go build cache (`go env GOCACHE`), `goBuildCacheTrim`, is off by default
 and is turned on per host, by the owner. The trim of the harness-owned
 verification cache's build directories, `verificationCacheTrim`, is on by
-default and is turned off per host, by the owner; its root and lock rules are
-in `docs/objective-verification.md`. Both read that host's
+default and is turned off per host, by the owner; its root, lock and size cap
+rules are in `docs/objective-verification.md`. Both read that host's
 `~/.config/tailterm/relay.json` at each check:
 
 | Key | Default | Meaning |
@@ -561,6 +561,7 @@ in `docs/objective-verification.md`. Both read that host's
 | `goBuildCacheTrimInterval` | `"1h"` | Time between trims, a Go duration; at least `5m`. |
 | `verificationCacheTrim` | absent, which is on | `"off"` turns the verification cache trim off for this host; `"on"` or no key is on. It runs once per sweep pass (`worktreeSweepInterval`). |
 | `verificationCacheTrimMaxAge` | `"24h"` | Verification build entries whose modification time is older than this go. A Go duration; at least `2h`. |
+| `verificationCacheTrimMaxGiB` | `20` | Size cap, in GiB, of the verification build directories: above it the oldest entries older than 2h also go. A positive JSON number; a bad value uses 20 GiB. |
 
 `go` refreshes an entry's modification time when it uses the entry and the
 time is more than an hour old, which is why the age cannot be set under 2

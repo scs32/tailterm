@@ -29,6 +29,20 @@ the step `release-runner.mjs --provision-prerequisites` uses: npm ci when
 overwrites. This happens before the host lock and prints each path's action and
 sha256. It refuses when the main worktree lacks a file or the copy dirties the
 checkout. A dirty or non-worktree checkout is not provisioned.
+Provisioned WASM may be any age, so a plan with a browser check and no
+`wasm-test-build`, in a checkout that has `scripts/build-wasm.sh`, checks its
+freshness (wi_37750145fc63b2f6). `.build/wasm-sources.json` records the
+sha256 of the candidate's git tree of `wasm/` and `scripts/build-wasm.sh`
+(never mtime) and the sha256 of `wasm/tailserve.wasm`, `.build/test.wasm` and
+`.build/go-modules.txt`. After admission and before the prerequisites are read,
+the held run rebuilds with `bash scripts/build-wasm.sh --test` when that record
+is missing or invalid, names other sources, or no longer matches a file's
+bytes, then writes a new record and prints each rebuilt file's sha256; a
+current record prints `WASM prerequisites current for sources <digest>`. A
+failed rebuild, or one that changes the checkout, refuses the run before any
+check starts with `Stale WASM prerequisites (<cause>): <why>`, the rebuild log
+kept in the output directory as `wasm-prerequisite-rebuild.log`. A plan with
+`wasm-test-build` builds the WASM itself and reads no record.
 Six formerly Chromium-only entrypoints accept `TEST_BROWSER=chromium|webkit`.
 The WebKit microphone fixtures return a real oscillator-backed MediaStream;
 application recording and AudioWorklet processing remain real. Their prototype
@@ -361,9 +375,10 @@ the whole root.
 trim let `build/go1.26.6-darwin-arm64` reach 50 GB by 10-17 and the free-disk
 floor refused every queue launch. On each scheduled sweep pass (the
 `worktreeSweepInterval`, default 1h), the relay unlinks build entries untouched
-for longer than `verificationCacheTrimMaxAge` (default `24h`, floor `2h`).
-Go refreshes a used entry's mtime once it is an hour old, so anything a run used
-in the last day stays. The trim is on by default because the root is the
+for longer than `verificationCacheTrimMaxAge` (default `24h`, floor `2h`), then
+holds the build directories to a size cap (below). Go refreshes a used entry's
+mtime once it is an hour old, so under the cap anything a run used in the last
+day stays. The trim is on by default because the root is the
 harness's own. Set `"verificationCacheTrim": "off"` in
 `~/.config/tailterm/relay.json` to stop it; a value other than `on` or `off`,
 or a relay.json that cannot be read, skips the pass. It is separate from
@@ -381,17 +396,38 @@ or a relay.json that cannot be read, skips the pass. It is separate from
   `-d` files directly inside the two-hex directories. The README, `trim.txt`,
   `testexpire.txt`, the markers, `mod/`, `speech-model/` and `downloads/` are
   never touched.
-- **Lock rule.** Any holder or waiter in the matrix host lock skips the pass
-  (reason `matrix-lock`), and so does a refused lock path or a lock file that
-  cannot be read or trusted. The lock is read again before each two-hex
-  directory, so a run that registers mid-pass stops the walk at the next
-  one. In the directory already being trimmed, only entries untouched for a
-  day go, and Go takes a missing entry as a miss and rebuilds it.
+- **Lock rule.** The trim runs while matrix runs hold or wait for the host
+  lock (wi_f6ce509f2a4b31ed); the line then notes `trimmed while <n> matrix
+  run(s) hold or wait for the host lock`. Only a refused lock path or a lock
+  file that cannot be read or trusted skips the pass (reason `matrix-lock`),
+  since the runs it would name are unknown. The lock is read again before
+  each two-hex directory and every 256 removals by the size cap, and such a
+  lock stops the walk there (`stopped early: <why>`). Every removal, by age or
+  by the cap, needs two no-follow looks, the second just before the unlink,
+  to see a regular `-a` or `-d` file older than the bound, and no bound is
+  under 2h. Go refreshes a used entry's mtime once it is an hour old, so a
+  removed entry has gone unused by every build for at least an hour; Go takes
+  a missing entry as a miss and rebuilds it, so a concurrent run is slower at
+  worst, never wrong. A build directory whose name ends `.tmp` is never opened.
+- **Size cap.** After the age walk, while the build directories still hold
+  more than `verificationCacheTrimMaxGiB` (default 20 GiB), the trim removes
+  the entries the walk kept that are older than 2h, oldest mtime first, until
+  they fit. Entries used in the last two hours always stay; when only those
+  are left the line says `size cap <cap> not reached: the rest is under 2h`.
+  A pass that stopped early skips the cap. Low space does not start a trim or
+  change what goes: when the volume's free space is under the sweep's
+  `worktreeSweepLowSpaceGiB` as the cap begins, the cap's removals are named
+  `low-space` instead of `size-cap`.
 - **Receipt.** Each attempt writes one line to the sweep journal (`tt team
   queue sweep-worktrees --journal`) with source `go-cache-trim`, the root in
   `lowestVolume`, and either the entries removed and bytes freed or the skip
-  reason. The text form prints it as `verification-cache-trim root=<root>`.
-  The low-space notice carries the last trimmed run.
+  reason. A trimmed line's reason names the rules that removed at least one
+  entry, joined by `+` in this order: `age-bound`, or `lock-time-age` when a
+  read of the lock before or during the age walk showed a holder or waiter;
+  then `size-cap` or `low-space`. The text form prints it as
+  `verification-cache-trim root=<root> ... rule=<reason>`. The low-space
+  notice carries the last trimmed run, with the rule, age bound and cap when
+  the cap removed entries.
 
 **Speech model.** `scripts/package-speech-model.mjs` reads each file from
 `<root>/speech-model/`, then from the checkout's own `.build/speech-source/`
@@ -438,10 +474,12 @@ vaults and tmux identity, and assigns a disposable HOME/TMPDIR. Commands run wit
 argv arrays and repository-relative cwd. The receipt retains the absolute worktree,
 allowlisted environment, prerequisite digests, command start/end/duration, exit,
 external log path and exact SHA-256. When the plan builds WASM and has a WASM
-reader, the `wasm/tailserve.wasm` and `.build/test.wasm` prerequisite entries
-record the built digest as `sha256`, the pre-run digest as `priorSha256`, and
-`source: "wasm-test-build"`; a build that passes without writing one of them fails
-with `wasm-test-build passed without writing <path>`. Each browser check and
+reader, the `wasm/tailserve.wasm`, `.build/test.wasm` and `.build/go-modules.txt`
+prerequisite entries record the built digest as `sha256`, the pre-run digest as
+`priorSha256`, and `source: "wasm-test-build"`; a build that passes without
+writing one of them fails with `wasm-test-build passed without writing <path>`.
+`.build/go-modules.txt` is hashed again after all checks have finished, and a
+change fails the run with `WASM changed after wasm-test-build: <path>`. Each browser check and
 `00-static-build` records in `wasm` the `{ path, sha256 }` of the two WASM files,
 hashed just before it ran; a file it cannot read fails the run with
 `Unreadable WASM before <id>: <path>`. Those digests must equal the build's
@@ -1622,6 +1660,12 @@ bytes; the handler independently reproduces the plan and the store checks every
 linked bug exists, is a bug, and remains open/in progress/blocked. Closing or
 dismissing a linked bug removes eligibility for every other item until a new
 plan resolves the entry, and a new plan can never list a closed bug.
+
+`wasm-test-build` can never be listed (wi_fcc0892578a426b9). A failed build
+leaves the browser checks and `00-static-build` on the previous run's WASM with
+no built digest to compare them to, so excusing it would let them pass on
+stale files. A matrix whose `knownFailures` names it is refused with
+`wasm-test-build cannot be a known failure: browser readers would run on stale WASM`.
 
 One exception lets a bug close while the approved matrix still lists entries
 that name it (Feature `wi_6fb81e10c366d7b4`, order #14489). The bug's own done
