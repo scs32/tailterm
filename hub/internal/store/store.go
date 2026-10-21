@@ -1429,6 +1429,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if req.AgentID != "" && req.To == req.AgentID {
 		return api.Message{}, workItemConflict(selfAddressedMessage)
 	}
+	// A typed message may cite only receipts the hub holds for its items.
+	if err := checkReceiptRefs(ctx, tx, req); err != nil {
+		return api.Message{}, err
+	}
 	m, err := s.insertMessageWithResume(ctx, tx, t, req, target, by, false, ownerReply, !ownerReply)
 	if err != nil {
 		return m, err
