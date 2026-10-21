@@ -918,12 +918,13 @@ func (s *Store) TeamQueuesByHost(ctx context.Context, host string) (api.TeamQueu
 	if host == "" {
 		return api.TeamQueueList{}, api.ErrInvalid
 	}
-	// The host listing names the same entries as the active view. A failed
-	// entry the owner recorded as integrated still needs the runner's team
-	// close, cleanup and finish, and a failed, unreleased one its release
-	// check, even when it is its project's only entry on this host
-	// (wi_2079cf201c960a84).
-	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE host=? AND NOT `+queueHistorySQL+` ORDER BY task_id,position LIMIT 200`, host)
+	// A failed entry the owner recorded as integrated still needs the
+	// runner's team close, cleanup and finish. A failed, unreleased one
+	// needs its release check, even when it is its project's only entry on
+	// this host (wi_2079cf201c960a84), but only while its project is open:
+	// a closed project's entry can never be released, and the runner's
+	// census would post to that project.
+	rows, err := s.db.QueryContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE host=? AND (state IN ('queued','launching','running') OR (state='failed' AND owner_integration_json<>'') OR (state='failed' AND released_at='' AND task_id IN (SELECT id FROM tasks WHERE status=?))) ORDER BY task_id,position LIMIT 200`, host, api.TaskOpen)
 	if err != nil {
 		return api.TeamQueueList{}, err
 	}

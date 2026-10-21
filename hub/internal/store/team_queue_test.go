@@ -363,6 +363,21 @@ func TestTeamQueueHostListingNamesFailedUnreleasedEntry(t *testing.T) {
 	if got := hosted("mini"); !reflect.DeepEqual(got, []string{released.ID}) {
 		t.Fatalf("owner-integrated entry not listed: %v", got)
 	}
+	// A closed project's failed, unreleased entry can never be released, so
+	// it leaves the listing; its owner-integrated entry still needs closing.
+	stuck := insertHistoryEntries(t, s, task, 101, 1, []byte(`{}`), nil)[0]
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='failed' WHERE id=?`, stuck.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := hosted("mini"); !reflect.DeepEqual(got, []string{released.ID, stuck.ID}) {
+		t.Fatalf("open project listing %v", got)
+	}
+	if _, err := s.CloseTask(ctx, task.ID, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := hosted("mini"); !reflect.DeepEqual(got, []string{released.ID}) {
+		t.Fatalf("closed project listing %v, want only the owner-integrated entry", got)
+	}
 }
 
 func TestTeamQueueReleaseRejectsUncertainRunAndUnsafeProject(t *testing.T) {
