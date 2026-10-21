@@ -1372,7 +1372,7 @@ function groupDialog() {
             })
             .join("")}</div>`
         : ""
-    }<h3>Group with</h3><div class="group-choices">${others.map((g) => `<button data-merge="${g.tab.id}">▦ ${esc(tabName(g.tab, true))}${g.ids.length > 1 ? " · " + g.ids.length + " panes" : ""}</button>`).join("") || '<p class="fine">Open another terminal with + first.</p>'}</div><details class="dialog-details"><summary>Resizing & keyboard tips</summary><p class="fine">Drag dividers to resize. Focus a divider and use arrow keys; hold Shift for larger steps. Double-click or press Enter to reset that split. Closing a pane disconnects only that SSH connection; remote tmux keeps running.</p></details>`,
+    }<h3>Group with</h3><div class="group-choices">${inHome ? '<p class="fine">The owner helper stays alone in Home and is not grouped.</p>' : others.map((g) => `<button data-merge="${g.tab.id}">▦ ${esc(tabName(g.tab, true))}${g.ids.length > 1 ? " · " + g.ids.length + " panes" : ""}</button>`).join("") || '<p class="fine">Open another terminal with + first.</p>'}</div><details class="dialog-details"><summary>Resizing & keyboard tips</summary><p class="fine">Drag dividers to resize. Focus a divider and use arrow keys; hold Shift for larger steps. Double-click or press Enter to reset that split. Closing a pane disconnects only that SSH connection; remote tmux keeps running.</p></details>`,
   );
   $$("[data-separate]").forEach(
     (b) =>
@@ -3271,9 +3271,16 @@ function openCommands() {
         label: "Upload images",
         run: () => imageUploads.choose(),
       });
-    for (const other of visibleTabs().filter(
-      (x) => x.id !== t.id && !paneGroups.members(t.id).includes(x.id),
-    ))
+    // Home holds only the owner helper: it splits with nothing and nothing
+    // splits into it.
+    for (const other of paneGroups.inHome(t.id)
+      ? []
+      : visibleTabs().filter(
+          (x) =>
+            x.id !== t.id &&
+            !paneGroups.members(t.id).includes(x.id) &&
+            !paneGroups.inHome(x.id),
+        ))
       commands.push({
         label: `Split with: ${other.session || "SSH shell"} · ${other.server.name} #${other.number}`,
         run: () => paneGroups.merge(other.id, t.id, false),

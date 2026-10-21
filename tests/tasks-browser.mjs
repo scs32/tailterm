@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { openVault } from "../client/vault-crypto.js";
 import { leaves } from "../client/pane-layout.js";
 import { checkGroupAlone, checkHelperWindow } from "./pane-groups-browser.mjs";
+import { exerciseHomeSplitOffers } from "./workspace-controls-browser.mjs";
 
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
 // configuration, task creation with a spawned agent, mirroring of agents the
@@ -464,6 +465,11 @@ export async function exerciseTasks(page, hub, origin, ssh) {
   }
   await page.setViewportSize(viewport);
   await helperWindow("original width");
+  await exerciseHomeSplitOffers(page, {
+    helper: helperTab,
+    session: "helper-fx",
+    plain: plainId,
+  });
   // The same, while the launcher attach is still connecting.
   ssh.hold("helper-hold");
   ssh.sessions.add("helper-hold");

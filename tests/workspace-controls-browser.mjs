@@ -157,3 +157,95 @@ export async function exerciseWorkspaceControls(page) {
     `Workspace controls: ${checked} actual hover/focus states match Tailscale; dark/light, desktop/mobile, disabled controls checked.`,
   );
 }
+
+// Commands and Terminal groups with an owner helper bound in Home: the helper
+// splits and groups with nothing, and no other tab offers it as a target.
+// `helper` is the Home pane's tab id and `session` its tmux session; `plain`
+// is an ordinary tab alone in its group.
+export async function exerciseHomeSplitOffers(
+  page,
+  { helper, session, plain },
+) {
+  const palette = async () => {
+    await page.locator("#commands").click();
+    const labels = await page
+      .locator("#command-results button")
+      .allTextContents();
+    await page.keyboard.press("Escape");
+    await page.locator("#dialog").waitFor({ state: "hidden" });
+    return labels;
+  };
+  const groups = async () => {
+    await page.locator("#commands").click();
+    await page.locator("#command-query").fill("Manage terminal groups");
+    await page
+      .locator("#command-results button")
+      .filter({ hasText: "Manage terminal groups" })
+      .click();
+    await page
+      .locator("#dialog h3")
+      .filter({ hasText: "Group with" })
+      .waitFor();
+    const merge = await page
+      .locator("#dialog [data-merge]")
+      .evaluateAll((nodes) => nodes.map((n) => n.dataset.merge));
+    const text = await page
+      .locator("#dialog .group-choices")
+      .last()
+      .innerText();
+    await page.keyboard.press("Escape");
+    await page.locator("#dialog").waitFor({ state: "hidden" });
+    return { merge, text };
+  };
+  const named = (label) => label.includes(`${session} ·`);
+
+  await page.locator(`.tab-strip > .home-tab [data-tab="${helper}"]`).click();
+  await page.locator(".tab-strip > .home-tab.active").waitFor();
+  const fromHome = await palette();
+  assert.deepEqual(
+    fromHome.filter((l) => l.startsWith("Split with")),
+    [],
+    "Commands offers no Split with from the Home helper",
+  );
+  const homeGroups = await groups();
+  assert.deepEqual(homeGroups.merge, [], "no Group with from the Home helper");
+  assert.match(
+    homeGroups.text,
+    /stays alone in Home/,
+    "Terminal groups says why the helper is not grouped",
+  );
+
+  await page.locator(`#tabs [data-tab="${plain}"]`).click();
+  await page.locator(`.pane-header[data-pane="${plain}"]`).waitFor();
+  assert.equal(
+    await page.locator(".pane-header").count(),
+    1,
+    "the plain tab is alone in its group",
+  );
+  const fromPlain = await palette();
+  const switches = fromPlain
+    .filter((l) => l.startsWith("Switch: "))
+    .map((l) => l.slice("Switch: ".length));
+  const splits = fromPlain
+    .filter((l) => l.startsWith("Split with: "))
+    .map((l) => l.slice("Split with: ".length));
+  assert.ok(switches.some(named), "the helper is a switch target");
+  assert.ok(splits.length > 0, "Split with still offers ordinary tabs");
+  assert.ok(!splits.some(named), "Split with does not offer the Home helper");
+  assert.ok(splits.every((l) => switches.includes(l)));
+  // Every switch target except the plain tab itself and the helper.
+  assert.equal(splits.length, switches.length - 2, JSON.stringify(splits));
+  const plainGroups = await groups();
+  assert.ok(!plainGroups.merge.includes(helper), "Group with omits the helper");
+  assert.deepEqual(
+    plainGroups.merge.sort(),
+    (
+      await page
+        .locator("#tabs [data-tab]")
+        .evaluateAll((nodes) => nodes.map((n) => n.dataset.tab))
+    )
+      .filter((id) => id !== plain)
+      .sort(),
+    "Group with still offers every other group",
+  );
+}
