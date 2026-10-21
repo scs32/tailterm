@@ -46,6 +46,18 @@ check runs in the store for every retire or close, whether it comes from
 A ready successor lifts both refusals: a prepared rotation away from that
 handler, or a committed rotation chain that ends at an open handler.
 
+Closing a recorded primary that has already exited is allowed
+(`wi_fc9b01ea7a2545a2`, order #41795). `tt handler rotate` and every other
+rotation skip an exited handler, so the refusal's advice could not be followed.
+Only a [dead primary](#a-primary-whose-wrapper-reported-exited) rotation sees
+it, and only when it is busy and its wrapper reported the exit; once such a
+rotation is prepared it already lifts the refusal. The hub accepts the
+close on `PATCH` and on `DELETE` with the handler's exact run. An exited
+handler is already unavailable, so its close posts no owner notice. Unchanged:
+a `closed` event for an exited agent is refused (`closed`) before the floor
+runs, as for any exited agent; retiring an exited agent is refused the same
+way; and closing a retired primary is still refused by the primary rule.
+
 Closing a retired handler that is not the primary is always allowed, since it is
 no longer available. The hub does not check its leases or obligations; rotation
 and the queue own those.
@@ -59,7 +71,9 @@ and the queue own those.
   and leaves the session alone.
 - A handler in any other status: `tt close` refuses before contacting the hub,
   with `the active database handler remains available while the project is open`.
-  Retire it first (`tt retire`, which the floor checks) or rotate it.
+  Retire it first (`tt retire`, which the floor checks) or rotate it. This
+  includes an exited handler, which cannot be retired either, so `tt close`
+  cannot close an exited primary even though the hub would accept the close.
 
 Its other checks still run first for a retired handler: the session must be on
 this host, and the project orchestrator and an item lead are not closed this way.
@@ -774,6 +788,8 @@ directory are inert without the new CLI.
   follow-up `wi_42be87739d7bbfc9`.
 - `tt close` still refuses a database handler that is not retired on the client
   side, including a non-primary one the hub would accept while another handler
-  is available. Retire it first, then close it.
+  is available. Retire it first, then close it. An exited handler cannot be
+  retired, so `tt close` cannot close it; the hub accepts its close only on
+  `PATCH` or `DELETE` with the exact run.
 - Team launch cleanup cannot close a failed launch that is the project's only
   handler; the handler stays starting and the owner sees it.

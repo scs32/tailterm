@@ -385,3 +385,91 @@ func TestHandlerFloorExemptsPauseTaskCloseAndRotation(t *testing.T) {
 		}
 	})
 }
+
+// floorClose closes a on one hub path: UpdateAgent, CloseAgentRun or a closed
+// event.
+func floorClose(t *testing.T, f *rotationFixture, path string, a api.Agent) error {
+	t.Helper()
+	ctx := context.Background()
+	switch path {
+	case "UpdateAgent":
+		closed := api.AgentClosed
+		_, err := f.s.UpdateAgent(ctx, a.ID, api.UpdateAgentRequest{Status: &closed}, f.by)
+		return err
+	case "CloseAgentRun":
+		_, err := f.s.CloseAgentRun(ctx, a.ID, a.RunID, f.by)
+		return err
+	default:
+		_, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventClosed}, f.by)
+		return err
+	}
+}
+
+// f2 (wi_fc9b01ea7a2545a2, order #41795): a recorded primary that has exited
+// closes on PATCH and DELETE, since a hand rotation cannot target it. A live
+// primary and the last available handler are still refused on every path, the
+// exited primary still cannot be retired or sent a closed event, and the close
+// posts no owner notice.
+func TestHandlerFloorAllowsClosingExitedPrimary(t *testing.T) {
+	for _, path := range []string{"UpdateAgent", "CloseAgentRun"} {
+		t.Run(path, func(t *testing.T) {
+			f := newRotationFixture(t)
+			ctx := context.Background()
+			primary := floorRotate(t, f, "floor")
+			spare := f.agent(t, "db-handler-spare", api.AgentRoleDatabaseHandler)
+			for _, p := range []string{path, "closed event"} {
+				wantFloorRefusal(t, p+" live primary", floorClose(t, f, p, primary), primary.Name+" is the project's primary database handler")
+			}
+			if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: primary.ID, RunID: primary.RunID, Kind: api.EventExited}, f.by); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := f.s.GetAgent(ctx, primary.ID); got.Status != api.AgentExited {
+				t.Fatalf("primary status after exit: %s", got.Status)
+			}
+			// An exited agent cannot be retired or sent events, as today.
+			retired := api.AgentRetired
+			if _, err := f.s.UpdateAgent(ctx, primary.ID, api.UpdateAgentRequest{Status: &retired}, f.by); !errors.Is(err, api.ErrClosed) {
+				t.Fatalf("retire the exited primary: %v", err)
+			}
+			if err := floorClose(t, f, "closed event", primary); !errors.Is(err, api.ErrClosed) {
+				t.Fatalf("closed event for the exited primary: %v", err)
+			}
+			if err := floorClose(t, f, path, primary); err != nil {
+				t.Fatalf("close the exited primary: %v", err)
+			}
+			if got, _ := f.s.GetAgent(ctx, primary.ID); got.Status != api.AgentClosed {
+				t.Fatalf("exited primary status after close: %s", got.Status)
+			}
+			if n := closedEvents(t, f.s, f.task.ID, primary.ID); n != 1 {
+				t.Fatalf("closed events: %d", n)
+			}
+			// The spare is now the last available handler.
+			for _, p := range []string{path, "closed event"} {
+				wantFloorRefusal(t, p+" last available", floorClose(t, f, p, spare), spare.Name+" is the project's last available database handler")
+			}
+			if got, _ := f.s.GetAgent(ctx, spare.ID); got.Status != api.AgentRunning {
+				t.Fatalf("refused spare status: %s", got.Status)
+			}
+			if n := len(floorNotices(t, f.s, f.task.ID)); n != 0 {
+				t.Fatalf("notices: %d", n)
+			}
+		})
+	}
+	// An exited primary that was the only handler: its exit posts the one
+	// notice and its close adds none.
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	primary := floorRotate(t, f, "floor")
+	if _, err := f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: primary.ID, RunID: primary.RunID, Kind: api.EventExited}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(floorNotices(t, f.s, f.task.ID)); n != 1 {
+		t.Fatalf("notices after the exit: %d", n)
+	}
+	if _, err := f.s.CloseAgentRun(ctx, primary.ID, primary.RunID, f.by); err != nil {
+		t.Fatalf("close the exited only primary: %v", err)
+	}
+	if n := len(floorNotices(t, f.s, f.task.ID)); n != 1 {
+		t.Fatalf("notices after the close: %d", n)
+	}
+}

@@ -15,7 +15,9 @@ import (
 // handlerFloorCheck decides whether a handler may move to next. It refuses a
 // retire or close of the recorded primary, or of the last available handler,
 // unless a rotation successor is ready, and reports whether the change takes
-// the project's available handler count to zero.
+// the project's available handler count to zero. Closing a primary that has
+// already exited is allowed: a hand rotation cannot target it
+// (wi_fc9b01ea7a2545a2, order #41795).
 func handlerFloorCheck(ctx context.Context, q queryRower, task api.Task, a api.Agent, next string) (crossesZero bool, err error) {
 	if a.Role != api.AgentRoleDatabaseHandler || task.Status != api.TaskOpen || task.PauseState != api.ProjectPauseActive || a.Status == next {
 		return false, nil
@@ -28,7 +30,7 @@ func handlerFloorCheck(ctx context.Context, q queryRower, task api.Task, a api.A
 	if err != nil {
 		return false, err
 	}
-	if refusable && a.ID == task.PrimaryHandlerID && !ready {
+	if refusable && a.ID == task.PrimaryHandlerID && !ready && !(next == api.AgentClosed && a.Status == api.AgentExited) {
 		return false, fmt.Errorf("%w: %s is the project's primary database handler; rotate it with tt handler rotate before retiring or closing it", api.ErrConflict, a.Name)
 	}
 	if !handlerAvailable(a.Status) {
