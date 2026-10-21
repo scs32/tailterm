@@ -222,7 +222,7 @@ func TestToolDenySilencingWords(t *testing.T) {
 		{"host-pkill", `killall node -d`},
 		{"host-pkill", `killall node -0`},
 		{"host-pkill,deployer-signal", `killall tt-deployer-compact --help`},
-		{"deployer-signal", `killall -9 tt-deployer-compact -l`},
+		{"host-pkill,deployer-signal", `killall -9 tt-deployer-compact -l`},
 		{"deployer-signal", `kill -9 tt-deployer -0`},
 		{"deployer-signal", `kill -TERM tt-deployer --help`},
 		{"host-pkill,deployer-signal", `killall -s 9 tt-deployer`},
@@ -238,6 +238,12 @@ func TestToolDenySilencingWords(t *testing.T) {
 		{"host-pkill", `killall -s 9 node`},
 		{"host-pkill", `killall -sterm node`},
 		{"host-pkill", `killall -v -s TERM -q node`},
+		// Both rules read killall's options only up to its first operand
+		// (wi_04e05ead7e788279).
+		{"host-pkill,deployer-signal", `killall tt-deployer-compact -l`},
+		{"host-pkill", `killall node -l`},
+		{"host-pkill", `killall --ignore-case node -u me`},
+		{"host-pkill", `killall -c tt node -u me`},
 	} {
 		if got := denyRuleNames(toolDenyClassify(c.command)); got != c.rules {
 			t.Errorf("%s: rules = %q; want %q", c.command, got, c.rules)
@@ -253,6 +259,12 @@ func TestToolDenySilencingWords(t *testing.T) {
 		`killall -u me -s KILL node`, `killall -t pts/1 -sKILL node`,
 		`killall -ls KILL tt-deployer`, `killall -dsKILL tt-deployer`, `killall -vl -s KILL tt-deployer`,
 		`killall -vs tt-deployer-compact`, `killall -s0 tt-deployer`, `killall -vsnode tt-deployer`,
+		// A later -l, -d or show-only -s still only lists or shows after a
+		// signal -s, for both rules (wi_04e05ead7e788279).
+		`killall -s KILL -l node`, `killall -s KILL -s0 node`,
+		`killall -s KILL -l tt-deployer-compact`, `killall -s KILL -s0 tt-deployer-compact`,
+		`killall -sKILL -d tt-deployer-compact`, `killall -vs 9 -q -s tt-deployer-compact`,
+		`killall -c tt -u me node`,
 	} {
 		if got := toolDenyClassify(command); len(got) != 0 {
 			t.Errorf("%s: rules = %q; want none", command, denyRuleNames(got))

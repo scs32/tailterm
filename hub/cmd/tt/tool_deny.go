@@ -276,7 +276,8 @@ func toolDenyShellArgs(args []string) (inline string, stdin bool) {
 // to its first operand, so its -0, -l, -s and -d count anywhere before it,
 // the values of -u, -t and -c stepped over. A -s whose value is a signal,
 // as toolDenyKillallSignal reads it, is Linux killall's "-s SIGNAL", which
-// sends it.
+// sends it unless a later option only lists or shows: its value is stepped
+// over too.
 func toolDenySendsNothing(name string, args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -298,8 +299,11 @@ func toolDenySendsNothing(name string, args []string) bool {
 		if _, signal := toolDenySignal(a[1:]); signal {
 			continue
 		}
-		if _, _, signal := toolDenyKillallSignal(args, i); signal {
-			return false
+		if _, at, signal := toolDenyKillallSignal(args, i); signal {
+			if at == len(a)-1 {
+				i++ // the value is the next word
+			}
+			continue
 		}
 		if strings.ContainsAny(a[1:], "lsd") {
 			return true
@@ -333,7 +337,9 @@ func toolDenyKillallSignal(args []string, i int) (sig string, at int, ok bool) {
 
 // pkill fires host-pkill unless an option narrows the match to a user,
 // parent, group, session, terminal or pid file, or only lists. A killall
-// -s whose value is a signal sends it and narrows nothing.
+// -s whose value is a signal sends it and narrows nothing. killall's
+// options end at its first operand, as toolDenySendsNothing reads them:
+// a later word is an operand however it is spelled.
 func (c *toolDenyScan) pkill(name string, args []string) {
 	scoping, flags := "UuPgGstF", "fxinola"
 	if name == "killall" {
@@ -348,6 +354,10 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 			break
 		}
 		if len(a) < 2 || a[0] != '-' || strings.HasPrefix(a, "--") {
+			if name == "killall" {
+				sum.omitted += len(args) - i
+				break
+			}
 			sum.omitted++
 			continue
 		}
@@ -356,6 +366,11 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 			continue
 		}
 		if name == "killall" {
+			if a == "-c" && i+1 < len(args) {
+				sum.omitted += 2 // -c and the name it limits the match to
+				i++
+				continue
+			}
 			if sig, at, ok := toolDenyKillallSignal(args, i); ok {
 				// Only the letters before the s are options; the rest is the value.
 				if strings.ContainsAny(a[1:at], scoping) {
