@@ -639,7 +639,8 @@ func shortSHA(sha string) string {
 
 // worktreeEvidencePatterns are the spellings a document or receipt may use to
 // cite the worktree: absolute, without the macOS /private prefix, relative to
-// the main checkout and relative to the home directory.
+// the main checkout and relative to the home directory as ~, $HOME and
+// ${HOME}.
 func worktreeEvidencePatterns(path, main string) []string {
 	patterns := []string{path}
 	for _, prefix := range []string{"/private/tmp/", "/private/var/"} {
@@ -653,7 +654,8 @@ func worktreeEvidencePatterns(path, main string) []string {
 		}
 	}
 	if home, err := homeDir(); err == nil && home != "" && pathWithin(path, home) && path != home {
-		patterns = append(patterns, "~"+strings.TrimPrefix(path, home))
+		rest := strings.TrimPrefix(path, home)
+		patterns = append(patterns, "~"+rest, "$HOME"+rest, "${HOME}"+rest)
 	}
 	return patterns
 }
@@ -1351,6 +1353,9 @@ func artifactItemStates(entries []api.TeamQueueEntry, agents []api.Agent) map[st
 // rules are off and every worktree is an ordinary one.
 type artifactPass struct {
 	root string
+	// configured is the root as given, before symlinks are resolved; a
+	// receipt may cite a checkout through it.
+	configured string
 	// custom marks a root that is not the default <main>-artifacts: it came
 	// from --artifacts or TAILTERM_ARTIFACTS and may be mistaken.
 	custom        bool
@@ -1375,7 +1380,7 @@ func newArtifactPass(in worktreeCleanupInputs, main string, linked []string) *ar
 	if root == "" || !filepath.IsAbs(root) {
 		return nil
 	}
-	a := &artifactPass{root: canonicalPath(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, dismissed: in.Dismissed, dismissFault: in.DismissedFault, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
+	a := &artifactPass{root: canonicalPath(root), configured: filepath.Clean(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, dismissed: in.Dismissed, dismissFault: in.DismissedFault, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
 	if a.acceptedAfter <= 0 {
 		a.acceptedAfter = acceptedAfterInput(defaultArtifactAcceptedAfter)
 	}
@@ -1592,11 +1597,19 @@ func (a *artifactPass) itemTexts(item string) ([]worktreeEvidence, string) {
 // cited applies the referenced-file rule to a verifier checkout: queue
 // evidence and the item's receipt and plan files (tracked docs are checked
 // with the candidates). It names the source and the path inside the checkout.
+// When the configured root resolves elsewhere, as a symlink does, the checkout
+// is also looked for under the configured spelling.
 func (a *artifactPass) cited(path, main, item string, evidence []worktreeEvidence) (string, string) {
 	texts, fault := a.itemTexts(item)
+	paths := []string{path}
+	if a.configured != "" && a.configured != a.root && pathWithin(path, a.root) {
+		paths = append(paths, a.configured+strings.TrimPrefix(path, a.root))
+	}
 	for _, ev := range append(append([]worktreeEvidence(nil), evidence...), texts...) {
-		if rel := artifactCitation(path, main, ev.Text); rel != "" {
-			return keepEvidence, "cited by " + ev.Source + ": " + rel
+		for _, p := range paths {
+			if rel := artifactCitation(p, main, ev.Text); rel != "" {
+				return keepEvidence, "cited by " + ev.Source + ": " + rel
+			}
 		}
 	}
 	if fault != "" {

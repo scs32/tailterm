@@ -14,15 +14,17 @@ import (
 
 // Diagnosis tests for wi_970c5207b8e8d1de (order #42078): they assert the
 // worktree cleanup's behaviour at tasks-hub f2043adc for claims c2, c4 and
-// c5, so a later fix changes them on purpose. The findings are written up in
-// docs/incidents/worktree-sweep-kept-970c/report.md. Every fixture is a temp
-// tree, a fake temp and artifacts root and a fake hub; none applies to a host
-// path.
+// c5, so a later fix changes them on purpose; wi_c3dc2bb931d90710 (order
+// #42633) changed the c2 rows for $HOME and the symlinked root. The findings
+// are written up in docs/incidents/worktree-sweep-kept-970c/report.md. Every
+// fixture is a temp tree, a fake temp and artifacts root and a fake hub; none
+// applies to a host path.
 
 // c2: a receipt in the item folder cites a file inside a released item's
-// verifier checkout, in one spelling per case. The absolute and "~"
-// spellings keep the checkout; an item-folder-relative path, a literal $HOME
-// and the unresolved spelling of a symlinked artifacts root do not.
+// verifier checkout, in one spelling per case. The absolute, "~", $HOME and
+// ${HOME} spellings keep the checkout, as do both the resolved and the
+// unresolved spelling of a symlinked artifacts root; an item-folder-relative
+// path does not (F2-3, out of scope).
 func TestWorktreeCleanupDiagCitationSpellings(t *testing.T) {
 	type spellingCase struct {
 		name string
@@ -44,10 +46,16 @@ func TestWorktreeCleanupDiagCitationSpellings(t *testing.T) {
 		}, "would-remove", ""},
 		{"literal $HOME", false, func(r cleanupRepo, checkout string) string {
 			return "$HOME" + strings.TrimPrefix(checkout, r.root) + "/test-results/out.txt"
-		}, "would-remove", ""},
+		}, "kept", keepEvidence},
+		{"literal ${HOME}", false, func(r cleanupRepo, checkout string) string {
+			return "${HOME}" + strings.TrimPrefix(checkout, r.root) + "/test-results/out.txt"
+		}, "kept", keepEvidence},
 		{"unresolved symlinked artifacts root", true, func(r cleanupRepo, checkout string) string {
 			return filepath.Join(r.artifacts(), artifactItemA, filepath.Base(checkout)) + "/test-results/out.txt"
-		}, "would-remove", ""},
+		}, "kept", keepEvidence},
+		{"resolved symlinked artifacts root", true, func(r cleanupRepo, checkout string) string {
+			return checkout + "/test-results/out.txt"
+		}, "kept", keepEvidence},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,12 +94,14 @@ func TestWorktreeCleanupDiagCitationSpellings(t *testing.T) {
 			requireExists(t, filepath.Join(checkout, "test-results", "out.txt"), true)
 		})
 	}
-	// The spellings the rule produces today: the path, its /private-less
-	// form, a main-checkout-relative form and a "~" form; none is relative
-	// to the item folder, uses $HOME or keeps a symlink unresolved.
+	// The spellings the rule produces: the path, its /private-less form, a
+	// main-checkout-relative form and the "~", $HOME and ${HOME} forms; none
+	// is relative to the item folder. The unresolved root spelling is tried
+	// by artifactPass.cited, not added here.
 	t.Setenv("HOME", "/Users/fixture")
 	got := worktreeEvidencePatterns("/Users/fixture/repo-artifacts/"+artifactItemA+"/verifier-abc1234", "/Users/fixture/repo")
-	want := []string{"/Users/fixture/repo-artifacts/" + artifactItemA + "/verifier-abc1234", "~/repo-artifacts/" + artifactItemA + "/verifier-abc1234"}
+	rest := "/repo-artifacts/" + artifactItemA + "/verifier-abc1234"
+	want := []string{"/Users/fixture" + rest, "~" + rest, "$HOME" + rest, "${HOME}" + rest}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("patterns %q, want %q", got, want)
 	}
