@@ -10,8 +10,74 @@ import {
   unlink,
 } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync, brotliCompressSync, constants } from "node:zlib";
 const root = new URL("../dist-static/", import.meta.url);
+// Go licence notices first, so a missing text stops the build before any
+// other work. Each module's texts come from the copies build-wasm.sh made
+// beside the module list, while that copy of the list matches; otherwise
+// from the module directory. A module with no text fails the build.
+const licenseFiles = ["LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "NOTICE"];
+const goModules = await readFile(
+  new URL("../.build/go-modules.txt", import.meta.url),
+);
+const copied = new URL("../.build/go-licenses/", import.meta.url);
+let useCopied = false;
+try {
+  useCopied = goModules.equals(
+    await readFile(new URL("go-modules.txt", copied)),
+  );
+  if (!useCopied)
+    console.error(
+      "package-static: .build/go-licenses is from another build; reading licence texts from the module directories instead.",
+    );
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+const readTexts = async (dir) => {
+  const texts = [];
+  for (const file of licenseFiles) {
+    try {
+      texts.push([file, await readFile(path.join(dir, file), "utf8")]);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  return texts;
+};
+const modules = [
+  ...new Set(goModules.toString("utf8").split("\n").filter(Boolean)),
+]
+  .sort()
+  .map((item) => {
+    const at = item.indexOf("|");
+    return at < 0
+      ? { name: item, dir: "" }
+      : { name: item.slice(0, at), dir: item.slice(at + 1) };
+  });
+let notices = "Go dependencies linked into Tailterm WASM\n";
+for (const { name, dir } of modules) {
+  let texts = useCopied
+    ? await readTexts(path.join(fileURLToPath(copied), "modules", name))
+    : [];
+  if (!texts.length && dir) texts = await readTexts(dir);
+  for (const [file, text] of texts)
+    notices += "\n\n" + name + " / " + file + "\n\n" + text;
+}
+// Checked against the text about to be written: every module has an entry.
+const lines = new Set(notices.split("\n"));
+const missing = modules.filter(
+  ({ name }) => !licenseFiles.some((file) => lines.has(name + " / " + file)),
+);
+if (missing.length) {
+  for (const { name, dir } of missing)
+    console.error(
+      `package-static: no licence text for Go module ${name} (looked in .build/go-licenses/modules/${name} and ${dir || "no module directory"})`,
+    );
+  process.exit(1);
+}
+await mkdir(new URL("licenses/", root), { recursive: true });
+await writeFile(new URL("licenses/Go-dependencies.txt", root), notices);
 for (const name of await readdir(new URL("assets/", root))) {
   if (!/\.(wasm|js|css)$/.test(name)) continue;
   const url = new URL("assets/" + name, root),
@@ -76,35 +142,6 @@ await copyFile(
   new URL("../wasm/LICENSE.go", import.meta.url),
   new URL("licenses/Go.txt", root),
 );
-const modules = new Set(
-  (await readFile(new URL("../.build/go-modules.txt", import.meta.url), "utf8"))
-    .split("\n")
-    .filter(Boolean),
-);
-let notices = "Go dependencies linked into Tailterm WASM\n";
-for (const item of [...modules].sort()) {
-  const [name, dir] = item.split("|");
-  for (const file of [
-    "LICENSE",
-    "LICENSE.txt",
-    "LICENSE.md",
-    "COPYING",
-    "NOTICE",
-  ]) {
-    try {
-      notices +=
-        "\n\n" +
-        name +
-        " / " +
-        file +
-        "\n\n" +
-        (await readFile(path.join(dir, file), "utf8"));
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-    }
-  }
-}
-await writeFile(new URL("licenses/Go-dependencies.txt", root), notices);
 console.log(
   "Static distribution prepared in dist-static. Serve it over HTTPS; no application backend is required.",
 );

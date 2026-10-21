@@ -17,9 +17,9 @@ else
   tarball="$root/.build/tailscale.tar.gz"
 fi
 source="$root/.build/tailscale-1.102.3"
-copy= download= extract=
+copy= download= extract= licenses=
 cleanup() {
-  for temporary in "$copy" "$download" "$extract"; do
+  for temporary in "$copy" "$download" "$extract" "$licenses"; do
     if [ -n "$temporary" ]; then rm -rf "$temporary"; fi
   done
 }
@@ -69,4 +69,24 @@ if [ "${1:-}" = "--test" ]; then
 fi
 cat "$(go env GOROOT)/lib/wasm/wasm_exec.js" > "$root/wasm/wasm_exec.js"
 cat "$(go env GOROOT)/LICENSE" > "$root/wasm/LICENSE.go"
-GOOS=js GOARCH=wasm go list -deps -f '{{with .Module}}{{.Path}}|{{.Dir}}{{end}}' ./cmd/tsconnect/wasm > "$root/.build/go-modules.txt"
+# Each module's licence texts are copied into the checkout beside a copy of
+# the module list they were read for, so packaging never depends on a Go
+# module cache that may since have been removed. Packaging fails closed on a
+# module with none; the module list itself is still written last.
+licenses="$root/.build/go-licenses.$$.tmp"
+mkdir "$licenses"
+GOOS=js GOARCH=wasm go list -deps -f '{{with .Module}}{{.Path}}|{{.Dir}}{{end}}' ./cmd/tsconnect/wasm > "$licenses/go-modules.txt"
+sort -u "$licenses/go-modules.txt" | while IFS='|' read -r module dir || [ -n "$module" ]; do
+  if [ -z "$module" ] || [ -z "$dir" ]; then continue; fi
+  for name in LICENSE LICENSE.txt LICENSE.md COPYING NOTICE; do
+    if [ -f "$dir/$name" ]; then
+      mkdir -p "$licenses/modules/$module"
+      # cat, not cp: module cache files are read-only, and cp keeps the mode.
+      cat "$dir/$name" > "$licenses/modules/$module/$name"
+    fi
+  done
+done
+rm -rf "$root/.build/go-licenses"
+mv "$licenses" "$root/.build/go-licenses"
+licenses=
+cat "$root/.build/go-licenses/go-modules.txt" > "$root/.build/go-modules.txt"

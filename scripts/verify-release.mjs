@@ -31,6 +31,47 @@ assert.deepEqual(
   await assetInventory(root),
   "Release assets changed after packaging.",
 );
+// Every Go module linked into the WASM has a licence entry in the notices.
+const readRequired = async (url, name) => {
+  try {
+    return await readFile(url, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    throw new Error(`Missing ${name}; rebuild before deploying.`);
+  }
+};
+const goModules = await readRequired(
+  new URL(".build/go-modules.txt", repo),
+  ".build/go-modules.txt",
+);
+const notices = new Set(
+  (
+    await readRequired(
+      new URL("licenses/Go-dependencies.txt", root),
+      "dist-static/licenses/Go-dependencies.txt",
+    )
+  ).split("\n"),
+);
+const unlisted = [
+  ...new Set(
+    goModules
+      .split("\n")
+      .filter(Boolean)
+      .map((item) => item.split("|")[0]),
+  ),
+]
+  .sort()
+  .filter(
+    (name) =>
+      !["LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "NOTICE"].some(
+        (file) => notices.has(name + " / " + file),
+      ),
+  );
+assert.deepEqual(
+  unlisted,
+  [],
+  "Go-dependencies.txt has no licence entry for: " + unlisted.join(", "),
+);
 console.log(
   `Verified ${manifest.commit}: ${Object.keys(manifest.files).length} assets match release.json.`,
 );
