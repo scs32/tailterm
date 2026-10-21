@@ -698,8 +698,49 @@ func TestCloseReportsHubRefusalForRetiredPrimaryHandler(t *testing.T) {
 	}
 }
 
-// a3: a handler that is not retired, the deployment agent and the steward keep
-// their client-side refusals in every status, and no write reaches the hub.
+// An exited handler, primary or not, closes through the hub with its exact
+// run, since the floor allows it, and its session cleanup is confirmed
+// (wi_1eb0870a86771168).
+func TestCloseSendsExitedHandlerToHub(t *testing.T) {
+	for _, primary := range []bool{false, true} {
+		t.Run(fmt.Sprintf("primary=%v", primary), func(t *testing.T) {
+			f := newCloseHub(t)
+			ctx := context.Background()
+			keep := f.agent(t, "db-handler", api.AgentRoleDatabaseHandler)
+			old := f.agent(t, "db-handler-2", api.AgentRoleDatabaseHandler)
+			if primary {
+				f.exec(t, `UPDATE tasks SET primary_handler_id=? WHERE id=?`, old.ID, f.task.ID)
+			}
+			f.exec(t, `UPDATE agents SET status=? WHERE id=?`, api.AgentExited, old.ID)
+			// A stale run is refused by the hub, so a close that lands proves
+			// the CLI sent this handler's exact run.
+			if _, err := f.c.CloseAgent(ctx, f.task.ID, old.ID, api.NewID("run")); err == nil {
+				t.Fatal("hub closed an exited handler for a stale run")
+			}
+			writes := f.writes.Load()
+			if err := cmdClose(f.e, []string{old.Name}); err != nil {
+				t.Fatalf("tt close exited handler: %v", err)
+			}
+			if f.writes.Load() == writes {
+				t.Fatal("tt close of an exited handler sent no hub write")
+			}
+			got, err := f.c.GetAgent(ctx, f.task.ID, old.ID)
+			if err != nil || got.Status != api.AgentClosed || got.RunID != old.RunID || !got.CleanupDone {
+				t.Fatalf("exited handler after close: %+v %v", got, err)
+			}
+			if f.sessionAlive(old) {
+				t.Fatal("closed handler's session survived")
+			}
+			if f.status(t, keep.ID) == api.AgentClosed || !f.sessionAlive(keep) {
+				t.Fatal("close touched the remaining handler")
+			}
+		})
+	}
+}
+
+// a3: a handler that is neither retired nor exited, the deployment agent and
+// the steward keep their client-side refusals in every status, and no write
+// reaches the hub.
 func TestCloseStillRefusesAvailableHandlerAndPersistentRoles(t *testing.T) {
 	f := newCloseHub(t)
 	f.agent(t, "db-handler", api.AgentRoleDatabaseHandler)
@@ -708,8 +749,8 @@ func TestCloseStillRefusesAvailableHandlerAndPersistentRoles(t *testing.T) {
 		name, role, want string
 		statuses         []string
 	}{
-		{name: "db-handler-2", role: api.AgentRoleDatabaseHandler, want: handler, statuses: []string{api.AgentRunning, api.AgentDone}},
-		{name: "deployer", role: api.AgentRoleDeployment, want: handler, statuses: []string{api.AgentRunning, api.AgentRetired}},
+		{name: "db-handler-2", role: api.AgentRoleDatabaseHandler, want: handler, statuses: []string{api.AgentRunning, api.AgentDone, api.AgentNeedsInput}},
+		{name: "deployer", role: api.AgentRoleDeployment, want: handler, statuses: []string{api.AgentRunning, api.AgentRetired, api.AgentExited}},
 		{name: "backlog-steward", role: api.AgentRoleBacklogSteward, want: "the backlog steward remains available while the project is open; rotate it with tt steward rotate", statuses: []string{api.AgentRunning, api.AgentRetired}},
 	} {
 		a := f.agent(t, tc.name, tc.role)

@@ -1627,9 +1627,10 @@ func cmdClose(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	// A retired database handler is no longer available, so its close goes to
-	// the hub, whose handler floor decides (it refuses the recorded primary).
-	if a.Role == api.AgentRoleDeployment || (a.Role == api.AgentRoleDatabaseHandler && a.Status != api.AgentRetired) {
+	// A retired or exited database handler is no longer available, so its
+	// close goes to the hub, whose handler floor decides (it refuses a retired
+	// primary and allows an exited one, which no rotation can target).
+	if a.Role == api.AgentRoleDeployment || (a.Role == api.AgentRoleDatabaseHandler && a.Status != api.AgentRetired && a.Status != api.AgentExited) {
 		return errors.New("the active database handler remains available while the project is open")
 	}
 	if a.Role == api.AgentRoleBacklogSteward {
