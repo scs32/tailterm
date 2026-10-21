@@ -33,6 +33,9 @@ Product code in hub/cmd/tt reads the home only through `hub/cmd/tt/home.go`:
   name a home path's replacement: `TAILTERM_RELAY_STATE`,
   `TAILTERM_HANDOFF_CONFIG`, `TAILTERM_HANDOFF_DIR`, `TAILTERM_TOOL_LEDGER_DIR`,
   `TAILTERM_REDACT_SETTING_FILE`, `CODEX_HOME` and `CLAUDE_CONFIG_DIR`.
+- `homeSettingFrom(getenv, name)` is `homeSetting` for code that reads its
+  environment through an injected getenv; the doctor's Claude hooks check
+  reads `CLAUDE_CONFIG_DIR` this way.
 - `homeSeen(path)` reports a home resolved some other way;
   `verificationCacheRoot` uses it for the HOME its injected getenv returned.
 
@@ -41,8 +44,10 @@ before. They also pass each value to `homeWatch`, which the binary leaves nil.
 Tests point the seam at a temporary root through HOME (and the settings), as
 before; there is no second override. New code that reads the home or one of
 these settings must use the seam: `TestHomeSeamOnlyCaller` fails, naming
-file:line, on any `os.UserHomeDir` call, or any `os.Getenv`/`os.LookupEnv` of
-the seven names, outside home.go.
+file:line, on any `os.UserHomeDir` call outside home.go, and on any use of
+one of the seven names as a string that is not the name argument of
+`homeSetting` or `homeSettingFrom`. Matching the string catches an
+`os.Getenv`, a read through an injected getenv and a name kept in a list.
 
 ## The real-home guard
 

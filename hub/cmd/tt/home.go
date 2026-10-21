@@ -19,7 +19,13 @@ func homeDir() (string, error) {
 // TAILTERM_TOOL_LEDGER_DIR, TAILTERM_REDACT_SETTING_FILE, CODEX_HOME and
 // CLAUDE_CONFIG_DIR.
 func homeSetting(name string) string {
-	value := os.Getenv(name)
+	return homeSettingFrom(os.Getenv, name)
+}
+
+// homeSettingFrom is homeSetting for code that reads its environment through
+// an injected getenv, such as the doctor's probe.
+func homeSettingFrom(getenv func(string) string, name string) string {
+	value := getenv(name)
 	if value != "" {
 		homeSeen(value)
 	}

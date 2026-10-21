@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -69,10 +70,6 @@ func TestHomeSeamOnlyCaller(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	settings := map[string]bool{}
-	for _, name := range homeSettingNames {
-		settings[name] = true
-	}
 	fset := token.NewFileSet()
 	checked := 0
 	for _, file := range files {
@@ -84,35 +81,43 @@ func TestHomeSeamOnlyCaller(t *testing.T) {
 			t.Fatal(err)
 		}
 		checked++
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "os" {
-				return true
-			}
-			switch sel.Sel.Name {
-			case "UserHomeDir":
-				t.Errorf("%s: os.UserHomeDir outside home.go; use homeDir", fset.Position(call.Pos()))
-			case "Getenv", "LookupEnv":
-				if len(call.Args) == 1 {
-					if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						if name, err := strconv.Unquote(lit.Value); err == nil && settings[name] {
-							t.Errorf("%s: os.%s(%q) outside home.go; use homeSetting", fset.Position(call.Pos()), sel.Sel.Name, name)
-						}
-					}
-				}
-			}
-			return true
-		})
+		for _, v := range homeSeamViolations(fset, f) {
+			t.Error(v)
+		}
 	}
 	if checked < 20 {
 		t.Fatalf("checked only %d files", checked)
+	}
+	// The check itself catches each way around the seam: a direct call, a
+	// read through an injected getenv (the doctor's probe, finding f1 of
+	// review 42190) and a name kept in a list for a loop.
+	for _, src := range []string{
+		`package main; import "os"; func f() { os.UserHomeDir() }`,
+		`package main; import "os"; func f() string { return os.Getenv("CODEX_HOME") }`,
+		`package main; import "os"; func f() { os.LookupEnv("TAILTERM_RELAY_STATE") }`,
+		`package main; func f(d *doctorRun) string { return d.p.env("CLAUDE_CONFIG_DIR") }`,
+		`package main; var names = []string{"TAILTERM_TOOL_LEDGER_DIR"}`,
+	} {
+		f, err := parser.ParseFile(fset, "probe.go", src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(homeSeamViolations(fset, f)) != 1 {
+			t.Errorf("the source check misses %s", src)
+		}
+	}
+	for _, src := range []string{
+		`package main; func f() string { return homeSetting("CODEX_HOME") }`,
+		`package main; func f(d *doctorRun) string { return homeSettingFrom(d.p.env, "CLAUDE_CONFIG_DIR") }`,
+		`package main; func f() []string { return []string{"CODEX_HOME=" + homeSetting("CODEX_HOME")} }`,
+	} {
+		f, err := parser.ParseFile(fset, "probe.go", src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v := homeSeamViolations(fset, f); len(v) != 0 {
+			t.Errorf("the source check flags %s: %v", src, v)
+		}
 	}
 	// verificationCacheRoot takes HOME from an injected getenv, so it reports
 	// the home it resolved to the seam itself.
@@ -125,6 +130,50 @@ func TestHomeSeamOnlyCaller(t *testing.T) {
 	if !strings.Contains(body, `getenv("HOME")`) || !strings.Contains(body, "homeSeen(home)") {
 		t.Fatal("verificationCacheRoot no longer passes the home it resolved to homeSeen")
 	}
+}
+
+// homeSeamViolations lists, as file:line, each place a file reads around the
+// seam: a call to os.UserHomeDir, or any use of one of the seven setting
+// names as a string that is not the name argument of homeSetting or
+// homeSettingFrom. Matching the string, not os.Getenv, also catches a read
+// through an injected getenv and a name kept for a loop.
+func homeSeamViolations(fset *token.FileSet, f *ast.File) []string {
+	settings := map[string]bool{}
+	for _, name := range homeSettingNames {
+		settings[name] = true
+	}
+	allowed := map[*ast.BasicLit]bool{}
+	var out []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			if (fun.Name == "homeSetting" || fun.Name == "homeSettingFrom") && len(call.Args) > 0 {
+				if lit, ok := call.Args[len(call.Args)-1].(*ast.BasicLit); ok {
+					allowed[lit] = true
+				}
+			}
+		case *ast.SelectorExpr:
+			if pkg, ok := fun.X.(*ast.Ident); ok && pkg.Name == "os" && fun.Sel.Name == "UserHomeDir" {
+				out = append(out, fmt.Sprintf("%s: os.UserHomeDir outside home.go; use homeDir", fset.Position(call.Pos())))
+			}
+		}
+		return true
+	})
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING || allowed[lit] {
+			return true
+		}
+		if name, err := strconv.Unquote(lit.Value); err == nil && settings[name] {
+			out = append(out, fmt.Sprintf("%s: %s read outside the seam; use homeSetting, or homeSettingFrom for an injected getenv", fset.Position(lit.Pos()), name))
+		}
+		return true
+	})
+	return out
 }
 
 // homeProbeStart and homeProbeRead put two goroutines that are not tests

@@ -494,7 +494,7 @@ func loginCheck(name, tool string, args []string, fix string) doctorCheck {
 // the setting. A hook is found by its event and command suffix, since
 // SessionStart carries both session-start and handoff.
 func claudeHooksCheck(d *doctorRun) doctorResult {
-	dir := d.p.env("CLAUDE_CONFIG_DIR")
+	dir := homeSettingFrom(d.p.env, "CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		dir = d.home(".claude")
 	}

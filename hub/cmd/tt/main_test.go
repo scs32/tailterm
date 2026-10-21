@@ -280,7 +280,7 @@ func homeGuardWatch(path string, real []string) {
 // so it is matched by its suffix.
 func homeSeamFrame(name string) bool {
 	switch name {
-	case "homeDir", "homeSetting", "homeSeen", "homeGuardWatch", "homeReadCaller":
+	case "homeDir", "homeSetting", "homeSettingFrom", "homeSeen", "homeGuardWatch", "homeReadCaller":
 		return true
 	}
 	return strings.Contains(name, "installHomeWatch.func")
