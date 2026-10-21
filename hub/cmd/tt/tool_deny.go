@@ -274,11 +274,9 @@ func toolDenyShellArgs(args []string) (inline string, stdin bool) {
 // count as the first argument, where kill and pkill take their signal: later
 // they are a pattern, an operand or a usage error. killall reads options up
 // to its first operand, so its -0, -l, -s and -d count anywhere before it,
-// the values of -u, -t and -c stepped over. A -s whose value is a signal
-// is Linux killall's "-s SIGNAL", which sends it. The value is the rest of
-// the word, or the next word when nothing follows the s, and a group such
-// as -vs reads as its letters given separately: an -l or -d before the s
-// still only lists or shows.
+// the values of -u, -t and -c stepped over. A -s whose value is a signal,
+// as toolDenyKillallSignal reads it, is Linux killall's "-s SIGNAL", which
+// sends it.
 func toolDenySendsNothing(name string, args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -300,14 +298,8 @@ func toolDenySendsNothing(name string, args []string) bool {
 		if _, signal := toolDenySignal(a[1:]); signal {
 			continue
 		}
-		if j := strings.IndexByte(a, 's'); j > 0 && !strings.ContainsAny(a[1:j], "ld") {
-			value := a[j+1:]
-			if value == "" && i+1 < len(args) {
-				value = args[i+1]
-			}
-			if _, signal := toolDenySignal(value); signal {
-				return false
-			}
+		if _, _, signal := toolDenyKillallSignal(args, i); signal {
+			return false
 		}
 		if strings.ContainsAny(a[1:], "lsd") {
 			return true
@@ -319,16 +311,38 @@ func toolDenySendsNothing(name string, args []string) bool {
 	return false
 }
 
+// toolDenyKillallSignal reads the -s in killall's option word args[i] as
+// Linux killall's "-s SIGNAL". The value is the rest of the word, or the
+// next word when nothing follows the s, and a group such as -vs reads as
+// its letters given separately: an -l or -d before the s still only lists
+// or shows. It returns the signal and the index of the s in the word, and
+// false when the word holds no -s whose value is a signal.
+func toolDenyKillallSignal(args []string, i int) (sig string, at int, ok bool) {
+	a := args[i]
+	at = strings.IndexByte(a, 's')
+	if at <= 0 || strings.ContainsAny(a[1:at], "ld") {
+		return "", 0, false
+	}
+	value := a[at+1:]
+	if value == "" && i+1 < len(args) {
+		value = args[i+1]
+	}
+	sig, ok = toolDenySignal(value)
+	return sig, at, ok
+}
+
 // pkill fires host-pkill unless an option narrows the match to a user,
-// parent, group, session, terminal or pid file, or only lists.
+// parent, group, session, terminal or pid file, or only lists. A killall
+// -s whose value is a signal sends it and narrows nothing.
 func (c *toolDenyScan) pkill(name string, args []string) {
 	scoping, flags := "UuPgGstF", "fxinola"
 	if name == "killall" {
-		scoping, flags = "utls", "eIqvwm" // -l lists signals, -s only shows what it would do
+		scoping, flags = "utls", "eIqvwm" // -l lists signals, a show-only -s only shows what it would do
 	}
 	sum := toolDenySum{}
 	sum.add(name)
-	for i, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--" {
 			sum.omitted += len(args) - i
 			break
@@ -340,6 +354,20 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 		if sig, ok := toolDenySignal(a[1:]); ok {
 			sum.add("-" + sig)
 			continue
+		}
+		if name == "killall" {
+			if sig, at, ok := toolDenyKillallSignal(args, i); ok {
+				// Only the letters before the s are options; the rest is the value.
+				if strings.ContainsAny(a[1:at], scoping) {
+					return
+				}
+				sum.flags(a[:at], flags)
+				sum.add("-" + sig)
+				if at == len(a)-1 {
+					i++ // the value is the next word
+				}
+				continue
+			}
 		}
 		if strings.ContainsAny(a[1:], scoping) {
 			return
