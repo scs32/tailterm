@@ -1898,7 +1898,7 @@ export async function scanBuildCache(dir, { settleMs = 200, settleTries = 5 } = 
 // the toolchain from the host or that generation, a build cache per
 // toolchain. Private (refused or failed): today's per-home caches. Writes
 // cache-report.json and returns the environment additions and the line.
-export async function prepareVerificationCaches({ plan, cwd, home, output, environment, options = {} }) {
+export async function prepareVerificationCaches({ plan, cwd, home, output, environment, wasmRebuild = false, options = {} }) {
   const {
     root: cacheRoot = verificationCacheRoot(process.env),
     goProxy = process.env.GOPROXY && process.env.GOPROXY !== "off" ? process.env.GOPROXY : DEFAULT_GOPROXY,
@@ -1947,11 +1947,14 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
     const scan = await scanBuildCache(build.dir, settleMs === undefined ? {} : { settleMs });
     const sources = moduleSources(cwd, home, plan);
     const base = { ...environment, GOTOOLCHAIN: "local", GOFLAGS: "-mod=readonly", GOCACHE: build.dir };
-    // wasm-test-build reads Tailscale's module set from the generation too;
-    // only a script the runner cannot read safely, or a wasm seed that fails
-    // without corruption, leaves that one check on per-home modules.
+    // wasm-test-build, or a stale-WASM rebuild in its place, reads
+    // Tailscale's module set from the generation too; only a script the
+    // runner cannot read safely, or a wasm seed that fails without
+    // corruption, leaves that one build on per-home modules.
+    const wasmBuild = plan.checks.some((check) => check.id === "wasm-test-build") ? "wasm-test-build"
+      : wasmRebuild ? "WASM rebuild" : "";
     let wasm = null;
-    if (plan.checks.some((check) => check.id === "wasm-test-build")) {
+    if (wasmBuild) {
       const spec = wasmSeedSpec(cwd);
       wasm = spec.cause ? { cause: spec.cause } : { source: wasmSource(spec, cwd, home) };
     }
@@ -1980,7 +1983,7 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
       (modules.report.generations > 1 ? ` of ${modules.report.generations} generations` : "") +
       `, toolchain ${toolchain.version} (${toolchain.source === "host" ? "host" : `cached; host ${host} is older than go.mod`})` +
       `, build ${basename(build.dir)} scanned ${scan.outputs} outputs in ${scan.ms} ms, removed ${scan.removed}` +
-      (wasm?.cause ? `, wasm-test-build: per-home modules (${wasm.cause})` : wasm ? ", wasm-test-build: shared modules" : "");
+      (wasm?.cause ? `, ${wasmBuild}: per-home modules (${wasm.cause})` : wasm ? `, ${wasmBuild}: shared modules` : "");
     writeFileSync(join(output, "cache-report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
     return {
       line,
@@ -1994,8 +1997,8 @@ export async function prepareVerificationCaches({ plan, cwd, home, output, envir
         PATH: modules.env.PATH,
         TAILTERM_VERIFICATION_CACHE: root,
       },
-      // The fallback: that check alone keeps a per-home module cache with the
-      // network, and the shared toolchain and build cache.
+      // The fallback: that check (or the rebuild) alone keeps a per-home
+      // module cache with the network, and the shared toolchain and build cache.
       checkEnvironment: wasm?.cause
         ? { "wasm-test-build": { GOMODCACHE: join(home, "go", "pkg", "mod"), GOPROXY: goProxy } }
         : {},
@@ -2337,25 +2340,26 @@ const checksWasmSources = (plan, cwd) =>
   plan.checks.some(isBrowserCheck) &&
   !plan.checks.some((check) => check.id === "wasm-test-build") &&
   git(cwd, "ls-tree", "--name-only", plan.commit, "--", "scripts/build-wasm.sh") !== "";
-// Candidate code runs here, so it sees only what a build needs, never the
-// inherited task, hub or TAILTERM_* variables.
-const WASM_REBUILD_ENVIRONMENT = ["PATH", "HOME", "LANG", "TMPDIR", "GOMODCACHE", "GOPROXY", "GOTOOLCHAIN", "GOFLAGS"];
-// Held: after admission and before the prerequisites are read, so the
-// receipt and every reader see the rebuilt files. A failed rebuild, or one
-// that changes the checkout, refuses the run before any check starts.
-async function rebuildStaleWasm(plan, cwd, output, { abortSignal, onGroup, print }) {
-  if (!checksWasmSources(plan, cwd)) return;
+// Why the plan's WASM prerequisites need a rebuild, or "" when they do not
+// (current, or a plan that reads no record). Held: after admission.
+function staleWasmPrerequisites(plan, cwd, print) {
+  if (!checksWasmSources(plan, cwd)) return "";
   const cause = staleWasmCause(cwd, plan.commit);
-  if (!cause) {
+  if (!cause)
     print("matrix run: WASM prerequisites current for sources " + wasmSourceDigest(cwd, plan.commit).slice(0, 12));
-    return;
-  }
+  return cause;
+}
+// Before the prerequisites are read, so the receipt and every reader see the
+// rebuilt files. A failed rebuild, or one that changes the checkout, refuses
+// the run before any check starts. Candidate code runs here with the run's
+// environment, as wasm-test-build would: the verifier home and the run's Go
+// caches, never the inherited task, hub or TAILTERM_* variables. With shared
+// caches build-wasm.sh takes its shared branch; with private ones it is
+// pointed at the verifier home, so neither leaves a cache in the checkout.
+async function rebuildStaleWasm(plan, cause, cwd, output, environment, { abortSignal, onGroup, print }) {
   print(`matrix run: WASM prerequisites stale (${cause}); rebuilding with bash scripts/build-wasm.sh --test`);
   const matrix = JSON.parse(readFileSync(join(cwd, "verification/matrix.json"), "utf8"));
   const timeout = matrix.checkTimeoutMs?.["wasm-test-build"] ?? matrix.defaultTimeoutMs ?? 600000;
-  const environment = Object.fromEntries(
-    WASM_REBUILD_ENVIRONMENT.filter((name) => process.env[name] !== undefined).map((name) => [name, process.env[name]]),
-  );
   const check = {
     id: "wasm-prerequisite-rebuild",
     argv: ["bash", "scripts/build-wasm.sh", "--test"],
@@ -2932,12 +2936,10 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     onGroup,
   } = options;
   requireFreeSpace(minFreeBytes, getAvailableBytes);
-  await rebuildStaleWasm(plan, cwd, output, {
-    abortSignal,
-    onGroup,
-    print: options.hostLock?.print ?? console.log,
-  });
-  const prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
+  const print = options.hostLock?.print ?? console.log;
+  const staleWasm = staleWasmPrerequisites(plan, cwd, print);
+  // Read again after a stale-WASM rebuild, once the run's caches exist.
+  let prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
   // Keep the unique private home independent of arbitrarily deep inherited
   // TMPDIR. createHome is injectable like the cleanup hooks for failure tests.
   // Read before the home exists: only a process older than this can be
@@ -2973,11 +2975,11 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     // Go modules, toolchain and build cache: shared under the harness cache
     // root when the plan can run Go, else per-home as before.
     const caches = await prepareVerificationCaches({
-      plan, cwd, home, output, environment,
+      plan, cwd, home, output, environment, wasmRebuild: Boolean(staleWasm),
       options: { ...options.caches, abortSignal },
     });
     Object.assign(environment, caches.environment);
-    if (caches.line) (options.hostLock?.print ?? console.log)(caches.line);
+    if (caches.line) print(caches.line);
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
     if (plan.checks.some(isBrowserCheck)) {
       environment.PLAYWRIGHT_BROWSERS_PATH =
@@ -2986,6 +2988,14 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     }
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
+    if (staleWasm) {
+      const rebuild = { ...environment, ...caches.checkEnvironment?.["wasm-test-build"] };
+      // Private caches: build-wasm.sh's shared branch with the home's Go
+      // caches and its tarball under the home, removed with it.
+      rebuild.TAILTERM_VERIFICATION_CACHE ??= join(home, "wasm-rebuild-cache");
+      await rebuildStaleWasm(plan, staleWasm, cwd, output, rebuild, { abortSignal, onGroup, print });
+      prerequisites = readPrerequisites(plan.checks, cwd, options.readPrerequisiteFile);
+    }
     const needsBinaries = plan.checks.some((check) =>
       [...binarySuites].some((suite) => check.id.startsWith(`tests/${suite}-browser.mjs`)));
     if (needsBinaries) {

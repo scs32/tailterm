@@ -3,10 +3,11 @@
 // runs them beside the rest of that file.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, realpathSync, lstatSync } from "node:fs";
+import { tmpdir, homedir } from "node:os";
+import { join, relative, isAbsolute } from "node:path";
+import { spawnSync, execFileSync } from "node:child_process";
+import { crc32 as zlibCrc32 } from "node:zlib";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
@@ -1109,9 +1110,17 @@ test("WASM prerequisite: a provisioned build with no source record is rebuilt on
     assert.deepEqual(readLines(join(wt, ".build/rebuild-calls")), ["--test"], mode + ": one rebuild");
     assert.deepEqual(readLines(join(wt, ".build/order")), ["rebuild", "reader"], mode);
     // The rebuild sees none of the runner's inherited TAILTERM_* variables.
+    // This fixture has no hub/go.sum, so its Go caches are the verifier
+    // home's: build-wasm.sh is pointed at that home, never the checkout.
     const env = readLines(join(wt, ".build/rebuild-env"));
-    assert(env.some((line) => line.startsWith("PATH=")));
-    assert.deepEqual(env.filter((line) => line.startsWith("TAILTERM_")), [], mode);
+    const run = receipt.environment;
+    assert(env.includes("PATH=" + run.PATH), mode);
+    assert.deepEqual(env.filter((line) => line.startsWith("TAILTERM_")),
+      [`TAILTERM_VERIFICATION_CACHE=${join(run.HOME, "wasm-rebuild-cache")}`], mode);
+    for (const name of ["HOME", "TMPDIR", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOTOOLCHAIN"])
+      assert(env.includes(`${name}=${run[name]}`), `${mode}: ${name}`);
+    assert.equal(run.GOCACHE, join(run.HOME, "go-build"));
+    for (const local of [".build/go", ".build/cache"]) assert(!existsSync(join(wt, local)), local);
 
     // The next run in the same worktree trusts the record and rebuilds nothing.
     events.length = 0;
@@ -1219,4 +1228,245 @@ test("WASM prerequisite: plans with no WASM reader, no build script or their own
   assert.deepEqual(readLines(join(h.cwd, ".build/rebuild-calls")), ["--test"]);
   assert.deepEqual(readLines(join(h.cwd, ".build/order")), ["rebuild", "reader"]);
   assert(!existsSync(join(h.cwd, ".build/wasm-sources.json")));
+});
+
+// wi_52c459fde3a00e00 / order #42103: with shared caches the stale-WASM
+// rebuild runs the real build-wasm.sh with the run's own Go caches, so each
+// fresh worktree reuses one build cache, one module generation and one
+// tarball instead of making its own. A tiny tailscale.com (whose wasm package
+// needs example.com/jsdep only through the copied wasm/upstream_js.go) is
+// served from a file:// proxy, and its release tarball by a curl stand-in;
+// these helpers follow tests/verification-4.test.js, which this item does
+// not own.
+function storedZip(entries) {
+  const parts = [], central = [];
+  let offset = 0;
+  for (const [name, text] of Object.entries(entries)) {
+    const data = Buffer.from(text), file = Buffer.from(name), crc = zlibCrc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x21, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(file.length, 26);
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(0x21, 14);
+    entry.writeUInt32LE(crc, 16);
+    entry.writeUInt32LE(data.length, 20);
+    entry.writeUInt32LE(data.length, 24);
+    entry.writeUInt16LE(file.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    parts.push(local, file, data);
+    central.push(entry, file);
+    offset += 30 + file.length + data.length;
+  }
+  const directory = Buffer.concat(central), end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(central.length / 2, 8);
+  end.writeUInt16LE(central.length / 2, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, directory, end]);
+}
+// Go makes module directories read-only.
+function goCacheDirectory(t, prefix) {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => existsSync(directory) && removeVerifierHome(directory));
+  return directory;
+}
+// The Go environment the fixture's own setup uses: never the caller's caches.
+function setupGoEnvironment(t, proxy) {
+  const scratch = goCacheDirectory(t, "verification-go-setup-");
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(GO|TAILTERM_)/.test(key)));
+  return { ...environment, GOMODCACHE: join(scratch, "mod"), GOCACHE: join(scratch, "build"), GOPATH: join(scratch, "path"),
+    GOFLAGS: "-mod=mod", GOSUMDB: "off", GOTOOLCHAIN: "local", GOPROXY: proxy.url };
+}
+// A proxy serving example.com/jsdep and tailscale.com v1.0.0; returns the
+// tailscale.com files.
+function tailscaleProxy(t) {
+  const directory = tempDir(t, "verification-goproxy-"), proxy = { directory, url: "file://" + directory };
+  const publish = (path, files) => {
+    const dir = join(directory, path, "@v");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "list"), "v1.0.0\n");
+    writeFileSync(join(dir, "v1.0.0.info"), '{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}\n');
+    writeFileSync(join(dir, "v1.0.0.mod"), files["go.mod"]);
+    writeFileSync(join(dir, "v1.0.0.zip"), storedZip(Object.fromEntries(
+      Object.entries(files).map(([name, text]) => [`${path}@v1.0.0/${name}`, text]))));
+  };
+  publish("example.com/jsdep", { "go.mod": "module example.com/jsdep\n\ngo 1.21\n",
+    "jsdep.go": "package jsdep\n\nfunc Value() int { return 2 }\n" });
+  const source = tempDir(t, "verification-tailscale-source-");
+  const files = {
+    "go.mod": "module tailscale.com\n\ngo 1.21\n\nrequire example.com/jsdep v1.0.0\n",
+    "x/x.go": "package x\n\nfunc V() int { return 1 }\n",
+    "cmd/tsconnect/wasm/main.go": "package main\n\nfunc main() {}\n",
+    "cmd/tsconnect/other/o.go": 'package other\n\nimport _ "example.com/jsdep"\n',
+  };
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(join(source, name, ".."), { recursive: true });
+    writeFileSync(join(source, name), text);
+  }
+  execFileSync("go", ["mod", "tidy"], { cwd: source, env: setupGoEnvironment(t, proxy), stdio: "pipe" });
+  for (const name of ["go.mod", "go.sum"]) files[name] = readFileSync(join(source, name), "utf8");
+  publish("tailscale.com", files);
+  return { proxy, files };
+}
+// The release tarball (top directory tailscale-1.0.0/) and its sha256.
+function tailscaleRelease(t, files) {
+  const scratch = tempDir(t, "verification-tailscale-tarball-");
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(join(scratch, "tailscale-1.0.0", name, ".."), { recursive: true });
+    writeFileSync(join(scratch, "tailscale-1.0.0", name), text);
+  }
+  const path = join(scratch, "release.tar.gz");
+  execFileSync("tar", ["-czf", path, "-C", scratch, "tailscale-1.0.0"]);
+  return { path, sha: sha256(readFileSync(path)) };
+}
+// A curl first on PATH: logs each call and copies the tarball to -o.
+function curlStandIn(t, source) {
+  const tools = tempDir(t, "verification-curl-"), log = join(tools, "curl.log");
+  writeFileSync(join(tools, "curl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n` +
+    `out=\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\ncp '${source}' "$out"\n`, { mode: 0o755 });
+  return { tools, calls: () => readLines(log).length };
+}
+const hostGoRoot = () => execFileSync("go", ["env", "GOROOT"], { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } }).trim();
+// A Homebrew GOROOT has no LICENSE (a downloaded toolchain does).
+const hostGoLicense = () => (existsSync(join(hostGoRoot(), "LICENSE")) ? "LICENSE" : "PATENTS");
+// The real scripts/build-wasm.sh for the fixture release, which also writes
+// its environment to .build/rebuild-env. Each replacement must match as often
+// as expected, so a reshaped script fails here instead of testing something else.
+function fixtureWasmScript(sha) {
+  let text = readFileSync(new URL("../scripts/build-wasm.sh", import.meta.url), "utf8");
+  const swap = (from, to, count) => {
+    assert.equal(text.split(from).length - 1, count, `build-wasm.sh mentions ${from} ${count} times`);
+    text = text.replaceAll(from, to);
+  };
+  swap("1.102.3", "1.0.0", 3);
+  swap(/^sha256=([0-9a-f]{64})$/m.exec(text)[1], sha, 1);
+  swap('"$(go env GOROOT)/LICENSE"', `"$(go env GOROOT)/${hostGoLicense()}"`, 1);
+  swap("\nroot=$(pwd)\n", '\nroot=$(pwd)\nmkdir -p .build\nenv > .build/rebuild-env\n', 1);
+  return text;
+}
+const STALE_WASM = "\0asm\x01\0\0\0stale";
+// A browser fixture whose hub module requires tailscale.com v1.0.0, with the
+// build script and every checkout file it reads or rewrites, and a client/
+// candidate whose plan reads the WASM without building it.
+function sharedWasmFixture(t, proxy, release) {
+  const f = browserFixture(t, { "fixture-browser.mjs": "console.log('reader ran');\n" });
+  writeFileSync(join(f.cwd, ".gitignore"), "node_modules/\n.build/\nwasm/*.wasm\n");
+  f.git("rm", "-q", "--cached", "wasm/tailserve.wasm");
+  const files = {
+    "hub/go.mod": "module example.com/hub\n\ngo 1.21\n\nrequire tailscale.com v1.0.0\n",
+    "hub/ts.go": 'package hub\n\nimport "tailscale.com/x"\n\nvar _ = x.V\n',
+    "wasm/upstream_js.go": 'package main\n\nimport _ "example.com/jsdep"\n',
+    ...Object.fromEntries(["ssh_js.go", "upload_js.go", "sftp_js.go", "fixture_js.go"].map((name) => ["wasm/" + name, "package main\n"])),
+    "wasm/wasm_exec.js": readFileSync(join(hostGoRoot(), "lib/wasm/wasm_exec.js"), "utf8"),
+    "wasm/LICENSE.go": readFileSync(join(hostGoRoot(), hostGoLicense()), "utf8"),
+    "scripts/build-wasm.sh": fixtureWasmScript(release.sha),
+  };
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(join(f.cwd, name, ".."), { recursive: true });
+    writeFileSync(join(f.cwd, name), text);
+  }
+  execFileSync("go", ["mod", "tidy"], { cwd: join(f.cwd, "hub"), env: setupGoEnvironment(t, proxy), stdio: "pipe" });
+  // The main worktree's stale build, which go build overwrites only as an
+  // object file.
+  for (const path of ["wasm/tailserve.wasm", ".build/test.wasm"]) writeFileSync(join(f.cwd, path), STALE_WASM);
+  f.git("add", ".");
+  f.git("commit", "-qm", "wasm sources");
+  const baseCommit = f.git("rev-parse", "HEAD");
+  const commit = commitChange(f, "client/candidate.txt", "change\n", "candidate");
+  const context = { baseCommit, commit };
+  return { ...f, context, plan: makePlan({ ...context, owned: ["client/"] }, f.cwd) };
+}
+const treeBytes = (dir) => {
+  let total = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true }))
+    if (entry.isFile()) total += lstatSync(join(entry.parentPath, entry.name)).size;
+  return total;
+};
+const insidePath = (child, parent) => {
+  const rel = relative(parent, child);
+  return rel === "" || (rel.split("/")[0] !== ".." && !isAbsolute(rel));
+};
+
+test("WASM prerequisite: with shared caches two fresh worktrees rebuild with the run's Go caches and one tarball", { timeout: 300000 }, async (t) => {
+  const { proxy, files } = tailscaleProxy(t);
+  const release = tailscaleRelease(t, files);
+  const curl = curlStandIn(t, release.path);
+  const f = sharedWasmFixture(t, proxy, release);
+  assert(!f.plan.checks.some((check) => check.id === "wasm-test-build"), "the plan does not build the WASM itself");
+  const root = join(goCacheDirectory(t, "verification-cache-wasm-rebuild-"), "root");
+  const savedPath = process.env.PATH;
+  process.env.PATH = curl.tools + ":" + savedPath;
+  t.after(() => (process.env.PATH = savedPath));
+  // Every spelling of the user's own Go caches.
+  const userGo = JSON.parse(execFileSync("go", ["env", "-json", "GOMODCACHE", "GOCACHE"],
+    { encoding: "utf8", env: { ...process.env, GOTOOLCHAIN: "local" } }));
+  const userCaches = [join(homedir(), "go"), join(homedir(), "Library", "Caches", "go-build"), userGo.GOMODCACHE, userGo.GOCACHE];
+  const runs = [];
+  for (const pass of ["cold", "fresh worktree"]) {
+    const wt = linkedWorktree(t, f);
+    t.after(() => existsSync(join(wt, ".build")) && removeVerifierHome(join(wt, ".build")));
+    const events = [], output = tempDir(t, "verification-wasm-shared-");
+    const buildBefore = existsSync(join(root, "build")) ? treeBytes(join(root, "build")) : 0;
+    const started = Date.now();
+    const receipt = await runPlan(f.plan, wt, output, { ...wasmOptions(events), caches: { root, goProxy: proxy.url } });
+    const run = { receipt, seconds: (Date.now() - started) / 1000, growth: treeBytes(join(root, "build")) - buildBefore };
+    runs.push(run);
+    const log = readFileSync(join(output, "wasm-prerequisite-rebuild.log"), "utf8");
+    assert(receipt.checks.every((c) => c.exitCode === 0), `${pass}: ${log}`);
+    assert(events.includes("matrix run: WASM prerequisites stale (no source record); rebuilding with bash scripts/build-wasm.sh --test"), pass);
+    const cacheLine = events.find((line) => line.startsWith("matrix run: go caches:"));
+    assert.match(cacheLine, /, WASM rebuild: shared modules$/, pass);
+    assert(events.indexOf(cacheLine) < events.findIndex((line) => line.startsWith("matrix run: WASM prerequisites stale")), "caches first");
+
+    // The rebuild's environment is the run's: its Go caches, toolchain and
+    // cache root, the verifier home, and no other TAILTERM_* variable.
+    const env = Object.fromEntries(readLines(join(wt, ".build/rebuild-env")).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+    const runEnv = receipt.environment;
+    for (const name of ["GOCACHE", "GOMODCACHE", "GOPROXY", "GOFLAGS", "GOTOOLCHAIN", "PATH", "HOME", "TMPDIR", "GOPATH", "TAILTERM_VERIFICATION_CACHE"])
+      assert.equal(env[name], runEnv[name], `${pass}: ${name}`);
+    assert.deepEqual(Object.keys(env).filter((name) => name.startsWith("TAILTERM_")), ["TAILTERM_VERIFICATION_CACHE"], pass);
+    assert.equal(env.TAILTERM_VERIFICATION_CACHE, realpathSync(root));
+    assert.equal(env.GOPROXY, "off");
+    for (const name of ["GOCACHE", "GOMODCACHE"]) {
+      assert(insidePath(env[name], realpathSync(root)), `${pass}: ${name} ${env[name]} is under the cache root`);
+      assert(!insidePath(env[name], realpathSync(wt)), `${pass}: ${name} is outside the checkout`);
+      for (const user of userCaches) assert(!insidePath(env[name], user) && !insidePath(user, env[name]), `${pass}: ${name} is not ${user}`);
+    }
+    const state = pass === "cold" ? "downloaded" : "cached";
+    assert.equal(/^build-wasm: .*$/m.exec(log)?.[0],
+      `build-wasm: GOCACHE=${env.GOCACHE} GOMODCACHE=${env.GOMODCACHE} tarball=${join(realpathSync(root), "downloads", release.sha + ".tar.gz")} (${state})`, pass);
+    assert.deepEqual(readdirSync(join(root, "downloads")), [release.sha + ".tar.gz"]);
+    assert.equal(curl.calls(), 1, `${pass}: one download in all`);
+
+    // The worktree has no Go cache or tarball of its own, stays clean, and
+    // every reader saw the rebuilt WASM.
+    for (const local of [".build/go", ".build/cache", ".build/tailscale.tar.gz"]) assert(!existsSync(join(wt, local)), `${pass}: ${local}`);
+    assert.equal(spawnSync("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd: wt, encoding: "utf8" }).stdout, "", pass);
+    const built = ["wasm/tailserve.wasm", ".build/test.wasm"].map((path) => ({ path, sha256: sha256(readFileSync(join(wt, path))) }));
+    assert(built.every((entry) => entry.sha256 !== digest(STALE_WASM)), `${pass}: rebuilt`);
+    for (const entry of built) assert.deepEqual(receipt.prerequisites.find((p) => p.path === entry.path), entry);
+    for (const reader of receipt.checks.filter((c) => c.wasm)) assert.deepEqual(reader.wasm, built, reader.id);
+    assert.equal(matrixRunner.staleWasmCause(wt, f.context.commit), "", `${pass}: recorded`);
+    run.env = env;
+    run.report = JSON.parse(readFileSync(join(output, "cache-report.json"), "utf8"));
+  }
+  // The fresh worktree reused the same build cache, module generation and
+  // tarball: nothing seeded or downloaded, and the build cache barely grew.
+  assert.equal(runs[1].env.GOCACHE, runs[0].env.GOCACHE);
+  assert.equal(runs[1].env.GOMODCACHE, runs[0].env.GOMODCACHE);
+  assert.equal(runs[1].report.modules.state, "warm");
+  assert.deepEqual(runs[1].report.downloads, { toolchains: 0, modules: 0 });
+  assert.equal(runs[1].report.wasm.copy, "verified");
+  assert(runs[1].growth < runs[0].growth / 10, `build cache grew ${runs[1].growth} bytes after a cold ${runs[0].growth}`);
+  console.log(`wasm rebuild runs: cold ${runs[0].seconds} s (+${runs[0].growth} build bytes), ` +
+    `fresh worktree ${runs[1].seconds} s (+${runs[1].growth})`);
 });
