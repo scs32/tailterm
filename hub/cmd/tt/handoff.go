@@ -101,10 +101,10 @@ const handoffUsage = "usage: tt handoff show [--task T] [--json]\n" +
 // ---- the setting ----
 
 func handoffConfigPath() string {
-	if path := os.Getenv("TAILTERM_HANDOFF_CONFIG"); path != "" {
+	if path := homeSetting("TAILTERM_HANDOFF_CONFIG"); path != "" {
 		return path
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return ""
 	}
@@ -159,10 +159,10 @@ func handoffTouch(path string) {
 // ---- the record ----
 
 func handoffRoot() string {
-	if path := os.Getenv("TAILTERM_HANDOFF_DIR"); path != "" {
+	if path := homeSetting("TAILTERM_HANDOFF_DIR"); path != "" {
 		return path
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return ""
 	}
@@ -1321,9 +1321,9 @@ func handoffTranscriptStart(session string) (time.Time, bool) {
 	if !threadIDPattern.MatchString(session) {
 		return time.Time{}, false
 	}
-	base := os.Getenv("CLAUDE_CONFIG_DIR")
+	base := homeSetting("CLAUDE_CONFIG_DIR")
 	if base == "" {
-		home, err := os.UserHomeDir()
+		home, err := homeDir()
 		if err != nil {
 			return time.Time{}, false
 		}

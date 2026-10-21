@@ -80,10 +80,10 @@ func toolRedactMode() string {
 }
 
 func toolRedactSettingPath() string {
-	if path := os.Getenv("TAILTERM_REDACT_SETTING_FILE"); path != "" {
+	if path := homeSetting("TAILTERM_REDACT_SETTING_FILE"); path != "" {
 		return path
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return ""
 	}

@@ -652,7 +652,7 @@ func worktreeEvidencePatterns(path, main string) []string {
 			patterns = append(patterns, rel)
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" && pathWithin(path, home) && path != home {
+	if home, err := homeDir(); err == nil && home != "" && pathWithin(path, home) && path != home {
 		patterns = append(patterns, "~"+strings.TrimPrefix(path, home))
 	}
 	return patterns
@@ -2854,7 +2854,7 @@ func finishedTrimSet(host string, entries []api.TeamQueueEntry, agents []api.Age
 // contain: the standing owner rule is that they are never cleared.
 func neverTouchPaths() []string {
 	var out []string
-	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+	if home, err := homeDir(); err == nil && filepath.IsAbs(home) {
 		out = append(out, filepath.Join(home, "Library", "Caches"), filepath.Join(home, "go"), filepath.Join(home, ".npm"))
 	}
 	for _, name := range []string{"GOCACHE", "GOMODCACHE", "GOPATH", "npm_config_cache", "TAILTERM_VERIFICATION_CACHE"} {

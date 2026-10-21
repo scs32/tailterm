@@ -168,10 +168,10 @@ type toolLedgerPending struct {
 
 // toolLedgerRoot is the directory holding one ledger directory per agent.
 func toolLedgerRoot() string {
-	if path := os.Getenv("TAILTERM_TOOL_LEDGER_DIR"); path != "" {
+	if path := homeSetting("TAILTERM_TOOL_LEDGER_DIR"); path != "" {
 		return path
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return ""
 	}

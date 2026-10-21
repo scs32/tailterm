@@ -192,7 +192,7 @@ func (e *exitError) Unwrap() error { return e.err }
 func main() {
 	// SSH exec and tmux often start without the interactive shell's PATH.
 	// Preserve existing precedence, then add standard user/package locations.
-	home, _ := os.UserHomeDir()
+	home, _ := homeDir()
 	parts := []string{os.Getenv("PATH"), filepath.Dir(selfPath()), filepath.Join(home, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"}
 	_ = os.Setenv("PATH", strings.Join(parts, string(os.PathListSeparator)))
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help" {

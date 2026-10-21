@@ -397,7 +397,7 @@ func pathHolds(parent, child string) bool {
 // inside the module cache. A cache inside the home directory is the usual
 // layout and is accepted.
 func validateGoBuildCache(cache *goCacheHandle, dir, modCache string) string {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return "no home directory"
 	}
@@ -635,7 +635,7 @@ var nativeGoCacheDir = func(ctx context.Context) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "env", "GOCACHE", "GOMODCACHE")
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := homeDir(); err == nil {
 		cmd.Dir = home
 	}
 	out, err := cmd.Output()
@@ -832,6 +832,7 @@ func verificationCacheRoot(getenv func(string) string, goos string) (string, err
 	if home == "" {
 		return "", errors.New("no home directory")
 	}
+	homeSeen(home)
 	if goos == "darwin" {
 		return filepath.Join(home, "Library", "Caches", "tailterm-verification"), nil
 	}
@@ -960,7 +961,7 @@ func openVerificationRoot(root string, env verificationGoEnv) (*goCacheHandle, s
 	if !filepath.IsAbs(root) {
 		return nil, goCacheTrimSkipNotCache, "the root is not an absolute path"
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return nil, goCacheTrimSkipRefused, "no home directory"
 	}

@@ -174,7 +174,7 @@ func loadClaudeStall(b runtimeBinding) claudeStall {
 // without regard to case, so "claudestallaction" would count, and would even
 // override the real key when both are present.
 func relayStallAction() string {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return claudeStallReport
 	}

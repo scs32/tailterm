@@ -151,7 +151,7 @@ func doctorKnownRole(role string) bool {
 }
 
 func newHostProbe(e env) hostProbe {
-	home, _ := os.UserHomeDir()
+	home, _ := homeDir()
 	return hostProbe{
 		goos:      runtime.GOOS,
 		home:      home,

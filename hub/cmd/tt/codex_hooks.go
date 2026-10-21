@@ -18,10 +18,10 @@ import (
 // does nothing outside a Tailterm agent session.
 
 func codexHome() string {
-	if h := os.Getenv("CODEX_HOME"); h != "" {
+	if h := homeSetting("CODEX_HOME"); h != "" {
 		return h
 	}
-	home, _ := os.UserHomeDir()
+	home, _ := homeDir()
 	return filepath.Join(home, ".codex")
 }
 

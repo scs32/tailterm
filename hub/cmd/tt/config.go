@@ -12,7 +12,7 @@ func (e *env) loadConfig() {
 		e.token = ""
 		e.configHub = ""
 	}
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return
 	}

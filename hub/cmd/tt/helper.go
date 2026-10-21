@@ -450,7 +450,7 @@ func newHelperRequestID() (string, error) {
 }
 
 func claudeTranscriptExists(thread string) bool {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return false
 	}
@@ -477,7 +477,7 @@ func helperRuntimeIdentity() (runtime, thread, codex, codexHome string, err erro
 		if err != nil {
 			return "", "", "", "", err
 		}
-		codexHome = os.Getenv("CODEX_HOME")
+		codexHome = homeSetting("CODEX_HOME")
 		if codexHome != "" {
 			codexHome, err = filepath.Abs(codexHome)
 			if err != nil {

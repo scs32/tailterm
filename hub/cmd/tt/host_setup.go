@@ -105,12 +105,12 @@ type hostPaths struct {
 }
 
 func newHostPaths() (hostPaths, error) {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil || home == "" {
 		return hostPaths{}, errors.New("no home directory: set HOME")
 	}
 	bin := filepath.Join(home, ".local", "bin")
-	claude := os.Getenv("CLAUDE_CONFIG_DIR")
+	claude := homeSetting("CLAUDE_CONFIG_DIR")
 	if claude == "" {
 		claude = filepath.Join(home, ".claude")
 	}

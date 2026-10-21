@@ -77,7 +77,7 @@ func sweepSettingsWarn(key, raw, used string) {
 // A missing file is no keys and no fault; a file that exists but cannot be
 // read, is over 64 KiB or is not a JSON object is a fault.
 func readRelayConfig() (map[string]json.RawMessage, string) {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return nil, "no home directory"
 	}

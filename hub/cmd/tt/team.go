@@ -371,7 +371,7 @@ func checkTeamRoster(detail api.TaskDetail, journal teamLaunchJournal) error {
 }
 
 func teamJournalPath(hub, task, item string, order int64) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return "", err
 	}

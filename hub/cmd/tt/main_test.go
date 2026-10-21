@@ -13,10 +13,14 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/server"
@@ -53,9 +57,13 @@ func TestMain(m *testing.M) {
 // setting and lost ledger rows).
 //
 // The guard is checked before and after the run, and fails it with the path
-// that would have been read. A child that is this test binary again inherits
-// the real homes in testRealHomesEnv and checks the home it was given, so a
-// test that starts one with the user's home fails with that child's message.
+// that would have been read. During the run it watches every path the home
+// seam resolves (home.go): a test that resolves one inside a real home fails
+// on the spot, named with the path and the caller (see guardedRun). The rules
+// and their limits are in docs/test-isolation.md. A child that is this test
+// binary again inherits the real homes in testRealHomesEnv and checks the
+// home it was given, so a test that starts one with the user's home fails
+// with that child's message.
 // A child may have another temporary home; it never gets one of its own here.
 // Neither does a process whose caller already gave it a home that is not the
 // user's: it runs under the guard with that home.
@@ -126,12 +134,27 @@ func runWithOwnHome(run func() int) int {
 
 // guardedRun checks the guard on both sides of the run, so a test that left
 // the process environment pointing at the user's home fails the run too.
+// Between the checks it installs homeGuardWatch, which fails the test that
+// resolves a real-home path through the home seam. A read the watch could not
+// fail in its test, because product code recovered the panic or no test was
+// running, fails the run afterwards with the first such read.
 func guardedRun(run func() int) int {
 	if err := realHomeGuard(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	installHomeWatch(filepath.SplitList(os.Getenv(testRealHomesEnv)))
 	code := run()
+	if r := homeReadFirst.Load(); r != nil {
+		line := "after the tests: " + r.message()
+		if more := homeReadMore.Load(); more > 0 {
+			line += fmt.Sprintf(" (and %d more)", more)
+		}
+		fmt.Fprintln(os.Stderr, line)
+		if code == 0 {
+			code = 1
+		}
+	}
 	if err := realHomeGuard(); err != nil {
 		fmt.Fprintln(os.Stderr, "after the tests:", err)
 		if code == 0 {
@@ -153,15 +176,8 @@ const testRealHomesEnv = "TT_TEST_REAL_HOMES"
 func realHomeGuard() error {
 	real := filepath.SplitList(os.Getenv(testRealHomesEnv))
 	home, _ := os.UserHomeDir()
-	const rule = "a test and every process it starts must use a temporary home (see runWithOwnHome)"
-	own := []string{os.TempDir()}
-	for _, dir := range real {
-		if home != "" && pathWithinAny(dir, []string{home}) && pathWithinAny(home, []string{dir}) {
-			return fmt.Errorf("real-home guard: the home of this hub/cmd/tt test process is the real user home %s; %s", home, rule)
-		}
-	}
-	if home != "" {
-		own = append(own, home)
+	if isRealHome(home, real) {
+		return fmt.Errorf("real-home guard: the home of this hub/cmd/tt test process is the real user home %s; %s", home, realHomeRule)
 	}
 	for _, p := range []struct{ what, path string }{
 		{"the redaction setting", toolRedactSettingPath()},
@@ -171,11 +187,226 @@ func realHomeGuard() error {
 		{"the tool ledger", toolLedgerRoot()},
 		{"the Codex home", codexHome()},
 	} {
-		if p.path != "" && !pathWithinAny(p.path, own) && pathWithinAny(p.path, real) {
-			return fmt.Errorf("real-home guard: this hub/cmd/tt test process resolves %s to %s, inside the real user home; %s", p.what, p.path, rule)
+		if realHomePath(p.path, real) {
+			return fmt.Errorf("real-home guard: this hub/cmd/tt test process resolves %s to %s, inside the real user home; %s", p.what, p.path, realHomeRule)
 		}
 	}
 	return nil
+}
+
+const realHomeRule = "a test and every process it starts must use a temporary home (see runWithOwnHome and docs/test-isolation.md)"
+
+// isRealHome reports whether home is one of the real homes itself.
+func isRealHome(home string, real []string) bool {
+	for _, dir := range real {
+		if home != "" && pathWithinAny(dir, []string{home}) && pathWithinAny(home, []string{dir}) {
+			return true
+		}
+	}
+	return false
+}
+
+// realHomePath reports whether path lies within a real home and outside this
+// run's own directories: the temporary directory, and the current home when
+// that home is not itself a real one.
+func realHomePath(path string, real []string) bool {
+	if path == "" || !pathWithinAny(path, real) {
+		return false
+	}
+	own := []string{os.TempDir()}
+	if home, _ := os.UserHomeDir(); home != "" && !isRealHome(home, real) {
+		own = append(own, home)
+	}
+	return !pathWithinAny(path, own)
+}
+
+// homeRead is a real-home path the home seam resolved during the run: the
+// function that asked for it and the test it is charged to. Test is empty
+// when no running test started the reading goroutine; starter then names the
+// last function known to have started it.
+type homeRead struct{ path, caller, test, starter string }
+
+func (r *homeRead) message() string {
+	who := r.test
+	if who == "" {
+		who = "no running test"
+		if r.starter != "" {
+			who += " (a goroutine started by " + r.starter + ")"
+		}
+	}
+	return fmt.Sprintf("real-home guard: %s resolved %s inside the real user home, through %s; %s", who, r.path, r.caller, realHomeRule)
+}
+
+var (
+	// homeReadFirst keeps the first real-home read of the run, and
+	// homeReadMore counts the rest, for guardedRun's report.
+	homeReadFirst atomic.Pointer[homeRead]
+	homeReadMore  atomic.Int64
+)
+
+// installHomeWatch sets homeWatch for the run, with the real homes fixed now:
+// a test that later changes TT_TEST_REAL_HOMES for a child cannot switch the
+// watch off. Without real homes (a live run) nothing is watched.
+func installHomeWatch(real []string) {
+	if len(real) == 0 {
+		return
+	}
+	homeWatch = func(path string) { homeGuardWatch(path, real) }
+}
+
+// homeGuardWatch is the run's homeWatch. A path inside a real home is kept
+// as a homeRead and, when a test is found for it, fails that test with a
+// panic: in the test's own goroutine testing prints --- FAIL for it, and in a
+// goroutine it started the binary exits with the message.
+func homeGuardWatch(path string, real []string) {
+	if !realHomePath(path, real) {
+		return
+	}
+	caller, test := homeReadCaller()
+	r := &homeRead{path: path, caller: caller, test: test}
+	if test == "" {
+		r.test, r.starter = homeReadStarter()
+	}
+	if !homeReadFirst.CompareAndSwap(nil, r) {
+		homeReadMore.Add(1)
+	}
+	if r.test != "" {
+		panic(r.message())
+	}
+}
+
+// homeSeamFrame reports whether a function of this package lies between a
+// caller and the watch. The watch's closure may be inlined into guardedRun,
+// so it is matched by its suffix.
+func homeSeamFrame(name string) bool {
+	switch name {
+	case "homeDir", "homeSetting", "homeSeen", "homeGuardWatch", "homeReadCaller":
+		return true
+	}
+	return strings.Contains(name, "installHomeWatch.func")
+}
+
+// homePackage is the package prefix of this binary's functions, "main".
+var homePackage = strings.TrimSuffix(runtime.FuncForPC(reflect.ValueOf(homeDir).Pointer()).Name(), ".homeDir")
+
+// homeReadCaller returns the first function outside the seam, as
+// "relayDir (relay.go:140)", and the test on the current goroutine's stack.
+func homeReadCaller() (caller, test string) {
+	pcs := make([]uintptr, 256)
+	for {
+		n := runtime.Callers(1, pcs)
+		if n < len(pcs) {
+			pcs = pcs[:n]
+			break
+		}
+		pcs = make([]uintptr, 2*len(pcs))
+	}
+	frames := runtime.CallersFrames(pcs)
+	for {
+		frame, more := frames.Next()
+		name, ours := strings.CutPrefix(frame.Function, homePackage+".")
+		if caller == "" && !(ours && homeSeamFrame(name)) {
+			caller = fmt.Sprintf("%s (%s:%d)", strings.TrimPrefix(frame.Function, homePackage+"."), filepath.Base(frame.File), frame.Line)
+		}
+		if t := homeTestName(frame.Function); t != "" && test == "" {
+			test = t
+		}
+		if !more || test != "" {
+			return caller, test
+		}
+	}
+}
+
+// homeTestName returns the top-level test, fuzz, benchmark or example
+// function a frame belongs to, without a closure suffix, or "".
+func homeTestName(function string) string {
+	name, ours := strings.CutPrefix(function, homePackage+".")
+	if !ours {
+		return ""
+	}
+	name, _, _ = strings.Cut(name, ".")
+	for _, prefix := range []string{"Test", "Fuzz", "Benchmark", "Example"} {
+		rest, ok := strings.CutPrefix(name, prefix)
+		if !ok || name == "TestMain" {
+			continue
+		}
+		if r, _ := utf8.DecodeRuneInString(rest); rest == "" || !unicode.IsLower(r) {
+			return name
+		}
+	}
+	return ""
+}
+
+// homeReadStarter follows the current goroutine's starters through a full
+// traceback, using Go's "created by F in goroutine N" lines, to the first
+// one that is or runs a test. It returns that test, or "" and the last
+// starter found, when the chain ends at a goroutine that has exited or at
+// TestMain's.
+func homeReadStarter() (test, starter string) {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) || len(buf) >= 64<<20 {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	type block struct {
+		funcs   []string
+		creator string
+		parent  string
+	}
+	blocks := map[string]block{}
+	first := ""
+	for _, text := range strings.Split(string(buf), "\n\n") {
+		lines := strings.Split(strings.TrimSpace(text), "\n")
+		id, ok := strings.CutPrefix(lines[0], "goroutine ")
+		if !ok {
+			continue
+		}
+		id, _, _ = strings.Cut(id, " ")
+		var b block
+		for _, line := range lines[1:] {
+			if strings.HasPrefix(line, "	") {
+				continue
+			}
+			if created, ok := strings.CutPrefix(line, "created by "); ok {
+				b.creator, b.parent, _ = strings.Cut(created, " in goroutine ")
+				continue
+			}
+			if i := strings.LastIndex(line, "("); i > 0 {
+				b.funcs = append(b.funcs, line[:i])
+			}
+		}
+		if first == "" {
+			first = id
+		}
+		blocks[id] = b
+	}
+	for id, seen := first, map[string]bool{}; id != "" && !seen[id]; {
+		seen[id] = true
+		b, ok := blocks[id]
+		if !ok {
+			break
+		}
+		if id != first {
+			for _, f := range b.funcs {
+				if t := homeTestName(f); t != "" {
+					return t, ""
+				}
+			}
+		}
+		if b.creator == "" {
+			break
+		}
+		starter = strings.TrimPrefix(b.creator, homePackage+".")
+		if t := homeTestName(b.creator); t != "" {
+			return t, ""
+		}
+		id = b.parent
+	}
+	return "", starter
 }
 
 // pathWithinAny reports whether path is one of dirs or below one, comparing

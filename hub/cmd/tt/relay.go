@@ -134,10 +134,10 @@ func relayAgentSkipReason(a api.Agent, b runtimeBinding) string {
 }
 
 func relayDir() string {
-	if path := os.Getenv("TAILTERM_RELAY_STATE"); path != "" {
+	if path := homeSetting("TAILTERM_RELAY_STATE"); path != "" {
 		return path
 	}
-	home, _ := os.UserHomeDir()
+	home, _ := homeDir()
 	return filepath.Join(home, ".local", "state", "tailterm", "relay")
 }
 func bindingKey(b runtimeBinding) string {
@@ -188,7 +188,7 @@ func bindRuntime(e env, thread string) error {
 	if err != nil {
 		return err
 	}
-	b := runtimeBinding{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Thread: thread, Codex: codex, CodexHome: os.Getenv("CODEX_HOME"), Runtime: "codex", Session: os.Getenv(spawn.EnvSession)}
+	b := runtimeBinding{Hub: e.hub, Task: e.task, Agent: e.agent, Run: e.runID, Thread: thread, Codex: codex, CodexHome: homeSetting("CODEX_HOME"), Runtime: "codex", Session: os.Getenv(spawn.EnvSession)}
 	if !validBinding(b) {
 		return errors.New("a task agent, run, and exact Codex thread UUID are required")
 	}

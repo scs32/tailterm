@@ -81,7 +81,7 @@ exit 0
 
 // claudeUsageHome is the home directory the capture lives under.
 func claudeUsageHome() string {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return ""
 	}

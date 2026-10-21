@@ -776,7 +776,7 @@ func hubReachSettingsFrom(config map[string]json.RawMessage, home string) hubRea
 
 func nativeHubReachSettings() hubReachSettings {
 	config, _ := readRelayConfig()
-	home, _ := os.UserHomeDir()
+	home, _ := homeDir()
 	return hubReachSettingsFrom(config, home)
 }
 

@@ -207,7 +207,7 @@ func activityDefaults() activityThresholds {
 }
 
 func activityTranscript(b runtimeBinding) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homeDir()
 	if err != nil {
 		return "", err
 	}
