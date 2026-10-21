@@ -287,6 +287,84 @@ func TestTeamQueueFailedReleaseKeepsHistoryAndAllowsNextClaim(t *testing.T) {
 	}
 }
 
+// wi_2079cf201c960a84: the host listing names a failed, unreleased entry even
+// when it is its project's only entry on the host, so the runner visits the
+// project and its failed-entry release check runs. Released failed and
+// finished entries stay out; an owner-integrated failed entry stays in.
+func TestTeamQueueHostListingNamesFailedUnreleasedEntry(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 2)
+	ctx := context.Background()
+	claimFail := func(q api.TeamQueueEntry) api.TeamQueueEntry {
+		t.Helper()
+		q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "fail-" + q.ID, Operation: "fail", EntryID: q.ID, ExpectedRevision: q.Revision, Failure: "planned fixture failure"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	release := func(q api.TeamQueueEntry) api.TeamQueueEntry {
+		t.Helper()
+		q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "release-" + q.ID, Operation: "release", EntryID: q.ID, ExpectedRevision: q.Revision})
+		if err != nil || q.ReleasedAt == "" {
+			t.Fatalf("release %+v %v", q, err)
+		}
+		return q
+	}
+	hosted := func(host string) []string {
+		t.Helper()
+		list, err := s.TeamQueuesByHost(ctx, host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := []string{}
+		for _, q := range list.Entries {
+			ids = append(ids, q.ID)
+		}
+		return ids
+	}
+	// History only: a released failed entry and a finished one.
+	released := release(claimFail(addCheckoutEntry(t, s, task, items[1], orders[1], "/b", "src/b")))
+	insertHistoryEntries(t, s, task, 100, 1, []byte(`{}`), nil)
+	if got := hosted("mini"); len(got) != 0 {
+		t.Fatalf("history listed on its host: %v", got)
+	}
+	failed := claimFail(addCheckoutEntry(t, s, task, items[0], orders[0], "/a", "src/a"))
+	if failed.State != "failed" || failed.ReleasedAt != "" || failed.OwnerIntegration != nil {
+		t.Fatalf("fixture entry %+v", failed)
+	}
+	if got := hosted("mini"); !reflect.DeepEqual(got, []string{failed.ID}) {
+		t.Fatalf("host listing %v, want only the failed unreleased entry %s", got, failed.ID)
+	}
+	if got := hosted("other"); len(got) != 0 {
+		t.Fatalf("another host lists %v", got)
+	}
+	// The project the listing names reaches the runner's release branch: a
+	// parallel queue whose active view holds the entry failed and unreleased
+	// with no owner integration. Its release then leaves the host listing.
+	page, err := s.TeamQueuePage(ctx, task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || !queueParallel(page.ConcurrencyLimit) || len(page.Entries) != 1 {
+		t.Fatalf("active view %+v %v", page, err)
+	}
+	if q := page.Entries[0]; q.ID != failed.ID || q.Host != "mini" || q.State != "failed" || q.ReleasedAt != "" || q.OwnerIntegration != nil {
+		t.Fatalf("active entry %+v", q)
+	}
+	release(failed)
+	if got := hosted("mini"); len(got) != 0 {
+		t.Fatalf("released entry still listed: %v", got)
+	}
+	// An owner-integrated failed entry is listed as before, released or not.
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET owner_integration_json='{"commit":"abc","baseCommit":"def","changedFiles":[],"at":"2026-09-30T00:00:00Z"}' WHERE id=?`, released.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := hosted("mini"); !reflect.DeepEqual(got, []string{released.ID}) {
+		t.Fatalf("owner-integrated entry not listed: %v", got)
+	}
+}
+
 func TestTeamQueueReleaseRejectsUncertainRunAndUnsafeProject(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()
