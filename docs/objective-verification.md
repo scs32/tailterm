@@ -377,9 +377,9 @@ floor refused every queue launch. On each scheduled sweep pass (the
 `worktreeSweepInterval`, default 1h), the relay unlinks build entries untouched
 for longer than `verificationCacheTrimMaxAge` (default `24h`, floor `2h`), then
 holds the build directories to a size cap (below). Go refreshes a used entry's
-mtime once it is an hour old, so under the cap anything a run used in the last
-day stays. The trim is on by default because the root is the
-harness's own. Set `"verificationCacheTrim": "off"` in
+mtime only once it is an hour old, so an entry's mtime can lag its last use by
+up to an hour: under the cap anything a run used in the last 23 hours stays.
+The trim is on by default because the root is the harness's own. Set `"verificationCacheTrim": "off"` in
 `~/.config/tailterm/relay.json` to stop it; a value other than `on` or `off`,
 or a relay.json that cannot be read, skips the pass. It is separate from
 `goBuildCacheTrim`, which covers the user's own `GOCACHE`.
@@ -412,8 +412,9 @@ or a relay.json that cannot be read, skips the pass. It is separate from
 - **Size cap.** After the age walk, while the build directories still hold
   more than `verificationCacheTrimMaxGiB` (default 20 GiB), the trim removes
   the entries the walk kept that are older than 2h, oldest mtime first, until
-  they fit. Entries used in the last two hours always stay; when only those
-  are left the line says `size cap <cap> not reached: the rest is under 2h`.
+  they fit. Entries modified in the last two hours always stay, so, with
+  Go's one-hour refresh, any entry used in the last hour stays; when only
+  those are left the line says `size cap <cap> not reached: the rest is under 2h`.
   A pass that stopped early skips the cap. Low space does not start a trim or
   change what goes: when the volume's free space is under the sweep's
   `worktreeSweepLowSpaceGiB` as the cap begins, the cap's removals are named
