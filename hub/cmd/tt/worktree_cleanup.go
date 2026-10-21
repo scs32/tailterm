@@ -161,7 +161,8 @@ type worktreeCleanupInputs struct {
 	// Dismissed is each dismissed work item's last update, which is no
 	// earlier than its dismissal (sweep only). An item with no queue record
 	// that is listed here is decided by its dismissal; any other stays
-	// retention. DismissedFault says why some dismissals could not be read.
+	// retention. DismissedFault is a pass-wide note naming the projects whose
+	// dismissals could not be read.
 	Dismissed      map[string]time.Time
 	DismissedFault string
 	// Artifacts overrides the artifacts root (default: artifactsRootFor).
@@ -1745,11 +1746,35 @@ func pinArtifactHead(ctx context.Context, common, item string, w gitWorktree) (s
 	return "", false, errors.New("retired refs for " + name + " hold other commits")
 }
 
-// leftoverManifest returns a manifest beside the checkout that already names
-// its path and head, or "": one a pass wrote before it stopped short of the
-// removal, or one an earlier checkout of the same commit there left. Either
-// already describes this removal. Only regular files are read.
-func leftoverManifest(w gitWorktree) string {
+// checkoutCreated is when the worktree whose admin directory is admin was
+// added: the directory's birth time where the platform records one, or else
+// the time its commondir file, written once by git worktree add, was written.
+func checkoutCreated(admin string) (time.Time, bool) {
+	if admin == "" {
+		return time.Time{}, false
+	}
+	if info, err := os.Lstat(admin); err == nil {
+		if birth, ok := birthTime(info); ok {
+			return birth, true
+		}
+	}
+	if info, err := os.Lstat(filepath.Join(admin, "commondir")); err == nil {
+		return info.ModTime(), true
+	}
+	return time.Time{}, false
+}
+
+// leftoverManifest returns a manifest a pass wrote for this very checkout
+// before it stopped short of the removal, or "": a regular file beside it
+// that names its path and head and was written no earlier than the checkout
+// was added. A manifest from an earlier checkout at the same path, even of
+// the same commit, is older than this one and is not reused; nor is any when
+// the checkout's creation time cannot be read.
+func leftoverManifest(w gitWorktree, admin string) string {
+	created, ok := checkoutCreated(admin)
+	if !ok {
+		return ""
+	}
 	dir, base := filepath.Split(w.Path)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1770,7 +1795,10 @@ func leftoverManifest(w gitWorktree) string {
 			continue
 		}
 		var m artifactManifest
-		if json.Unmarshal(data, &m) == nil && m.Path == w.Path && m.Head == w.Head {
+		if json.Unmarshal(data, &m) != nil || m.Path != w.Path || m.Head != w.Head {
+			continue
+		}
+		if at, err := time.Parse(time.RFC3339Nano, m.At); err == nil && !at.Before(created) {
 			return path
 		}
 	}
@@ -1780,9 +1808,9 @@ func leftoverManifest(w gitWorktree) string {
 // removeArtifactCheckout pins the checkout's commit when nothing else holds
 // it, writes the manifest, then removes the worktree through the ordinary
 // re-checked path. A removal that keeps the checkout takes the manifest and
-// a ref made here back. A manifest left beside the checkout for its path and
-// head is reused, not written again, so a pass that stopped between the write
-// and the removal leaves one manifest; a reused one is never taken back.
+// a ref made here back. A manifest an earlier pass wrote for this same
+// checkout is reused, not written again, so a pass that stopped between the
+// write and the removal leaves one manifest; a reused one is never taken back.
 func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, admin string, cleared map[string]bool, item string, st artifactItemState, base worktreeCleanupReceipt, now time.Time) (string, string, string, int64) {
 	m, err := buildArtifactManifest(ctx, w, item, st, base, now)
 	if err != nil {
@@ -1798,7 +1826,7 @@ func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, a
 		}
 	}
 	m.PinnedRef = ref
-	manifest := leftoverManifest(w)
+	manifest := leftoverManifest(w, admin)
 	reused := manifest != ""
 	if !reused {
 		if manifest, err = writeArtifactManifest(w.Path, m, now); err != nil {
@@ -2398,11 +2426,21 @@ type sweepHubState struct {
 	dismissFault string
 }
 
+// dismissalFault is the pass-wide note for the projects whose dismissals
+// could not be read: an item with no queue record may be one of theirs.
+func dismissalFault(projects []string) string {
+	if len(projects) == 0 {
+		return ""
+	}
+	return "this pass could not read the dismissed items of " + strings.Join(projects, ", ")
+}
+
 // readSweepHub reads every project's agents, every page of its queue and its
 // dismissed work items. A dismissal read that fails only leaves those items
 // retention, so it is noted rather than refused.
 func readSweepHub(ctx context.Context, c *api.Client) (sweepHubState, error) {
 	state := sweepHubState{dismissed: map[string]time.Time{}}
+	var unreadable []string
 	tasks, err := c.ListTasks(ctx)
 	if err != nil {
 		return state, fmt.Errorf("sweep needs the hub: %w", err)
@@ -2437,10 +2475,11 @@ func readSweepHub(ctx context.Context, c *api.Client) (sweepHubState, error) {
 			}
 			after = queue.History.NextAfter
 		}
-		if err := readDismissed(ctx, c, task.ID, state.dismissed); err != nil && state.dismissFault == "" {
-			state.dismissFault = "dismissals of project " + task.ID + " unreadable: " + err.Error()
+		if err := readDismissed(ctx, c, task.ID, state.dismissed); err != nil {
+			unreadable = append(unreadable, task.ID)
 		}
 	}
+	state.dismissFault = dismissalFault(unreadable)
 	return state, nil
 }
 

@@ -5712,7 +5712,7 @@ func TestWorktreeCleanupSweepDismissedItemCheckouts(t *testing.T) {
 	r := newCleanupRepo(t)
 	r.ignoreBuildOutput(t)
 	host := spawn.Host()
-	const task, unreadable = "tsk_d15d15d15d15d150", "tsk_d15d15d15d15d151"
+	const task, unreadable, alsoUnreadable = "tsk_d15d15d15d15d150", "tsk_d15d15d15d15d151", "tsk_d15d15d15d15d152"
 	const itemD, itemE = "wi_d4d4d4d4d4d4d4d4", "wi_e5e5e5e5e5e5e5e5"
 	now := time.Now()
 	dismissedAt := now.Add(-2 * time.Hour)
@@ -5726,15 +5726,16 @@ func TestWorktreeCleanupSweepDismissedItemCheckouts(t *testing.T) {
 		return api.WorkItem{ID: id, Seq: seq, TaskID: task, Status: "dismissed", UpdatedAt: at}
 	}
 	hub := &cleanupHub{
-		tasks:   []api.Task{{ID: task, Status: api.TaskOpen}, {ID: unreadable, Status: api.TaskOpen}},
-		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}, unreadable: {Task: api.Task{ID: unreadable, Status: api.TaskOpen}}},
-		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{runningEntry}}},
+		tasks: []api.Task{{ID: task, Status: api.TaskOpen}, {ID: unreadable, Status: api.TaskOpen}, {ID: alsoUnreadable, Status: api.TaskOpen}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}, unreadable: {Task: api.Task{ID: unreadable, Status: api.TaskOpen}},
+			alsoUnreadable: {Task: api.Task{ID: alsoUnreadable, Status: api.TaskOpen}}},
+		queues: map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{runningEntry}}},
 		workItems: map[string][]api.WorkItem{
 			task: {dismissed(1, artifactItemA, dismissedAt), dismissed(2, artifactItemB, now.Add(-10*time.Minute)), dismissed(3, artifactItemC, dismissedAt),
 				{ID: itemD, Seq: 4, TaskID: task, Status: "open", UpdatedAt: dismissedAt}},
 			unreadable: {dismissed(1, itemE, dismissedAt)},
 		},
-		workItemsFail: map[string]bool{unreadable: true},
+		workItemsFail: map[string]bool{unreadable: true, alsoUnreadable: true},
 	}
 	server := httptest.NewServer(hub)
 	defer server.Close()
@@ -5746,7 +5747,8 @@ func TestWorktreeCleanupSweepDismissedItemCheckouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fault := "dismissals of project " + unreadable + " unreadable"
+	// The note is pass-wide and names every project whose listing failed.
+	fault := "this pass could not read the dismissed items of " + unreadable + ", " + alsoUnreadable
 	for _, want := range []string{
 		"would-remove " + old + " (artifact checkout; item " + artifactItemA + " dismissed 2h ago; ",
 		"kept retention " + young + ": dismissed 10m ago; eligible after 1h",
@@ -5792,7 +5794,7 @@ func TestWorktreeCleanupSweepDismissedItemCheckouts(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, err := readSweepHub(context.Background(), c)
-	if err != nil || len(state.dismissed) != api.MaxLimit+1 || state.dismissFault == "" {
+	if err != nil || len(state.dismissed) != api.MaxLimit+1 || state.dismissFault != fault {
 		t.Fatalf("paged dismissals: %d, fault %q, %v", len(state.dismissed), state.dismissFault, err)
 	}
 	if _, ok := state.dismissed[fmt.Sprintf("wi_%016x", api.MaxLimit+1)]; !ok {
@@ -5831,7 +5833,7 @@ func TestWorktreeCleanupArtifactManifestAfterCrash(t *testing.T) {
 	// The crash: the manifest is written and the checkout is still there.
 	crashed := r.verifierCheckout(t, artifactItemA, "verifier-abc1234")
 	head := cleanupGit(t, crashed, "rev-parse", "HEAD")
-	left, err := writeArtifactManifest(crashed, artifactManifest{Version: 1, At: "2026-10-01T00:00:00Z", Source: "sweep", ItemID: artifactItemA, Path: crashed, Head: head, Basis: artifactItemReleased, Entries: []artifactManifestEntry{}}, time.Now())
+	left, err := writeArtifactManifest(crashed, artifactManifest{Version: 1, At: time.Now().UTC().Format(time.RFC3339Nano), Source: "sweep", ItemID: artifactItemA, Path: crashed, Head: head, Basis: artifactItemReleased, Entries: []artifactManifestEntry{}}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5885,5 +5887,29 @@ func TestWorktreeCleanupArtifactManifestAfterCrash(t *testing.T) {
 	}
 	if m := manifests(again); len(m) != 2 {
 		t.Fatalf("manifests %v", m)
+	}
+
+	// A checkout re-created at the same path after a real removal has the
+	// same head, as verifier folders are named by commit; its removal still
+	// writes a manifest of its own.
+	const itemC = artifactItemC
+	first := r.verifierCheckout(t, itemC, filepath.Join("verifier-abc1234", "checkout"))
+	items = artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(itemC)}, nil)
+	d = requireDecision(t, r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true}), first, "removed", "")
+	removedFirst := d.Manifest
+	firstBytes := readFixtureFiles(t, removedFirst)
+	recreated := r.verifierCheckout(t, itemC, filepath.Join("verifier-abc1234", "checkout"))
+	if recreated != first || cleanupGit(t, recreated, "rev-parse", "HEAD") != readArtifactManifest(t, removedFirst).Head {
+		t.Fatal("the fixture did not re-create the same checkout")
+	}
+	d = requireDecision(t, r.artifactSweep(t, worktreeCleanupInputs{Items: items, Apply: true}), recreated, "removed", "")
+	if d.Manifest == removedFirst || !strings.HasPrefix(d.Manifest, recreated+".removed-") {
+		t.Fatalf("re-created checkout reused the earlier manifest: %+v", d)
+	}
+	if m := manifests(recreated); len(m) != 2 {
+		t.Fatalf("manifests after the re-created removal: %v", m)
+	}
+	if after := readFixtureFiles(t, removedFirst); after[removedFirst] != firstBytes[removedFirst] {
+		t.Fatal("the earlier removal's manifest was changed")
 	}
 }
