@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,pushGroupState,processStartTime,bootIdentity,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -634,7 +634,7 @@ async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={})
  a.escalate=async d=>{escalations.push(d);a.calls.push("escalate");};a.finish=async(r,g)=>{await host.finish(r,g);a.calls.push("finish");};
  if(setup)setup(f,c);
  const started=Date.now(),r=await runRelease(c,a),took=Date.now()-started;
- return {f,j,a,c,r,took,escalations,dir:dirname(gitPath),file:readFileSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"),"utf8"),journal:JSON.parse(readFileSync(c.journalPath,"utf8"))};
+ return {f,j,a,c,r,took,escalations,dir:dirname(gitPath),file:existsSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"))?readFileSync(join(dirname(c.journalPath),"rel_fixture-receipt.json"),"utf8"):null,journal:JSON.parse(readFileSync(c.journalPath,"utf8"))};
 }
 const STDERR_TEXT=["unable to access","RPC failed","[redacted]","hunter2","ghs_","fatal","error:"];
 const noStderr=(text,what)=>{for(const s of STDERR_TEXT)assert.ok(!text.includes(s),`${what} holds ${s}`);};
@@ -723,6 +723,131 @@ test("push p4 a run stopped in pushing after a failed attempt pushes once more a
  // A good push on the next resume keeps the old bare shape.
  after.phase="pushing";delete after.receipt.push;writeFileSync(t.c.journalPath,JSON.stringify(after));
  const good=await runRelease({...t.c,push:undefined},t.a);assert.deepEqual(good.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(remoteHead(t.f),t.j.commit);
+});
+// wi_56e50fb1bc6bbdaa: a run stopped mid-push leaves its push group
+// journaled with process-instance proof, and the resume settles it first.
+// The fake push and ls-remote log each call to $D/log; files in $D choose
+// the push: fail or landed. An earlier group is a detached shell like the runner's push that
+// logs the SIGTERM it gets, so the log shows the order of stop, read and push.
+const RESUMABLE='echo push >> "$D/log"; [ -f "$D/fail" ] && { cat "$ERR" >&2; exit 128; }; [ -f "$D/landed" ] && { "$REAL" "$@" || exit $?; echo "error: RPC failed" >&2; exit 1; }; :';
+const LOGGED_READ='echo ls-remote >> "$D/log"',TRAPPED='trap \'echo earlier-term >> "$D/log"; exit 143\' TERM; touch "$D/ready"; sleep 30 & wait';
+const modes=(...names)=>(f,c)=>{for(const n of names)writeFileSync(join(dirname(c.push.git),n),"");};
+const pushLog=t=>{try{return readFileSync(join(t.dir,"log"),"utf8").split("\n").filter(Boolean);}catch{return [];}};
+const waitFor=async(check,ms=10000)=>{const end=Date.now()+ms;while(!check()){if(Date.now()>end)throw new Error("timed out waiting");await new Promise(r=>setTimeout(r,20));}};
+async function earlierGroup(t,script,{cwd=t.dir,proof=true}={}){
+ rmSync(join(t.dir,"ready"),{force:true});
+ const child=spawn("sh",["-c",script],{cwd,detached:true,stdio:"ignore",env:{...process.env,D:t.dir,REAL:REAL_GIT,C:t.j.commit}});child.unref();
+ await waitFor(()=>existsSync(join(t.dir,"ready")));
+ return {pgid:child.pid,startedAt:proof?processStartTime(child.pid):null,boot:proof?bootIdentity():null};
+}
+// The journal as a run stopped in pushing leaves it, with the given group.
+const resumeAt=(t,pushGroup)=>{const journal=JSON.parse(readFileSync(t.c.journalPath,"utf8"));journal.phase="pushing";delete journal.receipt.push;if(pushGroup)journal.pushGroup=pushGroup;writeFileSync(t.c.journalPath,JSON.stringify(journal));writeFileSync(join(t.dir,"log"),"");};
+const readJournalFile=t=>JSON.parse(readFileSync(t.c.journalPath,"utf8"));
+const killGroup=pgid=>{try{process.kill(-pgid,"SIGKILL");}catch{}};
+test("push r1 the push group and its proof are journaled before the runner waits on the push, and never reach the receipt",async t0=>{
+ process.env.RELEASE_TEST_JOURNAL="";t0.after(()=>{delete process.env.RELEASE_TEST_JOURNAL;});
+ const seen='echo $$ > "$D/leader.pid"; i=0; while ! grep -q pushGroup "$RELEASE_TEST_JOURNAL" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; cp "$RELEASE_TEST_JOURNAL" "$D/seen.json"';
+ const t=await pushCase(seen,undefined,{setup:(f,c)=>{process.env.RELEASE_TEST_JOURNAL=c.journalPath;}});
+ const during=JSON.parse(readFileSync(join(t.dir,"seen.json"),"utf8")),leader=Number(readFileSync(join(t.dir,"leader.pid"),"utf8"));
+ assert.equal(during.phase,"pushing");assert.equal(during.pushGroup.pgid,leader);assert.equal(typeof during.pushGroup.startedAt,"string");assert.ok(during.pushGroup.startedAt.length>0);
+ assert.equal(during.pushGroup.boot,bootIdentity());assert.ok(bootIdentity());
+ assert.deepEqual(t.r.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(t.journal.pushGroup,undefined,"a finished push leaves no group");
+ for(const text of [JSON.stringify(t.r),t.file])for(const word of ["pushGroup","pgid","startedAt","boot"])assert.ok(!text.includes(word),word);
+});
+test("push r2 a resume stops a live earlier push group that is ours, then reads the remote, then pushes",async()=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});assert.equal(t.escalations.length,1);rmSync(join(t.dir,"fail"));
+ const group=await earlierGroup(t,TRAPPED);
+ try{
+  assert.equal(pushGroupState(group),"ours");resumeAt(t,group);
+  const r=await runRelease(t.c,t.a);
+  assert.deepEqual(pushLog(t),["earlier-term","ls-remote","push"],"stop, then read, then push");
+  assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(remoteHead(t.f),t.j.commit);assert.equal(groupGone(group.pgid),true);
+  const after=readJournalFile(t);assert.equal(after.pushGroup,undefined);assert.deepEqual(after.pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"ours",stopped:true,remoteCheck:"absent"});
+  assert.equal(t.escalations.length,1,"no second escalation");assert.equal(after.phase,"complete");
+ }finally{killGroup(group.pgid);}
+});
+test("push r2 a resume whose stopped earlier push had landed reads it landed and does not push again",async()=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+ const group=await earlierGroup(t,`"$REAL" push --quiet origin "$C:refs/heads/tasks-hub" || exit 1; ${TRAPPED}`,{cwd:t.f.cwd});
+ try{
+  assert.equal(remoteHead(t.f),t.j.commit);resumeAt(t,group);
+  const r=await runRelease(t.c,t.a);
+  assert.deepEqual(pushLog(t),["earlier-term","ls-remote"],"no new push");assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});
+  assert.deepEqual(readJournalFile(t).pushAttempts.at(-1),{at:readJournalFile(t).pushAttempts.at(-1).at,outcome:"pushed",earlierGroup:{pgid:group.pgid,proof:"ours",stopped:true,remoteCheck:"landed"}});
+  assert.equal(t.escalations.length,1);
+ }finally{killGroup(group.pgid);}
+});
+test("push r2 an earlier group that outlives the stop bound is unknown, unread, not pushed again and escalated once",async()=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("landed")});assert.deepEqual(t.escalations,[]);rmSync(join(t.dir,"landed"));
+ const group=await earlierGroup(t,'trap "" TERM; touch "$D/ready"; sleep 30');
+ try{
+  resumeAt(t,group);
+  const r=await runRelease({...t.c,push:{...t.c.push,graceMs:4000,stopMs:300}},t.a);
+  assert.deepEqual(pushLog(t),[],"no read and no push while the group runs");assert.equal(groupGone(group.pgid),false);
+  assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"failed",reason:"push-failed",remoteCheck:"unknown"});
+  assert.equal(t.escalations.length,1);assert.deepEqual(t.escalations[0].pushCause,{reason:"push-failed",remoteCheck:"unknown"});
+  const after=readJournalFile(t);assert.deepEqual(after.pushGroup,group,"still journaled");assert.deepEqual(after.pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"ours",stopped:false});
+ }finally{killGroup(group.pgid);}
+});
+test("push r3 a recorded group that is gone keeps today's resume: no signal, no read before the push",async()=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+ const group=await earlierGroup(t,'touch "$D/ready"; exit 0');await waitFor(()=>groupGone(group.pgid));
+ assert.equal(pushGroupState(group),"gone");resumeAt(t,group);
+ const r=await runRelease(t.c,t.a);
+ assert.deepEqual(pushLog(t),["push"]);assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});
+ assert.deepEqual(readJournalFile(t).pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"gone",stopped:true});assert.equal(readJournalFile(t).pushGroup,undefined);
+});
+test("push r4 a live group the resume cannot prove its own is never signalled",async()=>{
+ // Another start time or boot: the pid is someone else's, so the push is over.
+ for(const other of [{startedAt:"Thu Jan  1 00:00:00 1970"},{boot:"another-boot"}]){
+  const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+  const group=await earlierGroup(t,TRAPPED);
+  try{
+   const recorded={...group,...other};assert.equal(pushGroupState(recorded),"gone");resumeAt(t,recorded);
+   const r=await runRelease(t.c,t.a);
+   assert.deepEqual(pushLog(t),["push"],"no earlier-term");assert.equal(groupGone(group.pgid),false,"left running");assert.equal(r.push.outcome,"pushed");
+  }finally{killGroup(group.pgid);}
+ }
+ // No proof at all: present, unproven, unsignalled, unread and not pushed again.
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+ const group=await earlierGroup(t,TRAPPED,{proof:false});
+ try{
+  assert.equal(pushGroupState(group),"unproven");assert.equal(pushGroupState({pgid:1}),"unproven");assert.equal(pushGroupState({pgid:"7"}),"unproven");
+  resumeAt(t,group);
+  const r=await runRelease(t.c,t.a);
+  assert.deepEqual(pushLog(t),[]);assert.equal(groupGone(group.pgid),false);
+  assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"failed",reason:"push-failed",remoteCheck:"unknown"});
+  assert.deepEqual(readJournalFile(t).pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"unproven",stopped:false});
+ }finally{killGroup(group.pgid);}
+});
+// A runner process with the entry point's stop handling (SIGTERM and SIGINT
+// only abort its waits) is stopped mid-push: the push finishes, the release
+// completes and the group is cleared before it exits.
+test("push r5 a clean runner stop mid-push lets the push finish, and the release completes with its group cleared",async t0=>{
+ const gitPath=fakeGit('touch "$D/pushing"; while [ ! -f "$D/go" ]; do sleep 0.05; done'),d=dirname(gitPath),out=join(d,"out.json"),script=join(d,"runner.mjs");
+ const url=p=>JSON.stringify(new URL(p,import.meta.url).href);
+ writeFileSync(script,`import {readFileSync,writeFileSync} from "node:fs";
+import {runRelease} from ${url("../scripts/release-runner.mjs")};
+import {fixture,job,change,fake,config} from ${url("./release-runner-fixtures.mjs")};
+const [git,out]=process.argv.slice(2),controller=new AbortController();
+process.on("SIGTERM",()=>controller.abort());process.on("SIGINT",()=>controller.abort());
+const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c={...config(f,j),push:{git}};
+writeFileSync(out+".start",JSON.stringify({f,journalPath:c.journalPath,commit:j.commit}));
+const r=await runRelease(c,a);
+writeFileSync(out,JSON.stringify({r,calls:a.calls,aborted:controller.signal.aborted,journal:JSON.parse(readFileSync(c.journalPath,"utf8"))}));
+`);
+ const child=spawn(process.execPath,[script,gitPath,out],{stdio:"ignore"}),exited=new Promise(r=>child.once("exit",(code,signal)=>r({code,signal})));
+ t0.after(()=>{try{child.kill("SIGKILL");}catch{}});
+ let start,during;
+ await waitFor(()=>{try{start=JSON.parse(readFileSync(out+".start","utf8"));during=JSON.parse(readFileSync(start.journalPath,"utf8"));return existsSync(join(d,"pushing"))&&!!during.pushGroup;}catch{return false;}},30000);
+ assert.equal(during.phase,"pushing");assert.ok(Number.isSafeInteger(during.pushGroup.pgid));
+ child.kill("SIGTERM");await new Promise(r=>setTimeout(r,500));
+ assert.equal(child.exitCode,null,"the runner still waits on the push");assert.equal(groupGone(during.pushGroup.pgid),false,"the push group is not signalled");
+ writeFileSync(join(d,"go"),"");
+ assert.deepEqual(await exited,{code:0,signal:null});
+ const done=JSON.parse(readFileSync(out,"utf8"));
+ assert.equal(done.aborted,true,"the stop reached the runner");assert.equal(done.r.outcome,"released");assert.deepEqual(done.r.push,{remote:"origin",commit:start.commit,outcome:"pushed"});
+ assert.equal(done.journal.phase,"complete");assert.equal(done.journal.pushGroup,undefined);assert.ok(done.calls.includes("finish"));assert.equal(remoteHead(start.f),start.commit);
 });
 test("push p2 the push limit is a named five-minute policy and an invalid commit never runs git",async()=>{
  assert.equal(PUSH_TIMEOUT_MS,300000);const src=readFileSync(new URL("../scripts/release-runner.mjs",import.meta.url),"utf8");assert.ok(!src.includes("timeout:120000"));

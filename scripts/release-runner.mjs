@@ -641,6 +641,13 @@ export function moveReleaseRef(cwd, revert, integrated) {
 // helper) cannot land the push after the re-check. The re-check runs only
 // once the group is gone; a group still present after PUSH_STOP_WAIT_MS is
 // not read and counts as unknown.
+// The resume (wi_56e50fb1bc6bbdaa): the group and its process-instance proof
+// (the leader's start time and the host's boot identity) are journaled before
+// the runner waits on the push, so a runner that stopped mid-push leaves it
+// recorded. A resumed run stops a recorded group that is still ours with the
+// same bounds before it reads the remote or pushes again; a group it cannot
+// prove ours is never signalled. A clean stop of the runner lets the push
+// finish, so only a runner killed mid-push leaves a group for the resume.
 export const PUSH_TIMEOUT_MS = 300000, REMOTE_CHECK_TIMEOUT_MS = 30000, PUSH_STDERR_BYTES = 2048;
 export const PUSH_STOP_GRACE_MS = 5000, PUSH_STOP_WAIT_MS = 15000;
 // The stable reason tags of a failed push, classified from its stderr,
@@ -660,6 +667,28 @@ export function pushStderr(raw) {
   const kept = sanitizeCapture({logs: [{service: "git", lines}]}).logs[0].lines.join("\n"), bytes = Buffer.from(kept, "utf8");
   return bytes.length <= PUSH_STDERR_BYTES ? kept : bytes.subarray(bytes.length - PUSH_STDERR_BYTES).toString("utf8").replace(/^\uFFFD+/, "");
 }
+// The start time of a live pid, as ps prints it, or null.
+export function processStartTime(pid) {
+  try {return execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;} catch {return null;}
+}
+// The host's boot identity: Linux's boot_id or macOS's kern.boottime, or null.
+export function bootIdentity() {
+  try {return readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim()||null;} catch {}
+  try {return execFileSync("sysctl",["-n","kern.boottime"],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;} catch {return null;}
+}
+// What a journaled push group is now: "gone" (no process is left in it, or
+// its pid now belongs to another process or another boot, so the push is
+// over), "ours" (its leader still runs with the recorded start time on the
+// recorded boot) or "unproven" (still present without that proof). Only an
+// "ours" group is ever signalled.
+export function pushGroupState(group) {
+  const pgid = group?.pgid;
+  if (!Number.isSafeInteger(pgid) || pgid <= 1) return "unproven";
+  if (groupGone(pgid)) return "gone";
+  const boot = bootIdentity(), started = processStartTime(pgid);
+  if ((group.boot && boot && group.boot !== boot) || (group.startedAt && started && group.startedAt !== started)) return "gone";
+  return group.boot && boot && group.startedAt && started ? "ours" : "unproven";
+}
 // Signals the push's group, SIGKILL after graceMs, and resolves true once
 // no process is left in it, or false at stopMs.
 export async function stopPushGroup(pgid, {graceMs=PUSH_STOP_GRACE_MS, stopMs=PUSH_STOP_WAIT_MS}={}) {
@@ -675,14 +704,21 @@ export async function stopPushGroup(pgid, {graceMs=PUSH_STOP_GRACE_MS, stopMs=PU
 }
 // One push: {outcome, elapsedMs} and, for a failed one, timedOut, exitCode
 // or signal, reason, the sanitized stderr and stopped (whether the push's
-// process group is gone). elapsedMs stays within the hub's bound. git,
+// process group is gone). elapsedMs stays within the hub's bound. onGroup
+// receives the group's record ({pgid, startedAt, boot}) before the wait. git,
 // timeoutMs, graceMs and stopMs are test seams.
-export async function pushRelease(cwd, commit, {remote="origin", git="git", timeoutMs=PUSH_TIMEOUT_MS, graceMs=PUSH_STOP_GRACE_MS, stopMs=PUSH_STOP_WAIT_MS}={}) {
+export async function pushRelease(cwd, commit, {remote="origin", git="git", timeoutMs=PUSH_TIMEOUT_MS, graceMs=PUSH_STOP_GRACE_MS, stopMs=PUSH_STOP_WAIT_MS, onGroup}={}) {
   if (!sha(commit)) return {outcome:"failed", elapsedMs:0, reason:"push-failed"};
   const start = Date.now(), elapsed = () => Math.min(PROBE_WAIT_MAX_MS, Math.max(0, Date.now() - start));
   let child;
   try {child = spawn(git,["push","--quiet",remote,`${commit}:refs/heads/tasks-hub`],{cwd,detached:true,stdio:["ignore","ignore","pipe"],env:{...process.env,GIT_TERMINAL_PROMPT:"0"}});}
   catch {return {outcome:"failed", elapsedMs:elapsed(), reason:"push-failed", stopped:true};}
+  const group = Number.isSafeInteger(child.pid);
+  // A group that cannot be journaled is stopped before the error goes on.
+  if (group) {
+    try {onGroup?.({pgid:child.pid, startedAt:processStartTime(child.pid), boot:bootIdentity()});}
+    catch (error) {child.stderr?.destroy();child.on("error", () => {});await stopPushGroup(child.pid, {graceMs, stopMs});throw error;}
+  }
   // The last 64 KiB of stderr; pushStderr keeps at most its last 2 KB.
   let raw = Buffer.alloc(0), exit = null;
   child.stderr?.on("data", chunk => {raw = Buffer.concat([raw, chunk]); if (raw.length > 65536) raw = raw.subarray(raw.length - 65536);});
@@ -694,7 +730,7 @@ export async function pushRelease(cwd, commit, {remote="origin", git="git", time
   clearTimeout(timer);
   if (!timedOut && exit.code === 0) return {outcome:"pushed", elapsedMs:elapsed()};
   // Any failed push stops its whole group before anything reads the remote.
-  const stopped = Number.isSafeInteger(child.pid) ? await stopPushGroup(child.pid, {graceMs, stopMs}) : true;
+  const stopped = group ? await stopPushGroup(child.pid, {graceMs, stopMs}) : true;
   if (stopped) await Promise.race([closed, new Promise(r => setTimeout(r, 1000))]);
   const result = {outcome:"failed", elapsedMs:elapsed()}, stderr = pushStderr(raw);
   if (timedOut) result.timedOut = true;
@@ -1034,18 +1070,37 @@ export async function runRelease(config, adapter) {
   // rolls back: a failed push, once its process group is gone, reads the
   // remote once and, unless the commit landed there, is escalated once; the
   // release stands. A group that outlived the stop bound is unknown, unread.
-  // config.push (git, timeoutMs, graceMs, stopMs, checkTimeoutMs) is a test
-  // seam, never set in deploy.json.
+  // A resumed run first settles the push group its stopped run journaled
+  // (state.pushGroup): one that is gone changes nothing; one still ours is
+  // stopped with the push's bounds and, once gone, the remote is read before
+  // any new push, which a landed commit makes unneeded; one that outlives the
+  // bound, or is present without proof, is unknown, unread and not pushed
+  // again. A clean runner stop does not end the push: the release finishes
+  // first. config.push (git, timeoutMs, graceMs, stopMs, checkTimeoutMs) is a
+  // test seam, never set in deploy.json.
   const pushAndFinish=async receipt=>{
     state.receipt=receipt;state.phase="pushing";checkpoint();
-    const seam=config.push||{},pushed=await pushRelease(cwd,receipt.commit,{git:seam.git,timeoutMs:seam.timeoutMs,graceMs:seam.graceMs,stopMs:seam.stopMs});
-    let remoteCheck;
-    if(pushed.outcome==="failed" && pushed.stopped===false)remoteCheck="unknown";
-    else if(pushed.outcome==="failed"){const read=remoteTasksHub(cwd,{git:seam.git,timeoutMs:seam.checkTimeoutMs});remoteCheck=read.unknown?"unknown":read.sha===receipt.commit?"landed":"absent";}
+    const seam=config.push||{},readRemote=()=>{const read=remoteTasksHub(cwd,{git:seam.git,timeoutMs:seam.checkTimeoutMs});return read.unknown?"unknown":read.sha===receipt.commit?"landed":"absent";};
+    let pushed,remoteCheck,earlier;
+    if(state.pushGroup){
+      const proof=pushGroupState(state.pushGroup),stopped=proof==="ours"?await stopPushGroup(state.pushGroup.pgid,{graceMs:seam.graceMs,stopMs:seam.stopMs}):proof==="gone";
+      earlier={pgid:state.pushGroup.pgid,proof,stopped};
+      if(!stopped){pushed={outcome:"failed",reason:"push-failed",stopped:false};remoteCheck="unknown";}
+      else{
+        delete state.pushGroup;checkpoint();
+        if(proof==="ours"){earlier.remoteCheck=readRemote();if(earlier.remoteCheck==="landed")pushed={outcome:"pushed"};}
+      }
+    }
+    if(!pushed){
+      pushed=await pushRelease(cwd,receipt.commit,{git:seam.git,timeoutMs:seam.timeoutMs,graceMs:seam.graceMs,stopMs:seam.stopMs,onGroup:group=>{state.pushGroup=group;checkpoint();}});
+      if(pushed.stopped!==false)delete state.pushGroup;
+      if(pushed.outcome==="failed" && pushed.stopped===false)remoteCheck="unknown";
+      else if(pushed.outcome==="failed")remoteCheck=readRemote();
+    }
     const stderrSHA256=pushed.stderr?createHash("sha256").update(pushed.stderr).digest("hex"):undefined;
     // The private journal keeps the last five attempts, stderr included.
-    state.pushAttempts=[...(state.pushAttempts||[]),{at:new Date().toISOString(),...pushed,...(stderrSHA256?{stderrSHA256}:{}),...(remoteCheck?{remoteCheck}:{})}].slice(-5);checkpoint();
-    const cause=pushed.outcome==="failed"?{...(pushed.timedOut?{timedOut:true}:{}),...(pushed.exitCode!==undefined?{exitCode:pushed.exitCode}:{}),...(pushed.signal?{signal:pushed.signal}:{}),elapsedMs:pushed.elapsedMs,reason:pushed.reason,remoteCheck,...(stderrSHA256?{stderrSHA256}:{})}:{};
+    state.pushAttempts=[...(state.pushAttempts||[]),{at:new Date().toISOString(),...pushed,...(stderrSHA256?{stderrSHA256}:{}),...(remoteCheck?{remoteCheck}:{}),...(earlier?{earlierGroup:earlier}:{})}].slice(-5);checkpoint();
+    const cause=pushed.outcome==="failed"?{...(pushed.timedOut?{timedOut:true}:{}),...(pushed.exitCode!==undefined?{exitCode:pushed.exitCode}:{}),...(pushed.signal?{signal:pushed.signal}:{}),...(pushed.elapsedMs!==undefined?{elapsedMs:pushed.elapsedMs}:{}),reason:pushed.reason,remoteCheck,...(stderrSHA256?{stderrSHA256}:{})}:{};
     receipt.push={remote:"origin",commit:receipt.commit,outcome:pushed.outcome,...cause};checkpoint();
     if(receipt.push.outcome==="failed" && remoteCheck!=="landed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed",pushCause:cause});}catch{}}
     state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);materialize();state.phase="complete";checkpoint();return receipt;
@@ -1554,7 +1609,7 @@ export class HostAdapter {
   readRun(dir){return readRun(dir);}
   // One pid only; the text is compared, never parsed for anything but order.
   processStartTime(pid){
-    try{return execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;}catch{return null;}
+    return processStartTime(pid);
   }
   signalProcess(target,name){process.kill(target,name);}
   pidGone(pid){return pidGone(pid);}

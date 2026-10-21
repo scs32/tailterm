@@ -297,10 +297,27 @@ and the first release are separate operational steps.
   `exit 128 after 2 s (push-auth-failed)`, the remote check, and the first 12
   characters of the stderr hash. The outcome stays `released`, and live targets
   are not rolled back. A hub or `tt` older than these fields drops them; the
-  runner then accepts the saved receipt without them. A run stopped in
-  `pushing` resumes the push, then finishes; the resume does not stop a push
-  group left by the stopped run, and its own push and re-check proceed as
-  above. The rollback path never pushes.
+  runner then accepts the saved receipt without them. Before it waits on the
+  push, the runner saves the group in the private job journal (`pushGroup`:
+  the group id, the leader's `ps` start time and the host's boot identity,
+  Linux's `boot_id` or macOS's `kern.boottime`); it never reaches the
+  receipt, and it is cleared once the group is gone. A run stopped in
+  `pushing` resumes the push, then finishes. The resume first settles a
+  journaled group (wi_56e50fb1bc6bbdaa). A group that is gone, or whose id now
+  belongs to another start time or boot, is over: it is never signalled and
+  the push and re-check proceed as above. A group still present whose leader
+  has the recorded start time on the recorded boot is the earlier push: it is
+  stopped with the same bounds (SIGTERM, SIGKILL after 5 s, at most 15 s),
+  and once it is gone origin's `tasks-hub` is read before any new push; a
+  `landed` commit needs no new push and is recorded `pushed`. A group that
+  outlives the bound, or is present without that proof, is not signalled
+  again or read and nothing is pushed: the receipt records `failed`,
+  `reason: push-failed`, `remoteCheck: unknown`, escalated once as above. A
+  clean runner stop (SIGTERM or SIGINT) during a push does not end it: the
+  push runs to its result or its 5-minute limit and the release finishes as
+  above before the runner exits, so only a runner killed mid-push (a crash,
+  SIGKILL or host loss) leaves a journaled group for the resume. The rollback
+  path never pushes.
 - **Revert (D1).** After a rollback of a published release (outcome
   `rolled_back` or `blocked`), the runner creates one commit whose tree is the
   pre-release `tasks-hub` tree and whose parent is the integrated commit, with
