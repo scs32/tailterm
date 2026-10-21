@@ -667,27 +667,56 @@ export function pushStderr(raw) {
   const kept = sanitizeCapture({logs: [{service: "git", lines}]}).logs[0].lines.join("\n"), bytes = Buffer.from(kept, "utf8");
   return bytes.length <= PUSH_STDERR_BYTES ? kept : bytes.subarray(bytes.length - PUSH_STDERR_BYTES).toString("utf8").replace(/^\uFFFD+/, "");
 }
-// The start time of a live pid, as ps prints it, or null.
+// ps and sysctl render dates in the caller's TZ and locale, so they are read
+// in a fixed one: a runner resumed from another shell reads the same text.
+const FIXED_ENV = () => ({...process.env, TZ:"UTC", LC_ALL:"C"});
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+// The start time of a live pid as an ISO UTC string, or null.
 export function processStartTime(pid) {
-  try {return execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;} catch {return null;}
+  let text;
+  try {text = execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000,env:FIXED_ENV()}).trim();} catch {return null;}
+  const m = /^[A-Z][a-z]{2} +([A-Z][a-z]{2}) +(\d{1,2}) +(\d{2}):(\d{2}):(\d{2}) +(\d{4})$/.exec(text), month = m ? MONTHS.indexOf(m[1]) : -1;
+  return month < 0 ? null : new Date(Date.UTC(+m[6], month, +m[2], +m[3], +m[4], +m[5])).toISOString();
 }
-// The host's boot identity: Linux's boot_id or macOS's kern.boottime, or null.
+// The host's boot identity: Linux's boot_id or kern.boottime's numbers on
+// macOS, or null.
 export function bootIdentity() {
-  try {return readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim()||null;} catch {}
-  try {return execFileSync("sysctl",["-n","kern.boottime"],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000}).trim()||null;} catch {return null;}
+  try {const id = readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim(); if (id) return id;} catch {}
+  try {return bootKey(execFileSync("sysctl",["-n","kern.boottime"],{encoding:"utf8",stdio:["ignore","pipe","ignore"],timeout:5000,env:FIXED_ENV()}));} catch {return null;}
 }
+// The comparable form of a recorded or live identity, or null for text no
+// rule compares. A start time is ISO UTC; one journaled before was ps's
+// rendered date. A boot is a boot_id or kern.boottime's sec and usec, which
+// an earlier journal's full kern.boottime text still holds.
+const startKey = text => typeof text === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(text) ? text : null;
+function bootKey(text) {
+  if (typeof text !== "string") return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text.trim())) return text.trim().toLowerCase();
+  const m = /\{ *sec *= *(\d+), *usec *= *(\d+) *\}/.exec(text);
+  return m ? `{ sec = ${m[1]}, usec = ${m[2]} }` : null;
+}
+// The one rule both the push group and matrix run proofs use: "same" or
+// "other" when the recorded and live values compare, else "unproven".
+function identityMatch(recorded, live, key) {
+  const a = key(recorded), b = key(live);
+  return a === null || b === null ? "unproven" : a === b ? "same" : "other";
+}
+export const startMatch = (recorded, live) => identityMatch(recorded, live, startKey);
+export const bootMatch = (recorded, live) => identityMatch(recorded, live, bootKey);
+// Whether a start time compares and is no later than at (ISO) plus slackMs.
+export const startedBy = (started, at, slackMs) => startKey(started) !== null && Date.parse(started) <= Date.parse(at) + slackMs;
 // What a journaled push group is now: "gone" (no process is left in it, or
 // its pid now belongs to another process or another boot, so the push is
 // over), "ours" (its leader still runs with the recorded start time on the
-// recorded boot) or "unproven" (still present without that proof). Only an
-// "ours" group is ever signalled.
+// recorded boot) or "unproven" (still present without that proof, as with a
+// value that does not compare). Only an "ours" group is ever signalled.
 export function pushGroupState(group) {
   const pgid = group?.pgid;
   if (!Number.isSafeInteger(pgid) || pgid <= 1) return "unproven";
   if (groupGone(pgid)) return "gone";
-  const boot = bootIdentity(), started = processStartTime(pgid);
-  if ((group.boot && boot && group.boot !== boot) || (group.startedAt && started && group.startedAt !== started)) return "gone";
-  return group.boot && boot && group.startedAt && started ? "ours" : "unproven";
+  const boot = bootMatch(group.boot, bootIdentity()), started = startMatch(group.startedAt, processStartTime(pgid));
+  if (boot === "other" || started === "other") return "gone";
+  return boot === "same" && started === "same" ? "ours" : "unproven";
 }
 // Signals the push's group, SIGKILL after graceMs, and resolves true once
 // no process is left in it, or false at stopMs.
@@ -1607,7 +1636,7 @@ export class HostAdapter {
   }
   saveRun(dir,run){save(join(dir,"run.json"),run);}
   readRun(dir){return readRun(dir);}
-  // One pid only; the text is compared, never parsed for anything but order.
+  // One pid only, as ISO UTC; compared by startMatch and ordered by startedBy.
   processStartTime(pid){
     return processStartTime(pid);
   }
@@ -1664,7 +1693,7 @@ export class HostAdapter {
       const pid=child?.pid??found?.entry.pid;
       if(Number.isSafeInteger(pid) && pid>0){
         // A lock-file pid is ours only if that process began before it joined.
-        const started=this.processStartTime(pid),ours=child || (started && Date.parse(started)<=Date.parse(found.entry.requestedAt)+1000);
+        const started=this.processStartTime(pid),ours=child || startedBy(started,found.entry.requestedAt,1000);
         Object.assign(run,{state:"started",pid,processStartedAt:ours?started:null,groups:[]});
         if(!persist())return "waiting";
       }
@@ -1685,7 +1714,7 @@ export class HostAdapter {
         }
         persist();return "waiting";
       }
-      if(!(run.pid>1) || (!child && !(run.processStartedAt && this.processStartTime(run.pid)===run.processStartedAt)))return held("no process-instance proof for the matrix run pid");
+      if(!(run.pid>1) || (!child && startMatch(run.processStartedAt,this.processStartTime(run.pid))!=="same"))return held("no process-instance proof for the matrix run pid");
       const grace=this.config.matrixStopGraceMs??MATRIX_STOP_GRACE_MS;
       // SIGTERM takes the run's own interruption path: it stops its checks,
       // removes its home and releases the host lock.

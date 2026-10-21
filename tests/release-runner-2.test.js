@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,st
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
-import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,pushGroupState,processStartTime,bootIdentity,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
+import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,pushGroupState,processStartTime,bootIdentity,startMatch,bootMatch,startedBy,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
 import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
@@ -749,7 +749,7 @@ test("push r1 the push group and its proof are journaled before the runner waits
  const seen='echo $$ > "$D/leader.pid"; i=0; while ! grep -q pushGroup "$RELEASE_TEST_JOURNAL" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; cp "$RELEASE_TEST_JOURNAL" "$D/seen.json"';
  const t=await pushCase(seen,undefined,{setup:(f,c)=>{process.env.RELEASE_TEST_JOURNAL=c.journalPath;}});
  const during=JSON.parse(readFileSync(join(t.dir,"seen.json"),"utf8")),leader=Number(readFileSync(join(t.dir,"leader.pid"),"utf8"));
- assert.equal(during.phase,"pushing");assert.equal(during.pushGroup.pgid,leader);assert.equal(typeof during.pushGroup.startedAt,"string");assert.ok(during.pushGroup.startedAt.length>0);
+ assert.equal(during.phase,"pushing");assert.equal(during.pushGroup.pgid,leader);assert.match(during.pushGroup.startedAt,ISO_START);
  assert.equal(during.pushGroup.boot,bootIdentity());assert.ok(bootIdentity());
  assert.deepEqual(t.r.push,{remote:"origin",commit:t.j.commit,outcome:"pushed"});assert.equal(t.journal.pushGroup,undefined,"a finished push leaves no group");
  for(const text of [JSON.stringify(t.r),t.file])for(const word of ["pushGroup","pgid","startedAt","boot"])assert.ok(!text.includes(word),word);
@@ -799,7 +799,7 @@ test("push r3 a recorded group that is gone keeps today's resume: no signal, no 
 });
 test("push r4 a live group the resume cannot prove its own is never signalled",async()=>{
  // Another start time or boot: the pid is someone else's, so the push is over.
- for(const other of [{startedAt:"Thu Jan  1 00:00:00 1970"},{boot:"another-boot"}]){
+ for(const other of [{startedAt:"1970-01-01T00:00:00.000Z"},{boot:"{ sec = 1, usec = 0 }"}]){
   const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
   const group=await earlierGroup(t,TRAPPED);
   try{
@@ -816,6 +816,66 @@ test("push r4 a live group the resume cannot prove its own is never signalled",a
   resumeAt(t,group);
   const r=await runRelease(t.c,t.a);
   assert.deepEqual(pushLog(t),[]);assert.equal(groupGone(group.pgid),false);
+  assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"failed",reason:"push-failed",remoteCheck:"unknown"});
+  assert.deepEqual(readJournalFile(t).pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"unproven",stopped:false});
+ }finally{killGroup(group.pgid);}
+});
+const ISO_START=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/;
+// A fake ps and sysctl first on PATH. In TZ=UTC with LC_ALL=C they run the
+// real tool; in any other environment they print a rendering of their own,
+// as the tools do in another TZ or locale. as() sets the test process's
+// environment, the one an earlier or a resumed runner would have had, and
+// rendered() is what the runner read before the fix.
+function otherEnvironments(t){
+ const dir=mkdtempSync(join(tmpdir(),"runner-fake-ps-")),real=name=>execFileSync("sh",["-c",`command -v ${name} || echo false`],{encoding:"utf8"}).trim();
+ const tool=(name,body)=>{writeFileSync(join(dir,name),`#!/bin/sh\nif [ "$TZ" = UTC ] && [ "$LC_ALL" = C ]; then exec ${real(name)} "$@"; fi\n${body}\n`);chmodSync(join(dir,name),0o755);};
+ tool("ps",'echo "Mi. 21 Okt. 11:35:50 2026 $TZ"');
+ tool("sysctl",`out=$(${real("sysctl")} "$@") || exit 1; echo "\${out%%\\}*}} gerendert $TZ"`);
+ const saved=Object.fromEntries(["PATH","TZ","LC_ALL"].map(k=>[k,process.env[k]])),put=(k,v)=>{if(v===undefined)delete process.env[k];else process.env[k]=v;};
+ process.env.PATH=`${dir}:${process.env.PATH}`;
+ t.after(()=>{for(const [k,v] of Object.entries(saved))put(k,v);rmSync(dir,{recursive:true,force:true});});
+ return {as:(tz,lc)=>{put("TZ",tz);put("LC_ALL",lc);},
+  rendered:pid=>execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8"}).trim(),
+  renderedBoot:()=>{try{return execFileSync("sysctl",["-n","kern.boottime"],{encoding:"utf8",stdio:["ignore","pipe","ignore"]}).trim();}catch{return null;}}};
+}
+test("push r6 the start and boot identity compare one rule, in any TZ or locale",t=>{
+ const now="2026-10-21T18:35:50.000Z",later="2026-10-21T18:35:51.000Z",legacy="Wed Oct 21 11:35:50 2026";
+ assert.deepEqual([startMatch(now,now),startMatch(now,later),startMatch(legacy,now),startMatch(now,legacy),startMatch(null,now),startMatch(now,null)],["same","other","unproven","unproven","unproven","unproven"]);
+ const macos="{ sec = 1787452403, usec = 399698 }",id="0b3c5d1e-2f40-4a5b-9c6d-7e8f90a1b2c3";
+ assert.deepEqual([bootMatch(macos,`${macos} Sat Aug 22 19:33:23 2026`),bootMatch(`${macos} Sun Aug 23 02:33:23 2026`,macos),bootMatch(macos,"{ sec = 1, usec = 0 }"),bootMatch(id,id.toUpperCase()),bootMatch(id,macos),bootMatch("another-boot",macos),bootMatch(undefined,macos)],["same","same","other","same","other","unproven","unproven"]);
+ assert.deepEqual([startedBy(now,now,1000),startedBy(later,now,1000),startedBy("2026-10-21T18:35:52.000Z",now,1000),startedBy(legacy,"2030-01-01T00:00:00.000Z",1000),startedBy(null,now,1000)],[true,true,false,false,false]);
+ // The same live process reads the same identity whatever the caller's TZ and locale.
+ const env=otherEnvironments(t),pid=process.pid;
+ env.as("Pacific/Auckland","de_DE.UTF-8");const a=[processStartTime(pid),bootIdentity(),env.rendered(pid),env.renderedBoot()];
+ env.as("America/Los_Angeles",undefined);const b=[processStartTime(pid),bootIdentity(),env.rendered(pid),env.renderedBoot()];
+ assert.match(a[0],ISO_START);assert.ok(a[1]);assert.deepEqual(a.slice(0,2),b.slice(0,2));
+ assert.notEqual(a[2],b[2],"the fake ps renders by environment");
+ if(!existsSync("/proc/sys/kernel/random/boot_id"))assert.notEqual(a[3],b[3],"the fake sysctl renders by environment");
+});
+test("push r6 a live group recorded under another TZ and locale is ours: stopped, read, then pushed",async t0=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+ const env=otherEnvironments(t0);env.as("Pacific/Auckland","de_DE.UTF-8");
+ const group=await earlierGroup(t,TRAPPED),then=env.rendered(group.pgid);
+ try{
+  env.as("America/Los_Angeles",undefined);assert.notEqual(env.rendered(group.pgid),then,"the rendered text differs");
+  assert.equal(pushGroupState(group),"ours");resumeAt(t,group);
+  const r=await runRelease(t.c,t.a);
+  assert.deepEqual(pushLog(t),["earlier-term","ls-remote","push"]);assert.equal(r.push.outcome,"pushed");assert.equal(groupGone(group.pgid),true);
+  assert.deepEqual(readJournalFile(t).pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"ours",stopped:true,remoteCheck:"absent"});
+ }finally{killGroup(group.pgid);}
+});
+test("push r6 a live group journaled before the fix, with rendered text, is unproven: never signalled and never pushed over",async t0=>{
+ const t=await pushCase(RESUMABLE,LOGGED_READ,{setup:modes("fail")});rmSync(join(t.dir,"fail"));
+ const env=otherEnvironments(t0);env.as("Pacific/Auckland","de_DE.UTF-8");
+ const group=await earlierGroup(t,TRAPPED),legacy={...group,startedAt:env.rendered(group.pgid),boot:env.renderedBoot()??group.boot};
+ try{
+  env.as("America/Los_Angeles",undefined);
+  assert.equal(pushGroupState(legacy),"unproven");assert.equal(pushGroupState({...legacy,boot:"another-boot"}),"unproven");
+  // Earlier boot text still holds the boot's numbers, so it compares; another boot means the pid is not ours.
+  assert.equal(pushGroupState({...group,boot:legacy.boot}),"ours");assert.equal(pushGroupState({...legacy,boot:"{ sec = 1, usec = 0 }"}),"gone");
+  resumeAt(t,legacy);
+  const r=await runRelease(t.c,t.a);
+  assert.deepEqual(pushLog(t),[],"no stop, no read, no push");assert.equal(groupGone(group.pgid),false);
   assert.deepEqual(r.push,{remote:"origin",commit:t.j.commit,outcome:"failed",reason:"push-failed",remoteCheck:"unknown"});
   assert.deepEqual(readJournalFile(t).pushAttempts.at(-1).earlierGroup,{pgid:group.pgid,proof:"unproven",stopped:false});
  }finally{killGroup(group.pgid);}
@@ -1316,16 +1376,46 @@ test("a10 (ii) a run that ignores SIGTERM gets its own group killed after the gr
 });
 test("a10 (iii) a stale lock entry matching a reused pid is never signalled, and the job is held",async t=>{
  const h=lockHost(t),other=idle(t);let clock=5000000;h.adapter.now=()=>clock;h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return other.pid;};
- h.adapter.processStartTime=()=>"Thu Jan  1 00:00:00 2026";
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"Thu Jan  1 00:00:00 2026");
+ h.adapter.processStartTime=()=>"2026-01-01T00:00:00.000Z";
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"2026-01-01T00:00:00.000Z");
  // The pid now belongs to an unrelated live process; the lock file still names it for this directory.
- delete h.adapter.processStartTime;assert.notEqual(h.adapter.processStartTime(other.pid),"Thu Jan  1 00:00:00 2026");
+ delete h.adapter.processStartTime;assert.equal(startMatch("2026-01-01T00:00:00.000Z",h.adapter.processStartTime(other.pid)),"other");
  assert(updateHostState(h.path,state=>{state.holders=[holderEntry(other.pid,h.dir)];}).done);
  clock=h.deadline()+3600000;
  for(let poll=0;poll<3;poll++){clock+=MATRIX_STOP_GRACE_MS;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);}
  assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);
  assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid:other.pid,groups:[],reason:"no process-instance proof for the matrix run pid"});
  assert.equal(h.run().state,"started");assert.equal(h.run().stopRequestedAt,undefined);
+});
+// The matrix run proof under the push group's rule: a run launched by a
+// runner in another TZ and locale is proven and stopped at its deadline; a
+// start time journaled before the fix is no proof, so the job is held.
+test("a10 (iii) a run recorded under another TZ and locale is proven, and one recorded as rendered text is held unsignalled",async t=>{
+ const env=otherEnvironments(t);
+ for(const legacy of [false,true]){
+  env.as("Pacific/Auckland","de_DE.UTF-8");
+  const h=lockHost(t),other=idle(t);let clock=5000000;h.adapter.now=()=>clock;h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return other.pid;};
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.match(h.run().processStartedAt,ISO_START);
+  if(legacy)writeFileSync(join(h.dir,"run.json"),JSON.stringify({...h.run(),processStartedAt:env.rendered(other.pid)}));
+  env.as("America/Los_Angeles",undefined);
+  assert(updateHostState(h.path,state=>{state.holders=[holderEntry(other.pid,h.dir)];}).done);
+  clock=h.deadline();assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);
+  if(legacy){
+   assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);assert.equal(h.adapter.matrixHeld.reason,"no process-instance proof for the matrix run pid");
+  }else{
+   assert.deepEqual(h.signals,[[other.pid,"SIGTERM"]]);assert.equal(h.adapter.matrixHeld,null);assert.equal(h.run().stopRequestedAt,clock);
+  }
+ }
+});
+test("a5 (iii) lock-file adoption takes only a start time that compares, made before the pid joined",async t=>{
+ for(const [started,ours] of [["2020-01-01T00:00:00.000Z",true],["Wed Jan  1 00:00:00 2020",false],[null,false]]){
+  const h=lockHost(t),child=idle(t);h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return child.pid;};
+  const save=h.adapter.saveRun.bind(h.adapter);let saves=0;h.adapter.saveRun=(dir,run)=>{if(++saves===2)throw new Error("lost");save(dir,run);};
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().state,"starting");
+  h.adapter.processStartTime=()=>started;
+  assert(updateHostState(h.path,state=>{state.waiters.push({...holderEntry(child.pid,h.dir),grantSeqAtRequest:0,overtakenBy:0});}).done);
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.deepEqual([h.run().state,h.run().processStartedAt],["started",ours?started:null]);
+ }
 });
 test("a10 (iv) after a takeover while a recorded check group survives, the group is not signalled and the job is held with one notice naming it",async t=>{
  const h=lockHost(t,{group:true});
