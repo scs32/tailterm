@@ -199,6 +199,28 @@ test("the reviewer folds a same-file finding into an existing held item", () => 
   }
 });
 
+// wi_06611d359b2081ee: the reviewer cites every round-two fail, so a passing
+// regression passes its criterion, and the lead settles a round-two partial on
+// the candidate where its blocker passed; neither needs an owner-accept.
+test("review prompts cite every round-two fail and settle partials by criterionIds", () => {
+  const reviewerRule =
+    "In round two, cite every fail: a regression that breaks a criterion also sets criterion to it, and the hub refuses a fail no blocker or finding cites.";
+  const leadRule =
+    "Focused verification names the exact candidate, fix and blocker IDs, plus round-two partials in criterionIds, checked by the original reviewer or a linked-item verifier. After a blocker-only pass, a criterionIds-only request on that candidate settles them.";
+  for (const id of ["planned", "small"]) {
+    const reviewer = exampleTeam(id).members.find((member) => member.name === "reviewer").prompt;
+    assert.equal(reviewer.split(reviewerRule).length - 1, 1, id);
+  }
+  const lead = exampleTeam("planned").members.find((member) => member.name === "lead").prompt;
+  assert.equal(lead.split(leadRule).length - 1, 1);
+  assert.ok(Buffer.byteLength(lead) < MAX_AGENT_PROMPT_BYTES, `planned lead prompt is ${Buffer.byteLength(lead)} bytes`);
+  for (const path of ["../docs/team-examples.md", "../hub/internal/teamplan/plan.mjs"]) {
+    const text = readFileSync(new URL(path, import.meta.url), "utf8");
+    assert.equal(text.split(reviewerRule).length - 1, 1, path);
+    assert.equal(text.split(leadRule).length - 1, 1, path);
+  }
+});
+
 // wi_85148428c4ab9c9b: the steward asks the handler for an evidence note and
 // never for a description append on an accepted or released item.
 test("the steward records recurrences through an evidence note", () => {

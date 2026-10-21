@@ -529,7 +529,12 @@ metadata includes `regression:true`, distinct exact `baseline` and `candidate`,
 and command+output or file+line. Findings are automatically filed once as native
 linked work items and held for triage. Round two retains prior blocker IDs or
 resolves them explicitly in `blockerIds`; only evidenced new regressions block.
-New non-regression blockers are converted to follow-ups.
+New non-regression blockers are converted to follow-ups. In round two every
+reviewer-owned criterion marked `fail` must be cited by the `criterion` of a
+blocker or finding; the hub refuses the RESULT naming the first uncited one. A
+regression that breaks a criterion sets `criterion` to it beside
+`regression:true`, so its passing focused verification passes that criterion.
+A regression with no `criterion` can only block, never pass a failed criterion.
 
 After two completed rounds, a focused REQUEST has `mode:"focused"`, exact
 `candidate`, `fix`, and unresolved `blockerIds`. Its RESULT repeats that metadata,
@@ -597,7 +602,12 @@ Each ID must be a distinct frozen criterion that is not verification-owned, is
 `partial` in round two, has no unresolved blocker or finding, and is not also a
 named blocker ID. `criterionIds` may stand alone on the round-two candidate, or
 ride on a request that names `blockerIds`, an equivalence or `treeDiffers`, so
-a partial plus a rebase or fix is one request. The RESULT repeats the metadata
+a partial plus a rebase or fix is one request. It may also stand alone on a
+changed candidate where an earlier focused RESULT passed blockers by ID and no
+blocker is open: after a blocker-only pass, the partial is settled on that same
+commit, not routed as a rebase. Its RESULT reports only the criterion IDs, with
+no `equivalence` key. A changed candidate with a blocker still open there keeps
+the rebase and `treeDiffers` refusals. The RESULT repeats the metadata
 and reports pass/fail for each criterion ID in Status, beside any blocker IDs
 and the `equivalence` or `delta` key. The round's own verdict stays `partial`;
 the focused record is the settlement and stores the `receiptGeneration` that

@@ -9,16 +9,19 @@ import (
 // Diagnosis for wi_6b77641eabe55fc0 (order #41982): on wi_d7010deecb20211f a
 // round-two blocker b1 passed structured focused verification (#15339), a
 // plain lead accept was refused, and the item needed an owner-accept (#15340,
-// #15343). These tests rebuild that shape at the current tip for each blocker
-// form the hub accepts and pin today's outcome, so a fix changes them on
-// purpose. See docs/incidents/review-blocker-focused-15340/report.md.
+// #15343). These tests rebuild that shape for each blocker form the hub
+// accepts. They first pinned the outcome at the diagnosis tip; the fix for
+// wi_06611d359b2081ee (order #42472) changed the rows on purpose, and they now
+// pin the fixed behaviour: a round-two fail must be cited, and a partial can be
+// settled on the candidate where its blocker passed. See
+// docs/incidents/review-blocker-focused-15340/report.md.
 //
 // The fixture stands in for the incident's criteria: a1 is verification-owned
 // (a1-a10 and a12 were pending-verification) and a2 is the reviewed criterion
 // the blocker concerns (a11, the runbook).
 
 const diagRefusalPartial = "conflict: review convergence: criterion a2 has not passed; a partial with no blocker is settled by focused verification naming it in criterionIds"
-const diagRefusalFailed = "conflict: review convergence: criterion a2 has not passed"
+const diagRefusalUncited = "conflict: review convergence: criterion a2 failed with no blocker or finding citing it; set criterion on the blocker for that failure (a regression may cite the criterion it breaks)"
 
 func newDiagFixture(t *testing.T) *convergenceFixture {
 	t.Helper()
@@ -30,11 +33,6 @@ func (f *convergenceFixture) diagFocused(t *testing.T, meta api.ReviewMetadata, 
 	f.focusedCheck(t, meta, status, map[string]api.Evidence{"e1": {Type: "record", Value: "fixture: named fix confirmed on " + meta.Candidate}})
 }
 
-func (f *convergenceFixture) diagDisposition(kind, candidate string, from api.Agent) error {
-	_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: candidate}, Body: api.EnvelopeBody{Text: kind}}, "", 0, from)
-	return err
-}
-
 func diagOutcome(err error) string {
 	if err == nil {
 		return "accepted"
@@ -44,21 +42,31 @@ func diagOutcome(err error) string {
 
 // Every form: two general rounds, round two records blocker b1 on candidate B,
 // structured focused verification passes b1 on candidate C, the matrix receipt
-// for C is saved, and the lead posts a plain accept of C.
+// for C is saved, and the lead posts a plain accept of C. A form whose round-two
+// RESULT is now refused names that refusal in wantRound2 instead.
 func TestReviewConvergenceDiagBlockerFormsAfterFocusedPass(t *testing.T) {
 	regression := api.ReviewFinding{ID: "b1", Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Runbook baseline update never reaches the running deployer", File: "docs/project-deployment.md", Line: 316}
+	citedRegression := regression
+	citedRegression.Criterion = "a2"
 	cited := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: "Runbook baseline update never reaches the running deployer", File: "docs/project-deployment.md", Line: 316}
 	forms := []struct {
-		name     string
-		round1   map[string]string
-		blockers []api.ReviewFinding // round one, retained in round two when set
-		round2   map[string]string
-		blocker  api.ReviewFinding
-		want     string
+		name       string
+		round1     map[string]string
+		blockers   []api.ReviewFinding // round one, retained in round two when set
+		round2     map[string]string
+		blocker    api.ReviewFinding
+		wantRound2 string // the round-two RESULT refusal, when the form never reaches the accept
+		want       string
 	}{
 		// The #15340 shape: a regression blocker with no criterion, a11 partial.
+		// It still needs a2 in criterionIds; see the blocker-only tests below.
 		{name: "regression blocker, criterion partial", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "partial"}, blocker: regression, want: diagRefusalPartial},
-		{name: "regression blocker, criterion failed", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "fail"}, blocker: regression, want: diagRefusalFailed},
+		// Was accepted at round two and then refused at the accept with "criterion
+		// a2 has not passed", leaving only owner-accept. The hub now refuses the
+		// uncited fail when the reviewer can still cite it.
+		{name: "regression blocker, criterion failed", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "fail"}, blocker: regression, wantRound2: diagRefusalUncited},
+		// The cited form of the row above: the regression's focused pass passes a2.
+		{name: "regression blocker citing the criterion, criterion failed", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "fail"}, blocker: citedRegression, want: "accepted"},
 		{name: "regression blocker, criterion passed", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "pass"}, blocker: regression, want: "accepted"},
 		// New in round two, so the hub files it as a finding; it still fails a2.
 		{name: "criterion blocker new in round two", round1: map[string]string{"a1": "pending-verification", "a2": "partial"}, round2: map[string]string{"a1": "pending-verification", "a2": "fail"}, blocker: cited, want: "accepted"},
@@ -71,6 +79,15 @@ func TestReviewConvergenceDiagBlockerFormsAfterFocusedPass(t *testing.T) {
 			blocker := form.blocker
 			if blocker.Regression {
 				blocker.Candidate = candidateB
+			}
+			if form.wantRound2 != "" {
+				r := f.review(t, candidateB)
+				_, err := f.post(f.resultEnv(candidateB, form.round2, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{blocker}}), "", r.Seq, f.reviewer)
+				t.Logf("round-two result: %s", diagOutcome(err))
+				if diagOutcome(err) != form.wantRound2 {
+					t.Fatalf("round-two outcome changed:\n got %s\nwant %s", diagOutcome(err), form.wantRound2)
+				}
+				return
 			}
 			f.generalRound(t, candidateB, form.round2, api.ReviewMetadata{Blockers: []api.ReviewFinding{blocker}})
 			f.diagFocused(t, api.ReviewMetadata{Candidate: candidateC, Fix: "Re-read baselines each poll", BlockerIDs: []string{"b1"}}, map[string]string{"b1": "pass"})
@@ -95,12 +112,10 @@ func TestReviewConvergenceDiagBlockerFormsAfterFocusedPass(t *testing.T) {
 	})
 }
 
-// diagBlockerOnlyFocusedRefused replays the #15340 sequence: focused
-// verification names only b1 on C, the plain accept is refused, and the lead
-// cannot then settle a2 on C. A criterionIds-only request on C is a
-// changed-candidate route that needs the reviewed candidate converged, and b1
-// is still open on B; naming b1 again is refused because it passed on C.
-func diagBlockerOnlyFocusedRefused(t *testing.T) *convergenceFixture {
+// diagBlockerOnlyFocusedPass replays the #15340 sequence: focused
+// verification names only b1 on C and the plain accept is refused, because a2
+// is still partial.
+func diagBlockerOnlyFocusedPass(t *testing.T) *convergenceFixture {
 	t.Helper()
 	f := newDiagFixture(t)
 	f.generalRound(t, candidateA, map[string]string{"a1": "pending-verification", "a2": "partial"}, api.ReviewMetadata{})
@@ -111,38 +126,35 @@ func diagBlockerOnlyFocusedRefused(t *testing.T) *convergenceFixture {
 	if got := diagOutcome(f.acceptCandidate(candidateC, f.lead)); got != diagRefusalPartial {
 		t.Fatalf("accept outcome changed:\n got %s\nwant %s", got, diagRefusalPartial)
 	}
-	settle := api.ReviewMetadata{Candidate: candidateC, Fix: "Re-read baselines each poll after " + candidateB, CriterionIDs: []string{"a2"}}
-	_, err := f.focusedRequest(settle)
-	t.Logf("criterionIds-only request on C: %s", diagOutcome(err))
-	want := "conflict: review convergence: rebase verification needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: unresolved blockers on accepted candidate)"
-	if diagOutcome(err) != want {
-		t.Fatalf("settling request outcome changed:\n got %s\nwant %s", diagOutcome(err), want)
-	}
+	return f
+}
+
+// After the blocker-only pass, C settles without the owner: a criterionIds-only
+// request on C is no longer routed as a rebase of B, because b1 passed on C and
+// nothing is open there. At the diagnosis tip this request was refused with
+// "rebase verification needs a converged review ... (cause: unresolved blockers
+// on accepted candidate)" and only owner-decision and owner-accept were left.
+// Naming b1 again stays refused: it already passed on C.
+func TestReviewConvergenceDiagBlockerOnlyFocusedSettlesWithoutOwner(t *testing.T) {
+	f := diagBlockerOnlyFocusedPass(t)
 	again := api.ReviewMetadata{Candidate: candidateC, Fix: "Re-read baselines each poll", BlockerIDs: []string{"b1"}, CriterionIDs: []string{"a2"}}
-	_, err = f.focusedRequest(again)
+	_, err := f.focusedRequest(again)
 	t.Logf("b1 plus criterionIds request on C: %s", diagOutcome(err))
 	if want := "conflict: review convergence: focused verification must name distinct unresolved blocker IDs"; diagOutcome(err) != want {
 		t.Fatalf("repeat request outcome changed:\n got %s\nwant %s", diagOutcome(err), want)
 	}
-	return f
-}
-
-// For C itself only the owner-decision and owner-accept path is left, as on
-// 09-29 (#15340, #15343).
-func TestReviewConvergenceDiagBlockerOnlyFocusedNeedsOwnerAccept(t *testing.T) {
-	f := diagBlockerOnlyFocusedRefused(t)
-	if err := f.diagDisposition("owner-decision", candidateC, f.lead); err != nil {
-		t.Fatal("owner-decision", err)
-	}
-	if err := f.diagDisposition("owner-accept", candidateC, api.Agent{}); err != nil {
-		t.Fatal("owner-accept", err)
+	f.diagFocused(t, api.ReviewMetadata{Candidate: candidateC, Fix: "Settle the runbook criterion on the fixed candidate", CriterionIDs: []string{"a2"}}, map[string]string{"a2": "pass"})
+	got := diagOutcome(f.acceptCandidate(candidateC, f.lead))
+	t.Logf("accept of C after criterionIds-only a2: %s", got)
+	if got != "accepted" {
+		t.Fatalf("accept outcome changed:\n got %s\nwant accepted", got)
 	}
 }
 
-// A different commit D escapes without the owner: b1 is open again on D, so
-// one focused request can name b1 and a2 together.
+// A different commit D still settles too: b1 is open again on D, so one
+// focused request can name b1 and a2 together.
 func TestReviewConvergenceDiagBlockerOnlyFocusedNewCandidateSettles(t *testing.T) {
-	f := diagBlockerOnlyFocusedRefused(t)
+	f := diagBlockerOnlyFocusedPass(t)
 	seedPassingVerification(t, f.s, f.item, candidateD)
 	f.diagFocused(t, api.ReviewMetadata{Candidate: candidateD, Fix: "Re-read baselines each poll", BlockerIDs: []string{"b1"}, CriterionIDs: []string{"a2"}}, map[string]string{"b1": "pass", "a2": "pass"})
 	got := diagOutcome(f.acceptCandidate(candidateD, f.lead))
@@ -168,28 +180,30 @@ func TestReviewConvergenceDiagPartialRegressionSettledInOneFocused(t *testing.T)
 	}
 }
 
-// With a2 failed rather than partial, criterionIds cannot name it, so no
-// focused request maps the regression's pass to a2.
-func TestReviewConvergenceDiagFailedRegressionCannotSettle(t *testing.T) {
+// With a2 failed rather than partial, criterionIds cannot name it, so an
+// uncited regression could never pass a2. At the diagnosis tip that round two
+// was saved and only owner-accept was left. Now the round-two RESULT is refused
+// while the reviewer can still cite a2, and the cited form settles.
+func TestReviewConvergenceDiagFailedRegressionMustCite(t *testing.T) {
 	f := newDiagFixture(t)
 	f.generalRound(t, candidateA, map[string]string{"a1": "pending-verification", "a2": "partial"}, api.ReviewMetadata{})
 	b1 := api.ReviewFinding{ID: "b1", Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Runbook baseline update never reaches the running deployer", File: "docs/project-deployment.md", Line: 316}
-	f.generalRound(t, candidateB, map[string]string{"a1": "pending-verification", "a2": "fail"}, api.ReviewMetadata{Blockers: []api.ReviewFinding{b1}})
+	failed := map[string]string{"a1": "pending-verification", "a2": "fail"}
+	r := f.review(t, candidateB)
+	_, err := f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b1}}), "", r.Seq, f.reviewer)
+	t.Logf("round-two result with an uncited regression and a2 failed: %s", diagOutcome(err))
+	if diagOutcome(err) != diagRefusalUncited {
+		t.Fatalf("round-two outcome changed:\n got %s\nwant %s", diagOutcome(err), diagRefusalUncited)
+	}
+	b1.Criterion = "a2"
+	if _, err = f.post(f.resultEnv(candidateB, failed, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b1}}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal("cited round two", err)
+	}
 	seedPassingVerification(t, f.s, f.item, candidateC)
-	both := api.ReviewMetadata{Candidate: candidateC, Fix: "Re-read baselines each poll", BlockerIDs: []string{"b1"}, CriterionIDs: []string{"a2"}}
-	_, err := f.focusedRequest(both)
-	t.Logf("b1 plus criterionIds request with a2 failed: %s", diagOutcome(err))
-	if want := "conflict: review convergence: criterionIds must name distinct round-two partial criteria that are not verification-owned"; diagOutcome(err) != want {
-		t.Fatalf("settling request outcome changed:\n got %s\nwant %s", diagOutcome(err), want)
-	}
 	f.diagFocused(t, api.ReviewMetadata{Candidate: candidateC, Fix: "Re-read baselines each poll", BlockerIDs: []string{"b1"}}, map[string]string{"b1": "pass"})
-	if got := diagOutcome(f.acceptCandidate(candidateC, f.lead)); got != diagRefusalFailed {
-		t.Fatalf("accept outcome changed:\n got %s\nwant %s", got, diagRefusalFailed)
-	}
-	if err = f.diagDisposition("owner-decision", candidateC, f.lead); err != nil {
-		t.Fatal("owner-decision", err)
-	}
-	if err = f.diagDisposition("owner-accept", candidateC, api.Agent{}); err != nil {
-		t.Fatal("owner-accept", err)
+	got := diagOutcome(f.acceptCandidate(candidateC, f.lead))
+	t.Logf("accept of C after focused pass of the cited regression: %s", got)
+	if got != "accepted" {
+		t.Fatalf("accept outcome changed:\n got %s\nwant accepted", got)
 	}
 }

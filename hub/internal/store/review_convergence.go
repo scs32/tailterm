@@ -942,8 +942,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		// of the round-two candidate, or with treeDiffers a lead-named fix whose
 		// exact delta the verifier confirms. The hub checks identity and shape; the
 		// verifier attests the git fact. criterionIds may ride on any focused
-		// request, or stand alone on the reviewed candidate, to settle round-two
-		// partials by the passing receipt for the exact candidate.
+		// request, or stand alone on the reviewed candidate or on a candidate whose
+		// blockers focused verification passed there, to settle round-two partials
+		// by the passing receipt for the exact candidate.
 		rebase := len(meta.BlockerIDs) == 0
 		reviewed := state.Rounds[1].Candidate
 		route := "rebase verification"
@@ -1002,7 +1003,8 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if meta.TreeDiffers && !rebase {
 				return reviewConflict("treeDiffers verification names no blocker IDs; verify unresolved blockers by ID")
 			}
-			if rebase && (meta.Candidate != reviewed || meta.TreeDiffers || len(meta.CriterionIDs) == 0) {
+			settle := meta.Candidate == reviewed && !meta.TreeDiffers && len(meta.CriterionIDs) > 0
+			if rebase && !settle && !settlesOnVerifiedCandidate(state, meta.Candidate, meta.BlockerIDs, meta.CriterionIDs, meta.TreeDiffers) {
 				if meta.Candidate == reviewed {
 					return reviewConflict(route + " needs a candidate other than the reviewed one")
 				}
@@ -1060,7 +1062,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				// tree) or delta (treeDiffers). The two are never interchangeable.
 				keys := append(append([]string{}, f.BlockerIDs...), f.CriterionIDs...)
 				proof := ""
-				if len(f.BlockerIDs) == 0 && f.Candidate != reviewed {
+				if len(f.BlockerIDs) == 0 && f.Candidate != reviewed && !settlesOnVerifiedCandidate(state, f.Candidate, f.BlockerIDs, f.CriterionIDs, f.TreeDiffers) {
 					proof = "equivalence"
 					if f.TreeDiffers {
 						proof = "delta"
@@ -1244,6 +1246,28 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				return err
 			}
 			state.FollowUps = append(state.FollowUps, follow)
+		}
+	}
+	// Round two cites every reviewer-owned fail: an uncited fail has no blocker
+	// whose focused pass could pass it, so it could only end in an owner-accept.
+	// A regression that breaks a criterion cites it. Criteria are a1..aN, so the
+	// refusal names the lowest uncited one.
+	if round.Number == 2 {
+		for i := 1; i <= len(sc.Criteria); i++ {
+			key := "a" + strconv.Itoa(i)
+			if verificationOwned(sc.VerificationCriteria, key) || e.Body.Status[key] != "fail" {
+				continue
+			}
+			cited := false
+			for _, b := range blockers {
+				cited = cited || b.Criterion == key
+			}
+			for _, f := range findings {
+				cited = cited || f.Criterion == key
+			}
+			if !cited {
+				return reviewConflict("criterion " + key + " failed with no blocker or finding citing it; set criterion on the blocker for that failure (a regression may cite the criterion it breaks)")
+			}
 		}
 	}
 	sort.Strings(scopeResolvedIDs)
@@ -1910,4 +1934,21 @@ func outstandingOnCandidate(state api.ReviewConvergence, candidate string) map[s
 		}
 	}
 	return outstanding(filtered)
+}
+
+// settlesOnVerifiedCandidate reports whether a focused request with no blocker
+// IDs settles round-two partials on a changed candidate instead of proving a
+// rebase or a lead-named fix: an earlier passing focused record verified
+// blockers by ID on that exact candidate and none is open there. A request
+// and its RESULT both use it, so they agree on the Status keys.
+func settlesOnVerifiedCandidate(state api.ReviewConvergence, candidate string, blockerIDs, criterionIDs []string, treeDiffers bool) bool {
+	if len(blockerIDs) != 0 || len(criterionIDs) == 0 || treeDiffers || len(outstandingOnCandidate(state, candidate)) != 0 {
+		return false
+	}
+	for _, f := range state.Focused {
+		if f.Passed && f.ResultSeq != 0 && f.Candidate == candidate && len(f.BlockerIDs) > 0 {
+			return true
+		}
+	}
+	return false
 }

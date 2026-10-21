@@ -2639,6 +2639,173 @@ func TestReviewConvergenceChangedCandidateSettlesPartialInOneRequest(t *testing.
 	}
 }
 
+// wi_06611d359b2081ee v1: round two cites every reviewer-owned fail, or the
+// RESULT is refused while the reviewer can still cite it. Round one may still
+// leave a fail uncited; round two then cites it or passes it.
+func TestReviewConvergenceRoundTwoUncitedFailRefused(t *testing.T) {
+	regression := func(criterion string) api.ReviewFinding {
+		return api.ReviewFinding{ID: "b1", Criterion: criterion, Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Retry drops the saved state", File: "fixture.go", Line: 7}
+	}
+	cited := api.ReviewFinding{ID: "b1", Criterion: "a2", Title: "Retry drops the saved state", File: "fixture.go", Line: 7}
+	finding := func(id, criterion string) api.ReviewFinding {
+		return api.ReviewFinding{ID: id, Criterion: criterion, Title: "Retry state is not reported", File: "fixture.go", Line: 9}
+	}
+	uncited := func(key string) string {
+		return "conflict: review convergence: criterion " + key + " failed with no blocker or finding citing it; set criterion on the blocker for that failure (a regression may cite the criterion it breaks)"
+	}
+	failed := map[string]string{"a1": "pass", "a2": "fail"}
+	for _, tc := range []struct {
+		name           string
+		round1         map[string]string
+		round1Blockers []api.ReviewFinding
+		round2         map[string]string
+		meta           api.ReviewMetadata
+		want           string // "" when the round is saved
+	}{
+		{name: "no blocker", round1: failed, round2: failed, want: uncited("a2")},
+		{name: "regression with no criterion", round1: partialConvergence, round2: failed, meta: api.ReviewMetadata{Blockers: []api.ReviewFinding{regression("")}}, want: uncited("a2")},
+		{name: "regression citing the criterion", round1: partialConvergence, round2: failed, meta: api.ReviewMetadata{Blockers: []api.ReviewFinding{regression("a2")}}},
+		{name: "round-one blocker retained", round1: failed, round1Blockers: []api.ReviewFinding{cited}, round2: failed, meta: api.ReviewMetadata{Blockers: []api.ReviewFinding{cited}}},
+		{name: "finding", round1: partialConvergence, round2: failed, meta: api.ReviewMetadata{Findings: []api.ReviewFinding{finding("f1", "a2")}}},
+		{name: "new non-regression blocker filed as a finding", round1: partialConvergence, round2: failed, meta: api.ReviewMetadata{Blockers: []api.ReviewFinding{cited}}},
+		{name: "two uncited fails name the lower", round1: partialConvergence, round2: map[string]string{"a1": "fail", "a2": "fail"}, want: uncited("a1")},
+		{name: "a cited fail beside an uncited one", round1: partialConvergence, round2: map[string]string{"a1": "fail", "a2": "fail"}, meta: api.ReviewMetadata{Findings: []api.ReviewFinding{finding("f1", "a1")}}, want: uncited("a2")},
+		{name: "round-one uncited fail passed in round two", round1: failed, round2: passConvergence},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			f.generalRound(t, candidateA, tc.round1, api.ReviewMetadata{Blockers: tc.round1Blockers})
+			r := f.review(t, candidateB)
+			before, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+			meta := tc.meta
+			meta.Mode = "general"
+			_, err := f.post(f.resultEnv(candidateB, tc.round2, meta), "", r.Seq, f.reviewer)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal("round two refused", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("round two:\n got %v\nwant %s", err, tc.want)
+			}
+			after, _ := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+			st := f.state(t)
+			if len(before.Items) != len(after.Items) || len(st.Rounds) != 2 || st.Rounds[1].ResultSeq != 0 || len(st.FollowUps) != 0 {
+				t.Fatal("refused round two left writes behind", st)
+			}
+		})
+	}
+}
+
+// wi_06611d359b2081ee v2: a regression that cites the criterion it breaks is
+// passed by its focused verification, so a plain accept needs no owner.
+func TestReviewConvergenceRegressionCitingCriterionAcceptsAfterFocusedPass(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+	b1 := api.ReviewFinding{ID: "b1", Criterion: "a2", Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Retry drops the saved state", File: "fixture.go", Line: 7}
+	f.generalRound(t, candidateB, map[string]string{"a1": "pass", "a2": "fail"}, api.ReviewMetadata{Blockers: []api.ReviewFinding{b1}})
+	if err := f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has not passed") {
+		t.Fatal("accept with the regression open", err)
+	}
+	f.focusedCheck(t, api.ReviewMetadata{Candidate: candidateC, Fix: "Keep the saved state on retry", BlockerIDs: []string{"b1"}}, map[string]string{"b1": "pass"}, receiptProof(candidateC))
+	if err := f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+		t.Fatal("plain accept after the regression passed", err)
+	}
+	st := f.state(t)
+	if st.Rounds[1].Verdicts["a2"] != "fail" || len(st.Focused) != 1 || !st.Focused[0].Passed || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateC {
+		t.Fatal("accepted state", st)
+	}
+}
+
+// wi_06611d359b2081ee v3: after a blocker-only focused pass on C, a
+// criterionIds-only request on C settles a round-two partial with the exact
+// receipt. It is not a rebase of B: its RESULT reports only the criterion IDs.
+// A candidate with no blocker pass there, or with a blocker still open there,
+// keeps the rebase route and its refusal.
+func TestReviewConvergenceCriterionIDsSettleAfterBlockerOnlyFocusedPass(t *testing.T) {
+	setup := func(t *testing.T, blockers ...string) *convergenceFixture {
+		f := newConvergenceFixture(t)
+		f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+		var round2 []api.ReviewFinding
+		for i, id := range blockers {
+			round2 = append(round2, api.ReviewFinding{ID: id, Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Retry drops the saved state", File: "fixture.go", Line: 7 + i})
+		}
+		f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{Blockers: round2})
+		f.focusedCheck(t, api.ReviewMetadata{Candidate: candidateC, Fix: "Keep the saved state on retry", BlockerIDs: []string{"b1"}}, map[string]string{"b1": "pass"}, receiptProof(candidateC))
+		return f
+	}
+	settle := api.ReviewMetadata{Candidate: candidateC, Fix: "Full matrix receipt covers a2 on the fixed candidate", CriterionIDs: []string{"a2"}}
+	rebaseRefusal := "conflict: review convergence: rebase verification needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: unresolved blockers on accepted candidate)"
+
+	t.Run("settles on the blocker-verified candidate", func(t *testing.T) {
+		f := setup(t, "b1")
+		if err := f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has not passed; a partial") {
+			t.Fatal("accept before settling a2", err)
+		}
+		_, err := f.focusedRequest(settle)
+		receiptRefused(t, "settle request with no receipt for C", err)
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		request, err := f.focusedRequest(settle)
+		if err != nil {
+			t.Fatal("settle request refused", err)
+		}
+		for label, status := range map[string]map[string]string{
+			"equivalence key": {"equivalence": "pass", "a2": "pass"},
+			"delta key":       {"delta": "pass", "a2": "pass"},
+			"blocker key":     {"b1": "pass", "a2": "pass"},
+		} {
+			if err = f.focusedResult(request.Seq, settle, status, receiptProof(candidateC)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "Status reports pass or fail for exactly a2") {
+				t.Fatal(label, err)
+			}
+		}
+		if err = f.focusedResult(request.Seq, settle, map[string]string{"a2": "pass"}, receiptProof(candidateC)); err != nil {
+			t.Fatal("settle result refused", err)
+		}
+		f.thirdReviewRefused(t, candidateC)
+		if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("settlement on C accepted the reviewed candidate", err)
+		}
+		if err = f.acceptCandidate(candidateC, api.Agent{}); err != nil {
+			t.Fatal("plain accept of C", err)
+		}
+		st := f.state(t)
+		if st.Rounds[1].Verdicts["a2"] != "partial" || len(st.Focused) != 2 || !st.Focused[1].Passed || st.Focused[1].ReceiptGeneration <= 0 || st.Focused[1].TreeDiffers || len(st.Focused[1].BlockerIDs) != 0 || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidateC {
+			t.Fatal("accepted state", st)
+		}
+	})
+	t.Run("failed settlement keeps the partial", func(t *testing.T) {
+		f := setup(t, "b1")
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		f.focusedCheck(t, settle, map[string]string{"a2": "fail"}, receiptProof(candidateC))
+		if err := f.acceptCandidate(candidateC, api.Agent{}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "criterion a2 has not passed; a partial") {
+			t.Fatal("accept after a failed settlement", err)
+		}
+	})
+	t.Run("candidate with no blocker pass keeps the rebase route", func(t *testing.T) {
+		f := setup(t, "b1")
+		seedPassingVerification(t, f.s, f.item, candidateD)
+		other := settle
+		other.Candidate, other.Fix = candidateD, "Full matrix receipt covers a2 after "+candidateB
+		if _, err := f.focusedRequest(other); err == nil || err.Error() != rebaseRefusal {
+			t.Fatalf("settle request on D:\n got %v\nwant %s", err, rebaseRefusal)
+		}
+	})
+	t.Run("blocker still open on the candidate keeps the rebase route", func(t *testing.T) {
+		f := setup(t, "b1", "b2")
+		seedPassingVerification(t, f.s, f.item, candidateC)
+		withFix := settle
+		withFix.Fix = "Full matrix receipt covers a2 after " + candidateB
+		if _, err := f.focusedRequest(withFix); err == nil || err.Error() != rebaseRefusal {
+			t.Fatalf("settle request on C with b2 open:\n got %v\nwant %s", err, rebaseRefusal)
+		}
+		withFix.TreeDiffers = true
+		if _, err := f.focusedRequest(withFix); err == nil || !strings.Contains(err.Error(), "treeDiffers verification needs a converged review") {
+			t.Fatal("treeDiffers request on C with b2 open", err)
+		}
+	})
+}
+
 // The documented focused examples are valid on the wire as tt send reads them.
 func TestReviewConvergenceDocumentedFocusedExamples(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "message-broker.md"))
