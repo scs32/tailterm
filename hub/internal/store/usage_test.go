@@ -1004,7 +1004,10 @@ func TestUsageReportReadCostBounded(t *testing.T) {
 	if small != 5 || large != small {
 		t.Fatalf("obligation queries grew with the turn count: %d for 600 turns, %d for 3000", small, large)
 	}
-	if took > 2*time.Second {
+	// The wall-clock bound holds only outside -race: under the race detector on
+	// a loaded host one 3000-turn read took 2.34 s, so race runs log the time
+	// and rely on the query count above, which catches growth with turns.
+	if took > 2*time.Second && !raceBuilt() {
 		t.Fatalf("report over 3000 turns took %s", took)
 	}
 	t.Logf("3000 turns: %s, %d obligation queries", took, large)
