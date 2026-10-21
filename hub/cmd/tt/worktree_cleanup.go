@@ -158,6 +158,12 @@ type worktreeCleanupInputs struct {
 	// Items turns on the artifact checkout rules: the state of every item
 	// with a queue record. Nil leaves every worktree under the ordinary rules.
 	Items map[string]artifactItemState
+	// Dismissed is each dismissed work item's last update, which is no
+	// earlier than its dismissal (sweep only). An item with no queue record
+	// that is listed here is decided by its dismissal; any other stays
+	// retention. DismissedFault says why some dismissals could not be read.
+	Dismissed      map[string]time.Time
+	DismissedFault string
 	// Artifacts overrides the artifacts root (default: artifactsRootFor).
 	Artifacts string
 	// AcceptedAfter is how long an accepted, unreleased item keeps its
@@ -954,7 +960,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 					before := dirModTime(parent)
 					if item != "" {
 						// A verifier checkout leaves a manifest beside its receipts.
-						reason, why, manifest, bytes = removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.items[item], in.Receipt, now)
+						reason, why, manifest, bytes = removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.itemState(item), in.Receipt, now)
 					} else {
 						reason, why = removeWorktree(ctx, common, w, admin, cleared)
 					}
@@ -1251,15 +1257,19 @@ const (
 	artifactItemRunning  = "running"
 	artifactItemReleased = "released"
 	artifactItemAccepted = "accepted"
+	// A dismissed item with no queue record; it never comes from a queue
+	// entry.
+	artifactItemDismissed = "dismissed"
 )
 
 // artifactItemState is what the queue records say about one item. An item
 // with no record has no state and is never treated as released.
 type artifactItemState struct {
 	State string
-	// At is the acceptance time of an accepted item.
+	// At is the acceptance time of an accepted item, or the dismissal time
+	// of a dismissed one.
 	At time.Time
-	// BasisAt is the recorded time of the release or acceptance.
+	// BasisAt is the recorded time of the release, acceptance or dismissal.
 	BasisAt string
 	EntryID string
 	Detail  string
@@ -1344,6 +1354,8 @@ type artifactPass struct {
 	// from --artifacts or TAILTERM_ARTIFACTS and may be mistaken.
 	custom        bool
 	items         map[string]artifactItemState
+	dismissed     map[string]time.Time
+	dismissFault  string
 	acceptedAfter time.Duration
 	now           time.Time
 	linked        map[string]bool
@@ -1362,7 +1374,7 @@ func newArtifactPass(in worktreeCleanupInputs, main string, linked []string) *ar
 	if root == "" || !filepath.IsAbs(root) {
 		return nil
 	}
-	a := &artifactPass{root: canonicalPath(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
+	a := &artifactPass{root: canonicalPath(root), custom: main == "" || canonicalPath(root) != canonicalPath(main+"-artifacts"), items: in.Items, dismissed: in.Dismissed, dismissFault: in.DismissedFault, acceptedAfter: in.AcceptedAfter, now: in.Now, linked: map[string]bool{}, texts: map[string][]worktreeEvidence{}, textFault: map[string]string{}}
 	if a.acceptedAfter <= 0 {
 		a.acceptedAfter = acceptedAfterInput(defaultArtifactAcceptedAfter)
 	}
@@ -1448,23 +1460,40 @@ func (a *artifactPass) unreadable(items []string) string {
 	return ""
 }
 
+// itemState is what decides an item's checkouts: its queue record, or its
+// dismissal when it has none. The zero state means neither is known.
+func (a *artifactPass) itemState(item string) artifactItemState {
+	if st, ok := a.items[item]; ok {
+		return st
+	}
+	if at, ok := a.dismissed[item]; ok {
+		return artifactItemState{State: artifactItemDismissed, At: at, BasisAt: at.UTC().Format(time.RFC3339Nano)}
+	}
+	return artifactItemState{}
+}
+
 // gate returns the keep reason while the item holds its checkouts, or "" with
-// the basis for removing them.
+// the basis for removing them. A dismissed item waits as an accepted one
+// does, from its dismissal.
 func (a *artifactPass) gate(item string) (string, string) {
-	st, ok := a.items[item]
-	switch {
-	case !ok:
-		return keepRetention, "no queue record for " + item
-	case st.State == artifactItemRunning:
+	st := a.itemState(item)
+	switch st.State {
+	case "":
+		detail := "no queue record for " + item
+		if a.dismissFault != "" {
+			detail += "; " + a.dismissFault
+		}
+		return keepRetention, detail
+	case artifactItemRunning:
 		return keepItemActive, st.Detail
-	case st.State == artifactItemReleased:
+	case artifactItemReleased:
 		return "", "item " + item + " released"
 	}
 	age := a.now.Sub(st.At)
 	if age < a.acceptedAfter {
-		return keepRetention, fmt.Sprintf("accepted %s ago; eligible after %s", shortDuration(age), shortDuration(a.acceptedAfter))
+		return keepRetention, fmt.Sprintf("%s %s ago; eligible after %s", st.State, shortDuration(age), shortDuration(a.acceptedAfter))
 	}
-	return "", fmt.Sprintf("item %s accepted %s ago", item, shortDuration(age))
+	return "", fmt.Sprintf("item %s %s %s ago", item, st.State, shortDuration(age))
 }
 
 // artifactCitation returns the path inside the checkout that text refers to,
@@ -1716,10 +1745,44 @@ func pinArtifactHead(ctx context.Context, common, item string, w gitWorktree) (s
 	return "", false, errors.New("retired refs for " + name + " hold other commits")
 }
 
+// leftoverManifest returns a manifest beside the checkout that already names
+// its path and head, or "": one a pass wrote before it stopped short of the
+// removal, or one an earlier checkout of the same commit there left. Either
+// already describes this removal. Only regular files are read.
+func leftoverManifest(w gitWorktree) string {
+	dir, base := filepath.Split(w.Path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, d := range entries {
+		name := d.Name()
+		if name != base+".removed.json" && !(strings.HasPrefix(name, base+".removed-") && strings.HasSuffix(name, ".json")) {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > maxArtifactTextBytes {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var m artifactManifest
+		if json.Unmarshal(data, &m) == nil && m.Path == w.Path && m.Head == w.Head {
+			return path
+		}
+	}
+	return ""
+}
+
 // removeArtifactCheckout pins the checkout's commit when nothing else holds
 // it, writes the manifest, then removes the worktree through the ordinary
 // re-checked path. A removal that keeps the checkout takes the manifest and
-// a ref made here back, so a manifest always means a removed checkout.
+// a ref made here back. A manifest left beside the checkout for its path and
+// head is reused, not written again, so a pass that stopped between the write
+// and the removal leaves one manifest; a reused one is never taken back.
 func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, admin string, cleared map[string]bool, item string, st artifactItemState, base worktreeCleanupReceipt, now time.Time) (string, string, string, int64) {
 	m, err := buildArtifactManifest(ctx, w, item, st, base, now)
 	if err != nil {
@@ -1735,13 +1798,18 @@ func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, a
 		}
 	}
 	m.PinnedRef = ref
-	manifest, err := writeArtifactManifest(w.Path, m, now)
-	if err != nil {
-		unpin()
-		return keepFailed, "write manifest: " + err.Error(), "", 0
+	manifest := leftoverManifest(w)
+	reused := manifest != ""
+	if !reused {
+		if manifest, err = writeArtifactManifest(w.Path, m, now); err != nil {
+			unpin()
+			return keepFailed, "write manifest: " + err.Error(), "", 0
+		}
 	}
 	if reason, why := removeWorktree(ctx, common, w, admin, cleared); reason != "" {
-		_ = os.Remove(manifest)
+		if !reused {
+			_ = os.Remove(manifest)
+		}
 		unpin()
 		return reason, why, "", 0
 	}
@@ -1773,18 +1841,32 @@ func mainCheckoutGuess(repo string) string {
 	return ""
 }
 
-// holdsDetachedCheckout reports whether a directory one level below dir is a
-// detached linked worktree, reading only its .git link and HEAD.
+// holdsDetachedCheckout reports whether a directory one or two levels below
+// dir, such as <item>/verifier-x/checkout, is a detached linked worktree,
+// reading only .git links and HEAD. It follows no symlink below dir and does
+// not look inside a directory that holds a .git entry.
 func holdsDetachedCheckout(dir string) bool {
+	return detachedCheckoutWithin(dir, 2)
+}
+
+func detachedCheckoutWithin(dir string, depth int) bool {
 	children, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
 	for _, d := range children {
+		// A symlink's entry is not a directory, so it is never followed.
 		if !d.IsDir() {
 			continue
 		}
-		admin := worktreeAdminDir(filepath.Join(dir, d.Name()))
+		child := filepath.Join(dir, d.Name())
+		if _, err := os.Lstat(filepath.Join(child, ".git")); err != nil {
+			if depth > 1 && detachedCheckoutWithin(child, depth-1) {
+				return true
+			}
+			continue
+		}
+		admin := worktreeAdminDir(child)
 		if admin == "" {
 			continue
 		}
@@ -2310,11 +2392,17 @@ type worktreeSweepReport struct {
 type sweepHubState struct {
 	entries []api.TeamQueueEntry
 	agents  []api.Agent
+	// dismissed and dismissFault are the cleanup inputs Dismissed and
+	// DismissedFault.
+	dismissed    map[string]time.Time
+	dismissFault string
 }
 
-// readSweepHub reads every project's agents and every page of its queue.
+// readSweepHub reads every project's agents, every page of its queue and its
+// dismissed work items. A dismissal read that fails only leaves those items
+// retention, so it is noted rather than refused.
 func readSweepHub(ctx context.Context, c *api.Client) (sweepHubState, error) {
-	var state sweepHubState
+	state := sweepHubState{dismissed: map[string]time.Time{}}
 	tasks, err := c.ListTasks(ctx)
 	if err != nil {
 		return state, fmt.Errorf("sweep needs the hub: %w", err)
@@ -2349,8 +2437,35 @@ func readSweepHub(ctx context.Context, c *api.Client) (sweepHubState, error) {
 			}
 			after = queue.History.NextAfter
 		}
+		if err := readDismissed(ctx, c, task.ID, state.dismissed); err != nil && state.dismissFault == "" {
+			state.dismissFault = "dismissals of project " + task.ID + " unreadable: " + err.Error()
+		}
 	}
 	return state, nil
+}
+
+// readDismissed adds each dismissed work item of a project to dismissed, at
+// its last update: the hub keeps no separate dismissal time, and the last
+// update is never earlier than the dismissal.
+func readDismissed(ctx context.Context, c *api.Client, task string, dismissed map[string]time.Time) error {
+	for after, pages := int64(0), 0; ; pages++ {
+		list, err := c.ListWorkItems(ctx, task, "", "dismissed", after, api.MaxLimit)
+		if err != nil {
+			return err
+		}
+		for _, item := range list.Items {
+			if item.Status == "dismissed" && item.ID != "" && !item.UpdatedAt.IsZero() {
+				dismissed[item.ID] = item.UpdatedAt
+			}
+		}
+		if len(list.Items) < api.MaxLimit || list.Next <= after {
+			return nil
+		}
+		if pages >= 1000 {
+			return errors.New("work item listing does not end")
+		}
+		after = list.Next
+	}
 }
 
 // sweepOptions is one sweep of one repository.
@@ -2400,7 +2515,8 @@ func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o s
 	in := worktreeCleanupInputs{
 		Repo: o.Repo, InUse: inUse, Evidence: evidence, MinIdle: o.MinIdle, Now: o.Now,
 		Apply: o.Apply, MeasureBytes: true, Receipt: worktreeCleanupReceipt{Source: "sweep"},
-		Items: artifactItemStates(state.entries, state.agents), Artifacts: o.Artifacts, AcceptedAfter: o.AcceptedAfter,
+		Items: artifactItemStates(state.entries, state.agents), Dismissed: state.dismissed, DismissedFault: state.dismissFault,
+		Artifacts: o.Artifacts, AcceptedAfter: o.AcceptedAfter,
 		TempRoot: claudeTempRoot(), TempCwds: tempCwds,
 		Trim: finishedTrimSet(host, state.entries, state.agents), Tombstones: o.Apply,
 		TempHomes:     func() bool { return claimVerifyHomeTempPass(o.Now) },
