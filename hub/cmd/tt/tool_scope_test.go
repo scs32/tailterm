@@ -1472,22 +1472,33 @@ func TestToolScopeLateCheckRow(t *testing.T) {
 		}
 		cases = append(cases, lateCase{rule + ", a token-shaped path, check at 130ms", rule, secret + ".go", "[redacted].go", 130 * time.Millisecond, before})
 	}
+	// A hook goroutine that reads its input after the deadline returns
+	// before the check (record in tool_ledger.go writes nothing late). One
+	// that read it in time reaches the check after writing its pending
+	// entry, so a hook that returned at its deadline and started no check
+	// within this grace ran none.
+	const checkGrace = time.Second
 	real := toolScopeCheck
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// returned carries how long after the hook's start the check
-			// returned, from the goroutine the hook leaves behind.
-			returned := make(chan time.Duration, 8)
-			setToolLedger(t, &toolScopeCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage, cwd string) {
-				time.Sleep(time.Until(l.started.Add(c.delay)))
-				real(l, row, tool, input, cwd)
-				returned <- time.Since(l.started)
-			})
 			// A check that a stalled host held until the real deadline has
-			// no row to show, so that attempt is run again in a new sandbox,
-			// at most three times; the last is judged as it stands.
+			// no row to show, and one it kept from starting has no return,
+			// so that attempt is run again in a new sandbox, at most three
+			// times; the last is judged as it stands.
 			const attempts = 3
 			for attempt := 1; ; attempt++ {
+				// Each attempt installs its own check. The hook keeps the
+				// check it was given, so a late one from an earlier attempt
+				// reports on that attempt's channels, never on these.
+				// returned carries how long after the hook's start the check
+				// returned, from the goroutine the hook leaves behind.
+				started, returned := make(chan struct{}, 1), make(chan time.Duration, 1)
+				setToolLedger(t, &toolScopeCheck, func(l toolLedger, row toolLedgerRow, tool string, input json.RawMessage, cwd string) {
+					started <- struct{}{}
+					time.Sleep(time.Until(l.started.Add(c.delay)))
+					real(l, row, tool, input, cwd)
+					returned <- time.Since(l.started)
+				})
 				var e env
 				var root string
 				if c.before {
@@ -1505,11 +1516,38 @@ func TestToolScopeLateCheckRow(t *testing.T) {
 				if r.err != nil || r.out != "" {
 					t.Fatalf("hook = %v, output %q; want nil and no output", r.err, r.out)
 				}
+				ran := false
+				select {
+				case <-started:
+					ran = true
+				default:
+					// A hook that returned before its deadline has finished
+					// its goroutine, and with it any check.
+					if r.elapsed >= toolLedgerDeadline {
+						select {
+						case <-started:
+							ran = true
+						case <-time.After(checkGrace):
+						}
+					}
+				}
+				if !ran {
+					if r.elapsed < toolLedgerDeadline {
+						t.Fatalf("no check ran: the hook finished in %v, inside its %v deadline, without starting the check", r.elapsed, toolLedgerDeadline)
+					}
+					why := fmt.Sprintf("no check ran: the hook returned at the %v deadline in %v and started no check within %v", toolLedgerDeadline, r.elapsed, checkGrace)
+					if attempt < attempts {
+						t.Logf("attempt %d: %s; running it again in a new sandbox", attempt, why)
+						time.Sleep(time.Duration(attempt) * time.Second)
+						continue
+					}
+					t.Fatal(why)
+				}
 				var elapsed time.Duration
 				select {
 				case elapsed = <-returned:
 				case <-time.After(10 * time.Second):
-					t.Fatal("the check never returned")
+					t.Fatal("the check started and never returned")
 				}
 				rows := wouldReportRows(toolLedgerRows(t, root, e.agent))
 				if len(rows) == 0 && elapsed >= toolLedgerDeadline && attempt < attempts {
