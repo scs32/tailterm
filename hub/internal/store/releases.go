@@ -60,7 +60,8 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  reported_at TEXT NOT NULL DEFAULT '',record_json TEXT NOT NULL DEFAULT '',
  scan_seq INTEGER NOT NULL DEFAULT 0,code_seq INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS release_windows (
- task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),record_json TEXT NOT NULL);`
+ task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),record_json TEXT NOT NULL);
+ CREATE INDEX IF NOT EXISTS messages_matrix_approvals ON messages(task_id,seq) WHERE ` + matrixApprovalCandidate + `;`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
 
@@ -294,6 +295,16 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 
 const matrixApprovalPrefix = "verification-matrix-approval:"
 
+// matrixApprovalCandidate selects the owner messages that carry the approval
+// token anywhere, the rows releaseMatrixApprovals reads. It is both the
+// partial index's WHERE and the query's, so a list or detail read of a
+// claimed job walks only those rows instead of every project message.
+const matrixApprovalCandidate = `from_agent='' AND instr(text,'` + matrixApprovalPrefix + `')>0`
+
+// matrixApprovalsQuery must use the partial index: INDEXED BY makes the
+// statement fail rather than fall back to a scan.
+const matrixApprovalsQuery = `SELECT seq,text FROM messages INDEXED BY messages_matrix_approvals WHERE task_id=? AND ` + matrixApprovalCandidate + ` AND from_node<>'system' ORDER BY seq`
+
 // releaseMatrixApproval reports whether the message at seq is an owner
 // approval of exactly this matrix digest: owner-authored, not a system
 // message, and its whole trimmed text the approval token (the rule
@@ -310,7 +321,7 @@ func releaseMatrixApproval(ctx context.Context, q queryRower, task string, seq i
 // releaseMatrixApprovals lists the project's owner matrix approvals, the
 // newest message per digest, in message order.
 func releaseMatrixApprovals(ctx context.Context, db *sql.DB, task string) ([]api.ReleaseMatrixApproval, error) {
-	rows, err := db.QueryContext(ctx, `SELECT seq,text FROM messages WHERE task_id=? AND from_agent='' AND from_node<>'system' AND text LIKE ? ORDER BY seq`, task, "%"+matrixApprovalPrefix+"%")
+	rows, err := db.QueryContext(ctx, matrixApprovalsQuery, task)
 	if err != nil {
 		return nil, err
 	}
@@ -885,6 +896,15 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if j.State == "held" {
 				return zero, releaseConflict("job " + j.ID + " is on an owner hold; release the hold first with tt deployment unhold")
 			}
+			// A retry follows the job it names, so only the entry's latest
+			// job may be superseded.
+			var latest, latestState string
+			if err = tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task, j.EntryID).Scan(&latest, &latestState); err != nil {
+				return zero, err
+			}
+			if latest != j.ID {
+				return zero, releaseConflict("job " + j.ID + " is not its entry's latest release job; the latest is " + latest + " (" + latestState + ")")
+			}
 			if reason := releaseSupersedable(j); reason != "" {
 				return zero, releaseConflict(reason)
 			}
@@ -919,6 +939,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				return zero, releaseConflict("integrated matrix plan required")
 			}
 			p := *req.Plan
+			// Both digests reach refusal text below, so they are checked
+			// first and an invalid one is never echoed.
+			if !validContextDigest(p.MatrixDigest) || !validContextDigest(p.ApprovedMatrixDigest) {
+				return zero, releaseConflict("integrated plan matrix digest is not a valid digest")
+			}
 			if p.Commit != req.IntegratedCommit || p.BaseCommit != j.BaseCommit || p.Repository != j.Repository || p.ApprovedMatrixDigest != p.MatrixDigest || p.VerifierAgentID != j.AgentID || p.VerifierRunID != j.RunID || p.ChecksDigest != verificationDigest(p.Checks) || p.ScopeRevision != j.ScopeRevision {
 				return zero, releaseConflict("integrated plan binding mismatch")
 			}

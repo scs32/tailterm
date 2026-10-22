@@ -469,6 +469,146 @@ func TestReleaseImportBindsOwnerApprovedMatrixChange(t *testing.T) {
 	}
 }
 
+// wi_3aca3c7a3a869afb x1: an integrated plan whose matrix digests are not
+// context digests is refused before any refusal text could echo them, even
+// with an owner message that names the same text.
+func TestReleaseImportRefusesInvalidMatrixDigestWithoutEchoingIt(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	approved := goRaceMatrix(goRace(raceFlags, "./cmd/tt"))
+	j := claimGoRaceJob(t, s, task, h, d, entry, approved)
+	const want = "release: integrated plan matrix digest is not a valid digest"
+	for name, c := range map[string]struct{ digest, approved string }{
+		"non-hex":          {strings.Repeat("Z", 64), strings.Repeat("Z", 64)},
+		"upper-hex":        {strings.Repeat("F", 64), strings.Repeat("F", 64)},
+		"markup":           {"<b>9f9f9f9f</b>", "<b>9f9f9f9f</b>"},
+		"empty":            {"", ""},
+		"approved-invalid": {matrixB, "QQQQQQQQ"},
+		"plan-invalid":     {"QQQQQQQQ", matrixB},
+	} {
+		covering := ownerApproval(t, s, task, "verification-matrix-approval:"+c.digest)
+		req := matrixImport(j, h, d, "bad-digest-"+name, c.digest, covering, approved)
+		req.Plan.ApprovedMatrixDigest = c.approved
+		_, err := s.ReleaseAction(ctx, task.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, bad := range []string{c.digest, c.approved} {
+			if bad != "" && bad != matrixB && strings.Contains(err.Error(), bad[:min(8, len(bad))]) {
+				t.Fatalf("%s: refusal echoes %q: %v", name, bad, err)
+			}
+		}
+		saved, err := releaseLoad(ctx, s.db, task.ID, j.ID)
+		if err != nil || saved.Generation != j.Generation || saved.IntegratedPlan != nil || saved.IntegratedMatrix != nil {
+			t.Fatal(name, "changed the job", saved.Generation, err)
+		}
+	}
+	// A valid changed digest without an approval still names both digests.
+	_, err := s.ReleaseAction(ctx, task.ID, matrixImport(j, h, d, "valid-unapproved", matrixB, 0, approved))
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "matrix digest changed aaaaaaaa -> bbbbbbbb; no approval") {
+		t.Fatal(err)
+	}
+}
+
+// legacyMatrixApprovals is the approvals read before wi_3aca3c7a3a869afb
+// x2: a leading-wildcard LIKE over every project message. It is the oracle
+// the indexed read must match.
+func legacyMatrixApprovals(t *testing.T, s *Store, task string) []api.ReleaseMatrixApproval {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT seq,text FROM messages WHERE task_id=? AND from_agent='' AND from_node<>'system' AND text LIKE ? ORDER BY seq`, task, "%"+matrixApprovalPrefix+"%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []api.ReleaseMatrixApproval
+	for rows.Next() {
+		var seq int64
+		var text string
+		if err = rows.Scan(&seq, &text); err != nil {
+			t.Fatal(err)
+		}
+		digest, ok := strings.CutPrefix(strings.TrimSpace(text), matrixApprovalPrefix)
+		if !ok || !validContextDigest(digest) {
+			continue
+		}
+		out = slices.DeleteFunc(out, func(a api.ReleaseMatrixApproval) bool { return a.Digest == digest })
+		out = append(out, api.ReleaseMatrixApproval{Digest: digest, MessageSeq: seq})
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// wi_3aca3c7a3a869afb x2: while a job is claimed, list and detail reads find
+// approvals through the partial index of token-bearing owner messages, not a
+// scan of every project message, and return what the old scan returned.
+func TestReleaseMatrixApprovalsUseIndexAndMatchScan(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	j := claimGoRaceJob(t, s, task, h, d, entry, goRaceMatrix(goRace(raceFlags, "./cmd/tt")))
+	matrixC := strings.Repeat("c", 64)
+	other := secondTask(t, s)
+	ownerApproval(t, s, other, "verification-matrix-approval:"+matrixC)
+	for i := range 50 {
+		ownerApproval(t, s, task, fmt.Sprintf("ordinary owner message %d", i))
+	}
+	first := ownerApproval(t, s, task, "verification-matrix-approval:"+matrixA)
+	ownerApproval(t, s, task, "I approve verification-matrix-approval:"+matrixB)
+	ownerApproval(t, s, task, "VERIFICATION-MATRIX-APPROVAL:"+matrixB)
+	ownerApproval(t, s, task, "verification-matrix-approval:"+strings.Repeat("Z", 64))
+	ownerApproval(t, s, task, "verification-matrix-approval:"+matrixB+" and more")
+	if _, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "verification-matrix-approval:" + matrixC, RequestID: "agent-approval", AgentID: h.ID}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	spaced := ownerApproval(t, s, task, "\t verification-matrix-approval:"+matrixB+"\n")
+	newest := ownerApproval(t, s, task, "verification-matrix-approval:"+matrixA)
+	want := []api.ReleaseMatrixApproval{{Digest: matrixB, MessageSeq: spaced}, {Digest: matrixA, MessageSeq: newest}}
+	if newest <= first {
+		t.Fatal("message order", first, newest)
+	}
+	if legacy := legacyMatrixApprovals(t, s, task.ID); !slices.Equal(legacy, want) {
+		t.Fatalf("oracle %+v", legacy)
+	}
+	jobs, err := s.Releases(ctx, task.ID)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != j.ID || !slices.Equal(jobs[0].MatrixApprovals, want) {
+		t.Fatalf("list approvals %+v %v", jobs, err)
+	}
+	detail, err := s.Release(ctx, task.ID, j.ID)
+	if err != nil || !slices.Equal(detail.MatrixApprovals, want) {
+		t.Fatalf("detail approvals %+v %v", detail.MatrixApprovals, err)
+	}
+
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+matrixApprovalsQuery, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err = rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	rows.Close()
+	if len(plan) != 1 || !strings.Contains(plan[0], "USING INDEX messages_matrix_approvals") {
+		t.Fatalf("approvals query plan %q", plan)
+	}
+	// The index holds only owner messages that carry the token.
+	var indexed, tokens int
+	if err = s.db.QueryRow(`SELECT count(*) FROM messages INDEXED BY messages_matrix_approvals WHERE task_id=? AND `+matrixApprovalCandidate, task.ID).Scan(&indexed); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND from_agent='' AND instr(text,?)>0`, task.ID, matrixApprovalPrefix).Scan(&tokens); err != nil {
+		t.Fatal(err)
+	}
+	if indexed != tokens || indexed != 6 {
+		t.Fatal("indexed rows", indexed, tokens)
+	}
+}
+
 // shardedRace is the go-race of a matrix with goRaceShards: the matrix
 // runner's own command with the shard count in its prefix, then only packages
 // (wi_d6b6387726c1f846). The coverage rule reads it like the go test form.
@@ -2401,6 +2541,35 @@ func TestReleaseRetryCreatesNewJobForRefusedEntry(t *testing.T) {
 	}
 	if jobs, err = s.Releases(ctx, task.ID); err != nil || len(jobs) != 3 || jobs[0].ID != first.ID || jobs[1].ID != second.ID || jobs[2].ID != third.ID {
 		t.Fatal("history after second retry", jobs, err)
+	}
+}
+
+// wi_3aca3c7a3a869afb x3: once a retry follows a refused job, only the
+// entry's latest job may be superseded; the refusal names the newer job and
+// leaves the earlier one as it was.
+func TestReleaseSupersedeRefusesJobWithNewerRetry(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	first := refusedJob(t, s, task, h, d, entry)
+	second, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := releaseRow(t, s, task, first.ID)
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{first.Commit})
+	supersede := func(key string, j api.ReleaseJob) (api.ReleaseJob, error) {
+		return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	}
+	_, err = supersede("supersede-earlier", first)
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "job "+first.ID+" is not its entry's latest release job; the latest is "+second.ID+" (verified)") {
+		t.Fatal(err)
+	}
+	if releaseRow(t, s, task, first.ID) != before {
+		t.Fatal("refused job changed")
+	}
+	done, err := supersede("supersede-latest", second)
+	if err != nil || done.State != "superseded" || done.Supersession.HandReleaseID != hand.ID {
+		t.Fatal(done, err)
 	}
 }
 
