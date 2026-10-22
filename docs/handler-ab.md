@@ -100,9 +100,14 @@ to its leased item:
 It leaves out the primary's duties: intake and filing, estimates, readiness
 passes and allocation, lane proposals, shared-path waits and steward routing.
 Each shared rule is one constant that the primary guidance also carries, so a
-change to it reaches both and the template digest covers it. Briefings are
-generated at launch: a running arm handler sees a guidance change only when a
-fresh one is spawned. Arm handlers still do not rotate (D1).
+change to it reaches both and the template digest covers it. The arm-only
+text, the lease paragraph, is outside the handler template digest, so a change
+to it alone shows no digest mismatch in `tt handler arms get` or the arms
+report. It is left out on purpose: arm handlers do not rotate (D1), and folding
+it into the shared digest would mark every live handler stale until the arm
+policy digest is re-saved, since enabling refuses on a mismatch (D3). Briefings
+are generated at launch: a running arm handler sees a guidance change, the
+arm-only text included, only when a fresh one is spawned.
 
 ## Draw and lease
 
