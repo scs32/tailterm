@@ -4074,7 +4074,7 @@ func TestTeamRunnerFailedReleaseReturnsHubTransportFaultEveryPass(t *testing.T) 
 // on its host, and the hub refuses that project's census, so it must neither
 // take the census nor hold the open projects' parallel launches.
 func TestTeamRunnerHostCensusSkipsClosedProject(t *testing.T) {
-	for _, listing := range []string{"closed-head", "all-closed", "open"} {
+	for _, listing := range []string{"closed-head", "all-closed", "reopened", "open"} {
 		t.Run(listing, func(t *testing.T) { teamRunnerHostCensusSkipsClosedProject(t, listing) })
 	}
 }
@@ -4124,7 +4124,7 @@ func teamRunnerHostCensusSkipsClosedProject(t *testing.T, listing string) {
 		}
 	}
 	var entry api.TeamQueueEntry
-	if listing != "all-closed" {
+	if listing != "all-closed" && listing != "reopened" {
 		if entry, err = f.c.TeamQueueAction(ctx, open.task.ID, api.TeamQueueRequest{RequestID: "census-add", Operation: "add", ItemID: open.item.ID, OrderMessageSeq: open.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/census"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -4200,6 +4200,18 @@ func teamRunnerHostCensusSkipsClosedProject(t *testing.T, listing string) {
 		tick("second tick")
 		if got := usage(); got != seed.SourceDigest {
 			t.Fatalf("host usage digest %s, want the seeded one unchanged", got)
+		}
+	case "reopened":
+		// A remembered project that the owner reopens takes the census on
+		// the next tick.
+		tick("closed tick", closed.task.ID)
+		reopen := api.TaskOpen
+		if _, err := f.c.UpdateTask(ctx, closed.task.ID, api.UpdateTaskRequest{Status: &reopen}); err != nil {
+			t.Fatal(err)
+		}
+		tick("tick after the reopen", closed.task.ID)
+		if got := usage(); got != strings.Repeat("c", 64) {
+			t.Fatalf("host usage digest %s, want the reopened project's census", got)
 		}
 	case "open":
 		tick("first tick", open.task.ID)

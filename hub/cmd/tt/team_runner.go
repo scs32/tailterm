@@ -323,8 +323,8 @@ func (b *releaseErrorBook) retain(hub string, keep func(task, entry string) bool
 }
 
 // closedProjectBook holds, per hub, the projects whose host census the hub
-// refused because they are closed. A project never reopens, so the census
-// skips it for as long as the host listing still names it.
+// refused because they are closed. The census skips them for as long as the
+// host listing names them and the hub does not list them as open again.
 type closedProjectBook struct {
 	mu     sync.Mutex
 	closed map[string]map[string]bool
@@ -355,6 +355,15 @@ func (b *closedProjectBook) add(hub, task string) {
 		b.closed[hub] = map[string]bool{}
 	}
 	b.closed[hub][task] = true
+}
+
+func (b *closedProjectBook) forget(hub, task string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.closed[strings.TrimRight(hub, "/")], task)
 }
 
 // retain keeps hub's projects that listed still names.
@@ -1372,6 +1381,7 @@ func queueParallel(limit int) bool { return limit != 1 }
 // rather than holding every parallel launch on the host. With no open
 // project listed, no census is posted and nothing waits on one.
 func (r teamRunner) hostCensus(ctx context.Context, c *api.Client, projects []string, host string, list api.TeamQueueList) error {
+	r.recheckClosedProjects(ctx, c, projects)
 	for _, task := range projects {
 		if r.closedProjects.has(c.Base, task) {
 			continue
@@ -1383,6 +1393,29 @@ func (r teamRunner) hostCensus(ctx context.Context, c *api.Client, projects []st
 		r.closedProjects.add(c.Base, task)
 	}
 	return nil
+}
+
+// recheckClosedProjects forgets each remembered project that the hub lists
+// as open again, since the owner can reopen a closed project. While the host
+// listing names a remembered project this costs one project list read per
+// tick, and no write. A failed read keeps the memory until the next tick.
+func (r teamRunner) recheckClosedProjects(ctx context.Context, c *api.Client, projects []string) {
+	remembered := false
+	for _, task := range projects {
+		remembered = remembered || r.closedProjects.has(c.Base, task)
+	}
+	if !remembered {
+		return
+	}
+	tasks, err := c.ListTasks(ctx)
+	if err != nil {
+		return
+	}
+	for _, t := range tasks {
+		if t.Status == api.TaskOpen {
+			r.closedProjects.forget(c.Base, t.ID)
+		}
+	}
 }
 
 // hubRefusedClosedTask reports the hub's refusal of a write to a closed
