@@ -11,8 +11,7 @@
     },
     {
       "file": "tests/appearance-switching-browser.mjs",
-      "mode": "both",
-      "requiredPorts": [4319]
+      "mode": "both"
     },
     {
       "file": "tests/board-audit-async-browser.mjs",
@@ -44,8 +43,7 @@
     },
     {
       "file": "tests/browser.mjs",
-      "mode": "selected",
-      "requiredPorts": [14318]
+      "mode": "selected"
     },
     {
       "file": "tests/colored-history-browser.mjs",

@@ -1105,16 +1105,16 @@ test("approved matrix records default, per-check timeout and required fixed port
     checks.find((c) => c.id === "npm-unit").environment.VERIFICATION_TIMEOUT_MS,
     "480000",
   );
-  assert.equal(
-    checks.find((c) => c.id === "tests/browser.mjs:chromium").environment
-      .VERIFICATION_REQUIRED_PORTS,
-    "14318",
-  );
-  assert.equal(
-    checks.find((c) => c.id === "tests/appearance-switching-browser.mjs")
-      .environment.VERIFICATION_REQUIRED_PORTS,
-    "4319",
-  );
+  for (const id of [
+    "tests/browser.mjs:chromium",
+    "tests/appearance-switching-browser.mjs",
+  ])
+    assert.equal(
+      "VERIFICATION_REQUIRED_PORTS" in
+        checks.find((c) => c.id === id).environment,
+      false,
+      id,
+    );
   assert.throws(
     () =>
       selectChecks(
