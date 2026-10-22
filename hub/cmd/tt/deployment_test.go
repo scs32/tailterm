@@ -609,6 +609,76 @@ func TestDeploymentProvisioningReturnsTheRunnerReason(t *testing.T) {
 	}
 }
 
+// wi_31e817b4f98a1153 p1-p3: a successful run's stderr notes follow its JSON on
+// tt's stderr, unchanged and bounded; a failed run still returns only the
+// reason and echoes nothing.
+func TestDeploymentProvisioningShowsRunnerStderrOnSuccess(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node unavailable")
+	}
+	checkout := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(checkout, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := `const from = process.argv.at(-1);
+if (from === '/warn') {
+  console.log('{"version":1}');
+  process.stderr.write('go-licenses: copied none of the tree: key differs\n  texts come from module directories\n');
+} else if (from === '/flood') {
+  console.log('{"version":1}');
+  process.stderr.write('x'.repeat(99) + '\n');
+  process.stderr.write(('y'.repeat(99) + '\n').repeat(1000));
+} else {
+  console.log('{"partial":true}');
+  console.error('noise');
+  console.error('Missing matrix prerequisites: .build/test.wasm');
+  process.exitCode = 1;
+}
+`
+	if err := os.WriteFile(filepath.Join(checkout, "scripts", "release-runner.mjs"), []byte(runner), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(source string) (string, string, error) {
+		var stdout string
+		stderr, err := captureStream(t, &os.Stderr, func() error {
+			var runErr error
+			stdout, runErr = captureStream(t, &os.Stdout, func() error { return provisionPrerequisites(checkout, source) })
+			return runErr
+		})
+		return stdout, stderr, err
+	}
+
+	stdout, stderr, err := run("/warn")
+	if err != nil || stdout != "{\"version\":1}\n" {
+		t.Fatalf("stdout JSON changed: %q %v", stdout, err)
+	}
+	if want := "go-licenses: copied none of the tree: key differs\n  texts come from module directories\n"; stderr != want {
+		t.Fatalf("stderr = %q, want %q", stderr, want)
+	}
+
+	stdout, stderr, err = run("/bad")
+	if err == nil || err.Error() != "deployment prerequisites: Missing matrix prerequisites: .build/test.wasm" {
+		t.Fatal(err)
+	}
+	if stdout != "{\"partial\":true}\n" || stderr != "" {
+		t.Fatalf("failure echoed runner output: stdout %q stderr %q", stdout, stderr)
+	}
+
+	// 100 + 100000 bytes: whole lines up to the limit, then one count line.
+	stdout, stderr, err = run("/flood")
+	if err != nil || stdout != "{\"version\":1}\n" {
+		t.Fatalf("stdout JSON changed: %q %v", stdout, err)
+	}
+	shown := 100 + (provisionStderrLimit-100)/100*100
+	lines := strings.SplitAfter(stderr, "\n")
+	if body := strings.Join(lines[:len(lines)-2], ""); len(body) != shown || !strings.HasPrefix(body, strings.Repeat("x", 99)+"\n") || !strings.HasSuffix(body, strings.Repeat("y", 99)+"\n") {
+		t.Fatalf("bounded stderr: %d bytes, want %d whole lines", len(body), shown)
+	}
+	if want := fmt.Sprintf("deployment prerequisites: %d more bytes of runner stderr not shown (limit %d)\n", 100100-shown, provisionStderrLimit); lines[len(lines)-2] != want {
+		t.Fatalf("limit line = %q, want %q", lines[len(lines)-2], want)
+	}
+}
+
 func TestDeploymentBoundedListAndExactGet(t *testing.T) {
 	task := "tsk_0123456789abcdef"
 	id := "rel_0123456789abcdef"

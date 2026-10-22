@@ -472,8 +472,15 @@ func serveRunner(checkout, config string) error {
 	}
 }
 
+// provisionStderrLimit bounds the runner's stderr that a successful setup
+// echoes: notes such as the go-licenses skip reason are a few lines, so 64 KiB
+// keeps every real note whole and a runaway runner from flooding the terminal.
+const provisionStderrLimit = 64 << 10
+
 // provisionPrerequisites runs the checkout's release runner, which prints the
-// provisioned files as JSON, or only a named reason on failure.
+// provisioned files as JSON, or only a named reason on failure. On success its
+// stderr notes follow the JSON on tt's stderr, unchanged up to
+// provisionStderrLimit, then one line saying how much was left out.
 func provisionPrerequisites(checkout, source string) error {
 	cmd := exec.Command("node", "scripts/release-runner.mjs", "--provision-prerequisites", "--from", source)
 	cmd.Dir = checkout
@@ -487,6 +494,18 @@ func provisionPrerequisites(checkout, source string) error {
 		}
 		return fmt.Errorf("deployment prerequisites: %w", err)
 	}
+	notes := stderr.Bytes()
+	if len(notes) <= provisionStderrLimit {
+		_, _ = os.Stderr.Write(notes)
+		return nil
+	}
+	// Cut at the last whole line inside the bound, so no note is half printed.
+	shown := notes[:provisionStderrLimit]
+	if cut := bytes.LastIndexByte(shown, '\n'); cut >= 0 {
+		shown = shown[:cut+1]
+	}
+	_, _ = os.Stderr.Write(shown)
+	fmt.Fprintf(os.Stderr, "deployment prerequisites: %d more bytes of runner stderr not shown (limit %d)\n", len(notes)-len(shown), provisionStderrLimit)
 	return nil
 }
 
