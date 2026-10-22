@@ -527,29 +527,94 @@ func replaceUsageItemShares(ctx context.Context, tx *sql.Tx, task, agent, run st
 	return nil
 }
 
-// backfillUsageItemShares gives share rows to every stored turn that has none
+// usageItemShareChecksSchema keeps the stored turns whose share rows may no
+// longer match their current revision. Its triggers add a turn when it is
+// inserted, when its key or revision changes, and when one of its share rows is
+// deleted or rekeyed, whichever binary makes the change, so a turn an older
+// binary writes or revises after a rollback is listed too. Those are the only
+// ways a turn can come to lack share rows at its revision. A payload rewrite
+// (the retention cleanup) adds nothing. The triggers test for a listed turn
+// instead of INSERT OR IGNORE: the conflict policy of the statement that fires
+// a trigger, such as the turn upsert, overrides the one in its body.
+const usageItemShareChecksSchema = `CREATE TABLE IF NOT EXISTS usage_item_share_checks(turn_rowid INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS usage_item_share_checks_turn_insert AFTER INSERT ON usage_turns
+ BEGIN INSERT INTO usage_item_share_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_item_share_checks WHERE turn_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_item_share_checks_turn_update AFTER UPDATE OF task_id,agent_id,run_id,request_id,revision ON usage_turns
+ BEGIN INSERT INTO usage_item_share_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_item_share_checks WHERE turn_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_item_share_checks_share_delete AFTER DELETE ON usage_item_shares
+ BEGIN INSERT INTO usage_item_share_checks SELECT t.rowid FROM usage_turns t WHERE t.task_id=OLD.task_id AND t.agent_id=OLD.agent_id AND t.run_id=OLD.run_id AND t.request_id=OLD.request_id
+ AND NOT EXISTS (SELECT 1 FROM usage_item_share_checks c WHERE c.turn_rowid=t.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_item_share_checks_share_update AFTER UPDATE OF task_id,agent_id,run_id,request_id,turn_revision ON usage_item_shares
+ BEGIN INSERT INTO usage_item_share_checks SELECT t.rowid FROM usage_turns t WHERE t.task_id=OLD.task_id AND t.agent_id=OLD.agent_id AND t.run_id=OLD.run_id AND t.request_id=OLD.request_id
+ AND NOT EXISTS (SELECT 1 FROM usage_item_share_checks c WHERE c.turn_rowid=t.rowid); END;`
+
+// usageItemShareChecked is nil in production. Tests set it to count the turns
+// each backfill batch examined, or to return an error that stops the backfill
+// after a committed batch.
+var usageItemShareChecked func(examined int) error
+
+// backfillUsageItemShares gives share rows to every listed turn that has none
 // at its current revision: turns stored before the table existed, and turns an
-// older binary wrote or revised after a rollback. It is idempotent and works
-// in bounded transactions, so an interrupted open resumes.
+// older binary wrote or revised after a rollback. It reads only the turns
+// usage_item_share_checks lists, so an open costs the turns changed since the
+// last one, not the whole history. When any of the list's triggers is missing
+// (a store from before the list, or a table rebuilt without them) it lists
+// every turn once. It is idempotent and works in bounded transactions that
+// clear the turns they checked, so an interrupted open resumes.
 func backfillUsageItemShares(db *sql.DB) error {
 	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	var triggers int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('usage_item_share_checks_turn_insert','usage_item_share_checks_turn_update','usage_item_share_checks_share_delete','usage_item_share_checks_share_update')`).Scan(&triggers); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if triggers < 4 {
+		if _, err = tx.ExecContext(ctx, usageItemShareChecksSchema); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_item_share_checks SELECT rowid FROM usage_turns`); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
 	type turn struct {
-		rowid                                 int64
 		task, agent, run, request, projection string
 	}
-	after := int64(0)
 	for {
-		rows, err := db.QueryContext(ctx, `SELECT t.rowid,t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turns t
- WHERE t.rowid>? AND NOT EXISTS (SELECT 1 FROM usage_item_shares s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
- ORDER BY t.rowid LIMIT 500`, after)
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
+			return err
+		}
+		var examined int
+		var last sql.NullInt64
+		if err = tx.QueryRowContext(ctx, `SELECT count(*),max(turn_rowid) FROM (SELECT turn_rowid FROM usage_item_share_checks ORDER BY turn_rowid LIMIT 500)`).Scan(&examined, &last); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if examined == 0 {
+			return tx.Rollback()
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_item_share_checks c JOIN usage_turns t ON t.rowid=c.turn_rowid
+ WHERE c.turn_rowid<=? AND NOT EXISTS (SELECT 1 FROM usage_item_shares s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
+ ORDER BY c.turn_rowid`, last.Int64)
+		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		batch := []turn{}
 		for rows.Next() {
 			var x turn
-			if err = rows.Scan(&x.rowid, &x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
+			if err = rows.Scan(&x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
 				rows.Close()
+				tx.Rollback()
 				return err
 			}
 			batch = append(batch, x)
@@ -557,17 +622,10 @@ func backfillUsageItemShares(db *sql.DB) error {
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return err
-		}
-		if len(batch) == 0 {
-			return nil
-		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		for _, x := range batch {
-			after = x.rowid
 			var p api.UsageProjection
 			if json.Unmarshal([]byte(x.projection), &p) != nil || p.Turn.ID != x.request {
 				continue // the report cannot read this row either
@@ -577,8 +635,18 @@ func backfillUsageItemShares(db *sql.DB) error {
 				return err
 			}
 		}
+		// Rewriting the shares listed these turns again; clear them after.
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_item_share_checks WHERE turn_rowid<=?`, last.Int64); err != nil {
+			tx.Rollback()
+			return err
+		}
 		if err = tx.Commit(); err != nil {
 			return err
+		}
+		if usageItemShareChecked != nil {
+			if err = usageItemShareChecked(examined); err != nil {
+				return err
+			}
 		}
 	}
 }

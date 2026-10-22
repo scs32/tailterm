@@ -2897,3 +2897,150 @@ func TestUsageLegacyTwoStageLedgerReadsApart(t *testing.T) {
 		})
 	}
 }
+
+// u1, u2: an open checks only the turns changed since the last one. A store
+// from before the check list is backfilled once, and an interrupted backfill
+// resumes where it stopped. A turn inserted without shares and one revised in
+// place, as an older binary would after a rollback, get shares at the next
+// open, which examines those two and no other turn; a payload rewrite lists
+// nothing, and an unreadable projection is skipped once.
+func TestUsageItemShareBackfillChecksChangedTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	examined, stop := []int{}, errors.New("stopped after one batch")
+	usageItemShareChecked = func(n int) error {
+		examined = append(examined, n)
+		if len(examined) == 1 && stop != nil {
+			return stop
+		}
+		return nil
+	}
+	t.Cleanup(func() { usageItemShareChecked = nil })
+	const turns = 1200
+	task, agent, run := "tsk_00000000000000bb", "agt_00000000000000bb", "run_00000000000000bb"
+	at := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	projection := func(id string, revision, input int) string {
+		return fmt.Sprintf(`{"turn":{"id":%q,"revision":%d,"runtime":"codex","session":"s","model":"m","at":%q,"tokens":{"input":%d,"cached":900,"cacheWrite":0,"output":40,"reasoning":10},"raw":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10},"sourceDigest":%q,"activation":"a","complete":true},"agentId":%q,"runId":%q,"role":"builder","roleSource":"name","phase":"build","phaseReason":"synthetic","shares":[{"taskId":%q,"denominator":1,"reason":"synthetic"}]}`,
+			id, revision, at.Format(time.RFC3339Nano), input, strings.Repeat("a", 64), agent, run, task)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := s.db.Exec(query, args...); err != nil {
+			t.Fatal(query, err)
+		}
+	}
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+			t.Fatal(query, err)
+		}
+		return n
+	}
+	// The old full scan: turns with no share row at their current revision.
+	const missing = `SELECT count(*) FROM usage_turns t WHERE NOT EXISTS (SELECT 1 FROM usage_item_shares s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)`
+	const triggers = `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'usage_item_share_checks_%'`
+	reopen := func() int {
+		t.Helper()
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		examined = examined[:0]
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, n := range examined {
+			total += n
+		}
+		return total
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.Prepare(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < turns; i++ {
+		id := fmt.Sprintf("t%04d", i)
+		p := projection(id, 1, 100)
+		if i == 900 {
+			p = "not json"
+		}
+		if _, err := insert.Exec(task, agent, run, id, ts(at), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Return the file to a store from before the check list.
+	for _, statement := range []string{`DROP TRIGGER usage_item_share_checks_turn_insert`, `DROP TRIGGER usage_item_share_checks_turn_update`,
+		`DROP TRIGGER usage_item_share_checks_share_delete`, `DROP TRIGGER usage_item_share_checks_share_update`, `DROP TABLE usage_item_share_checks`} {
+		exec(statement)
+	}
+	if n := count(missing); n != turns {
+		t.Fatalf("%d turns without shares before the backfill, want %d", n, turns)
+	}
+
+	// An interrupted backfill lists every turn, commits one batch and leaves
+	// the rest listed.
+	if err := backfillUsageItemShares(s.db); !errors.Is(err, stop) {
+		t.Fatalf("interrupted backfill: %v", err)
+	}
+	if n := count(triggers); n != 4 {
+		t.Fatalf("%d check triggers after the first backfill, want 4", n)
+	}
+	if n, listed := count(missing), count(`SELECT count(*) FROM usage_item_share_checks`); n != turns-500 || listed != turns-500 {
+		t.Fatalf("after one batch %d turns lack shares and %d are listed, want %d", n, listed, turns-500)
+	}
+	stop = nil
+
+	// The next open resumes with the listed turns only.
+	if n := reopen(); n != turns-500 {
+		t.Fatalf("the resumed open examined %d turns, want %d", n, turns-500)
+	}
+	if n := count(missing); n != 1 || count(missing+` AND t.request_id='t0900'`) != 1 {
+		t.Fatalf("%d turns lack shares after the resumed open, want only the unreadable t0900", n)
+	}
+	if n := count(`SELECT count(*) FROM usage_item_shares WHERE task_id=? AND turn_revision=1 AND tokens=1050`, task); n != turns-1 {
+		t.Fatalf("%d share rows after the resumed open, want %d", n, turns-1)
+	}
+	if n := count(`SELECT count(*) FROM usage_item_share_checks`); n != 0 {
+		t.Fatalf("%d turns still listed", n)
+	}
+
+	// With nothing changed, an open examines no turn, the unreadable one too.
+	if n := reopen(); n != 0 {
+		t.Fatalf("an open with nothing changed examined %d turns", n)
+	}
+
+	// An older binary inserts a turn and revises another in place without
+	// shares; the retention cleanup rewrites a payload.
+	exec(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`, task, agent, run, "t9999", ts(at), projection("t9999", 1, 100))
+	exec(`UPDATE usage_turns SET revision=2,projection=? WHERE request_id='t0042'`, projection("t0042", 2, 300))
+	exec(`UPDATE usage_turns SET payload='x' WHERE request_id='t0043'`)
+	if n := count(missing); n != 3 {
+		t.Fatalf("%d turns lack shares before the next open, want 3", n)
+	}
+	if n := reopen(); n != 2 {
+		t.Fatalf("the open after two changed turns examined %d, want 2", n)
+	}
+	if n := count(missing); n != 1 {
+		t.Fatalf("%d turns lack shares after the next open, want only t0900", n)
+	}
+	if got := tableDump(t, s, `SELECT request_id,turn_revision,tokens FROM usage_item_shares WHERE request_id IN ('t0042','t9999') ORDER BY request_id`); got != "request_id=t0042|turn_revision=2|tokens=1250|\nrequest_id=t9999|turn_revision=1|tokens=1050|\n" {
+		t.Fatalf("share rows of the changed turns:\n%s", got)
+	}
+	if n := reopen(); n != 0 {
+		t.Fatalf("the open after the backfill examined %d turns", n)
+	}
+}
