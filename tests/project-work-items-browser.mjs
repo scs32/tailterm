@@ -114,7 +114,9 @@ async function fixture(label) {
   return { source, target, other, missing, exited, legacy, legacyHandlerID };
 }
 
-let dropNextCreate = false, dropNextUpdate = false, delayNextHistoryMessage = false;
+let dropNextCreate = false, dropNextUpdate = false, delayNextHistoryMessage = false, refuseNextScopeEdit = false;
+// JSON bodies of the work-item updates the proxy forwarded to the hub.
+const updateBodies = [];
 const html = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><div id="app"><div id="workspace"><main><header></header></main></div><dialog id="dialog"></dialog><p id="notice"></p></div><script type="module">
 import {createHubClient} from '/client/hub-client.js';
 import {createWorkItemsView} from '/client/work-items-view.js';
@@ -166,6 +168,17 @@ const web = createServer(async (req, res) => {
       res.end("ok");
       return;
     }
+    if (req.url === "/qa/refuse-next-scope-edit" && req.method === "POST") {
+      refuseNextScopeEdit = true;
+      res.end("ok");
+      return;
+    }
+    if (req.url === "/qa/update-bodies") {
+      if (req.method === "POST") updateBodies.length = 0;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(updateBodies));
+      return;
+    }
     if (req.url === "/qa/delay-next-history-message" && req.method === "POST") {
       delayNextHistoryMessage = true;
       res.end("ok");
@@ -174,6 +187,19 @@ const web = createServer(async (req, res) => {
     if (req.url.startsWith("/v1/")) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
+      if (req.method === "POST" && /\/work-items\/wi_[a-f0-9]+\/updates$/.test(req.url)) {
+        const update = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        // The hub's scope-edit guard refusal, which needs an accepted queue
+        // entry the throwaway hub cannot build here. The store tests cover
+        // the real refusal.
+        if (refuseNextScopeEdit && ("title" in update || "description" in update) && !update.scopeChange) {
+          refuseNextScopeEdit = false;
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "conflict: accepted candidate awaits release (job rel_fixture, state verified, entry tqe_fixture); a title or description change would invalidate it. Record evidence with tt work-items note, or repeat with --scope-change to change scope deliberately" }));
+          return;
+        }
+        updateBodies.push(update);
+      }
       const upstream = await fetch(hub + req.url, {
         method: req.method,
         headers: req.headers["content-type"] ? { "content-type": req.headers["content-type"] } : undefined,
@@ -491,6 +517,41 @@ try {
       await page.locator(`[data-item-edit="${createdID}"]`).click();
       await page.screenshot({ path: `.build/project-work-item-editor-${name}.png` });
       await page.locator('#dialog-close').click();
+
+      // An accepted, unreleased bug: a priority edit sends only the priority,
+      // and the guard refusal of a title edit explains the pending release and
+      // offers the deliberate scope-change marker.
+      const accepted = await api("POST", `/v1/tasks/${source.task.id}/work-items`, { kind: "bug", title: `${name} accepted bug`, requestId: `${name}-accepted-bug` });
+      await page.evaluate(() => qa.bugs.reload());
+      await page.locator(`[data-item-edit="${accepted.id}"]`).click();
+      assert.equal(await page.locator('#work-item-scope-change').isVisible(), false, "scope-change marker shown before any refusal");
+      await fetch(origin + "/qa/update-bodies", { method: "POST" });
+      await page.locator('#work-item-priority').selectOption("high");
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      let bodies = await (await fetch(origin + "/qa/update-bodies")).json();
+      assert.deepEqual(bodies.map((body) => Object.keys(body).sort()), [["expectedRevision", "priority", "requestId"]], "a priority edit sent other fields");
+      assert.equal((await item(source.task.id, accepted.id)).priority, "high");
+      await page.locator(`[data-work-item="${accepted.id}"]`).filter({ hasText: "High" }).waitFor();
+      await fetch(origin + "/qa/refuse-next-scope-edit", { method: "POST" });
+      await page.locator(`[data-item-edit="${accepted.id}"]`).click();
+      await page.locator('#work-item-title').fill(`${name} accepted bug, new scope`);
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#work-item-error').filter({ hasText: "would invalidate that release" }).waitFor();
+      assert.match(await page.locator('#work-item-error').innerText(), /tick Deliberate scope change/);
+      assert.equal(await page.locator('#work-item-scope-change').isVisible(), true, "refusal did not offer the scope-change marker");
+      assert.equal(await page.locator('#work-item-scope-change').isChecked(), false);
+      assert.equal(await page.locator('#work-item-title').inputValue(), `${name} accepted bug, new scope`, "refused edit text was discarded");
+      await page.locator('#work-item-scope-change').check();
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      bodies = await (await fetch(origin + "/qa/update-bodies")).json();
+      assert.equal(bodies.length, 2, "the refused edit reached the hub");
+      assert.equal(bodies[1].title, `${name} accepted bug, new scope`);
+      assert.equal(bodies[1].scopeChange, true, "the marker did not send scopeChange");
+      const rescoped = await item(source.task.id, accepted.id);
+      assert.equal(rescoped.title, `${name} accepted bug, new scope`);
+      assert.equal(rescoped.scopeRevision, accepted.scopeRevision + 1, "the deliberate scope change did not advance the scope");
 
       // A feature is its own kind and survives a mode switch/reload.
       await page.locator('[data-mode="features"]').click();

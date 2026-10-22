@@ -138,9 +138,17 @@ the entry as integrated by hand, or the entry failed with no job. For a
 recorded scope amendment pass `tt work-items update --scope-change` with
 `--title` or `--body-file` (API field `scopeChange`). The change then saves as
 before and invalidates that release: the candidate must be re-verified and
-re-accepted. `--scope-change` without a title or description is refused. Status
-and priority changes are not guarded. Never append evidence to the description
-of an accepted or released item.
+re-accepted. `--scope-change` without a title or description is refused. Never
+append evidence to the description of an accepted or released item.
+
+Status and priority changes are not guarded and keep a pending release. They
+advance the item revision but not the scope revision, and the release checks
+the scope and that the item is done, so a status away from `done` holds the
+release until the item is done again. The Bugs/Features edit form sends only
+the fields that changed. When the hub refuses its title or description change,
+the form explains that the change would invalidate the pending release and
+offers a Deliberate scope change checkbox; ticking it and saving again sends
+`scopeChange`.
 
 ## Database handler
 

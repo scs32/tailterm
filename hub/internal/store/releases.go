@@ -528,7 +528,10 @@ func releaseCandidate(ctx context.Context, tx *sql.Tx, task, entry string) (api.
 		return e, p, r, err
 	}
 	plan, receipt := currentVerification(records)
-	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || !verifiedRepository(plan.Repository, *e.Acceptance) || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || e.Acceptance.ItemRevision != item.Revision || item.Status != "done" {
+	// Status and priority edits advance only the item revision, so this
+	// compares scope: the current plan is at the item's scope and was recorded
+	// no later than the acceptance, and the item is done.
+	if plan == nil || receipt == nil || plan.Commit != e.Acceptance.Commit || !verifiedRepository(plan.Repository, *e.Acceptance) || plan.BaseCommit != e.Acceptance.BaseCommit || plan.ScopeRevision != item.ScopeRevision || plan.ItemRevision > e.Acceptance.ItemRevision || item.Status != "done" {
 		return e, p, r, releaseConflict("exact accepted SHA and current verification required")
 	}
 	if err = verificationEligible(*plan, *receipt); err != nil {

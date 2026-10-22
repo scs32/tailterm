@@ -6161,6 +6161,115 @@ func TestReleaseStaysClaimableAfterEvidenceNote(t *testing.T) {
 	}
 }
 
+// A priority edit on an accepted bug, before and after its release job is
+// enqueued, advances only the item revision and leaves the job claimable.
+func TestReleaseStaysClaimableAfterPriorityEdit(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	before := releaseEntryItem(t, s, task, entry)
+	priority := func(item api.WorkItem, value string) api.WorkItem {
+		t.Helper()
+		saved, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Priority: &value}, by)
+		if err != nil || saved.Priority != value {
+			t.Fatalf("priority %s: %+v err=%v", value, saved, err)
+		}
+		return saved
+	}
+	item := priority(before, "high")
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal("enqueue after a priority edit:", err)
+	}
+	item = priority(item, "low")
+	if item.Revision != before.Revision+2 || item.ScopeRevision != before.ScopeRevision {
+		t.Fatalf("priority edits: revision %d->%d scope %d->%d", before.Revision, item.Revision, before.ScopeRevision, item.ScopeRevision)
+	}
+	claimed, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+	if err != nil || claimed.State != "claimed" {
+		t.Fatalf("claim after priority edits: state=%q err=%v", claimed.State, err)
+	}
+}
+
+// A status edit away from done holds an accepted bug's release until the bug
+// is done again; it does not invalidate the release.
+func TestReleaseStaysClaimableAfterStatusEdit(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	before := releaseEntryItem(t, s, task, entry)
+	j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(item api.WorkItem, value string) api.WorkItem {
+		t.Helper()
+		saved, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &value}, by)
+		if err != nil || saved.Status != value {
+			t.Fatalf("status %s: %+v err=%v", value, saved, err)
+		}
+		return saved
+	}
+	claim := func(key string) (api.ReleaseJob, error) {
+		return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+	}
+	item := status(before, "in_progress")
+	if _, err = claim("claim-in-progress"); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact accepted SHA and current verification required") {
+		t.Fatalf("claim while in progress: %v", err)
+	}
+	item = status(item, "done")
+	if item.Revision != before.Revision+2 || item.ScopeRevision != before.ScopeRevision {
+		t.Fatalf("status edits: revision %d->%d scope %d->%d", before.Revision, item.Revision, before.ScopeRevision, item.ScopeRevision)
+	}
+	claimed, err := claim("claim")
+	if err != nil || claimed.State != "claimed" {
+		t.Fatalf("claim after the status round trip: state=%q err=%v", claimed.State, err)
+	}
+}
+
+// A deliberate scope change still refuses the accepted candidate's claim, and
+// its enqueue, even when a new plan and receipt are later recorded at the new
+// scope.
+func TestReleaseRefusesClaimAfterScopeEdit(t *testing.T) {
+	for _, c := range []struct {
+		name            string
+		newPlan, before bool // before: the scope edit precedes the enqueue
+	}{{"scope edit", false, false}, {"new plan after the scope edit", true, false}, {"new plan before the enqueue", true, true}} {
+		t.Run(c.name, func(t *testing.T) {
+			s, task, h, d, entry := releaseFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "fixture", User: "owner"}
+			item := releaseEntryItem(t, s, task, entry)
+			enqueue := func() (api.ReleaseJob, error) {
+				return s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+			}
+			var j api.ReleaseJob
+			var err error
+			if !c.before {
+				if j, err = enqueue(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			title := "Amended scope: also cover the second pane"
+			edited, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Title: &title, ScopeChange: true}, by)
+			if err != nil || edited.ScopeRevision != item.ScopeRevision+1 {
+				t.Fatalf("deliberate scope change: %+v err=%v", edited, err)
+			}
+			if c.newPlan {
+				seedPassingVerification(t, s, edited, candidateB)
+			}
+			if c.before {
+				_, err = enqueue()
+			} else {
+				_, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "claim", Operation: "claim", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation})
+			}
+			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact accepted SHA and current verification required") {
+				t.Fatalf("release after the scope edit: %v", err)
+			}
+		})
+	}
+}
+
 // claimedRelease enqueues the entry's job and has the deployer claim it.
 func claimedRelease(t *testing.T, s *Store, task api.Task, h, d api.Agent, entry string) api.ReleaseJob {
 	t.Helper()

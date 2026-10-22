@@ -380,7 +380,7 @@ export function createWorkItemsView({
         )
         .join(
           "",
-        )}</select></label><label>Title<input id="work-item-title" required maxlength="120" value="${esc(savedValues.title ?? item?.title ?? "")}" ${readonly ? "disabled" : ""}></label><label>Description<textarea id="work-item-description" rows="5" maxlength="8192" ${readonly ? "disabled" : ""}>${esc(savedValues.description ?? item?.description ?? "")}</textarea></label><div class="work-item-fields"><label>Status<select id="work-item-status" ${!item || readonly ? "disabled" : ""}>${options(statuses, savedValues.status || item?.status || "open")}</select></label><label>Priority<select id="work-item-priority" ${readonly ? "disabled" : ""}>${options(priorities, savedValues.priority || item?.priority || "normal")}</select></label></div><p id="work-item-error" class="fine" role="status">${readonly ? "This project is closed. Its records are read-only." : saved ? "Recovered unsent changes from this encrypted workspace." : ""}</p><div class="dialog-actions">${readonly ? "" : '<button type="button" data-item-discard>Discard draft</button><button type="submit" class="primary">Save</button>'}${item && !readonly ? '<button type="button" data-item-dispatch>Send to project</button>' : ""}</div></form>`,
+        )}</select></label><label>Title<input id="work-item-title" required maxlength="120" value="${esc(savedValues.title ?? item?.title ?? "")}" ${readonly ? "disabled" : ""}></label><label>Description<textarea id="work-item-description" rows="5" maxlength="8192" ${readonly ? "disabled" : ""}>${esc(savedValues.description ?? item?.description ?? "")}</textarea></label><div class="work-item-fields"><label>Status<select id="work-item-status" ${!item || readonly ? "disabled" : ""}>${options(statuses, savedValues.status || item?.status || "open")}</select></label><label>Priority<select id="work-item-priority" ${readonly ? "disabled" : ""}>${options(priorities, savedValues.priority || item?.priority || "normal")}</select></label></div>${item && !readonly ? `<label id="work-item-scope-change-field" class="remember-password" ${savedValues.scopeChange ? "" : "hidden"}><input type="checkbox" id="work-item-scope-change" ${savedValues.scopeChange ? "checked" : ""}> Deliberate scope change: saving the title or description invalidates the pending release</label>` : ""}<p id="work-item-error" class="fine" role="status">${readonly ? "This project is closed. Its records are read-only." : saved ? "Recovered unsent changes from this encrypted workspace." : ""}</p><div class="dialog-actions">${readonly ? "" : '<button type="button" data-item-discard>Discard draft</button><button type="submit" class="primary">Save</button>'}${item && !readonly ? '<button type="button" data-item-dispatch>Send to project</button>' : ""}</div></form>`,
     );
     const form = document.querySelector("#work-item-form"),
       error = form.querySelector("#work-item-error");
@@ -393,6 +393,7 @@ export function createWorkItemsView({
       description: form.querySelector("#work-item-description").value,
       status: form.querySelector("#work-item-status").value,
       priority: form.querySelector("#work-item-priority").value,
+      scopeChange: !!form.querySelector("#work-item-scope-change")?.checked,
     });
     const persist = () =>
       drafts.save({
@@ -435,25 +436,18 @@ export function createWorkItemsView({
         error.textContent = "Choose a project and enter a title.";
         return;
       }
+      const status = form.querySelector("#work-item-status").value,
+        scopeChange = values().scopeChange;
       const payload = JSON.stringify({
         taskId,
         ...body,
-        ...(item
-          ? { status: form.querySelector("#work-item-status").value }
-          : {}),
+        ...(item ? { status, scopeChange } : {}),
       });
-      const intentPayload = intent
-        ? JSON.stringify({
-            taskId: intent.taskId,
-            title: intent.request?.title,
-            description: intent.request?.description,
-            priority: intent.request?.priority,
-            ...(item ? { status: intent.request?.status } : {}),
-          })
-        : "";
+      // The saved payload, not the request, identifies a replay: an edit sends
+      // only the fields that differ from the item the form opened with.
       if (
         intent &&
-        (intentPayload !== payload || (!item && intent.request?.kind !== kind))
+        (intent.payload !== payload || (!item && intent.request?.kind !== kind))
       ) {
         key = crypto.randomUUID();
         intent = null;
@@ -465,15 +459,31 @@ export function createWorkItemsView({
         intent.request?.requestId !== key
       ) {
         intent = null;
-        const request = item
-          ? {
-              ...body,
-              status: form.querySelector("#work-item-status").value,
-              expectedRevision: item.revision,
-              requestId: key,
-            }
-          : { ...body, kind, requestId: key };
-        intent = { taskId, itemId: item?.id || "", request };
+        let request = { ...body, kind, requestId: key };
+        if (item) {
+          const changed = {
+            ...(body.title !== item.title ? { title: body.title } : {}),
+            ...(body.description !== (item.description || "")
+              ? { description: body.description }
+              : {}),
+            ...(status !== item.status ? { status } : {}),
+            ...(body.priority !== item.priority
+              ? { priority: body.priority }
+              : {}),
+          };
+          if (!Object.keys(changed).length) {
+            error.textContent = "No changes to save.";
+            return;
+          }
+          if (scopeChange && ("title" in changed || "description" in changed))
+            changed.scopeChange = true;
+          request = {
+            ...changed,
+            expectedRevision: item.revision,
+            requestId: key,
+          };
+        }
+        intent = { taskId, itemId: item?.id || "", request, payload };
       }
       await persist().catch(() => {});
       pending = true;
@@ -497,9 +507,17 @@ export function createWorkItemsView({
           intent = null;
           await persist().catch(() => {});
         }
+        const awaitsRelease =
+          e.status === 409 &&
+          String(e.message).includes("accepted candidate awaits release");
+        if (awaitsRelease)
+          form
+            .querySelector("#work-item-scope-change-field")
+            ?.removeAttribute("hidden");
         if (form.isConnected)
-          error.textContent =
-            e.status === 409
+          error.textContent = awaitsRelease
+            ? "This item's accepted candidate awaits release. A title or description change would invalidate that release. Save status or priority alone, or tick Deliberate scope change and save again."
+            : e.status === 409
               ? `${e.message} Reopen this item to load its latest version; your text is retained here.`
               : e.message;
       } finally {
