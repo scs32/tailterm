@@ -107,6 +107,71 @@ func TestWorktreeCleanupDiagCitationSpellings(t *testing.T) {
 	}
 }
 
+// wi_e904b9cac59b1873 (order #43115): a tracked docs/ file on tasks-hub cites
+// a released item's verifier checkout under a symlinked artifacts root, in
+// one spelling per case. A file inside the checkout keeps it through either
+// the configured (unresolved) or the resolved spelling of the root; the bare
+// configured-spelling directory, like no citation at all, does not.
+func TestWorktreeCleanupDiagDocsConfiguredRootSpelling(t *testing.T) {
+	type docsCase struct {
+		name string
+		// cite returns the doc's text, or "" for no doc.
+		cite   func(r cleanupRepo, checkout string) string
+		action string
+		reason string
+	}
+	configured := func(r cleanupRepo, checkout string) string {
+		return filepath.Join(r.artifacts(), artifactItemA, filepath.Base(checkout))
+	}
+	cases := []docsCase{
+		{"configured spelling", func(r cleanupRepo, checkout string) string {
+			return "Evidence: `" + configured(r, checkout) + "/test-results/out.txt`.\n"
+		}, "kept", keepEvidence},
+		{"resolved spelling", func(r cleanupRepo, checkout string) string {
+			return "Evidence: `" + checkout + "/test-results/out.txt`.\n"
+		}, "kept", keepEvidence},
+		{"configured bare directory", func(r cleanupRepo, checkout string) string {
+			return "The matrix ran in `" + configured(r, checkout) + "`.\n"
+		}, "would-remove", ""},
+		{"uncited", func(r cleanupRepo, checkout string) string {
+			return ""
+		}, "would-remove", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newCleanupRepo(t)
+			r.ignoreBuildOutput(t)
+			real := filepath.Join(r.root, "artifacts-real")
+			if err := os.MkdirAll(real, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, r.artifacts()); err != nil {
+				t.Fatal(err)
+			}
+			checkout := canonicalPath(r.verifierCheckout(t, artifactItemA, "verifier-abc1234"))
+			if strings.HasPrefix(checkout, r.artifacts()+"/") {
+				t.Fatalf("checkout %s is not under the resolved root", checkout)
+			}
+			writeFixtureFile(t, filepath.Join(checkout, "test-results", "out.txt"), "kept output\n")
+			if text := tc.cite(r, checkout); text != "" {
+				writeFixtureFile(t, filepath.Join(r.main, "docs", "release.md"), text)
+				cleanupGit(t, r.main, "add", "docs/release.md")
+				cleanupGit(t, r.main, "commit", "-q", "-m", "cite a checkout")
+			}
+
+			got := r.artifactSweep(t, worktreeCleanupInputs{Items: artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)})
+			d := requireDecision(t, got, checkout, tc.action, tc.reason)
+			if tc.reason == keepEvidence && d.Detail != "cited by docs/release.md: test-results/out.txt" {
+				t.Fatalf("detail %q does not name the doc and the cited file", d.Detail)
+			}
+			if tc.reason == "" && d.Detail != "item "+artifactItemA+" released" {
+				t.Fatalf("detail %q, want the release basis", d.Detail)
+			}
+			requireExists(t, filepath.Join(checkout, "test-results", "out.txt"), true)
+		})
+	}
+}
+
 // diagCloseoutTick is one closeout runner tick's cost: the hub reads by
 // kind and the Git calls.
 type diagCloseoutTick struct {

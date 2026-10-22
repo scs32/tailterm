@@ -663,15 +663,23 @@ func worktreeEvidencePatterns(path, main string) []string {
 // docsCitations maps each candidate path to the first tracked docs/ file on
 // tasks-hub that cites it, using one git grep over all candidates. A strict
 // path is an artifact checkout: only a citation of something inside it counts.
-func docsCitations(ctx context.Context, common, main string, paths []string, strict map[string]bool) (map[string]string, error) {
+// A path under art's root is also looked for under its configured spelling.
+func docsCitations(ctx context.Context, common, main string, paths []string, strict map[string]bool, art *artifactPass) (map[string]string, error) {
 	out := map[string]string{}
 	if len(paths) == 0 || !gitRefExists(ctx, common, "refs/heads/tasks-hub") {
 		return out, nil
 	}
+	spellings := map[string][]string{}
 	args := []string{"grep", "-F", "-l"}
 	for _, p := range paths {
-		for _, pattern := range worktreeEvidencePatterns(p, main) {
-			args = append(args, "-e", pattern)
+		spellings[p] = []string{p}
+		if c := art.configuredSpelling(p); c != "" {
+			spellings[p] = append(spellings[p], c)
+		}
+		for _, s := range spellings[p] {
+			for _, pattern := range worktreeEvidencePatterns(s, main) {
+				args = append(args, "-e", pattern)
+			}
 		}
 	}
 	args = append(args, "refs/heads/tasks-hub", "--", "docs/")
@@ -695,15 +703,21 @@ func docsCitations(ctx context.Context, common, main string, paths []string, str
 			if out[p] != "" {
 				continue
 			}
-			if strict[p] {
-				if rel := artifactCitation(p, main, content); rel != "" {
-					out[p] = file + ": " + rel
+			for _, s := range spellings[p] {
+				if strict[p] {
+					if rel := artifactCitation(s, main, content); rel != "" {
+						out[p] = file + ": " + rel
+						break
+					}
+					continue
 				}
-				continue
-			}
-			for _, pattern := range worktreeEvidencePatterns(p, main) {
-				if strings.Contains(content, pattern) {
-					out[p] = file
+				for _, pattern := range worktreeEvidencePatterns(s, main) {
+					if strings.Contains(content, pattern) {
+						out[p] = file
+						break
+					}
+				}
+				if out[p] != "" {
 					break
 				}
 			}
@@ -898,7 +912,7 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	for _, t := range temp {
 		paths = append(paths, t.Folder)
 	}
-	cited, err := docsCitations(ctx, common, main, paths, strict)
+	cited, err := docsCitations(ctx, common, main, paths, strict, art)
 	if err != nil {
 		return nil, fmt.Errorf("evidence lookup: %w", err)
 	}
@@ -1592,6 +1606,16 @@ func (a *artifactPass) itemTexts(item string) ([]worktreeEvidence, string) {
 	})
 	a.texts[item], a.textFault[item] = texts, fault
 	return texts, fault
+}
+
+// configuredSpelling returns path under the configured root's spelling when
+// that root resolves elsewhere, as a symlink does, and path lies under the
+// resolved root; otherwise "".
+func (a *artifactPass) configuredSpelling(path string) string {
+	if a == nil || a.configured == "" || a.configured == a.root || !pathWithin(path, a.root) {
+		return ""
+	}
+	return a.configured + strings.TrimPrefix(path, a.root)
 }
 
 // cited applies the referenced-file rule to a verifier checkout: queue
@@ -3029,7 +3053,7 @@ func classifyCache(ctx context.Context, in worktreeCleanupInputs, common, main s
 	if nested != "" {
 		return nil, keepNested, "contains Git repository " + nested
 	}
-	docs, err := docsCitations(ctx, common, main, []string{cache}, nil)
+	docs, err := docsCitations(ctx, common, main, []string{cache}, nil, nil)
 	if err != nil {
 		return nil, keepFailed, "evidence lookup: " + err.Error()
 	}
@@ -3860,7 +3884,7 @@ func cleanupVerifierHomes(ctx context.Context, in worktreeCleanupInputs, common,
 	for _, h := range homes {
 		paths = append(paths, h.path)
 	}
-	cited, err := docsCitations(ctx, common, main, paths, nil)
+	cited, err := docsCitations(ctx, common, main, paths, nil, nil)
 	if err != nil {
 		// Nothing is deleted without the citation check; the reports so far
 		// are returned with the error.
