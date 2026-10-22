@@ -4068,3 +4068,175 @@ func TestTeamRunnerFailedReleaseReturnsHubTransportFaultEveryPass(t *testing.T) 
 	q.LaunchJSON = json.RawMessage(uncertain)
 	wantHubFault("hub fault after a local error")
 }
+
+// wi_5bb3a86587b571ae h1-h3: the host census goes to the first listed project
+// that is open. A closed project's owner-integrated failed entry still lists
+// on its host, and the hub refuses that project's census, so it must neither
+// take the census nor hold the open projects' parallel launches.
+func TestTeamRunnerHostCensusSkipsClosedProject(t *testing.T) {
+	for _, listing := range []string{"closed-head", "all-closed", "open"} {
+		t.Run(listing, func(t *testing.T) { teamRunnerHostCensusSkipsClosedProject(t, listing) })
+	}
+}
+
+func teamRunnerHostCensusSkipsClosedProject(t *testing.T, listing string) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	// Two projects in host listing order, which is by project ID: the
+	// first is closed with an owner-integrated failed entry, the second
+	// is open and parallel.
+	closed, open := censusProject(t, f, "first"), censusProject(t, f, "second")
+	if open.task.ID < closed.task.ID {
+		closed, open = open, closed
+	}
+	domain, err := canonicalLimiterDomain(f.c.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	free := int64(1 << 20)
+	seed := api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: &free}
+	for _, req := range []api.TeamQueueRequest{
+		{RequestID: "census-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: domain, HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20},
+		{RequestID: "census-usage", Operation: "observe_host", Host: "fixture", HostUsage: &seed},
+		{RequestID: "census-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2},
+	} {
+		if _, err := f.c.TeamQueueAction(ctx, open.task.ID, req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if listing != "open" {
+		q, err := f.c.TeamQueueAction(ctx, closed.task.ID, api.TeamQueueRequest{RequestID: "closed-add", Operation: "add", ItemID: closed.item.ID, OrderMessageSeq: closed.order, Host: "fixture", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, req := range []api.TeamQueueRequest{
+			{RequestID: "closed-claim", Operation: "claim", Host: "fixture"},
+			{RequestID: "closed-fail", Operation: "fail", Failure: "fixture"},
+			{RequestID: "closed-integrated", Operation: "owner_integrated", OwnerIntegrationCommit: strings.Repeat("b", 40), OwnerIntegrationEvidence: "owner release record"},
+		} {
+			req.EntryID, req.ExpectedRevision = q.ID, q.Revision
+			if q, err = f.c.TeamQueueAction(ctx, closed.task.ID, req); err != nil {
+				t.Fatalf("%s: %v", req.Operation, err)
+			}
+		}
+		if _, err := f.c.CloseTask(ctx, closed.task.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var entry api.TeamQueueEntry
+	if listing != "all-closed" {
+		if entry, err = f.c.TeamQueueAction(ctx, open.task.ID, api.TeamQueueRequest{RequestID: "census-add", Operation: "add", ItemID: open.item.ID, OrderMessageSeq: open.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/census"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := f.c.TeamQueueByHost(ctx, "fixture")
+	if err != nil || len(list.Entries) == 0 {
+		t.Fatalf("host listing %+v %v", list, err)
+	}
+	if head := list.Entries[0]; listing != "open" && (head.TaskID != closed.task.ID || head.OwnerIntegration == nil) {
+		t.Fatalf("listing head %s %s, want the closed project's owner-integrated entry", head.TaskID, head.State)
+	}
+
+	var targets []string
+	posts := 0
+	r := queueCorrectionRunner(t, open, 1)
+	// As in production, a census fault is reported, not returned: the
+	// report's stamp is how this test sees a hold.
+	r.roundRobin, r.closedProjects = true, &closedProjectBook{}
+	r.census = func(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, _ *api.TeamHostUsage, _ []string) error {
+		targets, posts = append(targets, task), posts+1
+		usage := api.TeamHostUsage{Host: host, LimiterDomain: policy.LimiterDomain, PolicyVersion: policy.Version, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 2, Complete: true, SourceDigest: strings.Repeat("c", 64), FreeDiskMiB: &free}
+		_, err := c.TeamQueueAction(ctx, task, api.TeamQueueRequest{RequestID: fmt.Sprintf("census-%d", posts), Operation: "observe_host", Host: host, HostUsage: &usage})
+		return err
+	}
+	held := teamHostBudgetLastLog.Swap(0)
+	defer teamHostBudgetLastLog.Store(held)
+	tick := func(name string, want ...string) {
+		t.Helper()
+		targets = nil
+		err := r.tick(ctx, f.e, f.c, "fixture")
+		if err != nil && strings.Contains(err.Error(), "census") {
+			t.Fatalf("%s: tick %v", name, err)
+		}
+		if got := strings.Join(targets, ","); got != strings.Join(want, ",") {
+			t.Fatalf("%s: census targets %q, want %q", name, got, strings.Join(want, ","))
+		}
+		if teamHostBudgetLastLog.Load() != 0 {
+			t.Fatalf("%s: the host census held parallel launches", name)
+		}
+	}
+	usage := func() string {
+		t.Helper()
+		list, err := f.c.TeamQueueByHost(ctx, "fixture")
+		if err != nil || list.HostUsage == nil {
+			t.Fatalf("host usage %+v %v", list.HostUsage, err)
+		}
+		return list.HostUsage.SourceDigest
+	}
+	state := func() string {
+		t.Helper()
+		got, err := f.c.GetTeamQueueEntry(ctx, open.task.ID, entry.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.State
+	}
+	switch listing {
+	case "closed-head":
+		// The closed project refuses once, the open one takes the census
+		// and its parallel launch proceeds; later ticks skip the closed one.
+		tick("first tick", closed.task.ID, open.task.ID)
+		if got := state(); got != "running" {
+			t.Fatalf("open project's parallel entry %s, want running", got)
+		}
+		if got := usage(); got != strings.Repeat("c", 64) {
+			t.Fatalf("host usage digest %s, want the open project's census", got)
+		}
+		tick("second tick", open.task.ID)
+	case "all-closed":
+		// No open project: no census is saved and nothing is held. The
+		// refusal is remembered, so the next tick asks no one.
+		tick("first tick", closed.task.ID)
+		tick("second tick")
+		if got := usage(); got != seed.SourceDigest {
+			t.Fatalf("host usage digest %s, want the seeded one unchanged", got)
+		}
+	case "open":
+		tick("first tick", open.task.ID)
+		if got := state(); got != "running" {
+			t.Fatalf("open project's parallel entry %s, want running", got)
+		}
+		tick("second tick", open.task.ID)
+	}
+}
+
+// censusProject adds a project with a running handler and one bounded,
+// scope-confirmed item. It returns f naming that project, its item and order.
+func censusProject(t *testing.T, f teamFixture, name string) teamFixture {
+	t.Helper()
+	ctx := context.Background()
+	task, err := f.c.CreateTask(ctx, api.CreateTaskRequest{Name: name + " census project"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := f.c.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name + "-handler", Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: name + "-handler", Runtime: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: handler.ID, RunID: handler.RunID, Kind: api.EventRunning}); err != nil {
+		t.Fatal(err)
+	}
+	item, err := f.c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: name + " delivery", RequestID: name + "-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.c.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "bounded " + name + " order", RequestID: name + "-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.ConfirmWorkOrderScope(ctx, task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: name + "-scope", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	f.task, f.item, f.order, f.handler = task, item, order.Seq, handler
+	return f
+}

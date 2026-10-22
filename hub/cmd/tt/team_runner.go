@@ -57,6 +57,9 @@ type teamRunner struct {
 	// releaseErrors reports a repeated local release error once per
 	// message; nil reports it every tick, as before.
 	releaseErrors *releaseErrorBook
+	// closedProjects remembers the projects that refused the host census
+	// as closed; nil asks them again on every live tick.
+	closedProjects *closedProjectBook
 }
 
 func (r teamRunner) clock() time.Time {
@@ -319,6 +322,56 @@ func (b *releaseErrorBook) retain(hub string, keep func(task, entry string) bool
 	retainQueueKeys(b.entries, hub, keep)
 }
 
+// closedProjectBook holds, per hub, the projects whose host census the hub
+// refused because they are closed. A project never reopens, so the census
+// skips it for as long as the host listing still names it.
+type closedProjectBook struct {
+	mu     sync.Mutex
+	closed map[string]map[string]bool
+}
+
+var productionClosedProjects = &closedProjectBook{}
+
+func (b *closedProjectBook) has(hub, task string) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed[strings.TrimRight(hub, "/")][task]
+}
+
+func (b *closedProjectBook) add(hub, task string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hub = strings.TrimRight(hub, "/")
+	if b.closed == nil {
+		b.closed = map[string]map[string]bool{}
+	}
+	if b.closed[hub] == nil {
+		b.closed[hub] = map[string]bool{}
+	}
+	b.closed[hub][task] = true
+}
+
+// retain keeps hub's projects that listed still names.
+func (b *closedProjectBook) retain(hub string, listed map[string]bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	closed := b.closed[strings.TrimRight(hub, "/")]
+	for task := range closed {
+		if !listed[task] {
+			delete(closed, task)
+		}
+	}
+}
+
 // postedStallNotices remembers the stall notices this relay process has
 // saved, so a persisting stall costs no hub write per tick. After a restart
 // the hub replays the saved notice instead of posting another.
@@ -412,6 +465,7 @@ func productionTeamRunner() teamRunner {
 		cleanupPending: productionCleanupPending,
 		changedFiles:   productionChangedFiles,
 		releaseErrors:  productionReleaseErrors,
+		closedProjects: productionClosedProjects,
 	}
 }
 
@@ -836,6 +890,14 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 		}
 		list = saved.list
 	}
+	seen := map[string]bool{}
+	projects := make([]string, 0)
+	for _, entry := range list.Entries {
+		if !seen[entry.TaskID] {
+			seen[entry.TaskID] = true
+			projects = append(projects, entry.TaskID)
+		}
+	}
 	var hostBudgetErr error
 	// The census is a hub write from the listing's usage, so an old listing
 	// takes none; nothing new launches from one either.
@@ -845,17 +907,12 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			hostBudgetErr = errors.New("host policy limiter domain differs from relay hub")
 		} else if err := activeRelayBudget.configure(list.HostPolicy, time.Now()); err != nil {
 			hostBudgetErr = err
-		} else if err := r.census(ctx, c, list.Entries[0].TaskID, host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries)); err != nil {
+		} else if err := r.hostCensus(ctx, c, projects, host, list); err != nil {
 			hostBudgetErr = fmt.Errorf("host relay binding census: %w", err)
 		}
 	}
-	seen := map[string]bool{}
-	projects := make([]string, 0)
-	for _, entry := range list.Entries {
-		if !seen[entry.TaskID] {
-			seen[entry.TaskID] = true
-			projects = append(projects, entry.TaskID)
-		}
+	if hostListed {
+		r.closedProjects.retain(c.Base, seen)
 	}
 	if r.roundRobin && len(projects) > 1 {
 		start := int((teamQueueProjectCursor.Add(1) - 1) % uint64(len(projects)))
@@ -1307,6 +1364,33 @@ func (r teamRunner) noticeStalls(ctx context.Context, c *api.Client, queue api.T
 // queueParallel mirrors the hub: 1 is the serial queue, 0 has no fixed cap
 // and N >= 2 is an owner ceiling.
 func queueParallel(limit int) bool { return limit != 1 }
+
+// hostCensus posts the host census to the first listed project that is open
+// (wi_5bb3a86587b571ae). A closed project's owner-integrated entry still
+// lists on its host until its team is closed, and the hub refuses a closed
+// project's census, so that refusal moves on to the next listed project
+// rather than holding every parallel launch on the host. With no open
+// project listed, no census is posted and nothing waits on one.
+func (r teamRunner) hostCensus(ctx context.Context, c *api.Client, projects []string, host string, list api.TeamQueueList) error {
+	for _, task := range projects {
+		if r.closedProjects.has(c.Base, task) {
+			continue
+		}
+		err := r.census(ctx, c, task, host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries))
+		if !hubRefusedClosedTask(err) {
+			return err
+		}
+		r.closedProjects.add(c.Base, task)
+	}
+	return nil
+}
+
+// hubRefusedClosedTask reports the hub's refusal of a write to a closed
+// project.
+func hubRefusedClosedTask(err error) bool {
+	var response *api.HTTPError
+	return errors.As(err, &response) && response.Status == 409 && response.Msg == "task is closed"
+}
 
 // queueCwds lists the launch folders of a host's queue entries for the disk
 // census.
