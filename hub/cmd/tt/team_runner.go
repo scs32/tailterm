@@ -37,8 +37,9 @@ type teamRunner struct {
 	// changed lists the files a candidate changed; nil uses Git.
 	changed func(ctx context.Context, repository, base, commit string) ([]string, error)
 	// worktrees removes a finished entry's worktrees once their work is
-	// integrated (docs/team-launch.md); nil leaves them in place.
-	worktrees func(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry) error
+	// integrated (docs/team-launch.md), reading the pass's project detail
+	// with readDetail; nil leaves them in place.
+	worktrees func(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry, readDetail func() (api.TaskDetail, error)) error
 	// stallGrace is how long a stall holds before its Board notice; zero
 	// uses the hub's five minutes.
 	stallGrace time.Duration
@@ -1080,14 +1081,26 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			// Finished teams' worktrees go once their release lands. A
 			// finished entry is history, which the active listing never
 			// names, so closeout reads the project's recent history page,
-			// at most once per closeoutWorktreeInterval. The cleanup is
-			// local: it logs and never fails the tick or entry.
+			// at most once per closeoutWorktreeInterval, and the project
+			// detail at most once per pass, only when an entry needs it.
+			// It is read here, after this pass's launches, so in-use
+			// protection sees their agents. The cleanup is local: it logs
+			// and never fails the tick or entry.
 			if recent, ok := closeoutHistory(ctx, c, taskID, now); ok {
+				var closeoutTask *api.TaskDetail
+				var closeoutTaskErr error
+				readCloseoutTask := func() (api.TaskDetail, error) {
+					if closeoutTask == nil && closeoutTaskErr == nil {
+						detail, err := c.GetTask(ctx, taskID)
+						closeoutTask, closeoutTaskErr = &detail, err
+					}
+					return *closeoutTask, closeoutTaskErr
+				}
 				for _, q := range recent.Entries {
 					if q.Host != host || q.State != "finished" || q.Acceptance == nil {
 						continue
 					}
-					if err := r.worktrees(ctx, c, host, list, recent, q); err != nil {
+					if err := r.worktrees(ctx, c, host, list, recent, q, readCloseoutTask); err != nil {
 						fmt.Fprintf(os.Stderr, "[tt relay] worktree cleanup %s: %v\n", q.ID, err)
 					}
 				}

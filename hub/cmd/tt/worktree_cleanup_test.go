@@ -959,7 +959,7 @@ func TestWorktreeCleanupRunnerKeepsUnreleasedWorktree(t *testing.T) {
 	}
 	var stderr strings.Builder
 	restore := captureStderr(t, &stderr)
-	err = closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished)
+	err = closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished, nil)
 	restore()
 	if err != nil {
 		t.Fatal(err)
@@ -978,13 +978,13 @@ func TestWorktreeCleanupRunnerKeepsUnreleasedWorktree(t *testing.T) {
 	}
 	// Within the interval the entry is not re-examined.
 	calls := countWorktreeGit(t)
-	if err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished); err != nil || calls.Load() != 0 {
+	if err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished, nil); err != nil || calls.Load() != 0 {
 		t.Fatalf("re-examined within the interval: calls=%d err=%v", calls.Load(), err)
 	}
 	// After the release lands, the next look removes it.
 	cleanupGit(t, r.main, "merge", "-q", "--ff-only", "bug/waiting")
 	closeoutWorktreeChecks.Delete(finished.ID)
-	if err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished); err != nil {
+	if err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished, nil); err != nil {
 		t.Fatal(err)
 	}
 	requireExists(t, w, false)
@@ -1228,12 +1228,23 @@ func TestWorktreeCleanupCloseoutKeepsWorktreeInUse(t *testing.T) {
 	var stderr strings.Builder
 	restore := captureStderr(t, &stderr)
 	for _, q := range []api.TeamQueueEntry{byRunning, byAgent} {
-		if err := closeoutWorktrees(context.Background(), c, host, active, project, q); err != nil {
+		if err := closeoutWorktrees(context.Background(), c, host, active, project, q, nil); err != nil {
 			restore()
 			t.Fatal(err)
 		}
 	}
 	restore()
+	// A direct call has no runner pass to share, so each reads the project
+	// detail itself.
+	getTask := 0
+	for _, l := range hub.queryLog() {
+		if l == "GET /v1/tasks/"+task {
+			getTask++
+		}
+	}
+	if getTask != 2 {
+		t.Fatalf("%d GetTask reads for two direct closeouts, want 2: %v", getTask, hub.queryLog())
+	}
 	requireExists(t, reused, true)
 	requireExists(t, visited, true)
 	receipts := readCleanupReceipts(t)
@@ -1340,7 +1351,7 @@ func TestWorktreeCleanupKeepsWorktreeHoldingNestedWork(t *testing.T) {
 					}
 					var stderr strings.Builder
 					restore := captureStderr(t, &stderr)
-					err = closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, api.TeamQueueList{Entries: []api.TeamQueueEntry{q}}, q)
+					err = closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, api.TeamQueueList{Entries: []api.TeamQueueEntry{q}}, q, nil)
 					restore()
 					if err != nil {
 						t.Fatal(err)
@@ -2193,7 +2204,7 @@ func TestWorktreeCleanupRunnerPrunesArtifactsAndTemp(t *testing.T) {
 	closeoutWorktreeChecks.Delete(released.ID)
 	calls := countWorktreeGit(t)
 	requests, _ := hub.snapshot()
-	if err := closeoutWorktrees(context.Background(), c, host, hub.byHost, hub.queues[task], released); err != nil {
+	if err := closeoutWorktrees(context.Background(), c, host, hub.byHost, hub.queues[task], released, nil); err != nil {
 		t.Fatal(err)
 	}
 	after, writes := hub.snapshot()
@@ -3997,7 +4008,7 @@ func TestWorktreeCleanupCloseoutSkipsQuietlyWhileASweepHoldsTheLock(t *testing.T
 		closeoutWorktreeChecks.Delete(finished.ID)
 		var stderr strings.Builder
 		restore := captureStderr(t, &stderr)
-		err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, list, finished)
+		err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, list, finished, nil)
 		restore()
 		return stderr.String(), err
 	}

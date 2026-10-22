@@ -193,13 +193,15 @@ func TestWorktreeCleanupDiagKeptEntryRecheckCost(t *testing.T) {
 	}
 	layouts := []layoutCase{{"one-level", "verifier-abc1234"}, {"nested", filepath.Join("verifier-abc1234", "checkout")}}
 	reasons := []string{keepRetention, keepEvidence, keepDirty}
-	// Measured at f2043adc. Per examined entry closeout costs one
-	// GetTeamQueueEntry (history entries are summaries), one GetTask and a
-	// fixed run of Git calls that depends on how far classification gets.
+	// Measured at f2043adc, then after F4-1. Closeout reads the project
+	// detail once per pass, however many entries it examines; per examined
+	// entry it costs one GetTeamQueueEntry (history entries are summaries)
+	// and a fixed run of Git calls that depends on how far classification
+	// gets.
 	full := map[string]diagCloseoutTick{
-		keepRetention: {getTask: 1 + n, getEntry: n, history: 1, git: 4 * n},
-		keepEvidence:  {getTask: 1 + n, getEntry: n, history: 1, git: 4 * n},
-		keepDirty:     {getTask: 1 + n, getEntry: n, history: 1, git: 5 * n},
+		keepRetention: {getTask: 1 + 1, getEntry: n, history: 1, git: 4 * n},
+		keepEvidence:  {getTask: 1 + 1, getEntry: n, history: 1, git: 4 * n},
+		keepDirty:     {getTask: 1 + 1, getEntry: n, history: 1, git: 5 * n},
 	}
 	quiet := diagCloseoutTick{getTask: 1}
 	items := []string{"wi_d1a90000000000a1", "wi_d1a90000000000a2", "wi_d1a90000000000a3"}

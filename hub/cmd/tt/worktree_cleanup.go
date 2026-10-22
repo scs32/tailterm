@@ -2251,8 +2251,9 @@ func worktreeProtection(host string, entries []api.TeamQueueEntry, agents []api.
 // worktrees, temp folders or verifier checkouts still exists, at most once
 // per closeoutWorktreeInterval, and never writes to the hub. A history
 // summary is read again in full before anything is decided, because its
-// evidence is clipped.
-func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry) error {
+// evidence is clipped. The runner passes readDetail, the project detail it
+// reads at most once per pass; nil reads it here.
+func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, project api.TeamQueueList, q api.TeamQueueEntry, readDetail func() (api.TaskDetail, error)) error {
 	direct, repo := closeoutPaths(q)
 	if repo == "" {
 		return nil
@@ -2307,7 +2308,10 @@ func closeoutWorktrees(ctx context.Context, c *api.Client, host string, active, 
 			return nil
 		}
 	}
-	detail, err := c.GetTask(ctx, q.TaskID)
+	if readDetail == nil {
+		readDetail = func() (api.TaskDetail, error) { return c.GetTask(ctx, q.TaskID) }
+	}
+	detail, err := readDetail()
 	if err != nil {
 		return err
 	}
