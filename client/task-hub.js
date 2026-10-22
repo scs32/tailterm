@@ -44,6 +44,8 @@ import {
   liveProject,
   sessionCheckNeeded,
   taskMemberIds,
+  homeAgent,
+  homePlacement,
 } from "./tasks.js";
 import {
   agentCleanupCommand,
@@ -538,6 +540,19 @@ export function createTaskHub(host) {
             tab.task?.agentId === orchestrator?.id,
         );
       groups?.model.setTaskOrchestrator?.(feed.taskId, tab?.id);
+      // Home was decided when each pane was created or adopted, from the saved
+      // membership while the role was unknown. Now the roster gives the role:
+      // an ordinary pane an older workspace saved in Home leaves it, and the
+      // owner helper stays. Only the placement changes.
+      for (const t of host.getTabs()) {
+        if (t.disposed || t.task?.taskId !== feed.taskId) continue;
+        const agent = feed.agents.find((a) => a.id === t.task.agentId);
+        if (agent)
+          t.home = homePlacement({
+            binding: t.task,
+            role: homeAgent(agent) ? "owner_helper" : "",
+          });
+      }
       groups?.sync();
     };
     const reconcileCurrent = () =>

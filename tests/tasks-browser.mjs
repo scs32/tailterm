@@ -1106,13 +1106,55 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     id: helperId,
     step: "old workspace, unknown role",
   });
+  // The roster gives its role: the pane leaves Home for its project's tab.
+  // Only the placement changes: the same terminal stays connected, nothing is
+  // closed or reattached, and no other pane's tmux window is sized. Outside
+  // Home the focused ordinary pane may take its own viewport claim, as any
+  // focused agent pane does.
+  const others = () =>
+    ssh.sizingLog.filter((e) => e.session !== "helper-rs").length;
+  const panesBefore = allPanes(await inventory()).sort();
+  const before = {
+    panes: await paneChanges(),
+    opens: ssh.sizeLog.filter((e) => e.kind === "open").length,
+    others: others(),
+  };
   await rosterBack("old workspace");
+  await waitFor(
+    async () =>
+      (await page.locator(".tab-strip > .home-tab [data-tab]").count()) === 0,
+    "old workspace: the pane leaves Home",
+  );
+  assert.deepEqual(
+    {
+      panes: await paneChanges(),
+      opens: ssh.sizeLog.filter((e) => e.kind === "open").length,
+      others: others(),
+    },
+    before,
+    "old workspace: leaving Home closes, reattaches and sizes nothing else",
+  );
   await checkNeverNamedHelper(page, {
     id: helperId,
     step: "old workspace, after the roster",
   });
+  const placed = await inventory();
+  assert.ok(
+    sessionsOf(placed, "restore-live")?.includes("helper-rs"),
+    "old workspace: the pane joins its project's tab",
+  );
+  assert.deepEqual(
+    allPanes(placed).sort(),
+    panesBefore,
+    "old workspace: the same panes, only placed differently",
+  );
+  assert.equal(
+    placed.some((t) => t.home),
+    false,
+    "old workspace: nothing is left in Home",
+  );
   console.log(
-    `Late roster passed: a restored helper is unnamed until the roster (${refused} refused reads), then Owner helper - restore-live; an ordinary pane saved in Home is never named Owner helper.`,
+    `Late roster passed: a restored helper is unnamed until the roster (${refused} refused reads), then Owner helper - restore-live; an ordinary pane saved in Home is never named Owner helper and leaves Home for its project once the roster arrives.`,
   );
 
   // Leave the hub and tabs as the later checks expect them.
