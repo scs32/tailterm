@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { releaseBaselines } from "../scripts/release-targets.mjs";
-import { buildInputs, readReleaseSummaries, readReleaseDetail } from "../scripts/release-inputs.mjs";
+import { buildInputs, readReleaseSummaries, readReleaseDetail, RELEASE_READ_ATTEMPTS } from "../scripts/release-inputs.mjs";
 
 function releaseReply(jobs,argv) {
  const flag=n=>{const i=argv.indexOf(n);return i<0?undefined:argv[i+1];};
@@ -304,5 +304,87 @@ test("changed or summary-only detail holds the input builder",async()=>{
   f.deps.tt=argv=>argv[1]==="get"?JSON.stringify({...f.job,...patch}):read(argv);
   await assert.rejects(buildInputs(f.config,f.job.id,{deps:f.deps}),/detail changed or invalid/);
   assert.ok(!f.calls.some(a=>["probe","preflight","copy"].includes(a[0])));assert.deepEqual(readdirSync(f.home),["plan-template.json"]);
+ }
+});
+
+// wi_0eb175656698d661: the hub refuses a page whose ledger changed after its
+// token was issued. The two shapes a stale refusal reaches the reader in: the
+// runner's (HostAdapter.command keeps only the refusal) and a raw tt error's.
+const STALE="hub: 409 conflict: release: stale list snapshot";
+const staleShapes={
+ refusal:()=>Object.assign(new Error("Host operation failed"),{refusal:STALE}),
+ stderr:()=>Object.assign(new Error(`Command failed: tt deployment list\ntt: ${STALE}\n`),{status:1,stderr:`tt: ${STALE}\n`}),
+};
+function churnLedger(){
+ const ledger=[{id:"rel_claimed",state:"claimed",generation:2}];
+ for(let i=0;i<450;i++)ledger.push({id:`rel_hist_${i}`,state:"released",generation:1});
+ return ledger;
+}
+// A fake read of a ledger that may change between two reads: attempt N is
+// counted from its first page (active, no cursor, no token) and answers with
+// its own token; fail(attempt, argv) returns an error to throw for a page.
+function churnRead(ledgers,fail){
+ const calls=[];let attempt=0;
+ const read=argv=>{
+  calls.push(argv);
+  if(argv.includes("active")&&!argv.includes("--after")&&!argv.includes("--snapshot"))attempt++;
+  const error=fail(attempt,argv);if(error)throw error;
+  const page=releaseReply(ledgers[Math.min(attempt,ledgers.length)-1],argv);page.page.snapshot=String(attempt).repeat(64);
+  return JSON.stringify(page);
+ };
+ return {read,calls,attempts:()=>attempt};
+}
+
+test("a stale snapshot restarts the whole read from a fresh first page and keeps one attempt only",()=>{
+ for(const [shape,stale] of Object.entries(staleShapes)){
+  const before=churnLedger(),after=[...churnLedger(),{id:"rel_new",state:"released",generation:1}];
+  // The first attempt is refused on its second settled page, after its active
+  // page and first settled page were read.
+  const f=churnRead([before,after],(n,argv)=>n===1&&argv.includes("settled")&&argv.includes("--after")?stale():null);
+  const jobs=readReleaseSummaries(f.read);
+  const clean=readReleaseSummaries(argv=>{const page=releaseReply(after,argv);page.page.snapshot="2".repeat(64);return JSON.stringify(page);});
+  assert.equal(f.attempts(),2,shape);
+  assert.deepEqual(jobs,clean,shape);
+  assert.equal(jobs.length,after.length,shape);assert.equal(new Set(jobs.map(j=>j.id)).size,after.length,shape);
+  assert.equal(jobs.releaseSnapshot,"2".repeat(64),shape);
+  assert.deepEqual(jobs.releaseHead,clean.releaseHead,shape);assert.equal(jobs[0].releaseSnapshot,"2".repeat(64),shape);
+  const restart=f.calls.findIndex((a,i)=>i>0&&a.includes("active")&&!a.includes("--snapshot"));
+  assert.ok(restart>0,shape);assert.deepEqual(f.calls[restart],["deployment","list","--view","active","--limit","200"],shape);
+  assert.ok(f.calls.slice(restart+1).every(a=>a[a.indexOf("--snapshot")+1]==="2".repeat(64)),shape);
+ }
+});
+
+test("a stale snapshot on every attempt fails after exactly the bound with the last refusal",()=>{
+ for(const [shape,stale] of Object.entries(staleShapes)){
+  for(const firstPage of [false,true]){
+   const thrown=[];
+   const f=churnRead([churnLedger()],(n,argv)=>(firstPage||argv.includes("settled"))?(thrown.push(stale()),thrown.at(-1)):null);
+   assert.throws(()=>readReleaseSummaries(f.read),e=>e===thrown.at(-1));
+   assert.equal(f.attempts(),RELEASE_READ_ATTEMPTS,`${shape} ${firstPage}`);assert.equal(thrown.length,RELEASE_READ_ATTEMPTS);
+  }
+ }
+ assert.equal(RELEASE_READ_ATTEMPTS,3);
+});
+
+test("other refusals and invalid pages fail the read on their first occurrence",()=>{
+ const errors={
+  generation:()=>Object.assign(new Error("Host operation failed"),{refusal:"hub: 409 conflict: release: generation changed"}),
+  "raw-409":()=>Object.assign(new Error("Command failed"),{status:1,stderr:"tt: hub: 409 conflict: release: retry changed\n"}),
+  "not-found":()=>Object.assign(new Error("Host operation failed"),{refusal:"hub: 404 not found"}),
+  plain:()=>new Error("boom"),
+ };
+ for(const [kind,error] of Object.entries(errors)){
+  const thrown=error(),f=churnRead([churnLedger()],(n,argv)=>argv.includes("settled")?thrown:null);
+  assert.throws(()=>readReleaseSummaries(f.read),e=>e===thrown,kind);assert.equal(f.attempts(),1,kind);
+ }
+ const pages={
+  "Invalid release page":page=>{page.version=2;},
+  "Repeating release cursor":page=>{page.page.nextAfter="same";},
+  "Release page task changed":page=>{page.jobs=page.jobs.map((j,i)=>({...j,taskId:i?"tsk_b":"tsk_a"}));},
+ };
+ for(const [message,patch] of Object.entries(pages)){
+  let attempts=0;
+  const read=argv=>{if(argv.includes("active")&&!argv.includes("--after"))attempts++;const page=releaseReply(churnLedger(),argv);if(argv.includes("settled"))patch(page);return JSON.stringify(page);};
+  assert.throws(()=>readReleaseSummaries(read),{message},message);assert.equal(attempts,1,message);
  }
 });

@@ -61,9 +61,26 @@ export function hostDeps(config, configPath) {
 }
 
 const SETTLED = new Set(["released", "rolled_back", "refused", "superseded"]);
+// A stale snapshot (the hub's 409 "stale list snapshot") means only that a job
+// changed between two pages of one read, which is routine while releases move.
+// It is known by the runner's refusal (HostAdapter.command) or a raw tt
+// error's stderr; nothing else is.
+const STALE_SNAPSHOT = /\bhub: 409 [^\n]*\brelease: stale list snapshot\s*$/;
+const staleSnapshot = error => [error?.refusal, error?.stderr].some(t => STALE_SNAPSHOT.test(typeof t === "string" ? t : Buffer.isBuffer(t) ? t.toString("utf8") : ""));
+// Whole two-view reads tried before a stale snapshot fails the read.
+export const RELEASE_READ_ATTEMPTS = 3;
 // Read both views to terminal metadata before exposing any jobs to a caller.
-// The same ledger token covers both traversals; a changed ledger holds the poll.
+// The same ledger token covers both traversals. A stale snapshot restarts the
+// whole read from a first page with no token, keeping nothing of the attempt
+// before, so the result is always one snapshot; after RELEASE_READ_ATTEMPTS
+// its error is thrown as it came. Any other failure holds the poll at once.
 export function readReleaseSummaries(read) {
+  for (let attempt = 1; ; attempt++) {
+    try { return readReleaseSummariesOnce(read); }
+    catch (error) { if (!staleSnapshot(error) || attempt >= RELEASE_READ_ATTEMPTS) throw error; }
+  }
+}
+function readReleaseSummariesOnce(read) {
   const jobs = [], ids = new Set(), rows = new Set(), cursors = new Set();
   let task;
   let snapshot = "", head;
