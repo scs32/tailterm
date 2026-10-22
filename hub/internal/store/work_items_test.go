@@ -1367,3 +1367,84 @@ func TestDeliberateScopeChangeStillBlocksRelease(t *testing.T) {
 		})
 	}
 }
+
+// The guard clears once no release of the accepted candidate can still
+// happen, and keeps refusing, with its text unchanged, while one can.
+func TestScopeEditGuardClearsWhenNoReleaseCanHappen(t *testing.T) {
+	const integrated = `{"commit":"abc","baseCommit":"def","changedFiles":[],"at":"2026-09-30T00:00:00Z"}`
+	for _, c := range []struct {
+		name  string
+		job   string // the latest job's state; empty seeds no job
+		entry string // an UPDATE of the entry row, if any
+		wants []string
+	}{
+		{name: "refused job", job: "refused"},
+		{name: "rolled back job", job: "rolled_back"},
+		{name: "superseded job", job: "superseded"},
+		{name: "owner integrated entry with no job", entry: `state='running',released_at='2026-09-30T00:00:00Z',owner_integration_json='` + integrated + `'`},
+		{name: "owner integrated entry with a live job", job: "verified", entry: `owner_integration_json='` + integrated + `'`},
+		{name: "failed entry with no job", entry: `state='failed'`},
+		{name: "verified job", job: "verified", wants: []string{"state verified"}},
+		{name: "held job", job: "held", wants: []string{"state held"}},
+		{name: "finished entry with no job yet", wants: []string{"no release job yet"}},
+		{name: "running entry with no job yet", entry: `state='running'`, wants: []string{"no release job yet"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, task, h, _, entry := releaseFixture(t)
+			ctx := context.Background()
+			by := api.Caller{Node: "fixture", User: "owner"}
+			item := releaseEntryItem(t, s, task, entry)
+			var job string
+			if c.job != "" {
+				j, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "enqueue", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry})
+				if err != nil {
+					t.Fatal(err)
+				}
+				job = j.ID
+				if _, err = s.db.Exec(`UPDATE release_jobs SET state=?,record_json=json_set(record_json,'$.state',?) WHERE task_id=? AND id=?`, c.job, c.job, task.ID, job); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.entry != "" {
+				if _, err := s.db.Exec(`UPDATE team_queue_entries SET `+c.entry+` WHERE id=?`, entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			appended, retitled := item.Description+"\nRecurrence: seen again", "Renamed after acceptance"
+			_, legacy := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &appended}, by)
+			if c.wants == nil {
+				if legacy != nil {
+					t.Fatalf("PATCH: %v", legacy)
+				}
+				if _, _, err := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision + 1, Title: &retitled, RequestID: "keyed"}, by); err != nil {
+					t.Fatalf("keyed: %v", err)
+				}
+				got, err := s.GetWorkItem(ctx, task.ID, item.ID)
+				if err != nil || got.Description != appended || got.Title != retitled || got.ScopeRevision != item.ScopeRevision+2 {
+					t.Fatalf("cleared edits did not save: %+v err=%v", got, err)
+				}
+				return
+			}
+			_, _, keyed := s.CreateWorkItemUpdate(ctx, task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Title: &retitled, RequestID: "keyed"}, by)
+			wants := append(c.wants, entry, "--scope-change", "tt work-items note")
+			if job != "" {
+				wants = append(wants, job)
+			}
+			for route, err := range map[string]error{"PATCH": legacy, "keyed": keyed} {
+				if !errors.Is(err, api.ErrConflict) {
+					t.Fatalf("%s: err=%v, want a conflict", route, err)
+				}
+				for _, want := range wants {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("%s: %q does not name %q", route, err, want)
+					}
+				}
+			}
+			// A deliberate scope change still saves through the guard.
+			saved, err := s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Description: &appended, ScopeChange: true}, by)
+			if err != nil || saved.Description != appended || saved.ScopeRevision != item.ScopeRevision+1 {
+				t.Fatalf("deliberate scope change: %+v err=%v", saved, err)
+			}
+		})
+	}
+}

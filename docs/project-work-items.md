@@ -121,16 +121,20 @@ accepted candidate stays claimable for release. Repeating the command with the
 same request ID and content replays the saved artifact.
 
 A title or description change advances the scope revision, and a release claim
-refuses a candidate accepted at an earlier scope. So while an item's accepted
-candidate awaits release (its latest accepted queue entry has no release job
-yet, or that job is neither `released` nor `superseded`) both update routes
-refuse a title or description change with 409:
+refuses a candidate accepted at an earlier scope. So while a release of an
+item's accepted candidate can still happen (its latest accepted queue entry
+has a latest release job in a non-terminal state, or has no release job yet
+while the entry is running or finished) both update routes refuse a title or
+description change with 409:
 
 ```
 accepted candidate awaits release (job rel_X, state S, entry tqe_Y); a title or description change would invalidate it. Record evidence with tt work-items note, or repeat with --scope-change to change scope deliberately
 ```
 
-With no job yet the text reads `(entry tqe_Y, no release job yet)`. For a
+With no job yet the text reads `(entry tqe_Y, no release job yet)`. The guard
+clears once no release of that candidate can still happen: the entry's latest
+job is `released`, `superseded`, `refused` or `rolled_back`, the owner recorded
+the entry as integrated by hand, or the entry failed with no job. For a
 recorded scope amendment pass `tt work-items update --scope-change` with
 `--title` or `--body-file` (API field `scopeChange`). The change then saves as
 before and invalidates that release: the candidate must be re-verified and

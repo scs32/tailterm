@@ -69,25 +69,36 @@ func workItemConflict(message string) error {
 // item's accepted candidate awaits release: the change advances the scope
 // revision, and the release claim then refuses the accepted candidate. The
 // caller skips it for a deliberate scope change.
+//
+// It clears once no release of that candidate can still happen: the latest
+// accepted entry is owner integrated, its latest job is released, superseded,
+// refused or rolled back, or the entry failed with no job.
 func refuseScopeEditBeforeRelease(ctx context.Context, q queryRower, item api.WorkItem) error {
-	var entry string
-	err := q.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND acceptance_json<>'' ORDER BY position DESC LIMIT 1`, item.TaskID, item.ID).Scan(&entry)
+	var entry, entryState, ownerIntegration string
+	err := q.QueryRowContext(ctx, `SELECT id,state,owner_integration_json FROM team_queue_entries WHERE task_id=? AND item_id=? AND acceptance_json<>'' ORDER BY position DESC LIMIT 1`, item.TaskID, item.ID).Scan(&entry, &entryState, &ownerIntegration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	if ownerIntegration != "" {
+		return nil
+	}
 	const advice = "a title or description change would invalidate it. Record evidence with tt work-items note, or repeat with --scope-change to change scope deliberately"
 	var job, state string
 	err = q.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, item.TaskID, entry).Scan(&job, &state)
 	if errors.Is(err, sql.ErrNoRows) {
+		if entryState == "failed" {
+			return nil
+		}
 		return workItemConflict(fmt.Sprintf("accepted candidate awaits release (entry %s, no release job yet); %s", entry, advice))
 	}
 	if err != nil {
 		return err
 	}
-	if state == "released" || state == "superseded" {
+	switch state {
+	case "released", "superseded", "refused", "rolled_back":
 		return nil
 	}
 	return workItemConflict(fmt.Sprintf("accepted candidate awaits release (job %s, state %s, entry %s); %s", job, state, entry, advice))
