@@ -4136,7 +4136,8 @@ func TestReviewFoldCandidatesCap(t *testing.T) {
 
 // c1, c3 (wi_b16be34236f99e5c): an eligible item whose description names
 // the reviewed item's ID and only a file outside the order is listed with
-// that file, among the owned-path candidates newest first, and a fold of a
+// that file, among the owned-path candidates newest first, also when an
+// artifact path comes first (n1, wi_be87629a5af07575), and a fold of a
 // finding on that file into it passes the unchanged fold rule. An item that
 // names neither, the ID but no file, a longer ID, or the ID while ordered is
 // not listed.
@@ -4145,6 +4146,7 @@ func TestReviewFoldCandidatesNamesReviewedItem(t *testing.T) {
 	f := newConvergenceFixture(t)
 	older := fileFoldItem(t, f, "older", "Owned path, older", "Owned paths: "+foldFile+".")
 	named := fileFoldItem(t, f, "named", "Names the reviewed item", "Raised during "+f.item.ID+": see https://example.com/docs/a.md and /Users/x/notes.md, then "+outside+".")
+	artifact := fileFoldItem(t, f, "artifact", "Names an artifact first", "Raised during "+f.item.ID+". Artifact: tailterm-artifacts/backlog-steward/fold-use-2026-10-21.md, then "+outside+".")
 	fileFoldItem(t, f, "neither", "Names neither", "The gap is in "+outside+".")
 	fileFoldItem(t, f, "no-file", "Names the ID but no file", "Raised during "+f.item.ID+", no file yet.")
 	fileFoldItem(t, f, "longer", "Names a longer ID", "Raised during "+f.item.ID+"0 in "+outside+".")
@@ -4153,7 +4155,7 @@ func TestReviewFoldCandidatesNamesReviewedItem(t *testing.T) {
 	newer := fileFoldItem(t, f, "newer", "Owned path, newer", "- "+foldFile+" and "+f.item.ID)
 	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
 	r := f.review(t, candidateA)
-	want := []string{foldCandidateLine(newer, foldFile), foldCandidateLine(named, outside), foldCandidateLine(older, foldFile)}
+	want := []string{foldCandidateLine(newer, foldFile), foldCandidateLine(artifact, outside), foldCandidateLine(named, outside), foldCandidateLine(older, foldFile)}
 	if got := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)); !reflect.DeepEqual(got, want) {
 		t.Fatalf("candidates\n got %q\nwant %q", got, want)
 	}
@@ -4168,7 +4170,8 @@ func TestReviewFoldCandidatesNamesReviewedItem(t *testing.T) {
 
 // c1: the reviewed ID counts only as a whole token, and the listed file is
 // the first repository-relative path the description names that a fold
-// accepts.
+// accepts. n3 (wi_be87629a5af07575): an artifact path, a module path,
+// "$HOME/..." and a version string are not repository files.
 func TestReviewFoldCandidateNamedFile(t *testing.T) {
 	const id = "wi_0123456789abcdef"
 	for text, want := range map[string]bool{
@@ -4192,6 +4195,11 @@ func TestReviewFoldCandidateNamedFile(t *testing.T) {
 		"a/../b.go, hub/.gitignore, hub/x. and docs/x.md": "docs/x.md",
 		"no file here":        "",
 		"hub/internal/store/": "",
+		"Artifact: tailterm-artifacts/backlog-steward/fold-use-2026-10-21.md then hub/a.go": "hub/a.go",
+		"github.com/scs32/tailterm/hub/x.go":                                                "",
+		"$HOME/x.md and hub/e.go":                                                           "hub/e.go",
+		"v1.2/3.4 then hub/c.go":                                                            "hub/c.go",
+		"Artifact: tailterm-artifacts/backlog-steward/fold-use-2026-10-21.md.":              "",
 	} {
 		if got := firstNamedFile(text); got != want {
 			t.Errorf("firstNamedFile(%q) = %q, want %q", text, got, want)

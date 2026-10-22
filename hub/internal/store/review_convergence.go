@@ -1685,8 +1685,9 @@ func reviewOwnedPaths(ctx context.Context, q queryRower, task string, item api.W
 // foldCandidates lists, newest first and at most foldCandidateLimit, the open
 // items other than reviewed that can take a fold (foldIneligible) and whose
 // description names one of owned, each with the first such path, or else
-// names reviewed's ID, each with the first file it names (an item that names
-// no file is left out). It is the triage and fold rule, not a copy of it.
+// names reviewed's ID, each with the first repository file it names (an item
+// that names none is left out). It is the triage and fold rule, not a copy
+// of it.
 func foldCandidates(ctx context.Context, q queryRower, task, reviewed string, owned []string) ([]foldCandidate, error) {
 	rows, err := q.QueryContext(ctx, `SELECT id,title,description FROM work_items WHERE task_id=? AND status='open' AND id<>? ORDER BY seq DESC`, task, reviewed)
 	if err != nil {
@@ -1756,11 +1757,21 @@ func namesItem(text, id string) bool {
 	}
 }
 
-// firstNamedFile returns the first file text names: a whole run of path
-// bytes, less a sentence full stop, that holds a "/", whose last segment has
-// an extension, that is a repository-relative path a finding may name, and
-// that namesFile accepts. Absolute paths and URLs ("//" after the scheme) do
-// not count. It returns "" when text names no file.
+// repositoryTopDirs are the tracked top-level directories of the repository
+// at tasks-hub. The hub has no checkout to read them from, so a new
+// top-level directory must be added here.
+var repositoryTopDirs = map[string]bool{
+	".github": true, "client": true, "deploy": true, "docs": true, "hub": true, "scripts": true,
+	"server": true, "shared": true, "tests": true, "tools": true, "verification": true, "wasm": true,
+}
+
+// firstNamedFile returns the first repository file text names: a whole run
+// of path bytes, less a sentence full stop, that holds a "/", whose first
+// segment is one of repositoryTopDirs, whose last segment has an extension,
+// that is a repository-relative path a finding may name, and that namesFile
+// accepts. Absolute paths, URLs ("//" after the scheme), artifact and module
+// paths, "$HOME/..." and version strings do not count. It returns "" when
+// text names no repository file.
 func firstNamedFile(text string) string {
 	for i := 0; i < len(text); {
 		if !pathByte(text[i]) {
@@ -1774,7 +1785,8 @@ func firstNamedFile(text string) string {
 		p := strings.TrimSuffix(text[i:j], ".")
 		i = j
 		base := p[strings.LastIndex(p, "/")+1:]
-		if !strings.Contains(p, "/") || strings.LastIndex(base, ".") <= 0 || strings.HasSuffix(base, ".") {
+		top, _, found := strings.Cut(p, "/")
+		if !found || !repositoryTopDirs[top] || strings.LastIndex(base, ".") <= 0 || strings.HasSuffix(base, ".") {
 			continue
 		}
 		if _, err := canonicalQueueOwnership([]string{p}); err != nil || !namesFile(text, p) {
