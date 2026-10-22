@@ -1575,11 +1575,11 @@ const foldCandidateLimit = 10
 
 const (
 	foldCandidatesSubject = "Fold candidates for your review"
-	foldCandidatesHeader  = "Open, held, unordered items that name a file this item owns. To fold a finding into one, set the finding's into to its ID when the file and the cause match; otherwise file the finding new."
+	foldCandidatesHeader  = "Open, held, unordered items that name a file this item owns or this item's ID. To fold a finding into one, set the finding's into to its ID when the file and the cause match; otherwise file the finding new."
 )
 
 // foldCandidate is an item a reviewer may fold a finding into, with the
-// owned path its description names.
+// file its description names.
 type foldCandidate struct{ ID, Title, Path string }
 
 // foldCandidatePost posts one fold-candidates notice. Tests replace it to
@@ -1684,8 +1684,9 @@ func reviewOwnedPaths(ctx context.Context, q queryRower, task string, item api.W
 
 // foldCandidates lists, newest first and at most foldCandidateLimit, the open
 // items other than reviewed that can take a fold (foldIneligible) and whose
-// description names one of owned, each with the first such path. It is the
-// triage and fold rule, not a copy of it.
+// description names one of owned, each with the first such path, or else
+// names reviewed's ID, each with the first file it names (an item that names
+// no file is left out). It is the triage and fold rule, not a copy of it.
 func foldCandidates(ctx context.Context, q queryRower, task, reviewed string, owned []string) ([]foldCandidate, error) {
 	rows, err := q.QueryContext(ctx, `SELECT id,title,description FROM work_items WHERE task_id=? AND status='open' AND id<>? ORDER BY seq DESC`, task, reviewed)
 	if err != nil {
@@ -1715,17 +1716,73 @@ func foldCandidates(ctx context.Context, q queryRower, task, reviewed string, ow
 		if ineligible[o.id] != "" {
 			continue
 		}
+		path := ""
 		for _, p := range owned {
 			if namesFile(o.description, p) {
-				out = append(out, foldCandidate{ID: o.id, Title: o.title, Path: p})
+				path = p
 				break
 			}
+		}
+		if path == "" && namesItem(o.description, reviewed) {
+			path = firstNamedFile(o.description)
+		}
+		if path != "" {
+			out = append(out, foldCandidate{ID: o.id, Title: o.title, Path: path})
 		}
 		if len(out) == foldCandidateLimit {
 			break
 		}
 	}
 	return out, nil
+}
+
+// namesItem reports whether text names the work item id as a whole token:
+// the bytes on either side are not letters, digits or underscores, so a
+// longer ID that contains id does not count.
+func namesItem(text, id string) bool {
+	word := func(b byte) bool {
+		return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
+	}
+	for from := 0; ; {
+		i := strings.Index(text[from:], id)
+		if i < 0 {
+			return false
+		}
+		start, end := from+i, from+i+len(id)
+		if (start == 0 || !word(text[start-1])) && (end == len(text) || !word(text[end])) {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+// firstNamedFile returns the first file text names: a whole run of path
+// bytes, less a sentence full stop, that holds a "/", whose last segment has
+// an extension, that is a repository-relative path a finding may name, and
+// that namesFile accepts. Absolute paths and URLs ("//" after the scheme) do
+// not count. It returns "" when text names no file.
+func firstNamedFile(text string) string {
+	for i := 0; i < len(text); {
+		if !pathByte(text[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(text) && pathByte(text[j]) {
+			j++
+		}
+		p := strings.TrimSuffix(text[i:j], ".")
+		i = j
+		base := p[strings.LastIndex(p, "/")+1:]
+		if !strings.Contains(p, "/") || strings.LastIndex(base, ".") <= 0 || strings.HasSuffix(base, ".") {
+			continue
+		}
+		if _, err := canonicalQueueOwnership([]string{p}); err != nil || !namesFile(text, p) {
+			continue
+		}
+		return p
+	}
+	return ""
 }
 
 // packFoldCandidates packs one full line per candidate, in order, into as

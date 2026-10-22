@@ -178,10 +178,16 @@ about to start; it is only evidence there.
 
 At REVIEW the hub sends the reviewer the fold candidates in a NOTICE linked to
 the REVIEW (`refs.review`): up to 10 open items, newest first, that pass the
-target checks above and name one of the owned paths of the order the review
-stage is confirmed under (that order's queue entry at the current item
-revision, else its scope confirmation). Each line gives the full item ID, the
-owned path it names and its title. Lines that do not fit one notice continue in
+target checks above and either name one of the owned paths of the order the
+review stage is confirmed under (that order's queue entry at the current item
+revision, else its scope confirmation) or name the reviewed item's full ID
+(added by `wi_b16be34236f99e5c`). Items a team files about the item it is
+building often name a file outside its order, so the second source finds
+them. Each line gives the full item ID, a file it names and its title: the first owned
+path it names, else the first repository-relative file it names (absolute
+paths and URLs do not count). An item that names the ID but no file is not
+listed. Listing does not loosen the fold rule above: the target must still
+name the finding's file. Lines that do not fit one notice continue in
 another; a line too large for any notice is left out and recorded in a
 `fold_candidates_skipped` event. No notice is sent when none qualify, and the
 notice never refuses or rolls back a REVIEW.

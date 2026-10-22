@@ -4134,6 +4134,71 @@ func TestReviewFoldCandidatesCap(t *testing.T) {
 	}
 }
 
+// c1, c3 (wi_b16be34236f99e5c): an eligible item whose description names
+// the reviewed item's ID and only a file outside the order is listed with
+// that file, among the owned-path candidates newest first, and a fold of a
+// finding on that file into it passes the unchanged fold rule. An item that
+// names neither, the ID but no file, a longer ID, or the ID while ordered is
+// not listed.
+func TestReviewFoldCandidatesNamesReviewedItem(t *testing.T) {
+	const outside = "docs/objective-verification.md"
+	f := newConvergenceFixture(t)
+	older := fileFoldItem(t, f, "older", "Owned path, older", "Owned paths: "+foldFile+".")
+	named := fileFoldItem(t, f, "named", "Names the reviewed item", "Raised during "+f.item.ID+": see https://example.com/docs/a.md and /Users/x/notes.md, then "+outside+".")
+	fileFoldItem(t, f, "neither", "Names neither", "The gap is in "+outside+".")
+	fileFoldItem(t, f, "no-file", "Names the ID but no file", "Raised during "+f.item.ID+", no file yet.")
+	fileFoldItem(t, f, "longer", "Names a longer ID", "Raised during "+f.item.ID+"0 in "+outside+".")
+	ordered := fileFoldItem(t, f, "ordered", "Names the ID, ordered", "Raised during "+f.item.ID+" in "+outside+".")
+	contextLinkedMessage(t, f.s, f.task, ordered, "fold order", "fold-order-ordered", nil)
+	newer := fileFoldItem(t, f, "newer", "Owned path, newer", "- "+foldFile+" and "+f.item.ID)
+	f.confirmOwned(t, f.stageHandler(t), f.ownerOrder(t, "fold-order"), "fold-scope", []string{foldFile})
+	r := f.review(t, candidateA)
+	want := []string{foldCandidateLine(newer, foldFile), foldCandidateLine(named, outside), foldCandidateLine(older, foldFile)}
+	if got := foldCandidateLines(t, f, r, foldCandidateNotices(t, f, r.Seq)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates\n got %q\nwant %q", got, want)
+	}
+	finding := api.ReviewFinding{ID: "f1", Title: "Fold fixture finding", File: outside, Line: 3, Into: named.ID}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{finding}}), "", r.Seq, f.reviewer); err != nil {
+		t.Fatal("fold into the listed item:", err)
+	}
+	if notes := foldNotes(t, f.s, named.ID); len(notes) != 1 || notes[0].namespace != "review-fold" {
+		t.Fatalf("notes %+v", notes)
+	}
+}
+
+// c1: the reviewed ID counts only as a whole token, and the listed file is
+// the first repository-relative path the description names that a fold
+// accepts.
+func TestReviewFoldCandidateNamedFile(t *testing.T) {
+	const id = "wi_0123456789abcdef"
+	for text, want := range map[string]bool{
+		id:                           true,
+		"(" + id + ").":              true,
+		"tsk_0123456789abcdef/" + id: true,
+		id + "0":                     false,
+		"x" + id:                     false,
+		"wi_0123456789abcde":         false,
+	} {
+		if got := namesItem(text, id); got != want {
+			t.Errorf("namesItem(%q) = %v, want %v", text, got, want)
+		}
+	}
+	for text, want := range map[string]string{
+		"owns " + foldFile + ".":                          foldFile,
+		"`" + foldFile + "`:12, then docs/x.md":           foldFile,
+		"see https://example.com/a/b.md then docs/x.md":   "docs/x.md",
+		"/Users/x/notes.md and docs/x.md":                 "docs/x.md",
+		"hub/internal/store and Makefile then docs/x.md":  "docs/x.md",
+		"a/../b.go, hub/.gitignore, hub/x. and docs/x.md": "docs/x.md",
+		"no file here":        "",
+		"hub/internal/store/": "",
+	} {
+		if got := firstNamedFile(text); got != want {
+			t.Errorf("firstNamedFile(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
 // c1, c5: no owned paths, or owned paths no eligible item names, send no
 // notice and record nothing.
 func TestReviewFoldCandidatesNone(t *testing.T) {
