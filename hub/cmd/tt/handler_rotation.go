@@ -1074,6 +1074,12 @@ func cmdHandlerRotation(e env, args []string) error {
 		for _, p := range h.Reissued {
 			fmt.Printf("  #%d -> #%d  %s (was %s)\n", p.OldMessageSeq, p.NewMessageSeq, p.Subject, p.OldState)
 		}
+		if len(h.Skipped) > 0 {
+			fmt.Printf("Not moved, the sender re-sent them after the close: %d\n", len(h.Skipped))
+			for _, v := range h.Skipped {
+				fmt.Printf("  #%d not moved, re-sent as #%d (%s)  %s\n", v.OldMessageSeq, v.NewMessageSeq, v.Reason, v.Subject)
+			}
+		}
 		fmt.Printf("Pending scope confirmations: %d\n", len(h.PendingScopeConfirmations))
 		for _, v := range h.PendingScopeConfirmations {
 			fmt.Printf("  %s item %s r%d order #%d\n", v.EntryID, v.ItemID, v.ItemRevision, v.OrderSeq)

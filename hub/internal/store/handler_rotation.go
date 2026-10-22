@@ -675,7 +675,9 @@ const exitedRecipientGoneReason = "recipient agent is " + api.AgentExited
 // exitedHandlerClosedObligations lists the obligations of an exited handler
 // that the broker closed recipient_gone, for that reason, at or after the
 // wrapper's exit report. Nothing closed earlier or for any other reason is
-// listed. Reissuing one marks it superseded, so it is never listed twice.
+// listed. Reissuing one marks it superseded, and one its sender already
+// re-sent stays closed (resentAfterClose); the same commit closes the old
+// handler, so none is listed twice.
 func exitedHandlerClosedObligations(ctx context.Context, tx *sql.Tx, task string, old api.Agent, exit api.HandlerRotationExit) ([]api.Obligation, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT `+obligationCols+` FROM obligations WHERE task_id=? AND agent_id=? AND state=? AND outcome=? AND reason=? ORDER BY message_seq,id`,
 		task, old.ID, api.ObligationClosed, api.OutcomeRecipientGone, exitedRecipientGoneReason)
@@ -695,6 +697,87 @@ func exitedHandlerClosedObligations(ctx context.Context, tx *sql.Tx, task string
 		}
 	}
 	return out, rows.Err()
+}
+
+// resentAfterClose finds the sender's re-send of a closed obligation: a later
+// message from the author of its original message, to the successor by name
+// or to the database handler role, created at or after the close. It returns
+// the first match and why it matched, or a zero message.
+func resentAfterClose(ctx context.Context, tx *sql.Tx, task string, o api.Obligation, successor api.Agent) (api.Message, string, error) {
+	if o.ClosedAt == nil {
+		return api.Message{}, "", nil
+	}
+	authored, err := originalMessage(ctx, tx, task, o.MessageSeq)
+	if err != nil {
+		return api.Message{}, "", err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT m.seq FROM messages m WHERE m.task_id=? AND m.seq>? AND m.from_agent=? AND m.from_node=? AND m.from_user=?
+ AND (m.to_agent=? OR EXISTS (SELECT 1 FROM obligations ob WHERE ob.message_seq=m.seq AND ob.via_role=?)) ORDER BY m.seq`,
+		task, o.MessageSeq, authored.From.AgentID, authored.From.Node, authored.From.User, successor.ID, api.RoleDatabaseHandler)
+	if err != nil {
+		return api.Message{}, "", err
+	}
+	var seqs []int64
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			rows.Close()
+			return api.Message{}, "", err
+		}
+		seqs = append(seqs, seq)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return api.Message{}, "", err
+	}
+	for _, seq := range seqs {
+		c, err := loadMessage(tx, ctx, task, seq)
+		if err != nil {
+			return api.Message{}, "", err
+		}
+		// Timestamps are not stored in a sortable form, so the bound is applied here.
+		if c.CreatedAt.Before(*o.ClosedAt) {
+			continue
+		}
+		if reason := resentReason(authored, c); reason != "" {
+			return c, reason, nil
+		}
+	}
+	return api.Message{}, "", nil
+}
+
+// resentReason says why a later message c from the same sender re-sends
+// original: the same kind, and either the same request id or the same subject
+// and linked work items (two unlinked messages link the same items). It is ""
+// when c is something else.
+func resentReason(original, c api.Message) string {
+	if original.Envelope == nil || c.Envelope == nil || original.Envelope.Kind != c.Envelope.Kind {
+		return ""
+	}
+	if original.PostReceipt != nil && c.PostReceipt != nil && original.PostReceipt.RequestID != "" && original.PostReceipt.RequestID == c.PostReceipt.RequestID {
+		return api.HandlerRotationSkipRequestID
+	}
+	subject := strings.TrimSpace(original.Envelope.Subject)
+	if subject == "" || subject != strings.TrimSpace(c.Envelope.Subject) {
+		return ""
+	}
+	items := func(m api.Message) map[string]bool {
+		set := map[string]bool{}
+		for _, w := range m.WorkItems {
+			set[w.ItemTaskID+"/"+w.ItemID] = true
+		}
+		return set
+	}
+	a, b := items(original), items(c)
+	if len(a) != len(b) {
+		return ""
+	}
+	for k := range a {
+		if !b[k] {
+			return ""
+		}
+	}
+	return api.HandlerRotationSkipSubjectItem
 }
 
 // deadPrimaryOffHint is how the feature is turned off; the docs, the queue
@@ -1255,6 +1338,18 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 		}
 	}
 	for _, o := range open {
+		if o.State == api.ObligationClosed {
+			// Closed by the broker after the exit: the sender may already
+			// have re-sent it, and the successor would then hold it twice.
+			resent, reason, err := resentAfterClose(ctx, tx, t.ID, o, successor)
+			if err != nil {
+				return zero, err
+			}
+			if reason != "" {
+				handoff.Skipped = append(handoff.Skipped, api.HandlerRotationSkip{OldObligationID: o.ID, OldMessageSeq: o.MessageSeq, NewMessageSeq: resent.Seq, Reason: reason, Subject: o.Subject})
+				continue
+			}
+		}
 		var viaRole string
 		if err = tx.QueryRowContext(ctx, `SELECT via_role FROM obligations WHERE id=?`, o.ID).Scan(&viaRole); err != nil {
 			return zero, err
@@ -1335,6 +1430,9 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	payload := map[string]any{"handlerRotationId": r.ID, "state": r.State,
 		"oldAgentId": old.ID, "oldRunId": old.RunID, "successorAgentId": successor.ID, "successorRunId": successor.RunID, "handlerRevision": t.HandlerRevision,
 		"reissued": len(handoff.Reissued), "noticeSeq": noticeSeq, "oldRuntime": old.Runtime, "successorRuntime": successor.Runtime}
+	if len(handoff.Skipped) > 0 {
+		payload["skipped"] = len(handoff.Skipped)
+	}
 	if dead {
 		payload["reason"], payload["leasesMoved"], payload["ownerNoticeSeq"], payload["commitDeathEvidence"] = r.Reason, len(handoff.LiveLeases), ownerNoticeSeq, req.DeathEvidence
 	}

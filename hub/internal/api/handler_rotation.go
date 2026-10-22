@@ -238,6 +238,9 @@ type HandlerRotationHandoff struct {
 	// InFlight is set by a dead_primary rotation: what the dead run was doing,
 	// reported because nothing can be recovered from a dead process.
 	InFlight *HandlerRotationInFlight `json:"inFlight,omitempty"`
+	// Skipped lists the obligations the broker closed after an exit that were
+	// not moved, because their sender re-sent them after the close.
+	Skipped []HandlerRotationSkip `json:"skipped,omitempty"`
 }
 
 // HandlerRotationInFlight reports a dead run's last state and its recent
@@ -268,6 +271,24 @@ type HandlerRotationReissue struct {
 	NewObligationID string `json:"newObligationId"`
 	NewMessageSeq   int64  `json:"newMessageSeq"`
 	ViaRole         string `json:"viaRole,omitempty"`
+	Subject         string `json:"subject"`
+}
+
+// Why a closed obligation was not reissued: the sender's later message to
+// the successor or the role carried the same request id, or the same subject
+// and linked work items.
+const (
+	HandlerRotationSkipRequestID   = "request_id"
+	HandlerRotationSkipSubjectItem = "subject_and_work_item"
+)
+
+// HandlerRotationSkip is a closed obligation left closed; NewMessageSeq is the
+// sender's re-send that already reached the successor or the role.
+type HandlerRotationSkip struct {
+	OldObligationID string `json:"oldObligationId"`
+	OldMessageSeq   int64  `json:"oldMessageSeq"`
+	NewMessageSeq   int64  `json:"newMessageSeq"`
+	Reason          string `json:"reason"`
 	Subject         string `json:"subject"`
 }
 

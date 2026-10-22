@@ -2648,3 +2648,230 @@ func TestHandlerRotationDueListUnreadableDeadAndExitedPrimary(t *testing.T) {
 		check("limit policy off")
 	}
 }
+
+// Reissue dedupe (wi_d9e5d645bf6a466d, order #43382): an obligation the
+// broker closed after the exit is not moved when its sender already re-sent
+// it to the successor or the role after the close; the skip is on the
+// handoff. An obligation still open at commit moves as before.
+
+// exitedRotation exits the fixture handler, lets the broker close each listed
+// request, then prepares and commits the rotation. beforeClose runs after the
+// exit, afterClose before prepare and afterSucceed once the successor is
+// registered; each may be nil.
+func (f *deadPrimaryFixture) exitedRotation(t *testing.T, closes []int64, beforeClose, afterClose func(), afterSucceed func(successor api.Agent)) (api.HandlerRotation, api.Agent) {
+	t.Helper()
+	f.advance(time.Minute)
+	exit := f.exit(t, 3)
+	if beforeClose != nil {
+		beforeClose()
+	}
+	f.advance(30 * time.Second)
+	for _, seq := range closes {
+		f.brokerCloses(t, seq)
+	}
+	f.advance(time.Second)
+	if afterClose != nil {
+		afterClose()
+	}
+	f.advance(11 * time.Minute)
+	r, err := f.prepareExited(t, "resend-prepare", f.idleEvidence(exit))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	successor := f.succeed(t, r)
+	if afterSucceed != nil {
+		afterSucceed(successor)
+	}
+	f.advance(30 * time.Second)
+	if r, err = f.commitDead(r, "rotation-commit-"+r.ID, f.idleEvidence(exit)); err != nil || r.Handoff == nil {
+		t.Fatalf("commit: %+v %v", r, err)
+	}
+	return r, successor
+}
+
+// sendRole sends an unlinked request to role:database_handler, which only a
+// running handler other than the exited one can hold.
+func (f *deadPrimaryFixture) sendRole(t *testing.T, subject string) api.Message {
+	t.Helper()
+	if countRows(t, f.s, `SELECT count(*) FROM agents WHERE task_id=? AND name='db-handler-other'`, f.task.ID) == 0 {
+		f.agent(t, "db-handler-other", api.AgentRoleDatabaseHandler)
+	}
+	m := f.send(t, f.worker, api.EnvelopeKindRequest, "role:database_handler", subject, false)
+	if n := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE message_seq=? AND via_role=?`, m.Seq, api.RoleDatabaseHandler); n != 1 {
+		t.Fatalf("role request #%d has %d role obligation(s)", m.Seq, n)
+	}
+	return m
+}
+
+func reissuedFrom(r api.HandlerRotation, seq int64) []api.HandlerRotationReissue {
+	var out []api.HandlerRotationReissue
+	for _, p := range r.Handoff.Reissued {
+		if p.OldMessageSeq == seq {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// a1, a3: re-sent by name or by role after the close is skipped and recorded;
+// not re-sent, re-sent before the close, or re-sent as something else (another
+// subject, item or sender) is reissued as before.
+func TestHandlerRotationExitedPrimarySkipsResentRequest(t *testing.T) {
+	const first = "First fixture request held by the handler"
+	const linkedSubject = "Linked fixture request held by the handler"
+	const beforeClose, afterClose, afterSucceed = "before the close", "after the close", "after the successor registers"
+	for _, c := range []struct {
+		name string
+		// linked closes an item-linked request sent to the handler before the
+		// exit, in place of the first fixture request.
+		linked bool
+		at     string
+		send   func(t *testing.T, f *deadPrimaryFixture, successor api.Agent) api.Message
+		reason string
+	}{
+		{name: "re-sent to the successor", at: afterSucceed, reason: api.HandlerRotationSkipSubjectItem,
+			send: func(t *testing.T, f *deadPrimaryFixture, s api.Agent) api.Message {
+				return f.send(t, f.worker, api.EnvelopeKindRequest, s.ID, first, false)
+			}},
+		{name: "re-sent to the role", at: afterClose, reason: api.HandlerRotationSkipSubjectItem,
+			send: func(t *testing.T, f *deadPrimaryFixture, _ api.Agent) api.Message { return f.sendRole(t, first) }},
+		{name: "linked and re-sent with the same item", linked: true, at: afterSucceed, reason: api.HandlerRotationSkipSubjectItem,
+			send: func(t *testing.T, f *deadPrimaryFixture, s api.Agent) api.Message {
+				return f.send(t, f.worker, api.EnvelopeKindRequest, s.ID, linkedSubject, true)
+			}},
+		{name: "not re-sent"},
+		{name: "re-sent before the close", at: beforeClose,
+			send: func(t *testing.T, f *deadPrimaryFixture, _ api.Agent) api.Message { return f.sendRole(t, first) }},
+		{name: "re-sent with another subject", at: afterSucceed,
+			send: func(t *testing.T, f *deadPrimaryFixture, s api.Agent) api.Message {
+				return f.send(t, f.worker, api.EnvelopeKindRequest, s.ID, "Another fixture request", false)
+			}},
+		{name: "re-sent linked to an item", at: afterSucceed,
+			send: func(t *testing.T, f *deadPrimaryFixture, s api.Agent) api.Message {
+				return f.send(t, f.worker, api.EnvelopeKindRequest, s.ID, first, true)
+			}},
+		{name: "sent by someone else", at: afterSucceed,
+			send: func(t *testing.T, f *deadPrimaryFixture, s api.Agent) api.Message {
+				return f.send(t, f.agent(t, "reviewer", ""), api.EnvelopeKindRequest, s.ID, first, false)
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newDeadPrimaryFixture(t)
+			ctx := context.Background()
+			s := f.s
+			target, subject := f.requests[0], first
+			if c.linked {
+				target, subject = f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, linkedSubject, true), linkedSubject
+			}
+			var resent api.Message
+			at := func(phase string) func(api.Agent) {
+				return func(successor api.Agent) {
+					if c.at == phase {
+						resent = c.send(t, f, successor)
+					}
+				}
+			}
+			r, successor := f.exitedRotation(t, []int64{target.Seq}, func() { at(beforeClose)(api.Agent{}) }, func() { at(afterClose)(api.Agent{}) }, at(afterSucceed))
+			// The request still open at commit always moves.
+			if p := reissuedFrom(r, f.requests[1].Seq); len(p) != 1 || p[0].OldState == api.ObligationClosed {
+				t.Fatalf("open request #%d reissued: %+v", f.requests[1].Seq, p)
+			}
+			moved := reissuedFrom(r, target.Seq)
+			if c.reason == "" {
+				if len(moved) != 1 || moved[0].OldState != api.ObligationClosed || len(r.Handoff.Skipped) != 0 {
+					t.Fatalf("request #%d: reissued %+v skipped %+v", target.Seq, moved, r.Handoff.Skipped)
+				}
+				if data, _ := json.Marshal(r.Handoff); strings.Contains(string(data), `"skipped"`) {
+					t.Fatalf("a handoff with no skip names the list: %s", data)
+				}
+				return
+			}
+			if resent.Seq == 0 || len(moved) != 0 || len(r.Handoff.Skipped) != 1 {
+				t.Fatalf("request #%d: reissued %+v skipped %+v", target.Seq, moved, r.Handoff.Skipped)
+			}
+			var oldObligation string
+			if err := s.db.QueryRow(`SELECT id FROM obligations WHERE message_seq=? AND agent_id=? AND state='closed' AND outcome=? AND reason=?`,
+				target.Seq, f.old.ID, api.OutcomeRecipientGone, exitedRecipientGoneReason).Scan(&oldObligation); err != nil {
+				t.Fatalf("the skipped obligation did not stay closed recipient_gone: %v", err)
+			}
+			want := []api.HandlerRotationSkip{{OldObligationID: oldObligation, OldMessageSeq: target.Seq, NewMessageSeq: resent.Seq, Reason: c.reason, Subject: subject}}
+			if !reflect.DeepEqual(r.Handoff.Skipped, want) {
+				t.Fatalf("skipped %+v, want %+v", r.Handoff.Skipped, want)
+			}
+			// The successor, or the role holder, has the request once: the re-send.
+			if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE state<>'closed' AND source_kind='request' AND subject LIKE ?`, "%"+subject); n != 1 {
+				t.Fatalf("the request is open %d times", n)
+			}
+			if r.Receipt.Reissued != len(r.Handoff.Reissued) {
+				t.Fatalf("receipt %d moved, handoff %d", r.Receipt.Reissued, len(r.Handoff.Reissued))
+			}
+			// The skip is saved with the handoff and counted on the event.
+			saved, err := s.GetHandlerRotation(ctx, f.task.ID, r.ID)
+			if err != nil || saved.Handoff == nil || !reflect.DeepEqual(saved.Handoff.Skipped, want) {
+				t.Fatalf("saved handoff: %+v %v", saved.Handoff, err)
+			}
+			if n := countRows(t, s, `SELECT count(*) FROM events WHERE task_id=? AND agent_id=? AND text='Handler rotation committed' AND data LIKE '%"skipped":1%'`, f.task.ID, successor.ID); n != 1 {
+				t.Fatalf("committed events counting the skip: %d", n)
+			}
+		})
+	}
+}
+
+// a2: a request still open at commit is reissued even though its sender also
+// re-sent it to the successor; only a closed one is checked.
+func TestHandlerRotationExitedPrimaryMovesOpenResentRequest(t *testing.T) {
+	f := newDeadPrimaryFixture(t)
+	held := f.requests[1]
+	const subject = "Second fixture request held by role"
+	var resent api.Message
+	r, successor := f.exitedRotation(t, []int64{f.requests[0].Seq}, nil, nil, func(a api.Agent) {
+		resent = f.send(t, f.worker, api.EnvelopeKindRequest, a.ID, subject, false)
+	})
+	p := reissuedFrom(r, held.Seq)
+	if len(p) != 1 || p[0].OldState == api.ObligationClosed || p[0].ViaRole != api.RoleDatabaseHandler || len(r.Handoff.Skipped) != 0 || len(reissuedFrom(r, f.requests[0].Seq)) != 1 {
+		t.Fatalf("reissued %+v skipped %+v", r.Handoff.Reissued, r.Handoff.Skipped)
+	}
+	for _, seq := range []int64{resent.Seq, p[0].NewMessageSeq} {
+		if n := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND message_seq=? AND state<>'closed'`, successor.ID, seq); n != 1 {
+			t.Fatalf("request #%d open on the successor %d times", seq, n)
+		}
+	}
+}
+
+// a1: the match itself. A request id is the sender's own retry key; otherwise
+// the subject and the linked items must both match. The kind always must.
+func TestHandlerRotationResentReason(t *testing.T) {
+	msg := func(kind, subject, request string, items ...string) api.Message {
+		m := api.Message{Envelope: &api.Envelope{Kind: kind, Subject: subject}}
+		if request != "" {
+			m.PostReceipt = &api.MessagePostReceipt{RequestID: request}
+		}
+		for _, id := range items {
+			m.WorkItems = append(m.WorkItems, api.MessageWorkItem{ItemTaskID: "tsk_fixture", ItemID: id, ItemRevision: int64(len(m.WorkItems) + 1)})
+		}
+		return m
+	}
+	original := msg(api.EnvelopeKindRequest, "Fixture request", "req-1", "wi_a", "wi_b")
+	for _, c := range []struct {
+		name     string
+		original api.Message
+		resend   api.Message
+		want     string
+	}{
+		{"same request id, other subject", original, msg(api.EnvelopeKindRequest, "Reworded fixture request", "req-1"), api.HandlerRotationSkipRequestID},
+		{"same subject and items, other request id and revisions", original, msg(api.EnvelopeKindRequest, " Fixture request ", "req-2", "wi_b", "wi_a"), api.HandlerRotationSkipSubjectItem},
+		{"both unlinked, same subject", msg(api.EnvelopeKindRequest, "Fixture request", ""), msg(api.EnvelopeKindRequest, "Fixture request", ""), api.HandlerRotationSkipSubjectItem},
+		{"same subject, one item fewer", original, msg(api.EnvelopeKindRequest, "Fixture request", "req-2", "wi_a"), ""},
+		{"same subject, another item", original, msg(api.EnvelopeKindRequest, "Fixture request", "req-2", "wi_a", "wi_c"), ""},
+		{"same subject and items, another kind", original, msg(api.EnvelopeKindQuestion, "Fixture request", "req-2", "wi_a", "wi_b"), ""},
+		{"same request id, another kind", original, msg(api.EnvelopeKindNotice, "Fixture request", "req-1", "wi_a", "wi_b"), ""},
+		{"another subject", original, msg(api.EnvelopeKindRequest, "Another fixture request", "req-2", "wi_a", "wi_b"), ""},
+		{"no request ids, another subject", msg(api.EnvelopeKindRequest, "Fixture request", ""), msg(api.EnvelopeKindRequest, "Another fixture request", ""), ""},
+		{"empty subjects", msg(api.EnvelopeKindRequest, "", ""), msg(api.EnvelopeKindRequest, "", ""), ""},
+		{"untyped original", api.Message{Text: "Fixture request"}, msg(api.EnvelopeKindRequest, "Fixture request", ""), ""},
+	} {
+		if got := resentReason(c.original, c.resend); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}

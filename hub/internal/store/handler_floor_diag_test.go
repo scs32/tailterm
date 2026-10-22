@@ -221,12 +221,13 @@ func TestHandlerFloorDiagG3OwnerIntegratedEntryRoutesToSuccessor(t *testing.T) {
 	}
 }
 
-// g2 (wi_c3267a9dd720279f): reproduces. Commit of an exited primary's
-// rotation reissues every obligation the broker closed recipient_gone after
-// the exit (handler_rotation.go:679-698,1242,1262) with no check for a
-// request the sender already re-sent to the successor, so the successor
-// holds the same request twice and the handoff records no skip.
-func TestHandlerFloorDiagG2ResentRequestReachesSuccessorTwice(t *testing.T) {
+// g2 (wi_c3267a9dd720279f): fixed by wi_d9e5d645bf6a466d (order #43382).
+// Commit of an exited primary's rotation reissues the obligations the broker
+// closed recipient_gone after the exit, except one whose sender already
+// re-sent it to the successor or the role after the close: that one is
+// skipped, the skip is on the handoff, and the successor holds the request
+// once.
+func TestHandlerFloorDiagG2ResentRequestSkippedOnReissue(t *testing.T) {
 	f := newDeadPrimaryFixture(t)
 	s := f.s
 	const subject = "First fixture request held by the handler"
@@ -253,21 +254,16 @@ func TestHandlerFloorDiagG2ResentRequestReachesSuccessorTwice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	var reissue *api.HandlerRotationReissue
-	for i, p := range r.Handoff.Reissued {
+	for _, p := range r.Handoff.Reissued {
 		if p.OldMessageSeq == original.Seq {
-			reissue = &r.Handoff.Reissued[i]
+			t.Fatalf("the closed request is reissued despite the re-send: %+v", p)
 		}
 	}
-	if reissue == nil || reissue.OldState != api.ObligationClosed || reissue.NewObligationID == "" {
-		t.Fatalf("today the closed request is reissued despite the re-send: %+v", r.Handoff.Reissued)
+	if len(r.Handoff.Skipped) != 1 || r.Handoff.Skipped[0].OldMessageSeq != original.Seq || r.Handoff.Skipped[0].NewMessageSeq != resent.Seq ||
+		r.Handoff.Skipped[0].Reason != api.HandlerRotationSkipSubjectItem {
+		t.Fatalf("handoff skipped: %+v", r.Handoff.Skipped)
 	}
-	for _, seq := range []int64{resent.Seq, reissue.NewMessageSeq} {
-		if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND message_seq=? AND state<>'closed' AND source_kind='request'`, successor.ID, seq); n != 1 {
-			t.Fatalf("request #%d open on the successor %d times", seq, n)
-		}
-	}
-	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed' AND source_kind='request' AND subject LIKE ?`, successor.ID, "%"+subject); n != 2 {
-		t.Fatalf("today the successor holds the same request twice, got %d", n)
+	if n := countRows(t, s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>'closed' AND source_kind='request' AND subject LIKE ?`, successor.ID, "%"+subject); n != 1 {
+		t.Fatalf("the successor holds the request %d times", n)
 	}
 }
