@@ -299,7 +299,9 @@ type stallAgent struct {
 	lastSeen, lastWorking, bound           time.Time // bound: when this run was bound or registered
 	state                                  string    // stored activity state
 	activity                               *api.AgentActivity
-	decisions                              int // its unanswered owner decisions
+	decisions                              int   // its unanswered owner decisions
+	obligations                            int   // team members: open owner-gated obligations it holds or sent
+	contextSeq                             int64 // team members: the binding's context message; the run's messages come after it
 	// lifted is when a never-quiet case of this run last ended: the owner
 	// answered its decision request, or its matrix wait ended.
 	lifted time.Time
@@ -430,6 +432,18 @@ const stallAnsweredSQL = `(SELECT COALESCE(MAX(d.created_at),'') FROM decision_r
 
 const stallResumedSQL = `(SELECT COALESCE(MAX(c.resumed_at),'') FROM project_pause_cycles c WHERE c.task_id=t.id)`
 
+// stallObligationsSQL counts the open owner-gated obligations a member holds
+// or sent: one that needs more than delivery and is either answered with a
+// typed BLOCK (state blocked) or held by the project's owner helper. An
+// ordinary obligation between members, or to the handler or the steward, is
+// not counted, so this is narrower than the queue's idle-entry rule
+// (team_queue_stall.go). The open states are listed so the task and state
+// index serves it.
+const stallObligationsSQL = `(SELECT count(*) FROM obligations o JOIN messages m ON m.seq=o.message_seq LEFT JOIN agents h ON h.id=o.agent_id
+ WHERE o.task_id=a.task_id AND o.state IN ('` + api.ObligationQueued + `','` + api.ObligationDelivered + `','` + api.ObligationAcknowledged + `','` + api.ObligationWorking + `','` + api.ObligationBlocked + `')
+ AND o.needs<>'` + api.ObligationNeedsDelivery + `' AND (o.agent_id=a.id OR m.from_agent=a.id)
+ AND (o.state='` + api.ObligationBlocked + `' OR h.role='` + api.AgentRoleOwnerHelper + `'))`
+
 const stallDecisionsSQL = `(SELECT count(*) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
  LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq
  WHERE r.task_id=a.task_id AND m.from_agent=a.id AND m.from_run_id=a.run_id AND d.message_seq IS NULL)`
@@ -522,9 +536,9 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	rows, err = q.QueryContext(ctx, `SELECT e.task_id,e.id,e.item_id,e.created_at,e.admitted_at,
  EXISTS(SELECT 1 FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state IN ('waiting','met','orphaned')),
  EXISTS(SELECT 1 FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state='held'),
- COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),
+ COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),COALESCE(b.context_through_message_seq,0),
  COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END,
- COALESCE(p.wait_ended_at,''),CASE WHEN a.id IS NULL THEN '' ELSE `+stallAnsweredSQL+` END,`+stallResumedSQL+`,
+ CASE WHEN a.id IS NULL THEN 0 ELSE `+stallObligationsSQL+` END,COALESCE(p.wait_ended_at,''),CASE WHEN a.id IS NULL THEN '' ELSE `+stallAnsweredSQL+` END,`+stallResumedSQL+`,
  (SELECT COALESCE(MAX(h.resolved_at),'') FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state<>'held'),
  (SELECT COALESCE(MAX(w.closed_at),'') FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state NOT IN ('waiting','met','orphaned'))
  FROM team_queue_entries e JOIN tasks t ON t.id=e.task_id
@@ -541,8 +555,8 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		var a stallAgent
 		var id, entry, item, created, admitted, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
 		var waiting, held bool
-		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.state, &payload, &worked, &a.decisions,
-			&waited, &answered, &resumed, &released, &cleared); err != nil {
+		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.contextSeq, &a.state, &payload, &worked, &a.decisions,
+			&a.obligations, &waited, &answered, &resumed, &released, &cleared); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -685,6 +699,83 @@ func (r *stallReads) postedAfter(seq int64, runs map[stallRun]bool) (bool, error
 	return false, nil
 }
 
+// plannedWaitEnded is when the team's last planned wait ended: the latest
+// close of an owner-gated obligation a member held or sent, or, for one still
+// open whose BLOCK was lifted, its last progress time, which the resume sets.
+// Owner-gated means held by the owner helper or answered with a typed BLOCK
+// from its holder. Only messages after after are read: a member's
+// obligations all come after its binding's context. It is read only for a
+// team that is otherwise quiet; each result set is read to its end before the
+// next query.
+func (r *stallReads) plannedWaitEnded(agents []string, after int64) (time.Time, error) {
+	if len(agents) == 0 {
+		return time.Time{}, nil
+	}
+	in := strings.TrimSuffix(strings.Repeat("?,", len(agents)), ",")
+	args := []any{r.task, after, api.ObligationNeedsDelivery}
+	for range 2 {
+		for _, a := range agents {
+			args = append(args, a)
+		}
+	}
+	rows, err := r.q.QueryContext(r.ctx, `SELECT o.message_seq,o.agent_id,o.state,o.closed_at,o.last_progress_at,COALESCE(h.role,'')
+ FROM messages m JOIN obligations o ON o.message_seq=m.seq LEFT JOIN agents h ON h.id=o.agent_id
+ WHERE m.task_id=? AND m.seq>? AND o.needs<>? AND (o.agent_id IN (`+in+`) OR m.from_agent IN (`+in+`))`, args...)
+	if err != nil {
+		return time.Time{}, err
+	}
+	type held struct {
+		seq   int64
+		agent string
+	}
+	type candidate struct {
+		held
+		state, closed, progress, role string
+	}
+	var found []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.seq, &c.agent, &c.state, &c.closed, &c.progress, &c.role); err != nil {
+			rows.Close()
+			return time.Time{}, err
+		}
+		found = append(found, c)
+	}
+	if err := rows.Close(); err != nil || len(found) == 0 {
+		return time.Time{}, err
+	}
+	// The BLOCK answers in the same range, as the broker finds them.
+	rows, err = r.q.QueryContext(r.ctx, `SELECT reply_to,from_agent FROM messages WHERE task_id=? AND seq>? AND reply_to>0 AND envelope<>''
+ AND CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.kind') END=?`, r.task, after, api.EnvelopeKindBlock)
+	if err != nil {
+		return time.Time{}, err
+	}
+	blocked := map[held]bool{}
+	for rows.Next() {
+		var h held
+		if err := rows.Scan(&h.seq, &h.agent); err != nil {
+			rows.Close()
+			return time.Time{}, err
+		}
+		blocked[h] = true
+	}
+	if err := rows.Close(); err != nil {
+		return time.Time{}, err
+	}
+	var ended time.Time
+	for _, c := range found {
+		switch {
+		case c.role != api.AgentRoleOwnerHelper && !blocked[c.held]:
+			// never owner-gated
+		case c.state == api.ObligationClosed:
+			ended = latest(ended, parseTS(c.closed))
+		case c.state != api.ObligationBlocked && c.role != api.AgentRoleOwnerHelper:
+			ended = latest(ended, parseTS(c.progress))
+		}
+	}
+	return ended, nil
+}
+
 // stallNotice is one notice the write phase posts for an episode.
 type stallNotice struct {
 	action, subject, text string
@@ -794,6 +885,11 @@ func (t *stallTeam) neverQuiet(now time.Time) string {
 	for _, m := range t.members {
 		if m.matrixWait(now) {
 			return "matrix-wait"
+		}
+	}
+	for _, m := range t.members {
+		if m.obligations > 0 {
+			return "planned-wait"
 		}
 	}
 	return ""
@@ -908,14 +1004,25 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		if now.Sub(since) < stallWatchTeamQuiet {
 			continue
 		}
+		agents := make([]string, 0, len(t.members))
+		after := t.members[0].contextSeq
 		for _, m := range t.members {
 			posted, err := reads.recentPost(stallRun{m.id, m.runID})
 			if err != nil {
 				return plan, err
 			}
 			since = latest(since, posted)
+			agents = append(agents, m.id)
+			after = min(after, m.contextSeq)
 		}
 		if now.Sub(since) < stallWatchTeamQuiet {
+			continue
+		}
+		ended, err := reads.plannedWaitEnded(agents, after)
+		if err != nil {
+			return plan, err
+		}
+		if since = latest(since, ended); now.Sub(since) < stallWatchTeamQuiet {
 			continue
 		}
 		id := api.NewID("swe")

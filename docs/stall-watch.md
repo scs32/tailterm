@@ -2,6 +2,7 @@
 
 Feature `wi_fa5f10477f93c57d` revision 2, owner order #32210, builder assignment #32236.
 Follow-up feature `wi_830e10326defc8ee`, owner order #32312, builder assignment #32351: the helper states that send a team notice to the owner, and the hold after a hub start.
+Bug `wi_363c6bde9126fb4e` revision 2, order #42896, amendment #42976, builder assignment #42985: an open owner-gated obligation is a team planned wait.
 
 On 2026-10-10 the owner helper went quiet and the first owner ping came 4 h 20 min later, because the helper is itself the escalation point for team stalls and nothing watched it. A team that goes quiet as a whole was noticed only through obligation timers, measured in hours. The hub now watches both.
 
@@ -12,7 +13,7 @@ The stall watch **alerts and does nothing else**. An alert starts the diagnosis.
 | Watch | Fires when | Threshold (D1) | Who hears it |
 | --- | --- | --- | --- |
 | Helper watch | the owner helper owes the owner something and shows no post and no `working` report | 20 minutes | the owner, as a Discord ping |
-| Team watch | the team of a running queue entry shows no post, no `working` report and no matrix wait | 30 minutes | the owner helper, as a directed notice; the owner instead when the helper is quiet too, offline, not registered, crashed, stuck or blocked by its provider |
+| Team watch | the team of a running queue entry shows no post, no `working` report, no matrix wait and no open owner-gated obligation | 30 minutes | the owner helper, as a directed notice; the owner instead when the helper is quiet too, offline, not registered, crashed, stuck or blocked by its provider |
 
 - Each watch posts **one notice per episode**. An episode is one stretch of quiet for one subject: the helper, or one queue entry.
 - An episode ends silently. No notice says that the subject is back.
@@ -81,6 +82,7 @@ For a team:
 | open owner decision | a member's run has an unanswered `tt ask` |
 | working | a member's effective state is `working` |
 | matrix wait | a member reports a wait for, or a run on, the matrix host, started less than 4 h 30 min ago |
+| planned wait | a member holds or sent an open obligation that needs more than delivery and is owner-gated: one answered with a typed BLOCK (`--resume-when`; state `blocked`), or one held by the project's owner helper |
 | entry not running | the entry is queued, launching, finished, failed or released |
 
 For the helper:
@@ -91,6 +93,8 @@ For the helper:
 - its current run has an unanswered `tt ask`: the owner already holds the next step.
 
 A helper in `unknown`, or with status `needs_input` and no stored decision request, is **not** exempt. It is pinged and the state is named.
+
+The team's planned wait is deliberately **narrower than the queue's idle-entry rule** ([agent-activity.md](agent-activity.md), "Recording a planned wait"), which is unchanged and counts every open obligation. Only an obligation that waits on the owner keeps this watch quiet: an obligation a member sent to the owner helper (a REQUEST, a QUESTION or a BLOCK to it as the project orchestrator), or any obligation a member holds or sent that its holder answered with a typed BLOCK. An ordinary obligation inside the team (an ASSIGN, REVIEW, REQUEST or QUESTION between members, or to the database handler or the steward) does not, so a team that only owes itself work is still noticed after 30 minutes. A member is the run counted here; the database handler and other project roles are not members. A delivery-only obligation (a NOTICE, a FINDING, or a BLOCK sent to anyone but the project orchestrator that is not a reply) never counts. A member whose status is `needs_input`, with no open owner-gated obligation, is **not** exempt; the queue counts it, this watch does not. The planned wait has no time bound here: an overdue obligation still escalates through the broker's own nudges and lead and owner escalations, which this watch does not change. The helper watch does not use this case.
 
 ### When a never-quiet case ends
 
@@ -105,6 +109,7 @@ The hub reads the end of each case from rows that already exist:
 | Case | The end is |
 | --- | --- |
 | open owner decision | the time of the owner's answer to a request from that run |
+| planned wait | the close time of the newest owner-gated obligation a member held or sent; for one still open whose BLOCK was lifted by an ack, its last progress time, which the ack sets |
 | held entry | the time the hold was continued or stopped |
 | shared-path wait | the time the wait was closed (resumed, overdue or cleared) |
 | matrix wait | the first activity report without the wait, or 4 h 30 min after its start when the relay stopped reporting |
@@ -249,6 +254,7 @@ The migration only creates these tables. Nothing is altered or back-filled.
 - **A provider-blocked helper gets two notices**: the provider-block notice after about two minutes and the helper watch after twenty. They name the same fix.
 - **An old unanswered `tt ask` from the helper's current run** keeps the helper watch off until the owner answers it.
 - **A replaced run starts a fresh 20 minutes**, because registering the helper is the owner's own action.
+- **The end of a planned wait is read from messages after the members' binding context.** An owner-gated obligation from before a member's binding, which a fresh team does not have, does not restart the quiet time when it closes. A lifted BLOCK restarts it at the obligation's last progress time, so later progress on that obligation restarts it again.
 - **The watch covers the helper and queue teams only.** The database handler, the deployer and the steward are not watched.
 
 ## Owed after release
