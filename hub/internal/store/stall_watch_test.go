@@ -1160,6 +1160,30 @@ func TestStallWatchTeamPlannedWait(t *testing.T) {
 		f.typed(lead, h, 0, stallRequest)
 		quietFor(t, f, "the owner helper holds a member's request")
 	})
+	// wi_9aba800fb4cf5abb: a member's REQUEST straight to the owner is held by
+	// no agent (agent_id empty, recipient_kind owner); the owner's answer closes
+	// it and starts the quiet time afresh.
+	t.Run("direct owner request, then the owner's answer", func(t *testing.T) {
+		f, entry, lead, _ := build(t)
+		env := stallRequest
+		env.To = "owner"
+		req, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{AgentID: lead.ID, RunID: lead.RunID, To: "owner", Envelope: &env}, stallOwner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := f.count(open+` AND agent_id='' AND recipient_kind=?`, req.Seq, api.ObligationNeedsDelivery, api.ObligationClosed, api.ObligationRecipientOwner); got != 1 {
+			t.Fatalf("open owner obligations = %d, want 1", got)
+		}
+		quietFor(t, f, "a member's request waits for the owner")
+		if _, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{ReplyTo: req.Seq,
+			Envelope: &api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "The owner approved the matrix line", Body: api.EnvelopeBody{Answer: "approved"}}}, stallOwner); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.count(open, req.Seq, api.ObligationNeedsDelivery, api.ObligationClosed); got != 0 {
+			t.Fatalf("open owner obligations = %d after the answer, want 0", got)
+		}
+		noticeAfter(t, f, entry, f.now())
+	})
 	t.Run("assignment answered with a BLOCK, then resumed", func(t *testing.T) {
 		f, entry, lead, _ := build(t)
 		builder := f.member("builder-a", 0)
@@ -1188,9 +1212,10 @@ func TestStallWatchTeamPlannedWait(t *testing.T) {
 		f.closed("planned-wait")
 	})
 	// Not owner-gated, as today: a team with no open obligation, one whose
-	// only open obligation is an internal assignment or a request to the
-	// database handler, one with only a delivery-only notice, or a member in
-	// needs_input is noticed 30 minutes after its last post.
+	// only open obligation is an internal assignment, a request to another
+	// member, the database handler or the steward, one with only a
+	// delivery-only notice, or a member in needs_input is noticed 30 minutes
+	// after its last post.
 	for name, apply := range map[string]func(f *stallFixture, lead, h api.Agent){
 		"no obligation": func(*stallFixture, api.Agent, api.Agent) {},
 		"internal assignment": func(f *stallFixture, lead, _ api.Agent) {
@@ -1205,6 +1230,19 @@ func TestStallWatchTeamPlannedWait(t *testing.T) {
 			handler := f.member("db-handler-a", 1)
 			f.exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleDatabaseHandler, handler.ID)
 			f.typed(lead, handler, 0, stallRequest)
+		},
+		"request to the steward": func(f *stallFixture, lead, _ api.Agent) {
+			steward := f.member("steward-a", 1)
+			f.exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleBacklogSteward, steward.ID)
+			f.typed(lead, steward, 0, stallRequest)
+		},
+		"member-to-member request": func(f *stallFixture, lead, _ api.Agent) {
+			builder := f.member("builder-a", 0)
+			f.state(builder, "idle")
+			r := f.typed(lead, builder, 0, stallRequest)
+			if got := f.count(open, r.Seq, api.ObligationNeedsDelivery, api.ObligationClosed); got != 1 {
+				f.t.Fatalf("open requests = %d, want 1", got)
+			}
 		},
 		"delivery-only notice": func(f *stallFixture, lead, h api.Agent) {
 			f.typed(lead, h, 0, api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "The candidate waits for the matrix line", Body: api.EnvelopeBody{Text: "waiting"}})

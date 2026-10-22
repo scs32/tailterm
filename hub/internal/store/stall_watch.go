@@ -433,8 +433,9 @@ const stallAnsweredSQL = `(SELECT COALESCE(MAX(d.created_at),'') FROM decision_r
 const stallResumedSQL = `(SELECT COALESCE(MAX(c.resumed_at),'') FROM project_pause_cycles c WHERE c.task_id=t.id)`
 
 // stallObligationsSQL counts the open owner-gated obligations a member holds
-// or sent: one that needs more than delivery and is either answered with a
-// typed BLOCK (state blocked) or held by the project's owner helper. An
+// or sent: one that needs more than delivery and is answered with a typed
+// BLOCK (state blocked), held by the project's owner helper, or a REQUEST
+// addressed to the owner (recipient_kind owner, held by no agent). An
 // ordinary obligation between members, or to the handler or the steward, is
 // not counted, so this is narrower than the queue's idle-entry rule
 // (team_queue_stall.go). The open states are listed so the task and state
@@ -442,7 +443,7 @@ const stallResumedSQL = `(SELECT COALESCE(MAX(c.resumed_at),'') FROM project_pau
 const stallObligationsSQL = `(SELECT count(*) FROM obligations o JOIN messages m ON m.seq=o.message_seq LEFT JOIN agents h ON h.id=o.agent_id
  WHERE o.task_id=a.task_id AND o.state IN ('` + api.ObligationQueued + `','` + api.ObligationDelivered + `','` + api.ObligationAcknowledged + `','` + api.ObligationWorking + `','` + api.ObligationBlocked + `')
  AND o.needs<>'` + api.ObligationNeedsDelivery + `' AND (o.agent_id=a.id OR m.from_agent=a.id)
- AND (o.state='` + api.ObligationBlocked + `' OR h.role='` + api.AgentRoleOwnerHelper + `'))`
+ AND (o.state='` + api.ObligationBlocked + `' OR h.role='` + api.AgentRoleOwnerHelper + `' OR o.recipient_kind='` + api.ObligationRecipientOwner + `'))`
 
 const stallDecisionsSQL = `(SELECT count(*) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
  LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq
@@ -702,11 +703,11 @@ func (r *stallReads) postedAfter(seq int64, runs map[stallRun]bool) (bool, error
 // plannedWaitEnded is when the team's last planned wait ended: the latest
 // close of an owner-gated obligation a member held or sent, or, for one still
 // open whose BLOCK was lifted, its last progress time, which the resume sets.
-// Owner-gated means held by the owner helper or answered with a typed BLOCK
-// from its holder. Only messages after after are read: a member's
-// obligations all come after its binding's context. It is read only for a
-// team that is otherwise quiet; each result set is read to its end before the
-// next query.
+// Owner-gated means held by the owner helper, addressed to the owner, or
+// answered with a typed BLOCK from its holder. Only messages after after are
+// read: a member's obligations all come after its binding's context. It is
+// read only for a team that is otherwise quiet; each result set is read to its
+// end before the next query.
 func (r *stallReads) plannedWaitEnded(agents []string, after int64) (time.Time, error) {
 	if len(agents) == 0 {
 		return time.Time{}, nil
@@ -718,7 +719,7 @@ func (r *stallReads) plannedWaitEnded(agents []string, after int64) (time.Time, 
 			args = append(args, a)
 		}
 	}
-	rows, err := r.q.QueryContext(r.ctx, `SELECT o.message_seq,o.agent_id,o.state,o.closed_at,o.last_progress_at,COALESCE(h.role,'')
+	rows, err := r.q.QueryContext(r.ctx, `SELECT o.message_seq,o.agent_id,o.state,o.closed_at,o.last_progress_at,COALESCE(h.role,''),o.recipient_kind
  FROM messages m JOIN obligations o ON o.message_seq=m.seq LEFT JOIN agents h ON h.id=o.agent_id
  WHERE m.task_id=? AND m.seq>? AND o.needs<>? AND (o.agent_id IN (`+in+`) OR m.from_agent IN (`+in+`))`, args...)
 	if err != nil {
@@ -730,12 +731,12 @@ func (r *stallReads) plannedWaitEnded(agents []string, after int64) (time.Time, 
 	}
 	type candidate struct {
 		held
-		state, closed, progress, role string
+		state, closed, progress, role, recipient string
 	}
 	var found []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.seq, &c.agent, &c.state, &c.closed, &c.progress, &c.role); err != nil {
+		if err := rows.Scan(&c.seq, &c.agent, &c.state, &c.closed, &c.progress, &c.role, &c.recipient); err != nil {
 			rows.Close()
 			return time.Time{}, err
 		}
@@ -764,12 +765,13 @@ func (r *stallReads) plannedWaitEnded(agents []string, after int64) (time.Time, 
 	}
 	var ended time.Time
 	for _, c := range found {
+		toOwner := c.role == api.AgentRoleOwnerHelper || c.recipient == api.ObligationRecipientOwner
 		switch {
-		case c.role != api.AgentRoleOwnerHelper && !blocked[c.held]:
+		case !toOwner && !blocked[c.held]:
 			// never owner-gated
 		case c.state == api.ObligationClosed:
 			ended = latest(ended, parseTS(c.closed))
-		case c.state != api.ObligationBlocked && c.role != api.AgentRoleOwnerHelper:
+		case c.state != api.ObligationBlocked && !toOwner:
 			ended = latest(ended, parseTS(c.progress))
 		}
 	}

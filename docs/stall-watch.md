@@ -82,7 +82,7 @@ For a team:
 | open owner decision | a member's run has an unanswered `tt ask` |
 | working | a member's effective state is `working` |
 | matrix wait | a member reports a wait for, or a run on, the matrix host, started less than 4 h 30 min ago |
-| planned wait | a member holds or sent an open obligation that needs more than delivery and is owner-gated: one answered with a typed BLOCK (`--resume-when`; state `blocked`), or one held by the project's owner helper |
+| planned wait | a member holds or sent an open obligation that needs more than delivery and is owner-gated: one answered with a typed BLOCK (`--resume-when`; state `blocked`), one held by the project's owner helper, or a REQUEST the member addressed to the owner (held by no agent; recipient `owner`) |
 | entry not running | the entry is queued, launching, finished, failed or released |
 
 For the helper:
@@ -94,7 +94,7 @@ For the helper:
 
 A helper in `unknown`, or with status `needs_input` and no stored decision request, is **not** exempt. It is pinged and the state is named.
 
-The team's planned wait is deliberately **narrower than the queue's idle-entry rule** ([agent-activity.md](agent-activity.md), "Recording a planned wait"), which is unchanged and counts every open obligation. Only an obligation that waits on the owner keeps this watch quiet: an obligation a member sent to the owner helper (a REQUEST, a QUESTION or a BLOCK to it as the project orchestrator), or any obligation a member holds or sent that its holder answered with a typed BLOCK. An ordinary obligation inside the team (an ASSIGN, REVIEW, REQUEST or QUESTION between members, or to the database handler or the steward) does not, so a team that only owes itself work is still noticed after 30 minutes. A member is the run counted here; the database handler and other project roles are not members. A delivery-only obligation (a NOTICE, a FINDING, or a BLOCK sent to anyone but the project orchestrator that is not a reply) never counts. A member whose status is `needs_input`, with no open owner-gated obligation, is **not** exempt; the queue counts it, this watch does not. The planned wait has no time bound here: an overdue obligation still escalates through the broker's own nudges and lead and owner escalations, which this watch does not change. The helper watch does not use this case.
+The team's planned wait is deliberately **narrower than the queue's idle-entry rule** ([agent-activity.md](agent-activity.md), "Recording a planned wait"), which is unchanged and counts every open obligation. Only an obligation that waits on the owner keeps this watch quiet: an obligation a member sent to the owner helper (a REQUEST, a QUESTION or a BLOCK to it as the project orchestrator), a typed REQUEST a member addressed to the owner directly, which no agent holds and the owner's answer closes, or any obligation a member holds or sent that its holder answered with a typed BLOCK. An ordinary obligation inside the team (an ASSIGN, REVIEW, REQUEST or QUESTION between members, or to the database handler or the steward) does not, so a team that only owes itself work is still noticed after 30 minutes. A member is the run counted here; the database handler and other project roles are not members. So an obligation held or sent only by a retired run, or by a run of an earlier admission of the item, is not counted either, though the idle-entry rule, which reads every bound run of the item but the handler, still counts it. The difference only adds notices; it never hides a stall. A delivery-only obligation (a NOTICE, a FINDING, or a BLOCK sent to anyone but the project orchestrator that is not a reply) never counts. A member whose status is `needs_input`, with no open owner-gated obligation, is **not** exempt; the queue counts it, this watch does not. The planned wait has no time bound here: an overdue obligation still escalates through the broker's own nudges and lead and owner escalations, which this watch does not change. The helper watch does not use this case.
 
 ### When a never-quiet case ends
 
@@ -109,7 +109,7 @@ The hub reads the end of each case from rows that already exist:
 | Case | The end is |
 | --- | --- |
 | open owner decision | the time of the owner's answer to a request from that run |
-| planned wait | the close time of the newest owner-gated obligation a member held or sent; for one still open whose BLOCK was lifted by an ack, its last progress time, which the ack sets |
+| planned wait | the close time of the newest owner-gated obligation a member held or sent (for a direct owner REQUEST, the owner's answer); for one still open whose BLOCK was lifted by an ack, its last progress time, which the ack sets |
 | held entry | the time the hold was continued or stopped |
 | shared-path wait | the time the wait was closed (resumed, overdue or cleared) |
 | matrix wait | the first activity report without the wait, or 4 h 30 min after its start when the relay stopped reporting |
