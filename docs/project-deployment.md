@@ -691,6 +691,10 @@ id was not recorded (an id that is not 1 to 120 characters of
 `[A-Za-z0-9_./-]`, or one past the first 50). With `unnamed` above 0, `unaffected` covers only the
 named checks. Other fallbacks (`batch-plan-uncovered`, `batch-import-timeout`,
 `batch-selection-refused`, a run that could not start) carry no attribution.
+Neither does a receipt refused only for the matrix home cleanup error
+(`VERIFICATION_HOME_CLEANUP_ERROR`, with no failed and no unnamed check):
+`batchFallback` then has no `failed` or `unaffected` list and names the cause
+as `cause: "matrix-home-cleanup-error"`, without the error's own text.
 
 ```sh
 jq .batchFallback journalDirectory/LEAD_ID.json

@@ -1056,13 +1056,15 @@ export async function runRelease(config, adapter) {
   // Which jobs each failed check of the batch's run belongs to, from the
   // approved check ids saved with each batch-add, the lead first; a check
   // only the selection added belongs to none. A job none of them belongs to
-  // is unaffected. Only for a failure that names its failed checks.
+  // is unaffected. Only for a failure that names or counts a failed check;
+  // a refusal only for the matrix home cleanup error names that as its cause.
   const attribution=failure=>{
-    if(!Array.isArray(failure?.failedChecks))return {};
+    const unnamed=Number.isSafeInteger(failure?.unnamed) && failure.unnamed>0?failure.unnamed:0;
+    if(!Array.isArray(failure?.failedChecks) || (!failure.failedChecks.length && !unnamed))return failure?.homeCleanupError===true?{cause:"matrix-home-cleanup-error"}:{};
     const jobs=state.batch.jobs.filter(j=>Array.isArray(j.checkIds));
     const failed=failure.failedChecks.map(checkId=>({checkId,jobs:jobs.filter(j=>j.checkIds.includes(checkId)).map(j=>j.jobId)}));
     const unaffected=jobs.map(j=>j.jobId).filter(id=>!failed.some(f=>f.jobs.includes(id)));
-    return {failed,unaffected,...(Number.isSafeInteger(failure.unnamed) && failure.unnamed>0?{unnamed:failure.unnamed}:{})};
+    return {failed,unaffected,...(unnamed?{unnamed}:{})};
   };
   const finishFallback=async()=>{
     if(adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return "waiting";
@@ -1612,9 +1614,10 @@ export class HostAdapter {
     if(run?.refusal)throw releaseError(run.refusal);
     if(!existsSync(receiptPath))throw releaseError("Integrated matrix run ended without a receipt");
     // The receipt is read only once its run is gone, and imported only when
-    // eligible. A refusal names its failed checks for a batch's attribution.
+    // eligible. A refusal names its failed checks for a batch's attribution,
+    // and marks the home cleanup error without copying its text.
     const receipt=JSON.parse(readFileSync(receiptPath,"utf8"));
-    if(!receiptEligible(receipt))throw Object.assign(releaseError("Integrated matrix receipt is not eligible"),failedChecks(receipt));
+    if(!receiptEligible(receipt))throw Object.assign(releaseError("Integrated matrix receipt is not eligible"),failedChecks(receipt),receipt.environment?.VERIFICATION_HOME_CLEANUP_ERROR?{homeCleanupError:true}:{});
     try{this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);}
     catch(error){if(error?.transport===true)return false;throw error;}
     this.matrixImportRequested=true;

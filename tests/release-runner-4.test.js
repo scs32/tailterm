@@ -631,3 +631,33 @@ test("union5 a failed union run names, for each failed check, the jobs whose app
  assert.deepEqual(failedChecks({checks:many}),{failedChecks:many.slice(0,50).map(c=>c.id),unnamed:10});
  assert.deepEqual(failedChecks({checks:[{id:"a",exitCode:0}]}),{failedChecks:[],unnamed:0});
 });
+test("union6 a batch run refused only for the matrix home cleanup error records no attribution and names the cleanup error as its cause",async()=>{
+ const run=async(failure)=>{
+  const b=planned([NPM],[NPM,...GO_CHECKS],[NPM,BROWSER_CHECK]),a=batchFake(b.lead),c=batchConfig(b,3);
+  a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(a.verifies.length===1)throw Object.assign(releaseError("Integrated matrix receipt is not eligible"),failure);return true;};
+  assert.equal((await runRelease(c,a)).outcome,"released");
+  assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","batch-drop","verify","merged","deploy:tailos","finish"]);
+  assert.deepEqual(c.solo,["rel_b2","rel_b3"]);assert.deepEqual([...readBatchSolo(c.home)],["rel_b2","rel_b3"]);assert.deepEqual(batchFiles(c.home),["batch-solo.json"]);
+  const journal=batchJournal(c);assert.equal(journal.batch,null);
+  return {batchId:batchId("rel_b1",2,b.tip),fallback:journal.batchFallback};
+ };
+ const base={reason:"batch-matrix-failed",detail:"Integrated matrix receipt is not eligible",members:["rel_b2","rel_b3"],status:"done"};
+ // Every check passed: no failed list, no unaffected list, the cleanup error as the cause.
+ let r=await run({failedChecks:[],unnamed:0,homeCleanupError:true});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base,cause:"matrix-home-cleanup-error"});
+ // A refusal that names or counts nothing records no attribution either.
+ r=await run({failedChecks:[],unnamed:0});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base});
+ // With failed checks beside the cleanup error, attribution is unchanged.
+ r=await run({failedChecks:["go-vet"],unnamed:0,homeCleanupError:true});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base,failed:[{checkId:"go-vet",jobs:["rel_b2"]}],unaffected:["rel_b1","rel_b3"]});
+ r=await run({failedChecks:[],unnamed:1,homeCleanupError:true});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base,failed:[],unaffected:["rel_b1","rel_b2","rel_b3"],unnamed:1});
+ // The host adapter marks a receipt refused only for the cleanup error, without its text.
+ const h=matrixHost({receipt:{environment:{VERIFICATION_HOME_CLEANUP_ERROR:"rm /private/home: busy"},checks:[{id:"go-vet",exitCode:0},{id:"npm-unit",exitCode:0}]}});
+ await assert.rejects(h.verify(h.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible" && JSON.stringify(e.failedChecks)==="[]" && e.unnamed===0 && e.homeCleanupError===true && !JSON.stringify(e).includes("busy"));
+ assert.equal(h.sends().length,0);
+ // A receipt without the cleanup error is not marked.
+ const g=matrixHost({receipt:{environment:{},checks:[{id:"go-vet",exitCode:1}]}});
+ await assert.rejects(g.verify(g.integrated),e=>JSON.stringify(e.failedChecks)==='["go-vet"]' && e.homeCleanupError===undefined);
+});
