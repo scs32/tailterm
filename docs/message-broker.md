@@ -121,6 +121,44 @@ hub wraps them as `kind: human` with the text as the body.
 - **`to`**: an agent name, `role:<role>` or `lead`. The broker resolves roles to
   the current agent/run when it creates the obligation and records the resolution.
 
+### Receipt refs
+
+Before saving a typed message, the hub checks its receipt refs against the
+receipts it holds, so the Board cannot cite a receipt the hub never saved or
+one of another item (`hub/internal/store/receipt_refs.go`).
+
+- **Checked keys**: `receipt` and any key ending in `-receipt`, such as
+  `order-receipt`. Keys such as `receipt1` or `receipt-generation` are not
+  checked.
+- **Checked values**: after trimming spaces, a value with the prefix `wob_`,
+  `wir_`, `nart_`, `nrr_`, `nlnk_` or `rel_` must be a well-formed ID (the
+  prefix and 16 hex digits) saved in that receipt's own table. A value may end
+  in `@N`, a whole number from 1; for `nart_` that artifact version must also be
+  saved.
+- **Same item**: when the saved receipt records an item, that item must be one
+  the message links, through `--work-item` or the `item` ref (with or without
+  `@revision`). A message with no linked item has only the receipt's existence
+  checked, and a receipt that records no item passes.
+- **Not checked**: other keys, other value prefixes (such as `mpr_`, `bat_`,
+  paths or hashes) and plain-text posts.
+- **Replay**: the check runs after request-id replay, so an identical resend of
+  a message accepted earlier still returns the original, even if its receipt no
+  longer resolves. A refused post saves no post receipt, so the corrected post
+  may reuse its request ID.
+
+A refused post is a 400 with code `invalid-envelope` and one problem per bad
+ref, in key order, every bad ref named rather than only the first. `tt send`
+exits 2 and prints them under `invalid message:`. The exact problems are:
+
+```
+refs.KEY: VALUE is not a saved receipt on this hub; copy the ID from the saved readback
+refs.KEY: VALUE belongs to item ITEM, not the linked item LINKED
+```
+
+The first covers both an unsaved and a malformed ID. In the second, `ITEM` is
+the item the receipt records and `LINKED` is the message's linked item IDs,
+sorted and joined with `, `.
+
 ### Kinds and what they oblige
 
 | Kind | Required body fields | Creates obligation | Closed by |
