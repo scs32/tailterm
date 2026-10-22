@@ -2758,12 +2758,14 @@ func (s *Store) rebindTeamQueueEntry(ctx context.Context, tx *sql.Tx, t api.Task
 		}
 		return fmt.Errorf("%w: entry %s: scope is not confirmed for item revision %d; confirm scope for revision %d and order #%d, then %s", api.ErrConflict, e.ID, item.Revision, item.Revision, e.OrderMessageSeq, queueRebindCommand(task, e.ID))
 	}
+	// The source is the amendment: linked at the current revision, which is
+	// newer than the entry's, so the original order or an older link fails.
 	var linked int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=? AND item_revision<=? AND relationship='primary'`, task, req.SourceMessageSeq, task, e.ItemID, item.Revision).Scan(&linked); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM message_work_item_links WHERE message_task_id=? AND message_seq=? AND item_task_id=? AND item_id=? AND item_revision=? AND relationship='primary'`, task, req.SourceMessageSeq, task, e.ItemID, item.Revision).Scan(&linked); err != nil {
 		return err
 	}
 	if linked != 1 {
-		return fmt.Errorf("%w: entry %s: message #%d is not linked to its item; name the amendment's message with --source", api.ErrConflict, e.ID, req.SourceMessageSeq)
+		return fmt.Errorf("%w: entry %s: message #%d is not linked to its item at revision %d; name the amendment's message, primary-linked at revision %d, with --source", api.ErrConflict, e.ID, req.SourceMessageSeq, item.Revision, item.Revision)
 	}
 	var fromScope int64
 	if err := tx.QueryRowContext(ctx, `SELECT scope_revision FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq).Scan(&fromScope); err != nil && !errors.Is(err, sql.ErrNoRows) {

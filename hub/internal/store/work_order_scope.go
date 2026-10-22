@@ -195,6 +195,18 @@ func requireCurrentConfirmedTeamOrder(ctx context.Context, q queryRower, e api.T
 	return requireConfirmedTeamOrder(ctx, q, e.TaskID, e.ItemID, e.ItemRevision, e.OrderMessageSeq)
 }
 
+// amendedEntryScopeRefusal is the scope refusal for an amended item whose
+// live entry is still at an older revision: it names the entry, the
+// confirmation it needs and the supported path, a rebind for a queued or
+// running entry and a requeue for a launching one.
+func amendedEntryScopeRefusal(e api.TeamQueueEntry, current int64) error {
+	next := "then " + queueRebindCommand(e.TaskID, e.ID)
+	if e.State == "launching" {
+		next = "let the launch fail, then " + queueRequeueCommand(e.TaskID, e.ID)
+	}
+	return workItemConflict(fmt.Sprintf("scope is not confirmed for item revision %d; entry %s is %s at revision %d. Confirm scope for revision %d and order #%d, %s", current, e.ID, e.State, e.ItemRevision, current, e.OrderMessageSeq, next))
+}
+
 func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, req api.ConfirmWorkOrderScopeRequest) (api.WorkOrderScopeConfirmation, error) {
 	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 1 || req.ScopeRevision < 1 || req.OrderMessageSeq < 1 {
 		return api.WorkOrderScopeConfirmation{}, api.ErrInvalid
@@ -354,7 +366,16 @@ func (s *Store) SaveWorkOrderBookkeeping(ctx context.Context, task, itemID strin
 	if item.Revision != req.ExpectedRevision {
 		return api.WorkOrderBookkeepingReceipt{}, workItemConflict("item revision changed; bookkeeping cannot edit item fields")
 	}
+	// An item has at most one live entry, whatever its attempt.
+	queue := api.TeamQueueEntry{TaskID: task, ItemID: itemID}
+	err = tx.QueryRowContext(ctx, `SELECT id,item_revision,order_seq,state FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('queued','launching','running')`, task, itemID).Scan(&queue.ID, &queue.ItemRevision, &queue.OrderMessageSeq, &queue.State)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return api.WorkOrderBookkeepingReceipt{}, err
+	}
 	if err := requireConfirmedTeamOrder(ctx, tx, task, itemID, item.Revision, req.OrderMessageSeq); err != nil {
+		if queue.ID != "" && queue.ItemRevision != item.Revision && errors.Is(err, api.ErrConflict) {
+			return api.WorkOrderBookkeepingReceipt{}, amendedEntryScopeRefusal(queue, item.Revision)
+		}
 		return api.WorkOrderBookkeepingReceipt{}, err
 	}
 	var linked int
@@ -364,14 +385,7 @@ func (s *Store) SaveWorkOrderBookkeeping(ctx context.Context, task, itemID strin
 	if linked != 1 {
 		return api.WorkOrderBookkeepingReceipt{}, workItemConflict("bookkeeping source message is not linked to this item")
 	}
-	// An item has at most one live entry, whatever its attempt.
-	queueID := ""
-	queue := api.TeamQueueEntry{TaskID: task, ItemID: itemID}
-	err = tx.QueryRowContext(ctx, `SELECT id,item_revision,order_seq,state FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('queued','launching','running')`, task, itemID).Scan(&queue.ID, &queue.ItemRevision, &queue.OrderMessageSeq, &queue.State)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return api.WorkOrderBookkeepingReceipt{}, err
-	}
-	queueID = queue.ID
+	queueID := queue.ID
 	if queueID != "" && queue.ItemRevision != item.Revision {
 		// The item was amended after this entry was queued or launched.
 		return api.WorkOrderBookkeepingReceipt{}, staleQueueEntry(queue, item.Revision)

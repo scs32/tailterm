@@ -2182,6 +2182,69 @@ func TestTeamQueueRebindRefusals(t *testing.T) {
 	}
 }
 
+// A rebind's source is the amendment: a message linked to the item at its
+// current revision. The original order, or a message linked at an older
+// revision, is refused naming the entry and the expected revision.
+func TestTeamQueueRebindSourceMustBeTheAmendment(t *testing.T) {
+	f := newRebindFixture(t, false)
+	first, older := f.amend(t, "one")
+	updated, source := f.amend(t, "two")
+	if older.WorkItems[0].ItemRevision != first.Revision || first.Revision >= updated.Revision {
+		t.Fatalf("fixture revisions %d -> %d", first.Revision, updated.Revision)
+	}
+	f.confirm(t, updated)
+	want := fmt.Sprintf("at revision %d", updated.Revision)
+	for name, stale := range map[string]api.Message{"original order": f.order, "older amendment": older} {
+		_, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.rebind(updated, stale))
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), f.entry.ID) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s as source: %v, want a conflict naming %s and %q", name, err, f.entry.ID, want)
+		}
+	}
+	if same, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID); err != nil || same.ItemRevision != f.item.Revision || len(same.Rebinds) != 0 {
+		t.Fatalf("refused source moved the entry %+v %v", same, err)
+	}
+	rebound, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.rebind(updated, source))
+	if err != nil || rebound.ItemRevision != updated.Revision || len(rebound.Rebinds) != 1 || rebound.Rebinds[0].SourceMessageSeq != source.Seq {
+		t.Fatalf("rebind with the amendment %+v %v", rebound, err)
+	}
+}
+
+// Bookkeeping at an amended revision before its scope is confirmed is
+// refused naming the live entry left at the older revision and the rebind
+// command (a requeue for a launching entry, which cannot be rebound); with
+// no entry the refusal stays the generic one.
+func TestWorkOrderBookkeepingBeforeScopeNamesAmendedEntry(t *testing.T) {
+	for _, state := range []string{"queued", "launching", "running"} {
+		f := newRebindFixture(t, state == "running")
+		command := queueRebindCommand(f.task.ID, f.entry.ID)
+		if state == "launching" {
+			f.entry = f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, Host: "mini"})
+			command = queueRequeueCommand(f.task.ID, f.entry.ID)
+		}
+		updated, source := f.amend(t, "one")
+		req := api.WorkOrderBookkeepingRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, OrderMessageSeq: f.order.Seq, SourceMessageSeq: source.Seq, Kind: "decision", QueueEntryID: f.entry.ID}
+		_, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "scope is not confirmed") || !strings.Contains(err.Error(), "entry "+f.entry.ID+" is "+state) || !strings.Contains(err.Error(), command) {
+			t.Fatalf("%s: bookkeeping refusal = %v, want the entry and %q", state, err, command)
+		}
+		// The item with no entry keeps the generic refusal.
+		description := "amended other"
+		other, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.other.ID, api.UpdateWorkItemRequest{Revision: f.other.Revision, Description: &description, ScopeChange: true}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherSource, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "other amendment", RequestID: api.NewID("req"), WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: other.ID, ItemRevision: other.Revision, Relationship: "primary"}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = api.WorkOrderBookkeepingRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: other.Revision, OrderMessageSeq: f.otherOrder.Seq, SourceMessageSeq: otherSource.Seq, Kind: "decision"}
+		_, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, other.ID, req)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "scope is not confirmed") || strings.Contains(err.Error(), "entry ") {
+			t.Fatalf("%s: no-entry refusal = %v", state, err)
+		}
+	}
+}
+
 // a6: a bound agent keeps posting across a rebind. After the item moves on
 // again, its posts linked at the revision it was admitted at and at the
 // revision it was rebound to are both accepted; a revision its binding never
