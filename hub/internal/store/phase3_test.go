@@ -174,6 +174,89 @@ func TestRoleRecipients(t *testing.T) {
 	}
 }
 
+// wi_7ca25711aa94898c (order #43071): role:database_handler for an item whose
+// owner-integrated released entry names a rotated-away handler run follows the
+// committed rotation from that exact run to the live end of the chain; every
+// other case routes or refuses as before.
+func TestItemHandlerRoleFollowsCommittedRotation(t *testing.T) {
+	// entry adds a queue entry for the first item naming h's exact run, released
+	// with owner integration when released is true, and live otherwise.
+	entry := func(t *testing.T, f *rotationFixture, key string, h api.Agent, released bool) string {
+		t.Helper()
+		q, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/" + key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		releasedAt, integration := "", ""
+		if released {
+			releasedAt, integration = ts(time.Now().UTC()), `{"fixture":true}`
+		}
+		if _, err = f.s.db.Exec(`UPDATE team_queue_entries SET state='running',handler_id=?,handler_run_id=?,handler_lease_generation=1,released_at=?,owner_integration_json=? WHERE id=?`, h.ID, h.RunID, releasedAt, integration, q.ID); err != nil {
+			t.Fatal(err)
+		}
+		return q.ID
+	}
+	refused := func(t *testing.T, f *rotationFixture, what string) {
+		t.Helper()
+		m, err := diagSendRole(f, f.worker, "Synthetic request for the item handler")
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact item role run is unavailable") {
+			t.Fatalf("%s: want the exact run refusal, got to=%q %v", what, m.To, err)
+		}
+	}
+	routes := func(t *testing.T, f *rotationFixture, what string, want api.Agent) {
+		t.Helper()
+		m, err := diagSendRole(f, f.worker, "Synthetic request for the item handler")
+		if err != nil || m.To != want.ID {
+			t.Fatalf("%s: want %s, got to=%q %v", what, want.ID, m.To, err)
+		}
+	}
+
+	t.Run("r1 two committed rotations reach the open end", func(t *testing.T) {
+		f := newRotationFixture(t)
+		old := f.old
+		entry(t, f, "r1-two-hops", old, true)
+		s1 := floorRotate(t, f, "r1-first")
+		f.old = s1
+		f.idle(t, s1)
+		s2 := floorRotate(t, f, "r1-second")
+		routes(t, f, "owner-integrated entry after two rotations", s2)
+	})
+
+	t.Run("r2 a closed handler with no committed rotation is refused", func(t *testing.T) {
+		f := newRotationFixture(t)
+		old := f.old
+		f.agent(t, "db-handler-spare", api.AgentRoleDatabaseHandler)
+		entry(t, f, "r2-no-rotation", old, true)
+		if _, err := f.s.CloseAgentRun(context.Background(), old.ID, old.RunID, f.by); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f, "closed handler without a rotation")
+	})
+
+	t.Run("r2 a rotation from another run of the handler is not followed", func(t *testing.T) {
+		f := newRotationFixture(t)
+		old := f.old
+		id := entry(t, f, "r2-stale-run", old, true)
+		floorRotate(t, f, "r2-stale-run")
+		if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET handler_run_id=? WHERE id=?`, "run_fixture_other", id); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, f, "entry naming another run of the rotated handler")
+	})
+
+	t.Run("r3 live entries route as before", func(t *testing.T) {
+		f := newRotationFixture(t)
+		old := f.old
+		successor := floorRotate(t, f, "r3-live")
+		id := entry(t, f, "r3-live", old, false)
+		refused(t, f, "live entry naming the closed old run")
+		if _, err := f.s.db.Exec(`UPDATE team_queue_entries SET handler_id=?,handler_run_id=? WHERE id=?`, successor.ID, successor.RunID, id); err != nil {
+			t.Fatal(err)
+		}
+		routes(t, f, "live entry naming the successor", successor)
+	})
+}
+
 // c12: a BLOCK obliges the lead, not a worker told to wait.
 func TestBlockObligesOnlyTheLead(t *testing.T) {
 	f := newPhase3Fixture(t)

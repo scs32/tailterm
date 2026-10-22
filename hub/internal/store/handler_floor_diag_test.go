@@ -185,13 +185,12 @@ func diagSendRole(f *rotationFixture, from api.Agent, subject string) (api.Messa
 	return f.s.PostMessage(context.Background(), f.task.ID, req, f.by)
 }
 
-// g3 (wi_70e2545bb8a643f0): reproduces as a refusal. A released entry is not
-// a lease (team_queue_scope.go:68), so no rotation moves it, but item role
-// resolution still reads an owner-integrated released entry's handler
-// (phase3.go:264) and refuses its closed run (phase3.go:271) instead of
-// routing role:database_handler to the live successor. A plainly released
-// entry falls through to the primary.
-func TestHandlerFloorDiagG3OwnerIntegratedEntryRoutesToDeadHandler(t *testing.T) {
+// g3 (wi_70e2545bb8a643f0): fixed by wi_7ca25711aa94898c (order #43071). A
+// released entry is not a lease (team_queue_scope.go:68), so no rotation moves
+// it; item role resolution now follows the committed rotation from an
+// owner-integrated released entry's closed handler run to the live successor.
+// A plainly released entry falls through to the primary, as before.
+func TestHandlerFloorDiagG3OwnerIntegratedEntryRoutesToSuccessor(t *testing.T) {
 	for _, integration := range []string{`{"diag":true}`, ""} {
 		name := "owner-integrated"
 		if integration == "" {
@@ -215,14 +214,8 @@ func TestHandlerFloorDiagG3OwnerIntegratedEntryRoutesToDeadHandler(t *testing.T)
 				t.Fatalf("released entry handler after rotation: %s %v", handler, err)
 			}
 			m, err := diagSendRole(f, f.worker, "Synthetic request after the rotation")
-			if integration == "" {
-				if err != nil || m.To != successor.ID {
-					t.Fatalf("plainly released entry: want the successor %s, got to=%q %v", successor.ID, m.To, err)
-				}
-				return
-			}
-			if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "exact item role run is unavailable") {
-				t.Fatalf("owner-integrated entry: today the role resolves to the closed old run and is refused, got to=%q %v", m.To, err)
+			if err != nil || m.To != successor.ID {
+				t.Fatalf("%s entry: want the successor %s, got to=%q %v", name, successor.ID, m.To, err)
 			}
 		})
 	}

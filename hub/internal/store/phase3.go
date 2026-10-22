@@ -254,6 +254,7 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 	}
 	if itemID != "" && (role == api.RoleLead || role == api.RoleDatabaseHandler) {
 		var id, run string
+		var released bool
 		var err error
 		if role == api.RoleLead {
 			err = tx.QueryRowContext(ctx, `SELECT agent_id,run_id FROM item_team_leads WHERE task_id=? AND item_id=? AND state<>'closed'`, task.ID, itemID).Scan(&id, &run)
@@ -261,13 +262,18 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 			// An owner-integrated entry is released but its team may still be
 			// live for post-release checks, so it keeps routing to the handler
 			// that served it. A plainly released entry's team is closed.
-			err = tx.QueryRowContext(ctx, `SELECT handler_id,handler_run_id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('launching','running','failed') AND (released_at='' OR owner_integration_json<>'') ORDER BY position DESC LIMIT 1`, task.ID, itemID).Scan(&id, &run)
+			err = tx.QueryRowContext(ctx, `SELECT handler_id,handler_run_id,released_at<>'' FROM team_queue_entries WHERE task_id=? AND item_id=? AND state IN ('launching','running','failed') AND (released_at='' OR owner_integration_json<>'') ORDER BY position DESC LIMIT 1`, task.ID, itemID).Scan(&id, &run, &released)
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return api.Agent{}, err
 		}
 		if err == nil && id != "" {
 			a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=? AND run_id=?`, task.ID, id, run))
+			if (err != nil || !a.Online || a.Status == api.AgentRetired) && released {
+				if a, err = rotatedItemHandler(ctx, tx, task.ID, id, run); err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return api.Agent{}, err
+				}
+			}
 			if err != nil || !a.Online || a.Status == api.AgentRetired {
 				return api.Agent{}, fmt.Errorf("%w: exact item role run is unavailable", api.ErrConflict)
 			}
@@ -305,6 +311,28 @@ func resolveRole(ctx context.Context, tx *sql.Tx, task api.Task, role, itemID st
 		return a, fmt.Errorf("%w: role:%s cannot be resolved: no running agent holds it", api.ErrConflict, role)
 	}
 	return a, err
+}
+
+// rotatedItemHandler is the live end of a committed rotation from an
+// owner-integrated released entry's exact handler run. A released entry is not
+// a lease, so a committed rotation does not rewrite it; without a committed
+// rotation from that run it returns sql.ErrNoRows and the caller refuses.
+func rotatedItemHandler(ctx context.Context, tx *sql.Tx, taskID, id, run string) (api.Agent, error) {
+	var rotated int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM handler_rotations WHERE task_id=? AND old_agent_id=? AND old_run_id=? AND state='committed'`, taskID, id, run).Scan(&rotated); err != nil {
+		return api.Agent{}, err
+	}
+	if rotated == 0 {
+		return api.Agent{}, sql.ErrNoRows
+	}
+	successor, err := liveSuccessor(ctx, tx, id)
+	if err != nil {
+		return api.Agent{}, err
+	}
+	if successor == "" {
+		return api.Agent{}, sql.ErrNoRows
+	}
+	return scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, taskID, successor))
 }
 
 // messageRole is the role a typed message addresses, or "".
