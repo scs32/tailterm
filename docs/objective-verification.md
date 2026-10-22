@@ -374,11 +374,12 @@ the whole root.
 **Build cache trim by the relay** (wi_dad4e23eb9f43ae1). Go's own five-day
 trim let `build/go1.26.6-darwin-arm64` reach 50 GB by 10-17 and the free-disk
 floor refused every queue launch. On each scheduled sweep pass (the
-`worktreeSweepInterval`, default 1h), the relay unlinks build entries untouched
-for longer than `verificationCacheTrimMaxAge` (default `24h`, floor `2h`), then
-holds the build directories to a size cap (below). Go refreshes a used entry's
-mtime only once it is an hour old, so an entry's mtime can lag its last use by
-up to an hour: under the cap anything a run used in the last 23 hours stays.
+`worktreeSweepInterval`, default 1h), and on an extra pass when space is low
+(below), the relay unlinks build entries untouched for longer than
+`verificationCacheTrimMaxAge` (default `24h`, floor `2h`), then holds the
+build directories to a size cap (below). Go refreshes a used entry's mtime
+only once it is an hour old, so an entry's mtime can lag its last use by up to
+an hour: under the cap anything a run used in the last 23 hours stays.
 The trim is on by default because the root is the harness's own. Set `"verificationCacheTrim": "off"` in
 `~/.config/tailterm/relay.json` to stop it; a value other than `on` or `off`,
 or a relay.json that cannot be read, skips the pass. It is separate from
@@ -410,20 +411,43 @@ or a relay.json that cannot be read, skips the pass. It is separate from
   a missing entry as a miss and rebuilds it, so a concurrent run is slower at
   worst, never wrong. A build directory whose name ends `.tmp` is never opened.
 - **Size cap.** After the age walk, while the build directories still hold
-  more than `verificationCacheTrimMaxGiB` (default 20 GiB), the trim removes
-  the entries the walk kept that are older than 2h, oldest mtime first, until
-  they fit. Entries modified in the last two hours always stay, so, with
-  Go's one-hour refresh, any entry used in the last hour stays; when only
-  those are left the line says `size cap <cap> not reached: the rest is under 2h`.
-  A pass that stopped early skips the cap. Low space does not start a trim or
-  change what goes: when the volume's free space is under the sweep's
+  more than a margin of 75% of `verificationCacheTrimMaxGiB` (default 20 GiB,
+  so 15 GiB), the trim removes the entries the walk kept that are older than
+  2h, oldest mtime first, until they fit the margin. The margin is there
+  because a pass applies the cap only once an hour and builds add to the cache
+  in between: on 10-21 passes left 16.9-17.7 GiB, under the cap and so
+  untouched by it, and 23 GB was measured 26 minutes after one with three race
+  matrix runs building. The 5 GiB left under the default cap covers an hour of
+  builds (the journal's hours on 10-20 and 10-21 added 0.6-1.8 GiB, that busy
+  half hour about 4 GiB). Entries modified in the last two hours always stay,
+  so, with Go's one-hour refresh, any entry used in the last hour stays. When
+  the cap removed entries the line says
+  `size cap <cap>, margin <margin>: removed <n> entries, freed <bytes>`; when
+  only entries under 2h are left above the margin it says
+  `size cap <cap>, margin <margin> not reached: the rest is under 2h`.
+  A pass that stopped early skips the cap. Low space does not change what
+  goes: when the volume's free space is under the sweep's
   `worktreeSweepLowSpaceGiB` as the cap begins, the cap's removals are named
   `low-space` instead of `size-cap`.
+- **Extra pass on low space.** Between scheduled passes, when the scheduled
+  pass is not due, the relay runs an extra pass if the volume holding the root
+  has less free space than `worktreeSweepLowSpaceGiB` and no attempt,
+  scheduled or extra, began in the last 15 minutes. The relay checks every 30
+  seconds and a pass walks the whole cache, so a volume that stays low gets
+  one extra pass every 15 minutes, not one a check. There is none before the
+  first scheduled pass, on a settings fault, or when the root or its free
+  space cannot be read; the scheduled pass journals those. An extra pass takes
+  the same trim lock (a pass already running means no extra pass and no line)
+  and follows the lock rule and the rules above, and it counts as a run, so
+  the next scheduled pass is an interval after it. Its line's detail starts
+  `extra pass: <free> free, under the low-space threshold <threshold>`,
+  skipped lines included; the rules the reason names are unchanged.
 - **Receipt.** Each attempt writes one line to the sweep journal (`tt team
   queue sweep-worktrees --journal`) with source `go-cache-trim`, the root in
-  `lowestVolume`, and either the entries removed and bytes freed or the skip
-  reason. A trimmed line's reason names the rules that removed at least one
-  entry, joined by `+` in this order: `age-bound`, or `lock-time-age` when a
+  `lowestVolume`, and either the entries removed, bytes freed and the build
+  directories' size before and after (`cacheBytesBefore`, `cacheBytesAfter`)
+  or the skip reason. A trimmed line's reason names the rules that removed at
+  least one entry, joined by `+` in this order: `age-bound`, or `lock-time-age` when a
   read of the lock before or during the age walk showed a holder or waiter;
   then `size-cap` or `low-space`. The text form prints it as
   `verification-cache-trim root=<root> ... rule=<reason>`. The low-space

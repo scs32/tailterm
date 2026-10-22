@@ -559,9 +559,9 @@ rules are in `docs/objective-verification.md`. Both read that host's
 | `goBuildCacheTrim` | absent, which is off | `"on"` turns the user cache trim on for this host; `"off"` or no key is off. |
 | `goBuildCacheTrimMaxAge` | `"24h"` | Entries whose modification time is older than this go. A Go duration; at least `2h`. |
 | `goBuildCacheTrimInterval` | `"1h"` | Time between trims, a Go duration; at least `5m`. |
-| `verificationCacheTrim` | absent, which is on | `"off"` turns the verification cache trim off for this host; `"on"` or no key is on. It runs once per sweep pass (`worktreeSweepInterval`). |
+| `verificationCacheTrim` | absent, which is on | `"off"` turns the verification cache trim off for this host; `"on"` or no key is on. It runs once per sweep pass (`worktreeSweepInterval`), plus an extra pass at most every 15 minutes while its volume is under `worktreeSweepLowSpaceGiB`. |
 | `verificationCacheTrimMaxAge` | `"24h"` | Verification build entries whose modification time is older than this go. A Go duration; at least `2h`. |
-| `verificationCacheTrimMaxGiB` | `20` | Size cap, in GiB, of the verification build directories: above it the oldest entries older than 2h also go. A positive JSON number; a bad value uses 20 GiB. |
+| `verificationCacheTrimMaxGiB` | `20` | Size cap, in GiB, of the verification build directories: once they hold more than 75% of it (15 GiB of the default), the oldest entries older than 2h also go until they are back down to that 75% margin. A positive JSON number; a bad value uses 20 GiB. |
 
 `go` refreshes an entry's modification time when it uses the entry and the
 time is more than an hour old, which is why the age cannot be set under 2
@@ -604,9 +604,14 @@ and it never touches the module cache (`~/go/pkg/mod`) or any other cache.
 
 ```json
 {"at":"…","source":"go-cache-trim","outcome":"trimmed","reason":"",
- "filesRemoved":812,"bytesFreed":123,"cacheBytesAfter":456,
- "freeBytesAfter":789,"maxAge":"24h0m0s","lowSpace":false,"durationMs":950}
+ "filesRemoved":812,"bytesFreed":123,"cacheBytesBefore":579,
+ "cacheBytesAfter":456,"freeBytesAfter":789,"maxAge":"24h0m0s",
+ "lowSpace":false,"durationMs":950}
 ```
+
+`--journal` prints a trimmed line as
+`<at> go-cache-trim trimmed files=812 freed=123 B cache-before=579 B cache=456 B free=789 B max-age=24h0m0s`,
+with `cache-before=` only when the line has `cacheBytesBefore`.
 
 The line also carries the sweep's other keys, unused. `outcome` is `trimmed`,
 `skipped` (`settings`, `no-go`, `not-a-cache`) or `failed` (`state`, `walk`).
@@ -614,10 +619,15 @@ The line also carries the sweep's other keys, unused. `outcome` is `trimmed`,
 sizes. `cacheBytesAfter` is the sum of the sizes of the regular files left
 directly inside the two-hex directories, whatever their names; it leaves out
 `README`, `trim.txt`, `fuzz` and anything deeper, and it is file size, not
-disk blocks, so it differs from `du`. `freeBytesAfter` is the free space of
-the cache's own volume, or `-1` when it could not be read. All three counts
-are written when they are zero. `detail` says `stopped early` when the pass's
-time ran out, and counts entries that could not be removed.
+disk blocks, so it differs from `du`. `cacheBytesBefore` is the same files'
+size at the walk's first look, removed ones included. It is set on trim lines
+that walked the cache, from this trim and from the verification cache trim,
+and is absent from other lines and from lines written before it was counted.
+`freeBytesAfter` is the free space of the cache's own volume, or `-1` when it
+could not be read. The three counts `filesRemoved`, `bytesFreed` and
+`cacheBytesAfter` are written when they are zero. `detail` says `stopped
+early` when the pass's time ran out, and counts entries that could not be
+removed.
 
 *Low space.* The trim never posts a message. Its line sets `lowSpace` when the
 cache's volume is below `worktreeSweepLowSpaceGiB`, and the sweep's one notice
