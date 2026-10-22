@@ -6,7 +6,7 @@ import {join,dirname} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
 import {integrateCandidate,publishIntegration,runRelease,liveCheck,runnableJob,HostAdapter,cliRetry,serveDeployment,hostLockNames,retentionPolicy,pruneJournal,rehearsalArgv,failureRehearsal,reconcileHostLocks,revertCommit,moveReleaseRef,tasksHubCheckedOut,releaseError,failureReason,receiptReason,probeDiagnostics,withoutDiagnostics,sameReceipt,validateNativeRelease,pushRelease,pushCauseText,pushGroupState,processStartTime,bootIdentity,startMatch,bootMatch,startedBy,PUSH_REASONS,PUSH_TIMEOUT_MS,PUSH_STOP_GRACE_MS,PUSH_STOP_WAIT_MS,reconcileReceipts,MATRIX_PREREQUISITES,MATRIX_HOST_WAIT_MS,MATRIX_LAUNCH_GRACE_MS,MATRIX_STOP_GRACE_MS,MATRIX_DEADLINE_SLACK_MS,missingPrerequisites,provisionPrerequisites,matrixRunTimeout,matrixPriority,matrixWaitNotice,matrixHeldNotice,fenceWaitNotice,matrixRunUnsettled} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readJournal,updateHostState,pidGone,groupGone,RUN_TIMEOUT_GRACE_MS,DEFAULT_HOLDER_CAP_MS} from "../scripts/verify-matrix-host-lock.mjs";
-import {planRunTimeout,readPrerequisites} from "../scripts/verify-matrix.mjs";
+import {planRunTimeout,readPrerequisites,provisionWorktreePrerequisites} from "../scripts/verify-matrix.mjs";
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
@@ -1155,6 +1155,61 @@ test("p1 the provisioning command prints the prerequisites, or only the named re
  const q=provisionFixture();mkdirSync(join(q.cwd,"node_modules"));writeFileSync(join(q.cwd,"node_modules/.package-lock.json"),"{}");rmSync(join(q.from,".build/go-modules.txt"));
  const r=execFileSync(process.execPath,["-e",`const r=require("child_process").spawnSync(process.execPath,${JSON.stringify([RUNNER,"--provision-prerequisites","--from",q.from])},{cwd:${JSON.stringify(q.cwd)},encoding:"utf8"});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr}))`],{encoding:"utf8"});
  assert.deepEqual(JSON.parse(r),{status:1,stdout:"",stderr:"Missing matrix prerequisites: .build/go-modules.txt\n"});
+});
+// wi_f8650bcc961b78bb: the source's .build/go-licenses tree, keyed by its own
+// copy of the module list, and every file under a tree as path -> bytes.
+const goLicenses=(from,key=readFileSync(join(from,".build/go-modules.txt")))=>{const dir=join(from,".build/go-licenses");mkdirSync(join(dir,"modules/example.com/a"),{recursive:true});writeFileSync(join(dir,"go-modules.txt"),key);writeFileSync(join(dir,"modules/example.com/a/LICENSE"),"licence a");writeFileSync(join(dir,"GOROOT-LICENSE"),"licence go");};
+const treeOf=dir=>{const out={};const walk=rel=>{for(const name of readdirSync(join(dir,rel))){const r=rel?rel+"/"+name:name;if(statSync(join(dir,r)).isDirectory())walk(r);else out[r]=readFileSync(join(dir,r)).toString("base64");}};walk("");return out;};
+const provisioned=(p,lines=[])=>({receipt:provisionPrerequisites(p.cwd,{from:p.from,run:p.run,print:l=>lines.push(l)}),lines});
+test("g1 g3 a copied module list brings the source's go-licenses copies when their key matches, and a second run changes nothing",()=>{
+ const p=provisionFixture();goLicenses(p.from);
+ const {receipt,lines}=provisioned(p);
+ assert.deepEqual(lines,[".build/go-licenses copied: its go-modules.txt matches the copied module list"]);
+ assert.deepEqual(treeOf(join(p.cwd,".build/go-licenses")),treeOf(join(p.from,".build/go-licenses")));assert.equal(Object.keys(treeOf(join(p.cwd,".build/go-licenses"))).length,3);
+ assert.deepEqual(readdirSync(join(p.cwd,".build")).sort(),["go-licenses","go-modules.txt","speech-fixture.wav","test.wasm"],"no temporary copy left");
+ assert.deepEqual(receipt.prerequisites.map(x=>[x.path,x.action]),MATRIX_PREREQUISITES.map((x,i)=>[x,i?"copied":"installed"]));
+ assert.deepEqual(Object.keys(receipt).sort(),["prerequisites","version"]);for(const x of receipt.prerequisites)assert.deepEqual(Object.keys(x).sort(),["action","path","sha256"]);
+ assert.equal(git(p.cwd,"status","--porcelain"),"");
+ const before=treeOf(join(p.cwd,".build"));writeFileSync(join(p.from,".build/go-licenses/modules/example.com/a/LICENSE"),"changed in the source");
+ const again=provisioned(p);
+ assert.deepEqual(again.lines,[]);assert.ok(again.receipt.prerequisites.every(x=>x.action==="present"));
+ assert.deepEqual(treeOf(join(p.cwd,".build")),before,"the second run changes nothing");
+});
+test("g1 g3 a mismatched key or a missing tree copies none of it and names the reason",()=>{
+ const p=provisionFixture();goLicenses(p.from,"fixture another build's list");
+ const mismatched=provisioned(p);
+ assert.deepEqual(mismatched.lines,[".build/go-licenses not copied: its go-modules.txt differs from the copied module list; licence texts come from the module directories the list names"]);
+ assert.ok(!existsSync(join(p.cwd,".build/go-licenses")));assert.equal(mismatched.receipt.prerequisites.at(-1).action,"copied");
+ const q=provisionFixture(),missing=provisioned(q);
+ assert.deepEqual(missing.lines,[".build/go-licenses not copied: the source has no .build/go-licenses/go-modules.txt; licence texts come from the module directories the list names"]);
+ assert.ok(!existsSync(join(q.cwd,".build/go-licenses")));
+ const k=provisionFixture();goLicenses(k.from);rmSync(join(k.from,".build/go-licenses/go-modules.txt"));
+ assert.match(provisioned(k).lines[0],/not copied: the source has no \.build\/go-licenses\/go-modules\.txt/);assert.ok(!existsSync(join(k.cwd,".build/go-licenses")),"no key, no tree");
+ for(const x of [p,q,k])assert.deepEqual(readdirSync(join(x.cwd,".build")).sort(),["go-modules.txt","speech-fixture.wav","test.wasm"]);
+ const c=provisionFixture();mkdirSync(join(c.cwd,"node_modules"));writeFileSync(join(c.cwd,"node_modules/.package-lock.json"),"{}");goLicenses(c.from,"fixture another build's list");
+ const r=spawnSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",c.from],{cwd:c.cwd,encoding:"utf8"});
+ assert.equal(r.status,0);assert.equal(r.stderr,".build/go-licenses not copied: its go-modules.txt differs from the copied module list; licence texts come from the module directories the list names\n");
+ const out=JSON.parse(r.stdout);assert.deepEqual(Object.keys(out).sort(),["prerequisites","version"]);assert.deepEqual(out.prerequisites.map(x=>x.action),["present","copied","copied","copied","copied"]);
+});
+test("g1 g3 an existing target go-licenses tree is left untouched",()=>{
+ const p=provisionFixture();goLicenses(p.from);mkdirSync(join(p.cwd,".build/go-licenses"),{recursive:true});writeFileSync(join(p.cwd,".build/go-licenses/go-modules.txt"),"local list");
+ const {receipt,lines}=provisioned(p);
+ assert.deepEqual(lines,[".build/go-licenses not copied: the checkout already has one; licence texts come from the module directories the list names"]);
+ assert.deepEqual(treeOf(join(p.cwd,".build/go-licenses")),{"go-modules.txt":Buffer.from("local list").toString("base64")});
+ assert.equal(receipt.prerequisites.at(-1).action,"copied");assert.equal(git(p.cwd,"status","--porcelain"),"");
+ // A module list already present is not copied, so its licence tree is not looked at.
+ const q=provisionFixture();goLicenses(q.from);mkdirSync(join(q.cwd,".build"));writeFileSync(join(q.cwd,".build/go-modules.txt"),"local list");
+ assert.deepEqual(provisioned(q).lines,[]);assert.ok(!existsSync(join(q.cwd,".build/go-licenses")));
+});
+test("g1 a matrix run in a linked worktree prints whether the go-licenses copies came",()=>{
+ const checks=[{id:"fixture-browser",argv:["node","fixture.mjs"],environment:{TEST_BROWSER:"both"}}];
+ for(const [key,line] of [[undefined,"matrix run: .build/go-licenses copied: its go-modules.txt matches the copied module list"],["fixture another build's list","matrix run: .build/go-licenses not copied: its go-modules.txt differs from the copied module list; licence texts come from the module directories the list names"]]){
+  const p=provisionFixture();placePrerequisites(p.cwd);goLicenses(p.cwd,key);
+  const wt=join(mkdtempSync(join(tmpdir(),"provision-linked-")),"wt");git(p.cwd,"worktree","add","-q","--detach",wt);
+  const printed=[];provisionWorktreePrerequisites(checks,wt,{installPrerequisites:p.run,hostLock:{print:l=>printed.push(l)}});
+  assert.equal(printed.at(-1),line);assert.equal(printed.length,7);assert.equal(existsSync(join(wt,".build/go-licenses")),key===undefined);
+  assert.equal(git(wt,"status","--porcelain"),"");
+ }
 });
 test("a8 a10 the deployer's run bound is the serial sum under the holder cap, the number the run itself records",async t=>{
  assert.equal(7560000>DEFAULT_HOLDER_CAP_MS,true);assert.equal(matrixRunTimeout(workedPlan),7200000,"the serial sum of 126 minutes is clamped to the cap");
