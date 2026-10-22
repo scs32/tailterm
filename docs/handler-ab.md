@@ -82,6 +82,28 @@ records the handler run's digest and the policy's, and the report flags items
 whose digest differs from the policy's or from every digest the other arms'
 items used.
 
+## Arm handler briefing
+
+An arm handler is briefed as an owner-provisioned auxiliary Database handler
+(`hub/cmd/tt/coordination.go`). Its briefing holds the lease paragraph (work
+only on the item leased to this agent; unallocated intake stays with the
+primary), the queue acceptance briefing, and the shared handler rules, scoped
+to its leased item:
+
+- run `tt obligations` and answer live-team gate REQUESTs before each queued
+  record;
+- read back each committed record, the native evidence-read rules, and the
+  audit-trail, scope-change and completion-tracking rules;
+- the Start evidence rule, with the queue team Start and amendment rules;
+- record evidence on an existing item as a `tt work-items note`.
+
+It leaves out the primary's duties: intake and filing, estimates, readiness
+passes and allocation, lane proposals, shared-path waits and steward routing.
+Each shared rule is one constant that the primary guidance also carries, so a
+change to it reaches both and the template digest covers it. Briefings are
+generated at launch: a running arm handler sees a guidance change only when a
+fresh one is spawned. Arm handlers still do not rotate (D1).
+
 ## Draw and lease
 
 For a queue entry the claim computes `h = SHA-256(seed + "\x00" + entryID)` and

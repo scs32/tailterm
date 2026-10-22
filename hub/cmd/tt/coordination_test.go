@@ -1075,12 +1075,11 @@ func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
 		want                   int
 	}{
 		{"primary handler", primary, rule + " " + accept, 2},
-		{"auxiliary handler", auxiliary, rule, 1},
-		{"auxiliary handler", auxiliary, accept, 1},
+		{"auxiliary handler", auxiliary, rule + " " + accept, 2},
 		{"builder", builder, rule, 1},
 		{"builder", builder, accept, 1},
 		{"primary handler", primary, amended, 2},
-		{"auxiliary handler", auxiliary, amended, 1},
+		{"auxiliary handler", auxiliary, amended, 2},
 		{"builder", builder, amended, 1},
 	} {
 		if n := strings.Count(check.briefing, check.clause); n != check.want {
@@ -1105,6 +1104,53 @@ func TestQueueTeamStartRuleIsSharedByAuditHandlerAndTeamTexts(t *testing.T) {
 	}
 	if !strings.Contains(string(plan), queueTeamStartAmendmentRule) {
 		t.Fatal("team plan bundle does not define a scope amendment")
+	}
+}
+
+// wi_3744e40dbb01dc8a: an auxiliary (leased arm) handler's briefing carries
+// the shared handler guidance once, scoped to its leased item, and leaves out
+// the primary handler's intake, allocation and steward duties. Each shared
+// rule is part of primaryHandlerGuidance, so a change reaches both.
+func TestAuxiliaryHandlerBriefingCarriesSharedGuidance(t *testing.T) {
+	task := api.Task{Name: "Project", Orchestrator: "lead"}
+	roster := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}, {Name: "handler-aux", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}}
+	steward := stewardBriefing{Active: "backlog-steward"}
+	auxiliary := agentTaskBriefingWithSteward(task, "handler-aux", api.AgentRoleDatabaseHandler, "", roster, 0, false, steward)
+	primary := agentTaskBriefingWithSteward(task, "handler", api.AgentRoleDatabaseHandler, "", roster, 0, false, steward)
+	if !strings.Contains(auxiliary, "owner-provisioned auxiliary Database handler") || !strings.Contains(auxiliary, queueHandlerAcceptanceBriefing()) {
+		t.Fatalf("auxiliary briefing lost its lease or acceptance text: %s", auxiliary)
+	}
+	if !strings.HasSuffix(auxiliary, "These handler rules apply to your leased item:"+leasedHandlerGuidance) {
+		t.Fatalf("auxiliary briefing does not end with the leased guidance: %s", auxiliary)
+	}
+	for _, rule := range []string{handlerGateRule, handlerReadBackRule, handlerEvidenceReadRule, handlerAuditRule, handlerStartEvidenceRule, handlerEvidenceRule} {
+		if n := strings.Count(primaryHandlerGuidance, rule); n != 1 {
+			t.Fatalf("primary guidance states a shared rule %d times: %q", n, rule)
+		}
+		if n := strings.Count(leasedHandlerGuidance, rule); n != 1 {
+			t.Fatalf("leased guidance states a shared rule %d times: %q", n, rule)
+		}
+		if n := strings.Count(auxiliary, rule); n != 1 {
+			t.Fatalf("auxiliary briefing states a shared rule %d times: %q", n, rule)
+		}
+	}
+	for _, primaryOnly := range []string{
+		"You are this project's durable Database handler",
+		"Handle intake, lookup, work orders",
+		"For board intake, use the original message sequence as --source-seq",
+		"perform a readiness pass",
+		"Before proposing allocation",
+		handlerEstimateRule,
+		handlerLaneRule,
+		handlerWaitRule,
+		steward.handlerLine(),
+	} {
+		if !strings.Contains(primary, primaryOnly) {
+			t.Fatalf("primary briefing lacks %q", primaryOnly)
+		}
+		if strings.Contains(auxiliary, primaryOnly) {
+			t.Fatalf("auxiliary briefing carries primary-only duty %q", primaryOnly)
+		}
 	}
 }
 
