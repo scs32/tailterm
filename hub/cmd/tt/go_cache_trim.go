@@ -39,8 +39,10 @@ import (
 // Above a margin under its size cap it also removes the oldest entries older
 // than two hours until the build directories fit the margin, and the journal
 // line's reason names the rules that removed entries. Between scheduled
-// passes, while the cache's volume is under the sweep's low-space threshold,
-// an extra pass runs at most every verificationLowSpaceTrimEvery.
+// passes, while the cache's volume is under the sweep's low-space threshold
+// or its build directories measure over the size cap, an extra pass runs at
+// most every verificationLowSpaceTrimEvery, and the cap is measured at most
+// that often.
 
 const (
 	defaultGoCacheTrimMaxAge = 24 * time.Hour
@@ -65,12 +67,18 @@ const (
 	// matrix runs building. 75% of the default cap is 15 GiB, which leaves
 	// 5 GiB for an hour of builds: the journal's hours on 10-20 and 10-21
 	// added 0.6-1.8 GiB between passes, and that busy half hour about 4 GiB.
+	// Faster growth than that is caught by the size check between passes
+	// (verificationExtraDue).
 	verificationTrimMarginPercent = 75
 	// verificationLowSpaceTrimEvery spaces the extra verification passes
 	// that run between scheduled ones while the cache's volume is under the
-	// sweep's low-space threshold. The relay checks every 30 seconds, and a
-	// pass walks the whole cache, so a volume that stays low gets one every
-	// 15 minutes, not one a check.
+	// sweep's low-space threshold or its build directories measure over the
+	// size cap, and the size checks between them. The relay checks every 30
+	// seconds, and a pass or a size check walks the whole cache, so a volume
+	// that stays low or a cache that stays over its cap gets one every 15
+	// minutes, not one a check. On 10-22 the cache grew from 15 GiB to 21 GiB
+	// in about 12 minutes with four teams building, and with 15 GiB free no
+	// low-space pass came.
 	verificationLowSpaceTrimEvery = 15 * time.Minute
 	// minGoCacheTrimMaxAge is the least age: go refreshes an entry's mtime
 	// only when it is more than an hour old.
@@ -210,8 +218,11 @@ func readVerificationTrimSettings() (goCacheTrimSettings, string) {
 type goCacheTrimState struct {
 	// LastRunAt is the last trimmed run; LastAttemptAt also counts skipped
 	// and failed attempts.
-	LastRunAt       time.Time `json:"lastRunAt"`
-	LastAttemptAt   time.Time `json:"lastAttemptAt"`
+	LastRunAt     time.Time `json:"lastRunAt"`
+	LastAttemptAt time.Time `json:"lastAttemptAt"`
+	// LastSizeCheckAt is the verification trim's last measure of its build
+	// directories between passes, which spaces the next.
+	LastSizeCheckAt time.Time `json:"lastSizeCheckAt,omitzero"`
 	FilesRemoved    int64     `json:"filesRemoved"`
 	BytesFreed      int64     `json:"bytesFreed"`
 	CacheBytesAfter int64     `json:"cacheBytesAfter"`
@@ -650,6 +661,9 @@ type goCacheTrimDeps struct {
 	// matrixLock reads the host lock: the matrix runs that hold or wait for
 	// it, or why it cannot be read or trusted, which forbids a trim.
 	matrixLock func() (runs int, unreadable string)
+	// buildBytes measures the root's build directories for the size check
+	// between passes; nil is verificationBuildBytes.
+	buildBytes func(root string) (int64, error)
 }
 
 // nativeGoCacheDir asks go for the build cache and the module cache. There is
@@ -683,6 +697,7 @@ func nativeGoCacheTrimDeps() goCacheTrimDeps {
 		verificationRoot:     func() (string, error) { return nativeVerificationCacheRoot() },
 		goEnv:                func(ctx context.Context) (verificationGoEnv, error) { return nativeVerificationGoEnv(ctx) },
 		matrixLock:           verificationTrimMatrixLock,
+		buildBytes:           verificationBuildBytes,
 	}
 }
 
@@ -1308,8 +1323,10 @@ func (p *verificationTrimPass) removeCandidate(cache *goCacheHandle, c verificat
 // cache, with its own lock file, state record and fault gate. Every line it
 // writes has source goCacheTrimSource and names the root in lowestVolume. A
 // run is due an interval after the last one, or sooner when
-// verificationLowSpaceDue says so; such an extra pass takes the same locks,
-// counts as a run and says why in its line's detail.
+// verificationExtraDue says so; such an extra pass takes the same locks,
+// counts as a run and says why in its line's detail. A size check that finds
+// the build directories under the cap records only its time and writes no
+// line.
 func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	now := d.now()
 	started := time.Now()
@@ -1362,8 +1379,20 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	}
 	var extra string
 	if !goCacheTrimDue(last, settings.Interval, now) {
-		if extra = verificationLowSpaceDue(d, last, settings, fault, now); extra == "" {
-			return false
+		var measured bool
+		if extra, measured = verificationExtraDue(d, last, settings, fault, now); extra == "" {
+			if !measured {
+				return false
+			}
+			// An under-cap check records only its own time, for the spacing.
+			err = updateSweepState(func(s *sweepState) error {
+				if s.GoCacheTrim != nil && s.GoCacheTrim.Verification != nil {
+					s.GoCacheTrim.Verification.LastSizeCheckAt = now.UTC()
+				}
+				return nil
+			})
+			_, wrote := stateFault(stateFaultSave, err, "")
+			return wrote
 		}
 	}
 	err = updateSweepState(func(s *sweepState) error {
@@ -1452,23 +1481,115 @@ func verificationTrimAttempt(ctx context.Context, d goCacheTrimDeps) bool {
 	return true
 }
 
-// verificationLowSpaceDue says why an extra verification pass is due before
-// the scheduled one, or "": the volume holding the root has less free space
-// than the sweep's low-space threshold, and no attempt, scheduled or extra,
-// began in the last verificationLowSpaceTrimEvery. A settings fault, or a root
-// or free space that cannot be read, is no reason: the scheduled pass journals
-// those.
-func verificationLowSpaceDue(d goCacheTrimDeps, last *goCacheTrimState, settings goCacheTrimSettings, fault string, now time.Time) string {
+// verificationExtraDue says why an extra verification pass is due before the
+// scheduled one, or "", and whether it measured the build directories. No
+// attempt, scheduled or extra, may have begun in the last
+// verificationLowSpaceTrimEvery. Then the pass is due when the volume holding
+// the root has less free space than the sweep's low-space threshold, which
+// takes precedence; or, with a size cap and no size check in the last
+// verificationLowSpaceTrimEvery, when the build directories measure over the
+// cap. A settings fault or a root that cannot be named is no reason, free
+// space that cannot be read is no low-space reason, and a size that cannot be
+// read is no over-cap one: the scheduled pass journals those.
+func verificationExtraDue(d goCacheTrimDeps, last *goCacheTrimState, settings goCacheTrimSettings, fault string, now time.Time) (string, bool) {
 	if fault != "" || last == nil || now.Sub(last.LastAttemptAt) < verificationLowSpaceTrimEvery {
-		return ""
+		return "", false
 	}
 	root, err := d.verificationRoot()
 	if err != nil {
-		return ""
+		return "", false
 	}
-	free, err := d.freeBytes(root)
-	if err != nil || free >= settings.LowSpaceBytes {
-		return ""
+	if free, err := d.freeBytes(root); err == nil && free < settings.LowSpaceBytes {
+		return fmt.Sprintf("extra pass: %s free, under the low-space threshold %s", humanBytes(free), humanBytes(settings.LowSpaceBytes)), false
 	}
-	return fmt.Sprintf("extra pass: %s free, under the low-space threshold %s", humanBytes(free), humanBytes(settings.LowSpaceBytes))
+	if settings.MaxBytes <= 0 || now.Sub(last.LastSizeCheckAt) < verificationLowSpaceTrimEvery {
+		return "", false
+	}
+	measure := d.buildBytes
+	if measure == nil {
+		measure = verificationBuildBytes
+	}
+	size, err := measure(root)
+	if err != nil || size <= settings.MaxBytes {
+		return "", true
+	}
+	return fmt.Sprintf("extra pass: build directories hold %s, over the size cap %s", humanBytes(size), humanBytes(settings.MaxBytes)), true
+}
+
+// verificationBuildBytes is the size check's one stat walk: the apparent size
+// of the regular files directly inside the two-hex directories of each
+// directory in <root>/build, as a pass counts them, with no file opened and
+// no symlink followed. A build directory under construction (a name ending
+// .tmp) is not counted. It does not apply the pass's marker rules, so it may
+// count a directory the pass leaves alone; then the pass trims nothing there
+// and the check comes again only after verificationLowSpaceTrimEvery.
+func verificationBuildBytes(root string) (int64, error) {
+	handle, err := openGoBuildCache(root)
+	if err != nil {
+		return 0, err
+	}
+	defer handle.close()
+	build, err := openGoCacheDirectory(handle.root, "build")
+	if err != nil || build == nil {
+		return 0, err
+	}
+	defer build.Close()
+	names, err := rootNames(build)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, name := range names {
+		if strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		cache, err := openGoCacheDirectory(build, name)
+		if err != nil {
+			return 0, err
+		}
+		if cache == nil {
+			continue
+		}
+		size, err := goCacheEntryBytes(cache)
+		_ = cache.Close()
+		if err != nil {
+			return 0, err
+		}
+		total += size
+	}
+	return total, nil
+}
+
+// goCacheEntryBytes sums the regular files directly inside one build
+// directory's two-hex directories. A name that goes during the walk is not
+// counted.
+func goCacheEntryBytes(cache *os.Root) (int64, error) {
+	names, err := rootNames(cache)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, name := range names {
+		if !isTwoHex(name) {
+			continue
+		}
+		sub, err := openGoCacheDirectory(cache, name)
+		if err != nil {
+			return 0, err
+		}
+		if sub == nil {
+			continue
+		}
+		entries, err := rootNames(sub)
+		for _, entry := range entries {
+			if info, lerr := sub.Lstat(entry); lerr == nil && info.Mode().IsRegular() {
+				total += info.Size()
+			}
+		}
+		_ = sub.Close()
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
 }

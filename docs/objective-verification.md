@@ -375,8 +375,9 @@ the whole root.
 trim let `build/go1.26.6-darwin-arm64` reach 50 GB by 10-17 and the free-disk
 floor refused every queue launch. On each scheduled sweep pass (the
 `worktreeSweepInterval`, default 1h), and on an extra pass when space is low
-(below), the relay unlinks build entries untouched for longer than
-`verificationCacheTrimMaxAge` (default `24h`, floor `2h`), then holds the
+or the build directories are over their size cap (below), the relay unlinks
+build entries untouched for longer than `verificationCacheTrimMaxAge`
+(default `24h`, floor `2h`), then holds the
 build directories to a size cap (below). Go refreshes a used entry's mtime
 only once it is an hour old, so an entry's mtime can lag its last use by up to
 an hour: under the cap anything a run used in the last 23 hours stays.
@@ -419,7 +420,9 @@ or a relay.json that cannot be read, skips the pass. It is separate from
   untouched by it, and 23 GB was measured 26 minutes after one with three race
   matrix runs building. The 5 GiB left under the default cap covers an hour of
   builds (the journal's hours on 10-20 and 10-21 added 0.6-1.8 GiB, that busy
-  half hour about 4 GiB). Entries modified in the last two hours always stay,
+  half hour about 4 GiB). Between scheduled passes the cap is also checked
+  at most every 15 minutes, and a cache over it gets an extra pass (below).
+  Entries modified in the last two hours always stay,
   so, with Go's one-hour refresh, any entry used in the last hour stays. When
   the cap removed entries the line says
   `size cap <cap>, margin <margin>: removed <n> entries, freed <bytes>`; when
@@ -429,23 +432,37 @@ or a relay.json that cannot be read, skips the pass. It is separate from
   goes: when the volume's free space is under the sweep's
   `worktreeSweepLowSpaceGiB` as the cap begins, the cap's removals are named
   `low-space` instead of `size-cap`.
-- **Extra pass on low space.** Between scheduled passes, when the scheduled
-  pass is not due, the relay runs an extra pass if the volume holding the root
-  has less free space than `worktreeSweepLowSpaceGiB` and no attempt,
-  scheduled or extra, began in the last 15 minutes. The relay checks every 30
-  seconds and a pass walks the whole cache, so a volume that stays low gets
-  one extra pass every 15 minutes, not one a check. There is none before the
-  first scheduled pass, on a settings fault, or when the root or its free
-  space cannot be read; the scheduled pass journals those. An extra pass takes
-  the same trim lock (a pass already running means no extra pass and no line)
-  and follows the lock rule and the rules above. A trimmed extra pass counts
-  as a run, so the next scheduled pass is an interval after it. A skipped one
-  records only an attempt, so the scheduled pass stays due an interval after
-  the last run, but not sooner than 5 minutes after that attempt. The detail
-  of a trimmed or skipped extra pass line starts
-  `extra pass: <free> free, under the low-space threshold <threshold>`; a
+- **Extra pass on low space or over the cap.** Between scheduled passes,
+  when the scheduled pass is not due and no attempt, scheduled or extra, began
+  in the last 15 minutes, the relay runs an extra pass if the volume holding
+  the root has less free space than `worktreeSweepLowSpaceGiB`, or else if
+  the build directories measure over the size cap (wi_f941b49e31cd9b4a: on
+  10-22 the cache grew from 15 GiB to 21 GiB in about 12 minutes with four
+  teams building and 15 GiB free, so no low-space pass came). The cap is
+  checked at most every 15 minutes between scheduled passes: the check is one
+  stat walk of the regular files in the build directories' two-hex
+  directories, as a pass counts them (a `.tmp` directory is not counted), and
+  its time is recorded, so the relay's 30-second checks do not walk again. A
+  check that finds the build directories at or under the cap writes no line
+  and moves neither the last run nor the last attempt. The relay checks every
+  30 seconds and a pass walks the whole cache, so a volume that stays low, or
+  a cache that stays over its cap, gets one extra pass every 15 minutes, not
+  one a check. There is none before the first scheduled pass, on a settings
+  fault, or when the root cannot be named; free space that cannot be read
+  brings no low-space pass, and a cap of 0 or a size that cannot be read
+  brings no over-cap pass. The scheduled pass journals those. An extra pass
+  takes the same trim lock (a pass already running means no extra pass and no
+  line) and follows the lock rule and the rules above, including the trim to
+  the margin. A trimmed extra pass counts as a run, so the next scheduled pass is
+  an interval after it. A skipped one records only an attempt, so the
+  scheduled pass stays due an interval after the last run, but not sooner
+  than 5 minutes after that attempt. The detail of a trimmed or skipped extra
+  pass line starts
+  `extra pass: <free> free, under the low-space threshold <threshold>` on low
+  space, which takes precedence when both apply, or
+  `extra pass: build directories hold <size>, over the size cap <cap>`; a
   failed walk line carries only the walk error. The rules the reason names
-  are unchanged.
+  are unchanged, and the line carries `durationMs` as every line does.
 - **Receipt.** Each attempt writes one line to the sweep journal (`tt team
   queue sweep-worktrees --journal`) with source `go-cache-trim`, the root in
   `lowestVolume`, and either the entries removed, bytes freed and the build

@@ -2128,3 +2128,154 @@ func TestGoCacheTrimVerificationBeforeFieldOldLines(t *testing.T) {
 		t.Fatalf("sweep line %s: %v", encoded, err)
 	}
 }
+
+// v1-v3 (wi_f941b49e31cd9b4a): between scheduled passes, build directories
+// over the size cap bring an extra pass at the next 15-minute check, with the
+// over-cap detail and the margin trim, even with space to spare. A check under
+// the cap writes no line and moves no pass time, and checks are at most one
+// stat walk per verificationLowSpaceTrimEvery. Low space keeps precedence.
+func TestGoCacheTrimVerificationOverCapExtraPass(t *testing.T) {
+	f := newVerificationFixture(t)
+	f.vsettings.MaxBytes = 800
+	walks := 0
+	f.deps.buildBytes = func(root string) (int64, error) {
+		walks++
+		if root != f.vroot {
+			t.Fatalf("measured %s, want the root %s", root, f.vroot)
+		}
+		return verificationBuildBytes(root)
+	}
+	start := f.now
+	first := f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 300, 5*time.Hour)
+	if !f.attempt() || len(verificationLines(t)) != 1 || walks != 0 {
+		t.Fatalf("scheduled pass: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	requireExists(t, first, true)
+
+	// Builds add 600 B: 900 B is over the 800 B cap, but within 15 minutes of
+	// the pass nothing is measured.
+	second := f.ventry("ab/"+strings.Repeat("2", 64)+"-a", 300, 4*time.Hour)
+	third := f.ventry("ac/"+strings.Repeat("3", 64)+"-a", 300, 3*time.Hour)
+	f.now = start.Add(10 * time.Minute)
+	if f.attempt() || len(verificationLines(t)) != 1 || walks != 0 {
+		t.Fatalf("within the interval: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+
+	// At the 15-minute tick, with 100 GiB free: one walk, and an extra pass
+	// that trims to the 600 B margin.
+	f.now = start.Add(15 * time.Minute)
+	if !f.attempt() || len(verificationLines(t)) != 2 || walks != 1 {
+		t.Fatalf("no over-cap extra pass: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	requireExists(t, first, false)
+	requireExists(t, second, true)
+	requireExists(t, third, true)
+	line := lastVerificationLine(t)
+	if line.Outcome != "trimmed" || line.Reason != verificationRuleSizeCap || line.LowSpace || *line.FilesRemoved != 1 ||
+		*line.CacheBytesBefore != 900 || *line.CacheBytesAfter != 600 ||
+		line.Detail != "extra pass: build directories hold 900 B, over the size cap 800 B; size cap 800 B, margin 600 B: removed 1 entries, freed 300 B" {
+		t.Fatalf("over-cap extra pass: %+v", line)
+	}
+	data, err := os.ReadFile(sweepJournalPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if last := raw[len(raw)-1]; !strings.Contains(last, `"lowestVolume":"`+f.vroot+`"`) || !strings.Contains(last, `"durationMs":`) {
+		t.Fatalf("no durationMs on the extra pass line: %s", last)
+	}
+	state, _ := loadSweepState()
+	if v := state.GoCacheTrim.Verification; !v.LastRunAt.Equal(f.now) || !v.LastAttemptAt.Equal(f.now) {
+		t.Fatalf("an over-cap extra pass is a run: %+v", v)
+	}
+	ran := f.now
+
+	// Under the cap 20 minutes later: one walk, no line, and only the check
+	// time moves.
+	f.now = start.Add(35 * time.Minute)
+	if f.attempt() || len(verificationLines(t)) != 2 || walks != 2 {
+		t.Fatalf("under the cap: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	state, _ = loadSweepState()
+	if v := state.GoCacheTrim.Verification; !v.LastRunAt.Equal(ran) || !v.LastAttemptAt.Equal(ran) || !v.LastSizeCheckAt.Equal(f.now) {
+		t.Fatalf("an under-cap check moved the pass times: %+v", v)
+	}
+
+	// Relay ticks within 15 minutes of that check do not walk again, even
+	// once the cache is over the cap.
+	fourth := f.ventry("ad/"+strings.Repeat("4", 64)+"-a", 300, 3*time.Hour)
+	for _, after := range []time.Duration{30 * time.Second, 5 * time.Minute, 14*time.Minute + 59*time.Second} {
+		f.now = start.Add(35*time.Minute + after)
+		if f.attempt() || len(verificationLines(t)) != 2 || walks != 2 {
+			t.Fatalf("a check %v after the last: lines %d, walks %d", after, len(verificationLines(t)), walks)
+		}
+	}
+
+	// The next tick measures 900 B and trims.
+	f.now = start.Add(50 * time.Minute)
+	if !f.attempt() || len(verificationLines(t)) != 3 || walks != 3 {
+		t.Fatalf("no extra pass at the next tick: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	requireExists(t, second, false)
+	requireExists(t, fourth, true)
+	if line := lastVerificationLine(t); !strings.HasPrefix(line.Detail, "extra pass: build directories hold 900 B, over the size cap 800 B; ") {
+		t.Fatalf("second over-cap pass: %+v", line)
+	}
+
+	// Over the cap and low on space: the low-space trigger and its text win,
+	// with no walk.
+	f.ventry("ae/"+strings.Repeat("5", 64)+"-a", 300, 3*time.Hour)
+	f.free = 1 << 30
+	f.now = start.Add(65 * time.Minute)
+	if !f.attempt() || len(verificationLines(t)) != 4 || walks != 3 {
+		t.Fatalf("low space and over the cap: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	if line := lastVerificationLine(t); line.Reason != verificationRuleLowSpace ||
+		!strings.HasPrefix(line.Detail, "extra pass: 1.0 GiB free, under the low-space threshold 8.0 GiB; ") {
+		t.Fatalf("low space first: %+v", line)
+	}
+
+	// No cap, or a settings fault: no walk and no pass.
+	f.free = 100 << 30
+	f.ventry("af/"+strings.Repeat("6", 64)+"-a", 900, 3*time.Hour)
+	f.vsettings.MaxBytes = 0
+	f.now = start.Add(85 * time.Minute)
+	if f.attempt() || len(verificationLines(t)) != 4 || walks != 3 {
+		t.Fatalf("no cap: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+	f.vsettings.MaxBytes = 800
+	f.vfault = "verificationCacheTrim is neither \"on\" nor \"off\""
+	if f.attempt() || len(verificationLines(t)) != 4 || walks != 3 {
+		t.Fatalf("settings fault: lines %d, walks %d", len(verificationLines(t)), walks)
+	}
+}
+
+// v2: the size check's walk counts the regular files in the two-hex
+// directories of every build directory, as a pass does, and not a directory
+// under construction, a symlink or anything outside the two-hex directories.
+func TestGoCacheTrimVerificationBuildBytes(t *testing.T) {
+	f := newVerificationFixture(t)
+	f.ventry("aa/"+strings.Repeat("1", 64)+"-a", 300, time.Hour)
+	f.ventry("ab/"+strings.Repeat("2", 64)+"-d", 200, time.Hour)
+	other := f.buildDir("go1.26.5-darwin-arm64")
+	f.file(filepath.Join(other, "0f", strings.Repeat("3", 64)+"-a"), 50, time.Hour)
+	f.file(filepath.Join(f.vroot, "build", "go1.27.0-darwin-arm64.tmp", "aa", strings.Repeat("4", 64)+"-a"), 1000, time.Hour)
+	f.file(filepath.Join(f.root, "outside", "big"), 5000, time.Hour)
+	if err := os.MkdirAll(filepath.Join(f.build, "ac"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for target, link := range map[string]string{
+		filepath.Join(f.root, "outside", "big"): filepath.Join(f.build, "ac", strings.Repeat("5", 64)+"-a"),
+		filepath.Join(f.root, "outside"):        filepath.Join(f.vroot, "build", "linked"),
+	} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := verificationBuildBytes(f.vroot); err != nil || got != 550 {
+		t.Fatalf("measured %d, %v; want 550", got, err)
+	}
+	if got, err := verificationBuildBytes(filepath.Join(f.root, "absent")); err == nil {
+		t.Fatalf("an absent root measured %d with no error", got)
+	}
+}
