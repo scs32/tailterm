@@ -438,10 +438,14 @@ or a relay.json that cannot be read, skips the pass. It is separate from
   first scheduled pass, on a settings fault, or when the root or its free
   space cannot be read; the scheduled pass journals those. An extra pass takes
   the same trim lock (a pass already running means no extra pass and no line)
-  and follows the lock rule and the rules above, and it counts as a run, so
-  the next scheduled pass is an interval after it. Its line's detail starts
-  `extra pass: <free> free, under the low-space threshold <threshold>`,
-  skipped lines included; the rules the reason names are unchanged.
+  and follows the lock rule and the rules above. A trimmed extra pass counts
+  as a run, so the next scheduled pass is an interval after it. A skipped one
+  records only an attempt, so the scheduled pass stays due an interval after
+  the last run, but not sooner than 5 minutes after that attempt. The detail
+  of a trimmed or skipped extra pass line starts
+  `extra pass: <free> free, under the low-space threshold <threshold>`; a
+  failed walk line carries only the walk error. The rules the reason names
+  are unchanged.
 - **Receipt.** Each attempt writes one line to the sweep journal (`tt team
   queue sweep-worktrees --journal`) with source `go-cache-trim`, the root in
   `lowestVolume`, and either the entries removed, bytes freed and the build
