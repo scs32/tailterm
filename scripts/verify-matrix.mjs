@@ -17,6 +17,7 @@ import {
   renameSync,
   readlinkSync,
   copyFileSync,
+  cpSync,
   constants,
 } from "node:fs";
 import { resolve, relative, join, isAbsolute, dirname, basename } from "node:path";
@@ -1142,10 +1143,43 @@ export const missingPrerequisites = (cwd) => MATRIX_PREREQUISITES.filter((p) => 
 // the same reasons.
 const reasonError = (reason) => Object.assign(new Error(reason), { releaseReason: reason });
 const prerequisiteError = (names) => reasonError("Missing matrix prerequisites: " + names.join(", "));
+// build-wasm.sh writes the module list's licence texts here, keyed by its own
+// copy of the list; package-static uses them only while that key matches.
+const GO_LICENSES = ".build/go-licenses";
+// wi_f8650bcc961b78bb / order #43273: a copied module list brings the source's
+// licence texts when the source's key matches it, so the worktree does not
+// depend on the source's module directories. All or nothing, never over an
+// existing tree; otherwise package-static falls back to those directories.
+function copyGoLicenses(cwd, source, print) {
+  const target = join(cwd, GO_LICENSES);
+  let skip;
+  try { lstatSync(target); skip = "the checkout already has one"; } catch {}
+  if (!skip) {
+    let key;
+    try { key = readFileSync(join(source, GO_LICENSES, "go-modules.txt")); } catch { skip = "the source has no " + GO_LICENSES + "/go-modules.txt"; }
+    if (key && !key.equals(readFileSync(join(cwd, ".build/go-modules.txt")))) skip = "its go-modules.txt differs from the copied module list";
+  }
+  if (!skip) {
+    // Copied whole under a temporary name, then renamed into place.
+    const temp = join(cwd, ".build", `go-licenses.${process.pid}.tmp`);
+    try {
+      cpSync(join(source, GO_LICENSES), temp, { recursive: true, force: false, errorOnExist: true });
+      renameSync(temp, target);
+      print(GO_LICENSES + " copied: its go-modules.txt matches the copied module list");
+      return;
+    } catch (error) {
+      rmSync(temp, { recursive: true, force: true });
+      skip = "copying failed: " + (error.code || error.message);
+    }
+  }
+  print(GO_LICENSES + " not copied: " + skip + "; licence texts come from the module directories the list names");
+}
+
 // Provisioning (tt deployment setup): npm ci when the install marker is
-// missing, then every other missing file is copied from the source checkout.
-// An existing file is never overwritten.
-export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), { cwd: dir, stdio: "ignore", timeout: 900000 }) } = {}) {
+// missing, then every other missing file is copied from the source checkout,
+// with the licence texts that match a copied module list (print says whether
+// they came). An existing file is never overwritten.
+export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), { cwd: dir, stdio: "ignore", timeout: 900000 }), print = (line) => process.stderr.write(line + "\n") } = {}) {
   let source;
   try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
   if (!source || source === realpathSync(cwd)) throw reasonError("Prerequisite source must be another absolute checkout");
@@ -1164,6 +1198,7 @@ export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFil
     actions.set(p, "copied");
   }
   if (missing.length) throw prerequisiteError(missing);
+  if (actions.get(".build/go-modules.txt") === "copied") copyGoLicenses(cwd, source, print);
   if (git(cwd, "status", "--porcelain")) throw reasonError("Prerequisite provisioning changed the checkout");
   return { version: 1, prerequisites: MATRIX_PREREQUISITES.map((p) => ({ path: p, sha256: createHash("sha256").update(readFileSync(join(cwd, p))).digest("hex"), action: actions.get(p) })) };
 }
@@ -1181,19 +1216,22 @@ export function provisionWorktreePrerequisites(checks, cwd, options = {}) {
   const from = main[0].slice("worktree ".length);
   if (from === realpathSync(cwd)) return;
   if (git(cwd, "status", "--porcelain", "--untracked-files=normal")) return;
+  const print = options.hostLock?.print ?? console.log;
+  const notes = [];
   let provisioned;
   try {
     provisioned = provisionPrerequisites(cwd, {
       from,
+      print: (line) => notes.push(line),
       ...(options.installPrerequisites ? { run: options.installPrerequisites } : {}),
     });
   } catch (error) {
     throw new Error(error.message);
   }
-  const print = options.hostLock?.print ?? console.log;
   print("matrix run: provisioned prerequisites from " + from);
   for (const entry of provisioned.prerequisites)
     print(`matrix run: prerequisite ${entry.path} ${entry.action} ${entry.sha256}`);
+  for (const note of notes) print("matrix run: " + note);
 }
 
 // Go makes module-cache directories read-only. Only walk the exact home this

@@ -354,12 +354,18 @@ handler. Three things make that run succeed or fail for a named reason
   file. All five are gitignored, and a checkout left dirty is refused. It prints
   each path with its sha256 and `present`, `copied` or `installed`, and fails,
   spawning nothing, with `Missing matrix prerequisites: PATHS` naming every file
-  missing from both checkouts. It is idempotent. The Playwright engines stay a
-  host prerequisite, and `.build/go-modules.txt` names module directories in the
-  source checkout's `.build/go`, which must remain there. Rebuild the source's
-  WASM files (`npm run build:wasm -- --test`) when WASM source changes; the
-  matrix's `wasm-test-build` check rebuilds them anyway when that group is
-  selected. For an existing deployer checkout, run the provisioning command
+  missing from both checkouts. It is idempotent. A copied
+  `.build/go-modules.txt` brings the source's `.build/go-licenses/` licence
+  copies with it, whole, only when the source's
+  `.build/go-licenses/go-modules.txt` matches the copied list byte for byte and
+  the checkout has no `.build/go-licenses/` yet; it is never written over.
+  Otherwise none of that tree is copied and the command says why on stderr (the
+  matrix run prints it too). Then the licence texts come from the module
+  directories the list names in the source checkout's `.build/go`, which must
+  remain there. The Playwright engines stay a host prerequisite. Rebuild the
+  source's WASM files (`npm run build:wasm -- --test`) when WASM source
+  changes; the matrix's `wasm-test-build` check rebuilds them anyway when that
+  group is selected. For an existing deployer checkout, run the provisioning command
   above in it (deployer retired between releases). Before the matrix runs, the
   runner checks the same five files and refuses a missing one by name.
 - **Bound.** The run's bound is the one every holder of the verification host
