@@ -34,8 +34,11 @@ const doctorNow = "2026-09-30T19:00:00Z"
 func newDoctorHost(t *testing.T) *doctorHost {
 	t.Helper()
 	root := t.TempDir()
+	// The fakes answer at once, but a loaded race run can stall one past the
+	// product's 10 s, and a timed-out tool reads as missing. Tests of the
+	// timeout itself set their own short bound.
 	h := &doctorHost{t: t, home: filepath.Join(root, "home"), repo: filepath.Join(root, "repo"), bin: filepath.Join(root, "bin"), root: filepath.Join(root, "sys"),
-		log: filepath.Join(root, "calls.log"), env: map[string]string{}, goos: "darwin", codexHook: true, freeMiB: 20000, timeout: 5 * time.Second}
+		log: filepath.Join(root, "calls.log"), env: map[string]string{}, goos: "darwin", codexHook: true, freeMiB: 20000, timeout: 30 * time.Second}
 	for _, dir := range []string{h.home, h.repo, h.bin, h.root} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
