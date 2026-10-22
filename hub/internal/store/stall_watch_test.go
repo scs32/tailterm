@@ -1073,6 +1073,136 @@ func TestStallWatchNeverQuiet(t *testing.T) {
 }
 
 // p7: membership is bound to this admission.
+// typed posts a typed message from the agent's exact run to another agent.
+func (f *stallFixture) typed(from, to api.Agent, replyTo int64, env api.Envelope) api.Message {
+	f.t.Helper()
+	env.To = to.Name
+	m, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{AgentID: from.ID, RunID: from.RunID, To: to.ID, ReplyTo: replyTo, Envelope: &env}, stallOwner)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return m
+}
+
+var (
+	stallRequest = api.Envelope{Kind: api.EnvelopeKindRequest, Subject: "Approve the matrix line for the candidate", Body: api.EnvelopeBody{Ask: "approve the matrix line"}}
+	stallBlock   = api.Envelope{Kind: api.EnvelopeKindBlock, Subject: "Waiting for the owner to approve the matrix line",
+		Body: api.EnvelopeBody{Reason: "the matrix line needs the owner", Needs: "the owner's approval", ResumeWhen: "the owner approves the matrix line"}}
+)
+
+// wi_363c6bde9126fb4e: an open obligation a member holds or sent, one
+// answered with a typed BLOCK included, is a planned wait, as in the queue's
+// idle-entry rule; its close starts the quiet time afresh.
+func TestStallWatchTeamPlannedWait(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	build := func(t *testing.T) (*stallFixture, string, api.Agent, api.Agent) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.state(lead, "idle")
+		return f, entry, lead, h
+	}
+	t.Run("request answered with a BLOCK", func(t *testing.T) {
+		f, _, lead, h := build(t)
+		req := f.typed(lead, h, 0, stallRequest)
+		f.advance(5 * time.Minute)
+		f.typed(h, lead, req.Seq, stallBlock)
+		if got := f.count(`SELECT count(*) FROM obligations WHERE message_seq=? AND state=?`, req.Seq, api.ObligationBlocked); got != 1 {
+			t.Fatalf("blocked obligations = %d, want 1", got)
+		}
+		for i := 0; i < 8; i++ {
+			f.advance(15 * time.Minute)
+			f.none("a member's request answered with a BLOCK")
+		}
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened during the planned wait")
+		}
+	})
+	t.Run("owner-gated block, then its close", func(t *testing.T) {
+		f, entry, lead, h := build(t)
+		// A BLOCK that is not a reply obliges the project orchestrator, here
+		// the helper, who waits on the owner.
+		f.exec(`UPDATE tasks SET orchestrator=? WHERE id=?`, h.Name, f.task.ID)
+		block := f.typed(lead, h, 0, stallBlock)
+		const open = `SELECT count(*) FROM obligations WHERE message_seq=? AND needs<>? AND state<>?`
+		if got := f.count(open, block.Seq, api.ObligationNeedsDelivery, api.ObligationClosed); got != 1 {
+			t.Fatalf("open BLOCK obligations = %d, want 1", got)
+		}
+		for i := 0; i < 8; i++ {
+			f.advance(15 * time.Minute)
+			f.none("a member's BLOCK waits for the owner")
+		}
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened during the planned wait")
+		}
+		// The owner approves and the helper's answer closes the BLOCK; no
+		// member posts, so only the close restarts the quiet time.
+		f.typed(h, lead, block.Seq, api.Envelope{Kind: api.EnvelopeKindAnswer, Subject: "The owner approved the matrix line", Body: api.EnvelopeBody{Answer: "approved"}})
+		closed := f.now()
+		if got := f.count(open, block.Seq, api.ObligationNeedsDelivery, api.ObligationClosed); got != 0 {
+			t.Fatalf("open BLOCK obligations = %d after the answer, want 0", got)
+		}
+		f.advance(stallWatchTeamQuiet - time.Minute)
+		f.none("inside the threshold after the close")
+		f.advance(time.Minute)
+		_, env, to := f.one(stallActionTeam)
+		if to != h.ID || env.Refs["entry"] != entry {
+			t.Fatalf("notice to %s refs %v, want the helper for %s", to, env.Refs, entry)
+		}
+		var since string
+		if err := f.s.db.QueryRow(`SELECT quiet_since FROM stall_watch_episodes WHERE task_id=?`, f.task.ID).Scan(&since); err != nil {
+			t.Fatal(err)
+		}
+		if !parseTS(since).Equal(closed) {
+			t.Fatalf("quiet since %s, want the close at %s", since, ts(closed))
+		}
+	})
+	t.Run("held obligation", func(t *testing.T) {
+		f, _, lead, h := build(t)
+		f.typed(h, lead, 0, stallRequest)
+		for i := 0; i < 4; i++ {
+			f.advance(30 * time.Minute)
+			f.none("a member holds a request")
+		}
+		if f.episodes() != 0 {
+			t.Fatal("an episode opened")
+		}
+	})
+	t.Run("an open episode ends", func(t *testing.T) {
+		f, _, lead, h := build(t)
+		f.advance(stallWatchTeamQuiet)
+		f.one(stallActionTeam)
+		f.advance(time.Minute)
+		f.typed(lead, h, 0, stallRequest)
+		f.none("the open episode ends silently")
+		f.closed("planned-wait")
+	})
+	// As today: a team with no open obligation, one with only delivery-only
+	// obligations, or a member in needs_input is still noticed after 30 min.
+	for name, apply := range map[string]func(f *stallFixture, lead, h api.Agent){
+		"no obligation": func(*stallFixture, api.Agent, api.Agent) {},
+		"delivery-only notice": func(f *stallFixture, lead, h api.Agent) {
+			f.typed(lead, h, 0, api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "The candidate waits for the matrix line", Body: api.EnvelopeBody{Text: "waiting"}})
+		},
+		"needs_input alone": func(f *stallFixture, lead, _ api.Agent) {
+			f.exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentNeedsInput, lead.ID)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, entry, lead, h := build(t)
+			apply(f, lead, h)
+			f.advance(stallWatchTeamQuiet - time.Minute)
+			f.none("inside the threshold")
+			f.advance(time.Minute)
+			if _, env, _ := f.one(stallActionTeam); env.Refs["entry"] != entry {
+				t.Fatalf("refs %v, want entry %s", env.Refs, entry)
+			}
+		})
+	}
+}
+
 func TestStallWatchTeamAdmission(t *testing.T) {
 	f := newStallFixture(t, stallNoon.Add(-time.Hour))
 	h := f.helper()

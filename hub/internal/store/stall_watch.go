@@ -300,6 +300,7 @@ type stallAgent struct {
 	state                                  string    // stored activity state
 	activity                               *api.AgentActivity
 	decisions                              int // its unanswered owner decisions
+	obligations                            int // open obligations it holds or sent that need more than delivery (team members only)
 	// lifted is when a never-quiet case of this run last ended: the owner
 	// answered its decision request, or its matrix wait ended.
 	lifted time.Time
@@ -430,6 +431,14 @@ const stallAnsweredSQL = `(SELECT COALESCE(MAX(d.created_at),'') FROM decision_r
 
 const stallResumedSQL = `(SELECT COALESCE(MAX(c.resumed_at),'') FROM project_pause_cycles c WHERE c.task_id=t.id)`
 
+// stallObligationsSQL counts the open obligations a member holds or sent that
+// need more than delivery, including one answered with a typed BLOCK: the
+// queue's idle-entry rule (team_queue_stall.go). The open states are listed
+// so the task and state index serves it.
+const stallObligationsSQL = `(SELECT count(*) FROM obligations o JOIN messages m ON m.seq=o.message_seq
+ WHERE o.task_id=a.task_id AND o.state IN ('` + api.ObligationQueued + `','` + api.ObligationDelivered + `','` + api.ObligationAcknowledged + `','` + api.ObligationWorking + `','` + api.ObligationBlocked + `')
+ AND o.needs<>'` + api.ObligationNeedsDelivery + `' AND (o.agent_id=a.id OR m.from_agent=a.id))`
+
 const stallDecisionsSQL = `(SELECT count(*) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
  LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq
  WHERE r.task_id=a.task_id AND m.from_agent=a.id AND m.from_run_id=a.run_id AND d.message_seq IS NULL)`
@@ -524,7 +533,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
  EXISTS(SELECT 1 FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state='held'),
  COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),
  COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END,
- COALESCE(p.wait_ended_at,''),CASE WHEN a.id IS NULL THEN '' ELSE `+stallAnsweredSQL+` END,`+stallResumedSQL+`,
+ CASE WHEN a.id IS NULL THEN 0 ELSE `+stallObligationsSQL+` END,COALESCE(p.wait_ended_at,''),CASE WHEN a.id IS NULL THEN '' ELSE `+stallAnsweredSQL+` END,`+stallResumedSQL+`,
  (SELECT COALESCE(MAX(h.resolved_at),'') FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state<>'held'),
  (SELECT COALESCE(MAX(w.closed_at),'') FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state NOT IN ('waiting','met','orphaned'))
  FROM team_queue_entries e JOIN tasks t ON t.id=e.task_id
@@ -542,7 +551,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		var id, entry, item, created, admitted, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
 		var waiting, held bool
 		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.state, &payload, &worked, &a.decisions,
-			&waited, &answered, &resumed, &released, &cleared); err != nil {
+			&a.obligations, &waited, &answered, &resumed, &released, &cleared); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -685,6 +694,26 @@ func (r *stallReads) postedAfter(seq int64, runs map[stallRun]bool) (bool, error
 	return false, nil
 }
 
+// obligationClosed is when the newest obligation that needs more than
+// delivery, held or sent by one of agents, closed: the end of the team's last
+// planned wait. It is read only for a team that is otherwise quiet.
+func (r *stallReads) obligationClosed(agents []string) (time.Time, error) {
+	if len(agents) == 0 {
+		return time.Time{}, nil
+	}
+	in := strings.TrimSuffix(strings.Repeat("?,", len(agents)), ",")
+	args := []any{r.task, api.ObligationClosed, api.ObligationNeedsDelivery}
+	for range 2 {
+		for _, a := range agents {
+			args = append(args, a)
+		}
+	}
+	var closed string
+	err := r.q.QueryRowContext(r.ctx, `SELECT COALESCE(MAX(o.closed_at),'') FROM obligations o JOIN messages m ON m.seq=o.message_seq
+ WHERE o.task_id=? AND o.state=? AND o.needs<>? AND (o.agent_id IN (`+in+`) OR m.from_agent IN (`+in+`))`, args...).Scan(&closed)
+	return parseTS(closed), err
+}
+
 // stallNotice is one notice the write phase posts for an episode.
 type stallNotice struct {
 	action, subject, text string
@@ -794,6 +823,11 @@ func (t *stallTeam) neverQuiet(now time.Time) string {
 	for _, m := range t.members {
 		if m.matrixWait(now) {
 			return "matrix-wait"
+		}
+	}
+	for _, m := range t.members {
+		if m.obligations > 0 {
+			return "planned-wait"
 		}
 	}
 	return ""
@@ -908,14 +942,23 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		if now.Sub(since) < stallWatchTeamQuiet {
 			continue
 		}
+		agents := make([]string, 0, len(t.members))
 		for _, m := range t.members {
 			posted, err := reads.recentPost(stallRun{m.id, m.runID})
 			if err != nil {
 				return plan, err
 			}
 			since = latest(since, posted)
+			agents = append(agents, m.id)
 		}
 		if now.Sub(since) < stallWatchTeamQuiet {
+			continue
+		}
+		closed, err := reads.obligationClosed(agents)
+		if err != nil {
+			return plan, err
+		}
+		if since = latest(since, closed); now.Sub(since) < stallWatchTeamQuiet {
 			continue
 		}
 		id := api.NewID("swe")
