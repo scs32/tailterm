@@ -436,10 +436,18 @@ function abortIntegration(cwd,expected,error) {
   const named="integration-conflict: "+conflict.paths.join(", "),listed=conflict.rejected===0 && conflict.count<=CONFLICT_PATHS && REASON.test(named);
   const refused=releaseError(listed?named:`integration-conflict: ${conflict.count} path${conflict.count===1?"":"s"}`);refused.conflict=conflict;throw refused;
 }
+// The ids of a matrix receipt's failed checks: named only when they match
+// CONFLICT_PATH, at most CONFLICT_PATHS; any other is counted in unnamed.
+export function failedChecks(receipt){
+  const failed=(Array.isArray(receipt?.checks)?receipt.checks:[]).filter(c=>c?.exitCode!==0 && c?.knownFailure!==true).map(c=>c?.id);
+  const named=[...new Set(failed.filter(id=>typeof id==="string" && CONFLICT_PATH.test(id)))].slice(0,CONFLICT_PATHS);
+  return {failedChecks:named,unnamed:failed.filter(id=>!named.includes(id)).length};
+}
 // Release batching. With releaseBatch.maxJobs above 1 in the private config,
 // the deployer integrates the verified jobs queued behind the one it claimed
 // (the lead) that cherry-pick cleanly, in queue order, into one candidate,
-// and runs one matrix, one import and one deploy for them. Only the lead is
+// and runs one matrix, one import and one deploy for them. That matrix run
+// keeps the union of the joined jobs' approved checks. Only the lead is
 // claimed; the hub settles the other jobs with the lead's released finish.
 // Absent or 1, none of this runs.
 export const BATCH_MAX_JOBS=8,BATCH_IMPORT_WAIT_MS=1800000;
@@ -465,15 +473,17 @@ export function batchCandidates(jobs,lead,solo=new Set()){
   return jobs.filter(j=>j.state==="verified" && !j.agentId && Number.isSafeInteger(j.rowId) && j.rowId>at && j.pauseGeneration===lead.pauseGeneration && sha(j.baseCommit) && j.baseCommit===lead.baseCommit && !solo.has(j.id)).sort((a,b)=>a.rowId-b.rowId);
 }
 const racePackages=argv=>{const first=Array.isArray(argv)?argv.findIndex(a=>typeof a==="string" && a.startsWith("./")):-1;return first<1 || argv.slice(first).some(a=>typeof a!=="string" || !a.startsWith("./"))?null:{flags:argv.slice(0,first),packages:argv.slice(first)};};
-// extra's checks carried on base's list, or null when they cannot be: every
-// check must equal the listed check of its id, except go-race, which may
-// differ in packages only. The merged go-race tests the union, or ./... alone.
+// The union of base's and extra's checks, or null when they cannot share one
+// run: a check whose id base lacks is appended, and a check whose id base has
+// must equal it, except go-race, which may differ in packages only. The merged
+// go-race tests the union, or ./... alone.
 function mergeAcceptedChecks(base,extra){
   if(!Array.isArray(base) || !Array.isArray(extra))return null;
   let out=base;
   for(const check of extra){
-    const at=out.findIndex(c=>c.id===check?.id);
-    if(at<0)return null;
+    if(typeof check?.id!=="string")return null;
+    const at=out.findIndex(c=>c.id===check.id);
+    if(at<0){out=[...out,check];continue;}
     if(canonical(out[at])===canonical(check))continue;
     const have=racePackages(out[at].argv),want=check.id==="go-race" && racePackages(check.argv);
     if(!have || !want || !same(have.flags,want.flags) || canonical({...out[at],argv:[]})!==canonical({...check,argv:[]}))return null;
@@ -483,7 +493,8 @@ function mergeAcceptedChecks(base,extra){
   return out;
 }
 // The accepted checks one matrix run must keep for the lead and the members
-// that can share it; a member whose checks differ in any other way is dropped.
+// that can share it: their union. A member with a check of an id already in
+// the union that differs other than go-race packages is dropped.
 export function batchAcceptedChecks(lead,members){
   let checks=lead.plan.checks;const joined=[],dropped=[];
   for(const member of members){
@@ -493,7 +504,10 @@ export function batchAcceptedChecks(lead,members){
   return {checks,checksDigest:digest(checks),joined,dropped};
 }
 // Why a job's full record cannot join the lead's batch, or "". The hub checks
-// the same at batch-add.
+// the same at batch-add, except batch-plan-mismatch: a check with an id the
+// lead's plan has that differs other than go-race packages. A check id the
+// lead lacks joins the batch's union; a conflict with an earlier member's
+// check is found as the batch forms (integrateBatch's fits hook).
 export function batchMismatch(lead,job){
   if(job?.state!=="verified" || job.agentId || job.pauseGeneration!==lead.pauseGeneration || job.repository!==lead.repository || job.baseCommit!==lead.baseCommit)return "batch-ineligible";
   if(job.plan?.matrixDigest!==lead.plan?.matrixDigest || job.plan?.matrixApprovalMessageSeq!==lead.plan?.matrixApprovalMessageSeq)return "batch-other-matrix";
@@ -542,8 +556,9 @@ function pickCandidate(cwd,job,head){
 // joined. hooks.integrated(first) follows the lead's integration; hooks.open
 // (base) declares the batch before the first member, returning its id or
 // false, and hooks.add(job, from, to) declares each job's range, the lead's
-// first. A hook that throws (an unconfirmed hub call) is passed on with the
-// checkout untouched. Returns today's integration, the jobs dropped, and
+// first. hooks.fits(job), when given, is asked before a candidate is picked:
+// a reason drops it with the checkout untouched. A hook that throws (an
+// unconfirmed hub call) is passed on with the checkout untouched. Returns today's integration, the jobs dropped, and
 // batch only when a member joined. The hub refuses a range that adds no
 // commit, so a lead with no change opens no batch, and a member the batch's
 // head already carries is dropped as batch-no-change; each releases alone.
@@ -555,6 +570,8 @@ export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
   let head=first.integrated,id=null,closed=false;
   for(const member of candidates){
     if(closed || Math.max(jobs.length,1)>=max)break;
+    const misfit=hooks.fits?.(member);
+    if(typeof misfit==="string" && misfit){dropped.push({jobId:member.id,reason:misfit});continue;}
     let to;
     try{to=pickCandidate(cwd,member,head);}
     catch(error){dropped.push({jobId:member.id,reason:failureReason(error)});continue;}
@@ -951,7 +968,12 @@ export async function runRelease(config, adapter) {
   const applyBatchOp=(record,ok)=>{
     if(record.applied)return;
     if(ok && record.op==="batch-open")state.batch={id:batchId(job.id,record.generation,record.commit),base:record.commit,jobs:[]};
-    if(ok && record.op==="batch-add" && state.batch){state.batch.jobs.push({...record.member,from:record.from,to:record.commit});if(record.goRace)state.batch.goRace=record.goRace;}
+    if(ok && record.op==="batch-add" && state.batch){
+      state.batch.jobs.push({...record.member,from:record.from,to:record.commit});
+      if(record.checks)state.batch.checks=record.checks;
+      // A journal of an earlier runner carries the merged go-race alone.
+      if(record.goRace)state.batch.goRace=record.goRace;
+    }
     record.applied=true;checkpoint();
   };
   const declare=async(op,fields)=>{const ok=await batchOp(op,fields),record=state.batchOps.findLast(o=>o.op===op);applyBatchOp(record,ok);return ok;};
@@ -961,9 +983,20 @@ export async function runRelease(config, adapter) {
     if(state.batch && state.batch.jobs.length<2){if(!batchDropped())await batchOp("batch-drop");state.batch=null;checkpoint();}
     return {expected:state.expected,integrated:state.batch?state.batch.jobs.at(-1).to:state.batchLead};
   };
-  const mergedGoRace=member=>{
-    const lead=job.plan?.checks,race=lead?.map(c=>c.id==="go-race" && state.batch?.goRace?state.batch.goRace:c);
-    return mergeAcceptedChecks(race,member.plan?.checks)?.find(c=>c.id==="go-race");
+  // The checks the batch's one run must keep so far: the union of the lead's
+  // and every joined member's approved checks, each saved with the batch-add
+  // that joined it. A refused add contributes nothing.
+  const batchChecks=()=>state.batch?.checks ?? job.plan?.checks?.map(c=>c.id==="go-race" && state.batch?.goRace?state.batch.goRace:c);
+  // Why a candidate cannot share the batch's run: a check with the id of one
+  // already in it (the lead's or an earlier member's) that differs other than
+  // go-race packages.
+  const batchFits=member=>job.plan?.checks===undefined && member.plan?.checks===undefined ? "" : mergeAcceptedChecks(batchChecks(),member.plan?.checks)?"":"batch-plan-mismatch";
+  // What a job's batch-add saves: the union with its checks, and on its range
+  // its approved check ids and, for a member, those the lead's plan lacks.
+  const joining=member=>{
+    const own=member.plan?.checks,ids=Array.isArray(own)?own.map(c=>c?.id):undefined,lead=new Set((job.plan?.checks||[]).map(c=>c.id));
+    const checks=member.id===job.id?undefined:mergeAcceptedChecks(batchChecks(),own);
+    return {...(checks?{checks}:{}),fields:ids?{checkIds:ids,...(member.id===job.id?{}:{contributed:ids.filter(id=>!lead.has(id))})}:{}};
   };
   // A job left out of this claim's batch is listed once, with its first reason.
   const noteDropped=entries=>{for(const {jobId,reason} of entries)if(!state.batchDropped?.some(d=>d.jobId===jobId))(state.batchDropped??=[]).push({jobId,reason});};
@@ -972,7 +1005,8 @@ export async function runRelease(config, adapter) {
     const result=await integrateBatch(cwd,job,members,config.batch.max,{
       integrated:first=>{state.expected=first.expected;state.integrated=first.integrated;state.batchLead=first.integrated;if(first.noChange)state.noChange=first.noChange;state.phase="batching";checkpoint();},
       open:async base=>await declare("batch-open",{commit:base})?state.batch.id:false,
-      add:(member,from,to)=>{const goRace=member.id===job.id?undefined:mergedGoRace(member);return declare("batch-add",{entryId:member.entryId,commit:to,from,...(goRace?{goRace}:{}),member:{jobId:member.id,entryId:member.entryId,generation:member.generation,commit:member.commit,verificationDigest:member.verificationDigest}});},
+      fits:batchFits,
+      add:(member,from,to)=>{const {checks,fields}=joining(member);return declare("batch-add",{entryId:member.entryId,commit:to,from,...(checks?{checks}:{}),member:{jobId:member.id,entryId:member.entryId,generation:member.generation,commit:member.commit,verificationDigest:member.verificationDigest,...fields}});},
     });
     noteDropped(result.dropped);
     return closeBatch();
@@ -1002,7 +1036,7 @@ export async function runRelease(config, adapter) {
   // The lead with the plan one matrix run must keep for the whole batch, and
   // each job's approved checks for the proof made before that run starts.
   const batchJob=()=>{
-    const checks=job.plan?.checks?.map(c=>c.id==="go-race" && state.batch.goRace?state.batch.goRace:c);
+    const checks=batchChecks();
     const members=state.batch.jobs.slice(1).map(j=>config.batch?.candidates?.find(c=>c.id===j.jobId));
     const selected=selection([job.plan,...members.map(m=>m?.plan)]);
     if(!checks)return {...job,integratedCommit:state.integrated,...selected};
@@ -1015,9 +1049,20 @@ export async function runRelease(config, adapter) {
   // lead goes on alone in this claim. False when the hub refuses the drop;
   // "waiting" while the batch's own matrix run is not confirmed over, since
   // the checkout must not move under it.
-  const fallback=async(reason,detail)=>{
-    state.batchFallback={batchId:state.batch.id,reason,...(detail && detail!==reason?{detail}:{}),members:state.batch.jobs.slice(1).map(j=>j.jobId),status:"dropping"};checkpoint();
+  const fallback=async(reason,detail,failure)=>{
+    state.batchFallback={batchId:state.batch.id,reason,...(detail && detail!==reason?{detail}:{}),members:state.batch.jobs.slice(1).map(j=>j.jobId),...attribution(failure),status:"dropping"};checkpoint();
     return finishFallback();
+  };
+  // Which jobs each failed check of the batch's run belongs to, from the
+  // approved check ids saved with each batch-add, the lead first; a check
+  // only the selection added belongs to none. A job none of them belongs to
+  // is unaffected. Only for a failure that names its failed checks.
+  const attribution=failure=>{
+    if(!Array.isArray(failure?.failedChecks))return {};
+    const jobs=state.batch.jobs.filter(j=>Array.isArray(j.checkIds));
+    const failed=failure.failedChecks.map(checkId=>({checkId,jobs:jobs.filter(j=>j.checkIds.includes(checkId)).map(j=>j.jobId)}));
+    const unaffected=jobs.map(j=>j.jobId).filter(id=>!failed.some(f=>f.jobs.includes(id)));
+    return {failed,unaffected,...(Number.isSafeInteger(failure.unnamed) && failure.unnamed>0?{unnamed:failure.unnamed}:{})};
   };
   const finishFallback=async()=>{
     if(adapter.settleMatrixRuns && await adapter.settleMatrixRuns(job)!==true)return "waiting";
@@ -1060,7 +1105,7 @@ export async function runRelease(config, adapter) {
       if(verified===true){state.phase="integrated";checkpoint();return null;}
       if(failure){
         const reason=failureReason(failure);
-        const fell=await fallback(reason==="batch-plan-uncovered"?reason:"batch-matrix-failed",reason);
+        const fell=await fallback(reason==="batch-plan-uncovered"?reason:"batch-matrix-failed",reason,failure);
         if(fell)return fell===true?null:waiting;
         throw failure;
       }
@@ -1196,8 +1241,9 @@ export async function runRelease(config, adapter) {
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;
-    // The batch receipt's intent is saved with the lead's, before any deploy.
-    if(state.batch)state.batchReceipt={version:1,batchId:state.batch.id,leadJobId:job.id,base:state.batch.base,integrated:integration.integrated,jobs:state.batch.jobs,dropped:state.batchDropped||[]};
+    // The batch receipt's intent is saved with the lead's, before any deploy,
+    // with the ids and digest of the union of checks its one run kept.
+    if(state.batch){const union=batchChecks();state.batchReceipt={version:1,batchId:state.batch.id,leadJobId:job.id,base:state.batch.base,integrated:integration.integrated,...(union?{checks:union.map(c=>c.id),checksDigest:digest(union)}:{}),jobs:state.batch.jobs,dropped:state.batchDropped||[]};}
     checkpoint();
     // Targets sharing one TrueNAS plan (hub and bridge together) deploy as a
     // group: both effects are journaled before the single deploy, so any
@@ -1565,8 +1611,10 @@ export class HostAdapter {
     }
     if(run?.refusal)throw releaseError(run.refusal);
     if(!existsSync(receiptPath))throw releaseError("Integrated matrix run ended without a receipt");
-    // The receipt is read only once its run is gone, and imported only when eligible.
-    if(!receiptEligible(JSON.parse(readFileSync(receiptPath,"utf8"))))throw releaseError("Integrated matrix receipt is not eligible");
+    // The receipt is read only once its run is gone, and imported only when
+    // eligible. A refusal names its failed checks for a batch's attribution.
+    const receipt=JSON.parse(readFileSync(receiptPath,"utf8"));
+    if(!receiptEligible(receipt))throw Object.assign(releaseError("Integrated matrix receipt is not eligible"),failedChecks(receipt));
     try{this.command([this.config.tt||"tt","send","--kind","request","--to",this.handler(),"--subject","Import verification for the integrated release commit","--ask",`Import release verification plan and receipt for job ${job.id} integrated commit ${job.integratedCommit} through tt deployment verification --plan-file and --file. Preserve exact job generation and inspect logs; release publication waits for saved import.`,"--request-id",`${job.id}-integrated-matrix-${job.integratedCommit}`,"--ref",`release-job=${job.id}`,"--ref",`integrated-commit=${job.integratedCommit}`,"--attachment",planPath,"--attachment",receiptPath]);}
     catch(error){if(error?.transport===true)return false;throw error;}
     this.matrixImportRequested=true;

@@ -8,7 +8,7 @@ import {heldClaimNotice,runRelease,HostAdapter,serveDeployment,releaseError,vali
 // Release batching (wi_50e80d45647b342a slice one).
 import {integrateBatch,batchCandidates,batchAcceptedChecks,batchMismatch,batchPlanCovers,batchId,releaseBatchPolicy,materializeBatch,readBatchSolo,reconcileReceipts,BATCH_IMPORT_WAIT_MS} from "../scripts/release-runner.mjs";
 import {planWithPreservation,digest as matrixDigest} from "../scripts/verify-matrix.mjs";
-import {git,change,job,recorded,RUNNER,ignorePrerequisites,placePrerequisites,exitedPid,until,ended,idle,CODE_RUN,codeRepo,codeHost,verifiedJob,codeGate,HELD_ITEM,HELD_HANDLER,HELD_HELPER,heldRoster,heldRun,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchJobs,batchFake,batchConfig,batchJournal,batchFiles,three,clean,matrixRepo,race,integratedPlan,covers,matrixFake,batchHub,daemonHub,SINGLE_JOB_TRACE,traceOf,GO_CHECKS,BROWSER_CHECK,planned,daemonJournal,MISMATCH,stale,claimed,wakeRefs,noticeArgv,argvField,WAKE_WAIT,WAKE_HELD,untaggedNoticeSends} from "./release-runner-fixtures.mjs";
+import {git,change,job,recorded,RUNNER,ignorePrerequisites,placePrerequisites,exitedPid,until,ended,idle,CODE_RUN,codeRepo,codeHost,verifiedJob,codeGate,HELD_ITEM,HELD_HANDLER,HELD_HELPER,heldRoster,heldRun,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchJobs,batchFake,batchConfig,batchJournal,batchFiles,three,clean,matrixRepo,race,integratedPlan,covers,matrixFake,batchHub,daemonHub,SINGLE_JOB_TRACE,traceOf,GO_CHECKS,planned,daemonJournal,MISMATCH,stale,claimed,wakeRefs,noticeArgv,argvField,WAKE_WAIT,WAKE_HELD,untaggedNoticeSends} from "./release-runner-fixtures.mjs";
 test("batch1 a clean batch of three integrates once, verifies once and deploys once",async()=>{
  const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);
  const r=await runRelease(c,a);
@@ -176,7 +176,9 @@ test("batch8 a docs-only member keeps ./... in the batch plan",async()=>{
  const other=structuredClone(code);other.plan.checks.find(c=>c.id==="go-vet").argv.push("-x");
  assert.equal(batchMismatch(lead,other),"batch-plan-mismatch");assert.deepEqual(batchAcceptedChecks(lead,[other,docs]).dropped,[{jobId:"rel_m3",reason:"batch-plan-mismatch"}]);
  const flags=structuredClone(code);flags.plan.checks.find(c=>c.id==="go-race").argv.splice(2,0,"-count=1");assert.equal(batchMismatch(lead,flags),"batch-plan-mismatch");
- const extra=structuredClone(code);extra.plan.checks.push({id:"npm-unit",argv:["npm","test"],cwd:".",environment:{}});assert.equal(batchMismatch(lead,extra),"batch-plan-mismatch");
+ // A check id the lead lacks joins the union.
+ const extra=structuredClone(code);extra.plan.checks.push({id:"npm-unit",argv:["npm","test"],cwd:".",environment:{}});assert.equal(batchMismatch(lead,extra),"");
+ const union=batchAcceptedChecks(lead,[extra]);assert.deepEqual(union.joined,["rel_m3"]);assert.deepEqual(union.checks.map(c=>c.id),[...lead.plan.checks.map(c=>c.id),"npm-unit"]);
 });
 test("batch9 a job with another base is not tried and releases alone",async()=>{
  const m=matrixRepo(),lead=m.accept(1,"hub/internal/store/store.go","package store\n\nvar Lead = 1\n");
@@ -419,9 +421,11 @@ test("batch15 a size of 3 with five eligible jobs batches three and leaves two w
  assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,"refs/heads/tasks-hub").split("\n"),["client/a.js","client/b.js","client/c.js"]);
  assert.ok(existsSync(join(h.home,"rel_b2.json"))&&existsSync(join(h.home,"rel_b3.json")));assert.deepEqual([...readBatchSolo(h.home)],[]);
 });
-test("batch16 a Go-only lead records batch-plan-mismatch for a browser-checks member, and a matching member still joins",async()=>{
+// A member whose go-vet has the lead's id and other argv cannot share its run.
+const VET_X=[{...GO_CHECKS[0],argv:[...GO_CHECKS[0].argv,"-x"]},GO_CHECKS[1]];
+test("batch16 a lead records batch-plan-mismatch for a member whose same-id check differs, and a matching member still joins",async()=>{
  // The lead goes alone: the reason is in its journal though no batch formed.
- const alone=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]),h=daemonHub(alone,{releaseBatch:{maxJobs:3}});
+ const alone=planned(GO_CHECKS,VET_X),h=daemonHub(alone,{releaseBatch:{maxJobs:3}});
  await h.poll();
  assert.deepEqual(h.seen[0].batch.candidates,[]);assert.deepEqual(h.seen[0].batch.excluded,MISMATCH);
  let journal=daemonJournal(h);
@@ -429,7 +433,7 @@ test("batch16 a Go-only lead records batch-plan-mismatch for a browser-checks me
  for(const key of ["batch","batchOps","batchLead","batchReceipt","batchFallback"])assert.ok(!(key in journal),key);
  assert.deepEqual(h.read().batch,[]);assert.deepEqual(h.read().jobs.map(j=>[j.id,j.state]),[["rel_b1","released"],["rel_b2","verified"]]);assert.deepEqual(batchFiles(h.home),[]);
  // A matching member behind the mismatched one joins, and the batch receipt carries the same reason.
- const mixed=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS),g=daemonHub(mixed,{releaseBatch:{maxJobs:3}});
+ const mixed=planned(GO_CHECKS,VET_X,GO_CHECKS),g=daemonHub(mixed,{releaseBatch:{maxJobs:3}});
  await g.poll();
  journal=daemonJournal(g);
  assert.deepEqual(g.seen[0].batch.candidates.map(j=>j.id),["rel_b3"]);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);assert.deepEqual(journal.batchDropped,MISMATCH);
@@ -463,7 +467,7 @@ test("batch17 an unreadable candidate and those past the read limit are recorded
 });
 test("batch18 an exclusion is recorded once per claim, over repeated polls and a resumed run",async()=>{
  // The matrix run is not over for two polls, so the same claim is polled three times.
- for(const checks of [[GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]],[GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS]]){
+ for(const checks of [[GO_CHECKS,VET_X],[GO_CHECKS,VET_X,GO_CHECKS]]){
   const b=planned(...checks),h=daemonHub(b,{releaseBatch:{maxJobs:3}});let polls=0;
   const release=(c,adapter)=>{const run=h.release(c,adapter),wait=++polls<3;adapter.verifyIntegrated=async()=>!wait;return run;};
   const poll=()=>serveDeployment(h.config,{once:true,configPath:h.configPath,release});
@@ -479,11 +483,11 @@ test("batch18 an exclusion is recorded once per claim, over repeated polls and a
   if(checks.length===3)assert.deepEqual(JSON.parse(readFileSync(join(h.home,journal.batch.id+"-receipt.json"),"utf8")).dropped,MISMATCH);
  }
  // A candidate the daemon left out and the runner then refuses again is listed once, with its first reason.
- const b=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK],GO_CHECKS),a=batchFake(b.lead),c=batchConfig(b,3,{excluded:[...MISMATCH,...MISMATCH]});
+ const b=planned(GO_CHECKS,VET_X,GO_CHECKS),a=batchFake(b.lead),c=batchConfig(b,3,{excluded:[...MISMATCH,...MISMATCH]});
  const r=await runRelease(c,a);
  assert.equal(r.outcome,"released");assert.deepEqual(batchJournal(c).batchDropped,MISMATCH);assert.deepEqual(batchJournal(c).batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);
  // A size of 1 records nothing even if exclusions are handed over.
- const one=planned(GO_CHECKS,[...GO_CHECKS,BROWSER_CHECK]),a1=batchFake(one.lead),c1=batchConfig(one,1,{candidates:[],excluded:MISMATCH});
+ const one=planned(GO_CHECKS,VET_X),a1=batchFake(one.lead),c1=batchConfig(one,1,{candidates:[],excluded:MISMATCH});
  assert.equal((await runRelease(c1,a1)).outcome,"released");assert.ok(!("batchDropped" in batchJournal(c1)));
 });
 test("batch19 a batch with an unknown path starts no matrix run and falls back to per-job releases",async()=>{

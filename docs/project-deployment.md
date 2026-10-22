@@ -602,14 +602,14 @@ bounded to 64 bytes), `wrong type for field "NAME"` (`wrong-type`), `malformed
 JSON` (`malformed-json`) or `trailing data after the JSON object`
 (`trailing-data`).
 
-### Release batching (wi_50e80d45647b342a, wi_a72bba736a8c1daf)
+### Release batching (wi_50e80d45647b342a, wi_a72bba736a8c1daf, wi_8193aff1439e9b20)
 
 With `releaseBatch.maxJobs` above 1 in the private config, the job the deployer
 claims leads a batch: jobs queued behind it are integrated on top of it, share
 one matrix run and are released together. The rule:
 
-**A job joins a batch only if all its checks are already in the lead's plan;
-otherwise it is released on its own.**
+**A job joins a batch when its checks can share the lead's matrix run; the
+batch's one run then keeps the union of every joined job's approved checks.**
 
 A queued job can join only when all of this holds:
 
@@ -617,10 +617,18 @@ A queued job can join only when all of this holds:
 - it has the lead's base commit, repository and pause generation, and is not
   marked to release alone after a failed batch (`batch-solo.json`);
 - its plan names the lead's approved matrix (digest and approval message);
-- every accepted check in its plan is already in the lead's plan, unchanged.
-  Only `go-race` may differ, and only in its packages (the batch tests the
-  union, or `./...`). A Go-only lead therefore never carries a job that also
-  needs browser checks; the reverse order can batch.
+- every accepted check in its plan whose id is already in the batch (the
+  lead's, or one an earlier member brought) is unchanged. Only `go-race` may
+  differ, and only in its packages (the batch tests the union, or `./...`). A
+  check whose id the batch lacks is added to it, so a Go-only lead carries a
+  job that also needs browser checks.
+
+The first three rules are unchanged by the union; only the last one compares
+checks. The union is the floor of the batch's one run: before that run starts
+the deployer proves the plan covers every joined job's approved checks, and
+the hub proves the same for each job at import, so a member's checks are never
+narrowed by riding with another job. A batch whose members bring other checks
+runs longer than the lead would alone.
 
 The deployer reads at most `2*(maxJobs-1)` candidates, in queue order, and takes
 the first that fit until the batch is full.
@@ -638,7 +646,7 @@ batch forms, its receipt `journalDirectory/bat_ID-receipt.json` carries the same
 
 | Reason | Meaning |
 | --- | --- |
-| `batch-plan-mismatch` | a check is not in the lead's plan, or differs from it |
+| `batch-plan-mismatch` | a check has the id of one already in the batch (the lead's or an earlier member's) and differs from it other than `go-race` packages |
 | `batch-other-matrix` | another approved matrix digest or approval message |
 | `batch-ineligible` | the full record is no longer verified, unclaimed, or of the lead's base, repository or pause generation |
 | `detail-unreadable` | the job's full record could not be read |
@@ -653,6 +661,33 @@ To see why a job did not ride with the one before it:
 
 ```sh
 jq .batchDropped journalDirectory/LEAD_ID.json
+```
+
+A released batch's receipt also records the union: `checks` (its check ids, in
+the order the run was handed them) and `checksDigest` (the digest of those
+checks, as handed to the matrix plan), and for each entry of `jobs` the job's
+approved `checkIds` and, for a member, `contributed`: its check ids the lead's
+plan lacks (`[]` when none).
+
+```sh
+jq '{checks, jobs: [.jobs[] | {jobId, contributed}]}' journalDirectory/bat_ID-receipt.json
+```
+
+When the batch's matrix run fails, the batch falls back as before: it is
+dropped at the hub, every member is marked to release alone
+(`batch-solo.json`), the lead goes on alone, and no `bat_` receipt is written.
+When the run's receipt names its failed checks, `batchFallback` in the lead's
+journal attributes them: `failed: [{checkId, jobs}]` lists, for each failed
+check, the jobs whose approved checks include it, the lead first (`[]` for a
+check only the integrated selection added); `unaffected` lists the jobs, the
+lead included, that own none of them; and `unnamed` counts failed checks whose
+id was not recorded (an id that is not 1 to 120 characters of
+`[A-Za-z0-9_./-]`, or one past the first 50). With `unnamed` above 0, `unaffected` covers only the
+named checks. Other fallbacks (`batch-plan-uncovered`, `batch-import-timeout`,
+`batch-selection-refused`, a run that could not start) carry no attribution.
+
+```sh
+jq .batchFallback journalDirectory/LEAD_ID.json
 ```
 
 ### The runner's own code (wi_2be015df9af54c5c)

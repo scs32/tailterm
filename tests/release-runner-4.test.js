@@ -530,3 +530,104 @@ test("stop4 a stop signal during the 30 s wait ends the daemon without waiting i
  assert.equal(await h.poll(undefined,undefined,{signal:stop.signal}),"");
  assert.ok(Date.now()-began<10000,`ended after ${Date.now()-began} ms`);assert.ok(h.calls().every(c=>c.argv[1]==="list"));
 });
+
+// Release batches run the union of their members' checks (wi_8193aff1439e9b20):
+// a member whose approved checks include ids the lead lacks joins, the one
+// matrix run keeps every joined job's approved checks, and the journal names
+// the union, each member's contribution and, on a failed run, whose checks failed.
+import {batchAcceptedChecks,batchId,releaseError,failureReason,readBatchSolo,failedChecks} from "../scripts/release-runner.mjs";
+import {digest as matrixDigest} from "../scripts/verify-matrix.mjs";
+import {planned,GO_CHECKS,BROWSER_CHECK,batchFake,batchFiles,matrixHost} from "./release-runner-fixtures.mjs";
+const NPM={id:"npm-unit",argv:["npm","test"],cwd:".",environment:{}},GO_VET=GO_CHECKS[0];
+const RACE=(...packages)=>({id:"go-race",argv:["go","test","-race",...packages],cwd:"hub",environment:{}});
+const unionIds=["npm-unit","go-vet","go-test","tests/board-browser.mjs"];
+const receiptOf=(c,journal)=>JSON.parse(readFileSync(join(c.home,journal.batch.id+"-receipt.json"),"utf8"));
+test("union1 a member with check ids the lead lacks joins, and the batch's checks are the union, each once",()=>{
+ const b=planned([NPM],[NPM,...GO_CHECKS],[NPM,BROWSER_CHECK]),[a,c]=b.members;
+ assert.equal(batchMismatch(b.lead,a),"");assert.equal(batchMismatch(b.lead,c),"");
+ const merged=batchAcceptedChecks(b.lead,[a,c]);
+ assert.deepEqual(merged.joined,["rel_b2","rel_b3"]);assert.deepEqual(merged.dropped,[]);
+ assert.deepEqual(merged.checks.map(x=>x.id),unionIds);assert.deepEqual(merged.checks,[NPM,...GO_CHECKS,BROWSER_CHECK]);assert.equal(merged.checksDigest,matrixDigest(merged.checks));
+ // go-race joins by package union when the lead has none, and ./... wins.
+ const race=planned([NPM],[NPM,RACE("./internal/api")],[NPM,RACE("./internal/store")]);
+ assert.deepEqual(batchAcceptedChecks(race.lead,race.members).checks,[NPM,RACE("./internal/api","./internal/store")]);
+ const all=planned([NPM],[NPM,RACE("./internal/api")],[RACE("./...")]);
+ assert.deepEqual(batchAcceptedChecks(all.lead,all.members).checks,[NPM,RACE("./...")]);
+});
+test("union2 a batch of two members with disjoint extra checks runs the union once, covers every job and records it",async()=>{
+ const b=planned([NPM],[NPM,...GO_CHECKS],[NPM,BROWSER_CHECK]),a=batchFake(b.lead),c=batchConfig(b,3);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+ assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","merged","deploy:tailos","finish"]);
+ assert.equal(a.verifies.length,1);const handed=a.verifies[0];
+ assert.deepEqual(handed.plan.checks.map(x=>x.id),unionIds);assert.equal(handed.plan.checksDigest,matrixDigest(handed.plan.checks));
+ // Every job's approved checks are covered by the union; the lead's own plan leaves rel_b2 and rel_b3 uncovered.
+ const all=covers(b.lead,...b.members);
+ assert.equal(batchPlanCovers({checks:handed.plan.checks},all),null);assert.equal(batchPlanCovers({checks:handed.plan.checks},handed.batchCovers),null);
+ assert.deepEqual(batchPlanCovers({checks:b.lead.plan.checks},all),{jobId:"rel_b2",checkId:"go-vet"});
+ assert.deepEqual(batchPlanCovers({checks:b.lead.plan.checks},covers(b.members[1])),{jobId:"rel_b3",checkId:"tests/board-browser.mjs"});
+ const journal=batchJournal(c),receipt=receiptOf(c,journal);
+ assert.deepEqual(receipt.checks,unionIds);assert.equal(receipt.checksDigest,handed.plan.checksDigest);
+ assert.deepEqual(receipt.jobs.map(j=>[j.jobId,j.checkIds,j.contributed]),[["rel_b1",["npm-unit"],undefined],["rel_b2",["npm-unit","go-vet","go-test"],["go-vet","go-test"]],["rel_b3",["npm-unit","tests/board-browser.mjs"],["tests/board-browser.mjs"]]]);
+ assert.deepEqual(receipt.dropped,[]);assert.deepEqual(c.solo,[]);
+});
+test("union3 the real integrated plan keeps a docs lead's and a Go member's checks and covers both",async()=>{
+ const m=matrixRepo(),lead=m.accept(1,"docs/a.md","a\n"),member=m.accept(2,"hub/internal/store/store.go","package store\n\nvar Member = 1\n");m.settle();
+ ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);
+ assert.deepEqual(checkIds(lead.plan),["npm-unit"]);assert.deepEqual(checkIds(member.plan),["go-race","go-test","go-vet"]);assert.equal(batchMismatch(lead,member),"");
+ const a=matrixFake(lead),c=batchConfig({f:m.f,lead,members:[member]},2);
+ const r=await runRelease(c,a);assert.equal(r.outcome,"released");assert.equal(a.verifies.length,1);
+ const handed=a.verifies[0];assert.deepEqual(checkIds(handed.plan),["npm-unit","go-race","go-test","go-vet"]);
+ const h=await hostPlan(m,handed);
+ assert.deepEqual(checkIds(h.plan),["go-race","go-test","go-vet","npm-unit"]);
+ assert.equal(batchPlanCovers(h.plan,handed.batchCovers),null);assert.equal(batchPlanCovers(h.plan,covers(lead,member)),null);assert.equal(h.started.length,1);
+});
+test("union4 eligibility is unchanged, and a same-id check that differs drops the later job, the lead's or an earlier member's",async()=>{
+ const b=planned([NPM,GO_VET,RACE("./internal/api")],[NPM,GO_VET]),member=b.members[0],edited=(edit,lead=b.lead)=>{const j=structuredClone(member);edit(j);return batchMismatch(lead,j);};
+ assert.equal(batchMismatch(b.lead,member),"");
+ assert.equal(edited(j=>j.repository="other"),"batch-ineligible");assert.equal(edited(j=>j.baseCommit="e".repeat(40)),"batch-ineligible");assert.equal(edited(j=>j.pauseGeneration=2),"batch-ineligible");
+ assert.equal(edited(j=>j.plan.matrixDigest="e".repeat(64)),"batch-other-matrix");assert.equal(edited(j=>j.plan.matrixApprovalMessageSeq=10),"batch-other-matrix");
+ assert.equal(edited(j=>j.plan.checks[1].argv.push("-x")),"batch-plan-mismatch");assert.equal(edited(j=>j.plan.checks[1].cwd="."),"batch-plan-mismatch");assert.equal(edited(j=>j.plan.checks[1].environment={X:"1"}),"batch-plan-mismatch");
+ assert.equal(edited(j=>j.plan.checks.push(RACE("./internal/store"))),"");assert.equal(edited(j=>j.plan.checks.push({...RACE("./internal/store"),argv:["go","test","-race","-count=1","./internal/store"]})),"batch-plan-mismatch");
+ // Member against member: rel_b3's go-vet differs from the one rel_b2 brought, so rel_b3 is dropped before it is picked.
+ const VET_X={...GO_VET,argv:[...GO_VET.argv,"-x"]},m=planned([NPM],[NPM,GO_VET],[NPM,VET_X]);
+ assert.equal(batchMismatch(m.lead,m.members[1]),"","the lead alone has no go-vet");
+ assert.deepEqual(batchAcceptedChecks(m.lead,m.members).dropped,[{jobId:"rel_b3",reason:"batch-plan-mismatch"}]);
+ const a=batchFake(m.lead),c=batchConfig(m,3);
+ assert.equal((await runRelease(c,a)).outcome,"released");
+ assert.deepEqual(a.calls.filter(x=>x.startsWith("batch-")),["batch-open","batch-add:tqe_b1","batch-add:tqe_b2"]);
+ const journal=batchJournal(c),dropped=[{jobId:"rel_b3",reason:"batch-plan-mismatch"}];
+ assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);assert.deepEqual(journal.batchDropped,dropped);assert.deepEqual(receiptOf(c,journal).dropped,dropped);
+ assert.deepEqual(a.verifies[0].plan.checks,[NPM,GO_VET]);assert.deepEqual(c.solo,[]);
+ // A refused member contributes nothing, so the job behind it then joins with its own go-vet.
+ const n=planned([NPM],[NPM,GO_VET],[NPM,VET_X]),a2=batchFake(n.lead,{refuse:(op,fields)=>op==="batch-add" && fields.entryId==="tqe_b2"}),c2=batchConfig(n,3);
+ assert.equal((await runRelease(c2,a2)).outcome,"released");
+ const j2=batchJournal(c2);
+ assert.deepEqual(j2.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b3"]);assert.deepEqual(j2.batchDropped,[{jobId:"rel_b2",reason:"batch-add-refused"}]);
+ assert.deepEqual(a2.verifies[0].plan.checks,[NPM,VET_X]);assert.deepEqual(receiptOf(c2,j2).checks,["npm-unit","go-vet"]);
+});
+test("union5 a failed union run names, for each failed check, the jobs whose approved checks include it, and every member still releases alone",async()=>{
+ const run=async(failure)=>{
+  const b=planned([NPM],[NPM,...GO_CHECKS],[NPM,BROWSER_CHECK]),a=batchFake(b.lead),c=batchConfig(b,3);
+  a.verifyIntegrated=async j=>{a.calls.push("verify");a.verifies.push(j);if(a.verifies.length===1)throw Object.assign(releaseError("Integrated matrix receipt is not eligible"),failure);return true;};
+  assert.equal((await runRelease(c,a)).outcome,"released");
+  assert.deepEqual(a.calls,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3","verify","batch-drop","verify","merged","deploy:tailos","finish"]);
+  assert.deepEqual(c.solo,["rel_b2","rel_b3"]);assert.deepEqual([...readBatchSolo(c.home)],["rel_b2","rel_b3"]);assert.deepEqual(batchFiles(c.home),["batch-solo.json"]);
+  const journal=batchJournal(c);assert.equal(journal.batch,null);
+  return {batchId:batchId("rel_b1",2,b.tip),fallback:journal.batchFallback};
+ };
+ const base={reason:"batch-matrix-failed",detail:"Integrated matrix receipt is not eligible",members:["rel_b2","rel_b3"],status:"done"};
+ let r=await run({failedChecks:["go-vet"],unnamed:0});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base,failed:[{checkId:"go-vet",jobs:["rel_b2"]}],unaffected:["rel_b1","rel_b3"]});
+ r=await run({failedChecks:["npm-unit","wasm-test-build"],unnamed:2});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base,failed:[{checkId:"npm-unit",jobs:["rel_b1","rel_b2","rel_b3"]},{checkId:"wasm-test-build",jobs:[]}],unaffected:[],unnamed:2});
+ // A failure that names no checks keeps today's fallback record.
+ r=await run({});
+ assert.deepEqual(r.fallback,{batchId:r.batchId,...base});
+ // The host adapter names a receipt's failed checks, validated and counted.
+ const h=matrixHost({receipt:{environment:{},checks:[{id:"go-vet",exitCode:1},{id:"npm-unit",exitCode:0},{id:"k",exitCode:1,knownFailure:true},{exitCode:1},{id:"bad id;",exitCode:2}]}});
+ await assert.rejects(h.verify(h.integrated),e=>failureReason(e)==="Integrated matrix receipt is not eligible" && e.message==="Integrated matrix receipt is not eligible" && JSON.stringify(e.failedChecks)==='["go-vet"]' && e.unnamed===2);
+ assert.equal(h.sends().length,0);
+ const many=Array.from({length:60},(_,i)=>({id:"c"+i,exitCode:1}));
+ assert.deepEqual(failedChecks({checks:many}),{failedChecks:many.slice(0,50).map(c=>c.id),unnamed:10});
+ assert.deepEqual(failedChecks({checks:[{id:"a",exitCode:0}]}),{failedChecks:[],unnamed:0});
+});
