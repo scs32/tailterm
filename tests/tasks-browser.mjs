@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { openVault } from "../client/vault-crypto.js";
 import { leaves } from "../client/pane-layout.js";
-import { checkGroupAlone, checkHelperWindow } from "./pane-groups-browser.mjs";
+import {
+  checkGroupAlone,
+  checkHelperWindow,
+  checkNeverNamedHelper,
+  recordHelperNames,
+} from "./pane-groups-browser.mjs";
 import { exerciseHomeSplitOffers } from "./workspace-controls-browser.mjs";
 
 // Drives the task hub through the UI against tests/fixture-hub.mjs: hub
@@ -1007,6 +1012,107 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   hub.api.closeTask(S.task.id);
   console.log(
     `Panes per group 4 re-split restore-split into ${resplit.map((t) => t.sessions.length).join(" + ")} panes; the stored groups came back after a refresh.`,
+  );
+
+  // The roster arrives after the restore: the hub refuses L's project read
+  // (not a 404, so the restore keeps L's panes) until rosterBack.
+  const rosterURL = new RegExp(`/fixture-hub/v1/tasks/${L.task.id}(\\?|$)`);
+  let refused = 0;
+  const refuse = (route) => {
+    refused++;
+    return route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: '{"error":"unavailable"}',
+    });
+  };
+  const reloadWithoutRoster = async (step) => {
+    await page.route(rosterURL, refuse);
+    const before = refused;
+    await hub.navigateWithHubHeld(page, () => page.reload());
+    await page.locator("#lockscreen").waitFor();
+    await unlock();
+    await waitFor(restored, `${step}: restore`, 90000);
+    assert.ok(refused > before, `${step}: the hub refused the project read`);
+  };
+  // The feed subscribes to L's events right after its first roster render.
+  const rosterBack = async (step) => {
+    const from = hub.api.requests.length;
+    await page.unroute(rosterURL, refuse);
+    await waitFor(
+      () =>
+        hub.api.requests
+          .slice(from)
+          .some((r) => r.startsWith(`GET /v1/tasks/${L.task.id}/events`)),
+      `${step}: the roster read`,
+    );
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+  };
+  const helperNames = () =>
+    page.evaluate(
+      (id) => globalThis.__helperNames.filter((s) => s.id === id),
+      helperId,
+    );
+  await recordHelperNames(page);
+
+  // A real helper restored before the roster keeps its place in Home, unnamed
+  // until the roster gives its role, then named from it.
+  await reloadWithoutRoster("late roster");
+  assert.equal(
+    await page
+      .locator(`.tab-strip > .home-tab [data-tab="${helperId}"]`)
+      .count(),
+    1,
+    "late roster: the helper is restored in Home",
+  );
+  await checkNeverNamedHelper(page, {
+    id: helperId,
+    step: "late roster, unknown role",
+  });
+  assert.deepEqual(
+    await page
+      .locator(".pane-header[data-home]")
+      .evaluateAll((els) => els.map((el) => el.dataset.pane)),
+    [helperId],
+    "late roster: the helper is alone in Home",
+  );
+  await rosterBack("late roster");
+  await waitFor(
+    async () =>
+      (await page.locator(".tab-strip > .home-tab .tab-name").textContent()) ===
+      "Owner helper - restore-live",
+    "late roster: the helper named from its role",
+  );
+  await helperWindow("after a late roster", helperBox);
+  assert.ok(
+    (await helperNames()).length,
+    "late roster: the recorder saw the helper's name",
+  );
+
+  // An older workspace saved an ordinary agent's pane inside Home. Restored
+  // bindings carry no role, so a pane saved in Home whose agent is not the
+  // helper is that case: it is never named Owner helper, before or after the
+  // roster arrives.
+  helperAgent.role = "";
+  await reloadWithoutRoster("old workspace");
+  assert.equal(
+    await page
+      .locator(`.tab-strip > .home-tab [data-tab="${helperId}"]`)
+      .count(),
+    1,
+    "old workspace: the pane is restored in Home",
+  );
+  await checkNeverNamedHelper(page, {
+    id: helperId,
+    step: "old workspace, unknown role",
+  });
+  await rosterBack("old workspace");
+  await checkNeverNamedHelper(page, {
+    id: helperId,
+    step: "old workspace, after the roster",
+  });
+  console.log(
+    `Late roster passed: a restored helper is unnamed until the roster (${refused} refused reads), then Owner helper - restore-live; an ordinary pane saved in Home is never named Owner helper.`,
   );
 
   // Leave the hub and tabs as the later checks expect them.

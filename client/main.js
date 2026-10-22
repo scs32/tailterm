@@ -1277,15 +1277,15 @@ function renderTabs() {
   if (t?.retryMessage)
     $("#terminal-status").textContent += " · " + t.retryMessage;
 }
-// A Home pane is the owner helper's: its name comes from the hub role and the
-// project, never the tmux session.
+// The owner helper's Home pane is named from its hub role and the project,
+// never the tmux session. Home membership alone names nothing: an older
+// workspace may have saved another pane there, so the role comes from the
+// binding, else the hub's roster; while it is unknown the pane keeps its
+// ordinary tab name.
 function helperName(t) {
-  return t?.home
-    ? helperLabel(
-        { ...t.task, role: "owner_helper" },
-        taskHub?.name(t.task?.taskId),
-      )
-    : "";
+  if (!t?.home) return "";
+  const role = t.task?.role ?? taskHub?.role(t.task?.taskId, t.task?.agentId);
+  return helperLabel({ ...t.task, role }, taskHub?.name(t.task?.taskId));
 }
 // The pinned Home tab is the owner helper's window: it mirrors home's focused
 // pane, so tab actions (select, session menu, close) work on it. With no

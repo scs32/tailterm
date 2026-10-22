@@ -205,6 +205,78 @@ export async function checkHelperWindow(
   }
   return box;
 }
+// Records, from each page load on, every pane named as the owner helper: in
+// its tab, its pane header, or the browser title while it is focused. Call
+// before the page opens; checkNeverNamedHelper reads the record.
+export async function recordHelperNames(page) {
+  await page.addInitScript(() => {
+    const seen = (globalThis.__helperNames = []);
+    const note = (id, where, text) => {
+      if (
+        id &&
+        text.includes("Owner helper") &&
+        !seen.some((s) => s.id === id && s.where === where && s.text === text)
+      )
+        seen.push({ id, where, text });
+    };
+    const scan = () => {
+      for (const label of document.querySelectorAll(".pane-header .pane-label"))
+        note(
+          label.closest(".pane-header").dataset.pane,
+          "pane",
+          label.textContent,
+        );
+      for (const tab of document.querySelectorAll(
+        ".tab-strip > .home-tab [data-tab], #tabs [data-tab]",
+      ))
+        note(
+          tab.dataset.tab,
+          "tab",
+          `${tab.textContent} ${tab.querySelector(".home-mark")?.getAttribute("aria-label") || ""}`,
+        );
+      note(
+        document.querySelector(".pane-header.active")?.dataset.pane,
+        "title",
+        document.title,
+      );
+    };
+    new MutationObserver(scan).observe(document, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-label", "class"],
+    });
+  });
+}
+// A task-bound pane that is not the owner helper, which an older workspace
+// saved inside Home: since the page loaded (see recordHelperNames) it was never
+// named Owner helper, and focused now, its tab, header and the browser title
+// give its ordinary name (`name`, when given).
+export async function checkNeverNamedHelper(page, { id, name, step }) {
+  const header = page.locator(`.pane-header[data-pane="${id}"]`);
+  await page
+    .locator(
+      `.tab-strip > .home-tab [data-tab="${id}"], #tabs [data-tab="${id}"]`,
+    )
+    .click();
+  await header.locator(".pane-label").click();
+  await page.locator(`.pane-header.active[data-pane="${id}"]`).waitFor();
+  const label = await header.locator(".pane-label").textContent();
+  assert.ok(!label.includes("Owner helper"), `${step}: pane header ${label}`);
+  if (name)
+    assert.ok(label.startsWith(name), `${step}: ${label} is the ordinary name`);
+  assert.ok(
+    !(await page.title()).includes("Owner helper"),
+    `${step}: browser title ${await page.title()}`,
+  );
+  const named = await page.evaluate(
+    (pane) => globalThis.__helperNames?.filter((s) => s.id === pane),
+    id,
+  );
+  assert.ok(named, `${step}: recordHelperNames ran before the page loaded`);
+  assert.deepEqual(named, [], `${step}: never named Owner helper`);
+}
 // Focusing a group shows the group alone: Home never sits beside it.
 export async function checkGroupAlone(page, tabId) {
   await page.locator(`#tabs [data-tab="${tabId}"]`).click();

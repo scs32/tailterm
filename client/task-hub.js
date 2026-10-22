@@ -457,6 +457,8 @@ export function createTaskHub(host) {
       }
       await reconcile(feed);
       if (feed.stopped) return;
+      // The first roster names the Home pane: redraw its tab and the title.
+      host.render();
       const subscription = client.subscribe(
         taskId,
         async (events) => {
@@ -3598,6 +3600,8 @@ export function createTaskHub(host) {
     attachToCurrent,
     settings,
     name: (id) => cache.get(id)?.task?.name,
+    role: (taskId, agentId) =>
+      cache.get(taskId)?.agents?.find((a) => a.id === agentId)?.role,
     stopAll,
     attach,
     detach,
