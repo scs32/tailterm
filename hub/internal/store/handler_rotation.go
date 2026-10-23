@@ -182,9 +182,39 @@ func primaryHandler(ctx context.Context, q queryRower, task api.Task) (api.Agent
 			return a, err
 		}
 	}
-	return scanAgent(q.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?)
- AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id LIMIT 1`,
-		task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, task.ID))
+	return oldestHandler(ctx, q, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?)
+ AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared')`,
+		task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited, task.ID)
+}
+
+// oldestHandler is the earliest-created handler the query returns, by parsed
+// creation time and then id. Stored times drop trailing zeros, so as text a
+// handler created on a whole millisecond sorts after a later one in that
+// millisecond (FINDING #32673). The parsed time survives a VACUUM, which may
+// renumber the rowid of agents.
+func oldestHandler(ctx context.Context, q queryRower, query string, args ...any) (api.Agent, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return api.Agent{}, err
+	}
+	defer rows.Close()
+	oldest, found := api.Agent{}, false
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return api.Agent{}, err
+		}
+		if !found || a.CreatedAt.Before(oldest.CreatedAt) || a.CreatedAt.Equal(oldest.CreatedAt) && a.ID < oldest.ID {
+			oldest, found = a, true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return api.Agent{}, err
+	}
+	if !found {
+		return api.Agent{}, sql.ErrNoRows
+	}
+	return oldest, nil
 }
 
 // exitedPrimaryHandler is the project's primary with the exited exclusion
@@ -202,9 +232,9 @@ func exitedPrimaryHandler(ctx context.Context, q queryRower, task api.Task) (api
 		}
 	}
 	if err != nil {
-		a, err = scanAgent(q.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status<>?
- AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared') ORDER BY created_at,id LIMIT 1`,
-			task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, task.ID))
+		a, err = oldestHandler(ctx, q, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status<>?
+ AND id NOT IN (SELECT successor_agent_id FROM handler_rotations WHERE task_id=? AND state='prepared')`,
+			task.ID, api.AgentRoleDatabaseHandler, api.AgentClosed, task.ID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return api.Agent{}, false, nil
 		}

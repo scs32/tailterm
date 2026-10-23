@@ -2918,3 +2918,59 @@ func TestHandlerRotationResentReason(t *testing.T) {
 		}
 	}
 }
+
+// Stored times drop trailing zeros, so a handler created on a whole
+// millisecond sorts after a later one in that millisecond as text. With no
+// recorded primary both fallbacks must still pick the older handler
+// (wi_fcdb3c8517ade6c3, order #44030, FINDING #32673).
+func TestPrimaryHandlerFallbackOrdersByParsedTime(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	aux := f.agent(t, "aux", api.AgentRoleDatabaseHandler)
+	created := func(a api.Agent, at string) {
+		t.Helper()
+		if _, err := f.s.db.Exec(`UPDATE agents SET created_at=? WHERE id=?`, at, a.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pick := func(wantPrimary, wantExited string, wantOK bool) {
+		t.Helper()
+		task, err := f.s.GetTask(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, err := primaryHandler(ctx, f.s.db, task); err != nil || p.ID != wantPrimary {
+			t.Errorf("primaryHandler = %s %v, want %s", p.ID, err, wantPrimary)
+		}
+		if e, ok, err := exitedPrimaryHandler(ctx, f.s.db, task); err != nil || e.ID != wantExited || ok != wantOK {
+			t.Errorf("exitedPrimaryHandler = %s %t %v, want %s %t", e.ID, ok, err, wantExited, wantOK)
+		}
+	}
+	created(f.old, "2026-10-13T01:44:15.994Z")
+	created(aux, "2026-10-13T01:44:15.994296Z")
+	pick(f.old.ID, f.old.ID, false)
+
+	// Equal times break by id.
+	created(aux, "2026-10-13T01:44:15.994Z")
+	first := f.old
+	if aux.ID < f.old.ID {
+		first = aux
+	}
+	pick(first.ID, first.ID, false)
+
+	// An exited older handler is the exited fallback but not the primary.
+	created(aux, "2026-10-13T01:44:15.994296Z")
+	if _, err := f.s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentExited, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	pick(aux.ID, f.old.ID, true)
+
+	// A recorded primary still wins over the older handler.
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`UPDATE tasks SET primary_handler_id=? WHERE id=?`, aux.ID, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	pick(aux.ID, aux.ID, false)
+}
