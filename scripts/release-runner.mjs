@@ -1352,7 +1352,8 @@ export async function runRelease(config, adapter) {
       checkpoint();
     }
     // One attempt; a failed post must not stop the bug request or the receipt.
-    const probeWaits=state.effects.flatMap(e=>[["live",e.liveCheck],["rollback",e.rollbackCheck]].filter(([,w])=>w).map(([probe,w])=>({target:e.target,probe,lastCommit:w.lastCommit,waitedMs:w.waitedMs})));
+    // A target is verified only after its live check passed.
+    const probeWaits=state.effects.flatMap(e=>[["live",e.liveCheck],["rollback",e.rollbackCheck]].filter(([,w])=>w).map(([probe,w])=>({target:e.target,probe,lastCommit:w.lastCommit,waitedMs:w.waitedMs,...(probe==="live"&&e.state==="verified"?{passed:true}:{})})));
     if(!state.escalationAttempted){state.escalationAttempted=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:state.outcome,...(state.revert?{revert:state.revert.outcome}:{}),...(state.effects.some(e=>e.rollback==="blocked")?{rollbackBlocked:true}:{}),...(probeWaits.length?{probeWaits}:{})});}catch{}}
     if(state.revert && !state.bugRequestAttempted){
       state.bugRequestAttempted=true;checkpoint();
@@ -1846,6 +1847,9 @@ export class HostAdapter {
     // Two TrueNAS plans made before either deploy would each pin the other's
     // pre-release mount, so hub and bridge together must share one plan.
     const {hub,bridge}=input.targets||{};
+    // A lone entry that names the paired plan would otherwise be refused only
+    // in the target loop, after publication.
+    if(!hub!==!bridge && same((hub||bridge).planTargets,PAIR))throw releaseError("Paired plan partner entry required");
     if(hub && bridge && (!same(hub.planTargets,PAIR) || !same(bridge.planTargets,PAIR) || ["release","planPath","preflightReceipt","preflightReceiptSHA256","backup","backupSHA256"].some(k=>hub[k]!==bridge[k])))throw releaseError("Hub and bridge need one paired plan");
     return input;
   }
@@ -2085,8 +2089,9 @@ export class HostAdapter {
     catch(error){if(error?.refusalRefused!==true)throw error;return this.native("refuse");}
   }
   async escalate(details={}){
-    // Only a re-validated 40-hex commit and whole seconds reach the text.
-    const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");
+    // Only a re-validated 40-hex commit and whole seconds reach the text. A
+    // live check that passed is not a cause of the failure and is left out.
+    const waits=(Array.isArray(details.probeWaits)?details.probeWaits:[]).filter(w=>w?.target==="tailos" && ["live","rollback"].includes(w.probe) && !(w.probe==="live" && w.passed===true)).map(w=>` TailOS ${w.probe==="live"?"live check":"rollback probe"} last saw ${sha(w.lastCommit)?w.lastCommit:"no readable release.json"}${Number.isSafeInteger(w.waitedMs)&&w.waitedMs>=0?` after ${Math.round(w.waitedMs/1000)} s`:""}.`).join("");
     if(details.outcome==="refused"){
       const reason=typeof details.reason==="string"&&REASON.test(details.reason)?details.reason:"unclassified";
       return this.command([this.config.tt||"tt","send","--kind","notice","--subject","Release refused before publication","--text",`Release ${this.job.id} was refused before publication; nothing was published or deployed. Reason: ${reason}.${reason.startsWith("integration-conflict")?" Next: re-apply the candidate on the current tasks-hub through a follow-through item and re-review the new commit.":""} Handler reconciliation required.`,"--request-id",`${this.job.id}-release-failure`,"--ref",`release-job=${this.job.id}`,...wakeRef(WAKE.attention)]);
@@ -2374,8 +2379,10 @@ export function retentionPolicy(config){
 // directly in one that is not evidence (ATTEMPT_KEPT, and every .log) goes
 // once it is attemptDays old. The directory itself always stays.
 //
-// Every removal is appended to retention.jsonl before it happens. Returns the
-// records written.
+// Every removal is appended to retention.jsonl before it happens. A file
+// whose earlier record is already there (its removal failed or was stopped) is
+// removed again without a second line: a terminal job's file names are never
+// made again. Returns the records written.
 const DIST=/^tailos-dist-([a-f0-9]{40})$/,ATTEMPT_KEPT=["receipt.json","context.json","plan.json","plan.preserved.json","run.json","run.json.set-aside"];
 export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
   const policy=retentionPolicy(config),dir=config.journalDirectory,records=[];
@@ -2385,8 +2392,11 @@ export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
     const fd=openSync(join(dir,"retention.jsonl"),"a",0o600);try{writeFileSync(fd,JSON.stringify(record)+"\n");fsyncSync(fd);}finally{closeSync(fd);}
     gone();records.push(record);return bytes;
   };
+  const key=(jobId,file,kind)=>JSON.stringify([jobId,file,kind]),logged=new Set();
+  try{for(const line of readFileSync(join(dir,"retention.jsonl"),"utf8").split("\n")){try{const r=JSON.parse(line);logged.add(key(r.jobId,r.file,r.kind));}catch{}}}catch{}
   const remove=(jobId,file,kind,reason)=>{
     const bytes=size(file);if(bytes===null)return 0;
+    if(logged.has(key(jobId,file,kind))){rmSync(join(dir,file));return bytes;}
     return recorded(jobId,file,kind,bytes,reason,()=>rmSync(join(dir,file)));
   };
   // A job's backup copy names of every generation, and those from before

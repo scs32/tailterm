@@ -398,6 +398,20 @@ test("retention removes a terminal job's backup copies of every generation and n
  assert.deepEqual(sweep(j,jobs,{releasedBackups:1,backupBudgetBytes:40}).map(r=>[r.file,r.reason]),[["rel_new-g4-truenas-backup.sqlite","budget"],["rel_new-g9-truenas-backup.sqlite","budget"]]);
  assert.deepEqual(j.names(),[...others,...live].sort());
 });
+test("p3 a backup or rehearsal copy that cannot be unlinked is recorded once over two sweeps and goes later without a second line",()=>{
+ const jobs=[{id:"rel_ref",state:"refused"}],at="2026-10-01T09:30:00.000Z";
+ // A backup copy in a journal directory that refuses the unlink; the log already exists, so its append still works.
+ const b=journalFixture({"rel_ref-bridge-backup.sqlite":11}),backup={version:1,at,jobId:"rel_ref",file:"rel_ref-bridge-backup.sqlite",kind:"backup",bytes:11,reason:"not-released"};
+ writeFileSync(join(b.dir,"retention.jsonl"),"",{mode:0o600});chmodSync(b.dir,0o500);
+ try{for(const n of [1,2]){assert.throws(()=>sweep(b,jobs,{}),/EACCES|EPERM/,"sweep "+n);assert.deepEqual(b.lines(),[backup],"sweep "+n);}}finally{chmodSync(b.dir,0o700);}
+ assert.deepEqual(b.names(),["rel_ref-bridge-backup.sqlite"]);
+ assert.deepEqual(sweep(b,jobs,{}),[],"the earlier line already records it");assert.deepEqual(b.names(),[]);assert.deepEqual(b.lines(),[backup]);
+ // A rehearsal file in a state directory that refuses the unlink.
+ const state=copyOf("rel_ref")+".rehearsal-rel_ref.state",r=journalFixture({}),rehearsal={version:1,at,jobId:"rel_ref",file:state+"/copy.sqlite-wal",kind:"rehearsal",bytes:5,reason:"terminal"};
+ mkdirSync(join(r.dir,state));writeFileSync(join(r.dir,state,"copy.sqlite-wal"),"x".repeat(5));chmodSync(join(r.dir,state),0o500);
+ try{for(const n of [1,2]){assert.throws(()=>sweep(r,jobs,{}),/EACCES|EPERM/,"sweep "+n);assert.deepEqual(r.lines(),[rehearsal],"sweep "+n);}}finally{chmodSync(join(r.dir,state),0o700);}
+ assert.deepEqual(sweep(r,jobs,{}),[]);assert.deepEqual(r.names(),[]);assert.deepEqual(r.lines(),[rehearsal]);
+});
 test("a8 retention defaults apply, an invalid value stops the daemon before any command, and a failed sweep does not hold the poll",async()=>{
  assert.deepEqual(retentionPolicy({}),{releasedBackups:3,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:3});assert.deepEqual(retentionPolicy({retention:{releasedBackups:0,attemptDays:0}}),{releasedBackups:0,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:0});
  const cwd=mkdtempSync(join(tmpdir(),"release-retention-daemon-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");
@@ -1093,6 +1107,16 @@ test("a3 the host adapter refuses unpaired hub and bridge inputs before publicat
  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake();a.verifyInputs=async()=>{throw releaseError("Hub and bridge need one paired plan");};
  await assert.rejects(runRelease(config(f,j),a),/refused/);assert.deepEqual(a.calls,["refuse","escalate"]);assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
 });
+test("p1 p2 a lone hub or bridge entry that names the paired plan is refused before publication",async()=>{
+ const h=pairedHost();
+ for(const lone of ["hub","bridge"]){h.importTargets({[lone]:h.shared});assert.throws(()=>h.adapter.jobInputs(h.commit),/^Error: Paired plan partner entry required$/,lone);}
+ // The real input check, reached through runRelease before publishIntegration.
+ h.importTargets({hub:h.shared});
+ const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);a.verifyInputs=async()=>{h.adapter.jobInputs(h.commit);return true;};
+ await assert.rejects(runRelease(c,a),/refused/);
+ assert.deepEqual(a.calls,["refuse","escalate"],"no merged call and no deploy");assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);assert.equal(remoteHead(f),f.base);
+ const journal=JSON.parse(readFileSync(c.journalPath,"utf8"));assert.equal(journal.refusalReason,"Paired plan partner entry required");assert.notEqual(journal.published,true);
+});
 test("a3 a paired plan deploys once with the shared plan and refuses a stale or changed partner",async()=>{
  const stale=pairedHost({bridgeRelease:"20260929-live"});stale.importTargets({hub:stale.shared,bridge:stale.shared});
  await assert.rejects(stale.adapter.prepare("hub",stale.commit),/mount this release/);await assert.rejects(stale.adapter.prepare("bridge",stale.commit),/mount this release/);
@@ -1783,6 +1807,17 @@ test("R5 the escalation names the TailOS waits and never echoes release.json con
  const text=calls[0][calls[0].indexOf("--text")+1];
  assert.ok(text.includes(`TailOS live check last saw ${"c".repeat(40)} after 90 s.`));assert.ok(text.includes("TailOS rollback probe last saw no readable release.json after 90 s."));
  assert.ok(!text.includes("SYNTHETIC")&&!text.includes("90 s; rm"),text);
+ // A live check that passed is left out; the rollback probe is still named.
+ await adapter.escalate({outcome:"rolled_back",probeWaits:[{target:"tailos",probe:"live",lastCommit:"d".repeat(40),waitedMs:30000,passed:true},{target:"tailos",probe:"rollback",lastCommit:"e".repeat(40),waitedMs:4000}]});
+ const passed=calls[1][calls[1].indexOf("--text")+1];
+ assert.ok(!passed.includes("live check")&&!passed.includes("d".repeat(40)),passed);assert.ok(passed.includes(`TailOS rollback probe last saw ${"e".repeat(40)} after 4 s.`),passed);
+});
+test("p4 the escalation marks a live check that passed and not one that failed",async()=>{
+ const f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});change(f,"hub/cmd/tt/main.go","fixture");const j=job(f,change(f,"client/a.js","a")),a=fake();let escalation;
+ const wait={lastCommit:"c".repeat(40),waitedMs:9000};
+ a.check=async t=>t==="tailos"?"identity":true;a.probeWait=(t,kind)=>kind==="live"?wait:undefined;a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(config(f,j),a),/inspect saved journal/);
+ assert.deepEqual(escalation.probeWaits,[{target:"mini",probe:"live",...wait,passed:true},{target:"tailos",probe:"live",...wait}]);
 });
 test("R6 an invalid TailOS switch window stops the daemon before any command",async()=>{
  const cwd=mkdtempSync(join(tmpdir(),"tailos-window-")),log=join(cwd,"calls.log"),fakeTT=join(cwd,"tt");
