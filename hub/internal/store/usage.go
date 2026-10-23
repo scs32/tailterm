@@ -97,31 +97,94 @@ func replaceUsageTurnTotal(ctx context.Context, tx *sql.Tx, task, agent, run, re
 	return err
 }
 
-// backfillUsageTurnTotals gives a totals row to every stored turn that has
+// usageTurnTotalChecksSchema keeps the stored turns whose totals row may no
+// longer match their current revision, as usageItemShareChecksSchema does for
+// share rows. Its triggers add a turn when it is inserted, when its key or
+// revision changes (the turn upsert included), and when its totals row is
+// deleted or rekeyed, whichever binary makes the change, so a turn an older
+// binary writes or revises after a rollback is listed too. A payload rewrite
+// adds nothing.
+const usageTurnTotalChecksSchema = `CREATE TABLE IF NOT EXISTS usage_turn_total_checks(turn_rowid INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS usage_turn_total_checks_turn_insert AFTER INSERT ON usage_turns
+ BEGIN INSERT INTO usage_turn_total_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_turn_total_checks WHERE turn_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_turn_total_checks_turn_update AFTER UPDATE OF task_id,agent_id,run_id,request_id,revision ON usage_turns
+ BEGIN INSERT INTO usage_turn_total_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_turn_total_checks WHERE turn_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_turn_total_checks_total_delete AFTER DELETE ON usage_turn_totals
+ BEGIN INSERT INTO usage_turn_total_checks SELECT t.rowid FROM usage_turns t WHERE t.task_id=OLD.task_id AND t.agent_id=OLD.agent_id AND t.run_id=OLD.run_id AND t.request_id=OLD.request_id
+ AND NOT EXISTS (SELECT 1 FROM usage_turn_total_checks c WHERE c.turn_rowid=t.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_turn_total_checks_total_update AFTER UPDATE OF task_id,agent_id,run_id,request_id,turn_revision ON usage_turn_totals
+ BEGIN INSERT INTO usage_turn_total_checks SELECT t.rowid FROM usage_turns t WHERE t.task_id=OLD.task_id AND t.agent_id=OLD.agent_id AND t.run_id=OLD.run_id AND t.request_id=OLD.request_id
+ AND NOT EXISTS (SELECT 1 FROM usage_turn_total_checks c WHERE c.turn_rowid=t.rowid); END;`
+
+// usageTurnTotalChecked is nil in production. Tests set it to count the turns
+// each backfill batch examined, or to return an error that stops the backfill
+// after a committed batch.
+var usageTurnTotalChecked func(examined int) error
+
+// backfillUsageTurnTotals gives a totals row to every listed turn that has
 // none at its current revision: turns stored before the table existed, and
-// turns an older binary wrote or revised after a rollback. Like
-// backfillUsageItemShares it is idempotent and works in bounded transactions,
-// so an interrupted open resumes. A turn whose projection does not decode gets
-// no row, as the allowance read skipped it before.
+// turns an older binary wrote or revised after a rollback. It reads only the
+// turns usage_turn_total_checks lists, so an open costs the turns changed since
+// the last one, not the whole history. When any of the list's triggers is
+// missing it lists every turn once. Like backfillUsageItemShares it is
+// idempotent and works in bounded transactions that clear the turns they
+// checked, so an interrupted open resumes. A turn whose projection does not
+// decode gets no row, as the allowance read skipped it before.
 func backfillUsageTurnTotals(db *sql.DB) error {
 	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	var triggers int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('usage_turn_total_checks_turn_insert','usage_turn_total_checks_turn_update','usage_turn_total_checks_total_delete','usage_turn_total_checks_total_update')`).Scan(&triggers); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if triggers < 4 {
+		if _, err = tx.ExecContext(ctx, usageTurnTotalChecksSchema); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_turn_total_checks SELECT rowid FROM usage_turns`); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
 	type turn struct {
-		rowid, revision                       int64
+		revision                              int64
 		task, agent, run, request, projection string
 	}
-	after := int64(0)
 	for {
-		rows, err := db.QueryContext(ctx, `SELECT t.rowid,t.revision,t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turns t
- WHERE t.rowid>? AND NOT EXISTS (SELECT 1 FROM usage_turn_totals s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
- ORDER BY t.rowid LIMIT 500`, after)
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
+			return err
+		}
+		var examined int
+		var last sql.NullInt64
+		if err = tx.QueryRowContext(ctx, `SELECT count(*),max(turn_rowid) FROM (SELECT turn_rowid FROM usage_turn_total_checks ORDER BY turn_rowid LIMIT 500)`).Scan(&examined, &last); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if examined == 0 {
+			return tx.Rollback()
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT t.revision,t.task_id,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turn_total_checks c JOIN usage_turns t ON t.rowid=c.turn_rowid
+ WHERE c.turn_rowid<=? AND NOT EXISTS (SELECT 1 FROM usage_turn_totals s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
+ ORDER BY c.turn_rowid`, last.Int64)
+		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		batch := []turn{}
 		for rows.Next() {
 			var x turn
-			if err = rows.Scan(&x.rowid, &x.revision, &x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
+			if err = rows.Scan(&x.revision, &x.task, &x.agent, &x.run, &x.request, &x.projection); err != nil {
 				rows.Close()
+				tx.Rollback()
 				return err
 			}
 			batch = append(batch, x)
@@ -129,17 +192,10 @@ func backfillUsageTurnTotals(db *sql.DB) error {
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return err
-		}
-		if len(batch) == 0 {
-			return nil
-		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		for _, x := range batch {
-			after = x.rowid
 			var p struct {
 				Turn struct {
 					Runtime string           `json:"runtime"`
@@ -155,8 +211,18 @@ func backfillUsageTurnTotals(db *sql.DB) error {
 				return err
 			}
 		}
+		// Rekeying a stale totals row listed these turns again; clear them after.
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_turn_total_checks WHERE turn_rowid<=?`, last.Int64); err != nil {
+			tx.Rollback()
+			return err
+		}
 		if err = tx.Commit(); err != nil {
 			return err
+		}
+		if usageTurnTotalChecked != nil {
+			if err = usageTurnTotalChecked(examined); err != nil {
+				return err
+			}
 		}
 	}
 }

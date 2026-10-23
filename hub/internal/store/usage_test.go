@@ -3044,3 +3044,156 @@ func TestUsageItemShareBackfillChecksChangedTurns(t *testing.T) {
 		t.Fatalf("the open after the backfill examined %d turns", n)
 	}
 }
+
+// t1, t2: the totals backfill checks only the turns changed since the last
+// open, as the item-share backfill does. A store from before the check list is
+// backfilled once, and an interrupted backfill resumes where it stopped. A
+// turn inserted without totals, one revised in place by the turn upsert, one
+// whose totals row is deleted and one whose totals row is rekeyed, as an older
+// binary or a manual repair would leave them, get totals at the next open,
+// which examines those four and no other turn; a payload rewrite lists
+// nothing, and an unreadable projection is skipped once.
+func TestUsageTurnTotalsBackfillChecksChangedTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	examined, stop := []int{}, errors.New("stopped after one batch")
+	usageTurnTotalChecked = func(n int) error {
+		examined = append(examined, n)
+		if len(examined) == 1 && stop != nil {
+			return stop
+		}
+		return nil
+	}
+	t.Cleanup(func() { usageTurnTotalChecked = nil })
+	const turns = 1200
+	task, agent, run := "tsk_00000000000000cc", "agt_00000000000000cc", "run_00000000000000cc"
+	at := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	projection := func(id string, revision, input int) string {
+		return fmt.Sprintf(`{"turn":{"id":%q,"revision":%d,"runtime":"codex","session":"s","model":"m","at":%q,"tokens":{"input":%d,"cached":900,"cacheWrite":0,"output":40,"reasoning":10},"raw":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10},"sourceDigest":%q,"activation":"a","complete":true},"agentId":%q,"runId":%q,"role":"builder","roleSource":"name","phase":"build","phaseReason":"synthetic","shares":[{"taskId":%q,"denominator":1,"reason":"synthetic"}]}`,
+			id, revision, at.Format(time.RFC3339Nano), input, strings.Repeat("a", 64), agent, run, task)
+	}
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := s.db.Exec(query, args...); err != nil {
+			t.Fatal(query, err)
+		}
+	}
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+			t.Fatal(query, err)
+		}
+		return n
+	}
+	// The old full scan: turns with no totals row at their current revision.
+	const missing = `SELECT count(*) FROM usage_turns t WHERE NOT EXISTS (SELECT 1 FROM usage_turn_totals s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)`
+	const triggers = `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'usage_turn_total_checks_%'`
+	reopen := func() int {
+		t.Helper()
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		examined = examined[:0]
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, n := range examined {
+			total += n
+		}
+		return total
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.Prepare(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < turns; i++ {
+		id := fmt.Sprintf("t%04d", i)
+		p := projection(id, 1, 100)
+		if i == 900 {
+			p = "not json"
+		}
+		if _, err := insert.Exec(task, agent, run, id, ts(at), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Return the file to a store from before the check list.
+	for _, statement := range []string{`DROP TRIGGER usage_turn_total_checks_turn_insert`, `DROP TRIGGER usage_turn_total_checks_turn_update`,
+		`DROP TRIGGER usage_turn_total_checks_total_delete`, `DROP TRIGGER usage_turn_total_checks_total_update`, `DROP TABLE usage_turn_total_checks`} {
+		exec(statement)
+	}
+	if n := count(missing); n != turns {
+		t.Fatalf("%d turns without totals before the backfill, want %d", n, turns)
+	}
+
+	// An interrupted backfill lists every turn, commits one batch and leaves
+	// the rest listed.
+	if err := backfillUsageTurnTotals(s.db); !errors.Is(err, stop) {
+		t.Fatalf("interrupted backfill: %v", err)
+	}
+	if n := count(triggers); n != 4 {
+		t.Fatalf("%d check triggers after the first backfill, want 4", n)
+	}
+	if n, listed := count(missing), count(`SELECT count(*) FROM usage_turn_total_checks`); n != turns-500 || listed != turns-500 {
+		t.Fatalf("after one batch %d turns lack totals and %d are listed, want %d", n, listed, turns-500)
+	}
+	stop = nil
+
+	// The next open resumes with the listed turns only.
+	if n := reopen(); n != turns-500 {
+		t.Fatalf("the resumed open examined %d turns, want %d", n, turns-500)
+	}
+	if n := count(missing); n != 1 || count(missing+` AND t.request_id='t0900'`) != 1 {
+		t.Fatalf("%d turns lack totals after the resumed open, want only the unreadable t0900", n)
+	}
+	if n := count(`SELECT count(*) FROM usage_turn_totals WHERE task_id=? AND turn_revision=1 AND runtime='codex' AND tokens=1050 AND at_ns=?`, task, at.UnixNano()); n != turns-1 {
+		t.Fatalf("%d totals rows after the resumed open, want %d", n, turns-1)
+	}
+	if n := count(`SELECT count(*) FROM usage_turn_total_checks`); n != 0 {
+		t.Fatalf("%d turns still listed", n)
+	}
+
+	// With nothing changed, an open examines no turn, the unreadable one too.
+	if n := reopen(); n != 0 {
+		t.Fatalf("an open with nothing changed examined %d turns", n)
+	}
+
+	// An older binary inserts a turn and revises another in place through the
+	// turn upsert, both without totals; one totals row is deleted and one is
+	// rekeyed to an older revision; the retention cleanup rewrites a payload.
+	exec(`INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`, task, agent, run, "t9999", ts(at), projection("t9999", 1, 100))
+	exec(`INSERT INTO usage_turns VALUES(?,?,?,?,2,?,'',?) ON CONFLICT(task_id,agent_id,run_id,request_id) DO UPDATE SET revision=excluded.revision,at=excluded.at,payload=excluded.payload,projection=excluded.projection`,
+		task, agent, run, "t0042", ts(at), projection("t0042", 2, 300))
+	exec(`DELETE FROM usage_turn_totals WHERE request_id='t0044'`)
+	exec(`UPDATE usage_turn_totals SET turn_revision=0,tokens=999999 WHERE request_id='t0045'`)
+	exec(`UPDATE usage_turns SET payload='x' WHERE request_id='t0043'`)
+	if n := count(missing); n != 5 {
+		t.Fatalf("%d turns lack totals before the next open, want 5", n)
+	}
+	if n := reopen(); n != 4 {
+		t.Fatalf("the open after four changed turns examined %d, want 4", n)
+	}
+	if n := count(missing); n != 1 {
+		t.Fatalf("%d turns lack totals after the next open, want only t0900", n)
+	}
+	if got := tableDump(t, s, `SELECT request_id,turn_revision,tokens FROM usage_turn_totals WHERE request_id IN ('t0042','t0044','t0045','t9999') ORDER BY request_id`); got != "request_id=t0042|turn_revision=2|tokens=1250|\nrequest_id=t0044|turn_revision=1|tokens=1050|\nrequest_id=t0045|turn_revision=1|tokens=1050|\nrequest_id=t9999|turn_revision=1|tokens=1050|\n" {
+		t.Fatalf("totals rows of the changed turns:\n%s", got)
+	}
+	if n := reopen(); n != 0 {
+		t.Fatalf("the open after the backfill examined %d turns", n)
+	}
+}
