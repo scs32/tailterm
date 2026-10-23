@@ -19,6 +19,12 @@ const esc = (s) =>
         c
       ],
   );
+// Stored text as an untouched form field holds it: a textarea reads CR and
+// CRLF as LF, and HTML drops one leading newline from its initial text.
+const asField = (text) =>
+  String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/^\n/, "");
 const statuses = {
   open: "Open",
   in_progress: "In progress",
@@ -462,8 +468,10 @@ export function createWorkItemsView({
         let request = { ...body, kind, requestId: key };
         if (item) {
           const changed = {
-            ...(body.title !== item.title ? { title: body.title } : {}),
-            ...(body.description !== (item.description || "")
+            ...(body.title !== asField(item.title)
+              ? { title: body.title }
+              : {}),
+            ...(body.description !== asField(item.description)
               ? { description: body.description }
               : {}),
             ...(status !== item.status ? { status } : {}),

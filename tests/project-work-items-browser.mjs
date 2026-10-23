@@ -553,6 +553,34 @@ try {
       assert.equal(rescoped.title, `${name} accepted bug, new scope`);
       assert.equal(rescoped.scopeRevision, accepted.scopeRevision + 1, "the deliberate scope change did not advance the scope");
 
+      // A textarea holds CR and CRLF as LF and drops one leading newline, so a
+      // stored description with either still counts as untouched; a real edit
+      // is sent exactly as typed.
+      const storedText = "\nfirst line\r\nsecond line\rthird line";
+      const raw = await api("POST", `/v1/tasks/${source.task.id}/work-items`, { kind: "bug", title: `${name} CR bug`, description: storedText, requestId: `${name}-cr-bug` });
+      assert.equal(raw.description, storedText);
+      await page.evaluate(() => qa.bugs.reload());
+      await page.locator(`[data-item-edit="${raw.id}"]`).click();
+      await fetch(origin + "/qa/update-bodies", { method: "POST" });
+      await page.locator('#work-item-priority').selectOption("high");
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      bodies = await (await fetch(origin + "/qa/update-bodies")).json();
+      assert.deepEqual(bodies.map((body) => Object.keys(body).sort()), [["expectedRevision", "priority", "requestId"]], "an untouched CR description was sent as changed");
+      const reprioritized = await item(source.task.id, raw.id);
+      assert.equal(reprioritized.priority, "high");
+      assert.equal(reprioritized.description, storedText, "the untouched description was rewritten");
+      await page.locator(`[data-work-item="${raw.id}"]`).filter({ hasText: "High" }).waitFor();
+      await page.locator(`[data-item-edit="${raw.id}"]`).click();
+      await page.locator('#work-item-description').fill("\nedited line\nnext line");
+      await page.locator('#work-item-form button[type=submit]').click();
+      await page.locator('#dialog').waitFor({ state: "hidden" });
+      bodies = await (await fetch(origin + "/qa/update-bodies")).json();
+      assert.equal(bodies.length, 2, "the description edit was not sent");
+      assert.deepEqual(Object.keys(bodies[1]).sort(), ["description", "expectedRevision", "requestId"]);
+      assert.equal(bodies[1].description, "\nedited line\nnext line", "the edited text was not sent as typed");
+      assert.equal((await item(source.task.id, raw.id)).description, "\nedited line\nnext line");
+
       // A feature is its own kind and survives a mode switch/reload.
       await page.locator('[data-mode="features"]').click();
       await page.locator('[data-items-new]').waitFor();
