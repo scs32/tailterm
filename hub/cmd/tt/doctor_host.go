@@ -987,11 +987,66 @@ func releaseChecks() []doctorCheck {
 	return append(checks, deployConfigChecks()...)
 }
 
-// wranglerCheck finds wrangler on PATH or in npm's npx cache without running
-// it or npx.
+// wranglerCheck checks the wrangler releases run: the exact devDependency pin
+// installed in the deployer checkout named by the deployer config's cwd.
+// Without that config it falls back to PATH or npm's npx cache, which releases
+// do not use. It never runs wrangler, npm or npx.
 func wranglerCheck(d *doctorRun) doctorResult {
+	if doc, _, ok := d.deployConfigDoc(); ok {
+		if cwd, _ := doc["cwd"].(string); cwd != "" {
+			return pinnedWranglerCheck(d, cwd)
+		}
+	}
+	return unpinnedWranglerCheck(d)
+}
+
+var doctorExactSemverRE = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
+// pinnedWranglerCheck mirrors pinnedWrangler in scripts/release-inputs.mjs:
+// package.json pins an exact devDependencies.wrangler, node_modules/wrangler
+// has that version and node_modules/.bin/wrangler exists. Lines never name
+// the checkout path.
+func pinnedWranglerCheck(d *doctorRun, cwd string) doctorResult {
+	const fix = "npm ci in the deployer checkout"
+	var pkg struct {
+		DevDependencies struct {
+			Wrangler string `json:"wrangler"`
+		} `json:"devDependencies"`
+	}
+	b, err := d.p.readFile(filepath.Join(cwd, "package.json"))
+	if err != nil || json.Unmarshal(b, &pkg) != nil {
+		return checkMissing("deployer checkout package.json not readable", "check cwd in the deployer config")
+	}
+	pin := pkg.DevDependencies.Wrangler
+	if !doctorExactSemverRE.MatchString(pin) {
+		return checkMissing("deployer checkout package.json has no exact wrangler pin", "pin an exact wrangler version in package.json devDependencies")
+	}
+	version, engines, ok := readWranglerPackage(d, filepath.Join(cwd, "node_modules", "wrangler", "package.json"))
+	if !ok {
+		return checkMissing("pinned wrangler "+pin+" not installed in the deployer checkout", fix)
+	}
+	if version != pin {
+		have := "an unreadable version"
+		if doctorExactSemverRE.MatchString(version) {
+			have = version
+		}
+		return checkWrong("deployer checkout has wrangler "+have+", package.json pins "+pin, fix)
+	}
+	if _, err := d.p.stat(filepath.Join(cwd, "node_modules", ".bin", "wrangler")); err != nil {
+		return checkMissing("pinned wrangler "+pin+" has no node_modules/.bin/wrangler", fix)
+	}
+	if res, ok := wranglerEnginesCheck(d, pin, engines); !ok {
+		return res
+	}
+	return checkOK("wrangler " + pin + " pinned in the deployer checkout")
+}
+
+// unpinnedWranglerCheck finds wrangler on PATH or in npm's npx cache. Releases
+// run the deployer checkout's pinned copy instead, so its lines say so.
+func unpinnedWranglerCheck(d *doctorRun) doctorResult {
+	const notReleases = "; not what releases use"
 	if path, err := d.p.lookPath("wrangler"); err == nil {
-		return checkOK(path + " (version not checked)")
+		return checkOK(path + " (version not checked)" + notReleases)
 	}
 	cache := d.p.env("npm_config_cache")
 	if cache == "" {
@@ -1000,37 +1055,56 @@ func wranglerCheck(d *doctorRun) doctorResult {
 	matches, _ := d.p.glob(filepath.Join(cache, "_npx", "*", "node_modules", "wrangler", "package.json"))
 	best, engines := "", ""
 	for _, m := range matches {
-		b, err := d.p.readFile(m)
-		if err != nil {
-			continue
-		}
-		var pkg struct {
-			Version string `json:"version"`
-			Engines struct {
-				Node string `json:"node"`
-			} `json:"engines"`
-		}
-		if json.Unmarshal(b, &pkg) != nil {
-			continue
-		}
-		parsed, ok := parseSemver(pkg.Version)
+		version, e, ok := readWranglerPackage(d, m)
 		if !ok {
 			continue
 		}
-		if best == "" || compareSemver(pkg.Version, best) > 0 {
-			best, engines = semverText(parsed), pkg.Engines.Node
+		parsed, ok := parseSemver(version)
+		if !ok {
+			continue
+		}
+		if best == "" || compareSemver(version, best) > 0 {
+			best, engines = semverText(parsed), e
 		}
 	}
 	if best == "" {
-		return checkMissing("not on PATH or in the npx cache", "npx wrangler --version (downloads it)")
+		return checkMissing("not on PATH or in the npx cache"+notReleases, "pass --deploy-config to check the deployer checkout's pinned wrangler")
 	}
+	if res, ok := wranglerEnginesCheck(d, best, engines); !ok {
+		return res
+	}
+	return checkOK("wrangler " + best + " (npx cache)" + notReleases)
+}
+
+// readWranglerPackage reads a wrangler package.json's version and
+// engines.node.
+func readWranglerPackage(d *doctorRun, path string) (version, engines string, ok bool) {
+	b, err := d.p.readFile(path)
+	if err != nil {
+		return "", "", false
+	}
+	var pkg struct {
+		Version string `json:"version"`
+		Engines struct {
+			Node string `json:"node"`
+		} `json:"engines"`
+	}
+	if json.Unmarshal(b, &pkg) != nil {
+		return "", "", false
+	}
+	return pkg.Version, pkg.Engines.Node, true
+}
+
+// wranglerEnginesCheck fails when wrangler's engines.node excludes the
+// installed Node.
+func wranglerEnginesCheck(d *doctorRun, version, engines string) (doctorResult, bool) {
 	if engines != "" {
 		node, _, found := d.nodeVersion()
 		if found && !semverSatisfies(node, engines) {
-			return checkWrong("wrangler "+best+" needs node "+doctorWord(engines)+", have "+node, "install a Node.js version in "+doctorWord(engines))
+			return checkWrong("wrangler "+version+" needs node "+doctorWord(engines)+", have "+node, "install a Node.js version in "+doctorWord(engines)), false
 		}
 	}
-	return checkOK("wrangler " + best + " (npx cache)")
+	return doctorResult{}, true
 }
 
 func wranglerCredentialCheck(d *doctorRun) doctorResult {
@@ -1212,26 +1286,7 @@ var doctorSHA40RE = regexp.MustCompile(`^[a-f0-9]{40}$`)
 // scripts/release-runner.mjs requires (serveDeployment, readBaselines). Lines
 // name fields only, never values.
 func deployConfigChecks() []doctorCheck {
-	const fixPass = "pass --deploy-config PRIVATE_PATH"
-	load := func(d *doctorRun) (map[string]any, doctorResult, bool) {
-		if v, ok := d.memo["deploy-config"]; ok {
-			c := v.(deployConfigLoad)
-			return c.doc, c.res, c.ok
-		}
-		c := deployConfigLoad{}
-		switch b, err := d.p.readFile(d.p.deployConfig); {
-		case d.p.deployConfig == "":
-			c.res = checkMissing("no --deploy-config", fixPass)
-		case err != nil:
-			c.res = checkMissing("deploy config not readable", "check the --deploy-config path")
-		case json.Unmarshal(b, &c.doc) != nil:
-			c.res = checkMissing("deploy config is not a JSON object", "fix the deployer config JSON")
-		default:
-			c.ok = true
-		}
-		d.memo["deploy-config"] = c
-		return c.doc, c.res, c.ok
-	}
+	load := (*doctorRun).deployConfigDoc
 	// Without --deploy-config the role prints one missing line, not eleven.
 	noConfig := func(d *doctorRun) bool { return d.p.deployConfig == "" }
 	field := func(name string, test func(doc map[string]any) bool, fix string) doctorCheck {
@@ -1288,6 +1343,27 @@ type deployConfigLoad struct {
 	doc map[string]any
 	res doctorResult
 	ok  bool
+}
+
+// deployConfigDoc reads the deployer config once per run.
+func (d *doctorRun) deployConfigDoc() (map[string]any, doctorResult, bool) {
+	if v, ok := d.memo["deploy-config"]; ok {
+		c := v.(deployConfigLoad)
+		return c.doc, c.res, c.ok
+	}
+	c := deployConfigLoad{}
+	switch b, err := d.p.readFile(d.p.deployConfig); {
+	case d.p.deployConfig == "":
+		c.res = checkMissing("no --deploy-config", "pass --deploy-config PRIVATE_PATH")
+	case err != nil:
+		c.res = checkMissing("deploy config not readable", "check the --deploy-config path")
+	case json.Unmarshal(b, &c.doc) != nil:
+		c.res = checkMissing("deploy config is not a JSON object", "fix the deployer config JSON")
+	default:
+		c.ok = true
+	}
+	d.memo["deploy-config"] = c
+	return c.doc, c.res, c.ok
 }
 
 // ---- semver ranges (package.json engines) ----

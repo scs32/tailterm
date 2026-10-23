@@ -27,6 +27,7 @@ type doctorHost struct {
 	freeMiB               int64
 	timeout               time.Duration
 	deployConfigPath      string
+	checkout              string
 }
 
 const doctorNow = "2026-09-30T19:00:00Z"
@@ -82,6 +83,12 @@ refresh_token = "SECRET-OAUTH-321"
 scopes = [ "account:read" ]
 `, 0o600)
 	h.file(".ssh/config", "Host *\n  ServerAliveInterval 30\n\nHost truenas\n  HostName SECRET-SSH-654\n  User root\n", 0o600)
+	// The deployer checkout's pinned wrangler; the path holds a secret marker
+	// so a line naming it fails TestDoctorRoleNoSecrets.
+	h.checkout = filepath.Join(root, "SECRET-CFG-000", "checkout")
+	h.checkoutFile("package.json", `{"devDependencies":{"wrangler":"4.145.0"}}`)
+	h.checkoutFile("node_modules/wrangler/package.json", `{"name":"wrangler","version":"4.145.0","engines":{"node":">=22.0.0"}}`)
+	h.fakeAt(h.checkoutPath("node_modules/.bin/wrangler"), "wrangler", "exit 0")
 	h.deployConfigPath = filepath.Join(root, "private", "deployer.json")
 	h.writeDeployConfig(map[string]any{})
 	return h
@@ -181,11 +188,27 @@ func (h *doctorHost) repoFile(rel, content string) {
 	}
 }
 
+func (h *doctorHost) checkoutPath(rel string) string {
+	h.t.Helper()
+	path := filepath.Join(h.checkout, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	return path
+}
+
+func (h *doctorHost) checkoutFile(rel, content string) {
+	h.t.Helper()
+	if err := os.WriteFile(h.checkoutPath(rel), []byte(content), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
 // writeDeployConfig writes a valid deployer config with overrides applied.
 func (h *doctorHost) writeDeployConfig(overrides map[string]any) {
 	h.t.Helper()
 	sha := strings.Repeat("a", 40)
-	doc := map[string]any{"version": 1, "enabled": true, "cwd": "/SECRET-CFG-000/cwd", "journalDirectory": "/SECRET-CFG-000/journal",
+	doc := map[string]any{"version": 1, "enabled": true, "cwd": h.checkout, "journalDirectory": "/SECRET-CFG-000/journal",
 		"hostAdapter": "SECRET-CFG-000", "baselines": map[string]any{"hub": sha, "bridge": sha, "mini": sha, "tailos": sha}}
 	for k, v := range overrides {
 		doc[k] = v
@@ -857,30 +880,45 @@ func TestDoctorRoleRelease(t *testing.T) {
 		expectLine(t, o, "deploy config", "missing", "not a JSON object", 1)
 		expectLine(t, o, "deploy config cwd", "missing", "not checked", 1)
 	})
-	t.Run("wrangler absent", func(t *testing.T) {
+	// d1: with a readable deployer config, wrangler is the checkout's pin.
+	t.Run("wrangler pinned ok", func(t *testing.T) {
 		h := newDoctorHost(t)
 		os.RemoveAll(filepath.Join(h.home, ".npm"))
 		o := h.run("release")
-		expectLine(t, o, "wrangler", "missing", "not on PATH or in the npx cache", 1)
-		if !strings.Contains(o.text, "fix: npx wrangler --version (downloads it)") {
+		expectLine(t, o, "wrangler", "ok", "wrangler 4.145.0 pinned in the deployer checkout", 0)
+		if log, _ := os.ReadFile(h.log); strings.Contains(string(log), "wrangler ") || strings.Contains(string(log), "npm ") || strings.Contains(string(log), "npx ") {
+			t.Fatalf("doctor ran wrangler, npm or npx:\n%s", log)
+		}
+	})
+	t.Run("wrangler pinned missing", func(t *testing.T) {
+		h := newDoctorHost(t)
+		// PATH and the npx cache do not stand in for the pinned copy.
+		h.fake("wrangler", "exit 0")
+		os.RemoveAll(filepath.Join(h.checkout, "node_modules"))
+		o := h.run("release")
+		expectLine(t, o, "wrangler", "missing", "pinned wrangler 4.145.0 not installed in the deployer checkout", 1)
+		if !strings.Contains(o.text, "fix: npm ci in the deployer checkout") {
 			t.Fatalf("fix hint:\n%s", o.text)
 		}
 	})
-	t.Run("wrangler on PATH", func(t *testing.T) {
+	t.Run("wrangler pinned version mismatch", func(t *testing.T) {
 		h := newDoctorHost(t)
-		os.RemoveAll(filepath.Join(h.home, ".npm"))
-		h.fake("wrangler", "exit 0")
-		expectLine(t, h.run("release"), "wrangler", "ok", "version not checked", 0)
-		if log, _ := os.ReadFile(h.log); strings.Contains(string(log), "wrangler ") {
-			t.Fatalf("wrangler ran:\n%s", log)
+		h.checkoutFile("node_modules/wrangler/package.json", `{"name":"wrangler","version":"4.144.1","engines":{"node":">=22.0.0"}}`)
+		o := h.run("release")
+		expectLine(t, o, "wrangler", "wrong version", "deployer checkout has wrangler 4.144.1, package.json pins 4.145.0", 1)
+		if !strings.Contains(o.text, "fix: npm ci in the deployer checkout") {
+			t.Fatalf("fix hint:\n%s", o.text)
 		}
 	})
-	t.Run("wrangler highest npx version", func(t *testing.T) {
+	t.Run("wrangler pinned without bin", func(t *testing.T) {
 		h := newDoctorHost(t)
-		h.env["npm_config_cache"] = filepath.Join(h.home, "npmcache")
-		h.file("npmcache/_npx/one/node_modules/wrangler/package.json", `{"version":"4.9.0","engines":{"node":">=22.0.0"}}`, 0o644)
-		h.file("npmcache/_npx/two/node_modules/wrangler/package.json", `{"version":"4.10.1","engines":{"node":">=22.0.0"}}`, 0o644)
-		expectLine(t, h.run("release"), "wrangler", "ok", "wrangler 4.10.1", 0)
+		os.Remove(filepath.Join(h.checkout, "node_modules", ".bin", "wrangler"))
+		expectLine(t, h.run("release"), "wrangler", "missing", "no node_modules/.bin/wrangler", 1)
+	})
+	t.Run("wrangler pin is a range", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.checkoutFile("package.json", `{"devDependencies":{"wrangler":"^4.145.0"}}`)
+		expectLine(t, h.run("release"), "wrangler", "missing", "no exact wrangler pin", 1)
 	})
 	t.Run("wrangler engines exclude node", func(t *testing.T) {
 		h := newDoctorHost(t)
@@ -888,6 +926,42 @@ func TestDoctorRoleRelease(t *testing.T) {
 		o := h.run("release")
 		expectLine(t, o, "wrangler", "wrong version", "needs node >=22.0.0, have 20.19.0", 1)
 		expectLine(t, o, "node "+doctorReleaseNodeRange, "wrong version", "20.19.0", 1)
+	})
+	// d2: without a deployer config, PATH or the npx cache, marked as not
+	// what releases use.
+	t.Run("wrangler absent without deploy config", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.deployConfigPath = ""
+		os.RemoveAll(filepath.Join(h.home, ".npm"))
+		o := h.run("release")
+		expectLine(t, o, "wrangler", "missing", "not on PATH or in the npx cache; not what releases use", 1)
+		if !strings.Contains(o.text, "fix: pass --deploy-config to check the deployer checkout's pinned wrangler") {
+			t.Fatalf("fix hint:\n%s", o.text)
+		}
+	})
+	t.Run("wrangler on PATH without deploy config", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.deployConfigPath = ""
+		os.RemoveAll(filepath.Join(h.home, ".npm"))
+		h.fake("wrangler", "exit 0")
+		expectLine(t, h.run("release"), "wrangler", "ok", "(version not checked); not what releases use", 1)
+		if log, _ := os.ReadFile(h.log); strings.Contains(string(log), "wrangler ") {
+			t.Fatalf("wrangler ran:\n%s", log)
+		}
+	})
+	t.Run("wrangler highest npx version without deploy config", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.deployConfigPath = ""
+		h.env["npm_config_cache"] = filepath.Join(h.home, "npmcache")
+		h.file("npmcache/_npx/one/node_modules/wrangler/package.json", `{"version":"4.9.0","engines":{"node":">=22.0.0"}}`, 0o644)
+		h.file("npmcache/_npx/two/node_modules/wrangler/package.json", `{"version":"4.10.1","engines":{"node":">=22.0.0"}}`, 0o644)
+		expectLine(t, h.run("release"), "wrangler", "ok", "wrangler 4.10.1 (npx cache); not what releases use", 1)
+	})
+	t.Run("wrangler npx engines exclude node without deploy config", func(t *testing.T) {
+		h := newDoctorHost(t)
+		h.deployConfigPath = ""
+		h.fake("node", "echo v20.19.0")
+		expectLine(t, h.run("release"), "wrangler", "wrong version", "needs node >=22.0.0, have 20.19.0", 1)
 	})
 	t.Run("wrangler token empty", func(t *testing.T) {
 		h := newDoctorHost(t)

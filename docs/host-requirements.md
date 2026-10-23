@@ -175,7 +175,7 @@ Client, plus:
 | GitHub login | `gh auth status` exits 0 | `gh auth login` | same | `gh login` |
 | python3 | runs `scripts/deploy-truenas-hub.py` | preinstalled or `brew install python` | `apt install python3` | `python3` |
 | Node.js | `>=22.12.0` (vite for `build:static` and wrangler's `>=22.0.0`) | `brew install node` | NodeSource or nvm | `node >=22.12.0` |
-| wrangler | releases run the pinned devDependency `wrangler 4.145.0` (exact, in `package.json` and `package-lock.json`) from the deployer checkout's `node_modules/.bin/wrangler`, never npx (see the note below). Doctor still looks on PATH or in npm's npx cache `~/.npm/_npx/*/node_modules/wrangler` (highest version; its `engines.node` must admit the installed Node) | `npm ci` in the deployer checkout | same | `wrangler` |
+| wrangler | releases run the pinned devDependency `wrangler 4.145.0` (exact, in `package.json` and `package-lock.json`) from the deployer checkout's `node_modules/.bin/wrangler`, never npx (see the note below). With a readable deployer config, doctor reads `<cwd>/node_modules/wrangler/package.json` in the checkout the config's `cwd` names: ok when its version equals the exact `devDependencies.wrangler` pin in `<cwd>/package.json` and `<cwd>/node_modules/.bin/wrangler` exists, wrong version when it differs, missing when absent (fix: `npm ci in the deployer checkout`); its `engines.node` must admit the installed Node. It never runs npm, npx or wrangler. Without a deployer config, doctor falls back to PATH or npm's npx cache `~/.npm/_npx/*/node_modules/wrangler` (highest version) and marks the line `not what releases use` | `npm ci` in the deployer checkout | same | `wrangler`: the deployer checkout's pinned copy, or with no deployer config PATH or the npx cache (`not what releases use`) |
 | wrangler credential | `CLOUDFLARE_API_TOKEN` set, or the OAuth file with an `oauth_token` that is unexpired or has a `refresh_token` | `npx wrangler login` | same | `wrangler credential` |
 | SSH route | `Host truenas` with `HostName` in `~/.ssh/config` (the `truenas-ssh` route in `scripts/deploy-truenas-hub.py`) | edit `~/.ssh/config` | same | `ssh route truenas` |
 | Container runtime | apple/container: `container` on PATH (or the deployer config's optional `rehearsal.runtime` path) with its service running (`container system status` exits 0), and the image `gcr.io/distroless/static-debian12:nonroot` pulled or pullable. Checked at 1.1.0 (`scripts/release-runner.mjs` `rehearse`) | `brew install container`, then `container system start` | none supported yet: a Linux release host cannot release a schema change | none |
@@ -272,7 +272,7 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
 | Worktrees under `.build/worktrees`; artifacts in `~/projects/tailterm-artifacts` | queue runner, team templates | portable (home-relative) |
 | `tt doctor` checked only tmux, runtimes and the hub | `hub/cmd/tt/coordination.go` `cmdDoctor` | fixed by `tt doctor --role` (plain `tt doctor` is unchanged) |
 | Verifier Playwright path is macOS-only | `scripts/verify-matrix.mjs:881-883` (`~/Library/Caches/ms-playwright`) | to fix |
-| wrangler is not in package.json; it runs from the npx cache | `scripts/deploy-static.mjs`, `~/.npm/_npx` | fixed: pinned devDependency run from `node_modules/.bin` (wi_34bf5751e60a4a18); `tt doctor` still checks PATH and the npx cache |
+| wrangler is not in package.json; it runs from the npx cache | `scripts/deploy-static.mjs`, `~/.npm/_npx` | fixed: pinned devDependency run from `node_modules/.bin` (wi_34bf5751e60a4a18); `tt doctor --role release` checks the deployer checkout's pinned copy (wi_ed373b576c8c5478) |
 | No Linux relay service | `tt host setup` installs launchd services only | to fix |
 
 ## Limits
@@ -281,4 +281,5 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
   first top-level `state = ...` line.
 - Login checks trust each CLI's exit status; a future release could change it.
 - The SSH check is a partial `ssh_config` reader (see above).
-- A wrangler found on PATH is reported without its version.
+- Without a deployer config, a wrangler found on PATH is reported without its
+  version.
