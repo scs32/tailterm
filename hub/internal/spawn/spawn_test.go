@@ -515,10 +515,13 @@ func TestWrapFixture(t *testing.T) {
 	os.Exit(0)
 }
 
-// wrapFixture writes the agent script and a fake $SHELL that records a login
-// call instead of starting one, and returns the record path and the fixture's
-// environment, which runs the script in the command's own shell.
-func wrapFixture(t *testing.T, script, shell string) (string, []string) {
+// wrapFixture writes the agent script and a fake $SHELL, and returns the
+// record path and the fixture's environment, which runs the script in the
+// command's own shell. Called as a login shell, the fake records the SIGTTOU
+// disposition the login process inherited (perl run by exec, since sh resets
+// it in the children it forks) and "login", then exits, or with interactive
+// becomes /bin/sh -l.
+func wrapFixture(t *testing.T, script string, interactive bool) (string, []string) {
 	t.Helper()
 	dir := t.TempDir()
 	rec := filepath.Join(dir, "record")
@@ -526,14 +529,38 @@ func wrapFixture(t *testing.T, script, shell string) (string, []string) {
 	if err := os.WriteFile(agent, []byte(strings.ReplaceAll(script, "REC", ShellQuote(rec))), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if shell == "" {
-		shell = filepath.Join(dir, "shell")
-		fake := "#!/bin/sh\nif [ \"$1\" = -l ]; then echo login >> " + ShellQuote(rec) + "; exit 0; fi\nexec /bin/sh \"$@\"\n"
-		if err := os.WriteFile(shell, []byte(fake), 0700); err != nil {
-			t.Fatal(err)
-		}
+	login, again := "exit 0", "''"
+	if interactive {
+		login, again = "exec /bin/sh -l", "1"
+	}
+	fake := `#!/bin/sh
+if [ "$1" = -l ]; then
+	if command -v perl >/dev/null; then
+		exec perl -e 'open(my $f, ">>", $ARGV[0]) or die; print $f "ttou ", ($SIG{TTOU} || "DEFAULT"), "\nlogin\n"; close $f; exec("/bin/sh", "-l") if $ARGV[1]; exit 0' REC ` + again + `
+	fi
+	echo login >> REC
+	` + login + `
+fi
+exec /bin/sh "$@"
+`
+	shell := filepath.Join(dir, "shell")
+	if err := os.WriteFile(shell, []byte(strings.ReplaceAll(fake, "REC", ShellQuote(rec))), 0700); err != nil {
+		t.Fatal(err)
 	}
 	return rec, []string{"TT_WRAP_FIXTURE=1", "SHELL=" + shell, "HOME=" + dir, "TT_WRAP_RECORD=" + rec, "TT_WRAP_COMMAND=. " + ShellQuote(agent)}
+}
+
+// loginTTOUDefault fails unless the login shell recorded the default SIGTTOU
+// action: an ignored one would pass to every job the shell starts.
+func loginTTOUDefault(t *testing.T, rec string) {
+	t.Helper()
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Log("perl not available; login shell SIGTTOU not checked")
+		return
+	}
+	if got := strings.Join(recordLine(t, rec, "ttou", 10*time.Second), " "); got != "DEFAULT" {
+		t.Fatalf("login shell SIGTTOU disposition %q, want DEFAULT", got)
+	}
 }
 
 // recordLine waits for the first record line starting with prefix and returns
@@ -635,7 +662,7 @@ trap 'echo "trap INT" >> REC; exit 130' INT
 echo "agent $$" >> REC
 sh -c 'trap "" TERM INT; echo "child $$" >> '"REC"'; while :; do sleep 1; done' &
 wait
-`, "")
+`, false)
 			killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture", "child": "sh -c"})
 			cmd := exec.Command(self, "-test.run=^TestWrapFixture$")
 			cmd.Env = append(os.Environ(), env...)
@@ -701,7 +728,7 @@ func TestWrapNormalExitKeepsLoginShell(t *testing.T) {
 	rec, env := wrapFixture(t, `sleep 30 &
 echo "child $!" >> REC
 exit 7
-`, "")
+`, false)
 	killOnCleanup(t, rec, map[string]string{"child": "sleep 30"})
 	cmd := exec.Command(self, "-test.run=^TestWrapFixture$")
 	cmd.Env = append(os.Environ(), env...)
@@ -718,12 +745,17 @@ exit 7
 		t.Fatalf("wrapper: %v\n%s", err, notice)
 	}
 	child := recordPID(t, rec, "child")
-	data, _ := os.ReadFile(rec)
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(readRecord(rec)), "\n") {
+		if !strings.HasPrefix(line, "ttou ") {
+			lines = append(lines, line)
+		}
+	}
 	want := []string{"exit 7 alive=true", "login", "return <nil>"}
 	if len(lines) < 3 || strings.Join(lines[len(lines)-3:], "|") != strings.Join(want, "|") {
 		t.Fatalf("record ends %q, want %q", lines, want)
 	}
+	loginTTOUDefault(t, rec)
 	if pidGone(child, "sleep 30") {
 		t.Fatal("normal exit killed the command's remaining child")
 	}
@@ -758,7 +790,7 @@ echo "agent $$ $1 $2" >> REC
 read line
 echo "read $line" >> REC
 while :; do sleep 0.2; done
-`, "")
+`, false)
 	killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture", "agent": ".tailterm-runtime-command-", "child": "sleep 60"})
 	pane("stop", env)
 	wrapper := recordPID(t, rec, "wrapper")
@@ -795,10 +827,11 @@ while :; do sleep 0.2; done
 	// A command that exits on its own hands the pane back to a login shell
 	// that can read it.
 	rec, env = wrapFixture(t, `exit 3
-`, "/bin/sh")
+`, true)
 	killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture"})
 	pane("login", env)
 	recordLine(t, rec, "exit 3", 10*time.Second)
+	loginTTOUDefault(t, rec)
 	run("send-keys", "-t", "=login:", "echo login-read >> "+ShellQuote(rec), "Enter")
 	recordLine(t, rec, "login-read", 10*time.Second)
 	run("send-keys", "-t", "=login:", "exit", "Enter")

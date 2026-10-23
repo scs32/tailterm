@@ -468,11 +468,15 @@ func groupAlive(pgid int) bool {
 // reclaimForeground makes the wrapper's group the terminal's foreground group
 // again, so the login shell it starts next can read the pane. A background
 // group changing the foreground would be stopped by SIGTTOU, so it is ignored
-// for the call and restored before any child inherits it.
+// for the call. signal.Reset would keep it ignored, and an exec'd child would
+// inherit that; Notify then Stop leaves the runtime's handler installed
+// instead, which a child's exec resets to the default action.
 func reclaimForeground(tty int) {
 	signal.Ignore(syscall.SIGTTOU)
 	_ = setTTYForegroundGroup(tty, syscall.Getpgrp())
-	signal.Reset(syscall.SIGTTOU)
+	ttou := make(chan os.Signal, 1)
+	signal.Notify(ttou, syscall.SIGTTOU)
+	signal.Stop(ttou)
 }
 
 // ttyForegroundGroup returns the foreground process group of terminal fd.
