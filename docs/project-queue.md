@@ -971,9 +971,11 @@ included, is not one. Two such faults no longer fail the entry:
   the run is cleaned up, so a cleanup that landed before the fault finishes the
   entry without another try. A fault that lasts never fails the entry; after
   30 minutes it raises the usual `Member cleanup still pending` notice to the
-  owner helper. Any other cleanup error, alone or beside a fault, still fails
-  the entry at once, and `Hub unavailable; local session retained` stays such an
-  error.
+  owner helper. A cleanup whose own read of the project gets no response
+  keeps that member's session and reports `Hub unavailable; local session
+  retained` with the fault, which counts as one. The same text after a read
+  the hub answered with a refusal is not a fault. Any other cleanup error,
+  alone or beside a fault, still fails the entry at once.
 - **Member spawn context restore.** `tt spawn` registers the member, then
   reads its work-item context before creating any session. When that read
   fails, the spawn closes the registration with a deadline of its own, since

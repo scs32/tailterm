@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -317,6 +319,88 @@ func TestLocalSessionsReadsACutListAgainOnce(t *testing.T) {
 				if sessions[i] != whole[i] {
 					t.Fatalf("session %d is %+v, want %+v", i, sessions[i], whole[i])
 				}
+			}
+		})
+	}
+}
+
+// wi_0cf7c5232a7d6636 (review #44244 b1): the session loop's task read that
+// gets no response keeps its transport fault, so the queue runner retries the
+// member cleanup; the selected pass does not report the retained session
+// again. A read the hub answered with a refusal keeps the non-retryable text
+// (wi_911636419fe7bae6). The hub is a stub; tmux runs on an isolated socket.
+func TestCleanupKeepsHubTransportFaultTyped(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	// The member cleanup's own 3 s hub client is what gives up.
+	previous := minCommandTimeout
+	minCommandTimeout = productionMinCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
+	for _, refused := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refused=%v", refused), func(t *testing.T) {
+			t.Setenv("TT_TMUX_SOCKET", "tt-cleanup-fault-"+strings.TrimPrefix(api.NewID("agt"), "agt_"))
+			t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+			ctx := context.Background()
+			defer startupTmux(ctx, "kill-server")
+			task := api.Task{ID: api.NewID("tsk"), Status: api.TaskOpen}
+			a := api.Agent{ID: api.NewID("agt"), TaskID: task.ID, RunID: api.NewID("run"), Session: "member", Status: api.AgentClosed}
+			var mu sync.Mutex
+			var gets, posts int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.Method == "GET" {
+					gets++
+					if gets == 1 && refused {
+						http.Error(w, "offline", 503)
+						return
+					}
+					if gets == 1 {
+						mu.Unlock()
+						select { // the first task read gets no answer
+						case <-r.Context().Done():
+						case <-time.After(20 * time.Second):
+						}
+						mu.Lock()
+						return
+					}
+				}
+				if r.Method == "POST" {
+					posts++
+					a.CleanupDone = true
+					json.NewEncoder(w).Encode(a)
+					return
+				}
+				json.NewEncoder(w).Encode(api.TaskDetail{Task: task, Agents: []api.Agent{a}})
+			}))
+			defer srv.Close()
+			e := env{hub: srv.URL}
+			if _, err := startupTmux(ctx, "new-session", "-d", "-s", "member", "-e", "TAILTERM_HUB="+e.hub, "-e", "TAILTERM_TASK="+task.ID, "-e", "TAILTERM_AGENT="+a.ID, "-e", "TAILTERM_RUN="+a.RunID, "sleep 300"); err != nil {
+				t.Fatal(err)
+			}
+			cleanup := productionTeamRunner().cleanup
+			err := cleanup(ctx, e, task.ID, a.ID)
+			if err == nil || !strings.Contains(err.Error(), "Hub unavailable; local session retained") || cleanupRetryable(err) {
+				t.Fatalf("first cleanup: %v", err)
+			}
+			if refused {
+				if cleanupHubFault(err) {
+					t.Fatalf("an answered refusal reads as a hub fault: %v", err)
+				}
+				return
+			}
+			if !cleanupHubFault(err) || !strings.Contains(err.Error(), "Client.Timeout exceeded") || strings.Contains(err.Error(), "Unverified session left open") {
+				t.Fatalf("one stalled read is not a lone hub fault: %v", err)
+			}
+			if _, err := startupTmux(ctx, "has-session", "-t", "=member"); err != nil || posts != 0 {
+				t.Fatalf("the faulted pass stopped the session or reported (%d receipts): %v", posts, err)
+			}
+			if err := cleanup(ctx, e, task.ID, a.ID); err != nil {
+				t.Fatalf("cleanup once the hub answers: %v", err)
+			}
+			if _, err := startupTmux(ctx, "has-session", "-t", "=member"); err == nil || posts != 1 || !a.CleanupDone {
+				t.Fatalf("session left or receipt missing: %d receipts", posts)
 			}
 		})
 	}

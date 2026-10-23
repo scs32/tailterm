@@ -4817,3 +4817,76 @@ func TestTeamRunnerRealSpawnRestoreFaultClosesAndRelaunches(t *testing.T) {
 		t.Fatalf("relaunch spawn errors %v sessions %d", spawnErrs, exactRunNewSessions(t, log))
 	}
 }
+
+// Review #44244 b1: the real member cleanup, not a stub. The member's owned
+// tmux session (isolated socket) names the fault hub, whose first task read
+// during cleanup gets no answer. The entry stays running, no cleanup is tried
+// inside the 15 s backoff, and the next try stops the session, saves the
+// receipt and finishes the entry.
+func TestTeamRunnerCloseoutRealCleanupTimeoutRetries(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+	previous := minCommandTimeout
+	minCommandTimeout = productionMinCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	defer startupTmux(ctx, "kill-server")
+	start := time.Now()
+	now := start
+	r := queueCorrectionRunner(t, f, 1)
+	clean := productionTeamRunner().cleanup
+	var calls atomic.Int32
+	r.cleanup = func(ctx context.Context, _ env, task, id string) error {
+		calls.Add(1)
+		return clean(ctx, hub.e, task, id)
+	}
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	var lead api.Agent
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range detail.Agents {
+		if a.Name == "correction-lead-0" {
+			lead = a
+		}
+	}
+	if _, err := startupTmux(ctx, "new-session", "-d", "-s", "correction-lead-0", "-e", "TAILTERM_HUB="+hub.e.hub, "-e", "TAILTERM_TASK="+f.task.ID, "-e", "TAILTERM_AGENT="+lead.ID, "-e", "TAILTERM_RUN="+lead.RunID, "sleep 300"); err != nil {
+		t.Fatal(err)
+	}
+	stall := hub.unanswered(func(r *http.Request) bool { return r.Method == "GET" && r.URL.Path == "/v1/tasks/"+f.task.ID }, false)
+	tick := func(at time.Duration, wantCalls int32, wantState string) {
+		t.Helper()
+		now = start.Add(at)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != wantState || got.Failure != "" || got.EscalationSeq != 0 {
+			t.Fatalf("tick at %s entry %+v %v", at, got, err)
+		}
+		if n := calls.Load(); n != wantCalls {
+			t.Fatalf("tick at %s: %d cleanup calls, want %d", at, n, wantCalls)
+		}
+	}
+	tick(0, 1, "running")
+	if !hub.fired(stall) {
+		t.Fatal("the cleanup's task read was not stalled")
+	}
+	if _, err := startupTmux(ctx, "has-session", "-t", "=correction-lead-0"); err != nil {
+		t.Fatal("the faulted cleanup stopped the session")
+	}
+	tick(launchRetryFirstDelay-time.Second, 1, "running")
+	tick(launchRetryFirstDelay, 2, "finished")
+	if _, err := startupTmux(ctx, "has-session", "-t", "=correction-lead-0"); err == nil {
+		t.Fatal("the member session survived its cleanup")
+	}
+	if a, err := f.c.GetAgent(ctx, f.task.ID, lead.ID); err != nil || !a.CleanupDone || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
+		t.Fatalf("member after cleanup %+v %v", a, err)
+	}
+}

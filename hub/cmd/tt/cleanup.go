@@ -140,6 +140,10 @@ func stopOwnedSession(ctx context.Context, s ownedSession) error {
 type cleanupResult struct {
 	Confirmed int      `json:"confirmed"`
 	Errors    []string `json:"errors"`
+	// faults holds, by index into Errors, the hub transport fault behind
+	// an error text, so the queue runner can retry it
+	// (wi_0cf7c5232a7d6636). The JSON keeps only the text.
+	faults map[int]error
 }
 
 // Explicit IDs come from the owner's SSH action on an agent's saved host and
@@ -175,6 +179,10 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 		return result, err
 	}
 	seen := map[string]bool{}
+	// retained names the agents whose session stayed only because the hub
+	// read got no response; the selected pass below does not report their
+	// sessions again.
+	retained := map[string]bool{}
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -187,6 +195,13 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 		d, err := get(s.Task)
 		if err != nil {
 			result.Errors = append(result.Errors, "Hub unavailable; local session retained")
+			if hubTransportFault(err) {
+				if result.faults == nil {
+					result.faults = map[int]error{}
+				}
+				result.faults[len(result.Errors)-1] = err
+				retained[s.Agent] = true
+			}
 			continue
 		}
 		var a *api.Agent
@@ -241,7 +256,7 @@ func cleanupSessions(ctx context.Context, e env, task string, selected []string)
 			return result, err
 		}
 		for _, id := range selected {
-			if seen[id] {
+			if seen[id] || retained[id] {
 				continue
 			}
 			found := false

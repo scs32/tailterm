@@ -505,7 +505,11 @@ func productionTeamRunner() teamRunner {
 				return err
 			}
 			errs := make([]error, 0, len(result.Errors))
-			for _, message := range result.Errors {
+			for i, message := range result.Errors {
+				if fault := result.faults[i]; fault != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", message, fault))
+					continue
+				}
 				errs = append(errs, errors.New(message))
 			}
 			return errors.Join(errs...)
