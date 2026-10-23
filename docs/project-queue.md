@@ -1708,12 +1708,15 @@ made outside the queue, and letting a smaller team pass a held head.
 
 Closeout and `tt team queue sweep-worktrees` (described in
 `docs/team-launch.md`) also retire two things a finished team leaves outside
-its worktree: the verifier's clean checkouts under the artifacts tree, and
-Claude Code's per-directory session temp folders. Receipts, logs and plan
-files are never removed. The sweep, and only the sweep, also trims one
-regenerable cache out of the checkouts it keeps (see "Cache trim"), trims the
-Go caches a verifier home's provenance marker owns, and removes marked
-verifier homes whose run is gone (see "Verifier homes").
+its worktree: the verifier's checkouts under the artifacts tree, and Claude
+Code's per-directory session temp folders. The sweep, never closeout, also
+removes a finished item's untracked artifact scratch three days after the
+item's queue entry is released or the item is dismissed (owner #44358);
+`docs/team-launch.md` ("Worktree cleanup", after "Sweep") has its rules.
+Receipts, logs and plan files are never removed. The sweep, and only the
+sweep, also trims one regenerable cache out of the checkouts it keeps (see
+"Cache trim"), trims the Go caches a verifier home's provenance marker owns,
+and removes marked verifier homes whose run is gone (see "Verifier homes").
 
 ```sh
 tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-after 0] [--artifacts DIR] [--cwd DIR]
@@ -1769,8 +1772,8 @@ as a check; it deletes.
   closeout and the scheduled sweep, set a wait instead. A negative
   `--accepted-after` is a usage error; a negative or unreadable environment
   value prints one line to stderr and uses no wait.
-- The checkout directory is the unit. Everything inside an eligible, clean
-  checkout is deleted: tracked sources, `node_modules` and build output.
+- The checkout directory is the unit. Everything inside an eligible checkout
+  is deleted: tracked sources, `node_modules` and build output.
   Everything beside it in the item folder stays as it is: receipts, logs,
   plan files, summaries and the manifest.
 - Referenced files are never removed. A checkout is kept whole, as
@@ -1785,13 +1788,29 @@ as a check; it deletes.
   `<checkout>-logs/`, does not keep it. Logs are not read: they name every
   file a build touched. A receipt or plan file that cannot be read, or is
   larger than 4 MiB, keeps the item's checkouts as `remove-failed`.
-- The commit need not be on `tasks-hub`: the checkout is a clean copy, and the
+- For a listed checkout, one Git still has a worktree record for, the commit
+  need not be on `tasks-hub`: the checkout is a clean copy, and the
   candidate's own branch and worktree stay under the ordinary rules. When no
   branch or remote holds the commit, removal first points
   `refs/tailterm/retired/<itemId>/<checkout name>` at it, so a SHA a receipt
   names cannot be garbage-collected. These refs are not pruned.
-- The removal is Git's `worktree remove`, never `--force`, re-checked
-  immediately before it runs.
+- A listed checkout's removal is Git's `worktree remove`, never `--force`,
+  re-checked immediately before it runs.
+- A checkout whose worktree record Git has pruned is not listed, but it is
+  still judged. The sweep and closeout find it under `<artifacts>/<itemId>/`,
+  one or two levels down, by its `.git` file naming a record under this
+  repository's `.git/worktrees/` that is gone. It is judged by the same
+  item-state, age and citation rules as a listed checkout: never removed
+  while its item runs, or while a receipt or tracked document cites a file
+  in it. Its age is the newest change anywhere in it, as for a session temp
+  folder, since its Git state went with the record. With no index or `HEAD`
+  it has no dirty check and no pinned ref. Removal re-checks the record and
+  the path, writes the manifest, which marks no entry tracked, and deletes
+  the files, the `.git` file last. The dry run lists it as `would-remove`
+  with its size and `worktree record pruned` in the detail, and the journal
+  counts it in `treesRemoved`. A `.git` directory, a record that exists or
+  belongs to another repository, a symlink and anything outside the
+  artifacts root are left alone.
 
 Before a checkout is removed, its manifest is written beside it as
 `<artifacts>/<itemId>/<checkout name>.removed.json`, mode 0600 (a timestamped
