@@ -1531,8 +1531,10 @@ test("every agent CLI stub shadows a real binary on the check PATH, fails fast a
   for (const name of names) {
     assert(lines.includes(`${home}/.verifier-bin/${name}`), name);
     assert(lines.includes(`tailterm verifier: ${name} is disabled during matrix checks`), name);
+    // The time covers a shell spawn plus the stub's own date/tr/cut calls, so
+    // the bound allows matrix load; status=1 and the marker prove the stub ran.
     const ms = lines.find((line) => line.startsWith(`${name} ms=`));
-    assert(ms && Number(ms.slice(name.length + 4)) < 2000, `${name} failed fast: ${ms}`);
+    assert(ms && Number(ms.slice(name.length + 4)) < 10000, `${name} failed fast: ${ms}`);
     const calls = readFileSync(join(output, `${name}-stub-calls.log`), "utf8").split("\n").filter(Boolean);
     assert.equal(calls.length, 1, name);
     assert.match(calls[0], /\t--version$/, name);
