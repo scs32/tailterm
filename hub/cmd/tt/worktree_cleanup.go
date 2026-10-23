@@ -5406,10 +5406,14 @@ func cleanupArtifactScratch(ctx context.Context, in worktreeCleanupInputs, commo
 	if len(folders) == 0 {
 		return decisions, nil
 	}
+	// A decision is keyed by both spellings: canonicalPath resolves a link
+	// at the decided path itself, which the walk, never following links,
+	// reaches by its own name.
 	decided := map[string]bool{}
 	for _, d := range decisions {
 		if !supersededCacheReport(d) {
 			decided[canonicalPath(d.Path)] = true
+			decided[filepath.Join(canonicalPath(filepath.Dir(d.Path)), filepath.Base(d.Path))] = true
 		}
 	}
 	var candidates []scratchCandidate

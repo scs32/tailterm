@@ -6518,6 +6518,40 @@ func TestWorktreeCleanupArtifactScratchNeverTouchesOtherPassesOrOutside(t *testi
 	run.requireEvidenceKept(t)
 }
 
+// t6 (a1): a matrix binary that is a link, which the matrix pass keeps as
+// unproven, gets no second decision from the scratch pass, and neither the
+// link nor its target is removed.
+func TestWorktreeCleanupArtifactScratchSkipsDecidedLink(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), trimItemRel)
+	linked := writeMatrixRun(t, filepath.Join(dir, "verifier", "matrix-link"), matrixCommitRel, "", "tailterm-hub-test")
+	target := filepath.Join(dir, "verifier", "link-target")
+	writeFixtureFile(t, target, "built test binary tailterm-hub-test of "+matrixCommitRel+"\n")
+	if err := os.Remove(linked.binaries[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, linked.binaries[0]); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(dir, "verifier", "scratch.bin")
+	writeFixtureFile(t, scratch, "scratch\n")
+	entry := releasedMatrixEntry(trimItemRel, matrixCommitRel)
+	entry.UpdatedAt = f.now.Add(-96 * time.Hour).UTC().Format(time.RFC3339Nano)
+	state := sweepHubState{entries: []api.TeamQueueEntry{entry}}
+	for _, apply := range []bool{false, true} {
+		got := f.sweepAt(t, state, apply, f.now.Add(time.Duration(len(readCleanupReceipts(t)))*time.Second), nil)
+		requireHomeDecision(t, got, linked.binaries[0], "kept", keepUnproven, kindMatrixBinary, "not a regular file")
+		if d, ok := scratchDecisions(got)[target]; ok {
+			t.Fatalf("apply=%v scratch decided the link target: %+v", apply, d)
+		}
+		if _, err := os.Lstat(linked.binaries[0]); err != nil {
+			t.Fatalf("apply=%v link: %v", apply, err)
+		}
+		requireExists(t, target, true)
+	}
+	requireExists(t, scratch, false)
+}
+
 func sortedKeys(m map[string]worktreeDecision) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
