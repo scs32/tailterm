@@ -1945,11 +1945,16 @@ Because the handoff adds documentation after the last deployment, the existing
 Rebuild before a future deployment; no redeployment was needed for this handoff.
 
 ```sh
+npm ci
 npm run build:static
 npm run verify:release
-npx wrangler login
-npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash "$(git rev-parse HEAD)" --commit-dirty=false
+node_modules/.bin/wrangler login
+node_modules/.bin/wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash "$(git rev-parse HEAD)" --commit-dirty=false
 ```
+
+`npm ci` installs the wrangler version pinned in `package.json`, and
+`node_modules/.bin/wrangler` runs that pinned version; do not use `npx wrangler`
+(see the wrangler notes in [host-requirements.md](host-requirements.md)).
 
 `--branch main` here selects the existing Pages project's production deployment;
 it does not require switching the source branch away from `tasks-hub` or merging

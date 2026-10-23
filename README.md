@@ -54,11 +54,15 @@ tmux must be installed on the destination for persistent sessions. Standard SSH 
 Deploy only `dist-static/` to an HTTPS static host. This branch uses Cloudflare Pages project **tailos**. From a clean committed checkout:
 
 ```sh
+npm ci
 npm run build:static
 npm run verify:release
-npx wrangler login
-npx wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash "$(git rev-parse HEAD)" --commit-dirty=false
+node_modules/.bin/wrangler login
+node_modules/.bin/wrangler pages deploy dist-static --project-name tailos --branch main --commit-hash "$(git rev-parse HEAD)" --commit-dirty=false
 ```
+
+`npm ci` installs the wrangler version pinned in `package.json`, and
+`node_modules/.bin/wrangler` runs that pinned version; do not use `npx wrangler`.
 
 The Pages production branch setting is `main`; the source checkout remains
 `tasks-hub`. **Do not use `npm run deploy:static` for this branch**: that older
