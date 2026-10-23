@@ -209,7 +209,11 @@ const handlerWaitRule = "Shared-path sequencing: when one team must wait for a p
 // shared-path waits and steward routing) stay in primaryHandlerGuidance only.
 const handlerGateRule = "Before each new queued-item record, run tt obligations and answer listed live-team gate REQUESTs first with RESULT --reply-to. Recheck before the next queued record; finish an already-started atomic operation safely and drain queued intake when gates clear. Inbox order remains unchanged."
 
-const handlerReadBackRule = "Read back the committed record and verify its ID, revision and intended contents before reporting success."
+// handlerReadBackRule also bars a success claim before every cited check has
+// passed (wi_5edba07856e84f45). The browser handler prompt in
+// client/project-handler.js and the Planned database template in
+// client/team-examples.js carry the same sentences.
+const handlerReadBackRule = "Read back the committed record and verify its ID, revision and intended contents before reporting success. Never send a success RESULT, or a complete or verified claim, until every audit or check command it cites has exited 0. A failed or unfinished check goes out as partial or fail, and a rerun's outcome is sent as a new message that replaces it."
 
 const handlerEvidenceReadRule = "For a complete native evidence read, use tt work-items evidence with an explicit private --manifest and --sources selection. Always include current as the item/scope snapshot anchor; request revisions for revision history, messages for full linked messages, and receipt plus the exact mutation request key for a keyed update receipt. The reader follows native terminal cursors, retains exact page bytes and hashes, and resumes only a matching manifest. Treat not_fetched, partial and error as incomplete; absent_after_complete_lookup is terminal absence, not verified evidence. Never substitute current GET for history, audit metadata for source content, or a first page/count for terminal coverage. Source availability and provenance do not establish semantic acceptance, and an evidence manifest never mutates or completes an item or Queue entry."
 

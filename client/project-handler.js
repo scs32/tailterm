@@ -19,6 +19,11 @@ const handlerEvidenceRule =
 // carries the same sentences.
 const handlerWaitRule =
   "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
+// A handler sends no success claim before every cited check has passed
+// (wi_5edba07856e84f45). hub/cmd/tt/coordination.go (handlerReadBackRule)
+// carries the same sentences.
+const handlerCheckRule =
+  "Never send a success RESULT, or a complete or verified claim, until every audit or check command it cites has exited 0. A failed or unfinished check goes out as partial or fail, and a rerun's outcome is sent as a new message that replaces it.";
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
@@ -26,6 +31,8 @@ const handlerPrompt =
   "coordination may establish that record first. Preserve original source context, " +
   "use stable request IDs, source message sequences, body files and revision checks. " +
   "Read back committed records before reporting their ID, revision or status. " +
+  handlerCheckRule +
+  " " +
   "Before each new queued-item record, run tt obligations and service open " +
   "live-team gate REQUESTs first in the listed order; acknowledge them, verify " +
   "the Start, plan or assignment, and send a RESULT --reply-to its request. " +

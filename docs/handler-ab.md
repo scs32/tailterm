@@ -94,6 +94,8 @@ to its leased item:
   record;
 - read back each committed record, the native evidence-read rules, and the
   audit-trail, scope-change and completion-tracking rules;
+- send no success RESULT, or complete or verified claim, until every audit or
+  check command it cites has exited 0 (part of the read-back rule);
 - the Start evidence rule, with the queue team Start and amendment rules;
 - record evidence on an existing item as a `tt work-items note`.
 
