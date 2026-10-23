@@ -5279,6 +5279,24 @@ func (a *artifactPass) scratchFolders(agents map[string]string) []scratchFolder 
 	return out
 }
 
+// scratchTranscriptExts are text transcripts of matrix gates, saves and
+// mutations, kept as evidence beside matrixEvidenceName's receipts and logs.
+var scratchTranscriptExts = []string{".out", ".err", ".diff", ".patch", ".sh", ".tsv", ".csv"}
+
+// scratchEvidenceName reports a file name the scratch pass keeps: one
+// matrixEvidenceName keeps, or a transcript.
+func scratchEvidenceName(name string) bool {
+	if matrixEvidenceName(name) {
+		return true
+	}
+	for _, ext := range scratchTranscriptExts {
+		if strings.HasSuffix(name, ext) {
+			return true
+		}
+	}
+	return false
+}
+
 // scratchLogsName reports a logs folder's name: logs, logs-* or *-logs.
 func scratchLogsName(name string) bool {
 	return name == "logs" || strings.HasPrefix(name, "logs-") || strings.HasSuffix(name, "-logs")
@@ -5305,9 +5323,9 @@ func scratchWhole(dir string) bool {
 
 // scratchKeeps reports an entry that is never scratch and never removed as
 // part of a folder holding it: a path an earlier pass decided, a .git entry,
-// a tombstone, a logs folder, a folder scratchHolder refuses, a file whose name is a
-// receipt, record, log or note (matrixEvidenceName), or anything that is not
-// a directory, regular file or symlink.
+// a tombstone, a logs folder, a folder scratchHolder refuses, a file whose
+// name is a receipt, record, log, note or transcript (scratchEvidenceName),
+// or anything that is not a directory, regular file or symlink.
 func scratchKeeps(p string, e fs.DirEntry, decided map[string]bool) bool {
 	name := e.Name()
 	switch {
@@ -5316,7 +5334,7 @@ func scratchKeeps(p string, e fs.DirEntry, decided map[string]bool) bool {
 	case e.IsDir():
 		return scratchLogsName(name) || scratchHolder(p)
 	case e.Type().IsRegular() || e.Type()&fs.ModeSymlink != 0:
-		return matrixEvidenceName(name)
+		return scratchEvidenceName(name)
 	}
 	return true
 }
@@ -5538,7 +5556,7 @@ func scratchRecheck(parent *os.Root, name string, info os.FileInfo, whole bool) 
 				why = "logs folder " + p + " appeared"
 			}
 		case d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0:
-			if matrixEvidenceName(base) {
+			if scratchEvidenceName(base) {
 				why = "evidence file " + p + " appeared"
 			}
 		default:

@@ -6677,3 +6677,35 @@ func TestWorktreeCleanupArtifactScratchSweepCommandReportsRows(t *testing.T) {
 		t.Fatalf("the dry run wrote: %+v %v", readCleanupReceipts(t), hub.writes)
 	}
 }
+
+// a1 (review #44467 f1): text transcripts of matrix gates, saves and
+// mutations are evidence, at the folder's top and inside a scratch-looking
+// folder, while a big binary beside them goes.
+func TestWorktreeCleanupArtifactScratchKeepsTranscripts(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), scratchItemRel)
+	kept := map[string]string{}
+	for _, name := range []string{"matrix-8872ec8-g1.out", "plan-save-8872ec8.err", "m.diff", "m.patch", "run.sh", "timings.tsv", "sizes.csv", "mutations/m2.diff"} {
+		p := filepath.Join(dir, name)
+		writeFixtureFile(t, p, "transcript "+name+"\n")
+		kept[p] = "transcript " + name + "\n"
+	}
+	big := filepath.Join(dir, "big.bin")
+	writeFixtureFile(t, big, strings.Repeat("b", 4000))
+	mutationBin := filepath.Join(dir, "mutations", "tt.test")
+	writeFixtureFile(t, mutationBin, strings.Repeat("t", 2000))
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour))}}
+	got := scratchDecisions(f.sweep(t, state, true))
+	if want := []string{big, mutationBin}; !reflect.DeepEqual(sortedKeys(got), want) {
+		t.Fatalf("scratch decisions %+v, want %v", got, want)
+	}
+	requireHomeDecision(t, got, big, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	requireHomeDecision(t, got, mutationBin, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	requireExists(t, big, false)
+	requireExists(t, mutationBin, false)
+	for p, want := range kept {
+		if data, err := os.ReadFile(p); err != nil || string(data) != want {
+			t.Fatalf("transcript %s changed: %q %v", p, data, err)
+		}
+	}
+}

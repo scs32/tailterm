@@ -445,11 +445,12 @@ recorded on the item's newest finished queue entry (its owner integration
 time, else the entry's last update), or, for an item with no release, at its
 dismissal (its last update). A folder whose item runs, has neither (no queue
 record, or only an acceptance), or is inside the window is not walked, nor is a
-symlinked folder. Inside an eligible folder the
-sweep never touches a `logs`, `logs-*` or `*-logs` folder, a file named like
-evidence (`*.md`, `*.json`, `*.jsonl`, `*.log`, `*.txt` and dot files), a
-checkout or any folder holding `.git`, a verifier home, or a path another pass
-of the same sweep decided. Everything else is scratch, judged as the largest
+symlinked folder. Inside an eligible folder the sweep never touches a
+`logs`, `logs-*` or `*-logs` folder, a file named like evidence (`*.md`,
+`*.json`, `*.jsonl`, `*.log`, `*.txt` and dot files) or a transcript (`*.out`,
+`*.err`, `*.diff`, `*.patch`, `*.sh`, `*.tsv`, `*.csv`), a checkout or any
+folder holding `.git`, a verifier home, or a path another pass of the same
+sweep decided. Everything else is scratch, judged as the largest
 entries that hold none of those: a folder holding only scratch is one entry, a
 Go cache or `node_modules` is one entry, and the item or agent folder itself
 stays. An entry is kept while a path in it is in use, while anything in it
