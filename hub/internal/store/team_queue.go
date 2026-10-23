@@ -2162,19 +2162,41 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				member["state"] = "uncertain"
 			} else if req.Operation == "unattempt" {
 				// The runner takes back an attempt whose registration the hub
-				// refused at the cap. Any agent row with the member's identity
-				// means the spawn may have happened: never respawn it.
+				// refused at the cap. Any other agent row with the member's
+				// identity means the spawn may have happened: never respawn it.
+				// One exception: the exact run's registration, already closed,
+				// which the runner closed before any session (a spawn whose
+				// work-context restore timed out). That identity can never
+				// register again, so the member takes a fresh agent and run.
 				fields, _ := member["fields"].(map[string]any)
 				agentID, _ := fields["agentId"].(string)
+				run, _ := member["runId"].(string)
 				if member["state"] != "uncertain" || !api.ValidID(agentID, "agt") {
 					return zero, api.ErrConflict
 				}
-				var registered int
-				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE id=?`, agentID).Scan(&registered); err != nil {
+				var rowTask, rowRun, rowStatus string
+				err := tx.QueryRowContext(ctx, `SELECT task_id,run_id,status FROM agents WHERE id=?`, agentID).Scan(&rowTask, &rowRun, &rowStatus)
+				switch {
+				case errors.Is(err, sql.ErrNoRows):
+				case err != nil:
 					return zero, err
-				}
-				if registered != 0 {
+				case rowTask != task || rowRun != run || rowStatus != string(api.AgentClosed):
 					return zero, fmt.Errorf("%w: member agent is registered; an attempted spawn is never taken back", api.ErrConflict)
+				default:
+					newAgent, newRun := api.NewID("agt"), api.NewID("run")
+					if req.MemberIndex == 0 {
+						// Freeze reserved the item's lead row for member 0's
+						// exact identity; it moves with the member.
+						moved, err := tx.ExecContext(ctx, `UPDATE item_team_leads SET agent_id=?,run_id=?,revision=revision+1 WHERE task_id=? AND item_id=? AND agent_id=? AND run_id=? AND state='launching'`, newAgent, newRun, task, e.ItemID, agentID, run)
+						if err != nil {
+							return zero, err
+						}
+						if n, _ := moved.RowsAffected(); n != 1 {
+							return zero, fmt.Errorf("%w: item lead reservation differs from the closed member", api.ErrConflict)
+						}
+					}
+					fields["agentId"] = newAgent
+					member["runId"] = newRun
 				}
 				member["state"] = "unstarted"
 			} else {

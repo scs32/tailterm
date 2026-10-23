@@ -930,7 +930,7 @@ same status, three times in a row, the runner fails the entry with `launch
 <step> refused permanently by the hub after 3 attempts: hub: <status>
 <message>`. With the backoff that is about 45 seconds to a minute after the
 first refusal. Any other outcome in between restarts the count. Transient
-errors never fail an entry. The hub posts the usual `Team queue failed and
+launch write errors never fail an entry. The hub posts the usual `Team queue failed and
 requires owner action` notice once, with refs entry, item and escalation, and
 `tt team queue list` shows `failed` with the ordinary failed reason (`--json`
 carries `failure`). A parallel failed entry with no live runs is released on
@@ -958,12 +958,45 @@ replay it rather than post another. A launch that was already stalled when a
 permanent refusal began gets both the stall notice and, later, the failure
 notice: two events, each posted once.
 
+**Hub faults in member spawn and cleanup** (`wi_0cf7c5232a7d6636`, incident
+I-44170). A hub fault here is a hub call that got no response: a network
+error, a dropped connection or a timeout. A response the hub sent, any status
+included, is not one. Two such faults no longer fail the entry:
+
+- **Member cleanup.** When a member's cleanup at closeout fails only with hub
+  faults, the entry stays `running` under its frozen close request, as for a
+  pending cleanup receipt. That member's cleanup is tried again on the launch
+  backoff: 15 seconds after the first fault in a row, then 30 seconds, 1, 2
+  and 4 minutes, and 5 minutes from then on. Each tick still reads whether
+  the run is cleaned up, so a cleanup that landed before the fault finishes the
+  entry without another try. A fault that lasts never fails the entry; after
+  30 minutes it raises the usual `Member cleanup still pending` notice to the
+  owner helper. Any other cleanup error, alone or beside a fault, still fails
+  the entry at once, and `Hub unavailable; local session retained` stays such an
+  error.
+- **Member spawn context restore.** `tt spawn` registers the member, then
+  reads its work-item context before creating any session. When that read
+  fails, the spawn closes the registration with a deadline of its own, since
+  the read may have spent the spawn's, and reports whether the close was
+  confirmed. If the read failed with a hub fault, the runner reads the exact
+  agent back. A registration with the frozen agent, run, name, item, revision
+  and order that reads `closed` is taken back with `unattempt`: the hub gives
+  the member a fresh agent and run ID (and moves the item's lead reservation
+  when it is the first member), returns it to `unstarted`, and the launch
+  backs off as above before spawning it again. A registration that is open or
+  differs fails the entry under the never-respawn rule. If the read-back itself
+  meets a hub fault, the relay remembers the member in memory and reconciles it
+  after the backoff; after a relay restart that record is gone, so the member
+  stays `uncertain` and is never respawned. A context read the hub refused, a
+  lost registration response and every other spawn error still fail the entry
+  at once.
+
 The backoff and the refusal count live in the relay's memory. A relay restart
 retries at once and allows at most three more permanent refusals before the
 same fail, whose notice the hub still posts only once. Not covered: a launch
 whose earlier members are live while a later member's write keeps failing
-backs off but is not a stall, and the claim step and the close path keep their
-own handling.
+backs off but is not a stall, the claim step keeps its own handling, and the
+team close write itself is not retried after a hub fault.
 
 ## Team queue limit changes
 
@@ -1607,7 +1640,8 @@ as the queued entry's reason, and `--json` carries it as `blockReason`.
 and its registration, the hub refuses the registration. Registration comes
 before any host session, so nothing was started. The runner sends `unattempt`,
 which returns the member to `unstarted` only while no agent has that member's
-ID, and then backs off as for any transient launch error with
+ID (or while the only one is that member's exact run, already closed: see
+"Team queue launch errors"), and then backs off as for any transient launch error with
 
     spawn NAME: project agent cap: N open + 1 seats > 32: register agent: hub: 409 limit reached
 
@@ -1634,7 +1668,8 @@ even a smaller team.
 Update the hub and the relay hosts' tt together. An older runner on the new
 hub reports the claim refusal as an error on every tick instead of waiting
 silently (it does not fail the entry), and a new runner on an older hub has no
-`unattempt` to call.
+`unattempt` to call. An older hub refuses to take back a closed registration,
+so a new runner fails that entry under the never-respawn rule, as before.
 
 Not covered here: showing the cap in `tt team queue policy` and a per-project
 cap setting (`wi_c8119b78f9045698`), reserving seats against registrations

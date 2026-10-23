@@ -1061,6 +1061,23 @@ func cmdAllocationIntentGet(e env, args []string) error {
 	return nil
 }
 
+// spawnContextRestoreError is a spawn whose agent registered but whose
+// work-item context read failed, so no session was created. Closed reports
+// whether the hub confirmed the registration's close; the queue runner
+// reconciles the exact agent and run either way (docs/project-queue.md,
+// "Team queue launch errors").
+type spawnContextRestoreError struct {
+	AgentID, RunID string
+	Closed         bool
+	Err            error
+}
+
+func (e *spawnContextRestoreError) Error() string {
+	return "restore work-item context: " + e.Err.Error()
+}
+
+func (e *spawnContextRestoreError) Unwrap() error { return e.Err }
+
 func cmdSpawn(e env, args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	name := fs.String("name", "", "agent name (required)")
@@ -1499,8 +1516,12 @@ func cmdSpawn(e env, args []string) error {
 		if agent.WorkItem != nil {
 			workContext, contextErr := c.GetAgentWorkItemContext(ctx, *task, agent.ID, agent.RunID)
 			if contextErr != nil {
-				_, _ = c.CloseAgent(ctx, *task, agent.ID, agent.RunID)
-				return fmt.Errorf("restore work-item context: %w", contextErr)
+				// A timed-out read may have spent the spawn's context; the
+				// close gets its own, and its outcome goes to the caller.
+				closeCtx, closeCancel := ctxTimeout(10 * time.Second)
+				_, closeErr := c.CloseAgent(closeCtx, *task, agent.ID, agent.RunID)
+				closeCancel()
+				return &spawnContextRestoreError{AgentID: agent.ID, RunID: agent.RunID, Closed: closeErr == nil, Err: contextErr}
 			}
 			contextBriefing, contextErr := formatWorkItemContext(workContext)
 			if contextErr != nil {

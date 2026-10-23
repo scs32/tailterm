@@ -994,6 +994,18 @@ type launchFaultHub struct {
 	counts    map[string]int
 	listFault *api.HTTPError
 	listing   func(*api.TeamQueueList)
+	// once holds requests the hub leaves unanswered one time each.
+	once []*unansweredOnce
+	srv  *httptest.Server
+}
+
+// unansweredOnce is one request the fault hub does not answer: it holds a
+// stalled request until the caller gives up, as a timeout, or closes the
+// connection of a dropped one.
+type unansweredOnce struct {
+	match func(*http.Request) bool
+	drop  bool
+	hits  int
 }
 
 func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
@@ -1001,6 +1013,19 @@ func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 	h := &launchFaultHub{faults: map[string]*api.HTTPError{}, counts: map[string]int{}}
 	inner := server.New(f.st, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "team-fixture", User: "owner"}, nil })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fault := h.takeOnce(r); fault != nil {
+			if fault.drop {
+				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+					conn.Close()
+				}
+				return
+			}
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+			return
+		}
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Count(r.URL.Path, "/") == 3 {
 			h.mu.Lock()
 			h.counts["get_task"]++
@@ -1054,8 +1079,42 @@ func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.e, h.c = env{hub: srv.URL, task: f.task.ID}, c
+	h.e, h.c, h.srv = env{hub: srv.URL, task: f.task.ID}, c, srv
 	return h
+}
+
+// unanswered leaves the next request that matches unanswered: stalled until
+// the caller times out, or dropped with drop. It returns the fault so a test
+// can read whether it fired.
+func (h *launchFaultHub) unanswered(match func(*http.Request) bool, drop bool) *unansweredOnce {
+	if drop {
+		// net/http quietly resends a GET whose reused connection closed
+		// unanswered; fresh connections make the drop reach the caller.
+		h.srv.Config.SetKeepAlivesEnabled(false)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fault := &unansweredOnce{match: match, drop: drop}
+	h.once = append(h.once, fault)
+	return fault
+}
+
+func (h *launchFaultHub) takeOnce(r *http.Request) *unansweredOnce {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, fault := range h.once {
+		if fault.hits == 0 && fault.match(r) {
+			fault.hits++
+			return fault
+		}
+	}
+	return nil
+}
+
+func (h *launchFaultHub) fired(fault *unansweredOnce) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return fault.hits > 0
 }
 
 func (h *launchFaultHub) refuse(operation string, status int, msg string) {
@@ -4251,4 +4310,510 @@ func censusProject(t *testing.T, f teamFixture, name string) teamFixture {
 	}
 	f.task, f.item, f.order, f.handler = task, item, order.Seq, handler
 	return f
+}
+
+// Hub timeouts in member cleanup and spawn (wi_0cf7c5232a7d6636, order
+// #44174). The fault hub stalls a read until a short-timeout client gives up,
+// or drops it, once; later reads are answered. No live hub, relay or tmux.
+
+const hubFaultTimeout = 100 * time.Millisecond
+
+// shortHubClient is a client that gives up on a stalled hub read quickly.
+func shortHubClient(t *testing.T, hub *launchFaultHub) *api.Client {
+	t.Helper()
+	c, err := api.NewClient(hub.e.hub, hubFaultTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// stalledTaskRead returns the error a hub task read gets from a hub that
+// does not answer in time, as in incident #44147.
+func stalledTaskRead(t *testing.T, hub *launchFaultHub, task string) error {
+	t.Helper()
+	stall := hub.unanswered(func(r *http.Request) bool { return r.Method == "GET" && r.URL.Path == "/v1/tasks/"+task }, false)
+	_, err := shortHubClient(t, hub).GetTask(context.Background(), task)
+	if !hub.fired(stall) || !hubTransportFault(err) || !strings.Contains(err.Error(), "Client.Timeout exceeded") {
+		t.Fatalf("stalled task read: %v", err)
+	}
+	return err
+}
+
+func TestCleanupHubFaultClassification(t *testing.T) {
+	timeout := &url.Error{Op: "Get", URL: "http://hub/v1/tasks/tsk_1", Err: context.DeadlineExceeded}
+	dropped := &url.Error{Op: "Get", URL: "http://hub/v1/tasks/tsk_1", Err: io.EOF}
+	refused := &api.HTTPError{Status: 404, Msg: "not found"}
+	for _, err := range []error{
+		timeout, dropped, fmt.Errorf("read: %w", timeout), context.DeadlineExceeded,
+		errors.Join(timeout, dropped),
+	} {
+		if !cleanupHubFault(err) {
+			t.Errorf("%v is not a hub fault", err)
+		}
+	}
+	for _, err := range []error{
+		nil, errors.Join(), refused, fmt.Errorf("hub: %w", refused),
+		&url.Error{Op: "Get", URL: "http://hub", Err: refused},
+		errors.New("Hub unavailable; local session retained"),
+		errors.New(cleanupReceiptPending),
+		errors.Join(timeout, errors.New("Agent is not closed")),
+	} {
+		if cleanupHubFault(err) {
+			t.Errorf("%v is a hub fault", err)
+		}
+	}
+}
+
+// q1, q3: one cleanup whose hub read times out leaves the entry running and
+// waits out the first backoff; the cleanup then finishes the entry.
+func TestTeamRunnerCloseoutCleanupTimeoutBacksOffThenFinishes(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	stall := hub.unanswered(func(r *http.Request) bool { return r.Method == "GET" && r.URL.Path == "/v1/tasks/"+f.task.ID }, false)
+	start := time.Now()
+	now := start
+	r := queueCorrectionRunner(t, f, 1)
+	clean := r.cleanup
+	var calls atomic.Int32
+	r.cleanup = func(ctx context.Context, e env, task, id string) error {
+		calls.Add(1)
+		if !hub.fired(stall) {
+			// cleanup.go reads the closed team before it reports.
+			if _, err := shortHubClient(t, hub).GetTask(ctx, task); err != nil {
+				return err
+			}
+		}
+		return clean(ctx, e, task, id)
+	}
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	tick := func(at time.Duration, wantCalls int32, wantState string) {
+		t.Helper()
+		now = start.Add(at)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+		got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+		if err != nil || got.State != wantState || got.Failure != "" || got.EscalationSeq != 0 {
+			t.Fatalf("tick at %s entry %+v %v", at, got, err)
+		}
+		if n := calls.Load(); n != wantCalls {
+			t.Fatalf("tick at %s: %d cleanup calls, want %d", at, n, wantCalls)
+		}
+	}
+	tick(0, 1, "running")
+	if !hub.fired(stall) {
+		t.Fatal("the cleanup read was not stalled")
+	}
+	tick(launchRetryFirstDelay-time.Second, 1, "running")
+	tick(launchRetryFirstDelay, 2, "finished")
+	if len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 || len(r.cleanupPending.entries) != 0 {
+		t.Fatalf("failure notice or pending state left: %v", r.cleanupPending.entries)
+	}
+}
+
+// q1: a lasting cleanup fault is paced on the launch backoff, never fails
+// the entry, and raises the cleanup-pending notice once past 30 minutes.
+func TestTeamRunnerCloseoutLastingCleanupFaultBacksOffAndNotices(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	if _, err := f.st.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "fault-helper"}, api.Caller{Node: "team-fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	fault := stalledTaskRead(t, hub, f.task.ID)
+	start := time.Now()
+	now := start
+	r := queueCorrectionRunner(t, f, 1)
+	var calls []time.Duration
+	r.cleanup = func(context.Context, env, string, string) error {
+		calls = append(calls, now.Sub(start))
+		return fault
+	}
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	notices := func() int {
+		t.Helper()
+		messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, m := range messages {
+			if m.Envelope != nil && m.Envelope.Subject == cleanupPendingTitle && strings.Contains(m.Text, "Client.Timeout exceeded") {
+				n++
+			}
+		}
+		return n
+	}
+	// Every 5 s for 35 minutes: a cleanup try only when its backoff ends.
+	for at := time.Duration(0); at <= 35*time.Minute; at += 5 * time.Second {
+		now = start.Add(at)
+		if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+			t.Fatalf("tick at %s: %v", at, err)
+		}
+	}
+	want := []time.Duration{0}
+	for i := 1; i < len(calls); i++ {
+		want = append(want, want[i-1]+launchRetryDelay(i))
+	}
+	if len(calls) != 11 || fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Fatalf("cleanup tries at %v, want %v", calls, want)
+	}
+	got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "running" || got.Failure != "" || got.EscalationSeq != 0 || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
+		t.Fatalf("lasting fault entry %+v %v", got, err)
+	}
+	if n := notices(); n != 1 {
+		t.Fatalf("%d cleanup pending notices, want 1", n)
+	}
+}
+
+// q1, q3: a cleanup error that the hub answered, or a fault mixed with
+// another error, still fails the entry at once.
+func TestTeamRunnerCloseoutAnsweredCleanupErrorFails(t *testing.T) {
+	timeout := &url.Error{Op: "Get", URL: "http://hub/v1/tasks/tsk_1", Err: context.DeadlineExceeded}
+	for name, cause := range map[string]error{
+		"refused": fmt.Errorf("hub: %w", &api.HTTPError{Status: 404, Msg: "agent not found"}),
+		"mixed":   errors.Join(timeout, errors.New("Agent is not closed")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			r := queueCorrectionRunner(t, f, 1)
+			r.cleanup = func(context.Context, env, string, string) error { return cause }
+			r.cleanupPending = &cleanupPendingBook{}
+			q := runningDismissedEntry(t, f, r)
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err == nil || !strings.Contains(err.Error(), cause.Error()) {
+				t.Fatalf("tick error %v", err)
+			}
+			got, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || got.State != "failed" || !strings.Contains(got.Failure, "cleanup: ") {
+				t.Fatalf("entry %+v %v", got, err)
+			}
+		})
+	}
+}
+
+// restoreFixture is a one-member launch behind a fault hub. Its spawn
+// registers the exact member and reads the work-item context the way
+// cmdSpawn does; the hub leaves that read unanswered once.
+type restoreFixture struct {
+	f        teamFixture
+	hub      *launchFaultHub
+	q        api.TeamQueueEntry
+	runner   teamRunner
+	now      time.Time
+	attempts int
+	// registered counts registrations by agent ID.
+	registered map[string]int
+	// keepOpen leaves the registration open after the fault, as a close
+	// that did not reach the hub.
+	keepOpen bool
+	// afterFault runs once the spawn has returned its fault.
+	afterFault func(agent string)
+	stall      *unansweredOnce
+	// register is the fake registration without the context read.
+	register func(env, []string) error
+}
+
+func newRestoreFixture(t *testing.T) *restoreFixture {
+	t.Helper()
+	x := &restoreFixture{registered: map[string]int{}}
+	x.f = newTeamFixture(t, true)
+	x.hub = newLaunchFaultHub(t, x.f)
+	ctx := context.Background()
+	var err error
+	if x.q, err = x.hub.c.TeamQueueAction(ctx, x.f.task.ID, api.TeamQueueRequest{RequestID: "restore-add", Operation: "add", ItemID: x.f.item.ID, OrderMessageSeq: x.f.order, Host: "fixture", Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	x.stall = x.hub.unanswered(func(r *http.Request) bool { return r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/work-context") }, false)
+	x.now = time.Now()
+	x.runner = queueCorrectionRunner(t, x.f, 1)
+	register := x.runner.spawn
+	x.register = register
+	x.runner.spawn = func(e env, args []string) error {
+		x.attempts++
+		flags := map[string]string{}
+		for i := 0; i+1 < len(args); i += 2 {
+			flags[args[i]] = args[i+1]
+		}
+		if err := register(e, args); err != nil {
+			return fmt.Errorf("register agent: %w", err)
+		}
+		id, run := flags["--agent-id"], flags["--expected-run-id"]
+		x.registered[id]++
+		c := x.f.c
+		if !x.hub.fired(x.stall) {
+			c = shortHubClient(t, x.hub)
+		}
+		if _, err := c.GetAgentWorkItemContext(ctx, flags["--task"], id, run); err != nil {
+			closed := false
+			if !x.keepOpen {
+				_, closeErr := x.f.c.CloseAgent(ctx, flags["--task"], id, run)
+				closed = closeErr == nil
+			}
+			if x.afterFault != nil {
+				x.afterFault(id)
+			}
+			return &spawnContextRestoreError{AgentID: id, RunID: run, Closed: closed, Err: err}
+		}
+		return nil
+	}
+	x.runner.retries = &launchRetryBook{}
+	x.runner.now = func() time.Time { return x.now }
+	return x
+}
+
+func (x *restoreFixture) tick(t *testing.T, after time.Duration) error {
+	t.Helper()
+	x.now = x.now.Add(after)
+	return x.runner.tick(context.Background(), x.hub.e, x.hub.c, "fixture")
+}
+
+func (x *restoreFixture) entry(t *testing.T) (api.TeamQueueEntry, teamLaunchJournal) {
+	t.Helper()
+	got, err := x.hub.c.GetTeamQueueEntry(context.Background(), x.f.task.ID, x.q.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var journal teamLaunchJournal
+	if len(got.LaunchJSON) > 0 {
+		if err := json.Unmarshal(got.LaunchJSON, &journal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return got, journal
+}
+
+// held checks an entry that is still launching, unfailed, with its one member
+// in state.
+func (x *restoreFixture) held(t *testing.T, step, state string) teamLaunchMember {
+	t.Helper()
+	got, journal := x.entry(t)
+	if got.State != "launching" || got.Failure != "" || got.EscalationSeq != 0 || x.hub.count("fail") != 0 || len(launchNotices(t, x.f, launchFailedSubject, x.q.ID)) != 0 {
+		t.Fatalf("%s: state=%s failure=%q escalation=%d fails=%d", step, got.State, got.Failure, got.EscalationSeq, x.hub.count("fail"))
+	}
+	if len(journal.Members) != 1 || journal.Members[0].State != state {
+		t.Fatalf("%s: members %+v, want one %s", step, journal.Members, state)
+	}
+	return journal.Members[0]
+}
+
+// running checks that the rotated member started and leads the item.
+func (x *restoreFixture) running(t *testing.T, old string) {
+	t.Helper()
+	got, journal := x.entry(t)
+	if got.State != "running" || got.Failure != "" || x.hub.count("fail") != 0 || len(launchNotices(t, x.f, launchFailedSubject, x.q.ID)) != 0 {
+		t.Fatalf("relaunch: state=%s failure=%q", got.State, got.Failure)
+	}
+	member := journal.Members[0]
+	lead, err := x.f.c.GetAgent(context.Background(), x.f.task.ID, member.Fields.AgentID)
+	if err != nil || member.Fields.AgentID == old || lead.RunID != member.RunID || !lead.ItemLead || lead.Status == api.AgentClosed {
+		t.Fatalf("relaunched lead %+v from %s: %v", lead, old, err)
+	}
+	if x.attempts != 2 || len(x.registered) != 2 || x.registered[old] != 1 || x.registered[member.Fields.AgentID] != 1 {
+		t.Fatalf("spawn attempts %d registrations %v", x.attempts, x.registered)
+	}
+}
+
+// q2, q3: a spawn whose context restore times out after registering, with its
+// registration closed, is taken back under a fresh identity and relaunched
+// after the first backoff. The entry is never failed.
+func TestTeamRunnerSpawnRestoreTimeoutRelaunchesClosedMember(t *testing.T) {
+	x := newRestoreFixture(t)
+	if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "closed before any session") || !strings.Contains(err.Error(), "Client.Timeout exceeded") {
+		t.Fatalf("restore timeout: %v", err)
+	}
+	_, journal := x.entry(t)
+	old := ""
+	for id := range x.registered {
+		old = id
+	}
+	member := x.held(t, "after the timeout", "unstarted")
+	if !x.hub.fired(x.stall) || x.hub.count("unattempt") != 1 || member.Fields.AgentID == old || len(journal.Members) != 1 {
+		t.Fatalf("take back: stalled=%v unattempts=%d member=%s old=%s", x.hub.fired(x.stall), x.hub.count("unattempt"), member.Fields.AgentID, old)
+	}
+	if a, err := x.f.c.GetAgent(context.Background(), x.f.task.ID, old); err != nil || a.Status != api.AgentClosed {
+		t.Fatalf("old registration %+v %v", a, err)
+	}
+	if err := x.tick(t, launchRetryFirstDelay-time.Second); err != nil || x.attempts != 1 || x.hub.count("attempt") != 1 {
+		t.Fatalf("tick inside the backoff: %v attempts=%d", err, x.attempts)
+	}
+	if err := x.tick(t, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	x.running(t, old)
+}
+
+// q2, q3: a registration still open after the fault is uncertain: the entry
+// fails at once and the member is never respawned.
+func TestTeamRunnerSpawnRestoreTimeoutNeverRespawnsOpenRegistration(t *testing.T) {
+	x := newRestoreFixture(t)
+	x.keepOpen = true
+	if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "never respawn") || !strings.Contains(err.Error(), "not closed") {
+		t.Fatalf("open registration: %v", err)
+	}
+	got, journal := x.entry(t)
+	if got.State != "failed" || !strings.Contains(got.Failure, "never respawn") || got.EscalationSeq == 0 || x.hub.count("unattempt") != 0 || journal.Members[0].State != "uncertain" {
+		t.Fatalf("entry %s failure %q unattempts %d members %+v", got.State, got.Failure, x.hub.count("unattempt"), journal.Members)
+	}
+	for i := 0; i < 3; i++ {
+		_ = x.tick(t, launchRetryMaxDelay)
+	}
+	if x.attempts != 1 {
+		t.Fatalf("respawned an uncertain member: %d attempts", x.attempts)
+	}
+}
+
+// q2, q3: when the read-back of the registration also times out, the relay
+// remembers the member and reconciles it after the backoff. A relay that
+// restarted has no such record and keeps the never-respawn rule.
+func TestTeamRunnerSpawnRestoreTimeoutReconcilesAfterReadBackFault(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%v", restart), func(t *testing.T) {
+			x := newRestoreFixture(t)
+			var readBack *unansweredOnce
+			x.afterFault = func(agent string) {
+				readBack = x.hub.unanswered(func(r *http.Request) bool {
+					return r.Method == "GET" && r.URL.Path == "/v1/tasks/"+x.f.task.ID+"/agents/"+agent
+				}, true)
+			}
+			if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "read back registration") {
+				t.Fatalf("read-back fault: %v", err)
+			}
+			x.held(t, "after the read-back fault", "uncertain")
+			if !x.hub.fired(readBack) || x.hub.count("unattempt") != 0 || x.runner.retries.pendingRestore(launchRetryKey(x.hub.c.Base, x.f.task.ID, x.q.ID)) == nil {
+				t.Fatal("read-back fault was not remembered")
+			}
+			old := ""
+			for id := range x.registered {
+				old = id
+			}
+			if restart {
+				x.runner.retries = &launchRetryBook{}
+				if err := x.tick(t, launchRetryFirstDelay); err == nil || !strings.Contains(err.Error(), "never respawn") {
+					t.Fatalf("restarted relay: %v", err)
+				}
+				got, _ := x.entry(t)
+				if got.State != "failed" || x.hub.count("unattempt") != 0 {
+					t.Fatalf("restarted relay entry %s unattempts %d", got.State, x.hub.count("unattempt"))
+				}
+				_ = x.tick(t, launchRetryMaxDelay)
+				if x.attempts != 1 {
+					t.Fatalf("respawned after a restart: %d attempts", x.attempts)
+				}
+				return
+			}
+			if err := x.tick(t, launchRetryFirstDelay-time.Second); err != nil || x.hub.count("unattempt") != 0 {
+				t.Fatalf("tick inside the backoff: %v", err)
+			}
+			if err := x.tick(t, time.Second); err == nil || !strings.Contains(err.Error(), "closed before any session") {
+				t.Fatalf("reconcile after the backoff: %v", err)
+			}
+			x.held(t, "after the reconcile", "unstarted")
+			if x.hub.count("unattempt") != 1 || x.runner.retries.pendingRestore(launchRetryKey(x.hub.c.Base, x.f.task.ID, x.q.ID)) != nil {
+				t.Fatalf("reconcile kept its record or did not take the member back")
+			}
+			if err := x.tick(t, launchRetryDelay(2)); err != nil {
+				t.Fatal(err)
+			}
+			x.running(t, old)
+		})
+	}
+}
+
+// q2, q3: a context-restore error the hub answered, or any other spawn
+// error, still fails the entry at once with no take-back.
+func TestTeamRunnerSpawnAnsweredRestoreErrorFails(t *testing.T) {
+	for name, fault := range map[string]func(id, run string) error{
+		"refused": func(id, run string) error {
+			return &spawnContextRestoreError{AgentID: id, RunID: run, Closed: true, Err: fmt.Errorf("hub: %w", &api.HTTPError{Status: 403, Msg: "forbidden"})}
+		},
+		"other": func(string, string) error { return errors.New("tmux could not start the session") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := newRestoreFixture(t)
+			register := x.register
+			x.runner.spawn = func(e env, args []string) error {
+				x.attempts++
+				flags := map[string]string{}
+				for i := 0; i+1 < len(args); i += 2 {
+					flags[args[i]] = args[i+1]
+				}
+				if err := register(e, args); err != nil {
+					return err
+				}
+				if _, err := x.f.c.CloseAgent(context.Background(), flags["--task"], flags["--agent-id"], flags["--expected-run-id"]); err != nil {
+					return err
+				}
+				return fault(flags["--agent-id"], flags["--expected-run-id"])
+			}
+			if err := x.tick(t, 0); err == nil {
+				t.Fatal("answered spawn error did not fail")
+			}
+			got, _ := x.entry(t)
+			if got.State != "failed" || !strings.HasPrefix(got.Failure, "spawn correction-lead-0: ") || x.hub.count("unattempt") != 0 {
+				t.Fatalf("entry %s failure %q unattempts %d", got.State, got.Failure, x.hub.count("unattempt"))
+			}
+			_ = x.tick(t, launchRetryMaxDelay)
+			if x.attempts != 1 {
+				t.Fatalf("respawned after an answered error: %d attempts", x.attempts)
+			}
+		})
+	}
+}
+
+// q2: the real cmdSpawn, against a hub that drops its context read once,
+// closes the registration with a context of its own, reports the close, and
+// creates no session; the runner relaunches the member under a fresh
+// identity. tmux is a fake that records its arguments.
+func TestTeamRunnerRealSpawnRestoreFaultClosesAndRelaunches(t *testing.T) {
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	log := exactRunTmux(t)
+	ctx := context.Background()
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "real-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: spawn.Host(), Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drop := hub.unanswered(func(r *http.Request) bool { return r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/work-context") }, true)
+	now := time.Now()
+	r := queueCorrectionRunner(t, f, 1)
+	r.retries = &launchRetryBook{}
+	r.now = func() time.Time { return now }
+	var spawnErrs []error
+	r.spawn = func(e env, args []string) error {
+		err := cmdSpawn(e, args)
+		spawnErrs = append(spawnErrs, err)
+		return err
+	}
+	if err := r.tick(ctx, hub.e, hub.c, spawn.Host()); err == nil || !strings.Contains(err.Error(), "closed before any session") {
+		t.Fatalf("dropped context read: %v", err)
+	}
+	var restore *spawnContextRestoreError
+	if len(spawnErrs) != 1 || !errors.As(spawnErrs[0], &restore) || !restore.Closed || !hubTransportFault(restore) || !hub.fired(drop) {
+		t.Fatalf("spawn error %#v", spawnErrs)
+	}
+	if a, err := f.c.GetAgent(ctx, f.task.ID, restore.AgentID); err != nil || a.RunID != restore.RunID || a.Status != api.AgentClosed {
+		t.Fatalf("closed registration %+v %v", a, err)
+	}
+	if n := exactRunNewSessions(t, log); n != 0 {
+		t.Fatalf("%d sessions created by a failed spawn", n)
+	}
+	now = now.Add(launchRetryFirstDelay)
+	if err := r.tick(ctx, hub.e, hub.c, spawn.Host()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || got.State != "running" || got.Failure != "" || hub.count("unattempt") != 1 {
+		t.Fatalf("relaunch %+v %v", got, err)
+	}
+	if len(spawnErrs) != 2 || spawnErrs[1] != nil || exactRunNewSessions(t, log) != 1 {
+		t.Fatalf("relaunch spawn errors %v sessions %d", spawnErrs, exactRunNewSessions(t, log))
+	}
 }

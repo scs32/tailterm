@@ -130,9 +130,54 @@ type launchRetryState struct {
 	failures  int
 	next      time.Time
 	lastErr   string
+	// restore names the member whose spawn timed out in its context
+	// restore and whose registration this relay could not read back yet.
+	restore *restoreFault
+}
+
+// restoreFault is a member spawn that registered and then failed to read its
+// work-item context, so it created no session.
+type restoreFault struct {
+	member int
+	agent  string
+	run    string
+	cause  string
 }
 
 var productionLaunchRetries = &launchRetryBook{}
+
+// noteRestore remembers, in relay memory only, a member registration that a
+// later tick must reconcile; a restart forgets it, and the member then keeps
+// the never-respawn rule.
+func (b *launchRetryBook) noteRestore(key string, fault *restoreFault) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.entries == nil {
+		b.entries = map[string]*launchRetryState{}
+	}
+	state := b.entries[key]
+	if state == nil {
+		state = &launchRetryState{}
+		b.entries[key] = state
+	}
+	state.restore = fault
+}
+
+// pendingRestore is the remembered member registration, if any.
+func (b *launchRetryBook) pendingRestore(key string) *restoreFault {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if state := b.entries[key]; state != nil {
+		return state.restore
+	}
+	return nil
+}
 
 func launchRetryKey(hub, task, entry string) string {
 	return strings.TrimRight(hub, "/") + "\x00" + task + "\x00" + entry
@@ -512,6 +557,23 @@ func cleanupRetryable(err error) bool {
 	return err.Error() == cleanupReceiptPending || err.Error() == cleanupSessionPresent
 }
 
+// cleanupHubFault reports a cleanup error made only of hub transport faults
+// (wi_0cf7c5232a7d6636): the hub may already hold the cleanup, so the member
+// waits like a pending one, paced on the launch backoff. A refusal the hub
+// sent is not one and still fails the entry.
+func cleanupHubFault(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := joined.Unwrap()
+		for _, e := range errs {
+			if !cleanupHubFault(e) {
+				return false
+			}
+		}
+		return len(errs) > 0
+	}
+	return hubTransportFault(err)
+}
+
 // cleanupPendingBook holds when each entry's member run first waited on a
 // retryable cleanup error, in relay memory only: a restart starts the
 // interval again, and the notice's request identity keeps it to one post.
@@ -529,6 +591,10 @@ type cleanupPendingState struct {
 	// notice may be tried again.
 	refusals int
 	next     time.Time
+	// faults counts the hub transport faults in a row; the member's next
+	// cleanup waits until retryAt.
+	faults  int
+	retryAt time.Time
 }
 
 var productionCleanupPending = &cleanupPendingBook{}
@@ -553,6 +619,38 @@ func (b *cleanupPendingBook) wait(key string, now time.Time) bool {
 		b.entries[key] = s
 	}
 	return !s.noticed && now.Sub(s.since) >= cleanupPendingNoticeAfter && !now.Before(s.next)
+}
+
+// paced records the outcome of a cleanup that waits: a hub transport fault
+// delays the member's next cleanup on the launch backoff (15 s doubling to
+// 5 min); any other wait ends the run of faults.
+func (b *cleanupPendingBook) paced(key string, fault bool, now time.Time) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.entries[key]
+	if s == nil {
+		return
+	}
+	if !fault {
+		s.faults, s.retryAt = 0, time.Time{}
+		return
+	}
+	s.faults++
+	s.retryAt = now.Add(launchRetryDelay(s.faults))
+}
+
+// backingOff reports whether the member's cleanup waits out a fault.
+func (b *cleanupPendingBook) backingOff(key string, now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.entries[key]
+	return s != nil && now.Before(s.retryAt)
 }
 
 // refused records a refused notice post and returns the wait before the
@@ -1503,6 +1601,20 @@ func (r teamRunner) releaseFailed(ctx context.Context, e env, c *api.Client, q a
 	return err
 }
 
+// hubTransportFault reports a hub call that got no response: a transport
+// fault, a timeout or an ended context. Unlike hubFault, any response the hub
+// sent, a refusal included, is not one.
+func hubTransportFault(err error) bool {
+	var response *api.HTTPError
+	if err == nil || errors.As(err, &response) {
+		return false
+	}
+	var transport *url.Error
+	var network net.Error
+	return errors.As(err, &transport) || errors.As(err, &network) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // hubFault reports an error from a hub call: the hub's response, or a
 // transport fault or ended context that kept one from arriving.
 func hubFault(err error) bool {
@@ -1575,6 +1687,44 @@ func (r teamRunner) verifyMember(ctx context.Context, e env, c *api.Client, q ap
 		return a, err
 	}
 	return a, nil
+}
+
+// reconcileRestore settles a member spawn that registered and then timed out
+// reading its work-item context, before any session (wi_0cf7c5232a7d6636).
+// The exact agent and run, read back closed, is taken back with a fresh
+// identity and the launch backs off. A registration that is open, differs or
+// cannot be read back without a relay record keeps the never-respawn rule; a
+// read that times out is remembered and tried again after the backoff.
+func (r teamRunner) reconcileRestore(ctx context.Context, c *api.Client, q api.TeamQueueEntry, i int, m teamLaunchMember, cause error) error {
+	key := launchRetryKey(c.Base, q.TaskID, q.ID)
+	f := m.Fields
+	a, err := c.GetAgent(ctx, q.TaskID, f.AgentID)
+	if hubTransportFault(err) && r.retries != nil {
+		r.retries.noteRestore(key, &restoreFault{member: i, agent: f.AgentID, run: m.RunID, cause: cause.Error()})
+		return fmt.Errorf("%v; read back registration %s: %w", cause, f.AgentID, err)
+	}
+	if err == nil && (a.ID != f.AgentID || a.TaskID != q.TaskID || a.RunID != m.RunID || a.Name != f.Name || a.WorkItem == nil || a.WorkItem.ItemID != q.ItemID || a.WorkItem.ItemRevision != q.ItemRevision || a.WorkItem.WorkOrderMessage.Seq != q.OrderMessageSeq) {
+		err = errors.New("exact agent registration differs from frozen member")
+	} else if err == nil && a.Status != api.AgentClosed {
+		err = fmt.Errorf("registration is %s, not closed", a.Status)
+	}
+	if err != nil {
+		r.retries.noteRestore(key, nil)
+		return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s is not confirmed closed; never respawn: %w (after %v)", f.AgentID, err, cause))
+	}
+	r.retries.noteRestore(key, &restoreFault{member: i, agent: f.AgentID, run: m.RunID, cause: cause.Error()})
+	revision := q.Revision
+	if _, err := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-unattempt-%s-%d-%d", q.ID, i, q.Revision), Operation: "unattempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i}); err != nil {
+		if hubTransportFault(err) {
+			return &launchStepError{op: "unattempt", revision: revision, err: err}
+		}
+		// A hub that keeps every registered member refuses this: the
+		// member stays uncertain and is never respawned.
+		r.retries.noteRestore(key, nil)
+		return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s could not be taken back; never respawn: %w (after %v)", f.AgentID, err, cause))
+	}
+	r.retries.noteRestore(key, nil)
+	return &launchStepError{op: "spawn " + f.Name, revision: revision, err: fmt.Errorf("registration %s run %s closed before any session; the member takes a fresh identity: %w", f.AgentID, m.RunID, cause)}
 }
 
 // boundedLaunch paces a launch that keeps failing and fails the entry once
@@ -1717,6 +1867,9 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			continue
 		}
 		if member.State == "uncertain" {
+			if fault := r.retries.pendingRestore(launchRetryKey(c.Base, q.TaskID, q.ID)); fault != nil && fault.member == i && fault.agent == member.Fields.AgentID && fault.run == member.RunID {
+				return r.reconcileRestore(ctx, c, q, i, *member, errors.New(fault.cause))
+			}
 			a, err := r.verifyMember(ctx, e, c, q, *member)
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w", member.Fields.AgentID, err))
@@ -1780,6 +1933,10 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 					}
 				}
 				return &launchStepError{op: "spawn " + f.Name, revision: revision, err: fmt.Errorf("%s%d open + 1 seats > %d: %w", projectAgentCapPrefix, open, api.MaxAgentsPerTask, spawnErr)}
+			}
+			var restore *spawnContextRestoreError
+			if errors.As(spawnErr, &restore) && hubTransportFault(restore.Err) && restore.AgentID == f.AgentID && restore.RunID == member.RunID {
+				return r.reconcileRestore(ctx, c, q, i, *member, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
 			}
 			return r.fail(ctx, c, q, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
 		}
@@ -1902,12 +2059,16 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 			return r.fail(ctx, c, q, fmt.Errorf("member %s cleanup is on another host", m.AgentID))
 		}
 		key := cleanupPendingKey(c.Base, q.ID, m.AgentID, m.RunID)
+		if r.cleanupPending.backingOff(key, r.clock()) {
+			continue // The poll below still sees a cleanup that landed.
+		}
 		err := r.cleanup(ctx, e, q.TaskID, m.AgentID)
 		if err == nil {
 			r.cleanupPending.drop(key)
 			continue
 		}
-		if !cleanupRetryable(err) {
+		fault := cleanupHubFault(err)
+		if !fault && !cleanupRetryable(err) {
 			// An earlier member may be waiting: the failed entry leaves
 			// closeout, so none of its keys stay.
 			r.cleanupPending.dropEntry(c.Base, q.ID)
@@ -1915,7 +2076,10 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 		}
 		// The receipt may still land or may already have: keep the frozen
 		// close request and let the CleanupDone poll below decide.
-		if now := r.clock(); r.cleanupPending.wait(key, now) {
+		now := r.clock()
+		due := r.cleanupPending.wait(key, now)
+		r.cleanupPending.paced(key, fault, now)
+		if due {
 			r.noticeCleanupPending(ctx, c, q, m, key, err, now)
 		}
 	}

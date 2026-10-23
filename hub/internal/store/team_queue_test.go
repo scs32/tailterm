@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3012,6 +3013,182 @@ func TestTeamQueueUnattemptOnlyWithoutRegistration(t *testing.T) {
 	if err != nil || saved.Revision != q.Revision || !reflect.DeepEqual(launchMemberStates(t, saved), []string{"uncertain"}) {
 		t.Fatalf("registered member after refusal %+v %v", saved, err)
 	}
+}
+
+// launchMemberIdentities lists each frozen member's agent and run.
+func launchMemberIdentities(t *testing.T, q api.TeamQueueEntry) [][2]string {
+	t.Helper()
+	var plan struct {
+		Members []struct {
+			Fields struct {
+				AgentID string `json:"agentId"`
+			} `json:"fields"`
+			RunID string `json:"runId"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(q.LaunchJSON, &plan); err != nil {
+		t.Fatal(err)
+	}
+	var ids [][2]string
+	for _, m := range plan.Members {
+		ids = append(ids, [2]string{m.Fields.AgentID, m.RunID})
+	}
+	return ids
+}
+
+// wi_0cf7c5232a7d6636 q2: a member whose exact run registered and was closed
+// before any session (a spawn whose work-context restore timed out) is taken
+// back with a fresh agent and run; the item's lead row moves with member 0.
+// An open registration, another run or another project still refuses.
+func TestTeamQueueUnattemptRotatesClosedExactRegistration(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := capLaunchPlan(task, items[0], orders[0], api.TeamQueueEntry{}, 2)
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan}); err != nil {
+		t.Fatal(err)
+	}
+	step := func(key, operation string, member int) (api.TeamQueueEntry, error) {
+		return s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: operation, EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: member})
+	}
+	leadRow := func() [3]string {
+		t.Helper()
+		var agent, run string
+		var revision int64
+		if err := s.db.QueryRow(`SELECT agent_id,run_id,revision FROM item_team_leads WHERE task_id=? AND item_id=?`, task.ID, items[0].ID).Scan(&agent, &run, &revision); err != nil {
+			t.Fatal(err)
+		}
+		return [3]string{agent, run, fmt.Sprint(revision)}
+	}
+	// register saves the member's registration row with the given run,
+	// project and status, as the spawn would have left it.
+	register := func(id, name, taskID, run, status string) {
+		t.Helper()
+		if _, err := s.db.Exec(`DELETE FROM agents WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: name, AgentID: id, Host: "mini", Session: name}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`UPDATE agents SET task_id=?,run_id=?,status=? WHERE id=?`, taskID, run, status, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frozen := launchMemberIdentities(t, q)
+	reserved := leadRow()
+	if reserved[0] != frozen[0][0] || reserved[1] != frozen[0][1] {
+		t.Fatalf("lead row %v is not member 0 %v", reserved, frozen[0])
+	}
+	if q, err = step("attempt-lead", "attempt", 0); err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Other project"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, row := range map[string][3]string{
+		"open":          {task.ID, frozen[0][1], string(api.AgentStarting)},
+		"exited":        {task.ID, frozen[0][1], string(api.AgentExited)},
+		"other-run":     {task.ID, api.NewID("run"), string(api.AgentClosed)},
+		"other-project": {other.ID, frozen[0][1], string(api.AgentClosed)},
+	} {
+		register(frozen[0][0], "member-0", row[0], row[1], row[2])
+		if _, err := step("unattempt-"+name, "unattempt", 0); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "member agent is registered") {
+			t.Fatalf("%s registration taken back: %v", name, err)
+		}
+	}
+	if saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID); err != nil || saved.Revision != q.Revision || !reflect.DeepEqual(launchMemberIdentities(t, saved), frozen) || leadRow() != reserved {
+		t.Fatalf("refusals changed the launch %+v lead %v %v", saved, leadRow(), err)
+	}
+	// The exact run, closed: the lead takes a fresh identity and the lead
+	// row follows it.
+	register(frozen[0][0], "member-0", task.ID, frozen[0][1], string(api.AgentClosed))
+	rotated, err := step("unattempt-lead", "unattempt", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := launchMemberIdentities(t, rotated)
+	if !reflect.DeepEqual(launchMemberStates(t, rotated), []string{"unstarted", "unstarted"}) || ids[1] != frozen[1] ||
+		!api.ValidID(ids[0][0], "agt") || !validRunID(ids[0][1]) || ids[0][0] == frozen[0][0] || ids[0][1] == frozen[0][1] {
+		t.Fatalf("rotated lead %v from %v states %v", ids, frozen, launchMemberStates(t, rotated))
+	}
+	if got := leadRow(); got[0] != ids[0][0] || got[1] != ids[0][1] || got[2] != fmt.Sprint(mustInt(t, reserved[2])+1) {
+		t.Fatalf("lead row %v after rotation to %v (was %v)", got, ids[0], reserved)
+	}
+	// A replay returns the same fresh identity.
+	if replay, err := step("unattempt-lead", "unattempt", 0); err != nil || !reflect.DeepEqual(launchMemberIdentities(t, replay), ids) {
+		t.Fatalf("replayed rotation %v %v", replay, err)
+	}
+	q = rotated
+	if q, err = step("attempt-lead-2", "attempt", 0); err != nil || !reflect.DeepEqual(launchMemberStates(t, q), []string{"uncertain", "unstarted"}) {
+		t.Fatalf("attempt after rotation %+v %v", q, err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "started-lead", Operation: "started", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: 0, MemberRunID: ids[0][1]}); err != nil || launchMemberStates(t, q)[0] != "started" {
+		t.Fatalf("rotated lead start %+v %v", q, err)
+	}
+	// A non-lead rotation leaves the lead row alone.
+	lead := leadRow()
+	if q, err = step("attempt-member", "attempt", 1); err != nil {
+		t.Fatal(err)
+	}
+	register(frozen[1][0], "member-1", task.ID, frozen[1][1], string(api.AgentClosed))
+	if q, err = step("unattempt-member", "unattempt", 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := launchMemberIdentities(t, q); got[0] != ids[0] || got[1][0] == frozen[1][0] || got[1][1] == frozen[1][1] || launchMemberStates(t, q)[1] != "unstarted" || leadRow() != lead {
+		t.Fatalf("member rotation %v states %v lead %v (was %v)", got, launchMemberStates(t, q), leadRow(), lead)
+	}
+}
+
+// A lead row that no longer names the closed member refuses the rotation.
+func TestTeamQueueUnattemptRefusesLeadRowMismatch(t *testing.T) {
+	s, task, items, orders := queueFixture(t)
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: items[0].ID, OrderMessageSeq: orders[0].Seq, Host: "mini", Cwd: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}); err != nil {
+		t.Fatal(err)
+	}
+	plan, ids := capLaunchPlan(task, items[0], orders[0], api.TeamQueueEntry{}, 1)
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: plan}); err != nil {
+		t.Fatal(err)
+	}
+	if q, err = s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "attempt", Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	run := launchMemberIdentities(t, q)[0][1]
+	if _, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "member-0", AgentID: ids[0], Host: "mini", Session: "member-0"}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE agents SET run_id=?,status='closed' WHERE id=?`, run, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE item_team_leads SET run_id=? WHERE task_id=? AND item_id=?`, api.NewID("run"), task.ID, items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: "unattempt", Operation: "unattempt", EntryID: q.ID, ExpectedRevision: q.Revision}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "item lead reservation differs") {
+		t.Fatalf("rotation past a moved lead row: %v", err)
+	}
+	if saved, err := s.GetTeamQueueEntry(ctx, task.ID, q.ID); err != nil || saved.Revision != q.Revision || launchMemberIdentities(t, saved)[0][0] != ids[0] {
+		t.Fatalf("refused rotation changed the launch %+v %v", saved, err)
+	}
+}
+
+func mustInt(t *testing.T, s string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 // A set_limit that lowers the queue limit never adds load, so it skips the
