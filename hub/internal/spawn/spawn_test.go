@@ -881,6 +881,49 @@ wait
 	}
 }
 
+// a3: a survivor's name is the executable's name even when the process shows
+// arguments in its argv[0], as programs that set their title do.
+func TestWrapSurvivorNameHasNoArgumentText(t *testing.T) {
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not available")
+	}
+	cmd := exec.Command(sleep, "20")
+	cmd.Args[0] = "mytool --url https://example.invalid/api --token=FAKESECRET123"
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	pid := cmd.Process.Pid
+	var table map[int]procInfo
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if table, err = psProcesses(); err != nil {
+			t.Fatal(err)
+		}
+		// Until the exec is visible the row still shows the test binary.
+		if p, ok := table[pid]; ok && !strings.Contains(p.comm, ".test") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d row %+v never showed the exec", pid, table[pid])
+		}
+	}
+	got := survivorsOf(descendants(table, os.Getpid()), table)
+	for _, s := range got {
+		if s.PID != pid {
+			continue
+		}
+		if s.Command != "sleep" || strings.ContainsAny(s.Command, "-=") {
+			t.Fatalf("survivor name %q, want the executable name sleep with no argument text", s.Command)
+		}
+		return
+	}
+	t.Fatalf("pid %d missing from survivors %+v", pid, got)
+}
+
 // getsid returns the session ID of pid.
 func getsid(pid int) (int, error) {
 	sid, _, errno := syscall.RawSyscall(syscall.SYS_GETSID, uintptr(pid), 0, 0)

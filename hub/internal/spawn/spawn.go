@@ -515,12 +515,14 @@ var readProcesses = psProcesses
 var procRow = regexp.MustCompile(`^\s*([0-9]+)\s+([0-9]+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+[0-9]+\s+[0-9:]+\s+[0-9]{4})\s+(.+?)\s*$`)
 
 // psProcesses reads pid, parent, start time and command name of every
-// process with ps. The ps gets no terminal, so the read never stops the
-// wrapper while the command's group holds the foreground.
+// process with ps. The name is ucomm, the kernel's accounting name, not comm:
+// on macOS comm is argv[0] as the process shows it, and a process that sets
+// its title puts its arguments there. The ps gets no terminal, so the read
+// never stops the wrapper while the command's group holds the foreground.
 func psProcesses() (map[int]procInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), processReadWindow)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=")
+	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,ucomm=")
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out := &boundedBuffer{limit: maxProcRows * 256}
 	cmd.Stdout = out
@@ -594,8 +596,8 @@ func survivorsOf(before, after map[int]procInfo) []Survivor {
 	return out
 }
 
-// survivorName is the base name of a ps command column, printable and at
-// most maxSurvivorName bytes.
+// survivorName is the base name of a ps command name, printable and at most
+// maxSurvivorName bytes.
 func survivorName(comm string) string {
 	name := strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) {
