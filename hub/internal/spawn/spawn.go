@@ -12,10 +12,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -355,10 +358,14 @@ var wrapKillWait = 2 * time.Second
 // SIGTERM or SIGINT addressed to the wrapper is forwarded to the group once; a
 // member still alive wrapStopGrace later gets SIGKILL with the whole group.
 // onExit then runs after the group has ended, and the wrapper ends by the
-// signal it received, with no login shell. SIGHUP keeps its default, so a
-// closed pane ends the wrapper without onExit, as before. A command that exits
-// on its own is reported at once, leaving any remaining children alone.
-func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
+// signal it received, with no login shell. Descendants outside the group, in
+// their own group or session, are never signalled: the wrapper reads the
+// process table before the forward and again after the group has ended, and
+// passes the ones still running to onExit as survivors. SIGHUP keeps its
+// default, so a closed pane ends the wrapper without onExit, as before. A
+// command that exits on its own is reported at once with no survivors, leaving
+// any remaining children alone.
+func Wrap(command string, onStart func(pid int), onExit func(code int, survivors []Survivor)) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
@@ -387,13 +394,25 @@ func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	var stop syscall.Signal
+	var survivors []Survivor
+	var readErr error
 	select {
 	case err = <-done:
 		signal.Stop(stops)
 		signal.Reset(syscall.SIGTERM, syscall.SIGINT)
 	case sig := <-stops:
 		stop = sig.(syscall.Signal)
+		// Read before the forward: a descendant whose parent ends is
+		// reparented, so its ancestry is gone after the stop.
+		var before map[int]procInfo
+		before, readErr = readProcesses()
 		err = stopGroup(pgid, stop, done)
+		if readErr == nil {
+			var after map[int]procInfo
+			if after, readErr = readProcesses(); readErr == nil {
+				survivors = survivorsOf(descendants(before, pgid), after)
+			}
+		}
 	}
 	code := 0
 	var exitErr *exec.ExitError
@@ -405,7 +424,10 @@ func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	if foreground {
 		reclaimForeground(tty)
 	}
-	onExit(code)
+	if readErr != nil {
+		fmt.Fprintf(os.Stderr, "\n[tt] process table unreadable (%v); processes left running by the stop are not reported.\n", readErr)
+	}
+	onExit(code, survivors)
 	if stop != 0 {
 		cleanup()
 		signal.Stop(stops)
@@ -463,6 +485,129 @@ func stopGroup(pgid int, sig syscall.Signal, done <-chan error) error {
 // the wrapper may not signal still counts.
 func groupAlive(pgid int) bool {
 	return !errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH)
+}
+
+// Survivor is a descendant of a stopped command still running after the
+// command's group ended. Command is the executable's base name, never its
+// arguments, which may hold secrets.
+type Survivor struct {
+	PID     int
+	Command string
+}
+
+// procInfo is one process table row: identity columns only, no arguments.
+type procInfo struct {
+	pid, parent   int
+	started, comm string
+}
+
+// Bounds on one process table read and on the descendants taken from it.
+const (
+	maxProcRows       = 4096
+	maxDescendants    = 1024
+	maxSurvivorName   = 64
+	processReadWindow = 2 * time.Second
+)
+
+// readProcesses reads the host's process table; tests replace it.
+var readProcesses = psProcesses
+
+var procRow = regexp.MustCompile(`^\s*([0-9]+)\s+([0-9]+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+[0-9]+\s+[0-9:]+\s+[0-9]{4})\s+(.+?)\s*$`)
+
+// psProcesses reads pid, parent, start time and command name of every
+// process with ps. The ps gets no terminal, so the read never stops the
+// wrapper while the command's group holds the foreground.
+func psProcesses() (map[int]procInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), processReadWindow)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,ppid=,lstart=,comm=")
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out := &boundedBuffer{limit: maxProcRows * 256}
+	cmd.Stdout = out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	table := map[int]procInfo{}
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		row := procRow.FindStringSubmatch(line)
+		if row == nil {
+			return nil, errors.New("process table format unavailable")
+		}
+		if len(table) >= maxProcRows {
+			return nil, errors.New("process table too large")
+		}
+		pid, _ := strconv.Atoi(row[1])
+		parent, _ := strconv.Atoi(row[2])
+		table[pid] = procInfo{pid, parent, strings.Join(strings.Fields(row[3]), " "), row[4]}
+	}
+	return table, nil
+}
+
+type boundedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b.Len()+len(p) > b.limit {
+		return 0, errors.New("process table output too large")
+	}
+	return b.Buffer.Write(p)
+}
+
+// descendants returns every process below root in table by parent links,
+// whatever its process group or session, without root itself. It stops at
+// maxDescendants entries.
+func descendants(table map[int]procInfo, root int) map[int]procInfo {
+	children := map[int][]procInfo{}
+	for _, p := range table {
+		if p.pid != p.parent {
+			children[p.parent] = append(children[p.parent], p)
+		}
+	}
+	out := map[int]procInfo{}
+	queue := []int{root}
+	for len(queue) > 0 && len(out) < maxDescendants {
+		next := queue[0]
+		queue = queue[1:]
+		for _, c := range children[next] {
+			if _, seen := out[c.pid]; seen || c.pid == root || len(out) >= maxDescendants {
+				continue
+			}
+			out[c.pid] = c
+			queue = append(queue, c.pid)
+		}
+	}
+	return out
+}
+
+// survivorsOf returns the processes of before still in after with the same
+// start time, by pid. A pid reused by a newer process is not a survivor.
+func survivorsOf(before, after map[int]procInfo) []Survivor {
+	var out []Survivor
+	for pid, p := range before {
+		if now, ok := after[pid]; ok && now.started == p.started {
+			out = append(out, Survivor{PID: pid, Command: survivorName(p.comm)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
+	return out
+}
+
+// survivorName is the base name of a ps command column, printable and at
+// most maxSurvivorName bytes.
+func survivorName(comm string) string {
+	name := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return '?'
+	}, filepath.Base(comm))
+	for len(name) > maxSurvivorName {
+		_, size := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-size]
+	}
+	return name
 }
 
 // reclaimForeground makes the wrapper's group the terminal's foreground group

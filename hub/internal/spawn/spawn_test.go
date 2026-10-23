@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -487,7 +488,8 @@ func TestSpawnCreateExportsArtifactsRoot(t *testing.T) {
 
 // TestWrapFixture is the wrapper under test when the test binary is re-run
 // with TT_WRAP_FIXTURE=1: it runs Wrap on TT_WRAP_COMMAND with a 300 ms stop
-// grace and appends what the wrapper saw to TT_WRAP_RECORD.
+// grace and appends what the wrapper saw to TT_WRAP_RECORD: each process
+// table read as "snapshot", then the survivors and the exit onExit received.
 func TestWrapFixture(t *testing.T) {
 	if os.Getenv("TT_WRAP_FIXTURE") != "1" {
 		return
@@ -501,11 +503,24 @@ func TestWrapFixture(t *testing.T) {
 		}
 	}
 	record("wrapper %d", os.Getpid())
+	read := readProcesses
+	readProcesses = func() (map[int]procInfo, error) {
+		record("snapshot")
+		return read()
+	}
 	pgid := 0
 	err := Wrap(os.Getenv("TT_WRAP_COMMAND"), func(pid int) {
 		pgid = pid
 		record("start %d", pid)
-	}, func(code int) {
+	}, func(code int, survivors []Survivor) {
+		names := []string{}
+		for _, s := range survivors {
+			names = append(names, fmt.Sprintf("%d:%s", s.PID, s.Command))
+		}
+		if len(names) == 0 {
+			names = append(names, "none")
+		}
+		record("survivors %s", strings.Join(names, ","))
 		record("exit %d alive=%v", code, groupAlive(pgid))
 	})
 	record("return %v", err)
@@ -709,6 +724,9 @@ wait
 			if !pidGone(child, "sh -c") {
 				t.Fatalf("child %d outlived onExit", child)
 			}
+			if got := strings.Join(recordLine(t, rec, "survivors", 0), " "); got != "none" || recordCount(t, rec, "snapshot") != 2 {
+				t.Fatalf("survivors %q after %d process table reads, want none after 2", got, recordCount(t, rec, "snapshot"))
+			}
 			if recordCount(t, rec, "login") != 0 || recordCount(t, rec, "return <nil>") != 0 {
 				t.Fatal("stopped wrapper started the login shell")
 			}
@@ -759,8 +777,166 @@ exit 7
 	if pidGone(child, "sleep 30") {
 		t.Fatal("normal exit killed the command's remaining child")
 	}
+	// A command that exits on its own reads no process table and reports no
+	// survivors, even with its child still running.
+	if got := strings.Join(recordLine(t, rec, "survivors", 0), " "); got != "none" || recordCount(t, rec, "snapshot") != 0 {
+		t.Fatalf("normal exit reported survivors %q after %d process table reads, want none after 0", got, recordCount(t, rec, "snapshot"))
+	}
 	if !strings.Contains(string(notice), "[tt] agent command exited with status 7; this pane is now a shell.") {
 		t.Fatalf("stderr notice missing: %q", notice)
+	}
+}
+
+// TestWrapSessionChildFixture is an agent's child that leaves the command's
+// group when the test binary is re-run with TT_WRAP_SESSION_CHILD=1: it starts
+// its own session, records "session PID", records any stop or hangup signal
+// it receives as "session got SIG", and ends by itself after a minute.
+func TestWrapSessionChildFixture(t *testing.T) {
+	if os.Getenv("TT_WRAP_SESSION_CHILD") != "1" {
+		return
+	}
+	record := func(format string, args ...any) {
+		f, err := os.OpenFile(os.Getenv("TT_WRAP_RECORD"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err == nil {
+			fmt.Fprintf(f, format+"\n", args...)
+			f.Close()
+		}
+	}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	if _, err := syscall.Setsid(); err != nil {
+		record("session setsid %v", err)
+		os.Exit(1)
+	}
+	record("session %d", os.Getpid())
+	select {
+	case sig := <-sigs:
+		record("session got %v", sig)
+	case <-time.After(time.Minute):
+	}
+	os.Exit(0)
+}
+
+// k4: a stop ends the command's group, and the agent's child in its own
+// session outlives it unsignalled and is reported by pid and name.
+func TestWrapStopReportsSessionChildWithoutSignallingIt(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The group child ignores TERM, so only the group SIGKILL ends it.
+	rec, env := wrapFixture(t, `trap 'exit 143' TERM
+echo "agent $$" >> REC
+sh -c 'trap "" TERM INT; echo "child $$" >> '"REC"'; while :; do sleep 1; done' &
+TT_WRAP_SESSION_CHILD=1 "$TT_WRAP_SELF" -test.run='^TestWrapSessionChildFixture$' &
+wait
+`, false)
+	killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture", "child": "sh -c", "session": "TestWrapSessionChildFixture"})
+	cmd := exec.Command(self, "-test.run=^TestWrapFixture$")
+	cmd.Env = append(os.Environ(), append(env, "TT_WRAP_SELF="+self)...)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	agent := recordPID(t, rec, "agent")
+	child := recordPID(t, rec, "child")
+	session := recordPID(t, rec, "session")
+	if sid, err := getsid(session); err != nil || sid != session {
+		t.Fatalf("session child sid %d (%v), want its own session %d", sid, err, session)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("wrapper did not end after its stop signal")
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || !exit.Sys().(syscall.WaitStatus).Signaled() || exit.Sys().(syscall.WaitStatus).Signal() != syscall.SIGTERM {
+		t.Fatalf("wrapper ended %v, want killed by SIGTERM", err)
+	}
+	if got := strings.Join(recordLine(t, rec, "exit", 0), " "); got != "143 alive=false" {
+		t.Fatalf("onExit record %q, want 143 with the group ended", got)
+	}
+	if !pidGone(agent, ".tailterm-runtime-command-") || !pidGone(child, "sh -c") {
+		t.Fatalf("group member outlived the stop: agent gone %v, child gone %v", pidGone(agent, ".tailterm-runtime-command-"), pidGone(child, "sh -c"))
+	}
+	want := fmt.Sprintf("%d:%s", session, filepath.Base(self))
+	if got := strings.Join(recordLine(t, rec, "survivors", 0), " "); got != want {
+		t.Fatalf("survivors %q, want only the session child %q", got, want)
+	}
+	if n := recordCount(t, rec, "snapshot"); n != 2 {
+		t.Fatalf("%d process table reads, want one before the stop and one after", n)
+	}
+	// Never signalled: still running after the wrapper ended, and nothing
+	// recorded by its handler.
+	time.Sleep(200 * time.Millisecond)
+	if pidGone(session, "TestWrapSessionChildFixture") {
+		t.Fatal("the stop ended the session child")
+	}
+	if strings.Contains(readRecord(rec), "session got") {
+		t.Fatalf("the session child was signalled:\n%s", readRecord(rec))
+	}
+}
+
+// getsid returns the session ID of pid.
+func getsid(pid int) (int, error) {
+	sid, _, errno := syscall.RawSyscall(syscall.SYS_GETSID, uintptr(pid), 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(sid), nil
+}
+
+// k1: descendants follow parent links into other groups and sessions, and a
+// survivor needs the same pid and start time after the stop.
+func TestWrapSurvivorsMatchStartTimeAcrossSessions(t *testing.T) {
+	at := func(s string) string { return "Thu Oct 23 14:06:" + s + " 2026" }
+	table := map[int]procInfo{
+		1:   {1, 0, at("00"), "/sbin/launchd"},
+		100: {100, 1, at("01"), "/bin/sh"},           // the command, pgid 100
+		101: {101, 100, at("02"), "/bin/sleep"},      // group member
+		102: {102, 100, at("02"), "/usr/bin/claude"}, // runtime
+		200: {200, 102, at("03"), "/bin/zsh"},        // tool shell, own session
+		201: {201, 200, at("04"), "/usr/bin/git"},    // its child
+		300: {300, 1, at("05"), "/bin/zsh"},          // unrelated
+	}
+	got := descendants(table, 100)
+	if len(got) != 4 {
+		t.Fatalf("descendants %v, want 101 102 200 201", got)
+	}
+	for _, pid := range []int{101, 102, 200, 201} {
+		if _, ok := got[pid]; !ok {
+			t.Fatalf("descendant %d missing from %v", pid, got)
+		}
+	}
+	// After the stop: the group is gone, 200 survived reparented, 201's pid
+	// was reused by a newer process, and 300 never was a descendant.
+	after := map[int]procInfo{
+		1:   table[1],
+		200: {200, 1, at("03"), "/bin/zsh"},
+		201: {201, 1, at("09"), "/bin/cat"},
+		300: table[300],
+	}
+	if s := survivorsOf(got, after); len(s) != 1 || s[0] != (Survivor{PID: 200, Command: "zsh"}) {
+		t.Fatalf("survivors %+v, want only pid 200 zsh", s)
+	}
+	if s := survivorsOf(got, nil); len(s) != 0 {
+		t.Fatalf("survivors %+v with every process ended", s)
+	}
+	// The walk stops at maxDescendants, and names are base names only,
+	// printable and bounded.
+	wide := map[int]procInfo{10: {10, 1, at("00"), "sh"}}
+	for pid := 11; pid < 11+maxDescendants+50; pid++ {
+		wide[pid] = procInfo{pid, 10, at("00"), "sleep"}
+	}
+	if n := len(descendants(wide, 10)); n != maxDescendants {
+		t.Fatalf("%d descendants, want the cap %d", n, maxDescendants)
+	}
+	if name := survivorName("/opt/x/" + strings.Repeat("é", 40) + "\x07"); len(name) > maxSurvivorName || strings.ContainsAny(name, "/\x07") {
+		t.Fatalf("survivor name %q", name)
 	}
 }
 

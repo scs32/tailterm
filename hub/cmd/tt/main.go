@@ -1726,9 +1726,9 @@ func cmdWrap(e env, args []string) error {
 				}
 			}
 		}()
-	}, func(code int) {
+	}, func(code int, survivors []spawn.Survivor) {
 		close(stopped)
-		wrapperExited(ctx, e, code, productionExitReporter(e))
+		wrapperExited(ctx, e, code, productionExitReporter(e), survivors...)
 	})
 }
 
@@ -1736,12 +1736,20 @@ func cmdWrap(e env, args []string) error {
 // reports it to the hub. When that post fails and the receipt holds the
 // exit, the report is retried in the background until ctx ends; it reports
 // whether that retry started. Without a recorded exit nothing is retried.
-func wrapperExited(ctx context.Context, e env, code int, r exitReporter) bool {
+// Survivors of a stop are named in the report's data and in one Board notice;
+// the report text stays the one the exited-primary rule matches.
+func wrapperExited(ctx context.Context, e env, code int, r exitReporter, survivors ...spawn.Survivor) bool {
 	_, recorded := recordRuntimeExit(e)
 	if e.task == "" || e.agent == "" || e.hub == "" {
 		return false
 	}
-	if err := postEvent(e, api.EventExited, exitReportText(code), nil); err == nil {
+	err := postEvent(e, api.EventExited, exitReportText(code), survivorData(survivors))
+	if len(survivors) > 0 {
+		if _, nerr := postSurvivorNotice(e, survivors); nerr != nil {
+			fmt.Fprintf(os.Stderr, "[tt] the Board notice about processes left running was not posted: %v\n", nerr)
+		}
+	}
+	if err == nil {
 		if recorded {
 			recordRuntimeExitReport(e, time.Now(), "")
 		}
@@ -1752,6 +1760,62 @@ func wrapperExited(ctx context.Context, e env, code int, r exitReporter) bool {
 	}
 	go r.deliver(ctx, e, code)
 	return true
+}
+
+// wrapSurvivorLimit bounds the survivors one exit report or notice names.
+const wrapSurvivorLimit = 10
+
+// survivorData is the exit report's data for the survivors of a stop: nil
+// without any, so a plain exit report is unchanged.
+func survivorData(survivors []spawn.Survivor) map[string]any {
+	if len(survivors) == 0 {
+		return nil
+	}
+	shown := survivors[:min(len(survivors), wrapSurvivorLimit)]
+	list := make([]map[string]any, len(shown))
+	for i, s := range shown {
+		list[i] = map[string]any{"pid": s.PID, "command": s.Command}
+	}
+	data := map[string]any{"survivors": list}
+	if omitted := len(survivors) - len(shown); omitted > 0 {
+		data["survivorsOmitted"] = omitted
+	}
+	return data
+}
+
+// postSurvivorNotice tells the owner on the Board which processes outlived a
+// stopped agent's process group. It is posted without the agent's identity,
+// so the agent's unacknowledged work cannot hold it back, and once per run:
+// a repost returns the stored notice.
+func postSurvivorNotice(e env, survivors []spawn.Survivor) (api.Message, error) {
+	c, err := e.client(5 * time.Second)
+	if err != nil {
+		return api.Message{}, err
+	}
+	shown := survivors[:min(len(survivors), wrapSurvivorLimit)]
+	names := make([]string, len(shown))
+	for i, s := range shown {
+		names[i] = fmt.Sprintf("pid %d %s", s.PID, s.Command)
+	}
+	list := strings.Join(names, ", ")
+	if omitted := len(survivors) - len(shown); omitted > 0 {
+		list += fmt.Sprintf(" and %d more", omitted)
+	}
+	who := e.agentName
+	if who == "" {
+		who = e.agent
+	}
+	note := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "A stopped agent left processes running outside its process group",
+		Refs: map[string]string{"agent": e.agent},
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("%s was stopped; %d process(es) it started outside its process group are still running and were not signalled: %s. Check whether they were meant to keep running.", who, len(survivors), list)}}
+	requestID := "wrap-survivors-" + e.agent
+	if e.runID != "" {
+		note.Refs["run"] = e.runID
+		requestID = "wrap-survivors-" + e.runID
+	}
+	ctx, cancel := ctxTimeout(5 * time.Second)
+	defer cancel()
+	return c.PostMessage(ctx, e.task, api.PostMessageRequest{Envelope: &note, Text: api.RenderText(note), RequestID: requestID})
 }
 
 func wrapCommand(args []string) (string, error) {

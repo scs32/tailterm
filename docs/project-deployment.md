@@ -2458,11 +2458,15 @@ binding or for an integrated matrix import; not published, no receipt, no inputs
 bound) is stopped cleanly instead: send SIGTERM to the runner's `pid` in
 `journalDirectory/runner-code.json`. SIGTERM or SIGINT to the
 `tt deployment serve` process reaches the runner too: serve passes both on to
-it and exits with the runner's status. A signal to the pane's `tt wrap`
-wrapper does not reach the runner. The runner treats SIGINT the same way, but
-Ctrl-C in its pane also signals the pane's wrapper; if the hub has recorded
-the run's exit before the unclaim arrives, the unclaim is refused and the job
-stays held, so prefer SIGTERM to the runner's pid. The runner ends its
+it and exits with the runner's status. SIGTERM or SIGINT to the pane's
+`tt wrap` wrapper is forwarded once to its command's process group, which
+holds serve and the runner; a member still alive 5 s later gets SIGKILL with
+the whole group, which can cut an unclaim short. Descendants outside that
+group (in their own group or session) are never signalled: the wrapper names
+each one still running by pid and command name in its exit report and in a
+Board notice. Ctrl-C in the pane goes to the command's group, which holds the
+terminal, and not to the wrapper. The runner treats SIGINT the same way as
+SIGTERM, but prefer SIGTERM to the runner's pid. The runner ends its
 wait at once, gives the claim back with `tt deployment unclaim` (an exact-run
 record, disposition `unclaimed`, with no incident or prevention item), archives
 the claim's journal as `ID.json.unclaimed-gN` and exits with the line "Release
