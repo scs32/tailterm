@@ -425,8 +425,9 @@ releases the slot without closing the parent project.
 addressed recipient as the person responsible for acting. Delivery scope is saved
 per message; toggling the setting does not rewrite older messages. Instructions
 explicitly discourage duplicate work, acknowledgements of acknowledgements, and
-reply loops. The starter swarm uses Astra with four Terra workers; ten workers
-is not a mandatory default or evidence of better performance.
+reply loops. The starter swarm uses a Claude Opus orchestrator with four GPT-6
+Luna workers; ten workers is not a mandatory default or evidence of better
+performance.
 
 ### Messages, wake-up, and lifecycle
 

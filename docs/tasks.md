@@ -162,7 +162,8 @@ persisted per message; toggling swarm does not replay older directed messages.
 The Codex inbox relay wakes recipients for swarm broadcasts, excluding the sender.
 Teams and the deployed hub now allow up to 32 open members per task; helper limits
 remain separately enforced. See [team examples](team-examples.md) for full rules,
-model choices, and the Astra/four-Terra starting swarm.
+model choices, and the starting swarm of a Claude Opus orchestrator with four
+GPT-6 Luna workers.
 
 ### Permissions and tool visibility
 
