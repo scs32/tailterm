@@ -817,10 +817,13 @@ func TestHandlerRotationAuthorizedRuntimeChange(t *testing.T) {
 	if err = s.db.QueryRow(`SELECT text FROM messages WHERE task_id=? AND seq=? AND to_agent=? AND envelope LIKE '%"handlerRotation":"`+r.ID+`"%'`, f.task.ID, committed.Receipt.NoticeSeq, successor.ID).Scan(&notice); err != nil {
 		t.Fatalf("handoff notice: %v", err)
 	}
-	for _, want := range []string{r.ID, "from runtime codex to claude", "authorized by " + who + ": " + why} {
+	for _, want := range []string{r.ID, " This change from runtime codex to claude and model gpt-6.1-sol to claude-sonnet-5-5 was authorized by " + who + ": " + why} {
 		if !strings.Contains(notice, want) {
 			t.Fatalf("handoff notice misses %q:\n%s", want, notice)
 		}
+	}
+	if strings.Contains(notice, "reasoning") {
+		t.Fatalf("handoff notice names an unchanged reasoning:\n%s", notice)
 	}
 	// The record and the committed event carry the authorization and runtimes.
 	want := api.HandlerRotationAuthorization{AuthorizedBy: who, Reason: why, OldRuntime: "codex", SuccessorRuntime: "claude"}
@@ -844,6 +847,46 @@ func TestHandlerRotationAuthorizedRuntimeChange(t *testing.T) {
 	replay, err := f.commit(r, "commit")
 	if err != nil || !reflect.DeepEqual(replay.Receipt, committed.Receipt) || replay.Authorization == nil || *replay.Authorization != want || countRows(t, s, `SELECT count(*) FROM messages WHERE task_id=?`, f.task.ID) != messages {
 		t.Fatalf("replay: %+v %v", replay, err)
+	}
+}
+
+// The handoff NOTICE names only what an authorized change changed: a model-only
+// change never reads "from runtime X to X" (wi_7dd116c81497132e).
+func TestHandlerRotationAuthorizedNoticeNamesOnlyChanges(t *testing.T) {
+	for name, tc := range map[string]struct {
+		successor api.HandlerArm
+		change    string
+	}{
+		"model only":     {api.HandlerArm{Runtime: "codex", Model: "gpt-6.1-mini", Reasoning: "high"}, " from model gpt-6.1-sol to gpt-6.1-mini"},
+		"reasoning only": {api.HandlerArm{Runtime: "codex", Model: "gpt-6.1-sol", Reasoning: "medium"}, " from reasoning high to medium"},
+		"all three":      {api.HandlerArm{Runtime: "claude", Model: "claude-sonnet-5-5", Reasoning: "medium"}, " from runtime codex to claude, model gpt-6.1-sol to claude-sonnet-5-5 and reasoning high to medium"},
+		"nothing":        {armO, ""},
+		"unrecorded":     {api.HandlerArm{Runtime: "codex"}, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRotationFixture(t)
+			f.asRun(t, armO)
+			const who, why = "owner", "Owner decision: try another handler model"
+			r, err := f.prepareAs("prepare", api.HandlerRotationTriggerOwner, who, why)
+			if err != nil {
+				t.Fatal(err)
+			}
+			successor := f.successor(t, r, tc.successor)
+			committed, err := f.commit(r, "commit")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var notice string
+			if err = f.s.db.QueryRow(`SELECT text FROM messages WHERE task_id=? AND seq=? AND to_agent=?`, f.task.ID, committed.Receipt.NoticeSeq, successor.ID).Scan(&notice); err != nil {
+				t.Fatalf("handoff notice: %v", err)
+			}
+			if want := " This change" + tc.change + " was authorized by " + who + ": " + why; !strings.HasSuffix(notice, want) {
+				t.Fatalf("handoff notice must end %q:\n%s", want, notice)
+			}
+			if tc.successor.Runtime == armO.Runtime && strings.Contains(notice, "runtime codex") {
+				t.Fatalf("handoff notice names an unchanged runtime:\n%s", notice)
+			}
+		})
 	}
 }
 

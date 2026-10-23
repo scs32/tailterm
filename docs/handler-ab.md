@@ -386,6 +386,13 @@ before spawning in the same case when the saved spec's `--model` or
 for a run of no arm, rotation is unchanged. An arm that does not rotate grows context; the
 report shows rotations and mean input tokens per request per arm.
 
+The one exception is an [owner-authorized
+change](handler-rotation.md#changing-the-primarys-runtime-or-model): with
+`--authorized-by` and `--authorization-reason`, rotation may move the primary
+to another runtime, model or arm. It lifts only the runtime match and
+`arm_changed`, and never writes the arm policy. D1 is unchanged: the change
+still rotates only the primary.
+
 A [dead primary rotation](handler-rotation.md#a-dead-primary) moves the dead
 handler's live leases to the successor, which the check above keeps in the same
 arm. A moved lease keeps its arm assignment: the row takes the successor's

@@ -1231,6 +1231,34 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 	return r, nil
 }
 
+// authorizedRotationChange names what an authorized rotation changed, such as
+// " from runtime codex to claude and model gpt-6.1-sol to claude-sonnet-5-5":
+// each of runtime, model and reasoning only when it differs, and the model or
+// reasoning only when both runs recorded it. Empty when none differs.
+func authorizedRotationChange(ctx context.Context, tx *sql.Tx, old, successor api.Agent) (string, error) {
+	oldRec, err := loadHandlerRunRecord(ctx, tx, old.ID, old.RunID)
+	if err != nil {
+		return "", err
+	}
+	next, err := loadHandlerRunRecord(ctx, tx, successor.ID, successor.RunID)
+	if err != nil {
+		return "", err
+	}
+	var parts []string
+	for _, f := range []struct{ name, from, to string }{{"runtime", old.Runtime, successor.Runtime}, {"model", oldRec.model, next.model}, {"reasoning", oldRec.reasoning, next.reasoning}} {
+		if f.from != f.to && f.from != "" && f.to != "" {
+			parts = append(parts, f.name+" "+f.from+" to "+f.to)
+		}
+	}
+	switch len(parts) {
+	case 0:
+		return "", nil
+	case 1:
+		return " from " + parts[0], nil
+	}
+	return " from " + strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1], nil
+}
+
 func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Task, req api.HandlerRotationRequest, by api.Caller) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	if req.RotationID == "" {
@@ -1372,7 +1400,11 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	text := fmt.Sprintf("You are now this project's primary Database handler, replacing %s (%s / %s) by handler rotation %s. %d open obligation(s) moved to you. Run tt handler rotation get %s for the durable handoff: moved obligations, pending scope confirmations, requests and allocation intents the old handler authored, claimed Queue entries and legacy required deliveries. Continue from that record; do not repeat work it shows as done.",
 		old.Name, old.ID, old.RunID, r.ID, len(handoff.Reissued), r.ID)
 	if authorized {
-		text += fmt.Sprintf(" This change from runtime %s to %s was authorized by %s: %s", old.Runtime, successor.Runtime, r.Authorization.AuthorizedBy, r.Authorization.Reason)
+		change, err := authorizedRotationChange(ctx, tx, old, successor)
+		if err != nil {
+			return zero, err
+		}
+		text += fmt.Sprintf(" This change%s was authorized by %s: %s", change, r.Authorization.AuthorizedBy, r.Authorization.Reason)
 	}
 	subject, fallback := "Handler rotation handoff to "+successor.Name, "Handler rotation handoff"
 	if dead {
