@@ -2286,10 +2286,12 @@ func TestBoundAgentPostsAcrossRebind(t *testing.T) {
 	}
 }
 
-// a4: after a running rebind the same entry and item go on to handler
-// acceptance, team close at the rebound revision and finish.
-func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
-	f := newRebindFixture(t, true)
+// acceptAndClose rebinds the running entry to an amended scope, saves the item
+// done with the entry's acceptance and closes and cleans its team, so the
+// entry is ready to finish. It returns the accepted entry, the amended item
+// and the completion report pin the done save carried.
+func (f *rebindFixture) acceptAndClose(t *testing.T) (api.TeamQueueEntry, api.WorkItem, api.NarrativeReportPin) {
+	t.Helper()
 	updated, source := f.amend(t, "one")
 	f.confirm(t, updated)
 	f.entry = f.action(t, f.rebind(updated, source))
@@ -2299,9 +2301,10 @@ func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pin := api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}
 	done := "done"
 	if _, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: updated.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "done-save",
-		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision},
+		CompletionReport: &pin,
 		QueueAcceptance:  &api.WorkItemQueueAcceptance{EntryID: f.entry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by); err != nil {
 		t.Fatalf("done save with acceptance: %v", err)
 	}
@@ -2339,15 +2342,95 @@ func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
 	}
 	closeJSON, _ := json.Marshal(closeReq)
 	f.entry = f.action(t, api.TeamQueueRequest{Operation: "close", EntryID: f.entry.ID, ExpectedRevision: accepted.Revision, CloseJSON: closeJSON})
+	return accepted, updated, pin
+}
+
+// finishIntegration is the finish request carrying the accepted candidate's
+// integration snapshot.
+func (f *rebindFixture) finishIntegration(accepted api.TeamQueueEntry) api.TeamQueueRequest {
 	a := accepted.Acceptance
-	finished := f.action(t, api.TeamQueueRequest{Operation: "finish", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision,
-		Integration: &api.TeamIntegrationReady{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: a.Worktree, Branch: a.Branch, Commit: a.Commit, Evidence: a.Evidence}})
+	return api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "finish", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision,
+		Integration: &api.TeamIntegrationReady{Repository: a.Repository, BaseCommit: a.BaseCommit, Worktree: a.Worktree, Branch: a.Branch, Commit: a.Commit, Evidence: a.Evidence}}
+}
+
+// a4: after a running rebind the same entry and item go on to handler
+// acceptance, team close at the rebound revision and finish.
+func TestTeamQueueRebindThenAcceptAndFinish(t *testing.T) {
+	f := newRebindFixture(t, true)
+	accepted, updated, _ := f.acceptAndClose(t)
+	finished := f.action(t, f.finishIntegration(accepted))
 	if finished.ID != accepted.ID || finished.ItemID != f.item.ID || finished.State != "finished" || finished.Integration == nil || finished.ItemRevision != updated.Revision || finished.Attempt != 1 {
 		t.Fatalf("finished entry %+v", finished)
 	}
 	var entries int
 	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_entries WHERE task_id=?`, f.task.ID).Scan(&entries); err != nil || entries != 1 {
 		t.Fatalf("entries %d %v: the rebound entry finished without a replacement", entries, err)
+	}
+}
+
+// Status and priority edits after the acceptance advance only the item
+// revision, so the finish with the integration snapshot still accepts the
+// candidate; the finish while the item is not terminal still refuses.
+func TestTeamQueueFinishAfterStatusOrPriorityEdit(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		edits []api.UpdateWorkItemRequest
+	}{
+		{"priority", []api.UpdateWorkItemRequest{{Priority: ptr("high")}, {Priority: ptr("low")}}},
+		{"status", []api.UpdateWorkItemRequest{{Status: ptr("in_progress")}, {Status: ptr("done")}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRebindFixture(t, true)
+			accepted, _, pin := f.acceptAndClose(t)
+			item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := item
+			for _, edit := range c.edits {
+				edit.Revision = item.Revision
+				if edit.Status != nil && *edit.Status == "done" {
+					edit.CompletionReport = &pin
+				}
+				if item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, edit, f.by); err != nil {
+					t.Fatalf("%s edit: %v", c.name, err)
+				}
+				if item.Status != "done" {
+					if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.finishIntegration(accepted)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "item is not terminal") {
+						t.Fatalf("finish while %s: %v", item.Status, err)
+					}
+				}
+			}
+			if item.Revision != before.Revision+2 || item.ScopeRevision != before.ScopeRevision || item.Status != "done" || !reflect.DeepEqual(item.CompletionReport, before.CompletionReport) {
+				t.Fatalf("%s edits: revision %d->%d scope %d->%d status %s report %+v", c.name, before.Revision, item.Revision, before.ScopeRevision, item.ScopeRevision, item.Status, item.CompletionReport)
+			}
+			finished, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.finishIntegration(accepted))
+			if err != nil || finished.State != "finished" || finished.Integration == nil || finished.Integration.Commit != accepted.Acceptance.Commit || finished.Acceptance.ItemRevision != accepted.Acceptance.ItemRevision {
+				t.Fatalf("finish after the %s edits: %+v %v", c.name, finished, err)
+			}
+		})
+	}
+}
+
+// A deliberate scope change after the acceptance still refuses the finish with
+// the integration snapshot, and the entry stays unfinished.
+func TestTeamQueueFinishRefusesAfterScopeEdit(t *testing.T) {
+	f := newRebindFixture(t, true)
+	accepted, _, _ := f.acceptAndClose(t)
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	title := "Amended scope: also cover the second pane"
+	edited, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Title: &title, ScopeChange: true}, f.by)
+	if err != nil || edited.ScopeRevision != item.ScopeRevision+1 || edited.Status != "done" {
+		t.Fatalf("deliberate scope change: %+v %v", edited, err)
+	}
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.finishIntegration(accepted)); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("finish after the scope edit: %v", err)
+	}
+	if e, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID); err != nil || e.State == "finished" || e.Integration != nil {
+		t.Fatalf("entry after the refused finish %+v %v", e, err)
 	}
 }
 

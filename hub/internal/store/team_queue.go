@@ -2348,7 +2348,16 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			}
 			if req.Integration != nil {
 				candidate := *req.Integration
-				if item.Status != "done" || e.Repository == "" || e.Acceptance == nil || e.Acceptance.ItemRevision != item.Revision || !reflect.DeepEqual(e.Acceptance.CompletionReport, item.CompletionReport) || candidate.Repository != e.Acceptance.Repository || candidate.BaseCommit != e.Acceptance.BaseCommit || candidate.Worktree != e.Acceptance.Worktree || candidate.Branch != e.Acceptance.Branch || candidate.Commit != e.Acceptance.Commit || candidate.Evidence != e.Acceptance.Evidence {
+				// Status and priority edits advance only the item revision, so
+				// this compares scope: the item has not moved back from the
+				// acceptance, and no later revision changed its scope.
+				sameScope := false
+				if e.Acceptance != nil {
+					if sameScope, err = scopeUnchangedSince(ctx, tx, item, e.Acceptance.ItemRevision); err != nil {
+						return zero, err
+					}
+				}
+				if item.Status != "done" || e.Repository == "" || e.Acceptance == nil || !sameScope || !reflect.DeepEqual(e.Acceptance.CompletionReport, item.CompletionReport) || candidate.Repository != e.Acceptance.Repository || candidate.BaseCommit != e.Acceptance.BaseCommit || candidate.Worktree != e.Acceptance.Worktree || candidate.Branch != e.Acceptance.Branch || candidate.Commit != e.Acceptance.Commit || candidate.Evidence != e.Acceptance.Evidence {
 					return zero, api.ErrInvalid
 				}
 				candidate.ReadyAt = now
@@ -3145,6 +3154,42 @@ func pendingTeamQueueAcceptance(ctx context.Context, tx *sql.Tx, task, item stri
 // item's running lead on its current run, and that run is admitted to the
 // item under the entry's order at the entry's revision. A handler's save gets
 // none of these checks and behaves as before.
+// scopeUnchangedSince reports whether the item is at or past revision and no
+// saved revision after it changed the title or description, the fields that
+// advance the scope revision. A revision missing from the saved history, or
+// one without its changed fields, counts as a scope change.
+func scopeUnchangedSince(ctx context.Context, tx *sql.Tx, item api.WorkItem, revision int64) (bool, error) {
+	if revision < 1 || revision > item.Revision {
+		return false, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT changed_fields FROM work_item_revisions WHERE item_task_id=? AND item_id=? AND revision>? AND revision<=?`, item.TaskID, item.ID, revision, item.Revision)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var saved int64
+	for rows.Next() {
+		var changed sql.NullString
+		if err = rows.Scan(&changed); err != nil {
+			return false, err
+		}
+		var fields []string
+		if !changed.Valid || json.Unmarshal([]byte(changed.String), &fields) != nil {
+			return false, nil
+		}
+		for _, field := range fields {
+			if field == "title" || field == "description" {
+				return false, nil
+			}
+		}
+		saved++
+	}
+	if err = rows.Err(); err != nil {
+		return false, err
+	}
+	return saved == item.Revision-revision, nil
+}
+
 func doneSaveQueueGate(ctx context.Context, tx *sql.Tx, task, item, agentID string, accept *api.WorkItemQueueAcceptance) (*api.TeamQueueEntry, error) {
 	pending, err := pendingTeamQueueAcceptance(ctx, tx, task, item)
 	if err != nil {
