@@ -99,6 +99,10 @@ type gitWorktree struct {
 	Prunable bool
 	Bare     bool
 	Main     bool
+	// Orphan marks a verifier checkout git no longer lists: its .git file
+	// names a worktree record of this repository that is gone. It has no
+	// HEAD, index or branch (see orphanedCheckouts).
+	Orphan bool
 }
 
 type worktreeDecision struct {
@@ -877,8 +881,9 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 			linked = append(linked, worktrees[i].Path)
 		}
 	}
+	art := newArtifactPass(in, main, linked)
 	var candidates []gitWorktree
-	for _, w := range worktrees {
+	for _, w := range append(worktrees, orphanedCheckouts(common, art)...) {
 		if w.Main || w.Bare {
 			continue
 		}
@@ -899,7 +904,6 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	if now.IsZero() {
 		now = time.Now()
 	}
-	art := newArtifactPass(in, main, linked)
 	temp := sessionTempCandidates(in, main, linked)
 	paths := make([]string, len(candidates), len(candidates)+len(temp))
 	strict := map[string]bool{}
@@ -975,7 +979,9 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 				held, heldWhy := in.exclusive(func(p string) string { return worktreeInUseAt(w.Path, p, linked) }, func() {
 					parent := filepath.Dir(w.Path)
 					before := dirModTime(parent)
-					if item != "" {
+					if w.Orphan {
+						reason, why, manifest, bytes = removeOrphanedCheckout(ctx, common, w, admin, cleared, item, art, in.Receipt, now)
+					} else if item != "" {
 						// A verifier checkout leaves a manifest beside its receipts.
 						reason, why, manifest, bytes = removeArtifactCheckout(ctx, common, w, admin, cleared, item, art.itemState(item), in.Receipt, now)
 					} else {
@@ -1111,7 +1117,13 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 		if now.IsZero() {
 			now = time.Now()
 		}
-		if idle := worktreeIdle(admin, now); idle < in.MinIdle {
+		if w.Orphan {
+			// Its Git state went with its worktree record, so its age is the
+			// session temp rule's: anything in it, at any depth.
+			if idle := sessionTempIdle(w.Path, now, cleared, nil); idle < in.MinIdle {
+				return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
+			}
+		} else if idle := worktreeIdle(admin, now); idle < in.MinIdle {
 			return keepRecent, fmt.Sprintf("Git state changed %s ago", idle.Round(time.Minute))
 		}
 	}
@@ -1136,15 +1148,21 @@ func classifyWorktree(ctx context.Context, common, main string, w gitWorktree, a
 			}
 		}
 	}
-	if op := worktreeOperation(admin); op != "" {
-		return keepOperation, op + " in progress"
-	}
-	dirty, err := worktreeDirty(ctx, w.Path)
-	if err != nil {
-		return keepFailed, err.Error()
-	}
-	if dirty != "" {
-		return keepDirty, dirty
+	if w.Orphan {
+		// With no index there is nothing to call dirty: the item gate is
+		// what frees it, and the candidate's branch keeps its commits.
+		eligible += "; worktree record pruned: git no longer lists " + admin
+	} else {
+		if op := worktreeOperation(admin); op != "" {
+			return keepOperation, op + " in progress"
+		}
+		dirty, err := worktreeDirty(ctx, w.Path)
+		if err != nil {
+			return keepFailed, err.Error()
+		}
+		if dirty != "" {
+			return keepDirty, dirty
+		}
 	}
 	// A verifier checkout is a clean detached copy of a candidate whose own
 	// branch stays under the ordinary rules, so it need not be integrated;
@@ -1694,9 +1712,13 @@ func treeUsage(root string) (int64, int64, error) {
 
 func buildArtifactManifest(ctx context.Context, w gitWorktree, item string, st artifactItemState, base worktreeCleanupReceipt, now time.Time) (artifactManifest, error) {
 	m := artifactManifest{Version: 1, At: now.UTC().Format(time.RFC3339Nano), Source: base.Source, ItemID: item, EntryID: st.EntryID, Path: w.Path, Head: w.Head, Basis: st.State, BasisAt: st.BasisAt, Entries: []artifactManifestEntry{}}
-	listed, err := worktreeGit(ctx, w.Path, "ls-tree", "--name-only", "-z", "HEAD")
-	if err != nil {
-		return m, err
+	// An orphaned checkout has no HEAD to list, so no entry is called tracked.
+	listed := ""
+	if !w.Orphan {
+		var err error
+		if listed, err = worktreeGit(ctx, w.Path, "ls-tree", "--name-only", "-z", "HEAD"); err != nil {
+			return m, err
+		}
 	}
 	tracked := map[string]bool{}
 	for _, name := range strings.Split(listed, "\x00") {
@@ -1809,6 +1831,9 @@ func checkoutCreated(admin string) (time.Time, bool) {
 // the checkout's creation time cannot be read.
 func leftoverManifest(w gitWorktree, admin string) string {
 	created, ok := checkoutCreated(admin)
+	if w.Orphan {
+		created, ok = orphanCreated(w.Path)
+	}
 	if !ok {
 		return ""
 	}
@@ -1879,6 +1904,152 @@ func removeArtifactCheckout(ctx context.Context, common string, w gitWorktree, a
 		return reason, why, "", 0
 	}
 	return "", "", manifest, m.Bytes
+}
+
+// orphanedCheckouts finds the verifier checkouts git no longer lists: a
+// directory one or two levels below <artifacts>/<itemId>/, as
+// holdsDetachedCheckout reads them, whose .git file names a worktree record
+// of this repository (<common>/worktrees/<name>) that is gone. Git prunes
+// such a record and leaves the directory, which its worktree list then never
+// names. They are judged as verifier checkouts. It follows no symlink and
+// does not look inside a directory that holds a .git entry.
+func orphanedCheckouts(common string, art *artifactPass) []gitWorktree {
+	if art == nil {
+		return nil
+	}
+	items, err := os.ReadDir(art.root)
+	if err != nil {
+		return nil
+	}
+	var out []gitWorktree
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		children, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, d := range children {
+			if !d.IsDir() {
+				continue
+			}
+			child := filepath.Join(dir, d.Name())
+			if _, err := os.Lstat(filepath.Join(child, ".git")); err != nil {
+				if depth > 1 {
+					walk(child, depth-1)
+				}
+				continue
+			}
+			if !art.linked[child] && orphanAdmin(common, child) != "" {
+				out = append(out, gitWorktree{Path: child, Detached: true, Orphan: true})
+			}
+		}
+	}
+	for _, d := range items {
+		if d.IsDir() && artifactItemIDPattern.MatchString(d.Name()) {
+			walk(filepath.Join(art.root, d.Name()), 2)
+		}
+	}
+	return out
+}
+
+// orphanAdmin returns the worktree record a checkout's .git file names when
+// it is one of this repository's and is gone, or "".
+func orphanAdmin(common, path string) string {
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	admin := worktreeAdminDir(path)
+	if admin == "" || canonicalPath(filepath.Dir(admin)) != filepath.Join(common, "worktrees") {
+		return ""
+	}
+	if _, err := os.Lstat(admin); !os.IsNotExist(err) {
+		return ""
+	}
+	return admin
+}
+
+// orphanCreated is when an orphaned checkout was added: the birth time of
+// its .git file, written once by git worktree add, or else its mtime.
+func orphanCreated(path string) (time.Time, bool) {
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	if err != nil {
+		return time.Time{}, false
+	}
+	if birth, ok := birthTime(info); ok {
+		return birth, true
+	}
+	return info.ModTime(), true
+}
+
+// removeOrphanedCheckout re-checks an orphaned checkout, writes its manifest
+// as removeArtifactCheckout does, and deletes it. With no worktree record
+// git cannot remove it and there is no HEAD to pin. The .git file goes last,
+// so a pass that stops part way leaves an orphan the next pass finds again.
+func removeOrphanedCheckout(ctx context.Context, common string, w gitWorktree, admin string, cleared map[string]bool, item string, art *artifactPass, base worktreeCleanupReceipt, now time.Time) (string, string, string, int64) {
+	if orphanAdmin(common, w.Path) != admin {
+		return keepMoved, "its .git file changed since classification", "", 0
+	}
+	info, err := os.Lstat(w.Path)
+	if err != nil || !info.IsDir() {
+		return keepMoved, "the checkout is not a real directory", "", 0
+	}
+	if real, err := filepath.EvalSymlinks(w.Path); err != nil || real != w.Path || art.checkoutItem(w) != item {
+		return keepMoved, "the checkout is not below " + filepath.Join(art.root, item), "", 0
+	}
+	nested, err := nestedRepository(w.Path, cleared)
+	if err != nil {
+		return keepFailed, "scan for nested repositories: " + err.Error(), "", 0
+	}
+	if nested != "" {
+		return keepNested, "contains Git repository " + nested, "", 0
+	}
+	m, err := buildArtifactManifest(ctx, w, item, art.itemState(item), base, now)
+	if err != nil {
+		return keepFailed, "manifest: " + err.Error(), "", 0
+	}
+	manifest := leftoverManifest(w, admin)
+	reused := manifest != ""
+	if !reused {
+		if manifest, err = writeArtifactManifest(w.Path, m, now); err != nil {
+			return keepFailed, "write manifest: " + err.Error(), "", 0
+		}
+	}
+	restore, err := makeWorktreeWritable(w.Path)
+	if err == nil {
+		err = removeOrphanTree(w.Path)
+		if err != nil {
+			restore()
+		}
+	}
+	if err != nil {
+		if !reused {
+			_ = os.Remove(manifest)
+		}
+		return keepFailed, "remove: " + err.Error(), "", 0
+	}
+	return "", "", manifest, m.Bytes
+}
+
+// removeOrphanTree deletes everything in path but its .git file, then the
+// file and the directory.
+func removeOrphanTree(path string) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, d := range entries {
+		if d.Name() == ".git" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(path, d.Name())); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(path, ".git")); err != nil {
+		return err
+	}
+	return os.Remove(path)
 }
 
 // mainCheckoutGuess names the main checkout from a repository path without
@@ -2948,7 +3119,8 @@ func trimCaches(ctx context.Context, in worktreeCleanupInputs, common, main stri
 	var out []worktreeDecision
 	var eligible []trimCheckout
 	for i, w := range candidates {
-		if i >= len(decisions) || decisions[i].Path != w.Path || decisions[i].Action != "kept" || !trimKeptReasons[decisions[i].Reason] {
+		// An orphaned checkout is kept or removed whole, never trimmed.
+		if w.Orphan || i >= len(decisions) || decisions[i].Path != w.Path || decisions[i].Action != "kept" || !trimKeptReasons[decisions[i].Reason] {
 			continue
 		}
 		item := art.checkoutItem(w)

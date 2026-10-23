@@ -5924,3 +5924,236 @@ func TestWorktreeCleanupArtifactManifestAfterCrash(t *testing.T) {
 		t.Fatal("the earlier removal's manifest was changed")
 	}
 }
+
+// orphanCheckout adds a verifier checkout and then drops its worktree record,
+// as git's prune does, so git no longer lists it and only its directory and
+// .git file stay.
+func (r cleanupRepo) orphanCheckout(t *testing.T, item, name string) string {
+	t.Helper()
+	path := r.verifierCheckout(t, item, name)
+	admin := worktreeAdminDir(path)
+	if admin == "" {
+		t.Fatalf("%s has no worktree record", path)
+	}
+	if err := os.RemoveAll(admin); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cleanupGit(t, r.main, "worktree", "list", "--porcelain"), path) {
+		t.Fatalf("git still lists %s", path)
+	}
+	return path
+}
+
+// o1-o3: a verifier checkout whose worktree record git pruned is judged by
+// the item, age and citation gates of a listed one: a released item's goes,
+// a running item's and a cited one stay, and a listed checkout is judged as
+// before. A .git directory, a record of another repository, a record that
+// exists, a symlink and a folder outside the artifacts root are not orphans.
+func TestWorktreeCleanupOrphanedArtifactCheckout(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	const citedItem = "wi_d4d4d4d4d4d4d4d4"
+	landed := r.orphanCheckout(t, artifactItemA, "verifier-abc1234")
+	running := r.orphanCheckout(t, artifactItemB, "verifier-abc1234")
+	cited := r.orphanCheckout(t, citedItem, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(cited, "test-results", "out.txt"), "kept output\n")
+	writeFixtureFile(t, filepath.Join(r.main, "docs", "release.md"), "Evidence: `"+cited+"/test-results/out.txt`.\n")
+	cleanupGit(t, r.main, "add", "docs/release.md")
+	cleanupGit(t, r.main, "commit", "-q", "-m", "cite an orphaned checkout file")
+	listed := r.verifierCheckout(t, artifactItemC, "verifier-def5678")
+	listedHead := cleanupGit(t, listed, "rev-parse", "HEAD")
+
+	// Beside the landed orphan: its item folder's receipt, and a link out of
+	// the checkout that removal must not follow.
+	receipt := filepath.Join(artifactItemDir(r, artifactItemA), "verifier-abc1234-logs", "receipt.json")
+	writeFixtureFile(t, receipt, `{"cwd":"`+landed+`"}`+"\n")
+	outside := filepath.Join(r.root, "outside", "keep.txt")
+	writeFixtureFile(t, outside, "outside\n")
+	if err := os.Symlink(filepath.Dir(outside), filepath.Join(landed, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not orphans, all under the released item A.
+	nestedRepo := filepath.Join(artifactItemDir(r, artifactItemA), "clone")
+	cleanupGit(t, r.root, "init", "-q", nestedRepo)
+	otherRepo := filepath.Join(artifactItemDir(r, artifactItemA), "other-repo")
+	writeFixtureFile(t, filepath.Join(otherRepo, ".git"), "gitdir: "+filepath.Join(r.root, "elsewhere", ".git", "worktrees", "other-repo")+"\n")
+	liveRecord := filepath.Join(artifactItemDir(r, artifactItemA), "live-record")
+	writeFixtureFile(t, filepath.Join(liveRecord, ".git"), "gitdir: "+worktreeAdminDir(listed)+"\n")
+	linkTarget := filepath.Join(r.root, "linked-orphan")
+	writeFixtureFile(t, filepath.Join(linkTarget, ".git"), "gitdir: "+filepath.Join(r.common, "worktrees", "linked-orphan")+"\n")
+	symlinked := filepath.Join(artifactItemDir(r, artifactItemA), "symlinked")
+	if err := os.Symlink(linkTarget, symlinked); err != nil {
+		t.Fatal(err)
+	}
+	strayParent := filepath.Join(r.root, "stray", artifactItemA, "verifier-abc1234")
+	writeFixtureFile(t, filepath.Join(strayParent, ".git"), "gitdir: "+filepath.Join(r.common, "worktrees", "stray")+"\n")
+	notOrphans := []string{nestedRepo, otherRepo, liveRecord, symlinked, linkTarget, strayParent}
+
+	items := artifactItemStates([]api.TeamQueueEntry{
+		releasedArtifactEntry(artifactItemA),
+		releasedArtifactEntry(artifactItemB),
+		{ID: "tqe_orphan_running", ItemID: artifactItemB, State: "running", Position: 2},
+		releasedArtifactEntry(citedItem),
+		releasedArtifactEntry(artifactItemC),
+	}, nil)
+	before := fixtureTree(t, r.artifacts(), filepath.Dir(outside), linkTarget, strayParent)
+	now := time.Now()
+
+	// The age gate reads the orphan's tree, which changed just now.
+	recent := r.artifactSweep(t, worktreeCleanupInputs{Items: items, MinIdle: 24 * time.Hour, Now: now})
+	if d := requireDecision(t, recent, landed, "kept", keepRecent); d.Kind != kindArtifactCheckout || !strings.HasPrefix(d.Detail, "changed ") {
+		t.Fatalf("recent orphan %+v", d)
+	}
+
+	dry := r.artifactSweep(t, worktreeCleanupInputs{Items: items, MinIdle: 24 * time.Hour, Now: now.Add(48 * time.Hour)})
+	d := requireDecision(t, dry, landed, "would-remove", "")
+	if d.Kind != kindArtifactCheckout || d.Bytes <= 0 ||
+		d.Detail != "item "+artifactItemA+" released; worktree record pruned: git no longer lists "+filepath.Join(r.common, "worktrees", "verifier-abc1234") {
+		t.Fatalf("dry orphan %+v", d)
+	}
+	if d := requireDecision(t, dry, running, "kept", keepItemActive); !strings.Contains(d.Detail, "tqe_orphan_running is running") {
+		t.Fatalf("running orphan %+v", d)
+	}
+	if d := requireDecision(t, dry, cited, "kept", keepEvidence); d.Detail != "cited by docs/release.md: test-results/out.txt" {
+		t.Fatalf("cited orphan %+v", d)
+	}
+	if d := requireDecision(t, dry, listed, "would-remove", ""); d.Detail != "item "+artifactItemC+" released" {
+		t.Fatalf("listed checkout %+v", d)
+	}
+	for _, p := range notOrphans {
+		if d, ok := dry[p]; ok {
+			t.Fatalf("%s is not an orphaned checkout: %+v", p, d)
+		}
+	}
+	if after := fixtureTree(t, r.artifacts(), filepath.Dir(outside), linkTarget, strayParent); after != before {
+		t.Fatalf("a dry run changed the tree:\n%s", after)
+	}
+	if receipts := readCleanupReceipts(t); len(receipts) != 0 {
+		t.Fatalf("dry run wrote receipts %+v", receipts)
+	}
+
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, MinIdle: 24 * time.Hour, Now: now.Add(48 * time.Hour), Apply: true})
+	removed := requireDecision(t, got, landed, "removed", "")
+	requireExists(t, landed, false)
+	requireExists(t, artifactItemDir(r, artifactItemA), true)
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "outside\n" {
+		t.Fatalf("removal followed a link out of the checkout: %q %v", data, err)
+	}
+	if data, err := os.ReadFile(receipt); err != nil || string(data) != `{"cwd":"`+landed+`"}`+"\n" {
+		t.Fatalf("receipt beside the checkout changed: %q %v", data, err)
+	}
+	m := readArtifactManifest(t, landed+".removed.json")
+	if removed.Manifest != landed+".removed.json" || m.Path != landed || m.Head != "" || m.PinnedRef != "" || m.ItemID != artifactItemA ||
+		m.Basis != artifactItemReleased || m.Bytes != removed.Bytes || m.Bytes <= 0 {
+		t.Fatalf("orphan manifest %+v for %+v", m, removed)
+	}
+	for _, e := range m.Entries {
+		if e.Tracked {
+			t.Fatalf("an orphan has no HEAD to call %s tracked", e.Name)
+		}
+	}
+	requireDecision(t, got, running, "kept", keepItemActive)
+	requireDecision(t, got, cited, "kept", keepEvidence)
+	requireExists(t, filepath.Join(running, "node_modules", "left-pad", "index.js"), true)
+	requireExists(t, filepath.Join(cited, "test-results", "out.txt"), true)
+	listedGone := requireDecision(t, got, listed, "removed", "")
+	requireExists(t, listed, false)
+	if lm := readArtifactManifest(t, listedGone.Manifest); lm.Head != listedHead {
+		t.Fatalf("listed manifest %+v", lm)
+	}
+	for _, p := range notOrphans {
+		requireExists(t, p, true)
+	}
+	var lines []worktreeCleanupReceipt
+	for _, rec := range readCleanupReceipts(t) {
+		if rec.Kind == kindArtifactCheckout && rec.Action == "removed" {
+			lines = append(lines, rec)
+		}
+	}
+	if rec, ok := receiptFor(lines, landed); !ok || len(lines) != 2 || !strings.Contains(rec.Detail, "worktree record pruned") || rec.Manifest != landed+".removed.json" || rec.Bytes != removed.Bytes {
+		t.Fatalf("removal receipts %+v", lines)
+	}
+}
+
+func artifactItemDir(r cleanupRepo, item string) string { return filepath.Join(r.artifacts(), item) }
+
+// o1: closeout selects its item's orphaned checkouts too, and a removal left
+// part way, with the .git file still there, is found and finished by the next
+// pass with the manifest the first one wrote.
+func TestWorktreeCleanupOrphanedCheckoutInterruptedRemoval(t *testing.T) {
+	r := newCleanupRepo(t)
+	r.ignoreBuildOutput(t)
+	orphan := r.orphanCheckout(t, artifactItemA, "verifier-abc1234")
+	items := artifactItemStates([]api.TeamQueueEntry{releasedArtifactEntry(artifactItemA)}, nil)
+	selectItem := func(w gitWorktree, main string, linked []string) bool {
+		return pathWithin(w.Path, artifactItemDir(r, artifactItemA))
+	}
+	// A pass that wrote the manifest and the start of the removal, then stopped.
+	first := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Select: selectItem})
+	requireDecision(t, first, orphan, "would-remove", "")
+	m := artifactManifest{Version: 1, At: time.Now().UTC().Format(time.RFC3339Nano), Source: "sweep", ItemID: artifactItemA, Path: orphan, Basis: artifactItemReleased}
+	manifest, err := writeArtifactManifest(orphan, m, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(orphan, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := r.artifactSweep(t, worktreeCleanupInputs{Items: items, Select: selectItem, Apply: true})
+	d := requireDecision(t, got, orphan, "removed", "")
+	requireExists(t, orphan, false)
+	if d.Manifest != manifest {
+		t.Fatalf("manifest %q, want the leftover %q", d.Manifest, manifest)
+	}
+	if left, _ := filepath.Glob(orphan + ".removed-*.json"); len(left) != 0 {
+		t.Fatalf("a second manifest was written: %v", left)
+	}
+}
+
+// o2: the manual dry run lists an orphaned checkout with its size and the
+// pruned record, and the scheduled sweep removes it and counts it in the
+// journal's treesRemoved.
+func TestWorktreeCleanupOrphanedCheckoutSweepAndJournal(t *testing.T) {
+	f := newSweepFixture(t)
+	orphan := f.r.orphanCheckout(t, sweepItem, "verifier-abc1234")
+	at := f.now
+	oldNow := sweepNow
+	sweepNow = func() time.Time { return at }
+	t.Cleanup(func() { sweepNow = oldNow })
+
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(env{hub: f.hubURL}, []string{"--cwd", f.r.main, "--min-idle", "6h", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v\n%s", err, out)
+	}
+	var report worktreeSweepReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	var row *worktreeDecision
+	for i := range report.Worktrees {
+		if report.Worktrees[i].Path == orphan {
+			row = &report.Worktrees[i]
+		}
+	}
+	if row == nil || row.Action != "would-remove" || row.Bytes <= 0 || row.Kind != kindArtifactCheckout || !strings.Contains(row.Detail, "worktree record pruned") {
+		t.Fatalf("dry-run row %+v in %s", row, out)
+	}
+	requireExists(t, orphan, true)
+
+	if !f.attempt() || f.sweeps != 1 {
+		t.Fatalf("scheduled sweep: %d sweeps", f.sweeps)
+	}
+	requireExists(t, orphan, false)
+	line := lastSweepLine(t)
+	if line.Outcome != "swept" || line.TreesRemoved != 1 || line.BytesFreed != row.Bytes {
+		t.Fatalf("journal line %+v, dry-run bytes %d", line, row.Bytes)
+	}
+	rec, ok := receiptFor(readCleanupReceipts(t), orphan)
+	if !ok || rec.Action != "removed" || !strings.Contains(rec.Detail, "worktree record pruned") {
+		t.Fatalf("receipt %+v", rec)
+	}
+}

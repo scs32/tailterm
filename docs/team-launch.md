@@ -421,6 +421,20 @@ before the hub is read. `docs/project-queue.md` ("Team queue artifact and
 session temp retention") has the rules for verifier checkouts and session temp
 folders.
 
+A verifier checkout whose worktree record git has pruned is still judged. The
+sweep finds it under `<artifacts>/<itemId>/`, one or two levels down, by its
+`.git` file naming a record under this repository's `.git/worktrees/` that is
+gone. It is judged by the same item-state, age and citation rules as a listed
+checkout and removed when they allow: never while its item runs, and never
+while a tracked document or a receipt cites a file in it. Its age is the
+newest change anywhere in it, as for a session temp folder, since its Git state
+went with the record. With no index or `HEAD` it has no dirty check and no
+pinned ref, and its manifest marks nothing tracked. The dry run lists it as
+`would-remove` with its size and `worktree record pruned` in the detail, and
+the journal counts it in `treesRemoved`. A `.git` directory, a record that
+exists or belongs to another repository, a symlink and anything outside the
+artifacts root are left alone.
+
 Run it from any worktree of the repository (or pass `--cwd`). It first reads
 every project's roster and team queue from the hub and exits non-zero, having
 touched nothing, if any read fails. The default is a dry run that changes
