@@ -1004,18 +1004,22 @@ longer fail the entry:
   its `attempt`. When that read gets no response, the entry stays `launching`
   and backs off as above. The next launch reads the registration of the exact
   frozen agent and run again, and records the member `started` when its name,
-  host, item, revision and order match and it is not closed or exited. That
-  read-back never spawns, and a fault there backs off again. A relay restart
-  loses nothing, since the member's state is on the hub. A registration the
-  hub refused or that differs fails the entry under the never-respawn rule.
+  host, item, revision and order match, it is not closed or exited, and this
+  host holds the session that exact run owns. That read-back never spawns,
+  and a fault there backs off again. A relay restart loses nothing, since the
+  member's state is on the hub. A registration the hub refused or that
+  differs, or a missing owned session, fails the entry under the
+  never-respawn rule.
 - **Team close.** At closeout the runner freezes its close request on the
   entry, reads that request's receipt and, if the hub has none, sends the
   close. When the receipt read or the close gets no response, the entry stays
   `running` and backs off as above, making no close call while it waits. The
   next try uses the same frozen request and reads its receipt first, so a
-  close that landed before the fault is found, not sent again. The close's
-  two waits (open obligations, a changed team snapshot) are unchanged; any
-  other error the hub answered still fails the entry at once.
+  close that landed before the fault is found, not sent again. A receipt read
+  the hub answered with an error other than 404 is returned and tried again
+  on the next tick without failing the entry, as before. The close's two
+  waits (open obligations, a changed team snapshot) are unchanged; any other
+  error the hub answered on the close itself still fails the entry at once.
 
 The backoff and the refusal count live in the relay's memory. A relay restart
 retries at once and allows at most three more permanent refusals before the
