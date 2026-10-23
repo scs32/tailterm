@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { releaseBaselines } from "../scripts/release-targets.mjs";
-import { buildInputs, readReleaseSummaries, readReleaseDetail, RELEASE_READ_ATTEMPTS } from "../scripts/release-inputs.mjs";
+import { buildInputs, readReleaseSummaries, readReleaseDetail, RELEASE_READ_ATTEMPTS, pinnedWrangler, wranglerBin } from "../scripts/release-inputs.mjs";
 
 function releaseReply(jobs,argv) {
  const flag=n=>{const i=argv.indexOf(n);return i<0?undefined:argv[i+1];};
@@ -112,10 +112,28 @@ test("TailOS rolls back to the retained dist of the live commit", async () => {
   mkdirSync(join(f.home, `tailos-dist-${"5".repeat(40)}`));
   await buildInputs(f.config, f.job.id, { deps: f.deps });
   const t = JSON.parse(readFileSync(join(f.home, "rel_0123abcd-g4-inputs.json"), "utf8")).targets.tailos;
-  assert.deepEqual(t.rollbackProgram, ["npx", "wrangler", "pages", "deploy", join(f.home, `tailos-dist-${"5".repeat(40)}`), "--project-name", "tailos", "--branch", "main", "--commit-hash", "5".repeat(40), "--commit-dirty=false"]);
+  assert.deepEqual(t.rollbackProgram, [join(f.config.cwd, "node_modules", ".bin", "wrangler"), "pages", "deploy", join(f.home, `tailos-dist-${"5".repeat(40)}`), "--project-name", "tailos", "--branch", "main", "--commit-hash", "5".repeat(40), "--commit-dirty=false"]);
   assert.deepEqual(t.rollbackProbe, ["node", "scripts/release-probe.mjs", "rollback", "tailos", "--expect-commit", "5".repeat(40), "--config", f.deps.configPath]);
   assert.equal(t.rollbackSafe, true);
   assert.ok(!f.calls.some(c => c[0] === "preflight"));
+});
+
+test("w2 pinnedWrangler returns the bin only for the exact pinned install", () => {
+  const install = ({ pin = "4.145.0", installed = "4.145.0", bin = true } = {}) => {
+    const cwd = mkdtempSync(join(tmpdir(), "inputs-wrangler-"));
+    if (pin) writeFileSync(join(cwd, "package.json"), JSON.stringify({ devDependencies: { wrangler: pin } }));
+    if (installed) { mkdirSync(join(cwd, "node_modules/wrangler"), { recursive: true }); writeFileSync(join(cwd, "node_modules/wrangler/package.json"), JSON.stringify({ version: installed })); }
+    if (bin) { mkdirSync(join(cwd, "node_modules/.bin"), { recursive: true }); writeFileSync(join(cwd, "node_modules/.bin/wrangler"), ""); }
+    return cwd;
+  };
+  const exact = install();
+  assert.equal(wranglerBin(exact), join(exact, "node_modules", ".bin", "wrangler"));
+  assert.equal(pinnedWrangler(exact), wranglerBin(exact));
+  assert.equal(pinnedWrangler(install({ installed: "4.144.0" })), null, "another installed version");
+  assert.equal(pinnedWrangler(install({ pin: "^4.145.0" })), null, "a range, not an exact pin");
+  assert.equal(pinnedWrangler(install({ pin: null })), null, "no package.json");
+  assert.equal(pinnedWrangler(install({ installed: null })), null, "not installed");
+  assert.equal(pinnedWrangler(install({ bin: false })), null, "no bin link");
 });
 
 test("released receipts move baselines, so nothing selected gives an empty manifest", async () => {

@@ -175,7 +175,7 @@ Client, plus:
 | GitHub login | `gh auth status` exits 0 | `gh auth login` | same | `gh login` |
 | python3 | runs `scripts/deploy-truenas-hub.py` | preinstalled or `brew install python` | `apt install python3` | `python3` |
 | Node.js | `>=22.12.0` (vite for `build:static` and wrangler's `>=22.0.0`) | `brew install node` | NodeSource or nvm | `node >=22.12.0` |
-| wrangler | on PATH, or in npm's npx cache `~/.npm/_npx/*/node_modules/wrangler` (highest version; its `engines.node` must admit the installed Node) | `npx wrangler --version` (downloads it) | same | `wrangler` |
+| wrangler | releases run the pinned devDependency `wrangler 4.145.0` (exact, in `package.json` and `package-lock.json`) from the deployer checkout's `node_modules/.bin/wrangler`, never npx (see the note below). Doctor still looks on PATH or in npm's npx cache `~/.npm/_npx/*/node_modules/wrangler` (highest version; its `engines.node` must admit the installed Node) | `npm ci` in the deployer checkout | same | `wrangler` |
 | wrangler credential | `CLOUDFLARE_API_TOKEN` set, or the OAuth file with an `oauth_token` that is unexpired or has a `refresh_token` | `npx wrangler login` | same | `wrangler credential` |
 | SSH route | `Host truenas` with `HostName` in `~/.ssh/config` (the `truenas-ssh` route in `scripts/deploy-truenas-hub.py`) | edit `~/.ssh/config` | same | `ssh route truenas` |
 | Container runtime | apple/container: `container` on PATH (or the deployer config's optional `rehearsal.runtime` path) with its service running (`container system status` exits 0), and the image `gcr.io/distroless/static-debian12:nonroot` pulled or pullable. Checked at 1.1.0 (`scripts/release-runner.mjs` `rehearse`) | `brew install container`, then `container system start` | none supported yet: a Linux release host cannot release a schema change | none |
@@ -183,6 +183,26 @@ Client, plus:
 
 Notes:
 
+- wrangler is pinned to `4.145.0` (wi_34bf5751e60a4a18). The TailOS deploy,
+  the TailOS rollback program that `scripts/release-inputs.mjs` records and
+  the old-site `scripts/deploy-static.mjs` run
+  `<checkout>/node_modules/.bin/wrangler`, and only when `package.json` pins
+  one exact version and `node_modules/wrangler` has that version installed.
+  Before publishing a job that selects TailOS, the release runner runs
+  `npm ci` when `package-lock.json` changed since the TailOS baseline, then
+  refuses the job unpublished with `Pinned wrangler not installed; run npm ci`
+  when that install is missing, so no target deploys. Rollback programs
+  recorded before the pin (`npx wrangler ...`) run as recorded; in the
+  deployer checkout npx finds the pinned local binary first. 4.145.0 needs
+  Node `>=22.0.0`, which the Node row covers.
+- To update the pin: run
+  `npm install -D -E --package-lock-only --ignore-scripts --no-audit --no-fund wrangler@X.Y.Z`,
+  check that the lockfile diff only changes wrangler's own entries (the root
+  entry and the packages wrangler needs) and removes nothing, run the release
+  tests (`node --test tests/release-runner-3.test.js tests/release-inputs.test.js`,
+  whose w1 test names the pinned version), then commit both files and
+  release. That release changes `package-lock.json`, so the deployer runs
+  `npm ci` before publication.
 - The wrangler OAuth file is `~/Library/Preferences/.wrangler/config/default.toml`
   on macOS and `$XDG_CONFIG_HOME/.wrangler/config/default.toml` (default
   `~/.config`) on Linux. An expired access token with a refresh token is `ok`
@@ -252,7 +272,7 @@ the role. Source: the item's inventory at 476eacc, rechecked at 10bc367.
 | Worktrees under `.build/worktrees`; artifacts in `~/projects/tailterm-artifacts` | queue runner, team templates | portable (home-relative) |
 | `tt doctor` checked only tmux, runtimes and the hub | `hub/cmd/tt/coordination.go` `cmdDoctor` | fixed by `tt doctor --role` (plain `tt doctor` is unchanged) |
 | Verifier Playwright path is macOS-only | `scripts/verify-matrix.mjs:881-883` (`~/Library/Caches/ms-playwright`) | to fix |
-| wrangler is not in package.json; it runs from the npx cache | `scripts/deploy-static.mjs`, `~/.npm/_npx` | to fix (pin it) |
+| wrangler is not in package.json; it runs from the npx cache | `scripts/deploy-static.mjs`, `~/.npm/_npx` | fixed: pinned devDependency run from `node_modules/.bin` (wi_34bf5751e60a4a18); `tt doctor` still checks PATH and the npx cache |
 | No Linux relay service | `tt host setup` installs launchd services only | to fix |
 
 ## Limits

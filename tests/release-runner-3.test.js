@@ -8,7 +8,7 @@ import {execFileSync,execFile,spawnSync} from "node:child_process";
 import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
-import {RELEASE_READ_ATTEMPTS} from "../scripts/release-inputs.mjs";
+import {RELEASE_READ_ATTEMPTS,wranglerBin} from "../scripts/release-inputs.mjs";
 import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
 test("m5 end to end: a matrix change no owner approval covers refuses the job by name and leaves tasks-hub alone",async()=>{
  const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11}]);
@@ -269,7 +269,7 @@ test("g2 the four named adapter refusals carry their tag and a prepare refusal j
  hostConfig.targets.hub={};const release="rel_tags-"+commit.slice(0,12)+"-hub";adapter.command=argv=>{if(argv[1]==="version")return stamped(commit);if(argv.includes("build"))writeFileSync(argv[argv.indexOf("-o")+1],"binary");return "";};
  importInputs(adapter,commit,{hub:{release,backupJobId:"rel_previous",backup:join(home,"rel_previous-backup")}});
  await assert.rejects(adapter.prepare("hub",commit),tagged("Fresh job backup identity required"));
- adapter.command=()=>"no url";await assert.rejects(adapter.deploy("tailos",{commit}),tagged("TailOS deployment identity unconfirmed"));
+ const pinnedHost=new HostAdapter({cwd:fakeWrangler(),journalDirectory:home},{id:"rel_tags"});pinnedHost.command=()=>"no url";await assert.rejects(pinnedHost.deploy("tailos",{commit}),tagged("TailOS deployment identity unconfirmed"));
  // Through the runner: the real adapter's prepare has no input for the target.
  const g=fixture(),j=job(g,change(g,"client/a.js","a")),r=await journalOf(g,j,(a,c)=>{
   const host=new HostAdapter({cwd:g.cwd,journalDirectory:dirname(c.journalPath),baselines:c.baselines,targets:{tailos:{}}},{...j});importInputs(host,j.commit,{});a.prepare=(t,commit)=>host.prepare(t,commit);
@@ -309,9 +309,83 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
  const rg=await journalOf(...start(),a=>{a.merged=async()=>{throw releaseError("Paired plan members disagree");};},/Release failed/);
  assert.equal(rg.journal.failure,undefined);assert.deepEqual(rg.journal.failureDetail,{text:"Paired plan members disagree"});assert.equal(rg.journal.published,true);
 });
+// w1-w3: a fake pinned wrangler install. No test runs wrangler or npx: every
+// host command goes through a capturing adapter.command.
+const WRANGLER="4.145.0",WRANGLER_TAG="Pinned wrangler not installed; run npm ci";
+function fakeWrangler(cwd=mkdtempSync(join(tmpdir(),"release-wrangler-")),{pin=WRANGLER,installed=WRANGLER,bin=true,manifest=true}={}){
+ if(manifest)writeFileSync(join(cwd,"package.json"),JSON.stringify({devDependencies:{wrangler:pin}}));
+ if(installed){mkdirSync(join(cwd,"node_modules/wrangler"),{recursive:true});writeFileSync(join(cwd,"node_modules/wrangler/package.json"),JSON.stringify({version:installed}));}
+ if(bin){mkdirSync(join(cwd,"node_modules/.bin"),{recursive:true});writeFileSync(join(cwd,"node_modules/.bin/wrangler"),"");}
+ return cwd;
+}
+const tailosRollback=(bin,commit)=>[bin,"pages","deploy","/journal/tailos-dist-"+commit,"--project-name","tailos","--branch","main","--commit-hash",commit,"--commit-dirty=false"];
+test("wrangler w1 package.json and the lockfile pin one exact wrangler version",()=>{
+ const pkg=JSON.parse(readFileSync(new URL("../package.json",import.meta.url),"utf8")),lock=JSON.parse(readFileSync(new URL("../package-lock.json",import.meta.url),"utf8"));
+ const pin=pkg.devDependencies.wrangler;assert.match(pin,/^\d+\.\d+\.\d+$/);assert.equal(pin,WRANGLER);
+ assert.equal(lock.packages[""].devDependencies.wrangler,pin);assert.equal(lock.packages["node_modules/wrangler"].version,pin);
+});
+test("wrangler w1 the TailOS deploy runs the pinned checkout binary",async()=>{
+ const cwd=fakeWrangler(),commit="c".repeat(40),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});
+ adapter.command=argv=>{calls.push(argv);return "https://abcdef12.tailos.pages.dev";};
+ const a={commit};await adapter.deploy("tailos",a);
+ assert.deepEqual(calls,[[join(cwd,"node_modules/.bin/wrangler"),"pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",commit,"--commit-dirty=false"]]);
+ assert.equal(a.deployment,"https://abcdef12.tailos.pages.dev");
+});
+test("wrangler w1 no release or old-site script calls npx",()=>{
+ for(const name of ["release-runner.mjs","release-inputs.mjs","deploy-static.mjs"]){
+  const source=readFileSync(new URL("../scripts/"+name,import.meta.url),"utf8");assert.ok(!source.includes('"npx"'),name);assert.ok(!/["']wrangler["']\s*,\s*["']pages["']/.test(source),name);
+ }
+ assert.ok(readFileSync(new URL("../scripts/deploy-static.mjs",import.meta.url),"utf8").includes('"node_modules/.bin/wrangler"'));
+});
+test("wrangler w2 a missing pinned wrangler refuses the job before publication and before any target deploys",async()=>{
+ const g=fixture();mkdirSync(join(g.cwd,"hub/cmd/tt"),{recursive:true});change(g,"hub/cmd/tt/x.go","x");const j=job(g,change(g,"client/a.js","a"));
+ const before=git(g.cwd,"rev-parse","refs/heads/tasks-hub");let tools=0;
+ const r=await journalOf(g,j,(a,c)=>{
+  const host=new HostAdapter({cwd:g.cwd,journalDirectory:dirname(c.journalPath),baselines:c.baselines,targets:{tailos:{}}},{...j});
+  a.releaseTools=commit=>{tools++;return host.releaseTools(commit);};
+ });
+ assert.equal(tools,1);
+ assert.deepEqual(r.journal.failure,{step:"prepare",target:"tailos",reason:WRANGLER_TAG});assert.equal(r.journal.refusalReason,WRANGLER_TAG);
+ assert.notEqual(r.journal.published,true);assert.deepEqual(r.journal.effects,[]);
+ assert.ok(r.a.calls.includes("refuse"));assert.ok(!r.a.calls.includes("merged"));assert.ok(!r.a.calls.some(c=>String(c).startsWith("deploy:")));
+ assert.equal(git(g.cwd,"rev-parse","refs/heads/tasks-hub"),before);
+});
+test("wrangler w2 releaseTools refuses a missing binary, a different installed version and a non-exact pin",async()=>{
+ const g=fixture(),commit=change(g,"client/a.js","a");git(g.cwd,"checkout","--detach",commit);
+ const tagged=e=>failureReason(e)===WRANGLER_TAG;
+ const tools=(over)=>{const cwd=over===null?g.cwd:fakeWrangler(g.cwd,over);const h=new HostAdapter({cwd,journalDirectory:cwd,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,g.base]))},{id:"rel_fixture"});const cmds=[];h.command=argv=>{cmds.push(argv);return "";};return {h,cmds};};
+ for(const over of [null,{installed:"4.144.0"},{pin:"^"+WRANGLER},{bin:false}]){
+  rmSync(join(g.cwd,"node_modules"),{recursive:true,force:true});const {h,cmds}=tools(over);
+  await assert.rejects(h.releaseTools(commit),tagged,JSON.stringify(over));assert.deepEqual(cmds,[],"no lockfile change, no npm ci");
+ }
+ rmSync(join(g.cwd,"node_modules"),{recursive:true,force:true});const ok=tools({});await ok.h.releaseTools(commit);assert.deepEqual(ok.cmds,[]);
+ // The deploy checks too, and runs nothing when the install is missing.
+ const empty=mkdtempSync(join(tmpdir(),"release-wrangler-none-")),d=new HostAdapter({cwd:empty,journalDirectory:empty},{id:"rel_fixture"}),ran=[];d.command=argv=>{ran.push(argv);return "https://abcdef12.tailos.pages.dev";};
+ await assert.rejects(d.deploy("tailos",{commit}),tagged);assert.deepEqual(ran,[]);
+});
+test("wrangler w2 releaseTools runs npm ci once when the lockfile changed and prepare does not repeat it",async()=>{
+ const g=fixture();change(g,"package.json",JSON.stringify({devDependencies:{wrangler:WRANGLER}}));const commit=change(g,"package-lock.json","{}");git(g.cwd,"checkout","--detach",commit);
+ const home=mkdtempSync(join(tmpdir(),"release-wrangler-ci-")),cmds=[];
+ const h=new HostAdapter({cwd:g.cwd,journalDirectory:home,baselines:Object.fromEntries(["hub","bridge","mini","tailos"].map(t=>[t,g.base])),targets:{tailos:{}}},{...job(g,commit),id:"rel_fixture"});
+ h.command=argv=>{cmds.push(argv.join(" "));if(argv.join(" ")==="npm ci")fakeWrangler(g.cwd,{manifest:false});return "";};
+ await h.releaseTools(commit);assert.deepEqual(cmds,["npm ci"]);
+ importInputs(h,commit,{tailos:{release:"rel_fixture-"+commit.slice(0,12)+"-tailos"}});
+ await assert.rejects(h.prepare("tailos",commit),e=>failureReason(e)!==WRANGLER_TAG);
+ assert.deepEqual(cmds,["npm ci","npm run build:static","npm run verify:release"]);
+});
+test("wrangler w2 a pinned TailOS rollback with no install throws before running, and an old npx program runs as recorded",async()=>{
+ const commit="5".repeat(40),probe=[process.execPath,"probe"];
+ const rollback=(cwd,program)=>{const h=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"}),ran=[];h.command=argv=>{ran.push(argv);return JSON.stringify({restored:true,databaseWritesPreserved:true});};h.artifacts.set("tailos",{rollbackSafe:true,rollbackProgram:program,rollbackProbe:probe});return {h,ran};};
+ const empty=mkdtempSync(join(tmpdir(),"release-wrangler-rollback-")),missing=rollback(empty,tailosRollback(wranglerBin(empty),commit));
+ await assert.rejects(missing.h.rollback("tailos"),e=>failureReason(e)===WRANGLER_TAG);assert.deepEqual(missing.ran,[]);
+ const cwd=fakeWrangler(),pinned=rollback(cwd,tailosRollback(wranglerBin(cwd),commit));
+ assert.equal(await pinned.h.rollback("tailos"),true);assert.deepEqual(pinned.ran,[tailosRollback(join(cwd,"node_modules/.bin/wrangler"),commit),probe]);
+ const old=["npx","wrangler",...tailosRollback("x",commit).slice(1)],recorded=rollback(empty,old);
+ assert.equal(await recorded.h.rollback("tailos"),true);assert.deepEqual(recorded.ran,[old,probe]);
+});
 test("g1 the runner throws no untagged fixed error",()=>{
  const source=readFileSync(RUNNER,"utf8");assert.ok(!source.includes("throw new Error("));assert.equal(source.split("new Error(").length-1,2,"releaseError and the command wrapper");
- for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed"]){
+ for(const tag of ["Release binding mismatch","Dirty deployment checkout","Unknown commit identity","Unknown candidate base","Nonlinear candidate series","Candidate integration refused","Integrated checkout changed","Release ref race","Ambiguous journal requires handler reconciliation","Release host locked; inspect prior execution","Fresh job backup identity required","Exact job target input required","Candidate build checkout mismatch","TailOS deployment identity unconfirmed","Pinned wrangler not installed; run npm ci"]){
   assert.ok(source.includes(`releaseError("${tag}")`),tag);assert.equal(failureReason(releaseError(tag)),tag);
  }
 });
@@ -876,7 +950,7 @@ else process.exit(2);`);chmodSync(tt,0o755);
  const slept=[],sleep=cliRetry.sleep;cliRetry.sleep=ms=>{slept.push(ms);};t.after(()=>{cliRetry.sleep=sleep;});
  const saved=()=>JSON.parse(readFileSync(jobPath,"utf8"));
  // A poll's adapter: the real CLI paths, with the target steps stubbed.
- const adapter=()=>Object.assign(new HostAdapter({cwd:f.cwd,tt,journalDirectory:home},saved()),{prepare:async()=>({release:"fixture-release",artifactSHA256:"b".repeat(64)}),deploy:async()=>{},check:async()=>true,rollback:async()=>true,retain:async()=>{},jobInputs:()=>({targets:{}})});
+ const adapter=()=>Object.assign(new HostAdapter({cwd:f.cwd,tt,journalDirectory:home},saved()),{releaseTools:async()=>{},prepare:async()=>({release:"fixture-release",artifactSHA256:"b".repeat(64)}),deploy:async()=>{},check:async()=>true,rollback:async()=>true,retain:async()=>{},jobInputs:()=>({targets:{}})});
  const calls=()=>existsSync(log)?readFileSync(log,"utf8").trim().split("\n").filter(Boolean).map(l=>JSON.parse(l)):[];
  const ops=name=>calls().filter(c=>c.op===name),journal=join(home,"rel_retry.json");
  const release=a=>runRelease({...config(f,claimed),journalPath:journal},a);

@@ -1882,8 +1882,14 @@ mutation. After a verified TailOS deploy the runner keeps `dist-static` as
 `journalDirectory/tailos-dist-COMMIT` (0700); the next job's TailOS rollback
 redeploys that directory with Wrangler. A hand release of TailOS
 retains the same directory through `tt deployment hand-release --dist` (see
-"Superseding jobs released by hand"). `prepare(tailos)` runs `npm ci` first when
-`package-lock.json` changed since the TailOS baseline.
+"Superseding jobs released by hand"). Before publication, when TailOS is
+selected, the runner runs `npm ci` if `package-lock.json` changed since the
+TailOS baseline and refuses the job unpublished (`Pinned wrangler not
+installed; run npm ci`) if the wrangler pinned in `package.json` is not
+installed in the checkout; `prepare(tailos)` runs `npm ci` first only when that
+check did not already run it for the commit. The deploy and the recorded
+rollback run that pinned `node_modules/.bin/wrangler`, never npx
+(docs/host-requirements.md).
 
 **Failure diagnostics in the receipt** (wi_d4e96831ab3a0038). A rolled_back or
 blocked receipt that `tt deployment finish` saves carries, beside its outcomes:
@@ -2584,8 +2590,9 @@ scripts/release-probe.mjs rollback TARGET --expect-release PRIOR_RELEASE
   doctor), copy `journalDirectory/ID-mini-before` over the installed `tt`
   atomically (copy to `tt.rollback`, then rename) and restart the relay with the
   configured command. The runner's rollback does the same.
-- TailOS: `npx wrangler pages deploy journalDirectory/tailos-dist-PRIOR
---project-name tailos --branch main --commit-hash PRIOR --commit-dirty=false`,
+- TailOS: from the deployer checkout, `DEPLOYER_CHECKOUT/node_modules/.bin/wrangler
+pages deploy journalDirectory/tailos-dist-PRIOR --project-name tailos --branch
+main --commit-hash PRIOR --commit-dirty=false`,
   then `node scripts/release-probe.mjs rollback tailos --expect-commit PRIOR
 --config PRIVATE`. The probe polls for up to the switch window (above; the
   default 90 s without `--config`) before it reports `restored: false`.

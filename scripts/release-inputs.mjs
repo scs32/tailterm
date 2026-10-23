@@ -39,6 +39,20 @@ export function fileSHA256(path) {
   return hash.digest("hex");
 }
 const fileSHA = fileSHA256;
+// w1: TailOS deploys and rolls back with the wrangler pinned in package.json,
+// run from the checkout's node_modules, never a copy npx finds or fetches.
+// pinnedWrangler names that binary only when package.json pins one exact
+// version and node_modules holds that version; otherwise null. It reads
+// files only and never runs wrangler.
+export const wranglerBin = cwd => join(resolve(cwd), "node_modules", ".bin", "wrangler");
+export function pinnedWrangler(cwd) {
+  try {
+    const pin = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")).devDependencies?.wrangler;
+    if (typeof pin !== "string" || !/^\d+\.\d+\.\d+$/.test(pin)) return null;
+    if (JSON.parse(readFileSync(join(cwd, "node_modules", "wrangler", "package.json"), "utf8")).version !== pin) return null;
+    return existsSync(wranglerBin(cwd)) ? wranglerBin(cwd) : null;
+  } catch { return null; }
+}
 function writePrivate(path, text) {
   const fd = openSync(path, "wx", 0o600);
   try { writeFileSync(fd, text); } finally { closeSync(fd); }
@@ -241,7 +255,7 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
       targets.mini = { release, rollbackSafe: true, rollbackProbe: [...probeArgv, "mini", "--expect-sha", prior.artifactSHA256, ...cfg] };
     } else {
       const retained = join(dir, `tailos-dist-${prior.commit}`), safe = sha(prior.commit) && existsSync(retained);
-      targets.tailos = { release, rollbackSafe: safe, ...(safe ? { rollbackProgram: ["npx", "wrangler", "pages", "deploy", retained, "--project-name", "tailos", "--branch", "main", "--commit-hash", prior.commit, "--commit-dirty=false"],
+      targets.tailos = { release, rollbackSafe: safe, ...(safe ? { rollbackProgram: [wranglerBin(config.cwd), "pages", "deploy", retained, "--project-name", "tailos", "--branch", "main", "--commit-hash", prior.commit, "--commit-dirty=false"],
         rollbackProbe: [...probeArgv, "tailos", "--expect-commit", prior.commit, ...cfg] } : {}) };
     }
   }

@@ -532,7 +532,7 @@ end(undefined);
  // A host adapter whose batch calls, fence and detail go through that tt.
  const adapter=()=>{
   const host=new HostAdapter({cwd:b.f.cwd,journalDirectory:home,tt},read().job),stub=fake();host.calls=stub.calls;
-  for(const key of ["merged","prepare","deploy","check","rollback","finish","escalate","requestBug","block","refuse"])host[key]=stub[key];
+  for(const key of ["merged","releaseTools","prepare","deploy","check","rollback","finish","escalate","requestBug","block","refuse"])host[key]=stub[key];
   host.verifyIntegrated=async()=>{stub.calls.push("verify");return true;};host.verifyInputs=async()=>true;host.settleMatrixRuns=async()=>true;host.retain=async()=>{};
   return host;
  };
@@ -574,7 +574,7 @@ end(undefined);
  const seen=[];
  const release=(c,adapter)=>{
   seen.push(c);const stub=fake();
-  for(const key of ["prepare","deploy","check","rollback","escalate","requestBug"])adapter[key]=stub[key];
+  for(const key of ["releaseTools","prepare","deploy","check","rollback","escalate","requestBug"])adapter[key]=stub[key];
   adapter.verifyIntegrated=async()=>true;adapter.verifyInputs=async()=>true;adapter.settleMatrixRuns=async()=>true;adapter.retain=async()=>{};
   return runRelease({...c,testPolicy:config.testPolicy},adapter);
  };

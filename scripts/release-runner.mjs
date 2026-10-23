@@ -1,4 +1,4 @@
-import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256, RELEASE_READ_ATTEMPTS } from "./release-inputs.mjs";
+import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256, RELEASE_READ_ATTEMPTS, pinnedWrangler, wranglerBin } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1244,7 +1244,12 @@ export async function runRelease(config, adapter) {
     }
     const windowWait=await quietWindow(selected);if(windowWait)return windowWait;
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
-    await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
+    await fence();
+    // w2: the pinned wrangler is installed (npm ci when the lockfile changed)
+    // and checked before publication, so a missing one refuses the job
+    // unpublished with no target deployed.
+    if(selected.includes("tailos") && adapter.releaseTools){begin({step:"prepare",target:"tailos"});await adapter.releaseTools(integration.integrated);step=null;}
+    publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;
@@ -1852,6 +1857,16 @@ export class HostAdapter {
     copyFileSync(artifact.installPath,path,constants.COPYFILE_EXCL);
     artifact.rollbackPath=path;artifact.priorArtifactSHA256=fileDigest(path);artifact.rollbackCaptured=true;
   }
+  // w2: before publication, install the pinned wrangler when the lockfile
+  // changed (once per commit; prepare does not repeat it) and refuse the job
+  // when the exact pinned version is not installed.
+  async releaseTools(commit){
+    if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw releaseError("Candidate build checkout mismatch");
+    const baselines=this.baselines||this.config.baselines;
+    if(this.installedFor!==commit && diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
+    this.installedFor=commit;
+    if(!pinnedWrangler(this.config.cwd))throw releaseError("Pinned wrangler not installed; run npm ci");
+  }
   async prepare(target,commit){
     if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw releaseError("Candidate build checkout mismatch");
     const t=this.config.targets[target];if(!t)throw releaseError("Target host config required");
@@ -1865,8 +1880,10 @@ export class HostAdapter {
     const baselines=this.baselines||this.config.baselines;
     artifact.schemaChanged=["hub","bridge"].includes(target) && schemaChanged(this.config.cwd,baselines.hub,commit);
     if(target==="tailos"){
-      if(diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
+      if(this.installedFor!==commit && diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
       this.command(["npm","run","build:static"]);this.command(["npm","run","verify:release"]);
+      // A resumed run skips the pre-publication check; the deploy needs it.
+      if(!pinnedWrangler(this.config.cwd))throw releaseError("Pinned wrangler not installed; run npm ci");
       const manifest=JSON.parse(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
       if(manifest.commit!==commit)throw releaseError("Static commit mismatch");
       artifact.artifactSHA256=digest(readFileSync(join(this.config.cwd,"dist-static/release.json"),"utf8"));
@@ -1980,7 +1997,8 @@ export class HostAdapter {
       this.command(a.hostSetup||[a.artifactPath,"host","setup","--from",a.artifactPath]);
       if(fileDigest(a.installPath)!==a.artifactSHA256)throw releaseError("Mini install does not match the pinned artifact");
     }else{
-      const output=this.command(["npx","wrangler","pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",a.commit,"--commit-dirty=false"]);
+      const bin=pinnedWrangler(this.config.cwd);if(!bin)throw releaseError("Pinned wrangler not installed; run npm ci");
+      const output=this.command([bin,"pages","deploy","dist-static","--project-name","tailos","--branch","main","--commit-hash",a.commit,"--commit-dirty=false"]);
       // Output is kept out of messages/receipts; a host probe supplies the
       // immutable deployment ID only after independently resolving it.
       const match=output.match(/https:\/\/([a-f0-9]{8})\.tailos\.pages\.dev/);if(!match)throw releaseError("TailOS deployment identity unconfirmed");a.deployment=match[0];
@@ -2035,7 +2053,12 @@ export class HostAdapter {
       // runs once so the journal shows the app state it left behind.
       try{this.command(a.rollbackProgram);}
       catch{try{this.readyWait(target,"rollback",JSON.parse(this.command(a.rollbackProbe)));}catch{}return false;}
-    }else{this.command(a.rollbackProgram);}
+    }else{
+      // A program recorded with the pinned binary needs it installed; one an
+      // older inputs script recorded (npx wrangler) runs as recorded.
+      if(a.rollbackProgram?.[0]===wranglerBin(this.config.cwd) && !pinnedWrangler(this.config.cwd))throw releaseError("Pinned wrangler not installed; run npm ci");
+      this.command(a.rollbackProgram);
+    }
     const r=JSON.parse(this.command(a.rollbackProbe));
     if(PAIR.includes(target))this.readyWait(target,"rollback",r);
     if(target==="tailos")this.probeWaits.set("tailos:rollback",{lastCommit:sha(r.lastCommit)?r.lastCommit:null,waitedMs:Number.isSafeInteger(r.waitedMs)&&r.waitedMs>=0?r.waitedMs:null});
