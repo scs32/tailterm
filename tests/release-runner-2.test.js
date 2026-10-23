@@ -412,6 +412,13 @@ test("p3 a backup or rehearsal copy that cannot be unlinked is recorded once ove
  try{for(const n of [1,2]){assert.throws(()=>sweep(r,jobs,{}),/EACCES|EPERM/,"sweep "+n);assert.deepEqual(r.lines(),[rehearsal],"sweep "+n);}}finally{chmodSync(join(r.dir,state),0o700);}
  assert.deepEqual(sweep(r,jobs,{}),[]);assert.deepEqual(r.names(),[]);assert.deepEqual(r.lines(),[rehearsal]);
 });
+test("an old TailOS dist folder that cannot be removed is recorded once over two sweeps and goes later without a second line",()=>{
+ // The folder refuses the removal of its own entries, so it and its index stay.
+ const j=distFixture(2,3,4,5),record=distRecord("rel_2",2,"count");chmodSync(join(j.dir,DIST(2)),0o500);
+ try{for(const n of [1,2]){assert.throws(()=>sweepAt(j,fiveReleased(),{}),/EACCES|EPERM|ENOTEMPTY/,"sweep "+n);assert.deepEqual(j.lines(),[record],"sweep "+n);}}finally{chmodSync(join(j.dir,DIST(2)),0o700);}
+ assert.ok(existsSync(join(j.dir,DIST(2),"index.html")));
+ assert.deepEqual(sweepAt(j,fiveReleased(),{}),[],"the earlier line already records it");assert.deepEqual(j.names(),[DIST(3),DIST(4),DIST(5)]);assert.deepEqual(j.lines(),[record]);
+});
 test("a8 retention defaults apply, an invalid value stops the daemon before any command, and a failed sweep does not hold the poll",async()=>{
  assert.deepEqual(retentionPolicy({}),{releasedBackups:3,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:3});assert.deepEqual(retentionPolicy({retention:{releasedBackups:0,attemptDays:0}}),{releasedBackups:0,backupBudgetBytes:4294967296,releasedDists:3,attemptDays:0});
  const cwd=mkdtempSync(join(tmpdir(),"release-retention-daemon-")),log=join(cwd,"calls"),fakeTT=join(cwd,"tt");

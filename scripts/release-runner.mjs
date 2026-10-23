@@ -2382,7 +2382,11 @@ export function retentionPolicy(config){
 // Every removal is appended to retention.jsonl before it happens. A file
 // whose earlier record is already there (its removal failed or was stopped) is
 // removed again without a second line: a terminal job's file names are never
-// made again. Returns the records written.
+// made again. A dist folder follows the same rule by job, name and kind,
+// though its name can be made again when that commit is rebuilt: a rebuilt
+// copy removed for the same job goes without a new line, since the earlier one
+// already records that job's copy, and one removed for another job gets its own.
+// Returns the records written.
 const DIST=/^tailos-dist-([a-f0-9]{40})$/,ATTEMPT_KEPT=["receipt.json","context.json","plan.json","plan.preserved.json","run.json","run.json.set-aside"];
 export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
   const policy=retentionPolicy(config),dir=config.journalDirectory,records=[];
@@ -2474,7 +2478,8 @@ export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
       const owner=released.get(commit),left=carried.get(commit);
       if(!owner && !(left && left.at<oldest))continue;
       const bytes=treeBytes(join(dir,name));if(bytes===null)continue;
-      recorded(owner?owner.id:left.id,name,"dist",bytes,owner?"count":"not-released",()=>rmSync(join(dir,name),{recursive:true}));
+      const jobId=owner?owner.id:left.id,gone=()=>rmSync(join(dir,name),{recursive:true});
+      if(logged.has(key(jobId,name,"dist")))gone();else recorded(jobId,name,"dist",bytes,owner?"count":"not-released",gone);
     }
   }
   function pruneAttempts(){
