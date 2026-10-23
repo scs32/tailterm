@@ -1470,3 +1470,22 @@ test("WASM prerequisite: with shared caches two fresh worktrees rebuild with the
   console.log(`wasm rebuild runs: cold ${runs[0].seconds} s (+${runs[0].growth} build bytes), ` +
     `fresh worktree ${runs[1].seconds} s (+${runs[1].growth})`);
 });
+
+// wi_5a4491949182661c: Playwright's own per-OS browser cache, not the macOS
+// path on every OS; an explicit PLAYWRIGHT_BROWSERS_PATH wins unchanged.
+test("browser checks use Playwright's per-OS browser cache", () => {
+  const { playwrightBrowsersPath } = matrixRunner;
+  const home = "/home/verifier";
+  assert.equal(playwrightBrowsersPath({ HOME: "/Users/verifier" }, "darwin"), "/Users/verifier/Library/Caches/ms-playwright");
+  assert.equal(playwrightBrowsersPath({ HOME: "/Users/verifier", XDG_CACHE_HOME: "/xdg" }, "darwin"), "/Users/verifier/Library/Caches/ms-playwright");
+  assert.equal(playwrightBrowsersPath({ HOME: home }, "linux"), "/home/verifier/.cache/ms-playwright");
+  assert.equal(playwrightBrowsersPath({ HOME: home, XDG_CACHE_HOME: "/xdg" }, "linux"), "/xdg/ms-playwright");
+  assert.equal(playwrightBrowsersPath({ HOME: home, XDG_CACHE_HOME: "" }, "linux"), "/home/verifier/.cache/ms-playwright");
+  for (const platform of ["darwin", "linux"]) {
+    for (const named of ["/srv/browsers", "0"])
+      assert.equal(playwrightBrowsersPath({ HOME: home, XDG_CACHE_HOME: "/xdg", PLAYWRIGHT_BROWSERS_PATH: named }, platform), named, platform);
+  }
+  // The default reads the runner's environment and platform.
+  assert.equal(playwrightBrowsersPath(), process.env.PLAYWRIGHT_BROWSERS_PATH ||
+    (process.platform === "darwin" ? join(process.env.HOME, "Library/Caches/ms-playwright") : join(process.env.XDG_CACHE_HOME || join(process.env.HOME, ".cache"), "ms-playwright")));
+});

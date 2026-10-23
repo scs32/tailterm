@@ -1298,6 +1298,15 @@ export function verificationCacheRoot(environment = process.env) {
   const xdg = environment.XDG_CACHE_HOME;
   return join(xdg && isAbsolute(xdg) ? xdg : join(home, ".cache"), "tailterm-verification");
 }
+// Playwright's own browser cache rule: an explicit PLAYWRIGHT_BROWSERS_PATH,
+// else ~/Library/Caches on macOS, else $XDG_CACHE_HOME or ~/.cache. Read from
+// the runner's environment, not the verifier home that replaces HOME.
+export function playwrightBrowsersPath(environment = process.env, platform = process.platform) {
+  if (environment.PLAYWRIGHT_BROWSERS_PATH) return environment.PLAYWRIGHT_BROWSERS_PATH;
+  const home = environment.HOME || homedir();
+  if (platform === "darwin") return join(home, "Library", "Caches", "ms-playwright");
+  return join(environment.XDG_CACHE_HOME || join(home, ".cache"), "ms-playwright");
+}
 const GENERATION = /^gen-[a-f0-9]{16}$/;
 const BUILD_OUTPUT = /^[0-9a-f]{64}-d$/;
 const BUILD_INDEX = /^[0-9a-f]{64}-a$/;
@@ -3020,9 +3029,7 @@ async function executeHeldPlan(plan, cwd, output, options, receiptName, makeRece
     if (caches.line) print(caches.line);
     // No inherited task/hub credentials, runtime config, vault or tmux socket.
     if (plan.checks.some(isBrowserCheck)) {
-      environment.PLAYWRIGHT_BROWSERS_PATH =
-        process.env.PLAYWRIGHT_BROWSERS_PATH ||
-        join(process.env.HOME, "Library/Caches/ms-playwright");
+      environment.PLAYWRIGHT_BROWSERS_PATH = playwrightBrowsersPath();
     }
     if (abortSignal?.aborted)
       throw new Error("Verification interrupted by " + abortSignal.reason);
