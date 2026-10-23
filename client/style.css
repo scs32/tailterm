@@ -4394,6 +4394,8 @@ html:fullscreen {
 .task-actions > .fine {
   flex-basis: 100%;
   margin-bottom: 4px;
+  /* Wrap the label between words only, never inside one. */
+  overflow-wrap: normal;
 }
 .files-view {
   border: 1px solid color-mix(in srgb, var(--muted) 20%, transparent);
@@ -4575,7 +4577,7 @@ html:fullscreen {
   align-items: center;
 }
 .task-card .task-actions > .fine {
-  flex: 1;
+  flex: 1 1 auto;
   margin: 0;
 }
 .task-more {
@@ -5182,8 +5184,7 @@ html:fullscreen {
     max-width: none;
   }
   #mode-view .task-actions > .fine {
-    flex-basis: auto;
-    flex: 1;
+    flex: 1 1 auto;
     text-align: left;
   }
 }

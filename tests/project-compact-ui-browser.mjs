@@ -113,7 +113,7 @@ try {
   for (const engine of [chromium, webkit]) {
     const browser = await engine.launch();
     try {
-      for (const width of [1440, 390])
+      for (const width of [1440, 1200, 390])
         for (const count of [0, 1, 12]) {
           const context = await browser.newContext({
             viewport: { width, height: 900 },
@@ -148,6 +148,47 @@ try {
               await expect(toggle).toHaveCount(count ? 1 : 0);
               await expect(page.locator(".hub-sync-status")).toHaveCount(0);
               await expect(page.locator(".compose-note")).toHaveCount(0);
+              if (mode === "tasks") {
+                // The footer label wraps only between words, in the app shell
+                // and in a view mounted without it.
+                const splitWords = () =>
+                  page.evaluate(() => {
+                    const text = document.querySelector(
+                      ".task-detail-card .task-actions > .fine",
+                    ).firstChild;
+                    return [...text.data.matchAll(/\S+/g)]
+                      .filter((m) => {
+                        const range = document.createRange();
+                        range.setStart(text, m.index);
+                        range.setEnd(text, m.index + m[0].length);
+                        const tops = [...range.getClientRects()].map((r) =>
+                          Math.round(r.top),
+                        );
+                        return new Set(tops).size !== 1;
+                      })
+                      .map((m) => m[0]);
+                  });
+                assert.deepEqual(
+                  await splitWords(),
+                  [],
+                  "label in shell keeps whole words",
+                );
+                await page.evaluate(
+                  () =>
+                    (document.querySelector("#mode-view").id =
+                      "unshelled-view"),
+                );
+                assert.deepEqual(
+                  await splitWords(),
+                  [],
+                  "label without shell keeps whole words",
+                );
+                await page.evaluate(
+                  () =>
+                    (document.querySelector("#unshelled-view").id =
+                      "mode-view"),
+                );
+              }
               if (!count) continue;
               await page.evaluate(() => {
                 window.savedViewHeading = document.querySelector(".board-head");
