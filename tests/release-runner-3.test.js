@@ -350,6 +350,17 @@ test("wrangler w2 a missing pinned wrangler refuses the job before publication a
  assert.ok(r.a.calls.includes("refuse"));assert.ok(!r.a.calls.includes("merged"));assert.ok(!r.a.calls.some(c=>String(c).startsWith("deploy:")));
  assert.equal(git(g.cwd,"rev-parse","refs/heads/tasks-hub"),before);
 });
+test("wrangler w2 a claim lost while releaseTools runs is refused unpublished: the fence check stays directly before publication",async()=>{
+ const g=fixture(),j=job(g,change(g,"client/a.js","a")),before=git(g.cwd,"rev-parse","refs/heads/tasks-hub");let lost=false,after=0;
+ const r=await journalOf(g,j,a=>{
+  a.releaseTools=async()=>{a.calls.push("releaseTools");lost=true;};
+  a.fence=async()=>{if(lost)after++;return !lost;};
+ });
+ assert.ok(after>=1,"a fence check after releaseTools");assert.equal(r.journal.refusalReason,"release fence lost");
+ assert.notEqual(r.journal.published,true);assert.deepEqual(r.journal.effects,[]);
+ assert.ok(r.a.calls.includes("releaseTools"));assert.ok(r.a.calls.includes("refuse"));assert.ok(!r.a.calls.includes("merged"));assert.ok(!r.a.calls.some(c=>String(c).startsWith("deploy:")));
+ assert.equal(git(g.cwd,"rev-parse","refs/heads/tasks-hub"),before);
+});
 test("wrangler w2 releaseTools refuses a missing binary, a different installed version and a non-exact pin",async()=>{
  const g=fixture(),commit=change(g,"client/a.js","a");git(g.cwd,"checkout","--detach",commit);
  const tagged=e=>failureReason(e)===WRANGLER_TAG;

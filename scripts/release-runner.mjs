@@ -1244,12 +1244,12 @@ export async function runRelease(config, adapter) {
     }
     const windowWait=await quietWindow(selected);if(windowWait)return windowWait;
     if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
-    await fence();
     // w2: the pinned wrangler is installed (npm ci when the lockfile changed)
     // and checked before publication, so a missing one refuses the job
-    // unpublished with no target deployed.
+    // unpublished with no target deployed. It runs before the fence check, so
+    // a claim lost during npm ci is still found unpublished.
     if(selected.includes("tailos") && adapter.releaseTools){begin({step:"prepare",target:"tailos"});await adapter.releaseTools(integration.integrated);step=null;}
-    publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
+    await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;
