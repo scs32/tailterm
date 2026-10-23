@@ -1005,7 +1005,7 @@ Send lead a short set of material objections, each with evidence, impact and a r
 
 ## Coordinated swarm
 
-An Astra orchestrator and four Luna workers sharing one broadcast conversation.
+One Claude Opus orchestrator and four GPT-6 Luna workers sharing one broadcast conversation.
 
 **Use for:** Exploration or implementation with genuinely separable assignments. Start with four workers; add more only when useful work remains.
 

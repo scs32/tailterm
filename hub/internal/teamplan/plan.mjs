@@ -45,6 +45,14 @@ const opus = "claude-opus-5-5",
   sonnet = "claude-sonnet-5-5",
   astra = "gpt-6-astra",
   luna = "gpt-6-luna";
+// Display names for template summaries that describe their seats' models.
+const modelNames = {
+  [opus]: "Claude Opus",
+  [sonnet]: "Claude Sonnet",
+  [astra]: "GPT-6 Astra",
+  [luna]: "GPT-6 Luna",
+};
+const modelName = (id) => modelNames[id] || id;
 // The one Start rule for a team queue entry, and the sentence that says which
 // revisions it means. hub/cmd/tt/coordination.go (queueTeamStartRule,
 // queueTeamStartAmendmentRule) carries the same sentences, and
@@ -533,8 +541,12 @@ Send lead a short set of material objections, each with evidence, impact and a r
     name: "Coordinated swarm",
     swarm: true,
     orchestrator: "orchestrator",
-    summary:
-      "An Astra orchestrator and four Luna workers sharing one broadcast conversation.",
+    // Read from the seats so a model change cannot leave the summary stale.
+    get summary() {
+      const orchestrator = this.members.find((m) => m.name === this.orchestrator),
+        worker = this.members.find((m) => m !== orchestrator);
+      return `One ${modelName(orchestrator.model)} orchestrator and four ${modelName(worker.model)} workers sharing one broadcast conversation.`;
+    },
     fit: "Exploration or implementation with genuinely separable assignments. Start with four workers; add more only when useful work remains.",
     goal: "In <repository or source set>, achieve <outcome>. Split <independent areas> among workers. Acceptance: <checks>. Stop at <scope boundary>.",
     workflow:
