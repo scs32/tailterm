@@ -994,9 +994,12 @@ type launchFaultHub struct {
 	counts    map[string]int
 	listFault *api.HTTPError
 	listing   func(*api.TeamQueueList)
-	// once holds requests the hub leaves unanswered one time each.
+	// once holds requests the hub leaves unanswered, or answers with a
+	// chosen refusal, one time each.
 	once []*unansweredOnce
-	srv  *httptest.Server
+	// requests counts every request by method and path.
+	requests map[string]int
+	srv      *httptest.Server
 }
 
 // unansweredOnce is one request the fault hub does not answer: it holds a
@@ -1005,15 +1008,35 @@ type launchFaultHub struct {
 type unansweredOnce struct {
 	match func(*http.Request) bool
 	drop  bool
-	hits  int
+	// landed serves the request before leaving its response unanswered: a
+	// write that took effect whose answer was lost.
+	landed bool
+	// refusal answers the request with this status instead.
+	refusal *api.HTTPError
+	hits    int
 }
 
 func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 	t.Helper()
-	h := &launchFaultHub{faults: map[string]*api.HTTPError{}, counts: map[string]int{}}
+	h := &launchFaultHub{faults: map[string]*api.HTTPError{}, counts: map[string]int{}, requests: map[string]int{}}
 	inner := server.New(f.st, func(*http.Request) (api.Caller, error) { return api.Caller{Node: "team-fixture", User: "owner"}, nil })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		h.requests[r.Method+" "+r.URL.Path]++
+		h.mu.Unlock()
 		if fault := h.takeOnce(r); fault != nil {
+			if fault.refusal != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(fault.refusal.Status)
+				_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: fault.refusal.Msg})
+				return
+			}
+			if fault.landed {
+				inner.ServeHTTP(httptest.NewRecorder(), r)
+			}
+			// The server notices a caller that gave up only once the body
+			// is read, so a stalled write ends with its caller.
+			_, _ = io.Copy(io.Discard, r.Body)
 			if fault.drop {
 				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
 					conn.Close()
@@ -1097,6 +1120,39 @@ func (h *launchFaultHub) unanswered(match func(*http.Request) bool, drop bool) *
 	fault := &unansweredOnce{match: match, drop: drop}
 	h.once = append(h.once, fault)
 	return fault
+}
+
+// landedOnce serves the next request that matches and then leaves it
+// unanswered until the caller times out.
+func (h *launchFaultHub) landedOnce(match func(*http.Request) bool) *unansweredOnce {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fault := &unansweredOnce{match: match, landed: true}
+	h.once = append(h.once, fault)
+	return fault
+}
+
+// refuseOnce answers the next request that matches with status and msg.
+func (h *launchFaultHub) refuseOnce(match func(*http.Request) bool, status int, msg string) *unansweredOnce {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fault := &unansweredOnce{match: match, refusal: &api.HTTPError{Status: status, Msg: msg}}
+	h.once = append(h.once, fault)
+	return fault
+}
+
+// hits counts the requests the hub received with method whose path starts
+// with prefix.
+func (h *launchFaultHub) hits(method, prefix string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for key, count := range h.requests {
+		if strings.HasPrefix(key, method+" "+prefix) {
+			n += count
+		}
+	}
+	return n
 }
 
 func (h *launchFaultHub) takeOnce(r *http.Request) *unansweredOnce {
@@ -4888,5 +4944,319 @@ func TestTeamRunnerCloseoutRealCleanupTimeoutRetries(t *testing.T) {
 	}
 	if a, err := f.c.GetAgent(ctx, f.task.ID, lead.ID); err != nil || !a.CleanupDone || len(launchNotices(t, f, launchFailedSubject, q.ID)) != 0 {
 		t.Fatalf("member after cleanup %+v %v", a, err)
+	}
+}
+
+// Hub timeouts in the lead claim, the post-spawn registration read and the
+// team close write (wi_fa522a5f0f48c870, order #44435). The runner talks to
+// the fault hub through a 1 s client; only the exact matched request stalls.
+
+// faultClient is the runner's client for these tests.
+func faultClient(t *testing.T, hub *launchFaultHub) *api.Client {
+	t.Helper()
+	c, err := api.NewClient(hub.e.hub, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func exactRequest(method, path string) func(*http.Request) bool {
+	return func(r *http.Request) bool { return r.Method == method && r.URL.Path == path }
+}
+
+// queueEntry reads the entry and its frozen journal.
+func queueEntry(t *testing.T, f teamFixture, id string) (api.TeamQueueEntry, teamLaunchJournal) {
+	t.Helper()
+	got, err := f.c.GetTeamQueueEntry(context.Background(), f.task.ID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var journal teamLaunchJournal
+	if len(got.LaunchJSON) > 0 {
+		if err := json.Unmarshal(got.LaunchJSON, &journal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return got, journal
+}
+
+// unfailed checks an entry in state with no failure, notice or fail write.
+func unfailed(t *testing.T, f teamFixture, hub *launchFaultHub, id, step, state string) teamLaunchJournal {
+	t.Helper()
+	got, journal := queueEntry(t, f, id)
+	if got.State != state || got.Failure != "" || got.EscalationSeq != 0 || hub.count("fail") != 0 || len(launchNotices(t, f, launchFailedSubject, id)) != 0 {
+		t.Fatalf("%s: state=%s (want %s) failure=%q escalation=%d fails=%d", step, got.State, state, got.Failure, got.EscalationSeq, hub.count("fail"))
+	}
+	return journal
+}
+
+// h3, h4: a serial lead claim that gets no response leaves the entry
+// launching and backs off; the next launch claims the lead (or finds the
+// claim that landed) and spawns the member once.
+func TestTeamRunnerLeadClaimTimeoutBacksOffThenLaunches(t *testing.T) {
+	for _, landed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("landed=%v", landed), func(t *testing.T) {
+			f, hub, q, runner, now, spawns := launchRetryFixture(t)
+			c := faultClient(t, hub)
+			ctx := context.Background()
+			path := "/v1/tasks/" + f.task.ID
+			var stall *unansweredOnce
+			if landed {
+				stall = hub.landedOnce(exactRequest("PATCH", path))
+			} else {
+				stall = hub.unanswered(exactRequest("PATCH", path), false)
+			}
+			start := *now
+			tick := func(at time.Duration) error {
+				*now = start.Add(at)
+				return runner.tick(ctx, hub.e, c, "fixture")
+			}
+			if err := tick(0); err == nil || !strings.Contains(err.Error(), "claim lead") || !strings.Contains(err.Error(), "Client.Timeout exceeded") {
+				t.Fatalf("claim timeout: %v", err)
+			}
+			unfailed(t, f, hub, q.ID, "after the timeout", "launching")
+			if !hub.fired(stall) || hub.hits("PATCH", path) != 1 || *spawns != 0 {
+				t.Fatalf("claim: stalled=%v patches=%d spawns=%d", hub.fired(stall), hub.hits("PATCH", path), *spawns)
+			}
+			if err := tick(launchRetryFirstDelay - time.Second); err != nil || hub.hits("PATCH", path) != 1 || *spawns != 0 {
+				t.Fatalf("tick inside the backoff: %v patches=%d spawns=%d", err, hub.hits("PATCH", path), *spawns)
+			}
+			if err := tick(launchRetryFirstDelay); err != nil {
+				t.Fatal(err)
+			}
+			journal := unfailed(t, f, hub, q.ID, "after the backoff", "running")
+			want := 2
+			if landed {
+				want = 1 // The next launch reads the claim that landed.
+			}
+			if hub.hits("PATCH", path) != want || *spawns != 1 {
+				t.Fatalf("relaunch: patches=%d (want %d) spawns=%d", hub.hits("PATCH", path), want, *spawns)
+			}
+			detail, err := f.c.GetTask(ctx, f.task.ID)
+			if err != nil || detail.Task.Orchestrator != journal.Members[0].Fields.Name {
+				t.Fatalf("orchestrator %q %v", detail.Task.Orchestrator, err)
+			}
+		})
+	}
+}
+
+// h3, h4: a lead claim the hub refuses still fails the entry at once.
+func TestTeamRunnerLeadClaimRefusalFails(t *testing.T) {
+	f, hub, q, runner, now, spawns := launchRetryFixture(t)
+	c := faultClient(t, hub)
+	ctx := context.Background()
+	hub.refuseOnce(exactRequest("PATCH", "/v1/tasks/"+f.task.ID), 403, "forbidden")
+	if err := runner.tick(ctx, hub.e, c, "fixture"); err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("refused claim: %v", err)
+	}
+	got, _ := queueEntry(t, f, q.ID)
+	if got.State != "failed" || !strings.Contains(got.Failure, "forbidden") || *spawns != 0 {
+		t.Fatalf("entry %s failure %q spawns %d", got.State, got.Failure, *spawns)
+	}
+	*now = now.Add(launchRetryMaxDelay)
+	_ = runner.tick(ctx, hub.e, c, "fixture")
+	if *spawns != 0 {
+		t.Fatalf("spawned after a refused claim: %d", *spawns)
+	}
+}
+
+// registrationReadFixture is a one-member launch whose spawn registers the
+// member and then arms fault, when set, on the runner's next read of that
+// exact agent.
+func registrationReadFixture(t *testing.T, fault func(hub *launchFaultHub, match func(*http.Request) bool)) (teamFixture, *launchFaultHub, api.TeamQueueEntry, *teamRunner, *time.Time, *int, *api.Client) {
+	t.Helper()
+	f, hub, q, runner, now, spawns := launchRetryFixture(t)
+	spawn := runner.spawn
+	runner.spawn = func(e env, args []string) error {
+		if err := spawn(e, args); err != nil {
+			return err
+		}
+		for i := 0; i+1 < len(args); i += 2 {
+			if args[i] == "--agent-id" && fault != nil {
+				fault(hub, exactRequest("GET", "/v1/tasks/"+f.task.ID+"/agents/"+args[i+1]))
+			}
+		}
+		return nil
+	}
+	return f, hub, q, runner, now, spawns, faultClient(t, hub)
+}
+
+// h2, h4: a post-spawn registration read that gets no response leaves the
+// member uncertain; after the backoff the runner reads the exact agent and
+// run back and starts it without spawning again, also when that read-back
+// faults once more or the relay restarted.
+func TestTeamRunnerPostSpawnRegistrationTimeoutStartsWithoutRespawn(t *testing.T) {
+	for _, mode := range []string{"plain", "read-back faults too", "relay restart"} {
+		t.Run(mode, func(t *testing.T) {
+			var stall *unansweredOnce
+			f, hub, q, runner, now, spawns, c := registrationReadFixture(t, func(hub *launchFaultHub, match func(*http.Request) bool) {
+				stall = hub.unanswered(match, false)
+			})
+			ctx := context.Background()
+			start := *now
+			tick := func(at time.Duration) error {
+				*now = start.Add(at)
+				return runner.tick(ctx, hub.e, c, "fixture")
+			}
+			if err := tick(0); err == nil || !strings.Contains(err.Error(), "spawn registration") || !strings.Contains(err.Error(), "Client.Timeout exceeded") {
+				t.Fatalf("registration read timeout: %v", err)
+			}
+			journal := unfailed(t, f, hub, q.ID, "after the timeout", "launching")
+			if !hub.fired(stall) || len(journal.Members) != 1 || journal.Members[0].State != "uncertain" || *spawns != 1 {
+				t.Fatalf("after the timeout: stalled=%v members=%+v spawns=%d", hub.fired(stall), journal.Members, *spawns)
+			}
+			frozen := journal.Members[0]
+			agentPath := "/v1/tasks/" + f.task.ID + "/agents/" + frozen.Fields.AgentID
+			if err := tick(launchRetryFirstDelay - time.Second); err != nil || hub.count("attempt") != 1 || *spawns != 1 {
+				t.Fatalf("tick inside the backoff: %v attempts=%d spawns=%d", err, hub.count("attempt"), *spawns)
+			}
+			at := launchRetryFirstDelay
+			switch mode {
+			case "read-back faults too":
+				again := hub.unanswered(exactRequest("GET", agentPath), false)
+				if err := tick(at); err == nil || !strings.Contains(err.Error(), "read back registration") {
+					t.Fatalf("read-back fault: %v", err)
+				}
+				if !hub.fired(again) || unfailed(t, f, hub, q.ID, "after the read-back fault", "launching").Members[0].State != "uncertain" {
+					t.Fatal("read-back fault left the member started or did not fire")
+				}
+				at += launchRetryDelay(2)
+			case "relay restart":
+				runner.retries = &launchRetryBook{}
+			}
+			if err := tick(at); err != nil {
+				t.Fatal(err)
+			}
+			member := unfailed(t, f, hub, q.ID, "after the read-back", "running").Members[0]
+			if member.State != "started" || member.Fields.AgentID != frozen.Fields.AgentID || member.RunID != frozen.RunID || *spawns != 1 || hub.count("attempt") != 1 {
+				t.Fatalf("started %+v from %+v spawns=%d attempts=%d", member, frozen, *spawns, hub.count("attempt"))
+			}
+			if a, err := f.c.GetAgent(ctx, f.task.ID, frozen.Fields.AgentID); err != nil || a.RunID != frozen.RunID || a.Status == api.AgentClosed {
+				t.Fatalf("member %+v %v", a, err)
+			}
+		})
+	}
+}
+
+// h2, h4: a registration read the hub answered with a refusal, or one that
+// shows a closed registration, still fails the entry and never respawns.
+func TestTeamRunnerPostSpawnRegistrationDefiniteErrorFails(t *testing.T) {
+	for _, mode := range []string{"refused", "closed"} {
+		t.Run(mode, func(t *testing.T) {
+			f, hub, q, runner, now, spawns, c := registrationReadFixture(t, func(hub *launchFaultHub, match func(*http.Request) bool) {
+				if mode == "refused" {
+					hub.refuseOnce(match, 404, "agent not found")
+				}
+			})
+			if mode == "closed" {
+				spawn := runner.spawn
+				runner.spawn = func(e env, args []string) error {
+					if err := spawn(e, args); err != nil {
+						return err
+					}
+					flags := map[string]string{}
+					for i := 0; i+1 < len(args); i += 2 {
+						flags[args[i]] = args[i+1]
+					}
+					_, err := f.c.CloseAgent(context.Background(), flags["--task"], flags["--agent-id"], flags["--expected-run-id"])
+					return err
+				}
+			}
+			ctx := context.Background()
+			if err := runner.tick(ctx, hub.e, c, "fixture"); err == nil || !strings.Contains(err.Error(), "spawn registration") {
+				t.Fatalf("definite registration error: %v", err)
+			}
+			got, _ := queueEntry(t, f, q.ID)
+			if got.State != "failed" || !strings.HasPrefix(got.Failure, "spawn registration ") || got.EscalationSeq == 0 {
+				t.Fatalf("entry %s failure %q", got.State, got.Failure)
+			}
+			for i := 0; i < 3; i++ {
+				*now = now.Add(launchRetryMaxDelay)
+				_ = runner.tick(ctx, hub.e, c, "fixture")
+			}
+			if *spawns != 1 {
+				t.Fatalf("respawned after a definite registration error: %d spawns", *spawns)
+			}
+		})
+	}
+}
+
+// closeWriteFixture is a running one-member entry whose item was dismissed,
+// ticked through the fault hub with an isolated cleanup book and fake clock.
+func closeWriteFixture(t *testing.T) (teamFixture, *launchFaultHub, api.TeamQueueEntry, *teamRunner, *time.Time, *api.Client) {
+	t.Helper()
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	now := time.Now()
+	r := queueCorrectionRunner(t, f, 1)
+	r.cleanupPending = &cleanupPendingBook{}
+	r.now = func() time.Time { return now }
+	q := runningDismissedEntry(t, f, r)
+	return f, hub, q, &r, &now, faultClient(t, hub)
+}
+
+// h1, h4: a team close write that gets no response keeps the frozen close
+// request, waits out the first backoff, and then closes, cleans up and
+// finishes; a close that landed is found by its receipt, not repeated.
+func TestTeamRunnerCloseWriteTimeoutBacksOffThenFinishes(t *testing.T) {
+	for _, landed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("landed=%v", landed), func(t *testing.T) {
+			f, hub, q, runner, now, c := closeWriteFixture(t)
+			ctx := context.Background()
+			closePath := "/v1/tasks/" + f.task.ID + "/team-close"
+			var stall *unansweredOnce
+			if landed {
+				stall = hub.landedOnce(exactRequest("POST", closePath))
+			} else {
+				stall = hub.unanswered(exactRequest("POST", closePath), false)
+			}
+			start := *now
+			tick := func(at time.Duration) error {
+				*now = start.Add(at)
+				return runner.tick(ctx, hub.e, c, "fixture")
+			}
+			if err := tick(0); err == nil || !strings.Contains(err.Error(), "team close") || !strings.Contains(err.Error(), "Client.Timeout exceeded") {
+				t.Fatalf("close timeout: %v", err)
+			}
+			unfailed(t, f, hub, q.ID, "after the timeout", "running")
+			got, _ := queueEntry(t, f, q.ID)
+			receipts, posts := hub.hits("GET", closePath+"/receipts/"), hub.hits("POST", closePath)
+			if !hub.fired(stall) || len(got.CloseJSON) == 0 || receipts != 1 || posts != 1 {
+				t.Fatalf("close: stalled=%v closeJSON=%d receipts=%d posts=%d", hub.fired(stall), len(got.CloseJSON), receipts, posts)
+			}
+			if err := tick(launchRetryFirstDelay - time.Second); err != nil || hub.hits("GET", closePath+"/receipts/") != receipts || hub.hits("POST", closePath) != posts {
+				t.Fatalf("tick inside the backoff: %v receipts=%d posts=%d", err, hub.hits("GET", closePath+"/receipts/"), hub.hits("POST", closePath))
+			}
+			if err := tick(launchRetryFirstDelay); err != nil {
+				t.Fatal(err)
+			}
+			unfailed(t, f, hub, q.ID, "after the backoff", "finished")
+			want := 2
+			if landed {
+				want = 1 // The receipt read finds the close that landed.
+			}
+			if hub.hits("POST", closePath) != want || len(runner.cleanupPending.entries) != 0 {
+				t.Fatalf("finish: posts=%d (want %d) pending=%v", hub.hits("POST", closePath), want, runner.cleanupPending.entries)
+			}
+		})
+	}
+}
+
+// h1, h4: a team close write the hub answered with an error other than the
+// two waits still fails the entry at once.
+func TestTeamRunnerCloseWriteAnsweredErrorFails(t *testing.T) {
+	for _, status := range []int{400, 500} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			f, hub, q, runner, _, c := closeWriteFixture(t)
+			hub.refuseOnce(exactRequest("POST", "/v1/tasks/"+f.task.ID+"/team-close"), status, "close refused")
+			if err := runner.tick(context.Background(), hub.e, c, "fixture"); err == nil || !strings.Contains(err.Error(), "close refused") {
+				t.Fatalf("answered close error: %v", err)
+			}
+			got, _ := queueEntry(t, f, q.ID)
+			if got.State != "failed" || !strings.HasPrefix(got.Failure, "team close: ") {
+				t.Fatalf("entry %s failure %q", got.State, got.Failure)
+			}
+		})
 	}
 }

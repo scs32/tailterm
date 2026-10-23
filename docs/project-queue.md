@@ -958,10 +958,11 @@ replay it rather than post another. A launch that was already stalled when a
 permanent refusal began gets both the stall notice and, later, the failure
 notice: two events, each posted once.
 
-**Hub faults in member spawn and cleanup** (`wi_0cf7c5232a7d6636`, incident
-I-44170). A hub fault here is a hub call that got no response: a network
-error, a dropped connection or a timeout. A response the hub sent, any status
-included, is not one. Two such faults no longer fail the entry:
+**Hub faults in queue launch and closeout** (`wi_0cf7c5232a7d6636` and
+`wi_fa522a5f0f48c870`, incident I-44170). A hub fault here is a hub call that
+got no response: a network error, a dropped connection or a timeout. A
+response the hub sent, any status included, is not one. Five such faults no
+longer fail the entry:
 
 - **Member cleanup.** When a member's cleanup at closeout fails only with hub
   faults, the entry stays `running` under its frozen close request, as for a
@@ -992,13 +993,35 @@ included, is not one. Two such faults no longer fail the entry:
   stays `uncertain` and is never respawned. A context read the hub refused, a
   lost registration response and every other spawn error still fail the entry
   at once.
+- **Lead claim.** A serial launch names its lead as the project orchestrator
+  before the first spawn. When that write gets no response, the entry stays
+  `launching` and backs off as above. The claim may have landed, so the next
+  launch reads the project again and claims only if no orchestrator is set.
+  A claim the hub answered with an error still fails the entry at once.
+- **Post-spawn registration read.** After a member's spawn returns, the
+  runner reads the member's registration back before recording it `started`.
+  The session already exists, and the hub recorded the member `uncertain` at
+  its `attempt`. When that read gets no response, the entry stays `launching`
+  and backs off as above. The next launch reads the registration of the exact
+  frozen agent and run again, and records the member `started` when its name,
+  host, item, revision and order match and it is not closed or exited. That
+  read-back never spawns, and a fault there backs off again. A relay restart
+  loses nothing, since the member's state is on the hub. A registration the
+  hub refused or that differs fails the entry under the never-respawn rule.
+- **Team close.** At closeout the runner freezes its close request on the
+  entry, reads that request's receipt and, if the hub has none, sends the
+  close. When the receipt read or the close gets no response, the entry stays
+  `running` and backs off as above, making no close call while it waits. The
+  next try uses the same frozen request and reads its receipt first, so a
+  close that landed before the fault is found, not sent again. The close's
+  two waits (open obligations, a changed team snapshot) are unchanged; any
+  other error the hub answered still fails the entry at once.
 
 The backoff and the refusal count live in the relay's memory. A relay restart
 retries at once and allows at most three more permanent refusals before the
 same fail, whose notice the hub still posts only once. Not covered: a launch
 whose earlier members are live while a later member's write keeps failing
-backs off but is not a stall, the claim step keeps its own handling, and the
-team close write itself is not retried after a hub fault.
+backs off but is not a stall.
 
 ## Team queue limit changes
 

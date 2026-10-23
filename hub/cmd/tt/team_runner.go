@@ -646,6 +646,17 @@ func (b *cleanupPendingBook) paced(key string, fault bool, now time.Time) {
 	s.retryAt = now.Add(launchRetryDelay(s.faults))
 }
 
+// fault records one more hub transport fault in a row for key, which need
+// not be waiting yet, and delays its next try on the launch backoff. The team
+// close write uses it (wi_fa522a5f0f48c870).
+func (b *cleanupPendingBook) fault(key string, now time.Time) {
+	if b == nil {
+		return
+	}
+	b.wait(key, now)
+	b.paced(key, true, now)
+}
+
 // backingOff reports whether the member's cleanup waits out a fault.
 func (b *cleanupPendingBook) backingOff(key string, now time.Time) bool {
 	if b == nil {
@@ -1830,6 +1841,12 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 	lead := journal.Members[0].Fields.Name
 	if !parallel && detail.Task.Orchestrator == "" {
 		if _, err := c.UpdateTask(ctx, q.TaskID, api.UpdateTaskRequest{Orchestrator: &lead, TeamLaunchToken: "queue-claim-" + q.ID}); err != nil {
+			if hubTransportFault(err) {
+				// The claim may have landed: the next launch reads the
+				// project again and skips a claim that already holds
+				// (wi_fa522a5f0f48c870).
+				return fmt.Errorf("claim lead %s: %w", lead, err)
+			}
 			return r.fail(ctx, c, q, err)
 		}
 	}
@@ -1875,6 +1892,11 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 				return r.reconcileRestore(ctx, c, q, i, *member, errors.New(fault.cause))
 			}
 			a, err := r.verifyMember(ctx, e, c, q, *member)
+			if hubTransportFault(err) {
+				// The member stays uncertain and is read back again after
+				// the backoff; this branch never spawns.
+				return fmt.Errorf("uncertain spawn %s: read back registration: %w", member.Fields.AgentID, err)
+			}
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w", member.Fields.AgentID, err))
 			}
@@ -1945,6 +1967,13 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			return r.fail(ctx, c, q, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
 		}
 		a, err := r.verifyMember(ctx, e, c, q, *member)
+		if hubTransportFault(err) {
+			// The session exists and the attempt left the member uncertain:
+			// after the backoff the uncertain branch above reads the exact
+			// agent and run back and never spawns it again
+			// (wi_fa522a5f0f48c870).
+			return fmt.Errorf("spawn registration %s: %w", f.Name, err)
+		}
 		if err != nil {
 			return r.fail(ctx, c, q, fmt.Errorf("spawn registration %s: %w", f.Name, err))
 		}
@@ -2036,13 +2065,28 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 	} else if err := json.Unmarshal(q.CloseJSON, &closeReq); err != nil {
 		return r.fail(ctx, c, q, err)
 	}
+	// A team close that got no response from the hub waits on the launch
+	// backoff under its frozen request; the next try reads the receipt first,
+	// so a close that landed is found, not repeated (wi_fa522a5f0f48c870).
+	closeKey := cleanupPendingKey(c.Base, q.ID, "team-close", closeReq.RequestID)
+	if r.cleanupPending.backingOff(closeKey, r.clock()) {
+		return nil
+	}
 	result, err := c.GetTeamCloseReceipt(ctx, q.TaskID, closeReq.RequestID)
 	if err != nil {
 		var response *api.HTTPError
 		if !errors.As(err, &response) || response.Status != 404 {
+			if hubTransportFault(err) {
+				r.cleanupPending.fault(closeKey, r.clock())
+				return fmt.Errorf("team close: %w", err)
+			}
 			return err
 		}
 		result, err = c.CloseItemTeam(ctx, q.TaskID, closeReq)
+		if hubTransportFault(err) {
+			r.cleanupPending.fault(closeKey, r.clock())
+			return fmt.Errorf("team close: %w", err)
+		}
 		if err != nil {
 			var response *api.HTTPError
 			if errors.As(err, &response) && response.Status == 409 && response.Code == "team-close-obligations" {
@@ -2057,6 +2101,7 @@ func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.Team
 			return r.fail(ctx, c, q, fmt.Errorf("team close: %w", err))
 		}
 	}
+	r.cleanupPending.drop(closeKey)
 	for _, m := range result.Members {
 		if m.Host != host {
 			r.cleanupPending.dropEntry(c.Base, q.ID)
