@@ -1357,8 +1357,10 @@ the same item.
 
 `tt team queue rebind --entry tqe_ID --source SEQ` moves an entry to the item's
 current revision. `SEQ` is the message that records the amendment; it must be
-linked to the item. The entry keeps its ID, position, order message, handler
-lease, ownership and frozen launch.
+primary-linked to the item at the item's current revision, which is newer than
+the entry's. The original work-order message, or any message linked only at an
+older revision, is refused. The entry keeps its ID, position, order message,
+handler lease, ownership and frozen launch.
 
 | Entry state | Rebind | Why |
 |---|---|---|
@@ -1382,7 +1384,9 @@ about the queue.
 The handler's sequence after an owner-approved amendment:
 
 1. Save the amendment to the item (a new item revision) and post or identify
-   its message.
+   its message, primary-linked to the item at that new revision. That message
+   is the rebind's `--source`; the original work-order message or an older
+   link is refused.
 2. Confirm scope for the entry's order at the new revision
    (`tt work-items scope confirm`). A rebind without it is refused with
    `confirm scope for revision N and order #SEQ, then tt team queue rebind ...`.

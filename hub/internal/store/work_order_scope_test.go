@@ -335,3 +335,41 @@ func TestWorkOrderBookkeepingAfterRebind(t *testing.T) {
 		t.Fatalf("entries %d %v: a rebind needs no replacement", entries, err)
 	}
 }
+
+// b1: with the live entry left at an older revision, bookkeeping that names
+// the entry's own order is refused with the entry's text; bookkeeping that
+// names another order keeps the generic scope refusal, also after the entry's
+// order is confirmed at the amended revision.
+func TestWorkOrderBookkeepingAmendedEntryRefusalOnlyForItsOrder(t *testing.T) {
+	for _, state := range []string{"queued", "running"} {
+		f := newRebindFixture(t, state == "running")
+		updated, source := f.amend(t, "one")
+		another, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "another order", RequestID: api.NewID("req"), WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: updated.Revision, Relationship: "primary"}}}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		save := func(order int64) error {
+			req := api.WorkOrderBookkeepingRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, OrderMessageSeq: order, SourceMessageSeq: source.Seq, Kind: "decision", QueueEntryID: f.entry.ID}
+			_, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, f.item.ID, req)
+			return err
+		}
+		generic := func(when string) {
+			t.Helper()
+			want := requireConfirmedTeamOrder(f.ctx, f.s.db, f.task.ID, f.item.ID, updated.Revision, another.Seq)
+			if want == nil {
+				t.Fatalf("%s %s: another order is confirmed", state, when)
+			}
+			if err := save(another.Seq); !errors.Is(err, api.ErrConflict) || err.Error() != want.Error() || strings.Contains(err.Error(), "entry ") {
+				t.Fatalf("%s %s: another order's refusal = %v, want the generic %q", state, when, err, want)
+			}
+		}
+
+		err = save(f.order.Seq)
+		if want := amendedEntryScopeRefusal(f.entry, updated.Revision); !errors.Is(err, api.ErrConflict) || err == nil || err.Error() != want.Error() {
+			t.Fatalf("%s: own order's refusal = %v, want %q", state, err, want)
+		}
+		generic("before confirmation")
+		f.confirm(t, updated)
+		generic("after confirmation")
+	}
+}

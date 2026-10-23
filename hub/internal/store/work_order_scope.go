@@ -373,7 +373,9 @@ func (s *Store) SaveWorkOrderBookkeeping(ctx context.Context, task, itemID strin
 		return api.WorkOrderBookkeepingReceipt{}, err
 	}
 	if err := requireConfirmedTeamOrder(ctx, tx, task, itemID, item.Revision, req.OrderMessageSeq); err != nil {
-		if queue.ID != "" && queue.ItemRevision != item.Revision && errors.Is(err, api.ErrConflict) {
+		// Only the entry's own order gets the entry's text; another order
+		// keeps the generic refusal.
+		if queue.ID != "" && queue.ItemRevision != item.Revision && queue.OrderMessageSeq == req.OrderMessageSeq && errors.Is(err, api.ErrConflict) {
 			return api.WorkOrderBookkeepingReceipt{}, amendedEntryScopeRefusal(queue, item.Revision)
 		}
 		return api.WorkOrderBookkeepingReceipt{}, err
