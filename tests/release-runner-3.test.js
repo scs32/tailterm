@@ -8,6 +8,7 @@ import {execFileSync,execFile,spawnSync} from "node:child_process";
 import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
+import {RELEASE_READ_ATTEMPTS} from "../scripts/release-inputs.mjs";
 import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
 test("m5 end to end: a matrix change no owner approval covers refuses the job by name and leaves tasks-hub alone",async()=>{
  const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11}]);
@@ -1301,4 +1302,71 @@ test("claim a16 a claim whose answer was lost is not sent again: the next poll r
  h.setJobs(JSON.parse(readFileSync(jobs,"utf8")));const before=h.claims().length;
  assert.equal(await h.poll(null,release),"");
  assert.equal(h.claims().length,before);assert.deepEqual(released,[["rel_lost","claimed",2,CODE_RUN]]);assert.equal(existsSync(join(h.home,"transport-wait.json")),false);
+});
+
+// Stale list snapshots on the poll's ledger read (wi_1ed244046bcbc1ce). The
+// fake hub fails the list pages a rule names, counted per kind over the
+// test: "first" is an active page with no token, "settled" the settled first
+// page and "bookend" an active page with a token and no cursor. One verified
+// job makes two bookends a pass: its detail's and the closing one.
+const STALE_LIST="tt: hub: 409 conflict: release: stale list snapshot",CLI_FAILED="A deployer CLI call failed";
+function staleHost(t,rules,extra=""){
+ const cwd=mkdtempSync(join(tmpdir(),"release-stale-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const faults=join(cwd,"faults.json");writeFileSync(faults,JSON.stringify({rules,seen:{}}));
+ const h=codeHost(t,cwd,`const page=a[1]!=='list'?a[1]:flag('--view')==='settled'?(a.includes('--after')?'settled-next':'settled'):a.includes('--after')?'active-next':a.includes('--snapshot')?'bookend':'first';
+const faults=JSON.parse(fs.readFileSync(${JSON.stringify(faults)},'utf8')),n=faults.seen[page]=(faults.seen[page]||0)+1;fs.writeFileSync(${JSON.stringify(faults)},JSON.stringify(faults));
+const rule=faults.rules.find(r=>r.page===page&&n>=r.from&&(r.to===null||n<=r.to));if(rule){fs.writeSync(2,rule.stderr+'\\n');process.exit(1);}`+extra);
+ const released=[],release=async c=>{released.push(c.job.id);return {jobId:c.job.id,outcome:"waiting_inputs"};};
+ const pages=kind=>h.calls().filter(c=>c.argv[1]==="list"&&(kind==="first"?!c.argv.includes("--snapshot"):kind==="bookend"?c.argv.includes("active")&&c.argv.includes("--snapshot")&&!c.argv.includes("--after"):true)).length;
+ const told=()=>h.sends().filter(s=>s.subject===CLI_FAILED),kept=()=>JSON.parse(readFileSync(join(h.home,"cli-failures.json"),"utf8")).failures;
+ return {h,released,release,pages,told,kept};
+}
+test("stale s1 a bookend refused stale once restarts the whole read: the job runs, the poll is not held and nothing is noticed",async t=>{
+ const s=staleHost(t,[{page:"bookend",from:1,to:1,stderr:STALE_LIST}]);s.h.setJobs([verifiedJob("rel_stale")]);
+ assert.equal(await s.h.poll(null,s.release),"");assert.deepEqual(s.released,["rel_stale"]);
+ // Two whole reads: the refused pass, then fresh summaries, the detail's bookend and the closing one.
+ assert.equal(s.pages("first"),2);assert.equal(s.pages("bookend"),3);assert.equal(s.h.calls().filter(c=>c.argv[1]==="get").length,2);
+ assert.deepEqual(s.told(),[]);
+ // The private record still keeps the refused try.
+ assert.deepEqual(s.kept().map(f=>[f.argv.slice(1,4).join(" "),f.stderr,f.count]),[["deployment list --view",STALE_LIST+"\n",1]]);
+ // The closing bookend refused once restarts the read the same way.
+ const c=staleHost(t,[{page:"bookend",from:2,to:2,stderr:STALE_LIST}]);c.h.setJobs([verifiedJob("rel_stale")]);
+ assert.equal(await c.h.poll(null,c.release),"");assert.deepEqual(c.released,["rel_stale"]);assert.equal(c.pages("first"),2);assert.deepEqual(c.told(),[]);
+});
+test("stale s1 a bookend refused stale on every pass holds the poll after the bound with one notice, and nothing is claimed",async t=>{
+ const s=staleHost(t,[{page:"bookend",from:1,to:null,stderr:STALE_LIST}]);s.h.setJobs([verifiedJob("rel_stale")]);
+ assert.equal(await s.h.poll(null,s.release),"Deployment poll held (tt deployment list exit 1); inspect native input or recovery evidence.\n");
+ assert.equal(s.pages("first"),RELEASE_READ_ATTEMPTS);assert.equal(s.pages("bookend"),RELEASE_READ_ATTEMPTS);assert.deepEqual(s.released,[]);assert.deepEqual(s.h.claims(),[]);
+ assert.equal(s.told().length,1);assert.equal(s.told()[0].text,cliFailureNotice({reason:"tt deployment list exit 1"},CODE_RUN).text);
+ assert.equal(s.kept().length,1);assert.equal(s.kept()[0].count,RELEASE_READ_ATTEMPTS);
+});
+test("stale s1 a bookend failure other than a stale snapshot holds the poll at once with no restart",async t=>{
+ for(const stderr of ["tt: hub: 409 conflict: release: generation changed","tt: hub: 404 not found: release job"]){
+  const s=staleHost(t,[{page:"bookend",from:1,to:null,stderr}]);s.h.setJobs([verifiedJob("rel_stale")]);
+  assert.match(await s.h.poll(null,s.release),/^Deployment poll held \(tt deployment list exit 1\)/);
+  assert.equal(s.pages("first"),1);assert.equal(s.pages("bookend"),1);assert.deepEqual(s.released,[]);assert.equal(s.told().length,1);
+ }
+ // A detail read that fails does not restart either.
+ const g=staleHost(t,[{page:"get",from:1,to:null,stderr:"tt: hub: 404 not found: release job"}]);g.h.setJobs([verifiedJob("rel_stale")]);
+ assert.match(await g.h.poll(null,g.release),/^Deployment poll held \(tt deployment get exit 1\)/);assert.equal(g.pages("first"),1);assert.equal(g.told().length,1);
+});
+test("stale s2 a stale refusal the read recovered from is not noticed when a later step of the same poll fails",async t=>{
+ // The summary read recovers from a refused settled page, then the detail read fails: only the detail is noticed.
+ const s=staleHost(t,[{page:"settled",from:1,to:1,stderr:STALE_LIST},{page:"get",from:1,to:null,stderr:"tt: hub: 404 not found: release job"}]);s.h.setJobs([verifiedJob("rel_stale")]);
+ assert.match(await s.h.poll(null,s.release),/^Deployment poll held \(tt deployment get exit 1\)/);assert.equal(s.pages("first"),2);
+ assert.deepEqual(s.told().map(n=>n.text),[cliFailureNotice({reason:"tt deployment get exit 1",jobId:null},CODE_RUN).text]);
+ assert.deepEqual(s.kept().map(f=>f.argv[2]),["list","get"]);
+ // A recovered bookend, then a release that is held: only the release's own failures would be noticed, and it has none.
+ const r=staleHost(t,[{page:"bookend",from:1,to:1,stderr:STALE_LIST}]);r.h.setJobs([verifiedJob("rel_stale")]);
+ assert.equal(await r.h.poll(null,async()=>{throw new Error("held");}),"Release held; inspect handler fence and private journal.\n");
+ assert.deepEqual(r.told(),[]);assert.equal(r.kept().length,1);
+});
+test("stale s1 a later job's bookend refused stale in the job loop ends the poll quietly: no restart, claim, hold or notice",async t=>{
+ // rel_first's claim is refused, so rel_next is read in the job loop; its bookend (the third) is refused stale.
+ const s=staleHost(t,[{page:"bookend",from:3,to:3,stderr:STALE_LIST}],`if(a[1]==='claim'&&flag('--job')==='rel_first'){fs.writeSync(2,'tt: hub: 409 conflict: release: candidate changed\\n');process.exit(1);}`+heldRoster);
+ s.h.setJobs([verifiedJob("rel_first"),verifiedJob("rel_next")]);
+ assert.equal(await s.h.poll(null,s.release),"Release claim held; handler reconciliation required.\nRelease ledger changed during the poll; the next poll reads it again.\n");
+ assert.equal(s.pages("first"),1);assert.deepEqual(s.h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),["rel_first"]);assert.deepEqual(s.released,[]);assert.deepEqual(s.told(),[]);
+ // The next poll reads afresh and runs the later job.
+ assert.equal(await s.h.poll(null,s.release),"Release claim held; handler reconciliation required.\n");assert.deepEqual(s.released,["rel_next"]);assert.deepEqual(s.told(),[]);
 });

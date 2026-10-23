@@ -1,4 +1,4 @@
-import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256 } from "./release-inputs.mjs";
+import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256, RELEASE_READ_ATTEMPTS } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -164,6 +164,11 @@ export const cliRetry = {tries: 3, delaysMs: [5000, 20000], windowMs: 60000, sle
 // cannot grow the file. A record that cannot be written is dropped. Every
 // failed try of a retried call is recorded, a later success notwithstanding.
 const CLI_FAILURES = 20, CLI_STDERR_BYTES = 16384;
+// The hub's refusal of a page whose ledger changed after its token was
+// issued, as HostAdapter.command keeps it: the shape release-inputs.mjs
+// restarts its summary read on.
+const STALE_SNAPSHOT = /\bhub: 409 [^\n]*\brelease: stale list snapshot\s*$/;
+const staleSnapshot = error => typeof error?.refusal === "string" && STALE_SNAPSHOT.test(error.refusal);
 // The hub's 409 for a native release call sent at a generation the job has
 // left (releaseConflict "generation changed"), as the CLI prints it. Only this
 // yes or no is taken from the child's stderr; none of its text is kept.
@@ -2646,23 +2651,38 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const configured=configPath?readBaselines(configPath):config.baselines;
     reader=new HostAdapter(config,{});
     const read=argv=>reader.command([config.tt||"tt",...argv]);
-    const jobs=readReleaseSummaries(read);
-    // Validate complete baseline history before any recovery write, pruning or claim.
-    const baselines=deploymentBaselines(configured,jobs);
-    // Fetch every locally relevant recovery record and the selected/held job
-    // before any write, deletion or claim. A failed detail read holds the poll.
-    const selected=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
-    const details=new Map();
-    const lock=hostLockPath(config.cwd,jobs[0]||{});
-    const lockedJob=existsSync(lock)?JSON.parse(readFileSync(lock,"utf8")).jobId:null;
-    for(const summary of jobs){
-      const path=join(config.journalDirectory,summary.id+".json");
-      const pending=existsSync(path) && ["finishing","receipt_pending"].includes(JSON.parse(readFileSync(path,"utf8")).phase);
-      if(summary.id===selected?.id || ["claimed","merged","blocked"].includes(summary.state) || pending || summary.id===lockedJob){
-        details.set(summary.id,readReleaseDetail(read,summary));
+    // The poll's ledger read writes nothing, so a stale snapshot refused on a
+    // detail's bookend (or the closing one) restarts it whole: fresh
+    // summaries, details and bookend, at most RELEASE_READ_ATTEMPTS passes,
+    // each summary read keeping its own bound. A failure the read recovered
+    // from is dropped from reader.cliFailures (the private record keeps it),
+    // so a later failure of this poll notices only what ended it.
+    const readLedger=()=>{
+      for(let pass=1;;pass++){
+        const mark=reader.cliFailures.length;
+        const jobs=readReleaseSummaries(read);reader.cliFailures.splice(mark);
+        // Validate complete baseline history before any recovery write, pruning or claim.
+        const baselines=deploymentBaselines(configured,jobs);
+        // Fetch every locally relevant recovery record and the selected/held job
+        // before any write, deletion or claim. Any other failed detail read holds the poll.
+        const selected=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
+        const details=new Map();
+        const lock=hostLockPath(config.cwd,jobs[0]||{});
+        const lockedJob=existsSync(lock)?JSON.parse(readFileSync(lock,"utf8")).jobId:null;
+        try{
+          for(const summary of jobs){
+            const path=join(config.journalDirectory,summary.id+".json");
+            const pending=existsSync(path) && ["finishing","receipt_pending"].includes(JSON.parse(readFileSync(path,"utf8")).phase);
+            if(summary.id===selected?.id || ["claimed","merged","blocked"].includes(summary.state) || pending || summary.id===lockedJob){
+              details.set(summary.id,readReleaseDetail(read,summary));
+            }
+          }
+          bookendReleaseLedger(read,jobs.releaseSnapshot,jobs.releaseHead);
+        }catch(error){if(!staleSnapshot(error) || pass>=RELEASE_READ_ATTEMPTS)throw error;reader.cliFailures.splice(mark);continue;}
+        return {jobs,baselines,details,lock};
       }
-    }
-    bookendReleaseLedger(read,jobs.releaseSnapshot,jobs.releaseHead);
+    };
+    const {jobs,baselines,details,lock}=readLedger();
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs,{keepDists:[baselines.tailos]});}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
@@ -2703,7 +2723,16 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const skipped=new Set();
     for (;;) {
       const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
-      const job=summary?(details.get(summary.id)||readReleaseDetail(read,summary)):null;
+      // A verified job behind a skipped one is read here, after this poll's
+      // writes (receipts, set-aside archives, notices). A stale snapshot on
+      // its bookend does not restart the read, which would repeat them: the
+      // poll ends quietly, nothing is claimed and the next poll reads afresh.
+      let job=null;
+      if(summary){
+        const mark=reader.cliFailures.length;
+        try{job=details.get(summary.id)||readReleaseDetail(read,summary);}
+        catch(error){if(!staleSnapshot(error))throw error;reader.cliFailures.splice(mark);process.stderr.write("Release ledger changed during the poll; the next poll reads it again.\n");break;}
+      }
       if(!job){
         const holder=jobs.find(j=>["claimed","merged","blocked"].includes(j.state)),onHold=jobs.find(j=>j.state==="held");
         if(holder)notify(reader,jobs,details.get(holder.id),holder.state);
