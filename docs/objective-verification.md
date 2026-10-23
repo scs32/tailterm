@@ -684,12 +684,15 @@ The save is refused with its own reason unless all of these hold:
   changed`). Who may approve a matrix does not change.
 - `fromScopeRevision` is the receipt's scope and `toScopeRevision` the item's
   newer current scope.
-- `rebindId` is the running entry's latest rebind, from the receipt's scope
-  to the item's current scope. A later save that changes only the item
-  revision, such as status or priority, does not block it: `itemRevision` is
-  then the item's current revision and the derived plan takes it. A later
-  scope change refuses (`rebind does not move the receipt's scope to the
-  current one`). After such a save the running entry is behind the item, so
+- `rebindId` is the running entry's latest scope-moving rebind, from the
+  receipt's scope to the item's current scope. A later save that changes
+  only the item revision, such as status or priority, does not block it:
+  `itemRevision` is then the item's current revision and the derived plan
+  takes it. A later same-scope rebind, one that keeps the scope revision,
+  does not block it either, and `rebindId` still names the scope-moving one.
+  A later scope change refuses (`rebind does not move the receipt's scope to
+  the current one`), and once a later rebind moves the scope, the earlier one
+  is no longer the latest (`rebind is not the running entry's latest`). After such a save the running entry is behind the item, so
   the item lead's operator check refuses it and the database handler authors
   the carry-over. `ownerEditMessageSeq` is that
   rebind's source message, and the owner wrote it: no agent identity, not a

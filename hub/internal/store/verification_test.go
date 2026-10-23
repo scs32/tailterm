@@ -2528,6 +2528,75 @@ func TestVerificationCarryOverAfterNonScopeSave(t *testing.T) {
 	refusedFor(t, "later scope change", "rebind does not move the receipt's scope to the current one", err)
 }
 
+// wi_a0963615a08a1b86 r1, r2: a rebind that keeps the scope, after a status
+// save, is skipped, so the carry-over still names the owner edit's rebind. A
+// later scope-moving rebind supersedes it and refuses as before.
+func TestVerificationCarryOverSkipsSameScopeRebind(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	item := f.sameScopeRebind(t, "status")
+	rebinds, err := teamQueueRebinds(f.ctx, f.s.db, f.task.ID, f.entry.ID)
+	if err != nil || len(rebinds) != 2 || rebinds[1].FromScopeRevision != rebinds[1].ToScopeRevision || rebinds[1].ToItemRevision != item.Revision {
+		t.Fatal("same-scope rebind", rebinds, err)
+	}
+	req := f.carry(t, "carry-same", f.handler)
+	req.CarryOver.ItemRevision = item.Revision
+	req.CarryOver.RebindID = rebinds[1].ID
+	_, err = f.save(req)
+	refusedFor(t, "same-scope rebind named", "rebind is not the running entry's latest", err)
+	req = f.carry(t, "carry", f.handler)
+	req.CarryOver.ItemRevision = item.Revision
+	record, err := f.save(req)
+	if err != nil {
+		t.Fatal("carry-over after a same-scope rebind", err)
+	}
+	if record.CarryOver.RebindID != f.rebound.ID || record.CarryOver.Plan.ItemRevision != item.Revision || record.CarryOver.Plan.ScopeRevision != f.updated.ScopeRevision {
+		t.Fatalf("carried record %+v", record.CarryOver)
+	}
+
+	later := newCarryOverFixture(t, carryOptions{})
+	later.sameScopeRebind(t, "status")
+	again, edit := later.amend(t, "again")
+	later.confirm(t, again)
+	later.entry = later.action(t, later.rebind(again, edit))
+	rebinds, err = teamQueueRebinds(later.ctx, later.s.db, later.task.ID, later.entry.ID)
+	if err != nil || len(rebinds) != 3 || rebinds[2].FromScopeRevision != later.updated.ScopeRevision || rebinds[2].ToScopeRevision != again.ScopeRevision {
+		t.Fatal("later scope-moving rebind", rebinds, err)
+	}
+	for _, row := range []struct {
+		name, key, rebind, reason string
+	}{
+		{"owner edit's rebind", "carry-edit", later.rebound.ID, "rebind is not the running entry's latest"},
+		{"later rebind", "carry-later", rebinds[2].ID, "rebind does not move the receipt's scope to the current one"},
+	} {
+		req = later.carry(t, row.key, later.handler)
+		req.CarryOver.ItemRevision, req.CarryOver.ToScopeRevision, req.CarryOver.RebindID = again.Revision, again.ScopeRevision, row.rebind
+		_, err = later.save(req)
+		refusedFor(t, row.name, row.reason, err)
+	}
+}
+
+// sameScopeRebind saves a status change, confirms the order at the new
+// revision and rebinds the running entry to it, keeping the scope.
+func (f *carryOverFixture) sameScopeRebind(t *testing.T, key string) api.WorkItem {
+	t.Helper()
+	current, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := "blocked"
+	item, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Status: &status}, f.by)
+	if err != nil || item.ScopeRevision != current.ScopeRevision {
+		t.Fatal("status save", item.ScopeRevision, err)
+	}
+	f.confirm(t, item)
+	source, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "status save " + key, RequestID: "status-" + key, WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.entry = f.action(t, f.rebind(item, source))
+	return item
+}
+
 // a6: a stale, superseded or failed source receipt is refused.
 func TestVerificationCarryOverDeniesStaleOrFailedReceipt(t *testing.T) {
 	f := newCarryOverFixture(t, carryOptions{})

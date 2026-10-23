@@ -743,11 +743,12 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 }
 
 // validateVerificationCarryOver checks a carry-over against the stored
-// records, the item, its running entry's latest rebind and its review ledger,
-// and returns the record to save: the request with AmendedBy and the derived
-// pair filled. The rebind must move the receipt's scope to the item's current
-// scope; a later save that changes only the item revision, such as status or
-// priority, does not block it. The handler's scope confirmation at the
+// records, the item, its running entry's latest scope-moving rebind and its
+// review ledger, and returns the record to save: the request with AmendedBy
+// and the derived pair filled. The rebind must move the receipt's scope to the
+// item's current scope; a later save that changes only the item revision, such
+// as status or priority, does not block it, nor does a later rebind that keeps
+// the scope. The handler's scope confirmation at the
 // rebind's revision must record the amended criteria and owned paths, equal
 // to the receipt's scope without the moved criteria (confirmedAmendedScope).
 // In the same transaction it saves the carried review scope: the source scope
@@ -798,8 +799,9 @@ func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.Wor
 	if c.FromScopeRevision != p.ScopeRevision || c.ToScopeRevision != item.ScopeRevision || c.ToScopeRevision <= c.FromScopeRevision {
 		return nil, verificationConflict("carry-over must move the receipt's scope to the item's newer current scope")
 	}
-	// The owner edit is the running entry's latest rebind, from the receipt's
-	// scope to the current one, sourced from a message the owner wrote.
+	// The owner edit is the running entry's latest scope-moving rebind, from
+	// the receipt's scope to the current one, sourced from a message the owner
+	// wrote. A later rebind that keeps the scope is skipped.
 	var entry string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' ORDER BY attempt DESC LIMIT 1`, item.TaskID, item.ID).Scan(&entry)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -812,10 +814,14 @@ func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.Wor
 	if err != nil {
 		return nil, err
 	}
-	if len(rebinds) == 0 || rebinds[len(rebinds)-1].ID != c.RebindID {
+	latest := len(rebinds) - 1
+	for latest >= 0 && rebinds[latest].FromScopeRevision == rebinds[latest].ToScopeRevision {
+		latest--
+	}
+	if latest < 0 || rebinds[latest].ID != c.RebindID {
 		return nil, verificationConflict("rebind is not the running entry's latest")
 	}
-	rebind := rebinds[len(rebinds)-1]
+	rebind := rebinds[latest]
 	if rebind.FromScopeRevision != p.ScopeRevision || rebind.ToScopeRevision != item.ScopeRevision {
 		return nil, verificationConflict("rebind does not move the receipt's scope to the current one")
 	}
