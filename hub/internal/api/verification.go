@@ -167,16 +167,56 @@ type VerificationReceipt struct {
 	AIV             AIVBinding                 `json:"aiv"`
 }
 type VerificationRequest struct {
-	RequestID          string               `json:"requestId"`
-	AgentID            string               `json:"agentId"`
-	RunID              string               `json:"runId"`
-	ExpectedGeneration int64                `json:"expectedGeneration"`
-	Plan               *VerificationPlan    `json:"plan,omitempty"`
-	Receipt            *VerificationReceipt `json:"receipt,omitempty"`
+	RequestID          string                 `json:"requestId"`
+	AgentID            string                 `json:"agentId"`
+	RunID              string                 `json:"runId"`
+	ExpectedGeneration int64                  `json:"expectedGeneration"`
+	Plan               *VerificationPlan      `json:"plan,omitempty"`
+	Receipt            *VerificationReceipt   `json:"receipt,omitempty"`
+	CarryOver          *VerificationCarryOver `json:"carryOver,omitempty"`
 	// ContextDigest is the caller run's admitted context digest. An item
 	// lead or verifier must send it; a database handler has no binding and
 	// sends none.
 	ContextDigest string `json:"contextDigest,omitempty"`
+}
+
+// VerificationCarryOver rebinds the current passing receipt to the scope an
+// owner edit produced when that edit only moved verification-owned criteria
+// to open linked items. The caller states what it saw: the source receipt,
+// its exact commit, approved matrix and checks, both scope revisions, the
+// queue rebind and owner message of the edit, and each moved criterion. The
+// hub checks every field, and on the saved record fills AmendedBy from the
+// rebind and the derived Plan and Receipt: the source pair with only the
+// scope and item revisions and the receipt's plan digest moved. A request
+// that sets them is refused.
+type VerificationCarryOver struct {
+	ItemRevision             int64                        `json:"itemRevision"`
+	SourceGeneration         int64                        `json:"sourceGeneration"`
+	SourceReceiptDigest      string                       `json:"sourceReceiptDigest"`
+	SourcePlanDigest         string                       `json:"sourcePlanDigest"`
+	Commit                   string                       `json:"commit"`
+	MatrixDigest             string                       `json:"matrixDigest"`
+	MatrixApprovalMessageSeq int64                        `json:"matrixApprovalMessageSeq"`
+	ChecksDigest             string                       `json:"checksDigest"`
+	FromScopeRevision        int64                        `json:"fromScopeRevision"`
+	ToScopeRevision          int64                        `json:"toScopeRevision"`
+	RebindID                 string                       `json:"rebindId"`
+	OwnerEditMessageSeq      int64                        `json:"ownerEditMessageSeq"`
+	Moved                    []VerificationMovedCriterion `json:"moved"`
+	AmendedBy                *Sender                      `json:"amendedBy,omitempty"`
+	Plan                     *VerificationPlan            `json:"plan,omitempty"`
+	Receipt                  *VerificationReceipt         `json:"receipt,omitempty"`
+}
+
+// VerificationMovedCriterion is one verification-owned criterion the owner
+// edit moved off the item: its ID and text in the source scope, and the open
+// item that now carries it, at that item's revision when it was moved.
+type VerificationMovedCriterion struct {
+	ID           string `json:"id"`
+	Text         string `json:"text"`
+	ItemTaskID   string `json:"itemTaskId"`
+	ItemID       string `json:"itemId"`
+	ItemRevision int64  `json:"itemRevision"`
 }
 
 // VerificationNotice names one dependent actor a receipt import told, or the
@@ -188,17 +228,18 @@ type VerificationNotice struct {
 	Skipped    string `json:"skipped,omitempty"`
 }
 type VerificationRecord struct {
-	ItemID         string               `json:"itemId"`
-	ItemTaskID     string               `json:"itemTaskId"`
-	Generation     int64                `json:"generation"`
-	Kind           string               `json:"kind"`
-	RequestID      string               `json:"requestId"`
-	Digest         string               `json:"digest"`
-	HandlerAgentID string               `json:"handlerAgentId"`
-	HandlerRunID   string               `json:"handlerRunId"`
-	CreatedAt      string               `json:"createdAt"`
-	Plan           *VerificationPlan    `json:"plan,omitempty"`
-	Receipt        *VerificationReceipt `json:"receipt,omitempty"`
+	ItemID         string                 `json:"itemId"`
+	ItemTaskID     string                 `json:"itemTaskId"`
+	Generation     int64                  `json:"generation"`
+	Kind           string                 `json:"kind"`
+	RequestID      string                 `json:"requestId"`
+	Digest         string                 `json:"digest"`
+	HandlerAgentID string                 `json:"handlerAgentId"`
+	HandlerRunID   string                 `json:"handlerRunId"`
+	CreatedAt      string                 `json:"createdAt"`
+	Plan           *VerificationPlan      `json:"plan,omitempty"`
+	Receipt        *VerificationReceipt   `json:"receipt,omitempty"`
+	CarryOver      *VerificationCarryOver `json:"carryOver,omitempty"`
 	// HandlerAgentID and HandlerRunID hold the author. AuthorRole is lead or
 	// verifier when the author is not a database handler. Notices lists who
 	// a receipt import told.
@@ -232,10 +273,13 @@ func (c *Client) VerificationEnrollment(ctx context.Context, task, item, agent, 
 }
 
 // Summary is derived from the current plan; superseded evidence is never reused.
+// CarryOverGeneration is set when the current pair was carried over an owner
+// scope edit, and names that record.
 type VerificationSummary struct {
-	State  string                     `json:"state"`
-	Commit string                     `json:"commit"`
-	Checks []VerificationCheckSummary `json:"checks,omitempty"`
+	State               string                     `json:"state"`
+	Commit              string                     `json:"commit"`
+	Checks              []VerificationCheckSummary `json:"checks,omitempty"`
+	CarryOverGeneration int64                      `json:"carryOverGeneration,omitempty"`
 }
 type VerificationCheckSummary struct {
 	ID           string `json:"id"`

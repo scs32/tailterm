@@ -530,7 +530,17 @@ func reviewReadySettling(state api.ReviewConvergence, scope int64, candidate str
 		return reviewConflict("no completed general review")
 	}
 	last := state.Rounds[len(state.Rounds)-1]
-	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), sc.Criteria) || !reflect.DeepEqual(normalizedVerificationCriteria(last.VerificationCriteria), normalizedVerificationCriteria(sc.VerificationCriteria)) {
+	reviewed := sc
+	if source := carriedScope(&state, sc, last.ScopeRevision); source != nil {
+		// A carry-over moved verification-owned criteria off the scope this
+		// round reviewed. The round still decides, on this exact candidate,
+		// and every criterion that stayed must pass below.
+		if last.Candidate != candidate {
+			return reviewConflict("a carried scope needs its latest general review on the exact candidate")
+		}
+		reviewed = source
+	}
+	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), reviewed.Criteria) || !reflect.DeepEqual(normalizedVerificationCriteria(last.VerificationCriteria), normalizedVerificationCriteria(reviewed.VerificationCriteria)) {
 		return reviewConflict("latest general review is incomplete or stale")
 	}
 	verdicts := map[string]string{}

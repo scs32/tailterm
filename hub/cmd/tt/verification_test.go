@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -126,9 +127,17 @@ type verificationCLI struct {
 	lead, builder, verifier api.Agent
 	planFile, receiptFile   string
 	logFile                 string
+	entry                   api.TeamQueueEntry
 }
 
 func newVerificationCLI(t *testing.T) *verificationCLI {
+	t.Helper()
+	return newVerificationCLIWith(t, map[string]string{"a1": "works"}, nil)
+}
+
+// newVerificationCLIWith is newVerificationCLI with the ASSIGN's criteria and
+// verification-owned criteria.
+func newVerificationCLIWith(t *testing.T, acceptance map[string]string, owned []string) *verificationCLI {
 	t.Helper()
 	f := &verificationCLI{teamFixture: newTeamFixtureKind(t, true, "bug")}
 	ctx := context.Background()
@@ -172,9 +181,10 @@ func newVerificationCLI(t *testing.T) *verificationCLI {
 		step.EntryID, step.ExpectedRevision = entry.ID, entry.Revision
 		entry = action(step)
 	}
+	f.entry = entry
 	links := []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}
 	assign, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{To: f.builder.ID, AgentID: f.lead.ID, RunID: f.lead.RunID, RequestID: "cli-assign", WorkItems: links,
-		Envelope: &api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works"}}}})
+		Envelope: &api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: acceptance, VerificationCriteria: owned}}})
 	if err != nil {
 		t.Fatal("assign", err)
 	}
@@ -357,5 +367,94 @@ func TestVerificationCLIReplay(t *testing.T) {
 	history, err := f.c.VerificationHistory(ctx, f.task.ID, f.item.ID, f.lead.ID, f.lead.RunID)
 	if err != nil || len(history) != 2 {
 		t.Fatalf("history after replays: %d records %v", len(history), err)
+	}
+}
+
+// a2 (wi_9f6ca42e3acb9e22): the lead or the handler carries the receipt over
+// an owner edit with tt verification carry-over against the real route, and
+// tt verification history reads the record back. The plan's verifier is
+// refused, and a file that sets a hub-filled field is refused before any
+// write.
+func TestVerificationCLICarryOver(t *testing.T) {
+	for _, author := range []string{"lead", "handler"} {
+		t.Run(author, func(t *testing.T) {
+			f := newVerificationCLIWith(t, map[string]string{"a1": "works", "a2": "matrix passes"}, []string{"a2"})
+			ctx := context.Background()
+			if _, _, err := f.plan(t, f.as(f.lead)); err != nil {
+				t.Fatal("plan", err)
+			}
+			if _, _, err := f.receipt(t, f.as(f.verifier)); err != nil {
+				t.Fatal("receipt", err)
+			}
+			linked, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "matrix follow-up", RequestID: "linked"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			description := "a2 moved to the follow-up"
+			updated, err := f.c.UpdateWorkItem(ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: f.item.Revision, Description: &description, ScopeChange: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			edit, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "owner moves a2", RequestID: "owner-edit", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: updated.Revision, Relationship: "primary"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.c.ConfirmWorkOrderScope(ctx, f.task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "amended-scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, ScopeRevision: updated.ScopeRevision, OrderMessageSeq: f.order, Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			entry, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rebind", Operation: "rebind", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, ItemRevision: updated.Revision, SourceMessageSeq: edit.Seq})
+			if err != nil || len(entry.Rebinds) != 1 {
+				t.Fatal("rebind", entry.Rebinds, err)
+			}
+			history, err := f.c.VerificationHistory(ctx, f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+			if err != nil || len(history) != 2 {
+				t.Fatal(history, err)
+			}
+			p, r := history[0].Plan, history[1].Receipt
+			c := api.VerificationCarryOver{ItemRevision: updated.Revision, SourceGeneration: 2, SourceReceiptDigest: cliDigest(r), SourcePlanDigest: cliDigest(p), Commit: p.Commit, MatrixDigest: p.MatrixDigest, MatrixApprovalMessageSeq: p.MatrixApprovalMessageSeq, ChecksDigest: p.ChecksDigest,
+				FromScopeRevision: p.ScopeRevision, ToScopeRevision: updated.ScopeRevision, RebindID: entry.Rebinds[0].ID, OwnerEditMessageSeq: edit.Seq,
+				Moved: []api.VerificationMovedCriterion{{ID: "a2", Text: "matrix passes", ItemTaskID: f.task.ID, ItemID: linked.ID, ItemRevision: linked.Revision}}}
+			dir := t.TempDir()
+			file := filepath.Join(dir, "carry-over.json")
+			data, _ := json.Marshal(c)
+			if err = os.WriteFile(file, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			forged := c
+			forged.Plan = p
+			forgedFile := filepath.Join(dir, "forged.json")
+			data, _ = json.Marshal(forged)
+			if err = os.WriteFile(forgedFile, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			carry := func(e env, file, key string) (api.VerificationRecord, string, error) {
+				return f.run(t, e, "carry-over", "--file", file, "--request-id", key, "--generation", "2")
+			}
+			if _, _, err = carry(f.as(f.lead), forgedFile, "forged"); err == nil || !strings.Contains(err.Error(), "must not set plan, receipt or amendedBy") {
+				t.Fatalf("forged file: %v", err)
+			}
+			if _, _, err = carry(f.as(f.verifier), file, "verifier-carry"); err == nil || !strings.Contains(err.Error(), "only the item lead or the database handler may carry a receipt over") {
+				t.Fatalf("verifier carry-over: %v", err)
+			}
+			by, role := f.lead, "lead"
+			if author == "handler" {
+				by, role = f.handler, ""
+			}
+			record, out, err := carry(f.as(by), file, "carry")
+			if err != nil {
+				t.Fatal("carry-over", err)
+			}
+			if record.Kind != "carry-over" || record.Generation != 3 || record.AuthorRole != role || record.HandlerAgentID != by.ID || record.CarryOver == nil || record.CarryOver.Plan == nil || record.CarryOver.Plan.ScopeRevision != updated.ScopeRevision || record.CarryOver.AmendedBy == nil {
+				t.Fatalf("carry-over record %+v", record)
+			}
+			if !strings.Contains(out, `"carryOver"`) || !strings.Contains(out, `"rebindId"`) {
+				t.Fatalf("output does not print the carry-over: %s", out)
+			}
+			out, err = captureCLIOutput(t, func() error { return cmdVerification(f.as(f.handler), []string{"history", "--item", f.item.ID}) })
+			var read []api.VerificationRecord
+			if err != nil || json.Unmarshal([]byte(out), &read) != nil || len(read) != 3 || !reflect.DeepEqual(read[2], record) {
+				t.Fatalf("history %q %v", out, err)
+			}
+		})
 	}
 }

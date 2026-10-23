@@ -73,8 +73,62 @@ func currentVerification(records []api.VerificationRecord) (*api.VerificationPla
 		if v.Receipt != nil {
 			r = v.Receipt
 		}
+		// A carry-over replaces the current pair with the derived one the
+		// hub saved on it.
+		if v.CarryOver != nil && v.CarryOver.Plan != nil && v.CarryOver.Receipt != nil {
+			p, r = v.CarryOver.Plan, v.CarryOver.Receipt
+		}
 	}
 	return p, r
+}
+
+// currentCarryOvers lists the carry-over records since the current plan,
+// oldest first. The current pair was carried over each of them.
+func currentCarryOvers(records []api.VerificationRecord) []api.VerificationRecord {
+	var out []api.VerificationRecord
+	for _, v := range records {
+		if v.Plan != nil {
+			out = nil
+		}
+		if v.CarryOver != nil {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// carriedCriteriaKept refuses completion when a criterion the current pair
+// was carried over has been waived: its linked item is gone or dismissed. A
+// done linked item delivered it.
+func carriedCriteriaKept(ctx context.Context, q queryRower, carried []api.VerificationRecord) error {
+	for _, v := range carried {
+		for _, m := range v.CarryOver.Moved {
+			var status string
+			err := q.QueryRowContext(ctx, `SELECT status FROM work_items WHERE task_id=? AND id=?`, m.ItemTaskID, m.ItemID).Scan(&status)
+			if errors.Is(err, sql.ErrNoRows) {
+				status = "missing"
+			} else if err != nil {
+				return err
+			}
+			if status == "dismissed" || status == "missing" {
+				return verificationConflict(fmt.Sprintf("moved criterion %s was waived: linked item %s is %s", m.ID, m.ItemID, status))
+			}
+		}
+	}
+	return nil
+}
+
+// carriedScope returns the scope at revision from that sc was carried over
+// from, or nil. Only a carry-over saves a later scope revision under an
+// earlier revision's assignment, so the shared assignment identifies it.
+func carriedScope(state *api.ReviewConvergence, sc *api.ReviewScope, from int64) *api.ReviewScope {
+	if sc == nil || from >= sc.ScopeRevision {
+		return nil
+	}
+	if source := scopeFor(state, from); source != nil && source.AssignmentSeq == sc.AssignmentSeq {
+		return source
+	}
+	return nil
 }
 func (s *Store) VerificationHistory(ctx context.Context, task, item, agent, run string) ([]api.VerificationRecord, error) {
 	if err := requireItemReader(ctx, s.db, task, item, agent, run); err != nil {
@@ -113,12 +167,8 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 	if p.ItemID != item.ID || p.ItemTaskID != item.TaskID || p.Version != 1 || !validRequestID(p.OperationKey) || p.ItemRevision != item.Revision || p.ScopeRevision != item.ScopeRevision || !validGitCommit(p.Commit) || !validGitCommit(p.BaseCommit) || strings.TrimSpace(p.Repository) == "" || !validContextDigest(p.MatrixDigest) || len(p.Checks) == 0 || len(p.Owned) == 0 || verificationDigest(p.Checks) != p.ChecksDigest {
 		return verificationConflict("invalid current plan or check digest")
 	}
-	var approver, node, text string
-	if p.ApprovedMatrixDigest != p.MatrixDigest || p.MatrixApprovalMessageSeq <= 0 {
-		return verificationConflict("independently owner-approved matrix required")
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT from_agent,from_node,text FROM messages WHERE task_id=? AND seq=?`, item.TaskID, p.MatrixApprovalMessageSeq).Scan(&approver, &node, &text); err != nil || approver != "" || node == "system" || strings.TrimSpace(text) != "verification-matrix-approval:"+p.MatrixDigest {
-		return verificationConflict("owner matrix approval source does not bind exact digest")
+	if err := ownerApprovedMatrix(ctx, tx, item.TaskID, p); err != nil {
+		return err
 	}
 	if err := requireConfirmedTeamOrder(ctx, tx, item.TaskID, item.ID, item.Revision, p.OrderMessageSeq); err != nil {
 		return err
@@ -170,6 +220,19 @@ func validateVerificationPlan(ctx context.Context, tx *sql.Tx, item api.WorkItem
 	}
 	_, err = validateVerificationKnownFailures(ctx, tx, p, item, nil)
 	return err
+}
+
+// ownerApprovedMatrix requires the plan's matrix digest to be the one the
+// owner approved in its approval message.
+func ownerApprovedMatrix(ctx context.Context, q queryRower, task string, p api.VerificationPlan) error {
+	var approver, node, text string
+	if p.ApprovedMatrixDigest != p.MatrixDigest || p.MatrixApprovalMessageSeq <= 0 {
+		return verificationConflict("independently owner-approved matrix required")
+	}
+	if err := q.QueryRowContext(ctx, `SELECT from_agent,from_node,text FROM messages WHERE task_id=? AND seq=?`, task, p.MatrixApprovalMessageSeq).Scan(&approver, &node, &text); err != nil || approver != "" || node == "system" || strings.TrimSpace(text) != "verification-matrix-approval:"+p.MatrixDigest {
+		return verificationConflict("owner matrix approval source does not bind exact digest")
+	}
+	return nil
 }
 func validateVerificationReceipt(p api.VerificationPlan, r api.VerificationReceipt) error {
 	if !filepath.IsAbs(r.Worktree) || r.Version != 1 || r.OperationKey != p.OperationKey || r.PlanDigest != verificationDigest(p) || r.Commit != p.Commit || r.BaseCommit != p.BaseCommit || r.Repository != p.Repository || r.MatrixDigest != p.MatrixDigest || r.ChecksDigest != p.ChecksDigest || r.VerifierAgentID != p.VerifierAgentID || r.VerifierRunID != p.VerifierRunID || !r.Detached || !r.CleanBefore || !r.CleanAfter || r.AIV.State != "unsubmitted" || len(r.Checks) != len(p.Checks) || len(r.Environment) == 0 {
@@ -384,8 +447,9 @@ func absVerificationDuration(n int64) int64 {
 // verificationAuthor admits the author of a plan freeze or receipt import and
 // returns the role saved on its record: empty for a database handler, lead
 // for the item lead, verifier for the current plan's verifier. A handler is
-// admitted as before. Only the lead may freeze a plan besides the handler;
-// the lead or the current plan's exact verifier run may import its receipt.
+// admitted as before. Only the lead may freeze a plan or carry a receipt over
+// besides the handler; the lead or the current plan's exact verifier run may
+// import its receipt.
 func verificationAuthor(ctx context.Context, q queryRower, task, item string, req api.VerificationRequest, records []api.VerificationRecord) (string, error) {
 	plan, _ := currentVerification(records)
 	var order int64
@@ -405,6 +469,8 @@ func verificationAuthor(ctx context.Context, q queryRower, task, item string, re
 		return itemOperatorLead, nil
 	case req.Plan != nil:
 		return "", verificationConflict("only the item lead or the database handler may freeze a verification plan")
+	case req.CarryOver != nil:
+		return "", verificationConflict("only the item lead or the database handler may carry a receipt over")
 	case plan != nil && plan.VerifierAgentID == req.AgentID && plan.VerifierRunID == req.RunID:
 		return "verifier", nil
 	}
@@ -540,8 +606,17 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	zero := api.VerificationRecord{}
-	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || (req.Plan == nil) == (req.Receipt == nil) {
+	parts := 0
+	for _, set := range []bool{req.Plan != nil, req.Receipt != nil, req.CarryOver != nil} {
+		if set {
+			parts++
+		}
+	}
+	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || parts != 1 {
 		return zero, api.ErrInvalid
+	}
+	if c := req.CarryOver; c != nil && (c.AmendedBy != nil || c.Plan != nil || c.Receipt != nil) {
+		return zero, fmt.Errorf("%w: verification: a carry-over's plan, receipt and amendedBy are filled by the hub", api.ErrInvalid)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -592,7 +667,13 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	}
 	kind := "plan"
 	var notices []api.VerificationNotice
-	if req.Plan != nil {
+	carried := req.CarryOver
+	if carried != nil {
+		kind = "carry-over"
+		if carried, err = validateVerificationCarryOver(ctx, tx, item, records, *req.CarryOver); err != nil {
+			return zero, err
+		}
+	} else if req.Plan != nil {
 		if err = validateVerificationPlan(ctx, tx, item, *req.Plan); err != nil {
 			return zero, err
 		}
@@ -643,7 +724,7 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 			return zero, err
 		}
 	}
-	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt, AuthorRole: authorRole, Notices: notices}
+	record := api.VerificationRecord{ItemID: itemID, ItemTaskID: task, Generation: generation + 1, Kind: kind, RequestID: req.RequestID, Digest: hash, HandlerAgentID: req.AgentID, HandlerRunID: req.RunID, CreatedAt: ts(s.now()), Plan: req.Plan, Receipt: req.Receipt, CarryOver: carried, AuthorRole: authorRole, Notices: notices}
 	b, err := json.Marshal(record)
 	if err != nil {
 		return zero, err
@@ -658,6 +739,172 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		s.notify(task)
 	}
 	return record, nil
+}
+
+// validateVerificationCarryOver checks a carry-over against the stored
+// records, the item, its running entry's latest rebind and its review ledger,
+// and returns the record to save: the request with AmendedBy and the derived
+// pair filled. In the same transaction it saves the carried review scope:
+// the source scope without the moved criteria, under the source assignment.
+// A standing acceptance is kept: the candidate and evidence are identical and
+// the amended criteria are a subset of those it accepted.
+func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.WorkItem, records []api.VerificationRecord, c api.VerificationCarryOver) (*api.VerificationCarryOver, error) {
+	if item.Status == "done" || item.Status == "dismissed" {
+		return nil, verificationConflict("a " + item.Status + " item is not carried over")
+	}
+	if c.ItemRevision != item.Revision {
+		return nil, verificationConflict("item revision changed")
+	}
+	p, r := currentVerification(records)
+	if p == nil || r == nil {
+		return nil, verificationConflict("passing receipt required")
+	}
+	if c.SourceGeneration != currentReceiptGeneration(records) || c.SourceReceiptDigest != verificationDigest(*r) || c.SourcePlanDigest != verificationDigest(*p) {
+		return nil, verificationConflict("source receipt is not the current receipt")
+	}
+	state, err := reviewState(ctx, tx, item.TaskID, item.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, round := range state.Rounds {
+		if round.ReviewerID == r.VerifierAgentID {
+			return nil, verificationConflict("reviewer cannot verify")
+		}
+	}
+	if err = verificationEligible(*p, *r); err != nil {
+		return nil, err
+	}
+	if _, err = validateVerificationKnownFailures(ctx, tx, *p, item, r); err != nil {
+		return nil, err
+	}
+	if c.Commit != p.Commit {
+		return nil, verificationConflict("candidate changed")
+	}
+	if c.MatrixDigest != p.MatrixDigest || c.MatrixApprovalMessageSeq != p.MatrixApprovalMessageSeq {
+		return nil, verificationConflict("matrix or its approval changed")
+	}
+	if err = ownerApprovedMatrix(ctx, tx, item.TaskID, *p); err != nil {
+		return nil, err
+	}
+	if c.ChecksDigest != p.ChecksDigest || verificationDigest(p.Checks) != p.ChecksDigest {
+		return nil, verificationConflict("checks digest changed")
+	}
+	if c.FromScopeRevision != p.ScopeRevision || c.ToScopeRevision != item.ScopeRevision || c.ToScopeRevision <= c.FromScopeRevision {
+		return nil, verificationConflict("carry-over must move the receipt's scope to the item's newer current scope")
+	}
+	// The owner edit is the running entry's latest rebind, from the receipt's
+	// scope to the current one, sourced from a message the owner wrote.
+	var entry string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? AND state='running' ORDER BY attempt DESC LIMIT 1`, item.TaskID, item.ID).Scan(&entry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, verificationConflict("carry-over needs the item's running team queue entry")
+	}
+	if err != nil {
+		return nil, err
+	}
+	rebinds, err := teamQueueRebinds(ctx, tx, item.TaskID, entry)
+	if err != nil {
+		return nil, err
+	}
+	if len(rebinds) == 0 || rebinds[len(rebinds)-1].ID != c.RebindID {
+		return nil, verificationConflict("rebind is not the running entry's latest")
+	}
+	rebind := rebinds[len(rebinds)-1]
+	if rebind.FromScopeRevision != p.ScopeRevision || rebind.ToScopeRevision != item.ScopeRevision || rebind.ToItemRevision != item.Revision {
+		return nil, verificationConflict("rebind does not move the receipt's scope to the current one")
+	}
+	if c.OwnerEditMessageSeq != rebind.SourceMessageSeq {
+		return nil, verificationConflict("owner edit message is not the rebind's source")
+	}
+	if owner, err := ownerWrittenOrder(ctx, tx, item.TaskID, c.OwnerEditMessageSeq); err != nil {
+		return nil, err
+	} else if !owner {
+		return nil, verificationConflict("the edit's message was not written by the owner")
+	}
+	if state.History != "recorded" {
+		return nil, verificationConflict("recorded review history required")
+	}
+	source := scopeFor(&state, p.ScopeRevision)
+	if source == nil || source.AssignmentSeq != p.AssignmentSeq {
+		return nil, verificationConflict("assignment changed")
+	}
+	if scopeFor(&state, item.ScopeRevision) != nil {
+		return nil, verificationConflict("new scope already assigned; freeze a new plan")
+	}
+	if len(c.Moved) == 0 {
+		return nil, verificationConflict("carry-over must name each moved criterion")
+	}
+	criteria := map[string]string{}
+	for k, v := range source.Criteria {
+		criteria[k] = v
+	}
+	var owned []string
+	for _, id := range source.VerificationCriteria {
+		owned = append(owned, id)
+	}
+	for _, m := range c.Moved {
+		text, ok := criteria[m.ID]
+		if !ok {
+			return nil, verificationConflict("moved criterion " + m.ID + " is not a remaining criterion of the receipt's scope")
+		}
+		if !verificationOwned(source.VerificationCriteria, m.ID) {
+			return nil, verificationConflict("moved criterion " + m.ID + " is an implementation criterion")
+		}
+		if m.Text != text {
+			return nil, verificationConflict("moved criterion " + m.ID + " text differs from the receipt's scope")
+		}
+		delete(criteria, m.ID)
+		kept := owned[:0]
+		for _, id := range owned {
+			if id != m.ID {
+				kept = append(kept, id)
+			}
+		}
+		owned = kept
+		if m.ItemTaskID != item.TaskID || m.ItemID == item.ID {
+			return nil, verificationConflict("moved criterion " + m.ID + " needs another item of this project")
+		}
+		linked, err := getWorkItem(tx, ctx, m.ItemTaskID, m.ItemID)
+		if err != nil {
+			return nil, verificationConflict("moved criterion " + m.ID + " needs an existing linked item")
+		}
+		if linked.Kind != "bug" && linked.Kind != "feature" {
+			return nil, verificationConflict("moved criterion " + m.ID + " needs a linked bug or feature")
+		}
+		if linked.Status != "open" && linked.Status != "in_progress" && linked.Status != "blocked" {
+			return nil, verificationConflict("moved criterion " + m.ID + " needs an open linked item; " + linked.ID + " is " + linked.Status)
+		}
+		if linked.Revision != m.ItemRevision {
+			return nil, verificationConflict("moved criterion " + m.ID + " linked item revision changed")
+		}
+	}
+	if len(criteria) == 0 {
+		return nil, verificationConflict("at least one criterion must stay on the item")
+	}
+	stage := state
+	if _, err = currentReviewStage(ctx, tx, item.TaskID, &stage, item.ScopeRevision, 0); err != nil {
+		return nil, err
+	}
+	if len(outstandingOnCandidate(stage, p.Commit)) != 0 {
+		return nil, verificationConflict("unresolved review blocker on the candidate")
+	}
+	if len(state.Stages) == 0 {
+		// Record the stages before a second scope makes them derivable.
+		if state.Stages, err = legacyReviewStages(ctx, tx, item.TaskID, state); err != nil {
+			return nil, err
+		}
+	}
+	state.Scopes = append(state.Scopes, api.ReviewScope{ScopeRevision: item.ScopeRevision, ItemRevision: item.Revision, AssignmentSeq: source.AssignmentSeq, Criteria: criteria, VerificationCriteria: normalizedVerificationCriteria(owned)})
+	if err = saveReviewState(ctx, tx, item.TaskID, state); err != nil {
+		return nil, err
+	}
+	plan := *p
+	plan.ScopeRevision, plan.ItemRevision = item.ScopeRevision, item.Revision
+	receipt := *r
+	receipt.PlanDigest = verificationDigest(plan)
+	amendedBy := rebind.AmendedBy
+	c.AmendedBy, c.Plan, c.Receipt = &amendedBy, &plan, &receipt
+	return &c, nil
 }
 
 // verificationCompletion is the item's exact-candidate verification state for
@@ -686,12 +933,15 @@ func checkVerificationCompletion(ctx context.Context, tx *sql.Tx, item api.WorkI
 	if sc := scopeFor(&state, item.ScopeRevision); sc != nil && len(sc.VerificationCriteria) > 0 {
 		required = true
 	}
-	if !required {
-		return nil, nil
-	}
 	records, err := verificationRecords(ctx, tx, item.TaskID, item.ID)
 	if err != nil {
 		return nil, err
+	}
+	// A carried pair stays required after its last verification-owned
+	// criterion moved off the item.
+	carried := currentCarryOvers(records)
+	if !required && len(carried) == 0 {
+		return nil, nil
 	}
 	p, r := currentVerification(records)
 	if p == nil || r == nil || p.ScopeRevision != item.ScopeRevision || candidate == "" || p.Commit != candidate {
@@ -711,6 +961,9 @@ func checkVerificationCompletion(ctx context.Context, tx *sql.Tx, item api.WorkI
 	if err = verificationEligible(*p, *r); err != nil {
 		return nil, err
 	}
+	if err = carriedCriteriaKept(ctx, tx, carried); err != nil {
+		return nil, err
+	}
 	resolved, err := validateVerificationKnownFailures(ctx, tx, *p, item, r)
 	if err != nil {
 		return nil, err
@@ -719,14 +972,15 @@ func checkVerificationCompletion(ctx context.Context, tx *sql.Tx, item api.WorkI
 }
 
 // currentReceiptGeneration is the generation of the receipt currentVerification
-// returns, or 0 when the current plan has none.
+// returns, or 0 when the current plan has none. For a carried pair it is the
+// carry-over record's.
 func currentReceiptGeneration(records []api.VerificationRecord) int64 {
 	var generation int64
 	for _, v := range records {
 		if v.Plan != nil {
 			generation = 0
 		}
-		if v.Receipt != nil {
+		if v.Receipt != nil || v.CarryOver != nil {
 			generation = v.Generation
 		}
 	}
@@ -802,6 +1056,10 @@ func (s *Store) loadTeamVerification(ctx context.Context, e *api.TeamQueueEntry)
 	}
 	summary := &api.VerificationSummary{State: "pending", Commit: p.Commit}
 	e.Verification = summary
+	carried := currentCarryOvers(records)
+	if len(carried) > 0 {
+		summary.CarryOverGeneration = carried[len(carried)-1].Generation
+	}
 	var scope int64
 	if err = s.db.QueryRowContext(ctx, `SELECT narrative_scope_revision FROM work_items WHERE task_id=? AND id=?`, e.TaskID, e.ItemID).Scan(&scope); err != nil {
 		return err
@@ -833,7 +1091,7 @@ func (s *Store) loadTeamVerification(ctx context.Context, e *api.TeamQueueEntry)
 			independent = false
 		}
 	}
-	if independent && verificationEligible(*p, *r) == nil {
+	if independent && verificationEligible(*p, *r) == nil && carriedCriteriaKept(ctx, s.db, carried) == nil {
 		item, err := getWorkItem(s.db, ctx, e.TaskID, e.ItemID)
 		if err != nil {
 			return err

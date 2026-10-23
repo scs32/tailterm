@@ -1326,11 +1326,18 @@ type operatorFixture struct {
 
 func newOperatorFixture(t *testing.T) *operatorFixture {
 	t.Helper()
+	return newOperatorFixtureWith(t, map[string]string{"a1": "works", "a2": "retries"}, nil)
+}
+
+// newOperatorFixtureWith is newOperatorFixture with the ASSIGN's criteria and
+// verification-owned criteria.
+func newOperatorFixtureWith(t *testing.T, acceptance map[string]string, owned []string) *operatorFixture {
+	t.Helper()
 	f := &operatorFixture{rebindFixture: newRebindFixture(t, true)}
 	f.builder = f.worker
 	f.verifier, f.reviewer = f.member(t, "verifier"), f.member(t, "reviewer")
 	var err error
-	env := api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	env := api.Envelope{Kind: "assign", Subject: "Implement frozen fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: acceptance, VerificationCriteria: owned}}
 	if f.assign, err = f.post(env, f.builder.ID, f.lead); err != nil {
 		t.Fatal("assign", err)
 	}
@@ -2012,4 +2019,521 @@ func TestVerificationLegacyReceiptShapeAndDigestUnchanged(t *testing.T) {
 	if verificationDigest(decoded) != verificationDigest(literal) {
 		t.Fatal("decoding a legacy receipt changed its digest")
 	}
+}
+
+// Receipt carry-over (wi_9f6ca42e3acb9e22): an owner scope edit that only
+// moves verification-owned criteria to an open linked item keeps the exact
+// passing receipt through an auditable carry-over record.
+
+var carryCriteria = map[string]string{"a1": "works", "a2": "retries", "a3": "store race matrix passes"}
+
+// carryOptions vary the state a carry-over fixture is built to.
+type carryOptions struct {
+	failed     bool // the receipt has an unlisted exhausted failure
+	superseded bool // a newer plan with no receipt follows the receipt
+	noReview   bool // no general review and no acceptance
+	blocker    bool // the review leaves a blocker on a2 and is not accepted
+	partial    bool // the review leaves a2 partial and is not accepted
+	agentEdit  bool // a handler, not the owner, posts the edit's message
+}
+
+// carryOverFixture is a running entry whose lead froze a plan with a
+// verification-owned a3, its verifier's receipt, a general review on the
+// exact candidate passing a1 and a2 with a3 pending, the lead's acceptance,
+// and an owner scope edit the handler confirmed and rebound the entry to.
+type carryOverFixture struct {
+	*operatorFixture
+	updated api.WorkItem
+	edit    api.Message
+	rebound api.TeamQueueRebind
+}
+
+func newCarryOverFixture(t *testing.T, opt carryOptions) *carryOverFixture {
+	t.Helper()
+	f := &carryOverFixture{operatorFixture: newOperatorFixtureWith(t, carryCriteria, []string{"a3"})}
+	f.freeze(t)
+	r := passingVerification(f.plan)
+	if opt.failed {
+		r.Checks[0].ExitCode, r.Checks[0].FailureReason = 1, "exit"
+	}
+	if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, f.receipt(t, "receipt", f.verifier, r)); err != nil {
+		t.Fatal("receipt", err)
+	}
+	if opt.superseded {
+		again := f.plan
+		again.OperationKey = "fixture-verification-again"
+		req := api.VerificationRequest{RequestID: "plan-again", AgentID: f.lead.ID, RunID: f.lead.RunID, ContextDigest: f.digest(t, f.lead), ExpectedGeneration: 2, Plan: &again}
+		if _, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req); err != nil {
+			t.Fatal("newer plan", err)
+		}
+	}
+	if !opt.noReview {
+		review, err := f.post(api.Envelope{Kind: "review", Subject: "Review frozen fixture candidate", Body: api.EnvelopeBody{Candidate: f.plan.Commit, Scope: "Fixture", Acceptance: carryCriteria, VerificationCriteria: []string{"a3"}}}, f.reviewer.ID, f.lead)
+		if err != nil {
+			t.Fatal("review", err)
+		}
+		verdicts := map[string]string{"a1": "pass", "a2": "pass", "a3": "pending-verification"}
+		meta := api.ReviewMetadata{Mode: "general", Candidate: f.plan.Commit}
+		switch {
+		case opt.blocker:
+			verdicts["a2"] = "fail"
+			meta.Blockers = []api.ReviewFinding{{ID: "b1", Criterion: "a2", Title: "Retry loses state", File: "fixture.go", Line: 7}}
+		case opt.partial:
+			verdicts["a2"] = "partial"
+		}
+		result := api.Envelope{Kind: "result", Subject: "Fixture review verdicts recorded", Review: &meta, Body: api.EnvelopeBody{Outcome: "done", Status: verdicts}, Evidence: map[string]api.Evidence{"e1": {Type: "command", Value: "fixture check -> recorded verdicts"}}}
+		if _, err = f.reply(result, review.Seq, f.reviewer); err != nil {
+			t.Fatal("review result", err)
+		}
+		if !opt.blocker && !opt.partial && !opt.failed && !opt.superseded {
+			if err = f.disposition("accept", f.lead); err != nil {
+				t.Fatal("accept", err)
+			}
+		}
+	}
+	if opt.agentEdit {
+		description := "amended scope by an agent"
+		current, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.updated, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: current.Revision, Description: &description, ScopeChange: true}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		if f.edit, err = f.post(api.Envelope{Kind: "notice", Subject: "Scope amendment saved for the fixture", Body: api.EnvelopeBody{Text: "a3 moved"}}, "", f.handler); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		f.updated, f.edit = f.amend(t, "move-a3")
+	}
+	if f.updated.ScopeRevision <= f.plan.ScopeRevision {
+		t.Fatalf("the edit kept scope revision %d", f.updated.ScopeRevision)
+	}
+	f.confirm(t, f.updated)
+	f.entry = f.action(t, f.rebind(f.updated, f.edit))
+	rebinds, err := teamQueueRebinds(f.ctx, f.s.db, f.task.ID, f.entry.ID)
+	if err != nil || len(rebinds) != 1 {
+		t.Fatal("rebind", rebinds, err)
+	}
+	f.rebound = rebinds[0]
+	return f
+}
+
+// reply posts a typed reply from a team member, linked at the item's current
+// revision.
+func (f *operatorFixture) reply(env api.Envelope, to int64, from api.Agent) (api.Message, error) {
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		return api.Message{}, err
+	}
+	return f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Envelope: &env, ReplyTo: to, AgentID: from.ID, RunID: from.RunID, RequestID: api.NewID("req"),
+		WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, f.by)
+}
+
+// disposition posts the lead's review disposition for the plan's candidate.
+func (f *operatorFixture) disposition(kind string, from api.Agent) error {
+	_, err := f.post(api.Envelope{Kind: "notice", Subject: "Record the review disposition", Review: &api.ReviewMetadata{Mode: "disposition", Disposition: kind, Candidate: f.plan.Commit}, Body: api.EnvelopeBody{Text: kind}}, "", from)
+	return err
+}
+
+// state is the item's review ledger.
+func (f *carryOverFixture) state(t *testing.T) api.ReviewConvergence {
+	t.Helper()
+	state, err := reviewState(f.ctx, f.s.db, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+// history is the item's verification history as the handler reads it.
+func (f *carryOverFixture) history(t *testing.T) []api.VerificationRecord {
+	t.Helper()
+	records, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return records
+}
+
+// carry is the carry-over request from the given author that moves a3 to the
+// second item, stating the current pair as the source.
+func (f *carryOverFixture) carry(t *testing.T, key string, from api.Agent) api.VerificationRequest {
+	t.Helper()
+	records := f.history(t)
+	p, r := currentVerification(records)
+	if r == nil {
+		r = &api.VerificationReceipt{}
+	}
+	other, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := api.VerificationCarryOver{ItemRevision: f.updated.Revision, SourceGeneration: currentReceiptGeneration(records), SourceReceiptDigest: verificationDigest(*r), SourcePlanDigest: verificationDigest(*p),
+		Commit: p.Commit, MatrixDigest: p.MatrixDigest, MatrixApprovalMessageSeq: p.MatrixApprovalMessageSeq, ChecksDigest: p.ChecksDigest, FromScopeRevision: p.ScopeRevision, ToScopeRevision: f.updated.ScopeRevision,
+		RebindID: f.rebound.ID, OwnerEditMessageSeq: f.edit.Seq, Moved: []api.VerificationMovedCriterion{{ID: "a3", Text: carryCriteria["a3"], ItemTaskID: f.task.ID, ItemID: other.ID, ItemRevision: other.Revision}}}
+	req := api.VerificationRequest{RequestID: key, AgentID: from.ID, RunID: from.RunID, ExpectedGeneration: int64(len(records)), CarryOver: &c}
+	if from.Role != api.AgentRoleDatabaseHandler {
+		req.ContextDigest = f.digest(t, from)
+	}
+	return req
+}
+
+// save saves a carry-over request.
+func (f *carryOverFixture) save(req api.VerificationRequest) (api.VerificationRecord, error) {
+	return f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+}
+
+// done is the lead's done save with queue acceptance of the plan's commit.
+func (f *carryOverFixture) done(t *testing.T, key string) (api.WorkItemUpdateResult, error) {
+	t.Helper()
+	saver := &leadSaveFixture{f.rebindFixture}
+	return saver.save(saver.request(t, key, f.lead, f.plan.Commit))
+}
+
+// setLinked sets the second item's status as a later save would.
+func (f *carryOverFixture) setLinked(t *testing.T, status string) {
+	t.Helper()
+	if _, err := f.s.db.Exec(`UPDATE work_items SET status=? WHERE task_id=? AND id=?`, status, f.task.ID, f.other.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// summary is the entry's queue verification summary.
+func (f *carryOverFixture) summary(t *testing.T) api.VerificationSummary {
+	t.Helper()
+	q, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, f.entry.ID)
+	if err != nil || q.Verification == nil {
+		t.Fatal("queue entry verification", q.Verification, err)
+	}
+	return *q.Verification
+}
+
+// a1, a3: the lead carries the passing receipt over the owner's edit; the
+// record binds its sources and reads back, and the parent completes on the
+// amended criteria with the existing acceptance and no new plan or receipt.
+// Its release job binds the new scope.
+func TestVerificationCarryOverAllowsMovedCriterion(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	before := f.history(t)
+	source, receipt := currentVerification(before)
+	if s := f.summary(t); s.State != "stale" {
+		t.Fatalf("summary before the carry-over: %+v", s)
+	}
+	refusedFor(t, "done save before the carry-over", "passing receipt for current scope and exact accepted candidate required", func() error { _, err := f.done(t, "early-done"); return err }())
+	req := f.carry(t, "carry", f.lead)
+	record, err := f.save(req)
+	if err != nil {
+		t.Fatal("carry-over", err)
+	}
+	c := record.CarryOver
+	if record.Kind != "carry-over" || record.Generation != 3 || record.AuthorRole != itemOperatorLead || record.HandlerAgentID != f.lead.ID || record.Plan != nil || record.Receipt != nil || c == nil {
+		t.Fatalf("record %+v", record)
+	}
+	if c.SourceGeneration != 2 || c.SourceReceiptDigest != verificationDigest(*receipt) || c.SourcePlanDigest != verificationDigest(*source) || c.Commit != f.plan.Commit || c.MatrixDigest != f.plan.MatrixDigest || c.MatrixApprovalMessageSeq != f.plan.MatrixApprovalMessageSeq || c.ChecksDigest != f.plan.ChecksDigest {
+		t.Fatalf("source binding %+v", c)
+	}
+	if c.FromScopeRevision != f.plan.ScopeRevision || c.ToScopeRevision != f.updated.ScopeRevision || c.RebindID != f.rebound.ID || c.OwnerEditMessageSeq != f.edit.Seq || c.AmendedBy == nil || *c.AmendedBy != f.rebound.AmendedBy {
+		t.Fatalf("edit binding %+v amendedBy %v", c, c.AmendedBy)
+	}
+	if len(c.Moved) != 1 || c.Moved[0].ID != "a3" || c.Moved[0].Text != carryCriteria["a3"] || c.Moved[0].ItemID != f.other.ID {
+		t.Fatalf("moved %+v", c.Moved)
+	}
+	// The derived pair differs from the source only in its scope and item
+	// revisions and the receipt's plan digest.
+	want := *source
+	want.ScopeRevision, want.ItemRevision = f.updated.ScopeRevision, f.updated.Revision
+	if !reflect.DeepEqual(*c.Plan, want) {
+		t.Fatalf("derived plan %+v", c.Plan)
+	}
+	wantReceipt := *receipt
+	wantReceipt.PlanDigest = verificationDigest(want)
+	if !reflect.DeepEqual(*c.Receipt, wantReceipt) || validateVerificationReceipt(*c.Plan, *c.Receipt) != nil {
+		t.Fatalf("derived receipt %+v", c.Receipt)
+	}
+	history := f.history(t)
+	if len(history) != 3 || !reflect.DeepEqual(history[2], record) {
+		t.Fatalf("readback %+v", history)
+	}
+	state := f.state(t)
+	carried := scopeFor(&state, f.updated.ScopeRevision)
+	if carried == nil || carried.AssignmentSeq != f.assign.Seq || !reflect.DeepEqual(carried.Criteria, map[string]string{"a1": "works", "a2": "retries"}) || len(carried.VerificationCriteria) != 0 {
+		t.Fatalf("carried scope %+v", carried)
+	}
+	if state.Disposition == nil || state.Disposition.Kind != "accept" {
+		t.Fatal("carry-over cleared the acceptance", state.Disposition)
+	}
+	if s := f.summary(t); s.State != "passing" || s.CarryOverGeneration != 3 || s.Commit != f.plan.Commit {
+		t.Fatalf("summary %+v", s)
+	}
+	res, err := f.done(t, "carried-done")
+	if err != nil {
+		t.Fatal("done save after the carry-over", err)
+	}
+	if item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID); err != nil || item.Status != "done" || item.Revision != res.Revision.Revision {
+		t.Fatal("item not done", item, err)
+	}
+	if n := f.records(t); n != 3 {
+		t.Fatalf("completion wrote verification records: %d", n)
+	}
+	var raw string
+	if err := f.s.db.QueryRow(`SELECT record_json FROM release_jobs WHERE task_id=? AND entry_id=?`, f.task.ID, f.entry.ID).Scan(&raw); err != nil {
+		t.Fatal("release job", err)
+	}
+	var job api.ReleaseJob
+	if err := json.Unmarshal([]byte(raw), &job); err != nil || job.ScopeRevision != f.updated.ScopeRevision || job.Commit != f.plan.Commit || job.VerificationDigest != verificationDigest(wantReceipt) {
+		t.Fatalf("release job %+v %v", job, err)
+	}
+}
+
+// a1: a retry replays, a changed payload or generation is refused, the record
+// survives a reopen, and the hub-filled fields cannot be sent.
+func TestVerificationCarryOverAuditAndReplay(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	req := f.carry(t, "carry", f.handler)
+	for name, bad := range map[string]func(*api.VerificationRequest){
+		"plan sent":      func(r *api.VerificationRequest) { p := f.plan; r.CarryOver.Plan = &p },
+		"receipt sent":   func(r *api.VerificationRequest) { x := passingVerification(f.plan); r.CarryOver.Receipt = &x },
+		"amendedBy sent": func(r *api.VerificationRequest) { r.CarryOver.AmendedBy = &api.Sender{User: "owner"} },
+		"plan and carry-over": func(r *api.VerificationRequest) {
+			p := f.plan
+			r.Plan = &p
+		},
+	} {
+		changed := req
+		inner := *req.CarryOver
+		changed.CarryOver = &inner
+		bad(&changed)
+		if _, err := f.save(changed); !errors.Is(err, api.ErrInvalid) {
+			t.Fatal(name, err)
+		}
+	}
+	first, err := f.save(req)
+	if err != nil || first.AuthorRole != "" || first.HandlerAgentID != f.handler.ID {
+		t.Fatal("handler carry-over", first, err)
+	}
+	again, err := f.save(req)
+	if err != nil || !reflect.DeepEqual(again, first) {
+		t.Fatal("replay", again, err)
+	}
+	changed := req
+	inner := *req.CarryOver
+	inner.Moved = append([]api.VerificationMovedCriterion(nil), inner.Moved...)
+	inner.Moved[0].ItemRevision++
+	changed.CarryOver = &inner
+	refusedFor(t, "changed retry", "retry payload changed", func() error { _, err := f.save(changed); return err }())
+	stale := req
+	stale.RequestID = "carry-stale-generation"
+	refusedFor(t, "stale generation", "generation changed", func() error { _, err := f.save(stale); return err }())
+	var path string
+	if err := f.s.db.QueryRow(`SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Close()
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s = reopened
+	history := f.history(t)
+	if len(history) != 3 || !reflect.DeepEqual(history[2], first) {
+		t.Fatalf("history after reopen %+v", history)
+	}
+	if p, r := currentVerification(history); p == nil || r == nil || p.ScopeRevision != f.updated.ScopeRevision || currentReceiptGeneration(history) != 3 {
+		t.Fatal("current pair after reopen", p, r)
+	}
+}
+
+// a4, a5: every eligibility rule refuses with its own reason and saves
+// nothing.
+func TestVerificationCarryOverDeniesChangedScope(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	for _, row := range []struct {
+		name, reason string
+		change       func(*api.VerificationRequest, *api.VerificationCarryOver)
+	}{
+		{"implementation criterion", "moved criterion a1 is an implementation criterion", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) {
+			c.Moved[0].ID, c.Moved[0].Text = "a1", carryCriteria["a1"]
+		}},
+		{"unknown criterion", "moved criterion a9 is not a remaining criterion", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved[0].ID = "a9" }},
+		{"repeated criterion", "moved criterion a3 is not a remaining criterion", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved = append(c.Moved, c.Moved[0]) }},
+		{"changed text", "moved criterion a3 text differs", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) {
+			c.Moved[0].Text = "store race passes once"
+		}},
+		{"no moved criterion", "carry-over must name each moved criterion", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved = nil }},
+		{"linked to the parent", "needs another item of this project", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved[0].ItemID = f.item.ID }},
+		{"linked item missing", "needs an existing linked item", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved[0].ItemID = api.NewID("wi") }},
+		{"linked item revision", "linked item revision changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Moved[0].ItemRevision++ }},
+		{"wrong from scope", "carry-over must move the receipt's scope", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.FromScopeRevision++ }},
+		{"wrong to scope", "carry-over must move the receipt's scope", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.ToScopeRevision++ }},
+		{"stale item revision", "item revision changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.ItemRevision-- }},
+		{"other rebind", "rebind is not the running entry's latest", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.RebindID = api.NewID("tqr") }},
+		{"other edit message", "owner edit message is not the rebind's source", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.OwnerEditMessageSeq = f.order.Seq }},
+		{"changed candidate", "candidate changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.Commit = candidateB }},
+		{"changed matrix", "matrix or its approval changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) {
+			c.MatrixDigest = strings.Repeat("c", 64)
+		}},
+		{"changed approval", "matrix or its approval changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) { c.MatrixApprovalMessageSeq++ }},
+		{"changed checks", "checks digest changed", func(_ *api.VerificationRequest, c *api.VerificationCarryOver) {
+			c.ChecksDigest = strings.Repeat("d", 64)
+		}},
+		{"verifier author", "only the item lead or the database handler may carry a receipt over", func(r *api.VerificationRequest, _ *api.VerificationCarryOver) {
+			r.AgentID, r.RunID, r.ContextDigest = f.verifier.ID, f.verifier.RunID, f.digest(t, f.verifier)
+		}},
+		{"member author", "only the item lead or the database handler may carry a receipt over", func(r *api.VerificationRequest, _ *api.VerificationCarryOver) {
+			r.AgentID, r.RunID, r.ContextDigest = f.builder.ID, f.builder.RunID, f.digest(t, f.builder)
+		}},
+	} {
+		req := f.carry(t, "carry-"+strings.ReplaceAll(row.name, " ", "-"), f.lead)
+		row.change(&req, req.CarryOver)
+		_, err := f.save(req)
+		refusedFor(t, row.name, row.reason, err)
+	}
+	for _, status := range []string{"done", "dismissed"} {
+		f.setLinked(t, status)
+		_, err := f.save(f.carry(t, "carry-linked-"+status, f.lead))
+		refusedFor(t, "linked item "+status, "needs an open linked item; "+f.other.ID+" is "+status, err)
+	}
+	f.setLinked(t, "open")
+	if n := f.records(t); n != 2 {
+		t.Fatalf("a refusal saved a record: %d", n)
+	}
+	if state := f.state(t); scopeFor(&state, f.updated.ScopeRevision) != nil {
+		t.Fatal("a refusal saved the carried scope")
+	}
+
+	// A non-owner edit, an outstanding blocker and a new-scope ASSIGN are
+	// states, not fields.
+	agent := newCarryOverFixture(t, carryOptions{agentEdit: true})
+	_, err := agent.save(agent.carry(t, "carry", agent.lead))
+	refusedFor(t, "agent-written edit", "the edit's message was not written by the owner", err)
+	blocked := newCarryOverFixture(t, carryOptions{blocker: true})
+	_, err = blocked.save(blocked.carry(t, "carry", blocked.lead))
+	refusedFor(t, "outstanding blocker", "unresolved review blocker on the candidate", err)
+	assigned := newCarryOverFixture(t, carryOptions{})
+	env := api.Envelope{Kind: "assign", Subject: "Implement the amended fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	if _, err = assigned.post(env, assigned.builder.ID, assigned.lead); err != nil {
+		t.Fatal("new-scope assign", err)
+	}
+	_, err = assigned.save(assigned.carry(t, "carry", assigned.lead))
+	refusedFor(t, "new-scope assign", "new scope already assigned; freeze a new plan", err)
+}
+
+// a6: a stale, superseded or failed source receipt is refused.
+func TestVerificationCarryOverDeniesStaleOrFailedReceipt(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	for name, change := range map[string]func(*api.VerificationCarryOver){
+		"older generation":       func(c *api.VerificationCarryOver) { c.SourceGeneration = 1 },
+		"another receipt digest": func(c *api.VerificationCarryOver) { c.SourceReceiptDigest = strings.Repeat("e", 64) },
+		"another plan digest":    func(c *api.VerificationCarryOver) { c.SourcePlanDigest = strings.Repeat("e", 64) },
+	} {
+		req := f.carry(t, "carry-"+strings.ReplaceAll(name, " ", "-"), f.lead)
+		change(req.CarryOver)
+		_, err := f.save(req)
+		refusedFor(t, name, "source receipt is not the current receipt", err)
+	}
+	superseded := newCarryOverFixture(t, carryOptions{superseded: true})
+	_, err := superseded.save(superseded.carry(t, "carry", superseded.lead))
+	refusedFor(t, "superseded receipt", "passing receipt required", err)
+	failed := newCarryOverFixture(t, carryOptions{failed: true})
+	_, err = failed.save(failed.carry(t, "carry", failed.lead))
+	refusedFor(t, "failed receipt", "unlisted exhausted failure blocks completion", err)
+}
+
+// a4: a dismissed linked item waives the moved criterion, so completion,
+// queue acceptance and the release candidate refuse naming it; its done
+// status delivers it.
+func TestVerificationCarryOverCompletionWaiver(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	if _, err := f.save(f.carry(t, "carry", f.lead)); err != nil {
+		t.Fatal("carry-over", err)
+	}
+	const waived = "moved criterion a3 was waived"
+	f.setLinked(t, "dismissed")
+	_, err := f.done(t, "waived-done")
+	refusedFor(t, "done save with queue acceptance", waived, err)
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = reviewCompletion(f.ctx, tx, item, f.plan.Commit)
+	tx.Rollback()
+	refusedFor(t, "queue gate", waived, err)
+	if s := f.summary(t); s.State != "blocked" {
+		t.Fatalf("summary with a waived criterion %+v", s)
+	}
+	f.setLinked(t, "done")
+	if _, err = f.done(t, "delivered-done"); err != nil {
+		t.Fatal("done save with the linked item done", err)
+	}
+	f.setLinked(t, "dismissed")
+	tx, err = f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = releaseCandidate(f.ctx, tx, f.task.ID, f.entry.ID)
+	tx.Rollback()
+	refusedFor(t, "release candidate", waived, err)
+}
+
+// a5: a later ASSIGN at the new scope is new work: the carried pair goes
+// stale.
+func TestVerificationCarryOverLaterAssignGoesStale(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	if _, err := f.save(f.carry(t, "carry", f.lead)); err != nil {
+		t.Fatal("carry-over", err)
+	}
+	env := api.Envelope{Kind: "assign", Subject: "Implement the amended fixture criteria", Body: api.EnvelopeBody{Objective: "Fixture", Owns: []string{"fixture"}, Acceptance: map[string]string{"a1": "works", "a2": "retries"}}}
+	if _, err := f.post(env, f.builder.ID, f.lead); err != nil {
+		t.Fatal("later assign", err)
+	}
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = checkVerificationCompletion(f.ctx, tx, item, f.plan.Commit)
+	tx.Rollback()
+	refusedFor(t, "completion after a later assign", "assignment changed", err)
+	if s := f.summary(t); s.State != "stale" {
+		t.Fatalf("summary after a later assign %+v", s)
+	}
+}
+
+// a5: a carry-over never skips review. The latest general review must be on
+// the exact candidate and pass every criterion that stayed; with none, or a
+// partial, completion refuses.
+func TestVerificationCarryOverCompletionStillNeedsReview(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		opt    carryOptions
+		reason string
+	}{
+		{"no review", carryOptions{noReview: true}, "no completed general review"},
+		{"partial verdict", carryOptions{partial: true}, "criterion a2 has not passed"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newCarryOverFixture(t, row.opt)
+			if _, err := f.save(f.carry(t, "carry", f.lead)); err != nil {
+				t.Fatal("carry-over", err)
+			}
+			refusedFor(t, "review gate", row.reason, reviewReady(f.state(t), f.updated.ScopeRevision, f.plan.Commit))
+		})
+	}
+	f := newCarryOverFixture(t, carryOptions{})
+	if _, err := f.save(f.carry(t, "carry", f.lead)); err != nil {
+		t.Fatal("carry-over", err)
+	}
+	state := f.state(t)
+	if err := reviewReady(state, f.updated.ScopeRevision, f.plan.Commit); err != nil {
+		t.Fatal("review gate on the exact candidate", err)
+	}
+	refusedFor(t, "review gate on another candidate", "a carried scope needs its latest general review on the exact candidate", reviewReady(state, f.updated.ScopeRevision, candidateB))
 }

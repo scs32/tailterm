@@ -18,11 +18,11 @@ import (
 
 func cmdVerification(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt verification plan|receipt|history|enrollment --item ID [--file PATH --request-id KEY --generation N]")
+		return errors.New("usage: tt verification plan|receipt|carry-over|history|enrollment --item ID [--file PATH --request-id KEY --generation N]")
 	}
 	fs := flag.NewFlagSet("verification "+args[0], flag.ContinueOnError)
 	item := fs.String("item", "", "exact work item")
-	file := fs.String("file", "", "plan or receipt JSON file")
+	file := fs.String("file", "", "plan, receipt or carry-over JSON file")
 	key := fs.String("request-id", "", "stable retry identity")
 	generation := fs.Int64("generation", 0, "expected record generation")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -72,6 +72,13 @@ func cmdVerification(e env, args []string) error {
 	case "receipt":
 		req.Receipt = &api.VerificationReceipt{}
 		err = json.Unmarshal(data, req.Receipt)
+	case "carry-over":
+		// The file states what the author saw; the hub fills the rest.
+		req.CarryOver = &api.VerificationCarryOver{}
+		err = json.Unmarshal(data, req.CarryOver)
+		if c := req.CarryOver; err == nil && (c.Plan != nil || c.Receipt != nil || c.AmendedBy != nil) {
+			err = errors.New("a carry-over file must not set plan, receipt or amendedBy; the hub fills them")
+		}
 	default:
 		return errors.New("unknown verification operation")
 	}

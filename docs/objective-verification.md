@@ -600,6 +600,121 @@ This fits the re-binding of an acceptance to a verified correction
 history, where that re-bind can read it and bind it to the correction's
 passing receipt.
 
+## A receipt carried over an owner scope edit
+
+Bug `wi_9f6ca42e3acb9e22`, order #43751, owner-helper approval #43776. A
+passing receipt binds the plan's scope revision, so an owner edit that only
+moves a verification-owned criterion to another item would otherwise leave the
+parent needing a new plan and a full matrix run on an unchanged candidate. A
+`carry-over` verification record keeps that receipt instead, with an audit
+trail of why it still applies.
+
+When it applies: the owner edited the item's scope, the edit was saved as a
+new scope revision, the leased handler confirmed it and rebound the running
+queue entry (`tt team queue rebind`), and the edit only moved
+verification-owned criteria to open linked items. The candidate, matrix,
+matrix approval, checks and every implementation criterion are unchanged.
+
+The item lead or the database handler saves it through the API, the
+`POST .../verification` route or the CLI. The plan's verifier and other team
+members are refused. The file states what the author saw. The hub checks each
+field and fills the rest:
+
+```sh
+tt verification history --item ITEM            # read the current pair and generation
+tt verification carry-over --item ITEM --file carry-over.json --request-id KEY --generation 2
+tt verification history --item ITEM            # the record reads back with kind carry-over
+```
+
+```json
+{
+  "itemRevision": 4,
+  "sourceGeneration": 2,
+  "sourceReceiptDigest": "<canonical digest of the current receipt>",
+  "sourcePlanDigest": "<canonical digest of the current plan>",
+  "commit": "<exact candidate SHA>",
+  "matrixDigest": "<plan matrixDigest>",
+  "matrixApprovalMessageSeq": 120,
+  "checksDigest": "<plan checksDigest>",
+  "fromScopeRevision": 3,
+  "toScopeRevision": 4,
+  "rebindId": "tqr_...",
+  "ownerEditMessageSeq": 130,
+  "moved": [{"id": "a8", "text": "<the criterion's exact text>", "itemTaskId": "tsk_...", "itemId": "wi_...", "itemRevision": 1}]
+}
+```
+
+The save is refused with its own reason unless all of these hold:
+
+- `--generation` is the item's record count and `itemRevision` is the item's
+  current revision. A retry with the same request ID and payload replays the
+  saved record; a changed payload is refused.
+- The current pair has a receipt (`passing receipt required`), and
+  `sourceGeneration` and both digests name it (`source receipt is not the
+  current receipt`). The source may itself be an earlier carry-over.
+- That receipt is eligible: no unlisted exhausted failure, known failures
+  still on open bugs, and its verifier reviewed nothing.
+- `commit` is the plan's (`candidate changed`); `matrixDigest` and
+  `matrixApprovalMessageSeq` are the plan's (`matrix or its approval
+  changed`) and the owner's approval message still binds that digest;
+  `checksDigest` is the plan's and still hashes its checks (`checks digest
+  changed`). Who may approve a matrix does not change.
+- `fromScopeRevision` is the receipt's scope and `toScopeRevision` the item's
+  newer current scope.
+- `rebindId` is the running entry's latest rebind, from the receipt's scope
+  to the current scope and item revision. `ownerEditMessageSeq` is that
+  rebind's source message, and the owner wrote it: no agent identity, not a
+  system message and not a notice. An edit announced by an agent, including
+  a delegate, is refused (`the edit's message was not written by the owner`).
+- The receipt's scope still has the plan's assignment (`assignment changed`),
+  and no ASSIGN exists at the new scope (`new scope already assigned; freeze
+  a new plan`).
+- Each moved criterion is a remaining, verification-owned criterion of the
+  receipt's scope with its exact text. Moving an implementation criterion is
+  refused. At least one criterion stays on the item.
+- Each linked item is another bug or feature of the same project, open, in
+  progress or blocked, at the stated revision.
+- No review blocker is unresolved on the candidate.
+
+The saved record keeps the request and adds `amendedBy` (the rebind's
+amender) and a derived plan and receipt. The derived plan is the source plan
+with only `scopeRevision` and `itemRevision` moved to the item's current
+ones. The derived receipt is the source receipt with only `planDigest`
+recomputed for that plan. The commit, base, repository, matrix, approval,
+checks, assignment, order, builder and verifier, and every check result, log
+and attempt are byte-identical. The derived pair becomes the current pair, so
+completion, queue acceptance, the queue summary and the release job read it
+unchanged; the release job binds the new scope. A receipt import after it is
+refused as for any receipted plan, and a new plan supersedes it normally.
+
+In the same transaction the hub saves the carried review scope: the source
+scope's criteria and verification-owned criteria without the moved ones, under
+the source scope's assignment. A standing `accept` or `owner-accept` is not
+cleared, unlike a new plan: the candidate and evidence are identical and the
+amended criteria are a subset of those it accepted.
+
+Review is never skipped. Completion still needs the latest general review
+round on the exact candidate. When that round reviewed the scope the
+carry-over moved from, its criteria are compared with that scope, every
+criterion that stayed must pass, and an unresolved blocker still refuses.
+With no round, a partial or a round on another candidate, completion refuses.
+
+A moved criterion stays required on its linked item and cannot be waived
+silently. Completion, queue acceptance and the release candidate refuse while
+a linked item is dismissed or gone (`moved criterion a8 was waived: linked
+item wi_... is dismissed`); a done linked item delivered it. The queue
+summary shows `passing` with `carryOverGeneration` set, or `blocked` while a
+moved criterion is waived.
+
+It does not apply to an edit that changes the candidate, the matrix or its
+approval, the checks or an implementation criterion; to an item with no
+running queue entry or rebind; to linked items in another project; or after
+new work at the new scope. A later ASSIGN at the new scope, which must repeat
+the carried criteria, makes the carried pair `assignment changed` and stale,
+and needs a new plan. Moving a middle criterion leaves non-contiguous IDs,
+and an ASSIGN needs contiguous `a1..aN`, so new work at that scope needs
+another scope edit first.
+
 ## Integrated plans keep accepted checks
 
 An integrated plan never runs less than the accepted plan. A superset is
@@ -1743,7 +1858,9 @@ stop-after-success, aggregate evidence, labels and flags are verified by the
 native store. A new plan clears the current receipt while keeping old records.
 Delivery reads derive summaries from the current plan and receipt; they display
 check IDs, flaky status, known failures and now-passing flags. Missing receipts
-show pending, changed scope/assignment shows stale, and blocked evidence never
+show pending, changed scope/assignment shows stale (a pair carried over an
+owner edit is current at its new scope; see "A receipt carried over an owner
+scope edit"), and blocked evidence never
 shows passing. Optional new fields preserve existing v1 canonical digests and
 legacy single-attempt receipts; legacy failures still block completion.
 
