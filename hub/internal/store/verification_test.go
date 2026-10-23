@@ -2035,6 +2035,11 @@ type carryOptions struct {
 	blocker    bool // the review leaves a blocker on a2 and is not accepted
 	partial    bool // the review leaves a2 partial and is not accepted
 	agentEdit  bool // a handler, not the owner, posts the edit's message
+	// The handler's confirmation of the amended revision (wi_94e5cad697b5beb2).
+	criteria   map[string]string // amended criteria; nil is carryCriteria without a3
+	owns       []string          // amended owned paths; nil is the plan's Owned
+	bare       bool              // confirm with neither criteria nor owned paths
+	sourceOwns []string          // owned paths the receipt scope's confirmation recorded
 }
 
 // carryOverFixture is a running entry whose lead froze a plan with a
@@ -2109,7 +2114,25 @@ func newCarryOverFixture(t *testing.T, opt carryOptions) *carryOverFixture {
 	if f.updated.ScopeRevision <= f.plan.ScopeRevision {
 		t.Fatalf("the edit kept scope revision %d", f.updated.ScopeRevision)
 	}
-	f.confirm(t, f.updated)
+	if opt.sourceOwns != nil {
+		owned, _ := json.Marshal(opt.sourceOwns)
+		if _, err := f.s.db.Exec(`UPDATE work_order_scope_confirmations SET ownership_json=? WHERE task_id=? AND item_id=? AND item_revision=?`, string(owned), f.task.ID, f.item.ID, f.plan.ItemRevision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	confirm := api.ConfirmWorkOrderScopeRequest{RequestID: api.NewID("req"), AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: f.updated.Revision, ScopeRevision: f.updated.ScopeRevision, OrderMessageSeq: f.order.Seq, Complete: true}
+	if !opt.bare {
+		confirm.Criteria, confirm.Ownership = opt.criteria, opt.owns
+		if confirm.Criteria == nil {
+			confirm.Criteria = map[string]string{"a1": carryCriteria["a1"], "a2": carryCriteria["a2"]}
+		}
+		if confirm.Ownership == nil {
+			confirm.Ownership = f.plan.Owned
+		}
+	}
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, confirm); err != nil {
+		t.Fatal("confirm amended scope", err)
+	}
 	f.entry = f.action(t, f.rebind(f.updated, f.edit))
 	rebinds, err := teamQueueRebinds(f.ctx, f.s.db, f.task.ID, f.entry.ID)
 	if err != nil || len(rebinds) != 1 {
@@ -2417,6 +2440,92 @@ func TestVerificationCarryOverDeniesChangedScope(t *testing.T) {
 	}
 	_, err = assigned.save(assigned.carry(t, "carry", assigned.lead))
 	refusedFor(t, "new-scope assign", "new scope already assigned; freeze a new plan", err)
+}
+
+// wi_94e5cad697b5beb2 k2, k3: the carry-over compares the handler's confirmed
+// amended criteria and owned paths with the receipt's scope minus the moved
+// criteria. Only an exact match saves; every refusal names the criterion or
+// paths and saves nothing.
+func TestVerificationCarryOverChecksConfirmedCriteria(t *testing.T) {
+	kept := func(change func(map[string]string)) map[string]string {
+		m := map[string]string{"a1": carryCriteria["a1"], "a2": carryCriteria["a2"]}
+		change(m)
+		return m
+	}
+	moved := newCarryOverFixture(t, carryOptions{})
+	if _, err := moved.save(moved.carry(t, "carry", moved.lead)); err != nil {
+		t.Fatal("moved criterion only", err)
+	}
+	for _, row := range []struct {
+		name, reason string
+		opt          carryOptions
+	}{
+		{"implementation criterion rewritten", "criterion a1 text differs from the confirmed amended scope", carryOptions{criteria: kept(func(m map[string]string) { m["a1"] = "works offline" })}},
+		{"implementation criterion text padded", "criterion a2 text differs", carryOptions{criteria: kept(func(m map[string]string) { m["a2"] += " " })}},
+		{"criterion added", "criterion a4 is not in the receipt's scope", carryOptions{criteria: kept(func(m map[string]string) { m["a4"] = "logs the retry" })}},
+		{"criterion removed", "criterion a2 of the receipt's scope is missing from the confirmed amended scope", carryOptions{criteria: kept(func(m map[string]string) { delete(m, "a2") })}},
+		{"moved criterion still confirmed", "moved criterion a3 is still in the confirmed amended scope", carryOptions{criteria: kept(func(m map[string]string) { m["a3"] = carryCriteria["a3"] })}},
+		{"ownership added", "owned paths differ from the receipt's scope: added docs/extra.md", carryOptions{owns: []string{"fixture", "docs/extra.md"}}},
+		{"ownership replaced", "owned paths differ from the receipt's scope: added other; removed fixture", carryOptions{owns: []string{"other"}}},
+		{"source confirmation is the baseline", "owned paths differ from the receipt's scope: added fixture; removed hub/internal/store", carryOptions{sourceOwns: []string{"hub/internal/store"}}},
+		{"confirmation without criteria", "records no amended criteria; the database handler must confirm them before a carry-over", carryOptions{bare: true}},
+	} {
+		f := newCarryOverFixture(t, row.opt)
+		_, err := f.save(f.carry(t, "carry", f.lead))
+		refusedFor(t, row.name, row.reason, err)
+		if n := f.records(t); n != 2 {
+			t.Fatalf("%s: a refusal saved a record: %d", row.name, n)
+		}
+		if state := f.state(t); scopeFor(&state, f.updated.ScopeRevision) != nil {
+			t.Fatalf("%s: a refusal saved the carried scope", row.name)
+		}
+	}
+	// The source confirmation's ownership, when recorded, is matched exactly.
+	same := newCarryOverFixture(t, carryOptions{sourceOwns: []string{"hub/internal/store"}, owns: []string{"hub/internal/store"}})
+	if _, err := same.save(same.carry(t, "carry", same.handler)); err != nil {
+		t.Fatal("source confirmation ownership kept", err)
+	}
+}
+
+// wi_94e5cad697b5beb2 k4: a status or priority save after the rebind moves
+// only the item revision, so the carry-over still applies at the current
+// revision; a later scope change still refuses.
+func TestVerificationCarryOverAfterNonScopeSave(t *testing.T) {
+	f := newCarryOverFixture(t, carryOptions{})
+	priority, status := "high", "blocked"
+	item := f.updated
+	for _, change := range []api.UpdateWorkItemRequest{{Priority: &priority}, {Status: &status}} {
+		change.Revision = item.Revision
+		var err error
+		if item, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, change, f.by); err != nil {
+			t.Fatal("non-scope save", err)
+		}
+	}
+	if item.Revision != f.updated.Revision+2 || item.ScopeRevision != f.updated.ScopeRevision {
+		t.Fatalf("non-scope saves moved revision %d scope %d", item.Revision, item.ScopeRevision)
+	}
+	req := f.carry(t, "carry", f.handler)
+	req.CarryOver.ItemRevision = item.Revision
+	record, err := f.save(req)
+	if err != nil {
+		t.Fatal("carry-over after a non-scope save", err)
+	}
+	if record.CarryOver.Plan.ItemRevision != item.Revision || record.CarryOver.Plan.ScopeRevision != f.updated.ScopeRevision {
+		t.Fatalf("derived plan %+v", record.CarryOver.Plan)
+	}
+	if state := f.state(t); scopeFor(&state, item.ScopeRevision) == nil || scopeFor(&state, item.ScopeRevision).ItemRevision != item.Revision {
+		t.Fatal("carried scope", scopeFor(&state, item.ScopeRevision))
+	}
+
+	later := newCarryOverFixture(t, carryOptions{})
+	again, _ := later.amend(t, "again")
+	if again.ScopeRevision <= later.updated.ScopeRevision {
+		t.Fatalf("the second edit kept scope revision %d", again.ScopeRevision)
+	}
+	req = later.carry(t, "carry", later.handler)
+	req.CarryOver.ItemRevision, req.CarryOver.ToScopeRevision = again.Revision, again.ScopeRevision
+	_, err = later.save(req)
+	refusedFor(t, "later scope change", "rebind does not move the receipt's scope to the current one", err)
 }
 
 // a6: a stale, superseded or failed source receipt is refused.

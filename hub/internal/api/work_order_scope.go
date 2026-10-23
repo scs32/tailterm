@@ -23,6 +23,10 @@ type WorkOrderScopeConfirmation struct {
 	// Ownership is the repository-relative files and directories the handler
 	// recorded from the plan or intake; a queue add without --owns uses it.
 	Ownership []string `json:"ownership,omitempty"`
+	// Criteria are the amended criteria the handler read from the owner
+	// filing, by criterion ID with exact text. A receipt carry-over to this
+	// revision requires them.
+	Criteria map[string]string `json:"criteria,omitempty"`
 }
 
 type ConfirmWorkOrderScopeRequest struct {
@@ -36,7 +40,16 @@ type ConfirmWorkOrderScopeRequest struct {
 	Complete bool `json:"complete"`
 	// Ownership is optional; it is part of the retry identity.
 	Ownership []string `json:"ownership,omitempty"`
+	// Criteria are optional and need Ownership; they are part of the retry
+	// identity.
+	Criteria map[string]string `json:"criteria,omitempty"`
 }
+
+// MaxConfirmedCriteria bounds the amended criteria one confirmation records.
+const MaxConfirmedCriteria = 64
+
+// ValidCriterionID reports whether id is a criterion key, such as a1.
+func ValidCriterionID(id string) bool { return namedKey.MatchString(id) }
 
 type WorkOrderBookkeepingRequest struct {
 	RequestID        string               `json:"requestId"`

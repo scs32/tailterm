@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -744,10 +745,15 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 // validateVerificationCarryOver checks a carry-over against the stored
 // records, the item, its running entry's latest rebind and its review ledger,
 // and returns the record to save: the request with AmendedBy and the derived
-// pair filled. In the same transaction it saves the carried review scope:
-// the source scope without the moved criteria, under the source assignment.
-// A standing acceptance is kept: the candidate and evidence are identical and
-// the amended criteria are a subset of those it accepted.
+// pair filled. The rebind must move the receipt's scope to the item's current
+// scope; a later save that changes only the item revision, such as status or
+// priority, does not block it. The handler's scope confirmation at the
+// rebind's revision must record the amended criteria and owned paths, equal
+// to the receipt's scope without the moved criteria (confirmedAmendedScope).
+// In the same transaction it saves the carried review scope: the source scope
+// without the moved criteria, under the source assignment. A standing
+// acceptance is kept: the candidate and evidence are identical and the
+// amended criteria are a subset of those it accepted.
 func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.WorkItem, records []api.VerificationRecord, c api.VerificationCarryOver) (*api.VerificationCarryOver, error) {
 	if item.Status == "done" || item.Status == "dismissed" {
 		return nil, verificationConflict("a " + item.Status + " item is not carried over")
@@ -810,7 +816,7 @@ func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.Wor
 		return nil, verificationConflict("rebind is not the running entry's latest")
 	}
 	rebind := rebinds[len(rebinds)-1]
-	if rebind.FromScopeRevision != p.ScopeRevision || rebind.ToScopeRevision != item.ScopeRevision || rebind.ToItemRevision != item.Revision {
+	if rebind.FromScopeRevision != p.ScopeRevision || rebind.ToScopeRevision != item.ScopeRevision {
 		return nil, verificationConflict("rebind does not move the receipt's scope to the current one")
 	}
 	if c.OwnerEditMessageSeq != rebind.SourceMessageSeq {
@@ -881,6 +887,9 @@ func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.Wor
 	if len(criteria) == 0 {
 		return nil, verificationConflict("at least one criterion must stay on the item")
 	}
+	if err = confirmedAmendedScope(ctx, tx, item, rebind, *p, criteria, c.Moved); err != nil {
+		return nil, err
+	}
 	stage := state
 	if _, err = currentReviewStage(ctx, tx, item.TaskID, &stage, item.ScopeRevision, 0); err != nil {
 		return nil, err
@@ -905,6 +914,101 @@ func validateVerificationCarryOver(ctx context.Context, tx *sql.Tx, item api.Wor
 	amendedBy := rebind.AmendedBy
 	c.AmendedBy, c.Plan, c.Receipt = &amendedBy, &plan, &receipt
 	return &c, nil
+}
+
+// confirmedAmendedScope compares the handler's confirmation of the amended
+// revision with the scope a carry-over keeps. expected is the receipt's scope
+// criteria without the moved ones; the confirmed criteria must equal it byte
+// for byte, and the confirmed owned paths must equal the receipt scope's: its
+// own confirmation's ownership, or the plan's Owned when that recorded none.
+// A confirmation without criteria or owned paths refuses, so the gate fails
+// closed. Each refusal names the criterion or paths.
+func confirmedAmendedScope(ctx context.Context, tx *sql.Tx, item api.WorkItem, rebind api.TeamQueueRebind, p api.VerificationPlan, expected map[string]string, moved []api.VerificationMovedCriterion) error {
+	scope, owned, confirmed, found, err := confirmedScope(ctx, tx, item.TaskID, item.ID, rebind.ToItemRevision, rebind.OrderMessageSeq)
+	if err != nil {
+		return err
+	}
+	if !found || scope != item.ScopeRevision {
+		return verificationConflict(fmt.Sprintf("carry-over needs the scope confirmation of item revision %d", rebind.ToItemRevision))
+	}
+	if len(confirmed) == 0 {
+		return verificationConflict(fmt.Sprintf("the scope confirmation of item revision %d records no amended criteria; the database handler must confirm them before a carry-over", rebind.ToItemRevision))
+	}
+	isMoved := map[string]bool{}
+	for _, m := range moved {
+		isMoved[m.ID] = true
+	}
+	var ids []string
+	for id := range expected {
+		ids = append(ids, id)
+	}
+	for id := range confirmed {
+		if _, ok := expected[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		want, kept := expected[id]
+		got, ok := confirmed[id]
+		switch {
+		case kept && !ok:
+			return verificationConflict("criterion " + id + " of the receipt's scope is missing from the confirmed amended scope")
+		case !kept && isMoved[id]:
+			return verificationConflict("moved criterion " + id + " is still in the confirmed amended scope")
+		case !kept:
+			return verificationConflict("criterion " + id + " is not in the receipt's scope")
+		case got != want:
+			return verificationConflict("criterion " + id + " text differs from the confirmed amended scope")
+		}
+	}
+	if len(owned) == 0 {
+		return verificationConflict(fmt.Sprintf("the scope confirmation of item revision %d records no owned paths", rebind.ToItemRevision))
+	}
+	_, baseline, _, _, err := confirmedScope(ctx, tx, item.TaskID, item.ID, rebind.FromItemRevision, rebind.OrderMessageSeq)
+	if err != nil {
+		return err
+	}
+	if len(baseline) == 0 {
+		baseline = p.Owned
+	}
+	if added, removed := ownershipDiff(baseline, owned); len(added)+len(removed) > 0 {
+		var parts []string
+		if len(added) > 0 {
+			parts = append(parts, "added "+strings.Join(added, ", "))
+		}
+		if len(removed) > 0 {
+			parts = append(parts, "removed "+strings.Join(removed, ", "))
+		}
+		return verificationConflict("owned paths differ from the receipt's scope: " + strings.Join(parts, "; "))
+	}
+	return nil
+}
+
+// ownershipDiff returns the paths in now but not in base, and in base but
+// not in now, each sorted; it compares exact strings.
+func ownershipDiff(base, now []string) (added, removed []string) {
+	in := func(list []string, v string) bool {
+		for _, x := range list {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	}
+	for _, v := range now {
+		if !in(base, v) && !in(added, v) {
+			added = append(added, v)
+		}
+	}
+	for _, v := range base {
+		if !in(now, v) && !in(removed, v) {
+			removed = append(removed, v)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
 }
 
 // verificationCompletion is the item's exact-candidate verification state for

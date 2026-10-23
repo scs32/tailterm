@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -399,8 +400,38 @@ func TestVerificationCLICarryOver(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = f.c.ConfirmWorkOrderScope(ctx, f.task.ID, f.item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "amended-scope", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, ScopeRevision: updated.ScopeRevision, OrderMessageSeq: f.order, Complete: true}); err != nil {
+			// The handler confirms the amended criteria and owned paths
+			// through tt work-items scope confirm (wi_94e5cad697b5beb2 k1).
+			criteriaFile := filepath.Join(t.TempDir(), "criteria.json")
+			if err = os.WriteFile(criteriaFile, []byte(`{"a1":"works"}`), 0600); err != nil {
 				t.Fatal(err)
+			}
+			revision, scope, order := strconv.FormatInt(updated.Revision, 10), strconv.FormatInt(updated.ScopeRevision, 10), strconv.FormatInt(f.order, 10)
+			for name, body := range map[string]string{"empty object": `{}`, "invalid JSON": `{"a1":`, "missing": ""} {
+				bad := filepath.Join(t.TempDir(), "criteria.json")
+				if body != "" {
+					if err = os.WriteFile(bad, []byte(body), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err = cmdWorkOrderScope(f.as(f.handler), []string{"confirm", "--complete", "--request-id", "bad-criteria", "--revision", revision, "--scope-revision", scope, "--order", order, "--owns", "fixture", "--criteria-file", bad, f.item.ID})
+				if err == nil || !strings.HasPrefix(err.Error(), "criteria file: ") {
+					t.Fatalf("%s criteria file: %v", name, err)
+				}
+			}
+			out, err := captureCLIOutput(t, func() error {
+				return cmdWorkOrderScope(f.as(f.handler), []string{"confirm", "--complete", "--request-id", "amended-scope", "--revision", revision, "--scope-revision", scope, "--order", order, "--owns", "fixture", "--criteria-file", criteriaFile, f.item.ID})
+			})
+			var confirmed api.WorkOrderScopeConfirmation
+			if err != nil || json.Unmarshal([]byte(out), &confirmed) != nil || !reflect.DeepEqual(confirmed.Criteria, map[string]string{"a1": "works"}) || !reflect.DeepEqual(confirmed.Ownership, []string{"fixture"}) {
+				t.Fatalf("scope confirm %q %v", out, err)
+			}
+			out, err = captureCLIOutput(t, func() error {
+				return cmdWorkOrderScope(f.as(f.handler), []string{"get", "--revision", revision, "--order", order, f.item.ID})
+			})
+			var readBack api.WorkOrderScopeConfirmation
+			if err != nil || json.Unmarshal([]byte(out), &readBack) != nil || !reflect.DeepEqual(readBack, confirmed) {
+				t.Fatalf("scope get %q %v", out, err)
 			}
 			entry, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "rebind", Operation: "rebind", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision, ItemRevision: updated.Revision, SourceMessageSeq: edit.Seq})
 			if err != nil || len(entry.Rebinds) != 1 {

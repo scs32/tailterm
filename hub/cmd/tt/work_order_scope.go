@@ -27,6 +27,7 @@ func cmdWorkOrderScope(e env, args []string) error {
 	admissionsFile := fs.String("admissions-file", "", "JSON array of exact admitted agent/run/digest bindings")
 	requestID := fs.String("request-id", "", "stable retry id")
 	complete := fs.Bool("complete", false, "handler verified complete owner-filed scope")
+	criteriaFile := fs.String("criteria-file", "", "confirm: JSON object of each amended criterion ID to its exact text, as read from the owner filing; needs --owns. A receipt carry-over to this revision requires them")
 	var owns ownershipFlags
 	fs.Var(&owns, "owns", "confirm: repository-relative file or directory the plan or intake will change (repeatable); a queue add without --owns uses it")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -49,9 +50,22 @@ func cmdWorkOrderScope(e env, args []string) error {
 	switch sub {
 	case "confirm":
 		if e.agent == "" || e.runID == "" || !*complete || !validScopeArgs(*requestID, *revision, *order) || *scope < 1 {
-			return errors.New("confirm requires handler agent, --complete, --request-id, --revision, --scope-revision and --order")
+			return errors.New("confirm requires handler agent, --complete, --request-id, --revision, --scope-revision and --order; --criteria-file and --owns are optional")
 		}
-		out, err := c.ConfirmWorkOrderScope(ctx, task, item, api.ConfirmWorkOrderScopeRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, ScopeRevision: *scope, OrderMessageSeq: *order, Complete: true, Ownership: owns})
+		var criteria map[string]string
+		if *criteriaFile != "" {
+			data, err := os.ReadFile(*criteriaFile)
+			if err != nil {
+				return fmt.Errorf("criteria file: %w", err)
+			}
+			if err := json.Unmarshal(data, &criteria); err != nil {
+				return fmt.Errorf("criteria file: %w", err)
+			}
+			if len(criteria) == 0 {
+				return errors.New("criteria file: no criteria; give a JSON object of criterion ID to exact text")
+			}
+		}
+		out, err := c.ConfirmWorkOrderScope(ctx, task, item, api.ConfirmWorkOrderScopeRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, ScopeRevision: *scope, OrderMessageSeq: *order, Complete: true, Ownership: owns, Criteria: criteria})
 		if err != nil {
 			return err
 		}

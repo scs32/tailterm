@@ -610,10 +610,33 @@ parent needing a new plan and a full matrix run on an unchanged candidate. A
 trail of why it still applies.
 
 When it applies: the owner edited the item's scope, the edit was saved as a
-new scope revision, the leased handler confirmed it and rebound the running
-queue entry (`tt team queue rebind`), and the edit only moved
-verification-owned criteria to open linked items. The candidate, matrix,
-matrix approval, checks and every implementation criterion are unchanged.
+new scope revision, the leased handler confirmed it with the amended criteria
+and owned paths and rebound the running queue entry (`tt team queue rebind`),
+and the edit only moved verification-owned criteria to open linked items. The
+candidate, matrix, matrix approval, checks, owned paths and every
+implementation criterion are unchanged.
+
+Bug `wi_94e5cad697b5beb2`, order #43974: the hub checks "unchanged" itself.
+The handler's scope confirmation of the amended revision records the amended
+criteria it read from the owner filing, each criterion ID with its exact text,
+and the owned paths, alongside the `--complete` assertion. They are saved with
+the confirmation, are part of its retry identity and read back with
+`tt work-items scope get`. Criteria need `--owns`. A confirmation without
+criteria still saves, but no carry-over can use it.
+
+```sh
+tt work-items scope confirm ITEM --complete --request-id KEY --revision 4 --scope-revision 4 \
+  --order 120 --owns hub/internal/store --criteria-file criteria.json
+tt work-items scope get ITEM --revision 4 --order 120    # reads back criteria and ownership
+```
+
+```json
+{"a1": "<a1's exact text>", "a2": "<a2's exact text>"}
+```
+
+The criteria use the receipt scope's IDs and exact texts, the frozen ASSIGN's
+`a1..aN`, as the owner amended them, without the moved ones. A paraphrase is
+refused, which falls back to a new plan and a full matrix run.
 
 The item lead or the database handler saves it through the API, the
 `POST .../verification` route or the CLI. The plan's verifier and other team
@@ -662,7 +685,13 @@ The save is refused with its own reason unless all of these hold:
 - `fromScopeRevision` is the receipt's scope and `toScopeRevision` the item's
   newer current scope.
 - `rebindId` is the running entry's latest rebind, from the receipt's scope
-  to the current scope and item revision. `ownerEditMessageSeq` is that
+  to the item's current scope. A later save that changes only the item
+  revision, such as status or priority, does not block it: `itemRevision` is
+  then the item's current revision and the derived plan takes it. A later
+  scope change refuses (`rebind does not move the receipt's scope to the
+  current one`). After such a save the running entry is behind the item, so
+  the item lead's operator check refuses it and the database handler authors
+  the carry-over. `ownerEditMessageSeq` is that
   rebind's source message, and the owner wrote it: no agent identity, not a
   system message and not a notice. An edit announced by an agent, including
   a delegate, is refused (`the edit's message was not written by the owner`).
@@ -674,6 +703,21 @@ The save is refused with its own reason unless all of these hold:
   refused. At least one criterion stays on the item.
 - Each linked item is another bug or feature of the same project, open, in
   progress or blocked, at the stated revision.
+- The scope confirmation at the rebind's item revision and order exists for
+  the current scope (`carry-over needs the scope confirmation of item revision
+  N`) and records amended criteria (`... records no amended criteria`), so the
+  gate fails closed. Its criteria equal the receipt's scope criteria without
+  the moved ones, byte for byte, each refusal naming the criterion: a removed
+  one (`criterion a2 of the receipt's scope is missing from the confirmed
+  amended scope`), a moved one still listed (`moved criterion a3 is still in
+  the confirmed amended scope`), an added one (`criterion a4 is not in the
+  receipt's scope`) or a changed text (`criterion a1 text differs from the
+  confirmed amended scope`).
+- That confirmation records owned paths (`... records no owned paths`), equal
+  as a set of exact strings to the receipt scope's: the ownership its own
+  confirmation recorded at the rebind's source revision, or the plan's
+  `owned` when that recorded none. A difference refuses naming the paths
+  (`owned paths differ from the receipt's scope: added X; removed Y`).
 - No review blocker is unresolved on the candidate.
 
 The saved record keeps the request and adds `amendedBy` (the rebind's
@@ -707,13 +751,18 @@ summary shows `passing` with `carryOverGeneration` set, or `blocked` while a
 moved criterion is waived.
 
 It does not apply to an edit that changes the candidate, the matrix or its
-approval, the checks or an implementation criterion; to an item with no
-running queue entry or rebind; to linked items in another project; or after
-new work at the new scope. A later ASSIGN at the new scope, which must repeat
-the carried criteria, makes the carried pair `assignment changed` and stale,
-and needs a new plan. Moving a middle criterion leaves non-contiguous IDs,
-and an ASSIGN needs contiguous `a1..aN`, so new work at that scope needs
-another scope edit first.
+approval, the checks, the owned paths or an implementation criterion (the
+last two are enforced by comparing the handler's confirmation, above); to an
+item with no running queue entry or rebind; to linked items in another
+project; or after new work at the new scope. A later ASSIGN at the new scope,
+which must repeat the carried criteria, makes the carried pair `assignment
+changed` and stale, and needs a new plan. Moving a middle criterion leaves
+non-contiguous IDs, and an ASSIGN needs contiguous `a1..aN`, so new work at
+that scope needs another scope edit first.
+
+Owner stopgap #43885 (no receipt carry-over is authored; a moved criterion
+takes a new plan and a full matrix run) stays in force until
+`wi_94e5cad697b5beb2` releases, and ends with that release.
 
 ## Integrated plans keep accepted checks
 

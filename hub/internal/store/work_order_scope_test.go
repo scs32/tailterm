@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -371,5 +372,78 @@ func TestWorkOrderBookkeepingAmendedEntryRefusalOnlyForItsOrder(t *testing.T) {
 		generic("before confirmation")
 		f.confirm(t, updated)
 		generic("after confirmation")
+	}
+}
+
+// wi_94e5cad697b5beb2 k1: the confirmation of an amended revision records the
+// amended criteria with their exact text and the owned paths. They are part of
+// the retry identity, read back after a reopen, and need the owned paths; a
+// confirmation without criteria is unchanged.
+func TestWorkOrderScopeConfirmationRecordsAmendedCriteria(t *testing.T) {
+	f := newRebindFixture(t, true)
+	legacy, err := f.s.GetWorkOrderScopeConfirmation(f.ctx, f.task.ID, f.item.ID, f.item.Revision, f.order.Seq)
+	if err != nil || legacy.Criteria != nil {
+		t.Fatalf("confirmation without criteria %+v %v", legacy, err)
+	}
+	if raw, _ := json.Marshal(legacy); strings.Contains(string(raw), `"criteria"`) {
+		t.Fatalf("confirmation without criteria encodes them: %s", raw)
+	}
+	updated, _ := f.amend(t, "criteria")
+	criteria := map[string]string{"a1": "works", "a2": " retries  twice "}
+	confirm := api.ConfirmWorkOrderScopeRequest{RequestID: "amended-criteria", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: updated.Revision, ScopeRevision: updated.ScopeRevision, OrderMessageSeq: f.order.Seq, Complete: true, Ownership: []string{"hub/internal/store"}, Criteria: criteria}
+	many := map[string]string{}
+	for i := 0; i <= api.MaxConfirmedCriteria; i++ {
+		many[fmt.Sprintf("a%d", i+1)] = "criterion"
+	}
+	for name, bad := range map[string]map[string]string{
+		"capital ID":    {"A1": "works"},
+		"spaced ID":     {"a 1": "works"},
+		"blank text":    {"a1": " \t"},
+		"invalid UTF-8": {"a1": "\xff"},
+		"too many":      many,
+	} {
+		req := confirm
+		req.RequestID, req.Criteria = "bad-"+strings.ReplaceAll(name, " ", "-"), bad
+		if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, req); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	unowned := confirm
+	unowned.RequestID, unowned.Ownership = "criteria-unowned", nil
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, unowned); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "amended criteria need the owned paths") {
+		t.Fatalf("criteria without owned paths: %v", err)
+	}
+	if _, err := f.s.GetWorkOrderScopeConfirmation(f.ctx, f.task.ID, f.item.ID, updated.Revision, f.order.Seq); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("a refusal saved a confirmation: %v", err)
+	}
+	filed, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(filed.Criteria, criteria) || !reflect.DeepEqual(filed.Ownership, []string{"hub/internal/store"}) || filed.ItemRevision != updated.Revision || filed.ScopeRevision != updated.ScopeRevision {
+		t.Fatalf("filed %+v", filed)
+	}
+	if raw, _ := json.Marshal(filed); !strings.Contains(string(raw), `"criteria":{"a1":"works","a2":" retries  twice "}`) {
+		t.Fatalf("record JSON %s", raw)
+	}
+	if replay, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, confirm); err != nil || !reflect.DeepEqual(replay, filed) {
+		t.Fatalf("replay %+v %v", replay, err)
+	}
+	changed := confirm
+	changed.Criteria = map[string]string{"a1": "works", "a2": "retries twice"}
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, f.item.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "confirmation retry payload changed") {
+		t.Fatalf("changed criteria retry: %v", err)
+	}
+	var path string
+	if err := f.s.db.QueryRow(`SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Close()
+	if f.s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.s.GetWorkOrderScopeConfirmation(f.ctx, f.task.ID, f.item.ID, updated.Revision, f.order.Seq)
+	if err != nil || !reflect.DeepEqual(got, filed) {
+		t.Fatalf("readback after reopen %+v %v", got, err)
 	}
 }

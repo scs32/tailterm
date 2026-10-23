@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -31,7 +33,15 @@ func migrateWorkOrderScope(db *sql.DB) error {
 		return err
 	}
 	if n == 0 {
-		_, err = db.Exec(`ALTER TABLE work_order_scope_confirmations ADD COLUMN ownership_json TEXT NOT NULL DEFAULT '[]'`)
+		if _, err = db.Exec(`ALTER TABLE work_order_scope_confirmations ADD COLUMN ownership_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			return err
+		}
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('work_order_scope_confirmations') WHERE name='criteria_json'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err = db.Exec(`ALTER TABLE work_order_scope_confirmations ADD COLUMN criteria_json TEXT NOT NULL DEFAULT ''`)
 	}
 	return err
 }
@@ -218,6 +228,12 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 	if err != nil {
 		return api.WorkOrderScopeConfirmation{}, err
 	}
+	if !validConfirmedCriteria(req.Criteria) {
+		return api.WorkOrderScopeConfirmation{}, api.ErrInvalid
+	}
+	if len(req.Criteria) > 0 && len(ownership) == 0 {
+		return api.WorkOrderScopeConfirmation{}, workItemConflict("amended criteria need the owned paths; pass --owns")
+	}
 	hash := requestHash(struct {
 		Task, Item string
 		Request    api.ConfirmWorkOrderScopeRequest
@@ -230,14 +246,17 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 	}
 	defer tx.Rollback()
 	var prior api.WorkOrderScopeConfirmation
-	var priorHash, priorOwnership string
-	err = tx.QueryRowContext(ctx, `SELECT item_id,item_revision,scope_revision,order_seq,source_message_seq,agent_id,run_id,created_at,payload_hash,ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior.ItemID, &prior.ItemRevision, &prior.ScopeRevision, &prior.OrderSeq, &prior.SourceMessageSeq, &prior.AgentID, &prior.RunID, &prior.CreatedAt, &priorHash, &priorOwnership)
+	var priorHash, priorOwnership, priorCriteria string
+	err = tx.QueryRowContext(ctx, `SELECT item_id,item_revision,scope_revision,order_seq,source_message_seq,agent_id,run_id,created_at,payload_hash,ownership_json,criteria_json FROM work_order_scope_confirmations WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior.ItemID, &prior.ItemRevision, &prior.ScopeRevision, &prior.OrderSeq, &prior.SourceMessageSeq, &prior.AgentID, &prior.RunID, &prior.CreatedAt, &priorHash, &priorOwnership, &priorCriteria)
 	if err == nil {
 		if priorHash != hash {
 			return api.WorkOrderScopeConfirmation{}, workItemConflict("confirmation retry payload changed")
 		}
 		prior.TaskID, prior.RequestID = task, req.RequestID
 		if prior.Ownership, err = scopeOwnership(priorOwnership); err != nil {
+			return api.WorkOrderScopeConfirmation{}, err
+		}
+		if prior.Criteria, err = scopeCriteria(priorCriteria); err != nil {
 			return api.WorkOrderScopeConfirmation{}, err
 		}
 		return prior, nil
@@ -272,7 +291,13 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 		out.Ownership = ownership
 	}
 	ownedJSON, _ := json.Marshal(ownership)
-	_, err = tx.ExecContext(ctx, `INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,source_message_seq,request_id,payload_hash,agent_id,run_id,created_at,ownership_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, task, itemID, out.ItemRevision, out.ScopeRevision, out.OrderSeq, out.SourceMessageSeq, out.RequestID, hash, out.AgentID, out.RunID, out.CreatedAt, string(ownedJSON))
+	criteriaJSON := ""
+	if len(req.Criteria) > 0 {
+		out.Criteria = req.Criteria
+		b, _ := json.Marshal(req.Criteria)
+		criteriaJSON = string(b)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO work_order_scope_confirmations(task_id,item_id,item_revision,scope_revision,order_seq,source_message_seq,request_id,payload_hash,agent_id,run_id,created_at,ownership_json,criteria_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, task, itemID, out.ItemRevision, out.ScopeRevision, out.OrderSeq, out.SourceMessageSeq, out.RequestID, hash, out.AgentID, out.RunID, out.CreatedAt, string(ownedJSON), criteriaJSON)
 	if err != nil {
 		return api.WorkOrderScopeConfirmation{}, err
 	}
@@ -288,8 +313,8 @@ func (s *Store) GetWorkOrderScopeConfirmation(ctx context.Context, task, item st
 		return api.WorkOrderScopeConfirmation{}, api.ErrInvalid
 	}
 	var out api.WorkOrderScopeConfirmation
-	var ownership string
-	err := s.db.QueryRowContext(ctx, `SELECT scope_revision,source_message_seq,request_id,agent_id,run_id,created_at,ownership_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&out.ScopeRevision, &out.SourceMessageSeq, &out.RequestID, &out.AgentID, &out.RunID, &out.CreatedAt, &ownership)
+	var ownership, criteria string
+	err := s.db.QueryRowContext(ctx, `SELECT scope_revision,source_message_seq,request_id,agent_id,run_id,created_at,ownership_json,criteria_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&out.ScopeRevision, &out.SourceMessageSeq, &out.RequestID, &out.AgentID, &out.RunID, &out.CreatedAt, &ownership, &criteria)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, api.ErrNotFound
 	}
@@ -297,8 +322,59 @@ func (s *Store) GetWorkOrderScopeConfirmation(ctx context.Context, task, item st
 		return out, err
 	}
 	out.TaskID, out.ItemID, out.ItemRevision, out.OrderSeq = task, item, revision, order
-	out.Ownership, err = scopeOwnership(ownership)
+	if out.Ownership, err = scopeOwnership(ownership); err != nil {
+		return out, err
+	}
+	out.Criteria, err = scopeCriteria(criteria)
 	return out, err
+}
+
+// confirmedScope reads the scope revision, ownership and amended criteria a
+// confirmation recorded; found is false when there is none.
+func confirmedScope(ctx context.Context, q queryRower, task, item string, revision, order int64) (scope int64, ownership []string, criteria map[string]string, found bool, err error) {
+	var owned, raw string
+	err = q.QueryRowContext(ctx, `SELECT scope_revision,ownership_json,criteria_json FROM work_order_scope_confirmations WHERE task_id=? AND item_id=? AND item_revision=? AND order_seq=?`, task, item, revision, order).Scan(&scope, &owned, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil, nil, false, nil
+	}
+	if err != nil {
+		return 0, nil, nil, false, err
+	}
+	if ownership, err = scopeOwnership(owned); err != nil {
+		return 0, nil, nil, false, err
+	}
+	if criteria, err = scopeCriteria(raw); err != nil {
+		return 0, nil, nil, false, err
+	}
+	return scope, ownership, criteria, true, nil
+}
+
+// validConfirmedCriteria checks amended criteria: criterion-key IDs with
+// non-blank UTF-8 text, at most api.MaxConfirmedCriteria. None is valid.
+func validConfirmedCriteria(criteria map[string]string) bool {
+	if len(criteria) > api.MaxConfirmedCriteria {
+		return false
+	}
+	for id, text := range criteria {
+		if !api.ValidCriterionID(id) || !utf8.ValidString(text) || strings.TrimSpace(text) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// scopeCriteria decodes a confirmation's saved amended criteria; none is nil.
+func scopeCriteria(raw string) (map[string]string, error) {
+	var criteria map[string]string
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &criteria); err != nil {
+			return nil, err
+		}
+	}
+	if len(criteria) == 0 {
+		return nil, nil
+	}
+	return criteria, nil
 }
 
 // scopeOwnership decodes a confirmation's saved ownership; none is nil.
