@@ -2,12 +2,14 @@ package spawn
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -23,10 +25,10 @@ import (
 // socket path holds about 104 bytes, and the macOS per-user temporary
 // directory would use half of that before the socket name.
 //
-// The TestContextArgvFixture child exits from inside its test and starts no
-// tmux, so it gets no directory to leave behind.
+// The TestContextArgvFixture and TestWrapFixture children start no tmux, so
+// they get no directory to leave behind.
 func TestMain(m *testing.M) {
-	if os.Getenv("TT_SYNTHETIC_CONTEXT_ARGV") == "1" {
+	if os.Getenv("TT_SYNTHETIC_CONTEXT_ARGV") == "1" || os.Getenv("TT_WRAP_FIXTURE") == "1" {
 		os.Exit(m.Run())
 	}
 	dir, err := os.MkdirTemp("/tmp", "tt-tmux-")
@@ -481,4 +483,324 @@ func TestSpawnCreateExportsArtifactsRoot(t *testing.T) {
 	t.Setenv(EnvArtifacts, "relative/dir")
 	create("host-relative", queue, nil)
 	want("host-relative", "")
+}
+
+// TestWrapFixture is the wrapper under test when the test binary is re-run
+// with TT_WRAP_FIXTURE=1: it runs Wrap on TT_WRAP_COMMAND with a 300 ms stop
+// grace and appends what the wrapper saw to TT_WRAP_RECORD.
+func TestWrapFixture(t *testing.T) {
+	if os.Getenv("TT_WRAP_FIXTURE") != "1" {
+		return
+	}
+	wrapStopGrace = 300 * time.Millisecond
+	record := func(format string, args ...any) {
+		f, err := os.OpenFile(os.Getenv("TT_WRAP_RECORD"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err == nil {
+			fmt.Fprintf(f, format+"\n", args...)
+			f.Close()
+		}
+	}
+	record("wrapper %d", os.Getpid())
+	pgid := 0
+	err := Wrap(os.Getenv("TT_WRAP_COMMAND"), func(pid int) {
+		pgid = pid
+		record("start %d", pid)
+	}, func(code int) {
+		record("exit %d alive=%v", code, groupAlive(pgid))
+	})
+	record("return %v", err)
+	if err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// wrapFixture writes the agent script and a fake $SHELL that records a login
+// call instead of starting one, and returns the record path and the fixture's
+// environment, which runs the script in the command's own shell.
+func wrapFixture(t *testing.T, script, shell string) (string, []string) {
+	t.Helper()
+	dir := t.TempDir()
+	rec := filepath.Join(dir, "record")
+	agent := filepath.Join(dir, "agent.sh")
+	if err := os.WriteFile(agent, []byte(strings.ReplaceAll(script, "REC", ShellQuote(rec))), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if shell == "" {
+		shell = filepath.Join(dir, "shell")
+		fake := "#!/bin/sh\nif [ \"$1\" = -l ]; then echo login >> " + ShellQuote(rec) + "; exit 0; fi\nexec /bin/sh \"$@\"\n"
+		if err := os.WriteFile(shell, []byte(fake), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec, []string{"TT_WRAP_FIXTURE=1", "SHELL=" + shell, "HOME=" + dir, "TT_WRAP_RECORD=" + rec, "TT_WRAP_COMMAND=. " + ShellQuote(agent)}
+}
+
+// recordLine waits for the first record line starting with prefix and returns
+// its remaining fields.
+func recordLine(t *testing.T, rec, prefix string, wait time.Duration) []string {
+	t.Helper()
+	for deadline := time.Now().Add(wait); ; time.Sleep(20 * time.Millisecond) {
+		data, _ := os.ReadFile(rec)
+		for _, line := range strings.Split(string(data), "\n") {
+			if line == prefix || strings.HasPrefix(line, prefix+" ") {
+				return strings.Fields(strings.TrimPrefix(line, prefix))
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q record within %v:\n%s", prefix, wait, data)
+		}
+	}
+}
+
+func readRecord(rec string) string {
+	data, _ := os.ReadFile(rec)
+	return string(data)
+}
+
+func recordCount(t *testing.T, rec, line string) int {
+	t.Helper()
+	n := 0
+	for _, l := range strings.Split(readRecord(rec), "\n") {
+		if l == line {
+			n++
+		}
+	}
+	return n
+}
+
+func recordPID(t *testing.T, rec, prefix string) int {
+	t.Helper()
+	pid, err := strconv.Atoi(recordLine(t, rec, prefix, 10*time.Second)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+// pidGone reports whether pid has ended: it no longer exists, or the pid now
+// belongs to a process whose command does not contain want.
+func pidGone(pid int, want string) bool {
+	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		return true
+	}
+	out, err := exec.Command("ps", "-o", "stat=,command=", "-p", strconv.Itoa(pid)).Output()
+	text := strings.TrimSpace(string(out))
+	return err != nil || !strings.Contains(text, want) || strings.HasPrefix(text, "Z")
+}
+
+func waitGone(t *testing.T, pid int, want string, wait time.Duration) {
+	t.Helper()
+	for deadline := time.Now().Add(wait); !pidGone(pid, want); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d (%s) still running after %v", pid, want, wait)
+		}
+	}
+}
+
+// killOnCleanup kills each recorded pid that still runs want when the test
+// ends, so a failure leaves none of the fixture's processes behind.
+func killOnCleanup(t *testing.T, rec string, prefixes map[string]string) {
+	t.Cleanup(func() {
+		data, _ := os.ReadFile(rec)
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			if want, ok := prefixes[fields[0]]; ok {
+				if pid, err := strconv.Atoi(fields[1]); err == nil && pid > 1 && !pidGone(pid, want) {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+	})
+}
+
+func TestWrapForwardsStopSignalToCommandGroup(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		sig  syscall.Signal
+		name string
+		code string
+	}{{syscall.SIGTERM, "TERM", "143"}, {syscall.SIGINT, "INT", "130"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The child ignores the signal (a background child also ignores
+			// INT), so only the group SIGKILL after the grace ends it.
+			rec, env := wrapFixture(t, `trap 'echo "trap TERM" >> REC; exit 143' TERM
+trap 'echo "trap INT" >> REC; exit 130' INT
+echo "agent $$" >> REC
+sh -c 'trap "" TERM INT; echo "child $$" >> '"REC"'; while :; do sleep 1; done' &
+wait
+`, "")
+			killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture", "child": "sh -c"})
+			cmd := exec.Command(self, "-test.run=^TestWrapFixture$")
+			cmd.Env = append(os.Environ(), env...)
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			agent := recordPID(t, rec, "agent")
+			child := recordPID(t, rec, "child")
+			if got := recordPID(t, rec, "start"); got != agent {
+				t.Fatalf("onStart pid %d, agent shell %d", got, agent)
+			}
+			if pgid, err := syscall.Getpgid(agent); err != nil || pgid != agent {
+				t.Fatalf("agent pgid %d (%v), want its own group %d", pgid, err, agent)
+			}
+			if pgid, err := syscall.Getpgid(child); err != nil || pgid != agent {
+				t.Fatalf("child pgid %d (%v), want the agent group %d", pgid, err, agent)
+			}
+			sent := time.Now()
+			if err := cmd.Process.Signal(tc.sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err = <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("wrapper did not end after its stop signal")
+			}
+			elapsed := time.Since(sent)
+			var exit *exec.ExitError
+			status, ok := syscall.WaitStatus(0), false
+			if errors.As(err, &exit) {
+				status, ok = exit.Sys().(syscall.WaitStatus)
+			}
+			if !ok || !status.Signaled() || status.Signal() != tc.sig {
+				t.Fatalf("wrapper ended %v, want killed by %v", err, tc.sig)
+			}
+			if n := recordCount(t, rec, "trap "+tc.name); n != 1 {
+				t.Fatalf("agent received %s %d times, want once", tc.name, n)
+			}
+			if got := strings.Join(recordLine(t, rec, "exit", 0), " "); got != tc.code+" alive=false" {
+				t.Fatalf("onExit record %q, want %s with the group ended", got, tc.code)
+			}
+			if !pidGone(child, "sh -c") {
+				t.Fatalf("child %d outlived onExit", child)
+			}
+			if recordCount(t, rec, "login") != 0 || recordCount(t, rec, "return <nil>") != 0 {
+				t.Fatal("stopped wrapper started the login shell")
+			}
+			// The child can only end by the SIGKILL that follows the grace.
+			if limit := 300*time.Millisecond + wrapKillWait + 2*time.Second; elapsed < 300*time.Millisecond || elapsed > limit {
+				t.Fatalf("wrapper ended %v after the signal, want between the grace and %v", elapsed, limit)
+			}
+		})
+	}
+}
+
+func TestWrapNormalExitKeepsLoginShell(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, env := wrapFixture(t, `sleep 30 &
+echo "child $!" >> REC
+exit 7
+`, "")
+	killOnCleanup(t, rec, map[string]string{"child": "sleep 30"})
+	cmd := exec.Command(self, "-test.run=^TestWrapFixture$")
+	cmd.Env = append(os.Environ(), env...)
+	// A file, not a pipe: the child keeps the wrapper's stderr open.
+	stderr, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	cmd.Stderr = stderr
+	err = cmd.Run()
+	notice, _ := os.ReadFile(stderr.Name())
+	if err != nil {
+		t.Fatalf("wrapper: %v\n%s", err, notice)
+	}
+	child := recordPID(t, rec, "child")
+	data, _ := os.ReadFile(rec)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"exit 7 alive=true", "login", "return <nil>"}
+	if len(lines) < 3 || strings.Join(lines[len(lines)-3:], "|") != strings.Join(want, "|") {
+		t.Fatalf("record ends %q, want %q", lines, want)
+	}
+	if pidGone(child, "sleep 30") {
+		t.Fatal("normal exit killed the command's remaining child")
+	}
+	if !strings.Contains(string(notice), "[tt] agent command exited with status 7; this pane is now a shell.") {
+		t.Fatalf("stderr notice missing: %q", notice)
+	}
+}
+
+func TestWrapTerminalForegroundCtrlCAndKillSession(t *testing.T) {
+	run := privateTmux(t)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane := func(session string, env []string) {
+		words := []string{"exec", "env"}
+		for _, kv := range env {
+			words = append(words, ShellQuote(kv))
+		}
+		words = append(words, ShellQuote(self), "-test.run=^TestWrapFixture$")
+		run("-f", "/dev/null", "new-session", "-d", "-x", "80", "-y", "24", "-s", session, strings.Join(words, " "))
+	}
+
+	// The agent reads the pane, counts INT and ends on HUP; its background
+	// child is in the same group.
+	rec, env := wrapFixture(t, `trap 'echo "trap INT" >> REC' INT
+trap 'echo "trap HUP" >> REC; exit 129' HUP
+sleep 60 &
+echo "child $!" >> REC
+set -- $(ps -o pgid=,tpgid= -p $$)
+echo "agent $$ $1 $2" >> REC
+read line
+echo "read $line" >> REC
+while :; do sleep 0.2; done
+`, "")
+	killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture", "agent": ".tailterm-runtime-command-", "child": "sleep 60"})
+	pane("stop", env)
+	wrapper := recordPID(t, rec, "wrapper")
+	child := recordPID(t, rec, "child")
+	ids := recordLine(t, rec, "agent", 10*time.Second)
+	if len(ids) != 3 || ids[0] != ids[1] || ids[1] != ids[2] {
+		t.Fatalf("agent pid, pgid, tpgid = %q, want the command's group in the foreground", ids)
+	}
+	agent, _ := strconv.Atoi(ids[0])
+	run("send-keys", "-t", "=stop:", "pane input", "Enter")
+	recordLine(t, rec, "read pane input", 10*time.Second)
+
+	run("send-keys", "-t", "=stop:", "C-c")
+	recordLine(t, rec, "trap INT", 10*time.Second)
+	// A forwarded copy would arrive at once and start the 300 ms stop.
+	time.Sleep(time.Second)
+	if n := recordCount(t, rec, "trap INT"); n != 1 {
+		t.Fatalf("pane Ctrl-C reached the agent %d times, want once", n)
+	}
+	if pidGone(agent, ".tailterm-runtime-command-") || strings.Contains(readRecord(rec), "\nexit ") {
+		t.Fatal("pane Ctrl-C stopped the wrapper's command")
+	}
+
+	run("kill-session", "-t", "=stop")
+	waitGone(t, wrapper, "TestWrapFixture", 5*time.Second)
+	waitGone(t, agent, ".tailterm-runtime-command-", 5*time.Second)
+	waitGone(t, child, "sleep 60", 5*time.Second)
+	for _, line := range strings.Split(readRecord(rec), "\n") {
+		if strings.HasPrefix(line, "exit ") || strings.HasPrefix(line, "return ") {
+			t.Fatalf("kill-session reached onExit or the login shell: %q", line)
+		}
+	}
+
+	// A command that exits on its own hands the pane back to a login shell
+	// that can read it.
+	rec, env = wrapFixture(t, `exit 3
+`, "/bin/sh")
+	killOnCleanup(t, rec, map[string]string{"wrapper": "TestWrapFixture"})
+	pane("login", env)
+	recordLine(t, rec, "exit 3", 10*time.Second)
+	run("send-keys", "-t", "=login:", "echo login-read >> "+ShellQuote(rec), "Enter")
+	recordLine(t, rec, "login-read", 10*time.Second)
+	run("send-keys", "-t", "=login:", "exit", "Enter")
+	recordLine(t, rec, "return <nil>", 10*time.Second)
 }

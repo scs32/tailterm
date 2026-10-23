@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Env names shared by tt and tailterm.
@@ -336,8 +339,25 @@ func Runtimes() []string {
 	return out
 }
 
+// wrapStopGrace bounds how long the command's process group may outlive a
+// forwarded stop signal before the whole group gets SIGKILL.
+var wrapStopGrace = 5 * time.Second
+
+// wrapKillWait bounds the wait for the group to end after that SIGKILL.
+var wrapKillWait = 2 * time.Second
+
 // Wrap runs a shell command, reporting start and exit through the callbacks,
 // then keeps the pane alive with an interactive shell so the session persists.
+//
+// The command leads its own process group (pgid = the onStart pid). When the
+// wrapper's group is the terminal's foreground group, the command's group takes
+// the foreground, so pane input and a pane Ctrl-C reach the command alone. A
+// SIGTERM or SIGINT addressed to the wrapper is forwarded to the group once; a
+// member still alive wrapStopGrace later gets SIGKILL with the whole group.
+// onExit then runs after the group has ended, and the wrapper ends by the
+// signal it received, with no login shell. SIGHUP keeps its default, so a
+// closed pane ends the wrapper without onExit, as before. A command that exits
+// on its own is reported at once, leaving any remaining children alone.
 func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -349,12 +369,32 @@ func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	}
 	defer cleanup()
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	tty := int(os.Stdin.Fd())
+	pgrp, err := ttyForegroundGroup(tty)
+	foreground := err == nil && pgrp == syscall.Getpgrp()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Foreground: foreground, Ctty: tty}
+	// Registered before Start, so no stop signal arrives while it would still
+	// end the wrapper without reaching the command.
+	stops := make(chan os.Signal, 4)
+	signal.Notify(stops, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(stops)
 	err = cmd.Start()
 	if err != nil {
 		return err
 	}
-	onStart(cmd.Process.Pid)
-	err = cmd.Wait()
+	pgid := cmd.Process.Pid
+	onStart(pgid)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var stop syscall.Signal
+	select {
+	case err = <-done:
+		signal.Stop(stops)
+		signal.Reset(syscall.SIGTERM, syscall.SIGINT)
+	case sig := <-stops:
+		stop = sig.(syscall.Signal)
+		err = stopGroup(pgid, stop, done)
+	}
 	code := 0
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -362,11 +402,95 @@ func Wrap(command string, onStart func(pid int), onExit func(code int)) error {
 	} else if err != nil {
 		code = 127
 	}
+	if foreground {
+		reclaimForeground(tty)
+	}
 	onExit(code)
+	if stop != 0 {
+		cleanup()
+		signal.Stop(stops)
+		signal.Reset(stop)
+		_ = syscall.Kill(os.Getpid(), stop)
+		time.Sleep(time.Second)
+		return fmt.Errorf("wrapper survived its own %v", stop)
+	}
 	fmt.Fprintf(os.Stderr, "\n[tt] agent command exited with status %d; this pane is now a shell.\n", code)
 	login := exec.Command(shell, "-l")
 	login.Stdin, login.Stdout, login.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return login.Run()
+}
+
+// stopGroup forwards sig to the command's process group once and waits until
+// the command's Wait has returned and the group has no members. A member still
+// alive wrapStopGrace after the forward gets SIGKILL with the whole group, and
+// the wait gives up wrapKillWait after that. Further stop signals stay queued
+// on the wrapper's channel and are not forwarded again. It returns the
+// command's Wait result.
+func stopGroup(pgid int, sig syscall.Signal, done <-chan error) error {
+	_ = syscall.Kill(-pgid, sig)
+	var waitErr error
+	exited, killed := false, false
+	deadline := time.Now().Add(wrapStopGrace)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if !exited {
+			select {
+			case waitErr = <-done:
+				exited = true
+			default:
+			}
+		}
+		if exited && !groupAlive(pgid) {
+			return waitErr
+		}
+		if time.Now().After(deadline) {
+			if killed {
+				if !exited {
+					waitErr = <-done
+				}
+				return waitErr
+			}
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			killed = true
+			deadline = time.Now().Add(wrapKillWait)
+		}
+		<-tick.C
+	}
+}
+
+// groupAlive reports whether process group pgid still has a member; a member
+// the wrapper may not signal still counts.
+func groupAlive(pgid int) bool {
+	return !errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH)
+}
+
+// reclaimForeground makes the wrapper's group the terminal's foreground group
+// again, so the login shell it starts next can read the pane. A background
+// group changing the foreground would be stopped by SIGTTOU, so it is ignored
+// for the call and restored before any child inherits it.
+func reclaimForeground(tty int) {
+	signal.Ignore(syscall.SIGTTOU)
+	_ = setTTYForegroundGroup(tty, syscall.Getpgrp())
+	signal.Reset(syscall.SIGTTOU)
+}
+
+// ttyForegroundGroup returns the foreground process group of terminal fd.
+func ttyForegroundGroup(fd int) (int, error) {
+	var pgrp int32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(syscall.TIOCGPGRP), uintptr(unsafe.Pointer(&pgrp))); errno != 0 {
+		return 0, errno
+	}
+	return int(pgrp), nil
+}
+
+// setTTYForegroundGroup makes pgrp the foreground process group of terminal fd.
+func setTTYForegroundGroup(fd, pgrp int) error {
+	group := int32(pgrp)
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(syscall.TIOCSPGRP), uintptr(unsafe.Pointer(&group))); errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // ReadJSON reads a JSON object from r into a map, tolerating empty input.
